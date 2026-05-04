@@ -434,7 +434,7 @@ function renderConfig(data) {
     const tbody = document.getElementById('models-tbody');
     const limits = data.model_limits || {};
     const caps = data.model_capabilities || {};
-    const capLabels = { chat: 'Chat', vision: 'Vision', tools: 'Tools', code: 'Code' };
+    const capLabels = { chat: 'Chat', vision: 'Vision', tools: 'Tools', code: 'Code', 'web-search': 'Web' };
     let html = '';
     for (const [id, info] of Object.entries(data.models)) {
         const lim = limits[id] || [];

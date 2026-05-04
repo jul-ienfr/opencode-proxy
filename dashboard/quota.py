@@ -27,18 +27,18 @@ _AUTH_COOKIE_ENV = "OPENCODE_GO_AUTH_COOKIE"
 MODEL_CAPABILITIES: dict[str, list[str]] = {
     "glm-5.1":          ["chat", "tools", "vision"],
     "glm-5":            ["chat", "tools", "vision"],
-    "kimi-k2.5":        ["chat", "tools", "vision", "code"],
-    "kimi-k2.6":        ["chat", "tools", "vision"],
+    "kimi-k2.5":        ["chat", "tools", "vision", "code", "web-search"],
+    "kimi-k2.6":        ["chat", "tools", "vision", "code", "web-search"],
     "deepseek-v4-pro":  ["chat", "tools", "code"],
     "deepseek-v4-flash":["chat", "tools", "code"],
-    "mimo-v2-pro":      ["chat", "tools", "vision"],
+    "mimo-v2-pro":      ["chat", "tools"],
     "mimo-v2-omni":     ["chat", "tools", "vision"],
     "mimo-v2.5-pro":    ["chat", "tools", "vision"],
     "mimo-v2.5":        ["chat", "tools", "vision"],
     "minimax-m2.7":     ["chat", "tools", "vision"],
     "minimax-m2.5":     ["chat", "tools", "vision"],
-    "qwen3.6-plus":     ["chat", "tools", "vision"],
-    "qwen3.5-plus":     ["chat", "tools", "vision"],
+    "qwen3.6-plus":     ["chat", "tools", "vision", "code", "web-search"],
+    "qwen3.5-plus":     ["chat", "tools", "vision", "code", "web-search"],
 }
 
 # ── Per-model estimated request limits ──
