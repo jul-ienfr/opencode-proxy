@@ -21,8 +21,292 @@ const HTTP_STATUS_EXPLANATIONS = {
     530: 'Cloudflare 530 — origin DNS error (domain does not resolve)',
 };
 
+// ── i18n ──
+
+const LOCALE = {
+    en: {
+        'nav.stats': 'Token Stats',
+        'nav.logs': 'Logs',
+        'nav.quotas': 'Quotas',
+        'nav.config': 'Configuration',
+        'last.update': 'Last update: ',
+        'stats.overview': 'Overview',
+        'stats.input': 'Input',
+        'stats.output': 'Output',
+        'stats.cache': 'Cache',
+        'stats.total': 'Total Tokens',
+        'stats.success': 'Success',
+        'stats.failed': 'Failed',
+        'stats.avg_duration': 'Avg Duration (ms)',
+        'stats.requests': 'Total Requests',
+        'stats.by_model': 'By Model',
+        'stats.model': 'Model',
+        'stats.pct': '%',
+        'stats.no_data': 'No data',
+        'stats.loading': 'Loading...',
+        'filter.today': 'Today',
+        'filter.7d': '7 Days',
+        'filter.30d': '30 Days',
+        'filter.custom': 'Custom',
+        'filter.apply': 'Apply',
+        'filter.to': 'to',
+        'filter.now': 'now',
+        'logs.title': 'Request History',
+        'logs.time': 'Time',
+        'logs.original_model': 'Original Model',
+        'logs.mapped_model': 'Mapped Model',
+        'logs.thinking': 'Thinking',
+        'logs.effort': 'Effort',
+        'logs.duration': 'Duration (ms)',
+        'logs.status': 'Status',
+        'logs.no_data': 'No history',
+        'quotas.title': 'OpenCode Go Quotas',
+        'quotas.rolling': '5-Hour Rolling',
+        'quotas.weekly': 'Weekly',
+        'quotas.monthly': 'Monthly',
+        'quotas.not_configured': 'Quota tracking not configured. Add workspace credentials in Configuration -> API Keys.',
+        'quotas.error': 'Failed to load quota data.',
+        'quotas.last_updated': 'Last updated: ',
+        'quotas.resets_in': 'Resets in ',
+        'quotas.resetting': 'Resetting...',
+        'quotas.remaining': '% remaining',
+        'config.server': 'Server Settings',
+        'config.api_port': 'API Port',
+        'config.web_port': 'Web UI Port',
+        'config.bind_address': 'Bind Address',
+        'config.bind_lan': 'Local network (0.0.0.0)',
+        'config.bind_local': 'Local machine only (127.0.0.1)',
+        'config.key_routing': 'Key Routing',
+        'config.routing_rr': 'Round-Robin',
+        'config.routing_failover': 'Failover',
+        'config.save': 'Save Configuration',
+        'config.saved': 'Configuration updated.',
+        'proxy.running': 'Running',
+        'proxy.stopped': 'Stopped',
+        'proxy.start': 'Start',
+        'proxy.stop': 'Stop',
+        'proxy.restart_notice': 'Proxy restart required for port changes to take effect.',
+        'proxy.copy': 'Click to copy',
+        'proxy.copied': 'Copied!',
+        'config.model_mapping': 'Model Mapping',
+        'config.mapping_desc': 'Routes map Claude model names (opus, sonnet, haiku) to backend models.',
+        'config.disable_mapping': 'Disable model mapping (pass-through)',
+        'config.disable_mapping_hint': 'When enabled, the original model name is passed directly without mapping.',
+        'config.opus': 'Opus Route',
+        'config.sonnet': 'Sonnet Route',
+        'config.haiku': 'Haiku Route',
+        'config.custom_routes': 'Custom Mapping',
+        'config.custom_routes_desc': 'Add custom model name to backend model mappings. Match keywords are checked in order.',
+        'config.cr_match': 'Match Keyword',
+        'config.cr_backend': 'Backend Model',
+        'config.cr_add_btn': 'Add',
+        'config.cr_save': 'Save Custom Routes',
+        'config.cr_saved': 'Saved!',
+        'config.cr_no_routes': 'No custom routes',
+        'config.new_badge': 'NEW',
+        'config.cr_placeholder': 'e.g. nimo',
+        'config.cr_alert': 'Enter match keyword and select a backend model.',
+        'config.cr_select_model': 'Select model...',
+        'config.api_keys': 'API Keys',
+        'config.api_keys_desc': 'Configure API keys for upstream access. Each key can have its own Go workspace credentials.',
+        'config.ak_key': 'API Key',
+        'config.ak_workspace': 'Go Workspace ID',
+        'config.ak_cookie': 'Go Auth Cookie',
+        'config.ak_add': '+ Add Key',
+        'config.ak_save': 'Save API Keys',
+        'config.ak_saved': 'Saved!',
+        'config.ak_no_keys': 'No API keys configured',
+        'config.ak_delete': 'Delete',
+        'config.models': 'Available Models',
+        'config.model_id': 'Model ID',
+        'config.capabilities': 'Capabilities',
+        'config.protocol': 'Protocol',
+        'config.endpoint': 'Endpoint',
+        'config.limit_5h': '5h limit',
+        'config.limit_weekly': 'Weekly limit',
+        'config.limit_monthly': 'Monthly limit',
+        'config.models_hint': 'Estimated request limits based on your plan\'s dollar caps and per-model pricing.',
+        'config.see_docs': 'See docs',
+        'config.no_models': 'No models',
+        'page.of': 'Page {c} of {t}',
+        'page.prev': '« Previous',
+        'page.next': 'Next »',
+        'delete.history': 'Delete History',
+        'delete.all': 'Delete All',
+        'delete.before_date': 'Delete Before Date',
+        'delete.modal_title': 'Delete History Before',
+        'delete.confirm_all': 'Delete all history?',
+        'delete.confirm_before': 'Delete history before {d}?',
+        'lang.en': 'English',
+        'lang.fr': 'Français',
+        'show_hide': 'Show/hide',
+        'cap.chat': 'Chat',
+        'cap.vision': 'Vision',
+        'cap.tools': 'Tools',
+        'cap.code': 'Code',
+        'cap.web_search': 'Web',
+        'status.error': 'Error',
+        'cancel': 'Cancel',
+        'error.unknown': 'Unknown error',
+    },
+    fr: {
+        'nav.stats': 'Statistiques',
+        'nav.logs': 'Historique',
+        'nav.quotas': 'Quotas',
+        'nav.config': 'Configuration',
+        'last.update': 'Dernière mise à jour : ',
+        'stats.overview': 'Aperçu',
+        'stats.input': 'Entrée',
+        'stats.output': 'Sortie',
+        'stats.cache': 'Cache',
+        'stats.total': 'Total Tokens',
+        'stats.success': 'Succès',
+        'stats.failed': 'Échecs',
+        'stats.avg_duration': 'Durée moy. (ms)',
+        'stats.requests': 'Total Requêtes',
+        'stats.by_model': 'Par Modèle',
+        'stats.model': 'Modèle',
+        'stats.pct': ' %',
+        'stats.no_data': 'Aucune donnée',
+        'stats.loading': 'Chargement...',
+        'filter.today': "Aujourd'hui",
+        'filter.7d': '7 Jours',
+        'filter.30d': '30 Jours',
+        'filter.custom': 'Personnalisé',
+        'filter.apply': 'Appliquer',
+        'filter.to': 'au',
+        'filter.now': 'maintenant',
+        'logs.title': 'Historique des Requêtes',
+        'logs.time': 'Heure',
+        'logs.original_model': "Modèle d'origine",
+        'logs.mapped_model': 'Modèle mappé',
+        'logs.thinking': 'Réflexion',
+        'logs.effort': 'Effort',
+        'logs.duration': 'Durée (ms)',
+        'logs.status': 'Statut',
+        'logs.no_data': 'Aucun historique',
+        'quotas.title': 'Quotas OpenCode Go',
+        'quotas.rolling': 'Glissant 5h',
+        'quotas.weekly': 'Hebdomadaire',
+        'quotas.monthly': 'Mensuel',
+        'quotas.not_configured': 'Suivi des quotas non configuré. Ajoutez des identifiants dans Configuration → API Keys.',
+        'quotas.error': 'Échec du chargement des quotas.',
+        'quotas.last_updated': 'Dernière mise à jour : ',
+        'quotas.resets_in': 'Réinitialisation dans ',
+        'quotas.resetting': 'Réinitialisation...',
+        'quotas.remaining': '% restant',
+        'config.server': 'Paramètres Serveur',
+        'config.api_port': 'Port API',
+        'config.web_port': 'Port Interface Web',
+        'config.bind_address': 'Adresse de liaison',
+        'config.bind_lan': 'Réseau local (0.0.0.0)',
+        'config.bind_local': 'Machine uniquement (127.0.0.1)',
+        'config.key_routing': 'Routage des clés',
+        'config.routing_rr': 'Round-Robin',
+        'config.routing_failover': 'Failover',
+        'config.save': 'Sauvegarder',
+        'config.saved': 'Configuration mise à jour.',
+        'proxy.running': 'En cours',
+        'proxy.stopped': 'Arrêté',
+        'proxy.start': 'Démarrer',
+        'proxy.stop': 'Arrêter',
+        'proxy.restart_notice': 'Un redémarrage est nécessaire pour appliquer les changements de port.',
+        'proxy.copy': 'Cliquer pour copier',
+        'proxy.copied': 'Copié !',
+        'config.model_mapping': 'Mapping des Modèles',
+        'config.mapping_desc': 'Les routes associent les noms Claude (opus, sonnet, haiku) aux modèles backend.',
+        'config.disable_mapping': 'Désactiver le mapping (transparent)',
+        'config.disable_mapping_hint': 'Quand activé, le nom du modèle original est passé directement.',
+        'config.opus': 'Route Opus',
+        'config.sonnet': 'Route Sonnet',
+        'config.haiku': 'Route Haiku',
+        'config.custom_routes': 'Mapping Personnalisé',
+        'config.custom_routes_desc': 'Ajoutez des mappings personnalisés (vérifiés dans l\'ordre).',
+        'config.cr_match': 'Mot-clé',
+        'config.cr_backend': 'Modèle Backend',
+        'config.cr_add_btn': 'Ajouter',
+        'config.cr_save': 'Sauvegarder',
+        'config.cr_saved': 'Sauvegardé !',
+        'config.cr_no_routes': 'Aucun routage personnalisé',
+        'config.new_badge': 'NOUVEAU',
+        'config.cr_placeholder': 'ex: nimo',
+        'config.cr_alert': 'Entrez un mot-clé et sélectionnez un modèle.',
+        'config.cr_select_model': 'Sélectionner un modèle...',
+        'config.api_keys': 'Clés API',
+        'config.api_keys_desc': 'Configurez les clés API. Chaque clé peut avoir ses propres identifiants Go workspace.',
+        'config.ak_key': 'Clé API',
+        'config.ak_workspace': 'ID Workspace',
+        'config.ak_cookie': 'Cookie Auth',
+        'config.ak_add': '+ Ajouter',
+        'config.ak_save': 'Sauvegarder',
+        'config.ak_saved': 'Sauvegardé !',
+        'config.ak_no_keys': 'Aucune clé API configurée',
+        'config.ak_delete': 'Supprimer',
+        'config.models': 'Modèles Disponibles',
+        'config.model_id': 'ID du Modèle',
+        'config.capabilities': 'Capacités',
+        'config.protocol': 'Protocole',
+        'config.endpoint': 'Endpoint',
+        'config.limit_5h': 'Limite 5h',
+        'config.limit_weekly': 'Limite hebdo',
+        'config.limit_monthly': 'Limite mensuelle',
+        'config.models_hint': 'Limites estimées selon votre plan et le tarif par modèle.',
+        'config.see_docs': 'Voir docs',
+        'config.no_models': 'Aucun modèle',
+        'page.of': 'Page {c} sur {t}',
+        'page.prev': '« Précédent',
+        'page.next': 'Suivant »',
+        'delete.history': 'Supprimer',
+        'delete.all': 'Tout supprimer',
+        'delete.before_date': 'Supprimer avant le',
+        'delete.modal_title': 'Supprimer l\'historique avant le',
+        'delete.confirm_all': 'Supprimer tout l\'historique ?',
+        'delete.confirm_before': 'Supprimer l\'historique avant le {d} ?',
+        'lang.en': 'English',
+        'lang.fr': 'Français',
+        'show_hide': 'Afficher/masquer',
+        'cap.chat': 'Chat',
+        'cap.vision': 'Vision',
+        'cap.tools': 'Outils',
+        'cap.code': 'Code',
+        'cap.web_search': 'Web',
+        'status.error': 'Erreur',
+        'cancel': 'Annuler',
+        'error.unknown': 'Erreur inconnue',
+    },
+};
+
+let _lang = localStorage.getItem('lang') || 'en';
+
+function t(key) {
+    return LOCALE[_lang]?.[key] || LOCALE.en[key] || key;
+}
+
+function setLang(lang) {
+    _lang = lang;
+    localStorage.setItem('lang', lang);
+    document.documentElement.lang = lang;
+    // Re-translate static elements
+    document.querySelectorAll('[data-i18n]').forEach(el => {
+        el.textContent = t(el.dataset.i18n);
+    });
+    // Refresh views
+    const activeTab = document.querySelector('.tab.active');
+    if (activeTab) {
+        const target = activeTab.dataset.tab;
+        if (target === 'config') fetchConfig().then(renderConfig);
+        else if (target === 'quotas') fetchQuotas().then(renderQuotas);
+    }
+    refreshAll();
+}
+
+function getLang() {
+    return _lang;
+}
+
+
 function getErrorDetails(errorStr) {
-    if (!errorStr) return { short: 'Unknown error', explanation: '' };
+    if (!errorStr) return { short: t('error.unknown'), explanation: '' };
     const match = errorStr.match(/HTTP\s+(\d{3})/i);
     if (match) {
         const code = parseInt(match[1]);
@@ -117,7 +401,7 @@ async function fetchQuotas() {
 }
 
 function formatResetTime(seconds) {
-    if (seconds <= 0) return 'now';
+    if (seconds <= 0) return t('filter.now');
     const d = Math.floor(seconds / 86400);
     const h = Math.floor((seconds % 86400) / 3600);
     const m = Math.floor((seconds % 3600) / 60);
@@ -133,7 +417,7 @@ function renderQuotas(data) {
     const statusMsg = document.getElementById('quota-status-message');
 
     if (!data || Object.keys(data).length === 0) {
-        statusMsg.textContent = 'Quota tracking not configured. Add workspace credentials in Configuration -> API Keys.';
+        statusMsg.textContent = t('quotas.not_configured');
         container.innerHTML = '';
         return;
     }
@@ -151,7 +435,7 @@ function renderQuotas(data) {
 
         if (status === 'error' && !quotas.rolling && !quotas.weekly && !quotas.monthly) {
             allHtml += `<div class="quota-workspace">
-                <div class="quota-error">Workspace ${wsId.slice(0, 8)}...: Error — ${error}</div>
+                <div class="quota-error">${wsId.slice(0, 8)}...: ${t('status.error')} — ${error}</div>
             </div>`;
             continue;
         }
@@ -163,7 +447,7 @@ function renderQuotas(data) {
 
         // Per-workspace status message
         if (status === 'error') {
-            wsHtml += `<p class="config-hint" style="color:var(--danger)">Last fetch error: ${error}. Showing cached data.</p>`;
+            wsHtml += `<p class="config-hint" style="color:var(--danger)">${t('quotas.last_updated')}${error}.</p>`;
         }
 
         wsHtml += '<div class="quota-grid">';
@@ -173,9 +457,9 @@ function renderQuotas(data) {
             const remaining = (100 - pct).toFixed(1);
 
             const barClass = pct >= 85 ? 'quota-bar-danger' : pct >= 60 ? 'quota-bar-warning' : 'quota-bar-ok';
-            const label = period === 'rolling' ? '5-Hour Rolling' : period.charAt(0).toUpperCase() + period.slice(1);
+            const label = period === 'rolling' ? t('quotas.rolling') : period === 'weekly' ? t('quotas.weekly') : t('quotas.monthly');
             const resetSec = q.reset_in_sec || 0;
-            const resetText = resetSec > 0 ? 'Resets in ' + formatResetTime(resetSec) : '';
+            const resetText = resetSec > 0 ? t('quotas.resets_in') + formatResetTime(resetSec) : '';
             const resetTarget = resetSec > 0 ? Math.floor(Date.now() / 1000) + resetSec : '';
 
             wsHtml += `<div class="quota-item">
@@ -188,14 +472,14 @@ function renderQuotas(data) {
                 </div>
                 <div class="quota-stats">
                     <span class="quota-usage">${pct.toFixed(1)}%</span>
-                    <span class="quota-remaining">${remaining}% remaining</span>
+                    <span class="quota-remaining">${remaining}${t('quotas.remaining')}</span>
                 </div>
             </div>`;
         }
         wsHtml += '</div>';
 
         if (fetchedAt) {
-            wsHtml += `<div class="quota-footer"><span class="quota-fetched-at">Last updated: ${formatDateTime(fetchedAt)}</span></div>`;
+            wsHtml += `<div class="quota-footer"><span class="quota-fetched-at">${t('quotas.last_updated')}${formatDateTime(fetchedAt)}</span></div>`;
         }
 
         allHtml += `<div class="quota-workspace">${wsHtml}</div>`;
@@ -221,7 +505,7 @@ function renderStats(data) {
     const models = data.models;
 
     if (Object.keys(models).length === 0) {
-        tbody.innerHTML = '<tr><td colspan="9">No data</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="9">' + t('stats.no_data') + '</td></tr>';
         return;
     }
 
@@ -321,7 +605,7 @@ function renderCharts(data) {
 function renderHistory(data) {
     const tbody = document.getElementById('history-tbody');
     if (!data || data.logs.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="10">No history</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="10">' + t('logs.no_data') + '</td></tr>';
         updatePagination(1, 1);
         return;
     }
@@ -378,12 +662,12 @@ function renderConfig(data) {
 
     if (data.proxy_running) {
         statusDot.className = 'status-dot running';
-        statusText.textContent = 'Running';
+        statusText.textContent = t('proxy.running');
         btnStart.disabled = true;
         btnStop.disabled = false;
     } else {
         statusDot.className = 'status-dot stopped';
-        statusText.textContent = 'Stopped';
+        statusText.textContent = t('proxy.stopped');
         btnStart.disabled = false;
         btnStop.disabled = true;
     }
@@ -391,10 +675,10 @@ function renderConfig(data) {
     // Local address — click to copy
     const localUrl = `http://localhost:${data.port}`;
     statusAddr.textContent = localUrl;
-    statusAddr.title = 'Click to copy';
+    statusAddr.title = t('proxy.copy');
     statusAddr.onclick = () => {
         navigator.clipboard.writeText(localUrl).then(() => {
-            statusAddr.textContent = 'Copied!';
+            statusAddr.textContent = t('proxy.copied');
             setTimeout(() => { statusAddr.textContent = localUrl; }, 1500);
         }).catch(() => {});
     };
@@ -403,12 +687,12 @@ function renderConfig(data) {
     if (data.host === '0.0.0.0' && data.local_ip && data.local_ip !== '127.0.0.1') {
         const lanUrl = `http://${data.local_ip}:${data.port}`;
         statusLan.textContent = ' / ' + lanUrl;
-        statusLan.title = 'Click to copy';
+        statusLan.title = t('proxy.copy');
         statusLan.className = 'config-addr clickable';
         statusLan.style.display = '';
         statusLan.onclick = () => {
             navigator.clipboard.writeText(lanUrl).then(() => {
-                statusLan.textContent = ' / Copied!';
+                statusLan.textContent = ' / ' + t('proxy.copied');
                 setTimeout(() => { statusLan.textContent = ' / ' + lanUrl; }, 1500);
             }).catch(() => {});
         };
@@ -441,20 +725,20 @@ function renderConfig(data) {
 
     // Populate cr-model select in add section
     const crModelSelect = document.getElementById('cr-model');
-    crModelSelect.innerHTML = '<option value="">Select model...</option>' +
+    crModelSelect.innerHTML = '<option value="">' + t('config.cr_select_model') + '</option>' +
         modelIds.map(id => `<option value="${id}">${id}</option>`).join('');
 
     // Available models table
     const tbody = document.getElementById('models-tbody');
     const limits = data.model_limits || {};
     const caps = data.model_capabilities || {};
-    const capLabels = { chat: 'Chat', vision: 'Vision', tools: 'Tools', code: 'Code', 'web-search': 'Web' };
+    const capLabels = { chat: t('cap.chat'), vision: t('cap.vision'), tools: t('cap.tools'), code: t('cap.code'), 'web-search': t('cap.web_search') };
     let html = '';
     for (const [id, info] of Object.entries(data.models)) {
         const lim = limits[id] || [];
         const modelCaps = caps[id] || [];
         const capHtml = modelCaps.map(c => `<span class="cap-badge">${capLabels[c] || c}</span>`).join('') || '<span class="text-dim">-</span>';
-        const badge = info.source === 'upstream' ? ' <span class="new-badge">NEW</span>' : '';
+        const badge = info.source === 'upstream' ? ' <span class="new-badge">' + t('config.new_badge') + '</span>' : '';
         html += `<tr>
             <td><span class="clickable-model-id" data-id="${id}">${id}</span>${badge}</td>
             <td style="white-space:nowrap">${capHtml}</td>
@@ -465,7 +749,7 @@ function renderConfig(data) {
             <td>${lim[2] ? formatNumber(lim[2]) : '-'}</td>
         </tr>`;
     }
-    tbody.innerHTML = html || '<tr><td colspan="7">No models</td></tr>';
+    tbody.innerHTML = html || '<tr><td colspan="7">' + t('config.no_models') + '</td></tr>';
 
     // API keys table
     renderApiKeysTable(data.api_keys || []);
@@ -478,7 +762,7 @@ function renderCustomRoutes(routes, modelIds) {
     const tbody = document.getElementById('custom-routes-tbody');
     const entries = Object.entries(routes);
     if (entries.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="3">No custom routes</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="3">' + t('config.cr_no_routes') + '</td></tr>';
         return;
     }
     const opts = modelIds.map(id => `<option value="${id}">${id}</option>`).join('');
@@ -488,7 +772,7 @@ function renderCustomRoutes(routes, modelIds) {
         const model = info.model || '';
         html += `<tr>
             <td><input type="text" class="config-input cr-edit-match" value="${match}" style="width:100%"></td>
-            <td><select class="config-select cr-edit-model" style="width:100%"><option value="">Select...</option>${opts.replace(`value="${model}"`, `value="${model}" selected`)}</select></td>
+            <td><select class="config-select cr-edit-model" style="width:100%"><option value="">${t('config.cr_select_model')}</option>${opts.replace(`value="${model}"`, `value="${model}" selected`)}</select></td>
             <td><button class="btn btn-danger btn-sm cr-delete-btn" data-key="${key}">Delete</button></td>
         </tr>`;
     }
@@ -498,7 +782,7 @@ function renderCustomRoutes(routes, modelIds) {
 function renderApiKeysTable(apiKeys) {
     const tbody = document.getElementById('api-keys-tbody');
     if (!apiKeys || apiKeys.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="4">No API keys configured</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="4">' + t('config.ak_no_keys') + '</td></tr>';
         return;
     }
     tbody.innerHTML = apiKeys.map((k, i) => {
@@ -507,10 +791,10 @@ function renderApiKeysTable(apiKeys) {
         const wsPlaceholder = k.go_workspace_id_masked || ws.slice(0, 4) + '****' || '';
         const cookiePlaceholder = k.go_auth_cookie_masked || '****';
         return `<tr data-index="${i}">
-            <td><div class="api-key-row"><input type="password" class="config-input ak-key" value="${k.api_key || ''}" placeholder="${keyPlaceholder}" style="width:100%;font-family:monospace"><button class="btn btn-sm btn-toggle-secret" title="Show/hide">&#128065;</button></div></td>
+            <td><div class="api-key-row"><input type="password" class="config-input ak-key" value="${k.api_key || ''}" placeholder="${keyPlaceholder}" style="width:100%;font-family:monospace"><button class="btn btn-sm btn-toggle-secret" title="${t('show_hide')}">&#128065;</button></div></td>
             <td><input type="text" class="config-input ak-workspace" value="${ws}" style="width:100%"></td>
-            <td><div class="api-key-row"><input type="password" class="config-input ak-cookie" value="${k.go_auth_cookie || ''}" placeholder="${cookiePlaceholder}" style="width:100%;font-family:monospace"><button class="btn btn-sm btn-toggle-secret" title="Show/hide">&#128065;</button></div></td>
-            <td><button class="btn btn-danger btn-sm ak-delete-btn">Delete</button></td>
+            <td><div class="api-key-row"><input type="password" class="config-input ak-cookie" value="${k.go_auth_cookie || ''}" placeholder="${cookiePlaceholder}" style="width:100%;font-family:monospace"><button class="btn btn-sm btn-toggle-secret" title="${t('show_hide')}">&#128065;</button></div></td>
+            <td><button class="btn btn-danger btn-sm ak-delete-btn">${t('config.ak_delete')}</button></td>
         </tr>`;
     }).join('');
 }
@@ -520,7 +804,7 @@ function updatePagination(current, total) {
     const prevBtn = document.getElementById('prev-page');
     const nextBtn = document.getElementById('next-page');
 
-    pageInfo.textContent = `Page ${current} of ${total}`;
+    pageInfo.textContent = t('page.of').replace('{c}', current).replace('{t}', total);
     prevBtn.disabled = current <= 1;
     nextBtn.disabled = current >= total;
 }
@@ -629,7 +913,7 @@ function setupConfig() {
             });
             const result = await resp.json();
             document.getElementById('restart-notice').style.display = result.needs_restart ? '' : 'none';
-            saveStatus.textContent = result.message || 'Saved!';
+            saveStatus.textContent = result.message || t('config.saved');
             saveStatus.className = 'save-status success';
             setTimeout(() => { saveStatus.textContent = ''; }, 3000);
             // Refresh config display
@@ -660,15 +944,15 @@ function setupConfig() {
     document.getElementById('cr-add-btn').addEventListener('click', () => {
         const match = document.getElementById('cr-match').value.trim();
         const model = document.getElementById('cr-model').value;
-        if (!match || !model) { alert('Enter match keyword and select a backend model.'); return; }
+        if (!match || !model) { alert(t('config.cr_alert')); return; }
         const tbody = document.getElementById('custom-routes-tbody');
         const key = match.toLowerCase().replace(/[^a-z0-9]/g, '');
         const opts = availableModels.map(id => `<option value="${id}" ${id === model ? 'selected' : ''}>${id}</option>`).join('');
         const row = document.createElement('tr');
         row.id = `cr-row-${key}`;
         row.innerHTML = `<td><input type="text" class="config-input cr-edit-match" value="${match}" style="width:100%"></td>
-            <td><select class="config-select cr-edit-model" style="width:100%"><option value="">Select...</option>${opts}</select></td>
-            <td><button class="btn btn-danger btn-sm cr-delete-btn" data-key="${key}">Delete</button></td>`;
+            <td><select class="config-select cr-edit-model" style="width:100%"><option value="">${t('config.cr_select_model')}</option>${opts}</select></td>
+            <td><button class="btn btn-danger btn-sm cr-delete-btn" data-key="${key}">${t('config.ak_delete')}</button></td>`;
         // Remove empty state
         if (tbody.querySelector('td[colspan]')) tbody.innerHTML = '';
         tbody.appendChild(row);
@@ -684,7 +968,7 @@ function setupConfig() {
         if (row) row.remove();
         const tbody = document.getElementById('custom-routes-tbody');
         if (!tbody.querySelector('tr')) {
-            tbody.innerHTML = '<tr><td colspan="3">No custom routes</td></tr>';
+            tbody.innerHTML = '<tr><td colspan="3">' + t('config.cr_no_routes') + '</td></tr>';
         }
     });
 
@@ -711,7 +995,7 @@ function setupConfig() {
                 body: JSON.stringify(routes),
             });
             const result = await resp.json();
-            status.textContent = 'Saved!';
+            status.textContent = t('config.cr_saved');
             status.className = 'save-status success';
             setTimeout(() => { status.textContent = ''; }, 3000);
             fetchConfig().then(renderConfig);
@@ -731,10 +1015,10 @@ function setupConfig() {
         if (emptyRow) tbody.innerHTML = '';
         const tr = document.createElement('tr');
         tr.innerHTML = `
-            <td><div class="api-key-row"><input type="password" class="config-input ak-key" placeholder="sk-..." style="width:100%;font-family:monospace"><button class="btn btn-sm btn-toggle-secret" title="Show/hide">&#128065;</button></div></td>
+            <td><div class="api-key-row"><input type="password" class="config-input ak-key" placeholder="sk-..." style="width:100%;font-family:monospace"><button class="btn btn-sm btn-toggle-secret" title="${t('show_hide')}">&#128065;</button></div></td>
             <td><input type="text" class="config-input ak-workspace" placeholder="wrk_..." style="width:100%"></td>
-            <td><div class="api-key-row"><input type="password" class="config-input ak-cookie" placeholder="Fe26.2..." style="width:100%;font-family:monospace"><button class="btn btn-sm btn-toggle-secret" title="Show/hide">&#128065;</button></div></td>
-            <td><button class="btn btn-danger btn-sm ak-delete-btn">Delete</button></td>
+            <td><div class="api-key-row"><input type="password" class="config-input ak-cookie" placeholder="Fe26.2..." style="width:100%;font-family:monospace"><button class="btn btn-sm btn-toggle-secret" title="${t('show_hide')}">&#128065;</button></div></td>
+            <td><button class="btn btn-danger btn-sm ak-delete-btn">${t('config.ak_delete')}</button></td>
         `;
         tbody.appendChild(tr);
     });
@@ -747,7 +1031,7 @@ function setupConfig() {
         if (row) row.remove();
         const tbody = document.getElementById('api-keys-tbody');
         if (!tbody.querySelector('tr')) {
-            tbody.innerHTML = '<tr><td colspan="4">No API keys configured</td></tr>';
+            tbody.innerHTML = '<tr><td colspan="4">' + t('config.ak_no_keys') + '</td></tr>';
         }
     });
 
@@ -786,7 +1070,7 @@ function setupConfig() {
                 body: JSON.stringify({ api_keys: keys }),
             });
             const result = await resp.json();
-            status.textContent = 'Saved!';
+            status.textContent = t('config.ak_saved');
             status.className = 'save-status success';
             setTimeout(() => { status.textContent = ''; }, 3000);
             fetchConfig().then(renderConfig);
@@ -808,7 +1092,7 @@ async function refreshAll() {
     renderCharts(stats);
     renderHistory(history);
     renderQuotas(quotas);
-    document.getElementById('last-update').textContent = `Last update: ${formatTime()}`;
+    document.getElementById('last-update').textContent = t('last.update') + formatTime();
 }
 
 async function loadHistory() {
@@ -850,6 +1134,18 @@ document.addEventListener('DOMContentLoaded', () => {
     setupFilter();
     setupConfig();
     refreshAll();
+
+    // Language selector
+    const langSelect = document.getElementById('lang-select');
+    if (langSelect) {
+        langSelect.value = getLang();
+        langSelect.addEventListener('change', () => setLang(langSelect.value));
+    }
+
+    // Apply initial language to static elements
+    document.querySelectorAll('[data-i18n]').forEach(el => {
+        el.textContent = t(el.dataset.i18n);
+    });
 
     // ── SSE real-time updates ──
     let eventSource = null;
@@ -913,7 +1209,7 @@ document.addEventListener('DOMContentLoaded', () => {
             const target = parseInt(el.dataset.resetTarget || '0', 10);
             if (!target) return;
             const remaining = target - Math.floor(Date.now() / 1000);
-            el.textContent = remaining <= 0 ? 'Resetting...' : 'Resets in ' + formatResetTime(remaining);
+            el.textContent = remaining <= 0 ? t('quotas.resetting') : t('quotas.resets_in') + formatResetTime(remaining);
         });
     }, 1000);
 
@@ -926,7 +1222,7 @@ document.addEventListener('DOMContentLoaded', () => {
     });
 
     document.getElementById('delete-all-opt').addEventListener('click', () => {
-        if (confirm('Delete all history?')) {
+        if (confirm(t('delete.confirm_all'))) {
             deleteHistory(null, true);
         }
         deleteMenu.style.display = 'none';
@@ -940,7 +1236,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     document.getElementById('modal-delete-btn').addEventListener('click', () => {
         const d = document.getElementById('delete-date').value;
-        if (d && confirm(`Delete history before ${d}?`)) {
+        if (d && confirm(t('delete.confirm_before').replace('{d}', d))) {
             deleteHistory(d);
         }
         document.getElementById('delete-modal').style.display = 'none';
@@ -979,7 +1275,7 @@ document.addEventListener('DOMContentLoaded', () => {
         if (!id) return;
         navigator.clipboard.writeText(id).then(() => {
             const orig = el.textContent;
-            el.textContent = '✓ Copied';
+            el.textContent = '✓ ' + t('proxy.copied');
             el.style.color = 'var(--success)';
             setTimeout(() => {
                 el.textContent = orig;

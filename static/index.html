@@ -9,64 +9,70 @@
 <body>
     <div class="container">
         <header>
-            <h1>OpenCode Dashboard</h1>
+            <h1>OpenCode Proxy</h1>
+            <div class="header-controls">
+                <select id="lang-select" class="lang-select" title="Language">
+                    <option value="en" data-i18n="lang.en">English</option>
+                    <option value="fr" data-i18n="lang.fr">Français</option>
+                </select>
+                <button class="theme-toggle" id="theme-toggle" title="Toggle theme">&#9784;</button>
+            </div>
         </header>
-        <button class="theme-toggle" id="theme-toggle" title="Toggle theme">&#9784;</button>
 
         <div class="filter-bar">
             <nav class="tabs">
-                <button class="tab active" data-tab="stats">Token Stats</button>
-                <button class="tab" data-tab="logs">Logs</button>
-                <button class="tab" data-tab="quotas">Quotas</button>
-                <button class="tab" data-tab="config">Configuration</button>
+                <button class="tab active" data-tab="stats" data-i18n="nav.stats">Token Stats</button>
+                <button class="tab" data-tab="logs" data-i18n="nav.logs">Logs</button>
+                <button class="tab" data-tab="quotas" data-i18n="nav.quotas">Quotas</button>
+                <button class="tab" data-tab="config" data-i18n="nav.config">Configuration</button>
             </nav>
             <div class="filter-controls">
-                <button class="btn active" data-range="today">Today</button>
-                <button class="btn" data-range="7d">7 Days</button>
-                <button class="btn" data-range="30d">30 Days</button>
-                <button class="btn" data-range="custom">Custom</button>
+                <button class="btn active" data-range="today" data-i18n="filter.today">Today</button>
+                <button class="btn" data-range="7d" data-i18n="filter.7d">7 Days</button>
+                <button class="btn" data-range="30d" data-i18n="filter.30d">30 Days</button>
+                <button class="btn" data-range="custom" data-i18n="filter.custom">Custom</button>
                 <input type="date" id="from-date" class="date-input" style="display:none">
-                <span id="date-sep" style="display:none">to</span>
+                <span id="date-sep" style="display:none" data-i18n="filter.to">to</span>
                 <input type="date" id="to-date" class="date-input" style="display:none">
-                <button class="btn" id="apply-filter" style="display:none">Apply</button>
+                <button class="btn" id="apply-filter" style="display:none" data-i18n="filter.apply">Apply</button>
             </div>
         </div>
 
         <main>
             <section id="stats" class="tab-content active">
                 <div class="card">
-                    <h2>Overview</h2>
+                    <h2 data-i18n="stats.overview">Overview</h2>
                     <div class="totals">
                         <div class="stat-box">
-                            <span class="label">Input</span>
+                            <span class="label" data-i18n="stats.input">Input</span>
                             <span class="value" id="total-input">0</span>
                         </div>
                         <div class="stat-box">
-                            <span class="label">Output</span>
+                            <span class="label" data-i18n="stats.output">Output</span>
                             <span class="value" id="total-output">0</span>
                         </div>
                         <div class="stat-box">
-                            <span class="label">Cache</span>
+                            <span class="label" data-i18n="stats.cache">Cache</span>
                             <span class="value" id="total-cache">0</span>
                         </div>
                         <div class="stat-box highlight">
-                            <span class="label">Total Tokens</span>
+                            <span class="label" data-i18n="stats.total">Total Tokens</span>
                             <span class="value" id="total-all">0</span>
                         </div>
                         <div class="stat-box">
-                            <span class="label">Success</span>
+                            <span class="label" data-i18n="stats.success">Success</span>
                             <span class="value status-ok" id="total-success">0</span>
                         </div>
                         <div class="stat-box">
-                            <span class="label">Failed</span>
+                            <span class="label" data-i18n="stats.failed">Failed</span>
                             <span class="value status-fail" id="total-fail">0</span>
                         </div>
                         <div class="stat-box">
-                            <span class="label">Avg Duration (ms)</span>
+                            <span class="label" data-i18n="stats.avg_duration">Avg Duration (ms)</span>
                             <span class="value" id="avg-duration">0</span>
                         </div>
                         <div class="stat-box highlight">
-                            <span class="label">Total Requests</span>
+                            <span class="label" data-i18n="stats.requests">Total Requests</span>
                             <span class="value" id="total-requests">0</span>
                         </div>
                     </div>
@@ -74,37 +80,37 @@
 
                 <div class="charts-row">
                     <div class="card chart-card">
-                        <h2>Token Distribution</h2>
+                        <h2 data-i18n="chart.token_dist">Token Distribution</h2>
                         <canvas id="chart-tokens" width="300" height="300"></canvas>
                     </div>
                     <div class="card chart-card">
-                        <h2>Token % by Model</h2>
+                        <h2 data-i18n="chart.token_pct">Token % by Model</h2>
                         <canvas id="chart-model-tokens" width="300" height="300"></canvas>
                     </div>
                     <div class="card chart-card">
-                        <h2>Requests % by Model</h2>
+                        <h2 data-i18n="chart.req_pct">Requests % by Model</h2>
                         <canvas id="chart-model-requests" width="300" height="300"></canvas>
                     </div>
                 </div>
 
                 <div class="card">
-                    <h2>By Model</h2>
+                    <h2 data-i18n="stats.by_model">By Model</h2>
                     <table id="model-table">
                         <thead>
                             <tr>
-                                <th>Model</th>
-                                <th>Input</th>
-                                <th>Output</th>
-                                <th>Cache</th>
-                                <th>Total</th>
-                                <th>%</th>
-                                <th>Success</th>
-                                <th>Failed</th>
-                                <th>Avg Duration (ms)</th>
+                                <th data-i18n="stats.model">Model</th>
+                                <th data-i18n="stats.input">Input</th>
+                                <th data-i18n="stats.output">Output</th>
+                                <th data-i18n="stats.cache">Cache</th>
+                                <th data-i18n="stats.total">Total</th>
+                                <th data-i18n="stats.pct">%</th>
+                                <th data-i18n="stats.success">Success</th>
+                                <th data-i18n="stats.failed">Failed</th>
+                                <th data-i18n="stats.avg_duration">Avg Duration (ms)</th>
                             </tr>
                         </thead>
                         <tbody id="model-tbody">
-                            <tr><td colspan="9">Loading...</td></tr>
+                            <tr><td colspan="9" data-i18n="stats.loading">Loading...</td></tr>
                         </tbody>
                     </table>
                 </div>
@@ -112,30 +118,30 @@
 
             <section id="logs" class="tab-content">
                 <div class="card">
-                    <h2>Request History</h2>
+                    <h2 data-i18n="logs.title">Request History</h2>
                     <table id="history-table">
                         <thead>
                             <tr>
-                                <th>Time</th>
-                                <th>Original Model</th>
-                                <th>Mapped Model</th>
-                                <th>Input</th>
-                                <th>Output</th>
-                                <th>Cache</th>
-                                <th>Thinking</th>
-                                <th>Effort</th>
-                                <th>Duration (ms)</th>
-                                <th>Status</th>
+                                <th data-i18n="logs.time">Time</th>
+                                <th data-i18n="logs.original_model">Original Model</th>
+                                <th data-i18n="logs.mapped_model">Mapped Model</th>
+                                <th data-i18n="stats.input">Input</th>
+                                <th data-i18n="stats.output">Output</th>
+                                <th data-i18n="stats.cache">Cache</th>
+                                <th data-i18n="logs.thinking">Thinking</th>
+                                <th data-i18n="logs.effort">Effort</th>
+                                <th data-i18n="logs.duration">Duration (ms)</th>
+                                <th data-i18n="logs.status">Status</th>
                             </tr>
                         </thead>
                         <tbody id="history-tbody">
-                            <tr><td colspan="10">Loading...</td></tr>
+                            <tr><td colspan="10" data-i18n="stats.loading">Loading...</td></tr>
                         </tbody>
                     </table>
                     <div class="pagination" id="pagination">
-                        <button class="btn" id="prev-page">&laquo; Previous</button>
+                        <button class="btn" id="prev-page" data-i18n="page.prev">&laquo; Previous</button>
                         <span id="page-info">Page 1</span>
-                        <button class="btn" id="next-page">Next &raquo;</button>
+                        <button class="btn" id="next-page" data-i18n="page.next">Next &raquo;</button>
                     </div>
                 </div>
             </section>
@@ -151,74 +157,74 @@
             <section id="config" class="tab-content">
                 <!-- Server Settings -->
                 <div class="card">
-                    <h2>Server Settings</h2>
+                    <h2 data-i18n="config.server">Server Settings</h2>
                     <div class="config-row" style="margin-bottom:18px">
                         <div class="config-status">
                             <span id="proxy-status-dot" class="status-dot running"></span>
-                            <span id="proxy-status-text">Running</span>
+                            <span id="proxy-status-text" data-i18n="proxy.running">Running</span>
                             <span id="proxy-status-addr" class="config-addr clickable"></span>
                             <span id="proxy-status-lan" class="config-addr" style="display:none"></span>
                         </div>
                         <div class="config-actions">
-                            <button class="btn" id="btn-proxy-start" disabled>Start</button>
-                            <button class="btn btn-danger" id="btn-proxy-stop">Stop</button>
+                            <button class="btn" id="btn-proxy-start" disabled data-i18n="proxy.start">Start</button>
+                            <button class="btn btn-danger" id="btn-proxy-stop" data-i18n="proxy.stop">Stop</button>
                         </div>
                     </div>
-                    <div id="restart-notice" class="notice" style="display:none;margin-bottom:16px">
+                    <div id="restart-notice" class="notice" style="display:none;margin-bottom:16px" data-i18n="proxy.restart_notice">
                         Proxy restart required for port changes to take effect.
                     </div>
                     <div class="config-grid">
                         <div class="config-field">
-                            <label for="cfg-port">API Port</label>
+                            <label for="cfg-port" data-i18n="config.api_port">API Port</label>
                             <input type="number" id="cfg-port" class="config-input" min="1" max="65535">
                         </div>
                         <div class="config-field">
-                            <label for="cfg-web-port">Web UI Port</label>
+                            <label for="cfg-web-port" data-i18n="config.web_port">Web UI Port</label>
                             <input type="number" id="cfg-web-port" class="config-input" min="1" max="65535">
                         </div>
                         <div class="config-field">
-                            <label for="cfg-bind-address">Bind Address</label>
+                            <label for="cfg-bind-address" data-i18n="config.bind_address">Bind Address</label>
                             <select id="cfg-bind-address" class="config-select">
-                                <option value="0.0.0.0">Local network (0.0.0.0)</option>
-                                <option value="127.0.0.1">Local machine only (127.0.0.1)</option>
+                                <option value="0.0.0.0" data-i18n="config.bind_lan">Local network (0.0.0.0)</option>
+                                <option value="127.0.0.1" data-i18n="config.bind_local">Local machine only (127.0.0.1)</option>
                             </select>
                         </div>
                         <div class="config-field">
-                            <label for="cfg-routing">Key Routing</label>
+                            <label for="cfg-routing" data-i18n="config.key_routing">Key Routing</label>
                             <select id="cfg-routing" class="config-select">
-                                <option value="round-robin">Round-Robin</option>
-                                <option value="failover">Failover</option>
+                                <option value="round-robin" data-i18n="config.routing_rr">Round-Robin</option>
+                                <option value="failover" data-i18n="config.routing_failover">Failover</option>
                             </select>
                         </div>
                     </div>
                     <div class="config-actions" style="margin-top: 15px;">
-                        <button class="btn btn-primary" id="btn-save-config">Save Configuration</button>
+                        <button class="btn btn-primary" id="btn-save-config" data-i18n="config.save">Save Configuration</button>
                         <span id="config-save-status" class="save-status"></span>
                     </div>
                 </div>
 
                 <!-- Model mapping -->
                 <div class="card">
-                    <h2>Model Mapping</h2>
-                    <p class="config-hint">Routes map Claude model names (opus, sonnet, haiku) to backend models.</p>
+                    <h2 data-i18n="config.model_mapping">Model Mapping</h2>
+                    <p class="config-hint" data-i18n="config.mapping_desc">Routes map Claude model names (opus, sonnet, haiku) to backend models.</p>
                     <div class="config-field" style="margin-bottom: 15px;">
                         <label class="checkbox-label">
                             <input type="checkbox" id="cfg-disable-mapping">
-                            <span>Disable model mapping (pass-through)</span>
+                            <span data-i18n="config.disable_mapping">Disable model mapping (pass-through)</span>
                         </label>
-                        <p class="config-hint">When enabled, the original model name is passed directly without mapping.</p>
+                        <p class="config-hint" data-i18n="config.disable_mapping_hint">When enabled, the original model name is passed directly without mapping.</p>
                     </div>
                     <div class="config-grid" id="mapping-grid">
                         <div class="config-field">
-                            <label for="route-opus">Opus Route</label>
+                            <label for="route-opus" data-i18n="config.opus">Opus Route</label>
                             <select id="route-opus" class="config-select"></select>
                         </div>
                         <div class="config-field">
-                            <label for="route-sonnet">Sonnet Route</label>
+                            <label for="route-sonnet" data-i18n="config.sonnet">Sonnet Route</label>
                             <select id="route-sonnet" class="config-select"></select>
                         </div>
                         <div class="config-field">
-                            <label for="route-haiku">Haiku Route</label>
+                            <label for="route-haiku" data-i18n="config.haiku">Haiku Route</label>
                             <select id="route-haiku" class="config-select"></select>
                         </div>
                     </div>
@@ -226,101 +232,101 @@
 
                 <!-- Custom mapping -->
                 <div class="card">
-                    <h2>Custom Mapping</h2>
-                    <p class="config-hint">Add custom model name to backend model mappings. Match keywords are checked in order.</p>
+                    <h2 data-i18n="config.custom_routes">Custom Mapping</h2>
+                    <p class="config-hint" data-i18n="config.custom_routes_desc">Add custom model name to backend model mappings. Match keywords are checked in order.</p>
                     <div class="custom-routes-table">
                         <table id="custom-routes-table">
                             <thead>
                                 <tr>
-                                    <th>Match Keyword</th>
-                                    <th>Backend Model</th>
+                                    <th data-i18n="config.cr_match">Match Keyword</th>
+                                    <th data-i18n="config.cr_backend">Backend Model</th>
                                     <th></th>
                                 </tr>
                             </thead>
                             <tbody id="custom-routes-tbody">
-                                <tr><td colspan="3">No custom routes</td></tr>
+                                <tr><td colspan="3" data-i18n="config.cr_no_routes">No custom routes</td></tr>
                             </tbody>
                         </table>
                     </div>
                     <div class="custom-route-add">
                         <input type="text" id="cr-match" class="config-input" placeholder="e.g. nimo">
-                        <select id="cr-model" class="config-select"><option value="">Select model...</option></select>
-                        <button class="btn" id="cr-add-btn">Add</button>
+                        <select id="cr-model" class="config-select"><option value="" data-i18n="config.cr_select_model">Select model...</option></select>
+                        <button class="btn" id="cr-add-btn" data-i18n="config.cr_add_btn">Add</button>
                     </div>
                     <div class="config-actions" style="margin-top: 10px;">
-                        <button class="btn btn-primary" id="cr-save-btn">Save Custom Routes</button>
+                        <button class="btn btn-primary" id="cr-save-btn" data-i18n="config.cr_save">Save Custom Routes</button>
                         <span id="cr-save-status" class="save-status"></span>
                     </div>
                 </div>
 
                 <!-- API Keys -->
                 <div class="card">
-                    <h2>API Keys</h2>
-                    <p class="config-hint">Configure API keys for upstream access. Each key can have its own Go workspace credentials for per-workspace quota tracking.</p>
+                    <h2 data-i18n="config.api_keys">API Keys</h2>
+                    <p class="config-hint" data-i18n="config.api_keys_desc">Configure API keys for upstream access. Each key can have its own Go workspace credentials.</p>
                     <div class="api-keys-table">
                         <table id="api-keys-table">
                             <thead>
                                 <tr>
-                                    <th>API Key</th>
-                                    <th>Go Workspace ID</th>
-                                    <th>Go Auth Cookie</th>
+                                    <th data-i18n="config.ak_key">API Key</th>
+                                    <th data-i18n="config.ak_workspace">Go Workspace ID</th>
+                                    <th data-i18n="config.ak_cookie">Go Auth Cookie</th>
                                     <th style="width:70px"></th>
                                 </tr>
                             </thead>
                             <tbody id="api-keys-tbody">
-                                <tr><td colspan="4">No API keys configured</td></tr>
+                                <tr><td colspan="4" data-i18n="config.ak_no_keys">No API keys configured</td></tr>
                             </tbody>
                         </table>
                     </div>
                     <div class="config-actions" style="margin-top:10px;gap:8px">
-                        <button class="btn" id="api-key-add-btn">+ Add Key</button>
-                        <button class="btn btn-primary" id="api-key-save-btn">Save API Keys</button>
+                        <button class="btn" id="api-key-add-btn" data-i18n="config.ak_add">+ Add Key</button>
+                        <button class="btn btn-primary" id="api-key-save-btn" data-i18n="config.ak_save">Save API Keys</button>
                         <span id="api-key-save-status" class="save-status"></span>
                     </div>
                 </div>
 
                 <!-- Available models -->
                 <div class="card">
-                    <h2>Available Models</h2>
+                    <h2 data-i18n="config.models">Available Models</h2>
                     <table id="models-table">
                         <thead>
                             <tr>
-                                <th>Model ID</th>
-                                <th>Capabilities</th>
-                                <th>Protocol</th>
-                                <th>Endpoint</th>
-                                <th>5h limit</th>
-                                <th>Weekly limit</th>
-                                <th>Monthly limit</th>
+                                <th data-i18n="config.model_id">Model ID</th>
+                                <th data-i18n="config.capabilities">Capabilities</th>
+                                <th data-i18n="config.protocol">Protocol</th>
+                                <th data-i18n="config.endpoint">Endpoint</th>
+                                <th data-i18n="config.limit_5h">5h limit</th>
+                                <th data-i18n="config.limit_weekly">Weekly limit</th>
+                                <th data-i18n="config.limit_monthly">Monthly limit</th>
                             </tr>
                         </thead>
                         <tbody id="models-tbody">
-                            <tr><td colspan="7">Loading...</td></tr>
+                            <tr><td colspan="7" data-i18n="stats.loading">Loading...</td></tr>
                         </tbody>
                     </table>
-                    <p class="config-hint" style="margin-top:8px">Estimated request limits per time window based on your plan's dollar caps and per-model pricing. <a href="https://opencode.ai/docs/fr/go/#usage-limits" target="_blank">See docs</a></p>
+                    <p class="config-hint" style="margin-top:8px"><span data-i18n="config.models_hint">Estimated request limits based on your plan's dollar caps and per-model pricing.</span> <a href="https://opencode.ai/docs/fr/go/#usage-limits" target="_blank" data-i18n="config.see_docs">See docs</a></p>
                 </div>
             </section>
         </main>
 
         <footer>
-            <span id="last-update">Last update: --</span>
+            <span id="last-update"><span data-i18n="last.update">Last update: </span>--</span>
             <div class="delete-section">
                 <div class="delete-menu" id="delete-menu" style="display:none">
-                    <button class="delete-option" id="delete-all-opt">Delete All</button>
-                    <button class="delete-option" id="delete-by-date-opt">Delete Before Date</button>
+                    <button class="delete-option" id="delete-all-opt" data-i18n="delete.all">Delete All</button>
+                    <button class="delete-option" id="delete-by-date-opt" data-i18n="delete.before_date">Delete Before Date</button>
                 </div>
-                <button class="btn btn-danger" id="delete-btn">Delete History</button>
+                <button class="btn btn-danger" id="delete-btn" data-i18n="delete.history">Delete History</button>
             </div>
         </footer>
 
         <div class="modal-overlay" id="delete-modal" style="display:none">
             <div class="modal">
-                <h3>Delete History Before</h3>
+                <h3 data-i18n="delete.modal_title">Delete History Before</h3>
                 <input type="date" id="delete-date" class="date-input modal-date">
                 <div class="modal-buttons">
-                    <button class="btn btn-danger" id="modal-delete-btn">Delete</button>
-                    <button class="btn" id="modal-cancel-btn">Cancel</button>
+                    <button class="btn btn-danger" id="modal-delete-btn" data-i18n="delete.all">Delete</button>
+                    <button class="btn" id="modal-cancel-btn" data-i18n="cancel">Cancel</button>
                 </div>
             </div>
         </div>
