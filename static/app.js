@@ -399,8 +399,8 @@ function renderConfig(data) {
         }).catch(() => {});
     };
 
-    // LAN address
-    if (data.local_ip && data.local_ip !== '127.0.0.1') {
+    // LAN address — only show when bind is 0.0.0.0
+    if (data.host === '0.0.0.0' && data.local_ip && data.local_ip !== '127.0.0.1') {
         const lanUrl = `http://${data.local_ip}:${data.port}`;
         statusLan.textContent = ' / ' + lanUrl;
         statusLan.title = 'Click to copy';
@@ -591,6 +591,18 @@ function setupConfig() {
             f.disabled = disableMapping.checked;
             f.style.opacity = disableMapping.checked ? '0.4' : '1';
         });
+    });
+
+    // Bind address change → toggle LAN address visibility
+    document.getElementById('cfg-bind-address').addEventListener('change', function () {
+        const lanEl = document.getElementById('proxy-status-lan');
+        if (!lanEl) return;
+        if (this.value === '0.0.0.0') {
+            // Re-render to show LAN addr if available
+            fetchConfig().then(renderConfig);
+        } else {
+            lanEl.style.display = 'none';
+        }
     });
 
     // Save config
