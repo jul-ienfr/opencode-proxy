@@ -419,7 +419,6 @@ function renderConfig(data) {
     // Port settings
     document.getElementById('cfg-port').value = data.port;
     document.getElementById('cfg-web-port').value = data.web_port;
-    document.getElementById('cfg-proxy').value = data.proxy || '';
     document.getElementById('cfg-bind-address').value = data.host || '0.0.0.0';
     document.getElementById('cfg-routing').value = data.routing || 'round-robin';
     document.getElementById('cfg-disable-mapping').checked = data.disable_mapping || false;
@@ -608,7 +607,6 @@ function setupConfig() {
             web_port: parseInt(document.getElementById('cfg-web-port').value),
             host: document.getElementById('cfg-bind-address').value,
             routing: document.getElementById('cfg-routing').value,
-            proxy: document.getElementById('cfg-proxy').value,
             disable_mapping: document.getElementById('cfg-disable-mapping').checked,
         };
         try {
