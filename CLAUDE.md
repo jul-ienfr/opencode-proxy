@@ -36,6 +36,49 @@ Optional server overrides:
 - `OPENCODE_PORT` - API port (default: `4000`)
 - `OPENCODE_WEB_PORT` - Web UI port (default: `8082`)
 
+## Deployment (Ubuntu Server)
+
+### Option 1: systemd service
+
+```bash
+# Create user
+sudo useradd -r -s /bin/false opencode
+
+# Clone and setup
+sudo mkdir -p /opt/opencode-proxy
+sudo cp -r . /opt/opencode-proxy/
+cd /opt/opencode-proxy
+sudo python3 -m venv .venv
+sudo .venv/bin/pip install -r requirements.txt
+sudo cp .env.example .env
+# Edit .env with your config
+
+# Install service
+sudo cp opencode.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable opencode
+sudo systemctl start opencode
+
+# Check status
+sudo systemctl status opencode
+```
+
+### Option 2: Docker
+
+```bash
+# Build
+docker build -t opencode-proxy .
+
+# Run (mount .env for config persistence)
+docker run -d \
+  --name opencode-proxy \
+  -p 4000:4000 \
+  -p 8082:8082 \
+  -v $(pwd)/.env:/app/.env \
+  -v opencode-logs:/app/logs \
+  opencode-proxy
+```
+
 ## Architecture
 
 ### Entry Point
