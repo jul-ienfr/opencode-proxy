@@ -1,0 +1,8 @@
+{
+  "kimik25": {
+    "match": [
+      "kimi-k2.5"
+    ],
+    "model": "deepseek-v4-flash"
+  }
+}

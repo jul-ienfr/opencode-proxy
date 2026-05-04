@@ -1,0 +1,361 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>OpenCode Dashboard</title>
+    <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>OpenCode Dashboard</h1>
+        </header>
+        <button class="theme-toggle" id="theme-toggle" title="Toggle theme">&#9784;</button>
+
+        <div class="filter-bar">
+            <nav class="tabs">
+                <button class="tab active" data-tab="stats">Token Stats</button>
+                <button class="tab" data-tab="logs">Logs</button>
+                <button class="tab" data-tab="quotas">Quotas</button>
+                <button class="tab" data-tab="config">Configuration</button>
+            </nav>
+            <div class="filter-controls">
+                <button class="btn active" data-range="today">Today</button>
+                <button class="btn" data-range="7d">7 Days</button>
+                <button class="btn" data-range="30d">30 Days</button>
+                <button class="btn" data-range="custom">Custom</button>
+                <input type="date" id="from-date" class="date-input" style="display:none">
+                <span id="date-sep" style="display:none">to</span>
+                <input type="date" id="to-date" class="date-input" style="display:none">
+                <button class="btn" id="apply-filter" style="display:none">Apply</button>
+            </div>
+        </div>
+
+        <main>
+            <section id="stats" class="tab-content active">
+                <div class="card">
+                    <h2>Overview</h2>
+                    <div class="totals">
+                        <div class="stat-box">
+                            <span class="label">Input</span>
+                            <span class="value" id="total-input">0</span>
+                        </div>
+                        <div class="stat-box">
+                            <span class="label">Output</span>
+                            <span class="value" id="total-output">0</span>
+                        </div>
+                        <div class="stat-box">
+                            <span class="label">Cache</span>
+                            <span class="value" id="total-cache">0</span>
+                        </div>
+                        <div class="stat-box highlight">
+                            <span class="label">Total Tokens</span>
+                            <span class="value" id="total-all">0</span>
+                        </div>
+                        <div class="stat-box">
+                            <span class="label">Success</span>
+                            <span class="value status-ok" id="total-success">0</span>
+                        </div>
+                        <div class="stat-box">
+                            <span class="label">Failed</span>
+                            <span class="value status-fail" id="total-fail">0</span>
+                        </div>
+                        <div class="stat-box">
+                            <span class="label">Avg Duration (ms)</span>
+                            <span class="value" id="avg-duration">0</span>
+                        </div>
+                        <div class="stat-box highlight">
+                            <span class="label">Total Requests</span>
+                            <span class="value" id="total-requests">0</span>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="charts-row">
+                    <div class="card chart-card">
+                        <h2>Token Distribution</h2>
+                        <canvas id="chart-tokens" width="300" height="300"></canvas>
+                    </div>
+                    <div class="card chart-card">
+                        <h2>Token % by Model</h2>
+                        <canvas id="chart-model-tokens" width="300" height="300"></canvas>
+                    </div>
+                    <div class="card chart-card">
+                        <h2>Requests % by Model</h2>
+                        <canvas id="chart-model-requests" width="300" height="300"></canvas>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <h2>By Model</h2>
+                    <table id="model-table">
+                        <thead>
+                            <tr>
+                                <th>Model</th>
+                                <th>Input</th>
+                                <th>Output</th>
+                                <th>Cache</th>
+                                <th>Total</th>
+                                <th>%</th>
+                                <th>Success</th>
+                                <th>Failed</th>
+                                <th>Avg Duration (ms)</th>
+                            </tr>
+                        </thead>
+                        <tbody id="model-tbody">
+                            <tr><td colspan="9">Loading...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </section>
+
+            <section id="logs" class="tab-content">
+                <div class="card">
+                    <h2>Request History</h2>
+                    <table id="history-table">
+                        <thead>
+                            <tr>
+                                <th>Time</th>
+                                <th>Original Model</th>
+                                <th>Mapped Model</th>
+                                <th>Input</th>
+                                <th>Output</th>
+                                <th>Cache</th>
+                                <th>Thinking</th>
+                                <th>Effort</th>
+                                <th>Duration (ms)</th>
+                                <th>Status</th>
+                            </tr>
+                        </thead>
+                        <tbody id="history-tbody">
+                            <tr><td colspan="10">Loading...</td></tr>
+                        </tbody>
+                    </table>
+                    <div class="pagination" id="pagination">
+                        <button class="btn" id="prev-page">&laquo; Previous</button>
+                        <span id="page-info">Page 1</span>
+                        <button class="btn" id="next-page">Next &raquo;</button>
+                    </div>
+                </div>
+            </section>
+
+            <section id="quotas" class="tab-content">
+                <div class="card" id="quota-card">
+                    <h2>OpenCode Go Quotas</h2>
+                    <p id="quota-status-message" class="config-hint"></p>
+                    <div id="quota-content">
+                        <div class="quota-grid">
+                            <div class="quota-item" id="quota-rolling">
+                                <div class="quota-header">
+                                    <span class="quota-label">5-Hour Rolling</span>
+                                    <span class="quota-reset" id="quota-rolling-reset"></span>
+                                </div>
+                                <div class="quota-bar-container">
+                                    <div class="quota-bar quota-bar-ok" id="quota-rolling-bar"></div>
+                                </div>
+                                <div class="quota-stats">
+                                    <span class="quota-usage" id="quota-rolling-usage">0%</span>
+                                    <span class="quota-remaining" id="quota-rolling-remaining">100% remaining</span>
+                                </div>
+                            </div>
+                            <div class="quota-item" id="quota-weekly">
+                                <div class="quota-header">
+                                    <span class="quota-label">Weekly</span>
+                                    <span class="quota-reset" id="quota-weekly-reset"></span>
+                                </div>
+                                <div class="quota-bar-container">
+                                    <div class="quota-bar quota-bar-ok" id="quota-weekly-bar"></div>
+                                </div>
+                                <div class="quota-stats">
+                                    <span class="quota-usage" id="quota-weekly-usage">0%</span>
+                                    <span class="quota-remaining" id="quota-weekly-remaining">100% remaining</span>
+                                </div>
+                            </div>
+                            <div class="quota-item" id="quota-monthly">
+                                <div class="quota-header">
+                                    <span class="quota-label">Monthly</span>
+                                    <span class="quota-reset" id="quota-monthly-reset"></span>
+                                </div>
+                                <div class="quota-bar-container">
+                                    <div class="quota-bar quota-bar-ok" id="quota-monthly-bar"></div>
+                                </div>
+                                <div class="quota-stats">
+                                    <span class="quota-usage" id="quota-monthly-usage">0%</span>
+                                    <span class="quota-remaining" id="quota-monthly-remaining">100% remaining</span>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="quota-footer">
+                            <span id="quota-fetched-at" class="config-hint"></span>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <section id="config" class="tab-content">
+                <!-- Proxy control -->
+                <div class="card">
+                    <h2>Proxy Status</h2>
+                    <div class="config-row">
+                        <div class="config-status">
+                            <span id="proxy-status-dot" class="status-dot running"></span>
+                            <span id="proxy-status-text">Running</span>
+                            <span id="proxy-status-addr" class="config-addr clickable"></span>
+                            <span id="proxy-status-lan" class="config-addr" style="display:none"></span>
+                        </div>
+                        <div class="config-actions">
+                            <button class="btn" id="btn-proxy-start" disabled>Start</button>
+                            <button class="btn btn-danger" id="btn-proxy-stop">Stop</button>
+                        </div>
+                    </div>
+                    <div id="restart-notice" class="notice" style="display:none">
+                        Proxy restart required for port changes to take effect.
+                    </div>
+                </div>
+
+                <!-- Model mapping -->
+                <div class="card">
+                    <h2>Model Mapping</h2>
+                    <p class="config-hint">Routes map Claude model names (opus, sonnet, haiku) to backend models.</p>
+                    <div class="config-field" style="margin-bottom: 15px;">
+                        <label class="checkbox-label">
+                            <input type="checkbox" id="cfg-disable-mapping">
+                            <span>Disable model mapping (pass-through)</span>
+                        </label>
+                        <p class="config-hint">When enabled, the original model name is passed directly without mapping.</p>
+                    </div>
+                    <div class="config-grid" id="mapping-grid">
+                        <div class="config-field">
+                            <label for="route-opus">Opus Route</label>
+                            <select id="route-opus" class="config-select"></select>
+                        </div>
+                        <div class="config-field">
+                            <label for="route-sonnet">Sonnet Route</label>
+                            <select id="route-sonnet" class="config-select"></select>
+                        </div>
+                        <div class="config-field">
+                            <label for="route-haiku">Haiku Route</label>
+                            <select id="route-haiku" class="config-select"></select>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Custom mapping -->
+                <div class="card">
+                    <h2>Custom Mapping</h2>
+                    <p class="config-hint">Add custom model name to backend model mappings. Match keywords are checked in order.</p>
+                    <div class="custom-routes-table">
+                        <table id="custom-routes-table">
+                            <thead>
+                                <tr>
+                                    <th>Match Keyword</th>
+                                    <th>Backend Model</th>
+                                    <th></th>
+                                </tr>
+                            </thead>
+                            <tbody id="custom-routes-tbody">
+                                <tr><td colspan="3">No custom routes</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                    <div class="custom-route-add">
+                        <input type="text" id="cr-match" class="config-input" placeholder="e.g. nimo">
+                        <select id="cr-model" class="config-select"><option value="">Select model...</option></select>
+                        <button class="btn" id="cr-add-btn">Add</button>
+                    </div>
+                    <div class="config-actions" style="margin-top: 10px;">
+                        <button class="btn btn-primary" id="cr-save-btn">Save Custom Routes</button>
+                        <span id="cr-save-status" class="save-status"></span>
+                    </div>
+                </div>
+
+                <!-- Available models -->
+                <div class="card">
+                    <h2>Available Models</h2>
+                    <table id="models-table">
+                        <thead>
+                            <tr>
+                                <th>Model ID</th>
+                                <th>Capabilities</th>
+                                <th>Protocol</th>
+                                <th>Endpoint</th>
+                                <th>5h limit</th>
+                                <th>Weekly limit</th>
+                                <th>Monthly limit</th>
+                            </tr>
+                        </thead>
+                        <tbody id="models-tbody">
+                            <tr><td colspan="7">Loading...</td></tr>
+                        </tbody>
+                    </table>
+                    <p class="config-hint" style="margin-top:8px">Estimated request limits per time window based on your plan's dollar caps and per-model pricing. <a href="https://opencode.ai/docs/fr/go/#usage-limits" target="_blank">See docs</a></p>
+                </div>
+
+                <!-- Server config -->
+                <div class="card">
+                    <h2>Server Settings</h2>
+                    <div class="config-grid">
+                        <div class="config-field">
+                            <label for="cfg-port">API Port</label>
+                            <input type="number" id="cfg-port" class="config-input" min="1" max="65535">
+                        </div>
+                        <div class="config-field">
+                            <label for="cfg-web-port">Web UI Port</label>
+                            <input type="number" id="cfg-web-port" class="config-input" min="1" max="65535">
+                        </div>
+                        <div class="config-field">
+                            <label for="cfg-proxy">HTTP Proxy</label>
+                            <input type="text" id="cfg-proxy" class="config-input" placeholder="http://proxy:port">
+                        </div>
+                        <div class="config-field">
+                            <label for="cfg-api-key">API Key</label>
+                            <div class="api-key-row">
+                                <input type="password" id="cfg-api-key" class="config-input" placeholder="Leave blank to keep current">
+                                <button class="btn btn-sm" id="btn-toggle-key" title="Show/hide">&#128065;</button>
+                            </div>
+                        </div>
+                        <div class="config-field">
+                            <label for="cfg-go-workspace">OpenCode Go Workspace ID</label>
+                            <input type="text" id="cfg-go-workspace" class="config-input" placeholder="wrk_...">
+                        </div>
+                        <div class="config-field">
+                            <label for="cfg-go-cookie">OpenCode Go Auth Cookie</label>
+                            <input type="password" id="cfg-go-cookie" class="config-input" placeholder="Fe26.2...">
+                        </div>
+                    </div>
+                    <div class="config-actions" style="margin-top: 15px;">
+                        <button class="btn btn-primary" id="btn-save-config">Save Configuration</button>
+                        <span id="config-save-status" class="save-status"></span>
+                    </div>
+                </div>
+            </section>
+        </main>
+
+        <footer>
+            <span id="last-update">Last update: --</span>
+            <div class="delete-section">
+                <div class="delete-menu" id="delete-menu" style="display:none">
+                    <button class="delete-option" id="delete-all-opt">Delete All</button>
+                    <button class="delete-option" id="delete-by-date-opt">Delete Before Date</button>
+                </div>
+                <button class="btn btn-danger" id="delete-btn">Delete History</button>
+            </div>
+        </footer>
+
+        <div class="modal-overlay" id="delete-modal" style="display:none">
+            <div class="modal">
+                <h3>Delete History Before</h3>
+                <input type="date" id="delete-date" class="date-input modal-date">
+                <div class="modal-buttons">
+                    <button class="btn btn-danger" id="modal-delete-btn">Delete</button>
+                    <button class="btn" id="modal-cancel-btn">Cancel</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7"></script>
+    <script src="/static/app.js"></script>
+</body>
+</html>
