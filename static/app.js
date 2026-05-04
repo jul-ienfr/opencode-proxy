@@ -508,9 +508,9 @@ function renderApiKeysTable(apiKeys) {
         const wsPlaceholder = k.go_workspace_id_masked || ws.slice(0, 4) + '****' || '';
         const cookiePlaceholder = k.go_auth_cookie_masked || '****';
         return `<tr data-index="${i}">
-            <td><input type="password" class="config-input ak-key" value="${k.api_key || ''}" placeholder="${keyPlaceholder}" style="width:100%;font-family:monospace"></td>
+            <td><div class="api-key-row"><input type="password" class="config-input ak-key" value="${k.api_key || ''}" placeholder="${keyPlaceholder}" style="width:100%;font-family:monospace"><button class="btn btn-sm btn-toggle-secret" title="Show/hide">&#128065;</button></div></td>
             <td><input type="text" class="config-input ak-workspace" value="${ws}" style="width:100%"></td>
-            <td><input type="password" class="config-input ak-cookie" value="${k.go_auth_cookie || ''}" placeholder="${cookiePlaceholder}" style="width:100%;font-family:monospace"></td>
+            <td><div class="api-key-row"><input type="password" class="config-input ak-cookie" value="${k.go_auth_cookie || ''}" placeholder="${cookiePlaceholder}" style="width:100%;font-family:monospace"><button class="btn btn-sm btn-toggle-secret" title="Show/hide">&#128065;</button></div></td>
             <td><button class="btn btn-danger btn-sm ak-delete-btn">Delete</button></td>
         </tr>`;
     }).join('');
@@ -721,9 +721,9 @@ function setupConfig() {
         if (emptyRow) tbody.innerHTML = '';
         const tr = document.createElement('tr');
         tr.innerHTML = `
-            <td><input type="password" class="config-input ak-key" placeholder="sk-..." style="width:100%;font-family:monospace"></td>
+            <td><div class="api-key-row"><input type="password" class="config-input ak-key" placeholder="sk-..." style="width:100%;font-family:monospace"><button class="btn btn-sm btn-toggle-secret" title="Show/hide">&#128065;</button></div></td>
             <td><input type="text" class="config-input ak-workspace" placeholder="wrk_..." style="width:100%"></td>
-            <td><input type="password" class="config-input ak-cookie" placeholder="Fe26.2..." style="width:100%;font-family:monospace"></td>
+            <td><div class="api-key-row"><input type="password" class="config-input ak-cookie" placeholder="Fe26.2..." style="width:100%;font-family:monospace"><button class="btn btn-sm btn-toggle-secret" title="Show/hide">&#128065;</button></div></td>
             <td><button class="btn btn-danger btn-sm ak-delete-btn">Delete</button></td>
         `;
         tbody.appendChild(tr);
@@ -738,6 +738,20 @@ function setupConfig() {
         const tbody = document.getElementById('api-keys-tbody');
         if (!tbody.querySelector('tr')) {
             tbody.innerHTML = '<tr><td colspan="4">No API keys configured</td></tr>';
+        }
+    });
+
+    // Toggle secret visibility (delegated)
+    document.getElementById('api-keys-tbody').addEventListener('click', (e) => {
+        const btn = e.target.closest('.btn-toggle-secret');
+        if (!btn) return;
+        const input = btn.previousElementSibling;
+        if (input && input.type === 'password') {
+            input.type = 'text';
+            btn.textContent = '\u{1F441}';
+        } else if (input) {
+            input.type = 'password';
+            btn.textContent = '\u{1F441}';
         }
     });
 
