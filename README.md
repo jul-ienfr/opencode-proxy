@@ -1,8 +1,6 @@
 # OpenCode-Proxy
 
-A python proxy that lets you use [OpenCode Go](https://opencode.ai/docs/go/) subscription with [Claude Code](https://docs.anthropic.com/en/docs/claude-code).
-
-<img width="449" height="319" alt="image" src="https://github.com/user-attachments/assets/9337be52-4681-414c-bb2b-ad624f079659" />
+A Python proxy for using [OpenCode Go](https://opencode.ai/docs/go/) subscription with [Claude Code](https://docs.anthropic.com/en/docs/claude-code). Features a real-time web dashboard with token stats, subscription quota tracking, and full configuration management.
 
 ## Requirements
 
@@ -14,6 +12,14 @@ A python proxy that lets you use [OpenCode Go](https://opencode.ai/docs/go/) sub
 pip install -r requirements.txt
 ```
 
+### GUI Mode (optional)
+
+For system tray GUI (`--gui` flag):
+
+```bash
+pip install pystray Pillow pywebview
+```
+
 ## Configuration
 
 Copy `.env.example` to `.env` and edit:
@@ -22,19 +28,29 @@ Copy `.env.example` to `.env` and edit:
 cp .env.example .env
 ```
 
-Edit values in `.env`:
-
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `OPENCODE_PROXY` | Proxy server | `` |
-| `OPENCODE_API_KEY` | API key for OpenCode | `` |
+| `OPENCODE_API_KEY` | API key for OpenCode | — |
+| `OPENCODE_PROXY` | HTTP proxy server | — |
 | `OPUS_MAP_MODEL` | Model for opus route | `kimi-k2.6` |
 | `SONNET_MAP_MODEL` | Model for sonnet route | `glm-5.1` |
 | `HAIKU_MAP_MODEL` | Model for haiku route | `minimax-m2.5` |
+| `OPENCODE_HOST` | Bind address | `0.0.0.0` |
+| `OPENCODE_PORT` | API port | `4000` |
+| `OPENCODE_WEB_PORT` | Web UI port | `8082` |
+
+### OpenCode Go Quotas
+
+To enable subscription quota tracking in the dashboard:
+
+| Variable | Description |
+|----------|-------------|
+| `OPENCODE_GO_WORKSPACE_ID` | Your workspace ID (`wrk_...`) |
+| `OPENCODE_GO_AUTH_COOKIE` | Auth cookie from opencode.ai (`Fe26.2...`) |
+
+You can also configure these directly from the dashboard Configuration tab.
 
 ## Claude Code Configuration
-
-To use this proxy with Claude Code, add these environment variables to your shell configuration:
 
 ```bash
 export ANTHROPIC_API_KEY="fake-key"
@@ -42,7 +58,7 @@ export ANTHROPIC_AUTH_TOKEN="fake"
 export ANTHROPIC_BASE_URL="http://localhost:4000"
 ```
 
-Or add them to your `.env` file:
+Or in your `.env`:
 
 ```env
 ANTHROPIC_API_KEY=fake-key
@@ -50,7 +66,7 @@ ANTHROPIC_AUTH_TOKEN=fake
 ANTHROPIC_BASE_URL=http://localhost:4000
 ```
 
-**Note:** The proxy server must be running (`python opencode.py`) before using Claude Code.
+**Note:** The proxy must be running (`python opencode.py`) before using Claude Code.
 
 ## Running
 
@@ -58,58 +74,78 @@ ANTHROPIC_BASE_URL=http://localhost:4000
 python opencode.py
 ```
 
-Server will start:
+Server starts:
 - **API**: http://localhost:4000
 - **Web Dashboard**: http://localhost:8082
 
+### GUI Mode
+
+```bash
+python opencode.py --gui
+```
+
 ## Web Dashboard
 
-The web interface has 2 tabs:
+The dashboard features 4 tabs with real-time updates via SSE (Server-Sent Events).
 
 ### Token Stats
-- Overview: Input, Output, Cache, Success, Failed, Avg Duration
-- Charts: Token Distribution, Token % by Model, Requests % by Model
-- Detailed table by model
-<img width="1172" height="784" alt="image" src="https://github.com/user-attachments/assets/3e29adfe-14c8-4d71-a158-a7cbe0e65174" />
+- Overview counters: Input, Output, Cache, Total, Success, Failed, Avg Duration
+- Charts: Token Distribution (donut), Token % by Model, Requests % by Model
+- Detailed breakdown table by model
 
+### Logs (Request History)
+- Full request logs: time, original/model, tokens, thinking, effort, duration, status
+- Filter: Today, 7 Days, 30 Days, Custom date range
+- Error details: HTTP status codes with explanations (520, 524, etc.) on hover
+- Pagination
+- Delete history (all or before date)
 
-### Request History
-- Request logs with full info: time, model, duration, tokens, status
-- Filter by time: Today, 7 Days, 30 Days, Custom
-- Delete history: all or by date
-<img width="1196" height="588" alt="image" src="https://github.com/user-attachments/assets/5e5c2118-79c3-4504-96d9-b14043bfe537" />
+### Quotas
+- OpenCode Go usage bars: 5-hour rolling, weekly, monthly
+- Live countdown timers for reset time
+- Color-coded progress bars (green < 60%, orange 60–85%, red > 85%)
+- Auto-refreshes every 5 minutes + instant update on change
 
+### Configuration
+- **Proxy Status**: Running/stopped indicator, start/stop buttons, click-to-copy localhost and LAN addresses
+- **Model Mapping**: Map opus/sonnet/haiku to any available backend model, with pass-through toggle
+- **Custom Mapping**: Add keyword-based custom routes (e.g., "nimo" → model)
+- **Available Models**: Auto-discovered from upstream at startup, with capability badges (Chat, Vision, Tools, Code) and per-model request limits (5h/weekly/monthly)
+- **Server Settings**: API port, Web UI port, HTTP proxy, API key, Go workspace ID, Go auth cookie
+- **Instant apply**: All changes take effect immediately — no restart required (hot-restart for port changes)
 
 ### Common Features
-- Dark/Light theme (Dark by default)
-- Auto-refresh every 5 seconds
-- Time filter shared across both tabs
+- Dark/Light theme (persisted in localStorage)
+- Real-time updates via SSE (falls back to polling)
+- Time filter shared across Stats and Logs tabs
 
 ## API Endpoints
 
 | Method | Path | Description |
 |--------|------|-------------|
-| POST | `/v1/messages` | Proxy Anthropic format |
+| POST | `/v1/messages` | Proxy Anthropic format → backend |
 | POST | `/anthropic/v1/messages` | Proxy Anthropic format |
-| POST | `/v1/messages/count_tokens` | Estimate token count for a request |
+| POST | `/v1/messages/count_tokens` | Estimate token count |
 | GET | `/health` | Health check |
-| GET | `/api/stats` | Token usage stats (supports `from_date`, `to_date`) |
-| GET | `/api/logs` | Terminal logs |
-| GET | `/api/history` | Request history from DB (supports `from_date`, `to_date`) |
+| GET | `/v1/models` | List available models |
+| GET | `/api/stats` | Token stats (supports `from_date`, `to_date`) |
+| GET | `/api/history` | Request history (supports pagination, date filter) |
 | DELETE | `/api/history` | Delete history (`before` or `all=true`) |
-
-## Advanced Configuration
-
-For other settings, edit `config/settings.py`:
-
-- `PORT`: API port (default 4000)
-- `WEB_PORT`: Web UI port (default 8082)
-- `MODELS`: Models and endpoints list (hardcoded in code)
+| GET | `/api/logs` | Terminal logs |
+| GET | `/api/config` | Full proxy configuration |
+| POST | `/api/config` | Update configuration at runtime |
+| GET | `/api/config/custom-routes` | List custom routes |
+| POST | `/api/config/custom-routes` | Save custom routes |
+| GET | `/api/proxy/status` | Proxy running status |
+| POST | `/api/proxy/start` | Start the proxy |
+| POST | `/api/proxy/stop` | Stop the proxy |
+| GET | `/api/events` | SSE event stream (real-time updates) |
+| GET | `/api/quotas` | OpenCode Go quota usage |
 
 ## Keyboard shortcuts (Terminal)
 
-- `j`/`↓`: Scroll down log
-- `k`/`↑`: Scroll up log
+- `j`/`↓`: Scroll down
+- `k`/`↑`: Scroll up
 - `g`: Go to top
 - `G`: Go to bottom
 - `Ctrl+C`: Exit
@@ -117,24 +153,30 @@ For other settings, edit `config/settings.py`:
 ## Project Structure
 
 ```
-opencode.py              # Main FastAPI server
+opencode.py              # Main FastAPI server + ServerManager (hot-restart)
 config/
   __init__.py            # Package exports
-  settings.py            # Configuration (PROXY, API_KEY, MODELS, ROUTES)
+  settings.py            # Configuration, .env management, routes
 dashboard/
   __init__.py            # Package exports
-  api.py                 # Dashboard API endpoints (stats, logs, history)
-  display.py             # Rich terminal display (token table, log panel)
+  api.py                 # Dashboard API endpoints
+  display.py             # Rich terminal display
+  events.py              # SSE event manager (real-time push)
+  quota.py               # OpenCode Go quota fetcher + model discovery
+gui/
+  __init__.py            # GUI package
+  icon.py                # System tray icon
+  tray.py                # System tray menu
+  window.py              # WebView window
+  _webview_main.py       # WebView entry point
 static/
-  index.html             # Dashboard UI
-  styles.css             # Styling (dark/light theme)
-  app.js                 # JavaScript
+  index.html             # Dashboard UI (4 tabs)
+  styles.css             # Theming (dark/light)
+  app.js                 # Frontend logic
+custom_routes.json       # Custom route mappings (persistent)
 requirements.txt         # Python dependencies
 .env.example             # Template environment configuration
 .env                     # Environment configuration (gitignored)
-.gitignore               # Git ignore rules
-logs/                    # Runtime directory (auto-created)
-  requests.db            # SQLite - request history
 ```
 
 ## License
