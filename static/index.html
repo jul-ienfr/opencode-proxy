@@ -149,6 +149,54 @@
             </section>
 
             <section id="config" class="tab-content">
+                <!-- Server Settings -->
+                <div class="card">
+                    <h2>Server Settings</h2>
+                    <div class="config-row" style="margin-bottom:18px">
+                        <div class="config-status">
+                            <span id="proxy-status-dot" class="status-dot running"></span>
+                            <span id="proxy-status-text">Running</span>
+                            <span id="proxy-status-addr" class="config-addr clickable"></span>
+                            <span id="proxy-status-lan" class="config-addr" style="display:none"></span>
+                        </div>
+                        <div class="config-actions">
+                            <button class="btn" id="btn-proxy-start" disabled>Start</button>
+                            <button class="btn btn-danger" id="btn-proxy-stop">Stop</button>
+                        </div>
+                    </div>
+                    <div id="restart-notice" class="notice" style="display:none;margin-bottom:16px">
+                        Proxy restart required for port changes to take effect.
+                    </div>
+                    <div class="config-grid">
+                        <div class="config-field">
+                            <label for="cfg-port">API Port</label>
+                            <input type="number" id="cfg-port" class="config-input" min="1" max="65535">
+                        </div>
+                        <div class="config-field">
+                            <label for="cfg-web-port">Web UI Port</label>
+                            <input type="number" id="cfg-web-port" class="config-input" min="1" max="65535">
+                        </div>
+                        <div class="config-field">
+                            <label for="cfg-bind-address">Bind Address</label>
+                            <select id="cfg-bind-address" class="config-select">
+                                <option value="0.0.0.0">Local network (0.0.0.0)</option>
+                                <option value="127.0.0.1">Local machine only (127.0.0.1)</option>
+                            </select>
+                        </div>
+                        <div class="config-field">
+                            <label for="cfg-routing">Key Routing</label>
+                            <select id="cfg-routing" class="config-select">
+                                <option value="round-robin">Round-Robin</option>
+                                <option value="failover">Failover</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="config-actions" style="margin-top: 15px;">
+                        <button class="btn btn-primary" id="btn-save-config">Save Configuration</button>
+                        <span id="config-save-status" class="save-status"></span>
+                    </div>
+                </div>
+
                 <!-- Model mapping -->
                 <div class="card">
                     <h2>Model Mapping</h2>
@@ -251,54 +299,6 @@
                         </tbody>
                     </table>
                     <p class="config-hint" style="margin-top:8px">Estimated request limits per time window based on your plan's dollar caps and per-model pricing. <a href="https://opencode.ai/docs/fr/go/#usage-limits" target="_blank">See docs</a></p>
-                </div>
-
-                <!-- Server Settings -->
-                <div class="card">
-                    <h2>Server Settings</h2>
-                    <div class="config-row" style="margin-bottom:18px">
-                        <div class="config-status">
-                            <span id="proxy-status-dot" class="status-dot running"></span>
-                            <span id="proxy-status-text">Running</span>
-                            <span id="proxy-status-addr" class="config-addr clickable"></span>
-                            <span id="proxy-status-lan" class="config-addr" style="display:none"></span>
-                        </div>
-                        <div class="config-actions">
-                            <button class="btn" id="btn-proxy-start" disabled>Start</button>
-                            <button class="btn btn-danger" id="btn-proxy-stop">Stop</button>
-                        </div>
-                    </div>
-                    <div id="restart-notice" class="notice" style="display:none;margin-bottom:16px">
-                        Proxy restart required for port changes to take effect.
-                    </div>
-                    <div class="config-grid">
-                        <div class="config-field">
-                            <label for="cfg-port">API Port</label>
-                            <input type="number" id="cfg-port" class="config-input" min="1" max="65535">
-                        </div>
-                        <div class="config-field">
-                            <label for="cfg-web-port">Web UI Port</label>
-                            <input type="number" id="cfg-web-port" class="config-input" min="1" max="65535">
-                        </div>
-                        <div class="config-field">
-                            <label for="cfg-bind-address">Bind Address</label>
-                            <select id="cfg-bind-address" class="config-select">
-                                <option value="0.0.0.0">Local network (0.0.0.0)</option>
-                                <option value="127.0.0.1">Local machine only (127.0.0.1)</option>
-                            </select>
-                        </div>
-                        <div class="config-field">
-                            <label for="cfg-routing">Key Routing</label>
-                            <select id="cfg-routing" class="config-select">
-                                <option value="round-robin">Round-Robin</option>
-                                <option value="failover">Failover</option>
-                            </select>
-                        </div>
-                    </div>
-                    <div class="config-actions" style="margin-top: 15px;">
-                        <button class="btn btn-primary" id="btn-save-config">Save Configuration</button>
-                        <span id="config-save-status" class="save-status"></span>
-                    </div>
                 </div>
             </section>
         </main>
