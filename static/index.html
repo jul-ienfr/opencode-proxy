@@ -144,52 +144,7 @@
                 <div class="card" id="quota-card">
                     <h2>OpenCode Go Quotas</h2>
                     <p id="quota-status-message" class="config-hint"></p>
-                    <div id="quota-content">
-                        <div class="quota-grid">
-                            <div class="quota-item" id="quota-rolling">
-                                <div class="quota-header">
-                                    <span class="quota-label">5-Hour Rolling</span>
-                                    <span class="quota-reset" id="quota-rolling-reset"></span>
-                                </div>
-                                <div class="quota-bar-container">
-                                    <div class="quota-bar quota-bar-ok" id="quota-rolling-bar"></div>
-                                </div>
-                                <div class="quota-stats">
-                                    <span class="quota-usage" id="quota-rolling-usage">0%</span>
-                                    <span class="quota-remaining" id="quota-rolling-remaining">100% remaining</span>
-                                </div>
-                            </div>
-                            <div class="quota-item" id="quota-weekly">
-                                <div class="quota-header">
-                                    <span class="quota-label">Weekly</span>
-                                    <span class="quota-reset" id="quota-weekly-reset"></span>
-                                </div>
-                                <div class="quota-bar-container">
-                                    <div class="quota-bar quota-bar-ok" id="quota-weekly-bar"></div>
-                                </div>
-                                <div class="quota-stats">
-                                    <span class="quota-usage" id="quota-weekly-usage">0%</span>
-                                    <span class="quota-remaining" id="quota-weekly-remaining">100% remaining</span>
-                                </div>
-                            </div>
-                            <div class="quota-item" id="quota-monthly">
-                                <div class="quota-header">
-                                    <span class="quota-label">Monthly</span>
-                                    <span class="quota-reset" id="quota-monthly-reset"></span>
-                                </div>
-                                <div class="quota-bar-container">
-                                    <div class="quota-bar quota-bar-ok" id="quota-monthly-bar"></div>
-                                </div>
-                                <div class="quota-stats">
-                                    <span class="quota-usage" id="quota-monthly-usage">0%</span>
-                                    <span class="quota-remaining" id="quota-monthly-remaining">100% remaining</span>
-                                </div>
-                            </div>
-                        </div>
-                        <div class="quota-footer">
-                            <span id="quota-fetched-at" class="config-hint"></span>
-                        </div>
-                    </div>
+                    <div id="quota-workspaces"></div>
                 </div>
             </section>
 
@@ -270,6 +225,32 @@
                     </div>
                 </div>
 
+                <!-- API Keys -->
+                <div class="card">
+                    <h2>API Keys</h2>
+                    <p class="config-hint">Configure API keys for upstream access. Each key can have its own Go workspace credentials for per-workspace quota tracking.</p>
+                    <div class="api-keys-table">
+                        <table id="api-keys-table">
+                            <thead>
+                                <tr>
+                                    <th>API Key</th>
+                                    <th>Go Workspace ID</th>
+                                    <th>Go Auth Cookie</th>
+                                    <th style="width:70px"></th>
+                                </tr>
+                            </thead>
+                            <tbody id="api-keys-tbody">
+                                <tr><td colspan="4">No API keys configured</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                    <div class="config-actions" style="margin-top:10px;gap:8px">
+                        <button class="btn" id="api-key-add-btn">+ Add Key</button>
+                        <button class="btn btn-primary" id="api-key-save-btn">Save API Keys</button>
+                        <span id="api-key-save-status" class="save-status"></span>
+                    </div>
+                </div>
+
                 <!-- Available models -->
                 <div class="card">
                     <h2>Available Models</h2>
@@ -305,23 +286,22 @@
                             <input type="number" id="cfg-web-port" class="config-input" min="1" max="65535">
                         </div>
                         <div class="config-field">
+                            <label for="cfg-bind-address">Bind Address</label>
+                            <select id="cfg-bind-address" class="config-select">
+                                <option value="0.0.0.0">Local network (0.0.0.0)</option>
+                                <option value="127.0.0.1">Local machine only (127.0.0.1)</option>
+                            </select>
+                        </div>
+                        <div class="config-field">
+                            <label for="cfg-routing">Key Routing</label>
+                            <select id="cfg-routing" class="config-select">
+                                <option value="round-robin">Round-Robin</option>
+                                <option value="failover">Failover</option>
+                            </select>
+                        </div>
+                        <div class="config-field">
                             <label for="cfg-proxy">HTTP Proxy</label>
                             <input type="text" id="cfg-proxy" class="config-input" placeholder="http://proxy:port">
-                        </div>
-                        <div class="config-field">
-                            <label for="cfg-api-key">API Key</label>
-                            <div class="api-key-row">
-                                <input type="password" id="cfg-api-key" class="config-input" placeholder="Leave blank to keep current">
-                                <button class="btn btn-sm" id="btn-toggle-key" title="Show/hide">&#128065;</button>
-                            </div>
-                        </div>
-                        <div class="config-field">
-                            <label for="cfg-go-workspace">OpenCode Go Workspace ID</label>
-                            <input type="text" id="cfg-go-workspace" class="config-input" placeholder="wrk_...">
-                        </div>
-                        <div class="config-field">
-                            <label for="cfg-go-cookie">OpenCode Go Auth Cookie</label>
-                            <input type="password" id="cfg-go-cookie" class="config-input" placeholder="Fe26.2...">
                         </div>
                     </div>
                     <div class="config-actions" style="margin-top: 15px;">

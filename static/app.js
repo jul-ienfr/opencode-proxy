@@ -118,76 +118,90 @@ async function fetchQuotas() {
 
 function formatResetTime(seconds) {
     if (seconds <= 0) return 'now';
-    const h = Math.floor(seconds / 3600);
+    const d = Math.floor(seconds / 86400);
+    const h = Math.floor((seconds % 86400) / 3600);
     const m = Math.floor((seconds % 3600) / 60);
     const s = Math.floor(seconds % 60);
+    if (d > 0) return `${d}d ${h}h ${m}m`;
     if (h > 0) return `${h}h ${m}m`;
     if (m > 0) return `${m}m ${s}s`;
     return `${s}s`;
 }
 
 function renderQuotas(data) {
-    const content = document.getElementById('quota-content');
+    const container = document.getElementById('quota-workspaces');
     const statusMsg = document.getElementById('quota-status-message');
 
-    if (!data) {
-        statusMsg.textContent = 'Failed to load quota data.';
-        content.style.display = 'none';
+    if (!data || Object.keys(data).length === 0) {
+        statusMsg.textContent = 'Quota tracking not configured. Add workspace credentials in Configuration -> API Keys.';
+        container.innerHTML = '';
         return;
     }
 
-    if (data.status === 'not_configured') {
-        statusMsg.textContent =
-            'Quota tracking not configured. Set OPENCODE_GO_WORKSPACE_ID and OPENCODE_GO_AUTH_COOKIE in your .env file.';
-        content.style.display = 'none';
-        return;
-    }
+    statusMsg.textContent = '';
+    const entries = Object.entries(data);
+    const showHeaders = entries.length > 1;
 
-    if (data.status === 'error' && !data.quotas) {
-        statusMsg.textContent = 'Error: ' + (data.error || 'Unknown error');
-        content.style.display = 'none';
-        return;
-    }
+    let allHtml = '';
+    for (const [wsId, wsData] of entries) {
+        const status = wsData.status || 'error';
+        const error = wsData.error || '';
+        const quotas = wsData.quotas || {};
+        const fetchedAt = wsData.fetched_at || null;
 
-    content.style.display = '';
-    statusMsg.textContent = data.status === 'error'
-        ? 'Last fetch error: ' + (data.error || '') + '. Showing cached data.'
-        : '';
-
-    for (const period of ['rolling', 'weekly', 'monthly']) {
-        const q = data.quotas[period] || { usage_percent: 0, reset_in_sec: 0 };
-        const pct = Math.min(100, Math.max(0, q.usage_percent || 0));
-        const remaining = (100 - pct).toFixed(1);
-
-        // Progress bar
-        const bar = document.getElementById(`quota-${period}-bar`);
-        bar.style.width = pct + '%';
-        bar.className = 'quota-bar';
-        if (pct >= 85) bar.classList.add('quota-bar-danger');
-        else if (pct >= 60) bar.classList.add('quota-bar-warning');
-        else bar.classList.add('quota-bar-ok');
-
-        // Usage text
-        document.getElementById(`quota-${period}-usage`).textContent = pct.toFixed(1) + '%';
-
-        // Remaining text
-        document.getElementById(`quota-${period}-remaining`).textContent = remaining + '% remaining';
-
-        // Reset countdown
-        const resetEl = document.getElementById(`quota-${period}-reset`);
-        const resetSec = q.reset_in_sec || 0;
-        if (resetSec > 0) {
-            resetEl.textContent = 'Resets in ' + formatResetTime(resetSec);
-            resetEl.dataset.resetTarget = Math.floor(Date.now() / 1000) + resetSec;
-        } else {
-            resetEl.textContent = '';
-            resetEl.dataset.resetTarget = '';
+        if (status === 'error' && !quotas.rolling && !quotas.weekly && !quotas.monthly) {
+            allHtml += `<div class="quota-workspace">
+                <div class="quota-error">Workspace ${wsId.slice(0, 8)}...: Error — ${error}</div>
+            </div>`;
+            continue;
         }
+
+        let wsHtml = '';
+        if (showHeaders) {
+            wsHtml += `<h3 class="quota-workspace-title">Workspace: ${wsId}</h3>`;
+        }
+
+        // Per-workspace status message
+        if (status === 'error') {
+            wsHtml += `<p class="config-hint" style="color:var(--danger)">Last fetch error: ${error}. Showing cached data.</p>`;
+        }
+
+        wsHtml += '<div class="quota-grid">';
+        for (const period of ['rolling', 'weekly', 'monthly']) {
+            const q = quotas[period] || { usage_percent: 0, reset_in_sec: 0 };
+            const pct = Math.min(100, Math.max(0, q.usage_percent || 0));
+            const remaining = (100 - pct).toFixed(1);
+
+            const barClass = pct >= 85 ? 'quota-bar-danger' : pct >= 60 ? 'quota-bar-warning' : 'quota-bar-ok';
+            const label = period === 'rolling' ? '5-Hour Rolling' : period.charAt(0).toUpperCase() + period.slice(1);
+            const resetSec = q.reset_in_sec || 0;
+            const resetText = resetSec > 0 ? 'Resets in ' + formatResetTime(resetSec) : '';
+            const resetTarget = resetSec > 0 ? Math.floor(Date.now() / 1000) + resetSec : '';
+
+            wsHtml += `<div class="quota-item">
+                <div class="quota-header">
+                    <span class="quota-label">${label}</span>
+                    <span class="quota-reset" data-reset-target="${resetTarget}">${resetText}</span>
+                </div>
+                <div class="quota-bar-container">
+                    <div class="quota-bar ${barClass}" style="width:${pct}%"></div>
+                </div>
+                <div class="quota-stats">
+                    <span class="quota-usage">${pct.toFixed(1)}%</span>
+                    <span class="quota-remaining">${remaining}% remaining</span>
+                </div>
+            </div>`;
+        }
+        wsHtml += '</div>';
+
+        if (fetchedAt) {
+            wsHtml += `<div class="quota-footer"><span class="quota-fetched-at">Last updated: ${formatDateTime(fetchedAt)}</span></div>`;
+        }
+
+        allHtml += `<div class="quota-workspace">${wsHtml}</div>`;
     }
 
-    // Fetched timestamp
-    const fetchedAt = document.getElementById('quota-fetched-at');
-    fetchedAt.textContent = data.fetched_at ? 'Last updated: ' + formatDateTime(data.fetched_at) : '';
+    container.innerHTML = allHtml;
 }
 
 function renderStats(data) {
@@ -406,7 +420,8 @@ function renderConfig(data) {
     document.getElementById('cfg-port').value = data.port;
     document.getElementById('cfg-web-port').value = data.web_port;
     document.getElementById('cfg-proxy').value = data.proxy || '';
-    document.getElementById('cfg-api-key').value = '';
+    document.getElementById('cfg-bind-address').value = data.host || '0.0.0.0';
+    document.getElementById('cfg-routing').value = data.routing || 'round-robin';
     document.getElementById('cfg-disable-mapping').checked = data.disable_mapping || false;
 
     // Enable/disable mapping fields based on checkbox
@@ -442,7 +457,7 @@ function renderConfig(data) {
         const capHtml = modelCaps.map(c => `<span class="cap-badge">${capLabels[c] || c}</span>`).join('') || '<span class="text-dim">-</span>';
         const badge = info.source === 'upstream' ? ' <span class="new-badge">NEW</span>' : '';
         html += `<tr>
-            <td>${id}${badge}</td>
+            <td><span class="clickable-model-id" data-id="${id}">${id}</span>${badge}</td>
             <td style="white-space:nowrap">${capHtml}</td>
             <td>${info.protocol}</td>
             <td>${info.endpoint}</td>
@@ -453,15 +468,8 @@ function renderConfig(data) {
     }
     tbody.innerHTML = html || '<tr><td colspan="7">No models</td></tr>';
 
-    // Quota config
-    document.getElementById('cfg-go-workspace').value = '';
-    document.getElementById('cfg-go-workspace').placeholder = data.go_workspace_id_set ? data.go_workspace_id_masked : 'Not set';
-    document.getElementById('cfg-go-cookie').value = '';
-    document.getElementById('cfg-go-cookie').placeholder = data.go_auth_cookie_set ? data.go_auth_cookie_masked : 'Not set';
-
-    // API key indicator
-    const keyInput = document.getElementById('cfg-api-key');
-    keyInput.placeholder = data.api_key_set ? data.api_key_masked : 'Not set';
+    // API keys table
+    renderApiKeysTable(data.api_keys || []);
 
     // Custom routes table
     renderCustomRoutes(data.custom_routes || {}, modelIds);
@@ -486,6 +494,26 @@ function renderCustomRoutes(routes, modelIds) {
         </tr>`;
     }
     tbody.innerHTML = html;
+}
+
+function renderApiKeysTable(apiKeys) {
+    const tbody = document.getElementById('api-keys-tbody');
+    if (!apiKeys || apiKeys.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="4">No API keys configured</td></tr>';
+        return;
+    }
+    tbody.innerHTML = apiKeys.map((k, i) => {
+        const keyPlaceholder = k.api_key_masked || '****';
+        const ws = k.go_workspace_id || '';
+        const wsPlaceholder = k.go_workspace_id_masked || ws.slice(0, 4) + '****' || '';
+        const cookiePlaceholder = k.go_auth_cookie_masked || '****';
+        return `<tr data-index="${i}">
+            <td><input type="password" class="config-input ak-key" value="${k.api_key || ''}" placeholder="${keyPlaceholder}" style="width:100%;font-family:monospace"></td>
+            <td><input type="text" class="config-input ak-workspace" value="${ws}" style="width:100%"></td>
+            <td><input type="password" class="config-input ak-cookie" value="${k.go_auth_cookie || ''}" placeholder="${cookiePlaceholder}" style="width:100%;font-family:monospace"></td>
+            <td><button class="btn btn-danger btn-sm ak-delete-btn">Delete</button></td>
+        </tr>`;
+    }).join('');
 }
 
 function updatePagination(current, total) {
@@ -555,13 +583,6 @@ function setupFilter() {
 }
 
 function setupConfig() {
-    // Toggle API key visibility
-    const keyInput = document.getElementById('cfg-api-key');
-    const toggleBtn = document.getElementById('btn-toggle-key');
-    toggleBtn.addEventListener('click', () => {
-        keyInput.type = keyInput.type === 'password' ? 'text' : 'password';
-    });
-
     // Disable mapping toggle
     const disableMapping = document.getElementById('cfg-disable-mapping');
     const mappingGrid = document.getElementById('mapping-grid');
@@ -585,21 +606,11 @@ function setupConfig() {
             },
             port: parseInt(document.getElementById('cfg-port').value),
             web_port: parseInt(document.getElementById('cfg-web-port').value),
+            host: document.getElementById('cfg-bind-address').value,
+            routing: document.getElementById('cfg-routing').value,
             proxy: document.getElementById('cfg-proxy').value,
             disable_mapping: document.getElementById('cfg-disable-mapping').checked,
         };
-        const apiKey = document.getElementById('cfg-api-key').value.trim();
-        if (apiKey) {
-            payload.api_key = apiKey;
-        }
-        const goWorkspace = document.getElementById('cfg-go-workspace').value.trim();
-        if (goWorkspace) {
-            payload.go_workspace_id = goWorkspace;
-        }
-        const goCookie = document.getElementById('cfg-go-cookie').value.trim();
-        if (goCookie) {
-            payload.go_auth_cookie = goCookie;
-        }
         try {
             const resp = await fetch('/api/config', {
                 method: 'POST',
@@ -688,6 +699,67 @@ function setupConfig() {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(routes),
+            });
+            const result = await resp.json();
+            status.textContent = 'Saved!';
+            status.className = 'save-status success';
+            setTimeout(() => { status.textContent = ''; }, 3000);
+            fetchConfig().then(renderConfig);
+        } catch (e) {
+            status.textContent = 'Error saving';
+            status.className = 'save-status error';
+            console.error(e);
+        }
+    });
+
+    // ── API Keys management ──
+
+    // Add key row
+    document.getElementById('api-key-add-btn').addEventListener('click', () => {
+        const tbody = document.getElementById('api-keys-tbody');
+        const emptyRow = tbody.querySelector('td[colspan]');
+        if (emptyRow) tbody.innerHTML = '';
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+            <td><input type="password" class="config-input ak-key" placeholder="sk-..." style="width:100%;font-family:monospace"></td>
+            <td><input type="text" class="config-input ak-workspace" placeholder="wrk_..." style="width:100%"></td>
+            <td><input type="password" class="config-input ak-cookie" placeholder="Fe26.2..." style="width:100%;font-family:monospace"></td>
+            <td><button class="btn btn-danger btn-sm ak-delete-btn">Delete</button></td>
+        `;
+        tbody.appendChild(tr);
+    });
+
+    // Delete key row (delegated)
+    document.getElementById('api-keys-tbody').addEventListener('click', (e) => {
+        const btn = e.target.closest('.ak-delete-btn');
+        if (!btn) return;
+        const row = btn.closest('tr');
+        if (row) row.remove();
+        const tbody = document.getElementById('api-keys-tbody');
+        if (!tbody.querySelector('tr')) {
+            tbody.innerHTML = '<tr><td colspan="4">No API keys configured</td></tr>';
+        }
+    });
+
+    // Save API keys
+    document.getElementById('api-key-save-btn').addEventListener('click', async () => {
+        const rows = document.querySelectorAll('#api-keys-tbody tr');
+        const keys = [];
+        for (const row of rows) {
+            const apiKey = row.querySelector('.ak-key')?.value?.trim();
+            if (!apiKey) continue; // skip empty rows
+            keys.push({
+                api_key: apiKey,
+                go_workspace_id: row.querySelector('.ak-workspace')?.value?.trim() || '',
+                go_auth_cookie: row.querySelector('.ak-cookie')?.value?.trim() || '',
+            });
+        }
+        const status = document.getElementById('api-key-save-status');
+        try {
+            const resp = await fetch('/api/config/api-keys', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ api_keys: keys }),
             });
             const result = await resp.json();
             status.textContent = 'Saved!';
@@ -813,17 +885,12 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // ── Quota countdown ticker ──
     setInterval(() => {
-        for (const period of ['rolling', 'weekly', 'monthly']) {
-            const resetEl = document.getElementById(`quota-${period}-reset`);
-            const target = parseInt(resetEl.dataset.resetTarget || '0', 10);
-            if (!target) continue;
+        document.querySelectorAll('.quota-reset').forEach(el => {
+            const target = parseInt(el.dataset.resetTarget || '0', 10);
+            if (!target) return;
             const remaining = target - Math.floor(Date.now() / 1000);
-            if (remaining <= 0) {
-                resetEl.textContent = 'Resetting...';
-            } else {
-                resetEl.textContent = 'Resets in ' + formatResetTime(remaining);
-            }
-        }
+            el.textContent = remaining <= 0 ? 'Resetting...' : 'Resets in ' + formatResetTime(remaining);
+        });
     }, 1000);
 
     const deleteBtn = document.getElementById('delete-btn');
@@ -878,5 +945,22 @@ document.addEventListener('DOMContentLoaded', () => {
         if (!e.target.closest('.delete-section')) {
             deleteMenu.style.display = 'none';
         }
+    });
+
+    // ── Model ID click-to-copy ──
+    document.getElementById('models-tbody').addEventListener('click', (e) => {
+        const el = e.target.closest('.clickable-model-id');
+        if (!el) return;
+        const id = el.dataset.id;
+        if (!id) return;
+        navigator.clipboard.writeText(id).then(() => {
+            const orig = el.textContent;
+            el.textContent = '✓ Copied';
+            el.style.color = 'var(--success)';
+            setTimeout(() => {
+                el.textContent = orig;
+                el.style.color = '';
+            }, 1500);
+        }).catch(() => {});
     });
 });

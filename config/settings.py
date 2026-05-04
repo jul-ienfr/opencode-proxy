@@ -3,6 +3,7 @@ import json
 
 ENV_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env")
 CUSTOM_ROUTES_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "custom_routes.json")
+API_KEYS_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "api_keys.json")
 
 # Config keys that are safe to expose via the API (not secrets)
 CONFIG_KEYS = ["OPENCODE_PROXY", "OPENCODE_HOST", "OPENCODE_PORT", "OPENCODE_WEB_PORT",
@@ -28,6 +29,7 @@ PROXY = os.getenv("OPENCODE_PROXY") or ""
 API_KEY = os.getenv("OPENCODE_API_KEY") or ""
 OPENCODE_GO_WORKSPACE_ID = os.getenv("OPENCODE_GO_WORKSPACE_ID", "")
 OPENCODE_GO_AUTH_COOKIE = os.getenv("OPENCODE_GO_AUTH_COOKIE", "")
+API_KEY_ROUTING = os.getenv("API_KEY_ROUTING", "round-robin")
 
 API_BASE_OPENAI    = "https://opencode.ai/zen/go/v1/chat/completions"
 API_BASE_ANTHROPIC = "https://opencode.ai/zen/go/v1/messages"
@@ -110,9 +112,36 @@ def save_custom_routes(routes: dict):
     ROUTES.update(load_routes())
 
 
+def load_api_keys() -> list[dict]:
+    """Load API key configs from JSON. Falls back to .env single-key."""
+    if os.path.exists(API_KEYS_PATH):
+        try:
+            with open(API_KEYS_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, list) and len(data) > 0:
+                    return data
+        except Exception:
+            pass
+    # Fallback: single key from .env
+    if API_KEY:
+        return [{"api_key": API_KEY,
+                 "go_workspace_id": OPENCODE_GO_WORKSPACE_ID,
+                 "go_auth_cookie": OPENCODE_GO_AUTH_COOKIE}]
+    return []
+
+
+def save_api_keys(configs: list[dict]):
+    """Save API key configs to JSON."""
+    with open(API_KEYS_PATH, "w", encoding="utf-8") as f:
+        json.dump(configs, f, indent=2, ensure_ascii=False)
+    API_KEYS.clear()
+    API_KEYS.extend(configs)
+
+
 CUSTOM_ROUTES = load_custom_routes()
 ROUTES = load_routes()
 DISABLE_MAPPING = os.getenv("DISABLE_MAPPING", "").lower() in ("1", "true", "yes")
+API_KEYS = load_api_keys()
 
 
 def get_model_config(model_id: str) -> dict:
@@ -154,20 +183,27 @@ def save_env(updates: dict):
         elif key == "OPENCODE_GO_AUTH_COOKIE":
             global OPENCODE_GO_AUTH_COOKIE
             OPENCODE_GO_AUTH_COOKIE = value
+        elif key == "API_KEY_ROUTING":
+            global API_KEY_ROUTING
+            API_KEY_ROUTING = value
         elif key == "DISABLE_MAPPING":
             global DISABLE_MAPPING
             DISABLE_MAPPING = value.lower() in ("1", "true", "yes")
+        elif key == "OPENCODE_HOST":
+            global HOST
+            HOST = value
 
     # Refresh routes
     global ROUTES
     ROUTES = load_routes()
 
 
-def apply_port_changes(port=None, web_port=None):
-    """Update PORT and WEB_PORT at runtime. Returns (new_port, new_web_port)."""
-    global PORT, WEB_PORT
+def apply_server_changes(port=None, web_port=None, host=None):
+    """Update HOST, PORT, WEB_PORT at runtime."""
+    global HOST, PORT, WEB_PORT
+    if host is not None:
+        HOST = host
     if port is not None:
         PORT = int(port)
     if web_port is not None:
         WEB_PORT = int(web_port)
-    return PORT, WEB_PORT

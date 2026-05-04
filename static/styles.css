@@ -795,6 +795,65 @@ footer {
     letter-spacing: 0.5px;
 }
 
+/* ── Clickable Model ID ── */
+.clickable-model-id {
+    cursor: pointer;
+    transition: color 0.2s;
+}
+
+.clickable-model-id:hover {
+    color: var(--accent);
+    text-decoration: underline;
+}
+
+/* ── API Keys table ── */
+.api-keys-table {
+    margin-bottom: 12px;
+}
+
+#api-keys-table th:first-child,
+#api-keys-table td:first-child {
+    min-width: 280px;
+}
+
+#api-keys-table th:nth-child(2),
+#api-keys-table td:nth-child(2) {
+    min-width: 160px;
+}
+
+/* ── Multi-workspace quotas ── */
+.quota-workspace {
+    margin-bottom: 24px;
+}
+
+.quota-workspace:last-child {
+    margin-bottom: 0;
+}
+
+.quota-workspace-title {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text-heading);
+    margin-bottom: 12px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid var(--border);
+    font-family: monospace;
+}
+
+.quota-error {
+    padding: 12px 16px;
+    background: rgba(239, 83, 80, 0.1);
+    border: 1px solid rgba(239, 83, 80, 0.3);
+    border-radius: 6px;
+    color: var(--danger);
+    font-size: 13px;
+}
+
+.quota-fetched-at {
+    font-size: 12px;
+    color: var(--text-dim);
+}
+
 .new-badge {
     display: inline-block;
     font-size: 10px;

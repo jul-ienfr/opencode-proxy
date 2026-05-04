@@ -10,7 +10,7 @@ from fastapi import Request, Response
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-from config import MODELS, HOST, PORT, WEB_PORT, PROXY, API_KEY, CONFIG_KEYS, save_env, apply_port_changes, DISABLE_MAPPING, CUSTOM_ROUTES, save_custom_routes
+from config import MODELS, HOST, PORT, WEB_PORT, PROXY, API_KEY, CONFIG_KEYS, save_env, apply_server_changes, DISABLE_MAPPING, CUSTOM_ROUTES, save_custom_routes, API_KEYS, save_api_keys, API_KEY_ROUTING
 import config.settings as config_settings
 from .display import log_lines
 from .events import get_event_manager
@@ -79,6 +79,18 @@ def register_dashboard(app, static_dir, conn, db_lock, server_manager_getter=Non
             "go_workspace_id_masked": (config_settings.OPENCODE_GO_WORKSPACE_ID[:4] + "****") if config_settings.OPENCODE_GO_WORKSPACE_ID and len(config_settings.OPENCODE_GO_WORKSPACE_ID) > 4 else (config_settings.OPENCODE_GO_WORKSPACE_ID or ""),
             "go_auth_cookie_set": bool(config_settings.OPENCODE_GO_AUTH_COOKIE),
             "go_auth_cookie_masked": (config_settings.OPENCODE_GO_AUTH_COOKIE[:6] + "****") if config_settings.OPENCODE_GO_AUTH_COOKIE and len(config_settings.OPENCODE_GO_AUTH_COOKIE) > 6 else (""),
+            "api_keys": [
+                {
+                    "api_key_masked": (k["api_key"][:4] + "****" + k["api_key"][-4:]) if len(k.get("api_key", "")) > 8 else "****",
+                    "api_key": k.get("api_key", ""),
+                    "go_workspace_id_masked": (k.get("go_workspace_id", "")[:4] + "****") if len(k.get("go_workspace_id", "")) > 4 else "",
+                    "go_auth_cookie_masked": (k.get("go_auth_cookie", "")[:6] + "****") if len(k.get("go_auth_cookie", "")) > 6 else "",
+                    "go_workspace_id": k.get("go_workspace_id", ""),
+                    "go_auth_cookie": k.get("go_auth_cookie", ""),
+                }
+                for k in API_KEYS
+            ],
+            "routing": API_KEY_ROUTING,
         }
 
     @app.get("/api/config/custom-routes")
@@ -90,6 +102,33 @@ def register_dashboard(app, static_dir, conn, db_lock, server_manager_getter=Non
         body = await request.json()
         save_custom_routes(body)
         return {"status": "ok", "message": "Custom routes updated."}
+
+    @app.get("/api/config/api-keys")
+    async def get_api_keys_config():
+        return {
+            "api_keys": [
+                {
+                    "api_key_masked": (k["api_key"][:4] + "****" + k["api_key"][-4:]) if len(k.get("api_key", "")) > 8 else "****",
+                    "api_key": k.get("api_key", ""),
+                    "has_go_workspace": bool(k.get("go_workspace_id")),
+                    "has_go_cookie": bool(k.get("go_auth_cookie")),
+                    "go_workspace_id": k.get("go_workspace_id", ""),
+                    "go_auth_cookie": k.get("go_auth_cookie", ""),
+                }
+                for k in API_KEYS
+            ],
+            "count": len(API_KEYS),
+            "routing": API_KEY_ROUTING,
+        }
+
+    @app.post("/api/config/api-keys")
+    async def update_api_keys_config(request: Request):
+        body = await request.json()
+        if "api_keys" in body:
+            save_api_keys(body["api_keys"])
+        if "routing" in body:
+            save_env({"API_KEY_ROUTING": body["routing"]})
+        return {"status": "ok", "message": "API keys saved."}
 
     @app.post("/api/config")
     async def update_config(request: Request):
@@ -120,31 +159,46 @@ def register_dashboard(app, static_dir, conn, db_lock, server_manager_getter=Non
         if "go_auth_cookie" in body and body["go_auth_cookie"]:
             env_updates["OPENCODE_GO_AUTH_COOKIE"] = body["go_auth_cookie"]
 
-        port_changed = False
-        web_port_changed = False
+        if "routing" in body:
+            env_updates["API_KEY_ROUTING"] = body["routing"]
+
+        restart_needed = False
 
         if "port" in body:
             new_port = int(body["port"])
             if new_port != PORT:
                 env_updates["OPENCODE_PORT"] = str(new_port)
-                port_changed = True
+                restart_needed = True
 
         if "web_port" in body:
             new_web_port = int(body["web_port"])
             if new_web_port != WEB_PORT:
                 env_updates["OPENCODE_WEB_PORT"] = str(new_web_port)
-                web_port_changed = True
+                restart_needed = True
+
+        if "host" in body:
+            new_host = body["host"]
+            if new_host != HOST:
+                env_updates["OPENCODE_HOST"] = new_host
+                restart_needed = True
 
         if env_updates:
             save_env(env_updates)
 
-        needs_restart = False
-        if port_changed or web_port_changed:
-            apply_port_changes(port=body.get("port"), web_port=body.get("web_port"))
+        if restart_needed:
+            apply_server_changes(
+                port=body.get("port"),
+                web_port=body.get("web_port"),
+                host=body.get("host"),
+            )
             mgr = server_manager_getter() if server_manager_getter else None
             if mgr:
                 try:
-                    mgr.restart(port=body.get("port"), web_port=body.get("web_port"))
+                    mgr.restart(
+                        port=body.get("port"),
+                        web_port=body.get("web_port"),
+                        host=body.get("host"),
+                    )
                 except Exception as e:
                     return {
                         "status": "error",
@@ -154,7 +208,7 @@ def register_dashboard(app, static_dir, conn, db_lock, server_manager_getter=Non
 
         return {
             "status": "ok",
-            "needs_restart": needs_restart,
+            "needs_restart": False,
             "message": "Configuration updated.",
         }
 

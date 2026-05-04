@@ -121,27 +121,34 @@ def get_available_models() -> dict:
 
 # ── In-memory quota cache ──
 
-_cache = {
-    "status": "not_configured",
-    "error": None,
-    "fetched_at": None,
-    "quotas": {
-        "rolling": {"usage_percent": 0, "reset_in_sec": 0},
-        "weekly":  {"usage_percent": 0, "reset_in_sec": 0},
-        "monthly": {"usage_percent": 0, "reset_in_sec": 0},
-    },
-}
+_caches: dict[str, dict] = {}
 _cache_lock = asyncio.Lock()
 
 
-def is_configured() -> bool:
-    wid = os.environ.get(_WORKSPACE_ID_ENV, "").strip()
-    ac = os.environ.get(_AUTH_COOKIE_ENV, "").strip()
-    if not wid or not re.match(r"^wrk_[A-Za-z0-9_-]+$", wid):
-        return False
-    if not ac or len(ac) < 10:
-        return False
-    return True
+def _new_cache(status="not_configured", error=None):
+    return {
+        "status": status,
+        "error": error,
+        "fetched_at": None,
+        "quotas": {
+            "rolling": {"usage_percent": 0, "reset_in_sec": 0},
+            "weekly": {"usage_percent": 0, "reset_in_sec": 0},
+            "monthly": {"usage_percent": 0, "reset_in_sec": 0},
+        },
+    }
+
+
+def get_configured_workspaces() -> list[dict]:
+    """Return list of API key configs that have workspace_id + auth_cookie."""
+    try:
+        from config.settings import API_KEYS
+        return [
+            k for k in API_KEYS
+            if k.get("go_workspace_id") and re.match(r"^wrk_[A-Za-z0-9_-]+$", k["go_workspace_id"])
+               and k.get("go_auth_cookie") and len(k["go_auth_cookie"]) >= 10
+        ]
+    except (ImportError, AttributeError):
+        return []
 
 
 # ── Model limits fetcher ──
@@ -348,10 +355,8 @@ def parse_quota_html(html: str) -> dict:
 QUOTA_FETCH_INTERVAL = 300  # 5 minutes
 
 
-async def fetch_quotas() -> dict:
-    """Fetch and parse quota data from opencode.ai."""
-    workspace_id = os.environ[_WORKSPACE_ID_ENV].strip()
-    auth_cookie = os.environ[_AUTH_COOKIE_ENV].strip()
+async def fetch_quotas(workspace_id: str, auth_cookie: str) -> dict:
+    """Fetch and parse quota data from opencode.ai for a given workspace."""
     url = f"https://opencode.ai/workspace/{httpx.URL(workspace_id)}/go"
 
     headers = {
@@ -375,7 +380,7 @@ async def fetch_quotas() -> dict:
 
 def get_quota_snapshot() -> dict:
     """Return a JSON-serializable snapshot for the API endpoint."""
-    return dict(_cache)
+    return dict(_caches)
 
 
 # ── Background poller ──
@@ -413,30 +418,42 @@ async def start_quota_fetcher(app):
 
     async def _poll():
         while True:
-            configured = is_configured()
-            if not configured:
-                async with _cache_lock:
-                    _cache["status"] = "not_configured"
-                    _cache["error"] = None
-                get_event_manager().publish("quotas_updated", {"status": "not_configured"})
+            workspaces = get_configured_workspaces()
+            active_ids = {k["go_workspace_id"] for k in workspaces}
+
+            # Remove caches for workspaces no longer configured
+            async with _cache_lock:
+                for wid in list(_caches.keys()):
+                    if wid not in active_ids:
+                        del _caches[wid]
+
+            if not workspaces:
                 await asyncio.sleep(QUOTA_FETCH_INTERVAL)
                 continue
 
-            try:
-                quotas = await fetch_quotas()
-                async with _cache_lock:
-                    _cache["status"] = "ok"
-                    _cache["error"] = None
-                    _cache["fetched_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
-                    _cache["quotas"] = quotas
-                get_event_manager().publish("quotas_updated", {"status": "ok"})
-                logger.debug("OpenCode Go quotas refreshed successfully")
-            except Exception as e:
-                logger.warning("OpenCode Go quota fetch failed: %s", e)
-                async with _cache_lock:
-                    _cache["status"] = "error"
-                    _cache["error"] = str(e)
-                get_event_manager().publish("quotas_updated", {"status": "error", "error": str(e)})
+            for ws in workspaces:
+                wid = ws["go_workspace_id"]
+                cookie = ws["go_auth_cookie"]
+                try:
+                    quotas = await fetch_quotas(wid, cookie)
+                    async with _cache_lock:
+                        _caches[wid] = {
+                            "status": "ok",
+                            "error": None,
+                            "fetched_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                            "quotas": quotas,
+                        }
+                    get_event_manager().publish("quotas_updated", {"workspace_id": wid, "status": "ok"})
+                    logger.debug("Quotas refreshed for workspace %s", wid[:8])
+                except Exception as e:
+                    logger.warning("Quota fetch failed for workspace %s: %s", wid[:8], e)
+                    async with _cache_lock:
+                        if wid in _caches:
+                            _caches[wid]["status"] = "error"
+                            _caches[wid]["error"] = str(e)
+                        else:
+                            _caches[wid] = _new_cache("error", str(e))
+                    get_event_manager().publish("quotas_updated", {"workspace_id": wid, "status": "error", "error": str(e)})
 
             await asyncio.sleep(QUOTA_FETCH_INTERVAL)
 

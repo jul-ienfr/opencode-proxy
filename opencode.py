@@ -16,7 +16,39 @@ import httpx
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import StreamingResponse, JSONResponse
 
-from config import API_KEY, PROXY, MODELS, ROUTES, get_model_config, HOST, PORT, WEB_PORT, DISABLE_MAPPING
+from config import API_KEY, PROXY, MODELS, ROUTES, get_model_config, HOST, PORT, WEB_PORT, DISABLE_MAPPING, API_KEYS, API_KEY_ROUTING
+
+import itertools
+
+# ── API key routing ──
+_key_cycle = None
+_key_failover_index = 0
+
+def get_next_api_key() -> dict:
+    global _key_cycle, _key_failover_index
+    if not API_KEYS:
+        return {"api_key": API_KEY}
+    if len(API_KEYS) == 1:
+        return API_KEYS[0]
+    if API_KEY_ROUTING == "failover":
+        return API_KEYS[_key_failover_index % len(API_KEYS)]
+    if _key_cycle is None:
+        _key_cycle = itertools.cycle(API_KEYS)
+    return next(_key_cycle)
+
+def advance_failover():
+    global _key_failover_index
+    if API_KEYS and API_KEY_ROUTING == "failover":
+        _key_failover_index = (_key_failover_index + 1) % len(API_KEYS)
+
+def _get_auth_headers(protocol: str) -> dict:
+    entry = get_next_api_key()
+    ak = entry.get("api_key", API_KEY)
+    if protocol == "anthropic":
+        return {"x-api-key": ak, "Content-Type": "application/json",
+                "anthropic-version": "2023-06-01"}
+    return {"Authorization": f"Bearer {ak}", "Content-Type": "application/json"}
+
 
 try:
     import tiktoken
@@ -404,8 +436,7 @@ async def messages(request: Request):
 
     # ── Anthropic pass-through ──────────────────────────────────
     if protocol == "anthropic":
-        a_headers = {"x-api-key": API_KEY, "Content-Type": "application/json",
-                     "anthropic-version": "2023-06-01"}
+        a_headers = _get_auth_headers("anthropic")
         is_stream = body.get("stream", False)
 
         if not is_stream:
@@ -510,7 +541,7 @@ async def messages(request: Request):
 
     # ── OpenAI-protocol ─────────────────────────────────────────
     oai_body = anthropic_to_openai(body, model_id)
-    headers = {"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"}
+    headers = _get_auth_headers("openai")
     is_stream = oai_body["stream"]
 
     if not is_stream:
@@ -800,9 +831,11 @@ class ServerManager:
         self._thread = None
         self._web_thread = None
 
-    def restart(self, port=None, web_port=None):
-        """Hot-restart: stop + update ports + start."""
+    def restart(self, port=None, web_port=None, host=None):
+        """Hot-restart: stop + update host/ports + start."""
         self.stop()
+        if host is not None:
+            self.host = host
         if port is not None:
             self.port = int(port)
         if web_port is not None:

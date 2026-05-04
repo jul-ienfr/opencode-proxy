@@ -4,5 +4,11 @@
       "kimi-k2.5"
     ],
     "model": "deepseek-v4-flash"
+  },
+  "mimov25pro": {
+    "match": [
+      "mimo-v2.5-pro"
+    ],
+    "model": "deepseek-v4-flash"
   }
 }
