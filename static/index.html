@@ -149,26 +149,6 @@
             </section>
 
             <section id="config" class="tab-content">
-                <!-- Proxy control -->
-                <div class="card">
-                    <h2>Proxy Status</h2>
-                    <div class="config-row">
-                        <div class="config-status">
-                            <span id="proxy-status-dot" class="status-dot running"></span>
-                            <span id="proxy-status-text">Running</span>
-                            <span id="proxy-status-addr" class="config-addr clickable"></span>
-                            <span id="proxy-status-lan" class="config-addr" style="display:none"></span>
-                        </div>
-                        <div class="config-actions">
-                            <button class="btn" id="btn-proxy-start" disabled>Start</button>
-                            <button class="btn btn-danger" id="btn-proxy-stop">Stop</button>
-                        </div>
-                    </div>
-                    <div id="restart-notice" class="notice" style="display:none">
-                        Proxy restart required for port changes to take effect.
-                    </div>
-                </div>
-
                 <!-- Model mapping -->
                 <div class="card">
                     <h2>Model Mapping</h2>
@@ -273,9 +253,24 @@
                     <p class="config-hint" style="margin-top:8px">Estimated request limits per time window based on your plan's dollar caps and per-model pricing. <a href="https://opencode.ai/docs/fr/go/#usage-limits" target="_blank">See docs</a></p>
                 </div>
 
-                <!-- Server config -->
+                <!-- Server Settings -->
                 <div class="card">
                     <h2>Server Settings</h2>
+                    <div class="config-row" style="margin-bottom:18px">
+                        <div class="config-status">
+                            <span id="proxy-status-dot" class="status-dot running"></span>
+                            <span id="proxy-status-text">Running</span>
+                            <span id="proxy-status-addr" class="config-addr clickable"></span>
+                            <span id="proxy-status-lan" class="config-addr" style="display:none"></span>
+                        </div>
+                        <div class="config-actions">
+                            <button class="btn" id="btn-proxy-start" disabled>Start</button>
+                            <button class="btn btn-danger" id="btn-proxy-stop">Stop</button>
+                        </div>
+                    </div>
+                    <div id="restart-notice" class="notice" style="display:none;margin-bottom:16px">
+                        Proxy restart required for port changes to take effect.
+                    </div>
                     <div class="config-grid">
                         <div class="config-field">
                             <label for="cfg-port">API Port</label>
