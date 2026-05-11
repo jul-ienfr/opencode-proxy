@@ -10,7 +10,7 @@ class TrayApp:
         self.server_manager = server_manager
         self.host = host
         self.port = port
-        self.dashboard = DashboardWindow(web_port)
+        self.dashboard = DashboardWindow(port)
         self._icon = None
 
     def _api_url(self):
@@ -65,8 +65,13 @@ class TrayApp:
 
     def _on_quit(self, icon, item):
         self.dashboard.close()
-        self.server_manager.stop()
-        icon.stop()
+        # Stop servers in background; don't block the tray message loop.
+        import threading
+        threading.Thread(target=self.server_manager.stop, daemon=True).start()
+        try:
+            icon.stop()
+        except Exception:
+            pass
 
     # ── Entry point ──
 

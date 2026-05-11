@@ -212,8 +212,61 @@ async def fetch_model_limits() -> dict[str, list[int]]:
 
 
 def get_model_limits() -> dict[str, list[int]]:
-    """Return fetched model limits, or fallback defaults."""
-    return _model_limits_cache or _MODEL_LIMITS_FALLBACK
+    """Return model limits: fetched cache topped up with fallback defaults."""
+    base = dict(_MODEL_LIMITS_FALLBACK)
+    if _model_limits_cache:
+        base.update(_model_limits_cache)
+    return base
+
+
+# ── Capability estimation for unknown models ──
+
+
+def _estimate_capabilities(model_id: str) -> list[str]:
+    """Estimate capabilities for unknown models based on name patterns."""
+    caps = ["chat", "tools"]
+    m = model_id.lower()
+    if any(x in m for x in ("vision", "omni", "vl", "visual")):
+        caps.append("vision")
+    if any(x in m for x in ("code", "coder", "deepseek")):
+        caps.append("code")
+    if "search" in m:
+        caps.append("web-search")
+    return caps
+
+
+def get_model_capabilities_for_all(models: dict) -> dict[str, list[str]]:
+    """Return capabilities for every model — known caps + heuristic estimation."""
+    result = {}
+    for mid in models:
+        if mid in MODEL_CAPABILITIES:
+            result[mid] = MODEL_CAPABILITIES[mid]
+        else:
+            result[mid] = _estimate_capabilities(mid)
+    return result
+
+
+# ── Limit estimation for unknown models ──
+
+
+def _estimate_limits(model_id: str) -> list[int]:
+    """Estimate request limits for unknown models based on name patterns."""
+    m = model_id.lower()
+    if "flash" in m:
+        return [30000, 75000, 150000]
+    return [1000, 2500, 5000]
+
+
+def get_model_limits_for_all(models: dict) -> dict[str, list[int]]:
+    """Return limits for every model — real values topped up with estimation."""
+    base = get_model_limits()
+    result = {}
+    for mid in models:
+        if mid in base:
+            result[mid] = base[mid]
+        else:
+            result[mid] = _estimate_limits(mid)
+    return result
 
 
 # ── HTML parsing ──
@@ -418,6 +471,17 @@ async def start_quota_fetcher(app):
 
     async def _poll():
         while True:
+            # Periodically refresh upstream model list (every cycle = ~5 min)
+            try:
+                models = await fetch_available_models()
+                old_cache: list[str] = _models_cache or []
+                if set(models) != set(old_cache):
+                    _models_cache = models
+                    logger.info("Upstream model list changed: %d models", len(models))
+                    get_event_manager().publish("models_updated", {"count": len(models)})
+            except Exception:
+                pass
+
             workspaces = get_configured_workspaces()
             active_ids = {k["go_workspace_id"] for k in workspaces}
 

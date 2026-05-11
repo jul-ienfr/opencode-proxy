@@ -11,38 +11,74 @@ import os
 import sqlite3
 import threading
 import traceback
+import asyncio
 from contextlib import asynccontextmanager
 import httpx
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import StreamingResponse, JSONResponse
 
-from config import API_KEY, PROXY, MODELS, ROUTES, get_model_config, HOST, PORT, WEB_PORT, DISABLE_MAPPING, API_KEYS, API_KEY_ROUTING
+from config import API_KEY, PROXY, MODELS, ROUTES, get_model_config, HOST, PORT, WEB_PORT, DISABLE_MAPPING, API_KEYS, API_KEY_ROUTING, CUSTOM_ROUTES
 
 import itertools
 
 # ── API key routing ──
 _key_cycle = None
+_key_cycle_keys = []
 _key_failover_index = 0
 
+def _get_enabled_keys() -> list[dict]:
+    return [k for k in API_KEYS if k.get("enabled", True)]
+
 def get_next_api_key() -> dict:
-    global _key_cycle, _key_failover_index
+    global _key_cycle, _key_cycle_keys, _key_failover_index
     if not API_KEYS:
         return {"api_key": API_KEY}
-    if len(API_KEYS) == 1:
-        return API_KEYS[0]
+    enabled = _get_enabled_keys()
+    if not enabled:
+        return {"api_key": API_KEY}
+    if len(enabled) == 1:
+        return enabled[0]
     if API_KEY_ROUTING == "failover":
-        return API_KEYS[_key_failover_index % len(API_KEYS)]
-    if _key_cycle is None:
-        _key_cycle = itertools.cycle(API_KEYS)
+        for i in range(len(API_KEYS)):
+            idx = (_key_failover_index + i) % len(API_KEYS)
+            if API_KEYS[idx].get("enabled", True):
+                return API_KEYS[idx]
+        return {"api_key": API_KEY}
+    # rebuild cycle if enabled keys changed (e.g. toggled via dashboard)
+    current_ids = [k.get("api_key") for k in enabled]
+    if _key_cycle is None or _key_cycle_keys != current_ids:
+        _key_cycle = itertools.cycle(enabled)
+        _key_cycle_keys = current_ids
     return next(_key_cycle)
+
+def _find_alternative_key(failed_key: str) -> dict | None:
+    """Return the first enabled key different from failed_key, or None."""
+    for k in API_KEYS:
+        if k.get("api_key") != failed_key and k.get("enabled", True):
+            return k
+    return None
 
 def advance_failover():
     global _key_failover_index
     if API_KEYS and API_KEY_ROUTING == "failover":
         _key_failover_index = (_key_failover_index + 1) % len(API_KEYS)
 
-def _get_auth_headers(protocol: str) -> dict:
-    entry = get_next_api_key()
+def _alias_for_key(api_key: str) -> str:
+    """Look up the alias for a given API key. Returns empty string if not found."""
+    for k in API_KEYS:
+        if k.get("api_key") == api_key:
+            return k.get("alias", "") or ""
+    return ""
+
+def _key_from_headers(headers: dict, protocol: str) -> str:
+    """Extract the API key from request headers."""
+    if protocol == "anthropic":
+        return headers.get("x-api-key", "")
+    return headers.get("Authorization", "").replace("Bearer ", "")
+
+def _get_auth_headers(protocol: str, entry: dict | None = None) -> dict:
+    if entry is None:
+        entry = get_next_api_key()
     ak = entry.get("api_key", API_KEY)
     if protocol == "anthropic":
         return {"x-api-key": ak, "Content-Type": "application/json",
@@ -90,7 +126,7 @@ _conn.execute("""
     )
 """)
 _conn.execute("CREATE INDEX IF NOT EXISTS idx_timestamp ON requests(timestamp)")
-for col, default in [("protocol", "NULL"), ("is_stream", "0"), ("thinking", "NULL"), ("effort", "NULL")]:
+for col, default in [("protocol", "NULL"), ("is_stream", "0"), ("thinking", "NULL"), ("effort", "NULL"), ("client_ip", "NULL"), ("account_alias", "NULL")]:
     try:
         _conn.execute(f"ALTER TABLE requests ADD COLUMN {col} TEXT DEFAULT {default}")
     except Exception:
@@ -100,17 +136,19 @@ _conn.commit()
 
 def _save_request(req_id, model, original_model, duration_ms,
                   tokens_input, tokens_output, tokens_cache, success=True, error=None,
-                  protocol=None, is_stream=False, thinking=None, effort=None):
+                  protocol=None, is_stream=False, thinking=None, effort=None,
+                  client_ip=None, account_alias=None):
     timestamp = time.strftime("%Y-%m-%dT%H:%M:%S")
     with _db_lock:
         _conn.execute("""
             INSERT OR REPLACE INTO requests (id, timestamp, model, original_model, duration_ms,
                 tokens_input, tokens_output, tokens_cache, success, error,
-                protocol, is_stream, thinking, effort)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                protocol, is_stream, thinking, effort, client_ip, account_alias)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (req_id, timestamp, model, original_model, duration_ms,
               tokens_input, tokens_output, tokens_cache, 1 if success else 0, error,
-              protocol, 1 if is_stream else 0, thinking, effort))
+              protocol, 1 if is_stream else 0, thinking, effort,
+              client_ip, account_alias))
         _conn.commit()
 
     # Notify dashboard SSE clients about the update
@@ -167,8 +205,14 @@ def _route_for(model_name: str) -> dict:
         return {"match": [], "model": model_name}
     name = model_name.lower()
     for r in ROUTES.values():
-        if any(m in name for m in r["match"]):
+        if r.get("enabled") is False:
+            continue
+        if any(m in name for m in r.get("match", [])):
             return r
+    # Wildcard catch-all: if a custom route "*" (or legacy "") exists, use it
+    wildcard = CUSTOM_ROUTES.get("*") or CUSTOM_ROUTES.get("")
+    if wildcard and isinstance(wildcard, dict) and wildcard.get("model") and wildcard.get("enabled") is not False:
+        return wildcard
     return ROUTES["sonnet"]
 
 
@@ -408,6 +452,10 @@ def _elapsed_ms(start_time: float) -> int:
 async def messages(request: Request):
     req_id = f"msg_{uuid.uuid4().hex[:24]}"
     start_time = time.time()
+    client_ip = request.client.host if request.client else "unknown"
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        client_ip = forwarded.split(",")[0].strip()
 
     try:
         body = json.loads(await request.body())
@@ -424,6 +472,16 @@ async def messages(request: Request):
     body = dict(body)
     body["model"] = model_id
 
+    # Apply custom route overrides for thinking/effort
+    thinking_override = route.get("thinking")
+    if thinking_override and thinking_override != "auto":
+        if not isinstance(body.get("thinking"), dict):
+            body["thinking"] = {}
+        body["thinking"]["type"] = thinking_override
+    effort_override = route.get("effort")
+    if effort_override and effort_override != "auto":
+        body["effort"] = effort_override
+
     # Extract thinking for logging
     thinking = body.get("thinking", {})
     thinking_type = thinking.get("type", "none") if isinstance(thinking, dict) else "none"
@@ -432,7 +490,7 @@ async def messages(request: Request):
               or (body.get("output_config", {}).get("effort") if isinstance(body.get("output_config"), dict) else None)
               or "none")
 
-    _log(f"→ {original_model!r} → {model_id} | {protocol} | stream={body.get('stream', False)} | thinking={thinking_type} | effort={effort}")
+    _log(f"→ {original_model!r} → {model_id} | {protocol} | stream={body.get('stream', False)} | thinking={thinking_type} | effort={effort} | ip={client_ip}")
 
     # ── Anthropic pass-through ──────────────────────────────────
     if protocol == "anthropic":
@@ -441,11 +499,20 @@ async def messages(request: Request):
 
         if not is_stream:
             resp = await _client.post(endpoint, json=body, headers=a_headers)
+            if resp.status_code == 429 and len(API_KEYS) > 1:
+                failed_key = a_headers.get("x-api-key", "")
+                alt = _find_alternative_key(failed_key)
+                if alt:
+                    _log(f"  429 on key, retrying with alternative key")
+                    a_headers = _get_auth_headers("anthropic", entry=alt)
+                    resp = await _client.post(endpoint, json=body, headers=a_headers)
+            account_alias = _alias_for_key(a_headers.get("x-api-key", ""))
             if resp.status_code != 200:
                 _log(f"  ERROR {resp.status_code}: {resp.text[:300]}")
                 _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
                              0, 0, 0, success=False, error=f"HTTP {resp.status_code}",
-                             protocol=protocol, is_stream=is_stream, thinking=thinking_type, effort=effort)
+                             protocol=protocol, is_stream=is_stream, thinking=thinking_type, effort=effort,
+                             client_ip=client_ip, account_alias=account_alias)
                 return Response(content=resp.content, status_code=resp.status_code, media_type="application/json")
             data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
             usage = data.get("usage", {})
@@ -456,10 +523,12 @@ async def messages(request: Request):
                 _token_usage[model_id]["input"] += req_in
                 _token_usage[model_id]["output"] += req_out
                 _token_usage[model_id]["cache"] += req_cache
-            _log(f"  ← {model_id} | +{req_in} in | +{req_out} out | +{req_cache} cache")
+            alias_tag = f" | account={account_alias}" if account_alias else ""
+            _log(f"  ← {model_id} | +{req_in} in | +{req_out} out | +{req_cache} cache{alias_tag}")
             _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
                          req_in, req_out, req_cache, success=True,
-                         protocol=protocol, is_stream=is_stream, thinking=thinking_type, effort=effort)
+                         protocol=protocol, is_stream=is_stream, thinking=thinking_type, effort=effort,
+                         client_ip=client_ip, account_alias=account_alias)
             return Response(content=resp.content, media_type="application/json")
 
         # Estimate input tokens for Anthropic streaming
@@ -467,74 +536,95 @@ async def messages(request: Request):
         with _token_lock:
             _token_usage[model_id]["input"] += est_input
 
-        async def anthropic_stream():
+        async def anthropic_stream(headers):
             stream_in = None
             stream_out = stream_cache = 0
             _line_buf = ""
-            try:
-                async with _client.stream("POST", endpoint, json=body, headers=a_headers) as resp:
-                    if resp.status_code != 200:
-                        err = await resp.aread()
-                        _log(f"  ERROR {resp.status_code}: {err[:300]}")
-                        _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
-                                     0, 0, 0, success=False, error=f"HTTP {resp.status_code}",
-                                     protocol=protocol, is_stream=True, thinking=thinking_type, effort=effort)
-                        error_payload = {"type": "error", "error": {"type": "api_error",
-                                       "message": f"HTTP {resp.status_code}: {err.decode('utf-8', errors='replace')[:200]}"}}
-                        yield _sse("error", error_payload)
-                        return
-                    async for chunk in resp.aiter_bytes():
-                        yield chunk
-                        _line_buf += chunk.decode("utf-8", errors="replace")
-                        while "\n" in _line_buf:
-                            line, _line_buf = _line_buf.split("\n", 1)
-                            line = line.strip()
-                            if not line.startswith("data:"):
-                                continue
-                            data_str = line[5:].strip()
-                            if data_str == "[DONE]":
-                                continue
-                            try:
-                                event = json.loads(data_str)
-                            except Exception:
-                                continue
-                            etype = event.get("type", "")
-                            if etype == "message_start":
-                                usage = event.get("message", {}).get("usage", {})
-                                stream_in = usage.get("input_tokens")
-                                if stream_in is not None:
-                                    with _token_lock:
-                                        _token_usage[model_id]["input"] -= est_input
-                                        _token_usage[model_id]["input"] += stream_in
-                                stream_cache = usage.get("cache_read_input_tokens", 0)
-                                if stream_cache:
-                                    with _token_lock:
-                                        _token_usage[model_id]["cache"] += stream_cache
-                            elif etype == "message_delta":
-                                usage = event.get("usage", {})
-                                stream_out = usage.get("output_tokens", 0)
-                # After stream ends, apply final output token count
-                if stream_out:
-                    with _token_lock:
-                        _token_usage[model_id]["output"] += stream_out
-            except Exception as e:
-                _log(f"  ERROR stream: {e}")
-                if stream_in is None:
-                    with _token_lock:
-                        _token_usage[model_id]["input"] -= est_input
-                if stream_out:
-                    with _token_lock:
-                        _token_usage[model_id]["output"] += stream_out
-                _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
-                             stream_in if stream_in is not None else est_input, stream_out, stream_cache, success=False, error=str(e),
-                             protocol=protocol, is_stream=True, thinking=thinking_type, effort=effort)
+            for _attempt in range(2):  # retry once on 429
+                try:
+                    async with _client.stream("POST", endpoint, json=body, headers=headers) as resp:
+                        if resp.status_code != 200:
+                            if resp.status_code == 429 and _attempt == 0 and len(API_KEYS) > 1:
+                                failed_key = headers.get("x-api-key", "")
+                                alt = _find_alternative_key(failed_key)
+                                if alt:
+                                    _log(f"  429 on key, retrying with alternative key")
+                                    headers = _get_auth_headers("anthropic", entry=alt)
+                                    continue  # retry with next attempt
+                            err = await resp.aread()
+                            _log(f"  ERROR {resp.status_code}: {err[:300]}")
+                            ak = _alias_for_key(headers.get("x-api-key", ""))
+                            _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
+                                         0, 0, 0, success=False, error=f"HTTP {resp.status_code}",
+                                         protocol=protocol, is_stream=True, thinking=thinking_type, effort=effort,
+                                         client_ip=client_ip, account_alias=ak)
+                            error_payload = {"type": "error", "error": {"type": "api_error",
+                                           "message": f"HTTP {resp.status_code}: {err.decode('utf-8', errors='replace')[:200]}"}}
+                            yield _sse("error", error_payload)
+                            return
+                        async for chunk in resp.aiter_bytes():
+                            yield chunk
+                            _line_buf += chunk.decode("utf-8", errors="replace")
+                            while "\n" in _line_buf:
+                                line, _line_buf = _line_buf.split("\n", 1)
+                                line = line.strip()
+                                if not line.startswith("data:"):
+                                    continue
+                                data_str = line[5:].strip()
+                                if data_str == "[DONE]":
+                                    continue
+                                try:
+                                    event = json.loads(data_str)
+                                except Exception:
+                                    continue
+                                etype = event.get("type", "")
+                                if etype == "message_start":
+                                    usage = event.get("message", {}).get("usage", {})
+                                    stream_in = usage.get("input_tokens")
+                                    if stream_in is not None:
+                                        with _token_lock:
+                                            _token_usage[model_id]["input"] -= est_input
+                                            _token_usage[model_id]["input"] += stream_in
+                                    stream_cache = usage.get("cache_read_input_tokens", 0)
+                                    if stream_cache:
+                                        with _token_lock:
+                                            _token_usage[model_id]["cache"] += stream_cache
+                                elif etype == "message_delta":
+                                    usage = event.get("usage", {})
+                                    stream_out = usage.get("output_tokens", 0)
+                        # After stream ends, apply final output token count
+                        if stream_out:
+                            with _token_lock:
+                                _token_usage[model_id]["output"] += stream_out
+                except Exception as e:
+                    ak = _alias_for_key(headers.get("x-api-key", "")) if headers else ""
+                    _log(f"  ERROR stream: {e}")
+                    if stream_in is None:
+                        with _token_lock:
+                            _token_usage[model_id]["input"] -= est_input
+                    if stream_out:
+                        with _token_lock:
+                            _token_usage[model_id]["output"] += stream_out
+                    _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
+                                 stream_in if stream_in is not None else est_input, stream_out, stream_cache, success=False, error=str(e),
+                                 protocol=protocol, is_stream=True, thinking=thinking_type, effort=effort,
+                                 client_ip=client_ip, account_alias=ak)
+                    return
+                else:
+                    # Only reached if no exception and no break (successful stream)
+                    break
+            else:
+                # Exhausted retries without success → error already yielded
                 return
             logged_in = stream_in if stream_in is not None else est_input
             if stream_in is not None or stream_out:
-                _log(f"  ← {model_id} | +{logged_in} in | +{stream_out} out | +{stream_cache} cache")
+                ak = _alias_for_key(headers.get("x-api-key", ""))
+                alias_tag = f" | account={ak}" if ak else ""
+                _log(f"  ← {model_id} | +{logged_in} in | +{stream_out} out | +{stream_cache} cache{alias_tag}")
                 _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
                              logged_in, stream_out, stream_cache, success=True,
-                             protocol=protocol, is_stream=True, thinking=thinking_type, effort=effort)
+                             protocol=protocol, is_stream=True, thinking=thinking_type, effort=effort,
+                             client_ip=client_ip, account_alias=ak)
 
         return StreamingResponse(anthropic_stream(), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
@@ -546,11 +636,20 @@ async def messages(request: Request):
 
     if not is_stream:
         resp = await _client.post(endpoint, json=oai_body, headers=headers)
+        if resp.status_code == 429 and len(API_KEYS) > 1:
+            failed_key = headers.get("Authorization", "").replace("Bearer ", "")
+            alt = _find_alternative_key(failed_key)
+            if alt:
+                _log(f"  429 on key, retrying with alternative key")
+                headers = _get_auth_headers("openai", entry=alt)
+                resp = await _client.post(endpoint, json=oai_body, headers=headers)
+        account_alias = _alias_for_key(_key_from_headers(headers, "openai"))
         if resp.status_code != 200:
             _log(f"  ERROR {resp.status_code}: {resp.text[:300]}")
             _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
                          0, 0, 0, success=False, error=f"HTTP {resp.status_code}",
-                         protocol=protocol, is_stream=is_stream, thinking=thinking_type, effort=effort)
+                         protocol=protocol, is_stream=is_stream, thinking=thinking_type, effort=effort,
+                         client_ip=client_ip, account_alias=account_alias)
             try:
                 err_data = resp.json()
                 err_msg = err_data.get("error", {})
@@ -570,10 +669,12 @@ async def messages(request: Request):
             _token_usage[model_id]["input"] += req_in
             _token_usage[model_id]["output"] += req_out
             _token_usage[model_id]["cache"] += cache
-        _log(f"  ← {model_id} | +{req_in} in | +{req_out} out | +{cache} cache")
+        alias_tag = f" | account={account_alias}" if account_alias else ""
+        _log(f"  ← {model_id} | +{req_in} in | +{req_out} out | +{cache} cache{alias_tag}")
         _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
                      req_in, req_out, cache, success=True,
-                     protocol=protocol, is_stream=False, thinking=thinking_type, effort=effort)
+                     protocol=protocol, is_stream=False, thinking=thinking_type, effort=effort,
+                     client_ip=client_ip, account_alias=account_alias)
         return Response(content=json.dumps(openai_to_anthropic(data, original_model), ensure_ascii=False),
                         media_type="application/json")
 
@@ -585,7 +686,7 @@ async def messages(request: Request):
     with _token_lock:
         _token_usage[model_id]["input"] += stream_in_est
 
-    async def stream_gen():
+    async def stream_gen(hdrs):
         started = False
         open_blocks = []
         text_block_idx = None
@@ -595,153 +696,173 @@ async def messages(request: Request):
         stream_out_tokens = 0
         actual_usage = None
 
-        try:
-            async with _client.stream("POST", endpoint, json=oai_body, headers=headers) as resp:
-                if resp.status_code != 200:
-                    err = await resp.aread()
-                    _log(f"  ERROR {resp.status_code}: {err[:300]}")
-                    _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
-                                 0, 0, 0, success=False, error=f"HTTP {resp.status_code}",
-                                 protocol=protocol, is_stream=True, thinking=thinking_type, effort=effort)
-                    error_payload = {"type": "error", "error": {"type": "api_error",
-                                   "message": f"HTTP {resp.status_code}: {err.decode('utf-8', errors='replace')[:200]}"}}
-                    yield _sse("error", error_payload)
-                    return
+        for _attempt in range(2):
+            try:
+                async with _client.stream("POST", endpoint, json=oai_body, headers=hdrs) as resp:
+                    if resp.status_code != 200:
+                        if resp.status_code == 429 and _attempt == 0 and len(API_KEYS) > 1:
+                            failed_key = hdrs.get("Authorization", "").replace("Bearer ", "")
+                            alt = _find_alternative_key(failed_key)
+                            if alt:
+                                _log(f"  429 on key, retrying with alternative key")
+                                hdrs = _get_auth_headers("openai", entry=alt)
+                                continue
+                        err = await resp.aread()
+                        _log(f"  ERROR {resp.status_code}: {err[:300]}")
+                        ak_h = _alias_for_key(_key_from_headers(hdrs, "openai"))
+                        _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
+                                     0, 0, 0, success=False, error=f"HTTP {resp.status_code}",
+                                     protocol=protocol, is_stream=True, thinking=thinking_type, effort=effort,
+                                     client_ip=client_ip, account_alias=ak_h)
+                        error_payload = {"type": "error", "error": {"type": "api_error",
+                                       "message": f"HTTP {resp.status_code}: {err.decode('utf-8', errors='replace')[:200]}"}}
+                        yield _sse("error", error_payload)
+                        return
 
-                async for line in resp.aiter_lines():
-                    if not line.startswith("data:"):
-                        continue
-                    data = line[5:].strip()
+                    async for line in resp.aiter_lines():
+                        if not line.startswith("data:"):
+                            continue
+                        data = line[5:].strip()
 
-                    if data == "[DONE]":
-                        final_in = stream_in_est
-                        final_out = stream_out_tokens
-                        final_cache = 0
-                        with _token_lock:
-                            if actual_usage:
-                                final_in = actual_usage.get("prompt_tokens")
-                                if final_in is None:
-                                    final_in = stream_in_est
-                                final_out = actual_usage.get("completion_tokens")
-                                if final_out is None:
-                                    total = actual_usage.get("total_tokens")
-                                    prompt = actual_usage.get("prompt_tokens")
-                                    if total is not None and prompt is not None:
-                                        final_out = total - prompt
-                                if final_out is None:
-                                    final_out = stream_out_tokens
-                                final_cache = _extract_cache_tokens(actual_usage)
-                                _token_usage[model_id]["input"] -= stream_in_est
-                                _token_usage[model_id]["input"] += final_in
-                                _token_usage[model_id]["output"] += final_out
-                                if final_cache:
-                                    _token_usage[model_id]["cache"] += final_cache
-                            else:
-                                _token_usage[model_id]["output"] += stream_out_tokens
+                        if data == "[DONE]":
+                            final_in = stream_in_est
+                            final_out = stream_out_tokens
+                            final_cache = 0
+                            with _token_lock:
+                                if actual_usage:
+                                    final_in = actual_usage.get("prompt_tokens")
+                                    if final_in is None:
+                                        final_in = stream_in_est
+                                    final_out = actual_usage.get("completion_tokens")
+                                    if final_out is None:
+                                        total = actual_usage.get("total_tokens")
+                                        prompt = actual_usage.get("prompt_tokens")
+                                        if total is not None and prompt is not None:
+                                            final_out = total - prompt
+                                    if final_out is None:
+                                        final_out = stream_out_tokens
+                                    final_cache = _extract_cache_tokens(actual_usage)
+                                    _token_usage[model_id]["input"] -= stream_in_est
+                                    _token_usage[model_id]["input"] += final_in
+                                    _token_usage[model_id]["output"] += final_out
+                                    if final_cache:
+                                        _token_usage[model_id]["cache"] += final_cache
+                                else:
+                                    _token_usage[model_id]["output"] += stream_out_tokens
+                            if not started:
+                                started = True
+                                yield _sse("message_start", {"type": "message_start", "message": {
+                                    "id": msg_id, "type": "message", "role": "assistant", "content": [],
+                                    "model": original_model, "stop_reason": None, "stop_sequence": None,
+                                    "usage": {"input_tokens": final_in, "output_tokens": 0}}})
+                            for idx in open_blocks:
+                                yield _sse("content_block_stop", {"type": "content_block_stop", "index": idx})
+                            has_tools = bool(tool_block_idx)
+                            yield _sse("message_delta", {"type": "message_delta", "delta": {"stop_reason": "tool_use" if has_tools else "end_turn"}, "usage": {"output_tokens": final_out}})
+                            yield _sse("message_stop", {"type": "message_stop"})
+                            log_tag = "" if actual_usage else " (est)"
+                            ak_h = _alias_for_key(_key_from_headers(hdrs, "openai"))
+                            alias_tag = f" | account={ak_h}" if ak_h else ""
+                            _log(f"  ← {model_id} | +{final_in} in{log_tag} | +{final_out} out{log_tag} | +{final_cache} cache{alias_tag}")
+                            _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
+                                         final_in, final_out, final_cache, success=True,
+                                         protocol=protocol, is_stream=True, thinking=thinking_type, effort=effort,
+                                         client_ip=client_ip, account_alias=ak_h)
+                            break
+
+                        try:
+                            chunk = json.loads(data)
+                        except Exception:
+                            continue
+
+                        chunk_usage = chunk.get("usage")
+                        if chunk_usage and isinstance(chunk_usage, dict):
+                            actual_usage = chunk_usage
+
+                        choices = chunk.get("choices", [])
+                        if not choices or not isinstance(choices, list):
+                            continue
+                        first_choice = choices[0] if choices else {}
+                        delta = first_choice.get("delta", {}) if isinstance(first_choice, dict) else {}
+                        if not delta or not isinstance(delta, dict):
+                            delta = {}
+
                         if not started:
                             started = True
                             yield _sse("message_start", {"type": "message_start", "message": {
                                 "id": msg_id, "type": "message", "role": "assistant", "content": [],
                                 "model": original_model, "stop_reason": None, "stop_sequence": None,
-                                "usage": {"input_tokens": final_in, "output_tokens": 0}}})
-                        for idx in open_blocks:
-                            yield _sse("content_block_stop", {"type": "content_block_stop", "index": idx})
-                        has_tools = bool(tool_block_idx)
-                        yield _sse("message_delta", {"type": "message_delta", "delta": {"stop_reason": "tool_use" if has_tools else "end_turn"}, "usage": {"output_tokens": final_out}})
-                        yield _sse("message_stop", {"type": "message_stop"})
-                        log_tag = "" if actual_usage else " (est)"
-                        _log(f"  ← {model_id} | +{final_in} in{log_tag} | +{final_out} out{log_tag} | +{final_cache} cache")
-                        _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
-                                     final_in, final_out, final_cache, success=True,
-                                     protocol=protocol, is_stream=True, thinking=thinking_type, effort=effort)
-                        break
+                                "usage": {"input_tokens": stream_in_est, "output_tokens": 0}}})
 
-                    try:
-                        chunk = json.loads(data)
-                    except Exception:
-                        continue
+                        # Text
+                        text = ""
+                        c = delta.get("content")
+                        if isinstance(c, str):
+                            text = c
+                        elif isinstance(c, list):
+                            text = "".join(p.get("text", "") for p in c if isinstance(p, dict) and p.get("type") == "text")
 
-                    chunk_usage = chunk.get("usage")
-                    if chunk_usage and isinstance(chunk_usage, dict):
-                        actual_usage = chunk_usage
+                        if text:
+                            if text_block_idx is None:
+                                text_block_idx = next_block_idx
+                                next_block_idx += 1
+                                yield _sse("content_block_start", {"type": "content_block_start", "index": text_block_idx,
+                                           "content_block": {"type": "text", "text": ""}})
+                                open_blocks.append(text_block_idx)
+                            stream_out_tokens += _estimate_tokens(text)
+                            yield _sse("content_block_delta", {"type": "content_block_delta", "index": text_block_idx,
+                                       "delta": {"type": "text_delta", "text": text}})
 
-                    choices = chunk.get("choices", [])
-                    if not choices or not isinstance(choices, list):
-                        continue
-                    first_choice = choices[0] if choices else {}
-                    delta = first_choice.get("delta", {}) if isinstance(first_choice, dict) else {}
-                    if not delta or not isinstance(delta, dict):
-                        delta = {}
+                        # Reasoning content
+                        reasoning = delta.get("reasoning_content")
+                        if isinstance(reasoning, str) and reasoning:
+                            if reasoning_block_idx is None:
+                                reasoning_block_idx = next_block_idx
+                                next_block_idx += 1
+                                yield _sse("content_block_start", {"type": "content_block_start", "index": reasoning_block_idx,
+                                           "content_block": {"type": "thinking", "thinking": ""}})
+                                open_blocks.append(reasoning_block_idx)
+                            stream_out_tokens += _estimate_tokens(reasoning)
+                            yield _sse("content_block_delta", {"type": "content_block_delta", "index": reasoning_block_idx,
+                                       "delta": {"type": "thinking_delta", "thinking": reasoning}})
 
-                    if not started:
-                        started = True
-                        yield _sse("message_start", {"type": "message_start", "message": {
-                            "id": msg_id, "type": "message", "role": "assistant", "content": [],
-                            "model": original_model, "stop_reason": None, "stop_sequence": None,
-                            "usage": {"input_tokens": stream_in_est, "output_tokens": 0}}})
+                        # Tool calls
+                        for tc in (delta.get("tool_calls") or []):
+                            api_idx = tc.get("index", 0)
+                            if api_idx not in tool_block_idx:
+                                block_idx = next_block_idx
+                                next_block_idx += 1
+                                tool_block_idx[api_idx] = block_idx
+                                tc_id = tc.get("id", f"toolu_{uuid.uuid4().hex[:8]}")
+                                yield _sse("content_block_start", {"type": "content_block_start", "index": block_idx,
+                                           "content_block": {"type": "tool_use", "id": tc_id,
+                                           "name": tc.get("function", {}).get("name", ""), "input": {}}})
+                                open_blocks.append(block_idx)
+                            if args := tc.get("function", {}).get("arguments", ""):
+                                stream_out_tokens += _estimate_tokens(args)
+                                yield _sse("content_block_delta", {"type": "content_block_delta", "index": tool_block_idx[api_idx],
+                                           "delta": {"type": "input_json_delta", "partial_json": args}})
+            except Exception as e:
+                _log(f"  ERROR stream: {e}")
+                with _token_lock:
+                    _token_usage[model_id]["input"] -= stream_in_est
+                ak_h = _alias_for_key(_key_from_headers(hdrs, "openai"))
+                _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
+                             stream_in_est, stream_out_tokens, 0, success=False, error=str(e),
+                             protocol=protocol, is_stream=True, thinking=thinking_type, effort=effort,
+                             client_ip=client_ip, account_alias=ak_h)
+                if started:
+                    for idx in open_blocks:
+                        yield _sse("content_block_stop", {"type": "content_block_stop", "index": idx})
+                    yield _sse("message_delta", {"type": "message_delta", "delta": {"stop_reason": "error"}, "usage": {"output_tokens": stream_out_tokens}})
+                    yield _sse("message_stop", {"type": "message_stop"})
+                return
+            else:
+                break
+        else:
+            return
 
-                    # Text
-                    text = ""
-                    c = delta.get("content")
-                    if isinstance(c, str):
-                        text = c
-                    elif isinstance(c, list):
-                        text = "".join(p.get("text", "") for p in c if isinstance(p, dict) and p.get("type") == "text")
-
-                    if text:
-                        if text_block_idx is None:
-                            text_block_idx = next_block_idx
-                            next_block_idx += 1
-                            yield _sse("content_block_start", {"type": "content_block_start", "index": text_block_idx,
-                                       "content_block": {"type": "text", "text": ""}})
-                            open_blocks.append(text_block_idx)
-                        stream_out_tokens += _estimate_tokens(text)
-                        yield _sse("content_block_delta", {"type": "content_block_delta", "index": text_block_idx,
-                                   "delta": {"type": "text_delta", "text": text}})
-
-                    # Reasoning content
-                    reasoning = delta.get("reasoning_content")
-                    if isinstance(reasoning, str) and reasoning:
-                        if reasoning_block_idx is None:
-                            reasoning_block_idx = next_block_idx
-                            next_block_idx += 1
-                            yield _sse("content_block_start", {"type": "content_block_start", "index": reasoning_block_idx,
-                                       "content_block": {"type": "thinking", "thinking": ""}})
-                            open_blocks.append(reasoning_block_idx)
-                        stream_out_tokens += _estimate_tokens(reasoning)
-                        yield _sse("content_block_delta", {"type": "content_block_delta", "index": reasoning_block_idx,
-                                   "delta": {"type": "thinking_delta", "thinking": reasoning}})
-
-                    # Tool calls
-                    for tc in (delta.get("tool_calls") or []):
-                        api_idx = tc.get("index", 0)
-                        if api_idx not in tool_block_idx:
-                            block_idx = next_block_idx
-                            next_block_idx += 1
-                            tool_block_idx[api_idx] = block_idx
-                            tc_id = tc.get("id", f"toolu_{uuid.uuid4().hex[:8]}")
-                            yield _sse("content_block_start", {"type": "content_block_start", "index": block_idx,
-                                       "content_block": {"type": "tool_use", "id": tc_id,
-                                       "name": tc.get("function", {}).get("name", ""), "input": {}}})
-                            open_blocks.append(block_idx)
-                        if args := tc.get("function", {}).get("arguments", ""):
-                            stream_out_tokens += _estimate_tokens(args)
-                            yield _sse("content_block_delta", {"type": "content_block_delta", "index": tool_block_idx[api_idx],
-                                       "delta": {"type": "input_json_delta", "partial_json": args}})
-        except Exception as e:
-            _log(f"  ERROR stream: {e}")
-            with _token_lock:
-                _token_usage[model_id]["input"] -= stream_in_est
-            _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
-                         stream_in_est, stream_out_tokens, 0, success=False, error=str(e),
-                         protocol=protocol, is_stream=True, thinking=thinking_type, effort=effort)
-            if started:
-                for idx in open_blocks:
-                    yield _sse("content_block_stop", {"type": "content_block_stop", "index": idx})
-                yield _sse("message_delta", {"type": "message_delta", "delta": {"stop_reason": "error"}, "usage": {"output_tokens": stream_out_tokens}})
-                yield _sse("message_stop", {"type": "message_stop"})
-
-    return StreamingResponse(stream_gen(), media_type="text/event-stream",
+    return StreamingResponse(stream_gen(headers), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
 
 
