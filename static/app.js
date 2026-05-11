@@ -40,7 +40,9 @@ const LOCALE = {
         'stats.avg_duration': 'Avg Duration (ms)',
         'stats.requests': 'Total Requests',
         'stats.by_model': 'By Model',
+        'stats.by_account': 'By Account',
         'stats.model': 'Model',
+        'stats.account': 'Account',
         'stats.pct': '%',
         'stats.no_data': 'No data',
         'stats.loading': 'Loading...',
@@ -55,6 +57,7 @@ const LOCALE = {
         'logs.time': 'Time',
         'logs.original_model': 'Original Model',
         'logs.mapped_model': 'Mapped Model',
+        'logs.account': 'Account',
         'logs.thinking': 'Thinking',
         'logs.effort': 'Effort',
         'logs.duration': 'Duration (ms)',
@@ -99,6 +102,16 @@ const LOCALE = {
         'config.custom_routes_desc': 'Add custom model name to backend model mappings. Match keywords are checked in order.',
         'config.cr_match': 'Match Keyword',
         'config.cr_backend': 'Backend Model',
+        'config.cr_enabled': 'Enabled',
+        'config.cr_thinking': 'Thinking',
+        'config.cr_effort': 'Effort',
+        'config.cr_thinking_auto': 'Auto',
+        'config.cr_thinking_disabled': 'Disabled',
+        'config.cr_thinking_adaptive': 'Adaptive',
+        'config.cr_effort_auto': 'Auto',
+        'config.cr_effort_low': 'Low',
+        'config.cr_effort_medium': 'Medium',
+        'config.cr_effort_high': 'High',
         'config.cr_add_btn': 'Add',
         'config.cr_save': 'Save Custom Routes',
         'config.cr_saved': 'Saved!',
@@ -109,6 +122,7 @@ const LOCALE = {
         'config.cr_select_model': 'Select model...',
         'config.api_keys': 'API Keys',
         'config.api_keys_desc': 'Configure API keys for upstream access. Each key can have its own Go workspace credentials.',
+        'config.ak_alias': 'Alias',
         'config.ak_key': 'API Key',
         'config.ak_workspace': 'Go Workspace ID',
         'config.ak_cookie': 'Go Auth Cookie',
@@ -116,6 +130,7 @@ const LOCALE = {
         'config.ak_save': 'Save API Keys',
         'config.ak_saved': 'Saved!',
         'config.ak_no_keys': 'No API keys configured',
+        'config.ak_enabled': 'Enabled',
         'config.ak_delete': 'Delete',
         'config.models': 'Available Models',
         'config.model_id': 'Model ID',
@@ -165,7 +180,9 @@ const LOCALE = {
         'stats.avg_duration': 'Durée moy. (ms)',
         'stats.requests': 'Total Requêtes',
         'stats.by_model': 'Par Modèle',
+        'stats.by_account': 'Par Compte',
         'stats.model': 'Modèle',
+        'stats.account': 'Compte',
         'stats.pct': ' %',
         'stats.no_data': 'Aucune donnée',
         'stats.loading': 'Chargement...',
@@ -180,6 +197,7 @@ const LOCALE = {
         'logs.time': 'Heure',
         'logs.original_model': "Modèle d'origine",
         'logs.mapped_model': 'Modèle mappé',
+        'logs.account': 'Compte',
         'logs.thinking': 'Réflexion',
         'logs.effort': 'Effort',
         'logs.duration': 'Durée (ms)',
@@ -224,6 +242,16 @@ const LOCALE = {
         'config.custom_routes_desc': 'Ajoutez des mappings personnalisés (vérifiés dans l\'ordre).',
         'config.cr_match': 'Mot-clé',
         'config.cr_backend': 'Modèle Backend',
+        'config.cr_enabled': 'Active',
+        'config.cr_thinking': 'Réflexion',
+        'config.cr_effort': 'Effort',
+        'config.cr_thinking_auto': 'Auto',
+        'config.cr_thinking_disabled': 'Désactivé',
+        'config.cr_thinking_adaptive': 'Adaptatif',
+        'config.cr_effort_auto': 'Auto',
+        'config.cr_effort_low': 'Faible',
+        'config.cr_effort_medium': 'Moyen',
+        'config.cr_effort_high': 'Élevé',
         'config.cr_add_btn': 'Ajouter',
         'config.cr_save': 'Sauvegarder',
         'config.cr_saved': 'Sauvegardé !',
@@ -234,6 +262,7 @@ const LOCALE = {
         'config.cr_select_model': 'Sélectionner un modèle...',
         'config.api_keys': 'Clés API',
         'config.api_keys_desc': 'Configurez les clés API. Chaque clé peut avoir ses propres identifiants Go workspace.',
+        'config.ak_alias': 'Alias',
         'config.ak_key': 'Clé API',
         'config.ak_workspace': 'ID Workspace',
         'config.ak_cookie': 'Cookie Auth',
@@ -241,6 +270,7 @@ const LOCALE = {
         'config.ak_save': 'Sauvegarder',
         'config.ak_saved': 'Sauvegardé !',
         'config.ak_no_keys': 'Aucune clé API configurée',
+        'config.ak_enabled': 'Activée',
         'config.ak_delete': 'Supprimer',
         'config.models': 'Modèles Disponibles',
         'config.model_id': 'ID du Modèle',
@@ -304,6 +334,10 @@ function getLang() {
     return _lang;
 }
 
+function makeRouteKey(match) {
+    if (match === '*') return '*';
+    return match.toLowerCase().replace(/[^a-z0-9]/g, '');
+}
 
 function getErrorDetails(errorStr) {
     if (!errorStr) return { short: t('error.unknown'), explanation: '' };
@@ -506,24 +540,46 @@ function renderStats(data) {
 
     if (Object.keys(models).length === 0) {
         tbody.innerHTML = '<tr><td colspan="9">' + t('stats.no_data') + '</td></tr>';
-        return;
+    } else {
+        let html = '';
+        for (const [model, s] of Object.entries(models)) {
+            html += `<tr>
+                <td>${model}</td>
+                <td>${formatNumber(s.input)}</td>
+                <td>${formatNumber(s.output)}</td>
+                <td>${formatNumber(s.cache)}</td>
+                <td>${formatNumber(s.total)}</td>
+                <td>${s.pct}</td>
+                <td>${formatNumber(s.success_count)}</td>
+                <td>${formatNumber(s.fail_count)}</td>
+                <td>${s.avg_duration_ms ? formatNumber(s.avg_duration_ms) : '-'}</td>
+            </tr>`;
+        }
+        tbody.innerHTML = html;
     }
 
-    let html = '';
-    for (const [model, s] of Object.entries(models)) {
-        html += `<tr>
-            <td>${model}</td>
-            <td>${formatNumber(s.input)}</td>
-            <td>${formatNumber(s.output)}</td>
-            <td>${formatNumber(s.cache)}</td>
-            <td>${formatNumber(s.total)}</td>
-            <td>${s.pct}</td>
-            <td>${formatNumber(s.success_count)}</td>
-            <td>${formatNumber(s.fail_count)}</td>
-            <td>${s.avg_duration_ms ? formatNumber(s.avg_duration_ms) : '-'}</td>
-        </tr>`;
+    // Per-account stats
+    const atbody = document.getElementById('account-tbody');
+    const accounts = data.accounts;
+    if (!accounts || Object.keys(accounts).length === 0) {
+        atbody.innerHTML = '<tr><td colspan="9">' + t('stats.no_data') + '</td></tr>';
+    } else {
+        let html = '';
+        for (const [account, s] of Object.entries(accounts)) {
+            html += `<tr>
+                <td>${account}</td>
+                <td>${formatNumber(s.input)}</td>
+                <td>${formatNumber(s.output)}</td>
+                <td>${formatNumber(s.cache)}</td>
+                <td>${formatNumber(s.total)}</td>
+                <td>${s.pct}</td>
+                <td>${formatNumber(s.success_count)}</td>
+                <td>${formatNumber(s.fail_count)}</td>
+                <td>${s.avg_duration_ms ? formatNumber(s.avg_duration_ms) : '-'}</td>
+            </tr>`;
+        }
+        atbody.innerHTML = html;
     }
-    tbody.innerHTML = html;
 }
 
 let chartTokens = null;
@@ -605,7 +661,7 @@ function renderCharts(data) {
 function renderHistory(data) {
     const tbody = document.getElementById('history-tbody');
     if (!data || data.logs.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="10">' + t('logs.no_data') + '</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="11">' + t('logs.no_data') + '</td></tr>';
         updatePagination(1, 1);
         return;
     }
@@ -630,6 +686,7 @@ function renderHistory(data) {
         const thinking = log.thinking || '-';
         const effort = log.effort || '-';
         html += `<tr>
+            <td>${log.account_alias || '-'}</td>
             <td>${formatDateTime(log.timestamp)}</td>
             <td>${log.original_model || '-'}</td>
             <td>${log.model || '-'}</td>
@@ -756,24 +813,41 @@ function renderConfig(data) {
 
     // Custom routes table
     renderCustomRoutes(data.custom_routes || {}, modelIds);
+
+    // Apply server-side language if different
+    if (data.lang && data.lang !== getLang()) {
+        setLang(data.lang);
+        const ls = document.getElementById('lang-select');
+        if (ls) ls.value = data.lang;
+    }
 }
 
 function renderCustomRoutes(routes, modelIds) {
     const tbody = document.getElementById('custom-routes-tbody');
     const entries = Object.entries(routes);
     if (entries.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="3">' + t('config.cr_no_routes') + '</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="6">' + t('config.cr_no_routes') + '</td></tr>';
         return;
     }
     const opts = modelIds.map(id => `<option value="${id}">${id}</option>`).join('');
+    const thinkOpts = ['auto', 'disabled', 'adaptive'].map(v =>
+        `<option value="${v}">${t('config.cr_thinking_' + v)}</option>`).join('');
+    const effortOpts = ['auto', 'low', 'medium', 'high'].map(v =>
+        `<option value="${v}">${t('config.cr_effort_' + v)}</option>`).join('');
     let html = '';
     for (const [key, info] of entries) {
         const match = (info.match || []).join(', ');
         const model = info.model || '';
+        const checked = info.enabled !== false ? 'checked' : '';
+        const thinkVal = info.thinking || 'auto';
+        const effortVal = info.effort || 'auto';
         html += `<tr>
             <td><input type="text" class="config-input cr-edit-match" value="${match}" style="width:100%"></td>
             <td><select class="config-select cr-edit-model" style="width:100%"><option value="">${t('config.cr_select_model')}</option>${opts.replace(`value="${model}"`, `value="${model}" selected`)}</select></td>
-            <td><button class="btn btn-danger btn-sm cr-delete-btn" data-key="${key}">Delete</button></td>
+            <td style="text-align:center"><input type="checkbox" class="cr-edit-enabled" ${checked}></td>
+            <td><select class="config-select cr-edit-thinking" style="width:100%">${thinkOpts.replace(`value="${thinkVal}"`, `value="${thinkVal}" selected`)}</select></td>
+            <td><select class="config-select cr-edit-effort" style="width:100%">${effortOpts.replace(`value="${effortVal}"`, `value="${effortVal}" selected`)}</select></td>
+            <td><button class="btn btn-danger btn-sm cr-delete-btn" data-key="${key}">${t('config.ak_delete')}</button></td>
         </tr>`;
     }
     tbody.innerHTML = html;
@@ -782,7 +856,7 @@ function renderCustomRoutes(routes, modelIds) {
 function renderApiKeysTable(apiKeys) {
     const tbody = document.getElementById('api-keys-tbody');
     if (!apiKeys || apiKeys.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="4">' + t('config.ak_no_keys') + '</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="6">' + t('config.ak_no_keys') + '</td></tr>';
         return;
     }
     tbody.innerHTML = apiKeys.map((k, i) => {
@@ -791,9 +865,11 @@ function renderApiKeysTable(apiKeys) {
         const wsPlaceholder = k.go_workspace_id_masked || ws.slice(0, 4) + '****' || '';
         const cookiePlaceholder = k.go_auth_cookie_masked || '****';
         return `<tr data-index="${i}">
+            <td><input type="text" class="config-input ak-alias" value="${k.alias || ''}" placeholder="${t('config.ak_alias')}" style="width:100%"></td>
             <td><div class="api-key-row"><input type="password" class="config-input ak-key" value="${k.api_key || ''}" placeholder="${keyPlaceholder}" style="width:100%;font-family:monospace"><button class="btn btn-sm btn-toggle-secret" title="${t('show_hide')}">&#128065;</button></div></td>
             <td><input type="text" class="config-input ak-workspace" value="${ws}" style="width:100%"></td>
             <td><div class="api-key-row"><input type="password" class="config-input ak-cookie" value="${k.go_auth_cookie || ''}" placeholder="${cookiePlaceholder}" style="width:100%;font-family:monospace"><button class="btn btn-sm btn-toggle-secret" title="${t('show_hide')}">&#128065;</button></div></td>
+            <td style="text-align:center"><input type="checkbox" class="ak-enabled" ${k.enabled !== false ? 'checked' : ''}></td>
             <td><button class="btn btn-danger btn-sm ak-delete-btn">${t('config.ak_delete')}</button></td>
         </tr>`;
     }).join('');
@@ -946,12 +1022,21 @@ function setupConfig() {
         const model = document.getElementById('cr-model').value;
         if (!match || !model) { alert(t('config.cr_alert')); return; }
         const tbody = document.getElementById('custom-routes-tbody');
-        const key = match.toLowerCase().replace(/[^a-z0-9]/g, '');
+        const key = makeRouteKey(match);
         const opts = availableModels.map(id => `<option value="${id}" ${id === model ? 'selected' : ''}>${id}</option>`).join('');
         const row = document.createElement('tr');
         row.id = `cr-row-${key}`;
+        const thinkOptsA = ['auto', 'disabled', 'adaptive'].map(v =>
+            `<option value="${v}">${t('config.cr_thinking_' + v)}</option>`).join('');
+        const effortOptsA = ['auto', 'low', 'medium', 'high'].map(v =>
+            `<option value="${v}">${t('config.cr_effort_' + v)}</option>`).join('');
+        const thinking = document.getElementById('cr-thinking').value;
+        const effort = document.getElementById('cr-effort').value;
         row.innerHTML = `<td><input type="text" class="config-input cr-edit-match" value="${match}" style="width:100%"></td>
             <td><select class="config-select cr-edit-model" style="width:100%"><option value="">${t('config.cr_select_model')}</option>${opts}</select></td>
+            <td style="text-align:center"><input type="checkbox" class="cr-edit-enabled" checked></td>
+            <td><select class="config-select cr-edit-thinking" style="width:100%">${thinkOptsA.replace(`value="${thinking}"`, `value="${thinking}" selected`)}</select></td>
+            <td><select class="config-select cr-edit-effort" style="width:100%">${effortOptsA.replace(`value="${effort}"`, `value="${effort}" selected`)}</select></td>
             <td><button class="btn btn-danger btn-sm cr-delete-btn" data-key="${key}">${t('config.ak_delete')}</button></td>`;
         // Remove empty state
         if (tbody.querySelector('td[colspan]')) tbody.innerHTML = '';
@@ -968,7 +1053,7 @@ function setupConfig() {
         if (row) row.remove();
         const tbody = document.getElementById('custom-routes-tbody');
         if (!tbody.querySelector('tr')) {
-            tbody.innerHTML = '<tr><td colspan="3">' + t('config.cr_no_routes') + '</td></tr>';
+            tbody.innerHTML = '<tr><td colspan="6">' + t('config.cr_no_routes') + '</td></tr>';
         }
     });
 
@@ -984,8 +1069,15 @@ function setupConfig() {
             const match = matchInput.value.trim();
             const model = modelInput.value.trim();
             if (!match || !model) continue;
-            const key = match.toLowerCase().replace(/[^a-z0-9]/g, '');
-            routes[key] = { match: [match], model: model };
+            const key = makeRouteKey(match);
+            const routeData = { match: [match], model: model };
+            const enabled = row.querySelector('.cr-edit-enabled')?.checked ?? true;
+            if (!enabled) routeData.enabled = false;
+            const thinking = row.querySelector('.cr-edit-thinking')?.value;
+            if (thinking && thinking !== 'auto') routeData.thinking = thinking;
+            const effort = row.querySelector('.cr-edit-effort')?.value;
+            if (effort && effort !== 'auto') routeData.effort = effort;
+            routes[key] = routeData;
         }
         const status = document.getElementById('cr-save-status');
         try {
@@ -1015,9 +1107,11 @@ function setupConfig() {
         if (emptyRow) tbody.innerHTML = '';
         const tr = document.createElement('tr');
         tr.innerHTML = `
+            <td><input type="text" class="config-input ak-alias" placeholder="${t('config.ak_alias')}" style="width:100%"></td>
             <td><div class="api-key-row"><input type="password" class="config-input ak-key" placeholder="sk-..." style="width:100%;font-family:monospace"><button class="btn btn-sm btn-toggle-secret" title="${t('show_hide')}">&#128065;</button></div></td>
             <td><input type="text" class="config-input ak-workspace" placeholder="wrk_..." style="width:100%"></td>
             <td><div class="api-key-row"><input type="password" class="config-input ak-cookie" placeholder="Fe26.2..." style="width:100%;font-family:monospace"><button class="btn btn-sm btn-toggle-secret" title="${t('show_hide')}">&#128065;</button></div></td>
+            <td style="text-align:center"><input type="checkbox" class="ak-enabled" checked></td>
             <td><button class="btn btn-danger btn-sm ak-delete-btn">${t('config.ak_delete')}</button></td>
         `;
         tbody.appendChild(tr);
@@ -1031,7 +1125,7 @@ function setupConfig() {
         if (row) row.remove();
         const tbody = document.getElementById('api-keys-tbody');
         if (!tbody.querySelector('tr')) {
-            tbody.innerHTML = '<tr><td colspan="4">' + t('config.ak_no_keys') + '</td></tr>';
+            tbody.innerHTML = '<tr><td colspan="6">' + t('config.ak_no_keys') + '</td></tr>';
         }
     });
 
@@ -1058,8 +1152,10 @@ function setupConfig() {
             if (!apiKey) continue; // skip empty rows
             keys.push({
                 api_key: apiKey,
+                alias: row.querySelector('.ak-alias')?.value?.trim() || '',
                 go_workspace_id: row.querySelector('.ak-workspace')?.value?.trim() || '',
                 go_auth_cookie: row.querySelector('.ak-cookie')?.value?.trim() || '',
+                enabled: row.querySelector('.ak-enabled')?.checked ?? true,
             });
         }
         const status = document.getElementById('api-key-save-status');
@@ -1139,13 +1235,29 @@ document.addEventListener('DOMContentLoaded', () => {
     const langSelect = document.getElementById('lang-select');
     if (langSelect) {
         langSelect.value = getLang();
-        langSelect.addEventListener('change', () => setLang(langSelect.value));
+        langSelect.addEventListener('change', () => {
+            const newLang = langSelect.value;
+            setLang(newLang);
+            fetch('/api/config', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ lang: newLang })
+            }).catch(() => {});
+        });
     }
 
     // Apply initial language to static elements
     document.querySelectorAll('[data-i18n]').forEach(el => {
         el.textContent = t(el.dataset.i18n);
     });
+
+    // Fetch server-side language preference (may override localStorage)
+    fetch('/api/config').then(r => r.json()).then(data => {
+        if (data.lang && data.lang !== getLang()) {
+            setLang(data.lang);
+            if (langSelect) langSelect.value = data.lang;
+        }
+    }).catch(() => {});
 
     // ── SSE real-time updates ──
     let eventSource = null;
@@ -1177,6 +1289,11 @@ document.addEventListener('DOMContentLoaded', () => {
         es.addEventListener('connected', () => { stopPolling(); });
         es.addEventListener('quotas_updated', () => {
             fetchQuotas().then(renderQuotas);
+        });
+        es.addEventListener('models_updated', () => {
+            fetchConfig().then(data => {
+                if (data) { configData = data; renderConfig(data); }
+            });
         });
 
         es.onerror = () => {

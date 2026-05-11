@@ -114,6 +114,28 @@
                         </tbody>
                     </table>
                 </div>
+
+                <div class="card">
+                    <h2 data-i18n="stats.by_account">By Account</h2>
+                    <table id="account-table">
+                        <thead>
+                            <tr>
+                                <th data-i18n="stats.account">Account</th>
+                                <th data-i18n="stats.input">Input</th>
+                                <th data-i18n="stats.output">Output</th>
+                                <th data-i18n="stats.cache">Cache</th>
+                                <th data-i18n="stats.total">Total</th>
+                                <th data-i18n="stats.pct">%</th>
+                                <th data-i18n="stats.success">Success</th>
+                                <th data-i18n="stats.failed">Failed</th>
+                                <th data-i18n="stats.avg_duration">Avg Duration (ms)</th>
+                            </tr>
+                        </thead>
+                        <tbody id="account-tbody">
+                            <tr><td colspan="9" data-i18n="stats.loading">Loading...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
             </section>
 
             <section id="logs" class="tab-content">
@@ -122,6 +144,7 @@
                     <table id="history-table">
                         <thead>
                             <tr>
+                                <th data-i18n="logs.account">Account</th>
                                 <th data-i18n="logs.time">Time</th>
                                 <th data-i18n="logs.original_model">Original Model</th>
                                 <th data-i18n="logs.mapped_model">Mapped Model</th>
@@ -135,7 +158,7 @@
                             </tr>
                         </thead>
                         <tbody id="history-tbody">
-                            <tr><td colspan="10" data-i18n="stats.loading">Loading...</td></tr>
+                            <tr><td colspan="11" data-i18n="stats.loading">Loading...</td></tr>
                         </tbody>
                     </table>
                     <div class="pagination" id="pagination">
@@ -240,16 +263,30 @@
                                 <tr>
                                     <th data-i18n="config.cr_match">Match Keyword</th>
                                     <th data-i18n="config.cr_backend">Backend Model</th>
-                                    <th></th>
+                                    <th style="width:60px" data-i18n="config.cr_enabled">Enabled</th>
+                                    <th style="width:90px" data-i18n="config.cr_thinking">Thinking</th>
+                                    <th style="width:90px" data-i18n="config.cr_effort">Effort</th>
+                                    <th style="width:70px"></th>
                                 </tr>
                             </thead>
                             <tbody id="custom-routes-tbody">
-                                <tr><td colspan="3" data-i18n="config.cr_no_routes">No custom routes</td></tr>
+                                <tr><td colspan="6" data-i18n="config.cr_no_routes">No custom routes</td></tr>
                             </tbody>
                         </table>
                     </div>
                     <div class="custom-route-add">
                         <input type="text" id="cr-match" class="config-input" placeholder="e.g. nimo">
+                        <select id="cr-thinking" class="config-select" style="width:auto">
+                            <option value="auto" data-i18n="config.cr_thinking_auto">Auto</option>
+                            <option value="adaptive" data-i18n="config.cr_thinking_adaptive">Adaptive</option>
+                            <option value="disabled" data-i18n="config.cr_thinking_disabled">Disabled</option>
+                        </select>
+                        <select id="cr-effort" class="config-select" style="width:auto">
+                            <option value="auto" data-i18n="config.cr_effort_auto">Auto</option>
+                            <option value="low" data-i18n="config.cr_effort_low">Low</option>
+                            <option value="medium" data-i18n="config.cr_effort_medium">Medium</option>
+                            <option value="high" data-i18n="config.cr_effort_high">High</option>
+                        </select>
                         <select id="cr-model" class="config-select"><option value="" data-i18n="config.cr_select_model">Select model...</option></select>
                         <button class="btn" id="cr-add-btn" data-i18n="config.cr_add_btn">Add</button>
                     </div>
@@ -267,14 +304,16 @@
                         <table id="api-keys-table">
                             <thead>
                                 <tr>
+                                    <th data-i18n="config.ak_alias">Alias</th>
                                     <th data-i18n="config.ak_key">API Key</th>
                                     <th data-i18n="config.ak_workspace">Go Workspace ID</th>
                                     <th data-i18n="config.ak_cookie">Go Auth Cookie</th>
+                                    <th style="width:70px" data-i18n="config.ak_enabled">Enabled</th>
                                     <th style="width:70px"></th>
                                 </tr>
                             </thead>
                             <tbody id="api-keys-tbody">
-                                <tr><td colspan="4" data-i18n="config.ak_no_keys">No API keys configured</td></tr>
+                                <tr><td colspan="6" data-i18n="config.ak_no_keys">No API keys configured</td></tr>
                             </tbody>
                         </table>
                     </div>

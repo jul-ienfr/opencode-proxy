@@ -119,6 +119,9 @@ def load_api_keys() -> list[dict]:
             with open(API_KEYS_PATH, "r", encoding="utf-8") as f:
                 data = json.load(f)
                 if isinstance(data, list) and len(data) > 0:
+                    for i, k in enumerate(data):
+                        if not k.get("alias"):
+                            k["alias"] = f"Compte {i+1}"
                     return data
         except Exception:
             pass

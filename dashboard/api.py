@@ -14,7 +14,7 @@ from config import MODELS, HOST, PORT, WEB_PORT, PROXY, API_KEY, CONFIG_KEYS, sa
 import config.settings as config_settings
 from .display import log_lines
 from .events import get_event_manager
-from .quota import get_quota_snapshot, get_model_limits, get_available_models, MODEL_CAPABILITIES
+from .quota import get_quota_snapshot, get_available_models, get_model_limits_for_all, get_model_capabilities_for_all
 
 
 def _get_local_ip() -> str:
@@ -70,8 +70,8 @@ def register_dashboard(app, static_dir, conn, db_lock, server_manager_getter=Non
             "web_port": WEB_PORT,
             "routes": routes_info,
             "models": models_info,
-            "model_limits": get_model_limits(),
-            "model_capabilities": MODEL_CAPABILITIES,
+            "model_limits": get_model_limits_for_all(models_info),
+            "model_capabilities": get_model_capabilities_for_all(models_info),
             "proxy_running": server_manager_getter().is_running if server_manager_getter and server_manager_getter() else True,
             "disable_mapping": DISABLE_MAPPING,
             "custom_routes": config_settings.CUSTOM_ROUTES,
@@ -87,10 +87,13 @@ def register_dashboard(app, static_dir, conn, db_lock, server_manager_getter=Non
                     "go_auth_cookie_masked": (k.get("go_auth_cookie", "")[:6] + "****") if len(k.get("go_auth_cookie", "")) > 6 else "",
                     "go_workspace_id": k.get("go_workspace_id", ""),
                     "go_auth_cookie": k.get("go_auth_cookie", ""),
+                    "enabled": k.get("enabled", True),
+                    "alias": k.get("alias", ""),
                 }
                 for k in API_KEYS
             ],
             "routing": API_KEY_ROUTING,
+            "lang": os.getenv("PROXY_LANG", "en"),
         }
 
     @app.get("/api/config/custom-routes")
@@ -114,6 +117,8 @@ def register_dashboard(app, static_dir, conn, db_lock, server_manager_getter=Non
                     "has_go_cookie": bool(k.get("go_auth_cookie")),
                     "go_workspace_id": k.get("go_workspace_id", ""),
                     "go_auth_cookie": k.get("go_auth_cookie", ""),
+                    "enabled": k.get("enabled", True),
+                    "alias": k.get("alias", ""),
                 }
                 for k in API_KEYS
             ],
@@ -161,6 +166,9 @@ def register_dashboard(app, static_dir, conn, db_lock, server_manager_getter=Non
 
         if "routing" in body:
             env_updates["API_KEY_ROUTING"] = body["routing"]
+
+        if "lang" in body:
+            env_updates["PROXY_LANG"] = body["lang"]
 
         restart_needed = False
 
@@ -288,7 +296,30 @@ def register_dashboard(app, static_dir, conn, db_lock, server_manager_getter=Non
                 "avg_duration_ms": int(r[7])
             }
 
-        return {"models": models, "totals": totals}
+        # Per-account stats
+        acct_rows = conn.execute(
+            "SELECT COALESCE(account_alias, ''), COALESCE(SUM(tokens_input), 0), COALESCE(SUM(tokens_output), 0),"
+            "       COALESCE(SUM(tokens_cache), 0), COUNT(*),"
+            "       SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END),"
+            "       SUM(CASE WHEN success = 0 OR success IS NULL THEN 1 ELSE 0 END),"
+            "       COALESCE(AVG(duration_ms), 0)"
+            " FROM requests " + where +
+            " GROUP BY account_alias",
+            params,
+        ).fetchall()
+
+        accounts = {}
+        for r in acct_rows:
+            t = r[1] + r[2] + r[3]
+            label = r[0] if r[0] else "(default)"
+            accounts[label] = {
+                "input": r[1], "output": r[2], "cache": r[3], "total": t,
+                "pct": f"{t/sum_total*100:.1f}%" if sum_total else "0%",
+                "count": r[4], "success_count": r[5], "fail_count": r[6],
+                "avg_duration_ms": int(r[7])
+            }
+
+        return {"models": models, "accounts": accounts, "totals": totals}
 
     @app.get("/api/logs")
     async def get_logs(limit: int = 100, offset: int = 0):
@@ -360,6 +391,7 @@ def register_dashboard(app, static_dir, conn, db_lock, server_manager_getter=Non
                     "is_stream": bool(r["is_stream"]) if "is_stream" in r.keys() else False,
                     "thinking": r["thinking"] if "thinking" in r.keys() else None,
                     "effort": r["effort"] if "effort" in r.keys() else None,
+                    "account_alias": r["account_alias"] if "account_alias" in r.keys() else None,
                 }
                 for r in rows
             ],
