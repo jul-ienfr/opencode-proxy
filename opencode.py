@@ -587,6 +587,152 @@ def anthropic_to_openai_response(anthro: dict, model: str) -> dict:
     }
 
 
+def openai_responses_to_anthropic(body: dict) -> dict:
+    """Convert OpenAI Responses API request → Anthropic Messages format."""
+    system_text = ""
+    pending_tool_results = []
+    anthro_messages = []
+
+    for item in body.get("input", []):
+        if not isinstance(item, dict):
+            continue
+        role = item.get("role", item.get("type", "user"))
+
+        if role in ("system", "developer"):
+            for block in (item.get("content") or []):
+                if isinstance(block, dict) and block.get("type") == "input_text":
+                    system_text += block.get("text", "")
+            continue
+
+        if item.get("type") == "function_call_output":
+            pending_tool_results.append({
+                "type": "tool_result",
+                "tool_use_id": item.get("call_id", item.get("id", "")),
+                "content": item.get("output", ""),
+            })
+            continue
+
+        if role not in ("user", "assistant"):
+            continue
+
+        blocks = []
+        if role == "user" and pending_tool_results:
+            blocks.extend(pending_tool_results)
+            pending_tool_results = []
+
+        for block in (item.get("content") or []):
+            if not isinstance(block, dict):
+                continue
+            btype = block.get("type", "")
+            if btype in ("input_text", "text"):
+                blocks.append({"type": "text", "text": block.get("text", "")})
+            elif btype == "reasoning":
+                summary = block.get("summary") or []
+                text = "".join(s.get("text", "") for s in summary if isinstance(s, dict))
+                if text:
+                    blocks.insert(0, {"type": "thinking", "thinking": text})
+
+        if not blocks:
+            blocks.append({"type": "text", "text": ""})
+        anthro_messages.append({"role": role, "content": blocks})
+
+    if pending_tool_results:
+        anthro_messages.append({"role": "user", "content": pending_tool_results})
+
+    result = {
+        "model": body.get("model", ""),
+        "messages": anthro_messages,
+        "max_tokens": body.get("max_output_tokens", 16384),
+        "stream": body.get("stream", False),
+    }
+    if system_text:
+        result["system"] = system_text
+    if "temperature" in body:
+        result["temperature"] = body["temperature"]
+    if "top_p" in body:
+        result["top_p"] = body["top_p"]
+
+    # Convert tools (strip "type": "function" wrapper)
+    if "tools" in body:
+        result["tools"] = []
+        for t in body["tools"]:
+            if isinstance(t, dict) and t.get("type") == "function":
+                tool = {"name": t["name"], "description": t.get("description", "")}
+                tool["input_schema"] = t.get("input_schema") or t.get("parameters") or {}
+                result["tools"].append(tool)
+        tc = body.get("tool_choice", "auto")
+        if isinstance(tc, dict):
+            tc_type = tc.get("type", "auto")
+            if tc_type == "function":
+                result["tool_choice"] = {"type": "tool", "name": tc.get("name", "")}
+            else:
+                result["tool_choice"] = tc_type
+        else:
+            result["tool_choice"] = tc
+
+    return result
+
+
+def anthropic_to_openai_responses(anthro: dict, model: str) -> dict:
+    """Convert Anthropic Messages response → OpenAI Responses API format."""
+    content_blocks = anthro.get("content", [])
+    output_items = []
+    text_content = []
+    function_calls = []
+
+    for block in content_blocks:
+        if not isinstance(block, dict):
+            continue
+        btype = block.get("type", "")
+        if btype == "text":
+            text_content.append({"type": "output_text", "text": block.get("text", "")})
+        elif btype == "thinking":
+            output_items.insert(0, {
+                "type": "reasoning",
+                "summary": [{"type": "summary_text", "text": block.get("thinking", "")}],
+            })
+        elif btype == "tool_use":
+            function_calls.append({
+                "type": "function_call",
+                "id": block.get("id", f"call_{uuid.uuid4().hex[:12]}"),
+                "name": block.get("name", ""),
+                "arguments": json.dumps(block.get("input", {}), ensure_ascii=False),
+                "status": "completed",
+            })
+
+    if text_content:
+        output_items.append({"type": "message", "role": "assistant", "content": text_content})
+    output_items.extend(function_calls)
+
+    # Status mapping
+    sr = anthro.get("stop_reason", "")
+    if sr == "max_tokens":
+        status = "incomplete"
+    else:
+        status = "completed"
+
+    # Usage mapping
+    usage = anthro.get("usage", {})
+    in_t = usage.get("input_tokens", 0)
+    out_t = usage.get("output_tokens", 0)
+    oai_usage = {
+        "input_tokens": in_t,
+        "output_tokens": out_t,
+        "total_tokens": in_t + out_t,
+    }
+    if usage.get("cache_read_input_tokens"):
+        oai_usage["output_tokens_details"] = {"cached_tokens": usage["cache_read_input_tokens"]}
+
+    return {
+        "id": f"resp_{uuid.uuid4().hex[:24]}",
+        "object": "response",
+        "status": status,
+        "model": model,
+        "output": output_items,
+        "usage": oai_usage,
+    }
+
+
 def _estimate_tokens(text: str) -> int:
     if _encoding:
         return len(_encoding.encode(text))
@@ -1506,6 +1652,354 @@ async def chat_completions(request: Request):
             return
 
     return StreamingResponse(_anthro_to_oai_stream(a_headers), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
+
+
+@app.post("/v1/responses")
+async def responses(request: Request):
+    req_id = f"resp_{uuid.uuid4().hex[:24]}"
+    start_time = time.time()
+    client_ip = request.client.host if request.client else "unknown"
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        client_ip = forwarded.split(",")[0].strip()
+
+    try:
+        body = json.loads(await request.body())
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "invalid json"})
+
+    original_model = body.get("model", "")
+    tool_names = _extract_tool_names(body)
+    route = _route_for(original_model, tool_names)
+    model_id = route["model"]
+    cfg = get_model_config(model_id)
+    endpoint = cfg["endpoint"]
+    protocol = cfg["protocol"]
+    is_stream = body.get("stream", False)
+
+    _log(f"→ {original_model!r} → {model_id} | {protocol} | responses | stream={is_stream} | ip={client_ip}")
+
+    # Convert Responses API → Anthropic format
+    anthro_body = openai_responses_to_anthropic(body)
+    anthro_body["model"] = model_id
+
+    # Apply route overrides
+    thinking_override = route.get("thinking")
+    if thinking_override and thinking_override != "auto":
+        if not isinstance(anthro_body.get("thinking"), dict):
+            anthro_body["thinking"] = {}
+        anthro_body["thinking"]["type"] = thinking_override
+    effort_override = route.get("effort")
+    if effort_override and effort_override != "auto":
+        anthro_body["effort"] = effort_override
+
+    thinking = anthro_body.get("thinking", {})
+    thinking_type = thinking.get("type", "none") if isinstance(thinking, dict) else "none"
+    effort = (anthro_body.get("effort")
+              or (thinking.get("effort") if isinstance(thinking, dict) else None)
+              or "none")
+
+    # ── Anthropic backend (passthrough) ─────────────────────
+    if protocol == "anthropic":
+        a_headers = _get_auth_headers("anthropic")
+        if not is_stream:
+            resp = await _client.post(endpoint, json=anthro_body, headers=a_headers)
+            if resp.status_code == 429 and len(API_KEYS) > 1:
+                failed_key = a_headers.get("x-api-key", "")
+                alt = _find_alternative_key(failed_key)
+                if alt:
+                    a_headers = _get_auth_headers("anthropic", entry=alt)
+                    resp = await _client.post(endpoint, json=anthro_body, headers=a_headers)
+            account_alias = _alias_for_key(a_headers.get("x-api-key", ""))
+            if resp.status_code != 200:
+                _log(f"  ERROR {resp.status_code}: {resp.text[:300]}")
+                await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
+                             0, 0, 0, success=False, error=f"HTTP {resp.status_code}",
+                             protocol=protocol, is_stream=is_stream, thinking=thinking_type, effort=effort,
+                             client_ip=client_ip, account_alias=account_alias, tools=tool_names)
+                try:
+                    err_data = resp.json()
+                    err_msg = err_data.get("error", {}).get("message", resp.text[:200])
+                except Exception:
+                    err_msg = resp.text[:200]
+                return Response(content=json.dumps({"error": {"message": err_msg}}), status_code=resp.status_code, media_type="application/json")
+            data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+            usage = data.get("usage", {})
+            req_in = usage.get("input_tokens", 0) or usage.get("prompt_tokens", 0)
+            req_out = usage.get("output_tokens", 0) or usage.get("completion_tokens", 0)
+            req_cache = usage.get("cache_read_input_tokens", 0)
+            with _token_lock:
+                _token_usage[model_id]["input"] += req_in
+                _token_usage[model_id]["output"] += req_out
+                _token_usage[model_id]["cache"] += req_cache
+            alias_tag = f" | account={account_alias}" if account_alias else ""
+            _log(f"  ← {model_id} | +{req_in} in | +{req_out} out | +{req_cache} cache{alias_tag}")
+            await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
+                         req_in, req_out, req_cache, success=True,
+                         protocol=protocol, is_stream=is_stream, thinking=thinking_type, effort=effort,
+                         client_ip=client_ip, account_alias=account_alias, tools=tool_names)
+            oai_resp = anthropic_to_openai_responses(data, original_model)
+            return Response(content=json.dumps(oai_resp, ensure_ascii=False), media_type="application/json")
+        # Anthropic streaming → Responses SSE
+        anthro_body["stream"] = True
+        async def _responses_anthro_stream(hdrs):
+            _id = f"resp_{uuid.uuid4().hex[:24]}"
+            _created = int(time.time())
+            started = False
+            text_content = []
+            reasoning_text = ""
+            stream_out = 0
+            total_input = 0
+            _line_buf = ""
+            actual_usage = None
+            for _attempt in range(2):
+                try:
+                    async with _client.stream("POST", endpoint, json=anthro_body, headers=hdrs) as resp:
+                        if resp.status_code != 200:
+                            if resp.status_code == 429 and _attempt == 0 and len(API_KEYS) > 1:
+                                failed_key = hdrs.get("x-api-key", "")
+                                alt = _find_alternative_key(failed_key)
+                                if alt:
+                                    hdrs = _get_auth_headers("anthropic", entry=alt)
+                                    continue
+                            ak = _alias_for_key(hdrs.get("x-api-key", ""))
+                            await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
+                                         0, 0, 0, success=False, error=f"HTTP {resp.status_code}",
+                                         protocol=protocol, is_stream=True, thinking=thinking_type, effort=effort,
+                                         client_ip=client_ip, account_alias=ak, tools=tool_names)
+                            yield b"data: " + json.dumps({"error": {"message": f"HTTP {resp.status_code}"}}, ensure_ascii=False).encode() + b"\n\n"
+                            return
+                        async for raw in resp.aiter_bytes():
+                            _line_buf += raw.decode("utf-8", errors="replace")
+                            while "\n" in _line_buf:
+                                line, _line_buf = _line_buf.split("\n", 1)
+                                line = line.strip()
+                                if not line.startswith("data:"):
+                                    continue
+                                data_str = line[5:].strip()
+                                try:
+                                    ev = json.loads(data_str)
+                                except Exception:
+                                    continue
+                                etype = ev.get("type", "")
+                                if etype == "message_start":
+                                    usage = ev.get("message", {}).get("usage", {})
+                                    total_input = usage.get("input_tokens", 0)
+                                    started = True
+                                elif etype == "content_block_delta":
+                                    delta = ev.get("delta", {})
+                                    dtype = delta.get("type")
+                                    if dtype == "text_delta":
+                                        txt = delta.get("text", "")
+                                        text_content.append(txt)
+                                        stream_out += _estimate_tokens(txt)
+                                    elif dtype == "thinking_delta":
+                                        reasoning_text += delta.get("thinking", "")
+                                        stream_out += _estimate_tokens(delta.get("thinking", ""))
+                                elif etype == "message_delta":
+                                    actual_usage = ev.get("usage", {})
+                                    if actual_usage.get("output_tokens"):
+                                        stream_out = actual_usage["output_tokens"]
+                                elif etype == "message_stop":
+                                    break
+                    # Build single Responses chunk
+                    chunk = {
+                        "type": "response.output_item.done",
+                        "item": {"type": "message", "role": "assistant", "content": []},
+                    }
+                    if text_content:
+                        chunk["item"]["content"].append({"type": "output_text", "text": "".join(text_content)})
+                    yield b"data: " + json.dumps(chunk, ensure_ascii=False).encode() + b"\n\n"
+                    yield b"data: " + json.dumps({"type": "response.output_item.done", "item": chunk["item"]}, ensure_ascii=False).encode() + b"\n\n"
+
+                    sr = anthro_body.get("stop_reason", "")
+                    status = "incomplete" if sr == "max_tokens" else "completed"
+                    resp_done = {
+                        "type": "response.done",
+                        "response": {
+                            "id": _id, "object": "response", "status": status,
+                            "model": original_model,
+                            "output": [chunk["item"]] if text_content else [],
+                            "usage": {"input_tokens": total_input, "output_tokens": stream_out},
+                        },
+                    }
+                    yield b"data: " + json.dumps(resp_done, ensure_ascii=False).encode() + b"\n\n"
+                    yield b"data: [DONE]\n\n"
+
+                    with _token_lock:
+                        _token_usage[model_id]["input"] += total_input
+                        _token_usage[model_id]["output"] += stream_out
+                    ak = _alias_for_key(hdrs.get("x-api-key", ""))
+                    _log(f"  ← {model_id} | +{total_input} in | +{stream_out} out")
+                    await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
+                                 total_input, stream_out, 0, success=True,
+                                 protocol=protocol, is_stream=True, thinking=thinking_type, effort=effort,
+                                 client_ip=client_ip, account_alias=ak, tools=tool_names)
+                    return
+                except Exception as e:
+                    _log(f"  ERROR stream: {e}")
+                    return
+                else:
+                    break
+            else:
+                return
+        return StreamingResponse(_responses_anthro_stream(a_headers), media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
+
+    # ── OpenAI backend (double conversion) ──────────────────
+    # Convert Anthropic → Chat Completions for the backend
+    oai_body = anthropic_to_openai(anthro_body, model_id)
+    headers = _get_auth_headers("openai")
+    is_stream = oai_body["stream"]
+
+    if not is_stream:
+        resp = await _client.post(endpoint, json=oai_body, headers=headers)
+        if resp.status_code == 429 and len(API_KEYS) > 1:
+            failed_key = headers.get("Authorization", "").replace("Bearer ", "")
+            alt = _find_alternative_key(failed_key)
+            if alt:
+                headers = _get_auth_headers("openai", entry=alt)
+                resp = await _client.post(endpoint, json=oai_body, headers=headers)
+        account_alias = _alias_for_key(_key_from_headers(headers, "openai"))
+        if resp.status_code != 200:
+            _log(f"  ERROR {resp.status_code}: {resp.text[:300]}")
+            await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
+                         0, 0, 0, success=False, error=f"HTTP {resp.status_code}",
+                         protocol=protocol, is_stream=is_stream, thinking=thinking_type, effort=effort,
+                         client_ip=client_ip, account_alias=account_alias, tools=tool_names)
+            try:
+                err_data = resp.json()
+                err_msg = err_data.get("error", {}).get("message", resp.text[:200])
+            except Exception:
+                err_msg = resp.text[:200]
+            return Response(content=json.dumps({"error": {"message": err_msg}}), status_code=resp.status_code, media_type="application/json")
+        data = resp.json()
+        usage = data.get("usage", {})
+        req_in = usage.get("prompt_tokens", 0)
+        req_out = usage.get("completion_tokens", 0)
+        cache = _extract_cache_tokens(usage)
+        with _token_lock:
+            _token_usage[model_id]["input"] += req_in
+            _token_usage[model_id]["output"] += req_out
+            _token_usage[model_id]["cache"] += cache
+        alias_tag = f" | account={account_alias}" if account_alias else ""
+        _log(f"  ← {model_id} | +{req_in} in | +{req_out} out | +{cache} cache{alias_tag}")
+        await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
+                     req_in, req_out, cache, success=True,
+                     protocol=protocol, is_stream=is_stream, thinking=thinking_type, effort=effort,
+                     client_ip=client_ip, account_alias=account_alias, tools=tool_names)
+        # Convert Chat Completions → Anthropic → Responses
+        anthro_data = openai_to_anthropic(data, original_model)
+        oai_resp = anthropic_to_openai_responses(anthro_data, original_model)
+        return Response(content=json.dumps(oai_resp, ensure_ascii=False), media_type="application/json")
+
+    # ── Streaming (OpenAI backend) ──────────────────────────
+    oai_body["stream_options"] = {"include_usage": True}
+    est_input = sum(_estimate_tokens(m.get("content", "")) if isinstance(m.get("content"), str) else 0
+                    for m in oai_body.get("messages", []))
+    with _token_lock:
+        _token_usage[model_id]["input"] += est_input
+
+    async def _responses_openai_stream(hdrs):
+        _id = f"resp_{uuid.uuid4().hex[:24]}"
+        stream_out = 0
+        actual_usage = None
+        full_content = ""
+        for _attempt in range(2):
+            try:
+                async with _client.stream("POST", endpoint, json=oai_body, headers=hdrs) as resp:
+                    if resp.status_code != 200:
+                        if resp.status_code == 429 and _attempt == 0 and len(API_KEYS) > 1:
+                            failed_key = hdrs.get("Authorization", "").replace("Bearer ", "")
+                            alt = _find_alternative_key(failed_key)
+                            if alt:
+                                hdrs = _get_auth_headers("openai", entry=alt)
+                                continue
+                        err = await resp.aread()
+                        ak_h = _alias_for_key(_key_from_headers(hdrs, "openai"))
+                        await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
+                                     0, 0, 0, success=False, error=f"HTTP {resp.status_code}",
+                                     protocol=protocol, is_stream=True, thinking=thinking_type, effort=effort,
+                                     client_ip=client_ip, account_alias=ak_h, tools=tool_names)
+                        yield b"data: " + json.dumps({"error": {"message": f"HTTP {resp.status_code}"}}, ensure_ascii=False).encode() + b"\n\ndata: [DONE]\n\n"
+                        return
+                    async for line in resp.aiter_lines():
+                        if not line.startswith("data:"):
+                            continue
+                        data_str = line[5:].strip()
+                        if data_str == "[DONE]":
+                            continue
+                        try:
+                            chunk = json.loads(data_str)
+                        except Exception:
+                            continue
+                        chunk_usage = chunk.get("usage")
+                        if isinstance(chunk_usage, dict):
+                            actual_usage = chunk_usage
+                        choices = chunk.get("choices", [])
+                        if choices and isinstance(choices, list) and len(choices) > 0:
+                            delta = choices[0].get("delta", {})
+                            if isinstance(delta, dict):
+                                c = delta.get("content")
+                                if isinstance(c, str):
+                                    full_content += c
+                                    stream_out += _estimate_tokens(c)
+                    # Stream ended — emit Responses chunk
+                    final_in = est_input
+                    final_out = stream_out
+                    final_cache = 0
+                    with _token_lock:
+                        if actual_usage:
+                            final_in = actual_usage.get("prompt_tokens", est_input)
+                            final_out = actual_usage.get("completion_tokens", stream_out)
+                            final_cache = _extract_cache_tokens(actual_usage)
+                            _token_usage[model_id]["input"] -= est_input
+                            _token_usage[model_id]["input"] += final_in
+                            _token_usage[model_id]["output"] += final_out
+                            if final_cache:
+                                _token_usage[model_id]["cache"] += final_cache
+                        else:
+                            _token_usage[model_id]["output"] += stream_out
+
+                    resp_item = {
+                        "type": "message", "role": "assistant",
+                        "content": [{"type": "output_text", "text": full_content}],
+                    }
+                    yield b"data: " + json.dumps({"type": "response.output_item.done", "item": resp_item}, ensure_ascii=False).encode() + b"\n\n"
+                    yield b"data: " + json.dumps({
+                        "type": "response.done",
+                        "response": {
+                            "id": _id, "object": "response", "status": "completed",
+                            "model": original_model, "output": [resp_item],
+                            "usage": {"input_tokens": final_in, "output_tokens": final_out},
+                        },
+                    }, ensure_ascii=False).encode() + b"\n\n"
+                    yield b"data: [DONE]\n\n"
+
+                    log_tag = "" if actual_usage else " (est)"
+                    ak_h = _alias_for_key(_key_from_headers(hdrs, "openai"))
+                    _log(f"  ← {model_id} | +{final_in} in{log_tag} | +{final_out} out")
+                    await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
+                                 final_in, final_out, final_cache, success=True,
+                                 protocol=protocol, is_stream=True, thinking=thinking_type, effort=effort,
+                                 client_ip=client_ip, account_alias=ak_h, tools=tool_names)
+            except Exception as e:
+                _log(f"  ERROR stream: {e}")
+                with _token_lock:
+                    _token_usage[model_id]["input"] -= est_input
+                ak_h = _alias_for_key(_key_from_headers(hdrs, "openai"))
+                await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
+                             est_input, stream_out, 0, success=False, error=str(e),
+                             protocol=protocol, is_stream=True, thinking=thinking_type, effort=effort,
+                             client_ip=client_ip, account_alias=ak_h, tools=tool_names)
+                return
+            else:
+                break
+        else:
+            return
+
+    return StreamingResponse(_responses_openai_stream(headers), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
 
 
