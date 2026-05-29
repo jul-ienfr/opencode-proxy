@@ -733,6 +733,28 @@ def anthropic_to_openai_responses(anthro: dict, model: str) -> dict:
     }
 
 
+# ── Thinking models token guard ────────────────────────────
+THINKING_MODELS = {
+    "deepseek-v4-flash": 256,
+    "deepseek-v4-pro": 512,
+}
+
+def ensure_min_tokens(body: dict, default: int = 256) -> dict:
+    """Ajuste max_output_tokens pour les modèles thinking afin qu'il
+    reste des tokens pour la réponse après le reasoning."""
+    model = body.get("model", "")
+    min_tokens = default
+    for prefix, tokens in THINKING_MODELS.items():
+        if model.startswith(prefix) or model == prefix:
+            min_tokens = max(min_tokens, tokens)
+            break
+    current = body.get("max_output_tokens") or body.get("max_tokens")
+    if current is not None and current < min_tokens:
+        body["max_output_tokens"] = min_tokens
+        _log(f"  ⚠️ {model}: max_tokens ajusté {current} → {min_tokens}")
+    return body
+
+
 def _estimate_tokens(text: str) -> int:
     if _encoding:
         return len(_encoding.encode(text))
@@ -1668,6 +1690,8 @@ async def responses(request: Request):
         body = json.loads(await request.body())
     except Exception:
         return JSONResponse(status_code=400, content={"error": "invalid json"})
+
+    body = ensure_min_tokens(body)
 
     original_model = body.get("model", "")
     tool_names = _extract_tool_names(body)
