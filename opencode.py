@@ -739,8 +739,8 @@ def anthropic_to_openai_responses(anthro: dict, model: str) -> dict:
 
 # ── Thinking models token guard ────────────────────────────
 THINKING_MODELS = {
-    "deepseek-v4-flash": 8192,
-    "deepseek-v4-pro": 16384,
+    "deepseek-v4-flash": 2048,
+    "deepseek-v4-pro": 4096,
 }
 
 def ensure_min_tokens(body: dict, default: int = 256) -> dict:
@@ -1259,7 +1259,17 @@ async def health():
 @app.get("/v1/models")
 async def list_models():
     now = int(time.time())
-    data = [{"id": model_id, "object": "model", "created": now, "owned_by": "opencode"} for model_id in MODELS]
+    seen = set()
+    data = []
+    for model_id in MODELS:
+        if model_id not in seen:
+            data.append({"id": model_id, "object": "model", "created": now, "owned_by": "opencode"})
+            seen.add(model_id)
+    # Add route names (sonnet, opus, haiku) and common aliases Codex might use
+    for alias in ["gpt-5-codex", "gpt-5", "gpt-4o", "codex", "deepseek-chat"]:
+        if alias not in seen:
+            data.append({"id": alias, "object": "model", "created": now, "owned_by": "opencode"})
+            seen.add(alias)
     return {"object": "list", "data": data}
 
 
@@ -1954,6 +1964,9 @@ async def responses(request: Request):
         full_content = ""
         content_index = 0
         output_index = 0
+        tool_calls_data = {}
+        # Emit immediate event to prevent Codex timeout while DeepSeek reasons
+        yield _sse("response.in_progress", {})
         for _attempt in range(2):
             try:
                 async with _client.stream("POST", endpoint, json=oai_body, headers=hdrs) as resp:
@@ -2008,12 +2021,25 @@ async def responses(request: Request):
                                             "item_id": item_id,
                                             "output_index": output_index,
                                         })
-                    # Stream ended
-                    yield _sse("response.output_text.done", {
-                        "item_id": item_id,
-                        "output_index": output_index,
-                        "content_index": content_index,
-                    })
+                                for tc in (delta.get("tool_calls") or []):
+                                    idx = tc.get("index", 0)
+                                    if idx not in tool_calls_data:
+                                        tool_calls_data[idx] = {
+                                            "id": tc.get("id", f"call_{uuid.uuid4().hex[:12]}"),
+                                            "name": tc.get("function", {}).get("name", ""),
+                                            "arguments": "",
+                                        }
+                                    args = tc.get("function", {}).get("arguments", "")
+                                    if args:
+                                        tool_calls_data[idx]["arguments"] += args
+                                        stream_out += _estimate_tokens(args)
+                    # Stream ended — only emit output_text.done if there was text
+                    if full_content:
+                        yield _sse("response.output_text.done", {
+                            "item_id": item_id,
+                            "output_index": output_index,
+                            "content_index": content_index,
+                        })
                     final_in = est_input
                     final_out = stream_out
                     final_cache = 0
@@ -2030,12 +2056,24 @@ async def responses(request: Request):
                         else:
                             _token_usage[model_id]["output"] += stream_out
 
-                    msg_item = {"type": "message", "role": "assistant",
-                                "content": [{"type": "output_text", "text": full_content}]}
-                    yield _sse("response.output_item.done", {"id": item_id, **msg_item})
+                    output_items = []
+                    if full_content:
+                        msg_item = {"type": "message", "role": "assistant",
+                                    "content": [{"type": "output_text", "text": full_content}]}
+                        output_items.append(msg_item)
+                    for tcd in tool_calls_data.values():
+                        output_items.append({
+                            "type": "function_call",
+                            "id": tcd["id"],
+                            "name": tcd["name"],
+                            "arguments": tcd["arguments"],
+                            "status": "completed",
+                        })
+                    if output_items:
+                        yield _sse("response.output_item.done", {"id": item_id, **output_items[0]})
                     yield _sse("response.completed", {
                         "id": _id, "status": "completed",
-                        "output": [msg_item],
+                        "output": output_items,
                         "usage": {"input_tokens": final_in, "output_tokens": final_out},
                     })
                     yield b"data: [DONE]\n\n"
