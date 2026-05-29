@@ -1728,7 +1728,7 @@ async def responses(request: Request):
               or (thinking.get("effort") if isinstance(thinking, dict) else None)
               or "none")
 
-    show_thinking = body.get("show_thinking", True)
+    show_thinking = body.get("show_thinking", False)
 
     # ── Anthropic backend (passthrough) ─────────────────────
     if protocol == "anthropic":
