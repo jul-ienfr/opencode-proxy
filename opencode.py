@@ -1706,6 +1706,13 @@ async def responses(request: Request):
 
     body = ensure_min_tokens(body)
 
+    # ── DeepSeek optimizations ────────────────────────────────
+    if "deepseek-v4" in body.get("model", ""):
+        # Filter tools: keep only those DeepSeek handles well
+        basic_tools = {"Read", "Write", "Edit", "Bash", "Grep", "Glob", "WebSearch"}
+        if "tools" in body:
+            body["tools"] = [t for t in body["tools"] if isinstance(t, dict) and t.get("name") in basic_tools]
+
     original_model = body.get("model", "")
     tool_names = _extract_tool_names(body)
     route = _route_for(original_model, tool_names)
@@ -1720,6 +1727,17 @@ async def responses(request: Request):
     # Convert Responses API → Anthropic format
     anthro_body = openai_responses_to_anthropic(body)
     anthro_body["model"] = model_id
+
+    # Inject system prompt for deepseek to use tools
+    if "deepseek-v4" in model_id:
+        tool_hint = (
+            "You are an AI coding assistant with access to tools. "
+            "When the user asks you to write code, read files, or run commands, "
+            "you MUST respond by calling a function — do NOT explain what you would do. "
+            "Available tools: Read, Write, Edit, Bash, Grep, Glob."
+        )
+        existing = anthro_body.get("system", "")
+        anthro_body["system"] = (tool_hint + "\n\n" + existing) if existing else tool_hint
 
     # Apply route overrides
     thinking_override = route.get("thinking")
