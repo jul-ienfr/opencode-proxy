@@ -723,9 +723,8 @@ def anthropic_to_openai_responses(anthro: dict, model: str) -> dict:
         "input_tokens": in_t,
         "output_tokens": out_t,
         "total_tokens": in_t + out_t,
+        "output_tokens_details": {"reasoning_tokens": 0, "cached_tokens": usage.get("cache_read_input_tokens", 0)},
     }
-    if usage.get("cache_read_input_tokens"):
-        oai_usage["output_tokens_details"] = {"cached_tokens": usage["cache_read_input_tokens"]}
 
     return {
         "id": f"resp_{uuid.uuid4().hex[:24]}",
@@ -1781,126 +1780,46 @@ async def responses(request: Request):
                          client_ip=client_ip, account_alias=account_alias, tools=tool_names)
             oai_resp = anthropic_to_openai_responses(data, original_model)
             return Response(content=json.dumps(oai_resp, ensure_ascii=False), media_type="application/json")
-        # Anthropic streaming → Responses SSE
-        anthro_body["stream"] = True
-        async def _responses_anthro_stream(hdrs):
-            _id = f"resp_{uuid.uuid4().hex[:24]}"
-            item_id = f"msg_{uuid.uuid4().hex[:12]}"
-            content_types = {}
-            text_buf = []
-            stream_out = 0
-            total_input = 0
-            output_index = 0
-            content_index = 0
-            _line_buf = ""
-            actual_usage = None
-            for _attempt in range(2):
-                try:
-                    async with _client.stream("POST", endpoint, json=anthro_body, headers=hdrs) as resp:
-                        if resp.status_code != 200:
-                            if resp.status_code == 429 and _attempt == 0 and len(API_KEYS) > 1:
-                                failed_key = hdrs.get("x-api-key", "")
-                                alt = _find_alternative_key(failed_key)
-                                if alt:
-                                    hdrs = _get_auth_headers("anthropic", entry=alt)
-                                    continue
-                            ak = _alias_for_key(hdrs.get("x-api-key", ""))
-                            await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
-                                         0, 0, 0, success=False, error=f"HTTP {resp.status_code}",
-                                         protocol=protocol, is_stream=True, thinking=thinking_type, effort=effort,
-                                         client_ip=client_ip, account_alias=ak, tools=tool_names)
-                            yield b"data: " + json.dumps({"error": {"message": f"HTTP {resp.status_code}"}}, ensure_ascii=False).encode() + b"\n\n"
-                            return
-                        async for raw in resp.aiter_bytes():
-                            _line_buf += raw.decode("utf-8", errors="replace")
-                            while "\n" in _line_buf:
-                                line, _line_buf = _line_buf.split("\n", 1)
-                                line = line.strip()
-                                if not line.startswith("data:"):
-                                    continue
-                                data_str = line[5:].strip()
-                                try:
-                                    ev = json.loads(data_str)
-                                except Exception:
-                                    continue
-                                etype = ev.get("type", "")
-                                if etype == "message_start":
-                                    usage = ev.get("message", {}).get("usage", {})
-                                    total_input = usage.get("input_tokens", 0)
-                                elif etype == "content_block_start":
-                                    idx = ev.get("index")
-                                    block = ev.get("content_block", {})
-                                    content_types[idx] = block.get("type")
-                                    if content_types[idx] == "text":
-                                        content_index = len(text_buf)
-                                elif etype == "content_block_delta":
-                                    idx = ev.get("index")
-                                    delta = ev.get("delta", {})
-                                    dtype = delta.get("type")
-                                    if dtype == "text_delta":
-                                        txt = delta.get("text", "")
-                                        text_buf.append(txt)
-                                        stream_out += _estimate_tokens(txt)
-                                        yield _sse("response.output_text.delta", {
-                                            "delta": txt,
-                                            "item_id": item_id,
-                                            "output_index": output_index,
-                                            "content_index": content_index,
-                                        })
-                                    elif dtype == "thinking_delta":
-                                        txt = delta.get("thinking", "")
-                                        stream_out += _estimate_tokens(txt)
-                                        if txt and show_thinking:
-                                            yield _sse("response.reasoning.delta", {
-                                                "delta": txt,
-                                                "item_id": item_id,
-                                                "output_index": output_index,
-                                            })
-                                elif etype == "content_block_stop":
-                                    idx = ev.get("index")
-                                    if content_types.get(idx) == "text":
-                                        yield _sse("response.output_text.done", {
-                                            "item_id": item_id,
-                                            "output_index": output_index,
-                                            "content_index": content_index,
-                                        })
-                                elif etype == "message_delta":
-                                    actual_usage = ev.get("usage", {})
-                                    if actual_usage.get("output_tokens"):
-                                        stream_out = actual_usage["output_tokens"]
-                                elif etype == "message_stop":
-                                    full_text = "".join(text_buf)
-                                    msg_item = {"type": "message", "role": "assistant",
-                                                "content": [{"type": "output_text", "text": full_text}]}
-                                    yield _sse("response.output_item.done", {
-                                        "id": item_id, **msg_item,
-                                    })
-                                    status = "completed"
-                                    yield _sse("response.completed", {
-                                        "id": _id, "status": status,
-                                        "output": [msg_item],
-                                        "usage": {"input_tokens": total_input, "output_tokens": stream_out},
-                                    })
-                                    yield b"data: [DONE]\n\n"
-                                    with _token_lock:
-                                        _token_usage[model_id]["input"] += total_input
-                                        _token_usage[model_id]["output"] += stream_out
-                                    ak = _alias_for_key(hdrs.get("x-api-key", ""))
-                                    _log(f"  ← {model_id} | +{total_input} in | +{stream_out} out")
-                                    await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
-                                                 total_input, stream_out, 0, success=True,
-                                                 protocol=protocol, is_stream=True, thinking=thinking_type, effort=effort,
-                                                 client_ip=client_ip, account_alias=ak, tools=tool_names)
-                                    return
-                except Exception as e:
-                    _log(f"  ERROR stream: {e}")
-                    return
-                else:
-                    break
-            else:
-                return
-        return StreamingResponse(_responses_anthro_stream(a_headers), media_type="text/event-stream",
-                                 headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
+        # Anthropic streaming → collect, then emit SSE
+        anthro_body["stream"] = False
+        resp = await _client.post(endpoint, json=anthro_body, headers=a_headers)
+        if resp.status_code == 429 and len(API_KEYS) > 1:
+            failed_key = a_headers.get("x-api-key", "")
+            alt = _find_alternative_key(failed_key)
+            if alt:
+                a_headers = _get_auth_headers("anthropic", entry=alt)
+                resp = await _client.post(endpoint, json=anthro_body, headers=a_headers)
+        account_alias = _alias_for_key(a_headers.get("x-api-key", ""))
+        if resp.status_code != 200:
+            _log(f"  ERROR {resp.status_code}: {resp.text[:300]}")
+            await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
+                         0, 0, 0, success=False, error=f"HTTP {resp.status_code}",
+                         protocol=protocol, is_stream=True, thinking=thinking_type, effort=effort,
+                         client_ip=client_ip, account_alias=account_alias, tools=tool_names)
+            async def err_stream():
+                yield b"data: [DONE]\n\n"
+            return StreamingResponse(err_stream(), media_type="text/event-stream",
+                                     headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
+        data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+        usage = data.get("usage", {})
+        req_in = usage.get("input_tokens", 0) or usage.get("prompt_tokens", 0)
+        req_out = usage.get("output_tokens", 0) or usage.get("completion_tokens", 0)
+        req_cache = usage.get("cache_read_input_tokens", 0)
+        with _token_lock:
+            _token_usage[model_id]["input"] += req_in
+            _token_usage[model_id]["output"] += req_out
+            _token_usage[model_id]["cache"] += req_cache
+        alias_tag = f" | account={account_alias}" if account_alias else ""
+        _log(f"  ← {model_id} | +{req_in} in | +{req_out} out | +{req_cache} cache{alias_tag}")
+        await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
+                     req_in, req_out, req_cache, success=True,
+                     protocol=protocol, is_stream=True, thinking=thinking_type, effort=effort,
+                     client_ip=client_ip, account_alias=account_alias, tools=tool_names)
+        oai_resp = anthropic_to_openai_responses(data, original_model)
+        payload = json.dumps({"type": "response.completed", "response": oai_resp}, ensure_ascii=False)
+        sse_body = f"data: {payload}\n\ndata: [DONE]\n\n".encode()
+        return Response(content=sse_body, media_type="text/event-stream",
+                        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
 
     # ── OpenAI backend (double conversion) ──────────────────
     # Convert Anthropic → Chat Completions for the backend
@@ -1949,159 +1868,50 @@ async def responses(request: Request):
         oai_resp = anthropic_to_openai_responses(anthro_data, original_model)
         return Response(content=json.dumps(oai_resp, ensure_ascii=False), media_type="application/json")
 
-    # ── Streaming (OpenAI backend) ──────────────────────────
-    oai_body["stream_options"] = {"include_usage": True}
-    est_input = sum(_estimate_tokens(m.get("content", "")) if isinstance(m.get("content"), str) else 0
-                    for m in oai_body.get("messages", []))
+    # ── Streaming (OpenAI backend) — collect, then emit SSE ──
+    oai_body["stream"] = False
+    resp = await _client.post(endpoint, json=oai_body, headers=headers)
+    if resp.status_code == 429 and len(API_KEYS) > 1:
+        failed_key = headers.get("Authorization", "").replace("Bearer ", "")
+        alt = _find_alternative_key(failed_key)
+        if alt:
+            headers = _get_auth_headers("openai", entry=alt)
+            resp = await _client.post(endpoint, json=oai_body, headers=headers)
+    account_alias = _alias_for_key(_key_from_headers(headers, "openai"))
+    if resp.status_code != 200:
+        _log(f"  ERROR {resp.status_code}: {resp.text[:300]}")
+        await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
+                     0, 0, 0, success=False, error=f"HTTP {resp.status_code}",
+                     protocol=protocol, is_stream=True, thinking=thinking_type, effort=effort,
+                     client_ip=client_ip, account_alias=account_alias, tools=tool_names)
+        err = json.dumps({"error": {"message": f"HTTP {resp.status_code}"}}, ensure_ascii=False)
+        async def err_stream():
+            yield b"data: [DONE]\n\n"
+        return StreamingResponse(err_stream(), media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
+    data = resp.json()
+    usage = data.get("usage", {})
+    req_in = usage.get("prompt_tokens", 0)
+    req_out = usage.get("completion_tokens", 0)
+    cache = _extract_cache_tokens(usage)
     with _token_lock:
-        _token_usage[model_id]["input"] += est_input
-
-    async def _responses_openai_stream(hdrs):
-        _id = f"resp_{uuid.uuid4().hex[:24]}"
-        item_id = f"msg_{uuid.uuid4().hex[:12]}"
-        stream_out = 0
-        actual_usage = None
-        full_content = ""
-        content_index = 0
-        output_index = 0
-        tool_calls_data = {}
-        # Emit immediate event to prevent Codex timeout while DeepSeek reasons
-        yield _sse("response.in_progress", {})
-        for _attempt in range(2):
-            try:
-                async with _client.stream("POST", endpoint, json=oai_body, headers=hdrs) as resp:
-                    if resp.status_code != 200:
-                        if resp.status_code == 429 and _attempt == 0 and len(API_KEYS) > 1:
-                            failed_key = hdrs.get("Authorization", "").replace("Bearer ", "")
-                            alt = _find_alternative_key(failed_key)
-                            if alt:
-                                hdrs = _get_auth_headers("openai", entry=alt)
-                                continue
-                        err = await resp.aread()
-                        ak_h = _alias_for_key(_key_from_headers(hdrs, "openai"))
-                        await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
-                                     0, 0, 0, success=False, error=f"HTTP {resp.status_code}",
-                                     protocol=protocol, is_stream=True, thinking=thinking_type, effort=effort,
-                                     client_ip=client_ip, account_alias=ak_h, tools=tool_names)
-                        yield b"data: " + json.dumps({"error": {"message": f"HTTP {resp.status_code}"}}, ensure_ascii=False).encode() + b"\n\ndata: [DONE]\n\n"
-                        return
-                    async for line in resp.aiter_lines():
-                        if not line.startswith("data:"):
-                            continue
-                        data_str = line[5:].strip()
-                        if data_str == "[DONE]":
-                            continue
-                        try:
-                            chunk = json.loads(data_str)
-                        except Exception:
-                            continue
-                        chunk_usage = chunk.get("usage")
-                        if isinstance(chunk_usage, dict):
-                            actual_usage = chunk_usage
-                        choices = chunk.get("choices", [])
-                        if choices and isinstance(choices, list) and len(choices) > 0:
-                            delta = choices[0].get("delta", {})
-                            if isinstance(delta, dict):
-                                c = delta.get("content")
-                                if isinstance(c, str) and c:
-                                    full_content += c
-                                    stream_out += _estimate_tokens(c)
-                                    yield _sse("response.output_text.delta", {
-                                        "delta": c,
-                                        "item_id": item_id,
-                                        "output_index": output_index,
-                                        "content_index": content_index,
-                                    })
-                                rc = delta.get("reasoning_content")
-                                if isinstance(rc, str) and rc:
-                                    stream_out += _estimate_tokens(rc)
-                                    if show_thinking:
-                                        yield _sse("response.reasoning.delta", {
-                                            "delta": rc,
-                                            "item_id": item_id,
-                                            "output_index": output_index,
-                                        })
-                                for tc in (delta.get("tool_calls") or []):
-                                    idx = tc.get("index", 0)
-                                    if idx not in tool_calls_data:
-                                        tool_calls_data[idx] = {
-                                            "id": tc.get("id", f"call_{uuid.uuid4().hex[:12]}"),
-                                            "name": tc.get("function", {}).get("name", ""),
-                                            "arguments": "",
-                                        }
-                                    args = tc.get("function", {}).get("arguments", "")
-                                    if args:
-                                        tool_calls_data[idx]["arguments"] += args
-                                        stream_out += _estimate_tokens(args)
-                    # Stream ended — only emit output_text.done if there was text
-                    if full_content:
-                        yield _sse("response.output_text.done", {
-                            "item_id": item_id,
-                            "output_index": output_index,
-                            "content_index": content_index,
-                        })
-                    final_in = est_input
-                    final_out = stream_out
-                    final_cache = 0
-                    with _token_lock:
-                        if actual_usage:
-                            final_in = actual_usage.get("prompt_tokens", est_input)
-                            final_out = actual_usage.get("completion_tokens", stream_out)
-                            final_cache = _extract_cache_tokens(actual_usage)
-                            _token_usage[model_id]["input"] -= est_input
-                            _token_usage[model_id]["input"] += final_in
-                            _token_usage[model_id]["output"] += final_out
-                            if final_cache:
-                                _token_usage[model_id]["cache"] += final_cache
-                        else:
-                            _token_usage[model_id]["output"] += stream_out
-
-                    output_items = []
-                    if full_content:
-                        msg_item = {"type": "message", "role": "assistant",
-                                    "content": [{"type": "output_text", "text": full_content}]}
-                        output_items.append(msg_item)
-                    for tcd in tool_calls_data.values():
-                        output_items.append({
-                            "type": "function_call",
-                            "id": tcd["id"],
-                            "name": tcd["name"],
-                            "arguments": tcd["arguments"],
-                            "status": "completed",
-                        })
-                    if output_items:
-                        yield _sse("response.output_item.done", {"id": item_id, **output_items[0]})
-                    yield _sse("response.completed", {
-                        "id": _id, "status": "completed",
-                        "output": output_items,
-                        "usage": {"input_tokens": final_in, "output_tokens": final_out},
-                    })
-                    yield b"data: [DONE]\n\n"
-
-                    log_tag = "" if actual_usage else " (est)"
-                    ak_h = _alias_for_key(_key_from_headers(hdrs, "openai"))
-                    _log(f"  ← {model_id} | +{final_in} in{log_tag} | +{final_out} out")
-                    await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
-                                 final_in, final_out, final_cache, success=True,
-                                 protocol=protocol, is_stream=True, thinking=thinking_type, effort=effort,
-                                 client_ip=client_ip, account_alias=ak_h, tools=tool_names)
-            except Exception as e:
-                _log(f"  ERROR stream: {e}")
-                with _token_lock:
-                    _token_usage[model_id]["input"] -= est_input
-                ak_h = _alias_for_key(_key_from_headers(hdrs, "openai"))
-                await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
-                             est_input, stream_out, 0, success=False, error=str(e),
-                             protocol=protocol, is_stream=True, thinking=thinking_type, effort=effort,
-                             client_ip=client_ip, account_alias=ak_h, tools=tool_names)
-                return
-            else:
-                break
-        else:
-            return
-
-    return StreamingResponse(_responses_openai_stream(headers), media_type="text/event-stream",
-                             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
+        _token_usage[model_id]["input"] += req_in
+        _token_usage[model_id]["output"] += req_out
+        _token_usage[model_id]["cache"] += cache
+    alias_tag = f" | account={account_alias}" if account_alias else ""
+    _log(f"  ← {model_id} | +{req_in} in | +{req_out} out | +{cache} cache{alias_tag}")
+    await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
+                 req_in, req_out, cache, success=True,
+                 protocol=protocol, is_stream=True, thinking=thinking_type, effort=effort,
+                 client_ip=client_ip, account_alias=account_alias, tools=tool_names)
+    # Convert Chat Completions → Anthropic → Responses
+    anthro_data = openai_to_anthropic(data, original_model)
+    oai_resp = anthropic_to_openai_responses(anthro_data, original_model)
+    # Return as single SSE block (data-only format)
+    payload = json.dumps({"type": "response.completed", "response": oai_resp}, ensure_ascii=False)
+    sse_body = f"data: {payload}\n\ndata: [DONE]\n\n".encode()
+    return Response(content=sse_body, media_type="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
 
 
 class ServerManager:
