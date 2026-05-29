@@ -735,8 +735,8 @@ def anthropic_to_openai_responses(anthro: dict, model: str) -> dict:
 
 # ── Thinking models token guard ────────────────────────────
 THINKING_MODELS = {
-    "deepseek-v4-flash": 256,
-    "deepseek-v4-pro": 512,
+    "deepseek-v4-flash": 2048,
+    "deepseek-v4-pro": 4096,
 }
 
 def ensure_min_tokens(body: dict, default: int = 256) -> dict:
