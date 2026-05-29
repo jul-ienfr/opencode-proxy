@@ -1728,6 +1728,8 @@ async def responses(request: Request):
               or (thinking.get("effort") if isinstance(thinking, dict) else None)
               or "none")
 
+    show_thinking = body.get("show_thinking", True)
+
     # ── Anthropic backend (passthrough) ─────────────────────
     if protocol == "anthropic":
         a_headers = _get_auth_headers("anthropic")
@@ -1838,7 +1840,7 @@ async def responses(request: Request):
                                     elif dtype == "thinking_delta":
                                         txt = delta.get("thinking", "")
                                         stream_out += _estimate_tokens(txt)
-                                        if txt:
+                                        if txt and show_thinking:
                                             yield _sse("response.reasoning.delta", {
                                                 "delta": txt,
                                                 "item_id": item_id,
@@ -2000,11 +2002,12 @@ async def responses(request: Request):
                                 rc = delta.get("reasoning_content")
                                 if isinstance(rc, str) and rc:
                                     stream_out += _estimate_tokens(rc)
-                                    yield _sse("response.reasoning.delta", {
-                                        "delta": rc,
-                                        "item_id": item_id,
-                                        "output_index": output_index,
-                                    })
+                                    if show_thinking:
+                                        yield _sse("response.reasoning.delta", {
+                                            "delta": rc,
+                                            "item_id": item_id,
+                                            "output_index": output_index,
+                                        })
                     # Stream ended
                     yield _sse("response.output_text.done", {
                         "item_id": item_id,
