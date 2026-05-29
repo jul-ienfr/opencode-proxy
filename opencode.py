@@ -1745,12 +1745,13 @@ async def responses(request: Request):
         anthro_body["stream"] = True
         async def _responses_anthro_stream(hdrs):
             _id = f"resp_{uuid.uuid4().hex[:24]}"
-            _created = int(time.time())
-            started = False
-            text_content = []
-            reasoning_text = ""
+            item_id = f"msg_{uuid.uuid4().hex[:12]}"
+            content_types = {}
+            text_buf = []
             stream_out = 0
             total_input = 0
+            output_index = 0
+            content_index = 0
             _line_buf = ""
             actual_usage = None
             for _attempt in range(2):
@@ -1786,57 +1787,64 @@ async def responses(request: Request):
                                 if etype == "message_start":
                                     usage = ev.get("message", {}).get("usage", {})
                                     total_input = usage.get("input_tokens", 0)
-                                    started = True
+                                elif etype == "content_block_start":
+                                    idx = ev.get("index")
+                                    block = ev.get("content_block", {})
+                                    content_types[idx] = block.get("type")
+                                    if content_types[idx] == "text":
+                                        content_index = len(text_buf)
                                 elif etype == "content_block_delta":
+                                    idx = ev.get("index")
                                     delta = ev.get("delta", {})
                                     dtype = delta.get("type")
                                     if dtype == "text_delta":
                                         txt = delta.get("text", "")
-                                        text_content.append(txt)
+                                        text_buf.append(txt)
                                         stream_out += _estimate_tokens(txt)
+                                        yield _sse("response.output_text.delta", {
+                                            "delta": txt,
+                                            "item_id": item_id,
+                                            "output_index": output_index,
+                                            "content_index": content_index,
+                                        })
                                     elif dtype == "thinking_delta":
-                                        reasoning_text += delta.get("thinking", "")
                                         stream_out += _estimate_tokens(delta.get("thinking", ""))
+                                elif etype == "content_block_stop":
+                                    idx = ev.get("index")
+                                    if content_types.get(idx) == "text":
+                                        yield _sse("response.output_text.done", {
+                                            "item_id": item_id,
+                                            "output_index": output_index,
+                                            "content_index": content_index,
+                                        })
                                 elif etype == "message_delta":
                                     actual_usage = ev.get("usage", {})
                                     if actual_usage.get("output_tokens"):
                                         stream_out = actual_usage["output_tokens"]
                                 elif etype == "message_stop":
-                                    break
-                    # Build single Responses chunk
-                    chunk = {
-                        "type": "response.output_item.done",
-                        "item": {"type": "message", "role": "assistant", "content": []},
-                    }
-                    if text_content:
-                        chunk["item"]["content"].append({"type": "output_text", "text": "".join(text_content)})
-                    yield b"data: " + json.dumps(chunk, ensure_ascii=False).encode() + b"\n\n"
-                    yield b"data: " + json.dumps({"type": "response.output_item.done", "item": chunk["item"]}, ensure_ascii=False).encode() + b"\n\n"
-
-                    sr = anthro_body.get("stop_reason", "")
-                    status = "incomplete" if sr == "max_tokens" else "completed"
-                    resp_done = {
-                        "type": "response.done",
-                        "response": {
-                            "id": _id, "object": "response", "status": status,
-                            "model": original_model,
-                            "output": [chunk["item"]] if text_content else [],
-                            "usage": {"input_tokens": total_input, "output_tokens": stream_out},
-                        },
-                    }
-                    yield b"data: " + json.dumps(resp_done, ensure_ascii=False).encode() + b"\n\n"
-                    yield b"data: [DONE]\n\n"
-
-                    with _token_lock:
-                        _token_usage[model_id]["input"] += total_input
-                        _token_usage[model_id]["output"] += stream_out
-                    ak = _alias_for_key(hdrs.get("x-api-key", ""))
-                    _log(f"  ← {model_id} | +{total_input} in | +{stream_out} out")
-                    await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
-                                 total_input, stream_out, 0, success=True,
-                                 protocol=protocol, is_stream=True, thinking=thinking_type, effort=effort,
-                                 client_ip=client_ip, account_alias=ak, tools=tool_names)
-                    return
+                                    full_text = "".join(text_buf)
+                                    msg_item = {"type": "message", "role": "assistant",
+                                                "content": [{"type": "output_text", "text": full_text}]}
+                                    yield _sse("response.output_item.done", {
+                                        "id": item_id, **msg_item,
+                                    })
+                                    status = "completed"
+                                    yield _sse("response.completed", {
+                                        "id": _id, "status": status,
+                                        "output": [msg_item],
+                                        "usage": {"input_tokens": total_input, "output_tokens": stream_out},
+                                    })
+                                    yield b"data: [DONE]\n\n"
+                                    with _token_lock:
+                                        _token_usage[model_id]["input"] += total_input
+                                        _token_usage[model_id]["output"] += stream_out
+                                    ak = _alias_for_key(hdrs.get("x-api-key", ""))
+                                    _log(f"  ← {model_id} | +{total_input} in | +{stream_out} out")
+                                    await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
+                                                 total_input, stream_out, 0, success=True,
+                                                 protocol=protocol, is_stream=True, thinking=thinking_type, effort=effort,
+                                                 client_ip=client_ip, account_alias=ak, tools=tool_names)
+                                    return
                 except Exception as e:
                     _log(f"  ERROR stream: {e}")
                     return
@@ -1903,9 +1911,12 @@ async def responses(request: Request):
 
     async def _responses_openai_stream(hdrs):
         _id = f"resp_{uuid.uuid4().hex[:24]}"
+        item_id = f"msg_{uuid.uuid4().hex[:12]}"
         stream_out = 0
         actual_usage = None
         full_content = ""
+        content_index = 0
+        output_index = 0
         for _attempt in range(2):
             try:
                 async with _client.stream("POST", endpoint, json=oai_body, headers=hdrs) as resp:
@@ -1942,10 +1953,21 @@ async def responses(request: Request):
                             delta = choices[0].get("delta", {})
                             if isinstance(delta, dict):
                                 c = delta.get("content")
-                                if isinstance(c, str):
+                                if isinstance(c, str) and c:
                                     full_content += c
                                     stream_out += _estimate_tokens(c)
-                    # Stream ended — emit Responses chunk
+                                    yield _sse("response.output_text.delta", {
+                                        "delta": c,
+                                        "item_id": item_id,
+                                        "output_index": output_index,
+                                        "content_index": content_index,
+                                    })
+                    # Stream ended
+                    yield _sse("response.output_text.done", {
+                        "item_id": item_id,
+                        "output_index": output_index,
+                        "content_index": content_index,
+                    })
                     final_in = est_input
                     final_out = stream_out
                     final_cache = 0
@@ -1962,19 +1984,14 @@ async def responses(request: Request):
                         else:
                             _token_usage[model_id]["output"] += stream_out
 
-                    resp_item = {
-                        "type": "message", "role": "assistant",
-                        "content": [{"type": "output_text", "text": full_content}],
-                    }
-                    yield b"data: " + json.dumps({"type": "response.output_item.done", "item": resp_item}, ensure_ascii=False).encode() + b"\n\n"
-                    yield b"data: " + json.dumps({
-                        "type": "response.done",
-                        "response": {
-                            "id": _id, "object": "response", "status": "completed",
-                            "model": original_model, "output": [resp_item],
-                            "usage": {"input_tokens": final_in, "output_tokens": final_out},
-                        },
-                    }, ensure_ascii=False).encode() + b"\n\n"
+                    msg_item = {"type": "message", "role": "assistant",
+                                "content": [{"type": "output_text", "text": full_content}]}
+                    yield _sse("response.output_item.done", {"id": item_id, **msg_item})
+                    yield _sse("response.completed", {
+                        "id": _id, "status": "completed",
+                        "output": [msg_item],
+                        "usage": {"input_tokens": final_in, "output_tokens": final_out},
+                    })
                     yield b"data: [DONE]\n\n"
 
                     log_tag = "" if actual_usage else " (est)"
