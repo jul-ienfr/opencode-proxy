@@ -1724,6 +1724,10 @@ async def responses(request: Request):
               or (thinking.get("effort") if isinstance(thinking, dict) else None)
               or "none")
 
+    # Disable thinking for deepseek models (they consume all tokens on reasoning)
+    if "deepseek-v4" in model_id:
+        anthro_body["thinking"] = {"type": "disabled"}
+
     # ── Anthropic backend (passthrough) ─────────────────────
     if protocol == "anthropic":
         a_headers = _get_auth_headers("anthropic")
@@ -1889,6 +1893,11 @@ async def responses(request: Request):
     # ── OpenAI backend (double conversion) ──────────────────
     # Convert Anthropic → Chat Completions for the backend
     oai_body = anthropic_to_openai(anthro_body, model_id)
+
+    # Reduce reasoning effort for deepseek models
+    if "deepseek-v4" in model_id:
+        oai_body["reasoning_effort"] = "low"
+
     headers = _get_auth_headers("openai")
     is_stream = oai_body["stream"]
 
