@@ -1731,13 +1731,17 @@ async def responses(request: Request):
     # Inject system prompt for deepseek to use tools
     if "deepseek-v4" in model_id:
         tool_hint = (
-            "You are an AI coding assistant with access to tools. "
-            "When the user asks you to write code, read files, or run commands, "
-            "you MUST respond by calling a function — do NOT explain what you would do. "
-            "Available tools: Read, Write, Edit, Bash, Grep, Glob."
+            "You are an AI coding assistant. You MUST use the available tools to complete tasks.\n\n"
+            "Examples:\n"
+            'User: "Read the file src/main.py"\n'
+            'Assistant: {"type": "function_call", "name": "Read", "arguments": {"file_path": "src/main.py"}}\n\n'
+            'User: "Create hello.py that prints hello"\n'
+            'Assistant: {"type": "function_call", "name": "Write", "arguments": {"file_path": "hello.py", "content": "print(\"hello\")"}}\n\n'
+            'User: "List all Python files"\n'
+            'Assistant: {"type": "function_call", "name": "Glob", "arguments": {"pattern": "**/*.py"}}\n\n'
+            "Now respond to the user's request with a tool call. Do NOT explain — just call the function."
         )
-        existing = anthro_body.get("system", "")
-        anthro_body["system"] = (tool_hint + "\n\n" + existing) if existing else tool_hint
+        anthro_body["system"] = tool_hint
 
     # Apply route overrides
     thinking_override = route.get("thinking")
