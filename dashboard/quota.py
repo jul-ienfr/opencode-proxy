@@ -521,5 +521,9 @@ async def start_quota_fetcher(app):
 
             await asyncio.sleep(QUOTA_FETCH_INTERVAL)
 
+    # Cancel existing task if called again (double-invocation guard)
+    existing = getattr(app.state, '_quota_task', None)
+    if existing and not existing.done():
+        existing.cancel()
     task = asyncio.create_task(_poll())
     app.state._quota_task = task

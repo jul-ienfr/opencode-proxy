@@ -17,16 +17,29 @@ from .events import get_event_manager
 from .quota import get_quota_snapshot, get_available_models, get_model_limits_for_all, get_model_capabilities_for_all
 
 
-def _get_local_ip() -> str:
-    """Get the local network IP address (not 127.0.0.1)."""
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+def _get_local_ips() -> list:
+    """Get all local network IP addresses (excluding loopback)."""
+    ips = []
     try:
-        s.connect(("10.254.254.254", 1))
-        return s.getsockname()[0]
+        hostname = socket.gethostname()
+        for info in socket.getaddrinfo(hostname, None):
+            addr = info[4][0]
+            if addr and not addr.startswith("127.") and '.' in addr:
+                if addr not in ips:
+                    ips.append(addr)
     except Exception:
-        return "127.0.0.1"
-    finally:
-        s.close()
+        pass
+    # Fallback: try to determine primary IP via connection
+    if not ips:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("10.254.254.254", 1))
+            ips.append(s.getsockname()[0])
+        except Exception:
+            pass
+        finally:
+            s.close()
+    return ips
 
 
 def _build_where(from_date=None, to_date=None):
@@ -39,6 +52,12 @@ def _build_where(from_date=None, to_date=None):
         params.append(to_date + "T23:59:59")
     where = "WHERE " + " AND ".join(conditions) if conditions else ""
     return where, params
+
+
+def daysAgo(n: int) -> str:
+    """Return date string for N days ago (en-CA format YYYY-MM-DD)."""
+    from datetime import datetime, timedelta
+    return (datetime.now() - timedelta(days=n)).strftime("%Y-%m-%d")
 
 
 def register_dashboard(app, static_dir, conn, db_lock, server_manager_getter=None):
@@ -66,7 +85,7 @@ def register_dashboard(app, static_dir, conn, db_lock, server_manager_getter=Non
             "api_key_masked": (API_KEY[:4] + "****" + API_KEY[-4:]) if API_KEY and len(API_KEY) > 8 else ("****" if API_KEY else ""),
             "host": HOST,
             "port": PORT,
-            "local_ip": _get_local_ip(),
+            "local_ips": _get_local_ips(),
             "web_port": WEB_PORT,
             "routes": routes_info,
             "models": models_info,
@@ -255,7 +274,7 @@ def register_dashboard(app, static_dir, conn, db_lock, server_manager_getter=Non
     async def get_stats(from_date: str = None, to_date: str = None):
         where, params = _build_where(from_date, to_date)
 
-        with db_lock:
+        async with db_lock:
             row = conn.execute(
                 "SELECT COALESCE(SUM(tokens_input), 0), COALESCE(SUM(tokens_output), 0),"
                 "       COALESCE(SUM(tokens_cache), 0), COUNT(*),"
@@ -345,8 +364,11 @@ def register_dashboard(app, static_dir, conn, db_lock, server_manager_getter=Non
                         payload = await asyncio.wait_for(queue.get(), timeout=30)
                         yield payload
                     except asyncio.TimeoutError:
+                        # Check if client disconnected during idle period
+                        if await request.is_disconnected():
+                            break
                         yield ": keepalive\n\n"
-            except asyncio.CancelledError:
+            except (asyncio.CancelledError, RuntimeError):
                 pass
             finally:
                 await manager.unsubscribe(queue)
@@ -360,6 +382,41 @@ def register_dashboard(app, static_dir, conn, db_lock, server_manager_getter=Non
     async def get_quotas():
         return get_quota_snapshot()
 
+    @app.get("/api/tools")
+    async def get_tools(days: int = 7):
+        """Aggregate tool names from recent requests."""
+        where, params = _build_where(daysAgo(days), None)
+        async with db_lock:
+            rows = conn.execute(
+                "SELECT tools FROM requests " + where + " AND tools IS NOT NULL AND tools != '[]'",
+                params,
+            ).fetchall()
+
+        # Aggregate tool names and count occurrences
+        tool_counts = {}
+        for row in rows:
+            try:
+                tools = json.loads(row["tools"]) if isinstance(row["tools"], str) else []
+                for tool in tools:
+                    tool_counts[tool] = tool_counts.get(tool, 0) + 1
+            except (json.JSONDecodeError, TypeError):
+                continue
+
+        # Sort by frequency descending
+        sorted_tools = sorted(tool_counts.items(), key=lambda x: -x[1])
+
+        # Check if any tool matches an existing custom route
+        custom_routes = CUSTOM_ROUTES
+        result = []
+        for name, count in sorted_tools:
+            routed_to = None
+            for route_key, route_info in custom_routes.items():
+                if route_info.get("match") and name in route_info["match"]:
+                    routed_to = route_info.get("model")
+                    break
+            result.append({"name": name, "count": count, "routed_to": routed_to})
+        return result
+
     # ── Stats & history ──
 
     @app.get("/api/history")
@@ -368,7 +425,7 @@ def register_dashboard(app, static_dir, conn, db_lock, server_manager_getter=Non
         query = "SELECT * FROM requests " + where + " ORDER BY timestamp DESC LIMIT ? OFFSET ?"
         params.extend([limit, offset])
 
-        with db_lock:
+        async with db_lock:
             rows = conn.execute(query, params).fetchall()
             count_query = "SELECT COUNT(*) FROM requests " + where
             total_row = conn.execute(count_query, params[:-2]).fetchone()
@@ -392,6 +449,7 @@ def register_dashboard(app, static_dir, conn, db_lock, server_manager_getter=Non
                     "thinking": r["thinking"] if "thinking" in r.keys() else None,
                     "effort": r["effort"] if "effort" in r.keys() else None,
                     "account_alias": r["account_alias"] if "account_alias" in r.keys() else None,
+                    "tools": json.loads(r["tools"]) if "tools" in r.keys() and r["tools"] and r["tools"] != "[]" else [],
                 }
                 for r in rows
             ],
@@ -403,7 +461,7 @@ def register_dashboard(app, static_dir, conn, db_lock, server_manager_getter=Non
 
     @app.delete("/api/history")
     async def delete_history(before: str = None, all: bool = False):
-        with db_lock:
+        async with db_lock:
             if all:
                 conn.execute("DELETE FROM requests")
             elif before:

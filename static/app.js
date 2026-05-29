@@ -60,6 +60,7 @@ const LOCALE = {
         'logs.account': 'Account',
         'logs.thinking': 'Thinking',
         'logs.effort': 'Effort',
+        'logs.tools': 'Tools',
         'logs.duration': 'Duration (ms)',
         'logs.status': 'Status',
         'logs.no_data': 'No history',
@@ -119,6 +120,18 @@ const LOCALE = {
         'config.new_badge': 'NEW',
         'config.cr_placeholder': 'e.g. nimo',
         'config.cr_alert': 'Enter match keyword and select a backend model.',
+        'config.tool_routing': 'Tool Routing',
+        'config.tool_routing_desc': 'Assign a backend model to each tool detected in recent requests. Routes are created automatically as custom mappings.',
+        'config.tr_tool': 'Tool',
+        'config.tr_count': 'Uses',
+        'config.tr_backend': 'Backend Model',
+        'config.tr_status': 'Status',
+        'config.tr_routed': 'Routed',
+        'config.tr_unrouted': 'Unrouted',
+        'config.tr_save': 'Save Tool Routes',
+        'config.tr_saved': 'Tool routes saved!',
+        'config.tr_no_tools': 'No tools detected in recent requests.',
+        'config.tr_alert_save': 'No tools to route.',
         'config.cr_select_model': 'Select model...',
         'config.api_keys': 'API Keys',
         'config.api_keys_desc': 'Configure API keys for upstream access. Each key can have its own Go workspace credentials.',
@@ -259,6 +272,18 @@ const LOCALE = {
         'config.new_badge': 'NOUVEAU',
         'config.cr_placeholder': 'ex: nimo',
         'config.cr_alert': 'Entrez un mot-clé et sélectionnez un modèle.',
+        'config.tool_routing': 'Routage par Outil',
+        'config.tool_routing_desc': 'Assignez un modèle backend à chaque outil détecté dans les requêtes récentes. Les routes sont créées automatiquement.',
+        'config.tr_tool': 'Outil',
+        'config.tr_count': 'Utilisations',
+        'config.tr_backend': 'Modèle Backend',
+        'config.tr_status': 'Statut',
+        'config.tr_routed': 'Routé',
+        'config.tr_unrouted': 'Non routé',
+        'config.tr_save': 'Sauvegarder',
+        'config.tr_saved': 'Routes d\'outils sauvegardées !',
+        'config.tr_no_tools': 'Aucun outil détecté dans les requêtes récentes.',
+        'config.tr_alert_save': 'Rien à sauvegarder.',
         'config.cr_select_model': 'Sélectionner un modèle...',
         'config.api_keys': 'Clés API',
         'config.api_keys_desc': 'Configurez les clés API. Chaque clé peut avoir ses propres identifiants Go workspace.',
@@ -386,16 +411,37 @@ let totalPages = 1;
 let configData = null;
 let availableModels = [];
 
+function escHtml(s) {
+    return (s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+async function apiFetch(url, options = {}) {
+    const resp = await fetch(url, options);
+    if (!resp.ok) {
+        const text = await resp.text().catch(() => '');
+        throw new Error(`HTTP ${resp.status}: ${text.slice(0, 200)}`);
+    }
+    return resp.json();
+}
+
 async function fetchStats(from, to) {
     try {
         let url = '/api/stats?';
         if (from) url += `from_date=${from}&`;
         if (to) url += `to_date=${to}`;
-        const resp = await fetch(url);
-        return await resp.json();
+        return await apiFetch(url);
     } catch (e) {
         console.error('Failed to fetch stats:', e);
         return null;
+    }
+}
+
+async function fetchToolRoutes(days = 7) {
+    try {
+        return await apiFetch(`/api/tools?days=${days}`);
+    } catch (e) {
+        console.error('Failed to fetch tool routes:', e);
+        return [];
     }
 }
 
@@ -405,8 +451,7 @@ async function fetchHistory(from, to, page = 1) {
         let url = `/api/history?limit=${perPage}&offset=${offset}`;
         if (from) url += `&from_date=${from}`;
         if (to) url += `&to_date=${to}`;
-        const resp = await fetch(url);
-        return await resp.json();
+        return await apiFetch(url);
     } catch (e) {
         console.error('Failed to fetch history:', e);
         return null;
@@ -415,8 +460,7 @@ async function fetchHistory(from, to, page = 1) {
 
 async function fetchConfig() {
     try {
-        const resp = await fetch('/api/config');
-        configData = await resp.json();
+        configData = await apiFetch('/api/config');
         return configData;
     } catch (e) {
         console.error('Failed to fetch config:', e);
@@ -426,8 +470,7 @@ async function fetchConfig() {
 
 async function fetchQuotas() {
     try {
-        const resp = await fetch('/api/quotas');
-        return await resp.json();
+        return await apiFetch('/api/quotas');
     } catch (e) {
         console.error('Failed to fetch quotas:', e);
         return null;
@@ -606,14 +649,19 @@ function renderCharts(data) {
         chartTokens.options.plugins.legend.labels.color = textColor;
         chartTokens.update('none');
     } else {
-        chartTokens = new Chart(document.getElementById('chart-tokens'), {
-            type: 'doughnut',
-            data: {
-                labels: ['Input', 'Output', 'Cache'],
-                datasets: [{ data: tokenData, backgroundColor: ['#4fc3f7', '#ff8a65', '#81c784'], borderWidth: 0 }]
-            },
-            options: makeChartOpts(textColor)
-        });
+        try {
+            chartTokens = new Chart(document.getElementById('chart-tokens'), {
+                type: 'doughnut',
+                data: {
+                    labels: ['Input', 'Output', 'Cache'],
+                    datasets: [{ data: tokenData, backgroundColor: ['#4fc3f7', '#ff8a65', '#81c784'], borderWidth: 0 }]
+                },
+                options: makeChartOpts(textColor)
+            });
+        } catch (e) {
+            console.warn('Chart.js not available:', e);
+            document.querySelector('.chart-card')?.remove();
+        }
     }
 
     // Per model
@@ -630,14 +678,18 @@ function renderCharts(data) {
         chartModelTokens.options.plugins.legend.labels.color = textColor;
         chartModelTokens.update('none');
     } else {
-        chartModelTokens = new Chart(document.getElementById('chart-model-tokens'), {
-            type: 'doughnut',
-            data: {
-                labels: modelLabels,
-                datasets: [{ data: modelTokenData, backgroundColor: colors, borderWidth: 0 }]
-            },
-            options: makeChartOpts(textColor)
-        });
+        try {
+            chartModelTokens = new Chart(document.getElementById('chart-model-tokens'), {
+                type: 'doughnut',
+                data: {
+                    labels: modelLabels,
+                    datasets: [{ data: modelTokenData, backgroundColor: colors, borderWidth: 0 }]
+                },
+                options: makeChartOpts(textColor)
+            });
+        } catch (e) {
+            console.warn('Chart.js not available:', e);
+        }
     }
 
     if (chartModelRequests) {
@@ -647,21 +699,25 @@ function renderCharts(data) {
         chartModelRequests.options.plugins.legend.labels.color = textColor;
         chartModelRequests.update('none');
     } else {
-        chartModelRequests = new Chart(document.getElementById('chart-model-requests'), {
-            type: 'doughnut',
-            data: {
-                labels: modelLabels,
-                datasets: [{ data: modelRequestData, backgroundColor: colors, borderWidth: 0 }]
-            },
-            options: makeChartOpts(textColor)
-        });
+        try {
+            chartModelRequests = new Chart(document.getElementById('chart-model-requests'), {
+                type: 'doughnut',
+                data: {
+                    labels: modelLabels,
+                    datasets: [{ data: modelRequestData, backgroundColor: colors, borderWidth: 0 }]
+                },
+                options: makeChartOpts(textColor)
+            });
+        } catch (e) {
+            console.warn('Chart.js not available:', e);
+        }
     }
 }
 
 function renderHistory(data) {
     const tbody = document.getElementById('history-tbody');
     if (!data || data.logs.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="11">' + t('logs.no_data') + '</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="12">' + t('logs.no_data') + '</td></tr>';
         updatePagination(1, 1);
         return;
     }
@@ -674,8 +730,8 @@ function renderHistory(data) {
             status = '<span class="status-ok">&#10004;</span>';
         } else {
             const errDetail = getErrorDetails(log.error || '');
-            const escError = (log.error || '').replace(/"/g, '&quot;').replace(/</g, '&lt;');
-            const escExplanation = errDetail.explanation ? errDetail.explanation.replace(/"/g, '&quot;').replace(/</g, '&lt;') : '';
+            const escError = escHtml(log.error);
+            const escExplanation = errDetail.explanation ? escHtml(errDetail.explanation) : '';
             // Build a rich tooltip: error → explanation → context
             const tooltipParts = ['Error: ' + escError];
             if (escExplanation) tooltipParts.push(escExplanation);
@@ -695,6 +751,7 @@ function renderHistory(data) {
             <td>${formatNumber(log.tokens_cache)}</td>
             <td>${thinking}</td>
             <td>${effort}</td>
+            <td ${(log.tools && log.tools.length > 3) ? 'title="' + log.tools.join(', ') + '"' : ''}>${(log.tools && log.tools.length) ? log.tools.slice(0, 3).join(', ') + (log.tools.length > 3 ? ', +' + (log.tools.length - 3) : '') : '-'}</td>
             <td>${duration}</td>
             <td>${status}</td>
         </tr>`;
@@ -740,26 +797,35 @@ function renderConfig(data) {
         }).catch(() => {});
     };
 
-    // LAN address — only show when bind is 0.0.0.0
-    if (data.host === '0.0.0.0' && data.local_ip && data.local_ip !== '127.0.0.1') {
-        const lanUrl = `http://${data.local_ip}:${data.port}`;
-        statusLan.textContent = ' / ' + lanUrl;
-        statusLan.title = t('proxy.copy');
-        statusLan.className = 'config-addr clickable';
-        statusLan.style.display = '';
-        statusLan.onclick = () => {
-            navigator.clipboard.writeText(lanUrl).then(() => {
-                statusLan.textContent = ' / ' + t('proxy.copied');
-                setTimeout(() => { statusLan.textContent = ' / ' + lanUrl; }, 1500);
-            }).catch(() => {});
-        };
+    // LAN addresses — only show when bind is 0.0.0.0
+    if (data.host === '0.0.0.0') {
+        const ips = (data.local_ips || []).filter(ip => ip !== '127.0.0.1');
+        if (ips.length > 0) {
+            statusLan.innerHTML = ' / ' + ips.map(ip => {
+                const url = `http://${ip}:${data.port}`;
+                return `<span class="config-addr clickable" title="${t('proxy.copy')}">${url}</span>`;
+            }).join(' / ');
+            statusLan.style.display = '';
+            // Make each span clickable to copy
+            statusLan.querySelectorAll('.clickable').forEach(el => {
+                const url = el.textContent;
+                el.onclick = () => {
+                    navigator.clipboard.writeText(url).then(() => {
+                        const orig = el.textContent;
+                        el.textContent = t('proxy.copied');
+                        setTimeout(() => { el.textContent = orig; }, 1500);
+                    }).catch(() => {});
+                };
+            });
+        } else {
+            statusLan.style.display = 'none';
+        }
     } else {
         statusLan.style.display = 'none';
     }
 
     // Port settings
     document.getElementById('cfg-port').value = data.port;
-    document.getElementById('cfg-web-port').value = data.web_port;
     document.getElementById('cfg-bind-address').value = data.host || '0.0.0.0';
     document.getElementById('cfg-routing').value = data.routing || 'round-robin';
     document.getElementById('cfg-disable-mapping').checked = data.disable_mapping || false;
@@ -814,6 +880,9 @@ function renderConfig(data) {
     // Custom routes table
     renderCustomRoutes(data.custom_routes || {}, modelIds);
 
+    // Tool routes table — fetch and render
+    fetchToolRoutes().then(tools => renderToolRoutes(tools, modelIds));
+
     // Apply server-side language if different
     if (data.lang && data.lang !== getLang()) {
         setLang(data.lang);
@@ -851,6 +920,46 @@ function renderCustomRoutes(routes, modelIds) {
         </tr>`;
     }
     tbody.innerHTML = html;
+}
+
+function renderToolRoutes(tools, modelIds) {
+    const tbody = document.getElementById('tool-routes-tbody');
+    if (!tools || tools.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="4">' + t('config.tr_no_tools') + '</td></tr>';
+        return;
+    }
+    const opts = modelIds.map(id => `<option value="${id}">${id}</option>`).join('');
+    let html = '';
+    for (const tool of tools) {
+        const selectedRouted = tool.routed_to || '';
+        const isRouted = !!selectedRouted;
+        html += `<tr>
+            <td><code>${escHtml(tool.name)}</code></td>
+            <td>${tool.count}</td>
+            <td><select class="config-select tr-model-select" style="width:100%" data-tool="${escHtml(tool.name)}">
+                <option value="">—</option>
+                ${opts.replace(`value="${selectedRouted}"`, `value="${selectedRouted}" selected`)}
+            </select></td>
+            <td>${isRouted ? '<span class="status-ok">' + t('config.tr_routed') + '</span>' : '<span class="text-dim">' + t('config.tr_unrouted') + '</span>'}</td>
+        </tr>`;
+    }
+    tbody.innerHTML = html;
+}
+
+function gatherToolRoutes() {
+    const rows = document.querySelectorAll('#tool-routes-tbody tr');
+    const toolRoutes = {};
+    for (const row of rows) {
+        const select = row.querySelector('.tr-model-select');
+        if (!select) continue;
+        const toolName = select.dataset.tool;
+        const model = select.value;
+        if (toolName && model) {
+            const key = makeRouteKey(toolName);
+            toolRoutes[key] = { match: [toolName], model: model };
+        }
+    }
+    return toolRoutes;
 }
 
 function renderApiKeysTable(apiKeys) {
@@ -976,18 +1085,16 @@ function setupConfig() {
                 haiku: document.getElementById('route-haiku').value,
             },
             port: parseInt(document.getElementById('cfg-port').value),
-            web_port: parseInt(document.getElementById('cfg-web-port').value),
             host: document.getElementById('cfg-bind-address').value,
             routing: document.getElementById('cfg-routing').value,
             disable_mapping: document.getElementById('cfg-disable-mapping').checked,
         };
         try {
-            const resp = await fetch('/api/config', {
+            const result = await apiFetch('/api/config', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(payload),
             });
-            const result = await resp.json();
             document.getElementById('restart-notice').style.display = result.needs_restart ? '' : 'none';
             saveStatus.textContent = result.message || t('config.saved');
             saveStatus.className = 'save-status success';
@@ -1004,14 +1111,14 @@ function setupConfig() {
     // Proxy start/stop
     document.getElementById('btn-proxy-start').addEventListener('click', async () => {
         try {
-            await fetch('/api/proxy/start', { method: 'POST' });
+            await apiFetch('/api/proxy/start', { method: 'POST' }).catch(() => {});
             fetchConfig().then(renderConfig);
         } catch (e) { console.error(e); }
     });
 
     document.getElementById('btn-proxy-stop').addEventListener('click', async () => {
         try {
-            await fetch('/api/proxy/stop', { method: 'POST' });
+            await apiFetch('/api/proxy/stop', { method: 'POST' }).catch(() => {});
             fetchConfig().then(renderConfig);
         } catch (e) { console.error(e); }
     });
@@ -1081,13 +1188,59 @@ function setupConfig() {
         }
         const status = document.getElementById('cr-save-status');
         try {
-            const resp = await fetch('/api/config/custom-routes', {
+            await apiFetch('/api/config/custom-routes', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(routes),
             });
-            const result = await resp.json();
             status.textContent = t('config.cr_saved');
+            status.className = 'save-status success';
+            setTimeout(() => { status.textContent = ''; }, 3000);
+            fetchConfig().then(renderConfig);
+        } catch (e) {
+            status.textContent = 'Error saving';
+            status.className = 'save-status error';
+            console.error(e);
+        }
+    });
+
+    // ── Tool Routes: save ──
+    document.getElementById('tr-save-btn').addEventListener('click', async () => {
+        const toolRoutes = gatherToolRoutes();
+        const toolKeys = Object.keys(toolRoutes);
+        if (toolKeys.length === 0) {
+            const status = document.getElementById('tr-save-status');
+            status.textContent = t('config.tr_alert_save');
+            status.className = 'save-status';
+            setTimeout(() => { status.textContent = ''; }, 2000);
+            return;
+        }
+
+        // Fetch existing custom routes and merge
+        const configData = await apiFetch('/api/config');
+        const existingRoutes = configData.custom_routes || {};
+
+        // Remove old tool routes (those matching known tool names from the current data)
+        const currentTools = await fetchToolRoutes();
+        const currentToolNames = new Set(currentTools.map(t => t.name));
+        for (const key of Object.keys(existingRoutes)) {
+            const matches = existingRoutes[key].match || [];
+            if (matches.some(m => currentToolNames.has(m))) {
+                delete existingRoutes[key];
+            }
+        }
+
+        // Merge new tool routes
+        const mergedRoutes = { ...existingRoutes, ...toolRoutes };
+
+        const status = document.getElementById('tr-save-status');
+        try {
+            await apiFetch('/api/config/custom-routes', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(mergedRoutes),
+            });
+            status.textContent = t('config.tr_saved');
             status.className = 'save-status success';
             setTimeout(() => { status.textContent = ''; }, 3000);
             fetchConfig().then(renderConfig);
@@ -1160,12 +1313,11 @@ function setupConfig() {
         }
         const status = document.getElementById('api-key-save-status');
         try {
-            const resp = await fetch('/api/config/api-keys', {
+            await apiFetch('/api/config/api-keys', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ api_keys: keys }),
             });
-            const result = await resp.json();
             status.textContent = t('config.ak_saved');
             status.className = 'save-status success';
             setTimeout(() => { status.textContent = ''; }, 3000);
@@ -1204,7 +1356,7 @@ async function deleteHistory(before = null, all = false) {
             const d = before || filterTo;
             url += `before=${d}`;
         }
-        await fetch(url, { method: 'DELETE' });
+        await apiFetch(url, { method: 'DELETE' });
         currentPage = 1;
         refreshAll();
     } catch (e) {
@@ -1238,7 +1390,7 @@ document.addEventListener('DOMContentLoaded', () => {
         langSelect.addEventListener('change', () => {
             const newLang = langSelect.value;
             setLang(newLang);
-            fetch('/api/config', {
+            apiFetch('/api/config', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ lang: newLang })
@@ -1252,7 +1404,7 @@ document.addEventListener('DOMContentLoaded', () => {
     });
 
     // Fetch server-side language preference (may override localStorage)
-    fetch('/api/config').then(r => r.json()).then(data => {
+    apiFetch('/api/config').then(data => {
         if (data.lang && data.lang !== getLang()) {
             setLang(data.lang);
             if (langSelect) langSelect.value = data.lang;
@@ -1273,12 +1425,12 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     function connectSSE() {
+        if (window._sseRetry) { clearTimeout(window._sseRetry); window._sseRetry = null; }
         if (eventSource) eventSource.close();
         const es = new EventSource('/api/events');
         eventSource = es;
 
         es.addEventListener('stats_updated', () => {
-            if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
             // Debounce: coalesce rapid events into a single refresh
             if (window._sseRefresh) clearTimeout(window._sseRefresh);
             window._sseRefresh = setTimeout(() => {
@@ -1286,7 +1438,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 refreshAll();
             }, 200);
         });
-        es.addEventListener('connected', () => { stopPolling(); });
+        es.addEventListener('connected', () => { startPolling(30000); });
         es.addEventListener('quotas_updated', () => {
             fetchQuotas().then(renderQuotas);
         });
@@ -1300,7 +1452,12 @@ document.addEventListener('DOMContentLoaded', () => {
             if (es !== eventSource) return; // stale
             if (eventSource) { eventSource.close(); eventSource = null; }
             if (!pollTimer) startPolling(15000);
-            setTimeout(connectSSE, 5000);
+            if (!window._sseRetry) {
+                window._sseRetry = setTimeout(() => {
+                    window._sseRetry = null;
+                    connectSSE();
+                }, 5000);
+            }
         };
     }
 

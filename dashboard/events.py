@@ -17,7 +17,7 @@ class EventManager:
         self._lock = threading.Lock()
 
     async def subscribe(self):
-        queue = asyncio.Queue()
+        queue = asyncio.Queue(maxsize=256)
         with self._lock:
             self._subscribers.append(queue)
         return queue
@@ -38,8 +38,10 @@ class EventManager:
                 try:
                     q.put_nowait(payload)
                     alive.append(q)
+                except asyncio.QueueFull:
+                    pass  # drop event for slow subscriber
                 except Exception:
-                    pass
+                    pass  # closed/destroyed queue
             self._subscribers = alive
 
 

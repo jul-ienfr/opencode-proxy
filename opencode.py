@@ -106,7 +106,9 @@ os.makedirs(LOG_DIR, exist_ok=True)
 _db_path = os.path.join(LOG_DIR, "requests.db")
 _conn = sqlite3.connect(_db_path, check_same_thread=False)
 _conn.row_factory = sqlite3.Row
-_db_lock = threading.Lock()
+_conn.execute("PRAGMA journal_mode=WAL")
+_conn.execute("PRAGMA busy_timeout=5000")
+_db_lock = asyncio.Lock()
 _conn.execute("""
     CREATE TABLE IF NOT EXISTS requests (
         id TEXT PRIMARY KEY,
@@ -126,7 +128,7 @@ _conn.execute("""
     )
 """)
 _conn.execute("CREATE INDEX IF NOT EXISTS idx_timestamp ON requests(timestamp)")
-for col, default in [("protocol", "NULL"), ("is_stream", "0"), ("thinking", "NULL"), ("effort", "NULL"), ("client_ip", "NULL"), ("account_alias", "NULL")]:
+for col, default in [("protocol", "NULL"), ("is_stream", "0"), ("thinking", "NULL"), ("effort", "NULL"), ("client_ip", "NULL"), ("account_alias", "NULL"), ("tools", "NULL")]:
     try:
         _conn.execute(f"ALTER TABLE requests ADD COLUMN {col} TEXT DEFAULT {default}")
     except Exception:
@@ -134,21 +136,22 @@ for col, default in [("protocol", "NULL"), ("is_stream", "0"), ("thinking", "NUL
 _conn.commit()
 
 
-def _save_request(req_id, model, original_model, duration_ms,
-                  tokens_input, tokens_output, tokens_cache, success=True, error=None,
-                  protocol=None, is_stream=False, thinking=None, effort=None,
-                  client_ip=None, account_alias=None):
+async def _save_request(req_id, model, original_model, duration_ms,
+	                  tokens_input, tokens_output, tokens_cache, success=True, error=None,
+	                  protocol=None, is_stream=False, thinking=None, effort=None,
+	                  client_ip=None, account_alias=None, tools=None):
+    tools_json = json.dumps(tools) if tools else "[]"
     timestamp = time.strftime("%Y-%m-%dT%H:%M:%S")
-    with _db_lock:
+    async with _db_lock:
         _conn.execute("""
             INSERT OR REPLACE INTO requests (id, timestamp, model, original_model, duration_ms,
                 tokens_input, tokens_output, tokens_cache, success, error,
-                protocol, is_stream, thinking, effort, client_ip, account_alias)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                protocol, is_stream, thinking, effort, client_ip, account_alias, tools)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (req_id, timestamp, model, original_model, duration_ms,
               tokens_input, tokens_output, tokens_cache, 1 if success else 0, error,
               protocol, 1 if is_stream else 0, thinking, effort,
-              client_ip, account_alias))
+              client_ip, account_alias, tools_json))
         _conn.commit()
 
     # Notify dashboard SSE clients about the update
@@ -200,20 +203,41 @@ def _sse(event: str, payload: dict) -> bytes:
     return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n".encode()
 
 
-def _route_for(model_name: str) -> dict:
+def _route_for(model_name: str, tool_names: list = None) -> dict:
     if DISABLE_MAPPING:
         return {"match": [], "model": model_name}
     name = model_name.lower()
+    tool_names_lower = [t.lower() for t in (tool_names or [])]
     for r in ROUTES.values():
         if r.get("enabled") is False:
             continue
         if any(m in name for m in r.get("match", [])):
+            return r
+        # Match on tool names too (optional, additive)
+        if tool_names_lower and any(m in t for m in r.get("match", []) for t in tool_names_lower):
             return r
     # Wildcard catch-all: if a custom route "*" (or legacy "") exists, use it
     wildcard = CUSTOM_ROUTES.get("*") or CUSTOM_ROUTES.get("")
     if wildcard and isinstance(wildcard, dict) and wildcard.get("model") and wildcard.get("enabled") is not False:
         return wildcard
     return ROUTES["sonnet"]
+
+
+def _extract_tool_names(body: dict) -> list:
+    """Extract tool names from request body (Anthropic or OpenAI format)."""
+    tools = body.get("tools", [])
+    if not isinstance(tools, list):
+        return []
+    names = []
+    for t in tools:
+        if isinstance(t, dict):
+            if "name" in t and isinstance(t["name"], str):
+                names.append(t["name"])
+            elif "function" in t and isinstance(t["function"], dict):
+                fn = t["function"]
+                if "name" in fn and isinstance(fn["name"], str):
+                    names.append(fn["name"])
+    return names
 
 
 def _extract_text(content) -> str:
@@ -380,6 +404,189 @@ def openai_to_anthropic(resp: dict, model: str) -> dict:
     }
 
 
+def openai_to_anthropic_request(oai_body: dict) -> dict:
+    """Convert OpenAI Chat Completions request → Anthropic Messages format."""
+    system_text = ""
+    pending_tool_results = []
+    anthro_messages = []
+
+    for msg in oai_body.get("messages", []):
+        role = msg.get("role", "")
+
+        if role == "system":
+            system_text = _extract_text(msg.get("content", ""))
+            continue
+
+        if role == "tool":
+            pending_tool_results.append({
+                "type": "tool_result",
+                "tool_use_id": msg.get("tool_call_id", ""),
+                "content": _extract_text(msg.get("content", "")),
+            })
+            continue
+
+        if role not in ("user", "assistant"):
+            continue
+
+        blocks = []
+
+        # Prepend pending tool_results to the next user message
+        if role == "user" and pending_tool_results:
+            blocks.extend(pending_tool_results)
+            pending_tool_results = []
+
+        # Convert content
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            if content:
+                blocks.append({"type": "text", "text": content})
+        elif isinstance(content, list):
+            for block in content:
+                t = block.get("type", "")
+                if t == "text":
+                    blocks.append({"type": "text", "text": block.get("text", "")})
+
+        # Convert tool_calls (assistant only)
+        for tc in msg.get("tool_calls") or []:
+            fn = tc.get("function", {})
+            try:
+                inp = json.loads(fn.get("arguments", "{}"))
+            except Exception:
+                inp = {}
+            blocks.append({
+                "type": "tool_use",
+                "id": tc.get("id", f"toolu_{uuid.uuid4().hex[:8]}"),
+                "name": fn.get("name", ""),
+                "input": inp,
+            })
+
+        # Convert reasoning_content → thinking block (assistant only)
+        if role == "assistant":
+            reasoning = msg.get("reasoning_content")
+            if isinstance(reasoning, str) and reasoning.strip():
+                blocks.insert(0, {"type": "thinking", "thinking": reasoning})
+
+        # Ensure at least one block
+        if not blocks:
+            blocks.append({"type": "text", "text": ""})
+
+        anthro_messages.append({"role": role, "content": blocks})
+
+    # Trailing tool_results (edge case)
+    if pending_tool_results:
+        anthro_messages.append({"role": "user", "content": pending_tool_results})
+
+    result = {
+        "model": oai_body.get("model", ""),
+        "messages": anthro_messages,
+        "max_tokens": oai_body.get("max_tokens", 16384),
+        "stream": oai_body.get("stream", False),
+    }
+
+    if system_text:
+        result["system"] = system_text
+
+    # Map simple params
+    for key, anthro_key in [("temperature", "temperature"), ("top_p", "top_p"),
+                             ("stop", "stop_sequences")]:
+        if key in oai_body:
+            result[anthro_key] = oai_body[key]
+
+    # Convert tools
+    if "tools" in oai_body:
+        result["tools"] = [{
+            "name": t["function"]["name"],
+            "description": t["function"].get("description", ""),
+            "input_schema": t["function"].get("parameters", {}),
+        } for t in oai_body["tools"] if t.get("type") == "function"]
+
+        # Convert tool_choice
+        tc = oai_body.get("tool_choice", "auto")
+        if isinstance(tc, dict):
+            tc_type = tc.get("type", "auto")
+            if tc_type == "function":
+                result["tool_choice"] = {"type": "tool", "name": tc.get("function", {}).get("name", "")}
+            elif tc_type == "any":
+                result["tool_choice"] = {"type": "any"}
+            else:
+                result["tool_choice"] = tc_type
+        else:
+            result["tool_choice"] = tc
+
+    return result
+
+
+def anthropic_to_openai_response(anthro: dict, model: str) -> dict:
+    """Convert Anthropic Messages response → OpenAI Chat Completions format."""
+    content_blocks = anthro.get("content", [])
+    text_parts = []
+    reasoning_text = ""
+    tool_calls = []
+
+    for block in content_blocks:
+        if not isinstance(block, dict):
+            continue
+        t = block.get("type", "")
+        if t == "text":
+            text_parts.append(block.get("text", ""))
+        elif t == "thinking":
+            reasoning_text = block.get("thinking", "")
+        elif t == "tool_use":
+            tool_calls.append({
+                "id": block.get("id", f"call_{uuid.uuid4().hex[:12]}"),
+                "type": "function",
+                "function": {
+                    "name": block.get("name", ""),
+                    "arguments": json.dumps(block.get("input", {}), ensure_ascii=False),
+                },
+            })
+
+    # Determine finish_reason
+    sr = anthro.get("stop_reason", "")
+    if sr == "max_tokens":
+        finish = "length"
+    elif sr == "tool_use":
+        finish = "tool_calls"
+    else:
+        finish = "stop"
+
+    # Usage mapping
+    usage = anthro.get("usage", {})
+    prompt_tokens = usage.get("input_tokens", 0)
+    completion_tokens = usage.get("output_tokens", 0)
+    oai_usage = {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
+    }
+    cache_read = usage.get("cache_read_input_tokens", 0)
+    if cache_read:
+        oai_usage["prompt_tokens_details"] = {"cached_tokens": cache_read}
+
+    message = {"role": "assistant"}
+    if text_parts:
+        message["content"] = "\n".join(text_parts)
+    else:
+        message["content"] = ""
+    if reasoning_text:
+        message["reasoning_content"] = reasoning_text
+    if tool_calls:
+        message["tool_calls"] = tool_calls
+
+    return {
+        "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "message": message,
+            "finish_reason": finish,
+        }],
+        "usage": oai_usage,
+    }
+
+
 def _estimate_tokens(text: str) -> int:
     if _encoding:
         return len(_encoding.encode(text))
@@ -463,7 +670,8 @@ async def messages(request: Request):
         return Response(content='{"error":"invalid json"}', status_code=400)
 
     original_model = body.get("model", "")
-    route = _route_for(original_model)
+    tool_names = _extract_tool_names(body)
+    route = _route_for(original_model, tool_names)
     model_id = route["model"]
     cfg = get_model_config(model_id)
     endpoint = cfg["endpoint"]
@@ -509,10 +717,10 @@ async def messages(request: Request):
             account_alias = _alias_for_key(a_headers.get("x-api-key", ""))
             if resp.status_code != 200:
                 _log(f"  ERROR {resp.status_code}: {resp.text[:300]}")
-                _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
+                await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
                              0, 0, 0, success=False, error=f"HTTP {resp.status_code}",
                              protocol=protocol, is_stream=is_stream, thinking=thinking_type, effort=effort,
-                             client_ip=client_ip, account_alias=account_alias)
+                             client_ip=client_ip, account_alias=account_alias, tools=tool_names)
                 return Response(content=resp.content, status_code=resp.status_code, media_type="application/json")
             data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
             usage = data.get("usage", {})
@@ -525,11 +733,12 @@ async def messages(request: Request):
                 _token_usage[model_id]["cache"] += req_cache
             alias_tag = f" | account={account_alias}" if account_alias else ""
             _log(f"  ← {model_id} | +{req_in} in | +{req_out} out | +{req_cache} cache{alias_tag}")
-            _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
+            await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
                          req_in, req_out, req_cache, success=True,
                          protocol=protocol, is_stream=is_stream, thinking=thinking_type, effort=effort,
-                         client_ip=client_ip, account_alias=account_alias)
+                         client_ip=client_ip, account_alias=account_alias, tools=tool_names)
             return Response(content=resp.content, media_type="application/json")
+
 
         # Estimate input tokens for Anthropic streaming
         est_input = _estimate_input_tokens(body)
@@ -554,10 +763,10 @@ async def messages(request: Request):
                             err = await resp.aread()
                             _log(f"  ERROR {resp.status_code}: {err[:300]}")
                             ak = _alias_for_key(headers.get("x-api-key", ""))
-                            _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
+                            await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
                                          0, 0, 0, success=False, error=f"HTTP {resp.status_code}",
                                          protocol=protocol, is_stream=True, thinking=thinking_type, effort=effort,
-                                         client_ip=client_ip, account_alias=ak)
+                                         client_ip=client_ip, account_alias=ak, tools=tool_names)
                             error_payload = {"type": "error", "error": {"type": "api_error",
                                            "message": f"HTTP {resp.status_code}: {err.decode('utf-8', errors='replace')[:200]}"}}
                             yield _sse("error", error_payload)
@@ -605,10 +814,10 @@ async def messages(request: Request):
                     if stream_out:
                         with _token_lock:
                             _token_usage[model_id]["output"] += stream_out
-                    _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
+                    await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
                                  stream_in if stream_in is not None else est_input, stream_out, stream_cache, success=False, error=str(e),
                                  protocol=protocol, is_stream=True, thinking=thinking_type, effort=effort,
-                                 client_ip=client_ip, account_alias=ak)
+                                 client_ip=client_ip, account_alias=ak, tools=tool_names)
                     return
                 else:
                     # Only reached if no exception and no break (successful stream)
@@ -621,10 +830,10 @@ async def messages(request: Request):
                 ak = _alias_for_key(headers.get("x-api-key", ""))
                 alias_tag = f" | account={ak}" if ak else ""
                 _log(f"  ← {model_id} | +{logged_in} in | +{stream_out} out | +{stream_cache} cache{alias_tag}")
-                _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
+                await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
                              logged_in, stream_out, stream_cache, success=True,
                              protocol=protocol, is_stream=True, thinking=thinking_type, effort=effort,
-                             client_ip=client_ip, account_alias=ak)
+                             client_ip=client_ip, account_alias=ak, tools=tool_names)
 
         return StreamingResponse(anthropic_stream(), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
@@ -646,10 +855,10 @@ async def messages(request: Request):
         account_alias = _alias_for_key(_key_from_headers(headers, "openai"))
         if resp.status_code != 200:
             _log(f"  ERROR {resp.status_code}: {resp.text[:300]}")
-            _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
+            await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
                          0, 0, 0, success=False, error=f"HTTP {resp.status_code}",
                          protocol=protocol, is_stream=is_stream, thinking=thinking_type, effort=effort,
-                         client_ip=client_ip, account_alias=account_alias)
+                         client_ip=client_ip, account_alias=account_alias, tools=tool_names)
             try:
                 err_data = resp.json()
                 err_msg = err_data.get("error", {})
@@ -671,10 +880,10 @@ async def messages(request: Request):
             _token_usage[model_id]["cache"] += cache
         alias_tag = f" | account={account_alias}" if account_alias else ""
         _log(f"  ← {model_id} | +{req_in} in | +{req_out} out | +{cache} cache{alias_tag}")
-        _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
+        await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
                      req_in, req_out, cache, success=True,
                      protocol=protocol, is_stream=False, thinking=thinking_type, effort=effort,
-                     client_ip=client_ip, account_alias=account_alias)
+                     client_ip=client_ip, account_alias=account_alias, tools=tool_names)
         return Response(content=json.dumps(openai_to_anthropic(data, original_model), ensure_ascii=False),
                         media_type="application/json")
 
@@ -710,10 +919,10 @@ async def messages(request: Request):
                         err = await resp.aread()
                         _log(f"  ERROR {resp.status_code}: {err[:300]}")
                         ak_h = _alias_for_key(_key_from_headers(hdrs, "openai"))
-                        _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
+                        await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
                                      0, 0, 0, success=False, error=f"HTTP {resp.status_code}",
                                      protocol=protocol, is_stream=True, thinking=thinking_type, effort=effort,
-                                     client_ip=client_ip, account_alias=ak_h)
+                                     client_ip=client_ip, account_alias=ak_h, tools=tool_names)
                         error_payload = {"type": "error", "error": {"type": "api_error",
                                        "message": f"HTTP {resp.status_code}: {err.decode('utf-8', errors='replace')[:200]}"}}
                         yield _sse("error", error_payload)
@@ -764,10 +973,10 @@ async def messages(request: Request):
                             ak_h = _alias_for_key(_key_from_headers(hdrs, "openai"))
                             alias_tag = f" | account={ak_h}" if ak_h else ""
                             _log(f"  ← {model_id} | +{final_in} in{log_tag} | +{final_out} out{log_tag} | +{final_cache} cache{alias_tag}")
-                            _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
+                            await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
                                          final_in, final_out, final_cache, success=True,
                                          protocol=protocol, is_stream=True, thinking=thinking_type, effort=effort,
-                                         client_ip=client_ip, account_alias=ak_h)
+                                         client_ip=client_ip, account_alias=ak_h, tools=tool_names)
                             break
 
                         try:
@@ -847,10 +1056,10 @@ async def messages(request: Request):
                 with _token_lock:
                     _token_usage[model_id]["input"] -= stream_in_est
                 ak_h = _alias_for_key(_key_from_headers(hdrs, "openai"))
-                _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
+                await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
                              stream_in_est, stream_out_tokens, 0, success=False, error=str(e),
                              protocol=protocol, is_stream=True, thinking=thinking_type, effort=effort,
-                             client_ip=client_ip, account_alias=ak_h)
+                             client_ip=client_ip, account_alias=ak_h, tools=tool_names)
                 if started:
                     for idx in open_blocks:
                         yield _sse("content_block_stop", {"type": "content_block_stop", "index": idx})
@@ -866,9 +1075,8 @@ async def messages(request: Request):
                              headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
 
 
-@app.get("/health")
 async def health():
-    with _db_lock:
+    async with _db_lock:
         _conn.execute("SELECT 1")
     with _token_lock:
         usage = {model: {"input": d["input"], "output": d["output"], "cache": d["cache"]}
@@ -893,6 +1101,414 @@ async def count_tokens(request: Request):
     return {"input_tokens": tokens}
 
 
+@app.post("/v1/chat/completions")
+async def chat_completions(request: Request):
+    req_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+    start_time = time.time()
+    client_ip = request.client.host if request.client else "unknown"
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        client_ip = forwarded.split(",")[0].strip()
+
+    try:
+        body = json.loads(await request.body())
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "invalid json"})
+
+    original_model = body.get("model", "")
+    tool_names = _extract_tool_names(body)
+    route = _route_for(original_model, tool_names)
+    model_id = route["model"]
+    cfg = get_model_config(model_id)
+    endpoint = cfg["endpoint"]
+    protocol = cfg["protocol"]
+
+    body = dict(body)
+    body["model"] = model_id
+    is_stream = body.get("stream", False)
+
+    thinking_type = "none"
+    effort = body.get("effort", "none")
+
+    _log(f"→ {original_model!r} → {model_id} | {protocol} | chat/completions | stream={is_stream} | ip={client_ip}")
+
+    # ── OpenAI passthrough ─────────────────────────────────────
+    if protocol == "openai":
+        headers = _get_auth_headers("openai")
+
+        if not is_stream:
+            resp = await _client.post(endpoint, json=body, headers=headers)
+            if resp.status_code == 429 and len(API_KEYS) > 1:
+                failed_key = headers.get("Authorization", "").replace("Bearer ", "")
+                alt = _find_alternative_key(failed_key)
+                if alt:
+                    _log(f"  429 on key, retrying with alternative key")
+                    headers = _get_auth_headers("openai", entry=alt)
+                    resp = await _client.post(endpoint, json=body, headers=headers)
+            account_alias = _alias_for_key(_key_from_headers(headers, "openai"))
+            if resp.status_code != 200:
+                _log(f"  ERROR {resp.status_code}: {resp.text[:300]}")
+                await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
+                             0, 0, 0, success=False, error=f"HTTP {resp.status_code}",
+                             protocol=protocol, is_stream=is_stream, thinking=thinking_type, effort=effort,
+                             client_ip=client_ip, account_alias=account_alias, tools=tool_names)
+                try:
+                    err_data = resp.json()
+                except Exception:
+                    return Response(content=resp.content, status_code=resp.status_code, media_type="application/json")
+                return Response(content=resp.content, status_code=resp.status_code, media_type="application/json")
+            data = resp.json()
+            usage = data.get("usage", {})
+            req_in = usage.get("prompt_tokens", 0)
+            req_out = usage.get("completion_tokens", 0)
+            cache = _extract_cache_tokens(usage)
+            with _token_lock:
+                _token_usage[model_id]["input"] += req_in
+                _token_usage[model_id]["output"] += req_out
+                _token_usage[model_id]["cache"] += cache
+            alias_tag = f" | account={account_alias}" if account_alias else ""
+            _log(f"  ← {model_id} | +{req_in} in | +{req_out} out | +{cache} cache{alias_tag}")
+            await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
+                         req_in, req_out, cache, success=True,
+                         protocol=protocol, is_stream=is_stream, thinking=thinking_type, effort=effort,
+                         client_ip=client_ip, account_alias=account_alias, tools=tool_names)
+            return Response(content=json.dumps(data, ensure_ascii=False), media_type="application/json")
+
+        # ── OpenAI streaming passthrough ──
+        oai_body = dict(body)
+        oai_body["stream_options"] = {"include_usage": True}
+
+        est_input = sum(_estimate_tokens(m.get("content", "")) if isinstance(m.get("content"), str) else 0
+                        for m in oai_body.get("messages", []))
+        with _token_lock:
+            _token_usage[model_id]["input"] += est_input
+
+        async def openai_stream(hdrs):
+            stream_out = 0
+            actual_usage = None
+            for _attempt in range(2):
+                try:
+                    async with _client.stream("POST", endpoint, json=oai_body, headers=hdrs) as resp:
+                        if resp.status_code != 200:
+                            if resp.status_code == 429 and _attempt == 0 and len(API_KEYS) > 1:
+                                failed_key = hdrs.get("Authorization", "").replace("Bearer ", "")
+                                alt = _find_alternative_key(failed_key)
+                                if alt:
+                                    _log(f"  429 on key, retrying with alternative key")
+                                    hdrs = _get_auth_headers("openai", entry=alt)
+                                    continue
+                            err = await resp.aread()
+                            _log(f"  ERROR {resp.status_code}: {err[:300]}")
+                            ak_h = _alias_for_key(_key_from_headers(hdrs, "openai"))
+                            await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
+                                         0, 0, 0, success=False, error=f"HTTP {resp.status_code}",
+                                         protocol=protocol, is_stream=True, thinking=thinking_type, effort=effort,
+                                         client_ip=client_ip, account_alias=ak_h, tools=tool_names)
+                            yield b"data: " + json.dumps({"error": {"message": f"HTTP {resp.status_code}"}}, ensure_ascii=False).encode() + b"\n\ndata: [DONE]\n\n"
+                            return
+
+                        async for line in resp.aiter_lines():
+                            if not line.startswith("data:"):
+                                continue
+                            data_str = line[5:].strip()
+                            if data_str == "[DONE]":
+                                yield line.encode() + b"\n\n"
+                                continue
+                            try:
+                                chunk = json.loads(data_str)
+                            except Exception:
+                                yield line.encode() + b"\n\n"
+                                continue
+                            chunk_usage = chunk.get("usage")
+                            if isinstance(chunk_usage, dict):
+                                actual_usage = chunk_usage
+                            choices = chunk.get("choices", [])
+                            if choices and isinstance(choices, list) and len(choices) > 0:
+                                delta = choices[0].get("delta", {}) if isinstance(choices[0], dict) else {}
+                                if isinstance(delta, dict):
+                                    c = delta.get("content")
+                                    if isinstance(c, str):
+                                        stream_out += _estimate_tokens(c)
+                                    rc = delta.get("reasoning_content")
+                                    if isinstance(rc, str):
+                                        stream_out += _estimate_tokens(rc)
+                            yield line.encode() + b"\n\n"
+
+                        # Stream ended — finalize tracking
+                        final_in = est_input
+                        final_out = stream_out
+                        final_cache = 0
+                        with _token_lock:
+                            if actual_usage:
+                                final_in = actual_usage.get("prompt_tokens", est_input)
+                                final_out = actual_usage.get("completion_tokens", stream_out)
+                                final_cache = _extract_cache_tokens(actual_usage)
+                                _token_usage[model_id]["input"] -= est_input
+                                _token_usage[model_id]["input"] += final_in
+                                _token_usage[model_id]["output"] += final_out
+                                if final_cache:
+                                    _token_usage[model_id]["cache"] += final_cache
+                            else:
+                                _token_usage[model_id]["output"] += stream_out
+
+                        log_tag = "" if actual_usage else " (est)"
+                        ak_h = _alias_for_key(_key_from_headers(hdrs, "openai"))
+                        alias_tag = f" | account={ak_h}" if ak_h else ""
+                        _log(f"  ← {model_id} | +{final_in} in{log_tag} | +{final_out} out{log_tag} | +{final_cache} cache{alias_tag}")
+                        await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
+                                     final_in, final_out, final_cache, success=True,
+                                     protocol=protocol, is_stream=True, thinking=thinking_type, effort=effort,
+                                     client_ip=client_ip, account_alias=ak_h, tools=tool_names)
+                except Exception as e:
+                    _log(f"  ERROR stream: {e}")
+                    with _token_lock:
+                        _token_usage[model_id]["input"] -= est_input
+                    ak_h = _alias_for_key(_key_from_headers(hdrs, "openai"))
+                    await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
+                                 est_input, stream_out, 0, success=False, error=str(e),
+                                 protocol=protocol, is_stream=True, thinking=thinking_type, effort=effort,
+                                 client_ip=client_ip, account_alias=ak_h, tools=tool_names)
+                    return
+                else:
+                    break
+            else:
+                return
+
+        return StreamingResponse(openai_stream(headers), media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
+
+    # ── Anthropic protocol (double conversion) ──────────────────
+    anthro_body = openai_to_anthropic_request(body)
+
+    # Apply thinking/effort overrides from route
+    thinking_override = route.get("thinking")
+    if thinking_override and thinking_override != "auto":
+        if not isinstance(anthro_body.get("thinking"), dict):
+            anthro_body["thinking"] = {}
+        anthro_body["thinking"]["type"] = thinking_override
+    effort_override = route.get("effort")
+    if effort_override and effort_override != "auto":
+        anthro_body["effort"] = effort_override
+
+    thinking = anthro_body.get("thinking", {})
+    thinking_type = thinking.get("type", "none") if isinstance(thinking, dict) else "none"
+    effort = (anthro_body.get("effort")
+              or (thinking.get("effort") if isinstance(thinking, dict) else None)
+              or "none")
+    a_headers = _get_auth_headers("anthropic")
+
+    if not is_stream:
+        resp = await _client.post(endpoint, json=anthro_body, headers=a_headers)
+        if resp.status_code == 429 and len(API_KEYS) > 1:
+            failed_key = a_headers.get("x-api-key", "")
+            alt = _find_alternative_key(failed_key)
+            if alt:
+                _log(f"  429 on key, retrying with alternative key")
+                a_headers = _get_auth_headers("anthropic", entry=alt)
+                resp = await _client.post(endpoint, json=anthro_body, headers=a_headers)
+        account_alias = _alias_for_key(a_headers.get("x-api-key", ""))
+        if resp.status_code != 200:
+            _log(f"  ERROR {resp.status_code}: {resp.text[:300]}")
+            await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
+                         0, 0, 0, success=False, error=f"HTTP {resp.status_code}",
+                         protocol=protocol, is_stream=is_stream, thinking=thinking_type, effort=effort,
+                         client_ip=client_ip, account_alias=account_alias, tools=tool_names)
+            try:
+                err_data = resp.json()
+                err_msg = err_data.get("error", {}).get("message", resp.text[:200])
+            except Exception:
+                err_msg = resp.text[:200]
+            oai_err = json.dumps({"error": {"message": err_msg, "type": "api_error"}}, ensure_ascii=False)
+            return Response(content=oai_err, status_code=resp.status_code, media_type="application/json")
+
+        data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+        usage = data.get("usage", {})
+        req_in = usage.get("input_tokens", 0) or usage.get("prompt_tokens", 0)
+        req_out = usage.get("output_tokens", 0) or usage.get("completion_tokens", 0)
+        req_cache = usage.get("cache_read_input_tokens", 0)
+        with _token_lock:
+            _token_usage[model_id]["input"] += req_in
+            _token_usage[model_id]["output"] += req_out
+            _token_usage[model_id]["cache"] += req_cache
+        alias_tag = f" | account={account_alias}" if account_alias else ""
+        _log(f"  ← {model_id} | +{req_in} in | +{req_out} out | +{req_cache} cache{alias_tag}")
+        await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
+                     req_in, req_out, req_cache, success=True,
+                     protocol=protocol, is_stream=is_stream, thinking=thinking_type, effort=effort,
+                     client_ip=client_ip, account_alias=account_alias, tools=tool_names)
+
+        oai_response = anthropic_to_openai_response(data, original_model)
+        return Response(content=json.dumps(oai_response, ensure_ascii=False), media_type="application/json")
+
+    # ── Streaming with Anthropic backend (true streaming) ──
+    async def _anthro_to_oai_stream(hdrs):
+        _id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+        _created = int(time.time())
+        started = False
+        content_types = {}
+        text_data = {}
+        thinking_data = {}
+        tool_data = {}
+        open_blocks = set()
+        stream_out = 0
+        actual_usage = None
+        total_input = 0
+        _line_buf = ""
+
+        def _chunk(delta_override, finish):
+            c = {
+                "id": _id, "object": "chat.completion.chunk", "created": _created,
+                "model": original_model,
+                "choices": [{"index": 0, "delta": delta_override, "finish_reason": finish}],
+            }
+            return b"data: " + json.dumps(c, ensure_ascii=False).encode() + b"\n\n"
+
+        for _attempt in range(2):
+            try:
+                async with _client.stream("POST", endpoint, json=anthro_body, headers=hdrs) as resp:
+                    if resp.status_code != 200:
+                        if resp.status_code == 429 and _attempt == 0 and len(API_KEYS) > 1:
+                            failed_key = hdrs.get("x-api-key", "")
+                            alt = _find_alternative_key(failed_key)
+                            if alt:
+                                _log(f"  429 on key, retrying with alternative key")
+                                hdrs = _get_auth_headers("anthropic", entry=alt)
+                                continue
+                        ak = _alias_for_key(hdrs.get("x-api-key", ""))
+                        _log(f"  ERROR {resp.status_code}")
+                        await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
+                                     0, 0, 0, success=False, error=f"HTTP {resp.status_code}",
+                                     protocol=protocol, is_stream=True, thinking=thinking_type, effort=effort,
+                                     client_ip=client_ip, account_alias=ak, tools=tool_names)
+                        yield b"data: " + json.dumps({"error": {"message": f"HTTP {resp.status_code}"}}, ensure_ascii=False).encode() + b"\n\ndata: [DONE]\n\n"
+                        return
+
+                    async for raw in resp.aiter_bytes():
+                        _line_buf += raw.decode("utf-8", errors="replace")
+                        while "\n" in _line_buf:
+                            line, _line_buf = _line_buf.split("\n", 1)
+                            line = line.strip()
+                            if not line.startswith("data:"):
+                                continue
+                            data_str = line[5:].strip()
+                            try:
+                                ev = json.loads(data_str)
+                            except Exception:
+                                continue
+                            etype = ev.get("type", "")
+
+                            if etype == "message_start":
+                                msg = ev.get("message", {})
+                                usage = msg.get("usage", {})
+                                total_input = usage.get("input_tokens", 0)
+                                started = True
+                                yield _chunk({"role": "assistant", "content": ""}, None)
+
+                            elif etype == "content_block_start":
+                                idx = ev.get("index")
+                                block = ev.get("content_block", {})
+                                btype = block.get("type")
+                                content_types[idx] = btype
+                                open_blocks.add(idx)
+                                if btype == "tool_use":
+                                    tool_data[idx] = {
+                                        "id": block.get("id", f"toolu_{uuid.uuid4().hex[:8]}"),
+                                        "name": block.get("name", ""),
+                                        "args": "",
+                                    }
+                                    yield _chunk({
+                                        "tool_calls": [{
+                                            "index": idx, "id": tool_data[idx]["id"],
+                                            "type": "function",
+                                            "function": {"name": tool_data[idx]["name"], "arguments": ""},
+                                        }]
+                                    }, None)
+
+                            elif etype == "content_block_delta":
+                                idx = ev.get("index")
+                                delta = ev.get("delta", {})
+                                dtype = delta.get("type")
+                                if dtype == "text_delta":
+                                    txt = delta.get("text", "")
+                                    text_data[idx] = text_data.get(idx, "") + txt
+                                    stream_out += _estimate_tokens(txt)
+                                    yield _chunk({"content": txt}, None)
+                                elif dtype == "thinking_delta":
+                                    th = delta.get("thinking", "")
+                                    thinking_data[idx] = thinking_data.get(idx, "") + th
+                                    stream_out += _estimate_tokens(th)
+                                    yield _chunk({"reasoning_content": th}, None)
+                                elif dtype == "input_json_delta":
+                                    pj = delta.get("partial_json", "")
+                                    if idx in tool_data:
+                                        tool_data[idx]["args"] += pj
+                                        stream_out += _estimate_tokens(pj)
+                                        yield _chunk({
+                                            "tool_calls": [{
+                                                "index": idx, "id": tool_data[idx]["id"],
+                                                "type": "function",
+                                                "function": {"name": tool_data[idx]["name"], "arguments": pj},
+                                            }]
+                                        }, None)
+
+                            elif etype == "content_block_stop":
+                                idx = ev.get("index")
+                                open_blocks.discard(idx)
+
+                            elif etype == "message_delta":
+                                d = ev.get("delta", {})
+                                u = ev.get("usage", {})
+                                actual_usage = u
+                                if u.get("output_tokens"):
+                                    stream_out = u["output_tokens"]
+                                sr = d.get("stop_reason", "")
+                                if sr == "end_turn":
+                                    finish = "stop"
+                                elif sr == "max_tokens":
+                                    finish = "length"
+                                elif sr == "tool_use":
+                                    finish = "tool_calls"
+                                else:
+                                    finish = "stop"
+                                yield _chunk({}, finish)
+
+                            elif etype == "message_stop":
+                                with _token_lock:
+                                    _token_usage[model_id]["input"] += total_input
+                                    _token_usage[model_id]["output"] += stream_out
+                                    if actual_usage:
+                                        cache = _extract_cache_tokens(actual_usage)
+                                        if cache:
+                                            _token_usage[model_id]["cache"] += cache
+                                ak = _alias_for_key(hdrs.get("x-api-key", ""))
+                                alias_tag = f" | account={ak}" if ak else ""
+                                _log(f"  ← {model_id} | +{total_input} in | +{stream_out} out{alias_tag}")
+                                await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
+                                             total_input, stream_out, _extract_cache_tokens(actual_usage or {}), success=True,
+                                             protocol=protocol, is_stream=True, thinking=thinking_type, effort=effort,
+                                             client_ip=client_ip, account_alias=ak, tools=tool_names)
+                                yield b"data: [DONE]\n\n"
+                                return
+            except Exception as e:
+                _log(f"  ERROR stream: {e}")
+                ak = _alias_for_key(hdrs.get("x-api-key", ""))
+                await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
+                             total_input or 0, stream_out, 0, success=False, error=str(e),
+                             protocol=protocol, is_stream=True, thinking=thinking_type, effort=effort,
+                             client_ip=client_ip, account_alias=ak, tools=tool_names)
+                if started:
+                    yield _chunk({}, "stop")
+                    yield b"data: [DONE]\n\n"
+                return
+            else:
+                break
+        else:
+            return
+
+    return StreamingResponse(_anthro_to_oai_stream(a_headers), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
+
+
 class ServerManager:
     """Manages uvicorn server lifecycle for start/stop/restart."""
 
@@ -902,9 +1518,7 @@ class ServerManager:
         self.port = port
         self.web_port = web_port
         self._server = None
-        self._web_server = None
         self._thread = None
-        self._web_thread = None
         self._lock = threading.Lock()
         self.is_running = False
 
@@ -924,12 +1538,6 @@ class ServerManager:
             self._thread = threading.Thread(target=self._server.run, daemon=True)
             self._thread.start()
 
-            if self.web_port != self.port:
-                web_config = Config(self.app, host=self.host, port=self.web_port, log_level="info", log_config=None)
-                self._web_server = Server(web_config)
-                self._web_thread = threading.Thread(target=self._web_server.run, daemon=True)
-                self._web_thread.start()
-
             time.sleep(0.5)
             self.is_running = True
 
@@ -939,18 +1547,11 @@ class ServerManager:
                 return
             if self._server:
                 self._server.should_exit = True
-            if self._web_server:
-                self._web_server.should_exit = True
             self.is_running = False
-        # Wait for threads outside the lock
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=5)
-        if self._web_thread and self._web_thread.is_alive():
-            self._web_thread.join(timeout=5)
         self._server = None
-        self._web_server = None
         self._thread = None
-        self._web_thread = None
 
     def restart(self, port=None, web_port=None, host=None):
         """Hot-restart: stop + update host/ports + start."""
@@ -975,8 +1576,6 @@ if __name__ == "__main__":
     mgr.start()
 
     _log(f"API: http://localhost:{PORT}")
-    if WEB_PORT != PORT:
-        _log(f"Web UI: http://localhost:{WEB_PORT}")
 
     if use_gui:
         try:

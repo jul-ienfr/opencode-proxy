@@ -115,3 +115,47 @@ docker run -d \
 ### Web Dashboard
 - Static files in `static/` directory
 - Token usage stats and request history via API endpoints
+
+## Remote Server Maintenance (192.168.31.101)
+
+Le serveur distant est une Ubuntu 24.04 qui héberge l'opencode-proxy ainsi que d'autres workloads (P-core, etc.).
+
+### Problème connu : VS Code Remote-SSH
+
+La connexion VS Code Remote-SSH peut échouer avec l'erreur `AsyncPipeFailed(NotFound)` quand :
+- Le disque racine est > 90% (actuellement ~78% après nettoyage)
+- Les jobs P-core saturent le CPU (load > 150)
+- Le swap est saturé
+
+### Nettoyage rapide
+
+Sur la machine distante :
+```bash
+fix-vscode              # Tue les processus + nettoie l'état VS Code
+~/scripts/clean-vscode-server.sh --rotate  # Rotation des logs seulement
+~/scripts/clean-vscode-server.sh --check   # Vérification de l'état
+```
+
+Un cron de rotation des logs tourne chaque dimanche à 3h00.
+
+### Swap
+
+18.1 Go de swap total :
+- `/swap.img` : 6.1 Go (fichier original)
+- `/mnt/storage500/swap.img` : 12 Go (swap secondaire, ajouté le 29/05/2026)
+
+### P-core : Contrôle des jobs
+
+Les jobs P-core sont gérés par :
+- `pcore-scheduler.service` (daemon CronManager)
+- 17 timers systemd user
+
+Modifications effectuées le 29/05/2026 :
+- `prediction-core-live-observer.timer` : passage de 5 min → 15 min
+- `pcore-calibration.timer` : décalé de 03:00 → 04:00 (conflit avec backup)
+
+### Taille de la partition
+
+P-core a été déplacé vers `/mnt/storage500/P-core/` avec un symlink :
+```
+/home/jul/P-core -> /mnt/storage500/P-core/

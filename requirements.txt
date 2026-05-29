@@ -1,8 +1,8 @@
-fastapi
-uvicorn[standard]
-httpx
-rich
+fastapi>=0.100,<1
+uvicorn[standard]>=0.20,<1
+httpx>=0.24,<1
+rich>=13,<15
 tiktoken>=0.7.0
-pystray
-Pillow
-pywebview
+pystray>=0.19,<1
+Pillow>=10,<11
+pywebview>=5,<7

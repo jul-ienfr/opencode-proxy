@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="vi">
+<html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -15,7 +15,7 @@
                     <option value="en" data-i18n="lang.en">English</option>
                     <option value="fr" data-i18n="lang.fr">Français</option>
                 </select>
-                <button class="theme-toggle" id="theme-toggle" title="Toggle theme">&#9784;</button>
+                <button class="theme-toggle" id="theme-toggle" title="Toggle theme" aria-label="Toggle theme">&#9784;</button>
             </div>
         </header>
 
@@ -81,15 +81,15 @@
                 <div class="charts-row">
                     <div class="card chart-card">
                         <h2 data-i18n="chart.token_dist">Token Distribution</h2>
-                        <canvas id="chart-tokens" width="300" height="300"></canvas>
+                        <canvas id="chart-tokens" width="300" height="300" role="img" aria-label="Token distribution chart"></canvas>
                     </div>
                     <div class="card chart-card">
                         <h2 data-i18n="chart.token_pct">Token % by Model</h2>
-                        <canvas id="chart-model-tokens" width="300" height="300"></canvas>
+                        <canvas id="chart-model-tokens" width="300" height="300" role="img" aria-label="Token percentage by model chart"></canvas>
                     </div>
                     <div class="card chart-card">
                         <h2 data-i18n="chart.req_pct">Requests % by Model</h2>
-                        <canvas id="chart-model-requests" width="300" height="300"></canvas>
+                        <canvas id="chart-model-requests" width="300" height="300" role="img" aria-label="Request percentage by model chart"></canvas>
                     </div>
                 </div>
 
@@ -153,12 +153,13 @@
                                 <th data-i18n="stats.cache">Cache</th>
                                 <th data-i18n="logs.thinking">Thinking</th>
                                 <th data-i18n="logs.effort">Effort</th>
+                                <th data-i18n="logs.tools">Tools</th>
                                 <th data-i18n="logs.duration">Duration (ms)</th>
                                 <th data-i18n="logs.status">Status</th>
                             </tr>
                         </thead>
                         <tbody id="history-tbody">
-                            <tr><td colspan="11" data-i18n="stats.loading">Loading...</td></tr>
+                            <tr><td colspan="12" data-i18n="stats.loading">Loading...</td></tr>
                         </tbody>
                     </table>
                     <div class="pagination" id="pagination">
@@ -200,10 +201,6 @@
                         <div class="config-field">
                             <label for="cfg-port" data-i18n="config.api_port">API Port</label>
                             <input type="number" id="cfg-port" class="config-input" min="1" max="65535">
-                        </div>
-                        <div class="config-field">
-                            <label for="cfg-web-port" data-i18n="config.web_port">Web UI Port</label>
-                            <input type="number" id="cfg-web-port" class="config-input" min="1" max="65535">
                         </div>
                         <div class="config-field">
                             <label for="cfg-bind-address" data-i18n="config.bind_address">Bind Address</label>
@@ -275,7 +272,7 @@
                         </table>
                     </div>
                     <div class="custom-route-add">
-                        <input type="text" id="cr-match" class="config-input" placeholder="e.g. nimo">
+                        <input type="text" id="cr-match" class="config-input" placeholder="e.g. nimo, web_search">
                         <select id="cr-thinking" class="config-select" style="width:auto">
                             <option value="auto" data-i18n="config.cr_thinking_auto">Auto</option>
                             <option value="adaptive" data-i18n="config.cr_thinking_adaptive">Adaptive</option>
@@ -293,6 +290,31 @@
                     <div class="config-actions" style="margin-top: 10px;">
                         <button class="btn btn-primary" id="cr-save-btn" data-i18n="config.cr_save">Save Custom Routes</button>
                         <span id="cr-save-status" class="save-status"></span>
+                    </div>
+                </div>
+
+                <!-- Tool Routing -->
+                <div class="card">
+                    <h2 data-i18n="config.tool_routing">Tool Routing</h2>
+                    <p class="config-hint" data-i18n="config.tool_routing_desc">Assign a backend model to each tool detected in recent requests. Routes are created automatically as custom mappings.</p>
+                    <div class="tool-routes-table">
+                        <table id="tool-routes-table">
+                            <thead>
+                                <tr>
+                                    <th data-i18n="config.tr_tool">Tool</th>
+                                    <th data-i18n="config.tr_count">Uses</th>
+                                    <th data-i18n="config.tr_backend">Backend Model</th>
+                                    <th data-i18n="config.tr_status">Status</th>
+                                </tr>
+                            </thead>
+                            <tbody id="tool-routes-tbody">
+                                <tr><td colspan="4" data-i18n="stats.loading">Loading...</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                    <div class="config-actions" style="margin-top: 10px;">
+                        <button class="btn btn-primary" id="tr-save-btn" data-i18n="config.tr_save">Save Tool Routes</button>
+                        <span id="tr-save-status" class="save-status"></span>
                     </div>
                 </div>
 
@@ -359,9 +381,9 @@
             </div>
         </footer>
 
-        <div class="modal-overlay" id="delete-modal" style="display:none">
+        <div class="modal-overlay" id="delete-modal" style="display:none" role="dialog" aria-modal="true" aria-labelledby="delete-modal-title">
             <div class="modal">
-                <h3 data-i18n="delete.modal_title">Delete History Before</h3>
+                <h3 id="delete-modal-title" data-i18n="delete.modal_title">Delete History Before</h3>
                 <input type="date" id="delete-date" class="date-input modal-date">
                 <div class="modal-buttons">
                     <button class="btn btn-danger" id="modal-delete-btn" data-i18n="delete.all">Delete</button>

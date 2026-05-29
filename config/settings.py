@@ -1,5 +1,6 @@
 import os
 import json
+import logging
 
 ENV_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env")
 CUSTOM_ROUTES_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "custom_routes.json")
@@ -58,31 +59,30 @@ MODELS = {
 def load_routes():
     """Load ROUTES from environment variables or use default."""
     disable = os.getenv("DISABLE_MAPPING", "").lower() in ("1", "true", "yes")
-    if disable:
-        return {}
-
-    # Aliases: user-provided name → canonical prefix
-    ALIASES = {
-        "nimo":  "mimo",
-    }
-    # Build reverse map: canonical prefix → list of alias prefixes
-    alias_reverse = {}
-    for alias, canonical in ALIASES.items():
-        alias_reverse.setdefault(canonical, []).append(alias)
-
     routes = {}
-    for model_id in MODELS:
-        key = model_id.replace("-", "").replace(".", "").replace("_", "")
-        match_keywords = [model_id]
-        prefix = model_id.split("-")[0]
-        for alias in alias_reverse.get(prefix, []):
-            match_keywords.append(model_id.replace(prefix, alias, 1))
-        routes[key] = {"match": match_keywords, "model": model_id}
+    if not disable:
+        # Aliases: user-provided name → canonical prefix
+        ALIASES = {
+            "nimo":  "mimo",
+        }
+        # Build reverse map: canonical prefix → list of alias prefixes
+        alias_reverse = {}
+        for alias, canonical in ALIASES.items():
+            alias_reverse.setdefault(canonical, []).append(alias)
 
-    # Custom user-defined routes
+        for model_id in MODELS:
+            key = model_id.replace("-", "").replace(".", "").replace("_", "")
+            match_keywords = [model_id]
+            prefix = model_id.split("-")[0]
+            for alias in alias_reverse.get(prefix, []):
+                match_keywords.append(model_id.replace(prefix, alias, 1))
+            routes[key] = {"match": match_keywords, "model": model_id}
+
+    # Custom user-defined routes (applied even when mapping is disabled)
     for key, value in CUSTOM_ROUTES.items():
         routes[key] = value
 
+    # Always apply model route overrides
     routes["opus"]   = {"match": ["opus"],   "model": os.getenv("OPUS_MAP_MODEL", "kimi-k2.6")}
     routes["sonnet"] = {"match": ["sonnet"], "model": os.getenv("SONNET_MAP_MODEL", "glm-5.1")}
     routes["haiku"]  = {"match": ["haiku"],  "model": os.getenv("HAIKU_MAP_MODEL", "minimax-m2.5")}
@@ -97,8 +97,8 @@ def load_custom_routes():
                 data = json.load(f)
                 if isinstance(data, dict):
                     return data
-        except Exception:
-            pass
+        except Exception as e:
+            logging.warning("Failed to load custom_routes.json: %s", e)
     return {}
 
 
@@ -123,8 +123,8 @@ def load_api_keys() -> list[dict]:
                         if not k.get("alias"):
                             k["alias"] = f"Compte {i+1}"
                     return data
-        except Exception:
-            pass
+        except Exception as e:
+            logging.warning("Failed to load api_keys.json: %s", e)
     # Fallback: single key from .env
     if API_KEY:
         return [{"api_key": API_KEY,
