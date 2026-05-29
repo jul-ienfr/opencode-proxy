@@ -1808,7 +1808,14 @@ async def responses(request: Request):
                                             "content_index": content_index,
                                         })
                                     elif dtype == "thinking_delta":
-                                        stream_out += _estimate_tokens(delta.get("thinking", ""))
+                                        txt = delta.get("thinking", "")
+                                        stream_out += _estimate_tokens(txt)
+                                        if txt:
+                                            yield _sse("response.reasoning.delta", {
+                                                "delta": txt,
+                                                "item_id": item_id,
+                                                "output_index": output_index,
+                                            })
                                 elif etype == "content_block_stop":
                                     idx = ev.get("index")
                                     if content_types.get(idx) == "text":
@@ -1961,6 +1968,14 @@ async def responses(request: Request):
                                         "item_id": item_id,
                                         "output_index": output_index,
                                         "content_index": content_index,
+                                    })
+                                rc = delta.get("reasoning_content")
+                                if isinstance(rc, str) and rc:
+                                    stream_out += _estimate_tokens(rc)
+                                    yield _sse("response.reasoning.delta", {
+                                        "delta": rc,
+                                        "item_id": item_id,
+                                        "output_index": output_index,
                                     })
                     # Stream ended
                     yield _sse("response.output_text.done", {
