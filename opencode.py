@@ -670,6 +670,10 @@ def openai_responses_to_anthropic(body: dict) -> dict:
         else:
             result["tool_choice"] = tc
 
+    # Pass through thinking control if explicitly set
+    if "thinking" in body:
+        result["thinking"] = body["thinking"]
+
     return result
 
 
@@ -1692,6 +1696,10 @@ async def responses(request: Request):
         return JSONResponse(status_code=400, content={"error": "invalid json"})
 
     body = ensure_min_tokens(body)
+
+    # Disable thinking for deepseek models (they consume all tokens on reasoning)
+    if "deepseek-v4" in (body.get("model", "")):
+        body["thinking"] = {"type": "disabled"}
 
     original_model = body.get("model", "")
     tool_names = _extract_tool_names(body)
