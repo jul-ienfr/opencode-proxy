@@ -89,6 +89,7 @@ const LOCALE = {
         'proxy.stopped': 'Stopped',
         'proxy.start': 'Start',
         'proxy.stop': 'Stop',
+        'proxy.restart': 'Restart',
         'proxy.restart_notice': 'Proxy restart required for port changes to take effect.',
         'proxy.copy': 'Click to copy',
         'proxy.copied': 'Copied!',
@@ -241,6 +242,7 @@ const LOCALE = {
         'proxy.stopped': 'Arrêté',
         'proxy.start': 'Démarrer',
         'proxy.stop': 'Arrêter',
+        'proxy.restart': 'Redémarrer',
         'proxy.restart_notice': 'Un redémarrage est nécessaire pour appliquer les changements de port.',
         'proxy.copy': 'Cliquer pour copier',
         'proxy.copied': 'Copié !',
@@ -773,17 +775,20 @@ function renderConfig(data) {
     const statusLan = document.getElementById('proxy-status-lan');
     const btnStart = document.getElementById('btn-proxy-start');
     const btnStop = document.getElementById('btn-proxy-stop');
+    const btnRestart = document.getElementById('btn-proxy-restart');
 
     if (data.proxy_running) {
         statusDot.className = 'status-dot running';
         statusText.textContent = t('proxy.running');
         btnStart.disabled = true;
         btnStop.disabled = false;
+        btnRestart.disabled = false;
     } else {
         statusDot.className = 'status-dot stopped';
         statusText.textContent = t('proxy.stopped');
         btnStart.disabled = false;
         btnStop.disabled = true;
+        btnRestart.disabled = true;
     }
 
     // Local address — click to copy
@@ -1119,6 +1124,14 @@ function setupConfig() {
     document.getElementById('btn-proxy-stop').addEventListener('click', async () => {
         try {
             await apiFetch('/api/proxy/stop', { method: 'POST' }).catch(() => {});
+            fetchConfig().then(renderConfig);
+        } catch (e) { console.error(e); }
+    });
+
+    document.getElementById('btn-proxy-restart').addEventListener('click', async () => {
+        try {
+            await apiFetch('/api/proxy/restart', { method: 'POST' }).catch(() => {});
+            await new Promise(r => setTimeout(r, 1500));
             fetchConfig().then(renderConfig);
         } catch (e) { console.error(e); }
     });

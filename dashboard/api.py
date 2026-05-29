@@ -268,6 +268,14 @@ def register_dashboard(app, static_dir, conn, db_lock, server_manager_getter=Non
         mgr.stop()
         return {"status": "ok", "message": "Proxy stopped"}
 
+    @app.post("/api/proxy/restart")
+    async def proxy_restart():
+        mgr = server_manager_getter() if server_manager_getter else None
+        if not mgr:
+            return {"status": "error", "message": "No server manager available"}
+        mgr.restart()
+        return {"status": "ok", "message": "Proxy restarted"}
+
     # ── Stats & history ──
 
     @app.get("/api/stats")
