@@ -17,7 +17,7 @@ import httpx
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import StreamingResponse, JSONResponse
 
-from config import API_KEY, PROXY, MODELS, ROUTES, get_model_config, HOST, PORT, WEB_PORT, DISABLE_MAPPING, API_KEYS, API_KEY_ROUTING, CUSTOM_ROUTES
+from config import API_KEY, PROXY, MODELS, ROUTES, get_model_config, HOST, PORT, WEB_PORT, DISABLE_MAPPING, API_KEYS, API_KEY_ROUTING, CUSTOM_ROUTES, maybe_reload_custom_routes
 
 import itertools
 
@@ -204,6 +204,7 @@ def _sse(event: str, payload: dict) -> bytes:
 
 
 def _route_for(model_name: str, tool_names: list = None) -> dict:
+    maybe_reload_custom_routes()
     if DISABLE_MAPPING:
         return {"match": [], "model": model_name}
     name = model_name.lower()
@@ -609,6 +610,23 @@ def openai_responses_to_anthropic(body: dict) -> dict:
                 "type": "tool_result",
                 "tool_use_id": item.get("call_id", item.get("id", "")),
                 "content": item.get("output", ""),
+            })
+            continue
+
+        # Convert previous-turn function_call items to assistant tool_use blocks
+        if item.get("type") == "function_call":
+            try:
+                inp = json.loads(item.get("arguments", "{}"))
+            except Exception:
+                inp = {}
+            anthro_messages.append({
+                "role": "assistant",
+                "content": [{
+                    "type": "tool_use",
+                    "id": item.get("id", f"toolu_{uuid.uuid4().hex[:12]}"),
+                    "name": item.get("name", ""),
+                    "input": inp,
+                }]
             })
             continue
 
@@ -1134,11 +1152,11 @@ async def messages(request: Request):
                                 yield _sse("message_start", {"type": "message_start", "message": {
                                     "id": msg_id, "type": "message", "role": "assistant", "content": [],
                                     "model": original_model, "stop_reason": None, "stop_sequence": None,
-                                    "usage": {"input_tokens": final_in, "output_tokens": 0}}})
+                                    "usage": {"input_tokens": final_in, "output_tokens": 0, "cache_read_input_tokens": final_cache}}})
                             for idx in open_blocks:
                                 yield _sse("content_block_stop", {"type": "content_block_stop", "index": idx})
                             has_tools = bool(tool_block_idx)
-                            yield _sse("message_delta", {"type": "message_delta", "delta": {"stop_reason": "tool_use" if has_tools else "end_turn"}, "usage": {"output_tokens": final_out}})
+                            yield _sse("message_delta", {"type": "message_delta", "delta": {"stop_reason": "tool_use" if has_tools else "end_turn"}, "usage": {"output_tokens": final_out, "cache_read_input_tokens": final_cache}})
                             yield _sse("message_stop", {"type": "message_stop"})
                             log_tag = "" if actual_usage else " (est)"
                             ak_h = _alias_for_key(_key_from_headers(hdrs, "openai"))
@@ -1172,7 +1190,7 @@ async def messages(request: Request):
                             yield _sse("message_start", {"type": "message_start", "message": {
                                 "id": msg_id, "type": "message", "role": "assistant", "content": [],
                                 "model": original_model, "stop_reason": None, "stop_sequence": None,
-                                "usage": {"input_tokens": stream_in_est, "output_tokens": 0}}})
+                                "usage": {"input_tokens": stream_in_est, "output_tokens": 0, "cache_read_input_tokens": 0}}})
 
                         # Text
                         text = ""
@@ -1662,10 +1680,11 @@ async def chat_completions(request: Request):
                                         if cache:
                                             _token_usage[model_id]["cache"] += cache
                                 ak = _alias_for_key(hdrs.get("x-api-key", ""))
+                                cache_val = _extract_cache_tokens(actual_usage or {})
                                 alias_tag = f" | account={ak}" if ak else ""
-                                _log(f"  ← {model_id} | +{total_input} in | +{stream_out} out{alias_tag}")
+                                _log(f"  ← {model_id} | +{total_input} in | +{stream_out} out | +{cache_val} cache{alias_tag}")
                                 await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
-                                             total_input, stream_out, _extract_cache_tokens(actual_usage or {}), success=True,
+                                             total_input, stream_out, cache_val, success=True,
                                              protocol=protocol, is_stream=True, thinking=thinking_type, effort=effort,
                                              client_ip=client_ip, account_alias=ak, tools=tool_names)
                                 yield b"data: [DONE]\n\n"
@@ -1731,17 +1750,13 @@ async def responses(request: Request):
     # Inject system prompt for deepseek to use tools
     if "deepseek-v4" in model_id:
         tool_hint = (
-            "You are an AI coding assistant. You MUST use the available tools to complete tasks.\n\n"
-            "Examples:\n"
-            'User: "Read the file src/main.py"\n'
-            'Assistant: {"type": "function_call", "name": "Read", "arguments": {"file_path": "src/main.py"}}\n\n'
-            'User: "Create hello.py that prints hello"\n'
-            'Assistant: {"type": "function_call", "name": "Write", "arguments": {"file_path": "hello.py", "content": "print(\"hello\")"}}\n\n'
-            'User: "List all Python files"\n'
-            'Assistant: {"type": "function_call", "name": "Glob", "arguments": {"pattern": "**/*.py"}}\n\n'
-            "Now respond to the user's request with a tool call. Do NOT explain — just call the function."
+            "IMPORTANT: You are a coding agent with file system access. "
+            "When asked to create or modify files, always use the Write tool. "
+            "When asked to read files, use Read. For shell commands, use Bash. "
+            "DO NOT describe what you will do — just call the appropriate function."
         )
-        anthro_body["system"] = tool_hint
+        existing = anthro_body.get("system", "")
+        anthro_body["system"] = (tool_hint + "\n\n" + existing) if existing else tool_hint
 
     # Apply route overrides
     thinking_override = route.get("thinking")

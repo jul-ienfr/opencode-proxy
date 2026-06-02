@@ -1,19 +1,7 @@
 {
-  "kimik25": {
+  "mimov25": {
     "match": [
-      "kimi-k2.5"
-    ],
-    "model": "deepseek-v4-flash"
-  },
-  "mimov25pro": {
-    "match": [
-      "mimo-v2.5-pro"
-    ],
-    "model": "deepseek-v4-flash"
-  },
-  "glm51": {
-    "match": [
-      "glm-5.1"
+      "mimo-v2.5"
     ],
     "model": "deepseek-v4-flash"
   },
@@ -21,12 +9,6 @@
     "match": [
       "*"
     ],
-    "model": "deepseek-v4-flash"
-  },
-  "mimov25": {
-    "match": [
-      "mimo-v2.5"
-    ],
-    "model": "deepseek-v4-flash"
+    "model": "mimo-v2.5"
   }
 }

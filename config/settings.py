@@ -147,6 +147,50 @@ DISABLE_MAPPING = os.getenv("DISABLE_MAPPING", "").lower() in ("1", "true", "yes
 API_KEYS = load_api_keys()
 
 
+def _get_mtime():
+    try:
+        return os.path.getmtime(CUSTOM_ROUTES_PATH)
+    except OSError:
+        return 0.0
+
+
+_custom_routes_mtime = _get_mtime()
+
+
+def maybe_reload_custom_routes():
+    """Re-read custom_routes.json if it has been modified since last load."""
+    global _custom_routes_mtime
+    try:
+        mtime = _get_mtime()
+        if mtime == _custom_routes_mtime:
+            return
+        _custom_routes_mtime = mtime
+
+        new_cr = load_custom_routes()
+        old_cr_keys = set(CUSTOM_ROUTES.keys())
+        new_cr_keys = set(new_cr.keys())
+        for k in new_cr_keys - old_cr_keys:
+            CUSTOM_ROUTES[k] = new_cr[k]
+        for k in new_cr_keys & old_cr_keys:
+            CUSTOM_ROUTES[k] = new_cr[k]
+        for k in old_cr_keys - new_cr_keys:
+            del CUSTOM_ROUTES[k]
+
+        new_routes = load_routes()
+        old_r_keys = set(ROUTES.keys())
+        new_r_keys = set(new_routes.keys())
+        for k in new_r_keys - old_r_keys:
+            ROUTES[k] = new_routes[k]
+        for k in new_r_keys & old_r_keys:
+            ROUTES[k] = new_routes[k]
+        for k in old_r_keys - new_r_keys:
+            del ROUTES[k]
+
+        logging.info("Reloaded custom_routes.json (%d routes)", len(ROUTES))
+    except Exception as e:
+        logging.warning("Failed to reload custom_routes.json: %s", e)
+
+
 def get_model_config(model_id: str) -> dict:
     """Return merged config for model_id with sensible defaults."""
     cfg = MODELS.get(model_id, {})
