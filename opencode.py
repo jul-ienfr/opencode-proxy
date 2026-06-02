@@ -1552,6 +1552,7 @@ async def chat_completions(request: Request):
         stream_out = 0
         actual_usage = None
         total_input = 0
+        cache_read = 0
         _line_buf = ""
 
         def _chunk(delta_override, finish):
@@ -1600,6 +1601,7 @@ async def chat_completions(request: Request):
                                 msg = ev.get("message", {})
                                 usage = msg.get("usage", {})
                                 total_input = usage.get("input_tokens", 0)
+                                cache_read = usage.get("cache_read_input_tokens", 0)
                                 started = True
                                 yield _chunk({"role": "assistant", "content": ""}, None)
 
@@ -1675,18 +1677,30 @@ async def chat_completions(request: Request):
                                 with _token_lock:
                                     _token_usage[model_id]["input"] += total_input
                                     _token_usage[model_id]["output"] += stream_out
-                                    if actual_usage:
-                                        cache = _extract_cache_tokens(actual_usage)
-                                        if cache:
-                                            _token_usage[model_id]["cache"] += cache
+                                    if cache_read:
+                                        _token_usage[model_id]["cache"] += cache_read
                                 ak = _alias_for_key(hdrs.get("x-api-key", ""))
-                                cache_val = _extract_cache_tokens(actual_usage or {})
                                 alias_tag = f" | account={ak}" if ak else ""
-                                _log(f"  ← {model_id} | +{total_input} in | +{stream_out} out | +{cache_val} cache{alias_tag}")
+                                _log(f"  ← {model_id} | +{total_input} in | +{stream_out} out | +{cache_read} cache{alias_tag}")
                                 await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
-                                             total_input, stream_out, cache_val, success=True,
+                                             total_input, stream_out, cache_read, success=True,
                                              protocol=protocol, is_stream=True, thinking=thinking_type, effort=effort,
                                              client_ip=client_ip, account_alias=ak, tools=tool_names)
+                                # Send final usage chunk for OpenAI streaming client
+                                total = total_input + stream_out
+                                usage_chunk = {
+                                    "id": _id, "object": "chat.completion.chunk", "created": _created,
+                                    "model": original_model,
+                                    "choices": [],
+                                    "usage": {
+                                        "prompt_tokens": total_input,
+                                        "completion_tokens": stream_out,
+                                        "total_tokens": total,
+                                    }
+                                }
+                                if cache_read:
+                                    usage_chunk["usage"]["prompt_tokens_details"] = {"cached_tokens": cache_read}
+                                yield b"data: " + json.dumps(usage_chunk, ensure_ascii=False).encode() + b"\n\n"
                                 yield b"data: [DONE]\n\n"
                                 return
             except Exception as e:
