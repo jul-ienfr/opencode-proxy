@@ -267,9 +267,18 @@ def anthropic_to_openai(body: dict, model: str) -> dict:
 
     messages = []
 
-    # System prompt
-    if system_text := _extract_text(body.get("system", "")):
-        messages.append({"role": "system", "content": system_text})
+    # System prompt — preserve cache_control as message-level field (safe for all providers)
+    system_val = body.get("system", "")
+    if isinstance(system_val, list):
+        text = _extract_text(system_val)
+        if text:
+            msg = {"role": "system", "content": text}
+            # Add cache_control at message level if any system block had it
+            if any(isinstance(b, dict) and "cache_control" in b for b in system_val):
+                msg["cache_control"] = {"type": "ephemeral"}
+            messages.append(msg)
+    elif system_val:
+        messages.append({"role": "system", "content": system_val})
 
     for msg in body.get("messages", []):
         role, content = msg["role"], msg.get("content", "")
