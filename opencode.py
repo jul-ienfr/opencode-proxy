@@ -111,13 +111,15 @@ STATIC_DIR = os.path.join(BASE_DIR, "static")
 LOG_DIR = os.path.join(BASE_DIR, "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
 
-# SQLite setup
+# Request body size limit (10 MB)
+MAX_BODY_SIZE = 10 * 1024 * 1024
+
+# SQLite setup — synchronous connection, all DB ops run in thread pool
 _db_path = os.path.join(LOG_DIR, "requests.db")
 _conn = sqlite3.connect(_db_path, check_same_thread=False)
 _conn.row_factory = sqlite3.Row
 _conn.execute("PRAGMA journal_mode=WAL")
 _conn.execute("PRAGMA busy_timeout=5000")
-_db_lock = asyncio.Lock()
 _conn.execute("""
     CREATE TABLE IF NOT EXISTS requests (
         id TEXT PRIMARY KEY,
@@ -149,24 +151,33 @@ for col, default in [("protocol", "NULL"), ("is_stream", "0"), ("thinking", "NUL
 _conn.commit()
 
 
+def _db_insert_sync(req_id, timestamp, model, original_model, duration_ms,
+                    tokens_input, tokens_output, tokens_cache, success, error,
+                    protocol, is_stream, thinking, effort, client_ip, account_alias, tools_json):
+    """Synchronous DB insert — called via asyncio.to_thread()."""
+    _conn.execute("""
+        INSERT OR REPLACE INTO requests (id, timestamp, model, original_model, duration_ms,
+            tokens_input, tokens_output, tokens_cache, success, error,
+            protocol, is_stream, thinking, effort, client_ip, account_alias, tools)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (req_id, timestamp, model, original_model, duration_ms,
+          tokens_input, tokens_output, tokens_cache, 1 if success else 0, error,
+          protocol, 1 if is_stream else 0, thinking, effort,
+          client_ip, account_alias, tools_json))
+    _conn.commit()
+
+
 async def _save_request(req_id, model, original_model, duration_ms,
 	                  tokens_input, tokens_output, tokens_cache, success=True, error=None,
 	                  protocol=None, is_stream=False, thinking=None, effort=None,
 	                  client_ip=None, account_alias=None, tools=None):
     tools_json = json.dumps(tools) if tools else "[]"
     timestamp = time.strftime("%Y-%m-%dT%H:%M:%S")
-    async with _db_lock:
-        _conn.execute("""
-            INSERT OR REPLACE INTO requests (id, timestamp, model, original_model, duration_ms,
-                tokens_input, tokens_output, tokens_cache, success, error,
-                protocol, is_stream, thinking, effort, client_ip, account_alias, tools)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (req_id, timestamp, model, original_model, duration_ms,
-              tokens_input, tokens_output, tokens_cache, 1 if success else 0, error,
-              protocol, 1 if is_stream else 0, thinking, effort,
-              client_ip, account_alias, tools_json))
-        _conn.commit()
-
+    await asyncio.to_thread(
+        _db_insert_sync, req_id, timestamp, model, original_model, duration_ms,
+        tokens_input, tokens_output, tokens_cache, success, error,
+        protocol, is_stream, thinking, effort, client_ip, account_alias, tools_json
+    )
     # Notify dashboard SSE clients about the update
     try:
         get_event_manager().publish("stats_updated", {"time": timestamp})
@@ -209,7 +220,7 @@ async def debug_exception(request: Request, exc: Exception):
 # Server manager set later in __main__ for GUI mode; None means always-running
 _server_manager = None
 
-register_dashboard(app, STATIC_DIR, _conn, _db_lock, server_manager_getter=lambda: _server_manager)
+register_dashboard(app, STATIC_DIR, _conn, server_manager_getter=lambda: _server_manager)
 
 
 def _sse(event: str, payload: dict) -> bytes:
@@ -840,26 +851,52 @@ def openai_responses_to_anthropic(body: dict) -> dict:
         else:
             result["tool_choice"] = tc
 
-    # Pass through thinking control — convert Anthropic format to model-specific format
-    if "thinking" in body and isinstance(body["thinking"], dict):
-        t = body["thinking"]
-        ttype = t.get("type", "")
-        budget = t.get("budget_tokens", 0)
-        wants_thinking = ttype in ("enabled", "adaptive") or budget > 0
-        if wants_thinking:
-            if model.startswith("kimi-k2.6"):
-                # Kimi K2.6 uses reasoning: true (not reasoning_effort)
-                result["reasoning"] = True
+    # Convert Anthropic thinking/effort -> model-specific reasoning parameter
+    # Claude Code sends: thinking: {type: "adaptive"} OR effort: "low"/"medium"/"high"/"xhigh"/"max"
+    effort_level = body.get("effort")
+    thinking = body.get("thinking") if isinstance(body.get("thinking"), dict) else {}
+    ttype = thinking.get("type", "")
+    budget = thinking.get("budget_tokens", 0)
+
+    # Determine desired effort from effort param or thinking param
+    if effort_level and effort_level != "none":
+        wants_thinking = True
+    elif ttype in ("enabled", "adaptive") or budget > 0:
+        wants_thinking = True
+        # Map deprecated budget_tokens -> effort level
+        if budget >= 16000 or budget == 0:
+            effort_level = "xhigh"
+        elif budget >= 10000:
+            effort_level = "high"
+        elif budget >= 4000:
+            effort_level = "medium"
+        elif ttype == "adaptive":
+            effort_level = "medium"
+        else:
+            effort_level = "low"
+    else:
+        wants_thinking = False
+
+    if wants_thinking:
+        if model.startswith("kimi-k2.6"):
+            # Kimi K2.6 uses reasoning: true (not reasoning_effort)
+            result["reasoning"] = True
+        elif model.startswith("deepseek-v4"):
+            # DeepSeek V4 only supports high and max
+            if effort_level in ("xhigh", "max"):
+                result["reasoning_effort"] = "max"
             else:
-                # DeepSeek, MiMo, etc. use reasoning_effort
-                if budget and budget >= 10000:
-                    result["reasoning_effort"] = "high"
-                elif budget and budget >= 4000:
-                    result["reasoning_effort"] = "medium"
-                elif ttype == "adaptive":
-                    result["reasoning_effort"] = "medium"
-                else:
-                    result["reasoning_effort"] = "low"
+                result["reasoning_effort"] = "high"
+        else:
+            # MiMo V2.5 etc. supports low/medium/high
+            if effort_level in ("xhigh", "max"):
+                result["reasoning_effort"] = "high"
+            elif effort_level in ("high",):
+                result["reasoning_effort"] = "high"
+            elif effort_level in ("medium",):
+                result["reasoning_effort"] = "medium"
+            else:
+                result["reasoning_effort"] = "low"
 
     return result
 
@@ -946,6 +983,10 @@ def ensure_min_tokens(body: dict, default: int = 256) -> dict:
 
 
 def _estimate_tokens(text: str) -> int:
+    """Fast token estimation — uses char-length for small strings, tiktoken for large."""
+    if len(text) < 200:
+        # Fast path: ~4 chars per token for English, ~2 for CJK — use 3 as compromise
+        return max(1, len(text) // 3)
     if _encoding:
         return len(_encoding.encode(text))
     return max(1, len(text) // 3)
@@ -1045,8 +1086,12 @@ async def messages(request: Request):
     if forwarded:
         client_ip = forwarded.split(",")[0].strip()
 
+    body_bytes = await request.body()
+    if len(body_bytes) > MAX_BODY_SIZE:
+        return JSONResponse(status_code=413, content={"error": f"Request body too large ({len(body_bytes)} bytes, max {MAX_BODY_SIZE})"})
+
     try:
-        body = json.loads(await request.body())
+        body = json.loads(body_bytes)
     except Exception:
         return JSONResponse(status_code=400, content={"error": "invalid json"})
 
@@ -1484,11 +1529,9 @@ async def messages(request: Request):
 
 @app.get("/health")
 async def health():
-    async with _db_lock:
-        _conn.execute("SELECT 1")
-    with _token_lock:
-        usage = {model: {"input": d["input"], "output": d["output"], "cache": d["cache"]}
-                 for model, d in _token_usage.items()}
+    await asyncio.to_thread(_conn.execute, "SELECT 1")
+    usage = {model: {"input": d["input"], "output": d["output"], "cache": d["cache"]}
+             for model, d in _token_usage.items()}
     return {"status": "ok", "usage": usage}
 
 
@@ -1528,8 +1571,12 @@ async def chat_completions(request: Request):
     if forwarded:
         client_ip = forwarded.split(",")[0].strip()
 
+    body_bytes = await request.body()
+    if len(body_bytes) > MAX_BODY_SIZE:
+        return JSONResponse(status_code=413, content={"error": f"Request body too large ({len(body_bytes)} bytes, max {MAX_BODY_SIZE})"})
+
     try:
-        body = json.loads(await request.body())
+        body = json.loads(body_bytes)
     except Exception:
         return JSONResponse(status_code=400, content={"error": "invalid json"})
 
@@ -1963,8 +2010,12 @@ async def responses(request: Request):
     if forwarded:
         client_ip = forwarded.split(",")[0].strip()
 
+    body_bytes = await request.body()
+    if len(body_bytes) > MAX_BODY_SIZE:
+        return JSONResponse(status_code=413, content={"error": f"Request body too large ({len(body_bytes)} bytes, max {MAX_BODY_SIZE})"})
+
     try:
-        body = json.loads(await request.body())
+        body = json.loads(body_bytes)
     except Exception:
         return JSONResponse(status_code=400, content={"error": "invalid json"})
 
