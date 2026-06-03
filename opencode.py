@@ -19,7 +19,7 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse as StarletteJSONResponse
 
-from config import API_KEY, PROXY, MODELS, ROUTES, get_model_config, HOST, PORT, WEB_PORT, DISABLE_MAPPING, API_KEYS, API_KEY_ROUTING, CUSTOM_ROUTES, maybe_reload_custom_routes
+from config import API_KEY, PROXY, MODELS, ROUTES, get_model_config, HOST, PORT, WEB_PORT, DISABLE_MAPPING, API_KEYS, API_KEY_ROUTING, CUSTOM_ROUTES, maybe_reload_custom_routes, CACHE_MIN_PROMPT_SIZE
 
 import itertools
 
@@ -873,9 +873,9 @@ CACHE_REWRITE_MODELS = {"mimo-v2.5", "mimo-v2-pro", "mimo-v2-omni", "mimo-v2.5-p
 def _find_split_point(text: str) -> int:
     """Find the best split point between static instructions and dynamic content.
 
-    Looks for the last double-newline in the first 4000 chars to split cleanly.
+    Looks for the last double-newline in the first 8000 chars to split cleanly.
     """
-    search_limit = min(4000, len(text) // 2)
+    search_limit = min(8000, len(text) // 2)
     last_double = text.rfind("\n\n", 0, search_limit)
     if last_double > 500:
         return last_double
@@ -910,7 +910,7 @@ def _restructure_for_cache(oai_body: dict, model_id: str) -> dict:
         return oai_body
 
     sys_content = messages[sys_idx].get("content", "")
-    if not isinstance(sys_content, str) or len(sys_content) < 2000:
+    if not isinstance(sys_content, str) or len(sys_content) < CACHE_MIN_PROMPT_SIZE:
         return oai_body  # Small prompt, no need to restructure
 
     split_point = _find_split_point(sys_content)
@@ -963,19 +963,19 @@ def anthropic_to_openai(body: dict, model: str) -> dict:
 
     messages = []
 
-    # System prompt — preserve cache_control as message-level field (safe for all providers)
+    # System prompt — always add cache_control for prefix caching
     system_val = body.get("system", "")
     if isinstance(system_val, list):
         text = _extract_text(system_val)
         if text:
             text = _strip_billing_header(text)
-            msg = {"role": "system", "content": text}
-            # Add cache_control at message level if any system block had it
-            if any(isinstance(b, dict) and "cache_control" in b for b in system_val):
-                msg["cache_control"] = {"type": "ephemeral"}
+            msg = {"role": "system", "content": text, "cache_control": {"type": "ephemeral"}}
             messages.append(msg)
     elif system_val:
-        messages.append({"role": "system", "content": _strip_billing_header(system_val)})
+        msg = {"role": "system", "content": _strip_billing_header(system_val)}
+        # Always add cache_control to system messages for prefix caching
+        msg["cache_control"] = {"type": "ephemeral"}
+        messages.append(msg)
 
     for msg in body.get("messages", []):
         role, content = msg["role"], msg.get("content", "")
@@ -1054,6 +1054,13 @@ def anthropic_to_openai(body: dict, model: str) -> dict:
             if last_cache_control and not is_asst:
                 out["cache_control"] = last_cache_control
             messages.append(out)
+
+    # Add cache_control to the last user message for optimal prefix caching
+    # (Anthropic best practice: cache system + last user turn)
+    for i in range(len(messages) - 1, -1, -1):
+        if messages[i].get("role") == "user":
+            messages[i]["cache_control"] = {"type": "ephemeral"}
+            break
 
     # Build request
     oai = {"model": model, "messages": messages,
@@ -2172,6 +2179,35 @@ async def health():
 async def circuit_breakers():
     """Return status of all circuit breakers."""
     return {endpoint: cb.get_status() for endpoint, cb in _circuit_breakers.items()}
+
+
+@app.post("/api/circuit-breakers/reset")
+async def circuit_breakers_reset(request: Request):
+    """Reset one or all circuit breakers to closed state.
+
+    Body (JSON, optional):
+      - {"endpoint": "https://..."} → reset one
+      - {} or no body → reset all
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    target = body.get("endpoint")
+    if target:
+        cb = _circuit_breakers.get(target)
+        if cb is None:
+            return JSONResponse(status_code=404, content={"error": f"No circuit breaker for {target}"})
+        cb.record_success()
+        _log(f"  CIRCUIT BREAKER RESET: {target}")
+        return {"reset": target, "status": cb.get_status()}
+    # Reset all
+    count = 0
+    for endpoint, cb in _circuit_breakers.items():
+        cb.record_success()
+        count += 1
+    _log(f"  CIRCUIT BREAKERS RESET: all ({count} endpoints)")
+    return {"reset": "all", "count": count}
 
 
 @app.get("/v1/models")
