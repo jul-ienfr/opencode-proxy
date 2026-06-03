@@ -15,6 +15,7 @@ import os
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import opencode as _opencode_mod
 from opencode import (
     anthropic_to_openai,
     anthropic_to_openai_response,
@@ -414,6 +415,12 @@ class TestBucket:
 
 
 # ── Route Matching ──────────────────────────────────────────────
+
+@pytest.fixture(autouse=True)
+def _disable_mapping_off(monkeypatch):
+    """Force DISABLE_MAPPING=False for route tests."""
+    monkeypatch.setattr(_opencode_mod, "DISABLE_MAPPING", False)
+
 
 class TestRouteFor:
     """Test model route matching."""

@@ -272,7 +272,8 @@ app = FastAPI(lifespan=lifespan)
 @app.exception_handler(Exception)
 async def debug_exception(request: Request, exc: Exception):
     tb = traceback.format_exc()
-    _log(f"ERROR: {exc}\n{tb}")
+    client_ip = request.client.host if request.client else "unknown"
+    _log(f"ERROR {request.method} {request.url.path} from {client_ip}: {type(exc).__name__}: {exc}\n{tb}")
     # Don't expose tracebacks to clients — log them server-side only
     return JSONResponse(status_code=500, content={"error": "Internal server error"})
 
@@ -1726,7 +1727,7 @@ async def messages(request: Request):
                                 _token_usage[model_id]["output"] += stream_out
                 except Exception as e:
                     ak = _alias_for_key(headers.get("x-api-key", "")) if headers else ""
-                    _log(f"  ERROR stream (attempt {_attempt+1}): {e}")
+                    _log(f"  ERROR stream (attempt {_attempt+1}): {type(e).__name__}: {e}")
                     if _attempt == 0:
                         continue  # retry once on connection error
                     if stream_in is None:
@@ -1940,7 +1941,7 @@ async def messages(request: Request):
                                 yield _sse("content_block_delta", {"type": "content_block_delta", "index": tool_block_idx[api_idx],
                                            "delta": {"type": "input_json_delta", "partial_json": args}})
             except Exception as e:
-                _log(f"  ERROR stream (attempt {_attempt+1}): {e}")
+                _log(f"  ERROR stream (attempt {_attempt+1}): {type(e).__name__}: {e}")
                 if _attempt == 0:
                     continue  # retry once on connection error
                 with _token_lock:
@@ -2142,7 +2143,7 @@ async def chat_completions(request: Request):
                                      effort, client_ip, ak_h, tool_names, log_tag,
                                      tools_used=used_tools if used_tools else None)
                 except Exception as e:
-                    _log(f"  ERROR stream (attempt {_attempt+1}): {e}")
+                    _log(f"  ERROR stream (attempt {_attempt+1}): {type(e).__name__}: {e}")
                     if _attempt == 0:
                         continue  # retry once on connection error
                     with _token_lock:
@@ -2368,7 +2369,7 @@ async def chat_completions(request: Request):
                                 yield b"data: [DONE]\n\n"
                                 return
             except Exception as e:
-                _log(f"  ERROR stream (attempt {_attempt+1}): {e}")
+                _log(f"  ERROR stream (attempt {_attempt+1}): {type(e).__name__}: {e}")
                 if _attempt == 0:
                     continue  # retry once on connection error
                 ak = _alias_for_key(hdrs.get("x-api-key", ""))
