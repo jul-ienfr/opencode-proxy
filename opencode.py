@@ -2026,24 +2026,19 @@ async def chat_completions(request: Request):
         async def openai_stream(hdrs):
             stream_out = 0
             actual_usage = None
+            _handle_429 = _make_stream_retry_loop("openai")
             for _attempt in range(2):
                 try:
                     async with _client.stream("POST", endpoint, json=oai_body, headers=hdrs) as resp:
                         if resp.status_code != 200:
-                            if resp.status_code == 429 and _attempt == 0 and len(API_KEYS) > 1:
-                                failed_key = hdrs.get("Authorization", "").replace("Bearer ", "")
-                                alt = _find_alternative_key(failed_key)
-                                if alt:
-                                    _log(f"  429 on key, retrying with alternative key")
-                                    hdrs = _get_auth_headers("openai", entry=alt)
-                                    continue
+                            hdrs, should_retry = _handle_429(hdrs, resp.status_code, _attempt)
+                            if should_retry:
+                                continue
                             err = await resp.aread()
-                            _log(f"  ERROR {resp.status_code}: {err[:300]}")
                             ak_h = _alias_for_key(_key_from_headers(hdrs, "openai"))
-                            await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
-                                         0, 0, 0, success=False, error=f"HTTP {resp.status_code}",
-                                         protocol=protocol, is_stream=True, thinking=thinking_type, effort=effort,
-                                         client_ip=client_ip, account_alias=ak_h, tools=tool_names)
+                            await _log_and_save_error(req_id, model_id, original_model, start_time,
+                                         resp.status_code, err, protocol, True, thinking_type,
+                                         effort, client_ip, ak_h, tool_names)
                             yield b"data: " + json.dumps({"error": {"message": f"HTTP {resp.status_code}"}}, ensure_ascii=False).encode() + b"\n\ndata: [DONE]\n\n"
                             return
 
@@ -2075,30 +2070,13 @@ async def chat_completions(request: Request):
                             yield line.encode() + b"\n\n"
 
                         # Stream ended — finalize tracking
-                        final_in = est_input
-                        final_out = stream_out
-                        final_cache = 0
-                        with _token_lock:
-                            if actual_usage:
-                                final_in = actual_usage.get("prompt_tokens", est_input)
-                                final_out = actual_usage.get("completion_tokens", stream_out)
-                                final_cache = _extract_cache_tokens(actual_usage)
-                                _token_usage[model_id]["input"] -= est_input
-                                _token_usage[model_id]["input"] += final_in
-                                _token_usage[model_id]["output"] += final_out
-                                if final_cache:
-                                    _token_usage[model_id]["cache"] += final_cache
-                            else:
-                                _token_usage[model_id]["output"] += stream_out
-
-                        log_tag = "" if actual_usage else " (est)"
+                        final_in, final_out, final_cache, log_tag = _finalize_stream_tokens(
+                            model_id, est_input, None, stream_out, 0,
+                            actual_usage, _token_usage, _token_lock)
                         ak_h = _alias_for_key(_key_from_headers(hdrs, "openai"))
-                        alias_tag = f" | account={ak_h}" if ak_h else ""
-                        _log(f"  ← {model_id} | +{final_in} in{log_tag} | +{final_out} out{log_tag} | +{final_cache} cache{alias_tag}")
-                        await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
-                                     final_in, final_out, final_cache, success=True,
-                                     protocol=protocol, is_stream=True, thinking=thinking_type, effort=effort,
-                                     client_ip=client_ip, account_alias=ak_h, tools=tool_names)
+                        await _save_and_log_request(req_id, model_id, original_model, start_time,
+                                     final_in, final_out, final_cache, protocol, True, thinking_type,
+                                     effort, client_ip, ak_h, tool_names, log_tag)
                 except Exception as e:
                     _log(f"  ERROR stream (attempt {_attempt+1}): {e}")
                     if _attempt == 0:
@@ -2106,10 +2084,9 @@ async def chat_completions(request: Request):
                     with _token_lock:
                         _token_usage[model_id]["input"] -= est_input
                     ak_h = _alias_for_key(_key_from_headers(hdrs, "openai"))
-                    await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
-                                 est_input, stream_out, 0, success=False, error=str(e),
-                                 protocol=protocol, is_stream=True, thinking=thinking_type, effort=effort,
-                                 client_ip=client_ip, account_alias=ak_h, tools=tool_names)
+                    await _log_and_save_error(req_id, model_id, original_model, start_time,
+                                 0, str(e), protocol, True, thinking_type,
+                                 effort, client_ip, ak_h, tool_names)
                     return
                 else:
                     break
