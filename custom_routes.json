@@ -3,18 +3,24 @@
     "match": [
       "mimo-v2.5"
     ],
-    "model": "deepseek-v4-flash"
-  },
-  "*": {
-    "match": [
-      "*"
-    ],
-    "model": "deepseek-v4-flash"
+    "model": "mimo-v2.5"
   },
   "mimov25pro": {
     "match": [
       "mimo-v2.5-pro"
     ],
-    "model": "deepseek-v4-flash"
+    "model": "mimo-v2.5"
+  },
+  "minimaxm25": {
+    "match": [
+      "minimax-m2.5"
+    ],
+    "model": "mimo-v2.5"
+  },
+  "qwen35plus": {
+    "match": [
+      "qwen3.5-plus"
+    ],
+    "model": "mimo-v2.5"
   }
 }

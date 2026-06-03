@@ -50,9 +50,11 @@ MODELS = {
     "mimo-v2.5-pro"    : {"endpoint": API_BASE_OPENAI,    "protocol": "openai"},
     "mimo-v2.5"        : {"endpoint": API_BASE_OPENAI,    "protocol": "openai"},
     "minimax-m2.7"     : {"endpoint": API_BASE_ANTHROPIC, "protocol": "anthropic"},
+    "minimax-m3"       : {"endpoint": API_BASE_ANTHROPIC, "protocol": "anthropic"},
     "minimax-m2.5"     : {"endpoint": API_BASE_ANTHROPIC, "protocol": "anthropic"},
-    "qwen3.6-plus"     : {"endpoint": API_BASE_OPENAI,    "protocol": "openai"},
-    "qwen3.5-plus"     : {"endpoint": API_BASE_OPENAI,    "protocol": "openai"},
+    "qwen3.7-max"      : {"endpoint": API_BASE_ANTHROPIC, "protocol": "anthropic"},
+    "qwen3.6-plus"     : {"endpoint": API_BASE_ANTHROPIC, "protocol": "anthropic"},
+    "qwen3.5-plus"     : {"endpoint": API_BASE_ANTHROPIC, "protocol": "anthropic"},
 }
 
 

@@ -38,6 +38,8 @@ const LOCALE = {
         'stats.success': 'Success',
         'stats.failed': 'Failed',
         'stats.avg_duration': 'Avg Duration (ms)',
+        'stats.cache_hit_rate': 'Cache Hit Rate',
+        'stats.success_rate': 'Success Rate',
         'stats.requests': 'Total Requests',
         'stats.by_model': 'By Model',
         'stats.by_account': 'By Account',
@@ -90,6 +92,8 @@ const LOCALE = {
         'proxy.start': 'Start',
         'proxy.stop': 'Stop',
         'proxy.restart': 'Restart',
+        'proxy.full_restart': 'Full Restart',
+        'proxy.full_restart_confirm': 'Full restart will reload all code changes. The server will be briefly unavailable. Continue?',
         'proxy.restart_notice': 'Proxy restart required for port changes to take effect.',
         'proxy.copy': 'Click to copy',
         'proxy.copied': 'Copied!',
@@ -192,6 +196,8 @@ const LOCALE = {
         'stats.success': 'Succès',
         'stats.failed': 'Échecs',
         'stats.avg_duration': 'Durée moy. (ms)',
+        'stats.cache_hit_rate': 'Cache Hit Rate',
+        'stats.success_rate': 'Taux de Succès',
         'stats.requests': 'Total Requêtes',
         'stats.by_model': 'Par Modèle',
         'stats.by_account': 'Par Compte',
@@ -243,6 +249,8 @@ const LOCALE = {
         'proxy.start': 'Démarrer',
         'proxy.stop': 'Arrêter',
         'proxy.restart': 'Redémarrer',
+        'proxy.full_restart': 'Redémarrage complet',
+        'proxy.full_restart_confirm': 'Le redémarrage complet rechargera toutes les modifications de code. Le serveur sera brièvement indisponible. Continuer ?',
         'proxy.restart_notice': 'Un redémarrage est nécessaire pour appliquer les changements de port.',
         'proxy.copy': 'Cliquer pour copier',
         'proxy.copied': 'Copié !',
@@ -578,23 +586,27 @@ function renderStats(data) {
     document.getElementById('total-success').textContent = formatNumber(t.success_count);
     document.getElementById('total-fail').textContent = formatNumber(t.fail_count);
     document.getElementById('avg-duration').textContent = t.avg_duration_ms ? formatNumber(t.avg_duration_ms) : '-';
+    document.getElementById('cache-hit-rate').textContent = t.cache_hit_rate != null ? t.cache_hit_rate + '%' : '0%';
+    document.getElementById('success-rate').textContent = t.success_rate != null ? t.success_rate + '%' : '0%';
     document.getElementById('total-requests').textContent = formatNumber(t.count);
 
     const tbody = document.getElementById('model-tbody');
     const models = data.models;
 
     if (Object.keys(models).length === 0) {
-        tbody.innerHTML = '<tr><td colspan="9">' + t('stats.no_data') + '</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="11">' + t('stats.no_data') + '</td></tr>';
     } else {
         let html = '';
         for (const [model, s] of Object.entries(models)) {
             html += `<tr>
-                <td>${model}</td>
+                <td>${escHtml(model)}</td>
                 <td>${formatNumber(s.input)}</td>
                 <td>${formatNumber(s.output)}</td>
                 <td>${formatNumber(s.cache)}</td>
                 <td>${formatNumber(s.total)}</td>
                 <td>${s.pct}</td>
+                <td>${s.cache_hit_rate != null ? s.cache_hit_rate + '%' : '0%'}</td>
+                <td>${s.success_rate != null ? s.success_rate + '%' : '0%'}</td>
                 <td>${formatNumber(s.success_count)}</td>
                 <td>${formatNumber(s.fail_count)}</td>
                 <td>${s.avg_duration_ms ? formatNumber(s.avg_duration_ms) : '-'}</td>
@@ -607,17 +619,19 @@ function renderStats(data) {
     const atbody = document.getElementById('account-tbody');
     const accounts = data.accounts;
     if (!accounts || Object.keys(accounts).length === 0) {
-        atbody.innerHTML = '<tr><td colspan="9">' + t('stats.no_data') + '</td></tr>';
+        atbody.innerHTML = '<tr><td colspan="11">' + t('stats.no_data') + '</td></tr>';
     } else {
         let html = '';
         for (const [account, s] of Object.entries(accounts)) {
             html += `<tr>
-                <td>${account}</td>
+                <td>${escHtml(account)}</td>
                 <td>${formatNumber(s.input)}</td>
                 <td>${formatNumber(s.output)}</td>
                 <td>${formatNumber(s.cache)}</td>
                 <td>${formatNumber(s.total)}</td>
                 <td>${s.pct}</td>
+                <td>${s.cache_hit_rate != null ? s.cache_hit_rate + '%' : '0%'}</td>
+                <td>${s.success_rate != null ? s.success_rate + '%' : '0%'}</td>
                 <td>${formatNumber(s.success_count)}</td>
                 <td>${formatNumber(s.fail_count)}</td>
                 <td>${s.avg_duration_ms ? formatNumber(s.avg_duration_ms) : '-'}</td>
@@ -737,23 +751,23 @@ function renderHistory(data) {
             // Build a rich tooltip: error → explanation → context
             const tooltipParts = ['Error: ' + escError];
             if (escExplanation) tooltipParts.push(escExplanation);
-            tooltipParts.push('Model: ' + (log.model || '-') + ' | Protocol: ' + (log.protocol || '-'));
+            tooltipParts.push('Model: ' + escHtml(log.model || '-') + ' | Protocol: ' + escHtml(log.protocol || '-'));
             const tooltipText = tooltipParts.join('&#10;');
             status = `<span class="status-fail">&#10008;</span> <span class="error-text">${escError}</span><span class="status-info" title="${tooltipText}">&#9432;</span>`;
         }
         const thinking = log.thinking || '-';
         const effort = log.effort || '-';
         html += `<tr>
-            <td>${log.account_alias || '-'}</td>
+            <td>${escHtml(log.account_alias) || '-'}</td>
             <td>${formatDateTime(log.timestamp)}</td>
-            <td>${log.original_model || '-'}</td>
-            <td>${log.model || '-'}</td>
+            <td>${escHtml(log.original_model) || '-'}</td>
+            <td>${escHtml(log.model) || '-'}</td>
             <td>${formatNumber(log.tokens_input)}</td>
             <td>${formatNumber(log.tokens_output)}</td>
             <td>${formatNumber(log.tokens_cache)}</td>
             <td>${thinking}</td>
             <td>${effort}</td>
-            <td ${(log.tools && log.tools.length > 3) ? 'title="' + log.tools.join(', ') + '"' : ''}>${(log.tools && log.tools.length) ? log.tools.slice(0, 3).join(', ') + (log.tools.length > 3 ? ', +' + (log.tools.length - 3) : '') : '-'}</td>
+            <td ${(log.tools && log.tools.length > 3) ? 'title="' + log.tools.map(escHtml).join(', ') + '"' : ''}>${(log.tools && log.tools.length) ? log.tools.slice(0, 3).map(escHtml).join(', ') + (log.tools.length > 3 ? ', +' + (log.tools.length - 3) : '') : '-'}</td>
             <td>${duration}</td>
             <td>${status}</td>
         </tr>`;
@@ -847,14 +861,14 @@ function renderConfig(data) {
         const select = document.getElementById(`route-${route}`);
         const currentModel = data.routes[route]?.model || '';
         select.innerHTML = modelIds.map(id =>
-            `<option value="${id}" ${id === currentModel ? 'selected' : ''}>${id}</option>`
+            `<option value="${escHtml(id)}" ${id === currentModel ? 'selected' : ''}>${escHtml(id)}</option>`
         ).join('');
     }
 
     // Populate cr-model select in add section
     const crModelSelect = document.getElementById('cr-model');
     crModelSelect.innerHTML = '<option value="">' + t('config.cr_select_model') + '</option>' +
-        modelIds.map(id => `<option value="${id}">${id}</option>`).join('');
+        modelIds.map(id => `<option value="${escHtml(id)}">${escHtml(id)}</option>`).join('');
 
     // Available models table
     const tbody = document.getElementById('models-tbody');
@@ -868,10 +882,10 @@ function renderConfig(data) {
         const capHtml = modelCaps.map(c => `<span class="cap-badge">${capLabels[c] || c}</span>`).join('') || '<span class="text-dim">-</span>';
         const badge = info.source === 'upstream' ? ' <span class="new-badge">' + t('config.new_badge') + '</span>' : '';
         html += `<tr>
-            <td><span class="clickable-model-id" data-id="${id}">${id}</span>${badge}</td>
+            <td><span class="clickable-model-id" data-id="${escHtml(id)}">${escHtml(id)}</span>${badge}</td>
             <td style="white-space:nowrap">${capHtml}</td>
-            <td>${info.protocol}</td>
-            <td>${info.endpoint}</td>
+            <td>${escHtml(info.protocol)}</td>
+            <td>${escHtml(info.endpoint)}</td>
             <td>${lim[0] ? formatNumber(lim[0]) : '-'}</td>
             <td>${lim[1] ? formatNumber(lim[1]) : '-'}</td>
             <td>${lim[2] ? formatNumber(lim[2]) : '-'}</td>
@@ -1136,6 +1150,16 @@ function setupConfig() {
         } catch (e) { console.error(e); }
     });
 
+    document.getElementById('btn-proxy-full-restart').addEventListener('click', async () => {
+        if (!confirm(t('proxy.full_restart_confirm'))) return;
+        try {
+            await apiFetch('/api/proxy/restart?full=true', { method: 'POST' }).catch(() => {});
+            // Wait for the process to fully restart
+            await new Promise(r => setTimeout(r, 3000));
+            fetchConfig().then(renderConfig);
+        } catch (e) { console.error(e); }
+    });
+
     // Custom routes: add
     document.getElementById('cr-add-btn').addEventListener('click', () => {
         const match = document.getElementById('cr-match').value.trim();
@@ -1190,7 +1214,7 @@ function setupConfig() {
             const model = modelInput.value.trim();
             if (!match || !model) continue;
             const key = makeRouteKey(match);
-            const routeData = { match: [match], model: model };
+            const routeData = { match: match.split(',').map(s => s.trim()), model: model };
             const enabled = row.querySelector('.cr-edit-enabled')?.checked ?? true;
             if (!enabled) routeData.enabled = false;
             const thinking = row.querySelector('.cr-edit-thinking')?.value;
@@ -1343,17 +1367,24 @@ function setupConfig() {
     });
 }
 
+var _refreshing = false;
 async function refreshAll() {
-    const [stats, history, quotas] = await Promise.all([
-        fetchStats(filterFrom, filterTo),
-        fetchHistory(filterFrom, filterTo, currentPage),
-        fetchQuotas()
-    ]);
-    renderStats(stats);
-    renderCharts(stats);
-    renderHistory(history);
-    renderQuotas(quotas);
-    document.getElementById('last-update').textContent = t('last.update') + formatTime();
+    if (_refreshing) return;
+    _refreshing = true;
+    try {
+        const [stats, history, quotas] = await Promise.all([
+            fetchStats(filterFrom, filterTo),
+            fetchHistory(filterFrom, filterTo, currentPage),
+            fetchQuotas()
+        ]);
+        renderStats(stats);
+        renderCharts(stats);
+        renderHistory(history);
+        renderQuotas(quotas);
+        document.getElementById('last-update').textContent = t('last.update') + formatTime();
+    } finally {
+        _refreshing = false;
+    }
 }
 
 async function loadHistory() {

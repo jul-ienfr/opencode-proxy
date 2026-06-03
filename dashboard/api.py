@@ -269,10 +269,15 @@ def register_dashboard(app, static_dir, conn, db_lock, server_manager_getter=Non
         return {"status": "ok", "message": "Proxy stopped"}
 
     @app.post("/api/proxy/restart")
-    async def proxy_restart():
+    async def proxy_restart(full: bool = False):
         mgr = server_manager_getter() if server_manager_getter else None
         if not mgr:
             return {"status": "error", "message": "No server manager available"}
+        if full:
+            # Schedule full restart after response is sent
+            loop = asyncio.get_event_loop()
+            loop.call_soon(mgr.full_restart)
+            return {"status": "ok", "message": "Full restart triggered"}
         mgr.restart()
         return {"status": "ok", "message": "Proxy restarted"}
 
@@ -293,12 +298,22 @@ def register_dashboard(app, static_dir, conn, db_lock, server_manager_getter=Non
                 params,
             ).fetchone()
 
+            total_input = row[0]
+            total_cache = row[2]
+            total_count = row[3]
+            total_success = row[4]
+            total_fail = row[5]
+            cache_hit_rate = (total_cache / (total_input + total_cache) * 100) if (total_input + total_cache) > 0 else 0.0
+            success_rate = (total_success / total_count * 100) if total_count > 0 else 100.0
+
             totals = {
-                "input": row[0], "output": row[1], "cache": row[2],
-                "total": row[0] + row[1] + row[2],
-                "count": row[3],
-                "success_count": row[4], "fail_count": row[5],
-                "avg_duration_ms": int(row[6])
+                "input": total_input, "output": row[1], "cache": total_cache,
+                "total": total_input + row[1] + total_cache,
+                "count": total_count,
+                "success_count": total_success, "fail_count": total_fail,
+                "avg_duration_ms": int(row[6]),
+                "cache_hit_rate": round(cache_hit_rate, 1),
+                "success_rate": round(success_rate, 1),
             }
 
             rows = conn.execute(
@@ -316,11 +331,15 @@ def register_dashboard(app, static_dir, conn, db_lock, server_manager_getter=Non
         models = {}
         for r in rows:
             t = r[1] + r[2] + r[3]
+            m_cache_rate = (r[3] / (r[1] + r[3]) * 100) if (r[1] + r[3]) > 0 else 0.0
+            m_success_rate = (r[5] / r[4] * 100) if r[4] > 0 else 100.0
             models[r[0]] = {
                 "input": r[1], "output": r[2], "cache": r[3], "total": t,
                 "pct": f"{t/sum_total*100:.1f}%" if sum_total else "0%",
                 "count": r[4], "success_count": r[5], "fail_count": r[6],
-                "avg_duration_ms": int(r[7])
+                "avg_duration_ms": int(r[7]),
+                "cache_hit_rate": round(m_cache_rate, 1),
+                "success_rate": round(m_success_rate, 1),
             }
 
         # Per-account stats
@@ -339,11 +358,15 @@ def register_dashboard(app, static_dir, conn, db_lock, server_manager_getter=Non
         for r in acct_rows:
             t = r[1] + r[2] + r[3]
             label = r[0] if r[0] else "(default)"
+            a_cache_rate = (r[3] / (r[1] + r[3]) * 100) if (r[1] + r[3]) > 0 else 0.0
+            a_success_rate = (r[5] / r[4] * 100) if r[4] > 0 else 100.0
             accounts[label] = {
                 "input": r[1], "output": r[2], "cache": r[3], "total": t,
                 "pct": f"{t/sum_total*100:.1f}%" if sum_total else "0%",
                 "count": r[4], "success_count": r[5], "fail_count": r[6],
-                "avg_duration_ms": int(r[7])
+                "avg_duration_ms": int(r[7]),
+                "cache_hit_rate": round(a_cache_rate, 1),
+                "success_rate": round(a_success_rate, 1),
             }
 
         return {"models": models, "accounts": accounts, "totals": totals}

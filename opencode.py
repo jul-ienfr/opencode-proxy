@@ -25,6 +25,7 @@ import itertools
 _key_cycle = None
 _key_cycle_keys = []
 _key_failover_index = 0
+_key_cycle_lock = threading.Lock()
 
 def _get_enabled_keys() -> list[dict]:
     return [k for k in API_KEYS if k.get("enabled", True)]
@@ -44,12 +45,12 @@ def get_next_api_key() -> dict:
             if API_KEYS[idx].get("enabled", True):
                 return API_KEYS[idx]
         return {"api_key": API_KEY}
-    # rebuild cycle if enabled keys changed (e.g. toggled via dashboard)
-    current_ids = [k.get("api_key") for k in enabled]
-    if _key_cycle is None or _key_cycle_keys != current_ids:
-        _key_cycle = itertools.cycle(enabled)
-        _key_cycle_keys = current_ids
-    return next(_key_cycle)
+    with _key_cycle_lock:
+        current_ids = [k.get("api_key") for k in enabled]
+        if _key_cycle is None or _key_cycle_keys != current_ids:
+            _key_cycle = itertools.cycle(enabled)
+            _key_cycle_keys = current_ids
+        return next(_key_cycle)
 
 def _find_alternative_key(failed_key: str) -> dict | None:
     """Return the first enabled key different from failed_key, or None."""
@@ -63,12 +64,20 @@ def advance_failover():
     if API_KEYS and API_KEY_ROUTING == "failover":
         _key_failover_index = (_key_failover_index + 1) % len(API_KEYS)
 
+_key_alias_cache: dict[str, str] = {}
+
+
+def _rebuild_key_cache():
+    """Rebuild the API key → alias lookup dict."""
+    global _key_alias_cache
+    _key_alias_cache = {k["api_key"]: k.get("alias", "") or "" for k in API_KEYS if k.get("api_key")}
+
+_rebuild_key_cache()
+
+
 def _alias_for_key(api_key: str) -> str:
-    """Look up the alias for a given API key. Returns empty string if not found."""
-    for k in API_KEYS:
-        if k.get("api_key") == api_key:
-            return k.get("alias", "") or ""
-    return ""
+    """Look up the alias for a given API key. O(1) via dict cache."""
+    return _key_alias_cache.get(api_key, "")
 
 def _key_from_headers(headers: dict, protocol: str) -> str:
     """Extract the API key from request headers."""
@@ -128,6 +137,10 @@ _conn.execute("""
     )
 """)
 _conn.execute("CREATE INDEX IF NOT EXISTS idx_timestamp ON requests(timestamp)")
+_conn.execute("CREATE INDEX IF NOT EXISTS idx_model ON requests(model)")
+_conn.execute("CREATE INDEX IF NOT EXISTS idx_success ON requests(success)")
+_conn.execute("CREATE INDEX IF NOT EXISTS idx_account ON requests(account_alias)")
+_conn.execute("CREATE INDEX IF NOT EXISTS idx_ts_model ON requests(timestamp, model)")
 for col, default in [("protocol", "NULL"), ("is_stream", "0"), ("thinking", "NULL"), ("effort", "NULL"), ("client_ip", "NULL"), ("account_alias", "NULL"), ("tools", "NULL")]:
     try:
         _conn.execute(f"ALTER TABLE requests ADD COLUMN {col} TEXT DEFAULT {default}")
@@ -203,11 +216,17 @@ def _sse(event: str, payload: dict) -> bytes:
     return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n".encode()
 
 
-def _route_for(model_name: str, tool_names: list = None) -> dict:
+def _route_for(model_name: str, tool_names: list = None) -> dict | None:
     maybe_reload_custom_routes()
     if DISABLE_MAPPING:
         return {"match": [], "model": model_name}
-    name = model_name.lower()
+    name = model_name.lower().strip()
+    if not name:
+        return None
+    # 1. Direct lookup in MODELS (exact model name)
+    if name in MODELS:
+        return {"match": [name], "model": name}
+    # 2. Alias mapping (opus/sonnet/haiku → configured model)
     tool_names_lower = [t.lower() for t in (tool_names or [])]
     for r in ROUTES.values():
         if r.get("enabled") is False:
@@ -217,11 +236,12 @@ def _route_for(model_name: str, tool_names: list = None) -> dict:
         # Match on tool names too (optional, additive)
         if tool_names_lower and any(m in t for m in r.get("match", []) for t in tool_names_lower):
             return r
-    # Wildcard catch-all: if a custom route "*" (or legacy "") exists, use it
+    # 3. Wildcard catch-all: if a custom route "*" (or legacy "") exists, use it
     wildcard = CUSTOM_ROUTES.get("*") or CUSTOM_ROUTES.get("")
     if wildcard and isinstance(wildcard, dict) and wildcard.get("model") and wildcard.get("enabled") is not False:
         return wildcard
-    return ROUTES["sonnet"]
+    # 4. No match found — return None instead of silent fallback
+    return None
 
 
 def _extract_tool_names(body: dict) -> list:
@@ -262,6 +282,98 @@ def _extract_text(content) -> str:
     return str(content) if content else ""
 
 
+# ── Cache restructuration for models without semantic caching ──
+CACHE_REWRITE_MODELS = {"mimo-v2.5", "mimo-v2-pro", "mimo-v2-omni", "mimo-v2.5-pro"}
+
+
+def _find_split_point(text: str) -> int:
+    """Find the best split point between static instructions and dynamic content.
+
+    Looks for the last double-newline in the first 4000 chars to split cleanly.
+    """
+    search_limit = min(4000, len(text) // 2)
+    last_double = text.rfind("\n\n", 0, search_limit)
+    if last_double > 500:
+        return last_double
+    last_newline = text.rfind("\n", 0, search_limit)
+    if last_newline > 500:
+        return last_newline
+    return 0
+
+
+def _restructure_for_cache(oai_body: dict, model_id: str) -> dict:
+    """For models without semantic caching, split the system prompt.
+
+    Keeps the static part (instructions + tools) as the system message with
+    cache_control, and moves the dynamic part (conversation history) into
+    the messages array so the prefix stays stable across requests.
+    """
+    if model_id not in CACHE_REWRITE_MODELS:
+        return oai_body
+
+    messages = oai_body.get("messages", [])
+    if not messages:
+        return oai_body
+
+    # Find the system message
+    sys_idx = None
+    for i, m in enumerate(messages):
+        if m.get("role") == "system":
+            sys_idx = i
+            break
+
+    if sys_idx is None:
+        return oai_body
+
+    sys_content = messages[sys_idx].get("content", "")
+    if not isinstance(sys_content, str) or len(sys_content) < 2000:
+        return oai_body  # Small prompt, no need to restructure
+
+    split_point = _find_split_point(sys_content)
+    if split_point <= 0:
+        return oai_body
+
+    static_part = sys_content[:split_point].strip()
+    dynamic_part = sys_content[split_point:].strip()
+
+    # Rebuild: static system message with cache_control + dynamic as user message
+    new_messages = [{
+        "role": "system",
+        "content": static_part,
+        "cache_control": {"type": "ephemeral"},
+    }]
+
+    if dynamic_part:
+        new_messages.append({"role": "user", "content": dynamic_part})
+
+    # Append original messages (skip the old system message)
+    for i, m in enumerate(messages):
+        if i != sys_idx:
+            new_messages.append(m)
+
+    oai_body["messages"] = new_messages
+    _log(f"  [cache] split system prompt: static={len(static_part)} dynamic={len(dynamic_part)} chars")
+    return oai_body
+
+
+def _strip_billing_header(text: str) -> str:
+    """Remove x-anthropic-billing-header from system prompt.
+
+    Claude Code injects a billing header with a changing hash (cch=...) that
+    breaks prompt caching by modifying the prefix on every request.
+    """
+    if not text.startswith("x-anthropic-billing-header:"):
+        return text
+    # Strip the first line (the header) and any trailing blank line
+    first_nl = text.find("\n")
+    if first_nl == -1:
+        return text
+    rest = text[first_nl + 1:]
+    if rest.startswith("\n"):
+        rest = rest[1:]
+    return rest
+
+
 def anthropic_to_openai(body: dict, model: str) -> dict:
     thinking = isinstance(body.get("thinking"), dict) and body["thinking"].get("type") in ("enabled", "adaptive")
 
@@ -272,13 +384,14 @@ def anthropic_to_openai(body: dict, model: str) -> dict:
     if isinstance(system_val, list):
         text = _extract_text(system_val)
         if text:
+            text = _strip_billing_header(text)
             msg = {"role": "system", "content": text}
             # Add cache_control at message level if any system block had it
             if any(isinstance(b, dict) and "cache_control" in b for b in system_val):
                 msg["cache_control"] = {"type": "ephemeral"}
             messages.append(msg)
     elif system_val:
-        messages.append({"role": "system", "content": system_val})
+        messages.append({"role": "system", "content": _strip_billing_header(system_val)})
 
     for msg in body.get("messages", []):
         role, content = msg["role"], msg.get("content", "")
@@ -296,6 +409,7 @@ def anthropic_to_openai(body: dict, model: str) -> dict:
             continue
 
         text_parts, tool_calls, thinking_parts, tool_results = [], [], [], []
+        last_cache_control = None
 
         for block in content:
             if isinstance(block, str):
@@ -307,6 +421,8 @@ def anthropic_to_openai(body: dict, model: str) -> dict:
             btype = block.get("type")
             if btype == "text":
                 text_parts.append(block.get("text", ""))
+                if "cache_control" in block:
+                    last_cache_control = block["cache_control"]
             elif btype == "thinking":
                 thinking_parts.append(block.get("thinking", ""))
             elif btype == "tool_use":
@@ -324,6 +440,8 @@ def anthropic_to_openai(body: dict, model: str) -> dict:
                     "tool_call_id": block.get("tool_use_id", ""),
                     "content": _extract_text(block.get("content", "")),
                 })
+                if "cache_control" in block:
+                    last_cache_control = block["cache_control"]
 
         # Emit tool_result messages first (must immediately follow assistant's tool_calls)
         messages.extend(tool_results)
@@ -340,6 +458,8 @@ def anthropic_to_openai(body: dict, model: str) -> dict:
                 out["reasoning_content"] = joined_thinking
             elif thinking and is_asst:
                 out["reasoning_content"] = " "
+            if last_cache_control and not is_asst:
+                out["cache_control"] = last_cache_control
             messages.append(out)
         elif text_parts or thinking_parts or (thinking and is_asst):
             out = {"role": role, "content": "\n".join(text_parts) if text_parts else ""}
@@ -347,6 +467,8 @@ def anthropic_to_openai(body: dict, model: str) -> dict:
                 out["reasoning_content"] = joined_thinking
             elif thinking and is_asst:
                 out["reasoning_content"] = " "
+            if last_cache_control and not is_asst:
+                out["cache_control"] = last_cache_control
             messages.append(out)
 
     # Build request
@@ -359,10 +481,29 @@ def anthropic_to_openai(body: dict, model: str) -> dict:
             oai[oai_key] = body[key]
 
     if "tools" in body:
-        oai["tools"] = [{"type": "function", "function": {
-            "name": t["name"], "description": t.get("description", ""),
-            "parameters": t.get("input_schema", {}),
-        }} for t in body["tools"]]
+        # Support both Anthropic format (name at top level) and OpenAI format (function.name)
+        oai_tools = []
+        for t in body["tools"]:
+            if "name" in t:
+                # Anthropic format: {"name": "...", "description": "...", "input_schema": {...}}
+                oai_tools.append({"type": "function", "function": {
+                    "name": t["name"], "description": t.get("description", ""),
+                    "parameters": t.get("input_schema", {}),
+                }})
+            elif "function" in t:
+                # OpenAI format: {"type": "function", "function": {"name": "...", ...}}
+                fn = t["function"]
+                oai_tools.append({"type": "function", "function": {
+                    "name": fn.get("name", ""), "description": fn.get("description", ""),
+                    "parameters": fn.get("parameters", {}),
+                }})
+            else:
+                # Unknown format, try best effort
+                oai_tools.append({"type": "function", "function": {
+                    "name": t.get("name", ""), "description": t.get("description", ""),
+                    "parameters": t.get("input_schema", t.get("parameters", {})),
+                }})
+        oai["tools"] = oai_tools
         tc = body.get("tool_choice", "auto")
         if isinstance(tc, dict):
             tc_type = tc.get("type", "auto")
@@ -375,6 +516,8 @@ def anthropic_to_openai(body: dict, model: str) -> dict:
         else:
             oai["tool_choice"] = tc
 
+    # Restructure system prompt for models without semantic caching
+    oai = _restructure_for_cache(oai, model)
     return oai
 
 
@@ -852,6 +995,29 @@ def _elapsed_ms(start_time: float) -> int:
     return int((time.time() - start_time) * 1000)
 
 
+# ── Shared helpers for endpoint handlers ──────────────────────────
+
+def _get_client_ip(request: Request) -> str:
+    """Extract client IP from request, respecting X-Forwarded-For."""
+    ip = request.client.host if request.client else "unknown"
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        ip = forwarded.split(",")[0].strip()
+    return ip
+
+
+async def _try_failover_key(hdrs: dict, err_status: int) -> dict:
+    """If 429 and multiple keys configured, return headers for an alternative key. Else return None."""
+    if err_status != 429 or len(API_KEYS) <= 1:
+        return None
+    failed = hdrs.get("Authorization", "").replace("Bearer ", "")
+    alt = _find_alternative_key(failed)
+    if alt:
+        _log(f"  429 on key, retrying with alternative key")
+        return _get_auth_headers("openai", entry=alt)
+    return None
+
+
 @app.api_route("/v1/messages", methods=["POST"])
 @app.api_route("/anthropic/v1/messages", methods=["POST"])
 async def messages(request: Request):
@@ -865,11 +1031,17 @@ async def messages(request: Request):
     try:
         body = json.loads(await request.body())
     except Exception:
-        return Response(content='{"error":"invalid json"}', status_code=400)
+        return JSONResponse(status_code=400, content={"error": "invalid json"})
 
     original_model = body.get("model", "")
     tool_names = _extract_tool_names(body)
     route = _route_for(original_model, tool_names)
+    if route is None:
+        available = sorted(MODELS.keys())
+        return Response(
+            content=json.dumps({"error": f"Model not found: {original_model!r}", "available_models": available}),
+            status_code=404, media_type="application/json",
+        )
     model_id = route["model"]
     cfg = get_model_config(model_id)
     endpoint = cfg["endpoint"]
@@ -947,6 +1119,9 @@ async def messages(request: Request):
             stream_in = None
             stream_out = stream_cache = 0
             _line_buf = ""
+            started = False
+            open_blocks = []
+            stop_reason = "end_turn"
             for _attempt in range(2):  # retry once on 429
                 try:
                     async with _client.stream("POST", endpoint, json=body, headers=headers) as resp:
@@ -988,6 +1163,7 @@ async def messages(request: Request):
                                 if etype == "message_start":
                                     usage = event.get("message", {}).get("usage", {})
                                     stream_in = usage.get("input_tokens")
+                                    started = True
                                     if stream_in is not None:
                                         with _token_lock:
                                             _token_usage[model_id]["input"] -= est_input
@@ -996,16 +1172,25 @@ async def messages(request: Request):
                                     if stream_cache:
                                         with _token_lock:
                                             _token_usage[model_id]["cache"] += stream_cache
+                                elif etype == "content_block_start":
+                                    open_blocks.append(event.get("index"))
+                                elif etype == "content_block_stop":
+                                    idx = event.get("index")
+                                    if idx in open_blocks:
+                                        open_blocks.remove(idx)
                                 elif etype == "message_delta":
                                     usage = event.get("usage", {})
                                     stream_out = usage.get("output_tokens", 0)
+                                    stop_reason = event.get("delta", {}).get("stop_reason", stop_reason)
                         # After stream ends, apply final output token count
                         if stream_out:
                             with _token_lock:
                                 _token_usage[model_id]["output"] += stream_out
                 except Exception as e:
                     ak = _alias_for_key(headers.get("x-api-key", "")) if headers else ""
-                    _log(f"  ERROR stream: {e}")
+                    _log(f"  ERROR stream (attempt {_attempt+1}): {e}")
+                    if _attempt == 0:
+                        continue  # retry once on connection error
                     if stream_in is None:
                         with _token_lock:
                             _token_usage[model_id]["input"] -= est_input
@@ -1016,6 +1201,11 @@ async def messages(request: Request):
                                  stream_in if stream_in is not None else est_input, stream_out, stream_cache, success=False, error=str(e),
                                  protocol=protocol, is_stream=True, thinking=thinking_type, effort=effort,
                                  client_ip=client_ip, account_alias=ak, tools=tool_names)
+                    if started:
+                        for idx in open_blocks:
+                            yield _sse("content_block_stop", {"type": "content_block_stop", "index": idx})
+                        yield _sse("message_delta", {"type": "message_delta", "delta": {"stop_reason": "error"}, "usage": {"output_tokens": stream_out}})
+                        yield _sse("message_stop", {"type": "message_stop"})
                     return
                 else:
                     # Only reached if no exception and no break (successful stream)
@@ -1033,7 +1223,7 @@ async def messages(request: Request):
                              protocol=protocol, is_stream=True, thinking=thinking_type, effort=effort,
                              client_ip=client_ip, account_alias=ak, tools=tool_names)
 
-        return StreamingResponse(anthropic_stream(), media_type="text/event-stream",
+        return StreamingResponse(anthropic_stream(a_headers), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
 
     # ── OpenAI-protocol ─────────────────────────────────────────
@@ -1067,7 +1257,7 @@ async def messages(request: Request):
             anthro_err = json.dumps({"type": "error", "error": {"type": "api_error", "message": f"HTTP {resp.status_code}: {err_msg}"}},
                                     ensure_ascii=False)
             return Response(content=anthro_err, status_code=resp.status_code, media_type="application/json")
-        data = resp.json()
+        data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
         usage = data.get("usage", {})
         req_in = usage.get("prompt_tokens", 0)
         req_out = usage.get("completion_tokens", 0)
@@ -1250,7 +1440,9 @@ async def messages(request: Request):
                                 yield _sse("content_block_delta", {"type": "content_block_delta", "index": tool_block_idx[api_idx],
                                            "delta": {"type": "input_json_delta", "partial_json": args}})
             except Exception as e:
-                _log(f"  ERROR stream: {e}")
+                _log(f"  ERROR stream (attempt {_attempt+1}): {e}")
+                if _attempt == 0:
+                    continue  # retry once on connection error
                 with _token_lock:
                     _token_usage[model_id]["input"] -= stream_in_est
                 ak_h = _alias_for_key(_key_from_headers(hdrs, "openai"))
@@ -1273,6 +1465,7 @@ async def messages(request: Request):
                              headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
 
 
+@app.get("/health")
 async def health():
     async with _db_lock:
         _conn.execute("SELECT 1")
@@ -1304,7 +1497,7 @@ async def count_tokens(request: Request):
     try:
         body = json.loads(await request.body())
     except Exception:
-        return Response(content='{"error":"invalid json"}', status_code=400)
+        return JSONResponse(status_code=400, content={"error": "invalid json"})
     tokens = _estimate_input_tokens(body)
     return {"input_tokens": tokens}
 
@@ -1326,6 +1519,12 @@ async def chat_completions(request: Request):
     original_model = body.get("model", "")
     tool_names = _extract_tool_names(body)
     route = _route_for(original_model, tool_names)
+    if route is None:
+        available = sorted(MODELS.keys())
+        return JSONResponse(status_code=404, content={
+            "error": f"Model not found: {original_model!r}",
+            "available_models": available,
+        })
     model_id = route["model"]
     cfg = get_model_config(model_id)
     endpoint = cfg["endpoint"]
@@ -1386,8 +1585,7 @@ async def chat_completions(request: Request):
         oai_body = dict(body)
         oai_body["stream_options"] = {"include_usage": True}
 
-        est_input = sum(_estimate_tokens(m.get("content", "")) if isinstance(m.get("content"), str) else 0
-                        for m in oai_body.get("messages", []))
+        est_input = _estimate_input_tokens(body)
         with _token_lock:
             _token_usage[model_id]["input"] += est_input
 
@@ -1468,7 +1666,9 @@ async def chat_completions(request: Request):
                                      protocol=protocol, is_stream=True, thinking=thinking_type, effort=effort,
                                      client_ip=client_ip, account_alias=ak_h, tools=tool_names)
                 except Exception as e:
-                    _log(f"  ERROR stream: {e}")
+                    _log(f"  ERROR stream (attempt {_attempt+1}): {e}")
+                    if _attempt == 0:
+                        continue  # retry once on connection error
                     with _token_lock:
                         _token_usage[model_id]["input"] -= est_input
                     ak_h = _alias_for_key(_key_from_headers(hdrs, "openai"))
@@ -1713,12 +1913,17 @@ async def chat_completions(request: Request):
                                 yield b"data: [DONE]\n\n"
                                 return
             except Exception as e:
-                _log(f"  ERROR stream: {e}")
+                _log(f"  ERROR stream (attempt {_attempt+1}): {e}")
+                if _attempt == 0:
+                    continue  # retry once on connection error
                 ak = _alias_for_key(hdrs.get("x-api-key", ""))
                 await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
                              total_input or 0, stream_out, 0, success=False, error=str(e),
                              protocol=protocol, is_stream=True, thinking=thinking_type, effort=effort,
                              client_ip=client_ip, account_alias=ak, tools=tool_names)
+                if total_input:
+                    with _token_lock:
+                        _token_usage[model_id]["input"] += total_input
                 if started:
                     yield _chunk({}, "stop")
                     yield b"data: [DONE]\n\n"
@@ -1758,6 +1963,12 @@ async def responses(request: Request):
     original_model = body.get("model", "")
     tool_names = _extract_tool_names(body)
     route = _route_for(original_model, tool_names)
+    if route is None:
+        available = sorted(MODELS.keys())
+        return JSONResponse(status_code=404, content={
+            "error": f"Model not found: {original_model!r}",
+            "available_models": available,
+        })
     model_id = route["model"]
     cfg = get_model_config(model_id)
     endpoint = cfg["endpoint"]
@@ -1947,7 +2158,7 @@ async def responses(request: Request):
             yield b"data: [DONE]\n\n"
         return StreamingResponse(err_stream(), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
-    data = resp.json()
+    data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
     usage = data.get("usage", {})
     req_in = usage.get("prompt_tokens", 0)
     req_out = usage.get("completion_tokens", 0)
@@ -2027,6 +2238,15 @@ class ServerManager:
             self.web_port = int(web_port)
         time.sleep(0.3)
         self.start()
+
+    def full_restart(self):
+        """Full process restart — re-executes Python to reload all code."""
+        import subprocess
+        import sys
+        cmd = [sys.executable] + sys.argv
+        _log("Full restart: launching new process...")
+        subprocess.Popen(cmd, close_fds=True)
+        os._exit(0)
 
 
 if __name__ == "__main__":
