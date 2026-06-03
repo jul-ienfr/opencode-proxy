@@ -308,7 +308,7 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None):
             total_count = row[3]
             total_success = row[4]
             total_fail = row[5]
-            cache_hit_rate = (total_cache / (total_input + total_cache) * 100) if (total_input + total_cache) > 0 else 0.0
+            cache_hit_rate = (total_cache / total_input * 100) if total_input > 0 else 0.0
             success_rate = (total_success / total_count * 100) if total_count > 0 else 100.0
 
             totals = {
@@ -351,7 +351,7 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None):
         models = {}
         for r in rows:
             t = r[1] + r[2] + r[3]
-            m_cache_rate = (r[3] / (r[1] + r[3]) * 100) if (r[1] + r[3]) > 0 else 0.0
+            m_cache_rate = (r[3] / r[1] * 100) if r[1] > 0 else 0.0
             m_success_rate = (r[5] / r[4] * 100) if r[4] > 0 else 100.0
             models[r[0]] = {
                 "input": r[1], "output": r[2], "cache": r[3], "total": t,
@@ -367,7 +367,7 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None):
         for r in acct_rows:
             t = r[1] + r[2] + r[3]
             label = r[0] if r[0] else "(default)"
-            a_cache_rate = (r[3] / (r[1] + r[3]) * 100) if (r[1] + r[3]) > 0 else 0.0
+            a_cache_rate = (r[3] / r[1] * 100) if r[1] > 0 else 0.0
             a_success_rate = (r[5] / r[4] * 100) if r[4] > 0 else 100.0
             accounts[label] = {
                 "input": r[1], "output": r[2], "cache": r[3], "total": t,
