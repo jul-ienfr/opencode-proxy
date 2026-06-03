@@ -17,6 +17,17 @@ from .events import get_event_manager
 
 logger = logging.getLogger(__name__)
 
+# Shared HTTP client for quota fetcher (reused across calls, avoids fd leaks)
+_http_client: httpx.AsyncClient | None = None
+
+
+async def _get_http_client() -> httpx.AsyncClient:
+    """Get or create a shared httpx client for the quota fetcher."""
+    global _http_client
+    if _http_client is None or _http_client.is_closed:
+        _http_client = httpx.AsyncClient(timeout=30, follow_redirects=True)
+    return _http_client
+
 # ── Env var validation ──
 
 _WORKSPACE_ID_ENV = "OPENCODE_GO_WORKSPACE_ID"
@@ -78,8 +89,8 @@ API_BASE_ANTHROPIC = "https://opencode.ai/zen/go/v1/messages"
 async def fetch_available_models() -> list[str]:
     """Fetch model IDs from the upstream OpenCode /v1/models endpoint."""
     try:
-        async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
-            resp = await client.get(MODELS_URL)
+        client = await _get_http_client()
+        resp = await client.get(MODELS_URL)
         if resp.status_code != 200:
             raise RuntimeError(f"Models endpoint HTTP {resp.status_code}")
         data = resp.json()
@@ -156,8 +167,8 @@ def get_configured_workspaces() -> list[dict]:
 async def fetch_model_limits() -> dict[str, list[int]]:
     """Fetch per-model request limits from the OpenCode docs page."""
     try:
-        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
-            resp = await client.get(DOCS_URL)
+        client = await _get_http_client()
+        resp = await client.get(DOCS_URL)
 
         if resp.status_code != 200:
             raise RuntimeError(f"Docs page returned HTTP {resp.status_code}")
@@ -418,8 +429,8 @@ async def fetch_quotas(workspace_id: str, auth_cookie: str) -> dict:
         "User-Agent": "opencode-proxy/1.0",
     }
 
-    async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
-        resp = await client.get(url, headers=headers)
+    client = await _get_http_client()
+    resp = await client.get(url, headers=headers)
 
     if resp.status_code in (401, 403):
         raise RuntimeError("OpenCode Go authentication failed. Refresh your auth cookie.")

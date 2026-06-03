@@ -17,6 +17,11 @@ from .events import get_event_manager
 from .quota import get_quota_snapshot, get_available_models, get_model_limits_for_all, get_model_capabilities_for_all
 
 
+async def _db_query_sync(fn):
+    """Run a synchronous DB function in a thread pool to avoid blocking the event loop."""
+    return await asyncio.to_thread(fn)
+
+
 def _get_local_ips() -> list:
     """Get all local network IP addresses (excluding loopback)."""
     ips = []
@@ -60,7 +65,7 @@ def daysAgo(n: int) -> str:
     return (datetime.now() - timedelta(days=n)).strftime("%Y-%m-%d")
 
 
-def register_dashboard(app, static_dir, conn, db_lock, server_manager_getter=None):
+def register_dashboard(app, static_dir, conn, server_manager_getter=None):
     app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
     @app.get("/")
@@ -85,7 +90,7 @@ def register_dashboard(app, static_dir, conn, db_lock, server_manager_getter=Non
             "api_key_masked": (API_KEY[:4] + "****" + API_KEY[-4:]) if API_KEY and len(API_KEY) > 8 else ("****" if API_KEY else ""),
             "host": HOST,
             "port": PORT,
-            "local_ips": _get_local_ips(),
+            "local_ips": await asyncio.to_thread(_get_local_ips),
             "web_port": WEB_PORT,
             "routes": routes_info,
             "models": models_info,
@@ -287,7 +292,7 @@ def register_dashboard(app, static_dir, conn, db_lock, server_manager_getter=Non
     async def get_stats(from_date: str = None, to_date: str = None):
         where, params = _build_where(from_date, to_date)
 
-        async with db_lock:
+        def _query_stats():
             row = conn.execute(
                 "SELECT COALESCE(SUM(tokens_input), 0), COALESCE(SUM(tokens_output), 0),"
                 "       COALESCE(SUM(tokens_cache), 0), COUNT(*),"
@@ -327,6 +332,21 @@ def register_dashboard(app, static_dir, conn, db_lock, server_manager_getter=Non
                 params,
             ).fetchall()
 
+            acct_rows = conn.execute(
+                "SELECT COALESCE(account_alias, ''), COALESCE(SUM(tokens_input), 0), COALESCE(SUM(tokens_output), 0),"
+                "       COALESCE(SUM(tokens_cache), 0), COUNT(*),"
+                "       SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END),"
+                "       SUM(CASE WHEN success = 0 OR success IS NULL THEN 1 ELSE 0 END),"
+                "       COALESCE(AVG(duration_ms), 0)"
+                " FROM requests " + where +
+                " GROUP BY account_alias",
+                params,
+            ).fetchall()
+
+            return totals, rows, acct_rows
+
+        totals, rows, acct_rows = await asyncio.to_thread(_query_stats)
+
         sum_total = totals["total"]
         models = {}
         for r in rows:
@@ -343,17 +363,6 @@ def register_dashboard(app, static_dir, conn, db_lock, server_manager_getter=Non
             }
 
         # Per-account stats
-        acct_rows = conn.execute(
-            "SELECT COALESCE(account_alias, ''), COALESCE(SUM(tokens_input), 0), COALESCE(SUM(tokens_output), 0),"
-            "       COALESCE(SUM(tokens_cache), 0), COUNT(*),"
-            "       SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END),"
-            "       SUM(CASE WHEN success = 0 OR success IS NULL THEN 1 ELSE 0 END),"
-            "       COALESCE(AVG(duration_ms), 0)"
-            " FROM requests " + where +
-            " GROUP BY account_alias",
-            params,
-        ).fetchall()
-
         accounts = {}
         for r in acct_rows:
             t = r[1] + r[2] + r[3]
@@ -417,11 +426,12 @@ def register_dashboard(app, static_dir, conn, db_lock, server_manager_getter=Non
     async def get_tools(days: int = 7):
         """Aggregate tool names from recent requests."""
         where, params = _build_where(daysAgo(days), None)
-        async with db_lock:
-            rows = conn.execute(
+        def _query_tools():
+            return conn.execute(
                 "SELECT tools FROM requests " + where + " AND tools IS NOT NULL AND tools != '[]'",
                 params,
             ).fetchall()
+        rows = await asyncio.to_thread(_query_tools)
 
         # Aggregate tool names and count occurrences
         tool_counts = {}
@@ -456,11 +466,14 @@ def register_dashboard(app, static_dir, conn, db_lock, server_manager_getter=Non
         query = "SELECT * FROM requests " + where + " ORDER BY timestamp DESC LIMIT ? OFFSET ?"
         params.extend([limit, offset])
 
-        async with db_lock:
+        def _query_history():
             rows = conn.execute(query, params).fetchall()
             count_query = "SELECT COUNT(*) FROM requests " + where
             total_row = conn.execute(count_query, params[:-2]).fetchone()
             total_count = total_row[0] if total_row else 0
+            return rows, total_count
+
+        rows, total_count = await asyncio.to_thread(_query_history)
 
         return {
             "logs": [
@@ -492,12 +505,15 @@ def register_dashboard(app, static_dir, conn, db_lock, server_manager_getter=Non
 
     @app.delete("/api/history")
     async def delete_history(before: str = None, all: bool = False):
-        async with db_lock:
+        if not all and not before:
+            return {"error": "Specify 'before' date or 'all=true'"}
+
+        def _delete():
             if all:
                 conn.execute("DELETE FROM requests")
             elif before:
                 conn.execute("DELETE FROM requests WHERE timestamp < ?", (before + "T23:59:59",))
-            else:
-                return {"error": "Specify 'before' date or 'all=true'"}
             conn.commit()
+
+        await asyncio.to_thread(_delete)
         return {"status": "deleted"}

@@ -1,6 +1,7 @@
 import os
 import json
 import logging
+import time
 
 ENV_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env")
 CUSTOM_ROUTES_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "custom_routes.json")
@@ -157,11 +158,21 @@ def _get_mtime():
 
 
 _custom_routes_mtime = _get_mtime()
+_custom_routes_last_check = 0.0
+_CUSTOM_ROUTES_CHECK_INTERVAL = 5  # seconds between file stat checks
 
 
 def maybe_reload_custom_routes():
-    """Re-read custom_routes.json if it has been modified since last load."""
-    global _custom_routes_mtime
+    """Re-read custom_routes.json if it has been modified since last load.
+
+    Rate-limited to check the filesystem at most once every 5 seconds
+    to avoid syscall overhead under high request rates.
+    """
+    global _custom_routes_mtime, _custom_routes_last_check
+    now = time.time()
+    if now - _custom_routes_last_check < _CUSTOM_ROUTES_CHECK_INTERVAL:
+        return
+    _custom_routes_last_check = now
     try:
         mtime = _get_mtime()
         if mtime == _custom_routes_mtime:

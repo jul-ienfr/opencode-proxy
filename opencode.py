@@ -16,6 +16,8 @@ from contextlib import asynccontextmanager
 import httpx
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import StreamingResponse, JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import JSONResponse as StarletteJSONResponse
 
 from config import API_KEY, PROXY, MODELS, ROUTES, get_model_config, HOST, PORT, WEB_PORT, DISABLE_MAPPING, API_KEYS, API_KEY_ROUTING, CUSTOM_ROUTES, maybe_reload_custom_routes
 
@@ -185,12 +187,45 @@ async def _save_request(req_id, model, original_model, duration_ms,
         pass
 
 
-# Token usage tracking (in-memory, lost on restart)
+# Token usage tracking (in-memory, restored from SQLite on startup)
 _token_usage = {model: {"input": 0, "output": 0, "cache": 0} for model in MODELS}
 _token_lock = threading.Lock()
 
-# Shared HTTP client (reused across requests)
-_transport = httpx.AsyncHTTPTransport(proxy=PROXY) if PROXY else None
+def _restore_token_counters():
+    """Restore in-memory token counters from SQLite on startup."""
+    try:
+        rows = _conn.execute(
+            "SELECT model, COALESCE(SUM(tokens_input), 0), COALESCE(SUM(tokens_output), 0),"
+            "       COALESCE(SUM(tokens_cache), 0)"
+            " FROM requests GROUP BY model"
+        ).fetchall()
+        for row in rows:
+            model = row["model"]
+            if model in _token_usage:
+                _token_usage[model]["input"] = row[1]
+                _token_usage[model]["output"] = row[2]
+                _token_usage[model]["cache"] = row[3]
+        _log(f"  Restored token counters for {len(rows)} models from database")
+    except Exception as e:
+        _log(f"  Warning: Could not restore token counters: {e}")
+
+_restore_token_counters()
+
+
+def _wal_checkpoint():
+    """Run WAL checkpoint to prevent WAL file growth."""
+    try:
+        _conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    except Exception:
+        pass
+
+# Shared HTTP client (reused across requests) with connection pooling
+_transport = httpx.AsyncHTTPTransport(
+    proxy=PROXY,
+    limits=httpx.Limits(max_connections=100, max_keepalive_connections=20, keepalive_expiry=30),
+) if PROXY else httpx.AsyncHTTPTransport(
+    limits=httpx.Limits(max_connections=100, max_keepalive_connections=20, keepalive_expiry=30),
+)
 _client = httpx.AsyncClient(transport=_transport, timeout=300)
 
 
@@ -198,8 +233,24 @@ _client = httpx.AsyncClient(transport=_transport, timeout=300)
 async def lifespan(app):
     # Start background quota fetcher (no-op if env vars not set)
     await start_quota_fetcher(app)
+
+    # Periodic WAL checkpoint (every hour)
+    async def _periodic_checkpoint():
+        while True:
+            await asyncio.sleep(3600)
+            await asyncio.to_thread(_wal_checkpoint)
+
+    checkpoint_task = asyncio.create_task(_periodic_checkpoint())
+
     yield
-    # Cancel quota fetcher
+
+    # Cancel background tasks
+    checkpoint_task.cancel()
+    try:
+        await checkpoint_task
+    except asyncio.CancelledError:
+        pass
+
     task = getattr(app.state, '_quota_task', None)
     if task:
         task.cancel()
@@ -208,6 +259,10 @@ async def lifespan(app):
         except asyncio.CancelledError:
             pass
     await _client.aclose()
+    # Close quota fetcher shared client
+    from dashboard.quota import _http_client as _quota_client
+    if _quota_client and not _quota_client.is_closed:
+        await _quota_client.aclose()
 
 app = FastAPI(lifespan=lifespan)
 
@@ -215,12 +270,217 @@ app = FastAPI(lifespan=lifespan)
 async def debug_exception(request: Request, exc: Exception):
     tb = traceback.format_exc()
     _log(f"ERROR: {exc}\n{tb}")
-    return JSONResponse(status_code=500, content={"error": str(exc), "traceback": tb})
+    # Don't expose tracebacks to clients — log them server-side only
+    return JSONResponse(status_code=500, content={"error": "Internal server error"})
 
 # Server manager set later in __main__ for GUI mode; None means always-running
 _server_manager = None
 
 register_dashboard(app, STATIC_DIR, _conn, server_manager_getter=lambda: _server_manager)
+
+
+# ── Rate Limiting (token bucket, per-IP) ────────────────────────
+
+RATE_LIMIT_RPS = float(os.environ.get("RATE_LIMIT_RPS", "50"))
+RATE_LIMIT_BURST = float(os.environ.get("RATE_LIMIT_BURST", "100"))
+_STALE_BUCKET_TTL = 300  # seconds — remove buckets inactive for 5 min
+
+
+class _Bucket:
+    """Token bucket for a single client IP."""
+    __slots__ = ("tokens", "last_refill", "max_tokens", "refill_rate", "lock", "last_access")
+
+    def __init__(self, rate: float, burst: float):
+        self.tokens = burst
+        self.last_refill = time.monotonic()
+        self.max_tokens = burst
+        self.refill_rate = rate  # tokens per second
+        self.lock = asyncio.Lock()
+        self.last_access = time.monotonic()
+
+    async def consume(self) -> tuple[bool, float]:
+        """Try to consume one token. Returns (allowed, retry_after_seconds)."""
+        async with self.lock:
+            now = time.monotonic()
+            self.last_access = now
+            elapsed = now - self.last_refill
+            # Refill tokens
+            self.tokens = min(self.max_tokens, self.tokens + elapsed * self.refill_rate)
+            self.last_refill = now
+            if self.tokens >= 1.0:
+                self.tokens -= 1.0
+                return True, 0.0
+            # Calculate wait time for next token
+            wait = (1.0 - self.tokens) / self.refill_rate
+            return False, wait
+
+
+class RateLimitMiddleware(BaseHTTPMiddleware):
+    """Per-IP token bucket rate limiter with periodic stale bucket cleanup."""
+
+    # Paths that bypass rate limiting
+    _SKIP_PREFIXES = ("/api/", "/static/", "/health")
+
+    def __init__(self, app, rate: float = RATE_LIMIT_RPS, burst: float = RATE_LIMIT_BURST):
+        super().__init__(app)
+        self._rate = rate
+        self._burst = burst
+        self._buckets: dict[str, _Bucket] = {}
+        self._cleanup_task: asyncio.Task | None = None
+
+    async def dispatch(self, request: Request, call_next):
+        path = request.url.path
+
+        # Skip rate limiting for excluded paths
+        if path == "/health" or any(path.startswith(p) for p in self._SKIP_PREFIXES):
+            return await call_next(request)
+
+        # Start cleanup task lazily on first request
+        if self._cleanup_task is None or self._cleanup_task.done():
+            self._cleanup_task = asyncio.create_task(self._cleanup_loop())
+
+        # Identify client IP
+        ip = "unknown"
+        if request.client:
+            ip = request.client.host
+        forwarded = request.headers.get("x-forwarded-for")
+        if forwarded:
+            ip = forwarded.split(",")[0].strip()
+
+        # Get or create bucket for this IP
+        bucket = self._buckets.get(ip)
+        if bucket is None:
+            bucket = _Bucket(self._rate, self._burst)
+            self._buckets[ip] = bucket
+
+        allowed, retry_after = await bucket.consume()
+        if allowed:
+            return await call_next(request)
+
+        # Rate limited — return 429 with Retry-After header
+        retry_after_int = max(1, int(retry_after) + 1)
+        return StarletteJSONResponse(
+            status_code=429,
+            content={"error": "Rate limit exceeded. Try again shortly."},
+            headers={"Retry-After": str(retry_after_int)},
+        )
+
+    async def _cleanup_loop(self):
+        """Periodically remove buckets with no recent activity."""
+        while True:
+            await asyncio.sleep(60)
+            now = time.monotonic()
+            stale = [ip for ip, b in self._buckets.items()
+                     if now - b.last_access > _STALE_BUCKET_TTL]
+            for ip in stale:
+                self._buckets.pop(ip, None)
+
+
+app.add_middleware(RateLimitMiddleware)
+
+
+# ── Circuit Breaker (per-endpoint) ──────────────────────────────
+
+_CB_FAILURE_THRESHOLD = 5     # trips open after N consecutive failures
+_CB_RECOVERY_TIMEOUT = 60.0   # seconds before half-open test
+
+
+class _CircuitBreaker:
+    """Per-endpoint circuit breaker: CLOSED → OPEN → HALF_OPEN → CLOSED."""
+    __slots__ = ("failures", "state", "opened_at")
+
+    def __init__(self):
+        self.failures = 0
+        self.state = "closed"  # closed | open | half_open
+        self.opened_at = 0.0
+
+    def record_success(self):
+        self.failures = 0
+        self.state = "closed"
+
+    def record_failure(self):
+        self.failures += 1
+        if self.failures >= _CB_FAILURE_THRESHOLD:
+            self.state = "open"
+            self.opened_at = time.monotonic()
+
+    def should_allow(self) -> bool:
+        if self.state == "closed":
+            return True
+        if self.state == "open":
+            if time.monotonic() - self.opened_at >= _CB_RECOVERY_TIMEOUT:
+                self.state = "half_open"
+                return True  # allow one test request
+            return False
+        # half_open: allow one request through
+        return True
+
+
+_circuit_breakers: dict[str, _CircuitBreaker] = {}
+
+
+def _get_cb(endpoint: str) -> _CircuitBreaker:
+    cb = _circuit_breakers.get(endpoint)
+    if cb is None:
+        cb = _CircuitBreaker()
+        _circuit_breakers[endpoint] = cb
+    return cb
+
+
+def _cb_should_allow(endpoint: str) -> bool:
+    """Check if the circuit breaker allows a request to this endpoint."""
+    return _get_cb(endpoint).should_allow()
+
+
+def _cb_record_success(endpoint: str):
+    """Record a successful request to this endpoint."""
+    _get_cb(endpoint).record_success()
+
+
+def _cb_record_failure(endpoint: str):
+    """Record a failed request to this endpoint."""
+    _get_cb(endpoint).record_failure()
+
+
+# ── HTTP helpers with circuit breaker ────────────────────────────
+
+class CircuitOpenError(Exception):
+    """Raised when the circuit breaker is open for an endpoint."""
+    pass
+
+
+async def _forward_post(endpoint, json, headers):
+    """POST with circuit breaker. Raises CircuitOpenError if circuit is open."""
+    if not _cb_should_allow(endpoint):
+        raise CircuitOpenError(f"Circuit breaker open for {endpoint}")
+    try:
+        resp = await _client.post(endpoint, json=json, headers=headers)
+        _cb_record_success(endpoint)
+        return resp
+    except CircuitOpenError:
+        raise
+    except Exception:
+        _cb_record_failure(endpoint)
+        raise
+
+
+async def _forward_stream(method, endpoint, json, headers):
+    """Stream with circuit breaker. Raises CircuitOpenError if circuit is open."""
+    if not _cb_should_allow(endpoint):
+        raise CircuitOpenError(f"Circuit breaker open for {endpoint}")
+    try:
+        cm = _client.stream(method, endpoint, json=json, headers=headers)
+        resp = await cm.__aenter__()
+        if resp.status_code >= 500:
+            _cb_record_failure(endpoint)
+        else:
+            _cb_record_success(endpoint)
+        return cm, resp
+    except CircuitOpenError:
+        raise
+    except Exception:
+        _cb_record_failure(endpoint)
+        raise
 
 
 def _sse(event: str, payload: dict) -> bytes:
@@ -960,6 +1220,76 @@ def anthropic_to_openai_responses(anthro: dict, model: str) -> dict:
     }
 
 
+def openai_chat_to_responses(chat_resp: dict, model: str) -> dict:
+    """Convert OpenAI Chat Completions response directly to OpenAI Responses API format.
+
+    Bypasses the intermediate Anthropic format to avoid data loss and unnecessary conversion.
+    """
+    choice = chat_resp.get("choices", [{}])[0]
+    msg = choice.get("message", {})
+    usage = chat_resp.get("usage", {})
+
+    output_items = []
+
+    # Reasoning content -> reasoning item
+    reasoning = msg.get("reasoning_content")
+    if reasoning:
+        output_items.insert(0, {
+            "type": "reasoning",
+            "summary": [{"type": "summary_text", "text": reasoning}],
+        })
+
+    # Text content -> message item with output_text
+    content = msg.get("content", "")
+    if content:
+        output_items.append({
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": content}],
+        })
+
+    # Tool calls -> function_call items
+    for tc in (msg.get("tool_calls") or []):
+        fn = tc.get("function", {})
+        output_items.append({
+            "type": "function_call",
+            "id": tc.get("id", f"call_{uuid.uuid4().hex[:12]}"),
+            "name": fn.get("name", ""),
+            "arguments": fn.get("arguments", "{}"),
+            "status": "completed",
+        })
+
+    # Status mapping
+    finish = choice.get("finish_reason", "")
+    if finish == "length":
+        status = "incomplete"
+    else:
+        status = "completed"
+
+    # Usage mapping
+    prompt_tokens = usage.get("prompt_tokens", 0)
+    completion_tokens = usage.get("completion_tokens", 0)
+    cached = _extract_cache_tokens(usage)
+    oai_usage = {
+        "input_tokens": prompt_tokens,
+        "output_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
+        "output_tokens_details": {
+            "reasoning_tokens": 0,
+            "cached_tokens": cached,
+        },
+    }
+
+    return {
+        "id": f"resp_{uuid.uuid4().hex[:24]}",
+        "object": "response",
+        "status": status,
+        "model": model,
+        "output": output_items,
+        "usage": oai_usage,
+    }
+
+
 # ── Thinking models token guard ────────────────────────────
 THINKING_MODELS = {
     "deepseek-v4-flash": 2048,
@@ -1132,6 +1462,11 @@ async def messages(request: Request):
 
     _log(f"→ {original_model!r} → {model_id} | {protocol} | stream={body.get('stream', False)} | thinking={thinking_type} | effort={effort} | ip={client_ip}")
 
+    # Circuit breaker check
+    if not _cb_should_allow(endpoint):
+        _log(f"  CIRCUIT BREAKER OPEN — fast-failing request to {endpoint}")
+        return JSONResponse(status_code=503, content={"error": "Service temporarily unavailable (circuit breaker open)"})
+
     # ── Anthropic pass-through ──────────────────────────────────
     if protocol == "anthropic":
         a_headers = _get_auth_headers("anthropic")
@@ -1209,6 +1544,8 @@ async def messages(request: Request):
                         async for chunk in resp.aiter_bytes():
                             yield chunk
                             _line_buf += chunk.decode("utf-8", errors="replace")
+                            if len(_line_buf) > 1_000_000:
+                                _line_buf = _line_buf[-1000:]
                             while "\n" in _line_buf:
                                 line, _line_buf = _line_buf.split("\n", 1)
                                 line = line.strip()
@@ -1603,6 +1940,11 @@ async def chat_completions(request: Request):
 
     _log(f"→ {original_model!r} → {model_id} | {protocol} | chat/completions | stream={is_stream} | ip={client_ip}")
 
+    # Circuit breaker check
+    if not _cb_should_allow(endpoint):
+        _log(f"  CIRCUIT BREAKER OPEN — fast-failing request to {endpoint}")
+        return JSONResponse(status_code=503, content={"error": "Service temporarily unavailable (circuit breaker open)"})
+
     # ── OpenAI passthrough ─────────────────────────────────────
     if protocol == "openai":
         headers = _get_auth_headers("openai")
@@ -1858,6 +2200,8 @@ async def chat_completions(request: Request):
 
                     async for raw in resp.aiter_bytes():
                         _line_buf += raw.decode("utf-8", errors="replace")
+                        if len(_line_buf) > 1_000_000:
+                            _line_buf = _line_buf[-1000:]
                         while "\n" in _line_buf:
                             line, _line_buf = _line_buf.split("\n", 1)
                             line = line.strip()
@@ -2045,6 +2389,11 @@ async def responses(request: Request):
 
     _log(f"→ {original_model!r} → {model_id} | {protocol} | responses | stream={is_stream} | ip={client_ip}")
 
+    # Circuit breaker check
+    if not _cb_should_allow(endpoint):
+        _log(f"  CIRCUIT BREAKER OPEN — fast-failing request to {endpoint}")
+        return JSONResponse(status_code=503, content={"error": "Service temporarily unavailable (circuit breaker open)"})
+
     # Convert Responses API → Anthropic format
     anthro_body = openai_responses_to_anthropic(body)
     anthro_body["model"] = model_id
@@ -2200,9 +2549,8 @@ async def responses(request: Request):
                      req_in, req_out, cache, success=True,
                      protocol=protocol, is_stream=is_stream, thinking=thinking_type, effort=effort,
                      client_ip=client_ip, account_alias=account_alias, tools=tool_names)
-        # Convert Chat Completions → Anthropic → Responses
-        anthro_data = openai_to_anthropic(data, original_model)
-        oai_resp = anthropic_to_openai_responses(anthro_data, original_model)
+        # Direct conversion: Chat Completions → Responses (no intermediate Anthropic format)
+        oai_resp = openai_chat_to_responses(data, original_model)
         return Response(content=json.dumps(oai_resp, ensure_ascii=False), media_type="application/json")
 
     # ── Streaming (OpenAI backend) — collect, then emit SSE ──
@@ -2241,9 +2589,8 @@ async def responses(request: Request):
                  req_in, req_out, cache, success=True,
                  protocol=protocol, is_stream=True, thinking=thinking_type, effort=effort,
                  client_ip=client_ip, account_alias=account_alias, tools=tool_names)
-    # Convert Chat Completions → Anthropic → Responses
-    anthro_data = openai_to_anthropic(data, original_model)
-    oai_resp = anthropic_to_openai_responses(anthro_data, original_model)
+    # Direct conversion: Chat Completions → Responses (no intermediate Anthropic format)
+    oai_resp = openai_chat_to_responses(data, original_model)
     # Return as single SSE block (data-only format)
     payload = json.dumps({"type": "response.completed", "response": oai_resp}, ensure_ascii=False)
     sse_body = f"data: {payload}\n\ndata: [DONE]\n\n".encode()
