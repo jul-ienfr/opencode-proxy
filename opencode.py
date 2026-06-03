@@ -400,7 +400,11 @@ class _CircuitBreaker:
 
     def record_failure(self):
         self.failures += 1
-        if self.failures >= _CB_FAILURE_THRESHOLD:
+        if self.state == "half_open":
+            # Failure during half-open test → immediately reopen
+            self.state = "open"
+            self.opened_at = time.monotonic()
+        elif self.failures >= _CB_FAILURE_THRESHOLD:
             self.state = "open"
             self.opened_at = time.monotonic()
 
