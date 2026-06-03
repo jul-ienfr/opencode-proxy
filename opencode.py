@@ -532,6 +532,74 @@ async def _log_and_save_error(req_id, model_id, original_model, start_time,
                  client_ip=client_ip, account_alias=account_alias, tools=tools)
 
 
+# ── Streaming helpers ───────────────────────────────────────────
+
+def _make_stream_retry_loop(protocol):
+    """Return a retry function for streaming 429 handling.
+
+    Returns (attempt_headers, should_retry) where should_retry=True means
+    the caller should `continue` the outer loop.
+    """
+    def _handle_429(headers, status_code, attempt):
+        if status_code == 429 and attempt == 0 and len(API_KEYS) > 1:
+            failed_key = _key_from_headers(headers, protocol)
+            alt = _find_alternative_key(failed_key)
+            if alt:
+                _log(f"  429 on key, retrying with alternative key")
+                return _get_auth_headers(protocol, entry=alt), True
+        return headers, False
+    return _handle_429
+
+
+async def _stream_error_response(req_id, model_id, original_model, start_time,
+                                  status_code, resp_body, protocol, thinking_type,
+                                  effort, client_ip, account_alias, tools,
+                                  error_payload):
+    """Handle streaming error: log, save DB, yield error SSE event. Returns the error event bytes."""
+    _log(f"  ERROR {status_code}: {resp_body[:300] if isinstance(resp_body, str) else resp_body[:300]}")
+    await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
+                 0, 0, 0, success=False, error=f"HTTP {status_code}",
+                 protocol=protocol, is_stream=True, thinking=thinking_type, effort=effort,
+                 client_ip=client_ip, account_alias=account_alias, tools=tools)
+    return _sse("error", error_payload)
+
+
+def _finalize_stream_tokens(model_id, est_input, stream_in, stream_out, stream_cache,
+                             actual_usage, _token_usage, _token_lock):
+    """Reconcile estimated vs actual token counts after stream ends.
+
+    Returns (final_in, final_out, final_cache, log_tag).
+    """
+    final_in = stream_in if stream_in is not None else est_input
+    final_out = stream_out
+    final_cache = stream_cache
+    log_tag = ""
+
+    if actual_usage:
+        final_in = actual_usage.get("prompt_tokens") or final_in
+        final_out = actual_usage.get("completion_tokens")
+        if final_out is None:
+            total = actual_usage.get("total_tokens")
+            prompt = actual_usage.get("prompt_tokens")
+            if total is not None and prompt is not None:
+                final_out = total - prompt
+        final_out = final_out or stream_out
+        final_cache = _extract_cache_tokens(actual_usage)
+        log_tag = ""
+        with _token_lock:
+            _token_usage[model_id]["input"] -= est_input
+            _token_usage[model_id]["input"] += final_in
+            _token_usage[model_id]["output"] += final_out
+            if final_cache:
+                _token_usage[model_id]["cache"] += final_cache
+    else:
+        log_tag = " (est)"
+        with _token_lock:
+            _token_usage[model_id]["output"] += stream_out
+
+    return final_in, final_out, final_cache, log_tag
+
+
 def _sse(event: str, payload: dict) -> bytes:
     return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n".encode()
 
@@ -1553,27 +1621,21 @@ async def messages(request: Request):
             started = False
             open_blocks = []
             stop_reason = "end_turn"
+            _handle_429 = _make_stream_retry_loop("anthropic")
             for _attempt in range(2):  # retry once on 429
                 try:
                     async with _client.stream("POST", endpoint, json=body, headers=headers) as resp:
                         if resp.status_code != 200:
-                            if resp.status_code == 429 and _attempt == 0 and len(API_KEYS) > 1:
-                                failed_key = headers.get("x-api-key", "")
-                                alt = _find_alternative_key(failed_key)
-                                if alt:
-                                    _log(f"  429 on key, retrying with alternative key")
-                                    headers = _get_auth_headers("anthropic", entry=alt)
-                                    continue  # retry with next attempt
+                            headers, should_retry = _handle_429(headers, resp.status_code, _attempt)
+                            if should_retry:
+                                continue
                             err = await resp.aread()
-                            _log(f"  ERROR {resp.status_code}: {err[:300]}")
                             ak = _alias_for_key(headers.get("x-api-key", ""))
-                            await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
-                                         0, 0, 0, success=False, error=f"HTTP {resp.status_code}",
-                                         protocol=protocol, is_stream=True, thinking=thinking_type, effort=effort,
-                                         client_ip=client_ip, account_alias=ak, tools=tool_names)
                             error_payload = {"type": "error", "error": {"type": "api_error",
                                            "message": f"HTTP {resp.status_code}: {err.decode('utf-8', errors='replace')[:200]}"}}
-                            yield _sse("error", error_payload)
+                            yield await _stream_error_response(req_id, model_id, original_model, start_time,
+                                         resp.status_code, err, protocol, thinking_type, effort,
+                                         client_ip, ak, tool_names, error_payload)
                             return
                         async for chunk in resp.aiter_bytes():
                             yield chunk
@@ -1649,12 +1711,9 @@ async def messages(request: Request):
             logged_in = stream_in if stream_in is not None else est_input
             if stream_in is not None or stream_out:
                 ak = _alias_for_key(headers.get("x-api-key", ""))
-                alias_tag = f" | account={ak}" if ak else ""
-                _log(f"  ← {model_id} | +{logged_in} in | +{stream_out} out | +{stream_cache} cache{alias_tag}")
-                await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
-                             logged_in, stream_out, stream_cache, success=True,
-                             protocol=protocol, is_stream=True, thinking=thinking_type, effort=effort,
-                             client_ip=client_ip, account_alias=ak, tools=tool_names)
+                await _save_and_log_request(req_id, model_id, original_model, start_time,
+                             logged_in, stream_out, stream_cache, protocol, True, thinking_type,
+                             effort, client_ip, ak, tool_names)
 
         return StreamingResponse(anthropic_stream(a_headers), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
@@ -1710,28 +1769,22 @@ async def messages(request: Request):
         next_block_idx = 0
         stream_out_tokens = 0
         actual_usage = None
+        _handle_429 = _make_stream_retry_loop("openai")
 
         for _attempt in range(2):
             try:
                 async with _client.stream("POST", endpoint, json=oai_body, headers=hdrs) as resp:
                     if resp.status_code != 200:
-                        if resp.status_code == 429 and _attempt == 0 and len(API_KEYS) > 1:
-                            failed_key = hdrs.get("Authorization", "").replace("Bearer ", "")
-                            alt = _find_alternative_key(failed_key)
-                            if alt:
-                                _log(f"  429 on key, retrying with alternative key")
-                                hdrs = _get_auth_headers("openai", entry=alt)
-                                continue
+                        hdrs, should_retry = _handle_429(hdrs, resp.status_code, _attempt)
+                        if should_retry:
+                            continue
                         err = await resp.aread()
-                        _log(f"  ERROR {resp.status_code}: {err[:300]}")
                         ak_h = _alias_for_key(_key_from_headers(hdrs, "openai"))
-                        await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
-                                     0, 0, 0, success=False, error=f"HTTP {resp.status_code}",
-                                     protocol=protocol, is_stream=True, thinking=thinking_type, effort=effort,
-                                     client_ip=client_ip, account_alias=ak_h, tools=tool_names)
                         error_payload = {"type": "error", "error": {"type": "api_error",
                                        "message": f"HTTP {resp.status_code}: {err.decode('utf-8', errors='replace')[:200]}"}}
-                        yield _sse("error", error_payload)
+                        yield await _stream_error_response(req_id, model_id, original_model, start_time,
+                                     resp.status_code, err, protocol, thinking_type, effort,
+                                     client_ip, ak_h, tool_names, error_payload)
                         return
 
                     async for line in resp.aiter_lines():
@@ -1740,30 +1793,9 @@ async def messages(request: Request):
                         data = line[5:].strip()
 
                         if data == "[DONE]":
-                            final_in = stream_in_est
-                            final_out = stream_out_tokens
-                            final_cache = 0
-                            with _token_lock:
-                                if actual_usage:
-                                    final_in = actual_usage.get("prompt_tokens")
-                                    if final_in is None:
-                                        final_in = stream_in_est
-                                    final_out = actual_usage.get("completion_tokens")
-                                    if final_out is None:
-                                        total = actual_usage.get("total_tokens")
-                                        prompt = actual_usage.get("prompt_tokens")
-                                        if total is not None and prompt is not None:
-                                            final_out = total - prompt
-                                    if final_out is None:
-                                        final_out = stream_out_tokens
-                                    final_cache = _extract_cache_tokens(actual_usage)
-                                    _token_usage[model_id]["input"] -= stream_in_est
-                                    _token_usage[model_id]["input"] += final_in
-                                    _token_usage[model_id]["output"] += final_out
-                                    if final_cache:
-                                        _token_usage[model_id]["cache"] += final_cache
-                                else:
-                                    _token_usage[model_id]["output"] += stream_out_tokens
+                            final_in, final_out, final_cache, log_tag = _finalize_stream_tokens(
+                                model_id, stream_in_est, None, stream_out_tokens, 0,
+                                actual_usage, _token_usage, _token_lock)
                             if not started:
                                 started = True
                                 yield _sse("message_start", {"type": "message_start", "message": {
@@ -1775,14 +1807,10 @@ async def messages(request: Request):
                             has_tools = bool(tool_block_idx)
                             yield _sse("message_delta", {"type": "message_delta", "delta": {"stop_reason": "tool_use" if has_tools else "end_turn"}, "usage": {"output_tokens": final_out, "cache_read_input_tokens": final_cache}})
                             yield _sse("message_stop", {"type": "message_stop"})
-                            log_tag = "" if actual_usage else " (est)"
                             ak_h = _alias_for_key(_key_from_headers(hdrs, "openai"))
-                            alias_tag = f" | account={ak_h}" if ak_h else ""
-                            _log(f"  ← {model_id} | +{final_in} in{log_tag} | +{final_out} out{log_tag} | +{final_cache} cache{alias_tag}")
-                            await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
-                                         final_in, final_out, final_cache, success=True,
-                                         protocol=protocol, is_stream=True, thinking=thinking_type, effort=effort,
-                                         client_ip=client_ip, account_alias=ak_h, tools=tool_names)
+                            await _save_and_log_request(req_id, model_id, original_model, start_time,
+                                         final_in, final_out, final_cache, protocol, True, thinking_type,
+                                         effort, client_ip, ak_h, tool_names, log_tag)
                             break
 
                         try:
