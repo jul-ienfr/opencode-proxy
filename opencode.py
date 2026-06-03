@@ -1811,7 +1811,11 @@ async def messages(request: Request):
                              resp.status_code, resp.text, protocol, is_stream, thinking_type,
                              effort, client_ip, account_alias, tool_names)
                 return Response(content=resp.content, status_code=resp.status_code, media_type="application/json")
-            data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+            try:
+                data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+            except Exception:
+                _log(f"  UPSTREAM DECODE ERROR: non-JSON response from {endpoint}")
+                return JSONResponse(status_code=502, content={"error": "Upstream returned non-JSON response"})
             usage = data.get("usage", {})
             req_in = usage.get("input_tokens", 0) or usage.get("prompt_tokens", 0)
             req_out = usage.get("output_tokens", 0) or usage.get("completion_tokens", 0)
@@ -2159,10 +2163,10 @@ async def health():
         if cb.state == "open":
             any_open = True
 
-    # Quick upstream connectivity check (5s timeout)
+    # Quick upstream connectivity check (5s timeout, GET a lightweight endpoint)
     upstream_ok = True
     try:
-        resp = await _client.get("/v1/models", timeout=5.0)
+        resp = await _client.get("https://opencode.ai", timeout=5.0)
         upstream_ok = resp.status_code < 500
     except Exception:
         upstream_ok = False

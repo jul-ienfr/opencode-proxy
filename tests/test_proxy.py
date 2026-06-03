@@ -20,7 +20,10 @@ from opencode import (
     anthropic_to_openai,
     anthropic_to_openai_response,
     openai_to_anthropic,
+    openai_to_anthropic_request,
     openai_chat_to_responses,
+    openai_responses_to_anthropic,
+    anthropic_to_openai_responses,
     _estimate_tokens,
     _route_for,
     _CircuitBreaker,
@@ -502,3 +505,161 @@ class TestRoundTrip:
         tc = oai_resp["choices"][0]["message"]["tool_calls"][0]
         assert tc["function"]["name"] == "search"
         assert json.loads(tc["function"]["arguments"]) == {"q": "test"}
+
+
+# ── openai_to_anthropic_request ──────────────────────────────────
+
+class TestOpenAIToAnthropicRequest:
+    """Test OpenAI Chat Completions request → Anthropic Messages request conversion."""
+
+    def test_simple_user_message(self):
+        body = {
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "Hello"}],
+        }
+        result = openai_to_anthropic_request(body)
+        assert result["model"] == "gpt-4o"
+        assert result["messages"][0]["role"] == "user"
+        assert result["messages"][0]["content"][0]["type"] == "text"
+        assert result["messages"][0]["content"][0]["text"] == "Hello"
+
+    def test_system_message(self):
+        body = {
+            "model": "gpt-4o",
+            "messages": [
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": "Hello"},
+            ],
+        }
+        result = openai_to_anthropic_request(body)
+        assert result["system"] == "You are a helpful assistant."
+        # System message should not appear in messages list
+        assert all(m["role"] != "system" for m in result["messages"])
+
+    def test_tool_calls_conversion(self):
+        body = {
+            "model": "gpt-4o",
+            "messages": [
+                {"role": "user", "content": "Search for cats"},
+                {"role": "assistant", "content": "", "tool_calls": [
+                    {"id": "call_123", "function": {"name": "search", "arguments": '{"q":"cats"}'}}
+                ]},
+                {"role": "tool", "tool_call_id": "call_123", "content": "Found cats"},
+            ],
+        }
+        result = openai_to_anthropic_request(body)
+        # Assistant message should have tool_use block
+        assistant = result["messages"][1]
+        assert assistant["role"] == "assistant"
+        assert assistant["content"][0]["type"] == "tool_use"
+        assert assistant["content"][0]["name"] == "search"
+        # User message should have tool_result
+        user = result["messages"][2]
+        assert user["content"][0]["type"] == "tool_result"
+        assert user["content"][0]["tool_use_id"] == "call_123"
+
+
+# ── openai_responses_to_anthropic ────────────────────────────────
+
+class TestOpenAIResponsesToAnthropic:
+    """Test OpenAI Responses API request → Anthropic Messages request conversion."""
+
+    def test_simple_input(self):
+        body = {
+            "model": "gpt-4o",
+            "input": [
+                {"role": "user", "content": [{"type": "input_text", "text": "Hello"}]},
+            ],
+        }
+        result = openai_responses_to_anthropic(body)
+        assert result["model"] == "gpt-4o"
+        assert result["messages"][0]["role"] == "user"
+        assert result["messages"][0]["content"][0]["type"] == "text"
+        assert result["messages"][0]["content"][0]["text"] == "Hello"
+
+    def test_function_call_conversion(self):
+        body = {
+            "model": "gpt-4o",
+            "input": [
+                {"type": "function_call", "id": "fc_123", "name": "search", "arguments": '{"q":"test"}'},
+                {"type": "function_call_output", "call_id": "fc_123", "output": "Found results"},
+            ],
+        }
+        result = openai_responses_to_anthropic(body)
+        # function_call → assistant tool_use
+        assistant = result["messages"][0]
+        assert assistant["role"] == "assistant"
+        assert assistant["content"][0]["type"] == "tool_use"
+        assert assistant["content"][0]["name"] == "search"
+        # function_call_output → user tool_result
+        user = result["messages"][1]
+        assert user["role"] == "user"
+        assert user["content"][0]["type"] == "tool_result"
+        assert user["content"][0]["tool_use_id"] == "fc_123"
+
+    def test_system_message(self):
+        body = {
+            "model": "gpt-4o",
+            "input": [
+                {"role": "system", "content": [{"type": "input_text", "text": "Be helpful"}]},
+                {"role": "user", "content": [{"type": "input_text", "text": "Hi"}]},
+            ],
+        }
+        result = openai_responses_to_anthropic(body)
+        assert result["system"] == "Be helpful"
+        assert all(m["role"] != "system" for m in result["messages"])
+
+
+# ── anthropic_to_openai_responses ────────────────────────────────
+
+class TestAnthropicToOpenAIResponses:
+    """Test Anthropic Messages response → OpenAI Responses API response conversion."""
+
+    def test_text_response(self):
+        anthro = {
+            "content": [{"type": "text", "text": "Hello world"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 10, "output_tokens": 5},
+        }
+        result = anthropic_to_openai_responses(anthro, "test-model")
+        assert result["object"] == "response"
+        assert result["status"] == "completed"
+        assert result["model"] == "test-model"
+        msg = result["output"][0]
+        assert msg["type"] == "message"
+        assert msg["content"][0]["text"] == "Hello world"
+
+    def test_tool_use_response(self):
+        anthro = {
+            "content": [{"type": "tool_use", "id": "toolu_123", "name": "search", "input": {"q": "test"}}],
+            "stop_reason": "tool_use",
+            "usage": {"input_tokens": 10, "output_tokens": 5},
+        }
+        result = anthropic_to_openai_responses(anthro, "test-model")
+        assert result["status"] == "completed"
+        fc = result["output"][0]
+        assert fc["type"] == "function_call"
+        assert fc["name"] == "search"
+        assert json.loads(fc["arguments"]) == {"q": "test"}
+
+    def test_max_tokens_status(self):
+        anthro = {
+            "content": [{"type": "text", "text": "Partial answer"}],
+            "stop_reason": "max_tokens",
+            "usage": {"input_tokens": 10, "output_tokens": 100},
+        }
+        result = anthropic_to_openai_responses(anthro, "test-model")
+        assert result["status"] == "incomplete"
+
+    def test_usage_mapping(self):
+        anthro = {
+            "content": [{"type": "text", "text": "Hi"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 20, "output_tokens": 10, "cache_read_input_tokens": 5},
+        }
+        result = anthropic_to_openai_responses(anthro, "test-model")
+        usage = result["usage"]
+        assert usage["input_tokens"] == 20
+        assert usage["output_tokens"] == 10
+        assert usage["total_tokens"] == 30
+        assert usage["output_tokens_details"]["cached_tokens"] == 5
