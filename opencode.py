@@ -2182,6 +2182,7 @@ async def chat_completions(request: Request):
         total_input = 0
         cache_read = 0
         _line_buf = ""
+        _handle_429 = _make_stream_retry_loop("anthropic")
 
         def _chunk(delta_override, finish):
             c = {
@@ -2195,19 +2196,13 @@ async def chat_completions(request: Request):
             try:
                 async with _client.stream("POST", endpoint, json=anthro_body, headers=hdrs) as resp:
                     if resp.status_code != 200:
-                        if resp.status_code == 429 and _attempt == 0 and len(API_KEYS) > 1:
-                            failed_key = hdrs.get("x-api-key", "")
-                            alt = _find_alternative_key(failed_key)
-                            if alt:
-                                _log(f"  429 on key, retrying with alternative key")
-                                hdrs = _get_auth_headers("anthropic", entry=alt)
-                                continue
+                        hdrs, should_retry = _handle_429(hdrs, resp.status_code, _attempt)
+                        if should_retry:
+                            continue
                         ak = _alias_for_key(hdrs.get("x-api-key", ""))
-                        _log(f"  ERROR {resp.status_code}")
-                        await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
-                                     0, 0, 0, success=False, error=f"HTTP {resp.status_code}",
-                                     protocol=protocol, is_stream=True, thinking=thinking_type, effort=effort,
-                                     client_ip=client_ip, account_alias=ak, tools=tool_names)
+                        await _log_and_save_error(req_id, model_id, original_model, start_time,
+                                     resp.status_code, str(resp.status_code), protocol, True, thinking_type,
+                                     effort, client_ip, ak, tool_names)
                         yield b"data: " + json.dumps({"error": {"message": f"HTTP {resp.status_code}"}}, ensure_ascii=False).encode() + b"\n\ndata: [DONE]\n\n"
                         return
 
@@ -2304,18 +2299,11 @@ async def chat_completions(request: Request):
                                 yield _chunk({}, finish)
 
                             elif etype == "message_stop":
-                                with _token_lock:
-                                    _token_usage[model_id]["input"] += total_input
-                                    _token_usage[model_id]["output"] += stream_out
-                                    if cache_read:
-                                        _token_usage[model_id]["cache"] += cache_read
+                                _update_token_usage(model_id, total_input, stream_out, cache_read)
                                 ak = _alias_for_key(hdrs.get("x-api-key", ""))
-                                alias_tag = f" | account={ak}" if ak else ""
-                                _log(f"  ← {model_id} | +{total_input} in | +{stream_out} out | +{cache_read} cache{alias_tag}")
-                                await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
-                                             total_input, stream_out, cache_read, success=True,
-                                             protocol=protocol, is_stream=True, thinking=thinking_type, effort=effort,
-                                             client_ip=client_ip, account_alias=ak, tools=tool_names)
+                                await _save_and_log_request(req_id, model_id, original_model, start_time,
+                                             total_input, stream_out, cache_read, protocol, True, thinking_type,
+                                             effort, client_ip, ak, tool_names)
                                 # Send final usage chunk for OpenAI streaming client
                                 total = total_input + stream_out
                                 usage_chunk = {
