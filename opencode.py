@@ -2552,10 +2552,15 @@ class ServerManager:
             self._thread = threading.Thread(target=self._server.run, daemon=True)
             self._thread.start()
 
-            time.sleep(0.5)
+            # Wait for server to actually start listening
+            for _ in range(50):
+                time.sleep(0.1)
+                if self._server.started:
+                    break
             self.is_running = True
 
-    def stop(self):
+    def stop(self, timeout=10):
+        """Graceful stop: signal uvicorn to stop, then wait for in-flight requests."""
         with self._lock:
             if not self.is_running:
                 return
@@ -2563,12 +2568,12 @@ class ServerManager:
                 self._server.should_exit = True
             self.is_running = False
         if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=5)
+            self._thread.join(timeout=timeout)
         self._server = None
         self._thread = None
 
     def restart(self, port=None, web_port=None, host=None):
-        """Hot-restart: stop + update host/ports + start."""
+        """Hot-restart: graceful stop + update host/ports + start."""
         self.stop()
         if host is not None:
             self.host = host
@@ -2576,17 +2581,20 @@ class ServerManager:
             self.port = int(port)
         if web_port is not None:
             self.web_port = int(web_port)
-        time.sleep(0.3)
         self.start()
 
     def full_restart(self):
-        """Full process restart — re-executes Python to reload all code."""
-        import subprocess
+        """Full process restart — re-executes Python to reload all code.
+
+        Uses os.execv() to replace the current process in-place,
+        avoiding zombie child processes from subprocess.Popen + os._exit.
+        """
         import sys
-        cmd = [sys.executable] + sys.argv
-        _log("Full restart: launching new process...")
-        subprocess.Popen(cmd, close_fds=True)
-        os._exit(0)
+        _log("Full restart: replacing process...")
+        # Flush all output before exec
+        for stream in (sys.stdout, sys.stderr):
+            stream.flush()
+        os.execv(sys.executable, [sys.executable] + sys.argv)
 
 
 if __name__ == "__main__":
