@@ -840,21 +840,26 @@ def openai_responses_to_anthropic(body: dict) -> dict:
         else:
             result["tool_choice"] = tc
 
-    # Pass through thinking control — convert Anthropic format to OpenAI reasoning_effort
+    # Pass through thinking control — convert Anthropic format to model-specific format
     if "thinking" in body and isinstance(body["thinking"], dict):
         t = body["thinking"]
         ttype = t.get("type", "")
         budget = t.get("budget_tokens", 0)
-        # Map Anthropic thinking → OpenAI reasoning_effort
-        if ttype in ("enabled", "adaptive") or budget > 0:
-            if budget and budget >= 10000:
-                result["reasoning_effort"] = "high"
-            elif budget and budget >= 4000:
-                result["reasoning_effort"] = "medium"
-            elif ttype == "adaptive":
-                result["reasoning_effort"] = "medium"
+        wants_thinking = ttype in ("enabled", "adaptive") or budget > 0
+        if wants_thinking:
+            if model.startswith("kimi-k2.6"):
+                # Kimi K2.6 uses reasoning: true (not reasoning_effort)
+                result["reasoning"] = True
             else:
-                result["reasoning_effort"] = "low"
+                # DeepSeek, MiMo, etc. use reasoning_effort
+                if budget and budget >= 10000:
+                    result["reasoning_effort"] = "high"
+                elif budget and budget >= 4000:
+                    result["reasoning_effort"] = "medium"
+                elif ttype == "adaptive":
+                    result["reasoning_effort"] = "medium"
+                else:
+                    result["reasoning_effort"] = "low"
 
     return result
 
