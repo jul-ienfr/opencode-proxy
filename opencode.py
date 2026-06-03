@@ -225,11 +225,11 @@ def _wal_checkpoint():
 # Shared HTTP client (reused across requests) with connection pooling
 _transport = httpx.AsyncHTTPTransport(
     proxy=PROXY,
-    limits=httpx.Limits(max_connections=100, max_keepalive_connections=20, keepalive_expiry=30),
+    limits=httpx.Limits(max_connections=200, max_keepalive_connections=50, keepalive_expiry=120),
 ) if PROXY else httpx.AsyncHTTPTransport(
-    limits=httpx.Limits(max_connections=100, max_keepalive_connections=20, keepalive_expiry=30),
+    limits=httpx.Limits(max_connections=200, max_keepalive_connections=50, keepalive_expiry=120),
 )
-_client = httpx.AsyncClient(transport=_transport, timeout=300)
+_client = httpx.AsyncClient(transport=_transport, timeout=httpx.Timeout(connect=30, read=600, write=30, pool=10))
 
 
 @asynccontextmanager
@@ -638,6 +638,26 @@ def _finalize_stream_tokens(model_id, est_input, stream_in, stream_out, stream_c
 
 def _sse(event: str, payload: dict) -> bytes:
     return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n".encode()
+
+
+# Keepalive comment that is harmless to clients: every 15s during idle periods
+_SSE_KEEPALIVE_INTERVAL = 15  # seconds
+
+
+async def _sse_keepalive(stream_gen, interval: float = _SSE_KEEPALIVE_INTERVAL):
+    """Wrap an async generator to inject SSE keepalive comments during idle periods.
+
+    When no chunk is yielded for `interval` seconds, sends `: ping\\n\\n`
+    (a comment line, ignored by SSE clients) to keep the connection alive.
+    """
+    while True:
+        try:
+            chunk = await asyncio.wait_for(anext(stream_gen), timeout=interval)
+            yield chunk
+        except StopAsyncIteration:
+            return
+        except asyncio.TimeoutError:
+            yield b": ping\n\n"
 
 
 def _route_for(model_name: str, tool_names: list = None) -> dict | None:
@@ -1760,7 +1780,7 @@ async def messages(request: Request):
                              logged_in, stream_out, stream_cache, protocol, True, thinking_type,
                              effort, client_ip, ak, tool_names, tools_used=used_tools if used_tools else None)
 
-        return StreamingResponse(anthropic_stream(a_headers), media_type="text/event-stream",
+        return StreamingResponse(_sse_keepalive(anthropic_stream(a_headers)), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
 
     # ── OpenAI-protocol ─────────────────────────────────────────
@@ -1963,7 +1983,7 @@ async def messages(request: Request):
         else:
             return
 
-    return StreamingResponse(stream_gen(headers), media_type="text/event-stream",
+    return StreamingResponse(_sse_keepalive(stream_gen(headers)), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
 
 
@@ -2158,7 +2178,7 @@ async def chat_completions(request: Request):
             else:
                 return
 
-        return StreamingResponse(openai_stream(headers), media_type="text/event-stream",
+        return StreamingResponse(_sse_keepalive(openai_stream(headers)), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
 
     # ── Anthropic protocol (double conversion) ──────────────────
@@ -2389,7 +2409,7 @@ async def chat_completions(request: Request):
         else:
             return
 
-    return StreamingResponse(_anthro_to_oai_stream(a_headers), media_type="text/event-stream",
+    return StreamingResponse(_sse_keepalive(_anthro_to_oai_stream(a_headers)), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
 
 
@@ -2629,7 +2649,8 @@ class ServerManager:
                 lg.handlers = [h]
                 lg.propagate = False
 
-            config = Config(self.app, host=self.host, port=self.port, log_level="info", log_config=None)
+            config = Config(self.app, host=self.host, port=self.port, log_level="info", log_config=None,
+                            timeout_keep_alive=300)
             self._server = Server(config)
             self._thread = threading.Thread(target=self._server.run, daemon=True)
             self._thread.start()
