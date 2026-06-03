@@ -840,9 +840,21 @@ def openai_responses_to_anthropic(body: dict) -> dict:
         else:
             result["tool_choice"] = tc
 
-    # Pass through thinking control only for models that support it
-    if "thinking" in body and model in THINKING_MODELS:
-        result["thinking"] = body["thinking"]
+    # Pass through thinking control — convert Anthropic format to OpenAI reasoning_effort
+    if "thinking" in body and isinstance(body["thinking"], dict):
+        t = body["thinking"]
+        ttype = t.get("type", "")
+        budget = t.get("budget_tokens", 0)
+        # Map Anthropic thinking → OpenAI reasoning_effort
+        if ttype in ("enabled", "adaptive") or budget > 0:
+            if budget and budget >= 10000:
+                result["reasoning_effort"] = "high"
+            elif budget and budget >= 4000:
+                result["reasoning_effort"] = "medium"
+            elif ttype == "adaptive":
+                result["reasoning_effort"] = "medium"
+            else:
+                result["reasoning_effort"] = "low"
 
     return result
 
