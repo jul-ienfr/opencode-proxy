@@ -795,29 +795,36 @@ async def _sse_keepalive(stream_gen, interval: float = _SSE_KEEPALIVE_INTERVAL):
 
 def _route_for(model_name: str, tool_names: list = None) -> dict | None:
     maybe_reload_custom_routes()
-    if DISABLE_MAPPING:
-        return {"match": [], "model": model_name}
     name = model_name.lower().strip()
     if not name:
         return None
-    # 1. Direct lookup in MODELS (exact model name)
-    if name in MODELS:
-        return {"match": [name], "model": name}
-    # 2. Alias mapping (opus/sonnet/haiku → configured model)
+    # When DISABLE_MAPPING, only check custom routes (not auto-generated aliases)
+    if DISABLE_MAPPING:
+        for r in CUSTOM_ROUTES.values():
+            if any(m in name for m in r.get("match", [])):
+                return r
+        return {"match": [], "model": model_name}
+    # 1. Tool-based routing (optional, additive)
     tool_names_lower = [t.lower() for t in (tool_names or [])]
+    for r in ROUTES.values():
+        if r.get("enabled") is False:
+            continue
+        if tool_names_lower and any(m in t for m in r.get("match", []) for t in tool_names_lower):
+            return r
+    # 2. Model-based routing (alias matching)
     for r in ROUTES.values():
         if r.get("enabled") is False:
             continue
         if any(m in name for m in r.get("match", [])):
             return r
-        # Match on tool names too (optional, additive)
-        if tool_names_lower and any(m in t for m in r.get("match", []) for t in tool_names_lower):
-            return r
-    # 3. Wildcard catch-all: if a custom route "*" (or legacy "") exists, use it
+    # 3. Direct lookup in MODELS (exact model name)
+    if name in MODELS:
+        return {"match": [name], "model": name}
+    # 4. Wildcard catch-all: if a custom route "*" (or legacy "") exists, use it
     wildcard = CUSTOM_ROUTES.get("*") or CUSTOM_ROUTES.get("")
     if wildcard and isinstance(wildcard, dict) and wildcard.get("model") and wildcard.get("enabled") is not False:
         return wildcard
-    # 4. No match found — return None instead of silent fallback
+    # 5. No match found
     return None
 
 

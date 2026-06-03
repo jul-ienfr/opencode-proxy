@@ -13,6 +13,11 @@ __pycache__/
 # Database
 logs/requests.db
 logs/*.db
+logs/*.db-shm
+logs/*.db-wal
+
+# Logs
+*.log
 
 # IDE
 .vscode/
