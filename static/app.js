@@ -578,17 +578,17 @@ function renderQuotas(data) {
 function renderStats(data) {
     if (!data) return;
 
-    const t = data.totals;
-    document.getElementById('total-input').textContent = formatNumber(t.input);
-    document.getElementById('total-output').textContent = formatNumber(t.output);
-    document.getElementById('total-cache').textContent = formatNumber(t.cache);
-    document.getElementById('total-all').textContent = formatNumber(t.total);
-    document.getElementById('total-success').textContent = formatNumber(t.success_count);
-    document.getElementById('total-fail').textContent = formatNumber(t.fail_count);
-    document.getElementById('avg-duration').textContent = t.avg_duration_ms ? formatNumber(t.avg_duration_ms) : '-';
-    document.getElementById('cache-hit-rate').textContent = t.cache_hit_rate != null ? t.cache_hit_rate + '%' : '0%';
-    document.getElementById('success-rate').textContent = t.success_rate != null ? t.success_rate + '%' : '0%';
-    document.getElementById('total-requests').textContent = formatNumber(t.count);
+    const totals = data.totals;
+    document.getElementById('total-input').textContent = formatNumber(totals.input);
+    document.getElementById('total-output').textContent = formatNumber(totals.output);
+    document.getElementById('total-cache').textContent = formatNumber(totals.cache);
+    document.getElementById('total-all').textContent = formatNumber(totals.total);
+    document.getElementById('total-success').textContent = formatNumber(totals.success_count);
+    document.getElementById('total-fail').textContent = formatNumber(totals.fail_count);
+    document.getElementById('avg-duration').textContent = totals.avg_duration_ms ? formatNumber(totals.avg_duration_ms) : '-';
+    document.getElementById('cache-hit-rate').textContent = totals.cache_hit_rate != null ? totals.cache_hit_rate + '%' : '0%';
+    document.getElementById('success-rate').textContent = totals.success_rate != null ? totals.success_rate + '%' : '0%';
+    document.getElementById('total-requests').textContent = formatNumber(totals.count);
 
     const tbody = document.getElementById('model-tbody');
     const models = data.models;
@@ -656,8 +656,8 @@ function renderCharts(data) {
     const isDark = document.documentElement.getAttribute('data-theme') !== 'light';
     const textColor = isDark ? '#e0e0e0' : '#333';
 
-    const t = data.totals;
-    const tokenData = [t.input, t.output, t.cache];
+    const totals = data.totals;
+    const tokenData = [totals.input, totals.output, totals.cache];
 
     // Token distribution
     if (chartTokens) {
@@ -1458,6 +1458,8 @@ document.addEventListener('DOMContentLoaded', () => {
     // ── SSE real-time updates ──
     let eventSource = null;
     let pollTimer = null;
+    let sseRetryDelay = 1000;
+    const SSE_MAX_DELAY = 30000;
 
     function startPolling(intervalMs) {
         if (pollTimer) clearInterval(pollTimer);
@@ -1482,7 +1484,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 refreshAll();
             }, 200);
         });
-        es.addEventListener('connected', () => { startPolling(30000); });
+        es.addEventListener('connected', () => { startPolling(30000); sseRetryDelay = 1000; });
         es.addEventListener('quotas_updated', () => {
             fetchQuotas().then(renderQuotas);
         });
@@ -1500,7 +1502,8 @@ document.addEventListener('DOMContentLoaded', () => {
                 window._sseRetry = setTimeout(() => {
                     window._sseRetry = null;
                     connectSSE();
-                }, 5000);
+                }, sseRetryDelay);
+                sseRetryDelay = Math.min(sseRetryDelay * 2, SSE_MAX_DELAY);
             }
         };
     }

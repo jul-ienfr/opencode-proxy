@@ -53,7 +53,7 @@ def build_display(routes, token_usage, token_lock):
 
     sum_total = 0
     for route_info in routes.values():
-        d = usage_snapshot[route_info["model"]]
+        d = usage_snapshot.get(route_info["model"], {"input": 0, "output": 0, "cache": 0})
         sum_total += d["input"] + d["output"] + d["cache"]
 
     sum_in = sum_out = sum_cache = 0
@@ -61,7 +61,7 @@ def build_display(routes, token_usage, token_lock):
     for route_name, route_info in routes.items():
         model = route_info["model"]
         shown.add(model)
-        d = usage_snapshot[model]
+        d = usage_snapshot.get(model, {"input": 0, "output": 0, "cache": 0})
         total = d["input"] + d["output"] + d["cache"]
         sum_in += d["input"]
         sum_out += d["output"]
@@ -113,13 +113,12 @@ def build_display(routes, token_usage, token_lock):
 
 def start_input_thread():
     global _log_scroll
-    _running = True
+    _stop_event = threading.Event()
 
     def _input_thread():
-        nonlocal _running
         if sys.platform == "win32":
             import msvcrt
-            while _running:
+            while not _stop_event.is_set():
                 if msvcrt.kbhit():
                     try:
                         ch = msvcrt.getch()
@@ -140,7 +139,7 @@ def start_input_thread():
                             continue
                         ch = ch.decode("utf-8", errors="ignore")
                         if ch == "\x03":
-                            _running = False
+                            _stop_event.set()
                         elif ch == "k":
                             _log_scroll = max(0, _log_scroll - 1)
                         elif ch == "j":
@@ -159,11 +158,11 @@ def start_input_thread():
             old = termios.tcgetattr(fd)
             tty.setraw(fd)
             try:
-                while _running:
+                while not _stop_event.is_set():
                     if select.select([sys.stdin], [], [], 0.05)[0]:
                         ch = sys.stdin.read(1)
                         if ch == "\x03":
-                            _running = False
+                            _stop_event.set()
                         elif ch == "\x1b":
                             seq = sys.stdin.read(2) if select.select([sys.stdin], [], [], 0.01)[0] else ""
                             if seq == "[A":
@@ -192,7 +191,7 @@ def start_input_thread():
                 termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
     threading.Thread(target=_input_thread, daemon=True).start()
-    return lambda: _running
+    return lambda: not _stop_event.is_set()
 
 
 def run_terminal_loop(routes, token_usage, token_lock):

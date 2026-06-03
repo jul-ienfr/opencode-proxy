@@ -73,7 +73,14 @@ _MODEL_LIMITS_FALLBACK: dict[str, list[int]] = {
 }
 
 _model_limits_cache: dict[str, list[int]] | None = None
-_model_limits_lock = asyncio.Lock()
+_model_limits_lock: asyncio.Lock | None = None
+
+
+def _get_model_limits_lock() -> asyncio.Lock:
+    global _model_limits_lock
+    if _model_limits_lock is None:
+        _model_limits_lock = asyncio.Lock()
+    return _model_limits_lock
 
 DOCS_URL = "https://opencode.ai/docs/fr/go/"
 MODELS_URL = "https://opencode.ai/zen/go/v1/models"
@@ -421,7 +428,8 @@ QUOTA_FETCH_INTERVAL = 300  # 5 minutes
 
 async def fetch_quotas(workspace_id: str, auth_cookie: str) -> dict:
     """Fetch and parse quota data from opencode.ai for a given workspace."""
-    url = f"https://opencode.ai/workspace/{httpx.URL(workspace_id)}/go"
+    from urllib.parse import quote
+    url = f"https://opencode.ai/workspace/{quote(workspace_id, safe='')}/go"
 
     headers = {
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -464,7 +472,7 @@ async def start_quota_fetcher(app):
         # Model limits from docs
         try:
             limits = await fetch_model_limits()
-            async with _model_limits_lock:
+            async with _get_model_limits_lock():
                 global _model_limits_cache
                 _model_limits_cache = limits
         except Exception:

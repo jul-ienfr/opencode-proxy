@@ -197,13 +197,23 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None):
         restart_needed = False
 
         if "port" in body:
-            new_port = int(body["port"])
+            try:
+                new_port = int(body["port"])
+            except (ValueError, TypeError):
+                return {"status": "error", "message": "Invalid port value"}
+            if not (1 <= new_port <= 65535):
+                return {"status": "error", "message": "Port must be between 1 and 65535"}
             if new_port != PORT:
                 env_updates["OPENCODE_PORT"] = str(new_port)
                 restart_needed = True
 
         if "web_port" in body:
-            new_web_port = int(body["web_port"])
+            try:
+                new_web_port = int(body["web_port"])
+            except (ValueError, TypeError):
+                return {"status": "error", "message": "Invalid web port value"}
+            if not (1 <= new_web_port <= 65535):
+                return {"status": "error", "message": "Web port must be between 1 and 65535"}
             if new_web_port != WEB_PORT:
                 env_updates["OPENCODE_WEB_PORT"] = str(new_web_port)
                 restart_needed = True
@@ -439,7 +449,8 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None):
             try:
                 tools = json.loads(row["tools"]) if isinstance(row["tools"], str) else []
                 for tool in tools:
-                    tool_counts[tool] = tool_counts.get(tool, 0) + 1
+                    if isinstance(tool, str):
+                        tool_counts[tool] = tool_counts.get(tool, 0) + 1
             except (json.JSONDecodeError, TypeError):
                 continue
 
