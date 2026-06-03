@@ -232,6 +232,80 @@ _transport = httpx.AsyncHTTPTransport(
 _client = httpx.AsyncClient(transport=_transport, timeout=httpx.Timeout(connect=30, read=600, write=30, pool=10))
 
 
+# ── Response Cache (non-streaming only) ──────────────────────────
+
+class _ResponseCache:
+    """LRU cache for non-streaming API responses with TTL and size limit.
+
+    Cache key: SHA-256 of the request body (excluding streaming and tool_use).
+    Returns (body_bytes, headers_dict) or None on miss.
+    """
+    def __init__(self, max_size: int = 1000, ttl: float = 300.0):
+        self._max_size = max_size
+        self._ttl = ttl
+        self._store: dict[str, tuple[float, bytes, dict]] = {}  # key -> (ts, body, headers)
+        self._access_order: list[str] = []
+
+    def _evict(self):
+        while len(self._store) > self._max_size:
+            oldest = self._access_order.pop(0)
+            self._store.pop(oldest, None)
+
+    def get(self, key: str) -> tuple[bytes, dict] | None:
+        entry = self._store.get(key)
+        if entry is None:
+            return None
+        ts, body, headers = entry
+        if time.monotonic() - ts > self._ttl:
+            self._store.pop(key, None)
+            try:
+                self._access_order.remove(key)
+            except ValueError:
+                pass
+            return None
+        # Move to end of access order (most recently used)
+        try:
+            self._access_order.remove(key)
+        except ValueError:
+            pass
+        self._access_order.append(key)
+        return body, headers
+
+    def put(self, key: str, body: bytes, headers: dict):
+        if key in self._store:
+            try:
+                self._access_order.remove(key)
+            except ValueError:
+                pass
+        self._store[key] = (time.monotonic(), body, dict(headers))
+        self._access_order.append(key)
+        self._evict()
+
+    def make_key(self, body: dict) -> str | None:
+        """Create cache key from request body. Returns None if not cacheable."""
+        if body.get("stream"):
+            return None
+        # Don't cache requests with tool use (non-deterministic)
+        messages = body.get("messages", [])
+        for msg in messages:
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "tool_result":
+                        return None
+        try:
+            import hashlib
+            return hashlib.sha256(json.dumps(body, sort_keys=True, default=str).encode()).hexdigest()
+        except Exception:
+            return None
+
+    def stats(self) -> dict:
+        return {"size": len(self._store), "max_size": self._max_size, "ttl": self._ttl}
+
+
+_response_cache = _ResponseCache()
+
+
 @asynccontextmanager
 async def lifespan(app):
     # Start background quota fetcher (no-op if env vars not set)
@@ -383,6 +457,34 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 app.add_middleware(RateLimitMiddleware)
 
 
+# ── Access Log Middleware ─────────────────────────────────────────
+
+class AccessLogMiddleware(BaseHTTPMiddleware):
+    """Log every request with method, path, status code, duration, and client IP."""
+
+    _SKIP_PREFIXES = ("/api/", "/static/", "/health")
+
+    async def dispatch(self, request: Request, call_next):
+        path = request.url.path
+        if path == "/health" or any(path.startswith(p) for p in self._SKIP_PREFIXES):
+            return await call_next(request)
+
+        client_ip = request.client.host if request.client else "?"
+        forwarded = request.headers.get("x-forwarded-for")
+        if forwarded:
+            client_ip = forwarded.split(",")[0].strip()
+
+        start = time.monotonic()
+        response = await call_next(request)
+        elapsed_ms = (time.monotonic() - start) * 1000
+
+        _log(f"{request.method} {path} {response.status_code} {elapsed_ms:.0f}ms {client_ip}")
+        return response
+
+
+app.add_middleware(AccessLogMiddleware)
+
+
 # ── Circuit Breaker (per-endpoint) ──────────────────────────────
 
 _CB_FAILURE_THRESHOLD = 5     # trips open after N consecutive failures
@@ -391,19 +493,27 @@ _CB_RECOVERY_TIMEOUT = 60.0   # seconds before half-open test
 
 class _CircuitBreaker:
     """Per-endpoint circuit breaker: CLOSED → OPEN → HALF_OPEN → CLOSED."""
-    __slots__ = ("failures", "state", "opened_at")
+    __slots__ = ("failures", "state", "opened_at", "total_requests", "total_failures", "last_failure_time", "created_at")
 
     def __init__(self):
         self.failures = 0
         self.state = "closed"  # closed | open | half_open
         self.opened_at = 0.0
+        self.total_requests = 0
+        self.total_failures = 0
+        self.last_failure_time = 0.0
+        self.created_at = time.monotonic()
 
     def record_success(self):
         self.failures = 0
+        self.total_requests += 1
         self.state = "closed"
 
     def record_failure(self):
         self.failures += 1
+        self.total_failures += 1
+        self.total_requests += 1
+        self.last_failure_time = time.monotonic()
         if self.state == "half_open":
             # Failure during half-open test → immediately reopen
             self.state = "open"
@@ -422,6 +532,17 @@ class _CircuitBreaker:
             return False
         # half_open: allow one request through
         return True
+
+    def get_status(self) -> dict:
+        uptime = time.monotonic() - self.created_at
+        return {
+            "state": self.state,
+            "failures": self.failures,
+            "total_requests": self.total_requests,
+            "total_failures": self.total_failures,
+            "last_failure_time": self.last_failure_time,
+            "uptime_seconds": round(uptime, 1),
+        }
 
 
 _circuit_breakers: dict[str, _CircuitBreaker] = {}
@@ -502,34 +623,46 @@ async def _forward_stream(method, endpoint, json, headers):
 # ── Shared helper functions for endpoint handlers ──────────────
 
 async def _do_request_with_retry(endpoint, body, headers, protocol, retry_on_429=True):
-    """POST request with automatic 429 key failover.
+    """POST request with automatic 429 key failover and 5xx retry with backoff.
 
     Returns (response, final_headers) -- headers may differ after retry.
     Raises UpstreamError on connection/timeout/protocol failures.
     """
-    try:
-        resp = await _client.post(endpoint, json=body, headers=headers)
-    except httpx.ConnectError as e:
-        _log(f"  UPSTREAM CONNECT ERROR: {type(e).__name__}: {e}")
-        raise UpstreamError(f"Cannot connect to upstream: {e}", status_code=502, original=e) from e
-    except httpx.TimeoutException as e:
-        _log(f"  UPSTREAM TIMEOUT: {type(e).__name__}: {e}")
-        raise UpstreamError(f"Upstream request timed out: {e}", status_code=504, original=e) from e
-    except httpx.RequestError as e:
-        _log(f"  UPSTREAM REQUEST ERROR: {type(e).__name__}: {e}")
-        raise UpstreamError(f"Upstream request failed: {type(e).__name__}: {e}", status_code=502, original=e) from e
+    _RETRYABLE_STATUSES = {502, 503, 504}
+    max_retries = 2
 
-    if retry_on_429 and resp.status_code == 429 and len(API_KEYS) > 1:
-        failed_key = _key_from_headers(headers, protocol)
-        alt = _find_alternative_key(failed_key)
-        if alt:
-            _log(f"  429 on key, retrying with alternative key")
-            headers = _get_auth_headers(protocol, entry=alt)
-            try:
-                resp = await _client.post(endpoint, json=body, headers=headers)
-            except httpx.RequestError as e:
-                _log(f"  UPSTREAM REQUEST ERROR (retry): {type(e).__name__}: {e}")
-                raise UpstreamError(f"Upstream request failed on retry: {e}", status_code=502, original=e) from e
+    for attempt in range(max_retries):
+        try:
+            resp = await _client.post(endpoint, json=body, headers=headers)
+        except httpx.ConnectError as e:
+            _log(f"  UPSTREAM CONNECT ERROR: {type(e).__name__}: {e}")
+            raise UpstreamError(f"Cannot connect to upstream: {e}", status_code=502, original=e) from e
+        except httpx.TimeoutException as e:
+            _log(f"  UPSTREAM TIMEOUT: {type(e).__name__}: {e}")
+            raise UpstreamError(f"Upstream request timed out: {e}", status_code=504, original=e) from e
+        except httpx.RequestError as e:
+            _log(f"  UPSTREAM REQUEST ERROR: {type(e).__name__}: {e}")
+            raise UpstreamError(f"Upstream request failed: {type(e).__name__}: {e}", status_code=502, original=e) from e
+
+        # Retry on 429 with key failover
+        if retry_on_429 and resp.status_code == 429 and len(API_KEYS) > 1:
+            failed_key = _key_from_headers(headers, protocol)
+            alt = _find_alternative_key(failed_key)
+            if alt:
+                _log(f"  429 on key, retrying with alternative key")
+                headers = _get_auth_headers(protocol, entry=alt)
+                continue
+
+        # Retry on 502/503/504 with backoff
+        if resp.status_code in _RETRYABLE_STATUSES and attempt < max_retries - 1:
+            wait = 1.0 * (2 ** attempt)  # 1s, 2s
+            _log(f"  RETRY {resp.status_code} after {wait:.1f}s (attempt {attempt+1}/{max_retries})")
+            await asyncio.sleep(wait)
+            continue
+
+        return resp, headers
+
+    # Should not reach here, but safety fallback
     return resp, headers
 
 
@@ -1646,6 +1779,14 @@ async def messages(request: Request):
         is_stream = body.get("stream", False)
 
         if not is_stream:
+            # Check cache
+            cache_key = _response_cache.make_key(body)
+            cached = cache_key and _response_cache.get(cache_key)
+            if cached:
+                cached_body, cached_headers = cached
+                _log(f"  ← {model_id} | cache HIT")
+                return Response(content=cached_body, headers={**cached_headers, "X-Cache": "HIT"}, media_type="application/json")
+
             try:
                 resp, a_headers = await _do_request_with_retry(endpoint, body, a_headers, "anthropic")
             except UpstreamError as e:
@@ -1666,7 +1807,9 @@ async def messages(request: Request):
             await _save_and_log_request(req_id, model_id, original_model, start_time,
                          req_in, req_out, req_cache, protocol, is_stream, thinking_type,
                          effort, client_ip, account_alias, tool_names, tools_used=used)
-            return Response(content=resp.content, media_type="application/json")
+            if cache_key:
+                _response_cache.put(cache_key, resp.content, {"Content-Type": "application/json"})
+            return Response(content=resp.content, headers={"X-Cache": "MISS"}, media_type="application/json")
 
 
         # Estimate input tokens for Anthropic streaming
@@ -1990,9 +2133,38 @@ async def messages(request: Request):
 @app.get("/health")
 async def health():
     await asyncio.to_thread(_conn.execute, "SELECT 1")
+
     usage = {model: {"input": d["input"], "output": d["output"], "cache": d["cache"]}
              for model, d in _token_usage.items()}
-    return {"status": "ok", "usage": usage}
+
+    # Check circuit breaker status
+    cb_status = {}
+    any_open = False
+    for endpoint, cb in _circuit_breakers.items():
+        cb_status[endpoint] = cb.get_status()
+        if cb.state == "open":
+            any_open = True
+
+    # Quick upstream connectivity check (5s timeout)
+    upstream_ok = True
+    try:
+        resp = await _client.get("/v1/models", timeout=5.0)
+        upstream_ok = resp.status_code < 500
+    except Exception:
+        upstream_ok = False
+
+    status = "ok"
+    if not upstream_ok or any_open:
+        status = "degraded"
+
+    return {"status": status, "usage": usage, "upstream": "ok" if upstream_ok else "unreachable",
+            "circuit_breakers": cb_status}
+
+
+@app.get("/api/circuit-breakers")
+async def circuit_breakers():
+    """Return status of all circuit breakers."""
+    return {endpoint: cb.get_status() for endpoint, cb in _circuit_breakers.items()}
 
 
 @app.get("/v1/models")
@@ -2002,14 +2174,22 @@ async def list_models():
     data = []
     for model_id in MODELS:
         if model_id not in seen:
-            data.append({"id": model_id, "object": "model", "created": now, "owned_by": "opencode"})
+            cfg = get_model_config(model_id)
+            endpoint = cfg.get("endpoint", "")
+            cb = _circuit_breakers.get(endpoint)
+            cb_state = cb.state if cb else "unknown"
+            usage = _token_usage.get(model_id, {})
+            data.append({
+                "id": model_id, "object": "model", "created": now, "owned_by": "opencode",
+                "status": cb_state,
+                "requests": {"input": usage.get("input", 0), "output": usage.get("output", 0), "cache": usage.get("cache", 0)},
+            })
             seen.add(model_id)
-    # Add route names (sonnet, opus, haiku) and common aliases Codex might use
     for alias in ["gpt-5-codex", "gpt-5", "gpt-4o", "codex", "deepseek-chat"]:
         if alias not in seen:
             data.append({"id": alias, "object": "model", "created": now, "owned_by": "opencode"})
             seen.add(alias)
-    return {"object": "list", "data": data}
+    return {"object": "list", "data": data, "cache": _response_cache.stats()}
 
 
 @app.post("/v1/messages/count_tokens")
