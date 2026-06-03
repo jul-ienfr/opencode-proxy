@@ -456,6 +456,14 @@ class CircuitOpenError(Exception):
     pass
 
 
+class UpstreamError(Exception):
+    """Raised when an upstream HTTP request fails (connection, timeout, etc.)."""
+    def __init__(self, message: str, status_code: int = 502, original: Exception = None):
+        super().__init__(message)
+        self.status_code = status_code
+        self.original = original
+
+
 async def _forward_post(endpoint, json, headers):
     """POST with circuit breaker. Raises CircuitOpenError if circuit is open."""
     if not _cb_should_allow(endpoint):
@@ -496,15 +504,31 @@ async def _do_request_with_retry(endpoint, body, headers, protocol, retry_on_429
     """POST request with automatic 429 key failover.
 
     Returns (response, final_headers) -- headers may differ after retry.
+    Raises UpstreamError on connection/timeout/protocol failures.
     """
-    resp = await _client.post(endpoint, json=body, headers=headers)
+    try:
+        resp = await _client.post(endpoint, json=body, headers=headers)
+    except httpx.ConnectError as e:
+        _log(f"  UPSTREAM CONNECT ERROR: {type(e).__name__}: {e}")
+        raise UpstreamError(f"Cannot connect to upstream: {e}", status_code=502, original=e) from e
+    except httpx.TimeoutException as e:
+        _log(f"  UPSTREAM TIMEOUT: {type(e).__name__}: {e}")
+        raise UpstreamError(f"Upstream request timed out: {e}", status_code=504, original=e) from e
+    except httpx.RequestError as e:
+        _log(f"  UPSTREAM REQUEST ERROR: {type(e).__name__}: {e}")
+        raise UpstreamError(f"Upstream request failed: {type(e).__name__}: {e}", status_code=502, original=e) from e
+
     if retry_on_429 and resp.status_code == 429 and len(API_KEYS) > 1:
         failed_key = _key_from_headers(headers, protocol)
         alt = _find_alternative_key(failed_key)
         if alt:
             _log(f"  429 on key, retrying with alternative key")
             headers = _get_auth_headers(protocol, entry=alt)
-            resp = await _client.post(endpoint, json=body, headers=headers)
+            try:
+                resp = await _client.post(endpoint, json=body, headers=headers)
+            except httpx.RequestError as e:
+                _log(f"  UPSTREAM REQUEST ERROR (retry): {type(e).__name__}: {e}")
+                raise UpstreamError(f"Upstream request failed on retry: {e}", status_code=502, original=e) from e
     return resp, headers
 
 
@@ -1601,7 +1625,10 @@ async def messages(request: Request):
         is_stream = body.get("stream", False)
 
         if not is_stream:
-            resp, a_headers = await _do_request_with_retry(endpoint, body, a_headers, "anthropic")
+            try:
+                resp, a_headers = await _do_request_with_retry(endpoint, body, a_headers, "anthropic")
+            except UpstreamError as e:
+                return JSONResponse(status_code=e.status_code, content={"error": str(e)})
             account_alias = _alias_for_key(a_headers.get("x-api-key", ""))
             if resp.status_code != 200:
                 await _log_and_save_error(req_id, model_id, original_model, start_time,
@@ -1741,7 +1768,10 @@ async def messages(request: Request):
     is_stream = oai_body["stream"]
 
     if not is_stream:
-        resp, headers = await _do_request_with_retry(endpoint, oai_body, headers, "openai")
+        try:
+            resp, headers = await _do_request_with_retry(endpoint, oai_body, headers, "openai")
+        except UpstreamError as e:
+            return JSONResponse(status_code=e.status_code, content={"error": str(e)})
         account_alias = _alias_for_key(_key_from_headers(headers, "openai"))
         if resp.status_code != 200:
             await _log_and_save_error(req_id, model_id, original_model, start_time,
@@ -2022,7 +2052,10 @@ async def chat_completions(request: Request):
         headers = _get_auth_headers("openai")
 
         if not is_stream:
-            resp, headers = await _do_request_with_retry(endpoint, body, headers, "openai")
+            try:
+                resp, headers = await _do_request_with_retry(endpoint, body, headers, "openai")
+            except UpstreamError as e:
+                return JSONResponse(status_code=e.status_code, content={"error": str(e)})
             account_alias = _alias_for_key(_key_from_headers(headers, "openai"))
             if resp.status_code != 200:
                 await _log_and_save_error(req_id, model_id, original_model, start_time,
@@ -2148,7 +2181,10 @@ async def chat_completions(request: Request):
     a_headers = _get_auth_headers("anthropic")
 
     if not is_stream:
-        resp, a_headers = await _do_request_with_retry(endpoint, anthro_body, a_headers, "anthropic")
+        try:
+            resp, a_headers = await _do_request_with_retry(endpoint, anthro_body, a_headers, "anthropic")
+        except UpstreamError as e:
+            return JSONResponse(status_code=e.status_code, content={"error": str(e)})
         account_alias = _alias_for_key(a_headers.get("x-api-key", ""))
         if resp.status_code != 200:
             await _log_and_save_error(req_id, model_id, original_model, start_time,
@@ -2440,7 +2476,10 @@ async def responses(request: Request):
     if protocol == "anthropic":
         a_headers = _get_auth_headers("anthropic")
         if not is_stream:
-            resp, a_headers = await _do_request_with_retry(endpoint, anthro_body, a_headers, "anthropic")
+            try:
+                resp, a_headers = await _do_request_with_retry(endpoint, anthro_body, a_headers, "anthropic")
+            except UpstreamError as e:
+                return JSONResponse(status_code=e.status_code, content={"error": str(e)})
             account_alias = _alias_for_key(a_headers.get("x-api-key", ""))
             if resp.status_code != 200:
                 await _log_and_save_error(req_id, model_id, original_model, start_time,
@@ -2466,7 +2505,10 @@ async def responses(request: Request):
             return Response(content=json.dumps(oai_resp, ensure_ascii=False), media_type="application/json")
         # Anthropic streaming → collect, then emit SSE
         anthro_body["stream"] = False
-        resp, a_headers = await _do_request_with_retry(endpoint, anthro_body, a_headers, "anthropic")
+        try:
+            resp, a_headers = await _do_request_with_retry(endpoint, anthro_body, a_headers, "anthropic")
+        except UpstreamError as e:
+            return JSONResponse(status_code=e.status_code, content={"error": str(e)})
         account_alias = _alias_for_key(a_headers.get("x-api-key", ""))
         if resp.status_code != 200:
             await _log_and_save_error(req_id, model_id, original_model, start_time,
@@ -2499,7 +2541,10 @@ async def responses(request: Request):
     is_stream = oai_body["stream"]
 
     if not is_stream:
-        resp, headers = await _do_request_with_retry(endpoint, oai_body, headers, "openai")
+        try:
+            resp, headers = await _do_request_with_retry(endpoint, oai_body, headers, "openai")
+        except UpstreamError as e:
+            return JSONResponse(status_code=e.status_code, content={"error": str(e)})
         account_alias = _alias_for_key(_key_from_headers(headers, "openai"))
         if resp.status_code != 200:
             await _log_and_save_error(req_id, model_id, original_model, start_time,
@@ -2527,7 +2572,10 @@ async def responses(request: Request):
 
     # ── Streaming (OpenAI backend) — collect, then emit SSE ──
     oai_body["stream"] = False
-    resp, headers = await _do_request_with_retry(endpoint, oai_body, headers, "openai")
+    try:
+        resp, headers = await _do_request_with_retry(endpoint, oai_body, headers, "openai")
+    except UpstreamError as e:
+        return JSONResponse(status_code=e.status_code, content={"error": str(e)})
     account_alias = _alias_for_key(_key_from_headers(headers, "openai"))
     if resp.status_code != 200:
         await _log_and_save_error(req_id, model_id, original_model, start_time,
