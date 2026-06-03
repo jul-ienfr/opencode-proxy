@@ -840,8 +840,8 @@ def openai_responses_to_anthropic(body: dict) -> dict:
         else:
             result["tool_choice"] = tc
 
-    # Pass through thinking control if explicitly set
-    if "thinking" in body:
+    # Pass through thinking control only for models that support it
+    if "thinking" in body and model in THINKING_MODELS:
         result["thinking"] = body["thinking"]
 
     return result
