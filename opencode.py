@@ -483,6 +483,55 @@ async def _forward_stream(method, endpoint, json, headers):
         raise
 
 
+# ── Shared helper functions for endpoint handlers ──────────────
+
+async def _do_request_with_retry(endpoint, body, headers, protocol, retry_on_429=True):
+    """POST request with automatic 429 key failover.
+
+    Returns (response, final_headers) -- headers may differ after retry.
+    """
+    resp = await _client.post(endpoint, json=body, headers=headers)
+    if retry_on_429 and resp.status_code == 429 and len(API_KEYS) > 1:
+        failed_key = _key_from_headers(headers, protocol)
+        alt = _find_alternative_key(failed_key)
+        if alt:
+            _log(f"  429 on key, retrying with alternative key")
+            headers = _get_auth_headers(protocol, entry=alt)
+            resp = await _client.post(endpoint, json=body, headers=headers)
+    return resp, headers
+
+
+def _update_token_usage(model_id, inp, out, cache):
+    """Thread-safe update of in-memory token counters."""
+    with _token_lock:
+        _token_usage[model_id]["input"] += inp
+        _token_usage[model_id]["output"] += out
+        _token_usage[model_id]["cache"] += cache
+
+
+async def _save_and_log_request(req_id, model_id, original_model, start_time,
+                                 inp, out, cache, protocol, is_stream, thinking_type,
+                                 effort, client_ip, account_alias, tools, log_tag=""):
+    """Log success and save to DB with success=True."""
+    alias_tag = f" | account={account_alias}" if account_alias else ""
+    _log(f"  ← {model_id} | +{inp} in{log_tag} | +{out} out{log_tag} | +{cache} cache{alias_tag}")
+    await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
+                 inp, out, cache, success=True,
+                 protocol=protocol, is_stream=is_stream, thinking=thinking_type, effort=effort,
+                 client_ip=client_ip, account_alias=account_alias, tools=tools)
+
+
+async def _log_and_save_error(req_id, model_id, original_model, start_time,
+                               status_code, resp_text, protocol, is_stream, thinking_type,
+                               effort, client_ip, account_alias, tools):
+    """Log error and save to DB with success=False."""
+    _log(f"  ERROR {status_code}: {resp_text[:300]}")
+    await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
+                 0, 0, 0, success=False, error=f"HTTP {status_code}",
+                 protocol=protocol, is_stream=is_stream, thinking=thinking_type, effort=effort,
+                 client_ip=client_ip, account_alias=account_alias, tools=tools)
+
+
 def _sse(event: str, payload: dict) -> bytes:
     return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n".encode()
 
@@ -1473,37 +1522,22 @@ async def messages(request: Request):
         is_stream = body.get("stream", False)
 
         if not is_stream:
-            resp = await _client.post(endpoint, json=body, headers=a_headers)
-            if resp.status_code == 429 and len(API_KEYS) > 1:
-                failed_key = a_headers.get("x-api-key", "")
-                alt = _find_alternative_key(failed_key)
-                if alt:
-                    _log(f"  429 on key, retrying with alternative key")
-                    a_headers = _get_auth_headers("anthropic", entry=alt)
-                    resp = await _client.post(endpoint, json=body, headers=a_headers)
+            resp, a_headers = await _do_request_with_retry(endpoint, body, a_headers, "anthropic")
             account_alias = _alias_for_key(a_headers.get("x-api-key", ""))
             if resp.status_code != 200:
-                _log(f"  ERROR {resp.status_code}: {resp.text[:300]}")
-                await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
-                             0, 0, 0, success=False, error=f"HTTP {resp.status_code}",
-                             protocol=protocol, is_stream=is_stream, thinking=thinking_type, effort=effort,
-                             client_ip=client_ip, account_alias=account_alias, tools=tool_names)
+                await _log_and_save_error(req_id, model_id, original_model, start_time,
+                             resp.status_code, resp.text, protocol, is_stream, thinking_type,
+                             effort, client_ip, account_alias, tool_names)
                 return Response(content=resp.content, status_code=resp.status_code, media_type="application/json")
             data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
             usage = data.get("usage", {})
             req_in = usage.get("input_tokens", 0) or usage.get("prompt_tokens", 0)
             req_out = usage.get("output_tokens", 0) or usage.get("completion_tokens", 0)
             req_cache = usage.get("cache_read_input_tokens", 0)
-            with _token_lock:
-                _token_usage[model_id]["input"] += req_in
-                _token_usage[model_id]["output"] += req_out
-                _token_usage[model_id]["cache"] += req_cache
-            alias_tag = f" | account={account_alias}" if account_alias else ""
-            _log(f"  ← {model_id} | +{req_in} in | +{req_out} out | +{req_cache} cache{alias_tag}")
-            await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
-                         req_in, req_out, req_cache, success=True,
-                         protocol=protocol, is_stream=is_stream, thinking=thinking_type, effort=effort,
-                         client_ip=client_ip, account_alias=account_alias, tools=tool_names)
+            _update_token_usage(model_id, req_in, req_out, req_cache)
+            await _save_and_log_request(req_id, model_id, original_model, start_time,
+                         req_in, req_out, req_cache, protocol, is_stream, thinking_type,
+                         effort, client_ip, account_alias, tool_names)
             return Response(content=resp.content, media_type="application/json")
 
 
@@ -1631,21 +1665,12 @@ async def messages(request: Request):
     is_stream = oai_body["stream"]
 
     if not is_stream:
-        resp = await _client.post(endpoint, json=oai_body, headers=headers)
-        if resp.status_code == 429 and len(API_KEYS) > 1:
-            failed_key = headers.get("Authorization", "").replace("Bearer ", "")
-            alt = _find_alternative_key(failed_key)
-            if alt:
-                _log(f"  429 on key, retrying with alternative key")
-                headers = _get_auth_headers("openai", entry=alt)
-                resp = await _client.post(endpoint, json=oai_body, headers=headers)
+        resp, headers = await _do_request_with_retry(endpoint, oai_body, headers, "openai")
         account_alias = _alias_for_key(_key_from_headers(headers, "openai"))
         if resp.status_code != 200:
-            _log(f"  ERROR {resp.status_code}: {resp.text[:300]}")
-            await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
-                         0, 0, 0, success=False, error=f"HTTP {resp.status_code}",
-                         protocol=protocol, is_stream=is_stream, thinking=thinking_type, effort=effort,
-                         client_ip=client_ip, account_alias=account_alias, tools=tool_names)
+            await _log_and_save_error(req_id, model_id, original_model, start_time,
+                         resp.status_code, resp.text, protocol, is_stream, thinking_type,
+                         effort, client_ip, account_alias, tool_names)
             try:
                 err_data = resp.json()
                 err_msg = err_data.get("error", {})
@@ -1661,16 +1686,10 @@ async def messages(request: Request):
         req_in = usage.get("prompt_tokens", 0)
         req_out = usage.get("completion_tokens", 0)
         cache = _extract_cache_tokens(usage)
-        with _token_lock:
-            _token_usage[model_id]["input"] += req_in
-            _token_usage[model_id]["output"] += req_out
-            _token_usage[model_id]["cache"] += cache
-        alias_tag = f" | account={account_alias}" if account_alias else ""
-        _log(f"  ← {model_id} | +{req_in} in | +{req_out} out | +{cache} cache{alias_tag}")
-        await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
-                     req_in, req_out, cache, success=True,
-                     protocol=protocol, is_stream=False, thinking=thinking_type, effort=effort,
-                     client_ip=client_ip, account_alias=account_alias, tools=tool_names)
+        _update_token_usage(model_id, req_in, req_out, cache)
+        await _save_and_log_request(req_id, model_id, original_model, start_time,
+                     req_in, req_out, cache, protocol, is_stream=False, thinking=thinking_type,
+                     effort=effort, client_ip=client_ip, account_alias=account_alias, tools=tool_names)
         return Response(content=json.dumps(openai_to_anthropic(data, original_model), ensure_ascii=False),
                         media_type="application/json")
 
@@ -1950,41 +1969,22 @@ async def chat_completions(request: Request):
         headers = _get_auth_headers("openai")
 
         if not is_stream:
-            resp = await _client.post(endpoint, json=body, headers=headers)
-            if resp.status_code == 429 and len(API_KEYS) > 1:
-                failed_key = headers.get("Authorization", "").replace("Bearer ", "")
-                alt = _find_alternative_key(failed_key)
-                if alt:
-                    _log(f"  429 on key, retrying with alternative key")
-                    headers = _get_auth_headers("openai", entry=alt)
-                    resp = await _client.post(endpoint, json=body, headers=headers)
+            resp, headers = await _do_request_with_retry(endpoint, body, headers, "openai")
             account_alias = _alias_for_key(_key_from_headers(headers, "openai"))
             if resp.status_code != 200:
-                _log(f"  ERROR {resp.status_code}: {resp.text[:300]}")
-                await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
-                             0, 0, 0, success=False, error=f"HTTP {resp.status_code}",
-                             protocol=protocol, is_stream=is_stream, thinking=thinking_type, effort=effort,
-                             client_ip=client_ip, account_alias=account_alias, tools=tool_names)
-                try:
-                    err_data = resp.json()
-                except Exception:
-                    return Response(content=resp.content, status_code=resp.status_code, media_type="application/json")
+                await _log_and_save_error(req_id, model_id, original_model, start_time,
+                             resp.status_code, resp.text, protocol, is_stream, thinking_type,
+                             effort, client_ip, account_alias, tool_names)
                 return Response(content=resp.content, status_code=resp.status_code, media_type="application/json")
             data = resp.json()
             usage = data.get("usage", {})
             req_in = usage.get("prompt_tokens", 0)
             req_out = usage.get("completion_tokens", 0)
             cache = _extract_cache_tokens(usage)
-            with _token_lock:
-                _token_usage[model_id]["input"] += req_in
-                _token_usage[model_id]["output"] += req_out
-                _token_usage[model_id]["cache"] += cache
-            alias_tag = f" | account={account_alias}" if account_alias else ""
-            _log(f"  ← {model_id} | +{req_in} in | +{req_out} out | +{cache} cache{alias_tag}")
-            await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
-                         req_in, req_out, cache, success=True,
-                         protocol=protocol, is_stream=is_stream, thinking=thinking_type, effort=effort,
-                         client_ip=client_ip, account_alias=account_alias, tools=tool_names)
+            _update_token_usage(model_id, req_in, req_out, cache)
+            await _save_and_log_request(req_id, model_id, original_model, start_time,
+                         req_in, req_out, cache, protocol, is_stream, thinking_type,
+                         effort, client_ip, account_alias, tool_names)
             return Response(content=json.dumps(data, ensure_ascii=False), media_type="application/json")
 
         # ── OpenAI streaming passthrough ──
@@ -2112,21 +2112,12 @@ async def chat_completions(request: Request):
     a_headers = _get_auth_headers("anthropic")
 
     if not is_stream:
-        resp = await _client.post(endpoint, json=anthro_body, headers=a_headers)
-        if resp.status_code == 429 and len(API_KEYS) > 1:
-            failed_key = a_headers.get("x-api-key", "")
-            alt = _find_alternative_key(failed_key)
-            if alt:
-                _log(f"  429 on key, retrying with alternative key")
-                a_headers = _get_auth_headers("anthropic", entry=alt)
-                resp = await _client.post(endpoint, json=anthro_body, headers=a_headers)
+        resp, a_headers = await _do_request_with_retry(endpoint, anthro_body, a_headers, "anthropic")
         account_alias = _alias_for_key(a_headers.get("x-api-key", ""))
         if resp.status_code != 200:
-            _log(f"  ERROR {resp.status_code}: {resp.text[:300]}")
-            await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
-                         0, 0, 0, success=False, error=f"HTTP {resp.status_code}",
-                         protocol=protocol, is_stream=is_stream, thinking=thinking_type, effort=effort,
-                         client_ip=client_ip, account_alias=account_alias, tools=tool_names)
+            await _log_and_save_error(req_id, model_id, original_model, start_time,
+                         resp.status_code, resp.text, protocol, is_stream, thinking_type,
+                         effort, client_ip, account_alias, tool_names)
             try:
                 err_data = resp.json()
                 err_msg = err_data.get("error", {}).get("message", resp.text[:200])
@@ -2140,16 +2131,10 @@ async def chat_completions(request: Request):
         req_in = usage.get("input_tokens", 0) or usage.get("prompt_tokens", 0)
         req_out = usage.get("output_tokens", 0) or usage.get("completion_tokens", 0)
         req_cache = usage.get("cache_read_input_tokens", 0)
-        with _token_lock:
-            _token_usage[model_id]["input"] += req_in
-            _token_usage[model_id]["output"] += req_out
-            _token_usage[model_id]["cache"] += req_cache
-        alias_tag = f" | account={account_alias}" if account_alias else ""
-        _log(f"  ← {model_id} | +{req_in} in | +{req_out} out | +{req_cache} cache{alias_tag}")
-        await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
-                     req_in, req_out, req_cache, success=True,
-                     protocol=protocol, is_stream=is_stream, thinking=thinking_type, effort=effort,
-                     client_ip=client_ip, account_alias=account_alias, tools=tool_names)
+        _update_token_usage(model_id, req_in, req_out, req_cache)
+        await _save_and_log_request(req_id, model_id, original_model, start_time,
+                     req_in, req_out, req_cache, protocol, is_stream, thinking_type,
+                     effort, client_ip, account_alias, tool_names)
 
         oai_response = anthropic_to_openai_response(data, original_model)
         return Response(content=json.dumps(oai_response, ensure_ascii=False), media_type="application/json")
@@ -2429,20 +2414,12 @@ async def responses(request: Request):
     if protocol == "anthropic":
         a_headers = _get_auth_headers("anthropic")
         if not is_stream:
-            resp = await _client.post(endpoint, json=anthro_body, headers=a_headers)
-            if resp.status_code == 429 and len(API_KEYS) > 1:
-                failed_key = a_headers.get("x-api-key", "")
-                alt = _find_alternative_key(failed_key)
-                if alt:
-                    a_headers = _get_auth_headers("anthropic", entry=alt)
-                    resp = await _client.post(endpoint, json=anthro_body, headers=a_headers)
+            resp, a_headers = await _do_request_with_retry(endpoint, anthro_body, a_headers, "anthropic")
             account_alias = _alias_for_key(a_headers.get("x-api-key", ""))
             if resp.status_code != 200:
-                _log(f"  ERROR {resp.status_code}: {resp.text[:300]}")
-                await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
-                             0, 0, 0, success=False, error=f"HTTP {resp.status_code}",
-                             protocol=protocol, is_stream=is_stream, thinking=thinking_type, effort=effort,
-                             client_ip=client_ip, account_alias=account_alias, tools=tool_names)
+                await _log_and_save_error(req_id, model_id, original_model, start_time,
+                             resp.status_code, resp.text, protocol, is_stream, thinking_type,
+                             effort, client_ip, account_alias, tool_names)
                 try:
                     err_data = resp.json()
                     err_msg = err_data.get("error", {}).get("message", resp.text[:200])
@@ -2454,34 +2431,20 @@ async def responses(request: Request):
             req_in = usage.get("input_tokens", 0) or usage.get("prompt_tokens", 0)
             req_out = usage.get("output_tokens", 0) or usage.get("completion_tokens", 0)
             req_cache = usage.get("cache_read_input_tokens", 0)
-            with _token_lock:
-                _token_usage[model_id]["input"] += req_in
-                _token_usage[model_id]["output"] += req_out
-                _token_usage[model_id]["cache"] += req_cache
-            alias_tag = f" | account={account_alias}" if account_alias else ""
-            _log(f"  ← {model_id} | +{req_in} in | +{req_out} out | +{req_cache} cache{alias_tag}")
-            await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
-                         req_in, req_out, req_cache, success=True,
-                         protocol=protocol, is_stream=is_stream, thinking=thinking_type, effort=effort,
-                         client_ip=client_ip, account_alias=account_alias, tools=tool_names)
+            _update_token_usage(model_id, req_in, req_out, req_cache)
+            await _save_and_log_request(req_id, model_id, original_model, start_time,
+                         req_in, req_out, req_cache, protocol, is_stream, thinking_type,
+                         effort, client_ip, account_alias, tool_names)
             oai_resp = anthropic_to_openai_responses(data, original_model)
             return Response(content=json.dumps(oai_resp, ensure_ascii=False), media_type="application/json")
         # Anthropic streaming → collect, then emit SSE
         anthro_body["stream"] = False
-        resp = await _client.post(endpoint, json=anthro_body, headers=a_headers)
-        if resp.status_code == 429 and len(API_KEYS) > 1:
-            failed_key = a_headers.get("x-api-key", "")
-            alt = _find_alternative_key(failed_key)
-            if alt:
-                a_headers = _get_auth_headers("anthropic", entry=alt)
-                resp = await _client.post(endpoint, json=anthro_body, headers=a_headers)
+        resp, a_headers = await _do_request_with_retry(endpoint, anthro_body, a_headers, "anthropic")
         account_alias = _alias_for_key(a_headers.get("x-api-key", ""))
         if resp.status_code != 200:
-            _log(f"  ERROR {resp.status_code}: {resp.text[:300]}")
-            await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
-                         0, 0, 0, success=False, error=f"HTTP {resp.status_code}",
-                         protocol=protocol, is_stream=True, thinking=thinking_type, effort=effort,
-                         client_ip=client_ip, account_alias=account_alias, tools=tool_names)
+            await _log_and_save_error(req_id, model_id, original_model, start_time,
+                         resp.status_code, resp.text, protocol, True, thinking_type,
+                         effort, client_ip, account_alias, tool_names)
             async def err_stream():
                 yield b"data: [DONE]\n\n"
             return StreamingResponse(err_stream(), media_type="text/event-stream",
@@ -2491,16 +2454,10 @@ async def responses(request: Request):
         req_in = usage.get("input_tokens", 0) or usage.get("prompt_tokens", 0)
         req_out = usage.get("output_tokens", 0) or usage.get("completion_tokens", 0)
         req_cache = usage.get("cache_read_input_tokens", 0)
-        with _token_lock:
-            _token_usage[model_id]["input"] += req_in
-            _token_usage[model_id]["output"] += req_out
-            _token_usage[model_id]["cache"] += req_cache
-        alias_tag = f" | account={account_alias}" if account_alias else ""
-        _log(f"  ← {model_id} | +{req_in} in | +{req_out} out | +{req_cache} cache{alias_tag}")
-        await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
-                     req_in, req_out, req_cache, success=True,
-                     protocol=protocol, is_stream=True, thinking=thinking_type, effort=effort,
-                     client_ip=client_ip, account_alias=account_alias, tools=tool_names)
+        _update_token_usage(model_id, req_in, req_out, req_cache)
+        await _save_and_log_request(req_id, model_id, original_model, start_time,
+                     req_in, req_out, req_cache, protocol, True, thinking_type,
+                     effort, client_ip, account_alias, tool_names)
         oai_resp = anthropic_to_openai_responses(data, original_model)
         payload = json.dumps({"type": "response.completed", "response": oai_resp}, ensure_ascii=False)
         sse_body = f"data: {payload}\n\ndata: [DONE]\n\n".encode()
@@ -2514,20 +2471,12 @@ async def responses(request: Request):
     is_stream = oai_body["stream"]
 
     if not is_stream:
-        resp = await _client.post(endpoint, json=oai_body, headers=headers)
-        if resp.status_code == 429 and len(API_KEYS) > 1:
-            failed_key = headers.get("Authorization", "").replace("Bearer ", "")
-            alt = _find_alternative_key(failed_key)
-            if alt:
-                headers = _get_auth_headers("openai", entry=alt)
-                resp = await _client.post(endpoint, json=oai_body, headers=headers)
+        resp, headers = await _do_request_with_retry(endpoint, oai_body, headers, "openai")
         account_alias = _alias_for_key(_key_from_headers(headers, "openai"))
         if resp.status_code != 200:
-            _log(f"  ERROR {resp.status_code}: {resp.text[:300]}")
-            await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
-                         0, 0, 0, success=False, error=f"HTTP {resp.status_code}",
-                         protocol=protocol, is_stream=is_stream, thinking=thinking_type, effort=effort,
-                         client_ip=client_ip, account_alias=account_alias, tools=tool_names)
+            await _log_and_save_error(req_id, model_id, original_model, start_time,
+                         resp.status_code, resp.text, protocol, is_stream, thinking_type,
+                         effort, client_ip, account_alias, tool_names)
             try:
                 err_data = resp.json()
                 err_msg = err_data.get("error", {}).get("message", resp.text[:200])
@@ -2539,37 +2488,22 @@ async def responses(request: Request):
         req_in = usage.get("prompt_tokens", 0)
         req_out = usage.get("completion_tokens", 0)
         cache = _extract_cache_tokens(usage)
-        with _token_lock:
-            _token_usage[model_id]["input"] += req_in
-            _token_usage[model_id]["output"] += req_out
-            _token_usage[model_id]["cache"] += cache
-        alias_tag = f" | account={account_alias}" if account_alias else ""
-        _log(f"  ← {model_id} | +{req_in} in | +{req_out} out | +{cache} cache{alias_tag}")
-        await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
-                     req_in, req_out, cache, success=True,
-                     protocol=protocol, is_stream=is_stream, thinking=thinking_type, effort=effort,
-                     client_ip=client_ip, account_alias=account_alias, tools=tool_names)
+        _update_token_usage(model_id, req_in, req_out, cache)
+        await _save_and_log_request(req_id, model_id, original_model, start_time,
+                     req_in, req_out, cache, protocol, is_stream, thinking_type,
+                     effort, client_ip, account_alias, tool_names)
         # Direct conversion: Chat Completions → Responses (no intermediate Anthropic format)
         oai_resp = openai_chat_to_responses(data, original_model)
         return Response(content=json.dumps(oai_resp, ensure_ascii=False), media_type="application/json")
 
     # ── Streaming (OpenAI backend) — collect, then emit SSE ──
     oai_body["stream"] = False
-    resp = await _client.post(endpoint, json=oai_body, headers=headers)
-    if resp.status_code == 429 and len(API_KEYS) > 1:
-        failed_key = headers.get("Authorization", "").replace("Bearer ", "")
-        alt = _find_alternative_key(failed_key)
-        if alt:
-            headers = _get_auth_headers("openai", entry=alt)
-            resp = await _client.post(endpoint, json=oai_body, headers=headers)
+    resp, headers = await _do_request_with_retry(endpoint, oai_body, headers, "openai")
     account_alias = _alias_for_key(_key_from_headers(headers, "openai"))
     if resp.status_code != 200:
-        _log(f"  ERROR {resp.status_code}: {resp.text[:300]}")
-        await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
-                     0, 0, 0, success=False, error=f"HTTP {resp.status_code}",
-                     protocol=protocol, is_stream=True, thinking=thinking_type, effort=effort,
-                     client_ip=client_ip, account_alias=account_alias, tools=tool_names)
-        err = json.dumps({"error": {"message": f"HTTP {resp.status_code}"}}, ensure_ascii=False)
+        await _log_and_save_error(req_id, model_id, original_model, start_time,
+                     resp.status_code, resp.text, protocol, True, thinking_type,
+                     effort, client_ip, account_alias, tool_names)
         async def err_stream():
             yield b"data: [DONE]\n\n"
         return StreamingResponse(err_stream(), media_type="text/event-stream",
@@ -2579,16 +2513,10 @@ async def responses(request: Request):
     req_in = usage.get("prompt_tokens", 0)
     req_out = usage.get("completion_tokens", 0)
     cache = _extract_cache_tokens(usage)
-    with _token_lock:
-        _token_usage[model_id]["input"] += req_in
-        _token_usage[model_id]["output"] += req_out
-        _token_usage[model_id]["cache"] += cache
-    alias_tag = f" | account={account_alias}" if account_alias else ""
-    _log(f"  ← {model_id} | +{req_in} in | +{req_out} out | +{cache} cache{alias_tag}")
-    await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
-                 req_in, req_out, cache, success=True,
-                 protocol=protocol, is_stream=True, thinking=thinking_type, effort=effort,
-                 client_ip=client_ip, account_alias=account_alias, tools=tool_names)
+    _update_token_usage(model_id, req_in, req_out, cache)
+    await _save_and_log_request(req_id, model_id, original_model, start_time,
+                 req_in, req_out, cache, protocol, True, thinking_type,
+                 effort, client_ip, account_alias, tool_names)
     # Direct conversion: Chat Completions → Responses (no intermediate Anthropic format)
     oai_resp = openai_chat_to_responses(data, original_model)
     # Return as single SSE block (data-only format)
