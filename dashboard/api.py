@@ -10,11 +10,14 @@ from fastapi import Request, Response
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-from config import MODELS, HOST, PORT, WEB_PORT, PROXY, API_KEY, CONFIG_KEYS, save_env, apply_server_changes, DISABLE_MAPPING, CUSTOM_ROUTES, save_custom_routes, API_KEYS, save_api_keys, API_KEY_ROUTING
+from config import MODELS, HOST, PORT, WEB_PORT, PROXY, API_KEY, CONFIG_KEYS, save_env, apply_server_changes, CUSTOM_ROUTES, save_custom_routes, API_KEYS, save_api_keys, API_KEY_ROUTING
 import config.settings as config_settings
 from .display import log_lines
 from .events import get_event_manager
 from .quota import get_quota_snapshot, get_available_models, get_model_limits_for_all, get_model_capabilities_for_all
+
+# Tools that work on all models — hidden from routing UI by default
+UNIVERSAL_TOOLS = {"Read", "Write", "Edit", "Bash", "Grep", "Glob", "WebSearch"}
 
 
 async def _db_query_sync(fn):
@@ -65,7 +68,7 @@ def daysAgo(n: int) -> str:
     return (datetime.now() - timedelta(days=n)).strftime("%Y-%m-%d")
 
 
-def register_dashboard(app, static_dir, conn, server_manager_getter=None):
+def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_usage=None, token_lock=None):
     app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
     @app.get("/")
@@ -97,7 +100,7 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None):
             "model_limits": get_model_limits_for_all(models_info),
             "model_capabilities": get_model_capabilities_for_all(models_info),
             "proxy_running": server_manager_getter().is_running if server_manager_getter and server_manager_getter() else True,
-            "disable_mapping": DISABLE_MAPPING,
+            "disable_mapping": config_settings.DISABLE_MAPPING,
             "custom_routes": config_settings.CUSTOM_ROUTES,
             "go_workspace_id_set": bool(config_settings.OPENCODE_GO_WORKSPACE_ID),
             "go_workspace_id_masked": (config_settings.OPENCODE_GO_WORKSPACE_ID[:4] + "****") if config_settings.OPENCODE_GO_WORKSPACE_ID and len(config_settings.OPENCODE_GO_WORKSPACE_ID) > 4 else (config_settings.OPENCODE_GO_WORKSPACE_ID or ""),
@@ -433,8 +436,9 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None):
         return get_quota_snapshot()
 
     @app.get("/api/tools")
-    async def get_tools(days: int = 7):
-        """Aggregate tool names from recent requests."""
+    async def get_tools(days: int = 7, all: bool = False):
+        """Aggregate tool names from recent requests.
+        Set ?all=true to include universal tools (Read, Write, etc.)."""
         where, params = _build_where(daysAgo(days), None)
         def _query_tools():
             return conn.execute(
@@ -456,6 +460,10 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None):
 
         # Sort by frequency descending
         sorted_tools = sorted(tool_counts.items(), key=lambda x: -x[1])
+
+        # Filter out universal tools unless ?all=true
+        if not all:
+            sorted_tools = [(n, c) for n, c in sorted_tools if n not in UNIVERSAL_TOOLS]
 
         # Check if any tool matches an existing custom route
         custom_routes = CUSTOM_ROUTES
@@ -505,6 +513,7 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None):
                     "effort": r["effort"] if "effort" in r.keys() else None,
                     "account_alias": r["account_alias"] if "account_alias" in r.keys() else None,
                     "tools": json.loads(r["tools"]) if "tools" in r.keys() and r["tools"] and r["tools"] != "[]" else [],
+                    "tools_used": json.loads(r["tools_used"]) if "tools_used" in r.keys() and r["tools_used"] and r["tools_used"] != "[]" else [],
                 }
                 for r in rows
             ],
@@ -515,15 +524,39 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None):
         }
 
     @app.delete("/api/history")
-    async def delete_history(before: str = None, all: bool = False):
-        if not all and not before:
-            return {"error": "Specify 'before' date or 'all=true'"}
+    async def delete_history(before: str = None, all: bool = False, model: str = None):
+        if not all and not before and not model:
+            return {"error": "Specify 'before' date, 'model' name, or 'all=true'"}
 
         def _delete():
             if all:
                 conn.execute("DELETE FROM requests")
+                if token_usage:
+                    with token_lock:
+                        for d in token_usage.values():
+                            d["input"] = d["output"] = d["cache"] = 0
+            elif model:
+                conn.execute("DELETE FROM requests WHERE model = ?", (model,))
+                if token_usage and model in token_usage:
+                    with token_lock:
+                        token_usage[model]["input"] = token_usage[model]["output"] = token_usage[model]["cache"] = 0
             elif before:
                 conn.execute("DELETE FROM requests WHERE timestamp < ?", (before + "T23:59:59",))
+                # Recalculate all counters from remaining rows
+                if token_usage:
+                    rows = conn.execute(
+                        "SELECT model, COALESCE(SUM(tokens_input), 0), COALESCE(SUM(tokens_output), 0),"
+                        " COALESCE(SUM(tokens_cache), 0) FROM requests GROUP BY model"
+                    ).fetchall()
+                    with token_lock:
+                        for d in token_usage.values():
+                            d["input"] = d["output"] = d["cache"] = 0
+                        for row in rows:
+                            m = row[0]
+                            if m in token_usage:
+                                token_usage[m]["input"] = row[1]
+                                token_usage[m]["output"] = row[2]
+                                token_usage[m]["cache"] = row[3]
             conn.commit()
 
         await asyncio.to_thread(_delete)

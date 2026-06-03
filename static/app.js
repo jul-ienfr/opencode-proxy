@@ -446,9 +446,10 @@ async function fetchStats(from, to) {
     }
 }
 
-async function fetchToolRoutes(days = 7) {
+async function fetchToolRoutes(days = 7, showAll = false) {
     try {
-        return await apiFetch(`/api/tools?days=${days}`);
+        const params = `days=${days}` + (showAll ? '&all=true' : '');
+        return await apiFetch(`/api/tools?${params}`);
     } catch (e) {
         console.error('Failed to fetch tool routes:', e);
         return [];
@@ -767,7 +768,7 @@ function renderHistory(data) {
             <td>${formatNumber(log.tokens_cache)}</td>
             <td>${thinking}</td>
             <td>${effort}</td>
-            <td ${(log.tools && log.tools.length > 3) ? 'title="' + log.tools.map(escHtml).join(', ') + '"' : ''}>${(log.tools && log.tools.length) ? log.tools.slice(0, 3).map(escHtml).join(', ') + (log.tools.length > 3 ? ', +' + (log.tools.length - 3) : '') : '-'}</td>
+            <td ${(log.tools && log.tools.length) ? 'title="Déclarés: ' + log.tools.map(escHtml).join(', ') + (log.tools_used && log.tools_used.length ? '\nUtilisés: ' + log.tools_used.map(escHtml).join(', ') : '') + '"' : ''}>${(log.tools_used && log.tools_used.length) ? log.tools_used.slice(0, 3).map(escHtml).join(', ') + (log.tools_used.length > 3 ? ', +' + (log.tools_used.length - 3) : '') + (log.tools && log.tools.length > log.tools_used.length ? ` <span class="tools-count" title="${log.tools.length} outils déclarés">(${log.tools.length})</span>` : '') : '-'}</td>
             <td>${duration}</td>
             <td>${status}</td>
         </tr>`;
@@ -1241,24 +1242,22 @@ function setupConfig() {
         }
     });
 
+    // ── Tool Routes: toggle universal tools visibility ──
+    document.getElementById('tr-show-all').addEventListener('change', async (e) => {
+        const tools = await fetchToolRoutes(7, e.target.checked);
+        renderToolRoutes(tools, availableModels);
+    });
+
     // ── Tool Routes: save ──
     document.getElementById('tr-save-btn').addEventListener('click', async () => {
         const toolRoutes = gatherToolRoutes();
-        const toolKeys = Object.keys(toolRoutes);
-        if (toolKeys.length === 0) {
-            const status = document.getElementById('tr-save-status');
-            status.textContent = t('config.tr_alert_save');
-            status.className = 'save-status';
-            setTimeout(() => { status.textContent = ''; }, 2000);
-            return;
-        }
 
         // Fetch existing custom routes and merge
         const configData = await apiFetch('/api/config');
         const existingRoutes = configData.custom_routes || {};
 
         // Remove old tool routes (those matching known tool names from the current data)
-        const currentTools = await fetchToolRoutes();
+        const currentTools = await fetchToolRoutes(7, true); // fetch all including universal
         const currentToolNames = new Set(currentTools.map(t => t.name));
         for (const key of Object.keys(existingRoutes)) {
             const matches = existingRoutes[key].match || [];

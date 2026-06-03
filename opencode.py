@@ -145,7 +145,7 @@ _conn.execute("CREATE INDEX IF NOT EXISTS idx_model ON requests(model)")
 _conn.execute("CREATE INDEX IF NOT EXISTS idx_success ON requests(success)")
 _conn.execute("CREATE INDEX IF NOT EXISTS idx_account ON requests(account_alias)")
 _conn.execute("CREATE INDEX IF NOT EXISTS idx_ts_model ON requests(timestamp, model)")
-for col, default in [("protocol", "NULL"), ("is_stream", "0"), ("thinking", "NULL"), ("effort", "NULL"), ("client_ip", "NULL"), ("account_alias", "NULL"), ("tools", "NULL")]:
+for col, default in [("protocol", "NULL"), ("is_stream", "0"), ("thinking", "NULL"), ("effort", "NULL"), ("client_ip", "NULL"), ("account_alias", "NULL"), ("tools", "NULL"), ("tools_used", "NULL")]:
     try:
         _conn.execute(f"ALTER TABLE requests ADD COLUMN {col} TEXT DEFAULT {default}")
     except Exception:
@@ -155,30 +155,33 @@ _conn.commit()
 
 def _db_insert_sync(req_id, timestamp, model, original_model, duration_ms,
                     tokens_input, tokens_output, tokens_cache, success, error,
-                    protocol, is_stream, thinking, effort, client_ip, account_alias, tools_json):
+                    protocol, is_stream, thinking, effort, client_ip, account_alias,
+                    tools_json, tools_used_json):
     """Synchronous DB insert — called via asyncio.to_thread()."""
     _conn.execute("""
         INSERT OR REPLACE INTO requests (id, timestamp, model, original_model, duration_ms,
             tokens_input, tokens_output, tokens_cache, success, error,
-            protocol, is_stream, thinking, effort, client_ip, account_alias, tools)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            protocol, is_stream, thinking, effort, client_ip, account_alias, tools, tools_used)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (req_id, timestamp, model, original_model, duration_ms,
           tokens_input, tokens_output, tokens_cache, 1 if success else 0, error,
           protocol, 1 if is_stream else 0, thinking, effort,
-          client_ip, account_alias, tools_json))
+          client_ip, account_alias, tools_json, tools_used_json))
     _conn.commit()
 
 
 async def _save_request(req_id, model, original_model, duration_ms,
 	                  tokens_input, tokens_output, tokens_cache, success=True, error=None,
 	                  protocol=None, is_stream=False, thinking=None, effort=None,
-	                  client_ip=None, account_alias=None, tools=None):
+	                  client_ip=None, account_alias=None, tools=None, tools_used=None):
     tools_json = json.dumps(tools) if tools else "[]"
+    tools_used_json = json.dumps(tools_used) if tools_used else "[]"
     timestamp = time.strftime("%Y-%m-%dT%H:%M:%S")
     await asyncio.to_thread(
         _db_insert_sync, req_id, timestamp, model, original_model, duration_ms,
         tokens_input, tokens_output, tokens_cache, success, error,
-        protocol, is_stream, thinking, effort, client_ip, account_alias, tools_json
+        protocol, is_stream, thinking, effort, client_ip, account_alias,
+        tools_json, tools_used_json
     )
     # Notify dashboard SSE clients about the update
     try:
@@ -276,7 +279,7 @@ async def debug_exception(request: Request, exc: Exception):
 # Server manager set later in __main__ for GUI mode; None means always-running
 _server_manager = None
 
-register_dashboard(app, STATIC_DIR, _conn, server_manager_getter=lambda: _server_manager)
+register_dashboard(app, STATIC_DIR, _conn, server_manager_getter=lambda: _server_manager, token_usage=_token_usage, token_lock=_token_lock)
 
 
 # ── Rate Limiting (token bucket, per-IP) ────────────────────────
@@ -515,25 +518,28 @@ def _update_token_usage(model_id, inp, out, cache):
 
 async def _save_and_log_request(req_id, model_id, original_model, start_time,
                                  inp, out, cache, protocol, is_stream, thinking_type,
-                                 effort, client_ip, account_alias, tools, log_tag=""):
+                                 effort, client_ip, account_alias, tools, log_tag="",
+                                 tools_used=None):
     """Log success and save to DB with success=True."""
     alias_tag = f" | account={account_alias}" if account_alias else ""
     _log(f"  ← {model_id} | +{inp} in{log_tag} | +{out} out{log_tag} | +{cache} cache{alias_tag}")
     await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
                  inp, out, cache, success=True,
                  protocol=protocol, is_stream=is_stream, thinking=thinking_type, effort=effort,
-                 client_ip=client_ip, account_alias=account_alias, tools=tools)
+                 client_ip=client_ip, account_alias=account_alias, tools=tools,
+                 tools_used=tools_used)
 
 
 async def _log_and_save_error(req_id, model_id, original_model, start_time,
                                status_code, resp_text, protocol, is_stream, thinking_type,
-                               effort, client_ip, account_alias, tools):
+                               effort, client_ip, account_alias, tools, tools_used=None):
     """Log error and save to DB with success=False."""
     _log(f"  ERROR {status_code}: {resp_text[:300]}")
     await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
                  0, 0, 0, success=False, error=f"HTTP {status_code}",
                  protocol=protocol, is_stream=is_stream, thinking=thinking_type, effort=effort,
-                 client_ip=client_ip, account_alias=account_alias, tools=tools)
+                 client_ip=client_ip, account_alias=account_alias, tools=tools,
+                 tools_used=tools_used)
 
 
 # ── Streaming helpers ───────────────────────────────────────────
@@ -558,13 +564,14 @@ def _make_stream_retry_loop(protocol):
 async def _stream_error_response(req_id, model_id, original_model, start_time,
                                   status_code, resp_body, protocol, thinking_type,
                                   effort, client_ip, account_alias, tools,
-                                  error_payload):
+                                  error_payload, tools_used=None):
     """Handle streaming error: log, save DB, yield error SSE event. Returns the error event bytes."""
     _log(f"  ERROR {status_code}: {resp_body[:300] if isinstance(resp_body, str) else resp_body[:300]}")
     await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
                  0, 0, 0, success=False, error=f"HTTP {status_code}",
                  protocol=protocol, is_stream=True, thinking=thinking_type, effort=effort,
-                 client_ip=client_ip, account_alias=account_alias, tools=tools)
+                 client_ip=client_ip, account_alias=account_alias, tools=tools,
+                 tools_used=tools_used)
     return _sse("error", error_payload)
 
 
@@ -1607,9 +1614,10 @@ async def messages(request: Request):
             req_out = usage.get("output_tokens", 0) or usage.get("completion_tokens", 0)
             req_cache = usage.get("cache_read_input_tokens", 0)
             _update_token_usage(model_id, req_in, req_out, req_cache)
+            used = [b["name"] for b in data.get("content", []) if b.get("type") == "tool_use"]
             await _save_and_log_request(req_id, model_id, original_model, start_time,
                          req_in, req_out, req_cache, protocol, is_stream, thinking_type,
-                         effort, client_ip, account_alias, tool_names)
+                         effort, client_ip, account_alias, tool_names, tools_used=used)
             return Response(content=resp.content, media_type="application/json")
 
 
@@ -1624,6 +1632,7 @@ async def messages(request: Request):
             _line_buf = ""
             started = False
             open_blocks = []
+            used_tools = []
             stop_reason = "end_turn"
             _handle_429 = _make_stream_retry_loop("anthropic")
             for _attempt in range(2):  # retry once on 429
@@ -1672,6 +1681,9 @@ async def messages(request: Request):
                                         with _token_lock:
                                             _token_usage[model_id]["cache"] += stream_cache
                                 elif etype == "content_block_start":
+                                    block = event.get("content_block", {})
+                                    if block.get("type") == "tool_use" and block.get("name"):
+                                        used_tools.append(block["name"])
                                     open_blocks.append(event.get("index"))
                                 elif etype == "content_block_stop":
                                     idx = event.get("index")
@@ -1699,7 +1711,8 @@ async def messages(request: Request):
                     await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
                                  stream_in if stream_in is not None else est_input, stream_out, stream_cache, success=False, error=str(e),
                                  protocol=protocol, is_stream=True, thinking=thinking_type, effort=effort,
-                                 client_ip=client_ip, account_alias=ak, tools=tool_names)
+                                 client_ip=client_ip, account_alias=ak, tools=tool_names,
+                                 tools_used=used_tools if used_tools else None)
                     if started:
                         for idx in open_blocks:
                             yield _sse("content_block_stop", {"type": "content_block_stop", "index": idx})
@@ -1717,7 +1730,7 @@ async def messages(request: Request):
                 ak = _alias_for_key(headers.get("x-api-key", ""))
                 await _save_and_log_request(req_id, model_id, original_model, start_time,
                              logged_in, stream_out, stream_cache, protocol, True, thinking_type,
-                             effort, client_ip, ak, tool_names)
+                             effort, client_ip, ak, tool_names, tools_used=used_tools if used_tools else None)
 
         return StreamingResponse(anthropic_stream(a_headers), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
@@ -1750,9 +1763,11 @@ async def messages(request: Request):
         req_out = usage.get("completion_tokens", 0)
         cache = _extract_cache_tokens(usage)
         _update_token_usage(model_id, req_in, req_out, cache)
+        used = [tc["function"]["name"] for tc in data.get("choices", [{}])[0].get("message", {}).get("tool_calls", [])]
         await _save_and_log_request(req_id, model_id, original_model, start_time,
                      req_in, req_out, cache, protocol, is_stream=False, thinking=thinking_type,
-                     effort=effort, client_ip=client_ip, account_alias=account_alias, tools=tool_names)
+                     effort=effort, client_ip=client_ip, account_alias=account_alias, tools=tool_names,
+                     tools_used=used if used else None)
         return Response(content=json.dumps(openai_to_anthropic(data, original_model), ensure_ascii=False),
                         media_type="application/json")
 
@@ -1773,6 +1788,7 @@ async def messages(request: Request):
         next_block_idx = 0
         stream_out_tokens = 0
         actual_usage = None
+        used_tools = []
         _handle_429 = _make_stream_retry_loop("openai")
 
         for _attempt in range(2):
@@ -1814,7 +1830,8 @@ async def messages(request: Request):
                             ak_h = _alias_for_key(_key_from_headers(hdrs, "openai"))
                             await _save_and_log_request(req_id, model_id, original_model, start_time,
                                          final_in, final_out, final_cache, protocol, True, thinking_type,
-                                         effort, client_ip, ak_h, tool_names, log_tag)
+                                         effort, client_ip, ak_h, tool_names, log_tag,
+                                         tools_used=used_tools if used_tools else None)
                             break
 
                         try:
@@ -1881,9 +1898,12 @@ async def messages(request: Request):
                                 next_block_idx += 1
                                 tool_block_idx[api_idx] = block_idx
                                 tc_id = tc.get("id", f"toolu_{uuid.uuid4().hex[:8]}")
+                                tc_name = tc.get("function", {}).get("name", "")
+                                if tc_name:
+                                    used_tools.append(tc_name)
                                 yield _sse("content_block_start", {"type": "content_block_start", "index": block_idx,
                                            "content_block": {"type": "tool_use", "id": tc_id,
-                                           "name": tc.get("function", {}).get("name", ""), "input": {}}})
+                                           "name": tc_name, "input": {}}})
                                 open_blocks.append(block_idx)
                             if args := tc.get("function", {}).get("arguments", ""):
                                 stream_out_tokens += _estimate_tokens(args)
@@ -1899,7 +1919,8 @@ async def messages(request: Request):
                 await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
                              stream_in_est, stream_out_tokens, 0, success=False, error=str(e),
                              protocol=protocol, is_stream=True, thinking=thinking_type, effort=effort,
-                             client_ip=client_ip, account_alias=ak_h, tools=tool_names)
+                             client_ip=client_ip, account_alias=ak_h, tools=tool_names,
+                             tools_used=used_tools if used_tools else None)
                 if started:
                     for idx in open_blocks:
                         yield _sse("content_block_stop", {"type": "content_block_stop", "index": idx})
@@ -2014,9 +2035,10 @@ async def chat_completions(request: Request):
             req_out = usage.get("completion_tokens", 0)
             cache = _extract_cache_tokens(usage)
             _update_token_usage(model_id, req_in, req_out, cache)
+            used = [tc["function"]["name"] for tc in data.get("choices", [{}])[0].get("message", {}).get("tool_calls", [])]
             await _save_and_log_request(req_id, model_id, original_model, start_time,
                          req_in, req_out, cache, protocol, is_stream, thinking_type,
-                         effort, client_ip, account_alias, tool_names)
+                         effort, client_ip, account_alias, tool_names, tools_used=used if used else None)
             return Response(content=json.dumps(data, ensure_ascii=False), media_type="application/json")
 
         # ── OpenAI streaming passthrough ──
@@ -2030,6 +2052,7 @@ async def chat_completions(request: Request):
         async def openai_stream(hdrs):
             stream_out = 0
             actual_usage = None
+            used_tools = []
             _handle_429 = _make_stream_retry_loop("openai")
             for _attempt in range(2):
                 try:
@@ -2071,6 +2094,9 @@ async def chat_completions(request: Request):
                                     rc = delta.get("reasoning_content")
                                     if isinstance(rc, str):
                                         stream_out += _estimate_tokens(rc)
+                                    for tc in delta.get("tool_calls", []):
+                                        if isinstance(tc, dict) and "name" in tc.get("function", {}):
+                                            used_tools.append(tc["function"]["name"])
                             yield line.encode() + b"\n\n"
 
                         # Stream ended — finalize tracking
@@ -2080,7 +2106,8 @@ async def chat_completions(request: Request):
                         ak_h = _alias_for_key(_key_from_headers(hdrs, "openai"))
                         await _save_and_log_request(req_id, model_id, original_model, start_time,
                                      final_in, final_out, final_cache, protocol, True, thinking_type,
-                                     effort, client_ip, ak_h, tool_names, log_tag)
+                                     effort, client_ip, ak_h, tool_names, log_tag,
+                                     tools_used=used_tools if used_tools else None)
                 except Exception as e:
                     _log(f"  ERROR stream (attempt {_attempt+1}): {e}")
                     if _attempt == 0:
@@ -2141,9 +2168,10 @@ async def chat_completions(request: Request):
         req_out = usage.get("output_tokens", 0) or usage.get("completion_tokens", 0)
         req_cache = usage.get("cache_read_input_tokens", 0)
         _update_token_usage(model_id, req_in, req_out, req_cache)
+        used = [b["name"] for b in data.get("content", []) if b.get("type") == "tool_use"]
         await _save_and_log_request(req_id, model_id, original_model, start_time,
                      req_in, req_out, req_cache, protocol, is_stream, thinking_type,
-                     effort, client_ip, account_alias, tool_names)
+                     effort, client_ip, account_alias, tool_names, tools_used=used if used else None)
 
         oai_response = anthropic_to_openai_response(data, original_model)
         return Response(content=json.dumps(oai_response, ensure_ascii=False), media_type="application/json")
@@ -2282,9 +2310,10 @@ async def chat_completions(request: Request):
                             elif etype == "message_stop":
                                 _update_token_usage(model_id, total_input, stream_out, cache_read)
                                 ak = _alias_for_key(hdrs.get("x-api-key", ""))
+                                used_tools = [v["name"] for v in tool_data.values() if v.get("name")]
                                 await _save_and_log_request(req_id, model_id, original_model, start_time,
                                              total_input, stream_out, cache_read, protocol, True, thinking_type,
-                                             effort, client_ip, ak, tool_names)
+                                             effort, client_ip, ak, tool_names, tools_used=used_tools if used_tools else None)
                                 # Send final usage chunk for OpenAI streaming client
                                 total = total_input + stream_out
                                 usage_chunk = {
@@ -2429,9 +2458,10 @@ async def responses(request: Request):
             req_out = usage.get("output_tokens", 0) or usage.get("completion_tokens", 0)
             req_cache = usage.get("cache_read_input_tokens", 0)
             _update_token_usage(model_id, req_in, req_out, req_cache)
+            used = [b["name"] for b in data.get("content", []) if b.get("type") == "tool_use"]
             await _save_and_log_request(req_id, model_id, original_model, start_time,
                          req_in, req_out, req_cache, protocol, is_stream, thinking_type,
-                         effort, client_ip, account_alias, tool_names)
+                         effort, client_ip, account_alias, tool_names, tools_used=used if used else None)
             oai_resp = anthropic_to_openai_responses(data, original_model)
             return Response(content=json.dumps(oai_resp, ensure_ascii=False), media_type="application/json")
         # Anthropic streaming → collect, then emit SSE
@@ -2452,9 +2482,10 @@ async def responses(request: Request):
         req_out = usage.get("output_tokens", 0) or usage.get("completion_tokens", 0)
         req_cache = usage.get("cache_read_input_tokens", 0)
         _update_token_usage(model_id, req_in, req_out, req_cache)
+        used = [b["name"] for b in data.get("content", []) if b.get("type") == "tool_use"]
         await _save_and_log_request(req_id, model_id, original_model, start_time,
                      req_in, req_out, req_cache, protocol, True, thinking_type,
-                     effort, client_ip, account_alias, tool_names)
+                     effort, client_ip, account_alias, tool_names, tools_used=used if used else None)
         oai_resp = anthropic_to_openai_responses(data, original_model)
         payload = json.dumps({"type": "response.completed", "response": oai_resp}, ensure_ascii=False)
         sse_body = f"data: {payload}\n\ndata: [DONE]\n\n".encode()
@@ -2486,9 +2517,10 @@ async def responses(request: Request):
         req_out = usage.get("completion_tokens", 0)
         cache = _extract_cache_tokens(usage)
         _update_token_usage(model_id, req_in, req_out, cache)
+        used = [tc["function"]["name"] for tc in data.get("choices", [{}])[0].get("message", {}).get("tool_calls", [])]
         await _save_and_log_request(req_id, model_id, original_model, start_time,
                      req_in, req_out, cache, protocol, is_stream, thinking_type,
-                     effort, client_ip, account_alias, tool_names)
+                     effort, client_ip, account_alias, tool_names, tools_used=used if used else None)
         # Direct conversion: Chat Completions → Responses (no intermediate Anthropic format)
         oai_resp = openai_chat_to_responses(data, original_model)
         return Response(content=json.dumps(oai_resp, ensure_ascii=False), media_type="application/json")
@@ -2511,9 +2543,10 @@ async def responses(request: Request):
     req_out = usage.get("completion_tokens", 0)
     cache = _extract_cache_tokens(usage)
     _update_token_usage(model_id, req_in, req_out, cache)
+    used = [tc["function"]["name"] for tc in data.get("choices", [{}])[0].get("message", {}).get("tool_calls", [])]
     await _save_and_log_request(req_id, model_id, original_model, start_time,
                  req_in, req_out, cache, protocol, True, thinking_type,
-                 effort, client_ip, account_alias, tool_names)
+                 effort, client_ip, account_alias, tool_names, tools_used=used if used else None)
     # Direct conversion: Chat Completions → Responses (no intermediate Anthropic format)
     oai_resp = openai_chat_to_responses(data, original_model)
     # Return as single SSE block (data-only format)

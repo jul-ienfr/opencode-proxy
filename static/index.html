@@ -311,6 +311,9 @@
                 <div class="card">
                     <h2 data-i18n="config.tool_routing">Tool Routing</h2>
                     <p class="config-hint" data-i18n="config.tool_routing_desc">Assign a backend model to each tool detected in recent requests. Routes are created automatically as custom mappings.</p>
+                    <label style="display:flex;align-items:center;gap:8px;margin-bottom:8px;cursor:pointer;font-size:0.85em;">
+                        <input type="checkbox" id="tr-show-all"> <span data-i18n="config.tr_show_all">Show universal tools (Read, Write, Bash…)</span>
+                    </label>
                     <div class="tool-routes-table">
                         <table id="tool-routes-table">
                             <thead>

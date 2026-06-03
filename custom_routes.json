@@ -11,12 +11,6 @@
     ],
     "model": "mimo-v2.5"
   },
-  "minimaxm25": {
-    "match": [
-      "minimax-m2.5"
-    ],
-    "model": "mimo-v2.5"
-  },
   "qwen35plus": {
     "match": [
       "qwen3.5-plus"

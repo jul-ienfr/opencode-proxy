@@ -885,3 +885,6 @@ footer {
     text-transform: uppercase;
     vertical-align: middle;
 }
+
+/* ── Tools indicator ── */
+.tools-count { color: var(--text-muted); font-size: 0.8em; cursor: help; }
