@@ -19,6 +19,7 @@ from fastapi import FastAPI, Request, Response
 from fastapi.responses import StreamingResponse, JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse as StarletteJSONResponse
+from starlette.requests import ClientDisconnect
 
 from config import API_KEY, PROXY, MODELS, ROUTES, get_model_config, HOST, PORT, WEB_PORT, DISABLE_MAPPING, API_KEYS, API_KEY_ROUTING, CUSTOM_ROUTES, maybe_reload_custom_routes, CACHE_MIN_PROMPT_SIZE, DEBUG
 
@@ -545,7 +546,10 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
         # Skip rate limiting for excluded paths
         if path == "/health" or any(path.startswith(p) for p in self._SKIP_PREFIXES):
-            return await call_next(request)
+            try:
+                return await call_next(request)
+            except ClientDisconnect:
+                return StarletteJSONResponse(status_code=499, content={"error": "Client disconnected"})
 
         # Start cleanup task lazily on first request
         if self._cleanup_task is None or self._cleanup_task.done():
@@ -568,7 +572,10 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
         allowed, retry_after = await bucket.consume()
         if allowed:
-            return await call_next(request)
+            try:
+                return await call_next(request)
+            except ClientDisconnect:
+                return StarletteJSONResponse(status_code=499, content={"error": "Client disconnected"})
 
         # Rate limited — return 429 with Retry-After header
         retry_after_int = max(1, int(retry_after) + 1)
@@ -612,7 +619,11 @@ class AccessLogMiddleware(BaseHTTPMiddleware):
             client_ip = forwarded.split(",")[0].strip()
 
         start = time.monotonic()
-        response = await call_next(request)
+        try:
+            response = await call_next(request)
+        except ClientDisconnect:
+            _debug(f"  [access] client disconnected: {request.method} {path} {client_ip}")
+            return StarletteJSONResponse(status_code=499, content={"error": "Client disconnected"})
         elapsed_ms = (time.monotonic() - start) * 1000
 
         _log(f"{request.method} {path} {response.status_code} {elapsed_ms:.0f}ms {client_ip}")
@@ -984,6 +995,10 @@ async def _sse_keepalive(stream_gen, interval: float = _SSE_KEEPALIVE_INTERVAL):
             return
         except asyncio.TimeoutError:
             yield b": ping\n\n"
+        except Exception as e:
+            # ClientDisconnect, ConnectionResetError, etc. — client gone, stop gracefully
+            _debug(f"  [stream] keepalive exiting: {type(e).__name__}: {e}")
+            return
 
 
 def _route_for(model_name: str, tool_names: list = None) -> dict | None:

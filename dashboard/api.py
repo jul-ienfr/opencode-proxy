@@ -120,7 +120,12 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
     from starlette.middleware.base import BaseHTTPMiddleware
     class _StaticCacheMiddleware(BaseHTTPMiddleware):
         async def dispatch(self, request, call_next):
-            response = await call_next(request)
+            try:
+                response = await call_next(request)
+            except Exception:
+                # ClientDisconnect, ConnectionResetError, etc. — client gone
+                from starlette.responses import Response as StarletteResponse
+                return StarletteResponse(status_code=499)
             if request.url.path.startswith("/static/"):
                 response.headers["Cache-Control"] = "public, max-age=3600"
             return response
