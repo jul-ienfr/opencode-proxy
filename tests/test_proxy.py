@@ -48,7 +48,8 @@ class TestAnthropicToOpenAI:
         }
         result = anthropic_to_openai(body, "claude-3-opus")
         assert result["model"] == "claude-3-opus"
-        assert result["messages"] == [{"role": "user", "content": "Hello"}]
+        # cache_control is added to the last user message for prefix caching
+        assert result["messages"] == [{"role": "user", "content": "Hello", "cache_control": {"type": "ephemeral"}}]
         assert result["max_tokens"] == 1024
         assert result["stream"] is False
 
@@ -421,8 +422,14 @@ class TestBucket:
 
 @pytest.fixture(autouse=True)
 def _disable_mapping_off(monkeypatch):
-    """Force DISABLE_MAPPING=False for route tests."""
+    """Force DISABLE_MAPPING=False and clear custom routes for route tests."""
     monkeypatch.setattr(_opencode_mod, "DISABLE_MAPPING", False)
+    # Rebuild ROUTES without custom route overrides (use config.load_routes with empty custom)
+    from config import settings as _cfg_settings
+    monkeypatch.setattr(_cfg_settings, "CUSTOM_ROUTES", {})
+    _clean_routes = _cfg_settings.load_routes()
+    monkeypatch.setattr(_opencode_mod, "ROUTES", _clean_routes)
+    monkeypatch.setattr(_opencode_mod, "CUSTOM_ROUTES", {})
 
 
 class TestRouteFor:

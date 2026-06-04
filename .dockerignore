@@ -5,3 +5,14 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+.git/
+.pytest_cache/
+test_*.py
+tests/
+scripts/
+*.log
+*.err
+debug_dash.py
+proxy_debug.log
+CLAUDE.md
+.claude/

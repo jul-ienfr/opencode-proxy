@@ -478,7 +478,7 @@ app = FastAPI(lifespan=lifespan)
 @app.exception_handler(Exception)
 async def debug_exception(request: Request, exc: Exception):
     tb = traceback.format_exc()
-    client_ip = request.client.host if request.client else "unknown"
+    client_ip = _get_client_ip(request)
     _log(f"ERROR {request.method} {request.url.path} from {client_ip}: {type(exc).__name__}: {exc}")
     _debug(f"Traceback (500):\n{tb}")
     # Don't expose tracebacks to clients — log them server-side only
@@ -731,6 +731,22 @@ class UpstreamError(Exception):
         super().__init__(message)
         self.status_code = status_code
         self.original = original
+
+
+# ── Standardized error response helpers ──
+
+def _anthropic_error(status_code: int, message: str, error_type: str = "api_error") -> JSONResponse:
+    """Return an error in Anthropic Messages API format."""
+    return JSONResponse(status_code=status_code, content={
+        "type": "error",
+        "error": {"type": error_type, "message": message},
+    })
+
+def _openai_error(status_code: int, message: str, error_type: str = "invalid_request_error") -> JSONResponse:
+    """Return an error in OpenAI API format."""
+    return JSONResponse(status_code=status_code, content={
+        "error": {"message": message, "type": error_type, "code": str(status_code)},
+    })
 
 
 async def _forward_post(endpoint, json, headers):
@@ -1979,21 +1995,18 @@ async def _try_failover_key(hdrs: dict, err_status: int) -> dict:
 async def messages(request: Request):
     req_id = _fast_id("msg")
     start_time = time.time()
-    client_ip = request.client.host if request.client else "unknown"
-    forwarded = request.headers.get("x-forwarded-for")
-    if forwarded:
-        client_ip = forwarded.split(",")[0].strip()
+    client_ip = _get_client_ip(request)
 
     body_bytes = await request.body()
     if len(body_bytes) > MAX_BODY_SIZE:
         _debug(f"  413: body too large ({len(body_bytes)} bytes)")
-        return JSONResponse(status_code=413, content={"error": f"Request body too large ({len(body_bytes)} bytes, max {MAX_BODY_SIZE})"})
+        return _anthropic_error(413, f"Request body too large ({len(body_bytes)} bytes, max {MAX_BODY_SIZE})")
 
     try:
         body = json.loads(body_bytes)
     except Exception:
         _debug(f"  400: invalid JSON body")
-        return JSONResponse(status_code=400, content={"error": "invalid json"})
+        return _anthropic_error(400, "invalid json")
 
     original_model = body.get("model", "")
     tool_names = _extract_tool_names(body)
@@ -2040,7 +2053,7 @@ async def messages(request: Request):
     # Circuit breaker check
     if not _cb_should_allow(endpoint):
         _log(f"  CIRCUIT BREAKER OPEN — fast-failing request to {endpoint}")
-        return JSONResponse(status_code=503, content={"error": "Service temporarily unavailable (circuit breaker open)"})
+        return _anthropic_error(503, "Service temporarily unavailable (circuit breaker open)")
 
     # ── Anthropic pass-through ──────────────────────────────────
     if protocol == "anthropic":
@@ -2075,7 +2088,7 @@ async def messages(request: Request):
             except Exception:
                 _debug(f"  ✗ non-JSON response from {endpoint}")
                 _log(f"  UPSTREAM DECODE ERROR: non-JSON response from {endpoint}")
-                return JSONResponse(status_code=502, content={"error": "Upstream returned non-JSON response"})
+                return _anthropic_error(502, "Upstream returned non-JSON response")
             usage = data.get("usage", {})
             req_in = usage.get("input_tokens", 0) or usage.get("prompt_tokens", 0)
             req_out = usage.get("output_tokens", 0) or usage.get("completion_tokens", 0)
@@ -2239,7 +2252,7 @@ async def messages(request: Request):
     except Exception as e:
         _debug(f"[messages] ✗ conversion failed: {e}")
         _log(f"  CONVERSION ERROR: anthropic_to_openai failed: {type(e).__name__}: {e}")
-        return JSONResponse(status_code=400, content={"error": f"Request conversion failed: {e}"})
+        return _anthropic_error(400, f"Request conversion failed: {e}")
     headers = _get_auth_headers("openai")
     is_stream = oai_body["stream"]
 
@@ -2270,7 +2283,7 @@ async def messages(request: Request):
         except Exception:
             _debug(f"  ✗ non-JSON response from {endpoint}")
             _log(f"  UPSTREAM DECODE ERROR: non-JSON response from {endpoint}")
-            return JSONResponse(status_code=502, content={"error": "Upstream returned non-JSON response"})
+            return _anthropic_error(502, "Upstream returned non-JSON response")
         usage = data.get("usage", {})
         req_in = usage.get("prompt_tokens", 0)
         req_out = usage.get("completion_tokens", 0)
@@ -2532,7 +2545,7 @@ async def circuit_breakers_reset(request: Request):
     if target:
         cb = _circuit_breakers.get(target)
         if cb is None:
-            return JSONResponse(status_code=404, content={"error": f"No circuit breaker for {target}"})
+            return _anthropic_error(404, f"No circuit breaker for {target}")
         cb.record_success()
         _log(f"  CIRCUIT BREAKER RESET: {target}")
         return {"reset": target, "status": cb.get_status()}
@@ -2575,7 +2588,7 @@ async def count_tokens(request: Request):
     try:
         body = json.loads(await request.body())
     except Exception:
-        return JSONResponse(status_code=400, content={"error": "invalid json"})
+        return _anthropic_error(400, "invalid json")
     tokens = _estimate_input_tokens(body)
     return {"input_tokens": tokens}
 
@@ -2584,21 +2597,18 @@ async def count_tokens(request: Request):
 async def chat_completions(request: Request):
     req_id = _fast_id("chatcmpl")
     start_time = time.time()
-    client_ip = request.client.host if request.client else "unknown"
-    forwarded = request.headers.get("x-forwarded-for")
-    if forwarded:
-        client_ip = forwarded.split(",")[0].strip()
+    client_ip = _get_client_ip(request)
 
     body_bytes = await request.body()
     if len(body_bytes) > MAX_BODY_SIZE:
         _debug(f"  413: body too large ({len(body_bytes)} bytes)")
-        return JSONResponse(status_code=413, content={"error": f"Request body too large ({len(body_bytes)} bytes, max {MAX_BODY_SIZE})"})
+        return _openai_error(413, f"Request body too large ({len(body_bytes)} bytes, max {MAX_BODY_SIZE})")
 
     try:
         body = json.loads(body_bytes)
     except Exception:
         _debug(f"  400: invalid JSON body")
-        return JSONResponse(status_code=400, content={"error": "invalid json"})
+        return _openai_error(400, "invalid json")
 
     original_model = body.get("model", "")
     tool_names = _extract_tool_names(body)
@@ -2635,7 +2645,7 @@ async def chat_completions(request: Request):
     # Circuit breaker check
     if not _cb_should_allow(endpoint):
         _log(f"  CIRCUIT BREAKER OPEN — fast-failing request to {endpoint}")
-        return JSONResponse(status_code=503, content={"error": "Service temporarily unavailable (circuit breaker open)"})
+        return _openai_error(503, "Service temporarily unavailable (circuit breaker open)")
 
     # ── OpenAI passthrough ─────────────────────────────────────
     if protocol == "openai":
@@ -2657,7 +2667,7 @@ async def chat_completions(request: Request):
             except Exception:
                 _debug(f"  ✗ non-JSON response from {endpoint}")
                 _log(f"  UPSTREAM DECODE ERROR: non-JSON response from {endpoint}")
-                return JSONResponse(status_code=502, content={"error": "Upstream returned non-JSON response"})
+                return _openai_error(502, "Upstream returned non-JSON response")
             usage = data.get("usage", {})
             req_in = usage.get("prompt_tokens", 0)
             req_out = usage.get("completion_tokens", 0)
@@ -2802,7 +2812,7 @@ async def chat_completions(request: Request):
         except Exception:
             _debug(f"  ✗ non-JSON response from {endpoint}")
             _log(f"  UPSTREAM DECODE ERROR: non-JSON response from {endpoint}")
-            return JSONResponse(status_code=502, content={"error": "Upstream returned non-JSON response"})
+            return _openai_error(502, "Upstream returned non-JSON response")
         usage = data.get("usage", {})
         req_in = usage.get("input_tokens", 0) or usage.get("prompt_tokens", 0)
         req_out = usage.get("output_tokens", 0) or usage.get("completion_tokens", 0)
@@ -3003,21 +3013,18 @@ async def chat_completions(request: Request):
 async def responses(request: Request):
     req_id = _fast_id("resp")
     start_time = time.time()
-    client_ip = request.client.host if request.client else "unknown"
-    forwarded = request.headers.get("x-forwarded-for")
-    if forwarded:
-        client_ip = forwarded.split(",")[0].strip()
+    client_ip = _get_client_ip(request)
 
     body_bytes = await request.body()
     if len(body_bytes) > MAX_BODY_SIZE:
         _debug(f"  413: body too large ({len(body_bytes)} bytes)")
-        return JSONResponse(status_code=413, content={"error": f"Request body too large ({len(body_bytes)} bytes, max {MAX_BODY_SIZE})"})
+        return _openai_error(413, f"Request body too large ({len(body_bytes)} bytes, max {MAX_BODY_SIZE})")
 
     try:
         body = json.loads(body_bytes)
     except Exception:
         _debug(f"  400: invalid JSON body")
-        return JSONResponse(status_code=400, content={"error": "invalid json"})
+        return _openai_error(400, "invalid json")
 
     body = ensure_min_tokens(body)
 
@@ -3048,7 +3055,7 @@ async def responses(request: Request):
     # Circuit breaker check
     if not _cb_should_allow(endpoint):
         _log(f"  CIRCUIT BREAKER OPEN — fast-failing request to {endpoint}")
-        return JSONResponse(status_code=503, content={"error": "Service temporarily unavailable (circuit breaker open)"})
+        return _openai_error(503, "Service temporarily unavailable (circuit breaker open)")
 
     # Convert Responses API → Anthropic format
     anthro_body = openai_responses_to_anthropic(body)
@@ -3105,7 +3112,7 @@ async def responses(request: Request):
             except Exception:
                 _debug(f"  ✗ non-JSON response from {endpoint}")
                 _log(f"  UPSTREAM DECODE ERROR: non-JSON response from {endpoint}")
-                return JSONResponse(status_code=502, content={"error": "Upstream returned non-JSON response"})
+                return _openai_error(502, "Upstream returned non-JSON response")
             usage = data.get("usage", {})
             req_in = usage.get("input_tokens", 0) or usage.get("prompt_tokens", 0)
             req_out = usage.get("output_tokens", 0) or usage.get("completion_tokens", 0)
@@ -3137,7 +3144,7 @@ async def responses(request: Request):
         except Exception:
             _debug(f"  ✗ non-JSON response from {endpoint}")
             _log(f"  UPSTREAM DECODE ERROR: non-JSON response from {endpoint}")
-            return JSONResponse(status_code=502, content={"error": "Upstream returned non-JSON response"})
+            return _openai_error(502, "Upstream returned non-JSON response")
         usage = data.get("usage", {})
         req_in = usage.get("input_tokens", 0) or usage.get("prompt_tokens", 0)
         req_out = usage.get("output_tokens", 0) or usage.get("completion_tokens", 0)
@@ -3160,7 +3167,7 @@ async def responses(request: Request):
     except Exception as e:
         _debug(f"[responses] ✗ conversion failed: {e}")
         _log(f"  CONVERSION ERROR: anthropic_to_openai failed: {type(e).__name__}: {e}")
-        return JSONResponse(status_code=400, content={"error": f"Request conversion failed: {e}"})
+        return _openai_error(400, f"Request conversion failed: {e}")
     headers = _get_auth_headers("openai")
     is_stream = oai_body["stream"]
 
@@ -3185,7 +3192,7 @@ async def responses(request: Request):
         except Exception:
             _debug(f"  ✗ non-JSON response from {endpoint}")
             _log(f"  UPSTREAM DECODE ERROR: non-JSON response from {endpoint}")
-            return JSONResponse(status_code=502, content={"error": "Upstream returned non-JSON response"})
+            return _openai_error(502, "Upstream returned non-JSON response")
         usage = data.get("usage", {})
         req_in = usage.get("prompt_tokens", 0)
         req_out = usage.get("completion_tokens", 0)
@@ -3219,7 +3226,7 @@ async def responses(request: Request):
     except Exception:
         _debug(f"  ✗ non-JSON response from {endpoint}")
         _log(f"  UPSTREAM DECODE ERROR: non-JSON response from {endpoint}")
-        return JSONResponse(status_code=502, content={"error": "Upstream returned non-JSON response"})
+        return _openai_error(502, "Upstream returned non-JSON response")
     usage = data.get("usage", {})
     req_in = usage.get("prompt_tokens", 0)
     req_out = usage.get("completion_tokens", 0)

@@ -9,6 +9,8 @@ import collections
 import threading
 import logging
 
+import config.settings as _cfg_settings
+
 from rich.live import Live
 from rich.table import Table
 from rich.panel import Panel
@@ -22,13 +24,16 @@ _display_dirty = True  # Flag: set True when token usage changes, False after re
 
 # Debug file handle — set via set_debug_log_file() after LOG_DIR is known
 _debug_file = None
+_debug_write_counter = 0
+_DEBUG_FLUSH_INTERVAL = 10  # Flush to disk every N writes (reduces syscall overhead)
 
 
 def set_debug_log_file(path: str):
     """Open (or create) the debug log file. Called once at startup by opencode.py."""
-    global _debug_file
+    global _debug_file, _debug_write_counter
     try:
         _debug_file = open(path, "a", encoding="utf-8")
+        _debug_write_counter = 0
     except Exception:
         _debug_file = None
 
@@ -44,17 +49,20 @@ def log(msg: str):
 
 def debug(msg: str):
     """Emit a debug message to terminal + debug.log file. No-op when DEBUG is off."""
-    import config.settings as _cfg
-    if not _cfg.DEBUG:
+    if not _cfg_settings.DEBUG:
         return
     # Write to terminal / web dashboard
     log(f"[DEBUG] {msg}")
-    # Write to debug.log file
+    # Write to debug.log file (buffered: flush every N writes to reduce syscall overhead)
     if _debug_file is not None:
         try:
+            global _debug_write_counter
             ts = time.strftime("%Y-%m-%d %H:%M:%S")
             _debug_file.write(f"[{ts}] {msg}\n")
-            _debug_file.flush()
+            _debug_write_counter += 1
+            if _debug_write_counter >= _DEBUG_FLUSH_INTERVAL:
+                _debug_file.flush()
+                _debug_write_counter = 0
         except Exception:
             pass
 
@@ -65,18 +73,21 @@ class RichLogHandler(logging.Handler):
         if "/api/" in msg or "Uvicorn running" in msg:
             return
         # When DEBUG is on, forward all levels (including DEBUG) to the log panel
-        import config.settings as _cfg
-        if not _cfg.DEBUG and record.levelno < logging.WARNING:
+        if not _cfg_settings.DEBUG and record.levelno < logging.WARNING:
             return
         level = record.levelname
         ts = time.strftime("%H:%M:%S")
         log_lines.append(f"[{ts}] [{level}] {msg}")
-        # Also write DEBUG-level messages to the debug.log file
-        if _cfg.DEBUG and _debug_file is not None and record.levelno <= logging.DEBUG:
+        # Also write DEBUG-level messages to the debug.log file (buffered flush)
+        if _cfg_settings.DEBUG and _debug_file is not None and record.levelno <= logging.DEBUG:
             try:
+                global _debug_write_counter
                 fts = time.strftime("%Y-%m-%d %H:%M:%S")
                 _debug_file.write(f"[{fts}] [{level}] {msg}\n")
-                _debug_file.flush()
+                _debug_write_counter += 1
+                if _debug_write_counter >= _DEBUG_FLUSH_INTERVAL:
+                    _debug_file.flush()
+                    _debug_write_counter = 0
             except Exception:
                 pass
 

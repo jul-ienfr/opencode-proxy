@@ -28,6 +28,7 @@ class _TTLCache:
     def __init__(self, ttl: float = 10.0):
         self._ttl = ttl
         self._store: dict[str, tuple[float, any]] = {}
+        self._cleanup_counter = 0
 
     def get(self, key: str):
         entry = self._store.get(key)
@@ -37,6 +38,16 @@ class _TTLCache:
 
     def set(self, key: str, value):
         self._store[key] = (time.monotonic(), value)
+        self._cleanup_counter += 1
+        if self._cleanup_counter >= 50:
+            self._cleanup_counter = 0
+            self._evict_expired()
+
+    def _evict_expired(self):
+        now = time.monotonic()
+        expired = [k for k, (ts, _) in self._store.items() if (now - ts) >= self._ttl]
+        for k in expired:
+            del self._store[k]
 
     def invalidate(self, key: str | None = None):
         if key:
@@ -105,10 +116,30 @@ def daysAgo(n: int) -> str:
 
 
 def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_usage=None, token_lock=None):
+    # Add Cache-Control headers for static assets (JS/CSS/HTML)
+    from starlette.middleware.base import BaseHTTPMiddleware
+    class _StaticCacheMiddleware(BaseHTTPMiddleware):
+        async def dispatch(self, request, call_next):
+            response = await call_next(request)
+            if request.url.path.startswith("/static/"):
+                response.headers["Cache-Control"] = "public, max-age=3600"
+            return response
+    app.add_middleware(_StaticCacheMiddleware)
+
     app.mount("/static", StaticFiles(directory=static_dir), name="static")
+
+    # Cache index.html in memory — avoids re-reading from disk on every request
+    _index_html_cache: bytes | None = None
+    try:
+        with open(os.path.join(static_dir, "index.html"), "rb") as _f:
+            _index_html_cache = _f.read()
+    except Exception:
+        pass
 
     @app.get("/")
     async def root():
+        if _index_html_cache is not None:
+            return Response(content=_index_html_cache, media_type="text/html; charset=utf-8")
         from fastapi.responses import FileResponse
         return FileResponse(os.path.join(static_dir, "index.html"))
 
@@ -474,18 +505,20 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
 
     @app.get("/api/debug/logs")
     async def get_debug_logs(limit: int = 500, offset: int = 0):
-        """Return lines from logs/debug.log, most recent first."""
+        """Return lines from logs/debug.log, most recent first (memory-safe)."""
         log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs")
         debug_log_path = os.path.join(log_dir, "debug.log")
+        MAX_READ_SIZE = 10 * 1024 * 1024  # 10MB safety limit
         try:
             if not os.path.exists(debug_log_path):
                 return {"logs": [], "total": 0, "has_more": False}
+            file_size = os.path.getsize(debug_log_path)
+            if file_size > MAX_READ_SIZE:
+                return {"logs": [], "total": 0, "has_more": False, "error": "Debug log too large (>10MB), truncate it first"}
             with open(debug_log_path, "r", encoding="utf-8", errors="replace") as f:
                 all_lines = f.readlines()
             total = len(all_lines)
-            # Most recent first
-            all_lines = list(reversed(all_lines))
-            page = [line.rstrip("\n") for line in all_lines[offset:offset + limit]]
+            page = [line.rstrip("\n") for line in reversed(all_lines[offset:offset + limit])]
             return {
                 "logs": page,
                 "total": total,
@@ -547,6 +580,11 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
     async def get_tools(days: int = 7, all: bool = False):
         """Aggregate tool names from recent requests.
         Set ?all=true to include universal tools (Read, Write, etc.)."""
+        cache_key = f"tools:{days}:{all}"
+        cached = _tools_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
         where, params = _build_where(daysAgo(days), None)
         def _query_tools():
             return conn.execute(
@@ -583,6 +621,7 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
                     routed_to = route_info.get("model")
                     break
             result.append({"name": name, "count": count, "routed_to": routed_to})
+        _tools_cache.set(cache_key, result)
         return result
 
     # ── Stats & history ──
