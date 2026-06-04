@@ -2204,7 +2204,14 @@ async def messages(request: Request):
                     _debug(f"  [stream] exception on attempt {_attempt+1}: {type(e).__name__}: {e}")
                     _log(f"  ERROR stream (attempt {_attempt+1}): {type(e).__name__}: {e}")
                     if _attempt == 0:
-                        continue  # retry once on connection error
+                        # Try alternative key on retry
+                        failed_key = _key_from_headers(headers, "anthropic")
+                        alt = _find_alternative_key(failed_key)
+                        if alt:
+                            _debug(f"  ⟳ stream retry with alt key: alias={alt.get('alias', '?')}")
+                            _log(f"  Retrying stream with alternative key: {alt.get('alias', '?')}")
+                            headers = _get_auth_headers("anthropic", entry=alt)
+                        continue
                     if stream_in is None:
                         try:
                             with _token_lock:
@@ -2447,8 +2454,16 @@ async def messages(request: Request):
                                            "delta": {"type": "input_json_delta", "partial_json": args}})
             except Exception as e:
                 _log(f"  ERROR stream (attempt {_attempt+1}): {type(e).__name__}: {e}")
+                _debug(f"  ✗ stream exception: {type(e).__name__}: {e}")
                 if _attempt == 0:
-                    continue  # retry once on connection error
+                    # Try alternative key on retry (handles rate-limit disguised as disconnect)
+                    failed_key = _key_from_headers(hdrs, "openai")
+                    alt = _find_alternative_key(failed_key)
+                    if alt:
+                        _debug(f"  ⟳ stream retry with alt key: alias={alt.get('alias', '?')}")
+                        _log(f"  Retrying stream with alternative key: {alt.get('alias', '?')}")
+                        hdrs = _get_auth_headers("openai", entry=alt)
+                    continue
                 try:
                     with _token_lock:
                         _token_usage[model_id]["input"] -= stream_in_est
@@ -2749,8 +2764,16 @@ async def chat_completions(request: Request):
                                      tools_used=used_tools if used_tools else None)
                 except Exception as e:
                     _log(f"  ERROR stream (attempt {_attempt+1}): {type(e).__name__}: {e}")
+                    _debug(f"  ✗ stream exception: {type(e).__name__}: {e}")
                     if _attempt == 0:
-                        continue  # retry once on connection error
+                        # Try alternative key on retry
+                        failed_key = _key_from_headers(hdrs, "openai")
+                        alt = _find_alternative_key(failed_key)
+                        if alt:
+                            _debug(f"  ⟳ stream retry with alt key: alias={alt.get('alias', '?')}")
+                            _log(f"  Retrying stream with alternative key: {alt.get('alias', '?')}")
+                            hdrs = _get_auth_headers("openai", entry=alt)
+                        continue
                     try:
                         with _token_lock:
                             _token_usage[model_id]["input"] -= est_input
@@ -2983,8 +3006,16 @@ async def chat_completions(request: Request):
                                 return
             except Exception as e:
                 _log(f"  ERROR stream (attempt {_attempt+1}): {type(e).__name__}: {e}")
+                _debug(f"  ✗ stream exception: {type(e).__name__}: {e}")
                 if _attempt == 0:
-                    continue  # retry once on connection error
+                    # Try alternative key on retry
+                    failed_key = _key_from_headers(hdrs, "anthropic")
+                    alt = _find_alternative_key(failed_key)
+                    if alt:
+                        _debug(f"  ⟳ stream retry with alt key: alias={alt.get('alias', '?')}")
+                        _log(f"  Retrying stream with alternative key: {alt.get('alias', '?')}")
+                        hdrs = _get_auth_headers("anthropic", entry=alt)
+                    continue
                 ak = _alias_for_key(hdrs.get("x-api-key", ""))
                 await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
                              total_input or 0, stream_out, 0, success=False, error=str(e),
