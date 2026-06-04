@@ -668,10 +668,15 @@ async def _do_request_with_retry(endpoint, body, headers, protocol, retry_on_429
 
 def _update_token_usage(model_id, inp, out, cache):
     """Thread-safe update of in-memory token counters."""
-    with _token_lock:
-        _token_usage[model_id]["input"] += inp
-        _token_usage[model_id]["output"] += out
-        _token_usage[model_id]["cache"] += cache
+    try:
+        with _token_lock:
+            if model_id not in _token_usage:
+                _token_usage[model_id] = {"input": 0, "output": 0, "cache": 0}
+            _token_usage[model_id]["input"] += inp
+            _token_usage[model_id]["output"] += out
+            _token_usage[model_id]["cache"] += cache
+    except Exception as e:
+        _log(f"  WARN: _update_token_usage failed for {model_id!r}: {type(e).__name__}: {e}")
 
 
 async def _save_and_log_request(req_id, model_id, original_model, start_time,
@@ -681,11 +686,14 @@ async def _save_and_log_request(req_id, model_id, original_model, start_time,
     """Log success and save to DB with success=True."""
     alias_tag = f" | account={account_alias}" if account_alias else ""
     _log(f"  ← {model_id} | +{inp} in{log_tag} | +{out} out{log_tag} | +{cache} cache{alias_tag}")
-    await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
-                 inp, out, cache, success=True,
-                 protocol=protocol, is_stream=is_stream, thinking=thinking_type, effort=effort,
-                 client_ip=client_ip, account_alias=account_alias, tools=tools,
-                 tools_used=tools_used)
+    try:
+        await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
+                     inp, out, cache, success=True,
+                     protocol=protocol, is_stream=is_stream, thinking=thinking_type, effort=effort,
+                     client_ip=client_ip, account_alias=account_alias, tools=tools,
+                     tools_used=tools_used)
+    except Exception as e:
+        _log(f"  WARN: save_request failed: {type(e).__name__}: {e}")
 
 
 async def _log_and_save_error(req_id, model_id, original_model, start_time,
@@ -693,11 +701,14 @@ async def _log_and_save_error(req_id, model_id, original_model, start_time,
                                effort, client_ip, account_alias, tools, tools_used=None):
     """Log error and save to DB with success=False."""
     _log(f"  ERROR {status_code}: {resp_text[:300]}")
-    await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
-                 0, 0, 0, success=False, error=f"HTTP {status_code}",
-                 protocol=protocol, is_stream=is_stream, thinking=thinking_type, effort=effort,
-                 client_ip=client_ip, account_alias=account_alias, tools=tools,
-                 tools_used=tools_used)
+    try:
+        await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
+                     0, 0, 0, success=False, error=f"HTTP {status_code}",
+                     protocol=protocol, is_stream=is_stream, thinking=thinking_type, effort=effort,
+                     client_ip=client_ip, account_alias=account_alias, tools=tools,
+                     tools_used=tools_used)
+    except Exception as e:
+        _log(f"  WARN: save_request (error path) failed: {type(e).__name__}: {e}")
 
 
 # ── Streaming helpers ───────────────────────────────────────────
@@ -744,27 +755,30 @@ def _finalize_stream_tokens(model_id, est_input, stream_in, stream_out, stream_c
     final_cache = stream_cache
     log_tag = ""
 
-    if actual_usage:
-        final_in = actual_usage.get("prompt_tokens") or final_in
-        final_out = actual_usage.get("completion_tokens")
-        if final_out is None:
-            total = actual_usage.get("total_tokens")
-            prompt = actual_usage.get("prompt_tokens")
-            if total is not None and prompt is not None:
-                final_out = total - prompt
-        final_out = final_out or stream_out
-        final_cache = _extract_cache_tokens(actual_usage)
-        log_tag = ""
-        with _token_lock:
-            _token_usage[model_id]["input"] -= est_input
-            _token_usage[model_id]["input"] += final_in
-            _token_usage[model_id]["output"] += final_out
-            if final_cache:
-                _token_usage[model_id]["cache"] += final_cache
-    else:
-        log_tag = " (est)"
-        with _token_lock:
-            _token_usage[model_id]["output"] += stream_out
+    try:
+        if actual_usage:
+            final_in = actual_usage.get("prompt_tokens") or final_in
+            final_out = actual_usage.get("completion_tokens")
+            if final_out is None:
+                total = actual_usage.get("total_tokens")
+                prompt = actual_usage.get("prompt_tokens")
+                if total is not None and prompt is not None:
+                    final_out = total - prompt
+            final_out = final_out or stream_out
+            final_cache = _extract_cache_tokens(actual_usage)
+            log_tag = ""
+            with _token_lock:
+                _token_usage[model_id]["input"] -= est_input
+                _token_usage[model_id]["input"] += final_in
+                _token_usage[model_id]["output"] += final_out
+                if final_cache:
+                    _token_usage[model_id]["cache"] += final_cache
+        else:
+            log_tag = " (est)"
+            with _token_lock:
+                _token_usage[model_id]["output"] += stream_out
+    except Exception as e:
+        _log(f"  WARN: _finalize_stream_tokens failed for {model_id!r}: {type(e).__name__}: {e}")
 
     return final_in, final_out, final_cache, log_tag
 
@@ -1644,48 +1658,52 @@ def _estimate_tokens(text: str) -> int:
 
 def _estimate_input_tokens(body: dict) -> int:
     """Estimate input tokens from message content, tools, and tool_results."""
-    chunks = []
+    try:
+        chunks = []
 
-    # System prompt
-    system = body.get("system", "")
-    if isinstance(system, str):
-        chunks.append(system)
-    elif isinstance(system, list):
-        for s in system:
-            if isinstance(s, str):
-                chunks.append(s)
-            elif isinstance(s, dict):
-                chunks.append(s.get("text", ""))
+        # System prompt
+        system = body.get("system", "")
+        if isinstance(system, str):
+            chunks.append(system)
+        elif isinstance(system, list):
+            for s in system:
+                if isinstance(s, str):
+                    chunks.append(s)
+                elif isinstance(s, dict):
+                    chunks.append(s.get("text", ""))
 
-    # Tools definitions
-    for tool in body.get("tools", []):
-        chunks.append(tool.get("name", ""))
-        chunks.append(tool.get("description", ""))
-        chunks.append(str(tool.get("input_schema", {})))
+        # Tools definitions
+        for tool in body.get("tools", []):
+            chunks.append(tool.get("name", ""))
+            chunks.append(tool.get("description", ""))
+            chunks.append(str(tool.get("input_schema", {})))
 
-    # Messages
-    for msg in body.get("messages", []):
-        content = msg.get("content", "")
-        if isinstance(content, str):
-            chunks.append(content)
-        elif isinstance(content, list):
-            for block in content:
-                if isinstance(block, str):
-                    chunks.append(block)
-                elif isinstance(block, dict):
-                    btype = block.get("type", "")
-                    if btype == "tool_result":
-                        chunks.append(_extract_text(block.get("content", "")))
-                    elif btype == "thinking":
-                        chunks.append(block.get("thinking", ""))
-                    else:
-                        chunks.append(block.get("text", ""))
-                        chunks.append(str(block.get("input", "")))
+        # Messages
+        for msg in body.get("messages", []):
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                chunks.append(content)
+            elif isinstance(content, list):
+                for block in content:
+                    if isinstance(block, str):
+                        chunks.append(block)
+                    elif isinstance(block, dict):
+                        btype = block.get("type", "")
+                        if btype == "tool_result":
+                            chunks.append(_extract_text(block.get("content", "")))
+                        elif btype == "thinking":
+                            chunks.append(block.get("thinking", ""))
+                        else:
+                            chunks.append(block.get("text", ""))
+                            chunks.append(str(block.get("input", "")))
 
-    combined = "\n".join(chunks)
-    if _encoding:
-        return len(_encoding.encode(combined))
-    return max(1, len(combined) // 3)
+        combined = "\n".join(chunks)
+        if _encoding:
+            return len(_encoding.encode(combined))
+        return max(1, len(combined) // 3)
+    except Exception as e:
+        _log(f"  WARN: token estimation failed: {type(e).__name__}: {e}")
+        return 0
 
 
 def _extract_cache_tokens(usage: dict) -> int:
@@ -1945,7 +1963,11 @@ async def messages(request: Request):
                                  headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
 
     # ── OpenAI-protocol ─────────────────────────────────────────
-    oai_body = anthropic_to_openai(body, model_id)
+    try:
+        oai_body = anthropic_to_openai(body, model_id)
+    except Exception as e:
+        _log(f"  CONVERSION ERROR: anthropic_to_openai failed: {type(e).__name__}: {e}")
+        return JSONResponse(status_code=400, content={"error": f"Request conversion failed: {e}"})
     headers = _get_auth_headers("openai")
     is_stream = oai_body["stream"]
 
@@ -1969,7 +1991,11 @@ async def messages(request: Request):
             anthro_err = json.dumps({"type": "error", "error": {"type": "api_error", "message": f"HTTP {resp.status_code}: {err_msg}"}},
                                     ensure_ascii=False)
             return Response(content=anthro_err, status_code=resp.status_code, media_type="application/json")
-        data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+        try:
+            data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+        except Exception:
+            _log(f"  UPSTREAM DECODE ERROR: non-JSON response from {endpoint}")
+            return JSONResponse(status_code=502, content={"error": "Upstream returned non-JSON response"})
         usage = data.get("usage", {})
         req_in = usage.get("prompt_tokens", 0)
         req_out = usage.get("completion_tokens", 0)
@@ -2310,7 +2336,11 @@ async def chat_completions(request: Request):
                              resp.status_code, resp.text, protocol, is_stream, thinking_type,
                              effort, client_ip, account_alias, tool_names)
                 return Response(content=resp.content, status_code=resp.status_code, media_type="application/json")
-            data = resp.json()
+            try:
+                data = resp.json()
+            except Exception:
+                _log(f"  UPSTREAM DECODE ERROR: non-JSON response from {endpoint}")
+                return JSONResponse(status_code=502, content={"error": "Upstream returned non-JSON response"})
             usage = data.get("usage", {})
             req_in = usage.get("prompt_tokens", 0)
             req_out = usage.get("completion_tokens", 0)
@@ -2784,7 +2814,11 @@ async def responses(request: Request):
 
     # ── OpenAI backend (double conversion) ──────────────────
     # Convert Anthropic → Chat Completions for the backend
-    oai_body = anthropic_to_openai(anthro_body, model_id)
+    try:
+        oai_body = anthropic_to_openai(anthro_body, model_id)
+    except Exception as e:
+        _log(f"  CONVERSION ERROR: anthropic_to_openai failed: {type(e).__name__}: {e}")
+        return JSONResponse(status_code=400, content={"error": f"Request conversion failed: {e}"})
     headers = _get_auth_headers("openai")
     is_stream = oai_body["stream"]
 
