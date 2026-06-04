@@ -3,7 +3,8 @@
     "match": [
       "mimo-v2.5"
     ],
-    "model": "mimo-v2.5"
+    "model": "mimo-v2.5",
+    "thinking": "adaptive"
   },
   "mimov25pro": {
     "match": [
@@ -15,7 +16,8 @@
     "match": [
       "qwen3.5-plus"
     ],
-    "model": "mimo-v2.5"
+    "model": "mimo-v2.5",
+    "thinking": "adaptive"
   },
   "gpt54mini": {
     "match": [

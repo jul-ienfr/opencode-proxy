@@ -510,20 +510,61 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
 
     @app.get("/api/debug/logs")
     async def get_debug_logs(limit: int = 500, offset: int = 0):
-        """Return lines from logs/debug.log, most recent first (memory-safe)."""
+        """Return lines from logs/debug.log, most recent first.
+        Auto-rotation keeps the file ≤50MB so full-read is the normal path;
+        falls back to tail-reading for files that somehow exceed that."""
         log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs")
         debug_log_path = os.path.join(log_dir, "debug.log")
-        MAX_READ_SIZE = 10 * 1024 * 1024  # 10MB safety limit
         try:
             if not os.path.exists(debug_log_path):
                 return {"logs": [], "total": 0, "has_more": False}
+
             file_size = os.path.getsize(debug_log_path)
-            if file_size > MAX_READ_SIZE:
-                return {"logs": [], "total": 0, "has_more": False, "error": "Debug log too large (>10MB), truncate it first"}
-            with open(debug_log_path, "r", encoding="utf-8", errors="replace") as f:
-                all_lines = f.readlines()
-            total = len(all_lines)
-            page = [line.rstrip("\n") for line in reversed(all_lines[offset:offset + limit])]
+            if file_size == 0:
+                return {"logs": [], "total": 0, "has_more": False}
+
+            MAX_FULL_READ = 50 * 1024 * 1024  # 50 MB — matches rotation threshold
+
+            def _read_all():
+                """Read the whole file (fine for files up to 50 MB)."""
+                with open(debug_log_path, "r", encoding="utf-8", errors="replace") as f:
+                    all_lines = f.readlines()
+                total = len(all_lines)
+                # Most-recent-first, paginated
+                reversed_lines = [line.rstrip("\n") for line in reversed(all_lines)]
+                page = reversed_lines[offset:offset + limit]
+                return page, total
+
+            def _read_tail():
+                """Read from the end of a large file.
+                Reads up to 10 MB from EOF — enough for thousands of lines."""
+                with open(debug_log_path, "rb") as f:
+                    f.seek(0, 2)
+                    file_size = f.tell()
+
+                    # Read up to 10 MB from end
+                    read_size = min(file_size, 10 * 1024 * 1024)
+                    f.seek(file_size - read_size)
+                    data = f.read().decode("utf-8", errors="replace")
+
+                lines = data.split("\n")
+                # Discard partial first line (continuation from before our window)
+                if file_size > read_size and len(lines) > 1:
+                    lines = lines[1:]
+                # Discard trailing empty from final newline
+                if lines and lines[-1] == "":
+                    lines = lines[:-1]
+
+                total = len(lines)
+                reversed_lines = list(reversed(lines))
+                page = reversed_lines[offset:offset + limit]
+                return page, total
+
+            if file_size <= MAX_FULL_READ:
+                page, total = await asyncio.to_thread(_read_all)
+            else:
+                page, total = await asyncio.to_thread(_read_tail)
+
             return {
                 "logs": page,
                 "total": total,

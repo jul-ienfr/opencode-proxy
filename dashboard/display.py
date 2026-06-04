@@ -24,16 +24,40 @@ _display_dirty = True  # Flag: set True when token usage changes, False after re
 
 # Debug file handle — set via set_debug_log_file() after LOG_DIR is known
 _debug_file = None
+_debug_file_path = None
 _debug_write_counter = 0
 _DEBUG_FLUSH_INTERVAL = 10  # Flush to disk every N writes (reduces syscall overhead)
+_DEBUG_MAX_SIZE = 50 * 1024 * 1024  # Auto-rotate when file exceeds 50 MB
+
+
+def _rotate_debug_log():
+    """Rotate debug.log → debug.log.1 when it exceeds _DEBUG_MAX_SIZE."""
+    global _debug_file, _debug_file_path
+    if _debug_file is None or _debug_file_path is None:
+        return
+    try:
+        size = os.path.getsize(_debug_file_path)
+        if size <= _DEBUG_MAX_SIZE:
+            return
+        _debug_file.close()
+        rotated = _debug_file_path + ".1"
+        if os.path.exists(rotated):
+            os.remove(rotated)
+        os.rename(_debug_file_path, rotated)
+        _debug_file = open(_debug_file_path, "a", encoding="utf-8")
+        _debug_write_counter = 0
+    except Exception:
+        pass
 
 
 def set_debug_log_file(path: str):
     """Open (or create) the debug log file. Called once at startup by opencode.py."""
-    global _debug_file, _debug_write_counter
+    global _debug_file, _debug_file_path, _debug_write_counter
+    _debug_file_path = path
     try:
         _debug_file = open(path, "a", encoding="utf-8")
         _debug_write_counter = 0
+        _rotate_debug_log()  # Rotate if needed at startup
     except Exception:
         _debug_file = None
 
@@ -57,6 +81,7 @@ def debug(msg: str):
     if _debug_file is not None:
         try:
             global _debug_write_counter
+            _rotate_debug_log()  # Auto-rotate if file is too large
             ts = time.strftime("%Y-%m-%d %H:%M:%S")
             _debug_file.write(f"[{ts}] {msg}\n")
             _debug_write_counter += 1
@@ -82,6 +107,7 @@ class RichLogHandler(logging.Handler):
         if _cfg_settings.DEBUG and _debug_file is not None and record.levelno <= logging.DEBUG:
             try:
                 global _debug_write_counter
+                _rotate_debug_log()  # Auto-rotate if file is too large
                 fts = time.strftime("%Y-%m-%d %H:%M:%S")
                 _debug_file.write(f"[{fts}] [{level}] {msg}\n")
                 _debug_write_counter += 1

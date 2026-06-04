@@ -577,10 +577,10 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
             except ClientDisconnect:
                 return StarletteJSONResponse(status_code=499, content={"error": "Client disconnected"})
 
-        # Rate limited — return 429 with Retry-After header
+        # Rate limited — return 503 (not 429) to avoid Claude Code auth window
         retry_after_int = max(1, int(retry_after) + 1)
         return StarletteJSONResponse(
-            status_code=429,
+            status_code=503,
             content={"error": "Rate limit exceeded. Try again shortly."},
             headers={"Retry-After": str(retry_after_int)},
         )
@@ -2093,10 +2093,15 @@ async def messages(request: Request):
                 return JSONResponse(status_code=e.status_code, content={"error": str(e)})
             account_alias = _alias_for_key(a_headers.get("x-api-key", ""))
             if resp.status_code != 200:
-                _debug(f"  ✗ upstream {resp.status_code}: {resp.text[:500]}")
+                # Convert 429 → 503 to avoid Claude Code auth window on quota exhaustion
+                status = 503 if resp.status_code == 429 else resp.status_code
+                msg = "All API keys exhausted (rate limited). Try again later." if resp.status_code == 429 else resp.text[:500]
+                _debug(f"  ✗ upstream {resp.status_code} → client {status}: {msg[:300]}")
                 await _log_and_save_error(req_id, model_id, original_model, start_time,
                              resp.status_code, resp.text, protocol, is_stream, thinking_type,
                              effort, client_ip, account_alias, tool_names)
+                if resp.status_code == 429:
+                    return _anthropic_error(503, msg)
                 return Response(content=resp.content, status_code=resp.status_code, media_type="application/json")
             try:
                 data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
@@ -2147,10 +2152,13 @@ async def messages(request: Request):
                             err = await resp.aread()
                             ak = _alias_for_key(headers.get("x-api-key", ""))
                             _debug(f"  [stream] error {resp.status_code}: {err[:300]}")
+                            # Convert 429 → 503 to avoid Claude Code auth window on quota exhaustion
+                            err_status = 503 if resp.status_code == 429 else resp.status_code
+                            err_msg = "All API keys exhausted (rate limited). Try again later." if resp.status_code == 429 else f"HTTP {resp.status_code}: {err.decode('utf-8', errors='replace')[:200]}"
                             error_payload = {"type": "error", "error": {"type": "api_error",
-                                           "message": f"HTTP {resp.status_code}: {err.decode('utf-8', errors='replace')[:200]}"}}
+                                           "message": err_msg}}
                             yield await _stream_error_response(req_id, model_id, original_model, start_time,
-                                         resp.status_code, err, protocol, thinking_type, effort,
+                                         err_status, err, protocol, thinking_type, effort,
                                          client_ip, ak, tool_names, error_payload)
                             return
                         async for chunk in resp.aiter_bytes():
@@ -2290,6 +2298,9 @@ async def messages(request: Request):
             await _log_and_save_error(req_id, model_id, original_model, start_time,
                          resp.status_code, resp.text, protocol, is_stream, thinking_type,
                          effort, client_ip, account_alias, tool_names)
+            # Convert 429 → 503 to avoid Claude Code auth window on quota exhaustion
+            if resp.status_code == 429:
+                return _anthropic_error(503, "All API keys exhausted (rate limited). Try again later.")
             try:
                 err_data = resp.json()
                 err_msg = err_data.get("error", {})
@@ -2353,10 +2364,13 @@ async def messages(request: Request):
                             continue
                         err = await resp.aread()
                         ak_h = _alias_for_key(_key_from_headers(hdrs, "openai"))
+                        # Convert 429 → 503 to avoid Claude Code auth window on quota exhaustion
+                        err_status = 503 if resp.status_code == 429 else resp.status_code
+                        err_msg = "All API keys exhausted (rate limited). Try again later." if resp.status_code == 429 else f"HTTP {resp.status_code}: {err.decode('utf-8', errors='replace')[:200]}"
                         error_payload = {"type": "error", "error": {"type": "api_error",
-                                       "message": f"HTTP {resp.status_code}: {err.decode('utf-8', errors='replace')[:200]}"}}
+                                       "message": err_msg}}
                         yield await _stream_error_response(req_id, model_id, original_model, start_time,
-                                     resp.status_code, err, protocol, thinking_type, effort,
+                                     err_status, err, protocol, thinking_type, effort,
                                      client_ip, ak_h, tool_names, error_payload)
                         return
 
@@ -2735,7 +2749,10 @@ async def chat_completions(request: Request):
                             await _log_and_save_error(req_id, model_id, original_model, start_time,
                                          resp.status_code, err, protocol, True, thinking_type,
                                          effort, client_ip, ak_h, tool_names)
-                            yield b"data: " + json.dumps({"error": {"message": f"HTTP {resp.status_code}"}}, ensure_ascii=False).encode() + b"\n\ndata: [DONE]\n\n"
+                            # Convert 429 → 503 to avoid Claude Code auth window on quota exhaustion
+                            err_status = 503 if resp.status_code == 429 else resp.status_code
+                            err_msg = "All API keys exhausted (rate limited). Try again later." if resp.status_code == 429 else f"HTTP {resp.status_code}"
+                            yield b"data: " + json.dumps({"error": {"message": err_msg}}, ensure_ascii=False).encode() + b"\n\ndata: [DONE]\n\n"
                             return
 
                         async for line in resp.aiter_lines():
@@ -2900,7 +2917,10 @@ async def chat_completions(request: Request):
                         await _log_and_save_error(req_id, model_id, original_model, start_time,
                                      resp.status_code, str(resp.status_code), protocol, True, thinking_type,
                                      effort, client_ip, ak, tool_names)
-                        yield b"data: " + json.dumps({"error": {"message": f"HTTP {resp.status_code}"}}, ensure_ascii=False).encode() + b"\n\ndata: [DONE]\n\n"
+                        # Convert 429 → 503 to avoid Claude Code auth window on quota exhaustion
+                        err_status = 503 if resp.status_code == 429 else resp.status_code
+                        err_msg = "All API keys exhausted (rate limited). Try again later." if resp.status_code == 429 else f"HTTP {resp.status_code}"
+                        yield b"data: " + json.dumps({"error": {"message": err_msg}}, ensure_ascii=False).encode() + b"\n\ndata: [DONE]\n\n"
                         return
 
                     async for raw in resp.aiter_bytes():
