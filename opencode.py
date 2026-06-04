@@ -1299,6 +1299,54 @@ def anthropic_to_openai(body: dict, model: str) -> dict:
         else:
             oai["tool_choice"] = tc
 
+    # Convert Anthropic thinking/effort → OpenAI reasoning parameters
+    # Claude Code sends: thinking: {type: "adaptive"} OR effort: "low"/"medium"/"high"/"xhigh"/"max"
+    effort_level = body.get("effort")
+    thinking_param = body.get("thinking") if isinstance(body.get("thinking"), dict) else {}
+    ttype = thinking_param.get("type", "")
+    budget = thinking_param.get("budget_tokens", 0)
+
+    if effort_level and effort_level != "none":
+        wants_thinking = True
+    elif ttype in ("enabled", "adaptive") or budget > 0:
+        wants_thinking = True
+        if budget >= 16000 or budget == 0:
+            effort_level = "xhigh"
+        elif budget >= 10000:
+            effort_level = "high"
+        elif budget >= 4000:
+            effort_level = "medium"
+        elif ttype == "adaptive":
+            effort_level = "medium"
+        else:
+            effort_level = "low"
+    else:
+        wants_thinking = False
+
+    if wants_thinking:
+        if model.startswith("kimi-k2.6"):
+            # Kimi K2.6 uses reasoning: true (not reasoning_effort)
+            oai["reasoning"] = True
+            _debug(f"  [thinking] {model}: reasoning=True (effort={effort_level})")
+        elif model.startswith("deepseek-v4"):
+            # DeepSeek V4 only supports high and max
+            if effort_level in ("xhigh", "max"):
+                oai["reasoning_effort"] = "max"
+            else:
+                oai["reasoning_effort"] = "high"
+            _debug(f"  [thinking] {model}: reasoning_effort={oai['reasoning_effort']} (effort={effort_level})")
+        else:
+            # MiMo V2.5 etc. supports low/medium/high
+            if effort_level in ("xhigh", "max"):
+                oai["reasoning_effort"] = "high"
+            elif effort_level in ("high",):
+                oai["reasoning_effort"] = "high"
+            elif effort_level in ("medium",):
+                oai["reasoning_effort"] = "medium"
+            else:
+                oai["reasoning_effort"] = "low"
+            _debug(f"  [thinking] {model}: reasoning_effort={oai['reasoning_effort']} (effort={effort_level})")
+
     # Restructure system prompt for models without semantic caching
     oai = _restructure_for_cache(oai, model)
     return oai
@@ -1310,7 +1358,7 @@ def openai_to_anthropic(resp: dict, model: str) -> dict:
     usage = resp.get("usage", {})
 
     blocks = []
-    if reasoning := msg.get("reasoning_content"):
+    if reasoning := msg.get("reasoning_content") or msg.get("reasoning"):
         blocks.append({"type": "thinking", "thinking": reasoning})
     if msg.get("content"):
         blocks.append({"type": "text", "text": msg["content"]})
@@ -1398,7 +1446,7 @@ def openai_to_anthropic_request(oai_body: dict) -> dict:
 
         # Convert reasoning_content → thinking block (assistant only)
         if role == "assistant":
-            reasoning = msg.get("reasoning_content")
+            reasoning = msg.get("reasoning_content") or msg.get("reasoning")
             if isinstance(reasoning, str) and reasoning.strip():
                 blocks.insert(0, {"type": "thinking", "thinking": reasoning})
 
@@ -1747,7 +1795,7 @@ def openai_chat_to_responses(chat_resp: dict, model: str) -> dict:
     output_items = []
 
     # Reasoning content -> reasoning item
-    reasoning = msg.get("reasoning_content")
+    reasoning = msg.get("reasoning_content") or msg.get("reasoning")
     if reasoning:
         output_items.insert(0, {
             "type": "reasoning",
@@ -2231,9 +2279,9 @@ async def messages(request: Request):
         _update_token_usage(model_id, req_in, req_out, cache)
         used = [tc["function"]["name"] for tc in data.get("choices", [{}])[0].get("message", {}).get("tool_calls", [])]
         msg_data = data.get("choices", [{}])[0].get("message", {})
-        if not msg_data.get("reasoning_content") and thinking_type != "none":
+        if not (msg_data.get("reasoning_content") or msg_data.get("reasoning")) and thinking_type != "none":
             _debug(f"  [non-stream] WARNING: thinking requested (type={thinking_type}, effort={effort}) but upstream returned no reasoning_content")
-        _debug(f"  [non-stream] blocks: text={bool(msg_data.get('content'))} thinking={bool(msg_data.get('reasoning_content'))} tools={used}")
+        _debug(f"  [non-stream] blocks: text={bool(msg_data.get('content'))} thinking={bool(msg_data.get('reasoning_content') or msg_data.get('reasoning'))} tools={used}")
         await _save_and_log_request(req_id, model_id, original_model, start_time,
                      req_in, req_out, cache, protocol, is_stream=False, thinking_type=thinking_type,
                      effort=effort, client_ip=client_ip, account_alias=account_alias, tools=tool_names,
@@ -2351,7 +2399,7 @@ async def messages(request: Request):
                                        "delta": {"type": "text_delta", "text": text}})
 
                         # Reasoning content
-                        reasoning = delta.get("reasoning_content")
+                        reasoning = delta.get("reasoning_content") or delta.get("reasoning")
                         if isinstance(reasoning, str) and reasoning:
                             if reasoning_block_idx is None:
                                 reasoning_block_idx = next_block_idx
@@ -2575,8 +2623,8 @@ async def chat_completions(request: Request):
     body["model"] = model_id
     is_stream = body.get("stream", False)
 
-    thinking_type = "none"
     thinking_raw = body.get("thinking") if isinstance(body.get("thinking"), dict) else {}
+    thinking_type = thinking_raw.get("type", "none") if isinstance(thinking_raw, dict) and thinking_raw else "none"
     effort = (body.get("effort")
               or (thinking_raw.get("effort") if isinstance(thinking_raw, dict) else None)
               or (body.get("output_config", {}).get("effort") if isinstance(body.get("output_config"), dict) else None)
@@ -2672,7 +2720,7 @@ async def chat_completions(request: Request):
                                     c = delta.get("content")
                                     if isinstance(c, str):
                                         stream_out += _estimate_tokens(c)
-                                    rc = delta.get("reasoning_content")
+                                    rc = delta.get("reasoning_content") or delta.get("reasoning")
                                     if isinstance(rc, str):
                                         stream_out += _estimate_tokens(rc)
                                     for tc in delta.get("tool_calls", []):
