@@ -860,7 +860,10 @@ def _route_for(model_name: str, tool_names: list = None) -> dict | None:
         for r in CUSTOM_ROUTES.values():
             if any(m in name for m in r.get("match", [])):
                 return r
-        return {"match": [], "model": model_name}
+        # No custom route matched — check if the model exists directly
+        if name in MODELS:
+            return {"match": [name], "model": model_name}
+        return None
     # 1. Tool-based routing (optional, additive)
     tool_names_lower = [t.lower() for t in (tool_names or [])]
     for r in ROUTES.values():
