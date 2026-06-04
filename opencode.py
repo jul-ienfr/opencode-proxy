@@ -19,7 +19,7 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse as StarletteJSONResponse
 
-from config import API_KEY, PROXY, MODELS, ROUTES, get_model_config, HOST, PORT, WEB_PORT, DISABLE_MAPPING, API_KEYS, API_KEY_ROUTING, CUSTOM_ROUTES, maybe_reload_custom_routes, CACHE_MIN_PROMPT_SIZE
+from config import API_KEY, PROXY, MODELS, ROUTES, get_model_config, HOST, PORT, WEB_PORT, DISABLE_MAPPING, API_KEYS, API_KEY_ROUTING, CUSTOM_ROUTES, maybe_reload_custom_routes, CACHE_MIN_PROMPT_SIZE, DEBUG
 
 import itertools
 
@@ -105,13 +105,18 @@ except Exception:
 
 from dashboard import register_dashboard
 from dashboard import start_quota_fetcher
-from dashboard.display import log as _log, RichLogHandler, run_terminal_loop
+from dashboard.display import log as _log, debug as _debug, set_debug_log_file, RichLogHandler, run_terminal_loop
 from dashboard.events import get_event_manager
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
 LOG_DIR = os.path.join(BASE_DIR, "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
+
+# Debug log file setup
+if DEBUG:
+    set_debug_log_file(os.path.join(LOG_DIR, "debug.log"))
+    _debug("Debug mode enabled — full request/response logging active")
 
 # Request body size limit (10 MB)
 MAX_BODY_SIZE = 10 * 1024 * 1024
@@ -230,6 +235,29 @@ _transport = httpx.AsyncHTTPTransport(
     limits=httpx.Limits(max_connections=200, max_keepalive_connections=50, keepalive_expiry=120),
 )
 _client = httpx.AsyncClient(transport=_transport, timeout=httpx.Timeout(connect=30, read=600, write=30, pool=10))
+
+
+# ── Debug helpers ──────────────────────────────────────────────────
+
+def _sanitize_headers(headers) -> dict:
+    """Mask sensitive header values for debug logging."""
+    safe = dict(headers)
+    for key in ("x-api-key", "Authorization"):
+        if key in safe:
+            val = safe[key]
+            safe[key] = val[:8] + "..." + val[-4:] if len(val) > 16 else "***"
+    return safe
+
+
+def _truncate(body, max_len=10240) -> str:
+    """Pretty-print a body for debug logging, truncated to max_len chars."""
+    try:
+        text = json.dumps(body, indent=2, ensure_ascii=False, default=str)
+    except Exception:
+        text = str(body)
+    if len(text) > max_len:
+        return text[:max_len] + f"\n... [{len(text) - max_len} chars truncated]"
+    return text
 
 
 # ── Response Cache (non-streaming only) ──────────────────────────
@@ -632,23 +660,32 @@ async def _do_request_with_retry(endpoint, body, headers, protocol, retry_on_429
     max_retries = 2
 
     for attempt in range(max_retries):
+        _debug(f"  → upstream POST {endpoint} attempt {attempt+1}/{max_retries} headers={_sanitize_headers(headers)}")
+        t0 = time.monotonic()
         try:
             resp = await _client.post(endpoint, json=body, headers=headers)
         except httpx.ConnectError as e:
+            _debug(f"  ✗ connect error after {(time.monotonic()-t0)*1000:.0f}ms: {e}")
             _log(f"  UPSTREAM CONNECT ERROR: {type(e).__name__}: {e}")
             raise UpstreamError(f"Cannot connect to upstream: {e}", status_code=502, original=e) from e
         except httpx.TimeoutException as e:
+            _debug(f"  ✗ timeout after {(time.monotonic()-t0)*1000:.0f}ms: {e}")
             _log(f"  UPSTREAM TIMEOUT: {type(e).__name__}: {e}")
             raise UpstreamError(f"Upstream request timed out: {e}", status_code=504, original=e) from e
         except httpx.RequestError as e:
+            _debug(f"  ✗ request error after {(time.monotonic()-t0)*1000:.0f}ms: {e}")
             _log(f"  UPSTREAM REQUEST ERROR: {type(e).__name__}: {e}")
             raise UpstreamError(f"Upstream request failed: {type(e).__name__}: {e}", status_code=502, original=e) from e
+
+        elapsed_ms = (time.monotonic() - t0) * 1000
+        _debug(f"  ← upstream {resp.status_code} in {elapsed_ms:.0f}ms | content-type={resp.headers.get('content-type', '?')}")
 
         # Retry on 429 with key failover
         if retry_on_429 and resp.status_code == 429 and len(API_KEYS) > 1:
             failed_key = _key_from_headers(headers, protocol)
             alt = _find_alternative_key(failed_key)
             if alt:
+                _debug(f"  ⟳ 429 failover: {failed_key[:8]}… → alias={alt.get('alias', '?')}")
                 _log(f"  429 on key, retrying with alternative key")
                 headers = _get_auth_headers(protocol, entry=alt)
                 continue
@@ -656,6 +693,7 @@ async def _do_request_with_retry(endpoint, body, headers, protocol, retry_on_429
         # Retry on 502/503/504 with backoff
         if resp.status_code in _RETRYABLE_STATUSES and attempt < max_retries - 1:
             wait = 1.0 * (2 ** attempt)  # 1s, 2s
+            _debug(f"  ⟳ retry {resp.status_code} in {wait:.1f}s")
             _log(f"  RETRY {resp.status_code} after {wait:.1f}s (attempt {attempt+1}/{max_retries})")
             await asyncio.sleep(wait)
             continue
@@ -1765,8 +1803,12 @@ async def messages(request: Request):
 
     original_model = body.get("model", "")
     tool_names = _extract_tool_names(body)
+    _debug(f"[messages] req_id={req_id} model={original_model!r} tools={tool_names} ip={client_ip}")
+    _debug(f"[messages] headers={_sanitize_headers(dict(request.headers))}")
+    _debug(f"[messages] body=\n{_truncate(body)}")
     route = _route_for(original_model, tool_names)
     if route is None:
+        _debug(f"[messages] ✗ no route found for {original_model!r}")
         available = sorted(MODELS.keys())
         return Response(
             content=json.dumps({"error": f"Model not found: {original_model!r}", "available_models": available}),
@@ -1776,6 +1818,7 @@ async def messages(request: Request):
     cfg = get_model_config(model_id)
     endpoint = cfg["endpoint"]
     protocol = cfg["protocol"]
+    _debug(f"[messages] route: {original_model!r} → {model_id} | {protocol} | endpoint={endpoint}")
 
     body = dict(body)
     body["model"] = model_id
@@ -1816,15 +1859,19 @@ async def messages(request: Request):
             cached = cache_key and _response_cache.get(cache_key)
             if cached:
                 cached_body, cached_headers = cached
+                _debug(f"  cache HIT key={cache_key[:16]}… size={len(cached_body)} bytes")
                 _log(f"  ← {model_id} | cache HIT")
                 return Response(content=cached_body, headers={**cached_headers, "X-Cache": "HIT"}, media_type="application/json")
+            _debug(f"  cache MISS key={cache_key[:16] if cache_key else 'none'}…")
 
             try:
                 resp, a_headers = await _do_request_with_retry(endpoint, body, a_headers, "anthropic")
             except UpstreamError as e:
+                _debug(f"  ✗ upstream error: {e}")
                 return JSONResponse(status_code=e.status_code, content={"error": str(e)})
             account_alias = _alias_for_key(a_headers.get("x-api-key", ""))
             if resp.status_code != 200:
+                _debug(f"  ✗ upstream {resp.status_code}: {resp.text[:500]}")
                 await _log_and_save_error(req_id, model_id, original_model, start_time,
                              resp.status_code, resp.text, protocol, is_stream, thinking_type,
                              effort, client_ip, account_alias, tool_names)
@@ -1832,12 +1879,15 @@ async def messages(request: Request):
             try:
                 data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
             except Exception:
+                _debug(f"  ✗ non-JSON response from {endpoint}")
                 _log(f"  UPSTREAM DECODE ERROR: non-JSON response from {endpoint}")
                 return JSONResponse(status_code=502, content={"error": "Upstream returned non-JSON response"})
             usage = data.get("usage", {})
             req_in = usage.get("input_tokens", 0) or usage.get("prompt_tokens", 0)
             req_out = usage.get("output_tokens", 0) or usage.get("completion_tokens", 0)
             req_cache = usage.get("cache_read_input_tokens", 0)
+            _debug(f"  usage: in={req_in} out={req_out} cache={req_cache}")
+            _debug(f"  response=\n{_truncate(data)}")
             _update_token_usage(model_id, req_in, req_out, req_cache)
             used = [b["name"] for b in data.get("content", []) if b.get("type") == "tool_use"]
             await _save_and_log_request(req_id, model_id, original_model, start_time,
@@ -2017,7 +2067,7 @@ async def messages(request: Request):
         _update_token_usage(model_id, req_in, req_out, cache)
         used = [tc["function"]["name"] for tc in data.get("choices", [{}])[0].get("message", {}).get("tool_calls", [])]
         await _save_and_log_request(req_id, model_id, original_model, start_time,
-                     req_in, req_out, cache, protocol, is_stream=False, thinking=thinking_type,
+                     req_in, req_out, cache, protocol, is_stream=False, thinking_type=thinking_type,
                      effort=effort, client_ip=client_ip, account_alias=account_alias, tools=tool_names,
                      tools_used=used if used else None)
         return Response(content=json.dumps(openai_to_anthropic(data, original_model), ensure_ascii=False),
