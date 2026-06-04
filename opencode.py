@@ -715,6 +715,7 @@ def _update_token_usage(model_id, inp, out, cache):
             _token_usage[model_id]["output"] += out
             _token_usage[model_id]["cache"] += cache
     except Exception as e:
+        _debug(f"  ✗ _update_token_usage failed: {type(e).__name__}: {e}")
         _log(f"  WARN: _update_token_usage failed for {model_id!r}: {type(e).__name__}: {e}")
 
 
@@ -732,6 +733,7 @@ async def _save_and_log_request(req_id, model_id, original_model, start_time,
                      client_ip=client_ip, account_alias=account_alias, tools=tools,
                      tools_used=tools_used)
     except Exception as e:
+        _debug(f"  ✗ save_request failed: {type(e).__name__}: {e}")
         _log(f"  WARN: save_request failed: {type(e).__name__}: {e}")
 
 
@@ -747,6 +749,7 @@ async def _log_and_save_error(req_id, model_id, original_model, start_time,
                      client_ip=client_ip, account_alias=account_alias, tools=tools,
                      tools_used=tools_used)
     except Exception as e:
+        _debug(f"  ✗ save_request (error path) failed: {type(e).__name__}: {e}")
         _log(f"  WARN: save_request (error path) failed: {type(e).__name__}: {e}")
 
 
@@ -817,6 +820,7 @@ def _finalize_stream_tokens(model_id, est_input, stream_in, stream_out, stream_c
             with _token_lock:
                 _token_usage[model_id]["output"] += stream_out
     except Exception as e:
+        _debug(f"  ✗ _finalize_stream_tokens failed: {type(e).__name__}: {e}")
         _log(f"  WARN: _finalize_stream_tokens failed for {model_id!r}: {type(e).__name__}: {e}")
 
     return final_in, final_out, final_cache, log_tag
@@ -1741,6 +1745,7 @@ def _estimate_input_tokens(body: dict) -> int:
             return len(_encoding.encode(combined))
         return max(1, len(combined) // 3)
     except Exception as e:
+        _debug(f"  ✗ token estimation failed: {type(e).__name__}: {e}")
         _log(f"  WARN: token estimation failed: {type(e).__name__}: {e}")
         return 0
 
@@ -2924,6 +2929,7 @@ async def responses(request: Request):
     try:
         oai_body = anthropic_to_openai(anthro_body, model_id)
     except Exception as e:
+        _debug(f"[responses] ✗ conversion failed: {e}")
         _log(f"  CONVERSION ERROR: anthropic_to_openai failed: {type(e).__name__}: {e}")
         return JSONResponse(status_code=400, content={"error": f"Request conversion failed: {e}"})
     headers = _get_auth_headers("openai")
