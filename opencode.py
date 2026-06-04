@@ -375,7 +375,8 @@ app = FastAPI(lifespan=lifespan)
 async def debug_exception(request: Request, exc: Exception):
     tb = traceback.format_exc()
     client_ip = request.client.host if request.client else "unknown"
-    _log(f"ERROR {request.method} {request.url.path} from {client_ip}: {type(exc).__name__}: {exc}\n{tb}")
+    _log(f"ERROR {request.method} {request.url.path} from {client_ip}: {type(exc).__name__}: {exc}")
+    _debug(f"Traceback (500):\n{tb}")
     # Don't expose tracebacks to clients — log them server-side only
     return JSONResponse(status_code=500, content={"error": "Internal server error"})
 
@@ -1900,6 +1901,7 @@ async def messages(request: Request):
 
         # Estimate input tokens for Anthropic streaming
         est_input = _estimate_input_tokens(body)
+        _debug(f"  [stream] est_input={est_input}")
         _update_token_usage(model_id, est_input, 0, 0)
 
         async def anthropic_stream(headers):
@@ -1914,12 +1916,14 @@ async def messages(request: Request):
             for _attempt in range(2):  # retry once on 429
                 try:
                     async with _client.stream("POST", endpoint, json=body, headers=headers) as resp:
+                        _debug(f"  [stream] connected status={resp.status_code}")
                         if resp.status_code != 200:
                             headers, should_retry = _handle_429(headers, resp.status_code, _attempt)
                             if should_retry:
                                 continue
                             err = await resp.aread()
                             ak = _alias_for_key(headers.get("x-api-key", ""))
+                            _debug(f"  [stream] error {resp.status_code}: {err[:300]}")
                             error_payload = {"type": "error", "error": {"type": "api_error",
                                            "message": f"HTTP {resp.status_code}: {err.decode('utf-8', errors='replace')[:200]}"}}
                             yield await _stream_error_response(req_id, model_id, original_model, start_time,
@@ -1984,6 +1988,7 @@ async def messages(request: Request):
                                 pass
                 except Exception as e:
                     ak = _alias_for_key(headers.get("x-api-key", "")) if headers else ""
+                    _debug(f"  [stream] exception on attempt {_attempt+1}: {type(e).__name__}: {e}")
                     _log(f"  ERROR stream (attempt {_attempt+1}): {type(e).__name__}: {e}")
                     if _attempt == 0:
                         continue  # retry once on connection error
@@ -2017,6 +2022,7 @@ async def messages(request: Request):
                 # Exhausted retries without success → error already yielded
                 return
             logged_in = stream_in if stream_in is not None else est_input
+            _debug(f"  [stream] done: in={logged_in} out={stream_out} cache={stream_cache} tools={used_tools}")
             if stream_in is not None or stream_out:
                 ak = _alias_for_key(headers.get("x-api-key", ""))
                 await _save_and_log_request(req_id, model_id, original_model, start_time,
@@ -2029,7 +2035,9 @@ async def messages(request: Request):
     # ── OpenAI-protocol ─────────────────────────────────────────
     try:
         oai_body = anthropic_to_openai(body, model_id)
+        _debug(f"[messages] converted to openai: {_truncate(oai_body, 5000)}")
     except Exception as e:
+        _debug(f"[messages] ✗ conversion failed: {e}")
         _log(f"  CONVERSION ERROR: anthropic_to_openai failed: {type(e).__name__}: {e}")
         return JSONResponse(status_code=400, content={"error": f"Request conversion failed: {e}"})
     headers = _get_auth_headers("openai")
@@ -2039,8 +2047,10 @@ async def messages(request: Request):
         try:
             resp, headers = await _do_request_with_retry(endpoint, oai_body, headers, "openai")
         except UpstreamError as e:
+            _debug(f"  ✗ upstream error: {e}")
             return JSONResponse(status_code=e.status_code, content={"error": str(e)})
         account_alias = _alias_for_key(_key_from_headers(headers, "openai"))
+        _debug(f"  response status={resp.status_code} size={len(resp.content)} bytes")
         if resp.status_code != 200:
             await _log_and_save_error(req_id, model_id, original_model, start_time,
                          resp.status_code, resp.text, protocol, is_stream, thinking_type,
@@ -2058,12 +2068,14 @@ async def messages(request: Request):
         try:
             data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
         except Exception:
+            _debug(f"  ✗ non-JSON response from {endpoint}")
             _log(f"  UPSTREAM DECODE ERROR: non-JSON response from {endpoint}")
             return JSONResponse(status_code=502, content={"error": "Upstream returned non-JSON response"})
         usage = data.get("usage", {})
         req_in = usage.get("prompt_tokens", 0)
         req_out = usage.get("completion_tokens", 0)
         cache = _extract_cache_tokens(usage)
+        _debug(f"  usage: in={req_in} out={req_out} cache={cache}")
         _update_token_usage(model_id, req_in, req_out, cache)
         used = [tc["function"]["name"] for tc in data.get("choices", [{}])[0].get("message", {}).get("tool_calls", [])]
         await _save_and_log_request(req_id, model_id, original_model, start_time,
@@ -2078,6 +2090,7 @@ async def messages(request: Request):
     oai_body["stream_options"] = {"include_usage": True}
 
     stream_in_est = _estimate_input_tokens(body)
+    _debug(f"  [stream-oai] est_input={stream_in_est}")
     _update_token_usage(model_id, stream_in_est, 0, 0)
 
     async def stream_gen(hdrs):
@@ -2361,8 +2374,12 @@ async def chat_completions(request: Request):
 
     original_model = body.get("model", "")
     tool_names = _extract_tool_names(body)
+    _debug(f"[chat] req_id={req_id} model={original_model!r} tools={tool_names} ip={client_ip}")
+    _debug(f"[chat] headers={_sanitize_headers(dict(request.headers))}")
+    _debug(f"[chat] body=\n{_truncate(body)}")
     route = _route_for(original_model, tool_names)
     if route is None:
+        _debug(f"[chat] ✗ no route found for {original_model!r}")
         available = sorted(MODELS.keys())
         return JSONResponse(status_code=404, content={
             "error": f"Model not found: {original_model!r}",
@@ -2372,6 +2389,7 @@ async def chat_completions(request: Request):
     cfg = get_model_config(model_id)
     endpoint = cfg["endpoint"]
     protocol = cfg["protocol"]
+    _debug(f"[chat] route: {original_model!r} → {model_id} | {protocol} | endpoint={endpoint}")
 
     body = dict(body)
     body["model"] = model_id
@@ -2405,12 +2423,14 @@ async def chat_completions(request: Request):
             try:
                 data = resp.json()
             except Exception:
+                _debug(f"  ✗ non-JSON response from {endpoint}")
                 _log(f"  UPSTREAM DECODE ERROR: non-JSON response from {endpoint}")
                 return JSONResponse(status_code=502, content={"error": "Upstream returned non-JSON response"})
             usage = data.get("usage", {})
             req_in = usage.get("prompt_tokens", 0)
             req_out = usage.get("completion_tokens", 0)
             cache = _extract_cache_tokens(usage)
+            _debug(f"  usage: in={req_in} out={req_out} cache={cache}")
             _update_token_usage(model_id, req_in, req_out, cache)
             used = [tc["function"]["name"] for tc in data.get("choices", [{}])[0].get("message", {}).get("tool_calls", [])]
             await _save_and_log_request(req_id, model_id, original_model, start_time,
@@ -2424,6 +2444,7 @@ async def chat_completions(request: Request):
 
         est_input = _estimate_input_tokens(body)
         _update_token_usage(model_id, est_input, 0, 0)
+        _debug(f"  [chat-stream] est_input={est_input}")
 
         async def openai_stream(hdrs):
             stream_out = 0
@@ -2547,6 +2568,7 @@ async def chat_completions(request: Request):
         try:
             data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
         except Exception:
+            _debug(f"  ✗ non-JSON response from {endpoint}")
             _log(f"  UPSTREAM DECODE ERROR: non-JSON response from {endpoint}")
             return JSONResponse(status_code=502, content={"error": "Upstream returned non-JSON response"})
         usage = data.get("usage", {})
@@ -2847,6 +2869,7 @@ async def responses(request: Request):
             try:
                 data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
             except Exception:
+                _debug(f"  ✗ non-JSON response from {endpoint}")
                 _log(f"  UPSTREAM DECODE ERROR: non-JSON response from {endpoint}")
                 return JSONResponse(status_code=502, content={"error": "Upstream returned non-JSON response"})
             usage = data.get("usage", {})
@@ -2878,6 +2901,7 @@ async def responses(request: Request):
         try:
             data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
         except Exception:
+            _debug(f"  ✗ non-JSON response from {endpoint}")
             _log(f"  UPSTREAM DECODE ERROR: non-JSON response from {endpoint}")
             return JSONResponse(status_code=502, content={"error": "Upstream returned non-JSON response"})
         usage = data.get("usage", {})
@@ -2924,6 +2948,7 @@ async def responses(request: Request):
         try:
             data = resp.json()
         except Exception:
+            _debug(f"  ✗ non-JSON response from {endpoint}")
             _log(f"  UPSTREAM DECODE ERROR: non-JSON response from {endpoint}")
             return JSONResponse(status_code=502, content={"error": "Upstream returned non-JSON response"})
         usage = data.get("usage", {})
@@ -2957,6 +2982,7 @@ async def responses(request: Request):
     try:
         data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
     except Exception:
+        _debug(f"  ✗ non-JSON response from {endpoint}")
         _log(f"  UPSTREAM DECODE ERROR: non-JSON response from {endpoint}")
         return JSONResponse(status_code=502, content={"error": "Upstream returned non-JSON response"})
     usage = data.get("usage", {})
