@@ -17,6 +17,16 @@ from .events import get_event_manager
 
 logger = logging.getLogger(__name__)
 
+# Callback invoked when a workspace transitions from error → ok.
+# Registered by opencode.py to unpause API keys that recovered.
+_on_workspace_recovered_callback = None
+
+
+def set_on_workspace_recovered_callback(callback):
+    """Register a callback: callback(workspace_id) called when workspace recovers."""
+    global _on_workspace_recovered_callback
+    _on_workspace_recovered_callback = callback
+
 # Shared HTTP client for quota fetcher (reused across calls, avoids fd leaks)
 _http_client: httpx.AsyncClient | None = None
 
@@ -522,7 +532,11 @@ async def start_quota_fetcher(app):
                 cookie = ws["go_auth_cookie"]
                 try:
                     quotas = await fetch_quotas(wid, cookie)
+                    # Check if workspace was previously in error (for recovery callback)
+                    was_error = False
                     async with _cache_lock:
+                        prev = _caches.get(wid)
+                        was_error = prev and prev.get("status") == "error"
                         _caches[wid] = {
                             "status": "ok",
                             "error": None,
@@ -531,6 +545,12 @@ async def start_quota_fetcher(app):
                         }
                     get_event_manager().publish("quotas_updated", {"workspace_id": wid, "status": "ok"})
                     logger.debug("Quotas refreshed for workspace %s", wid[:8])
+                    # Notify recovery: unpause API key if it was paused due to 401
+                    if was_error and _on_workspace_recovered_callback:
+                        try:
+                            _on_workspace_recovered_callback(wid)
+                        except Exception as cb_err:
+                            logger.debug("Recovery callback error for workspace %s: %s", wid[:8], cb_err)
                 except Exception as e:
                     logger.warning("Quota fetch failed for workspace %s: %s", wid[:8], e)
                     async with _cache_lock:
