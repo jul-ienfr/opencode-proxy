@@ -12,7 +12,7 @@ from fastapi.staticfiles import StaticFiles
 
 from config import MODELS, HOST, PORT, WEB_PORT, PROXY, API_KEY, CONFIG_KEYS, save_env, apply_server_changes, CUSTOM_ROUTES, save_custom_routes, API_KEYS, save_api_keys, API_KEY_ROUTING
 import config.settings as config_settings
-from .display import log_lines
+from .display import log_lines, debug as _debug
 from .events import get_event_manager
 from .quota import get_quota_snapshot, get_available_models, get_model_limits_for_all, get_model_capabilities_for_all
 
@@ -130,6 +130,7 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
     @app.post("/api/config/custom-routes")
     async def update_custom_routes(request: Request):
         body = await request.json()
+        _debug(f"  [config] custom routes updated ({len(body)} routes)")
         save_custom_routes(body)
         return {"status": "ok", "message": "Custom routes updated."}
 
@@ -157,6 +158,7 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
     async def update_api_keys_config(request: Request):
         body = await request.json()
         if "api_keys" in body:
+            _debug(f"  [config] API keys updated ({len(body['api_keys'])} keys)")
             save_api_keys(body["api_keys"])
         if "routing" in body:
             save_env({"API_KEY_ROUTING": body["routing"]})
@@ -430,6 +432,7 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
     async def event_stream(request: Request):
         manager = get_event_manager()
         queue = await manager.subscribe()
+        _debug(f"  [sse] new SSE subscriber")
 
         async def event_generator():
             try:
@@ -547,6 +550,7 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
 
     @app.delete("/api/history")
     async def delete_history(before: str = None, all: bool = False, model: str = None):
+        _debug(f"  [history] delete: all={all} model={model} before={before}")
         if not all and not before and not model:
             return {"error": "Specify 'before' date, 'model' name, or 'all=true'"}
 

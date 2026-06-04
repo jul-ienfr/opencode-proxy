@@ -6,7 +6,10 @@ Thread-safe: publish() can be called from sync or async contexts.
 
 import json
 import asyncio
+import logging
 import threading
+
+logger = logging.getLogger(__name__)
 
 
 class EventManager:
@@ -20,6 +23,7 @@ class EventManager:
         queue = asyncio.Queue(maxsize=256)
         with self._lock:
             self._subscribers.append(queue)
+            logger.debug("[sse] subscriber added, count=%d", len(self._subscribers))
         return queue
 
     async def unsubscribe(self, queue):
@@ -28,6 +32,7 @@ class EventManager:
                 self._subscribers.remove(queue)
             except ValueError:
                 pass
+            logger.debug("[sse] subscriber removed, count=%d", len(self._subscribers))
 
     def publish(self, event: str, data: dict):
         """Thread-safe. Call from sync or async context."""
@@ -39,7 +44,7 @@ class EventManager:
                     q.put_nowait(payload)
                     alive.append(q)
                 except asyncio.QueueFull:
-                    pass  # drop event for slow subscriber
+                    logger.debug("[sse] event dropped for slow subscriber (queue full, event=%s)", event)
                 except Exception:
                     pass  # closed/destroyed queue
             self._subscribers = alive

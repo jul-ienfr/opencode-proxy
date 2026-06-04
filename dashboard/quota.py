@@ -441,6 +441,7 @@ async def fetch_quotas(workspace_id: str, auth_cookie: str) -> dict:
     resp = await client.get(url, headers=headers)
 
     if resp.status_code in (401, 403):
+        logger.debug("[quota] auth failed for workspace %s (HTTP %d)", workspace_id[:8], resp.status_code)
         raise RuntimeError("OpenCode Go authentication failed. Refresh your auth cookie.")
     if resp.status_code != 200:
         raise RuntimeError(f"OpenCode Go request failed with HTTP {resp.status_code}.")
@@ -464,6 +465,7 @@ async def start_quota_fetcher(app):
     The poller always runs and checks env vars dynamically at each cycle,
     so config changes (workspace ID, auth cookie) take effect without restart.
     """
+    logger.debug("[quota] start_quota_fetcher called")
 
     # Fetch model limits + available models on startup
     async def _startup_fetch():
@@ -482,6 +484,7 @@ async def start_quota_fetcher(app):
         try:
             models = await fetch_available_models()
             _models_cache = models
+            logger.debug("[quota] discovered %d models from upstream", len(models))
             logger.info("Discovered %d models from upstream", len(models))
         except Exception:
             logger.info("Using local models only (upstream fetch failed)")

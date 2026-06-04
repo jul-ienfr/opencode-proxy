@@ -63,9 +63,21 @@ class RichLogHandler(logging.Handler):
         msg = record.getMessage()
         if "/api/" in msg or "Uvicorn running" in msg:
             return
+        # When DEBUG is on, forward all levels (including DEBUG) to the log panel
+        import config.settings as _cfg
+        if not _cfg.DEBUG and record.levelno < logging.WARNING:
+            return
         level = record.levelname
         ts = time.strftime("%H:%M:%S")
         log_lines.append(f"[{ts}] [{level}] {msg}")
+        # Also write DEBUG-level messages to the debug.log file
+        if _cfg.DEBUG and _debug_file is not None and record.levelno <= logging.DEBUG:
+            try:
+                fts = time.strftime("%Y-%m-%d %H:%M:%S")
+                _debug_file.write(f"[{fts}] [{level}] {msg}\n")
+                _debug_file.flush()
+            except Exception:
+                pass
 
 
 def build_display(routes, token_usage, token_lock):

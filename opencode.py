@@ -35,36 +35,47 @@ def _get_enabled_keys() -> list[dict]:
 def get_next_api_key() -> dict:
     global _key_cycle, _key_cycle_keys, _key_failover_index
     if not API_KEYS:
+        _debug(f"  [apikey] no API_KEYS configured, falling back to .env key")
         return {"api_key": API_KEY}
     enabled = _get_enabled_keys()
     if not enabled:
+        _debug(f"  [apikey] no enabled keys, falling back to .env key")
         return {"api_key": API_KEY}
     if len(enabled) == 1:
+        _debug(f"  [apikey] single key: alias={enabled[0].get('alias','?')}")
         return enabled[0]
     if API_KEY_ROUTING == "failover":
         for i in range(len(API_KEYS)):
             idx = (_key_failover_index + i) % len(API_KEYS)
             if API_KEYS[idx].get("enabled", True):
+                _debug(f"  [apikey] failover selected alias={API_KEYS[idx].get('alias','?')} (idx={idx})")
                 return API_KEYS[idx]
+        _debug(f"  [apikey] failover exhausted, falling back to .env key")
         return {"api_key": API_KEY}
     with _key_cycle_lock:
         current_ids = [k.get("api_key") for k in enabled]
         if _key_cycle is None or _key_cycle_keys != current_ids:
             _key_cycle = itertools.cycle(enabled)
             _key_cycle_keys = current_ids
-        return next(_key_cycle)
+            _debug(f"  [apikey] round-robin cycle rebuilt: {len(enabled)} keys")
+        selected = next(_key_cycle)
+        _debug(f"  [apikey] round-robin selected alias={selected.get('alias','?')}")
+        return selected
 
 def _find_alternative_key(failed_key: str) -> dict | None:
     """Return the first enabled key different from failed_key, or None."""
     for k in API_KEYS:
         if k.get("api_key") != failed_key and k.get("enabled", True):
+            _debug(f"  [apikey] alternative key found alias={k.get('alias','?')}")
             return k
+    _debug(f"  [apikey] no alternative key for {failed_key[:8]}...")
     return None
 
 def advance_failover():
     global _key_failover_index
     if API_KEYS and API_KEY_ROUTING == "failover":
         _key_failover_index = (_key_failover_index + 1) % len(API_KEYS)
+        _debug(f"  [apikey] failover index advanced to {_key_failover_index}")
 
 _key_alias_cache: dict[str, str] = {}
 
@@ -73,6 +84,7 @@ def _rebuild_key_cache():
     """Rebuild the API key → alias lookup dict."""
     global _key_alias_cache
     _key_alias_cache = {k["api_key"]: k.get("alias", "") or "" for k in API_KEYS if k.get("api_key")}
+    _debug(f"  [apikey] rebuilt alias cache: {len(_key_alias_cache)} keys")
 
 _rebuild_key_cache()
 
@@ -156,6 +168,7 @@ for col, default in [("protocol", "NULL"), ("is_stream", "0"), ("thinking", "NUL
     except Exception:
         pass
 _conn.commit()
+_debug(f"  [db] SQLite connection established: {_db_path}")
 
 
 def _db_insert_sync(req_id, timestamp, model, original_model, duration_ms,
@@ -163,6 +176,7 @@ def _db_insert_sync(req_id, timestamp, model, original_model, duration_ms,
                     protocol, is_stream, thinking, effort, client_ip, account_alias,
                     tools_json, tools_used_json):
     """Synchronous DB insert — called via asyncio.to_thread()."""
+    t0 = time.monotonic()
     _conn.execute("""
         INSERT OR REPLACE INTO requests (id, timestamp, model, original_model, duration_ms,
             tokens_input, tokens_output, tokens_cache, success, error,
@@ -173,6 +187,7 @@ def _db_insert_sync(req_id, timestamp, model, original_model, duration_ms,
           protocol, 1 if is_stream else 0, thinking, effort,
           client_ip, account_alias, tools_json, tools_used_json))
     _conn.commit()
+    _debug(f"  [db] _db_insert_sync: committed req_id={req_id} in {(time.monotonic()-t0)*1000:.1f}ms")
 
 
 async def _save_request(req_id, model, original_model, duration_ms,
@@ -188,6 +203,7 @@ async def _save_request(req_id, model, original_model, duration_ms,
         protocol, is_stream, thinking, effort, client_ip, account_alias,
         tools_json, tools_used_json
     )
+    _debug(f"  [db] _save_request: saved req_id={req_id} model={model} success={success}")
     # Notify dashboard SSE clients about the update
     try:
         get_event_manager().publish("stats_updated", {"time": timestamp})
@@ -207,14 +223,21 @@ def _restore_token_counters():
             "       COALESCE(SUM(tokens_cache), 0)"
             " FROM requests GROUP BY model"
         ).fetchall()
+        total_in, total_out, total_cache = 0, 0, 0
         for row in rows:
             model = row["model"]
             if model in _token_usage:
                 _token_usage[model]["input"] = row[1]
                 _token_usage[model]["output"] = row[2]
                 _token_usage[model]["cache"] = row[3]
+                _debug(f"  [db] restored {model}: in={row[1]} out={row[2]} cache={row[3]}")
+                total_in += row[1]
+                total_out += row[2]
+                total_cache += row[3]
+        _debug(f"  [db] token counters restored: {len(rows)} models, total in={total_in} out={total_out} cache={total_cache}")
         _log(f"  Restored token counters for {len(rows)} models from database")
     except Exception as e:
+        _debug(f"  [db] restore token counters FAILED: {type(e).__name__}: {e}")
         _log(f"  Warning: Could not restore token counters: {e}")
 
 _restore_token_counters()
@@ -224,8 +247,9 @@ def _wal_checkpoint():
     """Run WAL checkpoint to prevent WAL file growth."""
     try:
         _conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-    except Exception:
-        pass
+        _debug("  [db] WAL checkpoint completed successfully")
+    except Exception as e:
+        _debug(f"  [db] WAL checkpoint FAILED: {type(e).__name__}: {e}")
 
 # Shared HTTP client (reused across requests) with connection pooling
 _transport = httpx.AsyncHTTPTransport(
@@ -275,9 +299,13 @@ class _ResponseCache:
         self._access_order: list[str] = []
 
     def _evict(self):
+        evicted = 0
         while len(self._store) > self._max_size:
             oldest = self._access_order.pop(0)
             self._store.pop(oldest, None)
+            evicted += 1
+        if evicted > 0:
+            _debug(f"  [cache] _evict: evicted {evicted} entries, store_size={len(self._store)}/{self._max_size}")
 
     def get(self, key: str) -> tuple[bytes, dict] | None:
         entry = self._store.get(key)
@@ -285,6 +313,7 @@ class _ResponseCache:
             return None
         ts, body, headers = entry
         if time.monotonic() - ts > self._ttl:
+            _debug(f"  [cache] get: TTL expired (age={time.monotonic()-ts:.1f}s > ttl={self._ttl}s), evicting key={key[:16]}...")
             self._store.pop(key, None)
             try:
                 self._access_order.remove(key)
@@ -297,6 +326,7 @@ class _ResponseCache:
         except ValueError:
             pass
         self._access_order.append(key)
+        _debug(f"  [cache] get: HIT key={key[:16]}... size={len(body)} bytes")
         return body, headers
 
     def put(self, key: str, body: bytes, headers: dict):
@@ -308,10 +338,12 @@ class _ResponseCache:
         self._store[key] = (time.monotonic(), body, dict(headers))
         self._access_order.append(key)
         self._evict()
+        _debug(f"  [cache] put: key={key[:16]}... store_size={len(self._store)}/{self._max_size}")
 
     def make_key(self, body: dict) -> str | None:
         """Create cache key from request body. Returns None if not cacheable."""
         if body.get("stream"):
+            _debug(f"  [cache] make_key: stream=True, returning None")
             return None
         # Don't cache requests with tool use (non-deterministic)
         messages = body.get("messages", [])
@@ -320,10 +352,13 @@ class _ResponseCache:
             if isinstance(content, list):
                 for block in content:
                     if isinstance(block, dict) and block.get("type") == "tool_result":
+                        _debug(f"  [cache] make_key: tool_result found, returning None")
                         return None
         try:
             import hashlib
-            return hashlib.sha256(json.dumps(body, sort_keys=True, default=str).encode()).hexdigest()
+            key = hashlib.sha256(json.dumps(body, sort_keys=True, default=str).encode()).hexdigest()
+            _debug(f"  [cache] make_key: generated hash={key[:16]}...")
+            return key
         except Exception:
             return None
 
@@ -336,6 +371,7 @@ _response_cache = _ResponseCache()
 
 @asynccontextmanager
 async def lifespan(app):
+    _debug("  [lifespan] app starting")
     # Start background quota fetcher (no-op if env vars not set)
     await start_quota_fetcher(app)
 
@@ -346,15 +382,18 @@ async def lifespan(app):
             await asyncio.to_thread(_wal_checkpoint)
 
     checkpoint_task = asyncio.create_task(_periodic_checkpoint())
+    _debug("  [lifespan] background tasks created (WAL checkpoint, quota fetcher)")
 
     yield
 
+    _debug("  [lifespan] app shutting down")
     # Cancel background tasks
     checkpoint_task.cancel()
     try:
         await checkpoint_task
     except asyncio.CancelledError:
         pass
+    _debug("  [lifespan] WAL checkpoint task cancelled")
 
     task = getattr(app.state, '_quota_task', None)
     if task:
@@ -363,11 +402,14 @@ async def lifespan(app):
             await task
         except asyncio.CancelledError:
             pass
+        _debug("  [lifespan] quota fetcher task cancelled")
     await _client.aclose()
+    _debug("  [lifespan] HTTP client closed")
     # Close quota fetcher shared client
     from dashboard.quota import _http_client as _quota_client
     if _quota_client and not _quota_client.is_closed:
         await _quota_client.aclose()
+        _debug("  [lifespan] quota fetcher HTTP client closed")
 
 app = FastAPI(lifespan=lifespan)
 
@@ -419,6 +461,7 @@ class _Bucket:
                 return True, 0.0
             # Calculate wait time for next token
             wait = (1.0 - self.tokens) / self.refill_rate
+            _debug(f"  [ratelimit] DENIED (tokens={self.tokens:.2f}, retry_after={wait:.2f}s)")
             return False, wait
 
 
@@ -459,6 +502,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         if bucket is None:
             bucket = _Bucket(self._rate, self._burst)
             self._buckets[ip] = bucket
+            _debug(f"  [ratelimit] new bucket for {ip} (rate={self._rate}, burst={self._burst})")
 
         allowed, retry_after = await bucket.consume()
         if allowed:
@@ -481,6 +525,8 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
                      if now - b.last_access > _STALE_BUCKET_TTL]
             for ip in stale:
                 self._buckets.pop(ip, None)
+            if stale:
+                _debug(f"  [ratelimit] cleanup: {len(stale)} stale buckets removed, {len(self._buckets)} active")
 
 
 app.add_middleware(RateLimitMiddleware)
@@ -534,11 +580,15 @@ class _CircuitBreaker:
         self.created_at = time.monotonic()
 
     def record_success(self):
+        old_state = self.state
         self.failures = 0
         self.total_requests += 1
         self.state = "closed"
+        if old_state != "closed":
+            _debug(f"  [cb] state {old_state} → closed (success #{self.total_requests})")
 
     def record_failure(self):
+        old_state = self.state
         self.failures += 1
         self.total_failures += 1
         self.total_requests += 1
@@ -547,9 +597,11 @@ class _CircuitBreaker:
             # Failure during half-open test → immediately reopen
             self.state = "open"
             self.opened_at = time.monotonic()
+            _debug(f"  [cb] half_open → open (test request failed)")
         elif self.failures >= _CB_FAILURE_THRESHOLD:
             self.state = "open"
             self.opened_at = time.monotonic()
+            _debug(f"  [cb] {old_state} → open (failures={self.failures}/{_CB_FAILURE_THRESHOLD})")
 
     def should_allow(self) -> bool:
         if self.state == "closed":
@@ -557,7 +609,10 @@ class _CircuitBreaker:
         if self.state == "open":
             if time.monotonic() - self.opened_at >= _CB_RECOVERY_TIMEOUT:
                 self.state = "half_open"
+                _debug(f"  [cb] open → half_open (cooldown expired)")
                 return True  # allow one test request
+            remaining = _CB_RECOVERY_TIMEOUT - (time.monotonic() - self.opened_at)
+            _debug(f"  [cb] DENIED (state=open, cooldown={remaining:.0f}s remaining)")
             return False
         # half_open: allow one request through
         return True
@@ -582,6 +637,7 @@ def _get_cb(endpoint: str) -> _CircuitBreaker:
     if cb is None:
         cb = _CircuitBreaker()
         _circuit_breakers[endpoint] = cb
+        _debug(f"  [cb] created circuit breaker for {endpoint}")
     return cb
 
 
@@ -714,6 +770,7 @@ def _update_token_usage(model_id, inp, out, cache):
             _token_usage[model_id]["input"] += inp
             _token_usage[model_id]["output"] += out
             _token_usage[model_id]["cache"] += cache
+        _debug(f"  [tokens] _update_token_usage: model={model_id} +{inp} in +{out} out +{cache} cache | totals: {_token_usage[model_id]}")
     except Exception as e:
         _debug(f"  ✗ _update_token_usage failed: {type(e).__name__}: {e}")
         _log(f"  WARN: _update_token_usage failed for {model_id!r}: {type(e).__name__}: {e}")
@@ -819,6 +876,7 @@ def _finalize_stream_tokens(model_id, est_input, stream_in, stream_out, stream_c
             log_tag = " (est)"
             with _token_lock:
                 _token_usage[model_id]["output"] += stream_out
+            _debug(f"  [tokens] _finalize_stream_tokens: model={model_id} fallback (no actual_usage) est_in={est_input} stream_out={stream_out}")
     except Exception as e:
         _debug(f"  ✗ _finalize_stream_tokens failed: {type(e).__name__}: {e}")
         _log(f"  WARN: _finalize_stream_tokens failed for {model_id!r}: {type(e).__name__}: {e}")
@@ -859,10 +917,13 @@ def _route_for(model_name: str, tool_names: list = None) -> dict | None:
     if DISABLE_MAPPING:
         for r in CUSTOM_ROUTES.values():
             if any(m in name for m in r.get("match", [])):
+                _debug(f"  [route] DISABLE_MAPPING custom match: '{name}' → {r.get('model')}")
                 return r
         # No custom route matched — check if the model exists directly
         if name in MODELS:
+            _debug(f"  [route] DISABLE_MAPPING direct model: '{name}'")
             return {"match": [name], "model": model_name}
+        _debug(f"  [route] DISABLE_MAPPING no match for '{name}'")
         return None
     # 1. Tool-based routing (optional, additive)
     tool_names_lower = [t.lower() for t in (tool_names or [])]
@@ -870,21 +931,26 @@ def _route_for(model_name: str, tool_names: list = None) -> dict | None:
         if r.get("enabled") is False:
             continue
         if tool_names_lower and any(m in t for m in r.get("match", []) for t in tool_names_lower):
+            _debug(f"  [route] tool-based match: {r.get('model')} (tool match)")
             return r
     # 2. Model-based routing (alias matching)
     for r in ROUTES.values():
         if r.get("enabled") is False:
             continue
         if any(m in name for m in r.get("match", [])):
+            _debug(f"  [route] model match: {r.get('model')} (pattern in '{name}')")
             return r
     # 3. Direct lookup in MODELS (exact model name)
     if name in MODELS:
+        _debug(f"  [route] direct MODELS lookup: '{name}'")
         return {"match": [name], "model": name}
     # 4. Wildcard catch-all: if a custom route "*" (or legacy "") exists, use it
     wildcard = CUSTOM_ROUTES.get("*") or CUSTOM_ROUTES.get("")
     if wildcard and isinstance(wildcard, dict) and wildcard.get("model") and wildcard.get("enabled") is not False:
+        _debug(f"  [route] wildcard catch-all: {wildcard.get('model')}")
         return wildcard
     # 5. No match found
+    _debug(f"  [route] no match for '{name}'")
     return None
 
 
@@ -902,6 +968,7 @@ def _extract_tool_names(body: dict) -> list:
                 fn = t["function"]
                 if "name" in fn and isinstance(fn["name"], str):
                     names.append(fn["name"])
+    _debug(f"  [tools] extracted {len(names)} tool names: {names}")
     return names
 
 
@@ -971,10 +1038,12 @@ def _restructure_for_cache(oai_body: dict, model_id: str) -> dict:
 
     sys_content = messages[sys_idx].get("content", "")
     if not isinstance(sys_content, str) or len(sys_content) < CACHE_MIN_PROMPT_SIZE:
+        _debug(f"  [cache-restructure] skipped: sys_content len={len(sys_content) if isinstance(sys_content, str) else 0} < min={CACHE_MIN_PROMPT_SIZE}")
         return oai_body  # Small prompt, no need to restructure
 
     split_point = _find_split_point(sys_content)
     if split_point <= 0:
+        _debug(f"  [cache-restructure] skipped: no valid split point found in {len(sys_content)} chars")
         return oai_body
 
     static_part = sys_content[:split_point].strip()
@@ -996,6 +1065,7 @@ def _restructure_for_cache(oai_body: dict, model_id: str) -> dict:
             new_messages.append(m)
 
     oai_body["messages"] = new_messages
+    _debug(f"  [cache-restructure] split at point={split_point}: static={len(static_part)} dynamic={len(dynamic_part)} chars")
     _log(f"  [cache] split system prompt: static={len(static_part)} dynamic={len(dynamic_part)} chars")
     return oai_body
 
@@ -1803,11 +1873,13 @@ async def messages(request: Request):
 
     body_bytes = await request.body()
     if len(body_bytes) > MAX_BODY_SIZE:
+        _debug(f"  413: body too large ({len(body_bytes)} bytes)")
         return JSONResponse(status_code=413, content={"error": f"Request body too large ({len(body_bytes)} bytes, max {MAX_BODY_SIZE})"})
 
     try:
         body = json.loads(body_bytes)
     except Exception:
+        _debug(f"  400: invalid JSON body")
         return JSONResponse(status_code=400, content={"error": "invalid json"})
 
     original_model = body.get("model", "")
@@ -1922,12 +1994,14 @@ async def messages(request: Request):
             stop_reason = "end_turn"
             _handle_429 = _make_stream_retry_loop("anthropic")
             for _attempt in range(2):  # retry once on 429
+                _debug(f"  [stream] attempt {_attempt+1}/2")
                 try:
                     async with _client.stream("POST", endpoint, json=body, headers=headers) as resp:
                         _debug(f"  [stream] connected status={resp.status_code}")
                         if resp.status_code != 200:
                             headers, should_retry = _handle_429(headers, resp.status_code, _attempt)
                             if should_retry:
+                                _debug(f"  [stream] 429 retry, key swapped")
                                 continue
                             err = await resp.aread()
                             ak = _alias_for_key(headers.get("x-api-key", ""))
@@ -1950,6 +2024,7 @@ async def messages(request: Request):
                                     continue
                                 data_str = line[5:].strip()
                                 if data_str == "[DONE]":
+                                    _debug(f"  [stream] [DONE] received")
                                     continue
                                 try:
                                     event = json.loads(data_str)
@@ -1959,6 +2034,7 @@ async def messages(request: Request):
                                 if etype == "message_start":
                                     usage = event.get("message", {}).get("usage", {})
                                     stream_in = usage.get("input_tokens")
+                                    _debug(f"  [stream] message_start: input_tokens={stream_in} cache_read={usage.get('cache_read_input_tokens', 0)}")
                                     started = True
                                     if stream_in is not None:
                                         try:
@@ -1976,17 +2052,20 @@ async def messages(request: Request):
                                             pass
                                 elif etype == "content_block_start":
                                     block = event.get("content_block", {})
+                                    _debug(f"  [stream] content_block_start: type={block.get('type')} name={block.get('name', '')} index={event.get('index')}")
                                     if block.get("type") == "tool_use" and block.get("name"):
                                         used_tools.append(block["name"])
                                     open_blocks.append(event.get("index"))
                                 elif etype == "content_block_stop":
                                     idx = event.get("index")
+                                    _debug(f"  [stream] content_block_stop: index={idx}")
                                     if idx in open_blocks:
                                         open_blocks.remove(idx)
                                 elif etype == "message_delta":
                                     usage = event.get("usage", {})
                                     stream_out = usage.get("output_tokens", 0)
                                     stop_reason = event.get("delta", {}).get("stop_reason", stop_reason)
+                                    _debug(f"  [stream] message_delta: stop_reason={stop_reason} output_tokens={stream_out}")
                         # After stream ends, apply final output token count
                         if stream_out:
                             try:
@@ -2263,7 +2342,9 @@ async def messages(request: Request):
 
 @app.get("/health")
 async def health():
+    _debug("  [health] health check started")
     await asyncio.to_thread(_conn.execute, "SELECT 1")
+    _debug("  [health] DB connectivity OK")
 
     usage = {model: {"input": d["input"], "output": d["output"], "cache": d["cache"]}
              for model, d in _token_usage.items()}
@@ -2275,6 +2356,7 @@ async def health():
         cb_status[endpoint] = cb.get_status()
         if cb.state == "open":
             any_open = True
+    _debug(f"  [health] circuit breakers: {len(_circuit_breakers)} total, any_open={any_open}")
 
     # Quick upstream connectivity check (5s timeout, GET a lightweight endpoint)
     upstream_ok = True
@@ -2283,11 +2365,13 @@ async def health():
         upstream_ok = resp.status_code < 500
     except Exception:
         upstream_ok = False
+    _debug(f"  [health] upstream check: {'ok' if upstream_ok else 'unreachable'}")
 
     status = "ok"
     if not upstream_ok or any_open:
         status = "degraded"
 
+    _debug(f"  [health] overall status={status}")
     return {"status": status, "usage": usage, "upstream": "ok" if upstream_ok else "unreachable",
             "circuit_breakers": cb_status}
 
@@ -2373,11 +2457,13 @@ async def chat_completions(request: Request):
 
     body_bytes = await request.body()
     if len(body_bytes) > MAX_BODY_SIZE:
+        _debug(f"  413: body too large ({len(body_bytes)} bytes)")
         return JSONResponse(status_code=413, content={"error": f"Request body too large ({len(body_bytes)} bytes, max {MAX_BODY_SIZE})"})
 
     try:
         body = json.loads(body_bytes)
     except Exception:
+        _debug(f"  400: invalid JSON body")
         return JSONResponse(status_code=400, content={"error": "invalid json"})
 
     original_model = body.get("model", "")
@@ -2786,11 +2872,13 @@ async def responses(request: Request):
 
     body_bytes = await request.body()
     if len(body_bytes) > MAX_BODY_SIZE:
+        _debug(f"  413: body too large ({len(body_bytes)} bytes)")
         return JSONResponse(status_code=413, content={"error": f"Request body too large ({len(body_bytes)} bytes, max {MAX_BODY_SIZE})"})
 
     try:
         body = json.loads(body_bytes)
     except Exception:
+        _debug(f"  400: invalid JSON body")
         return JSONResponse(status_code=400, content={"error": "invalid json"})
 
     body = ensure_min_tokens(body)
@@ -3029,6 +3117,7 @@ class ServerManager:
         from uvicorn import Config, Server
         with self._lock:
             if self.is_running:
+                _debug(f"  [server] start skipped — already running on {self.host}:{self.port}")
                 return
             h = RichLogHandler()
             for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
@@ -3048,12 +3137,15 @@ class ServerManager:
                 if self._server.started:
                     break
             self.is_running = True
+            _debug(f"  [server] started on {self.host}:{self.port} (web_port={self.web_port})")
 
     def stop(self, timeout=10):
         """Graceful stop: signal uvicorn to stop, then wait for in-flight requests."""
         with self._lock:
             if not self.is_running:
+                _debug(f"  [server] stop skipped — not running")
                 return
+            _debug(f"  [server] stopping on {self.host}:{self.port}...")
             if self._server:
                 self._server.should_exit = True
             self.is_running = False
@@ -3061,9 +3153,11 @@ class ServerManager:
             self._thread.join(timeout=timeout)
         self._server = None
         self._thread = None
+        _debug(f"  [server] stopped")
 
     def restart(self, port=None, web_port=None, host=None):
         """Hot-restart: graceful stop + update host/ports + start."""
+        _debug(f"  [server] restart requested: host={host} port={port} web_port={web_port}")
         self.stop()
         if host is not None:
             self.host = host
@@ -3072,6 +3166,7 @@ class ServerManager:
         if web_port is not None:
             self.web_port = int(web_port)
         self.start()
+        _debug(f"  [server] restarted on {self.host}:{self.port}")
 
     def full_restart(self):
         """Full process restart — re-executes Python to reload all code.
