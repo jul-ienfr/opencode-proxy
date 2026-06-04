@@ -16,5 +16,17 @@
       "qwen3.5-plus"
     ],
     "model": "mimo-v2.5"
+  },
+  "gpt54mini": {
+    "match": [
+      "gpt-5.4-mini"
+    ],
+    "model": "mimo-v2.5"
+  },
+  "kimik26": {
+    "match": [
+      "kimi-k2.6"
+    ],
+    "model": "mimo-v2.5"
   }
 }

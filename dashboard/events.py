@@ -35,19 +35,26 @@ class EventManager:
             logger.debug("[sse] subscriber removed, count=%d", len(self._subscribers))
 
     def publish(self, event: str, data: dict):
-        """Thread-safe. Call from sync or async context."""
+        """Thread-safe. Call from sync or async context.
+
+        Uses snapshot pattern: copy subscribers under lock, then iterate
+        without holding the lock to avoid blocking subscribe/unsubscribe.
+        """
         payload = f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
         with self._lock:
-            alive = []
-            for q in self._subscribers:
-                try:
-                    q.put_nowait(payload)
-                    alive.append(q)
-                except asyncio.QueueFull:
-                    logger.debug("[sse] event dropped for slow subscriber (queue full, event=%s)", event)
-                except Exception:
-                    pass  # closed/destroyed queue
-            self._subscribers = alive
+            subscribers = list(self._subscribers)
+        alive = []
+        for q in subscribers:
+            try:
+                q.put_nowait(payload)
+                alive.append(q)
+            except asyncio.QueueFull:
+                logger.debug("[sse] event dropped for slow subscriber (queue full, event=%s)", event)
+            except Exception:
+                pass  # closed/destroyed queue
+        if len(alive) != len(subscribers):
+            with self._lock:
+                self._subscribers = alive
 
 
 _module_manager = EventManager()

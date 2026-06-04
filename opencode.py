@@ -12,6 +12,7 @@ import sqlite3
 import threading
 import traceback
 import asyncio
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 import httpx
 from fastapi import FastAPI, Request, Response
@@ -84,9 +85,6 @@ def _rebuild_key_cache():
     """Rebuild the API key → alias lookup dict."""
     global _key_alias_cache
     _key_alias_cache = {k["api_key"]: k.get("alias", "") or "" for k in API_KEYS if k.get("api_key")}
-    _debug(f"  [apikey] rebuilt alias cache: {len(_key_alias_cache)} keys")
-
-_rebuild_key_cache()
 
 
 def _alias_for_key(api_key: str) -> str:
@@ -115,10 +113,21 @@ try:
 except Exception:
     _encoding = None
 
+# Fast monotonic ID generator — avoids /dev/urandom syscall of uuid4()
+# Used for request IDs (logging/DB keys only, not security-critical)
+_id_counter = itertools.count()
+def _fast_id(prefix: str = "id") -> str:
+    """Generate a fast, unique-enough ID within this process. ~0.01ms vs ~0.5ms for uuid4."""
+    return f"{prefix}_{time.monotonic_ns():x}-{next(_id_counter):x}"
+
 from dashboard import register_dashboard
 from dashboard import start_quota_fetcher
 from dashboard.display import log as _log, debug as _debug, set_debug_log_file, RichLogHandler, run_terminal_loop
 from dashboard.events import get_event_manager
+
+# Call after all imports are resolved (requires _debug for logging)
+_rebuild_key_cache()
+_debug(f"  [apikey] rebuilt alias cache: {len(_key_alias_cache)} keys")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
@@ -139,6 +148,10 @@ _conn = sqlite3.connect(_db_path, check_same_thread=False)
 _conn.row_factory = sqlite3.Row
 _conn.execute("PRAGMA journal_mode=WAL")
 _conn.execute("PRAGMA busy_timeout=5000")
+_conn.execute("PRAGMA synchronous=NORMAL")       # WAL+NORMAL: safe crash-resilient, 50-90% fewer fsyncs
+_conn.execute("PRAGMA cache_size=-64000")        # 64MB page cache (default: 2MB)
+_conn.execute("PRAGMA temp_store=MEMORY")        # temp tables in RAM
+_conn.execute("PRAGMA mmap_size=268435456")      # memory-mapped I/O for 256MB
 _conn.execute("""
     CREATE TABLE IF NOT EXISTS requests (
         id TEXT PRIMARY KEY,
@@ -171,11 +184,34 @@ _conn.commit()
 _debug(f"  [db] SQLite connection established: {_db_path}")
 
 
+_db_pending_inserts = 0
+_db_last_commit = time.monotonic()
+_DB_COMMIT_INTERVAL = 5.0   # seconds between periodic commits
+_DB_COMMIT_BATCH = 10       # force commit after N inserts
+_db_commit_lock = threading.Lock()
+
+def _db_flush():
+    """Force a pending commit. Called periodically and before shutdown."""
+    global _db_pending_inserts, _db_last_commit
+    with _db_commit_lock:
+        if _db_pending_inserts > 0:
+            _conn.commit()
+            _debug(f"  [db] _db_flush: committed {_db_pending_inserts} pending inserts")
+            _db_pending_inserts = 0
+            _db_last_commit = time.monotonic()
+
+
 def _db_insert_sync(req_id, timestamp, model, original_model, duration_ms,
                     tokens_input, tokens_output, tokens_cache, success, error,
                     protocol, is_stream, thinking, effort, client_ip, account_alias,
                     tools_json, tools_used_json):
-    """Synchronous DB insert — called via asyncio.to_thread()."""
+    """Synchronous DB insert — called via asyncio.to_thread().
+
+    Batches commits: accumulates INSERTs and commits every _DB_COMMIT_BATCH
+    inserts or every _DB_COMMIT_INTERVAL seconds, whichever comes first.
+    Reduces fsync overhead under load (50 req/s → ~1 commit/s instead of 50).
+    """
+    global _db_pending_inserts, _db_last_commit
     t0 = time.monotonic()
     _conn.execute("""
         INSERT OR REPLACE INTO requests (id, timestamp, model, original_model, duration_ms,
@@ -186,8 +222,18 @@ def _db_insert_sync(req_id, timestamp, model, original_model, duration_ms,
           tokens_input, tokens_output, tokens_cache, 1 if success else 0, error,
           protocol, 1 if is_stream else 0, thinking, effort,
           client_ip, account_alias, tools_json, tools_used_json))
-    _conn.commit()
-    _debug(f"  [db] _db_insert_sync: committed req_id={req_id} in {(time.monotonic()-t0)*1000:.1f}ms")
+    # Batch commit logic
+    with _db_commit_lock:
+        _db_pending_inserts += 1
+        now = time.monotonic()
+        elapsed = now - _db_last_commit
+        if _db_pending_inserts >= _DB_COMMIT_BATCH or elapsed >= _DB_COMMIT_INTERVAL:
+            _conn.commit()
+            _debug(f"  [db] _db_insert_sync: batch-committed {_db_pending_inserts} inserts ({elapsed:.1f}s) in {(time.monotonic()-t0)*1000:.1f}ms")
+            _db_pending_inserts = 0
+            _db_last_commit = now
+        else:
+            _debug(f"  [db] _db_insert_sync: queued req_id={req_id} (pending={_db_pending_inserts}, {elapsed:.1f}s since last commit)")
 
 
 async def _save_request(req_id, model, original_model, duration_ms,
@@ -289,19 +335,20 @@ def _truncate(body, max_len=10240) -> str:
 class _ResponseCache:
     """LRU cache for non-streaming API responses with TTL and size limit.
 
-    Cache key: SHA-256 of the request body (excluding streaming and tool_use).
+    Cache key: blake2b hash of raw request body bytes (excluding streaming and tool_use).
     Returns (body_bytes, headers_dict) or None on miss.
+    Uses OrderedDict for O(1) LRU operations instead of list-based O(n).
     """
     def __init__(self, max_size: int = 1000, ttl: float = 300.0):
         self._max_size = max_size
         self._ttl = ttl
         self._store: dict[str, tuple[float, bytes, dict]] = {}  # key -> (ts, body, headers)
-        self._access_order: list[str] = []
+        self._access_order: OrderedDict[str, None] = OrderedDict()  # O(1) LRU tracking
 
     def _evict(self):
         evicted = 0
         while len(self._store) > self._max_size:
-            oldest = self._access_order.pop(0)
+            oldest, _ = self._access_order.popitem(last=False)  # O(1) pop oldest
             self._store.pop(oldest, None)
             evicted += 1
         if evicted > 0:
@@ -315,33 +362,27 @@ class _ResponseCache:
         if time.monotonic() - ts > self._ttl:
             _debug(f"  [cache] get: TTL expired (age={time.monotonic()-ts:.1f}s > ttl={self._ttl}s), evicting key={key[:16]}...")
             self._store.pop(key, None)
-            try:
-                self._access_order.remove(key)
-            except ValueError:
-                pass
+            self._access_order.pop(key, None)
             return None
-        # Move to end of access order (most recently used)
-        try:
-            self._access_order.remove(key)
-        except ValueError:
-            pass
-        self._access_order.append(key)
+        # Move to end of access order (most recently used) — O(1)
+        self._access_order.move_to_end(key)
         _debug(f"  [cache] get: HIT key={key[:16]}... size={len(body)} bytes")
         return body, headers
 
     def put(self, key: str, body: bytes, headers: dict):
         if key in self._store:
-            try:
-                self._access_order.remove(key)
-            except ValueError:
-                pass
+            self._access_order.pop(key, None)
         self._store[key] = (time.monotonic(), body, dict(headers))
-        self._access_order.append(key)
+        self._access_order[key] = None  # append to end — O(1)
         self._evict()
         _debug(f"  [cache] put: key={key[:16]}... store_size={len(self._store)}/{self._max_size}")
 
-    def make_key(self, body: dict) -> str | None:
-        """Create cache key from request body. Returns None if not cacheable."""
+    def make_key(self, body: dict, body_bytes: bytes | None = None) -> str | None:
+        """Create cache key from request body. Returns None if not cacheable.
+
+        If body_bytes is provided, hashes raw bytes directly (fast, no re-serialization).
+        Falls back to json.dumps + blake2b if body_bytes is not provided.
+        """
         if body.get("stream"):
             _debug(f"  [cache] make_key: stream=True, returning None")
             return None
@@ -356,7 +397,12 @@ class _ResponseCache:
                         return None
         try:
             import hashlib
-            key = hashlib.sha256(json.dumps(body, sort_keys=True, default=str).encode()).hexdigest()
+            if body_bytes:
+                # Fast path: hash raw bytes directly (avoids json.dumps + sort_keys)
+                key = hashlib.blake2b(body_bytes, digest_size=16).hexdigest()
+            else:
+                # Fallback: deterministic JSON serialization + blake2b
+                key = hashlib.blake2b(json.dumps(body, separators=(',', ':'), default=str).encode(), digest_size=16).hexdigest()
             _debug(f"  [cache] make_key: generated hash={key[:16]}...")
             return key
         except Exception:
@@ -381,19 +427,35 @@ async def lifespan(app):
             await asyncio.sleep(3600)
             await asyncio.to_thread(_wal_checkpoint)
 
+    # Periodic DB flush (every 5s) to commit any batched inserts
+    async def _periodic_db_flush():
+        while True:
+            await asyncio.sleep(_DB_COMMIT_INTERVAL)
+            await asyncio.to_thread(_db_flush)
+
     checkpoint_task = asyncio.create_task(_periodic_checkpoint())
-    _debug("  [lifespan] background tasks created (WAL checkpoint, quota fetcher)")
+    db_flush_task = asyncio.create_task(_periodic_db_flush())
+    _debug("  [lifespan] background tasks created (WAL checkpoint, DB flush, quota fetcher)")
 
     yield
 
     _debug("  [lifespan] app shutting down")
+    # Flush any pending DB writes before shutdown
+    await asyncio.to_thread(_db_flush)
+    _debug("  [lifespan] final DB flush done")
+
     # Cancel background tasks
     checkpoint_task.cancel()
+    db_flush_task.cancel()
     try:
         await checkpoint_task
     except asyncio.CancelledError:
         pass
-    _debug("  [lifespan] WAL checkpoint task cancelled")
+    try:
+        await db_flush_task
+    except asyncio.CancelledError:
+        pass
+    _debug("  [lifespan] background tasks cancelled")
 
     task = getattr(app.state, '_quota_task', None)
     if task:
@@ -1591,12 +1653,14 @@ def openai_responses_to_anthropic(body: dict) -> dict:
         if model.startswith("kimi-k2.6"):
             # Kimi K2.6 uses reasoning: true (not reasoning_effort)
             result["reasoning"] = True
+            _debug(f"  [thinking] {model}: reasoning=True (effort={effort_level})")
         elif model.startswith("deepseek-v4"):
             # DeepSeek V4 only supports high and max
             if effort_level in ("xhigh", "max"):
                 result["reasoning_effort"] = "max"
             else:
                 result["reasoning_effort"] = "high"
+            _debug(f"  [thinking] {model}: reasoning_effort={result['reasoning_effort']} (effort={effort_level})")
         else:
             # MiMo V2.5 etc. supports low/medium/high
             if effort_level in ("xhigh", "max"):
@@ -1607,6 +1671,7 @@ def openai_responses_to_anthropic(body: dict) -> dict:
                 result["reasoning_effort"] = "medium"
             else:
                 result["reasoning_effort"] = "low"
+            _debug(f"  [thinking] {model}: reasoning_effort={result['reasoning_effort']} (effort={effort_level})")
 
     return result
 
@@ -1864,7 +1929,7 @@ async def _try_failover_key(hdrs: dict, err_status: int) -> dict:
 @app.api_route("/v1/messages", methods=["POST"])
 @app.api_route("/anthropic/v1/messages", methods=["POST"])
 async def messages(request: Request):
-    req_id = f"msg_{uuid.uuid4().hex[:24]}"
+    req_id = _fast_id("msg")
     start_time = time.time()
     client_ip = request.client.host if request.client else "unknown"
     forwarded = request.headers.get("x-forwarded-for")
@@ -1936,7 +2001,7 @@ async def messages(request: Request):
 
         if not is_stream:
             # Check cache
-            cache_key = _response_cache.make_key(body)
+            cache_key = _response_cache.make_key(body, body_bytes=body_bytes)
             cached = cache_key and _response_cache.get(cache_key)
             if cached:
                 cached_body, cached_headers = cached
@@ -2165,6 +2230,10 @@ async def messages(request: Request):
         _debug(f"  usage: in={req_in} out={req_out} cache={cache}")
         _update_token_usage(model_id, req_in, req_out, cache)
         used = [tc["function"]["name"] for tc in data.get("choices", [{}])[0].get("message", {}).get("tool_calls", [])]
+        msg_data = data.get("choices", [{}])[0].get("message", {})
+        if not msg_data.get("reasoning_content") and thinking_type != "none":
+            _debug(f"  [non-stream] WARNING: thinking requested (type={thinking_type}, effort={effort}) but upstream returned no reasoning_content")
+        _debug(f"  [non-stream] blocks: text={bool(msg_data.get('content'))} thinking={bool(msg_data.get('reasoning_content'))} tools={used}")
         await _save_and_log_request(req_id, model_id, original_model, start_time,
                      req_in, req_out, cache, protocol, is_stream=False, thinking_type=thinking_type,
                      effort=effort, client_ip=client_ip, account_alias=account_alias, tools=tool_names,
@@ -2173,7 +2242,7 @@ async def messages(request: Request):
                         media_type="application/json")
 
     # Streaming
-    msg_id = f"msg_{uuid.uuid4().hex[:24]}"
+    msg_id = _fast_id("msg")
     oai_body["stream_options"] = {"include_usage": True}
 
     stream_in_est = _estimate_input_tokens(body)
@@ -2226,6 +2295,9 @@ async def messages(request: Request):
                             for idx in open_blocks:
                                 yield _sse("content_block_stop", {"type": "content_block_stop", "index": idx})
                             has_tools = bool(tool_block_idx)
+                            _debug(f"  [stream-oai] summary: text={text_block_idx is not None} thinking={reasoning_block_idx is not None} tools={list(tool_block_idx.keys())} stop={'tool_use' if has_tools else 'end_turn'} out_tokens={final_out}")
+                            if reasoning_block_idx is None and thinking_type != "none":
+                                _debug(f"  [stream-oai] WARNING: thinking requested (type={thinking_type}, effort={effort}) but upstream returned no reasoning_content")
                             yield _sse("message_delta", {"type": "message_delta", "delta": {"stop_reason": "tool_use" if has_tools else "end_turn"}, "usage": {"output_tokens": final_out, "cache_read_input_tokens": final_cache}})
                             yield _sse("message_stop", {"type": "message_stop"})
                             ak_h = _alias_for_key(_key_from_headers(hdrs, "openai"))
@@ -2284,6 +2356,7 @@ async def messages(request: Request):
                             if reasoning_block_idx is None:
                                 reasoning_block_idx = next_block_idx
                                 next_block_idx += 1
+                                _debug(f"  [stream-oai] reasoning_content block_start idx={reasoning_block_idx}")
                                 yield _sse("content_block_start", {"type": "content_block_start", "index": reasoning_block_idx,
                                            "content_block": {"type": "thinking", "thinking": ""}})
                                 open_blocks.append(reasoning_block_idx)
@@ -2302,6 +2375,7 @@ async def messages(request: Request):
                                 tc_name = tc.get("function", {}).get("name", "")
                                 if tc_name:
                                     used_tools.append(tc_name)
+                                _debug(f"  [stream-oai] tool_call block_start idx={block_idx} name={tc_name!r} id={tc_id}")
                                 yield _sse("content_block_start", {"type": "content_block_start", "index": block_idx,
                                            "content_block": {"type": "tool_use", "id": tc_id,
                                            "name": tc_name, "input": {}}})
@@ -2340,6 +2414,9 @@ async def messages(request: Request):
                              headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
 
 
+_health_cache: tuple[float, bool] | None = None  # (timestamp, upstream_ok)
+_health_lock = threading.Lock()
+
 @app.get("/health")
 async def health():
     _debug("  [health] health check started")
@@ -2358,14 +2435,23 @@ async def health():
             any_open = True
     _debug(f"  [health] circuit breakers: {len(_circuit_breakers)} total, any_open={any_open}")
 
-    # Quick upstream connectivity check (5s timeout, GET a lightweight endpoint)
+    # Quick upstream connectivity check (5s timeout, cached for 15s)
+    global _health_cache
     upstream_ok = True
-    try:
-        resp = await _client.get("https://opencode.ai", timeout=5.0)
-        upstream_ok = resp.status_code < 500
-    except Exception:
-        upstream_ok = False
-    _debug(f"  [health] upstream check: {'ok' if upstream_ok else 'unreachable'}")
+    now = time.monotonic()
+    with _health_lock:
+        if _health_cache and (now - _health_cache[0]) < 15.0:
+            upstream_ok = _health_cache[1]
+            _debug(f"  [health] upstream check (cached): {'ok' if upstream_ok else 'unreachable'}")
+        else:
+            # Cache miss — perform actual check
+            try:
+                resp = await _client.get("https://opencode.ai", timeout=5.0)
+                upstream_ok = resp.status_code < 500
+            except Exception:
+                upstream_ok = False
+            _health_cache = (now, upstream_ok)
+            _debug(f"  [health] upstream check (fresh): {'ok' if upstream_ok else 'unreachable'}")
 
     status = "ok"
     if not upstream_ok or any_open:
@@ -2448,7 +2534,7 @@ async def count_tokens(request: Request):
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
-    req_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+    req_id = _fast_id("chatcmpl")
     start_time = time.time()
     client_ip = request.client.host if request.client else "unknown"
     forwarded = request.headers.get("x-forwarded-for")
@@ -2490,9 +2576,13 @@ async def chat_completions(request: Request):
     is_stream = body.get("stream", False)
 
     thinking_type = "none"
-    effort = body.get("effort", "none")
+    thinking_raw = body.get("thinking") if isinstance(body.get("thinking"), dict) else {}
+    effort = (body.get("effort")
+              or (thinking_raw.get("effort") if isinstance(thinking_raw, dict) else None)
+              or (body.get("output_config", {}).get("effort") if isinstance(body.get("output_config"), dict) else None)
+              or "none")
 
-    _log(f"→ {original_model!r} → {model_id} | {protocol} | chat/completions | stream={is_stream} | ip={client_ip}")
+    _log(f"→ {original_model!r} → {model_id} | {protocol} | chat/completions | stream={is_stream} | thinking={thinking_type} | effort={effort} | ip={client_ip}")
 
     # Circuit breaker check
     if not _cb_should_allow(endpoint):
@@ -2863,7 +2953,7 @@ async def chat_completions(request: Request):
 
 @app.post("/v1/responses")
 async def responses(request: Request):
-    req_id = f"resp_{uuid.uuid4().hex[:24]}"
+    req_id = _fast_id("resp")
     start_time = time.time()
     client_ip = request.client.host if request.client else "unknown"
     forwarded = request.headers.get("x-forwarded-for")

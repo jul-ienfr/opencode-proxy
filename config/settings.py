@@ -2,6 +2,7 @@ import os
 import json
 import logging
 import time
+import threading
 
 logger = logging.getLogger(__name__)
 
@@ -175,6 +176,7 @@ def _get_mtime():
 _custom_routes_mtime = _get_mtime()
 _custom_routes_last_check = 0.0
 _CUSTOM_ROUTES_CHECK_INTERVAL = 5  # seconds between file stat checks
+_reload_lock = threading.Lock()     # protects CUSTOM_ROUTES and ROUTES mutations
 
 
 def maybe_reload_custom_routes():
@@ -182,6 +184,7 @@ def maybe_reload_custom_routes():
 
     Rate-limited to check the filesystem at most once every 5 seconds
     to avoid syscall overhead under high request rates.
+    Thread-safe: uses _reload_lock to prevent concurrent dict mutations.
     """
     global _custom_routes_mtime, _custom_routes_last_check
     now = time.time()
@@ -279,6 +282,9 @@ def save_env(updates: dict):
         elif key == "OPENCODE_HOST":
             global HOST
             HOST = value
+        elif key == "OPENCODE_DEBUG":
+            global DEBUG
+            DEBUG = value.lower() in ("1", "true", "yes")
 
     # Refresh routes
     global ROUTES

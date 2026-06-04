@@ -25,6 +25,7 @@
                 <button class="tab" data-tab="logs" data-i18n="nav.logs">Logs</button>
                 <button class="tab" data-tab="quotas" data-i18n="nav.quotas">Quotas</button>
                 <button class="tab" data-tab="config" data-i18n="nav.config">Configuration</button>
+                <button class="tab" data-tab="debug-logs" data-i18n="nav.debug_logs" style="display:none">Debug Logs</button>
             </nav>
             <div class="filter-controls">
                 <button class="btn active" data-range="today" data-i18n="filter.today">Today</button>
@@ -235,6 +236,17 @@
                         <button class="btn btn-primary" id="btn-save-config" data-i18n="config.save">Save Configuration</button>
                         <span id="config-save-status" class="save-status"></span>
                     </div>
+                    <!-- Debug Mode -->
+                    <div class="config-field" style="margin-top: 18px; padding-top: 15px; border-top: 1px solid var(--border);">
+                        <div style="display: flex; align-items: center; gap: 12px;">
+                            <label class="checkbox-label" style="flex: 1;">
+                                <input type="checkbox" id="cfg-debug-mode">
+                                <span data-i18n="config.debug_mode">Debug Mode</span>
+                            </label>
+                            <span id="debug-status-text" class="text-dim" style="font-size:0.85em" data-i18n="config.debug_off">Debug logging off</span>
+                        </div>
+                        <p class="config-hint" data-i18n="config.debug_desc">Enable verbose request/response logging. Logs persist across restarts.</p>
+                    </div>
                 </div>
 
                 <!-- Model mapping -->
@@ -383,6 +395,25 @@
                         </tbody>
                     </table>
                     <p class="config-hint" style="margin-top:8px"><span data-i18n="config.models_hint">Estimated request limits based on your plan's dollar caps and per-model pricing.</span> <a href="https://opencode.ai/docs/fr/go/#usage-limits" target="_blank" data-i18n="config.see_docs">See docs</a></p>
+                </div>
+            </section>
+
+            <section id="debug-logs" class="tab-content">
+                <div class="card">
+                    <h2 data-i18n="debug.title">Debug Log Viewer</h2>
+                    <div class="config-actions" style="margin-bottom: 12px; gap: 8px;">
+                        <button class="btn btn-danger" id="btn-clear-debug-log" data-i18n="debug.clear">Clear Log</button>
+                        <label class="checkbox-label" style="font-size:0.85em; cursor:pointer;">
+                            <input type="checkbox" id="debug-auto-refresh"> <span data-i18n="debug.auto_refresh">Auto-refresh</span>
+                        </label>
+                        <span id="debug-log-status" class="save-status"></span>
+                    </div>
+                    <div id="debug-log-content" style="background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:12px;max-height:600px;overflow-y:auto;font-family:monospace;font-size:0.82em;line-height:1.55;white-space:pre-wrap;word-break:break-all;" data-i18n="debug.loading">Loading...</div>
+                    <div class="pagination" id="debug-pagination" style="margin-top:10px">
+                        <button class="btn" id="debug-prev-page" data-i18n="page.prev">&laquo; Previous</button>
+                        <span id="debug-page-info">Page 1</span>
+                        <button class="btn" id="debug-next-page" data-i18n="page.next">Next &raquo;</button>
+                    </div>
                 </div>
             </section>
         </main>

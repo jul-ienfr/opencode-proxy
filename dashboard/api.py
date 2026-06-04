@@ -4,6 +4,7 @@ Dashboard API endpoints: stats, logs, history, config, static files.
 
 import json
 import os
+import time
 import asyncio
 import socket
 from fastapi import Request, Response
@@ -20,13 +21,47 @@ from .quota import get_quota_snapshot, get_available_models, get_model_limits_fo
 UNIVERSAL_TOOLS = {"Read", "Write", "Edit", "Bash", "Grep", "Glob", "WebSearch"}
 
 
+# ── Simple TTL cache for expensive dashboard queries ──
+
+class _TTLCache:
+    """In-memory cache with TTL for reducing redundant DB scans."""
+    def __init__(self, ttl: float = 10.0):
+        self._ttl = ttl
+        self._store: dict[str, tuple[float, any]] = {}
+
+    def get(self, key: str):
+        entry = self._store.get(key)
+        if entry and (time.monotonic() - entry[0]) < self._ttl:
+            return entry[1]
+        return None
+
+    def set(self, key: str, value):
+        self._store[key] = (time.monotonic(), value)
+
+    def invalidate(self, key: str | None = None):
+        if key:
+            self._store.pop(key, None)
+        else:
+            self._store.clear()
+
+_stats_cache = _TTLCache(ttl=10.0)
+_tools_cache = _TTLCache(ttl=30.0)
+
+# Cache for local IP resolution (rarely changes)
+_local_ips_cache: tuple[float, list] | None = None
+
+
 async def _db_query_sync(fn):
     """Run a synchronous DB function in a thread pool to avoid blocking the event loop."""
     return await asyncio.to_thread(fn)
 
 
 def _get_local_ips() -> list:
-    """Get all local network IP addresses (excluding loopback)."""
+    """Get all local network IP addresses (excluding loopback). Cached 60s."""
+    global _local_ips_cache
+    now = time.monotonic()
+    if _local_ips_cache and (now - _local_ips_cache[0]) < 60.0:
+        return _local_ips_cache[1]
     ips = []
     try:
         hostname = socket.gethostname()
@@ -47,6 +82,7 @@ def _get_local_ips() -> list:
             pass
         finally:
             s.close()
+    _local_ips_cache = (now, ips)
     return ips
 
 
@@ -306,6 +342,12 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
     @app.get("/api/stats")
     async def get_stats(from_date: str = None, to_date: str = None):
         where, params = _build_where(from_date, to_date)
+        cache_key = f"stats:{where}:{tuple(params)}"
+
+        # Return cached result if fresh (< 10s old)
+        cached = _stats_cache.get(cache_key)
+        if cached is not None:
+            return cached
 
         def _query_stats():
             row = conn.execute(
@@ -393,7 +435,9 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
                 "success_rate": round(a_success_rate, 1),
             }
 
-        return {"models": models, "accounts": accounts, "totals": totals}
+        result = {"models": models, "accounts": accounts, "totals": totals}
+        _stats_cache.set(cache_key, result)
+        return result
 
     @app.get("/api/logs")
     async def get_logs(limit: int = 100, offset: int = 0):
@@ -415,6 +459,8 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
         body = await request.json()
         enabled = body.get("enabled", False)
         config_settings.DEBUG = bool(enabled)
+        # Persist to .env so debug survives restarts
+        save_env({"OPENCODE_DEBUG": "1" if enabled else "0"})
         # Update display module's debug function too
         from dashboard.display import set_debug_log_file
         if enabled:
@@ -425,6 +471,43 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
         from dashboard.display import debug as _debug_fn
         _debug_fn(f"Debug mode {'ENABLED' if enabled else 'DISABLED'} via API")
         return {"enabled": config_settings.DEBUG}
+
+    @app.get("/api/debug/logs")
+    async def get_debug_logs(limit: int = 500, offset: int = 0):
+        """Return lines from logs/debug.log, most recent first."""
+        log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs")
+        debug_log_path = os.path.join(log_dir, "debug.log")
+        try:
+            if not os.path.exists(debug_log_path):
+                return {"logs": [], "total": 0, "has_more": False}
+            with open(debug_log_path, "r", encoding="utf-8", errors="replace") as f:
+                all_lines = f.readlines()
+            total = len(all_lines)
+            # Most recent first
+            all_lines = list(reversed(all_lines))
+            page = [line.rstrip("\n") for line in all_lines[offset:offset + limit]]
+            return {
+                "logs": page,
+                "total": total,
+                "has_more": offset + limit < total,
+            }
+        except Exception as e:
+            return {"logs": [], "total": 0, "has_more": False, "error": str(e)}
+
+    @app.delete("/api/debug/logs")
+    async def clear_debug_logs():
+        """Truncate logs/debug.log."""
+        log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs")
+        debug_log_path = os.path.join(log_dir, "debug.log")
+        try:
+            if os.path.exists(debug_log_path):
+                with open(debug_log_path, "w", encoding="utf-8") as f:
+                    f.truncate(0)
+            from dashboard.display import debug as _debug_fn
+            _debug_fn("Debug log cleared via API")
+            return {"status": "ok", "message": "Debug log cleared."}
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
 
     # ── SSE events ──
 

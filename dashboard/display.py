@@ -18,6 +18,7 @@ from rich import box
 log_lines = collections.deque(maxlen=200)
 LOG_VISIBLE = 35
 _log_scroll = 0
+_display_dirty = True  # Flag: set True when token usage changes, False after rebuild
 
 # Debug file handle — set via set_debug_log_file() after LOG_DIR is known
 _debug_file = None
@@ -237,8 +238,11 @@ def start_input_thread():
 
 
 def run_terminal_loop(routes, token_usage, token_lock):
+    global _display_dirty
     stop = start_input_thread()
     with Live(build_display(routes, token_usage, token_lock), refresh_per_second=1, screen=True) as live:
         while stop():
-            live.update(build_display(routes, token_usage, token_lock))
-            time.sleep(1)
+            if _display_dirty:
+                _display_dirty = False
+                live.update(build_display(routes, token_usage, token_lock))
+            time.sleep(0.5)

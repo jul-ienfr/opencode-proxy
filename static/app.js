@@ -138,6 +138,19 @@ const LOCALE = {
         'config.tr_no_tools': 'No tools detected in recent requests.',
         'config.tr_alert_save': 'No tools to route.',
         'config.cr_select_model': 'Select model...',
+        'config.debug_mode': 'Debug Mode',
+        'config.debug_desc': 'Enable verbose request/response logging. Logs persist across restarts.',
+        'config.debug_enabled': 'Debug logging active',
+        'config.debug_off': 'Debug logging off',
+        'config.debug_save': 'Toggle',
+        'nav.debug_logs': 'Debug Logs',
+        'debug.title': 'Debug Log Viewer',
+        'debug.clear': 'Clear Log',
+        'debug.cleared': 'Log cleared.',
+        'debug.auto_refresh': 'Auto-refresh',
+        'debug.no_data': 'No debug logs. Enable debug mode in Configuration first.',
+        'debug.loading': 'Loading...',
+        'debug.lines': 'lines',
         'config.api_keys': 'API Keys',
         'config.api_keys_desc': 'Configure API keys for upstream access. Each key can have its own Go workspace credentials.',
         'config.ak_alias': 'Alias',
@@ -295,6 +308,19 @@ const LOCALE = {
         'config.tr_no_tools': 'Aucun outil détecté dans les requêtes récentes.',
         'config.tr_alert_save': 'Rien à sauvegarder.',
         'config.cr_select_model': 'Sélectionner un modèle...',
+        'config.debug_mode': 'Mode Debug',
+        'config.debug_desc': 'Activer la journalisation détaillée des requêtes/réponses. Les logs persistent après redémarrage.',
+        'config.debug_enabled': 'Debug actif',
+        'config.debug_off': 'Debug désactivé',
+        'config.debug_save': 'Basculer',
+        'nav.debug_logs': 'Logs Debug',
+        'debug.title': 'Visionneuse de Logs Debug',
+        'debug.clear': 'Vider le log',
+        'debug.cleared': 'Log vidé.',
+        'debug.auto_refresh': 'Actualisation auto',
+        'debug.no_data': 'Aucun log debug. Activez le mode debug dans Configuration.',
+        'debug.loading': 'Chargement...',
+        'debug.lines': 'lignes',
         'config.api_keys': 'Clés API',
         'config.api_keys_desc': 'Configurez les clés API. Chaque clé peut avoir ses propres identifiants Go workspace.',
         'config.ak_alias': 'Alias',
@@ -486,6 +512,73 @@ async function fetchQuotas() {
         console.error('Failed to fetch quotas:', e);
         return null;
     }
+}
+
+async function fetchDebugStatus() {
+    try {
+        return await apiFetch('/api/debug');
+    } catch (e) {
+        console.error('Failed to fetch debug status:', e);
+        return { enabled: false };
+    }
+}
+
+async function setDebugMode(enabled) {
+    try {
+        return await apiFetch('/api/debug', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ enabled }),
+        });
+    } catch (e) {
+        console.error('Failed to set debug mode:', e);
+        return { enabled: false };
+    }
+}
+
+// Debug logs pagination state
+let debugLogPage = 1;
+const debugLogPerPage = 200;
+let debugLogTotalPages = 1;
+
+async function fetchDebugLogs(page = 1) {
+    try {
+        const offset = (page - 1) * debugLogPerPage;
+        return await apiFetch(`/api/debug/logs?limit=${debugLogPerPage}&offset=${offset}`);
+    } catch (e) {
+        console.error('Failed to fetch debug logs:', e);
+        return { logs: [], total: 0, has_more: false };
+    }
+}
+
+async function clearDebugLogs() {
+    try {
+        return await apiFetch('/api/debug/logs', { method: 'DELETE' });
+    } catch (e) {
+        console.error('Failed to clear debug logs:', e);
+        return { status: 'error' };
+    }
+}
+
+function renderDebugLogLines(data) {
+    const el = document.getElementById('debug-log-content');
+    if (!data || !data.logs || data.logs.length === 0) {
+        el.textContent = t('debug.no_data');
+        el.style.color = 'var(--text-dim)';
+        return;
+    }
+    el.style.color = '';
+    el.textContent = data.logs.join('\n');
+    // Scroll to bottom (most recent at bottom after reverse in API)
+    el.scrollTop = el.scrollHeight;
+    // Update pagination
+    debugLogTotalPages = Math.max(1, Math.ceil(data.total / debugLogPerPage));
+    const pageInfo = document.getElementById('debug-page-info');
+    const prevBtn = document.getElementById('debug-prev-page');
+    const nextBtn = document.getElementById('debug-next-page');
+    pageInfo.textContent = t('page.of').replace('{c}', debugLogPage).replace('{t}', debugLogTotalPages);
+    prevBtn.disabled = debugLogPage <= 1;
+    nextBtn.disabled = debugLogPage >= debugLogTotalPages;
 }
 
 function formatResetTime(seconds) {
@@ -850,6 +943,21 @@ function renderConfig(data) {
     document.getElementById('cfg-routing').value = data.routing || 'round-robin';
     document.getElementById('cfg-disable-mapping').checked = data.disable_mapping || false;
 
+    // Debug mode state
+    fetchDebugStatus().then(debugData => {
+        const debugCb = document.getElementById('cfg-debug-mode');
+        const debugText = document.getElementById('debug-status-text');
+        const debugLogsTabBtn = document.querySelector('[data-tab="debug-logs"]');
+        if (debugCb) debugCb.checked = debugData.enabled;
+        if (debugText) {
+            debugText.textContent = debugData.enabled ? t('config.debug_enabled') : t('config.debug_off');
+            debugText.className = '';
+            debugText.style.color = debugData.enabled ? 'var(--success)' : 'var(--text-dim)';
+        }
+        // Show/hide debug logs tab
+        if (debugLogsTabBtn) debugLogsTabBtn.style.display = debugData.enabled ? '' : 'none';
+    });
+
     // Enable/disable mapping fields based on checkbox
     const mappingGrid = document.getElementById('mapping-grid');
     const routeFields = mappingGrid ? mappingGrid.querySelectorAll('.config-field') : [];
@@ -1029,6 +1137,9 @@ function setupTabs() {
                 fetchConfig().then(renderConfig);
             } else if (target === 'quotas') {
                 fetchQuotas().then(renderQuotas);
+            } else if (target === 'debug-logs') {
+                debugLogPage = 1;
+                fetchDebugLogs(1).then(renderDebugLogLines);
             }
         });
     });
@@ -1364,6 +1475,24 @@ function setupConfig() {
             console.error(e);
         }
     });
+
+    // ── Debug mode toggle ──
+    const debugCb = document.getElementById('cfg-debug-mode');
+    const debugText = document.getElementById('debug-status-text');
+    if (debugCb) {
+        debugCb.addEventListener('change', async () => {
+            const enabled = debugCb.checked;
+            const result = await setDebugMode(enabled);
+            if (debugText) {
+                debugText.textContent = enabled ? t('config.debug_enabled') : t('config.debug_off');
+                debugText.className = '';
+                debugText.style.color = enabled ? 'var(--success)' : 'var(--text-dim)';
+            }
+            // Show/hide debug logs tab
+            const debugLogsTabBtn = document.querySelector('[data-tab="debug-logs"]');
+            if (debugLogsTabBtn) debugLogsTabBtn.style.display = enabled ? '' : 'none';
+        });
+    }
 }
 
 var _refreshing = false;
@@ -1426,6 +1555,12 @@ document.addEventListener('DOMContentLoaded', () => {
     setupConfig();
     refreshAll();
 
+    // Show/hide debug logs tab based on debug mode state
+    fetchDebugStatus().then(debugData => {
+        const debugLogsTabBtn = document.querySelector('[data-tab="debug-logs"]');
+        if (debugLogsTabBtn) debugLogsTabBtn.style.display = debugData.enabled ? '' : 'none';
+    });
+
     // Language selector
     const langSelect = document.getElementById('lang-select');
     if (langSelect) {
@@ -1483,7 +1618,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 refreshAll();
             }, 200);
         });
-        es.addEventListener('connected', () => { startPolling(30000); sseRetryDelay = 1000; });
+        es.addEventListener('connected', () => { stopPolling(); sseRetryDelay = 1000; });
         es.addEventListener('quotas_updated', () => {
             fetchQuotas().then(renderQuotas);
         });
@@ -1584,6 +1719,53 @@ document.addEventListener('DOMContentLoaded', () => {
     document.addEventListener('click', (e) => {
         if (!e.target.closest('.delete-section')) {
             deleteMenu.style.display = 'none';
+        }
+    });
+
+    // ── Debug Logs: clear ──
+    document.getElementById('btn-clear-debug-log').addEventListener('click', async () => {
+        const status = document.getElementById('debug-log-status');
+        try {
+            await clearDebugLogs();
+            status.textContent = t('debug.cleared');
+            status.className = 'save-status success';
+            setTimeout(() => { status.textContent = ''; }, 3000);
+            debugLogPage = 1;
+            fetchDebugLogs(1).then(renderDebugLogLines);
+        } catch (e) {
+            status.textContent = 'Error';
+            status.className = 'save-status error';
+        }
+    });
+
+    // ── Debug Logs: pagination ──
+    document.getElementById('debug-prev-page').addEventListener('click', () => {
+        if (debugLogPage > 1) {
+            debugLogPage--;
+            fetchDebugLogs(debugLogPage).then(renderDebugLogLines);
+        }
+    });
+
+    document.getElementById('debug-next-page').addEventListener('click', () => {
+        if (debugLogPage < debugLogTotalPages) {
+            debugLogPage++;
+            fetchDebugLogs(debugLogPage).then(renderDebugLogLines);
+        }
+    });
+
+    // ── Debug Logs: auto-refresh ──
+    let debugAutoRefreshTimer = null;
+    document.getElementById('debug-auto-refresh').addEventListener('change', (e) => {
+        if (e.target.checked) {
+            debugAutoRefreshTimer = setInterval(() => {
+                // Only refresh if debug-logs tab is active
+                const activeTab = document.querySelector('.tab.active');
+                if (activeTab && activeTab.dataset.tab === 'debug-logs') {
+                    fetchDebugLogs(debugLogPage).then(renderDebugLogLines);
+                }
+            }, 3000);
+        } else {
+            if (debugAutoRefreshTimer) { clearInterval(debugAutoRefreshTimer); debugAutoRefreshTimer = null; }
         }
     });
 
