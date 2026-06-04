@@ -4,6 +4,7 @@ Rich terminal display: token usage table, log panel, keyboard input.
 
 import sys
 import time
+import os
 import collections
 import threading
 import logging
@@ -18,6 +19,18 @@ log_lines = collections.deque(maxlen=200)
 LOG_VISIBLE = 35
 _log_scroll = 0
 
+# Debug file handle — set via set_debug_log_file() after LOG_DIR is known
+_debug_file = None
+
+
+def set_debug_log_file(path: str):
+    """Open (or create) the debug log file. Called once at startup by opencode.py."""
+    global _debug_file
+    try:
+        _debug_file = open(path, "a", encoding="utf-8")
+    except Exception:
+        _debug_file = None
+
 
 def log(msg: str):
     global _log_scroll
@@ -26,6 +39,23 @@ def log(msg: str):
     ts = time.strftime("%H:%M:%S")
     log_lines.append(f"[{ts}] {msg}")
     _log_scroll = max(0, len(log_lines) - LOG_VISIBLE)
+
+
+def debug(msg: str):
+    """Emit a debug message to terminal + debug.log file. No-op when DEBUG is off."""
+    import config.settings as _cfg
+    if not _cfg.DEBUG:
+        return
+    # Write to terminal / web dashboard
+    log(f"[DEBUG] {msg}")
+    # Write to debug.log file
+    if _debug_file is not None:
+        try:
+            ts = time.strftime("%Y-%m-%d %H:%M:%S")
+            _debug_file.write(f"[{ts}] {msg}\n")
+            _debug_file.flush()
+        except Exception:
+            pass
 
 
 class RichLogHandler(logging.Handler):

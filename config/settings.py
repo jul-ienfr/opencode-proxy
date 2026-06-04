@@ -33,6 +33,7 @@ OPENCODE_GO_WORKSPACE_ID = os.getenv("OPENCODE_GO_WORKSPACE_ID", "")
 OPENCODE_GO_AUTH_COOKIE = os.getenv("OPENCODE_GO_AUTH_COOKIE", "")
 API_KEY_ROUTING = os.getenv("API_KEY_ROUTING", "round-robin")
 CACHE_MIN_PROMPT_SIZE = int(os.getenv("CACHE_MIN_PROMPT_SIZE", "2000"))
+DEBUG = os.getenv("OPENCODE_DEBUG", "").lower() in ("1", "true", "yes")
 
 API_BASE_OPENAI    = "https://opencode.ai/zen/go/v1/chat/completions"
 API_BASE_ANTHROPIC = "https://opencode.ai/zen/go/v1/messages"

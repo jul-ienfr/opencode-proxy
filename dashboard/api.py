@@ -402,6 +402,28 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
             "has_more": offset + limit < len(lines)
         }
 
+    # ── Debug toggle ──
+
+    @app.get("/api/debug")
+    async def get_debug():
+        return {"enabled": config_settings.DEBUG}
+
+    @app.post("/api/debug")
+    async def set_debug(request: Request):
+        body = await request.json()
+        enabled = body.get("enabled", False)
+        config_settings.DEBUG = bool(enabled)
+        # Update display module's debug function too
+        from dashboard.display import set_debug_log_file
+        if enabled:
+            from config import settings
+            log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs")
+            debug_log_path = os.path.join(log_dir, "debug.log")
+            set_debug_log_file(debug_log_path)
+        from dashboard.display import debug as _debug_fn
+        _debug_fn(f"Debug mode {'ENABLED' if enabled else 'DISABLED'} via API")
+        return {"enabled": config_settings.DEBUG}
+
     # ── SSE events ──
 
     @app.get("/api/events")
