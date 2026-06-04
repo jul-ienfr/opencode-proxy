@@ -1850,8 +1850,7 @@ async def messages(request: Request):
 
         # Estimate input tokens for Anthropic streaming
         est_input = _estimate_input_tokens(body)
-        with _token_lock:
-            _token_usage[model_id]["input"] += est_input
+        _update_token_usage(model_id, est_input, 0, 0)
 
         async def anthropic_stream(headers):
             stream_in = None
@@ -1900,13 +1899,19 @@ async def messages(request: Request):
                                     stream_in = usage.get("input_tokens")
                                     started = True
                                     if stream_in is not None:
-                                        with _token_lock:
-                                            _token_usage[model_id]["input"] -= est_input
-                                            _token_usage[model_id]["input"] += stream_in
+                                        try:
+                                            with _token_lock:
+                                                _token_usage[model_id]["input"] -= est_input
+                                                _token_usage[model_id]["input"] += stream_in
+                                        except Exception:
+                                            pass
                                     stream_cache = usage.get("cache_read_input_tokens", 0)
                                     if stream_cache:
-                                        with _token_lock:
-                                            _token_usage[model_id]["cache"] += stream_cache
+                                        try:
+                                            with _token_lock:
+                                                _token_usage[model_id]["cache"] += stream_cache
+                                        except Exception:
+                                            pass
                                 elif etype == "content_block_start":
                                     block = event.get("content_block", {})
                                     if block.get("type") == "tool_use" and block.get("name"):
@@ -1922,19 +1927,28 @@ async def messages(request: Request):
                                     stop_reason = event.get("delta", {}).get("stop_reason", stop_reason)
                         # After stream ends, apply final output token count
                         if stream_out:
-                            with _token_lock:
-                                _token_usage[model_id]["output"] += stream_out
+                            try:
+                                with _token_lock:
+                                    _token_usage[model_id]["output"] += stream_out
+                            except Exception:
+                                pass
                 except Exception as e:
                     ak = _alias_for_key(headers.get("x-api-key", "")) if headers else ""
                     _log(f"  ERROR stream (attempt {_attempt+1}): {type(e).__name__}: {e}")
                     if _attempt == 0:
                         continue  # retry once on connection error
                     if stream_in is None:
-                        with _token_lock:
-                            _token_usage[model_id]["input"] -= est_input
+                        try:
+                            with _token_lock:
+                                _token_usage[model_id]["input"] -= est_input
+                        except Exception:
+                            pass
                     if stream_out:
-                        with _token_lock:
-                            _token_usage[model_id]["output"] += stream_out
+                        try:
+                            with _token_lock:
+                                _token_usage[model_id]["output"] += stream_out
+                        except Exception:
+                            pass
                     await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
                                  stream_in if stream_in is not None else est_input, stream_out, stream_cache, success=False, error=str(e),
                                  protocol=protocol, is_stream=True, thinking=thinking_type, effort=effort,
@@ -2014,8 +2028,7 @@ async def messages(request: Request):
     oai_body["stream_options"] = {"include_usage": True}
 
     stream_in_est = _estimate_input_tokens(body)
-    with _token_lock:
-        _token_usage[model_id]["input"] += stream_in_est
+    _update_token_usage(model_id, stream_in_est, 0, 0)
 
     async def stream_gen(hdrs):
         started = False
@@ -2151,8 +2164,11 @@ async def messages(request: Request):
                 _log(f"  ERROR stream (attempt {_attempt+1}): {type(e).__name__}: {e}")
                 if _attempt == 0:
                     continue  # retry once on connection error
-                with _token_lock:
-                    _token_usage[model_id]["input"] -= stream_in_est
+                try:
+                    with _token_lock:
+                        _token_usage[model_id]["input"] -= stream_in_est
+                except Exception:
+                    pass
                 ak_h = _alias_for_key(_key_from_headers(hdrs, "openai"))
                 await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
                              stream_in_est, stream_out_tokens, 0, success=False, error=str(e),
@@ -2357,8 +2373,7 @@ async def chat_completions(request: Request):
         oai_body["stream_options"] = {"include_usage": True}
 
         est_input = _estimate_input_tokens(body)
-        with _token_lock:
-            _token_usage[model_id]["input"] += est_input
+        _update_token_usage(model_id, est_input, 0, 0)
 
         async def openai_stream(hdrs):
             stream_out = 0
@@ -2423,8 +2438,11 @@ async def chat_completions(request: Request):
                     _log(f"  ERROR stream (attempt {_attempt+1}): {type(e).__name__}: {e}")
                     if _attempt == 0:
                         continue  # retry once on connection error
-                    with _token_lock:
-                        _token_usage[model_id]["input"] -= est_input
+                    try:
+                        with _token_lock:
+                            _token_usage[model_id]["input"] -= est_input
+                    except Exception:
+                        pass
                     ak_h = _alias_for_key(_key_from_headers(hdrs, "openai"))
                     await _log_and_save_error(req_id, model_id, original_model, start_time,
                                  0, str(e), protocol, True, thinking_type,
@@ -2476,7 +2494,11 @@ async def chat_completions(request: Request):
             oai_err = json.dumps({"error": {"message": err_msg, "type": "api_error"}}, ensure_ascii=False)
             return Response(content=oai_err, status_code=resp.status_code, media_type="application/json")
 
-        data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+        try:
+            data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+        except Exception:
+            _log(f"  UPSTREAM DECODE ERROR: non-JSON response from {endpoint}")
+            return JSONResponse(status_code=502, content={"error": "Upstream returned non-JSON response"})
         usage = data.get("usage", {})
         req_in = usage.get("input_tokens", 0) or usage.get("prompt_tokens", 0)
         req_out = usage.get("output_tokens", 0) or usage.get("completion_tokens", 0)
@@ -2655,8 +2677,11 @@ async def chat_completions(request: Request):
                              protocol=protocol, is_stream=True, thinking=thinking_type, effort=effort,
                              client_ip=client_ip, account_alias=ak, tools=tool_names)
                 if total_input:
-                    with _token_lock:
-                        _token_usage[model_id]["input"] += total_input
+                    try:
+                        with _token_lock:
+                            _token_usage[model_id]["input"] += total_input
+                    except Exception:
+                        pass
                 if started:
                     yield _chunk({}, "stop")
                     yield b"data: [DONE]\n\n"
@@ -2769,7 +2794,11 @@ async def responses(request: Request):
                 except Exception:
                     err_msg = resp.text[:200]
                 return Response(content=json.dumps({"error": {"message": err_msg}}), status_code=resp.status_code, media_type="application/json")
-            data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+            try:
+                data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+            except Exception:
+                _log(f"  UPSTREAM DECODE ERROR: non-JSON response from {endpoint}")
+                return JSONResponse(status_code=502, content={"error": "Upstream returned non-JSON response"})
             usage = data.get("usage", {})
             req_in = usage.get("input_tokens", 0) or usage.get("prompt_tokens", 0)
             req_out = usage.get("output_tokens", 0) or usage.get("completion_tokens", 0)
@@ -2796,7 +2825,11 @@ async def responses(request: Request):
                 yield b"data: [DONE]\n\n"
             return StreamingResponse(err_stream(), media_type="text/event-stream",
                                      headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
-        data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+        try:
+            data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+        except Exception:
+            _log(f"  UPSTREAM DECODE ERROR: non-JSON response from {endpoint}")
+            return JSONResponse(status_code=502, content={"error": "Upstream returned non-JSON response"})
         usage = data.get("usage", {})
         req_in = usage.get("input_tokens", 0) or usage.get("prompt_tokens", 0)
         req_out = usage.get("output_tokens", 0) or usage.get("completion_tokens", 0)
@@ -2838,7 +2871,11 @@ async def responses(request: Request):
             except Exception:
                 err_msg = resp.text[:200]
             return Response(content=json.dumps({"error": {"message": err_msg}}), status_code=resp.status_code, media_type="application/json")
-        data = resp.json()
+        try:
+            data = resp.json()
+        except Exception:
+            _log(f"  UPSTREAM DECODE ERROR: non-JSON response from {endpoint}")
+            return JSONResponse(status_code=502, content={"error": "Upstream returned non-JSON response"})
         usage = data.get("usage", {})
         req_in = usage.get("prompt_tokens", 0)
         req_out = usage.get("completion_tokens", 0)
@@ -2867,7 +2904,11 @@ async def responses(request: Request):
             yield b"data: [DONE]\n\n"
         return StreamingResponse(err_stream(), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
-    data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+    try:
+        data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+    except Exception:
+        _log(f"  UPSTREAM DECODE ERROR: non-JSON response from {endpoint}")
+        return JSONResponse(status_code=502, content={"error": "Upstream returned non-JSON response"})
     usage = data.get("usage", {})
     req_in = usage.get("prompt_tokens", 0)
     req_out = usage.get("completion_tokens", 0)
