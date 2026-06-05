@@ -993,62 +993,94 @@ function showRequestDetail(reqId) {
     const modal = document.getElementById('request-detail-modal');
     const content = document.getElementById('req-detail-content');
 
-    const statusHtml = log.success
-        ? '<span class="status-ok">&#10004; Success</span>'
-        : `<span class="status-fail">&#10008; ${escHtml(log.error || 'Error')}</span>`;
-
-    const toolsUsedHtml = (log.tools_used && log.tools_used.length)
-        ? log.tools_used.map(t => `<span class="tool-badge used">${escHtml(t)}</span>`).join(' ')
-        : '<span style="color:#888">-</span>';
-
-    const toolsDeclaredHtml = (log.tools && log.tools.length)
-        ? log.tools.map(t => `<span class="tool-badge declared">${escHtml(t)}</span>`).join(' ')
-        : '<span style="color:#888">-</span>';
-
-    content.innerHTML = `
-        <div class="detail-grid">
-            <span class="detail-label">Status</span>
-            <span class="detail-value">${statusHtml}</span>
-            <span class="detail-label">ID</span>
-            <span class="detail-value" style="font-family:monospace;font-size:0.85em">${escHtml(log.id)}</span>
-            <span class="detail-label">Timestamp</span>
-            <span class="detail-value">${formatDateTime(log.timestamp)}</span>
-            <span class="detail-label">Account</span>
-            <span class="detail-value">${escHtml(log.account_alias) || '-'}</span>
-            <span class="detail-label">Original Model</span>
-            <span class="detail-value">${escHtml(log.original_model) || '-'}</span>
-            <span class="detail-label">Mapped Model</span>
-            <span class="detail-value">${escHtml(log.model) || '-'}</span>
-            <span class="detail-label">Protocol</span>
-            <span class="detail-value">${escHtml(log.protocol) || '-'}</span>
-            <span class="detail-label">Stream</span>
-            <span class="detail-value">${log.is_stream ? 'Yes' : 'No'}</span>
-            <span class="detail-label">Duration</span>
-            <span class="detail-value">${log.duration_ms ? formatNumber(log.duration_ms) + ' ms' : '-'}</span>
-            <span class="detail-label">Input Tokens</span>
-            <span class="detail-value">${formatNumber(log.tokens_input)}</span>
-            <span class="detail-label">Output Tokens</span>
-            <span class="detail-value">${formatNumber(log.tokens_output)}</span>
-            <span class="detail-label">Cache Tokens</span>
-            <span class="detail-value">${formatNumber(log.tokens_cache)}</span>
-            <span class="detail-label">Thinking</span>
-            <span class="detail-value">${escHtml(log.thinking) || '-'}</span>
-            <span class="detail-label">Effort</span>
-            <span class="detail-value">${escHtml(log.effort) || '-'}</span>
-        </div>
-
-        <div class="detail-section">
-            <h4>Tools Used (${log.tools_used ? log.tools_used.length : 0})</h4>
-            <div class="detail-tools-list">${toolsUsedHtml}</div>
-        </div>
-
-        <div class="detail-section">
-            <h4>Tools Declared (${log.tools ? log.tools.length : 0})</h4>
-            <div class="detail-tools-list">${toolsDeclaredHtml}</div>
-        </div>
-    `;
-
+    // Show loading state while fetching full details
+    content.innerHTML = '<p style="color:#888;text-align:center;padding:20px">Loading details...</p>';
     modal.style.display = 'flex';
+
+    // Fetch full details from API
+    fetch(`/api/requests/${encodeURIComponent(reqId)}`)
+        .then(r => r.json())
+        .then(detail => {
+            const statusHtml = detail.success
+                ? '<span class="status-ok">&#10004; Success</span>'
+                : `<span class="status-fail">&#10008; ${escHtml(detail.error || 'Error')}</span>`;
+
+            const toolsUsedHtml = (detail.tools_used && detail.tools_used.length)
+                ? [...new Set(detail.tools_used)].map(t => `<span class="tool-badge used">${escHtml(t)}</span>`).join(' ')
+                : '<span style="color:#888">-</span>';
+
+            const toolsDeclaredHtml = (detail.tools && detail.tools.length)
+                ? detail.tools.map(t => `<span class="tool-badge declared">${escHtml(t)}</span>`).join(' ')
+                : '<span style="color:#888">-</span>';
+
+            // Build collapsible JSON sections
+            function jsonSection(title, data, collapsed) {
+                if (!data) return '';
+                const jsonStr = JSON.stringify(data, null, 2);
+                const size = jsonStr.length;
+                const sizeLabel = size > 1024 ? `${(size/1024).toFixed(1)} KB` : `${size} B`;
+                const id = 'json-' + title.toLowerCase().replace(/[^a-z0-9]+/g, '-');
+                return `
+                    <div class="detail-section">
+                        <h4 class="json-toggle" onclick="document.getElementById('${id}').classList.toggle('collapsed'); this.classList.toggle('collapsed')">
+                            ${collapsed ? '&#9654;' : '&#9660;'} ${escHtml(title)} <span class="json-size">(${sizeLabel})</span>
+                        </h4>
+                        <pre id="${id}" class="json-block${collapsed ? ' collapsed' : ''}"><code>${escHtml(jsonStr)}</code></pre>
+                    </div>
+                `;
+            }
+
+            content.innerHTML = `
+                <div class="detail-grid">
+                    <span class="detail-label">Status</span>
+                    <span class="detail-value">${statusHtml}</span>
+                    <span class="detail-label">ID</span>
+                    <span class="detail-value" style="font-family:monospace;font-size:0.85em">${escHtml(detail.id)}</span>
+                    <span class="detail-label">Timestamp</span>
+                    <span class="detail-value">${formatDateTime(detail.timestamp)}</span>
+                    <span class="detail-label">Account</span>
+                    <span class="detail-value">${escHtml(detail.account_alias) || '-'}</span>
+                    <span class="detail-label">Client IP</span>
+                    <span class="detail-value">${escHtml(detail.client_ip) || '-'}</span>
+                    <span class="detail-label">Original Model</span>
+                    <span class="detail-value">${escHtml(detail.original_model) || '-'}</span>
+                    <span class="detail-label">Mapped Model</span>
+                    <span class="detail-value">${escHtml(detail.model) || '-'}</span>
+                    <span class="detail-label">Protocol</span>
+                    <span class="detail-value">${escHtml(detail.protocol) || '-'}</span>
+                    <span class="detail-label">Stream</span>
+                    <span class="detail-value">${detail.is_stream ? 'Yes' : 'No'}</span>
+                    <span class="detail-label">Duration</span>
+                    <span class="detail-value">${detail.duration_ms ? formatNumber(detail.duration_ms) + ' ms' : '-'}</span>
+                    <span class="detail-label">Input Tokens</span>
+                    <span class="detail-value">${formatNumber(detail.tokens_input)}</span>
+                    <span class="detail-label">Output Tokens</span>
+                    <span class="detail-value">${formatNumber(detail.tokens_output)}</span>
+                    <span class="detail-label">Cache Tokens</span>
+                    <span class="detail-value">${formatNumber(detail.tokens_cache)}</span>
+                    <span class="detail-label">Thinking</span>
+                    <span class="detail-value">${escHtml(detail.thinking) || '-'}</span>
+                    <span class="detail-label">Effort</span>
+                    <span class="detail-value">${escHtml(detail.effort) || '-'}</span>
+                </div>
+
+                <div class="detail-section">
+                    <h4>Tools Used (${detail.tools_used ? [...new Set(detail.tools_used)].length : 0})</h4>
+                    <div class="detail-tools-list">${toolsUsedHtml}</div>
+                </div>
+
+                <div class="detail-section">
+                    <h4>Tools Declared (${detail.tools ? detail.tools.length : 0})</h4>
+                    <div class="detail-tools-list">${toolsDeclaredHtml}</div>
+                </div>
+
+                ${jsonSection('Request Body', detail.request_body, false)}
+                ${jsonSection('Response Body', detail.response_body, true)}
+            `;
+        })
+        .catch(err => {
+            content.innerHTML = `<p style="color:#f44">Failed to load details: ${escHtml(err.message)}</p>`;
+        });
 }
 
 function renderHistory(data) {
@@ -1086,9 +1118,10 @@ function renderHistory(data) {
         // Tools: show badges for actually used tools
         let toolsHtml = '-';
         if (log.tools_used && log.tools_used.length) {
-            const badges = log.tools_used.slice(0, 5).map(t => `<span class="tool-badge used">${escHtml(t)}</span>`).join('');
-            const more = log.tools_used.length > 5 ? `<span class="tool-badge declared">+${log.tools_used.length - 5}</span>` : '';
-            const tooltip = (log.tools && log.tools.length) ? `Déclarés: ${log.tools.join(', ')}\nUtilisés: ${log.tools_used.join(', ')}` : `Utilisés: ${log.tools_used.join(', ')}`;
+            const uniqueTools = [...new Set(log.tools_used)];
+            const badges = uniqueTools.slice(0, 5).map(t => `<span class="tool-badge used">${escHtml(t)}</span>`).join('');
+            const more = uniqueTools.length > 5 ? `<span class="tool-badge declared">+${uniqueTools.length - 5}</span>` : '';
+            const tooltip = (log.tools && log.tools.length) ? `Déclarés: ${log.tools.join(', ')}\nUtilisés: ${uniqueTools.join(', ')}` : `Utilisés: ${uniqueTools.join(', ')}`;
             toolsHtml = `<span title="${escHtml(tooltip)}">${badges}${more}</span>`;
         } else if (log.tools && log.tools.length) {
             toolsHtml = `<span title="${escHtml(log.tools.join(', '))}"><span class="tool-badge declared">${log.tools.length} declared</span></span>`;

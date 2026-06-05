@@ -447,6 +447,7 @@ if DEBUG:
 
 # Request body size limit (from YAML config, default 10 MB)
 MAX_BODY_SIZE = yaml_get("upstream", "max_body_size", 10 * 1024 * 1024)
+MAX_BODY_STORAGE = 100_000  # Max chars stored per request/response body in DB
 
 # SQLite setup — synchronous connection, all DB ops run in thread pool
 _db_path = os.path.join(LOG_DIR, "requests.db")
@@ -481,7 +482,7 @@ _conn.execute("CREATE INDEX IF NOT EXISTS idx_model ON requests(model)")
 _conn.execute("CREATE INDEX IF NOT EXISTS idx_success ON requests(success)")
 _conn.execute("CREATE INDEX IF NOT EXISTS idx_account ON requests(account_alias)")
 _conn.execute("CREATE INDEX IF NOT EXISTS idx_ts_model ON requests(timestamp, model)")
-for col, default in [("protocol", "NULL"), ("is_stream", "0"), ("thinking", "NULL"), ("effort", "NULL"), ("client_ip", "NULL"), ("account_alias", "NULL"), ("tools", "NULL"), ("tools_used", "NULL")]:
+for col, default in [("protocol", "NULL"), ("is_stream", "0"), ("thinking", "NULL"), ("effort", "NULL"), ("client_ip", "NULL"), ("account_alias", "NULL"), ("tools", "NULL"), ("tools_used", "NULL"), ("request_body", "NULL"), ("response_body", "NULL")]:
     try:
         _conn.execute(f"ALTER TABLE requests ADD COLUMN {col} TEXT DEFAULT {default}")
     except Exception:
@@ -510,7 +511,7 @@ def _db_flush():
 def _db_insert_sync(req_id, timestamp, model, original_model, duration_ms,
                     tokens_input, tokens_output, tokens_cache, success, error,
                     protocol, is_stream, thinking, effort, client_ip, account_alias,
-                    tools_json, tools_used_json):
+                    tools_json, tools_used_json, request_body_json=None, response_body_json=None):
     """Synchronous DB insert — called via asyncio.to_thread().
 
     Batches commits: accumulates INSERTs and commits every _DB_COMMIT_BATCH
@@ -522,12 +523,14 @@ def _db_insert_sync(req_id, timestamp, model, original_model, duration_ms,
     _conn.execute("""
         INSERT OR REPLACE INTO requests (id, timestamp, model, original_model, duration_ms,
             tokens_input, tokens_output, tokens_cache, success, error,
-            protocol, is_stream, thinking, effort, client_ip, account_alias, tools, tools_used)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            protocol, is_stream, thinking, effort, client_ip, account_alias, tools, tools_used,
+            request_body, response_body)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (req_id, timestamp, model, original_model, duration_ms,
           tokens_input, tokens_output, tokens_cache, 1 if success else 0, error,
           protocol, 1 if is_stream else 0, thinking, effort,
-          client_ip, account_alias, tools_json, tools_used_json))
+          client_ip, account_alias, tools_json, tools_used_json,
+          request_body_json, response_body_json))
     # Batch commit logic
     with _db_commit_lock:
         _db_pending_inserts += 1
@@ -545,15 +548,18 @@ def _db_insert_sync(req_id, timestamp, model, original_model, duration_ms,
 async def _save_request(req_id, model, original_model, duration_ms,
 	                  tokens_input, tokens_output, tokens_cache, success=True, error=None,
 	                  protocol=None, is_stream=False, thinking=None, effort=None,
-	                  client_ip=None, account_alias=None, tools=None, tools_used=None):
+	                  client_ip=None, account_alias=None, tools=None, tools_used=None,
+	                  request_body=None, response_body=None):
     tools_json = json.dumps(tools) if tools else "[]"
-    tools_used_json = json.dumps(tools_used) if tools_used else "[]"
+    tools_used_json = json.dumps(list(dict.fromkeys(tools_used))) if tools_used else "[]"
+    request_body_json = json.dumps(request_body, ensure_ascii=False)[:MAX_BODY_STORAGE] if request_body else None
+    response_body_json = json.dumps(response_body, ensure_ascii=False)[:MAX_BODY_STORAGE] if response_body else None
     timestamp = time.strftime("%Y-%m-%dT%H:%M:%S")
     await asyncio.to_thread(
         _db_insert_sync, req_id, timestamp, model, original_model, duration_ms,
         tokens_input, tokens_output, tokens_cache, success, error,
         protocol, is_stream, thinking, effort, client_ip, account_alias,
-        tools_json, tools_used_json
+        tools_json, tools_used_json, request_body_json, response_body_json
     )
     # Force commit so dashboard reads see the new row immediately
     _db_flush()
@@ -1234,7 +1240,7 @@ def _update_token_usage(model_id, inp, out, cache):
 async def _save_and_log_request(req_id, model_id, original_model, start_time,
                                  inp, out, cache, protocol, is_stream, thinking_type,
                                  effort, client_ip, account_alias, tools, log_tag="",
-                                 tools_used=None):
+                                 tools_used=None, request_body=None, response_body=None):
     """Log success and save to DB with success=True."""
     alias_tag = f" | account={account_alias}" if account_alias else ""
     _log(f"  ← {model_id} | +{inp} in{log_tag} | +{out} out{log_tag} | +{cache} cache{alias_tag}")
@@ -1243,7 +1249,7 @@ async def _save_and_log_request(req_id, model_id, original_model, start_time,
                      inp, out, cache, success=True,
                      protocol=protocol, is_stream=is_stream, thinking=thinking_type, effort=effort,
                      client_ip=client_ip, account_alias=account_alias, tools=tools,
-                     tools_used=tools_used)
+                     tools_used=tools_used, request_body=request_body, response_body=response_body)
     except Exception as e:
         _debug(f"  ✗ save_request failed: {type(e).__name__}: {e}")
         _log(f"  WARN: save_request failed: {type(e).__name__}: {e}")
@@ -1251,7 +1257,8 @@ async def _save_and_log_request(req_id, model_id, original_model, start_time,
 
 async def _log_and_save_error(req_id, model_id, original_model, start_time,
                                status_code, resp_text, protocol, is_stream, thinking_type,
-                               effort, client_ip, account_alias, tools, tools_used=None):
+                               effort, client_ip, account_alias, tools, tools_used=None,
+                               request_body=None, response_body=None):
     """Log error and save to DB with success=False."""
     _log(f"  ERROR {status_code}: {resp_text[:300]}")
     try:
@@ -1259,7 +1266,7 @@ async def _log_and_save_error(req_id, model_id, original_model, start_time,
                      0, 0, 0, success=False, error=f"HTTP {status_code}",
                      protocol=protocol, is_stream=is_stream, thinking=thinking_type, effort=effort,
                      client_ip=client_ip, account_alias=account_alias, tools=tools,
-                     tools_used=tools_used)
+                     tools_used=tools_used, request_body=request_body, response_body=response_body)
     except Exception as e:
         _debug(f"  ✗ save_request (error path) failed: {type(e).__name__}: {e}")
         _log(f"  WARN: save_request (error path) failed: {type(e).__name__}: {e}")
@@ -1292,14 +1299,14 @@ def _make_stream_retry_loop(protocol):
 async def _stream_error_response(req_id, model_id, original_model, start_time,
                                   status_code, resp_body, protocol, thinking_type,
                                   effort, client_ip, account_alias, tools,
-                                  error_payload, tools_used=None):
+                                  error_payload, tools_used=None, request_body=None):
     """Handle streaming error: log, save DB, yield error SSE event. Returns the error event bytes."""
     _log(f"  ERROR {status_code}: {resp_body[:300] if isinstance(resp_body, str) else resp_body[:300]}")
     await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
                  0, 0, 0, success=False, error=f"HTTP {status_code}",
                  protocol=protocol, is_stream=True, thinking=thinking_type, effort=effort,
                  client_ip=client_ip, account_alias=account_alias, tools=tools,
-                 tools_used=tools_used)
+                 tools_used=tools_used, request_body=request_body)
     return _sse("error", error_payload)
 
 
@@ -2629,6 +2636,7 @@ async def messages(request: Request):
 
     original_model = body.get("model", "")
     tool_names = _extract_tool_names(body)
+    request_body = body  # Capture original request before mutation
     _debug(f"[messages] req_id={req_id} model={original_model!r} tools={tool_names} ip={client_ip}")
     _debug(f"[messages] headers={_sanitize_headers(dict(request.headers))}")
     _debug(f"[messages] body=\n{_truncate(body)}")
@@ -2714,7 +2722,8 @@ async def messages(request: Request):
                 _debug(f"  ✗ upstream {resp.status_code} → client {status}: {msg[:300]}")
                 await _log_and_save_error(req_id, model_id, original_model, start_time,
                              resp.status_code, resp.text, protocol, is_stream, thinking_type,
-                             effort, client_ip, account_alias, tool_names)
+                             effort, client_ip, account_alias, tool_names,
+                             request_body=request_body, response_body={"error": resp.text[:2000]})
                 if resp.status_code in (429, 401):
                     return _anthropic_error(503, msg)
                 return Response(content=resp.content, status_code=resp.status_code, media_type="application/json")
@@ -2734,7 +2743,8 @@ async def messages(request: Request):
             used = [b["name"] for b in data.get("content", []) if b.get("type") == "tool_use"]
             await _save_and_log_request(req_id, model_id, original_model, start_time,
                          req_in, req_out, req_cache, protocol, is_stream, thinking_type,
-                         effort, client_ip, account_alias, tool_names, tools_used=used)
+                         effort, client_ip, account_alias, tool_names, tools_used=used,
+                         request_body=request_body, response_body=data)
             if cache_key:
                 _response_cache.put(cache_key, resp.content, {"Content-Type": "application/json"})
             return Response(content=resp.content, headers={"X-Cache": "MISS"}, media_type="application/json")
@@ -2779,7 +2789,8 @@ async def messages(request: Request):
                                            "message": err_msg}}
                             yield await _stream_error_response(req_id, model_id, original_model, start_time,
                                          err_status, err, protocol, thinking_type, effort,
-                                         client_ip, ak, tool_names, error_payload)
+                                         client_ip, ak, tool_names, error_payload,
+                                         request_body=request_body)
                             return
                         async for chunk in resp.aiter_bytes():
                             yield chunk
@@ -2873,7 +2884,8 @@ async def messages(request: Request):
                                  stream_in if stream_in is not None else est_input, stream_out, stream_cache, success=False, error=str(e),
                                  protocol=protocol, is_stream=True, thinking=thinking_type, effort=effort,
                                  client_ip=client_ip, account_alias=ak, tools=tool_names,
-                                 tools_used=used_tools if used_tools else None)
+                                 tools_used=used_tools if used_tools else None,
+                                 request_body=request_body)
                     if started:
                         for idx in open_blocks:
                             yield _sse("content_block_stop", {"type": "content_block_stop", "index": idx})
@@ -2892,7 +2904,8 @@ async def messages(request: Request):
                 ak = _alias_for_key(headers.get("x-api-key", ""))
                 await _save_and_log_request(req_id, model_id, original_model, start_time,
                              logged_in, stream_out, stream_cache, protocol, True, thinking_type,
-                             effort, client_ip, ak, tool_names, tools_used=used_tools if used_tools else None)
+                             effort, client_ip, ak, tool_names, tools_used=used_tools if used_tools else None,
+                             request_body=request_body)
 
         return StreamingResponse(_sse_keepalive(anthropic_stream(a_headers)), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
@@ -2919,7 +2932,8 @@ async def messages(request: Request):
         if resp.status_code != 200:
             await _log_and_save_error(req_id, model_id, original_model, start_time,
                          resp.status_code, resp.text, protocol, is_stream, thinking_type,
-                         effort, client_ip, account_alias, tool_names)
+                         effort, client_ip, account_alias, tool_names,
+                         request_body=request_body, response_body={"error": resp.text[:2000]})
             # Convert 429/401 → 503 to avoid Claude Code auth window
             if resp.status_code == 429:
                 return _anthropic_error(503, "All API keys exhausted (rate limited). Try again later.")
@@ -2955,7 +2969,8 @@ async def messages(request: Request):
         await _save_and_log_request(req_id, model_id, original_model, start_time,
                      req_in, req_out, cache, protocol, is_stream=False, thinking_type=thinking_type,
                      effort=effort, client_ip=client_ip, account_alias=account_alias, tools=tool_names,
-                     tools_used=used if used else None)
+                     tools_used=used if used else None,
+                     request_body=request_body, response_body=data)
         return Response(content=json.dumps(openai_to_anthropic(data, original_model), ensure_ascii=False),
                         media_type="application/json")
 
@@ -3000,7 +3015,8 @@ async def messages(request: Request):
                                        "message": err_msg}}
                         yield await _stream_error_response(req_id, model_id, original_model, start_time,
                                      err_status, err, protocol, thinking_type, effort,
-                                     client_ip, ak_h, tool_names, error_payload)
+                                     client_ip, ak_h, tool_names, error_payload,
+                                     request_body=request_body)
                         return
 
                     async for line in resp.aiter_lines():
@@ -3030,7 +3046,8 @@ async def messages(request: Request):
                             await _save_and_log_request(req_id, model_id, original_model, start_time,
                                          final_in, final_out, final_cache, protocol, True, thinking_type,
                                          effort, client_ip, ak_h, tool_names, log_tag,
-                                         tools_used=used_tools if used_tools else None)
+                                         tools_used=used_tools if used_tools else None,
+                                         request_body=request_body)
                             break
 
                         try:
@@ -3134,7 +3151,8 @@ async def messages(request: Request):
                              stream_in_est, stream_out_tokens, 0, success=False, error=str(e),
                              protocol=protocol, is_stream=True, thinking=thinking_type, effort=effort,
                              client_ip=client_ip, account_alias=ak_h, tools=tool_names,
-                             tools_used=used_tools if used_tools else None)
+                             tools_used=used_tools if used_tools else None,
+                             request_body=request_body)
                 if started:
                     for idx in open_blocks:
                         yield _sse("content_block_stop", {"type": "content_block_stop", "index": idx})
@@ -3312,6 +3330,7 @@ async def chat_completions(request: Request):
 
     original_model = body.get("model", "")
     tool_names = _extract_tool_names(body)
+    request_body = body  # Capture original request before mutation
     _debug(f"[chat] req_id={req_id} model={original_model!r} tools={tool_names} ip={client_ip}")
     _debug(f"[chat] headers={_sanitize_headers(dict(request.headers))}")
     _debug(f"[chat] body=\n{_truncate(body)}")
@@ -3366,7 +3385,8 @@ async def chat_completions(request: Request):
             if resp.status_code != 200:
                 await _log_and_save_error(req_id, model_id, original_model, start_time,
                              resp.status_code, resp.text, protocol, is_stream, thinking_type,
-                             effort, client_ip, account_alias, tool_names)
+                             effort, client_ip, account_alias, tool_names,
+                             request_body=request_body, response_body={"error": resp.text[:2000]})
                 return Response(content=resp.content, status_code=resp.status_code, media_type="application/json")
             try:
                 data = resp.json()
@@ -3383,7 +3403,8 @@ async def chat_completions(request: Request):
             used = [tc["function"]["name"] for tc in data.get("choices", [{}])[0].get("message", {}).get("tool_calls", [])]
             await _save_and_log_request(req_id, model_id, original_model, start_time,
                          req_in, req_out, cache, protocol, is_stream, thinking_type,
-                         effort, client_ip, account_alias, tool_names, tools_used=used if used else None)
+                         effort, client_ip, account_alias, tool_names, tools_used=used if used else None,
+                         request_body=request_body, response_body=data)
             return Response(content=json.dumps(data, ensure_ascii=False), media_type="application/json")
 
         # ── OpenAI streaming passthrough ──
@@ -3411,7 +3432,8 @@ async def chat_completions(request: Request):
                             ak_h = _alias_for_key(_key_from_headers(hdrs, "openai"))
                             await _log_and_save_error(req_id, model_id, original_model, start_time,
                                          resp.status_code, err, protocol, True, thinking_type,
-                                         effort, client_ip, ak_h, tool_names)
+                                         effort, client_ip, ak_h, tool_names,
+                                         request_body=request_body, response_body={"error": str(err)[:2000]})
                             # Convert 429/401 → 503 to avoid Claude Code auth window
                             err_status = 503 if resp.status_code in (429, 401) else resp.status_code
                             if resp.status_code == 429:
@@ -3464,7 +3486,8 @@ async def chat_completions(request: Request):
                         await _save_and_log_request(req_id, model_id, original_model, start_time,
                                      final_in, final_out, final_cache, protocol, True, thinking_type,
                                      effort, client_ip, ak_h, tool_names, log_tag,
-                                     tools_used=used_tools if used_tools else None)
+                                     tools_used=used_tools if used_tools else None,
+                                     request_body=request_body)
                 except Exception as e:
                     _log(f"  ERROR stream (attempt {_attempt+1}): {type(e).__name__}: {e}")
                     _debug(f"  ✗ stream exception: {type(e).__name__}: {e}")
@@ -3487,7 +3510,8 @@ async def chat_completions(request: Request):
                     ak_h = _alias_for_key(_key_from_headers(hdrs, "openai"))
                     await _log_and_save_error(req_id, model_id, original_model, start_time,
                                  0, str(e), protocol, True, thinking_type,
-                                 effort, client_ip, ak_h, tool_names)
+                                 effort, client_ip, ak_h, tool_names,
+                                 request_body=request_body)
                     return
                 else:
                     break
@@ -3526,7 +3550,8 @@ async def chat_completions(request: Request):
         if resp.status_code != 200:
             await _log_and_save_error(req_id, model_id, original_model, start_time,
                          resp.status_code, resp.text, protocol, is_stream, thinking_type,
-                         effort, client_ip, account_alias, tool_names)
+                         effort, client_ip, account_alias, tool_names,
+                         request_body=request_body, response_body={"error": resp.text[:2000]})
             try:
                 err_data = resp.json()
                 err_msg = err_data.get("error", {}).get("message", resp.text[:200])
@@ -3549,7 +3574,8 @@ async def chat_completions(request: Request):
         used = [b["name"] for b in data.get("content", []) if b.get("type") == "tool_use"]
         await _save_and_log_request(req_id, model_id, original_model, start_time,
                      req_in, req_out, req_cache, protocol, is_stream, thinking_type,
-                     effort, client_ip, account_alias, tool_names, tools_used=used if used else None)
+                     effort, client_ip, account_alias, tool_names, tools_used=used if used else None,
+                     request_body=request_body, response_body=data)
 
         oai_response = anthropic_to_openai_response(data, original_model)
         return Response(content=json.dumps(oai_response, ensure_ascii=False), media_type="application/json")
@@ -3589,7 +3615,8 @@ async def chat_completions(request: Request):
                         ak = _alias_for_key(hdrs.get("x-api-key", ""))
                         await _log_and_save_error(req_id, model_id, original_model, start_time,
                                      resp.status_code, str(resp.status_code), protocol, True, thinking_type,
-                                     effort, client_ip, ak, tool_names)
+                                     effort, client_ip, ak, tool_names,
+                                     request_body=request_body)
                         # Convert 429/401 → 503 to avoid Claude Code auth window
                         err_status = 503 if resp.status_code in (429, 401) else resp.status_code
                         if resp.status_code == 429:
@@ -3699,7 +3726,8 @@ async def chat_completions(request: Request):
                                 used_tools = [v["name"] for v in tool_data.values() if v.get("name")]
                                 await _save_and_log_request(req_id, model_id, original_model, start_time,
                                              total_input, stream_out, cache_read, protocol, True, thinking_type,
-                                             effort, client_ip, ak, tool_names, tools_used=used_tools if used_tools else None)
+                                             effort, client_ip, ak, tool_names, tools_used=used_tools if used_tools else None,
+                                             request_body=request_body)
                                 # Send final usage chunk for OpenAI streaming client
                                 total = total_input + stream_out
                                 usage_chunk = {
@@ -3735,7 +3763,8 @@ async def chat_completions(request: Request):
                 await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
                              total_input or 0, stream_out, 0, success=False, error=str(e),
                              protocol=protocol, is_stream=True, thinking=thinking_type, effort=effort,
-                             client_ip=client_ip, account_alias=ak, tools=tool_names)
+                             client_ip=client_ip, account_alias=ak, tools=tool_names,
+                             request_body=request_body)
                 if total_input:
                     try:
                         with _token_lock:
@@ -3776,6 +3805,7 @@ async def responses(request: Request):
 
     original_model = body.get("model", "")
     tool_names = _extract_tool_names(body)
+    request_body = body  # Capture original request before mutation
     route = _route_for(original_model, tool_names)
     if route is None:
         available = sorted(MODELS.keys())
@@ -3834,7 +3864,8 @@ async def responses(request: Request):
             if resp.status_code != 200:
                 await _log_and_save_error(req_id, model_id, original_model, start_time,
                              resp.status_code, resp.text, protocol, is_stream, thinking_type,
-                             effort, client_ip, account_alias, tool_names)
+                             effort, client_ip, account_alias, tool_names,
+                             request_body=request_body, response_body={"error": resp.text[:2000]})
                 try:
                     err_data = resp.json()
                     err_msg = err_data.get("error", {}).get("message", resp.text[:200])
@@ -3855,7 +3886,8 @@ async def responses(request: Request):
             used = [b["name"] for b in data.get("content", []) if b.get("type") == "tool_use"]
             await _save_and_log_request(req_id, model_id, original_model, start_time,
                          req_in, req_out, req_cache, protocol, is_stream, thinking_type,
-                         effort, client_ip, account_alias, tool_names, tools_used=used if used else None)
+                         effort, client_ip, account_alias, tool_names, tools_used=used if used else None,
+                         request_body=request_body, response_body=data)
             oai_resp = anthropic_to_openai_responses(data, original_model)
             return Response(content=json.dumps(oai_resp, ensure_ascii=False), media_type="application/json")
         # Anthropic streaming → collect, then emit SSE
@@ -3868,7 +3900,8 @@ async def responses(request: Request):
         if resp.status_code != 200:
             await _log_and_save_error(req_id, model_id, original_model, start_time,
                          resp.status_code, resp.text, protocol, True, thinking_type,
-                         effort, client_ip, account_alias, tool_names)
+                         effort, client_ip, account_alias, tool_names,
+                         request_body=request_body, response_body={"error": resp.text[:2000]})
             async def err_stream():
                 yield b"data: [DONE]\n\n"
             return StreamingResponse(err_stream(), media_type="text/event-stream",
@@ -3887,7 +3920,8 @@ async def responses(request: Request):
         used = [b["name"] for b in data.get("content", []) if b.get("type") == "tool_use"]
         await _save_and_log_request(req_id, model_id, original_model, start_time,
                      req_in, req_out, req_cache, protocol, True, thinking_type,
-                     effort, client_ip, account_alias, tool_names, tools_used=used if used else None)
+                     effort, client_ip, account_alias, tool_names, tools_used=used if used else None,
+                     request_body=request_body, response_body=data)
         oai_resp = anthropic_to_openai_responses(data, original_model)
         payload = json.dumps({"type": "response.completed", "response": oai_resp}, ensure_ascii=False)
         sse_body = f"data: {payload}\n\ndata: [DONE]\n\n".encode()
@@ -3914,7 +3948,8 @@ async def responses(request: Request):
         if resp.status_code != 200:
             await _log_and_save_error(req_id, model_id, original_model, start_time,
                          resp.status_code, resp.text, protocol, is_stream, thinking_type,
-                         effort, client_ip, account_alias, tool_names)
+                         effort, client_ip, account_alias, tool_names,
+                         request_body=request_body, response_body={"error": resp.text[:2000]})
             try:
                 err_data = resp.json()
                 err_msg = err_data.get("error", {}).get("message", resp.text[:200])
@@ -3935,7 +3970,8 @@ async def responses(request: Request):
         used = [tc["function"]["name"] for tc in data.get("choices", [{}])[0].get("message", {}).get("tool_calls", [])]
         await _save_and_log_request(req_id, model_id, original_model, start_time,
                      req_in, req_out, cache, protocol, is_stream, thinking_type,
-                     effort, client_ip, account_alias, tool_names, tools_used=used if used else None)
+                     effort, client_ip, account_alias, tool_names, tools_used=used if used else None,
+                     request_body=request_body, response_body=data)
         # Direct conversion: Chat Completions → Responses (no intermediate Anthropic format)
         oai_resp = openai_chat_to_responses(data, original_model)
         return Response(content=json.dumps(oai_resp, ensure_ascii=False), media_type="application/json")
@@ -3950,7 +3986,8 @@ async def responses(request: Request):
     if resp.status_code != 200:
         await _log_and_save_error(req_id, model_id, original_model, start_time,
                      resp.status_code, resp.text, protocol, True, thinking_type,
-                     effort, client_ip, account_alias, tool_names)
+                     effort, client_ip, account_alias, tool_names,
+                     request_body=request_body, response_body={"error": resp.text[:2000]})
         async def err_stream():
             yield b"data: [DONE]\n\n"
         return StreamingResponse(err_stream(), media_type="text/event-stream",
@@ -3969,7 +4006,8 @@ async def responses(request: Request):
     used = [tc["function"]["name"] for tc in data.get("choices", [{}])[0].get("message", {}).get("tool_calls", [])]
     await _save_and_log_request(req_id, model_id, original_model, start_time,
                  req_in, req_out, cache, protocol, True, thinking_type,
-                 effort, client_ip, account_alias, tool_names, tools_used=used if used else None)
+                 effort, client_ip, account_alias, tool_names, tools_used=used if used else None,
+                 request_body=request_body, response_body=data)
     # Direct conversion: Chat Completions → Responses (no intermediate Anthropic format)
     oai_resp = openai_chat_to_responses(data, original_model)
     # Return as single SSE block (data-only format)

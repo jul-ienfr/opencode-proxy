@@ -8,7 +8,7 @@ import time
 import asyncio
 import socket
 from fastapi import Request, Response
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from config import MODELS, HOST, PORT, WEB_PORT, PROXY, API_KEY, CONFIG_KEYS, save_env, apply_server_changes, CUSTOM_ROUTES, save_custom_routes, API_KEYS, save_api_keys, API_KEY_ROUTING
@@ -856,6 +856,48 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
             "page": offset // limit + 1,
             "per_page": limit,
             "has_more": offset + limit < total_count
+        }
+
+    @app.get("/api/requests/{req_id}")
+    async def get_request_detail(req_id: str):
+        """Return full request details including request/response bodies."""
+        def _query_request():
+            row = conn.execute("SELECT * FROM requests WHERE id = ?", (req_id,)).fetchone()
+            return row
+
+        row = await asyncio.to_thread(_query_request)
+        if not row:
+            return JSONResponse(status_code=404, content={"error": "Request not found"})
+
+        def _parse_json_field(val):
+            if not val or val == "[]" or val == "null":
+                return None
+            try:
+                return json.loads(val)
+            except Exception:
+                return val
+
+        return {
+            "id": row["id"],
+            "timestamp": row["timestamp"],
+            "model": row["model"],
+            "original_model": row["original_model"],
+            "duration_ms": row["duration_ms"],
+            "tokens_input": row["tokens_input"],
+            "tokens_output": row["tokens_output"],
+            "tokens_cache": row["tokens_cache"],
+            "success": bool(row["success"]),
+            "error": row["error"],
+            "protocol": row["protocol"] if "protocol" in row.keys() else None,
+            "is_stream": bool(row["is_stream"]) if "is_stream" in row.keys() else False,
+            "thinking": row["thinking"] if "thinking" in row.keys() else None,
+            "effort": row["effort"] if "effort" in row.keys() else None,
+            "client_ip": row["client_ip"] if "client_ip" in row.keys() else None,
+            "account_alias": row["account_alias"] if "account_alias" in row.keys() else None,
+            "tools": _parse_json_field(row["tools"]) if "tools" in row.keys() else [],
+            "tools_used": _parse_json_field(row["tools_used"]) if "tools_used" in row.keys() else [],
+            "request_body": _parse_json_field(row["request_body"]) if "request_body" in row.keys() else None,
+            "response_body": _parse_json_field(row["response_body"]) if "response_body" in row.keys() else None,
         }
 
     @app.get("/api/history/filters")
