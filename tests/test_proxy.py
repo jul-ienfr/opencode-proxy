@@ -26,6 +26,9 @@ from opencode import (
     anthropic_to_openai_responses,
     _estimate_tokens,
     _route_for,
+    _tool_name,
+    _inject_system_hint,
+    _filter_tools_for_model,
     _CircuitBreaker,
     _CB_FAILURE_THRESHOLD,
     _CB_RECOVERY_TIMEOUT,
@@ -670,3 +673,171 @@ class TestAnthropicToOpenAIResponses:
         assert usage["output_tokens"] == 10
         assert usage["total_tokens"] == 30
         assert usage["output_tokens_details"]["cached_tokens"] == 5
+
+
+# ── Tool Name Extraction ────────────────────────────────────────
+
+class TestToolName:
+    """Test _tool_name() with both Anthropic and OpenAI formats."""
+
+    def test_anthropic_format(self):
+        tool = {"name": "Bash", "description": "Run bash", "input_schema": {}}
+        assert _tool_name(tool) == "Bash"
+
+    def test_openai_format(self):
+        tool = {"type": "function", "function": {"name": "Read", "parameters": {}}}
+        assert _tool_name(tool) == "Read"
+
+    def test_non_dict_returns_empty(self):
+        assert _tool_name("not a dict") == ""
+        assert _tool_name(None) == ""
+        assert _tool_name(42) == ""
+
+    def test_missing_name_returns_empty(self):
+        assert _tool_name({"description": "no name"}) == ""
+        assert _tool_name({"type": "function", "function": {}}) == ""
+
+
+# ── System Hint Injection ───────────────────────────────────────
+
+class TestInjectSystemHint:
+    """Test _inject_system_hint() for Anthropic and OpenAI formats."""
+
+    def test_anthropic_string_system(self):
+        body = {"system": "You are helpful.", "messages": []}
+        _inject_system_hint(body, "HINT: use tools")
+        assert body["system"] == "HINT: use tools\n\nYou are helpful."
+
+    def test_anthropic_empty_system(self):
+        body = {"system": "", "messages": []}
+        _inject_system_hint(body, "HINT: use tools")
+        assert body["system"] == "HINT: use tools"
+
+    def test_anthropic_list_system(self):
+        body = {"system": [{"type": "text", "text": "Existing"}], "messages": []}
+        _inject_system_hint(body, "HINT")
+        assert body["system"][0]["text"] == "HINT"
+        assert body["system"][1]["text"] == "Existing"
+
+    def test_openai_system_role(self):
+        body = {"messages": [{"role": "system", "content": "Existing"}]}
+        _inject_system_hint(body, "HINT")
+        assert body["messages"][0]["content"] == "HINT\n\nExisting"
+
+    def test_openai_developer_role(self):
+        body = {"messages": [{"role": "developer", "content": "Devs"}]}
+        _inject_system_hint(body, "HINT")
+        assert body["messages"][0]["content"] == "HINT\n\nDevs"
+
+    def test_openai_no_system_inserts(self):
+        body = {"messages": [{"role": "user", "content": "Hi"}]}
+        _inject_system_hint(body, "HINT")
+        assert body["messages"][0]["role"] == "system"
+        assert body["messages"][0]["content"] == "HINT"
+
+    def test_empty_hint_noop(self):
+        body = {"system": "Existing"}
+        _inject_system_hint(body, "")
+        assert body["system"] == "Existing"
+        _inject_system_hint(body, None)
+        assert body["system"] == "Existing"
+
+
+# ── Tool Filtering ──────────────────────────────────────────────
+
+class TestFilterToolsForModel:
+    """Test _filter_tools_for_model() with config-driven filtering."""
+
+    ANTHROPIC_TOOLS = [
+        {"name": "Read", "description": "Read", "input_schema": {}},
+        {"name": "Write", "description": "Write", "input_schema": {}},
+        {"name": "Bash", "description": "Bash", "input_schema": {}},
+        {"name": "WebSearch", "description": "Search", "input_schema": {}},
+    ]
+
+    OPENAI_TOOLS = [
+        {"type": "function", "function": {"name": "Read", "parameters": {}}},
+        {"type": "function", "function": {"name": "Write", "parameters": {}}},
+        {"type": "function", "function": {"name": "Bash", "parameters": {}}},
+        {"type": "function", "function": {"name": "WebSearch", "parameters": {}}},
+    ]
+
+    def _patch_config(self, monkeypatch, config):
+        """Helper to patch TOOL_CAPABILITIES for tests.
+
+        Patches both config.TOOL_CAPABILITIES and config.get_tool_config
+        so the filtering function sees our test config.
+        """
+        import config as cfg
+        monkeypatch.setattr(cfg, "TOOL_CAPABILITIES", config)
+
+        # Also patch get_tool_config to use our config
+        def _mock_get_tool_config(model_id):
+            defaults = {"supported_tools": None, "unsupported_tools": [], "system_hint": None, "fallback_model": None}
+            model_cfg = config.get(model_id, {})
+            default_cfg = config.get("_default", {})
+            return {**defaults, **default_cfg, **model_cfg}
+
+        monkeypatch.setattr(cfg, "get_tool_config", _mock_get_tool_config)
+
+    def test_whitelist_filters_anthropic(self, monkeypatch):
+        config = {"test-model": {"supported_tools": ["Read", "Write"]}}
+        self._patch_config(monkeypatch, config)
+        body = {"tools": list(self.ANTHROPIC_TOOLS)}
+        result = _filter_tools_for_model(body, "test-model")
+        assert result == ["Read", "Write"]
+        assert len(body["tools"]) == 2
+
+    def test_whitelist_filters_openai(self, monkeypatch):
+        config = {"test-model": {"supported_tools": ["Read"]}}
+        self._patch_config(monkeypatch, config)
+        body = {"tools": list(self.OPENAI_TOOLS)}
+        result = _filter_tools_for_model(body, "test-model")
+        assert result == ["Read"]
+        assert len(body["tools"]) == 1
+
+    def test_blacklist_removes_tools(self, monkeypatch):
+        config = {"test-model": {"unsupported_tools": ["WebSearch", "Bash"]}}
+        self._patch_config(monkeypatch, config)
+        body = {"tools": list(self.ANTHROPIC_TOOLS)}
+        result = _filter_tools_for_model(body, "test-model")
+        assert "WebSearch" not in result
+        assert "Bash" not in result
+        assert "Read" in result
+        assert "Write" in result
+
+    def test_no_config_passthrough(self, monkeypatch):
+        self._patch_config(monkeypatch, {})
+        body = {"tools": list(self.ANTHROPIC_TOOLS)}
+        result = _filter_tools_for_model(body, "unknown-model")
+        assert result == ["Read", "Write", "Bash", "WebSearch"]
+
+    def test_default_fallback(self, monkeypatch):
+        config = {"_default": {"unsupported_tools": ["WebSearch"]}}
+        self._patch_config(monkeypatch, config)
+        body = {"tools": list(self.ANTHROPIC_TOOLS)}
+        result = _filter_tools_for_model(body, "unknown-model")
+        assert "WebSearch" not in result
+        assert "Read" in result
+
+    def test_system_hint_injected(self, monkeypatch):
+        config = {"test-model": {"system_hint": "Use tools!", "unsupported_tools": []}}
+        self._patch_config(monkeypatch, config)
+        body = {"system": "Original", "tools": list(self.ANTHROPIC_TOOLS)}
+        _filter_tools_for_model(body, "test-model")
+        assert "Use tools!" in body["system"]
+
+    def test_no_tools_no_filtering(self, monkeypatch):
+        config = {"test-model": {"supported_tools": ["Read"]}}
+        self._patch_config(monkeypatch, config)
+        body = {"messages": [{"role": "user", "content": "Hi"}]}
+        result = _filter_tools_for_model(body, "test-model")
+        assert result == []
+
+    def test_whitelist_precedence_over_blacklist(self, monkeypatch):
+        config = {"test-model": {"supported_tools": ["Read"], "unsupported_tools": ["Write"]}}
+        self._patch_config(monkeypatch, config)
+        body = {"tools": list(self.ANTHROPIC_TOOLS)}
+        result = _filter_tools_for_model(body, "test-model")
+        # Whitelist wins: only Read kept
+        assert result == ["Read"]

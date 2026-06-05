@@ -1,0 +1,172 @@
+server:
+  host: 0.0.0.0
+  port: 4000
+  web_port: 8082
+  debug: false
+  log_dir: logs
+upstream:
+  openai_base: https://opencode.ai/zen/go/v1/chat/completions
+  anthropic_base: https://opencode.ai/zen/go/v1/messages
+  proxy: ''
+  timeout:
+    connect: 30
+    read: 600
+    write: 30
+    pool: 10
+  max_connections: 200
+  max_keepalive: 50
+  keepalive_expiry: 120
+  max_body_size: 10485760
+routing:
+  opus_model: kimi-k2.6
+  sonnet_model: glm-5.1
+  haiku_model: minimax-m2.5
+  key_routing: round-robin
+  disable_mapping: false
+  aliases:
+    nimo: mimo
+models:
+  glm-5.1:
+    protocol: openai
+  glm-5:
+    protocol: openai
+  kimi-k2.5:
+    protocol: openai
+  kimi-k2.6:
+    protocol: openai
+  deepseek-v4-pro:
+    protocol: openai
+  deepseek-v4-flash:
+    protocol: openai
+  mimo-v2-pro:
+    protocol: openai
+  mimo-v2-omni:
+    protocol: openai
+  mimo-v2.5-pro:
+    protocol: openai
+  mimo-v2.5:
+    protocol: openai
+  minimax-m2.7:
+    protocol: anthropic
+  minimax-m3:
+    protocol: anthropic
+  minimax-m2.5:
+    protocol: anthropic
+  qwen3.7-max:
+    protocol: anthropic
+  qwen3.6-plus:
+    protocol: anthropic
+  qwen3.5-plus:
+    protocol: anthropic
+custom_routes: {}
+api_keys:
+- api_key: ***REDACTED***
+  alias: joedouille648@gmail.com
+  go_workspace_id: ***REDACTED***
+  go_auth_cookie: ***REDACTED***__DQvrqd6A5p-lq0u9cdVmy-C2mpuQhdjwQH9gfcUq7p1xH0EBObjUFGxXl2NxrUQ5qdkfrA_ka5ppR7RFZQ547_a5UrWYSVvF7fGzD8LrxhbWFnThwCmEUDrsUg0AfVrptbKUfpvYbyiGeRRwkJbB4sfHSNJ25pOLR6xE8oOj176x0_IBZQtTokc_SBn_R9C_cUCqlwfJxaJhjBxAdglYPHkaTTDBn3IyI_7dL7PK3A*1812155771277*c8e19832a98d4cbf6ecb0bf3d0c0a8b830b2d5254c3c06743e0e0ff1c30deac3*Qae8LtSpAZJ_PYujMcoXLWCEth3GfDgg7qpAoqKCFTM
+  enabled: true
+- api_key: ***REDACTED***
+  alias: arthur0405@atomicmail.io
+  go_workspace_id: ***REDACTED***
+  go_auth_cookie: ***REDACTED***_0HsjABI1vcnv8B-aHrCEKyx3Mw9Z5mXFuOzOAdc-0WvprIBVelNthvkdOSLDS_kJUP83cVz-36DsTOawMG0RKlvU-M0SzkYj-MlKsoRAhFTnhsFqI8grVHuVaxvV-6Fprw1aViDybwRg2ylvOnWAV95X6X4Zm76eb0rDzymeLpZkRBsJ_yjHP7-25iR6D2yLUSPRuZZ5_imWADFQT3T67Io0hLCqi57OxcU93CC41_zaHuM4sJTDDZQufdr9rwaLwU82iuzWVwZaKQUzu9CF_hS0BXbQyQh6q_Kd4zPoM1_dMg83O32a1-uog*1809852122595*25a2b2cf8a8f252f74ee5b670e125fec6cd51eae7dd87216995ae94700b9e4ed*oMuZRSfbtn7HfIpgGXwp4rDZuLeGKwwDMO2I7c3Um5w
+  enabled: true
+- api_key: ***REDACTED***
+  alias: Patrice
+  go_workspace_id: ***REDACTED***
+  go_auth_cookie: ***REDACTED***_Q8awCP9kF3hhNzafAikYWPNwrHjC44lfvQSKMmZ94xJKyWHEAOR76CNtNcaN3C19invmsQ1C1HI502SqNh1DeviNzhxEdh7hlrx2mD77HE9jDu-YYfSiFp1rC10urx8TaF8b5NDwwmx_MY9aoGIL8FZt6Acw*1811664610719*8fcc623f3350d9bdd9dcf778a3dc85f6fb5a8b40cf0b8fbb448da016ef567d56*i3-pZOMhlQ9dvtyCHhAOS67yq8aVWMuv379prphYzvA
+  enabled: true
+- api_key: ***REDACTED***
+  alias: laurent2804@atomicmail.io
+  go_workspace_id: ***REDACTED***
+  go_auth_cookie: ***REDACTED***_GflFCtr9Dpzp_bMRb340Z7Z6UifXLuvFNiyvV5RUX8ZgdWrATjXx-vc7PoqcA2AB0F2w3WX9Cjhp5vB-QfDG60PxAwFSxSwXybpJKHBOJ7Arqer0bL4errYBggWDs_PlI-bJrPwL2atZoW6gd8zwX2XZpS_qJufzTfFEFhyQjNzh7xxDriyXl7ElkUdpo9wm4LQDYMweEqQu3rOIuFGg67G0R_JYSmX4rWDgFpg*1811773950919*ab25dd318eabbf66b9ca8d7fa86d043f990d017d7555ce0e7a14b855783f9097*dQ5-TbwgAZ2YfZRzsaaTh0lPGwgsjgtO_2ZMPTzsyWA
+  enabled: true
+- api_key: ***REDACTED***
+  alias: antoinne2804@atomicmail.io
+  go_workspace_id: ***REDACTED***
+  go_auth_cookie: ***REDACTED***__5VroywwiTwm3CPzHHIQ*PVoDMWiOv5kWUwVBR3soNowRXIl533efR-LuJus21y-zrL432UDmHo_PILi3GwzqATYejEAWG_qyl-bJernqjbWsr_f2LXNP6ZJYczUfsgiA_I5G2YeL29htTqLBD1QRen8H2gJ_QZjfxhbv5z9-oZMuLXHHb6KhlLPcxQAIKOZh9-bbPQO63nkFJvceeq9fy1zAlKcsU53ScmoA1aynN4wSb8zgLhYQw5OFIKegzWYBAIKeU78hoUN-c5FT9Izc-2_RlhlHrDG4O7NxyJSanC3GL3R-I1Zuqf0pMiZ1NlqB5CIYXGXndrTVSBou4dTdeQGzL64VfkH3v0VO1Ef15A*1811941689510*96da07d6d6c8c1ddf68201e97a843b049f2969cd3d607329bde382898c601461*Hh1nIWV6OPqLDKd1hIeiNImYgE0tnAxuVnQLrtPWovA
+  enabled: true
+- api_key: ***REDACTED***
+  alias: salon2804@atomicmail.io
+  go_workspace_id: ***REDACTED***
+  go_auth_cookie: ***REDACTED***_Wn816bBrM64_XeQ72MYVkknKafK7nib3gpQEyaa9QBAWXjVbjT48Y_W1VimEKi8ku-JCyXAMgIxKUMc1xLDD7f4CcoTyB9PCYe2LCwW2DgEkuWFHY2aQB8XZwjqXCUcZqtzr84YrEP6uaa2akcDHDCrWG3xONEAkznAo_cfIvvU9scxmKkMrpaPDFankrf4VBSDzLswl0S-M65CMY9BXfe8XhxzWVYxPGsX-I0JbWQhXxRtqj624QCOnbNBHqge5qO3hBRzeVZhw44ofx1QDbUzPeGjxely9Ba0ZvShlQ0dIsltYEf6UzKV1tIl3MHo8FNMX5khynxtP-KXYQ*1812145657727*c9fd2a8c78b617921d06353eb4a67f8b76569c446abe8c3ddc841cc2bfbb9beb*3vEjVQni-nW0AeWSzaNR8FhTu66uufzGEX2lKz6ku28
+  enabled: true
+tool_capabilities:
+  _default:
+    supported_tools: null
+    unsupported_tools: []
+    system_hint: null
+  mimo-v2-pro:
+    supported_tools: []
+    unsupported_tools:
+    - Read
+    - Write
+    - Edit
+    - Bash
+    - Grep
+    - Glob
+    - WebSearch
+    - WebFetch
+    - TodoWrite
+    system_hint: null
+web_search:
+  mode: duckduckgo
+  target_model: null
+  max_results: 5
+  timeout: 10
+cache:
+  max_size: 1000
+  ttl: 300
+  min_prompt_size: 2000
+circuit_breaker:
+  failure_threshold: 5
+  recovery_timeout: 60
+rate_limit:
+  rps: 50
+  burst: 100
+  stale_ttl: 300
+key_pause:
+  default_pause: 60
+  max_pause: 600
+database:
+  busy_timeout: 5000
+  cache_size: 64000
+  mmap_size: 268435456
+  commit_interval: 5
+  commit_batch: 10
+background:
+  wal_checkpoint_interval: 3600
+  key_pause_cleanup_interval: 30
+  quota_fetch_interval: 300
+  health_cache_ttl: 15
+  health_timeout: 5
+  custom_routes_check_interval: 5
+  tool_cap_check_interval: 5
+streaming:
+  sse_keepalive_interval: 15
+  line_buffer_max: 1000000
+  retry_attempts: 2
+debug:
+  truncate_max: 10240
+  flush_interval: 10
+  max_size: 52428800
+  log_lines_max: 200
+thinking:
+  min_tokens:
+    deepseek-v4-flash: 2048
+    deepseek-v4-pro: 4096
+  default_min_tokens: 256
+cache_rewrite_models:
+- mimo-v2.5
+- mimo-v2-pro
+- mimo-v2-omni
+- mimo-v2.5-pro
+dashboard:
+  universal_tools:
+  - Read
+  - Write
+  - Edit
+  - Bash
+  - Grep
+  - Glob
+  - WebSearch
+  display_lines: 35

@@ -97,8 +97,30 @@
                         <canvas id="chart-model-tokens" width="300" height="300" role="img" aria-label="Token percentage by model chart"></canvas>
                     </div>
                     <div class="card chart-card">
-                        <h2 data-i18n="chart.req_pct">Requests % by Model</h2>
+                        <h2 data-i18n="chart.req_pct">Requests % by Model</hh2>
                         <canvas id="chart-model-requests" width="300" height="300" role="img" aria-label="Request percentage by model chart"></canvas>
+                    </div>
+                </div>
+
+                <!-- Time-series charts -->
+                <div class="charts-row">
+                    <div class="card chart-card" style="flex:1;min-width:400px">
+                        <h2>Requests over Time</h2>
+                        <canvas id="chart-ts-requests" height="200" role="img" aria-label="Requests over time chart"></canvas>
+                    </div>
+                    <div class="card chart-card" style="flex:1;min-width:400px">
+                        <h2>Tokens over Time</h2>
+                        <canvas id="chart-ts-tokens" height="200" role="img" aria-label="Tokens over time chart"></canvas>
+                    </div>
+                </div>
+                <div class="charts-row">
+                    <div class="card chart-card" style="flex:1;min-width:400px">
+                        <h2>Avg Duration (ms)</h2>
+                        <canvas id="chart-ts-duration" height="200" role="img" aria-label="Average duration over time chart"></canvas>
+                    </div>
+                    <div class="card chart-card" style="flex:1;min-width:400px">
+                        <h2>Success vs Error Rate</h2>
+                        <canvas id="chart-ts-success" height="200" role="img" aria-label="Success vs error rate chart"></canvas>
                     </div>
                 </div>
 
@@ -154,6 +176,53 @@
             <section id="logs" class="tab-content">
                 <div class="card">
                     <h2 data-i18n="logs.title">Request History</h2>
+
+                    <!-- Filters -->
+                    <div class="history-filters" id="history-filters">
+                        <div class="filter-row">
+                            <div class="filter-group">
+                                <label>Status</label>
+                                <select id="filter-status" class="config-select">
+                                    <option value="">All</option>
+                                    <option value="success">Success</option>
+                                    <option value="error">Error</option>
+                                </select>
+                            </div>
+                            <div class="filter-group">
+                                <label>Model</label>
+                                <select id="filter-model" class="config-select">
+                                    <option value="">All</option>
+                                </select>
+                            </div>
+                            <div class="filter-group">
+                                <label>Original Model</label>
+                                <select id="filter-original-model" class="config-select">
+                                    <option value="">All</option>
+                                </select>
+                            </div>
+                            <div class="filter-group">
+                                <label>Account</label>
+                                <select id="filter-account" class="config-select">
+                                    <option value="">All</option>
+                                </select>
+                            </div>
+                            <div class="filter-group">
+                                <label>Tool Used</label>
+                                <select id="filter-tool" class="config-select">
+                                    <option value="">All</option>
+                                </select>
+                            </div>
+                            <div class="filter-group">
+                                <label>Search</label>
+                                <input type="text" id="filter-search" class="config-input" placeholder="Error text, model..." style="width:160px">
+                            </div>
+                            <div class="filter-group" style="align-self:flex-end">
+                                <button class="btn btn-primary btn-sm" id="filter-apply-btn">Apply</button>
+                                <button class="btn btn-sm" id="filter-reset-btn">Reset</button>
+                            </div>
+                        </div>
+                    </div>
+
                     <table id="history-table">
                         <thead>
                             <tr>
@@ -347,6 +416,59 @@
                     </div>
                 </div>
 
+                <!-- Tool Compatibility Matrix -->
+                <div class="card">
+                    <h2>Tool Compatibility</h2>
+                    <p class="config-hint">Configure which tools each model supports. Unsupported tools are filtered out before sending requests to the model.</p>
+                    <div class="tool-compat-table" style="overflow-x:auto;">
+                        <table id="tool-compat-table">
+                            <thead>
+                                <tr>
+                                    <th style="min-width:140px">Model</th>
+                                    <th>Protocol</th>
+                                    <th colspan="100" style="text-align:center">Tools (✓ = supported, ✗ = filtered)</th>
+                                </tr>
+                            </thead>
+                            <tbody id="tool-compat-tbody">
+                                <tr><td colspan="100" data-i18n="stats.loading">Loading...</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                    <div class="config-actions" style="margin-top: 10px;">
+                        <button class="btn btn-primary" id="tc-save-btn">Save Tool Capabilities</button>
+                        <span id="tc-save-status" class="save-status"></span>
+                    </div>
+                </div>
+
+                <!-- Web Search -->
+                <div class="card">
+                    <h2>Web Search</h2>
+                    <p class="config-hint">Configure how the proxy handles web_search tool calls from Claude Code.</p>
+                    <div style="display:flex;gap:20px;align-items:flex-end;flex-wrap:wrap;">
+                        <div>
+                            <label style="font-size:0.85em;color:#888;">Mode</label>
+                            <select id="ws-mode-select" class="config-select" style="min-width:200px">
+                                <option value="duckduckgo">DuckDuckGo (local)</option>
+                                <option value="model">Model (passthrough)</option>
+                                <option value="ddg_then_model">DuckDuckGo → Model</option>
+                                <option value="model_then_ddg">Model → DuckDuckGo</option>
+                            </select>
+                        </div>
+                        <div id="ws-model-group">
+                            <label style="font-size:0.85em;color:#888;">Target Model</label>
+                            <select id="ws-model-select" class="config-select" style="min-width:200px">
+                                <option value="">-- select model --</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label style="font-size:0.85em;color:#888;">Max Results</label>
+                            <input type="number" id="ws-max-results" class="config-input" value="5" min="1" max="20" style="width:80px">
+                        </div>
+                        <button class="btn btn-primary" id="ws-save-btn">Save</button>
+                        <span id="ws-save-status" class="save-status"></span>
+                    </div>
+                </div>
+
                 <!-- API Keys -->
                 <div class="card">
                     <h2 data-i18n="config.api_keys">API Keys</h2>
@@ -436,6 +558,19 @@
                 <div class="modal-buttons">
                     <button class="btn btn-danger" id="modal-delete-btn" data-i18n="delete.all">Delete</button>
                     <button class="btn" id="modal-cancel-btn" data-i18n="cancel">Cancel</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Request Detail Modal -->
+        <div class="modal-overlay" id="request-detail-modal" style="display:none" role="dialog" aria-modal="true">
+            <div class="modal" style="max-width:700px;width:95vw;max-height:85vh;overflow-y:auto">
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:15px">
+                    <h3>Request Details</h3>
+                    <button class="btn btn-sm" id="req-detail-close">&times;</button>
+                </div>
+                <div id="req-detail-content">
+                    <p style="color:#888">Loading...</p>
                 </div>
             </div>
         </div>
