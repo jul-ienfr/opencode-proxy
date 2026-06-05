@@ -1042,6 +1042,8 @@ function showRequestDetail(reqId) {
                     <span class="detail-value">${escHtml(detail.account_alias) || '-'}</span>
                     <span class="detail-label">Client IP</span>
                     <span class="detail-value">${escHtml(detail.client_ip) || '-'}</span>
+                    <span class="detail-label">Client</span>
+                    <span class="detail-value" style="font-family:monospace;font-size:0.85em">${escHtml(detail.client_user_agent) || '-'}</span>
                     <span class="detail-label">Original Model</span>
                     <span class="detail-value">${escHtml(detail.original_model) || '-'}</span>
                     <span class="detail-label">Mapped Model</span>
@@ -1086,7 +1088,7 @@ function showRequestDetail(reqId) {
 function renderHistory(data) {
     const tbody = document.getElementById('history-tbody');
     if (!data || data.logs.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="12">' + t('logs.no_data') + '</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="13">' + t('logs.no_data') + '</td></tr>';
         updatePagination(1, 1);
         return;
     }
@@ -1137,6 +1139,7 @@ function renderHistory(data) {
             <td>${thinking}</td>
             <td>${effort}</td>
             <td>${toolsHtml}</td>
+            <td>${escHtml(log.client_ip) || '-'}</td>
             <td>${duration}</td>
             <td>${status}</td>
         </tr>`;

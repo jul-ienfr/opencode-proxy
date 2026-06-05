@@ -12,6 +12,7 @@ import sqlite3
 import threading
 import traceback
 import asyncio
+import contextvars
 import yaml
 from collections import OrderedDict
 from contextlib import asynccontextmanager
@@ -482,7 +483,7 @@ _conn.execute("CREATE INDEX IF NOT EXISTS idx_model ON requests(model)")
 _conn.execute("CREATE INDEX IF NOT EXISTS idx_success ON requests(success)")
 _conn.execute("CREATE INDEX IF NOT EXISTS idx_account ON requests(account_alias)")
 _conn.execute("CREATE INDEX IF NOT EXISTS idx_ts_model ON requests(timestamp, model)")
-for col, default in [("protocol", "NULL"), ("is_stream", "0"), ("thinking", "NULL"), ("effort", "NULL"), ("client_ip", "NULL"), ("account_alias", "NULL"), ("tools", "NULL"), ("tools_used", "NULL"), ("request_body", "NULL"), ("response_body", "NULL")]:
+for col, default in [("protocol", "NULL"), ("is_stream", "0"), ("thinking", "NULL"), ("effort", "NULL"), ("client_ip", "NULL"), ("account_alias", "NULL"), ("tools", "NULL"), ("tools_used", "NULL"), ("request_body", "NULL"), ("response_body", "NULL"), ("client_user_agent", "NULL")]:
     try:
         _conn.execute(f"ALTER TABLE requests ADD COLUMN {col} TEXT DEFAULT {default}")
     except Exception:
@@ -496,6 +497,10 @@ _db_last_commit = time.monotonic()
 _DB_COMMIT_INTERVAL = yaml_get("database", "commit_interval", 5)   # seconds between periodic commits
 _DB_COMMIT_BATCH = yaml_get("database", "commit_batch", 10)       # force commit after N inserts
 _db_commit_lock = threading.Lock()
+
+# Context variable to pass client user-agent from endpoint handlers to _save_request
+# without threading it through every intermediate function call.
+_current_user_agent: contextvars.ContextVar[str] = contextvars.ContextVar('_current_user_agent', default=None)
 
 def _db_flush():
     """Force a pending commit. Called periodically and before shutdown."""
@@ -511,7 +516,8 @@ def _db_flush():
 def _db_insert_sync(req_id, timestamp, model, original_model, duration_ms,
                     tokens_input, tokens_output, tokens_cache, success, error,
                     protocol, is_stream, thinking, effort, client_ip, account_alias,
-                    tools_json, tools_used_json, request_body_json=None, response_body_json=None):
+                    tools_json, tools_used_json, request_body_json=None, response_body_json=None,
+                    client_user_agent=None):
     """Synchronous DB insert — called via asyncio.to_thread().
 
     Batches commits: accumulates INSERTs and commits every _DB_COMMIT_BATCH
@@ -524,13 +530,13 @@ def _db_insert_sync(req_id, timestamp, model, original_model, duration_ms,
         INSERT OR REPLACE INTO requests (id, timestamp, model, original_model, duration_ms,
             tokens_input, tokens_output, tokens_cache, success, error,
             protocol, is_stream, thinking, effort, client_ip, account_alias, tools, tools_used,
-            request_body, response_body)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            request_body, response_body, client_user_agent)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (req_id, timestamp, model, original_model, duration_ms,
           tokens_input, tokens_output, tokens_cache, 1 if success else 0, error,
           protocol, 1 if is_stream else 0, thinking, effort,
           client_ip, account_alias, tools_json, tools_used_json,
-          request_body_json, response_body_json))
+          request_body_json, response_body_json, client_user_agent))
     # Batch commit logic
     with _db_commit_lock:
         _db_pending_inserts += 1
@@ -554,12 +560,14 @@ async def _save_request(req_id, model, original_model, duration_ms,
     tools_used_json = json.dumps(list(dict.fromkeys(tools_used))) if tools_used else "[]"
     request_body_json = json.dumps(request_body, ensure_ascii=False)[:MAX_BODY_STORAGE] if request_body else None
     response_body_json = json.dumps(response_body, ensure_ascii=False)[:MAX_BODY_STORAGE] if response_body else None
+    client_user_agent = _current_user_agent.get()
     timestamp = time.strftime("%Y-%m-%dT%H:%M:%S")
     await asyncio.to_thread(
         _db_insert_sync, req_id, timestamp, model, original_model, duration_ms,
         tokens_input, tokens_output, tokens_cache, success, error,
         protocol, is_stream, thinking, effort, client_ip, account_alias,
-        tools_json, tools_used_json, request_body_json, response_body_json
+        tools_json, tools_used_json, request_body_json, response_body_json,
+        client_user_agent
     )
     # Force commit so dashboard reads see the new row immediately
     _db_flush()
@@ -2622,6 +2630,7 @@ async def messages(request: Request):
     req_id = _fast_id("msg")
     start_time = time.time()
     client_ip = _get_client_ip(request)
+    _current_user_agent.set(request.headers.get("user-agent"))
 
     body_bytes = await request.body()
     if len(body_bytes) > MAX_BODY_SIZE:
@@ -3316,6 +3325,7 @@ async def chat_completions(request: Request):
     req_id = _fast_id("chatcmpl")
     start_time = time.time()
     client_ip = _get_client_ip(request)
+    _current_user_agent.set(request.headers.get("user-agent"))
 
     body_bytes = await request.body()
     if len(body_bytes) > MAX_BODY_SIZE:
@@ -3789,6 +3799,7 @@ async def responses(request: Request):
     req_id = _fast_id("resp")
     start_time = time.time()
     client_ip = _get_client_ip(request)
+    _current_user_agent.set(request.headers.get("user-agent"))
 
     body_bytes = await request.body()
     if len(body_bytes) > MAX_BODY_SIZE:
