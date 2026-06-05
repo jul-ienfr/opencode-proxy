@@ -194,6 +194,9 @@ const LOCALE = {
         'status.error': 'Error',
         'cancel': 'Cancel',
         'error.unknown': 'Unknown error',
+        'chart.token_dist': 'Token Distribution',
+        'chart.token_pct': 'Token % by Model',
+        'chart.req_pct': 'Requests % by Model',
     },
     fr: {
         'nav.stats': 'Statistiques',
@@ -364,6 +367,9 @@ const LOCALE = {
         'status.error': 'Erreur',
         'cancel': 'Annuler',
         'error.unknown': 'Erreur inconnue',
+        'chart.token_dist': 'Distribution des tokens',
+        'chart.token_pct': 'Tokens % par modèle',
+        'chart.req_pct': 'Requêtes % par modèle',
     },
 };
 
