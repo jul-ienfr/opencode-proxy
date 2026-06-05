@@ -12,6 +12,7 @@ import sqlite3
 import threading
 import traceback
 import asyncio
+import yaml
 from collections import OrderedDict
 from contextlib import asynccontextmanager
 import httpx
@@ -21,7 +22,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse as StarletteJSONResponse
 from starlette.requests import ClientDisconnect
 
-from config import API_KEY, PROXY, MODELS, ROUTES, get_model_config, HOST, PORT, WEB_PORT, DISABLE_MAPPING, API_KEYS, API_KEY_ROUTING, CUSTOM_ROUTES, maybe_reload_custom_routes, CACHE_MIN_PROMPT_SIZE, DEBUG
+from config import API_KEY, PROXY, MODELS, ROUTES, get_model_config, HOST, PORT, WEB_PORT, DISABLE_MAPPING, API_KEYS, API_KEY_ROUTING, CUSTOM_ROUTES, maybe_reload_custom_routes, CACHE_MIN_PROMPT_SIZE, DEBUG, yaml_get
 
 import itertools
 
@@ -94,12 +95,6 @@ def _find_alternative_key(failed_key: str) -> dict | None:
     _debug(f"  [apikey] no alternative key for {failed_key[:8]}...")
     return None
 
-def advance_failover():
-    global _key_failover_index
-    if API_KEYS and API_KEY_ROUTING == "failover":
-        _key_failover_index = (_key_failover_index + 1) % len(API_KEYS)
-        _debug(f"  [apikey] failover index advanced to {_key_failover_index}")
-
 _key_alias_cache: dict[str, str] = {}
 
 
@@ -122,6 +117,9 @@ def _parse_rate_limit_pause(resp_headers) -> tuple[float, str]:
     Returns (pause_seconds, reason). Priority:
     Retry-After > RateLimit-Reset > X-RateLimit-Reset > default (60s).
     """
+    _max_pause = float(yaml_get("key_pause", "max_pause", 600))
+    _default_pause = float(yaml_get("key_pause", "default_pause", 60))
+
     # Normalize: httpx headers are case-insensitive, use .get() which is
     # already case-insensitive for httpx.Headers objects.
     get = resp_headers.get if hasattr(resp_headers, "get") else lambda k: resp_headers.get(k.lower(), "")
@@ -132,7 +130,7 @@ def _parse_rate_limit_pause(resp_headers) -> tuple[float, str]:
         try:
             secs = float(retry_after)
             if secs > 0:
-                return min(secs, 600.0), "Retry-After"
+                return min(secs, _max_pause), "Retry-After"
         except (ValueError, TypeError):
             pass
 
@@ -142,7 +140,7 @@ def _parse_rate_limit_pause(resp_headers) -> tuple[float, str]:
         try:
             secs = float(rl_reset)
             if secs > 0:
-                return min(secs, 600.0), "RateLimit-Reset"
+                return min(secs, _max_pause), "RateLimit-Reset"
         except (ValueError, TypeError):
             pass
 
@@ -154,19 +152,26 @@ def _parse_rate_limit_pause(resp_headers) -> tuple[float, str]:
             if reset_val > 1577836800:  # looks like a unix timestamp
                 secs = reset_val - time.time()
                 if secs > 0:
-                    return min(secs, 600.0), "X-RateLimit-Reset"
+                    return min(secs, _max_pause), "X-RateLimit-Reset"
             elif reset_val > 0:  # seconds remaining
-                return min(reset_val, 600.0), "X-RateLimit-Reset"
+                return min(reset_val, _max_pause), "X-RateLimit-Reset"
         except (ValueError, TypeError):
             pass
 
-    return 60.0, "default"
+    return _default_pause, "default"
 
 
 class _KeyPauser:
-    """Per-key rate limit pause tracker. Pauses a key when upstream returns 429."""
+    """Per-key rate limit pause tracker. Pauses a key when upstream returns 429.
 
-    def __init__(self, max_pause: float = 600.0):
+    Persists pause state to logs/paused_keys.yaml so pauses survive reboots.
+    """
+
+    _PAUSED_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "paused_keys.yaml")
+
+    def __init__(self, max_pause: float = None):
+        if max_pause is None:
+            max_pause = float(yaml_get("key_pause", "max_pause", 600))
         self._paused: dict[str, float] = {}   # key_prefix -> monotonic expiry
         self._reasons: dict[str, str] = {}    # key_prefix -> reason string
         self._lock = threading.Lock()
@@ -176,6 +181,57 @@ class _KeyPauser:
     def _prefix(api_key: str) -> str:
         """Use first 12 chars as key identifier (safe for logging, unique enough)."""
         return api_key[:12] if len(api_key) >= 12 else api_key
+
+    def _save(self):
+        """Persist current pause state to YAML file (wall clock times)."""
+        try:
+            data = {}
+            for prefix, mono_expiry in self._paused.items():
+                remaining = mono_expiry - time.monotonic()
+                if remaining > 0:
+                    wall_expiry = time.time() + remaining
+                    data[prefix] = {
+                        "expiry": wall_expiry,
+                        "reason": self._reasons.get(prefix, ""),
+                    }
+            os.makedirs(os.path.dirname(self._PAUSED_FILE), exist_ok=True)
+            with open(self._PAUSED_FILE, "w", encoding="utf-8") as f:
+                yaml.dump({"paused_keys": data}, f, default_flow_style=False)
+        except Exception as e:
+            _debug(f"  [keypauser] save error: {e}")
+
+    def load(self, api_keys: list):
+        """Load persisted pause state from YAML (called once at startup).
+
+        Converts wall clock expiry → monotonic expiry so is_paused() works.
+        Expired entries are silently dropped.
+        """
+        try:
+            if not os.path.exists(self._PAUSED_FILE):
+                return
+            with open(self._PAUSED_FILE, "r", encoding="utf-8") as f:
+                raw = yaml.safe_load(f) or {}
+            entries = raw.get("paused_keys", {})
+            if not entries:
+                return
+            now_wall = time.time()
+            now_mono = time.monotonic()
+            loaded = 0
+            for prefix, info in entries.items():
+                wall_expiry = info.get("expiry", 0)
+                if wall_expiry <= now_wall:
+                    continue  # already expired
+                remaining = wall_expiry - now_wall
+                mono_expiry = now_mono + remaining
+                with self._lock:
+                    self._paused[prefix] = mono_expiry
+                    self._reasons[prefix] = info.get("reason", "")
+                loaded += 1
+            if loaded:
+                _debug(f"  [keypauser] loaded {loaded} persisted pauses from disk")
+                _log(f"  KEY PAUSER: restored {loaded} pauses from disk")
+        except Exception as e:
+            _debug(f"  [keypauser] load error: {e}")
 
     def pause_key(self, api_key: str, duration: float, reason: str = ""):
         """Pause a key for `duration` seconds from now."""
@@ -187,6 +243,7 @@ class _KeyPauser:
             if expiry > existing:  # only extend, never shorten
                 self._paused[prefix] = expiry
                 self._reasons[prefix] = reason
+                self._save()
         alias = _alias_for_key(api_key)
         _debug(f"  [keypauser] PAUSED alias={alias} prefix={prefix} for {duration:.0f}s reason={reason}")
         _log(f"  KEY PAUSED: alias={alias} for {duration:.0f}s ({reason})")
@@ -261,6 +318,8 @@ class _KeyPauser:
             for k in expired:
                 del self._paused[k]
                 self._reasons.pop(k, None)
+            if expired:
+                self._save()
         if expired:
             _debug(f"  [keypauser] cleanup: {len(expired)} expired pauses removed")
 
@@ -271,6 +330,7 @@ class _KeyPauser:
             if prefix in self._paused:
                 del self._paused[prefix]
                 self._reasons.pop(prefix, None)
+                self._save()
                 alias = _alias_for_key(api_key)
                 _debug(f"  [keypauser] UNPAUSED alias={alias} prefix={prefix} (recovered)")
                 _log(f"  KEY UNPAUSED: alias={alias} (recovered)")
@@ -290,6 +350,51 @@ def on_workspace_recovered(workspace_id: str):
         if k.get("go_workspace_id") == workspace_id:
             _key_pauser.unpause_if_paused(k.get("api_key", ""))
             break
+
+
+async def _pause_key_for_quota_reset(api_key: str):
+    """On 429, fetch fresh quotas for this key's workspace and pause until reset.
+
+    Finds which rolling quota is at 100%, calculates the exact reset time,
+    and pauses the key for that duration. The key auto-re-enables at reset.
+    """
+    try:
+        from dashboard.quota import fetch_quotas, get_configured_workspaces
+        # Find workspace for this key
+        ws_entry = None
+        for k in API_KEYS:
+            if k.get("api_key") == api_key and k.get("go_workspace_id") and k.get("go_auth_cookie"):
+                ws_entry = k
+                break
+        if not ws_entry:
+            return  # No workspace configured for this key, can't fetch quotas
+
+        wid = ws_entry["go_workspace_id"]
+        cookie = ws_entry["go_auth_cookie"]
+        quotas = await fetch_quotas(wid, cookie)
+
+        # Find which quota window is exhausted — prefer rolling (5h window)
+        for window in ("rolling", "weekly", "monthly"):
+            q = quotas.get(window, {})
+            usage = q.get("usage_percent", 0)
+            reset_sec = q.get("reset_in_sec", 0)
+            if usage >= 100 and reset_sec > 0:
+                alias = _alias_for_key(api_key)
+                re_enable_at = time.time() + reset_sec
+                re_enable_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(re_enable_at))
+                _key_pauser.pause_key(api_key, reset_sec,
+                                      f"quota {window} {usage:.0f}% → réactivation {re_enable_str}")
+                _log(f"  QUOTA {window.upper()} AT {usage:.0f}% — key {alias} paused until {re_enable_str} (in {reset_sec:.0f}s)")
+                return
+
+        # No quota at 100% — use default pause
+        _default_pause = float(yaml_get("key_pause", "default_pause", 60))
+        _key_pauser.pause_key(api_key, _default_pause, "429 (no quota at 100%)")
+    except Exception as e:
+        _debug(f"  [quota] failed to fetch quotas for 429 pause: {e}")
+        # Fallback to default pause
+        _default_pause = float(yaml_get("key_pause", "default_pause", 60))
+        _key_pauser.pause_key(api_key, _default_pause, "429 (quota fetch failed)")
 
 
 def _key_from_headers(headers: dict, protocol: str) -> str:
@@ -340,19 +445,19 @@ if DEBUG:
     set_debug_log_file(os.path.join(LOG_DIR, "debug.log"))
     _debug("Debug mode enabled — full request/response logging active")
 
-# Request body size limit (10 MB)
-MAX_BODY_SIZE = 10 * 1024 * 1024
+# Request body size limit (from YAML config, default 10 MB)
+MAX_BODY_SIZE = yaml_get("upstream", "max_body_size", 10 * 1024 * 1024)
 
 # SQLite setup — synchronous connection, all DB ops run in thread pool
 _db_path = os.path.join(LOG_DIR, "requests.db")
 _conn = sqlite3.connect(_db_path, check_same_thread=False)
 _conn.row_factory = sqlite3.Row
 _conn.execute("PRAGMA journal_mode=WAL")
-_conn.execute("PRAGMA busy_timeout=5000")
+_conn.execute(f"PRAGMA busy_timeout={yaml_get('database', 'busy_timeout', 5000)}")
 _conn.execute("PRAGMA synchronous=NORMAL")       # WAL+NORMAL: safe crash-resilient, 50-90% fewer fsyncs
-_conn.execute("PRAGMA cache_size=-64000")        # 64MB page cache (default: 2MB)
+_conn.execute(f"PRAGMA cache_size=-{yaml_get('database', 'cache_size', 64000)}")  # page cache
 _conn.execute("PRAGMA temp_store=MEMORY")        # temp tables in RAM
-_conn.execute("PRAGMA mmap_size=268435456")      # memory-mapped I/O for 256MB
+_conn.execute(f"PRAGMA mmap_size={yaml_get('database', 'mmap_size', 268435456)}")  # memory-mapped I/O
 _conn.execute("""
     CREATE TABLE IF NOT EXISTS requests (
         id TEXT PRIMARY KEY,
@@ -387,8 +492,8 @@ _debug(f"  [db] SQLite connection established: {_db_path}")
 
 _db_pending_inserts = 0
 _db_last_commit = time.monotonic()
-_DB_COMMIT_INTERVAL = 5.0   # seconds between periodic commits
-_DB_COMMIT_BATCH = 10       # force commit after N inserts
+_DB_COMMIT_INTERVAL = yaml_get("database", "commit_interval", 5)   # seconds between periodic commits
+_DB_COMMIT_BATCH = yaml_get("database", "commit_batch", 10)       # force commit after N inserts
 _db_commit_lock = threading.Lock()
 
 def _db_flush():
@@ -454,6 +559,29 @@ async def _save_request(req_id, model, original_model, duration_ms,
     # Notify dashboard SSE clients about the update
     try:
         get_event_manager().publish("stats_updated", {"time": timestamp})
+        # Also publish request detail via SSE
+        tools_used_list = json.loads(tools_used_json) if tools_used_json and tools_used_json != "[]" else []
+        tools_list = json.loads(tools_json) if tools_json and tools_json != "[]" else []
+        get_event_manager().publish("request_completed", {
+            "id": req_id,
+            "timestamp": timestamp,
+            "model": model,
+            "original_model": original_model,
+            "duration_ms": duration_ms,
+            "tokens_input": tokens_input,
+            "tokens_output": tokens_output,
+            "tokens_cache": tokens_cache,
+            "success": success,
+            "error": error,
+            "protocol": protocol,
+            "is_stream": is_stream,
+            "thinking": thinking,
+            "effort": effort,
+            "client_ip": client_ip,
+            "account_alias": account_alias,
+            "tools": tools_list,
+            "tools_used": tools_used_list,
+        })
     except Exception:
         pass
 
@@ -520,7 +648,9 @@ def _sanitize_headers(headers) -> dict:
     return safe
 
 
-def _truncate(body, max_len=10240) -> str:
+def _truncate(body, max_len=None) -> str:
+    if max_len is None:
+        max_len = yaml_get("debug", "truncate_max", 10240)
     """Pretty-print a body for debug logging, truncated to max_len chars."""
     try:
         text = json.dumps(body, indent=2, ensure_ascii=False, default=str)
@@ -619,6 +749,9 @@ _response_cache = _ResponseCache()
 @asynccontextmanager
 async def lifespan(app):
     _debug("  [lifespan] app starting")
+    # Restore persisted key pause state from disk
+    _key_pauser.load(API_KEYS)
+
     # Start background quota fetcher (no-op if env vars not set)
     await start_quota_fetcher(app)
 
@@ -627,10 +760,10 @@ async def lifespan(app):
     set_on_workspace_recovered_callback(on_workspace_recovered)
     _debug("  [lifespan] workspace recovery callback registered")
 
-    # Periodic WAL checkpoint (every hour)
+    # Periodic WAL checkpoint
     async def _periodic_checkpoint():
         while True:
-            await asyncio.sleep(3600)
+            await asyncio.sleep(yaml_get("background", "wal_checkpoint_interval", 3600))
             await asyncio.to_thread(_wal_checkpoint)
 
     # Periodic DB flush (every 5s) to commit any batched inserts
@@ -642,10 +775,10 @@ async def lifespan(app):
     checkpoint_task = asyncio.create_task(_periodic_checkpoint())
     db_flush_task = asyncio.create_task(_periodic_db_flush())
 
-    # Periodic key pause cleanup (every 30s) to remove expired entries
+    # Periodic key pause cleanup to remove expired entries
     async def _periodic_key_pause_cleanup():
         while True:
-            await asyncio.sleep(30)
+            await asyncio.sleep(yaml_get("background", "key_pause_cleanup_interval", 30))
             _key_pauser.cleanup_expired()
 
     key_pause_cleanup_task = asyncio.create_task(_periodic_key_pause_cleanup())
@@ -711,9 +844,9 @@ register_dashboard(app, STATIC_DIR, _conn, server_manager_getter=lambda: _server
 
 # ── Rate Limiting (token bucket, per-IP) ────────────────────────
 
-RATE_LIMIT_RPS = float(os.environ.get("RATE_LIMIT_RPS", "50"))
-RATE_LIMIT_BURST = float(os.environ.get("RATE_LIMIT_BURST", "100"))
-_STALE_BUCKET_TTL = 300  # seconds — remove buckets inactive for 5 min
+RATE_LIMIT_RPS = float(os.environ.get("RATE_LIMIT_RPS", str(yaml_get("rate_limit", "rps", 50))))
+RATE_LIMIT_BURST = float(os.environ.get("RATE_LIMIT_BURST", str(yaml_get("rate_limit", "burst", 100))))
+_STALE_BUCKET_TTL = yaml_get("rate_limit", "stale_ttl", 300)  # seconds — remove buckets inactive for 5 min
 
 
 class _Bucket:
@@ -853,8 +986,8 @@ app.add_middleware(AccessLogMiddleware)
 
 # ── Circuit Breaker (per-endpoint) ──────────────────────────────
 
-_CB_FAILURE_THRESHOLD = 5     # trips open after N consecutive failures
-_CB_RECOVERY_TIMEOUT = 60.0   # seconds before half-open test
+_CB_FAILURE_THRESHOLD = yaml_get("circuit_breaker", "failure_threshold", 5)     # trips open after N consecutive failures
+_CB_RECOVERY_TIMEOUT = float(yaml_get("circuit_breaker", "recovery_timeout", 60))   # seconds before half-open test
 
 
 class _CircuitBreaker:
@@ -1021,7 +1154,7 @@ async def _do_request_with_retry(endpoint, body, headers, protocol, retry_on_429
     Raises UpstreamError on connection/timeout/protocol failures.
     """
     _RETRYABLE_STATUSES = {502, 503, 504}
-    max_retries = 2
+    max_retries = yaml_get("streaming", "retry_attempts", 2)
 
     for attempt in range(max_retries):
         _debug(f"  → upstream POST {endpoint} attempt {attempt+1}/{max_retries} headers={_sanitize_headers(headers)}")
@@ -1047,9 +1180,8 @@ async def _do_request_with_retry(endpoint, body, headers, protocol, retry_on_429
         # Retry on 429 with key failover
         if retry_on_429 and resp.status_code == 429 and len(API_KEYS) > 1:
             failed_key = _key_from_headers(headers, protocol)
-            # Parse rate-limit headers and pause the failed key
-            pause_secs, reason = _parse_rate_limit_pause(resp.headers)
-            _key_pauser.pause_key(failed_key, pause_secs, reason)
+            # Fetch fresh quotas and pause key until exact reset time
+            await _pause_key_for_quota_reset(failed_key)
             alt = _find_alternative_key(failed_key)
             if alt:
                 _debug(f"  ⟳ 429 failover: {failed_key[:8]}… → alias={alt.get('alias', '?')}")
@@ -1139,19 +1271,14 @@ def _make_stream_retry_loop(protocol):
     Returns (attempt_headers, should_retry) where should_retry=True means
     the caller should `continue` the outer loop.
     """
-    def _handle_429(headers, status_code, attempt, resp_headers=None):
+    async def _handle_429(headers, status_code, attempt, resp_headers=None):
         if attempt == 0 and len(API_KEYS) > 1 and status_code in (429, 401):
             failed_key = _key_from_headers(headers, protocol)
             if status_code == 429:
-                # Parse rate-limit headers and pause the failed key
-                if resp_headers:
-                    pause_secs, reason = _parse_rate_limit_pause(resp_headers)
-                else:
-                    pause_secs, reason = 60.0, "default (no headers)"
+                # Fetch fresh quotas and pause key until exact reset time
+                await _pause_key_for_quota_reset(failed_key)
             else:  # 401
-                pause_secs = _key_pauser._max_pause
-                reason = "401 Unauthorized"
-            _key_pauser.pause_key(failed_key, pause_secs, reason)
+                _key_pauser.pause_key(failed_key, _key_pauser._max_pause, "401 Unauthorized")
             alt = _find_alternative_key(failed_key)
             if alt:
                 _log(f"  {status_code} on key, retrying with alternative key")
@@ -1220,7 +1347,7 @@ def _sse(event: str, payload: dict) -> bytes:
 
 
 # Keepalive comment that is harmless to clients: every 15s during idle periods
-_SSE_KEEPALIVE_INTERVAL = 15  # seconds
+_SSE_KEEPALIVE_INTERVAL = yaml_get("streaming", "sse_keepalive_interval", 15)  # seconds
 
 
 async def _sse_keepalive(stream_gen, interval: float = _SSE_KEEPALIVE_INTERVAL):
@@ -1307,6 +1434,248 @@ def _extract_tool_names(body: dict) -> list:
     return names
 
 
+def _tool_name(tool: dict) -> str:
+    """Extract tool name from either Anthropic or OpenAI format."""
+    if not isinstance(tool, dict):
+        return ""
+    if "name" in tool and isinstance(tool["name"], str):
+        return tool["name"]
+    fn = tool.get("function")
+    if isinstance(fn, dict) and "name" in fn and isinstance(fn["name"], str):
+        return fn["name"]
+    return ""
+
+
+def _inject_system_hint(body: dict, hint: str):
+    """Inject a system prompt hint into the request body.
+
+    Works for both Anthropic format (body['system']) and OpenAI format (messages with system role).
+    """
+    if not hint:
+        return
+    # Anthropic format: body has "system" field
+    if "system" in body:
+        existing = body["system"]
+        if isinstance(existing, str):
+            body["system"] = (hint + "\n\n" + existing) if existing else hint
+        elif isinstance(existing, list):
+            body["system"] = [{"type": "text", "text": hint}] + existing
+    # OpenAI format: messages array with system role
+    elif "messages" in body:
+        for msg in body["messages"]:
+            if msg.get("role") in ("system", "developer"):
+                msg["content"] = hint + "\n\n" + msg.get("content", "")
+                return
+        body["messages"].insert(0, {"role": "system", "content": hint})
+
+
+def _filter_tools_for_model(body: dict, model_id: str) -> list:
+    """Filter tools in request body based on model capabilities.
+
+    Mutates body in place. Returns the list of tool names actually sent.
+
+    Applies:
+    1. Whitelist (supported_tools) if set
+    2. Blacklist (unsupported_tools) if set
+    3. System hint injection if configured
+    """
+    import config as _cfg
+
+    # Fast path: no config at all
+    if not _cfg.TOOL_CAPABILITIES:
+        return _extract_tool_names(body)
+
+    cfg = _cfg.get_tool_config(model_id)
+    supported = cfg.get("supported_tools")
+    unsupported = cfg.get("unsupported_tools") or []
+    hint = cfg.get("system_hint")
+
+    # No filtering needed
+    if not supported and not unsupported and not hint:
+        return _extract_tool_names(body)
+
+    tools = body.get("tools")
+    if not isinstance(tools, list) or not tools:
+        # No tools in request — inject hint if configured and tools exist
+        if hint and body.get("tools"):
+            _inject_system_hint(body, hint)
+        return []
+
+    original_count = len(tools)
+
+    if supported is not None:
+        # Whitelist mode: keep only supported tools
+        allowed = set(supported)
+        tools = [t for t in tools if _tool_name(t) in allowed]
+    elif unsupported:
+        # Blacklist mode: remove unsupported tools
+        blocked = set(unsupported)
+        tools = [t for t in tools if _tool_name(t) not in blocked]
+
+    body["tools"] = tools
+
+    removed = original_count - len(tools)
+    if removed > 0:
+        _debug(f"  [tool-filter] {model_id}: filtered {removed}/{original_count} tools")
+
+    # Inject system hint if tools are present
+    if hint and tools:
+        _inject_system_hint(body, hint)
+
+    kept = [_tool_name(t) for t in tools]
+    return kept
+
+
+# ── Web Search Handler ───────────────────────────────────────────────
+
+def _is_web_search_forced(body: dict, protocol: str) -> bool:
+    """Check if tool_choice is forced to web_search."""
+    tc = body.get("tool_choice")
+    if not isinstance(tc, dict):
+        return False
+    if protocol == "anthropic":
+        return tc.get("type") == "tool" and tc.get("name") == "web_search"
+    else:
+        return tc.get("type") == "function" and tc.get("function", {}).get("name") == "web_search"
+
+
+def _extract_search_query(body: dict) -> str:
+    """Extract the search query from the last user message."""
+    messages = body.get("messages", [])
+    for msg in reversed(messages):
+        if msg.get("role") == "user":
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                # Look for "Perform a web search for the query: ..." pattern
+                if "web search" in content.lower():
+                    for line in content.split("\n"):
+                        if "query:" in line.lower():
+                            return line.split(":", 1)[1].strip()
+                return content[:500]
+            elif isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        text = block.get("text", "")
+                        if "web search" in text.lower():
+                            for line in text.split("\n"):
+                                if "query:" in line.lower():
+                                    return line.split(":", 1)[1].strip()
+                        return text[:500]
+    return ""
+
+
+def _execute_ddg_search(query: str, max_results: int = 5) -> str:
+    """Execute a DuckDuckGo search and return formatted results."""
+    try:
+        from duckduckgo_search import DDGS
+        with DDGS() as ddgs:
+            results = list(ddgs.text(query, max_results=max_results))
+        if not results:
+            return f"No results found for: {query}"
+        lines = [f"Web search results for '{query}':\n"]
+        for i, r in enumerate(results, 1):
+            title = r.get("title", "")
+            body_text = r.get("body", "")
+            href = r.get("href", "")
+            lines.append(f"{i}. **{title}**\n   {body_text}\n   {href}\n")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Search error: {type(e).__name__}: {e}"
+
+
+def _inject_search_results(body: dict, results: str, protocol: str):
+    """Inject search results as a system message in the request body."""
+    if protocol == "anthropic":
+        existing = body.get("system", "")
+        if isinstance(existing, str):
+            body["system"] = results + "\n\n" + existing if existing else results
+        elif isinstance(existing, list):
+            body["system"] = [{"type": "text", "text": results}] + existing
+    else:
+        # OpenAI format — inject as system message at the beginning
+        messages = body.get("messages", [])
+        messages.insert(0, {"role": "system", "content": results})
+        body["messages"] = messages
+
+
+def _strip_web_search_tool(body: dict, protocol: str):
+    """Remove web_search tool and forced tool_choice from the body."""
+    # Remove web_search from tools
+    if "tools" in body:
+        if protocol == "anthropic":
+            body["tools"] = [t for t in body["tools"] if t.get("name") != "web_search"]
+        else:
+            body["tools"] = [t for t in body["tools"]
+                            if t.get("function", {}).get("name") != "web_search"]
+        if not body["tools"]:
+            del body["tools"]
+
+    # Remove forced tool_choice
+    tc = body.get("tool_choice")
+    if isinstance(tc, dict):
+        is_forced_web_search = (
+            (tc.get("type") == "tool" and tc.get("name") == "web_search") or
+            (tc.get("type") == "function" and tc.get("function", {}).get("name") == "web_search")
+        )
+        if is_forced_web_search:
+            del body["tool_choice"]
+
+
+async def _handle_web_search(body: dict, model_id: str, protocol: str) -> bool:
+    """Handle web_search tool by executing locally or routing to a compatible model.
+
+    Returns True if the request was handled locally (caller should return synthetic response).
+    Returns False if the request should proceed normally to upstream.
+    """
+    if not _is_web_search_forced(body, protocol):
+        return False
+
+    mode = yaml_get("web_search", "mode", "duckduckgo")
+    target_model = yaml_get("web_search", "target_model", None)
+    max_results = yaml_get("web_search", "max_results", 5)
+    query = _extract_search_query(body)
+
+    _debug(f"  [web-search] mode={mode} model={model_id} query={query[:80]}...")
+
+    if mode == "duckduckgo":
+        # Execute search locally and inject results
+        results = _execute_ddg_search(query, max_results)
+        _inject_search_results(body, results, protocol)
+        _strip_web_search_tool(body, protocol)
+        _log(f"  WEB SEARCH: DuckDuckGo query='{query[:60]}' → injected results")
+        return False  # Let upstream process the request with search context
+
+    elif mode == "model" and target_model:
+        # Replace model with one that supports web_search
+        body["model"] = target_model
+        _log(f"  WEB SEARCH: routed to {target_model} for web_search")
+        return False  # Let upstream process with the compatible model
+
+    elif mode == "ddg_then_model" and target_model:
+        # Try DuckDuckGo first, fallback to model on failure
+        results = _execute_ddg_search(query, max_results)
+        if "error" in results.lower() or "no results" in results.lower():
+            body["model"] = target_model
+            _log(f"  WEB SEARCH: DDG failed, routed to {target_model}")
+        else:
+            _inject_search_results(body, results, protocol)
+            _strip_web_search_tool(body, protocol)
+            _log(f"  WEB SEARCH: DuckDuckGo query='{query[:60]}' → injected results")
+        return False
+
+    elif mode == "model_then_ddg":
+        # Let upstream try first (will handle via 400 fallback)
+        if target_model:
+            body["model"] = target_model
+        _log(f"  WEB SEARCH: model-first for web_search (fallback=DDG)")
+        return False
+
+    # Default: strip the tool and let upstream handle without it
+    _strip_web_search_tool(body, protocol)
+    _log(f"  WEB SEARCH: stripped web_search tool (mode={mode})")
+    return False
+
+
 def _extract_text(content) -> str:
     if isinstance(content, str):
         return content
@@ -1329,7 +1698,7 @@ def _extract_text(content) -> str:
 
 
 # ── Cache restructuration for models without semantic caching ──
-CACHE_REWRITE_MODELS = {"mimo-v2.5", "mimo-v2-pro", "mimo-v2-omni", "mimo-v2.5-pro"}
+CACHE_REWRITE_MODELS = set(yaml_get("cache_rewrite_models", default=["mimo-v2.5", "mimo-v2-pro", "mimo-v2-omni", "mimo-v2.5-pro"]))
 
 
 def _find_split_point(text: str) -> int:
@@ -2127,12 +2496,15 @@ def openai_chat_to_responses(chat_resp: dict, model: str) -> dict:
 
 
 # ── Thinking models token guard ────────────────────────────
-THINKING_MODELS = {
+_thinking_cfg = yaml_get("thinking", "min_tokens", {})
+THINKING_MODELS = {k: int(v) for k, v in _thinking_cfg.items()} if isinstance(_thinking_cfg, dict) else {
     "deepseek-v4-flash": 2048,
     "deepseek-v4-pro": 4096,
 }
 
-def ensure_min_tokens(body: dict, default: int = 256) -> dict:
+def ensure_min_tokens(body: dict, default: int = None) -> dict:
+    if default is None:
+        default = yaml_get("thinking", "default_min_tokens", 256)
     """Ajuste max_output_tokens pour les modèles thinking afin qu'il
     reste des tokens pour la réponse après le reasoning."""
     model = body.get("model", "")
@@ -2235,18 +2607,6 @@ def _get_client_ip(request: Request) -> str:
     return ip
 
 
-async def _try_failover_key(hdrs: dict, err_status: int) -> dict:
-    """If 429 and multiple keys configured, return headers for an alternative key. Else return None."""
-    if err_status != 429 or len(API_KEYS) <= 1:
-        return None
-    failed = hdrs.get("Authorization", "").replace("Bearer ", "")
-    alt = _find_alternative_key(failed)
-    if alt:
-        _log(f"  429 on key, retrying with alternative key")
-        return _get_auth_headers("openai", entry=alt)
-    return None
-
-
 @app.api_route("/v1/messages", methods=["POST"])
 @app.api_route("/anthropic/v1/messages", methods=["POST"])
 async def messages(request: Request):
@@ -2296,6 +2656,12 @@ async def messages(request: Request):
     effort_override = route.get("effort")
     if effort_override and effort_override != "auto":
         body["effort"] = effort_override
+
+    # Filter tools based on model capabilities
+    tool_names = _filter_tools_for_model(body, model_id)
+
+    # Handle web_search tool (DuckDuckGo or model routing)
+    await _handle_web_search(body, model_id, protocol)
 
     # Extract thinking for logging
     thinking = body.get("thinking", {})
@@ -2383,16 +2749,16 @@ async def messages(request: Request):
             _line_buf = ""
             started = False
             open_blocks = []
-            used_tools = []
             stop_reason = "end_turn"
             _handle_429 = _make_stream_retry_loop("anthropic")
-            for _attempt in range(2):  # retry once on 429
+            for _attempt in range(yaml_get("streaming", "retry_attempts", 2)):
+                used_tools = []  # Reset on each retry attempt
                 _debug(f"  [stream] attempt {_attempt+1}/2")
                 try:
                     async with _client.stream("POST", endpoint, json=body, headers=headers) as resp:
                         _debug(f"  [stream] connected status={resp.status_code}")
                         if resp.status_code != 200:
-                            headers, should_retry = _handle_429(headers, resp.status_code, _attempt, resp.headers)
+                            headers, should_retry = await _handle_429(headers, resp.status_code, _attempt, resp.headers)
                             if should_retry:
                                 _debug(f"  [stream] 429 retry, key swapped")
                                 continue
@@ -2416,7 +2782,7 @@ async def messages(request: Request):
                         async for chunk in resp.aiter_bytes():
                             yield chunk
                             _line_buf += chunk.decode("utf-8", errors="replace")
-                            if len(_line_buf) > 1_000_000:
+                            if len(_line_buf) > yaml_get("streaming", "line_buffer_max", 1_000_000):
                                 _line_buf = _line_buf[-1000:]
                             while "\n" in _line_buf:
                                 line, _line_buf = _line_buf.split("\n", 1)
@@ -2481,6 +2847,8 @@ async def messages(request: Request):
                     if _attempt == 0:
                         # Try alternative key on retry
                         failed_key = _key_from_headers(headers, "anthropic")
+                        _default_pause = float(yaml_get("key_pause", "default_pause", 60))
+                        _key_pauser.pause_key(failed_key, _default_pause, "stream exception")
                         alt = _find_alternative_key(failed_key)
                         if alt:
                             _debug(f"  ⟳ stream retry with alt key: alias={alt.get('alias', '?')}")
@@ -2602,18 +2970,18 @@ async def messages(request: Request):
         open_blocks = []
         text_block_idx = None
         reasoning_block_idx = None
-        tool_block_idx = {}
         next_block_idx = 0
         stream_out_tokens = 0
         actual_usage = None
-        used_tools = []
         _handle_429 = _make_stream_retry_loop("openai")
 
-        for _attempt in range(2):
+        for _attempt in range(yaml_get("streaming", "retry_attempts", 2)):
+            used_tools = []  # Reset on each retry attempt
+            tool_block_idx = {}  # Reset tracking dict on each retry
             try:
                 async with _client.stream("POST", endpoint, json=oai_body, headers=hdrs) as resp:
                     if resp.status_code != 200:
-                        hdrs, should_retry = _handle_429(hdrs, resp.status_code, _attempt, resp.headers)
+                        hdrs, should_retry = await _handle_429(hdrs, resp.status_code, _attempt, resp.headers)
                         if should_retry:
                             continue
                         err = await resp.aread()
@@ -2746,6 +3114,8 @@ async def messages(request: Request):
                 if _attempt == 0:
                     # Try alternative key on retry (handles rate-limit disguised as disconnect)
                     failed_key = _key_from_headers(hdrs, "openai")
+                    _default_pause = float(yaml_get("key_pause", "default_pause", 60))
+                    _key_pauser.pause_key(failed_key, _default_pause, "stream exception")
                     alt = _find_alternative_key(failed_key)
                     if alt:
                         _debug(f"  ⟳ stream retry with alt key: alias={alt.get('alias', '?')}")
@@ -2804,13 +3174,13 @@ async def health():
     upstream_ok = True
     now = time.monotonic()
     with _health_lock:
-        if _health_cache and (now - _health_cache[0]) < 15.0:
+        if _health_cache and (now - _health_cache[0]) < yaml_get("background", "health_cache_ttl", 15):
             upstream_ok = _health_cache[1]
             _debug(f"  [health] upstream check (cached): {'ok' if upstream_ok else 'unreachable'}")
         else:
             # Cache miss — perform actual check
             try:
-                resp = await _client.get("https://opencode.ai", timeout=5.0)
+                resp = await _client.get("https://opencode.ai", timeout=float(yaml_get("background", "health_timeout", 5)))
                 upstream_ok = resp.status_code < 500
             except Exception:
                 upstream_ok = False
@@ -2968,6 +3338,12 @@ async def chat_completions(request: Request):
               or (body.get("output_config", {}).get("effort") if isinstance(body.get("output_config"), dict) else None)
               or "none")
 
+    # Filter tools based on model capabilities
+    tool_names = _filter_tools_for_model(body, model_id)
+
+    # Handle web_search tool (DuckDuckGo or model routing)
+    await _handle_web_search(body, model_id, protocol)
+
     _log(f"→ {original_model!r} → {model_id} | {protocol} | chat/completions | stream={is_stream} | thinking={thinking_type} | effort={effort} | ip={client_ip}")
 
     # Circuit breaker check
@@ -3019,13 +3395,14 @@ async def chat_completions(request: Request):
         async def openai_stream(hdrs):
             stream_out = 0
             actual_usage = None
-            used_tools = []
             _handle_429 = _make_stream_retry_loop("openai")
-            for _attempt in range(2):
+            for _attempt in range(yaml_get("streaming", "retry_attempts", 2)):
+                used_tools = []
+                seen_tool_indices = set()  # dedup tool calls by index
                 try:
                     async with _client.stream("POST", endpoint, json=oai_body, headers=hdrs) as resp:
                         if resp.status_code != 200:
-                            hdrs, should_retry = _handle_429(hdrs, resp.status_code, _attempt, resp.headers)
+                            hdrs, should_retry = await _handle_429(hdrs, resp.status_code, _attempt, resp.headers)
                             if should_retry:
                                 continue
                             err = await resp.aread()
@@ -3071,7 +3448,10 @@ async def chat_completions(request: Request):
                                         stream_out += _estimate_tokens(rc)
                                     for tc in delta.get("tool_calls", []):
                                         if isinstance(tc, dict) and "name" in tc.get("function", {}):
-                                            used_tools.append(tc["function"]["name"])
+                                            tc_idx = tc.get("index", len(seen_tool_indices))
+                                            if tc_idx not in seen_tool_indices:
+                                                seen_tool_indices.add(tc_idx)
+                                                used_tools.append(tc["function"]["name"])
                             yield line.encode() + b"\n\n"
 
                         # Stream ended — finalize tracking
@@ -3089,6 +3469,8 @@ async def chat_completions(request: Request):
                     if _attempt == 0:
                         # Try alternative key on retry
                         failed_key = _key_from_headers(hdrs, "openai")
+                        _default_pause = float(yaml_get("key_pause", "default_pause", 60))
+                        _key_pauser.pause_key(failed_key, _default_pause, "stream exception")
                         alt = _find_alternative_key(failed_key)
                         if alt:
                             _debug(f"  ⟳ stream retry with alt key: alias={alt.get('alias', '?')}")
@@ -3195,11 +3577,11 @@ async def chat_completions(request: Request):
             }
             return b"data: " + json.dumps(c, ensure_ascii=False).encode() + b"\n\n"
 
-        for _attempt in range(2):
+        for _attempt in range(yaml_get("streaming", "retry_attempts", 2)):
             try:
                 async with _client.stream("POST", endpoint, json=anthro_body, headers=hdrs) as resp:
                     if resp.status_code != 200:
-                        hdrs, should_retry = _handle_429(hdrs, resp.status_code, _attempt, resp.headers)
+                        hdrs, should_retry = await _handle_429(hdrs, resp.status_code, _attempt, resp.headers)
                         if should_retry:
                             continue
                         ak = _alias_for_key(hdrs.get("x-api-key", ""))
@@ -3339,6 +3721,8 @@ async def chat_completions(request: Request):
                 if _attempt == 0:
                     # Try alternative key on retry
                     failed_key = _key_from_headers(hdrs, "anthropic")
+                    _default_pause = float(yaml_get("key_pause", "default_pause", 60))
+                    _key_pauser.pause_key(failed_key, _default_pause, "stream exception")
                     alt = _find_alternative_key(failed_key)
                     if alt:
                         _debug(f"  ⟳ stream retry with alt key: alias={alt.get('alias', '?')}")
@@ -3388,13 +3772,6 @@ async def responses(request: Request):
 
     body = ensure_min_tokens(body)
 
-    # ── DeepSeek optimizations ────────────────────────────────
-    if "deepseek-v4" in body.get("model", ""):
-        # Filter tools: keep only those DeepSeek handles well
-        basic_tools = {"Read", "Write", "Edit", "Bash", "Grep", "Glob", "WebSearch"}
-        if "tools" in body:
-            body["tools"] = [t for t in body["tools"] if isinstance(t, dict) and t.get("name") in basic_tools]
-
     original_model = body.get("model", "")
     tool_names = _extract_tool_names(body)
     route = _route_for(original_model, tool_names)
@@ -3421,16 +3798,11 @@ async def responses(request: Request):
     anthro_body = openai_responses_to_anthropic(body)
     anthro_body["model"] = model_id
 
-    # Inject system prompt for deepseek to use tools
-    if "deepseek-v4" in model_id:
-        tool_hint = (
-            "IMPORTANT: You are a coding agent with file system access. "
-            "When asked to create or modify files, always use the Write tool. "
-            "When asked to read files, use Read. For shell commands, use Bash. "
-            "DO NOT describe what you will do — just call the appropriate function."
-        )
-        existing = anthro_body.get("system", "")
-        anthro_body["system"] = (tool_hint + "\n\n" + existing) if existing else tool_hint
+    # Filter tools based on model capabilities
+    tool_names = _filter_tools_for_model(anthro_body, model_id)
+
+    # Handle web_search tool (DuckDuckGo or model routing)
+    await _handle_web_search(anthro_body, model_id, "anthropic")
 
     # Apply route overrides
     thinking_override = route.get("thinking")

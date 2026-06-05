@@ -464,6 +464,59 @@ footer {
     justify-content: flex-end;
 }
 
+/* Request detail modal */
+.detail-grid {
+    display: grid;
+    grid-template-columns: 140px 1fr;
+    gap: 8px 12px;
+    font-size: 0.9em;
+}
+.detail-label {
+    color: var(--text-muted);
+    font-weight: 500;
+    text-transform: uppercase;
+    font-size: 0.8em;
+    letter-spacing: 0.3px;
+}
+.detail-value {
+    color: var(--text);
+    word-break: break-all;
+}
+.detail-section {
+    margin-top: 15px;
+    padding-top: 12px;
+    border-top: 1px solid var(--border);
+}
+.detail-section h4 {
+    margin: 0 0 8px 0;
+    font-size: 0.9em;
+    color: var(--text-heading);
+}
+.detail-pre {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 10px;
+    font-family: 'Fira Code', monospace;
+    font-size: 0.8em;
+    overflow-x: auto;
+    white-space: pre-wrap;
+    max-height: 300px;
+    overflow-y: auto;
+    color: var(--text);
+}
+.detail-tools-list {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+}
+.detail-row {
+    cursor: pointer;
+}
+.detail-row:hover {
+    opacity: 0.85;
+}
+
 @media (max-width: 768px) {
     .totals {
         grid-template-columns: repeat(2, 1fr);
@@ -489,6 +542,54 @@ footer {
 .chart-card canvas {
     max-width: 280px;
     max-height: 280px;
+}
+
+/* ── History Filters ── */
+.history-filters {
+    margin-bottom: 15px;
+    padding: 12px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+}
+.filter-row {
+    display: flex;
+    gap: 12px;
+    align-items: flex-end;
+    flex-wrap: wrap;
+}
+.filter-group {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+.filter-group label {
+    font-size: 0.8em;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+.filter-group .config-select,
+.filter-group .config-input {
+    min-width: 130px;
+    font-size: 0.85em;
+}
+.tool-badge {
+    display: inline-block;
+    padding: 2px 6px;
+    margin: 1px 2px;
+    font-size: 0.75em;
+    border-radius: 4px;
+    background: var(--accent);
+    color: #fff;
+    white-space: nowrap;
+}
+.tool-badge.used {
+    background: #2d8a4e;
+}
+.tool-badge.declared {
+    background: #555;
+    opacity: 0.7;
 }
 
 /* ── Pagination ── */
@@ -888,3 +989,12 @@ footer {
 
 /* ── Tools indicator ── */
 .tools-count { color: var(--text-muted); font-size: 0.8em; cursor: help; }
+
+/* ── Tool Compatibility Matrix ── */
+.tool-compat-table { margin-top: 8px; }
+.tool-compat-table table { width: 100%; border-collapse: collapse; font-size: 0.85em; }
+.tool-compat-table th, .tool-compat-table td { padding: 6px 8px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+.tool-compat-table th { background: var(--bg-secondary); font-weight: 600; text-align: left; }
+.tc-supported { color: var(--success); font-weight: 700; }
+.tc-unsupported { color: var(--error); font-weight: 700; }
+.tool-compat-table td[data-model]:hover { background: var(--bg-secondary); }

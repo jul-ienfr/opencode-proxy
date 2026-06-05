@@ -437,6 +437,12 @@ function daysAgoStr(n) {
 // Global filter state
 let filterFrom = todayStr();
 let filterTo = todayStr();
+let filterStatus = '';
+let filterModel = '';
+let filterOriginalModel = '';
+let filterAccount = '';
+let filterTool = '';
+let filterSearch = '';
 
 // Pagination state
 let currentPage = 1;
@@ -488,6 +494,12 @@ async function fetchHistory(from, to, page = 1) {
         let url = `/api/history?limit=${perPage}&offset=${offset}`;
         if (from) url += `&from_date=${from}`;
         if (to) url += `&to_date=${to}`;
+        if (filterStatus) url += `&status=${encodeURIComponent(filterStatus)}`;
+        if (filterModel) url += `&model=${encodeURIComponent(filterModel)}`;
+        if (filterOriginalModel) url += `&original_model=${encodeURIComponent(filterOriginalModel)}`;
+        if (filterAccount) url += `&account=${encodeURIComponent(filterAccount)}`;
+        if (filterTool) url += `&tool=${encodeURIComponent(filterTool)}`;
+        if (filterSearch) url += `&search=${encodeURIComponent(filterSearch)}`;
         return await apiFetch(url);
     } catch (e) {
         console.error('Failed to fetch history:', e);
@@ -607,23 +619,35 @@ function renderQuotas(data) {
     const entries = Object.entries(data);
     const showHeaders = entries.length > 1;
 
+    // Build workspace ID → alias lookup from config
+    const wsAliasMap = {};
+    if (configData && configData.api_keys) {
+        for (const k of configData.api_keys) {
+            if (k.go_workspace_id && k.alias) wsAliasMap[k.go_workspace_id] = k.alias;
+        }
+    }
+
     let allHtml = '';
     for (const [wsId, wsData] of entries) {
         const status = wsData.status || 'error';
         const error = wsData.error || '';
         const quotas = wsData.quotas || {};
         const fetchedAt = wsData.fetched_at || null;
+        const alias = wsAliasMap[wsId] || '';
 
         if (status === 'error' && !quotas.rolling && !quotas.weekly && !quotas.monthly) {
+            const label = alias || wsId.slice(0, 8) + '...';
             allHtml += `<div class="quota-workspace">
-                <div class="quota-error">${wsId.slice(0, 8)}...: ${t('status.error')} — ${error}</div>
+                <div class="quota-error">${escHtml(label)}: ${t('status.error')} — ${error}</div>
             </div>`;
             continue;
         }
 
         let wsHtml = '';
         if (showHeaders) {
-            wsHtml += `<h3 class="quota-workspace-title">Workspace: ${wsId}</h3>`;
+            const displayName = alias || wsId;
+            const tooltip = alias ? ` title="${escHtml(wsId)}"` : '';
+            wsHtml += `<h3 class="quota-workspace-title"${tooltip}>Workspace: ${escHtml(displayName)}</h3>`;
         }
 
         // Per-workspace status message
@@ -824,12 +848,214 @@ function renderCharts(data) {
     }
 }
 
+// ── Time-series charts ──
+let chartTsRequests = null, chartTsTokens = null, chartTsDuration = null, chartTsSuccess = null;
+
+async function renderTimeSeriesCharts(from, to) {
+    try {
+        const data = await apiFetch(`/api/stats/timeseries?from_date=${from || ''}&to_date=${to || ''}&granularity=hour`);
+        if (!data || !data.series || !data.series.length) return;
+
+        const isDark = document.documentElement.getAttribute('data-theme') !== 'light';
+        const textColor = isDark ? '#e0e0e0' : '#333';
+        const gridColor = isDark ? 'rgba(255,255,255,0.1)' : 'rgba(0,0,0,0.1)';
+
+        const labels = data.series.map(s => {
+            const d = s.period;
+            // Format: "2026-06-05 14:00" → "14h" or "2026-06-05" → "Jun 5"
+            if (d.length === 16) return d.substring(11, 16); // "HH:MM"
+            if (d.length === 10) return d.substring(5); // "MM-DD"
+            return d;
+        });
+
+        const tsOpts = {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: { legend: { display: false } },
+            scales: {
+                x: { ticks: { color: textColor, maxTicksLimit: 12 }, grid: { color: gridColor } },
+                y: { ticks: { color: textColor }, grid: { color: gridColor }, beginAtZero: true }
+            },
+            elements: { point: { radius: 2 }, line: { tension: 0.3 } }
+        };
+
+        // Requests over time (bar)
+        const reqData = data.series.map(s => s.count);
+        const failData = data.series.map(s => s.fail);
+        if (chartTsRequests) {
+            chartTsRequests.data.labels = labels;
+            chartTsRequests.data.datasets[0].data = reqData;
+            chartTsRequests.data.datasets[1].data = failData;
+            chartTsRequests.update('none');
+        } else {
+            try {
+                chartTsRequests = new Chart(document.getElementById('chart-ts-requests'), {
+                    type: 'bar',
+                    data: {
+                        labels,
+                        datasets: [
+                            { label: 'Success', data: reqData, backgroundColor: 'rgba(75,192,192,0.7)' },
+                            { label: 'Errors', data: failData, backgroundColor: 'rgba(255,99,132,0.7)' }
+                        ]
+                    },
+                    options: { ...tsOpts, plugins: { legend: { display: true, labels: { color: textColor } } } }
+                });
+            } catch (e) { console.warn('Chart.js not available:', e); }
+        }
+
+        // Tokens over time (line)
+        const inputData = data.series.map(s => s.input_tokens);
+        const outputData = data.series.map(s => s.output_tokens);
+        const cacheData = data.series.map(s => s.cache_tokens);
+        if (chartTsTokens) {
+            chartTsTokens.data.labels = labels;
+            chartTsTokens.data.datasets[0].data = inputData;
+            chartTsTokens.data.datasets[1].data = outputData;
+            chartTsTokens.data.datasets[2].data = cacheData;
+            chartTsTokens.update('none');
+        } else {
+            try {
+                chartTsTokens = new Chart(document.getElementById('chart-ts-tokens'), {
+                    type: 'line',
+                    data: {
+                        labels,
+                        datasets: [
+                            { label: 'Input', data: inputData, borderColor: '#4fc3f7', fill: true, backgroundColor: 'rgba(79,195,247,0.1)' },
+                            { label: 'Output', data: outputData, borderColor: '#ff8a65', fill: true, backgroundColor: 'rgba(255,138,101,0.1)' },
+                            { label: 'Cache', data: cacheData, borderColor: '#81c784', fill: true, backgroundColor: 'rgba(129,199,132,0.1)' }
+                        ]
+                    },
+                    options: { ...tsOpts, plugins: { legend: { display: true, labels: { color: textColor } } } }
+                });
+            } catch (e) { console.warn('Chart.js not available:', e); }
+        }
+
+        // Duration over time (line)
+        const durData = data.series.map(s => s.avg_duration_ms);
+        if (chartTsDuration) {
+            chartTsDuration.data.labels = labels;
+            chartTsDuration.data.datasets[0].data = durData;
+            chartTsDuration.update('none');
+        } else {
+            try {
+                chartTsDuration = new Chart(document.getElementById('chart-ts-duration'), {
+                    type: 'line',
+                    data: {
+                        labels,
+                        datasets: [{ label: 'Avg Duration (ms)', data: durData, borderColor: '#ce93d8', fill: true, backgroundColor: 'rgba(206,147,216,0.1)' }]
+                    },
+                    options: tsOpts
+                });
+            } catch (e) { console.warn('Chart.js not available:', e); }
+        }
+
+        // Success vs Error (stacked bar)
+        const successData = data.series.map(s => s.success);
+        if (chartTsSuccess) {
+            chartTsSuccess.data.labels = labels;
+            chartTsSuccess.data.datasets[0].data = successData;
+            chartTsSuccess.data.datasets[1].data = failData;
+            chartTsSuccess.update('none');
+        } else {
+            try {
+                chartTsSuccess = new Chart(document.getElementById('chart-ts-success'), {
+                    type: 'bar',
+                    data: {
+                        labels,
+                        datasets: [
+                            { label: 'Success', data: successData, backgroundColor: 'rgba(75,192,192,0.7)' },
+                            { label: 'Error', data: failData, backgroundColor: 'rgba(255,99,132,0.7)' }
+                        ]
+                    },
+                    options: { ...tsOpts, plugins: { legend: { display: true, labels: { color: textColor } } }, scales: { ...tsOpts.scales, x: { ...tsOpts.scales.x, stacked: true }, y: { ...tsOpts.scales.y, stacked: true } } }
+                });
+            } catch (e) { console.warn('Chart.js not available:', e); }
+        }
+    } catch (e) {
+        console.error('Failed to render time-series charts:', e);
+    }
+}
+
+// ── Request Detail Modal ──
+
+let _historyLogsCache = {};
+
+function showRequestDetail(reqId) {
+    const log = _historyLogsCache[reqId];
+    if (!log) return;
+
+    const modal = document.getElementById('request-detail-modal');
+    const content = document.getElementById('req-detail-content');
+
+    const statusHtml = log.success
+        ? '<span class="status-ok">&#10004; Success</span>'
+        : `<span class="status-fail">&#10008; ${escHtml(log.error || 'Error')}</span>`;
+
+    const toolsUsedHtml = (log.tools_used && log.tools_used.length)
+        ? log.tools_used.map(t => `<span class="tool-badge used">${escHtml(t)}</span>`).join(' ')
+        : '<span style="color:#888">-</span>';
+
+    const toolsDeclaredHtml = (log.tools && log.tools.length)
+        ? log.tools.map(t => `<span class="tool-badge declared">${escHtml(t)}</span>`).join(' ')
+        : '<span style="color:#888">-</span>';
+
+    content.innerHTML = `
+        <div class="detail-grid">
+            <span class="detail-label">Status</span>
+            <span class="detail-value">${statusHtml}</span>
+            <span class="detail-label">ID</span>
+            <span class="detail-value" style="font-family:monospace;font-size:0.85em">${escHtml(log.id)}</span>
+            <span class="detail-label">Timestamp</span>
+            <span class="detail-value">${formatDateTime(log.timestamp)}</span>
+            <span class="detail-label">Account</span>
+            <span class="detail-value">${escHtml(log.account_alias) || '-'}</span>
+            <span class="detail-label">Original Model</span>
+            <span class="detail-value">${escHtml(log.original_model) || '-'}</span>
+            <span class="detail-label">Mapped Model</span>
+            <span class="detail-value">${escHtml(log.model) || '-'}</span>
+            <span class="detail-label">Protocol</span>
+            <span class="detail-value">${escHtml(log.protocol) || '-'}</span>
+            <span class="detail-label">Stream</span>
+            <span class="detail-value">${log.is_stream ? 'Yes' : 'No'}</span>
+            <span class="detail-label">Duration</span>
+            <span class="detail-value">${log.duration_ms ? formatNumber(log.duration_ms) + ' ms' : '-'}</span>
+            <span class="detail-label">Input Tokens</span>
+            <span class="detail-value">${formatNumber(log.tokens_input)}</span>
+            <span class="detail-label">Output Tokens</span>
+            <span class="detail-value">${formatNumber(log.tokens_output)}</span>
+            <span class="detail-label">Cache Tokens</span>
+            <span class="detail-value">${formatNumber(log.tokens_cache)}</span>
+            <span class="detail-label">Thinking</span>
+            <span class="detail-value">${escHtml(log.thinking) || '-'}</span>
+            <span class="detail-label">Effort</span>
+            <span class="detail-value">${escHtml(log.effort) || '-'}</span>
+        </div>
+
+        <div class="detail-section">
+            <h4>Tools Used (${log.tools_used ? log.tools_used.length : 0})</h4>
+            <div class="detail-tools-list">${toolsUsedHtml}</div>
+        </div>
+
+        <div class="detail-section">
+            <h4>Tools Declared (${log.tools ? log.tools.length : 0})</h4>
+            <div class="detail-tools-list">${toolsDeclaredHtml}</div>
+        </div>
+    `;
+
+    modal.style.display = 'flex';
+}
+
 function renderHistory(data) {
     const tbody = document.getElementById('history-tbody');
     if (!data || data.logs.length === 0) {
         tbody.innerHTML = '<tr><td colspan="12">' + t('logs.no_data') + '</td></tr>';
         updatePagination(1, 1);
         return;
+    }
+
+    // Cache logs for detail modal
+    for (const log of data.logs) {
+        _historyLogsCache[log.id] = log;
     }
 
     let html = '';
@@ -851,7 +1077,17 @@ function renderHistory(data) {
         }
         const thinking = log.thinking || '-';
         const effort = log.effort || '-';
-        html += `<tr>
+        // Tools: show badges for actually used tools
+        let toolsHtml = '-';
+        if (log.tools_used && log.tools_used.length) {
+            const badges = log.tools_used.slice(0, 5).map(t => `<span class="tool-badge used">${escHtml(t)}</span>`).join('');
+            const more = log.tools_used.length > 5 ? `<span class="tool-badge declared">+${log.tools_used.length - 5}</span>` : '';
+            const tooltip = (log.tools && log.tools.length) ? `Déclarés: ${log.tools.join(', ')}\nUtilisés: ${log.tools_used.join(', ')}` : `Utilisés: ${log.tools_used.join(', ')}`;
+            toolsHtml = `<span title="${escHtml(tooltip)}">${badges}${more}</span>`;
+        } else if (log.tools && log.tools.length) {
+            toolsHtml = `<span title="${escHtml(log.tools.join(', '))}"><span class="tool-badge declared">${log.tools.length} declared</span></span>`;
+        }
+        html += `<tr class="detail-row" data-req-id="${escHtml(log.id)}">
             <td>${escHtml(log.account_alias) || '-'}</td>
             <td>${formatDateTime(log.timestamp)}</td>
             <td>${escHtml(log.original_model) || '-'}</td>
@@ -861,7 +1097,7 @@ function renderHistory(data) {
             <td>${formatNumber(log.tokens_cache)}</td>
             <td>${thinking}</td>
             <td>${effort}</td>
-            <td ${(log.tools && log.tools.length) ? 'title="Déclarés: ' + log.tools.map(escHtml).join(', ') + (log.tools_used && log.tools_used.length ? '\nUtilisés: ' + log.tools_used.map(escHtml).join(', ') : '') + '"' : ''}>${(log.tools_used && log.tools_used.length) ? log.tools_used.slice(0, 3).map(escHtml).join(', ') + (log.tools_used.length > 3 ? ', +' + (log.tools_used.length - 3) : '') + (log.tools && log.tools.length > log.tools_used.length ? ` <span class="tools-count" title="${log.tools.length} outils déclarés">(${log.tools.length})</span>` : '') : '-'}</td>
+            <td>${toolsHtml}</td>
             <td>${duration}</td>
             <td>${status}</td>
         </tr>`;
@@ -1011,6 +1247,9 @@ function renderConfig(data) {
     // Tool routes table — fetch and render
     fetchToolRoutes().then(tools => renderToolRoutes(tools, modelIds));
 
+    // Tool compatibility matrix — fetch and render
+    fetchToolCapabilities().then(data => renderToolCompatMatrix(data, modelIds));
+
     // Apply server-side language if different
     if (data.lang && data.lang !== getLang()) {
         setLang(data.lang);
@@ -1088,6 +1327,196 @@ function gatherToolRoutes() {
         }
     }
     return toolRoutes;
+}
+
+// ── Tool Compatibility Matrix ──
+
+let _toolCompatData = null;
+
+async function fetchToolCapabilities() {
+    try {
+        return await apiFetch('/api/config/tool-capabilities');
+    } catch (e) {
+        console.error('Failed to fetch tool capabilities:', e);
+        return null;
+    }
+}
+
+function renderToolCompatMatrix(data, modelIds) {
+    const tbody = document.getElementById('tool-compat-tbody');
+    if (!data || !data.all_tools || data.all_tools.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="100">No tool data available yet. Make some requests first.</td></tr>';
+        return;
+    }
+    const caps = data.capabilities || {};
+    const tools = data.all_tools;
+    const models = data.all_models || modelIds;
+    const protocols = {};
+    // Build protocol map from MODELS config or default
+    for (const m of models) {
+        protocols[m] = 'openai'; // default
+    }
+
+    // Header row with tool names
+    let headerHtml = '<tr><th style="min-width:140px">Model</th><th>Protocol</th>';
+    for (const tool of tools) {
+        headerHtml += `<th style="writing-mode:vertical-lr;text-orientation:mixed;font-size:0.75em;min-width:36px">${escHtml(tool)}</th>`;
+    }
+    headerHtml += '<th>System Hint</th></tr>';
+
+    // Data rows
+    let bodyHtml = '';
+    for (const model of models) {
+        if (model === '_default' || model === '_doc') continue;
+        const cfg = caps[model] || {};
+        const defaults = caps['_default'] || {};
+        const supported = cfg.supported_tools || defaults.supported_tools;
+        const unsupported = cfg.unsupported_tools || defaults.unsupported_tools || [];
+        const hint = cfg.system_hint || defaults.system_hint || '';
+
+        bodyHtml += '<tr>';
+        bodyHtml += `<td><code style="font-size:0.85em">${escHtml(model)}</code></td>`;
+        bodyHtml += `<td class="text-dim" style="font-size:0.8em">${protocols[model] || 'openai'}</td>`;
+
+        for (const tool of tools) {
+            let supported_val;
+            if (supported !== null && supported !== undefined) {
+                supported_val = supported.includes(tool);
+            } else {
+                supported_val = !unsupported.includes(tool);
+            }
+            const cls = supported_val ? 'tc-supported' : 'tc-unsupported';
+            const icon = supported_val ? '✓' : '✗';
+            bodyHtml += `<td class="${cls}" style="text-align:center;cursor:pointer" data-model="${escHtml(model)}" data-tool="${escHtml(tool)}" onclick="toggleToolCompat(this)">${icon}</td>`;
+        }
+
+        const hintIcon = hint ? '💡' : '—';
+        bodyHtml += `<td style="text-align:center;font-size:0.9em" title="${escHtml(hint)}">${hintIcon}</td>`;
+        bodyHtml += '</tr>';
+    }
+
+    // Default row
+    if (caps['_default']) {
+        const def = caps['_default'];
+        bodyHtml += '<tr style="border-top:2px solid var(--border)">';
+        bodyHtml += '<td><code style="font-size:0.85em">_default</code></td>';
+        bodyHtml += '<td class="text-dim" style="font-size:0.8em">—</td>';
+        for (const tool of tools) {
+            const supported_val = def.unsupported_tools ? !def.unsupported_tools.includes(tool) : true;
+            const cls = supported_val ? 'tc-supported' : 'tc-unsupported';
+            const icon = supported_val ? '✓' : '✗';
+            bodyHtml += `<td class="${cls}" style="text-align:center;cursor:pointer" data-model="_default" data-tool="${escHtml(tool)}" onclick="toggleToolCompat(this)">${icon}</td>`;
+        }
+        bodyHtml += '<td style="text-align:center;font-size:0.9em">—</td>';
+        bodyHtml += '</tr>';
+    }
+
+    tbody.innerHTML = headerHtml + bodyHtml;
+    _toolCompatData = data;
+}
+
+function toggleToolCompat(td) {
+    const model = td.dataset.model;
+    const tool = td.dataset.tool;
+    const isCurrentlySupported = td.textContent.trim() === '✓';
+    td.textContent = isCurrentlySupported ? '✗' : '✓';
+    td.className = isCurrentlySupported ? 'tc-unsupported' : 'tc-supported';
+
+    // Update _toolCompatData
+    if (_toolCompatData && _toolCompatData.capabilities) {
+        const caps = _toolCompatData.capabilities;
+        const defaults = caps['_default'] || {};
+        const modelCfg = caps[model] || {};
+
+        // Switch between whitelist and blacklist modes
+        if (isCurrentlySupported) {
+            // Was supported, now unsupported — add to unsupported_tools
+            const unsupported = modelCfg.unsupported_tools || [];
+            if (!unsupported.includes(tool)) {
+                unsupported.push(tool);
+            }
+            caps[model] = { ...modelCfg, unsupported_tools: unsupported };
+        } else {
+            // Was unsupported, now supported — remove from unsupported_tools
+            let unsupported = modelCfg.unsupported_tools || [];
+            unsupported = unsupported.filter(t => t !== tool);
+            if (unsupported.length === 0 && !modelCfg.supported_tools) {
+                delete caps[model].unsupported_tools;
+            } else {
+                caps[model] = { ...modelCfg, unsupported_tools: unsupported };
+            }
+        }
+    }
+}
+
+async function saveToolCapabilities() {
+    if (!_toolCompatData || !_toolCompatData.capabilities) return;
+    const status = document.getElementById('tc-save-status');
+    try {
+        await apiFetch('/api/config/tool-capabilities', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(_toolCompatData.capabilities),
+        });
+        status.textContent = 'Saved!';
+        status.className = 'save-status success';
+        setTimeout(() => { status.textContent = ''; }, 3000);
+    } catch (e) {
+        status.textContent = 'Error saving';
+        status.className = 'save-status error';
+        console.error(e);
+    }
+}
+
+// ── Web Search config ──
+async function fetchWebSearchConfig() {
+    try {
+        const data = await apiFetch('/api/config/web-search');
+        const modeSelect = document.getElementById('ws-mode-select');
+        const modelSelect = document.getElementById('ws-model-select');
+        const maxResults = document.getElementById('ws-max-results');
+
+        modeSelect.value = data.mode || 'duckduckgo';
+        maxResults.value = data.max_results || 5;
+
+        // Populate model dropdown
+        modelSelect.innerHTML = '<option value="">-- select model --</option>';
+        (data.available_models || []).forEach(m => {
+            const opt = document.createElement('option');
+            opt.value = m;
+            opt.textContent = m;
+            if (m === data.target_model) opt.selected = true;
+            modelSelect.appendChild(opt);
+        });
+
+        // Show/hide model selector based on mode
+        const showModel = data.mode !== 'duckduckgo';
+        document.getElementById('ws-model-group').style.display = showModel ? '' : 'none';
+    } catch (e) {
+        console.error('Failed to fetch web search config:', e);
+    }
+}
+
+async function saveWebSearchConfig() {
+    const status = document.getElementById('ws-save-status');
+    try {
+        const mode = document.getElementById('ws-mode-select').value;
+        const target_model = document.getElementById('ws-model-select').value || null;
+        const max_results = parseInt(document.getElementById('ws-max-results').value) || 5;
+
+        await apiFetch('/api/config/web-search', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ mode, target_model, max_results }),
+        });
+        status.textContent = 'Saved!';
+        status.className = 'save-status success';
+        setTimeout(() => { status.textContent = ''; }, 3000);
+    } catch (e) {
+        status.textContent = 'Error saving';
+        status.className = 'save-status error';
+        console.error(e);
+    }
 }
 
 function renderApiKeysTable(apiKeys) {
@@ -1179,6 +1608,86 @@ function setupFilter() {
         currentPage = 1;
         refreshAll();
     });
+}
+
+// ── History Filters ──
+
+async function fetchHistoryFilters() {
+    try {
+        const data = await apiFetch('/api/history/filters');
+        populateFilterDropdown('filter-model', data.models || []);
+        populateFilterDropdown('filter-original-model', data.original_models || []);
+        populateFilterDropdown('filter-account', data.accounts || []);
+        populateFilterDropdown('filter-tool', data.tools_used || []);
+    } catch (e) {
+        console.error('Failed to fetch history filters:', e);
+    }
+}
+
+function populateFilterDropdown(id, values) {
+    const select = document.getElementById(id);
+    if (!select) return;
+    const current = select.value;
+    select.innerHTML = '<option value="">All</option>';
+    values.forEach(v => {
+        if (!v) return;
+        const opt = document.createElement('option');
+        opt.value = v;
+        opt.textContent = v;
+        if (v === current) opt.selected = true;
+        select.appendChild(opt);
+    });
+}
+
+
+function setupHistoryFilters() {
+    const applyBtn = document.getElementById('filter-apply-btn');
+    const resetBtn = document.getElementById('filter-reset-btn');
+
+    if (applyBtn) {
+        applyBtn.addEventListener('click', () => {
+            filterStatus = document.getElementById('filter-status').value;
+            filterModel = document.getElementById('filter-model').value;
+            filterOriginalModel = document.getElementById('filter-original-model').value;
+            filterAccount = document.getElementById('filter-account').value;
+            filterTool = document.getElementById('filter-tool').value;
+            filterSearch = document.getElementById('filter-search').value;
+            currentPage = 1;
+            refreshAll();
+        });
+    }
+
+    if (resetBtn) {
+        resetBtn.addEventListener('click', () => {
+            document.getElementById('filter-status').value = '';
+            document.getElementById('filter-model').value = '';
+            document.getElementById('filter-original-model').value = '';
+            document.getElementById('filter-account').value = '';
+            document.getElementById('filter-tool').value = '';
+            document.getElementById('filter-search').value = '';
+            filterStatus = '';
+            filterModel = '';
+            filterOriginalModel = '';
+            filterAccount = '';
+            filterTool = '';
+            filterSearch = '';
+            currentPage = 1;
+            refreshAll();
+        });
+    }
+
+    // Also apply on Enter in search field
+    const searchInput = document.getElementById('filter-search');
+    if (searchInput) {
+        searchInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') {
+                applyBtn.click();
+            }
+        });
+    }
+
+    // Fetch filter options
+    fetchHistoryFilters();
 }
 
 function setupConfig() {
@@ -1398,6 +1907,17 @@ function setupConfig() {
         }
     });
 
+    // ── Tool Capabilities save ──
+    document.getElementById('tc-save-btn').addEventListener('click', saveToolCapabilities);
+
+    // ── Web Search config ──
+    fetchWebSearchConfig();
+    document.getElementById('ws-save-btn').addEventListener('click', saveWebSearchConfig);
+    document.getElementById('ws-mode-select').addEventListener('change', (e) => {
+        const showModel = e.target.value !== 'duckduckgo';
+        document.getElementById('ws-model-group').style.display = showModel ? '' : 'none';
+    });
+
     // ── API Keys management ──
 
     // Add key row
@@ -1509,6 +2029,7 @@ async function refreshAll() {
         renderCharts(stats);
         renderHistory(history);
         renderQuotas(quotas);
+        renderTimeSeriesCharts(filterFrom, filterTo);
         document.getElementById('last-update').textContent = t('last.update') + formatTime();
     } finally {
         _refreshing = false;
@@ -1552,8 +2073,10 @@ document.addEventListener('DOMContentLoaded', () => {
 
     setupTabs();
     setupFilter();
+    setupHistoryFilters();
     setupConfig();
-    refreshAll();
+    // Load config first so renderQuotas can map workspace IDs to aliases
+    fetchConfig().then(() => refreshAll());
 
     // Show/hide debug logs tab based on debug mode state
     fetchDebugStatus().then(debugData => {
@@ -1714,6 +2237,22 @@ document.addEventListener('DOMContentLoaded', () => {
             currentPage++;
             loadHistory();
         }
+    });
+
+    // Request detail modal
+    document.getElementById('req-detail-close').addEventListener('click', () => {
+        document.getElementById('request-detail-modal').style.display = 'none';
+    });
+    document.getElementById('request-detail-modal').addEventListener('click', (e) => {
+        if (e.target === e.currentTarget) {
+            e.currentTarget.style.display = 'none';
+        }
+    });
+
+    // History row click → show detail
+    document.getElementById('history-tbody').addEventListener('click', (e) => {
+        const row = e.target.closest('tr[data-req-id]');
+        if (row) showRequestDetail(row.dataset.reqId);
     });
 
     document.addEventListener('click', (e) => {

@@ -97,7 +97,7 @@ def _get_local_ips() -> list:
     return ips
 
 
-def _build_where(from_date=None, to_date=None):
+def _build_where(from_date=None, to_date=None, status=None, model=None, original_model=None, account=None, tool=None, search=None):
     conditions, params = [], []
     if from_date:
         conditions.append("timestamp >= ?")
@@ -105,6 +105,25 @@ def _build_where(from_date=None, to_date=None):
     if to_date:
         conditions.append("timestamp <= ?")
         params.append(to_date + "T23:59:59")
+    if status == "success":
+        conditions.append("success = 1")
+    elif status == "error":
+        conditions.append("success = 0")
+    if model:
+        conditions.append("model = ?")
+        params.append(model)
+    if original_model:
+        conditions.append("original_model = ?")
+        params.append(original_model)
+    if account:
+        conditions.append("account_alias = ?")
+        params.append(account)
+    if tool:
+        conditions.append("tools_used LIKE ?")
+        params.append(f'%"{tool}"%')
+    if search:
+        conditions.append("(error LIKE ? OR model LIKE ? OR original_model LIKE ?)")
+        params.extend([f"%{search}%", f"%{search}%", f"%{search}%"])
     where = "WHERE " + " AND ".join(conditions) if conditions else ""
     return where, params
 
@@ -205,6 +224,71 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
         _debug(f"  [config] custom routes updated ({len(body)} routes)")
         save_custom_routes(body)
         return {"status": "ok", "message": "Custom routes updated."}
+
+    @app.get("/api/config/tool-capabilities")
+    async def get_tool_capabilities():
+        from config import TOOL_CAPABILITIES, MODELS
+        # Get all known tools from the database
+        where, params = _build_where(daysAgo(30), None)
+        def _query_all_tools():
+            return conn.execute(
+                "SELECT tools FROM requests " + where + " AND tools IS NOT NULL AND tools != '[]'",
+                params,
+            ).fetchall()
+        rows = await asyncio.to_thread(_query_all_tools)
+        all_tools = set()
+        for row in rows:
+            try:
+                tools = json.loads(row["tools"]) if isinstance(row["tools"], str) else []
+                for t in tools:
+                    if isinstance(t, str):
+                        all_tools.add(t)
+            except (json.JSONDecodeError, TypeError):
+                continue
+        return {
+            "capabilities": TOOL_CAPABILITIES,
+            "all_tools": sorted(all_tools),
+            "all_models": sorted(MODELS.keys()),
+        }
+
+    @app.post("/api/config/tool-capabilities")
+    async def update_tool_capabilities(request: Request):
+        body = await request.json()
+        from config import save_tool_capabilities
+        _debug(f"  [config] tool capabilities updated ({len(body)} entries)")
+        save_tool_capabilities(body)
+        return {"status": "ok", "message": "Tool capabilities updated."}
+
+    @app.get("/api/config/web-search")
+    async def get_web_search_config():
+        from config import yaml_get
+        mode = yaml_get("web_search", "mode", "duckduckgo")
+        target_model = yaml_get("web_search", "target_model", None)
+        max_results = yaml_get("web_search", "max_results", 5)
+        timeout = yaml_get("web_search", "timeout", 10)
+        return {
+            "mode": mode,
+            "target_model": target_model,
+            "max_results": max_results,
+            "timeout": timeout,
+            "available_models": sorted(MODELS.keys()),
+            "modes": ["duckduckgo", "model", "ddg_then_model", "model_then_ddg"],
+        }
+
+    @app.post("/api/config/web-search")
+    async def update_web_search_config(request: Request):
+        body = await request.json()
+        from config import yaml_set
+        if "mode" in body:
+            yaml_set("web_search", "mode", body["mode"])
+        if "target_model" in body:
+            yaml_set("web_search", "target_model", body["target_model"])
+        if "max_results" in body:
+            yaml_set("web_search", "max_results", int(body["max_results"]))
+        if "timeout" in body:
+            yaml_set("web_search", "timeout", int(body["timeout"]))
+        _debug(f"  [config] web search updated: mode={body.get('mode')}, model={body.get('target_model')}")
+        return {"status": "ok", "message": "Web search config updated."}
 
     @app.get("/api/config/api-keys")
     async def get_api_keys_config():
@@ -475,6 +559,62 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
         _stats_cache.set(cache_key, result)
         return result
 
+    @app.get("/api/stats/timeseries")
+    async def get_stats_timeseries(from_date: str = None, to_date: str = None, granularity: str = "hour"):
+        """Return time-series data for charts: requests count, tokens, avg duration per time bucket."""
+        where, params = _build_where(from_date, to_date)
+
+        # Determine time grouping format
+        if granularity == "day":
+            time_fmt = "%Y-%m-%d"
+        elif granularity == "week":
+            time_fmt = "%Y-W%W"
+        else:  # hour
+            time_fmt = "%Y-%m-%d %H:00"
+
+        def _query_timeseries():
+            # Group by truncated timestamp
+            if granularity == "day":
+                trunc_expr = "substr(timestamp, 1, 10)"
+            elif granularity == "week":
+                trunc_expr = "substr(timestamp, 1, 4) || '-W' || printf('%02d', ((cast(substr(timestamp, 9, 2) as integer) - 1) / 7 + 1))"
+            else:  # hour
+                trunc_expr = "substr(timestamp, 1, 13) || ':00'"
+
+            rows = conn.execute(
+                f"SELECT {trunc_expr} as period, "
+                "COUNT(*) as count, "
+                "SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) as success_count, "
+                "SUM(CASE WHEN success = 0 OR success IS NULL THEN 1 ELSE 0 END) as fail_count, "
+                "COALESCE(SUM(tokens_input), 0) as input_tokens, "
+                "COALESCE(SUM(tokens_output), 0) as output_tokens, "
+                "COALESCE(SUM(tokens_cache), 0) as cache_tokens, "
+                "COALESCE(AVG(duration_ms), 0) as avg_duration "
+                "FROM requests " + where +
+                f" GROUP BY period ORDER BY period",
+                params,
+            ).fetchall()
+            return rows
+
+        rows = await asyncio.to_thread(_query_timeseries)
+
+        return {
+            "series": [
+                {
+                    "period": r["period"],
+                    "count": r["count"],
+                    "success": r["success_count"],
+                    "fail": r["fail_count"],
+                    "input_tokens": r["input_tokens"],
+                    "output_tokens": r["output_tokens"],
+                    "cache_tokens": r["cache_tokens"],
+                    "avg_duration_ms": int(r["avg_duration"]),
+                }
+                for r in rows
+            ],
+            "granularity": granularity,
+        }
+
     @app.get("/api/logs")
     async def get_logs(limit: int = 100, offset: int = 0):
         lines = list(log_lines)
@@ -673,8 +813,10 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
     # ── Stats & history ──
 
     @app.get("/api/history")
-    async def get_history(from_date: str = None, to_date: str = None, limit: int = 20, offset: int = 0):
-        where, params = _build_where(from_date, to_date)
+    async def get_history(from_date: str = None, to_date: str = None, limit: int = 20, offset: int = 0,
+                          status: str = None, model: str = None, original_model: str = None,
+                          account: str = None, tool: str = None, search: str = None):
+        where, params = _build_where(from_date, to_date, status, model, original_model, account, tool, search)
         query = "SELECT * FROM requests " + where + " ORDER BY timestamp DESC LIMIT ? OFFSET ?"
         params.extend([limit, offset])
 
@@ -715,6 +857,33 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
             "per_page": limit,
             "has_more": offset + limit < total_count
         }
+
+    @app.get("/api/history/filters")
+    async def get_history_filters():
+        """Return unique values for history filter dropdowns."""
+        def _query_filters():
+            models = [r[0] for r in conn.execute(
+                "SELECT DISTINCT model FROM requests WHERE model IS NOT NULL ORDER BY model").fetchall()]
+            orig_models = [r[0] for r in conn.execute(
+                "SELECT DISTINCT original_model FROM requests WHERE original_model IS NOT NULL ORDER BY original_model").fetchall()]
+            accounts = [r[0] for r in conn.execute(
+                "SELECT DISTINCT account_alias FROM requests WHERE account_alias IS NOT NULL ORDER BY account_alias").fetchall()]
+            # Extract all unique tool names from tools_used JSON arrays
+            tool_set = set()
+            for row in conn.execute("SELECT tools_used FROM requests WHERE tools_used IS NOT NULL AND tools_used != '[]'"):
+                try:
+                    tools = json.loads(row[0])
+                    if isinstance(tools, list):
+                        tool_set.update(tools)
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            return {
+                "models": models,
+                "original_models": orig_models,
+                "accounts": accounts,
+                "tools_used": sorted(tool_set),
+            }
+        return await asyncio.to_thread(_query_filters)
 
     @app.delete("/api/history")
     async def delete_history(before: str = None, all: bool = False, model: str = None):
