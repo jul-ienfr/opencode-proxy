@@ -555,6 +555,8 @@ async def _save_request(req_id, model, original_model, duration_ms,
         protocol, is_stream, thinking, effort, client_ip, account_alias,
         tools_json, tools_used_json
     )
+    # Force commit so dashboard reads see the new row immediately
+    _db_flush()
     _debug(f"  [db] _save_request: saved req_id={req_id} model={model} success={success}")
     # Notify dashboard SSE clients about the update
     try:
