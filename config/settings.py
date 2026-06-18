@@ -118,7 +118,10 @@ def _env_bool(key: str, default=False):
 def _env_int(key: str, default=0):
     val = os.getenv(key)
     if val is not None:
-        return int(val)
+        try:
+            return int(val)
+        except ValueError:
+            logging.warning("Invalid integer for %s=%r, using default %d", key, val, default)
     return default
 
 
@@ -132,6 +135,7 @@ PROXY = _env("OPENCODE_PROXY", yaml_get("upstream", "proxy", ""))
 API_KEY = _env("OPENCODE_API_KEY", "")
 OPENCODE_GO_WORKSPACE_ID = _env("OPENCODE_GO_WORKSPACE_ID", "")
 OPENCODE_GO_AUTH_COOKIE = _env("OPENCODE_GO_AUTH_COOKIE", "")
+OPENCODE_GO_USE_BALANCE = _env_bool("OPENCODE_GO_USE_BALANCE", True)
 API_KEY_ROUTING = _env("API_KEY_ROUTING", yaml_get("routing", "key_routing", "round-robin"))
 CACHE_MIN_PROMPT_SIZE = _env_int("CACHE_MIN_PROMPT_SIZE", yaml_get("cache", "min_prompt_size", 2000))
 DEBUG = _env_bool("OPENCODE_DEBUG", yaml_get("server", "debug", False))
@@ -139,6 +143,10 @@ DEBUG = _env_bool("OPENCODE_DEBUG", yaml_get("server", "debug", False))
 # ── Upstream endpoints ──────────────────────────────────────────────
 API_BASE_OPENAI = yaml_get("upstream", "openai_base", "https://opencode.ai/zen/go/v1/chat/completions")
 API_BASE_ANTHROPIC = yaml_get("upstream", "anthropic_base", "https://opencode.ai/zen/go/v1/messages")
+API_BASE_FREE = yaml_get("upstream", "free_base", "https://opencode.ai/zen/v1/chat/completions")
+
+# ── Free model mapping (paid → free equivalent) ────────────────────
+FREE_MODEL_MAP = yaml_get("free_model_map", default={})
 
 # ── Server ──────────────────────────────────────────────────────────
 HOST = _env("OPENCODE_HOST", yaml_get("server", "host", "0.0.0.0"))
@@ -153,6 +161,31 @@ for _model_id, _model_data in _models_cfg.items():
         _proto = _model_data.get("protocol", "openai")
         _endpoint = API_BASE_OPENAI if _proto == "openai" else API_BASE_ANTHROPIC
         MODELS[_model_id] = {"endpoint": _endpoint, "protocol": _proto}
+
+def _fetch_upstream_models():
+    """Fetch available models from upstream API and add them to MODELS."""
+    import subprocess
+    try:
+        url = f"{API_BASE_OPENAI.rsplit('/chat/completions', 1)[0]}/models"
+        result = subprocess.run(
+            ["curl", "-s", "--max-time", "10", url],
+            capture_output=True, text=True, timeout=15
+        )
+        if result.returncode != 0:
+            raise Exception(f"curl failed: {result.stderr}")
+        data = json.loads(result.stdout)
+        models = data.get("data", [])
+        added = 0
+        for m in models:
+            model_id = m.get("id", "")
+            if model_id and model_id not in MODELS:
+                MODELS[model_id] = {"endpoint": API_BASE_OPENAI, "protocol": "openai"}
+                added += 1
+        logger.info("[config] upstream models: fetched %d, added %d new", len(models), added)
+    except Exception as e:
+        logger.warning("[config] upstream models fetch failed: %s", e)
+
+_fetch_upstream_models()
 
 # ── Routing ─────────────────────────────────────────────────────────
 DISABLE_MAPPING = _env_bool("DISABLE_MAPPING", yaml_get("routing", "disable_mapping", False))
@@ -209,14 +242,18 @@ def load_custom_routes() -> dict:
 
 def save_custom_routes(routes: dict):
     """Save custom routes to YAML config and reload ROUTES."""
+    global SORTED_ROUTES, SORTED_CUSTOM_ROUTES
     _yaml_data.setdefault("custom_routes", {}).update(routes)
     # Also keep JSON file for backward compat
     with open(CUSTOM_ROUTES_PATH, "w", encoding="utf-8") as f:
         json.dump(routes, f, indent=2)
-    CUSTOM_ROUTES.clear()
-    CUSTOM_ROUTES.update(routes)
-    ROUTES.clear()
-    ROUTES.update(load_routes())
+    with _reload_lock:
+        CUSTOM_ROUTES.clear()
+        CUSTOM_ROUTES.update(routes)
+        ROUTES.clear()
+        ROUTES.update(load_routes())
+        SORTED_ROUTES = _sort_routes_by_match(ROUTES)
+        SORTED_CUSTOM_ROUTES = _sort_routes_by_match(CUSTOM_ROUTES)
     save_yaml_config()
 
 
@@ -288,8 +325,7 @@ def save_api_keys(configs: list[dict]):
     """Save API key configs to YAML."""
     _yaml_data["api_keys"] = configs
     save_yaml_config()
-    API_KEYS.clear()
-    API_KEYS.extend(configs)
+    API_KEYS[:] = configs  # Atomic replacement — readers never see empty list
 
 
 # ── Module-level state ──────────────────────────────────────────────
@@ -315,9 +351,23 @@ _CUSTOM_ROUTES_CHECK_INTERVAL = yaml_get("background", "custom_routes_check_inte
 _reload_lock = threading.Lock()
 
 
+def _sort_routes_by_match(routes: dict) -> list:
+    """Return routes sorted by longest match pattern first (most specific)."""
+    return sorted(
+        routes.values(),
+        key=lambda r: max((len(m) for m in r.get("match", [])), default=0),
+        reverse=True
+    )
+
+
+# Pre-sorted route lists (rebuilt on load/reload)
+SORTED_ROUTES = _sort_routes_by_match(ROUTES)
+SORTED_CUSTOM_ROUTES = _sort_routes_by_match(CUSTOM_ROUTES)
+
+
 def maybe_reload_custom_routes():
     """Re-read custom_routes.json if modified. Rate-limited, thread-safe."""
-    global _custom_routes_mtime, _custom_routes_last_check
+    global _custom_routes_mtime, _custom_routes_last_check, SORTED_ROUTES, SORTED_CUSTOM_ROUTES
     now = time.time()
     if now - _custom_routes_last_check < _CUSTOM_ROUTES_CHECK_INTERVAL:
         return
@@ -344,6 +394,9 @@ def maybe_reload_custom_routes():
                 ROUTES[k] = new_routes[k]
             for k in old_r_keys - new_r_keys:
                 del ROUTES[k]
+
+            SORTED_ROUTES = _sort_routes_by_match(ROUTES)
+            SORTED_CUSTOM_ROUTES = _sort_routes_by_match(CUSTOM_ROUTES)
 
         logging.info("Reloaded custom_routes.json (%d routes)", len(ROUTES))
     except Exception as e:

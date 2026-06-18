@@ -7,6 +7,7 @@ server:
 upstream:
   openai_base: https://opencode.ai/zen/go/v1/chat/completions
   anthropic_base: https://opencode.ai/zen/go/v1/messages
+  free_base: https://opencode.ai/zen/v1/chat/completions
   proxy: ''
   timeout:
     connect: 30
@@ -26,6 +27,8 @@ routing:
   aliases:
     nimo: mimo
 models:
+  glm-5.2:
+    protocol: openai
   glm-5.1:
     protocol: openai
   glm-5:
@@ -58,7 +61,32 @@ models:
     protocol: anthropic
   qwen3.5-plus:
     protocol: anthropic
-custom_routes: {}
+free_model_map:
+  deepseek-v4-flash: deepseek-v4-flash-free
+  mimo-v2.5: mimo-v2.5-free
+custom_routes:
+  mimov25:
+    match:
+    - mimo-v2.5
+    model: mimo-v2.5
+    thinking: adaptive
+  mimov25pro:
+    match:
+    - mimo-v2.5-pro
+    model: mimo-v2.5
+  qwen35plus:
+    match:
+    - qwen3.5-plus
+    model: mimo-v2.5
+    thinking: adaptive
+  gpt54mini:
+    match:
+    - gpt-5.4-mini
+    model: mimo-v2.5
+  kimik26:
+    match:
+    - kimi-k2.6
+    model: mimo-v2.5
 api_keys:
 - api_key: ***REDACTED***
   alias: joedouille648@gmail.com

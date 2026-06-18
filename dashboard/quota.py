@@ -60,6 +60,12 @@ MODEL_CAPABILITIES: dict[str, list[str]] = {
     "minimax-m2.5":     ["chat", "tools", "vision"],
     "qwen3.6-plus":     ["chat", "tools", "vision", "code", "web-search"],
     "qwen3.5-plus":     ["chat", "tools", "vision", "code", "web-search"],
+    # Free models (OpenCode Zen, no Go subscription required)
+    "big-pickle":               ["chat"],
+    "deepseek-v4-flash-free":   ["chat", "code"],
+    "mimo-v2.5-free":           ["chat", "vision"],
+    "north-mini-code-free":     ["chat", "code"],
+    "nemotron-3-ultra-free":    ["chat"],
 }
 
 # ── Per-model estimated request limits ──
@@ -434,6 +440,80 @@ def parse_quota_html(html: str) -> dict:
 # ── HTTP fetch ──
 
 QUOTA_FETCH_INTERVAL = 300  # 5 minutes
+
+# ── Use Balance toggle ──
+# SolidJS server action hashes (reverse-engineered from OpenCode frontend)
+_USE_BALANCE_ACTION = "d554b8f229e4a1afe01c6135a872a6b6943b8486e4f4ac24a47fd2615ae22f64"
+_LITE_USE_BALANCE_ACTION = "0c8d84b0a700eb0de440ca4c9105b42d6c9ede971d6bf592fa4f91bbeaaa1e6b"
+_SERVER_URL = "https://opencode.ai/_server"
+
+
+async def toggle_use_balance(workspace_id: str, auth_cookie: str, enabled: bool = True) -> bool:
+    """Toggle the 'Use Balance' setting on OpenCode for a workspace.
+
+    When enabled, Go falls back to Zen balance credits after usage limits are hit.
+    Uses SolidJS server actions (reverse-engineered from the OpenCode frontend).
+
+    Returns True on success, False on failure.
+    """
+    from urllib.parse import quote
+    import uuid
+
+    client = await _get_http_client()
+    instance_id = f"server-fn:{uuid.uuid4().hex[:8]}"
+
+    # Try the main setUseBalance action first, fall back to lite variant
+    for action_hash in (_USE_BALANCE_ACTION, _LITE_USE_BALANCE_ACTION):
+        url = f"{_SERVER_URL}?id={quote(action_hash, safe='')}"
+        headers = {
+            "Cookie": f"auth={auth_cookie}",
+            "X-Server-Id": action_hash,
+            "X-Server-Instance": instance_id,
+            "User-Agent": "opencode-proxy/1.0",
+            "Origin": "https://opencode.ai",
+            "Referer": f"https://opencode.ai/workspace/{quote(workspace_id, safe='')}/go",
+        }
+
+        form_data = {
+            "workspaceID": workspace_id,
+            "useBalance": "on" if enabled else "",
+        }
+
+        try:
+            resp = await client.post(url, data=form_data, headers=headers)
+            if resp.status_code == 200:
+                logger.info("[balance] toggle useBalance=%s for workspace %s (action %s)",
+                            enabled, workspace_id[:12], action_hash[:12])
+                return True
+            else:
+                logger.debug("[balance] action %s returned HTTP %d for workspace %s",
+                             action_hash[:12], resp.status_code, workspace_id[:12])
+        except Exception as e:
+            logger.debug("[balance] action %s failed for workspace %s: %s",
+                         action_hash[:12], workspace_id[:12], e)
+
+    logger.warning("[balance] all toggle actions failed for workspace %s", workspace_id[:12])
+    return False
+
+
+async def toggle_use_balance_all(enabled: bool = True) -> dict[str, bool]:
+    """Toggle 'Use Balance' for all configured workspaces.
+
+    Returns dict mapping workspace_id to success status.
+    """
+    from config.settings import OPENCODE_GO_USE_BALANCE
+
+    if not OPENCODE_GO_USE_BALANCE:
+        logger.debug("[balance] OPENCODE_GO_USE_BALANCE is disabled, skipping toggle")
+        return {}
+
+    workspaces = get_configured_workspaces()
+    results = {}
+    for ws in workspaces:
+        wid = ws["go_workspace_id"]
+        cookie = ws["go_auth_cookie"]
+        results[wid] = await toggle_use_balance(wid, cookie, enabled)
+    return results
 
 
 async def fetch_quotas(workspace_id: str, auth_cookie: str) -> dict:
