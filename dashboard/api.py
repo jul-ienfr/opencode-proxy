@@ -139,12 +139,7 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
     from starlette.middleware.base import BaseHTTPMiddleware
     class _StaticCacheMiddleware(BaseHTTPMiddleware):
         async def dispatch(self, request, call_next):
-            try:
-                response = await call_next(request)
-            except Exception:
-                # ClientDisconnect, ConnectionResetError, etc. — client gone
-                from starlette.responses import Response as StarletteResponse
-                return StarletteResponse(status_code=499)
+            response = await call_next(request)
             if request.url.path.startswith("/static/"):
                 response.headers["Cache-Control"] = "public, max-age=3600"
             return response
@@ -211,6 +206,7 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
                 for k in API_KEYS
             ],
             "routing": API_KEY_ROUTING,
+            "free_model_map": config_settings.FREE_MODEL_MAP,
             "lang": os.getenv("PROXY_LANG", "en"),
         }
 
@@ -761,6 +757,64 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
     @app.get("/api/quotas")
     async def get_quotas():
         return get_quota_snapshot()
+
+    @app.get("/api/free-model-usage")
+    async def get_free_model_usage(days: int = 7):
+        """Free model usage stats for quota analysis.
+
+        Returns per-model, per-key, per-workspace aggregates with
+        total requests, tokens, and success/failure counts.
+        """
+        def _query():
+            where = "WHERE timestamp >= datetime('now', ?)"
+            params = [f"-{days} days"]
+            rows = conn.execute(
+                "SELECT timestamp, paid_model, free_model, api_key, workspace_id, "
+                "       status, tokens_input, tokens_output, duration_ms "
+                "FROM free_model_usage " + where + " ORDER BY timestamp DESC LIMIT 5000",
+                params,
+            ).fetchall()
+            return rows
+
+        rows = await asyncio.to_thread(_query)
+
+        # Aggregate by free_model
+        by_model = {}
+        by_key = {}
+        by_workspace = {}
+        timeline = []
+        for r in rows:
+            ts, paid, free, key, ws, status, tok_in, tok_out, dur = r
+            # By model
+            m = by_model.setdefault(free, {"requests": 0, "tokens_in": 0, "tokens_out": 0, "success": 0, "fail": 0})
+            m["requests"] += 1
+            m["tokens_in"] += tok_in or 0
+            m["tokens_out"] += tok_out or 0
+            if status == 200:
+                m["success"] += 1
+            else:
+                m["fail"] += 1
+            # By key
+            k = by_key.setdefault(key, {"requests": 0, "tokens_in": 0, "tokens_out": 0})
+            k["requests"] += 1
+            k["tokens_in"] += tok_in or 0
+            k["tokens_out"] += tok_out or 0
+            # By workspace
+            w = by_workspace.setdefault(ws, {"requests": 0, "tokens_in": 0, "tokens_out": 0})
+            w["requests"] += 1
+            w["tokens_in"] += tok_in or 0
+            w["tokens_out"] += tok_out or 0
+            # Timeline (hourly buckets)
+            timeline.append({"ts": ts, "model": free, "status": status, "tokens": (tok_in or 0) + (tok_out or 0)})
+
+        return {
+            "days": days,
+            "total_requests": len(rows),
+            "by_model": by_model,
+            "by_key": by_key,
+            "by_workspace": by_workspace,
+            "recent": timeline[:100],
+        }
 
     @app.get("/api/tools")
     async def get_tools(days: int = 7, all: bool = False):

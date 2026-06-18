@@ -23,7 +23,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse as StarletteJSONResponse
 from starlette.requests import ClientDisconnect
 
-from config import API_KEY, PROXY, MODELS, ROUTES, get_model_config, HOST, PORT, WEB_PORT, DISABLE_MAPPING, API_KEYS, API_KEY_ROUTING, CUSTOM_ROUTES, maybe_reload_custom_routes, CACHE_MIN_PROMPT_SIZE, DEBUG, yaml_get
+from config import API_KEY, PROXY, MODELS, ROUTES, get_model_config, HOST, PORT, WEB_PORT, DISABLE_MAPPING, API_KEYS, API_KEY_ROUTING, CUSTOM_ROUTES, maybe_reload_custom_routes, CACHE_MIN_PROMPT_SIZE, DEBUG, yaml_get, SORTED_ROUTES, SORTED_CUSTOM_ROUTES, API_BASE_FREE, FREE_MODEL_MAP
 
 import itertools
 
@@ -50,11 +50,14 @@ def get_next_api_key() -> dict:
     available = [k for k in enabled if not _key_pauser.is_paused(k.get("api_key", ""))]
 
     if not available:
-        # All paused — use the one with shortest remaining pause
-        best = _key_pauser.best_available(enabled)
-        if best:
-            _debug(f"  [apikey] all keys paused, using shortest-paused alias={best.get('alias','?')}")
-            return best
+        # All paused — raise with shortest wait time instead of reusing a paused key
+        min_rem = max(
+            (_key_pauser.remaining(k.get("api_key", "")) for k in enabled),
+            default=0
+        )
+        if min_rem > 0:
+            _debug(f"  [apikey] ALL keys paused, min remaining={min_rem:.0f}s — raising AllKeysPausedError")
+            raise AllKeysPausedError(min_rem)
         _debug(f"  [apikey] no keys available, falling back to .env key")
         return {"api_key": API_KEY}
 
@@ -69,9 +72,12 @@ def get_next_api_key() -> dict:
                 _debug(f"  [apikey] failover selected alias={API_KEYS[idx].get('alias','?')} (idx={idx})")
                 return API_KEYS[idx]
         # Fallback to shortest-paused
-        best = _key_pauser.best_available(enabled)
-        if best:
-            return best
+        min_rem = max(
+            (_key_pauser.remaining(k.get("api_key", "")) for k in enabled),
+            default=0
+        )
+        if min_rem > 0:
+            raise AllKeysPausedError(min_rem)
         _debug(f"  [apikey] failover exhausted, falling back to .env key")
         return {"api_key": API_KEY}
 
@@ -234,10 +240,16 @@ class _KeyPauser:
         except Exception as e:
             _debug(f"  [keypauser] load error: {e}")
 
-    def pause_key(self, api_key: str, duration: float, reason: str = ""):
-        """Pause a key for `duration` seconds from now."""
+    def pause_key(self, api_key: str, duration: float, reason: str = "", quota_based: bool = False):
+        """Pause a key for `duration` seconds from now.
+
+        When quota_based=True, the duration is the actual quota reset time
+        and is NOT capped at max_pause. Other pauses (401, stream exception,
+        default) are capped at max_pause.
+        """
         prefix = self._prefix(api_key)
-        duration = min(duration, self._max_pause)
+        if not quota_based:
+            duration = min(duration, self._max_pause)
         expiry = time.monotonic() + duration
         with self._lock:
             existing = self._paused.get(prefix, 0)
@@ -379,12 +391,13 @@ async def _pause_key_for_quota_reset(api_key: str):
             q = quotas.get(window, {})
             usage = q.get("usage_percent", 0)
             reset_sec = q.get("reset_in_sec", 0)
-            if usage >= 100 and reset_sec > 0:
+            if usage >= 95 and reset_sec > 0:
                 alias = _alias_for_key(api_key)
                 re_enable_at = time.time() + reset_sec
                 re_enable_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(re_enable_at))
                 _key_pauser.pause_key(api_key, reset_sec,
-                                      f"quota {window} {usage:.0f}% → réactivation {re_enable_str}")
+                                      f"quota {window} {usage:.0f}% → réactivation {re_enable_str}",
+                                      quota_based=True)
                 _log(f"  QUOTA {window.upper()} AT {usage:.0f}% — key {alias} paused until {re_enable_str} (in {reset_sec:.0f}s)")
                 return
 
@@ -403,6 +416,13 @@ def _key_from_headers(headers: dict, protocol: str) -> str:
     if protocol == "anthropic":
         return headers.get("x-api-key", "")
     return headers.get("Authorization", "").replace("Bearer ", "")
+
+def _workspace_for_key(api_key: str) -> str:
+    """Look up workspace ID for an API key."""
+    for k in API_KEYS:
+        if k.get("api_key") == api_key:
+            return k.get("go_workspace_id", "unknown")
+    return "unknown"
 
 def _get_auth_headers(protocol: str, entry: dict | None = None) -> dict:
     if entry is None:
@@ -450,6 +470,30 @@ if DEBUG:
 MAX_BODY_SIZE = yaml_get("upstream", "max_body_size", 10 * 1024 * 1024)
 MAX_BODY_STORAGE = 100_000  # Max chars stored per request/response body in DB
 
+
+def _truncate_body_for_storage(body: dict, max_chars: int = MAX_BODY_STORAGE) -> str | None:
+    """Serialize body to JSON, truncating messages array if needed to stay under max_chars.
+
+    Keeps model, tools, and a summary of messages to preserve context while
+    avoiding the memory waste of serializing a 10MB body just to keep 100K.
+    """
+    if not body:
+        return None
+    # Fast path: small body, serialize directly
+    full = json.dumps(body, ensure_ascii=False, separators=(',', ':'))
+    if len(full) <= max_chars:
+        return full
+    # Slow path: truncate messages array to fit
+    truncated = {k: v for k, v in body.items() if k != "messages"}
+    messages = body.get("messages", [])
+    if messages:
+        truncated["messages"] = messages[:2] + [{"_truncated": True, "original_count": len(messages)}]
+    result = json.dumps(truncated, ensure_ascii=False, separators=(',', ':'))
+    if len(result) > max_chars:
+        # Still too large — hard-truncate the string
+        result = result[:max_chars]
+    return result
+
 # SQLite setup — synchronous connection, all DB ops run in thread pool
 _db_path = os.path.join(LOG_DIR, "requests.db")
 _conn = sqlite3.connect(_db_path, check_same_thread=False)
@@ -492,6 +536,28 @@ _conn.commit()
 _debug(f"  [db] SQLite connection established: {_db_path}")
 
 
+# ── Free model usage tracking ──
+_conn.execute("""
+    CREATE TABLE IF NOT EXISTS free_model_usage (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp TEXT NOT NULL,
+        paid_model TEXT NOT NULL,
+        free_model TEXT NOT NULL,
+        api_key TEXT NOT NULL,
+        workspace_id TEXT NOT NULL,
+        status INTEGER NOT NULL,
+        tokens_input INTEGER DEFAULT 0,
+        tokens_output INTEGER DEFAULT 0,
+        duration_ms INTEGER DEFAULT 0
+    )
+""")
+_conn.execute("CREATE INDEX IF NOT EXISTS idx_free_ts ON free_model_usage(timestamp)")
+_conn.execute("CREATE INDEX IF NOT EXISTS idx_free_model ON free_model_usage(free_model)")
+_conn.execute("CREATE INDEX IF NOT EXISTS idx_free_key ON free_model_usage(api_key)")
+_conn.commit()
+_debug(f"  [db] free_model_usage table ready")
+
+
 _db_pending_inserts = 0
 _db_last_commit = time.monotonic()
 _DB_COMMIT_INTERVAL = yaml_get("database", "commit_interval", 5)   # seconds between periodic commits
@@ -526,19 +592,21 @@ def _db_insert_sync(req_id, timestamp, model, original_model, duration_ms,
     """
     global _db_pending_inserts, _db_last_commit
     t0 = time.monotonic()
-    _conn.execute("""
-        INSERT OR REPLACE INTO requests (id, timestamp, model, original_model, duration_ms,
-            tokens_input, tokens_output, tokens_cache, success, error,
-            protocol, is_stream, thinking, effort, client_ip, account_alias, tools, tools_used,
-            request_body, response_body, client_user_agent)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (req_id, timestamp, model, original_model, duration_ms,
-          tokens_input, tokens_output, tokens_cache, 1 if success else 0, error,
-          protocol, 1 if is_stream else 0, thinking, effort,
-          client_ip, account_alias, tools_json, tools_used_json,
-          request_body_json, response_body_json, client_user_agent))
-    # Batch commit logic
+    # Lock the entire execute+commit block to prevent InterfaceError when
+    # _db_flush or _wal_checkpoint runs concurrently on another thread.
     with _db_commit_lock:
+        _conn.execute("""
+            INSERT OR REPLACE INTO requests (id, timestamp, model, original_model, duration_ms,
+                tokens_input, tokens_output, tokens_cache, success, error,
+                protocol, is_stream, thinking, effort, client_ip, account_alias, tools, tools_used,
+                request_body, response_body, client_user_agent)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (req_id, timestamp, model, original_model, duration_ms,
+              tokens_input, tokens_output, tokens_cache, 1 if success else 0, error,
+              protocol, 1 if is_stream else 0, thinking, effort,
+              client_ip, account_alias, tools_json, tools_used_json,
+              request_body_json, response_body_json, client_user_agent))
+        # Batch commit logic
         _db_pending_inserts += 1
         now = time.monotonic()
         elapsed = now - _db_last_commit
@@ -558,8 +626,8 @@ async def _save_request(req_id, model, original_model, duration_ms,
 	                  request_body=None, response_body=None):
     tools_json = json.dumps(tools) if tools else "[]"
     tools_used_json = json.dumps(list(dict.fromkeys(tools_used))) if tools_used else "[]"
-    request_body_json = json.dumps(request_body, ensure_ascii=False)[:MAX_BODY_STORAGE] if request_body else None
-    response_body_json = json.dumps(response_body, ensure_ascii=False)[:MAX_BODY_STORAGE] if response_body else None
+    request_body_json = _truncate_body_for_storage(request_body) if request_body else None
+    response_body_json = _truncate_body_for_storage(response_body) if response_body else None
     client_user_agent = _current_user_agent.get()
     timestamp = time.strftime("%Y-%m-%dT%H:%M:%S")
     await asyncio.to_thread(
@@ -569,15 +637,17 @@ async def _save_request(req_id, model, original_model, duration_ms,
         tools_json, tools_used_json, request_body_json, response_body_json,
         client_user_agent
     )
-    # Force commit so dashboard reads see the new row immediately
-    _db_flush()
+    # Fire-and-forget: commit in thread pool so dashboard sees the row quickly
+    # without blocking the event loop. A blocked event loop freezes SSE streams
+    # and triggers client-side 499 disconnects.
+    if _db_pending_inserts > 0:
+        asyncio.get_running_loop().run_in_executor(None, _db_flush)
     _debug(f"  [db] _save_request: saved req_id={req_id} model={model} success={success}")
     # Notify dashboard SSE clients about the update
     try:
         get_event_manager().publish("stats_updated", {"time": timestamp})
-        # Also publish request detail via SSE
-        tools_used_list = json.loads(tools_used_json) if tools_used_json and tools_used_json != "[]" else []
-        tools_list = json.loads(tools_json) if tools_json and tools_json != "[]" else []
+        # Also publish request detail via SSE — reuse original Python objects
+        tools_used_deduped = list(dict.fromkeys(tools_used)) if tools_used else []
         get_event_manager().publish("request_completed", {
             "id": req_id,
             "timestamp": timestamp,
@@ -595,11 +665,32 @@ async def _save_request(req_id, model, original_model, duration_ms,
             "effort": effort,
             "client_ip": client_ip,
             "account_alias": account_alias,
-            "tools": tools_list,
-            "tools_used": tools_used_list,
+            "tools": tools or [],
+            "tools_used": tools_used_deduped,
         })
-    except Exception:
-        pass
+    except Exception as e:
+        _debug(f"  ✗ SSE publish failed: {type(e).__name__}: {e}")
+
+
+def _log_free_model_usage(paid_model: str, free_model: str, api_key: str,
+                          workspace_id: str, status: int, tokens_in: int = 0,
+                          tokens_out: int = 0, duration_ms: int = 0):
+    """Log a free model request to the database for quota analysis."""
+    timestamp = time.strftime("%Y-%m-%dT%H:%M:%S")
+    try:
+        _conn.execute(
+            "INSERT INTO free_model_usage "
+            "(timestamp, paid_model, free_model, api_key, workspace_id, status, "
+            " tokens_input, tokens_output, duration_ms) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (timestamp, paid_model, free_model, api_key[:16] + "...", workspace_id,
+             status, tokens_in, tokens_out, duration_ms)
+        )
+        _conn.commit()
+        _debug(f"  [free-usage] logged: {free_model} key={api_key[:8]}... ws={workspace_id[:12]}... "
+               f"status={status} in={tokens_in} out={tokens_out}")
+    except Exception as e:
+        _debug(f"  [free-usage] log failed: {e}")
 
 
 # Token usage tracking (in-memory, restored from SQLite on startup)
@@ -637,7 +728,8 @@ _restore_token_counters()
 def _wal_checkpoint():
     """Run WAL checkpoint to prevent WAL file growth."""
     try:
-        _conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        with _db_commit_lock:
+            _conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         _debug("  [db] WAL checkpoint completed successfully")
     except Exception as e:
         _debug(f"  [db] WAL checkpoint FAILED: {type(e).__name__}: {e}")
@@ -770,6 +862,16 @@ async def lifespan(app):
 
     # Start background quota fetcher (no-op if env vars not set)
     await start_quota_fetcher(app)
+
+    # Toggle "Use Balance" on for all workspaces (so Go falls back to Zen balance)
+    try:
+        from dashboard import toggle_use_balance_all
+        balance_results = await toggle_use_balance_all()
+        if balance_results:
+            ok = sum(1 for v in balance_results.values() if v)
+            _debug(f"  [lifespan] use-balance toggle: {ok}/{len(balance_results)} workspaces enabled")
+    except Exception as e:
+        _debug(f"  [lifespan] use-balance toggle failed: {e}")
 
     # Register recovery callback: unpause API keys when workspace returns to ok
     from dashboard.quota import set_on_workspace_recovered_callback
@@ -989,7 +1091,9 @@ class AccessLogMiddleware(BaseHTTPMiddleware):
         try:
             response = await call_next(request)
         except ClientDisconnect:
-            _debug(f"  [access] client disconnected: {request.method} {path} {client_ip}")
+            elapsed_ms = (time.monotonic() - start) * 1000
+            _debug(f"  [access] client disconnected after {elapsed_ms:.0f}ms: {request.method} {path} {client_ip}")
+            _log(f"{request.method} {path} 499 {elapsed_ms:.0f}ms {client_ip}")
             return StarletteJSONResponse(status_code=499, content={"error": "Client disconnected"})
         elapsed_ms = (time.monotonic() - start) * 1000
 
@@ -1111,6 +1215,13 @@ class UpstreamError(Exception):
         self.original = original
 
 
+class AllKeysPausedError(Exception):
+    """Raised when all API keys are paused and no request can be made."""
+    def __init__(self, retry_after: float):
+        super().__init__(f"All API keys paused, retry after {retry_after:.0f}s")
+        self.retry_after = retry_after
+
+
 # ── Standardized error response helpers ──
 
 def _anthropic_error(status_code: int, message: str, error_type: str = "api_error") -> JSONResponse:
@@ -1142,26 +1253,76 @@ async def _forward_post(endpoint, json, headers):
         raise
 
 
-async def _forward_stream(method, endpoint, json, headers):
-    """Stream with circuit breaker. Raises CircuitOpenError if circuit is open."""
-    if not _cb_should_allow(endpoint):
-        raise CircuitOpenError(f"Circuit breaker open for {endpoint}")
-    try:
-        cm = _client.stream(method, endpoint, json=json, headers=headers)
-        resp = await cm.__aenter__()
-        if resp.status_code >= 500:
-            _cb_record_failure(endpoint)
-        else:
-            _cb_record_success(endpoint)
-        return cm, resp
-    except CircuitOpenError:
-        raise
-    except Exception:
-        _cb_record_failure(endpoint)
-        raise
-
 
 # ── Shared helper functions for endpoint handlers ──────────────
+
+async def _try_free_model_first(body, headers, protocol, model_id,
+                                api_key=None, workspace_id=None):
+    """Try the free model equivalent before falling back to paid.
+
+    If the model has a free equivalent in FREE_MODEL_MAP, attempt the request
+    via the free endpoint first. On 429 (quota exhausted), returns None to
+    signal the caller should use the paid model instead.
+
+    Every attempt is logged to free_model_usage table for quota analysis.
+
+    Returns (response, headers, actual_model_name) if free model succeeded,
+    or None if fallback needed. The actual_model_name is the free model ID
+    that was used (e.g. "mimo-v2.5-free"), so callers can log it correctly.
+    """
+    free_model = FREE_MODEL_MAP.get(model_id)
+    if not free_model:
+        return None  # No free equivalent, proceed with paid
+
+    _debug(f"  [free] trying free model {free_model!r} instead of {model_id!r}")
+
+    # Build free request: swap model name and endpoint
+    free_body = dict(body)
+    free_body["model"] = free_model
+
+    t0 = time.monotonic()
+    try:
+        resp, free_headers = await _do_request_with_retry(
+            API_BASE_FREE, free_body, headers, protocol, retry_on_429=False
+        )
+    except UpstreamError:
+        _log_free_model_usage(model_id, free_model, api_key or "unknown",
+                              workspace_id or "unknown", 502)
+        return None  # Connection error on free → fall back to paid
+
+    elapsed_ms = int((time.monotonic() - t0) * 1000)
+
+    # Extract token usage from response
+    tokens_in = tokens_out = 0
+    if resp.status_code == 200:
+        try:
+            data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+            usage = data.get("usage", {})
+            tokens_in = usage.get("prompt_tokens", 0) or usage.get("input_tokens", 0)
+            tokens_out = usage.get("completion_tokens", 0) or usage.get("output_tokens", 0)
+        except Exception:
+            pass
+
+    # Log every attempt
+    _log_free_model_usage(model_id, free_model, api_key or "unknown",
+                          workspace_id or "unknown", resp.status_code,
+                          tokens_in, tokens_out, elapsed_ms)
+
+    if resp.status_code == 200:
+        _debug(f"  [free] {free_model!r} succeeded ({tokens_in}+{tokens_out} tokens)")
+        _log(f"  FREE {free_model!r} OK ({tokens_in}+{tokens_out} tokens, saved paid quota)")
+        return resp, free_headers, free_model
+
+    # 429 = free quota exhausted → fall back to paid silently
+    if resp.status_code == 429:
+        _debug(f"  [free] {free_model!r} rate limited → falling back to paid {model_id!r}")
+        _log(f"  FREE {free_model!r} RATE LIMITED → falling back to paid {model_id!r}")
+        return None
+
+    # Other errors → fall back to paid
+    _debug(f"  [free] {free_model!r} returned {resp.status_code} → falling back to paid")
+    return None
+
 
 async def _do_request_with_retry(endpoint, body, headers, protocol, retry_on_429=True):
     """POST request with automatic 429 key failover and 5xx retry with backoff.
@@ -1169,11 +1330,12 @@ async def _do_request_with_retry(endpoint, body, headers, protocol, retry_on_429
     Returns (response, final_headers) -- headers may differ after retry.
     Raises UpstreamError on connection/timeout/protocol failures.
     """
-    _RETRYABLE_STATUSES = {502, 503, 504}
+    _RETRYABLE_STATUSES = {502, 503, 504, 499}
     max_retries = yaml_get("streaming", "retry_attempts", 2)
 
     for attempt in range(max_retries):
-        _debug(f"  → upstream POST {endpoint} attempt {attempt+1}/{max_retries} headers={_sanitize_headers(headers)}")
+        if DEBUG:
+            _debug(f"  → upstream POST {endpoint} attempt {attempt+1}/{max_retries} headers={_sanitize_headers(headers)}")
         t0 = time.monotonic()
         try:
             resp = await _client.post(endpoint, json=body, headers=headers)
@@ -1289,13 +1451,17 @@ def _make_stream_retry_loop(protocol):
     the caller should `continue` the outer loop.
     """
     async def _handle_429(headers, status_code, attempt, resp_headers=None):
-        if attempt == 0 and len(API_KEYS) > 1 and status_code in (429, 401):
+        if attempt == 0 and len(API_KEYS) > 1 and status_code in (429, 401, 400):
             failed_key = _key_from_headers(headers, protocol)
             if status_code == 429:
                 # Fetch fresh quotas and pause key until exact reset time
                 await _pause_key_for_quota_reset(failed_key)
-            else:  # 401
+            elif status_code == 401:
                 _key_pauser.pause_key(failed_key, _key_pauser._max_pause, "401 Unauthorized")
+            elif status_code == 400:
+                # Check for credit/balance errors in resp_headers or skip
+                # We need to check the response body - handled in caller
+                pass
             alt = _find_alternative_key(failed_key)
             if alt:
                 _log(f"  {status_code} on key, retrying with alternative key")
@@ -1394,7 +1560,7 @@ def _route_for(model_name: str, tool_names: list = None) -> dict | None:
         return None
     # When DISABLE_MAPPING, only check custom routes (not auto-generated aliases)
     if DISABLE_MAPPING:
-        for r in CUSTOM_ROUTES.values():
+        for r in SORTED_CUSTOM_ROUTES:
             if any(m in name for m in r.get("match", [])):
                 _debug(f"  [route] DISABLE_MAPPING custom match: '{name}' → {r.get('model')}")
                 return r
@@ -1404,16 +1570,16 @@ def _route_for(model_name: str, tool_names: list = None) -> dict | None:
             return {"match": [name], "model": model_name}
         _debug(f"  [route] DISABLE_MAPPING no match for '{name}'")
         return None
-    # 1. Tool-based routing (optional, additive)
+    # 1. Tool-based routing (sorted by longest match first)
     tool_names_lower = [t.lower() for t in (tool_names or [])]
-    for r in ROUTES.values():
+    for r in SORTED_ROUTES:
         if r.get("enabled") is False:
             continue
         if tool_names_lower and any(m in t for m in r.get("match", []) for t in tool_names_lower):
             _debug(f"  [route] tool-based match: {r.get('model')} (tool match)")
             return r
-    # 2. Model-based routing (alias matching)
-    for r in ROUTES.values():
+    # 2. Model-based routing (sorted by longest match first)
+    for r in SORTED_ROUTES:
         if r.get("enabled") is False:
             continue
         if any(m in name for m in r.get("match", [])):
@@ -1655,8 +1821,8 @@ async def _handle_web_search(body: dict, model_id: str, protocol: str) -> bool:
     _debug(f"  [web-search] mode={mode} model={model_id} query={query[:80]}...")
 
     if mode == "duckduckgo":
-        # Execute search locally and inject results
-        results = _execute_ddg_search(query, max_results)
+        # Execute search locally and inject results (offload to thread to avoid blocking event loop)
+        results = await asyncio.to_thread(_execute_ddg_search, query, max_results)
         _inject_search_results(body, results, protocol)
         _strip_web_search_tool(body, protocol)
         _log(f"  WEB SEARCH: DuckDuckGo query='{query[:60]}' → injected results")
@@ -1669,8 +1835,8 @@ async def _handle_web_search(body: dict, model_id: str, protocol: str) -> bool:
         return False  # Let upstream process with the compatible model
 
     elif mode == "ddg_then_model" and target_model:
-        # Try DuckDuckGo first, fallback to model on failure
-        results = _execute_ddg_search(query, max_results)
+        # Try DuckDuckGo first, fallback to model on failure (offload to thread)
+        results = await asyncio.to_thread(_execute_ddg_search, query, max_results)
         if "error" in results.lower() or "no results" in results.lower():
             body["model"] = target_model
             _log(f"  WEB SEARCH: DDG failed, routed to {target_model}")
@@ -1811,6 +1977,8 @@ def _strip_billing_header(text: str) -> str:
 
 def anthropic_to_openai(body: dict, model: str) -> dict:
     thinking = isinstance(body.get("thinking"), dict) and body["thinking"].get("type") in ("enabled", "adaptive")
+    # GLM-5.x models don't support cache_control — skip it
+    supports_cache_control = not model.startswith("glm-5")
 
     messages = []
 
@@ -1820,12 +1988,15 @@ def anthropic_to_openai(body: dict, model: str) -> dict:
         text = _extract_text(system_val)
         if text:
             text = _strip_billing_header(text)
-            msg = {"role": "system", "content": text, "cache_control": {"type": "ephemeral"}}
+            msg = {"role": "system", "content": text}
+            if supports_cache_control:
+                msg["cache_control"] = {"type": "ephemeral"}
             messages.append(msg)
     elif system_val:
         msg = {"role": "system", "content": _strip_billing_header(system_val)}
         # Always add cache_control to system messages for prefix caching
-        msg["cache_control"] = {"type": "ephemeral"}
+        if supports_cache_control:
+            msg["cache_control"] = {"type": "ephemeral"}
         messages.append(msg)
 
     for msg in body.get("messages", []):
@@ -1902,16 +2073,17 @@ def anthropic_to_openai(body: dict, model: str) -> dict:
                 out["reasoning_content"] = joined_thinking
             elif thinking and is_asst:
                 out["reasoning_content"] = " "
-            if last_cache_control and not is_asst:
+            if last_cache_control and not is_asst and supports_cache_control:
                 out["cache_control"] = last_cache_control
             messages.append(out)
 
     # Add cache_control to the last user message for optimal prefix caching
     # (Anthropic best practice: cache system + last user turn)
-    for i in range(len(messages) - 1, -1, -1):
-        if messages[i].get("role") == "user":
-            messages[i]["cache_control"] = {"type": "ephemeral"}
-            break
+    if supports_cache_control:
+        for i in range(len(messages) - 1, -1, -1):
+            if messages[i].get("role") == "user":
+                messages[i]["cache_control"] = {"type": "ephemeral"}
+                break
 
     # Build request
     oai = {"model": model, "messages": messages,
@@ -1987,6 +2159,17 @@ def anthropic_to_openai(body: dict, model: str) -> dict:
             # Kimi K2.6 uses reasoning: true (not reasoning_effort)
             oai["reasoning"] = True
             _debug(f"  [thinking] {model}: reasoning=True (effort={effort_level})")
+        elif model.startswith("glm-5"):
+            # GLM-5.x supports reasoning_effort like mimo-v2.5
+            if effort_level in ("xhigh", "max"):
+                oai["reasoning_effort"] = "high"
+            elif effort_level in ("high",):
+                oai["reasoning_effort"] = "high"
+            elif effort_level in ("medium",):
+                oai["reasoning_effort"] = "medium"
+            else:
+                oai["reasoning_effort"] = "low"
+            _debug(f"  [thinking] {model}: reasoning_effort={oai['reasoning_effort']} (effort={effort_level})")
         elif model.startswith("deepseek-v4"):
             # DeepSeek V4 only supports high and max
             if effort_level in ("xhigh", "max"):
@@ -2361,6 +2544,17 @@ def openai_responses_to_anthropic(body: dict) -> dict:
             # Kimi K2.6 uses reasoning: true (not reasoning_effort)
             result["reasoning"] = True
             _debug(f"  [thinking] {model}: reasoning=True (effort={effort_level})")
+        elif model.startswith("glm-5"):
+            # GLM-5.x supports reasoning_effort like mimo-v2.5
+            if effort_level in ("xhigh", "max"):
+                result["reasoning_effort"] = "high"
+            elif effort_level in ("high",):
+                result["reasoning_effort"] = "high"
+            elif effort_level in ("medium",):
+                result["reasoning_effort"] = "medium"
+            else:
+                result["reasoning_effort"] = "low"
+            _debug(f"  [thinking] {model}: reasoning_effort={result['reasoning_effort']} (effort={effort_level})")
         elif model.startswith("deepseek-v4"):
             # DeepSeek V4 only supports high and max
             if effort_level in ("xhigh", "max"):
@@ -2610,7 +2804,7 @@ def _extract_cache_tokens(usage: dict) -> int:
 
 
 def _elapsed_ms(start_time: float) -> int:
-    return int((time.time() - start_time) * 1000)
+    return int((time.monotonic() - start_time) * 1000)
 
 
 # ── Shared helpers for endpoint handlers ──────────────────────────
@@ -2628,11 +2822,12 @@ def _get_client_ip(request: Request) -> str:
 @app.api_route("/anthropic/v1/messages", methods=["POST"])
 async def messages(request: Request):
     req_id = _fast_id("msg")
-    start_time = time.time()
+    start_time = time.monotonic()
     client_ip = _get_client_ip(request)
     _current_user_agent.set(request.headers.get("user-agent"))
 
     body_bytes = await request.body()
+    _debug(f"  [body] read {len(body_bytes)} bytes in {(time.monotonic() - start_time) * 1000:.0f}ms")
     if len(body_bytes) > MAX_BODY_SIZE:
         _debug(f"  413: body too large ({len(body_bytes)} bytes)")
         return _anthropic_error(413, f"Request body too large ({len(body_bytes)} bytes, max {MAX_BODY_SIZE})")
@@ -2647,8 +2842,9 @@ async def messages(request: Request):
     tool_names = _extract_tool_names(body)
     request_body = body  # Capture original request before mutation
     _debug(f"[messages] req_id={req_id} model={original_model!r} tools={tool_names} ip={client_ip}")
-    _debug(f"[messages] headers={_sanitize_headers(dict(request.headers))}")
-    _debug(f"[messages] body=\n{_truncate(body)}")
+    if DEBUG:
+        _debug(f"[messages] headers={_sanitize_headers(dict(request.headers))}")
+        _debug(f"[messages] body=\n{_truncate(body)}")
     route = _route_for(original_model, tool_names)
     if route is None:
         _debug(f"[messages] ✗ no route found for {original_model!r}")
@@ -2699,7 +2895,15 @@ async def messages(request: Request):
 
     # ── Anthropic pass-through ──────────────────────────────────
     if protocol == "anthropic":
-        a_headers = _get_auth_headers("anthropic")
+        try:
+            a_headers = _get_auth_headers("anthropic")
+        except AllKeysPausedError as e:
+            retry_after = int(e.retry_after) + 1
+            return Response(
+                content=json.dumps({"type": "error", "error": {"type": "api_error",
+                    "message": f"All API keys exhausted. Retry after {retry_after}s."}}),
+                status_code=503, media_type="application/json",
+                headers={"Retry-After": str(retry_after)})
         is_stream = body.get("stream", False)
 
         if not is_stream:
@@ -2713,19 +2917,30 @@ async def messages(request: Request):
                 return Response(content=cached_body, headers={**cached_headers, "X-Cache": "HIT"}, media_type="application/json")
             _debug(f"  cache MISS key={cache_key[:16] if cache_key else 'none'}…")
 
+            # Try free model first if available
             try:
-                resp, a_headers = await _do_request_with_retry(endpoint, body, a_headers, "anthropic")
+                _ak = _key_from_headers(a_headers, "anthropic")
+                free_result = await _try_free_model_first(body, a_headers, "anthropic", model_id,
+                                                          api_key=_ak, workspace_id=_workspace_for_key(_ak))
+                if free_result is not None:
+                    resp, a_headers, _actual_model = free_result
+                    model_id = _actual_model  # Log as free model
+                else:
+                    resp, a_headers = await _do_request_with_retry(endpoint, body, a_headers, "anthropic")
             except UpstreamError as e:
                 _debug(f"  ✗ upstream error: {e}")
                 return JSONResponse(status_code=e.status_code, content={"error": str(e)})
             account_alias = _alias_for_key(a_headers.get("x-api-key", ""))
             if resp.status_code != 200:
                 # Convert 429/401 → 503 to avoid Claude Code auth window
-                status = 503 if resp.status_code in (429, 401) else resp.status_code
+                # Convert 499 → 502 (upstream disconnected, non-standard code)
+                status = 503 if resp.status_code in (429, 401) else (502 if resp.status_code == 499 else resp.status_code)
                 if resp.status_code == 429:
                     msg = "All API keys exhausted (rate limited). Try again later."
                 elif resp.status_code == 401:
                     msg = "All API keys exhausted (unauthorized). Check your API keys."
+                elif resp.status_code == 499:
+                    msg = "Upstream disconnected (499). Retrying may help."
                 else:
                     msg = resp.text[:500]
                 _debug(f"  ✗ upstream {resp.status_code} → client {status}: {msg[:300]}")
@@ -2733,8 +2948,27 @@ async def messages(request: Request):
                              resp.status_code, resp.text, protocol, is_stream, thinking_type,
                              effort, client_ip, account_alias, tool_names,
                              request_body=request_body, response_body={"error": resp.text[:2000]})
+                # Pause key on credit/balance errors (400) and retry with alt key
+                if resp.status_code == 400 and any(x in resp.text for x in ("Insufficient balance", "Monthly usage limit")):
+                    failed_key = headers.get("x-api-key", "")
+                    _key_pauser.pause_key(failed_key, _key_pauser._max_pause, f"400 credit error: {resp.text[:80]}")
+                    alt = _find_alternative_key(failed_key)
+                    if alt:
+                        _log(f"  400 credit error on key, retrying with alternative key")
+                        headers = {"x-api-key": alt.get("api_key", ""), "Content-Type": "application/json",
+                                   "anthropic-version": "2023-06-01"}
+                        try:
+                            resp, headers = await _do_request_with_retry(endpoint, body, headers, "anthropic")
+                            if resp.status_code == 200:
+                                account_alias = _alias_for_key(headers.get("x-api-key", ""))
+                            else:
+                                return _anthropic_error(503, "All API keys exhausted. Check your billing.")
+                        except UpstreamError as e:
+                            return _anthropic_error(e.status_code, str(e))
                 if resp.status_code in (429, 401):
                     return _anthropic_error(503, msg)
+                if resp.status_code == 499:
+                    return _anthropic_error(502, msg)
                 return Response(content=resp.content, status_code=resp.status_code, media_type="application/json")
             try:
                 data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
@@ -2759,12 +2993,28 @@ async def messages(request: Request):
             return Response(content=resp.content, headers={"X-Cache": "MISS"}, media_type="application/json")
 
 
-        # Estimate input tokens for Anthropic streaming
-        est_input = _estimate_input_tokens(body)
-        _debug(f"  [stream] est_input={est_input}")
-        _update_token_usage(model_id, est_input, 0, 0)
-
         async def anthropic_stream(headers):
+            nonlocal endpoint, body, model_id
+            # Try free model for streaming: swap endpoint/model before starting stream
+            free_model = FREE_MODEL_MAP.get(model_id)
+            if free_model:
+                _debug(f"  [stream] attempting free model {free_model!r} first")
+                # Save paid config in case we need to fall back
+                paid_endpoint = endpoint
+                paid_body = dict(body)
+                paid_body["model"] = model_id
+                # Swap to free
+                body = dict(body)
+                body["model"] = free_model
+                endpoint = API_BASE_FREE
+                _using_free = True
+                model_id = free_model  # Log as free model
+            else:
+                _using_free = False
+            # Defer token estimation to first chunk — reduces pre-response latency
+            est_input = _estimate_input_tokens(body)
+            _debug(f"  [stream] est_input={est_input}")
+            _update_token_usage(model_id, est_input, 0, 0)
             stream_in = None
             stream_out = stream_cache = 0
             _line_buf = ""
@@ -2779,11 +3029,34 @@ async def messages(request: Request):
                     async with _client.stream("POST", endpoint, json=body, headers=headers) as resp:
                         _debug(f"  [stream] connected status={resp.status_code}")
                         if resp.status_code != 200:
+                            # Free model 429 → fall back to paid model
+                            if _using_free and resp.status_code == 429:
+                                _debug(f"  [stream] free model 429 → falling back to paid {model_id!r}")
+                                _log(f"  FREE model rate limited → falling back to paid {model_id!r}")
+                                body = paid_body
+                                endpoint = paid_endpoint
+                                _using_free = False
+                                continue
                             headers, should_retry = await _handle_429(headers, resp.status_code, _attempt, resp.headers)
                             if should_retry:
                                 _debug(f"  [stream] 429 retry, key swapped")
                                 continue
+                            if resp.status_code == 499:
+                                wait = 1.0 * (2 ** _attempt)
+                                _debug(f"  [stream] upstream 499, retrying in {wait:.1f}s (attempt {_attempt+1})")
+                                await asyncio.sleep(wait)
+                                continue
                             err = await resp.aread()
+                            # Pause key on credit/balance errors (400)
+                            if resp.status_code == 400 and any(x in err.decode(errors='ignore') for x in ("Insufficient balance", "Monthly usage limit")):
+                                failed_key = headers.get("x-api-key", "")
+                                _key_pauser.pause_key(failed_key, _key_pauser._max_pause, f"400 credit error")
+                                alt = _find_alternative_key(failed_key)
+                                if alt:
+                                    _log(f"  400 credit error on key, retrying with alternative key")
+                                    headers = {"x-api-key": alt.get("api_key", ""), "Content-Type": "application/json",
+                                               "anthropic-version": "2023-06-01"}
+                                    continue
                             ak = _alias_for_key(headers.get("x-api-key", ""))
                             _debug(f"  [stream] error {resp.status_code}: {err[:300]}")
                             # Convert 429/401 → 503 to avoid Claude Code auth window
@@ -2830,8 +3103,8 @@ async def messages(request: Request):
                                             with _token_lock:
                                                 _token_usage[model_id]["input"] -= est_input
                                                 _token_usage[model_id]["input"] += stream_in
-                                        except Exception:
-                                            pass
+                                        except Exception as e:
+                                            _debug(f"  ✗ token rollback failed: {type(e).__name__}: {e}")
                                     stream_cache = usage.get("cache_read_input_tokens", 0)
                                     if stream_cache:
                                         try:
@@ -2869,8 +3142,12 @@ async def messages(request: Request):
                     if _attempt == 0:
                         # Try alternative key on retry
                         failed_key = _key_from_headers(headers, "anthropic")
-                        _default_pause = float(yaml_get("key_pause", "default_pause", 60))
-                        _key_pauser.pause_key(failed_key, _default_pause, "stream exception")
+                        if not _key_pauser.is_paused(failed_key):
+                            try:
+                                await _pause_key_for_quota_reset(failed_key)
+                            except Exception:
+                                _default_pause = float(yaml_get("key_pause", "default_pause", 60))
+                                _key_pauser.pause_key(failed_key, _default_pause, "stream exception")
                         alt = _find_alternative_key(failed_key)
                         if alt:
                             _debug(f"  ⟳ stream retry with alt key: alias={alt.get('alias', '?')}")
@@ -2881,8 +3158,8 @@ async def messages(request: Request):
                         try:
                             with _token_lock:
                                 _token_usage[model_id]["input"] -= est_input
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            _debug(f"  ✗ token rollback failed: {type(e).__name__}: {e}")
                     if stream_out:
                         try:
                             with _token_lock:
@@ -2927,12 +3204,28 @@ async def messages(request: Request):
         _debug(f"[messages] ✗ conversion failed: {e}")
         _log(f"  CONVERSION ERROR: anthropic_to_openai failed: {type(e).__name__}: {e}")
         return _anthropic_error(400, f"Request conversion failed: {e}")
-    headers = _get_auth_headers("openai")
+    try:
+        headers = _get_auth_headers("openai")
+    except AllKeysPausedError as e:
+        retry_after = int(e.retry_after) + 1
+        return Response(
+            content=json.dumps({"type": "error", "error": {"type": "api_error",
+                "message": f"All API keys exhausted. Retry after {retry_after}s."}}),
+            status_code=503, media_type="application/json",
+            headers={"Retry-After": str(retry_after)})
     is_stream = oai_body["stream"]
 
     if not is_stream:
+        # Try free model first if available
         try:
-            resp, headers = await _do_request_with_retry(endpoint, oai_body, headers, "openai")
+            _ak = _key_from_headers(headers, "openai")
+            free_result = await _try_free_model_first(oai_body, headers, "openai", model_id,
+                                                      api_key=_ak, workspace_id=_workspace_for_key(_ak))
+            if free_result is not None:
+                resp, headers, _actual_model = free_result
+                model_id = _actual_model
+            else:
+                resp, headers = await _do_request_with_retry(endpoint, oai_body, headers, "openai")
         except UpstreamError as e:
             _debug(f"  ✗ upstream error: {e}")
             return JSONResponse(status_code=e.status_code, content={"error": str(e)})
@@ -2943,11 +3236,30 @@ async def messages(request: Request):
                          resp.status_code, resp.text, protocol, is_stream, thinking_type,
                          effort, client_ip, account_alias, tool_names,
                          request_body=request_body, response_body={"error": resp.text[:2000]})
+            # Pause key on credit/balance errors (400)
+            if resp.status_code == 400 and any(x in resp.text for x in ("Insufficient balance", "Monthly usage limit")):
+                failed_key = _key_from_headers(headers, "openai")
+                _key_pauser.pause_key(failed_key, _key_pauser._max_pause, f"400 credit error: {resp.text[:80]}")
+                alt = _find_alternative_key(failed_key)
+                if alt:
+                    _log(f"  400 credit error on key, retrying with alternative key")
+                    headers = _get_auth_headers("openai", entry=alt)
+                    # Retry once with alt key
+                    try:
+                        resp, headers = await _do_request_with_retry(endpoint, oai_body, headers, "openai")
+                        if resp.status_code == 200:
+                            account_alias = _alias_for_key(_key_from_headers(headers, "openai"))
+                        else:
+                            return _anthropic_error(503, "All API keys exhausted. Check your billing.")
+                    except UpstreamError as e:
+                        return _anthropic_error(e.status_code, str(e))
             # Convert 429/401 → 503 to avoid Claude Code auth window
             if resp.status_code == 429:
                 return _anthropic_error(503, "All API keys exhausted (rate limited). Try again later.")
             if resp.status_code == 401:
                 return _anthropic_error(503, "All API keys exhausted (unauthorized). Check your API keys.")
+            if resp.status_code == 499:
+                return _anthropic_error(502, "Upstream disconnected (499). Retrying may help.")
             try:
                 err_data = resp.json()
                 err_msg = err_data.get("error", {})
@@ -2987,11 +3299,27 @@ async def messages(request: Request):
     msg_id = _fast_id("msg")
     oai_body["stream_options"] = {"include_usage": True}
 
-    stream_in_est = _estimate_input_tokens(body)
-    _debug(f"  [stream-oai] est_input={stream_in_est}")
-    _update_token_usage(model_id, stream_in_est, 0, 0)
-
     async def stream_gen(hdrs):
+        nonlocal endpoint, oai_body
+        # Use local variable to avoid sharing model_id across concurrent requests
+        _req_model_id = model_id
+        # Try free model for streaming
+        _paid_model_id = _req_model_id  # Save original for fallback
+        free_model = FREE_MODEL_MAP.get(_req_model_id)
+        if free_model:
+            _debug(f"  [stream-oai] attempting free model {free_model!r} first")
+            paid_endpoint = endpoint
+            paid_oai_body = dict(oai_body)
+            oai_body = dict(oai_body)
+            oai_body["model"] = free_model
+            endpoint = API_BASE_FREE
+            _req_model_id = free_model  # Log as free model
+            _using_free = True
+        else:
+            _using_free = False
+        stream_in_est = _estimate_input_tokens(body)
+        _debug(f"  [stream-oai] est_input={stream_in_est}")
+        _update_token_usage(_req_model_id, stream_in_est, 0, 0)
         started = False
         open_blocks = []
         text_block_idx = None
@@ -3007,26 +3335,34 @@ async def messages(request: Request):
             try:
                 async with _client.stream("POST", endpoint, json=oai_body, headers=hdrs) as resp:
                     if resp.status_code != 200:
+                        # Free model 429 → fall back to paid model
+                        if _using_free and resp.status_code == 429:
+                            _debug(f"  [stream-oai] free model 429 → falling back to paid {_paid_model_id!r}")
+                            _log(f"  FREE model rate limited → falling back to paid {_paid_model_id!r}")
+                            oai_body = paid_oai_body
+                            endpoint = paid_endpoint
+                            model_id = _paid_model_id
+                            _using_free = False
+                            continue
                         hdrs, should_retry = await _handle_429(hdrs, resp.status_code, _attempt, resp.headers)
                         if should_retry:
                             continue
+                        if resp.status_code == 499:
+                            wait = 1.0 * (2 ** _attempt)
+                            _debug(f"  [stream-oai] upstream 499, retrying in {wait:.1f}s (attempt {_attempt+1})")
+                            await asyncio.sleep(wait)
+                            continue
                         err = await resp.aread()
+                        # Pause key on credit/balance errors (400)
+                        if resp.status_code == 400 and any(x in err.decode(errors='ignore') for x in ("Insufficient balance", "Monthly usage limit")):
+                            failed_key = _key_from_headers(hdrs, "openai")
+                            _key_pauser.pause_key(failed_key, _key_pauser._max_pause, f"400 credit error")
+                            alt = _find_alternative_key(failed_key)
+                            if alt:
+                                _log(f"  400 credit error on key, retrying with alternative key")
+                                hdrs = _get_auth_headers("openai", entry=alt)
+                                continue
                         ak_h = _alias_for_key(_key_from_headers(hdrs, "openai"))
-                        # Convert 429/401 → 503 to avoid Claude Code auth window
-                        err_status = 503 if resp.status_code in (429, 401) else resp.status_code
-                        if resp.status_code == 429:
-                            err_msg = "All API keys exhausted (rate limited). Try again later."
-                        elif resp.status_code == 401:
-                            err_msg = "All API keys exhausted (unauthorized). Check your API keys."
-                        else:
-                            err_msg = f"HTTP {resp.status_code}: {err.decode('utf-8', errors='replace')[:200]}"
-                        error_payload = {"type": "error", "error": {"type": "api_error",
-                                       "message": err_msg}}
-                        yield await _stream_error_response(req_id, model_id, original_model, start_time,
-                                     err_status, err, protocol, thinking_type, effort,
-                                     client_ip, ak_h, tool_names, error_payload,
-                                     request_body=request_body)
-                        return
 
                     async for line in resp.aiter_lines():
                         if not line.startswith("data:"):
@@ -3052,7 +3388,7 @@ async def messages(request: Request):
                             yield _sse("message_delta", {"type": "message_delta", "delta": {"stop_reason": "tool_use" if has_tools else "end_turn"}, "usage": {"output_tokens": final_out, "cache_read_input_tokens": final_cache}})
                             yield _sse("message_stop", {"type": "message_stop"})
                             ak_h = _alias_for_key(_key_from_headers(hdrs, "openai"))
-                            await _save_and_log_request(req_id, model_id, original_model, start_time,
+                            await _save_and_log_request(req_id, _req_model_id, original_model, start_time,
                                          final_in, final_out, final_cache, protocol, True, thinking_type,
                                          effort, client_ip, ak_h, tool_names, log_tag,
                                          tools_used=used_tools if used_tools else None,
@@ -3062,6 +3398,8 @@ async def messages(request: Request):
                         try:
                             chunk = json.loads(data)
                         except Exception:
+                            continue
+                        if chunk is None:
                             continue
 
                         chunk_usage = chunk.get("usage")
@@ -3138,12 +3476,16 @@ async def messages(request: Request):
                                            "delta": {"type": "input_json_delta", "partial_json": args}})
             except Exception as e:
                 _log(f"  ERROR stream (attempt {_attempt+1}): {type(e).__name__}: {e}")
-                _debug(f"  ✗ stream exception: {type(e).__name__}: {e}")
+                _debug(f"  ✗ stream exception: {type(e).__name__}: {e}\n{traceback.format_exc()}")
                 if _attempt == 0:
                     # Try alternative key on retry (handles rate-limit disguised as disconnect)
                     failed_key = _key_from_headers(hdrs, "openai")
-                    _default_pause = float(yaml_get("key_pause", "default_pause", 60))
-                    _key_pauser.pause_key(failed_key, _default_pause, "stream exception")
+                    if not _key_pauser.is_paused(failed_key):
+                        try:
+                            await _pause_key_for_quota_reset(failed_key)
+                        except Exception:
+                            _default_pause = float(yaml_get("key_pause", "default_pause", 60))
+                            _key_pauser.pause_key(failed_key, _default_pause, "stream exception")
                     alt = _find_alternative_key(failed_key)
                     if alt:
                         _debug(f"  ⟳ stream retry with alt key: alias={alt.get('alias', '?')}")
@@ -3152,11 +3494,11 @@ async def messages(request: Request):
                     continue
                 try:
                     with _token_lock:
-                        _token_usage[model_id]["input"] -= stream_in_est
+                        _token_usage[_req_model_id]["input"] -= stream_in_est
                 except Exception:
                     pass
                 ak_h = _alias_for_key(_key_from_headers(hdrs, "openai"))
-                await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
+                await _save_request(req_id, _req_model_id, original_model, _elapsed_ms(start_time),
                              stream_in_est, stream_out_tokens, 0, success=False, error=str(e),
                              protocol=protocol, is_stream=True, thinking=thinking_type, effort=effort,
                              client_ip=client_ip, account_alias=ak_h, tools=tool_names,
@@ -3178,7 +3520,7 @@ async def messages(request: Request):
 
 
 _health_cache: tuple[float, bool] | None = None  # (timestamp, upstream_ok)
-_health_lock = threading.Lock()
+_health_lock = asyncio.Lock()
 
 @app.get("/health")
 async def health():
@@ -3202,7 +3544,7 @@ async def health():
     global _health_cache
     upstream_ok = True
     now = time.monotonic()
-    with _health_lock:
+    async with _health_lock:
         if _health_cache and (now - _health_cache[0]) < yaml_get("background", "health_cache_ttl", 15):
             upstream_ok = _health_cache[1]
             _debug(f"  [health] upstream check (cached): {'ok' if upstream_ok else 'unreachable'}")
@@ -3323,11 +3665,12 @@ async def count_tokens(request: Request):
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     req_id = _fast_id("chatcmpl")
-    start_time = time.time()
+    start_time = time.monotonic()
     client_ip = _get_client_ip(request)
     _current_user_agent.set(request.headers.get("user-agent"))
 
     body_bytes = await request.body()
+    _debug(f"  [body] read {len(body_bytes)} bytes in {(time.monotonic() - start_time) * 1000:.0f}ms")
     if len(body_bytes) > MAX_BODY_SIZE:
         _debug(f"  413: body too large ({len(body_bytes)} bytes)")
         return _openai_error(413, f"Request body too large ({len(body_bytes)} bytes, max {MAX_BODY_SIZE})")
@@ -3342,8 +3685,9 @@ async def chat_completions(request: Request):
     tool_names = _extract_tool_names(body)
     request_body = body  # Capture original request before mutation
     _debug(f"[chat] req_id={req_id} model={original_model!r} tools={tool_names} ip={client_ip}")
-    _debug(f"[chat] headers={_sanitize_headers(dict(request.headers))}")
-    _debug(f"[chat] body=\n{_truncate(body)}")
+    if DEBUG:
+        _debug(f"[chat] headers={_sanitize_headers(dict(request.headers))}")
+        _debug(f"[chat] body=\n{_truncate(body)}")
     route = _route_for(original_model, tool_names)
     if route is None:
         _debug(f"[chat] ✗ no route found for {original_model!r}")
@@ -3384,11 +3728,27 @@ async def chat_completions(request: Request):
 
     # ── OpenAI passthrough ─────────────────────────────────────
     if protocol == "openai":
-        headers = _get_auth_headers("openai")
+        try:
+            headers = _get_auth_headers("openai")
+        except AllKeysPausedError as e:
+            retry_after = int(e.retry_after) + 1
+            return Response(
+                content=json.dumps({"error": {"message": f"All API keys exhausted. Retry after {retry_after}s.",
+                    "type": "api_error", "code": "503"}}),
+                status_code=503, media_type="application/json",
+                headers={"Retry-After": str(retry_after)})
 
         if not is_stream:
+            # Try free model first if available
             try:
-                resp, headers = await _do_request_with_retry(endpoint, body, headers, "openai")
+                _ak = _key_from_headers(headers, "openai")
+                free_result = await _try_free_model_first(body, headers, "openai", model_id,
+                                                          api_key=_ak, workspace_id=_workspace_for_key(_ak))
+                if free_result is not None:
+                    resp, headers, _actual_model = free_result
+                    model_id = _actual_model
+                else:
+                    resp, headers = await _do_request_with_retry(endpoint, body, headers, "openai")
             except UpstreamError as e:
                 return JSONResponse(status_code=e.status_code, content={"error": str(e)})
             account_alias = _alias_for_key(_key_from_headers(headers, "openai"))
@@ -3397,6 +3757,22 @@ async def chat_completions(request: Request):
                              resp.status_code, resp.text, protocol, is_stream, thinking_type,
                              effort, client_ip, account_alias, tool_names,
                              request_body=request_body, response_body={"error": resp.text[:2000]})
+                # Pause key on credit/balance errors (400) and retry with alt key
+                if resp.status_code == 400 and any(x in resp.text for x in ("Insufficient balance", "Monthly usage limit")):
+                    failed_key = _key_from_headers(headers, "openai")
+                    _key_pauser.pause_key(failed_key, _key_pauser._max_pause, f"400 credit error: {resp.text[:80]}")
+                    alt = _find_alternative_key(failed_key)
+                    if alt:
+                        _log(f"  400 credit error on key, retrying with alternative key")
+                        headers = _get_auth_headers("openai", entry=alt)
+                        try:
+                            resp, headers = await _do_request_with_retry(endpoint, body, headers, "openai")
+                            if resp.status_code == 200:
+                                account_alias = _alias_for_key(_key_from_headers(headers, "openai"))
+                            else:
+                                return _openai_error(503, "All API keys exhausted. Check your billing.")
+                        except UpstreamError as e:
+                            return JSONResponse(status_code=e.status_code, content={"error": str(e)})
                 return Response(content=resp.content, status_code=resp.status_code, media_type="application/json")
             try:
                 data = resp.json()
@@ -3421,11 +3797,26 @@ async def chat_completions(request: Request):
         oai_body = dict(body)
         oai_body["stream_options"] = {"include_usage": True}
 
-        est_input = _estimate_input_tokens(body)
-        _update_token_usage(model_id, est_input, 0, 0)
-        _debug(f"  [chat-stream] est_input={est_input}")
-
         async def openai_stream(hdrs):
+            nonlocal endpoint, oai_body, model_id
+            # Try free model for streaming: swap endpoint/model before starting stream
+            free_model = FREE_MODEL_MAP.get(model_id)
+            if free_model:
+                _debug(f"  [chat-stream] attempting free model {free_model!r} first")
+                # Save paid config
+                paid_endpoint = endpoint
+                paid_oai_body = dict(oai_body)
+                # Swap to free
+                oai_body = dict(oai_body)
+                oai_body["model"] = free_model
+                endpoint = API_BASE_FREE
+                _using_free = True
+                model_id = free_model  # Log as free model
+            else:
+                _using_free = False
+            est_input = _estimate_input_tokens(body)
+            _update_token_usage(model_id, est_input, 0, 0)
+            _debug(f"  [chat-stream] est_input={est_input}")
             stream_out = 0
             actual_usage = None
             _handle_429 = _make_stream_retry_loop("openai")
@@ -3435,15 +3826,33 @@ async def chat_completions(request: Request):
                 try:
                     async with _client.stream("POST", endpoint, json=oai_body, headers=hdrs) as resp:
                         if resp.status_code != 200:
+                            # Free model 429 → fall back to paid model
+                            if _using_free and resp.status_code == 429:
+                                _debug(f"  [chat-stream] free model 429 → falling back to paid {model_id!r}")
+                                _log(f"  FREE model rate limited → falling back to paid {model_id!r}")
+                                oai_body = paid_oai_body
+                                endpoint = paid_endpoint
+                                _using_free = False
+                                continue
                             hdrs, should_retry = await _handle_429(hdrs, resp.status_code, _attempt, resp.headers)
                             if should_retry:
                                 continue
+                            if resp.status_code == 499:
+                                wait = 1.0 * (2 ** _attempt)
+                                _debug(f"  [chat-stream] upstream 499, retrying in {wait:.1f}s (attempt {_attempt+1})")
+                                await asyncio.sleep(wait)
+                                continue
                             err = await resp.aread()
+                            # Pause key on credit/balance errors (400)
+                            if resp.status_code == 400 and any(x in err.decode(errors='ignore') for x in ("Insufficient balance", "Monthly usage limit")):
+                                failed_key = _key_from_headers(hdrs, "openai")
+                                _key_pauser.pause_key(failed_key, _key_pauser._max_pause, f"400 credit error")
+                                alt = _find_alternative_key(failed_key)
+                                if alt:
+                                    _log(f"  400 credit error on key, retrying with alternative key")
+                                    hdrs = _get_auth_headers("openai", entry=alt)
+                                    continue
                             ak_h = _alias_for_key(_key_from_headers(hdrs, "openai"))
-                            await _log_and_save_error(req_id, model_id, original_model, start_time,
-                                         resp.status_code, err, protocol, True, thinking_type,
-                                         effort, client_ip, ak_h, tool_names,
-                                         request_body=request_body, response_body={"error": str(err)[:2000]})
                             # Convert 429/401 → 503 to avoid Claude Code auth window
                             err_status = 503 if resp.status_code in (429, 401) else resp.status_code
                             if resp.status_code == 429:
@@ -3465,6 +3874,9 @@ async def chat_completions(request: Request):
                             try:
                                 chunk = json.loads(data_str)
                             except Exception:
+                                yield line.encode() + b"\n\n"
+                                continue
+                            if chunk is None:
                                 yield line.encode() + b"\n\n"
                                 continue
                             chunk_usage = chunk.get("usage")
@@ -3500,12 +3912,16 @@ async def chat_completions(request: Request):
                                      request_body=request_body)
                 except Exception as e:
                     _log(f"  ERROR stream (attempt {_attempt+1}): {type(e).__name__}: {e}")
-                    _debug(f"  ✗ stream exception: {type(e).__name__}: {e}")
+                    _debug(f"  ✗ stream exception: {type(e).__name__}: {e}\n{traceback.format_exc()}")
                     if _attempt == 0:
                         # Try alternative key on retry
                         failed_key = _key_from_headers(hdrs, "openai")
-                        _default_pause = float(yaml_get("key_pause", "default_pause", 60))
-                        _key_pauser.pause_key(failed_key, _default_pause, "stream exception")
+                        if not _key_pauser.is_paused(failed_key):
+                            try:
+                                await _pause_key_for_quota_reset(failed_key)
+                            except Exception:
+                                _default_pause = float(yaml_get("key_pause", "default_pause", 60))
+                                _key_pauser.pause_key(failed_key, _default_pause, "stream exception")
                         alt = _find_alternative_key(failed_key)
                         if alt:
                             _debug(f"  ⟳ stream retry with alt key: alias={alt.get('alias', '?')}")
@@ -3515,8 +3931,8 @@ async def chat_completions(request: Request):
                     try:
                         with _token_lock:
                             _token_usage[model_id]["input"] -= est_input
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        _debug(f"  ✗ token rollback failed: {type(e).__name__}: {e}")
                     ak_h = _alias_for_key(_key_from_headers(hdrs, "openai"))
                     await _log_and_save_error(req_id, model_id, original_model, start_time,
                                  0, str(e), protocol, True, thinking_type,
@@ -3549,11 +3965,27 @@ async def chat_completions(request: Request):
     effort = (anthro_body.get("effort")
               or (thinking.get("effort") if isinstance(thinking, dict) else None)
               or "none")
-    a_headers = _get_auth_headers("anthropic")
+    try:
+        a_headers = _get_auth_headers("anthropic")
+    except AllKeysPausedError as e:
+        retry_after = int(e.retry_after) + 1
+        return Response(
+            content=json.dumps({"error": {"message": f"All API keys exhausted. Retry after {retry_after}s.",
+                "type": "api_error"}}),
+            status_code=503, media_type="application/json",
+            headers={"Retry-After": str(retry_after)})
 
     if not is_stream:
+        # Try free model first if available
         try:
-            resp, a_headers = await _do_request_with_retry(endpoint, anthro_body, a_headers, "anthropic")
+            _ak = a_headers.get("x-api-key", "")
+            free_result = await _try_free_model_first(anthro_body, a_headers, "anthropic", model_id,
+                                                      api_key=_ak, workspace_id=_workspace_for_key(_ak))
+            if free_result is not None:
+                resp, a_headers, _actual_model = free_result
+                model_id = _actual_model
+            else:
+                resp, a_headers = await _do_request_with_retry(endpoint, anthro_body, a_headers, "anthropic")
         except UpstreamError as e:
             return JSONResponse(status_code=e.status_code, content={"error": str(e)})
         account_alias = _alias_for_key(a_headers.get("x-api-key", ""))
@@ -3622,6 +4054,22 @@ async def chat_completions(request: Request):
                         hdrs, should_retry = await _handle_429(hdrs, resp.status_code, _attempt, resp.headers)
                         if should_retry:
                             continue
+                        if resp.status_code == 499:
+                            wait = 1.0 * (2 ** _attempt)
+                            _debug(f"  [anthro-to-oai-stream] upstream 499, retrying in {wait:.1f}s (attempt {_attempt+1})")
+                            await asyncio.sleep(wait)
+                            continue
+                        err = await resp.aread()
+                        # Pause key on credit/balance errors (400)
+                        if resp.status_code == 400 and any(x in err.decode(errors='ignore') for x in ("Insufficient balance", "Monthly usage limit")):
+                            failed_key = hdrs.get("x-api-key", "")
+                            _key_pauser.pause_key(failed_key, _key_pauser._max_pause, f"400 credit error")
+                            alt = _find_alternative_key(failed_key)
+                            if alt:
+                                _log(f"  400 credit error on key, retrying with alternative key")
+                                hdrs = {"x-api-key": alt.get("api_key", ""), "Content-Type": "application/json",
+                                       "anthropic-version": "2023-06-01"}
+                                continue
                         ak = _alias_for_key(hdrs.get("x-api-key", ""))
                         await _log_and_save_error(req_id, model_id, original_model, start_time,
                                      resp.status_code, str(resp.status_code), protocol, True, thinking_type,
@@ -3757,12 +4205,16 @@ async def chat_completions(request: Request):
                                 return
             except Exception as e:
                 _log(f"  ERROR stream (attempt {_attempt+1}): {type(e).__name__}: {e}")
-                _debug(f"  ✗ stream exception: {type(e).__name__}: {e}")
+                _debug(f"  ✗ stream exception: {type(e).__name__}: {e}\n{traceback.format_exc()}")
                 if _attempt == 0:
                     # Try alternative key on retry
                     failed_key = _key_from_headers(hdrs, "anthropic")
-                    _default_pause = float(yaml_get("key_pause", "default_pause", 60))
-                    _key_pauser.pause_key(failed_key, _default_pause, "stream exception")
+                    if not _key_pauser.is_paused(failed_key):
+                        try:
+                            await _pause_key_for_quota_reset(failed_key)
+                        except Exception:
+                            _default_pause = float(yaml_get("key_pause", "default_pause", 60))
+                            _key_pauser.pause_key(failed_key, _default_pause, "stream exception")
                     alt = _find_alternative_key(failed_key)
                     if alt:
                         _debug(f"  ⟳ stream retry with alt key: alias={alt.get('alias', '?')}")
@@ -3797,11 +4249,12 @@ async def chat_completions(request: Request):
 @app.post("/v1/responses")
 async def responses(request: Request):
     req_id = _fast_id("resp")
-    start_time = time.time()
+    start_time = time.monotonic()
     client_ip = _get_client_ip(request)
     _current_user_agent.set(request.headers.get("user-agent"))
 
     body_bytes = await request.body()
+    _debug(f"  [body] read {len(body_bytes)} bytes in {(time.monotonic() - start_time) * 1000:.0f}ms")
     if len(body_bytes) > MAX_BODY_SIZE:
         _debug(f"  413: body too large ({len(body_bytes)} bytes)")
         return _openai_error(413, f"Request body too large ({len(body_bytes)} bytes, max {MAX_BODY_SIZE})")
@@ -3865,10 +4318,26 @@ async def responses(request: Request):
 
     # ── Anthropic backend (passthrough) ─────────────────────
     if protocol == "anthropic":
-        a_headers = _get_auth_headers("anthropic")
+        try:
+            a_headers = _get_auth_headers("anthropic")
+        except AllKeysPausedError as e:
+            retry_after = int(e.retry_after) + 1
+            return Response(
+                content=json.dumps({"error": {"message": f"All API keys exhausted. Retry after {retry_after}s.",
+                    "type": "api_error"}}),
+                status_code=503, media_type="application/json",
+                headers={"Retry-After": str(retry_after)})
         if not is_stream:
+            # Try free model first if available
             try:
-                resp, a_headers = await _do_request_with_retry(endpoint, anthro_body, a_headers, "anthropic")
+                _ak = a_headers.get("x-api-key", "")
+                free_result = await _try_free_model_first(anthro_body, a_headers, "anthropic", model_id,
+                                                          api_key=_ak, workspace_id=_workspace_for_key(_ak))
+                if free_result is not None:
+                    resp, a_headers, _actual_model = free_result
+                    model_id = _actual_model
+                else:
+                    resp, a_headers = await _do_request_with_retry(endpoint, anthro_body, a_headers, "anthropic")
             except UpstreamError as e:
                 return JSONResponse(status_code=e.status_code, content={"error": str(e)})
             account_alias = _alias_for_key(a_headers.get("x-api-key", ""))
@@ -3877,6 +4346,23 @@ async def responses(request: Request):
                              resp.status_code, resp.text, protocol, is_stream, thinking_type,
                              effort, client_ip, account_alias, tool_names,
                              request_body=request_body, response_body={"error": resp.text[:2000]})
+                # Pause key on credit/balance errors (400) and retry with alt key
+                if resp.status_code == 400 and any(x in resp.text for x in ("Insufficient balance", "Monthly usage limit")):
+                    failed_key = a_headers.get("x-api-key", "")
+                    _key_pauser.pause_key(failed_key, _key_pauser._max_pause, f"400 credit error: {resp.text[:80]}")
+                    alt = _find_alternative_key(failed_key)
+                    if alt:
+                        _log(f"  400 credit error on key, retrying with alternative key")
+                        a_headers = {"x-api-key": alt.get("api_key", ""), "Content-Type": "application/json",
+                                     "anthropic-version": "2023-06-01"}
+                        try:
+                            resp, a_headers = await _do_request_with_retry(endpoint, anthro_body, a_headers, "anthropic")
+                            if resp.status_code == 200:
+                                account_alias = _alias_for_key(a_headers.get("x-api-key", ""))
+                            else:
+                                return Response(content=json.dumps({"error": {"message": "All API keys exhausted. Check your billing."}}), status_code=503, media_type="application/json")
+                        except UpstreamError as e:
+                            return JSONResponse(status_code=e.status_code, content={"error": str(e)})
                 try:
                     err_data = resp.json()
                     err_msg = err_data.get("error", {}).get("message", resp.text[:200])
@@ -3903,8 +4389,16 @@ async def responses(request: Request):
             return Response(content=json.dumps(oai_resp, ensure_ascii=False), media_type="application/json")
         # Anthropic streaming → collect, then emit SSE
         anthro_body["stream"] = False
+        # Try free model first if available
         try:
-            resp, a_headers = await _do_request_with_retry(endpoint, anthro_body, a_headers, "anthropic")
+            _ak = a_headers.get("x-api-key", "")
+            free_result = await _try_free_model_first(anthro_body, a_headers, "anthropic", model_id,
+                                                      api_key=_ak, workspace_id=_workspace_for_key(_ak))
+            if free_result is not None:
+                resp, a_headers, _actual_model = free_result
+                model_id = _actual_model
+            else:
+                resp, a_headers = await _do_request_with_retry(endpoint, anthro_body, a_headers, "anthropic")
         except UpstreamError as e:
             return JSONResponse(status_code=e.status_code, content={"error": str(e)})
         account_alias = _alias_for_key(a_headers.get("x-api-key", ""))
@@ -3947,12 +4441,28 @@ async def responses(request: Request):
         _debug(f"[responses] ✗ conversion failed: {e}")
         _log(f"  CONVERSION ERROR: anthropic_to_openai failed: {type(e).__name__}: {e}")
         return _openai_error(400, f"Request conversion failed: {e}")
-    headers = _get_auth_headers("openai")
+    try:
+        headers = _get_auth_headers("openai")
+    except AllKeysPausedError as e:
+        retry_after = int(e.retry_after) + 1
+        return Response(
+            content=json.dumps({"error": {"message": f"All API keys exhausted. Retry after {retry_after}s.",
+                "type": "api_error", "code": "503"}}),
+            status_code=503, media_type="application/json",
+            headers={"Retry-After": str(retry_after)})
     is_stream = oai_body["stream"]
 
     if not is_stream:
+        # Try free model first if available
         try:
-            resp, headers = await _do_request_with_retry(endpoint, oai_body, headers, "openai")
+            _ak = _key_from_headers(headers, "openai")
+            free_result = await _try_free_model_first(oai_body, headers, "openai", model_id,
+                                                      api_key=_ak, workspace_id=_workspace_for_key(_ak))
+            if free_result is not None:
+                resp, headers, _actual_model = free_result
+                model_id = _actual_model
+            else:
+                resp, headers = await _do_request_with_retry(endpoint, oai_body, headers, "openai")
         except UpstreamError as e:
             return JSONResponse(status_code=e.status_code, content={"error": str(e)})
         account_alias = _alias_for_key(_key_from_headers(headers, "openai"))
@@ -3989,8 +4499,16 @@ async def responses(request: Request):
 
     # ── Streaming (OpenAI backend) — collect, then emit SSE ──
     oai_body["stream"] = False
+    # Try free model first if available
     try:
-        resp, headers = await _do_request_with_retry(endpoint, oai_body, headers, "openai")
+        _ak = _key_from_headers(headers, "openai")
+        free_result = await _try_free_model_first(oai_body, headers, "openai", model_id,
+                                                  api_key=_ak, workspace_id=_workspace_for_key(_ak))
+        if free_result is not None:
+            resp, headers, _actual_model = free_result
+            model_id = _actual_model
+        else:
+            resp, headers = await _do_request_with_retry(endpoint, oai_body, headers, "openai")
     except UpstreamError as e:
         return JSONResponse(status_code=e.status_code, content={"error": str(e)})
     account_alias = _alias_for_key(_key_from_headers(headers, "openai"))
