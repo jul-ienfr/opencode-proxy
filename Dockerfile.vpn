@@ -1,0 +1,10 @@
+FROM alpine:3.19
+
+RUN apk add --no-cache openvpn tinyproxy curl bash
+
+COPY vpn/ /vpn/
+RUN chmod +x /vpn/entrypoint.sh
+
+EXPOSE 8888
+
+CMD ["/vpn/entrypoint.sh"]

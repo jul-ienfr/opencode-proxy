@@ -2,7 +2,7 @@
 Free IP pool for rotating IP addresses on free model requests.
 
 Each VPN session gives a fresh IP = fresh free model quota.
-This module manages the rotation and tracks usage per IP.
+Uses tinyproxy (HTTP) via WSL2 or Docker for routing requests through the VPN tunnel.
 """
 
 import time
@@ -18,8 +18,8 @@ logger = logging.getLogger(__name__)
 class FreeIPPool:
     """Manages IP rotation for free model requests.
 
-    When the free model quota for the current IP is exhausted (429),
-    the pool switches to the next VPN server for a fresh IP.
+    Routes free model requests through a local HTTP proxy (tinyproxy)
+    that tunnels traffic via OpenVPN in WSL2 or Docker.
     """
 
     def __init__(self, vpn_manager: VPNManager, quota_per_ip: int = 300):
@@ -28,12 +28,18 @@ class FreeIPPool:
         self._request_count = 0
         self._session_start: Optional[float] = None
         self._total_free_requests = 0
-        this_ip_history: list[dict] = []
-        self._ip_stats: dict[str, dict] = {}  # ip -> {requests, start, end}
+        self._ip_stats: dict[str, dict] = {}
 
     @property
     def enabled(self) -> bool:
         return self._vpn.enabled
+
+    @property
+    def proxy_url(self) -> Optional[str]:
+        """Return the HTTP proxy URL for routing through VPN."""
+        if self._vpn.enabled and self._vpn.status == "connected":
+            return self._vpn.proxy_url
+        return None
 
     async def ensure_connected(self):
         """Ensure VPN is connected. Connect to first server if not."""
@@ -44,14 +50,14 @@ class FreeIPPool:
             self._request_count = 0
             self._session_start = time.monotonic()
 
-    async def on_request(self) -> bool:
+    async def on_request(self) -> Optional[str]:
         """Called before each free model request.
 
-        Returns True if VPN is ready, False if VPN is disabled.
+        Returns the HTTP proxy URL if VPN is ready, None if disabled.
         May switch IP if quota is exhausted.
         """
         if not self._vpn.enabled:
-            return False
+            return None
 
         await self.ensure_connected()
 
@@ -74,13 +80,10 @@ class FreeIPPool:
                         self._request_count, self._quota_per_ip)
             await self.switch_ip()
 
-        return True
+        return self.proxy_url
 
     async def on_quota_exhausted(self):
-        """Called when free model returns 429 (quota exhausted).
-
-        Immediately switches to next IP.
-        """
+        """Called when free model returns 429 (quota exhausted)."""
         if not self._vpn.enabled:
             return
 
