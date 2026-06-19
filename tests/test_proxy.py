@@ -36,6 +36,7 @@ from opencode import (
     RATE_LIMIT_RPS,
     RATE_LIMIT_BURST,
 )
+from config.settings import _resolve_protocol, KNOWN_PROTOCOLS
 
 
 # ── Protocol Conversions ────────────────────────────────────────
@@ -841,3 +842,63 @@ class TestFilterToolsForModel:
         result = _filter_tools_for_model(body, "test-model")
         # Whitelist wins: only Read kept
         assert result == ["Read"]
+
+
+# ── Protocol Resolution ──────────────────────────────────────────
+
+class TestResolveProtocol:
+    """Test _resolve_protocol() maps model IDs to correct protocols."""
+
+    def test_glm_is_openai(self):
+        assert _resolve_protocol("glm-5.2") == "openai"
+
+    def test_glm51_is_openai(self):
+        assert _resolve_protocol("glm-5.1") == "openai"
+
+    def test_kimi_is_openai(self):
+        assert _resolve_protocol("kimi-k2.7") == "openai"
+
+    def test_kimi25_is_openai(self):
+        assert _resolve_protocol("kimi-k2.5") == "openai"
+
+    def test_deepseek_is_openai(self):
+        assert _resolve_protocol("deepseek-v4-pro") == "openai"
+
+    def test_deepseek_flash_is_openai(self):
+        assert _resolve_protocol("deepseek-v4-flash") == "openai"
+
+    def test_mimo_is_openai(self):
+        assert _resolve_protocol("mimo-v2.5") == "openai"
+
+    def test_mimo_pro_is_openai(self):
+        assert _resolve_protocol("mimo-v2-pro") == "openai"
+
+    def test_minimax_is_anthropic(self):
+        assert _resolve_protocol("minimax-m2.5") == "anthropic"
+
+    def test_minimax_m3_is_anthropic(self):
+        assert _resolve_protocol("minimax-m3") == "anthropic"
+
+    def test_qwen_is_anthropic(self):
+        assert _resolve_protocol("qwen3.7-plus") == "anthropic"
+
+    def test_qwen_max_is_anthropic(self):
+        assert _resolve_protocol("qwen3.7-max") == "anthropic"
+
+    def test_unknown_falls_back_to_openai(self):
+        assert _resolve_protocol("totally-unknown-xyz") == "openai"
+
+    def test_single_word_model(self):
+        # Model without hyphen: prefix = full name
+        assert _resolve_protocol("gemma3") == "openai"
+
+    def test_known_protocols_has_all_families(self):
+        """Verify all expected families are in the registry."""
+        expected_openai = {"glm", "kimi", "deepseek", "mimo"}
+        expected_anthropic = {"minimax", "qwen"}
+        assert expected_openai.issubset(set(
+            k for k, v in KNOWN_PROTOCOLS.items() if v == "openai"
+        ))
+        assert expected_anthropic.issubset(set(
+            k for k, v in KNOWN_PROTOCOLS.items() if v == "anthropic"
+        ))

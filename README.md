@@ -78,6 +78,37 @@ Server starts:
 - **API**: http://localhost:4000
 - **Web Dashboard**: http://localhost:8082
 
+## VPN & IP Rotation (Free Model Quota)
+
+The proxy can rotate IP addresses via OpenVPN to multiply free model quotas.
+
+### Setup
+
+1. Install OpenVPN (included in Docker image, or `apt install openvpn` on Linux)
+2. Download NordVPN `.ovpn` configs from https://nordvpn.com/servers/tools/
+3. Configure in dashboard (VPN & IP tab) or in `config.yaml`:
+
+```yaml
+ip_rotation:
+  enabled: true
+  openvpn:
+    servers:
+      - name: NordVPN-FR
+        config: /path/to/fr.nordvpn.com.udp.ovpn
+    auth_file: /path/to/credentials.txt
+    protocol: udp
+  quota_per_ip: 300
+```
+
+4. Save NordVPN credentials in the dashboard (VPN & IP → Credentials)
+
+### How it works
+
+- Free model requests go through OpenVPN tunnel (different IP = different quota)
+- Paid model requests go through direct IP (no VPN)
+- When quota is exhausted (~300 requests), proxy auto-switches to next VPN server
+- TLS fingerprint imitates Chrome via `curl_cffi` (anti-detection)
+
 ### GUI Mode
 
 ```bash

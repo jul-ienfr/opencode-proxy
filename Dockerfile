@@ -2,9 +2,10 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# System deps for httpx/uvicorn
+# System deps: ca-certificates + OpenVPN for IP rotation
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
+    openvpn \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python dependencies from requirements.txt (respects version pins)
@@ -13,7 +14,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Non-root user for security
 RUN groupadd -r opencode && useradd -r -g opencode -d /app -s /sbin/nologin opencode \
-    && mkdir -p /app/logs && chown -R opencode:opencode /app
+    && mkdir -p /app/logs /app/vpn_configs && chown -R opencode:opencode /app
 
 COPY --chown=opencode:opencode . .
 

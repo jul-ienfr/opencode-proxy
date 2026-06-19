@@ -816,6 +816,193 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
             "recent": timeline[:100],
         }
 
+    # ── VPN / IP rotation endpoints ──
+
+    @app.get("/api/vpn-status")
+    async def get_vpn_status():
+        """Get current VPN status, IP, server, and usage stats."""
+        import shared_state
+        if shared_state.vpn_manager and shared_state.free_ip_pool:
+            return shared_state.free_ip_pool.get_status()
+        return {"enabled": False, "status": "not_configured"}
+
+    @app.get("/api/vpn-config")
+    async def get_vpn_config():
+        """Get current VPN configuration."""
+        import shared_state
+        if shared_state.vpn_manager:
+            return shared_state.vpn_manager.get_config()
+        return {"enabled": False, "servers": [], "auth_file": "", "protocol": "udp"}
+
+    @app.post("/api/vpn-config")
+    async def update_vpn_config(request: Request):
+        """Update VPN configuration."""
+        import shared_state
+        import os
+        body = await request.json()
+
+        # Handle credentials - always save to file (no VPN manager needed)
+        if "credentials" in body:
+            creds = body.pop("credentials")
+            username = creds.get("username", "")
+            password = creds.get("password", "")
+            if username and password:
+                configs_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "vpn_configs")
+                os.makedirs(configs_dir, exist_ok=True)
+                cred_path = os.path.join(configs_dir, "credentials.txt")
+                with open(cred_path, "w", newline='\n') as f:
+                    f.write(f"{username}\n{password}\n")
+                try:
+                    os.chmod(cred_path, 0o600)
+                except Exception:
+                    pass
+                if shared_state.vpn_manager:
+                    shared_state.vpn_manager._auth_file = cred_path
+
+        # Handle other operations (need VPN manager)
+        if shared_state.vpn_manager:
+            if "add_server" in body:
+                srv = body.pop("add_server")
+                shared_state.vpn_manager.add_server(srv["name"], srv["config"])
+            if "remove_server" in body:
+                shared_state.vpn_manager.remove_server(body.pop("remove_server"))
+            if body:
+                shared_state.vpn_manager.update_config(body)
+
+        config = shared_state.vpn_manager.get_config() if shared_state.vpn_manager else {}
+        return {"ok": True, "config": config}
+
+    @app.post("/api/vpn/toggle")
+    async def toggle_vpn(request: Request):
+        """Enable or disable VPN rotation."""
+        import shared_state
+        body = await request.json()
+        enabled = body.get("enabled", True)
+        if shared_state.vpn_manager:
+            shared_state.vpn_manager.enabled = enabled
+            if shared_state.free_ip_pool:
+                shared_state.free_ip_pool._vpn = shared_state.vpn_manager
+            return {"ok": True, "enabled": enabled}
+        return {"error": "VPN manager not initialized"}
+
+    @app.post("/api/vpn/connect")
+    async def connect_vpn():
+        """Force VPN connection to next server."""
+        import shared_state
+        if not shared_state.vpn_manager:
+            return {"error": "VPN manager not initialized"}
+        try:
+            ip = await shared_state.vpn_manager.connect_next()
+            return {"ok": True, "ip": ip, "server": shared_state.vpn_manager.current_server}
+        except Exception as e:
+            return {"error": str(e)}
+
+    @app.post("/api/vpn/disconnect")
+    async def disconnect_vpn():
+        """Disconnect VPN."""
+        import shared_state
+        if not shared_state.vpn_manager:
+            return {"error": "VPN manager not initialized"}
+        await shared_state.vpn_manager.disconnect()
+        return {"ok": True}
+
+    @app.post("/api/vpn/next")
+    async def next_vpn():
+        """Switch to next VPN server."""
+        import shared_state
+        if not shared_state.vpn_manager:
+            return {"error": "VPN manager not initialized"}
+        try:
+            if shared_state.free_ip_pool:
+                await shared_state.free_ip_pool.switch_ip()
+            else:
+                await shared_state.vpn_manager.connect_next()
+            return {"ok": True, "ip": shared_state.vpn_manager.current_ip, "server": shared_state.vpn_manager.current_server}
+        except Exception as e:
+            return {"error": str(e)}
+
+    @app.post("/api/vpn/upload-config")
+    async def upload_vpn_config(request: Request):
+        """Upload an OpenVPN .ovpn config file."""
+        import shared_state
+        import os
+        import uuid
+
+        form = await request.form()
+        name = form.get("name", "")
+        file = form.get("config")
+
+        if not name:
+            return {"error": "Server name required"}
+        if not file:
+            return {"error": "Config file required"}
+
+        # Save to configs directory
+        configs_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "vpn_configs")
+        os.makedirs(configs_dir, exist_ok=True)
+
+        # Save the file
+        file_path = os.path.join(configs_dir, f"{name}.ovpn")
+        content = await file.read()
+        with open(file_path, "wb") as f:
+            f.write(content)
+
+        # Add to VPN manager
+        if shared_state.vpn_manager:
+            shared_state.vpn_manager.add_server(name, file_path)
+
+        return {"ok": True, "path": file_path, "name": name}
+
+    @app.get("/api/vpn/credentials")
+    async def get_vpn_credentials():
+        """Check if VPN credentials exist (does not return actual values)."""
+        import os
+        configs_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "vpn_configs")
+        cred_path = os.path.join(configs_dir, "credentials.txt")
+        exists = os.path.exists(cred_path) and os.path.getsize(cred_path) > 0
+        username_saved = ""
+        if exists:
+            try:
+                with open(cred_path, "r") as f:
+                    lines = f.read().strip().split("\n")
+                    if lines:
+                        username_saved = lines[0]
+            except Exception:
+                pass
+        return {"exists": exists, "username_preview": username_saved[:4] + "****" if username_saved else ""}
+
+    @app.post("/api/vpn/credentials")
+    async def save_vpn_credentials(request: Request):
+        """Save NordVPN credentials."""
+        import shared_state
+        body = await request.json()
+        username = body.get("username", "")
+        password = body.get("password", "")
+
+        if not username or not password:
+            return {"error": "Username and password required"}
+
+        # Save to credentials file
+        import os
+        configs_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "vpn_configs")
+        os.makedirs(configs_dir, exist_ok=True)
+        cred_path = os.path.join(configs_dir, "credentials.txt")
+
+        with open(cred_path, "w") as f:
+            f.write(f"{username}\n{password}\n")
+
+        # Make readable only by owner
+        try:
+            os.chmod(cred_path, 0o600)
+        except Exception:
+            pass
+
+        # Update VPN manager
+        if shared_state.vpn_manager:
+            shared_state.vpn_manager._auth_file = cred_path
+
+        return {"ok": True}
+
     @app.get("/api/tools")
     async def get_tools(days: int = 7, all: bool = False):
         """Aggregate tool names from recent requests.
