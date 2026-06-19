@@ -1199,7 +1199,7 @@ function renderHistory(data) {
             toolsHtml = `<span title="${escHtml(log.tools.join(', '))}"><span class="tool-badge declared">${log.tools.length} declared</span></span>`;
         }
         html += `<tr class="detail-row" data-req-id="${escHtml(log.id)}">
-            <td>${escHtml(log.account_alias) || '-'}</td>
+            <td>${log.is_free_model ? '<span title="Modèle gratuit — pas de compte utilisé" style="color:var(--success);font-weight:bold">' + escHtml(log.free_ip || 'GRATUIT') + '</span>' : escHtml(log.account_alias) || '-'}</td>
             <td>${formatDateTime(log.timestamp)}</td>
             <td>${escHtml(log.original_model) || '-'}</td>
             <td>${escHtml(log.model) || '-'}</td>
@@ -2476,6 +2476,12 @@ document.addEventListener('DOMContentLoaded', () => {
             const cfgResp = await fetch('/api/vpn-config');
             const cfgData = await cfgResp.json();
             renderServerList(cfgData.servers || []);
+            // Initialize config fields
+            if (cfgData.mode) document.getElementById('vpn-mode').value = cfgData.mode;
+            if (cfgData.proxy_port) document.getElementById('vpn-proxy-port').value = cfgData.proxy_port;
+            if (cfgData.switch_delay) document.getElementById('vpn-switch-delay').value = cfgData.switch_delay;
+            if (cfgData.docker_image) document.getElementById('vpn-docker-image').value = cfgData.docker_image;
+            vpnInitConfig(cfgData.mode);
         } catch (e) {}
     }
 
@@ -2555,6 +2561,30 @@ document.addEventListener('DOMContentLoaded', () => {
         if (data.error) alert('Erreur: ' + data.error);
         refreshVPNStatus();
     };
+
+    window.vpnSaveConfig = async function() {
+        const mode = document.getElementById('vpn-mode').value;
+        const proxyPort = parseInt(document.getElementById('vpn-proxy-port').value) || 8888;
+        const switchDelay = parseInt(document.getElementById('vpn-switch-delay').value) || 5;
+        const quotaPerIp = parseInt(document.getElementById('vpn-quota-per-ip').value) || 300;
+        const dockerImage = document.getElementById('vpn-docker-image')?.value || 'openvpn-nordvpn';
+
+        await fetch('/api/vpn-config', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ mode, proxy_port: proxyPort, switch_delay: switchDelay, quota_per_ip: quotaPerIp, docker_image: dockerImage })
+        });
+
+        // Show/hide Docker options
+        document.getElementById('vpn-docker-row').style.display = mode === 'docker' ? 'flex' : 'none';
+        document.getElementById('vpn-mode-hint').textContent = mode === 'docker' ? 'Docker (reproductible, isolé)' : 'WSL2 (léger, déjà installé)';
+    };
+
+    // Initialize mode selector from config
+    function vpnInitConfig(mode) {
+        document.getElementById('vpn-mode').value = mode || 'wsl2';
+        document.getElementById('vpn-docker-row').style.display = (mode === 'docker') ? 'flex' : 'none';
+        document.getElementById('vpn-mode-hint').textContent = mode === 'docker' ? 'Docker (reproductible, isolé)' : 'WSL2 (léger, déjà installé)';
+    }
 
     window.vpnDisconnect = async function() {
         await fetch('/api/vpn/disconnect', { method: 'POST' });

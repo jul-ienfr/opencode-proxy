@@ -70,16 +70,20 @@ free_model_map:
   mimo-v2.5: mimo-v2.5-free
 ip_rotation:
   enabled: false
+  mode: wsl2
   free_only: true
+  vpn_proxy_port: 8888
   openvpn:
+    configs_dir: vpn/configs
+    auth_file: vpn/credentials.txt
     servers:
     - name: de1227
-      config: C:\Users\julie\Desktop\opencode-proxy-1.0.1\dashboard\..\vpn_configs\de1227.ovpn
+      config: vpn/configs/de1227.ovpn
     - name: de1223
-      config: C:\Users\julie\Desktop\opencode-proxy-1.0.1\dashboard\..\vpn_configs\de1223.ovpn
-    auth_file: ''
-    protocol: udp
+      config: vpn/configs/de1223.ovpn
   quota_per_ip: 300
+  switch_delay: 5
+  docker_image: openvpn-nordvpn
   switch_delay: 5
 custom_routes:
   mimov25:

@@ -537,7 +537,7 @@ _conn.execute("CREATE INDEX IF NOT EXISTS idx_model ON requests(model)")
 _conn.execute("CREATE INDEX IF NOT EXISTS idx_success ON requests(success)")
 _conn.execute("CREATE INDEX IF NOT EXISTS idx_account ON requests(account_alias)")
 _conn.execute("CREATE INDEX IF NOT EXISTS idx_ts_model ON requests(timestamp, model)")
-for col, default in [("protocol", "NULL"), ("is_stream", "0"), ("thinking", "NULL"), ("effort", "NULL"), ("client_ip", "NULL"), ("account_alias", "NULL"), ("tools", "NULL"), ("tools_used", "NULL"), ("request_body", "NULL"), ("response_body", "NULL"), ("client_user_agent", "NULL")]:
+for col, default in [("protocol", "NULL"), ("is_stream", "0"), ("thinking", "NULL"), ("effort", "NULL"), ("client_ip", "NULL"), ("account_alias", "NULL"), ("tools", "NULL"), ("tools_used", "NULL"), ("request_body", "NULL"), ("response_body", "NULL"), ("client_user_agent", "NULL"), ("free_model_ip", "NULL")]:
     try:
         _conn.execute(f"ALTER TABLE requests ADD COLUMN {col} TEXT DEFAULT {default}")
     except Exception:
@@ -558,12 +558,17 @@ _conn.execute("""
         status INTEGER NOT NULL,
         tokens_input INTEGER DEFAULT 0,
         tokens_output INTEGER DEFAULT 0,
-        duration_ms INTEGER DEFAULT 0
+        duration_ms INTEGER DEFAULT 0,
+        ip TEXT DEFAULT ''
     )
 """)
 _conn.execute("CREATE INDEX IF NOT EXISTS idx_free_ts ON free_model_usage(timestamp)")
 _conn.execute("CREATE INDEX IF NOT EXISTS idx_free_model ON free_model_usage(free_model)")
 _conn.execute("CREATE INDEX IF NOT EXISTS idx_free_key ON free_model_usage(api_key)")
+try:
+    _conn.execute("ALTER TABLE free_model_usage ADD COLUMN ip TEXT DEFAULT ''")
+except Exception:
+    pass  # Column already exists
 _conn.commit()
 _debug(f"  [db] free_model_usage table ready")
 
@@ -593,7 +598,7 @@ def _db_insert_sync(req_id, timestamp, model, original_model, duration_ms,
                     tokens_input, tokens_output, tokens_cache, success, error,
                     protocol, is_stream, thinking, effort, client_ip, account_alias,
                     tools_json, tools_used_json, request_body_json=None, response_body_json=None,
-                    client_user_agent=None):
+                    client_user_agent=None, free_model_ip=None):
     """Synchronous DB insert — called via asyncio.to_thread().
 
     Batches commits: accumulates INSERTs and commits every _DB_COMMIT_BATCH
@@ -609,13 +614,13 @@ def _db_insert_sync(req_id, timestamp, model, original_model, duration_ms,
             INSERT OR REPLACE INTO requests (id, timestamp, model, original_model, duration_ms,
                 tokens_input, tokens_output, tokens_cache, success, error,
                 protocol, is_stream, thinking, effort, client_ip, account_alias, tools, tools_used,
-                request_body, response_body, client_user_agent)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                request_body, response_body, client_user_agent, free_model_ip)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (req_id, timestamp, model, original_model, duration_ms,
               tokens_input, tokens_output, tokens_cache, 1 if success else 0, error,
               protocol, 1 if is_stream else 0, thinking, effort,
               client_ip, account_alias, tools_json, tools_used_json,
-              request_body_json, response_body_json, client_user_agent))
+              request_body_json, response_body_json, client_user_agent, free_model_ip))
         # Batch commit logic
         _db_pending_inserts += 1
         now = time.monotonic()
@@ -633,7 +638,7 @@ async def _save_request(req_id, model, original_model, duration_ms,
 	                  tokens_input, tokens_output, tokens_cache, success=True, error=None,
 	                  protocol=None, is_stream=False, thinking=None, effort=None,
 	                  client_ip=None, account_alias=None, tools=None, tools_used=None,
-	                  request_body=None, response_body=None):
+	                  request_body=None, response_body=None, free_model_ip=None):
     tools_json = json.dumps(tools) if tools else "[]"
     tools_used_json = json.dumps(list(dict.fromkeys(tools_used))) if tools_used else "[]"
     request_body_json = _truncate_body_for_storage(request_body) if request_body else None
@@ -645,7 +650,7 @@ async def _save_request(req_id, model, original_model, duration_ms,
         tokens_input, tokens_output, tokens_cache, success, error,
         protocol, is_stream, thinking, effort, client_ip, account_alias,
         tools_json, tools_used_json, request_body_json, response_body_json,
-        client_user_agent
+        client_user_agent, free_model_ip
     )
     # Fire-and-forget: commit in thread pool so dashboard sees the row quickly
     # without blocking the event loop. A blocked event loop freezes SSE streams
@@ -684,21 +689,21 @@ async def _save_request(req_id, model, original_model, duration_ms,
 
 def _log_free_model_usage(paid_model: str, free_model: str, api_key: str,
                           workspace_id: str, status: int, tokens_in: int = 0,
-                          tokens_out: int = 0, duration_ms: int = 0):
+                          tokens_out: int = 0, duration_ms: int = 0, ip: str = ""):
     """Log a free model request to the database for quota analysis."""
     timestamp = time.strftime("%Y-%m-%dT%H:%M:%S")
     try:
         _conn.execute(
             "INSERT INTO free_model_usage "
             "(timestamp, paid_model, free_model, api_key, workspace_id, status, "
-            " tokens_input, tokens_output, duration_ms) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " tokens_input, tokens_output, duration_ms, ip) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (timestamp, paid_model, free_model, api_key[:16] + "...", workspace_id,
-             status, tokens_in, tokens_out, duration_ms)
+             status, tokens_in, tokens_out, duration_ms, ip)
         )
         _conn.commit()
         _debug(f"  [free-usage] logged: {free_model} key={api_key[:8]}... ws={workspace_id[:12]}... "
-               f"status={status} in={tokens_in} out={tokens_out}")
+               f"status={status} ip={ip} in={tokens_in} out={tokens_out}")
     except Exception as e:
         _debug(f"  [free-usage] log failed: {e}")
 
@@ -1330,6 +1335,26 @@ class _CurlCffiResponse:
         return json.loads(self.text)
 
 
+# Cache for public IP to avoid flooding ipify.org
+_public_ip_cache = {"ip": "", "ts": 0.0}
+
+async def _get_cached_public_ip() -> str:
+    """Get public IP, cached for 60s to avoid flooding."""
+    now = time.monotonic()
+    if _public_ip_cache["ip"] and now - _public_ip_cache["ts"] < 60:
+        return _public_ip_cache["ip"]
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=5) as client:
+            resp = await client.get("https://api.ipify.org")
+            ip = resp.text.strip()
+            _public_ip_cache["ip"] = ip
+            _public_ip_cache["ts"] = now
+            return ip
+    except Exception:
+        return _public_ip_cache["ip"] or "unknown"
+
+
 async def _try_free_model_first(body, headers, protocol, model_id,
                                 api_key=None, workspace_id=None, api_keys=None):
     """Try the free model equivalent before falling back to paid.
@@ -1344,7 +1369,7 @@ async def _try_free_model_first(body, headers, protocol, model_id,
 
     Every attempt is logged to free_model_usage table for quota analysis.
 
-    Returns (response, headers, actual_model_name) if free model succeeded,
+    Returns (response, headers, actual_model_name, free_ip) if free model succeeded,
     or None if fallback needed.
     """
     global _free_ip_pool
@@ -1355,9 +1380,18 @@ async def _try_free_model_first(body, headers, protocol, model_id,
 
     _debug(f"  [free] trying free model {free_model!r} instead of {model_id!r}")
 
+    # Get current public IP for logging (VPN or direct)
+    free_ip = ""
+    if _vpn_manager and _vpn_manager.current_ip:
+        free_ip = _vpn_manager.current_ip
+    else:
+        free_ip = await _get_cached_public_ip()
+
     # Ensure VPN is connected if rotation is enabled
     if _free_ip_pool and _free_ip_pool.enabled:
         await _free_ip_pool.on_request()
+        if _vpn_manager and _vpn_manager.current_ip:
+            free_ip = _vpn_manager.current_ip
 
     # Select a key for the free model request.
     free_entry = _get_any_enabled_key()
@@ -1389,7 +1423,7 @@ async def _try_free_model_first(body, headers, protocol, model_id,
                 )
             except UpstreamError:
                 _log_free_model_usage(model_id, free_model, free_api_key,
-                                      free_workspace, 502)
+                                      free_workspace, 502, ip=free_ip)
                 return None
     else:
         try:
@@ -1398,7 +1432,7 @@ async def _try_free_model_first(body, headers, protocol, model_id,
             )
         except UpstreamError:
             _log_free_model_usage(model_id, free_model, free_api_key,
-                                  free_workspace, 502)
+                                  free_workspace, 502, ip=free_ip)
             return None
 
     elapsed_ms = int((time.monotonic() - t0) * 1000)
@@ -1417,12 +1451,12 @@ async def _try_free_model_first(body, headers, protocol, model_id,
     # Log every attempt
     _log_free_model_usage(model_id, free_model, free_api_key,
                           free_workspace, resp.status_code,
-                          tokens_in, tokens_out, elapsed_ms)
+                          tokens_in, tokens_out, elapsed_ms, ip=free_ip)
 
     if resp.status_code == 200:
         _debug(f"  [free] {free_model!r} succeeded ({tokens_in}+{tokens_out} tokens)")
         _log(f"  FREE {free_model!r} OK ({tokens_in}+{tokens_out} tokens, saved paid quota)")
-        return resp, resp_headers, free_model
+        return resp, resp_headers, free_model, free_ip
 
     # 429 = free quota exhausted → fall back to paid silently
     if resp.status_code == 429:
@@ -1538,16 +1572,27 @@ def _update_token_usage(model_id, inp, out, cache):
 async def _save_and_log_request(req_id, model_id, original_model, start_time,
                                  inp, out, cache, protocol, is_stream, thinking_type,
                                  effort, client_ip, account_alias, tools, log_tag="",
-                                 tools_used=None, request_body=None, response_body=None):
+                                 tools_used=None, request_body=None, response_body=None,
+                                 free_model_ip=None):
     """Log success and save to DB with success=True."""
+    # Auto-detect IP for free models if not provided
+    if free_model_ip is None and "-free" in (model_id or ""):
+        if _vpn_manager and _vpn_manager.current_ip:
+            free_model_ip = _vpn_manager.current_ip
+        else:
+            free_model_ip = await _get_cached_public_ip()
+
     alias_tag = f" | account={account_alias}" if account_alias else ""
+    if free_model_ip:
+        alias_tag = f" | vpn_ip={free_model_ip}"
     _log(f"  ← {model_id} | +{inp} in{log_tag} | +{out} out{log_tag} | +{cache} cache{alias_tag}")
     try:
         await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
                      inp, out, cache, success=True,
                      protocol=protocol, is_stream=is_stream, thinking=thinking_type, effort=effort,
                      client_ip=client_ip, account_alias=account_alias, tools=tools,
-                     tools_used=tools_used, request_body=request_body, response_body=response_body)
+                     tools_used=tools_used, request_body=request_body, response_body=response_body,
+                     free_model_ip=free_model_ip)
     except Exception as e:
         _debug(f"  ✗ save_request failed: {type(e).__name__}: {e}")
         _log(f"  WARN: save_request failed: {type(e).__name__}: {e}")
@@ -3052,7 +3097,7 @@ async def messages(request: Request):
                                                           api_key=_ak, workspace_id=_workspace_for_key(_ak),
                                                           api_keys=API_KEYS)
                 if free_result is not None:
-                    resp, a_headers, _actual_model = free_result
+                    resp, a_headers, _actual_model, _actual_ip = free_result
                     model_id = _actual_model  # Log as free model
                 else:
                     resp, a_headers = await _do_request_with_retry(endpoint, body, a_headers, "anthropic")
@@ -3352,7 +3397,7 @@ async def messages(request: Request):
                                                       api_key=_ak, workspace_id=_workspace_for_key(_ak),
                                                       api_keys=API_KEYS)
             if free_result is not None:
-                resp, headers, _actual_model = free_result
+                resp, headers, _actual_model, _actual_ip = free_result
                 model_id = _actual_model
             else:
                 resp, headers = await _do_request_with_retry(endpoint, oai_body, headers, "openai")
@@ -3876,7 +3921,7 @@ async def chat_completions(request: Request):
                                                           api_key=_ak, workspace_id=_workspace_for_key(_ak),
                                                           api_keys=API_KEYS)
                 if free_result is not None:
-                    resp, headers, _actual_model = free_result
+                    resp, headers, _actual_model, _actual_ip = free_result
                     model_id = _actual_model
                 else:
                     resp, headers = await _do_request_with_retry(endpoint, body, headers, "openai")
@@ -4114,7 +4159,7 @@ async def chat_completions(request: Request):
                                                       api_key=_ak, workspace_id=_workspace_for_key(_ak),
                                                       api_keys=API_KEYS)
             if free_result is not None:
-                resp, a_headers, _actual_model = free_result
+                resp, a_headers, _actual_model, _actual_ip = free_result
                 model_id = _actual_model
             else:
                 resp, a_headers = await _do_request_with_retry(endpoint, anthro_body, a_headers, "anthropic")
@@ -4467,7 +4512,7 @@ async def responses(request: Request):
                                                           api_key=_ak, workspace_id=_workspace_for_key(_ak),
                                                           api_keys=API_KEYS)
                 if free_result is not None:
-                    resp, a_headers, _actual_model = free_result
+                    resp, a_headers, _actual_model, _actual_ip = free_result
                     model_id = _actual_model
                 else:
                     resp, a_headers = await _do_request_with_retry(endpoint, anthro_body, a_headers, "anthropic")
@@ -4529,7 +4574,7 @@ async def responses(request: Request):
                                                       api_key=_ak, workspace_id=_workspace_for_key(_ak),
                                                       api_keys=API_KEYS)
             if free_result is not None:
-                resp, a_headers, _actual_model = free_result
+                resp, a_headers, _actual_model, _actual_ip = free_result
                 model_id = _actual_model
             else:
                 resp, a_headers = await _do_request_with_retry(endpoint, anthro_body, a_headers, "anthropic")
@@ -4594,7 +4639,7 @@ async def responses(request: Request):
                                                       api_key=_ak, workspace_id=_workspace_for_key(_ak),
                                                       api_keys=API_KEYS)
             if free_result is not None:
-                resp, headers, _actual_model = free_result
+                resp, headers, _actual_model, _actual_ip = free_result
                 model_id = _actual_model
             else:
                 resp, headers = await _do_request_with_retry(endpoint, oai_body, headers, "openai")
@@ -4641,7 +4686,7 @@ async def responses(request: Request):
                                                   api_key=_ak, workspace_id=_workspace_for_key(_ak),
                                                   api_keys=API_KEYS)
         if free_result is not None:
-            resp, headers, _actual_model = free_result
+            resp, headers, _actual_model, _actual_ip = free_result
             model_id = _actual_model
         else:
             resp, headers = await _do_request_with_retry(endpoint, oai_body, headers, "openai")

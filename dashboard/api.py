@@ -506,13 +506,13 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
             ).fetchall()
 
             acct_rows = conn.execute(
-                "SELECT COALESCE(account_alias, ''), COALESCE(SUM(tokens_input), 0), COALESCE(SUM(tokens_output), 0),"
+                "SELECT COALESCE(NULLIF(free_model_ip, ''), account_alias, ''), COALESCE(SUM(tokens_input), 0), COALESCE(SUM(tokens_output), 0),"
                 "       COALESCE(SUM(tokens_cache), 0), COUNT(*),"
                 "       SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END),"
                 "       SUM(CASE WHEN success = 0 OR success IS NULL THEN 1 ELSE 0 END),"
                 "       COALESCE(AVG(duration_ms), 0)"
                 " FROM requests " + where +
-                " GROUP BY account_alias",
+                " GROUP BY COALESCE(NULLIF(free_model_ip, ''), account_alias, '')",
                 params,
             ).fetchall()
 
@@ -762,15 +762,16 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
     async def get_free_model_usage(days: int = 7):
         """Free model usage stats for quota analysis.
 
-        Returns per-model, per-key, per-workspace aggregates with
+        Returns per-model, per-key, per-workspace, per-IP aggregates with
         total requests, tokens, and success/failure counts.
+        Also calculates quota reset times per IP.
         """
         def _query():
             where = "WHERE timestamp >= datetime('now', ?)"
             params = [f"-{days} days"]
             rows = conn.execute(
                 "SELECT timestamp, paid_model, free_model, api_key, workspace_id, "
-                "       status, tokens_input, tokens_output, duration_ms "
+                "       status, tokens_input, tokens_output, duration_ms, ip "
                 "FROM free_model_usage " + where + " ORDER BY timestamp DESC LIMIT 5000",
                 params,
             ).fetchall()
@@ -782,9 +783,10 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
         by_model = {}
         by_key = {}
         by_workspace = {}
+        by_ip = {}
         timeline = []
         for r in rows:
-            ts, paid, free, key, ws, status, tok_in, tok_out, dur = r
+            ts, paid, free, key, ws, status, tok_in, tok_out, dur, ip = r if len(r) > 9 else (*r, "")
             # By model
             m = by_model.setdefault(free, {"requests": 0, "tokens_in": 0, "tokens_out": 0, "success": 0, "fail": 0})
             m["requests"] += 1
@@ -804,8 +806,43 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
             w["requests"] += 1
             w["tokens_in"] += tok_in or 0
             w["tokens_out"] += tok_out or 0
-            # Timeline (hourly buckets)
-            timeline.append({"ts": ts, "model": free, "status": status, "tokens": (tok_in or 0) + (tok_out or 0)})
+            # By IP (track quota usage and reset time)
+            if ip:
+                ip_data = by_ip.setdefault(ip, {
+                    "requests": 0, "tokens_in": 0, "tokens_out": 0,
+                    "first_seen": ts, "last_seen": ts, "success": 0, "fail": 0,
+                    "reset_at": None, "available": False,
+                })
+                ip_data["requests"] += 1
+                ip_data["tokens_in"] += tok_in or 0
+                ip_data["tokens_out"] += tok_out or 0
+                if status == 200:
+                    ip_data["success"] += 1
+                else:
+                    ip_data["fail"] += 1
+                # Track time range
+                if ts > ip_data["last_seen"]:
+                    ip_data["last_seen"] = ts
+                if ts < ip_data["first_seen"]:
+                    ip_data["first_seen"] = ts
+            # Timeline
+            timeline.append({"ts": ts, "model": free, "status": status, "tokens": (tok_in or 0) + (tok_out or 0), "ip": ip})
+
+        # Calculate reset times for each IP (quota window = 48h from last request)
+        from datetime import datetime, timedelta
+        QUOTA_WINDOW_HOURS = 48
+        now = datetime.utcnow()
+        for ip_addr, ip_data in by_ip.items():
+            try:
+                last = datetime.fromisoformat(ip_data["last_seen"])
+                reset_at = last + timedelta(hours=QUOTA_WINDOW_HOURS)
+                ip_data["reset_at"] = reset_at.strftime("%Y-%m-%dT%H:%M:%S")
+                ip_data["available"] = now >= reset_at
+                ip_data["reset_in_sec"] = max(0, int((reset_at - now).total_seconds()))
+            except Exception:
+                ip_data["reset_at"] = None
+                ip_data["available"] = True
+                ip_data["reset_in_sec"] = 0
 
         return {
             "days": days,
@@ -813,6 +850,7 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
             "by_model": by_model,
             "by_key": by_key,
             "by_workspace": by_workspace,
+            "by_ip": by_ip,
             "recent": timeline[:100],
         }
 
@@ -887,7 +925,7 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
 
     @app.post("/api/vpn/connect")
     async def connect_vpn():
-        """Force VPN connection to next server."""
+        """Connect VPN — tries OpenVPN first, falls back to waiting for NordVPN app."""
         import shared_state
         if not shared_state.vpn_manager:
             return {"error": "VPN manager not initialized"}
@@ -895,7 +933,16 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
             ip = await shared_state.vpn_manager.connect_next()
             return {"ok": True, "ip": ip, "server": shared_state.vpn_manager.current_server}
         except Exception as e:
-            return {"error": str(e)}
+            error_msg = str(e)
+            if "AUTH_FAILED" in error_msg or "lockout" in error_msg.lower():
+                # OpenVPN failed — try waiting for NordVPN app connection
+                _debug("[vpn] OpenVPN failed, switching to NordVPN app detection mode")
+                try:
+                    ip = await shared_state.vpn_manager.connect_wait()
+                    return {"ok": True, "ip": ip, "server": {"name": "NordVPN App"}}
+                except Exception as e2:
+                    return {"error": f"OpenVPN failed: {error_msg}. NordVPN app detection: {e2}"}
+            return {"error": error_msg}
 
     @app.post("/api/vpn/disconnect")
     async def disconnect_vpn():
@@ -1089,6 +1136,8 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
                     "effort": r["effort"] if "effort" in r.keys() else None,
                     "client_ip": r["client_ip"] if "client_ip" in r.keys() else None,
                     "account_alias": r["account_alias"] if "account_alias" in r.keys() else None,
+                    "is_free_model": "-free" in (r["model"] or ""),
+                    "free_ip": r["free_model_ip"] if "free_model_ip" in r.keys() and r["free_model_ip"] else "",
                     "tools": json.loads(r["tools"]) if "tools" in r.keys() and r["tools"] and r["tools"] != "[]" else [],
                     "tools_used": json.loads(r["tools_used"]) if "tools_used" in r.keys() and r["tools_used"] and r["tools_used"] != "[]" else [],
                 }

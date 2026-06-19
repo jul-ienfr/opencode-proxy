@@ -316,8 +316,50 @@
                         </div>
                     </div>
 
-                    <!-- Two columns: Credentials + Config -->
-                    <div style="display:grid;grid-template-columns:1fr 1fr;gap:18px">
+                    <!-- Configuration section -->
+                    <div style="margin-top:18px">
+                        <h3 data-i18n="vpn.config">Configuration</h3>
+                        <div class="vpn-config-display" style="background:var(--bg-secondary);border-radius:8px;padding:16px">
+                            <!-- Mode selector -->
+                            <div class="config-row" style="margin-bottom:12px">
+                                <span class="label" data-i18n="vpn.mode">Mode</span>
+                                <div style="display:flex;gap:8px;align-items:center">
+                                    <select id="vpn-mode" class="config-input" style="width:120px;font-size:12px" onchange="vpnSaveConfig()">
+                                        <option value="wsl2">WSL2</option>
+                                        <option value="docker">Docker</option>
+                                    </select>
+                                    <span style="font-size:12px;color:var(--text-muted)" id="vpn-mode-hint">WSL2 (léger, déjà installé)</span>
+                                </div>
+                            </div>
+                            <!-- Proxy port -->
+                            <div class="config-row" style="margin-bottom:12px">
+                                <span class="label" data-i18n="vpn.proxy_port">Port proxy</span>
+                                <input type="number" id="vpn-proxy-port" class="config-input" value="8888" style="width:80px;font-size:12px" onchange="vpnSaveConfig()">
+                            </div>
+                            <!-- Switch delay -->
+                            <div class="config-row" style="margin-bottom:12px">
+                                <span class="label" data-i18n="vpn.switch_delay">Délai switch (s)</span>
+                                <input type="number" id="vpn-switch-delay" class="config-input" value="5" style="width:80px;font-size:12px" onchange="vpnSaveConfig()">
+                            </div>
+                            <!-- Quota per IP -->
+                            <div class="config-row" style="margin-bottom:12px">
+                                <span class="label" data-i18n="vpn.quota_per_ip">Quota / IP</span>
+                                <input type="number" id="vpn-quota-per-ip" class="config-input" value="300" style="width:80px;font-size:12px" onchange="vpnSaveConfig()">
+                            </div>
+                            <!-- Docker image (shown only in docker mode) -->
+                            <div class="config-row" id="vpn-docker-row" style="display:none;margin-bottom:12px">
+                                <span class="label" data-i18n="vpn.docker_image">Image Docker</span>
+                                <input type="text" id="vpn-docker-image" class="config-input" value="openvpn-nordvpn" style="width:200px;font-size:12px" onchange="vpnSaveConfig()">
+                            </div>
+                            <!-- Status summary -->
+                            <div style="margin-top:8px;padding-top:8px;border-top:1px solid var(--border);font-size:12px;color:var(--text-muted)">
+                                <span data-i18n="vpn.config_summary">Config sauvée automatiquement</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Two columns: Credentials + Servers -->
+                    <div style="display:grid;grid-template-columns:1fr 1fr;gap:18px;margin-top:18px">
                         <!-- Left: Credentials -->
                         <div>
                             <h3 data-i18n="vpn.credentials">Identifiants NordVPN</h3>
