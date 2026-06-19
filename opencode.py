@@ -23,7 +23,8 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse as StarletteJSONResponse
 from starlette.requests import ClientDisconnect
 
-from config import API_KEY, PROXY, MODELS, ROUTES, get_model_config, HOST, PORT, WEB_PORT, DISABLE_MAPPING, API_KEYS, API_KEY_ROUTING, CUSTOM_ROUTES, maybe_reload_custom_routes, CACHE_MIN_PROMPT_SIZE, DEBUG, yaml_get, SORTED_ROUTES, SORTED_CUSTOM_ROUTES, API_BASE_FREE, FREE_MODEL_MAP
+from config import API_KEY, PROXY, MODELS, ROUTES, get_model_config, HOST, PORT, WEB_PORT, DISABLE_MAPPING, API_KEYS, API_KEY_ROUTING, CUSTOM_ROUTES, maybe_reload_custom_routes, CACHE_MIN_PROMPT_SIZE, DEBUG, yaml_get, API_BASE_FREE, FREE_MODEL_MAP, IP_ROTATION
+import config.settings as _cfg_settings
 
 import itertools
 
@@ -35,6 +36,15 @@ _key_cycle_lock = threading.Lock()
 
 def _get_enabled_keys() -> list[dict]:
     return [k for k in API_KEYS if k.get("enabled", True)]
+
+def _get_any_enabled_key() -> dict | None:
+    """Return any enabled API key, ignoring pause status.
+
+    Used for free model requests which have separate quotas from paid models.
+    A key paused for paid quota exhaustion may still have free model quota available.
+    """
+    enabled = _get_enabled_keys()
+    return enabled[0] if enabled else None
 
 def get_next_api_key() -> dict:
     global _key_cycle, _key_cycle_keys, _key_failover_index
@@ -743,6 +753,10 @@ _transport = httpx.AsyncHTTPTransport(
 )
 _client = httpx.AsyncClient(transport=_transport, timeout=httpx.Timeout(connect=30, read=600, write=30, pool=10))
 
+# ── VPN / IP rotation (initialized in lifespan) ──────────────────
+_vpn_manager = None
+_free_ip_pool = None
+
 
 # ── Debug helpers ──────────────────────────────────────────────────
 
@@ -878,6 +892,16 @@ async def lifespan(app):
     set_on_workspace_recovered_callback(on_workspace_recovered)
     _debug("  [lifespan] workspace recovery callback registered")
 
+    # ── VPN / IP rotation for free models ──
+    import shared_state
+    from vpn_manager import VPNManager
+    from free_ip_pool import FreeIPPool
+    shared_state.vpn_manager = VPNManager(IP_ROTATION.get("openvpn", {}))
+    shared_state.vpn_manager.enabled = IP_ROTATION.get("enabled", False)
+    shared_state.free_ip_pool = FreeIPPool(shared_state.vpn_manager, IP_ROTATION.get("quota_per_ip", 300))
+    _debug(f"  [lifespan] VPN manager initialized (enabled={shared_state.vpn_manager.enabled}, "
+           f"servers={len(IP_ROTATION.get('openvpn', {}).get('servers', []))})")
+
     # Periodic WAL checkpoint
     async def _periodic_checkpoint():
         while True:
@@ -937,6 +961,10 @@ async def lifespan(app):
         _debug("  [lifespan] quota fetcher task cancelled")
     await _client.aclose()
     _debug("  [lifespan] HTTP client closed")
+    # Disconnect VPN if connected
+    if _vpn_manager and _vpn_manager.status == "connected":
+        await _vpn_manager.disconnect()
+        _debug("  [lifespan] VPN disconnected")
     # Close quota fetcher shared client
     from dashboard.quota import _http_client as _quota_client
     if _quota_client and not _quota_client.is_closed:
@@ -1256,39 +1284,122 @@ async def _forward_post(endpoint, json, headers):
 
 # ── Shared helper functions for endpoint handlers ──────────────
 
+async def _do_free_request_curl_cffi(body: dict, headers: dict):
+    """Make a free model request using curl_cffi for TLS fingerprint evasion.
+
+    Uses Chrome 131 TLS fingerprint and User-Agent to avoid detection.
+    Returns an httpx-like response object for compatibility.
+    """
+    try:
+        from curl_cffi.requests import AsyncSession
+    except ImportError:
+        raise RuntimeError("curl_cffi not installed: pip install curl_cffi")
+
+    # Convert headers to dict (remove auth for free models)
+    req_headers = {k: v for k, v in headers.items()
+                   if k.lower() not in ('authorization', 'x-api-key')}
+    req_headers["Content-Type"] = "application/json"
+
+    async with AsyncSession(impersonate="chrome131") as session:
+        resp = await session.post(
+            API_BASE_FREE,
+            json=body,
+            headers=req_headers,
+            timeout=60,
+        )
+        # Wrap in a compatible response object
+        return _CurlCffiResponse(resp)
+
+
+class _CurlCffiResponse:
+    """Wrapper to make curl_cffi response compatible with httpx response interface."""
+
+    def __init__(self, resp):
+        self._resp = resp
+        self.status_code = resp.status_code
+        self.headers = dict(resp.headers)
+
+    @property
+    def text(self) -> str:
+        if isinstance(self._resp.content, bytes):
+            return self._resp.content.decode("utf-8", errors="replace")
+        return str(self._resp.content)
+
+    def json(self):
+        import json
+        return json.loads(self.text)
+
+
 async def _try_free_model_first(body, headers, protocol, model_id,
-                                api_key=None, workspace_id=None):
+                                api_key=None, workspace_id=None, api_keys=None):
     """Try the free model equivalent before falling back to paid.
 
     If the model has a free equivalent in FREE_MODEL_MAP, attempt the request
     via the free endpoint first. On 429 (quota exhausted), returns None to
     signal the caller should use the paid model instead.
 
+    When VPN rotation is enabled, free requests go through a VPN tunnel
+    (different IP = different quota). Uses curl_cffi for TLS fingerprint
+    evasion (imitates Chrome).
+
     Every attempt is logged to free_model_usage table for quota analysis.
 
     Returns (response, headers, actual_model_name) if free model succeeded,
-    or None if fallback needed. The actual_model_name is the free model ID
-    that was used (e.g. "mimo-v2.5-free"), so callers can log it correctly.
+    or None if fallback needed.
     """
+    global _free_ip_pool
+
     free_model = FREE_MODEL_MAP.get(model_id)
     if not free_model:
         return None  # No free equivalent, proceed with paid
 
     _debug(f"  [free] trying free model {free_model!r} instead of {model_id!r}")
 
+    # Ensure VPN is connected if rotation is enabled
+    if _free_ip_pool and _free_ip_pool.enabled:
+        await _free_ip_pool.on_request()
+
+    # Select a key for the free model request.
+    free_entry = _get_any_enabled_key()
+    if free_entry:
+        free_headers = _get_auth_headers(protocol, free_entry)
+        free_api_key = free_entry.get("api_key", "unknown")
+        free_workspace = free_entry.get("go_workspace_id", "unknown")
+        _debug(f"  [free] using key alias={free_entry.get('alias','?')} for free model")
+    else:
+        free_headers = headers
+        free_api_key = api_key or "unknown"
+        free_workspace = workspace_id or "unknown"
+
     # Build free request: swap model name and endpoint
     free_body = dict(body)
     free_body["model"] = free_model
 
     t0 = time.monotonic()
-    try:
-        resp, free_headers = await _do_request_with_retry(
-            API_BASE_FREE, free_body, headers, protocol, retry_on_429=False
-        )
-    except UpstreamError:
-        _log_free_model_usage(model_id, free_model, api_key or "unknown",
-                              workspace_id or "unknown", 502)
-        return None  # Connection error on free → fall back to paid
+
+    # Use curl_cffi for TLS fingerprint evasion when VPN is enabled
+    if _free_ip_pool and _free_ip_pool.enabled:
+        try:
+            resp = await _do_free_request_curl_cffi(free_body, free_headers)
+        except Exception as e:
+            _debug(f"  [free] curl_cffi error: {e}, falling back to httpx")
+            try:
+                resp, resp_headers = await _do_request_with_retry(
+                    API_BASE_FREE, free_body, free_headers, protocol, retry_on_429=False
+                )
+            except UpstreamError:
+                _log_free_model_usage(model_id, free_model, free_api_key,
+                                      free_workspace, 502)
+                return None
+    else:
+        try:
+            resp, resp_headers = await _do_request_with_retry(
+                API_BASE_FREE, free_body, free_headers, protocol, retry_on_429=False
+            )
+        except UpstreamError:
+            _log_free_model_usage(model_id, free_model, free_api_key,
+                                  free_workspace, 502)
+            return None
 
     elapsed_ms = int((time.monotonic() - t0) * 1000)
 
@@ -1304,19 +1415,36 @@ async def _try_free_model_first(body, headers, protocol, model_id,
             pass
 
     # Log every attempt
-    _log_free_model_usage(model_id, free_model, api_key or "unknown",
-                          workspace_id or "unknown", resp.status_code,
+    _log_free_model_usage(model_id, free_model, free_api_key,
+                          free_workspace, resp.status_code,
                           tokens_in, tokens_out, elapsed_ms)
 
     if resp.status_code == 200:
         _debug(f"  [free] {free_model!r} succeeded ({tokens_in}+{tokens_out} tokens)")
         _log(f"  FREE {free_model!r} OK ({tokens_in}+{tokens_out} tokens, saved paid quota)")
-        return resp, free_headers, free_model
+        return resp, resp_headers, free_model
 
     # 429 = free quota exhausted → fall back to paid silently
     if resp.status_code == 429:
-        _debug(f"  [free] {free_model!r} rate limited → falling back to paid {model_id!r}")
-        _log(f"  FREE {free_model!r} RATE LIMITED → falling back to paid {model_id!r}")
+        # Read and log the 429 response body for quota analysis
+        try:
+            body_429 = resp.text[:500] if hasattr(resp, 'text') else ''
+        except Exception:
+            body_429 = ''
+        # Extract retry-after header (seconds until quota resets)
+        retry_after = resp.headers.get('retry-after', '')
+        # Also log response headers (may contain X-RateLimit-*)
+        headers_429 = {k: v for k, v in resp.headers.items()
+                       if k.lower() in ('retry-after', 'x-ratelimit-limit',
+                                         'x-ratelimit-remaining', 'x-ratelimit-reset',
+                                         'content-type')}
+        _debug(f"  [free] {free_model!r} 429 body={body_429!r} headers={headers_429}")
+        _log(f"  FREE {free_model!r} RATE LIMITED (429) retry-after={retry_after}s → falling back to paid {model_id!r}")
+
+        # If VPN rotation is enabled, switch IP on 429
+        if _free_ip_pool and _free_ip_pool.enabled:
+            asyncio.create_task(_free_ip_pool.on_quota_exhausted())
+
         return None
 
     # Other errors → fall back to paid
@@ -1560,7 +1688,7 @@ def _route_for(model_name: str, tool_names: list = None) -> dict | None:
         return None
     # When DISABLE_MAPPING, only check custom routes (not auto-generated aliases)
     if DISABLE_MAPPING:
-        for r in SORTED_CUSTOM_ROUTES:
+        for r in _cfg_settings.SORTED_CUSTOM_ROUTES:
             if any(m in name for m in r.get("match", [])):
                 _debug(f"  [route] DISABLE_MAPPING custom match: '{name}' → {r.get('model')}")
                 return r
@@ -1572,14 +1700,14 @@ def _route_for(model_name: str, tool_names: list = None) -> dict | None:
         return None
     # 1. Tool-based routing (sorted by longest match first)
     tool_names_lower = [t.lower() for t in (tool_names or [])]
-    for r in SORTED_ROUTES:
+    for r in _cfg_settings.SORTED_ROUTES:
         if r.get("enabled") is False:
             continue
         if tool_names_lower and any(m in t for m in r.get("match", []) for t in tool_names_lower):
             _debug(f"  [route] tool-based match: {r.get('model')} (tool match)")
             return r
     # 2. Model-based routing (sorted by longest match first)
-    for r in SORTED_ROUTES:
+    for r in _cfg_settings.SORTED_ROUTES:
         if r.get("enabled") is False:
             continue
         if any(m in name for m in r.get("match", [])):
@@ -2921,7 +3049,8 @@ async def messages(request: Request):
             try:
                 _ak = _key_from_headers(a_headers, "anthropic")
                 free_result = await _try_free_model_first(body, a_headers, "anthropic", model_id,
-                                                          api_key=_ak, workspace_id=_workspace_for_key(_ak))
+                                                          api_key=_ak, workspace_id=_workspace_for_key(_ak),
+                                                          api_keys=API_KEYS)
                 if free_result is not None:
                     resp, a_headers, _actual_model = free_result
                     model_id = _actual_model  # Log as free model
@@ -3220,7 +3349,8 @@ async def messages(request: Request):
         try:
             _ak = _key_from_headers(headers, "openai")
             free_result = await _try_free_model_first(oai_body, headers, "openai", model_id,
-                                                      api_key=_ak, workspace_id=_workspace_for_key(_ak))
+                                                      api_key=_ak, workspace_id=_workspace_for_key(_ak),
+                                                      api_keys=API_KEYS)
             if free_result is not None:
                 resp, headers, _actual_model = free_result
                 model_id = _actual_model
@@ -3743,7 +3873,8 @@ async def chat_completions(request: Request):
             try:
                 _ak = _key_from_headers(headers, "openai")
                 free_result = await _try_free_model_first(body, headers, "openai", model_id,
-                                                          api_key=_ak, workspace_id=_workspace_for_key(_ak))
+                                                          api_key=_ak, workspace_id=_workspace_for_key(_ak),
+                                                          api_keys=API_KEYS)
                 if free_result is not None:
                     resp, headers, _actual_model = free_result
                     model_id = _actual_model
@@ -3980,7 +4111,8 @@ async def chat_completions(request: Request):
         try:
             _ak = a_headers.get("x-api-key", "")
             free_result = await _try_free_model_first(anthro_body, a_headers, "anthropic", model_id,
-                                                      api_key=_ak, workspace_id=_workspace_for_key(_ak))
+                                                      api_key=_ak, workspace_id=_workspace_for_key(_ak),
+                                                      api_keys=API_KEYS)
             if free_result is not None:
                 resp, a_headers, _actual_model = free_result
                 model_id = _actual_model
@@ -4332,7 +4464,8 @@ async def responses(request: Request):
             try:
                 _ak = a_headers.get("x-api-key", "")
                 free_result = await _try_free_model_first(anthro_body, a_headers, "anthropic", model_id,
-                                                          api_key=_ak, workspace_id=_workspace_for_key(_ak))
+                                                          api_key=_ak, workspace_id=_workspace_for_key(_ak),
+                                                          api_keys=API_KEYS)
                 if free_result is not None:
                     resp, a_headers, _actual_model = free_result
                     model_id = _actual_model
@@ -4393,7 +4526,8 @@ async def responses(request: Request):
         try:
             _ak = a_headers.get("x-api-key", "")
             free_result = await _try_free_model_first(anthro_body, a_headers, "anthropic", model_id,
-                                                      api_key=_ak, workspace_id=_workspace_for_key(_ak))
+                                                      api_key=_ak, workspace_id=_workspace_for_key(_ak),
+                                                      api_keys=API_KEYS)
             if free_result is not None:
                 resp, a_headers, _actual_model = free_result
                 model_id = _actual_model
@@ -4457,7 +4591,8 @@ async def responses(request: Request):
         try:
             _ak = _key_from_headers(headers, "openai")
             free_result = await _try_free_model_first(oai_body, headers, "openai", model_id,
-                                                      api_key=_ak, workspace_id=_workspace_for_key(_ak))
+                                                      api_key=_ak, workspace_id=_workspace_for_key(_ak),
+                                                      api_keys=API_KEYS)
             if free_result is not None:
                 resp, headers, _actual_model = free_result
                 model_id = _actual_model
@@ -4503,7 +4638,8 @@ async def responses(request: Request):
     try:
         _ak = _key_from_headers(headers, "openai")
         free_result = await _try_free_model_first(oai_body, headers, "openai", model_id,
-                                                  api_key=_ak, workspace_id=_workspace_for_key(_ak))
+                                                  api_key=_ak, workspace_id=_workspace_for_key(_ak),
+                                                  api_keys=API_KEYS)
         if free_result is not None:
             resp, headers, _actual_model = free_result
             model_id = _actual_model

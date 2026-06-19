@@ -148,10 +148,47 @@ API_BASE_FREE = yaml_get("upstream", "free_base", "https://opencode.ai/zen/v1/ch
 # ── Free model mapping (paid → free equivalent) ────────────────────
 FREE_MODEL_MAP = yaml_get("free_model_map", default={})
 
+# ── IP rotation (OpenVPN for free model quota) ────────────────────
+IP_ROTATION = yaml_get("ip_rotation", default={})
+
 # ── Server ──────────────────────────────────────────────────────────
 HOST = _env("OPENCODE_HOST", yaml_get("server", "host", "0.0.0.0"))
 PORT = _env_int("OPENCODE_PORT", yaml_get("server", "port", 4000))
 WEB_PORT = _env_int("OPENCODE_WEB_PORT", yaml_get("server", "web_port", 8082))
+
+# ── Model family prefix → protocol mapping ─────────────────────────
+# Used by _fetch_upstream_models() to assign the correct protocol
+# to auto-discovered models from the upstream API.
+# When opencode.ai adds a new model family, add its prefix here.
+KNOWN_PROTOCOLS = {
+    # OpenAI protocol models
+    "glm":      "openai",
+    "kimi":     "openai",
+    "deepseek": "openai",
+    "mimo":     "openai",
+    # Anthropic protocol models
+    "minimax":  "anthropic",
+    "qwen":     "anthropic",
+}
+
+
+def _resolve_protocol(model_id: str) -> str:
+    """Resolve the protocol for a model ID using KNOWN_PROTOCOLS.
+
+    Extracts the family prefix (first token before '-' or '.', then strips
+    trailing digits) and looks it up in KNOWN_PROTOCOLS.
+    Falls back to "openai" if unknown.
+
+    Examples:
+        "kimi-k2.7"    -> "kimi"  -> "openai"
+        "qwen3.7-plus" -> "qwen"  -> "anthropic"
+        "glm-5.2"      -> "glm"   -> "openai"
+    """
+    import re
+    prefix = model_id.split("-")[0].split(".")[0].lower()
+    prefix = re.sub(r"\d+$", "", prefix)  # "qwen3" -> "qwen"
+    return KNOWN_PROTOCOLS.get(prefix, "openai")
+
 
 # ── Models ──────────────────────────────────────────────────────────
 _models_cfg = yaml_get("models", default={})
@@ -179,7 +216,9 @@ def _fetch_upstream_models():
         for m in models:
             model_id = m.get("id", "")
             if model_id and model_id not in MODELS:
-                MODELS[model_id] = {"endpoint": API_BASE_OPENAI, "protocol": "openai"}
+                proto = _resolve_protocol(model_id)
+                endpoint = API_BASE_OPENAI if proto == "openai" else API_BASE_ANTHROPIC
+                MODELS[model_id] = {"endpoint": endpoint, "protocol": proto}
                 added += 1
         logger.info("[config] upstream models: fetched %d, added %d new", len(models), added)
     except Exception as e:
@@ -193,7 +232,13 @@ ALIASES = yaml_get("routing", "aliases", {"nimo": "mimo"})
 
 
 def load_routes():
-    """Load ROUTES from YAML config or use default."""
+    """Load ROUTES from YAML config or use default.
+
+    Custom routes take priority over auto-generated routes: if a custom route
+    matches the same model name as an auto-generated route, the auto-generated
+    one is removed. This ensures custom mappings (e.g. mimo-v2.5 → glm-5.2)
+    are not shadowed by the default identity mapping.
+    """
     routes = {}
     if not DISABLE_MAPPING:
         alias_reverse = {}
@@ -208,7 +253,26 @@ def load_routes():
                 match_keywords.append(model_id.replace(prefix, alias, 1))
             routes[key] = {"match": match_keywords, "model": model_id}
 
-    # Custom user-defined routes
+    # Collect all match patterns from custom routes
+    custom_match_patterns = set()
+    for value in CUSTOM_ROUTES.values():
+        if isinstance(value, dict):
+            for m in value.get("match", []):
+                custom_match_patterns.add(m.lower())
+
+    # Remove auto-generated routes whose match patterns overlap with custom routes
+    if custom_match_patterns:
+        keys_to_remove = []
+        for key, route in routes.items():
+            if isinstance(route, dict):
+                for m in route.get("match", []):
+                    if m.lower() in custom_match_patterns:
+                        keys_to_remove.append(key)
+                        break
+        for key in keys_to_remove:
+            del routes[key]
+
+    # Custom user-defined routes (added AFTER cleanup so they always survive)
     for key, value in CUSTOM_ROUTES.items():
         routes[key] = value
 

@@ -24,6 +24,7 @@
                 <button class="tab active" data-tab="stats" data-i18n="nav.stats">Token Stats</button>
                 <button class="tab" data-tab="logs" data-i18n="nav.logs">Logs</button>
                 <button class="tab" data-tab="quotas" data-i18n="nav.quotas">Quotas</button>
+                <button class="tab" data-tab="vpn" data-i18n="nav.vpn">VPN & IP</button>
                 <button class="tab" data-tab="config" data-i18n="nav.config">Configuration</button>
                 <button class="tab" data-tab="debug-logs" data-i18n="nav.debug_logs" style="display:none">Debug Logs</button>
             </nav>
@@ -258,6 +259,111 @@
                     <h2>OpenCode Go Quotas</h2>
                     <p id="quota-status-message" class="config-hint"></p>
                     <div id="quota-workspaces"></div>
+                </div>
+            </section>
+
+            <section id="vpn" class="tab-content">
+                <div class="card">
+                    <h2 data-i18n="vpn.title">VPN & IP Rotation</h2>
+                    <p class="config-hint" data-i18n="vpn.hint">Rotate IP addresses for free model quota via OpenVPN</p>
+
+                    <!-- Real-time Status -->
+                    <div id="vpn-status" class="vpn-status" style="margin-bottom:18px">
+                        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+                            <div>
+                                <span id="vpn-status-dot" class="status-dot" style="display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:8px"></span>
+                                <strong id="vpn-status-text" data-i18n="vpn.disconnected">Disconnected</strong>
+                            </div>
+                            <div>
+                                <label class="toggle-switch" style="margin:0">
+                                    <input type="checkbox" id="vpn-toggle" onchange="toggleVPN(this.checked)">
+                                    <span class="toggle-slider"></span>
+                                </label>
+                                <span id="vpn-toggle-label" style="margin-left:8px;font-size:13px" data-i18n="vpn.rotation">Rotation</span>
+                            </div>
+                        </div>
+                        <div class="config-grid" style="grid-template-columns:1fr 1fr">
+                            <div class="config-row">
+                                <span class="label" data-i18n="vpn.current_ip">IP actuelle</span>
+                                <span id="vpn-ip" class="value" style="font-family:monospace;font-weight:bold">—</span>
+                            </div>
+                            <div class="config-row">
+                                <span class="label" data-i18n="vpn.current_server">Serveur</span>
+                                <span id="vpn-server" class="value">—</span>
+                            </div>
+                            <div class="config-row">
+                                <span class="label" data-i18n="vpn.requests_this_ip">Requêtes cette IP</span>
+                                <span id="vpn-requests" class="value">0 / 300</span>
+                            </div>
+                            <div class="config-row">
+                                <span class="label" data-i18n="vpn.total_free">Total gratuites</span>
+                                <span id="vpn-total-free" class="value">0</span>
+                            </div>
+                            <div class="config-row">
+                                <span class="label" data-i18n="vpn.ips_used">IPs utilisées</span>
+                                <span id="vpn-ips-used" class="value">0</span>
+                            </div>
+                            <div class="config-row">
+                                <span class="label" data-i18n="vpn.switches">Changements</span>
+                                <span id="vpn-switches" class="value">0</span>
+                            </div>
+                        </div>
+                        <!-- Action buttons -->
+                        <div style="display:flex;gap:8px;margin-top:12px">
+                            <button class="btn btn-primary" onclick="vpnConnect()" data-i18n="vpn.connect">Connecter</button>
+                            <button class="btn" onclick="vpnNext()" data-i18n="vpn.switch_ip">Changer d'IP</button>
+                            <button class="btn btn-danger" onclick="vpnDisconnect()" data-i18n="vpn.disconnect">Déconnecter</button>
+                        </div>
+                    </div>
+
+                    <!-- Two columns: Credentials + Config -->
+                    <div style="display:grid;grid-template-columns:1fr 1fr;gap:18px">
+                        <!-- Left: Credentials -->
+                        <div>
+                            <h3 data-i18n="vpn.credentials">Identifiants NordVPN</h3>
+                            <p class="config-hint" data-i18n="vpn.credentials_hint">Identifiants de service (Manual Setup)</p>
+                            <div id="vpn-cred-status" style="margin-bottom:8px;font-size:13px"></div>
+                            <div class="vpn-cred-display" style="background:var(--bg-secondary);border-radius:8px;padding:12px;margin-bottom:12px">
+                                <div class="config-row">
+                                    <span class="label">Username</span>
+                                    <span id="vpn-cred-username" class="value" style="font-family:monospace">—</span>
+                                </div>
+                                <div class="config-row">
+                                    <span class="label">Password</span>
+                                    <span id="vpn-cred-password" class="value" style="font-family:monospace">—</span>
+                                </div>
+                                <div class="config-row">
+                                    <span class="label">Fichier</span>
+                                    <span id="vpn-cred-file" class="value" style="font-size:12px;color:var(--text-muted)">—</span>
+                                </div>
+                            </div>
+                            <div style="display:flex;gap:6px;flex-wrap:wrap">
+                                <input type="text" id="vpn-username" class="config-input" placeholder="Username" style="width:140px;font-size:12px">
+                                <input type="password" id="vpn-password" class="config-input" placeholder="Password" style="width:140px;font-size:12px">
+                                <button class="btn btn-primary" onclick="vpnSaveCredentials()" data-i18n="vpn.save_credentials">Enregistrer</button>
+                            </div>
+                        </div>
+
+                        <!-- Right: Server Config -->
+                        <div>
+                            <h3 data-i18n="vpn.servers">Serveurs VPN</h3>
+                            <p class="config-hint" data-i18n="vpn.servers_hint">Configs .ovpn NordVPN</p>
+                            <div id="vpn-servers-list" style="max-height:180px;overflow-y:auto;margin-bottom:12px"></div>
+                            <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">
+                                <input type="text" id="vpn-server-name" class="config-input" placeholder="Nom (ex: NordVPN-FR)" style="width:120px;font-size:12px">
+                                <label class="btn" style="cursor:pointer;margin:0;font-size:12px">
+                                    <span data-i18n="vpn.browse">Parcourir</span>
+                                    <input type="file" id="vpn-file-input" accept=".ovpn" style="display:none" onchange="vpnFileSelected(this)">
+                                </label>
+                                <button class="btn btn-primary" onclick="vpnAddServer()" data-i18n="vpn.add_server">Ajouter</button>
+                            </div>
+                            <div id="vpn-selected-file" style="font-size:12px;color:var(--text-muted);margin-top:6px"></div>
+                        </div>
+                    </div>
+
+                    <!-- IP History -->
+                    <h3 style="margin-top:18px" data-i18n="vpn.ip_history">Historique des IP</h3>
+                    <div id="vpn-ip-history" style="max-height:150px;overflow-y:auto;font-size:12px"></div>
                 </div>
             </section>
 

@@ -28,7 +28,42 @@ const LOCALE = {
         'nav.stats': 'Token Stats',
         'nav.logs': 'Logs',
         'nav.quotas': 'Quotas',
+        'nav.vpn': 'VPN & IP',
         'nav.config': 'Configuration',
+        'vpn.title': 'VPN & IP Rotation',
+        'vpn.hint': 'Rotate IP addresses for free model quota via OpenVPN',
+        'vpn.status': 'Status',
+        'vpn.current_ip': 'Current IP',
+        'vpn.current_server': 'Server',
+        'vpn.requests_this_ip': 'Requests this IP',
+        'vpn.total_free': 'Total free requests',
+        'vpn.enable': 'Enable VPN rotation',
+        'vpn.enabled': 'VPN rotation enabled',
+        'vpn.disabled': 'VPN rotation disabled',
+        'vpn.connect': 'Connect',
+        'vpn.switch_ip': 'Switch IP',
+        'vpn.disconnect': 'Disconnect',
+        'vpn.servers': 'VPN Servers',
+        'vpn.add_server': 'Add Server',
+        'vpn.ip_history': 'IP History',
+        'vpn.credentials': 'NordVPN Credentials',
+        'vpn.credentials_hint': 'Service credentials from NordVPN dashboard (Manual Setup)',
+        'vpn.save_credentials': 'Save',
+        'vpn.browse': 'Browse',
+        'vpn.credentials_saved': 'Credentials saved',
+        'vpn.credentials_missing': 'No credentials saved',
+        'vpn.connected': 'Connected',
+        'vpn.connecting': 'Connecting...',
+        'vpn.disconnected': 'Disconnected',
+        'vpn.error': 'Error',
+        'vpn.rotation': 'Rotation',
+        'vpn.rotation_on': 'Enabled',
+        'vpn.rotation_off': 'Disabled',
+        'vpn.ips_used': 'IPs used',
+        'vpn.switches': 'Switches',
+        'vpn.servers_hint': 'NordVPN .ovpn configs',
+        'vpn.confirm_remove': 'Remove this server?',
+        'vpn.server_added': 'Server added',
         'last.update': 'Last update: ',
         'stats.overview': 'Overview',
         'stats.input': 'Input',
@@ -202,7 +237,42 @@ const LOCALE = {
         'nav.stats': 'Statistiques',
         'nav.logs': 'Historique',
         'nav.quotas': 'Quotas',
+        'nav.vpn': 'VPN & IP',
         'nav.config': 'Configuration',
+        'vpn.title': 'VPN & Rotation d\'IP',
+        'vpn.hint': 'Rotation des adresses IP pour le quota gratuit via OpenVPN',
+        'vpn.status': 'Statut',
+        'vpn.current_ip': 'IP actuelle',
+        'vpn.current_server': 'Serveur',
+        'vpn.requests_this_ip': 'Requêtes cette IP',
+        'vpn.total_free': 'Total requêtes gratuites',
+        'vpn.enable': 'Activer la rotation VPN',
+        'vpn.enabled': 'Rotation VPN activée',
+        'vpn.disabled': 'Rotation VPN désactivée',
+        'vpn.connect': 'Connecter',
+        'vpn.switch_ip': 'Changer d\'IP',
+        'vpn.disconnect': 'Déconnecter',
+        'vpn.servers': 'Serveurs VPN',
+        'vpn.add_server': 'Ajouter',
+        'vpn.ip_history': 'Historique des IP',
+        'vpn.credentials': 'Identifiants NordVPN',
+        'vpn.credentials_hint': 'Identifiants de service depuis le dashboard NordVPN (Configuration manuelle)',
+        'vpn.save_credentials': 'Enregistrer',
+        'vpn.browse': 'Parcourir',
+        'vpn.credentials_saved': 'Identifiants enregistrés',
+        'vpn.credentials_missing': 'Aucun identifiant enregistré',
+        'vpn.connected': 'Connecté',
+        'vpn.connecting': 'Connexion...',
+        'vpn.disconnected': 'Déconnecté',
+        'vpn.error': 'Erreur',
+        'vpn.rotation': 'Rotation',
+        'vpn.rotation_on': 'Activé',
+        'vpn.rotation_off': 'Désactivé',
+        'vpn.ips_used': 'IPs utilisées',
+        'vpn.switches': 'Changements',
+        'vpn.servers_hint': 'Configs .ovpn NordVPN',
+        'vpn.confirm_remove': 'Supprimer ce serveur ?',
+        'vpn.server_added': 'Serveur ajouté',
         'last.update': 'Dernière mise à jour : ',
         'stats.overview': 'Aperçu',
         'stats.input': 'Entrée',
@@ -1608,6 +1678,8 @@ function setupTabs() {
                 fetchConfig().then(renderConfig);
             } else if (target === 'quotas') {
                 fetchQuotas().then(renderQuotas);
+            } else if (target === 'vpn') {
+                refreshVPNStatus();
             } else if (target === 'debug-logs') {
                 debugLogPage = 1;
                 fetchDebugLogs(1).then(renderDebugLogLines);
@@ -2366,4 +2438,207 @@ document.addEventListener('DOMContentLoaded', () => {
             }, 1500);
         }).catch(() => {});
     });
+
+    // ── VPN tab refresh ──
+    async function refreshVPNStatus() {
+        try {
+            const resp = await fetch('/api/vpn-status');
+            const data = await resp.json();
+            updateVPNUI(data);
+        } catch (e) {
+            console.error('VPN status error:', e);
+        }
+        // Also check credential status
+        try {
+            const credResp = await fetch('/api/vpn/credentials');
+            const credData = await credResp.json();
+            const credStatus = document.getElementById('vpn-cred-status');
+            const usernameEl = document.getElementById('vpn-cred-username');
+            const passwordEl = document.getElementById('vpn-cred-password');
+            const fileEl = document.getElementById('vpn-cred-file');
+
+            if (credData.exists) {
+                if (credStatus) credStatus.innerHTML = '<span style="color:var(--success)">&#10003;</span> ' + (t('vpn.credentials_saved') || 'Enregistré');
+                if (usernameEl) usernameEl.textContent = credData.username_preview || '****';
+                if (passwordEl) passwordEl.textContent = '••••••••';
+                if (fileEl) fileEl.textContent = 'vpn_configs/credentials.txt';
+            } else {
+                if (credStatus) credStatus.innerHTML = '<span style="color:var(--warning)">!</span> ' + (t('vpn.credentials_missing') || 'Aucun identifiant');
+                if (usernameEl) usernameEl.textContent = '—';
+                if (passwordEl) passwordEl.textContent = '—';
+                if (fileEl) fileEl.textContent = '—';
+            }
+        } catch (e) {
+            console.error('Credential status error:', e);
+        }
+        // Also load server list from config
+        try {
+            const cfgResp = await fetch('/api/vpn-config');
+            const cfgData = await cfgResp.json();
+            renderServerList(cfgData.servers || []);
+        } catch (e) {}
+    }
+
+    function renderServerList(servers) {
+        const list = document.getElementById('vpn-servers-list');
+        if (!list) return;
+        if (!servers.length) {
+            list.innerHTML = '<div style="color:var(--text-muted);font-size:12px;padding:8px">Aucun serveur configuré</div>';
+            return;
+        }
+        list.innerHTML = servers.map((s, i) => `
+            <div style="display:flex;justify-content:space-between;align-items:center;padding:6px 8px;background:var(--bg-secondary);border-radius:6px;margin-bottom:4px;font-size:13px">
+                <div>
+                    <strong>${escHtml(s.name)}</strong>
+                    <span style="color:var(--text-muted);margin-left:8px;font-size:11px">${escHtml(s.config || '').split('/').pop()}</span>
+                </div>
+                <button class="btn btn-sm btn-danger" onclick="vpnRemoveServer('${escHtml(s.name)}')" style="font-size:11px;padding:2px 8px">✕</button>
+            </div>
+        `).join('');
+    }
+
+    function updateVPNUI(data) {
+        const statusEl = document.getElementById('vpn-status-text');
+        const statusDot = document.getElementById('vpn-status-dot');
+        const ipEl = document.getElementById('vpn-ip');
+        const serverEl = document.getElementById('vpn-server');
+        const requestsEl = document.getElementById('vpn-requests');
+        const totalEl = document.getElementById('vpn-total-free');
+        const ipsUsedEl = document.getElementById('vpn-ips-used');
+        const switchesEl = document.getElementById('vpn-switches');
+        const toggleEl = document.getElementById('vpn-toggle');
+        const toggleLabel = document.getElementById('vpn-toggle-label');
+
+        if (!statusEl) return;
+
+        const statusMap = {
+            connected: { color: 'var(--success)', label: t('vpn.connected') || 'Connecté' },
+            connecting: { color: 'var(--warning)', label: t('vpn.connecting') || 'Connexion...' },
+            disconnected: { color: 'var(--text-muted)', label: t('vpn.disconnected') || 'Déconnecté' },
+            error: { color: 'var(--danger)', label: t('vpn.error') || 'Erreur' }
+        };
+        const s = statusMap[data.status] || statusMap.disconnected;
+        statusEl.textContent = s.label;
+        statusEl.style.color = s.color;
+        if (statusDot) statusDot.style.background = s.color;
+
+        ipEl.textContent = data.current_ip || '—';
+        serverEl.textContent = data.current_server || '—';
+        requestsEl.textContent = `${data.requests_this_ip || 0} / ${data.quota_per_ip || 300}`;
+        totalEl.textContent = data.total_free_requests || 0;
+        if (ipsUsedEl) ipsUsedEl.textContent = data.ips_used || 0;
+        if (switchesEl) switchesEl.textContent = (data.vpn && data.vpn.total_switches) || 0;
+
+        toggleEl.checked = data.enabled || false;
+        toggleLabel.textContent = data.enabled ? (t('vpn.rotation_on') || 'Activé') : (t('vpn.rotation_off') || 'Désactivé');
+
+        // IP History
+        const historyEl = document.getElementById('vpn-ip-history');
+        if (historyEl && data.vpn && data.vpn.ip_history) {
+            historyEl.innerHTML = data.vpn.ip_history.slice().reverse().map(h =>
+                `<div style="padding:3px 0;border-bottom:1px solid var(--border)">
+                    <span style="font-family:monospace">${h.ip}</span>
+                    <span style="color:var(--text-muted)"> — ${h.server} — ${h.time}</span>
+                </div>`
+            ).join('') || '<div style="color:var(--text-muted);padding:4px">Aucun historique</div>';
+        }
+    }
+
+    window.toggleVPN = async function(enabled) {
+        await fetch('/api/vpn/toggle', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({enabled}) });
+        refreshVPNStatus();
+    };
+
+    window.vpnConnect = async function() {
+        const resp = await fetch('/api/vpn/connect', { method: 'POST' });
+        const data = await resp.json();
+        if (data.error) alert('Erreur: ' + data.error);
+        refreshVPNStatus();
+    };
+
+    window.vpnDisconnect = async function() {
+        await fetch('/api/vpn/disconnect', { method: 'POST' });
+        refreshVPNStatus();
+    };
+
+    window.vpnNext = async function() {
+        const resp = await fetch('/api/vpn/next', { method: 'POST' });
+        const data = await resp.json();
+        if (data.error) alert('Erreur: ' + data.error);
+        refreshVPNStatus();
+    };
+
+    window.vpnRemoveServer = async function(name) {
+        if (!confirm(t('vpn.confirm_remove') || 'Supprimer ce serveur ?')) return;
+        await fetch('/api/vpn-config', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({remove_server: name})
+        });
+        refreshVPNStatus();
+    };
+
+    window.vpnSaveCredentials = async function() {
+        const username = document.getElementById('vpn-username').value.trim();
+        const password = document.getElementById('vpn-password').value.trim();
+        if (!username || !password) return alert('Username and password required');
+        const resp = await fetch('/api/vpn-config', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({credentials: {username, password}})
+        });
+        const data = await resp.json();
+        if (data.error) {
+            alert('Error: ' + data.error);
+        } else {
+            // Clear fields and show saved indicator
+            document.getElementById('vpn-username').value = '';
+            document.getElementById('vpn-password').value = '';
+            refreshVPNStatus();
+        }
+    };
+
+    // Store selected file globally (dataset can't hold File objects)
+    let _vpnSelectedFile = null;
+
+    window.vpnFileSelected = function(input) {
+        const file = input.files[0];
+        if (!file) return;
+        _vpnSelectedFile = file;
+        const el = document.getElementById('vpn-selected-file');
+        if (el) el.textContent = 'Fichier: ' + file.name + ' (' + (file.size / 1024).toFixed(1) + ' Ko)';
+    };
+
+    window.vpnAddServer = async function() {
+        const name = document.getElementById('vpn-server-name').value.trim();
+        if (!name) return alert('Nom du serveur requis');
+
+        if (_vpnSelectedFile) {
+            // Upload the file
+            const formData = new FormData();
+            formData.append('name', name);
+            formData.append('config', _vpnSelectedFile);
+
+            const resp = await fetch('/api/vpn/upload-config', {
+                method: 'POST',
+                body: formData
+            });
+            const data = await resp.json();
+            if (data.error) alert('Erreur: ' + data.error);
+        } else {
+            return alert('Sélectionnez un fichier .ovpn');
+        }
+
+        document.getElementById('vpn-server-name').value = '';
+        document.getElementById('vpn-selected-file').textContent = '';
+        _vpnSelectedFile = null;
+        document.getElementById('vpn-file-input').value = '';
+        refreshVPNStatus();
+    };
+
+    // Refresh VPN status every 10 seconds when VPN tab is active
+    setInterval(() => {
+        const vpnTab = document.querySelector('.tab[data-tab="vpn"]');
+        if (vpnTab && vpnTab.classList.contains('active')) {
+            refreshVPNStatus();
+        }
+    }, 10000);
 });

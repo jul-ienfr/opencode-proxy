@@ -37,6 +37,8 @@ models:
     protocol: openai
   kimi-k2.6:
     protocol: openai
+  kimi-k2.7:
+    protocol: openai
   deepseek-v4-pro:
     protocol: openai
   deepseek-v4-flash:
@@ -57,6 +59,8 @@ models:
     protocol: anthropic
   qwen3.7-max:
     protocol: anthropic
+  qwen3.7-plus:
+    protocol: anthropic
   qwen3.6-plus:
     protocol: anthropic
   qwen3.5-plus:
@@ -64,6 +68,19 @@ models:
 free_model_map:
   deepseek-v4-flash: deepseek-v4-flash-free
   mimo-v2.5: mimo-v2.5-free
+ip_rotation:
+  enabled: false
+  free_only: true
+  openvpn:
+    servers:
+    - name: de1227
+      config: C:\Users\julie\Desktop\opencode-proxy-1.0.1\dashboard\..\vpn_configs\de1227.ovpn
+    - name: de1223
+      config: C:\Users\julie\Desktop\opencode-proxy-1.0.1\dashboard\..\vpn_configs\de1223.ovpn
+    auth_file: ''
+    protocol: udp
+  quota_per_ip: 300
+  switch_delay: 5
 custom_routes:
   mimov25:
     match:
