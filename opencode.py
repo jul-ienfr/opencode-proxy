@@ -588,8 +588,18 @@ def _db_flush():
     global _db_pending_inserts, _db_last_commit
     with _db_commit_lock:
         if _db_pending_inserts > 0:
-            _conn.commit()
-            _debug(f"  [db] _db_flush: committed {_db_pending_inserts} pending inserts")
+            try:
+                _conn.commit()
+                _debug(f"  [db] _db_flush: committed {_db_pending_inserts} pending inserts")
+            except Exception as e:
+                _debug(f"  [db] _db_flush commit FAILED: {type(e).__name__}: {e}")
+                # Try rollback to recover the connection for future operations
+                try:
+                    _conn.rollback()
+                except Exception:
+                    pass
+            # Always reset counter to avoid stuck state — even if commit failed,
+            # uncommitted rows will be lost but new inserts can proceed normally
             _db_pending_inserts = 0
             _db_last_commit = time.monotonic()
 
@@ -626,8 +636,16 @@ def _db_insert_sync(req_id, timestamp, model, original_model, duration_ms,
         now = time.monotonic()
         elapsed = now - _db_last_commit
         if _db_pending_inserts >= _DB_COMMIT_BATCH or elapsed >= _DB_COMMIT_INTERVAL:
-            _conn.commit()
-            _debug(f"  [db] _db_insert_sync: batch-committed {_db_pending_inserts} inserts ({elapsed:.1f}s) in {(time.monotonic()-t0)*1000:.1f}ms")
+            try:
+                _conn.commit()
+                _debug(f"  [db] _db_insert_sync: batch-committed {_db_pending_inserts} inserts ({elapsed:.1f}s) in {(time.monotonic()-t0)*1000:.1f}ms")
+            except Exception as e:
+                _debug(f"  [db] _db_insert_sync commit FAILED: {type(e).__name__}: {e}")
+                try:
+                    _conn.rollback()
+                except Exception:
+                    pass
+            # Always reset counter to avoid stuck state
             _db_pending_inserts = 0
             _db_last_commit = now
         else:
@@ -693,15 +711,16 @@ def _log_free_model_usage(paid_model: str, free_model: str, api_key: str,
     """Log a free model request to the database for quota analysis."""
     timestamp = time.strftime("%Y-%m-%dT%H:%M:%S")
     try:
-        _conn.execute(
-            "INSERT INTO free_model_usage "
-            "(timestamp, paid_model, free_model, api_key, workspace_id, status, "
-            " tokens_input, tokens_output, duration_ms, ip) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (timestamp, paid_model, free_model, api_key[:16] + "...", workspace_id,
-             status, tokens_in, tokens_out, duration_ms, ip)
-        )
-        _conn.commit()
+        with _db_commit_lock:
+            _conn.execute(
+                "INSERT INTO free_model_usage "
+                "(timestamp, paid_model, free_model, api_key, workspace_id, status, "
+                " tokens_input, tokens_output, duration_ms, ip) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (timestamp, paid_model, free_model, api_key[:16] + "...", workspace_id,
+                 status, tokens_in, tokens_out, duration_ms, ip)
+            )
+            _conn.commit()
         _debug(f"  [free-usage] logged: {free_model} key={api_key[:8]}... ws={workspace_id[:12]}... "
                f"status={status} ip={ip} in={tokens_in} out={tokens_out}")
     except Exception as e:
@@ -910,14 +929,22 @@ async def lifespan(app):
     # Periodic WAL checkpoint
     async def _periodic_checkpoint():
         while True:
-            await asyncio.sleep(yaml_get("background", "wal_checkpoint_interval", 3600))
-            await asyncio.to_thread(_wal_checkpoint)
+            try:
+                await asyncio.sleep(yaml_get("background", "wal_checkpoint_interval", 3600))
+                await asyncio.to_thread(_wal_checkpoint)
+            except Exception as e:
+                _debug(f"  [db] _periodic_checkpoint error: {type(e).__name__}: {e}")
+                await asyncio.sleep(60)  # retry after 60s on error
 
     # Periodic DB flush (every 5s) to commit any batched inserts
     async def _periodic_db_flush():
         while True:
-            await asyncio.sleep(_DB_COMMIT_INTERVAL)
-            await asyncio.to_thread(_db_flush)
+            try:
+                await asyncio.sleep(_DB_COMMIT_INTERVAL)
+                await asyncio.to_thread(_db_flush)
+            except Exception as e:
+                _debug(f"  [db] _periodic_db_flush error: {type(e).__name__}: {e}")
+                await asyncio.sleep(1)  # brief pause before retry
 
     checkpoint_task = asyncio.create_task(_periodic_checkpoint())
     db_flush_task = asyncio.create_task(_periodic_db_flush())
