@@ -777,7 +777,7 @@ def _sanitize_headers(headers) -> dict:
 
 def _truncate(body, max_len=None) -> str:
     if max_len is None:
-        max_len = yaml_get("debug", "truncate_max", 10240)
+        max_len = yaml_get("debug", "truncate_max", 2000)
     """Pretty-print a body for debug logging, truncated to max_len chars."""
     try:
         text = json.dumps(body, indent=2, ensure_ascii=False, default=str)
@@ -901,11 +901,11 @@ async def lifespan(app):
     import shared_state
     from vpn_manager import VPNManager
     from free_ip_pool import FreeIPPool
-    shared_state.vpn_manager = VPNManager(IP_ROTATION.get("openvpn", {}))
+    shared_state.vpn_manager = VPNManager(IP_ROTATION)
     shared_state.vpn_manager.enabled = IP_ROTATION.get("enabled", False)
-    shared_state.free_ip_pool = FreeIPPool(shared_state.vpn_manager, IP_ROTATION.get("quota_per_ip", 300))
+    shared_state.free_ip_pool = FreeIPPool(shared_state.vpn_manager)
     _debug(f"  [lifespan] VPN manager initialized (enabled={shared_state.vpn_manager.enabled}, "
-           f"servers={len(IP_ROTATION.get('openvpn', {}).get('servers', []))})")
+           f"mode={shared_state.vpn_manager._mode}, servers={len(IP_ROTATION.get('openvpn', {}).get('servers', []))})")
 
     # Periodic WAL checkpoint
     async def _periodic_checkpoint():
@@ -1316,6 +1316,28 @@ async def _do_free_request_curl_cffi(body: dict, headers: dict):
         return _CurlCffiResponse(resp)
 
 
+async def _do_free_request_socks5(body: dict, headers: dict, proxy_url: str):
+    """Make a free model request through a SOCKS5 proxy.
+
+    Uses httpx with socks5 proxy for routing through external proxy servers.
+    Returns an httpx response object.
+    """
+    import httpx
+
+    # Convert headers to dict (remove auth for free models)
+    req_headers = {k: v for k, v in headers.items()
+                   if k.lower() not in ('authorization', 'x-api-key')}
+    req_headers["Content-Type"] = "application/json"
+
+    async with httpx.AsyncClient(proxy=proxy_url, timeout=60) as client:
+        resp = await client.post(
+            API_BASE_FREE,
+            json=body,
+            headers=req_headers,
+        )
+        return resp
+
+
 class _CurlCffiResponse:
     """Wrapper to make curl_cffi response compatible with httpx response interface."""
 
@@ -1393,17 +1415,10 @@ async def _try_free_model_first(body, headers, protocol, model_id,
         if _vpn_manager and _vpn_manager.current_ip:
             free_ip = _vpn_manager.current_ip
 
-    # Select a key for the free model request.
-    free_entry = _get_any_enabled_key()
-    if free_entry:
-        free_headers = _get_auth_headers(protocol, free_entry)
-        free_api_key = free_entry.get("api_key", "unknown")
-        free_workspace = free_entry.get("go_workspace_id", "unknown")
-        _debug(f"  [free] using key alias={free_entry.get('alias','?')} for free model")
-    else:
-        free_headers = headers
-        free_api_key = api_key or "unknown"
-        free_workspace = workspace_id or "unknown"
+    # Free models don't need authentication — send minimal headers
+    free_headers = {"Content-Type": "application/json"}
+    free_api_key = "free (no auth)"
+    free_workspace = "free (no auth)"
 
     # Build free request: swap model name and endpoint
     free_body = dict(body)
@@ -1411,8 +1426,13 @@ async def _try_free_model_first(body, headers, protocol, model_id,
 
     t0 = time.monotonic()
 
-    # Use curl_cffi for TLS fingerprint evasion when VPN is enabled
-    if _free_ip_pool and _free_ip_pool.enabled:
+    # Determine routing based on proxy mode
+    proxy_mode = "direct"
+    if _vpn_manager:
+        proxy_mode = _vpn_manager.proxy_mode
+
+    if proxy_mode == "vpn" and _free_ip_pool and _free_ip_pool.enabled:
+        # VPN mode: use curl_cffi for TLS fingerprint evasion
         try:
             resp = await _do_free_request_curl_cffi(free_body, free_headers)
         except Exception as e:
@@ -1425,7 +1445,34 @@ async def _try_free_model_first(body, headers, protocol, model_id,
                 _log_free_model_usage(model_id, free_model, free_api_key,
                                       free_workspace, 502, ip=free_ip)
                 return None
+    elif proxy_mode == "socks5" and _free_ip_pool and _free_ip_pool.enabled:
+        # SOCKS5 mode: route through external SOCKS5 proxy
+        socks5_url = _free_ip_pool.proxy_url
+        if socks5_url:
+            try:
+                resp = await _do_free_request_socks5(free_body, free_headers, socks5_url)
+            except Exception as e:
+                _debug(f"  [free] SOCKS5 request error: {e}, falling back to httpx")
+                try:
+                    resp, resp_headers = await _do_request_with_retry(
+                        API_BASE_FREE, free_body, free_headers, protocol, retry_on_429=False
+                    )
+                except UpstreamError:
+                    _log_free_model_usage(model_id, free_model, free_api_key,
+                                          free_workspace, 502, ip=free_ip)
+                    return None
+        else:
+            # No SOCKS5 proxy available, fall back to direct
+            try:
+                resp, resp_headers = await _do_request_with_retry(
+                    API_BASE_FREE, free_body, free_headers, protocol, retry_on_429=False
+                )
+            except UpstreamError:
+                _log_free_model_usage(model_id, free_model, free_api_key,
+                                      free_workspace, 502, ip=free_ip)
+                return None
     else:
+        # Direct mode: no proxy
         try:
             resp, resp_headers = await _do_request_with_retry(
                 API_BASE_FREE, free_body, free_headers, protocol, retry_on_429=False
@@ -1487,15 +1534,19 @@ async def _try_free_model_first(body, headers, protocol, model_id,
 
 
 async def _do_request_with_retry(endpoint, body, headers, protocol, retry_on_429=True):
-    """POST request with automatic 429 key failover and 5xx retry with backoff.
+    """POST request with automatic 429/401 key failover and 5xx retry with backoff.
+
+    Key failover (429/401) does NOT consume a retry attempt — it's a key change,
+    not a retry. Only 5xx errors consume retries.
 
     Returns (response, final_headers) -- headers may differ after retry.
     Raises UpstreamError on connection/timeout/protocol failures.
     """
     _RETRYABLE_STATUSES = {502, 503, 504, 499}
     max_retries = yaml_get("streaming", "retry_attempts", 2)
+    attempt = 0
 
-    for attempt in range(max_retries):
+    while attempt < max_retries:
         if DEBUG:
             _debug(f"  → upstream POST {endpoint} attempt {attempt+1}/{max_retries} headers={_sanitize_headers(headers)}")
         t0 = time.monotonic()
@@ -1517,7 +1568,7 @@ async def _do_request_with_retry(endpoint, body, headers, protocol, retry_on_429
         elapsed_ms = (time.monotonic() - t0) * 1000
         _debug(f"  ← upstream {resp.status_code} in {elapsed_ms:.0f}ms | content-type={resp.headers.get('content-type', '?')}")
 
-        # Retry on 429 with key failover
+        # Key failover on 429 — does NOT consume a retry attempt
         if retry_on_429 and resp.status_code == 429 and len(API_KEYS) > 1:
             failed_key = _key_from_headers(headers, protocol)
             # Fetch fresh quotas and pause key until exact reset time
@@ -1527,25 +1578,33 @@ async def _do_request_with_retry(endpoint, body, headers, protocol, retry_on_429
                 _debug(f"  ⟳ 429 failover: {failed_key[:8]}… → alias={alt.get('alias', '?')}")
                 _log(f"  429 on key, retrying with alternative key")
                 headers = _get_auth_headers(protocol, entry=alt)
-                continue
+                continue  # retry immediately without incrementing attempt
 
-        # Retry on 401 with key failover (key is dead/invalid)
+        # Key failover on 401 — does NOT consume a retry attempt
         if resp.status_code == 401 and len(API_KEYS) > 1:
             failed_key = _key_from_headers(headers, protocol)
-            _key_pauser.pause_key(failed_key, _key_pauser._max_pause, "401 Unauthorized")
+            # Log the 401 response body to help diagnose dead/revoked keys
+            try:
+                _err_body = resp.text[:500] if hasattr(resp, 'text') else str(resp.content[:500])
+            except Exception:
+                _err_body = "(unable to read response body)"
+            _debug(f"  [auth] 401 response body: {_err_body}")
+            # 401 = key permanently invalid/revoked → pause 24h (not just 10 min)
+            _key_pauser.pause_key(failed_key, 86400, "401 Unauthorized (key likely revoked)")
             alt = _find_alternative_key(failed_key)
             if alt:
                 _debug(f"  ⟳ 401 failover: {failed_key[:8]}… → alias={alt.get('alias', '?')}")
                 _log(f"  401 on key (invalid/revoked), retrying with alternative key")
                 headers = _get_auth_headers(protocol, entry=alt)
-                continue
+                continue  # retry immediately without incrementing attempt
 
-        # Retry on 502/503/504 with backoff
+        # Retry on 502/503/504 with backoff — DOES consume a retry attempt
         if resp.status_code in _RETRYABLE_STATUSES and attempt < max_retries - 1:
             wait = 1.0 * (2 ** attempt)  # 1s, 2s
             _debug(f"  ⟳ retry {resp.status_code} in {wait:.1f}s")
             _log(f"  RETRY {resp.status_code} after {wait:.1f}s (attempt {attempt+1}/{max_retries})")
             await asyncio.sleep(wait)
+            attempt += 1
             continue
 
         return resp, headers
@@ -1630,7 +1689,8 @@ def _make_stream_retry_loop(protocol):
                 # Fetch fresh quotas and pause key until exact reset time
                 await _pause_key_for_quota_reset(failed_key)
             elif status_code == 401:
-                _key_pauser.pause_key(failed_key, _key_pauser._max_pause, "401 Unauthorized")
+                # 401 = key permanently invalid/revoked → pause 24h
+                _key_pauser.pause_key(failed_key, 86400, "401 Unauthorized (key likely revoked)")
             elif status_code == 400:
                 # Check for credit/balance errors in resp_headers or skip
                 # We need to check the response body - handled in caller
@@ -1722,7 +1782,11 @@ async def _sse_keepalive(stream_gen, interval: float = _SSE_KEEPALIVE_INTERVAL):
             yield b": ping\n\n"
         except Exception as e:
             # ClientDisconnect, ConnectionResetError, etc. — client gone, stop gracefully
-            _debug(f"  [stream] keepalive exiting: {type(e).__name__}: {e}")
+            # Log traceback for unexpected errors (like UnboundLocalError) to aid debugging
+            if isinstance(e, (ConnectionError, OSError)):
+                _debug(f"  [stream] keepalive exiting (client gone): {type(e).__name__}: {e}")
+            else:
+                _debug(f"  [stream] keepalive exiting: {type(e).__name__}: {e}\n{traceback.format_exc()}")
             return
 
 
@@ -3169,6 +3233,10 @@ async def messages(request: Request):
 
         async def anthropic_stream(headers):
             nonlocal endpoint, body, model_id
+            # _track_model is the model used for logging/token tracking.
+            # We use a local variable instead of reassigning model_id to avoid
+            # UnboundLocalError in Python 3.12+ (nonlocal + assignment conflict).
+            _track_model = model_id
             # Try free model for streaming: swap endpoint/model before starting stream
             free_model = FREE_MODEL_MAP.get(model_id)
             if free_model:
@@ -3182,13 +3250,13 @@ async def messages(request: Request):
                 body["model"] = free_model
                 endpoint = API_BASE_FREE
                 _using_free = True
-                model_id = free_model  # Log as free model
+                _track_model = free_model  # Log as free model
             else:
                 _using_free = False
             # Defer token estimation to first chunk — reduces pre-response latency
             est_input = _estimate_input_tokens(body)
             _debug(f"  [stream] est_input={est_input}")
-            _update_token_usage(model_id, est_input, 0, 0)
+            _update_token_usage(_track_model, est_input, 0, 0)
             stream_in = None
             stream_out = stream_cache = 0
             _line_buf = ""
@@ -3205,11 +3273,12 @@ async def messages(request: Request):
                         if resp.status_code != 200:
                             # Free model 429 → fall back to paid model
                             if _using_free and resp.status_code == 429:
-                                _debug(f"  [stream] free model 429 → falling back to paid {model_id!r}")
-                                _log(f"  FREE model rate limited → falling back to paid {model_id!r}")
+                                _debug(f"  [stream] free model 429 → falling back to paid {_track_model!r}")
+                                _log(f"  FREE model rate limited → falling back to paid {_track_model!r}")
                                 body = paid_body
                                 endpoint = paid_endpoint
                                 _using_free = False
+                                _track_model = model_id  # Revert tracking to paid model
                                 continue
                             headers, should_retry = await _handle_429(headers, resp.status_code, _attempt, resp.headers)
                             if should_retry:
@@ -3233,6 +3302,9 @@ async def messages(request: Request):
                                     continue
                             ak = _alias_for_key(headers.get("x-api-key", ""))
                             _debug(f"  [stream] error {resp.status_code}: {err[:300]}")
+                            # Log 401 body specifically for key diagnosis
+                            if resp.status_code == 401:
+                                _debug(f"  [auth] 401 response body: {err.decode('utf-8', errors='replace')[:500]}")
                             # Convert 429/401 → 503 to avoid Claude Code auth window
                             err_status = 503 if resp.status_code in (429, 401) else resp.status_code
                             if resp.status_code == 429:
@@ -3243,7 +3315,7 @@ async def messages(request: Request):
                                 err_msg = f"HTTP {resp.status_code}: {err.decode('utf-8', errors='replace')[:200]}"
                             error_payload = {"type": "error", "error": {"type": "api_error",
                                            "message": err_msg}}
-                            yield await _stream_error_response(req_id, model_id, original_model, start_time,
+                            yield await _stream_error_response(req_id, _track_model, original_model, start_time,
                                          err_status, err, protocol, thinking_type, effort,
                                          client_ip, ak, tool_names, error_payload,
                                          request_body=request_body)
@@ -3275,15 +3347,15 @@ async def messages(request: Request):
                                     if stream_in is not None:
                                         try:
                                             with _token_lock:
-                                                _token_usage[model_id]["input"] -= est_input
-                                                _token_usage[model_id]["input"] += stream_in
+                                                _token_usage[_track_model]["input"] -= est_input
+                                                _token_usage[_track_model]["input"] += stream_in
                                         except Exception as e:
                                             _debug(f"  ✗ token rollback failed: {type(e).__name__}: {e}")
                                     stream_cache = usage.get("cache_read_input_tokens", 0)
                                     if stream_cache:
                                         try:
                                             with _token_lock:
-                                                _token_usage[model_id]["cache"] += stream_cache
+                                                _token_usage[_track_model]["cache"] += stream_cache
                                         except Exception:
                                             pass
                                 elif etype == "content_block_start":
@@ -3306,15 +3378,25 @@ async def messages(request: Request):
                         if stream_out:
                             try:
                                 with _token_lock:
-                                    _token_usage[model_id]["output"] += stream_out
+                                    _token_usage[_track_model]["output"] += stream_out
                             except Exception:
                                 pass
+                        _cb_record_success(endpoint)  # Stream completed successfully
                 except Exception as e:
+                    _cb_record_failure(endpoint)  # Record failure for circuit breaker
                     ak = _alias_for_key(headers.get("x-api-key", "")) if headers else ""
                     _debug(f"  [stream] exception on attempt {_attempt+1}: {type(e).__name__}: {e}")
                     _log(f"  ERROR stream (attempt {_attempt+1}): {type(e).__name__}: {e}")
                     if _attempt == 0:
-                        # Try alternative key on retry
+                        # Network errors (server disconnect, timeout) → retry with same key first
+                        _is_network_error = isinstance(e, (httpx.RemoteProtocolError, httpx.ReadError,
+                                                           ConnectionError, OSError)) or "disconnected" in str(e).lower()
+                        if _is_network_error:
+                            _debug(f"  ⟳ stream retry (network error, same key)")
+                            _log(f"  Retrying stream (network error, same key)")
+                            await asyncio.sleep(1.0)
+                            continue
+                        # Auth/quota errors → try alternative key
                         failed_key = _key_from_headers(headers, "anthropic")
                         if not _key_pauser.is_paused(failed_key):
                             try:
@@ -3331,16 +3413,16 @@ async def messages(request: Request):
                     if stream_in is None:
                         try:
                             with _token_lock:
-                                _token_usage[model_id]["input"] -= est_input
+                                _token_usage[_track_model]["input"] -= est_input
                         except Exception as e:
                             _debug(f"  ✗ token rollback failed: {type(e).__name__}: {e}")
                     if stream_out:
                         try:
                             with _token_lock:
-                                _token_usage[model_id]["output"] += stream_out
+                                _token_usage[_track_model]["output"] += stream_out
                         except Exception:
                             pass
-                    await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
+                    await _save_request(req_id, _track_model, original_model, _elapsed_ms(start_time),
                                  stream_in if stream_in is not None else est_input, stream_out, stream_cache, success=False, error=str(e),
                                  protocol=protocol, is_stream=True, thinking=thinking_type, effort=effort,
                                  client_ip=client_ip, account_alias=ak, tools=tool_names,
@@ -3362,7 +3444,7 @@ async def messages(request: Request):
             _debug(f"  [stream] done: in={logged_in} out={stream_out} cache={stream_cache} tools={used_tools}")
             if stream_in is not None or stream_out:
                 ak = _alias_for_key(headers.get("x-api-key", ""))
-                await _save_and_log_request(req_id, model_id, original_model, start_time,
+                await _save_and_log_request(req_id, _track_model, original_model, start_time,
                              logged_in, stream_out, stream_cache, protocol, True, thinking_type,
                              effort, client_ip, ak, tool_names, tools_used=used_tools if used_tools else None,
                              request_body=request_body)
@@ -3373,7 +3455,7 @@ async def messages(request: Request):
     # ── OpenAI-protocol ─────────────────────────────────────────
     try:
         oai_body = anthropic_to_openai(body, model_id)
-        _debug(f"[messages] converted to openai: {_truncate(oai_body, 5000)}")
+        _debug(f"[messages] converted to openai: {_truncate(oai_body, 2000)}")
     except Exception as e:
         _debug(f"[messages] ✗ conversion failed: {e}")
         _log(f"  CONVERSION ERROR: anthropic_to_openai failed: {type(e).__name__}: {e}")
@@ -3475,7 +3557,7 @@ async def messages(request: Request):
     oai_body["stream_options"] = {"include_usage": True}
 
     async def stream_gen(hdrs):
-        nonlocal endpoint, oai_body
+        nonlocal endpoint, oai_body, model_id
         # Use local variable to avoid sharing model_id across concurrent requests
         _req_model_id = model_id
         # Try free model for streaming
@@ -3975,6 +4057,10 @@ async def chat_completions(request: Request):
 
         async def openai_stream(hdrs):
             nonlocal endpoint, oai_body, model_id
+            # _track_model is the model used for logging/token tracking.
+            # We use a local variable instead of reassigning model_id to avoid
+            # UnboundLocalError in Python 3.12+ (nonlocal + assignment conflict).
+            _track_model = model_id
             # Try free model for streaming: swap endpoint/model before starting stream
             free_model = FREE_MODEL_MAP.get(model_id)
             if free_model:
@@ -3987,11 +4073,11 @@ async def chat_completions(request: Request):
                 oai_body["model"] = free_model
                 endpoint = API_BASE_FREE
                 _using_free = True
-                model_id = free_model  # Log as free model
+                _track_model = free_model  # Log as free model
             else:
                 _using_free = False
             est_input = _estimate_input_tokens(body)
-            _update_token_usage(model_id, est_input, 0, 0)
+            _update_token_usage(_track_model, est_input, 0, 0)
             _debug(f"  [chat-stream] est_input={est_input}")
             stream_out = 0
             actual_usage = None
@@ -4004,11 +4090,12 @@ async def chat_completions(request: Request):
                         if resp.status_code != 200:
                             # Free model 429 → fall back to paid model
                             if _using_free and resp.status_code == 429:
-                                _debug(f"  [chat-stream] free model 429 → falling back to paid {model_id!r}")
-                                _log(f"  FREE model rate limited → falling back to paid {model_id!r}")
+                                _debug(f"  [chat-stream] free model 429 → falling back to paid {_track_model!r}")
+                                _log(f"  FREE model rate limited → falling back to paid {_track_model!r}")
                                 oai_body = paid_oai_body
                                 endpoint = paid_endpoint
                                 _using_free = False
+                                _track_model = model_id  # Revert tracking to paid model
                                 continue
                             hdrs, should_retry = await _handle_429(hdrs, resp.status_code, _attempt, resp.headers)
                             if should_retry:
@@ -4029,6 +4116,9 @@ async def chat_completions(request: Request):
                                     hdrs = _get_auth_headers("openai", entry=alt)
                                     continue
                             ak_h = _alias_for_key(_key_from_headers(hdrs, "openai"))
+                            # Log 401 body specifically for key diagnosis
+                            if resp.status_code == 401:
+                                _debug(f"  [auth] 401 response body: {err.decode('utf-8', errors='replace')[:500]}")
                             # Convert 429/401 → 503 to avoid Claude Code auth window
                             err_status = 503 if resp.status_code in (429, 401) else resp.status_code
                             if resp.status_code == 429:
@@ -4078,19 +4168,29 @@ async def chat_completions(request: Request):
 
                         # Stream ended — finalize tracking
                         final_in, final_out, final_cache, log_tag = _finalize_stream_tokens(
-                            model_id, est_input, None, stream_out, 0,
+                            _track_model, est_input, None, stream_out, 0,
                             actual_usage, _token_usage, _token_lock)
                         ak_h = _alias_for_key(_key_from_headers(hdrs, "openai"))
-                        await _save_and_log_request(req_id, model_id, original_model, start_time,
+                        await _save_and_log_request(req_id, _track_model, original_model, start_time,
                                      final_in, final_out, final_cache, protocol, True, thinking_type,
                                      effort, client_ip, ak_h, tool_names, log_tag,
                                      tools_used=used_tools if used_tools else None,
                                      request_body=request_body)
+                        _cb_record_success(endpoint)  # Stream completed successfully
                 except Exception as e:
+                    _cb_record_failure(endpoint)  # Record failure for circuit breaker
                     _log(f"  ERROR stream (attempt {_attempt+1}): {type(e).__name__}: {e}")
                     _debug(f"  ✗ stream exception: {type(e).__name__}: {e}\n{traceback.format_exc()}")
                     if _attempt == 0:
-                        # Try alternative key on retry
+                        # Network errors (server disconnect, timeout) → retry with same key first
+                        _is_network_error = isinstance(e, (httpx.RemoteProtocolError, httpx.ReadError,
+                                                           ConnectionError, OSError)) or "disconnected" in str(e).lower()
+                        if _is_network_error:
+                            _debug(f"  ⟳ stream retry (network error, same key)")
+                            _log(f"  Retrying stream (network error, same key)")
+                            await asyncio.sleep(1.0)
+                            continue
+                        # Auth/quota errors → try alternative key
                         failed_key = _key_from_headers(hdrs, "openai")
                         if not _key_pauser.is_paused(failed_key):
                             try:
@@ -4106,11 +4206,11 @@ async def chat_completions(request: Request):
                         continue
                     try:
                         with _token_lock:
-                            _token_usage[model_id]["input"] -= est_input
+                            _token_usage[_track_model]["input"] -= est_input
                     except Exception as e:
                         _debug(f"  ✗ token rollback failed: {type(e).__name__}: {e}")
                     ak_h = _alias_for_key(_key_from_headers(hdrs, "openai"))
-                    await _log_and_save_error(req_id, model_id, original_model, start_time,
+                    await _log_and_save_error(req_id, _track_model, original_model, start_time,
                                  0, str(e), protocol, True, thinking_type,
                                  effort, client_ip, ak_h, tool_names,
                                  request_body=request_body)
@@ -4201,6 +4301,7 @@ async def chat_completions(request: Request):
 
     # ── Streaming with Anthropic backend (true streaming) ──
     async def _anthro_to_oai_stream(hdrs):
+        nonlocal model_id
         _id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
         _created = int(time.time())
         started = False
@@ -4248,6 +4349,9 @@ async def chat_completions(request: Request):
                                        "anthropic-version": "2023-06-01"}
                                 continue
                         ak = _alias_for_key(hdrs.get("x-api-key", ""))
+                        # Log 401 body specifically for key diagnosis
+                        if resp.status_code == 401:
+                            _debug(f"  [auth] 401 response body: {err.decode('utf-8', errors='replace')[:500]}")
                         await _log_and_save_error(req_id, model_id, original_model, start_time,
                                      resp.status_code, str(resp.status_code), protocol, True, thinking_type,
                                      effort, client_ip, ak, tool_names,
@@ -4379,12 +4483,22 @@ async def chat_completions(request: Request):
                                     usage_chunk["usage"]["prompt_tokens_details"] = {"cached_tokens": cache_read}
                                 yield b"data: " + json.dumps(usage_chunk, ensure_ascii=False).encode() + b"\n\n"
                                 yield b"data: [DONE]\n\n"
+                                _cb_record_success(endpoint)  # Stream completed successfully
                                 return
             except Exception as e:
+                _cb_record_failure(endpoint)  # Record failure for circuit breaker
                 _log(f"  ERROR stream (attempt {_attempt+1}): {type(e).__name__}: {e}")
                 _debug(f"  ✗ stream exception: {type(e).__name__}: {e}\n{traceback.format_exc()}")
                 if _attempt == 0:
-                    # Try alternative key on retry
+                    # Network errors (server disconnect, timeout) → retry with same key first
+                    _is_network_error = isinstance(e, (httpx.RemoteProtocolError, httpx.ReadError,
+                                                       ConnectionError, OSError)) or "disconnected" in str(e).lower()
+                    if _is_network_error:
+                        _debug(f"  ⟳ stream retry (network error, same key)")
+                        _log(f"  Retrying stream (network error, same key)")
+                        await asyncio.sleep(1.0)
+                        continue
+                    # Auth/quota errors → try alternative key
                     failed_key = _key_from_headers(hdrs, "anthropic")
                     if not _key_pauser.is_paused(failed_key):
                         try:

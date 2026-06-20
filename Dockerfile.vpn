@@ -1,9 +1,14 @@
-FROM alpine:3.19
+FROM python:3.11
 
-RUN apk add --no-cache openvpn tinyproxy curl bash
+RUN echo 'deb http://deb.debian.org/debian bookworm main' > /etc/apt/sources.list && \
+    echo 'deb http://deb.debian.org/debian bookworm-updates main' >> /etc/apt/sources.list && \
+    echo 'deb http://deb.debian.org/debian-security bookworm-security main' >> /etc/apt/sources.list && \
+    apt-get update -o Acquire::Check-Valid-Until=false && \
+    apt-get install -y --no-install-recommends openvpn curl && \
+    rm -rf /var/lib/apt/lists/*
 
 COPY vpn/ /vpn/
-RUN chmod +x /vpn/entrypoint.sh
+RUN chmod +x /vpn/entrypoint.sh /vpn/proxy.py
 
 EXPOSE 8888
 

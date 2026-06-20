@@ -860,8 +860,12 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
     async def get_vpn_status():
         """Get current VPN status, IP, server, and usage stats."""
         import shared_state
-        if shared_state.vpn_manager and shared_state.free_ip_pool:
-            return shared_state.free_ip_pool.get_status()
+        if shared_state.vpn_manager:
+            # Check for existing Docker container
+            shared_state.vpn_manager._check_existing_docker()
+            if shared_state.free_ip_pool:
+                return shared_state.free_ip_pool.get_status()
+            return shared_state.vpn_manager.get_status()
         return {"enabled": False, "status": "not_configured"}
 
     @app.get("/api/vpn-config")
@@ -925,17 +929,22 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
 
     @app.post("/api/vpn/connect")
     async def connect_vpn():
-        """Connect VPN — tries OpenVPN first, falls back to waiting for NordVPN app."""
+        """Connect VPN — checks for existing container first, then tries connection."""
         import shared_state
         if not shared_state.vpn_manager:
             return {"error": "VPN manager not initialized"}
+
+        # Check if Docker container is already running
+        shared_state.vpn_manager._check_existing_docker()
+        if shared_state.vpn_manager.status == "connected":
+            return {"ok": True, "ip": shared_state.vpn_manager.current_ip, "server": {"name": "Docker VPN"}}
+
         try:
             ip = await shared_state.vpn_manager.connect_next()
             return {"ok": True, "ip": ip, "server": shared_state.vpn_manager.current_server}
         except Exception as e:
             error_msg = str(e)
             if "AUTH_FAILED" in error_msg or "lockout" in error_msg.lower():
-                # OpenVPN failed — try waiting for NordVPN app connection
                 _debug("[vpn] OpenVPN failed, switching to NordVPN app detection mode")
                 try:
                     ip = await shared_state.vpn_manager.connect_wait()
@@ -1049,6 +1058,111 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
             shared_state.vpn_manager._auth_file = cred_path
 
         return {"ok": True}
+
+    # ── SOCKS5 proxy endpoints ──
+
+    @app.get("/api/vpn/socks5")
+    async def get_socks5_proxies():
+        """Get list of SOCKS5 proxies."""
+        import shared_state
+        if shared_state.vpn_manager:
+            return {
+                "proxies": shared_state.vpn_manager.get_socks5_proxies(),
+                "rotate": shared_state.vpn_manager.socks5_rotate,
+            }
+        return {"proxies": [], "rotate": True}
+
+    @app.post("/api/vpn/socks5")
+    async def add_socks5_proxy(request: Request):
+        """Add a SOCKS5 proxy."""
+        import shared_state
+        body = await request.json()
+        host = body.get("host", "").strip()
+        port = int(body.get("port", 1080))
+        username = body.get("username", "").strip()
+        password = body.get("password", "").strip()
+
+        if not host:
+            return {"error": "Host required"}
+
+        if shared_state.vpn_manager:
+            shared_state.vpn_manager.add_socks5_proxy(host, port, username, password)
+            return {"ok": True, "proxies": shared_state.vpn_manager.get_socks5_proxies()}
+        return {"error": "VPN manager not initialized"}
+
+    @app.post("/api/vpn/socks5/remove")
+    async def remove_socks5_proxy(request: Request):
+        """Remove a SOCKS5 proxy by index."""
+        import shared_state
+        body = await request.json()
+        index = body.get("index")
+
+        if index is None:
+            return {"error": "Index required"}
+
+        if shared_state.vpn_manager:
+            shared_state.vpn_manager.remove_socks5_proxy(int(index))
+            return {"ok": True, "proxies": shared_state.vpn_manager.get_socks5_proxies()}
+        return {"error": "VPN manager not initialized"}
+
+    @app.post("/api/vpn/socks5/toggle")
+    async def toggle_socks5_proxy(request: Request):
+        """Enable or disable a SOCKS5 proxy."""
+        import shared_state
+        body = await request.json()
+        index = body.get("index")
+        enabled = body.get("enabled", True)
+
+        if index is None:
+            return {"error": "Index required"}
+
+        if shared_state.vpn_manager:
+            shared_state.vpn_manager.toggle_socks5_proxy(int(index), enabled)
+            return {"ok": True, "proxies": shared_state.vpn_manager.get_socks5_proxies()}
+        return {"error": "VPN manager not initialized"}
+
+    @app.post("/api/vpn/socks5/test")
+    async def test_socks5_proxy(request: Request):
+        """Test a SOCKS5 proxy connection."""
+        import shared_state
+        body = await request.json()
+        host = body.get("host", "").strip()
+        port = int(body.get("port", 1080))
+
+        if not host:
+            return {"error": "Host required"}
+
+        if shared_state.vpn_manager:
+            result = await shared_state.vpn_manager.test_socks5_proxy(host, port)
+            return result
+        return {"error": "VPN manager not initialized"}
+
+    @app.post("/api/vpn/proxy-mode")
+    async def set_proxy_mode(request: Request):
+        """Change the proxy mode (vpn, socks5, direct)."""
+        import shared_state
+        body = await request.json()
+        mode = body.get("mode", "vpn")
+
+        if mode not in ("vpn", "socks5", "direct"):
+            return {"error": "Invalid mode. Must be vpn, socks5, or direct"}
+
+        if shared_state.vpn_manager:
+            shared_state.vpn_manager.proxy_mode = mode
+            return {"ok": True, "proxy_mode": mode}
+        return {"error": "VPN manager not initialized"}
+
+    @app.post("/api/vpn/socks5/rotate")
+    async def set_socks5_rotation(request: Request):
+        """Enable or disable SOCKS5 proxy rotation."""
+        import shared_state
+        body = await request.json()
+        rotate = body.get("rotate", True)
+
+        if shared_state.vpn_manager:
+            shared_state.vpn_manager.socks5_rotate = rotate
+            return {"ok": True, "rotate": rotate}
+        return {"error": "VPN manager not initialized"}
 
     @app.get("/api/tools")
     async def get_tools(days: int = 7, all: bool = False):

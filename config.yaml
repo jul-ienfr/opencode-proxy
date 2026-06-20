@@ -69,8 +69,9 @@ free_model_map:
   deepseek-v4-flash: deepseek-v4-flash-free
   mimo-v2.5: mimo-v2.5-free
 ip_rotation:
-  enabled: false
-  mode: wsl2
+  enabled: true
+  proxy_mode: vpn
+  mode: docker
   free_only: true
   vpn_proxy_port: 8888
   openvpn:
@@ -84,7 +85,9 @@ ip_rotation:
   quota_per_ip: 300
   switch_delay: 5
   docker_image: openvpn-nordvpn
-  switch_delay: 5
+  socks5_proxies:
+    rotate_socks5: true
+    list: []
 custom_routes:
   mimov25:
     match:

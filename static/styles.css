@@ -1054,4 +1054,37 @@ footer {
 .toggle-switch input:checked + .toggle-slider { background: var(--success); }
 .toggle-switch input:checked + .toggle-slider:before { transform: translateX(20px); }
 .status-dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; background: var(--text-muted); margin-right: 6px; vertical-align: middle; }
+
+/* ── Proxy mode selector ── */
+.proxy-mode-btn {
+    display: inline-flex;
+    align-items: center;
+    padding: 6px 14px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 13px;
+    font-weight: 500;
+    background: var(--bg-tertiary);
+    color: var(--text-muted);
+    border: 1px solid var(--border);
+    transition: all 0.2s;
+    user-select: none;
+}
+.proxy-mode-btn:hover {
+    background: var(--bg-secondary);
+    color: var(--text-primary);
+}
+.proxy-mode-btn.active {
+    background: var(--primary);
+    color: white;
+    border-color: var(--primary);
+}
+
+/* ── SOCKS5 proxy list ── */
+.socks5-item {
+    transition: background 0.15s;
+}
+.socks5-item:hover {
+    background: var(--bg-tertiary);
+}
 .tool-compat-table td[data-model]:hover { background: var(--bg-secondary); }

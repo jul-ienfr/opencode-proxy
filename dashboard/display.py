@@ -27,7 +27,7 @@ _debug_file = None
 _debug_file_path = None
 _debug_write_counter = 0
 _DEBUG_FLUSH_INTERVAL = 10  # Flush to disk every N writes (reduces syscall overhead)
-_DEBUG_MAX_SIZE = 50 * 1024 * 1024  # Auto-rotate when file exceeds 50 MB
+_DEBUG_MAX_SIZE = 10 * 1024 * 1024  # Auto-rotate when file exceeds 10 MB
 
 
 def _rotate_debug_log():
