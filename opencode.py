@@ -4952,11 +4952,30 @@ class ServerManager:
 
 if __name__ == "__main__":
     import sys
+    import signal
+    import traceback as _traceback
 
     use_gui = "--gui" in sys.argv
 
     mgr = ServerManager(app, HOST, PORT, WEB_PORT)
     _server_manager = mgr
+
+    # Signal handler for clean shutdown on SIGINT/SIGTERM
+    def _shutdown_handler(signum, frame):
+        _log(f"Signal {signum} received, shutting down...")
+        try:
+            mgr.stop()
+        except Exception:
+            pass
+        _db_flush()
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, _shutdown_handler)
+    try:
+        signal.signal(signal.SIGTERM, _shutdown_handler)
+    except (OSError, AttributeError):
+        pass  # SIGTERM not available on Windows
+
     mgr.start()
 
     _log(f"API: http://localhost:{PORT}")
@@ -4969,4 +4988,17 @@ if __name__ == "__main__":
             sys.exit(1)
         run_gui(mgr, HOST, PORT, WEB_PORT)
     else:
-        run_terminal_loop(ROUTES, _token_usage, _token_lock)
+        try:
+            run_terminal_loop(ROUTES, _token_usage, _token_lock)
+        except KeyboardInterrupt:
+            _log("Interrupted by user (Ctrl+C)")
+        except Exception as e:
+            _log(f"FATAL: terminal loop crashed: {type(e).__name__}: {e}")
+            _debug(f"  [FATAL] traceback:\n{_traceback.format_exc()}")
+        finally:
+            _debug("  [main] cleaning up after terminal loop exit...")
+            try:
+                mgr.stop()
+            except Exception:
+                pass
+            _db_flush()

@@ -277,9 +277,13 @@ def start_input_thread():
 def run_terminal_loop(routes, token_usage, token_lock):
     global _display_dirty
     stop = start_input_thread()
-    with Live(build_display(routes, token_usage, token_lock), refresh_per_second=1, screen=True) as live:
-        while stop():
-            if _display_dirty:
-                _display_dirty = False
-                live.update(build_display(routes, token_usage, token_lock))
-            time.sleep(0.5)
+    try:
+        with Live(build_display(routes, token_usage, token_lock), refresh_per_second=1, screen=True) as live:
+            while stop():
+                if _display_dirty:
+                    _display_dirty = False
+                    live.update(build_display(routes, token_usage, token_lock))
+                time.sleep(0.5)
+    except Exception as e:
+        _debug(f"  [display] crashed: {type(e).__name__}: {e}")
+        raise  # re-throw so __main__ handler can log it too
