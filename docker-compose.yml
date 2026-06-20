@@ -1,0 +1,23 @@
+services:
+  opencode-proxy:
+    build: .
+    ports:
+      - "4000:4000"
+      - "8082:8082"
+    env_file:
+      - .env
+    volumes:
+      - ./logs:/app/logs
+    restart: unless-stopped
+
+  vpn-proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile.vpn
+    ports:
+      - "8888:8888"
+    volumes:
+      - ./vpn:/vpn
+    restart: unless-stopped
+    profiles:
+      - vpn

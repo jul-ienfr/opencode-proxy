@@ -24,7 +24,7 @@
                 <button class="tab active" data-tab="stats" data-i18n="nav.stats">Token Stats</button>
                 <button class="tab" data-tab="logs" data-i18n="nav.logs">Logs</button>
                 <button class="tab" data-tab="quotas" data-i18n="nav.quotas">Quotas</button>
-                <button class="tab" data-tab="vpn" data-i18n="nav.vpn">VPN & IP</button>
+                <button class="tab" data-tab="vpn" data-i18n="nav.free_models">Modèles Gratuits</button>
                 <button class="tab" data-tab="config" data-i18n="nav.config">Configuration</button>
                 <button class="tab" data-tab="debug-logs" data-i18n="nav.debug_logs" style="display:none">Debug Logs</button>
             </nav>
@@ -264,17 +264,47 @@
 
             <section id="vpn" class="tab-content">
                 <div class="card">
-                    <h2 data-i18n="vpn.title">VPN & IP Rotation</h2>
-                    <p class="config-hint" data-i18n="vpn.hint">Rotate IP addresses for free model quota via OpenVPN</p>
+                    <h2 data-i18n="free_models.title">Modèles Gratuits</h2>
+                    <p class="config-hint" data-i18n="free_models.hint">Gestion des accès aux modèles gratuits</p>
+
+                    <!-- Master enable toggle -->
+                    <div style="display:flex;align-items:center;gap:12px;margin-bottom:18px;padding:12px;background:var(--bg-secondary);border-radius:8px">
+                        <label class="toggle-switch" style="margin:0">
+                            <input type="checkbox" id="fm-toggle" onchange="toggleFreeModels(this.checked)">
+                            <span class="toggle-slider"></span>
+                        </label>
+                        <span id="fm-toggle-label" style="font-size:14px;font-weight:500" data-i18n="free_models.enable">Activer les modèles gratuits</span>
+                    </div>
+
+                    <!-- Proxy mode selector -->
+                    <div id="fm-proxy-mode-section" style="margin-bottom:18px;padding:12px;background:var(--bg-secondary);border-radius:8px">
+                        <div style="display:flex;align-items:center;gap:12px">
+                            <span class="label" style="font-weight:500" data-i18n="free_models.proxy_mode">Mode proxy</span>
+                            <div style="display:flex;gap:4px">
+                                <label class="proxy-mode-btn active" id="fm-mode-vpn" onclick="switchProxyMode('vpn')">
+                                    <input type="radio" name="proxy-mode" value="vpn" checked style="display:none">
+                                    <span data-i18n="free_models.mode_vpn">VPN (OpenVPN)</span>
+                                </label>
+                                <label class="proxy-mode-btn" id="fm-mode-socks5" onclick="switchProxyMode('socks5')">
+                                    <input type="radio" name="proxy-mode" value="socks5" style="display:none">
+                                    <span data-i18n="free_models.mode_socks5">SOCKS5</span>
+                                </label>
+                                <label class="proxy-mode-btn" id="fm-mode-direct" onclick="switchProxyMode('direct')">
+                                    <input type="radio" name="proxy-mode" value="direct" style="display:none">
+                                    <span data-i18n="free_models.mode_direct">Direct</span>
+                                </label>
+                            </div>
+                        </div>
+                    </div>
 
                     <!-- Real-time Status -->
                     <div id="vpn-status" class="vpn-status" style="margin-bottom:18px">
                         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
                             <div>
                                 <span id="vpn-status-dot" class="status-dot" style="display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:8px"></span>
-                                <strong id="vpn-status-text" data-i18n="vpn.disconnected">Disconnected</strong>
+                                <strong id="vpn-status-text" data-i18n="vpn.disconnected">Déconnecté</strong>
                             </div>
-                            <div>
+                            <div id="vpn-rotation-section">
                                 <label class="toggle-switch" style="margin:0">
                                     <input type="checkbox" id="vpn-toggle" onchange="toggleVPN(this.checked)">
                                     <span class="toggle-slider"></span>
@@ -307,6 +337,10 @@
                                 <span class="label" data-i18n="vpn.switches">Changements</span>
                                 <span id="vpn-switches" class="value">0</span>
                             </div>
+                            <div class="config-row">
+                                <span class="label" data-i18n="vpn.quota_per_ip">Quota / IP</span>
+                                <input type="number" id="vpn-quota-per-ip" class="config-input" value="300" style="width:80px;font-size:12px" onchange="saveQuotaPerIp()">
+                            </div>
                         </div>
                         <!-- Action buttons -->
                         <div style="display:flex;gap:8px;margin-top:12px">
@@ -316,90 +350,126 @@
                         </div>
                     </div>
 
-                    <!-- Configuration section -->
-                    <div style="margin-top:18px">
-                        <h3 data-i18n="vpn.config">Configuration</h3>
-                        <div class="vpn-config-display" style="background:var(--bg-secondary);border-radius:8px;padding:16px">
-                            <!-- Mode selector -->
-                            <div class="config-row" style="margin-bottom:12px">
-                                <span class="label" data-i18n="vpn.mode">Mode</span>
-                                <div style="display:flex;gap:8px;align-items:center">
-                                    <select id="vpn-mode" class="config-input" style="width:120px;font-size:12px" onchange="vpnSaveConfig()">
-                                        <option value="wsl2">WSL2</option>
-                                        <option value="docker">Docker</option>
-                                    </select>
-                                    <span style="font-size:12px;color:var(--text-muted)" id="vpn-mode-hint">WSL2 (léger, déjà installé)</span>
+                    <!-- VPN Configuration (shown when mode=vpn) -->
+                    <div id="fm-vpn-section">
+                        <div style="margin-top:18px">
+                            <h3 data-i18n="vpn.config">Configuration VPN</h3>
+                            <div class="vpn-config-display" style="background:var(--bg-secondary);border-radius:8px;padding:16px">
+                                <!-- Mode selector -->
+                                <div class="config-row" style="margin-bottom:12px">
+                                    <span class="label" data-i18n="vpn.mode">Mode</span>
+                                    <div style="display:flex;gap:8px;align-items:center">
+                                        <select id="vpn-mode" class="config-input" style="width:120px;font-size:12px" onchange="vpnSaveConfig()">
+                                            <option value="wsl2">WSL2</option>
+                                            <option value="docker">Docker</option>
+                                        </select>
+                                        <span style="font-size:12px;color:var(--text-muted)" id="vpn-mode-hint">WSL2 (léger, déjà installé)</span>
+                                    </div>
+                                </div>
+                                <!-- Proxy port -->
+                                <div class="config-row" style="margin-bottom:12px">
+                                    <span class="label" data-i18n="vpn.proxy_port">Port proxy</span>
+                                    <input type="number" id="vpn-proxy-port" class="config-input" value="8888" style="width:80px;font-size:12px" onchange="vpnSaveConfig()">
+                                </div>
+                                <!-- Switch delay -->
+                                <div class="config-row" style="margin-bottom:12px">
+                                    <span class="label" data-i18n="vpn.switch_delay">Délai switch (s)</span>
+                                    <input type="number" id="vpn-switch-delay" class="config-input" value="5" style="width:80px;font-size:12px" onchange="vpnSaveConfig()">
+                                </div>
+                                <!-- Docker image (shown only in docker mode) -->
+                                <div class="config-row" id="vpn-docker-row" style="display:none;margin-bottom:12px">
+                                    <span class="label" data-i18n="vpn.docker_image">Image Docker</span>
+                                    <input type="text" id="vpn-docker-image" class="config-input" value="openvpn-nordvpn" style="width:200px;font-size:12px" onchange="vpnSaveConfig()">
+                                </div>
+                                <!-- Status summary -->
+                                <div style="margin-top:8px;padding-top:8px;border-top:1px solid var(--border);font-size:12px;color:var(--text-muted)">
+                                    <span data-i18n="vpn.config_summary">Config sauvée automatiquement</span>
                                 </div>
                             </div>
-                            <!-- Proxy port -->
-                            <div class="config-row" style="margin-bottom:12px">
-                                <span class="label" data-i18n="vpn.proxy_port">Port proxy</span>
-                                <input type="number" id="vpn-proxy-port" class="config-input" value="8888" style="width:80px;font-size:12px" onchange="vpnSaveConfig()">
+                        </div>
+
+                        <!-- Two columns: Credentials + Servers -->
+                        <div style="display:grid;grid-template-columns:1fr 1fr;gap:18px;margin-top:18px">
+                            <!-- Left: Credentials -->
+                            <div>
+                                <h3 data-i18n="vpn.credentials">Identifiants NordVPN</h3>
+                                <p class="config-hint" data-i18n="vpn.credentials_hint">Identifiants de service (Manual Setup)</p>
+                                <div id="vpn-cred-status" style="margin-bottom:8px;font-size:13px"></div>
+                                <div class="vpn-cred-display" style="background:var(--bg-secondary);border-radius:8px;padding:12px;margin-bottom:12px">
+                                    <div class="config-row">
+                                        <span class="label">Username</span>
+                                        <span id="vpn-cred-username" class="value" style="font-family:monospace">—</span>
+                                    </div>
+                                    <div class="config-row">
+                                        <span class="label">Password</span>
+                                        <span id="vpn-cred-password" class="value" style="font-family:monospace">—</span>
+                                    </div>
+                                    <div class="config-row">
+                                        <span class="label">Fichier</span>
+                                        <span id="vpn-cred-file" class="value" style="font-size:12px;color:var(--text-muted)">—</span>
+                                    </div>
+                                </div>
+                                <div style="display:flex;gap:6px;flex-wrap:wrap">
+                                    <input type="text" id="vpn-username" class="config-input" placeholder="Username" style="width:140px;font-size:12px">
+                                    <input type="password" id="vpn-password" class="config-input" placeholder="Password" style="width:140px;font-size:12px">
+                                    <button class="btn btn-primary" onclick="vpnSaveCredentials()" data-i18n="vpn.save_credentials">Enregistrer</button>
+                                </div>
                             </div>
-                            <!-- Switch delay -->
-                            <div class="config-row" style="margin-bottom:12px">
-                                <span class="label" data-i18n="vpn.switch_delay">Délai switch (s)</span>
-                                <input type="number" id="vpn-switch-delay" class="config-input" value="5" style="width:80px;font-size:12px" onchange="vpnSaveConfig()">
-                            </div>
-                            <!-- Quota per IP -->
-                            <div class="config-row" style="margin-bottom:12px">
-                                <span class="label" data-i18n="vpn.quota_per_ip">Quota / IP</span>
-                                <input type="number" id="vpn-quota-per-ip" class="config-input" value="300" style="width:80px;font-size:12px" onchange="vpnSaveConfig()">
-                            </div>
-                            <!-- Docker image (shown only in docker mode) -->
-                            <div class="config-row" id="vpn-docker-row" style="display:none;margin-bottom:12px">
-                                <span class="label" data-i18n="vpn.docker_image">Image Docker</span>
-                                <input type="text" id="vpn-docker-image" class="config-input" value="openvpn-nordvpn" style="width:200px;font-size:12px" onchange="vpnSaveConfig()">
-                            </div>
-                            <!-- Status summary -->
-                            <div style="margin-top:8px;padding-top:8px;border-top:1px solid var(--border);font-size:12px;color:var(--text-muted)">
-                                <span data-i18n="vpn.config_summary">Config sauvée automatiquement</span>
+
+                            <!-- Right: Server Config -->
+                            <div>
+                                <h3 data-i18n="vpn.servers">Serveurs VPN</h3>
+                                <p class="config-hint" data-i18n="vpn.servers_hint">Configs .ovpn NordVPN</p>
+                                <div id="vpn-servers-list" style="max-height:180px;overflow-y:auto;margin-bottom:12px"></div>
+                                <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">
+                                    <input type="text" id="vpn-server-name" class="config-input" placeholder="Nom (ex: NordVPN-FR)" style="width:120px;font-size:12px">
+                                    <label class="btn" style="cursor:pointer;margin:0;font-size:12px">
+                                        <span data-i18n="vpn.browse">Parcourir</span>
+                                        <input type="file" id="vpn-file-input" accept=".ovpn" style="display:none" onchange="vpnFileSelected(this)">
+                                    </label>
+                                    <button class="btn btn-primary" onclick="vpnAddServer()" data-i18n="vpn.add_server">Ajouter</button>
+                                </div>
+                                <div id="vpn-selected-file" style="font-size:12px;color:var(--text-muted);margin-top:6px"></div>
                             </div>
                         </div>
                     </div>
 
-                    <!-- Two columns: Credentials + Servers -->
-                    <div style="display:grid;grid-template-columns:1fr 1fr;gap:18px;margin-top:18px">
-                        <!-- Left: Credentials -->
-                        <div>
-                            <h3 data-i18n="vpn.credentials">Identifiants NordVPN</h3>
-                            <p class="config-hint" data-i18n="vpn.credentials_hint">Identifiants de service (Manual Setup)</p>
-                            <div id="vpn-cred-status" style="margin-bottom:8px;font-size:13px"></div>
-                            <div class="vpn-cred-display" style="background:var(--bg-secondary);border-radius:8px;padding:12px;margin-bottom:12px">
-                                <div class="config-row">
-                                    <span class="label">Username</span>
-                                    <span id="vpn-cred-username" class="value" style="font-family:monospace">—</span>
-                                </div>
-                                <div class="config-row">
-                                    <span class="label">Password</span>
-                                    <span id="vpn-cred-password" class="value" style="font-family:monospace">—</span>
-                                </div>
-                                <div class="config-row">
-                                    <span class="label">Fichier</span>
-                                    <span id="vpn-cred-file" class="value" style="font-size:12px;color:var(--text-muted)">—</span>
-                                </div>
-                            </div>
-                            <div style="display:flex;gap:6px;flex-wrap:wrap">
-                                <input type="text" id="vpn-username" class="config-input" placeholder="Username" style="width:140px;font-size:12px">
-                                <input type="password" id="vpn-password" class="config-input" placeholder="Password" style="width:140px;font-size:12px">
-                                <button class="btn btn-primary" onclick="vpnSaveCredentials()" data-i18n="vpn.save_credentials">Enregistrer</button>
-                            </div>
+                    <!-- SOCKS5 Proxy Section (shown when mode=socks5) -->
+                    <div id="fm-socks5-section" style="display:none">
+                        <h3 style="margin-top:18px" data-i18n="free_models.socks5_title">Proxies SOCKS5</h3>
+                        <p class="config-hint" data-i18n="free_models.socks5_hint">Liste des proxies pour routage des requêtes gratuites</p>
+
+                        <!-- Rotation toggle -->
+                        <div style="display:flex;align-items:center;gap:12px;margin-bottom:12px;padding:10px;background:var(--bg-secondary);border-radius:8px">
+                            <label class="toggle-switch" style="margin:0">
+                                <input type="checkbox" id="fm-socks5-rotate" onchange="toggleSocks5Rotation(this.checked)">
+                                <span class="toggle-slider"></span>
+                            </label>
+                            <span style="font-size:13px" data-i18n="free_models.socks5_rotation">Rotation auto entre les proxies</span>
                         </div>
 
-                        <!-- Right: Server Config -->
-                        <div>
-                            <h3 data-i18n="vpn.servers">Serveurs VPN</h3>
-                            <p class="config-hint" data-i18n="vpn.servers_hint">Configs .ovpn NordVPN</p>
-                            <div id="vpn-servers-list" style="max-height:180px;overflow-y:auto;margin-bottom:12px"></div>
-                            <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">
-                                <input type="text" id="vpn-server-name" class="config-input" placeholder="Nom (ex: NordVPN-FR)" style="width:120px;font-size:12px">
-                                <label class="btn" style="cursor:pointer;margin:0;font-size:12px">
-                                    <span data-i18n="vpn.browse">Parcourir</span>
-                                    <input type="file" id="vpn-file-input" accept=".ovpn" style="display:none" onchange="vpnFileSelected(this)">
-                                </label>
-                                <button class="btn btn-primary" onclick="vpnAddServer()" data-i18n="vpn.add_server">Ajouter</button>
+                        <!-- Proxy list -->
+                        <div id="fm-socks5-list" style="max-height:200px;overflow-y:auto;margin-bottom:12px"></div>
+
+                        <!-- Add proxy form -->
+                        <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:end">
+                            <div>
+                                <label style="font-size:11px;color:var(--text-muted);display:block;margin-bottom:2px" data-i18n="free_models.socks5_host">Hôte</label>
+                                <input type="text" id="fm-socks5-host" class="config-input" placeholder="1.2.3.4" style="width:120px;font-size:12px">
                             </div>
-                            <div id="vpn-selected-file" style="font-size:12px;color:var(--text-muted);margin-top:6px"></div>
+                            <div>
+                                <label style="font-size:11px;color:var(--text-muted);display:block;margin-bottom:2px" data-i18n="free_models.socks5_port">Port</label>
+                                <input type="number" id="fm-socks5-port" class="config-input" placeholder="1080" value="1080" style="width:70px;font-size:12px">
+                            </div>
+                            <div>
+                                <label style="font-size:11px;color:var(--text-muted);display:block;margin-bottom:2px" data-i18n="free_models.socks5_user">Utilisateur</label>
+                                <input type="text" id="fm-socks5-user" class="config-input" placeholder="(optionnel)" style="width:100px;font-size:12px">
+                            </div>
+                            <div>
+                                <label style="font-size:11px;color:var(--text-muted);display:block;margin-bottom:2px" data-i18n="free_models.socks5_pass">Mot de passe</label>
+                                <input type="password" id="fm-socks5-pass" class="config-input" placeholder="(optionnel)" style="width:100px;font-size:12px">
+                            </div>
+                            <button class="btn btn-primary" onclick="addSocks5Proxy()" data-i18n="free_models.socks5_add">Ajouter proxy</button>
                         </div>
                     </div>
 

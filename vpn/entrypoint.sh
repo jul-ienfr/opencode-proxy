@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/sh
 # Docker VPN entrypoint — launch OpenVPN + tinyproxy
 # Expects: /vpn/configs/<server>.ovpn and /vpn/credentials.txt
 
@@ -22,6 +22,7 @@ openvpn \
     --config "$CONFIG" \
     --auth-user-pass "$CREDS" \
     --auth-nocache \
+    --redirect-gateway def1 \
     --daemon \
     --log /tmp/openvpn.log
 
@@ -41,16 +42,17 @@ if ! ip link show tun0 >/dev/null 2>&1; then
     exit 1
 fi
 
+# Force all traffic through tun0
+ip route del default 2>/dev/null || true
+ip route add default via 10.100.0.1 dev tun0 2>/dev/null || true
+
 # Check VPN IP
 VPN_IP=$(curl -s --max-time 10 https://api.ipify.org 2>/dev/null || echo "unknown")
 echo "VPN IP: $VPN_IP"
 
-# Configure tinyproxy
-sed -i "s/^Port .*/Port $PROXY_PORT/" /etc/tinyproxy/tinyproxy.conf
-sed -i "s/^Allow .*/Allow 127.0.0.1/" /etc/tinyproxy/tinyproxy.conf
-
-# Start tinyproxy
-echo "Starting tinyproxy on port $PROXY_PORT..."
+# Configure and start tinyproxy
+sed -i "s/^Port .*/Port $PROXY_PORT/" /etc/tinyproxy/tinyproxy.conf 2>/dev/null || true
+sed -i "s/^Allow .*/Allow 0.0.0.0\/0/" /etc/tinyproxy/tinyproxy.conf 2>/dev/null || true
 tinyproxy
 
 echo "=== VPN ready ==="
@@ -62,7 +64,7 @@ while true; do
     sleep 30
     if ! pgrep openvpn >/dev/null 2>&1; then
         echo "OpenVPN died, restarting..."
-        openvpn --config "$CONFIG" --auth-user-pass "$CREDS" --auth-nocache --daemon --log /tmp/openvpn.log
+        openvpn --config "$CONFIG" --auth-user-pass "$CREDS" --auth-nocache --redirect-gateway def1 --daemon --log /tmp/openvpn.log
         sleep 5
     fi
 done

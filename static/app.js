@@ -28,8 +28,30 @@ const LOCALE = {
         'nav.stats': 'Token Stats',
         'nav.logs': 'Logs',
         'nav.quotas': 'Quotas',
-        'nav.vpn': 'VPN & IP',
+        'nav.free_models': 'Free Models',
         'nav.config': 'Configuration',
+        'free_models.title': 'Free Models',
+        'free_models.hint': 'Manage access to free model endpoints',
+        'free_models.enable': 'Enable free models',
+        'free_models.proxy_mode': 'Proxy mode',
+        'free_models.mode_vpn': 'VPN (OpenVPN)',
+        'free_models.mode_socks5': 'SOCKS5',
+        'free_models.mode_direct': 'Direct',
+        'free_models.socks5_title': 'SOCKS5 Proxies',
+        'free_models.socks5_hint': 'Proxy list for routing free model requests',
+        'free_models.socks5_add': 'Add proxy',
+        'free_models.socks5_test': 'Test',
+        'free_models.socks5_host': 'Host',
+        'free_models.socks5_port': 'Port',
+        'free_models.socks5_user': 'Username (optional)',
+        'free_models.socks5_pass': 'Password (optional)',
+        'free_models.socks5_testing': 'Testing...',
+        'free_models.socks5_ok': 'Connection OK',
+        'free_models.socks5_fail': 'Failed',
+        'free_models.socks5_remove': 'Remove this proxy?',
+        'free_models.socks5_rotation': 'Auto rotation between proxies',
+        'free_models.socks5_rotate_on': 'Rotation enabled',
+        'free_models.socks5_rotate_off': 'Rotation disabled',
         'vpn.title': 'VPN & IP Rotation',
         'vpn.hint': 'Rotate IP addresses for free model quota via OpenVPN',
         'vpn.status': 'Status',
@@ -237,8 +259,30 @@ const LOCALE = {
         'nav.stats': 'Statistiques',
         'nav.logs': 'Historique',
         'nav.quotas': 'Quotas',
-        'nav.vpn': 'VPN & IP',
+        'nav.free_models': 'Modèles Gratuits',
         'nav.config': 'Configuration',
+        'free_models.title': 'Modèles Gratuits',
+        'free_models.hint': 'Gestion des accès aux modèles gratuits',
+        'free_models.enable': 'Activer les modèles gratuits',
+        'free_models.proxy_mode': 'Mode proxy',
+        'free_models.mode_vpn': 'VPN (OpenVPN)',
+        'free_models.mode_socks5': 'SOCKS5',
+        'free_models.mode_direct': 'Direct',
+        'free_models.socks5_title': 'Proxies SOCKS5',
+        'free_models.socks5_hint': 'Liste des proxies pour routage des requêtes gratuites',
+        'free_models.socks5_add': 'Ajouter proxy',
+        'free_models.socks5_test': 'Tester',
+        'free_models.socks5_host': 'Hôte',
+        'free_models.socks5_port': 'Port',
+        'free_models.socks5_user': 'Utilisateur (optionnel)',
+        'free_models.socks5_pass': 'Mot de passe (optionnel)',
+        'free_models.socks5_testing': 'Test en cours...',
+        'free_models.socks5_ok': 'Connexion OK',
+        'free_models.socks5_fail': 'Échec',
+        'free_models.socks5_remove': 'Supprimer ce proxy ?',
+        'free_models.socks5_rotation': 'Rotation auto entre les proxies',
+        'free_models.socks5_rotate_on': 'Rotation activée',
+        'free_models.socks5_rotate_off': 'Rotation désactivée',
         'vpn.title': 'VPN & Rotation d\'IP',
         'vpn.hint': 'Rotation des adresses IP pour le quota gratuit via OpenVPN',
         'vpn.status': 'Statut',
@@ -2480,8 +2524,33 @@ document.addEventListener('DOMContentLoaded', () => {
             if (cfgData.mode) document.getElementById('vpn-mode').value = cfgData.mode;
             if (cfgData.proxy_port) document.getElementById('vpn-proxy-port').value = cfgData.proxy_port;
             if (cfgData.switch_delay) document.getElementById('vpn-switch-delay').value = cfgData.switch_delay;
+            if (cfgData.quota_per_ip) document.getElementById('vpn-quota-per-ip').value = cfgData.quota_per_ip;
             if (cfgData.docker_image) document.getElementById('vpn-docker-image').value = cfgData.docker_image;
             vpnInitConfig(cfgData.mode);
+
+            // Initialize proxy mode UI
+            if (cfgData.proxy_mode) {
+                setProxyModeUI(cfgData.proxy_mode);
+            }
+
+            // Initialize free models master toggle
+            const fmToggle = document.getElementById('fm-toggle');
+            const fmLabel = document.getElementById('fm-toggle-label');
+            if (fmToggle) {
+                fmToggle.checked = cfgData.enabled || false;
+                if (fmLabel) fmLabel.textContent = cfgData.enabled
+                    ? (t('free_models.enable') || 'Activer les modèles gratuits')
+                    : (t('free_models.enable') || 'Activer les modèles gratuits');
+            }
+        } catch (e) {}
+
+        // Load SOCKS5 proxies
+        try {
+            const socks5Resp = await fetch('/api/vpn/socks5');
+            const socks5Data = await socks5Resp.json();
+            renderSocks5List(socks5Data.proxies || []);
+            const rotateToggle = document.getElementById('fm-socks5-rotate');
+            if (rotateToggle) rotateToggle.checked = socks5Data.rotate !== false;
         } catch (e) {}
     }
 
@@ -2566,17 +2635,24 @@ document.addEventListener('DOMContentLoaded', () => {
         const mode = document.getElementById('vpn-mode').value;
         const proxyPort = parseInt(document.getElementById('vpn-proxy-port').value) || 8888;
         const switchDelay = parseInt(document.getElementById('vpn-switch-delay').value) || 5;
-        const quotaPerIp = parseInt(document.getElementById('vpn-quota-per-ip').value) || 300;
         const dockerImage = document.getElementById('vpn-docker-image')?.value || 'openvpn-nordvpn';
 
         await fetch('/api/vpn-config', {
             method: 'POST', headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({ mode, proxy_port: proxyPort, switch_delay: switchDelay, quota_per_ip: quotaPerIp, docker_image: dockerImage })
+            body: JSON.stringify({ mode, proxy_port: proxyPort, switch_delay: switchDelay, docker_image: dockerImage })
         });
 
         // Show/hide Docker options
         document.getElementById('vpn-docker-row').style.display = mode === 'docker' ? 'flex' : 'none';
         document.getElementById('vpn-mode-hint').textContent = mode === 'docker' ? 'Docker (reproductible, isolé)' : 'WSL2 (léger, déjà installé)';
+    };
+
+    window.saveQuotaPerIp = async function() {
+        const quotaPerIp = parseInt(document.getElementById('vpn-quota-per-ip').value) || 300;
+        await fetch('/api/vpn-config', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ quota_per_ip: quotaPerIp })
+        });
     };
 
     // Initialize mode selector from config
@@ -2662,6 +2738,151 @@ document.addEventListener('DOMContentLoaded', () => {
         _vpnSelectedFile = null;
         document.getElementById('vpn-file-input').value = '';
         refreshVPNStatus();
+    };
+
+    // ── Free Models master toggle ──
+    window.toggleFreeModels = async function(enabled) {
+        await fetch('/api/vpn/toggle', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({enabled})
+        });
+        refreshVPNStatus();
+    };
+
+    // ── Proxy mode switching ──
+    function setProxyModeUI(mode) {
+        // Update radio buttons
+        document.querySelectorAll('.proxy-mode-btn').forEach(btn => btn.classList.remove('active'));
+        const activeBtn = document.getElementById('fm-mode-' + mode);
+        if (activeBtn) activeBtn.classList.add('active');
+
+        // Show/hide sections
+        const vpnSection = document.getElementById('fm-vpn-section');
+        const socks5Section = document.getElementById('fm-socks5-section');
+        if (vpnSection) vpnSection.style.display = mode === 'vpn' ? 'block' : 'none';
+        if (socks5Section) socks5Section.style.display = mode === 'socks5' ? 'block' : 'none';
+    }
+
+    window.switchProxyMode = async function(mode) {
+        setProxyModeUI(mode);
+        await fetch('/api/vpn/proxy-mode', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({mode})
+        });
+        refreshVPNStatus();
+    };
+
+    // ── SOCKS5 proxy management ──
+    function renderSocks5List(proxies) {
+        const list = document.getElementById('fm-socks5-list');
+        if (!list) return;
+        if (!proxies.length) {
+            list.innerHTML = '<div style="color:var(--text-muted);font-size:12px;padding:8px">Aucun proxy configuré</div>';
+            return;
+        }
+        list.innerHTML = proxies.map((p, i) => `
+            <div class="socks5-item" style="display:flex;justify-content:space-between;align-items:center;padding:8px 12px;background:var(--bg-secondary);border-radius:6px;margin-bottom:4px;font-size:13px">
+                <div style="display:flex;align-items:center;gap:12px">
+                    <label class="toggle-switch" style="margin:0">
+                        <input type="checkbox" ${p.enabled ? 'checked' : ''} onchange="toggleSocks5Proxy(${i}, this.checked)">
+                        <span class="toggle-slider"></span>
+                    </label>
+                    <span style="font-family:monospace;font-weight:bold">${escHtml(p.host)}:${escHtml(String(p.port))}</span>
+                    ${p.has_password ? '<span style="font-size:11px;color:var(--text-muted)">🔒</span>' : ''}
+                </div>
+                <div style="display:flex;gap:4px">
+                    <button class="btn btn-sm" onclick="testSocks5Proxy('${escHtml(p.host)}', ${p.port})" style="font-size:11px;padding:2px 8px" data-i18n="free_models.socks5_test">Tester</button>
+                    <button class="btn btn-sm btn-danger" onclick="removeSocks5Proxy(${i})" style="font-size:11px;padding:2px 8px">✕</button>
+                </div>
+            </div>
+        `).join('');
+    }
+
+    window.addSocks5Proxy = async function() {
+        const host = document.getElementById('fm-socks5-host').value.trim();
+        const port = parseInt(document.getElementById('fm-socks5-port').value) || 1080;
+        const username = document.getElementById('fm-socks5-user').value.trim();
+        const password = document.getElementById('fm-socks5-pass').value.trim();
+
+        if (!host) return alert('Hôte requis');
+
+        const resp = await fetch('/api/vpn/socks5', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({host, port, username, password})
+        });
+        const data = await resp.json();
+        if (data.error) return alert('Erreur: ' + data.error);
+
+        // Clear form
+        document.getElementById('fm-socks5-host').value = '';
+        document.getElementById('fm-socks5-port').value = '1080';
+        document.getElementById('fm-socks5-user').value = '';
+        document.getElementById('fm-socks5-pass').value = '';
+
+        renderSocks5List(data.proxies || []);
+    };
+
+    window.removeSocks5Proxy = async function(index) {
+        if (!confirm(t('free_models.socks5_remove') || 'Supprimer ce proxy ?')) return;
+
+        const resp = await fetch('/api/vpn/socks5/remove', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({index})
+        });
+        const data = await resp.json();
+        renderSocks5List(data.proxies || []);
+    };
+
+    window.toggleSocks5Proxy = async function(index, enabled) {
+        await fetch('/api/vpn/socks5/toggle', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({index, enabled})
+        });
+    };
+
+    window.testSocks5Proxy = async function(host, port) {
+        const btn = event.target;
+        const origText = btn.textContent;
+        btn.textContent = t('free_models.socks5_testing') || 'Test...';
+        btn.disabled = true;
+
+        try {
+            const resp = await fetch('/api/vpn/socks5/test', {
+                method: 'POST', headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({host, port})
+            });
+            const data = await resp.json();
+
+            if (data.ok) {
+                btn.textContent = '✓ ' + (data.ip || 'OK');
+                btn.style.color = 'var(--success)';
+                if (data.opencode_ok) {
+                    btn.title = 'opencode.ai accessible';
+                } else {
+                    btn.title = 'ipify OK, opencode.ai inaccessible';
+                }
+            } else {
+                btn.textContent = '✕ ' + (data.error || (t('free_models.socks5_fail') || 'Échec'));
+                btn.style.color = 'var(--danger)';
+            }
+        } catch (e) {
+            btn.textContent = '✕ Erreur';
+            btn.style.color = 'var(--danger)';
+        }
+
+        btn.disabled = false;
+        setTimeout(() => {
+            btn.textContent = origText;
+            btn.style.color = '';
+            btn.title = '';
+        }, 3000);
+    };
+
+    window.toggleSocks5Rotation = async function(enabled) {
+        await fetch('/api/vpn/socks5/rotate', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({rotate: enabled})
+        });
     };
 
     // Refresh VPN status every 10 seconds when VPN tab is active

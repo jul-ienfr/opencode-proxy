@@ -1,6 +1,6 @@
 fastapi>=0.100,<1
 uvicorn[standard]>=0.20,<1
-httpx>=0.24,<1
+httpx[socks]>=0.24,<1
 rich>=13,<15
 tiktoken>=0.7.0
 pystray>=0.19,<1

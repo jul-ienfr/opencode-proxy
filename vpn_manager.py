@@ -40,9 +40,23 @@ class VPNManager:
         self._enabled = config.get("enabled", False)
         self._switch_delay = config.get("switch_delay", 5)
 
+        # Proxy mode: vpn | socks5 | direct
+        self._proxy_mode = config.get("proxy_mode", "vpn")
+
         # Docker settings
         self._docker_image = config.get("docker_image", "openvpn-nordvpn")
         self._docker_container = "opencode-vpn"
+
+        # SOCKS5 proxy settings
+        socks5_cfg = config.get("socks5_proxies", {})
+        self._socks5_proxies: list[dict] = socks5_cfg.get("list", [])
+        self._socks5_rotate: bool = socks5_cfg.get("rotate_socks5", True)
+        self._socks5_cycle = None
+        self._socks5_current_index: int = -1
+        if self._socks5_proxies:
+            enabled = [p for p in self._socks5_proxies if p.get("enabled", True)]
+            if enabled:
+                self._socks5_cycle = itertools.cycle(enabled)
 
         # State
         self._cycle = itertools.cycle(self._servers) if self._servers else None
@@ -55,6 +69,10 @@ class VPNManager:
         self._auth_locked_until: float = 0.0
         self._total_switches = 0
         self._ip_history: list[dict] = []
+
+        # Check if Docker VPN is already running on startup
+        if self._mode == "docker":
+            self._check_existing_docker()
 
     @property
     def enabled(self) -> bool:
@@ -276,11 +294,29 @@ class VPNManager:
 
     # ── Docker mode ────────────────────────────────────────────
 
+    def _find_docker(self) -> str:
+        """Find Docker executable."""
+        import shutil
+        docker_path = shutil.which("docker")
+        if docker_path:
+            return docker_path
+        # Windows common paths
+        win_paths = [
+            r"C:\Program Files\Docker\Docker\resources\bin\docker.exe",
+            r"C:\Program Files (x86)\Docker\Docker\resources\bin\docker.exe",
+        ]
+        for p in win_paths:
+            if os.path.exists(p):
+                return p
+        return "docker"
+
     async def _connect_docker(self):
         """Connect via OpenVPN inside Docker container."""
         config_path = self._current_server.get("config", "")
         if not config_path or not os.path.exists(config_path):
             raise FileNotFoundError(f"Config not found: {config_path}")
+
+        docker_cmd = self._find_docker()
 
         # Ensure Docker image exists
         await self._docker_build()
@@ -289,18 +325,16 @@ class VPNManager:
         await self._stop_docker()
 
         # Run container with VPN config
-        abs_config = os.path.abspath(config_path)
-        abs_creds = os.path.abspath(self._auth_file)
+        abs_config = os.path.abspath(config_path).replace("\\", "/")
+        abs_creds = os.path.abspath(self._auth_file).replace("\\", "/")
         container = self._docker_container
 
         cmd = [
-            "docker", "run", "-d",
+            docker_cmd, "run", "-d",
             "--name", container,
             "--cap-add", "NET_ADMIN",
-            "--device", "/dev/net/tun:/dev/net/tun",
+            "--device", "/dev/net/tun",
             "-p", f"{self._proxy_port}:8888",
-            "-e", f"VPN_CONFIG=/vpn/configs/{os.path.basename(config_path)}",
-            "-e", f"VPN_CREDS=/vpn/credentials.txt",
             "-v", f"{abs_config}:/vpn/configs/{os.path.basename(config_path)}:ro",
             "-v", f"{abs_creds}:/vpn/credentials.txt:ro",
             "--rm",
@@ -331,27 +365,38 @@ class VPNManager:
 
     async def _stop_docker(self):
         """Stop and remove Docker VPN container."""
-        await self._run_docker(f"docker rm -f {self._docker_container} 2>/dev/null", check=False)
+        docker_cmd = self._find_docker()
+        proc = await asyncio.create_subprocess_exec(
+            docker_cmd, "rm", "-f", self._docker_container,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
+        await proc.communicate()
 
     async def _docker_build(self):
         """Build the VPN Docker image if it doesn't exist."""
-        ret = await self._run_docker(f"docker image inspect {self._docker_image} >/dev/null 2>&1", check=False)
-        if ret != 0:
+        docker_cmd = self._find_docker()
+        proc = await asyncio.create_subprocess_exec(
+            docker_cmd, "image", "inspect", self._docker_image,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
+        await proc.communicate()
+        if proc.returncode != 0:
             logger.info("[vpn] building Docker VPN image...")
             dockerfile = os.path.join(ROOT, "Dockerfile.vpn")
-            proc = await asyncio.create_subprocess_exec(
-                "docker", "build", "-t", self._docker_image, "-f", dockerfile, ROOT,
+            build_proc = await asyncio.create_subprocess_exec(
+                docker_cmd, "build", "-t", self._docker_image, "-f", dockerfile, ROOT,
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
             )
-            await proc.communicate()
-            if proc.returncode != 0:
+            await build_proc.communicate()
+            if build_proc.returncode != 0:
                 raise RuntimeError("Docker build failed")
             logger.info("[vpn] Docker image built: %s", self._docker_image)
 
     async def _run_docker(self, cmd: str, check: bool = True) -> int:
         """Run a command on the Docker VPN container."""
+        docker_cmd = self._find_docker()
         proc = await asyncio.create_subprocess_exec(
-            "docker", "exec", self._docker_container,
+            docker_cmd, "exec", self._docker_container,
             "bash", "-c", cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -359,7 +404,148 @@ class VPNManager:
         stdout, stderr = await proc.communicate()
         return proc.returncode
 
+    # ── SOCKS5 Proxy Management ──────────────────────────────
+
+    def _rebuild_socks5_cycle(self):
+        """Rebuild the SOCKS5 round-robin cycle from enabled proxies."""
+        enabled = [p for p in self._socks5_proxies if p.get("enabled", True)]
+        self._socks5_cycle = itertools.cycle(enabled) if enabled else None
+
+    @property
+    def proxy_mode(self) -> str:
+        return self._proxy_mode
+
+    @proxy_mode.setter
+    def proxy_mode(self, value: str):
+        if value in ("vpn", "socks5", "direct"):
+            self._proxy_mode = value
+
+    @property
+    def socks5_rotate(self) -> bool:
+        return self._socks5_rotate
+
+    @socks5_rotate.setter
+    def socks5_rotate(self, value: bool):
+        self._socks5_rotate = value
+
+    def get_socks5_proxies(self) -> list[dict]:
+        """Return the list of SOCKS5 proxies (without passwords)."""
+        return [
+            {"host": p["host"], "port": p["port"],
+             "username": p.get("username", ""), "enabled": p.get("enabled", True),
+             "has_password": bool(p.get("password"))}
+            for p in self._socks5_proxies
+        ]
+
+    def get_next_socks5_proxy(self) -> Optional[dict]:
+        """Get next SOCKS5 proxy via round-robin. Returns None if no proxies."""
+        if not self._socks5_cycle:
+            return None
+        try:
+            proxy = next(self._socks5_cycle)
+            return {"host": proxy["host"], "port": proxy["port"],
+                    "username": proxy.get("username", ""),
+                    "password": proxy.get("password", "")}
+        except StopIteration:
+            return None
+
+    def get_socks5_proxy_url(self) -> Optional[str]:
+        """Get the SOCKS5 proxy URL for the current proxy in rotation."""
+        proxy = self.get_next_socks5_proxy()
+        if not proxy:
+            return None
+        if proxy.get("username"):
+            return f"socks5://{proxy['username']}:{proxy['password']}@{proxy['host']}:{proxy['port']}"
+        return f"socks5://{proxy['host']}:{proxy['port']}"
+
+    def add_socks5_proxy(self, host: str, port: int, username: str = "", password: str = ""):
+        """Add a SOCKS5 proxy to the list."""
+        self._socks5_proxies.append({
+            "host": host, "port": port,
+            "username": username, "password": password,
+            "enabled": True,
+        })
+        self._rebuild_socks5_cycle()
+        logger.info("[vpn] SOCKS5 proxy added: %s:%d", host, port)
+
+    def remove_socks5_proxy(self, index: int):
+        """Remove a SOCKS5 proxy by index."""
+        if 0 <= index < len(self._socks5_proxies):
+            removed = self._socks5_proxies.pop(index)
+            self._rebuild_socks5_cycle()
+            logger.info("[vpn] SOCKS5 proxy removed: %s:%d", removed.get("host"), removed.get("port"))
+
+    def toggle_socks5_proxy(self, index: int, enabled: bool):
+        """Enable or disable a SOCKS5 proxy by index."""
+        if 0 <= index < len(self._socks5_proxies):
+            self._socks5_proxies[index]["enabled"] = enabled
+            self._rebuild_socks5_cycle()
+
+    async def test_socks5_proxy(self, host: str, port: int) -> dict:
+        """Test a SOCKS5 proxy connection.
+
+        Returns dict with keys: ok, ip, opencode_ok, error
+        """
+        import httpx
+        proxy_url = f"socks5://{host}:{port}"
+        result = {"ok": False, "ip": None, "opencode_ok": False, "error": None}
+
+        # Test 1: ipify.org via SOCKS5
+        try:
+            async with httpx.AsyncClient(proxy=proxy_url, timeout=15) as client:
+                resp = await client.get("https://api.ipify.org")
+                if resp.status_code == 200:
+                    result["ok"] = True
+                    result["ip"] = resp.text.strip()
+                else:
+                    result["error"] = f"ipify returned {resp.status_code}"
+        except Exception as e:
+            result["error"] = f"SOCKS5 connection failed: {e}"
+            return result
+
+        # Test 2: opencode.ai via SOCKS5
+        try:
+            async with httpx.AsyncClient(proxy=proxy_url, timeout=15) as client:
+                resp = await client.get("https://opencode.ai")
+                result["opencode_ok"] = resp.status_code < 500
+        except Exception as e:
+            logger.debug("[vpn] SOCKS5 test opencode.ai failed: %s", e)
+
+        return result
+
     # ── Common ─────────────────────────────────────────────────
+
+    def _check_existing_docker(self):
+        """Check if Docker VPN container is already running on startup."""
+        try:
+            import subprocess
+            docker_cmd = self._find_docker()
+            r = subprocess.run(
+                [docker_cmd, "ps", "-a", "--filter", "name=" + self._docker_container, "--format", "{{.Status}}"],
+                capture_output=True, text=True, timeout=5
+            )
+            if "Up" in r.stdout:
+                logger.info("[vpn] Docker VPN container already running")
+                # Get the IP from the container logs
+                r2 = subprocess.run(
+                    [docker_cmd, "logs", self._docker_container],
+                    capture_output=True, text=True, timeout=5
+                )
+                for line in r2.stdout.split("\n"):
+                    if "VPN IP:" in line:
+                        ip = line.split("VPN IP:")[-1].strip()
+                        if ip:
+                            self._current_ip = ip
+                            self._status = "connected"
+                            self._connected_at = time.monotonic()
+                            self._ip_history.append({
+                                "ip": ip, "server": "Docker VPN (existing)",
+                                "time": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                            })
+                            logger.info("[vpn] detected existing VPN connection, IP: %s", ip)
+                            return
+        except Exception as e:
+            logger.debug("[vpn] could not check existing Docker container: %s", e)
 
     async def _get_public_ip(self) -> str:
         """Get current public IP by querying an external service."""
@@ -380,6 +566,7 @@ class VPNManager:
 
         return {
             "enabled": self._enabled,
+            "proxy_mode": self._proxy_mode,
             "mode": self._mode,
             "status": self._status,
             "ip": self._current_ip,
@@ -392,12 +579,15 @@ class VPNManager:
             "ip_history": self._ip_history[-10:],
             "proxy_port": self._proxy_port,
             "proxy_url": self.proxy_url,
+            "socks5_count": len([p for p in self._socks5_proxies if p.get("enabled", True)]),
+            "socks5_current": self._socks5_current_index,
         }
 
     def get_config(self) -> dict:
         """Return current configuration for the dashboard."""
         return {
             "enabled": self._enabled,
+            "proxy_mode": self._proxy_mode,
             "mode": self._mode,
             "servers": self._servers,
             "auth_file": self._auth_file,
@@ -405,23 +595,31 @@ class VPNManager:
             "proxy_port": self._proxy_port,
             "switch_delay": self._switch_delay,
             "docker_image": self._docker_image,
+            "socks5_proxies": self.get_socks5_proxies(),
+            "socks5_rotate": self._socks5_rotate,
         }
 
     def update_config(self, updates: dict):
         """Update configuration from dashboard."""
         if "enabled" in updates:
             self._enabled = updates["enabled"]
+        if "proxy_mode" in updates:
+            self._proxy_mode = updates["proxy_mode"]
         if "mode" in updates:
             self._mode = updates["mode"]
         if "proxy_port" in updates:
             self._proxy_port = updates["proxy_port"]
         if "switch_delay" in updates:
             self._switch_delay = updates["switch_delay"]
+        if "quota_per_ip" in updates:
+            self._quota_per_ip = updates["quota_per_ip"]
         if "auth_file" in updates:
             self._auth_file = updates["auth_file"]
         if "servers" in updates:
             self._servers = updates["servers"]
             self._cycle = itertools.cycle(self._servers) if self._servers else None
+        if "socks5_rotate" in updates:
+            self._socks5_rotate = updates["socks5_rotate"]
 
     def add_server(self, name: str, config_path: str):
         """Add a VPN server to the rotation list."""
