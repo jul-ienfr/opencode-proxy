@@ -630,6 +630,44 @@ def _db_flush():
             _db_last_commit = time.monotonic()
 
 
+def _db_cleanup_old_bodies(retention_days: int = 7, delete_after_days: int = 30):
+    """Clean up old request data to prevent DB bloat.
+
+    Two-phase cleanup:
+    1. DELETE entire rows older than delete_after_days (30d default) — full removal
+    2. NULLIFY bodies for rows between retention_days and delete_after_days — keep metadata
+
+    Bodies account for ~95% of DB storage. This keeps recent bodies for debugging
+    while preventing unbounded growth. Called periodically by background task.
+    """
+    try:
+        # Phase 1: Delete old rows entirely
+        cutoff_delete = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(time.time() - delete_after_days * 86400))
+        cursor = _conn.execute("DELETE FROM requests WHERE timestamp < ?", (cutoff_delete,))
+        deleted = cursor.rowcount
+        cursor2 = _conn.execute("DELETE FROM free_model_usage WHERE timestamp < ?", (cutoff_delete,))
+        deleted2 = cursor2.rowcount
+
+        # Phase 2: Nullify bodies for 7-30 day old rows
+        cutoff_null = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(time.time() - retention_days * 86400))
+        cursor3 = _conn.execute(
+            "UPDATE requests SET request_body = NULL, response_body = NULL "
+            "WHERE timestamp < ? AND (request_body IS NOT NULL OR response_body IS NOT NULL)",
+            (cutoff_null,)
+        )
+        cleaned = cursor3.rowcount
+
+        total = deleted + deleted2 + cleaned
+        if total > 0:
+            _conn.commit()
+            _debug(f"  [db] cleanup: deleted {deleted}+{deleted2} old rows, cleared bodies from {cleaned} requests")
+            _log(f"  DB CLEANUP: deleted {deleted+deleted2} old rows, cleared {cleaned} bodies (>{retention_days}d)")
+        return deleted + deleted2 + cleaned
+    except Exception as e:
+        _debug(f"  [db] cleanup error: {type(e).__name__}: {e}")
+        return 0
+
+
 def _db_insert_sync(req_id, timestamp, model, original_model, duration_ms,
                     tokens_input, tokens_output, tokens_cache, success, error,
                     protocol, is_stream, thinking, effort, client_ip, account_alias,
@@ -982,7 +1020,22 @@ async def lifespan(app):
             _key_pauser.cleanup_expired()
 
     key_pause_cleanup_task = asyncio.create_task(_periodic_key_pause_cleanup())
-    _debug("  [lifespan] background tasks created (WAL checkpoint, DB flush, key pause cleanup, quota fetcher)")
+
+    # Periodic DB body cleanup (daily) — removes old request/response bodies to save disk
+    async def _periodic_db_cleanup():
+        # Run cleanup once at startup, then every 24h
+        await asyncio.sleep(60)  # wait 60s after startup before first cleanup
+        while True:
+            try:
+                retention = yaml_get("database", "body_retention_days", 7)
+                await asyncio.to_thread(_db_cleanup_old_bodies, retention)
+                await asyncio.sleep(yaml_get("background", "db_cleanup_interval", 86400))
+            except Exception as e:
+                _debug(f"  [db] periodic cleanup error: {type(e).__name__}: {e}")
+                await asyncio.sleep(3600)
+
+    db_cleanup_task = asyncio.create_task(_periodic_db_cleanup())
+    _debug("  [lifespan] background tasks created (WAL checkpoint, DB flush, key pause cleanup, DB body cleanup, quota fetcher)")
 
     yield
 
@@ -995,6 +1048,7 @@ async def lifespan(app):
     checkpoint_task.cancel()
     db_flush_task.cancel()
     key_pause_cleanup_task.cancel()
+    db_cleanup_task.cancel()
     try:
         await checkpoint_task
     except asyncio.CancelledError:
