@@ -61,7 +61,7 @@ def get_next_api_key() -> dict:
 
     if not available:
         # All paused — raise with shortest wait time instead of reusing a paused key
-        min_rem = max(
+        min_rem = min(
             (_key_pauser.remaining(k.get("api_key", "")) for k in enabled),
             default=0
         )
@@ -82,7 +82,7 @@ def get_next_api_key() -> dict:
                 _debug(f"  [apikey] failover selected alias={API_KEYS[idx].get('alias','?')} (idx={idx})")
                 return API_KEYS[idx]
         # Fallback to shortest-paused
-        min_rem = max(
+        min_rem = min(
             (_key_pauser.remaining(k.get("api_key", "")) for k in enabled),
             default=0
         )
@@ -200,7 +200,11 @@ class _KeyPauser:
         return api_key[:12] if len(api_key) >= 12 else api_key
 
     def _save(self):
-        """Persist current pause state to YAML file (wall clock times)."""
+        """Persist current pause state to YAML file (wall clock times).
+
+        File I/O is offloaded to a thread pool so it doesn't block the event loop.
+        Data serialization happens synchronously (fast, in-memory only).
+        """
         try:
             data = {}
             for prefix, mono_expiry in self._paused.items():
@@ -211,9 +215,18 @@ class _KeyPauser:
                         "expiry": wall_expiry,
                         "reason": self._reasons.get(prefix, ""),
                     }
-            os.makedirs(os.path.dirname(self._PAUSED_FILE), exist_ok=True)
-            with open(self._PAUSED_FILE, "w", encoding="utf-8") as f:
-                yaml.dump({"paused_keys": data}, f, default_flow_style=False)
+            # Offload file I/O to thread pool (non-blocking)
+            payload = {"paused_keys": data}
+            file_path = self._PAUSED_FILE
+            def _write_yaml():
+                os.makedirs(os.path.dirname(file_path), exist_ok=True)
+                with open(file_path, "w", encoding="utf-8") as f:
+                    yaml.dump(payload, f, default_flow_style=False)
+            try:
+                loop = asyncio.get_running_loop()
+                loop.run_in_executor(None, _write_yaml)
+            except RuntimeError:
+                _write_yaml()  # Fallback: sync if no event loop running
         except Exception as e:
             _debug(f"  [keypauser] save error: {e}")
 
@@ -486,21 +499,34 @@ def _truncate_body_for_storage(body: dict, max_chars: int = MAX_BODY_STORAGE) ->
 
     Keeps model, tools, and a summary of messages to preserve context while
     avoiding the memory waste of serializing a 10MB body just to keep 100K.
+
+    Optimized: builds truncated version first, only falls back to full
+    serialization if the truncated version is small enough.
     """
     if not body:
         return None
-    # Fast path: small body, serialize directly
-    full = json.dumps(body, ensure_ascii=False, separators=(',', ':'))
-    if len(full) <= max_chars:
-        return full
-    # Slow path: truncate messages array to fit
-    truncated = {k: v for k, v in body.items() if k != "messages"}
+    # Quick size estimate: sum of string lengths of non-messages fields
+    # This avoids full json.dumps for large bodies
+    estimate = sum(len(str(v)) for k, v in body.items() if k != "messages")
     messages = body.get("messages", [])
+    if messages:
+        # Estimate first 2 messages + truncation marker
+        for msg in messages[:2]:
+            estimate += len(str(msg))
+        estimate += 80  # truncation marker overhead
+
+    if estimate <= max_chars:
+        # Likely fits — do full serialization (single pass)
+        full = json.dumps(body, ensure_ascii=False, separators=(',', ':'))
+        if len(full) <= max_chars:
+            return full
+        # Fell through: full was too big, build truncated version
+    # Build truncated version (skip full serialization of large body)
+    truncated = {k: v for k, v in body.items() if k != "messages"}
     if messages:
         truncated["messages"] = messages[:2] + [{"_truncated": True, "original_count": len(messages)}]
     result = json.dumps(truncated, ensure_ascii=False, separators=(',', ':'))
     if len(result) > max_chars:
-        # Still too large — hard-truncate the string
         result = result[:max_chars]
     return result
 
@@ -1404,6 +1430,10 @@ async def _get_cached_public_ip() -> str:
         return _public_ip_cache["ip"] or "unknown"
 
 
+# Free model cooldown: after a 429, skip free model for this many seconds
+_free_model_cooldown_until = 0.0  # monotonic timestamp
+
+
 async def _try_free_model_first(body, headers, protocol, model_id,
                                 api_key=None, workspace_id=None, api_keys=None):
     """Try the free model equivalent before falling back to paid.
@@ -1426,6 +1456,12 @@ async def _try_free_model_first(body, headers, protocol, model_id,
     free_model = FREE_MODEL_MAP.get(model_id)
     if not free_model:
         return None  # No free equivalent, proceed with paid
+
+    # Skip free model if recently rate-limited (cooldown avoids sequential free→paid latency)
+    global _free_model_cooldown_until
+    if time.monotonic() < _free_model_cooldown_until:
+        _debug(f"  [free] skipping free model (cooldown active)")
+        return None
 
     _debug(f"  [free] trying free model {free_model!r} instead of {model_id!r}")
 
@@ -1549,6 +1585,9 @@ async def _try_free_model_first(body, headers, protocol, model_id,
         _debug(f"  [free] {free_model!r} 429 body={body_429!r} headers={headers_429}")
         _log(f"  FREE {free_model!r} RATE LIMITED (429) retry-after={retry_after}s → falling back to paid {model_id!r}")
 
+        # Set cooldown to skip free model for 60s (avoids sequential free→paid latency)
+        _free_model_cooldown_until = time.monotonic() + 60
+
         # If VPN rotation is enabled, switch IP on 429
         if _free_ip_pool and _free_ip_pool.enabled:
             asyncio.create_task(_free_ip_pool.on_quota_exhausted())
@@ -1616,8 +1655,8 @@ async def _do_request_with_retry(endpoint, body, headers, protocol, retry_on_429
             except Exception:
                 _err_body = "(unable to read response body)"
             _debug(f"  [auth] 401 response body: {_err_body}")
-            # 401 = key permanently invalid/revoked → pause 24h (not just 10 min)
-            _key_pauser.pause_key(failed_key, 86400, "401 Unauthorized (key likely revoked)")
+            # 401 = key temporarily unavailable (quota exhausted) → pause 1h
+            _key_pauser.pause_key(failed_key, 3600, "401 Unauthorized (temporary)")
             alt = _find_alternative_key(failed_key)
             if alt:
                 _debug(f"  ⟳ 401 failover: {failed_key[:8]}… → alias={alt.get('alias', '?')}")
@@ -3159,16 +3198,46 @@ async def messages(request: Request):
 
     # ── Anthropic pass-through ──────────────────────────────────
     if protocol == "anthropic":
+        is_stream = body.get("stream", False)
+
+        # ── Free model: try BEFORE auth (free models don't need API keys) ──
+        if not is_stream and FREE_MODEL_MAP.get(model_id):
+            try:
+                free_result = await _try_free_model_first(body, {}, "anthropic", model_id)
+                if free_result is not None:
+                    resp, _, _actual_model, _actual_ip = free_result
+                    data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+                    usage = data.get("usage", {})
+                    req_in = usage.get("input_tokens", 0) or usage.get("prompt_tokens", 0)
+                    req_out = usage.get("output_tokens", 0) or usage.get("completion_tokens", 0)
+                    req_cache = usage.get("cache_read_input_tokens", 0)
+                    _update_token_usage(_actual_model, req_in, req_out, req_cache)
+                    used = [b["name"] for b in data.get("content", []) if b.get("type") == "tool_use"]
+                    await _save_and_log_request(req_id, _actual_model, original_model, start_time,
+                                 req_in, req_out, req_cache, protocol, False, thinking_type,
+                                 effort, client_ip, "free (no auth)", tool_names, tools_used=used,
+                                 request_body=request_body, response_body=data, free_model_ip=_actual_ip)
+                    return Response(content=resp.content, media_type="application/json")
+            except Exception as e:
+                _debug(f"  [free] free model attempt failed: {e}")
+
         try:
             a_headers = _get_auth_headers("anthropic")
         except AllKeysPausedError as e:
+            # If a free model exists, try streaming with empty headers before giving up
+            if is_stream and FREE_MODEL_MAP.get(model_id):
+                async def anthropic_stream_free_fallback():
+                    # Re-use the existing generator — it already handles free model swap
+                    async for chunk in anthropic_stream({}):
+                        yield chunk
+                return StreamingResponse(_sse_keepalive(anthropic_stream_free_fallback()), media_type="text/event-stream",
+                                         headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
             retry_after = int(e.retry_after) + 1
             return Response(
                 content=json.dumps({"type": "error", "error": {"type": "api_error",
                     "message": f"All API keys exhausted. Retry after {retry_after}s."}}),
                 status_code=503, media_type="application/json",
                 headers={"Retry-After": str(retry_after)})
-        is_stream = body.get("stream", False)
 
         if not is_stream:
             # Check cache
@@ -3281,7 +3350,7 @@ async def messages(request: Request):
             else:
                 _using_free = False
             # Defer token estimation to first chunk — reduces pre-response latency
-            est_input = _estimate_input_tokens(body)
+            est_input = await asyncio.to_thread(_estimate_input_tokens, body)
             _debug(f"  [stream] est_input={est_input}")
             _update_token_usage(_track_model, est_input, 0, 0)
             stream_in = None
@@ -3371,20 +3440,17 @@ async def messages(request: Request):
                                     stream_in = usage.get("input_tokens")
                                     _debug(f"  [stream] message_start: input_tokens={stream_in} cache_read={usage.get('cache_read_input_tokens', 0)}")
                                     started = True
-                                    if stream_in is not None:
+                                    stream_cache = usage.get("cache_read_input_tokens", 0)
+                                    # Consolidated: single lock acquisition for input + cache update
+                                    if stream_in is not None or stream_cache:
                                         try:
                                             with _token_lock:
-                                                _token_usage[_track_model]["input"] -= est_input
-                                                _token_usage[_track_model]["input"] += stream_in
+                                                if stream_in is not None:
+                                                    _token_usage[_track_model]["input"] += stream_in - est_input
+                                                if stream_cache:
+                                                    _token_usage[_track_model]["cache"] += stream_cache
                                         except Exception as e:
                                             _debug(f"  ✗ token rollback failed: {type(e).__name__}: {e}")
-                                    stream_cache = usage.get("cache_read_input_tokens", 0)
-                                    if stream_cache:
-                                        try:
-                                            with _token_lock:
-                                                _token_usage[_track_model]["cache"] += stream_cache
-                                        except Exception:
-                                            pass
                                 elif etype == "content_block_start":
                                     block = event.get("content_block", {})
                                     _debug(f"  [stream] content_block_start: type={block.get('type')} name={block.get('name', '')} index={event.get('index')}")
@@ -3437,18 +3503,16 @@ async def messages(request: Request):
                             _log(f"  Retrying stream with alternative key: {alt.get('alias', '?')}")
                             headers = _get_auth_headers("anthropic", entry=alt)
                         continue
-                    if stream_in is None:
+                    # Consolidated: single lock acquisition for error-path token adjustments
+                    if stream_in is None or stream_out:
                         try:
                             with _token_lock:
-                                _token_usage[_track_model]["input"] -= est_input
+                                if stream_in is None:
+                                    _token_usage[_track_model]["input"] -= est_input
+                                if stream_out:
+                                    _token_usage[_track_model]["output"] += stream_out
                         except Exception as e:
                             _debug(f"  ✗ token rollback failed: {type(e).__name__}: {e}")
-                    if stream_out:
-                        try:
-                            with _token_lock:
-                                _token_usage[_track_model]["output"] += stream_out
-                        except Exception:
-                            pass
                     await _save_request(req_id, _track_model, original_model, _elapsed_ms(start_time),
                                  stream_in if stream_in is not None else est_input, stream_out, stream_cache, success=False, error=str(e),
                                  protocol=protocol, is_stream=True, thinking=thinking_type, effort=effort,
@@ -3476,7 +3540,9 @@ async def messages(request: Request):
                              effort, client_ip, ak, tool_names, tools_used=used_tools if used_tools else None,
                              request_body=request_body)
 
-        return StreamingResponse(_sse_keepalive(anthropic_stream(a_headers)), media_type="text/event-stream",
+        # For streaming: if free model exists, pass empty headers (free models don't need auth)
+        _stream_headers = a_headers if a_headers.get("x-api-key") else {}
+        return StreamingResponse(_sse_keepalive(anthropic_stream(_stream_headers)), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
 
     # ── OpenAI-protocol ─────────────────────────────────────────
@@ -3490,6 +3556,27 @@ async def messages(request: Request):
     try:
         headers = _get_auth_headers("openai")
     except AllKeysPausedError as e:
+        # If a free model exists, try it before giving up
+        if FREE_MODEL_MAP.get(model_id):
+            try:
+                free_result = await _try_free_model_first(oai_body, {}, "openai", model_id)
+                if free_result is not None:
+                    resp, _, _actual_model, _actual_ip = free_result
+                    data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+                    usage = data.get("usage", {})
+                    req_in = usage.get("prompt_tokens", 0)
+                    req_out = usage.get("completion_tokens", 0)
+                    cache = _extract_cache_tokens(usage)
+                    _update_token_usage(_actual_model, req_in, req_out, cache)
+                    used = [tc["function"]["name"] for tc in data.get("choices", [{}])[0].get("message", {}).get("tool_calls", [])]
+                    await _save_and_log_request(req_id, _actual_model, original_model, start_time,
+                                 req_in, req_out, cache, protocol, False, thinking_type,
+                                 effort, client_ip, "free (no auth)", tool_names, tools_used=used,
+                                 request_body=request_body, response_body=data, free_model_ip=_actual_ip)
+                    return Response(content=json.dumps(openai_to_anthropic(data, original_model), ensure_ascii=False),
+                                    media_type="application/json")
+            except Exception as e:
+                _debug(f"  [free] free model attempt failed: {e}")
         retry_after = int(e.retry_after) + 1
         return Response(
             content=json.dumps({"type": "error", "error": {"type": "api_error",
@@ -3601,7 +3688,7 @@ async def messages(request: Request):
             _using_free = True
         else:
             _using_free = False
-        stream_in_est = _estimate_input_tokens(body)
+        stream_in_est = await asyncio.to_thread(_estimate_input_tokens, body)
         _debug(f"  [stream-oai] est_input={stream_in_est}")
         _update_token_usage(_req_model_id, stream_in_est, 0, 0)
         started = False
@@ -3942,7 +4029,7 @@ async def count_tokens(request: Request):
         body = json.loads(await request.body())
     except Exception:
         return _anthropic_error(400, "invalid json")
-    tokens = _estimate_input_tokens(body)
+    tokens = await asyncio.to_thread(_estimate_input_tokens, body)
     return {"input_tokens": tokens}
 
 
@@ -4015,6 +4102,32 @@ async def chat_completions(request: Request):
         try:
             headers = _get_auth_headers("openai")
         except AllKeysPausedError as e:
+            # If a free model exists, try it before giving up
+            if FREE_MODEL_MAP.get(model_id):
+                if is_stream:
+                    # Streaming: pass empty headers — generator handles free model swap
+                    return StreamingResponse(_sse_keepalive(openai_stream({})), media_type="text/event-stream",
+                                             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
+                else:
+                    # Non-streaming: try free model
+                    try:
+                        free_result = await _try_free_model_first(body, {}, "openai", model_id)
+                        if free_result is not None:
+                            resp, _, _actual_model, _actual_ip = free_result
+                            data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+                            usage = data.get("usage", {})
+                            req_in = usage.get("prompt_tokens", 0)
+                            req_out = usage.get("completion_tokens", 0)
+                            cache = _extract_cache_tokens(usage)
+                            _update_token_usage(_actual_model, req_in, req_out, cache)
+                            used = [tc["function"]["name"] for tc in data.get("choices", [{}])[0].get("message", {}).get("tool_calls", [])]
+                            await _save_and_log_request(req_id, _actual_model, original_model, start_time,
+                                         req_in, req_out, cache, protocol, False, thinking_type,
+                                         effort, client_ip, "free (no auth)", tool_names, tools_used=used,
+                                         request_body=request_body, response_body=data, free_model_ip=_actual_ip)
+                            return Response(content=json.dumps(data, ensure_ascii=False), media_type="application/json")
+                    except Exception as e:
+                        _debug(f"  [free] free model attempt failed: {e}")
             retry_after = int(e.retry_after) + 1
             return Response(
                 content=json.dumps({"error": {"message": f"All API keys exhausted. Retry after {retry_after}s.",
@@ -4103,7 +4216,7 @@ async def chat_completions(request: Request):
                 _track_model = free_model  # Log as free model
             else:
                 _using_free = False
-            est_input = _estimate_input_tokens(body)
+            est_input = await asyncio.to_thread(_estimate_input_tokens, body)
             _update_token_usage(_track_model, est_input, 0, 0)
             _debug(f"  [chat-stream] est_input={est_input}")
             stream_out = 0
@@ -4271,6 +4384,33 @@ async def chat_completions(request: Request):
     try:
         a_headers = _get_auth_headers("anthropic")
     except AllKeysPausedError as e:
+        # If a free model exists, try it before giving up
+        if FREE_MODEL_MAP.get(model_id):
+            if is_stream:
+                # Streaming: pass empty headers — generator handles free model swap
+                return StreamingResponse(_sse_keepalive(_anthro_to_oai_stream({})), media_type="text/event-stream",
+                                         headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
+            else:
+                # Non-streaming: try free model
+                try:
+                    free_result = await _try_free_model_first(anthro_body, {}, "anthropic", model_id)
+                    if free_result is not None:
+                        resp, _, _actual_model, _actual_ip = free_result
+                        data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+                        usage = data.get("usage", {})
+                        req_in = usage.get("input_tokens", 0) or usage.get("prompt_tokens", 0)
+                        req_out = usage.get("output_tokens", 0) or usage.get("completion_tokens", 0)
+                        req_cache = usage.get("cache_read_input_tokens", 0)
+                        _update_token_usage(_actual_model, req_in, req_out, req_cache)
+                        used = [b["name"] for b in data.get("content", []) if b.get("type") == "tool_use"]
+                        await _save_and_log_request(req_id, _actual_model, original_model, start_time,
+                                     req_in, req_out, req_cache, protocol, False, thinking_type,
+                                     effort, client_ip, "free (no auth)", tool_names, tools_used=used,
+                                     request_body=request_body, response_body=data, free_model_ip=_actual_ip)
+                        oai_response = anthropic_to_openai_response(data, original_model)
+                        return Response(content=json.dumps(oai_response, ensure_ascii=False), media_type="application/json")
+                except Exception as e:
+                    _debug(f"  [free] free model attempt failed: {e}")
         retry_after = int(e.retry_after) + 1
         return Response(
             content=json.dumps({"error": {"message": f"All API keys exhausted. Retry after {retry_after}s.",
@@ -4328,7 +4468,22 @@ async def chat_completions(request: Request):
 
     # ── Streaming with Anthropic backend (true streaming) ──
     async def _anthro_to_oai_stream(hdrs):
-        nonlocal model_id
+        nonlocal endpoint, model_id
+        # Try free model for streaming: swap endpoint/model before starting stream
+        free_model = FREE_MODEL_MAP.get(model_id)
+        if free_model:
+            _debug(f"  [anthro-to-oai-stream] attempting free model {free_model!r} first")
+            paid_endpoint = endpoint
+            paid_anthro_body = dict(anthro_body)
+            paid_anthro_body["model"] = model_id
+            anthro_body = dict(anthro_body)
+            anthro_body["model"] = free_model
+            endpoint = API_BASE_FREE
+            _using_free = True
+            _track_model = free_model
+        else:
+            _using_free = False
+            _track_model = model_id
         _id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
         _created = int(time.time())
         started = False
@@ -4356,6 +4511,15 @@ async def chat_completions(request: Request):
             try:
                 async with _client.stream("POST", endpoint, json=anthro_body, headers=hdrs) as resp:
                     if resp.status_code != 200:
+                        # Free model 429 → fall back to paid model
+                        if _using_free and resp.status_code == 429:
+                            _debug(f"  [anthro-to-oai-stream] free model 429 → falling back to paid {_track_model!r}")
+                            _log(f"  FREE model rate limited → falling back to paid {_track_model!r}")
+                            anthro_body = paid_anthro_body
+                            endpoint = paid_endpoint
+                            _using_free = False
+                            _track_model = model_id
+                            continue
                         hdrs, should_retry = await _handle_429(hdrs, resp.status_code, _attempt, resp.headers)
                         if should_retry:
                             continue
@@ -4487,10 +4651,10 @@ async def chat_completions(request: Request):
                                 yield _chunk({}, finish)
 
                             elif etype == "message_stop":
-                                _update_token_usage(model_id, total_input, stream_out, cache_read)
+                                _update_token_usage(_track_model, total_input, stream_out, cache_read)
                                 ak = _alias_for_key(hdrs.get("x-api-key", ""))
                                 used_tools = [v["name"] for v in tool_data.values() if v.get("name")]
-                                await _save_and_log_request(req_id, model_id, original_model, start_time,
+                                await _save_and_log_request(req_id, _track_model, original_model, start_time,
                                              total_input, stream_out, cache_read, protocol, True, thinking_type,
                                              effort, client_ip, ak, tool_names, tools_used=used_tools if used_tools else None,
                                              request_body=request_body)
@@ -4639,6 +4803,36 @@ async def responses(request: Request):
         try:
             a_headers = _get_auth_headers("anthropic")
         except AllKeysPausedError as e:
+            # If a free model exists, try it before giving up
+            if FREE_MODEL_MAP.get(model_id):
+                if is_stream:
+                    # Streaming: pass empty headers — generator handles free model swap
+                    return StreamingResponse(_sse_keepalive(_anthro_to_oai_stream({})), media_type="text/event-stream",
+                                             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
+                else:
+                    # Non-streaming: try free model
+                    try:
+                        free_result = await _try_free_model_first(anthro_body, {}, "anthropic", model_id)
+                        if free_result is not None:
+                            resp, _, _actual_model, _actual_ip = free_result
+                            data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+                            usage = data.get("usage", {})
+                            req_in = usage.get("input_tokens", 0) or usage.get("prompt_tokens", 0)
+                            req_out = usage.get("output_tokens", 0) or usage.get("completion_tokens", 0)
+                            req_cache = usage.get("cache_read_input_tokens", 0)
+                            _update_token_usage(_actual_model, req_in, req_out, req_cache)
+                            used = [b["name"] for b in data.get("content", []) if b.get("type") == "tool_use"]
+                            await _save_and_log_request(req_id, _actual_model, original_model, start_time,
+                                         req_in, req_out, req_cache, protocol, False, thinking_type,
+                                         effort, client_ip, "free (no auth)", tool_names, tools_used=used,
+                                         request_body=request_body, response_body=data, free_model_ip=_actual_ip)
+                            oai_resp = anthropic_to_openai_responses(data, original_model)
+                            payload = json.dumps({"type": "response.completed", "response": oai_resp}, ensure_ascii=False)
+                            sse_body = f"data: {payload}\n\ndata: [DONE]\n\n".encode()
+                            return Response(content=sse_body, media_type="text/event-stream",
+                                            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
+                    except Exception as e:
+                        _debug(f"  [free] free model attempt failed: {e}")
             retry_after = int(e.retry_after) + 1
             return Response(
                 content=json.dumps({"error": {"message": f"All API keys exhausted. Retry after {retry_after}s.",
@@ -4764,6 +4958,30 @@ async def responses(request: Request):
     try:
         headers = _get_auth_headers("openai")
     except AllKeysPausedError as e:
+        # If a free model exists, try it before giving up
+        if FREE_MODEL_MAP.get(model_id):
+            try:
+                free_result = await _try_free_model_first(oai_body, {}, "openai", model_id)
+                if free_result is not None:
+                    resp, _, _actual_model, _actual_ip = free_result
+                    data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+                    usage = data.get("usage", {})
+                    req_in = usage.get("prompt_tokens", 0)
+                    req_out = usage.get("completion_tokens", 0)
+                    cache = _extract_cache_tokens(usage)
+                    _update_token_usage(_actual_model, req_in, req_out, cache)
+                    used = [tc["function"]["name"] for tc in data.get("choices", [{}])[0].get("message", {}).get("tool_calls", [])]
+                    await _save_and_log_request(req_id, _actual_model, original_model, start_time,
+                                 req_in, req_out, cache, protocol, False, thinking_type,
+                                 effort, client_ip, "free (no auth)", tool_names, tools_used=used,
+                                 request_body=request_body, response_body=data, free_model_ip=_actual_ip)
+                    oai_resp = openai_chat_to_responses(data, original_model)
+                    payload = json.dumps({"type": "response.completed", "response": oai_resp}, ensure_ascii=False)
+                    sse_body = f"data: {payload}\n\ndata: [DONE]\n\n".encode()
+                    return Response(content=sse_body, media_type="text/event-stream",
+                                    headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
+            except Exception as e:
+                _debug(f"  [free] free model attempt failed: {e}")
         retry_after = int(e.retry_after) + 1
         return Response(
             content=json.dumps({"error": {"message": f"All API keys exhausted. Retry after {retry_after}s.",
