@@ -43,18 +43,20 @@ class EventManager:
         payload = f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
         with self._lock:
             subscribers = list(self._subscribers)
-        alive = []
         for q in subscribers:
             try:
                 q.put_nowait(payload)
-                alive.append(q)
             except asyncio.QueueFull:
-                logger.debug("[sse] event dropped for slow subscriber (queue full, event=%s)", event)
-            except Exception:
-                pass  # closed/destroyed queue
-        if len(alive) != len(subscribers):
-            with self._lock:
-                self._subscribers = alive
+                # [31] Never drop the subscriber (that stalls the dashboard
+                # permanently once it stops polling). Evict the oldest buffered
+                # event instead — these are ephemeral state snapshots, so the
+                # client just gets the freshest one.
+                try:
+                    q.get_nowait()
+                    q.put_nowait(payload)
+                    logger.debug("[sse] slow subscriber: oldest event evicted (event=%s)", event)
+                except Exception:
+                    pass  # closed/destroyed queue
 
 
 _module_manager = EventManager()

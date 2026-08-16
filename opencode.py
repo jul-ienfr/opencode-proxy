@@ -8,6 +8,7 @@ import uuid
 import time
 import logging
 import os
+import re
 import sqlite3
 import threading
 import traceback
@@ -27,6 +28,8 @@ from config import API_KEY, PROXY, MODELS, ROUTES, get_model_config, HOST, PORT,
 import config.settings as _cfg_settings
 
 import itertools
+import email.utils
+import datetime
 
 # ── API key routing ──
 _key_cycle = None
@@ -37,24 +40,29 @@ _key_cycle_lock = threading.Lock()
 def _get_enabled_keys() -> list[dict]:
     return [k for k in API_KEYS if k.get("enabled", True)]
 
-def _get_any_enabled_key() -> dict | None:
-    """Return any enabled API key, ignoring pause status.
+def _env_key_or_raise() -> dict:
+    """Return the .env fallback key, or raise AllKeysPausedError if paused.
 
-    Used for free model requests which have separate quotas from paid models.
-    A key paused for paid quota exhaustion may still have free model quota available.
+    [CRITIC(9)] The .env fallback must not be hammered while paused: when
+    every routed key is paused AND the .env key itself is paused, raise so
+    the caller surfaces a clean retry-after instead of sending a request
+    with a known-dead key.
     """
-    enabled = _get_enabled_keys()
-    return enabled[0] if enabled else None
+    if _key_pauser.is_paused(API_KEY):
+        remaining = _key_pauser.remaining(API_KEY)
+        _debug(f"  [apikey] .env fallback key paused ({remaining:.0f}s) — raising AllKeysPausedError")
+        raise AllKeysPausedError(remaining if remaining > 0 else 1)
+    return {"api_key": API_KEY}
 
 def get_next_api_key() -> dict:
     global _key_cycle, _key_cycle_keys, _key_failover_index
     if not API_KEYS:
         _debug(f"  [apikey] no API_KEYS configured, falling back to .env key")
-        return {"api_key": API_KEY}
+        return _env_key_or_raise()
     enabled = _get_enabled_keys()
     if not enabled:
         _debug(f"  [apikey] no enabled keys, falling back to .env key")
-        return {"api_key": API_KEY}
+        return _env_key_or_raise()
 
     # Filter out paused keys
     available = [k for k in enabled if not _key_pauser.is_paused(k.get("api_key", ""))]
@@ -69,7 +77,7 @@ def get_next_api_key() -> dict:
             _debug(f"  [apikey] ALL keys paused, min remaining={min_rem:.0f}s — raising AllKeysPausedError")
             raise AllKeysPausedError(min_rem)
         _debug(f"  [apikey] no keys available, falling back to .env key")
-        return {"api_key": API_KEY}
+        return _env_key_or_raise()
 
     if len(available) == 1:
         _debug(f"  [apikey] single available key: alias={available[0].get('alias','?')}")
@@ -89,7 +97,7 @@ def get_next_api_key() -> dict:
         if min_rem > 0:
             raise AllKeysPausedError(min_rem)
         _debug(f"  [apikey] failover exhausted, falling back to .env key")
-        return {"api_key": API_KEY}
+        return _env_key_or_raise()
 
     # Round-robin: rebuild cycle from available keys only
     with _key_cycle_lock:
@@ -127,56 +135,6 @@ def _alias_for_key(api_key: str) -> str:
 
 
 # ── Key pause tracker ─────────────────────────────────────────
-
-def _parse_rate_limit_pause(resp_headers) -> tuple[float, str]:
-    """Parse rate-limit headers from a 429 response.
-
-    Returns (pause_seconds, reason). Priority:
-    Retry-After > RateLimit-Reset > X-RateLimit-Reset > default (60s).
-    """
-    _max_pause = float(yaml_get("key_pause", "max_pause", 600))
-    _default_pause = float(yaml_get("key_pause", "default_pause", 60))
-
-    # Normalize: httpx headers are case-insensitive, use .get() which is
-    # already case-insensitive for httpx.Headers objects.
-    get = resp_headers.get if hasattr(resp_headers, "get") else lambda k: resp_headers.get(k.lower(), "")
-
-    # 1. Retry-After (seconds or HTTP-date)
-    retry_after = get("retry-after")
-    if retry_after:
-        try:
-            secs = float(retry_after)
-            if secs > 0:
-                return min(secs, _max_pause), "Retry-After"
-        except (ValueError, TypeError):
-            pass
-
-    # 2. RateLimit-Reset (seconds until reset)
-    rl_reset = get("ratelimit-reset")
-    if rl_reset:
-        try:
-            secs = float(rl_reset)
-            if secs > 0:
-                return min(secs, _max_pause), "RateLimit-Reset"
-        except (ValueError, TypeError):
-            pass
-
-    # 3. X-RateLimit-Reset (unix timestamp or seconds)
-    xrl_reset = get("x-ratelimit-reset")
-    if xrl_reset:
-        try:
-            reset_val = float(xrl_reset)
-            if reset_val > 1577836800:  # looks like a unix timestamp
-                secs = reset_val - time.time()
-                if secs > 0:
-                    return min(secs, _max_pause), "X-RateLimit-Reset"
-            elif reset_val > 0:  # seconds remaining
-                return min(reset_val, _max_pause), "X-RateLimit-Reset"
-        except (ValueError, TypeError):
-            pass
-
-    return _default_pause, "default"
-
 
 class _KeyPauser:
     """Per-key rate limit pause tracker. Pauses a key when upstream returns 429.
@@ -266,12 +224,15 @@ class _KeyPauser:
     def pause_key(self, api_key: str, duration: float, reason: str = "", quota_based: bool = False):
         """Pause a key for `duration` seconds from now.
 
-        When quota_based=True, the duration is the actual quota reset time
-        and is NOT capped at max_pause. Other pauses (401, stream exception,
-        default) are capped at max_pause.
+        Only quota_based pauses (auto-computed reset times) are capped at
+        max_pause — the quota estimate can be wrong (e.g. a free-endpoint
+        429 misattributed to a paid key), and a wrong 24 h pause is worse
+        than a short one. Explicit 401/403 durations (revoked/blocked keys)
+        are honored in full: a revoked key never recovers, so capping its
+        pause only creates churn.
         """
         prefix = self._prefix(api_key)
-        if not quota_based:
+        if quota_based:
             duration = min(duration, self._max_pause)
         expiry = time.monotonic() + duration
         with self._lock:
@@ -639,6 +600,31 @@ def _db_flush():
             _db_last_commit = time.monotonic()
 
 
+def _db_vacuum_if_needed(deleted_rows: int):
+    """Reclaim disk space after cleanup deletes (Vague 4/(g)).
+
+    SQLite keeps freed pages inside the file until VACUUM — without it the
+    DB only grows. Runs at most daily (cleanup cadence), only when rows
+    were actually deleted. VACUUM needs exclusive access, so it holds the
+    same lock as inserts/checkpoints; it commits any pending transaction
+    first and is itself transactional (safe on failure).
+    """
+    if deleted_rows <= 0:
+        return
+    with _db_commit_lock:
+        try:
+            # A batched-insert transaction may still be open; VACUUM refuses
+            # to run inside one. Committing it early is harmless — the rows
+            # were destined to commit within the batch window anyway.
+            if _conn.in_transaction:
+                _conn.commit()
+            _conn.execute("VACUUM")
+        except Exception as e:
+            _debug(f"  [db] vacuum error: {type(e).__name__}: {e}")
+            return
+    _log(f"  DB VACUUM: reclaimed space after deleting {deleted_rows} rows")
+
+
 def _db_cleanup_old_bodies(retention_days: int = 7, delete_after_days: int = 30):
     """Clean up old request data to prevent DB bloat.
 
@@ -671,6 +657,7 @@ def _db_cleanup_old_bodies(retention_days: int = 7, delete_after_days: int = 30)
             _conn.commit()
             _debug(f"  [db] cleanup: deleted {deleted}+{deleted2} old rows, cleared bodies from {cleaned} requests")
             _log(f"  DB CLEANUP: deleted {deleted+deleted2} old rows, cleared {cleaned} bodies (>{retention_days}d)")
+            _db_vacuum_if_needed(deleted + deleted2)
         return deleted + deleted2 + cleaned
     except Exception as e:
         _debug(f"  [db] cleanup error: {type(e).__name__}: {e}")
@@ -895,6 +882,36 @@ def _truncate(body, max_len=None) -> str:
         text = str(body)
     if len(text) > max_len:
         return text[:max_len] + f"\n... [{len(text) - max_len} chars truncated]"
+    return text
+
+
+# Secret-masking patterns for log redaction (finding [40]).
+# Applied to every logged response/request body so secrets echoed by
+# upstream (429/401/403 bodies, error payloads) never reach debug.log.
+_REDACT_PATTERNS = [
+    # OpenAI-style API keys (sk-...)
+    (re.compile(r"\bsk-[A-Za-z0-9_\-]{8,}\b"), "sk-***"),
+    # Bearer tokens
+    (re.compile(r"(?i)\b(bearer\s+)[A-Za-z0-9._\-]{16,}"), r"\1***"),
+    # Sensitive header values in logged text: "x-api-key": "v", Authorization: v, cookie: v
+    (re.compile(r'(?i)("?(?:x-api-key|authorization|cookie|set-cookie)"?\s*[:=]\s*"?)[^"\s,}]{4,}'), r"\1***"),
+    # JSON fields / query params: api_key=..., apikey: ...
+    (re.compile(r'(?i)\b(api[_-]?key\s*[:=]\s*"?)[^"\s,}]{4,}'), r"\1***"),
+]
+
+
+def _redact(text, max_len=None) -> str:
+    """Mask secrets (API keys, bearer tokens, sensitive header values) in log text."""
+    if text is None:
+        return ""
+    if isinstance(text, bytes):
+        text = text.decode("utf-8", errors="replace")
+    elif not isinstance(text, str):
+        text = str(text)
+    for pat, repl in _REDACT_PATTERNS:
+        text = pat.sub(repl, text)
+    if max_len is not None and len(text) > max_len:
+        return text[:max_len] + f"... [{len(text) - max_len} chars truncated]"
     return text
 
 
@@ -1196,13 +1213,9 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         if self._cleanup_task is None or self._cleanup_task.done():
             self._cleanup_task = asyncio.create_task(self._cleanup_loop())
 
-        # Identify client IP
-        ip = "unknown"
-        if request.client:
-            ip = request.client.host
-        forwarded = request.headers.get("x-forwarded-for")
-        if forwarded:
-            ip = forwarded.split(",")[0].strip()
+        # Identify client IP — socket peer only. X-Forwarded-For is
+        # spoofable by any direct client, so it is never trusted (CRITIC 10).
+        ip = request.client.host if request.client else "unknown"
 
         # Get or create bucket for this IP
         bucket = self._buckets.get(ip)
@@ -1254,10 +1267,8 @@ class AccessLogMiddleware(BaseHTTPMiddleware):
         if path == "/health" or any(path.startswith(p) for p in self._SKIP_PREFIXES):
             return await call_next(request)
 
+        # Socket peer only — X-Forwarded-For is spoofable (CRITIC 10)
         client_ip = request.client.host if request.client else "?"
-        forwarded = request.headers.get("x-forwarded-for")
-        if forwarded:
-            client_ip = forwarded.split(",")[0].strip()
 
         start = time.monotonic()
         try:
@@ -1459,10 +1470,83 @@ async def _forward_post(endpoint, json, headers):
 
 # ── Shared helper functions for endpoint handlers ──────────────
 
+# ── Identity rotation for free requests ─────────────────────────
+# Each successful IP rotation advances an identity profile (curl_cffi
+# impersonation target + User-Agent + optional extra headers) so the
+# free endpoint sees a coherent browser "face" instead of the same
+# fingerprint on every fresh IP. The profile list and index are owned
+# by vpn_manager (config `ip_rotation.identity_profiles`).
+
+# Curated real User-Agents for the default-profile targets. curl_cffi
+# does not expose its embedded UA strings to Python, but the httpx
+# fallback paths (B/D) need a coherent UA — these are the public
+# browser UA strings matching the impersonation bundles.
+_UA_BY_IMPERSONATE = {
+    "chrome124": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "chrome131": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "chrome136": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+    "chrome142": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36",
+    "edge101": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/101.0.4951.64 Safari/537.36 Edg/101.0.1210.53",
+    "firefox135": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:135.0) Gecko/20100101 Firefox/135.0",
+    "safari170": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+}
+
+
+def _current_free_identity() -> dict:
+    """Active identity profile for free requests (vpn_manager ownership).
+
+    Falls back to the chrome131 default when the VPN manager is absent —
+    identical behavior to before identity rotation existed.
+    """
+    if _vpn_manager:
+        return _vpn_manager.current_identity
+    return {"impersonate": "chrome131", "user_agent": None, "extra_headers": {}}
+
+
+def _apply_identity(headers: dict, profile: dict, use_curated_ua: bool = True) -> dict:
+    """Stamp a free-request header dict with the identity profile.
+
+    The outgoing User-Agent ALWAYS comes from the identity, never from
+    the paid client (invariant A.0):
+      - explicit profile user_agent wins,
+      - else curated UA map (httpx paths),
+      - else (use_curated_ua=False, curl_cffi bundle paths) the incoming
+        client UA is removed so the impersonation bundle injects its own
+        coherent browser UA — curl_cffi only fills headers that are absent.
+    extra_headers are applied last so they can override anything.
+    """
+    out = dict(headers)
+    ua = profile.get("user_agent")
+    if not ua and use_curated_ua:
+        ua = _UA_BY_IMPERSONATE.get(profile.get("impersonate"))
+    if ua:
+        out["User-Agent"] = ua
+    elif not use_curated_ua:
+        out.pop("User-Agent", None)
+        out.pop("user-agent", None)
+    for k, v in (profile.get("extra_headers") or {}).items():
+        out[k] = v
+    return out
+
+
+def _free_request_headers(headers: dict) -> dict:
+    """Strip paid-account artifacts from a header dict for the free endpoint.
+
+    Invariant A.0: no request sent to API_BASE_FREE may carry the paid
+    key (Authorization / x-api-key), client cookies, x-request-id or
+    x-stainless-* SDK identifiers. Protocol headers (anthropic-version)
+    survive — they identify the API shape, not the account.
+    """
+    return {k: v for k, v in headers.items()
+            if k.lower() not in ("authorization", "x-api-key", "cookie", "x-request-id")
+            and not k.lower().startswith("x-stainless-")}
+
+
 async def _do_free_request_curl_cffi(body: dict, headers: dict, proxy_url: str | None = None):
     """Make a free model request using curl_cffi for TLS fingerprint evasion.
 
-    Uses Chrome 131 TLS fingerprint and User-Agent to avoid detection.
+    Uses the current identity profile's TLS fingerprint (default chrome131)
+    and User-Agent to avoid detection.
     When proxy_url is provided (VPN mode), routes through the tunnel so the
     request exits with the VPN IP (fresh free quota per IP).
     Returns an httpx-like response object for compatibility.
@@ -1472,18 +1556,18 @@ async def _do_free_request_curl_cffi(body: dict, headers: dict, proxy_url: str |
     except ImportError:
         raise RuntimeError("curl_cffi not installed: pip install curl_cffi")
 
-    # Convert headers to dict (remove auth for free models)
-    req_headers = {k: v for k, v in headers.items()
-                   if k.lower() not in ('authorization', 'x-api-key')}
+    # Strip paid-account artifacts, stamp the identity (bundle UA wins)
+    profile = _current_free_identity()
+    req_headers = _apply_identity(_free_request_headers(headers), profile, use_curated_ua=False)
     req_headers["Content-Type"] = "application/json"
 
-    async with AsyncSession(impersonate="chrome131",
+    async with AsyncSession(impersonate=profile["impersonate"],
                             proxy=_curl_proxy_url(proxy_url)) as session:
         resp = await session.post(
             API_BASE_FREE,
             json=body,
             headers=req_headers,
-            timeout=60,
+            timeout=(30, 600),  # (connect, read) — same as other free paths ([6])
         )
         # Wrap in a compatible response object
         return _CurlCffiResponse(resp)
@@ -1539,8 +1623,22 @@ class _CurlCffiStreamResponse:
         self.headers = dict(resp.headers)
 
     async def aiter_lines(self):
-        async for line in self._resp.aiter_lines():
-            yield line
+        """Yield SSE lines as str, split manually from raw bytes ([41]).
+
+        curl_cffi's own aiter_lines() yields bytes (its internal
+        splitting also raises TypeError "startswith first arg must
+        be bytes" in 0.14.0), while consumers expect httpx-style str
+        lines — so iterate aiter_content() and split on \n here,
+        buffering a partial line across chunks.
+        """
+        buf = b""
+        async for chunk in self._resp.aiter_content():
+            buf += chunk
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                yield line.rstrip(b"\r").decode("utf-8", errors="replace")
+        if buf:  # trailing line without final newline
+            yield buf.rstrip(b"\r").decode("utf-8", errors="replace")
 
     async def aiter_bytes(self):
         async for chunk in self._resp.aiter_content():
@@ -1554,22 +1652,31 @@ class _CurlCffiStreamResponse:
 
 
 @asynccontextmanager
-async def _open_free_stream(endpoint, body, headers, use_free: bool):
+async def _open_free_stream(endpoint, body, headers, use_free: bool, count_request: bool = True):
     """Context manager: upstream stream, routed through the VPN when free.
 
     use_free=True and VPN available → curl_cffi stream via the SOCKS5 tunnel
-    (fresh IP = fresh free quota), impersonate chrome131. Otherwise → normal
-    httpx stream. Both paths yield the same response interface.
+    (fresh IP = fresh free quota), impersonate the current identity profile.
+    Direct fallback (VPN down) → httpx stream with paid-account artifacts
+    stripped and the identity UA applied (invariant A.0). use_free=False →
+    normal paid httpx stream, headers untouched. All paths yield the same
+    response interface.
+
+    count_request=False skips the quota counter on this attempt ([19]): the
+    callers' retry loop re-enters this function on network errors, and each
+    re-entry must not advance the per-IP request count (1 request = 1 count,
+    whatever the number of attempts).
     """
     if use_free and _free_ip_pool and _free_ip_pool.enabled:
-        proxy_url = await _free_ip_pool.on_request()
+        proxy_url = await _free_ip_pool.on_request() if count_request else _free_ip_pool.proxy_url
         if proxy_url:
             try:
                 from curl_cffi.requests import AsyncSession
-                req_headers = {k: v for k, v in headers.items()
-                               if k.lower() not in ('authorization', 'x-api-key')}
+                profile = _current_free_identity()
+                req_headers = _apply_identity(_free_request_headers(headers),
+                                              profile, use_curated_ua=False)
                 req_headers["Content-Type"] = "application/json"
-                session = AsyncSession(impersonate="chrome131",
+                session = AsyncSession(impersonate=profile["impersonate"],
                                        proxy=_curl_proxy_url(proxy_url),
                                        timeout=(30, 600))  # connect 30 / read 600 (cf. upstream.timeout)
                 resp = await session.post(endpoint, json=body, headers=req_headers, stream=True)
@@ -1583,45 +1690,161 @@ async def _open_free_stream(endpoint, body, headers, use_free: bool):
             except Exception as e:
                 _debug(f"  [stream] curl_cffi proxy stream failed: {e}, falling back to direct stream")
                 _log(f"  FREE STREAM via VPN tunnel FAILED ({e}) → direct fallback (residential IP)")
+    if use_free:
+        # Direct fallback to the free endpoint: never forward the paid key,
+        # cookies or SDK identifiers (invariant A.0), stamp the identity UA.
+        profile = _current_free_identity()
+        free_headers = _apply_identity(_free_request_headers(headers), profile)
+        async with _client.stream("POST", endpoint, json=body, headers=free_headers) as resp:
+            yield resp
+        return
     async with _client.stream("POST", endpoint, json=body, headers=headers) as resp:
         yield resp
 
 
-# Cache for public IP to avoid flooding ipify.org
-_public_ip_cache = {"ip": "", "ts": 0.0}
+# Cache for public IP to avoid flooding ipify.org. [47]: the probe must
+# measure the REAL egress — through the tunnel when the VPN is up (that is
+# the IP free requests actually present upstream), direct otherwise. The
+# entry is tagged with the probe context so a tunnel IP is never served as
+# the direct egress (or vice versa) across a VPN transition.
+_public_ip_cache = {"ip": "", "ts": 0.0, "via_tunnel": False}
 
 async def _get_cached_public_ip() -> str:
-    """Get public IP, cached for 60s to avoid flooding."""
+    """Get the real egress IP, cached for 60s to avoid flooding.
+
+    [47] Probes THROUGH the SOCKS5 tunnel when the VPN is up — matching
+    the egress the free requests present upstream, not the machine's
+    residential IP. Falls back to the direct egress only when there is no
+    tunnel. Never raises.
+    """
+    expect_tunnel = bool(_vpn_manager and _vpn_manager.current_ip
+                         and getattr(_vpn_manager, "socks5_url", None))
     now = time.monotonic()
-    if _public_ip_cache["ip"] and now - _public_ip_cache["ts"] < 60:
-        return _public_ip_cache["ip"]
+    cached = _public_ip_cache
+    if cached["ip"] and now - cached["ts"] < 60 and cached["via_tunnel"] == expect_tunnel:
+        return cached["ip"]
     try:
         import httpx
-        async with httpx.AsyncClient(timeout=5) as client:
+        proxy = _vpn_manager.socks5_url if expect_tunnel else None
+        async with httpx.AsyncClient(timeout=10 if expect_tunnel else 5,
+                                     proxy=proxy) as client:
             resp = await client.get("https://api.ipify.org")
             ip = resp.text.strip()
-            _public_ip_cache["ip"] = ip
-            _public_ip_cache["ts"] = now
-            return ip
     except Exception:
-        return _public_ip_cache["ip"] or "unknown"
+        # Serve the stale value only when it matches the current context.
+        return cached["ip"] if cached["via_tunnel"] == expect_tunnel else "unknown"
+    if ip:
+        cached.update(ip=ip, ts=now, via_tunnel=expect_tunnel)
+        return ip
+    return cached["ip"] if cached["via_tunnel"] == expect_tunnel else "unknown"
 
 
-# Free model cooldown: after a 429, skip free model for this many seconds
-_free_model_cooldown_until = 0.0  # monotonic timestamp
+# Free model cooldown: after a 429 (or any free non-200), skip that free
+# model for a duration derived from the upstream retry-after.
+# Keyed per (model, current IP) ([4]) — one model/IP's quota exhaustion
+# must not block the others, and a rotation to a fresh IP starts with a
+# FRESH key (the 429 that triggered the rotation only blocks the
+# exhausted IP, never the model on the new IP).
+_free_model_cooldowns: dict[str, float] = {}  # "model|ip" -> monotonic expiry
+_FREE_COOLDOWN_MAX = 86400  # hard ceiling: retry-after beyond 24 h → 1 h default anyway
 
 
-async def _try_free_model_first(body, headers, protocol, model_id,
-                                api_key=None, workspace_id=None, api_keys=None):
+def _free_cooldown_key(free_model: str) -> str:
+    """Cooldown key = (free model, current egress IP) ([4]).
+
+    "direct" when no VPN IP is known (VPN down / direct mode) — in that
+    case there is no fresh-IP path, so the key must stay stable.
+    """
+    ip = _vpn_manager.current_ip if (_vpn_manager and _vpn_manager.current_ip) else "direct"
+    return f"{free_model}|{ip}"
+
+
+def _free_429_cooldown_seconds(retry_after: str = "") -> float:
+    """Duration (seconds) to cooldown a free model after a 429.
+
+    Accepts a seconds count ("120") or an RFC 9110 HTTP-date
+    ("Wed, 21 Oct 2015 07:28:00 GMT") ([7]). Anything unparseable or out
+    of (0, 86400] → 3600 s. An absent retry-after means we don't know
+    the reset time — defaulting long-ish is safe because the cooldown is
+    per-model and cheap (only skips free attempts, never blocks paid).
+    """
+    if not retry_after:
+        return 3600.0
+    v = 0.0
+    try:
+        v = float(retry_after)
+    except (TypeError, ValueError):
+        try:
+            parsed = email.utils.parsedate_to_datetime(retry_after)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=datetime.timezone.utc)  # HTTP-date is GMT
+            v = (parsed - datetime.datetime.now(datetime.timezone.utc)).total_seconds()
+        except (TypeError, ValueError, OverflowError):
+            return 3600.0
+    if 0 < v <= _FREE_COOLDOWN_MAX:
+        return v
+    return 3600.0
+
+
+def _set_free_cooldown(free_model: str, seconds: float) -> None:
+    key = _free_cooldown_key(free_model)
+    expiry = time.monotonic() + seconds
+    if len(_free_model_cooldowns) > 32:  # bound memory: drop expired entries
+        expired = [m for m, t in _free_model_cooldowns.items() if t <= time.monotonic()]
+        for m in expired:
+            del _free_model_cooldowns[m]
+    _free_model_cooldowns[key] = expiry
+    _log(f"  FREE COOLDOWN: {key} for {seconds:.0f}s")
+
+
+def _free_cooldown_active(free_model: str) -> bool:
+    key = _free_cooldown_key(free_model)
+    expiry = _free_model_cooldowns.get(key, 0.0)
+    if expiry > 0 and time.monotonic() < expiry:
+        return True
+    if expiry > 0:
+        del _free_model_cooldowns[key]
+    return False
+
+
+def _on_free_429_stream(free_model: str, retry_after: str = "") -> None:
+    """Free endpoint 429 during streaming: cooldown + paid fallback.
+
+    [0]/[42] restored: a 429 ALSO triggers an IP rotation in the
+    background (single-flight via FreeIPPool.on_quota_exhausted; the
+    calling request falls back to paid immediately). The cooldown is
+    keyed per (model, IP) ([4]) so the fresh IP starts with a fresh key
+    — the next free attempt on the new IP is NOT blocked by this 429.
+    No-op when VPN rotation is off.
+    """
+    _set_free_cooldown(free_model, _free_429_cooldown_seconds(retry_after))
+    if _free_ip_pool:
+        _free_ip_pool.on_quota_exhausted()
+
+
+def _free_usage_ip() -> str:
+    """Best-effort egress IP for free-model usage logging ([9]).
+
+    Never does network I/O — prefers the live VPN IP, falls back to the
+    cached ipify result from the last non-stream probe.
+    """
+    if _vpn_manager and _vpn_manager.current_ip:
+        return _vpn_manager.current_ip
+    return _public_ip_cache.get("ip", "") or ""
+
+
+async def _try_free_model_first(body, headers, protocol, model_id):
     """Try the free model equivalent before falling back to paid.
 
     If the model has a free equivalent in FREE_MODEL_MAP, attempt the request
-    via the free endpoint first. On 429 (quota exhausted), returns None to
-    signal the caller should use the paid model instead.
+    via the free endpoint first. On 429 (quota exhausted) or any other
+    non-200, returns None to signal the caller should use the paid model
+    instead, and sets a per-(model, IP) cooldown ([4]).
 
-    When VPN rotation is enabled, free requests go through a VPN tunnel
-    (different IP = different quota). Uses curl_cffi for TLS fingerprint
-    evasion (imitates Chrome).
+    When VPN rotation is enabled, free requests go through a VPN tunnel.
+    [0]/[42] restored: a 429 answers with a background IP rotation
+    (single-flight) so the next free attempt lands on a fresh IP with a
+    fresh cooldown key — exactly the path that unblocks the model.
 
     Every attempt is logged to free_model_usage table for quota analysis.
 
@@ -1634,10 +1857,9 @@ async def _try_free_model_first(body, headers, protocol, model_id,
     if not free_model:
         return None  # No free equivalent, proceed with paid
 
-    # Skip free model if recently rate-limited (cooldown avoids sequential free→paid latency)
-    global _free_model_cooldown_until
-    if time.monotonic() < _free_model_cooldown_until:
-        _debug(f"  [free] skipping free model (cooldown active)")
+    # Skip free model if its cooldown is active (avoids sequential free→paid latency)
+    if _free_cooldown_active(free_model):
+        _debug(f"  [free] skipping free model {free_model!r} (cooldown active)")
         return None
 
     _debug(f"  [free] trying free model {free_model!r} instead of {model_id!r}")
@@ -1655,8 +1877,8 @@ async def _try_free_model_first(body, headers, protocol, model_id,
         if _vpn_manager and _vpn_manager.current_ip:
             free_ip = _vpn_manager.current_ip
 
-    # Free models don't need authentication — send minimal headers
-    free_headers = {"Content-Type": "application/json"}
+    # Free models don't need authentication — minimal headers + identity UA
+    free_headers = _apply_identity({"Content-Type": "application/json"}, _current_free_identity())
     free_api_key = "free (no auth)"
     free_workspace = "free (no auth)"
 
@@ -1737,31 +1959,21 @@ async def _try_free_model_first(body, headers, protocol, model_id,
                        if k.lower() in ('retry-after', 'x-ratelimit-limit',
                                          'x-ratelimit-remaining', 'x-ratelimit-reset',
                                          'content-type')}
-        _debug(f"  [free] {free_model!r} 429 body={body_429!r} headers={headers_429}")
+        _debug(f"  [free] {free_model!r} 429 body={_redact(body_429)!r} headers={headers_429}")
         _log(f"  FREE {free_model!r} RATE LIMITED (429) retry-after={retry_after}s → falling back to paid {model_id!r}")
 
-        # Set cooldown to skip free model for 60s (avoids sequential free→paid latency)
-        _free_model_cooldown_until = time.monotonic() + 60
-
-        # If VPN rotation is enabled, switch IP on 429.
-        # A long retry-after means the account-wide free quota is exhausted —
-        # rotating would just restart the tunnel for nothing. Only rotate
-        # when retry-after is short (per-IP quota) or absent.
-        if _free_ip_pool and _free_ip_pool.enabled:
-            try:
-                _long_wait = 0
-                try:
-                    _long_wait = int(float(retry_after))
-                except (TypeError, ValueError):
-                    pass
-                if _long_wait <= 300:
-                    asyncio.create_task(_free_ip_pool.on_quota_exhausted())
-            except Exception as e:
-                _debug(f"  [free] quota-exhausted task error: {e}")
+        # Per-(model, IP) cooldown honoring the upstream retry-after ([4])
+        # + background IP rotation ([0]/[42]): the key is (model, current
+        # IP), so the rotation makes the next free attempt a fresh key.
+        _set_free_cooldown(free_model, _free_429_cooldown_seconds(retry_after))
+        if _free_ip_pool:
+            _free_ip_pool.on_quota_exhausted()
 
         return None
 
-    # Other errors → fall back to paid
+    # Other errors → cooldown (60 s) so the next request doesn't retry the
+    # free model immediately, then fall back to paid
+    _set_free_cooldown(free_model, 60)
     _debug(f"  [free] {free_model!r} returned {resp.status_code} → falling back to paid")
     return None
 
@@ -1821,7 +2033,7 @@ async def _do_request_with_retry(endpoint, body, headers, protocol, retry_on_429
                 _err_body = resp.text[:500] if hasattr(resp, 'text') else str(resp.content[:500])
             except Exception:
                 _err_body = "(unable to read response body)"
-            _debug(f"  [auth] 401 response body: {_err_body}")
+            _debug(f"  [auth] 401 response body: {_redact(_err_body, 500)}")
             # 401 = key temporarily unavailable (quota exhausted) → pause 1h
             _key_pauser.pause_key(failed_key, 3600, "401 Unauthorized (temporary)")
             alt = _find_alternative_key(failed_key)
@@ -1840,7 +2052,7 @@ async def _do_request_with_retry(endpoint, body, headers, protocol, retry_on_429
                 _err_body = resp.text[:500] if hasattr(resp, 'text') else str(resp.content[:500])
             except Exception:
                 _err_body = "(unable to read response body)"
-            _debug(f"  [auth] 403 response body: {_err_body}")
+            _debug(f"  [auth] 403 response body: {_redact(_err_body, 500)}")
             _key_pauser.pause_key(failed_key, 1800, "403 Forbidden (region/model not allowed)")
             alt = _find_alternative_key(failed_key)
             if alt:
@@ -1913,7 +2125,7 @@ async def _log_and_save_error(req_id, model_id, original_model, start_time,
                                effort, client_ip, account_alias, tools, tools_used=None,
                                request_body=None, response_body=None):
     """Log error and save to DB with success=False."""
-    _log(f"  ERROR {status_code}: {resp_text[:300]}")
+    _log(f"  ERROR {status_code}: {_redact(resp_text, 300)}")
     try:
         await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
                      0, 0, 0, success=False, error=f"HTTP {status_code}",
@@ -1962,7 +2174,7 @@ async def _stream_error_response(req_id, model_id, original_model, start_time,
                                   effort, client_ip, account_alias, tools,
                                   error_payload, tools_used=None, request_body=None):
     """Handle streaming error: log, save DB, yield error SSE event. Returns the error event bytes."""
-    _log(f"  ERROR {status_code}: {resp_body[:300] if isinstance(resp_body, str) else resp_body[:300]}")
+    _log(f"  ERROR {status_code}: {_redact(resp_body, 300)}")
     await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
                  0, 0, 0, success=False, error=f"HTTP {status_code}",
                  protocol=protocol, is_stream=True, thinking=thinking_type, effort=effort,
@@ -3298,9 +3510,13 @@ def _elapsed_ms(start_time: float) -> int:
     return int((time.monotonic() - start_time) * 1000)
 
 
-def _extract_tool_names(data: dict) -> list:
+def _extract_usage_tool_names(data: dict) -> list:
     """Extract tool call names from an OpenAI chat response, tolerating
-    missing choices / message / tool_calls (upstream may return null)."""
+    missing choices / message / tool_calls (upstream may return null).
+
+    Distinct from _extract_tool_names() (request side): a duplicate
+    definition here used to shadow the request-side helper at module
+    scope, breaking request-side tool extraction ([43])."""
     choices = data.get("choices") or []
     if not choices or not isinstance(choices, list):
         return []
@@ -3314,12 +3530,13 @@ def _extract_tool_names(data: dict) -> list:
 # ── Shared helpers for endpoint handlers ──────────────────────────
 
 def _get_client_ip(request: Request) -> str:
-    """Extract client IP from request, respecting X-Forwarded-For."""
-    ip = request.client.host if request.client else "unknown"
-    forwarded = request.headers.get("x-forwarded-for")
-    if forwarded:
-        ip = forwarded.split(",")[0].strip()
-    return ip
+    """Extract client IP from the socket peer only.
+
+    X-Forwarded-For is spoofable by any direct client and is never
+    trusted (CRITIC 10). Trusted-proxy deployments can re-enable it
+    behind a dedicated reverse proxy.
+    """
+    return request.client.host if request.client else "unknown"
 
 
 @app.api_route("/v1/messages", methods=["POST"])
@@ -3348,7 +3565,7 @@ async def messages(request: Request):
     _debug(f"[messages] req_id={req_id} model={original_model!r} tools={tool_names} ip={client_ip}")
     if DEBUG:
         _debug(f"[messages] headers={_sanitize_headers(dict(request.headers))}")
-        _debug(f"[messages] body=\n{_truncate(body)}")
+        _debug(f"[messages] body=\n{_redact(_truncate(body))}")
     route = _route_for(original_model, tool_names)
     if route is None:
         _debug(f"[messages] ✗ no route found for {original_model!r}")
@@ -3453,10 +3670,7 @@ async def messages(request: Request):
 
             # Try free model first if available
             try:
-                _ak = _key_from_headers(a_headers, "anthropic")
-                free_result = await _try_free_model_first(body, a_headers, "anthropic", model_id,
-                                                          api_key=_ak, workspace_id=_workspace_for_key(_ak),
-                                                          api_keys=API_KEYS)
+                free_result = await _try_free_model_first(body, a_headers, "anthropic", model_id)
                 if free_result is not None:
                     resp, a_headers, _actual_model, _actual_ip = free_result
                     model_id = _actual_model  # Log as free model
@@ -3480,7 +3694,7 @@ async def messages(request: Request):
                     msg = "Upstream disconnected (499). Retrying may help."
                 else:
                     msg = resp.text[:500]
-                _debug(f"  ✗ upstream {resp.status_code} → client {status}: {msg[:300]}")
+                _debug(f"  ✗ upstream {resp.status_code} → client {status}: {_redact(msg, 300)}")
                 await _log_and_save_error(req_id, model_id, original_model, start_time,
                              resp.status_code, resp.text, protocol, is_stream, thinking_type,
                              effort, client_ip, account_alias, tool_names,
@@ -3488,7 +3702,7 @@ async def messages(request: Request):
                 # Pause key on credit/balance errors (400) and retry with alt key
                 if resp.status_code == 400 and any(x in resp.text for x in ("Insufficient balance", "Monthly usage limit")):
                     failed_key = headers.get("x-api-key", "")
-                    _key_pauser.pause_key(failed_key, _key_pauser._max_pause, f"400 credit error: {resp.text[:80]}")
+                    _key_pauser.pause_key(failed_key, _key_pauser._max_pause, f"400 credit error: {_redact(resp.text, 80)}")
                     alt = _find_alternative_key(failed_key)
                     if alt:
                         _log(f"  400 credit error on key, retrying with alternative key")
@@ -3518,7 +3732,7 @@ async def messages(request: Request):
             req_out = usage.get("output_tokens", 0) or usage.get("completion_tokens", 0)
             req_cache = usage.get("cache_read_input_tokens", 0)
             _debug(f"  usage: in={req_in} out={req_out} cache={req_cache}")
-            _debug(f"  response=\n{_truncate(data)}")
+            _debug(f"  response=\n{_redact(_truncate(data))}")
             _update_token_usage(model_id, req_in, req_out, req_cache)
             used = [b["name"] for b in data.get("content", []) if b.get("type") == "tool_use"]
             await _save_and_log_request(req_id, model_id, original_model, start_time,
@@ -3567,17 +3781,27 @@ async def messages(request: Request):
                 used_tools = []  # Reset on each retry attempt
                 _debug(f"  [stream] attempt {_attempt+1}/2")
                 try:
-                    async with _open_free_stream(endpoint, body, headers, _using_free) as resp:
+                    async with _open_free_stream(endpoint, body, headers, _using_free,
+                                                 count_request=(_attempt == 0)) as resp:
                         _debug(f"  [stream] connected status={resp.status_code}")
                         if resp.status_code != 200:
-                            # Free model 429 → fall back to paid model
-                            if _using_free and resp.status_code == 429:
+                            if _using_free:
+                                # Free endpoint non-200 (429 quota, 5xx...) → cooldown
+                                # the free model, fall back to paid. Never pauses PAID
+                                # keys: a status from the free endpoint says nothing
+                                # about the paid account (CRITIC(2)/CRITIC(3)).
+                                if resp.status_code == 429:
+                                    _on_free_429_stream(free_model, resp.headers.get('retry-after', ''))
+                                else:
+                                    _set_free_cooldown(free_model, 60)
                                 body = paid_body
                                 endpoint = paid_endpoint
                                 _using_free = False
                                 _track_model = model_id  # Revert tracking to paid model
-                                _debug(f"  [stream] free model 429 → falling back to paid {_track_model!r}")
-                                _log(f"  FREE model rate limited → falling back to paid {_track_model!r}")
+                                _debug(f"  [stream] free model {resp.status_code} → falling back to paid {_track_model!r}")
+                                _log(f"  FREE model {resp.status_code} → falling back to paid {_track_model!r}")
+                                _log_free_model_usage(model_id, free_model, "free (no auth)", "free (no auth)",
+                                                      resp.status_code, ip=_free_usage_ip())
                                 continue
                             headers, should_retry = await _handle_429(headers, resp.status_code, _attempt, resp.headers)
                             if should_retry:
@@ -3600,10 +3824,10 @@ async def messages(request: Request):
                                                "anthropic-version": "2023-06-01"}
                                     continue
                             ak = _alias_for_key(headers.get("x-api-key", ""))
-                            _debug(f"  [stream] error {resp.status_code}: {err[:300]}")
+                            _debug(f"  [stream] error {resp.status_code}: {_redact(err, 300)}")
                             # Log 401 body specifically for key diagnosis
                             if resp.status_code == 401:
-                                _debug(f"  [auth] 401 response body: {err.decode('utf-8', errors='replace')[:500]}")
+                                _debug(f"  [auth] 401 response body: {_redact(err, 500)}")
                             # Convert 429/401/403 → 503 to avoid Claude Code auth window
                             # (statut normalisé inutile ici : HTTP déjà 200 en streaming,
                             # seul err_msg atteint le client)
@@ -3738,6 +3962,10 @@ async def messages(request: Request):
                 return
             logged_in = stream_in if stream_in is not None else est_input
             _debug(f"  [stream] done: in={logged_in} out={stream_out} cache={stream_cache} tools={used_tools}")
+            if _using_free:
+                _log_free_model_usage(model_id, free_model, "free (no auth)", "free (no auth)",
+                                      200, logged_in or 0, stream_out or 0,
+                                      _elapsed_ms(start_time), ip=_free_usage_ip())
             if stream_in is not None or stream_out:
                 ak = _alias_for_key(headers.get("x-api-key", ""))
                 await _save_and_log_request(req_id, _track_model, original_model, start_time,
@@ -3753,7 +3981,7 @@ async def messages(request: Request):
     # ── OpenAI-protocol ─────────────────────────────────────────
     try:
         oai_body = anthropic_to_openai(body, model_id)
-        _debug(f"[messages] converted to openai: {_truncate(oai_body, 2000)}")
+        _debug(f"[messages] converted to openai: {_redact(_truncate(oai_body, 2000))}")
     except Exception as e:
         _debug(f"[messages] ✗ conversion failed: {e}")
         _log(f"  CONVERSION ERROR: anthropic_to_openai failed: {type(e).__name__}: {e}")
@@ -3773,7 +4001,7 @@ async def messages(request: Request):
                     req_out = usage.get("completion_tokens", 0)
                     cache = _extract_cache_tokens(usage)
                     _update_token_usage(_actual_model, req_in, req_out, cache)
-                    used = _extract_tool_names(data)
+                    used = _extract_usage_tool_names(data)
                     await _save_and_log_request(req_id, _actual_model, original_model, start_time,
                                  req_in, req_out, cache, protocol, False, thinking_type,
                                  effort, client_ip, "free (no auth)", tool_names, tools_used=used,
@@ -3793,10 +4021,7 @@ async def messages(request: Request):
     if not is_stream:
         # Try free model first if available
         try:
-            _ak = _key_from_headers(headers, "openai")
-            free_result = await _try_free_model_first(oai_body, headers, "openai", model_id,
-                                                      api_key=_ak, workspace_id=_workspace_for_key(_ak),
-                                                      api_keys=API_KEYS)
+            free_result = await _try_free_model_first(oai_body, headers, "openai", model_id)
             if free_result is not None:
                 resp, headers, _actual_model, _actual_ip = free_result
                 model_id = _actual_model
@@ -3856,7 +4081,7 @@ async def messages(request: Request):
         cache = _extract_cache_tokens(usage)
         _debug(f"  usage: in={req_in} out={req_out} cache={cache}")
         _update_token_usage(model_id, req_in, req_out, cache)
-        used = _extract_tool_names(data)
+        used = _extract_usage_tool_names(data)
         msg_data = ((data.get("choices") or [{}])[0] or {}).get("message") or {}
         if not (msg_data.get("reasoning_content") or msg_data.get("reasoning")) and thinking_type != "none":
             _debug(f"  [non-stream] WARNING: thinking requested (type={thinking_type}, effort={effort}) but upstream returned no reasoning_content")
@@ -3907,12 +4132,22 @@ async def messages(request: Request):
             used_tools = []  # Reset on each retry attempt
             tool_block_idx = {}  # Reset tracking dict on each retry
             try:
-                async with _open_free_stream(endpoint, oai_body, hdrs, _using_free) as resp:
+                async with _open_free_stream(endpoint, oai_body, hdrs, _using_free,
+                                             count_request=(_attempt == 0)) as resp:
                     if resp.status_code != 200:
-                        # Free model 429 → fall back to paid model
-                        if _using_free and resp.status_code == 429:
-                            _debug(f"  [stream-oai] free model 429 → falling back to paid {_paid_model_id!r}")
-                            _log(f"  FREE model rate limited → falling back to paid {_paid_model_id!r}")
+                        if _using_free:
+                            # Free endpoint non-200 (429 quota, 5xx...) → cooldown
+                            # the free model, fall back to paid. Never pauses PAID
+                            # keys: a status from the free endpoint says nothing
+                            # about the paid account (CRITIC(2)/CRITIC(3)).
+                            if resp.status_code == 429:
+                                _on_free_429_stream(free_model, resp.headers.get('retry-after', ''))
+                            else:
+                                _set_free_cooldown(free_model, 60)
+                            _debug(f"  [stream-oai] free model {resp.status_code} → falling back to paid {_paid_model_id!r}")
+                            _log(f"  FREE model {resp.status_code} → falling back to paid {_paid_model_id!r}")
+                            _log_free_model_usage(_paid_model_id, free_model, "free (no auth)", "free (no auth)",
+                                                  resp.status_code, ip=_free_usage_ip())
                             oai_body = paid_oai_body
                             endpoint = paid_endpoint
                             model_id = _paid_model_id
@@ -3963,6 +4198,10 @@ async def messages(request: Request):
                             yield _sse("message_delta", {"type": "message_delta", "delta": {"stop_reason": "tool_use" if has_tools else "end_turn"}, "usage": {"output_tokens": final_out, "cache_read_input_tokens": final_cache}})
                             yield _sse("message_stop", {"type": "message_stop"})
                             ak_h = _alias_for_key(_key_from_headers(hdrs, "openai"))
+                            if _using_free:
+                                _log_free_model_usage(_paid_model_id, free_model, "free (no auth)", "free (no auth)",
+                                                      200, final_in or 0, final_out or 0,
+                                                      _elapsed_ms(start_time), ip=_free_usage_ip())
                             await _save_and_log_request(req_id, _req_model_id, original_model, start_time,
                                          final_in, final_out, final_cache, protocol, True, thinking_type,
                                          effort, client_ip, ak_h, tool_names, log_tag,
@@ -4262,7 +4501,7 @@ async def chat_completions(request: Request):
     _debug(f"[chat] req_id={req_id} model={original_model!r} tools={tool_names} ip={client_ip}")
     if DEBUG:
         _debug(f"[chat] headers={_sanitize_headers(dict(request.headers))}")
-        _debug(f"[chat] body=\n{_truncate(body)}")
+        _debug(f"[chat] body=\n{_redact(_truncate(body))}")
     route = _route_for(original_model, tool_names)
     if route is None:
         _debug(f"[chat] ✗ no route found for {original_model!r}")
@@ -4324,7 +4563,7 @@ async def chat_completions(request: Request):
                             req_out = usage.get("completion_tokens", 0)
                             cache = _extract_cache_tokens(usage)
                             _update_token_usage(_actual_model, req_in, req_out, cache)
-                            used = _extract_tool_names(data)
+                            used = _extract_usage_tool_names(data)
                             await _save_and_log_request(req_id, _actual_model, original_model, start_time,
                                          req_in, req_out, cache, protocol, False, thinking_type,
                                          effort, client_ip, "free (no auth)", tool_names, tools_used=used,
@@ -4340,12 +4579,17 @@ async def chat_completions(request: Request):
                 headers={"Retry-After": str(retry_after)})
 
         if not is_stream:
+            # Response cache (mirrors the anthropic non-stream handler) [8]
+            cache_key = _response_cache.make_key(body, body_bytes=body_bytes)
+            cached = cache_key and _response_cache.get(cache_key)
+            if cached:
+                cached_body, cached_headers = cached
+                _debug(f"  [chat] response cache HIT ({len(cached_body)} bytes)")
+                return Response(content=cached_body, headers={**cached_headers, "X-Cache": "HIT"},
+                                media_type="application/json")
             # Try free model first if available
             try:
-                _ak = _key_from_headers(headers, "openai")
-                free_result = await _try_free_model_first(body, headers, "openai", model_id,
-                                                          api_key=_ak, workspace_id=_workspace_for_key(_ak),
-                                                          api_keys=API_KEYS)
+                free_result = await _try_free_model_first(body, headers, "openai", model_id)
                 if free_result is not None:
                     resp, headers, _actual_model, _actual_ip = free_result
                     model_id = _actual_model
@@ -4362,7 +4606,7 @@ async def chat_completions(request: Request):
                 # Pause key on credit/balance errors (400) and retry with alt key
                 if resp.status_code == 400 and any(x in resp.text for x in ("Insufficient balance", "Monthly usage limit")):
                     failed_key = _key_from_headers(headers, "openai")
-                    _key_pauser.pause_key(failed_key, _key_pauser._max_pause, f"400 credit error: {resp.text[:80]}")
+                    _key_pauser.pause_key(failed_key, _key_pauser._max_pause, f"400 credit error: {_redact(resp.text, 80)}")
                     alt = _find_alternative_key(failed_key)
                     if alt:
                         _log(f"  400 credit error on key, retrying with alternative key")
@@ -4393,12 +4637,13 @@ async def chat_completions(request: Request):
             cache = _extract_cache_tokens(usage)
             _debug(f"  usage: in={req_in} out={req_out} cache={cache}")
             _update_token_usage(model_id, req_in, req_out, cache)
-            used = _extract_tool_names(data)
+            used = _extract_usage_tool_names(data)
             await _save_and_log_request(req_id, model_id, original_model, start_time,
                          req_in, req_out, cache, protocol, is_stream, thinking_type,
                          effort, client_ip, account_alias, tool_names, tools_used=used if used else None,
                          request_body=request_body, response_body=data)
-            return Response(content=json.dumps(data, ensure_ascii=False), media_type="application/json")
+            _response_cache.put(cache_key, resp.content, {"Content-Type": "application/json"})
+            return Response(content=resp.content, headers={"X-Cache": "MISS"}, media_type="application/json")
 
         # ── OpenAI streaming passthrough ──
         oai_body = dict(body)
@@ -4435,16 +4680,26 @@ async def chat_completions(request: Request):
                 used_tools = []
                 seen_tool_indices = set()  # dedup tool calls by index
                 try:
-                    async with _open_free_stream(endpoint, oai_body, hdrs, _using_free) as resp:
+                    async with _open_free_stream(endpoint, oai_body, hdrs, _using_free,
+                                             count_request=(_attempt == 0)) as resp:
                         if resp.status_code != 200:
-                            # Free model 429 → fall back to paid model
-                            if _using_free and resp.status_code == 429:
+                            if _using_free:
+                                # Free endpoint non-200 (429 quota, 5xx...) → cooldown
+                                # the free model, fall back to paid. Never pauses PAID
+                                # keys: a status from the free endpoint says nothing
+                                # about the paid account (CRITIC(2)/CRITIC(3)).
+                                if resp.status_code == 429:
+                                    _on_free_429_stream(free_model, resp.headers.get('retry-after', ''))
+                                else:
+                                    _set_free_cooldown(free_model, 60)
                                 oai_body = paid_oai_body
                                 endpoint = paid_endpoint
                                 _using_free = False
                                 _track_model = model_id  # Revert tracking to paid model
-                                _debug(f"  [chat-stream] free model 429 → falling back to paid {_track_model!r}")
-                                _log(f"  FREE model rate limited → falling back to paid {_track_model!r}")
+                                _debug(f"  [chat-stream] free model {resp.status_code} → falling back to paid {_track_model!r}")
+                                _log(f"  FREE model {resp.status_code} → falling back to paid {_track_model!r}")
+                                _log_free_model_usage(model_id, free_model, "free (no auth)", "free (no auth)",
+                                                      resp.status_code, ip=_free_usage_ip())
                                 continue
                             hdrs, should_retry = await _handle_429(hdrs, resp.status_code, _attempt, resp.headers)
                             if should_retry:
@@ -4467,7 +4722,7 @@ async def chat_completions(request: Request):
                             ak_h = _alias_for_key(_key_from_headers(hdrs, "openai"))
                             # Log 401 body specifically for key diagnosis
                             if resp.status_code == 401:
-                                _debug(f"  [auth] 401 response body: {err.decode('utf-8', errors='replace')[:500]}")
+                                _debug(f"  [auth] 401 response body: {_redact(err, 500)}")
                             # Convert 429/401/403 → 503 to avoid Claude Code auth window
                             err_status = 503 if resp.status_code in (429, 401, 403) else resp.status_code
                             if resp.status_code == 429:
@@ -4520,6 +4775,10 @@ async def chat_completions(request: Request):
                             _track_model, est_input, None, stream_out, 0,
                             actual_usage, _token_usage, _token_lock)
                         ak_h = _alias_for_key(_key_from_headers(hdrs, "openai"))
+                        if _using_free:
+                            _log_free_model_usage(model_id, free_model, "free (no auth)", "free (no auth)",
+                                                  200, final_in or 0, final_out or 0,
+                                                  _elapsed_ms(start_time), ip=_free_usage_ip())
                         await _save_and_log_request(req_id, _track_model, original_model, start_time,
                                      final_in, final_out, final_cache, protocol, True, thinking_type,
                                      effort, client_ip, ak_h, tool_names, log_tag,
@@ -4630,10 +4889,7 @@ async def chat_completions(request: Request):
     if not is_stream:
         # Try free model first if available
         try:
-            _ak = a_headers.get("x-api-key", "")
-            free_result = await _try_free_model_first(anthro_body, a_headers, "anthropic", model_id,
-                                                      api_key=_ak, workspace_id=_workspace_for_key(_ak),
-                                                      api_keys=API_KEYS)
+            free_result = await _try_free_model_first(anthro_body, a_headers, "anthropic", model_id)
             if free_result is not None:
                 resp, a_headers, _actual_model, _actual_ip = free_result
                 model_id = _actual_model
@@ -4723,16 +4979,26 @@ async def chat_completions(request: Request):
 
         for _attempt in range(yaml_get("streaming", "retry_attempts", 2)):
             try:
-                async with _open_free_stream(endpoint, anthro_body, hdrs, _using_free) as resp:
+                async with _open_free_stream(endpoint, anthro_body, hdrs, _using_free,
+                                             count_request=(_attempt == 0)) as resp:
                     if resp.status_code != 200:
-                        # Free model 429 → fall back to paid model
-                        if _using_free and resp.status_code == 429:
+                        if _using_free:
+                            # Free endpoint non-200 (429 quota, 5xx...) → cooldown
+                            # the free model, fall back to paid. Never pauses PAID
+                            # keys: a status from the free endpoint says nothing
+                            # about the paid account (CRITIC(2)/CRITIC(3)).
+                            if resp.status_code == 429:
+                                _on_free_429_stream(free_model, resp.headers.get('retry-after', ''))
+                            else:
+                                _set_free_cooldown(free_model, 60)
                             anthro_body = paid_anthro_body
                             endpoint = paid_endpoint
                             _using_free = False
                             _track_model = model_id
-                            _debug(f"  [anthro-to-oai-stream] free model 429 → falling back to paid {_track_model!r}")
-                            _log(f"  FREE model rate limited → falling back to paid {_track_model!r}")
+                            _debug(f"  [anthro-to-oai-stream] free model {resp.status_code} → falling back to paid {_track_model!r}")
+                            _log(f"  FREE model {resp.status_code} → falling back to paid {_track_model!r}")
+                            _log_free_model_usage(model_id, free_model, "free (no auth)", "free (no auth)",
+                                                  resp.status_code, ip=_free_usage_ip())
                             continue
                         hdrs, should_retry = await _handle_429(hdrs, resp.status_code, _attempt, resp.headers)
                         if should_retry:
@@ -4756,7 +5022,7 @@ async def chat_completions(request: Request):
                         ak = _alias_for_key(hdrs.get("x-api-key", ""))
                         # Log 401 body specifically for key diagnosis
                         if resp.status_code == 401:
-                            _debug(f"  [auth] 401 response body: {err.decode('utf-8', errors='replace')[:500]}")
+                            _debug(f"  [auth] 401 response body: {_redact(err, 500)}")
                         await _log_and_save_error(req_id, model_id, original_model, start_time,
                                      resp.status_code, str(resp.status_code), protocol, True, thinking_type,
                                      effort, client_ip, ak, tool_names,
@@ -4867,6 +5133,10 @@ async def chat_completions(request: Request):
                             elif etype == "message_stop":
                                 _update_token_usage(_track_model, total_input, stream_out, cache_read)
                                 ak = _alias_for_key(hdrs.get("x-api-key", ""))
+                                if _using_free:
+                                    _log_free_model_usage(model_id, free_model, "free (no auth)", "free (no auth)",
+                                                          200, total_input or 0, stream_out or 0,
+                                                          _elapsed_ms(start_time), ip=_free_usage_ip())
                                 used_tools = [v["name"] for v in tool_data.values() if v.get("name")]
                                 await _save_and_log_request(req_id, _track_model, original_model, start_time,
                                              total_input, stream_out, cache_read, protocol, True, thinking_type,
@@ -5056,10 +5326,7 @@ async def responses(request: Request):
         if not is_stream:
             # Try free model first if available
             try:
-                _ak = a_headers.get("x-api-key", "")
-                free_result = await _try_free_model_first(anthro_body, a_headers, "anthropic", model_id,
-                                                          api_key=_ak, workspace_id=_workspace_for_key(_ak),
-                                                          api_keys=API_KEYS)
+                free_result = await _try_free_model_first(anthro_body, a_headers, "anthropic", model_id)
                 if free_result is not None:
                     resp, a_headers, _actual_model, _actual_ip = free_result
                     model_id = _actual_model
@@ -5076,7 +5343,7 @@ async def responses(request: Request):
                 # Pause key on credit/balance errors (400) and retry with alt key
                 if resp.status_code == 400 and any(x in resp.text for x in ("Insufficient balance", "Monthly usage limit")):
                     failed_key = a_headers.get("x-api-key", "")
-                    _key_pauser.pause_key(failed_key, _key_pauser._max_pause, f"400 credit error: {resp.text[:80]}")
+                    _key_pauser.pause_key(failed_key, _key_pauser._max_pause, f"400 credit error: {_redact(resp.text, 80)}")
                     alt = _find_alternative_key(failed_key)
                     if alt:
                         _log(f"  400 credit error on key, retrying with alternative key")
@@ -5123,10 +5390,7 @@ async def responses(request: Request):
         anthro_body["stream"] = False
         # Try free model first if available
         try:
-            _ak = a_headers.get("x-api-key", "")
-            free_result = await _try_free_model_first(anthro_body, a_headers, "anthropic", model_id,
-                                                      api_key=_ak, workspace_id=_workspace_for_key(_ak),
-                                                      api_keys=API_KEYS)
+            free_result = await _try_free_model_first(anthro_body, a_headers, "anthropic", model_id)
             if free_result is not None:
                 resp, a_headers, _actual_model, _actual_ip = free_result
                 model_id = _actual_model
@@ -5189,7 +5453,7 @@ async def responses(request: Request):
                     req_out = usage.get("completion_tokens", 0)
                     cache = _extract_cache_tokens(usage)
                     _update_token_usage(_actual_model, req_in, req_out, cache)
-                    used = _extract_tool_names(data)
+                    used = _extract_usage_tool_names(data)
                     await _save_and_log_request(req_id, _actual_model, original_model, start_time,
                                  req_in, req_out, cache, protocol, False, thinking_type,
                                  effort, client_ip, "free (no auth)", tool_names, tools_used=used,
@@ -5212,10 +5476,7 @@ async def responses(request: Request):
     if not is_stream:
         # Try free model first if available
         try:
-            _ak = _key_from_headers(headers, "openai")
-            free_result = await _try_free_model_first(oai_body, headers, "openai", model_id,
-                                                      api_key=_ak, workspace_id=_workspace_for_key(_ak),
-                                                      api_keys=API_KEYS)
+            free_result = await _try_free_model_first(oai_body, headers, "openai", model_id)
             if free_result is not None:
                 resp, headers, _actual_model, _actual_ip = free_result
                 model_id = _actual_model
@@ -5251,7 +5512,7 @@ async def responses(request: Request):
         req_out = usage.get("completion_tokens", 0)
         cache = _extract_cache_tokens(usage)
         _update_token_usage(model_id, req_in, req_out, cache)
-        used = _extract_tool_names(data)
+        used = _extract_usage_tool_names(data)
         await _save_and_log_request(req_id, model_id, original_model, start_time,
                      req_in, req_out, cache, protocol, is_stream, thinking_type,
                      effort, client_ip, account_alias, tool_names, tools_used=used if used else None,
@@ -5264,10 +5525,7 @@ async def responses(request: Request):
     oai_body["stream"] = False
     # Try free model first if available
     try:
-        _ak = _key_from_headers(headers, "openai")
-        free_result = await _try_free_model_first(oai_body, headers, "openai", model_id,
-                                                  api_key=_ak, workspace_id=_workspace_for_key(_ak),
-                                                  api_keys=API_KEYS)
+        free_result = await _try_free_model_first(oai_body, headers, "openai", model_id)
         if free_result is not None:
             resp, headers, _actual_model, _actual_ip = free_result
             model_id = _actual_model
@@ -5296,7 +5554,7 @@ async def responses(request: Request):
     req_out = usage.get("completion_tokens", 0)
     cache = _extract_cache_tokens(usage)
     _update_token_usage(model_id, req_in, req_out, cache)
-    used = _extract_tool_names(data)
+    used = _extract_usage_tool_names(data)
     await _save_and_log_request(req_id, model_id, original_model, start_time,
                  req_in, req_out, cache, protocol, True, thinking_type,
                  effort, client_ip, account_alias, tool_names, tools_used=used if used else None,
@@ -5331,6 +5589,12 @@ class ServerManager:
                 return
             h = RichLogHandler()
             for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+                lg = logging.getLogger(name)
+                lg.handlers = [h]
+                lg.propagate = False
+            # [46] VPN logs were stderr-only (no handler attached) — route
+            # them into the same rich log panel as the rest of the app.
+            for name in ("vpn_manager", "free_ip_pool"):
                 lg = logging.getLogger(name)
                 lg.handlers = [h]
                 lg.propagate = False
@@ -5392,10 +5656,57 @@ class ServerManager:
         os.execv(sys.executable, [sys.executable] + sys.argv)
 
 
+# ── Mono-instance lock [CRITIC(7)] ────────────────────────────────────
+_INSTANCE_LOCK_FDS = []  # keep fds referenced: GC closing them would release the lock
+
+def _acquire_instance_lock(lock_path: str = os.path.join("logs", "opencode.lock")) -> None:
+    """Take a non-blocking exclusive file lock; exit if another instance holds it.
+
+    [CRITIC(7)] Two proxy instances would fight over port 4000, the rotation
+    machinery and the SQLite DB. The lock file is advisory — one lock per
+    host — so a second `python opencode.py` exits immediately with a clear
+    message instead of corrupting state.
+    """
+    import sys
+    try:
+        os.makedirs(os.path.dirname(lock_path) or ".", exist_ok=True)
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+    except OSError as e:
+        _log(f"WARNING: cannot create lock file {lock_path}: {e} — continuing without mono-instance guard")
+        return
+    try:
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        # stderr print: the Rich log panel is never built when we exit here,
+        # so this is the only place the user sees why the instance refused to start.
+        print(f"FATAL: another opencode-proxy instance is already running (lock held: {lock_path})",
+              file=sys.stderr, flush=True)
+        _log(f"FATAL: another opencode-proxy instance is already running (lock held: {lock_path})")
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        sys.exit(1)
+    try:
+        os.ftruncate(fd, 0)
+        os.write(fd, f"pid={os.getpid()}\n".encode("ascii"))
+    except OSError:
+        pass
+    _INSTANCE_LOCK_FDS.append(fd)
+    _debug(f"  [lock] instance lock acquired: {lock_path}")
+
+
 if __name__ == "__main__":
     import sys
     import signal
     import traceback as _traceback
+
+    _acquire_instance_lock()
 
     # GUI by default (system tray + dashboard window); --no-gui forces terminal mode.
     # --gui is still accepted for backward compatibility (no-op since it's the default).

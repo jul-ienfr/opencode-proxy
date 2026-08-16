@@ -4,13 +4,31 @@ services:
     container_name: opencode-proxy
     ports:
       - "4000:4000"
-      - "8082:8082"
     env_file:
       - .env
+    environment:
+      # [13] gluetun's proxies bind host loopback only — unreachable from
+      # this container. Reach them over the compose internal network.
+      - VPN_SOCKS5_URL=socks5://vpn-gluetun:1080
+      - VPN_PROXY_URL=http://vpn-gluetun:8888
+      # [13] docker compose runs from inside this container against the HOST
+      # daemon (docker.sock below), so its relative paths (./logs, .env,
+      # credentials.env...) resolve on the host. Point it at the host project
+      # dir — mounted read-only at the same path below — and adjust
+      # /opt/opencode-proxy to the real deployment directory.
+      - VPN_DOCKER_COMPOSE_FILE=/opt/opencode-proxy/docker-compose.yml
     volumes:
       - ./logs:/app/logs
       - ./config.yaml:/app/config.yaml:ro
       - ./api_keys.json:/app/api_keys.json:ro
+      # [13] docker CLI inside this container talks to the HOST daemon.
+      - /var/run/docker.sock:/var/run/docker.sock
+      # [13] host project dir read-only, mounted at the SAME absolute path as
+      # on the host, so `docker compose -f ...` resolves its relative paths
+      # against the real host directory.
+      - /opt/opencode-proxy:/opt/opencode-proxy:ro
+    group_add:
+      - "${DOCKER_GID:-998}"   # host docker group GID — `id -g docker`, or set DOCKER_GID in .env
     restart: unless-stopped
     depends_on:
       vpn-gluetun:

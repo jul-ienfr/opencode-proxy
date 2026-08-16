@@ -31,8 +31,7 @@ if errorlevel 1 (
 )
 
 echo Lancement du proxy OpenCode...
-echo API: http://localhost:4000
-echo Dashboard: http://localhost:8082
+echo API + Dashboard: http://localhost:4000
 echo.
 python opencode.py
 

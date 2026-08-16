@@ -8,6 +8,23 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     openvpn \
     && rm -rf /var/lib/apt/lists/*
 
+# docker CLI + compose v2 plugin ([13]): vpn_manager.py drives gluetun via
+# `docker compose up/pull/inspect/restart`, talking to the HOST daemon over
+# /var/run/docker.sock (mounted in docker-compose.yml). Debian bookworm has
+# no docker-cli / docker-compose-plugin packages, so install the pinned
+# static binaries. docker-compose.yml itself is NOT baked in — the compose
+# deployment mounts the host project dir (see VPN_DOCKER_COMPOSE_FILE).
+RUN apt-get update && apt-get install -y --no-install-recommends curl \
+    && curl -fsSL https://download.docker.com/linux/static/stable/x86_64/docker-27.5.1.tgz -o /tmp/docker.tgz \
+    && tar -xzf /tmp/docker.tgz -C /tmp \
+    && install -m 0755 /tmp/docker/docker /usr/local/bin/docker \
+    && mkdir -p /usr/local/lib/docker/cli-plugins \
+    && curl -fsSL https://github.com/docker/compose/releases/download/v2.32.4/docker-compose-linux-x86_64 \
+         -o /usr/local/lib/docker/cli-plugins/docker-compose \
+    && chmod +x /usr/local/lib/docker/cli-plugins/docker-compose \
+    && rm -rf /tmp/docker /tmp/docker.tgz \
+    && docker --version && docker compose version
+
 # Install Python dependencies from requirements.txt (respects version pins)
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
@@ -25,7 +42,7 @@ COPY --chown=opencode:opencode static/ ./static/
 
 USER opencode
 
-EXPOSE 4000 8082
+EXPOSE 4000
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:4000/health')" || exit 1

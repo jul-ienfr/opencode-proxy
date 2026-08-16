@@ -542,6 +542,8 @@ def save_env(updates: dict):
             global HOST; HOST = value
         elif key == "OPENCODE_DEBUG":
             global DEBUG; DEBUG = value.lower() in ("1", "true", "yes")
+        elif key == "OPENCODE_GO_USE_BALANCE":
+            global OPENCODE_GO_USE_BALANCE; OPENCODE_GO_USE_BALANCE = value.lower() in ("1", "true", "yes")
 
     global ROUTES
     ROUTES = load_routes()

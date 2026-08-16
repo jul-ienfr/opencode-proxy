@@ -1,7 +1,6 @@
 server:
   host: 0.0.0.0
-  port: 4000
-  web_port: 8082
+  port: 4000  # API + web dashboard (single port; 8082 was never bound)
   debug: false
   log_dir: logs
 upstream:
@@ -71,7 +70,6 @@ free_model_map:
 ip_rotation:
   enabled: true
   proxy_mode: vpn
-  free_only: true
   quota_per_ip: 300
   switch_delay: 5
   docker_container: opencode-vpn
@@ -84,6 +82,11 @@ ip_rotation:
   circuit_breaker_recovery: 300
   backoff_max_delay: 60
   ip_check_url: https://api.ipify.org
+  identity_rotation: true
+  identity_profiles:
+  - impersonate: chrome131
+    user_agent: null
+    extra_headers: {}
   update_enabled: true
   update_check_interval: 21600
   update_apply_window: 03:00-05:00

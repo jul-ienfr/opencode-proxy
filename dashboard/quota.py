@@ -361,12 +361,47 @@ def _read_object_literal(text: str, start_pos: int) -> str:
     raise ValueError("Unbalanced object literal (no closing '}' found)")
 
 
+def _js_string_to_json(m) -> str:
+    """Convert a single-quoted JS string match into a valid JSON string.
+
+    ([27]) The old regex copied escape sequences verbatim, which broke on
+    ``\\'`` (invalid JSON escape) and raw backslashes (``'C:\\Users'`` →
+    ``"C:\\Users"`` is invalid JSON) — the whole quota object then failed
+    to parse and the UI showed a green 0 %.
+    """
+    content = m.group(1)
+    out = []
+    i = 0
+    while i < len(content):
+        ch = content[i]
+        if ch == "\\" and i + 1 < len(content):
+            nxt = content[i + 1]
+            if nxt == "'":
+                out.append("'")  # \' → ' — the only escape invalid in JSON
+                i += 2
+                continue
+            if nxt in '"\\/bfnrtu':
+                out.append(ch)  # valid JSON escape with identical meaning
+                out.append(nxt)  # (\\ \" \/ \b \f \n \r \t \uXXXX) — copy verbatim
+                i += 2
+                continue
+            out.append("\\\\")  # literal backslash → must be doubled
+            i += 1
+            continue
+        if ch == '"':
+            out.append('\\"')  # literal double quote → escape
+        else:
+            out.append(ch)
+        i += 1
+    return '"' + "".join(out) + '"'
+
+
 def _normalize_js_object(raw: str) -> str:
     """Normalize a loose JS object literal into valid JSON."""
     # Quote unquoted keys: `{foo:` or `,foo:` → `{"foo":`
     s = re.sub(r'([{,]\s*)([A-Za-z_$][A-Za-z0-9_$]*)(\s*:)', r'\1"\2"\3', raw)
-    # Single-quoted strings → double-quoted
-    s = re.sub(r"'((?:\\.|[^'\\])*)'", lambda m: '"' + m.group(1).replace('"', '\\"') + '"', s)
+    # Single-quoted strings → double-quoted ([27] backslash-safe)
+    s = re.sub(r"'((?:\\.|[^'\\])*)'", _js_string_to_json, s)
     # Bare undefined → null (but not inside strings)
     s = re.sub(r'(?:"(?:[^"\\]|\\.)*")|\bundefined\b', lambda m: m.group(0) if m.group(0).startswith('"') else "null", s)
     # Trailing commas before } or ]
@@ -482,9 +517,19 @@ async def toggle_use_balance(workspace_id: str, auth_cookie: str, enabled: bool 
         try:
             resp = await client.post(url, data=form_data, headers=headers)
             if resp.status_code == 200:
-                logger.info("[balance] toggle useBalance=%s for workspace %s (action %s)",
-                            enabled, workspace_id[:12], action_hash[:12])
-                return True
+                # [33] A 200 alone is not proof of success: SolidJS server
+                # actions return {"error": ...} on failure. Verify the body.
+                try:
+                    body = resp.json()
+                except ValueError:
+                    body = None  # non-JSON body (redirect page) — treat as success
+                if body and body.get("error"):
+                    logger.debug("[balance] action %s returned error for workspace %s: %s",
+                                 action_hash[:12], workspace_id[:12], str(body.get("error"))[:200])
+                else:
+                    logger.info("[balance] toggle useBalance=%s for workspace %s (action %s)",
+                                enabled, workspace_id[:12], action_hash[:12])
+                    return True
             else:
                 logger.debug("[balance] action %s returned HTTP %d for workspace %s",
                              action_hash[:12], resp.status_code, workspace_id[:12])
@@ -517,7 +562,11 @@ async def toggle_use_balance_all(enabled: bool = True) -> dict[str, bool]:
 
 
 async def fetch_quotas(workspace_id: str, auth_cookie: str) -> dict:
-    """Fetch and parse quota data from opencode.ai for a given workspace."""
+    """Fetch and parse quota data from opencode.ai for a given workspace.
+
+    Retries transient failures (network errors, 5xx) up to 2 times with
+    backoff ([28]) — auth failures (401/403) and parse errors never retry.
+    """
     from urllib.parse import quote
     url = f"https://opencode.ai/workspace/{quote(workspace_id, safe='')}/go"
 
@@ -528,22 +577,49 @@ async def fetch_quotas(workspace_id: str, auth_cookie: str) -> dict:
     }
 
     client = await _get_http_client()
-    resp = await client.get(url, headers=headers)
+    last_err: Exception | None = None
+    for attempt in range(3):
+        try:
+            resp = await client.get(url, headers=headers)
+        except Exception as e:
+            last_err = e
+            if attempt < 2:
+                await asyncio.sleep(1.5 * (2 ** attempt))  # 1.5s, 3s
+                continue
+            raise
 
-    if resp.status_code in (401, 403):
-        logger.debug("[quota] auth failed for workspace %s (HTTP %d)", workspace_id[:8], resp.status_code)
-        raise RuntimeError("OpenCode Go authentication failed. Refresh your auth cookie.")
-    if resp.status_code != 200:
-        raise RuntimeError(f"OpenCode Go request failed with HTTP {resp.status_code}.")
+        if resp.status_code in (401, 403):
+            logger.debug("[quota] auth failed for workspace %s (HTTP %d)", workspace_id[:8], resp.status_code)
+            raise RuntimeError("OpenCode Go authentication failed. Refresh your auth cookie.")
+        if resp.status_code >= 500 and attempt < 2:
+            last_err = RuntimeError(f"OpenCode Go request failed with HTTP {resp.status_code}.")
+            await asyncio.sleep(1.5 * (2 ** attempt))
+            continue
+        if resp.status_code != 200:
+            raise RuntimeError(f"OpenCode Go request failed with HTTP {resp.status_code}.")
 
-    return parse_quota_html(resp.text)
+        try:
+            return parse_quota_html(resp.text)
+        except Exception as e:
+            last_err = e
+            if attempt < 2:
+                await asyncio.sleep(1.5 * (2 ** attempt))
+                continue
+            raise
+    raise last_err  # pragma: no cover — loop always returns or raises above
 
 
 # ── API accessor ──
 
-def get_quota_snapshot() -> dict:
-    """Return a JSON-serializable snapshot for the API endpoint."""
-    return dict(_caches)
+async def get_quota_snapshot() -> dict:
+    """Return a JSON-serializable snapshot for the API endpoint.
+
+    [34] Copied under _cache_lock (the poller mutates _caches concurrently),
+    one level deep so the in-place status updates can't race the JSON
+    serialization of a returned snapshot.
+    """
+    async with _cache_lock:
+        return {wid: dict(cache) for wid, cache in _caches.items()}
 
 
 # ── Background poller ──
@@ -620,7 +696,7 @@ async def start_quota_fetcher(app):
                         _caches[wid] = {
                             "status": "ok",
                             "error": None,
-                            "fetched_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                            "fetched_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                             "quotas": quotas,
                         }
                     get_event_manager().publish("quotas_updated", {"workspace_id": wid, "status": "ok"})

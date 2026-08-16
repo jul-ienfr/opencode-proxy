@@ -434,6 +434,12 @@ def _disable_mapping_off(monkeypatch):
     _clean_routes = _cfg_settings.load_routes()
     monkeypatch.setattr(_opencode_mod, "ROUTES", _clean_routes)
     monkeypatch.setattr(_opencode_mod, "CUSTOM_ROUTES", {})
+    # SORTED_* are computed at import from the real custom_routes.json —
+    # rebuild after replacing the dicts, or _route_for matches the stale
+    # production overrides ([43]).
+    monkeypatch.setattr(_cfg_settings, "SORTED_ROUTES",
+                        _cfg_settings._sort_routes_by_match(_clean_routes))
+    monkeypatch.setattr(_cfg_settings, "SORTED_CUSTOM_ROUTES", [])
 
 
 class TestRouteFor:

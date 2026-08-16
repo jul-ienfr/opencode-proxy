@@ -17,8 +17,7 @@ python opencode.py --no-gui
 ```
 
 Server starts on:
-- **API**: http://localhost:4000
-- **Web Dashboard**: http://localhost:8082
+- **API + Web Dashboard** (same app): http://localhost:4000
 
 ## Configuration
 
@@ -37,8 +36,7 @@ Key environment variables:
 
 Optional server overrides:
 - `OPENCODE_HOST` - Bind address (default: `0.0.0.0`)
-- `OPENCODE_PORT` - API port (default: `4000`)
-- `OPENCODE_WEB_PORT` - Web UI port (default: `8082`)
+- `OPENCODE_PORT` - API + dashboard port (default: `4000`)
 
 ## Deployment (Ubuntu Server)
 
@@ -77,7 +75,6 @@ docker build -t opencode-proxy .
 docker run -d \
   --name opencode-proxy \
   -p 4000:4000 \
-  -p 8082:8082 \
   -v $(pwd)/.env:/app/.env \
   -v opencode-logs:/app/logs \
   opencode-proxy

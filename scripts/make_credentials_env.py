@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
-"""Generate credentials.env from vpn_configs/credentials.txt.
+"""LEGACY migration helper: generate credentials.env from vpn_configs/credentials.txt.
 
+The dashboard now writes credentials.env directly ([24] single source);
+this one-shot script exists only to migrate an old credentials.txt once.
 Reads the two-line NordVPN service credentials file and writes a
 docker-compose env_file (OPENVPN_USER / OPENVPN_PASSWORD) with owner-only
 permissions. NEVER prints the values.

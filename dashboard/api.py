@@ -6,6 +6,7 @@ import json
 import os
 import time
 import asyncio
+import hmac
 import re
 import socket
 from datetime import datetime, timedelta, timezone
@@ -62,6 +63,26 @@ _tools_cache = _TTLCache(ttl=30.0)
 
 # Cache for local IP resolution (rarely changes)
 _local_ips_cache: tuple[float, list] | None = None
+
+# ── Dashboard auth (opt-in via DASHBOARD_TOKEN env) ──
+# When DASHBOARD_TOKEN is set, sensitive endpoints require the header
+# `X-Dashboard-Token` (constant-time comparison). Unset → legacy open access
+# (documented: set DASHBOARD_TOKEN when the server is exposed beyond localhost).
+
+_DASHBOARD_TOKEN = os.getenv("DASHBOARD_TOKEN", "").strip()
+
+
+def _check_dashboard_token(request: Request):
+    """Return a 401 response if the token is configured and not provided."""
+    if not _DASHBOARD_TOKEN:
+        return None
+    provided = request.headers.get("X-Dashboard-Token", "")
+    if provided and hmac.compare_digest(provided, _DASHBOARD_TOKEN):
+        return None
+    return JSONResponse(status_code=401, content={
+        "error": "unauthorized",
+        "message": "Valid X-Dashboard-Token header required (DASHBOARD_TOKEN env).",
+    })
 
 
 async def _db_query_sync(fn):
@@ -169,7 +190,6 @@ def _persist_vpn_config(updates: dict):
         key_map = {
             "enabled": "enabled",
             "proxy_mode": "proxy_mode",
-            "free_only": "free_only",
             "quota_per_ip": "quota_per_ip",
             "switch_delay": "switch_delay",
             "docker_container": "docker_container",
@@ -182,6 +202,8 @@ def _persist_vpn_config(updates: dict):
             "circuit_breaker_threshold": "circuit_breaker_threshold",
             "circuit_breaker_recovery": "circuit_breaker_recovery",
             "backoff_max_delay": "backoff_max_delay",
+            "identity_rotation": "identity_rotation",
+            "identity_profiles": "identity_profiles",
         }
 
         changed = False
@@ -197,10 +219,38 @@ def _persist_vpn_config(updates: dict):
             config["ip_rotation"] = ip_rot
             with open(config_path, "w", encoding="utf-8") as f:
                 yaml.dump(config, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+            # [32] keep the in-memory mirror in sync — otherwise the next
+            # settings.yaml_set() re-dumps the stale _yaml_data and reverts
+            # what we just wrote to disk.
+            try:
+                from config import settings as _st
+                _st._yaml_data["ip_rotation"] = dict(ip_rot)
+            except Exception:
+                pass
             _debug(f"  [vpn] config persisted to {config_path}")
 
     except Exception as e:
         _debug(f"  [vpn] failed to persist config: {e}")
+
+
+def _write_credentials_env(username: str, password: str):
+    """Write NordVPN credentials to credentials.env — the single source
+    gluetun reads via docker-compose env_file ([24]).
+
+    Plaintext on disk by design (docker compose env_file format); the file
+    is .gitignored. A container restart is needed for gluetun to pick up
+    the new values.
+    """
+    import os
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    cred_path = os.path.join(root, "credentials.env")
+    with open(cred_path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(f"OPENVPN_USER={username}\nOPENVPN_PASSWORD={password}\n")
+    try:
+        os.chmod(cred_path, 0o600)
+    except Exception:
+        pass
+    _debug(f"  [vpn] credentials written to {cred_path}")
 
 
 def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_usage=None, token_lock=None):
@@ -234,7 +284,10 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
     # ── Config endpoints ──
 
     @app.get("/api/config")
-    async def get_config():
+    async def get_config(request: Request):
+        err = _check_dashboard_token(request)
+        if err:
+            return err
         routes_info = {}
         for name, info in config_settings.ROUTES.items():
             routes_info[name] = {
@@ -285,6 +338,9 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
 
     @app.post("/api/config/custom-routes")
     async def update_custom_routes(request: Request):
+        err = _check_dashboard_token(request)
+        if err:
+            return err
         body = await request.json()
         _debug(f"  [config] custom routes updated ({len(body)} routes)")
         save_custom_routes(body)
@@ -318,6 +374,9 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
 
     @app.post("/api/config/tool-capabilities")
     async def update_tool_capabilities(request: Request):
+        err = _check_dashboard_token(request)
+        if err:
+            return err
         body = await request.json()
         from config import save_tool_capabilities
         _debug(f"  [config] tool capabilities updated ({len(body)} entries)")
@@ -342,6 +401,9 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
 
     @app.post("/api/config/web-search")
     async def update_web_search_config(request: Request):
+        err = _check_dashboard_token(request)
+        if err:
+            return err
         body = await request.json()
         from config import yaml_set
         if "mode" in body:
@@ -356,7 +418,10 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
         return {"status": "ok", "message": "Web search config updated."}
 
     @app.get("/api/config/api-keys")
-    async def get_api_keys_config():
+    async def get_api_keys_config(request: Request):
+        err = _check_dashboard_token(request)
+        if err:
+            return err
         return {
             "api_keys": [
                 {
@@ -377,6 +442,9 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
 
     @app.post("/api/config/api-keys")
     async def update_api_keys_config(request: Request):
+        err = _check_dashboard_token(request)
+        if err:
+            return err
         body = await request.json()
         if "api_keys" in body:
             _debug(f"  [config] API keys updated ({len(body['api_keys'])} keys)")
@@ -387,6 +455,9 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
 
     @app.post("/api/config")
     async def update_config(request: Request):
+        err = _check_dashboard_token(request)
+        if err:
+            return err
         body = await request.json()
         env_updates = {}
 
@@ -551,7 +622,8 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
             total_success = row[4]
             total_fail = row[5]
             cache_hit_rate = (total_cache / total_input * 100) if total_input > 0 else 0.0
-            success_rate = (total_success / total_count * 100) if total_count > 0 else 100.0
+            # [36] null (not 100%) when there are no requests — the UI shows « — »
+            success_rate = (total_success / total_count * 100) if total_count > 0 else None
 
             totals = {
                 "input": total_input, "output": row[1], "cache": total_cache,
@@ -560,7 +632,7 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
                 "success_count": total_success, "fail_count": total_fail,
                 "avg_duration_ms": int(row[6]),
                 "cache_hit_rate": round(cache_hit_rate, 1),
-                "success_rate": round(success_rate, 1),
+                "success_rate": round(success_rate, 1) if success_rate is not None else None,
             }
 
             rows = conn.execute(
@@ -594,14 +666,15 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
         for r in rows:
             t = r[1] + r[2] + r[3]
             m_cache_rate = (r[3] / r[1] * 100) if r[1] > 0 else 0.0
-            m_success_rate = (r[5] / r[4] * 100) if r[4] > 0 else 100.0
+            # [36] null (not 100%) when no requests — the UI shows « — »
+            m_success_rate = (r[5] / r[4] * 100) if r[4] > 0 else None
             models[r[0]] = {
                 "input": r[1], "output": r[2], "cache": r[3], "total": t,
                 "pct": f"{t/sum_total*100:.1f}%" if sum_total else "0%",
                 "count": r[4], "success_count": r[5], "fail_count": r[6],
                 "avg_duration_ms": int(r[7]),
                 "cache_hit_rate": round(m_cache_rate, 1),
-                "success_rate": round(m_success_rate, 1),
+                "success_rate": round(m_success_rate, 1) if m_success_rate is not None else None,
             }
 
         # Per-account stats
@@ -610,14 +683,15 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
             t = r[1] + r[2] + r[3]
             label = r[0] if r[0] else "(default)"
             a_cache_rate = (r[3] / r[1] * 100) if r[1] > 0 else 0.0
-            a_success_rate = (r[5] / r[4] * 100) if r[4] > 0 else 100.0
+            # [36] null (not 100%) when no requests — the UI shows « — »
+            a_success_rate = (r[5] / r[4] * 100) if r[4] > 0 else None
             accounts[label] = {
                 "input": r[1], "output": r[2], "cache": r[3], "total": t,
                 "pct": f"{t/sum_total*100:.1f}%" if sum_total else "0%",
                 "count": r[4], "success_count": r[5], "fail_count": r[6],
                 "avg_duration_ms": int(r[7]),
                 "cache_hit_rate": round(a_cache_rate, 1),
-                "success_rate": round(a_success_rate, 1),
+                "success_rate": round(a_success_rate, 1) if a_success_rate is not None else None,
             }
 
         result = {"models": models, "accounts": accounts, "totals": totals}
@@ -629,20 +703,14 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
         """Return time-series data for charts: requests count, tokens, avg duration per time bucket."""
         where, params = _build_where(from_date, to_date)
 
-        # Determine time grouping format
-        if granularity == "day":
-            time_fmt = "%Y-%m-%d"
-        elif granularity == "week":
-            time_fmt = "%Y-W%W"
-        else:  # hour
-            time_fmt = "%Y-%m-%d %H:00"
-
         def _query_timeseries():
             # Group by truncated timestamp
             if granularity == "day":
                 trunc_expr = "substr(timestamp, 1, 10)"
             elif granularity == "week":
-                trunc_expr = "substr(timestamp, 1, 4) || '-W' || printf('%02d', ((cast(substr(timestamp, 9, 2) as integer) - 1) / 7 + 1))"
+                # [29] real ISO 8601 week grouping (%G ISO year + %V week 01-53);
+                # the old day-of-month / 7 heuristic merged adjacent months.
+                trunc_expr = "strftime('%G', timestamp) || '-W' || strftime('%V', timestamp)"
             else:  # hour
                 trunc_expr = "substr(timestamp, 1, 13) || ':00'"
 
@@ -812,7 +880,11 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
                         # Check if client disconnected during idle period
                         if await request.is_disconnected():
                             break
-                        yield ": keepalive\n\n"
+                        # [31] Real event (not a comment): comments are invisible
+                        # to JS EventSource, so the client's silence watchdog
+                        # (app.js) can observe this ping and detect a stalled
+                        # stream instead of waiting forever.
+                        yield "event: ping\ndata: {}\n\n"
             except (asyncio.CancelledError, RuntimeError):
                 pass
             finally:
@@ -825,7 +897,7 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
 
     @app.get("/api/quotas")
     async def get_quotas():
-        return get_quota_snapshot()
+        return await get_quota_snapshot()
 
     @app.get("/api/free-model-usage")
     async def get_free_model_usage(days: int = 7):
@@ -904,8 +976,12 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
         for ip_addr, ip_data in by_ip.items():
             try:
                 last = datetime.fromisoformat(ip_data["last_seen"])
+                if last.tzinfo is not None:
+                    # [30] UTC timestamps carry a Z suffix → normalize to naive UTC
+                    # so the comparison below stays naive-vs-naive.
+                    last = last.astimezone(datetime.timezone.utc).replace(tzinfo=None)
                 reset_at = last + timedelta(hours=QUOTA_WINDOW_HOURS)
-                ip_data["reset_at"] = reset_at.strftime("%Y-%m-%dT%H:%M:%S")
+                ip_data["reset_at"] = reset_at.strftime("%Y-%m-%dT%H:%M:%SZ")
                 ip_data["available"] = now >= reset_at
                 ip_data["reset_in_sec"] = max(0, int((reset_at - now).total_seconds()))
             except Exception:
@@ -947,27 +1023,21 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
     @app.post("/api/vpn-config")
     async def update_vpn_config(request: Request):
         """Update VPN configuration (hot-reload + persist to config.yaml)."""
+        err = _check_dashboard_token(request)
+        if err:
+            return err
         import shared_state
         import os
         body = await request.json()
 
-        # Handle credentials - always save to file (no VPN manager needed)
+        # Handle credentials — [24] write the single source gluetun actually
+        # reads (credentials.env via docker-compose env_file).
         if "credentials" in body:
             creds = body.pop("credentials")
             username = creds.get("username", "")
             password = creds.get("password", "")
             if username and password:
-                configs_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "vpn_configs")
-                os.makedirs(configs_dir, exist_ok=True)
-                cred_path = os.path.join(configs_dir, "credentials.txt")
-                with open(cred_path, "w", newline='\n') as f:
-                    f.write(f"{username}\n{password}\n")
-                try:
-                    os.chmod(cred_path, 0o600)
-                except Exception:
-                    pass
-                if shared_state.vpn_manager:
-                    shared_state.vpn_manager._auth_file = cred_path
+                _write_credentials_env(username, password)
 
         # Handle config updates (need VPN manager)
         if shared_state.vpn_manager and body:
@@ -1058,7 +1128,9 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
             if not available:
                 return {"ok": False, "error": "no update available",
                         "update": shared_state.vpn_manager.get_status()["update"]}
-            result = await shared_state.vpn_manager.apply_update()
+            # check_opportune=True ([21]): the manual endpoint must not cut
+            # live free streams either — the check runs inside the lock.
+            result = await shared_state.vpn_manager.apply_update(check_opportune=True)
             result["update"] = shared_state.vpn_manager.get_status()["update"]
             return result
         except Exception as e:
@@ -1068,24 +1140,27 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
     async def get_vpn_credentials():
         """Check if VPN credentials exist (does not return actual values)."""
         import os
-        configs_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "vpn_configs")
-        cred_path = os.path.join(configs_dir, "credentials.txt")
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        cred_path = os.path.join(root, "credentials.env")
         exists = os.path.exists(cred_path) and os.path.getsize(cred_path) > 0
         username_saved = ""
         if exists:
             try:
-                with open(cred_path, "r") as f:
-                    lines = f.read().strip().split("\n")
-                    if lines:
-                        username_saved = lines[0]
+                with open(cred_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        if line.startswith("OPENVPN_USER="):
+                            username_saved = line.split("=", 1)[1].strip()
+                            break
             except Exception:
                 pass
         return {"exists": exists, "username_preview": username_saved[:4] + "****" if username_saved else ""}
 
     @app.post("/api/vpn/credentials")
     async def save_vpn_credentials(request: Request):
-        """Save NordVPN credentials."""
-        import shared_state
+        """Save NordVPN credentials — writes credentials.env (gluetun env_file)."""
+        err = _check_dashboard_token(request)
+        if err:
+            return err
         body = await request.json()
         username = body.get("username", "")
         password = body.get("password", "")
@@ -1093,26 +1168,8 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
         if not username or not password:
             return {"error": "Username and password required"}
 
-        # Save to credentials file
-        import os
-        configs_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "vpn_configs")
-        os.makedirs(configs_dir, exist_ok=True)
-        cred_path = os.path.join(configs_dir, "credentials.txt")
-
-        with open(cred_path, "w") as f:
-            f.write(f"{username}\n{password}\n")
-
-        # Make readable only by owner
-        try:
-            os.chmod(cred_path, 0o600)
-        except Exception:
-            pass
-
-        # Update VPN manager
-        if shared_state.vpn_manager:
-            shared_state.vpn_manager._auth_file = cred_path
-
-        return {"ok": True}
+        _write_credentials_env(username, password)
+        return {"ok": True, "note": "restart the VPN container (docker compose up -d) for gluetun to pick up new credentials"}
 
     @app.post("/api/vpn/save-state")
     async def save_vpn_state():
@@ -1124,8 +1181,11 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
         return {"error": "VPN manager not initialized"}
 
     @app.get("/api/vpn/export")
-    async def export_vpn_config():
+    async def export_vpn_config(request: Request):
         """Export VPN configuration as JSON."""
+        err = _check_dashboard_token(request)
+        if err:
+            return err
         import shared_state
         import json
         if not shared_state.vpn_manager:
@@ -1141,7 +1201,7 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
         export = {
             "config": config,
             "state": state,
-            "exported_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "exported_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "version": "1.0",
         }
         return export
@@ -1149,6 +1209,9 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
     @app.post("/api/vpn/import")
     async def import_vpn_config(request: Request):
         """Import VPN configuration from JSON."""
+        err = _check_dashboard_token(request)
+        if err:
+            return err
         import shared_state
         body = await request.json()
 
@@ -1267,8 +1330,12 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
         }
 
     @app.get("/api/requests/{req_id}")
-    async def get_request_detail(req_id: str):
+    async def get_request_detail(req_id: str, request: Request):
         """Return full request details including request/response bodies."""
+        err = _check_dashboard_token(request)
+        if err:
+            return err
+
         def _query_request():
             row = conn.execute("SELECT * FROM requests WHERE id = ?", (req_id,)).fetchone()
             return row

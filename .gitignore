@@ -11,13 +11,13 @@ __pycache__/
 *.so
 
 # Database
-logs/requests.db
-logs/*.db
-logs/*.db-shm
-logs/*.db-wal
+logs/*.db*
+logs/requests.db.bak*
 
 # Logs
 *.log
+logs/debug.log*
+logs/opencode.lock
 logs/paused_keys.yaml
 startup.err
 test_free_quota.py
@@ -45,4 +45,5 @@ ENV/
 vpn_configs/
 credentials.env
 logs/vpn_state.json
+env_dump.json
 *.ovpn

@@ -56,6 +56,7 @@ const LOCALE = {
         'vpn.hint': 'Rotate IP addresses for free model quota via OpenVPN',
         'vpn.status': 'Status',
         'vpn.current_ip': 'Current IP',
+        'vpn.identity': 'Identity',
         'vpn.current_server': 'Server',
         'vpn.requests_this_ip': 'Requests this IP',
         'vpn.total_free': 'Total free requests',
@@ -218,6 +219,7 @@ const LOCALE = {
         'debug.no_data': 'No debug logs. Enable debug mode in Configuration first.',
         'debug.loading': 'Loading...',
         'debug.lines': 'lines',
+        'dashboard_token_prompt': 'Enter dashboard token (DASHBOARD_TOKEN):',
         'config.api_keys': 'API Keys',
         'config.api_keys_desc': 'Configure API keys for upstream access. Each key can have its own Go workspace credentials.',
         'config.ak_alias': 'Alias',
@@ -297,6 +299,7 @@ const LOCALE = {
         'vpn.hint': 'Rotation des adresses IP pour le quota gratuit via OpenVPN',
         'vpn.status': 'Statut',
         'vpn.current_ip': 'IP actuelle',
+        'vpn.identity': 'Identité',
         'vpn.current_server': 'Serveur',
         'vpn.requests_this_ip': 'Requêtes cette IP',
         'vpn.total_free': 'Total requêtes gratuites',
@@ -458,6 +461,7 @@ const LOCALE = {
         'debug.no_data': 'Aucun log debug. Activez le mode debug dans Configuration.',
         'debug.loading': 'Chargement...',
         'debug.lines': 'lignes',
+        'dashboard_token_prompt': 'Entrez le jeton du dashboard (DASHBOARD_TOKEN) :',
         'config.api_keys': 'Clés API',
         'config.api_keys_desc': 'Configurez les clés API. Chaque clé peut avoir ses propres identifiants Go workspace.',
         'config.ak_alias': 'Alias',
@@ -598,12 +602,27 @@ function escHtml(s) {
 }
 
 async function apiFetch(url, options = {}) {
-    const resp = await fetch(url, options);
+    let resp = await fetchWithToken(url, options);
+    if (resp.status === 401 && localStorage.getItem('dashboard_token')) {
+        // Token rejected or expired — ask again, then retry once
+        const token = prompt(t('dashboard_token_prompt'));
+        if (token) {
+            localStorage.setItem('dashboard_token', token.trim());
+            resp = await fetchWithToken(url, options);
+        }
+    }
     if (!resp.ok) {
         const text = await resp.text().catch(() => '');
         throw new Error(`HTTP ${resp.status}: ${text.slice(0, 200)}`);
     }
     return resp.json();
+}
+
+async function fetchWithToken(url, options = {}) {
+    const token = localStorage.getItem('dashboard_token');
+    const headers = { ...(options.headers || {}) };
+    if (token) headers['X-Dashboard-Token'] = token;
+    return fetch(url, { ...options, headers });
 }
 
 async function fetchStats(from, to) {
@@ -749,7 +768,13 @@ function renderQuotas(data) {
     const container = document.getElementById('quota-workspaces');
     const statusMsg = document.getElementById('quota-status-message');
 
-    if (!data || Object.keys(data).length === 0) {
+    if (data === null) {
+        // [35] Fetch failed — distinguish from "nothing configured"
+        statusMsg.textContent = t('quotas.error');
+        container.innerHTML = '';
+        return;
+    }
+    if (Object.keys(data).length === 0) {
         statusMsg.textContent = t('quotas.not_configured');
         container.innerHTML = '';
         return;
@@ -845,7 +870,7 @@ function renderStats(data) {
     document.getElementById('total-fail').textContent = formatNumber(totals.fail_count);
     document.getElementById('avg-duration').textContent = totals.avg_duration_ms ? formatNumber(totals.avg_duration_ms) : '-';
     document.getElementById('cache-hit-rate').textContent = totals.cache_hit_rate != null ? totals.cache_hit_rate + '%' : '0%';
-    document.getElementById('success-rate').textContent = totals.success_rate != null ? totals.success_rate + '%' : '0%';
+    document.getElementById('success-rate').textContent = totals.success_rate != null ? totals.success_rate + '%' : '—';
     document.getElementById('total-requests').textContent = formatNumber(totals.count);
 
     const tbody = document.getElementById('model-tbody');
@@ -864,7 +889,7 @@ function renderStats(data) {
                 <td>${formatNumber(s.total)}</td>
                 <td>${s.pct}</td>
                 <td>${s.cache_hit_rate != null ? s.cache_hit_rate + '%' : '0%'}</td>
-                <td>${s.success_rate != null ? s.success_rate + '%' : '0%'}</td>
+                <td>${s.success_rate != null ? s.success_rate + '%' : '—'}</td>
                 <td>${formatNumber(s.success_count)}</td>
                 <td>${formatNumber(s.fail_count)}</td>
                 <td>${s.avg_duration_ms ? formatNumber(s.avg_duration_ms) : '-'}</td>
@@ -889,7 +914,7 @@ function renderStats(data) {
                 <td>${formatNumber(s.total)}</td>
                 <td>${s.pct}</td>
                 <td>${s.cache_hit_rate != null ? s.cache_hit_rate + '%' : '0%'}</td>
-                <td>${s.success_rate != null ? s.success_rate + '%' : '0%'}</td>
+                <td>${s.success_rate != null ? s.success_rate + '%' : '—'}</td>
                 <td>${formatNumber(s.success_count)}</td>
                 <td>${formatNumber(s.fail_count)}</td>
                 <td>${s.avg_duration_ms ? formatNumber(s.avg_duration_ms) : '-'}</td>
@@ -2294,7 +2319,9 @@ document.addEventListener('DOMContentLoaded', () => {
     let eventSource = null;
     let pollTimer = null;
     let sseRetryDelay = 1000;
+    let lastEventTs = Date.now();
     const SSE_MAX_DELAY = 30000;
+    const SSE_SILENCE_MS = 45000; // server pings every 30s of idle → 45s = 1 missed ping
 
     function startPolling(intervalMs) {
         if (pollTimer) clearInterval(pollTimer);
@@ -2305,13 +2332,29 @@ document.addEventListener('DOMContentLoaded', () => {
         if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
     }
 
+    function sseScheduleReconnect() {
+        if (!pollTimer) startPolling(15000);
+        if (!window._sseRetry) {
+            window._sseRetry = setTimeout(() => {
+                window._sseRetry = null;
+                connectSSE();
+            }, sseRetryDelay);
+            sseRetryDelay = Math.min(sseRetryDelay * 2, SSE_MAX_DELAY);
+        }
+    }
+
     function connectSSE() {
         if (window._sseRetry) { clearTimeout(window._sseRetry); window._sseRetry = null; }
         if (eventSource) eventSource.close();
         const es = new EventSource('/api/events');
         eventSource = es;
+        lastEventTs = Date.now();
 
+        // [31] Any event proves the stream is alive; the server also emits a
+        // `ping` event every 30s of idle (keepalive comments are invisible to JS).
+        es.addEventListener('ping', () => { lastEventTs = Date.now(); });
         es.addEventListener('stats_updated', () => {
+            lastEventTs = Date.now();
             // Debounce: coalesce rapid events into a single refresh
             if (window._sseRefresh) clearTimeout(window._sseRefresh);
             window._sseRefresh = setTimeout(() => {
@@ -2319,11 +2362,13 @@ document.addEventListener('DOMContentLoaded', () => {
                 refreshAll();
             }, 200);
         });
-        es.addEventListener('connected', () => { stopPolling(); sseRetryDelay = 1000; });
+        es.addEventListener('connected', () => { lastEventTs = Date.now(); stopPolling(); sseRetryDelay = 1000; });
         es.addEventListener('quotas_updated', () => {
+            lastEventTs = Date.now();
             fetchQuotas().then(renderQuotas);
         });
         es.addEventListener('models_updated', () => {
+            lastEventTs = Date.now();
             fetchConfig().then(data => {
                 if (data) { configData = data; renderConfig(data); }
             });
@@ -2332,16 +2377,20 @@ document.addEventListener('DOMContentLoaded', () => {
         es.onerror = () => {
             if (es !== eventSource) return; // stale
             if (eventSource) { eventSource.close(); eventSource = null; }
-            if (!pollTimer) startPolling(15000);
-            if (!window._sseRetry) {
-                window._sseRetry = setTimeout(() => {
-                    window._sseRetry = null;
-                    connectSSE();
-                }, sseRetryDelay);
-                sseRetryDelay = Math.min(sseRetryDelay * 2, SSE_MAX_DELAY);
-            }
+            sseScheduleReconnect();
         };
     }
+
+    // [31] Reconnect on silence: without this, a stalled stream with an open
+    // socket (and no events) would look healthy forever — onerror never fires.
+    setInterval(() => {
+        if (!eventSource) return;
+        if (Date.now() - lastEventTs > SSE_SILENCE_MS) {
+            eventSource.close();
+            eventSource = null;
+            sseScheduleReconnect();
+        }
+    }, 15000);
 
     connectSSE();
 
@@ -2365,7 +2414,19 @@ document.addEventListener('DOMContentLoaded', () => {
             const target = parseInt(el.dataset.resetTarget || '0', 10);
             if (!target) return;
             const remaining = target - Math.floor(Date.now() / 1000);
-            el.textContent = remaining <= 0 ? t('quotas.resetting') : t('quotas.resets_in') + formatResetTime(remaining);
+            if (remaining <= 0) {
+                // [35] Bounded « Resetting… »: once the countdown hits 0 the
+                // quota may already be available server-side; the next poll
+                // (≤5 min) refreshes the target. After a 10 s grace show « — »
+                // so the UI never claims "resetting" for minutes.
+                if (Date.now() - target * 1000 > 10000) {
+                    el.textContent = '—';
+                    return;
+                }
+                el.textContent = t('quotas.resetting');
+            } else {
+                el.textContent = t('quotas.resets_in') + formatResetTime(remaining);
+            }
         });
     }, 1000);
 
@@ -2525,7 +2586,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 if (credStatus) credStatus.innerHTML = '<span style="color:var(--success)">&#10003;</span> ' + (t('vpn.credentials_saved') || 'Enregistré');
                 if (usernameEl) usernameEl.textContent = credData.username_preview || '****';
                 if (passwordEl) passwordEl.textContent = '••••••••';
-                if (fileEl) fileEl.textContent = 'vpn_configs/credentials.txt';
+                if (fileEl) fileEl.textContent = 'credentials.env';
             } else {
                 if (credStatus) credStatus.innerHTML = '<span style="color:var(--warning)">!</span> ' + (t('vpn.credentials_missing') || 'Aucun identifiant');
                 if (usernameEl) usernameEl.textContent = '—';
@@ -2618,6 +2679,7 @@ document.addEventListener('DOMContentLoaded', () => {
         const statusEl = document.getElementById('vpn-status-text');
         const statusDot = document.getElementById('vpn-status-dot');
         const ipEl = document.getElementById('vpn-ip');
+        const identityEl = document.getElementById('vpn-identity');
         const serverEl = document.getElementById('vpn-server');
         const requestsEl = document.getElementById('vpn-requests');
         const totalEl = document.getElementById('vpn-total-free');
@@ -2640,6 +2702,10 @@ document.addEventListener('DOMContentLoaded', () => {
         if (statusDot) statusDot.style.background = s.color;
 
         ipEl.textContent = data.current_ip || '—';
+        if (identityEl) {
+            const ident = data.vpn && data.vpn.current_identity;
+            identityEl.textContent = ident ? `${ident.impersonate} #${data.vpn.identity_index}` : '—';
+        }
         serverEl.textContent = data.current_server || '—';
         requestsEl.textContent = `${data.requests_this_ip || 0} / ${data.quota_per_ip || 300}`;
         totalEl.textContent = data.total_free_requests || 0;
