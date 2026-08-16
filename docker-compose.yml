@@ -8,9 +8,69 @@ services:
       - .env
     volumes:
       - ./logs:/app/logs
+      - ./config.yaml:/app/config.yaml:ro
+      - ./api_keys.json:/app/api_keys.json:ro
     restart: unless-stopped
 
-  vpn-proxy:
+  # ── Option A: Gluetun (recommandé) ──
+  # Multi-provider VPN client, WireGuard, proxy intégré, 43 MB
+  # Documentation: https://github.com/qdm12/gluetun
+  vpn-gluetun:
+    image: qmcgaw/gluetun
+    container_name: opencode-vpn
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    ports:
+      - "8888:8888"    # HTTP proxy
+      - "1080:1080"    # SOCKS5 proxy
+    environment:
+      - VPN_SERVICE_PROVIDER=nordvpn
+      - VPN_TYPE=openvpn
+      - OPENVPN_USER=${NORDVPN_USER:-}
+      - OPENVPN_PASSWORD=${NORDVPN_PASSWORD:-}
+      - SERVER_COUNTRIES=${NORDVPN_COUNTRY:-Germany}
+      - HTTP_PROXY=on
+      - HTTP_PROXY_PORT=8888
+      - SOCKS5_PROXY=on
+      - SOCKS5_PROXY_PORT=1080
+      - DNS_OVER_TLS=on
+      - PUID=1000
+      - PGID=1000
+    volumes:
+      - gluetun:/gluetun
+    restart: unless-stopped
+    profiles:
+      - vpn
+      - gluetun
+
+  # ── Option B: NordVPN Officiel ──
+  # Client NordVPN Linux natif + tinyproxy
+  vpn-nordvpn-official:
+    build:
+      context: .
+      dockerfile: Dockerfile.nordvpn
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    ports:
+      - "8888:8888"
+    environment:
+      - NORDVPN_TOKEN=${NORDVPN_TOKEN:-}
+      - NORDVPN_COUNTRY=${NORDVPN_COUNTRY:-}
+      - NORDVPN_TECHNOLOGY=${NORDVPN_TECHNOLOGY:-NordLynx}
+      - NORDVPN_KILLSWITCH=on
+      - VPN_PROXY_PORT=8888
+    restart: unless-stopped
+    profiles:
+      - vpn
+      - nordvpn-official
+
+  # ── Option C: Legacy (OpenVPN brut) ──
+  # Configuration manuelle avec fichiers .ovpn
+  vpn-legacy:
     build:
       context: .
       dockerfile: Dockerfile.vpn
@@ -21,3 +81,7 @@ services:
     restart: unless-stopped
     profiles:
       - vpn
+      - legacy
+
+volumes:
+  gluetun:

@@ -40,3 +40,9 @@ vpn/credentials.txt
 venv/
 env/
 ENV/
+
+# Secrets
+vpn_configs/
+credentials.env
+logs/vpn_state.json
+*.ovpn

@@ -16,7 +16,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 RUN groupadd -r opencode && useradd -r -g opencode -d /app -s /sbin/nologin opencode \
     && mkdir -p /app/logs /app/vpn_configs && chown -R opencode:opencode /app
 
-COPY --chown=opencode:opencode . .
+# Explicit COPY only — never `COPY . .` (would bake config.yaml / vpn_configs secrets into the image)
+COPY --chown=opencode:opencode requirements.txt ./
+COPY --chown=opencode:opencode opencode.py vpn_manager.py free_ip_pool.py shared_state.py ./
+COPY --chown=opencode:opencode config/ ./config/
+COPY --chown=opencode:opencode dashboard/ ./dashboard/
+COPY --chown=opencode:opencode static/ ./static/
 
 USER opencode
 

@@ -358,14 +358,7 @@ def get_tool_config(model_id: str) -> dict:
 # ── API Keys ────────────────────────────────────────────────────────
 
 def load_api_keys() -> list[dict]:
-    """Load API key configs from YAML or JSON. Falls back to .env single-key."""
-    yaml_keys = yaml_get("api_keys", default=[])
-    if yaml_keys:
-        for i, k in enumerate(yaml_keys):
-            if not k.get("alias"):
-                k["alias"] = f"Compte {i+1}"
-        return yaml_keys
-    # Fallback to JSON file
+    """Load API key configs from api_keys.json (gitignored, primary). Falls back to YAML, then .env single-key."""
     if os.path.exists(API_KEYS_PATH):
         try:
             with open(API_KEYS_PATH, "r", encoding="utf-8") as f:
@@ -377,6 +370,12 @@ def load_api_keys() -> list[dict]:
                     return data
         except Exception as e:
             logging.warning("Failed to load api_keys.json: %s", e)
+    yaml_keys = yaml_get("api_keys", default=[])
+    if yaml_keys:
+        for i, k in enumerate(yaml_keys):
+            if not k.get("alias"):
+                k["alias"] = f"Compte {i+1}"
+        return yaml_keys
     # Fallback: single key from .env
     if API_KEY:
         return [{"api_key": API_KEY,
@@ -386,9 +385,9 @@ def load_api_keys() -> list[dict]:
 
 
 def save_api_keys(configs: list[dict]):
-    """Save API key configs to YAML."""
-    _yaml_data["api_keys"] = configs
-    save_yaml_config()
+    """Save API key configs to api_keys.json (never config.yaml — secrets stay out of git)."""
+    with open(API_KEYS_PATH, "w", encoding="utf-8") as f:
+        json.dump(configs, f, indent=2, ensure_ascii=False)
     API_KEYS[:] = configs  # Atomic replacement — readers never see empty list
 
 
