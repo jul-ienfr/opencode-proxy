@@ -12,12 +12,18 @@ A Python proxy for using [OpenCode Go](https://opencode.ai/docs/go/) subscriptio
 pip install -r requirements.txt
 ```
 
-### GUI Mode (optional)
+### GUI Mode (default)
 
-For system tray GUI (`--gui` flag):
+The proxy launches with a system tray icon and dashboard window **by default**. Required dependencies:
 
 ```bash
 pip install pystray Pillow pywebview
+```
+
+If these are missing, the proxy falls back to terminal mode with a warning. To force terminal mode:
+
+```bash
+python opencode.py --no-gui
 ```
 
 ## Configuration
@@ -111,9 +117,13 @@ ip_rotation:
 
 ### GUI Mode
 
+GUI is the default (system tray + dashboard window). For terminal mode:
+
 ```bash
-python opencode.py --gui
+python opencode.py --no-gui
 ```
+
+`--gui` is still accepted for backward compatibility.
 
 ## Web Dashboard
 

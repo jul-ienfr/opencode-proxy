@@ -4,7 +4,7 @@
 Validates that free-model traffic exits through the gluetun NordVPN tunnel.
 
 Usage:
-    OPENCODE_PORT=4001 python opencode.py          # instance under test
+    OPENCODE_PORT=4001 python opencode.py --no-gui  # instance under test (headless)
     python scripts/test_vpn_e2e.py [--port 4001]   # run the tests
 
 Tests:
@@ -37,7 +37,8 @@ def check(name: str, ok: bool, detail: str = "") -> None:
 
 
 def docker(args: list[str]) -> str:
-    out = subprocess.run(["docker", *args], capture_output=True, text=True, timeout=120)
+    out = subprocess.run(["docker", *args], capture_output=True, text=True,
+                         encoding="utf-8", errors="replace", timeout=120)
     return out.stdout.strip()
 
 

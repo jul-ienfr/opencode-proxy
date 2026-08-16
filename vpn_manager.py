@@ -46,7 +46,7 @@ class VPNState:
     TRANSITIONS = {
         DISCONNECTED: {CONNECTING, ERROR},
         CONNECTING: {CONNECTED, DISCONNECTING, ERROR, DISCONNECTED},
-        CONNECTED: {DISCONNECTING, ERROR},
+        CONNECTED: {CONNECTING, DISCONNECTING, ERROR},
         DISCONNECTING: {DISCONNECTED, ERROR},
         ERROR: {DISCONNECTED, CONNECTING},
     }
@@ -443,7 +443,7 @@ class VPNManager:
             self._error = "container not running"
             return self.get_status()
 
-        if await self._check_auth_failed():
+        if await self._check_auth_failed(info.get("started_at", "")):
             self._auth_failed = True
             self._status = VPNState.ERROR
             self._error = "AUTH_FAILED - NordVPN service credentials rejected"
@@ -456,6 +456,7 @@ class VPNManager:
             self._current_ip = ip
             self._connected_at = time.monotonic()
             self._status = VPNState.CONNECTED
+            self._error = None
             self._current_server = {
                 "name": self._docker_container, "country": self._server_countries}
         else:
@@ -659,6 +660,7 @@ class VPNManager:
             "running": state.get("Running", False),
             "healthy": state.get("Health", {}).get("Status") == "healthy",
             "restarting": state.get("Restarting", False),
+            "started_at": state.get("StartedAt", ""),
         }
 
     async def _docker_restart(self) -> None:
@@ -687,10 +689,17 @@ class VPNManager:
         else:
             await self._docker_restart()
 
-    async def _check_auth_failed(self) -> bool:
-        """Scan recent container logs for AUTH_FAILED (OpenVPN auth rejection)."""
+    async def _check_auth_failed(self, started_at: str = "") -> bool:
+        """Scan container logs for AUTH_FAILED (OpenVPN auth rejection).
+
+        Bound the scan to logs since the container's last start (StartedAt):
+        an AUTH_FAILED logged before the last restart is stale (resolved by
+        that restart) and must not flip the state to ERROR. Falls back to a
+        10-minute window when the start time is unknown.
+        """
+        since = started_at if started_at else "10m"
         result = await asyncio.to_thread(
-            self._docker_run, ["logs", "--since", "10m", self._docker_container], 30)
+            self._docker_run, ["logs", "--since", since, self._docker_container], 30)
         if result.returncode != 0:
             return False
         return "AUTH_FAILED" in result.stdout or "auth failed" in result.stdout.lower()

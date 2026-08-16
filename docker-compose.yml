@@ -32,10 +32,10 @@ services:
       - VPN_SERVICE_PROVIDER=nordvpn
       - VPN_TYPE=openvpn
       - SERVER_COUNTRIES=Germany
-      - HTTP_PROXY=on
-      - HTTP_PROXY_PORT=8888
-      - SOCKS5_PROXY=on
-      - SOCKS5_PROXY_PORT=1080
+      - HTTPPROXY=on
+      - HTTPPROXY_LISTENING_ADDRESS=:8888
+      - SOCKS5_ENABLED=on
+      - SOCKS5_LISTENING_ADDRESS=:1080
       - DNS_OVER_TLS=on
       - FIREWALL=on
       - PUID=1000

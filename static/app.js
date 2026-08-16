@@ -86,6 +86,16 @@ const LOCALE = {
         'vpn.servers_hint': 'NordVPN .ovpn configs',
         'vpn.confirm_remove': 'Remove this server?',
         'vpn.server_added': 'Server added',
+        'vpn.api_discovery': 'NordVPN API Discovery',
+        'vpn.api_hint': 'Auto-discover servers via NordVPN API',
+        'vpn.advanced': 'Advanced Settings',
+        'vpn.health_check': 'Health Check',
+        'vpn.config': 'VPN Configuration',
+        'vpn.mode': 'Mode',
+        'vpn.proxy_port': 'Proxy port',
+        'vpn.switch_delay': 'Switch delay (s)',
+        'vpn.docker_image': 'Docker image',
+        'vpn.config_summary': 'Config saved automatically',
         'last.update': 'Last update: ',
         'stats.overview': 'Overview',
         'stats.input': 'Input',
@@ -317,6 +327,16 @@ const LOCALE = {
         'vpn.servers_hint': 'Configs .ovpn NordVPN',
         'vpn.confirm_remove': 'Supprimer ce serveur ?',
         'vpn.server_added': 'Serveur ajouté',
+        'vpn.api_discovery': 'Découverte API NordVPN',
+        'vpn.api_hint': 'Découvre automatiquement les serveurs via l\'API NordVPN',
+        'vpn.advanced': 'Paramètres avancés',
+        'vpn.health_check': 'Health Check',
+        'vpn.config': 'Configuration VPN',
+        'vpn.mode': 'Mode',
+        'vpn.proxy_port': 'Port proxy',
+        'vpn.switch_delay': 'Délai switch (s)',
+        'vpn.docker_image': 'Image Docker',
+        'vpn.config_summary': 'Config sauvée automatiquement',
         'last.update': 'Dernière mise à jour : ',
         'stats.overview': 'Aperçu',
         'stats.input': 'Entrée',
@@ -2525,8 +2545,30 @@ document.addEventListener('DOMContentLoaded', () => {
             if (cfgData.proxy_port) document.getElementById('vpn-proxy-port').value = cfgData.proxy_port;
             if (cfgData.switch_delay) document.getElementById('vpn-switch-delay').value = cfgData.switch_delay;
             if (cfgData.quota_per_ip) document.getElementById('vpn-quota-per-ip').value = cfgData.quota_per_ip;
-            if (cfgData.docker_image) document.getElementById('vpn-docker-image').value = cfgData.docker_image;
+            if (cfgData.docker_image) {
+                const dockerSelect = document.getElementById('vpn-docker-image');
+                // Check if it's a known option or custom
+                const knownImages = ['qmcgaw/gluetun', 'nordvpn-official'];
+                if (knownImages.includes(cfgData.docker_image)) {
+                    dockerSelect.value = cfgData.docker_image;
+                } else {
+                    dockerSelect.value = 'custom';
+                    const customInput = document.getElementById('vpn-docker-image-custom');
+                    if (customInput) {
+                        customInput.style.display = 'block';
+                        customInput.value = cfgData.docker_image;
+                    }
+                }
+                vpnDockerImageChanged();
+            }
             vpnInitConfig(cfgData.mode);
+
+            // Load advanced config fields
+            if (cfgData.circuit_breaker_threshold) document.getElementById('vpn-cb-threshold').value = cfgData.circuit_breaker_threshold;
+            if (cfgData.circuit_breaker_recovery) document.getElementById('vpn-cb-recovery').value = cfgData.circuit_breaker_recovery;
+            if (cfgData.backoff_max_delay) document.getElementById('vpn-backoff-max').value = cfgData.backoff_max_delay;
+            if (cfgData.watchdog_interval !== undefined) document.getElementById('vpn-watchdog').value = cfgData.watchdog_interval;
+            if (cfgData.api_cache_ttl) document.getElementById('vpn-api-cache').value = cfgData.api_cache_ttl;
 
             // Initialize proxy mode UI
             if (cfgData.proxy_mode) {
@@ -2617,6 +2659,30 @@ document.addEventListener('DOMContentLoaded', () => {
                 </div>`
             ).join('') || '<div style="color:var(--text-muted);padding:4px">Aucun historique</div>';
         }
+
+        // Circuit breaker status
+        const cbStatusEl = document.getElementById('vpn-cb-status');
+        if (cbStatusEl && data.vpn && data.vpn.circuit_breaker) {
+            const cb = data.vpn.circuit_breaker;
+            const entries = Object.entries(cb);
+            if (entries.length > 0) {
+                const openServers = entries.filter(([_, v]) => v.state === 'open');
+                const failedServers = entries.filter(([_, v]) => v.failures > 0);
+                let html = '';
+                if (openServers.length > 0) {
+                    html += `<span style="color:var(--danger)">🔴 ${openServers.length} serveur(s) bloqué(s)</span> `;
+                }
+                if (failedServers.length > 0) {
+                    html += `<span style="color:var(--warning)">⚠️ ${failedServers.length} serveur(s) avec échecs</span> `;
+                }
+                if (data.vpn.backoff_failures > 0) {
+                    html += `<span style="color:var(--text-muted)">Backoff: ${data.vpn.backoff_delay}s (${data.vpn.backoff_failures} échecs)</span>`;
+                }
+                cbStatusEl.innerHTML = html || '<span style="color:var(--success)">✓ Tous les serveurs OK</span>';
+            } else {
+                cbStatusEl.innerHTML = '<span style="color:var(--success)">✓ Aucun échec enregistré</span>';
+            }
+        }
     }
 
     window.toggleVPN = async function(enabled) {
@@ -2625,9 +2691,37 @@ document.addEventListener('DOMContentLoaded', () => {
     };
 
     window.vpnConnect = async function() {
-        const resp = await fetch('/api/vpn/connect', { method: 'POST' });
-        const data = await resp.json();
-        if (data.error) alert('Erreur: ' + data.error);
+        const resultEl = document.getElementById('vpn-health-result');
+        if (resultEl) resultEl.innerHTML = '<span style="color:var(--warning)">Connexion en cours...</span>';
+
+        try {
+            const resp = await fetch('/api/vpn/connect', { method: 'POST' });
+            const data = await resp.json();
+            if (data.error) {
+                // Parse error for specific messages
+                let msg = data.error;
+                let color = 'var(--danger)';
+                if (msg.includes('not found') || msg.includes('Not found')) {
+                    msg = '✗ NordVPN non installé ou introuvable';
+                } else if (msg.includes('AUTH_FAILED') || msg.includes('auth')) {
+                    msg = '✗ Échec authentification — vérifiez vos identifiants';
+                } else if (msg.includes('locked') || msg.includes('cooldown')) {
+                    msg = '✗ Trop de tentatives — attendez avant de réessayer';
+                } else if (msg.includes('token')) {
+                    msg = '✗ Token NordVPN invalide ou manquant';
+                } else if (msg.includes('Config not found')) {
+                    msg = '✗ Fichier .ovpn non trouvé';
+                } else {
+                    msg = '✗ ' + msg;
+                }
+                if (resultEl) resultEl.innerHTML = `<span style="color:${color}">${msg}</span>`;
+            } else {
+                const ip = data.ip || '?';
+                if (resultEl) resultEl.innerHTML = `<span style="color:var(--success)">✓ Connecté — IP: ${ip}</span>`;
+            }
+        } catch (e) {
+            if (resultEl) resultEl.innerHTML = `<span style="color:var(--danger)">✗ Erreur: ${e.message}</span>`;
+        }
         refreshVPNStatus();
     };
 
@@ -2635,11 +2729,23 @@ document.addEventListener('DOMContentLoaded', () => {
         const mode = document.getElementById('vpn-mode').value;
         const proxyPort = parseInt(document.getElementById('vpn-proxy-port').value) || 8888;
         const switchDelay = parseInt(document.getElementById('vpn-switch-delay').value) || 5;
-        const dockerImage = document.getElementById('vpn-docker-image')?.value || 'openvpn-nordvpn';
+        let dockerImage = document.getElementById('vpn-docker-image')?.value || 'qmcgaw/gluetun';
+        if (dockerImage === 'custom') {
+            dockerImage = document.getElementById('vpn-docker-image-custom')?.value || 'qmcgaw/gluetun';
+        }
+        const cbThreshold = parseInt(document.getElementById('vpn-cb-threshold')?.value) || 3;
+        const cbRecovery = parseInt(document.getElementById('vpn-cb-recovery')?.value) || 300;
+        const backoffMax = parseInt(document.getElementById('vpn-backoff-max')?.value) || 60;
+        const watchdog = parseInt(document.getElementById('vpn-watchdog')?.value) || 60;
+        const apiCache = parseInt(document.getElementById('vpn-api-cache')?.value) || 900;
 
         await fetch('/api/vpn-config', {
             method: 'POST', headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({ mode, proxy_port: proxyPort, switch_delay: switchDelay, docker_image: dockerImage })
+            body: JSON.stringify({
+                mode, proxy_port: proxyPort, switch_delay: switchDelay, docker_image: dockerImage,
+                circuit_breaker_threshold: cbThreshold, circuit_breaker_recovery: cbRecovery,
+                backoff_max_delay: backoffMax, watchdog_interval: watchdog, api_cache_ttl: apiCache
+            })
         });
 
         // Show/hide Docker options
@@ -2659,8 +2765,124 @@ document.addEventListener('DOMContentLoaded', () => {
     function vpnInitConfig(mode) {
         document.getElementById('vpn-mode').value = mode || 'wsl2';
         document.getElementById('vpn-docker-row').style.display = (mode === 'docker') ? 'flex' : 'none';
-        document.getElementById('vpn-mode-hint').textContent = mode === 'docker' ? 'Docker (reproductible, isolé)' : 'WSL2 (léger, déjà installé)';
+        const nordvpnSection = document.getElementById('vpn-nordvpn-app-section');
+        if (nordvpnSection) nordvpnSection.style.display = (mode === 'nordvpn-app') ? 'block' : 'none';
+        const hints = {
+            auto: 'Auto-détecte le meilleur mode disponible',
+            docker: 'Docker (reproductible, isolé)',
+            native: 'Windows natif (OpenVPN installé)',
+            'nordvpn-app': 'NordVPN App (application desktop Windows)',
+            wsl2: 'WSL2 (léger, déjà installé)'
+        };
+        document.getElementById('vpn-mode-hint').textContent = hints[mode] || hints.wsl2;
     }
+
+    // ── VPN Diagnostic ──
+    window.vpnDiagnostic = async function() {
+        const resultEl = document.getElementById('vpn-diagnostic-result');
+        if (!resultEl) return;
+        resultEl.style.display = 'block';
+        resultEl.innerHTML = '<span style="color:var(--warning)">Diagnostic en cours...</span>';
+
+        try {
+            const resp = await fetch('/api/vpn/diagnostic');
+            const data = await resp.json();
+
+            let html = '<strong>🩺 Diagnostic VPN</strong><br>';
+
+            // Current mode
+            html += `<div style="margin-top:8px"><strong>Mode actuel:</strong> ${data.current_mode || '?'}</div>`;
+            html += `<div><strong>Status:</strong> ${data.status || '?'} | <strong>IP:</strong> ${data.ip || '?'}</div>`;
+
+            // NordVPN App
+            const nordvpn = data.nordvpn_app || {};
+            const nordvpnIcon = nordvpn.available ? '🟢' : '🔴';
+            html += `<div style="margin-top:6px">${nordvpnIcon} <strong>NordVPN App:</strong> ${nordvpn.available ? 'Installé (' + (nordvpn.exe || '?') + ')' : 'Non installé'}`;
+            if (nordvpn.status && nordvpn.status.connected) {
+                html += ` — Connecté: ${nordvpn.status.country || '?'} / ${nordvpn.status.city || '?'} / ${nordvpn.status.ip || '?'}`;
+            }
+            html += '</div>';
+
+            // Docker
+            const docker = data.docker || {};
+            const dockerIcon = docker.running ? '🟢' : docker.available ? '🟡' : '🔴';
+            html += `<div>${dockerIcon} <strong>Docker:</strong> ${docker.running ? 'En cours (v' + (docker.version || '?') + ')' : docker.available ? 'Installé mais arrêté' : 'Non installé'}</div>`;
+
+            // WSL2
+            const wsl2 = data.wsl2 || {};
+            const wsl2Icon = wsl2.available ? '🟢' : '🔴';
+            html += `<div>${wsl2Icon} <strong>WSL2:</strong> ${wsl2.available ? 'Disponible' : 'Non disponible'}</div>`;
+
+            // OpenVPN native
+            const openvpn = data.openvpn || {};
+            const openvpnIcon = openvpn.available ? '🟢' : '🔴';
+            html += `<div>${openvpnIcon} <strong>OpenVPN natif:</strong> ${openvpn.available ? openvpn.path : 'Non installé'}</div>`;
+
+            // Recommendation
+            html += `<div style="margin-top:8px;padding-top:6px;border-top:1px solid var(--border)"><strong>Recommandation:</strong> <span style="color:var(--success)">${data.recommendation || '?'}</span></div>`;
+
+            resultEl.innerHTML = html;
+        } catch (e) {
+            resultEl.innerHTML = `<span style="color:var(--danger)">✗ Erreur: ${e.message}</span>`;
+        }
+    };
+
+    // Test NordVPN App connection
+    window.vpnTestNordvpnApp = async function() {
+        const statusEl = document.getElementById('vpn-nordvpn-app-status');
+        const countriesEl = document.getElementById('vpn-nordvpn-app-countries');
+        if (statusEl) statusEl.innerHTML = '<span style="color:var(--warning)">Test en cours...</span>';
+
+        try {
+            // Check if available
+            const availResp = await fetch('/api/vpn/nordvpn-available');
+            const availData = await availResp.json();
+            if (!availData.available) {
+                if (statusEl) statusEl.innerHTML = '<span style="color:var(--danger)">✗ NordVPN non installé</span>';
+                return;
+            }
+
+            // Get status
+            const statusResp = await fetch('/api/vpn/nordvpn-status');
+            const statusData = await statusResp.json();
+            if (statusData.connected) {
+                if (statusEl) statusEl.innerHTML = `<span style="color:var(--success)">✓ Connecté</span> — ${statusData.country || '?'} / ${statusData.city || '?'} / IP: ${statusData.ip || '?'}`;
+            } else {
+                if (statusEl) statusEl.innerHTML = '<span style="color:var(--text-muted)">● Déconnecté (prêt)</span>';
+            }
+
+            // Get countries count
+            const countriesResp = await fetch('/api/vpn/nordvpn-countries');
+            const countriesData = await countriesResp.json();
+            if (countriesEl && countriesData.countries) {
+                countriesEl.textContent = `${countriesData.countries.length} pays disponibles`;
+            }
+        } catch (e) {
+            if (statusEl) statusEl.innerHTML = `<span style="color:var(--danger)">✗ ${e.message}</span>`;
+        }
+    };
+
+    // Docker image dropdown handler
+    window.vpnDockerImageChanged = function() {
+        const select = document.getElementById('vpn-docker-image');
+        const customInput = document.getElementById('vpn-docker-image-custom');
+        const hint = document.getElementById('vpn-docker-image-hint');
+        const value = select.value;
+
+        if (value === 'custom') {
+            customInput.style.display = 'block';
+        } else {
+            customInput.style.display = 'none';
+        }
+
+        const hints = {
+            'qmcgaw/gluetun': 'Gluetun: proxy intégré, WireGuard, 43 MB',
+            'nordvpn-official': 'NordVPN Officiel: client natif Linux, construit localement',
+            'custom': 'Entrez le nom de l\'image Docker'
+        };
+        if (hint) hint.textContent = hints[value] || '';
+        vpnSaveConfig();
+    };
 
     window.vpnDisconnect = async function() {
         await fetch('/api/vpn/disconnect', { method: 'POST' });
@@ -2738,6 +2960,135 @@ document.addEventListener('DOMContentLoaded', () => {
         _vpnSelectedFile = null;
         document.getElementById('vpn-file-input').value = '';
         refreshVPNStatus();
+    };
+
+    // ── VPN Health Check ──
+    window.vpnHealthCheck = async function() {
+        const resultEl = document.getElementById('vpn-health-result');
+        if (resultEl) resultEl.textContent = 'Test en cours...';
+        try {
+            const resp = await fetch('/api/vpn/health-check', { method: 'POST' });
+            const data = await resp.json();
+            if (data.ok) {
+                const latency = data.latency_ms ? ` (${data.latency_ms}ms)` : '';
+                const changed = data.ip_changed ? ' ⚠️ IP changée' : '';
+                if (resultEl) resultEl.innerHTML = `<span style="color:var(--success)">✓ OK${latency}</span>${changed}`;
+            } else {
+                if (resultEl) resultEl.innerHTML = `<span style="color:var(--danger)">✗ ${data.error || 'Échec'}</span>`;
+            }
+        } catch (e) {
+            if (resultEl) resultEl.innerHTML = `<span style="color:var(--danger)">✗ Erreur: ${e.message}</span>`;
+        }
+    };
+
+    // ── VPN Save State ──
+    window.vpnSaveState = async function() {
+        try {
+            await fetch('/api/vpn/save-state', { method: 'POST' });
+            const resultEl = document.getElementById('vpn-health-result');
+            if (resultEl) resultEl.innerHTML = '<span style="color:var(--success)">✓ État sauvegardé</span>';
+        } catch (e) {
+            console.error('Save state error:', e);
+        }
+    };
+
+    // ── NordVPN API Toggle ──
+    window.vpnToggleApi = async function(enabled) {
+        const section = document.getElementById('vpn-api-section');
+        if (section) section.style.display = enabled ? 'block' : 'none';
+        await fetch('/api/vpn-config', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ use_nordvpn_api: enabled })
+        });
+        if (enabled) {
+            vpnLoadCountries();
+        }
+    };
+
+    // ── Load Countries for API ──
+    async function vpnLoadCountries() {
+        try {
+            const resp = await fetch('/api/vpn/countries');
+            const data = await resp.json();
+            const select = document.getElementById('vpn-api-country');
+            if (select && data.countries) {
+                select.innerHTML = '<option value="">Tous</option>' +
+                    data.countries.map(c => `<option value="${c.code}">${c.name} (${c.code})</option>`).join('');
+            }
+        } catch (e) {
+            console.error('Load countries error:', e);
+        }
+    }
+
+    // ── Discover Servers via API ──
+    window.vpnDiscoverServers = async function() {
+        const country = document.getElementById('vpn-api-country')?.value || '';
+        const group = document.getElementById('vpn-api-group')?.value || '';
+        const limit = parseInt(document.getElementById('vpn-api-limit')?.value) || 5;
+        const resultsEl = document.getElementById('vpn-api-results');
+        if (resultsEl) resultsEl.textContent = 'Découverte en cours...';
+
+        try {
+            const resp = await fetch('/api/vpn/discover-and-add', {
+                method: 'POST', headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ country: country || null, group: group || null, limit })
+            });
+            const data = await resp.json();
+            if (data.error) {
+                if (resultsEl) resultsEl.innerHTML = `<span style="color:var(--danger)">✗ ${data.error}</span>`;
+            } else {
+                if (resultsEl) resultsEl.innerHTML = `<span style="color:var(--success)">✓ ${data.count} serveur(s) ajouté(s)</span>`;
+                refreshVPNStatus();
+            }
+        } catch (e) {
+            if (resultsEl) resultsEl.innerHTML = `<span style="color:var(--danger)">✗ Erreur: ${e.message}</span>`;
+        }
+    };
+
+    // ── Export VPN Config ──
+    window.vpnExportConfig = async function() {
+        try {
+            const resp = await fetch('/api/vpn/export');
+            const data = await resp.json();
+            const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `opencode-vpn-config-${new Date().toISOString().slice(0,10)}.json`;
+            a.click();
+            URL.revokeObjectURL(url);
+        } catch (e) {
+            alert('Export failed: ' + e.message);
+        }
+    };
+
+    // ── Import VPN Config ──
+    window.vpnImportConfig = async function() {
+        const input = document.createElement('input');
+        input.type = 'file';
+        input.accept = '.json';
+        input.onchange = async (e) => {
+            const file = e.target.files[0];
+            if (!file) return;
+            try {
+                const text = await file.text();
+                const data = JSON.parse(text);
+                const resp = await fetch('/api/vpn/import', {
+                    method: 'POST', headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(data)
+                });
+                const result = await resp.json();
+                if (result.ok) {
+                    alert('Configuration importée avec succès');
+                    refreshVPNStatus();
+                } else {
+                    alert('Import failed: ' + (result.error || 'Unknown error'));
+                }
+            } catch (e) {
+                alert('Import failed: ' + e.message);
+            }
+        };
+        input.click();
     };
 
     // ── Free Models master toggle ──

@@ -1450,7 +1450,8 @@ async def _do_free_request_curl_cffi(body: dict, headers: dict, proxy_url: str |
                    if k.lower() not in ('authorization', 'x-api-key')}
     req_headers["Content-Type"] = "application/json"
 
-    async with AsyncSession(impersonate="chrome131", proxy=proxy_url) as session:
+    async with AsyncSession(impersonate="chrome131",
+                            proxy=_curl_proxy_url(proxy_url)) as session:
         resp = await session.post(
             API_BASE_FREE,
             json=body,
@@ -1459,6 +1460,19 @@ async def _do_free_request_curl_cffi(body: dict, headers: dict, proxy_url: str |
         )
         # Wrap in a compatible response object
         return _CurlCffiResponse(resp)
+
+
+def _curl_proxy_url(proxy_url: str | None) -> str | None:
+    """Fix curl_cffi (libcurl) SOCKS5 routing on Windows.
+
+    With ``socks5://`` libcurl resolves the hostname locally, which times out
+    against gluetun on Windows Docker Desktop (observed: 60 s curl 28).
+    ``socks5h://`` resolves the hostname inside the tunnel (gluetun DNS), which
+    answers in <1 s. httpx is untouched — it never sees this conversion.
+    """
+    if proxy_url and proxy_url.startswith("socks5://"):
+        return "socks5h://" + proxy_url[len("socks5://"):]
+    return proxy_url
 
 
 class _CurlCffiResponse:
@@ -1512,6 +1526,7 @@ class _CurlCffiStreamResponse:
         await self._resp.aclose()
 
 
+@asynccontextmanager
 async def _open_free_stream(endpoint, body, headers, use_free: bool):
     """Context manager: upstream stream, routed through the VPN when free.
 
@@ -1527,7 +1542,8 @@ async def _open_free_stream(endpoint, body, headers, use_free: bool):
                 req_headers = {k: v for k, v in headers.items()
                                if k.lower() not in ('authorization', 'x-api-key')}
                 req_headers["Content-Type"] = "application/json"
-                session = AsyncSession(impersonate="chrome131", proxy=proxy_url,
+                session = AsyncSession(impersonate="chrome131",
+                                       proxy=_curl_proxy_url(proxy_url),
                                        timeout=(30, 600))  # connect 30 / read 600 (cf. upstream.timeout)
                 resp = await session.post(endpoint, json=body, headers=req_headers, stream=True)
                 wrapped = _CurlCffiStreamResponse(resp)
@@ -1539,6 +1555,7 @@ async def _open_free_stream(endpoint, body, headers, use_free: bool):
                 return
             except Exception as e:
                 _debug(f"  [stream] curl_cffi proxy stream failed: {e}, falling back to direct stream")
+                _log(f"  FREE STREAM via VPN tunnel FAILED ({e}) → direct fallback (residential IP)")
     async with _client.stream("POST", endpoint, json=body, headers=headers) as resp:
         yield resp
 
@@ -1636,6 +1653,7 @@ async def _try_free_model_first(body, headers, protocol, model_id,
             resp_headers = resp.headers
         except Exception as e:
             _debug(f"  [free] curl_cffi error: {e}, falling back to httpx")
+            _log(f"  FREE via VPN tunnel FAILED ({e}) → direct fallback (residential IP)")
             try:
                 resp, resp_headers = await _do_request_with_retry(
                     API_BASE_FREE, free_body, free_headers, protocol, retry_on_429=False
@@ -1698,10 +1716,19 @@ async def _try_free_model_first(body, headers, protocol, model_id,
         # Set cooldown to skip free model for 60s (avoids sequential free→paid latency)
         _free_model_cooldown_until = time.monotonic() + 60
 
-        # If VPN rotation is enabled, switch IP on 429
+        # If VPN rotation is enabled, switch IP on 429.
+        # A long retry-after means the account-wide free quota is exhausted —
+        # rotating would just restart the tunnel for nothing. Only rotate
+        # when retry-after is short (per-IP quota) or absent.
         if _free_ip_pool and _free_ip_pool.enabled:
             try:
-                asyncio.create_task(_free_ip_pool.on_quota_exhausted())
+                _long_wait = 0
+                try:
+                    _long_wait = int(float(retry_after))
+                except (TypeError, ValueError):
+                    pass
+                if _long_wait <= 300:
+                    asyncio.create_task(_free_ip_pool.on_quota_exhausted())
             except Exception as e:
                 _debug(f"  [free] quota-exhausted task error: {e}")
 
@@ -5343,7 +5370,9 @@ if __name__ == "__main__":
     import signal
     import traceback as _traceback
 
-    use_gui = "--gui" in sys.argv
+    # GUI by default (system tray + dashboard window); --no-gui forces terminal mode.
+    # --gui is still accepted for backward compatibility (no-op since it's the default).
+    use_gui = "--no-gui" not in sys.argv
 
     mgr = ServerManager(app, HOST, PORT, WEB_PORT)
     _server_manager = mgr
@@ -5372,8 +5401,11 @@ if __name__ == "__main__":
         try:
             from gui import run_gui
         except ImportError:
-            print("GUI dependencies not installed. Run: pip install pystray Pillow pywebview")
-            sys.exit(1)
+            # GUI is the default — fall back to terminal mode instead of exiting.
+            print("GUI dependencies not installed (pystray Pillow pywebview). Falling back to terminal mode.")
+            print("Install with: pip install pystray Pillow pywebview  (or use --no-gui to skip this check)")
+            use_gui = False
+    if use_gui:
         run_gui(mgr, HOST, PORT, WEB_PORT)
     else:
         try:

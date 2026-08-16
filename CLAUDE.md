@@ -8,8 +8,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 # Install dependencies
 pip install -r requirements.txt
 
-# Run the proxy server
+# Run the proxy server (GUI by default: system tray + dashboard window)
+# GUI deps: pip install pystray Pillow pywebview  (falls back to terminal mode if missing)
 python opencode.py
+
+# Force terminal mode (headless — used by systemd/Docker)
+python opencode.py --no-gui
 ```
 
 Server starts on:

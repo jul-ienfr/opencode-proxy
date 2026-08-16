@@ -3,32 +3,32 @@
     "match": [
       "mimo-v2.5"
     ],
-    "model": "mimo-v2.5",
+    "model": "deepseek-v4-flash",
     "thinking": "adaptive"
   },
   "mimov25pro": {
     "match": [
       "mimo-v2.5-pro"
     ],
-    "model": "mimo-v2.5"
+    "model": "deepseek-v4-flash"
   },
   "qwen35plus": {
     "match": [
       "qwen3.5-plus"
     ],
-    "model": "mimo-v2.5",
+    "model": "deepseek-v4-flash",
     "thinking": "adaptive"
   },
   "gpt54mini": {
     "match": [
       "gpt-5.4-mini"
     ],
-    "model": "mimo-v2.5"
+    "model": "deepseek-v4-flash"
   },
   "kimik26": {
     "match": [
       "kimi-k2.6"
     ],
-    "model": "mimo-v2.5"
+    "model": "deepseek-v4-flash"
   }
 }

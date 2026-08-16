@@ -1018,11 +1018,14 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
         if not shared_state.vpn_manager:
             return {"error": "VPN manager not initialized"}
         try:
+            ip_before = shared_state.vpn_manager.current_ip
             if shared_state.free_ip_pool:
                 await shared_state.free_ip_pool.switch_ip()
             else:
                 await shared_state.vpn_manager.connect_next()
-            return {"ok": True, "ip": shared_state.vpn_manager.current_ip, "server": shared_state.vpn_manager.current_server}
+            ip_after = shared_state.vpn_manager.current_ip
+            ok = bool(ip_after) and (ip_before is None or ip_after != ip_before)
+            return {"ok": ok, "ip": ip_after, "server": shared_state.vpn_manager.current_server}
         except Exception as e:
             return {"error": str(e)}
 
