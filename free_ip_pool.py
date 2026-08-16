@@ -87,6 +87,8 @@ class FreeIPPool:
 
         mode = self._vpn.proxy_mode
         if mode == "vpn":
+            # Track activity for opportune update timing
+            self._vpn.note_free_request()
             # Track stats for current VPN IP
             ip = self._vpn.current_ip or "unknown"
             if ip not in self._ip_stats:

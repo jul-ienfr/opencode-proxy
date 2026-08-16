@@ -84,6 +84,11 @@ ip_rotation:
   circuit_breaker_recovery: 300
   backoff_max_delay: 60
   ip_check_url: https://api.ipify.org
+  update_enabled: true
+  update_check_interval: 21600
+  update_apply_window: "03:00-05:00"
+  update_apply_idle_minutes: 15
+  update_apply_max_defer_hours: 24
 custom_routes:
   mimov25:
     match:

@@ -1026,6 +1026,23 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
         except Exception as e:
             return {"error": str(e)}
 
+    @app.post("/api/vpn/update")
+    async def update_vpn():
+        """Force-check and apply a pending gluetun image update."""
+        import shared_state
+        if not shared_state.vpn_manager:
+            return {"error": "VPN manager not initialized"}
+        try:
+            available = await shared_state.vpn_manager.check_update()
+            if not available:
+                return {"ok": False, "error": "no update available",
+                        "update": shared_state.vpn_manager.get_status()["update"]}
+            result = await shared_state.vpn_manager.apply_update()
+            result["update"] = shared_state.vpn_manager.get_status()["update"]
+            return result
+        except Exception as e:
+            return {"error": str(e)}
+
     @app.get("/api/vpn/credentials")
     async def get_vpn_credentials():
         """Check if VPN credentials exist (does not return actual values)."""

@@ -179,6 +179,23 @@ class VPNManager:
         self._server_countries = cfg.get("server_countries", "Germany")
         self._ip_check_url = cfg.get("ip_check_url", "https://api.ipify.org")
 
+        # Auto-update (gluetun image)
+        self._update_enabled = cfg.get("update_enabled", True)
+        self._update_check_interval = cfg.get("update_check_interval", 21600)
+        self._update_apply_window = cfg.get("update_apply_window", "03:00-05:00")
+        self._update_idle_minutes = cfg.get("update_apply_idle_minutes", 15)
+        self._update_max_defer_hours = cfg.get("update_apply_max_defer_hours", 24)
+        self._update_task: Optional[asyncio.Task] = None
+        self._update_available = False
+        self._update_current_digest: Optional[str] = None
+        self._update_new_digest: Optional[str] = None
+        self._update_old_image_id: Optional[str] = None
+        self._update_known_since: Optional[float] = None
+        self._update_checked_at: Optional[str] = None
+        self._update_applied_at: Optional[str] = None
+        self._update_last_error: Optional[str] = None
+        self._last_free_request_at: Optional[float] = None
+
         # Runtime state
         self._status = VPNState.DISCONNECTED
         self._error: Optional[str] = None
@@ -250,10 +267,15 @@ class VPNManager:
         """Startup: load persisted state and reconcile with container reality."""
         self.load_state()
         await self.refresh_status()
+        if self._update_enabled and not self._update_task:
+            self._update_task = asyncio.create_task(self._updater_loop())
 
     async def stop(self) -> None:
         """Shutdown: persist state only. The tunnel is left running
         (it is compose-managed and survives proxy restarts)."""
+        if self._update_task:
+            self._update_task.cancel()
+            self._update_task = None
         self.save_state()
 
     async def connect(self) -> None:
@@ -502,6 +524,11 @@ class VPNManager:
             "credentials_file": self._auth_file,
             "server_countries": self._server_countries,
             "ip_check_url": self._ip_check_url,
+            "update_enabled": self._update_enabled,
+            "update_check_interval": self._update_check_interval,
+            "update_apply_window": self._update_apply_window,
+            "update_apply_idle_minutes": self._update_idle_minutes,
+            "update_apply_max_defer_hours": self._update_max_defer_hours,
             "circuit_breaker_threshold": self._circuit_breaker._failure_threshold,
             "circuit_breaker_recovery": self._circuit_breaker._recovery_time,
             "backoff_max_delay": self._backoff._max_delay,
@@ -532,6 +559,16 @@ class VPNManager:
             self._backoff = BackoffTimer(
                 base_delay=self._switch_delay,
                 max_delay=float(updates["backoff_max_delay"]))
+        if "update_enabled" in updates:
+            self._update_enabled = bool(updates["update_enabled"])
+        if "update_check_interval" in updates:
+            self._update_check_interval = max(300, int(updates["update_check_interval"]))
+        if "update_apply_window" in updates:
+            self._update_apply_window = str(updates["update_apply_window"])
+        if "update_apply_idle_minutes" in updates:
+            self._update_idle_minutes = max(1, int(updates["update_apply_idle_minutes"]))
+        if "update_apply_max_defer_hours" in updates:
+            self._update_max_defer_hours = max(1, int(updates["update_apply_max_defer_hours"]))
         return self.get_config()
 
     def get_status(self) -> dict:
@@ -557,6 +594,19 @@ class VPNManager:
             "circuit_breaker": self._circuit_breaker.get_status(),
             "backoff_failures": self._backoff.consecutive_failures,
             "backoff_delay": self._backoff.delay,
+            "update": {
+                "enabled": self._update_enabled,
+                "check_interval": self._update_check_interval,
+                "apply_window": self._update_apply_window,
+                "idle_minutes": self._update_idle_minutes,
+                "max_defer_hours": self._update_max_defer_hours,
+                "available": self._update_available,
+                "current_digest": self._update_current_digest,
+                "new_digest": self._update_new_digest,
+                "checked_at": self._update_checked_at,
+                "applied_at": self._update_applied_at,
+                "last_error": self._update_last_error,
+            },
         }
 
     # ── Credentials ────────────────────────────────────────────
@@ -658,6 +708,193 @@ class VPNManager:
                 return False
             await asyncio.sleep(2)
         return False
+
+    # ── Auto-update (gluetun image) ────────────────────────────
+
+    _UPDATE_LOCK_PATH = os.path.join(ROOT, "logs", "vpn_update.lock")
+
+    def note_free_request(self) -> None:
+        """Record free-request activity (used to pick an opportune
+        moment for applying a pending update)."""
+        self._last_free_request_at = time.monotonic()
+
+    async def _docker_image_id(self, image: str) -> Optional[str]:
+        result = await asyncio.to_thread(
+            self._docker_run,
+            ["image", "inspect", image, "--format", "{{.Id}}"], 30)
+        if result.returncode != 0:
+            return None
+        return result.stdout.strip() or None
+
+    async def _docker_repo_digest(self, image: str) -> Optional[str]:
+        result = await asyncio.to_thread(
+            self._docker_run,
+            ["image", "inspect", image, "--format", "{{index .RepoDigests 0}}"], 30)
+        if result.returncode != 0:
+            return None
+        return result.stdout.strip() or None
+
+    async def check_update(self) -> bool:
+        """Check whether a newer gluetun image is available (non-disruptive).
+
+        `docker compose pull` downloads the new image but never touches the
+        running container. A digest change before/after means an update is
+        available; the previous image ID is kept for rollback.
+        """
+        if not self._update_enabled:
+            return False
+        try:
+            image = "qmcgaw/gluetun"
+            old_digest = await self._docker_repo_digest(image)
+            if not old_digest:
+                return False  # image not installed yet — nothing to update
+            old_id = await self._docker_image_id(image)
+            compose_file = os.path.join(ROOT, self._docker_compose_file)
+            result = await asyncio.to_thread(
+                self._docker_run,
+                ["compose", "-f", compose_file, "pull", "vpn-gluetun"], 300)
+            if result.returncode != 0:
+                raise RuntimeError(result.stderr.strip() or result.stdout.strip())
+            new_digest = await self._docker_repo_digest(image)
+            self._update_checked_at = time.strftime("%Y-%m-%dT%H:%M:%S")
+            self._update_last_error = None
+            if new_digest and new_digest != old_digest:
+                self._update_available = True
+                self._update_current_digest = old_digest
+                self._update_new_digest = new_digest
+                self._update_old_image_id = old_id
+                self._update_known_since = self._update_known_since or time.monotonic()
+                logger.info("[vpn-update] new gluetun image available: %s", new_digest[:19])
+                return True
+            self._update_available = False
+            self._update_new_digest = None
+            return False
+        except Exception as e:
+            self._update_last_error = str(e)
+            logger.warning("[vpn-update] check failed: %s", e)
+            return False
+
+    def _acquire_update_lock(self) -> bool:
+        """Cross-instance lock: refuse if another process is applying an
+        update right now. Stale locks (older than 15 min) are broken."""
+        try:
+            os.makedirs(os.path.dirname(self._UPDATE_LOCK_PATH), exist_ok=True)
+            fd = os.open(self._UPDATE_LOCK_PATH, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            try:
+                if time.time() - os.path.getmtime(self._UPDATE_LOCK_PATH) > 900:
+                    os.remove(self._UPDATE_LOCK_PATH)
+                    return self._acquire_update_lock()
+            except OSError:
+                pass
+            return False
+        os.write(fd, str(os.getpid()).encode())
+        os.close(fd)
+        return True
+
+    def _release_update_lock(self) -> None:
+        try:
+            os.remove(self._UPDATE_LOCK_PATH)
+        except OSError:
+            pass
+
+    async def apply_update(self) -> dict:
+        """Apply a pending update: recreate the container with the new image,
+        verify the tunnel, roll back on failure (best-effort)."""
+        async with self._lock:
+            if not self._update_available:
+                return {"ok": False, "error": "no update available"}
+            if not self._acquire_update_lock():
+                return {"ok": False, "error": "another instance is applying an update"}
+            try:
+                compose_file = os.path.join(ROOT, self._docker_compose_file)
+                result = await asyncio.to_thread(
+                    self._docker_run,
+                    ["compose", "-f", compose_file, "up", "-d", "--pull", "never", "vpn-gluetun"], 120)
+                if result.returncode != 0:
+                    raise RuntimeError(result.stderr.strip() or result.stdout.strip())
+                if not await self._wait_healthy(timeout=120):
+                    raise RuntimeError("tunnel not healthy after update")
+                if await self._check_auth_failed():
+                    self._auth_failed = True
+                    raise RuntimeError("AUTH_FAILED after update")
+                self._auth_failed = False
+                await self.refresh_status()
+                self._update_available = False
+                self._update_applied_at = time.strftime("%Y-%m-%dT%H:%M:%S")
+                self._update_known_since = None
+                self._update_old_image_id = None
+                self.save_state()
+                logger.info("[vpn-update] applied — container recreated with new image (IP %s)",
+                            self._current_ip)
+                return {"ok": True, "ip": self._current_ip}
+            except Exception as e:
+                self._update_last_error = str(e)
+                logger.error("[vpn-update] apply failed, rolling back: %s", e)
+                await self._rollback_update(self._update_old_image_id)
+                return {"ok": False, "error": str(e)}
+            finally:
+                self._release_update_lock()
+
+    async def _rollback_update(self, old_image_id: Optional[str]) -> None:
+        """Best-effort rollback: re-tag the previous image and recreate."""
+        if not old_image_id:
+            logger.error("[vpn-update] no previous image ID — cannot roll back")
+            return
+        try:
+            image = "qmcgaw/gluetun"
+            await asyncio.to_thread(self._docker_run, ["tag", old_image_id, image], 30)
+            compose_file = os.path.join(ROOT, self._docker_compose_file)
+            await asyncio.to_thread(
+                self._docker_run,
+                ["compose", "-f", compose_file, "up", "-d", "--pull", "never", "vpn-gluetun"], 120)
+            await self.refresh_status()
+            logger.warning("[vpn-update] rolled back to previous image %s", old_image_id[:19])
+        except Exception as e:
+            logger.error("[vpn-update] rollback failed: %s", e)
+
+    def _update_opportune(self) -> bool:
+        """Decide whether NOW is a good moment to apply a pending update.
+
+        - tunnel down           → apply immediately (no traffic at risk)
+        - nightly window (03:00-05:00 local) AND idle ≥ N min → apply
+        - known for > max_defer_hours → apply anyway
+        - otherwise             → wait for the next tick
+        """
+        if self._status != VPNState.CONNECTED:
+            return True  # tunnel down: nothing to disrupt
+        if self._update_known_since and \
+                time.monotonic() - self._update_known_since > self._update_max_defer_hours * 3600:
+            logger.info("[vpn-update] deferring >%dh — applying anyway",
+                        self._update_max_defer_hours)
+            return True
+        try:
+            start_str, end_str = self._update_apply_window.split("-")
+            start_h = int(start_str.split(":")[0])
+            end_h = int(end_str.split(":")[0])
+        except (ValueError, AttributeError):
+            start_h, end_h = 3, 5
+        in_window = start_h <= time.localtime().tm_hour < end_h
+        if not in_window:
+            return False
+        if self._last_free_request_at is None or \
+                time.monotonic() - self._last_free_request_at >= self._update_idle_minutes * 60:
+            return True
+        return False
+
+    async def _updater_loop(self) -> None:
+        """Background loop: detect available updates and apply them at the
+        most opportune moment. First iteration runs immediately, then every
+        update_check_interval seconds."""
+        while True:
+            try:
+                if await self.check_update() and self._update_opportune():
+                    await self.apply_update()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error("[vpn-update] background loop error: %s", e)
+            await asyncio.sleep(self._update_check_interval)
 
     # ── State persistence ──────────────────────────────────────
 
