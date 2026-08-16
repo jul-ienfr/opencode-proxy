@@ -134,6 +134,57 @@ def daysAgo(n: int) -> str:
     return (datetime.now() - timedelta(days=n)).strftime("%Y-%m-%d")
 
 
+def _persist_vpn_config(updates: dict):
+    """Persist VPN config changes to config.yaml (non-blocking, best-effort)."""
+    try:
+        import yaml
+        config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "config.yaml")
+        if not os.path.exists(config_path):
+            return
+
+        with open(config_path, "r", encoding="utf-8") as f:
+            config = yaml.safe_load(f) or {}
+
+        ip_rot = config.get("ip_rotation", {})
+
+        # Map update keys to config.yaml paths
+        key_map = {
+            "enabled": "enabled",
+            "proxy_mode": "proxy_mode",
+            "free_only": "free_only",
+            "quota_per_ip": "quota_per_ip",
+            "switch_delay": "switch_delay",
+            "docker_container": "docker_container",
+            "docker_compose_file": "docker_compose_file",
+            "vpn_proxy_port": "vpn_proxy_port",
+            "socks5_proxy_port": "socks5_proxy_port",
+            "credentials_file": "credentials_file",
+            "server_countries": "server_countries",
+            "ip_check_url": "ip_check_url",
+            "circuit_breaker_threshold": "circuit_breaker_threshold",
+            "circuit_breaker_recovery": "circuit_breaker_recovery",
+            "backoff_max_delay": "backoff_max_delay",
+        }
+
+        changed = False
+        for key, yaml_key in key_map.items():
+            if key in updates:
+                old_val = ip_rot.get(yaml_key)
+                new_val = updates[key]
+                if old_val != new_val:
+                    ip_rot[yaml_key] = new_val
+                    changed = True
+
+        if changed:
+            config["ip_rotation"] = ip_rot
+            with open(config_path, "w", encoding="utf-8") as f:
+                yaml.dump(config, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+            _debug(f"  [vpn] config persisted to {config_path}")
+
+    except Exception as e:
+        _debug(f"  [vpn] failed to persist config: {e}")
+
+
 def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_usage=None, token_lock=None):
     # Add Cache-Control headers for static assets (JS/CSS/HTML)
     from starlette.middleware.base import BaseHTTPMiddleware
@@ -861,8 +912,7 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
         """Get current VPN status, IP, server, and usage stats."""
         import shared_state
         if shared_state.vpn_manager:
-            # Check for existing Docker container
-            shared_state.vpn_manager._check_existing_docker()
+            await shared_state.vpn_manager.refresh_status()
             if shared_state.free_ip_pool:
                 return shared_state.free_ip_pool.get_status()
             return shared_state.vpn_manager.get_status()
@@ -878,7 +928,7 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
 
     @app.post("/api/vpn-config")
     async def update_vpn_config(request: Request):
-        """Update VPN configuration."""
+        """Update VPN configuration (hot-reload + persist to config.yaml)."""
         import shared_state
         import os
         body = await request.json()
@@ -901,15 +951,12 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
                 if shared_state.vpn_manager:
                     shared_state.vpn_manager._auth_file = cred_path
 
-        # Handle other operations (need VPN manager)
-        if shared_state.vpn_manager:
-            if "add_server" in body:
-                srv = body.pop("add_server")
-                shared_state.vpn_manager.add_server(srv["name"], srv["config"])
-            if "remove_server" in body:
-                shared_state.vpn_manager.remove_server(body.pop("remove_server"))
-            if body:
-                shared_state.vpn_manager.update_config(body)
+        # Handle config updates (need VPN manager)
+        if shared_state.vpn_manager and body:
+            await shared_state.vpn_manager.update_config(body)
+
+            # Persist changes to config.yaml
+            _persist_vpn_config(body)
 
         config = shared_state.vpn_manager.get_config() if shared_state.vpn_manager else {}
         return {"ok": True, "config": config}
@@ -929,29 +976,22 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
 
     @app.post("/api/vpn/connect")
     async def connect_vpn():
-        """Connect VPN — checks for existing container first, then tries connection."""
+        """Connect VPN — reconcile status, then connect via compose-managed gluetun."""
         import shared_state
         if not shared_state.vpn_manager:
             return {"error": "VPN manager not initialized"}
 
-        # Check if Docker container is already running
-        shared_state.vpn_manager._check_existing_docker()
+        await shared_state.vpn_manager.refresh_status()
         if shared_state.vpn_manager.status == "connected":
-            return {"ok": True, "ip": shared_state.vpn_manager.current_ip, "server": {"name": "Docker VPN"}}
+            return {"ok": True, "ip": shared_state.vpn_manager.current_ip,
+                    "server": shared_state.vpn_manager.current_server}
 
         try:
-            ip = await shared_state.vpn_manager.connect_next()
-            return {"ok": True, "ip": ip, "server": shared_state.vpn_manager.current_server}
+            await shared_state.vpn_manager.connect()
+            return {"ok": True, "ip": shared_state.vpn_manager.current_ip,
+                    "server": shared_state.vpn_manager.current_server}
         except Exception as e:
-            error_msg = str(e)
-            if "AUTH_FAILED" in error_msg or "lockout" in error_msg.lower():
-                _debug("[vpn] OpenVPN failed, switching to NordVPN app detection mode")
-                try:
-                    ip = await shared_state.vpn_manager.connect_wait()
-                    return {"ok": True, "ip": ip, "server": {"name": "NordVPN App"}}
-                except Exception as e2:
-                    return {"error": f"OpenVPN failed: {error_msg}. NordVPN app detection: {e2}"}
-            return {"error": error_msg}
+            return {"error": str(e)}
 
     @app.post("/api/vpn/disconnect")
     async def disconnect_vpn():
@@ -961,6 +1001,15 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
             return {"error": "VPN manager not initialized"}
         await shared_state.vpn_manager.disconnect()
         return {"ok": True}
+
+    @app.post("/api/vpn/health-check")
+    async def vpn_health_check():
+        """Run a health check on the current VPN connection."""
+        import shared_state
+        if not shared_state.vpn_manager:
+            return {"error": "VPN manager not initialized"}
+        result = await shared_state.vpn_manager.health_check()
+        return result
 
     @app.post("/api/vpn/next")
     async def next_vpn():
@@ -976,38 +1025,6 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
             return {"ok": True, "ip": shared_state.vpn_manager.current_ip, "server": shared_state.vpn_manager.current_server}
         except Exception as e:
             return {"error": str(e)}
-
-    @app.post("/api/vpn/upload-config")
-    async def upload_vpn_config(request: Request):
-        """Upload an OpenVPN .ovpn config file."""
-        import shared_state
-        import os
-        import uuid
-
-        form = await request.form()
-        name = form.get("name", "")
-        file = form.get("config")
-
-        if not name:
-            return {"error": "Server name required"}
-        if not file:
-            return {"error": "Config file required"}
-
-        # Save to configs directory
-        configs_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "vpn_configs")
-        os.makedirs(configs_dir, exist_ok=True)
-
-        # Save the file
-        file_path = os.path.join(configs_dir, f"{name}.ovpn")
-        content = await file.read()
-        with open(file_path, "wb") as f:
-            f.write(content)
-
-        # Add to VPN manager
-        if shared_state.vpn_manager:
-            shared_state.vpn_manager.add_server(name, file_path)
-
-        return {"ok": True, "path": file_path, "name": name}
 
     @app.get("/api/vpn/credentials")
     async def get_vpn_credentials():
@@ -1059,110 +1076,58 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
 
         return {"ok": True}
 
-    # ── SOCKS5 proxy endpoints ──
-
-    @app.get("/api/vpn/socks5")
-    async def get_socks5_proxies():
-        """Get list of SOCKS5 proxies."""
+    @app.post("/api/vpn/save-state")
+    async def save_vpn_state():
+        """Persist VPN state to disk."""
         import shared_state
         if shared_state.vpn_manager:
-            return {
-                "proxies": shared_state.vpn_manager.get_socks5_proxies(),
-                "rotate": shared_state.vpn_manager.socks5_rotate,
-            }
-        return {"proxies": [], "rotate": True}
-
-    @app.post("/api/vpn/socks5")
-    async def add_socks5_proxy(request: Request):
-        """Add a SOCKS5 proxy."""
-        import shared_state
-        body = await request.json()
-        host = body.get("host", "").strip()
-        port = int(body.get("port", 1080))
-        username = body.get("username", "").strip()
-        password = body.get("password", "").strip()
-
-        if not host:
-            return {"error": "Host required"}
-
-        if shared_state.vpn_manager:
-            shared_state.vpn_manager.add_socks5_proxy(host, port, username, password)
-            return {"ok": True, "proxies": shared_state.vpn_manager.get_socks5_proxies()}
+            shared_state.vpn_manager.save_state()
+            return {"ok": True}
         return {"error": "VPN manager not initialized"}
 
-    @app.post("/api/vpn/socks5/remove")
-    async def remove_socks5_proxy(request: Request):
-        """Remove a SOCKS5 proxy by index."""
+    @app.get("/api/vpn/export")
+    async def export_vpn_config():
+        """Export VPN configuration as JSON."""
+        import shared_state
+        import json
+        if not shared_state.vpn_manager:
+            return {"error": "VPN manager not initialized"}
+
+        config = shared_state.vpn_manager.get_config()
+        status = shared_state.vpn_manager.get_status()
+        state = {
+            "ip_history": shared_state.vpn_manager._ip_history,
+            "total_switches": shared_state.vpn_manager._total_switches,
+        }
+
+        export = {
+            "config": config,
+            "state": state,
+            "exported_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "version": "1.0",
+        }
+        return export
+
+    @app.post("/api/vpn/import")
+    async def import_vpn_config(request: Request):
+        """Import VPN configuration from JSON."""
         import shared_state
         body = await request.json()
-        index = body.get("index")
 
-        if index is None:
-            return {"error": "Index required"}
+        if "config" in body:
+            config = body["config"]
+            if shared_state.vpn_manager:
+                await shared_state.vpn_manager.update_config(config)
 
-        if shared_state.vpn_manager:
-            shared_state.vpn_manager.remove_socks5_proxy(int(index))
-            return {"ok": True, "proxies": shared_state.vpn_manager.get_socks5_proxies()}
-        return {"error": "VPN manager not initialized"}
+        if "state" in body:
+            state = body["state"]
+            if shared_state.vpn_manager:
+                if "ip_history" in state:
+                    shared_state.vpn_manager._ip_history = state["ip_history"]
+                if "total_switches" in state:
+                    shared_state.vpn_manager._total_switches = state["total_switches"]
 
-    @app.post("/api/vpn/socks5/toggle")
-    async def toggle_socks5_proxy(request: Request):
-        """Enable or disable a SOCKS5 proxy."""
-        import shared_state
-        body = await request.json()
-        index = body.get("index")
-        enabled = body.get("enabled", True)
-
-        if index is None:
-            return {"error": "Index required"}
-
-        if shared_state.vpn_manager:
-            shared_state.vpn_manager.toggle_socks5_proxy(int(index), enabled)
-            return {"ok": True, "proxies": shared_state.vpn_manager.get_socks5_proxies()}
-        return {"error": "VPN manager not initialized"}
-
-    @app.post("/api/vpn/socks5/test")
-    async def test_socks5_proxy(request: Request):
-        """Test a SOCKS5 proxy connection."""
-        import shared_state
-        body = await request.json()
-        host = body.get("host", "").strip()
-        port = int(body.get("port", 1080))
-
-        if not host:
-            return {"error": "Host required"}
-
-        if shared_state.vpn_manager:
-            result = await shared_state.vpn_manager.test_socks5_proxy(host, port)
-            return result
-        return {"error": "VPN manager not initialized"}
-
-    @app.post("/api/vpn/proxy-mode")
-    async def set_proxy_mode(request: Request):
-        """Change the proxy mode (vpn, socks5, direct)."""
-        import shared_state
-        body = await request.json()
-        mode = body.get("mode", "vpn")
-
-        if mode not in ("vpn", "socks5", "direct"):
-            return {"error": "Invalid mode. Must be vpn, socks5, or direct"}
-
-        if shared_state.vpn_manager:
-            shared_state.vpn_manager.proxy_mode = mode
-            return {"ok": True, "proxy_mode": mode}
-        return {"error": "VPN manager not initialized"}
-
-    @app.post("/api/vpn/socks5/rotate")
-    async def set_socks5_rotation(request: Request):
-        """Enable or disable SOCKS5 proxy rotation."""
-        import shared_state
-        body = await request.json()
-        rotate = body.get("rotate", True)
-
-        if shared_state.vpn_manager:
-            shared_state.vpn_manager.socks5_rotate = rotate
-            return {"ok": True, "rotate": rotate}
-        return {"error": "VPN manager not initialized"}
+        return {"ok": True}
 
     @app.get("/api/tools")
     async def get_tools(days: int = 7, all: bool = False):

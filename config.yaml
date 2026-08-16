@@ -71,44 +71,19 @@ free_model_map:
 ip_rotation:
   enabled: true
   proxy_mode: vpn
-  mode: docker
   free_only: true
-  vpn_proxy_port: 8888
-  openvpn:
-    configs_dir: vpn/configs
-    auth_file: vpn/credentials.txt
-    servers:
-    - name: de1227
-      config: vpn/configs/de1227.ovpn
-    - name: de1223
-      config: vpn/configs/de1223.ovpn
   quota_per_ip: 300
   switch_delay: 5
-  docker_image: qmcgaw/gluetun
-  docker_image_custom: ''
-  nordvpn_token: ''
-  nordvpn_technology: NordLynx
-  nordvpn_country: Germany
-  nordvpn_group: ''
-  docker_killswitch: true
-  docker_dns_over_tls: true
-  nordvpn_exe: ''
-  socks5_proxies:
-    rotate_socks5: true
-    list: []
-  use_nordvpn_api: false
-  api_cache_ttl: 900
+  docker_container: opencode-vpn
+  docker_compose_file: docker-compose.yml
+  vpn_proxy_port: 8888
+  socks5_proxy_port: 1080
+  credentials_file: vpn_configs/credentials.txt
+  server_countries: Germany
   circuit_breaker_threshold: 3
   circuit_breaker_recovery: 300
   backoff_max_delay: 60
-  watchdog_interval: 60
-  geo_filter:
-    include: []
-    exclude: []
-  rotation_rules: []
-  schedule:
-    enabled: false
-    rules: []
+  ip_check_url: https://api.ipify.org
 custom_routes:
   mimov25:
     match:

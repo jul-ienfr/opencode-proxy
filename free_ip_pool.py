@@ -2,7 +2,7 @@
 Free IP pool for rotating IP addresses on free model requests.
 
 Each VPN session gives a fresh IP = fresh free model quota.
-Uses tinyproxy (HTTP) via WSL2 or Docker for routing requests through the VPN tunnel.
+Routes free requests through the compose-managed gluetun tunnel (SOCKS5).
 """
 
 import time
@@ -18,8 +18,8 @@ logger = logging.getLogger(__name__)
 class FreeIPPool:
     """Manages IP rotation for free model requests.
 
-    Routes free model requests through a local HTTP proxy (tinyproxy)
-    that tunnels traffic via OpenVPN in WSL2 or Docker.
+    Routes free model requests through the gluetun SOCKS5 tunnel
+    (compose-managed Docker container).
     """
 
     def __init__(self, vpn_manager: VPNManager):
@@ -35,41 +35,31 @@ class FreeIPPool:
 
     @property
     def proxy_mode(self) -> str:
-        """Return the current proxy mode: vpn, socks5, or direct."""
+        """Return the current proxy mode: vpn, or direct."""
         return self._vpn.proxy_mode
 
     @property
     def proxy_url(self) -> Optional[str]:
-        """Return the proxy URL for routing free model requests.
+        """Return the SOCKS5 proxy URL when the tunnel is up.
 
-        In VPN mode: returns HTTP proxy URL (tinyproxy) when VPN is connected.
-        In SOCKS5 mode: returns socks5:// URL from the proxy rotation.
-        In direct mode: returns None (no proxy).
+        Gluetun is the only backend (compose-managed Docker): free requests
+        are routed via SOCKS5 (the HTTP proxy is not routed on Windows
+        Docker Desktop). Returns None when not connected or disabled.
         """
-        if not self._vpn.enabled:
+        if not self._vpn.enabled or self._vpn.proxy_mode != "vpn":
             return None
-
-        mode = self._vpn.proxy_mode
-        if mode == "vpn":
-            if self._vpn.status == "connected":
-                return self._vpn.proxy_url
-            return None
-        elif mode == "socks5":
-            return self._vpn.get_socks5_proxy_url()
-        else:  # direct
-            return None
+        if self._vpn.status == "connected":
+            return self._vpn.socks5_url
+        return None
 
     async def ensure_connected(self):
         """Ensure VPN is connected. Connect to first server if not."""
         if not self._vpn.enabled:
             return
-        mode = self._vpn.proxy_mode
-        if mode == "vpn":
-            if self._vpn.status != "connected":
-                await self._vpn.connect_next()
-                self._request_count = 0
-                self._session_start = time.monotonic()
-        # SOCKS5 and direct modes don't need VPN connection
+        if self._vpn.proxy_mode == "vpn" and self._vpn.status != "connected":
+            await self._vpn.connect_next()
+            self._request_count = 0
+            self._session_start = time.monotonic()
 
     async def on_request(self) -> Optional[str]:
         """Called before each free model request.
@@ -102,60 +92,59 @@ class FreeIPPool:
                 logger.info("[free-ip] approaching quota limit (%d/%d), switching IP",
                             self._request_count, self._vpn._quota_per_ip)
                 await self.switch_ip()
-        elif mode == "socks5":
-            # Track stats for current SOCKS5 proxy
-            proxy = self._vpn.get_next_socks5_proxy()
-            proxy_key = f"{proxy['host']}:{proxy['port']}" if proxy else "none"
-            if proxy_key not in self._ip_stats:
-                self._ip_stats[proxy_key] = {
-                    "requests": 0,
-                    "start": time.strftime("%Y-%m-%dT%H:%M:%S"),
-                    "server": f"SOCKS5 {proxy_key}",
-                }
-            self._ip_stats[proxy_key]["requests"] += 1
-
-            # Check quota limit for SOCKS5 too
-            if self._request_count >= self._vpn._quota_per_ip - 10:
-                logger.info("[free-ip] SOCKS5 approaching quota limit (%d/%d), switching proxy",
-                            self._request_count, self._vpn._quota_per_ip)
-                await self.switch_ip()
 
         return self.proxy_url
 
     async def on_quota_exhausted(self):
         """Called when free model returns 429 (quota exhausted)."""
-        if not self._vpn.enabled:
+        if not self._vpn.enabled or self._vpn.proxy_mode != "vpn":
             return
-
-        mode = self._vpn.proxy_mode
-        if mode == "vpn":
-            ip = self._vpn.current_ip or "unknown"
-            if ip in self._ip_stats:
-                self._ip_stats[ip]["end"] = time.strftime("%Y-%m-%dT%H:%M:%S")
-            logger.info("[free-ip] quota exhausted on IP %s, switching", ip)
-        elif mode == "socks5":
-            logger.info("[free-ip] SOCKS5 quota exhausted, switching proxy")
-        else:
-            return
-
+        ip = self._vpn.current_ip or "unknown"
+        if ip in self._ip_stats:
+            self._ip_stats[ip]["end"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+        logger.info("[free-ip] quota exhausted on IP %s, switching", ip)
         await self.switch_ip()
 
     async def switch_ip(self):
-        """Switch to the next VPN server or SOCKS5 proxy for a fresh IP."""
-        try:
-            mode = self._vpn.proxy_mode
-            if mode == "vpn":
+        """Switch to a fresh VPN IP.
+
+        Validates that the new IP is actually different from recent IPs
+        to avoid reconnecting to the same server.
+        """
+        old_ip = self._vpn.current_ip
+        recent_ips = [s.get("ip") for s in self._vpn._ip_history[-10:]]
+
+        max_attempts = 3
+        for attempt in range(max_attempts):
+            try:
                 await self._vpn.connect_next()
-            elif mode == "socks5":
-                # Round-robin is handled in get_socks5_proxy_url()
-                # Just log the switch
-                proxy = self._vpn.get_next_socks5_proxy()
-                if proxy:
-                    logger.info("[free-ip] switched to SOCKS5 proxy %s:%d", proxy["host"], proxy["port"])
-            self._request_count = 0
-            self._session_start = time.monotonic()
-        except Exception as e:
-            logger.error("[free-ip] failed to switch IP: %s", e)
+
+                new_ip = self._vpn.current_ip
+
+                # Validate IP actually changed
+                if new_ip and old_ip:
+                    if new_ip == old_ip:
+                        logger.warning("[free-ip] IP unchanged after switch (%s), attempt %d/%d",
+                                       new_ip, attempt + 1, max_attempts)
+                        if attempt < max_attempts - 1:
+                            continue
+                        else:
+                            logger.error("[free-ip] IP unchanged after %d attempts, proceeding anyway", max_attempts)
+                    elif new_ip in recent_ips:
+                        logger.warning("[free-ip] IP %s was recently used, attempt %d/%d",
+                                       new_ip, attempt + 1, max_attempts)
+                        if attempt < max_attempts - 1:
+                            continue
+
+                self._request_count = 0
+                self._session_start = time.monotonic()
+                return  # success
+
+            except Exception as e:
+                logger.error("[free-ip] failed to switch IP (attempt %d/%d): %s",
+                             attempt + 1, max_attempts, e)
+                if attempt < max_attempts - 1:
+                    await asyncio.sleep(2 ** attempt)  # brief backoff between attempts
 
     def get_status(self) -> dict:
         """Return pool status for the dashboard."""
