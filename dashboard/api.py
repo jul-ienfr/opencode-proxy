@@ -6,7 +6,9 @@ import json
 import os
 import time
 import asyncio
+import re
 import socket
+from datetime import datetime, timedelta, timezone
 from fastapi import Request, Response
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -101,10 +103,10 @@ def _build_where(from_date=None, to_date=None, status=None, model=None, original
     conditions, params = [], []
     if from_date:
         conditions.append("timestamp >= ?")
-        params.append(from_date)
+        params.append(_normalize_date_bound(from_date, end_of_day=False))
     if to_date:
         conditions.append("timestamp <= ?")
-        params.append(to_date + "T23:59:59")
+        params.append(_normalize_date_bound(to_date, end_of_day=True))
     if status == "success":
         conditions.append("success = 1")
     elif status == "error":
@@ -128,10 +130,26 @@ def _build_where(from_date=None, to_date=None, status=None, model=None, original
     return where, params
 
 
+_DATE_ONLY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _date_bound_to_utc(date_str: str, end_of_day: bool) -> str:
+    """Jour calendaire local → borne UTC+Z, via le fuseau système (DST-correct)."""
+    local_midnight = datetime.fromisoformat(date_str + "T00:00:00")  # naive = heure locale
+    local = local_midnight + timedelta(days=1) - timedelta(seconds=1) if end_of_day else local_midnight
+    return local.astimezone().astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _normalize_date_bound(value, end_of_day: bool):
+    """YYYY-MM-DD nu (sémantique locale) → borne UTC+Z ; timestamps complets passent tels quels."""
+    if isinstance(value, str) and _DATE_ONLY_RE.match(value):
+        return _date_bound_to_utc(value, end_of_day)
+    return value
+
+
 def daysAgo(n: int) -> str:
-    """Return date string for N days ago (en-CA format YYYY-MM-DD)."""
-    from datetime import datetime, timedelta
-    return (datetime.now() - timedelta(days=n)).strftime("%Y-%m-%d")
+    """Instant UTC exact à J-n (timestamp complet avec Z ; passe _build_where inchangé)."""
+    return (datetime.now(timezone.utc) - timedelta(days=n)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _persist_vpn_config(updates: dict):
@@ -818,7 +836,7 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
         Also calculates quota reset times per IP.
         """
         def _query():
-            where = "WHERE timestamp >= datetime('now', ?)"
+            where = "WHERE timestamp >= strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?)"
             params = [f"-{days} days"]
             rows = conn.execute(
                 "SELECT timestamp, paid_model, free_model, api_key, workspace_id, "
@@ -1337,7 +1355,7 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
                     with token_lock:
                         token_usage[model]["input"] = token_usage[model]["output"] = token_usage[model]["cache"] = 0
             elif before:
-                conn.execute("DELETE FROM requests WHERE timestamp < ?", (before + "T23:59:59",))
+                conn.execute("DELETE FROM requests WHERE timestamp < ?", (_normalize_date_bound(before, end_of_day=True),))
                 # Recalculate all counters from remaining rows
                 if token_usage:
                     rows = conn.execute(

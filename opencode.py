@@ -571,6 +571,15 @@ for col, default in [("protocol", "NULL"), ("is_stream", "0"), ("thinking", "NUL
 _conn.commit()
 _debug(f"  [db] SQLite connection established: {_db_path}")
 
+# [30] Canary: mixed naive/UTC timestamps break ORDER BY timestamp DESC (BINARY
+# collation) — warn the operator that scripts/migrate_timestamps_utc.py is pending.
+try:
+    _naive = _conn.execute("SELECT COUNT(*) FROM requests WHERE timestamp NOT LIKE '%Z'").fetchone()[0]
+    if _naive:
+        _log(f"  WARNING: {_naive} requests row(s) with naive timestamps (mixed local/UTC) — run scripts/migrate_timestamps_utc.py")
+except Exception:
+    pass
+
 
 # ── Free model usage tracking ──
 _conn.execute("""
@@ -642,14 +651,14 @@ def _db_cleanup_old_bodies(retention_days: int = 7, delete_after_days: int = 30)
     """
     try:
         # Phase 1: Delete old rows entirely
-        cutoff_delete = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(time.time() - delete_after_days * 86400))
+        cutoff_delete = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - delete_after_days * 86400))
         cursor = _conn.execute("DELETE FROM requests WHERE timestamp < ?", (cutoff_delete,))
         deleted = cursor.rowcount
         cursor2 = _conn.execute("DELETE FROM free_model_usage WHERE timestamp < ?", (cutoff_delete,))
         deleted2 = cursor2.rowcount
 
         # Phase 2: Nullify bodies for 7-30 day old rows
-        cutoff_null = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(time.time() - retention_days * 86400))
+        cutoff_null = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - retention_days * 86400))
         cursor3 = _conn.execute(
             "UPDATE requests SET request_body = NULL, response_body = NULL "
             "WHERE timestamp < ? AND (request_body IS NOT NULL OR response_body IS NOT NULL)",
@@ -668,6 +677,18 @@ def _db_cleanup_old_bodies(retention_days: int = 7, delete_after_days: int = 30)
         return 0
 
 
+def _normalize_timestamp_utc(timestamp: str) -> str:
+    """Naive local wall time → UTC+Z ; les valeurs déjà en Z passent inchangées."""
+    if timestamp.endswith("Z"):
+        return timestamp
+    try:
+        return (datetime.datetime.fromisoformat(timestamp)
+                .astimezone().astimezone(datetime.timezone.utc)
+                .strftime("%Y-%m-%dT%H:%M:%SZ"))
+    except ValueError:
+        return timestamp  # unparseable — store as-is rather than dropping the row
+
+
 def _db_insert_sync(req_id, timestamp, model, original_model, duration_ms,
                     tokens_input, tokens_output, tokens_cache, success, error,
                     protocol, is_stream, thinking, effort, client_ip, account_alias,
@@ -680,6 +701,9 @@ def _db_insert_sync(req_id, timestamp, model, original_model, duration_ms,
     Reduces fsync overhead under load (50 req/s → ~1 commit/s instead of 50).
     """
     global _db_pending_inserts, _db_last_commit
+    # [30] Normalize any timestamp that reaches the writer without a Z suffix:
+    # naive strings are local wall time and silently mis-order ORDER BY timestamp DESC.
+    timestamp = _normalize_timestamp_utc(timestamp)
     t0 = time.monotonic()
     # Lock the entire execute+commit block to prevent InterfaceError when
     # _db_flush or _wal_checkpoint runs concurrently on another thread.
@@ -726,7 +750,9 @@ async def _save_request(req_id, model, original_model, duration_ms,
     request_body_json = _truncate_body_for_storage(request_body) if request_body else None
     response_body_json = _truncate_body_for_storage(response_body) if response_body else None
     client_user_agent = _current_user_agent.get()
-    timestamp = time.strftime("%Y-%m-%dT%H:%M:%S")
+    # [30] UTC everywhere — Z suffix so JS Date parsing and SQLite
+    # string comparisons agree (naive strings were local wall time).
+    timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     await asyncio.to_thread(
         _db_insert_sync, req_id, timestamp, model, original_model, duration_ms,
         tokens_input, tokens_output, tokens_cache, success, error,
@@ -773,7 +799,8 @@ def _log_free_model_usage(paid_model: str, free_model: str, api_key: str,
                           workspace_id: str, status: int, tokens_in: int = 0,
                           tokens_out: int = 0, duration_ms: int = 0, ip: str = ""):
     """Log a free model request to the database for quota analysis."""
-    timestamp = time.strftime("%Y-%m-%dT%H:%M:%S")
+    timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())  # [30] UTC
+    timestamp = _normalize_timestamp_utc(timestamp)
     try:
         with _db_commit_lock:
             _conn.execute(
