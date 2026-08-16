@@ -987,8 +987,13 @@ async def lifespan(app):
     shared_state.vpn_manager = VPNManager(IP_ROTATION)
     shared_state.vpn_manager.enabled = IP_ROTATION.get("enabled", False)
     shared_state.free_ip_pool = FreeIPPool(shared_state.vpn_manager)
+    global _vpn_manager, _free_ip_pool
+    _vpn_manager = shared_state.vpn_manager
+    _free_ip_pool = shared_state.free_ip_pool
+    if _vpn_manager.enabled:
+        await _vpn_manager.start()
     _debug(f"  [lifespan] VPN manager initialized (enabled={shared_state.vpn_manager.enabled}, "
-           f"mode={shared_state.vpn_manager._mode}, servers={len(IP_ROTATION.get('openvpn', {}).get('servers', []))})")
+           f"mode={shared_state.vpn_manager._mode})")
 
     # Periodic WAL checkpoint
     async def _periodic_checkpoint():
@@ -1073,10 +1078,10 @@ async def lifespan(app):
         _debug("  [lifespan] quota fetcher task cancelled")
     await _client.aclose()
     _debug("  [lifespan] HTTP client closed")
-    # Disconnect VPN if connected
-    if _vpn_manager and _vpn_manager.status == "connected":
-        await _vpn_manager.disconnect()
-        _debug("  [lifespan] VPN disconnected")
+    # Save VPN state (container stays up — compose-managed)
+    if _vpn_manager:
+        await _vpn_manager.stop()
+        _debug("  [lifespan] VPN state saved")
     # Close quota fetcher shared client
     from dashboard.quota import _http_client as _quota_client
     if _quota_client and not _quota_client.is_closed:
@@ -1378,6 +1383,37 @@ def _openai_error(status_code: int, message: str, error_type: str = "invalid_req
     })
 
 
+# Claude Code traite 401/403 comme un échec d'authentification → il affiche sa
+# page de login/blocage. Un 401/403 upstream signifie que la clé/région du proxy
+# est bloquée — rien que l'utilisateur final puisse corriger en se reconnectant —
+# donc on normalise ces statuts en 503 avant qu'ils atteignent le client.
+_AUTH_WINDOW_CODES = {401, 403}
+
+
+def _safe_client_status(upstream_status: int) -> int:
+    """Statut à renvoyer au client pour éviter la fenêtre d'auth de Claude Code.
+
+    401/403/429 → 503, 499 → 502, sinon inchangé.
+    """
+    if upstream_status in _AUTH_WINDOW_CODES or upstream_status == 429:
+        return 503
+    if upstream_status == 499:
+        return 502
+    return upstream_status
+
+
+def _auth_window_message(status: int) -> str:
+    """Message propre pour les statuts upstream réécrits en 503."""
+    if status == 429:
+        return "All API keys exhausted (rate limited). Try again later."
+    if status == 401:
+        return "All API keys exhausted (unauthorized). Check your API keys."
+    if status == 403:
+        return ("Upstream access denied (403) — model/region may be restricted for "
+                "this key. Try again later or check key permissions.")
+    return f"Upstream error (HTTP {status}). Try again later."
+
+
 async def _forward_post(endpoint, json, headers):
     """POST with circuit breaker. Raises CircuitOpenError if circuit is open."""
     if not _cb_should_allow(endpoint):
@@ -1396,10 +1432,12 @@ async def _forward_post(endpoint, json, headers):
 
 # ── Shared helper functions for endpoint handlers ──────────────
 
-async def _do_free_request_curl_cffi(body: dict, headers: dict):
+async def _do_free_request_curl_cffi(body: dict, headers: dict, proxy_url: str | None = None):
     """Make a free model request using curl_cffi for TLS fingerprint evasion.
 
     Uses Chrome 131 TLS fingerprint and User-Agent to avoid detection.
+    When proxy_url is provided (VPN mode), routes through the tunnel so the
+    request exits with the VPN IP (fresh free quota per IP).
     Returns an httpx-like response object for compatibility.
     """
     try:
@@ -1412,7 +1450,7 @@ async def _do_free_request_curl_cffi(body: dict, headers: dict):
                    if k.lower() not in ('authorization', 'x-api-key')}
     req_headers["Content-Type"] = "application/json"
 
-    async with AsyncSession(impersonate="chrome131") as session:
+    async with AsyncSession(impersonate="chrome131", proxy=proxy_url) as session:
         resp = await session.post(
             API_BASE_FREE,
             json=body,
@@ -1421,28 +1459,6 @@ async def _do_free_request_curl_cffi(body: dict, headers: dict):
         )
         # Wrap in a compatible response object
         return _CurlCffiResponse(resp)
-
-
-async def _do_free_request_socks5(body: dict, headers: dict, proxy_url: str):
-    """Make a free model request through a SOCKS5 proxy.
-
-    Uses httpx with socks5 proxy for routing through external proxy servers.
-    Returns an httpx response object.
-    """
-    import httpx
-
-    # Convert headers to dict (remove auth for free models)
-    req_headers = {k: v for k, v in headers.items()
-                   if k.lower() not in ('authorization', 'x-api-key')}
-    req_headers["Content-Type"] = "application/json"
-
-    async with httpx.AsyncClient(proxy=proxy_url, timeout=60) as client:
-        resp = await client.post(
-            API_BASE_FREE,
-            json=body,
-            headers=req_headers,
-        )
-        return resp
 
 
 class _CurlCffiResponse:
@@ -1459,9 +1475,72 @@ class _CurlCffiResponse:
             return self._resp.content.decode("utf-8", errors="replace")
         return str(self._resp.content)
 
+    @property
+    def content(self) -> bytes:
+        return self._resp.content
+
     def json(self):
         import json
         return json.loads(self.text)
+
+
+class _CurlCffiStreamResponse:
+    """Wrapper: curl_cffi streaming response → httpx-like interface.
+
+    Exposes exactly what the streaming loops consume (status_code, headers,
+    aiter_lines, aiter_bytes, aread) so the free-VPN path can reuse them
+    unchanged. curl_cffi streams through the SOCKS5 tunnel when proxy set.
+    """
+
+    def __init__(self, resp):
+        self._resp = resp
+        self.status_code = resp.status_code
+        self.headers = dict(resp.headers)
+
+    async def aiter_lines(self):
+        async for line in self._resp.aiter_lines():
+            yield line
+
+    async def aiter_bytes(self):
+        async for chunk in self._resp.aiter_content():
+            yield chunk
+
+    async def aread(self):
+        return await self._resp.acontent()
+
+    async def aclose(self):
+        await self._resp.aclose()
+
+
+async def _open_free_stream(endpoint, body, headers, use_free: bool):
+    """Context manager: upstream stream, routed through the VPN when free.
+
+    use_free=True and VPN available → curl_cffi stream via the SOCKS5 tunnel
+    (fresh IP = fresh free quota), impersonate chrome131. Otherwise → normal
+    httpx stream. Both paths yield the same response interface.
+    """
+    if use_free and _free_ip_pool and _free_ip_pool.enabled:
+        proxy_url = await _free_ip_pool.on_request()
+        if proxy_url:
+            try:
+                from curl_cffi.requests import AsyncSession
+                req_headers = {k: v for k, v in headers.items()
+                               if k.lower() not in ('authorization', 'x-api-key')}
+                req_headers["Content-Type"] = "application/json"
+                session = AsyncSession(impersonate="chrome131", proxy=proxy_url,
+                                       timeout=(30, 600))  # connect 30 / read 600 (cf. upstream.timeout)
+                resp = await session.post(endpoint, json=body, headers=req_headers, stream=True)
+                wrapped = _CurlCffiStreamResponse(resp)
+                try:
+                    yield wrapped
+                finally:
+                    await resp.aclose()
+                    await session.close()
+                return
+            except Exception as e:
+                _debug(f"  [stream] curl_cffi proxy stream failed: {e}, falling back to direct stream")
+    async with _client.stream("POST", endpoint, json=body, headers=headers) as resp:
+        yield resp
 
 
 # Cache for public IP to avoid flooding ipify.org
@@ -1549,37 +1628,14 @@ async def _try_free_model_first(body, headers, protocol, model_id,
         proxy_mode = _vpn_manager.proxy_mode
 
     if proxy_mode == "vpn" and _free_ip_pool and _free_ip_pool.enabled:
-        # VPN mode: use curl_cffi for TLS fingerprint evasion
+        # VPN mode: use curl_cffi for TLS fingerprint evasion,
+        # routed through the VPN tunnel (SOCKS5 in docker mode) for a fresh IP
+        proxy_url = _free_ip_pool.proxy_url
         try:
-            resp = await _do_free_request_curl_cffi(free_body, free_headers)
+            resp = await _do_free_request_curl_cffi(free_body, free_headers, proxy_url)
+            resp_headers = resp.headers
         except Exception as e:
             _debug(f"  [free] curl_cffi error: {e}, falling back to httpx")
-            try:
-                resp, resp_headers = await _do_request_with_retry(
-                    API_BASE_FREE, free_body, free_headers, protocol, retry_on_429=False
-                )
-            except UpstreamError:
-                _log_free_model_usage(model_id, free_model, free_api_key,
-                                      free_workspace, 502, ip=free_ip)
-                return None
-    elif proxy_mode == "socks5" and _free_ip_pool and _free_ip_pool.enabled:
-        # SOCKS5 mode: route through external SOCKS5 proxy
-        socks5_url = _free_ip_pool.proxy_url
-        if socks5_url:
-            try:
-                resp = await _do_free_request_socks5(free_body, free_headers, socks5_url)
-            except Exception as e:
-                _debug(f"  [free] SOCKS5 request error: {e}, falling back to httpx")
-                try:
-                    resp, resp_headers = await _do_request_with_retry(
-                        API_BASE_FREE, free_body, free_headers, protocol, retry_on_429=False
-                    )
-                except UpstreamError:
-                    _log_free_model_usage(model_id, free_model, free_api_key,
-                                          free_workspace, 502, ip=free_ip)
-                    return None
-        else:
-            # No SOCKS5 proxy available, fall back to direct
             try:
                 resp, resp_headers = await _do_request_with_retry(
                     API_BASE_FREE, free_body, free_headers, protocol, retry_on_429=False
@@ -1644,7 +1700,10 @@ async def _try_free_model_first(body, headers, protocol, model_id,
 
         # If VPN rotation is enabled, switch IP on 429
         if _free_ip_pool and _free_ip_pool.enabled:
-            asyncio.create_task(_free_ip_pool.on_quota_exhausted())
+            try:
+                asyncio.create_task(_free_ip_pool.on_quota_exhausted())
+            except Exception as e:
+                _debug(f"  [free] quota-exhausted task error: {e}")
 
         return None
 
@@ -1715,6 +1774,24 @@ async def _do_request_with_retry(endpoint, body, headers, protocol, retry_on_429
             if alt:
                 _debug(f"  ⟳ 401 failover: {failed_key[:8]}… → alias={alt.get('alias', '?')}")
                 _log(f"  401 on key (invalid/revoked), retrying with alternative key")
+                headers = _get_auth_headers(protocol, entry=alt)
+                continue  # retry immediately without incrementing attempt
+
+        # Key failover on 403 — does NOT consume a retry attempt
+        # 403 = region/model blocked for the key (e.g. RegionError). Pause the
+        # key and try another account before surfacing anything to the client.
+        if retry_on_429 and resp.status_code == 403 and len(API_KEYS) > 1:
+            failed_key = _key_from_headers(headers, protocol)
+            try:
+                _err_body = resp.text[:500] if hasattr(resp, 'text') else str(resp.content[:500])
+            except Exception:
+                _err_body = "(unable to read response body)"
+            _debug(f"  [auth] 403 response body: {_err_body}")
+            _key_pauser.pause_key(failed_key, 1800, "403 Forbidden (region/model not allowed)")
+            alt = _find_alternative_key(failed_key)
+            if alt:
+                _debug(f"  ⟳ 403 failover: {failed_key[:8]}… → alias={alt.get('alias', '?')}")
+                _log(f"  403 on key, retrying with alternative key")
                 headers = _get_auth_headers(protocol, entry=alt)
                 continue  # retry immediately without incrementing attempt
 
@@ -1803,7 +1880,7 @@ def _make_stream_retry_loop(protocol):
     the caller should `continue` the outer loop.
     """
     async def _handle_429(headers, status_code, attempt, resp_headers=None):
-        if attempt == 0 and len(API_KEYS) > 1 and status_code in (429, 401, 400):
+        if attempt == 0 and len(API_KEYS) > 1 and status_code in (429, 401, 403, 400):
             failed_key = _key_from_headers(headers, protocol)
             if status_code == 429:
                 # Fetch fresh quotas and pause key until exact reset time
@@ -1811,6 +1888,9 @@ def _make_stream_retry_loop(protocol):
             elif status_code == 401:
                 # 401 = key permanently invalid/revoked → pause 24h
                 _key_pauser.pause_key(failed_key, 86400, "401 Unauthorized (key likely revoked)")
+            elif status_code == 403:
+                # 403 = region/model blocked for key → pause 30min
+                _key_pauser.pause_key(failed_key, 1800, "403 Forbidden (region/model not allowed)")
             elif status_code == 400:
                 # Check for credit/balance errors in resp_headers or skip
                 # We need to check the response body - handled in caller
@@ -3164,6 +3244,19 @@ def _elapsed_ms(start_time: float) -> int:
     return int((time.monotonic() - start_time) * 1000)
 
 
+def _extract_tool_names(data: dict) -> list:
+    """Extract tool call names from an OpenAI chat response, tolerating
+    missing choices / message / tool_calls (upstream may return null)."""
+    choices = data.get("choices") or []
+    if not choices or not isinstance(choices, list):
+        return []
+    msg = choices[0].get("message") if isinstance(choices[0], dict) else None
+    if not msg or not isinstance(msg, dict):
+        return []
+    return [tc["function"]["name"] for tc in (msg.get("tool_calls") or [])
+            if isinstance(tc, dict) and isinstance(tc.get("function"), dict)]
+
+
 # ── Shared helpers for endpoint handlers ──────────────────────────
 
 def _get_client_ip(request: Request) -> str:
@@ -3320,13 +3413,15 @@ async def messages(request: Request):
                 return JSONResponse(status_code=e.status_code, content={"error": str(e)})
             account_alias = _alias_for_key(a_headers.get("x-api-key", ""))
             if resp.status_code != 200:
-                # Convert 429/401 → 503 to avoid Claude Code auth window
+                # Normalize 429/401/403 → 503 to avoid Claude Code auth window
                 # Convert 499 → 502 (upstream disconnected, non-standard code)
-                status = 503 if resp.status_code in (429, 401) else (502 if resp.status_code == 499 else resp.status_code)
+                status = _safe_client_status(resp.status_code)
                 if resp.status_code == 429:
                     msg = "All API keys exhausted (rate limited). Try again later."
                 elif resp.status_code == 401:
                     msg = "All API keys exhausted (unauthorized). Check your API keys."
+                elif resp.status_code == 403:
+                    msg = _auth_window_message(403)
                 elif resp.status_code == 499:
                     msg = "Upstream disconnected (499). Retrying may help."
                 else:
@@ -3353,7 +3448,7 @@ async def messages(request: Request):
                                 return _anthropic_error(503, "All API keys exhausted. Check your billing.")
                         except UpstreamError as e:
                             return _anthropic_error(e.status_code, str(e))
-                if resp.status_code in (429, 401):
+                if resp.status_code in (429, 401, 403):
                     return _anthropic_error(503, msg)
                 if resp.status_code == 499:
                     return _anthropic_error(502, msg)
@@ -3418,17 +3513,17 @@ async def messages(request: Request):
                 used_tools = []  # Reset on each retry attempt
                 _debug(f"  [stream] attempt {_attempt+1}/2")
                 try:
-                    async with _client.stream("POST", endpoint, json=body, headers=headers) as resp:
+                    async with _open_free_stream(endpoint, body, headers, _using_free) as resp:
                         _debug(f"  [stream] connected status={resp.status_code}")
                         if resp.status_code != 200:
                             # Free model 429 → fall back to paid model
                             if _using_free and resp.status_code == 429:
-                                _debug(f"  [stream] free model 429 → falling back to paid {_track_model!r}")
-                                _log(f"  FREE model rate limited → falling back to paid {_track_model!r}")
                                 body = paid_body
                                 endpoint = paid_endpoint
                                 _using_free = False
                                 _track_model = model_id  # Revert tracking to paid model
+                                _debug(f"  [stream] free model 429 → falling back to paid {_track_model!r}")
+                                _log(f"  FREE model rate limited → falling back to paid {_track_model!r}")
                                 continue
                             headers, should_retry = await _handle_429(headers, resp.status_code, _attempt, resp.headers)
                             if should_retry:
@@ -3455,18 +3550,20 @@ async def messages(request: Request):
                             # Log 401 body specifically for key diagnosis
                             if resp.status_code == 401:
                                 _debug(f"  [auth] 401 response body: {err.decode('utf-8', errors='replace')[:500]}")
-                            # Convert 429/401 → 503 to avoid Claude Code auth window
-                            err_status = 503 if resp.status_code in (429, 401) else resp.status_code
+                            # Convert 429/401/403 → 503 to avoid Claude Code auth window
+                            # (statut normalisé inutile ici : HTTP déjà 200 en streaming,
+                            # seul err_msg atteint le client)
                             if resp.status_code == 429:
                                 err_msg = "All API keys exhausted (rate limited). Try again later."
-                            elif resp.status_code == 401:
-                                err_msg = "All API keys exhausted (unauthorized). Check your API keys."
+                            elif resp.status_code in (401, 403):
+                                err_msg = _auth_window_message(resp.status_code)
                             else:
                                 err_msg = f"HTTP {resp.status_code}: {err.decode('utf-8', errors='replace')[:200]}"
                             error_payload = {"type": "error", "error": {"type": "api_error",
                                            "message": err_msg}}
+                            # DB/console gardent le vrai statut upstream (resp.status_code)
                             yield await _stream_error_response(req_id, _track_model, original_model, start_time,
-                                         err_status, err, protocol, thinking_type, effort,
+                                         resp.status_code, err, protocol, thinking_type, effort,
                                          client_ip, ak, tool_names, error_payload,
                                          request_body=request_body)
                             return
@@ -3622,7 +3719,7 @@ async def messages(request: Request):
                     req_out = usage.get("completion_tokens", 0)
                     cache = _extract_cache_tokens(usage)
                     _update_token_usage(_actual_model, req_in, req_out, cache)
-                    used = [tc["function"]["name"] for tc in data.get("choices", [{}])[0].get("message", {}).get("tool_calls", [])]
+                    used = _extract_tool_names(data)
                     await _save_and_log_request(req_id, _actual_model, original_model, start_time,
                                  req_in, req_out, cache, protocol, False, thinking_type,
                                  effort, client_ip, "free (no auth)", tool_names, tools_used=used,
@@ -3678,11 +3775,9 @@ async def messages(request: Request):
                             return _anthropic_error(503, "All API keys exhausted. Check your billing.")
                     except UpstreamError as e:
                         return _anthropic_error(e.status_code, str(e))
-            # Convert 429/401 → 503 to avoid Claude Code auth window
-            if resp.status_code == 429:
-                return _anthropic_error(503, "All API keys exhausted (rate limited). Try again later.")
-            if resp.status_code == 401:
-                return _anthropic_error(503, "All API keys exhausted (unauthorized). Check your API keys.")
+            # Convert 429/401/403 → 503 to avoid Claude Code auth window
+            if resp.status_code in (429, 401, 403):
+                return _anthropic_error(503, _auth_window_message(resp.status_code))
             if resp.status_code == 499:
                 return _anthropic_error(502, "Upstream disconnected (499). Retrying may help.")
             try:
@@ -3707,8 +3802,8 @@ async def messages(request: Request):
         cache = _extract_cache_tokens(usage)
         _debug(f"  usage: in={req_in} out={req_out} cache={cache}")
         _update_token_usage(model_id, req_in, req_out, cache)
-        used = [tc["function"]["name"] for tc in data.get("choices", [{}])[0].get("message", {}).get("tool_calls", [])]
-        msg_data = data.get("choices", [{}])[0].get("message", {})
+        used = _extract_tool_names(data)
+        msg_data = ((data.get("choices") or [{}])[0] or {}).get("message") or {}
         if not (msg_data.get("reasoning_content") or msg_data.get("reasoning")) and thinking_type != "none":
             _debug(f"  [non-stream] WARNING: thinking requested (type={thinking_type}, effort={effort}) but upstream returned no reasoning_content")
         _debug(f"  [non-stream] blocks: text={bool(msg_data.get('content'))} thinking={bool(msg_data.get('reasoning_content') or msg_data.get('reasoning'))} tools={used}")
@@ -3758,7 +3853,7 @@ async def messages(request: Request):
             used_tools = []  # Reset on each retry attempt
             tool_block_idx = {}  # Reset tracking dict on each retry
             try:
-                async with _client.stream("POST", endpoint, json=oai_body, headers=hdrs) as resp:
+                async with _open_free_stream(endpoint, oai_body, hdrs, _using_free) as resp:
                     if resp.status_code != 200:
                         # Free model 429 → fall back to paid model
                         if _using_free and resp.status_code == 429:
@@ -3767,6 +3862,7 @@ async def messages(request: Request):
                             oai_body = paid_oai_body
                             endpoint = paid_endpoint
                             model_id = _paid_model_id
+                            _req_model_id = _paid_model_id  # Also revert logging model (fixes is_free_model in history)
                             _using_free = False
                             continue
                         hdrs, should_retry = await _handle_429(hdrs, resp.status_code, _attempt, resp.headers)
@@ -4174,7 +4270,7 @@ async def chat_completions(request: Request):
                             req_out = usage.get("completion_tokens", 0)
                             cache = _extract_cache_tokens(usage)
                             _update_token_usage(_actual_model, req_in, req_out, cache)
-                            used = [tc["function"]["name"] for tc in data.get("choices", [{}])[0].get("message", {}).get("tool_calls", [])]
+                            used = _extract_tool_names(data)
                             await _save_and_log_request(req_id, _actual_model, original_model, start_time,
                                          req_in, req_out, cache, protocol, False, thinking_type,
                                          effort, client_ip, "free (no auth)", tool_names, tools_used=used,
@@ -4225,6 +4321,11 @@ async def chat_completions(request: Request):
                                 return _openai_error(503, "All API keys exhausted. Check your billing.")
                         except UpstreamError as e:
                             return JSONResponse(status_code=e.status_code, content={"error": str(e)})
+                # Convert 429/401/403 → 503 to avoid Claude Code auth window
+                if resp.status_code in (429, 401, 403):
+                    return _openai_error(503, _auth_window_message(resp.status_code))
+                if resp.status_code == 499:
+                    return _openai_error(502, "Upstream disconnected (499). Retrying may help.")
                 return Response(content=resp.content, status_code=resp.status_code, media_type="application/json")
             try:
                 data = resp.json()
@@ -4238,7 +4339,7 @@ async def chat_completions(request: Request):
             cache = _extract_cache_tokens(usage)
             _debug(f"  usage: in={req_in} out={req_out} cache={cache}")
             _update_token_usage(model_id, req_in, req_out, cache)
-            used = [tc["function"]["name"] for tc in data.get("choices", [{}])[0].get("message", {}).get("tool_calls", [])]
+            used = _extract_tool_names(data)
             await _save_and_log_request(req_id, model_id, original_model, start_time,
                          req_in, req_out, cache, protocol, is_stream, thinking_type,
                          effort, client_ip, account_alias, tool_names, tools_used=used if used else None,
@@ -4280,16 +4381,16 @@ async def chat_completions(request: Request):
                 used_tools = []
                 seen_tool_indices = set()  # dedup tool calls by index
                 try:
-                    async with _client.stream("POST", endpoint, json=oai_body, headers=hdrs) as resp:
+                    async with _open_free_stream(endpoint, oai_body, hdrs, _using_free) as resp:
                         if resp.status_code != 200:
                             # Free model 429 → fall back to paid model
                             if _using_free and resp.status_code == 429:
-                                _debug(f"  [chat-stream] free model 429 → falling back to paid {_track_model!r}")
-                                _log(f"  FREE model rate limited → falling back to paid {_track_model!r}")
                                 oai_body = paid_oai_body
                                 endpoint = paid_endpoint
                                 _using_free = False
                                 _track_model = model_id  # Revert tracking to paid model
+                                _debug(f"  [chat-stream] free model 429 → falling back to paid {_track_model!r}")
+                                _log(f"  FREE model rate limited → falling back to paid {_track_model!r}")
                                 continue
                             hdrs, should_retry = await _handle_429(hdrs, resp.status_code, _attempt, resp.headers)
                             if should_retry:
@@ -4313,12 +4414,12 @@ async def chat_completions(request: Request):
                             # Log 401 body specifically for key diagnosis
                             if resp.status_code == 401:
                                 _debug(f"  [auth] 401 response body: {err.decode('utf-8', errors='replace')[:500]}")
-                            # Convert 429/401 → 503 to avoid Claude Code auth window
-                            err_status = 503 if resp.status_code in (429, 401) else resp.status_code
+                            # Convert 429/401/403 → 503 to avoid Claude Code auth window
+                            err_status = 503 if resp.status_code in (429, 401, 403) else resp.status_code
                             if resp.status_code == 429:
                                 err_msg = "All API keys exhausted (rate limited). Try again later."
-                            elif resp.status_code == 401:
-                                err_msg = "All API keys exhausted (unauthorized). Check your API keys."
+                            elif resp.status_code in (401, 403):
+                                err_msg = _auth_window_message(resp.status_code)
                             else:
                                 err_msg = f"HTTP {resp.status_code}"
                             yield b"data: " + json.dumps({"error": {"message": err_msg}}, ensure_ascii=False).encode() + b"\n\ndata: [DONE]\n\n"
@@ -4352,7 +4453,7 @@ async def chat_completions(request: Request):
                                     rc = delta.get("reasoning_content") or delta.get("reasoning")
                                     if isinstance(rc, str):
                                         stream_out += _estimate_tokens(rc)
-                                    for tc in delta.get("tool_calls", []):
+                                    for tc in (delta.get("tool_calls") or []):
                                         if isinstance(tc, dict) and "name" in tc.get("function", {}):
                                             tc_idx = tc.get("index", len(seen_tool_indices))
                                             if tc_idx not in seen_tool_indices:
@@ -4492,6 +4593,11 @@ async def chat_completions(request: Request):
                          resp.status_code, resp.text, protocol, is_stream, thinking_type,
                          effort, client_ip, account_alias, tool_names,
                          request_body=request_body, response_body={"error": resp.text[:2000]})
+            # Convert 429/401/403 → 503 to avoid Claude Code auth window
+            if resp.status_code in (429, 401, 403):
+                return _openai_error(503, _auth_window_message(resp.status_code))
+            if resp.status_code == 499:
+                return _openai_error(502, "Upstream disconnected (499). Retrying may help.")
             try:
                 err_data = resp.json()
                 err_msg = err_data.get("error", {}).get("message", resp.text[:200])
@@ -4563,16 +4669,16 @@ async def chat_completions(request: Request):
 
         for _attempt in range(yaml_get("streaming", "retry_attempts", 2)):
             try:
-                async with _client.stream("POST", endpoint, json=anthro_body, headers=hdrs) as resp:
+                async with _open_free_stream(endpoint, anthro_body, hdrs, _using_free) as resp:
                     if resp.status_code != 200:
                         # Free model 429 → fall back to paid model
                         if _using_free and resp.status_code == 429:
-                            _debug(f"  [anthro-to-oai-stream] free model 429 → falling back to paid {_track_model!r}")
-                            _log(f"  FREE model rate limited → falling back to paid {_track_model!r}")
                             anthro_body = paid_anthro_body
                             endpoint = paid_endpoint
                             _using_free = False
                             _track_model = model_id
+                            _debug(f"  [anthro-to-oai-stream] free model 429 → falling back to paid {_track_model!r}")
+                            _log(f"  FREE model rate limited → falling back to paid {_track_model!r}")
                             continue
                         hdrs, should_retry = await _handle_429(hdrs, resp.status_code, _attempt, resp.headers)
                         if should_retry:
@@ -4601,12 +4707,12 @@ async def chat_completions(request: Request):
                                      resp.status_code, str(resp.status_code), protocol, True, thinking_type,
                                      effort, client_ip, ak, tool_names,
                                      request_body=request_body)
-                        # Convert 429/401 → 503 to avoid Claude Code auth window
-                        err_status = 503 if resp.status_code in (429, 401) else resp.status_code
+                        # Convert 429/401/403 → 503 to avoid Claude Code auth window
+                        err_status = 503 if resp.status_code in (429, 401, 403) else resp.status_code
                         if resp.status_code == 429:
                             err_msg = "All API keys exhausted (rate limited). Try again later."
-                        elif resp.status_code == 401:
-                            err_msg = "All API keys exhausted (unauthorized). Check your API keys."
+                        elif resp.status_code in (401, 403):
+                            err_msg = _auth_window_message(resp.status_code)
                         else:
                             err_msg = f"HTTP {resp.status_code}"
                         yield b"data: " + json.dumps({"error": {"message": err_msg}}, ensure_ascii=False).encode() + b"\n\ndata: [DONE]\n\n"
@@ -4930,6 +5036,11 @@ async def responses(request: Request):
                                 return Response(content=json.dumps({"error": {"message": "All API keys exhausted. Check your billing."}}), status_code=503, media_type="application/json")
                         except UpstreamError as e:
                             return JSONResponse(status_code=e.status_code, content={"error": str(e)})
+                # Convert 429/401/403 → 503 to avoid Claude Code auth window
+                if resp.status_code in (429, 401, 403):
+                    return _openai_error(503, _auth_window_message(resp.status_code))
+                if resp.status_code == 499:
+                    return _openai_error(502, "Upstream disconnected (499). Retrying may help.")
                 try:
                     err_data = resp.json()
                     err_msg = err_data.get("error", {}).get("message", resp.text[:200])
@@ -5024,7 +5135,7 @@ async def responses(request: Request):
                     req_out = usage.get("completion_tokens", 0)
                     cache = _extract_cache_tokens(usage)
                     _update_token_usage(_actual_model, req_in, req_out, cache)
-                    used = [tc["function"]["name"] for tc in data.get("choices", [{}])[0].get("message", {}).get("tool_calls", [])]
+                    used = _extract_tool_names(data)
                     await _save_and_log_request(req_id, _actual_model, original_model, start_time,
                                  req_in, req_out, cache, protocol, False, thinking_type,
                                  effort, client_ip, "free (no auth)", tool_names, tools_used=used,
@@ -5064,6 +5175,11 @@ async def responses(request: Request):
                          resp.status_code, resp.text, protocol, is_stream, thinking_type,
                          effort, client_ip, account_alias, tool_names,
                          request_body=request_body, response_body={"error": resp.text[:2000]})
+            # Convert 429/401/403 → 503 to avoid Claude Code auth window
+            if resp.status_code in (429, 401, 403):
+                return _openai_error(503, _auth_window_message(resp.status_code))
+            if resp.status_code == 499:
+                return _openai_error(502, "Upstream disconnected (499). Retrying may help.")
             try:
                 err_data = resp.json()
                 err_msg = err_data.get("error", {}).get("message", resp.text[:200])
@@ -5081,7 +5197,7 @@ async def responses(request: Request):
         req_out = usage.get("completion_tokens", 0)
         cache = _extract_cache_tokens(usage)
         _update_token_usage(model_id, req_in, req_out, cache)
-        used = [tc["function"]["name"] for tc in data.get("choices", [{}])[0].get("message", {}).get("tool_calls", [])]
+        used = _extract_tool_names(data)
         await _save_and_log_request(req_id, model_id, original_model, start_time,
                      req_in, req_out, cache, protocol, is_stream, thinking_type,
                      effort, client_ip, account_alias, tool_names, tools_used=used if used else None,
@@ -5126,7 +5242,7 @@ async def responses(request: Request):
     req_out = usage.get("completion_tokens", 0)
     cache = _extract_cache_tokens(usage)
     _update_token_usage(model_id, req_in, req_out, cache)
-    used = [tc["function"]["name"] for tc in data.get("choices", [{}])[0].get("message", {}).get("tool_calls", [])]
+    used = _extract_tool_names(data)
     await _save_and_log_request(req_id, model_id, original_model, start_time,
                  req_in, req_out, cache, protocol, True, thinking_type,
                  effort, client_ip, account_alias, tool_names, tools_used=used if used else None,

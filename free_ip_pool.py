@@ -22,12 +22,15 @@ class FreeIPPool:
     (compose-managed Docker container).
     """
 
+    _CONNECT_RETRY_INTERVAL = 300  # min seconds between docker reconnect attempts when down
+
     def __init__(self, vpn_manager: VPNManager):
         self._vpn = vpn_manager
         self._request_count = 0
         self._session_start: Optional[float] = None
         self._total_free_requests = 0
         self._ip_stats: dict[str, dict] = {}
+        self._last_connect_attempt: Optional[float] = None
 
     @property
     def enabled(self) -> bool:
@@ -57,6 +60,13 @@ class FreeIPPool:
         if not self._vpn.enabled:
             return
         if self._vpn.proxy_mode == "vpn" and self._vpn.status != "connected":
+            # Cooldown: when the tunnel is down (e.g. AUTH_FAILED), a docker
+            # reconnect can take minutes. Only try again every 5 minutes;
+            # requests in between go direct immediately.
+            now = time.monotonic()
+            if self._last_connect_attempt and now - self._last_connect_attempt < self._CONNECT_RETRY_INTERVAL:
+                return
+            self._last_connect_attempt = now
             await self._vpn.connect_next()
             self._request_count = 0
             self._session_start = time.monotonic()

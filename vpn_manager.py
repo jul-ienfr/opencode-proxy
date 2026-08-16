@@ -652,6 +652,10 @@ class VPNManager:
             info = await self._docker_inspect()
             if info.get("running") and await self.get_public_ip():
                 return True
+            # Fail fast: AUTH_FAILED (rejected credentials) never recovers on
+            # its own — do not sit out the timeout, report immediately.
+            if not info or not info.get("running") or await self._check_auth_failed():
+                return False
             await asyncio.sleep(2)
         return False
 
