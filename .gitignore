@@ -45,5 +45,8 @@ ENV/
 vpn_configs/
 credentials.env
 logs/vpn_state.json
+logs/vpn_state2.json
+logs/shared_rotation.json
+logs/_dbg_free.py
 env_dump.json
 *.ovpn

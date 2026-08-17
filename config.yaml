@@ -1,6 +1,6 @@
 server:
   host: 0.0.0.0
-  port: 4000  # API + web dashboard (single port; 8082 was never bound)
+  port: 4000
   debug: false
   log_dir: logs
 upstream:
@@ -70,19 +70,35 @@ free_model_map:
 ip_rotation:
   enabled: true
   proxy_mode: vpn
-  quota_per_ip: 300
-  switch_delay: 5
+  dual_station: true
+  strict_free: false
+  quota_per_ip: 15
+  switch_delay: 1
   docker_container: opencode-vpn
   docker_compose_file: docker-compose.yml
   vpn_proxy_port: 8888
   socks5_proxy_port: 1080
+  socks5_proxy_port_2: 1081
+  vpn_proxy_port_2: 8889
+  docker_container_2: opencode-vpn-2
+  compose_service_2: vpn-gluetun-2
+  state_file_2: logs/vpn_state2.json
   credentials_file: vpn_configs/credentials.txt
-  server_countries: Germany
+  server_countries: Germany,Netherlands,France,Spain,Poland,Sweden,Denmark,Finland,Norway,Belgium,Switzerland,Austria,Portugal,Italy,Ireland,United
+    Kingdom,Czech Republic,Estonia,Latvia,Lithuania,Romania,Hungary,Greece,Slovakia,Slovenia,Croatia,Bulgaria,Luxembourg,Iceland,Cyprus,Malta
   circuit_breaker_threshold: 3
   circuit_breaker_recovery: 300
   backoff_max_delay: 60
+  bad_ttl: 60
   ip_check_url: https://api.ipify.org
+  ip_check_urls:
+  - https://api.ipify.org
+  - https://icanhazip.com
+  - https://ifconfig.me/ip
+  - https://checkip.amazonaws.com
   identity_rotation: true
+  identity_diversity: true
+  identity_max_profiles: 256
   identity_profiles:
   - impersonate: chrome131
     user_agent: null
@@ -92,6 +108,22 @@ ip_rotation:
   update_apply_window: 03:00-05:00
   update_apply_idle_minutes: 15
   update_apply_max_defer_hours: 24
+  watchdog_interval: 5
+  watchdog_backoff_base: 15
+  watchdog_backoff_max: 60
+  wait_healthy_poll: 0.5
+  status_cache_seconds: 2.0
+  connect_retry_interval: 20
+  rotation_fail_cooldown: 60
+  rotation_stagger: 2
+  recent_ip_window: 20
+  recent_ip_max_age: 1800
+  shared_rotation_file: logs/shared_rotation.json
+  server_provider: nordvpn
+  control_api_key: ''
+  country_rotation: true
+  country_offset: 14
+  docker_events: true
 custom_routes:
   mimov25:
     match:
@@ -196,3 +228,8 @@ dashboard:
   - Glob
   - WebSearch
   display_lines: 35
+traffic:
+  enabled: true
+  max_frames: 500
+  body_cap: 131072
+  max_bytes: 33554432

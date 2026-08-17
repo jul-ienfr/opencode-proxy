@@ -1,16 +1,17 @@
 """
 VPN Manager for OpenCode Proxy — gluetun / compose-managed only.
 
-The VPN tunnel is a single docker-compose service (vpn-gluetun, container
-"opencode-vpn") that survives proxy restarts. This manager NEVER creates
-or stops containers — it only:
-  - starts the service via `docker compose up -d vpn-gluetun`
-  - inspects / restarts the container
-  - scans container logs for AUTH_FAILED
-  - probes the public IP through the SOCKS5 tunnel (127.0.0.1:1080)
+The VPN tunnel is a docker-compose service (vpn-gluetun, container
+"opencode-vpn") that survives proxy restarts. Each station owns ONE
+service: station 1 = vpn-gluetun (ports 1080/8888), station 2 =
+vpn-gluetun-2 (ports 1081/8889, only when ip_rotation.dual_station is
+enabled). This manager never STOPS containers — the tunnel survives
+proxy restarts — but it DOES bring the service up at startup (and on
+auto-connect / rotation) via `docker compose up -d <compose_service>`; it
+also:
 
 proxy_mode:
-  - "vpn": free model requests are routed via socks5://127.0.0.1:1080
+  - "vpn": free model requests are routed via socks5://127.0.0.1:<port>
   - "direct": no proxy
 """
 
@@ -80,6 +81,137 @@ def _normalize_identity_profiles(profiles) -> list[dict]:
                        _DEFAULT_IDENTITY_PROFILE["impersonate"])
         result = [dict(_DEFAULT_IDENTITY_PROFILE)]
     return result
+
+
+# Curated User-Agents keyed by impersonation target. curl_cffi does not
+# expose its embedded UA strings to Python, but the httpx fallback paths
+# (opencode._apply_identity) need a coherent UA — these are derived by
+# family from the target name so every _KNOWN_IMPERSONATIONS target has a
+# matching desktop UA. The identity pool keeps user_agent=None so this map
+# (httpx paths) and the curl_cffi bundle (curl_cffi paths) stay the single
+# sources of the outgoing UA.
+def _safari_version(raw: str) -> str:
+    """Map a Safari impersonation tail (153 / 15_3 / 2601 ...) to a macOS
+    Version string."""
+    return {
+        "153": "15.3", "15_3": "15.3",
+        "155": "15.5", "15_5": "15.5",
+        "170": "17.0", "17_0": "17.0",
+        "180": "18.0", "18_0": "18.0",
+        "184": "18.4", "18_4": "18.4",
+        "260": "26.0", "2601": "26.1",
+    }.get(raw, "17.0")
+
+
+def _ua_for_target(imp: str) -> str:
+    """Deterministic desktop UA for an impersonation target (by family)."""
+    if imp.startswith("chrome"):
+        ver = imp[len("chrome"):]
+        return (f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                f"(KHTML, like Gecko) Chrome/{ver}.0.0.0 Safari/537.36")
+    if imp.startswith("edge"):
+        ver = imp[len("edge"):]
+        return (f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                f"(KHTML, like Gecko) Chrome/{ver}.0.4951.64 Safari/537.36 "
+                f"Edg/{ver}.0.1210.53")
+    if imp.startswith("firefox"):
+        ver = imp[len("firefox"):]
+        return (f"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:{ver}.0) "
+                f"Gecko/20100101 Firefox/{ver}.0")
+    if imp.startswith("safari"):
+        ver = _safari_version(imp[len("safari"):])
+        return (f"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                f"AppleWebKit/605.1.15 (KHTML, like Gecko) "
+                f"Version/{ver} Safari/605.1.15")
+    return ""
+
+
+# One entry per _KNOWN_IMPERSONATIONS target — the map can never drift
+# out of sync with the supported impersonations.
+_UA_BY_IMPERSONATE = {imp: _ua_for_target(imp) for imp in _KNOWN_IMPERSONATIONS}
+
+# Accept-Language variants for the identity pool (real-language groups
+# with realistic q-values). Chrome/edge targets combine these with two
+# sec-ch-ua brand-order permutations; firefox/safari send no client hints
+# and only vary the language.
+_LANG_VARIANTS = (
+    "fr-FR,fr;q=0.9,en;q=0.8",
+    "en-US,en;q=0.9,fr;q=0.8,fr-FR;q=0.7",
+    "de-DE,de;q=0.9,en;q=0.8",
+    "es-ES,es;q=0.9,en;q=0.8",
+    "it-IT,it;q=0.9,en;q=0.8,fr;q=0.7",
+)
+
+
+def _identity_header_variants(target: str) -> list[dict]:
+    """Per-target extra-header variants for the identity pool.
+
+    chrome/edge -> 2 sec-ch-ua brand-order permutations (same major, greased
+    brand list permuted) x 5 Accept-Language; firefox/safari -> the 5
+    Accept-Languages only (they emit no User-Agent client hints).
+    """
+    langs = [{"Accept-Language": lang} for lang in _LANG_VARIANTS]
+    if target.startswith(("chrome", "edge")):
+        major = "".join(ch for ch in target if ch.isdigit())
+        browser = "Microsoft Edge" if target.startswith("edge") else "Google Chrome"
+        grease = "99" if (major and int(major) >= 113) else "8"
+        chua = (
+            f'"Not/A)Brand";v="{grease}", "Chromium";v="{major}", "{browser}";v="{major}"',
+            f'"{browser}";v="{major}", "Chromium";v="{major}", "Not/A)Brand";v="{grease}"',
+        )
+        variants = []
+        for order in chua:
+            for lang in langs:
+                v = dict(lang)
+                v["sec-ch-ua"] = order
+                variants.append(v)
+        return variants
+    return langs
+
+
+def _headers_key(headers: dict) -> tuple:
+    """Hashable, order-insensitive key for an extra_headers dict."""
+    return tuple(sorted((str(k).lower(), str(v)) for k, v in (headers or {}).items()))
+
+
+def _build_identity_pool(profiles, diversity: bool, max_profiles: int) -> list[dict]:
+    """Expand explicit identities into a large, varied pool.
+
+    diversity=False (default, backward compatible): returns the normalized
+    explicit profiles untouched — with only a chrome131 seed the len<=1 gate
+    in current_identity pins everyone to profile[0], exactly as before.
+
+    diversity=True: returns the explicit profiles plus, for every known
+    impersonation target, a deterministic cartesian grid of per-target
+    header variants (chrome/edge x2 sec-ch-ua x5 languages, others x5
+    languages) — hundreds of distinct client fingerprints, one per IP.
+    Dedup by (impersonate, user_agent, extra_headers), deterministic order,
+    capped at max_profiles. user_agent stays None so the curl_cffi bundle
+    and the curated _UA_BY_IMPERSONATE map remain the UA sources.
+    """
+    base = _normalize_identity_profiles(profiles)
+    if not diversity:
+        return base
+    pool = list(base)
+    seen = {
+        (p["impersonate"], p["user_agent"], _headers_key(p["extra_headers"]))
+        for p in base
+    }
+    for imp in sorted(_KNOWN_IMPERSONATIONS):
+        for headers in _identity_header_variants(imp):
+            profile = {"impersonate": imp, "user_agent": None, "extra_headers": headers}
+            key = (imp, None, _headers_key(headers))
+            if key in seen:
+                continue
+            seen.add(key)
+            pool.append(profile)
+    pool.sort(key=lambda p: (p["impersonate"], p.get("user_agent") or "",
+                             str(sorted((k.lower(), v) for k, v in p["extra_headers"].items()))))
+    if len(pool) > max_profiles:
+        pool = pool[:max_profiles]
+    logger.info("[identity] pool: %d profiles (diversity=%s, cap=%d)",
+                len(pool), diversity, max_profiles)
+    return pool
 
 
 # ── State Machine ──────────────────────────────────────────────
@@ -208,6 +340,36 @@ class RotationFailed(RuntimeError):
     """
 
 
+def _sh_quote(value: str) -> str:
+    """Quote a string for POSIX sh embedded in a ``docker exec ... sh -c``
+    command. gluetun's wget needs the control key from the CONTAINER'S OWN
+    env ($VPN_CONTROL_API_KEY) — wget doesn't expand env vars in --header
+    values and docker exec doesn't propagate host env — so the JSON body is
+    interpolated by sh inside the container. Single quotes are escaped
+    defensively; the JSON is always compact ASCII."""
+    return "'" + value.replace("'", "'\"'\"'") + "'"
+
+
+# [incident 17/08] gluetun's country enum uses SPACED canonical names
+# ("United Kingdom", "Czech Republic"). NordVPN file-style names
+# ("United_Kingdom", "Czechia") are REJECTED by gluetun with a WARN
+# "values ... are not in choices" — a pin landing on one silently fails
+# the rotation. Map the known divergent spellings to gluetun's canonical
+# name so a pin can never emit an invalid country (the underscore→space +
+# title() normalization handles the rest).
+_COUNTRY_ALIASES = {
+    "Czechia": "Czech Republic",
+    "Lao Peoples Democratic Republic": "Lao People's Democratic Republic",
+}
+
+
+def _normalize_country(name: str) -> str:
+    """Canonical gluetun country name: strip, underscore→space, title-case,
+    then apply the alias map for spellings title() alone cannot fix."""
+    c = name.strip().replace("_", " ").strip().title()
+    return _COUNTRY_ALIASES.get(c, c)
+
+
 class VPNManager:
     """Manages the compose-managed gluetun VPN container.
 
@@ -218,40 +380,115 @@ class VPNManager:
     Config keys (ip_rotation section of config.yaml):
         enabled, proxy_mode, quota_per_ip, switch_delay,
         docker_container, docker_compose_file, vpn_proxy_port, socks5_proxy_port,
-        credentials_file, server_countries, circuit_breaker_threshold,
-        circuit_breaker_recovery, backoff_max_delay, ip_check_url,
+        credentials_file, server_countries, server_provider, circuit_breaker_threshold,
+        circuit_breaker_recovery, backoff_max_delay, watchdog_interval, ip_check_url,
+        ip_check_urls, control_api_key, country_rotation, country_offset,
+        wait_healthy_poll, status_cache_seconds, rotation_fail_cooldown,
         identity_rotation, identity_profiles
     """
 
-    def __init__(self, cfg: dict):
+    def __init__(self, cfg: dict, station: int = 1, shared=None):
+        """Build a VPN station manager.
+
+        ``station`` selects per-station config keys (suffix ``_2`` for
+        station 2: ``docker_container_2``, ``vpn_proxy_port_2``,
+        ``socks5_proxy_port_2``, ``compose_service_2``, ``state_file_2``) —
+        the dual-station setup runs two gluetun containers in parallel and
+        each station has its own ports/container/state file. Station 1 keeps
+        the legacy key names, so ``VPNManager(IP_ROTATION)`` is unchanged.
+
+        ``shared`` is the cross-station SharedRotationState (IP registry +
+        global identity cursor). When absent (or None) every cross-station
+        concern degrades to per-station local behavior — exact backward
+        compatibility.
+        """
+        self._shared: Optional[object] = shared
         self._config = cfg
+        self._station = station
         self._mode = "docker"  # sole mode: compose-managed gluetun (free_ip_pool compat)
         self._enabled = cfg.get("enabled", False)
         self._proxy_mode = cfg.get("proxy_mode", "vpn")  # vpn | direct
         self._quota_per_ip = cfg.get("quota_per_ip", 300)
         self._switch_delay = cfg.get("switch_delay", 5)
-        self._docker_container = cfg.get("docker_container", "opencode-vpn")
+        self._docker_container = cfg.get(
+            "docker_container_2" if station == 2 else "docker_container",
+            "opencode-vpn-2" if station == 2 else "opencode-vpn")
         self._docker_compose_file = cfg.get("docker_compose_file", "docker-compose.yml")
-        self._proxy_port = cfg.get("vpn_proxy_port", 8888)
-        self._socks5_port = cfg.get("socks5_proxy_port", 1080)
+        # The compose SERVICE name (not container name) used in `docker
+        # compose -f … up -d <service>` / `pull <service>` invocations.
+        self._compose_service = cfg.get(
+            "compose_service_2" if station == 2 else "compose_service",
+            "vpn-gluetun-2" if station == 2 else "vpn-gluetun")
+        # Per-station state file (station 2 must not clobber station 1's IP
+        # history/circuit breaker, and vice versa).
+        self._state_file = cfg.get(
+            "state_file_2" if station == 2 else "state_file",
+            os.path.join(ROOT, "logs", "vpn_state2.json" if station == 2 else "vpn_state.json"))
+        self._proxy_port = cfg.get(
+            "vpn_proxy_port_2" if station == 2 else "vpn_proxy_port", 8889 if station == 2 else 8888)
+        self._socks5_port = cfg.get(
+            "socks5_proxy_port_2" if station == 2 else "socks5_proxy_port", 1081 if station == 2 else 1080)
         self._auth_file = cfg.get(
             "credentials_file", os.path.join(ROOT, "vpn_configs", "credentials.txt"))
         self._server_countries = cfg.get("server_countries", "Germany")
+        self._server_provider = cfg.get("server_provider", "nordvpn")  # gluetun update -providers
         self._ip_check_url = cfg.get("ip_check_url", "https://api.ipify.org")
+        # IP-check fallback chain ([plan] C): ordered endpoints probed through
+        # the SAME SOCKS5 tunnel with a sticky index (the endpoint that works
+        # is kept until its first failure). Legacy direct mutations of
+        # _ip_check_url (tests) stay honored — _probe_urls() falls back to
+        # [self._ip_check_url, defaults] when ip_check_urls is absent.
+        _urls = cfg.get("ip_check_urls")
+        self._ip_check_urls = ([str(u).strip() for u in _urls if str(u).strip()]
+                               if isinstance(_urls, list) else [])
+        self._ip_check_idx = 0
+        # gluetun control server (docker exec; the key lives in the CONTAINER
+        # env as VPN_CONTROL_API_KEY — never in process args, never logged).
+        # Country rotation pins the country via PUT /v1/vpn/settings; both
+        # default OFF so existing configs/tests keep the legacy random-pool
+        # path ([plan] A).
+        self._control_api_key = str(cfg.get("control_api_key") or "").strip()
+        self._country_rotation = bool(cfg.get("country_rotation", False))
+        self._country_offset = max(0, int(cfg.get("country_offset", 0) or 0))
+        self._current_country: Optional[str] = None  # pinned country (control server)
+        self._country_pinned_at: Optional[float] = None
+        self._country_index = 0  # local cursor fallback (no shared state)
 
-        # Identity rotation (client fingerprint, advanced on IP rotation)
+        # Identity rotation (client fingerprint, advanced on IP rotation).
+        # identity_diversity (default False, backward-compatible) expands the
+        # explicit profiles into a large deterministic pool (targets x UA-map x
+        # header variants), capped at identity_max_profiles — the "one profile
+        # per IP" requirement. The base (explicit) profiles are kept separate
+        # so a config hot-reload can rebuild from the seed, not from the pool.
         self._identity_rotation_enabled = cfg.get("identity_rotation", True)
-        self._identity_profiles = _normalize_identity_profiles(cfg.get("identity_profiles"))
+        self._identity_diversity = bool(cfg.get("identity_diversity", False))
+        self._identity_max_profiles = max(1, int(cfg.get("identity_max_profiles", 256)))
+        self._identity_profiles_base = _normalize_identity_profiles(cfg.get("identity_profiles"))
+        self._identity_profiles = _build_identity_pool(
+            self._identity_profiles_base, self._identity_diversity, self._identity_max_profiles)
         self._identity_index = 0  # restored/clamped by load_state()
         self._rotation_task: Optional[asyncio.Task] = None  # single-flight rotation ([1]+[18])
 
         # Auto-update (gluetun image)
         self._update_enabled = cfg.get("update_enabled", True)
         self._update_check_interval = cfg.get("update_check_interval", 21600)
+        # Honor the configured value (config.yaml ships 7 for fast AUTH_FAILED
+        # detection); the floor only catches pathological values, it must not
+        # defeat the shipped cadence.
+        self._watchdog_interval = max(1, int(cfg.get("watchdog_interval", 60)))
+        # Poll cadence for _wait_healthy / control-server "running" wait
+        # (config ships 0.5 s — the legacy hard-coded sleep(2) is gone).
+        self._wait_healthy_poll = max(0.1, float(cfg.get("wait_healthy_poll", 2.0)))
         self._update_apply_window = cfg.get("update_apply_window", "03:00-05:00")
         self._update_idle_minutes = cfg.get("update_apply_idle_minutes", 15)
         self._update_max_defer_hours = cfg.get("update_apply_max_defer_hours", 24)
         self._update_task: Optional[asyncio.Task] = None
+        self._watchdog_task: Optional[asyncio.Task] = None
+        # Docker-events wake-up for the watchdog ([plan] C): created in
+        # start() — inside the running loop — so a container die/restart is
+        # acted on immediately instead of at the next interval.
+        self._watchdog_event: Optional[asyncio.Event] = None
+        self._startup_connect_task: Optional[asyncio.Task] = None
         self._update_available = False
         self._update_current_digest: Optional[str] = None
         self._update_new_digest: Optional[str] = None
@@ -269,20 +506,25 @@ class VPNManager:
         self._current_server: Optional[dict] = None
         self._connected_at: Optional[float] = None
         self._auth_failed = False
+        self._server_issue = False  # TLS negotiation failure (stale/crashed server)
         self._total_switches = 0
         self._ip_history: list[dict] = []
         self._lock = asyncio.Lock()
         # Fail-fast rotation cooldown (CRITIC(6)): after a total rotation
-        # failure, refuse new rotations for 300 s — covers every rotation
-        # path (ensure_connected, switch_ip, on_quota_exhausted, manual)
-        # instead of the old per-caller timer in free_ip_pool only.
-        self._ROTATION_FAIL_COOLDOWN = 300
+        # failure, refuse new rotations for rotation_fail_cooldown
+        # (default 300 s, config ships 60) — covers every rotation path
+        # (ensure_connected, switch_ip, on_quota_exhausted, manual) instead
+        # of the old per-caller timer in free_ip_pool only.
+        self._ROTATION_FAIL_COOLDOWN = max(5.0, float(cfg.get("rotation_fail_cooldown", 300)))
         self._last_rotation_failed_at: Optional[float] = None
+        # Last rotation failure detail (G7): exposed via get_status — a dead
+        # rotation must be visible in the dashboard/debug.log, not silent.
+        self._last_rotation_error: Optional[str] = None
         # [37] Dashboard cache: /api/vpn-status polls every 10 s and each
         # full refresh costs 2 docker subprocess calls + a tunnel HTTP probe.
         # Within _STATUS_CACHE_SECONDS of a completed refresh, refresh_status
         # returns the live in-memory state instead of re-probing docker.
-        self._STATUS_CACHE_SECONDS = 5.0
+        self._STATUS_CACHE_SECONDS = max(0.5, float(cfg.get("status_cache_seconds", 5.0)))
         self._last_status_refresh_at: Optional[float] = None
         # Free streams currently open (updated by opencode.py via
         # note_free_stream_start/end) — auto-update must not interrupt them ([21]).
@@ -297,8 +539,21 @@ class VPNManager:
             base_delay=cfg.get("switch_delay", 5),
             max_delay=cfg.get("backoff_max_delay", 60),
         )
+        # Auth watchdog backoff (AUTH_FAILED/TLS auto-restart): failed restarts
+        # space out base→…→max so the daemon is not hammered while a failure
+        # persists. Config keys watchdog_backoff_base/max (defaults 30/300 —
+        # legacy behavior); config.yaml ships 15/60 so recovery probes come
+        # back every ~15 s instead of every 60 s.
+        _wbase = max(1.0, float(cfg.get("watchdog_backoff_base", 30.0)))
+        _wmax = max(_wbase, float(cfg.get("watchdog_backoff_max", 300.0)))
+        self._watchdog_backoff = BackoffTimer(base_delay=_wbase, max_delay=_wmax)
+        self._watchdog_escalated_at: Optional[float] = None  # escalation re-arm: 30 min
 
         self.load_state()
+        if self._shared is not None:
+            # Make the shared identity cursor aware of this station's live
+            # index at boot so next_identity immediately avoids a collision.
+            self._shared.register_station(self._station, self._identity_index)
 
     # ── Public properties ──────────────────────────────────────
 
@@ -309,6 +564,15 @@ class VPNManager:
     @enabled.setter
     def enabled(self, value: bool):
         self._enabled = bool(value)
+        # Watchdog self-heal: start() is only called at boot when enabled,
+        # and /api/vpn/toggle only flips this flag — spawn the watchdog loop
+        # here so enabling mid-session activates it too. All call sites run
+        # inside the event loop; tolerate otherwise (start() creates it).
+        if self._enabled and (not self._watchdog_task or self._watchdog_task.done()):
+            try:
+                self._watchdog_task = asyncio.create_task(self._watchdog_loop())
+            except RuntimeError:
+                pass  # constructed outside a running loop — start() creates the task
 
     @property
     def proxy_mode(self) -> str:
@@ -345,6 +609,19 @@ class VPNManager:
         return self._identity_profiles[self._identity_index % len(self._identity_profiles)]
 
     @property
+    def _live_identity(self) -> dict:
+        """Identity the proxy will serve once connected.
+
+        Index-based and NOT gated on ``_status == CONNECTED`` on purpose —
+        during a transition (connect/rotation) the index has already
+        advanced but `current_identity` would still return profile[0],
+        so history/journal entries must read THIS to carry the NEW face.
+        """
+        if not self._identity_rotation_enabled or self._proxy_mode != "vpn":
+            return self._identity_profiles[0]
+        return self._identity_profiles[self._identity_index % len(self._identity_profiles)]
+
+    @property
     def current_server(self) -> Optional[dict]:
         return self._current_server
 
@@ -352,22 +629,33 @@ class VPNManager:
     def proxy_url(self) -> str:
         """HTTP proxy URL (gluetun HTTP proxy on 8888).
 
-        VPN_PROXY_URL overrides the host:port: inside the compose
-        deployment the loopback ports are unreachable from the proxy
-        container — docker-compose.yml points it at the internal
-        network instead ([13]).
+        Env override resolution: ``VPN_PROXY_URL_{station}`` first
+        (per-station, e.g. the compose-internal URL of station 2), then
+        ``VPN_PROXY_URL`` for station 1 only (legacy [13]: inside the
+        compose deployment the loopback ports are unreachable from the
+        proxy container — docker-compose.yml points it at the internal
+        network instead), then the localhost port.
         """
-        return os.environ.get("VPN_PROXY_URL") or f"http://127.0.0.1:{self._proxy_port}"
+        env_key = f"VPN_PROXY_URL_{self._station}" if self._station > 1 else "VPN_PROXY_URL"
+        value = os.environ.get(env_key)
+        if not value and self._station == 1:
+            value = os.environ.get("VPN_PROXY_URL")
+        return value or f"http://127.0.0.1:{self._proxy_port}"
 
     @property
     def socks5_url(self) -> str:
         """SOCKS5 proxy URL (gluetun SOCKS5 on 1080 — the reliable path on
         Windows Docker Desktop, where the HTTP proxy is not routed).
 
-        VPN_SOCKS5_URL overrides the host:port for the same reason as
-        proxy_url ([13]).
+        Env override resolution: ``VPN_SOCKS5_URL_{station}`` first
+        (per-station), then ``VPN_SOCKS5_URL`` for station 1 only (legacy
+        [13]), then the localhost port.
         """
-        return os.environ.get("VPN_SOCKS5_URL") or f"socks5://127.0.0.1:{self._socks5_port}"
+        env_key = f"VPN_SOCKS5_URL_{self._station}" if self._station > 1 else "VPN_SOCKS5_URL"
+        value = os.environ.get(env_key)
+        if not value and self._station == 1:
+            value = os.environ.get("VPN_SOCKS5_URL")
+        return value or f"socks5://127.0.0.1:{self._socks5_port}"
 
     def _compose_file_path(self) -> str:
         """Compose file path for `docker compose` invocations.
@@ -384,15 +672,60 @@ class VPNManager:
     # ── Lifecycle ──────────────────────────────────────────────
 
     async def start(self) -> None:
-        """Startup: load persisted state and reconcile with container reality."""
+        """Startup: load persisted state, reconcile with container reality,
+        and bring the tunnel up automatically when it is expected to be up.
+
+        ``refresh_status()`` only inspects the container — on a fresh boot or
+        a Docker daemon restart the container is absent and the status stays
+        disconnected. Nothing else issues ``docker compose up -d`` at boot
+        (the old lazy path waited for the first free request). So, when the
+        VPN is enabled, run ``connect()`` (compose up + wait healthy + IP
+        probe) unless the container is already connected. Fail-soft: if
+        docker is down or the compose file is missing, log a warning and
+        continue — the server still starts, and recovery happens via the
+        watchdog / lazy ``ensure_connected`` on the first free request, or
+        the manual dashboard button. A single startup failure neither opens
+        the circuit breaker (threshold 3) nor arms ``connect_next``'s
+        fail-fast cooldown (``_last_rotation_failed_at`` is only set by
+        ``connect_next``), so a later retry is not gated.
+        """
         self.load_state()
+        if self._watchdog_event is None:
+            self._watchdog_event = asyncio.Event()
         await self.refresh_status()
+        if (self._enabled and self._proxy_mode == "vpn"
+                and self._status != VPNState.CONNECTED):
+            # Startup must NOT block the HTTP server: compose up +
+            # wait_healthy (≤120s) + up to 3 _finalize_ip rotation rounds can
+            # take minutes. Connect in a background task — the watchdog and
+            # the lazy ensure_connected on the first free request overlap it
+            # safely (connect is single-flight under self._lock).
+            self._startup_connect_task = asyncio.create_task(self._startup_connect())
+        if not self._watchdog_task or self._watchdog_task.done():
+            self._watchdog_task = asyncio.create_task(self._watchdog_loop())
         if self._update_enabled and not self._update_task:
             self._update_task = asyncio.create_task(self._updater_loop())
+
+    async def _startup_connect(self) -> None:
+        """Background boot connect (see start()). Failure is recorded by
+        connect() itself (ERROR status, circuit/backoff) — the server stays
+        up and the watchdog / lazy ensure_connected retries."""
+        try:
+            await self.connect()
+        except Exception as e:
+            logger.warning(
+                "[vpn] startup connect failed (docker compose up) — "
+                "retried on first free request / manual connect: %s", e)
 
     async def stop(self) -> None:
         """Shutdown: persist state only. The tunnel is left running
         (it is compose-managed and survives proxy restarts)."""
+        if self._startup_connect_task:
+            self._startup_connect_task.cancel()
+            self._startup_connect_task = None
+        if self._watchdog_task:
+            self._watchdog_task.cancel()
+            self._watchdog_task = None
         if self._update_task:
             self._update_task.cancel()
             self._update_task = None
@@ -405,7 +738,7 @@ class VPNManager:
                 return
             if not VPNState.can_transition(self._status, VPNState.CONNECTING):
                 raise RuntimeError(f"Cannot transition from {self._status} to connecting")
-            self._status = VPNState.CONNECTING
+            self._set_status(VPNState.CONNECTING)
             self._error = None
             try:
                 await self._compose_up()
@@ -417,26 +750,43 @@ class VPNManager:
                     self._current_ip = None  # stale IP must not be served ([5])
                     raise RuntimeError("AUTH_FAILED - NordVPN service credentials rejected")
                 self._auth_failed = False
-                self._current_ip = await self.get_public_ip()
-                if not self._current_ip:
-                    raise RuntimeError("could not determine public IP through tunnel")
+                # Boot with country rotation: pin the next country via the
+                # control server — the SAME machine as rotation ([plan] A).
+                # On failure the tunnel is already healthy and _finalize_ip
+                # validates whatever country gluetun picked; the first
+                # rotation re-pins.
+                await self._pin_country_for_rotation()
+                # Validate + commit a fresh IP (never recent on either
+                # station): boot with containers still up forces a rotation
+                # here, so the very first IP is recorded with a NEW identity
+                # ([plan] C.1 — the old code never journalized the boot IP).
+                # allow_stale=True arms the last-attempt acceptance inside
+                # _finalize_ip: after two full container recreations a still-
+                # recent IP is accepted rather than failing boot outright —
+                # the safety valve that stops a constrained boot from
+                # looping forever (the watchdog/update paths instead escalate
+                # or roll back on False, so they must stay strict).
+                if not await self._finalize_ip(allow_stale=True):
+                    raise RuntimeError("could not finalize a fresh IP through tunnel")
                 self._connected_at = time.monotonic()
-                self._status = VPNState.CONNECTED
+                self._set_status(VPNState.CONNECTED)
                 self._current_server = {
-                    "name": self._docker_container, "country": self._server_countries}
+                    "name": self._docker_container,
+                    "country": self._current_country or self._server_countries}
                 self._circuit_breaker.record_success(self._docker_container)
                 self._backoff.record_success()
                 self._last_rotation_failed_at = None  # tunnel is up: clear cooldown
+                self._last_rotation_error = None
                 self.save_state()
                 logger.info("[vpn] connected — IP %s", self._current_ip)
             except asyncio.CancelledError:
                 # Client disconnect mid-connect must not leave the state
                 # stuck in CONNECTING ([17]).
-                self._status = VPNState.ERROR
+                self._set_status(VPNState.ERROR)
                 self._error = "connect cancelled"
                 raise
             except Exception as e:
-                self._status = VPNState.ERROR
+                self._set_status(VPNState.ERROR)
                 self._error = str(e)
                 self._circuit_breaker.record_failure(self._docker_container)
                 self._backoff.record_failure()
@@ -499,22 +849,32 @@ class VPNManager:
                 raise RuntimeError(f"Cannot transition from {self._status} to connecting")
 
             old_ip = self._current_ip
-            recent_ips = [s.get("ip") for s in self._ip_history[-10:]]
             last_error: Optional[Exception] = None
 
             for attempt in range(3):
-                self._status = VPNState.CONNECTING
+                self._set_status(VPNState.CONNECTING)
                 self._error = None
                 try:
-                    await self._ensure_container()
-                    started_at = await self._wait_healthy(timeout=120)
-                    if started_at is None:
-                        raise RuntimeError("gluetun not healthy after restart")
-                    if await self._check_auth_failed(started_at):
-                        self._auth_failed = True
-                        self._current_ip = None  # stale IP must not be served ([5])
-                        raise RuntimeError("AUTH_FAILED after restart")
-                    self._auth_failed = False
+                    # Country rotation first: the control-server pin IS the
+                    # reconnect (PUT settings -> stop+start) and the cursor
+                    # always advances, so consecutive pins never repeat a
+                    # country. When the pin is unavailable or fails, fall
+                    # through to the legacy container-restart branch.
+                    pinned = await self._pin_country_for_rotation()
+                    if pinned is None:
+                        await self._ensure_container()
+                        started_at = await self._wait_healthy(timeout=120)
+                        if started_at is None:
+                            raise RuntimeError("gluetun not healthy after restart")
+                        if await self._check_auth_failed(started_at):
+                            self._auth_failed = True
+                            self._current_ip = None  # stale IP must not be served ([5])
+                            raise RuntimeError("AUTH_FAILED after restart")
+                        self._auth_failed = False
+                    else:
+                        # The pin polled status:running inside the control
+                        # server — the tunnel is up; no container action.
+                        self._auth_failed = False
 
                     # Let the new tunnel stabilize before probing the IP
                     await asyncio.sleep(self._switch_delay)
@@ -524,30 +884,33 @@ class VPNManager:
                         raise RuntimeError("could not determine public IP")
                     if old_ip and new_ip == old_ip:
                         raise RuntimeError(f"IP unchanged after restart ({new_ip})")
-                    if new_ip in recent_ips and attempt < 2:
+                    if self._ip_recent(new_ip) and attempt < 2:
                         raise RuntimeError(f"IP {new_ip} recently used")
 
-                    # Success
+                    # Success — advance the identity BEFORE journalizing so
+                    # the history entry carries the NEW face ([plan] C.2 —
+                    # the old order logged the pre-advance identity).
                     self._current_ip = new_ip
                     self._current_server = {
-                        "name": self._docker_container, "country": self._server_countries}
+                        "name": self._docker_container,
+                        "country": self._current_country or self._server_countries}
                     self._connected_at = time.monotonic()
-                    self._status = VPNState.CONNECTED
+                    self._set_status(VPNState.CONNECTED)
                     self._total_switches += 1
+                    self._record_ip_change(new_ip)
+                    self._advance_identity()
                     self._ip_history.append({
                         "ip": new_ip,
                         "server": self._docker_container,
                         "time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                        "identity": self._live_identity.get("impersonate") or "",
+                        "identity_index": self._identity_index,
                     })
                     self._ip_history = self._ip_history[-100:]
                     self._circuit_breaker.record_success(self._docker_container)
                     self._backoff.record_success()
-                    # Advance the client identity in sync with the IP rotation
-                    if (self._identity_rotation_enabled and self._proxy_mode == "vpn"
-                            and len(self._identity_profiles) > 1):
-                        self._identity_index = (
-                            self._identity_index + 1) % len(self._identity_profiles)
                     self._last_rotation_failed_at = None  # success: clear cooldown
+                    self._last_rotation_error = None
                     self.save_state()
                     logger.info("[vpn] rotated → IP %s (switch #%d)", new_ip, self._total_switches)
                     return new_ip
@@ -555,7 +918,7 @@ class VPNManager:
                 except asyncio.CancelledError:
                     # Client disconnect mid-rotation must not leave the
                     # state stuck in CONNECTING ([17]).
-                    self._status = VPNState.ERROR
+                    self._set_status(VPNState.ERROR)
                     self._error = "rotation cancelled by client disconnect"
                     raise
                 except Exception as e:
@@ -566,13 +929,14 @@ class VPNManager:
                     if attempt < 2:
                         await asyncio.sleep(self._backoff.delay)
 
-            self._status = VPNState.ERROR
+            self._set_status(VPNState.ERROR)
             self._error = f"IP rotation failed after 3 attempts (last: {last_error})"
             logger.error("[vpn] %s", self._error)
             # CRITIC(5): a failed rotation is a failure, not a silent None —
             # raise so callers can react honestly. Also arm the fail-fast
             # cooldown (CRITIC(6)) so we don't hammer a dead tunnel.
             self._last_rotation_failed_at = time.monotonic()
+            self._last_rotation_error = f"{type(last_error).__name__}: {last_error}"
             raise RotationFailed(self._error)
 
     async def connect_wait(self, timeout: float = 120.0) -> bool:
@@ -586,12 +950,13 @@ class VPNManager:
             if ip:
                 self._current_ip = ip
                 self._connected_at = time.monotonic()
-                self._status = VPNState.CONNECTED
+                self._set_status(VPNState.CONNECTED)
                 self._current_server = {
-                    "name": self._docker_container, "country": self._server_countries}
+                    "name": self._docker_container,
+                    "country": self._current_country or self._server_countries}
                 return True
             await asyncio.sleep(3)
-        self._status = VPNState.ERROR
+        self._set_status(VPNState.ERROR)
         self._error = f"Timeout waiting for VPN connection ({int(timeout)}s)"
         logger.error("[vpn] %s", self._error)
         return False
@@ -602,12 +967,52 @@ class VPNManager:
         async with self._lock:
             if self._status == VPNState.DISCONNECTED:
                 return
-            self._status = VPNState.DISCONNECTING
+            self._set_status(VPNState.DISCONNECTING)
             self._current_ip = None
             self._connected_at = None
-            self._status = VPNState.DISCONNECTED
+            self._set_status(VPNState.DISCONNECTED)
             self.save_state()
             logger.info("[vpn] disconnected (tunnel left running, compose-managed)")
+
+    # ── State transitions + events ─────────────────────────────
+
+    def _set_status(self, status) -> None:
+        """Transition to ``status``, publishing a vpn_event on change
+        (dashboard SSE). No-op when the status is unchanged — only REAL
+        transitions surface, so kill/restart bursts coalesce naturally."""
+        if status == self._status:
+            return
+        self._status = status
+        self._publish_vpn_event()
+
+    def _publish_vpn_event(self) -> None:
+        """Broadcast the full status snapshot to SSE subscribers. Fail-open:
+        dashboard module import or publish errors must never crash a VPN
+        state transition."""
+        try:
+            from dashboard.events import get_event_manager
+            get_event_manager().publish("vpn_event", self.get_status())
+        except Exception as e:
+            logger.debug("[vpn] vpn_event publish skipped: %s", e)
+
+    def _on_container_event(self, event: dict) -> None:
+        """Handle a docker event for THIS station's container (loop context).
+
+        Every status change wakes the watchdog so recovery starts
+        immediately instead of on the next interval tick. A die/stop/kill
+        of a CONNECTED container flips the state to ERROR right away --
+        guarded so an in-flight rotation (CONNECTING) keeps its own
+        outcome instead of being corrupted by the event.
+        """
+        try:
+            if self._watchdog_event is not None:
+                self._watchdog_event.set()  # not awaited -- simply wake the loop
+            status = event.get("status")
+            if status in ("die", "stop", "kill") and self._status == VPNState.CONNECTED:
+                self._set_status(VPNState.ERROR)
+                self._error = f"container event {status} -- VPN down"
+        except Exception as e:
+            logger.debug("[vpn] container event handling failed: %s", e)
 
     # ── Status & health ────────────────────────────────────────
 
@@ -635,35 +1040,63 @@ class VPNManager:
         if not info:
             if self._status != VPNState.DISCONNECTED:
                 logger.warning("[vpn] container %s not found", self._docker_container)
-            self._status = VPNState.DISCONNECTED
+            self._set_status(VPNState.DISCONNECTED)
             self._current_ip = None
             self._error = None
             return self.get_status()
 
         if not info.get("running"):
-            self._status = VPNState.ERROR
+            self._set_status(VPNState.ERROR)
             self._error = "container not running"
             return self.get_status()
 
-        if await self._check_auth_failed(info.get("started_at", "")):
-            self._auth_failed = True
-            self._status = VPNState.ERROR
-            self._error = "AUTH_FAILED - NordVPN service credentials rejected"
+        auth_failed = await self._check_auth_failed(info.get("started_at", ""))
+        server_issue = await self._check_server_issue(info.get("started_at", ""))
+        if auth_failed or server_issue:
+            self._auth_failed = auth_failed
+            self._server_issue = server_issue
+            self._set_status(VPNState.ERROR)
+            self._error = ("AUTH_FAILED - NordVPN service credentials rejected" if auth_failed
+                           else "VPN server unreachable - TLS negotiation failed (stale server list?)")
             self._current_ip = None  # stale IP must not be served ([5])
             logger.error("[vpn] %s", self._error)
             return self.get_status()
         self._auth_failed = False
+        self._server_issue = False
+
+        # Control server first: 2 short docker-exec calls, self-reported
+        # truth from gluetun itself — no egress needed, answers even when
+        # the tunnel is half-dead. Country comes from OUR pinned state (the
+        # control API discloses credentials via GET /v1/vpn/settings — we
+        # never call it). SOCKS5 probe remains the fallback.
+        if self._control_api_key:
+            if await self._control_status():
+                ctl_ip = await self._control_public_ip()
+                if ctl_ip:
+                    self._current_ip = ctl_ip
+                    self._connected_at = time.monotonic()
+                    self._set_status(VPNState.CONNECTED)
+                    self._error = None
+                    self._current_server = {
+                        "name": self._docker_container,
+                        "country": self._current_country or self._server_countries}
+                    return self.get_status()
+            else:
+                self._set_status(VPNState.ERROR)
+                self._error = "gluetun control server reports VPN stopped"
+                return self.get_status()
 
         ip = await self.get_public_ip()
         if ip:
             self._current_ip = ip
             self._connected_at = time.monotonic()
-            self._status = VPNState.CONNECTED
+            self._set_status(VPNState.CONNECTED)
             self._error = None
             self._current_server = {
-                "name": self._docker_container, "country": self._server_countries}
+                "name": self._docker_container,
+                "country": self._current_country or self._server_countries}
         else:
-            self._status = VPNState.ERROR
+            self._set_status(VPNState.ERROR)
             self._error = "container running but tunnel not answering"
         return self.get_status()
 
@@ -683,14 +1116,33 @@ class VPNManager:
             result["latency_ms"] = elapsed_ms
             if new_ip:
                 result["ok"] = True
-                if new_ip != self._current_ip:
-                    result["ip_changed"] = True
-                    logger.warning("[vpn] health check: IP changed %s → %s",
-                                   self._current_ip, new_ip)
-                    # Network probe above stays outside the lock; only the
-                    # state mutation is guarded ([23]).
-                    async with self._lock:
+                # Network probe above stays outside the lock; only the state
+                # mutation is guarded ([23]). The ip_changed COMPARISON is
+                # made under the same lock: an unlocked read could observe the
+                # old IP, then a concurrent rotation (single-flight ... next)
+                # advances the identity while we wait for the lock, and we'd
+                # advance it a SECOND time for the same IP (finding j).
+                async with self._lock:
+                    if new_ip != self._current_ip:
+                        result["ip_changed"] = True
+                        logger.warning("[vpn] health check: IP changed %s → %s",
+                                       self._current_ip, new_ip)
                         self._current_ip = new_ip
+                        # The tunnel re-picked an IP outside a rotation — keep
+                        # the shared registry and identity in sync so the next
+                        # rotation never re-enters it and the history shows the
+                        # new face ([plan] C.5).
+                        self._record_ip_change(new_ip)
+                        self._advance_identity()
+                        self._ip_history.append({
+                            "ip": new_ip,
+                            "server": self._docker_container,
+                            "time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                            "identity": self._live_identity.get("impersonate") or "",
+                            "identity_index": self._identity_index,
+                        })
+                        self._ip_history = self._ip_history[-100:]
+                        self.save_state()
             else:
                 result["error"] = "Could not determine IP"
         except Exception as e:
@@ -701,22 +1153,158 @@ class VPNManager:
     async def get_public_ip(self) -> Optional[str]:
         """Query the public IP through the SOCKS5 tunnel (127.0.0.1:1080).
 
-        Returns None on any failure — never "unknown" as a success value.
+        Tries the ordered ``ip_check_urls`` chain (``ip_check_url`` stays
+        the legacy alias — entry 1 when no chain is configured), every
+        endpoint through the SAME tunnel: resolving outside it would
+        falsify rotation validation. The last working endpoint is sticky
+        (no 4-probe sweep on every call); a failed endpoint moves the
+        index on. Returns None only when every endpoint failed — never
+        "unknown" as a success value.
         """
+        urls = self._ip_check_urls or [self._ip_check_url]
+        for i in range(len(urls)):
+            url = urls[(self._ip_check_idx + i) % len(urls)]
+            try:
+                import httpx
+                async with httpx.AsyncClient(timeout=5, proxy=self.socks5_url) as client:
+                    resp = await client.get(url)
+                    ip = resp.text.strip()
+                if ip:
+                    # Sticky: remember the working endpoint (i==0 keeps it).
+                    self._ip_check_idx = (self._ip_check_idx + i) % len(urls)
+                    return ip
+            except Exception:
+                continue
+        self._ip_check_idx = 0  # full sweep failed — restart at the top next call
+        logger.error("[vpn] public IP probe failed on all %d endpoints via SOCKS5",
+                     len(urls))
+        return None
+
+    # ── IP freshness + identity advance (cross-station) ─────────
+
+    def _ip_recent(self, ip: str) -> bool:
+        """True when ``ip`` was used recently by EITHER station.
+
+        Shared registry when present (cross-station anti-reuse); else the
+        per-station history tail — exact backward-compatible local behavior.
+        """
+        if not ip:
+            return False
+        if self._shared is not None:
+            try:
+                return self._shared.is_recent(ip)
+            except Exception:
+                pass
+        return ip in [s.get("ip") for s in self._ip_history[-10:]]
+
+    def _record_ip_change(self, ip: str) -> None:
+        """Register ``ip`` as now-active for this station (shared registry)."""
+        if self._shared is None:
+            return
         try:
-            import httpx
-            async with httpx.AsyncClient(timeout=10, proxy=self.socks5_url) as client:
-                resp = await client.get(self._ip_check_url)
-                ip = resp.text.strip()
-                return ip or None
+            self._shared.record_ip(ip, self._station)
         except Exception as e:
-            logger.error("[vpn] failed to get public IP via SOCKS5: %s", e)
-            return None
+            logger.debug("[vpn] shared IP record failed: %s", e)
+
+    def _advance_identity(self) -> int:
+        """Move this station's identity index to a NEW profile.
+
+        Cross-station via the shared absolute cursor (guarantees the two
+        connected stations never hold the same live index at once — the skip
+        loop in shared_rotation.next_identity); local ``(idx+1) % n``
+        otherwise. Sets and returns the new index.
+        """
+        if not self._identity_rotation_enabled or self._proxy_mode != "vpn":
+            return self._identity_index
+        n = len(self._identity_profiles)
+        if n <= 1:
+            return 0
+        if self._shared is not None:
+            try:
+                self._identity_index = self._shared.next_identity(self._station, n)
+                return self._identity_index
+            except Exception as e:
+                logger.debug("[vpn] shared identity advance failed: %s", e)
+        self._identity_index = (self._identity_index + 1) % n
+        return self._identity_index
+
+    async def _finalize_ip(self, allow_stale: bool = False) -> bool:
+        """Validate + commit a fresh tunnel IP (up to 3 recovery rounds).
+
+        Probes the public IP inside try/except — a dead network is a failed
+        ATTEMPT, never an exception escaping to ``_watchdog_tick``. On a
+        fresh IP (not recent on either station): commit the new face —
+        registry, identity advance, history entry carrying the NEW identity,
+        persist. When the IP is missing/recent: force a container restart
+        (``_ensure_container`` — re-picks a server) and probe again.
+        ``allow_stale`` accepts a recent IP on the last attempt (legacy
+        recent_ips semantics) so a constrained boot cannot loop forever.
+        """
+        for attempt in range(3):
+            try:
+                new_ip = await self.get_public_ip()
+            except Exception as e:
+                new_ip = None
+                logger.debug("[vpn] finalize probe %d failed: %s", attempt, e)
+            if new_ip and not self._ip_recent(new_ip):
+                return self._commit_ip(new_ip)
+            if new_ip and self._ip_recent(new_ip) and allow_stale and attempt == 2:
+                return self._commit_ip(new_ip)
+            if attempt < 2:
+                try:
+                    await self._ensure_container()
+                    started_at = await self._wait_healthy(timeout=120)
+                    if started_at:
+                        auth = await self._check_auth_failed(started_at)
+                        tls = await self._check_server_issue(started_at)
+                        if auth or tls:
+                            self._auth_failed = auth
+                            self._server_issue = tls
+                            logger.warning(
+                                "[vpn] finalize recovery blocked: %s",
+                                "AUTH_FAILED" if auth else "TLS negotiation timeout")
+                    # The container action reset the country pool — re-pin so
+                    # the recovery doesn't undo the rotation ([plan] A). The
+                    # cursor always advances, so this picks a NEW country.
+                    await self._pin_country_for_rotation()
+                    await asyncio.sleep(self._switch_delay)
+                except Exception as e:
+                    logger.debug("[vpn] finalize recovery round failed: %s", e)
+        return False
+
+    def _commit_ip(self, new_ip: str) -> bool:
+        """Commit a chosen IP: current IP, shared registry, identity advance
+        BEFORE the history append (the entry must carry the NEW face — the
+        old order logged the pre-advance identity), persist."""
+        self._current_ip = new_ip
+        self._auth_failed = False
+        self._server_issue = False
+        self._record_ip_change(new_ip)
+        self._advance_identity()
+        self._ip_history.append({
+            "ip": new_ip,
+            "server": self._docker_container,
+            "time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "identity": self._live_identity.get("impersonate") or "",
+            "identity_index": self._identity_index,
+        })
+        self._ip_history = self._ip_history[-100:]
+        self.save_state()
+        return True
 
     # ── Config ─────────────────────────────────────────────────
 
     def get_config(self) -> dict:
         """Return current configuration for the dashboard."""
+        # Pool-level keys ("double embrayage") — read live from the config
+        # mirror so the dashboard reflects the persisted state (they are
+        # not per-station manager settings).
+        try:
+            from config.settings import _yaml_data as _cfg_data
+            _dual = _cfg_data.get("ip_rotation", {}).get("dual_station", False)
+            _strict = _cfg_data.get("ip_rotation", {}).get("strict_free", False)
+        except Exception:
+            _dual = _strict = False
         return {
             "enabled": self._enabled,
             "proxy_mode": self._proxy_mode,
@@ -729,7 +1317,18 @@ class VPNManager:
             "socks5_proxy_port": self._socks5_port,
             "credentials_file": self._auth_file,
             "server_countries": self._server_countries,
+            "server_provider": self._server_provider,
             "ip_check_url": self._ip_check_url,
+            "ip_check_urls": self._ip_check_urls,
+            # Never the control key itself — the dashboard only needs to
+            # know whether control-server auth is armed.
+            "control_api_key_set": bool(self._control_api_key),
+            "country_rotation": self._country_rotation,
+            "country_offset": self._country_offset,
+            "current_country": self._current_country,
+            "wait_healthy_poll": self._wait_healthy_poll,
+            "rotation_fail_cooldown": self._ROTATION_FAIL_COOLDOWN,
+            "status_cache_seconds": self._STATUS_CACHE_SECONDS,
             "update_enabled": self._update_enabled,
             "update_check_interval": self._update_check_interval,
             "update_apply_window": self._update_apply_window,
@@ -738,12 +1337,30 @@ class VPNManager:
             "circuit_breaker_threshold": self._circuit_breaker._failure_threshold,
             "circuit_breaker_recovery": self._circuit_breaker._recovery_time,
             "backoff_max_delay": self._backoff._max_delay,
+            "watchdog_interval": self._watchdog_interval,
+            "watchdog_backoff_base": self._watchdog_backoff._base_delay,
+            "watchdog_backoff_max": self._watchdog_backoff._max_delay,
             "identity_rotation": self._identity_rotation_enabled,
+            "identity_diversity": self._identity_diversity,
+            "identity_max_profiles": self._identity_max_profiles,
             "identity_profiles": self._identity_profiles,
+            "profiles_count": len(self._identity_profiles),
+            "recent_ip_window": self._config.get("recent_ip_window", 20),
+            "recent_ip_max_age": self._config.get("recent_ip_max_age", 1800),
+            "shared_rotation_file": self._config.get("shared_rotation_file",
+                                                      "logs/shared_rotation.json"),
+            "dual_station": _dual,
+            "strict_free": _strict,
         }
 
     async def update_config(self, updates: dict) -> dict:
         """Apply config updates from the dashboard (hot-reload, no restart)."""
+        # Keep the config dict in sync: get_config() reads the window keys
+        # back from self._config (not from live fields), so a stale dict
+        # would re-show the OLD values in the dashboard form and re-submitting
+        # would silently revert the hot-reload. In-place update — both
+        # stations share the same IP_ROTATION dict, so both stay symmetric.
+        self._config.update(updates)
         if "enabled" in updates:
             self._enabled = bool(updates["enabled"])
         if "proxy_mode" in updates and updates["proxy_mode"] in ("vpn", "direct"):
@@ -754,6 +1371,26 @@ class VPNManager:
             self._switch_delay = max(0.0, float(updates["switch_delay"]))
         if "server_countries" in updates:
             self._server_countries = str(updates["server_countries"])
+        if "ip_check_urls" in updates:
+            urls = updates["ip_check_urls"]
+            if isinstance(urls, list):
+                self._ip_check_urls = [str(u).strip() for u in urls if str(u).strip()]
+                self._ip_check_idx = 0  # re-base on the new chain
+        if "control_api_key" in updates and str(updates["control_api_key"]).strip():
+            # Hot-reload the control key (never echoed back via get_config).
+            self._control_api_key = str(updates["control_api_key"]).strip()
+        if "country_rotation" in updates:
+            self._country_rotation = bool(updates["country_rotation"])
+        if "country_offset" in updates:
+            self._country_offset = max(0, int(updates["country_offset"] or 0))
+        if "wait_healthy_poll" in updates:
+            self._wait_healthy_poll = max(0.1, float(updates["wait_healthy_poll"]))
+        if "rotation_fail_cooldown" in updates:
+            self._ROTATION_FAIL_COOLDOWN = max(5.0, float(updates["rotation_fail_cooldown"]))
+        if "status_cache_seconds" in updates:
+            self._STATUS_CACHE_SECONDS = max(0.5, float(updates["status_cache_seconds"]))
+        if "server_provider" in updates:
+            self._server_provider = str(updates["server_provider"]).strip() or "nordvpn"
         if "circuit_breaker_threshold" in updates or "circuit_breaker_recovery" in updates:
             threshold = updates.get(
                 "circuit_breaker_threshold", self._circuit_breaker._failure_threshold)
@@ -765,6 +1402,8 @@ class VPNManager:
             self._backoff = BackoffTimer(
                 base_delay=self._switch_delay,
                 max_delay=float(updates["backoff_max_delay"]))
+        if "watchdog_interval" in updates:
+            self._watchdog_interval = max(1, int(updates["watchdog_interval"]))
         if "update_enabled" in updates:
             self._update_enabled = bool(updates["update_enabled"])
         if "update_check_interval" in updates:
@@ -777,10 +1416,34 @@ class VPNManager:
             self._update_max_defer_hours = max(1, int(updates["update_apply_max_defer_hours"]))
         if "identity_rotation" in updates:
             self._identity_rotation_enabled = bool(updates["identity_rotation"])
+        if "identity_diversity" in updates:
+            self._identity_diversity = bool(updates["identity_diversity"])
+        if "identity_max_profiles" in updates:
+            self._identity_max_profiles = max(1, int(updates["identity_max_profiles"]))
         if "identity_profiles" in updates:
-            new_profiles = _normalize_identity_profiles(updates["identity_profiles"])
-            self._identity_profiles = new_profiles
-            self._identity_index %= len(new_profiles)  # clamp (config may shrink)
+            self._identity_profiles_base = _normalize_identity_profiles(updates["identity_profiles"])
+        if any(k in updates for k in ("identity_diversity", "identity_max_profiles",
+                                      "identity_profiles")):
+            # Rebuild from the explicit base (seed), not from the current pool.
+            self._identity_profiles = _build_identity_pool(
+                self._identity_profiles_base,
+                self._identity_diversity,
+                self._identity_max_profiles,
+            )
+            if self._identity_profiles:
+                self._identity_index %= len(self._identity_profiles)  # clamp (config may shrink)
+        if "watchdog_backoff_base" in updates or "watchdog_backoff_max" in updates:
+            _wbase = max(1.0, float(updates.get(
+                "watchdog_backoff_base", self._watchdog_backoff._base_delay)))
+            _wmax = max(_wbase, float(updates.get(
+                "watchdog_backoff_max", self._watchdog_backoff._max_delay)))
+            self._watchdog_backoff = BackoffTimer(base_delay=_wbase, max_delay=_wmax)
+        if self._shared is not None and any(
+                k in updates for k in ("recent_ip_window", "recent_ip_max_age",
+                                       "shared_rotation_file")):
+            # Hot-reload the cross-station windows (the shared registry is
+            # created once by opencode's lifespan; it re-reads these itself).
+            self._shared.set_window(self._config)
         return self.get_config()
 
     def get_status(self) -> dict:
@@ -794,10 +1457,18 @@ class VPNManager:
             "ip": self._current_ip,
             "server": self._current_server.get("name") if self._current_server else None,
             "country": self._current_server.get("country") if self._current_server else None,
+            "current_country": self._current_country,
+            "country_pinned_at": self._country_pinned_at,
+            "next_country": self._next_country_preview(),
+            "country_rotation": self._country_rotation,
             "connected_seconds": elapsed,
             "total_switches": self._total_switches,
+            "station": self._station,
             "error": self._error,
             "auth_failed": self._auth_failed,
+            "last_rotation_error": self._last_rotation_error,
+            "rotation_failed_at": (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self._last_rotation_failed_at))
+                                   if self._last_rotation_failed_at else None),
             "ip_history": self._ip_history[-10:],
             "proxy_port": self._proxy_port,
             "proxy_url": self.proxy_url,
@@ -806,7 +1477,14 @@ class VPNManager:
             "circuit_breaker": self._circuit_breaker.get_status(),
             "backoff_failures": self._backoff.consecutive_failures,
             "backoff_delay": self._backoff.delay,
+            "watchdog": {
+                "interval": self._watchdog_interval,
+                "failures": self._watchdog_backoff.consecutive_failures,
+                "next_delay": self._watchdog_backoff.delay,
+                "server_issue": self._server_issue,
+            },
             "identity_index": self._identity_index,
+            "profiles_count": len(self._identity_profiles),
             "current_identity": self.current_identity,
             "update": {
                 "enabled": self._update_enabled,
@@ -857,6 +1535,7 @@ class VPNManager:
             "healthy": state.get("Health", {}).get("Status") == "healthy",
             "restarting": state.get("Restarting", False),
             "started_at": state.get("StartedAt", ""),
+            "mounts": info.get("Mounts", []),
         }
 
     async def _docker_restart(self) -> None:
@@ -873,21 +1552,262 @@ class VPNManager:
             raise RuntimeError(
                 f"docker restart failed: {result.stderr.strip() or result.stdout.strip()}")
 
-    async def _compose_up(self) -> None:
+    # ── gluetun control server client ────────────────────────────
+    #
+    # All access is via `docker exec <ctn> sh -c 'wget ...'`. The control
+    # key comes from the CONTAINER's OWN env ($VPN_CONTROL_API_KEY, set by
+    # compose credentials.env and used by the healthcheck) — wget doesn't
+    # expand env vars inside --header values and docker exec never
+    # propagates host env, so sh does the expansion inside the container.
+    # The key therefore never appears in host argv, `ps`, or logs.
+    # Port 8000 is gluetun's default control-server port, never published.
+    # Routes (v3.41.3): GET /v1/vpn/status -> {"status": running|stopped},
+    # GET /v1/publicip/ip -> {"public_ip": ...}, PUT /v1/vpn/settings (partial
+    # merge -> validate -> stop+start). NEVER call GET /v1/vpn/settings — it
+    # discloses credentials; we track the country in our own state.
+
+    async def _control_exec(self, method: str, path: str,
+                            body: Optional[str] = None,
+                            timeout: float = 10.0) -> list[str]:
+        """Run one wget call against gluetun's control server inside the
+        container. Returns the decoded stdout lines on success, [] on any
+        failure (non-zero exit, wget absent, control server down, timeout).
+        Never logs the key. A 204 (no body) is still a success -> [].
+        """
+        key_var = "VPN_CONTROL_API_KEY"
+        cmd = ["exec", self._docker_container]
+        script = f'wget -q -O - -T {int(timeout)}' \
+                 f' --header="X-API-Key: ${key_var}"'
+        if method != "GET":
+            script += f' --method={method}'
+            if body:
+                script += f' --body-data={_sh_quote(body)}'
+        script += f" http://127.0.0.1:8000{path}"
+        cmd += ["sh", "-c", script]
+        try:
+            result = await asyncio.to_thread(
+                self._docker_run, cmd, int(timeout) + 5)
+        except RuntimeError as e:
+            logger.debug("[vpn] control server call %s %s failed: %s",
+                         method, path, e)
+            return []
+        if result.returncode != 0:
+            logger.debug("[vpn] control server %s %s rc=%d: %s", method, path,
+                         result.returncode,
+                         (result.stderr or result.stdout or "").strip()[:200])
+            return []
+        out = (result.stdout or "").splitlines()
+        return [ln.strip() for ln in out if ln.strip()]
+
+    async def _control_status(self) -> Optional[bool]:
+        """True when gluetun reports the VPN running, False when stopped,
+        None when the control server is unreachable (fail toward the
+        SOCKS5/status fallback chain)."""
+        if not self._control_api_key:
+            return None
+        lines = await self._control_exec("GET", "/v1/vpn/status", timeout=5)
+        for ln in lines:
+            try:
+                return json.loads(ln).get("status") == "running"
+            except (json.JSONDecodeError, AttributeError):
+                continue
+        return None
+
+    async def _control_public_ip(self) -> Optional[str]:
+        """IP as reported BY gluetun (self-reported, not a tunnel probe)."""
+        if not self._control_api_key:
+            return None
+        lines = await self._control_exec("GET", "/v1/publicip/ip", timeout=5)
+        for ln in lines:
+            try:
+                ip = json.loads(ln).get("public_ip")
+            except (json.JSONDecodeError, AttributeError):
+                continue
+            if ip:
+                return str(ip)
+        return None
+
+    async def _control_pin_country(self, country: str,
+                                   timeout: float = 60.0) -> bool:
+        """Ask gluetun to connect through ``country`` (PUT settings -> real
+        stop+start reconnect). Polls ``status: running`` at the healthy-poll
+        cadence until ``timeout``. Returns True only when the VPN came back
+        up (the IP itself is validated separately by the rotation path).
+
+        [incident 17/08] A pin that lands on an auth/TLS-failing server
+        NEVER recovers on its own (openvpn SIGUSR1-retries forever). We
+        fail fast by scanning the container logs since the pin started: an
+        AUTH_FAILED / TLS-negotiation line aborts the pin within
+        ``_wait_healthy_poll`` so the rotation cursor advances to the next
+        country immediately — instead of sitting in ``timeout`` (outage
+        was ~2 min before this fix).
+        """
+        if not self._control_api_key or not country:
+            return False
+        country = _normalize_country(country)
+        payload = json.dumps(
+            {"provider": {"server_selection": {"countries": [country]}}},
+            separators=(",", ":"))
+        lines = await self._control_exec(
+            "PUT", "/v1/vpn/settings", body=payload, timeout=10)
+        # 204 No Content -> [] is the success signature; any non-empty stdout
+        # is either a JSON error body or a diagnostic line -> failure.
+        if lines:
+            hint = ""
+            if "choices" in lines[0].lower():
+                hint = (f" (gluetun reported this country name as invalid / "
+                        f"\"not in choices\" — check server_countries)")
+            logger.warning("[vpn] control pin %s rejected: %s%s",
+                           country, lines[0][:200], hint)
+            return False
+        # Bound the failure scan to logs written AFTER the pin — a stale
+        # AUTH_FAILED from an earlier reconnect in the same container must
+        # not abort a healthy pin.
+        since_pin = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            # Scan BEFORE leaning on the status reply: gluetun can report
+            # "running" while openvpn is caught in an AUTH_FAILED retry
+            # loop, so the auth scan is the decisive signal.
+            if await self._check_auth_failed(since_pin) \
+                    or await self._check_server_issue(since_pin):
+                logger.warning(
+                    "[vpn] control pin %s: auth/TLS failure since pin start "
+                    "— abandoning, the next country will be pinned "
+                    "immediately", country)
+                return False
+            status = await self._control_status()
+            if status is True:
+                return True
+            if status is False:
+                logger.warning("[vpn] control pin %s: VPN reports stopped",
+                               country)
+            await asyncio.sleep(self._wait_healthy_poll)
+        logger.warning("[vpn] control pin %s: not running after %.0fs",
+                       country, timeout)
+        return False
+
+    def _countries_list(self) -> list[str]:
+        """Ordered rotation list from config server_countries (normalized to
+        gluetun's canonical names via _normalize_country — "United_Kingdom"
+        → "United Kingdom", "Czechia" → "Czech Republic"), or [] when unset."""
+        raw = getattr(self, "_server_countries", "") or ""
+        if not isinstance(raw, str):
+            raw = str(raw)
+        names = [c.strip() for c in raw.split(",") if c.strip()]
+        out = []
+        for c in names:
+            c = _normalize_country(c)
+            if c and c not in out:
+                out.append(c)
+        return out
+
+    def _local_next_country(self, previous: Optional[str]) -> Optional[str]:
+        """Deterministic local fallback when the shared state / control
+        server isn't available: walk the config list from the last pinned
+        country. Never returns the same country twice in a row."""
+        countries = self._countries_list()
+        if not countries:
+            return None
+        self._country_index = self._country_index % len(countries)
+        nxt = countries[self._country_index]
+        if countries[self._country_index] == previous:
+            self._country_index = (self._country_index + 1) % len(countries)
+            nxt = countries[self._country_index]
+        self._country_index = (self._country_index + 1) % len(countries)
+        return nxt
+
+    async def _pin_country_for_rotation(self) -> Optional[str]:
+        """Advance the shared country cursor and pin the next country via
+        the control server (PUT /v1/vpn/settings — a real reconnect).
+
+        Returns the pinned country name when the control server accepted
+        it and the VPN came back up; None when country rotation is off,
+        the control server is unavailable, or the pin failed — callers
+        then fall through to the legacy restart path. On success the
+        cursor has advanced (the next pin differs), so a "settings left
+        unchanged" reply can never repeat a country.
+        """
+        if not self._country_rotation or not self._control_api_key:
+            return None
+        countries = self._countries_list()
+        if len(countries) < 2:
+            return None
+        idx = None
+        if self._shared is not None and hasattr(self._shared, "next_country"):
+            try:
+                idx = self._shared.next_country(
+                    self._station, self._country_offset, len(countries))
+            except Exception as e:
+                logger.debug("[vpn] shared country cursor failed: %s", e)
+        nxt = countries[idx] if idx is not None else \
+            self._local_next_country(self._current_country)
+        if nxt is None or nxt == self._current_country:
+            return None
+        if await self._control_pin_country(nxt):
+            self._current_country = nxt
+            self._country_pinned_at = time.monotonic()
+            logger.info("[vpn] station %d pinned country %s",
+                        self._station, nxt)
+            return nxt
+        return None
+
+    def _next_country_preview(self) -> Optional[str]:
+        """Best-effort preview of the next pinned country for the dashboard
+        (the 'next country' cell). Mirrors _pin_country_for_rotation's pick
+        WITHOUT advancing the shared cursor or the local fallback cursor."""
+        if not self._country_rotation or not self._control_api_key:
+            return None
+        countries = self._countries_list()
+        if len(countries) < 2:
+            return None
+        idx = None
+        if self._shared is not None and hasattr(self._shared, "peek_next_country"):
+            try:
+                idx = self._shared.peek_next_country(
+                    self._station, self._country_offset, len(countries))
+            except Exception:
+                idx = None
+        if idx is not None:
+            nxt = countries[idx]
+        else:
+            # Local mirror of _local_next_country's walk — read-only.
+            cursor = self._country_index % len(countries)
+            nxt = countries[cursor]
+            if nxt == self._current_country:
+                nxt = countries[(cursor + 1) % len(countries)]
+        return nxt if nxt != self._current_country else None
+
+    async def _compose_up(self, force_recreate: bool = False) -> None:
         """Start the gluetun service via docker compose (idempotent)."""
         compose_file = self._compose_file_path()
-        result = await asyncio.to_thread(
-            self._docker_run,
-            ["compose", "-f", compose_file, "up", "-d", "vpn-gluetun"], 120)
+        cmd = ["compose", "-f", compose_file, "up", "-d", self._compose_service]
+        if force_recreate:
+            # A plain `docker restart` does NOT apply a changed env — only
+            # recreation re-reads the compose definition. AUTH_FAILED
+            # recovery must go through `compose up --force-recreate` so the
+            # wider pool (SERVER_COUNTRIES) is actually in effect.
+            cmd.insert(4, "--force-recreate")
+        result = await asyncio.to_thread(self._docker_run, cmd, 120)
         if result.returncode != 0:
             raise RuntimeError(
                 f"docker compose up failed: {result.stderr.strip() or result.stdout.strip()}")
 
-    async def _ensure_container(self) -> None:
-        """Compose up if the container is absent, else restart it."""
+    async def _ensure_container(self, force_recreate: Optional[bool] = None) -> None:
+        """Compose up if the container is absent, else restart it.
+
+        ``force_recreate``: None → recreate when the last restart was a
+        failure (AUTH_FAILED / server issue), so the changed compose
+        definition is re-read via ``--force-recreate``; True → always
+        recreate; False → plain ``docker restart``.
+        """
+        if force_recreate is None:
+            force_recreate = bool(self._auth_failed or self._server_issue)
         info = await self._docker_inspect()
         if not info:
             await self._compose_up()
+        elif force_recreate:
+            await self._compose_up(force_recreate=True)
         else:
             await self._docker_restart()
 
@@ -906,6 +1826,19 @@ class VPNManager:
             return False
         return "AUTH_FAILED" in result.stdout or "auth failed" in result.stdout.lower()
 
+    async def _check_server_issue(self, started_at: str = "") -> bool:
+        """Scan container logs for a TLS negotiation failure (stale server
+        IP or crashed server — gluetun's 🔌 'server no longer valid'
+        guidance). Detection: the raw openvpn line that guidance attaches to
+        in internal/openvpn/logs.go. Same StartedAt-bounding as
+        _check_auth_failed."""
+        since = started_at if started_at else "10m"
+        result = await asyncio.to_thread(
+            self._docker_run, ["logs", "--since", since, self._docker_container], 30)
+        if result.returncode != 0:
+            return False
+        return "tls key negotiation failed" in result.stdout.lower()
+
     async def _wait_healthy(self, timeout: float = 120.0) -> Optional[str]:
         """Wait until the container runs AND the SOCKS5 tunnel answers.
 
@@ -919,11 +1852,14 @@ class VPNManager:
             info = await self._docker_inspect()
             if info.get("running") and await self.get_public_ip():
                 return info.get("started_at", "")
-            # Fail fast: AUTH_FAILED (rejected credentials) never recovers on
-            # its own — do not sit out the timeout, report immediately.
-            if not info or not info.get("running") or await self._check_auth_failed(info.get("started_at", "")):
+            # Fail fast: AUTH_FAILED (rejected credentials) and TLS negotiation
+            # failures (dead server) never recover on their own — do not sit
+            # out the timeout, report immediately (TLS fails in ~20 s).
+            if not info or not info.get("running") \
+                    or await self._check_auth_failed(info.get("started_at", "")) \
+                    or await self._check_server_issue(info.get("started_at", "")):
                 return None
-            await asyncio.sleep(2)
+            await asyncio.sleep(self._wait_healthy_poll)
         return None
 
     # ── Auto-update (gluetun image) ────────────────────────────
@@ -980,7 +1916,7 @@ class VPNManager:
             compose_file = self._compose_file_path()
             result = await asyncio.to_thread(
                 self._docker_run,
-                ["compose", "-f", compose_file, "pull", "vpn-gluetun"], 300)
+                ["compose", "-f", compose_file, "pull", self._compose_service], 300)
             if result.returncode != 0:
                 raise RuntimeError(result.stderr.strip() or result.stdout.strip())
             new_digest = await self._docker_repo_digest(image)
@@ -1051,7 +1987,7 @@ class VPNManager:
                 compose_file = self._compose_file_path()
                 result = await asyncio.to_thread(
                     self._docker_run,
-                    ["compose", "-f", compose_file, "up", "-d", "--pull", "never", "vpn-gluetun"], 120)
+                    ["compose", "-f", compose_file, "up", "-d", "--pull", "never", self._compose_service], 120)
                 if result.returncode != 0:
                     raise RuntimeError(result.stderr.strip() or result.stdout.strip())
                 started_at = await self._wait_healthy(timeout=120)
@@ -1061,6 +1997,11 @@ class VPNManager:
                     self._auth_failed = True
                     raise RuntimeError("AUTH_FAILED after update")
                 self._auth_failed = False
+                # Fresh IP + NEW identity: the recreate re-picked a server, so
+                # validate the IP is not recent on either station and advance
+                # the identity ([plan] C.4). Failure rolls back below.
+                if not await self._finalize_ip(allow_stale=False):
+                    raise RuntimeError("could not finalize a fresh IP after update")
                 # force: container was just recreated — a cached status
                 # would report the pre-update container ([37]).
                 await self.refresh_status(force=True)
@@ -1091,7 +2032,7 @@ class VPNManager:
             compose_file = self._compose_file_path()
             await asyncio.to_thread(
                 self._docker_run,
-                ["compose", "-f", compose_file, "up", "-d", "--pull", "never", "vpn-gluetun"], 120)
+                ["compose", "-f", compose_file, "up", "-d", "--pull", "never", self._compose_service], 120)
             # force: container was just recreated — see _apply_update ([37]).
             await self.refresh_status(force=True)
             logger.warning("[vpn-update] rolled back to previous image %s", old_image_id[:19])
@@ -1143,11 +2084,182 @@ class VPNManager:
                 logger.error("[vpn-update] background loop error: %s", e)
             await asyncio.sleep(self._update_check_interval)
 
+    # ── Auth watchdog ──────────────────────────────────────────
+
+    async def _watchdog_loop(self) -> None:
+        """Background watchdog: auto-restart the gluetun container when
+        OpenVPN hits AUTH_FAILED or a TLS negotiation failure (stale/crashed
+        server) — neither recovers on its own, but a fresh connection attempt
+        eventually succeeds, so each detection triggers one `docker restart`.
+        After a restart that did not recover, the next scan runs on the
+        exponential backoff cadence (base x2, capped) so the first retries land
+        within the first minutes; while healthy it paces at the interval.
+        """
+        logger.info("[vpn-watchdog] active — interval %ds, backoff %ds → %ds",
+                    self._watchdog_interval,
+                    self._watchdog_backoff._base_delay,
+                    self._watchdog_backoff._max_delay)
+        while True:
+            try:
+                await self._watchdog_tick()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error("[vpn-watchdog] loop error: %s", e)
+            # Failure cadence = backoff (base→max); healthy cadence = interval.
+            delay = (self._watchdog_backoff.delay
+                     if self._watchdog_backoff.consecutive_failures > 0
+                     else self._watchdog_interval)
+            # Sleep dually on the interval AND container events: every
+            # die/stop/kill/start (docker events watcher sets
+            # _watchdog_event) wakes the loop immediately, so recovery
+            # starts within ms instead of on the next tick. None-guarded:
+            # the watcher may be disabled. A stale set (event set while
+            # wait_for raced its timeout) costs one extra tick — harmless.
+            if self._watchdog_event is not None:
+                try:
+                    await asyncio.wait_for(self._watchdog_event.wait(),
+                                           timeout=delay)
+                    self._watchdog_event.clear()
+                except asyncio.TimeoutError:
+                    pass
+            else:
+                await asyncio.sleep(delay)
+
+    async def _watchdog_tick(self) -> None:
+        """One watchdog pass: scan for AUTH_FAILED/TLS failure; restart when found."""
+        if not self._enabled or self._proxy_mode != "vpn":
+            return  # VPN feature off or tunnel bypassed — nothing to watch
+        if self._rotation_task and not self._rotation_task.done():
+            return  # rotation in flight — a restart would race its IP validation
+        if self._lock.locked():
+            return  # connect/rotate/apply_update in progress — skip this tick
+        escalate = False
+        async with self._lock:
+            # Source of truth: inspect + StartedAt-bounded log scan + SOCKS5
+            # probe. force=True: never serve the 5s cache here.
+            await self.refresh_status(force=True)
+            if not (self._auth_failed or self._server_issue):
+                self._watchdog_backoff.record_success()  # failure cleared: full cadence
+                return
+            info = await self._docker_inspect()
+            if not info or not info.get("running"):
+                return  # absent/stopped/restarting — other paths own the lifecycle
+            kind = "AUTH_FAILED" if self._auth_failed else "TLS negotiation timeout"
+            logger.warning("[vpn-watchdog] %s detected — restarting %s",
+                           kind, self._docker_container)
+            try:
+                # _ensure_container() recreates via compose (--force-recreate)
+                # because the last restart FAILED: a plain `docker restart`
+                # would never apply the widened SERVER_COUNTRIES pool.
+                await self._ensure_container()
+                started_at = await self._wait_healthy(timeout=120)
+                if started_at and not (await self._check_auth_failed(started_at)
+                                       or await self._check_server_issue(started_at)):
+                    # The --force-recreate reset the country pool — re-pin
+                    # the next country so recovery doesn't drift back to
+                    # whatever the container picked at random ([plan] A).
+                    await self._pin_country_for_rotation()
+                    # Recovered path: finalize a FRESH IP (not recent on
+                    # either station) — the watchdog must never land back on
+                    # the failed server/IP. _finalize_ip probes + restarts
+                    # (≤3 rounds), advances the identity to a NEW face and
+                    # persists; a false return means still-not-fresh.
+                    if await self._finalize_ip(allow_stale=False):
+                        self._watchdog_backoff.record_success()
+                        self._set_status(VPNState.CONNECTED)
+                        self._error = None
+                        await self.refresh_status(force=True)
+                        self.save_state()
+                        logger.info("[vpn-watchdog] recovered — tunnel healthy (IP %s)",
+                                    self._current_ip)
+                        return
+                # Still failing: keep the error state and back off.
+                self._watchdog_backoff.record_failure()
+                escalate = self._watchdog_backoff.consecutive_failures >= 2
+                logger.error("[vpn-watchdog] restart did not recover — next "
+                             "attempt in %ds (failure #%d)",
+                             int(self._watchdog_backoff.delay),
+                             self._watchdog_backoff.consecutive_failures)
+            except Exception as e:
+                self._watchdog_backoff.record_failure()
+                escalate = self._watchdog_backoff.consecutive_failures >= 2
+                logger.error("[vpn-watchdog] restart failed: %s — next attempt "
+                             "in %ds", e, int(self._watchdog_backoff.delay))
+        # Escalation OUTSIDE the lock: apply_update() takes self._lock —
+        # asyncio.Lock is not reentrant, calling it here would deadlock.
+        if escalate:
+            await self._watchdog_escalate()
+
+    async def _watchdog_escalate(self) -> None:
+        """≥2 failed restarts: the server list may be stale. Refresh it, then
+        try an image update (fresh list embedded per release). apply_update()
+        applies immediately: the tunnel is down, so _update_opportune()
+        returns True. Re-armed every 30 min to keep retrying long-lived
+        outages without hammering docker."""
+        if self._watchdog_escalated_at and \
+                time.monotonic() - self._watchdog_escalated_at < 1800:
+            return
+        self._watchdog_escalated_at = time.monotonic()
+        logger.warning("[vpn-watchdog] escalating: refreshing %s servers list "
+                       "+ checking image update", self._server_provider)
+        await self._refresh_servers_list()
+        applied = False
+        if self._update_enabled:
+            try:
+                if await self.check_update():
+                    result = await self.apply_update(check_opportune=True)
+                    applied = bool(result.get("ok"))
+            except Exception as e:
+                logger.error("[vpn-watchdog] escalation update failed: %s", e)
+        if not applied:
+            # No new image applied: plain restart re-picks a server from the
+            # freshly refreshed list. Re-check the lock — a rotation/connect
+            # may have started while the update check was running.
+            try:
+                if not self._lock.locked():
+                    await self._ensure_container()
+            except Exception as e:
+                logger.error("[vpn-watchdog] escalation restart failed: %s", e)
+
+    async def _resolve_gluetun_volume(self) -> str:
+        """Name of the named volume backing /gluetun in the running container.
+
+        docker compose names the volume '<project>_gluetun' (project = the
+        compose file's directory basename), which varies per deployment path
+        (e.g. opencode-proxy vs opencode-proxy-main) — never hardcode it.
+        Falls back to the bare 'gluetun' when the container is absent (its
+        own docker run-era name) so the refresh still has a target."""
+        info = await self._docker_inspect()
+        for m in info.get("mounts") or []:
+            if m.get("Type") == "volume" and m.get("Destination", "").rstrip("/") == "/gluetun" \
+                    and m.get("Name"):
+                return m["Name"]
+        return "gluetun"
+
+    async def _refresh_servers_list(self) -> None:
+        """One-shot `gluetun update -providers <provider>` into the named
+        volume backing /gluetun: rewrites the servers file with the current
+        list, works without a running tunnel, and the local file takes
+        precedence over the embedded list at next start. Fails soft."""
+        try:
+            volume = await self._resolve_gluetun_volume()
+            result = await asyncio.to_thread(
+                self._docker_run,
+                ["run", "--rm", "-v", f"{volume}:/gluetun", "qmcgaw/gluetun",
+                 "update", "-providers", self._server_provider], 180)
+            if result.returncode != 0:
+                logger.error("[vpn-watchdog] servers refresh returned %d: %s",
+                             result.returncode, result.stdout[-500:])
+        except Exception as e:
+            logger.error("[vpn-watchdog] servers refresh failed: %s", e)
+
     # ── State persistence ──────────────────────────────────────
 
     def _get_state_path(self) -> str:
-        """Return path to the VPN state file."""
-        return os.path.join(ROOT, "logs", "vpn_state.json")
+        """Return path to the VPN state file (per-station: station 2 keeps
+        its own history/circuit breaker in logs/vpn_state2.json)."""
+        return self._state_file
 
     def save_state(self):
         """Persist IP history, stats, and circuit breaker state to disk.
@@ -1162,6 +2274,7 @@ class VPNManager:
                 "circuit_breaker": self._circuit_breaker.get_status(),
                 "current_ip": self._current_ip,
                 "identity_index": self._identity_index,
+                "current_country": self._current_country,
                 "saved_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             }
             state_path = self._get_state_path()
@@ -1200,6 +2313,15 @@ class VPNManager:
                 }
             # Restore the last known IP so a fresh start doesn't show "unknown"
             self._current_ip = state.get("current_ip") or self._current_ip
+            # Fail-open: a persisted country is only a hint — the next pin
+            # advances the cursor anyway, and an empty/unknown value falls
+            # back to None (no country labeled until the next pin).
+            # Normalized [incident 17/08]: a stale "Czechia"/"United_Kingdom"
+            # persisted before the name fix must not label the dashboard or
+            # skew the nxt == _current_country comparison.
+            restored_country = state.get("current_country")
+            if isinstance(restored_country, str) and restored_country:
+                self._current_country = _normalize_country(restored_country)
             logger.info("[vpn] state loaded: %d IPs in history, %d total switches",
                         len(self._ip_history), self._total_switches)
         except Exception as e:

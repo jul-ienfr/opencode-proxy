@@ -9,6 +9,7 @@ import asyncio
 import hmac
 import re
 import socket
+import threading
 from datetime import datetime, timedelta, timezone
 from fastapi import Request, Response
 from fastapi.responses import StreamingResponse, JSONResponse
@@ -19,6 +20,8 @@ import config.settings as config_settings
 from .display import log_lines, debug as _debug
 from .events import get_event_manager
 from .quota import get_quota_snapshot, get_available_models, get_model_limits_for_all, get_model_capabilities_for_all
+
+from traffic_capture import capture as _traffic_capture
 
 # Tools that work on all models — hidden from routing UI by default
 UNIVERSAL_TOOLS = {"Read", "Write", "Edit", "Bash", "Grep", "Glob", "WebSearch"}
@@ -85,9 +88,60 @@ def _check_dashboard_token(request: Request):
     })
 
 
+# Secret fields that are never shipped to the browser (masked instead) and
+# must be preserved on write when the POST carries an empty value (the UI
+# posts '' for unchanged secret inputs — see static/app.js).
+_SECRET_FIELDS = ("api_key", "go_workspace_id", "go_auth_cookie")
+
+
+def _merge_preserved_api_keys(rows: list) -> list:
+    """Merge posted api-key rows over the stored ones, KEEPING the stored
+    secret when a posted secret field is empty (finding i).
+
+    Keys by ``alias`` (the UI's stable identity for a row). A row that only
+    carries masked placeholders + alias will therefore leave its secrets
+    untouched instead of blanking them.
+    """
+    if not isinstance(rows, list):
+        return rows if isinstance(rows, list) else []
+    stored = {str(k.get("alias", "")): k for k in API_KEYS if k.get("alias")}
+    out = []
+    for row in rows:
+        if not isinstance(row, dict):
+            out.append(row)
+            continue
+        merged = dict(row)
+        old = stored.get(str(row.get("alias", "")))
+        if old:
+            for field in _SECRET_FIELDS:
+                if not merged.get(field) and old.get(field):
+                    merged[field] = old[field]
+        out.append(merged)
+    return out
+
+
+# Serialization lock for the dashboard's reads on the SHARED sqlite connection.
+# opencode.py passes its own `_db_commit_lock` (register_dashboard db_lock arg)
+# so dashboard reads and the proxy's writers (inserts, vacuum, cleanup) can
+# never execute concurrently on one connection — that race produced
+# sqlite3.InterfaceError aborts observed in the traffic capture (GET frames
+# dying with "request aborted: InterfaceError", dur=0ms).
+_db_lock = threading.Lock()
+
+
+def _run_db_locked(fn):
+    """Run fn while holding the serialization lock (from the worker thread)."""
+    with _db_lock:
+        return fn()
+
+
 async def _db_query_sync(fn):
-    """Run a synchronous DB function in a thread pool to avoid blocking the event loop."""
-    return await asyncio.to_thread(fn)
+    """Run a synchronous DB function in a thread pool to avoid blocking the event loop.
+
+    The lock is acquired inside the worker thread — same lock the proxy
+    writers hold — so every read is atomic w.r.t. inserts/commits.
+    """
+    return await asyncio.to_thread(_run_db_locked, fn)
 
 
 def _get_local_ips() -> list:
@@ -190,6 +244,8 @@ def _persist_vpn_config(updates: dict):
         key_map = {
             "enabled": "enabled",
             "proxy_mode": "proxy_mode",
+            "dual_station": "dual_station",
+            "strict_free": "strict_free",
             "quota_per_ip": "quota_per_ip",
             "switch_delay": "switch_delay",
             "docker_container": "docker_container",
@@ -202,8 +258,24 @@ def _persist_vpn_config(updates: dict):
             "circuit_breaker_threshold": "circuit_breaker_threshold",
             "circuit_breaker_recovery": "circuit_breaker_recovery",
             "backoff_max_delay": "backoff_max_delay",
+            "watchdog_interval": "watchdog_interval",
             "identity_rotation": "identity_rotation",
+            "server_provider": "server_provider",
             "identity_profiles": "identity_profiles",
+            # Identity pool ("un profil par IP") + freshness windows + watchdog
+            "identity_diversity": "identity_diversity",
+            "identity_max_profiles": "identity_max_profiles",
+            "recent_ip_window": "recent_ip_window",
+            "recent_ip_max_age": "recent_ip_max_age",
+            "watchdog_backoff_base": "watchdog_backoff_base",
+            "watchdog_backoff_max": "watchdog_backoff_max",
+            "shared_rotation_file": "shared_rotation_file",
+            # Station 2 ("double embrayage")
+            "socks5_proxy_port_2": "socks5_proxy_port_2",
+            "vpn_proxy_port_2": "vpn_proxy_port_2",
+            "docker_container_2": "docker_container_2",
+            "compose_service_2": "compose_service_2",
+            "state_file_2": "state_file_2",
         }
 
         changed = False
@@ -224,7 +296,14 @@ def _persist_vpn_config(updates: dict):
             # what we just wrote to disk.
             try:
                 from config import settings as _st
-                _st._yaml_data["ip_rotation"] = dict(ip_rot)
+                cur = _st._yaml_data.get("ip_rotation")
+                if isinstance(cur, dict):
+                    # [33] in-place update: settings.IP_ROTATION is a live
+                    # reference to this dict — replacing it would orphan
+                    # opencode.py's copy and break strict_free hot-reload.
+                    cur.update(ip_rot)
+                else:
+                    _st._yaml_data["ip_rotation"] = dict(ip_rot)
             except Exception:
                 pass
             _debug(f"  [vpn] config persisted to {config_path}")
@@ -253,7 +332,13 @@ def _write_credentials_env(username: str, password: str):
     _debug(f"  [vpn] credentials written to {cred_path}")
 
 
-def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_usage=None, token_lock=None):
+def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_usage=None, token_lock=None, db_lock=None):
+    # Serialize dashboard DB reads with the proxy's writers: opencode.py passes
+    # its `_db_commit_lock`; without it a private lock still protects the
+    # dashboard's own concurrent reads.
+    global _db_lock
+    if db_lock is not None:
+        _db_lock = db_lock
     # Add Cache-Control headers for static assets (JS/CSS/HTML)
     from starlette.middleware.base import BaseHTTPMiddleware
     class _StaticCacheMiddleware(BaseHTTPMiddleware):
@@ -317,11 +402,12 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
             "api_keys": [
                 {
                     "api_key_masked": (k["api_key"][:4] + "****" + k["api_key"][-4:]) if len(k.get("api_key", "")) > 8 else "****",
-                    "api_key": k.get("api_key", ""),
                     "go_workspace_id_masked": (k.get("go_workspace_id", "")[:4] + "****") if len(k.get("go_workspace_id", "")) > 4 else "",
                     "go_auth_cookie_masked": (k.get("go_auth_cookie", "")[:6] + "****") if len(k.get("go_auth_cookie", "")) > 6 else "",
-                    "go_workspace_id": k.get("go_workspace_id", ""),
-                    "go_auth_cookie": k.get("go_auth_cookie", ""),
+                    # Finding i: never ship full secrets to the browser. The UI
+                    # (static/app.js) shows *_masked placeholders and posts ''
+                    # for unchanged fields — the merge in update_api_keys_config
+                    # keeps the stored value when a posted secret is empty.
                     "enabled": k.get("enabled", True),
                     "alias": k.get("alias", ""),
                 }
@@ -356,7 +442,7 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
                 "SELECT tools FROM requests " + where + " AND tools IS NOT NULL AND tools != '[]'",
                 params,
             ).fetchall()
-        rows = await asyncio.to_thread(_query_all_tools)
+        rows = await _db_query_sync(_query_all_tools)
         all_tools = set()
         for row in rows:
             try:
@@ -426,11 +512,12 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
             "api_keys": [
                 {
                     "api_key_masked": (k["api_key"][:4] + "****" + k["api_key"][-4:]) if len(k.get("api_key", "")) > 8 else "****",
-                    "api_key": k.get("api_key", ""),
                     "has_go_workspace": bool(k.get("go_workspace_id")),
                     "has_go_cookie": bool(k.get("go_auth_cookie")),
-                    "go_workspace_id": k.get("go_workspace_id", ""),
-                    "go_auth_cookie": k.get("go_auth_cookie", ""),
+                    # Finding i: never ship full secrets to the browser —
+                    # only presence flags + masked values. The UI posts ''
+                    # for unchanged secret fields; the merge below keeps the
+                    # stored value in that case.
                     "enabled": k.get("enabled", True),
                     "alias": k.get("alias", ""),
                 }
@@ -448,7 +535,8 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
         body = await request.json()
         if "api_keys" in body:
             _debug(f"  [config] API keys updated ({len(body['api_keys'])} keys)")
-            save_api_keys(body["api_keys"])
+            merged = _merge_preserved_api_keys(body["api_keys"])
+            save_api_keys(merged)
         if "routing" in body:
             save_env({"API_KEY_ROUTING": body["routing"]})
         return {"status": "ok", "message": "API keys saved."}
@@ -659,7 +747,7 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
 
             return totals, rows, acct_rows
 
-        totals, rows, acct_rows = await asyncio.to_thread(_query_stats)
+        totals, rows, acct_rows = await _db_query_sync(_query_stats)
 
         sum_total = totals["total"]
         models = {}
@@ -729,7 +817,7 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
             ).fetchall()
             return rows
 
-        rows = await asyncio.to_thread(_query_timeseries)
+        rows = await _db_query_sync(_query_timeseries)
 
         return {
             "series": [
@@ -918,7 +1006,7 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
             ).fetchall()
             return rows
 
-        rows = await asyncio.to_thread(_query)
+        rows = await _db_query_sync(_query)
 
         # Aggregate by free_model
         by_model = {}
@@ -1001,16 +1089,141 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
 
     # ── VPN / IP rotation endpoints ──
 
+    async def _ip_stats_db(vpn_manager=None) -> dict:
+        """Per-IP usage stats for the IP History block (free egress IPs).
+
+        Reads the requests table — free/paid split via the `-free` model
+        suffix (the proxy is the only producer of `-free` models), identity
+        = fingerprint profile of the most recent request on that IP,
+        rotation info (server + time) merged from the _ip_history of BOTH
+        stations (dual station — the table only records free_model_ip, not
+        the owning tunnel). Cached 10s (_stats_cache), bounded to the top
+        100 IPs by request count.
+        """
+        import shared_state
+        cached = _stats_cache.get("ip_stats")
+        if cached is not None:
+            return cached
+        stats: dict = {}
+        try:
+            def _query_grouped():
+                return conn.execute(
+                    "SELECT free_model_ip, COUNT(*) AS total,"
+                    "       SUM(CASE WHEN model LIKE '%-free' THEN 1 ELSE 0 END),"
+                    "       SUM(CASE WHEN model NOT LIKE '%-free' THEN 1 ELSE 0 END),"
+                    "       SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END),"
+                    "       SUM(CASE WHEN success = 0 OR success IS NULL THEN 1 ELSE 0 END),"
+                    "       MIN(timestamp), MAX(timestamp)"
+                    " FROM requests"
+                    " WHERE free_model_ip IS NOT NULL AND free_model_ip != ''"
+                    " GROUP BY free_model_ip"
+                    " ORDER BY COUNT(*) DESC, MAX(timestamp) DESC"
+                    " LIMIT 100"
+                ).fetchall()
+
+            def _query_identity():
+                return conn.execute(
+                    "SELECT free_model_ip, identity FROM ("
+                    "  SELECT free_model_ip, identity,"
+                    "         ROW_NUMBER() OVER (PARTITION BY free_model_ip"
+                    "                            ORDER BY timestamp DESC) AS rn"
+                    "  FROM requests"
+                    "  WHERE free_model_ip IS NOT NULL AND free_model_ip != ''"
+                    "    AND identity IS NOT NULL AND identity != ''"
+                    "  ORDER BY timestamp DESC LIMIT 1000"
+                    ") WHERE rn = 1"
+                ).fetchall()
+
+            rows = await _db_query_sync(_query_grouped)
+            id_rows = await _db_query_sync(_query_identity)
+            # Both stations' _ip_history merged — the newer entry wins
+            # (dedup by IP so the free_ip_model table's per-IP rotation data
+            # reflects whichever tunnel last served that IP).
+            def _merged_history():
+                merged: dict = {}
+                for mgr in (vpn_manager,
+                            getattr(shared_state, "vpn_manager_2", None)):
+                    if mgr is None:
+                        continue
+                    for h in mgr._ip_history:
+                        if not h.get("ip"):
+                            continue
+                        old = merged.get(h["ip"])
+                        if old is None or (h.get("time") or "") >= (old.get("time") or ""):
+                            merged[h["ip"]] = h
+                return merged
+
+            rotation_by_ip = _merged_history() if vpn_manager else {}
+            identity_by_ip = {r[0]: r[1] for r in id_rows}
+            for ip, total, free_c, paid_c, ok_c, fail_c, first_seen, last_seen in rows:
+                rot = rotation_by_ip.get(ip) or {}
+                stats[ip] = {
+                    "total": total,
+                    "free_count": free_c,
+                    "paid_count": paid_c,
+                    "success_count": ok_c,
+                    "fail_count": fail_c,
+                    "identity": identity_by_ip.get(ip),
+                    "server": rot.get("server"),
+                    "last_rotation": rot.get("time"),
+                    "first_seen": first_seen,
+                    "last_seen": last_seen,
+                }
+        except Exception as e:
+            _debug(f"  [db] ip_stats query error: {type(e).__name__}: {e}")
+            return {}
+        _stats_cache.set("ip_stats", stats)
+        return stats
+
     @app.get("/api/vpn-status")
     async def get_vpn_status():
         """Get current VPN status, IP, server, and usage stats."""
         import shared_state
         if shared_state.vpn_manager:
             await shared_state.vpn_manager.refresh_status()
+            # [34] dual station — refresh the second tunnel too so its IP /
+            # server shown in the VPN tab stay live.
+            if getattr(shared_state, "vpn_manager_2", None):
+                await shared_state.vpn_manager_2.refresh_status()
             if shared_state.free_ip_pool:
-                return shared_state.free_ip_pool.get_status()
-            return shared_state.vpn_manager.get_status()
-        return {"enabled": False, "status": "not_configured"}
+                data = shared_state.free_ip_pool.get_status()
+            else:
+                data = shared_state.vpn_manager.get_status()
+        else:
+            data = {"enabled": False, "status": "not_configured"}
+        # Per-IP usage stats — injected unconditionally (works in direct mode
+        # too: free_ip is then the residential IP). Frontend polls this
+        # endpoint every 10s while the vpn tab is active.
+        if isinstance(data, dict):
+            data["ip_stats"] = await _ip_stats_db(shared_state.vpn_manager)
+            # [plan] F: cross-station shared state (recent-IP registry +
+            # identity cursor) — lets the VPN tab show why an IP is skipped.
+            rot = getattr(shared_state, "shared_rotation", None)
+            if rot is not None:
+                data["shared_rotation"] = rot.get_status()
+            # [plan] C: real-time extras for the VPN panel — docker event
+            # watcher state (stream alive, last container event) and the
+            # per-station country (current / next / pinned-at / rotation on)
+            # overlaid from the managers: the pool status does not carry
+            # country fields.
+            watcher = getattr(shared_state, "docker_event_watcher", None)
+            if watcher is not None:
+                data["watch_events"] = watcher.get_status()
+            countries = {}
+            for mgr in (getattr(shared_state, "vpn_manager", None),
+                        getattr(shared_state, "vpn_manager_2", None)):
+                if mgr is None:
+                    continue
+                st = mgr.get_status()
+                countries[mgr._station] = {
+                    "current_country": st.get("current_country"),
+                    "next_country": st.get("next_country"),
+                    "country_pinned_at": st.get("country_pinned_at"),
+                    "country_rotation": st.get("country_rotation"),
+                }
+            if countries:
+                data["countries"] = countries
+        return data
 
     @app.get("/api/vpn-config")
     async def get_vpn_config():
@@ -1039,9 +1252,20 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
             if username and password:
                 _write_credentials_env(username, password)
 
-        # Handle config updates (need VPN manager)
+        # Handle config updates (need VPN manager). [plan] F: fan-out to
+        # BOTH stations — identity pool, watchdog backoff and freshness
+        # windows must stay symmetric on dual-station setups (a single
+        # shared registry and one absolute identity cursor globalise them).
         if shared_state.vpn_manager and body:
             await shared_state.vpn_manager.update_config(body)
+            mgr2 = getattr(shared_state, "vpn_manager_2", None)
+            if mgr2 is not None:
+                await mgr2.update_config(body)
+            # [plan] E: new ip_rotation timings drive the free-IP pool too
+            # (rotation_threshold stagger, connect retry, bad TTL, ...).
+            pool = getattr(shared_state, "free_ip_pool", None)
+            if pool is not None:
+                pool.update_config(body)
 
             # Persist changes to config.yaml
             _persist_vpn_config(body)
@@ -1100,20 +1324,52 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
         return result
 
     @app.post("/api/vpn/next")
-    async def next_vpn():
-        """Switch to next VPN server."""
+    async def next_vpn(request: Request):
+        """Switch to next VPN server.
+
+        Body may carry ``station`` (0 = active station, default; 1 = station 1;
+        2 = station 2 — the latter only with dual_station enabled).
+        """
         import shared_state
         if not shared_state.vpn_manager:
             return {"error": "VPN manager not initialized"}
         try:
-            ip_before = shared_state.vpn_manager.current_ip
+            body = await request.json()
+        except Exception:
+            body = {}
+        station = body.get("station", 0)
+        if station == 2:
+            mgr = getattr(shared_state, "vpn_manager_2", None)
+            if mgr is None:
+                return {"error": "station 2 not available (dual_station disabled)"}
+        elif station == 1:
+            mgr = shared_state.vpn_manager
+        else:
+            # 0 → the station the pool currently routes through.
+            mgr = None
+        try:
             if shared_state.free_ip_pool:
-                await shared_state.free_ip_pool.switch_ip()
+                if mgr is None:
+                    # 0 → the station the pool actually routes through.
+                    # switch_ip() rotates the pool's ACTIVE station (which may
+                    # be station 2); if we read station 1 here, a successful
+                    # station-2 rotation would be reported ok:false with the
+                    # wrong station_out — a false negative for the operator.
+                    mgr = shared_state.free_ip_pool.active_station or shared_state.vpn_manager
+                ip_before = mgr.current_ip
+                await shared_state.free_ip_pool.switch_ip(station=mgr)
+                ip_after = mgr.current_ip
+                server = mgr.current_server
+                station_out = mgr._station
             else:
-                await shared_state.vpn_manager.connect_next()
-            ip_after = shared_state.vpn_manager.current_ip
+                mgr = mgr or shared_state.vpn_manager
+                ip_before = mgr.current_ip
+                await mgr.connect_next()
+                ip_after = mgr.current_ip
+                server = mgr.current_server
+                station_out = mgr._station
             ok = bool(ip_after) and (ip_before is None or ip_after != ip_before)
-            return {"ok": ok, "ip": ip_after, "server": shared_state.vpn_manager.current_server}
+            return {"ok": ok, "ip": ip_after, "server": server, "station": station_out}
         except Exception as e:
             return {"error": str(e)}
 
@@ -1230,6 +1486,70 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
 
         return {"ok": True}
 
+    # ── Traffic capture (Wireshark-like raw request view) ──
+
+    @app.get("/api/traffic/status")
+    async def get_traffic_status(request: Request):
+        err = _check_dashboard_token(request)
+        if err:
+            return err
+        return _traffic_capture.status()
+
+    @app.post("/api/traffic/config")
+    async def set_traffic_config(request: Request):
+        err = _check_dashboard_token(request)
+        if err:
+            return err
+        body = await request.json()
+        _traffic_capture.configure(
+            enabled=body.get("enabled"),
+            max_frames=body.get("max_frames"),
+            body_cap=body.get("body_cap"),
+            max_bytes=body.get("max_bytes"),
+        )
+        _debug(f"  [traffic] config updated -> {json.dumps(body)}")
+        return {"ok": True, **(_traffic_capture.status())}
+
+    @app.get("/api/traffic/frames")
+    async def get_traffic_frames(request: Request, limit: int = 200, offset: int = 0,
+                                 method: str = None, path: str = None,
+                                 status: int = None, aborted: bool = None,
+                                 since: float = None):
+        err = _check_dashboard_token(request)
+        if err:
+            return err
+        frames = _traffic_capture.frames(limit=limit, offset=offset,
+                                         method=method, path=path,
+                                         status=status, aborted=aborted,
+                                         since=since)
+        return {"frames": frames, "total": len(frames), "status": _traffic_capture.status()}
+
+    @app.get("/api/traffic/frames/{frame_id}")
+    async def get_traffic_frame_detail(request: Request, frame_id: int):
+        err = _check_dashboard_token(request)
+        if err:
+            return err
+        frame = _traffic_capture.frame_detail(frame_id)
+        if frame is None:
+            return JSONResponse(status_code=404, content={"error": "frame not found"})
+        return frame
+
+    @app.post("/api/traffic/clear")
+    async def clear_traffic(request: Request):
+        err = _check_dashboard_token(request)
+        if err:
+            return err
+        n = _traffic_capture.clear()
+        _debug(f"  [traffic] capture cleared ({n} frames)")
+        return {"ok": True, "cleared": n}
+
+    @app.get("/api/traffic/stats")
+    async def get_traffic_stats(request: Request, window: float = 60.0):
+        err = _check_dashboard_token(request)
+        if err:
+            return err
+        return _traffic_capture.stats(window=max(1.0, window))
+
     @app.get("/api/tools")
     async def get_tools(days: int = 7, all: bool = False):
         """Aggregate tool names from recent requests.
@@ -1245,7 +1565,7 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
                 "SELECT tools FROM requests " + where + " AND tools IS NOT NULL AND tools != '[]'",
                 params,
             ).fetchall()
-        rows = await asyncio.to_thread(_query_tools)
+        rows = await _db_query_sync(_query_tools)
 
         # Aggregate tool names and count occurrences
         tool_counts = {}
@@ -1295,7 +1615,7 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
             total_count = total_row[0] if total_row else 0
             return rows, total_count
 
-        rows, total_count = await asyncio.to_thread(_query_history)
+        rows, total_count = await _db_query_sync(_query_history)
 
         return {
             "logs": [
@@ -1340,7 +1660,7 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
             row = conn.execute("SELECT * FROM requests WHERE id = ?", (req_id,)).fetchone()
             return row
 
-        row = await asyncio.to_thread(_query_request)
+        row = await _db_query_sync(_query_request)
         if not row:
             return JSONResponse(status_code=404, content={"error": "Request not found"})
 
@@ -1401,7 +1721,7 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
                 "accounts": accounts,
                 "tools_used": sorted(tool_set),
             }
-        return await asyncio.to_thread(_query_filters)
+        return await _db_query_sync(_query_filters)
 
     @app.delete("/api/history")
     async def delete_history(before: str = None, all: bool = False, model: str = None):
@@ -1440,5 +1760,5 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
                                 token_usage[m]["cache"] = row[3]
             conn.commit()
 
-        await asyncio.to_thread(_delete)
+        await _db_query_sync(_delete)
         return {"status": "deleted"}

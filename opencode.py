@@ -433,7 +433,7 @@ def _fast_id(prefix: str = "id") -> str:
 
 from dashboard import register_dashboard
 from dashboard import start_quota_fetcher
-from dashboard.display import log as _log, debug as _debug, set_debug_log_file, RichLogHandler, run_terminal_loop
+from dashboard.display import log as _log, debug as _debug, set_debug_log_file, attach_module_logger, attach_panel_logger, RichLogHandler, run_terminal_loop
 from dashboard.events import get_event_manager
 
 # Call after all imports are resolved (requires _debug for logging)
@@ -446,9 +446,15 @@ LOG_DIR = os.path.join(BASE_DIR, "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
 
 # Debug log file setup
+set_debug_log_file(os.path.join(LOG_DIR, "debug.log"))
 if DEBUG:
-    set_debug_log_file(os.path.join(LOG_DIR, "debug.log"))
     _debug("Debug mode enabled — full request/response logging active")
+# [36] G7 — VPN rotation failures must never be silent: attach the
+# vpn_manager / free_ip_pool loggers to debug.log even when DEBUG is off
+# (they fail exactly when the tunnel is down — the moments the trace
+# matters most). Handlers are rotation-aware (see dashboard.display).
+attach_module_logger("vpn_manager")
+attach_module_logger("free_ip_pool")
 
 # Request body size limit (from YAML config, default 10 MB)
 MAX_BODY_SIZE = yaml_get("upstream", "max_body_size", 10 * 1024 * 1024)
@@ -524,7 +530,8 @@ _conn.execute("CREATE INDEX IF NOT EXISTS idx_model ON requests(model)")
 _conn.execute("CREATE INDEX IF NOT EXISTS idx_success ON requests(success)")
 _conn.execute("CREATE INDEX IF NOT EXISTS idx_account ON requests(account_alias)")
 _conn.execute("CREATE INDEX IF NOT EXISTS idx_ts_model ON requests(timestamp, model)")
-for col, default in [("protocol", "NULL"), ("is_stream", "0"), ("thinking", "NULL"), ("effort", "NULL"), ("client_ip", "NULL"), ("account_alias", "NULL"), ("tools", "NULL"), ("tools_used", "NULL"), ("request_body", "NULL"), ("response_body", "NULL"), ("client_user_agent", "NULL"), ("free_model_ip", "NULL")]:
+_conn.execute("CREATE INDEX IF NOT EXISTS idx_free_ip ON requests(free_model_ip)")
+for col, default in [("protocol", "NULL"), ("is_stream", "0"), ("thinking", "NULL"), ("effort", "NULL"), ("client_ip", "NULL"), ("account_alias", "NULL"), ("tools", "NULL"), ("tools_used", "NULL"), ("request_body", "NULL"), ("response_body", "NULL"), ("client_user_agent", "NULL"), ("free_model_ip", "NULL"), ("identity", "NULL")]:
     try:
         _conn.execute(f"ALTER TABLE requests ADD COLUMN {col} TEXT DEFAULT {default}")
     except Exception:
@@ -578,6 +585,13 @@ _db_commit_lock = threading.Lock()
 # Context variable to pass client user-agent from endpoint handlers to _save_request
 # without threading it through every intermediate function call.
 _current_user_agent: contextvars.ContextVar[str] = contextvars.ContextVar('_current_user_agent', default=None)
+
+# Context variable carrying the free-channel attempt (egress IP + identity profile)
+# from the two places a free request actually leaves (_try_free_model_first,
+# _open_free_stream) to the leaf _save_request — same pattern as _current_user_agent.
+# Scoped to the asyncio task handling one client request; never leaks between requests.
+# Value: {"ip": str, "identity": str} — identity = profile impersonate (fingerprint).
+_current_free_attempt: contextvars.ContextVar[dict | None] = contextvars.ContextVar('_current_free_attempt', default=None)
 
 def _db_flush():
     """Force a pending commit. Called periodically and before shutdown."""
@@ -680,7 +694,7 @@ def _db_insert_sync(req_id, timestamp, model, original_model, duration_ms,
                     tokens_input, tokens_output, tokens_cache, success, error,
                     protocol, is_stream, thinking, effort, client_ip, account_alias,
                     tools_json, tools_used_json, request_body_json=None, response_body_json=None,
-                    client_user_agent=None, free_model_ip=None):
+                    client_user_agent=None, free_model_ip=None, identity=None):
     """Synchronous DB insert — called via asyncio.to_thread().
 
     Batches commits: accumulates INSERTs and commits every _DB_COMMIT_BATCH
@@ -699,13 +713,13 @@ def _db_insert_sync(req_id, timestamp, model, original_model, duration_ms,
             INSERT OR REPLACE INTO requests (id, timestamp, model, original_model, duration_ms,
                 tokens_input, tokens_output, tokens_cache, success, error,
                 protocol, is_stream, thinking, effort, client_ip, account_alias, tools, tools_used,
-                request_body, response_body, client_user_agent, free_model_ip)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                request_body, response_body, client_user_agent, free_model_ip, identity)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (req_id, timestamp, model, original_model, duration_ms,
               tokens_input, tokens_output, tokens_cache, 1 if success else 0, error,
               protocol, 1 if is_stream else 0, thinking, effort,
               client_ip, account_alias, tools_json, tools_used_json,
-              request_body_json, response_body_json, client_user_agent, free_model_ip))
+              request_body_json, response_body_json, client_user_agent, free_model_ip, identity))
         # Batch commit logic
         _db_pending_inserts += 1
         now = time.monotonic()
@@ -731,12 +745,24 @@ async def _save_request(req_id, model, original_model, duration_ms,
 	                  tokens_input, tokens_output, tokens_cache, success=True, error=None,
 	                  protocol=None, is_stream=False, thinking=None, effort=None,
 	                  client_ip=None, account_alias=None, tools=None, tools_used=None,
-	                  request_body=None, response_body=None, free_model_ip=None):
+	                  request_body=None, response_body=None, free_model_ip=None,
+	                  identity=None):
     tools_json = json.dumps(tools) if tools else "[]"
     tools_used_json = json.dumps(list(dict.fromkeys(tools_used))) if tools_used else "[]"
     request_body_json = _truncate_body_for_storage(request_body) if request_body else None
     response_body_json = _truncate_body_for_storage(response_body) if response_body else None
     client_user_agent = _current_user_agent.get()
+    # Leaf reader for the free-channel stamp: the two writers set
+    # _current_free_attempt (IP + identity profile) right before the free
+    # request leaves; any save site in the same task picks it up — including
+    # paid-fallback rows, which keep the free IP/identity of the attempt.
+    if free_model_ip is None or identity is None:
+        _attempt = _current_free_attempt.get()
+        if _attempt:
+            if free_model_ip is None:
+                free_model_ip = _attempt.get("ip") or None
+            if identity is None:
+                identity = _attempt.get("identity") or None
     # [30] UTC everywhere — Z suffix so JS Date parsing and SQLite
     # string comparisons agree (naive strings were local wall time).
     timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -745,7 +771,7 @@ async def _save_request(req_id, model, original_model, duration_ms,
         tokens_input, tokens_output, tokens_cache, success, error,
         protocol, is_stream, thinking, effort, client_ip, account_alias,
         tools_json, tools_used_json, request_body_json, response_body_json,
-        client_user_agent, free_model_ip
+        client_user_agent, free_model_ip, identity
     )
     # Fire-and-forget: commit in thread pool so dashboard sees the row quickly
     # without blocking the event loop. A blocked event loop freezes SSE streams
@@ -775,6 +801,8 @@ async def _save_request(req_id, model, original_model, duration_ms,
             "effort": effort,
             "client_ip": client_ip,
             "account_alias": account_alias,
+            "free_model_ip": free_model_ip,
+            "identity": identity,
             "tools": tools or [],
             "tools_used": tools_used_deduped,
         })
@@ -1027,17 +1055,62 @@ async def lifespan(app):
     # ── VPN / IP rotation for free models ──
     import shared_state
     from vpn_manager import VPNManager
+    from shared_rotation import SharedRotationState
     from free_ip_pool import FreeIPPool
-    shared_state.vpn_manager = VPNManager(IP_ROTATION)
+    # Cross-station shared state: recent-IP registry + one absolute identity
+    # cursor. Both stations read/write it so neither re-enters an IP the
+    # other used recently and their live identities never collide.
+    shared_state.shared_rotation = SharedRotationState(IP_ROTATION)
+    shared_state.vpn_manager = VPNManager(IP_ROTATION,
+                                          shared=shared_state.shared_rotation)
     shared_state.vpn_manager.enabled = IP_ROTATION.get("enabled", False)
-    shared_state.free_ip_pool = FreeIPPool(shared_state.vpn_manager)
+    # Dual station ("double embrayage"): a second gluetun tunnel runs in
+    # parallel (station 2) so a free request always lands on a fresh
+    # (model, IP) cooldown key while the other station rotates in the
+    # background. Opt-in via ip_rotation.dual_station (GUI toggle).
+    shared_state.vpn_manager_2 = None
+    if IP_ROTATION.get("dual_station", False):
+        shared_state.vpn_manager_2 = VPNManager(IP_ROTATION, station=2,
+                                                shared=shared_state.shared_rotation)
+        shared_state.vpn_manager_2.enabled = IP_ROTATION.get("enabled", False)
+    shared_state.free_ip_pool = FreeIPPool(shared_state.vpn_manager,
+                                           shared_state.vpn_manager_2)
+    # [plan] E: boot-time fan-out of the ip_rotation timings (connect retry,
+    # bad TTL, rotation stagger) — the pool's built-in defaults are the
+    # conservative legacy values.
+    shared_state.free_ip_pool.update_config(IP_ROTATION)
     global _vpn_manager, _free_ip_pool
     _vpn_manager = shared_state.vpn_manager
     _free_ip_pool = shared_state.free_ip_pool
-    if _vpn_manager.enabled:
-        await _vpn_manager.start()
+    # Start every enabled station in PARALLEL (dual station would otherwise
+    # halve the cold-start: station 2 waits for station 1's full compose-up).
+    # Each start() is fail-soft internally (docker down/logs a warning) so
+    # gather() never raises.
+    _startup_managers = [m for m in (shared_state.vpn_manager,
+                                     shared_state.vpn_manager_2)
+                         if m is not None and m.enabled]
+    if _startup_managers:
+        await asyncio.gather(*(m.start() for m in _startup_managers))
+    # [plan] C: docker event watcher — real-time container lifecycle → per-
+    # station watchdog wake + SSE vpn_event. Fail-open: if docker is missing
+    # or the stream dies, the watchdogs keep their interval pacing and the
+    # dashboard its 10 s poll — never breaks a request.
+    shared_state.docker_event_watcher = None
+    if IP_ROTATION.get("docker_events", True) and _startup_managers:
+        from docker_events import DockerEventWatcher
+        try:
+            _watcher = DockerEventWatcher(
+                {m._docker_container: m for m in _startup_managers})
+            await _watcher.start()
+            shared_state.docker_event_watcher = _watcher
+            _debug(f"  [lifespan] docker event watcher started "
+                   f"({len(_watcher._managers)} containers)")
+        except Exception as e:
+            _debug(f"  [lifespan] docker event watcher failed to start: {e}")
+            shared_state.docker_event_watcher = None
     _debug(f"  [lifespan] VPN manager initialized (enabled={shared_state.vpn_manager.enabled}, "
-           f"mode={shared_state.vpn_manager._mode})")
+           f"mode={shared_state.vpn_manager._mode}, "
+           f"dual_station={bool(shared_state.vpn_manager_2)})")
 
     # Periodic WAL checkpoint
     async def _periodic_checkpoint():
@@ -1112,6 +1185,15 @@ async def lifespan(app):
         pass
     _debug("  [lifespan] background tasks cancelled")
 
+    # Stop the docker event watcher (kills the docker events subprocess)
+    watcher = getattr(shared_state, "docker_event_watcher", None)
+    if watcher is not None:
+        try:
+            await watcher.stop()
+        except Exception as e:
+            _debug(f"  [lifespan] docker event watcher stop failed: {e}")
+        shared_state.docker_event_watcher = None
+
     task = getattr(app.state, '_quota_task', None)
     if task:
         task.cancel()
@@ -1126,6 +1208,9 @@ async def lifespan(app):
     if _vpn_manager:
         await _vpn_manager.stop()
         _debug("  [lifespan] VPN state saved")
+    if getattr(shared_state, "vpn_manager_2", None) is not None:
+        await shared_state.vpn_manager_2.stop()
+        _debug("  [lifespan] VPN station 2 state saved")
     # Close quota fetcher shared client
     from dashboard.quota import _http_client as _quota_client
     if _quota_client and not _quota_client.is_closed:
@@ -1146,7 +1231,7 @@ async def debug_exception(request: Request, exc: Exception):
 # Server manager set later in __main__ for GUI mode; None means always-running
 _server_manager = None
 
-register_dashboard(app, STATIC_DIR, _conn, server_manager_getter=lambda: _server_manager, token_usage=_token_usage, token_lock=_token_lock)
+register_dashboard(app, STATIC_DIR, _conn, server_manager_getter=lambda: _server_manager, token_usage=_token_usage, token_lock=_token_lock, db_lock=_db_commit_lock)
 
 
 # ── Rate Limiting (token bucket, per-IP) ────────────────────────
@@ -1285,6 +1370,23 @@ class AccessLogMiddleware(BaseHTTPMiddleware):
 
 
 app.add_middleware(AccessLogMiddleware)
+
+
+# ── Traffic Capture (Wireshark-like raw request view) ──────────────
+# Outermost middleware: records every client request — raw body bytes,
+# headers, timing, tempo, abrupt disconnects (RST) — into a bounded
+# ring buffer served by /api/traffic/*. Excludes /static, /health and
+# itself. Configurable via the `traffic:` block in config.yaml.
+
+from traffic_capture import capture as _traffic_capture, TrafficCaptureMiddleware
+
+_traffic_capture.configure(
+    enabled=bool(yaml_get("traffic", "enabled", True)),
+    max_frames=int(yaml_get("traffic", "max_frames", 500)),
+    body_cap=int(yaml_get("traffic", "body_cap", 131072)),
+    max_bytes=int(yaml_get("traffic", "max_bytes", 33554432)),
+)
+app.add_middleware(TrafficCaptureMiddleware, capture=_traffic_capture)
 
 
 # ── Circuit Breaker (per-endpoint) ──────────────────────────────
@@ -1477,29 +1579,30 @@ async def _forward_post(endpoint, json, headers):
 # fingerprint on every fresh IP. The profile list and index are owned
 # by vpn_manager (config `ip_rotation.identity_profiles`).
 
-# Curated real User-Agents for the default-profile targets. curl_cffi
-# does not expose its embedded UA strings to Python, but the httpx
-# fallback paths (B/D) need a coherent UA — these are the public
-# browser UA strings matching the impersonation bundles.
-_UA_BY_IMPERSONATE = {
-    "chrome124": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "chrome131": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    "chrome136": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
-    "chrome142": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36",
-    "edge101": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/101.0.4951.64 Safari/537.36 Edg/101.0.1210.53",
-    "firefox135": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:135.0) Gecko/20100101 Firefox/135.0",
-    "safari170": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
-}
+# Curated real User-Agents for the default-profile targets live in
+# vpn_manager (module-level _UA_BY_IMPERSONATE, derived by family from the
+# full supported-impersonation list so the httpx fallback paths stay
+# coherent with the curl_cffi bundles). Re-exported here: _apply_identity
+# reads it, and tests reference oc._UA_BY_IMPERSONATE.
+from vpn_manager import _UA_BY_IMPERSONATE
 
 
-def _current_free_identity() -> dict:
+def _current_free_identity(station=None) -> dict:
     """Active identity profile for free requests (vpn_manager ownership).
 
-    Falls back to the chrome131 default when the VPN manager is absent —
-    identical behavior to before identity rotation existed.
+    Station-aware: returns the identity of the station that will (or did)
+    serve the request. With dual station the two tunnels MUST expose
+    different identities — reading station 1 unconditionally would serve
+    the same fingerprint from both stations. ``station`` defaults to the
+    pool's last-picked station, then station 1. Falls back to the chrome131
+    default when no VPN manager is present — identical behavior to before
+    identity rotation existed.
     """
-    if _vpn_manager:
-        return _vpn_manager.current_identity
+    mgr = (station if station is not None
+           else (_free_ip_pool.active_station if _free_ip_pool else None)
+           or _vpn_manager)
+    if mgr:
+        return mgr.current_identity
     return {"impersonate": "chrome131", "user_agent": None, "extra_headers": {}}
 
 
@@ -1542,13 +1645,16 @@ def _free_request_headers(headers: dict) -> dict:
             and not k.lower().startswith("x-stainless-")}
 
 
-async def _do_free_request_curl_cffi(body: dict, headers: dict, proxy_url: str | None = None):
+async def _do_free_request_curl_cffi(body: dict, headers: dict, proxy_url: str | None = None,
+                                     station=None):
     """Make a free model request using curl_cffi for TLS fingerprint evasion.
 
     Uses the current identity profile's TLS fingerprint (default chrome131)
     and User-Agent to avoid detection.
     When proxy_url is provided (VPN mode), routes through the tunnel so the
     request exits with the VPN IP (fresh free quota per IP).
+    station disambiguates the identity under dual station (the tunnel that
+    egresses this request must be the one whose fingerprint is stamped).
     Returns an httpx-like response object for compatibility.
     """
     try:
@@ -1557,7 +1663,7 @@ async def _do_free_request_curl_cffi(body: dict, headers: dict, proxy_url: str |
         raise RuntimeError("curl_cffi not installed: pip install curl_cffi")
 
     # Strip paid-account artifacts, stamp the identity (bundle UA wins)
-    profile = _current_free_identity()
+    profile = _current_free_identity(station)
     req_headers = _apply_identity(_free_request_headers(headers), profile, use_curated_ua=False)
     req_headers["Content-Type"] = "application/json"
 
@@ -1668,11 +1774,31 @@ async def _open_free_stream(endpoint, body, headers, use_free: bool, count_reque
     whatever the number of attempts).
     """
     if use_free and _free_ip_pool and _free_ip_pool.enabled:
-        proxy_url = await _free_ip_pool.on_request() if count_request else _free_ip_pool.proxy_url
+        # on_request returns (proxy_url, station); the stream path used to
+        # take only the URL, leaving a TUPLE in proxy_url — every free stream
+        # then crashed into the direct fallback (BLOCKING, [plan] E).
+        if count_request:
+            proxy_url, station = await _free_ip_pool.on_request()
+        else:
+            # Retry after a network error: re-use the SAME station/proxy as
+            # the original attempt. Reading the fresh ``proxy_url`` property
+            # here would recompute ``_best_station()`` — a background 429
+            # rotation could then pick the OTHER station, so the retry would
+            # ship the retried request on a different IP than the one whose
+            # (model, IP) cooldown key was counted (finding h). The original
+            # attempt stored its proxy + station in the ContextVar.
+            _attempt = _current_free_attempt.get() or {}
+            proxy_url = _attempt.get("proxy_url")
+            station = _attempt.get("station") if proxy_url else None
         if proxy_url:
             try:
                 from curl_cffi.requests import AsyncSession
-                profile = _current_free_identity()
+                station = station or (_free_ip_pool.active_station if proxy_url else None)
+                profile = _current_free_identity(station)
+                _current_free_attempt.set({"ip": _free_usage_ip(station),
+                                           "identity": profile.get("impersonate") or "",
+                                           "station": station,
+                                           "proxy_url": proxy_url})
                 req_headers = _apply_identity(_free_request_headers(headers),
                                               profile, use_curated_ua=False)
                 req_headers["Content-Type"] = "application/json"
@@ -1694,6 +1820,10 @@ async def _open_free_stream(endpoint, body, headers, use_free: bool, count_reque
         # Direct fallback to the free endpoint: never forward the paid key,
         # cookies or SDK identifiers (invariant A.0), stamp the identity UA.
         profile = _current_free_identity()
+        _current_free_attempt.set({"ip": _free_usage_ip(),
+                                   "identity": profile.get("impersonate") or "",
+                                   "station": None,
+                                   "proxy_url": None})
         free_headers = _apply_identity(_free_request_headers(headers), profile)
         async with _client.stream("POST", endpoint, json=body, headers=free_headers) as resp:
             yield resp
@@ -1746,16 +1876,29 @@ async def _get_cached_public_ip() -> str:
 # FRESH key (the 429 that triggered the rotation only blocks the
 # exhausted IP, never the model on the new IP).
 _free_model_cooldowns: dict[str, float] = {}  # "model|ip" -> monotonic expiry
-_FREE_COOLDOWN_MAX = 86400  # hard ceiling: retry-after beyond 24 h → 1 h default anyway
+_FREE_COOLDOWN_MAX = 86400  # hard ceiling: retry-after beyond 24 h → default below
+# [incident 17/08 PAYANT] zen's free API 429 (FreeUsageLimitError) carries NO
+# retry-after header. The old 3600 s default meant ONE 429 — even a transient
+# tunnel-blip direct fallback — disabled every free attempt for a FULL HOUR
+# (verified: `skipping free model (cooldown active)` every minute 19:32-20:31,
+# a full hour of guaranteed PAID traffic). 120 s bounds the damage: after a
+# rotation the (model, IP) key is fresh anyway, and 120 s ≈ worst-case rotation
+# time + margin. Explicitly-pronounced retry-after values are still honored.
+_FREE_429_DEFAULT = 120.0
 
 
-def _free_cooldown_key(free_model: str) -> str:
-    """Cooldown key = (free model, current egress IP) ([4]).
+def _free_cooldown_key(free_model: str, station=None) -> str:
+    """Cooldown key = (free model, egress IP of the station used) ([4]).
 
-    "direct" when no VPN IP is known (VPN down / direct mode) — in that
-    case there is no fresh-IP path, so the key must stay stable.
+    With dual station, the 429 must cooldown the IP of the station that
+    actually served the request — not station 1's IP, which may be a
+    different, still-fresh key. ``station=None`` → the active station
+    (or station 1 as before). "direct" when no VPN IP is known (VPN
+    down / direct mode) — in that case there is no fresh-IP path, so the
+    key must stay stable.
     """
-    ip = _vpn_manager.current_ip if (_vpn_manager and _vpn_manager.current_ip) else "direct"
+    vpn = station or (_free_ip_pool.active_station if _free_ip_pool else None) or _vpn_manager
+    ip = vpn.current_ip if (vpn and vpn.current_ip) else "direct"
     return f"{free_model}|{ip}"
 
 
@@ -1764,12 +1907,14 @@ def _free_429_cooldown_seconds(retry_after: str = "") -> float:
 
     Accepts a seconds count ("120") or an RFC 9110 HTTP-date
     ("Wed, 21 Oct 2015 07:28:00 GMT") ([7]). Anything unparseable or out
-    of (0, 86400] → 3600 s. An absent retry-after means we don't know
-    the reset time — defaulting long-ish is safe because the cooldown is
-    per-model and cheap (only skips free attempts, never blocks paid).
+    of (0, 86400] → _FREE_429_DEFAULT (120 s). An absent retry-after means
+    we don't know the reset time — [incident 17/08] the OLD 3600 s default
+    made one 429 block ALL free attempts for an hour (an hour of paid); the
+    short default is safe because the key is (model, IP): the background
+    rotation gives a fresh IP/key well within 120 s.
     """
     if not retry_after:
-        return 3600.0
+        return _FREE_429_DEFAULT
     v = 0.0
     try:
         v = float(retry_after)
@@ -1780,14 +1925,14 @@ def _free_429_cooldown_seconds(retry_after: str = "") -> float:
                 parsed = parsed.replace(tzinfo=datetime.timezone.utc)  # HTTP-date is GMT
             v = (parsed - datetime.datetime.now(datetime.timezone.utc)).total_seconds()
         except (TypeError, ValueError, OverflowError):
-            return 3600.0
+            return _FREE_429_DEFAULT
     if 0 < v <= _FREE_COOLDOWN_MAX:
         return v
-    return 3600.0
+    return _FREE_429_DEFAULT
 
 
-def _set_free_cooldown(free_model: str, seconds: float) -> None:
-    key = _free_cooldown_key(free_model)
+def _set_free_cooldown(free_model: str, seconds: float, station=None) -> None:
+    key = _free_cooldown_key(free_model, station)
     expiry = time.monotonic() + seconds
     if len(_free_model_cooldowns) > 32:  # bound memory: drop expired entries
         expired = [m for m, t in _free_model_cooldowns.items() if t <= time.monotonic()]
@@ -1797,8 +1942,8 @@ def _set_free_cooldown(free_model: str, seconds: float) -> None:
     _log(f"  FREE COOLDOWN: {key} for {seconds:.0f}s")
 
 
-def _free_cooldown_active(free_model: str) -> bool:
-    key = _free_cooldown_key(free_model)
+def _free_cooldown_active(free_model: str, station=None) -> bool:
+    key = _free_cooldown_key(free_model, station)
     expiry = _free_model_cooldowns.get(key, 0.0)
     if expiry > 0 and time.monotonic() < expiry:
         return True
@@ -1807,8 +1952,41 @@ def _free_cooldown_active(free_model: str) -> bool:
     return False
 
 
-def _on_free_429_stream(free_model: str, retry_after: str = "") -> None:
+def _free_attempt_station():
+    """The station that served the current free attempt (ContextVar).
+
+    ``None`` when the attempt went direct or no free attempt is running
+    — callers then fall back to the active/last-used station.
+    """
+    attempt = _current_free_attempt.get()
+    return attempt.get("station") if attempt else None
+
+
+def _free_stations_exhausted(free_model: str) -> bool:
+    """True when NO station can serve a fresh free attempt for this model.
+
+    A station is exhausted when its tunnel is down / marked bad by a
+    recent 429, or when the (model, IP) cooldown key of its current IP
+    is still active. Used by strict_free: only refuse the request when
+    every station is truly exhausted — otherwise let the free attempt
+    land on the usable station instead of paying or refusing.
+    """
+    if not _free_ip_pool or not _free_ip_pool._stations:
+        return True
+    for st in _free_ip_pool._stations:
+        if _free_ip_pool._station_usable(st, exclude_approaching=False):
+            if not _free_cooldown_active(free_model, st):
+                return False
+    return True
+
+
+def _on_free_429_stream(free_model: str, retry_after: str = "") -> bool:
     """Free endpoint 429 during streaming: cooldown + paid fallback.
+
+    Returns True when the request must be REFUSED (strict_free mode and
+    both stations exhausted) — the caller then answers 429/503 to the
+    client instead of falling back to paid. Returns False → paid
+    fallback (default behavior).
 
     [0]/[42] restored: a 429 ALSO triggers an IP rotation in the
     background (single-flight via FreeIPPool.on_quota_exhausted; the
@@ -1817,20 +1995,48 @@ def _on_free_429_stream(free_model: str, retry_after: str = "") -> None:
     — the next free attempt on the new IP is NOT blocked by this 429.
     No-op when VPN rotation is off.
     """
-    _set_free_cooldown(free_model, _free_429_cooldown_seconds(retry_after))
+    station = _free_attempt_station()
+    _set_free_cooldown(free_model, _free_429_cooldown_seconds(retry_after), station)
     if _free_ip_pool:
-        _free_ip_pool.on_quota_exhausted()
+        _free_ip_pool.on_quota_exhausted(station)
+    return bool(IP_ROTATION.get("strict_free", False)) and _free_stations_exhausted(free_model)
 
 
-def _free_usage_ip() -> str:
+def _free_usage_ip(station=None) -> str:
     """Best-effort egress IP for free-model usage logging ([9]).
 
-    Never does network I/O — prefers the live VPN IP, falls back to the
-    cached ipify result from the last non-stream probe.
+    Never does network I/O — prefers the live VPN IP of the station
+    used (or station 1 as before), falls back to the cached ipify result
+    from the last non-stream probe.
     """
-    if _vpn_manager and _vpn_manager.current_ip:
-        return _vpn_manager.current_ip
+    vpn = station or (_free_ip_pool.active_station if _free_ip_pool else None) or _vpn_manager
+    if vpn and vpn.current_ip:
+        return vpn.current_ip
     return _public_ip_cache.get("ip", "") or ""
+
+
+class FreeQuotaExhausted(Exception):
+    """Raised by _try_free_model_first in strict_free mode when a 429
+    leaves no usable station (all stations bad/down and their (model, IP)
+    cooldown keys still active). The caller converts this into a 429/503
+    to the client with Retry-After — never a paid fallback."""
+
+    def __init__(self, retry_after: str = ""):
+        super().__init__(f"free quota exhausted on all VPN stations (retry-after={retry_after!r})")
+        self.retry_after = retry_after
+
+
+def _free_quota_exhausted_response(exc: FreeQuotaExhausted, protocol: str):
+    """HTTP refusal for strict_free exhaustion (non-stream requests)."""
+    retry_after = exc.retry_after or "60"
+    if protocol == "anthropic":
+        resp = _anthropic_error(429, f"Free quota exhausted on all VPN stations. Retry after {retry_after}s.",
+                                error_type="rate_limit_error")
+    else:
+        resp = _openai_error(429, f"Free quota exhausted on all VPN stations. Retry after {retry_after}s.",
+                             error_type="rate_limit_error")
+    resp.headers["Retry-After"] = retry_after
+    return resp
 
 
 async def _try_free_model_first(body, headers, protocol, model_id):
@@ -1857,28 +2063,45 @@ async def _try_free_model_first(body, headers, protocol, model_id):
     if not free_model:
         return None  # No free equivalent, proceed with paid
 
-    # Skip free model if its cooldown is active (avoids sequential free→paid latency)
-    if _free_cooldown_active(free_model):
-        _debug(f"  [free] skipping free model {free_model!r} (cooldown active)")
-        return None
+    # Dual-clutch pre-flight: pick the best station BEFORE the cooldown
+    # check. With dual station, a hot (model, IP) key on the best station
+    # is not a dead end — the OTHER station carries a different IP = a
+    # fresh key, so switch immediately instead of falling back to paid.
+    station = _free_ip_pool._best_station() if _free_ip_pool else None
+    if _free_cooldown_active(free_model, station):
+        other = _free_ip_pool._best_station_excluding(station) if (station is not None and _free_ip_pool) else None
+        if other is not None and not _free_cooldown_active(free_model, other):
+            _debug(f"  [free] station {station._station} (model, IP) cooldown active — "
+                   f"dual-clutch switch to station {other._station}")
+            station = other
+        else:
+            _debug(f"  [free] skipping free model {free_model!r} (cooldown active)")
+            return None
 
     _debug(f"  [free] trying free model {free_model!r} instead of {model_id!r}")
 
     # Get current public IP for logging (VPN or direct)
     free_ip = ""
-    if _vpn_manager and _vpn_manager.current_ip:
-        free_ip = _vpn_manager.current_ip
+    vpn = station or _vpn_manager
+    if vpn and vpn.current_ip:
+        free_ip = vpn.current_ip
     else:
         free_ip = await _get_cached_public_ip()
 
-    # Ensure VPN is connected if rotation is enabled
+    # Ensure VPN is connected if rotation is enabled; on_request returns
+    # the BEST station (may differ from the pre-flight pick — e.g. the
+    # preferred one rotated while we were fetching the public IP).
     if _free_ip_pool and _free_ip_pool.enabled:
-        await _free_ip_pool.on_request()
-        if _vpn_manager and _vpn_manager.current_ip:
-            free_ip = _vpn_manager.current_ip
+        _, station = await _free_ip_pool.on_request()
+        vpn = station or _vpn_manager
+        if vpn and vpn.current_ip:
+            free_ip = vpn.current_ip
 
     # Free models don't need authentication — minimal headers + identity UA
-    free_headers = _apply_identity({"Content-Type": "application/json"}, _current_free_identity())
+    free_profile = _current_free_identity(station)
+    _current_free_attempt.set({"ip": free_ip, "identity": free_profile.get("impersonate") or "",
+                               "station": station})
+    free_headers = _apply_identity({"Content-Type": "application/json"}, free_profile)
     free_api_key = "free (no auth)"
     free_workspace = "free (no auth)"
 
@@ -1895,14 +2118,45 @@ async def _try_free_model_first(body, headers, protocol, model_id):
 
     if proxy_mode == "vpn" and _free_ip_pool and _free_ip_pool.enabled:
         # VPN mode: use curl_cffi for TLS fingerprint evasion,
-        # routed through the VPN tunnel (SOCKS5 in docker mode) for a fresh IP
-        proxy_url = _free_ip_pool.proxy_url
-        try:
-            resp = await _do_free_request_curl_cffi(free_body, free_headers, proxy_url)
-            resp_headers = resp.headers
-        except Exception as e:
-            _debug(f"  [free] curl_cffi error: {e}, falling back to httpx")
-            _log(f"  FREE via VPN tunnel FAILED ({e}) → direct fallback (residential IP)")
+        # routed through the chosen station's tunnel (SOCKS5 in docker
+        # mode) for a fresh IP — station.socks5_url guarantees the
+        # request egresses the same station stamped in the contextvar.
+        #
+        # [incident 17/08 PAYANT] If the preferred station's tunnel fails
+        # (transient SOCKS5 blip), try the OTHER station's tunnel BEFORE
+        # the direct httpx fallback: the other station carries a different,
+        # likely-fresh egress IP whose free quota is untouched. The direct
+        # fallback egresses the residential IP (quota long consumed) — its
+        # immediate 429 is exactly what produced the hour-long cooldown
+        # poison. Direct is now ONLY reached when both tunnels are down
+        # (paid fallback is correct behaviour then).
+        attempt_stations = [station] if station is not None else []
+        if attempt_stations and _free_ip_pool:
+            other = _free_ip_pool._best_station_excluding(attempt_stations[0])
+            if other is not None:
+                attempt_stations.append(other)
+        resp = resp_headers = None
+        for idx, attempt in enumerate(attempt_stations):
+            if idx > 0:
+                _log(f"  FREE via station {attempt_stations[0]._station} tunnel FAILED → "
+                     f"dual-clutch to station {attempt._station} tunnel")
+            try:
+                resp = await _do_free_request_curl_cffi(free_body, free_headers,
+                                                        attempt.socks5_url, station=attempt)
+                resp_headers = resp.headers
+                if attempt is not attempt_stations[0]:
+                    station = attempt  # cooldown key + on_quota_exhausted must target THIS IP
+                    if attempt.current_ip:
+                        free_ip = attempt.current_ip
+                    _current_free_attempt.set({"ip": free_ip,
+                                               "identity": _current_free_identity(attempt).get("impersonate") or "",
+                                               "station": attempt})
+                break
+            except Exception as e:
+                _debug(f"  [free] curl_cffi error (station {attempt._station}): {e}")
+        if resp is None:
+            # Both tunnels down → last-resort direct fallback (residential IP).
+            _log("  FREE via BOTH VPN tunnels FAILED → direct fallback (residential IP)")
             try:
                 resp, resp_headers = await _do_request_with_retry(
                     API_BASE_FREE, free_body, free_headers, protocol, retry_on_429=False
@@ -1963,17 +2217,23 @@ async def _try_free_model_first(body, headers, protocol, model_id):
         _log(f"  FREE {free_model!r} RATE LIMITED (429) retry-after={retry_after}s → falling back to paid {model_id!r}")
 
         # Per-(model, IP) cooldown honoring the upstream retry-after ([4])
-        # + background IP rotation ([0]/[42]): the key is (model, current
-        # IP), so the rotation makes the next free attempt a fresh key.
-        _set_free_cooldown(free_model, _free_429_cooldown_seconds(retry_after))
+        # + background IP rotation ([0]/[42]): the key is (model, the
+        # station's current IP), so the rotation makes the next free
+        # attempt a fresh key.
+        _set_free_cooldown(free_model, _free_429_cooldown_seconds(retry_after), station)
         if _free_ip_pool:
-            _free_ip_pool.on_quota_exhausted()
+            _free_ip_pool.on_quota_exhausted(station)
+
+        # strict_free (GUI): when EVERY station is exhausted, refuse
+        # instead of paying — the caller answers 429/503 with Retry-After.
+        if IP_ROTATION.get("strict_free", False) and _free_stations_exhausted(free_model):
+            raise FreeQuotaExhausted(retry_after)
 
         return None
 
     # Other errors → cooldown (60 s) so the next request doesn't retry the
     # free model immediately, then fall back to paid
-    _set_free_cooldown(free_model, 60)
+    _set_free_cooldown(free_model, 60, station)
     _debug(f"  [free] {free_model!r} returned {resp.status_code} → falling back to paid")
     return None
 
@@ -2095,12 +2355,26 @@ async def _save_and_log_request(req_id, model_id, original_model, start_time,
                                  inp, out, cache, protocol, is_stream, thinking_type,
                                  effort, client_ip, account_alias, tools, log_tag="",
                                  tools_used=None, request_body=None, response_body=None,
-                                 free_model_ip=None):
+                                 free_model_ip=None, identity=None):
     """Log success and save to DB with success=True."""
-    # Auto-detect IP for free models if not provided
+    # Free-channel stamp first: the IP/identity of the free attempt beats the
+    # current IP (mid-stream 429 + background rotation must keep the pre-rotation
+    # IP). Falls back to auto-detect for -free models when no stamp exists.
+    if free_model_ip is None or identity is None:
+        _attempt = _current_free_attempt.get()
+        if _attempt:
+            if free_model_ip is None:
+                free_model_ip = _attempt.get("ip") or None
+            if identity is None:
+                identity = _attempt.get("identity") or None
     if free_model_ip is None and "-free" in (model_id or ""):
-        if _vpn_manager and _vpn_manager.current_ip:
-            free_model_ip = _vpn_manager.current_ip
+        # Station actually used by the free attempt (dual station) beats
+        # station 1's IP — a mid-stream 429 + background rotation must
+        # keep the pre-rotation station IP.
+        _station = _free_ip_pool.active_station if _free_ip_pool else None
+        vpn = _station or _vpn_manager
+        if vpn and vpn.current_ip:
+            free_model_ip = vpn.current_ip
         else:
             free_model_ip = await _get_cached_public_ip()
 
@@ -2114,7 +2388,7 @@ async def _save_and_log_request(req_id, model_id, original_model, start_time,
                      protocol=protocol, is_stream=is_stream, thinking=thinking_type, effort=effort,
                      client_ip=client_ip, account_alias=account_alias, tools=tools,
                      tools_used=tools_used, request_body=request_body, response_body=response_body,
-                     free_model_ip=free_model_ip)
+                     free_model_ip=free_model_ip, identity=identity)
     except Exception as e:
         _debug(f"  ✗ save_request failed: {type(e).__name__}: {e}")
         _log(f"  WARN: save_request failed: {type(e).__name__}: {e}")
@@ -2237,23 +2511,57 @@ async def _sse_keepalive(stream_gen, interval: float = _SSE_KEEPALIVE_INTERVAL):
 
     When no chunk is yielded for `interval` seconds, sends `: ping\\n\\n`
     (a comment line, ignored by SSE clients) to keep the connection alive.
+
+    IMPORTANT: the ping timer RACES the upstream read and never cancels it.
+    asyncio.wait_for(anext(...), timeout=interval) would CANCEL the pending
+    anext on a long upstream silence — CancelledError (a BaseException that
+    `except Exception` in the stream generators cannot catch) is thrown into
+    the inner generator, killing the upstream connection, so a stall > 15s
+    terminated the whole stream with EOF and no message_stop. Here the read
+    task keeps waiting across pings: a slow first chunk or a stalled VPN
+    tunnel no longer kills the stream, it just gets bridged by pings.
     """
-    while True:
-        try:
-            chunk = await asyncio.wait_for(anext(stream_gen), timeout=interval)
-            yield chunk
-        except StopAsyncIteration:
-            return
-        except asyncio.TimeoutError:
-            yield b": ping\n\n"
-        except Exception as e:
-            # ClientDisconnect, ConnectionResetError, etc. — client gone, stop gracefully
-            # Log traceback for unexpected errors (like UnboundLocalError) to aid debugging
-            if isinstance(e, (ConnectionError, OSError)):
-                _debug(f"  [stream] keepalive exiting (client gone): {type(e).__name__}: {e}")
+    read_task = ping_task = None
+    try:
+        while True:
+            if read_task is None or read_task.done():
+                read_task = asyncio.ensure_future(anext(stream_gen))
+            if ping_task is None or ping_task.done():
+                ping_task = asyncio.ensure_future(asyncio.sleep(interval))
+            done, _pending = await asyncio.wait(
+                {read_task, ping_task}, return_when=asyncio.FIRST_COMPLETED)
+            if read_task in done:
+                ping_task.cancel()
+                # NOTE: a cancelled task still reports done() == False until the
+                # event loop delivers the cancellation, so the loop-top guard
+                # would re-pass the STALE cancelled task to asyncio.wait → it
+                # completes instantly → bogus ping at t=0. Recycle explicitly.
+                ping_task = None
+                try:
+                    chunk = read_task.result()
+                except StopAsyncIteration:
+                    return
+                except Exception as e:
+                    # ClientDisconnect, ConnectionResetError, etc. — client gone, stop gracefully
+                    # Log traceback for unexpected errors (like UnboundLocalError) to aid debugging
+                    if isinstance(e, (ConnectionError, OSError)):
+                        _debug(f"  [stream] keepalive exiting (client gone): {type(e).__name__}: {e}")
+                    else:
+                        _debug(f"  [stream] keepalive exiting: {type(e).__name__}: {e}\n{traceback.format_exc()}")
+                    return
+                yield chunk
             else:
-                _debug(f"  [stream] keepalive exiting: {type(e).__name__}: {e}\n{traceback.format_exc()}")
-            return
+                # Ping fired while the upstream read is still pending — keep
+                # the read alive (it stays pending in read_task) and let the
+                # client know the proxy is still there.
+                yield b": ping\n\n"
+    finally:
+        if ping_task is not None:
+            ping_task.cancel()
+        if read_task is not None and not read_task.done():
+            # Only reached on a client disconnect / generator teardown —
+            # THERE the upstream abort is correct (client is gone).
+            read_task.cancel()
 
 
 def _route_for(model_name: str, tool_names: list = None) -> dict | None:
@@ -3636,6 +3944,8 @@ async def messages(request: Request):
                                  effort, client_ip, "free (no auth)", tool_names, tools_used=used,
                                  request_body=request_body, response_body=data, free_model_ip=_actual_ip)
                     return Response(content=resp.content, media_type="application/json")
+            except FreeQuotaExhausted as e:
+                return _free_quota_exhausted_response(e, "anthropic")
             except Exception as e:
                 _debug(f"  [free] free model attempt failed: {e}")
 
@@ -3676,6 +3986,8 @@ async def messages(request: Request):
                     model_id = _actual_model  # Log as free model
                 else:
                     resp, a_headers = await _do_request_with_retry(endpoint, body, a_headers, "anthropic")
+            except FreeQuotaExhausted as e:
+                return _free_quota_exhausted_response(e, "anthropic")
             except UpstreamError as e:
                 _debug(f"  ✗ upstream error: {e}")
                 return JSONResponse(status_code=e.status_code, content={"error": str(e)})
@@ -3791,9 +4103,10 @@ async def messages(request: Request):
                                 # keys: a status from the free endpoint says nothing
                                 # about the paid account (CRITIC(2)/CRITIC(3)).
                                 if resp.status_code == 429:
-                                    _on_free_429_stream(free_model, resp.headers.get('retry-after', ''))
+                                    _refuse = _on_free_429_stream(free_model, resp.headers.get('retry-after', ''))
                                 else:
-                                    _set_free_cooldown(free_model, 60)
+                                    _set_free_cooldown(free_model, 60, _free_attempt_station())
+                                    _refuse = False
                                 body = paid_body
                                 endpoint = paid_endpoint
                                 _using_free = False
@@ -3802,6 +4115,20 @@ async def messages(request: Request):
                                 _log(f"  FREE model {resp.status_code} → falling back to paid {_track_model!r}")
                                 _log_free_model_usage(model_id, free_model, "free (no auth)", "free (no auth)",
                                                       resp.status_code, ip=_free_usage_ip())
+                                if _refuse:
+                                    # strict_free (GUI): every station exhausted
+                                    # (bad/down + (model, IP) cooldown active) —
+                                    # refuse instead of paying.
+                                    _retry_after = resp.headers.get('retry-after', '') or "60"
+                                    yield await _stream_error_response(
+                                        req_id, free_model, original_model, start_time,
+                                        429, await resp.aread(), protocol, thinking_type,
+                                        effort, client_ip, "free (no auth)", tool_names,
+                                        {"type": "error",
+                                         "error": {"type": "rate_limit_error",
+                                                   "message": f"Free quota exhausted on all VPN stations. Retry after {_retry_after}s."}},
+                                        request_body=request_body)
+                                    return
                                 continue
                             headers, should_retry = await _handle_429(headers, resp.status_code, _attempt, resp.headers)
                             if should_retry:
@@ -4008,6 +4335,8 @@ async def messages(request: Request):
                                  request_body=request_body, response_body=data, free_model_ip=_actual_ip)
                     return Response(content=json.dumps(openai_to_anthropic(data, original_model), ensure_ascii=False),
                                     media_type="application/json")
+            except FreeQuotaExhausted as e:
+                return _free_quota_exhausted_response(e, "openai")
             except Exception as e:
                 _debug(f"  [free] free model attempt failed: {e}")
         retry_after = int(e.retry_after) + 1
@@ -4027,6 +4356,8 @@ async def messages(request: Request):
                 model_id = _actual_model
             else:
                 resp, headers = await _do_request_with_retry(endpoint, oai_body, headers, "openai")
+        except FreeQuotaExhausted as e:
+            return _free_quota_exhausted_response(e, "openai")
         except UpstreamError as e:
             _debug(f"  ✗ upstream error: {e}")
             return JSONResponse(status_code=e.status_code, content={"error": str(e)})
@@ -4141,9 +4472,10 @@ async def messages(request: Request):
                             # keys: a status from the free endpoint says nothing
                             # about the paid account (CRITIC(2)/CRITIC(3)).
                             if resp.status_code == 429:
-                                _on_free_429_stream(free_model, resp.headers.get('retry-after', ''))
+                                _refuse = _on_free_429_stream(free_model, resp.headers.get('retry-after', ''))
                             else:
-                                _set_free_cooldown(free_model, 60)
+                                _set_free_cooldown(free_model, 60, _free_attempt_station())
+                                _refuse = False
                             _debug(f"  [stream-oai] free model {resp.status_code} → falling back to paid {_paid_model_id!r}")
                             _log(f"  FREE model {resp.status_code} → falling back to paid {_paid_model_id!r}")
                             _log_free_model_usage(_paid_model_id, free_model, "free (no auth)", "free (no auth)",
@@ -4153,6 +4485,20 @@ async def messages(request: Request):
                             model_id = _paid_model_id
                             _req_model_id = _paid_model_id  # Also revert logging model (fixes is_free_model in history)
                             _using_free = False
+                            if _refuse:
+                                # strict_free (GUI): every station exhausted
+                                # (bad/down + (model, IP) cooldown active) —
+                                # refuse instead of paying.
+                                _retry_after = resp.headers.get('retry-after', '') or "60"
+                                yield await _stream_error_response(
+                                    req_id, free_model, original_model, start_time,
+                                    429, await resp.aread(), protocol, thinking_type,
+                                    effort, client_ip, "free (no auth)", tool_names,
+                                    {"type": "error",
+                                     "error": {"type": "rate_limit_error",
+                                               "message": f"Free quota exhausted on all VPN stations. Retry after {_retry_after}s."}},
+                                    request_body=request_body)
+                                return
                             continue
                         hdrs, should_retry = await _handle_429(hdrs, resp.status_code, _attempt, resp.headers)
                         if should_retry:
@@ -4569,6 +4915,8 @@ async def chat_completions(request: Request):
                                          effort, client_ip, "free (no auth)", tool_names, tools_used=used,
                                          request_body=request_body, response_body=data, free_model_ip=_actual_ip)
                             return Response(content=json.dumps(data, ensure_ascii=False), media_type="application/json")
+                    except FreeQuotaExhausted as e:
+                        return _free_quota_exhausted_response(e, "openai")
                     except Exception as e:
                         _debug(f"  [free] free model attempt failed: {e}")
             retry_after = int(e.retry_after) + 1
@@ -4595,6 +4943,8 @@ async def chat_completions(request: Request):
                     model_id = _actual_model
                 else:
                     resp, headers = await _do_request_with_retry(endpoint, body, headers, "openai")
+            except FreeQuotaExhausted as e:
+                return _free_quota_exhausted_response(e, "openai")
             except UpstreamError as e:
                 return JSONResponse(status_code=e.status_code, content={"error": str(e)})
             account_alias = _alias_for_key(_key_from_headers(headers, "openai"))
@@ -4689,9 +5039,10 @@ async def chat_completions(request: Request):
                                 # keys: a status from the free endpoint says nothing
                                 # about the paid account (CRITIC(2)/CRITIC(3)).
                                 if resp.status_code == 429:
-                                    _on_free_429_stream(free_model, resp.headers.get('retry-after', ''))
+                                    _refuse = _on_free_429_stream(free_model, resp.headers.get('retry-after', ''))
                                 else:
-                                    _set_free_cooldown(free_model, 60)
+                                    _set_free_cooldown(free_model, 60, _free_attempt_station())
+                                    _refuse = False
                                 oai_body = paid_oai_body
                                 endpoint = paid_endpoint
                                 _using_free = False
@@ -4700,6 +5051,20 @@ async def chat_completions(request: Request):
                                 _log(f"  FREE model {resp.status_code} → falling back to paid {_track_model!r}")
                                 _log_free_model_usage(model_id, free_model, "free (no auth)", "free (no auth)",
                                                       resp.status_code, ip=_free_usage_ip())
+                                if _refuse:
+                                    # strict_free (GUI): every station exhausted
+                                    # (bad/down + (model, IP) cooldown active) —
+                                    # refuse instead of paying.
+                                    _retry_after = resp.headers.get('retry-after', '') or "60"
+                                    yield await _stream_error_response(
+                                        req_id, free_model, original_model, start_time,
+                                        429, await resp.aread(), protocol, thinking_type,
+                                        effort, client_ip, "free (no auth)", tool_names,
+                                        {"type": "error",
+                                         "error": {"type": "rate_limit_error",
+                                                   "message": f"Free quota exhausted on all VPN stations. Retry after {_retry_after}s."}},
+                                        request_body=request_body)
+                                    return
                                 continue
                             hdrs, should_retry = await _handle_429(hdrs, resp.status_code, _attempt, resp.headers)
                             if should_retry:
@@ -4877,6 +5242,8 @@ async def chat_completions(request: Request):
                                      request_body=request_body, response_body=data, free_model_ip=_actual_ip)
                         oai_response = anthropic_to_openai_response(data, original_model)
                         return Response(content=json.dumps(oai_response, ensure_ascii=False), media_type="application/json")
+                except FreeQuotaExhausted as e:
+                    return _free_quota_exhausted_response(e, "anthropic")
                 except Exception as e:
                     _debug(f"  [free] free model attempt failed: {e}")
         retry_after = int(e.retry_after) + 1
@@ -4895,6 +5262,8 @@ async def chat_completions(request: Request):
                 model_id = _actual_model
             else:
                 resp, a_headers = await _do_request_with_retry(endpoint, anthro_body, a_headers, "anthropic")
+        except FreeQuotaExhausted as e:
+            return _free_quota_exhausted_response(e, "anthropic")
         except UpstreamError as e:
             return JSONResponse(status_code=e.status_code, content={"error": str(e)})
         account_alias = _alias_for_key(a_headers.get("x-api-key", ""))
@@ -4988,9 +5357,10 @@ async def chat_completions(request: Request):
                             # keys: a status from the free endpoint says nothing
                             # about the paid account (CRITIC(2)/CRITIC(3)).
                             if resp.status_code == 429:
-                                _on_free_429_stream(free_model, resp.headers.get('retry-after', ''))
+                                _refuse = _on_free_429_stream(free_model, resp.headers.get('retry-after', ''))
                             else:
-                                _set_free_cooldown(free_model, 60)
+                                _set_free_cooldown(free_model, 60, _free_attempt_station())
+                                _refuse = False
                             anthro_body = paid_anthro_body
                             endpoint = paid_endpoint
                             _using_free = False
@@ -4999,6 +5369,20 @@ async def chat_completions(request: Request):
                             _log(f"  FREE model {resp.status_code} → falling back to paid {_track_model!r}")
                             _log_free_model_usage(model_id, free_model, "free (no auth)", "free (no auth)",
                                                   resp.status_code, ip=_free_usage_ip())
+                            if _refuse:
+                                # strict_free (GUI): every station exhausted
+                                # (bad/down + (model, IP) cooldown active) —
+                                # refuse instead of paying.
+                                _retry_after = resp.headers.get('retry-after', '') or "60"
+                                yield await _stream_error_response(
+                                    req_id, free_model, original_model, start_time,
+                                    429, await resp.aread(), protocol, thinking_type,
+                                    effort, client_ip, "free (no auth)", tool_names,
+                                    {"type": "error",
+                                     "error": {"type": "rate_limit_error",
+                                               "message": f"Free quota exhausted on all VPN stations. Retry after {_retry_after}s."}},
+                                    request_body=request_body)
+                                return
                             continue
                         hdrs, should_retry = await _handle_429(hdrs, resp.status_code, _attempt, resp.headers)
                         if should_retry:
@@ -5315,6 +5699,8 @@ async def responses(request: Request):
                             sse_body = f"data: {payload}\n\ndata: [DONE]\n\n".encode()
                             return Response(content=sse_body, media_type="text/event-stream",
                                             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
+                    except FreeQuotaExhausted as e:
+                        return _free_quota_exhausted_response(e, "anthropic")
                     except Exception as e:
                         _debug(f"  [free] free model attempt failed: {e}")
             retry_after = int(e.retry_after) + 1
@@ -5332,6 +5718,8 @@ async def responses(request: Request):
                     model_id = _actual_model
                 else:
                     resp, a_headers = await _do_request_with_retry(endpoint, anthro_body, a_headers, "anthropic")
+            except FreeQuotaExhausted as e:
+                return _free_quota_exhausted_response(e, "anthropic")
             except UpstreamError as e:
                 return JSONResponse(status_code=e.status_code, content={"error": str(e)})
             account_alias = _alias_for_key(a_headers.get("x-api-key", ""))
@@ -5396,6 +5784,8 @@ async def responses(request: Request):
                 model_id = _actual_model
             else:
                 resp, a_headers = await _do_request_with_retry(endpoint, anthro_body, a_headers, "anthropic")
+        except FreeQuotaExhausted as e:
+            return _free_quota_exhausted_response(e, "anthropic")
         except UpstreamError as e:
             return JSONResponse(status_code=e.status_code, content={"error": str(e)})
         account_alias = _alias_for_key(a_headers.get("x-api-key", ""))
@@ -5463,6 +5853,8 @@ async def responses(request: Request):
                     sse_body = f"data: {payload}\n\ndata: [DONE]\n\n".encode()
                     return Response(content=sse_body, media_type="text/event-stream",
                                     headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
+            except FreeQuotaExhausted as e:
+                return _free_quota_exhausted_response(e, "openai")
             except Exception as e:
                 _debug(f"  [free] free model attempt failed: {e}")
         retry_after = int(e.retry_after) + 1
@@ -5482,6 +5874,8 @@ async def responses(request: Request):
                 model_id = _actual_model
             else:
                 resp, headers = await _do_request_with_retry(endpoint, oai_body, headers, "openai")
+        except FreeQuotaExhausted as e:
+            return _free_quota_exhausted_response(e, "openai")
         except UpstreamError as e:
             return JSONResponse(status_code=e.status_code, content={"error": str(e)})
         account_alias = _alias_for_key(_key_from_headers(headers, "openai"))
@@ -5531,6 +5925,8 @@ async def responses(request: Request):
             model_id = _actual_model
         else:
             resp, headers = await _do_request_with_retry(endpoint, oai_body, headers, "openai")
+    except FreeQuotaExhausted as e:
+        return _free_quota_exhausted_response(e, "openai")
     except UpstreamError as e:
         return JSONResponse(status_code=e.status_code, content={"error": str(e)})
     account_alias = _alias_for_key(_key_from_headers(headers, "openai"))
@@ -5594,10 +5990,12 @@ class ServerManager:
                 lg.propagate = False
             # [46] VPN logs were stderr-only (no handler attached) — route
             # them into the same rich log panel as the rest of the app.
+            # Append, don't replace: attach_module_logger() at startup put a
+            # debug.log FileHandler on these loggers, and replacing handlers
+            # + propagate=False made [vpn]/[vpn-watchdog] lines invisible in
+            # logs/debug.log exactly during AUTH_FAILED incidents.
             for name in ("vpn_manager", "free_ip_pool"):
-                lg = logging.getLogger(name)
-                lg.handlers = [h]
-                lg.propagate = False
+                attach_panel_logger(name, h)
 
             config = Config(self.app, host=self.host, port=self.port, log_level="info", log_config=None,
                             timeout_keep_alive=300)

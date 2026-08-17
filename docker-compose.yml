@@ -11,6 +11,9 @@ services:
       # this container. Reach them over the compose internal network.
       - VPN_SOCKS5_URL=socks5://vpn-gluetun:1080
       - VPN_PROXY_URL=http://vpn-gluetun:8888
+      # Station 2 ("double embrayage") — same reachability rule, port 1081/8889.
+      - VPN_SOCKS5_URL_2=socks5://vpn-gluetun-2:1081
+      - VPN_PROXY_URL_2=http://vpn-gluetun-2:8889
       # [13] docker compose runs from inside this container against the HOST
       # daemon (docker.sock below), so its relative paths (./logs, .env,
       # credentials.env...) resolve on the host. Point it at the host project
@@ -49,7 +52,12 @@ services:
     environment:
       - VPN_SERVICE_PROVIDER=nordvpn
       - VPN_TYPE=openvpn
-      - SERVER_COUNTRIES=Germany
+      # [incident 17/08] gluetun's country enum uses SPACED names
+      # ("United Kingdom", "Czech Republic") — NordVPN file-style
+      # "United_Kingdom"/"Czechia" are rejected with a WARN "not in
+      # choices" and silently break the rotation.
+      - SERVER_COUNTRIES=Germany,Netherlands,France,Spain,Poland,Sweden,Denmark,Finland,Norway,Belgium,Switzerland,Austria,Portugal,Italy,Ireland,United Kingdom,Czech Republic,Estonia,Latvia,Lithuania,Romania,Hungary,Greece,Slovakia,Slovenia,Croatia,Bulgaria,Luxembourg,Iceland,Cyprus,Malta
+      - UPDATER_PERIOD=480h   # gluetun refreshes its own servers list every 20 days (prevent stale list)
       - HTTPPROXY=on
       - HTTPPROXY_LISTENING_ADDRESS=:8888
       - SOCKS5_ENABLED=on
@@ -58,15 +66,87 @@ services:
       - FIREWALL=on
       - PUID=1000
       - PGID=1000
+      # [incident P0] control server — local healthchecks + country pinning
+      # via /v1/vpn/settings. Auth is mandatory since gluetun v3.39.1: the
+      # default role is a JSON ROLE OBJECT, not a bare name — '=normal' made
+      # every boot panic ("missing code for authentication method",
+      # auth.Role.ToLinesNode settings.go:178, restart loop). The JSON role
+      # with the api key lives in credentials.env as
+      # HTTP_CONTROL_SERVER_AUTH_DEFAULT_ROLE (same value as
+      # VPN_CONTROL_API_KEY) — never hard-coded in compose, env_file wins
+      # because no environment: entry repeats the var here. Port 8000 is NOT
+      # published: reached via docker exec / the compose network.
+      - HTTP_CONTROL_SERVER=on
     volumes:
       - gluetun:/gluetun
     restart: unless-stopped
+    # [plan] local healthcheck — hits the control server, NOT external
+    # egress (api.ipify.org at every 30s wasted bandwidth and depended on
+    # an external resolver). $$VPN_CONTROL_API_KEY: the escaped dollar keeps
+    # compose from interpolating it from the HOST env — the sh in the
+    # container expands it from its own env (credentials.env).
     healthcheck:
-      test: ["CMD", "wget", "-q", "-O", "-", "https://api.ipify.org"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 90s
+      test: ["CMD-SHELL", "wget -q -O - -T 5 --header=\"X-API-Key: $$VPN_CONTROL_API_KEY\" http://127.0.0.1:8000/v1/vpn/status"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+
+  # Station 2 ("double embrayage"): a second independent tunnel on its own
+  # loopback ports — two fresh IPs available simultaneously, one station
+  # rotates in background while the other serves free requests.
+  #
+  # Gated behind the "dual-station" profile: with ip_rotation.dual_station
+  # off (the default) the proxy must start WITHOUT waiting on station-2 —
+  # a stuck vpn-gluetun-2 would otherwise block the whole HTTP server at
+  # boot (compose `depends_on` blocks unconditionally). The proxy's own
+  # VPNManager brings station-2 up itself via `docker compose up
+  # vpn-gluetun-2` when dual_station is enabled — explicitly targeting a
+  # profiled service runs it regardless of its profile.
+  vpn-gluetun-2:
+    image: qmcgaw/gluetun
+    profiles: ["dual-station"]
+    container_name: opencode-vpn-2
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    ports:
+      - "127.0.0.1:8889:8889"    # HTTP proxy (loopback only)
+      - "127.0.0.1:1081:1081"    # SOCKS5 proxy (loopback only)
+    env_file:
+      - credentials.env
+    environment:
+      - VPN_SERVICE_PROVIDER=nordvpn
+      - VPN_TYPE=openvpn
+      # [incident 17/08] gluetun's country enum uses SPACED names
+      # ("United Kingdom", "Czech Republic") — NordVPN file-style
+      # "United_Kingdom"/"Czechia" are rejected with a WARN "not in
+      # choices" and silently break the rotation.
+      - SERVER_COUNTRIES=Germany,Netherlands,France,Spain,Poland,Sweden,Denmark,Finland,Norway,Belgium,Switzerland,Austria,Portugal,Italy,Ireland,United Kingdom,Czech Republic,Estonia,Latvia,Lithuania,Romania,Hungary,Greece,Slovakia,Slovenia,Croatia,Bulgaria,Luxembourg,Iceland,Cyprus,Malta
+      - UPDATER_PERIOD=480h   # gluetun refreshes its own servers list every 20 days (prevent stale list)
+      - HTTPPROXY=on
+      - HTTPPROXY_LISTENING_ADDRESS=:8889
+      - SOCKS5_ENABLED=on
+      - SOCKS5_LISTENING_ADDRESS=:1081
+      - DNS_OVER_TLS=on
+      - FIREWALL=on
+      - PUID=1000
+      - PGID=1000
+      # [incident P0] control server — idem (see vpn-gluetun above): role
+      # JSON in credentials.env, no bare '=normal' here.
+      - HTTP_CONTROL_SERVER=on
+    volumes:
+      - gluetun2:/gluetun
+    restart: unless-stopped
+    # [plan] local healthcheck — control server instead of external egress.
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - -T 5 --header=\"X-API-Key: $$VPN_CONTROL_API_KEY\" http://127.0.0.1:8000/v1/vpn/status"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
 
 volumes:
   gluetun:
+  gluetun2:

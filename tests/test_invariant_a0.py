@@ -41,6 +41,7 @@ import json
 import os
 import threading
 import http.server
+from contextlib import asynccontextmanager
 
 import pytest
 
@@ -124,9 +125,11 @@ class _StubPool:
 
     enabled = True
     proxy_url = "socks5://127.0.0.1:1080"
+    active_station = None
 
     async def on_request(self):
-        return self.proxy_url
+        # Real contract since the stream-tuple fix: (proxy_url, station).
+        return self.proxy_url, self.active_station
 
 
 @pytest.fixture
@@ -281,3 +284,223 @@ async def test_path_c_curl_cffi_tunnel_stream(free_env, monkeypatch):
     assert headers.get("user-agent") == bundle_ua, \
         f"Path C: curl_cffi bundle UA expected — silent fallback to direct? {headers.get('user-agent')!r}"
     assert headers.get("anthropic-version") == "2023-06-01"
+
+
+# ── _current_free_identity: station-aware identity resolution ─────────────
+# Pure resolution (opencode.py): explicit station wins, then
+# pool.active_station, then _vpn_manager, then the chrome131 default.
+# No network, no fixtures beyond monkeypatch.
+class _StubIdentityMgr:
+    """Minimal station/manager double: carries a current_identity dict only."""
+
+    def __init__(self, identity):
+        self.current_identity = identity
+
+
+class _StubIdentityPool:
+    """FreeIPPool double exposing only active_station for identity resolution."""
+
+    def __init__(self, active_station=None):
+        self.active_station = active_station
+
+
+def test_current_free_identity_explicit_station_wins_over_pool_active(monkeypatch):
+    """Explicit station param WINS over the pool's last-picked station."""
+    explicit = _StubIdentityMgr(
+        {"impersonate": "firefox144", "user_agent": None, "extra_headers": {}})
+    active = _StubIdentityMgr(
+        {"impersonate": "edge101", "user_agent": None, "extra_headers": {}})
+    monkeypatch.setattr(oc, "_free_ip_pool", _StubIdentityPool(active))
+    monkeypatch.setattr(oc, "_vpn_manager", None)
+    assert oc._current_free_identity(explicit) == explicit.current_identity
+
+
+def test_current_free_identity_defaults_to_pool_active_station(monkeypatch):
+    """station=None → resolves the pool.active_station manager's identity."""
+    active = _StubIdentityMgr(
+        {"impersonate": "edge101", "user_agent": None, "extra_headers": {}})
+    vpn = _StubIdentityMgr(
+        {"impersonate": "firefox144", "user_agent": None, "extra_headers": {}})
+    monkeypatch.setattr(oc, "_free_ip_pool", _StubIdentityPool(active))
+    monkeypatch.setattr(oc, "_vpn_manager", vpn)
+    assert oc._current_free_identity() == active.current_identity
+
+
+def test_current_free_identity_pool_without_active_falls_back_to_vpn_manager(monkeypatch):
+    """Pool present but active_station None → falls back to _vpn_manager."""
+    vpn = _StubIdentityMgr(
+        {"impersonate": "firefox144", "user_agent": None, "extra_headers": {}})
+    monkeypatch.setattr(oc, "_free_ip_pool", _StubIdentityPool(None))
+    monkeypatch.setattr(oc, "_vpn_manager", vpn)
+    assert oc._current_free_identity() == vpn.current_identity
+
+
+def test_current_free_identity_no_pool_falls_back_to_vpn_manager(monkeypatch):
+    """No pool at all → _vpn_manager's identity (historical station-1 face)."""
+    vpn = _StubIdentityMgr(
+        {"impersonate": "edge101", "user_agent": None, "extra_headers": {}})
+    monkeypatch.setattr(oc, "_free_ip_pool", None)
+    monkeypatch.setattr(oc, "_vpn_manager", vpn)
+    assert oc._current_free_identity() == vpn.current_identity
+
+
+def test_current_free_identity_no_manager_returns_chrome131_default(monkeypatch):
+    """No pool, no VPN manager → the chrome131 default dict (pre-rotation face)."""
+    monkeypatch.setattr(oc, "_free_ip_pool", None)
+    monkeypatch.setattr(oc, "_vpn_manager", None)
+    assert oc._current_free_identity() == \
+        {"impersonate": "chrome131", "user_agent": None, "extra_headers": {}}
+
+
+# ── _open_free_stream count_request=False: retry reuses the stored attempt ─
+# Site 2: a retry after a network error must NOT advance the quota counter
+# (no on_request()) — it re-reads the ContextVar from the original attempt.
+# Both branches run fully offline (faked session / faked _client).
+class _StubPoolNeverCount(_StubPool):
+    """Pool double whose on_request() MUST never run on count_request=False.
+
+    proxy_url differs from the ContextVar's in the tests below, so a wrong
+    read of the pool's proxy is caught. on_request raises — it sits OUTSIDE
+    the tunnel branch's try/except, so an accidental call fails loudly.
+    """
+
+    proxy_url = "socks5://127.0.0.1:1999"
+    calls = 0
+
+    async def on_request(self):
+        type(self).calls += 1
+        raise AssertionError("count_request=False must not call pool.on_request() "
+                             "(the quota counter must not advance on a retry)")
+
+
+class _FakeStreamResp:
+    """Minimal response double: status + headers, aclose() no-op."""
+
+    status_code = 200
+    headers = {}
+
+    async def aclose(self):
+        pass
+
+
+class _FakeCurlSession:
+    """curl_cffi AsyncSession double: records constructor kwargs, posts offline.
+
+    `created` is a class-level list of kwargs dicts, cleared per test — the
+    tunnel branch's session=AsyncSession(...) is captured there, letting the
+    test assert proxy=/impersonate= without any socket I/O.
+    """
+
+    created = []
+
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+        type(self).created.append(kwargs)   # captured for the test assertions
+
+    async def post(self, *args, **kwargs):
+        return _FakeStreamResp()
+
+    async def close(self):
+        pass
+
+
+class _FakeHttpxClient:
+    """httpx.AsyncClient double: records stream() calls, yields offline.
+
+    `calls` is a per-instance list of (method, url, kwargs) — the direct
+    fallback branch's `_client.stream(...)` is captured there.
+    """
+
+    def __init__(self):
+        self.calls = []
+
+    @asynccontextmanager
+    async def stream(self, method, url, **kwargs):
+        self.calls.append((method, url, kwargs))
+        yield _FakeStreamResp()
+
+
+@pytest.mark.asyncio
+async def test_open_free_stream_count_false_reuses_stored_station(free_env, monkeypatch):
+    """Retry (count_request=False) re-enters the tunnel with the ContextVar's
+    proxy/station — on_request() is never called, and the stored station is
+    the one resolved by _current_free_identity (not pool.active_station)."""
+    pytest.importorskip("curl_cffi")
+    _StubPoolNeverCount.calls = 0
+    _FakeCurlSession.created.clear()
+
+    pool = _StubPoolNeverCount()
+    pool.active_station = _StubIdentityMgr(
+        {"impersonate": "edge101", "user_agent": None, "extra_headers": {}})
+    monkeypatch.setattr(oc, "_free_ip_pool", pool)
+    # The stored station is an int sentinel here; the real helper would
+    # dereference .current_ip on it — stub it (the IP is already in the
+    # ContextVar, the retry must not touch live state anyway).
+    monkeypatch.setattr(oc, "_free_usage_ip", lambda station=None: "1.2.3.4")
+    monkeypatch.setattr("curl_cffi.requests.AsyncSession", _FakeCurlSession)
+    seen = {}
+
+    def _identity_spy(station=None):
+        seen["station"] = station
+        return {"impersonate": "firefox144", "user_agent": None, "extra_headers": {}}
+
+    monkeypatch.setattr(oc, "_current_free_identity", _identity_spy)
+
+    oc._current_free_attempt.set({"proxy_url": "socks5://127.0.0.1:1080",
+                                  "station": 2,
+                                  "identity": "firefox144",
+                                  "ip": "1.2.3.4"})
+    try:
+        body = {"model": "free-test-model",
+                "messages": [{"role": "user", "content": "hello"}]}
+        async with oc._open_free_stream(oc.API_BASE_FREE, body, dict(PAID_HEADERS),
+                                        use_free=True, count_request=False) as resp:
+            assert resp.status_code == 200
+    finally:
+        oc._current_free_attempt.set({})
+
+    # Quota counter untouched: on_request() must never run on a retry
+    assert _StubPoolNeverCount.calls == 0
+    # Identity resolved from the STORED station (2), not pool.active_station
+    # (a silent fallback to direct would call the spy with station=None)
+    assert seen.get("station") == 2
+    # Tunnel branch really ran, with the ContextVar's proxy (socks5h = the
+    # socks5 fix) — NOT the pool's proxy_url
+    assert len(_FakeCurlSession.created) == 1
+    sess = _FakeCurlSession.created[0]
+    assert sess["impersonate"] == "firefox144"
+    assert sess["proxy"] == "socks5h://127.0.0.1:1080"
+
+
+@pytest.mark.asyncio
+async def test_open_free_stream_count_false_empty_attempt_direct_fallback(free_env, monkeypatch):
+    """No prior attempt (empty ContextVar) → proxy_url None → direct httpx
+    fallback: still no on_request(), and the ContextVar is re-set with
+    station None so the next retry also goes direct."""
+    _StubPoolNeverCount.calls = 0
+    fake_client = _FakeHttpxClient()
+    monkeypatch.setattr(oc, "_free_ip_pool", _StubPoolNeverCount())
+    monkeypatch.setattr(oc, "_client", fake_client)
+
+    oc._current_free_attempt.set({})
+    try:
+        body = {"model": "free-test-model",
+                "messages": [{"role": "user", "content": "hello"}]}
+        async with oc._open_free_stream(oc.API_BASE_FREE, body, dict(PAID_HEADERS),
+                                        use_free=True, count_request=False) as resp:
+            assert resp.status_code == 200
+        # Capture the re-set ContextVar BEFORE the finally reset
+        attempt = oc._current_free_attempt.get() or {}
+    finally:
+        oc._current_free_attempt.set({})
+
+    assert _StubPoolNeverCount.calls == 0
+    assert len(fake_client.calls) == 1
+    method, url, kwargs = fake_client.calls[0]
+    assert method == "POST"
+    assert url == oc.API_BASE_FREE
+    # Direct path stamped the identity UA (invariant A.0)
+    assert kwargs["headers"].get("User-Agent") == oc._UA_BY_IMPERSONATE["chrome131"]
+    # Retry state: station None → the next attempt also falls back direct
+    assert attempt.get("station") is None
+    assert attempt.get("proxy_url") is None

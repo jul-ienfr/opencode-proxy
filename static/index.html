@@ -26,6 +26,7 @@
                 <button class="tab" data-tab="quotas" data-i18n="nav.quotas">Quotas</button>
                 <button class="tab" data-tab="vpn" data-i18n="nav.free_models">Modèles Gratuits</button>
                 <button class="tab" data-tab="config" data-i18n="nav.config">Configuration</button>
+                <button class="tab" data-tab="traffic" data-i18n="nav.traffic">Traffic</button>
                 <button class="tab" data-tab="debug-logs" data-i18n="nav.debug_logs" style="display:none">Debug Logs</button>
             </nav>
             <div class="filter-controls">
@@ -326,6 +327,14 @@
                                 <span id="vpn-server" class="value">—</span>
                             </div>
                             <div class="config-row">
+                                <span class="label">Pays</span>
+                                <span id="vpn-country" class="value">—</span>
+                            </div>
+                            <div class="config-row">
+                                <span class="label">Prochain pays</span>
+                                <span id="vpn-next-country" class="value">—</span>
+                            </div>
+                            <div class="config-row">
                                 <span class="label" data-i18n="vpn.requests_this_ip">Requêtes cette IP</span>
                                 <span id="vpn-requests" class="value">0 / 300</span>
                             </div>
@@ -346,11 +355,84 @@
                                 <input type="number" id="vpn-quota-per-ip" class="config-input" value="300" style="width:80px;font-size:12px" onchange="saveQuotaPerIp()">
                             </div>
                         </div>
+                        <!-- Double station ("double embrayage") -->
+                        <div id="vpn-dual-section" style="margin-top:14px;padding:12px;background:var(--bg-secondary);border-radius:8px">
+                            <div style="display:flex;justify-content:space-between;align-items:center">
+                                <strong style="font-size:13px">Double station (double embrayage)</strong>
+                                <label class="toggle-switch" style="margin:0">
+                                    <input type="checkbox" id="vpn-dual-toggle" onchange="vpnToggleDual(this.checked)">
+                                    <span class="toggle-slider"></span>
+                                </label>
+                            </div>
+                            <div style="font-size:11px;color:var(--text-muted);margin-top:4px">Deux tunnels simultanés : quand une station est épuisée (429) ou approche du quota, l'autre prend le relais immédiatement pendant que la première rotate en arrière-plan.</div>
+                            <div style="display:flex;align-items:center;gap:8px;margin-top:10px">
+                                <span class="label" style="font-size:12px">Mode épuisement</span>
+                                <select id="vpn-exhaust-mode" class="config-input" style="width:200px;font-size:12px" onchange="vpnSaveExhaustMode()">
+                                    <option value="fallback">Fallback payant (défaut)</option>
+                                    <option value="strict">Strict free — refuser 429/503</option>
+                                </select>
+                            </div>
+                            <div id="vpn-dual-hint" style="display:none;font-size:11px;color:var(--warning);margin-top:8px">⚠ Redémarrage du proxy requis pour que la 2e station soit active.</div>
+                            <!-- Station 2 status -->
+                            <div id="vpn-station2-row" style="display:none;margin-top:10px;padding-top:10px;border-top:1px solid var(--border,#333)">
+                                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+                                    <strong style="font-size:12px">Station 2</strong>
+                                    <span id="vpn-station2-status" style="font-size:12px">—</span>
+                                    <button class="btn" onclick="vpnNext(2)" style="font-size:11px;padding:2px 8px" data-i18n="vpn.switch_ip">Changer d'IP</button>
+                                </div>
+                                <div class="config-grid" style="grid-template-columns:1fr 1fr">
+                                    <div class="config-row">
+                                        <span class="label" data-i18n="vpn.current_ip">IP actuelle</span>
+                                        <span id="vpn-station2-ip" class="value" style="font-family:monospace;font-weight:bold">—</span>
+                                    </div>
+                                    <div class="config-row">
+                                        <span class="label" data-i18n="vpn.current_server">Serveur</span>
+                                        <span id="vpn-station2-server" class="value">—</span>
+                                    </div>
+                                    <div class="config-row">
+                                        <span class="label" data-i18n="vpn.requests_this_ip">Requêtes cette IP</span>
+                                        <span id="vpn-station2-requests" class="value">0 / 300</span>
+                                    </div>
+                                    <div class="config-row">
+                                        <span class="label">Pays</span>
+                                        <span id="vpn-station2-country" class="value">—</span>
+                                    </div>
+                                    <div class="config-row">
+                                        <span class="label">Prochain pays</span>
+                                        <span id="vpn-station2-next-country" class="value">—</span>
+                                    </div>
+                                    <div class="config-row">
+                                        <span class="label">État</span>
+                                        <span id="vpn-station2-err" class="value">—</span>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
                         <!-- Action buttons -->
                         <div style="display:flex;gap:8px;margin-top:12px">
                             <button class="btn btn-primary" onclick="vpnConnect()" data-i18n="vpn.connect">Connecter</button>
                             <button class="btn" onclick="vpnNext()" data-i18n="vpn.switch_ip">Changer d'IP</button>
                             <button class="btn btn-danger" onclick="vpnDisconnect()" data-i18n="vpn.disconnect">Déconnecter</button>
+                        </div>
+                        <!-- [plan] C: real-time panel — docker event watcher stream,
+                             shared country cursor, invariant state. Hidden until the
+                             server reports watch_events. -->
+                        <div id="vpn-realtime" style="display:none;margin-top:14px;padding:12px;background:var(--bg-secondary);border-radius:8px">
+                            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+                                <strong style="font-size:13px">Temps réel</strong>
+                                <span id="vpn-watcher" style="font-size:12px">—</span>
+                            </div>
+                            <div class="config-grid" style="grid-template-columns:1fr 1fr">
+                                <div class="config-row">
+                                    <span class="label">Curseur pays</span>
+                                    <span id="vpn-country-cursor" class="value">—</span>
+                                </div>
+                                <div class="config-row">
+                                    <span class="label">Rotation (stagger · file)</span>
+                                    <span id="vpn-rotate-pending" class="value">—</span>
+                                </div>
+                            </div>
+                            <div id="vpn-event-log" style="font-size:11px;font-family:monospace;margin-top:8px;max-height:90px;overflow-y:auto;color:var(--text-muted)"></div>
                         </div>
                     </div>
 
@@ -579,7 +661,7 @@
 
                     <!-- IP History -->
                     <h3 style="margin-top:18px" data-i18n="vpn.ip_history">Historique des IP</h3>
-                    <div id="vpn-ip-history" style="max-height:150px;overflow-y:auto;font-size:12px"></div>
+                    <div id="vpn-ip-history" style="max-height:200px;overflow-y:auto;font-size:12px"></div>
                 </div>
             </section>
 
@@ -840,6 +922,44 @@
                         </tbody>
                     </table>
                     <p class="config-hint" style="margin-top:8px"><span data-i18n="config.models_hint">Estimated request limits based on your plan's dollar caps and per-model pricing.</span> <a href="https://opencode.ai/docs/fr/go/#usage-limits" target="_blank" data-i18n="config.see_docs">See docs</a></p>
+                </div>
+            </section>
+
+            <section id="traffic" class="tab-content">
+                <div class="card">
+                    <h2 data-i18n="traffic.title">Traffic (Wireshark)</h2>
+                    <p class="config-hint" data-i18n="traffic.hint">Raw view of every client request on the wire — methods, paths, headers, body bytes, timing, tempo, and abrupt disconnects (RST).</p>
+                    <div class="config-actions" style="margin-bottom: 12px; gap: 8px; flex-wrap: wrap;">
+                        <label class="checkbox-label" style="font-size:0.85em; cursor:pointer;">
+                            <input type="checkbox" id="traffic-enabled" checked> <span data-i18n="traffic.capture">Capture</span>
+                        </label>
+                        <button class="btn" id="btn-traffic-clear" data-i18n="traffic.clear">Clear</button>
+                        <label class="checkbox-label" style="font-size:0.85em; cursor:pointer;">
+                            <input type="checkbox" id="traffic-auto-refresh" checked> <span data-i18n="traffic.auto_refresh">Auto-refresh</span>
+                        </label>
+                        <input type="text" id="traffic-filter" placeholder="filter path…" style="flex:1;min-width:160px;max-width:280px">
+                        <span id="traffic-status" class="save-status"></span>
+                    </div>
+                    <div class="config-actions" id="traffic-stats-bar" style="gap:12px;font-size:0.85em;flex-wrap:wrap;margin-bottom:10px"></div>
+                    <div style="overflow-x:auto;">
+                        <table class="table" id="traffic-table" style="font-size:0.82em;">
+                            <thead>
+                                <tr>
+                                    <th data-i18n="traffic.time">Time</th>
+                                    <th data-i18n="traffic.delta">&Delta;ms</th>
+                                    <th data-i18n="traffic.method">Method</th>
+                                    <th data-i18n="traffic.path">Path</th>
+                                    <th data-i18n="traffic.status">Status</th>
+                                    <th data-i18n="traffic.ttfb">TTFB</th>
+                                    <th data-i18n="traffic.duration">Dur</th>
+                                    <th data-i18n="traffic.size">Size</th>
+                                    <th data-i18n="traffic.flags">Flags</th>
+                                </tr>
+                            </thead>
+                            <tbody id="traffic-tbody"><tr><td colspan="9" data-i18n="traffic.loading">Loading…</td></tr></tbody>
+                        </table>
+                    </div>
+                    <div id="traffic-detail" class="config-hint" style="margin-top:12px; display:none;"></div>
                 </div>
             </section>
 

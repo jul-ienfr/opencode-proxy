@@ -69,6 +69,13 @@ const LOCALE = {
         'vpn.servers': 'VPN Servers',
         'vpn.add_server': 'Add Server',
         'vpn.ip_history': 'IP History',
+        'vpn.ip': 'IP',
+        'vpn.ip_total': 'Total',
+        'vpn.ip_free': 'Free',
+        'vpn.ip_paid': 'Paid',
+        'vpn.ip_identity': 'Identity',
+        'vpn.ip_last_seen': 'Last seen',
+        'vpn.ip_no_data': 'No IP usage yet',
         'vpn.credentials': 'NordVPN Credentials',
         'vpn.credentials_hint': 'Service credentials from NordVPN dashboard (Manual Setup)',
         'vpn.save_credentials': 'Save',
@@ -212,6 +219,40 @@ const LOCALE = {
         'config.debug_off': 'Debug logging off',
         'config.debug_save': 'Toggle',
         'nav.debug_logs': 'Debug Logs',
+        'nav.traffic': 'Traffic',
+        'traffic.title': 'Traffic (Wireshark)',
+        'traffic.hint': 'Raw view of every client request on the wire — methods, paths, headers, body bytes, timing, tempo, and abrupt disconnects (RST).',
+        'traffic.capture': 'Capture',
+        'traffic.clear': 'Clear',
+        'traffic.auto_refresh': 'Auto-refresh',
+        'traffic.loading': 'Loading…',
+        'traffic.no_data': 'No frames captured yet.',
+        'traffic.time': 'Time',
+        'traffic.delta': 'Δms',
+        'traffic.method': 'Method',
+        'traffic.path': 'Path',
+        'traffic.status': 'Status',
+        'traffic.ttfb': 'TTFB',
+        'traffic.duration': 'Dur',
+        'traffic.size': 'Size',
+        'traffic.flags': 'Flags',
+        'traffic.frames': 'frames',
+        'traffic.rps': 'req/s',
+        'traffic.aborted': 'aborted',
+        'traffic.in_flight': 'in flight',
+        'traffic.slowest': 'slowest',
+        'traffic.avg_delta': 'avg Δ',
+        'traffic.p95_delta': 'p95 Δ',
+        'traffic.p95_ttfb': 'p95 TTFB',
+        'traffic.detail_title': 'Frame {id} — {method} {path}',
+        'traffic.headers': 'Headers',
+        'traffic.body_hex': 'Body (hex dump, {n} bytes)',
+        'traffic.body_trunc': ' (truncated)',
+        'traffic.aborted_by': 'Aborted: {r}',
+        'traffic.no_body': 'No body',
+        'traffic.unknown': '?',
+        'traffic.settings_changed': 'Capture settings saved.',
+        'traffic.cleared': 'Capture cleared.',
         'debug.title': 'Debug Log Viewer',
         'debug.clear': 'Clear Log',
         'debug.cleared': 'Log cleared.',
@@ -312,6 +353,13 @@ const LOCALE = {
         'vpn.servers': 'Serveurs VPN',
         'vpn.add_server': 'Ajouter',
         'vpn.ip_history': 'Historique des IP',
+        'vpn.ip': 'IP',
+        'vpn.ip_total': 'Total',
+        'vpn.ip_free': 'Gratuites',
+        'vpn.ip_paid': 'Payantes',
+        'vpn.ip_identity': 'Identité',
+        'vpn.ip_last_seen': 'Dernière vue',
+        'vpn.ip_no_data': 'Aucune utilisation d\'IP',
         'vpn.credentials': 'Identifiants NordVPN',
         'vpn.credentials_hint': 'Identifiants de service depuis le dashboard NordVPN (Configuration manuelle)',
         'vpn.save_credentials': 'Enregistrer',
@@ -454,6 +502,40 @@ const LOCALE = {
         'config.debug_off': 'Debug désactivé',
         'config.debug_save': 'Basculer',
         'nav.debug_logs': 'Logs Debug',
+        'nav.traffic': 'Trafic',
+        'traffic.title': 'Trafic (Wireshark)',
+        'traffic.hint': 'Vue brute de chaque requête client sur le fil — méthodes, chemins, en-têtes, octets du corps, timing, tempo, et déconnexions abruptes (RST).',
+        'traffic.capture': 'Capture',
+        'traffic.clear': 'Vider',
+        'traffic.auto_refresh': 'Actualisation auto',
+        'traffic.loading': 'Chargement…',
+        'traffic.no_data': 'Aucune frame capturée pour l\'instant.',
+        'traffic.time': 'Heure',
+        'traffic.delta': 'Δms',
+        'traffic.method': 'Méthode',
+        'traffic.path': 'Chemin',
+        'traffic.status': 'Statut',
+        'traffic.ttfb': 'TTFB',
+        'traffic.duration': 'Durée',
+        'traffic.size': 'Taille',
+        'traffic.flags': 'Drapeaux',
+        'traffic.frames': 'frames',
+        'traffic.rps': 'req/s',
+        'traffic.aborted': 'avortées',
+        'traffic.in_flight': 'en vol',
+        'traffic.slowest': 'plus lente',
+        'traffic.avg_delta': 'Δ moy',
+        'traffic.p95_delta': 'Δ p95',
+        'traffic.p95_ttfb': 'TTFB p95',
+        'traffic.detail_title': 'Frame {id} — {method} {path}',
+        'traffic.headers': 'En-têtes',
+        'traffic.body_hex': 'Corps (dump hex, {n} octets)',
+        'traffic.body_trunc': ' (tronqué)',
+        'traffic.aborted_by': 'Avorté : {r}',
+        'traffic.no_body': 'Pas de corps',
+        'traffic.unknown': '?',
+        'traffic.settings_changed': 'Paramètres de capture enregistrés.',
+        'traffic.cleared': 'Capture vidée.',
         'debug.title': 'Visionneuse de Logs Debug',
         'debug.clear': 'Vider le log',
         'debug.cleared': 'Log vidé.',
@@ -750,6 +832,228 @@ function renderDebugLogLines(data) {
     pageInfo.textContent = t('page.of').replace('{c}', debugLogPage).replace('{t}', debugLogTotalPages);
     prevBtn.disabled = debugLogPage <= 1;
     nextBtn.disabled = debugLogPage >= debugLogTotalPages;
+}
+
+// ── Traffic / Wireshark-like raw capture ──
+
+function debounce(fn, ms) {
+    let timer = null;
+    return (...args) => {
+        if (timer) clearTimeout(timer);
+        timer = setTimeout(() => { timer = null; fn(...args); }, ms);
+    };
+}
+
+let trafficFilter = '';
+let trafficLastStats = null;
+
+async function fetchTrafficStatus() {
+    try {
+        return await apiFetch('/api/traffic/status');
+    } catch (e) {
+        console.error('Failed to fetch traffic status:', e);
+        return null;
+    }
+}
+
+async function toggleTrafficCapture(enabled) {
+    const statusEl = document.getElementById('traffic-status');
+    try {
+        await apiFetch('/api/traffic/config', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ enabled })
+        });
+        if (statusEl) {
+            statusEl.textContent = t('traffic.settings_changed');
+            statusEl.className = 'save-status success';
+            setTimeout(() => { statusEl.textContent = ''; }, 2500);
+        }
+    } catch (e) {
+        console.error('Failed to toggle capture:', e);
+        if (statusEl) {
+            statusEl.textContent = 'Error';
+            statusEl.className = 'save-status error';
+        }
+    }
+}
+
+async function clearTrafficCapture() {
+    const statusEl = document.getElementById('traffic-status');
+    try {
+        await apiFetch('/api/traffic/clear', { method: 'POST' });
+        if (statusEl) {
+            statusEl.textContent = t('traffic.cleared');
+            statusEl.className = 'save-status success';
+            setTimeout(() => { statusEl.textContent = ''; }, 2500);
+        }
+        const tbody = document.getElementById('traffic-tbody');
+        if (tbody) {
+            tbody.innerHTML = `<tr><td colspan="9">${t('traffic.no_data')}</td></tr>`;
+        }
+        const detail = document.getElementById('traffic-detail');
+        if (detail) detail.style.display = 'none';
+        trafficRefresh();
+    } catch (e) {
+        console.error('Failed to clear capture:', e);
+        if (statusEl) {
+            statusEl.textContent = 'Error';
+            statusEl.className = 'save-status error';
+        }
+    }
+}
+
+const METHOD_COLORS = {
+    GET: 'var(--success)',
+    POST: 'var(--accent)',
+    PUT: 'var(--warn)',
+    DELETE: 'var(--danger)',
+    PATCH: 'var(--warn)',
+    OPTIONS: 'var(--text-dim)',
+};
+
+function formatDur(ms) {
+    if (ms === null || ms === undefined || isNaN(ms)) return t('traffic.unknown');
+    if (ms < 1000) return Math.round(ms) + 'ms';
+    return (ms / 1000).toFixed(2) + 's';
+}
+
+function renderTrafficStatsBar(status, stats, frames) {
+    const bar = document.getElementById('traffic-stats-bar');
+    if (!bar) return;
+    let chips = [];
+    if (status) {
+        chips.push(`${status.frames} <b>${t('traffic.frames')}</b>`);
+        chips.push(`${status.bytes_stored ? (status.bytes_stored / 1024).toFixed(0) + 'KB' : '0B'} cap`);
+    }
+    if (stats) {
+        chips.push(`${stats.rps} <b>${t('traffic.rps')}</b>`);
+        if (stats.tempo_delta_ms) chips.push(`${t('traffic.avg_delta')} <b>${stats.tempo_delta_ms.p50}ms</b> / p95 <b>${stats.tempo_delta_ms.p95}ms</b>`);
+        if (stats.ttfb_ms) chips.push(`${t('traffic.p95_ttfb')} <b>${formatDur(stats.ttfb_ms.p95)}</b>`);
+        if (stats.duration_ms) chips.push(`${t('traffic.slowest')} <b>${formatDur(stats.duration_ms.max)}</b>`);
+        if (stats.aborted > 0) chips.push(`${t('traffic.aborted')} <b style="color:var(--danger)">${stats.aborted}</b>`);
+        if (stats.in_flight > 0) chips.push(`${t('traffic.in_flight')} <b style="color:var(--warn)">${stats.in_flight}</b>`);
+    }
+    let spark = '';
+    if (frames && frames.length > 1) {
+        // Tempo sparkline: inter-arrival delta per frame, oldest → newest
+        const deltas = frames.slice().reverse().map(f => f.delta_ms || 0);
+        const maxD = Math.max(...deltas, 1);
+        spark = '<span style="display:inline-flex;align-items:flex-end;gap:1px;height:22px;margin-left:6px;">'
+            + deltas.map(d => {
+                const h = Math.max(2, Math.round((d / maxD) * 20));
+                const hot = d > 0 && d < 5;
+                return `<span title="${d}ms" style="width:3px;height:${h}px;background:${hot ? 'var(--danger)' : 'var(--accent)'};opacity:.85"></span>`;
+            }).join('')
+            + '</span>';
+    }
+    bar.innerHTML = chips.map(c => `<span style="white-space:nowrap">${c}</span>`).join(' &nbsp;·&nbsp; ') + spark;
+}
+
+function renderTrafficFrames(data) {
+    const tbody = document.getElementById('traffic-tbody');
+    if (!tbody) return;
+    // Sync capture toggle with server state (baited by config page posts)
+    const capCb = document.getElementById('traffic-enabled');
+    if (capCb && data.status) capCb.checked = !!data.status.enabled;
+    renderTrafficStatsBar(data.status, trafficLastStats, data.frames);
+
+    if (!data.frames || data.frames.length === 0) {
+        tbody.innerHTML = `<tr><td colspan="9" style="color:var(--text-dim)">${t('traffic.no_data')}</td></tr>`;
+        return;
+    }
+    tbody.innerHTML = data.frames.map(f => {
+        const flags = [];
+        if (f.aborted) flags.push(`<span class="flag-abort" title="${escHtml(f.abort_reason || '')}">ABORT</span>`);
+        if (f.truncated) flags.push(`<span class="flag-trunc">TRUNC</span>`);
+        if (f.status === null) flags.push(`<span class="flag-flight">…</span>`);
+        const methodColor = METHOD_COLORS[f.method] || 'var(--text)';
+        const statusCell = f.status !== null
+            ? `<span style="color:${f.status >= 500 ? 'var(--danger)' : f.status >= 400 ? 'var(--warn)' : 'var(--success)'}">${f.status}</span>`
+            : '<span style="color:var(--text-dim)">…</span>';
+        const reqTarget = f.query ? `${f.path}?${f.query}` : f.path;
+        return `<tr data-fid="${f.id}" ${f.aborted ? 'class="row-abort"' : ''} style="cursor:pointer" title="${escHtml(f.request_line)} — ${escHtml(f.client_ip || '')}:${f.client_port ?? ''}">
+            <td style="white-space:nowrap;font-family:monospace;font-size:0.9em">${f.time}<span style="color:var(--text-dim)">.${String(f.time_ms).padStart(3, '0')}</span></td>
+            <td style="white-space:nowrap;text-align:right;font-family:monospace">${f.delta_ms !== null && f.delta_ms !== undefined ? f.delta_ms.toFixed(1) : '-'}</td>
+            <td style="color:${methodColor};font-weight:600">${escHtml(f.method)}</td>
+            <td style="max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:monospace;font-size:0.9em">${escHtml(reqTarget)}</td>
+            <td>${statusCell}</td>
+            <td style="white-space:nowrap;text-align:right;font-family:monospace">${f.ttfb_ms !== null && f.ttfb_ms !== undefined ? f.ttfb_ms.toFixed(0) : '-'}</td>
+            <td style="white-space:nowrap;text-align:right;font-family:monospace">${f.duration_ms !== null && f.duration_ms !== undefined ? f.duration_ms.toFixed(0) : '-'}</td>
+            <td style="white-space:nowrap;text-align:right;font-family:monospace">${f.body_len > 0 ? (f.body_len / 1024).toFixed(1) + 'KB' : '–'}</td>
+            <td style="white-space:nowrap">${flags.join(' ')}</td>
+        </tr>`;
+    }).join('');
+}
+
+async function trafficRefresh() {
+    trafficFilter = (document.getElementById('traffic-filter')?.value || '').trim();
+    const params = new URLSearchParams({ limit: '200' });
+    if (trafficFilter) params.set('path', trafficFilter);
+    try {
+        const [framesData, statsData, statusData] = await Promise.all([
+            apiFetch(`/api/traffic/frames?${params}`),
+            apiFetch('/api/traffic/stats?window=60.0'),
+            apiFetch('/api/traffic/status'),
+        ]);
+        trafficLastStats = statsData;
+        renderTrafficFrames({ ...framesData, status: statusData });
+    } catch (e) {
+        console.error('Failed to refresh traffic:', e);
+        const tbody = document.getElementById('traffic-tbody');
+        if (tbody) tbody.innerHTML = `<tr><td colspan="9" style="color:var(--danger)">Error</td></tr>`;
+    }
+}
+
+async function fetchTrafficFrameDetail(fid) {
+    const detail = document.getElementById('traffic-detail');
+    if (!detail) return;
+    try {
+        detail.style.display = 'block';
+        detail.innerHTML = '<span style="color:var(--text-dim)">' + t('traffic.loading') + '</span>';
+        const f = await apiFetch(`/api/traffic/frames/${fid}`);
+        renderTrafficDetail(detail, f);
+    } catch (e) {
+        console.error('Failed to fetch frame detail:', e);
+        detail.innerHTML = '<span style="color:var(--danger)">Error</span>';
+    }
+}
+
+function renderTrafficDetail(detail, f) {
+    const methodColor = METHOD_COLORS[f.method] || 'var(--text)';
+    const flags = [];
+    if (f.aborted) flags.push(`<span class="flag-abort">ABORT</span>`);
+    if (f.truncated) flags.push(`<span class="flag-trunc">TRUNC</span>`);
+    const metaLines = [
+        `<span style="color:${methodColor};font-weight:700">${escHtml(f.method)}</span> <span style="font-family:monospace">${escHtml(f.request_line)}</span> ${flags.join(' ')}`,
+        `${f.client_ip || '?'}:${f.client_port ?? '?'} &nbsp;·&nbsp; ${f.time}.${String(f.time_ms).padStart(3, '0')} &nbsp;·&nbsp; Δ ${f.delta_ms?.toFixed(1) ?? '-'}ms &nbsp;·&nbsp; TTFB ${f.ttfb_ms != null ? f.ttfb_ms.toFixed(1) + 'ms' : '-'} &nbsp;·&nbsp; dur ${f.duration_ms != null ? f.duration_ms.toFixed(1) + 'ms' : '-'}`,
+    ];
+    if (f.aborted && f.abort_reason) {
+        metaLines.push(`<span style="color:var(--danger)">⚠ ${escHtml(f.abort_reason)}</span>`);
+    }
+    let headersHtml = f.headers && f.headers.length
+        ? f.headers.map(h => `<div><span style="color:var(--text-dim)">${escHtml(h.name)}</span>: <span style="font-family:monospace">${escHtml(h.value)}</span></div>`).join('')
+        : `<span style="color:var(--text-dim)">—</span>`;
+    let hexHtml;
+    if (f.body_hex && f.body_hex.length) {
+        hexHtml = f.body_hex.map(row =>
+            `<div style="display:flex;gap:12px;white-space:pre;font-family:monospace;font-size:0.85em">
+                <span style="color:var(--text-dim);min-width:48px">${row.offset}</span>
+                <span style="min-width:150px">${row.hex}</span>
+                <span>${row.ascii}</span>
+            </div>`).join('');
+    } else {
+        hexHtml = `<span style="color:var(--text-dim)">${t('traffic.no_body')}</span>`;
+    }
+    detail.innerHTML = `
+        <div style="border-bottom:1px solid var(--border);padding-bottom:6px;margin-bottom:8px">
+            <div style="font-weight:600">${t('traffic.detail_title').replace('{id}', f.id).replace('{method}', f.method).replace('{path}', escHtml(f.path))}</div>
+            ${metaLines.join('<br>')}
+        </div>
+        <div style="margin-bottom:8px"><b>${t('traffic.headers')}</b> (${f.headers ? f.headers.length : 0})</div>
+        <div style="margin-bottom:8px;display:grid;grid-template-columns:1fr;gap:1px;max-height:220px;overflow-y:auto">${headersHtml}</div>
+        <div style="margin-bottom:4px"><b>${t('traffic.body_hex').replace('{n}', f.body_len ?? 0)}</b>${f.truncated ? t('traffic.body_trunc') : ''}</div>
+        <div style="background:var(--bg);border:1px solid var(--border);border-radius:4px;padding:8px;overflow-x:auto;max-height:360px;overflow-y:auto">${hexHtml}</div>`;
 }
 
 function formatResetTime(seconds) {
@@ -1772,6 +2076,8 @@ function setupTabs() {
             } else if (target === 'debug-logs') {
                 debugLogPage = 1;
                 fetchDebugLogs(1).then(renderDebugLogLines);
+            } else if (target === 'traffic') {
+                trafficRefresh();
             }
         });
     });
@@ -2216,6 +2522,60 @@ function setupConfig() {
             if (debugLogsTabBtn) debugLogsTabBtn.style.display = enabled ? '' : 'none';
         });
     }
+
+    // ── Traffic tab ──
+    let trafficTimer = null;
+    const trafficCapCb = document.getElementById('traffic-enabled');
+    if (trafficCapCb) {
+        trafficCapCb.addEventListener('change', () => toggleTrafficCapture(trafficCapCb.checked));
+    }
+
+    const trafficClearBtn = document.getElementById('btn-traffic-clear');
+    if (trafficClearBtn) trafficClearBtn.addEventListener('click', clearTrafficCapture);
+
+    // Sync toggle + stats bar with the live server state on load
+    fetchTrafficStatus().then(status => {
+        if (!status) return;
+        if (trafficCapCb) trafficCapCb.checked = !!status.enabled;
+        if (status.frames > 0 && document.querySelector('.tab.active')?.dataset.tab === 'traffic') {
+            trafficRefresh();
+        }
+    });
+
+    const trafficAutoCb = document.getElementById('traffic-auto-refresh');
+    if (trafficAutoCb) {
+        trafficAutoCb.addEventListener('change', (e) => {
+            if (e.target.checked) {
+                trafficRefresh();
+                trafficTimer = setInterval(() => {
+                    const activeTab = document.querySelector('.tab.active');
+                    if (activeTab && activeTab.dataset.tab === 'traffic') trafficRefresh();
+                }, 3000);
+            } else {
+                if (trafficTimer) { clearInterval(trafficTimer); trafficTimer = null; }
+            }
+        });
+    }
+
+    const trafficFilterInput = document.getElementById('traffic-filter');
+    if (trafficFilterInput) {
+        trafficFilterInput.addEventListener('input', debounce(() => {
+            const activeTab = document.querySelector('.tab.active');
+            if (activeTab && activeTab.dataset.tab === 'traffic') trafficRefresh();
+        }, 300));
+    }
+
+    // Clicking a frame row loads its detail (headers + hex dump)
+    const trafficTbody = document.getElementById('traffic-tbody');
+    if (trafficTbody) {
+        trafficTbody.addEventListener('click', (e) => {
+            const row = e.target.closest('tr[data-fid]');
+            if (!row) return;
+            trafficTbody.querySelectorAll('tr.selected').forEach(r => r.classList.remove('selected'));
+            row.classList.add('selected');
+            fetchTrafficFrameDetail(row.dataset.fid);
+        });
+    }
 }
 
 var _refreshing = false;
@@ -2372,6 +2732,17 @@ document.addEventListener('DOMContentLoaded', () => {
             fetchConfig().then(data => {
                 if (data) { configData = data; renderConfig(data); }
             });
+        });
+        // [plan] C: real-time vpn container events (die/start/restart/health)
+        // — refresh the VPN panel immediately. Server-side coalescing caps
+        // this at ≤1 event / 500 ms per subscriber (kill/restart cascades).
+        es.addEventListener('vpn_event', () => {
+            lastEventTs = Date.now();
+            if (window._sseVpnRefresh) clearTimeout(window._sseVpnRefresh);
+            window._sseVpnRefresh = setTimeout(() => {
+                window._sseVpnRefresh = null;
+                refreshVPNStatus();
+            }, 250);
         });
 
         es.onerror = () => {
@@ -2636,6 +3007,12 @@ document.addEventListener('DOMContentLoaded', () => {
                 setProxyModeUI(cfgData.proxy_mode);
             }
 
+            // [35] double embrayage — dual station toggle + exhaust mode
+            const dualToggle = document.getElementById('vpn-dual-toggle');
+            if (dualToggle) dualToggle.checked = cfgData.dual_station || false;
+            const exhaustMode = document.getElementById('vpn-exhaust-mode');
+            if (exhaustMode) exhaustMode.value = cfgData.strict_free ? 'strict' : 'fallback';
+
             // Initialize free models master toggle
             const fmToggle = document.getElementById('fm-toggle');
             const fmLabel = document.getElementById('fm-toggle-label');
@@ -2715,15 +3092,116 @@ document.addEventListener('DOMContentLoaded', () => {
         toggleEl.checked = data.enabled || false;
         toggleLabel.textContent = data.enabled ? (t('vpn.rotation_on') || 'Activé') : (t('vpn.rotation_off') || 'Désactivé');
 
-        // IP History
+        // [35] dual station — station 2 line (payload stations[] from the pool)
+        const s2Row = document.getElementById('vpn-station2-row');
+        const s2Hint = document.getElementById('vpn-dual-hint');
+        if (s2Row) {
+            const station2 = (data.stations || []).find(s => s.station === 2);
+            if (station2) {
+                s2Row.style.display = 'block';
+                if (s2Hint) s2Hint.style.display = 'none';
+                const s2Ip = document.getElementById('vpn-station2-ip');
+                const s2Server = document.getElementById('vpn-station2-server');
+                const s2Req = document.getElementById('vpn-station2-requests');
+                const s2Status = document.getElementById('vpn-station2-status');
+                const s2Err = document.getElementById('vpn-station2-err');
+                if (s2Ip) s2Ip.textContent = station2.current_ip || '—';
+                if (s2Server) s2Server.textContent = station2.current_server || '—';
+                if (s2Req) s2Req.textContent = `${station2.requests_this_ip || 0} / ${station2.quota_per_ip || 300}`;
+                const s2Map = { connected: t('vpn.connected') || 'Connecté', connecting: t('vpn.connecting') || 'Connexion...', disconnected: t('vpn.disconnected') || 'Déconnecté', error: t('vpn.error') || 'Erreur' };
+                if (s2Status) s2Status.textContent = (s2Map[station2.vpn_status] || station2.vpn_status) + (data.active_station === 2 ? ' · active' : '');
+                if (s2Err) {
+                    if (station2.last_rotation_error) s2Err.textContent = '⚠ ' + station2.last_rotation_error;
+                    else if (station2.bad_remaining > 0) s2Err.textContent = 'Cooldown (429) — ' + Math.ceil(station2.bad_remaining) + 's';
+                    else s2Err.textContent = '—';
+                }
+            } else {
+                s2Row.style.display = data.dual_station ? 'block' : 'none';
+                if (s2Hint) s2Hint.style.display = data.dual_station ? 'block' : 'none';
+            }
+        }
+
+        // IP History — stats par IP (payload ip_stats injecté par /api/vpn-status)
         const historyEl = document.getElementById('vpn-ip-history');
-        if (historyEl && data.vpn && data.vpn.ip_history) {
-            historyEl.innerHTML = data.vpn.ip_history.slice().reverse().map(h =>
-                `<div style="padding:3px 0;border-bottom:1px solid var(--border)">
-                    <span style="font-family:monospace">${h.ip}</span>
-                    <span style="color:var(--text-muted)"> — ${h.server} — ${h.time}</span>
-                </div>`
-            ).join('') || '<div style="color:var(--text-muted);padding:4px">Aucun historique</div>';
+        if (historyEl) {
+            const rows = data.ip_stats ? Object.entries(data.ip_stats) : [];
+            if (!rows.length) {
+                historyEl.innerHTML = `<div style="color:var(--text-muted);padding:4px">${t('vpn.ip_no_data') || 'Aucune utilisation d\'IP'}</div>`;
+            } else {
+                historyEl.innerHTML =
+                    '<table style="width:100%"><thead><tr>' +
+                    `<th style="text-align:left">${t('vpn.ip') || 'IP'}</th>` +
+                    `<th>${t('vpn.ip_total') || 'Total'}</th>` +
+                    `<th>${t('vpn.ip_free') || 'Gratuites'}</th>` +
+                    `<th>${t('vpn.ip_paid') || 'Payantes'}</th>` +
+                    `<th>${t('vpn.ip_identity') || 'Identité'}</th>` +
+                    `<th>${t('vpn.ip_last_seen') || 'Dernière vue'}</th>` +
+                    '</tr></thead><tbody>' +
+                    rows.map(([ip, s]) =>
+                        `<tr><td style="font-family:monospace;font-size:12px">${escHtml(ip)}` +
+                        (s.server ? `<div style="font-size:10px;color:var(--text-muted)">${escHtml(s.server)}${s.last_rotation ? ' — ' + formatDateTime(s.last_rotation) : ''}</div>` : '') +
+                        `</td><td style="font-size:12px">${formatNumber(s.total)}</td>` +
+                        `<td style="font-size:12px">${formatNumber(s.free_count)}</td>` +
+                        `<td style="font-size:12px">${formatNumber(s.paid_count)}</td>` +
+                        `<td style="font-size:12px">${escHtml(s.identity) || '—'}</td>` +
+                        `<td style="font-size:12px">${formatDateTime(s.last_seen)}</td></tr>`
+                    ).join('') +
+                    '</tbody></table>';
+            }
+        }
+
+        // [plan] C: real-time panel — country per station, shared cursor,
+        // docker event watcher + invariant state (all fail-open to '—').
+        const countries = data.countries || {};
+        const c1c = countries[1];
+        const c2c = countries[2];
+        const countryEl = document.getElementById('vpn-country');
+        const nextEl = document.getElementById('vpn-next-country');
+        if (countryEl) countryEl.textContent = (c1c && c1c.current_country) || '—';
+        if (nextEl) nextEl.textContent = (c1c && c1c.next_country) || '—';
+        const s2Country = document.getElementById('vpn-station2-country');
+        const s2Next = document.getElementById('vpn-station2-next-country');
+        if (s2Country) s2Country.textContent = (c2c && c2c.current_country) || '—';
+        if (s2Next) s2Next.textContent = (c2c && c2c.next_country) || '—';
+
+        const rt = document.getElementById('vpn-realtime');
+        if (rt) {
+            const we = data.watch_events;
+            if (we) {
+                rt.style.display = '';
+                const watcherEl = document.getElementById('vpn-watcher');
+                if (watcherEl) {
+                    const alive = we.running ? 'live' : 'off';
+                    const color = we.running ? 'var(--success)' : 'var(--warning)';
+                    watcherEl.innerHTML = '<span style="color:' + color + '">● docker events ' + escHtml(alive) + '</span>' +
+                        ' <span style="color:var(--text-muted)">' + (we.events_seen || 0) + ' évts</span>';
+                }
+                const cursorEl = document.getElementById('vpn-country-cursor');
+                if (cursorEl) {
+                    const sr = data.shared_rotation || {};
+                    const cc = sr.country_cursor;
+                    const bySt = sr.last_country_by_station || {};
+                    cursorEl.textContent = (cc !== undefined && cc !== null ? cc : '—') +
+                        ' · s1:' + (bySt[1] || '—') + ' · s2:' + (bySt[2] || '—');
+                }
+                const pendingEl = document.getElementById('vpn-rotate-pending');
+                if (pendingEl) {
+                    const pend = (data.rotate_pending || []).join(',') || 'aucune';
+                    pendingEl.textContent = (data.rotation_stagger || 0) + ' · ' + pend;
+                }
+                const eventLogEl = document.getElementById('vpn-event-log');
+                if (eventLogEl) {
+                    const rows = Object.entries(we.last_seen || {});
+                    eventLogEl.innerHTML = rows.length
+                        ? rows.map(([ctn, e]) =>
+                            '<div style="white-space:nowrap">' + escHtml(ctn) + ' → ' +
+                            escHtml(e.status) + ' <span style="opacity:.6">' +
+                            escHtml(e.time) + '</span></div>').join('')
+                        : '<div style="opacity:.7;font-style:italic">Aucun événement docker observé</div>';
+                }
+            } else {
+                rt.style.display = 'none';
+            }
         }
 
         // Circuit breaker status
@@ -2747,6 +3225,15 @@ document.addEventListener('DOMContentLoaded', () => {
                 cbStatusEl.innerHTML = html || '<span style="color:var(--success)">✓ Tous les serveurs OK</span>';
             } else {
                 cbStatusEl.innerHTML = '<span style="color:var(--success)">✓ Aucun échec enregistré</span>';
+            }
+        }
+        // [36] G7 — last rotation error of the active station, appended last
+        // so the circuit-breaker block above can't overwrite it.
+        if (cbStatusEl) {
+            const s1 = (data.stations || [])[0];
+            const rotErr = (s1 && s1.last_rotation_error) || (data.vpn && data.vpn.last_rotation_error);
+            if (rotErr) {
+                cbStatusEl.innerHTML += `<div style="color:var(--danger);margin-top:6px">⚠ Rotation: ${escHtml(rotErr)}</div>`;
             }
         }
     }
@@ -2955,10 +3442,38 @@ document.addEventListener('DOMContentLoaded', () => {
         refreshVPNStatus();
     };
 
-    window.vpnNext = async function() {
-        const resp = await fetch('/api/vpn/next', { method: 'POST' });
-        const data = await resp.json();
-        if (data.error) alert('Erreur: ' + data.error);
+    window.vpnNext = async function(station) {
+        try {
+            const resp = await fetch('/api/vpn/next', {
+                method: 'POST', headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({station: station || 0})
+            });
+            const data = await resp.json();
+            if (data.error) alert('Erreur: ' + data.error);
+        } catch (e) { alert('Erreur: ' + e); }
+        refreshVPNStatus();
+    };
+
+    // [35] double embrayage — dual station toggle + exhaust mode
+    window.vpnToggleDual = async function(enabled) {
+        await fetch('/api/vpn-config', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({dual_station: !!enabled})
+        });
+        const s2Row = document.getElementById('vpn-station2-row');
+        const s2Hint = document.getElementById('vpn-dual-hint');
+        // Station 2 only comes up at startup (lifespan) — until then, hint.
+        if (s2Row) s2Row.style.display = enabled ? 'block' : 'none';
+        if (s2Hint) s2Hint.style.display = enabled ? 'block' : 'none';
+        refreshVPNStatus();
+    };
+
+    window.vpnSaveExhaustMode = async function() {
+        const strict = document.getElementById('vpn-exhaust-mode').value === 'strict';
+        await fetch('/api/vpn-config', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({strict_free: strict})
+        });
         refreshVPNStatus();
     };
 

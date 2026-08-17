@@ -28,6 +28,7 @@ _debug_file_path = None
 _debug_write_counter = 0
 _DEBUG_FLUSH_INTERVAL = 10  # Flush to disk every N writes (reduces syscall overhead)
 _DEBUG_MAX_SIZE = 10 * 1024 * 1024  # Auto-rotate when file exceeds 10 MB
+_extra_handlers = []  # FileHandlers attached to module loggers (vpn_manager, free_ip_pool)
 
 
 def _rotate_debug_log():
@@ -40,6 +41,14 @@ def _rotate_debug_log():
         if size <= _DEBUG_MAX_SIZE:
             return
         _debug_file.close()
+        # [36] close the module-logger FileHandlers BEFORE the rename —
+        # on Windows an open handle makes os.rename fail with WinError 32.
+        # FileHandler re-opens baseFilename lazily on the next emit.
+        for _fh in _extra_handlers:
+            try:
+                _fh.close()
+            except Exception:
+                pass
         rotated = _debug_file_path + ".1"
         if os.path.exists(rotated):
             os.remove(rotated)
@@ -60,6 +69,51 @@ def set_debug_log_file(path: str):
         _rotate_debug_log()  # Rotate if needed at startup
     except Exception:
         _debug_file = None
+
+
+def attach_module_logger(name: str, level: int = logging.INFO):
+    """Attach the stdlib logger ``name`` to debug.log (rotation-aware).
+
+    Used for critical subsystems (vpn_manager, free_ip_pool) whose failures
+    must be visible in debug.log even when DEBUG is off — rotation failures
+    happen exactly when the tunnel is down, the moments you need the trace
+    most. The handler is registered in ``_extra_handlers`` so rotation
+    closes it before the rename (Windows file lock) and it re-opens the
+    new file lazily on the next emit.
+    """
+    global _debug_file_path
+    if not _debug_file_path:
+        return None
+    logger = logging.getLogger(name)
+    if logger.level == logging.NOTSET or logger.level > level:
+        logger.setLevel(level)
+    fh = logging.FileHandler(_debug_file_path, encoding="utf-8")
+    # Same bracketed-timestamp style as debug()/log() writes to debug.log,
+    # e.g. "[2026-08-17 18:54:50] [vpn_manager] [vpn-watchdog] ...". Keeping
+    # one consistent format lets header-anchored greps find both paths.
+    fh.setFormatter(logging.Formatter("[%(asctime)s] [%(name)s] %(message)s",
+                                      datefmt="%Y-%m-%d %H:%M:%S"))
+    fh.setLevel(level)
+    logger.addHandler(fh)
+    _extra_handlers.append(fh)
+    return fh
+
+
+def attach_panel_logger(name: str, handler: logging.Handler):
+    """Route a module logger to a panel/UI handler WITHOUT dropping existing ones.
+
+    WebServerThread attaches RichLogHandler to vpn_manager/free_ip_pool so
+    their lines appear in the dashboard panel. Replacing ``logger.handlers``
+    here would clobber the debug.log FileHandler installed by
+    attach_module_logger() — exactly what made [vpn]/[vpn-watchdog] lines
+    invisible in logs/debug.log during AUTH_FAILED incidents. Append instead,
+    and stop propagation so records don't double-emit through the root logger.
+    """
+    logger = logging.getLogger(name)
+    if handler not in logger.handlers:
+        logger.addHandler(handler)
+    logger.propagate = False
+    return logger
 
 
 def log(msg: str):
