@@ -552,6 +552,10 @@ class VPNManager:
         # waits for their REAL end before the next attempt.
         self._rotation_max_duration = max(5.0, float(cfg.get("rotation_max_duration", 240.0)))
         self._rotation_op_count = 0
+        # [review 18/08] funnel generation: bumped by the rotation teardown
+        # so a stale worker thread finishing late skips its decrement instead
+        # of corrupting the NEXT rotation's count (see _docker_run).
+        self._rotation_op_generation = 0
         self._rotation_op_event: Optional[asyncio.Event] = None
         self._rotation_loop: Optional[asyncio.AbstractEventLoop] = None
         # Pool-signal observability (am.23): the last real connection-
@@ -1120,7 +1124,11 @@ class VPNManager:
                         if attempt < 2:
                             # Cap the retry pause to the remaining wall so a
                             # late backoff (≤ 60 s) cannot push the rotation
-                            # past its deadline.
+                            # past its deadline. Recompute against the LIVE
+                            # wall: the pre-try `remaining` predates this
+                            # failed attempt and could overshoot it by up to
+                            # the attempt's own duration (review 18/08).
+                            remaining = max(0.0, deadline - self._now_fn())
                             await asyncio.sleep(
                                 min(self._backoff.delay, max(0.05, remaining)))
                     else:
@@ -1133,6 +1141,10 @@ class VPNManager:
                 self._rotation_loop = None
                 self._rotation_op_event = None
                 self._rotation_op_count = 0
+                # [review 18/08] bump the funnel generation: any thread that
+                # is STILL inside subprocess.run belongs to this rotation and
+                # must not decrement into the next rotation's accounting.
+                self._rotation_op_generation += 1
 
             self._set_status(VPNState.ERROR)
             if deadline_hit:
@@ -1881,9 +1893,16 @@ class VPNManager:
         pin/compose would race the first. Reads/writes of the count are
         single-word ops (GIL-stable) and the increment happens before
         subprocess.run (which releases the GIL anyway).
+
+        [review 18/08] funnel generation: the worker captures the rotation
+        generation at op-start and only decrements if it still matches —
+        the rotation teardown bumps the generation, so a thread left over
+        from a cancelled rotation finishing while the NEXT rotation runs
+        can no longer zero the new rotation's count.
         """
         loop = self._rotation_loop
         op_ev = self._rotation_op_event
+        gen = self._rotation_op_generation
         if loop is not None and op_ev is not None:
             self._rotation_op_count += 1
         try:
@@ -1897,8 +1916,15 @@ class VPNManager:
             raise RuntimeError("docker CLI not found on PATH")
         finally:
             if loop is not None and op_ev is not None:
-                self._rotation_op_count = max(0, self._rotation_op_count - 1)
-                loop.call_soon_threadsafe(op_ev.set)
+                # Stale-decrement guard: the rotation's teardown bumped the
+                # generation, so this op belongs to a dead rotation — leave
+                # the (new) count untouched. max(0, …) is belt-and-braces.
+                if self._rotation_op_generation == gen:
+                    self._rotation_op_count = max(0, self._rotation_op_count - 1)
+                try:
+                    loop.call_soon_threadsafe(op_ev.set)
+                except RuntimeError:
+                    pass  # loop already closed at shutdown — nothing to wake
 
     async def _await_rotation_ops_drained(self) -> None:
         """[plan 18/08 §D am.8] Wait for in-flight docker threads to end.
