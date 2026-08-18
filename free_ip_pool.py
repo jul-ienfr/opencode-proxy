@@ -57,6 +57,14 @@ class FreeIPPool:
         # update_config() (config.yaml `ip_rotation`, hot-reloadable).
         self._connect_retry_interval = float(self._CONNECT_RETRY_INTERVAL)
         self._bad_ttl = float(self._BAD_TTL)
+        # [review 18/08 F1a] Late-signal absorption window — SHORT on
+        # purpose (20 s, NOT bad_ttl): long enough for the dial queue of a
+        # request launched before a rotation (connect timeout 10 s +
+        # SOCKS5/TLS handshake) + the teardown recv of in-flight streams,
+        # short enough that a genuinely dead freshly-rotated tunnel is
+        # bad-marked within seconds (étage 0 must not re-strike it for a
+        # full bad_ttl). Stragglers older than this are assumed real.
+        self._late_signal_grace = 20.0
         self._rotation_stagger = 10  # C3: station N rotates (N-1)*stagger earlier
         # [17/08] Max seconds on_request waits for a background rotation
         # when the best station is over-threshold and no other station is
@@ -122,6 +130,7 @@ class FreeIPPool:
             per = self._per[sid] = {
                 "request_count": 0,
                 "session_start": None,
+                "last_confirmed_ip": None,  # [review F1b] repair anchor (current_ip)
                 "ip_stats": {},
                 "last_connect_attempt": None,
                 "last_quota_per_ip": None,  # hot-reload detection (CRITIC(11))
@@ -348,6 +357,10 @@ class FreeIPPool:
         per = self._per_station(station)
         per["request_count"] = 0
         per["session_start"] = time.monotonic()
+        # [review F1b] the rotation anchor: notify_connection_failure diffs
+        # station.current_ip against this to detect a MANAGER repair (re-pin
+        # with no pool rotation involved) and absorb its late-signal tail.
+        per["last_confirmed_ip"] = new_ip
         return new_ip
 
     def on_quota_exhausted(self, station: Optional[VPNManager] = None):
@@ -452,11 +465,35 @@ class FreeIPPool:
         rotation may fail after it landed — its failure must not bad-mark a
         freshly rotated (healthy) station.
         """
-        if self._any_other_usable(station):
-            per = self._per_station(station)
-            if (per["session_start"] is None or
-                    time.monotonic() - per["session_start"] >= self._bad_ttl):
-                per["bad_until"] = time.monotonic() + self._bad_ttl
+        per = self._per_station(station)
+        cur_ip = getattr(station, "current_ip", None)
+        # [review F1b] the repair anchor. The manager's repair path re-pins a
+        # FRESH IP without any pool rotation (session_start untouched) — a
+        # late signal from a pre-repair request must not bad-mark the repaired
+        # healthy tunnel. Two branches:
+        #   (a) no baseline yet: record the current IP WITHOUT touching
+        #       session_start — the FIRST genuine failure still bad-marks
+        #       (étage 0 alive from day one, never silently absorbed by a
+        #       baseline-establishing refresh);
+        #   (b) baseline exists and the IP changed → a repair landed: refresh
+        #       the anchor AND session_start so its late-signal tail is
+        #       absorbed by the grace guard below.
+        if per["last_confirmed_ip"] is None:
+            if cur_ip is not None:
+                per["last_confirmed_ip"] = cur_ip
+        elif cur_ip != per["last_confirmed_ip"]:
+            per["last_confirmed_ip"] = cur_ip
+            per["session_start"] = time.monotonic()
+        # [review F1a] the late-signal absorption window is the SHORT
+        # `_late_signal_grace` (20 s), NOT the full bad_ttl (60 s): a signal
+        # past the dial queue (connect timeout ~10-15 s + SOCKS5/TLS
+        # handshake) + teardown recv is genuine — the dead freshly-rotated
+        # tunnel is bad-marked NOW (étage 0) instead of being re-struck for a
+        # full bad_ttl.
+        if self._any_other_usable(station) and (
+                per["session_start"] is None or
+                time.monotonic() - per["session_start"] >= self._late_signal_grace):
+            per["bad_until"] = time.monotonic() + self._bad_ttl
         station.arm_egress_watchdog()
 
     async def _await_rotation(self, station: VPNManager) -> bool:

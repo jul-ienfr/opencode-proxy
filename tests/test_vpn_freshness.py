@@ -39,6 +39,7 @@ import asyncio
 import contextlib
 import os
 import subprocess
+import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -662,6 +663,34 @@ class TestWatchdogLoop:
                                 mgr._watchdog_interval]
         assert len(recorded) == 4                 # 4th sleep never taken
 
+    @pytest.mark.asyncio
+    async def test_cadence_armed_interval_while_egress_failures(self, tmp_path, monkeypatch):
+        """[plan 18/08 §E2/review 18/08] ARMED state (egress_failures > 0)
+        paces ticks at egress_failure_tick_interval (2 s), not the idle
+        watchdog_interval — the 2 s ramp of the refonte 1d. Backoff still
+        wins when set; the armed cadence is the default while armed."""
+        mgr = FakeVPNManager(_cfg(tmp_path), tmp_path=tmp_path)
+        ticks = {"n": 0}
+
+        async def fake_tick():
+            ticks["n"] += 1
+            mgr._egress_failures = 1          # armed on every tick
+
+        mgr._watchdog_tick = fake_tick
+        recorded = []
+
+        async def fake_sleep(delay):
+            recorded.append(delay)
+            if len(recorded) >= 3:
+                raise asyncio.CancelledError
+
+        monkeypatch.setattr(vm.asyncio, "sleep", fake_sleep)
+        with pytest.raises(asyncio.CancelledError):
+            await mgr._watchdog_loop()
+        assert ticks["n"] == 3
+        assert recorded[:2] == [mgr._egress_failure_tick_interval] * 2
+        assert mgr._egress_failure_tick_interval != mgr._watchdog_interval
+
 
 # ── [plan 18/08 §1c] pool signal → arm + wake ────────────────
 
@@ -715,6 +744,24 @@ class TestArmEgressWatchdog:
 
         assert mgr._last_conn_failure_at is not None
         assert mgr._conn_failure_signal_count == 2
+        # Public keys (am.23) — the exact surface a user debugs from, in
+        # BOTH get_status()["watchdog"] and stack_info(): a parasitic
+        # fast-recover is visible as an armed counter that keeps re-arming.
+        st = mgr.get_status()["watchdog"]
+        assert st["egress_failures"] == mgr._auto_wg_egress_ticks
+        assert st["egress_armed"] is True
+        assert st["egress_threshold"] == mgr._auto_wg_egress_ticks
+        assert st["egress_tick_interval"] == mgr._egress_failure_tick_interval
+        assert st["last_conn_failure_at"] is not None
+        # [review 18/08] the key is signal_count in BOTH surfaces (was
+        # conn_failure_signal_count in get_status — a rename, no API break:
+        # dashboard app.js only reads s.egress_failures).
+        assert st["signal_count"] == 2
+        si = mgr.stack_info()
+        assert si["egress_failures"] == mgr._auto_wg_egress_ticks
+        assert si["egress_armed"] is True
+        assert si["last_conn_failure_at"] is not None
+        assert si["signal_count"] == 2
 
     @pytest.mark.asyncio
     async def test_arm_then_healthy_probe_absorbs_blip(self, tmp_path):
@@ -782,7 +829,8 @@ class TestArmEgressWatchdog:
 
         await mgr._watchdog_tick()        # skip — rotation in flight
 
-        assert mgr._skipped_tick_logged is True
+        assert mgr._skipped_rotation_task is rotation, \
+            "the skip is traced per rotation task (not a resettable flag)"
         assert mgr.calls["restart"] == 0
         assert mgr.escalations == 0
         assert mgr._egress_failures == mgr._auto_wg_egress_ticks  # unchanged
@@ -980,3 +1028,133 @@ class TestConfigHotReload:
         assert cfg["shared_rotation_file"] == "logs/shared_new.json"
         # the plain-valued fields update through the same path
         assert cfg["watchdog_backoff_base"] == 15.0
+
+    @pytest.mark.asyncio
+    async def test_malformed_armed_config_skips_itself_not_fatal(self, tmp_path):
+        """[review 18/08 hot-reload] a malformed form value
+        (float("nope")/int(None)) raised out of update_config → 500 → the
+        WHOLE fan-out was aborted (piège 8). One bad key must skip itself
+        with a warning; the VALID sibling still lands."""
+        mgr = FakeVPNManager(_cfg(tmp_path), tmp_path=tmp_path)
+        await mgr.update_config({
+            "egress_failure_tick_interval": "nope",   # float("nope") raises
+            "auto_wg_egress_ticks": None,             # int(None) raises
+            "ip_probe_budget": 5,                     # valid sibling
+        })
+        assert mgr._egress_failure_tick_interval == 2.0  # untouched (default)
+        assert mgr._auto_wg_egress_ticks == 3             # untouched (default)
+        assert mgr._ip_probe_budget == 5.0                # applied — fan-out alive
+
+# ── [review 18/08 F2] real light probe: multi-endpoint fallback ──
+
+class _FakeHttpxResp:
+    """Minimal httpx.Response stand-in: the probe only closes it."""
+
+    async def aclose(self):
+        pass
+
+
+class _FakeHttpxClient:
+    """Records the CONNECT attempts; raises on URLs marked dead.
+
+    send() mirrors the real call shape (request, stream=...). The tuple
+    request comes from the fake httpx.Request below — (method, url).
+    """
+
+    def __init__(self, behavior, record, **kw):
+        self._behavior, self._record = behavior, record
+        self.closed = False
+
+    async def send(self, request, stream=False):
+        url = request[1]
+        self._record.append(url)
+        if not self._behavior.get(url, True):
+            raise RuntimeError(f"connect failed: {url}")
+        return _FakeHttpxResp()
+
+    async def aclose(self):
+        self.closed = True
+
+
+class _FakeHttpx:
+    """Fake httpx MODULE (stubbed into sys.modules — the probe imports
+    httpx inside the function, piège 4: never setattr on vpn_manager)."""
+
+    def __init__(self, behavior, record):
+        self._behavior, self._record = behavior, record
+
+    def AsyncClient(self, **kw):
+        return _FakeHttpxClient(self._behavior, self._record, **kw)
+
+    def Timeout(self, value):
+        return value
+
+    def Request(self, method, url):
+        return (method, url)
+
+
+class TestProbeTunnelLightEndpoints:
+    """[review 18/08 F2] the REAL _probe_tunnel_light walks the rotated
+    ip_check chain per-attempt: a dead sticky endpoint must NOT false-death
+    a healthy tunnel (the old single-endpoint probe escalated a full
+    recovery for nothing). Walk order is sticky-first (base index), the
+    last live endpoint becomes sticky, and a total failure leaves the
+    index untouched."""
+
+    def _mgr(self, tmp_path, urls):
+        mgr = FakeVPNManager(_cfg(tmp_path), tmp_path=tmp_path)
+        # Bind the REAL probe onto the instance (the fake class method is
+        # only for tick-level tests; here the probe itself is under test).
+        mgr._probe_tunnel_light = vm.VPNManager._probe_tunnel_light.__get__(mgr)
+        mgr._ip_check_urls = urls
+        mgr._ip_check_idx = 0
+        return mgr
+
+    def _patch(self, monkeypatch, behavior):
+        record = []
+        monkeypatch.setitem(sys.modules, "httpx",
+                            _FakeHttpx(behavior, record))
+        return record
+
+    @pytest.mark.asyncio
+    async def test_dead_first_endpoint_falls_through_to_alive(self, tmp_path, monkeypatch):
+        """The STICKY endpoint is dead but the next one answers → probe
+        True, the sticky index advances to the live one (subsequent probes
+        hit the responsive host first)."""
+        mgr = self._mgr(tmp_path, ["http://a", "http://b", "http://c"])
+        record = self._patch(monkeypatch, {"http://a": False})
+
+        ok = await mgr._probe_tunnel_light()
+
+        assert ok is True
+        assert record == ["http://a", "http://b"]
+        assert mgr._ip_check_idx == 1
+
+    @pytest.mark.asyncio
+    async def test_sticky_first_when_all_alive(self, tmp_path, monkeypatch):
+        """Base index 1, all endpoints alive → exactly ONE attempt (the
+        sticky one) — no wasted probes on a healthy chain."""
+        mgr = self._mgr(tmp_path, ["http://a", "http://b", "http://c"])
+        mgr._ip_check_idx = 1
+        record = self._patch(monkeypatch, {})
+
+        ok = await mgr._probe_tunnel_light()
+
+        assert ok is True
+        assert record == ["http://b"]
+        assert mgr._ip_check_idx == 1
+
+    @pytest.mark.asyncio
+    async def test_all_dead_false_index_unchanged(self, tmp_path, monkeypatch):
+        """Every endpoint dead → False (the tick ramps egress_dead), the
+        full chain is swept, and the index stays where it was."""
+        mgr = self._mgr(tmp_path, ["http://a", "http://b", "http://c"])
+        record = self._patch(monkeypatch,
+                             {"http://a": False, "http://b": False,
+                              "http://c": False})
+
+        ok = await mgr._probe_tunnel_light()
+
+        assert ok is False
+        assert record == ["http://a", "http://b", "http://c"]
+        assert mgr._ip_check_idx == 0

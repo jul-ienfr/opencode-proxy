@@ -519,9 +519,12 @@ class VPNManager:
         self._egress_failure_tick_interval = max(
             0.5, float(cfg.get("egress_failure_tick_interval", 2.0)))
         self._ip_probe_budget = max(1.0, float(cfg.get("ip_probe_budget", 8.0)))
-        # Pool-signal observability (am.23): the skipped-tick trace flag and
-        # the last real connection-failure report (time + count).
-        self._skipped_tick_logged = False
+        # Pool-signal observability (am.23): the last real connection-
+        # failure report (time + count) and the skipped-tick trace — per
+        # ROTATION TASK, not a global flag (a flag that resets on any normal
+        # tick loses the "lost pool wake on rotation X" trace; a per-task
+        # pointer re-logs for each distinct rotation).
+        self._skipped_rotation_task: Optional[asyncio.Task] = None
         self._last_conn_failure_at: Optional[float] = None
         self._conn_failure_signal_count = 0
         # [plan 18/08 §3c] Auto-mode reliability counters. Clock is
@@ -1283,22 +1286,46 @@ class VPNManager:
         import httpx
         try:
             urls = self._ip_check_urls or [self._ip_check_url]
-            url = urls[self._ip_check_idx % len(urls)]
-            client = httpx.AsyncClient(
-                proxy=self.socks5_url,
-                timeout=httpx.Timeout(self._ip_probe_budget))
-            try:
-                resp = await asyncio.wait_for(
-                    client.send(httpx.Request("CONNECT", url), stream=True),
-                    self._ip_probe_budget)
-                # Release the unread stream without downloading the body
-                # (bounded — a stuck tunnel must not cost the whole budget).
-                await asyncio.wait_for(resp.aclose(), 1.0)
-            finally:
-                await client.aclose()
+            # [review F2] the single-endpoint probe would false-death a
+            # healthy tunnel when the ip_check endpoint itself is down.
+            # Rotated sweep over ALL endpoints, sticky-first, bounded PER
+            # attempt: `min(2.0, budget)` keeps the worst case under budget
+            # across the sweep (n endpoints × per_attempt).
+            per_attempt = min(2.0, self._ip_probe_budget)
+            base = self._ip_check_idx
+            for i in range(len(urls)):
+                url = urls[(base + i) % len(urls)]
+                if await self._probe_connect(url, per_attempt=per_attempt):
+                    if i > 0:
+                        self._ip_check_idx = (base + i) % len(urls)
+                    return True
+            return False
+        except Exception:
+            return False
+
+    async def _probe_connect(self, url: str, *, per_attempt: float) -> bool:
+        """[review F2] One bounded SOCKS5 handshake + CONNECT toward ``url``.
+        NO GET: dead/alive is all we need — _finalize_ip does the full check
+        once the tunnel is back. Never called without an explicit wait_for
+        budget: an httpx timeout does NOT bound the SOCKS5 CONNECT (the
+        445 s stall bug class).
+        """
+        import httpx
+        client = httpx.AsyncClient(
+            proxy=self.socks5_url,
+            timeout=httpx.Timeout(per_attempt))
+        try:
+            resp = await asyncio.wait_for(
+                client.send(httpx.Request("CONNECT", url), stream=True),
+                per_attempt)
+            # Release the unread stream without downloading the body
+            # (bounded — a stuck tunnel must not cost the whole budget).
+            await asyncio.wait_for(resp.aclose(), 1.0)
             return True
         except Exception:
             return False
+        finally:
+            await client.aclose()
 
     # ── IP freshness + identity advance (cross-station) ─────────
 
@@ -1537,13 +1564,21 @@ class VPNManager:
         # [plan 18/08] armed cadence + probe budget + egress threshold — hot-
         # reload handlers (piège 8: two mandatory echo points; auto_wg_egress
         # ticks had NONE before this commit — read once at init).
-        if "egress_failure_tick_interval" in updates:
-            self._egress_failure_tick_interval = max(
-                0.5, float(updates["egress_failure_tick_interval"]))
-        if "ip_probe_budget" in updates:
-            self._ip_probe_budget = max(1.0, float(updates["ip_probe_budget"]))
-        if "auto_wg_egress_ticks" in updates:
-            self._auto_wg_egress_ticks = max(1, int(updates["auto_wg_egress_ticks"]))
+        # [review 18/08 hot-reload] guarded: a malformed form value
+        # (float(None)/int("")) raised into update_config → 500 → the whole
+        # update_config fan-out was aborted. One bad key must skip itself,
+        # not fail the rest.
+        for _key, _conv, _floor in (
+                ("egress_failure_tick_interval", float, 0.5),
+                ("ip_probe_budget", float, 1.0),
+                ("auto_wg_egress_ticks", int, 1)):
+            if _key not in updates:
+                continue
+            try:
+                setattr(self, f"_{_key}", max(_floor, _conv(updates[_key])))
+            except (TypeError, ValueError):
+                logger.warning("[vpn] ignored invalid hot-reload %s=%r",
+                               _key, updates[_key])
         if "update_enabled" in updates:
             self._update_enabled = bool(updates["update_enabled"])
         if "update_check_interval" in updates:
@@ -1629,7 +1664,9 @@ class VPNManager:
                 "egress_threshold": self._auto_wg_egress_ticks,
                 "egress_tick_interval": self._egress_failure_tick_interval,
                 "last_conn_failure_at": self._last_conn_failure_at,
-                "conn_failure_signal_count": self._conn_failure_signal_count,
+                # [review 18/08] key aligned with stack_info's signal_count
+                # (the dashboard static reads egress_failures only).
+                "signal_count": self._conn_failure_signal_count,
             },
             "identity_index": self._identity_index,
             "profiles_count": len(self._identity_profiles),
@@ -2562,7 +2599,6 @@ class VPNManager:
         """
         self._egress_failures = max(self._egress_failures,
                                     self._auto_wg_egress_ticks)
-        self._skipped_tick_logged = False
         self._last_conn_failure_at = self._now_fn()
         self._conn_failure_signal_count += 1
         if self._watchdog_event is not None:
@@ -2619,9 +2655,11 @@ class VPNManager:
         if self._rotation_task and not self._rotation_task.done():
             # Rotation in flight — a restart would race its IP validation
             # (the skip MUST stay). Trace it once per rotation so a lost
-            # pool wake (plan guard 2529) is visible in the logs.
-            if not self._skipped_tick_logged:
-                self._skipped_tick_logged = True
+            # pool wake (plan guard 2529) is visible in the logs: the
+            # per-task pointer re-logs for a NEW rotation, and stays quiet
+            # while the SAME rotation keeps the tick out.
+            if self._skipped_rotation_task is not self._rotation_task:
+                self._skipped_rotation_task = self._rotation_task
                 logger.info("[vpn-watchdog] tick skipped — rotation in flight")
             return
         if self._lock.locked():
@@ -2632,9 +2670,7 @@ class VPNManager:
             # (~3-8 s of docker CLI — the tick would blow past the 2 s
             # cadence). The light probe decides alone; the refresh returns
             # to transitions (recovery/compose, below) and idle ticks.
-            if self._egress_failures:
-                self._skipped_tick_logged = False
-            else:
+            if not self._egress_failures:
                 await self.refresh_status(force=True)
             egress_dead = False
             # [plan 18/08 §E1] Light egress probe — SOCKS5 handshake +

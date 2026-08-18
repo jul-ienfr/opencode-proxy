@@ -1724,6 +1724,7 @@ async def _do_free_request_curl_cffi(body: dict, headers: dict, proxy_url: str |
     """
     try:
         from curl_cffi.requests import AsyncSession
+        from curl_cffi.requests import errors as _err
     except ImportError:
         raise RuntimeError("curl_cffi not installed: pip install curl_cffi")
 
@@ -1746,7 +1747,7 @@ async def _do_free_request_curl_cffi(body: dict, headers: dict, proxy_url: str |
                 headers=req_headers,
                 timeout=(10, 600),  # (connect, read) — read 600: long streams
             )
-        except curl_cffi.requests.errors.RequestsError as e:
+        except _err.RequestsError as e:
             # [plan 18/08 §1a] a REAL connection failure (dead SOCKS5 tunnel)
             # is invisible to the pool — the station stays "connected" and
             # every request re-strikes it. Signal the pool+manager

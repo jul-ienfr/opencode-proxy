@@ -33,11 +33,15 @@ class _Station:
     recorder (never the real loop)."""
 
     def __init__(self, sid, *, enabled=True, proxy_mode="vpn",
-                 status="connected"):
+                 status="connected", current_ip=None):
         self._station = sid
         self.enabled = enabled
         self.proxy_mode = proxy_mode
         self.status = status
+        # [review 18/08 F1b] repair anchor source: the manager re-pins a
+        # FRESH IP on repair (current_ip changes) without touching
+        # session_start — notify detects the change via this attr.
+        self.current_ip = current_ip
         self.socks5_url = f"socks5://127.0.0.1:1{sid}080"
         self.armed = []                     # [plan 18/08 §1c] egress-watchdog arms
 
@@ -45,9 +49,13 @@ class _Station:
         self.armed.append(self._station)
 
 
-def _pool(st1, st2=None, *, bad_ttl=60):
+def _pool(st1, st2=None, *, bad_ttl=60, grace=20.0):
     pool = FreeIPPool(st1, st2)
     pool._bad_ttl = float(bad_ttl)
+    # [review 18/08 F1a] the late-signal absorption window — SHORT, the
+    # prod default is set explicitly so tests never silently inherit a
+    # future default drift.
+    pool._late_signal_grace = float(grace)
     # Stub the background-rotation launcher: notify must NEVER call it.
     pool.rotated = []
     pool._launch_rotation = lambda station: pool.rotated.append(station)
@@ -145,6 +153,75 @@ class TestPoolSignalling:
 
         assert p._per_station(st1)["bad_until"] is not None
 
+    def test_late_signal_beyond_grace_bad_marks(self):
+        """[review F1a] the absorption window is SHORT (20 s grace, NOT the
+        full 60 s bad_ttl): a signal 30 s after rotation is past the dial
+        queue (connect timeout 10 s + handshake) + teardown recv — genuine.
+        The dead freshly-rotated tunnel is bad-marked NOW (étage 0) instead
+        of being re-struck for a full bad_ttl. Fails on the pre-fix code
+        (which absorbed everything < bad_ttl)."""
+        st1, st2 = _fresh_pair()
+        p = _pool(st1, st2, bad_ttl=60)
+        p._per_station(st1)["session_start"] = time.monotonic() - 30
+
+        p.notify_connection_failure(st1)
+
+        assert p._per_station(st1)["bad_until"] is not None
+
+    def test_first_failure_marks_without_anchor(self):
+        """[review F1b regression guard] a station never pool-rotated has no
+        last_confirmed_ip anchor. Establishing the baseline on first
+        observation must NOT refresh session_start — the FIRST genuine
+        failure still bad-marks (étage 0 alive from day one, never silently
+        absorbed by a baseline-establishing refresh)."""
+        st1 = _Station(1, current_ip="1.1.1.1")
+        st2 = _Station(2)
+        p = _pool(st1, st2)
+
+        p.notify_connection_failure(st1)
+
+        assert p._per_station(st1)["bad_until"] is not None, \
+            "first genuine failure must bad-mark even without an anchor"
+
+    def test_repair_refresh_absorbs_late_signal(self):
+        """[review F1b] the manager repair path re-pins a FRESH IP
+        (current_ip changes) without touching session_start — the anchor
+        detects the change and refreshes: a late signal from a pre-repair
+        request is absorbed, the repaired healthy tunnel is never
+        bad-marked."""
+        st1 = _Station(1, current_ip="1.1.1.1")
+        st2 = _Station(2)
+        p = _pool(st1, st2)
+        per = p._per_station(st1)
+        per["last_confirmed_ip"] = "1.1.1.1"       # pool rotation recorded it
+        per["session_start"] = time.monotonic() - 120
+        st1.current_ip = "2.2.2.2"                 # the repair re-pin
+
+        p.notify_connection_failure(st1)
+
+        assert per["last_confirmed_ip"] == "2.2.2.2", \
+            "anchor must follow the repair re-pin"
+        assert per["bad_until"] is None, \
+            "fresh repair IP absorbs the late signal"
+
+    def test_repair_refresh_then_genuine_failure_marks(self):
+        """After the repair-anchor refresh, a signal beyond the grace window
+        is genuine → bad-mark: the refresh absorbs the repair tail, it does
+        NOT disable étage 0."""
+        st1 = _Station(1, current_ip="1.1.1.1")
+        st2 = _Station(2)
+        p = _pool(st1, st2)
+        per = p._per_station(st1)
+        per["last_confirmed_ip"] = "1.1.1.1"
+        per["session_start"] = time.monotonic() - 120
+        st1.current_ip = "2.2.2.2"
+
+        p.notify_connection_failure(st1)              # absorbed + anchor refresh
+        per["session_start"] = time.monotonic() - 30  # grace elapsed
+        p.notify_connection_failure(st1)              # genuine failure now
+
+        assert per["bad_until"] is not None
+
     def test_idempotent_signals(self):
         """Bad-marked stations no longer fail → one arm per episode; each
         signal still records (idempotent, no crash on re-mark)."""
@@ -228,3 +305,85 @@ class TestPoolSignal:
         monkeypatch.setattr(oc, "_free_ip_pool", None)
 
         oc._signal_connection_failure("st1")
+
+
+class TestRequestPathWiring:
+    """[review 18/08] the REAL request helper wires the signal — not just
+    the unit function. A fake curl session raises RequestsError(7) through
+    _do_free_request_curl_cffi → the pool recorder is notified and the
+    error re-raised (the caller owns the fallback); an HTTP response
+    (even 429) is never a signal (raise_for_status is False — the tunnel
+    is alive)."""
+
+    class _RecorderPool:
+        def __init__(self):
+            self.notified = []
+
+        enabled = True
+
+        async def on_request(self):
+            return "socks5://127.0.0.1:1080", "st1"
+
+        def notify_connection_failure(self, station):
+            self.notified.append(station)
+
+    class _FakeSession:
+        def __init__(self, *, error=None, response=None):
+            self._error, self._response = error, response
+            self.closed = False
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            self.closed = True
+            return False
+
+        async def post(self, *args, **kwargs):
+            if self._error is not None:
+                raise self._error
+            return self._response
+
+    class _FakeResponse:
+        status_code = 429
+        headers = {}
+        content = b"{}"
+
+    def _patch(self, monkeypatch, session):
+        rec = self._RecorderPool()
+        monkeypatch.setattr(oc, "_free_ip_pool", rec)
+        monkeypatch.setattr(oc, "_current_free_identity",
+                            lambda station=None: {"impersonate": "chrome131",
+                                                  "user_agent": None,
+                                                  "extra_headers": {}})
+        monkeypatch.setattr("curl_cffi.requests.AsyncSession",
+                            lambda **kw: session)
+        return rec
+
+    @pytest.mark.asyncio
+    async def test_real_helper_signals_on_connect_failure(self, monkeypatch):
+        """RequestsError code 7 (connection failed — the dead-tunnel class)
+        → notified + re-raised: the caller keeps its fallback, the pool
+        bad-marks and the manager arms."""
+        rec = self._patch(monkeypatch, self._FakeSession(
+            error=_err.RequestsError("connect failed", 7)))
+
+        with pytest.raises(_err.RequestsError):
+            await oc._do_free_request_curl_cffi(
+                {}, {}, "socks5://127.0.0.1:1080", "st1")
+
+        assert rec.notified == ["st1"]
+
+    @pytest.mark.asyncio
+    async def test_real_helper_no_signal_on_http_response(self, monkeypatch):
+        """A 429 response means the tunnel is ALIVE — no signal, the helper
+        returns the wrapped response normally."""
+        rec = self._patch(monkeypatch, self._FakeSession(
+            response=self._FakeResponse()))
+
+        resp = await oc._do_free_request_curl_cffi(
+            {}, {}, "socks5://127.0.0.1:1080", "st1")
+
+        assert isinstance(resp, oc._CurlCffiResponse)
+        assert resp.status_code == 429
+        assert rec.notified == []
