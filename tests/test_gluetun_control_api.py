@@ -806,12 +806,14 @@ class TestFastRecoverControl:
         assert mgr._status == vm.VPNState.CONNECTED
 
     @pytest.mark.asyncio
-    async def test_all_hosts_blacklisted_falls_through_to_compose(self, tmp_path):
-        """T3 bis — EVERY candidate host is blacklisted: all max_skips+1
-        pins are skips (no finalize in the fast path), and the tick falls
-        through to the compose escalation — 1 compose call, the unchanged
-        safety net — which recovers the tunnel (its own re-pin issues the
-        last PUT)."""
+    async def test_all_hosts_blacklisted_restart_rung_recovers(self, tmp_path):
+        """T3 bis (rungs revised, plan §E3/am.20) — EVERY candidate host is
+        blacklisted: all max_skips+1 pins are skips (no finalize in the fast
+        path), and the tick falls through to the LIGHT RESTART rung — the
+        first escalation now, compose is 2 rungs deeper — which recovers the
+        tunnel (its own re-pin issues the last PUT, then the shared
+        recovery tail finalizes a fresh IP). Compose is NOT reached on a
+        healthy stack."""
         mgr = _fast_mgr(tmp_path)
         now = time.time()
         for host in ("de707.nordvpn.com", "de712.nordvpn.com",
@@ -824,39 +826,54 @@ class TestFastRecoverControl:
         mgr._current_hostname = fake_hostname   # type: ignore[assignment]
         mgr.log_text = "AUTH: Received control message: AUTH_FAILED, restarting"
         await mgr._watchdog_tick()
-        assert len(_put_scripts(mgr)) == 4 + 1   # 4 fast-pin skips + compose-path re-pin
-        assert mgr.calls["compose_up"] == 1      # fast path exhausted → compose net
-        assert mgr.calls["restart"] == 0
-        assert mgr._status == vm.VPNState.CONNECTED   # the net recovered the tunnel
+        assert len(_put_scripts(mgr)) == 4 + 1   # 4 fast-pin skips + recovery-tail re-pin
+        assert mgr.calls["restart"] == 1         # the light rung healed the tunnel
+        assert mgr.calls["compose_up"] == 0      # compose never needed
+        assert mgr.finalize_calls == 1
+        assert mgr._status == vm.VPNState.CONNECTED   # fresh IP on the new server
 
     @pytest.mark.asyncio
-    async def test_no_pin_possible_falls_through_to_compose(self, tmp_path):
-        """T3 ter — a config where the pin can never produce a country
-        (server_countries has ONE country) with a live AUTH_FAILED: the
-        fast path retries (bounded by max_skips), issues ZERO PUTs (no
-        country to pin — `_pin_country_for_rotation` returns None before
-        any control call), then the tick's compose escalation runs once
-        and recovers. The pre-existing safety net is untouched."""
+    async def test_no_pin_possible_restart_rung_recovers(self, tmp_path):
+        """T3 ter (rungs revised, plan §E3/am.20) — a config where the pin
+        can never produce a country (server_countries has ONE country) with
+        a live AUTH_FAILED: the fast path retries (bounded by max_skips),
+        issues ZERO PUTs (no country to pin — `_pin_country_for_rotation`
+        returns None before any control call), then the tick's LIGHT RESTART
+        rung runs once and recovers — compose (2 rungs deeper) never fires
+        on a healthy stack."""
         mgr = _fast_mgr(tmp_path, server_countries="Germany")
         mgr.log_text = "AUTH: Received control message: AUTH_FAILED, restarting"
         await mgr._watchdog_tick()
         assert len(_put_scripts(mgr)) == 0
-        assert mgr.calls["compose_up"] == 1
-        assert mgr.calls["restart"] == 0
+        assert mgr.calls["restart"] == 1         # the light rung healed the tunnel
+        assert mgr.calls["compose_up"] == 0      # compose never needed
         assert mgr._status == vm.VPNState.CONNECTED
 
     @pytest.mark.asyncio
-    async def test_fast_path_skipped_without_control_server(self, tmp_path):
-        """T1 bis — no control API configured: the fast path returns False
-        immediately and the tick escalates through compose exactly as before
-        this feature (single-station control-less configs keep working)."""
+    async def test_restart_rung_recovers_without_control_server(self, tmp_path):
+        """T1 bis (rungs revised, plan §E3/am.20) — no control API
+        configured: the fast path returns False immediately and the tick
+        escalates through the LIGHT RESTART rung (the first escalation,
+        compose is 2 rungs deeper) — single-station control-less configs
+        keep working through the restart rung, which heals the tunnel and
+        finalizes a fresh IP without compose."""
         mgr = FakeVPNManager(_cfg(tmp_path, country_rotation=True,
                                   server_countries="Germany,France,Spain"),
                              tmp_path=tmp_path)
-        mgr.ips = ["5.6.7.8"]
+        # CONSTANT probe, not the base fake's one-shot FIFO: the recovery
+        # tail probes TWICE (finalize pops, then refresh_status re-probes
+        # for CONNECTED) — a consumed FIFO would starve the second call
+        # and flip the state to error. A real post-restart tunnel answers
+        # every probe; a constant IP models that (cf. _fast_mgr).
+        async def _constant_ip():
+            return "5.6.7.8"
+
+        mgr.get_public_ip = _constant_ip      # type: ignore[assignment]
         mgr.log_text = "AUTH_FAILED"
         await mgr._watchdog_tick()
-        assert mgr.calls["compose_up"] == 1
+        assert mgr.calls["restart"] == 1         # the light rung healed the tunnel
+        assert mgr.calls["compose_up"] == 0      # compose never needed
+        assert mgr._status == vm.VPNState.CONNECTED
 
 
 class TestFailedHostsPersistence:

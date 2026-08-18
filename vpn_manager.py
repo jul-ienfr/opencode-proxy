@@ -2902,6 +2902,28 @@ class VPNManager:
         if self._watchdog_event is not None:
             self._watchdog_event.set()  # loop wait(timeout) returns → live tick
 
+    async def _watchdog_recover_fresh_ip(self) -> bool:
+        """[plan 18/08 §E3/am.20] Shared recovery tail for the watchdog tick,
+        used by BOTH rungs (light restart and compose): re-pin the next
+        country (the container action reset the pool — the shared cursor
+        always advances, so this picks a NEW country, [plan] A), then
+        finalize a FRESH IP — the watchdog must never land back on the
+        failed server/IP (_finalize_ip probes + re-picks ≤3 rounds). On
+        success: backoff reset, CONNECTED, refresh, persist. Returns True
+        when the tunnel is healthy on a fresh IP (the tick can return),
+        else False (the caller keeps its recovery rung or backs off)."""
+        await self._pin_country_for_rotation()
+        if not await self._finalize_ip(allow_stale=False):
+            return False
+        self._watchdog_backoff.record_success()
+        self._set_status(VPNState.CONNECTED)
+        self._error = None
+        await self.refresh_status(force=True)
+        self.save_state()
+        logger.info("[vpn-watchdog] recovered — tunnel healthy (IP %s)",
+                    self._current_ip)
+        return True
+
     async def _watchdog_loop(self) -> None:
         """Background watchdog: auto-restart the gluetun container when
         OpenVPN hits AUTH_FAILED or a TLS negotiation failure (stale/crashed
@@ -3028,34 +3050,50 @@ class VPNManager:
                 if await self._fast_recover_via_control(max_skips=3):
                     return
                 try:
-                    # _ensure_container() recreates via compose
-                    # (--force-recreate) because the last restart FAILED: a
-                    # plain `docker restart` would never apply the widened
-                    # SERVER_COUNTRIES pool.
-                    await self._ensure_container()
-                    started_at = await self._wait_healthy(timeout=120)
-                    if started_at and not (await self._check_auth_failed(started_at)
-                                           or await self._check_server_issue(started_at)):
-                        # The --force-recreate reset the country pool — re-pin
-                        # the next country so recovery doesn't drift back to
-                        # whatever the container picked at random ([plan] A).
-                        await self._pin_country_for_rotation()
-                        # Recovered path: finalize a FRESH IP (not recent on
-                        # either station) — the watchdog must never land back
-                        # on the failed server/IP. _finalize_ip probes +
-                        # restarts (≤3 rounds), advances the identity to a NEW
-                        # face and persists; a false return means
-                        # still-not-fresh.
-                        if await self._finalize_ip(allow_stale=False):
-                            self._watchdog_backoff.record_success()
-                            self._set_status(VPNState.CONNECTED)
-                            self._error = None
-                            await self.refresh_status(force=True)
-                            self.save_state()
-                            logger.info("[vpn-watchdog] recovered — tunnel healthy (IP %s)",
-                                        self._current_ip)
+                    # [plan 18/08 §E3/am.20] LIGHT rung first — a plain
+                    # `docker restart` (~1-2 s) before the heavy compose
+                    # escalation: on a healthy stack it is all that is needed.
+                    # The compose rung below is the ESCALATION only —
+                    # --force-recreate exists solely to apply a WIDENED
+                    # SERVER_COUNTRIES pool after a restart that did NOT clear
+                    # the failure marker (a plain `docker restart` could never
+                    # apply it). Both rungs share the recovery tail
+                    # (_watchdog_recover_fresh_ip): re-pin the next country +
+                    # finalize a FRESH IP — the watchdog must never land back
+                    # on the failed server/IP. Per-rung guards: a failing
+                    # rung must not abort the tick — the compose rung IS the
+                    # escape hatch for a failed light restart.
+                    try:
+                        await self._docker_restart()
+                        started_at = await self._wait_healthy(timeout=60)
+                    except Exception as e:
+                        logger.warning("[vpn-watchdog] light restart failed: %s — "
+                                       "escalating to compose", e)
+                        started_at = None
+                    healed = bool(started_at) and not (
+                        await self._check_auth_failed(started_at)
+                        or await self._check_server_issue(started_at))
+                    if healed and await self._watchdog_recover_fresh_ip():
+                        return
+                    if not healed:
+                        logger.info("[vpn-watchdog] restart did not clear %s — "
+                                    "compose escalation", kind)
+                        try:
+                            await self._ensure_container()
+                            started_at = await self._wait_healthy(timeout=120)
+                        except Exception as e:
+                            logger.warning("[vpn-watchdog] compose escalation "
+                                           "failed: %s", e)
+                            started_at = None
+                        healed = bool(started_at) and not (
+                            await self._check_auth_failed(started_at)
+                            or await self._check_server_issue(started_at))
+                        if healed and await self._watchdog_recover_fresh_ip():
                             return
-                    # Still failing: keep the error state and back off.
+                    # Still failing: keep the error state and back off. This
+                    # tail is inside the try — with no exception it runs ONCE
+                    # after both rungs failed to heal; with an exception the
+                    # except below records the same single failure.
                     self._watchdog_backoff.record_failure()
                     escalate = self._watchdog_backoff.consecutive_failures >= 2
                     logger.error("[vpn-watchdog] restart did not recover — next "

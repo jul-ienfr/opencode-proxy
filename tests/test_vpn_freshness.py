@@ -125,7 +125,8 @@ class FakeVPNManager(vm.VPNManager):
         self.container_present = True
         self.log_text = ""                  # container logs: AUTH_FAILED marker
         self.clear_logs_on_restart = True
-        self.calls = {"restart": 0, "compose_up": 0, "inspect": 0}
+        self.calls = {"restart": 0, "compose_up": 0, "inspect": 0,
+                      "force_recreate": 0}
         self.escalations = 0
         self.finalize_calls = 0
 
@@ -144,6 +145,8 @@ class FakeVPNManager(vm.VPNManager):
 
     async def _compose_up(self, force_recreate=False):
         self.calls["compose_up"] += 1
+        if force_recreate:
+            self.calls["force_recreate"] += 1
         # A recreated container is brand-new: fresh logs. Same knob as
         # _docker_restart — clear_logs_on_restart=False models the pool
         # returning ANOTHER failing server (the 17/08 case: 3 bad German
@@ -576,14 +579,18 @@ class TestWatchdogTick:
         assert mgr._ip_history[-1]["identity"] == "firefox144"
         assert mgr._watchdog_backoff.consecutive_failures == 0
         assert mgr.escalations == 0
-        # Recovery recreates via compose (--force-recreate) — the tick's own
-        # recreate + finalize's re-pick round each call compose_up.
-        compose_calls = mgr.calls["compose_up"]
-        assert compose_calls >= 2
+        # [plan 18/08 §E3/am.20] Recovery is RUNG: the LIGHT `docker restart`
+        # comes first and heals by clearing the AUTH_FAILED marker on the
+        # fresh logs — the tick itself never composes. The single compose_up
+        # is finalize's re-pick round only: the stale _auth_failed attribute
+        # (a heal check does not clear it) forces the --force-recreate there.
+        assert mgr.calls["restart"] == 1
+        assert mgr.calls["compose_up"] == 1
+        assert mgr.calls["force_recreate"] == 1
 
-        # Second tick: tunnel healthy → backoff stays reset, no recreate
+        # Second tick: tunnel healthy → backoff stays reset, no restart
         await mgr._watchdog_tick()
-        assert mgr.calls["compose_up"] == compose_calls
+        assert mgr.calls["restart"] == 1
         assert mgr._watchdog_backoff.consecutive_failures == 0
 
     @pytest.mark.asyncio
@@ -612,8 +619,10 @@ class TestWatchdogTick:
         """AUTH_FAILED survives the recreate (the pool keeps returning
         failing servers, logs still dirty, no fresh IP): failure #1 backs
         off at 30s; failure #2 escalates at 60s — never a 7-minute silent
-        error state again. Each tick recreates via compose (--force-recreate),
-        the recovery branch never reaches _finalize_ip (re-check still dirty)."""
+        error state again. Each tick tries the LIGHT restart first, then the
+        compose --force-recreate once the marker survived (rung 2 is the
+        escalation, not a duplicate restart); _finalize_ip is never reached
+        (re-check still dirty)."""
         mgr = FakeVPNManager(_cfg(tmp_path), tmp_path=tmp_path)
         mgr.log_text = "AUTH_FAILED"
         mgr.clear_logs_on_restart = False                # recreate changes nothing
@@ -626,7 +635,9 @@ class TestWatchdogTick:
         assert mgr._watchdog_backoff.consecutive_failures == 2
         assert mgr._watchdog_backoff.delay == 60         # capped at backoff_max
         assert mgr.escalations == 1                      # escalated, ≥2 failures
+        assert mgr.calls["restart"] == 2                 # light restart per tick
         assert mgr.calls["compose_up"] == 2              # one recreate per tick
+        assert mgr.calls["force_recreate"] == 2          # marker survived → widen
         assert mgr.finalize_calls == 0                   # never recovered
 
     @pytest.mark.asyncio
@@ -708,6 +719,92 @@ class TestWatchdogTick:
         assert mgr._egress_failures == 0
         assert mgr.calls["restart"] == 0
         assert mgr.calls["compose_up"] == 0
+        assert mgr._watchdog_backoff.consecutive_failures == 0
+
+    # ── [plan 18/08 §E3/am.20] light restart rung before compose ─
+
+    @pytest.mark.asyncio
+    async def test_ov_light_restart_heals_without_compose(self, tmp_path):
+        """OpenVPN AUTH_FAILED: the LIGHT `docker restart` rung heals (fresh
+        logs, no marker) → fresh IP, CONNECTED, ZERO compose. The 60-120 s
+        compose wall collapses to the ~1-2 s restart (am.20: OV 120-180 s →
+        30-60 s; the wait_healthy fake is instant)."""
+        shared = _shared(tmp_path)
+        shared.record_ip("4.4.4.4", 1)
+        mgr = FakeVPNManager(_cfg(tmp_path), tmp_path=tmp_path)
+        mgr.log_text = "AUTH_FAILED - credentials rejected"
+        mgr.ips = ["5.5.5.5", "5.5.5.5", "5.5.5.5"]
+        await mgr._watchdog_tick()
+        assert mgr._status == vm.VPNState.CONNECTED
+        assert mgr._current_ip == "5.5.5.5"
+        assert mgr.calls["restart"] == 1       # the light rung only
+        assert mgr.calls["compose_up"] == 0    # never escalated — marker cleared
+        assert mgr.calls["force_recreate"] == 0
+        assert mgr._watchdog_backoff.consecutive_failures == 0
+        assert mgr.escalations == 0
+
+    @pytest.mark.asyncio
+    async def test_ov_marker_survives_light_restart_escalates_to_compose(self, tmp_path):
+        """OpenVPN AUTH_FAILED survives the light restart (the pool keeps
+        returning failing servers): the compose rung is the escalation —
+        --force-recreate is flagged because the marker survived (a plain
+        restart could never apply the widened SERVER_COUNTRIES pool)."""
+        mgr = FakeVPNManager(_cfg(tmp_path), tmp_path=tmp_path)
+        mgr.log_text = "AUTH_FAILED"
+        mgr.clear_logs_on_restart = False      # restart + recreate change nothing
+        mgr.ips = []
+        await mgr._watchdog_tick()
+        assert mgr.calls["restart"] == 1       # light rung attempted
+        assert mgr.calls["compose_up"] == 1    # …then the compose escalation
+        assert mgr.calls["force_recreate"] == 1
+        assert mgr.finalize_calls == 0         # re-check still dirty
+        assert mgr._watchdog_backoff.consecutive_failures == 1
+
+    @pytest.mark.asyncio
+    async def test_wg_light_restart_heals_but_no_fresh_skips_compose(self, tmp_path):
+        """WG dead tunnel: the light restart heals the container (no marker
+        to clear — nothing "widens") but no FRESH IP is reachable (only the
+        recently-used 1.1.1.1): back off WITHOUT composing. The compose rung
+        exists solely for a surviving marker — healed+stale must not pay the
+        compose wall."""
+        shared = _shared(tmp_path)
+        shared.record_ip("1.1.1.1", 1)
+        mgr = FakeVPNManager(_cfg(tmp_path, vpn_stack="wireguard"),
+                             shared=shared, tmp_path=tmp_path)
+        mgr.probe_alive = False
+        mgr.ips = ["1.1.1.1"] * 4              # tick1 refresh + 3 finalize rounds
+        seuil = mgr._auto_wg_egress_ticks
+        for _ in range(seuil - 1):
+            await mgr._watchdog_tick()
+        mgr.ips = ["1.1.1.1"] * 3              # recovery tick: 3 finalize rounds
+        await mgr._watchdog_tick()
+        assert mgr._ip_history == []           # never committed 1.1.1.1
+        assert mgr.calls["compose_up"] == 0    # healed → compose rung skipped
+        assert mgr.calls["force_recreate"] == 0
+        assert mgr.calls["restart"] == 3       # light rung + 2 finalize re-picks
+        assert mgr._watchdog_backoff.consecutive_failures == 1
+        assert mgr.escalations == 0
+
+    @pytest.mark.asyncio
+    async def test_light_restart_error_escapes_via_compose_rung(self, tmp_path):
+        """The light restart itself FAILS (docker daemon hiccup): the tick
+        does not crash — the compose rung is the escape hatch, --force-recreate
+        applies, and recovery completes on a fresh IP."""
+        mgr = FakeVPNManager(_cfg(tmp_path), tmp_path=tmp_path)
+        mgr.log_text = "AUTH_FAILED"
+        mgr.ips = ["6.6.6.6", "6.6.6.6", "6.6.6.6"]
+
+        async def boom():
+            mgr.calls["restart"] += 1
+            raise RuntimeError("docker daemon unreachable")
+        mgr._docker_restart = boom
+
+        await mgr._watchdog_tick()
+        assert mgr._status == vm.VPNState.CONNECTED
+        assert mgr._current_ip == "6.6.6.6"
+        assert mgr.calls["restart"] == 1       # the failed light rung
+        assert mgr.calls["compose_up"] == 1    # compose took over
+        assert mgr.calls["force_recreate"] == 1
         assert mgr._watchdog_backoff.consecutive_failures == 0
 
 # ── retrocompat: shared=None ────────────────────────────────────
