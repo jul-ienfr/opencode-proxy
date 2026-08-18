@@ -932,7 +932,7 @@ class TestStackSelector:
         flip INSIDE the lock and applies it AFTER it — exactly one compose,
         `_stack` stays "auto", cooldown armed, journal fed."""
         mgr = _stack_mgr(tmp_path, monkeypatch)
-        mgr.ips = []  # dead tunnel: refresh probe + egress probe both get None
+        mgr.probe_alive = False  # dead tunnel: the light SOCKS5 probe answers nothing
         mgr._egress_failures = mgr._auto_wg_egress_ticks - 1
         await mgr._watchdog_tick()
         assert mgr._stack_effective == "openvpn"
@@ -943,7 +943,7 @@ class TestStackSelector:
         assert mgr._last_auto_flip_at is not None  # cooldown armed
         flip = mgr._flips[-1]
         assert flip["from"] == "wireguard" and flip["to"] == "openvpn"
-        assert flip["reason"] == "auto: egress dead 5 ticks"
+        assert flip["reason"] == f"auto: egress dead {mgr._auto_wg_egress_ticks} ticks"
         # The flip superseded the escalation: no compose escalation fired.
         assert mgr.escalations == 0
         # .env switched for BOTH stations.

@@ -432,6 +432,33 @@ class FreeIPPool:
         self._active_station = st
         return st.socks5_url, st
 
+    def notify_connection_failure(self, station) -> None:
+        """[plan 18/08 §1b] A real connection failure on ``station``'s tunnel
+        (SOCKS5 dead — seen in the request path, invisible to the pool).
+
+        [étage 0] bad-mark immediately → _station_usable refuses it → the
+        next request switches to the other station instantly instead of
+        re-striking a known-dead tunnel. C1 guard first: never bad-mark the
+        last standing station (mono-station keeps serving; the request path
+        adopts the 10 s connect timeout — am.21).
+
+        [étage 1] the manager arms its egress watchdog and wakes it (~0-2 s)
+        → the live tick probes and repairs. NO rotation kick here (am.7):
+        a pool kick + the tick's fast-recover would race — the lock orders
+        but does not cancel, and a queued rotation would pin a second time
+        after the repair. The wake IS the repair.
+
+        Late-signal guard (am.18): a request launched BEFORE a successful
+        rotation may fail after it landed — its failure must not bad-mark a
+        freshly rotated (healthy) station.
+        """
+        if self._any_other_usable(station):
+            per = self._per_station(station)
+            if (per["session_start"] is None or
+                    time.monotonic() - per["session_start"] >= self._bad_ttl):
+                per["bad_until"] = time.monotonic() + self._bad_ttl
+        station.arm_egress_watchdog()
+
     async def _await_rotation(self, station: VPNManager) -> bool:
         """Wait (bounded by ``rotation_wait_timeout``) for a background
         rotation to finish and land a NEW IP on ``station``.

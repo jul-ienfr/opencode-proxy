@@ -47,9 +47,15 @@ class _StubStation:
         self.current_server = {"name": server_name}
         self.socks5_url = f"socks5://127.0.0.1:1{sid}080"
         self._last_rotation_error = None
+        self.armed = []                     # [plan 18/08 §1c] egress-watchdog arms
 
     def note_free_request(self):
         pass
+
+    def arm_egress_watchdog(self):
+        """[plan 18/08 §1b] the pool signals real connection failures to the
+        manager — the recorder must expose the arm (never the real loop)."""
+        self.armed.append(self._station)
 
     def get_status(self):
         return {"station": self._station, "status": self.status}

@@ -130,7 +130,9 @@ ip_rotation:
   vpn_stack: auto
   auto_ov_fail_threshold: 3
   auto_ov_return_min: 60
-  auto_wg_egress_ticks: 5
+  auto_wg_egress_ticks: 3
+  egress_failure_tick_interval: 2.0
+  ip_probe_budget: 8.0
   auto_flip_cooldown_min: 30
   rotation_wait_timeout: 20
   country_rotation: true

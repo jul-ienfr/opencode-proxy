@@ -71,6 +71,14 @@ def _cfg(tmp_path, **over):
         "identity_profiles": [dict(p) for p in PROFILES],
         "watchdog_backoff_base": 15.0,        # config.yaml ships 15/60
         "watchdog_backoff_max": 60.0,
+        # [plan 18/08 §1d] armed tick cadence + probe budget + threshold.
+        # Symbolic values — tests read mgr._auto_wg_egress_ticks, never a
+        # literal 3/5. control_pin_catchup: 0.0 keeps the pin tests at the
+        # old 60 s behavior (am.5 — only the fast-recover path threads it).
+        "auto_wg_egress_ticks": 3,
+        "egress_failure_tick_interval": 2.0,
+        "ip_probe_budget": 8.0,
+        "control_pin_catchup": 0.0,
     }
     cfg.update(over)
     return cfg
@@ -158,6 +166,17 @@ class FakeVPNManager(vm.VPNManager):
         if self.ips:
             return self.ips.pop(0)
         return None
+
+    # [plan 18/08 §1d] Light-egress probe stub: the REAL tick calls
+    # _probe_tunnel_light() on both stacks (WG and OV — the shared counter
+    # is the authority). probe_alive=False models a dead tunnel; the reset
+    # path is tested by flipping it back to True (blip absorbed, no
+    # recovery at all). NOT bool(self.ips): the refresh pops the only IP
+    # before the probe runs, which would fake a dead tunnel on every tick.
+    probe_alive = True
+
+    async def _probe_tunnel_light(self):
+        return self.probe_alive
 
     # ── escalation stub (record-only) ────────────────────────────
     async def _watchdog_escalate(self):
@@ -474,24 +493,25 @@ class TestWatchdogTick:
     # ── [plan 18/08 §2d] WireGuard egress watchdog ──────────────
 
     @pytest.mark.asyncio
-    async def test_wg_egress_dead_5_ticks_restarts_once(self, tmp_path):
+    async def test_wg_egress_dead_arms_recovery_at_threshold(self, tmp_path):
         """WG tunnel without egress: the control API still answers "running"
         and no OpenVPN marker exists — only the SOCKS5 egress probe detects
-        it. Ticks 1-4 arm the consecutive counter (backoff untouched, no
-        recovery action); tick 5 arms the recovery: fast-pin is OFF without
-        a control key, and the restart is PLAIN (no OpenVPN marker → no
-        --force-recreate; the tick's restart + the 2 finalize re-pick
-        rounds)."""
+        it. Ticks 1..(threshold-1) arm the shared counter (backoff untouched,
+        no recovery action); the threshold tick arms the recovery: fast-pin
+        is OFF without a control key, and the restart is PLAIN (no OpenVPN
+        marker → no --force-recreate; the tick's restart + the 2 finalize
+        re-pick rounds). Threshold read symbolically — never a literal."""
         mgr = FakeVPNManager(_cfg(tmp_path, vpn_stack="wireguard"), tmp_path=tmp_path)
-        mgr.ips = []                       # dead tunnel: every probe is None
-        for _ in range(4):
+        mgr.probe_alive = False              # dead tunnel: probe answers nothing
+        seuil = mgr._auto_wg_egress_ticks
+        for _ in range(seuil - 1):
             await mgr._watchdog_tick()
-        assert mgr._egress_failures == 4
+        assert mgr._egress_failures == seuil - 1
         assert mgr.calls["restart"] == 0      # waiting — no recovery action
         assert mgr.calls["compose_up"] == 0
         assert mgr._watchdog_backoff.consecutive_failures == 0
         await mgr._watchdog_tick()
-        assert mgr._egress_failures == 5
+        assert mgr._egress_failures == seuil
         assert mgr.calls["restart"] == 3      # tick's restart + 2 finalize rounds
         assert mgr.calls["compose_up"] == 0   # no OpenVPN marker → plain restart
         assert mgr.escalations == 0           # first failure — no escalation yet
@@ -502,34 +522,41 @@ class TestWatchdogTick:
         the next healthy tick resets the egress counter — no further
         restart."""
         mgr = FakeVPNManager(_cfg(tmp_path, vpn_stack="wireguard"), tmp_path=tmp_path)
-        # 4 dead ticks (refresh + egress probes each = 8), then the recovery
-        # tick: 2 dead probes + finalize round 0 + post-recovery refresh
-        mgr.ips = [None] * 8 + [None, None, "9.9.9.9", "9.9.9.9"]
-        for _ in range(4):
+        mgr.probe_alive = False
+        # Tick 1 (unarmed) pops one IP via refresh_status; the recovery tick
+        # (armed — the LIGHT probe is stubbed, it never pops): finalize round
+        # 0 + post-recovery refresh. [None, "9.9.9.9", "9.9.9.9"] exactly.
+        mgr.ips = [None] + ["9.9.9.9", "9.9.9.9"]
+        seuil = mgr._auto_wg_egress_ticks
+        for _ in range(seuil - 1):
             await mgr._watchdog_tick()
-        assert mgr._egress_failures == 4
+        assert mgr._egress_failures == seuil - 1
         await mgr._watchdog_tick()
         assert mgr._status == vm.VPNState.CONNECTED
         assert mgr._current_ip == "9.9.9.9"
         assert mgr.calls["restart"] == 1      # tick's restart only
-        assert mgr._egress_failures == 5      # reset on the next probe success
-        mgr.ips = ["9.9.9.9", "9.9.9.9"]      # refresh + egress both healthy
+        assert mgr._egress_failures == seuil  # reset on the next probe success
+        mgr.probe_alive = True
+        mgr.ips = ["9.9.9.9"]                 # armed tick skips refresh — no pop
         await mgr._watchdog_tick()
         assert mgr._egress_failures == 0
         assert mgr.calls["restart"] == 1      # healthy — no restart
 
     @pytest.mark.asyncio
     async def test_wg_egress_success_resets_counter(self, tmp_path):
-        """A probe success resets the consecutive-dead counter mid-arming:
-        never a recreate."""
+        """A probe success resets the shared counter MID-arming: a transient
+        blip (a real failure signalled by the pool, then a healthy probe) is
+        absorbed — ZERO recovery, no restart, no compose."""
         mgr = FakeVPNManager(_cfg(tmp_path, vpn_stack="wireguard"), tmp_path=tmp_path)
-        mgr._egress_failures = 4               # nearly armed
-        mgr.ips = ["1.1.1.1", "1.1.1.1"]       # refresh + egress both healthy
+        seuil = mgr._auto_wg_egress_ticks
+        mgr._egress_failures = seuil - 1      # nearly armed
+        mgr.probe_alive = True                # healthy probe (explicit)
+        mgr.ips = ["1.1.1.1"]                 # armed tick skips refresh — no pop
         await mgr._watchdog_tick()
         assert mgr._egress_failures == 0
+        assert mgr.calls["restart"] == 0
         assert mgr.calls["compose_up"] == 0
         assert mgr._watchdog_backoff.consecutive_failures == 0
-
 
 # ── retrocompat: shared=None ────────────────────────────────────
 
@@ -634,6 +661,138 @@ class TestWatchdogLoop:
         assert recorded[:3] == [mgr._watchdog_interval, 30.0,
                                 mgr._watchdog_interval]
         assert len(recorded) == 4                 # 4th sleep never taken
+
+
+# ── [plan 18/08 §1c] pool signal → arm + wake ────────────────
+
+class TestArmEgressWatchdog:
+    @pytest.mark.asyncio
+    async def test_arm_sets_counter_to_threshold(self, tmp_path):
+        """One real failure (pool signal) arms the FULL threshold at once:
+        the very next tick probes/recovers — no N-tick wait. The max()
+        absorbs a signal that arrives mid-arming."""
+        mgr = FakeVPNManager(_cfg(tmp_path), tmp_path=tmp_path)
+        seuil = mgr._auto_wg_egress_ticks
+        mgr._egress_failures = 1          # already mid-arming (WG ticks)
+
+        mgr.arm_egress_watchdog()
+
+        assert mgr._egress_failures == seuil
+
+    @pytest.mark.asyncio
+    async def test_arm_wakes_the_watchdog_event(self, tmp_path):
+        """The pool signal sets _watchdog_event: the loop's
+        wait(timeout) returns immediately → live tick in ~0-2 s instead
+        of the next idle cadence."""
+        mgr = FakeVPNManager(_cfg(tmp_path), tmp_path=tmp_path)
+        mgr._watchdog_event = asyncio.Event()   # manual (am.6)
+
+        mgr.arm_egress_watchdog()
+
+        assert mgr._watchdog_event.is_set()
+
+    @pytest.mark.asyncio
+    async def test_arm_none_guard_before_start(self, tmp_path):
+        """_watchdog_event is None before start() (piège 14) — the arm
+        must not crash on a not-yet-started manager."""
+        mgr = FakeVPNManager(_cfg(tmp_path), tmp_path=tmp_path)
+        assert mgr._watchdog_event is None
+
+        mgr.arm_egress_watchdog()         # must not raise
+
+        assert mgr._egress_failures == mgr._auto_wg_egress_ticks
+
+    @pytest.mark.asyncio
+    async def test_arm_records_observability(self, tmp_path):
+        """am.23: last failure time + signal count — the only way to
+        debug a parasitic fast-recover straight from the API."""
+        mgr = FakeVPNManager(_cfg(tmp_path), tmp_path=tmp_path)
+        assert mgr._last_conn_failure_at is None
+        assert mgr._conn_failure_signal_count == 0
+
+        mgr.arm_egress_watchdog()
+        mgr.arm_egress_watchdog()
+
+        assert mgr._last_conn_failure_at is not None
+        assert mgr._conn_failure_signal_count == 2
+
+    @pytest.mark.asyncio
+    async def test_arm_then_healthy_probe_absorbs_blip(self, tmp_path):
+        """"sonde saine annule la réparation armée": a real failure then
+        a HEALTHY probe = a transient blip — the armed tick resets the
+        counter, ZERO recovery (no restart, no compose, no escalation).
+        One arm + one tick, and the tunnel is exactly where it was."""
+        mgr = FakeVPNManager(_cfg(tmp_path), tmp_path=tmp_path)
+        mgr.arm_egress_watchdog()
+        assert mgr._egress_failures == mgr._auto_wg_egress_ticks
+        mgr.probe_alive = True            # the blip already passed
+        mgr.ips = []                      # armed tick skips refresh — no pop
+
+        await mgr._watchdog_tick()
+
+        assert mgr._egress_failures == 0
+        assert mgr.calls["restart"] == 0
+        assert mgr.calls["compose_up"] == 0
+        assert mgr.escalations == 0
+
+    @pytest.mark.asyncio
+    async def test_arm_then_dead_probe_recovers_in_one_tick(self, tmp_path):
+        """Armed + dead probe → the threshold tick recovers IMMEDIATELY
+        (one tick, not N): the arm collapses the 3-tick ramp into ~0-2 s
+        (detection 110-130 s → ~1 s after the first real failure). The
+        counter stays ARM-ED after a successful recovery (arm 3 + dead
+        probe 1) — the next healthy tick resets it, keeping the fast
+        follow-up cadence right after a recovery."""
+        mgr = FakeVPNManager(_cfg(tmp_path, vpn_stack="wireguard"), tmp_path=tmp_path)
+        mgr.arm_egress_watchdog()
+        mgr.probe_alive = False           # tunnel still dead
+
+        await mgr._watchdog_tick()
+
+        assert mgr._egress_failures == mgr._auto_wg_egress_ticks + 1
+        assert mgr.calls["restart"] == 3  # tick's restart + 2 finalize rounds
+        assert mgr.calls["compose_up"] == 0
+
+    @pytest.mark.asyncio
+    async def test_arm_ov_stack_recovers_in_one_tick(self, tmp_path):
+        """The INCIDENT stack: OpenVPN. The shared counter + unified
+        light probe cover OV without traffic — before the refonte, the
+        OV branch reset the counter every tick (ZERO detection)."""
+        mgr = FakeVPNManager(_cfg(tmp_path, vpn_stack="openvpn"), tmp_path=tmp_path)
+        mgr.arm_egress_watchdog()
+        mgr.probe_alive = False
+
+        await mgr._watchdog_tick()
+
+        assert mgr._egress_failures == mgr._auto_wg_egress_ticks + 1
+        assert mgr.calls["restart"] == 3
+        assert mgr.escalations == 0
+
+    @pytest.mark.asyncio
+    async def test_arm_during_rotation_skips_tick_once(self, tmp_path):
+        """Garde 2529: a rotation in flight must keep skipping the tick
+        (a restart would race its IP validation) — but the skip is now
+        TRACED once per rotation (am.4), so a lost pool wake is visible.
+        The rotation ends healthy → the armed tick probes → healthy →
+        reset, ZERO recovery."""
+        mgr = FakeVPNManager(_cfg(tmp_path), tmp_path=tmp_path)
+        mgr.arm_egress_watchdog()
+        rotation = asyncio.get_running_loop().create_future()
+        mgr._rotation_task = rotation
+
+        await mgr._watchdog_tick()        # skip — rotation in flight
+
+        assert mgr._skipped_tick_logged is True
+        assert mgr.calls["restart"] == 0
+        assert mgr.escalations == 0
+        assert mgr._egress_failures == mgr._auto_wg_egress_ticks  # unchanged
+
+        mgr._rotation_task = None         # rotation done
+        mgr.probe_alive = True            # the blip passed
+        await mgr._watchdog_tick()
+
+        assert mgr._egress_failures == 0  # healthy probe absorbs the arm
+        assert mgr.calls["restart"] == 0
 
 
 # ── health_check: tunnel re-picked an IP outside a rotation ──────

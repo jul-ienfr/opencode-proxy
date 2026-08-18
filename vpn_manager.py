@@ -506,8 +506,24 @@ class VPNManager:
             self._stack_effective = "openvpn"
         else:  # auto
             self._stack_effective = "wireguard" if os.path.exists(self._wg_key_file) else "openvpn"
-        self._egress_failures = 0  # consecutive dead-tunnel ticks (WG only)
-        self._auto_wg_egress_ticks = max(1, int(cfg.get("auto_wg_egress_ticks", 5)))
+        # [plan 18/08 §1d/§E2] Shared dead-tunnel counter (WG AND OpenVPN):
+        # the light egress probe below is the single authority for egress_dead
+        # on both stacks — the old "stack not WG: counter is meaningless" reset
+        # is gone, so detection without traffic works in OV too.
+        self._egress_failures = 0
+        self._auto_wg_egress_ticks = max(1, int(cfg.get("auto_wg_egress_ticks", 3)))
+        # Armed cadence: while failures are pending the watchdog probes every
+        # _egress_failure_tick_interval seconds (light probe only — the docker
+        # CLI refresh would blow past the cadence). ip_probe_budget bounds the
+        # probe's SOCKS5 CONNECT (an httpx timeout does not, am.10).
+        self._egress_failure_tick_interval = max(
+            0.5, float(cfg.get("egress_failure_tick_interval", 2.0)))
+        self._ip_probe_budget = max(1.0, float(cfg.get("ip_probe_budget", 8.0)))
+        # Pool-signal observability (am.23): the skipped-tick trace flag and
+        # the last real connection-failure report (time + count).
+        self._skipped_tick_logged = False
+        self._last_conn_failure_at: Optional[float] = None
+        self._conn_failure_signal_count = 0
         # [plan 18/08 §3c] Auto-mode reliability counters. Clock is
         # INJECTABLE (_now_fn) so tests can advance time without patching
         # time.monotonic globally (process-wide side effect); production uses
@@ -1254,6 +1270,36 @@ class VPNManager:
                      len(urls))
         return None
 
+    async def _probe_tunnel_light(self) -> bool:
+        """[plan 18/08 §E1/am.10] Light egress probe — SOCKS5 handshake +
+        CONNECT to the ip_check endpoint (same chain as get_public_ip). NO
+        GET: dead/alive is all we need — _finalize_ip does the full check
+        once the tunnel is back. Single authority for egress_dead on BOTH
+        stacks: the incident OV tunnel was "connected" with no AUTH_FAILED/
+        TLS marker, invisible without a probe. Never called without an
+        explicit wait_for budget: an httpx timeout does NOT bound the SOCKS5
+        CONNECT (the 445 s stall bug class).
+        """
+        import httpx
+        try:
+            urls = self._ip_check_urls or [self._ip_check_url]
+            url = urls[self._ip_check_idx % len(urls)]
+            client = httpx.AsyncClient(
+                proxy=self.socks5_url,
+                timeout=httpx.Timeout(self._ip_probe_budget))
+            try:
+                resp = await asyncio.wait_for(
+                    client.send(httpx.Request("CONNECT", url), stream=True),
+                    self._ip_probe_budget)
+                # Release the unread stream without downloading the body
+                # (bounded — a stuck tunnel must not cost the whole budget).
+                await asyncio.wait_for(resp.aclose(), 1.0)
+            finally:
+                await client.aclose()
+            return True
+        except Exception:
+            return False
+
     # ── IP freshness + identity advance (cross-station) ─────────
 
     def _ip_recent(self, ip: str) -> bool:
@@ -1415,6 +1461,9 @@ class VPNManager:
             "circuit_breaker_recovery": self._circuit_breaker._recovery_time,
             "backoff_max_delay": self._backoff._max_delay,
             "watchdog_interval": self._watchdog_interval,
+            "egress_failure_tick_interval": self._egress_failure_tick_interval,
+            "ip_probe_budget": self._ip_probe_budget,
+            "auto_wg_egress_ticks": self._auto_wg_egress_ticks,
             "watchdog_backoff_base": self._watchdog_backoff._base_delay,
             "watchdog_backoff_max": self._watchdog_backoff._max_delay,
             "identity_rotation": self._identity_rotation_enabled,
@@ -1485,6 +1534,16 @@ class VPNManager:
                 max_delay=float(updates["backoff_max_delay"]))
         if "watchdog_interval" in updates:
             self._watchdog_interval = max(1, int(updates["watchdog_interval"]))
+        # [plan 18/08] armed cadence + probe budget + egress threshold — hot-
+        # reload handlers (piège 8: two mandatory echo points; auto_wg_egress
+        # ticks had NONE before this commit — read once at init).
+        if "egress_failure_tick_interval" in updates:
+            self._egress_failure_tick_interval = max(
+                0.5, float(updates["egress_failure_tick_interval"]))
+        if "ip_probe_budget" in updates:
+            self._ip_probe_budget = max(1.0, float(updates["ip_probe_budget"]))
+        if "auto_wg_egress_ticks" in updates:
+            self._auto_wg_egress_ticks = max(1, int(updates["auto_wg_egress_ticks"]))
         if "update_enabled" in updates:
             self._update_enabled = bool(updates["update_enabled"])
         if "update_check_interval" in updates:
@@ -1563,6 +1622,14 @@ class VPNManager:
                 "failures": self._watchdog_backoff.consecutive_failures,
                 "next_delay": self._watchdog_backoff.delay,
                 "server_issue": self._server_issue,
+                # [plan 18/08 am.23] pool-signal observability — debug a
+                # parasitic fast-recover / missed wake straight from the API.
+                "egress_failures": self._egress_failures,
+                "egress_armed": self._egress_failures > 0,
+                "egress_threshold": self._auto_wg_egress_ticks,
+                "egress_tick_interval": self._egress_failure_tick_interval,
+                "last_conn_failure_at": self._last_conn_failure_at,
+                "conn_failure_signal_count": self._conn_failure_signal_count,
             },
             "identity_index": self._identity_index,
             "profiles_count": len(self._identity_profiles),
@@ -2140,7 +2207,10 @@ class VPNManager:
             "effective": self._stack_effective,
             "keys_present": self._wg_key_present(),
             "egress_failures": self._egress_failures,
+            "egress_armed": self._egress_failures > 0,
             "wg_egress_ticks": self._auto_wg_egress_ticks,
+            "last_conn_failure_at": self._last_conn_failure_at,
+            "signal_count": self._conn_failure_signal_count,
             "auth_failed_window": len(self._auth_failed_window),
             "auth_failed_threshold": self._auto_ov_fail_threshold,
             "cooldown_min": self._auto_flip_cooldown_min,
@@ -2482,6 +2552,22 @@ class VPNManager:
 
     # ── Auth watchdog ──────────────────────────────────────────
 
+    def arm_egress_watchdog(self) -> None:
+        """[plan 18/08 §1c] Pool signal: a REAL connection failed on this
+        tunnel (SOCKS5 dead). Arms the immediate recovery — the next tick
+        probes/recovers in ~1 s instead of waiting N idle ticks. The tick's
+        light probe decides alone: healthy → reset (a transient blip is
+        absorbed, no recovery at all), dead → threshold reached → recovery.
+        Both stacks: the shared counter reaches the threshold in every mode.
+        """
+        self._egress_failures = max(self._egress_failures,
+                                    self._auto_wg_egress_ticks)
+        self._skipped_tick_logged = False
+        self._last_conn_failure_at = self._now_fn()
+        self._conn_failure_signal_count += 1
+        if self._watchdog_event is not None:
+            self._watchdog_event.set()  # loop wait(timeout) returns → live tick
+
     async def _watchdog_loop(self) -> None:
         """Background watchdog: auto-restart the gluetun container when
         OpenVPN hits AUTH_FAILED or a TLS negotiation failure (stale/crashed
@@ -2502,9 +2588,13 @@ class VPNManager:
                 raise
             except Exception as e:
                 logger.error("[vpn-watchdog] loop error: %s", e)
-            # Failure cadence = backoff (base→max); healthy cadence = interval.
+            # Failure cadence = backoff (base→max); armed cadence = light
+            # probe every _egress_failure_tick_interval s (WG AND OV — the
+            # counter is shared); healthy cadence = normal interval.
             delay = (self._watchdog_backoff.delay
                      if self._watchdog_backoff.consecutive_failures > 0
+                     else self._egress_failure_tick_interval
+                     if self._egress_failures > 0
                      else self._watchdog_interval)
             # Sleep dually on the interval AND container events: every
             # die/stop/kill/start (docker events watcher sets
@@ -2527,37 +2617,45 @@ class VPNManager:
         if not self._enabled or self._proxy_mode != "vpn":
             return  # VPN feature off or tunnel bypassed — nothing to watch
         if self._rotation_task and not self._rotation_task.done():
-            return  # rotation in flight — a restart would race its IP validation
+            # Rotation in flight — a restart would race its IP validation
+            # (the skip MUST stay). Trace it once per rotation so a lost
+            # pool wake (plan guard 2529) is visible in the logs.
+            if not self._skipped_tick_logged:
+                self._skipped_tick_logged = True
+                logger.info("[vpn-watchdog] tick skipped — rotation in flight")
+            return
         if self._lock.locked():
             return  # connect/rotate/apply_update in progress — skip this tick
         escalate = False
         async with self._lock:
-            # Source of truth: inspect + StartedAt-bounded log scan + SOCKS5
-            # probe. force=True: never serve the 5s cache here.
-            await self.refresh_status(force=True)
-            # [plan 18/08 §2d] WireGuard egress probe — the control API
-            # answers "running" (+ its stale IP) even with a dead tunnel, and
-            # OpenVPN markers (AUTH_FAILED/TLS) cannot exist on WG: a dead WG
-            # tunnel would be invisible here. Probe the PUBLIC IP through the
-            # SOCKS5 tunnel (same chain as get_public_ip); N consecutive dead
-            # ticks arm the recovery path below (fast-pin reconnect, then
-            # compose). Any success resets the counter.
-            egress_dead = False
-            if self._stack_effective == "wireguard":
-                if await self.get_public_ip():
-                    if self._egress_failures:
-                        logger.info("[vpn-watchdog] egress OK — counter reset")
-                    self._egress_failures = 0
-                else:
-                    self._egress_failures += 1
-                    if self._egress_failures >= self._auto_wg_egress_ticks:
-                        egress_dead = True
-                    else:
-                        logger.warning("[vpn-watchdog] egress dead %d/%d ticks — waiting",
-                                       self._egress_failures, self._auto_wg_egress_ticks)
-                        return
+            # [plan 18/08 §1d/§E2] Armed state: skip the full refresh
+            # (~3-8 s of docker CLI — the tick would blow past the 2 s
+            # cadence). The light probe decides alone; the refresh returns
+            # to transitions (recovery/compose, below) and idle ticks.
+            if self._egress_failures:
+                self._skipped_tick_logged = False
             else:
-                self._egress_failures = 0  # stack not WG: counter is meaningless
+                await self.refresh_status(force=True)
+            egress_dead = False
+            # [plan 18/08 §E1] Light egress probe — SOCKS5 handshake +
+            # CONNECT to the ip_check endpoint, bounded by the probe budget,
+            # NO GET (dead/alive suffices; _finalize_ip does the full GET
+            # when the tunnel returns). Stack-agnostic: the incident tunnel
+            # was "connected" with no AUTH_FAILED/TLS marker — invisible
+            # without a probe. Same connect chain as get_public_ip.
+            if not await asyncio.wait_for(self._probe_tunnel_light(),
+                                          self._ip_probe_budget):
+                self._egress_failures += 1
+                if self._egress_failures >= self._auto_wg_egress_ticks:
+                    egress_dead = True
+                else:
+                    logger.warning("[vpn-watchdog] egress dead %d/%d ticks — waiting",
+                                   self._egress_failures, self._auto_wg_egress_ticks)
+                    return
+            else:
+                if self._egress_failures:
+                    logger.info("[vpn-watchdog] egress OK — counter reset")
+                self._egress_failures = 0
             # [plan 18/08 §3c] auto-mode policy — decided inside the lock on
             # fresh counters, applied AFTER it (_apply_stack takes the lock;
             # asyncio.Lock is not reentrant, calling it here would deadlock).

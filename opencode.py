@@ -1672,6 +1672,44 @@ def _free_request_headers(headers: dict) -> dict:
             and not k.lower().startswith("x-stainless-")}
 
 
+def _is_connect_error(e: Exception) -> bool:
+    """[plan 18/08 §1a] True when ``e`` is a transport-level connection
+    failure through the VPN tunnel (SOCKS5 dead) — NOT an HTTP answer.
+    curl_cffi 0.14.0: RequestsError aliases RequestException (all
+    subclasses); ``e.code`` is always set (IntEnum, 0 default); the
+    ``errors`` module exports only CurlError/RequestsError/
+    CookieConflict/SessionClosed — no subclass test possible. Classify by
+    libcurl code: resolve/connect/partial-file/timeout/SSL/recv = dead
+    tunnel. Fallback: the message names SOCKS/connect/proxy. Never fires
+    on HTTP responses — 429/5xx are not exceptions on this path
+    (raise_for_status is False).
+    """
+    import curl_cffi.requests.errors as _err
+    if not isinstance(e, _err.RequestsError):
+        return False
+    try:
+        code = int(getattr(e, "code", 0))
+    except (TypeError, ValueError):
+        code = 0
+    if code in (5, 6, 7, 18, 28, 35, 56, 97):
+        return True
+    msg = str(e).lower()
+    return any(k in msg for k in ("socks", "connect", "proxy"))
+
+
+def _signal_connection_failure(station) -> None:
+    """[plan 18/08 §1a] Fire-and-forget pool signal for a real connection
+    failure on ``station`` (SOCKS5 dead — invisible to the pool, which keeps
+    the station "connected"). The request path must NEVER suffer the signal:
+    any bug inside notify (bad-mark dispatch, logging) must not turn a free
+    request into an error — full swallow.
+    """
+    try:
+        _free_ip_pool.notify_connection_failure(station)
+    except Exception:
+        pass
+
+
 async def _do_free_request_curl_cffi(body: dict, headers: dict, proxy_url: str | None = None,
                                      station=None):
     """Make a free model request using curl_cffi for TLS fingerprint evasion.
@@ -1696,12 +1734,29 @@ async def _do_free_request_curl_cffi(body: dict, headers: dict, proxy_url: str |
 
     async with AsyncSession(impersonate=profile["impersonate"],
                             proxy=_curl_proxy_url(proxy_url)) as session:
-        resp = await session.post(
-            API_BASE_FREE,
-            json=body,
-            headers=req_headers,
-            timeout=(30, 600),  # (connect, read) — same as other free paths ([6])
-        )
+        # [plan 18/08 §1a/am.21] connect timeout 30 → 10: in mono-station the
+        # request IS the arming signal (bad-mark is C1-forbidden) — the first
+        # failure reaches the manager in ≤10-15 s, not 30. Read 600 unchanged
+        # (long model streams). SOCKS5+TLS handshake ≈ 1-2 s on a healthy
+        # tunnel — no legitimate request is impacted.
+        try:
+            resp = await session.post(
+                API_BASE_FREE,
+                json=body,
+                headers=req_headers,
+                timeout=(10, 600),  # (connect, read) — read 600: long streams
+            )
+        except curl_cffi.requests.errors.RequestsError as e:
+            # [plan 18/08 §1a] a REAL connection failure (dead SOCKS5 tunnel)
+            # is invisible to the pool — the station stays "connected" and
+            # every request re-strikes it. Signal the pool+manager
+            # fire-and-forget: bad-mark → instant failover (no request ever
+            # re-strikes a known-dead tunnel), arm+wake → live tick repair.
+            # Never on HTTP responses (429/5xx are not exceptions here —
+            # raise_for_status is False).
+            if station is not None and _is_connect_error(e):
+                _signal_connection_failure(station)
+            raise
         # Wrap in a compatible response object
         return _CurlCffiResponse(resp)
 
@@ -1846,9 +1901,14 @@ async def _open_free_stream(endpoint, body, headers, use_free: bool, count_reque
                 req_headers = _apply_identity(_free_request_headers(headers),
                                               profile, use_curated_ua=False)
                 req_headers["Content-Type"] = "application/json"
+                # [plan 18/08 §1a/am.21] connect timeout 30 → 10: in mono-station
+                # the request IS the arming signal (bad-mark is C1-forbidden) —
+                # the first failure reaches the manager in ≤10-15 s, not 30. Read
+                # 600 unchanged (long streams). SOCKS5+TLS handshake ≈ 1-2 s on a
+                # healthy tunnel — no legitimate request is impacted.
                 session = AsyncSession(impersonate=profile["impersonate"],
                                        proxy=_curl_proxy_url(proxy_url),
-                                       timeout=(30, 600))  # connect 30 / read 600 (cf. upstream.timeout)
+                                       timeout=(10, 600))  # connect 10 (am.21) / read 600
                 resp = await session.post(endpoint, json=body, headers=req_headers, stream=True)
                 wrapped = _CurlCffiStreamResponse(resp)
                 try:
@@ -1858,6 +1918,15 @@ async def _open_free_stream(endpoint, body, headers, use_free: bool, count_reque
                     await session.close()
                 return
             except Exception as e:
+                # [plan 18/08 §1a] a REAL connection failure (dead SOCKS5
+                # tunnel) is invisible to the pool — the station stays
+                # "connected" and every request re-strikes it. Signal
+                # fire-and-forget BEFORE the direct fallback (bad-mark →
+                # instant failover; arm+wake → live tick repair). No
+                # re-raise: the direct fallback is the existing semantics.
+                # Never on HTTP answers (429/5xx are not exceptions here).
+                if station is not None and _is_connect_error(e):
+                    _signal_connection_failure(station)
                 _debug(f"  [stream] curl_cffi proxy stream failed: {e}, falling back to direct stream")
                 _log(f"  FREE STREAM via VPN tunnel FAILED ({e}) → direct fallback (residential IP)")
     if use_free:
