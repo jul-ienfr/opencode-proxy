@@ -519,6 +519,13 @@ class VPNManager:
         self._egress_failure_tick_interval = max(
             0.5, float(cfg.get("egress_failure_tick_interval", 2.0)))
         self._ip_probe_budget = max(1.0, float(cfg.get("ip_probe_budget", 8.0)))
+        # [plan 18/08 §A/am.14] Per-round recovery bound in _finalize_ip:
+        # the 445 s incident stall accumulated over 3 rounds ×
+        # _wait_healthy(120) + docker legs. 45 s per round caps the worst
+        # finalize path at ~150-180 s without starving a slow-but-real
+        # reconnect (8-15 s). Hardcoded on purpose — rotation_max_duration
+        # (global wall) is the single tunable rotation knob.
+        self._rotation_recovery_timeout = 45.0
         # Pool-signal observability (am.23): the last real connection-
         # failure report (time + count) and the skipped-tick trace — per
         # ROTATION TASK, not a global flag (a flag that resets on any normal
@@ -1203,7 +1210,12 @@ class VPNManager:
             import httpx
             start = time.monotonic()
             async with httpx.AsyncClient(timeout=15, proxy=self.socks5_url) as client:
-                resp = await client.get(self._ip_check_url)
+                # [plan 18/08 §A] same stall class as get_public_ip: an
+                # httpx timeout does NOT bound a stuck SOCKS5 CONNECT —
+                # wait_for ip_probe_budget; the except below absorbs the
+                # TimeoutError into the error result.
+                resp = await asyncio.wait_for(
+                    client.get(self._ip_check_url), self._ip_probe_budget)
                 elapsed_ms = int((time.monotonic() - start) * 1000)
             new_ip = resp.text.strip()
             result["latency_ms"] = elapsed_ms
@@ -1243,31 +1255,53 @@ class VPNManager:
             logger.error("[vpn] health check failed: %s", e)
         return result
 
+    async def _probe_url(self, url: str) -> Optional[str]:
+        """[plan 18/08 §A] One bounded IP GET through the SOCKS5 tunnel —
+        the parallel unit of get_public_ip. Fresh coroutine per endpoint:
+        the sweep's wait_for cancels it on budget overrun, __aexit__ closes
+        the client on cancellation — no orphan task, no leaked client.
+        Returns the IP text (None on any failure)."""
+        try:
+            import httpx
+            async with httpx.AsyncClient(timeout=5, proxy=self.socks5_url) as client:
+                resp = await client.get(url)
+                ip = resp.text.strip()
+            return ip or None
+        except Exception:
+            return None
+
     async def get_public_ip(self) -> Optional[str]:
         """Query the public IP through the SOCKS5 tunnel (127.0.0.1:1080).
 
         Tries the ordered ``ip_check_urls`` chain (``ip_check_url`` stays
         the legacy alias — entry 1 when no chain is configured), every
         endpoint through the SAME tunnel: resolving outside it would
-        falsify rotation validation. The last working endpoint is sticky
-        (no 4-probe sweep on every call); a failed endpoint moves the
-        index on. Returns None only when every endpoint failed — never
-        "unknown" as a success value.
+        falsify rotation validation. [plan 18/08 §A] ALL endpoints are
+        probed in PARALLEL under ONE bounded sweep (``ip_probe_budget``)
+        — the old sequential chain cost n × per-request timeout stacked on
+        repeated callers (the 445 s stall class), with no sweep-level cap.
+        The first success in endpoint order from ``_ip_check_idx`` is
+        returned and kept sticky; a fully failed OR budget-overrun sweep
+        resets the index. Returns None only when every endpoint failed —
+        never "unknown" as a success value.
         """
         urls = self._ip_check_urls or [self._ip_check_url]
+        base = self._ip_check_idx                       # read BEFORE the sweep
+        try:
+            results = await asyncio.wait_for(
+                asyncio.gather(*(self._probe_url(u) for u in urls)),
+                self._ip_probe_budget)
+        except asyncio.TimeoutError:
+            results = []                                # sweep cancelled → total failure
         for i in range(len(urls)):
-            url = urls[(self._ip_check_idx + i) % len(urls)]
-            try:
-                import httpx
-                async with httpx.AsyncClient(timeout=5, proxy=self.socks5_url) as client:
-                    resp = await client.get(url)
-                    ip = resp.text.strip()
-                if ip:
-                    # Sticky: remember the working endpoint (i==0 keeps it).
-                    self._ip_check_idx = (self._ip_check_idx + i) % len(urls)
-                    return ip
-            except Exception:
-                continue
+            idx = (base + i) % len(urls)        # scan in rotated order...
+            if i >= len(results):
+                break                           # cancelled sweep → the total-failure tail
+            ip = results[idx]                   # ...but results[] is URLS order
+            if ip:
+                # Sticky: remember the working endpoint (i==0 keeps it).
+                self._ip_check_idx = idx
+                return ip
         self._ip_check_idx = 0  # full sweep failed — restart at the top next call
         logger.error("[vpn] public IP probe failed on all %d endpoints via SOCKS5",
                      len(urls))
@@ -1400,7 +1434,14 @@ class VPNManager:
             if attempt < 2:
                 try:
                     await self._ensure_container()
-                    started_at = await self._wait_healthy(timeout=120)
+                    # [plan 18/08 §A/am.14] per-round bound, not the old
+                    # flat 120 s: 3 recovery rounds × _wait_healthy(120) +
+                    # _ensure_container legs summed to the measured 445 s
+                    # stall. The budget is carried over from the rotation
+                    # config (no new knob — rotation_max_duration is the
+                    # global wall).
+                    started_at = await self._wait_healthy(
+                        timeout=self._rotation_recovery_timeout)
                     if started_at:
                         auth = await self._check_auth_failed(started_at)
                         tls = await self._check_server_issue(started_at)
