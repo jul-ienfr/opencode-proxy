@@ -37,6 +37,7 @@ record-only, per-station state files in tmp_path.
 """
 import asyncio
 import contextlib
+import os
 import subprocess
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -98,6 +99,17 @@ class FakeVPNManager(vm.VPNManager):
         key = "state_file_2" if station == 2 else "state_file"
         cfg.setdefault(key, str(tmp_path / f"vpn_state{station}.json"))
         super().__init__(cfg, station=station, shared=shared)
+        # [plan 18/08 §2d] Pin the WG key file into tmp_path: the repo's
+        # vpn_configs/ may or may not hold the NordLynx key on this machine,
+        # and the "auto" stack resolution must be deterministic in tests.
+        # Re-derive the effective stack exactly like the real __init__.
+        self._wg_key_file = str(tmp_path / "wireguard.env")
+        if self._stack == "wireguard":
+            self._stack_effective = "wireguard"
+        elif self._stack == "openvpn":
+            self._stack_effective = "openvpn"
+        else:
+            self._stack_effective = "wireguard" if os.path.exists(self._wg_key_file) else "openvpn"
         self.ips = []                       # FIFO answers for get_public_ip()
         self.container_present = True
         self.log_text = ""                  # container logs: AUTH_FAILED marker
@@ -458,6 +470,65 @@ class TestWatchdogTick:
         assert mgr._watchdog_backoff.consecutive_failures == 0
         assert mgr._watchdog_backoff.delay == 15
         assert mgr.calls["restart"] == 0
+
+    # ── [plan 18/08 §2d] WireGuard egress watchdog ──────────────
+
+    @pytest.mark.asyncio
+    async def test_wg_egress_dead_5_ticks_restarts_once(self, tmp_path):
+        """WG tunnel without egress: the control API still answers "running"
+        and no OpenVPN marker exists — only the SOCKS5 egress probe detects
+        it. Ticks 1-4 arm the consecutive counter (backoff untouched, no
+        recovery action); tick 5 arms the recovery: fast-pin is OFF without
+        a control key, and the restart is PLAIN (no OpenVPN marker → no
+        --force-recreate; the tick's restart + the 2 finalize re-pick
+        rounds)."""
+        mgr = FakeVPNManager(_cfg(tmp_path, vpn_stack="wireguard"), tmp_path=tmp_path)
+        mgr.ips = []                       # dead tunnel: every probe is None
+        for _ in range(4):
+            await mgr._watchdog_tick()
+        assert mgr._egress_failures == 4
+        assert mgr.calls["restart"] == 0      # waiting — no recovery action
+        assert mgr.calls["compose_up"] == 0
+        assert mgr._watchdog_backoff.consecutive_failures == 0
+        await mgr._watchdog_tick()
+        assert mgr._egress_failures == 5
+        assert mgr.calls["restart"] == 3      # tick's restart + 2 finalize rounds
+        assert mgr.calls["compose_up"] == 0   # no OpenVPN marker → plain restart
+        assert mgr.escalations == 0           # first failure — no escalation yet
+
+    @pytest.mark.asyncio
+    async def test_wg_egress_recovery_lands_on_fresh_ip(self, tmp_path):
+        """Dead-tunnel recovery lands on a FRESH IP (9.9.9.9), CONNECTED;
+        the next healthy tick resets the egress counter — no further
+        restart."""
+        mgr = FakeVPNManager(_cfg(tmp_path, vpn_stack="wireguard"), tmp_path=tmp_path)
+        # 4 dead ticks (refresh + egress probes each = 8), then the recovery
+        # tick: 2 dead probes + finalize round 0 + post-recovery refresh
+        mgr.ips = [None] * 8 + [None, None, "9.9.9.9", "9.9.9.9"]
+        for _ in range(4):
+            await mgr._watchdog_tick()
+        assert mgr._egress_failures == 4
+        await mgr._watchdog_tick()
+        assert mgr._status == vm.VPNState.CONNECTED
+        assert mgr._current_ip == "9.9.9.9"
+        assert mgr.calls["restart"] == 1      # tick's restart only
+        assert mgr._egress_failures == 5      # reset on the next probe success
+        mgr.ips = ["9.9.9.9", "9.9.9.9"]      # refresh + egress both healthy
+        await mgr._watchdog_tick()
+        assert mgr._egress_failures == 0
+        assert mgr.calls["restart"] == 1      # healthy — no restart
+
+    @pytest.mark.asyncio
+    async def test_wg_egress_success_resets_counter(self, tmp_path):
+        """A probe success resets the consecutive-dead counter mid-arming:
+        never a recreate."""
+        mgr = FakeVPNManager(_cfg(tmp_path, vpn_stack="wireguard"), tmp_path=tmp_path)
+        mgr._egress_failures = 4               # nearly armed
+        mgr.ips = ["1.1.1.1", "1.1.1.1"]       # refresh + egress both healthy
+        await mgr._watchdog_tick()
+        assert mgr._egress_failures == 0
+        assert mgr.calls["compose_up"] == 0
+        assert mgr._watchdog_backoff.consecutive_failures == 0
 
 
 # ── retrocompat: shared=None ────────────────────────────────────

@@ -157,6 +157,63 @@ services:
       retries: 3
       start_period: 60s
 
+  # [plan 18/08 §2c] Canary WireGuard/NordLynx — validates the shared
+  # NordLynx key (vpn_configs/wireguard.env, gitignored) BEFORE any station
+  # flips. One station at a time runs WireGuard during the test, so the
+  # single-account key never contends (NordGen issue #26: 2 devices sharing
+  # one key cannot hit the SAME server simultaneously — also guaranteed in
+  # production by the shared-rotation pass-1, countries differ per station).
+  #
+  # Deviation from the plan ("sans profiles"): the env_file here lists
+  # vpn_configs/wireguard.env which does NOT exist on a fresh clone — and
+  # Compose v5.3.1 treats a missing env_file in an UNPROFILED service as a
+  # FATAL error that breaks `docker compose up` of the whole model (stations
+  # included). The profile gates the file requirement away; an explicit
+  # `docker compose up -d vpn-wg-test` still runs the profiled service (same
+  # mechanism as vpn-gluetun-2, see comment above) and the canary never
+  # starts automatically.
+  vpn-wg-test:
+    image: qmcgaw/gluetun
+    profiles: ["wg-test"]
+    container_name: opencode-wg-test
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    ports:
+      - "127.0.0.1:8890:8890"    # HTTP proxy (loopback only, test port)
+      - "127.0.0.1:1082:1082"    # SOCKS5 proxy (loopback only, test port)
+    env_file:
+      - credentials.env
+      - vpn_configs/wireguard.env   # NordLynx key — shared by both stations
+    environment:
+      - VPN_SERVICE_PROVIDER=nordvpn
+      - VPN_TYPE=wireguard
+      # Single country: validation checks the public IP lands in Switzerland
+      # (spaced name — gluetun enum, see comment on SERVER_COUNTRIES above).
+      - SERVER_COUNTRIES=Switzerland
+      - UPDATER_PERIOD=480h
+      - HTTPPROXY=on
+      - HTTPPROXY_LISTENING_ADDRESS=:8890
+      - SOCKS5_ENABLED=on
+      - SOCKS5_LISTENING_ADDRESS=:1082
+      - DNS_OVER_TLS=on
+      - FIREWALL=on
+      - PUID=1000
+      - PGID=1000
+      - HTTP_CONTROL_SERVER=on
+    volumes:
+      - gluetun-wg-test:/gluetun
+    restart: unless-stopped
+    # [plan] local healthcheck — control server instead of external egress.
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - -T 5 --header=\"X-API-Key: $$VPN_CONTROL_API_KEY\" http://127.0.0.1:8000/v1/vpn/status"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+
 volumes:
   gluetun:
   gluetun2:
+  gluetun-wg-test:

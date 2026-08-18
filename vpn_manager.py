@@ -488,6 +488,26 @@ class VPNManager:
         # consumed ONLY by the fast-pin path (Phase 1c); free_ip_pool never
         # sees it. Wall-clock epoch timestamps so the TTL survives restarts.
         self._failed_hosts: dict[str, dict] = {}
+        # [plan 18/08 §2d/3c] VPN stack: "auto" | "wireguard" | "openvpn".
+        # auto starts on WireGuard when the NordLynx key is present (the
+        # most reliable stack — OpenVPN AUTH_FAILED cannot exist on WG) and
+        # falls back to OpenVPN when the WG tunnel loses egress; returns to
+        # the preferred WG stack after the prudent thresholds (Phase 3).
+        self._stack = str(cfg.get("vpn_stack", "auto")).strip().lower()
+        if self._stack not in ("auto", "wireguard", "openvpn"):
+            self._stack = "auto"
+        # Key file lives NEXT TO the compose file (vpn_configs/ is gitignored
+        # as a whole; the key never enters config.yaml, .env or state).
+        self._wg_key_file = os.path.join(
+            os.path.dirname(self._compose_file_path()), "vpn_configs", "wireguard.env")
+        if self._stack == "wireguard":
+            self._stack_effective = "wireguard"
+        elif self._stack == "openvpn":
+            self._stack_effective = "openvpn"
+        else:  # auto
+            self._stack_effective = "wireguard" if os.path.exists(self._wg_key_file) else "openvpn"
+        self._egress_failures = 0  # consecutive dead-tunnel ticks (WG only)
+        self._auto_wg_egress_ticks = max(1, int(cfg.get("auto_wg_egress_ticks", 5)))
 
         # Identity rotation (client fingerprint, advanced on IP rotation).
         # identity_diversity (default False, backward-compatible) expands the
@@ -2305,13 +2325,41 @@ class VPNManager:
             # Source of truth: inspect + StartedAt-bounded log scan + SOCKS5
             # probe. force=True: never serve the 5s cache here.
             await self.refresh_status(force=True)
-            if not (self._auth_failed or self._server_issue):
+            # [plan 18/08 §2d] WireGuard egress probe — the control API
+            # answers "running" (+ its stale IP) even with a dead tunnel, and
+            # OpenVPN markers (AUTH_FAILED/TLS) cannot exist on WG: a dead WG
+            # tunnel would be invisible here. Probe the PUBLIC IP through the
+            # SOCKS5 tunnel (same chain as get_public_ip); N consecutive dead
+            # ticks arm the recovery path below (fast-pin reconnect, then
+            # compose). Any success resets the counter.
+            egress_dead = False
+            if self._stack_effective == "wireguard":
+                if await self.get_public_ip():
+                    if self._egress_failures:
+                        logger.info("[vpn-watchdog] egress OK — counter reset")
+                    self._egress_failures = 0
+                else:
+                    self._egress_failures += 1
+                    if self._egress_failures >= self._auto_wg_egress_ticks:
+                        egress_dead = True
+                    else:
+                        logger.warning("[vpn-watchdog] egress dead %d/%d ticks — waiting",
+                                       self._egress_failures, self._auto_wg_egress_ticks)
+                        return
+            else:
+                self._egress_failures = 0  # stack not WG: counter is meaningless
+            if not (self._auth_failed or self._server_issue) and not egress_dead:
                 self._watchdog_backoff.record_success()  # failure cleared: full cadence
                 return
             info = await self._docker_inspect()
             if not info or not info.get("running"):
                 return  # absent/stopped/restarting — other paths own the lifecycle
-            kind = "AUTH_FAILED" if self._auth_failed else "TLS negotiation timeout"
+            if egress_dead:
+                kind = "egress dead"
+            elif self._auth_failed:
+                kind = "AUTH_FAILED"
+            else:
+                kind = "TLS negotiation timeout"
             logger.warning("[vpn-watchdog] %s detected — restarting %s",
                            kind, self._docker_container)
             # [plan 18/08] Fast recovery via the control API BEFORE compose:
