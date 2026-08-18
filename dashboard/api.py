@@ -1289,23 +1289,36 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
             if pool is not None:
                 pool.update_config(body)
 
-            # Persist changes to config.yaml
-            _persist_vpn_config(body)
+            # Persist changes to config.yaml. [audit 18/08] vpn_stack is
+            # excluded here and persisted AFTER the stack application
+            # succeeded — persisting first would leave config.yaml saying
+            # wireguard while the effective stack stayed openvpn when
+            # set_stack refuses (no vpn_configs/wireguard.env): incoherent
+            # persistent state that would also kill auto-flips on reboot
+            # (stack != auto wins). The other keys are unconditional.
+            _persist_body = {k: v for k, v in body.items() if k != "vpn_stack"}
+            _persist_vpn_config(_persist_body)
 
             # [plan 18/08 §3d] stack selection — applied AFTER the config
             # fan-out (set_stack persists the mode itself into the manager;
-            # config.yaml holds the selection via _persist_vpn_config above).
-            # _apply_stack recreates BOTH stations, so the station-2 manager
-            # only mirrors state (propagate=False) — no second compose.
+            # config.yaml holds the selection via the conditional persist
+            # above). _apply_stack recreates BOTH stations, so the station-2
+            # manager only mirrors state (propagate=False) — no second
+            # compose — and only on success (a refused flip must not desync
+            # station 2 from station 1).
             if "vpn_stack" in body:
+                _stack_ok = False
                 try:
                     _stack_res = await shared_state.vpn_manager.set_stack(
                         str(body["vpn_stack"]))
-                    if not _stack_res.get("ok"):
-                        _debug(f"  [vpn] set_stack: {_stack_res.get('error')}")
+                    _stack_ok = bool(_stack_res.get("ok"))
+                    if _stack_ok:
+                        _persist_vpn_config({"vpn_stack": str(body["vpn_stack"])})
+                    else:
+                        _debug(f"  [vpn] set_stack refused: {_stack_res.get('error')} — config.yaml keeps the previous stack")
                 except Exception as e:
                     _debug(f"  [vpn] set_stack failed: {e}")
-                if mgr2 is not None:
+                if _stack_ok and mgr2 is not None:
                     try:
                         await mgr2.set_stack(str(body["vpn_stack"]), propagate=False)
                     except Exception as e:

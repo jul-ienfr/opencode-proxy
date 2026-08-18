@@ -51,7 +51,13 @@ services:
       - credentials.env
       # [plan 18/08 §2b/3a] NordLynx key — always loaded, inert while
       # VPN_TYPE=openvpn (gluetun ignores settings of the unselected type).
-      - vpn_configs/wireguard.env
+      # required: false — a fresh clone has no vpn_configs/wireguard.env
+      # yet (gitignored); `docker compose up` must not fail before the key
+      # exists, and _apply_stack refuses a flip to wireguard without it
+      # (GUI hint). Audit 18/08: short-form list entry is required by
+      # default → breaks the whole model on a fresh clone.
+      - path: vpn_configs/wireguard.env
+        required: false
     environment:
       - VPN_SERVICE_PROVIDER=nordvpn
       # [plan 18/08 §3a] stack per station, driven by the .env next to this
@@ -129,7 +135,9 @@ services:
       - credentials.env
       # [plan 18/08 §2b/3a] NordLynx key — always loaded, inert while
       # VPN_TYPE=openvpn (gluetun ignores settings of the unselected type).
-      - vpn_configs/wireguard.env
+      # required: false — fresh-clone safety (see vpn-gluetun comment).
+      - path: vpn_configs/wireguard.env
+        required: false
     environment:
       - VPN_SERVICE_PROVIDER=nordvpn
       # [plan 18/08 §3a] stack per station, driven by the .env next to this
