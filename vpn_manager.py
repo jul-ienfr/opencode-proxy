@@ -3,12 +3,12 @@ VPN Manager for OpenCode Proxy — gluetun / compose-managed only.
 
 The VPN tunnel is a docker-compose service (vpn-gluetun, container
 "opencode-vpn") that survives proxy restarts. Each station owns ONE
-service: station 1 = vpn-gluetun (ports 1080/8888), station 2 =
-vpn-gluetun-2 (ports 1081/8889, only when ip_rotation.dual_station is
-enabled). This manager never STOPS containers — the tunnel survives
-proxy restarts — but it DOES bring the service up at startup (and on
-auto-connect / rotation) via `docker compose up -d <compose_service>`; it
-also:
+service: station N = vpn-gluetun-N (ports 1079+N/8887+N, stations 2+
+only when resolved ip_rotation.station_count >= N). This manager never
+STOPS containers on shutdown (the tunnel survives proxy restarts) —
+only the hot-reload downscale calls stop_container() — but it DOES
+bring the service up at startup (and on auto-connect / rotation) via
+`docker compose up -d <compose_service>`; it also:
 
 proxy_mode:
   - "vpn": free model requests are routed via socks5://127.0.0.1:<port>
@@ -24,6 +24,12 @@ import asyncio
 import logging
 import subprocess
 from typing import Optional
+
+# Cross-module registry of active VPN managers ([plan 18/08 §1]): set by
+# opencode.py's lifespan / _apply_station_count, read by _apply_stack to
+# scope a stack flip to the currently configured stations. shared_state is
+# a plain data module (no imports) — no import cycle.
+import shared_state
 
 logger = logging.getLogger(__name__)
 
@@ -415,12 +421,12 @@ class VPNManager:
     def __init__(self, cfg: dict, station: int = 1, shared=None):
         """Build a VPN station manager.
 
-        ``station`` selects per-station config keys (suffix ``_2`` for
-        station 2: ``docker_container_2``, ``vpn_proxy_port_2``,
-        ``socks5_proxy_port_2``, ``compose_service_2``, ``state_file_2``) —
-        the dual-station setup runs two gluetun containers in parallel and
-        each station has its own ports/container/state file. Station 1 keeps
-        the legacy key names, so ``VPNManager(IP_ROTATION)`` is unchanged.
+        ``station`` selects per-station config keys (suffix ``_N`` for
+        station N: ``docker_container_N``, ``vpn_proxy_port_N``,
+        ``socks5_proxy_port_N``, ``compose_service_N``, ``state_file_N``) —
+        the N-station setup runs N gluetun containers in parallel and each
+        station has its own ports/container/state file. Station 1 keeps the
+        legacy key names, so ``VPNManager(IP_ROTATION)`` is unchanged.
 
         ``shared`` is the cross-station SharedRotationState (IP registry +
         global identity cursor). When absent (or None) every cross-station
@@ -435,24 +441,29 @@ class VPNManager:
         self._proxy_mode = cfg.get("proxy_mode", "vpn")  # vpn | direct
         self._quota_per_ip = cfg.get("quota_per_ip", 300)
         self._switch_delay = cfg.get("switch_delay", 5)
+        # [plan 18/08 §1] N-station suffix: station 1 keeps the legacy key
+        # names, stations 2+ read ``_N``-suffixed keys with derived defaults
+        # (opencode-vpn-{N} / vpn-gluetun-{N} / socks5 1079+N / http 8887+N).
+        # Stations 1 and 2 behave exactly as before.
+        suffix = "" if station <= 1 else f"_{station}"
         self._docker_container = cfg.get(
-            "docker_container_2" if station == 2 else "docker_container",
-            "opencode-vpn-2" if station == 2 else "opencode-vpn")
+            f"docker_container{suffix}",
+            f"opencode-vpn-{station}" if station > 1 else "opencode-vpn")
         self._docker_compose_file = cfg.get("docker_compose_file", "docker-compose.yml")
         # The compose SERVICE name (not container name) used in `docker
         # compose -f … up -d <service>` / `pull <service>` invocations.
         self._compose_service = cfg.get(
-            "compose_service_2" if station == 2 else "compose_service",
-            "vpn-gluetun-2" if station == 2 else "vpn-gluetun")
-        # Per-station state file (station 2 must not clobber station 1's IP
-        # history/circuit breaker, and vice versa).
+            f"compose_service{suffix}",
+            f"vpn-gluetun-{station}" if station > 1 else "vpn-gluetun")
+        # Per-station state file (station N must not clobber another
+        # station's IP history/circuit breaker, and vice versa).
         self._state_file = cfg.get(
-            "state_file_2" if station == 2 else "state_file",
-            os.path.join(ROOT, "logs", "vpn_state2.json" if station == 2 else "vpn_state.json"))
+            f"state_file{suffix}",
+            os.path.join(ROOT, "logs", f"vpn_state{station}.json" if station > 1 else "vpn_state.json"))
         self._proxy_port = cfg.get(
-            "vpn_proxy_port_2" if station == 2 else "vpn_proxy_port", 8889 if station == 2 else 8888)
+            f"vpn_proxy_port{suffix}", 8887 + station if station > 1 else 8888)
         self._socks5_port = cfg.get(
-            "socks5_proxy_port_2" if station == 2 else "socks5_proxy_port", 1081 if station == 2 else 1080)
+            f"socks5_proxy_port{suffix}", 1079 + station if station > 1 else 1080)
         self._auth_file = cfg.get(
             "credentials_file", os.path.join(ROOT, "vpn_configs", "credentials.txt"))
         self._server_countries = cfg.get("server_countries", "Germany")
@@ -857,6 +868,35 @@ class VPNManager:
             self._update_task.cancel()
             self._update_task = None
         self.save_state()
+
+    async def stop_container(self) -> None:
+        """Downscale path only: stop the service, then DELETE the container.
+
+        [fix 19/08] compose stop ALONE left a retired station sitting in
+        ``Exited`` state — read by the operator as "les stations désactivées
+        ne sont pas supprimées". The container is now removed via
+        ``docker rm -f`` (idempotent: stale containers that already died —
+        or were created but never started — are gone too). ``rm`` without
+        ``-v`` KEEPS the named gluetun volume, so an upscale recreates the
+        container from the same volume and the persisted config survives.
+        ``stop()`` never calls this: proxy shutdown leaves the tunnels
+        running (compose-managed)."""
+        # 1) graceful gluetun shutdown — best-effort: the container may
+        #    already be dead, or live under a different compose project.
+        compose_file = self._compose_file_path()
+        result = await asyncio.to_thread(
+            self._docker_run, ["compose", "-f", compose_file, "stop",
+                               self._compose_service], 120)
+        if result.returncode != 0:
+            logger.warning("[vpn] compose stop failed (continuing to rm): %s",
+                           result.stderr.strip() or result.stdout.strip())
+        # 2) actually delete the container (keep the volume). "No such
+        #    container" is success — already removed by an earlier pass.
+        rm = await asyncio.to_thread(
+            self._docker_run, ["rm", "-f", self._docker_container], 120)
+        if rm.returncode != 0 and "No such container" not in (rm.stderr or ""):
+            raise RuntimeError(
+                f"docker rm failed: {rm.stderr.strip() or rm.stdout.strip()}")
 
     async def connect(self) -> None:
         """Bring the tunnel up: compose up + wait healthy + record IP."""
@@ -1635,12 +1675,15 @@ class VPNManager:
         # not per-station manager settings).
         try:
             from config.settings import _yaml_data as _cfg_data
+            from config.settings import resolved_station_count
             _dual = _cfg_data.get("ip_rotation", {}).get("dual_station", False)
             _strict = _cfg_data.get("ip_rotation", {}).get("strict_free", False)
             _vpn_stack = _cfg_data.get("ip_rotation", {}).get("vpn_stack", "auto")
+            _station_count = resolved_station_count(_cfg_data.get("ip_rotation", {}))
         except Exception:
             _dual = _strict = False
             _vpn_stack = "auto"
+            _station_count = 2 if _dual else 1
         return {
             "enabled": self._enabled,
             "proxy_mode": self._proxy_mode,
@@ -1698,6 +1741,10 @@ class VPNManager:
             # read from the config mirror so the dashboard reflects what was
             # persisted, like dual_station above.
             "vpn_stack": _vpn_stack,
+            # [plan 18/08 §1] parallel station count (1-10, resolved from
+            # station_count / dual_station — same canonical value the
+            # dropdown posts back).
+            "station_count": _station_count,
         }
 
     async def update_config(self, updates: dict) -> dict:
@@ -2417,14 +2464,23 @@ class VPNManager:
 
     async def _apply_stack(self, mode: str, reason: str = "manual",
                            auto: bool = False) -> bool:
-        """Switch the effective stack of BOTH stations (compose substitution)
-        and record the flip. mode ∈ {"wireguard", "openvpn"} (auto is resolved
-        by the caller). Refuses wireguard when vpn_configs/wireguard.env is
-        missing — the keys are NEVER generated or stored by the proxy.
+        """Switch the effective stack of ALL ACTIVE stations (compose
+        substitution) and record the flip. mode ∈ {"wireguard", "openvpn"}
+        (auto is resolved by the caller). Refuses wireguard when
+        vpn_configs/wireguard.env is missing — the keys are NEVER generated
+        or stored by the proxy.
 
-        Writes only VPN_TYPE_STATION1/2 into the .env next to the compose
-        file (read-modify-write + os.replace, atomic — same pattern as
-        save_state), then `compose up -d --force-recreate` per station.
+        Writes VPN_TYPE_STATION{1..N} for the active stations into the .env
+        next to the compose file (read-modify-write + os.replace, atomic —
+        same pattern as save_state) and PRUNES stale keys from downscaled
+        stations, then `compose up -d --force-recreate` on the active
+        services.
+
+        No-op semantics [fix 19/08]: when ``mode == _stack_effective`` the
+        .env is STILL re-synced (an upscaled station must join the stack the
+        active set already runs — without it the compose default
+        ``${VPN_TYPE_STATIONn:-openvpn}`` boots it on OpenVPN under a running
+        WireGuard fleet) — only the compose recreate is skipped.
         """
         if mode not in ("wireguard", "openvpn"):
             logger.error("[vpn] _apply_stack: invalid mode %r", mode)
@@ -2433,14 +2489,26 @@ class VPNManager:
             logger.warning("[vpn] _apply_stack: refusing wireguard — %s missing",
                            self._wg_key_file)
             return False
-        if mode == self._stack_effective:
-            logger.info("[vpn] stack already %s — no-op", mode)
-            return True
+        # [plan 18/08 §1] Active stations: the live registry (set by the
+        # lifespan / _apply_station_count). Fallback to the legacy station
+        # 1/2 pair when there is no registry (standalone manager, unit
+        # tests) so past dual-station behavior is unchanged.
+        _managers = list(getattr(shared_state, "vpn_managers", None) or [])
+        stations, services = [], []
+        for _m in _managers:
+            if _m is not None and _m._station not in stations:
+                stations.append(_m._station)
+                services.append(_m._compose_service)
+        if not stations:
+            stations = [1, 2] if self._station <= 2 else [self._station]
+            services = (["vpn-gluetun", "vpn-gluetun-2"] if self._station <= 2
+                        else [self._compose_service])
+        station_keys = {f"VPN_TYPE_STATION{s}" for s in stations}
         compose_path = self._compose_file_path()
         env_path = os.path.join(os.path.dirname(compose_path), ".env")
         try:
             # Read-modify-write: NEVER touch the other .env keys (secrets
-            # live there) — only the two VPN_TYPE_STATION vars.
+            # live there) — only the active stations' VPN_TYPE_STATION vars.
             data = ""
             try:
                 with open(env_path, "r", encoding="utf-8") as f:
@@ -2455,17 +2523,21 @@ class VPNManager:
                     out.append(ln)
                     continue
                 key = stripped.split("=", 1)[0].strip()
-                if key in ("VPN_TYPE_STATION1", "VPN_TYPE_STATION2"):
+                if key in station_keys:
                     seen.add(key)
                     if stripped == f"{key}={mode}":
                         out.append(ln)  # already the target value
                     else:
                         out.append(f"{key}={mode}")
                     continue
+                # Prune stale per-station vars from downscaled stations so a
+                # later upscale never resurrects a leftover value.
+                if key.startswith("VPN_TYPE_STATION") and re.fullmatch(
+                        r"VPN_TYPE_STATION\d+", key):
+                    continue
                 out.append(ln)
-            for key in ("VPN_TYPE_STATION1", "VPN_TYPE_STATION2"):
-                if key not in seen:
-                    out.append(f"{key}={mode}")
+            for key in sorted(station_keys - seen):
+                out.append(f"{key}={mode}")
             tmp = env_path + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
                 f.write("\n".join(out) + "\n")
@@ -2473,14 +2545,20 @@ class VPNManager:
         except OSError as e:
             logger.error("[vpn] _apply_stack: cannot write %s: %s", env_path, e)
             return False
-        # Recreate BOTH stations in the target stack in one compose call —
-        # vpn-gluetun-2 has the "dual-station" profile, but explicitly
-        # targeting a profiled service runs it regardless (same mechanism
-        # VPNManager uses to bring station 2 up itself). 300 s: two
-        # recreations, one command.
+        # [fix 19/08] No-op check AFTER the .env write: the env must be
+        # re-synced even when the stack is already effective — the compose
+        # default ${VPN_TYPE_STATIONn:-openvpn} would otherwise boot a newly
+        # upscaled station on OpenVPN under a running WireGuard fleet.
+        if mode == self._stack_effective:
+            logger.info("[vpn] stack already %s — no-op (env synced)", mode)
+            return True
+        # Recreate ALL active stations in the target stack in one compose
+        # call — profiled services run when explicitly targeted (same
+        # mechanism a station brings itself up). 300 s: N recreations,
+        # one command.
         try:
-            cmd = ["compose", "-f", compose_path, "up", "-d", "--force-recreate",
-                   "vpn-gluetun", "vpn-gluetun-2"]
+            cmd = (["compose", "-f", compose_path, "up", "-d", "--force-recreate"]
+                   + sorted(services))
             result = await asyncio.to_thread(self._docker_run, cmd, 300)
             if result.returncode != 0:
                 raise RuntimeError(result.stderr.strip() or result.stdout.strip())
@@ -2505,9 +2583,9 @@ class VPNManager:
     async def set_stack(self, mode: str, propagate: bool = True) -> dict:
         """API entry point (dashboard). mode ∈ {"auto", "wireguard", "openvpn"}.
         For a manual selection: apply it immediately (reason="manual").
-        propagate=False → state-only sync (used for the station-2 manager:
-        _apply_stack on station 1 already recreated BOTH containers — a
-        second compose call would be a duplicate).
+        propagate=False → state-only sync (used for the other managers:
+        _apply_stack already recreated ALL active containers — a second
+        compose call would be a duplicate).
         Returns a result dict for the dashboard."""
         if mode not in ("auto", "wireguard", "openvpn"):
             return {"ok": False, "error": f"unknown stack {mode!r}"}

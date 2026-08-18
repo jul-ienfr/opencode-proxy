@@ -371,16 +371,18 @@
                                 <div id="vpn-stack-loading" style="color:var(--text-muted)">…</div>
                             </div>
                         </div>
-                        <!-- Double station ("double embrayage") -->
+                        <!-- Stations VPN parallèles ("double embrayage") -->
                         <div id="vpn-dual-section" style="margin-top:14px;padding:12px;background:var(--bg-secondary);border-radius:8px">
-                            <div style="display:flex;justify-content:space-between;align-items:center">
-                                <strong style="font-size:13px">Double station (double embrayage)</strong>
-                                <label class="toggle-switch" style="margin:0">
-                                    <input type="checkbox" id="vpn-dual-toggle" onchange="vpnToggleDual(this.checked)">
-                                    <span class="toggle-slider"></span>
-                                </label>
+                            <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
+                                <strong style="font-size:13px" data-i18n="vpn.stations.title">Stations VPN parallèles</strong>
+                                <div style="display:flex;align-items:center;gap:8px">
+                                    <select id="vpn-station-count" class="config-input" style="width:70px;font-size:12px">
+                                        <!-- options 1-10 injected by JS -->
+                                    </select>
+                                    <button class="btn" onclick="vpnSaveStationCount()" style="font-size:12px;padding:4px 12px" data-i18n="vpn.stations.save">Appliquer</button>
+                                </div>
                             </div>
-                            <div style="font-size:11px;color:var(--text-muted);margin-top:4px">Deux tunnels simultanés : quand une station est épuisée (429) ou approche du quota, l'autre prend le relais immédiatement pendant que la première rotate en arrière-plan.</div>
+                            <div style="font-size:11px;color:var(--text-muted);margin-top:4px" data-i18n="vpn.stations.hint">N tunnels simultanés : quand une station est épuisée (429) ou approche du quota, une autre prend le relais immédiatement pendant que la première rotate en arrière-plan. Appliqué à chaud, sans redémarrage du proxy.</div>
                             <div style="display:flex;align-items:center;gap:8px;margin-top:10px">
                                 <span class="label" style="font-size:12px">Mode épuisement</span>
                                 <select id="vpn-exhaust-mode" class="config-input" style="width:200px;font-size:12px" onchange="vpnSaveExhaustMode()">
@@ -388,41 +390,8 @@
                                     <option value="strict">Strict free — refuser 429/503</option>
                                 </select>
                             </div>
-                            <div id="vpn-dual-hint" style="display:none;font-size:11px;color:var(--warning);margin-top:8px">⚠ Redémarrage du proxy requis pour que la 2e station soit active.</div>
-                            <!-- Station 2 status -->
-                            <div id="vpn-station2-row" style="display:none;margin-top:10px;padding-top:10px;border-top:1px solid var(--border,#333)">
-                                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
-                                    <strong style="font-size:12px">Station 2</strong>
-                                    <span id="vpn-station2-status" style="font-size:12px">—</span>
-                                    <button class="btn" onclick="vpnNext(2)" style="font-size:11px;padding:2px 8px" data-i18n="vpn.switch_ip">Changer d'IP</button>
-                                </div>
-                                <div class="config-grid" style="grid-template-columns:1fr 1fr">
-                                    <div class="config-row">
-                                        <span class="label" data-i18n="vpn.current_ip">IP actuelle</span>
-                                        <span id="vpn-station2-ip" class="value" style="font-family:monospace;font-weight:bold">—</span>
-                                    </div>
-                                    <div class="config-row">
-                                        <span class="label" data-i18n="vpn.current_server">Serveur</span>
-                                        <span id="vpn-station2-server" class="value">—</span>
-                                    </div>
-                                    <div class="config-row">
-                                        <span class="label" data-i18n="vpn.requests_this_ip">Requêtes cette IP</span>
-                                        <span id="vpn-station2-requests" class="value">0 / 300</span>
-                                    </div>
-                                    <div class="config-row">
-                                        <span class="label">Pays</span>
-                                        <span id="vpn-station2-country" class="value">—</span>
-                                    </div>
-                                    <div class="config-row">
-                                        <span class="label">Prochain pays</span>
-                                        <span id="vpn-station2-next-country" class="value">—</span>
-                                    </div>
-                                    <div class="config-row">
-                                        <span class="label">État</span>
-                                        <span id="vpn-station2-err" class="value">—</span>
-                                    </div>
-                                </div>
-                            </div>
+                            <!-- Station rows — rendered by JS (one per active station) -->
+                            <div id="vpn-station-rows" style="margin-top:10px"></div>
                         </div>
                         <!-- Action buttons -->
                         <div style="display:flex;gap:8px;margin-top:12px">

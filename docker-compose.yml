@@ -1,3 +1,47 @@
+# [plan 18/08 §1] Multi-station anchors (stations 3-10) — docker compose
+# supports YAML merge keys (`<<`), so the eight extra gluetun services
+# share one stanza instead of duplicating it. Stations 1-2 keep their
+# historical literal blocks.
+x-gluetun-multi-base: &gluetun-multi-base
+  image: qmcgaw/gluetun
+  cap_add:
+    - NET_ADMIN
+  devices:
+    - /dev/net/tun:/dev/net/tun
+  env_file:
+    - credentials.env
+    # [plan 18/08 §2b/3a] NordLynx key — always loaded, inert while
+    # VPN_TYPE=openvpn (gluetun ignores settings of the unselected type).
+    # required: false — fresh-clone safety (see vpn-gluetun comment).
+    - path: vpn_configs/wireguard.env
+      required: false
+  restart: unless-stopped
+  # [plan] local healthcheck — control server instead of external egress
+  # (see vpn-gluetun comment: $$ escapes compose interpolation so the sh in
+  # the container expands the key from its own env).
+  healthcheck:
+    test: ["CMD-SHELL", "wget -q -O - -T 5 --header=\"X-API-Key: $$VPN_CONTROL_API_KEY\" http://127.0.0.1:8000/v1/vpn/status"]
+    interval: 10s
+    timeout: 5s
+    retries: 3
+    start_period: 60s
+
+x-gluetun-multi-env: &gluetun-multi-env
+  # Environment shared by stations 3-10 — the per-station VPN_TYPE and
+  # listening addresses live in each service stanza (merged below).
+  # Mapping form on purpose: `<<` merge keys only work on mappings.
+  VPN_SERVICE_PROVIDER: nordvpn
+  OPENVPN_VERBOSITY: '4'   # hostname in logs (see vpn-gluetun comment)
+  SERVER_COUNTRIES: Germany,Netherlands,France,Spain,Poland,Sweden,Denmark,Finland,Norway,Belgium,Switzerland,Austria,Portugal,Italy,Ireland,United Kingdom,Czech Republic,Estonia,Latvia,Lithuania,Romania,Hungary,Greece,Slovakia,Slovenia,Croatia,Bulgaria,Luxembourg,Iceland,Cyprus,Malta
+  UPDATER_PERIOD: 480h
+  HTTPPROXY: 'on'
+  SOCKS5_ENABLED: 'on'
+  DNS_OVER_TLS: 'on'
+  FIREWALL: 'on'
+  PUID: '1000'
+  PGID: '1000'
+  HTTP_CONTROL_SERVER: 'on'   # role JSON in credentials.env (see vpn-gluetun comment)
+
 services:
   opencode-proxy:
     build: .
@@ -14,6 +58,24 @@ services:
       # Station 2 ("double embrayage") — same reachability rule, port 1081/8889.
       - VPN_SOCKS5_URL_2=socks5://vpn-gluetun-2:1081
       - VPN_PROXY_URL_2=http://vpn-gluetun-2:8889
+      # Stations 3-10 ("multi-station", plan 18/08) — same reachability rule;
+      # ports derived: socks5 1079+N, http 8887+N (container side).
+      - VPN_SOCKS5_URL_3=socks5://vpn-gluetun-3:1082
+      - VPN_PROXY_URL_3=http://vpn-gluetun-3:8890
+      - VPN_SOCKS5_URL_4=socks5://vpn-gluetun-4:1083
+      - VPN_PROXY_URL_4=http://vpn-gluetun-4:8891
+      - VPN_SOCKS5_URL_5=socks5://vpn-gluetun-5:1084
+      - VPN_PROXY_URL_5=http://vpn-gluetun-5:8892
+      - VPN_SOCKS5_URL_6=socks5://vpn-gluetun-6:1085
+      - VPN_PROXY_URL_6=http://vpn-gluetun-6:8893
+      - VPN_SOCKS5_URL_7=socks5://vpn-gluetun-7:1086
+      - VPN_PROXY_URL_7=http://vpn-gluetun-7:8894
+      - VPN_SOCKS5_URL_8=socks5://vpn-gluetun-8:1087
+      - VPN_PROXY_URL_8=http://vpn-gluetun-8:8895
+      - VPN_SOCKS5_URL_9=socks5://vpn-gluetun-9:1088
+      - VPN_PROXY_URL_9=http://vpn-gluetun-9:8896
+      - VPN_SOCKS5_URL_10=socks5://vpn-gluetun-10:1089
+      - VPN_PROXY_URL_10=http://vpn-gluetun-10:8897
       # [13] docker compose runs from inside this container against the HOST
       # daemon (docker.sock below), so its relative paths (./logs, .env,
       # credentials.env...) resolve on the host. Point it at the host project
@@ -122,7 +184,7 @@ services:
   # profiled service runs it regardless of its profile.
   vpn-gluetun-2:
     image: qmcgaw/gluetun
-    profiles: ["dual-station"]
+    profiles: ["dual-station", "multi-station"]
     container_name: opencode-vpn-2
     cap_add:
       - NET_ADMIN
@@ -177,6 +239,132 @@ services:
       retries: 3
       start_period: 60s
 
+  # Stations 3-10 ("multi-station", plan 18/08): N parallel tunnels on
+  # derived loopback ports (http 8887+N, socks5 1079+N; N=3 → 8890/1082).
+  # Same profile gating as station 2 — a plain `docker compose up -d`
+  # starts only station 1; VPNManager brings each station up BY NAME
+  # (`up -d vpn-gluetun-N`), which runs a profiled service regardless.
+  # Shared config comes from the x-gluetun-multi-* anchors above.
+  vpn-gluetun-3:
+    <<: *gluetun-multi-base
+    profiles: ["dual-station", "multi-station"]
+    container_name: opencode-vpn-3
+    ports:
+      - "127.0.0.1:8890:8890"    # HTTP proxy (loopback only)
+      - "127.0.0.1:1082:1082"    # SOCKS5 proxy (loopback only)
+    environment:
+      <<: *gluetun-multi-env
+      VPN_TYPE: ${VPN_TYPE_STATION3:-openvpn}
+      HTTPPROXY_LISTENING_ADDRESS: :8890
+      SOCKS5_LISTENING_ADDRESS: :1082
+    volumes:
+      - gluetun3:/gluetun
+
+  vpn-gluetun-4:
+    <<: *gluetun-multi-base
+    profiles: ["dual-station", "multi-station"]
+    container_name: opencode-vpn-4
+    ports:
+      - "127.0.0.1:8891:8891"    # HTTP proxy (loopback only)
+      - "127.0.0.1:1083:1083"    # SOCKS5 proxy (loopback only)
+    environment:
+      <<: *gluetun-multi-env
+      VPN_TYPE: ${VPN_TYPE_STATION4:-openvpn}
+      HTTPPROXY_LISTENING_ADDRESS: :8891
+      SOCKS5_LISTENING_ADDRESS: :1083
+    volumes:
+      - gluetun4:/gluetun
+
+  vpn-gluetun-5:
+    <<: *gluetun-multi-base
+    profiles: ["dual-station", "multi-station"]
+    container_name: opencode-vpn-5
+    ports:
+      - "127.0.0.1:8892:8892"    # HTTP proxy (loopback only)
+      - "127.0.0.1:1084:1084"    # SOCKS5 proxy (loopback only)
+    environment:
+      <<: *gluetun-multi-env
+      VPN_TYPE: ${VPN_TYPE_STATION5:-openvpn}
+      HTTPPROXY_LISTENING_ADDRESS: :8892
+      SOCKS5_LISTENING_ADDRESS: :1084
+    volumes:
+      - gluetun5:/gluetun
+
+  vpn-gluetun-6:
+    <<: *gluetun-multi-base
+    profiles: ["dual-station", "multi-station"]
+    container_name: opencode-vpn-6
+    ports:
+      - "127.0.0.1:8893:8893"    # HTTP proxy (loopback only)
+      - "127.0.0.1:1085:1085"    # SOCKS5 proxy (loopback only)
+    environment:
+      <<: *gluetun-multi-env
+      VPN_TYPE: ${VPN_TYPE_STATION6:-openvpn}
+      HTTPPROXY_LISTENING_ADDRESS: :8893
+      SOCKS5_LISTENING_ADDRESS: :1085
+    volumes:
+      - gluetun6:/gluetun
+
+  vpn-gluetun-7:
+    <<: *gluetun-multi-base
+    profiles: ["dual-station", "multi-station"]
+    container_name: opencode-vpn-7
+    ports:
+      - "127.0.0.1:8894:8894"    # HTTP proxy (loopback only)
+      - "127.0.0.1:1086:1086"    # SOCKS5 proxy (loopback only)
+    environment:
+      <<: *gluetun-multi-env
+      VPN_TYPE: ${VPN_TYPE_STATION7:-openvpn}
+      HTTPPROXY_LISTENING_ADDRESS: :8894
+      SOCKS5_LISTENING_ADDRESS: :1086
+    volumes:
+      - gluetun7:/gluetun
+
+  vpn-gluetun-8:
+    <<: *gluetun-multi-base
+    profiles: ["dual-station", "multi-station"]
+    container_name: opencode-vpn-8
+    ports:
+      - "127.0.0.1:8895:8895"    # HTTP proxy (loopback only)
+      - "127.0.0.1:1087:1087"    # SOCKS5 proxy (loopback only)
+    environment:
+      <<: *gluetun-multi-env
+      VPN_TYPE: ${VPN_TYPE_STATION8:-openvpn}
+      HTTPPROXY_LISTENING_ADDRESS: :8895
+      SOCKS5_LISTENING_ADDRESS: :1087
+    volumes:
+      - gluetun8:/gluetun
+
+  vpn-gluetun-9:
+    <<: *gluetun-multi-base
+    profiles: ["dual-station", "multi-station"]
+    container_name: opencode-vpn-9
+    ports:
+      - "127.0.0.1:8896:8896"    # HTTP proxy (loopback only)
+      - "127.0.0.1:1088:1088"    # SOCKS5 proxy (loopback only)
+    environment:
+      <<: *gluetun-multi-env
+      VPN_TYPE: ${VPN_TYPE_STATION9:-openvpn}
+      HTTPPROXY_LISTENING_ADDRESS: :8896
+      SOCKS5_LISTENING_ADDRESS: :1088
+    volumes:
+      - gluetun9:/gluetun
+
+  vpn-gluetun-10:
+    <<: *gluetun-multi-base
+    profiles: ["dual-station", "multi-station"]
+    container_name: opencode-vpn-10
+    ports:
+      - "127.0.0.1:8897:8897"    # HTTP proxy (loopback only)
+      - "127.0.0.1:1089:1089"    # SOCKS5 proxy (loopback only)
+    environment:
+      <<: *gluetun-multi-env
+      VPN_TYPE: ${VPN_TYPE_STATION10:-openvpn}
+      HTTPPROXY_LISTENING_ADDRESS: :8897
+      SOCKS5_LISTENING_ADDRESS: :1089
+    volumes:
+      - gluetun10:/gluetun
+
   # [plan 18/08 §2c] Canary WireGuard/NordLynx — validates the shared
   # NordLynx key (vpn_configs/wireguard.env, gitignored) BEFORE any station
   # flips. One station at a time runs WireGuard during the test, so the
@@ -201,8 +389,10 @@ services:
     devices:
       - /dev/net/tun:/dev/net/tun
     ports:
-      - "127.0.0.1:8890:8890"    # HTTP proxy (loopback only, test port)
-      - "127.0.0.1:1082:1082"    # SOCKS5 proxy (loopback only, test port)
+      # [plan 18/08 §1] Renumbered 8890/1082 → 8898/1090: the derived
+      # station-3 ports (8887+3 / 1079+3) would collide with the old values.
+      - "127.0.0.1:8898:8898"    # HTTP proxy (loopback only, test port)
+      - "127.0.0.1:1090:1090"    # SOCKS5 proxy (loopback only, test port)
     env_file:
       - credentials.env
       - vpn_configs/wireguard.env   # NordLynx key — shared by both stations
@@ -214,9 +404,9 @@ services:
       - SERVER_COUNTRIES=Switzerland
       - UPDATER_PERIOD=480h
       - HTTPPROXY=on
-      - HTTPPROXY_LISTENING_ADDRESS=:8890
+      - HTTPPROXY_LISTENING_ADDRESS=:8898
       - SOCKS5_ENABLED=on
-      - SOCKS5_LISTENING_ADDRESS=:1082
+      - SOCKS5_LISTENING_ADDRESS=:1090
       - DNS_OVER_TLS=on
       - FIREWALL=on
       - PUID=1000
@@ -236,4 +426,12 @@ services:
 volumes:
   gluetun:
   gluetun2:
+  gluetun3:
+  gluetun4:
+  gluetun5:
+  gluetun6:
+  gluetun7:
+  gluetun8:
+  gluetun9:
+  gluetun10:
   gluetun-wg-test:

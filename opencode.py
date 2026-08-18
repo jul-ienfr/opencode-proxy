@@ -913,6 +913,80 @@ def _ensure_http_client() -> httpx.AsyncClient:
 # ── VPN / IP rotation (initialized in lifespan) ──────────────────
 _vpn_manager = None
 _free_ip_pool = None
+# [plan 18/08 §4] Serializes POST /api/vpn-config station_count hot-reloads
+# (upscale/downscale) — two interleaved POSTs must never race the registry
+# or the pool's set_stations swap.
+_apply_station_lock = asyncio.Lock()
+
+
+async def _apply_station_count(new_n: int) -> None:
+    """[plan 18/08 §4] Hot-reload the number of parallel VPN stations.
+
+    GUI dropdown 1-10 → runtime start/stop of compose services, no proxy
+    restart. Serialized by ``_apply_station_lock`` (POSTs may interleave).
+
+    Upscale (new_n > old): create + start the missing managers
+    (``start()`` = compose up by service name) and append. Downscale:
+    ``stop()`` (state-only) then ``stop_container()`` (compose stop +
+    ``docker rm -f`` — the retired container is DELETED [fix 19/08],
+    its named volume survives, so an upscale recreates it) for each
+    retired station, then drop it.
+
+    Both directions converge on: pool.set_stations (fresh swap; the
+    worker is never cancelled — stale queue entries become no-ops),
+    watcher.set_managers (atomic map swap), and ``_persist_vpn_config``
+    LAST — if compose fails mid-way, config.yaml still holds the old
+    count, so the next boot is consistent with the pre-change state.
+    """
+    new_n = max(1, min(10, new_n))
+    async with _apply_station_lock:
+        import shared_state
+        managers = list(getattr(shared_state, "vpn_managers", None) or [])
+        old_n = len(managers)
+        if new_n == old_n:
+            return
+        from vpn_manager import VPNManager
+        if new_n > old_n:
+            for k in range(old_n + 1, new_n + 1):
+                m = VPNManager(IP_ROTATION, station=k,
+                               shared=shared_state.shared_rotation)
+                m.enabled = IP_ROTATION.get("enabled", False)
+                managers.append(m)
+            # Registry + pool converge BEFORE any docker call: _apply_stack
+            # reads the registry for the active set.
+            shared_state.vpn_managers = managers
+            pool = getattr(shared_state, "free_ip_pool", None)
+            if pool is not None:
+                pool.set_stations(managers)
+            # [fix 19/08] Sync the .env substitution keys FIRST: without
+            # VPN_TYPE_STATION{1..N}, a new station boots on the compose
+            # default ${VPN_TYPE_STATIONn:-openvpn} — OpenVPN under a
+            # running WireGuard fleet (the 2-new-stations-on-openvpn bug).
+            # No-op path writes the env, docker stays untouched.
+            if managers:
+                await managers[0]._apply_stack(managers[0]._stack_effective)
+            for m in managers[old_n:]:
+                await m.start()  # compose up -d <service> (fail-soft)
+        else:
+            for m in reversed(managers[new_n:]):
+                await m.stop()  # state-only (tunnel dies only via compose)
+                await m.stop_container()  # compose stop + rm -f (fix 19/08)
+            managers = managers[:new_n]
+            shared_state.vpn_managers = managers
+            pool = getattr(shared_state, "free_ip_pool", None)
+            if pool is not None:
+                pool.set_stations(managers)
+        watcher = getattr(shared_state, "docker_event_watcher", None)
+        if watcher is not None:
+            watcher.set_managers(
+                {m._docker_container: m for m in managers})
+        # Retro-compat aliases converge too
+        shared_state.vpn_manager = managers[0]
+        shared_state.vpn_manager_2 = managers[1] if new_n >= 2 else None
+        from dashboard.api import _persist_vpn_config
+        await _persist_vpn_config({"station_count": new_n})
+        _debug(f"  [vpn] station_count hot-reload {old_n} → {new_n} "
+               f"({len(managers)} active)")
 
 
 # ── Debug helpers ──────────────────────────────────────────────────
@@ -1088,46 +1162,48 @@ async def lifespan(app):
     # cursor. Both stations read/write it so neither re-enters an IP the
     # other used recently and their live identities never collide.
     shared_state.shared_rotation = SharedRotationState(IP_ROTATION)
-    shared_state.vpn_manager = VPNManager(IP_ROTATION,
-                                          shared=shared_state.shared_rotation)
-    shared_state.vpn_manager.enabled = IP_ROTATION.get("enabled", False)
-    # Dual station ("double embrayage"): a second gluetun tunnel runs in
-    # parallel (station 2) so a free request always lands on a fresh
-    # (model, IP) cooldown key while the other station rotates in the
-    # background. Opt-in via ip_rotation.dual_station (GUI toggle).
-    shared_state.vpn_manager_2 = None
-    if IP_ROTATION.get("dual_station", False):
-        shared_state.vpn_manager_2 = VPNManager(IP_ROTATION, station=2,
-                                                shared=shared_state.shared_rotation)
-        shared_state.vpn_manager_2.enabled = IP_ROTATION.get("enabled", False)
-    shared_state.free_ip_pool = FreeIPPool(shared_state.vpn_manager,
-                                           shared_state.vpn_manager_2)
+    # [plan 18/08 §4] N stations (GUI dropdown 1-10, hot-reload): boot with
+    # resolved_station_count() managers — each owns ONE compose service
+    # (vpn-gluetun-N, ports 1079+N/8887+N). Stations 2+ only exist when the
+    # resolved count >= N; _apply_station_count() grows/shrinks this set at
+    # runtime (start/stop_container) without a proxy restart.
+    n = _cfg_settings.resolved_station_count(IP_ROTATION)
+    _managers = [VPNManager(IP_ROTATION, station=k,
+                            shared=shared_state.shared_rotation)
+                 for k in range(1, n + 1)]
+    for m in _managers:
+        m.enabled = IP_ROTATION.get("enabled", False)
+    # Registry — SOURCE OF TRUTH for hot reload (1-indexed, [0] = station 1).
+    # vpn_manager / vpn_manager_2 stay retro-compat aliases for the legacy
+    # single/dual reads; all runtime readers use shared_state.vpn_managers.
+    shared_state.vpn_managers = _managers
+    shared_state.vpn_manager = _managers[0]
+    shared_state.vpn_manager_2 = _managers[1] if n >= 2 else None
+    shared_state.free_ip_pool = FreeIPPool(_managers[0],
+                                           _managers[1] if n >= 2 else None)
+    shared_state.free_ip_pool.set_stations(_managers)
     # [plan] E: boot-time fan-out of the ip_rotation timings (connect retry,
     # bad TTL, rotation stagger) — the pool's built-in defaults are the
     # conservative legacy values.
     shared_state.free_ip_pool.update_config(IP_ROTATION)
     global _vpn_manager, _free_ip_pool
-    _vpn_manager = shared_state.vpn_manager
+    _vpn_manager = _managers[0]
     _free_ip_pool = shared_state.free_ip_pool
-    # Start every enabled station in PARALLEL (dual station would otherwise
-    # halve the cold-start: station 2 waits for station 1's full compose-up).
-    # Each start() is fail-soft internally (docker down/logs a warning) so
-    # gather() never raises.
-    _startup_managers = [m for m in (shared_state.vpn_manager,
-                                     shared_state.vpn_manager_2)
-                         if m is not None and m.enabled]
-    if _startup_managers:
-        await asyncio.gather(*(m.start() for m in _startup_managers))
+    # Start every enabled station in PARALLEL (multi-station would otherwise
+    # serialize the cold-start: station N waits for station 1's full
+    # compose-up). Each start() is fail-soft internally (docker down/logs a
+    # warning) so gather() never raises.
+    await asyncio.gather(*(m.start() for m in _managers if m.enabled))
     # [plan] C: docker event watcher — real-time container lifecycle → per-
     # station watchdog wake + SSE vpn_event. Fail-open: if docker is missing
     # or the stream dies, the watchdogs keep their interval pacing and the
     # dashboard its 10 s poll — never breaks a request.
     shared_state.docker_event_watcher = None
-    if IP_ROTATION.get("docker_events", True) and _startup_managers:
+    if IP_ROTATION.get("docker_events", True) and _managers:
         from docker_events import DockerEventWatcher
         try:
             _watcher = DockerEventWatcher(
-                {m._docker_container: m for m in _startup_managers})
+                {m._docker_container: m for m in _managers})
             await _watcher.start()
             shared_state.docker_event_watcher = _watcher
             _debug(f"  [lifespan] docker event watcher started "
@@ -1135,9 +1211,8 @@ async def lifespan(app):
         except Exception as e:
             _debug(f"  [lifespan] docker event watcher failed to start: {e}")
             shared_state.docker_event_watcher = None
-    _debug(f"  [lifespan] VPN manager initialized (enabled={shared_state.vpn_manager.enabled}, "
-           f"mode={shared_state.vpn_manager._mode}, "
-           f"dual_station={bool(shared_state.vpn_manager_2)})")
+    _debug(f"  [lifespan] VPN manager initialized (enabled={_managers[0].enabled}, "
+           f"mode={_managers[0]._mode}, station_count={n})")
 
     # Periodic WAL checkpoint
     async def _periodic_checkpoint():
@@ -1231,13 +1306,13 @@ async def lifespan(app):
         _debug("  [lifespan] quota fetcher task cancelled")
     await _client.aclose()
     _debug("  [lifespan] HTTP client closed")
-    # Save VPN state (container stays up — compose-managed)
-    if _vpn_manager:
-        await _vpn_manager.stop()
-        _debug("  [lifespan] VPN state saved")
-    if getattr(shared_state, "vpn_manager_2", None) is not None:
-        await shared_state.vpn_manager_2.stop()
-        _debug("  [lifespan] VPN station 2 state saved")
+    # Save VPN state (containers stay up — compose-managed). Registry
+    # loop: stop() is state-only (never downscales) — reversed order so
+    # station 1's state is saved last like before.
+    for _m in reversed(getattr(shared_state, "vpn_managers", None) or []):
+        if _m is not None:
+            await _m.stop()
+    _debug(f"  [lifespan] VPN state saved ({len(shared_state.vpn_managers)} stations)")
     # Close quota fetcher shared client
     from dashboard.quota import _http_client as _quota_client
     if _quota_client and not _quota_client.is_closed:

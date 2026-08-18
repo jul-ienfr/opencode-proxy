@@ -93,6 +93,9 @@ const LOCALE = {
         'vpn.switches': 'Switches',
         'vpn.stack.title': 'VPN technology',
         'vpn.stack.hint': 'WireGuard/NordLynx preferred (no AUTH_FAILED); OpenVPN kept as fallback. Auto flips on reliability counters.',
+        'vpn.stations.title': 'Parallel VPN stations',
+        'vpn.stations.save': 'Apply',
+        'vpn.stations.hint': 'N simultaneous tunnels: when a station is exhausted (429) or near its quota, another takes over instantly while the first rotates in the background. Hot-applied, no proxy restart.',
         'vpn.stack.auto': 'Auto (recommended)',
         'vpn.stack.wireguard': 'WireGuard',
         'vpn.stack.openvpn': 'OpenVPN',
@@ -396,6 +399,9 @@ const LOCALE = {
         'vpn.switches': 'Changements',
         'vpn.stack.title': 'Technologie VPN',
         'vpn.stack.hint': 'WireGuard/NordLynx préféré (aucun AUTH_FAILED) ; OpenVPN conservé en filet. Auto bascule sur compteurs de fiabilité.',
+        'vpn.stations.title': 'Stations VPN parallèles',
+        'vpn.stations.save': 'Appliquer',
+        'vpn.stations.hint': 'N tunnels simultanés : quand une station est épuisée (429) ou approche du quota, une autre prend le relais immédiatement pendant que la première rotate en arrière-plan. Appliqué à chaud, sans redémarrage du proxy.',
         'vpn.stack.auto': 'Auto (recommandé)',
         'vpn.stack.wireguard': 'WireGuard',
         'vpn.stack.openvpn': 'OpenVPN',
@@ -3045,9 +3051,18 @@ document.addEventListener('DOMContentLoaded', () => {
                 setProxyModeUI(cfgData.proxy_mode);
             }
 
-            // [35] double embrayage — dual station toggle + exhaust mode
-            const dualToggle = document.getElementById('vpn-dual-toggle');
-            if (dualToggle) dualToggle.checked = cfgData.dual_station || false;
+            // [plan 18/08 §4] N-station selector (1-10) + exhaust mode
+            const stationCountSelect = document.getElementById('vpn-station-count');
+            if (stationCountSelect) {
+                stationCountSelect.innerHTML = '';
+                for (let n = 1; n <= 10; n++) {
+                    const opt = document.createElement('option');
+                    opt.value = String(n);
+                    opt.textContent = String(n);
+                    stationCountSelect.appendChild(opt);
+                }
+                stationCountSelect.value = String(cfgData.station_count || 1);
+            }
             const exhaustMode = document.getElementById('vpn-exhaust-mode');
             if (exhaustMode) exhaustMode.value = cfgData.strict_free ? 'strict' : 'fallback';
 
@@ -3196,33 +3211,43 @@ document.addEventListener('DOMContentLoaded', () => {
         toggleEl.checked = data.enabled || false;
         toggleLabel.textContent = data.enabled ? (t('vpn.rotation_on') || 'Activé') : (t('vpn.rotation_off') || 'Désactivé');
 
-        // [35] dual station — station 2 line (payload stations[] from the pool)
-        const s2Row = document.getElementById('vpn-station2-row');
-        const s2Hint = document.getElementById('vpn-dual-hint');
-        if (s2Row) {
-            const station2 = (data.stations || []).find(s => s.station === 2);
-            if (station2) {
-                s2Row.style.display = 'block';
-                if (s2Hint) s2Hint.style.display = 'none';
-                const s2Ip = document.getElementById('vpn-station2-ip');
-                const s2Server = document.getElementById('vpn-station2-server');
-                const s2Req = document.getElementById('vpn-station2-requests');
-                const s2Status = document.getElementById('vpn-station2-status');
-                const s2Err = document.getElementById('vpn-station2-err');
-                if (s2Ip) s2Ip.textContent = station2.current_ip || '—';
-                if (s2Server) s2Server.textContent = station2.current_server || '—';
-                if (s2Req) s2Req.textContent = `${station2.requests_this_ip || 0} / ${station2.quota_per_ip || 300}`;
-                const s2Map = { connected: t('vpn.connected') || 'Connecté', connecting: t('vpn.connecting') || 'Connexion...', disconnected: t('vpn.disconnected') || 'Déconnecté', error: t('vpn.error') || 'Erreur' };
-                if (s2Status) s2Status.textContent = (s2Map[station2.vpn_status] || station2.vpn_status) + (data.active_station === 2 ? ' · active' : '');
-                if (s2Err) {
-                    if (station2.last_rotation_error) s2Err.textContent = '⚠ ' + station2.last_rotation_error;
-                    else if (station2.bad_remaining > 0) s2Err.textContent = 'Cooldown (429) — ' + Math.ceil(station2.bad_remaining) + 's';
-                    else s2Err.textContent = '—';
-                }
-            } else {
-                s2Row.style.display = data.dual_station ? 'block' : 'none';
-                if (s2Hint) s2Hint.style.display = data.dual_station ? 'block' : 'none';
-            }
+        // [plan 18/08 §4] N-station — one row per active tunnel, rendered
+        // from the pool's stations[] payload (was a fixed station-2 block).
+        // Countries overlay comes from data.countries (below); active_station
+        // marks the tunnel the pool currently routes through.
+        const countries = data.countries || {};
+        const stationRowsEl = document.getElementById('vpn-station-rows');
+        if (stationRowsEl) {
+            const stations = data.stations || [];
+            const sMap = { connected: t('vpn.connected') || 'Connecté', connecting: t('vpn.connecting') || 'Connexion...', disconnected: t('vpn.disconnected') || 'Déconnecté', error: t('vpn.error') || 'Erreur' };
+            stationRowsEl.innerHTML = stations.map(s => {
+                const cn = countries[s.station] || {};
+                let errText = '—';
+                if (s.last_rotation_error) errText = '⚠ ' + escHtml(s.last_rotation_error);
+                else if (s.bad_remaining > 0) errText = 'Cooldown (429) — ' + Math.ceil(s.bad_remaining) + 's';
+                const statusText = (sMap[s.vpn_status] || s.vpn_status || '—') +
+                    (data.active_station === s.station ? ' · active' : '');
+                return '<div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border,#444)">' +
+                    '<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">' +
+                    '<strong style="font-size:12px">' + (t('vpn.stack.station') || 'Station') + ' ' + s.station + '</strong>' +
+                    '<span style="font-size:12px">' + statusText + '</span>' +
+                    '<button class="btn" onclick="vpnNext(' + s.station + ')" style="font-size:11px;padding:2px 8px">' +
+                    t('vpn.switch_ip') + '</button></div>' +
+                    '<div class="config-grid">' +
+                    '<div class="config-row"><span class="label">' + t('vpn.current_ip') + '</span>' +
+                    '<span class="value" style="font-family:monospace;font-weight:bold">' + escHtml(s.current_ip || '—') + '</span></div>' +
+                    '<div class="config-row"><span class="label">' + t('vpn.current_server') + '</span>' +
+                    '<span class="value">' + escHtml(s.current_server || '—') + '</span></div>' +
+                    '<div class="config-row"><span class="label">' + t('vpn.requests_this_ip') + '</span>' +
+                    '<span class="value">' + (s.requests_this_ip || 0) + ' / ' + (s.quota_per_ip || 300) + '</span></div>' +
+                    '<div class="config-row"><span class="label">Pays</span>' +
+                    '<span class="value">' + escHtml(cn.current_country || '—') + '</span></div>' +
+                    '<div class="config-row"><span class="label">Prochain pays</span>' +
+                    '<span class="value">' + escHtml(cn.next_country || '—') + '</span></div>' +
+                    '<div class="config-row"><span class="label">État</span>' +
+                    '<span class="value">' + errText + '</span></div>' +
+                    '</div></div>';
+            }).join('');
         }
 
         // IP History — stats par IP (payload ip_stats injecté par /api/vpn-status)
@@ -3256,17 +3281,13 @@ document.addEventListener('DOMContentLoaded', () => {
 
         // [plan] C: real-time panel — country per station, shared cursor,
         // docker event watcher + invariant state (all fail-open to '—').
-        const countries = data.countries || {};
+        // Station 1 keeps the fixed vpn-country/vpn-next-country slots; the
+        // station ≥2 countries were rendered inside the N-station rows above.
         const c1c = countries[1];
-        const c2c = countries[2];
         const countryEl = document.getElementById('vpn-country');
         const nextEl = document.getElementById('vpn-next-country');
         if (countryEl) countryEl.textContent = (c1c && c1c.current_country) || '—';
         if (nextEl) nextEl.textContent = (c1c && c1c.next_country) || '—';
-        const s2Country = document.getElementById('vpn-station2-country');
-        const s2Next = document.getElementById('vpn-station2-next-country');
-        if (s2Country) s2Country.textContent = (c2c && c2c.current_country) || '—';
-        if (s2Next) s2Next.textContent = (c2c && c2c.next_country) || '—';
 
         const rt = document.getElementById('vpn-realtime');
         if (rt) {
@@ -3285,8 +3306,10 @@ document.addEventListener('DOMContentLoaded', () => {
                     const sr = data.shared_rotation || {};
                     const cc = sr.country_cursor;
                     const bySt = sr.last_country_by_station || {};
+                    const byStText = Object.keys(bySt).sort((a, b) => a - b)
+                        .map(k => 's' + k + ':' + (bySt[k] || '—')).join(' · ');
                     cursorEl.textContent = (cc !== undefined && cc !== null ? cc : '—') +
-                        ' · s1:' + (bySt[1] || '—') + ' · s2:' + (bySt[2] || '—');
+                        (byStText ? ' · ' + byStText : '');
                 }
                 const pendingEl = document.getElementById('vpn-rotate-pending');
                 if (pendingEl) {
@@ -3558,18 +3581,31 @@ document.addEventListener('DOMContentLoaded', () => {
         refreshVPNStatus();
     };
 
-    // [35] double embrayage — dual station toggle + exhaust mode
-    window.vpnToggleDual = async function(enabled) {
-        await fetch('/api/vpn-config', {
-            method: 'POST', headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({dual_station: !!enabled})
-        });
-        const s2Row = document.getElementById('vpn-station2-row');
-        const s2Hint = document.getElementById('vpn-dual-hint');
-        // Station 2 only comes up at startup (lifespan) — until then, hint.
-        if (s2Row) s2Row.style.display = enabled ? 'block' : 'none';
-        if (s2Hint) s2Hint.style.display = enabled ? 'block' : 'none';
+    // [plan 18/08 §4] N-station hot reload — pick 1-10, POST the new count,
+    // then refresh status + config + stack info (start/stop compose
+    // containers at runtime, no proxy restart). Replaces the dual toggle.
+    window.vpnSaveStationCount = async function() {
+        const select = document.getElementById('vpn-station-count');
+        const n = select ? parseInt(select.value, 10) : 0;
+        if (!n || n < 1 || n > 10) return;
+        let data = null;
+        try {
+            const resp = await fetch('/api/vpn-config', {
+                method: 'POST', headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({station_count: n})
+            });
+            data = await resp.json();
+            if (data.error) alert('Erreur: ' + data.error);
+        } catch (e) { alert('Erreur: ' + e); }
+        // Re-sync the selector from the persisted config (short-circuit:
+        // a no-op POST leaves it where it was).
+        if (data && data.config) {
+            const persisted = parseInt(data.config.station_count, 10);
+            if (persisted) document.getElementById('vpn-station-count').value = String(persisted);
+        }
         refreshVPNStatus();
+        if (typeof refreshStackInfo === 'function') refreshStackInfo();
+        fetchConfig();
     };
 
     window.vpnSaveExhaustMode = async function() {

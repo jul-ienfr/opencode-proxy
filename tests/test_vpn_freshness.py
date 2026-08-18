@@ -106,7 +106,9 @@ class FakeVPNManager(vm.VPNManager):
 
     def __init__(self, cfg, station=1, shared=None, tmp_path=None, **kw):
         cfg = dict(cfg)
-        key = "state_file_2" if station == 2 else "state_file"
+        # [plan 18/08 §4] N-station: any station > 1 gets its own explicit key
+        # (state_file_2 → state_file_{N}); station 1 stays the legacy default.
+        key = f"state_file_{station}" if station > 1 else "state_file"
         cfg.setdefault(key, str(tmp_path / f"vpn_state{station}.json"))
         super().__init__(cfg, station=station, shared=shared)
         # [plan 18/08 §2d] Pin the WG key file into tmp_path: the repo's

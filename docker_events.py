@@ -77,6 +77,13 @@ class DockerEventWatcher:
     def running(self) -> bool:
         return self._task is not None and not self._task.done()
 
+    def set_managers(self, managers: dict) -> None:
+        """[plan 18/08 §4] Atomically swap the watched container map (hot
+        reload: upscale/downscale). ``_handle_line`` reads the map per
+        event — no reference is retained, so a plain attribute swap is
+        safe for the running stream."""
+        self._managers = dict(managers or {})
+
     # ── Watcher loop ───────────────────────────────────────────
 
     async def _run(self) -> None:

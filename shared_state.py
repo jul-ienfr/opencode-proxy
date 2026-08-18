@@ -11,3 +11,10 @@ free_ip_pool = None
 # Cross-station shared rotation registry (SharedRotationState) — created by
 # opencode.py's lifespan once the VPN subsystem boots (None before then).
 shared_rotation = None
+# [plan 18/08 §4] Active VPN station registry — SOURCE OF TRUTH for the
+# N-station hot-reload (GUI dropdown 1-10). 1-indexed list: [0] = station 1,
+# [1] = station 2, ... Set by opencode.py's lifespan and updated by
+# `_apply_station_count` on hot reload. `vpn_manager` (and any legacy
+# manager_2 references in callers) remain retro-compat aliases — all reads
+# here must go through the registry.
+vpn_managers: list = []

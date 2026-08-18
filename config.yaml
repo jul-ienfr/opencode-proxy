@@ -71,6 +71,7 @@ ip_rotation:
   enabled: true
   proxy_mode: vpn
   dual_station: true
+  station_count: 3
   strict_free: false
   quota_per_ip: 15
   switch_delay: 1
@@ -122,21 +123,12 @@ ip_rotation:
   server_provider: nordvpn
   control_api_key: ''
   control_enabled: true
-  # [plan 18/08 §3] VPN technology selector — auto: prefer WireGuard/NordLynx
-  # (no AUTH_FAILED possible), fall back to OpenVPN when the WG tunnel loses
-  # egress, return to WG after 3 AUTH_FAILED/30 min or 60 min healthy on OV.
-  # wireguard/openvpn: forced (no auto flips). Keys come from
-  # vpn_configs/wireguard.env only — never stored in config.yaml/.env.
   vpn_stack: auto
   auto_ov_fail_threshold: 3
   auto_ov_return_min: 60
   auto_wg_egress_ticks: 3
   egress_failure_tick_interval: 2.0
   ip_probe_budget: 8.0
-  # [plan 18/08 §B] Control-pin budget: poll "running" up to timeout, then
-  # wait up to catchup for a REAL IP through the tunnel. 20+25 → 45 s wall
-  # per rotation pin (am.12); the fast-recover escalation threads its own
-  # 15/15 (am.3) → 30 s/pin, 120 s/4-pin wall.
   control_pin_timeout: 20
   control_pin_catchup: 25
   auto_flip_cooldown_min: 30

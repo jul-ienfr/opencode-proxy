@@ -151,6 +151,22 @@ FREE_MODEL_MAP = yaml_get("free_model_map", default={})
 # ── IP rotation (OpenVPN for free model quota) ────────────────────
 IP_ROTATION = yaml_get("ip_rotation", default={})
 
+
+def resolved_station_count(cfg: dict) -> int:
+    """Resolve the number of parallel VPN stations (1-10).
+
+    Canonical key: ``station_count``. Retro-compat: absent →
+    ``dual_station: true`` ⇒ 2, else 1. Clamped to [1, 10] — the
+    NordVPN account limit is 10 simultaneous connections.
+    """
+    try:
+        n = int(cfg.get("station_count", 0) or 0)
+    except (TypeError, ValueError):
+        n = 0
+    if n:
+        return max(1, min(10, n))
+    return 2 if cfg.get("dual_station", False) else 1
+
 # ── Server ──────────────────────────────────────────────────────────
 HOST = _env("OPENCODE_HOST", yaml_get("server", "host", "0.0.0.0"))
 PORT = _env_int("OPENCODE_PORT", yaml_get("server", "port", 4000))

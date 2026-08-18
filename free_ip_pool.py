@@ -4,16 +4,20 @@ Free IP pool for rotating IP addresses on free model requests.
 Each VPN session gives a fresh IP = fresh free model quota.
 Routes free requests through the compose-managed gluetun tunnel (SOCKS5).
 
-Dual-station ("double embrayage"): when ip_rotation.dual_station is
-enabled, TWO gluetun stations run in parallel (A = station 1, B =
-station 2) like a dual-clutch gearbox — one gear always engaged. A
-request lands on the best available station; as soon as a station is
-bad (recent 429), at quota, or its tunnel is down, the OTHER takes over
-immediately while the bad one rotates in the background. A good IP is
-always available, so free quota is always spent on a fresh (model, IP)
-cooldown key. The 429 rotation behavior itself is unchanged ([0]/[42]):
-rotate in background + paid fallback, with the strict-free GUI option
-refusing to pay when both stations are exhausted.
+Multi-station ("double embrayage"): when the resolved ip_rotation
+station count (resolved_station_count — station_count (1-10), legacy
+`dual_station: true` ⇒ 2, absent ⇒ 1) is >= 2, N gluetun stations run
+in parallel (stations 1..N) like a dual-clutch gearbox — one gear
+always engaged. A request lands on the best available station; as soon
+as a station is bad (recent 429), at quota, or its tunnel is down, the
+NEXT best takes over immediately while the bad one rotates in the
+background. A good IP is always available, so free quota is always
+spent on a fresh (model, IP) cooldown key. The active set is
+hot-swappable with set_stations (GUI 1-10 dropdown, no proxy restart),
+the worker is never cancelled. The 429 rotation behavior itself is
+unchanged ([0]/[42]): rotate in background + paid fallback, with the
+strict-free GUI option refusing to pay when every station is
+exhausted.
 """
 
 import time
@@ -30,9 +34,9 @@ class FreeIPPool:
     """Manages IP rotation for free model requests.
 
     Routes free model requests through the gluetun SOCKS5 tunnel(s)
-    (compose-managed Docker containers). With dual_station, holds two
-    stations [A, B] and picks the best one per request — never waits for
-    a rotation.
+    (compose-managed Docker containers). With station_count >= 2, holds
+    N stations [1..N] and picks the best one per request — never waits
+    for a rotation. The active set is hot-swappable (set_stations).
     """
 
     _CONNECT_RETRY_INTERVAL = 300  # min seconds between docker reconnect attempts when down
@@ -553,11 +557,17 @@ class FreeIPPool:
 
     async def _rotation_worker(self) -> None:
         """Drain the rotation queue — one physical rotation at a time (C4),
-        in enqueue order. Station 2's lower threshold (C3) makes it rotate
-        first while station 1 keeps serving."""
+        in enqueue order. Station N's lower threshold (C3) makes it rotate
+        before station 1 keeps serving."""
         while True:
             station = await self._rotation_queue.get()
             self._pending.discard(station._station)
+            if station not in self._stations:
+                # [plan 18/08 §4] station downscaled while queued — no-op;
+                # its per-station state was pruned by set_stations. The
+                # C4/C5 single-flight guarantee stays intact: the entry
+                # was already dequeued, nothing else touches this station.
+                continue
             try:
                 await self._rotate_station(station)
             except Exception as e:
@@ -587,6 +597,34 @@ class FreeIPPool:
             logger.warning("[free-ip] station %d background rotation failed: %s",
                            station._station, e)
         finally:
+            self._rotation_tasks.pop(sid, None)
+
+        # ── Station set (hot-reload) ───────────────────────────────
+
+    def set_stations(self, stations: list) -> None:
+        """[plan 18/08 §4] Atomically swap the active station set (GUI
+        dropdown 1-10, hot reload — no proxy restart, no worker stop).
+
+        Effect: ``self._stations`` is replaced (sorted by station number,
+        so station 1 stays the preferred pass); per-station state of
+        removed stations is pruned (request counters + IP stats) so
+        ``get_status()`` / ``ips_used`` stay honest; their queued or
+        in-flight rotation entries are dropped from ``_pending`` /
+        ``_rotation_tasks``.
+
+        The worker is deliberately NOT cancelled: the single C4/C5 drain
+        loop survives, stale queue entries become no-ops (guard inside
+        ``_rotation_worker``), and a rotation already in flight finishes
+        harmlessly on the retired manager — the single-flight guarantee
+        is preserved without killing work mid-run.
+        """
+        stations = [s for s in stations if s is not None]
+        removed = {s._station for s in self._stations} - \
+            {s._station for s in stations}
+        self._stations = sorted(stations, key=lambda s: s._station)
+        for sid in removed:
+            self._per.pop(sid, None)
+            self._pending.discard(sid)
             self._rotation_tasks.pop(sid, None)
 
     def update_config(self, cfg: dict) -> None:

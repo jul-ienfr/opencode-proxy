@@ -71,6 +71,11 @@ def ctx(tmp_path, monkeypatch):
     s1 = _FakeMgr(1)
     s2 = _FakeMgr(2)
     pool = _FakePool()
+    # [plan 18/08 §4] the POST handler resolves stations via the
+    # vpn_managers registry (legacy vpn_manager/vpn_manager_2 pair kept for
+    # the pre-registry endpoints) — feed it the same fakes so the fan-out
+    # and mirror semantics are exercised for real.
+    monkeypatch.setattr(shared_state, "vpn_managers", [s1, s2], raising=False)
     monkeypatch.setattr(shared_state, "vpn_manager", s1)
     monkeypatch.setattr(shared_state, "vpn_manager_2", s2, raising=False)
     monkeypatch.setattr(shared_state, "free_ip_pool", pool, raising=False)

@@ -58,6 +58,9 @@ def app(tmp_path, monkeypatch):
     s1 = _FakeMgr(1, "10.0.0.1")
     s2 = _FakeMgr(2, "10.0.0.2")
     pool = _FakePool(s1, s2)
+    # [plan 18/08 §4] the handler resolves stations from the N-station
+    # registry — the legacy aliases alone leave it "not initialized".
+    monkeypatch.setattr(shared_state, "vpn_managers", [s1, s2], raising=False)
     monkeypatch.setattr(shared_state, "vpn_manager", s1)
     # vpn_manager_2 / free_ip_pool may not exist yet in a bare import —
     # create them for this test and tear them down after.

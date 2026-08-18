@@ -276,6 +276,10 @@ def _persist_vpn_config(updates: dict):
             "docker_container_2": "docker_container_2",
             "compose_service_2": "compose_service_2",
             "state_file_2": "state_file_2",
+            # [plan 18/08 §4] N-station selector (GUI dropdown 1-10, hot
+            # reload) — persisted so the runtime count survives a restart.
+            # `dual_station` remains mapped (legacy toggle, inoffensive).
+            "station_count": "station_count",
             # [plan 18/08 §3d] VPN technology selector (auto/wireguard/openvpn)
             # + auto-mode thresholds — persisted here so the selection is a
             # first-class config.yaml key (hot-reloaded via the mirror).
@@ -1149,8 +1153,11 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
             # reflects whichever tunnel last served that IP).
             def _merged_history():
                 merged: dict = {}
-                for mgr in (vpn_manager,
-                            getattr(shared_state, "vpn_manager_2", None)):
+                # [plan 18/08 §4] N-station: merge history from EVERY
+                # active station (was mgr1+mgr2 fixed pair); falls back to
+                # the caller's manager when no registry is present.
+                for mgr in (list(getattr(shared_state, "vpn_managers", None) or [])
+                            or [vpn_manager]):
                     if mgr is None:
                         continue
                     for h in mgr._ip_history:
@@ -1187,16 +1194,16 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
     async def get_vpn_status():
         """Get current VPN status, IP, server, and usage stats."""
         import shared_state
-        if shared_state.vpn_manager:
-            await shared_state.vpn_manager.refresh_status()
-            # [34] dual station — refresh the second tunnel too so its IP /
-            # server shown in the VPN tab stay live.
-            if getattr(shared_state, "vpn_manager_2", None):
-                await shared_state.vpn_manager_2.refresh_status()
+        managers = getattr(shared_state, "vpn_managers", None) or []
+        if managers:
+            # [plan 18/08 §4] N-station: refresh every active tunnel so the
+            # IPs / servers shown in the VPN tab stay live (was mgr1+mgr2).
+            for mgr in managers:
+                await mgr.refresh_status()
             if shared_state.free_ip_pool:
                 data = shared_state.free_ip_pool.get_status()
             else:
-                data = shared_state.vpn_manager.get_status()
+                data = managers[0].get_status()
         else:
             data = {"enabled": False, "status": "not_configured"}
         # Per-IP usage stats — injected unconditionally (works in direct mode
@@ -1218,8 +1225,9 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
             if watcher is not None:
                 data["watch_events"] = watcher.get_status()
             countries = {}
-            for mgr in (getattr(shared_state, "vpn_manager", None),
-                        getattr(shared_state, "vpn_manager_2", None)):
+            # [plan 18/08 §4] N-station: per-station country overlay for
+            # every active tunnel (was mgr1+mgr2 fixed pair).
+            for mgr in managers:
                 if mgr is None:
                     continue
                 st = mgr.get_status()
@@ -1246,13 +1254,11 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
         """[plan 18/08 §3d] VPN technology selector state — per-station
         effective stack, key presence, reliability counters, flip journal."""
         import shared_state
-        mgr1 = getattr(shared_state, "vpn_manager", None)
-        mgr2 = getattr(shared_state, "vpn_manager_2", None)
+        # [plan 18/08 §4] N-station: one entry per active station (was a
+        # fixed mgr1+mgr2 pair).
         info = {"stations": {}}
-        if mgr1 is not None:
-            info["stations"]["1"] = mgr1.stack_info()
-        if mgr2 is not None:
-            info["stations"]["2"] = mgr2.stack_info()
+        for mgr in getattr(shared_state, "vpn_managers", None) or []:
+            info["stations"][str(mgr._station)] = mgr.stack_info()
         return info
 
     @app.post("/api/vpn-config")
@@ -1275,14 +1281,33 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
                 _write_credentials_env(username, password)
 
         # Handle config updates (need VPN manager). [plan] F: fan-out to
-        # BOTH stations — identity pool, watchdog backoff and freshness
-        # windows must stay symmetric on dual-station setups (a single
-        # shared registry and one absolute identity cursor globalise them).
-        if shared_state.vpn_manager and body:
-            await shared_state.vpn_manager.update_config(body)
-            mgr2 = getattr(shared_state, "vpn_manager_2", None)
-            if mgr2 is not None:
-                await mgr2.update_config(body)
+        # ALL stations — identity pool, watchdog backoff and freshness
+        # windows must stay symmetric on every station (a single shared
+        # registry and one absolute identity cursor globalise them).
+        managers = getattr(shared_state, "vpn_managers", None) or []
+        if managers and body:
+            # [plan 18/08 §4] N-station hot-reload — change the number of
+            # parallel tunnels at runtime (start/stop compose containers,
+            # no proxy restart). Short-circuits when the count did not
+            # actually change; _apply_station_count persists config.yaml
+            # LAST (coherent on mid-failure).
+            if "station_count" in body:
+                _new_n = body["station_count"]
+                try:
+                    _new_n = int(_new_n)
+                except (TypeError, ValueError):
+                    _new_n = 0
+                body.pop("station_count")  # consumed — never fanned out
+                if _new_n and _new_n != len(managers):
+                    try:
+                        from opencode import _apply_station_count
+                        await _apply_station_count(_new_n)
+                    except Exception as e:
+                        _debug(f"  [vpn] station_count hot-reload failed: {e}")
+                        return {"error": f"station_count hot-reload failed: {e}"}
+                    managers = getattr(shared_state, "vpn_managers", None) or []
+            for mgr in managers:
+                await mgr.update_config(body)
             # [plan] E: new ip_rotation timings drive the free-IP pool too
             # (rotation_threshold stagger, connect retry, bad TTL, ...).
             pool = getattr(shared_state, "free_ip_pool", None)
@@ -1302,14 +1327,14 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
             # [plan 18/08 §3d] stack selection — applied AFTER the config
             # fan-out (set_stack persists the mode itself into the manager;
             # config.yaml holds the selection via the conditional persist
-            # above). _apply_stack recreates BOTH stations, so the station-2
-            # manager only mirrors state (propagate=False) — no second
-            # compose — and only on success (a refused flip must not desync
-            # station 2 from station 1).
+            # above). _apply_stack recreates ALL stations, so every station
+            # beyond the first only mirrors state (propagate=False) — no
+            # second compose — and only on success (a refused flip must not
+            # desync the other stations from station 1).
             if "vpn_stack" in body:
                 _stack_ok = False
                 try:
-                    _stack_res = await shared_state.vpn_manager.set_stack(
+                    _stack_res = await managers[0].set_stack(
                         str(body["vpn_stack"]))
                     _stack_ok = bool(_stack_res.get("ok"))
                     if _stack_ok:
@@ -1318,13 +1343,17 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
                         _debug(f"  [vpn] set_stack refused: {_stack_res.get('error')} — config.yaml keeps the previous stack")
                 except Exception as e:
                     _debug(f"  [vpn] set_stack failed: {e}")
-                if _stack_ok and mgr2 is not None:
-                    try:
-                        await mgr2.set_stack(str(body["vpn_stack"]), propagate=False)
-                    except Exception as e:
-                        _debug(f"  [vpn] set_stack (station 2) failed: {e}")
+                # only on success — a refused flip must not desync the other
+                # stations from station 1 (their mirror would claim a stack
+                # the primary never applied).
+                if _stack_ok:
+                    for _m in managers[1:]:
+                        try:
+                            await _m.set_stack(str(body["vpn_stack"]), propagate=False)
+                        except Exception as e:
+                            _debug(f"  [vpn] set_stack (station {_m._station}) failed: {e}")
 
-        config = shared_state.vpn_manager.get_config() if shared_state.vpn_manager else {}
+        config = managers[0].get_config() if managers else {}
         return {"ok": True, "config": config}
 
     @app.post("/api/vpn/toggle")
@@ -1381,23 +1410,28 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
     async def next_vpn(request: Request):
         """Switch to next VPN server.
 
-        Body may carry ``station`` (0 = active station, default; 1 = station 1;
-        2 = station 2 — the latter only with dual_station enabled).
+        Body may carry ``station`` (0 = active station, default; n = station
+        n — the latter only within the resolved station_count).
         """
         import shared_state
-        if not shared_state.vpn_manager:
+        managers = getattr(shared_state, "vpn_managers", None) or []
+        if not managers:
             return {"error": "VPN manager not initialized"}
         try:
             body = await request.json()
         except Exception:
             body = {}
         station = body.get("station", 0)
-        if station == 2:
-            mgr = getattr(shared_state, "vpn_manager_2", None)
-            if mgr is None:
-                return {"error": "station 2 not available (dual_station disabled)"}
-        elif station == 1:
-            mgr = shared_state.vpn_manager
+        try:
+            station = int(station)
+        except (TypeError, ValueError):
+            station = 0
+        if station:
+            # [plan 18/08 §4] N-station: 1-indexed lookup in the registry.
+            if not (1 <= station <= len(managers)):
+                return {"error": f"station {station} not configured "
+                                f"(station_count={len(managers)})"}
+            mgr = managers[station - 1]
         else:
             # 0 → the station the pool currently routes through.
             mgr = None
