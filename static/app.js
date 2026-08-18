@@ -91,6 +91,25 @@ const LOCALE = {
         'vpn.rotation_off': 'Disabled',
         'vpn.ips_used': 'IPs used',
         'vpn.switches': 'Switches',
+        'vpn.stack.title': 'VPN technology',
+        'vpn.stack.hint': 'WireGuard/NordLynx preferred (no AUTH_FAILED); OpenVPN kept as fallback. Auto flips on reliability counters.',
+        'vpn.stack.auto': 'Auto (recommended)',
+        'vpn.stack.wireguard': 'WireGuard',
+        'vpn.stack.openvpn': 'OpenVPN',
+        'vpn.stack.save': 'Save',
+        'vpn.stack.station': 'Station',
+        'vpn.stack.effective': 'Effective',
+        'vpn.stack.keys': 'WG keys',
+        'vpn.stack.keys_present': 'present',
+        'vpn.stack.keys_missing': 'missing',
+        'vpn.stack.egress_fail': 'Egress failures',
+        'vpn.stack.egress_ticks': 'Egress dead ticks',
+        'vpn.stack.auth_failed': 'AUTH_FAILED / 30 min',
+        'vpn.stack.threshold': 'Flip threshold',
+        'vpn.stack.cooldown': 'Flip cooldown',
+        'vpn.stack.last_flip': 'Last flip',
+        'vpn.stack.history': 'Flip history (last 5)',
+        'vpn.stack.none': 'none',
         'vpn.servers_hint': 'NordVPN .ovpn configs',
         'vpn.confirm_remove': 'Remove this server?',
         'vpn.server_added': 'Server added',
@@ -375,6 +394,25 @@ const LOCALE = {
         'vpn.rotation_off': 'Désactivé',
         'vpn.ips_used': 'IPs utilisées',
         'vpn.switches': 'Changements',
+        'vpn.stack.title': 'Technologie VPN',
+        'vpn.stack.hint': 'WireGuard/NordLynx préféré (aucun AUTH_FAILED) ; OpenVPN conservé en filet. Auto bascule sur compteurs de fiabilité.',
+        'vpn.stack.auto': 'Auto (recommandé)',
+        'vpn.stack.wireguard': 'WireGuard',
+        'vpn.stack.openvpn': 'OpenVPN',
+        'vpn.stack.save': 'Enregistrer',
+        'vpn.stack.station': 'Station',
+        'vpn.stack.effective': 'Effectif',
+        'vpn.stack.keys': 'Clés WG',
+        'vpn.stack.keys_present': 'présentes',
+        'vpn.stack.keys_missing': 'absentes',
+        'vpn.stack.egress_fail': 'Échecs egress',
+        'vpn.stack.egress_ticks': 'Ticks egress morts',
+        'vpn.stack.auth_failed': 'AUTH_FAILED / 30 min',
+        'vpn.stack.threshold': 'Seuil de bascule',
+        'vpn.stack.cooldown': 'Cooldown bascule',
+        'vpn.stack.last_flip': 'Dernière bascule',
+        'vpn.stack.history': 'Historique bascules (5 derniers)',
+        'vpn.stack.none': 'aucune',
         'vpn.servers_hint': 'Configs .ovpn NordVPN',
         'vpn.confirm_remove': 'Supprimer ce serveur ?',
         'vpn.server_added': 'Serveur ajouté',
@@ -3013,6 +3051,10 @@ document.addEventListener('DOMContentLoaded', () => {
             const exhaustMode = document.getElementById('vpn-exhaust-mode');
             if (exhaustMode) exhaustMode.value = cfgData.strict_free ? 'strict' : 'fallback';
 
+            // [plan 18/08 §3d] VPN technology selector
+            const stackSelect = document.getElementById('vpn-stack-select');
+            if (stackSelect && cfgData.vpn_stack) stackSelect.value = cfgData.vpn_stack;
+
             // Initialize free models master toggle
             const fmToggle = document.getElementById('fm-toggle');
             const fmLabel = document.getElementById('fm-toggle-label');
@@ -3032,7 +3074,69 @@ document.addEventListener('DOMContentLoaded', () => {
             const rotateToggle = document.getElementById('fm-socks5-rotate');
             if (rotateToggle) rotateToggle.checked = socks5Data.rotate !== false;
         } catch (e) {}
+
+        // [plan 18/08 §3d] VPN technology selector state
+        refreshStackInfo();
     }
+
+    // [plan 18/08 §3d] Render per-station stack info from GET /api/vpn-stack-info
+    async function refreshStackInfo() {
+        const container = document.getElementById('vpn-stack-stations');
+        if (!container) return;
+        try {
+            const resp = await fetch('/api/vpn-stack-info');
+            const data = await resp.json();
+            const stations = data.stations || {};
+            const keys = Object.keys(stations);
+            if (!keys.length) {
+                container.innerHTML = '<div style="color:var(--text-muted)">—</div>';
+                return;
+            }
+            container.innerHTML = keys.map(num => {
+                const s = stations[num];
+                const keysOk = s.keys_present
+                    ? '<span style="color:var(--success)">&#10003; ' + (t('vpn.stack.keys_present') || 'présentes') + '</span>'
+                    : '<span style="color:var(--warning)">! ' + (t('vpn.stack.keys_missing') || 'absentes') + '</span>';
+                const effLabel = s.effective === 'wireguard' ? (t('vpn.stack.wireguard') || 'WireGuard')
+                    : s.effective === 'openvpn' ? (t('vpn.stack.openvpn') || 'OpenVPN') : (s.effective || '—');
+                const lastFlip = (s.flips && s.flips.length)
+                    ? s.flips[s.flips.length - 1].time + ' ' + (s.flips[s.flips.length - 1].from || '?') + '→' + (s.flips[s.flips.length - 1].to || '?')
+                    : (t('vpn.stack.none') || 'aucune');
+                const hist = (s.flips && s.flips.length)
+                    ? '<div style="font-family:monospace;font-size:11px;margin-top:4px;color:var(--text-muted)">' +
+                        s.flips.slice(-5).map(f => escHtml(f.time + ' ' + (f.from || '?') + '→' + (f.to || '?') + ' (' + (f.reason || '') + ')')).join('<br>') +
+                      '</div>'
+                    : '';
+                return `
+                <div style="margin-top:8px;padding:8px;background:var(--bg-primary);border-radius:6px">
+                    <div style="display:flex;justify-content:space-between;align-items:center">
+                        <strong>${escHtml(t('vpn.stack.station') || 'Station')} ${num}</strong>
+                        <span>${effLabel} · ${keysOk}</span>
+                    </div>
+                    <div style="display:flex;gap:16px;margin-top:6px;font-size:11px;color:var(--text-muted);flex-wrap:wrap">
+                        <span>${escHtml(t('vpn.stack.egress_fail') || 'Échecs egress')}: ${s.egress_failures ?? 0}</span>
+                        <span>${escHtml(t('vpn.stack.egress_ticks') || 'Ticks egress morts')}: ${s.wg_egress_ticks ?? 0}</span>
+                        <span>${escHtml(t('vpn.stack.auth_failed') || 'AUTH_FAILED / 30 min')}: ${s.auth_failed_window ?? 0} / ${s.auth_failed_threshold ?? 3}</span>
+                        <span>${escHtml(t('vpn.stack.last_flip') || 'Dernière bascule')}: ${escHtml(lastFlip)}</span>
+                    </div>
+                    ${hist}
+                </div>`;
+            }).join('');
+        } catch (e) {
+            console.error('Stack info error:', e);
+            container.innerHTML = '<div style="color:var(--text-muted)">—</div>';
+        }
+    }
+
+    window.vpnSaveStack = async function() {
+        const select = document.getElementById('vpn-stack-select');
+        if (!select) return;
+        await fetch('/api/vpn-config', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({vpn_stack: select.value})
+        });
+        refreshVPNStatus();
+    };
 
     function renderServerList(servers) {
         const list = document.getElementById('vpn-servers-list');

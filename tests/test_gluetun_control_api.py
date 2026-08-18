@@ -780,3 +780,214 @@ class TestFailedHostsPersistence:
             "failures": 31, "first_failed_at": 1000.0, "bad_until": 1000.0}
         assert mgr._host_blacklisted("fr869.nordvpn.com") is False
         assert mgr._failed_hosts == {}
+
+
+class StackFakeVPNManager(ControlFakeVPNManager):
+    """ControlFakeVPNManager that records EVERY docker_run argv — the base
+    fake only captures control-server exec scripts, while the stack-flip
+    tests must assert the compose argv itself (both stations, no pull)."""
+
+    def __init__(self, cfg, station=1, shared=None, tmp_path=None, **kw):
+        super().__init__(cfg, station=station, shared=shared,
+                         tmp_path=tmp_path, **kw)
+        self.run_args = []
+
+    def _docker_run(self, args, timeout=30):
+        self.run_args.append(list(args))
+        return super()._docker_run(args, timeout=timeout)
+
+
+def _stack_mgr(tmp_path, monkeypatch, key=True, **cfg_over):
+    """StackFakeVPNManager wired so _apply_stack can NEVER touch the real
+    repo .env: VPN_DOCKER_COMPOSE_FILE points at tmp_path, so the .env
+    read-modify-write and the compose argv both stay in tmp (the real .env
+    holds secrets). ``key=True`` pre-creates tmp_path/wireguard.env so the
+    "auto" resolution (and the wireguard flip guard) see a key."""
+    monkeypatch.setenv("VPN_DOCKER_COMPOSE_FILE",
+                       str(tmp_path / "docker-compose.yml"))
+    if key:
+        (tmp_path / "wireguard.env").write_text("WIREGUARD_PRIVATE_KEY=abc\n")
+    return StackFakeVPNManager(_cfg(tmp_path, **cfg_over), tmp_path=tmp_path)
+
+
+class TestStackSelector:
+    """[plan 18/08 Phase 3] GUI technology selector — Auto/WireGuard/OpenVPN.
+
+    T5: manual set_stack("wireguard") writes VPN_TYPE_STATION{1,2} into the
+    .env (preserving unrelated keys) and issues exactly ONE compose
+    recreate for BOTH stations, no pull; flip journaled.
+    T6: auto policy — AUTH_FAILED window → WG, cooldown blocks a 2nd flip,
+    egress dead → OV, healthy OV 60 min → back to WG (injectable clock).
+    T7: set_stack("wireguard") without vpn_configs/wireguard.env → refusal,
+    compose never called, nothing written."""
+
+    # ── T5 ─────────────────────────────────────────────────────────
+    @pytest.mark.asyncio
+    async def test_t5_manual_wireguard_applies_env_and_one_compose(self, tmp_path, monkeypatch):
+        mgr = _stack_mgr(tmp_path, monkeypatch)
+        assert mgr._stack_effective == "wireguard"  # key present → auto starts WG
+        # Simulate a manual OpenVPN → WireGuard switch: effective must
+        # differ from the target, or _apply_stack no-ops.
+        mgr._stack_effective = "openvpn"
+        # The .env next to the compose file already holds unrelated keys —
+        # the read-modify-write must preserve them.
+        (tmp_path / ".env").write_text(
+            "# secrets must survive\nOPENCODE_API_KEY=super-secret\n"
+            "VPN_TYPE_STATION1=openvpn\n")
+        res = await mgr.set_stack("wireguard")
+        assert res == {"ok": True, "effective": "wireguard"}
+        assert mgr._stack == "wireguard"
+        env = (tmp_path / ".env").read_text()
+        assert "OPENCODE_API_KEY=super-secret" in env
+        assert "VPN_TYPE_STATION1=wireguard" in env
+        assert "VPN_TYPE_STATION2=wireguard" in env
+        # Exactly ONE compose call for BOTH stations, no pull.
+        assert mgr.calls["docker_run"] == 1
+        assert mgr.run_args[-1] == [
+            "compose", "-f", str(tmp_path / "docker-compose.yml"),
+            "up", "-d", "--force-recreate",
+            "vpn-gluetun", "vpn-gluetun-2"]
+        assert "pull" not in mgr.run_args[-1]
+        # Flip journal (cap 20, ISO-Z timestamp).
+        assert len(mgr._flips) == 1
+        flip = mgr._flips[0]
+        assert flip["from"] == "openvpn" and flip["to"] == "wireguard"
+        assert flip["reason"] == "manual"
+        assert re.match(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$", flip["time"])
+        assert mgr.stack_info()["selected"] == "wireguard"
+
+    # ── T6 — auto policy (unit, injectable clock) ──────────────────
+    @pytest.mark.asyncio
+    async def test_t6a_auth_failed_window_flips_to_wireguard(self, tmp_path, monkeypatch):
+        mgr = _stack_mgr(tmp_path, monkeypatch)
+        clock = {"t": 1_000_000.0}
+        mgr._now_fn = lambda: clock["t"]
+        mgr._stack_effective = "openvpn"
+        mgr._stack_since = clock["t"]
+        mgr._auth_failed_window = [clock["t"] - 1000, clock["t"] - 900,
+                                   clock["t"] - 800]
+        assert mgr._auto_flip_decision() == ("wireguard", "3 AUTH_FAILED/30min")
+        # Stale entries outside the 30-min window are pruned, not counted.
+        mgr._auth_failed_window = [clock["t"] - 2000, clock["t"] - 1000,
+                                   clock["t"] - 900]
+        assert mgr._auto_flip_decision() is None
+        # A manual selection (non-auto) never flips on its own.
+        mgr._auth_failed_window = [clock["t"] - 1000, clock["t"] - 900,
+                                   clock["t"] - 800]
+        mgr._stack = "openvpn"
+        assert mgr._auto_flip_decision() is None
+
+    @pytest.mark.asyncio
+    async def test_t6b_cooldown_blocks_second_flip(self, tmp_path, monkeypatch):
+        mgr = _stack_mgr(tmp_path, monkeypatch)
+        clock = {"t": 1_000_000.0}
+        mgr._now_fn = lambda: clock["t"]
+        mgr._stack_effective = "openvpn"
+        mgr._auth_failed_window = [clock["t"] - 1000, clock["t"] - 900,
+                                   clock["t"] - 800]
+        # Flipped 100 s ago: inside the 30-min cooldown → no second flip.
+        mgr._last_auto_flip_at = clock["t"] - 100
+        assert mgr._auto_flip_decision() is None
+        # Outside the cooldown the same state flips again (anti-flapping
+        # window has elapsed — the decision is legitimately due).
+        mgr._last_auto_flip_at = clock["t"] - 1900
+        assert mgr._auto_flip_decision() == ("wireguard", "3 AUTH_FAILED/30min")
+
+    @pytest.mark.asyncio
+    async def test_t6c_egress_dead_flips_to_openvpn(self, tmp_path, monkeypatch):
+        mgr = _stack_mgr(tmp_path, monkeypatch)
+        clock = {"t": 1_000_000.0}
+        mgr._now_fn = lambda: clock["t"]
+        mgr._stack_effective = "wireguard"
+        # 4/5 dead ticks: below the threshold — hold.
+        mgr._egress_failures = mgr._auto_wg_egress_ticks - 1
+        assert mgr._auto_flip_decision() is None
+        # 5/5: the flip IS the recovery.
+        mgr._egress_failures = mgr._auto_wg_egress_ticks
+        assert mgr._auto_flip_decision() == (
+            "openvpn", f"egress dead {mgr._auto_wg_egress_ticks} ticks")
+
+    @pytest.mark.asyncio
+    async def test_t6d_healthy_ov_returns_to_wireguard(self, tmp_path, monkeypatch):
+        mgr = _stack_mgr(tmp_path, monkeypatch)
+        clock = {"t": 1_000_000.0}
+        mgr._now_fn = lambda: clock["t"]
+        mgr._stack_effective = "openvpn"
+        # Healthy OV for > 60 min, zero failures → back to the preferred WG.
+        mgr._stack_since = clock["t"] - 3601
+        assert mgr._auto_flip_decision() == (
+            "wireguard", "OV healthy 60 min — return to WG")
+        # Not yet 60 min → stay on OpenVPN.
+        mgr._stack_since = clock["t"] - 3599
+        assert mgr._auto_flip_decision() is None
+        # Any recent AUTH_FAILED cancels the healthy return.
+        mgr._stack_since = clock["t"] - 3601
+        mgr._auth_failed_window = [clock["t"] - 100]
+        assert mgr._auto_flip_decision() is None
+
+    # ── T6 — auto policy (full watchdog tick) ──────────────────────
+    @pytest.mark.asyncio
+    async def test_t6e_watchdog_tick_egress_dead_applies_flip(self, tmp_path, monkeypatch):
+        """A dead WG tunnel (SOCKS5 probe answers nothing) arms the auto
+        flip INSIDE the lock and applies it AFTER it — exactly one compose,
+        `_stack` stays "auto", cooldown armed, journal fed."""
+        mgr = _stack_mgr(tmp_path, monkeypatch)
+        mgr.ips = []  # dead tunnel: refresh probe + egress probe both get None
+        mgr._egress_failures = mgr._auto_wg_egress_ticks - 1
+        await mgr._watchdog_tick()
+        assert mgr._stack_effective == "openvpn"
+        assert mgr._stack == "auto"          # auto mode is NOT deselected
+        assert mgr.calls["docker_run"] == 1  # exactly the flip compose
+        assert mgr.run_args[-1][:3] == ["compose", "-f",
+                                        str(tmp_path / "docker-compose.yml")]
+        assert mgr._last_auto_flip_at is not None  # cooldown armed
+        flip = mgr._flips[-1]
+        assert flip["from"] == "wireguard" and flip["to"] == "openvpn"
+        assert flip["reason"] == "auto: egress dead 5 ticks"
+        # The flip superseded the escalation: no compose escalation fired.
+        assert mgr.escalations == 0
+        # .env switched for BOTH stations.
+        env = (tmp_path / ".env").read_text()
+        assert "VPN_TYPE_STATION1=openvpn" in env
+        assert "VPN_TYPE_STATION2=openvpn" in env
+
+    @pytest.mark.asyncio
+    async def test_t6f_watchdog_tick_auth_failed_flips_to_wireguard(self, tmp_path, monkeypatch):
+        """3 live AUTH_FAILED in the 30-min window on a healthy-but-OV
+        station → the next tick flips to WG (preferred stack)."""
+        mgr = _stack_mgr(tmp_path, monkeypatch)
+        mgr._stack_effective = "openvpn"     # e.g. after an auto flip to OV
+        mgr._stack_since = mgr._now_fn()
+        t = mgr._now_fn()
+        mgr._auth_failed_window = [t - 500, t - 400, t - 300]
+        mgr.ips = ["1.2.3.4"]                # tunnel healthy — no recovery needed
+        await mgr._watchdog_tick()
+        assert mgr._stack_effective == "wireguard"
+        assert mgr._stack == "auto"
+        assert mgr.calls["docker_run"] == 1
+        assert mgr.escalations == 0
+        flip = mgr._flips[-1]
+        assert flip["from"] == "openvpn" and flip["to"] == "wireguard"
+        assert flip["reason"] == "auto: 3 AUTH_FAILED/30min"
+        env = (tmp_path / ".env").read_text()
+        assert "VPN_TYPE_STATION1=wireguard" in env
+        assert "VPN_TYPE_STATION2=wireguard" in env
+
+    # ── T7 ─────────────────────────────────────────────────────────
+    @pytest.mark.asyncio
+    async def test_t7_refuses_wireguard_without_key(self, tmp_path, monkeypatch):
+        """No vpn_configs/wireguard.env → set_stack("wireguard") refuses:
+        compose never called, .env never written, effective stays OpenVPN.
+        The keys are NEVER generated or stored by the proxy — this refusal
+        is the hard boundary."""
+        mgr = _stack_mgr(tmp_path, monkeypatch, key=False)
+        assert mgr._stack_effective == "openvpn"  # keyless auto starts OV
+        assert not mgr._wg_key_present()
+        res = await mgr.set_stack("wireguard")
+        assert res["ok"] is False
+        assert mgr.calls["docker_run"] == 0       # compose never called
+        assert not (tmp_path / ".env").exists()   # nothing written
+        assert mgr._stack_effective == "openvpn"
+        assert mgr._flips == []
+        # Auto mode on a keyless box can never decide a WG flip either.
+        assert mgr._auto_flip_decision() is None

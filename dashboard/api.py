@@ -276,6 +276,14 @@ def _persist_vpn_config(updates: dict):
             "docker_container_2": "docker_container_2",
             "compose_service_2": "compose_service_2",
             "state_file_2": "state_file_2",
+            # [plan 18/08 §3d] VPN technology selector (auto/wireguard/openvpn)
+            # + auto-mode thresholds — persisted here so the selection is a
+            # first-class config.yaml key (hot-reloaded via the mirror).
+            "vpn_stack": "vpn_stack",
+            "auto_ov_fail_threshold": "auto_ov_fail_threshold",
+            "auto_ov_return_min": "auto_ov_return_min",
+            "auto_wg_egress_ticks": "auto_wg_egress_ticks",
+            "auto_flip_cooldown_min": "auto_flip_cooldown_min",
         }
 
         changed = False
@@ -1233,6 +1241,20 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
             return shared_state.vpn_manager.get_config()
         return {"enabled": False, "servers": [], "auth_file": "", "protocol": "udp"}
 
+    @app.get("/api/vpn-stack-info")
+    async def get_vpn_stack_info():
+        """[plan 18/08 §3d] VPN technology selector state — per-station
+        effective stack, key presence, reliability counters, flip journal."""
+        import shared_state
+        mgr1 = getattr(shared_state, "vpn_manager", None)
+        mgr2 = getattr(shared_state, "vpn_manager_2", None)
+        info = {"stations": {}}
+        if mgr1 is not None:
+            info["stations"]["1"] = mgr1.stack_info()
+        if mgr2 is not None:
+            info["stations"]["2"] = mgr2.stack_info()
+        return info
+
     @app.post("/api/vpn-config")
     async def update_vpn_config(request: Request):
         """Update VPN configuration (hot-reload + persist to config.yaml)."""
@@ -1269,6 +1291,25 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
 
             # Persist changes to config.yaml
             _persist_vpn_config(body)
+
+            # [plan 18/08 §3d] stack selection — applied AFTER the config
+            # fan-out (set_stack persists the mode itself into the manager;
+            # config.yaml holds the selection via _persist_vpn_config above).
+            # _apply_stack recreates BOTH stations, so the station-2 manager
+            # only mirrors state (propagate=False) — no second compose.
+            if "vpn_stack" in body:
+                try:
+                    _stack_res = await shared_state.vpn_manager.set_stack(
+                        str(body["vpn_stack"]))
+                    if not _stack_res.get("ok"):
+                        _debug(f"  [vpn] set_stack: {_stack_res.get('error')}")
+                except Exception as e:
+                    _debug(f"  [vpn] set_stack failed: {e}")
+                if mgr2 is not None:
+                    try:
+                        await mgr2.set_stack(str(body["vpn_stack"]), propagate=False)
+                    except Exception as e:
+                        _debug(f"  [vpn] set_stack (station 2) failed: {e}")
 
         config = shared_state.vpn_manager.get_config() if shared_state.vpn_manager else {}
         return {"ok": True, "config": config}

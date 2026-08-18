@@ -355,6 +355,22 @@
                                 <input type="number" id="vpn-quota-per-ip" class="config-input" value="300" style="width:80px;font-size:12px" onchange="saveQuotaPerIp()">
                             </div>
                         </div>
+                        <!-- [plan 18/08 §3d] VPN technology selector -->
+                        <div id="vpn-stack-section" style="margin-top:14px;padding:12px;background:var(--bg-secondary);border-radius:8px">
+                            <div style="display:flex;justify-content:space-between;align-items:center">
+                                <strong style="font-size:13px" data-i18n="vpn.stack.title">Technologie VPN</strong>
+                                <select id="vpn-stack-select" class="config-input" style="width:180px;font-size:12px">
+                                    <option value="auto" data-i18n="vpn.stack.auto">Auto (recommandé)</option>
+                                    <option value="wireguard" data-i18n="vpn.stack.wireguard">WireGuard</option>
+                                    <option value="openvpn" data-i18n="vpn.stack.openvpn">OpenVPN</option>
+                                </select>
+                                <button onclick="vpnSaveStack()" style="padding:4px 12px;font-size:12px" data-i18n="vpn.stack.save">Enregistrer</button>
+                            </div>
+                            <div style="font-size:11px;color:var(--text-muted);margin-top:6px" data-i18n="vpn.stack.hint">WireGuard/NordLynx préféré (aucun AUTH_FAILED) ; OpenVPN conservé en filet. Auto bascule sur compteurs de fiabilité.</div>
+                            <div id="vpn-stack-stations" style="margin-top:10px;font-size:12px">
+                                <div id="vpn-stack-loading" style="color:var(--text-muted)">…</div>
+                            </div>
+                        </div>
                         <!-- Double station ("double embrayage") -->
                         <div id="vpn-dual-section" style="margin-top:14px;padding:12px;background:var(--bg-secondary);border-radius:8px">
                             <div style="display:flex;justify-content:space-between;align-items:center">

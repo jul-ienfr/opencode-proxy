@@ -508,6 +508,20 @@ class VPNManager:
             self._stack_effective = "wireguard" if os.path.exists(self._wg_key_file) else "openvpn"
         self._egress_failures = 0  # consecutive dead-tunnel ticks (WG only)
         self._auto_wg_egress_ticks = max(1, int(cfg.get("auto_wg_egress_ticks", 5)))
+        # [plan 18/08 §3c] Auto-mode reliability counters. Clock is
+        # INJECTABLE (_now_fn) so tests can advance time without patching
+        # time.monotonic globally (process-wide side effect); production uses
+        # time.monotonic.
+        self._now_fn = time.monotonic
+        self._auth_failed_window: list[float] = []  # monotonic ts, 30-min sliding
+        self._last_auto_flip_at: Optional[float] = None  # cooldown (monotonic)
+        self._stack_since: Optional[float] = None  # when the effective stack took over
+        self._auto_ov_fail_threshold = max(1, int(cfg.get("auto_ov_fail_threshold", 3)))
+        self._auto_ov_return_min = max(1, int(cfg.get("auto_ov_return_min", 60)))
+        self._auto_flip_cooldown_min = max(1, int(cfg.get("auto_flip_cooldown_min", 30)))
+        self._flips: list[dict] = []  # journal [{time, from, to, reason}], cap 20
+        self._pending_flip: Optional[tuple] = None  # set inside the tick lock,
+        # applied AFTER it (_apply_stack takes the lock — not reentrant).
 
         # Identity rotation (client fingerprint, advanced on IP rotation).
         # identity_diversity (default False, backward-compatible) expands the
@@ -1363,8 +1377,10 @@ class VPNManager:
             from config.settings import _yaml_data as _cfg_data
             _dual = _cfg_data.get("ip_rotation", {}).get("dual_station", False)
             _strict = _cfg_data.get("ip_rotation", {}).get("strict_free", False)
+            _vpn_stack = _cfg_data.get("ip_rotation", {}).get("vpn_stack", "auto")
         except Exception:
             _dual = _strict = False
+            _vpn_stack = "auto"
         return {
             "enabled": self._enabled,
             "proxy_mode": self._proxy_mode,
@@ -1412,6 +1428,10 @@ class VPNManager:
                                                       "logs/shared_rotation.json"),
             "dual_station": _dual,
             "strict_free": _strict,
+            # [plan 18/08 §3d] stack selection (auto/wireguard/openvpn) —
+            # read from the config mirror so the dashboard reflects what was
+            # persisted, like dual_station above.
+            "vpn_stack": _vpn_stack,
         }
 
     async def update_config(self, updates: dict) -> dict:
@@ -1942,6 +1962,192 @@ class VPNManager:
         else:
             await self._docker_restart()
 
+    # ------------------------------------------------------------------
+    # [plan 18/08 §3b/3c] Stack selector (auto / wireguard / openvpn)
+    # ------------------------------------------------------------------
+
+    def _auto_flip_decision(self) -> Optional[tuple]:
+        """Auto-mode policy, called every watchdog tick INSIDE the lock with
+        fresh counters. Returns (mode, reason) when a flip is due, else None.
+        Only meaningful when self._stack == "auto"; a manual selection never
+        flips on its own (the user's choice wins — _apply_stack is only
+        reached through set_stack() in that case).
+
+        - effective wireguard + egress dead ≥ auto_wg_egress_ticks → openvpn
+          (dead tunnel; the flip itself is the recovery).
+        - effective openvpn + ≥ auto_ov_fail_threshold live AUTH_FAILED in the
+          sliding 30-min window → wireguard (preferred stack).
+        - effective openvpn + window empty for auto_ov_return_min (healthy
+          OV for an hour) → back to wireguard (sticky: WG is preferred).
+        - cooldown auto_flip_cooldown_min between auto flips (anti-flapping);
+          never flip to wireguard when the key file is missing (guard).
+        """
+        if self._stack != "auto":
+            return None
+        now = self._now_fn()
+        # Lazy prune of the sliding window.
+        cutoff = now - 30 * 60
+        self._auth_failed_window = [t for t in self._auth_failed_window if t >= cutoff]
+        if self._last_auto_flip_at is not None and now - self._last_auto_flip_at < \
+                self._auto_flip_cooldown_min * 60:
+            return None  # cooldown — anti-flapping
+        if self._stack_effective == "wireguard":
+            if self._egress_failures >= self._auto_wg_egress_ticks:
+                return ("openvpn", f"egress dead {self._egress_failures} ticks")
+            return None
+        # Effective OpenVPN below.
+        if self._stack_effective != "openvpn":
+            return None
+        if not self._wg_key_present():
+            return None  # cannot flip to wireguard without the key
+        if len(self._auth_failed_window) >= self._auto_ov_fail_threshold:
+            return ("wireguard", f"{len(self._auth_failed_window)} AUTH_FAILED/30min")
+        if self._stack_since is not None and now - self._stack_since >= \
+                self._auto_ov_return_min * 60 and not self._auth_failed_window:
+            return ("wireguard", f"OV healthy {self._auto_ov_return_min} min — return to WG")
+        return None
+
+    def _wg_key_present(self) -> bool:
+        try:
+            return os.path.isfile(self._wg_key_file)
+        except Exception:
+            return False
+
+    async def _apply_stack(self, mode: str, reason: str = "manual",
+                           auto: bool = False) -> bool:
+        """Switch the effective stack of BOTH stations (compose substitution)
+        and record the flip. mode ∈ {"wireguard", "openvpn"} (auto is resolved
+        by the caller). Refuses wireguard when vpn_configs/wireguard.env is
+        missing — the keys are NEVER generated or stored by the proxy.
+
+        Writes only VPN_TYPE_STATION1/2 into the .env next to the compose
+        file (read-modify-write + os.replace, atomic — same pattern as
+        save_state), then `compose up -d --force-recreate` per station.
+        """
+        if mode not in ("wireguard", "openvpn"):
+            logger.error("[vpn] _apply_stack: invalid mode %r", mode)
+            return False
+        if mode == "wireguard" and not self._wg_key_present():
+            logger.warning("[vpn] _apply_stack: refusing wireguard — %s missing",
+                           self._wg_key_file)
+            return False
+        if mode == self._stack_effective:
+            logger.info("[vpn] stack already %s — no-op", mode)
+            return True
+        compose_path = self._compose_file_path()
+        env_path = os.path.join(os.path.dirname(compose_path), ".env")
+        try:
+            # Read-modify-write: NEVER touch the other .env keys (secrets
+            # live there) — only the two VPN_TYPE_STATION vars.
+            data = ""
+            try:
+                with open(env_path, "r", encoding="utf-8") as f:
+                    data = f.read()
+            except FileNotFoundError:
+                pass
+            lines = data.splitlines()
+            out, seen = [], set()
+            for ln in lines:
+                stripped = ln.strip()
+                if not stripped or stripped.startswith("#") or "=" not in stripped:
+                    out.append(ln)
+                    continue
+                key = stripped.split("=", 1)[0].strip()
+                if key in ("VPN_TYPE_STATION1", "VPN_TYPE_STATION2"):
+                    seen.add(key)
+                    if stripped == f"{key}={mode}":
+                        out.append(ln)  # already the target value
+                    else:
+                        out.append(f"{key}={mode}")
+                    continue
+                out.append(ln)
+            for key in ("VPN_TYPE_STATION1", "VPN_TYPE_STATION2"):
+                if key not in seen:
+                    out.append(f"{key}={mode}")
+            tmp = env_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write("\n".join(out) + "\n")
+            os.replace(tmp, env_path)
+        except OSError as e:
+            logger.error("[vpn] _apply_stack: cannot write %s: %s", env_path, e)
+            return False
+        # Recreate BOTH stations in the target stack in one compose call —
+        # vpn-gluetun-2 has the "dual-station" profile, but explicitly
+        # targeting a profiled service runs it regardless (same mechanism
+        # VPNManager uses to bring station 2 up itself). 300 s: two
+        # recreations, one command.
+        try:
+            cmd = ["compose", "-f", compose_path, "up", "-d", "--force-recreate",
+                   "vpn-gluetun", "vpn-gluetun-2"]
+            result = await asyncio.to_thread(self._docker_run, cmd, 300)
+            if result.returncode != 0:
+                raise RuntimeError(result.stderr.strip() or result.stdout.strip())
+        except Exception as e:
+            logger.error("[vpn] _apply_stack: compose recreate failed: %s", e)
+            return False
+        previous = self._stack_effective
+        self._stack_effective = mode
+        self._stack_since = self._now_fn()
+        if auto:
+            self._last_auto_flip_at = self._now_fn()
+        self._flips.append({
+            "time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "from": previous,
+            "to": mode,
+            "reason": reason,
+        })
+        self._flips = self._flips[-20:]
+        logger.info("[vpn] stack: %s→%s (%s)", previous, mode, reason)
+        return True
+
+    async def set_stack(self, mode: str, propagate: bool = True) -> dict:
+        """API entry point (dashboard). mode ∈ {"auto", "wireguard", "openvpn"}.
+        For a manual selection: apply it immediately (reason="manual").
+        propagate=False → state-only sync (used for the station-2 manager:
+        _apply_stack on station 1 already recreated BOTH containers — a
+        second compose call would be a duplicate).
+        Returns a result dict for the dashboard."""
+        if mode not in ("auto", "wireguard", "openvpn"):
+            return {"ok": False, "error": f"unknown stack {mode!r}"}
+        if mode == "auto":
+            # Back to auto: no forced flip — the watchdog policy resumes at
+            # the next tick from the current effective stack (WG stays WG).
+            self._stack = "auto"
+            self._auth_failed_window = []
+            self._last_auto_flip_at = None
+            logger.info("[vpn] stack: auto (effective %s, watchdog resumes)",
+                        self._stack_effective)
+            return {"ok": True, "effective": self._stack_effective}
+        if propagate:
+            ok = await self._apply_stack(mode, reason="manual")
+            if ok:
+                self._stack = mode  # manual selection wins over auto policy
+        else:
+            # State-only: station-2 manager mirrors the flip already applied
+            # by station 1's _apply_stack (both containers were recreated).
+            self._stack = mode
+            self._stack_effective = mode
+            self._stack_since = self._now_fn()
+            self._auth_failed_window = []
+            self._last_auto_flip_at = None
+            ok = True
+        return {"ok": ok, "effective": self._stack_effective}
+
+    def stack_info(self) -> dict:
+        """Snapshot for GET /api/vpn-stack-info (dashboard rendering)."""
+        return {
+            "selected": self._stack,
+            "effective": self._stack_effective,
+            "keys_present": self._wg_key_present(),
+            "egress_failures": self._egress_failures,
+            "wg_egress_ticks": self._auto_wg_egress_ticks,
+            "auth_failed_window": len(self._auth_failed_window),
+            "auth_failed_threshold": self._auto_ov_fail_threshold,
+            "cooldown_min": self._auto_flip_cooldown_min,
+            "stack_since": self._stack_since,
+            "flips": self._flips[-5:],
+        }
+
     async def _check_auth_failed(self, started_at: str = "") -> bool:
         """Scan container logs for AUTH_FAILED (OpenVPN auth rejection).
 
@@ -1971,6 +2177,10 @@ class VPNManager:
             # here, where live-ness is already established: an AUTH_FAILED
             # superseded by a success must never poison the blacklist.
             self._record_auth_failure(text)
+            # [plan 18/08 §3c] auto-mode counter: sliding 30-min window of
+            # LIVE rejections (threshold in config: auto_ov_fail_threshold).
+            # Monotonic timestamps; pruned lazily by _auto_flip_decision.
+            self._auth_failed_window.append(self._now_fn())
             return True
         return False
 
@@ -2348,66 +2558,95 @@ class VPNManager:
                         return
             else:
                 self._egress_failures = 0  # stack not WG: counter is meaningless
+            # [plan 18/08 §3c] auto-mode policy — decided inside the lock on
+            # fresh counters, applied AFTER it (_apply_stack takes the lock;
+            # asyncio.Lock is not reentrant, calling it here would deadlock).
+            self._pending_flip = self._auto_flip_decision()
             if not (self._auth_failed or self._server_issue) and not egress_dead:
                 self._watchdog_backoff.record_success()  # failure cleared: full cadence
-                return
-            info = await self._docker_inspect()
-            if not info or not info.get("running"):
-                return  # absent/stopped/restarting — other paths own the lifecycle
-            if egress_dead:
-                kind = "egress dead"
-            elif self._auth_failed:
-                kind = "AUTH_FAILED"
+                if self._pending_flip is None:
+                    return
+                # Healthy tick but a flip is due (auto: OV→WG return): skip
+                # the recovery block entirely — nothing is failing — the
+                # flip applies after the lock below.
             else:
-                kind = "TLS negotiation timeout"
-            logger.warning("[vpn-watchdog] %s detected — restarting %s",
-                           kind, self._docker_container)
-            # [plan 18/08] Fast recovery via the control API BEFORE compose:
-            # re-pin the next country (PUT /v1/vpn/settings) — a real
-            # stop+start reconnect in ~8-15 s with zero compose, vs minutes
-            # for a --force-recreate. Skips blacklisted hosts. On failure
-            # the compose path below (unchanged) is the escalation; same
-            # lock, so at most one recovery action per tick.
-            if await self._fast_recover_via_control(max_skips=3):
+                # Failing tick: the WG recovery path below may still succeed
+                # (fast-pin/compose revive the tunnel) — it returns early,
+                # which cancels the flip; only a failed recovery reaches the
+                # flip application after the lock. Intended: prefer keeping
+                # the current stack when a plain recovery works.
+                info = await self._docker_inspect()
+                if not info or not info.get("running"):
+                    return  # absent/stopped/restarting — other paths own the lifecycle
+                if egress_dead:
+                    kind = "egress dead"
+                elif self._auth_failed:
+                    kind = "AUTH_FAILED"
+                else:
+                    kind = "TLS negotiation timeout"
+                logger.warning("[vpn-watchdog] %s detected — restarting %s",
+                               kind, self._docker_container)
+                # [plan 18/08] Fast recovery via the control API BEFORE
+                # compose: re-pin the next country (PUT /v1/vpn/settings) — a
+                # real stop+start reconnect in ~8-15 s with zero compose, vs
+                # minutes for a --force-recreate. Skips blacklisted hosts. On
+                # failure the compose path below (unchanged) is the
+                # escalation; same lock, so at most one recovery action per
+                # tick.
+                if await self._fast_recover_via_control(max_skips=3):
+                    return
+                try:
+                    # _ensure_container() recreates via compose
+                    # (--force-recreate) because the last restart FAILED: a
+                    # plain `docker restart` would never apply the widened
+                    # SERVER_COUNTRIES pool.
+                    await self._ensure_container()
+                    started_at = await self._wait_healthy(timeout=120)
+                    if started_at and not (await self._check_auth_failed(started_at)
+                                           or await self._check_server_issue(started_at)):
+                        # The --force-recreate reset the country pool — re-pin
+                        # the next country so recovery doesn't drift back to
+                        # whatever the container picked at random ([plan] A).
+                        await self._pin_country_for_rotation()
+                        # Recovered path: finalize a FRESH IP (not recent on
+                        # either station) — the watchdog must never land back
+                        # on the failed server/IP. _finalize_ip probes +
+                        # restarts (≤3 rounds), advances the identity to a NEW
+                        # face and persists; a false return means
+                        # still-not-fresh.
+                        if await self._finalize_ip(allow_stale=False):
+                            self._watchdog_backoff.record_success()
+                            self._set_status(VPNState.CONNECTED)
+                            self._error = None
+                            await self.refresh_status(force=True)
+                            self.save_state()
+                            logger.info("[vpn-watchdog] recovered — tunnel healthy (IP %s)",
+                                        self._current_ip)
+                            return
+                    # Still failing: keep the error state and back off.
+                    self._watchdog_backoff.record_failure()
+                    escalate = self._watchdog_backoff.consecutive_failures >= 2
+                    logger.error("[vpn-watchdog] restart did not recover — next "
+                                 "attempt in %ds (failure #%d)",
+                                 int(self._watchdog_backoff.delay),
+                                 self._watchdog_backoff.consecutive_failures)
+                except Exception as e:
+                    self._watchdog_backoff.record_failure()
+                    escalate = self._watchdog_backoff.consecutive_failures >= 2
+                    logger.error("[vpn-watchdog] restart failed: %s — next attempt "
+                                 "in %ds", e, int(self._watchdog_backoff.delay))
+        # [plan 18/08 §3c] auto flip — applied OUTSIDE the lock (compose).
+        # A successful flip supersedes the escalation: the tunnel was just
+        # recreated in the other stack, no need to refresh servers/image too.
+        if self._pending_flip is not None:
+            mode, reason = self._pending_flip
+            self._pending_flip = None
+            ok = await self._apply_stack(mode, reason="auto: " + reason, auto=True)
+            if ok:
                 return
-            try:
-                # _ensure_container() recreates via compose (--force-recreate)
-                # because the last restart FAILED: a plain `docker restart`
-                # would never apply the widened SERVER_COUNTRIES pool.
-                await self._ensure_container()
-                started_at = await self._wait_healthy(timeout=120)
-                if started_at and not (await self._check_auth_failed(started_at)
-                                       or await self._check_server_issue(started_at)):
-                    # The --force-recreate reset the country pool — re-pin
-                    # the next country so recovery doesn't drift back to
-                    # whatever the container picked at random ([plan] A).
-                    await self._pin_country_for_rotation()
-                    # Recovered path: finalize a FRESH IP (not recent on
-                    # either station) — the watchdog must never land back on
-                    # the failed server/IP. _finalize_ip probes + restarts
-                    # (≤3 rounds), advances the identity to a NEW face and
-                    # persists; a false return means still-not-fresh.
-                    if await self._finalize_ip(allow_stale=False):
-                        self._watchdog_backoff.record_success()
-                        self._set_status(VPNState.CONNECTED)
-                        self._error = None
-                        await self.refresh_status(force=True)
-                        self.save_state()
-                        logger.info("[vpn-watchdog] recovered — tunnel healthy (IP %s)",
-                                    self._current_ip)
-                        return
-                # Still failing: keep the error state and back off.
-                self._watchdog_backoff.record_failure()
-                escalate = self._watchdog_backoff.consecutive_failures >= 2
-                logger.error("[vpn-watchdog] restart did not recover — next "
-                             "attempt in %ds (failure #%d)",
-                             int(self._watchdog_backoff.delay),
-                             self._watchdog_backoff.consecutive_failures)
-            except Exception as e:
-                self._watchdog_backoff.record_failure()
-                escalate = self._watchdog_backoff.consecutive_failures >= 2
-                logger.error("[vpn-watchdog] restart failed: %s — next attempt "
-                             "in %ds", e, int(self._watchdog_backoff.delay))
+            # Flip failed (e.g. compose error): fall through to the escalation
+            # below if the tick was failing — recovery is still needed.
+            escalate = escalate or self._watchdog_backoff.consecutive_failures >= 2
         # Escalation OUTSIDE the lock: apply_update() takes self._lock —
         # asyncio.Lock is not reentrant, calling it here would deadlock.
         if escalate:
@@ -2499,6 +2738,9 @@ class VPNManager:
                 "current_country": self._current_country,
                 # [plan 18/08] hostname blacklist (wall-clock TTL)
                 "failed_hosts": self._failed_hosts,
+                # [plan 18/08 §3b] stack selection + flip journal (cap 20)
+                "stack": self._stack,
+                "flips": self._flips,
                 "saved_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             }
             state_path = self._get_state_path()
@@ -2553,6 +2795,17 @@ class VPNManager:
                 k: v for k, v in state.get("failed_hosts", {}).items()
                 if isinstance(v, dict) and v.get("bad_until", 0) > now
             }
+            # [plan 18/08 §3b] Restore the stack selection (auto default) and
+            # the flip journal. Restoring the selection across restarts is
+            # what makes the GUI choice persistent without touching .env;
+            # effective stays as computed at init (WG if keys present else
+            # OV) — the watchdog reconciles auto at the next tick.
+            restored_stack = state.get("stack")
+            if restored_stack in ("auto", "wireguard", "openvpn"):
+                self._stack = restored_stack
+            restored_flips = state.get("flips")
+            if isinstance(restored_flips, list):
+                self._flips = [f for f in restored_flips if isinstance(f, dict)][-20:]
             logger.info("[vpn] state loaded: %d IPs in history, %d total switches",
                         len(self._ip_history), self._total_switches)
         except Exception as e:

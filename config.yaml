@@ -122,6 +122,16 @@ ip_rotation:
   server_provider: nordvpn
   control_api_key: ''
   control_enabled: true
+  # [plan 18/08 §3] VPN technology selector — auto: prefer WireGuard/NordLynx
+  # (no AUTH_FAILED possible), fall back to OpenVPN when the WG tunnel loses
+  # egress, return to WG after 3 AUTH_FAILED/30 min or 60 min healthy on OV.
+  # wireguard/openvpn: forced (no auto flips). Keys come from
+  # vpn_configs/wireguard.env only — never stored in config.yaml/.env.
+  vpn_stack: auto
+  auto_ov_fail_threshold: 3
+  auto_ov_return_min: 60
+  auto_wg_egress_ticks: 5
+  auto_flip_cooldown_min: 30
   rotation_wait_timeout: 20
   country_rotation: true
   country_offset: 14
