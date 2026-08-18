@@ -133,6 +133,12 @@ ip_rotation:
   auto_wg_egress_ticks: 3
   egress_failure_tick_interval: 2.0
   ip_probe_budget: 8.0
+  # [plan 18/08 §B] Control-pin budget: poll "running" up to timeout, then
+  # wait up to catchup for a REAL IP through the tunnel. 20+25 → 45 s wall
+  # per rotation pin (am.12); the fast-recover escalation threads its own
+  # 15/15 (am.3) → 30 s/pin, 120 s/4-pin wall.
+  control_pin_timeout: 20
+  control_pin_catchup: 25
   auto_flip_cooldown_min: 30
   rotation_wait_timeout: 20
   country_rotation: true

@@ -114,13 +114,26 @@ def _fast_cfg(tmp_path, **over):
 
 def _fast_mgr(tmp_path, ip="9.9.9.9", clears_on_pin=1, **over):
     """A ControlReconnectFake wired for the fast-pin flow: PUT accepted
-    (204-equivalent ""), status running, control public IP == the FIFO probe
-    IP (the post-recovery refresh_status reads the control IP, not the FIFO
-    — they must agree or the assert on _current_ip breaks)."""
+    (204-equivalent ""), status running, control public IP == the probe IP
+    (the post-recovery refresh_status reads the control IP, not the probe
+    — they must agree or the assert on _current_ip breaks).
+
+    get_public_ip returns CONSTANT IP — NOT the base fake's one-shot FIFO.
+    The pin catch-up (plan 18/08 §B, 15 s on the fast-recover path) polls
+    it after 'running' AND _finalize_ip re-probes it per recovery round: a
+    consumed FIFO would starve every later call, burn real 15 s catch-up
+    walls per pin (measured: 15 stray PUTs / 46 s on T1 with mgr.ips) and
+    cascade re-pins (vpn_manager 1466). The real parallel bounded sweep
+    (commit 2) answers on the first call whenever the tunnel lives — a
+    constant IP models that."""
     mgr = ControlReconnectFake(_fast_cfg(tmp_path, **over), station=1,
                                tmp_path=tmp_path,
                                clears_on_pin=clears_on_pin)
-    mgr.ips = [ip]
+
+    async def _constant_ip():
+        return ip
+
+    mgr.get_public_ip = _constant_ip          # type: ignore[assignment]
     mgr.stdout_by_fragment = {
         "/v1/vpn/settings": "",                       # accepted (204-equivalent)
         "/v1/vpn/status": '{"status":"running"}',
@@ -415,6 +428,107 @@ class TestControlPinCountry:
         assert new_ip == "1.2.3.4"
         assert mgr._status == vm.VPNState.CONNECTED
         assert mgr._current_country is None      # nothing pinned
+
+    @pytest.mark.asyncio
+    async def test_catchup_waits_for_real_ip_through_tunnel(self, tmp_path):
+        """[plan 18/08 §B] once gluetun reports 'running' the pin STILL
+        waits (catch-up) for a REAL public IP through the tunnel — the
+        445 s stall class was a 'connected' tunnel that never answered.
+        True the moment an IP answers, not at the catch-up wall."""
+        mgr = ControlFakeVPNManager(
+            _cfg(tmp_path, control_api_key="k",
+                 wait_healthy_poll=0.01), tmp_path=tmp_path)
+        mgr.stdout_by_fragment = {
+            "/v1/vpn/settings": "",
+            "/v1/vpn/status": '{"status":"running"}',
+        }
+        probes = []
+
+        async def _ip_probe():
+            probes.append(1)
+            return None if len(probes) < 3 else "1.2.3.4"
+        mgr.get_public_ip = _ip_probe            # type: ignore[assignment]
+
+        assert await mgr._control_pin_country("France", timeout=2, catchup=5) is True
+        assert len(probes) == 3                  # 2 misses, then the IP answers
+        assert len(_put_scripts(mgr)) == 1       # one PUT, no re-pin cascade
+
+    @pytest.mark.asyncio
+    async def test_catchup_aborts_fast_on_server_issue(self, tmp_path, caplog):
+        """[plan 18/08 §B] an auth/TLS signature DURING the catch-up aborts
+        the pin at once — the catch-up must not sit out its wall while the
+        server live-rejects the tunnel. The override passes the FIRST scan
+        (the pre-status one) so the abort lands only inside the catch-up
+        (audit 18/08: an unconditional flag would never enter it)."""
+        import logging
+        mgr = ControlFakeVPNManager(
+            _cfg(tmp_path, control_api_key="k",
+                 wait_healthy_poll=0.01), tmp_path=tmp_path)
+        mgr.stdout_by_fragment = {
+            "/v1/vpn/settings": "",
+            "/v1/vpn/status": '{"status":"running"}',
+        }
+        probes = []
+        scans = [0]
+
+        async def _ip_probe():
+            probes.append(1)
+            return None
+        mgr.get_public_ip = _ip_probe            # type: ignore[assignment]
+
+        async def _failing_in_catchup(*a, **k):
+            scans[0] += 1
+            return scans[0] > 1                  # 1st scan passes, catch-up aborts
+        mgr._check_server_issue = _failing_in_catchup
+
+        with caplog.at_level(logging.WARNING, logger="vpn_manager"):
+            assert await mgr._control_pin_country("Germany", timeout=2, catchup=5) is False
+        joined = "\n".join(r.getMessage() for r in caplog.records)
+        assert "during catch-up" in joined       # the INNER abort WARN (audit 18/08)
+        assert "auth/TLS failure" in joined
+        assert len(probes) == 0                  # aborted before any IP probe
+
+    @pytest.mark.asyncio
+    async def test_catchup_zero_preserves_legacy_pin(self, tmp_path):
+        """catchup=0 (the rotation-pin default): 'running' IS the verdict —
+        True immediately, ZERO IP probes. Exact legacy behavior."""
+        mgr = ControlFakeVPNManager(
+            _cfg(tmp_path, control_api_key="k",
+                 wait_healthy_poll=0.01), tmp_path=tmp_path)
+        mgr.stdout_by_fragment = {
+            "/v1/vpn/settings": "",
+            "/v1/vpn/status": '{"status":"running"}',
+        }
+        probes = []
+
+        async def _ip_probe():
+            probes.append(1)
+            return "1.2.3.4"
+        mgr.get_public_ip = _ip_probe            # type: ignore[assignment]
+
+        assert await mgr._control_pin_country("France", timeout=2) is True
+        assert probes == []
+
+    @pytest.mark.asyncio
+    async def test_pin_warns_stopped_once_per_pin(self, tmp_path, caplog):
+        """[incident 17/08] a pin polled 'stopped' for a while logged ONE
+        WARN per pin (59 identical lines in debug.log.1 → this dedupe is
+        LOCAL to the pin: a NEW pin warns again, never 59×)."""
+        import logging
+        mgr = ControlFakeVPNManager(
+            _cfg(tmp_path, control_api_key="k",
+                 wait_healthy_poll=0.01), tmp_path=tmp_path)
+        mgr.stdout_by_fragment = {
+            "/v1/vpn/settings": "",
+            "/v1/vpn/status": '{"status":"stopped"}',
+        }
+        for _ in range(2):                       # two independent pins
+            with caplog.at_level(logging.WARNING, logger="vpn_manager"):
+                assert await mgr._control_pin_country("France", timeout=0.1) is False
+            stopped = [r for r in caplog.records
+                       if "VPN reports stopped" in r.getMessage()]
+            assert len(stopped) == 1             # once per pin, never 59×
+            caplog.clear()
 
 
 # ── RECOVERY-AWARE log scans ([incident 17/08, live]) ────────────

@@ -519,6 +519,15 @@ class VPNManager:
         self._egress_failure_tick_interval = max(
             0.5, float(cfg.get("egress_failure_tick_interval", 2.0)))
         self._ip_probe_budget = max(1.0, float(cfg.get("ip_probe_budget", 8.0)))
+        # [plan 18/08 §B] Control-pin budget: how long a rotation pin may
+        # poll "running" (timeout) + how long it then waits for a REAL IP
+        # through the tunnel (catch-up, a "running but unreachable" guard —
+        # the 445 s stall class). Defaults keep the legacy 60 s no-catchup
+        # behavior; config.yaml ships 20/25 (45 s wall, am.12). The
+        # fast-recover path threads its own tighter 15/15 explicitly (am.3)
+        # — these attrs only feed normal rotation pins.
+        self._control_pin_timeout = max(5.0, float(cfg.get("control_pin_timeout", 60.0)))
+        self._control_pin_catchup = max(0.0, float(cfg.get("control_pin_catchup", 0.0)))
         # [plan 18/08 §A/am.14] Per-round recovery bound in _finalize_ip:
         # the 445 s incident stall accumulated over 3 rounds ×
         # _wait_healthy(120) + docker legs. 45 s per round caps the worst
@@ -1532,6 +1541,8 @@ class VPNManager:
             "egress_failure_tick_interval": self._egress_failure_tick_interval,
             "ip_probe_budget": self._ip_probe_budget,
             "auto_wg_egress_ticks": self._auto_wg_egress_ticks,
+            "control_pin_timeout": self._control_pin_timeout,
+            "control_pin_catchup": self._control_pin_catchup,
             "watchdog_backoff_base": self._watchdog_backoff._base_delay,
             "watchdog_backoff_max": self._watchdog_backoff._max_delay,
             "identity_rotation": self._identity_rotation_enabled,
@@ -1612,7 +1623,9 @@ class VPNManager:
         for _key, _conv, _floor in (
                 ("egress_failure_tick_interval", float, 0.5),
                 ("ip_probe_budget", float, 1.0),
-                ("auto_wg_egress_ticks", int, 1)):
+                ("auto_wg_egress_ticks", int, 1),
+                ("control_pin_timeout", float, 5.0),
+                ("control_pin_catchup", float, 0.0)):
             if _key not in updates:
                 continue
             try:
@@ -1854,11 +1867,21 @@ class VPNManager:
         return None
 
     async def _control_pin_country(self, country: str,
-                                   timeout: float = 60.0) -> bool:
+                                   timeout: float = 60.0,
+                                   catchup: float = 0.0) -> bool:
         """Ask gluetun to connect through ``country`` (PUT settings -> real
         stop+start reconnect). Polls ``status: running`` at the healthy-poll
         cadence until ``timeout``. Returns True only when the VPN came back
         up (the IP itself is validated separately by the rotation path).
+
+        ``catchup`` (am.3/am.12): once status flips to 'running', keep
+        waiting up to ``catchup`` seconds for a REAL public IP to answer
+        THROUGH the tunnel (cheap probe on the same SOCKS5 stack the request
+        path uses). A tunnel that reports running but never answers is the
+        445 s stall class — the catch-up abandons it early on an auth/TLS
+        signature but otherwise yields True at the wall (running is the pin
+        verdict; the IP is a speed bonus, not a gate — catchup=0 preserves
+        the exact legacy behavior).
 
         [incident 17/08] A pin that lands on an auth/TLS-failing server
         NEVER recovers on its own (openvpn SIGUSR1-retries forever). We
@@ -1898,6 +1921,7 @@ class VPNManager:
         # not abort a healthy pin.
         since_pin = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         deadline = time.monotonic() + timeout
+        stopped_warned = False          # [incident 17/08] one WARN per pin — 59/line spam
         while time.monotonic() < deadline:
             # Scan BEFORE leaning on the status reply: gluetun can report
             # "running" while openvpn is caught in an AUTH_FAILED retry
@@ -1911,10 +1935,37 @@ class VPNManager:
                 return False
             status = await self._control_status()
             if status is True:
+                if catchup > 0:
+                    # [plan 18/08 §B] "running" is not enough: a tunnel that
+                    # never answers a real IP probe is the 445 s stall class
+                    # (SOCKS5 CONNECT accepted but no data). Local loop,
+                    # never _wait_healthy (its fail-fast "not running" is a
+                    # false friend mid-reconnect, piège 7). Abort at once on
+                    # an auth/TLS signature; otherwise yield True at the
+                    # catch-up wall (running is the pin verdict).
+                    catchup_deadline = time.monotonic() + catchup
+                    while time.monotonic() < catchup_deadline:
+                        if await self._check_auth_failed(since_pin) \
+                                or await self._check_server_issue(since_pin):
+                            # [audit 18/08] same WARN as the pre-status scan —
+                            # a TLS failure mid-catch-up was silent before
+                            # (the incident was diagnosed through logs).
+                            logger.warning(
+                                "[vpn] control pin %s: auth/TLS failure "
+                                "during catch-up — abandoning", country)
+                            return False
+                        try:
+                            if await self.get_public_ip() is not None:
+                                return True    # a real IP through the tunnel
+                        except Exception:
+                            pass               # probe slipped — keep waiting
+                        await asyncio.sleep(self._wait_healthy_poll)
                 return True
             if status is False:
-                logger.warning("[vpn] control pin %s: VPN reports stopped",
-                               country)
+                if not stopped_warned:
+                    logger.warning("[vpn] control pin %s: VPN reports stopped",
+                                   country)
+                    stopped_warned = True
             await asyncio.sleep(self._wait_healthy_poll)
         logger.warning("[vpn] control pin %s: not running after %.0fs",
                        country, timeout)
@@ -1950,9 +2001,16 @@ class VPNManager:
         self._country_index = (self._country_index + 1) % len(countries)
         return nxt
 
-    async def _pin_country_for_rotation(self) -> Optional[str]:
+    async def _pin_country_for_rotation(self,
+                                        timeout: Optional[float] = None,
+                                        catchup: Optional[float] = None) -> Optional[str]:
         """Advance the shared country cursor and pin the next country via
         the control server (PUT /v1/vpn/settings — a real reconnect).
+
+        ``timeout``/``catchup`` (am.3): explicit budgets override the
+        configured attrs — None keeps the config defaults (60/0 = legacy).
+        The fast-recover path threads 15/15 so ITS pins hit the 30 s/pin,
+        120 s/4-pin wall without touching normal rotation behavior.
 
         Returns the pinned country name when the control server accepted
         it and the VPN came back up; None when country rotation is off,
@@ -1977,7 +2035,10 @@ class VPNManager:
             self._local_next_country(self._current_country)
         if nxt is None or nxt == self._current_country:
             return None
-        if await self._control_pin_country(nxt):
+        pin_timeout = self._control_pin_timeout if timeout is None else timeout
+        pin_catchup = self._control_pin_catchup if catchup is None else catchup
+        if await self._control_pin_country(nxt, timeout=pin_timeout,
+                                           catchup=pin_catchup):
             self._current_country = nxt
             self._country_pinned_at = time.monotonic()
             logger.info("[vpn] station %d pinned country %s",
@@ -1997,10 +2058,17 @@ class VPNManager:
             return None
         return _extract_current_hostname(result.stdout)
 
-    async def _fast_recover_via_control(self, max_skips: int = 3) -> bool:
+    async def _fast_recover_via_control(self, max_skips: int = 3,
+                                        timeout: float = 15.0,
+                                        catchup: float = 15.0) -> bool:
         """Recover an AUTH_FAILED/TLS tunnel WITHOUT compose: re-pin the
         next country via the control API (PUT /v1/vpn/settings — a real
         stop+start reconnect, ~8-15 s, vs minutes for --force-recreate).
+
+        ``timeout=15, catchup=15`` (am.3): every pin here is 30 s max and
+        the loop is bounded at ``max_skips+1`` pins → 120 s absolute wall
+        for the watchdog escalation (vs 60 s wall per pin before). Normal
+        rotation paths keep the configured 20/25 → 45 s wall.
 
         Skips blacklisted hosts without waiting for their ~11 s SIGUSR1
         retry cycle: after a successful pin the current hostname is
@@ -2020,7 +2088,8 @@ class VPNManager:
             return False
         for attempt in range(max_skips + 1):
             since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-            nxt = await self._pin_country_for_rotation()
+            nxt = await self._pin_country_for_rotation(timeout=timeout,
+                                                       catchup=catchup)
             if nxt is None:
                 if await self._check_auth_failed(since) \
                         or await self._check_server_issue(since):
