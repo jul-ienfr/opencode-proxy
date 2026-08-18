@@ -122,6 +122,7 @@ ip_rotation:
   server_provider: nordvpn
   control_api_key: ''
   control_enabled: true
+  rotation_wait_timeout: 20
   country_rotation: true
   country_offset: 14
   docker_events: true

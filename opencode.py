@@ -883,6 +883,33 @@ _transport = httpx.AsyncHTTPTransport(
 )
 _client = httpx.AsyncClient(transport=_transport, timeout=httpx.Timeout(connect=30, read=600, write=30, pool=10))
 
+
+def _ensure_http_client() -> httpx.AsyncClient:
+    """Lazy self-heal for the shared upstream client.
+
+    The lifespan shutdown calls ``await _client.aclose()`` (see below), so a
+    request that re-enters a stream/POST path during a restart handoff races
+    the now-closed client and httpx raises
+    RuntimeError("Cannot send a request, as the client has been closed.").
+    That error was surfacing as a confusing ✘ failure in dashboard history.
+    Re-create the client on demand instead — same pattern as
+    dashboard/quota.py::_get_http_client.
+    """
+    global _client, _transport
+    # getattr: real httpx clients always expose .is_closed; test doubles that
+    # omit it are treated as alive rather than closed.
+    if _client is None or getattr(_client, "is_closed", False):
+        _transport = httpx.AsyncHTTPTransport(
+            proxy=PROXY,
+            limits=httpx.Limits(max_connections=200, max_keepalive_connections=50, keepalive_expiry=120),
+        ) if PROXY else httpx.AsyncHTTPTransport(
+            limits=httpx.Limits(max_connections=200, max_keepalive_connections=50, keepalive_expiry=120),
+        )
+        _client = httpx.AsyncClient(transport=_transport, timeout=httpx.Timeout(connect=30, read=600, write=30, pool=10))
+        _debug("[http] shared upstream client re-created (was closed)")
+    return _client
+
+
 # ── VPN / IP rotation (initialized in lifespan) ──────────────────
 _vpn_manager = None
 _free_ip_pool = None
@@ -1559,7 +1586,7 @@ async def _forward_post(endpoint, json, headers):
     if not _cb_should_allow(endpoint):
         raise CircuitOpenError(f"Circuit breaker open for {endpoint}")
     try:
-        resp = await _client.post(endpoint, json=json, headers=headers)
+        resp = await _ensure_http_client().post(endpoint, json=json, headers=headers)
         _cb_record_success(endpoint)
         return resp
     except CircuitOpenError:
@@ -1758,7 +1785,8 @@ class _CurlCffiStreamResponse:
 
 
 @asynccontextmanager
-async def _open_free_stream(endpoint, body, headers, use_free: bool, count_request: bool = True):
+async def _open_free_stream(endpoint, body, headers, use_free: bool, count_request: bool = True,
+                            fresh_station: bool = False):
     """Context manager: upstream stream, routed through the VPN when free.
 
     use_free=True and VPN available → curl_cffi stream via the SOCKS5 tunnel
@@ -1772,6 +1800,13 @@ async def _open_free_stream(endpoint, body, headers, use_free: bool, count_reque
     callers' retry loop re-enters this function on network errors, and each
     re-entry must not advance the per-IP request count (1 request = 1 count,
     whatever the number of attempts).
+
+    fresh_station=True asks the pool for a DIFFERENT station than the one
+    that just disconnected ([17/08 21:44] "Server disconnected without
+    sending a response"): re-striking the same station = re-striking a dead
+    IP, a guaranteed ✘ under the per-IP quota model. Uses the ContextVar's
+    stored station as the failed one to exclude, then rotates it in the
+    background.
     """
     if use_free and _free_ip_pool and _free_ip_pool.enabled:
         # on_request returns (proxy_url, station); the stream path used to
@@ -1779,6 +1814,15 @@ async def _open_free_stream(endpoint, body, headers, use_free: bool, count_reque
         # then crashed into the direct fallback (BLOCKING, [plan] E).
         if count_request:
             proxy_url, station = await _free_ip_pool.on_request()
+        elif fresh_station:
+            # Disconnect retry: a different station = a different, likely-fresh
+            # (model, IP) cooldown key. NO counter advance (a retry is not a
+            # new request) — on_disconnect_retry is the count_request=False
+            # sibling of on_request. The failed station is bad-marked + rotated
+            # in the background by the pool.
+            _prev = _current_free_attempt.get() or {}
+            proxy_url, station = await _free_ip_pool.on_disconnect_retry(
+                _prev.get("station"))
         else:
             # Retry after a network error: re-use the SAME station/proxy as
             # the original attempt. Reading the fresh ``proxy_url`` property
@@ -1820,15 +1864,19 @@ async def _open_free_stream(endpoint, body, headers, use_free: bool, count_reque
         # Direct fallback to the free endpoint: never forward the paid key,
         # cookies or SDK identifiers (invariant A.0), stamp the identity UA.
         profile = _current_free_identity()
+        # Preserve the station that just failed (the tunnel branch above set
+        # it in the ContextVar before the accident): a disconnect retry must
+        # switch AWAY from it on_disconnect_retry, not re-strike the same IP.
+        _prev_attempt = _current_free_attempt.get() or {}
         _current_free_attempt.set({"ip": _free_usage_ip(),
                                    "identity": profile.get("impersonate") or "",
-                                   "station": None,
+                                   "station": _prev_attempt.get("station"),
                                    "proxy_url": None})
         free_headers = _apply_identity(_free_request_headers(headers), profile)
-        async with _client.stream("POST", endpoint, json=body, headers=free_headers) as resp:
+        async with _ensure_http_client().stream("POST", endpoint, json=body, headers=free_headers) as resp:
             yield resp
         return
-    async with _client.stream("POST", endpoint, json=body, headers=headers) as resp:
+    async with _ensure_http_client().stream("POST", endpoint, json=body, headers=headers) as resp:
         yield resp
 
 
@@ -2256,7 +2304,7 @@ async def _do_request_with_retry(endpoint, body, headers, protocol, retry_on_429
             _debug(f"  → upstream POST {endpoint} attempt {attempt+1}/{max_retries} headers={_sanitize_headers(headers)}")
         t0 = time.monotonic()
         try:
-            resp = await _client.post(endpoint, json=body, headers=headers)
+            resp = await _ensure_http_client().post(endpoint, json=body, headers=headers)
         except httpx.ConnectError as e:
             _debug(f"  ✗ connect error after {(time.monotonic()-t0)*1000:.0f}ms: {e}")
             _log(f"  UPSTREAM CONNECT ERROR: {type(e).__name__}: {e}")
@@ -4094,7 +4142,8 @@ async def messages(request: Request):
                 _debug(f"  [stream] attempt {_attempt+1}/2")
                 try:
                     async with _open_free_stream(endpoint, body, headers, _using_free,
-                                                 count_request=(_attempt == 0)) as resp:
+                                                 count_request=(_attempt == 0),
+                                                 fresh_station=(_attempt > 0 and _using_free)) as resp:
                         _debug(f"  [stream] connected status={resp.status_code}")
                         if resp.status_code != 200:
                             if _using_free:
@@ -4464,7 +4513,8 @@ async def messages(request: Request):
             tool_block_idx = {}  # Reset tracking dict on each retry
             try:
                 async with _open_free_stream(endpoint, oai_body, hdrs, _using_free,
-                                             count_request=(_attempt == 0)) as resp:
+                                             count_request=(_attempt == 0),
+                                             fresh_station=(_attempt > 0 and _using_free)) as resp:
                     if resp.status_code != 200:
                         if _using_free:
                             # Free endpoint non-200 (429 quota, 5xx...) → cooldown
@@ -4711,7 +4761,7 @@ async def health():
         else:
             # Cache miss — perform actual check
             try:
-                resp = await _client.get("https://opencode.ai", timeout=float(yaml_get("background", "health_timeout", 5)))
+                resp = await _ensure_http_client().get("https://opencode.ai", timeout=float(yaml_get("background", "health_timeout", 5)))
                 upstream_ok = resp.status_code < 500
             except Exception:
                 upstream_ok = False
@@ -5031,7 +5081,8 @@ async def chat_completions(request: Request):
                 seen_tool_indices = set()  # dedup tool calls by index
                 try:
                     async with _open_free_stream(endpoint, oai_body, hdrs, _using_free,
-                                             count_request=(_attempt == 0)) as resp:
+                                             count_request=(_attempt == 0),
+                                             fresh_station=(_attempt > 0 and _using_free)) as resp:
                         if resp.status_code != 200:
                             if _using_free:
                                 # Free endpoint non-200 (429 quota, 5xx...) → cooldown
@@ -5349,7 +5400,8 @@ async def chat_completions(request: Request):
         for _attempt in range(yaml_get("streaming", "retry_attempts", 2)):
             try:
                 async with _open_free_stream(endpoint, anthro_body, hdrs, _using_free,
-                                             count_request=(_attempt == 0)) as resp:
+                                             count_request=(_attempt == 0),
+                                             fresh_station=(_attempt > 0 and _using_free)) as resp:
                     if resp.status_code != 200:
                         if _using_free:
                             # Free endpoint non-200 (429 quota, 5xx...) → cooldown

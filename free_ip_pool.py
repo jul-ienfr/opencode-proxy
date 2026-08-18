@@ -58,6 +58,11 @@ class FreeIPPool:
         self._connect_retry_interval = float(self._CONNECT_RETRY_INTERVAL)
         self._bad_ttl = float(self._BAD_TTL)
         self._rotation_stagger = 10  # C3: station N rotates (N-1)*stagger earlier
+        # [17/08] Max seconds on_request waits for a background rotation
+        # when the best station is over-threshold and no other station is
+        # usable. Bounded: on timeout the request falls back to paid (None,
+        # None) instead of serving the burned IP (guaranteed 429 → paid).
+        self._rotation_wait_timeout = 20.0
         # Serialized rotation coordinator (C4/C5): ONE worker drains the
         # queue, so two stations never run physical rotations at the same
         # time. `_pending` dedups stations already queued (single-flight
@@ -278,10 +283,26 @@ class FreeIPPool:
                     per = self._per_station(station)
                     per["last_quota_per_ip"] = station._quota_per_ip
                 else:
+                    # [17/08] No other station usable and THIS one is over
+                    # threshold. Serving its current IP would be a burned IP —
+                    # the free request would 429 → paid on every request while
+                    # the rotation crawls. Kick the rotation and WAIT for it
+                    # (bounded by rotation_wait_timeout): serve the fresh IP
+                    # if it lands (switch_ip resets the counter), else return
+                    # (None, None) → paid now, never a guaranteed 429.
                     logger.info("[free-ip] station %d at threshold (%d/%d), "
-                                "rotating in background (no other station usable)",
-                                station._station, per["request_count"], station._quota_per_ip)
+                                "waiting ≤%.0fs for rotation (no other station usable)",
+                                station._station, per["request_count"],
+                                station._quota_per_ip, self._rotation_wait_timeout)
                     self._kick_connect(station)
+                    if not await self._await_rotation(station):
+                        return None, None
+                    # Keep the station that just landed the fresh IP —
+                    # switch_ip reset its counter, so this request counts
+                    # as the first on the new (model, IP) cooldown key.
+                    self._active_station = station
+                    per = self._per_station(station)
+                    per["last_quota_per_ip"] = station._quota_per_ip
 
             # Only count requests that actually went through the tunnel —
             # when the VPN is down, requests go direct on a residential IP
@@ -370,6 +391,82 @@ class FreeIPPool:
                     time.monotonic() + self._bad_ttl)
         self._launch_rotation(station)
 
+    async def on_disconnect_retry(self, failed: Optional[VPNManager] = None
+                                  ) -> tuple[Optional[str], Optional[VPNManager]]:
+        """Pick a DIFFERENT station for a retry after an upstream disconnect.
+
+        The stream retry loop used to re-strike the SAME station/proxy that
+        just died — under the per-IP quota model a dead IP is a guaranteed
+        failure. It surfaced as a ✘ dashboard row ("Server disconnected
+        without sending a response", 17/08 21:44). A retry is NOT a new
+        request: no counter advance (the failed attempt already consumed its
+        per-IP slot) — this is where it differs from `on_request`.
+
+        Mirrors `on_quota_exhausted`:
+          * no-op when disabled or not in vpn mode → (None, None)
+          * the failed station is bad-marked (C1 guard: only when ANOTHER
+            station is usable, never the last standing one) and rotated in
+            the background — a fresh IP for it, ready for the next request
+          * the retry lands on ``_best_station_excluding(failed)`` — a
+            different station = a different, likely-fresh (model, IP) key
+          * ``failed=None`` (no station known, e.g. a direct fallback) →
+            best station across the pool
+
+        Returns ``(proxy_url, station)``; ``(None, None)`` when no other
+        station is usable right now — the caller falls back to direct/paid
+        instead of burning another attempt on a dead IP.
+        """
+        if not self._vpn.enabled or self._vpn.proxy_mode != "vpn":
+            return None, None
+        await self.ensure_connected()
+        if failed is not None:
+            if self.dual_station:
+                if self._any_other_usable(failed):
+                    self._per_station(failed)["bad_until"] = (
+                        time.monotonic() + self._bad_ttl)
+            self._launch_rotation(failed)
+        st = (self._best_station_excluding(failed)
+              if failed is not None else self._best_station())
+        if st is None:
+            return None, None
+        self._active_station = st
+        return st.socks5_url, st
+
+    async def _await_rotation(self, station: VPNManager) -> bool:
+        """Wait (bounded by ``rotation_wait_timeout``) for a background
+        rotation to finish and land a NEW IP on ``station``.
+
+        Network truth over self-report: the rotation succeeded only when
+        ``station.current_ip`` CHANGED (connect_next's final step, resetting
+        ``request_count`` to 0). A rotation that failed — or never started
+        (still queued behind the other station's rotation) — ends this
+        routine uncleanly. Returns False on timeout/failure; the caller then
+        returns ``(None, None)`` → paid, never the burned IP.
+
+        Concurrent callers share the same in-flight rotation task
+        (``_rotation_tasks`` single-flight), so they all wake on its
+        completion.
+        """
+        burned_ip = station.current_ip
+        deadline = time.monotonic() + self._rotation_wait_timeout
+        while time.monotonic() < deadline:
+            task = self._rotation_tasks.get(station._station)
+            if task is not None and not task.done():
+                remaining = deadline - time.monotonic()
+                try:
+                    if remaining > 0:
+                        await asyncio.wait_for(
+                            asyncio.shield(task), remaining)
+                except asyncio.TimeoutError:
+                    return False
+                return station.current_ip is not None and \
+                    station.current_ip != burned_ip and \
+                    station.status == "connected"
+            # Not in flight yet — either queued behind another station's
+            # rotation (C4 serialized worker) or about to be launched.
+            await asyncio.sleep(0.05)
+        return False
+
     def _launch_rotation(self, station: VPNManager) -> None:
         """Queue a background rotation for one station (C4/C5).
 
@@ -440,6 +537,8 @@ class FreeIPPool:
             self._bad_ttl = max(0.0, float(cfg["bad_ttl"] or 0))
         if "rotation_stagger" in cfg:
             self._rotation_stagger = max(0, int(cfg["rotation_stagger"] or 0))
+        if "rotation_wait_timeout" in cfg:
+            self._rotation_wait_timeout = max(1.0, float(cfg["rotation_wait_timeout"] or 0))
 
     def get_status(self) -> dict:
         """Return pool status for the dashboard (aggregated over stations).

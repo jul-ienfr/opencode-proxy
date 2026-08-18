@@ -373,6 +373,31 @@ class _StubPoolNeverCount(_StubPool):
                              "(the quota counter must not advance on a retry)")
 
 
+class _StubPoolDisconnectRetry:
+    """Pool double for the fresh_station wiring: on_disconnect_retry returns
+    a DIFFERENT (proxy, station); on_request would advance the counter and
+    must never run.
+
+    Records every on_disconnect_retry argument; `return_disconnect` is
+    overridable per instance (e.g. (None, None) when no station is usable).
+    """
+
+    enabled = True
+    active_station = None  # read by _current_free_identity on the direct path
+    calls_to_request = 0
+    calls_to_disconnect = []
+    _return_disconnect = ("socks5://127.0.0.1:1999", 99)
+
+    async def on_request(self):
+        type(self).calls_to_request += 1
+        raise AssertionError("fresh_station=True must not call pool.on_request() "
+                             "(the quota counter must not advance on a retry)")
+
+    async def on_disconnect_retry(self, failed=None):
+        type(self).calls_to_disconnect.append(failed)
+        return self._return_disconnect
+
+
 class _FakeStreamResp:
     """Minimal response double: status + headers, aclose() no-op."""
 
@@ -504,3 +529,96 @@ async def test_open_free_stream_count_false_empty_attempt_direct_fallback(free_e
     # Retry state: station None → the next attempt also falls back direct
     assert attempt.get("station") is None
     assert attempt.get("proxy_url") is None
+
+
+# ── _open_free_stream fresh_station=True: disconnect retry switches station ─
+# The 17/08 21:44 ✘ ("Server disconnected without sending a response"): the
+# retry re-struck the SAME station/IP that just died — guaranteed failure
+# under the per-IP quota model. fresh_station=True asks the pool for a
+# DIFFERENT station WITHOUT advancing the counter (no on_request).
+@pytest.mark.asyncio
+async def test_open_free_stream_fresh_station_switches_station(free_env, monkeypatch):
+    """A disconnect retry (fresh_station=True) must call pool.on_disconnect_retry()
+    with the ContextVar's stored (failed) station and tunnel over the FRESH
+    proxy it returns — on_request() (counter advance) never runs."""
+    pytest.importorskip("curl_cffi")
+    _StubPoolDisconnectRetry.calls_to_request = 0
+    _StubPoolDisconnectRetry.calls_to_disconnect = []
+    _FakeCurlSession.created.clear()
+
+    pool = _StubPoolDisconnectRetry()
+    pool.active_station = None
+    monkeypatch.setattr(oc, "_free_ip_pool", pool)
+    monkeypatch.setattr(oc, "_free_usage_ip", lambda station=None: "9.9.9.9")
+    monkeypatch.setattr("curl_cffi.requests.AsyncSession", _FakeCurlSession)
+
+    def _identity_spy(station=None):
+        return {"impersonate": "firefox144", "user_agent": None, "extra_headers": {}}
+
+    monkeypatch.setattr(oc, "_current_free_identity", _identity_spy)
+
+    # The original attempt landed on station 1; it just disconnected.
+    oc._current_free_attempt.set({"proxy_url": "socks5://127.0.0.1:1080",
+                                  "station": 1,
+                                  "identity": "firefox144",
+                                  "ip": "9.9.9.9"})
+    try:
+        body = {"model": "free-test-model",
+                "messages": [{"role": "user", "content": "hello"}]}
+        async with oc._open_free_stream(oc.API_BASE_FREE, body, dict(PAID_HEADERS),
+                                        use_free=True, count_request=False,
+                                        fresh_station=True) as resp:
+            assert resp.status_code == 200
+    finally:
+        oc._current_free_attempt.set({})
+
+    # Quota counter untouched: on_request() must never run on a retry
+    assert _StubPoolDisconnectRetry.calls_to_request == 0
+    # The pool is told WHICH station failed (from the ContextVar), so it can
+    # exclude it from the pick.
+    assert _StubPoolDisconnectRetry.calls_to_disconnect == [1]
+    # Tunnel ran over the FRESH proxy (socks5h = the socks5 fix) — NOT the
+    # dead station's ContextVar proxy.
+    assert len(_FakeCurlSession.created) == 1
+    sess = _FakeCurlSession.created[0]
+    assert sess["proxy"] == "socks5h://127.0.0.1:1999"
+
+
+@pytest.mark.asyncio
+async def test_open_free_stream_fresh_station_direct_fallback_preserves_station(free_env, monkeypatch):
+    """fresh_station=True but no usable station (on_disconnect_retry returns
+    (None, None)) → direct httpx fallback; the ContextVar KEEPS the failed
+    station so a later retry can still switch away from it instead of
+    re-striking it."""
+    _StubPoolDisconnectRetry.calls_to_request = 0
+    _StubPoolDisconnectRetry.calls_to_disconnect = []
+    fake_client = _FakeHttpxClient()
+
+    pool = _StubPoolDisconnectRetry()
+    pool._return_disconnect = (None, None)  # no station usable right now
+    monkeypatch.setattr(oc, "_free_ip_pool", pool)
+    monkeypatch.setattr(oc, "_client", fake_client)
+
+    oc._current_free_attempt.set({"proxy_url": "socks5://127.0.0.1:1080",
+                                  "station": 1,
+                                  "identity": "",
+                                  "ip": "9.9.9.9"})
+    try:
+        body = {"model": "free-test-model",
+                "messages": [{"role": "user", "content": "hello"}]}
+        async with oc._open_free_stream(oc.API_BASE_FREE, body, dict(PAID_HEADERS),
+                                        use_free=True, count_request=False,
+                                        fresh_station=True) as resp:
+            assert resp.status_code == 200
+        # Capture the re-set ContextVar BEFORE the finally reset
+        attempt = oc._current_free_attempt.get() or {}
+    finally:
+        oc._current_free_attempt.set({})
+
+    assert _StubPoolDisconnectRetry.calls_to_request == 0
+    assert _StubPoolDisconnectRetry.calls_to_disconnect == [1]
+    assert len(fake_client.calls) == 1  # direct httpx fallback ran
+    # The failed station is preserved, not wiped: the next retry can still
+    # switch away from it (on_disconnect_retry(excluded=1)).
+    assert attempt.get("station") == 1
+    assert attempt.get("proxy_url") is None  # no tunnel → proxy None
