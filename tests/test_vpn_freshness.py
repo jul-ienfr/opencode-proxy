@@ -401,6 +401,74 @@ class TestConnectNext:
         with pytest.raises(vm.RotationFailed, match="cooldown"):
             await mgr.connect_next()
 
+    # ── [plan 18/08 §C] rotation died on a DEAD tunnel → egress arm ──
+    @pytest.mark.asyncio
+    async def test_rotation_dead_probe_arms_egress_watchdog(self, tmp_path):
+        """A rotation that dies on a REAL probe failure ("could not
+        determine public IP") hands itself to the egress watchdog:
+        counter armed at the threshold + wake — the next tick repairs
+        (~1 s), not after N idle ticks (the incident's 11 min 45 s
+        stall: the dead rotation then went silent)."""
+        shared = _shared(tmp_path)
+        shared.record_ip("1.1.1.1", 1)
+        mgr = FakeVPNManager(_cfg(tmp_path), shared=shared, tmp_path=tmp_path)
+        mgr.ips = ["1.1.1.1", "1.1.1.1", None]           # recent, recent, dead
+        mgr._watchdog_event = asyncio.Event()            # fake: start() never runs
+        with pytest.raises(vm.RotationFailed, match="public IP"):
+            await mgr.connect_next()
+        assert mgr._rotation_probe_dead is True
+        assert mgr._egress_failures == mgr._auto_wg_egress_ticks
+        assert mgr._watchdog_event.is_set()              # wake → live tick
+
+    @pytest.mark.asyncio
+    async def test_rotation_unchanged_ip_never_arms(self, tmp_path):
+        """"IP unchanged" proves the tunnel ANSWERS — the rotation lost
+        the lottery but the tunnel is alive. No arm: arming on this class
+        would send the watchdog repairing a perfectly healthy tunnel."""
+        shared = _shared(tmp_path)
+        shared.record_ip("1.1.1.1", 1)
+        mgr = FakeVPNManager(_cfg(tmp_path), shared=shared, tmp_path=tmp_path)
+        mgr._current_ip = "1.1.1.1"                      # old_ip non-None
+        mgr.ips = ["1.1.1.1", "1.1.1.1", "1.1.1.1"]      # unchanged ×3
+        mgr._watchdog_event = asyncio.Event()
+        with pytest.raises(vm.RotationFailed, match="unchanged"):
+            await mgr.connect_next()
+        assert mgr._rotation_probe_dead is False
+        assert mgr._egress_failures == 0
+        assert not mgr._watchdog_event.is_set()
+
+    @pytest.mark.asyncio
+    async def test_rotation_arm_is_monotone(self, tmp_path):
+        """max() keeps the counter monotone: an already-armed watchdog
+        (higher counter) stays where it is — no reset, no double logic."""
+        shared = _shared(tmp_path)
+        shared.record_ip("1.1.1.1", 1)
+        mgr = FakeVPNManager(_cfg(tmp_path), shared=shared, tmp_path=tmp_path)
+        mgr.ips = ["1.1.1.1", "1.1.1.1", None]
+        mgr._egress_failures = 5                         # pre-armed higher
+        with pytest.raises(vm.RotationFailed, match="public IP"):
+            await mgr.connect_next()
+        assert mgr._egress_failures == 5
+
+    @pytest.mark.asyncio
+    async def test_rotation_live_probe_after_dead_one_never_arms(self, tmp_path):
+        """Stale-latch guard (audit 6.2): attempt 0 dies on the probe →
+        attempt 1 the probe ANSWERS (tunnel lives) then "unchanged" →
+        the latch must be cleared by the successful probe — arming would
+        send the watchdog repairing a tunnel whose probe just answered,
+        and the WARN "real IP probe never answered" would lie."""
+        shared = _shared(tmp_path)
+        shared.record_ip("1.1.1.1", 1)
+        mgr = FakeVPNManager(_cfg(tmp_path), shared=shared, tmp_path=tmp_path)
+        mgr._current_ip = "1.1.1.1"
+        mgr.ips = [None, "1.1.1.1", "1.1.1.1"]             # dead, live→unchanged ×2
+        mgr._watchdog_event = asyncio.Event()
+        with pytest.raises(vm.RotationFailed, match="unchanged"):
+            await mgr.connect_next()
+        assert mgr._rotation_probe_dead is False           # probe answered
+        assert mgr._egress_failures == 0
+        assert not mgr._watchdog_event.is_set()
+
 
 # ── _watchdog_tick: AUTH_FAILED recovery ────────────────────────
 

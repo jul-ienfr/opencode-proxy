@@ -511,6 +511,12 @@ class VPNManager:
         # on both stacks — the old "stack not WG: counter is meaningless" reset
         # is gone, so detection without traffic works in OV too.
         self._egress_failures = 0
+        # [plan 18/08 §C] a rotation that died probing a REAL public IP
+        # means the tunnel itself is dead — armed once the rotation gives
+        # up so the egress watchdog repairs on the next tick (~1 s wake).
+        # Never set by "IP unchanged"/"recently used" (the tunnel answers
+        # there — the rotation just lost the lottery).
+        self._rotation_probe_dead = False
         self._auto_wg_egress_ticks = max(1, int(cfg.get("auto_wg_egress_ticks", 3)))
         # Armed cadence: while failures are pending the watchdog probes every
         # _egress_failure_tick_interval seconds (light probe only — the docker
@@ -954,6 +960,9 @@ class VPNManager:
 
             old_ip = self._current_ip
             last_error: Optional[Exception] = None
+            # [plan 18/08 §C] per-rotation reset — the flag lives only for
+            # this rotation's lifetime.
+            self._rotation_probe_dead = False
 
             for attempt in range(3):
                 self._set_status(VPNState.CONNECTING)
@@ -986,6 +995,12 @@ class VPNManager:
                     new_ip = await self.get_public_ip()
                     if not new_ip:
                         raise RuntimeError("could not determine public IP")
+                    # [review 18/08 §C] the probe ANSWERED — the tunnel
+                    # lives. Clear the latch: a later "IP unchanged"/
+                    # "recently used" failure is the lottery, not death,
+                    # and must not arm behind an earlier dead probe (the
+                    # final WARN would overstate — attempt 1 did answer).
+                    self._rotation_probe_dead = False
                     if old_ip and new_ip == old_ip:
                         raise RuntimeError(f"IP unchanged after restart ({new_ip})")
                     if self._ip_recent(new_ip) and attempt < 2:
@@ -1015,6 +1030,7 @@ class VPNManager:
                     self._backoff.record_success()
                     self._last_rotation_failed_at = None  # success: clear cooldown
                     self._last_rotation_error = None
+                    self._rotation_probe_dead = False  # success: tunnel answers
                     self.save_state()
                     logger.info("[vpn] rotated → IP %s (switch #%d)", new_ip, self._total_switches)
                     return new_ip
@@ -1027,6 +1043,13 @@ class VPNManager:
                     raise
                 except Exception as e:
                     last_error = e
+                    if "could not determine public IP" in str(e):
+                        # The rotation died asking for a REAL IP through the
+                        # tunnel — the tunnel itself is dead (the 445 s
+                        # stall class, incident 18/08 S2). NOT set on
+                        # "IP unchanged"/"recently used": those prove the
+                        # tunnel answers.
+                        self._rotation_probe_dead = True
                     self._circuit_breaker.record_failure(self._docker_container)
                     self._backoff.record_failure()
                     logger.warning("[vpn] rotation attempt %d/3 failed: %s", attempt + 1, e)
@@ -1041,6 +1064,25 @@ class VPNManager:
             # cooldown (CRITIC(6)) so we don't hammer a dead tunnel.
             self._last_rotation_failed_at = time.monotonic()
             self._last_rotation_error = f"{type(last_error).__name__}: {last_error}"
+            # [plan 18/08 §C] the rotation gave up AND the tunnel never
+            # answered the IP probe: hand off to the egress watchdog —
+            # arm it + wake it so the repair starts on the next tick
+            # (~1 s), not after N idle ticks (the incident's 11 min 45 s
+            # stall: the dead rotation then went silent). max() keeps the
+            # counter monotone (idempotent — an already-armed counter
+            # stays where it is); no manual reset: the tick's light probe
+            # is the single authority and clears it on recovery. No
+            # skipped-tick trace reset needed — the guard is per-ROTATION
+            # task (_skipped_rotation_task, commit 1), and this arm runs
+            # inside the dying rotation itself.
+            if self._rotation_probe_dead:
+                self._egress_failures = max(self._egress_failures,
+                                            self._auto_wg_egress_ticks)
+                if self._watchdog_event is not None:
+                    self._watchdog_event.set()  # loop wait(timeout) returns → live tick
+                logger.warning(
+                    "[vpn] rotation died on a dead tunnel — egress watchdog "
+                    "armed (real IP probe never answered)")
             raise RotationFailed(self._error)
 
     async def connect_wait(self, timeout: float = 120.0) -> bool:
