@@ -16,6 +16,7 @@ proxy_mode:
 """
 
 import os
+import re
 import sys
 import time
 import json
@@ -370,6 +371,30 @@ def _normalize_country(name: str) -> str:
     return _COUNTRY_ALIASES.get(c, c)
 
 
+# [plan 18/08] NordVPN OpenVPN hostnames: 2-letter country code + 2-4 digit
+# server number (uk2757, it460, hu73, de1372). {2,4} NOT {3,4}: 2-digit hosts
+# (hu73/gr80/ee77) would never match and the blacklist would stay silent
+# (Phase 1b/1c dead in silence). OpenVPN verbosity >= 4 (OPENVPN_VERBOSITY=4
+# in compose) logs "Connecting to [<host>]" once per connection attempt.
+_NORDVPN_HOST_RE = re.compile(r"[a-z]{2}[0-9]{2,4}\.nordvpn\.com")
+
+# Blacklist TTL: the OpenVPN sunset kills hosts within a daily window — one
+# wall-clock day covers it, and a host that starts working again simply
+# expires back into rotation.
+_FAILED_HOST_TTL = 24 * 3600
+
+
+def _extract_current_hostname(text: str) -> Optional[str]:
+    """Last NordVPN hostname present in gluetun log text.
+
+    gluetun's SIGUSR1 retry loop re-logs the SAME remote every ~11 s, so
+    the last "Connecting to [...]" line is the host currently in play.
+    None when no hostname is logged (OpenVPN verbosity < 4).
+    """
+    matches = _NORDVPN_HOST_RE.findall(text)
+    return matches[-1] if matches else None
+
+
 class VPNManager:
     """Manages the compose-managed gluetun VPN container.
 
@@ -448,11 +473,21 @@ class VPNManager:
         # default OFF so existing configs/tests keep the legacy random-pool
         # path ([plan] A).
         self._control_api_key = str(cfg.get("control_api_key") or "").strip()
+        # Host-side enable gate [incident 17/08]: config.yaml ships
+        # control_api_key: '' — the real key lives in credentials.env,
+        # expanded INSIDE the container only. `control_enabled` tells the
+        # HOST the control server is deployed; the gate is a BOOL, never
+        # the secret. Defaults to the key being set (backward-compatible).
+        self._control_enabled = bool(cfg.get("control_enabled", bool(self._control_api_key)))
         self._country_rotation = bool(cfg.get("country_rotation", False))
         self._country_offset = max(0, int(cfg.get("country_offset", 0) or 0))
         self._current_country: Optional[str] = None  # pinned country (control server)
         self._country_pinned_at: Optional[float] = None
         self._country_index = 0  # local cursor fallback (no shared state)
+        # [plan 18/08] Hostname blacklist (LIVE AUTH_FAILED, TTL 24 h) —
+        # consumed ONLY by the fast-pin path (Phase 1c); free_ip_pool never
+        # sees it. Wall-clock epoch timestamps so the TTL survives restarts.
+        self._failed_hosts: dict[str, dict] = {}
 
         # Identity rotation (client fingerprint, advanced on IP rotation).
         # identity_diversity (default False, backward-compatible) expands the
@@ -1069,8 +1104,9 @@ class VPNManager:
         # the tunnel is half-dead. Country comes from OUR pinned state (the
         # control API discloses credentials via GET /v1/vpn/settings — we
         # never call it). SOCKS5 probe remains the fallback.
-        if self._control_api_key:
-            if await self._control_status():
+        if self._control_enabled:
+            ctl = await self._control_status()
+            if ctl is True:
                 ctl_ip = await self._control_public_ip()
                 if ctl_ip:
                     self._current_ip = ctl_ip
@@ -1081,10 +1117,14 @@ class VPNManager:
                         "name": self._docker_container,
                         "country": self._current_country or self._server_countries}
                     return self.get_status()
-            else:
+            elif ctl is False:
+                # gluetun itself reports the VPN stopped — honest error, no
+                # SOCKS5 probe needed.
                 self._set_status(VPNState.ERROR)
                 self._error = "gluetun control server reports VPN stopped"
                 return self.get_status()
+            # ctl is None (control server unreachable) → fall through to the
+            # SOCKS5 probe below; "can't ask" must not read as "stopped".
 
         ip = await self.get_public_ip()
         if ip:
@@ -1323,6 +1363,7 @@ class VPNManager:
             # Never the control key itself — the dashboard only needs to
             # know whether control-server auth is armed.
             "control_api_key_set": bool(self._control_api_key),
+            "control_enabled": self._control_enabled,
             "country_rotation": self._country_rotation,
             "country_offset": self._country_offset,
             "current_country": self._current_country,
@@ -1603,7 +1644,7 @@ class VPNManager:
         """True when gluetun reports the VPN running, False when stopped,
         None when the control server is unreachable (fail toward the
         SOCKS5/status fallback chain)."""
-        if not self._control_api_key:
+        if not self._control_enabled:
             return None
         lines = await self._control_exec("GET", "/v1/vpn/status", timeout=5)
         for ln in lines:
@@ -1615,7 +1656,7 @@ class VPNManager:
 
     async def _control_public_ip(self) -> Optional[str]:
         """IP as reported BY gluetun (self-reported, not a tunnel probe)."""
-        if not self._control_api_key:
+        if not self._control_enabled:
             return None
         lines = await self._control_exec("GET", "/v1/publicip/ip", timeout=5)
         for ln in lines:
@@ -1642,7 +1683,7 @@ class VPNManager:
         country immediately — instead of sitting in ``timeout`` (outage
         was ~2 min before this fix).
         """
-        if not self._control_api_key or not country:
+        if not self._control_enabled or not country:
             return False
         country = _normalize_country(country)
         payload = json.dumps(
@@ -1650,16 +1691,23 @@ class VPNManager:
             separators=(",", ":"))
         lines = await self._control_exec(
             "PUT", "/v1/vpn/settings", body=payload, timeout=10)
-        # 204 No Content -> [] is the success signature; any non-empty stdout
-        # is either a JSON error body or a diagnostic line -> failure.
+        # [17/08 live] gluetun v3.41.3 answers a SUCCESSFUL settings PUT
+        # with "200 OK" + body "running" (7 bytes, text/plain) — NOT 204
+        # No Content. We must not treat that body as a rejection, or every
+        # successful pin falls back to the slow --force-recreate path.
+        # Only a non-"running" body is an error response.
         if lines:
-            hint = ""
-            if "choices" in lines[0].lower():
-                hint = (f" (gluetun reported this country name as invalid / "
-                        f"\"not in choices\" — check server_countries)")
-            logger.warning("[vpn] control pin %s rejected: %s%s",
-                           country, lines[0][:200], hint)
-            return False
+            if lines[0].strip().lower() == "running":
+                pass  # accepted — proceed to the status/auth poll below
+            else:
+                hint = ""
+                if "choices" in lines[0].lower():
+                    hint = (f" (gluetun reported this country name as "
+                            f"invalid / \"not in choices\" — check "
+                            f"server_countries)")
+                logger.warning("[vpn] control pin %s rejected: %s%s",
+                               country, lines[0][:200], hint)
+                return False
         # Bound the failure scan to logs written AFTER the pin — a stale
         # AUTH_FAILED from an earlier reconnect in the same container must
         # not abort a healthy pin.
@@ -1728,7 +1776,7 @@ class VPNManager:
         cursor has advanced (the next pin differs), so a "settings left
         unchanged" reply can never repeat a country.
         """
-        if not self._country_rotation or not self._control_api_key:
+        if not self._country_rotation or not self._control_enabled:
             return None
         countries = self._countries_list()
         if len(countries) < 2:
@@ -1752,11 +1800,74 @@ class VPNManager:
             return nxt
         return None
 
+    async def _current_hostname(self, since: str) -> Optional[str]:
+        """Hostname gluetun is currently trying — the LAST "Connecting to
+        [...]" line in container logs written since ``since``. The SIGUSR1
+        retry loop re-logs the same remote every ~11 s, so the last
+        occurrence is the host in play. None when the container is absent
+        or no hostname is logged (verbosity < 4)."""
+        result = await asyncio.to_thread(
+            self._docker_run, ["logs", "--since", since, self._docker_container], 30)
+        if result.returncode != 0:
+            return None
+        return _extract_current_hostname(result.stdout)
+
+    async def _fast_recover_via_control(self, max_skips: int = 3) -> bool:
+        """Recover an AUTH_FAILED/TLS tunnel WITHOUT compose: re-pin the
+        next country via the control API (PUT /v1/vpn/settings — a real
+        stop+start reconnect, ~8-15 s, vs minutes for --force-recreate).
+
+        Skips blacklisted hosts without waiting for their ~11 s SIGUSR1
+        retry cycle: after a successful pin the current hostname is
+        extracted from logs, and a blacklisted host triggers an immediate
+        re-pin (the shared cursor guarantees a different country). A FAILED
+        pin is retried only when a live auth/TLS rejection is visible since
+        the pin (dead-host case — the next country can work); infrastructure
+        failures (control server unreachable, timeout) fall through to the
+        compose path right away instead of burning the remaining attempts.
+
+        Returns True when the tunnel is healthy on a fresh IP; False lets
+        the watchdog's compose path (unchanged) be the escalation. Never
+        calls compose itself — callers run under the same lock, so at most
+        one recovery per tick.
+        """
+        if not self._country_rotation or not self._control_enabled:
+            return False
+        for attempt in range(max_skips + 1):
+            since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            nxt = await self._pin_country_for_rotation()
+            if nxt is None:
+                if await self._check_auth_failed(since) \
+                        or await self._check_server_issue(since):
+                    logger.warning(
+                        "[vpn] fast-pin: still rejecting (attempt %d/%d) — "
+                        "re-pinning a different country",
+                        attempt + 1, max_skips + 1)
+                    continue  # dead host: the next country can work
+                return False  # infra failure: compose path is the escalation
+            host = await self._current_hostname(since)
+            if host and self._host_blacklisted(host):
+                logger.warning(
+                    "[vpn] fast-pin: %s blacklisted — skipping it "
+                    "(attempt %d/%d)", host, attempt + 1, max_skips + 1)
+                continue
+            if await self._finalize_ip(allow_stale=False):
+                self._watchdog_backoff.record_success()
+                self._set_status(VPNState.CONNECTED)
+                self._error = None
+                await self.refresh_status(force=True)
+                self.save_state()
+                logger.info("[vpn] fast-pin: recovered — tunnel healthy (IP %s)",
+                            self._current_ip)
+                return True
+            # Finalize failed to land a fresh IP — try the next country.
+        return False
+
     def _next_country_preview(self) -> Optional[str]:
         """Best-effort preview of the next pinned country for the dashboard
         (the 'next country' cell). Mirrors _pin_country_for_rotation's pick
         WITHOUT advancing the shared cursor or the local fallback cursor."""
-        if not self._country_rotation or not self._control_api_key:
+        if not self._country_rotation or not self._control_enabled:
             return None
         countries = self._countries_list()
         if len(countries) < 2:
@@ -1814,30 +1925,85 @@ class VPNManager:
     async def _check_auth_failed(self, started_at: str = "") -> bool:
         """Scan container logs for AUTH_FAILED (OpenVPN auth rejection).
 
-        Bound the scan to logs since the container's last start (StartedAt):
-        an AUTH_FAILED logged before the last restart is stale (resolved by
-        that restart) and must not flip the state to ERROR. Falls back to a
-        10-minute window when the start time is unknown.
+        RECOVERY-AWARE ([incident 17/08]: gluetun's OpenVPN retry loop logs
+        an AUTH_FAILED push then lands on a working server and prints
+        "Initialization Sequence Completed" — the failure is recovered, not
+        live. An AUTH_FAILED before the LAST successful sequence is stale
+        and must not flip the state to ERROR; only an AUTH_FAILED AFTER the
+        last success (or with no success at all) is a live rejection. This
+        also covers the old StartedAt-bounding case: a pre-restart failure
+        in the window is likewise followed by a success after the restart.
+        Falls back to a 10-minute window when the start time is unknown.
         """
         since = started_at if started_at else "10m"
         result = await asyncio.to_thread(
             self._docker_run, ["logs", "--since", since, self._docker_container], 30)
         if result.returncode != 0:
             return False
-        return "AUTH_FAILED" in result.stdout or "auth failed" in result.stdout.lower()
+        text = result.stdout
+        if "AUTH_FAILED" not in text and "auth failed" not in text.lower():
+            return False                       # never auth-failed
+        # Recovered tunnel: the last logged openvpn success supersedes the
+        # last AUTH_FAILED. rfind on the chunk is cheap (str scan).
+        if text.rfind("Initialization Sequence Completed") < text.rfind("AUTH_FAILED"):
+            # [plan 18/08] LIVE rejection (after the last success) — blacklist
+            # the current hostname for fast-pin (Phase 1c). Recorded only
+            # here, where live-ness is already established: an AUTH_FAILED
+            # superseded by a success must never poison the blacklist.
+            self._record_auth_failure(text)
+            return True
+        return False
+
+    def _record_auth_failure(self, text: str) -> None:
+        """Blacklist the current NordVPN hostname after a LIVE AUTH_FAILED.
+
+        The caller has already established the rejection is live (no later
+        "Initialization Sequence Completed"). The blacklist is consumed ONLY
+        by the fast-pin path (Phase 1c) — free_ip_pool never sees it. TTL
+        24 h covers the daily sunset window; a host that works again simply
+        expires back into rotation.
+        """
+        host = _extract_current_hostname(text)
+        if not host:
+            return  # verbosity < 4: no hostname in logs — nothing to blacklist
+        now = time.time()
+        entry = self._failed_hosts.get(host)
+        if entry is None:
+            entry = {"failures": 0, "first_failed_at": now, "bad_until": 0.0}
+            self._failed_hosts[host] = entry
+        entry["failures"] += 1
+        entry["bad_until"] = now + _FAILED_HOST_TTL
+        logger.warning(
+            "[vpn] AUTH_FAILED on %s (failure #%d, TTL 24h) — fast-pin will skip it",
+            host, entry["failures"])
+
+    def _host_blacklisted(self, host: str) -> bool:
+        """True while a host is inside its 24 h blacklist window. Prunes the
+        entry when it expires, so the dict never grows unbounded."""
+        entry = self._failed_hosts.get(host)
+        if entry is None:
+            return False
+        if time.time() >= entry.get("bad_until", 0):
+            del self._failed_hosts[host]
+            return False
+        return True
 
     async def _check_server_issue(self, started_at: str = "") -> bool:
         """Scan container logs for a TLS negotiation failure (stale server
         IP or crashed server — gluetun's 🔌 'server no longer valid'
         guidance). Detection: the raw openvpn line that guidance attaches to
-        in internal/openvpn/logs.go. Same StartedAt-bounding as
-        _check_auth_failed."""
+        in internal/openvpn/logs.go. Same recovery-aware bounding as
+        _check_auth_failed: a TLS failure superseded by a later successful
+        connection is stale, not live."""
         since = started_at if started_at else "10m"
         result = await asyncio.to_thread(
             self._docker_run, ["logs", "--since", since, self._docker_container], 30)
         if result.returncode != 0:
             return False
-        return "tls key negotiation failed" in result.stdout.lower()
+        text = result.stdout.lower()
+        if "tls key negotiation failed" not in text:
+            return False
+        return text.rfind("initialization sequence completed") < text.rfind("tls key negotiation failed")
 
     async def _wait_healthy(self, timeout: float = 120.0) -> Optional[str]:
         """Wait until the container runs AND the SOCKS5 tunnel answers.
@@ -2148,6 +2314,14 @@ class VPNManager:
             kind = "AUTH_FAILED" if self._auth_failed else "TLS negotiation timeout"
             logger.warning("[vpn-watchdog] %s detected — restarting %s",
                            kind, self._docker_container)
+            # [plan 18/08] Fast recovery via the control API BEFORE compose:
+            # re-pin the next country (PUT /v1/vpn/settings) — a real
+            # stop+start reconnect in ~8-15 s with zero compose, vs minutes
+            # for a --force-recreate. Skips blacklisted hosts. On failure
+            # the compose path below (unchanged) is the escalation; same
+            # lock, so at most one recovery action per tick.
+            if await self._fast_recover_via_control(max_skips=3):
+                return
             try:
                 # _ensure_container() recreates via compose (--force-recreate)
                 # because the last restart FAILED: a plain `docker restart`
@@ -2275,6 +2449,8 @@ class VPNManager:
                 "current_ip": self._current_ip,
                 "identity_index": self._identity_index,
                 "current_country": self._current_country,
+                # [plan 18/08] hostname blacklist (wall-clock TTL)
+                "failed_hosts": self._failed_hosts,
                 "saved_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             }
             state_path = self._get_state_path()
@@ -2322,6 +2498,13 @@ class VPNManager:
             restored_country = state.get("current_country")
             if isinstance(restored_country, str) and restored_country:
                 self._current_country = _normalize_country(restored_country)
+            # [plan 18/08] Restore the hostname blacklist; prune entries whose
+            # 24 h window has passed (wall-clock epoch, monotonic-independent).
+            now = time.time()
+            self._failed_hosts = {
+                k: v for k, v in state.get("failed_hosts", {}).items()
+                if isinstance(v, dict) and v.get("bad_until", 0) > now
+            }
             logger.info("[vpn] state loaded: %d IPs in history, %d total switches",
                         len(self._ip_history), self._total_switches)
         except Exception as e:

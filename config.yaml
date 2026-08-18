@@ -121,6 +121,7 @@ ip_rotation:
   shared_rotation_file: logs/shared_rotation.json
   server_provider: nordvpn
   control_api_key: ''
+  control_enabled: true
   country_rotation: true
   country_offset: 14
   docker_events: true

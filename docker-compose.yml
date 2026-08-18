@@ -52,6 +52,11 @@ services:
     environment:
       - VPN_SERVICE_PROVIDER=nordvpn
       - VPN_TYPE=openvpn
+      # [plan 18/08] verbosity 4 exposes the hostname in the log line
+      # "Connecting to [uk1234.nordvpn.com]" — at the default verbosity (1)
+      # no hostname is logged, so AUTH_FAILED hosts could never be blacklisted
+      # nor fast-pinned (Phase 1b/1c). Cost: ~1 line per connection attempt.
+      - OPENVPN_VERBOSITY=4
       # [incident 17/08] gluetun's country enum uses SPACED names
       # ("United Kingdom", "Czech Republic") — NordVPN file-style
       # "United_Kingdom"/"Czechia" are rejected with a WARN "not in
@@ -119,6 +124,11 @@ services:
     environment:
       - VPN_SERVICE_PROVIDER=nordvpn
       - VPN_TYPE=openvpn
+      # [plan 18/08] verbosity 4 exposes the hostname in the log line
+      # "Connecting to [uk1234.nordvpn.com]" — at the default verbosity (1)
+      # no hostname is logged, so AUTH_FAILED hosts could never be blacklisted
+      # nor fast-pinned (Phase 1b/1c). Cost: ~1 line per connection attempt.
+      - OPENVPN_VERBOSITY=4
       # [incident 17/08] gluetun's country enum uses SPACED names
       # ("United Kingdom", "Czech Republic") — NordVPN file-style
       # "United_Kingdom"/"Czechia" are rejected with a WARN "not in
