@@ -49,9 +49,15 @@ services:
       - "127.0.0.1:1080:1080"    # SOCKS5 proxy (loopback only)
     env_file:
       - credentials.env
+      # [plan 18/08 §2b/3a] NordLynx key — always loaded, inert while
+      # VPN_TYPE=openvpn (gluetun ignores settings of the unselected type).
+      - vpn_configs/wireguard.env
     environment:
       - VPN_SERVICE_PROVIDER=nordvpn
-      - VPN_TYPE=openvpn
+      # [plan 18/08 §3a] stack per station, driven by the .env next to this
+      # compose file (VPN_TYPE_STATION{1,2}); defaults to openvpn so the
+      # file works on a fresh clone (Phase 1 stays armed as fallback).
+      - VPN_TYPE=${VPN_TYPE_STATION1:-openvpn}
       # [plan 18/08] verbosity 4 exposes the hostname in the log line
       # "Connecting to [uk1234.nordvpn.com]" — at the default verbosity (1)
       # no hostname is logged, so AUTH_FAILED hosts could never be blacklisted
@@ -121,9 +127,15 @@ services:
       - "127.0.0.1:1081:1081"    # SOCKS5 proxy (loopback only)
     env_file:
       - credentials.env
+      # [plan 18/08 §2b/3a] NordLynx key — always loaded, inert while
+      # VPN_TYPE=openvpn (gluetun ignores settings of the unselected type).
+      - vpn_configs/wireguard.env
     environment:
       - VPN_SERVICE_PROVIDER=nordvpn
-      - VPN_TYPE=openvpn
+      # [plan 18/08 §3a] stack per station, driven by the .env next to this
+      # compose file (VPN_TYPE_STATION{1,2}); defaults to openvpn so the
+      # file works on a fresh clone (Phase 1 stays armed as fallback).
+      - VPN_TYPE=${VPN_TYPE_STATION2:-openvpn}
       # [plan 18/08] verbosity 4 exposes the hostname in the log line
       # "Connecting to [uk1234.nordvpn.com]" — at the default verbosity (1)
       # no hostname is logged, so AUTH_FAILED hosts could never be blacklisted

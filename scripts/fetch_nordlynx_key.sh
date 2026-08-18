@@ -7,12 +7,13 @@
 # account (NordGen issue #26: one access token, one private key per
 # account, 10 devices max) — so ONE file is shared by both stations.
 #
-#   NORDVPN_ACCESS_TOKEN=<64-hex token> ./scripts/fetch_nordlynx_key.sh
-#   ./scripts/fetch_nordlynx_key.sh <64-hex token>      # arg form
+#   NORDVPN_ACCESS_TOKEN=<64-char token> ./scripts/fetch_nordlynx_key.sh
+#   ./scripts/fetch_nordlynx_key.sh <64-char token>     # arg form
 #
 # Token source: dashboard my.nordaccount.com or `nordvpn token`.
-# Exchange (constant from NordGen sources):
-#   curl -s -u "<TOKEN>:" "https://api.nordvpn.com/v1/users/services/credentials"
+# Exchange (verified against live API 18/08 — auth is basic with the
+# literal username "token", NOT the token as username):
+#   curl -s -u "token:<TOKEN>" "https://api.nordvpn.com/v1/users/services/credentials"
 #   → {"nordlynx_private_key": "<base64>"}
 #
 # Writes vpn_configs/wireguard.env (gitignored, chmod 600, same regime
@@ -35,8 +36,8 @@ if [[ -z "$TOKEN" ]]; then
     echo "token = 64-hex NordVPN access token (dashboard my.nordaccount.com)" >&2
     exit 1
 fi
-if [[ ! "$TOKEN" =~ ^[0-9a-f]{64}$ ]]; then
-    echo "error: token must be exactly 64 hex chars (got ${#TOKEN})" >&2
+if [[ ! "$TOKEN" =~ ^[A-Za-z0-9]{64}$ ]]; then
+    echo "error: token must be exactly 64 alphanumeric chars (got ${#TOKEN})" >&2
     exit 1
 fi
 
@@ -46,7 +47,7 @@ if [[ -f "$OUT" && "$FORCE" != 1 ]]; then
 fi
 
 echo "exchanging access token for NordLynx key…" >&2
-RESP="$(curl -sS -u "$TOKEN:" "https://api.nordvpn.com/v1/users/services/credentials")"
+RESP="$(curl -sS -u "token:$TOKEN" "https://api.nordvpn.com/v1/users/services/credentials")"
 KEY="$(printf '%s' "$RESP" | sed -n 's/.*"nordlynx_private_key"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
 if [[ -z "$KEY" ]]; then
     echo "error: no nordlynx_private_key in response: $RESP" >&2
