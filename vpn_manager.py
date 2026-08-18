@@ -541,6 +541,19 @@ class VPNManager:
         # reconnect (8-15 s). Hardcoded on purpose — rotation_max_duration
         # (global wall) is the single tunable rotation knob.
         self._rotation_recovery_timeout = 45.0
+        # [plan 18/08 §D] Global wall for a whole rotation (config
+        # rotation_max_duration, default 240 s): _connect_next_impl burns
+        # at most this before giving up — the dead-tunnel incident ran
+        # 10-13 min (unbounded 3 × pin/restart + probes). Per-attempt
+        # floor of 1 s keeps a near-deadline essay from being starved
+        # mid-primitive. am.8 accounting: a timeout must not race a live
+        # docker thread (asyncio.to_thread is not cancellable) — the funnel
+        # in _docker_run counts in-flight ops and _await_rotation_ops_drained
+        # waits for their REAL end before the next attempt.
+        self._rotation_max_duration = max(5.0, float(cfg.get("rotation_max_duration", 240.0)))
+        self._rotation_op_count = 0
+        self._rotation_op_event: Optional[asyncio.Event] = None
+        self._rotation_loop: Optional[asyncio.AbstractEventLoop] = None
         # Pool-signal observability (am.23): the last real connection-
         # failure report (time + count) and the skipped-tick trace — per
         # ROTATION TASK, not a global flag (a flag that resets on any normal
@@ -963,101 +976,171 @@ class VPNManager:
             # [plan 18/08 §C] per-rotation reset — the flag lives only for
             # this rotation's lifetime.
             self._rotation_probe_dead = False
+            # [plan 18/08 §D] global wall: the whole rotation (all 3
+            # attempts) burns at most rotation_max_duration before giving
+            # up — the dead-tunnel incident ran 10-13 min with no bound.
+            # Per-attempt floor of 1 s (max(1.0, remaining)) keeps a
+            # near-deadline essay from being starved mid-primitive.
+            deadline = self._now_fn() + self._rotation_max_duration
+            # am.8 rotation-scoped op accounting: _docker_run's funnel
+            # counts in-flight docker threads against this event so a
+            # deadline can wait for their REAL end (asyncio.to_thread is
+            # not cancellable) before the next attempt — a second
+            # pin/compose must never race the first. Torn down in the
+            # finally below (success, exhaustion, or client cancel).
+            self._rotation_loop = asyncio.get_running_loop()
+            self._rotation_op_event = asyncio.Event()
+            self._rotation_op_count = 0
 
-            for attempt in range(3):
-                self._set_status(VPNState.CONNECTING)
-                self._error = None
-                try:
-                    # Country rotation first: the control-server pin IS the
-                    # reconnect (PUT settings -> stop+start) and the cursor
-                    # always advances, so consecutive pins never repeat a
-                    # country. When the pin is unavailable or fails, fall
-                    # through to the legacy container-restart branch.
-                    pinned = await self._pin_country_for_rotation()
-                    if pinned is None:
-                        await self._ensure_container()
-                        started_at = await self._wait_healthy(timeout=120)
-                        if started_at is None:
-                            raise RuntimeError("gluetun not healthy after restart")
-                        if await self._check_auth_failed(started_at):
-                            self._auth_failed = True
-                            self._current_ip = None  # stale IP must not be served ([5])
-                            raise RuntimeError("AUTH_FAILED after restart")
-                        self._auth_failed = False
+            async def _attempt() -> str:
+                # One rotation attempt: pin country via the control server
+                # (a real reconnect when it works), else the legacy
+                # container-restart branch; then probe a REAL IP through the
+                # tunnel. Returns the new IP on success; raises on failure
+                # (dead probe / unchanged / recent). Extracted so each
+                # attempt can run under asyncio.wait_for(deadline).
+                # Country rotation first: the control-server pin IS the
+                # reconnect (PUT settings -> stop+start) and the cursor
+                # always advances, so consecutive pins never repeat a
+                # country. When the pin is unavailable or fails, fall
+                # through to the legacy container-restart branch.
+                pinned = await self._pin_country_for_rotation()
+                if pinned is None:
+                    await self._ensure_container()
+                    started_at = await self._wait_healthy(timeout=120)
+                    if started_at is None:
+                        raise RuntimeError("gluetun not healthy after restart")
+                    if await self._check_auth_failed(started_at):
+                        self._auth_failed = True
+                        self._current_ip = None  # stale IP must not be served ([5])
+                        raise RuntimeError("AUTH_FAILED after restart")
+                    self._auth_failed = False
+                else:
+                    # The pin polled status:running inside the control
+                    # server — the tunnel is up; no container action.
+                    self._auth_failed = False
+
+                # Let the new tunnel stabilize before probing the IP
+                await asyncio.sleep(self._switch_delay)
+
+                new_ip = await self.get_public_ip()
+                if not new_ip:
+                    raise RuntimeError("could not determine public IP")
+                # [review 18/08 §C] the probe ANSWERED — the tunnel
+                # lives. Clear the latch: a later "IP unchanged"/
+                # "recently used" failure is the lottery, not death,
+                # and must not arm behind an earlier dead probe (the
+                # final WARN would overstate — attempt 1 did answer).
+                self._rotation_probe_dead = False
+                if old_ip and new_ip == old_ip:
+                    raise RuntimeError(f"IP unchanged after restart ({new_ip})")
+                if self._ip_recent(new_ip) and attempt < 2:
+                    raise RuntimeError(f"IP {new_ip} recently used")
+
+                # Success — advance the identity BEFORE journalizing so
+                # the history entry carries the NEW face ([plan] C.2 —
+                # the old order logged the pre-advance identity).
+                self._current_ip = new_ip
+                self._current_server = {
+                    "name": self._docker_container,
+                    "country": self._current_country or self._server_countries}
+                self._connected_at = time.monotonic()
+                self._set_status(VPNState.CONNECTED)
+                self._total_switches += 1
+                self._record_ip_change(new_ip)
+                self._advance_identity()
+                self._ip_history.append({
+                    "ip": new_ip,
+                    "server": self._docker_container,
+                    "time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "identity": self._live_identity.get("impersonate") or "",
+                    "identity_index": self._identity_index,
+                })
+                self._ip_history = self._ip_history[-100:]
+                self._circuit_breaker.record_success(self._docker_container)
+                self._backoff.record_success()
+                self._last_rotation_failed_at = None  # success: clear cooldown
+                self._last_rotation_error = None
+                self._rotation_probe_dead = False  # success: tunnel answers
+                self.save_state()
+                logger.info("[vpn] rotated → IP %s (switch #%d)", new_ip, self._total_switches)
+                return new_ip
+
+            deadline_hit = False
+            try:
+                for attempt in range(3):
+                    if self._now_fn() >= deadline:
+                        # The wall is gone — a new attempt could only
+                        # overshoot it. last_error may still be None when
+                        # the wall expired before the first attempt.
+                        deadline_hit = True
+                        last_error = last_error or RuntimeError("rotation wall exceeded")
+                        break
+                    remaining = deadline - self._now_fn()
+                    self._set_status(VPNState.CONNECTING)
+                    self._error = None
+                    try:
+                        new_ip = await asyncio.wait_for(
+                            _attempt(), max(1.0, remaining))
+                    except asyncio.CancelledError:
+                        # Client disconnect mid-rotation must not leave the
+                        # state stuck in CONNECTING ([17]).
+                        self._set_status(VPNState.ERROR)
+                        self._error = "rotation cancelled by client disconnect"
+                        raise
+                    except asyncio.TimeoutError:
+                        # The attempt burnt its budget. am.8: whatever
+                        # docker op it left running is NOT finished
+                        # (to_thread cannot be cancelled) — wait for its
+                        # real end so the next attempt (or the repair rung)
+                        # never races it. The loop-top check then decides:
+                        # budget left → next attempt, else bail.
+                        deadline_hit = True
+                        last_error = RuntimeError("rotation deadline exceeded")
+                        self._circuit_breaker.record_failure(self._docker_container)
+                        self._backoff.record_failure()
+                        logger.warning(
+                            "[vpn] rotation attempt %d/3 hit the %.0f s wall — "
+                            "draining in-flight docker op", attempt + 1,
+                            self._rotation_max_duration)
+                        await self._await_rotation_ops_drained()
+                    except Exception as e:
+                        last_error = e
+                        if "could not determine public IP" in str(e):
+                            # The rotation died asking for a REAL IP through
+                            # the tunnel — the tunnel itself is dead (the
+                            # 445 s stall class, incident 18/08 S2). NOT set
+                            # on "IP unchanged"/"recently used": those prove
+                            # the tunnel answers.
+                            self._rotation_probe_dead = True
+                        self._circuit_breaker.record_failure(self._docker_container)
+                        self._backoff.record_failure()
+                        logger.warning("[vpn] rotation attempt %d/3 failed: %s",
+                                       attempt + 1, e)
+                        if attempt < 2:
+                            # Cap the retry pause to the remaining wall so a
+                            # late backoff (≤ 60 s) cannot push the rotation
+                            # past its deadline.
+                            await asyncio.sleep(
+                                min(self._backoff.delay, max(0.05, remaining)))
                     else:
-                        # The pin polled status:running inside the control
-                        # server — the tunnel is up; no container action.
-                        self._auth_failed = False
-
-                    # Let the new tunnel stabilize before probing the IP
-                    await asyncio.sleep(self._switch_delay)
-
-                    new_ip = await self.get_public_ip()
-                    if not new_ip:
-                        raise RuntimeError("could not determine public IP")
-                    # [review 18/08 §C] the probe ANSWERED — the tunnel
-                    # lives. Clear the latch: a later "IP unchanged"/
-                    # "recently used" failure is the lottery, not death,
-                    # and must not arm behind an earlier dead probe (the
-                    # final WARN would overstate — attempt 1 did answer).
-                    self._rotation_probe_dead = False
-                    if old_ip and new_ip == old_ip:
-                        raise RuntimeError(f"IP unchanged after restart ({new_ip})")
-                    if self._ip_recent(new_ip) and attempt < 2:
-                        raise RuntimeError(f"IP {new_ip} recently used")
-
-                    # Success — advance the identity BEFORE journalizing so
-                    # the history entry carries the NEW face ([plan] C.2 —
-                    # the old order logged the pre-advance identity).
-                    self._current_ip = new_ip
-                    self._current_server = {
-                        "name": self._docker_container,
-                        "country": self._current_country or self._server_countries}
-                    self._connected_at = time.monotonic()
-                    self._set_status(VPNState.CONNECTED)
-                    self._total_switches += 1
-                    self._record_ip_change(new_ip)
-                    self._advance_identity()
-                    self._ip_history.append({
-                        "ip": new_ip,
-                        "server": self._docker_container,
-                        "time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                        "identity": self._live_identity.get("impersonate") or "",
-                        "identity_index": self._identity_index,
-                    })
-                    self._ip_history = self._ip_history[-100:]
-                    self._circuit_breaker.record_success(self._docker_container)
-                    self._backoff.record_success()
-                    self._last_rotation_failed_at = None  # success: clear cooldown
-                    self._last_rotation_error = None
-                    self._rotation_probe_dead = False  # success: tunnel answers
-                    self.save_state()
-                    logger.info("[vpn] rotated → IP %s (switch #%d)", new_ip, self._total_switches)
-                    return new_ip
-
-                except asyncio.CancelledError:
-                    # Client disconnect mid-rotation must not leave the
-                    # state stuck in CONNECTING ([17]).
-                    self._set_status(VPNState.ERROR)
-                    self._error = "rotation cancelled by client disconnect"
-                    raise
-                except Exception as e:
-                    last_error = e
-                    if "could not determine public IP" in str(e):
-                        # The rotation died asking for a REAL IP through the
-                        # tunnel — the tunnel itself is dead (the 445 s
-                        # stall class, incident 18/08 S2). NOT set on
-                        # "IP unchanged"/"recently used": those prove the
-                        # tunnel answers.
-                        self._rotation_probe_dead = True
-                    self._circuit_breaker.record_failure(self._docker_container)
-                    self._backoff.record_failure()
-                    logger.warning("[vpn] rotation attempt %d/3 failed: %s", attempt + 1, e)
-                    if attempt < 2:
-                        await asyncio.sleep(self._backoff.delay)
+                        return new_ip
+            finally:
+                # [plan 18/08 §D] tear down the rotation-scoped op
+                # accounting (success, exhaustion, or client cancel). A
+                # racing thread's funnel keeps its own loop/event refs and
+                # call_soon_threadsafe is safe after this (no-op loop).
+                self._rotation_loop = None
+                self._rotation_op_event = None
+                self._rotation_op_count = 0
 
             self._set_status(VPNState.ERROR)
-            self._error = f"IP rotation failed after 3 attempts (last: {last_error})"
+            if deadline_hit:
+                self._error = (
+                    f"IP rotation gave up after {self._rotation_max_duration:.0f}s"
+                    f" (wall; last: {last_error})")
+            else:
+                self._error = f"IP rotation failed after 3 attempts (last: {last_error})"
             logger.error("[vpn] %s", self._error)
             # CRITIC(5): a failed rotation is a failure, not a silent None —
             # raise so callers can react honestly. Also arm the fail-fast
@@ -1585,6 +1668,7 @@ class VPNManager:
             "auto_wg_egress_ticks": self._auto_wg_egress_ticks,
             "control_pin_timeout": self._control_pin_timeout,
             "control_pin_catchup": self._control_pin_catchup,
+            "rotation_max_duration": self._rotation_max_duration,
             "watchdog_backoff_base": self._watchdog_backoff._base_delay,
             "watchdog_backoff_max": self._watchdog_backoff._max_delay,
             "identity_rotation": self._identity_rotation_enabled,
@@ -1667,7 +1751,8 @@ class VPNManager:
                 ("ip_probe_budget", float, 1.0),
                 ("auto_wg_egress_ticks", int, 1),
                 ("control_pin_timeout", float, 5.0),
-                ("control_pin_catchup", float, 0.0)):
+                ("control_pin_catchup", float, 0.0),
+                ("rotation_max_duration", float, 5.0)):
             if _key not in updates:
                 continue
             try:
@@ -1785,7 +1870,22 @@ class VPNManager:
     # ── Docker helpers (all blocking — run via asyncio.to_thread) ──
 
     def _docker_run(self, args: list[str], timeout: int = 30) -> subprocess.CompletedProcess:
-        """Run a docker CLI command (blocking — call via asyncio.to_thread)."""
+        """Run a docker CLI command (blocking — call via asyncio.to_thread).
+
+        [plan 18/08 §D am.8] Rotation-op funnel: while a rotation is in
+        flight (_rotation_loop set by _connect_next_impl), count in-flight
+        docker threads and signal their REAL end via the rotation op event
+        (call_soon_threadsafe from the worker). asyncio.to_thread is NOT
+        cancellable — a rotation deadline must wait for the thread to
+        actually finish before launching the next attempt, or a second
+        pin/compose would race the first. Reads/writes of the count are
+        single-word ops (GIL-stable) and the increment happens before
+        subprocess.run (which releases the GIL anyway).
+        """
+        loop = self._rotation_loop
+        op_ev = self._rotation_op_event
+        if loop is not None and op_ev is not None:
+            self._rotation_op_count += 1
         try:
             return subprocess.run(
                 ["docker", *args],
@@ -1795,6 +1895,26 @@ class VPNManager:
             )
         except FileNotFoundError:
             raise RuntimeError("docker CLI not found on PATH")
+        finally:
+            if loop is not None and op_ev is not None:
+                self._rotation_op_count = max(0, self._rotation_op_count - 1)
+                loop.call_soon_threadsafe(op_ev.set)
+
+    async def _await_rotation_ops_drained(self) -> None:
+        """[plan 18/08 §D am.8] Wait for in-flight docker threads to end.
+
+        Called when a rotation attempt hits the wall — the worker thread is
+        inside asyncio.to_thread and CANNOT be cancelled, so a subsequent
+        attempt (or the repair rung) must wait for its real finish before
+        issuing another docker primitive, or two pins/composes would race
+        each other. Level-triggered hazard: op_ev may already be set when
+        we look (the real end raced our drain) — clear BEFORE each wait so
+        a stale set cannot return us early while an op is still running.
+        """
+        while self._rotation_op_count > 0:
+            self._rotation_op_event.clear()
+            if self._rotation_op_count > 0:
+                await self._rotation_op_event.wait()
 
     async def _docker_inspect(self) -> dict:
         """Inspect the gluetun container. Returns {} if absent or docker unavailable."""

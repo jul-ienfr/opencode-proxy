@@ -41,6 +41,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
@@ -120,6 +121,7 @@ class FakeVPNManager(vm.VPNManager):
         else:
             self._stack_effective = "wireguard" if os.path.exists(self._wg_key_file) else "openvpn"
         self.ips = []                       # FIFO answers for get_public_ip()
+        self.probe_delay = 0.0              # sleep before answering (wall test)
         self.container_present = True
         self.log_text = ""                  # container logs: AUTH_FAILED marker
         self.clear_logs_on_restart = True
@@ -164,6 +166,8 @@ class FakeVPNManager(vm.VPNManager):
         return "2026-01-01T00:00:00Z"
 
     async def get_public_ip(self):
+        if self.probe_delay:
+            await asyncio.sleep(self.probe_delay)
         if self.ips:
             return self.ips.pop(0)
         return None
@@ -468,6 +472,85 @@ class TestConnectNext:
         assert mgr._rotation_probe_dead is False           # probe answered
         assert mgr._egress_failures == 0
         assert not mgr._watchdog_event.is_set()
+
+    # ── [plan 18/08 §D] rotation wall — per-attempt deadline ────
+    @pytest.mark.asyncio
+    async def test_rotation_hits_wall_raises_and_cleans_up(self, tmp_path):
+        """The global wall (rotation_max_duration) caps the whole rotation:
+        a slow probe that would take 1.5 s runs under wait_for(max(1.0,
+        remaining)) → TimeoutError → drain (no op in flight) → loop-top sees
+        the deadline gone → RotationFailed naming the wall. The rotation-
+        scoped op accounting is torn down (no leak into the next rotation)."""
+        shared = _shared(tmp_path)
+        mgr = FakeVPNManager(_cfg(tmp_path), shared=shared, tmp_path=tmp_path)
+        mgr._rotation_max_duration = 0.3                   # floor is 5 s at init,
+        # so poke the attr directly — the wall semantics are what is tested.
+        mgr.ips = ["1.1.1.1"]                              # the probe never answers
+        mgr.probe_delay = 1.5                              # slower than the budget
+        with pytest.raises(vm.RotationFailed, match="wall"):
+            await mgr.connect_next()
+        assert mgr._status == vm.VPNState.ERROR
+        assert mgr.ips == ["1.1.1.1"]                      # probe 1 started, 0 answered
+        assert mgr._rotation_probe_dead is False           # no probe evidence
+        assert mgr._egress_failures == 0                   # wall ≠ dead tunnel
+        # cleanup: a new rotation must not inherit the old accounting
+        assert mgr._rotation_op_count == 0
+        assert mgr._rotation_op_event is None
+        assert mgr._rotation_loop is None
+
+    @pytest.mark.asyncio
+    async def test_rotation_wall_threshold_but_crosses_it(self, tmp_path):
+        """A generous budget lets the rotation CROSS an early failure — the
+        wait_for wrapper is per-ATTEMPT, not a one-shot: attempt 0 dies on a
+        dead probe, backoff pause is capped to the remaining wall, attempt 1
+        succeeds and returns the fresh IP (extraction regression)."""
+        shared = _shared(tmp_path)
+        mgr = FakeVPNManager(_cfg(tmp_path), shared=shared, tmp_path=tmp_path)
+        mgr._current_ip = "1.1.1.1"
+        mgr.ips = [None, "2.2.2.2"]                        # dead probe, then fresh
+        await mgr.connect_next()
+        assert mgr._status == vm.VPNState.CONNECTED
+        assert mgr._current_ip == "2.2.2.2"
+        assert mgr._rotation_probe_dead is False           # the answer cleared it
+        assert mgr._ip_history[-1]["ip"] == "2.2.2.2"
+        assert mgr._rotation_op_count == 0                 # torn down on success
+        assert mgr._rotation_op_event is None
+        assert mgr._rotation_loop is None
+
+    @pytest.mark.asyncio
+    async def test_drain_waits_for_real_thread_end(self, tmp_path):
+        """am.8 unit: when a rotation deadline expires while a docker op is
+        still running (asyncio.to_thread is NOT cancellable), the drain waits
+        for its REAL end — including the level-triggered hazard where op_ev
+        is already set (clear lands a whole cycle, the wait then blocks until
+        the worker signals again). count == 0 returns instantly."""
+        mgr = FakeVPNManager(_cfg(tmp_path), tmp_path=tmp_path)
+        loop = asyncio.get_running_loop()
+
+        # (a) stale-set hazard: event already set but the op is still alive
+        mgr._rotation_loop = loop
+        mgr._rotation_op_event = asyncio.Event()
+        mgr._rotation_op_event.set()                       # stale set (level-triggered)
+        mgr._rotation_op_count = 1
+
+        def _slow_worker():
+            time.sleep(0.05)
+            mgr._rotation_op_count = max(0, mgr._rotation_op_count - 1)
+            loop.call_soon_threadsafe(mgr._rotation_op_event.set)
+
+        task = asyncio.create_task(asyncio.to_thread(_slow_worker))
+        t0 = time.monotonic()
+        await mgr._await_rotation_ops_drained()
+        elapsed = time.monotonic() - t0
+        await task
+        assert elapsed >= 0.04                    # blocked on the REAL end
+        assert mgr._rotation_op_count == 0
+
+        # (b) nothing in flight → returns immediately
+        mgr._rotation_op_count = 0
+        t0 = time.monotonic()
+        await mgr._await_rotation_ops_drained()
+        assert time.monotonic() - t0 < 0.01
 
 
 # ── _watchdog_tick: AUTH_FAILED recovery ────────────────────────

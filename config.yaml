@@ -141,6 +141,7 @@ ip_rotation:
   control_pin_catchup: 25
   auto_flip_cooldown_min: 30
   rotation_wait_timeout: 20
+  rotation_max_duration: 240
   country_rotation: true
   country_offset: 14
   docker_events: true
