@@ -324,6 +324,29 @@ def _persist_vpn_config(updates: dict):
         _debug(f"  [vpn] failed to persist config: {e}")
 
 
+def _persist_free_model_map(mapping: dict):
+    """Persist ``free_model_map`` to config.yaml (top-level key, best-effort).
+
+    Unlike ip_rotation keys it does NOT live under ``ip_rotation:`` — it is a
+    first-class top-level key (config/settings.py ``yaml_get("free_model_map")``),
+    so `_persist_vpn_config`'s key_map cannot reach it.
+    """
+    try:
+        import yaml
+        config_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "..", "config.yaml")
+        if not os.path.exists(config_path):
+            return
+        with open(config_path, "r", encoding="utf-8") as f:
+            config = yaml.safe_load(f) or {}
+        config["free_model_map"] = dict(mapping)
+        with open(config_path, "w", encoding="utf-8") as f:
+            yaml.dump(config, f, default_flow_style=False,
+                      allow_unicode=True, sort_keys=False)
+    except Exception as e:
+        _debug(f"  [free] failed to persist free_model_map: {e}")
+
+
 def _write_credentials_env(username: str, password: str):
     """Write NordVPN credentials to credentials.env — the single source
     gluetun reads via docker-compose env_file ([24]).
@@ -1279,6 +1302,25 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
             password = creds.get("password", "")
             if username and password:
                 _write_credentials_env(username, password)
+
+        # [fix 19/08] free_model_map is a TOP-LEVEL config.yaml key (not an
+        # ip_rotation one) — hot-reload by mutating the shared dict in place
+        # (opencode.py imports the SAME object by reference, so clear()+update
+        # is visible without a proxy restart) + persist to config.yaml + sync
+        # the in-memory mirror so a later settings.yaml_set() dump does not
+        # revert what we just wrote to disk. Consumed — never fanned out.
+        if "free_model_map" in body:
+            _fmm = body.pop("free_model_map")
+            if isinstance(_fmm, dict):
+                try:
+                    from config import settings as _st
+                    _st.FREE_MODEL_MAP.clear()
+                    _st.FREE_MODEL_MAP.update(_fmm)
+                    _st._yaml_data["free_model_map"] = dict(_fmm)
+                except Exception as e:
+                    _debug(f"  [free] free_model_map hot-reload failed: {e}")
+                    return {"error": f"free_model_map hot-reload failed: {e}"}
+                _persist_free_model_map(_fmm)
 
         # Handle config updates (need VPN manager). [plan] F: fan-out to
         # ALL stations — identity pool, watchdog backoff and freshness

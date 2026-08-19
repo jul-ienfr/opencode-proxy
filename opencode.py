@@ -1987,9 +1987,23 @@ async def _open_free_stream(endpoint, body, headers, use_free: bool, count_reque
                                        timeout=(10, 600))  # connect 10 (am.21) / read 600
                 resp = await session.post(endpoint, json=body, headers=req_headers, stream=True)
                 wrapped = _CurlCffiStreamResponse(resp)
+                # [plan 18/08 §am.22] register the in-flight stream so the
+                # watchdog can cancel it the moment egress death is CONFIRMED
+                # (egress_dead) — a client reading a dead tunnel must get the
+                # error in ≤ ~10 s, not after the up-to-600 s read timeout.
+                # asyncio.current_task() IS the request task (no task spawned
+                # here). Unregistered in the finally below. The registry is
+                # OPTIONAL pool protocol — a double without it (invariant
+                # tests) must not break the request path: hasattr guard.
+                if _free_ip_pool is not None and hasattr(
+                        _free_ip_pool, "register_stream"):
+                    _free_ip_pool.register_stream(station, asyncio.current_task())
                 try:
                     yield wrapped
                 finally:
+                    if _free_ip_pool is not None and hasattr(
+                            _free_ip_pool, "unregister_stream"):
+                        _free_ip_pool.unregister_stream(station, asyncio.current_task())
                     await resp.aclose()
                     await session.close()
                 return
@@ -2153,6 +2167,21 @@ def _free_attempt_station():
     """
     attempt = _current_free_attempt.get()
     return attempt.get("station") if attempt else None
+
+
+def _is_watchdog_cancelled(station) -> bool:
+    """[plan 18/08 §am.22/piège 19] was THIS task cancelled by the
+    egress-death watchdog (pool.cancel_streams on a confirmed-dead tunnel)?
+
+    The stream registry is OPTIONAL pool protocol: a pool double without it
+    can never classify (False) — the request path must not depend on it.
+    Sync and pure (id-marker lookups), safe to call mid-handler.
+    """
+    pool = _free_ip_pool
+    if station is None or pool is None:
+        return False
+    return getattr(pool, "is_watchdog_cancelled",
+                   lambda *a, **k: False)(station, asyncio.current_task())
 
 
 def _free_stations_exhausted(free_model: str) -> bool:
@@ -4425,6 +4454,24 @@ async def messages(request: Request):
                             except Exception:
                                 pass
                         _cb_record_success(endpoint)  # Stream completed successfully
+                except asyncio.CancelledError:
+                    # [plan 18/08 §am.22/piège 19] a free stream cancelled by the
+                    # watchdog (egress_dead CONFIRMED on its station) IS a network
+                    # failure of that tunnel — redirect into the failover: the
+                    # (_attempt>0) re-entry runs fresh_station=True →
+                    # on_disconnect_retry → the bad-marked dead station is
+                    # excluded, the retry lands on another station (or direct).
+                    # Genuine client disconnects arrive the same way (uvicorn
+                    # cancels the request task), but their tasks were never
+                    # registered → re-raised unchanged. Attempts exhausted →
+                    # honest error (client-side retry) instead of a dead re-strike.
+                    st = _free_attempt_station()
+                    if (st is not None and _attempt == 0
+                            and _is_watchdog_cancelled(st)):
+                        _debug(f"  ⟳ stream watchdog-cancelled (dead tunnel, station {getattr(st, '_station', '?')}) — failover retry")
+                        _log(f"  FREE STREAM on confirmed-dead tunnel cancelled → switching station")
+                        continue
+                    raise
                 except Exception as e:
                     _cb_record_failure(endpoint)  # Record failure for circuit breaker
                     ak = _alias_for_key(headers.get("x-api-key", "")) if headers else ""
@@ -4829,6 +4876,16 @@ async def messages(request: Request):
                                 stream_out_tokens += _estimate_tokens(args)
                                 yield _sse("content_block_delta", {"type": "content_block_delta", "index": tool_block_idx[api_idx],
                                            "delta": {"type": "input_json_delta", "partial_json": args}})
+            except asyncio.CancelledError:
+                # [plan 18/08 §am.22/piège 19] — same watchdog-cancel
+                # handling as the anthropic stream handler (see there).
+                st = _free_attempt_station()
+                if (st is not None and _attempt == 0
+                        and _is_watchdog_cancelled(st)):
+                    _debug(f"  ⟳ stream watchdog-cancelled (dead tunnel, station {getattr(st, '_station', '?')}) — failover retry")
+                    _log(f"  FREE STREAM on confirmed-dead tunnel cancelled → switching station")
+                    continue
+                raise
             except Exception as e:
                 _log(f"  ERROR stream (attempt {_attempt+1}): {type(e).__name__}: {e}")
                 _debug(f"  ✗ stream exception: {type(e).__name__}: {e}\n{traceback.format_exc()}")
@@ -5346,6 +5403,16 @@ async def chat_completions(request: Request):
                                      tools_used=used_tools if used_tools else None,
                                      request_body=request_body)
                         _cb_record_success(endpoint)  # Stream completed successfully
+                except asyncio.CancelledError:
+                    # [plan 18/08 §am.22/piège 19] — same watchdog-cancel
+                    # handling as the anthropic stream handler (see there).
+                    st = _free_attempt_station()
+                    if (st is not None and _attempt == 0
+                            and _is_watchdog_cancelled(st)):
+                        _debug(f"  ⟳ stream watchdog-cancelled (dead tunnel, station {getattr(st, '_station', '?')}) — failover retry")
+                        _log(f"  FREE STREAM on confirmed-dead tunnel cancelled → switching station")
+                        continue
+                    raise
                 except Exception as e:
                     _cb_record_failure(endpoint)  # Record failure for circuit breaker
                     _log(f"  ERROR stream (attempt {_attempt+1}): {type(e).__name__}: {e}")
@@ -5741,6 +5808,16 @@ async def chat_completions(request: Request):
                                 yield b"data: [DONE]\n\n"
                                 _cb_record_success(endpoint)  # Stream completed successfully
                                 return
+            except asyncio.CancelledError:
+                # [plan 18/08 §am.22/piège 19] — same watchdog-cancel
+                # handling as the anthropic stream handler (see there).
+                st = _free_attempt_station()
+                if (st is not None and _attempt == 0
+                        and _is_watchdog_cancelled(st)):
+                    _debug(f"  ⟳ stream watchdog-cancelled (dead tunnel, station {getattr(st, '_station', '?')}) — failover retry")
+                    _log(f"  FREE STREAM on confirmed-dead tunnel cancelled → switching station")
+                    continue
+                raise
             except Exception as e:
                 _cb_record_failure(endpoint)  # Record failure for circuit breaker
                 _log(f"  ERROR stream (attempt {_attempt+1}): {type(e).__name__}: {e}")

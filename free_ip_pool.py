@@ -500,6 +500,66 @@ class FreeIPPool:
             per["bad_until"] = time.monotonic() + self._bad_ttl
         station.arm_egress_watchdog()
 
+    # ── In-flight free stream registry (plan 18/08 §am.22) ──────
+
+    def register_stream(self, station, task) -> None:
+        """Record an in-flight free stream served over ``station``'s tunnel.
+
+        [plan 18/08 §am.22] when the tick CONFIRMS egress death (``egress_dead``
+        after the threshold), these streams are canceled — a client currently
+        reading a dead tunnel would otherwise sit on the keepalive-bridged
+        silence for up to the 600 s read timeout. Registration happens once
+        the tunnel POST succeeded (the real fire-and-forget signal already
+        covered the connect stage)."""
+        self._per_station(station).setdefault("stream_tasks", set()).add(task)
+
+    def unregister_stream(self, station, task) -> None:
+        """Drop ``task`` from the registry once its stream is done."""
+        per = self._per_station(station)
+        tasks = per.get("stream_tasks")
+        if tasks:
+            tasks.discard(task)
+
+    def cancel_streams(self, station) -> None:
+        """Cancel every in-flight free stream over ``station``'s tunnel.
+
+        Called by the manager's tick at ``egress_dead`` — the tunnel is CONFIRMED
+        dead by the light probe, so the streams on it cannot recover: giving the
+        clients the error NOW (instead of after the keepalive/read timeout) is
+        the whole point. The network-error classifier in opencode.py re-raises
+        genuine client disconnects (uvicorn cancels the request task the same
+        way); those task IDs were never registered here, so only tunnels that
+        are truly mid-stream get a cancel.
+
+        [piège 19] the retry loop must treat the watchdog cancel as a NETWORK
+        failure — redirect into the failover (bad-mark → ``on_disconnect_retry``
+        picks another station), never re-strike the dead one.
+
+        C1 guard on the bad-mark (as in `notify_connection_failure`): never
+        bad-mark the last standing station — but the CANCEL itself is
+        unconditional (a confirmed-dead tunnel cannot carry a stream).
+        """
+        per = self._per_station(station)
+        tasks = per.get("stream_tasks")
+        if not tasks:
+            return
+        # Bounded overwrite, not append: the cancelled set is per burst — a
+        # stream of a PREVIOUS burst has either propagated already (re-raised
+        # or retried to another station) or re-registered, so carrying stale
+        # IDs forward would only risk misclassifying a genuine client cancel.
+        per["watchdog_cancelled"] = {id(t) for t in tasks}
+        for t in list(tasks):
+            t.cancel()
+
+    def is_watchdog_cancelled(self, station, task) -> bool:
+        """True when ``task`` was cancelled by ``cancel_streams`` (not by a
+        genuine client disconnect). The marker lives OUTSIDE the live registry
+        (``stream_tasks``): unregister runs during CancelledError propagation,
+        BEFORE the handler's ``except asyncio.CancelledError`` inspects the
+        task, so the decision must not depend on the task still being listed."""
+        return any(id(task) in (per.get("watchdog_cancelled") or set())
+                   for per in self._per.values() if per.get("watchdog_cancelled"))
+
     async def _await_rotation(self, station: VPNManager) -> bool:
         """Wait (bounded by ``rotation_wait_timeout``) for a background
         rotation to finish and land a NEW IP on ``station``.

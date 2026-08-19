@@ -387,3 +387,109 @@ class TestRequestPathWiring:
         assert isinstance(resp, oc._CurlCffiResponse)
         assert resp.status_code == 429
         assert rec.notified == []
+
+
+class _Task:
+    """task double: cancel() records the call; __eq__ can't collide with the
+    id()-based marker (never used)."""
+
+    def __init__(self, name):
+        self.name = name
+        self.cancelled = 0
+
+    def cancel(self):
+        self.cancelled += 1
+
+
+class TestStreamsCancelled:
+    """[plan 18/08 §am.22] the tick's egress_death cancel: registered free
+    streams are cancelled + marked (watchdog_cancelled OUTSIDE the live
+    registry — unregister happens during CancelledError propagation, before
+    the handler inspects); genuine client disconnects (never registered)
+    are NOT classified; the marker is a bounded per-burst overwrite."""
+
+    def test_cancel_streams_cancels_and_marks_registered(self):
+        st1, st2 = _fresh_pair()
+        pool = _pool(st1, st2)
+        t1a, t1b, t2a = _Task("a"), _Task("b"), _Task("c")
+        pool.register_stream(st1, t1a)
+        pool.register_stream(st1, t1b)
+        pool.register_stream(st2, t2a)
+
+        pool.cancel_streams(st1)
+
+        assert t1a.cancelled == 1 and t1b.cancelled == 1
+        assert t2a.cancelled == 0, "other station's streams left alone until IT is confirmed dead"
+        assert pool.is_watchdog_cancelled(st1, t1a)
+        assert pool.is_watchdog_cancelled(st1, t1b)
+        assert not pool.is_watchdog_cancelled(st2, t2a)
+        # Marker SURVIVES unregister: the handler unregisters during
+        # CancelledError propagation, BEFORE inspecting it.
+        pool.unregister_stream(st1, t1a)
+        assert pool.is_watchdog_cancelled(st1, t1a)
+
+    def test_noop_when_nothing_registered(self):
+        st1 = _Station(1)
+        pool = _pool(st1)
+        pool.cancel_streams(st1)               # must not raise
+        pool.cancel_streams(_Station(2))       # unknown station → no raise
+        assert not pool.is_watchdog_cancelled(st1, _Task("x"))
+
+    def test_genuine_client_cancel_not_classified(self):
+        st1 = _Station(1)
+        pool = _pool(st1)
+        reg = _Task("stream")
+        client = _Task("client")               # uvicorn cancels this one directly
+        pool.register_stream(st1, reg)
+
+        pool.cancel_streams(st1)
+
+        assert reg.cancelled == 1
+        assert client.cancelled == 0, "never registered → never cancelled"
+        assert not pool.is_watchdog_cancelled(st1, client)
+        assert pool.is_watchdog_cancelled(st1, reg)
+
+    def test_burst_marker_bounded_overwrite(self):
+        """The cancelled marker is per burst: the second burst rebuilds it from
+        what is CURRENTLY registered, so a stale id of an already-propagated
+        stream is never carried forward (it can only misclassify a later task
+        that happens to reuse the id slot)."""
+        st1 = _Station(1)
+        pool = _pool(st1)
+        t1 = _Task("first burst")
+        pool.register_stream(st1, t1)
+        pool.cancel_streams(st1)
+        assert pool.is_watchdog_cancelled(st1, t1)
+        pool.unregister_stream(st1, t1)       # handler propagated → gone
+
+        t2 = _Task("second burst")             # fresh burst on a NEW stream
+        pool.register_stream(st1, t2)
+        pool.cancel_streams(st1)
+
+        assert pool.is_watchdog_cancelled(st1, t2)
+        assert not pool.is_watchdog_cancelled(st1, t1), \
+            "stale burst id must not survive the overwrite"
+
+    def test_re_registered_stream_marked_again(self):
+        """A stream still REGISTERED at the next burst is re-marked (still
+        in flight — legitimately a cancelled stream)."""
+        st1 = _Station(1)
+        pool = _pool(st1)
+        t = _Task("long stream")
+        pool.register_stream(st1, t)
+        pool.cancel_streams(st1)
+        pool.cancel_streams(st1)              # still registered/in-flight
+        assert t.cancelled == 2
+        assert pool.is_watchdog_cancelled(st1, t)
+
+    # ── registration wiring: who calls register/unregister ─────────
+
+    def test_register_and_unregister_roundtrip(self):
+        st1 = _Station(1)
+        pool = _pool(st1)
+        t = _Task("s")
+        pool.register_stream(st1, t)
+        pool.unregister_stream(st1, t)
+        pool.cancel_streams(st1)               # registry empty → no cancel
+        assert t.cancelled == 0
+        assert not pool.is_watchdog_cancelled(st1, t)

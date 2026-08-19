@@ -47,6 +47,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import pytest
 
 import shared_rotation
+import shared_state
 import vpn_manager as vm
 
 # Explicit 3-profile pool (diversity off — the plan's strict retrocompat
@@ -722,6 +723,72 @@ class TestWatchdogTick:
         assert mgr.calls["restart"] == 0
         assert mgr.calls["compose_up"] == 0
         assert mgr._watchdog_backoff.consecutive_failures == 0
+
+    # ── [plan 18/08 §am.22] egress death → cancel in-flight streams ─
+
+    @pytest.mark.asyncio
+    async def test_egress_dead_cancels_inflight_streams_at_threshold(self, tmp_path, monkeypatch):
+        """The pool registered the streams on this tunnel; when the threshold
+        tick CONFIRMS egress death (probe dead 3/3), the tick calls
+        pool.cancel_streams(self) — exactly once, at the threshold, never
+        while arming. The pool-side cancel semantics are covered in
+        test_pool_connection_failure.py; this proves the WIRING."""
+        mgr = FakeVPNManager(_cfg(tmp_path, vpn_stack="wireguard"), tmp_path=tmp_path)
+        mgr.probe_alive = False
+
+        class _RecPool:
+            def __init__(self):
+                self.cancelled = []
+
+            def cancel_streams(self, station):
+                self.cancelled.append(station)
+
+        rec = _RecPool()
+        monkeypatch.setattr(shared_state, "free_ip_pool", rec, raising=False)
+        seuil = mgr._auto_wg_egress_ticks
+        for _ in range(seuil - 1):
+            await mgr._watchdog_tick()
+        assert rec.cancelled == [], "no cancel while arming (1..threshold-1)"
+        await mgr._watchdog_tick()
+        assert rec.cancelled == [mgr], "the CONFIRMED-death tick cancels this tunnel's streams"
+        # The recovery (restart + finalize rounds) ran normally afterwards.
+        assert mgr.calls["restart"] == 3
+
+    @pytest.mark.asyncio
+    async def test_egress_blip_never_cancels_streams(self, tmp_path, monkeypatch):
+        """A transient blip (probe recovers before the threshold) is
+        absorbed: counter reset, ZERO recovery, ZERO cancel — the streams on
+        a healthy tunnel keep streaming."""
+        mgr = FakeVPNManager(_cfg(tmp_path, vpn_stack="wireguard"), tmp_path=tmp_path)
+        mgr._egress_failures = mgr._auto_wg_egress_ticks - 1   # nearly armed
+
+        class _RecPool:
+            def __init__(self):
+                self.cancelled = []
+
+            def cancel_streams(self, station):
+                self.cancelled.append(station)
+
+        rec = _RecPool()
+        monkeypatch.setattr(shared_state, "free_ip_pool", rec, raising=False)
+        mgr.probe_alive = True                 # healthy probe — blip absorbed
+        mgr.ips = ["1.1.1.1"]                  # armed tick skips refresh — no pop
+        await mgr._watchdog_tick()
+        assert mgr._egress_failures == 0
+        assert rec.cancelled == [], "a healthy tunnel's streams are never cancelled"
+        assert mgr.calls["restart"] == 0
+
+    @pytest.mark.asyncio
+    async def test_egress_dead_without_pool_noop(self, tmp_path, monkeypatch):
+        """No pool (self-heal mode / unit test): the tick survives — the
+        None-guard keeps the cancel out of the recovery path."""
+        mgr = FakeVPNManager(_cfg(tmp_path, vpn_stack="wireguard"), tmp_path=tmp_path)
+        mgr.probe_alive = False
+        monkeypatch.setattr(shared_state, "free_ip_pool", None, raising=False)
+        seuil = mgr._auto_wg_egress_ticks
+        for _ in range(seuil):
+            await mgr._watchdog_tick()
+        assert mgr._egress_failures == seuil
 
     # ── [plan 18/08 §E3/am.20] light restart rung before compose ─
 

@@ -3082,6 +3082,16 @@ class VPNManager:
                 self._egress_failures += 1
                 if self._egress_failures >= self._auto_wg_egress_ticks:
                     egress_dead = True
+                    # [plan 18/08 §am.22] Egress death CONFIRMED — cancel the
+                    # in-flight free streams on this tunnel (the pool
+                    # registered them). Sync call, safe inside the lock. Each
+                    # task's CancelledError surfaces in its handler as a
+                    # watchdog-cancel → failover retry (the bad-mark already
+                    # excludes the dead station) — never a passive up-to-600 s
+                    # read-timeout stall on a dead tunnel.
+                    pool = getattr(shared_state, "free_ip_pool", None)
+                    if pool is not None:
+                        pool.cancel_streams(self)
                 else:
                     logger.warning("[vpn-watchdog] egress dead %d/%d ticks — waiting",
                                    self._egress_failures, self._auto_wg_egress_ticks)

@@ -71,17 +71,20 @@ class _FakeWatcher:
         self.managers = dict(managers)
 
 
-def _canvas(tmp_path):
+def _canvas(tmp_path, monkeypatch):
     """Real FakeVPNManager×2 (recorders) + harness fakes, wired into
-    shared_state as a 2-station deployment."""
+    shared_state as a 2-station deployment. Assigned via monkeypatch so the
+    fixture restores the prior globals at teardown — a bare assignment here
+    would leak the stale pool/registry into every later suite test."""
     m1 = _Rec(_cfg(tmp_path, vpn_stack="auto"), tmp_path=tmp_path)
     m2 = _Rec(_cfg(tmp_path, vpn_stack="auto"), station=2, tmp_path=tmp_path)
     pool, watcher = _FakePool(), _FakeWatcher()
-    shared_state.vpn_managers = [m1, m2]
-    shared_state.vpn_manager = m1
-    shared_state.vpn_manager_2 = m2
-    shared_state.free_ip_pool = pool
-    shared_state.docker_event_watcher = watcher
+    monkeypatch.setattr(shared_state, "vpn_managers", [m1, m2], raising=False)
+    monkeypatch.setattr(shared_state, "vpn_manager", m1, raising=False)
+    monkeypatch.setattr(shared_state, "vpn_manager_2", m2, raising=False)
+    monkeypatch.setattr(shared_state, "free_ip_pool", pool, raising=False)
+    monkeypatch.setattr(shared_state, "docker_event_watcher", watcher,
+                        raising=False)
     return m1, m2, pool, watcher
 
 
@@ -97,7 +100,7 @@ async def test_upscale_3_syncs_env_stack_before_any_start(tmp_path, monkeypatch)
     compose = tmp_path / "docker-compose.yml"
     monkeypatch.setenv("VPN_DOCKER_COMPOSE_FILE", str(compose))
 
-    m1, m2, pool, watcher = _canvas(tmp_path)
+    m1, m2, pool, watcher = _canvas(tmp_path, monkeypatch)
     assert m1._stack_effective == "wireguard"      # key present + auto stack
 
     monkeypatch.setattr(vpn_manager, "VPNManager", _StubMgr)
@@ -136,11 +139,13 @@ async def test_downscale_3_to_2_stops_container_no_stack_call(tmp_path, monkeypa
              _StubMgr(_cfg(tmp_path), station=2),
              _StubMgr(_cfg(tmp_path), station=3)]
     pool, watcher = _FakePool(), _FakeWatcher()
-    shared_state.vpn_managers = stubs
-    shared_state.vpn_manager = stubs[0]
-    shared_state.vpn_manager_2 = stubs[1]
-    shared_state.free_ip_pool = pool
-    shared_state.docker_event_watcher = watcher
+    # monkeypatch (auto-restore) — never bare assign to shared_state.
+    monkeypatch.setattr(shared_state, "vpn_managers", stubs, raising=False)
+    monkeypatch.setattr(shared_state, "vpn_manager", stubs[0], raising=False)
+    monkeypatch.setattr(shared_state, "vpn_manager_2", stubs[1], raising=False)
+    monkeypatch.setattr(shared_state, "free_ip_pool", pool, raising=False)
+    monkeypatch.setattr(shared_state, "docker_event_watcher", watcher,
+                        raising=False)
     persisted = []
 
     async def _fake_persist(u):

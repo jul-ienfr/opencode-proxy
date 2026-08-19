@@ -65,13 +65,30 @@ models:
   qwen3.5-plus:
     protocol: anthropic
 free_model_map:
+  glm-5.2: deepseek-v4-flash-free
+  glm-5.1: deepseek-v4-flash-free
+  glm-5: deepseek-v4-flash-free
+  kimi-k2.5: deepseek-v4-flash-free
+  kimi-k2.6: deepseek-v4-flash-free
+  kimi-k2.7: deepseek-v4-flash-free
+  deepseek-v4-pro: deepseek-v4-flash-free
   deepseek-v4-flash: deepseek-v4-flash-free
-  mimo-v2.5: mimo-v2.5-free
+  mimo-v2-pro: deepseek-v4-flash-free
+  mimo-v2-omni: deepseek-v4-flash-free
+  mimo-v2.5-pro: deepseek-v4-flash-free
+  mimo-v2.5: deepseek-v4-flash-free
+  minimax-m2.7: mimo-v2.5-free
+  minimax-m3: mimo-v2.5-free
+  minimax-m2.5: mimo-v2.5-free
+  qwen3.7-max: mimo-v2.5-free
+  qwen3.7-plus: mimo-v2.5-free
+  qwen3.6-plus: mimo-v2.5-free
+  qwen3.5-plus: mimo-v2.5-free
 ip_rotation:
   enabled: true
   proxy_mode: vpn
   dual_station: true
-  station_count: 3
+  station_count: 4
   strict_free: false
   quota_per_ip: 15
   switch_delay: 1
@@ -123,7 +140,7 @@ ip_rotation:
   server_provider: nordvpn
   control_api_key: ''
   control_enabled: true
-  vpn_stack: auto
+  vpn_stack: wireguard
   auto_ov_fail_threshold: 3
   auto_ov_return_min: 60
   auto_wg_egress_ticks: 3
