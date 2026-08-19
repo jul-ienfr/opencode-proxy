@@ -12,25 +12,26 @@ plus ancien). Marqueurs :
 - ⚪ = CONFIRMED par l'audit mais NON re-vérifié dans cette passe
 - ⚫ = REFUTÉ par l'audit
 
-Suite de tests : **392 tests verts** (`pytest tests/ --collect-only` → 392).
+Suite de tests : **408 tests verts** (`pytest tests/ -q` → 408 passed, 19/08).
 
 ---
 
 ## 1. Ordre de priorité
 
 ### P0 — « Faire tourner » : aucun blocage, aucune régression
-1. **Tout le plan « quasi-instantané » (18/08) est LANDED sauf 2 blocs :**
-   - ❌ **Commit 7 — annulation des streams free sur mort egress confirmée** (am.22,
-     `pool.cancel_streams(station)`). Aucune occurrence de `cancel_streams` dans
-     `opencode.py`/`free_ip_pool.py`/`vpn_manager.py`. C'est le seul morceau de la
-     phase qui ne soit pas implémenté : aujourd'hui un stream en vol sur un tunnel
-     mort reste bridgé par keepalive (read 600 s) au lieu d'être annulé ≤ ~10 s.
-   - ❌ **Commit 8 — docs « Peer Connection Initiated »** (amendement audit 18/08).
-     `docker-compose.yml` et `vpn_manager.py` contiennent encore le texte faux
-     « Connecting to [uk1234.nordvpn.com] » (la vraie ligne est
-     « Peer Connection Initiated with [AF_INET]<ip>:1194 », visible dès verbosity 1).
+1. **Tout le plan « quasi-instantané » (18/08) est LANDED :**
+   - ✅ **Commit 7 — annulation des streams free sur mort egress confirmée** (am.22,
+     `pool.cancel_streams(station)`), fusionné dans `e0c302b` (poussé) : registre des
+     streams en vol (register/unregister) + `cancel_streams()` au tick egress_dead +
+     `is_watchdog_cancelled()` (marqueur hors registre) branché sur les 4 handlers
+     stream d'`opencode.py` ; tests `test_pool_connection_failure.py` ×6 +
+     `test_vpn_freshness.py` ×3.
+   - ✅ **Commit 8 — docs « Peer Connection Initiated »** (amendement audit 18/08),
+     `a7af2fc` (local, non poussé) : `docker-compose.yml` ×2 + `vpn_manager.py` ×4
+     corrigés — la vraie ligne est « Peer Connection Initiated with [AF_INET]<ip>:1194 »,
+     niveau M_INFO, visible dès verbosity 1 ; « Connecting to [...] » n'apparaît jamais.
      Zéro comportement — docs seulement.
-2. **Re-run complet de la suite avant/après chaque commit** (392) — c'est la porte
+2. **Re-run complet de la suite avant/après chaque commit** (408) — c'est la porte
    de non-régression « people RUN ».
 
 ### P1 — Décisions sécuritaires/opérationnelles (peu de code, surtout des choix)
@@ -99,9 +100,9 @@ Suite de tests : **392 tests verts** (`pytest tests/ --collect-only` → 392).
 |---|---|---|
 | Routage req → modèle (ROUTES / FREE_MODEL_MAP) | toute requête trouve son endpoint | ✅ stable |
 | Chemin free **non-stream** | 429 → cooldown → rotation IP → fallback paid | ✅ complet + 60 s cooldown |
-| Chemin free **stream** (trafic dominant de Claude Code) | idem | ✅ 429 → rotation depuis le fix [42] ; ❌ streams en vol non annulés sur tunnel mort (commit 7) |
+| Chemin free **stream** (trafic dominant de Claude Code) | idem | ✅ 429 → rotation depuis le fix [42] ; ✅ streams en vol annulés sur tunnel mort confirmé (commit 7, `cancel_streams`) |
 | Rotation IP (FreeIPPool + VPNManager) | ne jamais croiser le mur de quota, jamais servir un tunnel mort | ✅ étage 0/1/2 du plan (bad-mark, signal, sonde, wake, deadline 240 s, restart léger) |
-| Multi-station (N=1..10, hot-reload) | scale-up parallèle | ✅ 392 tests dont `test_vpn_stack_nstation.py`, `test_pool_station_set.py` — **non commité** (décision utilisateur) |
+| Multi-station (N=1..10, hot-reload) | scale-up parallèle | ✅ 408 tests dont `test_vpn_stack_nstation.py`, `test_pool_station_set.py` — committé `e05f456` |
 | KeyPauser + failover clés payées | 401/403/429 → pause réelle → clé alternative | ✅ |
 | Dashboard + débug + logs | visibilité = capacité à corriger | 🔶 token opt-in, bodies en clair (P1) |
 
@@ -152,17 +153,16 @@ Toute feature demandée/PR passera 3 portes avant d'entrer :
 1. **Ça fait tourner ?** (impact direct sur tunnel, quota, interruption — oui/non)
 2. **Ça casse un invariant ?** (jamais d'await sur rotation en chemin request, compteur
    IP honnête, C1 « ne jamais bad-marker la dernière station debout », single-flight)
-3. **Tests verts avant/après ?** (la suite complète de 392)
+3. **Tests verts avant/après ?** (la suite complète de 408)
 
 Refuser (ou déporter hors-ligne) ce qui ne passe pas la porte 1 — l'objectif est la
 stabilité, pas la richesse fonctionnelle.
 
 ## 7. Non terminé / non vérifié (transparence)
-- ❌ Commit 7 (cancel streams) et ❌ Commit 8 (docs) du plan 18/08 — non implémentés.
-- 🛑 La feature multi-station (station_count 1-10, hot-reload, `_apply_station_count`,
-  `stop_container`) est **fonctionnelle et testée (392 verts) mais NON commitée**
-  (14 fichiers modifiés + fichiers temporaires de revue en `??`). Ne rien committer/pousser
-  sans demande explicite — décision à prendre côté utilisateur.
+- ✅ Commit 7 (cancel streams, fusionné dans `e0c302b`, poussé) et ✅ Commit 8 (docs,
+  `a7af2fc`, local) du plan 18/08 — implémentés, suite 408 verte. Rien du plan n'est en reste.
+- ✅ La feature multi-station (station_count 1-10, hot-reload, `_apply_station_count`,
+  `stop_container`) est committée (`e05f456`).
 - ⚪ La file P2 (18 findings CONFIRMED non recertifiés) — à ré-évaluer un par un.
 - 🛑 « Programme whitelist » : hors dépôt, vérification impossible d'ici (voir §5).
 
