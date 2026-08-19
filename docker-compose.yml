@@ -126,10 +126,11 @@ services:
       # compose file (VPN_TYPE_STATION{1,2}); defaults to openvpn so the
       # file works on a fresh clone (Phase 1 stays armed as fallback).
       - VPN_TYPE=${VPN_TYPE_STATION1:-openvpn}
-      # [plan 18/08] verbosity 4 exposes the hostname in the log line
-      # "Connecting to [uk1234.nordvpn.com]" — at the default verbosity (1)
-      # no hostname is logged, so AUTH_FAILED hosts could never be blacklisted
-      # nor fast-pinned (Phase 1b/1c). Cost: ~1 line per connection attempt.
+      # [audit 18/08] the real OpenVPN hostname line is
+      # "[<host>] Peer Connection Initiated with [AF_INET]<ip>:1194" — an
+      # M_INFO message, visible from the DEFAULT verbosity (1). So extraction
+      # works without tuning; OPENVPN_VERBOSITY=4 is kept only for its ~1
+      # line/attempt debug detail (hostname at connect start).
       - OPENVPN_VERBOSITY=4
       # [incident 17/08] gluetun's country enum uses SPACED names
       # ("United Kingdom", "Czech Republic") — NordVPN file-style
@@ -206,10 +207,11 @@ services:
       # compose file (VPN_TYPE_STATION{1,2}); defaults to openvpn so the
       # file works on a fresh clone (Phase 1 stays armed as fallback).
       - VPN_TYPE=${VPN_TYPE_STATION2:-openvpn}
-      # [plan 18/08] verbosity 4 exposes the hostname in the log line
-      # "Connecting to [uk1234.nordvpn.com]" — at the default verbosity (1)
-      # no hostname is logged, so AUTH_FAILED hosts could never be blacklisted
-      # nor fast-pinned (Phase 1b/1c). Cost: ~1 line per connection attempt.
+      # [audit 18/08] the real OpenVPN hostname line is
+      # "[<host>] Peer Connection Initiated with [AF_INET]<ip>:1194" — an
+      # M_INFO message, visible from the DEFAULT verbosity (1). So extraction
+      # works without tuning; OPENVPN_VERBOSITY=4 is kept only for its ~1
+      # line/attempt debug detail (hostname at connect start).
       - OPENVPN_VERBOSITY=4
       # [incident 17/08] gluetun's country enum uses SPACED names
       # ("United Kingdom", "Czech Republic") — NordVPN file-style

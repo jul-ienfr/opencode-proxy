@@ -380,8 +380,9 @@ def _normalize_country(name: str) -> str:
 # [plan 18/08] NordVPN OpenVPN hostnames: 2-letter country code + 2-4 digit
 # server number (uk2757, it460, hu73, de1372). {2,4} NOT {3,4}: 2-digit hosts
 # (hu73/gr80/ee77) would never match and the blacklist would stay silent
-# (Phase 1b/1c dead in silence). OpenVPN verbosity >= 4 (OPENVPN_VERBOSITY=4
-# in compose) logs "Connecting to [<host>]" once per connection attempt.
+# (Phase 1b/1c dead in silence). [audit 18/08] the hostname line is
+# "[<host>] Peer Connection Initiated with [AF_INET]<ip>:1194" (M_INFO,
+# visible from the default verbosity 1) — never "Connecting to [<host>]".
 _NORDVPN_HOST_RE = re.compile(r"[a-z]{2}[0-9]{2,4}\.nordvpn\.com")
 
 # Blacklist TTL: the OpenVPN sunset kills hosts within a daily window — one
@@ -394,8 +395,10 @@ def _extract_current_hostname(text: str) -> Optional[str]:
     """Last NordVPN hostname present in gluetun log text.
 
     gluetun's SIGUSR1 retry loop re-logs the SAME remote every ~11 s, so
-    the last "Connecting to [...]" line is the host currently in play.
-    None when no hostname is logged (OpenVPN verbosity < 4).
+    the last "[<host>] Peer Connection Initiated ..." line is the host
+    currently in play. [audit 18/08] that M_INFO line is visible from the
+    DEFAULT verbosity (1) — OPENVPN_VERBOSITY=4 is NOT required.
+    None when no hostname is logged.
     """
     matches = _NORDVPN_HOST_RE.findall(text)
     return matches[-1] if matches else None
@@ -2282,11 +2285,13 @@ class VPNManager:
         return None
 
     async def _current_hostname(self, since: str) -> Optional[str]:
-        """Hostname gluetun is currently trying — the LAST "Connecting to
-        [...]" line in container logs written since ``since``. The SIGUSR1
-        retry loop re-logs the same remote every ~11 s, so the last
-        occurrence is the host in play. None when the container is absent
-        or no hostname is logged (verbosity < 4)."""
+        """Hostname gluetun is currently trying — the LAST "[<host>] Peer
+        Connection Initiated with [AF_INET]<ip>:1194" line (M_INFO, visible
+        from the DEFAULT verbosity 1) in container logs written since
+        ``since``. [audit 18/08] that IS the OpenVPN hostname line — never
+        "Connecting to [...]". The SIGUSR1 retry loop re-logs the same
+        remote every ~11 s, so the last occurrence is the host in play.
+        None when the container is absent or no hostname is logged."""
         result = await asyncio.to_thread(
             self._docker_run, ["logs", "--since", since, self._docker_container], 30)
         if result.returncode != 0:
@@ -2678,7 +2683,7 @@ class VPNManager:
         """
         host = _extract_current_hostname(text)
         if not host:
-            return  # verbosity < 4: no hostname in logs — nothing to blacklist
+            return  # no hostname in this text — nothing to blacklist
         now = time.time()
         entry = self._failed_hosts.get(host)
         if entry is None:
