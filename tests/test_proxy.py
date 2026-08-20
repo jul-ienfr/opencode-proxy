@@ -440,6 +440,13 @@ def _disable_mapping_off(monkeypatch):
     monkeypatch.setattr(_cfg_settings, "SORTED_ROUTES",
                         _cfg_settings._sort_routes_by_match(_clean_routes))
     monkeypatch.setattr(_cfg_settings, "SORTED_CUSTOM_ROUTES", [])
+    # Prevent maybe_reload_custom_routes (called at top of _route_for) from
+    # re-reading config.yaml/custom_routes.json on disk and re-introducing
+    # the production custom_routes (e.g. kimik26: kimi-k2.6 → muse-spark)
+    # between tests — especially when the suite runs with other modules that
+    # may have touched the file mtime. Both references are patched.
+    monkeypatch.setattr(_cfg_settings, "maybe_reload_custom_routes", lambda: None)
+    monkeypatch.setattr(_opencode_mod, "maybe_reload_custom_routes", lambda: None)
 
 
 class TestRouteFor:

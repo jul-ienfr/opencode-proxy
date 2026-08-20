@@ -110,7 +110,32 @@ API_BASE_ANTHROPIC = "https://opencode.ai/zen/go/v1/messages"
 
 
 async def fetch_available_models() -> list[str]:
-    """Fetch model IDs from the upstream OpenCode /v1/models endpoint."""
+    """Fetch model IDs from the upstream OpenCode /v1/models endpoint.
+
+    Dédup free-discovery (plan §D) : si config.settings.FREE_MODELS est frais
+    (< FREE_DISCOVERY_INTERVAL), on réutilise le cache local au lieu de
+    refetcher zen/go/v1/models — évite le double httpx par cycle 300s.
+    """
+    # Dédup: reuse fresh free-discovery cache if available
+    try:
+        import config.settings as _cs
+        lr = _cs._FREE_DISCOVERY_STATE.get("last_refresh") if hasattr(_cs, "_FREE_DISCOVERY_STATE") else None
+        if lr and getattr(_cs, "FREE_MODELS", None):
+            try:
+                import datetime as _dt2
+                last = _dt2.datetime.fromisoformat(str(lr))
+                if last.tzinfo is None:
+                    last = last.replace(tzinfo=_dt2.timezone.utc)
+                age = (_dt2.datetime.now(_dt2.timezone.utc) - last).total_seconds()
+                interval = int(getattr(_cs, "FREE_DISCOVERY_INTERVAL", 3600) or 3600)
+                if 0 <= age < interval:
+                    logger.debug("[quota] reusing fresh FREE_MODELS (age %.0fs < %ds) — skip upstream fetch", age, interval)
+                    # Return union of local MODELS + known free ids (source de vérité)
+                    return sorted(set(_cs.MODELS.keys()) | set(_cs.FREE_MODELS))
+            except Exception:
+                pass
+    except Exception:
+        pass
     try:
         client = await _get_http_client()
         resp = await client.get(MODELS_URL)

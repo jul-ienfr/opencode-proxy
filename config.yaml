@@ -7,6 +7,7 @@ upstream:
   openai_base: https://opencode.ai/zen/go/v1/chat/completions
   anthropic_base: https://opencode.ai/zen/go/v1/messages
   free_base: https://opencode.ai/zen/v1/chat/completions
+  free_models_url: ''
   proxy: ''
   timeout:
     connect: 30
@@ -64,6 +65,38 @@ models:
     protocol: anthropic
   qwen3.5-plus:
     protocol: anthropic
+  kimi-k3:
+    protocol: openai
+  kimi-k2.7-code:
+    protocol: openai
+  glm-5.3:
+    protocol: openai
+  qwen3.8-max:
+    protocol: anthropic
+  hy3:
+    protocol: openai
+  hy3-preview:
+    protocol: openai
+  gpt-5.6-luna:
+    protocol: openai
+  grok-4.5:
+    protocol: openai
+  muse-spark-1.2-contributor:
+    protocol: openai
+  deepseek-v4-flash-free:
+    protocol: openai
+  hy3-free:
+    protocol: openai
+  laguna-s-2.1-free:
+    protocol: openai
+  mimo-v2.5-free:
+    protocol: openai
+  muse-spark-1.2-contributor-free:
+    protocol: openai
+  nemotron-3-ultra-free:
+    protocol: openai
+  nemotron-3.5-lightning-free:
+    protocol: openai
 free_model_map:
   glm-5.2: deepseek-v4-flash-free
   glm-5.1: deepseek-v4-flash-free
@@ -84,6 +117,8 @@ free_model_map:
   qwen3.7-plus: mimo-v2.5-free
   qwen3.6-plus: mimo-v2.5-free
   qwen3.5-plus: mimo-v2.5-free
+  hy3: hy3-free
+  muse-spark-1.2-contributor: muse-spark-1.2-contributor-free
 ip_rotation:
   enabled: true
   proxy_mode: vpn
@@ -109,7 +144,8 @@ ip_rotation:
   state_file_2: logs/vpn_state2.json
   credentials_file: vpn_configs/credentials.txt
   server_countries: Germany,Netherlands,France,Spain,Poland,Sweden,Denmark,Finland,Norway,Belgium,Switzerland,Austria,Portugal,Italy,Ireland,United
-    Kingdom,Czech Republic,Estonia,Latvia,Lithuania,Romania,Hungary,Greece,Slovakia,Slovenia,Croatia,Bulgaria,Luxembourg,Iceland,Cyprus,Malta
+    Kingdom,Czech Republic,Estonia,Latvia,Lithuania,Romania,Hungary,Greece,Slovakia,Slovenia,Croatia,Bulgaria,Luxembourg,Iceland,Cyprus,Malta,United
+    States,Canada,Australia,Japan,Singapore
   circuit_breaker_threshold: 3
   circuit_breaker_recovery: 300
   backoff_max_delay: 60
@@ -160,6 +196,21 @@ ip_rotation:
   country_rotation: true
   country_offset: 14
   docker_events: true
+geo:
+  enabled: true
+  version: 1
+  policies:
+    meta-muse-spark:
+      allowed_countries:
+      - United States
+      - Canada
+      - United Kingdom
+      - Australia
+      - Japan
+      - Singapore
+      mode: strict
+      require_vpn: true
+      last_checked_at: '2026-08-20T00:00:00Z'
 custom_routes:
   mimov25:
     match:
@@ -186,6 +237,10 @@ custom_routes:
   gpt56luna:
     match:
     - gpt-5.6-luna
+    model: muse-spark-1.2-contributor
+  deepseekv4flash:
+    match:
+    - deepseek-v4-flash
     model: muse-spark-1.2-contributor
 api_keys: []
 tool_capabilities:
@@ -268,6 +323,11 @@ dashboard:
   - Glob
   - WebSearch
   display_lines: 35
+free_discovery:
+  enabled: true
+  interval: 3600
+  auto_persist: true
+  default_target: mimo-v2.5-free
 traffic:
   enabled: true
   max_frames: 500

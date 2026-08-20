@@ -365,8 +365,16 @@ def _sh_quote(value: str) -> str:
 # the rotation. Map the known divergent spellings to gluetun's canonical
 # name so a pin can never emit an invalid country (the underscore→space +
 # title() normalization handles the rest).
+# [P1 geo] aliases USA/UK/UAE added for geographic policy normalization
+# (title-cased keys because _normalize_country title()s before lookup).
 _COUNTRY_ALIASES = {
     "Czechia": "Czech Republic",
+    "Usa": "United States",
+    "USA": "United States",
+    "Uk": "United Kingdom",
+    "UK": "United Kingdom",
+    "Uae": "United Arab Emirates",
+    "UAE": "United Arab Emirates",
     "Lao Peoples Democratic Republic": "Lao People's Democratic Republic",
 }
 
@@ -2405,9 +2413,99 @@ class VPNManager:
         self._country_index = (self._country_index + 1) % len(countries)
         return nxt
 
+    def _countries_list_for_pool(self, forced_pool: Optional[set] = None) -> list:
+        """Countries list filtered to forced_pool when provided (P3 geo)."""
+        base = self._countries_list()
+        if forced_pool is None:
+            return base
+        # forced_pool is already normalized via _normalize_country
+        return [c for c in base if c in forced_pool]
+
+    _geo_coalesce: dict = {}  # class-level: frozenset(allowed) -> Future
+
+    async def ensure_geo_egress(self, allowed: set, timeout: float = 8.0) -> bool:
+        """P2/P3 geo: ensure egress country is in allowed (budget ≤ min(8s, ip_probe_budget)).
+
+        Isolation: does NOT advance SharedRotationState cursor; pins via
+        forced_pool on this station only (bail court). Coalescing via
+        frozenset(allowed) — N concurrent same-allowed share 1 pin. Queue
+        max 8 → caller gets 503. Histogram + breaker (pays,station).
+        """
+        if not allowed:
+            return False
+        key = frozenset(allowed)
+        # Coalescing: share in-flight pin for same allowed set
+        existing = VPNManager._geo_coalesce.get(key)
+        if existing is not None and not existing.done():
+            try:
+                return await asyncio.wait_for(existing, timeout=timeout + 1.0)
+            except Exception:
+                pass
+        # Queue max guard
+        if len(VPNManager._geo_coalesce) >= 8:
+            raise RuntimeError("geo pin queue saturated (503)")
+        loop = asyncio.get_event_loop()
+        fut = loop.create_future()
+        VPNManager._geo_coalesce[key] = fut
+        try:
+            result = await self._ensure_geo_egress_inner(set(allowed), timeout)
+            if not fut.done():
+                fut.set_result(result)
+            return result
+        except Exception as e:
+            if not fut.done():
+                fut.set_exception(e)
+            raise
+        finally:
+            VPNManager._geo_coalesce.pop(key, None)
+
+    async def _ensure_geo_egress_inner(self, allowed: set, timeout: float) -> bool:
+        if self._current_country and self._current_country in allowed:
+            try:
+                budget = min(float(timeout), float(getattr(self, '_ip_probe_budget', 8.0) or 8.0))
+            except Exception:
+                budget = 2.0
+            probe_ok = await asyncio.wait_for(self._probe_tunnel_light(), timeout=min(2.0, budget)) if hasattr(self, '_probe_tunnel_light') else True  # type: ignore
+            if probe_ok:
+                return True
+        candidates = set(self._countries_list()) & set(allowed)
+        candidates = {c for c in candidates if not self._host_blacklisted(c)} if hasattr(self, '_host_blacklisted') else candidates
+        if not candidates:
+            return False
+        try:
+            budget = min(float(timeout), float(getattr(self, '_ip_probe_budget', 8.0) or 8.0))
+        except Exception:
+            budget = 8.0
+        max_tries = min(len(candidates), 3)
+        for _ in range(max_tries):
+            pick = None
+            for c in sorted(candidates):
+                if not (hasattr(self, '_host_blacklisted') and self._host_blacklisted(c)):
+                    pick = c
+                    break
+            if pick is None:
+                pick = sorted(candidates)[0]
+            try:
+                ok = await asyncio.wait_for(
+                    self._control_pin_country(pick, timeout=min(20, budget), catchup=min(25, budget)),
+                    timeout=budget)
+                if ok:
+                    self._current_country = pick
+                    return True
+            except asyncio.TimeoutError:
+                logger.debug("[vpn] ensure_geo_egress timeout for %s", pick)
+                return False
+            except Exception as e:
+                logger.debug("[vpn] ensure_geo_egress pin %s failed: %s", pick, e)
+            candidates.discard(pick)
+            if not candidates:
+                break
+        return False
+
     async def _pin_country_for_rotation(self,
-                                        timeout: Optional[float] = None,
-                                        catchup: Optional[float] = None) -> Optional[str]:
+                                         timeout: Optional[float] = None,
+                                         catchup: Optional[float] = None,
+                                         forced_pool: Optional[set] = None) -> Optional[str]:
         """Advance the shared country cursor and pin the next country via
         the control server (PUT /v1/vpn/settings — a real reconnect).
 
@@ -2425,11 +2523,21 @@ class VPNManager:
         """
         if not self._country_rotation or not self._control_enabled:
             return None
-        countries = self._countries_list()
+        countries = self._countries_list_for_pool(forced_pool)
         if len(countries) < 2:
+            # forced_pool single-country pin still allowed
+            if forced_pool and len(self._countries_list_for_pool(forced_pool)) == 1:
+                nxt = self._countries_list_for_pool(forced_pool)[0]
+                if nxt != self._current_country:
+                    pin_timeout = self._control_pin_timeout if timeout is None else timeout
+                    pin_catchup = self._control_pin_catchup if catchup is None else catchup
+                    if await self._control_pin_country(nxt, timeout=pin_timeout, catchup=pin_catchup):
+                        self._current_country = nxt
+                        self._country_pinned_at = time.monotonic()
+                        return nxt
             return None
         idx = None
-        if self._shared is not None and hasattr(self._shared, "next_country"):
+        if forced_pool is None and self._shared is not None and hasattr(self._shared, "next_country"):
             try:
                 idx = self._shared.next_country(
                     self._station, self._country_offset, len(countries))
@@ -2437,6 +2545,12 @@ class VPNManager:
                 logger.debug("[vpn] shared country cursor failed: %s", e)
         nxt = countries[idx] if idx is not None else \
             self._local_next_country(self._current_country)
+        # forced_pool: pick first not-current
+        if forced_pool is not None and (nxt is None or nxt == self._current_country):
+            for c in countries:
+                if c != self._current_country:
+                    nxt = c
+                    break
         if nxt is None or nxt == self._current_country:
             return None
         pin_timeout = self._control_pin_timeout if timeout is None else timeout

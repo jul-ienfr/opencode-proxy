@@ -9,6 +9,8 @@ import time
 import logging
 import os
 import re
+import hmac
+import random
 import sqlite3
 import threading
 import traceback
@@ -26,6 +28,13 @@ from starlette.requests import ClientDisconnect
 
 from config import API_KEY, PROXY, MODELS, ROUTES, get_model_config, HOST, PORT, WEB_PORT, DISABLE_MAPPING, API_KEYS, API_KEY_ROUTING, CUSTOM_ROUTES, maybe_reload_custom_routes, CACHE_MIN_PROMPT_SIZE, DEBUG, yaml_get, API_BASE_FREE, FREE_MODEL_MAP, IP_ROTATION
 import config.settings as _cfg_settings
+# P2 geo: dynamic GEO_ENABLED via settings (hot-reload), base resolver alias
+from config.settings import GEO_ENABLED as _GEO_ENABLED_STATIC, GEO_VERSION  # static snapshot
+try:
+    from vpn_manager import _normalize_country as _vpn_normalize_country
+except ImportError:
+    def _vpn_normalize_country(n):  # fallback never invents beyond title()
+        return n.strip().replace("_", " ").strip().title()
 
 import itertools
 import email.utils
@@ -531,7 +540,7 @@ _conn.execute("CREATE INDEX IF NOT EXISTS idx_success ON requests(success)")
 _conn.execute("CREATE INDEX IF NOT EXISTS idx_account ON requests(account_alias)")
 _conn.execute("CREATE INDEX IF NOT EXISTS idx_ts_model ON requests(timestamp, model)")
 _conn.execute("CREATE INDEX IF NOT EXISTS idx_free_ip ON requests(free_model_ip)")
-for col, default in [("protocol", "NULL"), ("is_stream", "0"), ("thinking", "NULL"), ("effort", "NULL"), ("client_ip", "NULL"), ("account_alias", "NULL"), ("tools", "NULL"), ("tools_used", "NULL"), ("request_body", "NULL"), ("response_body", "NULL"), ("client_user_agent", "NULL"), ("free_model_ip", "NULL"), ("identity", "NULL")]:
+for col, default in [("protocol", "NULL"), ("is_stream", "0"), ("thinking", "NULL"), ("effort", "NULL"), ("client_ip", "NULL"), ("account_alias", "NULL"), ("tools", "NULL"), ("tools_used", "NULL"), ("request_body", "NULL"), ("response_body", "NULL"), ("client_user_agent", "NULL"), ("free_model_ip", "NULL"), ("identity", "NULL"), ("geo_country", "NULL"), ("geo_blocked", "0")]:
     try:
         _conn.execute(f"ALTER TABLE requests ADD COLUMN {col} TEXT DEFAULT {default}")
     except Exception:
@@ -694,7 +703,7 @@ def _db_insert_sync(req_id, timestamp, model, original_model, duration_ms,
                     tokens_input, tokens_output, tokens_cache, success, error,
                     protocol, is_stream, thinking, effort, client_ip, account_alias,
                     tools_json, tools_used_json, request_body_json=None, response_body_json=None,
-                    client_user_agent=None, free_model_ip=None, identity=None):
+                    client_user_agent=None, free_model_ip=None, identity=None, geo_country=None, geo_blocked=None):
     """Synchronous DB insert — called via asyncio.to_thread().
 
     Batches commits: accumulates INSERTs and commits every _DB_COMMIT_BATCH
@@ -713,13 +722,13 @@ def _db_insert_sync(req_id, timestamp, model, original_model, duration_ms,
             INSERT OR REPLACE INTO requests (id, timestamp, model, original_model, duration_ms,
                 tokens_input, tokens_output, tokens_cache, success, error,
                 protocol, is_stream, thinking, effort, client_ip, account_alias, tools, tools_used,
-                request_body, response_body, client_user_agent, free_model_ip, identity)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                request_body, response_body, client_user_agent, free_model_ip, identity, geo_country, geo_blocked)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (req_id, timestamp, model, original_model, duration_ms,
               tokens_input, tokens_output, tokens_cache, 1 if success else 0, error,
               protocol, 1 if is_stream else 0, thinking, effort,
               client_ip, account_alias, tools_json, tools_used_json,
-              request_body_json, response_body_json, client_user_agent, free_model_ip, identity))
+              request_body_json, response_body_json, client_user_agent, free_model_ip, identity, geo_country, geo_blocked))
         # Batch commit logic
         _db_pending_inserts += 1
         now = time.monotonic()
@@ -746,7 +755,7 @@ async def _save_request(req_id, model, original_model, duration_ms,
 	                  protocol=None, is_stream=False, thinking=None, effort=None,
 	                  client_ip=None, account_alias=None, tools=None, tools_used=None,
 	                  request_body=None, response_body=None, free_model_ip=None,
-	                  identity=None):
+	                  identity=None, geo_country=None, geo_blocked=None):
     tools_json = json.dumps(tools) if tools else "[]"
     tools_used_json = json.dumps(list(dict.fromkeys(tools_used))) if tools_used else "[]"
     request_body_json = _truncate_body_for_storage(request_body) if request_body else None
@@ -771,7 +780,7 @@ async def _save_request(req_id, model, original_model, duration_ms,
         tokens_input, tokens_output, tokens_cache, success, error,
         protocol, is_stream, thinking, effort, client_ip, account_alias,
         tools_json, tools_used_json, request_body_json, response_body_json,
-        client_user_agent, free_model_ip, identity
+        client_user_agent, free_model_ip, identity, geo_country, geo_blocked
     )
     # Fire-and-forget: commit in thread pool so dashboard sees the row quickly
     # without blocking the event loop. A blocked event loop freezes SSE streams
@@ -913,6 +922,16 @@ def _ensure_http_client() -> httpx.AsyncClient:
 # ── VPN / IP rotation (initialized in lifespan) ──────────────────
 _vpn_manager = None
 _free_ip_pool = None
+# ── Geo gate isolation (P2) ──────────────────────────────────
+_geo_rotation_task = None
+_geo_breaker: dict = {}  # (country, station_id) -> consecutive failures
+_geo_breaker_threshold: int = 3
+_geo_pin_duration: list = []  # histogram buckets (ms)
+_geo_pin_duration_max: int = 200
+_geo_pinned_country: str | None = None
+_geo_pinned_station = None
+_geo_block_total = 0
+_geo_forced_pool: set | None = None
 # [plan 18/08 §4] Serializes POST /api/vpn-config station_count hot-reloads
 # (upscale/downscale) — two interleaved POSTs must never race the registry
 # or the pool's set_stations swap.
@@ -1297,6 +1316,60 @@ async def lifespan(app):
     db_cleanup_task = asyncio.create_task(_periodic_db_cleanup())
     _debug("  [lifespan] background tasks created (WAL checkpoint, DB flush, key pause cleanup, DB body cleanup, quota fetcher)")
 
+    # [free-discovery] periodic refresh (±10% jitter, backoff after 3 failures)
+    app.state._free_discovery_lock = asyncio.Lock()
+    app.state._free_discovery_task = None
+    app.state._free_refresh_last_minute: dict[str, float] = {}
+
+    async def _free_discovery_loop():
+        # Boot is already done synchronously via _ensure_free_models_sync() at import;
+        # loop just schedules the next refreshes.
+        while True:
+            try:
+                interval = int(yaml_get("free_discovery", "interval", yaml_get("background", "free_models_refresh_interval", _cfg_settings.FREE_DISCOVERY_INTERVAL)) or _cfg_settings.FREE_DISCOVERY_INTERVAL)
+                if interval < 60:
+                    interval = 60
+                # jitter ±10%
+                jitter = 0.9 + random.random() * 0.2
+                failures = int(_cfg_settings._FREE_DISCOVERY_STATE.get("consecutive_failures", 0) or 0)
+                if failures >= 3:
+                    sleep_s = min(7200, interval * 2) * jitter
+                    _debug(f"  [free-discovery] backoff active failures={failures} sleep={sleep_s:.0f}s")
+                else:
+                    sleep_s = interval * jitter
+                # expose next_refresh for observability
+                try:
+                    import datetime as _dt
+                    _cfg_settings._FREE_DISCOVERY_STATE["next_refresh"] = (_dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(seconds=sleep_s)).isoformat()
+                except Exception:
+                    pass
+                await asyncio.sleep(sleep_s)
+                if not _cfg_settings.FREE_DISCOVERY_ENABLED:
+                    continue
+                # singleflight: one fetch at a time
+                async with app.state._free_discovery_lock:
+                    added = await asyncio.to_thread(_cfg_settings._ensure_free_models_sync)
+                    if added:
+                        _debug(f"  [free-discovery] loop added {added} new MODELS")
+                    # publish event for SSE/dashboard if available
+                    try:
+                        from dashboard.events import get_event_manager
+                        get_event_manager().publish("free_models_updated", {
+                            "detected": _cfg_settings._FREE_DISCOVERY_STATE.get("detected", []),
+                            "source": _cfg_settings._FREE_DISCOVERY_STATE.get("source", "none"),
+                        })
+                    except Exception:
+                        pass
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                _debug(f"  [free-discovery] loop error: {type(e).__name__}: {e}")
+                await asyncio.sleep(60)
+
+    if _cfg_settings.FREE_DISCOVERY_ENABLED:
+        app.state._free_discovery_task = asyncio.create_task(_free_discovery_loop())
+        _debug("  [lifespan] free-discovery loop started")
+
     yield
 
     _debug("  [lifespan] app shutting down")
@@ -1345,6 +1418,14 @@ async def lifespan(app):
         except asyncio.CancelledError:
             pass
         _debug("  [lifespan] quota fetcher task cancelled")
+    fd_task = getattr(app.state, '_free_discovery_task', None)
+    if fd_task:
+        fd_task.cancel()
+        try:
+            await fd_task
+        except asyncio.CancelledError:
+            pass
+        _debug("  [lifespan] free-discovery task cancelled")
     await _client.aclose()
     _debug("  [lifespan] HTTP client closed")
     # Save VPN state (containers stay up — compose-managed). Registry
@@ -1664,6 +1745,77 @@ def _openai_error(status_code: int, message: str, error_type: str = "invalid_req
     return JSONResponse(status_code=status_code, content={
         "error": {"message": message, "type": error_type, "code": str(status_code)},
     })
+
+
+def _geo_headers(route: dict, pinned: bool = False, current_country: str | None = None) -> dict:
+    """Centralized X-Geo-* headers (plan vivid-hinton §2).
+
+    Minimized on success (X-Geo-Status/Mode/Pinned only); detailed
+    X-Geo-Allowed/Current only on 403 (caller merges).
+    """
+    try:
+        resolved = _cfg_settings.resolve_geo(route) if isinstance(route, dict) else {}
+    except Exception:
+        resolved = {}
+    mode = str(resolved.get("mode", "strict")) if isinstance(resolved, dict) else "strict"
+    status = str(resolved.get("geo_status", "ok")) if isinstance(resolved, dict) else "ok"
+    # UI label: prefer -> best_effort
+    ui_mode = "best_effort" if mode == "prefer" else mode
+    h = {"X-Geo-Mode": ui_mode, "X-Geo-Status": status, "X-Geo-Pinned": "true" if pinned else "false"}
+    return h
+
+
+def _geo_block_response(route: dict, current_country: str | None, protocol: str, passthrough_451: bool = False) -> JSONResponse:
+    """403 (Anthropic 400) + error.type=geo_blocked + {status:451} + X-Geo-* + Retry-After:0.
+
+    Compat: never raw 451 unless X-Geo-Passthrough:1 (C2/S2). SSE caller
+    should emit event:error {type:geo_blocked status:451} separately.
+    """
+    try:
+        resolved = _cfg_settings.resolve_geo(route) if isinstance(route, dict) else {}
+    except Exception:
+        resolved = {}
+    effective = resolved.get("effective_allowed", set()) if isinstance(resolved, dict) else set()
+    allowed_list = sorted(effective) if isinstance(effective, set) else []
+    body_allowed = ", ".join(allowed_list) if allowed_list else ""
+    mode = str(resolved.get("mode", "strict")) if isinstance(resolved, dict) else "strict"
+    ui_mode = "best_effort" if mode == "prefer" else mode
+    status = str(resolved.get("geo_status", "ok")) if isinstance(resolved, dict) else "ok"
+    headers = {
+        "X-Geo-Blocked": "1",
+        "X-Geo-Allowed": body_allowed,
+        "X-Geo-Current": str(current_country or ""),
+        "X-Geo-Mode": ui_mode,
+        "X-Geo-Status": status,
+        "X-Geo-Pinned": "false",
+        "Retry-After": "0",
+    }
+    code = 451 if passthrough_451 else (400 if protocol == "anthropic" else 403)
+    payload_anthropic = {
+        "type": "error",
+        "error": {"type": "geo_blocked", "message": f"Geographic restriction: model not available from {current_country or 'current egress'} — allowed: {body_allowed or 'none'}"},
+        "status": 451, "code": "geo_unavailable", "allowed": allowed_list, "current": current_country,
+    }
+    payload_openai = {
+        "error": {"message": payload_anthropic["error"]["message"], "type": "geo_blocked", "code": "geo_unavailable", "status": 451, "allowed": allowed_list, "current": current_country},
+    }
+    content = payload_anthropic if protocol == "anthropic" else payload_openai
+    # Passthrough 451 natif only if header present (C2)
+    if passthrough_451:
+        code = 451
+    return JSONResponse(status_code=code, content=content, headers=headers)
+
+
+def _geo_sse_error(route: dict, current_country: str | None) -> bytes:
+    """SSE event:error {type:geo_blocked status:451} (does not clobber _sse_keepalive)."""
+    try:
+        resolved = _cfg_settings.resolve_geo(route) if isinstance(route, dict) else {}
+    except Exception:
+        resolved = {}
+    effective = resolved.get("effective_allowed", set()) if isinstance(resolved, dict) else set()
+    allowed_list = sorted(effective) if isinstance(effective, set) else []
+    payload = {"type": "error", "error": {"type": "geo_blocked", "message": f"Geographic restriction — allowed: {', '.join(allowed_list) or 'none'}", "status": 451, "code": "geo_unavailable", "allowed": allowed_list, "current": current_country}}
+    return _sse("error", payload)
 
 
 # Claude Code traite 401/403 comme un échec d'authentification → il affiche sa
@@ -4389,6 +4541,151 @@ async def messages(request: Request):
 
     _log(f"→ {original_model!r} → {model_id} | {protocol} | stream={body.get('stream', False)} | thinking={thinking_type} | effort={effort} | ip={client_ip}")
 
+    # ── Geo gate (P2 strict/prefer/warn orthogonal, single pin before free path) ─
+    _geo_info = None
+    _geo_passthrough = request.headers.get("X-Geo-Passthrough", "") == "1"
+    try:
+        _geo_info = _cfg_settings.resolve_geo(route)
+    except Exception:
+        _geo_info = {"effective_allowed": set(), "mode": "strict", "require_vpn": False, "geo_status": "ok"}
+    _geo_has = isinstance(route, dict) and isinstance(route.get("geo"), dict)
+    _geo_enabled = bool(getattr(_cfg_settings, "GEO_ENABLED", False))
+    if _geo_has and _geo_enabled:
+        _geo_mode = str(_geo_info.get("mode", "strict"))
+        _geo_status = str(_geo_info.get("geo_status", "ok"))
+        _geo_require = bool(_geo_info.get("require_vpn", False))
+        _geo_effective = _geo_info.get("effective_allowed", set())
+        # misconfigured strict → 403 sans pin (R2)
+        if _geo_status == "misconfigured":
+            _geo_block_total += 1
+            _debug(f"  [geo] misconfigured strict block route={original_model!r}")
+            is_stream_geo = body.get("stream", False)
+            if is_stream_geo:
+                async def _geo_err_stream():
+                    yield _geo_sse_error(route, None)
+                return StreamingResponse(_geo_err_stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Geo-Blocked": "1", "X-Geo-Status": "misconfigured"})
+            return _geo_block_response(route, None, protocol, passthrough_451=_geo_passthrough)
+        # require_vpn orthogonal: même warn/prefer bloquent si pas de VPN (L3-4)
+        _vpn_on = bool(getattr(_cfg_settings.IP_ROTATION, "get", lambda *a, **k: None)("enabled", False)) if isinstance(getattr(_cfg_settings, "IP_ROTATION", None), dict) else False
+        # also check live managers
+        try:
+            import shared_state as _ss_geo
+            _vpn_on = _vpn_on and bool(getattr(_ss_geo, "vpn_managers", None))
+        except Exception:
+            pass
+        if _geo_require and not _vpn_on:
+            _geo_block_total += 1
+            _debug(f"  [geo] require_vpn violated (vpn off) mode={_geo_mode}")
+            is_stream_geo2 = body.get("stream", False)
+            if is_stream_geo2:
+                async def _geo_req_stream():
+                    yield _geo_sse_error(route, None)
+                return StreamingResponse(_geo_req_stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Geo-Blocked": "1", "X-Geo-Status": _geo_status})
+            return _geo_block_response(route, None, protocol, passthrough_451=_geo_passthrough)
+        # strict without VPN and no require_vpn → still 403 (no pin possible)
+        if _geo_mode == "strict" and not _vpn_on and not _geo_require:
+            # misconfigured already handled; this is strict+no egress → 403
+            if _geo_effective is not None and isinstance(_geo_effective, set) and len(_geo_effective) > 0:
+                _geo_block_total += 1
+                _debug(f"  [geo] strict no-vpn block (no egress to pin)")
+                is_stream_geo3 = body.get("stream", False)
+                if is_stream_geo3:
+                    async def _geo_novpn_stream():
+                        yield _geo_sse_error(route, None)
+                    return StreamingResponse(_geo_novpn_stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Geo-Blocked": "1"})
+                return _geo_block_response(route, None, protocol, passthrough_451=_geo_passthrough)
+        # ── Active geo pin (P2/P3) ──
+        # strict: must pin to allowed, else 403. prefer: try pin, else forward with X-Geo-Pinned:false.
+        # warn: forward + header (unless require_vpn already handled).
+        _geo_current = None
+        try:
+            import shared_state as _ss_geo2
+            for _m in getattr(_ss_geo2, "vpn_managers", None) or []:
+                if _m and getattr(_m, "_current_country", None):
+                    _geo_current = _m._current_country
+                    break
+        except Exception:
+            pass
+        if _geo_has and _geo_enabled and _vpn_on and _geo_effective and isinstance(_geo_effective, set) and len(_geo_effective) > 0:
+            if _geo_current and _geo_current in _geo_effective:
+                # already in allowed → no-op, record header via _geo_headers later
+                pass
+            else:
+                # need pin — budget ≤ min(8s, ip_probe_budget)
+                try:
+                    _probe_budget = float(_cfg_settings.IP_ROTATION.get("ip_probe_budget", 8.0) or 8.0) if isinstance(getattr(_cfg_settings, "IP_ROTATION", None), dict) else 8.0
+                except Exception:
+                    _probe_budget = 8.0
+                _geo_budget = min(8.0, _probe_budget)
+                _geo_ok = False
+                # coalescing key + queue guard (P3)
+                _geo_key = frozenset(_geo_effective)
+                # breaker check: skip countries in OPEN breaker
+                _geo_candidates = set(_geo_effective)
+                try:
+                    _geo_candidates = {c for c in _geo_candidates if _geo_breaker.get((c, 0), 0) < _geo_breaker_threshold}
+                except Exception:
+                    pass
+                if not _geo_candidates:
+                    _geo_candidates = set(_geo_effective)
+                # bounded pin via ensure_geo_egress on active manager
+                try:
+                    import shared_state as _ss_pin
+                    _pin_mgr = None
+                    for _m in getattr(_ss_pin, "vpn_managers", None) or []:
+                        if _m and hasattr(_m, "ensure_geo_egress"):
+                            _pin_mgr = _m
+                            break
+                    if _pin_mgr is not None:
+                        _t0 = time.monotonic()
+                        _geo_ok = await asyncio.wait_for(_pin_mgr.ensure_geo_egress(_geo_candidates, timeout=_geo_budget), timeout=_geo_budget + 1.0)
+                        _elapsed_ms = int((time.monotonic() - _t0) * 1000)
+                        _geo_pin_duration.append(_elapsed_ms)
+                        if len(_geo_pin_duration) > _geo_pin_duration_max:
+                            _geo_pin_duration.pop(0)
+                        if _geo_ok:
+                            _geo_current = next(iter(_geo_candidates)) if len(_geo_candidates) == 1 else _geo_current
+                            _geo_pinned_country = _geo_current
+                            # reset breaker on success
+                            for c in _geo_candidates:
+                                _geo_breaker.pop((c, 0), None)
+                        else:
+                            for c in _geo_candidates:
+                                _geo_breaker[(c, 0)] = _geo_breaker.get((c, 0), 0) + 1
+                    else:
+                        _debug(f"  [geo] no manager with ensure_geo_egress — skip pin")
+                except asyncio.TimeoutError:
+                    _debug(f"  [geo] pin timeout budget={_geo_budget}s")
+                    for c in _geo_candidates:
+                        _geo_breaker[(c, 0)] = _geo_breaker.get((c, 0), 0) + 1
+                except Exception as e:
+                    _debug(f"  [geo] pin failed: {type(e).__name__}: {e}")
+                    for c in _geo_candidates:
+                        _geo_breaker[(c, 0)] = _geo_breaker.get((c, 0), 0) + 1
+                # mode handling
+                if _geo_mode == "strict" and not _geo_ok:
+                    _geo_block_total += 1
+                    _debug(f"  [geo] strict pin failed → 403")
+                    is_stream_geo4 = body.get("stream", False)
+                    if is_stream_geo4:
+                        async def _geo_pin_fail_stream():
+                            yield _geo_sse_error(route, _geo_current)
+                        return StreamingResponse(_geo_pin_fail_stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Geo-Blocked": "1", "X-Geo-Mode": "strict", "X-Geo-Pinned": "false", "Retry-After": "0"})
+                    return _geo_block_response(route, _geo_current, protocol, passthrough_451=_geo_passthrough)
+                elif _geo_mode == "prefer" and not _geo_ok:
+                    _debug(f"  [geo] prefer pin failed → forward with best_effort")
+                    # inject header for downstream (prefer fall-through)
+                    request.state._geo_fallback = True  # type: ignore
+                elif _geo_mode == "warn":
+                    request.state._geo_fallback = False  # type: ignore
+                # stash for response headers
+                request.state._geo_pinned = bool(_geo_ok)  # type: ignore
+                request.state._geo_current = _geo_current  # type: ignore
+                request.state._geo_mode = _geo_mode  # type: ignore
+                # forced_pool for free path (R3 single pin)
+                _geo_forced_pool = set(_geo_effective) if _geo_ok else None
+                request.state._geo_forced_pool = _geo_forced_pool  # type: ignore
+
     # Circuit breaker check
     if not _cb_should_allow(endpoint):
         _log(f"  CIRCUIT BREAKER OPEN — fast-failing request to {endpoint}")
@@ -4525,7 +4822,16 @@ async def messages(request: Request):
                          request_body=request_body, response_body=data)
             if cache_key:
                 _response_cache.put(cache_key, resp.content, {"Content-Type": "application/json"})
-            return Response(content=resp.content, headers={"X-Cache": "MISS"}, media_type="application/json")
+            # success headers (minimized X-Geo-*)
+            _succ_geo = {}
+            try:
+                _pinned = bool(getattr(request.state, "_geo_pinned", False))
+                _cur = getattr(request.state, "_geo_current", None)
+                if _geo_has and _geo_enabled:
+                    _succ_geo = _geo_headers(route, pinned=_pinned, current_country=_cur)
+            except Exception:
+                pass
+            return Response(content=resp.content, headers={"X-Cache": "MISS", **_succ_geo}, media_type="application/json")
 
 
         async def anthropic_stream(headers):
@@ -5342,6 +5648,91 @@ async def key_pauses_reset():
     return {"reset": "all", "count": count}
 
 
+@app.get("/api/free-models")
+async def free_models():
+    """Observability for auto free discovery (GET /api/free-models)."""
+    st = _cfg_settings._FREE_DISCOVERY_STATE
+    return {
+        "detected": sorted(_cfg_settings.FREE_MODELS),
+        "mapped": dict(_cfg_settings.FREE_MODEL_MAP),
+        "pool": list(_cfg_settings.FREE_MODEL_POOL),
+        "removed": list(st.get("removed", []) or []),
+        "last_refresh": st.get("last_refresh"),
+        "next_refresh": st.get("next_refresh"),
+        "source": st.get("source", "none"),
+        "consecutive_failures": int(st.get("consecutive_failures", 0) or 0),
+    }
+
+
+@app.post("/api/free-discovery/refresh")
+async def free_discovery_refresh(request: Request):
+    """Manual refresh of free discovery (POST /api/free-discovery/refresh).
+
+    Guards (plan hardening):
+    - DASHBOARD_TOKEN opt-in via X-Dashboard-Token (constant-time) → 401
+    - control_enabled without control_api_key → 403
+    - Rate-limit 1/min per IP → 429 with Retry-After
+    - Singleflight via app.state._free_discovery_lock
+    """
+    # DASHBOARD_TOKEN guard (same contract as dashboard/api.py)
+    _dash = os.getenv("DASHBOARD_TOKEN", "").strip()
+    if _dash:
+        provided = request.headers.get("X-Dashboard-Token", "")
+        if not provided or not hmac.compare_digest(provided, _dash):
+            return JSONResponse(status_code=401, content={
+                "error": "unauthorized",
+                "message": "Valid X-Dashboard-Token header required (DASHBOARD_TOKEN env).",
+            })
+    # control_api guard (ip_rotation.control_enabled requires a key)
+    _ctrl_enabled = bool(yaml_get("ip_rotation", "control_enabled", False))
+    _ctrl_key = str(yaml_get("ip_rotation", "control_api_key", "") or "").strip()
+    if _ctrl_enabled and not _ctrl_key:
+        return JSONResponse(status_code=403, content={
+            "error": "forbidden",
+            "message": "control_enabled requires control_api_key — set ip_rotation.control_api_key",
+        })
+    # Rate-limit 1/min per IP
+    ip = request.client.host if request.client else "unknown"
+    _rl = getattr(app.state, "_free_refresh_last_minute", None)
+    if _rl is None:
+        app.state._free_refresh_last_minute = {}
+        _rl = app.state._free_refresh_last_minute
+    now_m = time.monotonic()
+    last = _rl.get(ip, 0)
+    if last and (now_m - last) < 60:
+        retry = int(60 - (now_m - last)) + 1
+        return JSONResponse(status_code=429,
+                            content={"error": "rate_limited", "retry_after": retry},
+                            headers={"Retry-After": str(retry)})
+    # Singleflight
+    lock = getattr(app.state, "_free_discovery_lock", None)
+    if lock is None:
+        app.state._free_discovery_lock = asyncio.Lock()
+        lock = app.state._free_discovery_lock
+    async with lock:
+        # Re-check rate-limit inside lock (concurrent POSTs)
+        now2 = time.monotonic()
+        last2 = _rl.get(ip, 0)
+        if last2 and (now2 - last2) < 60:
+            retry = int(60 - (now2 - last2)) + 1
+            return JSONResponse(status_code=429,
+                                content={"error": "rate_limited", "retry_after": retry},
+                                headers={"Retry-After": str(retry)})
+        added = await asyncio.to_thread(_cfg_settings._ensure_free_models_sync)
+        _rl[ip] = time.monotonic()
+        try:
+            from dashboard.events import get_event_manager
+            get_event_manager().publish("free_models_updated", {
+                "detected": sorted(_cfg_settings.FREE_MODELS),
+                "source": _cfg_settings._FREE_DISCOVERY_STATE.get("source", "none"),
+            })
+        except Exception:
+            pass
+    return {"refreshed": True, "added": int(added or 0),
+            "detected": sorted(_cfg_settings.FREE_MODELS),
+            "source": _cfg_settings._FREE_DISCOVERY_STATE.get("source", "none")}
+
+
 @app.get("/v1/models")
 async def list_models():
     now = int(time.time())
@@ -5435,6 +5826,109 @@ async def chat_completions(request: Request):
     await _handle_web_search(body, model_id, protocol)
 
     _log(f"→ {original_model!r} → {model_id} | {protocol} | chat/completions | stream={is_stream} | thinking={thinking_type} | effort={effort} | ip={client_ip}")
+
+    # ── Geo gate (mirror messages gate) ──
+    _geo_info = None
+    _geo_passthrough = request.headers.get("X-Geo-Passthrough", "") == "1"
+    try:
+        _geo_info = _cfg_settings.resolve_geo(route)
+    except Exception:
+        _geo_info = {"effective_allowed": set(), "mode": "strict", "require_vpn": False, "geo_status": "ok"}
+    _geo_has = isinstance(route, dict) and isinstance(route.get("geo"), dict)
+    _geo_enabled = bool(getattr(_cfg_settings, "GEO_ENABLED", False))
+    if _geo_has and _geo_enabled:
+        _geo_mode = str(_geo_info.get("mode", "strict"))
+        _geo_status = str(_geo_info.get("geo_status", "ok"))
+        _geo_require = bool(_geo_info.get("require_vpn", False))
+        _geo_effective = _geo_info.get("effective_allowed", set())
+        if _geo_status == "misconfigured":
+            if is_stream:
+                async def _geo_err_stream2():
+                    yield _geo_sse_error(route, None)
+                return StreamingResponse(_geo_err_stream2(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Geo-Blocked": "1", "X-Geo-Status": "misconfigured"})
+            return _geo_block_response(route, None, "openai", passthrough_451=_geo_passthrough)
+        _vpn_on2 = bool(getattr(_cfg_settings.IP_ROTATION, "get", lambda *a, **k: None)("enabled", False)) if isinstance(getattr(_cfg_settings, "IP_ROTATION", None), dict) else False
+        try:
+            import shared_state as _ss_geo
+            _vpn_on2 = _vpn_on2 and bool(getattr(_ss_geo, "vpn_managers", None))
+        except Exception:
+            pass
+        if _geo_require and not _vpn_on2:
+            if is_stream:
+                async def _geo_req_stream2():
+                    yield _geo_sse_error(route, None)
+                return StreamingResponse(_geo_req_stream2(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Geo-Blocked": "1"})
+            return _geo_block_response(route, None, "openai", passthrough_451=_geo_passthrough)
+        if _geo_mode == "strict" and not _vpn_on2 and not _geo_require:
+            if _geo_effective is not None and isinstance(_geo_effective, set) and len(_geo_effective) > 0:
+                if is_stream:
+                    async def _geo_novpn_stream2():
+                        yield _geo_sse_error(route, None)
+                    return StreamingResponse(_geo_novpn_stream2(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Geo-Blocked": "1"})
+                return _geo_block_response(route, None, "openai", passthrough_451=_geo_passthrough)
+        # active pin (strict must pin, prefer fall-through, warn header only)
+        _geo_current2 = None
+        try:
+            import shared_state as _ss_geo2
+            for _m in getattr(_ss_geo2, "vpn_managers", None) or []:
+                if _m and getattr(_m, "_current_country", None):
+                    _geo_current2 = _m._current_country
+                    break
+        except Exception:
+            pass
+        if _geo_has and _geo_enabled and _vpn_on2 and _geo_effective and isinstance(_geo_effective, set) and len(_geo_effective) > 0:
+            if not (_geo_current2 and _geo_current2 in _geo_effective):
+                try:
+                    _probe_budget = float(_cfg_settings.IP_ROTATION.get("ip_probe_budget", 8.0) or 8.0) if isinstance(getattr(_cfg_settings, "IP_ROTATION", None), dict) else 8.0
+                except Exception:
+                    _probe_budget = 8.0
+                _geo_budget = min(8.0, _probe_budget)
+                _geo_ok = False
+                _geo_candidates = set(_geo_effective)
+                try:
+                    _geo_candidates = {c for c in _geo_candidates if _geo_breaker.get((c, 0), 0) < _geo_breaker_threshold}
+                except Exception:
+                    pass
+                if not _geo_candidates:
+                    _geo_candidates = set(_geo_effective)
+                try:
+                    import shared_state as _ss_pin
+                    _pin_mgr = None
+                    for _m in getattr(_ss_pin, "vpn_managers", None) or []:
+                        if _m and hasattr(_m, "ensure_geo_egress"):
+                            _pin_mgr = _m
+                            break
+                    if _pin_mgr is not None:
+                        _t0 = time.monotonic()
+                        _geo_ok = await asyncio.wait_for(_pin_mgr.ensure_geo_egress(_geo_candidates, timeout=_geo_budget), timeout=_geo_budget + 1.0)
+                        _elapsed_ms = int((time.monotonic() - _t0) * 1000)
+                        _geo_pin_duration.append(_elapsed_ms)
+                        if len(_geo_pin_duration) > _geo_pin_duration_max:
+                            _geo_pin_duration.pop(0)
+                        if _geo_ok:
+                            _geo_current2 = next(iter(_geo_candidates)) if len(_geo_candidates) == 1 else _geo_current2
+                            for c in _geo_candidates:
+                                _geo_breaker.pop((c, 0), None)
+                        else:
+                            for c in _geo_candidates:
+                                _geo_breaker[(c, 0)] = _geo_breaker.get((c, 0), 0) + 1
+                except asyncio.TimeoutError:
+                    for c in _geo_candidates:
+                        _geo_breaker[(c, 0)] = _geo_breaker.get((c, 0), 0) + 1
+                except Exception:
+                    for c in _geo_candidates:
+                        _geo_breaker[(c, 0)] = _geo_breaker.get((c, 0), 0) + 1
+                if _geo_mode == "strict" and not _geo_ok:
+                    if is_stream:
+                        async def _geo_pin_fail_stream2():
+                            yield _geo_sse_error(route, _geo_current2)
+                        return StreamingResponse(_geo_pin_fail_stream2(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Geo-Blocked": "1", "Retry-After": "0"})
+                    return _geo_block_response(route, _geo_current2, "openai", passthrough_451=_geo_passthrough)
+                elif _geo_mode == "prefer" and not _geo_ok:
+                    request.state._geo_fallback = True  # type: ignore
+                request.state._geo_pinned = bool(_geo_ok)  # type: ignore
+                request.state._geo_current = _geo_current2  # type: ignore
+                request.state._geo_mode = _geo_mode  # type: ignore
 
     # Circuit breaker check
     if not _cb_should_allow(endpoint):
@@ -6265,6 +6759,107 @@ async def responses(request: Request):
     is_stream = body.get("stream", False)
 
     _log(f"→ {original_model!r} → {model_id} | {protocol} | responses | stream={is_stream} | ip={client_ip}")
+
+    # ── Geo gate (mirror) ──
+    _geo_info = None
+    _geo_passthrough = request.headers.get("X-Geo-Passthrough", "") == "1"
+    try:
+        _geo_info = _cfg_settings.resolve_geo(route)
+    except Exception:
+        _geo_info = {"effective_allowed": set(), "mode": "strict", "require_vpn": False, "geo_status": "ok"}
+    _geo_has = isinstance(route, dict) and isinstance(route.get("geo"), dict)
+    _geo_enabled = bool(getattr(_cfg_settings, "GEO_ENABLED", False))
+    if _geo_has and _geo_enabled:
+        _geo_mode = str(_geo_info.get("mode", "strict"))
+        _geo_status = str(_geo_info.get("geo_status", "ok"))
+        _geo_require = bool(_geo_info.get("require_vpn", False))
+        _geo_effective = _geo_info.get("effective_allowed", set())
+        if _geo_status == "misconfigured":
+            if is_stream:
+                async def _geo_err_stream3():
+                    yield _geo_sse_error(route, None)
+                return StreamingResponse(_geo_err_stream3(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Geo-Blocked": "1"})
+            return _geo_block_response(route, None, protocol, passthrough_451=_geo_passthrough)
+        _vpn_on3 = bool(getattr(_cfg_settings.IP_ROTATION, "get", lambda *a, **k: None)("enabled", False)) if isinstance(getattr(_cfg_settings, "IP_ROTATION", None), dict) else False
+        try:
+            import shared_state as _ss_geo
+            _vpn_on3 = _vpn_on3 and bool(getattr(_ss_geo, "vpn_managers", None))
+        except Exception:
+            pass
+        if _geo_require and not _vpn_on3:
+            if is_stream:
+                async def _geo_req_stream3():
+                    yield _geo_sse_error(route, None)
+                return StreamingResponse(_geo_req_stream3(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Geo-Blocked": "1"})
+            return _geo_block_response(route, None, protocol, passthrough_451=_geo_passthrough)
+        if _geo_mode == "strict" and not _vpn_on3 and not _geo_require:
+            if _geo_effective is not None and isinstance(_geo_effective, set) and len(_geo_effective) > 0:
+                if is_stream:
+                    async def _geo_novpn_stream3():
+                        yield _geo_sse_error(route, None)
+                    return StreamingResponse(_geo_novpn_stream3(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Geo-Blocked": "1"})
+                return _geo_block_response(route, None, protocol, passthrough_451=_geo_passthrough)
+        _geo_current3 = None
+        try:
+            import shared_state as _ss_geo2
+            for _m in getattr(_ss_geo2, "vpn_managers", None) or []:
+                if _m and getattr(_m, "_current_country", None):
+                    _geo_current3 = _m._current_country
+                    break
+        except Exception:
+            pass
+        if _geo_has and _geo_enabled and _vpn_on3 and _geo_effective and isinstance(_geo_effective, set) and len(_geo_effective) > 0:
+            if not (_geo_current3 and _geo_current3 in _geo_effective):
+                try:
+                    _probe_budget = float(_cfg_settings.IP_ROTATION.get("ip_probe_budget", 8.0) or 8.0) if isinstance(getattr(_cfg_settings, "IP_ROTATION", None), dict) else 8.0
+                except Exception:
+                    _probe_budget = 8.0
+                _geo_budget = min(8.0, _probe_budget)
+                _geo_ok = False
+                _geo_candidates = set(_geo_effective)
+                try:
+                    _geo_candidates = {c for c in _geo_candidates if _geo_breaker.get((c, 0), 0) < _geo_breaker_threshold}
+                except Exception:
+                    pass
+                if not _geo_candidates:
+                    _geo_candidates = set(_geo_effective)
+                try:
+                    import shared_state as _ss_pin
+                    _pin_mgr = None
+                    for _m in getattr(_ss_pin, "vpn_managers", None) or []:
+                        if _m and hasattr(_m, "ensure_geo_egress"):
+                            _pin_mgr = _m
+                            break
+                    if _pin_mgr is not None:
+                        _t0 = time.monotonic()
+                        _geo_ok = await asyncio.wait_for(_pin_mgr.ensure_geo_egress(_geo_candidates, timeout=_geo_budget), timeout=_geo_budget + 1.0)
+                        _elapsed_ms = int((time.monotonic() - _t0) * 1000)
+                        _geo_pin_duration.append(_elapsed_ms)
+                        if len(_geo_pin_duration) > _geo_pin_duration_max:
+                            _geo_pin_duration.pop(0)
+                        if _geo_ok:
+                            for c in _geo_candidates:
+                                _geo_breaker.pop((c, 0), None)
+                        else:
+                            for c in _geo_candidates:
+                                _geo_breaker[(c, 0)] = _geo_breaker.get((c, 0), 0) + 1
+                except asyncio.TimeoutError:
+                    for c in _geo_candidates:
+                        _geo_breaker[(c, 0)] = _geo_breaker.get((c, 0), 0) + 1
+                except Exception:
+                    for c in _geo_candidates:
+                        _geo_breaker[(c, 0)] = _geo_breaker.get((c, 0), 0) + 1
+                if _geo_mode == "strict" and not _geo_ok:
+                    if is_stream:
+                        async def _geo_pin_fail_stream3():
+                            yield _geo_sse_error(route, _geo_current3)
+                        return StreamingResponse(_geo_pin_fail_stream3(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Geo-Blocked": "1", "Retry-After": "0"})
+                    return _geo_block_response(route, _geo_current3, protocol, passthrough_451=_geo_passthrough)
+                elif _geo_mode == "prefer" and not _geo_ok:
+                    request.state._geo_fallback = True  # type: ignore
+                request.state._geo_pinned = bool(_geo_ok)  # type: ignore
+                request.state._geo_current = _geo_current3  # type: ignore
+                request.state._geo_mode = _geo_mode  # type: ignore
 
     # Circuit breaker check
     if not _cb_should_allow(endpoint):

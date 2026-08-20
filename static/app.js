@@ -3248,6 +3248,38 @@ document.addEventListener('DOMContentLoaded', () => {
             }
         }
 
+        // [vivid-hinton P4] geo banner + badges + kill-switch (strict/best_effort/warn)
+        const geoBanner = document.getElementById('geo-banner');
+        const geoToggleBtn = document.getElementById('geo-toggle-btn');
+        const geoBadge = document.getElementById('geo-badge');
+        if (geoBanner) {
+            const geo = data.geo || {};
+            const cur = data.current_country || '';
+            const allowedFor = data.current_country_allowed_for || [];
+            if (geoToggleBtn) geoToggleBtn.textContent = geo.enabled ? '🌍 Géo: ON' : '🌍 Géo: OFF';
+            if (geoBadge) {
+                const badgeMap = { strict: '🔴 strict', prefer: '🟠 best_effort', warn: '⚪ warn' };
+                // derive dominant mode from vpn-status geo if available
+                geoBadge.textContent = geo.enabled ? (badgeMap[geo.mode] || '') : '';
+            }
+            if (!geo.enabled) {
+                geoBanner.innerHTML = '🌍 <strong>Géo</strong> désactivée (kill-switch) — aucune restriction active.';
+                geoBanner.style.display = 'block';
+                geoBanner.style.background = 'rgba(120,120,120,0.12)';
+                geoBanner.style.border = '1px solid var(--border,#555)';
+                geoBanner.style.color = 'var(--text-muted)';
+            } else if (cur) {
+                const n = allowedFor.length;
+                geoBanner.innerHTML = '🌍 Pays actuel <strong>' + escHtml(cur) + '</strong> — ' + n + ' route(s) autorisée(s)' + (n ? ': ' + allowedFor.map(escHtml).join(', ') : '');
+                geoBanner.style.display = 'block';
+                geoBanner.style.background = 'rgba(80,160,255,0.10)';
+                geoBanner.style.border = '1px solid rgba(80,160,255,0.35)';
+                geoBanner.style.color = 'var(--text)';
+            } else {
+                geoBanner.style.display = 'none';
+            }
+        }
+
         // [plan 18/08 §4] N-station — one row per active tunnel, rendered
         // from the pool's stations[] payload (was a fixed station-2 block).
         // Countries overlay comes from data.countries (below); active_station
@@ -4014,6 +4046,17 @@ document.addEventListener('DOMContentLoaded', () => {
             method: 'POST', headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({rotate: enabled})
         });
+    };
+
+    window.toggleGeo = async function() {
+        const cur = await fetchWithToken('/api/geo-policies').then(r => r.json());
+        const enabled = !cur.enabled;
+        await fetchWithToken('/api/geo-policies', { method: 'PUT', headers: {'Content-Type': 'application/json', 'If-Match': String(Date.now())}, body: JSON.stringify({enabled, version: cur.version}) });
+        refreshVPNStatus();
+    };
+    window.rollbackGeo = async function() {
+        await fetchWithToken('/api/geo-policies/rollback', { method: 'POST' });
+        refreshVPNStatus();
     };
 
     // Refresh VPN status every 10 seconds when VPN tab is active

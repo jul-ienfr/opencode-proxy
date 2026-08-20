@@ -159,6 +159,29 @@ The dashboard features 4 tabs with real-time updates via SSE (Server-Sent Events
 - Color-coded progress bars (green < 60%, orange 60–85%, red > 85%)
 - Auto-refreshes every 5 minutes + instant update on change
 
+### Free Models — auto-discovery
+
+The proxy auto-discovers every `*-free` model announced on [Zen docs](https://opencode.ai/docs/fr/zen/) without any manual `config.yaml` edit.
+
+- **Live at startup**: `GET https://opencode.ai/zen/v1/models` + `GET https://opencode.ai/zen/go/v1/models` (union, dedup), filtered by cascade `pricing {input:0,output:0}` → `is_free`/`free`/`capabilities.free` → suffix `-free`. Fallback filet: scrape docs HTML `(?i)<td>*-free</td>` only if the API returns nothing.
+- **Instantly routable**: each new free id is added to `MODELS` (`{endpoint, protocol}`) — `muse-*`/`spark-*` → `https://opencode.ai/zen/v1/responses`, the rest → `free_base` — and, when a paid model has a `paid → paid-free` homonym (e.g. `hy3 → hy3-free`), a `free_model_map` entry is created automatically.
+- **Pool fallback** (no blind remap): payants without homonym stay unmapped; they fall back to `FREE_MODEL_POOL = sorted(FREE_MODELS)` on `429`/`max_free_attempts` (round-robin, family-preferential). `custom_routes` are never mutated.
+- **Durable + audit**: add-only merge, delta-check (`if new_set == FREE_MODELS: no-op` — no `mtime` bump), atomic `tmp+fsync+os.replace` under `_reload_lock`; removed upstream ids are never deleted, just logged (`[free-discovery] upstream removed … — keeping local`) and exposed in `GET /api/free-models → {removed}`.
+- **Lifecycle**: fire-and-forget at boot (no boot delay if Zen is down) + background loop `GET /models` every `free_discovery.interval` s (default 3600 s, `±10 %` jitter; after 3 consecutive failures `min(7200, interval×2)` backoff). On-demand `POST /api/free-discovery/refresh` (singleflight lock, guarded by `control_api_key` when `control_enabled`, `429` if >1/min).
+- **Observability**: `GET /api/free-models → {detected, mapped, pool, removed, last_refresh, next_refresh, source, consecutive_failures}` + dashboard badge + event `free_models_updated`. **5 free models covered with no manual step**: `mimo-v2.5-free`, `hy3-free`, `nemotron-3-ultra-free`, `nemotron-3.5-lightning-free`, `muse-spark-1.2-contributor-free` — `mimo-v2.5-free` is the live `free_model_map` target for the 6 `minimax-*`/`qwen*` payants (strict rotation); the other 4 are discovered and instantly usable in `model: hy3-free` etc.
+
+Config keys (all optional, defaults shown):
+
+```yaml
+free_discovery:
+  enabled: true
+  interval: 3600
+  auto_persist: true
+  default_target: mimo-v2.5-free
+upstream:
+  free_models_url: ''   # override GET /models URL; empty = auto (free_base + openai_base)
+```
+
 ### Configuration
 - **Proxy Status**: Running/stopped indicator, start/stop buttons, click-to-copy localhost and LAN addresses
 - **Model Mapping**: Map opus/sonnet/haiku to any available backend model, with pass-through toggle
@@ -190,6 +213,8 @@ The dashboard features 4 tabs with real-time updates via SSE (Server-Sent Events
 | GET | `/api/logs` | Terminal logs |
 | GET | `/api/events` | SSE event stream (real-time updates) |
 | GET | `/api/quotas` | OpenCode Go quota usage |
+| GET | `/api/free-models` | Free-model discovery snapshot `{detected,mapped,pool,removed,last_refresh,next_refresh,source,consecutive_failures}` |
+| POST | `/api/free-discovery/refresh` | Force a discovery refresh (singleflight, rate-limited) |
 | GET | `/api/free-model-usage` | Free model request counters |
 | GET | `/api/config` | Full proxy configuration |
 | POST | `/api/config` | Update configuration at runtime |

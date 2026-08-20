@@ -862,6 +862,109 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
             "lang": os.getenv("PROXY_LANG", "en"),
         }
 
+    @app.get("/api/routes")
+    async def get_routes(request: Request, q: str = None, geo_status: str = None, limit: int = 50, offset: int = 0):
+        """Routes with geo enrichment + pagination (vivid-hinton P4)."""
+        limit = max(1, min(200, int(limit or 50)))
+        offset = max(0, int(offset or 0))
+        items = []
+        for key, route in config_settings.ROUTES.items():
+            try:
+                g = config_settings.resolve_geo(route)
+            except Exception:
+                g = {"effective_allowed": set(), "mode": "strict", "require_vpn": False, "geo_status": "ok"}
+            status = str(g.get("geo_status", "ok"))
+            if geo_status and status != geo_status:
+                continue
+            if q and q.lower() not in key.lower() and q.lower() not in str(route.get("model", "")).lower():
+                continue
+            eff = g.get("effective_allowed", set())
+            items.append({
+                "key": key,
+                "match": route.get("match", []),
+                "model": route.get("model", ""),
+                "thinking": route.get("thinking"),
+                "geo": route.get("geo"),
+                "geo_status": status,
+                "effective_allowed": sorted(eff) if isinstance(eff, set) else [],
+                "mode": g.get("mode", "strict"),
+                "require_vpn": bool(g.get("require_vpn", False)),
+            })
+        total = len(items)
+        page = items[offset:offset + limit]
+        return {"routes": page, "total": total, "limit": limit, "offset": offset, "has_more": offset + limit < total}
+
+    @app.get("/api/geo-policies")
+    async def get_geo_policies(request: Request):
+        err = _check_dashboard_token(request)
+        if err:
+            return err
+        return {
+            "enabled": bool(getattr(config_settings, "GEO_ENABLED", False)),
+            "version": int(getattr(config_settings, "GEO_VERSION", 1) or 1),
+            "policies": dict(getattr(config_settings, "GEO_POLICIES", {}) or {}),
+        }
+
+    @app.put("/api/geo-policies")
+    async def put_geo_policies(request: Request):
+        err = _check_dashboard_token(request)
+        if err:
+            return err
+        # X-API-Key control-server guard + If-Match ETag
+        ctrl_key = str(config_settings.yaml_get("ip_rotation", "control_api_key", "") or "").strip()
+        provided_ctrl = request.headers.get("X-API-Key", "")
+        if ctrl_key and provided_ctrl != ctrl_key:
+            return JSONResponse(status_code=401, content={"error": "unauthorized", "message": "Valid X-API-Key required"})
+        # ETag via mtime
+        current_mtime = _config_yaml_mtime()
+        etag = str(int(current_mtime))
+        if_match = request.headers.get("If-Match", "")
+        if if_match and if_match != etag and if_match != f'"{etag}"':
+            return JSONResponse(status_code=412, content={"error": "precondition_failed", "message": "Stale ETag — reload and retry"})
+        body = await request.json()
+        # Validate schema
+        if "enabled" in body:
+            config_settings.GEO_ENABLED = bool(body["enabled"])
+            config_settings._yaml_data.setdefault("geo", {})["enabled"] = bool(body["enabled"])
+        if "version" in body:
+            try:
+                config_settings.GEO_VERSION = int(body["version"])
+                config_settings._yaml_data.setdefault("geo", {})["version"] = int(body["version"])
+            except Exception:
+                return JSONResponse(status_code=400, content={"error": "version must be int"})
+        if "policies" in body:
+            pol = body["policies"]
+            if not isinstance(pol, dict):
+                return JSONResponse(status_code=400, content={"error": "policies must be object"})
+            config_settings.GEO_POLICIES.clear()
+            config_settings.GEO_POLICIES.update(pol)
+            config_settings.SORTED_GEO_POLICIES[:] = sorted(pol.items())
+            config_settings._yaml_data.setdefault("geo", {})["policies"] = dict(pol)
+        # persist
+        try:
+            config_settings.save_yaml_config()
+            global _config_yaml_known_mtime
+            _config_yaml_known_mtime = _config_yaml_mtime()
+        except Exception as e:
+            return JSONResponse(status_code=500, content={"error": str(e)})
+        return {"ok": True, "enabled": bool(config_settings.GEO_ENABLED), "version": int(config_settings.GEO_VERSION), "etag": str(int(_config_yaml_mtime()))}
+
+    @app.post("/api/geo-policies/rollback")
+    async def geo_rollback(request: Request):
+        err = _check_dashboard_token(request)
+        if err:
+            return err
+        # Rollback = toggle enabled off (kill-switch) — simple N-1 without history
+        config_settings.GEO_ENABLED = False
+        config_settings._yaml_data.setdefault("geo", {})["enabled"] = False
+        try:
+            config_settings.save_yaml_config()
+            global _config_yaml_known_mtime
+            _config_yaml_known_mtime = _config_yaml_mtime()
+        except Exception as e:
+            return JSONResponse(status_code=500, content={"error": str(e)})
+        return {"ok": True, "enabled": False}
+
     @app.get("/api/config/custom-routes")
     async def get_custom_routes():
         return config_settings.CUSTOM_ROUTES
@@ -1676,6 +1779,41 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
                 "proxies": _socks5_payload(shared_state.free_ip_pool),
                 "rotate": _socks5_auto_rotate_state(),
             }
+            # [vivid-hinton P4] geo enrichment for vpn-status
+            try:
+                import opencode as _oc
+                _dur = getattr(_oc, "_geo_pin_duration", [])
+                _avg = sum(_dur) / len(_dur) if _dur else 0
+            except Exception:
+                _dur, _avg = [], 0
+            data["geo"] = {
+                "enabled": bool(getattr(config_settings, "GEO_ENABLED", False)),
+                "version": int(getattr(config_settings, "GEO_VERSION", 1) or 1),
+                "block_total": int(getattr(_oc, "_geo_block_total", 0)) if '_oc' in locals() else 0,
+                "pin_latency_avg_ms": round(_avg, 1),
+                "pin_latency_p95_ms": round(sorted(_dur)[int(len(_dur)*0.95)] if _dur else 0, 1),
+                "queue_depth": len(getattr(_oc, "_geo_breaker", {})) if '_oc' in locals() else 0,
+            }
+            # per-route allowed check for current country
+            try:
+                cur_country = None
+                for mgr in managers:
+                    if mgr and getattr(mgr, "_current_country", None):
+                        cur_country = mgr._current_country
+                        break
+                data["current_country"] = cur_country
+                allowed_for = []
+                for k, route in config_settings.ROUTES.items():
+                    try:
+                        g = config_settings.resolve_geo(route)
+                        eff = g.get("effective_allowed", set())
+                        if isinstance(eff, set) and cur_country and cur_country in eff:
+                            allowed_for.append(k)
+                    except Exception:
+                        pass
+                data["current_country_allowed_for"] = allowed_for
+            except Exception:
+                pass
             countries = {}
             # [plan 18/08 §4] N-station: per-station country overlay for
             # every active tunnel (was mgr1+mgr2 fixed pair).
