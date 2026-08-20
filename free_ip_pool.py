@@ -23,11 +23,73 @@ exhausted.
 import time
 import logging
 import asyncio
+import urllib.parse
 from typing import Optional
 
 from vpn_manager import RotationFailed, VPNManager
 
 logger = logging.getLogger(__name__)
+
+
+class Socks5Endpoint:
+    """[Axe 3.1] One static SOCKS5 proxy, duck-typed to look like a VPNManager
+    station to the pool's request/selection machinery.
+
+    Lives OUTSIDE ``_stations``: its ``_station`` is a negative id
+    (``-1 - index``) so it can never collide with docker stations 1..10, and
+    ``_launch_rotation``'s ``_station_ids`` guard rejects it — a static proxy
+    has no docker container to rotate. ``status`` is "connected" by
+    definition (the URL is reachable until the request path says otherwise);
+    ``current_ip``/``current_server`` stay None until the request path has
+    actually been served through it. ``note_free_request`` and
+    ``arm_egress_watchdog`` are no-ops (no docker activity, no watchdog to
+    arm — the pool's bad-mark handles a dead proxy).
+    """
+
+    def __init__(self, host, port, username=None, password=None,
+                 enabled=True, index=0):
+        self.host = str(host)
+        self.port = int(port)
+        self.username = username
+        self.password = password
+        self.enabled = bool(enabled)
+        self._station = -1 - int(index)  # negative — never a docker station
+        self.pid = f"{self.host}:{self.port}"
+        self._quota_per_ip = 0  # filled by set_socks5_proxies / update_config
+        self.status = "connected"
+        self.current_ip = None
+        self.current_server = None
+
+    @property
+    def has_password(self) -> bool:
+        return bool(self.password)
+
+    @property
+    def socks5_url(self) -> str:
+        """socks5://[user:pass@]host:port — auth URL-escaped."""
+        if self.username or self.password:
+            user = urllib.parse.quote(self.username or "", safe="")
+            pwd = urllib.parse.quote(self.password or "", safe="")
+            auth = f"{user}:{pwd}@"
+        else:
+            auth = ""
+        return f"socks5://{auth}{self.host}:{self.port}"
+
+    def note_free_request(self) -> None:
+        pass  # nothing to account for on a static proxy
+
+    def arm_egress_watchdog(self) -> None:
+        pass  # no docker watchdog — the pool bad-mark owns recovery
+
+    def get_status(self) -> dict:
+        return {
+            "pid": self.pid,
+            "host": self.host,
+            "port": self.port,
+            "enabled": self.enabled,
+            "has_password": self.has_password,
+            "quota_per_ip": self._quota_per_ip,
+        }
 
 
 class FreeIPPool:
@@ -41,6 +103,14 @@ class FreeIPPool:
 
     _CONNECT_RETRY_INTERVAL = 300  # min seconds between docker reconnect attempts when down
     _BAD_TTL = 60  # seconds a 429 keeps a station out of rotation before it can be retried
+    # [Axe 1.1] Rotation concurrency: how many stations may rotate at the
+    # same time. Bounded — a single blocked rotation (budget up to
+    # rotation_wait_timeout, plus docker ops) must not freeze the fleet.
+    _ROTATION_CONCURRENCY = 2
+    # [Axe 1.2] Consecutive post-commit-probe failures that trigger an
+    # IMMEDIATE re-rotation. After the cap the watchdog owns recovery —
+    # a persistently flapping tunnel must not hot-loop the docker stack.
+    _POST_COMMIT_RETRY_MAX = 2
 
     def __init__(self, vpn_manager: VPNManager,
                  vpn_manager_2: Optional[VPNManager] = None):
@@ -48,6 +118,11 @@ class FreeIPPool:
         self._stations = [vpn_manager]
         if vpn_manager_2 is not None:
             self._stations.append(vpn_manager_2)
+        # [plan 18/08 §2.3] Station-number set mirroring ``_stations`` —
+        # O(1) "is this station known?" check for _launch_rotation (a
+        # request handler holding a RETIRED manager must not re-queue it
+        # after a downscale).
+        self._station_ids = {m._station for m in self._stations}
         self._active_station: Optional[VPNManager] = None  # last station used by on_request
         self._total_free_requests = 0
         # Per-station state (request counters, IP stats, 429-bad TTL...)
@@ -75,13 +150,25 @@ class FreeIPPool:
         # usable. Bounded: on timeout the request falls back to paid (None,
         # None) instead of serving the burned IP (guaranteed 429 → paid).
         self._rotation_wait_timeout = 20.0
-        # Serialized rotation coordinator (C4/C5): ONE worker drains the
-        # queue, so two stations never run physical rotations at the same
-        # time. `_pending` dedups stations already queued (single-flight
-        # per station, alongside `_rotation_tasks` for in-flight ones).
+        # [Axe 1.1] Bounded rotation coordinator: up to _ROTATION_CONCURRENCY
+        # workers drain the queue in parallel, so a blocked rotation on one
+        # station (budget wait + docker ops) no longer freezes the fleet.
+        # `_pending` dedups stations already queued (single-flight per
+        # station, alongside `_rotation_tasks` for in-flight ones).
         self._rotation_queue: asyncio.Queue = asyncio.Queue()
         self._pending: set[int] = set()
-        self._worker_task: Optional[asyncio.Task] = None
+        self._worker_tasks: list = []  # rotation workers, pruned lazily
+
+        # [Axe 3.1] Static SOCKS5 proxies (socks5 mode — list of curated
+        # proxies instead of docker stations; NO docker is ever touched).
+        self._socks5_proxies: list = []  # validated config rows {host, port, ...}
+        self._socks5_eps: list = []      # parsed Socks5Endpoint list (negative sids)
+        self._socks5_rr = 0              # round-robin cursor (index into _socks5_eps)
+        self._socks5_current = None      # last endpoint used by on_request
+        # [Axe 3.1] True (default) = round-robin on every request; False =
+        # stick to the current proxy while usable (rotation only via
+        # bad-mark or the manual rotate endpoint).
+        self._socks5_auto_rotate = True
 
     # ── Properties ─────────────────────────────────────────────
 
@@ -91,8 +178,14 @@ class FreeIPPool:
 
     @property
     def proxy_mode(self) -> str:
-        """Return the current proxy mode: vpn, or direct."""
+        """Return the current proxy mode: vpn, socks5, or direct."""
         return self._vpn.proxy_mode
+
+    @property
+    def socks5_mode(self) -> bool:
+        """True when free traffic routes through the static SOCKS5 list
+        (proxy_mode == "socks5" and the pool is enabled)."""
+        return self._vpn.enabled and self._vpn.proxy_mode == "socks5"
 
     @property
     def dual_station(self) -> bool:
@@ -106,8 +199,16 @@ class FreeIPPool:
         Gluetun is the only backend (compose-managed Docker): free requests
         are routed via SOCKS5 (the HTTP proxy is not routed on Windows
         Docker Desktop). Returns None when not connected or disabled.
+
+        [Axe 3.1] socks5 mode: the last-used static proxy (or the next
+        round-robin one) — NO docker ever involved.
         """
-        if not self._vpn.enabled or self._vpn.proxy_mode != "vpn":
+        if not self._vpn.enabled:
+            return None
+        if self._vpn.proxy_mode == "socks5":
+            ep = self._socks5_current or self._socks5_next()
+            return ep.socks5_url if ep is not None else None
+        if self._vpn.proxy_mode != "vpn":
             return None
         best = self._best_station()
         if best is None or best.status != "connected":
@@ -139,6 +240,11 @@ class FreeIPPool:
                 "last_connect_attempt": None,
                 "last_quota_per_ip": None,  # hot-reload detection (CRITIC(11))
                 "bad_until": None,          # set by a 429 (double embrayage)
+                # [Axe 1.2] Consecutive dead probes right after a rotation
+                # commit (fresh tunnel committed but not egressing). Reset
+                # on any alive probe; capped at _POST_COMMIT_RETRY_MAX
+                # before the watchdog owns recovery (no docker hot-loop).
+                "post_commit_retry_count": 0,
             }
         return per
 
@@ -148,8 +254,17 @@ class FreeIPPool:
         Station N rotates ``rotation_stagger * (N - 1)`` requests earlier
         than station 1, so the two stations' quota walls never coincide —
         station 2 always crosses its threshold first and rotates while
-        station 1 keeps serving (and vice versa on the next cycle)."""
-        return max(0, station._quota_per_ip - 10 -
+        station 1 keeps serving (and vice versa on the next cycle).
+
+        [Revue 19/08] The floor is 1, NEVER 0: with a small quota
+        (quota_per_ip 15, stagger 2 → stations 4-6 compute a negative
+        headroom) the old ``max(0, ...)`` made every request cross the
+        threshold and re-queue a rotation per request. The floor keeps the
+        quota wall at a sane distance; the caller (``on_request``) routes a
+        degenerate threshold (== 1) through the THROTTLED kick instead of
+        the unthrottled dual-clutch launch — pacing rotations instead of
+        hot-looping them."""
+        return max(1, station._quota_per_ip - 10 -
                    self._rotation_stagger * max(0, station._station - 1))
 
     def _station_usable(self, station: VPNManager, *, exclude_approaching: bool) -> bool:
@@ -195,6 +310,17 @@ class FreeIPPool:
                     return st
         return None
 
+    def _best_station_excluding_many(self, excluded: set) -> Optional[VPNManager]:
+        """Best station NOT in ``excluded`` (cumulative retries: never
+        re-strike an IP/bucket already used in this request's free attempts)."""
+        for exclude_approaching in (True, False):
+            for st in self._stations:
+                if st in excluded:
+                    continue
+                if self._station_usable(st, exclude_approaching=exclude_approaching):
+                    return st
+        return None
+
     def _any_other_usable(self, station: VPNManager) -> bool:
         """True when at least one OTHER station is usable right now (C1 —
         the "never bad-mark the last standing station" guard)."""
@@ -204,6 +330,151 @@ class FreeIPPool:
             if self._station_usable(st, exclude_approaching=False):
                 return True
         return False
+
+    # [Axe 3.1] Static SOCKS5 proxies (socks5 mode — NO docker is ever
+    # touched). The proxy list is an alternative backend to the docker
+    # stations: negative sids (-1 - index) keep them outside ``_stations``
+    # and ``_launch_rotation``'s ``_station_ids`` guard, so the whole docker
+    # rotation/watchdog machinery is inert in socks5 mode.
+
+    def _socks5_enabled_eps(self) -> list:
+        return [ep for ep in self._socks5_eps if ep.enabled]
+
+    def _socks5_usable(self, ep, *, exclude_approaching: bool) -> bool:
+        """Like ``_station_usable`` but for a static SOCKS5 endpoint — same
+        counters and bad-until checks keyed by its negative sid.
+
+        [Revue 19/08] A DISABLED proxy is never usable: ``_station_usable``
+        has no notion of ``enabled`` (it was built for VPNManager), so the
+        stick branch of ``on_request`` would otherwise keep serving a proxy
+        the operator just toggled off (or re-resolve one disabled by a
+        config hot-reload)."""
+        if not ep.enabled:
+            return False
+        return self._station_usable(ep, exclude_approaching=exclude_approaching)
+
+    def _socks5_next(self, excluded=None) -> Optional[Socks5Endpoint]:
+        """Next static proxy in round-robin order.
+
+        Two passes (like ``_best_station_excluding``): the preferred pass
+        skips proxies at/over their rotation threshold, the second pass
+        admits them so a request still gets a shot at the free tier instead
+        of falling back to paid while every proxy is mid-quota. Advances
+        ``_socks5_rr`` to the chosen index so the following request rotates
+        on.
+        """
+        eps = self._socks5_enabled_eps()
+        if not eps:
+            return None
+        excluded = excluded or set()
+        n = len(eps)
+        start = (self._socks5_rr + 1) % n
+        for exclude_approaching in (True, False):
+            for i in range(n):
+                idx = (start + i) % n
+                ep = eps[idx]
+                if ep in excluded:
+                    continue
+                if self._socks5_usable(ep, exclude_approaching=exclude_approaching):
+                    self._socks5_rr = idx
+                    return ep
+        return None
+
+    def _socks5_best_excluding(self, ep) -> Optional[Socks5Endpoint]:
+        """Next usable proxy that is NOT ``ep`` (for a dual-clutch switch
+        when the current one approaches quota)."""
+        return self._socks5_next(excluded={ep})
+
+    def _socks5_any_other(self, ep) -> bool:
+        """True when at least one OTHER enabled proxy is usable (C1 guard
+        applied to the static list — never bad-mark the last proxy)."""
+        for other in self._socks5_enabled_eps():
+            if other is ep:
+                continue
+            if self._station_usable(other, exclude_approaching=False):
+                return True
+        return False
+
+    def set_socks5_proxies(self, proxies: list) -> None:
+        """[Axe 3.1] Replace the static SOCKS5 list from config.yaml
+        ``ip_rotation.socks5_proxies``.
+
+        Validates host/port, carries per-proxy request/bad state across the
+        rebuild by pid (so a hot-reload keeps counters instead of resetting
+        quota walls), prunes the state of removed proxies, resets the
+        round-robin cursor and re-resolves the current endpoint by pid.
+        """
+        new_rows = []
+        for row in proxies:
+            host = str(row.get("host") or "").strip()
+            try:
+                port = int(row.get("port"))
+            except (TypeError, ValueError):
+                port = 0
+            if not host or not (1 <= port <= 65535):
+                logger.warning("[free-ip] skipping invalid socks5 proxy %r", row)
+                continue
+            new_rows.append({
+                "host": host,
+                "port": port,
+                "username": row.get("username"),
+                "password": row.get("password"),
+                "enabled": bool(row.get("enabled", True)),
+            })
+        old_by_pid = {}
+        for ep in self._socks5_eps:
+            old_by_pid[ep.pid] = (ep, self._per.get(ep._station))
+        keep_pids = {f"{r['host']}:{r['port']}" for r in new_rows}
+        # Prune per-proxy state of proxies being removed.
+        for pid, (ep, per) in old_by_pid.items():
+            if pid not in keep_pids and per is not None:
+                self._per.pop(ep._station, None)
+        self._socks5_proxies = new_rows
+        eps = []
+        for i, row in enumerate(new_rows):
+            pid = f"{row['host']}:{row['port']}"
+            ep = Socks5Endpoint(
+                row["host"], row["port"],
+                username=row.get("username"),
+                password=row.get("password"),
+                enabled=row.get("enabled", True),
+                index=i,
+            )
+            ep._quota_per_ip = getattr(self._vpn, "_quota_per_ip", 0)
+            old = old_by_pid.get(pid)
+            if old is not None and old[1] is not None:
+                # Carry counters across the rebuild (same proxy, new sid).
+                self._per[ep._station] = old[1]
+            eps.append(ep)
+        self._socks5_eps = eps
+        if self._socks5_rr >= len(eps) or not eps:
+            self._socks5_rr = 0
+        if self._socks5_current is not None:
+            cur_pid = self._socks5_current.pid
+            # [Revue 19/08] Re-resolve only to an ENABLED endpoint: a config
+            # hot-reload may have toggled the current proxy off — keeping it
+            # current would make the stick branch serve a disabled proxy.
+            # When the pid disappeared or is disabled, advance round-robin
+            # to the next enabled/usable one instead (None if every proxy
+            # is disabled — the request falls back to paid).
+            self._socks5_current = next(
+                (e for e in eps if e.pid == cur_pid and e.enabled),
+                None) or self._socks5_next()
+
+    def rotate_socks5_now(self):
+        """[Axe 3.1] Manual rotate — pick the next usable proxy and make it
+        current (used by the dashboard rotate endpoint and the GUI throttle).
+        Returns the new endpoint, or None when no alternative is usable."""
+        if self._socks5_auto_rotate:
+            # Already round-robining — a manual turn just advances the cursor.
+            self._socks5_current = self._socks5_next()
+            return self._socks5_current
+        cur = self._socks5_current
+        ep = self._socks5_next(excluded={cur} if cur is not None else None)
+        if ep is None:
+            return None
+        self._socks5_current = ep
+        return ep
 
     # ── Connection / rotation ──────────────────────────────────
 
@@ -219,6 +490,12 @@ class FreeIPPool:
         never propagates into the request path (fail-open by design).
         """
         if not self._vpn.enabled:
+            return
+        if self._vpn.proxy_mode == "socks5":
+            # [Axe 3.1] socks5 mode: the static proxies have no docker
+            # container to reconnect — nothing to ensure (and any docker
+            # kick here would violate the "NO docker in socks5 mode"
+            # invariant).
             return
         for st in self._stations:
             if st.proxy_mode == "vpn" and st.status != "connected":
@@ -261,6 +538,49 @@ class FreeIPPool:
         self._total_free_requests += 1
 
         mode = self._vpn.proxy_mode
+        if mode == "socks5":
+            # [Axe 3.1] Static SOCKS5 list — round-robin pick, NO docker.
+            # The two-pass _socks5_next already prefers a fresh proxy; when
+            # EVERY proxy is at quota the second pass admits one so the
+            # request still gets its free shot (the 429 bad-mark then skips
+            # to another). No rotation launch, no dual-clutch wait — the
+            # whole docker/watchdog machinery is inert here.
+            if self._socks5_auto_rotate:
+                ep = self._socks5_next()
+            else:
+                # [Axe 3.1] Auto-rotate OFF → stick to the current proxy
+                # while it stays usable; only a bad-mark (429/quota) or the
+                # manual rotate endpoint forces a switch.
+                ep = self._socks5_current
+                if ep is None or not self._socks5_usable(
+                        ep, exclude_approaching=False):
+                    ep = self._socks5_next()
+            if ep is None:
+                return None, None
+            self._active_station = ep
+            per = self._per_station(ep)
+            # Hot-reload guard (CRITIC(11)): quota_per_ip changed via config
+            # → the counter refers to the OLD quota — reset lazily.
+            if per["last_quota_per_ip"] is not None and \
+                    per["last_quota_per_ip"] != ep._quota_per_ip:
+                logger.info("[free-ip] socks5 quota_per_ip changed %s → %s — "
+                            "resetting request counter",
+                            per["last_quota_per_ip"], ep._quota_per_ip)
+                per["request_count"] = 0
+            per["last_quota_per_ip"] = ep._quota_per_ip
+            per["request_count"] += 1
+            ep.note_free_request()
+            ip = ep.current_ip or ep.pid
+            if ip not in per["ip_stats"]:
+                per["ip_stats"][ip] = {
+                    "requests": 0,
+                    "start": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "server": "socks5",
+                }
+            per["ip_stats"][ip]["requests"] += 1
+            self._socks5_current = ep
+            return ep.socks5_url, ep
+
         if mode == "vpn":
             station = self._best_station()
             if station is None:
@@ -290,7 +610,17 @@ class FreeIPPool:
                                 "dual-clutch switch to station %d, rotating in background",
                                 station._station, per["request_count"],
                                 station._quota_per_ip, other._station)
-                    self._launch_rotation(station)
+                    # [Revue 19/08] Degenerate threshold (= 1, quota headroom
+                    # collapsed — the floor in _rotation_threshold): every
+                    # request crosses it, so an UNTHROTTLED _launch_rotation
+                    # would re-queue a rotation per request (churn, docker
+                    # hot-loop). The throttled kick (last_connect_attempt /
+                    # _connect_retry_interval) paces rotation attempts; the
+                    # request still passes to `other` with zero wait.
+                    if self._rotation_threshold(station) <= 1:
+                        self._kick_connect(station)
+                    else:
+                        self._launch_rotation(station)
                     station = other
                     self._active_station = station
                     per = self._per_station(station)
@@ -353,6 +683,11 @@ class FreeIPPool:
                 success.
         """
         station = station or self._active_station or self._vpn
+        if isinstance(station, Socks5Endpoint):
+            # [Axe 3.1] Static proxies have no docker rotation — nothing to
+            # switch. A stray call is a programming error, fail loudly.
+            raise RotationFailed(
+                f"socks5 proxy {station.pid} has no docker rotation")
         new_ip = await station.connect_next()
         if not new_ip:
             # Defensive: connect_next is typed to return str now, but a
@@ -399,7 +734,22 @@ class FreeIPPool:
 
         No-op when VPN is disabled or in direct mode.
         """
-        if not self._vpn.enabled or self._vpn.proxy_mode != "vpn":
+        if not self._vpn.enabled:
+            return
+        if self._vpn.proxy_mode == "socks5":
+            # [Axe 3.1] Static list, NO docker: bad-mark the current proxy
+            # (C1-guarded by _socks5_any_other) and let the next request
+            # skip to another one. No _launch_rotation — the rotation
+            # machinery is inert in socks5 mode.
+            ep = (station if isinstance(station, Socks5Endpoint)
+                  else self._socks5_current)
+            if ep is None:
+                return
+            if self._socks5_any_other(ep):
+                self._per_station(ep)["bad_until"] = (
+                    time.monotonic() + self._bad_ttl)
+            return
+        if self._vpn.proxy_mode != "vpn":
             return
         station = station or self._active_station or self._vpn
         if self.dual_station:
@@ -433,7 +783,25 @@ class FreeIPPool:
         station is usable right now — the caller falls back to direct/paid
         instead of burning another attempt on a dead IP.
         """
-        if not self._vpn.enabled or self._vpn.proxy_mode != "vpn":
+        if not self._vpn.enabled:
+            return None, None
+        if self._vpn.proxy_mode == "socks5":
+            # [Axe 3.1] Static list, NO docker: bad-mark the failed proxy
+            # (C1-guarded by _socks5_any_other) and pick the next one. No
+            # _launch_rotation, no dual_station check.
+            target = (failed if isinstance(failed, Socks5Endpoint)
+                      else self._socks5_current)
+            if target is not None and self._socks5_any_other(target):
+                self._per_station(target)["bad_until"] = (
+                    time.monotonic() + self._bad_ttl)
+            st = (self._socks5_best_excluding(target)
+                  if target is not None else self._socks5_next())
+            if st is None:
+                return None, None
+            self._active_station = st
+            self._socks5_current = st
+            return st.socks5_url, st
+        if self._vpn.proxy_mode != "vpn":
             return None, None
         await self.ensure_connected()
         if failed is not None:
@@ -469,6 +837,20 @@ class FreeIPPool:
         rotation may fail after it landed — its failure must not bad-mark a
         freshly rotated (healthy) station.
         """
+        if self._vpn.proxy_mode == "socks5":
+            # [Axe 3.1] Static list, NO docker: bad-mark the failing proxy
+            # (C1-guarded by _socks5_any_other) so the next request skips
+            # it. ``station`` may be None (a direct fallback) — fall back to
+            # the current endpoint; do NOT call _per_station(station) first
+            # (it would crash on None). No egress watchdog (no docker).
+            target = (station if isinstance(station, Socks5Endpoint)
+                      else self._socks5_current)
+            if target is None:
+                return
+            if self._socks5_any_other(target):
+                self._per_station(target)["bad_until"] = (
+                    time.monotonic() + self._bad_ttl)
+            return
         per = self._per_station(station)
         cur_ip = getattr(station, "current_ip", None)
         # [review F1b] the repair anchor. The manager's repair path re-pins a
@@ -511,10 +893,14 @@ class FreeIPPool:
         silence for up to the 600 s read timeout. Registration happens once
         the tunnel POST succeeded (the real fire-and-forget signal already
         covered the connect stage)."""
+        if station is None or isinstance(station, Socks5Endpoint):
+            return  # [Axe 3.1] socks5 mode registers nothing (no docker tunnel)
         self._per_station(station).setdefault("stream_tasks", set()).add(task)
 
     def unregister_stream(self, station, task) -> None:
         """Drop ``task`` from the registry once its stream is done."""
+        if station is None or isinstance(station, Socks5Endpoint):
+            return  # [Axe 3.1] socks5 mode never registered anything
         per = self._per_station(station)
         tasks = per.get("stream_tasks")
         if tasks:
@@ -539,6 +925,8 @@ class FreeIPPool:
         bad-mark the last standing station — but the CANCEL itself is
         unconditional (a confirmed-dead tunnel cannot carry a stream).
         """
+        if station is None:
+            return  # [Axe 3.1] socks5 mode has no docker tunnel to cancel
         per = self._per_station(station)
         tasks = per.get("stream_tasks")
         if not tasks:
@@ -587,49 +975,89 @@ class FreeIPPool:
                             asyncio.shield(task), remaining)
                 except asyncio.TimeoutError:
                     return False
+                # [Revue 19/08] The post-commit probe [Axe 1.2] can stamp a
+                # bad_until on the FRESH IP BEFORE this waiter wakes (the
+                # probe runs inside _rotate_station, right before the task
+                # completes) — a committed-but-dead tunnel must not be
+                # served as the result of a successful rotation. Re-check
+                # usability (exclude_approaching=False: only bad_until +
+                # status) so the request falls back to paid and the station
+                # re-rotates instead of getting a guaranteed 429.
                 return station.current_ip is not None and \
                     station.current_ip != burned_ip and \
-                    station.status == "connected"
+                    station.status == "connected" and \
+                    self._station_usable(station, exclude_approaching=False)
             # Not in flight yet — either queued behind another station's
-            # rotation (C4 serialized worker) or about to be launched.
+            # rotation (bounded workers [Axe 1.1]) or about to be launched.
             await asyncio.sleep(0.05)
         return False
+
+    def _ensure_workers(self) -> None:
+        """[Axe 1.1] Prune finished workers and top the pool back up to
+        ``_ROTATION_CONCURRENCY``. Workers are persistent (while-True queue
+        drains), so this is near-no-op in steady state — it only matters
+        after a worker died from a bug (guard in ``_rotation_worker``)."""
+        self._worker_tasks = [t for t in self._worker_tasks if not t.done()]
+        for _ in range(self._ROTATION_CONCURRENCY - len(self._worker_tasks)):
+            self._worker_tasks.append(
+                asyncio.create_task(self._rotation_worker()))
 
     def _launch_rotation(self, station: VPNManager) -> None:
         """Queue a background rotation for one station (C4/C5).
 
-        Serialized: a single worker drains ``_rotation_queue``, so at most
-        ONE physical rotation runs at any time (the invariant is about
-        stations being down, not rotations racing). Dedup both ways: a
-        station with a rotation already queued (``_pending``) or already in
-        flight (``_rotation_tasks``) is never queued twice — concurrent 429s
-        on the same station share one rotation."""
+        Bounded concurrency [Axe 1.1]: up to ``_ROTATION_CONCURRENCY``
+        workers drain the queue in parallel, so a rotation blocked on one
+        station (budget wait + docker ops) no longer freezes the fleet.
+        Dedup both ways: a station with a rotation already queued
+        (``_pending``) or already in flight (``_rotation_tasks``) is never
+        queued twice — concurrent 429s on the same station share one
+        rotation."""
         sid = station._station
+        if sid not in self._station_ids:
+            # [plan 18/08 §2.3] A request handler can hold a manager the
+            # downscale just retired (429 arrived mid-swap). The pool must
+            # IGNORE it — no queue entry, no docker work on a container
+            # that stop_container is deleting.
+            return
         if sid in self._pending:
             return
         task = self._rotation_tasks.get(sid)
         if task and not task.done():
             return  # a rotation for this station is already running
         self._pending.add(sid)
-        if self._worker_task is None or self._worker_task.done():
-            self._worker_task = asyncio.create_task(self._rotation_worker())
+        self._ensure_workers()
         self._rotation_queue.put_nowait(station)
 
     async def _rotation_worker(self) -> None:
-        """Drain the rotation queue — one physical rotation at a time (C4),
-        in enqueue order. Station N's lower threshold (C3) makes it rotate
-        before station 1 keeps serving."""
+        """Drain the rotation queue — up to ``_ROTATION_CONCURRENCY`` of
+        these run in parallel [Axe 1.1], so N stations rotate concurrently
+        (bounded) instead of serially. Per-station single-flight is kept
+        by ``_rotation_tasks`` registration before the first await."""
         while True:
             station = await self._rotation_queue.get()
             self._pending.discard(station._station)
             if station not in self._stations:
                 # [plan 18/08 §4] station downscaled while queued — no-op;
                 # its per-station state was pruned by set_stations. The
-                # C4/C5 single-flight guarantee stays intact: the entry
-                # was already dequeued, nothing else touches this station.
+                # single-flight guarantee stays intact: the entry was
+                # already dequeued, nothing else touches this station.
                 continue
             try:
                 await self._rotate_station(station)
+            except asyncio.CancelledError:
+                # [plan 18/08 §2.3] A downscale cancelled this rotation
+                # (cancel_rotations). Do NOT die: the remaining queue must
+                # still drain (_ensure_workers would only re-pay the price
+                # on the next launch). _rotate_station's finally already
+                # popped its _rotation_tasks registration.
+                # 3.12: the cancellation was delivered and consumed — clear
+                # the pending-cancel marker so the worker leaves the
+                # "cancelling" state (else `cancelled()`/`cancelling()`
+                # stay sticky and shutdown-time cancels stack up).
+                t = asyncio.current_task()
+                if t is not None and hasattr(t, "uncancel"):
+                    t.uncancel()
+                continue
             except Exception as e:
                 # _rotate_station swallows its own errors; this guard keeps
                 # the worker alive against any programming mistake.
@@ -641,14 +1069,51 @@ class FreeIPPool:
         # task that ever rotates, so ``current_task()`` is exactly the
         # "rotation running" marker `_launch_rotation` checks — a re-launch
         # of the same station while this one runs is deduped, another
-        # station's rotation queues behind it (serialized).
+        # station's rotation queues behind it.
         self._rotation_tasks[sid] = asyncio.current_task()
+        needs_retry = False  # [Axe 1.2] re-queue after finally-pop (dedup)
         try:
             await self.switch_ip(station=station)
+            per = self._per_station(station)
             # Rotation succeeded: the station has a fresh IP (fresh
             # (model, IP) cooldown key) — make it eligible again now,
             # without waiting out the bad TTL.
-            self._per_station(station)["bad_until"] = None
+            per["bad_until"] = None
+            if station.proxy_mode == "vpn":
+                # [Axe 1.2] Fresh probe AFTER the commit (direct call = not
+                # the watchdog's tick, no status cache): a committed-but-dead
+                # tunnel must re-rotate NOW instead of waiting for the
+                # watchdog to notice on a later tick.
+                try:
+                    alive = await station._probe_tunnel_light()
+                except Exception as e:
+                    # A probe bug must not turn a good rotation into a
+                    # failed one — log, assume dead (watchdog will confirm).
+                    logger.warning(
+                        "[free-ip] station %d post-commit probe error: %s",
+                        station._station, e)
+                    alive = False
+                if alive:
+                    per["post_commit_retry_count"] = 0
+                else:
+                    per["post_commit_retry_count"] += 1
+                    logger.warning(
+                        "[free-ip] station %d fresh IP not egressing "
+                        "(post-commit probe dead, attempt %d/%d) — "
+                        "re-rotating immediately",
+                        station._station, per["post_commit_retry_count"],
+                        self._POST_COMMIT_RETRY_MAX)
+                    # The watchdog must hear about the dead fresh tunnel on
+                    # EVERY probe failure, cap or not — at the cap it owns
+                    # the recovery escalation (no hot-loop of the stack).
+                    station.arm_egress_watchdog()
+                    if per["post_commit_retry_count"] < self._POST_COMMIT_RETRY_MAX:
+                        # C1: never bad-mark the ONLY usable station.
+                        if self._any_other_usable(station):
+                            per["bad_until"] = time.monotonic() + self._bad_ttl
+                        needs_retry = True
+                    # At the cap: give up on immediate re-rotation — the
+                    # watchdog owns recovery (escalation, not hot-loop).
         except Exception as e:
             # CRITIC(5): a failed background rotation must be logged, not
             # swallowed — the next free request will fall back to paid and
@@ -658,6 +1123,11 @@ class FreeIPPool:
                            station._station, e)
         finally:
             self._rotation_tasks.pop(sid, None)
+        if needs_retry:
+            # [Axe 1.2] Re-queue AFTER the finally-pop: _launch_rotation
+            # dedups on _rotation_tasks, which is still registered until
+            # here — queuing inside the try would be swallowed.
+            self._launch_rotation(station)
 
         # ── Station set (hot-reload) ───────────────────────────────
 
@@ -682,10 +1152,88 @@ class FreeIPPool:
         removed = {s._station for s in self._stations} - \
             {s._station for s in stations}
         self._stations = sorted(stations, key=lambda s: s._station)
+        self._station_ids = {s._station for s in self._stations}
         for sid in removed:
             self._per.pop(sid, None)
             self._pending.discard(sid)
             self._rotation_tasks.pop(sid, None)
+        # [plan 18/08 §2.3] Sweep any stale registrations whose sid is not in
+        # the new set (belt-and-braces: an entry can outlive the removed-set
+        # computation if a station object was swapped mid-reload) — unknown
+        # stations are ignored, never acted on.
+        for sid in list(self._pending):
+            if sid not in self._station_ids:
+                self._pending.discard(sid)
+        for sid in list(self._rotation_tasks):
+            if sid not in self._station_ids:
+                self._rotation_tasks.pop(sid, None)
+
+    async def cancel_rotations(self, sids) -> None:
+        """[plan 18/08 §2.3] Cancel + await (5 s cap) the in-flight
+        rotations of stations a downscale is about to remove.
+
+        A rotation must NOT finish on a container that stop_container is
+        about to delete (compose stop + docker rm -f) — it would resurrect
+        the retired station or leave it half-rotated. Called BEFORE
+        set_stations in the downscale branch of _apply_station_count.
+
+        Task identity: _rotate_station registers the WORKER task
+        (current_task()) as the rotation task, so cancelling it cancels the
+        worker's current _rotate_station call — vpn_manager's rotation-op
+        funnel (op count + generation) was designed for this, and
+        _rotate_station's finally pops its own registration. The worker
+        itself SURVIVES (it catches CancelledError and keeps draining the
+        queue), so it never completes — awaiting it would always hit the
+        cap. The real "rotation unwound" signal is the registration
+        popping, hence the poll below instead of wait_for on the task.
+
+        A rotation STUCK inside asyncio.to_thread cannot be killed (threads
+        are not cancellable): the poll caps at 5 s and lets the downscale
+        proceed anyway (best-effort — the op funnel guards the subsequent
+        docker sequencing). Unknown station ids are ignored.
+
+        [Revue 19/08] After cancel + await, the ids are RETIRED here —
+        dropped from ``_station_ids`` / ``_stations`` / ``_pending`` /
+        ``_rotation_tasks`` (+ per-station state pruned), so the pool's
+        guards close IMMEDIATELY. Without this, the sids stayed live until
+        the caller's later ``set_stations`` — and a 429 arriving DURING the
+        stop_container teardown window (opencode ``_apply_station_count``:
+        ``stop()`` + ``stop_container()`` awaiting docker, seconds) re-queued
+        a rotation through ``_launch_rotation``'s sid guard, landing docker
+        work on a container that was being deleted. ``set_stations`` stays
+        idempotent on already-retired sids (its ``removed`` set computes
+        from ``self._stations``, which is already shrunk)."""
+        if not sids:
+            return
+        wanted = set(sids)
+        tasks = [t for sid, t in self._rotation_tasks.items()
+                 if sid in wanted and t is not None and not t.done()]
+        if not tasks:
+            # No in-flight rotation: still retire eagerly (a degenerate
+            # threshold or a late 429 could re-queue otherwise).
+            self._retire_stations(wanted)
+            return
+        for t in tasks:
+            t.cancel()
+        deadline = time.monotonic() + 5.0
+        while self._rotation_tasks.keys() & wanted \
+                and time.monotonic() < deadline:
+            await asyncio.sleep(0.05)
+        self._retire_stations(wanted)
+
+    def _retire_stations(self, sids) -> None:
+        """[Revue 19/08] Eager pool-side retirement of stations being
+        downscaled — called by ``cancel_rotations`` so the teardown window
+        (stop() + stop_container() awaiting docker) sees the sid guards
+        closed. Mirrors set_stations' prune: state dropped, queued/in-flight
+        rotation entries removed, no docker work accepted afterwards."""
+        for sid in sids:
+            self._station_ids.discard(sid)
+            self._stations[:] = [s for s in self._stations
+                                 if s._station != sid]
+            self._pending.discard(sid)
+            self._rotation_tasks.pop(sid, None)
+            self._per.pop(sid, None)
 
     def update_config(self, cfg: dict) -> None:
         """Apply timing overrides from config.yaml ``ip_rotation`` (hot-reload,
@@ -701,6 +1249,42 @@ class FreeIPPool:
             self._rotation_stagger = max(0, int(cfg["rotation_stagger"] or 0))
         if "rotation_wait_timeout" in cfg:
             self._rotation_wait_timeout = max(1.0, float(cfg["rotation_wait_timeout"] or 0))
+        # [Axe 1.1] Bounded rotation concurrency (config.yaml
+        # `ip_rotation.rotation_concurrency`, hot-reloadable).
+        if "rotation_concurrency" in cfg:
+            self._ROTATION_CONCURRENCY = max(
+                1, int(cfg["rotation_concurrency"] or 0))
+        # [Axe 3.1] Static SOCKS5 list + quota refresh (config.yaml
+        # `ip_rotation.socks5_proxies` / `quota_per_ip`, hot-reloadable).
+        if "socks5_proxies" in cfg and isinstance(cfg["socks5_proxies"], list):
+            self.set_socks5_proxies(cfg["socks5_proxies"])
+        # [Axe 3.1] Auto-rotate OFF = stick to the current proxy while
+        # usable (rotation only via bad-mark or the rotate endpoint).
+        if "socks5_auto_rotate" in cfg:
+            self._socks5_auto_rotate = bool(cfg["socks5_auto_rotate"])
+        if "quota_per_ip" in cfg:
+            q = getattr(self._vpn, "_quota_per_ip",
+                        getattr(self._vpn, "quota_per_ip", 0))
+            for ep in self._socks5_eps:
+                ep._quota_per_ip = q
+                # hot-reload guard: stale counters refer to the old quota
+                per = self._per.get(ep._station)
+                if per is not None and per["last_quota_per_ip"] != q:
+                    per["request_count"] = 0
+                    per["last_quota_per_ip"] = q
+
+    def any_rotation_in_flight(self) -> bool:
+        """[Axe 1.4] True while at least one station rotation is running.
+
+        Called by ``_free_stations_exhausted`` (opencode.py) to decide
+        whether the pool is genuinely exhausted: a rotation in flight is
+        about to land a fresh (model, IP) key, so the request should WAIT
+        for it instead of falling back to paid. No lock needed — asyncio
+        runs this single-threaded and ``_rotation_tasks`` is mutated only
+        synchronously (registered before the rotation's first await, popped
+        in the same task's finally)."""
+        return any(t is not None and not t.done()
+                   for t in self._rotation_tasks.values())
 
     def get_status(self) -> dict:
         """Return pool status for the dashboard (aggregated over stations).
@@ -730,12 +1314,36 @@ class FreeIPPool:
         active = self._active_station or self._vpn
         s1 = stations[0]
 
+        # [Axe 3.1] Static SOCKS5 view (socks5 mode — no docker stations).
+        socks5_proxies = []
+        for ep in self._socks5_eps:
+            per = self._per.get(ep._station, {})
+            bad_until = per.get("bad_until")
+            socks5_proxies.append({
+                "pid": ep.pid,
+                "host": ep.host,
+                "port": ep.port,
+                "username": ep.username,
+                "has_password": ep.has_password,
+                "enabled": ep.enabled,
+                "current": self._socks5_current is ep,
+                "requests_this_ip": per.get("request_count", 0),
+                "quota_per_ip": ep._quota_per_ip,
+                "bad_until": bad_until,
+                "bad_remaining": (max(0, bad_until - time.monotonic())
+                                  if bad_until else 0),
+            })
+
         return {
             "enabled": self._vpn.enabled,
             "proxy_mode": self._vpn.proxy_mode,
             "dual_station": self.dual_station,
             "active_station": active._station,
             "stations": stations,
+            "socks5_mode": self.socks5_mode,
+            "socks5_current": (self._socks5_current.pid
+                               if self._socks5_current is not None else None),
+            "socks5_proxies": socks5_proxies,
             # Legacy top-level fields = station 1 (dashboard backward compat)
             "vpn_status": s1["vpn_status"],
             "current_ip": s1["current_ip"],
@@ -748,6 +1356,7 @@ class FreeIPPool:
             "connect_retry_interval": self._connect_retry_interval,
             "bad_ttl": self._bad_ttl,
             "rotation_stagger": self._rotation_stagger,
+            "rotation_concurrency": self._ROTATION_CONCURRENCY,
             "rotate_pending": sorted(self._pending),
             "ips_used": len({ip for p in self._per.values() for ip in p["ip_stats"]}),
             "ip_stats": {ip: st for p in self._per.values() for ip, st in p["ip_stats"].items()},

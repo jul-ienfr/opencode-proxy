@@ -288,8 +288,12 @@ class TestPoolSignal:
 
         assert rec.calls == ["st1"]
 
-    def test_signal_swallows_pool_errors(self, monkeypatch):
-        """The request path must NEVER suffer the signal — fire-and-forget."""
+    def test_signal_logs_and_reraises_pool_errors(self, monkeypatch, caplog):
+        """[Axe 1.5] A bug in the notification path must be VISIBLE, not
+        swallowed: the old `except Exception: pass` silently disabled the
+        failover for every following request. The exception is now logged
+        with traceback and re-raised — the request-level caller's own
+        except-block still falls back safely, but the defect surfaces."""
 
         class _Boom:
             def notify_connection_failure(self, station):
@@ -297,8 +301,12 @@ class TestPoolSignal:
 
         monkeypatch.setattr(oc, "_free_ip_pool", _Boom())
 
-        # Must not raise.
-        oc._signal_connection_failure("st1")
+        with pytest.raises(RuntimeError, match="pool broke"):
+            oc._signal_connection_failure("st1")
+
+        assert any("notify_connection_failure raised" in r.message
+                   for r in caplog.records), \
+            "the defect must be logged with context, not silenced"
 
     def test_signal_noop_without_pool(self, monkeypatch):
         """No VPN → pool absent (self-heal mode). The signal is a no-op."""

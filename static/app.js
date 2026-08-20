@@ -2982,7 +2982,7 @@ document.addEventListener('DOMContentLoaded', () => {
     // ── VPN tab refresh ──
     async function refreshVPNStatus() {
         try {
-            const resp = await fetch('/api/vpn-status');
+            const resp = await fetchWithToken('/api/vpn-status');
             const data = await resp.json();
             updateVPNUI(data);
         } catch (e) {
@@ -2990,7 +2990,7 @@ document.addEventListener('DOMContentLoaded', () => {
         }
         // Also check credential status
         try {
-            const credResp = await fetch('/api/vpn/credentials');
+            const credResp = await fetchWithToken('/api/vpn/credentials');
             const credData = await credResp.json();
             const credStatus = document.getElementById('vpn-cred-status');
             const usernameEl = document.getElementById('vpn-cred-username');
@@ -3013,7 +3013,7 @@ document.addEventListener('DOMContentLoaded', () => {
         }
         // Also load server list from config
         try {
-            const cfgResp = await fetch('/api/vpn-config');
+            const cfgResp = await fetchWithToken('/api/vpn-config');
             const cfgData = await cfgResp.json();
             renderServerList(cfgData.servers || []);
             // Initialize config fields
@@ -3066,6 +3066,13 @@ document.addEventListener('DOMContentLoaded', () => {
             const exhaustMode = document.getElementById('vpn-exhaust-mode');
             if (exhaustMode) exhaustMode.value = cfgData.strict_free ? 'strict' : 'fallback';
 
+            // [plan 19/08 §1/§2] free multi-attempt cap (1-3) + exception
+            // ordering (station-first / direct) — read from config.
+            const freeAttempts = document.getElementById('vpn-free-attempts');
+            if (freeAttempts) freeAttempts.value = String(cfgData.max_free_attempts || 2);
+            const exceptionMode = document.getElementById('vpn-exception-mode');
+            if (exceptionMode) exceptionMode.value = cfgData.free_exception_fallback || 'station-first';
+
             // [plan 18/08 §3d] VPN technology selector
             const stackSelect = document.getElementById('vpn-stack-select');
             if (stackSelect && cfgData.vpn_stack) stackSelect.value = cfgData.vpn_stack;
@@ -3083,7 +3090,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
         // Load SOCKS5 proxies
         try {
-            const socks5Resp = await fetch('/api/vpn/socks5');
+            const socks5Resp = await fetchWithToken('/api/vpn/socks5');
             const socks5Data = await socks5Resp.json();
             renderSocks5List(socks5Data.proxies || []);
             const rotateToggle = document.getElementById('fm-socks5-rotate');
@@ -3099,7 +3106,7 @@ document.addEventListener('DOMContentLoaded', () => {
         const container = document.getElementById('vpn-stack-stations');
         if (!container) return;
         try {
-            const resp = await fetch('/api/vpn-stack-info');
+            const resp = await fetchWithToken('/api/vpn-stack-info');
             const data = await resp.json();
             const stations = data.stations || {};
             const keys = Object.keys(stations);
@@ -3146,7 +3153,7 @@ document.addEventListener('DOMContentLoaded', () => {
     window.vpnSaveStack = async function() {
         const select = document.getElementById('vpn-stack-select');
         if (!select) return;
-        await fetch('/api/vpn-config', {
+        await fetchWithToken('/api/vpn-config', {
             method: 'POST', headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({vpn_stack: select.value})
         });
@@ -3210,6 +3217,36 @@ document.addEventListener('DOMContentLoaded', () => {
 
         toggleEl.checked = data.enabled || false;
         toggleLabel.textContent = data.enabled ? (t('vpn.rotation_on') || 'Activé') : (t('vpn.rotation_off') || 'Désactivé');
+
+        // [plan 18/08 §2.1] Env périmé (cause racine 19/08): le .env diffère
+        // de l'env du process — les enfants docker compose héritent de l'env,
+        // qui gagne sur le fichier. Le volet déterministe (_compose_env) force
+        // déjà VPN_TYPE_STATION{n} dans chaque enfant ; cette bannière signale
+        // la divergence restante (autres clés VPN_*) jusqu'au restart/re-push.
+        const envBanner = document.getElementById('vpn-env-divergence-banner');
+        if (envBanner) {
+            if (Array.isArray(data.env_divergence) && data.env_divergence.length) {
+                const keys = data.env_divergence.map(d => `<code>${escHtml(d.key)}</code>`).join(', ');
+                envBanner.innerHTML = '⚠ <strong>Env périmé</strong> — le .env diffère de l\'env du process pour : ' + keys +
+                    '. Redémarrez le proxy ou re-poussez la config pour re-synchroniser.';
+                envBanner.style.display = 'block';
+            } else {
+                envBanner.style.display = 'none';
+            }
+        }
+
+        // [plan 18/08 axe 3.4] config.yaml modifié à la main sans POST dashboard.
+        // Le hot-reload est push-only par design : on SIGNALE, on ne recharge
+        // jamais en auto (un état divergent serait invisible pour le pool).
+        const dirtyBanner = document.getElementById('vpn-config-dirty-banner');
+        if (dirtyBanner) {
+            if (data.config_yaml_dirty) {
+                dirtyBanner.innerHTML = '⚠ <strong>config.yaml modifié à la main</strong> — le détecteur M-time le signale mais le serveur ne recharge pas tout seul. Redémarrez le proxy ou re-poussez la config pour appliquer.';
+                dirtyBanner.style.display = 'block';
+            } else {
+                dirtyBanner.style.display = 'none';
+            }
+        }
 
         // [plan 18/08 §4] N-station — one row per active tunnel, rendered
         // from the pool's stations[] payload (was a fixed station-2 block).
@@ -3366,7 +3403,7 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     window.toggleVPN = async function(enabled) {
-        await fetch('/api/vpn/toggle', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({enabled}) });
+        await fetchWithToken('/api/vpn/toggle', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({enabled}) });
         refreshVPNStatus();
     };
 
@@ -3375,7 +3412,7 @@ document.addEventListener('DOMContentLoaded', () => {
         if (resultEl) resultEl.innerHTML = '<span style="color:var(--warning)">Connexion en cours...</span>';
 
         try {
-            const resp = await fetch('/api/vpn/connect', { method: 'POST' });
+            const resp = await fetchWithToken('/api/vpn/connect', { method: 'POST' });
             const data = await resp.json();
             if (data.error) {
                 // Parse error for specific messages
@@ -3419,7 +3456,7 @@ document.addEventListener('DOMContentLoaded', () => {
         const watchdog = parseInt(document.getElementById('vpn-watchdog')?.value) || 60;
         const apiCache = parseInt(document.getElementById('vpn-api-cache')?.value) || 900;
 
-        await fetch('/api/vpn-config', {
+        await fetchWithToken('/api/vpn-config', {
             method: 'POST', headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({
                 mode, proxy_port: proxyPort, switch_delay: switchDelay, docker_image: dockerImage,
@@ -3435,7 +3472,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     window.saveQuotaPerIp = async function() {
         const quotaPerIp = parseInt(document.getElementById('vpn-quota-per-ip').value) || 300;
-        await fetch('/api/vpn-config', {
+        await fetchWithToken('/api/vpn-config', {
             method: 'POST', headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({ quota_per_ip: quotaPerIp })
         });
@@ -3465,7 +3502,7 @@ document.addEventListener('DOMContentLoaded', () => {
         resultEl.innerHTML = '<span style="color:var(--warning)">Diagnostic en cours...</span>';
 
         try {
-            const resp = await fetch('/api/vpn/diagnostic');
+            const resp = await fetchWithToken('/api/vpn/diagnostic');
             const data = await resp.json();
 
             let html = '<strong>🩺 Diagnostic VPN</strong><br>';
@@ -3515,7 +3552,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
         try {
             // Check if available
-            const availResp = await fetch('/api/vpn/nordvpn-available');
+            const availResp = await fetchWithToken('/api/vpn/nordvpn-available');
             const availData = await availResp.json();
             if (!availData.available) {
                 if (statusEl) statusEl.innerHTML = '<span style="color:var(--danger)">✗ NordVPN non installé</span>';
@@ -3523,7 +3560,7 @@ document.addEventListener('DOMContentLoaded', () => {
             }
 
             // Get status
-            const statusResp = await fetch('/api/vpn/nordvpn-status');
+            const statusResp = await fetchWithToken('/api/vpn/nordvpn-status');
             const statusData = await statusResp.json();
             if (statusData.connected) {
                 if (statusEl) statusEl.innerHTML = `<span style="color:var(--success)">✓ Connecté</span> — ${statusData.country || '?'} / ${statusData.city || '?'} / IP: ${statusData.ip || '?'}`;
@@ -3532,7 +3569,7 @@ document.addEventListener('DOMContentLoaded', () => {
             }
 
             // Get countries count
-            const countriesResp = await fetch('/api/vpn/nordvpn-countries');
+            const countriesResp = await fetchWithToken('/api/vpn/nordvpn-countries');
             const countriesData = await countriesResp.json();
             if (countriesEl && countriesData.countries) {
                 countriesEl.textContent = `${countriesData.countries.length} pays disponibles`;
@@ -3565,13 +3602,13 @@ document.addEventListener('DOMContentLoaded', () => {
     };
 
     window.vpnDisconnect = async function() {
-        await fetch('/api/vpn/disconnect', { method: 'POST' });
+        await fetchWithToken('/api/vpn/disconnect', { method: 'POST' });
         refreshVPNStatus();
     };
 
     window.vpnNext = async function(station) {
         try {
-            const resp = await fetch('/api/vpn/next', {
+            const resp = await fetchWithToken('/api/vpn/next', {
                 method: 'POST', headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({station: station || 0})
             });
@@ -3590,7 +3627,7 @@ document.addEventListener('DOMContentLoaded', () => {
         if (!n || n < 1 || n > 10) return;
         let data = null;
         try {
-            const resp = await fetch('/api/vpn-config', {
+            const resp = await fetchWithToken('/api/vpn-config', {
                 method: 'POST', headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({station_count: n})
             });
@@ -3610,16 +3647,38 @@ document.addEventListener('DOMContentLoaded', () => {
 
     window.vpnSaveExhaustMode = async function() {
         const strict = document.getElementById('vpn-exhaust-mode').value === 'strict';
-        await fetch('/api/vpn-config', {
+        await fetchWithToken('/api/vpn-config', {
             method: 'POST', headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({strict_free: strict})
         });
         refreshVPNStatus();
     };
 
+    // [plan 19/08 §1] free multi-attempt cap (1-3) — persisted + hot-reload
+    // (read per-request via IP_ROTATION.get, no restart).
+    window.vpnSaveMaxFreeAttempts = async function() {
+        const n = parseInt(document.getElementById('vpn-free-attempts').value, 10) || 2;
+        await fetchWithToken('/api/vpn-config', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({max_free_attempts: n})
+        });
+        refreshVPNStatus();
+    };
+
+    // [plan 19/08 §2] exception ordering: dead tunnel → next station first,
+    // or direct residential fallback immediately.
+    window.vpnSaveExceptionFallback = async function() {
+        const mode = document.getElementById('vpn-exception-mode').value;
+        await fetchWithToken('/api/vpn-config', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({free_exception_fallback: mode})
+        });
+        refreshVPNStatus();
+    };
+
     window.vpnRemoveServer = async function(name) {
         if (!confirm(t('vpn.confirm_remove') || 'Supprimer ce serveur ?')) return;
-        await fetch('/api/vpn-config', {
+        await fetchWithToken('/api/vpn-config', {
             method: 'POST', headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({remove_server: name})
         });
@@ -3630,7 +3689,7 @@ document.addEventListener('DOMContentLoaded', () => {
         const username = document.getElementById('vpn-username').value.trim();
         const password = document.getElementById('vpn-password').value.trim();
         if (!username || !password) return alert('Username and password required');
-        const resp = await fetch('/api/vpn-config', {
+        const resp = await fetchWithToken('/api/vpn-config', {
             method: 'POST', headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({credentials: {username, password}})
         });
@@ -3666,7 +3725,7 @@ document.addEventListener('DOMContentLoaded', () => {
             formData.append('name', name);
             formData.append('config', _vpnSelectedFile);
 
-            const resp = await fetch('/api/vpn/upload-config', {
+            const resp = await fetchWithToken('/api/vpn/upload-config', {
                 method: 'POST',
                 body: formData
             });
@@ -3688,7 +3747,7 @@ document.addEventListener('DOMContentLoaded', () => {
         const resultEl = document.getElementById('vpn-health-result');
         if (resultEl) resultEl.textContent = 'Test en cours...';
         try {
-            const resp = await fetch('/api/vpn/health-check', { method: 'POST' });
+            const resp = await fetchWithToken('/api/vpn/health-check', { method: 'POST' });
             const data = await resp.json();
             if (data.ok) {
                 const latency = data.latency_ms ? ` (${data.latency_ms}ms)` : '';
@@ -3705,7 +3764,7 @@ document.addEventListener('DOMContentLoaded', () => {
     // ── VPN Save State ──
     window.vpnSaveState = async function() {
         try {
-            await fetch('/api/vpn/save-state', { method: 'POST' });
+            await fetchWithToken('/api/vpn/save-state', { method: 'POST' });
             const resultEl = document.getElementById('vpn-health-result');
             if (resultEl) resultEl.innerHTML = '<span style="color:var(--success)">✓ État sauvegardé</span>';
         } catch (e) {
@@ -3717,7 +3776,7 @@ document.addEventListener('DOMContentLoaded', () => {
     window.vpnToggleApi = async function(enabled) {
         const section = document.getElementById('vpn-api-section');
         if (section) section.style.display = enabled ? 'block' : 'none';
-        await fetch('/api/vpn-config', {
+        await fetchWithToken('/api/vpn-config', {
             method: 'POST', headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({ use_nordvpn_api: enabled })
         });
@@ -3729,7 +3788,7 @@ document.addEventListener('DOMContentLoaded', () => {
     // ── Load Countries for API ──
     async function vpnLoadCountries() {
         try {
-            const resp = await fetch('/api/vpn/countries');
+            const resp = await fetchWithToken('/api/vpn/countries');
             const data = await resp.json();
             const select = document.getElementById('vpn-api-country');
             if (select && data.countries) {
@@ -3750,7 +3809,7 @@ document.addEventListener('DOMContentLoaded', () => {
         if (resultsEl) resultsEl.textContent = 'Découverte en cours...';
 
         try {
-            const resp = await fetch('/api/vpn/discover-and-add', {
+            const resp = await fetchWithToken('/api/vpn/discover-and-add', {
                 method: 'POST', headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({ country: country || null, group: group || null, limit })
             });
@@ -3769,7 +3828,7 @@ document.addEventListener('DOMContentLoaded', () => {
     // ── Export VPN Config ──
     window.vpnExportConfig = async function() {
         try {
-            const resp = await fetch('/api/vpn/export');
+            const resp = await fetchWithToken('/api/vpn/export');
             const data = await resp.json();
             const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
             const url = URL.createObjectURL(blob);
@@ -3794,7 +3853,7 @@ document.addEventListener('DOMContentLoaded', () => {
             try {
                 const text = await file.text();
                 const data = JSON.parse(text);
-                const resp = await fetch('/api/vpn/import', {
+                const resp = await fetchWithToken('/api/vpn/import', {
                     method: 'POST', headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify(data)
                 });
@@ -3814,7 +3873,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // ── Free Models master toggle ──
     window.toggleFreeModels = async function(enabled) {
-        await fetch('/api/vpn/toggle', {
+        await fetchWithToken('/api/vpn/toggle', {
             method: 'POST', headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({enabled})
         });
@@ -3837,7 +3896,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     window.switchProxyMode = async function(mode) {
         setProxyModeUI(mode);
-        await fetch('/api/vpn/proxy-mode', {
+        await fetchWithToken('/api/vpn/proxy-mode', {
             method: 'POST', headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({mode})
         });
@@ -3878,7 +3937,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
         if (!host) return alert('Hôte requis');
 
-        const resp = await fetch('/api/vpn/socks5', {
+        const resp = await fetchWithToken('/api/vpn/socks5', {
             method: 'POST', headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({host, port, username, password})
         });
@@ -3897,7 +3956,7 @@ document.addEventListener('DOMContentLoaded', () => {
     window.removeSocks5Proxy = async function(index) {
         if (!confirm(t('free_models.socks5_remove') || 'Supprimer ce proxy ?')) return;
 
-        const resp = await fetch('/api/vpn/socks5/remove', {
+        const resp = await fetchWithToken('/api/vpn/socks5/remove', {
             method: 'POST', headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({index})
         });
@@ -3906,7 +3965,7 @@ document.addEventListener('DOMContentLoaded', () => {
     };
 
     window.toggleSocks5Proxy = async function(index, enabled) {
-        await fetch('/api/vpn/socks5/toggle', {
+        await fetchWithToken('/api/vpn/socks5/toggle', {
             method: 'POST', headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({index, enabled})
         });
@@ -3919,7 +3978,7 @@ document.addEventListener('DOMContentLoaded', () => {
         btn.disabled = true;
 
         try {
-            const resp = await fetch('/api/vpn/socks5/test', {
+            const resp = await fetchWithToken('/api/vpn/socks5/test', {
                 method: 'POST', headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({host, port})
             });
@@ -3951,7 +4010,7 @@ document.addEventListener('DOMContentLoaded', () => {
     };
 
     window.toggleSocks5Rotation = async function(enabled) {
-        await fetch('/api/vpn/socks5/rotate', {
+        await fetchWithToken('/api/vpn/socks5/rotate', {
             method: 'POST', headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({rotate: enabled})
         });

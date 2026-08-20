@@ -9,6 +9,7 @@ import asyncio
 import hmac
 import re
 import socket
+import subprocess
 import threading
 from datetime import datetime, timedelta, timezone
 from fastapi import Request, Response
@@ -73,6 +74,26 @@ _local_ips_cache: tuple[float, list] | None = None
 # (documented: set DASHBOARD_TOKEN when the server is exposed beyond localhost).
 
 _DASHBOARD_TOKEN = os.getenv("DASHBOARD_TOKEN", "").strip()
+
+# [Axe 3.4] config.yaml manual-edit detector. Hot-reload is push-only BY
+# DESIGN (no file watcher auto-reload) — this only tracks whether the file
+# changed on disk since the last dashboard write, and exposes it as
+# ``config_yaml_dirty`` in /api/vpn-status so the GUI can banner.
+#  Never auto-reload: a user editing config.yaml by hand must restart or
+# re-push to get a consistent state.
+__CONFIG_YAML_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.yaml")
+_config_yaml_known_mtime = 0.0
+
+
+def _config_yaml_mtime() -> float:
+    try:
+        return os.stat(__CONFIG_YAML_PATH).st_mtime
+    except OSError:
+        return 0.0
+
+
+_config_yaml_known_mtime = _config_yaml_mtime()
 
 
 def _check_dashboard_token(request: Request):
@@ -288,6 +309,17 @@ def _persist_vpn_config(updates: dict):
             "auto_ov_return_min": "auto_ov_return_min",
             "auto_wg_egress_ticks": "auto_wg_egress_ticks",
             "auto_flip_cooldown_min": "auto_flip_cooldown_min",
+            # [plan 19/08 §1/§2] free multi-attempt + exception ordering —
+            # no container effect (read per-request via IP_ROTATION.get),
+            # persisted so the GUI selection survives a restart.
+            "max_free_attempts": "max_free_attempts",
+            "free_exception_fallback": "free_exception_fallback",
+            # [Axe 3.1] socks5 backend (static proxy list, auto-rotate toggle,
+            # NordVPN country API, custom .ovpn file) — all persisted config.
+            "socks5_proxies": "socks5_proxies",
+            "socks5_auto_rotate": "socks5_auto_rotate",
+            "use_nordvpn_api": "use_nordvpn_api",
+            "custom_ovpn_file": "custom_ovpn_file",
         }
 
         changed = False
@@ -319,6 +351,9 @@ def _persist_vpn_config(updates: dict):
             except Exception:
                 pass
             _debug(f"  [vpn] config persisted to {config_path}")
+            # [Axe 3.4] dashboard wrote the file → it is NOT manually dirty.
+            global _config_yaml_known_mtime
+            _config_yaml_known_mtime = _config_yaml_mtime()
 
     except Exception as e:
         _debug(f"  [vpn] failed to persist config: {e}")
@@ -343,6 +378,9 @@ def _persist_free_model_map(mapping: dict):
         with open(config_path, "w", encoding="utf-8") as f:
             yaml.dump(config, f, default_flow_style=False,
                       allow_unicode=True, sort_keys=False)
+        # [Axe 3.4] dashboard wrote the file → not manually dirty.
+        global _config_yaml_known_mtime
+        _config_yaml_known_mtime = _config_yaml_mtime()
     except Exception as e:
         _debug(f"  [free] failed to persist free_model_map: {e}")
 
@@ -365,6 +403,377 @@ def _write_credentials_env(username: str, password: str):
     except Exception:
         pass
     _debug(f"  [vpn] credentials written to {cred_path}")
+
+
+# ── [Axe 3.1] SOCKS5 / NordVPN / diagnostic helpers ──
+# Every external I/O (NordVPN API, docker CLI, raw proxy probes) lives in
+# these small isolated helpers so the dashboard endpoints stay testable
+# offline (monkeypatch the helper, never the live system).
+
+def _vpn_proxy_mode() -> str:
+    """Current proxy mode for the GUI (vpn | socks5 | direct). Reads the
+    live manager registry first, then the config mirror, then defaults to
+    'vpn' (clients must never see an empty mode)."""
+    try:
+        import shared_state
+        mgrs = getattr(shared_state, "vpn_managers", None) or []
+        if isinstance(mgrs, list) and mgrs:
+            pm = getattr(mgrs[0], "proxy_mode", None)
+            if pm in ("vpn", "socks5", "direct"):
+                return pm
+        cfg = getattr(config_settings, "IP_ROTATION", None) or {}
+        pm = cfg.get("proxy_mode")
+        if pm in ("socks5", "direct"):
+            return pm
+    except Exception:
+        pass
+    return "vpn"
+
+
+def _socks5_payload(pool) -> list:
+    """Proxy rows for the GUI — defensive getattr (test fakes / older pools
+    lack the new attributes). Passwords are never shipped to the browser."""
+    rows = getattr(pool, "_socks5_proxies", None) or []
+    out = []
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        out.append({
+            "host": r.get("host", ""),
+            "port": r.get("port", 0),
+            "enabled": bool(r.get("enabled", True)),
+            "has_password": bool(r.get("password")),
+        })
+    return out
+
+
+def _dashboard_pool():
+    """The free-IP pool behind the VPN tab endpoints (None-safe)."""
+    try:
+        import shared_state
+        return getattr(shared_state, "free_ip_pool", None)
+    except Exception:
+        return None
+
+
+def _dashboard_managers() -> list:
+    """The active VPN manager registry ([] when uninitialized)."""
+    try:
+        import shared_state
+        return getattr(shared_state, "vpn_managers", None) or []
+    except Exception:
+        return []
+
+
+def _as_index(value) -> int:
+    """Index int strict — -1 sur toute valeur non-indexable (les bornes
+    sont vérifiées par l'appelant)."""
+    try:
+        idx = int(value)
+    except (TypeError, ValueError):
+        return -1
+    return idx
+
+
+def _apply_socks5_rows(rows: list) -> dict | None:
+    """Validate + persist the socks5 list, then push it to the pool.
+    Returns an error dict on invalid input, None on success."""
+    cleaned = []
+    for i, r in enumerate(rows or []):
+        if not isinstance(r, dict):
+            return {"error": f"ligne {i}: entrée invalide"}
+        host = str(r.get("host", "") or "").strip()
+        if not host:
+            return {"error": f"ligne {i}: host manquant"}
+        try:
+            port = int(r.get("port") or 0)
+        except (TypeError, ValueError):
+            return {"error": f"ligne {i}: port invalide"}
+        if not (1 <= port <= 65535):
+            return {"error": f"ligne {i}: port hors bornes (1-65535)"}
+        cleaned.append({
+            "host": host,
+            "port": port,
+            "enabled": bool(r.get("enabled", True)),
+            "username": str(r.get("username") or "").strip() or None,
+            "password": str(r.get("password") or "").strip() or None,
+        })
+    err = _persist_vpn_config({"socks5_proxies": cleaned})
+    if not err:
+        try:
+            import shared_state
+            pool = getattr(shared_state, "free_ip_pool", None)
+            if pool is not None and hasattr(pool, "set_socks5_proxies"):
+                pool.set_socks5_proxies(cleaned)
+        except Exception as e:
+            _debug(f"  [vpn] socks5 pool update failed: {e}")
+    return None
+
+
+def _socks5_auto_rotate_state() -> bool:
+    """Current auto-rotate toggle — config mirror first, pool second."""
+    try:
+        cfg = getattr(config_settings, "IP_ROTATION", None) or {}
+        if "socks5_auto_rotate" in cfg:
+            return bool(cfg["socks5_auto_rotate"])
+        import shared_state
+        pool = getattr(shared_state, "free_ip_pool", None)
+        if pool is not None and hasattr(pool, "_socks5_auto_rotate"):
+            return bool(pool._socks5_auto_rotate)
+    except Exception:
+        pass
+    return True
+
+
+def _read_exact(sock, n: int) -> bytes:
+    """Read exactly n bytes or raise (used for the SOCKS5 reply framing)."""
+    buf = b""
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise ConnectionError(
+                "fermeture de la connexion pendant la réponse SOCKS5")
+        buf += chunk
+    return buf
+
+
+def _socks5_raw_get(proxy_host: str, proxy_port: int, target: str,
+                    timeout: float = 8.0) -> tuple:
+    """Full HTTP(S) GET through a SOCKS5 proxy using raw sockets + ssl (no
+    socks-extras dependency). Returns (status, body, elapsed_seconds);
+    raises on connectivity failure. The CONNECT handshake doubles as the
+    proxy liveness probe."""
+    import ssl
+    import ipaddress
+    from urllib.parse import urlsplit
+    u = urlsplit(target)
+    host, port = u.hostname, u.port or 443
+    started = time.monotonic()
+    sock = socket.create_connection((proxy_host, int(proxy_port)),
+                                    timeout=timeout)
+    try:
+        sock.settimeout(timeout)
+        sock.sendall(b"\x05\x01\x00")  # version 5, 1 method, no-auth
+        ver, nmeth = _read_exact(sock, 2)
+        if ver != 5 or nmeth != 0:
+            raise ConnectionError(
+                f"proxy SOCKS5 a refusé le handshake ({ver}/{nmeth})")
+        try:
+            ipaddress.ip_address(host)
+            atyp, addr = 0x01, socket.inet_aton(host)
+        except ValueError:
+            atyp, hb = 0x03, host.encode()  # hostname ATYP
+            addr = bytes([len(hb)]) + hb
+        sock.sendall(b"\x05\x01\x00" + bytes([atyp]) + addr
+                     + int(port).to_bytes(2, "big"))
+        rep = _read_exact(sock, 4)
+        if rep[1] != 0:
+            raise ConnectionError(f"CONNECT SOCKS5 refusé (code {rep[1]})")
+        atyp = rep[3]
+        if atyp == 0x01:
+            _read_exact(sock, 6)      # IPv4 addr + port
+        elif atyp == 0x04:
+            _read_exact(sock, 18)     # IPv6 addr + port
+        elif atyp == 0x03:
+            ln = _read_exact(sock, 1)[0]
+            _read_exact(sock, ln + 2)  # hostname + port
+        else:
+            raise ConnectionError(f"réponse SOCKS5 atyp={atyp}")
+        path = u.path or "/"
+        if u.query:
+            path += "?" + u.query
+        req = (f"GET {path} HTTP/1.1\r\nHost: {host}\r\n"
+               f"User-Agent: opencode-proxy/1.0\r\nConnection: close\r\n\r\n")
+        with ssl.create_default_context().wrap_socket(
+                sock, server_hostname=host) as tls:
+            tls.sendall(req.encode())
+            data = b""
+            while True:
+                chunk = tls.recv(65536)
+                if not chunk:
+                    break
+                data += chunk
+    finally:
+        sock.close()
+    head, _, body = data.partition(b"\r\n\r\n")
+    status = int(head.split(b" ", 2)[1])
+    return status, body.decode("utf-8", "replace"), time.monotonic() - started
+
+
+async def _socks5_probe(host: str, port: int) -> dict:
+    """Test a static SOCKS5 proxy: egress IP + latency + opencode.ai
+    reachability through it (contracts: static/app.js socks5/test)."""
+    host = (host or "").strip()
+    try:
+        port = int(port)
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "port invalide"}
+    if not host:
+        return {"ok": False, "error": "host manquant"}
+
+    def _run():
+        status, body, elapsed = _socks5_raw_get(
+            host, port, "https://api.ipify.org/")
+        ip = body.strip()
+        try:
+            s2, _, _ = _socks5_raw_get(host, port, "https://opencode.ai/")
+            oc_ok = 200 <= s2 < 400
+        except Exception:
+            oc_ok = False
+        return ip, (200 <= status < 400), elapsed, oc_ok
+
+    try:
+        ip, ok, elapsed, oc_ok = await asyncio.to_thread(_run)
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    return {"ok": ok, "ip": ip, "opencode_ok": oc_ok,
+            "latency_ms": round(elapsed * 1000, 1)}
+
+
+async def _nordvpn_api_fetch(url: str, timeout: float = 10.0) -> dict:
+    """One GET against the (free, keyless) NordVPN server API. Isolated so
+    tests monkeypatch it — the live HTTP path never runs offline."""
+    def _do():
+        import httpx
+        with httpx.Client(timeout=timeout, follow_redirects=True) as c:
+            r = c.get(url)
+            r.raise_for_status()
+            return r.json()
+    return await asyncio.to_thread(_do)
+
+
+_NORDVPN_STATIC_COUNTRIES = [
+    {"code": "US", "name": "United States"},
+    {"code": "GB", "name": "United Kingdom"},
+    {"code": "DE", "name": "Germany"},
+    {"code": "FR", "name": "France"},
+    {"code": "NL", "name": "Netherlands"},
+    {"code": "SE", "name": "Sweden"},
+    {"code": "CH", "name": "Switzerland"},
+    {"code": "ES", "name": "Spain"},
+    {"code": "IT", "name": "Italy"},
+    {"code": "BE", "name": "Belgium"},
+    {"code": "AT", "name": "Austria"},
+    {"code": "DK", "name": "Denmark"},
+    {"code": "FI", "name": "Finland"},
+    {"code": "NO", "name": "Norway"},
+    {"code": "PL", "name": "Poland"},
+    {"code": "PT", "name": "Portugal"},
+    {"code": "CZ", "name": "Czechia"},
+    {"code": "RO", "name": "Romania"},
+    {"code": "TR", "name": "Turkey"},
+    {"code": "JP", "name": "Japan"},
+    {"code": "SG", "name": "Singapore"},
+    {"code": "AU", "name": "Australia"},
+    {"code": "NZ", "name": "New Zealand"},
+    {"code": "CA", "name": "Canada"},
+    {"code": "MX", "name": "Mexico"},
+    {"code": "ZA", "name": "South Africa"},
+    {"code": "IN", "name": "India"},
+]
+
+
+async def _nordvpn_countries(use_api: bool) -> list:
+    """Country list for the GUI: live NordVPN API when use_nordvpn_api is
+    on, else the static fallback (offline-safe)."""
+    if use_api:
+        try:
+            data = await _nordvpn_api_fetch(
+                "https://api.nordvpn.com/v1/servers/countries")
+            out = []
+            for row in data or []:
+                if not isinstance(row, dict):
+                    continue
+                code = str(row.get("code", "")).upper()
+                name = str(row.get("name", "")).strip()
+                if code and name:
+                    out.append({"code": code, "name": name})
+            if out:
+                return sorted(out, key=lambda c: c["name"])
+        except Exception as e:
+            _debug(f"  [nordvpn] countries API failed, static fallback: {e}")
+    return list(_NORDVPN_STATIC_COUNTRIES)
+
+
+async def _nordvpn_servers_by_country(code: str, limit: int = 20) -> list:
+    """Recommended OpenVPN servers for a country (NordVPN API). Returns
+    [{hostname, country, load}]; empty list on any failure."""
+    code = (code or "").strip().upper()
+    if not code:
+        return []
+    try:
+        countries = await _nordvpn_api_fetch(
+            "https://api.nordvpn.com/v1/servers/countries")
+        cid = None
+        for row in countries or []:
+            if isinstance(row, dict) and str(row.get("code", "")).upper() == code:
+                cid = row.get("id")
+                break
+        if cid is None:
+            return []
+        data = await _nordvpn_api_fetch(
+            "https://api.nordvpn.com/v1/servers/recommendations"
+            f"?limit={int(limit)}"
+            "&filters[servers_technologies][identifier]=openvpn_udp"
+            f"&filters[country_id]={int(cid)}")
+        out = []
+        for row in data or []:
+            if not isinstance(row, dict):
+                continue
+            host = str(row.get("hostname", "")).strip()
+            if host:
+                out.append({"hostname": host, "country": code,
+                            "load": row.get("load", 0)})
+        return out
+    except Exception as e:
+        _debug(f"  [nordvpn] servers_by_country({code}) failed: {e}")
+        return []
+
+
+def _docker_diag() -> dict:
+    """System docker info for the diagnostic bundle — isolated subprocess,
+    monkeypatchable (never live in tests)."""
+    diag = {"available": False, "running": False, "version": None}
+    try:
+        r = subprocess.run(
+            ["docker", "version", "--format", "{{.Server.Version}}"],
+            capture_output=True, text=True, timeout=10)
+        if r.returncode == 0:
+            diag["available"] = True
+            diag["version"] = (r.stdout or r.stderr).strip() or None
+    except Exception as e:
+        diag["error"] = str(e)
+        return diag
+    try:
+        info = subprocess.run(
+            ["docker", "info", "--format", "{{.ServerVersion}}"],
+            capture_output=True, text=True, timeout=10)
+        diag["running"] = info.returncode == 0
+    except Exception:
+        diag["running"] = False
+    return diag
+
+
+def _docker_compose_config() -> list:
+    """`docker compose config` output per active station (diagnostic
+    bundle). Empty list when no managers or docker is absent."""
+    try:
+        import shared_state
+        mgrs = getattr(shared_state, "vpn_managers", None) or []
+    except Exception:
+        mgrs = []
+    out = []
+    for m in mgrs:
+        df = getattr(m, "_docker_compose_file", None)
+        if not df:
+            continue
+        try:
+            r = subprocess.run(["docker", "compose", "-f", df, "config"],
+                               capture_output=True, text=True, timeout=15)
+            out.append(f"=== {df}\n{(r.stdout or r.stderr).strip()}")
+        except Exception as e:
+            out.append(f"=== {df}\n(erreur: {e})")
+    return out
 
 
 def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_usage=None, token_lock=None, db_lock=None):
@@ -1247,6 +1656,26 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
             watcher = getattr(shared_state, "docker_event_watcher", None)
             if watcher is not None:
                 data["watch_events"] = watcher.get_status()
+            # [plan 18/08 §2.1] Anti-env périmé: clés VPN_* dont la valeur
+            # .env diffère de l'env du process — les enfants `docker compose`
+            # héritent de l'env du parent (cause racine 19/08). La bannière
+            # dashboard s'affiche quand ce champ est présent.
+            if config_settings.ENV_DIVERGENCE:
+                data["env_divergence"] = [
+                    {"key": k, "file": f, "env": e}
+                    for k, f, e in config_settings.ENV_DIVERGENCE]
+            # [Axe 3.4] config.yaml modifié à la main sans POST dashboard →
+            # dirty: le hot-reload est push-only par design, une bannière GUI
+            # demande un restart ou une re-push (jamais d'auto-reload).
+            data["config_yaml_dirty"] = (
+                _config_yaml_mtime() != _config_yaml_known_mtime)
+            # [Axe 3.1] socks5 backend state — the GUI's proxy table + the
+            # auto-rotate toggle (never ship passwords).
+            data["proxy_mode"] = _vpn_proxy_mode()
+            data["socks5"] = {
+                "proxies": _socks5_payload(shared_state.free_ip_pool),
+                "rotate": _socks5_auto_rotate_state(),
+            }
             countries = {}
             # [plan 18/08 §4] N-station: per-station country overlay for
             # every active tunnel (was mgr1+mgr2 fixed pair).
@@ -1322,6 +1751,21 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
                     return {"error": f"free_model_map hot-reload failed: {e}"}
                 _persist_free_model_map(_fmm)
 
+        # [plan 19/08 §1/§2] free multi-attempt + exception ordering —
+        # validated here, then left in body so they reach _persist_vpn_config
+        # (config.yaml + in-memory mirror; read per-request via
+        # IP_ROTATION.get → hot-reload without restart). No container effect:
+        # update_config() stores them harmlessly in the manager _config dict.
+        if "max_free_attempts" in body:
+            try:
+                body["max_free_attempts"] = max(1, min(3, int(body["max_free_attempts"])))
+            except (TypeError, ValueError):
+                return {"error": "max_free_attempts must be an integer in [1,3]"}
+        if "free_exception_fallback" in body:
+            if str(body["free_exception_fallback"]) not in ("station-first", "direct"):
+                return {"error": "free_exception_fallback must be 'station-first' or 'direct'"}
+            body["free_exception_fallback"] = str(body["free_exception_fallback"])
+
         # Handle config updates (need VPN manager). [plan] F: fan-out to
         # ALL stations — identity pool, watchdog backoff and freshness
         # windows must stay symmetric on every station (a single shared
@@ -1334,13 +1778,21 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
             # actually change; _apply_station_count persists config.yaml
             # LAST (coherent on mid-failure).
             if "station_count" in body:
-                _new_n = body["station_count"]
+                _raw_n = body["station_count"]
                 try:
-                    _new_n = int(_new_n)
+                    _new_n = int(_raw_n)
                 except (TypeError, ValueError):
                     _new_n = 0
+                # [Axe 3.3] 400 explicite hors bornes — un clamp silencieux
+                # masque les erreurs GUI/programmatiques (un 15 tapé lancerait
+                # 10 stations sans sourciller).
+                if not (1 <= _new_n <= 10):
+                    return JSONResponse(
+                        status_code=400,
+                        content={"error": "station_count must be an integer "
+                                         f"in [1,10], got {_raw_n!r}"})
                 body.pop("station_count")  # consumed — never fanned out
-                if _new_n and _new_n != len(managers):
+                if _new_n != len(managers):
                     try:
                         from opencode import _apply_station_count
                         await _apply_station_count(_new_n)
@@ -1401,6 +1853,9 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
     @app.post("/api/vpn/toggle")
     async def toggle_vpn(request: Request):
         """Enable or disable VPN rotation."""
+        err = _check_dashboard_token(request)
+        if err:
+            return err
         import shared_state
         body = await request.json()
         enabled = body.get("enabled", True)
@@ -1412,8 +1867,11 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
         return {"error": "VPN manager not initialized"}
 
     @app.post("/api/vpn/connect")
-    async def connect_vpn():
+    async def connect_vpn(request: Request):
         """Connect VPN — reconcile status, then connect via compose-managed gluetun."""
+        err = _check_dashboard_token(request)
+        if err:
+            return err
         import shared_state
         if not shared_state.vpn_manager:
             return {"error": "VPN manager not initialized"}
@@ -1431,8 +1889,11 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
             return {"error": str(e)}
 
     @app.post("/api/vpn/disconnect")
-    async def disconnect_vpn():
+    async def disconnect_vpn(request: Request):
         """Disconnect VPN."""
+        err = _check_dashboard_token(request)
+        if err:
+            return err
         import shared_state
         if not shared_state.vpn_manager:
             return {"error": "VPN manager not initialized"}
@@ -1440,8 +1901,11 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
         return {"ok": True}
 
     @app.post("/api/vpn/health-check")
-    async def vpn_health_check():
+    async def vpn_health_check(request: Request):
         """Run a health check on the current VPN connection."""
+        err = _check_dashboard_token(request)
+        if err:
+            return err
         import shared_state
         if not shared_state.vpn_manager:
             return {"error": "VPN manager not initialized"}
@@ -1455,6 +1919,9 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
         Body may carry ``station`` (0 = active station, default; n = station
         n — the latter only within the resolved station_count).
         """
+        err = _check_dashboard_token(request)
+        if err:
+            return err
         import shared_state
         managers = getattr(shared_state, "vpn_managers", None) or []
         if not managers:
@@ -1504,8 +1971,11 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
             return {"error": str(e)}
 
     @app.post("/api/vpn/update")
-    async def update_vpn():
+    async def update_vpn(request: Request):
         """Force-check and apply a pending gluetun image update."""
+        err = _check_dashboard_token(request)
+        if err:
+            return err
         import shared_state
         if not shared_state.vpn_manager:
             return {"error": "VPN manager not initialized"}
@@ -1523,8 +1993,11 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
             return {"error": str(e)}
 
     @app.get("/api/vpn/credentials")
-    async def get_vpn_credentials():
+    async def get_vpn_credentials(request: Request):
         """Check if VPN credentials exist (does not return actual values)."""
+        err = _check_dashboard_token(request)
+        if err:
+            return err
         import os
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         cred_path = os.path.join(root, "credentials.env")
@@ -1558,8 +2031,11 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
         return {"ok": True, "note": "restart the VPN container (docker compose up -d) for gluetun to pick up new credentials"}
 
     @app.post("/api/vpn/save-state")
-    async def save_vpn_state():
+    async def save_vpn_state(request: Request):
         """Persist VPN state to disk."""
+        err = _check_dashboard_token(request)
+        if err:
+            return err
         import shared_state
         if shared_state.vpn_manager:
             shared_state.vpn_manager.save_state()
@@ -1615,6 +2091,311 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
                     shared_state.vpn_manager._total_switches = state["total_switches"]
 
         return {"ok": True}
+
+    # ── [Axe 3.1] SOCKS5 backend / NordVPN / diagnostic endpoints ──
+    # Contracts pinned from static/app.js (verified 19/08). All state-chan
+    # gers carry the dashboard token guard; read-only GETs stay open (the
+    # GUI polls them every 10 s). External I/O lives in the isolated helpers
+    # above (hot-patchable offline — live docker/API never runs in tests).
+
+    @app.get("/api/vpn/socks5")
+    async def get_vpn_socks5():
+        """Static SOCKS5 proxy list for the GUI (app.js socks5 GET →
+        ``{proxies, rotate}``; proxies never carry passwords)."""
+        pool = _dashboard_pool()
+        return {"proxies": _socks5_payload(pool),
+                "rotate": _socks5_auto_rotate_state()}
+
+    @app.post("/api/vpn/socks5")
+    async def add_vpn_socks5(request: Request):
+        """Append a static SOCKS5 proxy (``{host, port, username,
+        password}``). Persists + pushes the pool, returns the new list."""
+        err = _check_dashboard_token(request)
+        if err:
+            return err
+        body = await request.json()
+        pool = _dashboard_pool()
+        try:
+            port = int(body.get("port") or 1080)
+        except (TypeError, ValueError):
+            return {"error": f"port invalide: {body.get('port')!r}"}
+        rows = list(getattr(pool, "_socks5_proxies", None) or [])
+        rows.append({
+            "host": str(body.get("host", "") or ""),
+            "port": port,
+            "enabled": True,
+            "username": body.get("username"),
+            "password": body.get("password"),
+        })
+        err = _apply_socks5_rows(rows)
+        if err:
+            return err
+        return {"ok": True, "proxies": _socks5_payload(pool)}
+
+    @app.post("/api/vpn/socks5/remove")
+    async def remove_vpn_socks5(request: Request):
+        """Remove the proxy at ``{index}`` (app.js remove → ``{proxies}``)."""
+        err = _check_dashboard_token(request)
+        if err:
+            return err
+        body = await request.json()
+        pool = _dashboard_pool()
+        rows = list(getattr(pool, "_socks5_proxies", None) or [])
+        idx = _as_index(body.get("index"))
+        if not (0 <= idx < len(rows)):
+            return {"error": f"proxy index hors bornes: {idx!r}"}
+        del rows[idx]
+        err = _apply_socks5_rows(rows)
+        if err:
+            return err
+        return {"ok": True, "proxies": _socks5_payload(pool)}
+
+    @app.post("/api/vpn/socks5/toggle")
+    async def toggle_vpn_socks5(request: Request):
+        """Enable/disable the proxy at ``{index, enabled}``."""
+        err = _check_dashboard_token(request)
+        if err:
+            return err
+        body = await request.json()
+        pool = _dashboard_pool()
+        rows = list(getattr(pool, "_socks5_proxies", None) or [])
+        idx = _as_index(body.get("index"))
+        if not (0 <= idx < len(rows)):
+            return {"error": f"proxy index hors bornes: {idx!r}"}
+        rows[idx] = dict(rows[idx])
+        rows[idx]["enabled"] = bool(body.get("enabled", True))
+        err = _apply_socks5_rows(rows)
+        if err:
+            return err
+        return {"ok": True}
+
+    @app.post("/api/vpn/socks5/test")
+    async def test_vpn_socks5(request: Request):
+        """Probe one proxy (``{host, port}``) → ``{ok, ip, opencode_ok,
+        latency_ms, error}`` (raw SOCKS5 + ssl through ``_socks5_probe``)."""
+        err = _check_dashboard_token(request)
+        if err:
+            return err
+        body = await request.json()
+        return await _socks5_probe(body.get("host", ""), body.get("port", 0))
+
+    @app.post("/api/vpn/socks5/rotate")
+    async def rotate_vpn_socks5(request: Request):
+        """Two roles (app.js socks5/rotate):
+        - body ``{rotate: bool}`` → persist the auto-rotate toggle;
+        - body WITHOUT ``rotate`` → manual rotate to the next usable proxy
+          (``{ok, next}`` superset). Both keep the pool in sync."""
+        err = _check_dashboard_token(request)
+        if err:
+            return err
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        if "rotate" in body:
+            _v = bool(body.get("rotate"))
+            _persist_vpn_config({"socks5_auto_rotate": _v})
+            pool = _dashboard_pool()
+            if pool is not None and hasattr(pool, "_socks5_auto_rotate"):
+                pool._socks5_auto_rotate = _v
+            return {"ok": True, "rotate": _v}
+        pool = _dashboard_pool()
+        if pool is None or not hasattr(pool, "rotate_socks5_now"):
+            return {"error": "pool socks5 non disponible"}
+        nxt = pool.rotate_socks5_now()
+        return {"ok": nxt is not None,
+                "next": getattr(nxt, "pid", None) if nxt is not None else None}
+
+    @app.post("/api/vpn/proxy-mode")
+    async def set_vpn_proxy_mode(request: Request):
+        """Switch egress mode ``vpn | socks5 | direct`` — persists + fans out
+        to every station (the pool's socks5_mode reads managers[0].proxy_mode,
+        so this single property drives the whole free path)."""
+        err = _check_dashboard_token(request)
+        if err:
+            return err
+        body = await request.json()
+        mode = str(body.get("mode", "")).strip()
+        if mode not in ("vpn", "socks5", "direct"):
+            return {"error": f"mode doit être vpn|socks5|direct, reçu {mode!r}"}
+        managers = _dashboard_managers()
+        if not managers:
+            return {"error": "VPN manager non initialisé"}
+        for m in managers:
+            m.proxy_mode = mode
+        _persist_vpn_config({"proxy_mode": mode})
+        return {"ok": True, "mode": mode}
+
+    @app.get("/api/vpn/nordvpn-available")
+    async def nordvpn_available():
+        """``{available}`` — credentials.env présent + provider nordvpn."""
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        cred_path = os.path.join(root, "credentials.env")
+        has = os.path.exists(cred_path) and os.path.getsize(cred_path) > 0
+        cfg = getattr(config_settings, "IP_ROTATION", None) or {}
+        provider = str(cfg.get("server_provider") or "nordvpn").lower()
+        return {"available": has and provider == "nordvpn"}
+
+    @app.get("/api/vpn/nordvpn-status")
+    async def nordvpn_status():
+        """``{connected, country, city, ip}`` — adaptateur honnête depuis
+        l'état réel des managers (pas d'invention de credentials)."""
+        st = {"connected": False, "country": None, "city": None, "ip": None}
+        for m in _dashboard_managers():
+            try:
+                mg = m.get_status()
+            except Exception:
+                continue
+            if st["country"] is None:
+                st["country"] = mg.get("current_country") or None
+            if m.status == "connected" or mg.get("status") == "connected":
+                st["connected"] = True
+            if st["ip"] is None:
+                st["ip"] = getattr(m, "current_ip", None) or mg.get("ip") or None
+            if st["city"] is None:
+                st["city"] = mg.get("city") or None
+        return st
+
+    @app.get("/api/vpn/nordvpn-countries")
+    async def nordvpn_countries_ep():
+        """``{countries}`` — API NordVPN quand use_nordvpn_api, sinon liste
+        statique (offline-safe)."""
+        cfg = getattr(config_settings, "IP_ROTATION", None) or {}
+        return {"countries": await _nordvpn_countries(
+            bool(cfg.get("use_nordvpn_api")))}
+
+    @app.get("/api/vpn/countries")
+    async def vpn_countries_ep():
+        """``{countries}`` — même source que nordvpn-countries (app.js
+        vpnLoadCountries consomme ``data.countries``)."""
+        cfg = getattr(config_settings, "IP_ROTATION", None) or {}
+        return {"countries": await _nordvpn_countries(
+            bool(cfg.get("use_nordvpn_api")))}
+
+    @app.post("/api/vpn/discover-and-add")
+    async def vpn_discover_and_add(request: Request):
+        """Découvre les serveurs OpenVPN recommandés d'un pays (API NordVPN)
+        et ajoute le pays à la liste de rotation ``server_countries``
+        (noms séparés par virgules, format config.yaml). Retourne le nombre
+        de serveurs découverts (app.js : ``✓ N serveur(s) ajouté(s)``)."""
+        err = _check_dashboard_token(request)
+        if err:
+            return err
+        body = await request.json()
+        code = str(body.get("country") or "").strip().upper()
+        group = str(body.get("group") or "").strip()
+        try:
+            limit = max(1, min(50, int(body.get("limit") or 5)))
+        except (TypeError, ValueError):
+            limit = 5
+        if not code:
+            return {"error": "country requis (code, ex: DE)"}
+        servers = await _nordvpn_servers_by_country(code, limit=limit)
+        if not servers:
+            return {"error": f"aucun serveur trouvé pour {code}"}
+        # code → nom de pays (server_countries garde des NOMS de pays)
+        cname = code
+        for c in await _nordvpn_countries(True):
+            if str(c.get("code", "")).upper() == code:
+                cname = c.get("name") or code
+                break
+        cfg = getattr(config_settings, "IP_ROTATION", None) or {}
+        current = str(cfg.get("server_countries") or "")
+        names = [c.strip() for c in current.split(",") if c.strip()]
+        if cname not in names:
+            names.append(cname)
+        _persist_vpn_config({"server_countries": ", ".join(names)})
+        return {"count": len(servers), "country": cname}
+
+    @app.post("/api/vpn/upload-config")
+    async def vpn_upload_config(request: Request):
+        """Upload un fichier .ovpn (FormData ``{name, config}``) vers
+        ``vpn_configs/custom/`` et persiste ``custom_ovpn_file``."""
+        err = _check_dashboard_token(request)
+        if err:
+            return err
+        form = await request.form()
+        name = str(form.get("name") or "").strip() or "custom"
+        name = re.sub(r"[^A-Za-z0-9._-]", "_", name)
+        if not name.lower().endswith(".ovpn"):
+            name += ".ovpn"
+        upload = form.get("config")
+        content = upload.file.read() if upload is not None else None
+        if not content:
+            return {"error": "fichier config manquant (champ FormData 'config')"}
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        custom_dir = os.path.join(root, "vpn_configs", "custom")
+        os.makedirs(custom_dir, exist_ok=True)
+        path = os.path.join(custom_dir, name)
+        with open(path, "wb") as f:
+            f.write(content)
+        rel = os.path.join("vpn_configs", "custom", name)
+        _persist_vpn_config({"custom_ovpn_file": rel.replace(os.sep, "/")})
+        return {"ok": True, "path": rel.replace(os.sep, "/")}
+
+    @app.get("/api/vpn/diagnostic")
+    async def vpn_diagnostic():
+        """Bundle diagnostic (app.js vpnDiagnostic) — mode actuel, statut,
+        NordVPN app, docker, WSL2, OpenVPN natif, recommandation. Tout
+        l'I/O externe est dans les helpers isolés (monkeypatchables)."""
+        import shutil
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        managers = _dashboard_managers()
+        mode = _vpn_proxy_mode()
+        # État agrégé des stations actives.
+        status, ip = "not_configured", None
+        if managers:
+            connected = [m for m in managers
+                         if getattr(m, "status", None) == "connected"]
+            if connected:
+                status = "connected"
+            elif any(getattr(m, "status", None) in ("connecting",
+                                                    "rotating") for m in managers):
+                status = "connecting"
+            elif managers:
+                status = "not_connected"
+            ip = next((m.current_ip for m in managers if m.current_ip), None)
+        nordvpn = {"available": False, "exe": None, "status": None}
+        if status == "connected":
+            st = await nordvpn_status()
+            nordvpn = {"available": True, "exe": None, "status": st}
+        docker = _docker_diag()
+        wsl2 = {"available": False}
+        try:
+            r = subprocess.run(["wsl", "--status"], capture_output=True,
+                               text=True, timeout=5)
+            wsl2["available"] = r.returncode == 0
+        except Exception:
+            pass
+        openvpn = {"available": False, "path": None}
+        ovpn_path = shutil.which("openvpn")
+        if ovpn_path:
+            openvpn = {"available": True, "path": ovpn_path}
+        elif os.path.exists("/usr/sbin/openvpn"):
+            openvpn = {"available": True, "path": "/usr/sbin/openvpn"}
+        docker_ok = bool(docker.get("running"))
+        if mode == "vpn":
+            if status == "connected":
+                rec = "Connexion VPN active — rotation IP opérationnelle"
+            elif docker_ok:
+                rec = "Docker OK — VPN non connecté (voir statut ci-dessus)"
+            else:
+                rec = "Docker absent ou arrêté — installer/démarrer Docker puis reconnecter"
+        else:
+            rec = f"Mode {mode} actif (pas de tunnel docker requis)"
+        return {
+            "current_mode": mode,
+            "status": status,
+            "ip": ip,
+            "nordvpn_app": nordvpn,
+            "docker": docker,
+            "wsl2": wsl2,
+            "openvpn": openvpn,
+            "recommendation": rec,
+            "config_yaml_dirty": (
+                _config_yaml_mtime() != _config_yaml_known_mtime),
+            "compose_config": _docker_compose_config(),
+        }
 
     # ── Traffic capture (Wireshark-like raw request view) ──
 

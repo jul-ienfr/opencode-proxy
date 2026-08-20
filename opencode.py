@@ -932,11 +932,14 @@ async def _apply_station_count(new_n: int) -> None:
     its named volume survives, so an upscale recreates it) for each
     retired station, then drop it.
 
-    Both directions converge on: pool.set_stations (fresh swap; the
-    worker is never cancelled — stale queue entries become no-ops),
-    watcher.set_managers (atomic map swap), and ``_persist_vpn_config``
-    LAST — if compose fails mid-way, config.yaml still holds the old
-    count, so the next boot is consistent with the pre-change state.
+    Both directions converge on: pool.set_stations (fresh swap), watcher
+    set_managers (atomic map swap), and ``_persist_vpn_config`` LAST — if
+    compose fails mid-way, config.yaml still holds the old count, so the
+    next boot is consistent with the pre-change state. Downscale also
+    cancels the retired stations' in-flight rotations (cancel + await,
+    [plan 18/08 §2.3]) so no rotation lands on a container that
+    stop_container is deleting; the worker survives and stale queue
+    entries remain no-ops.
     """
     new_n = max(1, min(10, new_n))
     async with _apply_station_lock:
@@ -968,6 +971,14 @@ async def _apply_station_count(new_n: int) -> None:
             for m in managers[old_n:]:
                 await m.start()  # compose up -d <service> (fail-soft)
         else:
+            pool = getattr(shared_state, "free_ip_pool", None)
+            if pool is not None:
+                # [plan 18/08 §2.3] cancel + await (5 s cap) the retired
+                # stations' in-flight rotations BEFORE their containers are
+                # stopped/removed — a rotation must not land on a container
+                # that stop_container is about to delete.
+                await pool.cancel_rotations(
+                    [m._station for m in managers[new_n:]])
             for m in reversed(managers[new_n:]):
                 await m.stop()  # state-only (tunnel dies only via compose)
                 await m.stop_container()  # compose stop + rm -f (fix 19/08)
@@ -1189,6 +1200,19 @@ async def lifespan(app):
     global _vpn_manager, _free_ip_pool
     _vpn_manager = _managers[0]
     _free_ip_pool = shared_state.free_ip_pool
+    # [plan 18/08 §2.2] Boot reconcile: a crash (or a stack flip that died
+    # mid-way) leaves docker containers that do not match the registry —
+    # retired stations from a downscale that never got their `docker rm -f`,
+    # or containers booted on the stale stack (the 19/08 case). Remove them
+    # NOW so start() recreates the fleet exactly as configured; fail-soft
+    # (a broken docker daemon must not block boot — start() handles it).
+    try:
+        from vpn_manager import reconcile_orphan_containers
+        _removed = await reconcile_orphan_containers(_managers)
+        if _removed:
+            _debug(f"  [lifespan] boot reconcile removed: {_removed}")
+    except Exception as e:
+        _debug(f"  [lifespan] boot reconcile failed (fail-soft): {e}")
     # Start every enabled station in PARALLEL (multi-station would otherwise
     # serialize the cold-start: station N waits for station 1's full
     # compose-up). Each start() is fail-soft internally (docker down/logs a
@@ -1245,6 +1269,18 @@ async def lifespan(app):
 
     key_pause_cleanup_task = asyncio.create_task(_periodic_key_pause_cleanup())
 
+    # [plan 18/08 §4.2] Periodic free-cooldown sweep: each IP rotation
+    # leaves a dead (model, IP) key behind; the map must not grow forever.
+    async def _periodic_cooldown_sweep():
+        while True:
+            await asyncio.sleep(yaml_get("background", "cooldown_sweep_interval", 30))
+            try:
+                _sweep_free_cooldowns()
+            except Exception as e:
+                _debug(f"  [cooldown] sweep error: {type(e).__name__}: {e}")
+
+    cooldown_sweep_task = asyncio.create_task(_periodic_cooldown_sweep())
+
     # Periodic DB body cleanup (daily) — removes old request/response bodies to save disk
     async def _periodic_db_cleanup():
         # Run cleanup once at startup, then every 24h
@@ -1272,6 +1308,7 @@ async def lifespan(app):
     checkpoint_task.cancel()
     db_flush_task.cancel()
     key_pause_cleanup_task.cancel()
+    cooldown_sweep_task.cancel()
     db_cleanup_task.cancel()
     try:
         await checkpoint_task
@@ -1283,6 +1320,10 @@ async def lifespan(app):
         pass
     try:
         await key_pause_cleanup_task
+    except asyncio.CancelledError:
+        pass
+    try:
+        await cooldown_sweep_task
     except asyncio.CancelledError:
         pass
     _debug("  [lifespan] background tasks cancelled")
@@ -1704,7 +1745,12 @@ def _current_free_identity(station=None) -> dict:
            else (_free_ip_pool.active_station if _free_ip_pool else None)
            or _vpn_manager)
     if mgr:
-        return mgr.current_identity
+        # [Axe 3.1] A static SOCKS5 proxy has no docker identity machinery
+        # (no current_identity) — the chrome131 default below is correct
+        # for it too: the proxy still needs a coherent browser fingerprint.
+        identity = getattr(mgr, "current_identity", None)
+        if identity:
+            return identity
     return {"impersonate": "chrome131", "user_agent": None, "extra_headers": {}}
 
 
@@ -1773,16 +1819,33 @@ def _is_connect_error(e: Exception) -> bool:
 
 
 def _signal_connection_failure(station) -> None:
-    """[plan 18/08 §1a] Fire-and-forget pool signal for a real connection
-    failure on ``station`` (SOCKS5 dead — invisible to the pool, which keeps
-    the station "connected"). The request path must NEVER suffer the signal:
-    any bug inside notify (bad-mark dispatch, logging) must not turn a free
-    request into an error — full swallow.
+    """[plan 18/08 §1a / Axe 1.5] Fire-and-forget pool signal for a real
+    connection failure on ``station`` (SOCKS5 dead — invisible to the pool,
+    which keeps the station "connected").
+
+    [Axe 1.5] No more silent swallow: `except Exception: pass` hid a bug in
+    the notification path (bad-mark dispatch, logging) and silently disabled
+    the failover for every following request. A failure to NOTIFY is now
+    logged with traceback and re-raised at the request level — the caller's
+    own except-block already re-raises/falls back safely, so the request
+    still never dies, but the defect becomes visible instead of mute.
+    Only ``asyncio.CancelledError`` is exempt (a cancelled request must not
+    fabricate a connection failure), and a legitimately ABSENT pool (VPN
+    off, self-heal mode) stays a no-op — that absence is a valid state, not
+    a defect to surface.
     """
+    if not _free_ip_pool:
+        return
     try:
         _free_ip_pool.notify_connection_failure(station)
+    except asyncio.CancelledError:
+        raise
     except Exception:
-        pass
+        sid = getattr(station, "_station", "?")
+        _log(f"[free-ip] notify_connection_failure raised (station {sid})")
+        logging.getLogger(__name__).exception(
+            "[free-ip] notify_connection_failure raised (station %s):", sid)
+        raise
 
 
 async def _do_free_request_curl_cffi(body: dict, headers: dict, proxy_url: str | None = None,
@@ -1915,9 +1978,58 @@ class _CurlCffiStreamResponse:
         await self._resp.aclose()
 
 
+class _FreeTunnelFailure(Exception):
+    """[plan 19/08 §2] typed tunnel failure re-raised by _open_free_stream.
+
+    Free streams + station-first mode + remaining free budget: the caller's
+    retry loop MUST NOT see the exception as a paid-path failure — it must
+    try another station. The CM re-raises this instead of falling through to
+    the direct residential fallback, and each stream loop catches it via a
+    dedicated `except _FreeTunnelFailure:` clause placed BETWEEN
+    asyncio.CancelledError and the broad except Exception (a broad clause
+    first would route the failure into paid alt-key retries — the leak this
+    type exists to prevent).
+    """
+
+    def __init__(self, station, cause):
+        super().__init__(f"free tunnel failure on station {getattr(station, '_station', '?')}: {cause}")
+        self.station = station
+        self.cause = cause
+
+
+def _free_max_attempts() -> int:
+    """[plan 19/08 §1] max free attempts per request (GUI: max_free_attempts).
+
+    Each attempt lands on a DIFFERENT egress IP (station exclusion before
+    open). 1 = legacy behavior (one free try, then paid). Hot-reloaded: the
+    value is read from the live IP_ROTATION mirror per request.
+    """
+    try:
+        v = int(IP_ROTATION.get("max_free_attempts", 2) or 2)
+    except (TypeError, ValueError):
+        v = 2
+    return max(1, min(v, 3))
+
+
+def _free_exception_fallback_mode() -> str:
+    """[plan 19/08 §2] tunnel-failure strategy (GUI: free_exception_fallback).
+
+    "station-first" → a dead tunnel retries another station before the
+    direct residential fallback; "direct" → legacy immediate direct
+    fallback. Hot-reloaded per request like max_free_attempts.
+    """
+    mode = IP_ROTATION.get("free_exception_fallback", "station-first") or "station-first"
+    return mode if mode in ("station-first", "direct") else "station-first"
+
+
+def _free_attempts_active() -> bool:
+    """Free re-strike budget is active (>1 attempt or station-first)."""
+    return _free_max_attempts() > 1 or _free_exception_fallback_mode() == "station-first"
+
+
 @asynccontextmanager
 async def _open_free_stream(endpoint, body, headers, use_free: bool, count_request: bool = True,
-                            fresh_station: bool = False):
+                            fresh_station: bool = False, direct_fallback: bool = True):
     """Context manager: upstream stream, routed through the VPN when free.
 
     use_free=True and VPN available → curl_cffi stream via the SOCKS5 tunnel
@@ -1938,6 +2050,12 @@ async def _open_free_stream(endpoint, body, headers, use_free: bool, count_reque
     IP, a guaranteed ✘ under the per-IP quota model. Uses the ContextVar's
     stored station as the failed one to exclude, then rotates it in the
     background.
+
+    direct_fallback=False ([plan 19/08 §2] station-first mode): a tunnel
+    exception RE-RAISES as _FreeTunnelFailure instead of falling through to
+    the direct residential fallback — the caller's retry loop then tries
+    another station (fresh IP = fresh quota). True = legacy behavior (the
+    direct fallback is the existing semantics).
     """
     if use_free and _free_ip_pool and _free_ip_pool.enabled:
         # on_request returns (proxy_url, station); the stream path used to
@@ -2017,6 +2135,12 @@ async def _open_free_stream(endpoint, body, headers, use_free: bool, count_reque
                 # Never on HTTP answers (429/5xx are not exceptions here).
                 if station is not None and _is_connect_error(e):
                     _signal_connection_failure(station)
+                if not direct_fallback:
+                    # [plan 19/08 §2] station-first mode with remaining free
+                    # budget → re-raise so the caller's retry loop strikes
+                    # ANOTHER station (fresh IP = fresh quota) before the
+                    # residential-IP direct fallback is ever considered.
+                    raise _FreeTunnelFailure(station, e) from e
                 _debug(f"  [stream] curl_cffi proxy stream failed: {e}, falling back to direct stream")
                 _log(f"  FREE STREAM via VPN tunnel FAILED ({e}) → direct fallback (residential IP)")
     if use_free:
@@ -2105,6 +2229,12 @@ def _free_cooldown_key(free_model: str, station=None) -> str:
     key must stay stable.
     """
     vpn = station or (_free_ip_pool.active_station if _free_ip_pool else None) or _vpn_manager
+    if getattr(vpn, "pid", None):
+        # [Axe 3.1] Static SOCKS5 proxy: no docker IP to key on — the
+        # proxy's identity IS its host:port. Each proxy gets its own
+        # bucket: a 429 on one must never cooldown the others, which
+        # egress separate IPs.
+        return f"{free_model}|socks5:{vpn.pid}"
     ip = vpn.current_ip if (vpn and vpn.current_ip) else "direct"
     return f"{free_model}|{ip}"
 
@@ -2138,13 +2268,31 @@ def _free_429_cooldown_seconds(retry_after: str = "") -> float:
     return _FREE_429_DEFAULT
 
 
+def _sweep_free_cooldowns() -> int:
+    """[plan 18/08 §4.2] Drop expired (model, IP) cooldown entries.
+
+    Without a periodic sweep the map grows without bound: each rotation
+    leaves the previous IP's key behind (expiry is only cleaned lazily on
+    that exact key's next lookup). Run on the lifespan background tick —
+    the len()>32 guard in _set_free_cooldown remains a soft-limit for
+    transient bursts between ticks.
+    """
+    now = time.monotonic()
+    expired = [k for k, t in _free_model_cooldowns.items() if t <= now]
+    for k in expired:
+        del _free_model_cooldowns[k]
+    if expired:
+        _debug(f"  [cooldown] swept {len(expired)} expired free-cooldown entries")
+    return len(expired)
+
+
 def _set_free_cooldown(free_model: str, seconds: float, station=None) -> None:
     key = _free_cooldown_key(free_model, station)
     expiry = time.monotonic() + seconds
-    if len(_free_model_cooldowns) > 32:  # bound memory: drop expired entries
-        expired = [m for m, t in _free_model_cooldowns.items() if t <= time.monotonic()]
-        for m in expired:
-            del _free_model_cooldowns[m]
+    # soft-limit ([plan 18/08 §4.2]): the periodic _sweep_free_cooldowns is
+    # the real memory bound; this only avoids a burst between two ticks.
+    if len(_free_model_cooldowns) > 32:
+        _sweep_free_cooldowns()
     _free_model_cooldowns[key] = expiry
     _log(f"  FREE COOLDOWN: {key} for {seconds:.0f}s")
 
@@ -2192,9 +2340,30 @@ def _free_stations_exhausted(free_model: str) -> bool:
     is still active. Used by strict_free: only refuse the request when
     every station is truly exhausted — otherwise let the free attempt
     land on the usable station instead of paying or refusing.
+
+    [Axe 1.4] A rotation in flight is about to land a fresh (model, IP)
+    key on its station — the pool is NOT exhausted. Checking participation
+    re-reads the same single-threaded state the pool mutates, so the gate
+    is atomic with respect to rotations (no lock needed; see
+    ``FreeIPPool.any_rotation_in_flight``).
     """
-    if not _free_ip_pool or not _free_ip_pool._stations:
+    if not _free_ip_pool:
         return True
+    if getattr(_free_ip_pool, "socks5_mode", False):
+        # [Axe 3.1] socks5 mode: the docker stations are inert — the usable
+        # set is the enabled static proxies. No rotation can land a fresh
+        # (model, IP) key here (no docker), so the rotation-in-flight
+        # exemption below does not apply.
+        for ep in _free_ip_pool._socks5_enabled_eps():
+            if _free_ip_pool._socks5_usable(ep, exclude_approaching=False):
+                if not _free_cooldown_active(free_model, ep):
+                    return False
+        return True
+    if not _free_ip_pool._stations:
+        return True
+    if getattr(_free_ip_pool, "any_rotation_in_flight",
+               lambda: False)():
+        return False
     for st in _free_ip_pool._stations:
         if _free_ip_pool._station_usable(st, exclude_approaching=False):
             if not _free_cooldown_active(free_model, st):
@@ -2232,6 +2401,10 @@ def _free_usage_ip(station=None) -> str:
     from the last non-stream probe.
     """
     vpn = station or (_free_ip_pool.active_station if _free_ip_pool else None) or _vpn_manager
+    if getattr(vpn, "pid", None):
+        # [Axe 3.1] Static SOCKS5 proxy: no docker IP to report — its
+        # host:port identity is the correct usage label.
+        return f"socks5:{vpn.pid}"
     if vpn and vpn.current_ip:
         return vpn.current_ip
     return _public_ip_cache.get("ip", "") or ""
@@ -2269,6 +2442,12 @@ async def _try_free_model_first(body, headers, protocol, model_id):
     non-200, returns None to signal the caller should use the paid model
     instead, and sets a per-(model, IP) cooldown ([4]).
 
+    [plan 19/08 §1] max_free_attempts free strikes per request, each on a
+    DIFFERENT station: a 429 or dead tunnel consumes one attempt and the
+    next lands on a fresh station (fresh IP = fresh quota). Only after the
+    budget is spent does the request fall back to paid (or to the
+    residential-IP direct fallback on tunnel failure, station-first mode).
+
     When VPN rotation is enabled, free requests go through a VPN tunnel.
     [0]/[42] restored: a 429 answers with a background IP rotation
     (single-flight) so the next free attempt lands on a fresh IP with a
@@ -2285,22 +2464,20 @@ async def _try_free_model_first(body, headers, protocol, model_id):
     if not free_model:
         return None  # No free equivalent, proceed with paid
 
-    # Dual-clutch pre-flight: pick the best station BEFORE the cooldown
-    # check. With dual station, a hot (model, IP) key on the best station
-    # is not a dead end — the OTHER station carries a different IP = a
-    # fresh key, so switch immediately instead of falling back to paid.
-    station = _free_ip_pool._best_station() if _free_ip_pool else None
-    if _free_cooldown_active(free_model, station):
-        other = _free_ip_pool._best_station_excluding(station) if (station is not None and _free_ip_pool) else None
-        if other is not None and not _free_cooldown_active(free_model, other):
-            _debug(f"  [free] station {station._station} (model, IP) cooldown active — "
-                   f"dual-clutch switch to station {other._station}")
-            station = other
-        else:
-            _debug(f"  [free] skipping free model {free_model!r} (cooldown active)")
-            return None
+    # [plan 19/08 §1] pre-flight: ANY station with a fresh (model, IP) key?
+    # A hot key on the best station is not a dead end — each other station
+    # carries a different IP = a fresh key. The legacy check (best station
+    # hot → paid) leaked paid traffic whenever the fleet carried another
+    # warm station; only a request whose EVERY station is hot/bad/down must
+    # skip the free path. No pool (or VPN off) → legacy direct-mode attempt
+    # (residential IP), no gating.
+    if _free_ip_pool and _free_ip_pool.enabled and _free_stations_exhausted(free_model):
+        _debug(f"  [free] skipping free model {free_model!r} (no station with a fresh key)")
+        return None
 
     _debug(f"  [free] trying free model {free_model!r} instead of {model_id!r}")
+
+    station = _free_ip_pool._best_station() if _free_ip_pool else None
 
     # Get current public IP for logging (VPN or direct)
     free_ip = ""
@@ -2338,47 +2515,99 @@ async def _try_free_model_first(body, headers, protocol, model_id):
     if _vpn_manager:
         proxy_mode = _vpn_manager.proxy_mode
 
-    if proxy_mode == "vpn" and _free_ip_pool and _free_ip_pool.enabled:
-        # VPN mode: use curl_cffi for TLS fingerprint evasion,
-        # routed through the chosen station's tunnel (SOCKS5 in docker
-        # mode) for a fresh IP — station.socks5_url guarantees the
-        # request egresses the same station stamped in the contextvar.
+    if proxy_mode in ("vpn", "socks5") and _free_ip_pool and _free_ip_pool.enabled:
+        # VPN/socks5 mode: use curl_cffi for TLS fingerprint evasion,
+        # routed through the chosen station's tunnel or static SOCKS5
+        # proxy for a fresh IP — station.socks5_url guarantees the
+        # request egresses the same endpoint stamped in the contextvar.
         #
-        # [incident 17/08 PAYANT] If the preferred station's tunnel fails
-        # (transient SOCKS5 blip), try the OTHER station's tunnel BEFORE
-        # the direct httpx fallback: the other station carries a different,
-        # likely-fresh egress IP whose free quota is untouched. The direct
-        # fallback egresses the residential IP (quota long consumed) — its
-        # immediate 429 is exactly what produced the hour-long cooldown
-        # poison. Direct is now ONLY reached when both tunnels are down
-        # (paid fallback is correct behaviour then).
-        attempt_stations = [station] if station is not None else []
-        if attempt_stations and _free_ip_pool:
-            other = _free_ip_pool._best_station_excluding(attempt_stations[0])
-            if other is not None:
-                attempt_stations.append(other)
+        # [plan 19/08 §1] multi-attempt loop: up to max_free_attempts free
+        # strikes per request, each on a DIFFERENT station (cumulative
+        # exclusion — never re-strike the same IP twice). A 429 or a dead
+        # tunnel consumes one attempt and the loop continues on the next
+        # station (fresh IP = fresh quota); only after the budget is spent
+        # does the request fall back to paid (or to the residential-IP
+        # direct fallback on tunnel failure — its bucket is long consumed,
+        # so direct is reached only when every tunnel is down: paid
+        # fallback is correct behaviour then).
+        free_max = _free_max_attempts()
+        station_first = _free_exception_fallback_mode() == "station-first"
+        tried: set = set()
+        if station is not None:
+            tried.add(station)  # on_request pick = first strike (dual-clutch)
         resp = resp_headers = None
-        for idx, attempt in enumerate(attempt_stations):
-            if idx > 0:
-                _log(f"  FREE via station {attempt_stations[0]._station} tunnel FAILED → "
-                     f"dual-clutch to station {attempt._station} tunnel")
+        _free_used = 0
+        while resp is None and _free_used < free_max:
+            if _free_used == 0 and station is not None:
+                attempt = station
+            elif _free_ip_pool:
+                if getattr(_free_ip_pool, "socks5_mode", False):
+                    # [Axe 3.1] Static list — next round-robin proxy NOT in
+                    # ``tried`` (never re-strike the same proxy twice). The
+                    # two-pass walk admits an at-quota proxy on the second
+                    # pass so a request still gets its free shot.
+                    attempt = _free_ip_pool._socks5_next(excluded=tried)
+                else:
+                    attempt = (_free_ip_pool._best_station_excluding_many(tried) if tried
+                               else _free_ip_pool._best_station())
+                if attempt is not None:
+                    tried.add(attempt)
+            else:
+                attempt = None
+            if attempt is None:
+                break  # no station left → direct fallback below
+            _free_used += 1
+            _free_elapsed = int((time.monotonic() - t0) * 1000)
             try:
                 resp = await _do_free_request_curl_cffi(free_body, free_headers,
                                                         attempt.socks5_url, station=attempt)
                 resp_headers = resp.headers
-                if attempt is not attempt_stations[0]:
-                    station = attempt  # cooldown key + on_quota_exhausted must target THIS IP
-                    if attempt.current_ip:
-                        free_ip = attempt.current_ip
-                    _current_free_attempt.set({"ip": free_ip,
-                                               "identity": _current_free_identity(attempt).get("impersonate") or "",
-                                               "station": attempt})
-                break
+                if attempt.current_ip:
+                    free_ip = attempt.current_ip
+                elif getattr(attempt, "pid", None):
+                    # [Axe 3.1] Static proxy: no docker IP — log its id so
+                    # usage rows distinguish the proxies.
+                    free_ip = attempt.pid
+                _current_free_attempt.set({"ip": free_ip,
+                                           "identity": _current_free_identity(attempt).get("impersonate") or "",
+                                           "station": attempt})
+                station = attempt  # cooldown key + on_quota_exhausted must target THIS IP
+                if resp.status_code == 429 and _free_used < free_max:
+                    # 429 = this station's bucket exhausted → cooldown
+                    # (model, IP) + background rotation, then continue on a
+                    # FRESH station while the budget lasts ([plan 19/08 §1]:
+                    # each attempt a fresh IP; a same-IP retry would burn
+                    # the budget on a guaranteed ✘).
+                    _log_free_model_usage(model_id, free_model, free_api_key,
+                                          free_workspace, 429, 0, 0,
+                                          _free_elapsed, ip=free_ip)
+                    _set_free_cooldown(free_model,
+                                       _free_429_cooldown_seconds(resp.headers.get('retry-after', '') or ''),
+                                       attempt)
+                    if _free_ip_pool:
+                        _free_ip_pool.on_quota_exhausted(attempt)
+                    _log(f"  FREE {free_model!r} RATE LIMITED (429) on station {attempt._station} → "
+                         f"retry station fraîche (essai {_free_used + 1}/{free_max})")
+                    resp = None
+                    continue
+                break  # 200, final-429 or other status → shared handling below
             except Exception as e:
                 _debug(f"  [free] curl_cffi error (station {attempt._station}): {e}")
+                if station_first and _free_used < free_max:
+                    # [plan 19/08 §2] station-first: a dead tunnel retries
+                    # another station BEFORE the residential-IP direct
+                    # fallback (whose bucket is long exhausted).
+                    _log(f"  FREE via station {attempt._station} tunnel FAILED ({e}) → "
+                         f"retry station fraîche (essai {_free_used + 1}/{free_max})")
+                    continue
+                # station-first budget spent, or direct mode → legacy fallback
+                _log(f"  FREE via station {attempt._station} tunnel FAILED ({e}) → direct fallback (residential IP)")
+                resp = None
+                break
         if resp is None:
-            # Both tunnels down → last-resort direct fallback (residential IP).
-            _log("  FREE via BOTH VPN tunnels FAILED → direct fallback (residential IP)")
+            # Every tunnel down (or no station) → last-resort direct
+            # fallback (residential IP).
+            _log("  FREE via VPN tunnels FAILED → direct fallback (residential IP)")
             try:
                 resp, resp_headers = await _do_request_with_retry(
                     API_BASE_FREE, free_body, free_headers, protocol, retry_on_429=False
@@ -2411,7 +2640,9 @@ async def _try_free_model_first(body, headers, protocol, model_id):
         except Exception:
             pass
 
-    # Log every attempt
+    # Log the final response (non-final 429s were logged per-attempt inside
+    # the multi-attempt loop; direct-mode and direct-fallback responses
+    # never passed through the loop).
     _log_free_model_usage(model_id, free_model, free_api_key,
                           free_workspace, resp.status_code,
                           tokens_in, tokens_out, elapsed_ms, ip=free_ip)
@@ -2441,7 +2672,8 @@ async def _try_free_model_first(body, headers, protocol, model_id):
         # Per-(model, IP) cooldown honoring the upstream retry-after ([4])
         # + background IP rotation ([0]/[42]): the key is (model, the
         # station's current IP), so the rotation makes the next free
-        # attempt a fresh key.
+        # attempt a fresh key. (Non-final VPN 429s already did this in the
+        # multi-attempt loop — idempotent here.)
         _set_free_cooldown(free_model, _free_429_cooldown_seconds(retry_after), station)
         if _free_ip_pool:
             _free_ip_pool.on_quota_exhausted(station)
@@ -4311,13 +4543,21 @@ async def messages(request: Request):
             open_blocks = []
             stop_reason = "end_turn"
             _handle_429 = _make_stream_retry_loop("anthropic")
-            for _attempt in range(yaml_get("streaming", "retry_attempts", 2)):
+            _free_bound = yaml_get("streaming", "retry_attempts", 2)
+            if _using_free and _free_attempts_active():
+                # [plan 19/08 §1] free multi-attempt: extra free strikes on
+                # fresh stations; paid retry budget preserved
+                # (max_free_attempts=1 ⇒ exact legacy behaviour).
+                _free_bound += max(0, _free_max_attempts() - 1)
+            for _attempt in range(_free_bound):
                 used_tools = []  # Reset on each retry attempt
-                _debug(f"  [stream] attempt {_attempt+1}/2")
+                _debug(f"  [stream] attempt {_attempt+1}/{_free_bound}")
                 try:
                     async with _open_free_stream(endpoint, body, headers, _using_free,
                                                  count_request=(_attempt == 0),
-                                                 fresh_station=(_attempt > 0 and _using_free)) as resp:
+                                                 fresh_station=(_attempt > 0 and _using_free),
+                                                 direct_fallback=(_free_exception_fallback_mode() != "station-first"
+                                                                  or _attempt + 1 >= _free_max_attempts())) as resp:
                         _debug(f"  [stream] connected status={resp.status_code}")
                         if resp.status_code != 200:
                             if _using_free:
@@ -4327,6 +4567,16 @@ async def messages(request: Request):
                                 # about the paid account (CRITIC(2)/CRITIC(3)).
                                 if resp.status_code == 429:
                                     _refuse = _on_free_429_stream(free_model, resp.headers.get('retry-after', ''))
+                                    if not _refuse and _attempt + 1 < _free_max_attempts():
+                                        # [plan 19/08 §1] budget left → retry free on a
+                                        # FRESH station (fresh IP = fresh quota); keep
+                                        # _using_free so the next attempt re-enters free
+                                        # with fresh_station=True. Cooldown + rotation
+                                        # for the exhausted IP already done above.
+                                        _log_free_model_usage(model_id, free_model, "free (no auth)", "free (no auth)",
+                                                              resp.status_code, ip=_free_usage_ip())
+                                        _log(f"  FREE {free_model!r} RATE LIMITED (429) → retry station fraîche (essai {_attempt + 2}/{_free_max_attempts()})")
+                                        continue
                                 else:
                                     _set_free_cooldown(free_model, 60, _free_attempt_station())
                                     _refuse = False
@@ -4472,6 +4722,15 @@ async def messages(request: Request):
                         _log(f"  FREE STREAM on confirmed-dead tunnel cancelled → switching station")
                         continue
                     raise
+                except _FreeTunnelFailure as ftf:
+                    # [plan 19/08 §2] station-first: dead tunnel → retry free
+                    # on a FRESH station (fresh IP = fresh quota) before any
+                    # direct residential fallback. _using_free stays True →
+                    # next attempt re-enters free with fresh_station=True
+                    # (bad-mark → exclusion of the dead station).
+                    _cb_record_failure(endpoint)  # Record failure for circuit breaker
+                    _log(f"  FREE STREAM via station {getattr(ftf.station, '_station', '?')} tunnel FAILED ({ftf.cause}) → retry station fraîche")
+                    continue
                 except Exception as e:
                     _cb_record_failure(endpoint)  # Record failure for circuit breaker
                     ak = _alias_for_key(headers.get("x-api-key", "")) if headers else ""
@@ -4700,13 +4959,21 @@ async def messages(request: Request):
         actual_usage = None
         _handle_429 = _make_stream_retry_loop("openai")
 
-        for _attempt in range(yaml_get("streaming", "retry_attempts", 2)):
+        _free_bound = yaml_get("streaming", "retry_attempts", 2)
+        if _using_free and _free_attempts_active():
+            # [plan 19/08 §1] free multi-attempt: extra free strikes on
+            # fresh stations; paid retry budget preserved
+            # (max_free_attempts=1 ⇒ exact legacy behaviour).
+            _free_bound += max(0, _free_max_attempts() - 1)
+        for _attempt in range(_free_bound):
             used_tools = []  # Reset on each retry attempt
             tool_block_idx = {}  # Reset tracking dict on each retry
             try:
                 async with _open_free_stream(endpoint, oai_body, hdrs, _using_free,
                                              count_request=(_attempt == 0),
-                                             fresh_station=(_attempt > 0 and _using_free)) as resp:
+                                             fresh_station=(_attempt > 0 and _using_free),
+                                             direct_fallback=(_free_exception_fallback_mode() != "station-first"
+                                                              or _attempt + 1 >= _free_max_attempts())) as resp:
                     if resp.status_code != 200:
                         if _using_free:
                             # Free endpoint non-200 (429 quota, 5xx...) → cooldown
@@ -4715,6 +4982,16 @@ async def messages(request: Request):
                             # about the paid account (CRITIC(2)/CRITIC(3)).
                             if resp.status_code == 429:
                                 _refuse = _on_free_429_stream(free_model, resp.headers.get('retry-after', ''))
+                                if not _refuse and _attempt + 1 < _free_max_attempts():
+                                    # [plan 19/08 §1] budget left → retry free on a
+                                    # FRESH station (fresh IP = fresh quota); keep
+                                    # _using_free so the next attempt re-enters free
+                                    # with fresh_station=True. Cooldown + rotation
+                                    # for the exhausted IP already done above.
+                                    _log_free_model_usage(_paid_model_id, free_model, "free (no auth)", "free (no auth)",
+                                                          resp.status_code, ip=_free_usage_ip())
+                                    _log(f"  FREE {free_model!r} RATE LIMITED (429) → retry station fraîche (essai {_attempt + 2}/{_free_max_attempts()})")
+                                    continue
                             else:
                                 _set_free_cooldown(free_model, 60, _free_attempt_station())
                                 _refuse = False
@@ -4886,6 +5163,14 @@ async def messages(request: Request):
                     _log(f"  FREE STREAM on confirmed-dead tunnel cancelled → switching station")
                     continue
                 raise
+            except _FreeTunnelFailure as ftf:
+                # [plan 19/08 §2] station-first: dead tunnel → retry free
+                # on a FRESH station (fresh IP = fresh quota) before any
+                # direct residential fallback. _using_free stays True →
+                # next attempt re-enters free with fresh_station=True
+                # (bad-mark → exclusion of the dead station).
+                _log(f"  FREE STREAM via station {getattr(ftf.station, '_station', '?')} tunnel FAILED ({ftf.cause}) → retry station fraîche")
+                continue
             except Exception as e:
                 _log(f"  ERROR stream (attempt {_attempt+1}): {type(e).__name__}: {e}")
                 _debug(f"  ✗ stream exception: {type(e).__name__}: {e}\n{traceback.format_exc()}")
@@ -5278,13 +5563,21 @@ async def chat_completions(request: Request):
             stream_out = 0
             actual_usage = None
             _handle_429 = _make_stream_retry_loop("openai")
-            for _attempt in range(yaml_get("streaming", "retry_attempts", 2)):
+            _free_bound = yaml_get("streaming", "retry_attempts", 2)
+            if _using_free and _free_attempts_active():
+                # [plan 19/08 §1] free multi-attempt: extra free strikes on
+                # fresh stations; paid retry budget preserved
+                # (max_free_attempts=1 ⇒ exact legacy behaviour).
+                _free_bound += max(0, _free_max_attempts() - 1)
+            for _attempt in range(_free_bound):
                 used_tools = []
                 seen_tool_indices = set()  # dedup tool calls by index
                 try:
                     async with _open_free_stream(endpoint, oai_body, hdrs, _using_free,
                                              count_request=(_attempt == 0),
-                                             fresh_station=(_attempt > 0 and _using_free)) as resp:
+                                             fresh_station=(_attempt > 0 and _using_free),
+                                             direct_fallback=(_free_exception_fallback_mode() != "station-first"
+                                                              or _attempt + 1 >= _free_max_attempts())) as resp:
                         if resp.status_code != 200:
                             if _using_free:
                                 # Free endpoint non-200 (429 quota, 5xx...) → cooldown
@@ -5293,6 +5586,16 @@ async def chat_completions(request: Request):
                                 # about the paid account (CRITIC(2)/CRITIC(3)).
                                 if resp.status_code == 429:
                                     _refuse = _on_free_429_stream(free_model, resp.headers.get('retry-after', ''))
+                                    if not _refuse and _attempt + 1 < _free_max_attempts():
+                                        # [plan 19/08 §1] budget left → retry free on a
+                                        # FRESH station (fresh IP = fresh quota); keep
+                                        # _using_free so the next attempt re-enters free
+                                        # with fresh_station=True. Cooldown + rotation
+                                        # for the exhausted IP already done above.
+                                        _log_free_model_usage(model_id, free_model, "free (no auth)", "free (no auth)",
+                                                              resp.status_code, ip=_free_usage_ip())
+                                        _log(f"  FREE {free_model!r} RATE LIMITED (429) → retry station fraîche (essai {_attempt + 2}/{_free_max_attempts()})")
+                                        continue
                                 else:
                                     _set_free_cooldown(free_model, 60, _free_attempt_station())
                                     _refuse = False
@@ -5413,6 +5716,15 @@ async def chat_completions(request: Request):
                         _log(f"  FREE STREAM on confirmed-dead tunnel cancelled → switching station")
                         continue
                     raise
+                except _FreeTunnelFailure as ftf:
+                    # [plan 19/08 §2] station-first: dead tunnel → retry free
+                    # on a FRESH station (fresh IP = fresh quota) before any
+                    # direct residential fallback. _using_free stays True →
+                    # next attempt re-enters free with fresh_station=True
+                    # (bad-mark → exclusion of the dead station).
+                    _cb_record_failure(endpoint)  # Record failure for circuit breaker
+                    _log(f"  FREE STREAM via station {getattr(ftf.station, '_station', '?')} tunnel FAILED ({ftf.cause}) → retry station fraîche")
+                    continue
                 except Exception as e:
                     _cb_record_failure(endpoint)  # Record failure for circuit breaker
                     _log(f"  ERROR stream (attempt {_attempt+1}): {type(e).__name__}: {e}")
@@ -5609,11 +5921,19 @@ async def chat_completions(request: Request):
             }
             return b"data: " + json.dumps(c, ensure_ascii=False).encode() + b"\n\n"
 
-        for _attempt in range(yaml_get("streaming", "retry_attempts", 2)):
+        _free_bound = yaml_get("streaming", "retry_attempts", 2)
+        if _using_free and _free_attempts_active():
+            # [plan 19/08 §1] free multi-attempt: extra free strikes on
+            # fresh stations; paid retry budget preserved
+            # (max_free_attempts=1 ⇒ exact legacy behaviour).
+            _free_bound += max(0, _free_max_attempts() - 1)
+        for _attempt in range(_free_bound):
             try:
                 async with _open_free_stream(endpoint, anthro_body, hdrs, _using_free,
                                              count_request=(_attempt == 0),
-                                             fresh_station=(_attempt > 0 and _using_free)) as resp:
+                                             fresh_station=(_attempt > 0 and _using_free),
+                                             direct_fallback=(_free_exception_fallback_mode() != "station-first"
+                                                              or _attempt + 1 >= _free_max_attempts())) as resp:
                     if resp.status_code != 200:
                         if _using_free:
                             # Free endpoint non-200 (429 quota, 5xx...) → cooldown
@@ -5622,6 +5942,16 @@ async def chat_completions(request: Request):
                             # about the paid account (CRITIC(2)/CRITIC(3)).
                             if resp.status_code == 429:
                                 _refuse = _on_free_429_stream(free_model, resp.headers.get('retry-after', ''))
+                                if not _refuse and _attempt + 1 < _free_max_attempts():
+                                    # [plan 19/08 §1] budget left → retry free on a
+                                    # FRESH station (fresh IP = fresh quota); keep
+                                    # _using_free so the next attempt re-enters free
+                                    # with fresh_station=True. Cooldown + rotation
+                                    # for the exhausted IP already done above.
+                                    _log_free_model_usage(model_id, free_model, "free (no auth)", "free (no auth)",
+                                                          resp.status_code, ip=_free_usage_ip())
+                                    _log(f"  FREE {free_model!r} RATE LIMITED (429) → retry station fraîche (essai {_attempt + 2}/{_free_max_attempts()})")
+                                    continue
                             else:
                                 _set_free_cooldown(free_model, 60, _free_attempt_station())
                                 _refuse = False
@@ -5818,6 +6148,15 @@ async def chat_completions(request: Request):
                     _log(f"  FREE STREAM on confirmed-dead tunnel cancelled → switching station")
                     continue
                 raise
+            except _FreeTunnelFailure as ftf:
+                # [plan 19/08 §2] station-first: dead tunnel → retry free
+                # on a FRESH station (fresh IP = fresh quota) before any
+                # direct residential fallback. _using_free stays True →
+                # next attempt re-enters free with fresh_station=True
+                # (bad-mark → exclusion of the dead station).
+                _cb_record_failure(endpoint)  # Record failure for circuit breaker
+                _log(f"  FREE STREAM via station {getattr(ftf.station, '_station', '?')} tunnel FAILED ({ftf.cause}) → retry station fraîche")
+                continue
             except Exception as e:
                 _cb_record_failure(endpoint)  # Record failure for circuit breaker
                 _log(f"  ERROR stream (attempt {_attempt+1}): {type(e).__name__}: {e}")

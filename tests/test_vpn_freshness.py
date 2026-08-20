@@ -157,9 +157,10 @@ class FakeVPNManager(vm.VPNManager):
         if self.clear_logs_on_restart:
             self.log_text = ""
 
-    def _docker_run(self, args, timeout=30):
+    def _docker_run(self, args, timeout=30, env=None):
         """subprocess fake (apply_update / rollback): record, always succeed."""
         self.calls["docker_run"] = self.calls.get("docker_run", 0) + 1
+        self.last_env = dict(env) if env else None
         return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
 
     async def _check_auth_failed(self, started_at=""):

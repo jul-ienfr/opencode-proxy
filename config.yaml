@@ -88,8 +88,10 @@ ip_rotation:
   enabled: true
   proxy_mode: vpn
   dual_station: true
-  station_count: 4
+  station_count: 6
   strict_free: false
+  max_free_attempts: 3
+  free_exception_fallback: station-first
   quota_per_ip: 15
   switch_delay: 1
   docker_container: opencode-vpn
@@ -97,6 +99,10 @@ ip_rotation:
   vpn_proxy_port: 8888
   socks5_proxy_port: 1080
   socks5_proxy_port_2: 1081
+  socks5_proxies: []
+  socks5_auto_rotate: true
+  use_nordvpn_api: false
+  custom_ovpn_file: ''
   vpn_proxy_port_2: 8889
   docker_container_2: opencode-vpn-2
   compose_service_2: vpn-gluetun-2

@@ -58,9 +58,15 @@ class _StubMgr:
 class _FakePool:
     def __init__(self):
         self.stations = None
+        self.cancelled_sids = None
 
     def set_stations(self, stations):
         self.stations = list(stations)
+
+    async def cancel_rotations(self, sids):
+        """[plan 18/08 §2.3] Record the retired sids handed to the downscale
+        cancel step (the real pool cancels + awaits them)."""
+        self.cancelled_sids = list(sids)
 
 
 class _FakeWatcher:
@@ -154,6 +160,7 @@ async def test_downscale_3_to_2_stops_container_no_stack_call(tmp_path, monkeypa
 
     await opencode._apply_station_count(2)
 
+    assert pool.cancelled_sids == [3], "downscale cancels the retired rotations"
     assert stubs[2].stopped and stubs[2].stopped_container
     assert not stubs[0].stopped and not stubs[1].stopped
     assert [m._station for m in pool.stations] == [1, 2]

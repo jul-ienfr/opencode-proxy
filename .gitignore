@@ -45,9 +45,18 @@ ENV/
 # Secrets
 vpn_configs/
 credentials.env
-logs/vpn_state.json
-logs/vpn_state2.json
+logs/vpn_state*.json*
 logs/shared_rotation.json
-logs/_dbg_free.py
 env_dump.json
 *.ovpn
+
+# Debug dumps / transient scratch (debugging artifacts, not source)
+logs/_*
+logs/panel_dump.json
+logs/commit-*-msg.txt
+logs/env_vpn_type_backup_*
+vpn_cfg*.json
+pp1.json
+tmp/
+tests/_*.txt
+*_diff_tmp.txt

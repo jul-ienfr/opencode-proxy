@@ -46,8 +46,8 @@ class _Rec(FakeVPNManager):
                          tmp_path=tmp_path, **kw)
         self.cmds = []
 
-    def _docker_run(self, args, timeout=30):
-        self.cmds.append((list(args), timeout))
+    def _docker_run(self, args, timeout=30, env=None):
+        self.cmds.append((list(args), timeout, dict(env) if env else None))
         return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
 
 
@@ -103,7 +103,7 @@ async def test_apply_stack_four_stations_writes_env_and_composes(tmp_path, monke
     assert "VPN_TYPE_STATION7" not in env
     assert env["VPN_TYPE"] == "openvpn", "non-station vars preserved"
     assert env["SOME_SECRET"] == "abc123", "secrets preserved"
-    (args, timeout) = managers[0].cmds[-1]
+    (args, timeout, _env) = managers[0].cmds[-1]
     assert args == ["compose", "-f", str(compose), "up", "-d",
                     "--force-recreate", "vpn-gluetun", "vpn-gluetun-2",
                     "vpn-gluetun-3", "vpn-gluetun-4"]
@@ -163,7 +163,7 @@ async def test_apply_stack_downscale_prunes_stale_keys(tmp_path, monkeypatch):
         assert env[f"VPN_TYPE_STATION{s}"] == "openvpn"
     assert "VPN_TYPE_STATION4" not in env, "downscaled station-4 var pruned"
     assert "VPN_TYPE_STATION6" not in env
-    (args, _) = managers[0].cmds[-1]
+    (args, _, _) = managers[0].cmds[-1]
     assert args == ["compose", "-f", str(compose), "up", "-d",
                     "--force-recreate", "vpn-gluetun", "vpn-gluetun-2",
                     "vpn-gluetun-3"]
@@ -199,8 +199,8 @@ async def test_apply_stack_fallback_legacy_pair_when_registry_empty(tmp_path, mo
 @pytest.mark.asyncio
 async def test_apply_stack_compose_failure_does_not_advance(tmp_path, monkeypatch):
     class _Fail(_Rec):
-        def _docker_run(self, args, timeout=30):
-            self.cmds.append((list(args), timeout))
+        def _docker_run(self, args, timeout=30, env=None):
+            self.cmds.append((list(args), timeout, dict(env) if env else None))
             return subprocess.CompletedProcess(args, 1, stdout="",
                                                stderr="boom")
     m = _Fail(_cfg(tmp_path), tmp_path=tmp_path)
@@ -225,9 +225,12 @@ async def test_stop_container_argv_exact(tmp_path, monkeypatch):
     compose = tmp_path / "docker-compose.yml"
     monkeypatch.setenv("VPN_DOCKER_COMPOSE_FILE", str(compose))
     await m.stop_container()
-    assert m.cmds == [(["compose", "-f", str(compose), "stop",
-                        "vpn-gluetun"], 120),
-                      (["rm", "-f", "opencode-vpn"], 120)]
+    assert m.cmds[0][0] == ["compose", "-f", str(compose), "stop",
+                            "vpn-gluetun"]
+    assert m.cmds[0][1] == 120
+    assert m.cmds[0][2]["VPN_TYPE_STATION1"] == m._stack_effective, \
+        "compose stop child carries the explicit stack env (garde 2.1)"
+    assert m.cmds[1] == (["rm", "-f", "opencode-vpn"], 120, None)
 
 
 @pytest.mark.asyncio
@@ -235,8 +238,9 @@ async def test_stop_container_rm_failed_is_real_error(tmp_path, monkeypatch):
     """compose stop failure is best-effort (container may already be dead) —
     only a docker rm failure that is NOT 'No such container' raises."""
     class _Fail(_Rec):
-        def _docker_run(self, args, timeout=30):
-            self.cmds.append((list(args), timeout))   # record, then fail
+        def _docker_run(self, args, timeout=30, env=None):
+            self.cmds.append((list(args), timeout,
+                              dict(env) if env else None))   # record, then fail
             return subprocess.CompletedProcess(args, 1, stdout="",
                                                stderr="boom")
     m = _Fail(_cfg(tmp_path), tmp_path=tmp_path)
@@ -252,7 +256,7 @@ async def test_stop_container_already_removed_is_ok(tmp_path, monkeypatch):
     """'No such container' from docker rm is success — a station deleted by
     an earlier pass must not raise (downscale is idempotent)."""
     class _Gone(_Rec):
-        def _docker_run(self, args, timeout=30):
+        def _docker_run(self, args, timeout=30, env=None):
             stderr = "Not Found: No such container: opencode-vpn" \
                 if args[0] == "rm" else ""
             return subprocess.CompletedProcess(args, 1, stdout="", stderr=stderr)

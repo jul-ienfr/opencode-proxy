@@ -82,11 +82,23 @@ def yaml_set(section: str, key: str, value):
 
 # ── .env Loader (override YAML defaults) ─────────────────────────────
 
+# [plan 18/08 §2.1] Divergence env périmée: rempli par load_env_file()
+# quand une clé VPN_* présente dans os.environ (héritée d'un parent ou
+# posée avant le boot) diffère de la valeur du fichier .env. Ce sont les
+# clés que load_env_file refuse de recharger — l'env du process gagne sur
+# le fichier pour chaque enfant `docker compose` (cause racine 19/08).
+# Exposé par /api/vpn-status → env_divergence (dashboard bannière). Côté
+# déterministe, la correction est dans vpn_manager._compose_env().
+ENV_DIVERGENCE: list = []
+
+
 def load_env_file():
     """Load environment variables from .env file if it exists."""
     if not os.path.exists(ENV_PATH):
         return
     count = 0
+    divergence = []
+    loaded = set()
     with open(ENV_PATH, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -97,6 +109,25 @@ def load_env_file():
                 if key not in os.environ:
                     os.environ[key] = value
                     count += 1
+                    loaded.add(key)
+                elif key.startswith("VPN_") and value != os.environ[key] \
+                        and key not in loaded:
+                    # Stale parent env: the .env value was already there at
+                    # boot but the process env is ahead of it — compose
+                    # children inherit that env, so the file is NOT what the
+                    # fleet runs (19/08 incident). Keys loaded by a PREVIOUS
+                    # load_env_file() call are aligned by definition — never
+                    # flagged (a second call after a _apply_stack runtime
+                    # rewrite of VPN_TYPE_STATION* is not a divergence).
+                    divergence.append((key, value, os.environ[key]))
+    if divergence:
+        for key, file_val, env_val in divergence:
+            logger.warning(
+                "[config] env divergence: %s=%r in .env but %r in process env — "
+                "compose children inherit the process env, which WINS over the "
+                "file (19/08 root cause); restart the proxy or re-push the "
+                "config to re-sync", key, file_val, env_val)
+        ENV_DIVERGENCE[:] = divergence
     logger.debug("[config] load_env_file: loaded %d new vars from .env", count)
 
 

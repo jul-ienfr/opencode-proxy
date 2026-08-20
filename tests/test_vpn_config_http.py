@@ -15,7 +15,8 @@ as test_vpn_stack_persist.py; ``opencode._apply_station_count`` and
   reaches update_config/_persist (consumed).
 - POST with the CURRENT count → short-circuit: _apply_station_count never
   called; the key is still consumed (never fanned out).
-- POST {station_count: "abc"} → int() guard → same docile no-op path.
+- POST {station_count: "abc"} or 15 → HTTP 400 explicit (plan 18/08 axe 3.3
+  — a silent clamp would mask GUI/programmatic errors; 1..10 only).
 - regression: POST {dual_station: false} (legacy toggle) is a plain config
   update — no _apply_station_count, value persisted and fanned out.
 """
@@ -125,16 +126,32 @@ def test_post_station_count_same_value_short_circuits(ctx):
     assert persisted == [{}]
 
 
-# ── POST invalid value → int() guard, same docile path ───────────
+# ── POST invalid value → HTTP 400 (axe 3.3, plan 18/08) ──────────
 
-def test_post_station_count_invalid_is_docile(ctx):
+def test_post_station_count_non_int_is_400(ctx):
+    """A non-integer string is a caller bug: explicit 400 rather than a
+    silent docile no-op (the old clamp masked GUI/programmatic errors)."""
     fast, s1, s2, pool, applied, persisted = ctx
-
-    resp = _post(fast, {"station_count": "abc"})
-
-    assert resp["ok"] is True
+    with TestClient(fast) as client:
+        resp = client.post("/api/vpn-config", json={"station_count": "abc"})
+    assert resp.status_code == 400
+    assert "station_count" in resp.json()["error"]
     assert applied == []
-    assert persisted == [{}]
+    assert persisted == []
+
+
+def test_post_station_count_out_of_range_is_400(ctx):
+    """15 stations is outside 1..10: 400, never a silent clamp to 10."""
+    fast, s1, s2, pool, applied, persisted = ctx
+    with TestClient(fast) as client:
+        resp = client.post("/api/vpn-config", json={"station_count": 15})
+    assert resp.status_code == 400
+    assert applied == []
+    assert persisted == []
+
+    with TestClient(fast) as client:
+        resp0 = client.post("/api/vpn-config", json={"station_count": 0})
+    assert resp0.status_code == 400
 
 
 # ── regression: legacy dual_station toggle ───────────────────────

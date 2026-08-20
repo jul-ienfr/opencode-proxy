@@ -313,6 +313,10 @@
                                 <span id="vpn-toggle-label" style="margin-left:8px;font-size:13px" data-i18n="vpn.rotation">Rotation</span>
                             </div>
                         </div>
+                        <!-- [plan 18/08 §2.1] Env périmé: le .env diffère de l'env du process — les enfants docker compose héritent de l'env (cause racine 19/08). Rempli par updateVPNUI quand /api/vpn-status expose env_divergence. -->
+                        <div id="vpn-env-divergence-banner" style="display:none;margin-bottom:12px;padding:8px 12px;background:rgba(255,170,0,0.12);border:1px solid var(--warning);border-radius:6px;font-size:12px;color:var(--warning)"></div>
+                        <!-- [plan 18/08 axe 3.4] config.yaml modifié à la main sans POST dashboard — le hot-reload est push-only, il faut redémarrer ou re-pousser (jamais d'auto-reload). Rempli par updateVPNUI quand /api/vpn-status expose config_yaml_dirty. -->
+                        <div id="vpn-config-dirty-banner" style="display:none;margin-bottom:12px;padding:8px 12px;background:rgba(255,110,60,0.12);border:1px solid var(--danger,#e06c50);border-radius:6px;font-size:12px;color:var(--danger,#e06c50)"></div>
                         <div class="config-grid" style="grid-template-columns:1fr 1fr">
                             <div class="config-row">
                                 <span class="label" data-i18n="vpn.current_ip">IP actuelle</span>
@@ -388,6 +392,21 @@
                                 <select id="vpn-exhaust-mode" class="config-input" style="width:200px;font-size:12px" onchange="vpnSaveExhaustMode()">
                                     <option value="fallback">Fallback payant (défaut)</option>
                                     <option value="strict">Strict free — refuser 429/503</option>
+                                </select>
+                            </div>
+                            <div style="display:flex;align-items:center;gap:8px;margin-top:10px">
+                                <span class="label" style="font-size:12px">Essais gratuits / requête</span>
+                                <select id="vpn-free-attempts" class="config-input" style="width:70px;font-size:12px" onchange="vpnSaveMaxFreeAttempts()">
+                                    <option value="1">1</option>
+                                    <option value="2">2</option>
+                                    <option value="3">3</option>
+                                </select>
+                            </div>
+                            <div style="display:flex;align-items:center;gap:8px;margin-top:10px">
+                                <span class="label" style="font-size:12px">Échec tunnel VPN</span>
+                                <select id="vpn-exception-mode" class="config-input" style="width:200px;font-size:12px" onchange="vpnSaveExceptionFallback()">
+                                    <option value="station-first">Station suivante d'abord (recommandé)</option>
+                                    <option value="direct">IP résidentielle directe</option>
                                 </select>
                             </div>
                             <!-- Station rows — rendered by JS (one per active station) -->

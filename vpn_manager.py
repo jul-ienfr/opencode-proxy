@@ -22,6 +22,7 @@ import time
 import json
 import asyncio
 import logging
+import shutil
 import subprocess
 from typing import Optional
 
@@ -391,6 +392,35 @@ _NORDVPN_HOST_RE = re.compile(r"[a-z]{2}[0-9]{2,4}\.nordvpn\.com")
 _FAILED_HOST_TTL = 24 * 3600
 
 
+def _classify_probe_exc(exc: BaseException) -> str:
+    """[Axe 1.3] Structural probe-exception classification -> verdict string.
+
+    "timeout" (slow — grace phase applies) vs "refused" (definitive dead)
+    vs "error" (unknown, treated as dead, no grace). STRUCTURAL on purpose:
+    type-name + cause-chain + message inspection, never isinstance on
+    httpx.* exceptions — the offline tests stub ``httpx`` with a fake
+    module that has no httpx exception types (an isinstance there would
+    AttributeError). A bare RuntimeError (fake or real) => "error".
+    """
+    name = type(exc).__name__.lower()
+    if isinstance(exc, asyncio.TimeoutError) or name == "timeouterror":
+        return "timeout"
+    msg = str(exc).lower()
+    if name.endswith("timeout") or "timed out" in msg:
+        return "timeout"
+    if isinstance(exc, ConnectionRefusedError) or \
+            "refused" in msg or "10061" in msg or "econnrefused" in msg:
+        return "refused"
+    # Walk the cause chain: httpx/wireproxy tend to wrap the real socket
+    # error (ConnectionRefusedError) one or two layers down.
+    cur = exc
+    while cur is not None:
+        if isinstance(cur, ConnectionRefusedError):
+            return "refused"
+        cur = cur.__cause__
+    return "error"
+
+
 def _extract_current_hostname(text: str) -> Optional[str]:
     """Last NordVPN hostname present in gluetun log text.
 
@@ -441,7 +471,7 @@ class VPNManager:
         self._station = station
         self._mode = "docker"  # sole mode: compose-managed gluetun (free_ip_pool compat)
         self._enabled = cfg.get("enabled", False)
-        self._proxy_mode = cfg.get("proxy_mode", "vpn")  # vpn | direct
+        self._proxy_mode = cfg.get("proxy_mode", "vpn")  # vpn | socks5 | direct
         self._quota_per_ip = cfg.get("quota_per_ip", 300)
         self._switch_delay = cfg.get("switch_delay", 5)
         # [plan 18/08 §1] N-station suffix: station 1 keeps the legacy key
@@ -721,7 +751,7 @@ class VPNManager:
 
     @proxy_mode.setter
     def proxy_mode(self, value: str):
-        if value in ("vpn", "direct"):
+        if value in ("vpn", "socks5", "direct"):
             self._proxy_mode = value
 
     @property
@@ -860,7 +890,17 @@ class VPNManager:
 
     async def stop(self) -> None:
         """Shutdown: persist state only. The tunnel is left running
-        (it is compose-managed and survives proxy restarts)."""
+        (it is compose-managed and survives proxy restarts).
+
+        [Revue 19/08] ``_enabled`` is flipped to False: on the downscale
+        path (stop() then stop_container()) a rotation still aimed at this
+        manager — a shielded orphan, or a 429 that raced the pool-side
+        retire — must refuse any docker work. ``_connect_next_impl`` raises
+        RotationFailed when ``not self._enabled`` (VPN disabled gate), so
+        this makes the existing guard effective for retiring managers. A
+        fresh upscale builds NEW VPNManager instances (opencode
+        ``_apply_station_count``), so the retired manager is never
+        re-enabled."""
         if self._startup_connect_task:
             self._startup_connect_task.cancel()
             self._startup_connect_task = None
@@ -870,6 +910,7 @@ class VPNManager:
         if self._update_task:
             self._update_task.cancel()
             self._update_task = None
+        self._enabled = False
         self.save_state()
 
     async def stop_container(self) -> None:
@@ -889,7 +930,8 @@ class VPNManager:
         compose_file = self._compose_file_path()
         result = await asyncio.to_thread(
             self._docker_run, ["compose", "-f", compose_file, "stop",
-                               self._compose_service], 120)
+                               self._compose_service], 120,
+            env=self._compose_env())
         if result.returncode != 0:
             logger.warning("[vpn] compose stop failed (continuing to rm): %s",
                            result.stderr.strip() or result.stdout.strip())
@@ -1497,14 +1539,22 @@ class VPNManager:
         return None
 
     async def _probe_tunnel_light(self) -> bool:
-        """[plan 18/08 §E1/am.10] Light egress probe — SOCKS5 handshake +
-        CONNECT to the ip_check endpoint (same chain as get_public_ip). NO
-        GET: dead/alive is all we need — _finalize_ip does the full check
-        once the tunnel is back. Single authority for egress_dead on BOTH
-        stacks: the incident OV tunnel was "connected" with no AUTH_FAILED/
-        TLS marker, invisible without a probe. Never called without an
-        explicit wait_for budget: an httpx timeout does NOT bound the SOCKS5
-        CONNECT (the 445 s stall bug class).
+        """[plan 18/08 §E1/am.10 / Axe 1.3] Light egress probe — SOCKS5
+        handshake + CONNECT to the ip_check endpoint (same chain as
+        get_public_ip). NO GET: dead/alive is all we need — _finalize_ip
+        does the full check once the tunnel is back. Single authority for
+        egress_dead on BOTH stacks: the incident OV tunnel was "connected"
+        with no AUTH_FAILED/TLS marker, invisible without a probe. Never
+        called without an explicit wait_for budget: an httpx timeout does
+        NOT bound the SOCKS5 CONNECT (the 445 s stall bug class).
+
+        [Axe 1.3] Two-phase: phase 1 = quick rotated sweep (per_attempt
+        min(2.0, budget)) that distinguishes CONNECT-REFUSED (tunnel dead,
+        definitive) from TIMEOUT (tunnel slow — may still be alive). On
+        timeout-only failure, phase 2 = one grace attempt (remaining
+        budget, only if > 0.5 s) on the sticky-first endpoint before
+        declaring death — a slow-but-alive tunnel is no longer bad-marked
+        as dead.
         """
         import httpx
         try:
@@ -1516,22 +1566,48 @@ class VPNManager:
             # across the sweep (n endpoints × per_attempt).
             per_attempt = min(2.0, self._ip_probe_budget)
             base = self._ip_check_idx
+            timeout_seen = False
             for i in range(len(urls)):
                 url = urls[(base + i) % len(urls)]
-                if await self._probe_connect(url, per_attempt=per_attempt):
+                verdict = await self._probe_connect(url, per_attempt=per_attempt)
+                if verdict == "ok":
                     if i > 0:
                         self._ip_check_idx = (base + i) % len(urls)
                     return True
+                if verdict == "timeout":
+                    timeout_seen = True
+                # "refused"/"error" are definitive — no grace phase for
+                # them (full sweep continues; a later endpoint may be ok).
+            if timeout_seen:
+                # Grace: one attempt on the sticky-first endpoint with the
+                # REMAINING budget (leftover > 0.5 s is worth a try). A
+                # slow tunnel that answers here was never dead.
+                used = len(urls) * per_attempt
+                remaining = self._ip_probe_budget - used
+                if remaining > 0.5:
+                    verdict = await self._probe_connect(
+                        urls[(base + 0) % len(urls)],
+                        per_attempt=remaining)
+                    if verdict == "ok":
+                        return True
             return False
         except Exception:
             return False
 
-    async def _probe_connect(self, url: str, *, per_attempt: float) -> bool:
-        """[review F2] One bounded SOCKS5 handshake + CONNECT toward ``url``.
-        NO GET: dead/alive is all we need — _finalize_ip does the full check
-        once the tunnel is back. Never called without an explicit wait_for
-        budget: an httpx timeout does NOT bound the SOCKS5 CONNECT (the
-        445 s stall bug class).
+    async def _probe_connect(self, url: str, *, per_attempt: float) -> str:
+        """[review F2 + Axe 1.3] One bounded SOCKS5 handshake + CONNECT
+        toward ``url``. NO GET: dead/alive is all we need — _finalize_ip
+        does the full check once the tunnel is back. Never called without
+        an explicit wait_for budget: an httpx timeout does NOT bound the
+        SOCKS5 CONNECT (the 445 s stall bug class).
+
+        Returns a VERDICT string instead of bool [Axe 1.3]:
+        - "ok"      — CONNECT succeeded (tunnel alive)
+        - "refused" — connection refused (definitive dead)
+        - "timeout" — slow/unresponsive (may just be slow — grace applies)
+        - "error"   — anything else (treated as dead, no grace: the
+          classification is structural on type-name/cause-chain so the F2
+          tests' fake httpx module (no httpx exception types) still works.
         """
         import httpx
         client = httpx.AsyncClient(
@@ -1544,9 +1620,9 @@ class VPNManager:
             # Release the unread stream without downloading the body
             # (bounded — a stuck tunnel must not cost the whole budget).
             await asyncio.wait_for(resp.aclose(), 1.0)
-            return True
-        except Exception:
-            return False
+            return "ok"
+        except Exception as e:
+            return _classify_probe_exc(e)
         finally:
             await client.aclose()
 
@@ -1683,10 +1759,16 @@ class VPNManager:
             _strict = _cfg_data.get("ip_rotation", {}).get("strict_free", False)
             _vpn_stack = _cfg_data.get("ip_rotation", {}).get("vpn_stack", "auto")
             _station_count = resolved_station_count(_cfg_data.get("ip_rotation", {}))
+            # [plan 19/08 §1/§2] free multi-attempt cap + exception ordering —
+            # read from the config mirror (persisted selection, hot-reload).
+            _free_attempts = _cfg_data.get("ip_rotation", {}).get("max_free_attempts", 2)
+            _exc_fallback = _cfg_data.get("ip_rotation", {}).get("free_exception_fallback", "station-first")
         except Exception:
             _dual = _strict = False
             _vpn_stack = "auto"
             _station_count = 2 if _dual else 1
+            _free_attempts = 2
+            _exc_fallback = "station-first"
         return {
             "enabled": self._enabled,
             "proxy_mode": self._proxy_mode,
@@ -1748,6 +1830,10 @@ class VPNManager:
             # station_count / dual_station — same canonical value the
             # dropdown posts back).
             "station_count": _station_count,
+            # [plan 19/08 §1/§2] free multi-attempt cap (1-3) + exception
+            # ordering (station-first / direct) — same mirror pattern.
+            "max_free_attempts": _free_attempts,
+            "free_exception_fallback": _exc_fallback,
         }
 
     async def update_config(self, updates: dict) -> dict:
@@ -1760,7 +1846,7 @@ class VPNManager:
         self._config.update(updates)
         if "enabled" in updates:
             self._enabled = bool(updates["enabled"])
-        if "proxy_mode" in updates and updates["proxy_mode"] in ("vpn", "direct"):
+        if "proxy_mode" in updates and updates["proxy_mode"] in ("vpn", "socks5", "direct"):
             self._proxy_mode = updates["proxy_mode"]
         if "quota_per_ip" in updates:
             self._quota_per_ip = max(1, int(updates["quota_per_ip"]))
@@ -1931,8 +2017,14 @@ class VPNManager:
 
     # ── Docker helpers (all blocking — run via asyncio.to_thread) ──
 
-    def _docker_run(self, args: list[str], timeout: int = 30) -> subprocess.CompletedProcess:
+    def _docker_run(self, args: list[str], timeout: int = 30,
+                    env: Optional[dict] = None) -> subprocess.CompletedProcess:
         """Run a docker CLI command (blocking — call via asyncio.to_thread).
+
+        ``env`` [plan 18/08 §2.1]: explicit child environment for `docker
+        compose` invocations (see _compose_env). A child process's explicit
+        env wins over BOTH the inherited parent env AND the .env file next
+        to the compose file — the deterministic half of the 19/08 fix.
 
         [plan 18/08 §D am.8] Rotation-op funnel: while a rotation is in
         flight (_rotation_loop set by _connect_next_impl), count in-flight
@@ -1961,6 +2053,7 @@ class VPNManager:
                 capture_output=True, text=True, timeout=timeout,
                 creationflags=CREATE_NO_WINDOW,
                 encoding="utf-8", errors="replace",
+                env=env,
             )
         except FileNotFoundError:
             raise RuntimeError("docker CLI not found on PATH")
@@ -1975,6 +2068,33 @@ class VPNManager:
                     loop.call_soon_threadsafe(op_ev.set)
                 except RuntimeError:
                     pass  # loop already closed at shutdown — nothing to wake
+
+    def _compose_env(self, *, stations: Optional[list] = None,
+                     stack: Optional[str] = None) -> dict:
+        """Explicit environment for `docker compose` children.
+
+        [plan 18/08 §2.1] The 19/08 root cause: settings.load_env_file()
+        only fills os.environ when a key is ABSENT, so a parent env loaded
+        at boot wins over the .env file for every compose child — a sed on
+        the file was invisible until the process restarted. The fix here is
+        deterministic: the child gets the FULL parent env PLUS the
+        per-station VPN_TYPE_STATION{n} values, overriding whatever stale
+        value the parent carries. The compose interpolation is
+        ``${VPN_TYPE_STATION{n}:-openvpn}`` (docker-compose.yml) — this is
+        the ONLY surface that decides a station's stack.
+
+        ``stations`` defaults to this manager's own station; ``stack``
+        defaults to the current effective stack (compose's own default when
+        unknown). During a stack flip, _apply_stack passes the TARGET stack
+        so the child recreates in the requested mode even if the parent env
+        still carries the previous one.
+        """
+        env = dict(os.environ)
+        if stack is None:
+            stack = self._stack_effective or "openvpn"
+        for s in (stations or [self._station]):
+            env[f"VPN_TYPE_STATION{s}"] = stack
+        return env
 
     async def _await_rotation_ops_drained(self) -> None:
         """[plan 18/08 §D am.8] Wait for in-flight docker threads to end.
@@ -2393,7 +2513,8 @@ class VPNManager:
             # recovery must go through `compose up --force-recreate` so the
             # wider pool (SERVER_COUNTRIES) is actually in effect.
             cmd.insert(4, "--force-recreate")
-        result = await asyncio.to_thread(self._docker_run, cmd, 120)
+        result = await asyncio.to_thread(self._docker_run, cmd, 120,
+                                         env=self._compose_env())
         if result.returncode != 0:
             raise RuntimeError(
                 f"docker compose up failed: {result.stderr.strip() or result.stdout.strip()}")
@@ -2564,7 +2685,11 @@ class VPNManager:
         try:
             cmd = (["compose", "-f", compose_path, "up", "-d", "--force-recreate"]
                    + sorted(services))
-            result = await asyncio.to_thread(self._docker_run, cmd, 300)
+            # Explicit env: the TARGET stack reaches the compose child even
+            # when the parent env is stale (19/08 root cause — §2.1).
+            result = await asyncio.to_thread(
+                self._docker_run, cmd, 300,
+                env=self._compose_env(stations=stations, stack=mode))
             if result.returncode != 0:
                 raise RuntimeError(result.stderr.strip() or result.stdout.strip())
         except Exception as e:
@@ -2800,7 +2925,8 @@ class VPNManager:
             compose_file = self._compose_file_path()
             result = await asyncio.to_thread(
                 self._docker_run,
-                ["compose", "-f", compose_file, "pull", self._compose_service], 300)
+                ["compose", "-f", compose_file, "pull", self._compose_service],
+                300, env=self._compose_env())
             if result.returncode != 0:
                 raise RuntimeError(result.stderr.strip() or result.stdout.strip())
             new_digest = await self._docker_repo_digest(image)
@@ -2871,7 +2997,8 @@ class VPNManager:
                 compose_file = self._compose_file_path()
                 result = await asyncio.to_thread(
                     self._docker_run,
-                    ["compose", "-f", compose_file, "up", "-d", "--pull", "never", self._compose_service], 120)
+                    ["compose", "-f", compose_file, "up", "-d", "--pull", "never", self._compose_service],
+                    120, env=self._compose_env())
                 if result.returncode != 0:
                     raise RuntimeError(result.stderr.strip() or result.stdout.strip())
                 started_at = await self._wait_healthy(timeout=120)
@@ -2916,7 +3043,8 @@ class VPNManager:
             compose_file = self._compose_file_path()
             await asyncio.to_thread(
                 self._docker_run,
-                ["compose", "-f", compose_file, "up", "-d", "--pull", "never", self._compose_service], 120)
+                ["compose", "-f", compose_file, "up", "-d", "--pull", "never", self._compose_service],
+                120, env=self._compose_env())
             # force: container was just recreated — see _apply_update ([37]).
             await self.refresh_status(force=True)
             logger.warning("[vpn-update] rolled back to previous image %s", old_image_id[:19])
@@ -3082,8 +3210,21 @@ class VPNManager:
             # when the tunnel returns). Stack-agnostic: the incident tunnel
             # was "connected" with no AUTH_FAILED/TLS marker — invisible
             # without a probe. Same connect chain as get_public_ip.
-            if not await asyncio.wait_for(self._probe_tunnel_light(),
-                                          self._ip_probe_budget):
+            try:
+                tunnel_alive = await asyncio.wait_for(
+                    self._probe_tunnel_light(), self._ip_probe_budget)
+            except asyncio.TimeoutError:
+                # [plan 19/08] Half-open tunnel (TCP accepted, SOCKS5/CONNECT
+                # never answers — gluetun healthcheck-restart signature): the
+                # sweep worst case (n endpoints × probe + close) exceeds the
+                # budget, and the wait_for timeout used to kill the tick
+                # BEFORE the failure counter — the egress watchdog never
+                # armed and the dead tunnel stayed dead forever (the
+                # empty-message "loop error:" in the logs). Budget expiry =
+                # failed probe: the counter increments and the restart path
+                # below owns recovery.
+                tunnel_alive = False
+            if not tunnel_alive:
                 self._egress_failures += 1
                 if self._egress_failures >= self._auto_wg_egress_ticks:
                     egress_dead = True
@@ -3289,7 +3430,11 @@ class VPNManager:
         """Persist IP history, stats, and circuit breaker state to disk.
 
         Atomic write ([20]): temp file + os.replace, so a crash mid-write
-        can never leave a truncated state file.
+        can never leave a truncated state file. [plan 18/08 §4.1] the
+        current on-disk state is copied to ``*.bak`` (last-good) BEFORE the
+        overwrite, so a corrupted/empty write still leaves a recoverable
+        previous snapshot. Failures are logged with traceback but never
+        raised: saving must stay non-fatal for the runtime.
         """
         try:
             state = {
@@ -3308,13 +3453,16 @@ class VPNManager:
             }
             state_path = self._get_state_path()
             os.makedirs(os.path.dirname(state_path), exist_ok=True)
+            # [plan 18/08 §4.1] last-good copy BEFORE the overwrite.
+            if os.path.exists(state_path):
+                shutil.copy2(state_path, state_path + ".bak")
             tmp_path = state_path + ".tmp"
             with open(tmp_path, "w") as f:
                 json.dump(state, f, indent=2)
             os.replace(tmp_path, state_path)
             logger.debug("[vpn] state saved to %s", state_path)
         except Exception as e:
-            logger.debug("[vpn] failed to save state: %s", e)
+            logger.debug("[vpn] failed to save state: %s", e, exc_info=True)
 
     def load_state(self):
         """Load persisted state from disk."""
@@ -3373,3 +3521,133 @@ class VPNManager:
                         len(self._ip_history), self._total_switches)
         except Exception as e:
             logger.debug("[vpn] failed to load state: %s", e)
+
+
+# ── Boot reconcile — orphan / stale-stack container cleanup (plan 18/08 §2.2) ──
+
+def _docker_cli(args: list[str], timeout: int = 30,
+                env: Optional[dict] = None) -> subprocess.CompletedProcess:
+    """Blocking docker CLI call WITHOUT the rotation funnel.
+
+    Boot-time only (reconcile_orphan_containers runs before any rotation
+    exists), so there is no rotation-op accounting — a plain subprocess.run
+    with the same flags as VPNManager._docker_run. RuntimeError on a missing
+    docker CLI, same contract as the manager's helper.
+    """
+    try:
+        return subprocess.run(
+            ["docker", *args],
+            capture_output=True, text=True, timeout=timeout,
+            creationflags=CREATE_NO_WINDOW,
+            encoding="utf-8", errors="replace",
+            env=env,
+        )
+    except FileNotFoundError:
+        raise RuntimeError("docker CLI not found on PATH")
+
+
+def _env_value_from_inspect(info: dict, key: str) -> Optional[str]:
+    """Read one Config.Env entry from a docker inspect payload.
+
+    Config.Env is a list of "KEY=VALUE" strings; the compose interpolation
+    surfaces the stack exactly like that (e.g. "VPN_TYPE=wireguard").
+    Returns None when the key is absent (old container, or a malformed
+    payload) — the caller treats unknown as "keep" (conservative)."""
+    try:
+        env_list = info["Config"]["Env"]
+    except (KeyError, TypeError):
+        return None
+    for entry in env_list or []:
+        k, _, v = entry.partition("=")
+        if k == key:
+            return v or None
+    return None
+
+
+async def reconcile_orphan_containers(managers: list, runner=None) -> list[str]:
+    """[plan 18/08 §2.2] Remove fleet containers the boot must not keep.
+
+    A crash (or a stack flip that died mid-way) leaves docker containers
+    that do not match the manager registry: either a station retired by a
+    downscale that never got its ``docker rm -f``, or a container booted on
+    the stale stack (the 19/08 case) that survives into the new process.
+    Called in lifespan BEFORE the start() gather, so the fleet comes up
+    exactly as configured; start() then creates/repairs what is missing.
+
+    Rules (fail-soft — a docker error is logged, never raised, so a broken
+    docker daemon cannot block boot):
+      * enumerate ``docker ps -a`` filtered on the fleet prefix (anchored
+        name regex ^/opencode-vpn: excludes opencode-proxy and the
+        opencode-wg-test canary, which do not share the prefix);
+      * a name outside {m._docker_container for m in managers} is an orphan
+        → ``docker rm -f`` (named volumes survive: rm without -v);
+      * an expected name whose container runs VPN_TYPE != that station's
+        _stack_effective is a stale-stack survivor → removed too (start()
+        recreates it on the right stack — no wait for the watchdog);
+      * "No such container" from rm is success (a compose teardown raced
+        the boot — nothing to remove).
+
+    ``runner`` is an injectable async callable (args, timeout, env) ->
+    CompletedProcess for offline tests; the default is the module-level
+    _docker_cli via asyncio.to_thread (no funnel — boot time).
+
+    Returns the list of removed container names.
+    """
+    if not managers:
+        return []
+    run = runner or (lambda args, timeout=30, env=None:
+                     asyncio.to_thread(_docker_cli, args, timeout, env))
+    expected = {m._docker_container for m in managers}
+    removed: list[str] = []
+
+    async def _rm(name: str) -> None:
+        try:
+            res = await run(["rm", "-f", name], 30, None)
+        except (RuntimeError, subprocess.SubprocessError) as e:
+            logger.warning("[vpn] boot reconcile: rm %s failed — %s", name, e)
+            return
+        if res.returncode != 0 and "No such container" not in (res.stderr or ""):
+            logger.warning("[vpn] boot reconcile: rm %s failed rc=%d: %s",
+                           name, res.returncode, res.stderr.strip())
+
+    try:
+        result = await run(["ps", "-a", "--filter", "name=^/opencode-vpn",
+                            "--format", "{{.Names}}"], 30, None)
+    except (RuntimeError, subprocess.SubprocessError) as e:
+        logger.warning("[vpn] boot reconcile: ps failed — %s", e)
+        return []
+    if result.returncode != 0:
+        logger.warning("[vpn] boot reconcile: ps failed rc=%d: %s",
+                       result.returncode, result.stderr.strip())
+        return []
+    names = [ln.strip() for ln in result.stdout.splitlines() if ln.strip()]
+    by_name = {m._docker_container: m for m in managers}
+
+    for name in names:
+        if name not in expected:
+            removed.append(name)
+            await _rm(name)
+            continue
+        # Expected name: check the booted stack against the manager's
+        # effective stack (stale-env survivor / flip that crashed mid-way).
+        m = by_name.get(name)
+        if m is None:
+            continue
+        try:
+            insp = await run(["inspect", name], 15, None)
+        except (RuntimeError, subprocess.SubprocessError):
+            continue
+        if insp.returncode != 0:
+            continue
+        try:
+            info = json.loads(insp.stdout)[0]
+        except (json.JSONDecodeError, IndexError):
+            continue
+        vpn_type = _env_value_from_inspect(info, "VPN_TYPE")
+        if vpn_type is not None and vpn_type != (m._stack_effective or "openvpn"):
+            removed.append(name)
+            await _rm(name)
+    if removed:
+        logger.warning("[vpn] boot reconcile removed %d container(s): %s",
+                       len(removed), ", ".join(removed))
+    return removed

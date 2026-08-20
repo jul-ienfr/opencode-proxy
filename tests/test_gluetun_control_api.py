@@ -41,8 +41,9 @@ class ControlFakeVPNManager(FakeVPNManager):
         self.control_stdout = ""           # default stdout (fragments below override)
         self.stdout_by_fragment = {}       # fragment -> stdout override
 
-    def _docker_run(self, args, timeout=30):
+    def _docker_run(self, args, timeout=30, env=None):
         self.calls["docker_run"] += 1
+        self.last_env = dict(env) if env else None
         # Only log the args for control-server invocations (sh -c ... wget ...)
         # The script is the LAST element of ["exec", ctn, "sh", "-c", script].
         if args and args[:2] == ["exec", self._docker_container] \
@@ -93,13 +94,13 @@ class ControlReconnectFake(ControlFakeVPNManager):
         self.clears_on_pin = clears_on_pin
         self._pins = 0
 
-    def _docker_run(self, args, timeout=30):
+    def _docker_run(self, args, timeout=30, env=None):
         script = args[-1] if args else ""
         if "/v1/vpn/settings" in script:
             self._pins += 1
             if self._pins >= self.clears_on_pin:
                 self.log_text = ""
-        return super()._docker_run(args, timeout=timeout)
+        return super()._docker_run(args, timeout=timeout, env=env)
 
 
 def _fast_cfg(tmp_path, **over):
@@ -923,9 +924,9 @@ class StackFakeVPNManager(ControlFakeVPNManager):
                          tmp_path=tmp_path, **kw)
         self.run_args = []
 
-    def _docker_run(self, args, timeout=30):
+    def _docker_run(self, args, timeout=30, env=None):
         self.run_args.append(list(args))
-        return super()._docker_run(args, timeout=timeout)
+        return super()._docker_run(args, timeout=timeout, env=env)
 
 
 def _stack_mgr(tmp_path, monkeypatch, key=True, **cfg_over):
