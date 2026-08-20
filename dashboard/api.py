@@ -83,7 +83,7 @@ _DASHBOARD_TOKEN = os.getenv("DASHBOARD_TOKEN", "").strip()
 # re-push to get a consistent state.
 __CONFIG_YAML_PATH = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.yaml")
-_config_yaml_known_mtime = 0.0
+_config_yaml_known_mtime: float = 0.0
 
 
 def _config_yaml_mtime() -> float:
@@ -248,23 +248,25 @@ def daysAgo(n: int) -> str:
     return (datetime.now(timezone.utc) - timedelta(days=n)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+_persist_lock = __import__("threading").Lock()
+
 def _persist_vpn_config(updates: dict):
-    """Persist VPN config changes to config.yaml (non-blocking, best-effort)."""
+    """Persist VPN config changes to config.yaml (non-blocking, best-effort). [32]"""
     try:
         import yaml
         config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "config.yaml")
         if not os.path.exists(config_path):
             return
+        with _persist_lock:
+            with open(config_path, "r", encoding="utf-8") as f:
+                config = yaml.safe_load(f) or {}
 
-        with open(config_path, "r", encoding="utf-8") as f:
-            config = yaml.safe_load(f) or {}
+            ip_rot = config.get("ip_rotation", {})
 
-        ip_rot = config.get("ip_rotation", {})
-
-        # Map update keys to config.yaml paths
-        key_map = {
-            "enabled": "enabled",
-            "proxy_mode": "proxy_mode",
+            # Map update keys to config.yaml paths
+            key_map = {
+                "enabled": "enabled",
+                "proxy_mode": "proxy_mode",
             "dual_station": "dual_station",
             "strict_free": "strict_free",
             "quota_per_ip": "quota_per_ip",
@@ -351,8 +353,6 @@ def _persist_vpn_config(updates: dict):
             except Exception:
                 pass
             _debug(f"  [vpn] config persisted to {config_path}")
-            # [Axe 3.4] dashboard wrote the file → it is NOT manually dirty.
-            global _config_yaml_known_mtime
             _config_yaml_known_mtime = _config_yaml_mtime()
 
     except Exception as e:
