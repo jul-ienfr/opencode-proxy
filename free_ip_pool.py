@@ -267,13 +267,23 @@ class FreeIPPool:
         return max(1, station._quota_per_ip - 10 -
                    self._rotation_stagger * max(0, station._station - 1))
 
-    def _station_usable(self, station: VPNManager, *, exclude_approaching: bool) -> bool:
+    def _station_usable(self, station: VPNManager, *, exclude_approaching: bool, forced_pool=None) -> bool:
         """A station is usable when its tunnel is up and it is not marked
         bad by a recent 429. ``exclude_approaching`` also rules out stations
         at (or beyond) their rotation threshold (preferred pass) — the
         second pass admits them so the request still gets a shot at the
         free tier instead of falling back to paid while a background
         rotation is in flight."""
+        if forced_pool is not None:
+            cc = getattr(station, "_current_country", None) or getattr(station, "current_country", None)
+            if cc is not None:
+                try:
+                    from vpn_manager import _normalize_country as _nc
+                    if _nc(cc) not in forced_pool:
+                        return False
+                except Exception:
+                    if cc not in forced_pool:
+                        return False
         per = self._per_station(station)
         if per["bad_until"] and time.monotonic() < per["bad_until"]:
             return False
@@ -283,7 +293,7 @@ class FreeIPPool:
             return False
         return True
 
-    def _best_station(self) -> Optional[VPNManager]:
+    def _best_station(self, forced_pool=None) -> Optional[VPNManager]:
         """Best station for the next request — preference A (station 1)
         unless it is bad (recent 429) or its tunnel is down.
 
@@ -295,39 +305,39 @@ class FreeIPPool:
         parked at quota until both stations were exhausted.
         """
         for st in self._stations:
-            if self._station_usable(st, exclude_approaching=False):
+            if self._station_usable(st, exclude_approaching=False, forced_pool=forced_pool):
                 return st
         return None
 
-    def _best_station_excluding(self, station: VPNManager) -> Optional[VPNManager]:
+    def _best_station_excluding(self, station: VPNManager, forced_pool=None) -> Optional[VPNManager]:
         """Best station other than ``station`` (for an immediate dual-clutch
         switch when the current one approaches quota)."""
         for exclude_approaching in (True, False):
             for st in self._stations:
                 if st is station:
                     continue
-                if self._station_usable(st, exclude_approaching=exclude_approaching):
+                if self._station_usable(st, exclude_approaching=exclude_approaching, forced_pool=forced_pool):
                     return st
         return None
 
-    def _best_station_excluding_many(self, excluded: set) -> Optional[VPNManager]:
+    def _best_station_excluding_many(self, excluded: set, forced_pool=None) -> Optional[VPNManager]:
         """Best station NOT in ``excluded`` (cumulative retries: never
         re-strike an IP/bucket already used in this request's free attempts)."""
         for exclude_approaching in (True, False):
             for st in self._stations:
                 if st in excluded:
                     continue
-                if self._station_usable(st, exclude_approaching=exclude_approaching):
+                if self._station_usable(st, exclude_approaching=exclude_approaching, forced_pool=forced_pool):
                     return st
         return None
 
-    def _any_other_usable(self, station: VPNManager) -> bool:
+    def _any_other_usable(self, station: VPNManager, forced_pool=None) -> bool:
         """True when at least one OTHER station is usable right now (C1 —
         the "never bad-mark the last standing station" guard)."""
         for st in self._stations:
             if st is station:
                 continue
-            if self._station_usable(st, exclude_approaching=False):
+            if self._station_usable(st, exclude_approaching=False, forced_pool=forced_pool):
                 return True
         return False
 
@@ -516,7 +526,7 @@ class FreeIPPool:
         per["last_connect_attempt"] = now
         self._launch_rotation(station)
 
-    async def on_request(self) -> tuple[Optional[str], Optional[VPNManager]]:
+    async def on_request(self, forced_pool=None) -> tuple[Optional[str], Optional[VPNManager]]:
         """Called before each free model request.
 
         Returns ``(proxy_url, station)`` — the SOCKS5 URL of the best
@@ -582,7 +592,30 @@ class FreeIPPool:
             return ep.socks5_url, ep
 
         if mode == "vpn":
-            station = self._best_station()
+            station = self._best_station(forced_pool)
+            if station is None and forced_pool is not None:
+                for st in self._stations:
+                    if st.status != "connected":
+                        continue
+                    try:
+                        ok = await st.ensure_geo_egress(forced_pool, timeout=10.0)
+                        if ok:
+                            station = self._best_station(forced_pool)
+                            if station is not None:
+                                self._active_station = station
+                                per = self._per_station(station)
+                                per["last_quota_per_ip"] = station._quota_per_ip
+                                per["request_count"] += 1
+                                station.note_free_request()
+                                ip = station.current_ip or "unknown"
+                                if ip not in per["ip_stats"]:
+                                    per["ip_stats"][ip] = {"requests": 0, "start": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "server": station.current_server.get("name", "?") if station.current_server else "?"}
+                                per["ip_stats"][ip]["requests"] += 1
+                                return station.socks5_url, station
+                            break
+                    except Exception:
+                        continue
+                return None, None
             if station is None:
                 return None, None
             self._active_station = station
@@ -604,7 +637,7 @@ class FreeIPPool:
             # rotate it in the background — the request path never blocks
             # on a docker rotation (C6).
             if per["request_count"] >= self._rotation_threshold(station):
-                other = self._best_station_excluding(station)
+                other = self._best_station_excluding(station, forced_pool)
                 if other is not None:
                     logger.info("[free-ip] station %d approaching quota (%d/%d) — "
                                 "dual-clutch switch to station %d, rotating in background",
@@ -758,8 +791,8 @@ class FreeIPPool:
                     time.monotonic() + self._bad_ttl)
         self._launch_rotation(station)
 
-    async def on_disconnect_retry(self, failed: Optional[VPNManager] = None
-                                  ) -> tuple[Optional[str], Optional[VPNManager]]:
+    async def on_disconnect_retry(self, failed: Optional[VPNManager] = None, forced_pool=None
+                                   ) -> tuple[Optional[str], Optional[VPNManager]]:
         """Pick a DIFFERENT station for a retry after an upstream disconnect.
 
         The stream retry loop used to re-strike the SAME station/proxy that
@@ -810,8 +843,8 @@ class FreeIPPool:
                     self._per_station(failed)["bad_until"] = (
                         time.monotonic() + self._bad_ttl)
             self._launch_rotation(failed)
-        st = (self._best_station_excluding(failed)
-              if failed is not None else self._best_station())
+        st = (self._best_station_excluding(failed, forced_pool)
+              if failed is not None else self._best_station(forced_pool))
         if st is None:
             return None, None
         self._active_station = st

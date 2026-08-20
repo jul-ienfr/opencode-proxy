@@ -2985,6 +2985,11 @@ document.addEventListener('DOMContentLoaded', () => {
             const resp = await fetchWithToken('/api/vpn-status');
             const data = await resp.json();
             updateVPNUI(data);
+            try {
+                const cfgR = await fetchWithToken('/api/vpn-config');
+                const cfgJ = await cfgR.json();
+                if (cfgJ.proxy_mode) updateGeoWarning(cfgJ.proxy_mode);
+            } catch (e2) {}
         } catch (e) {
             console.error('VPN status error:', e);
         }
@@ -3913,17 +3918,62 @@ document.addEventListener('DOMContentLoaded', () => {
     };
 
     // ── Proxy mode switching ──
+    let _geoCache = null;
+    let _geoCacheTs = 0;
+    async function updateGeoWarning(mode) {
+        const el = document.getElementById('fm-geo-warning');
+        if (!el) return;
+        if (mode === 'vpn') { el.style.display = 'none'; return; }
+        try {
+            const now = Date.now();
+            if (!_geoCache || now - _geoCacheTs > 60000) {
+                const r = await fetchWithToken('/api/routes?geo_status=ok&limit=100');
+                const j = await r.json();
+                _geoCache = j.routes || [];
+                _geoCacheTs = now;
+            }
+            const geoRoutes = _geoCache.filter(x => x.geo && (x.geo.require_vpn || x.mode === 'strict'));
+            if (!geoRoutes.length) { el.style.display = 'none'; return; }
+            const isDirect = mode === 'direct';
+            const head = isDirect
+                ? '⚠️ Mode direct : les modèles géo-restreints risquent de ne pas fonctionner (403). Passez en VPN.'
+                : '⚠️ SOCKS5 : vérifiez que vos proxies sont dans les pays autorisés, sinon 403.';
+            const byModel = {};
+            for (const r of geoRoutes) {
+                const m = r.model || r.key;
+                if (!byModel[m]) byModel[m] = { countries: r.effective_allowed || [], matches: [] };
+                for (const mt of (r.match || [])) if (!byModel[m].matches.includes(mt)) byModel[m].matches.push(mt);
+            }
+            const lines = Object.entries(byModel).map(([model, v]) => {
+                const via = v.matches.filter(x => x !== model).join(', ');
+                const c = (v.countries || []).join(', ') || '—';
+                return `<div style="margin-bottom:6px"><strong>${escHtml(model)}</strong>${via ? ' <span style="opacity:.7">(via ' + escHtml(via) + ')</span>' : ''}<br><span style="opacity:.8">Autorisé : ${escHtml(c)} (strict, VPN requis)</span></div>`;
+            }).join('');
+            el.innerHTML = `<div style="display:flex;gap:8px;align-items:flex-start"><span style="flex:1">${head}</span><span class="geo-info" tabindex="0" aria-label="Détails géo" style="cursor:help;flex-shrink:0;width:20px;height:20px;display:inline-flex;align-items:center;justify-content:center;border-radius:50%;background:var(--warning,#e6a000);color:#fff;font-weight:700;font-size:12px">ⓘ<span class="geo-tooltip" role="tooltip" style="display:none;position:absolute;right:0;top:28px;min-width:320px;max-width:420px;padding:12px;background:var(--bg-card,#222);border:1px solid var(--border);border-radius:8px;box-shadow:0 8px 24px rgba(0,0,0,.4);font-size:11px;line-height:1.5;z-index:10">${lines}</span></span></div>`;
+            el.style.display = 'block';
+            const info = el.querySelector('.geo-info');
+            const tip = el.querySelector('.geo-tooltip');
+            if (info && tip) {
+                const show = () => tip.style.display = 'block';
+                const hide = () => tip.style.display = 'none';
+                info.addEventListener('mouseenter', show);
+                info.addEventListener('mouseleave', hide);
+                info.addEventListener('focus', show);
+                info.addEventListener('blur', hide);
+                el.style.position = 'relative';
+            }
+        } catch (e) { el.style.display = 'none'; }
+    }
+
     function setProxyModeUI(mode) {
-        // Update radio buttons
         document.querySelectorAll('.proxy-mode-btn').forEach(btn => btn.classList.remove('active'));
         const activeBtn = document.getElementById('fm-mode-' + mode);
         if (activeBtn) activeBtn.classList.add('active');
-
-        // Show/hide sections
         const vpnSection = document.getElementById('fm-vpn-section');
         const socks5Section = document.getElementById('fm-socks5-section');
         if (vpnSection) vpnSection.style.display = mode === 'vpn' ? 'block' : 'none';
         if (socks5Section) socks5Section.style.display = mode === 'socks5' ? 'block' : 'none';
+        updateGeoWarning(mode);
     }
 
     window.switchProxyMode = async function(mode) {

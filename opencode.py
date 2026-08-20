@@ -404,8 +404,10 @@ async def _pause_key_for_quota_reset(api_key: str):
         _key_pauser.pause_key(api_key, _default_pause, "429 (quota fetch failed)")
 
 
-def _key_from_headers(headers: dict, protocol: str) -> str:
+def _key_from_headers(headers: dict | None, protocol: str) -> str:
     """Extract the API key from request headers."""
+    if not headers:
+        return ""
     if protocol == "anthropic":
         return headers.get("x-api-key", "")
     return headers.get("Authorization", "").replace("Bearer ", "")
@@ -1818,6 +1820,162 @@ def _geo_sse_error(route: dict, current_country: str | None) -> bytes:
     return _sse("error", payload)
 
 
+async def _enforce_geo_gate(route: dict, request: Request, *, is_stream: bool, protocol: str):
+    """Gate unique fail-closed avant tout forward (I2/I3 adaptatif par modèle).
+
+    Retourne Response de bloc ou None si pass. Centralise les 3 gates
+    (/v1/messages, /v1/chat/completions, /v1/responses) + streaming + free.
+    Appelé en tête de handler avant circuit-breaker/cache/auth/forward,
+    et à chaque tentative free si rotation entre tentatives.
+    """
+    global _geo_block_total, _geo_forced_pool, _geo_pinned_country
+    try:
+        _geo_info = _cfg_settings.resolve_geo(route)
+    except Exception:
+        _geo_info = {"effective_allowed": set(), "mode": "strict", "require_vpn": False, "geo_status": "ok"}
+    _geo_has = isinstance(route, dict) and isinstance(route.get("geo"), dict)
+    _geo_enabled = bool(getattr(_cfg_settings, "GEO_ENABLED", False))
+    if not (_geo_has and _geo_enabled):
+        return None
+    _geo_mode = str(_geo_info.get("mode", "strict"))
+    _geo_status = str(_geo_info.get("geo_status", "ok"))
+    _geo_require = bool(_geo_info.get("require_vpn", False))
+    _geo_effective = _geo_info.get("effective_allowed", set())
+    _geo_passthrough = request.headers.get("X-Geo-Passthrough", "") == "1"
+    if _geo_status == "misconfigured":
+        _geo_block_total += 1
+        if is_stream:
+            async def _geo_err_stream():
+                yield _geo_sse_error(route, None)
+            return StreamingResponse(_geo_err_stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Geo-Blocked": "1", "X-Geo-Status": "misconfigured"})
+        return _geo_block_response(route, None, protocol, passthrough_451=_geo_passthrough)
+    _vpn_on = bool(getattr(_cfg_settings.IP_ROTATION, "get", lambda *a, **k: None)("enabled", False)) if isinstance(getattr(_cfg_settings, "IP_ROTATION", None), dict) else False
+    try:
+        import shared_state as _ss_geo
+        _vpn_on = _vpn_on and bool(getattr(_ss_geo, "vpn_managers", None))
+    except Exception:
+        pass
+    if _geo_require and not _vpn_on:
+        _geo_block_total += 1
+        if is_stream:
+            async def _geo_req_stream():
+                yield _geo_sse_error(route, None)
+            return StreamingResponse(_geo_req_stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Geo-Blocked": "1", "X-Geo-Status": _geo_status})
+        return _geo_block_response(route, None, protocol, passthrough_451=_geo_passthrough)
+    if _geo_mode == "strict" and not _vpn_on and not _geo_require:
+        if _geo_effective is not None and isinstance(_geo_effective, set) and len(_geo_effective) > 0:
+            _geo_block_total += 1
+            if is_stream:
+                async def _geo_novpn_stream():
+                    yield _geo_sse_error(route, None)
+                return StreamingResponse(_geo_novpn_stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Geo-Blocked": "1"})
+            return _geo_block_response(route, None, protocol, passthrough_451=_geo_passthrough)
+    _geo_current = None
+    try:
+        import shared_state as _ss_geo2
+        for _m in getattr(_ss_geo2, "vpn_managers", None) or []:
+            if _m and getattr(_m, "_current_country", None):
+                _geo_current = _m._current_country
+                break
+    except Exception:
+        pass
+    if _vpn_on and _geo_effective and isinstance(_geo_effective, set) and len(_geo_effective) > 0:
+        if _geo_current and _geo_current in _geo_effective:
+            request.state._geo_pinned = True  # type: ignore
+            request.state._geo_current = _geo_current  # type: ignore
+            request.state._geo_mode = _geo_mode  # type: ignore
+            request.state._geo_fallback = False  # type: ignore
+            _geo_forced_pool = set(_geo_effective)
+            request.state._geo_forced_pool = _geo_forced_pool  # type: ignore
+            return None
+        try:
+            _probe_budget = float(_cfg_settings.IP_ROTATION.get("ip_probe_budget", 8.0) or 8.0) if isinstance(getattr(_cfg_settings, "IP_ROTATION", None), dict) else 8.0
+        except Exception:
+            _probe_budget = 8.0
+        _geo_budget = min(8.0, _probe_budget)
+        _geo_ok = False
+        _geo_candidates = set(_geo_effective)
+        try:
+            _geo_candidates = {c for c in _geo_candidates if _geo_breaker.get((c, 0), 0) < _geo_breaker_threshold}
+        except Exception:
+            pass
+        if not _geo_candidates:
+            if _geo_mode == "strict":
+                _geo_block_total += 1
+                if is_stream:
+                    async def _geo_no_cand_stream():
+                        yield _geo_sse_error(route, _geo_current)
+                    return StreamingResponse(_geo_no_cand_stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Geo-Blocked": "1", "Retry-After": "0"})
+                return _geo_block_response(route, _geo_current, protocol, passthrough_451=_geo_passthrough)
+            request.state._geo_fallback = True  # type: ignore
+            request.state._geo_pinned = False  # type: ignore
+            request.state._geo_current = _geo_current  # type: ignore
+            request.state._geo_mode = _geo_mode  # type: ignore
+            return None
+        try:
+            import shared_state as _ss_pin
+            _pin_mgr = None
+            for _m in getattr(_ss_pin, "vpn_managers", None) or []:
+                if _m and hasattr(_m, "ensure_geo_egress"):
+                    _pin_mgr = _m
+                    break
+            if _pin_mgr is not None:
+                _t0 = time.monotonic()
+                _geo_ok = await asyncio.wait_for(_pin_mgr.ensure_geo_egress(_geo_candidates, timeout=_geo_budget), timeout=_geo_budget + 1.0)
+                _elapsed_ms = int((time.monotonic() - _t0) * 1000)
+                _geo_pin_duration.append(_elapsed_ms)
+                if len(_geo_pin_duration) > _geo_pin_duration_max:
+                    _geo_pin_duration.pop(0)
+                if _geo_ok:
+                    if len(_geo_candidates) == 1:
+                        _geo_current = next(iter(_geo_candidates))
+                    _geo_pinned_country = _geo_current
+                    for c in _geo_candidates:
+                        _geo_breaker.pop((c, 0), None)
+                else:
+                    for c in _geo_candidates:
+                        _geo_breaker[(c, 0)] = _geo_breaker.get((c, 0), 0) + 1
+            else:
+                _geo_ok = False
+                for c in _geo_candidates:
+                    _geo_breaker[(c, 0)] = _geo_breaker.get((c, 0), 0) + 1
+        except asyncio.TimeoutError:
+            for c in _geo_candidates:
+                _geo_breaker[(c, 0)] = _geo_breaker.get((c, 0), 0) + 1
+        except RuntimeError as e:
+            if "503" in str(e) or "saturated" in str(e).lower():
+                for c in _geo_candidates:
+                    _geo_breaker[(c, 0)] = _geo_breaker.get((c, 0), 0) + 1
+                if _geo_mode == "strict":
+                    _geo_block_total += 1
+                    return JSONResponse(status_code=503, content={"error": {"message": "Geo pin queue saturated", "type": "geo_unavailable"}}, headers={"X-Geo-Blocked": "1", "Retry-After": "0"})
+                request.state._geo_fallback = True  # type: ignore
+                request.state._geo_pinned = False  # type: ignore
+                return None
+            for c in _geo_candidates:
+                _geo_breaker[(c, 0)] = _geo_breaker.get((c, 0), 0) + 1
+        except Exception:
+            for c in _geo_candidates:
+                _geo_breaker[(c, 0)] = _geo_breaker.get((c, 0), 0) + 1
+        if _geo_mode == "strict" and not _geo_ok:
+            _geo_block_total += 1
+            if is_stream:
+                async def _geo_pin_fail_stream():
+                    yield _geo_sse_error(route, _geo_current)
+                return StreamingResponse(_geo_pin_fail_stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Geo-Blocked": "1", "X-Geo-Mode": "strict", "X-Geo-Pinned": "false", "Retry-After": "0"})
+            return _geo_block_response(route, _geo_current, protocol, passthrough_451=_geo_passthrough)
+        elif _geo_mode == "prefer" and not _geo_ok:
+            request.state._geo_fallback = True  # type: ignore
+        else:
+            request.state._geo_fallback = False  # type: ignore
+        request.state._geo_pinned = bool(_geo_ok)  # type: ignore
+        request.state._geo_current = _geo_current  # type: ignore
+        request.state._geo_mode = _geo_mode  # type: ignore
+        _geo_forced_pool = set(_geo_effective) if _geo_ok else None
+        request.state._geo_forced_pool = _geo_forced_pool  # type: ignore
+    return None
+
+
 # Claude Code traite 401/403 comme un échec d'authentification → il affiche sa
 # page de login/blocage. Un 401/403 upstream signifie que la clé/région du proxy
 # est bloquée — rien que l'utilisateur final puisse corriger en se reconnectant —
@@ -2001,7 +2159,7 @@ def _signal_connection_failure(station) -> None:
 
 
 async def _do_free_request_curl_cffi(body: dict, headers: dict, proxy_url: str | None = None,
-                                     station=None):
+                                     station=None, endpoint: str | None = None):
     """Make a free model request using curl_cffi for TLS fingerprint evasion.
 
     Uses the current identity profile's TLS fingerprint (default chrome131)
@@ -2025,14 +2183,20 @@ async def _do_free_request_curl_cffi(body: dict, headers: dict, proxy_url: str |
 
     async with AsyncSession(impersonate=profile["impersonate"],
                             proxy=_curl_proxy_url(proxy_url)) as session:
-        # [plan 18/08 §1a/am.21] connect timeout 30 → 10: in mono-station the
-        # request IS the arming signal (bad-mark is C1-forbidden) — the first
-        # failure reaches the manager in ≤10-15 s, not 30. Read 600 unchanged
-        # (long model streams). SOCKS5+TLS handshake ≈ 1-2 s on a healthy
-        # tunnel — no legitimate request is impacted.
+        if endpoint:
+            _ep = endpoint
+        else:
+            _ep = _cfg_settings._free_endpoint_for(body.get("model", ""))
+            if not _ep or _ep == _cfg_settings.API_BASE_FREE or _ep == _cfg_settings.API_BASE_FREE.replace("/chat/completions", "/v1/responses"):
+                _ep = API_BASE_FREE
+            if not _ep:
+                _ep = API_BASE_FREE
+                _ep = API_BASE_FREE
+            elif "/responses" in _ep and API_BASE_FREE != _cfg_settings.API_BASE_FREE:
+                _ep = API_BASE_FREE.replace("/chat/completions", "/responses").replace("/v1/chat/completions", "/v1/responses") if "/chat/completions" in API_BASE_FREE else _ep
         try:
             resp = await session.post(
-                API_BASE_FREE,
+                _ep,
                 json=body,
                 headers=req_headers,
                 timeout=(10, 600),  # (connect, read) — read 600: long streams
@@ -2181,7 +2345,7 @@ def _free_attempts_active() -> bool:
 
 @asynccontextmanager
 async def _open_free_stream(endpoint, body, headers, use_free: bool, count_request: bool = True,
-                            fresh_station: bool = False, direct_fallback: bool = True):
+                            fresh_station: bool = False, direct_fallback: bool = True, forced_pool=None):
     """Context manager: upstream stream, routed through the VPN when free.
 
     use_free=True and VPN available → curl_cffi stream via the SOCKS5 tunnel
@@ -2210,20 +2374,19 @@ async def _open_free_stream(endpoint, body, headers, use_free: bool, count_reque
     direct fallback is the existing semantics).
     """
     if use_free and _free_ip_pool and _free_ip_pool.enabled:
-        # on_request returns (proxy_url, station); the stream path used to
-        # take only the URL, leaving a TUPLE in proxy_url — every free stream
-        # then crashed into the direct fallback (BLOCKING, [plan] E).
         if count_request:
-            proxy_url, station = await _free_ip_pool.on_request()
+            try:
+                proxy_url, station = await _free_ip_pool.on_request(forced_pool)
+            except TypeError:
+                proxy_url, station = await _free_ip_pool.on_request()
         elif fresh_station:
-            # Disconnect retry: a different station = a different, likely-fresh
-            # (model, IP) cooldown key. NO counter advance (a retry is not a
-            # new request) — on_disconnect_retry is the count_request=False
-            # sibling of on_request. The failed station is bad-marked + rotated
-            # in the background by the pool.
             _prev = _current_free_attempt.get() or {}
-            proxy_url, station = await _free_ip_pool.on_disconnect_retry(
-                _prev.get("station"))
+            try:
+                proxy_url, station = await _free_ip_pool.on_disconnect_retry(
+                    _prev.get("station"), forced_pool)
+            except TypeError:
+                proxy_url, station = await _free_ip_pool.on_disconnect_retry(
+                    _prev.get("station"))
         else:
             # Retry after a network error: re-use the SAME station/proxy as
             # the original attempt. Reading the fresh ``proxy_url`` property
@@ -2604,7 +2767,7 @@ def _free_quota_exhausted_response(exc: FreeQuotaExhausted, protocol: str):
     return resp
 
 
-async def _try_free_model_first(body, headers, protocol, model_id):
+async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=None):
     """Try the free model equivalent before falling back to paid.
 
     If the model has a free equivalent in FREE_MODEL_MAP, attempt the request
@@ -2633,6 +2796,15 @@ async def _try_free_model_first(body, headers, protocol, model_id):
     free_model = FREE_MODEL_MAP.get(model_id)
     if not free_model:
         return None  # No free equivalent, proceed with paid
+    if _free_ip_pool is not None and not _free_ip_pool.enabled:
+        return None
+
+    free_endpoint = _cfg_settings._free_endpoint_for(free_model)
+    if API_BASE_FREE != _cfg_settings.API_BASE_FREE:
+        if "/responses" in free_endpoint:
+            free_endpoint = API_BASE_FREE.replace("/chat/completions", "/responses").replace("/v1/chat/completions", "/v1/responses") if "/chat/completions" in API_BASE_FREE else free_endpoint
+        else:
+            free_endpoint = API_BASE_FREE
 
     # [plan 19/08 §1] pre-flight: ANY station with a fresh (model, IP) key?
     # A hot key on the best station is not a dead end — each other station
@@ -2647,7 +2819,10 @@ async def _try_free_model_first(body, headers, protocol, model_id):
 
     _debug(f"  [free] trying free model {free_model!r} instead of {model_id!r}")
 
-    station = _free_ip_pool._best_station() if _free_ip_pool else None
+    try:
+        station = _free_ip_pool._best_station(forced_pool) if _free_ip_pool else None
+    except TypeError:
+        station = _free_ip_pool._best_station() if _free_ip_pool else None
 
     # Get current public IP for logging (VPN or direct)
     free_ip = ""
@@ -2661,7 +2836,10 @@ async def _try_free_model_first(body, headers, protocol, model_id):
     # the BEST station (may differ from the pre-flight pick — e.g. the
     # preferred one rotated while we were fetching the public IP).
     if _free_ip_pool and _free_ip_pool.enabled:
-        _, station = await _free_ip_pool.on_request()
+        try:
+            _, station = await _free_ip_pool.on_request(forced_pool)
+        except TypeError:
+            _, station = await _free_ip_pool.on_request()
         vpn = station or _vpn_manager
         if vpn and vpn.current_ip:
             free_ip = vpn.current_ip
@@ -2674,9 +2852,16 @@ async def _try_free_model_first(body, headers, protocol, model_id):
     free_api_key = "free (no auth)"
     free_workspace = "free (no auth)"
 
-    # Build free request: swap model name and endpoint
-    free_body = dict(body)
-    free_body["model"] = free_model
+    _is_responses = "/responses" in free_endpoint
+    if _is_responses:
+        if protocol == "anthropic":
+            free_body = _anthropic_to_responses_request({**body, "model": free_model})
+        else:
+            free_body = _chat_to_responses_request({**body, "model": free_model})
+    else:
+        free_body = dict(body)
+        free_body["model"] = free_model
+    _free_is_responses = _is_responses
 
     t0 = time.monotonic()
 
@@ -2718,8 +2903,8 @@ async def _try_free_model_first(body, headers, protocol, model_id):
                     # pass so a request still gets its free shot.
                     attempt = _free_ip_pool._socks5_next(excluded=tried)
                 else:
-                    attempt = (_free_ip_pool._best_station_excluding_many(tried) if tried
-                               else _free_ip_pool._best_station())
+                    attempt = (_free_ip_pool._best_station_excluding_many(tried, forced_pool) if tried
+                               else _free_ip_pool._best_station(forced_pool))
                 if attempt is not None:
                     tried.add(attempt)
             else:
@@ -2730,8 +2915,7 @@ async def _try_free_model_first(body, headers, protocol, model_id):
             _free_elapsed = int((time.monotonic() - t0) * 1000)
             try:
                 resp = await _do_free_request_curl_cffi(free_body, free_headers,
-                                                        attempt.socks5_url, station=attempt)
-                resp_headers = resp.headers
+                                                        attempt.socks5_url, station=attempt, endpoint=free_endpoint)
                 if attempt.current_ip:
                     free_ip = attempt.current_ip
                 elif getattr(attempt, "pid", None):
@@ -2775,22 +2959,19 @@ async def _try_free_model_first(body, headers, protocol, model_id):
                 resp = None
                 break
         if resp is None:
-            # Every tunnel down (or no station) → last-resort direct
-            # fallback (residential IP).
             _log("  FREE via VPN tunnels FAILED → direct fallback (residential IP)")
             try:
                 resp, resp_headers = await _do_request_with_retry(
-                    API_BASE_FREE, free_body, free_headers, protocol, retry_on_429=False
+                    free_endpoint, free_body, free_headers, protocol, retry_on_429=False
                 )
             except UpstreamError:
                 _log_free_model_usage(model_id, free_model, free_api_key,
                                       free_workspace, 502, ip=free_ip)
                 return None
     else:
-        # Direct mode: no proxy
         try:
             resp, resp_headers = await _do_request_with_retry(
-                API_BASE_FREE, free_body, free_headers, protocol, retry_on_429=False
+                free_endpoint, free_body, free_headers, protocol, retry_on_429=False
             )
         except UpstreamError:
             _log_free_model_usage(model_id, free_model, free_api_key,
@@ -2799,7 +2980,34 @@ async def _try_free_model_first(body, headers, protocol, model_id):
 
     elapsed_ms = int((time.monotonic() - t0) * 1000)
 
-    # Extract token usage from response
+    if _free_is_responses and resp.status_code == 200:
+        try:
+            rdata = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+            if protocol == "anthropic":
+                cdata = _responses_to_anthropic_response(rdata, free_model)
+                usage = cdata.get("usage", {})
+                tokens_in = usage.get("input_tokens", 0)
+                tokens_out = usage.get("output_tokens", 0)
+            else:
+                cdata = _responses_to_chat_response(rdata, free_model)
+                usage = cdata.get("usage", {})
+                tokens_in = usage.get("prompt_tokens", 0)
+                tokens_out = usage.get("completion_tokens", 0)
+            _log_free_model_usage(model_id, free_model, free_api_key, free_workspace, resp.status_code, tokens_in, tokens_out, elapsed_ms, ip=free_ip)
+            _debug(f"  [free] {free_model!r} succeeded ({tokens_in}+{tokens_out} tokens) via /responses")
+            wrapped = _CurlCffiResponse.__new__(_CurlCffiResponse)
+            wrapped._resp = resp._resp if hasattr(resp, "_resp") else resp
+            wrapped.status_code = 200
+            wrapped.headers = dict(resp.headers)
+            wrapped._converted = cdata
+            orig_json = wrapped._resp.json if hasattr(wrapped._resp, "json") else (lambda: cdata)
+            wrapped.json = lambda: cdata
+            wrapped.content = json.dumps(cdata, ensure_ascii=False).encode()
+            wrapped.text = json.dumps(cdata, ensure_ascii=False)
+            return wrapped, resp_headers, free_model, free_ip
+        except Exception as e:
+            _debug(f"  [free] /responses conversion failed: {e}")
+
     tokens_in = tokens_out = 0
     if resp.status_code == 200:
         try:
@@ -2810,9 +3018,6 @@ async def _try_free_model_first(body, headers, protocol, model_id):
         except Exception:
             pass
 
-    # Log the final response (non-final 429s were logged per-attempt inside
-    # the multi-attempt loop; direct-mode and direct-fallback responses
-    # never passed through the loop).
     _log_free_model_usage(model_id, free_model, free_api_key,
                           free_workspace, resp.status_code,
                           tokens_in, tokens_out, elapsed_ms, ip=free_ip)
@@ -4341,6 +4546,113 @@ def openai_chat_to_responses(chat_resp: dict, model: str) -> dict:
     }
 
 
+def _chat_to_responses_request(chat: dict) -> dict:
+    inp = []
+    for m in chat.get("messages", []) or []:
+        role = m.get("role", "user")
+        content = m.get("content", "")
+        if isinstance(content, str):
+            if content:
+                inp.append({"role": role, "content": [{"type": "input_text", "text": content}]})
+        elif isinstance(content, list):
+            txt = "\n".join(b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text")
+            if txt:
+                inp.append({"role": role, "content": [{"type": "input_text", "text": txt}]})
+        for tc in m.get("tool_calls", []) or []:
+            fn = tc.get("function", {}) if isinstance(tc.get("function"), dict) else {}
+            inp.append({"type": "function_call", "id": tc.get("id", ""), "name": fn.get("name", ""), "arguments": fn.get("arguments", "{}")})
+        if role == "tool":
+            inp.append({"type": "function_call_output", "call_id": m.get("tool_call_id", ""), "output": content if isinstance(content, str) else str(content)})
+    req = {"model": chat.get("model", ""), "input": inp, "stream": bool(chat.get("stream", False))}
+    if "max_tokens" in chat:
+        req["max_output_tokens"] = chat["max_tokens"]
+    if "max_output_tokens" in chat:
+        req["max_output_tokens"] = chat["max_output_tokens"]
+    for k in ("temperature", "top_p"):
+        if k in chat:
+            req[k] = chat[k]
+    if "tools" in chat:
+        tools = []
+        for t in chat["tools"]:
+            if isinstance(t, dict) and "function" in t:
+                fn = t["function"]
+                tools.append({"type": "function", "name": fn.get("name", ""), "description": fn.get("description", ""), "parameters": fn.get("parameters", {})})
+        if tools:
+            req["tools"] = tools
+        tc = chat.get("tool_choice")
+        if tc is not None:
+            if isinstance(tc, dict) and tc.get("type") == "function":
+                req["tool_choice"] = {"type": "function", "name": tc["function"].get("name", "")}
+            else:
+                req["tool_choice"] = tc
+    return req
+
+
+def _anthropic_to_responses_request(anthro: dict) -> dict:
+    chat = anthropic_to_openai(anthro, anthro.get("model", ""))
+    return _chat_to_responses_request(chat)
+
+
+def _responses_to_chat_response(resp: dict, model: str) -> dict:
+    out = resp.get("output", []) or []
+    texts = []
+    reasoning = ""
+    tool_calls = []
+    for item in out:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") == "message" and item.get("role") == "assistant":
+            for blk in item.get("content", []) or []:
+                if isinstance(blk, dict) and blk.get("type") == "output_text":
+                    texts.append(blk.get("text", ""))
+        elif item.get("type") == "reasoning":
+            for s in item.get("summary", []) or []:
+                if isinstance(s, dict):
+                    reasoning += s.get("text", "")
+        elif item.get("type") == "function_call":
+            tool_calls.append({"id": item.get("id", ""), "type": "function", "function": {"name": item.get("name", ""), "arguments": item.get("arguments", "{}")}})
+    msg = {"role": "assistant", "content": "\n".join(texts)}
+    if reasoning:
+        msg["reasoning_content"] = reasoning
+    if tool_calls:
+        msg["tool_calls"] = tool_calls
+    usage = resp.get("usage", {}) if isinstance(resp.get("usage"), dict) else {}
+    chat_usage = {"prompt_tokens": usage.get("input_tokens", 0), "completion_tokens": usage.get("output_tokens", 0), "total_tokens": usage.get("total_tokens", usage.get("input_tokens", 0) + usage.get("output_tokens", 0))}
+    status = resp.get("status", "completed")
+    finish = "stop" if status == "completed" else "length"
+    return {"id": resp.get("id", f"chatcmpl-{uuid.uuid4().hex[:8]}"), "object": "chat.completion", "created": int(time.time()), "model": model, "choices": [{"index": 0, "message": msg, "finish_reason": finish}], "usage": chat_usage}
+
+
+def _responses_to_anthropic_response(resp: dict, model: str) -> dict:
+    blocks = []
+    for item in resp.get("output", []) or []:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") == "reasoning":
+            for s in item.get("summary", []) or []:
+                if isinstance(s, dict) and s.get("text"):
+                    blocks.append({"type": "thinking", "thinking": s.get("text", "")})
+        elif item.get("type") == "message":
+            for blk in item.get("content", []) or []:
+                if isinstance(blk, dict) and blk.get("type") == "output_text" and blk.get("text"):
+                    blocks.append({"type": "text", "text": blk.get("text", "")})
+        elif item.get("type") == "function_call":
+            try:
+                inp = json.loads(item.get("arguments", "{}"))
+            except Exception:
+                inp = {}
+            blocks.append({"type": "tool_use", "id": item.get("id", ""), "name": item.get("name", ""), "input": inp})
+    if not blocks:
+        blocks.append({"type": "text", "text": ""})
+    usage = resp.get("usage", {}) if isinstance(resp.get("usage"), dict) else {}
+    status = resp.get("status", "completed")
+    stop = "end_turn" if status == "completed" else "max_tokens"
+    has_tools = any(b.get("type") == "tool_use" for b in blocks)
+    if has_tools:
+        stop = "tool_use"
+    return {"id": f"msg_{uuid.uuid4().hex[:24]}", "type": "message", "role": "assistant", "content": blocks, "model": model, "stop_reason": stop, "stop_sequence": None, "usage": {"input_tokens": usage.get("input_tokens", 0), "output_tokens": usage.get("output_tokens", 0), "cache_read_input_tokens": usage.get("output_tokens_details", {}).get("cached_tokens", 0) if isinstance(usage.get("output_tokens_details"), dict) else 0}}
+
+
 # ── Thinking models token guard ────────────────────────────
 _thinking_cfg = yaml_get("thinking", "min_tokens", {})
 THINKING_MODELS = {k: int(v) for k, v in _thinking_cfg.items()} if isinstance(_thinking_cfg, dict) else {
@@ -4541,150 +4853,9 @@ async def messages(request: Request):
 
     _log(f"→ {original_model!r} → {model_id} | {protocol} | stream={body.get('stream', False)} | thinking={thinking_type} | effort={effort} | ip={client_ip}")
 
-    # ── Geo gate (P2 strict/prefer/warn orthogonal, single pin before free path) ─
-    _geo_info = None
-    _geo_passthrough = request.headers.get("X-Geo-Passthrough", "") == "1"
-    try:
-        _geo_info = _cfg_settings.resolve_geo(route)
-    except Exception:
-        _geo_info = {"effective_allowed": set(), "mode": "strict", "require_vpn": False, "geo_status": "ok"}
-    _geo_has = isinstance(route, dict) and isinstance(route.get("geo"), dict)
-    _geo_enabled = bool(getattr(_cfg_settings, "GEO_ENABLED", False))
-    if _geo_has and _geo_enabled:
-        _geo_mode = str(_geo_info.get("mode", "strict"))
-        _geo_status = str(_geo_info.get("geo_status", "ok"))
-        _geo_require = bool(_geo_info.get("require_vpn", False))
-        _geo_effective = _geo_info.get("effective_allowed", set())
-        # misconfigured strict → 403 sans pin (R2)
-        if _geo_status == "misconfigured":
-            _geo_block_total += 1
-            _debug(f"  [geo] misconfigured strict block route={original_model!r}")
-            is_stream_geo = body.get("stream", False)
-            if is_stream_geo:
-                async def _geo_err_stream():
-                    yield _geo_sse_error(route, None)
-                return StreamingResponse(_geo_err_stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Geo-Blocked": "1", "X-Geo-Status": "misconfigured"})
-            return _geo_block_response(route, None, protocol, passthrough_451=_geo_passthrough)
-        # require_vpn orthogonal: même warn/prefer bloquent si pas de VPN (L3-4)
-        _vpn_on = bool(getattr(_cfg_settings.IP_ROTATION, "get", lambda *a, **k: None)("enabled", False)) if isinstance(getattr(_cfg_settings, "IP_ROTATION", None), dict) else False
-        # also check live managers
-        try:
-            import shared_state as _ss_geo
-            _vpn_on = _vpn_on and bool(getattr(_ss_geo, "vpn_managers", None))
-        except Exception:
-            pass
-        if _geo_require and not _vpn_on:
-            _geo_block_total += 1
-            _debug(f"  [geo] require_vpn violated (vpn off) mode={_geo_mode}")
-            is_stream_geo2 = body.get("stream", False)
-            if is_stream_geo2:
-                async def _geo_req_stream():
-                    yield _geo_sse_error(route, None)
-                return StreamingResponse(_geo_req_stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Geo-Blocked": "1", "X-Geo-Status": _geo_status})
-            return _geo_block_response(route, None, protocol, passthrough_451=_geo_passthrough)
-        # strict without VPN and no require_vpn → still 403 (no pin possible)
-        if _geo_mode == "strict" and not _vpn_on and not _geo_require:
-            # misconfigured already handled; this is strict+no egress → 403
-            if _geo_effective is not None and isinstance(_geo_effective, set) and len(_geo_effective) > 0:
-                _geo_block_total += 1
-                _debug(f"  [geo] strict no-vpn block (no egress to pin)")
-                is_stream_geo3 = body.get("stream", False)
-                if is_stream_geo3:
-                    async def _geo_novpn_stream():
-                        yield _geo_sse_error(route, None)
-                    return StreamingResponse(_geo_novpn_stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Geo-Blocked": "1"})
-                return _geo_block_response(route, None, protocol, passthrough_451=_geo_passthrough)
-        # ── Active geo pin (P2/P3) ──
-        # strict: must pin to allowed, else 403. prefer: try pin, else forward with X-Geo-Pinned:false.
-        # warn: forward + header (unless require_vpn already handled).
-        _geo_current = None
-        try:
-            import shared_state as _ss_geo2
-            for _m in getattr(_ss_geo2, "vpn_managers", None) or []:
-                if _m and getattr(_m, "_current_country", None):
-                    _geo_current = _m._current_country
-                    break
-        except Exception:
-            pass
-        if _geo_has and _geo_enabled and _vpn_on and _geo_effective and isinstance(_geo_effective, set) and len(_geo_effective) > 0:
-            if _geo_current and _geo_current in _geo_effective:
-                # already in allowed → no-op, record header via _geo_headers later
-                pass
-            else:
-                # need pin — budget ≤ min(8s, ip_probe_budget)
-                try:
-                    _probe_budget = float(_cfg_settings.IP_ROTATION.get("ip_probe_budget", 8.0) or 8.0) if isinstance(getattr(_cfg_settings, "IP_ROTATION", None), dict) else 8.0
-                except Exception:
-                    _probe_budget = 8.0
-                _geo_budget = min(8.0, _probe_budget)
-                _geo_ok = False
-                # coalescing key + queue guard (P3)
-                _geo_key = frozenset(_geo_effective)
-                # breaker check: skip countries in OPEN breaker
-                _geo_candidates = set(_geo_effective)
-                try:
-                    _geo_candidates = {c for c in _geo_candidates if _geo_breaker.get((c, 0), 0) < _geo_breaker_threshold}
-                except Exception:
-                    pass
-                if not _geo_candidates:
-                    _geo_candidates = set(_geo_effective)
-                # bounded pin via ensure_geo_egress on active manager
-                try:
-                    import shared_state as _ss_pin
-                    _pin_mgr = None
-                    for _m in getattr(_ss_pin, "vpn_managers", None) or []:
-                        if _m and hasattr(_m, "ensure_geo_egress"):
-                            _pin_mgr = _m
-                            break
-                    if _pin_mgr is not None:
-                        _t0 = time.monotonic()
-                        _geo_ok = await asyncio.wait_for(_pin_mgr.ensure_geo_egress(_geo_candidates, timeout=_geo_budget), timeout=_geo_budget + 1.0)
-                        _elapsed_ms = int((time.monotonic() - _t0) * 1000)
-                        _geo_pin_duration.append(_elapsed_ms)
-                        if len(_geo_pin_duration) > _geo_pin_duration_max:
-                            _geo_pin_duration.pop(0)
-                        if _geo_ok:
-                            _geo_current = next(iter(_geo_candidates)) if len(_geo_candidates) == 1 else _geo_current
-                            _geo_pinned_country = _geo_current
-                            # reset breaker on success
-                            for c in _geo_candidates:
-                                _geo_breaker.pop((c, 0), None)
-                        else:
-                            for c in _geo_candidates:
-                                _geo_breaker[(c, 0)] = _geo_breaker.get((c, 0), 0) + 1
-                    else:
-                        _debug(f"  [geo] no manager with ensure_geo_egress — skip pin")
-                except asyncio.TimeoutError:
-                    _debug(f"  [geo] pin timeout budget={_geo_budget}s")
-                    for c in _geo_candidates:
-                        _geo_breaker[(c, 0)] = _geo_breaker.get((c, 0), 0) + 1
-                except Exception as e:
-                    _debug(f"  [geo] pin failed: {type(e).__name__}: {e}")
-                    for c in _geo_candidates:
-                        _geo_breaker[(c, 0)] = _geo_breaker.get((c, 0), 0) + 1
-                # mode handling
-                if _geo_mode == "strict" and not _geo_ok:
-                    _geo_block_total += 1
-                    _debug(f"  [geo] strict pin failed → 403")
-                    is_stream_geo4 = body.get("stream", False)
-                    if is_stream_geo4:
-                        async def _geo_pin_fail_stream():
-                            yield _geo_sse_error(route, _geo_current)
-                        return StreamingResponse(_geo_pin_fail_stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Geo-Blocked": "1", "X-Geo-Mode": "strict", "X-Geo-Pinned": "false", "Retry-After": "0"})
-                    return _geo_block_response(route, _geo_current, protocol, passthrough_451=_geo_passthrough)
-                elif _geo_mode == "prefer" and not _geo_ok:
-                    _debug(f"  [geo] prefer pin failed → forward with best_effort")
-                    # inject header for downstream (prefer fall-through)
-                    request.state._geo_fallback = True  # type: ignore
-                elif _geo_mode == "warn":
-                    request.state._geo_fallback = False  # type: ignore
-                # stash for response headers
-                request.state._geo_pinned = bool(_geo_ok)  # type: ignore
-                request.state._geo_current = _geo_current  # type: ignore
-                request.state._geo_mode = _geo_mode  # type: ignore
-                # forced_pool for free path (R3 single pin)
-                _geo_forced_pool = set(_geo_effective) if _geo_ok else None
-                request.state._geo_forced_pool = _geo_forced_pool  # type: ignore
+    _geo_gate = await _enforce_geo_gate(route, request, is_stream=bool(body.get("stream", False)), protocol=protocol)
+    if _geo_gate is not None:
+        return _geo_gate
 
     # Circuit breaker check
     if not _cb_should_allow(endpoint):
@@ -4698,7 +4869,7 @@ async def messages(request: Request):
         # ── Free model: try BEFORE auth (free models don't need API keys) ──
         if not is_stream and FREE_MODEL_MAP.get(model_id):
             try:
-                free_result = await _try_free_model_first(body, {}, "anthropic", model_id)
+                free_result = await _try_free_model_first(body, {}, "anthropic", model_id, forced_pool=getattr(request.state, "_geo_forced_pool", None))
                 if free_result is not None:
                     resp, _, _actual_model, _actual_ip = free_result
                     data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
@@ -4749,7 +4920,7 @@ async def messages(request: Request):
 
             # Try free model first if available
             try:
-                free_result = await _try_free_model_first(body, a_headers, "anthropic", model_id)
+                free_result = await _try_free_model_first(body, a_headers, "anthropic", model_id, forced_pool=getattr(request.state, "_geo_forced_pool", None))
                 if free_result is not None:
                     resp, a_headers, _actual_model, _actual_ip = free_result
                     model_id = _actual_model  # Log as free model
@@ -4842,18 +5013,21 @@ async def messages(request: Request):
             _track_model = model_id
             # Try free model for streaming: swap endpoint/model before starting stream
             free_model = FREE_MODEL_MAP.get(model_id)
-            if free_model:
+            if free_model and not (_free_ip_pool is not None and not _free_ip_pool.enabled):
                 _debug(f"  [stream] attempting free model {free_model!r} first")
-                # Save paid config in case we need to fall back
                 paid_endpoint = endpoint
                 paid_body = dict(body)
                 paid_body["model"] = model_id
-                # Swap to free
                 body = dict(body)
                 body["model"] = free_model
-                endpoint = API_BASE_FREE
+                endpoint = _cfg_settings._free_endpoint_for(free_model)
+                if API_BASE_FREE != _cfg_settings.API_BASE_FREE:
+                    if "/responses" in endpoint:
+                        endpoint = API_BASE_FREE.replace("/chat/completions", "/responses").replace("/v1/chat/completions", "/v1/responses") if "/chat/completions" in API_BASE_FREE else endpoint
+                    else:
+                        endpoint = API_BASE_FREE
                 _using_free = True
-                _track_model = free_model  # Log as free model
+                _track_model = free_model
             else:
                 _using_free = False
             # Defer token estimation to first chunk — reduces pre-response latency
@@ -4881,7 +5055,8 @@ async def messages(request: Request):
                                                  count_request=(_attempt == 0),
                                                  fresh_station=(_attempt > 0 and _using_free),
                                                  direct_fallback=(_free_exception_fallback_mode() != "station-first"
-                                                                  or _attempt + 1 >= _free_max_attempts())) as resp:
+                                                                  or _attempt + 1 >= _free_max_attempts()),
+                                                  forced_pool=getattr(request.state, "_geo_forced_pool", None)) as resp:
                         _debug(f"  [stream] connected status={resp.status_code}")
                         if resp.status_code != 200:
                             if _using_free:
@@ -5143,7 +5318,7 @@ async def messages(request: Request):
         # If a free model exists, try it before giving up
         if FREE_MODEL_MAP.get(model_id):
             try:
-                free_result = await _try_free_model_first(oai_body, {}, "openai", model_id)
+                free_result = await _try_free_model_first(oai_body, {}, "openai", model_id, forced_pool=getattr(request.state, "_geo_forced_pool", None))
                 if free_result is not None:
                     resp, _, _actual_model, _actual_ip = free_result
                     data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
@@ -5174,7 +5349,7 @@ async def messages(request: Request):
     if not is_stream:
         # Try free model first if available
         try:
-            free_result = await _try_free_model_first(oai_body, headers, "openai", model_id)
+            free_result = await _try_free_model_first(oai_body, headers, "openai", model_id, forced_pool=getattr(request.state, "_geo_forced_pool", None))
             if free_result is not None:
                 resp, headers, _actual_model, _actual_ip = free_result
                 model_id = _actual_model
@@ -5260,14 +5435,14 @@ async def messages(request: Request):
         # Try free model for streaming
         _paid_model_id = _req_model_id  # Save original for fallback
         free_model = FREE_MODEL_MAP.get(_req_model_id)
-        if free_model:
+        if free_model and not (_free_ip_pool is not None and not _free_ip_pool.enabled):
             _debug(f"  [stream-oai] attempting free model {free_model!r} first")
             paid_endpoint = endpoint
             paid_oai_body = dict(oai_body)
             oai_body = dict(oai_body)
             oai_body["model"] = free_model
-            endpoint = API_BASE_FREE
-            _req_model_id = free_model  # Log as free model
+            endpoint = _cfg_settings._free_endpoint_for(free_model)
+            _req_model_id = free_model
             _using_free = True
         else:
             _using_free = False
@@ -5297,7 +5472,8 @@ async def messages(request: Request):
                                              count_request=(_attempt == 0),
                                              fresh_station=(_attempt > 0 and _using_free),
                                              direct_fallback=(_free_exception_fallback_mode() != "station-first"
-                                                              or _attempt + 1 >= _free_max_attempts())) as resp:
+                                                              or _attempt + 1 >= _free_max_attempts()),
+                                                  forced_pool=getattr(request.state, "_geo_forced_pool", None)) as resp:
                     if resp.status_code != 200:
                         if _using_free:
                             # Free endpoint non-200 (429 quota, 5xx...) → cooldown
@@ -5827,108 +6003,9 @@ async def chat_completions(request: Request):
 
     _log(f"→ {original_model!r} → {model_id} | {protocol} | chat/completions | stream={is_stream} | thinking={thinking_type} | effort={effort} | ip={client_ip}")
 
-    # ── Geo gate (mirror messages gate) ──
-    _geo_info = None
-    _geo_passthrough = request.headers.get("X-Geo-Passthrough", "") == "1"
-    try:
-        _geo_info = _cfg_settings.resolve_geo(route)
-    except Exception:
-        _geo_info = {"effective_allowed": set(), "mode": "strict", "require_vpn": False, "geo_status": "ok"}
-    _geo_has = isinstance(route, dict) and isinstance(route.get("geo"), dict)
-    _geo_enabled = bool(getattr(_cfg_settings, "GEO_ENABLED", False))
-    if _geo_has and _geo_enabled:
-        _geo_mode = str(_geo_info.get("mode", "strict"))
-        _geo_status = str(_geo_info.get("geo_status", "ok"))
-        _geo_require = bool(_geo_info.get("require_vpn", False))
-        _geo_effective = _geo_info.get("effective_allowed", set())
-        if _geo_status == "misconfigured":
-            if is_stream:
-                async def _geo_err_stream2():
-                    yield _geo_sse_error(route, None)
-                return StreamingResponse(_geo_err_stream2(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Geo-Blocked": "1", "X-Geo-Status": "misconfigured"})
-            return _geo_block_response(route, None, "openai", passthrough_451=_geo_passthrough)
-        _vpn_on2 = bool(getattr(_cfg_settings.IP_ROTATION, "get", lambda *a, **k: None)("enabled", False)) if isinstance(getattr(_cfg_settings, "IP_ROTATION", None), dict) else False
-        try:
-            import shared_state as _ss_geo
-            _vpn_on2 = _vpn_on2 and bool(getattr(_ss_geo, "vpn_managers", None))
-        except Exception:
-            pass
-        if _geo_require and not _vpn_on2:
-            if is_stream:
-                async def _geo_req_stream2():
-                    yield _geo_sse_error(route, None)
-                return StreamingResponse(_geo_req_stream2(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Geo-Blocked": "1"})
-            return _geo_block_response(route, None, "openai", passthrough_451=_geo_passthrough)
-        if _geo_mode == "strict" and not _vpn_on2 and not _geo_require:
-            if _geo_effective is not None and isinstance(_geo_effective, set) and len(_geo_effective) > 0:
-                if is_stream:
-                    async def _geo_novpn_stream2():
-                        yield _geo_sse_error(route, None)
-                    return StreamingResponse(_geo_novpn_stream2(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Geo-Blocked": "1"})
-                return _geo_block_response(route, None, "openai", passthrough_451=_geo_passthrough)
-        # active pin (strict must pin, prefer fall-through, warn header only)
-        _geo_current2 = None
-        try:
-            import shared_state as _ss_geo2
-            for _m in getattr(_ss_geo2, "vpn_managers", None) or []:
-                if _m and getattr(_m, "_current_country", None):
-                    _geo_current2 = _m._current_country
-                    break
-        except Exception:
-            pass
-        if _geo_has and _geo_enabled and _vpn_on2 and _geo_effective and isinstance(_geo_effective, set) and len(_geo_effective) > 0:
-            if not (_geo_current2 and _geo_current2 in _geo_effective):
-                try:
-                    _probe_budget = float(_cfg_settings.IP_ROTATION.get("ip_probe_budget", 8.0) or 8.0) if isinstance(getattr(_cfg_settings, "IP_ROTATION", None), dict) else 8.0
-                except Exception:
-                    _probe_budget = 8.0
-                _geo_budget = min(8.0, _probe_budget)
-                _geo_ok = False
-                _geo_candidates = set(_geo_effective)
-                try:
-                    _geo_candidates = {c for c in _geo_candidates if _geo_breaker.get((c, 0), 0) < _geo_breaker_threshold}
-                except Exception:
-                    pass
-                if not _geo_candidates:
-                    _geo_candidates = set(_geo_effective)
-                try:
-                    import shared_state as _ss_pin
-                    _pin_mgr = None
-                    for _m in getattr(_ss_pin, "vpn_managers", None) or []:
-                        if _m and hasattr(_m, "ensure_geo_egress"):
-                            _pin_mgr = _m
-                            break
-                    if _pin_mgr is not None:
-                        _t0 = time.monotonic()
-                        _geo_ok = await asyncio.wait_for(_pin_mgr.ensure_geo_egress(_geo_candidates, timeout=_geo_budget), timeout=_geo_budget + 1.0)
-                        _elapsed_ms = int((time.monotonic() - _t0) * 1000)
-                        _geo_pin_duration.append(_elapsed_ms)
-                        if len(_geo_pin_duration) > _geo_pin_duration_max:
-                            _geo_pin_duration.pop(0)
-                        if _geo_ok:
-                            _geo_current2 = next(iter(_geo_candidates)) if len(_geo_candidates) == 1 else _geo_current2
-                            for c in _geo_candidates:
-                                _geo_breaker.pop((c, 0), None)
-                        else:
-                            for c in _geo_candidates:
-                                _geo_breaker[(c, 0)] = _geo_breaker.get((c, 0), 0) + 1
-                except asyncio.TimeoutError:
-                    for c in _geo_candidates:
-                        _geo_breaker[(c, 0)] = _geo_breaker.get((c, 0), 0) + 1
-                except Exception:
-                    for c in _geo_candidates:
-                        _geo_breaker[(c, 0)] = _geo_breaker.get((c, 0), 0) + 1
-                if _geo_mode == "strict" and not _geo_ok:
-                    if is_stream:
-                        async def _geo_pin_fail_stream2():
-                            yield _geo_sse_error(route, _geo_current2)
-                        return StreamingResponse(_geo_pin_fail_stream2(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Geo-Blocked": "1", "Retry-After": "0"})
-                    return _geo_block_response(route, _geo_current2, "openai", passthrough_451=_geo_passthrough)
-                elif _geo_mode == "prefer" and not _geo_ok:
-                    request.state._geo_fallback = True  # type: ignore
-                request.state._geo_pinned = bool(_geo_ok)  # type: ignore
-                request.state._geo_current = _geo_current2  # type: ignore
-                request.state._geo_mode = _geo_mode  # type: ignore
+    _geo_gate = await _enforce_geo_gate(route, request, is_stream=bool(is_stream), protocol="openai")
+    if _geo_gate is not None:
+        return _geo_gate
 
     # Circuit breaker check
     if not _cb_should_allow(endpoint):
@@ -5949,7 +6026,7 @@ async def chat_completions(request: Request):
                 else:
                     # Non-streaming: try free model
                     try:
-                        free_result = await _try_free_model_first(body, {}, "openai", model_id)
+                        free_result = await _try_free_model_first(body, {}, "openai", model_id, forced_pool=getattr(request.state, "_geo_forced_pool", None))
                         if free_result is not None:
                             resp, _, _actual_model, _actual_ip = free_result
                             data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
@@ -5986,7 +6063,7 @@ async def chat_completions(request: Request):
                                 media_type="application/json")
             # Try free model first if available
             try:
-                free_result = await _try_free_model_first(body, headers, "openai", model_id)
+                free_result = await _try_free_model_first(body, headers, "openai", model_id, forced_pool=getattr(request.state, "_geo_forced_pool", None))
                 if free_result is not None:
                     resp, headers, _actual_model, _actual_ip = free_result
                     model_id = _actual_model
@@ -6056,17 +6133,15 @@ async def chat_completions(request: Request):
             _track_model = model_id
             # Try free model for streaming: swap endpoint/model before starting stream
             free_model = FREE_MODEL_MAP.get(model_id)
-            if free_model:
+            if free_model and not (_free_ip_pool is not None and not _free_ip_pool.enabled):
                 _debug(f"  [chat-stream] attempting free model {free_model!r} first")
-                # Save paid config
                 paid_endpoint = endpoint
                 paid_oai_body = dict(oai_body)
-                # Swap to free
                 oai_body = dict(oai_body)
                 oai_body["model"] = free_model
-                endpoint = API_BASE_FREE
+                endpoint = _cfg_settings._free_endpoint_for(free_model)
                 _using_free = True
-                _track_model = free_model  # Log as free model
+                _track_model = free_model
             else:
                 _using_free = False
             est_input = await asyncio.to_thread(_estimate_input_tokens, body)
@@ -6089,7 +6164,8 @@ async def chat_completions(request: Request):
                                              count_request=(_attempt == 0),
                                              fresh_station=(_attempt > 0 and _using_free),
                                              direct_fallback=(_free_exception_fallback_mode() != "station-first"
-                                                              or _attempt + 1 >= _free_max_attempts())) as resp:
+                                                              or _attempt + 1 >= _free_max_attempts()),
+                                                  forced_pool=getattr(request.state, "_geo_forced_pool", None)) as resp:
                         if resp.status_code != 200:
                             if _using_free:
                                 # Free endpoint non-200 (429 quota, 5xx...) → cooldown
@@ -6313,7 +6389,7 @@ async def chat_completions(request: Request):
             else:
                 # Non-streaming: try free model
                 try:
-                    free_result = await _try_free_model_first(anthro_body, {}, "anthropic", model_id)
+                    free_result = await _try_free_model_first(anthro_body, {}, "anthropic", model_id, forced_pool=getattr(request.state, "_geo_forced_pool", None))
                     if free_result is not None:
                         resp, _, _actual_model, _actual_ip = free_result
                         data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
@@ -6343,7 +6419,7 @@ async def chat_completions(request: Request):
     if not is_stream:
         # Try free model first if available
         try:
-            free_result = await _try_free_model_first(anthro_body, a_headers, "anthropic", model_id)
+            free_result = await _try_free_model_first(anthro_body, a_headers, "anthropic", model_id, forced_pool=getattr(request.state, "_geo_forced_pool", None))
             if free_result is not None:
                 resp, a_headers, _actual_model, _actual_ip = free_result
                 model_id = _actual_model
@@ -6397,14 +6473,14 @@ async def chat_completions(request: Request):
         nonlocal endpoint, model_id
         # Try free model for streaming: swap endpoint/model before starting stream
         free_model = FREE_MODEL_MAP.get(model_id)
-        if free_model:
+        if free_model and not (_free_ip_pool is not None and not _free_ip_pool.enabled):
             _debug(f"  [anthro-to-oai-stream] attempting free model {free_model!r} first")
             paid_endpoint = endpoint
             paid_anthro_body = dict(anthro_body)
             paid_anthro_body["model"] = model_id
             anthro_body = dict(anthro_body)
             anthro_body["model"] = free_model
-            endpoint = API_BASE_FREE
+            endpoint = _cfg_settings._free_endpoint_for(free_model)
             _using_free = True
             _track_model = free_model
         else:
@@ -6445,7 +6521,8 @@ async def chat_completions(request: Request):
                                              count_request=(_attempt == 0),
                                              fresh_station=(_attempt > 0 and _using_free),
                                              direct_fallback=(_free_exception_fallback_mode() != "station-first"
-                                                              or _attempt + 1 >= _free_max_attempts())) as resp:
+                                                              or _attempt + 1 >= _free_max_attempts()),
+                                                  forced_pool=getattr(request.state, "_geo_forced_pool", None)) as resp:
                     if resp.status_code != 200:
                         if _using_free:
                             # Free endpoint non-200 (429 quota, 5xx...) → cooldown
@@ -6760,106 +6837,9 @@ async def responses(request: Request):
 
     _log(f"→ {original_model!r} → {model_id} | {protocol} | responses | stream={is_stream} | ip={client_ip}")
 
-    # ── Geo gate (mirror) ──
-    _geo_info = None
-    _geo_passthrough = request.headers.get("X-Geo-Passthrough", "") == "1"
-    try:
-        _geo_info = _cfg_settings.resolve_geo(route)
-    except Exception:
-        _geo_info = {"effective_allowed": set(), "mode": "strict", "require_vpn": False, "geo_status": "ok"}
-    _geo_has = isinstance(route, dict) and isinstance(route.get("geo"), dict)
-    _geo_enabled = bool(getattr(_cfg_settings, "GEO_ENABLED", False))
-    if _geo_has and _geo_enabled:
-        _geo_mode = str(_geo_info.get("mode", "strict"))
-        _geo_status = str(_geo_info.get("geo_status", "ok"))
-        _geo_require = bool(_geo_info.get("require_vpn", False))
-        _geo_effective = _geo_info.get("effective_allowed", set())
-        if _geo_status == "misconfigured":
-            if is_stream:
-                async def _geo_err_stream3():
-                    yield _geo_sse_error(route, None)
-                return StreamingResponse(_geo_err_stream3(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Geo-Blocked": "1"})
-            return _geo_block_response(route, None, protocol, passthrough_451=_geo_passthrough)
-        _vpn_on3 = bool(getattr(_cfg_settings.IP_ROTATION, "get", lambda *a, **k: None)("enabled", False)) if isinstance(getattr(_cfg_settings, "IP_ROTATION", None), dict) else False
-        try:
-            import shared_state as _ss_geo
-            _vpn_on3 = _vpn_on3 and bool(getattr(_ss_geo, "vpn_managers", None))
-        except Exception:
-            pass
-        if _geo_require and not _vpn_on3:
-            if is_stream:
-                async def _geo_req_stream3():
-                    yield _geo_sse_error(route, None)
-                return StreamingResponse(_geo_req_stream3(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Geo-Blocked": "1"})
-            return _geo_block_response(route, None, protocol, passthrough_451=_geo_passthrough)
-        if _geo_mode == "strict" and not _vpn_on3 and not _geo_require:
-            if _geo_effective is not None and isinstance(_geo_effective, set) and len(_geo_effective) > 0:
-                if is_stream:
-                    async def _geo_novpn_stream3():
-                        yield _geo_sse_error(route, None)
-                    return StreamingResponse(_geo_novpn_stream3(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Geo-Blocked": "1"})
-                return _geo_block_response(route, None, protocol, passthrough_451=_geo_passthrough)
-        _geo_current3 = None
-        try:
-            import shared_state as _ss_geo2
-            for _m in getattr(_ss_geo2, "vpn_managers", None) or []:
-                if _m and getattr(_m, "_current_country", None):
-                    _geo_current3 = _m._current_country
-                    break
-        except Exception:
-            pass
-        if _geo_has and _geo_enabled and _vpn_on3 and _geo_effective and isinstance(_geo_effective, set) and len(_geo_effective) > 0:
-            if not (_geo_current3 and _geo_current3 in _geo_effective):
-                try:
-                    _probe_budget = float(_cfg_settings.IP_ROTATION.get("ip_probe_budget", 8.0) or 8.0) if isinstance(getattr(_cfg_settings, "IP_ROTATION", None), dict) else 8.0
-                except Exception:
-                    _probe_budget = 8.0
-                _geo_budget = min(8.0, _probe_budget)
-                _geo_ok = False
-                _geo_candidates = set(_geo_effective)
-                try:
-                    _geo_candidates = {c for c in _geo_candidates if _geo_breaker.get((c, 0), 0) < _geo_breaker_threshold}
-                except Exception:
-                    pass
-                if not _geo_candidates:
-                    _geo_candidates = set(_geo_effective)
-                try:
-                    import shared_state as _ss_pin
-                    _pin_mgr = None
-                    for _m in getattr(_ss_pin, "vpn_managers", None) or []:
-                        if _m and hasattr(_m, "ensure_geo_egress"):
-                            _pin_mgr = _m
-                            break
-                    if _pin_mgr is not None:
-                        _t0 = time.monotonic()
-                        _geo_ok = await asyncio.wait_for(_pin_mgr.ensure_geo_egress(_geo_candidates, timeout=_geo_budget), timeout=_geo_budget + 1.0)
-                        _elapsed_ms = int((time.monotonic() - _t0) * 1000)
-                        _geo_pin_duration.append(_elapsed_ms)
-                        if len(_geo_pin_duration) > _geo_pin_duration_max:
-                            _geo_pin_duration.pop(0)
-                        if _geo_ok:
-                            for c in _geo_candidates:
-                                _geo_breaker.pop((c, 0), None)
-                        else:
-                            for c in _geo_candidates:
-                                _geo_breaker[(c, 0)] = _geo_breaker.get((c, 0), 0) + 1
-                except asyncio.TimeoutError:
-                    for c in _geo_candidates:
-                        _geo_breaker[(c, 0)] = _geo_breaker.get((c, 0), 0) + 1
-                except Exception:
-                    for c in _geo_candidates:
-                        _geo_breaker[(c, 0)] = _geo_breaker.get((c, 0), 0) + 1
-                if _geo_mode == "strict" and not _geo_ok:
-                    if is_stream:
-                        async def _geo_pin_fail_stream3():
-                            yield _geo_sse_error(route, _geo_current3)
-                        return StreamingResponse(_geo_pin_fail_stream3(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Geo-Blocked": "1", "Retry-After": "0"})
-                    return _geo_block_response(route, _geo_current3, protocol, passthrough_451=_geo_passthrough)
-                elif _geo_mode == "prefer" and not _geo_ok:
-                    request.state._geo_fallback = True  # type: ignore
-                request.state._geo_pinned = bool(_geo_ok)  # type: ignore
-                request.state._geo_current = _geo_current3  # type: ignore
-                request.state._geo_mode = _geo_mode  # type: ignore
+    _geo_gate = await _enforce_geo_gate(route, request, is_stream=bool(is_stream), protocol=protocol)
+    if _geo_gate is not None:
+        return _geo_gate
 
     # Circuit breaker check
     if not _cb_should_allow(endpoint):
@@ -6906,7 +6886,7 @@ async def responses(request: Request):
                 else:
                     # Non-streaming: try free model
                     try:
-                        free_result = await _try_free_model_first(anthro_body, {}, "anthropic", model_id)
+                        free_result = await _try_free_model_first(anthro_body, {}, "anthropic", model_id, forced_pool=getattr(request.state, "_geo_forced_pool", None))
                         if free_result is not None:
                             resp, _, _actual_model, _actual_ip = free_result
                             data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
@@ -6938,7 +6918,7 @@ async def responses(request: Request):
         if not is_stream:
             # Try free model first if available
             try:
-                free_result = await _try_free_model_first(anthro_body, a_headers, "anthropic", model_id)
+                free_result = await _try_free_model_first(anthro_body, a_headers, "anthropic", model_id, forced_pool=getattr(request.state, "_geo_forced_pool", None))
                 if free_result is not None:
                     resp, a_headers, _actual_model, _actual_ip = free_result
                     model_id = _actual_model
@@ -7004,7 +6984,7 @@ async def responses(request: Request):
         anthro_body["stream"] = False
         # Try free model first if available
         try:
-            free_result = await _try_free_model_first(anthro_body, a_headers, "anthropic", model_id)
+            free_result = await _try_free_model_first(anthro_body, a_headers, "anthropic", model_id, forced_pool=getattr(request.state, "_geo_forced_pool", None))
             if free_result is not None:
                 resp, a_headers, _actual_model, _actual_ip = free_result
                 model_id = _actual_model
@@ -7060,7 +7040,7 @@ async def responses(request: Request):
         # If a free model exists, try it before giving up
         if FREE_MODEL_MAP.get(model_id):
             try:
-                free_result = await _try_free_model_first(oai_body, {}, "openai", model_id)
+                free_result = await _try_free_model_first(oai_body, {}, "openai", model_id, forced_pool=getattr(request.state, "_geo_forced_pool", None))
                 if free_result is not None:
                     resp, _, _actual_model, _actual_ip = free_result
                     data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
@@ -7094,7 +7074,7 @@ async def responses(request: Request):
     if not is_stream:
         # Try free model first if available
         try:
-            free_result = await _try_free_model_first(oai_body, headers, "openai", model_id)
+            free_result = await _try_free_model_first(oai_body, headers, "openai", model_id, forced_pool=getattr(request.state, "_geo_forced_pool", None))
             if free_result is not None:
                 resp, headers, _actual_model, _actual_ip = free_result
                 model_id = _actual_model
@@ -7145,7 +7125,7 @@ async def responses(request: Request):
     oai_body["stream"] = False
     # Try free model first if available
     try:
-        free_result = await _try_free_model_first(oai_body, headers, "openai", model_id)
+        free_result = await _try_free_model_first(oai_body, headers, "openai", model_id, forced_pool=getattr(request.state, "_geo_forced_pool", None))
         if free_result is not None:
             resp, headers, _actual_model, _actual_ip = free_result
             model_id = _actual_model
@@ -7330,7 +7310,7 @@ if __name__ == "__main__":
     import signal
     import traceback as _traceback
 
-    _acquire_instance_lock()
+    _acquire_instance_lock(f"logs/opencode-{PORT}.lock")
 
     # GUI by default (system tray + dashboard window); --no-gui forces terminal mode.
     # --gui is still accepted for backward compatibility (no-op since it's the default).

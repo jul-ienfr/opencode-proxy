@@ -423,7 +423,11 @@ MODELS = {}
 for _model_id, _model_data in _models_cfg.items():
     if isinstance(_model_data, dict):
         _proto = _model_data.get("protocol", "openai")
-        _endpoint = API_BASE_OPENAI if _proto == "openai" else API_BASE_ANTHROPIC
+        _lid = _model_id.lower()
+        if _lid.endswith("-free"):
+            _endpoint = API_BASE_FREE
+        else:
+            _endpoint = API_BASE_OPENAI if _proto == "openai" else API_BASE_ANTHROPIC
         MODELS[_model_id] = {"endpoint": _endpoint, "protocol": _proto}
 
 def _fetch_upstream_models():
@@ -640,11 +644,6 @@ def _fetch_free_models_sync(timeout: float = 10) -> tuple:
 
 
 def _free_endpoint_for(free_id: str) -> str:
-    """Endpoint per free_id (muse/spark → /responses, else free_base)."""
-    lower = free_id.lower()
-    if "muse" in lower or "spark" in lower:
-        # Responses API for contributor models
-        return "https://opencode.ai/zen/v1/responses"
     return API_BASE_FREE
 
 

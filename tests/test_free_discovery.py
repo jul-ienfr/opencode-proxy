@@ -240,7 +240,7 @@ class TestApplyPersist:
         yaml_data = {"server": {"host": "0.0.0.0", "port": 4000}, "models": {}, "free_model_map": {}}
         st, *old = _isolated_settings(tmp_path, monkeypatch, yaml_data)
         try:
-            assert st._free_endpoint_for("muse-spark-1.2-contributor-free") == "https://opencode.ai/zen/v1/responses"
+            assert st._free_endpoint_for("muse-spark-1.2-contributor-free") == st.API_BASE_FREE
             assert st._free_endpoint_for("mimo-v2.5-free") == st.API_BASE_FREE
         finally:
             _restore_settings(st, old)

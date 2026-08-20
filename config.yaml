@@ -83,6 +83,12 @@ models:
     protocol: openai
   muse-spark-1.2-contributor:
     protocol: openai
+    geo:
+      extends: meta-muse-spark
+  muse-spark-1.2-contributor-free:
+    protocol: openai
+    geo:
+      extends: meta-muse-spark
   deepseek-v4-flash-free:
     protocol: openai
   hy3-free:
@@ -91,11 +97,11 @@ models:
     protocol: openai
   mimo-v2.5-free:
     protocol: openai
-  muse-spark-1.2-contributor-free:
-    protocol: openai
   nemotron-3-ultra-free:
     protocol: openai
   nemotron-3.5-lightning-free:
+    protocol: openai
+  x-preview-f-free:
     protocol: openai
 free_model_map:
   glm-5.2: deepseek-v4-flash-free
@@ -125,8 +131,6 @@ ip_rotation:
   dual_station: true
   station_count: 3
   strict_free: false
-  max_free_attempts: 3
-  free_exception_fallback: station-first
   quota_per_ip: 15
   switch_delay: 1
   docker_container: opencode-vpn
@@ -196,6 +200,8 @@ ip_rotation:
   country_rotation: true
   country_offset: 14
   docker_events: true
+  max_free_attempts: 3
+  free_exception_fallback: station-first
 geo:
   enabled: true
   version: 1
@@ -217,31 +223,45 @@ custom_routes:
     - mimo-v2.5
     model: muse-spark-1.2-contributor
     thinking: adaptive
+    geo:
+      extends: meta-muse-spark
   mimov25pro:
     match:
     - mimo-v2.5-pro
     model: muse-spark-1.2-contributor
+    geo:
+      extends: meta-muse-spark
   qwen35plus:
     match:
     - qwen3.5-plus
     model: muse-spark-1.2-contributor
     thinking: adaptive
+    geo:
+      extends: meta-muse-spark
   gpt54mini:
     match:
     - gpt-5.4-mini
     model: muse-spark-1.2-contributor
+    geo:
+      extends: meta-muse-spark
   kimik26:
     match:
     - kimi-k2.6
     model: muse-spark-1.2-contributor
+    geo:
+      extends: meta-muse-spark
   gpt56luna:
     match:
     - gpt-5.6-luna
     model: muse-spark-1.2-contributor
+    geo:
+      extends: meta-muse-spark
   deepseekv4flash:
     match:
     - deepseek-v4-flash
     model: muse-spark-1.2-contributor
+    geo:
+      extends: meta-muse-spark
 api_keys: []
 tool_capabilities:
   _default:

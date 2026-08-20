@@ -127,7 +127,7 @@ class _FakeFreeCurl:
         self.bodies = []         # body per attempt (model swap check)
         self.headers = []        # headers per attempt (invariant A.0)
 
-    async def __call__(self, body, headers, proxy_url=None, station=None):
+    async def __call__(self, body, headers, proxy_url=None, station=None, endpoint=None, **kwargs):
         self.calls.append((proxy_url, station))
         self.bodies.append(body)
         self.headers.append(headers)
@@ -160,7 +160,7 @@ class _PoolMulti:
                 return st
         return None
 
-    def _best_station_excluding_many(self, excluded):
+    def _best_station_excluding_many(self, excluded, forced_pool=None):
         for exclude_approaching in (True, False):
             for st in self._stations:
                 if st in excluded:
