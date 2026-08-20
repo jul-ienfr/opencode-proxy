@@ -141,6 +141,75 @@ class TestComposeEnv:
         assert m._compose_env()["VPN_TYPE_STATION7"] == "openvpn"
 
 
+# ── custom .ovpn — gate OPENVPN_CUSTOM_CONFIG (Axe 3.1) ────────────
+
+class TestCustomOvpnEnv:
+    """[fix 20/08][Axe 3.1] The dashboard upload persists `custom_ovpn_file`
+    (compose-root-relative, `vpn_configs/custom/…`). `_compose_env` must
+    point OPENVPN_CUSTOM_CONFIG at its in-container mirror
+    `/vpn-custom/<basename>` — openvpn stack + file present ONLY: a stale
+    path must never leak into a WireGuard stanza, and an absent file is a
+    silent no-op (compose's ${VAR:-} interpolation stays inert), not an
+    error."""
+
+    def _ovpn_mgr(self, tmp_path, monkeypatch, *, stack="openvpn", rel=None,
+                  create_file=True):
+        cfg, _ = _cfg_with(tmp_path, vpn_stack=stack)
+        if rel is not None:
+            cfg["custom_ovpn_file"] = rel
+        m = _EnvRecFake(cfg, station=1, tmp_path=tmp_path)
+        _compose(tmp_path, monkeypatch)        # VPN_DOCKER_COMPOSE_FILE
+        if create_file and rel is not None:
+            p = tmp_path / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text("client\nremote 1.2.3.4 1194\n", encoding="utf-8")
+        return m
+
+    def test_openvpn_file_present_sets_var(self, tmp_path, monkeypatch):
+        m = self._ovpn_mgr(tmp_path, monkeypatch,
+                           rel="vpn_configs/custom/nl-01.ovpn")
+        env = m._compose_env()
+        assert env["OPENVPN_CUSTOM_CONFIG"] == "/vpn-custom/nl-01.ovpn", \
+            "in-container path = bind-mount mirror of the uploaded file"
+
+    def test_openvpn_without_custom_key_no_var(self, tmp_path, monkeypatch):
+        m = self._ovpn_mgr(tmp_path, monkeypatch, rel=None)
+        env = m._compose_env()
+        assert "OPENVPN_CUSTOM_CONFIG" not in env, \
+            "no custom configured → compose's ${VAR:-} interpolation is inert"
+
+    def test_openvpn_missing_file_no_var(self, tmp_path, monkeypatch):
+        """Upload persisted but the file vanished (manual cleanup / partial
+        deploy) — the gate must NOT fabricate a path the container can't
+        see (gluetun would fail on a missing /vpn-custom/… file)."""
+        m = self._ovpn_mgr(tmp_path, monkeypatch,
+                           rel="vpn_configs/custom/gone.ovpn",
+                           create_file=False)
+        env = m._compose_env()
+        assert "OPENVPN_CUSTOM_CONFIG" not in env
+
+    def test_wireguard_never_carries_custom(self, tmp_path, monkeypatch):
+        """Stale custom_ovpn_file + wireguard stack → no var (gluetun would
+        ignore the setting under WG anyway; the guard keeps the surface
+        honest — the 19/08 lesson: the env must never leak across stacks)."""
+        m = self._ovpn_mgr(tmp_path, monkeypatch, stack="wireguard",
+                           rel="vpn_configs/custom/nl-01.ovpn")
+        assert m._stack_effective == "wireguard"
+        env = m._compose_env()
+        assert "OPENVPN_CUSTOM_CONFIG" not in env
+
+    def test_os_separators_normalized(self, tmp_path, monkeypatch):
+        """The persisted rel may carry OS separators (dashboard uploads use
+        forward slashes, but hand-edited config.yaml may not) — the gate
+        normalizes before the existence check, so /vpn-custom/<basename>
+        stays stable on every host."""
+        m = self._ovpn_mgr(tmp_path, monkeypatch,
+                           rel=os.path.join("vpn_configs", "custom",
+                                            "nl-01.ovpn"))
+        env = m._compose_env()
+        assert env["OPENVPN_CUSTOM_CONFIG"] == "/vpn-custom/nl-01.ovpn"
+
+
 # ── call sites — env passe à travers le runner factice ─────────────
 
 class TestCallSitesPassEnv:

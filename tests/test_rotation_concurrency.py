@@ -133,27 +133,42 @@ def test_two_rotations_run_in_parallel():
 def test_rotation_concurrency_one_serializes():
     """Back-compat: rotation_concurrency = 1 must reproduce the old
     serialized behavior — the second rotation starts only after the first
-    finished."""
+    finished.
+
+    [fix 20/08][Axe 1.1] Non-vacuous redesign: the old in-fake assert fired
+    inside switch_ip, which _rotate_station's broad `except Exception`
+    swallows (free_ip_pool worker guard) — the test could never fail on a
+    serialization regression. Now the assertion is OBSERVABLE from outside:
+    station 1 blocks on a gate, and while it is blocked the second station
+    must NOT enter (with 2 workers — the regression this guards — station 2
+    would enter during the observation window and trip the assert)."""
     async def _go():
         s1, s2 = _Station(1), _Station(2)
         p = _pool(s1, s2)
         p._ROTATION_CONCURRENCY = 1
         order = []
-        first_done = asyncio.Event()
+        s1_entered = asyncio.Event()
+        s2_entered = asyncio.Event()
+        gate = asyncio.Event()
 
         async def serial_switch(station):
             order.append(station._station)
             if station._station == 1:
-                await asyncio.sleep(0.05)
-                first_done.set()
+                s1_entered.set()
+                await gate.wait()          # hold rotation 1 INSIDE switch_ip
             else:
-                assert first_done.is_set(), \
-                    "with 1 worker, station 2 must rotate AFTER station 1"
+                s2_entered.set()
 
         p.switch_ip = serial_switch
         p._launch_rotation(s1)
-        p._launch_rotation(s2)
-        await asyncio.sleep(0.15)
+        await asyncio.wait_for(s1_entered.wait(), 1.0)  # rotation 1 in flight
+        p._launch_rotation(s2)             # queued behind the single worker
+        await asyncio.sleep(0.1)           # observation window
+        assert not s2_entered.is_set(), \
+            "with 1 worker, station 2 must NOT enter while station 1 blocks"
+        gate.set()                         # release rotation 1
+        await asyncio.wait_for(s2_entered.wait(), 1.0)  # then 2 runs second
+        await asyncio.sleep(0.05)
         await _shutdown(p)
         assert order == [1, 2]
 

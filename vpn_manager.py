@@ -562,6 +562,15 @@ class VPNManager:
         # there — the rotation just lost the lottery).
         self._rotation_probe_dead = False
         self._auto_wg_egress_ticks = max(1, int(cfg.get("auto_wg_egress_ticks", 3)))
+        # [plan 20/08] Gluetun healthcheck-restart churn: a marginal WG
+        # tunnel makes gluetun's INTERNAL healthcheck restart the VPN every
+        # ~12 s — invisible to the SOCKS5 probe (it samples the live
+        # windows). _check_restart_churn counts the restart marker in the
+        # container logs over a sliding window; above the threshold the
+        # egress watchdog arms and the existing recovery chain plays
+        # (fresh country/IP → restart → flip).
+        self._restart_churn_threshold = max(1, int(cfg.get("restart_churn_threshold", 4)))
+        self._restart_churn_window_min = max(2, int(cfg.get("restart_churn_window_min", 10)))
         # Armed cadence: while failures are pending the watchdog probes every
         # _egress_failure_tick_interval seconds (light probe only — the docker
         # CLI refresh would blow past the cadence). ip_probe_budget bounds the
@@ -678,6 +687,15 @@ class VPNManager:
         self._connected_at: Optional[float] = None
         self._auth_failed = False
         self._server_issue = False  # TLS negotiation failure (stale/crashed server)
+        # [plan 20/08] Healthcheck-restart loop visible in the container
+        # logs (set by the refresh scan; self-resolves by window slide).
+        # _restart_churn_recovered_at is the wall-clock boundary of the last
+        # successful recovery: markers older than it are stale (docker logs
+        # span recoveries, and WG logs no per-attempt success marker to
+        # bound against) — the scan window snaps to after it so a healed
+        # tunnel is not re-flagged from its own pre-recovery history.
+        self._restart_churn = False
+        self._restart_churn_recovered_at: Optional[float] = None
         self._total_switches = 0
         self._ip_history: list[dict] = []
         self._lock = asyncio.Lock()
@@ -1390,6 +1408,17 @@ class VPNManager:
         self._auth_failed = False
         self._server_issue = False
 
+        # [plan 20/08] Gluetun healthcheck-restart churn: the SOCKS5 egress
+        # probe samples the LIVE windows of a marginal tunnel and stays
+        # silent while the internal healthcheck loops restarts (~12 s).
+        # The log scan sees the loop; arming the egress watchdog routes it
+        # into the existing recovery chain (fresh IP/country → restart →
+        # flip). Not an ERROR state: the tunnel may be answering right now.
+        churn = await self._check_restart_churn(self._restart_churn_window_min)
+        self._restart_churn = churn
+        if churn:
+            self.arm_egress_watchdog()
+
         # Control server first: 2 short docker-exec calls, self-reported
         # truth from gluetun itself — no egress needed, answers even when
         # the tunnel is half-dead. Country comes from OUR pinned state (the
@@ -1986,6 +2015,9 @@ class VPNManager:
                 "failures": self._watchdog_backoff.consecutive_failures,
                 "next_delay": self._watchdog_backoff.delay,
                 "server_issue": self._server_issue,
+                # [plan 20/08] healthcheck-restart churn flag: True while
+                # the refresh scan counts fresh restart markers.
+                "restart_churn": self._restart_churn,
                 # [plan 18/08 am.23] pool-signal observability — debug a
                 # parasitic fast-recover / missed wake straight from the API.
                 "egress_failures": self._egress_failures,
@@ -2094,6 +2126,20 @@ class VPNManager:
             stack = self._stack_effective or "openvpn"
         for s in (stations or [self._station]):
             env[f"VPN_TYPE_STATION{s}"] = stack
+        # [fix 20/08][Axe 3.1] Custom .ovpn (dashboard upload): compose's
+        # volume block bind-mounts vpn_configs/custom/ → /vpn-custom (ro)
+        # and stanzas interpolate ${OPENVPN_CUSTOM_CONFIG:-}. The uploaded
+        # path is persisted compose-ROOT-relative (upload endpoint) — resolve
+        # it next to the compose file and point the env at its in-container
+        # mirror. OpenVPN stack only: a stale custom path must never leak
+        # into a WireGuard stanza, and gluetun ignores it under WG anyway.
+        custom_ovpn = self._config.get("custom_ovpn_file")
+        if stack == "openvpn" and custom_ovpn:
+            cu_path = os.path.join(
+                os.path.dirname(self._compose_file_path()),
+                str(custom_ovpn).replace("/", os.sep))
+            if os.path.isfile(cu_path):
+                env["OPENVPN_CUSTOM_CONFIG"] = f"/vpn-custom/{os.path.basename(cu_path)}"
         return env
 
     async def _await_rotation_ops_drained(self) -> None:
@@ -2469,6 +2515,11 @@ class VPNManager:
                 self._watchdog_backoff.record_success()
                 self._set_status(VPNState.CONNECTED)
                 self._error = None
+                # [plan 20/08] Mark the recovery boundary BEFORE the internal
+                # refresh re-scans the churn window: docker logs span
+                # recoveries, so pre-recovery churn markers are stale — the
+                # scan snaps to after this instant.
+                self._restart_churn_recovered_at = time.time()
                 await self.refresh_status(force=True)
                 self.save_state()
                 logger.info("[vpn] fast-pin: recovered — tunnel healthy (IP %s)",
@@ -2848,6 +2899,44 @@ class VPNManager:
             return False
         return text.rfind("initialization sequence completed") < text.rfind("tls key negotiation failed")
 
+    async def _check_restart_churn(self, window_min: int = 10) -> bool:
+        """Scan container logs for a gluetun healthcheck-restart LOOP.
+
+        [plan 20/08] A marginal WG tunnel makes gluetun's internal healthcheck
+        (HEALTH_RESTART_VPN=on) restart the VPN every ~12 s — the
+        'restarting VPN because it failed to pass the healthcheck' marker —
+        while the SOCKS5 egress probe samples the live windows and sees
+        nothing. Unlike _check_auth_failed there is no per-attempt success
+        marker to bound to (gluetun logs 'wireguard setup is complete' on
+        EVERY attempt, even the ones killed 11 s later), so the bounding
+        event is OUR last successful recovery (_restart_churn_recovered_at):
+        the scan window snaps to after it, exactly like docker's own
+        filtering — markers written BEFORE it are stale, new ones re-arm.
+
+        Self-resolving: when the restarts stop, a scan sees no fresh markers
+        and the flag clears — no separate 'resolved' event needed.
+        """
+        if self._restart_churn_recovered_at is not None:
+            # Recovery boundary: only markers written after the last
+            # successful recovery count (docker logs span recoveries).
+            elapsed = max(1.0, time.time() - self._restart_churn_recovered_at)
+            since = f"{int(elapsed)}s"
+        else:
+            since = f"{max(2, int(window_min))}m"
+        result = await asyncio.to_thread(
+            self._docker_run, ["logs", "--since", since, self._docker_container], 30)
+        if result.returncode != 0:
+            return False
+        count = result.stdout.count(
+            "restarting VPN because it failed to pass the healthcheck")
+        if count >= self._restart_churn_threshold:
+            logger.warning(
+                "[vpn] healthcheck-restart churn: %d restarts in the last "
+                "%s (threshold %d) — arming egress watchdog",
+                count, since, self._restart_churn_threshold)
+            return True
+        return False
+
     async def _wait_healthy(self, timeout: float = 120.0) -> Optional[str]:
         """Wait until the container runs AND the SOCKS5 tunnel answers.
 
@@ -3015,6 +3104,11 @@ class VPNManager:
                     raise RuntimeError("could not finalize a fresh IP after update")
                 # force: container was just recreated — a cached status
                 # would report the pre-update container ([37]).
+                # The recreate IS a gluetun recovery: snap the churn scan
+                # window AFTER it, or pre-update restart markers would
+                # re-arm the egress watchdog for nothing (same anti
+                # stale-marker pattern as the watchdog recovery).
+                self._restart_churn_recovered_at = time.time()
                 await self.refresh_status(force=True)
                 self._update_available = False
                 self._update_applied_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -3046,6 +3140,9 @@ class VPNManager:
                 ["compose", "-f", compose_file, "up", "-d", "--pull", "never", self._compose_service],
                 120, env=self._compose_env())
             # force: container was just recreated — see _apply_update ([37]).
+            # Same churn-scan snap as _apply_update (the recreate is a
+            # recovery; pre-rollback markers must not re-arm the watchdog).
+            self._restart_churn_recovered_at = time.time()
             await self.refresh_status(force=True)
             logger.warning("[vpn-update] rolled back to previous image %s", old_image_id[:19])
         except Exception as e:
@@ -3129,6 +3226,10 @@ class VPNManager:
         self._watchdog_backoff.record_success()
         self._set_status(VPNState.CONNECTED)
         self._error = None
+        # [plan 20/08] Recovery boundary: pre-recovery churn markers are
+        # stale (docker logs span recoveries) — set BEFORE the internal
+        # refresh so its churn scan snaps to after this instant.
+        self._restart_churn_recovered_at = time.time()
         await self.refresh_status(force=True)
         self.save_state()
         logger.info("[vpn-watchdog] recovered — tunnel healthy (IP %s)",
@@ -3250,7 +3351,12 @@ class VPNManager:
             # fresh counters, applied AFTER it (_apply_stack takes the lock;
             # asyncio.Lock is not reentrant, calling it here would deadlock).
             self._pending_flip = self._auto_flip_decision()
-            if not (self._auth_failed or self._server_issue) and not egress_dead:
+            # [plan 20/08] _restart_churn: the healthcheck-restart LOOP is a
+            # failing tunnel even while the SOCKS5 probe happens to land in a
+            # live window — the flag alone routes the tick into the recovery
+            # chain (the refresh scan that armed it keeps the flag fresh).
+            if not (self._auth_failed or self._server_issue
+                    or self._restart_churn) and not egress_dead:
                 self._watchdog_backoff.record_success()  # failure cleared: full cadence
                 if self._pending_flip is None:
                     return
@@ -3270,6 +3376,8 @@ class VPNManager:
                     kind = "egress dead"
                 elif self._auth_failed:
                     kind = "AUTH_FAILED"
+                elif self._restart_churn:
+                    kind = "healthcheck restart loop"
                 else:
                     kind = "TLS negotiation timeout"
                 logger.warning("[vpn-watchdog] %s detected — restarting %s",

@@ -132,6 +132,7 @@ class FakeVPNManager(vm.VPNManager):
                       "force_recreate": 0}
         self.escalations = 0
         self.finalize_calls = 0
+        self.scan_since = []                # windows passed to the churn scan
 
     # ── docker fakes ─────────────────────────────────────────────
     async def _docker_inspect(self):
@@ -168,6 +169,14 @@ class FakeVPNManager(vm.VPNManager):
 
     async def _check_server_issue(self, started_at=""):
         return False
+
+    async def _check_restart_churn(self, window_min=10):
+        """Churn scan stub: log-marker driven like _check_auth_failed.
+        Default OFF (no marker → no churn) so the existing suites never
+        see it; the churn tests set log_text to the gluetun restart marker.
+        Records the window the refresh wiring passes (scan_since)."""
+        self.scan_since.append(window_min)
+        return "restarting VPN because" in self.log_text
 
     async def _wait_healthy(self, timeout=120.0):
         return "2026-01-01T00:00:00Z"

@@ -2359,11 +2359,18 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
         if status == "connected":
             st = await nordvpn_status()
             nordvpn = {"available": True, "exe": None, "status": st}
-        docker = _docker_diag()
+        # [fix 20/08][Axe 3] Tout l'I/O subprocess/docker est offloadé sur
+        # des threads : un daemon docker gelé (le mode défaillance documenté
+        # sur le serveur — load > 150) bloquait l'event loop jusqu'à ~115 s
+        # (2×10 s diag + 15 s × N compose config + 5 s wsl) et gelait tous
+        # les SSE en vol, les workers de rotation et les watchdogs.
+        docker = await asyncio.to_thread(_docker_diag)
         wsl2 = {"available": False}
         try:
-            r = subprocess.run(["wsl", "--status"], capture_output=True,
-                               text=True, timeout=5)
+            r = await asyncio.to_thread(
+                lambda: subprocess.run(["wsl", "--status"],
+                                       capture_output=True, text=True,
+                                       timeout=5))
             wsl2["available"] = r.returncode == 0
         except Exception:
             pass
@@ -2394,7 +2401,7 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
             "recommendation": rec,
             "config_yaml_dirty": (
                 _config_yaml_mtime() != _config_yaml_known_mtime),
-            "compose_config": _docker_compose_config(),
+            "compose_config": await asyncio.to_thread(_docker_compose_config),
         }
 
     # ── Traffic capture (Wireshark-like raw request view) ──

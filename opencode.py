@@ -2134,7 +2134,25 @@ async def _open_free_stream(endpoint, body, headers, use_free: bool, count_reque
                 # re-raise: the direct fallback is the existing semantics.
                 # Never on HTTP answers (429/5xx are not exceptions here).
                 if station is not None and _is_connect_error(e):
-                    _signal_connection_failure(station)
+                    # [fix 20/08][Axe 1.5] A notify-path failure must never
+                    # pre-empt the station-first retry ordering below: Axe 1.5
+                    # makes _signal_connection_failure log-and-RE-RAISE (with
+                    # full traceback, inside itself), which would otherwise
+                    # escape this generator untyped and bypass the caller's
+                    # `except _FreeTunnelFailure` fresh-station retry (plan
+                    # 19/08 §2). Guard the signal: the defect is already
+                    # logged with traceback inside — swallow it here and
+                    # continue to the raise below either way. The bad-mark
+                    # usually already landed, so later requests stay
+                    # protected and THIS request still fails over cleanly.
+                    # (asyncio.CancelledError is BaseException-derived and
+                    # passes through this guard untouched.)
+                    try:
+                        _signal_connection_failure(station)
+                    except Exception:
+                        _log("[free-ip] notify-step raised at the call site "
+                             "(traceback above) — swallowed to preserve the "
+                             "station-first retry")
                 if not direct_fallback:
                     # [plan 19/08 §2] station-first mode with remaining free
                     # budget → re-raise so the caller's retry loop strikes

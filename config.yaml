@@ -88,7 +88,7 @@ ip_rotation:
   enabled: true
   proxy_mode: vpn
   dual_station: true
-  station_count: 6
+  station_count: 3
   strict_free: false
   max_free_attempts: 3
   free_exception_fallback: station-first
@@ -164,25 +164,29 @@ custom_routes:
   mimov25:
     match:
     - mimo-v2.5
-    model: deepseek-v4-flash
+    model: muse-spark-1.2-contributor
     thinking: adaptive
   mimov25pro:
     match:
     - mimo-v2.5-pro
-    model: deepseek-v4-flash
+    model: muse-spark-1.2-contributor
   qwen35plus:
     match:
     - qwen3.5-plus
-    model: deepseek-v4-flash
+    model: muse-spark-1.2-contributor
     thinking: adaptive
   gpt54mini:
     match:
     - gpt-5.4-mini
-    model: deepseek-v4-flash
+    model: muse-spark-1.2-contributor
   kimik26:
     match:
     - kimi-k2.6
-    model: deepseek-v4-flash
+    model: muse-spark-1.2-contributor
+  gpt56luna:
+    match:
+    - gpt-5.6-luna
+    model: muse-spark-1.2-contributor
 api_keys: []
 tool_capabilities:
   _default:

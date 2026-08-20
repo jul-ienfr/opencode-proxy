@@ -41,6 +41,12 @@ x-gluetun-multi-env: &gluetun-multi-env
   PUID: '1000'
   PGID: '1000'
   HTTP_CONTROL_SERVER: 'on'   # role JSON in credentials.env (see vpn-gluetun comment)
+  # [fix 20/08][Axe 3.1] Custom .ovpn uploaded via the dashboard (POST
+  # /api/vpn/upload-config → config.yaml custom_ovpn_file). vpn_manager's
+  # _compose_env injects the variable when a custom file is configured and
+  # the stack is openvpn; `/vpn-custom` is the bind mount below. Empty by
+  # default → gluetun ignores the setting entirely (inert on a fresh clone).
+  OPENVPN_CUSTOM_CONFIG: ${OPENVPN_CUSTOM_CONFIG:-}
 
 services:
   opencode-proxy:
@@ -132,6 +138,9 @@ services:
       # works without tuning; OPENVPN_VERBOSITY=4 is kept only for its ~1
       # line/attempt debug detail (hostname at connect start).
       - OPENVPN_VERBOSITY=4
+      # [fix 20/08][Axe 3.1] custom .ovpn from the dashboard upload — path is
+      # the in-container bind mount /vpn-custom; empty default = inert.
+      - OPENVPN_CUSTOM_CONFIG=${OPENVPN_CUSTOM_CONFIG:-}
       # [incident 17/08] gluetun's country enum uses SPACED names
       # ("United Kingdom", "Czech Republic") — NordVPN file-style
       # "United_Kingdom"/"Czechia" are rejected with a WARN "not in
@@ -159,6 +168,9 @@ services:
       - HTTP_CONTROL_SERVER=on
     volumes:
       - gluetun:/gluetun
+      # [fix 20/08][Axe 3.1] custom .ovpn upload dir (read-only) — the
+      # OPENVPN_CUSTOM_CONFIG env above points inside it.
+      - ./vpn_configs/custom:/vpn-custom:ro
     restart: unless-stopped
     # [plan] local healthcheck — hits the control server, NOT external
     # egress (api.ipify.org at every 30s wasted bandwidth and depended on
@@ -213,6 +225,9 @@ services:
       # works without tuning; OPENVPN_VERBOSITY=4 is kept only for its ~1
       # line/attempt debug detail (hostname at connect start).
       - OPENVPN_VERBOSITY=4
+      # [fix 20/08][Axe 3.1] custom .ovpn from the dashboard upload — path is
+      # the in-container bind mount /vpn-custom; empty default = inert.
+      - OPENVPN_CUSTOM_CONFIG=${OPENVPN_CUSTOM_CONFIG:-}
       # [incident 17/08] gluetun's country enum uses SPACED names
       # ("United Kingdom", "Czech Republic") — NordVPN file-style
       # "United_Kingdom"/"Czechia" are rejected with a WARN "not in
@@ -232,6 +247,9 @@ services:
       - HTTP_CONTROL_SERVER=on
     volumes:
       - gluetun2:/gluetun
+      # [fix 20/08][Axe 3.1] custom .ovpn upload dir (read-only) — the
+      # OPENVPN_CUSTOM_CONFIG env above points inside it.
+      - ./vpn_configs/custom:/vpn-custom:ro
     restart: unless-stopped
     # [plan] local healthcheck — control server instead of external egress.
     healthcheck:
@@ -261,6 +279,9 @@ services:
       SOCKS5_LISTENING_ADDRESS: :1082
     volumes:
       - gluetun3:/gluetun
+      # [fix 20/08][Axe 3.1] custom .ovpn upload dir (read-only) — the
+      # OPENVPN_CUSTOM_CONFIG env above points inside it.
+      - ./vpn_configs/custom:/vpn-custom:ro
 
   vpn-gluetun-4:
     <<: *gluetun-multi-base
@@ -276,6 +297,9 @@ services:
       SOCKS5_LISTENING_ADDRESS: :1083
     volumes:
       - gluetun4:/gluetun
+      # [fix 20/08][Axe 3.1] custom .ovpn upload dir (read-only) — the
+      # OPENVPN_CUSTOM_CONFIG env above points inside it.
+      - ./vpn_configs/custom:/vpn-custom:ro
 
   vpn-gluetun-5:
     <<: *gluetun-multi-base
@@ -291,6 +315,9 @@ services:
       SOCKS5_LISTENING_ADDRESS: :1084
     volumes:
       - gluetun5:/gluetun
+      # [fix 20/08][Axe 3.1] custom .ovpn upload dir (read-only) — the
+      # OPENVPN_CUSTOM_CONFIG env above points inside it.
+      - ./vpn_configs/custom:/vpn-custom:ro
 
   vpn-gluetun-6:
     <<: *gluetun-multi-base
@@ -306,6 +333,9 @@ services:
       SOCKS5_LISTENING_ADDRESS: :1085
     volumes:
       - gluetun6:/gluetun
+      # [fix 20/08][Axe 3.1] custom .ovpn upload dir (read-only) — the
+      # OPENVPN_CUSTOM_CONFIG env above points inside it.
+      - ./vpn_configs/custom:/vpn-custom:ro
 
   vpn-gluetun-7:
     <<: *gluetun-multi-base
@@ -321,6 +351,9 @@ services:
       SOCKS5_LISTENING_ADDRESS: :1086
     volumes:
       - gluetun7:/gluetun
+      # [fix 20/08][Axe 3.1] custom .ovpn upload dir (read-only) — the
+      # OPENVPN_CUSTOM_CONFIG env above points inside it.
+      - ./vpn_configs/custom:/vpn-custom:ro
 
   vpn-gluetun-8:
     <<: *gluetun-multi-base
@@ -336,6 +369,9 @@ services:
       SOCKS5_LISTENING_ADDRESS: :1087
     volumes:
       - gluetun8:/gluetun
+      # [fix 20/08][Axe 3.1] custom .ovpn upload dir (read-only) — the
+      # OPENVPN_CUSTOM_CONFIG env above points inside it.
+      - ./vpn_configs/custom:/vpn-custom:ro
 
   vpn-gluetun-9:
     <<: *gluetun-multi-base
@@ -351,6 +387,9 @@ services:
       SOCKS5_LISTENING_ADDRESS: :1088
     volumes:
       - gluetun9:/gluetun
+      # [fix 20/08][Axe 3.1] custom .ovpn upload dir (read-only) — the
+      # OPENVPN_CUSTOM_CONFIG env above points inside it.
+      - ./vpn_configs/custom:/vpn-custom:ro
 
   vpn-gluetun-10:
     <<: *gluetun-multi-base
@@ -366,6 +405,9 @@ services:
       SOCKS5_LISTENING_ADDRESS: :1089
     volumes:
       - gluetun10:/gluetun
+      # [fix 20/08][Axe 3.1] custom .ovpn upload dir (read-only) — the
+      # OPENVPN_CUSTOM_CONFIG env above points inside it.
+      - ./vpn_configs/custom:/vpn-custom:ro
 
   # [plan 18/08 §2c] Canary WireGuard/NordLynx — validates the shared
   # NordLynx key (vpn_configs/wireguard.env, gitignored) BEFORE any station
