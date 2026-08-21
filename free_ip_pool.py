@@ -42,7 +42,8 @@ class FreeIPPool:
     def proxy_url(self) -> Optional[str]:
         """Return the proxy URL for routing free model requests.
 
-        In VPN mode: returns HTTP proxy URL (tinyproxy) when VPN is connected.
+        In VPN mode with Docker/Gluetun: returns socks5:// URL (works on Windows Docker Desktop).
+        In VPN mode with WSL2/native: returns HTTP proxy URL.
         In SOCKS5 mode: returns socks5:// URL from the proxy rotation.
         In direct mode: returns None (no proxy).
         """
@@ -52,6 +53,10 @@ class FreeIPPool:
         mode = self._vpn.proxy_mode
         if mode == "vpn":
             if self._vpn.status == "connected":
+                # Docker/Gluetun: use SOCKS5 (HTTP proxy doesn't route through VPN on Windows Docker Desktop)
+                if self._vpn._mode == "docker":
+                    return self._vpn.socks5_url
+                # WSL2/native: use HTTP proxy
                 return self._vpn.proxy_url
             return None
         elif mode == "socks5":
@@ -141,21 +146,51 @@ class FreeIPPool:
         await self.switch_ip()
 
     async def switch_ip(self):
-        """Switch to the next VPN server or SOCKS5 proxy for a fresh IP."""
-        try:
-            mode = self._vpn.proxy_mode
-            if mode == "vpn":
-                await self._vpn.connect_next()
-            elif mode == "socks5":
-                # Round-robin is handled in get_socks5_proxy_url()
-                # Just log the switch
-                proxy = self._vpn.get_next_socks5_proxy()
-                if proxy:
-                    logger.info("[free-ip] switched to SOCKS5 proxy %s:%d", proxy["host"], proxy["port"])
-            self._request_count = 0
-            self._session_start = time.monotonic()
-        except Exception as e:
-            logger.error("[free-ip] failed to switch IP: %s", e)
+        """Switch to the next VPN server or SOCKS5 proxy for a fresh IP.
+
+        Validates that the new IP is actually different from recent IPs
+        to avoid reconnecting to the same server.
+        """
+        old_ip = self._vpn.current_ip
+        recent_ips = [s.get("ip") for s in self._vpn._ip_history[-10:]]
+
+        max_attempts = 3
+        for attempt in range(max_attempts):
+            try:
+                mode = self._vpn.proxy_mode
+                if mode == "vpn":
+                    await self._vpn.connect_next()
+                elif mode == "socks5":
+                    proxy = self._vpn.get_next_socks5_proxy()
+                    if proxy:
+                        logger.info("[free-ip] switched to SOCKS5 proxy %s:%d", proxy["host"], proxy["port"])
+
+                new_ip = self._vpn.current_ip
+
+                # Validate IP actually changed
+                if mode == "vpn" and new_ip and old_ip:
+                    if new_ip == old_ip:
+                        logger.warning("[free-ip] IP unchanged after switch (%s), attempt %d/%d",
+                                       new_ip, attempt + 1, max_attempts)
+                        if attempt < max_attempts - 1:
+                            continue
+                        else:
+                            logger.error("[free-ip] IP unchanged after %d attempts, proceeding anyway", max_attempts)
+                    elif new_ip in recent_ips:
+                        logger.warning("[free-ip] IP %s was recently used, attempt %d/%d",
+                                       new_ip, attempt + 1, max_attempts)
+                        if attempt < max_attempts - 1:
+                            continue
+
+                self._request_count = 0
+                self._session_start = time.monotonic()
+                return  # success
+
+            except Exception as e:
+                logger.error("[free-ip] failed to switch IP (attempt %d/%d): %s",
+                             attempt + 1, max_attempts, e)
+                if attempt < max_attempts - 1:
+                    await asyncio.sleep(2 ** attempt)  # brief backoff between attempts
 
     def get_status(self) -> dict:
         """Return pool status for the dashboard."""
