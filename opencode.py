@@ -4153,6 +4153,7 @@ def anthropic_to_openai(body: dict, model: str) -> dict:
                 if not tid:
                     # Defensive: skip tool_result with missing/empty tool_use_id
                     # (can happen after context compaction loses the id)
+                    _debug(f"  [compact] SKIP tool_result with missing tool_use_id in anthropic_to_openai")
                     continue
                 tool_results.append({
                     "role": "tool",
@@ -4817,13 +4818,21 @@ def _chat_to_responses_request(chat: dict) -> dict:
     for m in chat.get("messages", []) or []:
         role = m.get("role", "user")
         content = m.get("content", "")
+        # Preserve cache_control from the chat message for prefix caching
+        cache_ctrl = m.get("cache_control")
         if isinstance(content, str):
             if content:
-                inp.append({"role": role, "content": [{"type": "input_text", "text": content}]})
+                item = {"role": role, "content": [{"type": "input_text", "text": content}]}
+                if cache_ctrl:
+                    item["cache_control"] = cache_ctrl
+                inp.append(item)
         elif isinstance(content, list):
             txt = "\n".join(b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text")
             if txt:
-                inp.append({"role": role, "content": [{"type": "input_text", "text": txt}]})
+                item = {"role": role, "content": [{"type": "input_text", "text": txt}]}
+                if cache_ctrl:
+                    item["cache_control"] = cache_ctrl
+                inp.append(item)
         for tc in m.get("tool_calls", []) or []:
             fn = tc.get("function", {}) if isinstance(tc.get("function"), dict) else {}
             inp.append({"type": "function_call", "id": tc.get("id", ""), "name": fn.get("name", ""), "arguments": fn.get("arguments", "{}")})
@@ -5204,6 +5213,13 @@ async def messages(request: Request):
     tool_names = _extract_tool_names(body)
     request_body = body  # Capture original request before mutation
     _debug(f"[messages] req_id={req_id} model={original_model!r} tools={tool_names} ip={client_ip}")
+
+    # [fix 20/08] Compact request detection + diagnostics
+    _thinking = body.get("thinking")
+    _is_compact = (isinstance(_thinking, dict) and _thinking.get("type") == "compact")
+    _msg_count = len(body.get("messages", []))
+    if _is_compact or _msg_count > 50 or len(body_bytes) > 500000:
+        _log(f"  [compact?] req_id={req_id} model={original_model!r} thinking={_thinking} msgs={_msg_count} body={len(body_bytes)}B")
     if DEBUG:
         _debug(f"[messages] headers={_sanitize_headers(dict(request.headers))}")
         _debug(f"[messages] body=\n{_redact(_truncate(body))}")
@@ -5943,7 +5959,8 @@ async def messages(request: Request):
                 if protocol == "anthropic":
                     oai_body = _anthropic_to_responses_request({**body, "model": free_model})
                 else:
-                    oai_body = _chat_to_responses_request({**body, "model": free_model})
+                    # [fix 20/08] Use oai_body (OpenAI chat format), not body (Anthropic format)
+                    oai_body = _chat_to_responses_request({**oai_body, "model": free_model})
                 oai_body = ensure_min_tokens(oai_body)
                 oai_body["stream"] = True
             _req_model_id = free_model
