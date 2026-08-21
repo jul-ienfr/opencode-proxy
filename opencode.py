@@ -4904,7 +4904,12 @@ def _responses_to_chat_response(resp: dict, model: str) -> dict:
     if tool_calls:
         msg["tool_calls"] = tool_calls
     usage = resp.get("usage", {}) if isinstance(resp.get("usage"), dict) else {}
+    # Cache tokens come from input_tokens_details, NOT output_tokens_details
+    _inp_details = usage.get("input_tokens_details") if isinstance(usage.get("input_tokens_details"), dict) else {}
+    _cached = _inp_details.get("cached_tokens", 0)
     chat_usage = {"prompt_tokens": usage.get("input_tokens", 0), "completion_tokens": usage.get("output_tokens", 0), "total_tokens": usage.get("total_tokens", usage.get("input_tokens", 0) + usage.get("output_tokens", 0))}
+    if _cached:
+        chat_usage["prompt_tokens_details"] = {"cached_tokens": _cached}
     status = resp.get("status", "completed")
     finish = "stop" if status == "completed" else "length"
     return {"id": resp.get("id", f"chatcmpl-{uuid.uuid4().hex[:8]}"), "object": "chat.completion", "created": int(time.time()), "model": model, "choices": [{"index": 0, "message": msg, "finish_reason": finish}], "usage": chat_usage}
@@ -4937,7 +4942,10 @@ def _responses_to_anthropic_response(resp: dict, model: str) -> dict:
     has_tools = any(b.get("type") == "tool_use" for b in blocks)
     if has_tools:
         stop = "tool_use"
-    return {"id": f"msg_{uuid.uuid4().hex[:24]}", "type": "message", "role": "assistant", "content": blocks, "model": model, "stop_reason": stop, "stop_sequence": None, "usage": {"input_tokens": usage.get("input_tokens", 0), "output_tokens": usage.get("output_tokens", 0), "cache_read_input_tokens": usage.get("output_tokens_details", {}).get("cached_tokens", 0) if isinstance(usage.get("output_tokens_details"), dict) else 0}}
+    # Cache tokens come from input_tokens_details, NOT output_tokens_details
+    _inp_details = usage.get("input_tokens_details") if isinstance(usage.get("input_tokens_details"), dict) else {}
+    _cache_read = _inp_details.get("cached_tokens", 0)
+    return {"id": f"msg_{uuid.uuid4().hex[:24]}", "type": "message", "role": "assistant", "content": blocks, "model": model, "stop_reason": stop, "stop_sequence": None, "usage": {"input_tokens": usage.get("input_tokens", 0), "output_tokens": usage.get("output_tokens", 0), "cache_read_input_tokens": _cache_read}}
 
 
 def _responses_sse_to_chat_deltas(raw_line: str):
@@ -4986,11 +4994,16 @@ def _responses_sse_to_chat_deltas(raw_line: str):
     if etype == "response.completed":
         resp = chunk.get("response", {})
         usage = resp.get("usage", {})
+        # Cache tokens come from input_tokens_details, NOT output_tokens_details
+        _inp_details = usage.get("input_tokens_details") if isinstance(usage.get("input_tokens_details"), dict) else {}
+        _cached = _inp_details.get("cached_tokens", 0)
         chat_usage = {
             "prompt_tokens": usage.get("input_tokens", 0),
             "completion_tokens": usage.get("output_tokens", 0),
             "total_tokens": usage.get("total_tokens", usage.get("input_tokens", 0) + usage.get("output_tokens", 0)),
         }
+        if _cached:
+            chat_usage["prompt_tokens_details"] = {"cached_tokens": _cached}
         return {"choices": [], "usage": chat_usage}
 
     # response.incomplete — model didn't generate output, treat as stream end
@@ -5900,7 +5913,8 @@ async def messages(request: Request):
         if is_responses_format:
             req_in = usage.get("input_tokens", 0)
             req_out = usage.get("output_tokens", 0)
-            cache = usage.get("output_tokens_details", {}).get("cached_tokens", 0) if isinstance(usage.get("output_tokens_details"), dict) else 0
+            _inp_det = usage.get("input_tokens_details") if isinstance(usage.get("input_tokens_details"), dict) else {}
+            cache = _inp_det.get("cached_tokens", 0)
         else:
             req_in = usage.get("prompt_tokens", 0)
             req_out = usage.get("completion_tokens", 0)
@@ -7655,6 +7669,14 @@ async def responses(request: Request):
                 status_code=503, media_type="application/json",
                 headers={"Retry-After": str(retry_after)})
         if not is_stream:
+            # Response cache (mirrors the anthropic/chat handlers)
+            cache_key = _response_cache.make_key(body, body_bytes=body_bytes)
+            cached = cache_key and _response_cache.get(cache_key)
+            if cached:
+                cached_body, cached_headers = cached
+                _debug(f"  [responses] response cache HIT ({len(cached_body)} bytes)")
+                return Response(content=cached_body, headers={**cached_headers, "X-Cache": "HIT"},
+                                media_type="application/json")
             # Try free model first if available
             _geo_tunnel = getattr(request.state, "_geo_force_tunnel", False)
             try:
@@ -7725,7 +7747,10 @@ async def responses(request: Request):
                          effort, client_ip, account_alias, tool_names, tools_used=used if used else None,
                          request_body=request_body, response_body=data)
             oai_resp = anthropic_to_openai_responses(data, original_model)
-            return Response(content=json.dumps(oai_resp, ensure_ascii=False), media_type="application/json")
+            _response_body = json.dumps(oai_resp, ensure_ascii=False).encode()
+            if cache_key:
+                _response_cache.put(cache_key, _response_body, {"Content-Type": "application/json"})
+            return Response(content=_response_body, media_type="application/json")
         # Anthropic streaming → collect, then emit SSE
         anthro_body["stream"] = False
         # Try free model first if available
@@ -7828,6 +7853,14 @@ async def responses(request: Request):
     is_stream = oai_body["stream"]
 
     if not is_stream:
+        # Response cache (mirrors the anthropic/chat handlers)
+        cache_key = _response_cache.make_key(body, body_bytes=body_bytes)
+        cached = cache_key and _response_cache.get(cache_key)
+        if cached:
+            cached_body, cached_headers = cached
+            _debug(f"  [responses] response cache HIT ({len(cached_body)} bytes)")
+            return Response(content=cached_body, headers={**cached_headers, "X-Cache": "HIT"},
+                            media_type="application/json")
         # Try free model first if available
         _geo_tunnel = getattr(request.state, "_geo_force_tunnel", False)
         try:
@@ -7876,7 +7909,8 @@ async def responses(request: Request):
         if is_responses_format:
             req_in = usage.get("input_tokens", 0)
             req_out = usage.get("output_tokens", 0)
-            cache = usage.get("output_tokens_details", {}).get("cached_tokens", 0) if isinstance(usage.get("output_tokens_details"), dict) else 0
+            _inp_det = usage.get("input_tokens_details") if isinstance(usage.get("input_tokens_details"), dict) else {}
+            cache = _inp_det.get("cached_tokens", 0)
         else:
             req_in = usage.get("prompt_tokens", 0)
             req_out = usage.get("completion_tokens", 0)
@@ -7899,7 +7933,10 @@ async def responses(request: Request):
         else:
             # Chat Completions format — convert to Responses API
             oai_resp = openai_chat_to_responses(data, original_model)
-        return Response(content=json.dumps(oai_resp, ensure_ascii=False), media_type="application/json")
+        _response_body = json.dumps(oai_resp, ensure_ascii=False).encode()
+        if cache_key:
+            _response_cache.put(cache_key, _response_body, {"Content-Type": "application/json"})
+        return Response(content=_response_body, media_type="application/json")
 
     # ── Streaming (OpenAI backend) — collect stream, emit Responses SSE ──
     # Try free model first if available
@@ -8201,13 +8238,21 @@ def _acquire_instance_lock(lock_path: str = os.path.join("logs", "opencode.lock"
 if __name__ == "__main__":
     import sys
     import signal
+    import argparse
     import traceback as _traceback
+
+    parser = argparse.ArgumentParser(description="OpenCode Proxy")
+    parser.add_argument("--no-gui", action="store_true", help="Force terminal mode (no system tray)")
+    parser.add_argument("--gui", action="store_true", help="(default, no-op for backward compat)")
+    parser.add_argument("--port", type=int, default=None, help=f"API port (default: {PORT})")
+    _cli_args = parser.parse_args()
+    if _cli_args.port is not None:
+        PORT = _cli_args.port
 
     _acquire_instance_lock(f"logs/opencode-{PORT}.lock")
 
     # GUI by default (system tray + dashboard window); --no-gui forces terminal mode.
-    # --gui is still accepted for backward compatibility (no-op since it's the default).
-    use_gui = "--no-gui" not in sys.argv
+    use_gui = not _cli_args.no_gui
 
     mgr = ServerManager(app, HOST, PORT, WEB_PORT)
     _server_manager = mgr
