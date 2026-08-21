@@ -97,7 +97,7 @@ def _get_local_ips() -> list:
     return ips
 
 
-def _build_where(from_date=None, to_date=None, status=None, model=None, original_model=None, account=None, tool=None, search=None):
+def _build_where(from_date=None, to_date=None, status=None, model=None, original_model=None, account=None, tool=None, search=None, is_stream=None):
     conditions, params = [], []
     if from_date:
         conditions.append("timestamp >= ?")
@@ -124,6 +124,12 @@ def _build_where(from_date=None, to_date=None, status=None, model=None, original
     if search:
         conditions.append("(error LIKE ? OR model LIKE ? OR original_model LIKE ?)")
         params.extend([f"%{search}%", f"%{search}%", f"%{search}%"])
+    if is_stream is not None and str(is_stream).strip() != "":
+        v = str(is_stream).strip().lower()
+        if v in ("true", "1", "yes"):
+            conditions.append("is_stream = 1")
+        elif v in ("false", "0", "no"):
+            conditions.append("is_stream = 0")
     where = "WHERE " + " AND ".join(conditions) if conditions else ""
     return where, params
 
@@ -1558,8 +1564,8 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
     @app.get("/api/history")
     async def get_history(from_date: str = None, to_date: str = None, limit: int = 20, offset: int = 0,
                           status: str = None, model: str = None, original_model: str = None,
-                          account: str = None, tool: str = None, search: str = None):
-        where, params = _build_where(from_date, to_date, status, model, original_model, account, tool, search)
+                          account: str = None, tool: str = None, search: str = None, is_stream: str = None):
+        where, params = _build_where(from_date, to_date, status, model, original_model, account, tool, search, is_stream)
         query = "SELECT * FROM requests " + where + " ORDER BY timestamp DESC LIMIT ? OFFSET ?"
         params.extend([limit, offset])
 

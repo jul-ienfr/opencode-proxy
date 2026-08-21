@@ -17,14 +17,7 @@ upstream:
   max_connections: 200
   max_keepalive: 50
   keepalive_expiry: 120
-  max_body_size:
-    default: 10485760    # 10 Mo — chat_completions et autres
-    messages: 26214400   # 25 Mo — couvre /compact (12-18 Mo p95)
-    responses: 15728640  # 15 Mo
-limits:
-  compact_json_thread_threshold: 1048576  # 1 Mo → json en thread
-  compact_tiktoken_char_limit: 100000    # 100k chars → fallback len//3.5
-  max_body_bytes_inflight: 104857600     # 100 Mo — garde volumétrique globale
+  max_body_size: 10485760
 routing:
   opus_model: kimi-k2.6
   sonnet_model: glm-5.1
@@ -75,6 +68,7 @@ models:
 free_model_map:
   deepseek-v4-flash: deepseek-v4-flash-free
   mimo-v2.5: mimo-v2.5-free
+  muse-spark-1.2-contributor: muse-spark-1.2-contributor-free
 ip_rotation:
   enabled: true
   proxy_mode: vpn
@@ -91,63 +85,105 @@ ip_rotation:
       config: vpn/configs/de1223.ovpn
   quota_per_ip: 300
   switch_delay: 5
-  docker_image: openvpn-nordvpn
+  docker_image: qmcgaw/gluetun
+  docker_image_custom: ''
+  nordvpn_token: ''
+  nordvpn_technology: NordLynx
+  nordvpn_country: Germany
+  nordvpn_group: ''
+  docker_killswitch: true
+  docker_dns_over_tls: true
+  nordvpn_exe: ''
   socks5_proxies:
     rotate_socks5: true
     list: []
+  use_nordvpn_api: false
+  api_cache_ttl: 900
+  circuit_breaker_threshold: 3
+  circuit_breaker_recovery: 300
+  backoff_max_delay: 60
+  watchdog_interval: 60
+  geo_filter:
+    include: []
+    exclude: []
+  rotation_rules: []
+  schedule:
+    enabled: false
+    rules: []
 custom_routes:
   mimov25:
     match:
     - mimo-v2.5
-    model: mimo-v2.5
+    model: muse-spark-1.2-contributor
     thinking: adaptive
   mimov25pro:
     match:
     - mimo-v2.5-pro
-    model: mimo-v2.5
+    model: muse-spark-1.2-contributor
   qwen35plus:
     match:
     - qwen3.5-plus
-    model: mimo-v2.5
+    model: muse-spark-1.2-contributor
     thinking: adaptive
   gpt54mini:
     match:
     - gpt-5.4-mini
-    model: mimo-v2.5
+    model: muse-spark-1.2-contributor
   kimik26:
     match:
     - kimi-k2.6
-    model: mimo-v2.5
+    model: muse-spark-1.2-contributor
+  minimaxm25:
+    match:
+    - minimax-m2.5
+    model: muse-spark-1.2-contributor
+  glm51:
+    match:
+    - glm-5.1
+    model: muse-spark-1.2-contributor
+  deepseekv4flash:
+    match:
+    - deepseek-v4-flash
+    model: muse-spark-1.2-contributor
+  musespark12contributor:
+    match:
+    - muse-spark-1.2-contributor
+    model: muse-spark-1.2-contributor
 api_keys:
-- api_key: ***REMOVED-ROTATE-ME***
-  alias: joedouille648@gmail.com
-  go_workspace_id: wrk_01KQQG13W80W15YQPS4CZGY9FM
-  go_auth_cookie: Fe26.2**2a3b830b49b0314519c10981bfd5433a4ad6d5e9424896147bd779ba2cde6bdc*yNBPBAwUHSGSwlPQcfpBdw*5iwtiALr0YYvtOr4iSg0k06RxpKF5KwIVtuBOpkgUT6EmKbLYmBObhOI7dzLuAsij3PoahWkYWFQiFyQ5g2F18oqpPGcNgh20mjDhMGNb6__DQvrqd6A5p-lq0u9cdVmy-C2mpuQhdjwQH9gfcUq7p1xH0EBObjUFGxXl2NxrUQ5qdkfrA_ka5ppR7RFZQ547_a5UrWYSVvF7fGzD8LrxhbWFnThwCmEUDrsUg0AfVrptbKUfpvYbyiGeRRwkJbB4sfHSNJ25pOLR6xE8oOj176x0_IBZQtTokc_SBn_R9C_cUCqlwfJxaJhjBxAdglYPHkaTTDBn3IyI_7dL7PK3A*1812155771277*c8e19832a98d4cbf6ecb0bf3d0c0a8b830b2d5254c3c06743e0e0ff1c30deac3*Qae8LtSpAZJ_PYujMcoXLWCEth3GfDgg7qpAoqKCFTM
-  enabled: true
 - api_key: sk-m6bjriSKKpGpoTPmvYqua71deb7f6jsmjaQfeCF3ZeDoDYwUrf8gndorUzrUWQNT
   alias: arthur0405@atomicmail.io
   go_workspace_id: wrk_01KR5YD5316DP1KSB8WR4XRH9E
   go_auth_cookie: Fe26.2**e4c2d52c5ad40f735d1f799d95c9406f1f94976c3045566fe598f6d36a4906b5*ELRWtmszKl38ppQ6IE3Vug*DP9YpL-3DCeBaPjZfuMH-A0I4hqd_0HsjABI1vcnv8B-aHrCEKyx3Mw9Z5mXFuOzOAdc-0WvprIBVelNthvkdOSLDS_kJUP83cVz-36DsTOawMG0RKlvU-M0SzkYj-MlKsoRAhFTnhsFqI8grVHuVaxvV-6Fprw1aViDybwRg2ylvOnWAV95X6X4Zm76eb0rDzymeLpZkRBsJ_yjHP7-25iR6D2yLUSPRuZZ5_imWADFQT3T67Io0hLCqi57OxcU93CC41_zaHuM4sJTDDZQufdr9rwaLwU82iuzWVwZaKQUzu9CF_hS0BXbQyQh6q_Kd4zPoM1_dMg83O32a1-uog*1809852122595*25a2b2cf8a8f252f74ee5b670e125fec6cd51eae7dd87216995ae94700b9e4ed*oMuZRSfbtn7HfIpgGXwp4rDZuLeGKwwDMO2I7c3Um5w
-  enabled: true
+  enabled: false
 - api_key: sk-0w7JFmSux2NXxB5PdOmq5uJQaYRznVi51Bnrmiff8bKYeFUhxTzfaGO7TZWP8hx8
   alias: Patrice
   go_workspace_id: wrk_01KSVYXW65VYQCKJ2WTXCXPGMQ
   go_auth_cookie: Fe26.2**f83b4b2afd4ddc6bcd034cb2a7c6a3c04fe359ca6422e0a1649945ca4bf77651*PHt4lM8ffxGnYU7IhGnVNA*YjIr-V5OXwEm8aBWNncxZ2TBJ8xE4Mkp2HZjVd7iJZ8djZP3aDwzmM6kn9UIGf35A--SfbDQfHg0kX7qJOMCd0Fkm66iG6mWX-lhXTykOpJymfoqUkcy7XgO3B65rZOrJ-3CCxVPM2xmeOlWwky1ztgUH-QDqYuWQxCfN5JhxzO6Loe8CP8MdpROx_Q8awCP9kF3hhNzafAikYWPNwrHjC44lfvQSKMmZ94xJKyWHEAOR76CNtNcaN3C19invmsQ1C1HI502SqNh1DeviNzhxEdh7hlrx2mD77HE9jDu-YYfSiFp1rC10urx8TaF8b5NDwwmx_MY9aoGIL8FZt6Acw*1811664610719*8fcc623f3350d9bdd9dcf778a3dc85f6fb5a8b40cf0b8fbb448da016ef567d56*i3-pZOMhlQ9dvtyCHhAOS67yq8aVWMuv379prphYzvA
-  enabled: true
+  enabled: false
 - api_key: sk-aWY4yVKEAuMDNMvAl6sdUGDusboeZW589ckWTJskd517kyu4yqQKIJrexHozD6XJ
   alias: laurent2804@atomicmail.io
   go_workspace_id: wrk_01KSZ76PMN617KQDXKH8VWP2FD
   go_auth_cookie: Fe26.2**629704ab113fb1b562df8a904d5a216c2dcf9748ef6920936654cb0d11824df6*G4Y3uvRZAX83f26VLLSQTA*a8snB6d1-6eTrW4Kml235NyL2ZbKrOYJVyy7RHz7IwQ-Ce9NBglWhI8YAaVaQn9H9rrJUpVaM6fSYpPPc5RJGfdUZGFGSqayhs8DunF9C4NMcp_GflFCtr9Dpzp_bMRb340Z7Z6UifXLuvFNiyvV5RUX8ZgdWrATjXx-vc7PoqcA2AB0F2w3WX9Cjhp5vB-QfDG60PxAwFSxSwXybpJKHBOJ7Arqer0bL4errYBggWDs_PlI-bJrPwL2atZoW6gd8zwX2XZpS_qJufzTfFEFhyQjNzh7xxDriyXl7ElkUdpo9wm4LQDYMweEqQu3rOIuFGg67G0R_JYSmX4rWDgFpg*1811773950919*ab25dd318eabbf66b9ca8d7fa86d043f990d017d7555ce0e7a14b855783f9097*dQ5-TbwgAZ2YfZRzsaaTh0lPGwgsjgtO_2ZMPTzsyWA
-  enabled: true
+  enabled: false
 - api_key: sk-mGh6PSl8t6rOCkAl8bJYCRAzuzCXdtDFWUZ3Jb2SjWF3pTmBmCzD2ZluB8eVlhni
   alias: antoinne2804@atomicmail.io
   go_workspace_id: wrk_01KT475NTJRWYVN0K4HT2QWY2R
   go_auth_cookie: Fe26.2**1284f8bafcaa37856bee92827f2e65d79de82477acd9ac80e25116f07f20517a*h__5VroywwiTwm3CPzHHIQ*PVoDMWiOv5kWUwVBR3soNowRXIl533efR-LuJus21y-zrL432UDmHo_PILi3GwzqATYejEAWG_qyl-bJernqjbWsr_f2LXNP6ZJYczUfsgiA_I5G2YeL29htTqLBD1QRen8H2gJ_QZjfxhbv5z9-oZMuLXHHb6KhlLPcxQAIKOZh9-bbPQO63nkFJvceeq9fy1zAlKcsU53ScmoA1aynN4wSb8zgLhYQw5OFIKegzWYBAIKeU78hoUN-c5FT9Izc-2_RlhlHrDG4O7NxyJSanC3GL3R-I1Zuqf0pMiZ1NlqB5CIYXGXndrTVSBou4dTdeQGzL64VfkH3v0VO1Ef15A*1811941689510*96da07d6d6c8c1ddf68201e97a843b049f2969cd3d607329bde382898c601461*Hh1nIWV6OPqLDKd1hIeiNImYgE0tnAxuVnQLrtPWovA
-  enabled: true
+  enabled: false
 - api_key: sk-8yE0lTW4d3xsVw9O1DZ9pbMdRpeVNMGGkPHJKE7TJ9axWQzujO0UCmRwQwdqss5m
   alias: salon2804@atomicmail.io
   go_workspace_id: wrk_01KTA9P9PCQBYYXV9DV09SVTH1
   go_auth_cookie: Fe26.2**0efc08f4cb18514907ec024a71f1d4920f42739bb53663cf859e47bb5e096cee*ow8JPWjSs0Qw-XVQ8X4NzQ*HirR_Wn816bBrM64_XeQ72MYVkknKafK7nib3gpQEyaa9QBAWXjVbjT48Y_W1VimEKi8ku-JCyXAMgIxKUMc1xLDD7f4CcoTyB9PCYe2LCwW2DgEkuWFHY2aQB8XZwjqXCUcZqtzr84YrEP6uaa2akcDHDCrWG3xONEAkznAo_cfIvvU9scxmKkMrpaPDFankrf4VBSDzLswl0S-M65CMY9BXfe8XhxzWVYxPGsX-I0JbWQhXxRtqj624QCOnbNBHqge5qO3hBRzeVZhw44ofx1QDbUzPeGjxely9Ba0ZvShlQ0dIsltYEf6UzKV1tIl3MHo8FNMX5khynxtP-KXYQ*1812145657727*c9fd2a8c78b617921d06353eb4a67f8b76569c446abe8c3ddc841cc2bfbb9beb*3vEjVQni-nW0AeWSzaNR8FhTu66uufzGEX2lKz6ku28
+  enabled: false
+- api_key: sk-NVvyO4F8u3W7Dyrks3Oa5cBy9wtTZePfK9I5gvsDqpIibWrH6GoeCmomNDUAsCfg
+  alias: julien fr ia
+  go_workspace_id: wrk_01KTAJVDMYQJJQHS1CZ5KJK4AF
+  go_auth_cookie: Fe26.2**bcd57c92133e4ac173cdfac9729c3bd3d5a95359f550f86368a33dbde7607a65*mUjCeFbDM-4iZn5VCnxQCg*ik44mooTEfP3zFz5Ay1dwtQUyjwLVjoScFpvWB3Z0HB3q5a6KU-c8oD-sMH_s26kOh9RdPed-y7al8ouTXWJN3UaZe1yTNWAr_SVMiX68kXpHnZkzUoE4FL0oEa-6sYj4xHPkcob7JVIz91iPypVGLVaOcNB2AziwiJ1yTmL4DY5JQ5sTUWZBJjSES51FILUB8B9Tkq9MA8CUVUbF686Ctln8FYcif1ugDwxleIuyVkWxWtBVnxt31D8BSpC0Ou2Vfb0o39QcZrtkZXJxegVNvkwJDEfgmGVYUUkhUZPKEONqlZtO_7K_yAAEcKO6k3i5n5KEmDex4AcMFc2BCIItA*1812155262772*69eeaf944ffacea7ceab22db08a2eca86e1a67198f4eb1dcb468b91dfd4c5939*Js5gZcZ--pgLCJKeURt4-Y_sn_1RYS0K5EbSMYmrLdk
+  enabled: true
+- api_key: sk-gp0UH80kSiH7itG6e6GH7cPVgomrl4e0xPdqmOJe29FEVo88Hodhdgrpd6BU0py9
+  alias: AXEL12
+  go_workspace_id: ''
+  go_auth_cookie: ''
   enabled: true
 tool_capabilities:
   _default:

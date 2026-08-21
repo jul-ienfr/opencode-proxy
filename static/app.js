@@ -583,6 +583,7 @@ let filterOriginalModel = '';
 let filterAccount = '';
 let filterTool = '';
 let filterSearch = '';
+let filterStream = '';
 
 // Pagination state
 let currentPage = 1;
@@ -640,6 +641,7 @@ async function fetchHistory(from, to, page = 1) {
         if (filterAccount) url += `&account=${encodeURIComponent(filterAccount)}`;
         if (filterTool) url += `&tool=${encodeURIComponent(filterTool)}`;
         if (filterSearch) url += `&search=${encodeURIComponent(filterSearch)}`;
+        if (filterStream) url += `&is_stream=${encodeURIComponent(filterStream)}`;
         return await apiFetch(url);
     } catch (e) {
         console.error('Failed to fetch history:', e);
@@ -1222,7 +1224,7 @@ function showRequestDetail(reqId) {
 function renderHistory(data) {
     const tbody = document.getElementById('history-tbody');
     if (!data || data.logs.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="13">' + t('logs.no_data') + '</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="14">' + t('logs.no_data') + '</td></tr>';
         updatePagination(1, 1);
         return;
     }
@@ -1274,6 +1276,7 @@ function renderHistory(data) {
             <td>${effort}</td>
             <td>${toolsHtml}</td>
             <td>${escHtml(log.client_ip) || '-'}</td>
+            <td>${log.is_stream ? '<span class="tool-badge used">Stream</span>' : '<span style="color:#888">-</span>'}</td>
             <td>${duration}</td>
             <td>${status}</td>
         </tr>`;
@@ -1829,6 +1832,7 @@ function setupHistoryFilters() {
             filterOriginalModel = document.getElementById('filter-original-model').value;
             filterAccount = document.getElementById('filter-account').value;
             filterTool = document.getElementById('filter-tool').value;
+            filterStream = document.getElementById('filter-stream').value;
             filterSearch = document.getElementById('filter-search').value;
             currentPage = 1;
             refreshAll();
@@ -1842,12 +1846,15 @@ function setupHistoryFilters() {
             document.getElementById('filter-original-model').value = '';
             document.getElementById('filter-account').value = '';
             document.getElementById('filter-tool').value = '';
+            const _fs = document.getElementById('filter-stream');
+            if (_fs) _fs.value = '';
             document.getElementById('filter-search').value = '';
             filterStatus = '';
             filterModel = '';
             filterOriginalModel = '';
             filterAccount = '';
             filterTool = '';
+            filterStream = '';
             filterSearch = '';
             currentPage = 1;
             refreshAll();

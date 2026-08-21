@@ -507,6 +507,30 @@ def _limit_for(route: str) -> int:
     return MAX_BODY_SIZE_MAP.get(route, MAX_BODY_SIZE_DEFAULT)
 
 
+def _normalize_stream_flag(raw) -> bool:
+    """Normalise le flag stream (bool / string / int) en bool strict.
+
+    Gère les variantes non-standard (\"true\", 1) que certains SDK envoient
+    sans casser le chemin rapide booléen dominant.
+    """
+    if raw is True:
+        return True
+    if raw is False or raw is None:
+        return False
+    if isinstance(raw, str):
+        return raw.strip().lower() in ("true", "1", "yes")
+    if isinstance(raw, int):
+        return raw != 0
+    return bool(raw)
+
+
+def _is_stream_requested(body: dict) -> bool:
+    """Retourne True si body[\"stream\"] demande explicitement du streaming."""
+    if not isinstance(body, dict):
+        return False
+    return _normalize_stream_flag(body.get("stream"))
+
+
 # Garde volumétrique globale — somme des bodies en cours de lecture/traitement
 _inflight_bytes: int = 0
 _inflight_lock = threading.Lock()
@@ -3381,6 +3405,10 @@ async def messages(request: Request):
     else:
         _debug(f"  [body] read {len(body_bytes)} bytes in {t_body:.0f}ms parse={t_parse:.0f}ms")
 
+    _is_stream_raw = body.get("stream")
+    _is_stream_norm = _is_stream_requested(body)
+    _debug(f"  [stream-debug] route=messages path={request.url.path} stream={_is_stream_raw!r} type={type(_is_stream_raw).__name__ if _is_stream_raw is not None else 'NoneType'} has_key={'stream' in body} normalized={_is_stream_norm} accept={request.headers.get('accept')} anthropic-beta={request.headers.get('anthropic-beta')} ua={request.headers.get('user-agent','')[:80]}")
+
     original_model = body.get("model", "")
     tool_names = _extract_tool_names(body)
     request_body = body  # Capture original request before mutation
@@ -3429,7 +3457,12 @@ async def messages(request: Request):
               or (body.get("output_config", {}).get("effort") if isinstance(body.get("output_config"), dict) else None)
               or "none")
 
-    _log(f"→ {original_model!r} → {model_id} | {protocol} | stream={body.get('stream', False)} | thinking={thinking_type} | effort={effort} | ip={client_ip}")
+    _log(f"→ {original_model!r} → {model_id} | {protocol} | stream={_is_stream_norm} | thinking={thinking_type} | effort={effort} | ip={client_ip}")
+    if not _is_stream_norm:
+        _debug(f"  → non-stream branch taken (is_stream={_is_stream_norm!r} raw={_is_stream_raw!r})")
+        _ua = (request.headers.get("user-agent") or "").lower()
+        if "claude" in _ua:
+            _log(f"  WARN Claude client request without stream=true on messages — check ANTHROPIC_BASE_URL / DISABLE_STREAMING")
 
     # Circuit breaker check
     if not _cb_should_allow(endpoint):
@@ -3438,7 +3471,7 @@ async def messages(request: Request):
 
     # ── Anthropic pass-through ──────────────────────────────────
     if protocol == "anthropic":
-        is_stream = body.get("stream", False)
+        is_stream = _is_stream_requested(body)
 
         # ── Free model: try BEFORE auth (free models don't need API keys) ──
         if not is_stream and FREE_MODEL_MAP.get(model_id):
@@ -3826,9 +3859,11 @@ async def messages(request: Request):
                 "message": f"All API keys exhausted. Retry after {retry_after}s."}}),
             status_code=503, media_type="application/json",
             headers={"Retry-After": str(retry_after)})
-    is_stream = oai_body["stream"]
+    is_stream = _is_stream_norm  # déjà normalisé à l'entrée (was oai_body["stream"])
+    _debug(f"  [stream-debug] route=messages/openai oai_stream={oai_body.get('stream')!r} normalized={is_stream}")
 
     if not is_stream:
+        _debug(f"  → non-stream branch taken (is_stream={is_stream!r} oai_raw={oai_body.get('stream')!r})")
         # Try free model first if available
         try:
             _ak = _key_from_headers(headers, "openai")
@@ -4360,9 +4395,12 @@ async def chat_completions(request: Request):
     protocol = cfg["protocol"]
     _debug(f"[chat] route: {original_model!r} → {model_id} | {protocol} | endpoint={endpoint}")
 
+    _is_stream_raw = body.get("stream")
+    is_stream = _is_stream_requested(body)
+    _debug(f"  [stream-debug] route=chat_completions path={request.url.path} stream={_is_stream_raw!r} type={type(_is_stream_raw).__name__ if _is_stream_raw is not None else 'NoneType'} has_key={'stream' in body} normalized={is_stream} accept={request.headers.get('accept')} anthropic-beta={request.headers.get('anthropic-beta')} ua={request.headers.get('user-agent','')[:80]}")
+
     body = dict(body)
     body["model"] = model_id
-    is_stream = body.get("stream", False)
 
     thinking_raw = body.get("thinking") if isinstance(body.get("thinking"), dict) else {}
     thinking_type = thinking_raw.get("type", "none") if isinstance(thinking_raw, dict) and thinking_raw else "none"
@@ -4378,6 +4416,11 @@ async def chat_completions(request: Request):
     await _handle_web_search(body, model_id, protocol)
 
     _log(f"→ {original_model!r} → {model_id} | {protocol} | chat/completions | stream={is_stream} | thinking={thinking_type} | effort={effort} | ip={client_ip}")
+    if not is_stream:
+        _debug(f"  → non-stream branch taken (is_stream={is_stream!r} raw={_is_stream_raw!r})")
+        _ua = (request.headers.get("user-agent") or "").lower()
+        if "claude" in _ua:
+            _log(f"  WARN Claude client request without stream=true on chat/completions — check ANTHROPIC_BASE_URL / DISABLE_STREAMING")
 
     # Circuit breaker check
     if not _cb_should_allow(endpoint):
@@ -5047,6 +5090,10 @@ async def responses(request: Request):
 
     body = ensure_min_tokens(body)
 
+    _is_stream_raw = body.get("stream")
+    is_stream = _is_stream_requested(body)
+    _debug(f"  [stream-debug] route=responses path={request.url.path} stream={_is_stream_raw!r} type={type(_is_stream_raw).__name__ if _is_stream_raw is not None else 'NoneType'} has_key={'stream' in body} normalized={is_stream} accept={request.headers.get('accept')} ua={request.headers.get('user-agent','')[:80]}")
+
     original_model = body.get("model", "")
     tool_names = _extract_tool_names(body)
     request_body = body  # Capture original request before mutation
@@ -5061,9 +5108,10 @@ async def responses(request: Request):
     cfg = get_model_config(model_id)
     endpoint = cfg["endpoint"]
     protocol = cfg["protocol"]
-    is_stream = body.get("stream", False)
 
     _log(f"→ {original_model!r} → {model_id} | {protocol} | responses | stream={is_stream} | ip={client_ip}")
+    if not is_stream:
+        _debug(f"  → non-stream branch taken (is_stream={is_stream!r} raw={_is_stream_raw!r})")
 
     # Circuit breaker check
     if not _cb_should_allow(endpoint):
@@ -5286,9 +5334,14 @@ async def responses(request: Request):
                 "type": "api_error", "code": "503"}}),
             status_code=503, media_type="application/json",
             headers={"Retry-After": str(retry_after)})
-    is_stream = oai_body["stream"]
+    # oai_body stream reflète body/stream déjà normalisé — on garde is_stream d'entrée si absent
+    _oai_raw = oai_body.get("stream")
+    if _oai_raw is not None:
+        is_stream = _normalize_stream_flag(_oai_raw)
+    _debug(f"  [stream-debug] route=responses/openai oai_stream={oai_body.get('stream')!r} normalized={is_stream}")
 
     if not is_stream:
+        _debug(f"  → non-stream branch taken (is_stream={is_stream!r} oai_raw={oai_body.get('stream')!r})")
         # Try free model first if available
         try:
             _ak = _key_from_headers(headers, "openai")

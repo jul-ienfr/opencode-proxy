@@ -47,6 +47,12 @@
     "match": [
       "deepseek-v4-flash"
     ],
-    "model": "mimo-v2.5"
+    "model": "muse-spark-1.2-contributor"
+  },
+  "musespark12contributor": {
+    "match": [
+      "muse-spark-1.2-contributor"
+    ],
+    "model": "muse-spark-1.2-contributor"
   }
 }

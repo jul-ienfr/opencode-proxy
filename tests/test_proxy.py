@@ -35,6 +35,8 @@ from opencode import (
     _Bucket,
     RATE_LIMIT_RPS,
     RATE_LIMIT_BURST,
+    _normalize_stream_flag,
+    _is_stream_requested,
 )
 from config.settings import _resolve_protocol, KNOWN_PROTOCOLS
 
@@ -426,12 +428,20 @@ class TestBucket:
 
 @pytest.fixture(autouse=True)
 def _disable_mapping_off(monkeypatch):
-    """Force DISABLE_MAPPING=False and clear custom routes for route tests."""
+    """Force DISABLE_MAPPING=False and clear custom routes for route tests.
+
+    Must also rebuild SORTED_* lists — _route_for() iterates over
+    config.settings.SORTED_CUSTOM_ROUTES / SORTED_ROUTES, not the dicts
+    directly, so patching only the dicts leaves stale shadowing entries.
+    """
     monkeypatch.setattr(_opencode_mod, "DISABLE_MAPPING", False)
-    # Rebuild ROUTES without custom route overrides (use config.load_routes with empty custom)
     from config import settings as _cfg_settings
     monkeypatch.setattr(_cfg_settings, "CUSTOM_ROUTES", {})
+    monkeypatch.setattr(_cfg_settings, "DISABLE_MAPPING", False)
     _clean_routes = _cfg_settings.load_routes()
+    monkeypatch.setattr(_cfg_settings, "ROUTES", _clean_routes)
+    monkeypatch.setattr(_cfg_settings, "SORTED_ROUTES", _cfg_settings._sort_routes_by_match(_clean_routes))
+    monkeypatch.setattr(_cfg_settings, "SORTED_CUSTOM_ROUTES", [])
     monkeypatch.setattr(_opencode_mod, "ROUTES", _clean_routes)
     monkeypatch.setattr(_opencode_mod, "CUSTOM_ROUTES", {})
 
@@ -902,3 +912,111 @@ class TestResolveProtocol:
         assert expected_anthropic.issubset(set(
             k for k, v in KNOWN_PROTOCOLS.items() if v == "anthropic"
         ))
+
+
+# ── Stream Flag Normalization ──────────────────────────────────
+
+class TestNormalizeStreamFlag:
+    """Test _normalize_stream_flag handles bool / string / int variants."""
+
+    def test_true_bool(self):
+        assert _normalize_stream_flag(True) is True
+
+    def test_false_bool(self):
+        assert _normalize_stream_flag(False) is False
+
+    def test_none_is_false(self):
+        assert _normalize_stream_flag(None) is False
+
+    def test_string_true_variants(self):
+        for v in ("true", "True", "TRUE", "  true  ", "1", "yes", "YES"):
+            assert _normalize_stream_flag(v) is True, f"expected True for {v!r}"
+
+    def test_string_false_variants(self):
+        for v in ("false", "False", "0", "no", "", "  ", "maybe"):
+            assert _normalize_stream_flag(v) is False, f"expected False for {v!r}"
+
+    def test_int_nonzero_true(self):
+        assert _normalize_stream_flag(1) is True
+        assert _normalize_stream_flag(2) is True
+
+    def test_int_zero_false(self):
+        assert _normalize_stream_flag(0) is False
+
+    def test_other_truthy_is_true(self):
+        assert _normalize_stream_flag([1]) is True
+        assert _normalize_stream_flag({"a": 1}) is True
+
+
+class TestIsStreamRequested:
+    """Test _is_stream_requested reads body[stream] via normalization."""
+
+    def test_missing_key_is_false(self):
+        assert _is_stream_requested({}) is False
+        assert _is_stream_requested({"model": "glm-5.1"}) is False
+
+    def test_false_and_none(self):
+        assert _is_stream_requested({"stream": False}) is False
+        assert _is_stream_requested({"stream": None}) is False
+
+    def test_true_bool(self):
+        assert _is_stream_requested({"stream": True}) is True
+
+    def test_string_variants(self):
+        assert _is_stream_requested({"stream": "true"}) is True
+        assert _is_stream_requested({"stream": "1"}) is True
+        assert _is_stream_requested({"stream": "yes"}) is True
+        assert _is_stream_requested({"stream": "false"}) is False
+        assert _is_stream_requested({"stream": "0"}) is False
+
+    def test_int_variants(self):
+        assert _is_stream_requested({"stream": 1}) is True
+        assert _is_stream_requested({"stream": 0}) is False
+
+    def test_non_dict_is_false(self):
+        assert _is_stream_requested(None) is False
+        assert _is_stream_requested("true") is False
+        assert _is_stream_requested([]) is False
+
+
+class TestStreamPropagation:
+    """Test anthropic_to_openai propagates stream flag and normalization is decoupled."""
+
+    def _base_body(self, stream_val=None):
+        body = {
+            "model": "claude-3-opus",
+            "messages": [{"role": "user", "content": "Hi"}],
+        }
+        if stream_val is not None or stream_val == False:  # allow explicit False
+            body["stream"] = stream_val
+        return body
+
+    def test_propagates_true(self):
+        body = {"model": "claude-3-opus", "messages": [{"role": "user", "content": "Hi"}], "stream": True}
+        result = anthropic_to_openai(body, "claude-3-opus")
+        assert result["stream"] is True
+        assert _is_stream_requested(body) is True
+
+    def test_propagates_false(self):
+        body = {"model": "claude-3-opus", "messages": [{"role": "user", "content": "Hi"}], "stream": False}
+        result = anthropic_to_openai(body, "claude-3-opus")
+        assert result["stream"] is False
+        assert _is_stream_requested(body) is False
+
+    def test_missing_stream_defaults_false(self):
+        body = {"model": "claude-3-opus", "messages": [{"role": "user", "content": "Hi"}]}
+        result = anthropic_to_openai(body, "claude-3-opus")
+        assert result["stream"] is False
+        assert _is_stream_requested(body) is False
+
+    def test_string_true_normalizes_but_oai_keeps_raw(self):
+        body = {"model": "claude-3-opus", "messages": [{"role": "user", "content": "Hi"}], "stream": "true"}
+        # Proxy branching must treat it as streaming
+        assert _is_stream_requested(body) is True
+        # anthropic_to_openai currently keeps raw value (string) — branching uses normalized flag, not raw
+        result = anthropic_to_openai(body, "claude-3-opus")
+        assert result["stream"] == "true"
+
+    def test_int_stream_variants(self):
+        assert _is_stream_requested({"stream": 1}) is True
+        assert _is_stream_requested({"stream": 0}) is False
