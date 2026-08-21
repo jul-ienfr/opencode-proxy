@@ -3,6 +3,7 @@ Claude Code Proxy → opencode.ai
 Convert Anthropic /v1/messages ↔ OpenAI chat/completions
 """
 
+import hashlib
 import json
 import uuid
 import time
@@ -489,9 +490,130 @@ if DEBUG:
     set_debug_log_file(os.path.join(LOG_DIR, "debug.log"))
     _debug("Debug mode enabled — full request/response logging active")
 
-# Request body size limit (from YAML config, default 10 MB)
-MAX_BODY_SIZE = yaml_get("upstream", "max_body_size", 10 * 1024 * 1024)
+# Request body size limit — per-route dict (default 10MB, messages 25MB for /compact)
+_RAW_MAX_BODY_SIZE = yaml_get("upstream", "max_body_size", 10 * 1024 * 1024)
+if isinstance(_RAW_MAX_BODY_SIZE, dict):
+    MAX_BODY_SIZE_DEFAULT = _RAW_MAX_BODY_SIZE.get("default", 10 * 1024 * 1024)
+    MAX_BODY_SIZE_MAP = {k: v for k, v in _RAW_MAX_BODY_SIZE.items() if k != "default"}
+else:
+    MAX_BODY_SIZE_DEFAULT = _RAW_MAX_BODY_SIZE
+    MAX_BODY_SIZE_MAP = {}
+# Backward compat: scalar MAX_BODY_SIZE still available
+MAX_BODY_SIZE = MAX_BODY_SIZE_DEFAULT
 MAX_BODY_STORAGE = 100_000  # Max chars stored per request/response body in DB
+
+
+def _limit_for(route: str) -> int:
+    return MAX_BODY_SIZE_MAP.get(route, MAX_BODY_SIZE_DEFAULT)
+
+
+# Garde volumétrique globale — somme des bodies en cours de lecture/traitement
+_inflight_bytes: int = 0
+_inflight_lock = threading.Lock()
+_count_tokens_cache: dict[str, tuple[float, int]] = {}  # blake2b hex -> (mono_ts, tokens)
+_COUNT_TOKENS_TTL = 5.0
+
+
+def _try_reserve_inflight(n: int) -> bool:
+    """Tente de réserver n bytes sur le compteur global. Retourne False si 100 Mo dépassés."""
+    max_inflight = int(yaml_get("limits", "max_body_bytes_inflight", 104857600))
+    if max_inflight <= 0:
+        return True
+    with _inflight_lock:
+        global _inflight_bytes
+        if _inflight_bytes + n > max_inflight:
+            return False
+        _inflight_bytes += n
+        return True
+
+
+def _release_inflight(n: int):
+    global _inflight_bytes
+    with _inflight_lock:
+        _inflight_bytes = max(0, _inflight_bytes - n)
+
+
+async def _read_body_limited(request: Request, route: str):
+    """Check Content-Length before buffering, then real body size. Returns bytes or Response 413/429.
+
+    Garde volumétrique: réserve Content-Length avant buffering; ajuste après lecture réelle.
+    L'appelant doit appeler _release_inflight(len(body_bytes)) dès que body_bytes n'est plus nécessaire
+    (après parse) pour libérer la pression globale. Si l'appelant retourne directement le Response
+    d'erreur, la réservation est déjà libérée ici.
+    """
+    limit = _limit_for(route)
+    cl = request.headers.get("content-length")
+    cl_int = None
+    reserved = 0
+    if cl is not None:
+        try:
+            cl_int = int(cl)
+            if cl_int > limit:
+                _debug(f"  413 early-reject route={route} content-length={cl} limit={limit}")
+                return _anthropic_error(413, f"Request body too large ({cl} bytes, max {limit})")
+            # Garde volumétrique pré-alloc
+            if not _try_reserve_inflight(cl_int):
+                _debug(f"  429 inflight guard route={route} cl={cl_int} inflight={_inflight_bytes}")
+                _log(f"  429 inflight guard: route={route} cl={cl_int} inflight={_inflight_bytes}")
+                return _anthropic_error(429, f"Server too busy (inflight limit). Try again shortly.")
+            reserved = cl_int
+        except ValueError:
+            cl_int = None
+
+    body = await request.body()
+
+    # Ajuste la réservation si taille réelle != annoncée, ou si pas de Content-Length
+    if reserved:
+        diff = len(body) - reserved
+        if diff > 0:
+            # Besoin de plus que réservé : tente d'étendre, sinon 429
+            if not _try_reserve_inflight(diff):
+                _release_inflight(reserved)
+                _debug(f"  429 inflight guard (grow) route={route} body={len(body)} reserved={reserved}")
+                return _anthropic_error(429, f"Server too busy (inflight limit). Try again shortly.")
+            reserved = len(body)
+        elif diff < 0:
+            _release_inflight(-diff)
+            reserved = len(body)
+    else:
+        # Pas de réservation préalable (pas de Content-Length) — réserve maintenant
+        if not _try_reserve_inflight(len(body)):
+            _debug(f"  429 inflight guard (no-cl) route={route} body={len(body)} inflight={_inflight_bytes}")
+            return _anthropic_error(429, f"Server too busy (inflight limit). Try again shortly.")
+        reserved = len(body)
+
+    # Per-route limit post-read (plus fiable que CL seul)
+    if len(body) > limit:
+        _release_inflight(reserved)
+        _debug(f"  413 route={route} body={len(body)} limit={limit}")
+        if route == "chat_completions":
+            return _openai_error(413, f"Request body too large ({len(body)} bytes, max {limit})")
+        return _anthropic_error(413, f"Request body too large ({len(body)} bytes, max {limit})")
+
+    # Succès: on garde la réservation — l'appelant libère via _release_inflight(len(body))
+    # On attache la taille réservée pour éviter un double len() si body est re-slicé
+    return body
+
+
+async def _parse_json_bytes(b: bytes) -> dict:
+    """Parse JSON off event loop if body > threshold, else inline."""
+    thresh = yaml_get("limits", "compact_json_thread_threshold", 1_048_576)
+    if len(b) > thresh:
+        return await asyncio.to_thread(json.loads, b)
+    return json.loads(b)
+
+
+async def _dump_json_limited(obj: dict) -> str:
+    """Serialize JSON off event loop if estimated size > threshold."""
+    thresh = yaml_get("limits", "compact_json_thread_threshold", 1_048_576)
+    # Quick estimate without full serialization
+    try:
+        est = len(str(obj))  # cheap upper bound
+    except Exception:
+        est = thresh + 1
+    if est > thresh:
+        return await asyncio.to_thread(json.dumps, obj, ensure_ascii=False, separators=(',', ':'))
+    return json.dumps(obj, ensure_ascii=False, separators=(',', ':'))
 
 
 def _truncate_body_for_storage(body: dict, max_chars: int = MAX_BODY_STORAGE) -> str | None:
@@ -501,7 +623,8 @@ def _truncate_body_for_storage(body: dict, max_chars: int = MAX_BODY_STORAGE) ->
     avoiding the memory waste of serializing a 10MB body just to keep 100K.
 
     Optimized: builds truncated version first, only falls back to full
-    serialization if the truncated version is small enough.
+    serialization if the truncated version is small enough. Logs when /compact
+    truncation occurs for observability.
     """
     if not body:
         return None
@@ -525,10 +648,33 @@ def _truncate_body_for_storage(body: dict, max_chars: int = MAX_BODY_STORAGE) ->
     truncated = {k: v for k, v in body.items() if k != "messages"}
     if messages:
         truncated["messages"] = messages[:2] + [{"_truncated": True, "original_count": len(messages)}]
+        # Compact observability: log truncation on large contexts
+        if len(messages) > 20:
+            _debug(f"  [compact-storage] truncated {len(messages)}→2 messages for DB (max_chars={max_chars})")
     result = json.dumps(truncated, ensure_ascii=False, separators=(',', ':'))
     if len(result) > max_chars:
         result = result[:max_chars]
     return result
+
+
+async def _truncate_body_for_storage_async(body: dict, max_chars: int = MAX_BODY_STORAGE) -> str | None:
+    """Async wrapper: offloads JSON serialization to thread if body is large (>1 Mo estimated)."""
+    if not body:
+        return None
+    # Cheap size gate: messages count or estimate
+    msgs = body.get("messages", []) if isinstance(body, dict) else []
+    thresh = int(yaml_get("limits", "compact_json_thread_threshold", 1_048_576))
+    # Estimate quickly without full serialization
+    try:
+        est = sum(len(str(v)) for k, v in body.items() if k != "messages")
+        for m in msgs[:2]:
+            est += len(str(m))
+    except Exception:
+        est = thresh + 1
+    # If body likely large, offload to thread to avoid blocking event loop
+    if est > thresh or len(msgs) > 50:
+        return await asyncio.to_thread(_truncate_body_for_storage, body, max_chars)
+    return _truncate_body_for_storage(body, max_chars)
 
 # SQLite setup — synchronous connection, all DB ops run in thread pool
 _db_path = os.path.join(LOG_DIR, "requests.db")
@@ -723,8 +869,8 @@ async def _save_request(req_id, model, original_model, duration_ms,
 	                  request_body=None, response_body=None, free_model_ip=None):
     tools_json = json.dumps(tools) if tools else "[]"
     tools_used_json = json.dumps(list(dict.fromkeys(tools_used))) if tools_used else "[]"
-    request_body_json = _truncate_body_for_storage(request_body) if request_body else None
-    response_body_json = _truncate_body_for_storage(response_body) if response_body else None
+    request_body_json = await _truncate_body_for_storage_async(request_body) if request_body else None
+    response_body_json = await _truncate_body_for_storage_async(response_body) if response_body else None
     client_user_agent = _current_user_agent.get()
     timestamp = time.strftime("%Y-%m-%dT%H:%M:%S")
     await asyncio.to_thread(
@@ -839,7 +985,10 @@ _transport = httpx.AsyncHTTPTransport(
 ) if PROXY else httpx.AsyncHTTPTransport(
     limits=httpx.Limits(max_connections=200, max_keepalive_connections=50, keepalive_expiry=120),
 )
-_client = httpx.AsyncClient(transport=_transport, timeout=httpx.Timeout(connect=30, read=600, write=30, pool=10))
+_t = yaml_get("upstream", "timeout", {}) or {}
+_client = httpx.AsyncClient(transport=_transport, timeout=httpx.Timeout(
+    connect=_t.get("connect", 30), read=_t.get("read", 600),
+    write=_t.get("write", 30), pool=_t.get("pool", 10)))
 
 # ── VPN / IP rotation (initialized in lifespan) ──────────────────
 _vpn_manager = None
@@ -862,10 +1011,18 @@ def _truncate(body, max_len=None) -> str:
     if max_len is None:
         max_len = yaml_get("debug", "truncate_max", 2000)
     """Pretty-print a body for debug logging, truncated to max_len chars."""
+    # Avoid json.dumps on huge /compact bodies (20MB → 80-150ms event-loop block)
     try:
+        # Quick cheap estimate: messages count * avg size
+        msgs = body.get("messages") if isinstance(body, dict) else None
+        if isinstance(msgs, list) and len(msgs) > 20:
+            return f"<body too large for debug: {len(msgs)} messages, keys={list(body.keys())[:6]}>"
         text = json.dumps(body, indent=2, ensure_ascii=False, default=str)
     except Exception:
-        text = str(body)
+        try:
+            text = str(body)
+        except Exception:
+            return "<unprintable body>"
     if len(text) > max_len:
         return text[:max_len] + f"\n... [{len(text) - max_len} chars truncated]"
     return text
@@ -1679,6 +1836,13 @@ async def _do_request_with_retry(endpoint, body, headers, protocol, retry_on_429
         except httpx.TimeoutException as e:
             _debug(f"  ✗ timeout after {(time.monotonic()-t0)*1000:.0f}ms: {e}")
             _log(f"  UPSTREAM TIMEOUT: {type(e).__name__}: {e}")
+            if attempt < max_retries - 1:
+                wait = 1.0 * (2 ** attempt)
+                _debug(f"  ⟳ timeout retry in {wait:.1f}s (attempt {attempt+1}/{max_retries})")
+                _log(f"  TIMEOUT RETRY after {wait:.1f}s (attempt {attempt+1}/{max_retries})")
+                await asyncio.sleep(wait)
+                attempt += 1
+                continue
             raise UpstreamError(f"Upstream request timed out: {e}", status_code=504, original=e) from e
         except httpx.RequestError as e:
             _debug(f"  ✗ request error after {(time.monotonic()-t0)*1000:.0f}ms: {e}")
@@ -3098,8 +3262,13 @@ def _estimate_tokens(text: str) -> int:
     return max(1, len(text) // 3)
 
 
-def _estimate_input_tokens(body: dict) -> int:
-    """Estimate input tokens from message content, tools, and tool_results."""
+def _estimate_input_tokens(body: dict, precise: bool = False) -> int:
+    """Estimate input tokens from message content, tools, and tool_results.
+
+    Fast-path: avoids "\n".join allocation when total_chars exceeds threshold
+    (divisor 3.5 more accurate than 3 for cl100k). count_tokens bypasses fast-path
+    when precise=True to preserve accuracy.
+    """
     try:
         chunks = []
 
@@ -3138,6 +3307,15 @@ def _estimate_input_tokens(body: dict) -> int:
                         else:
                             chunks.append(block.get("text", ""))
                             chunks.append(str(block.get("input", "")))
+
+        # Fast-path without allocation: capte 90% des gros contextes /compact
+        total_chars = sum(len(c) for c in chunks) + max(0, len(chunks) - 1)
+        thresh = yaml_get("limits", "compact_tiktoken_char_limit", 100_000)
+        # count_tokens needs precise estimate; use 1M threshold to preserve accuracy
+        if precise:
+            thresh = 1_000_000
+        if total_chars > thresh:
+            return max(1, int(total_chars / 3.5))
 
         combined = "\n".join(chunks)
         if _encoding:
@@ -3183,17 +3361,25 @@ async def messages(request: Request):
     client_ip = _get_client_ip(request)
     _current_user_agent.set(request.headers.get("user-agent"))
 
-    body_bytes = await request.body()
-    _debug(f"  [body] read {len(body_bytes)} bytes in {(time.monotonic() - start_time) * 1000:.0f}ms")
-    if len(body_bytes) > MAX_BODY_SIZE:
-        _debug(f"  413: body too large ({len(body_bytes)} bytes)")
-        return _anthropic_error(413, f"Request body too large ({len(body_bytes)} bytes, max {MAX_BODY_SIZE})")
-
+    t_body0 = time.monotonic()
+    body_bytes = await _read_body_limited(request, "messages")
+    if isinstance(body_bytes, Response):
+        return body_bytes
+    t_body = (time.monotonic() - t_body0) * 1000
+    t_parse0 = time.monotonic()
     try:
-        body = json.loads(body_bytes)
+        body = await _parse_json_bytes(body_bytes)
     except Exception:
+        _release_inflight(len(body_bytes))
         _debug(f"  400: invalid JSON body")
         return _anthropic_error(400, "invalid json")
+    t_parse = (time.monotonic() - t_parse0) * 1000
+    _release_inflight(len(body_bytes))
+    if len(body_bytes) > 500_000:
+        _debug(f"  [compact-timing] route=messages body={len(body_bytes)}b body_read={t_body:.0f}ms parse={t_parse:.0f}ms")
+        _log(f"  [compact-timing] route=messages body={len(body_bytes)}b body_read={t_body:.0f}ms parse={t_parse:.0f}ms")
+    else:
+        _debug(f"  [body] read {len(body_bytes)} bytes in {t_body:.0f}ms parse={t_parse:.0f}ms")
 
     original_model = body.get("model", "")
     tool_names = _extract_tool_names(body)
@@ -3403,8 +3589,8 @@ async def messages(request: Request):
                 _track_model = free_model  # Log as free model
             else:
                 _using_free = False
-            # Defer token estimation to first chunk — reduces pre-response latency
-            est_input = await asyncio.to_thread(_estimate_input_tokens, body)
+            # Fast-path synchronous (<5ms) — no to_thread to avoid TTFB penalty on /compact
+            est_input = _estimate_input_tokens(body)
             _debug(f"  [stream] est_input={est_input}")
             _update_token_usage(_track_model, est_input, 0, 0)
             stream_in = None
@@ -3474,7 +3660,10 @@ async def messages(request: Request):
                             yield chunk
                             _line_buf += chunk.decode("utf-8", errors="replace")
                             if len(_line_buf) > yaml_get("streaming", "line_buffer_max", 1_000_000):
-                                _line_buf = _line_buf[-1000:]
+                                _debug(f"  [stream] line_buf overflow len={len(_line_buf)} — resync to next newline")
+                                _log(f"  WARN stream line_buf truncated (len={len(_line_buf)})")
+                                nl = _line_buf.find("\n")
+                                _line_buf = _line_buf[nl + 1:] if nl != -1 else ""
                             while "\n" in _line_buf:
                                 line, _line_buf = _line_buf.split("\n", 1)
                                 line = line.strip()
@@ -3537,10 +3726,10 @@ async def messages(request: Request):
                     if _attempt == 0:
                         # Network errors (server disconnect, timeout) → retry with same key first
                         _is_network_error = isinstance(e, (httpx.RemoteProtocolError, httpx.ReadError,
-                                                           ConnectionError, OSError)) or "disconnected" in str(e).lower()
+                                                           httpx.TimeoutException, ConnectionError, OSError)) or "disconnected" in str(e).lower() or "timeout" in str(e).lower()
                         if _is_network_error:
-                            _debug(f"  ⟳ stream retry (network error, same key)")
-                            _log(f"  Retrying stream (network error, same key)")
+                            _debug(f"  ⟳ stream retry (network error/timeout, same key)")
+                            _log(f"  Retrying stream (network error/timeout, same key)")
                             await asyncio.sleep(1.0)
                             continue
                         # Auth/quota errors → try alternative key
@@ -4079,11 +4268,47 @@ async def list_models():
 
 @app.post("/v1/messages/count_tokens")
 async def count_tokens(request: Request):
+    t_body0 = time.monotonic()
+    body_bytes = await _read_body_limited(request, "messages")
+    if isinstance(body_bytes, Response):
+        return body_bytes
+    t_body = (time.monotonic() - t_body0) * 1000
+    # blake2b cache (TTL 5s) — même primitive que _ResponseCache
+    _cache_key = hashlib.blake2b(body_bytes, digest_size=16).hexdigest()
+    _cached = _count_tokens_cache.get(_cache_key)
+    if _cached is not None:
+        _ts, _tok = _cached
+        if time.monotonic() - _ts < _COUNT_TOKENS_TTL:
+            _release_inflight(len(body_bytes))
+            _debug(f"  [count_tokens] cache hit tokens={_tok} body={len(body_bytes)}b")
+            return {"input_tokens": _tok}
+        else:
+            _count_tokens_cache.pop(_cache_key, None)
+    t_parse0 = time.monotonic()
     try:
-        body = json.loads(await request.body())
+        body = await _parse_json_bytes(body_bytes)
     except Exception:
+        _release_inflight(len(body_bytes))
         return _anthropic_error(400, "invalid json")
-    tokens = await asyncio.to_thread(_estimate_input_tokens, body)
+    t_parse = (time.monotonic() - t_parse0) * 1000
+    _release_inflight(len(body_bytes))
+    if len(body_bytes) > 500_000:
+        _debug(f"  [compact-timing] route=count_tokens body={len(body_bytes)}b body_read={t_body:.0f}ms parse={t_parse:.0f}ms")
+    else:
+        _debug(f"  [body] count_tokens read {len(body_bytes)} bytes body_read={t_body:.0f}ms parse={t_parse:.0f}ms")
+    # count_tokens needs precise estimate — bypass fast-path (higher threshold)
+    t_est0 = time.monotonic()
+    tokens = await asyncio.to_thread(_estimate_input_tokens, body, True)
+    t_est = (time.monotonic() - t_est0) * 1000
+    if len(body_bytes) > 500_000:
+        _debug(f"  [compact-timing] route=count_tokens est={t_est:.0f}ms tokens={tokens}")
+    # Populate cache + opportunistic sweep of expired entries
+    _count_tokens_cache[_cache_key] = (time.monotonic(), tokens)
+    if len(_count_tokens_cache) > 512:
+        _now = time.monotonic()
+        for _k, (_ts2, _) in list(_count_tokens_cache.items()):
+            if _now - _ts2 > _COUNT_TOKENS_TTL:
+                _count_tokens_cache.pop(_k, None)
     return {"input_tokens": tokens}
 
 
@@ -4094,17 +4319,25 @@ async def chat_completions(request: Request):
     client_ip = _get_client_ip(request)
     _current_user_agent.set(request.headers.get("user-agent"))
 
-    body_bytes = await request.body()
-    _debug(f"  [body] read {len(body_bytes)} bytes in {(time.monotonic() - start_time) * 1000:.0f}ms")
-    if len(body_bytes) > MAX_BODY_SIZE:
-        _debug(f"  413: body too large ({len(body_bytes)} bytes)")
-        return _openai_error(413, f"Request body too large ({len(body_bytes)} bytes, max {MAX_BODY_SIZE})")
-
+    t_body0 = time.monotonic()
+    body_bytes = await _read_body_limited(request, "chat_completions")
+    if isinstance(body_bytes, Response):
+        return body_bytes
+    t_body = (time.monotonic() - t_body0) * 1000
+    t_parse0 = time.monotonic()
     try:
-        body = json.loads(body_bytes)
+        body = await _parse_json_bytes(body_bytes)
     except Exception:
+        _release_inflight(len(body_bytes))
         _debug(f"  400: invalid JSON body")
         return _openai_error(400, "invalid json")
+    t_parse = (time.monotonic() - t_parse0) * 1000
+    _release_inflight(len(body_bytes))
+    if len(body_bytes) > 500_000:
+        _debug(f"  [compact-timing] route=chat_completions body={len(body_bytes)}b body_read={t_body:.0f}ms parse={t_parse:.0f}ms")
+        _log(f"  [compact-timing] route=chat_completions body={len(body_bytes)}b body_read={t_body:.0f}ms parse={t_parse:.0f}ms")
+    else:
+        _debug(f"  [body] chat_completions read {len(body_bytes)} bytes body_read={t_body:.0f}ms parse={t_parse:.0f}ms")
 
     original_model = body.get("model", "")
     tool_names = _extract_tool_names(body)
@@ -4270,7 +4503,7 @@ async def chat_completions(request: Request):
                 _track_model = free_model  # Log as free model
             else:
                 _using_free = False
-            est_input = await asyncio.to_thread(_estimate_input_tokens, body)
+            est_input = _estimate_input_tokens(body)
             _update_token_usage(_track_model, est_input, 0, 0)
             _debug(f"  [chat-stream] est_input={est_input}")
             stream_out = 0
@@ -4378,10 +4611,10 @@ async def chat_completions(request: Request):
                     if _attempt == 0:
                         # Network errors (server disconnect, timeout) → retry with same key first
                         _is_network_error = isinstance(e, (httpx.RemoteProtocolError, httpx.ReadError,
-                                                           ConnectionError, OSError)) or "disconnected" in str(e).lower()
+                                                           httpx.TimeoutException, ConnectionError, OSError)) or "disconnected" in str(e).lower() or "timeout" in str(e).lower()
                         if _is_network_error:
-                            _debug(f"  ⟳ stream retry (network error, same key)")
-                            _log(f"  Retrying stream (network error, same key)")
+                            _debug(f"  ⟳ stream retry (network error/timeout, same key)")
+                            _log(f"  Retrying stream (network error/timeout, same key)")
                             await asyncio.sleep(1.0)
                             continue
                         # Auth/quota errors → try alternative key
@@ -4614,8 +4847,11 @@ async def chat_completions(request: Request):
 
                     async for raw in resp.aiter_bytes():
                         _line_buf += raw.decode("utf-8", errors="replace")
-                        if len(_line_buf) > 1_000_000:
-                            _line_buf = _line_buf[-1000:]
+                        if len(_line_buf) > yaml_get("streaming", "line_buffer_max", 1_000_000):
+                            _debug(f"  [stream] line_buf overflow len={len(_line_buf)} — resync to next newline")
+                            _log(f"  WARN stream line_buf truncated (len={len(_line_buf)})")
+                            nl = _line_buf.find("\n")
+                            _line_buf = _line_buf[nl + 1:] if nl != -1 else ""
                         while "\n" in _line_buf:
                             line, _line_buf = _line_buf.split("\n", 1)
                             line = line.strip()
@@ -4737,10 +4973,10 @@ async def chat_completions(request: Request):
                 if _attempt == 0:
                     # Network errors (server disconnect, timeout) → retry with same key first
                     _is_network_error = isinstance(e, (httpx.RemoteProtocolError, httpx.ReadError,
-                                                       ConnectionError, OSError)) or "disconnected" in str(e).lower()
+                                                       httpx.TimeoutException, ConnectionError, OSError)) or "disconnected" in str(e).lower() or "timeout" in str(e).lower()
                     if _is_network_error:
-                        _debug(f"  ⟳ stream retry (network error, same key)")
-                        _log(f"  Retrying stream (network error, same key)")
+                        _debug(f"  ⟳ stream retry (network error/timeout, same key)")
+                        _log(f"  Retrying stream (network error/timeout, same key)")
                         await asyncio.sleep(1.0)
                         continue
                     # Auth/quota errors → try alternative key
@@ -4789,17 +5025,25 @@ async def responses(request: Request):
     client_ip = _get_client_ip(request)
     _current_user_agent.set(request.headers.get("user-agent"))
 
-    body_bytes = await request.body()
-    _debug(f"  [body] read {len(body_bytes)} bytes in {(time.monotonic() - start_time) * 1000:.0f}ms")
-    if len(body_bytes) > MAX_BODY_SIZE:
-        _debug(f"  413: body too large ({len(body_bytes)} bytes)")
-        return _openai_error(413, f"Request body too large ({len(body_bytes)} bytes, max {MAX_BODY_SIZE})")
-
+    t_body0 = time.monotonic()
+    body_bytes = await _read_body_limited(request, "responses")
+    if isinstance(body_bytes, Response):
+        return body_bytes
+    t_body = (time.monotonic() - t_body0) * 1000
+    t_parse0 = time.monotonic()
     try:
-        body = json.loads(body_bytes)
+        body = await _parse_json_bytes(body_bytes)
     except Exception:
+        _release_inflight(len(body_bytes))
         _debug(f"  400: invalid JSON body")
         return _openai_error(400, "invalid json")
+    t_parse = (time.monotonic() - t_parse0) * 1000
+    _release_inflight(len(body_bytes))
+    if len(body_bytes) > 500_000:
+        _debug(f"  [compact-timing] route=responses body={len(body_bytes)}b body_read={t_body:.0f}ms parse={t_parse:.0f}ms")
+        _log(f"  [compact-timing] route=responses body={len(body_bytes)}b body_read={t_body:.0f}ms parse={t_parse:.0f}ms")
+    else:
+        _debug(f"  [body] responses read {len(body_bytes)} bytes body_read={t_body:.0f}ms parse={t_parse:.0f}ms")
 
     body = ensure_min_tokens(body)
 
