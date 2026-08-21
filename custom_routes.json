@@ -3,83 +3,44 @@
     "match": [
       "mimo-v2.5"
     ],
-    "model": "muse-spark-1.2-contributor",
-    "thinking": "adaptive",
-    "geo": {
-      "extends": "meta-muse-spark"
-    }
+    "model": "mimo-v2.5",
+    "thinking": "adaptive"
   },
   "mimov25pro": {
     "match": [
       "mimo-v2.5-pro"
     ],
-    "model": "muse-spark-1.2-contributor",
-    "geo": {
-      "extends": "meta-muse-spark"
-    }
+    "model": "muse-spark-1.2-contributor"
   },
   "qwen35plus": {
     "match": [
       "qwen3.5-plus"
     ],
     "model": "muse-spark-1.2-contributor",
-    "thinking": "adaptive",
-    "geo": {
-      "extends": "meta-muse-spark"
-    }
+    "thinking": "adaptive"
   },
   "gpt54mini": {
     "match": [
       "gpt-5.4-mini"
     ],
-    "model": "muse-spark-1.2-contributor",
-    "geo": {
-      "extends": "meta-muse-spark"
-    }
+    "model": "muse-spark-1.2-contributor"
   },
   "kimik26": {
     "match": [
       "kimi-k2.6"
     ],
-    "model": "muse-spark-1.2-contributor",
-    "geo": {
-      "extends": "meta-muse-spark"
-    }
+    "model": "muse-spark-1.2-contributor"
   },
   "gpt56luna": {
     "match": [
       "gpt-5.6-luna"
     ],
-    "model": "muse-spark-1.2-contributor",
-    "geo": {
-      "extends": "meta-muse-spark"
-    }
+    "model": "muse-spark-1.2-contributor"
   },
   "deepseekv4flash": {
     "match": [
       "deepseek-v4-flash"
     ],
-    "model": "muse-spark-1.2-contributor",
-    "geo": {
-      "extends": "meta-muse-spark"
-    }
-  },
-  "muse-spark-direct": {
-    "match": [
-      "muse-spark-1.2-contributor"
-    ],
-    "model": "muse-spark-1.2-contributor",
-    "geo": {
-      "extends": "meta-muse-spark"
-    }
-  },
-  "muse-spark-free-direct": {
-    "match": [
-      "muse-spark-1.2-contributor-free"
-    ],
-    "model": "muse-spark-1.2-contributor-free",
-    "geo": {
-      "extends": "meta-muse-spark"
-    }
+    "model": "mimo-v2.5"
   }
 }

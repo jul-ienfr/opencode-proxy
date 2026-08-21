@@ -103,7 +103,12 @@ models:
     protocol: openai
   x-preview-f-free:
     protocol: openai
+  ox-alpha-free:
+    protocol: openai
+  deepseek-v4-flash-vision-exp:
+    protocol: openai
 free_model_map:
+  mimo-v2.5: mimo-v2.5-free
   glm-5.2: deepseek-v4-flash-free
   glm-5.1: deepseek-v4-flash-free
   glm-5: deepseek-v4-flash-free
@@ -115,7 +120,6 @@ free_model_map:
   mimo-v2-pro: deepseek-v4-flash-free
   mimo-v2-omni: deepseek-v4-flash-free
   mimo-v2.5-pro: deepseek-v4-flash-free
-  mimo-v2.5: deepseek-v4-flash-free
   minimax-m2.7: mimo-v2.5-free
   minimax-m3: mimo-v2.5-free
   minimax-m2.5: mimo-v2.5-free
@@ -127,7 +131,7 @@ free_model_map:
   muse-spark-1.2-contributor: muse-spark-1.2-contributor-free
 ip_rotation:
   enabled: true
-  proxy_mode: vpn
+  proxy_mode: direct
   dual_station: true
   station_count: 3
   strict_free: false
@@ -205,6 +209,7 @@ ip_rotation:
 geo:
   enabled: true
   version: 1
+  allow_direct_when_compatible: true
   policies:
     meta-muse-spark:
       allowed_countries:
@@ -221,47 +226,33 @@ custom_routes:
   mimov25:
     match:
     - mimo-v2.5
-    model: muse-spark-1.2-contributor
+    model: mimo-v2.5
     thinking: adaptive
-    geo:
-      extends: meta-muse-spark
   mimov25pro:
     match:
     - mimo-v2.5-pro
     model: muse-spark-1.2-contributor
-    geo:
-      extends: meta-muse-spark
   qwen35plus:
     match:
     - qwen3.5-plus
     model: muse-spark-1.2-contributor
     thinking: adaptive
-    geo:
-      extends: meta-muse-spark
   gpt54mini:
     match:
     - gpt-5.4-mini
     model: muse-spark-1.2-contributor
-    geo:
-      extends: meta-muse-spark
   kimik26:
     match:
     - kimi-k2.6
     model: muse-spark-1.2-contributor
-    geo:
-      extends: meta-muse-spark
   gpt56luna:
     match:
     - gpt-5.6-luna
     model: muse-spark-1.2-contributor
-    geo:
-      extends: meta-muse-spark
   deepseekv4flash:
     match:
     - deepseek-v4-flash
-    model: muse-spark-1.2-contributor
-    geo:
-      extends: meta-muse-spark
+    model: mimo-v2.5
 api_keys: []
 tool_capabilities:
   _default:
@@ -327,6 +318,8 @@ thinking:
   min_tokens:
     deepseek-v4-flash: 2048
     deepseek-v4-pro: 4096
+    muse-spark-1.2-contributor: 1024
+    muse-spark-1.2-contributor-free: 1024
   default_min_tokens: 256
 cache_rewrite_models:
 - mimo-v2.5

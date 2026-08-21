@@ -232,6 +232,7 @@ GEO_ENABLED: bool = bool(yaml_get("geo", "enabled", False))
 GEO_VERSION: int = int(yaml_get("geo", "version", 1) or 1)
 GEO_POLICIES: dict = yaml_get("geo", "policies", {}) if isinstance(yaml_get("geo", "policies", {}), dict) else {}
 SORTED_GEO_POLICIES: list = sorted(GEO_POLICIES.items()) if isinstance(GEO_POLICIES, dict) else []
+GEO_ALLOW_DIRECT_WHEN_COMPATIBLE: bool = bool(yaml_get("geo", "allow_direct_when_compatible", True))
 
 
 def _server_countries_set() -> set:
@@ -356,6 +357,30 @@ def resolve_geo(route: dict) -> dict:
     return {"effective_allowed": effective, "mode": mode, "require_vpn": require_vpn, "geo_status": geo_status}
 
 
+def geo_strict_union() -> set:
+    """Union des effective_allowed de toutes les policies strict+require_vpn (Axe B).
+
+    Vide si GEO désactivé ou aucune policy strict. Consulté par vpn_manager
+    pour filtrer les rotations géo-restricted.
+    """
+    if not GEO_ENABLED:
+        return set()
+    union: set = set()
+    for _name, _pol in (GEO_POLICIES.items() if isinstance(GEO_POLICIES, dict) else []):
+        # La policy brute peut ne pas avoir blocked/allowed — on passe par
+        # un faux route {geo: {extends: name}} pour réutiliser resolve_geo
+        # (normalisation + intersection server_countries).
+        try:
+            _info = resolve_geo({"geo": {"extends": _name}})
+        except Exception:
+            continue
+        if _info.get("mode") == "strict" and _info.get("require_vpn") and _info.get("geo_status") != "misconfigured":
+            eff = _info.get("effective_allowed")
+            if isinstance(eff, set):
+                union |= eff
+    return union
+
+
 def resolved_station_count(cfg: dict) -> int:
     """Resolve the number of parallel VPN stations (1-10).
 
@@ -420,14 +445,24 @@ def _resolve_protocol(model_id: str) -> str:
 # ── Models ──────────────────────────────────────────────────────────
 _models_cfg = yaml_get("models", default={})
 MODELS = {}
+# muse-* and spark-* models use /v1/responses (Responses API), not /chat/completions
+# Paid: https://opencode.ai/zen/go/v1/responses, Free: https://opencode.ai/zen/v1/responses
+_RESPONSES_ENDPOINT = "https://opencode.ai/zen/go/v1/responses"
+_RESPONSES_FREE_ENDPOINT = "https://opencode.ai/zen/v1/responses"
 for _model_id, _model_data in _models_cfg.items():
     if isinstance(_model_data, dict):
         _proto = _model_data.get("protocol", "openai")
         _lid = _model_id.lower()
         if _lid.endswith("-free"):
-            _endpoint = API_BASE_FREE
+            if "muse" in _lid or "spark" in _lid:
+                _endpoint = _RESPONSES_FREE_ENDPOINT
+            else:
+                _endpoint = API_BASE_FREE
         else:
-            _endpoint = API_BASE_OPENAI if _proto == "openai" else API_BASE_ANTHROPIC
+            if "muse" in _lid or "spark" in _lid:
+                _endpoint = _RESPONSES_ENDPOINT
+            else:
+                _endpoint = API_BASE_OPENAI if _proto == "openai" else API_BASE_ANTHROPIC
         MODELS[_model_id] = {"endpoint": _endpoint, "protocol": _proto}
 
 def _fetch_upstream_models():
@@ -644,6 +679,14 @@ def _fetch_free_models_sync(timeout: float = 10) -> tuple:
 
 
 def _free_endpoint_for(free_id: str) -> str:
+    """Return the correct free endpoint for a model.
+
+    muse-* and spark-* models use the /v1/responses endpoint (Responses API),
+    while other models use the standard /v1/chat/completions endpoint.
+    """
+    lid = free_id.lower()
+    if "muse" in lid or "spark" in lid:
+        return "https://opencode.ai/zen/v1/responses"
     return API_BASE_FREE
 
 
@@ -1003,7 +1046,7 @@ def maybe_reload_custom_routes():
     _reload_lock. Atomic order: yaml_data -> IP_ROTATION -> geo -> routes -> SORTED_*.
     """
     global _custom_routes_mtime, _custom_routes_last_check, _config_yaml_mtime
-    global SORTED_ROUTES, SORTED_CUSTOM_ROUTES, SORTED_GEO_POLICIES, GEO_ENABLED, GEO_VERSION
+    global SORTED_ROUTES, SORTED_CUSTOM_ROUTES, SORTED_GEO_POLICIES, GEO_ENABLED, GEO_VERSION, GEO_ALLOW_DIRECT_WHEN_COMPATIBLE
     now = time.time()
     if now - _custom_routes_last_check < _CUSTOM_ROUTES_CHECK_INTERVAL:
         return
@@ -1053,8 +1096,9 @@ def maybe_reload_custom_routes():
                     if isinstance(new_policies, dict):
                         GEO_POLICIES.update(new_policies)
                     SORTED_GEO_POLICIES[:] = sorted(GEO_POLICIES.items())
-                    logging.info("[config] reloaded config.yaml geo.enabled=%s version=%s policies=%d",
-                                 GEO_ENABLED, GEO_VERSION, len(GEO_POLICIES))
+                    GEO_ALLOW_DIRECT_WHEN_COMPATIBLE = bool(geo_sec.get("allow_direct_when_compatible", True))
+                    logging.info("[config] reloaded config.yaml geo.enabled=%s version=%s policies=%d allow_direct=%s",
+                                 GEO_ENABLED, GEO_VERSION, len(GEO_POLICIES), GEO_ALLOW_DIRECT_WHEN_COMPATIBLE)
                 # custom_routes may live in yaml: need to reload after yaml swap
                 new_cr = load_custom_routes()
                 cr_changed = True  # force route rebuild after yaml change

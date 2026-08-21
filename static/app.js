@@ -3262,6 +3262,8 @@ document.addEventListener('DOMContentLoaded', () => {
             const cur = data.current_country || '';
             const allowedFor = data.current_country_allowed_for || [];
             if (geoToggleBtn) geoToggleBtn.textContent = geo.enabled ? '🌍 Géo: ON' : '🌍 Géo: OFF';
+            const geoDirectBtn = document.getElementById('geo-direct-btn');
+            if (geoDirectBtn) geoDirectBtn.textContent = geo.allow_direct_when_compatible ? 'Autoriser direct si IP compatible: ON' : 'Autoriser direct si IP compatible: OFF';
             if (geoBadge) {
                 const badgeMap = { strict: '🔴 strict', prefer: '🟠 best_effort', warn: '⚪ warn' };
                 // derive dominant mode from vpn-status geo if available
@@ -4102,6 +4104,12 @@ document.addEventListener('DOMContentLoaded', () => {
         const cur = await fetchWithToken('/api/geo-policies').then(r => r.json());
         const enabled = !cur.enabled;
         await fetchWithToken('/api/geo-policies', { method: 'PUT', headers: {'Content-Type': 'application/json', 'If-Match': String(Date.now())}, body: JSON.stringify({enabled, version: cur.version}) });
+        refreshVPNStatus();
+    };
+    window.toggleGeoDirect = async function() {
+        const cur = await fetchWithToken('/api/geo-policies').then(r => r.json());
+        const allow_direct_when_compatible = !cur.allow_direct_when_compatible;
+        await fetchWithToken('/api/geo-policies', { method: 'PUT', headers: {'Content-Type': 'application/json', 'If-Match': String(Date.now())}, body: JSON.stringify({allow_direct_when_compatible, version: cur.version, enabled: cur.enabled}) });
         refreshVPNStatus();
     };
     window.rollbackGeo = async function() {

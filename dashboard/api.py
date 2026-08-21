@@ -903,6 +903,7 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
             "enabled": bool(getattr(config_settings, "GEO_ENABLED", False)),
             "version": int(getattr(config_settings, "GEO_VERSION", 1) or 1),
             "policies": dict(getattr(config_settings, "GEO_POLICIES", {}) or {}),
+            "allow_direct_when_compatible": bool(getattr(config_settings, "GEO_ALLOW_DIRECT_WHEN_COMPATIBLE", True)),
         }
 
     @app.put("/api/geo-policies")
@@ -940,6 +941,10 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
             config_settings.GEO_POLICIES.update(pol)
             config_settings.SORTED_GEO_POLICIES[:] = sorted(pol.items())
             config_settings._yaml_data.setdefault("geo", {})["policies"] = dict(pol)
+        if "allow_direct_when_compatible" in body:
+            val = bool(body["allow_direct_when_compatible"])
+            config_settings.GEO_ALLOW_DIRECT_WHEN_COMPATIBLE = val
+            config_settings._yaml_data.setdefault("geo", {})["allow_direct_when_compatible"] = val
         # persist
         try:
             config_settings.save_yaml_config()
@@ -947,7 +952,7 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
             _config_yaml_known_mtime = _config_yaml_mtime()
         except Exception as e:
             return JSONResponse(status_code=500, content={"error": str(e)})
-        return {"ok": True, "enabled": bool(config_settings.GEO_ENABLED), "version": int(config_settings.GEO_VERSION), "etag": str(int(_config_yaml_mtime()))}
+        return {"ok": True, "enabled": bool(config_settings.GEO_ENABLED), "version": int(config_settings.GEO_VERSION), "allow_direct_when_compatible": bool(config_settings.GEO_ALLOW_DIRECT_WHEN_COMPATIBLE), "etag": str(int(_config_yaml_mtime()))}
 
     @app.post("/api/geo-policies/rollback")
     async def geo_rollback(request: Request):
@@ -1793,14 +1798,49 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
                 "pin_latency_avg_ms": round(_avg, 1),
                 "pin_latency_p95_ms": round(sorted(_dur)[int(len(_dur)*0.95)] if _dur else 0, 1),
                 "queue_depth": len(getattr(_oc, "_geo_breaker", {})) if '_oc' in locals() else 0,
+                "allow_direct_when_compatible": bool(getattr(config_settings, "GEO_ALLOW_DIRECT_WHEN_COMPATIBLE", True)),
+                "geo_allow_direct": bool(getattr(config_settings, "GEO_ALLOW_DIRECT_WHEN_COMPATIBLE", True)),
             }
-            # per-route allowed check for current country
+            # [Axe C] geo_strict_union: union of all effective_allowed countries
+            # across all geo-enabled routes — lets the GUI show which countries
+            # are needed globally.
+            try:
+                _strict_union: set = set()
+                for _rk, _rv in config_settings.ROUTES.items():
+                    try:
+                        _rg = config_settings.resolve_geo(_rv)
+                        _reff = _rg.get("effective_allowed", set())
+                        if isinstance(_reff, set):
+                            _strict_union |= _reff
+                    except Exception:
+                        pass
+                data["geo_strict_union"] = sorted(_strict_union)
+            except Exception:
+                data["geo_strict_union"] = []
+            # [Axe C] per-route allowed check for current country — read ALL
+            # managers and prefer a station already in effective_allowed.
             try:
                 cur_country = None
+                _all_mgr_countries: list = []
                 for mgr in managers:
                     if mgr and getattr(mgr, "_current_country", None):
-                        cur_country = mgr._current_country
+                        _all_mgr_countries.append(mgr._current_country)
+                # Prefer a country in effective_allowed (across any route)
+                _any_effective: set = set()
+                for _rk, _rv in config_settings.ROUTES.items():
+                    try:
+                        _rg = config_settings.resolve_geo(_rv)
+                        _reff = _rg.get("effective_allowed", set())
+                        if isinstance(_reff, set):
+                            _any_effective |= _reff
+                    except Exception:
+                        pass
+                for cc in _all_mgr_countries:
+                    if cc in _any_effective:
+                        cur_country = cc
                         break
+                if cur_country is None and _all_mgr_countries:
+                    cur_country = _all_mgr_countries[0]  # single-station compat
                 data["current_country"] = cur_country
                 allowed_for = []
                 for k, route in config_settings.ROUTES.items():

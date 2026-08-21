@@ -24,6 +24,7 @@ from opencode import (
     openai_chat_to_responses,
     openai_responses_to_anthropic,
     anthropic_to_openai_responses,
+    _chat_to_responses_request,
     _estimate_tokens,
     _route_for,
     _tool_name,
@@ -915,3 +916,83 @@ class TestResolveProtocol:
         assert expected_anthropic.issubset(set(
             k for k, v in KNOWN_PROTOCOLS.items() if v == "anthropic"
         ))
+
+
+# ── Chat-to-Responses reasoning forwarding ──────────────────────
+
+class TestChatToResponsesRequest:
+    """Test _chat_to_responses_request() forwards reasoning parameters."""
+
+    def test_reasoning_effort_forwarded(self):
+        """reasoning_effort must become reasoning: {summary: auto, effort: ...} in Responses API format."""
+        chat = {
+            "model": "muse-spark-1.2-contributor",
+            "messages": [{"role": "user", "content": "Think about 2+2"}],
+            "reasoning_effort": "high",
+        }
+        result = _chat_to_responses_request(chat)
+        assert "reasoning" in result
+        assert result["reasoning"] == {"summary": "auto", "effort": "high"}
+
+    def test_reasoning_effort_medium(self):
+        chat = {
+            "model": "muse-spark-1.2-contributor",
+            "messages": [{"role": "user", "content": "test"}],
+            "reasoning_effort": "medium",
+        }
+        result = _chat_to_responses_request(chat)
+        assert result["reasoning"] == {"summary": "auto", "effort": "medium"}
+
+    def test_reasoning_effort_low(self):
+        chat = {
+            "model": "muse-spark-1.2-contributor",
+            "messages": [{"role": "user", "content": "test"}],
+            "reasoning_effort": "low",
+        }
+        result = _chat_to_responses_request(chat)
+        assert result["reasoning"] == {"summary": "auto", "effort": "low"}
+
+    def test_reasoning_object_forwarded(self):
+        """If reasoning is already a dict (Responses API format), pass it through."""
+        reasoning = {"summary": "auto", "effort": "high"}
+        chat = {
+            "model": "muse-spark-1.2-contributor",
+            "messages": [{"role": "user", "content": "test"}],
+            "reasoning": reasoning,
+        }
+        result = _chat_to_responses_request(chat)
+        assert result["reasoning"] == reasoning
+
+    def test_no_reasoning_when_absent(self):
+        """No reasoning param → no reasoning in output."""
+        chat = {
+            "model": "muse-spark-1.2-contributor",
+            "messages": [{"role": "user", "content": "test"}],
+        }
+        result = _chat_to_responses_request(chat)
+        assert "reasoning" not in result
+
+    def test_reasoning_effort_takes_precedence(self):
+        """If both reasoning_effort and reasoning are present, reasoning_effort wins."""
+        chat = {
+            "model": "muse-spark-1.2-contributor",
+            "messages": [{"role": "user", "content": "test"}],
+            "reasoning_effort": "low",
+            "reasoning": {"summary": "auto", "effort": "high"},
+        }
+        result = _chat_to_responses_request(chat)
+        assert result["reasoning"] == {"summary": "auto", "effort": "low"}
+
+    def test_temperature_and_top_p_preserved(self):
+        """temperature and top_p must still be forwarded."""
+        chat = {
+            "model": "muse-spark-1.2-contributor",
+            "messages": [{"role": "user", "content": "test"}],
+            "temperature": 0.7,
+            "top_p": 0.9,
+            "reasoning_effort": "high",
+        }
+        result = _chat_to_responses_request(chat)
+        assert result["temperature"] == 0.7
+        assert result["top_p"] == 0.9
+        assert result["reasoning"] == {"summary": "auto", "effort": "high"}

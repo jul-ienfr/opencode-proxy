@@ -320,9 +320,10 @@
                         <div id="vpn-config-dirty-banner" style="display:none;margin-bottom:12px;padding:8px 12px;background:rgba(255,110,60,0.12);border:1px solid var(--danger,#e06c50);border-radius:6px;font-size:12px;color:var(--danger,#e06c50)"></div>
                         <!-- [vivid-hinton P4] geo banner (strict/best_effort/warn) -->
                         <div id="geo-banner" style="display:none;margin-bottom:12px;padding:8px 12px;border-radius:6px;font-size:12px"></div>
-                        <div id="geo-controls" style="display:flex;gap:8px;margin-bottom:12px">
+                        <div id="geo-controls" style="display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap">
                             <button class="btn" onclick="toggleGeo()" id="geo-toggle-btn" style="font-size:12px">🌍 Géo: …</button>
                             <button class="btn" onclick="rollbackGeo()" id="geo-rollback-btn" style="font-size:12px">↩ Rollback</button>
+                            <button class="btn" onclick="toggleGeoDirect()" id="geo-direct-btn" style="font-size:12px">Autoriser direct si IP compatible: …</button>
                             <span id="geo-badge" style="font-size:12px;align-self:center"></span>
                         </div>
                         <div class="config-grid" style="grid-template-columns:1fr 1fr">

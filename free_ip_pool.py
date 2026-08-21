@@ -735,7 +735,8 @@ class FreeIPPool:
         per["last_confirmed_ip"] = new_ip
         return new_ip
 
-    def on_quota_exhausted(self, station: Optional[VPNManager] = None):
+    def on_quota_exhausted(self, station: Optional[VPNManager] = None,
+                           forced_pool: Optional[set] = None):
         """Free quota exhausted (429): mark the station bad and rotate it
         in the background — the next request lands on the other station.
 
@@ -765,6 +766,9 @@ class FreeIPPool:
         (model, IP) cooldown gate keeps repeat free requests off the
         cooling IP meanwhile.
 
+        Axe B: ``forced_pool`` is propagated to the background rotation so
+        the rotated station stays within geo-allowed countries.
+
         No-op when VPN is disabled or in direct mode.
         """
         if not self._vpn.enabled:
@@ -789,7 +793,7 @@ class FreeIPPool:
             if self._any_other_usable(station):
                 self._per_station(station)["bad_until"] = (
                     time.monotonic() + self._bad_ttl)
-        self._launch_rotation(station)
+        self._launch_rotation(station, forced_pool=forced_pool)
 
     async def on_disconnect_retry(self, failed: Optional[VPNManager] = None, forced_pool=None
                                    ) -> tuple[Optional[str], Optional[VPNManager]]:
@@ -842,7 +846,7 @@ class FreeIPPool:
                 if self._any_other_usable(failed):
                     self._per_station(failed)["bad_until"] = (
                         time.monotonic() + self._bad_ttl)
-            self._launch_rotation(failed)
+            self._launch_rotation(failed, forced_pool=forced_pool)
         st = (self._best_station_excluding(failed, forced_pool)
               if failed is not None else self._best_station(forced_pool))
         if st is None:
@@ -1035,7 +1039,8 @@ class FreeIPPool:
             self._worker_tasks.append(
                 asyncio.create_task(self._rotation_worker()))
 
-    def _launch_rotation(self, station: VPNManager) -> None:
+    def _launch_rotation(self, station: VPNManager,
+                         forced_pool: Optional[set] = None) -> None:
         """Queue a background rotation for one station (C4/C5).
 
         Bounded concurrency [Axe 1.1]: up to ``_ROTATION_CONCURRENCY``
@@ -1044,7 +1049,11 @@ class FreeIPPool:
         Dedup both ways: a station with a rotation already queued
         (``_pending``) or already in flight (``_rotation_tasks``) is never
         queued twice — concurrent 429s on the same station share one
-        rotation."""
+        rotation.
+
+        Axe B: ``forced_pool`` is stored on the station as
+        ``_geo_forced_pool`` so the background rotation stays within
+        geo-allowed countries."""
         sid = station._station
         if sid not in self._station_ids:
             # [plan 18/08 §2.3] A request handler can hold a manager the
@@ -1057,6 +1066,10 @@ class FreeIPPool:
         task = self._rotation_tasks.get(sid)
         if task and not task.done():
             return  # a rotation for this station is already running
+        # Axe B: tag the station with geo constraint for the background
+        # rotation so _pin_country_for_rotation filters correctly
+        if forced_pool is not None:
+            station._geo_forced_pool = forced_pool
         self._pending.add(sid)
         self._ensure_workers()
         self._rotation_queue.put_nowait(station)

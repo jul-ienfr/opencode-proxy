@@ -1,5 +1,6 @@
 import pytest
-from unittest.mock import patch, MagicMock
+import asyncio
+from unittest.mock import patch, MagicMock, AsyncMock
 import config.settings as st
 
 
@@ -205,3 +206,232 @@ class TestGeoGateIntegration:
         opencode._geo_block_total += 1
         assert opencode._geo_block_total == before + 1
         opencode._geo_block_total = before
+
+
+# ── Axe D: Estonia non-regression tests ─────────────────────────────
+
+
+class TestEstoniaNonRegression:
+    """Non-regression: Estonia must never appear as egress when excluded
+    from the effective_allowed set (forced_pool)."""
+
+    # 32 real-ish NordVPN countries — Estonia is intentionally NOT in the
+    # forced_pool (effective_allowed) but IS in the server_countries list
+    # so that naive rotation could pick it.
+    _32_COUNTRIES = [
+        "Albania", "Argentina", "Australia", "Austria", "Belgium",
+        "Brazil", "Bulgaria", "Canada", "Czech Republic", "Denmark",
+        "Estonia", "Finland", "France", "Germany", "Greece",
+        "Hungary", "Iceland", "Ireland", "Italy", "Japan",
+        "Latvia", "Lithuania", "Luxembourg", "Netherlands", "New Zealand",
+        "Norway", "Poland", "Portugal", "Romania", "Singapore",
+        "Spain", "Sweden",
+    ]
+
+    def test_estonia_never_egress_strict(self):
+        """Simulate 3 VPN managers each landing on a country drawn from
+        32-country pool.  When strict+require_vpn and forced_pool does NOT
+        contain Estonia, ensure_geo_egress must never pin to Estonia."""
+        from vpn_manager import VPNManager
+        VPNManager._geo_coalesce.clear()
+        # Build 3 station managers — each with the full 32-country list
+        stations = []
+        for sid in (1, 2, 3):
+            m = VPNManager.__new__(VPNManager)
+            m._station = sid
+            m._current_country = None
+            m._countries_list = lambda: list(self._32_COUNTRIES)
+            m._server_countries = ",".join(self._32_COUNTRIES)
+            m._host_blacklisted = lambda c: False
+            m._ip_probe_budget = 8.0
+            m._status = "connected"
+            # Track every pin attempt
+            m._pin_log = []
+            async def _fake_pin(country, **kw):
+                m._pin_log.append(country)
+                m._current_country = country
+                return True
+            m._control_pin_country = _fake_pin
+            stations.append(m)
+
+        # forced_pool: everything EXCEPT Estonia
+        forced_pool = {c for c in self._32_COUNTRIES if c != "Estonia"}
+        assert "Estonia" not in forced_pool
+
+        # Rotate each station through ensure_geo_egress 10 times
+        # Each call picks the first sorted candidate; after pinning,
+        # the next call sees the current country already in allowed
+        # so it should short-circuit without pinning again.
+        async def _run():
+            for i in range(10):
+                # Alternate stations to exercise all paths
+                st = stations[i % 3]
+                ok = await st.ensure_geo_egress(forced_pool, timeout=1.0)
+                assert ok is True, f"ensure_geo_egress failed on station {st._station} iter {i}"
+                # The pinned country MUST NOT be Estonia
+                assert st._current_country != "Estonia", (
+                    f"Station {st._station} was pinned to Estonia at iter {i} — "
+                    f"Estonia must never appear in forced_pool={sorted(forced_pool)}"
+                )
+                assert st._current_country in forced_pool
+
+        try:
+            asyncio.run(_run())
+        finally:
+            VPNManager._geo_coalesce.clear()
+
+    def test_paid_geo_via_tunnel_conditional(self, monkeypatch):
+        """When _direct_country returns Estonia (not in allowed), the gate
+        must NOT allow httpx direct — it must force tunnel.  When
+        _direct_country returns an allowed country and GEO_ALLOW_DIRECT is
+        True, direct is permitted; when False, tunnel is forced."""
+        import opencode
+        import config.settings as st
+
+        monkeypatch.setattr(st, "GEO_ENABLED", True)
+        monkeypatch.setattr(st, "IP_ROTATION", {"enabled": True, "server_countries": "Germany,United States,France"})
+        monkeypatch.setattr(st, "GEO_POLICIES", {"meta": {"allowed_countries": ["Germany", "France"], "mode": "strict", "require_vpn": True}})
+        monkeypatch.setattr(st, "GEO_ALLOW_DIRECT_WHEN_COMPATIBLE", True)
+
+        route = {"model": "x", "geo": {"extends": "meta"}}
+        geo_info = st.resolve_geo(route)
+        assert "Germany" in geo_info["effective_allowed"]
+        assert "Estonia" not in geo_info["effective_allowed"]
+
+        # --- Case A: direct country = Estonia (not in allowed) → tunnel forced ---
+        # Mock _direct_country to return Estonia
+        async def _direct_estonia():
+            return "Estonia"
+        monkeypatch.setattr(opencode, "_direct_country", _direct_estonia)
+        # Mock shared_state: VPN is on
+        import shared_state
+        fake_mgr = MagicMock()
+        fake_mgr._current_country = "Germany"
+        fake_mgr.ensure_geo_egress = AsyncMock(return_value=True)
+        monkeypatch.setattr(shared_state, "vpn_managers", [fake_mgr], raising=False)
+
+        # Build a minimal Request mock
+        class _FakeState:
+            pass
+        class _FakeRequest:
+            def __init__(self):
+                self.headers = {}
+                self.state = _FakeState()
+        req = _FakeRequest()
+
+        # _enforce_geo_gate should NOT return None (should force tunnel)
+        result = asyncio.run(opencode._enforce_geo_gate(route, req, is_stream=False, protocol="openai"))
+        # When _direct_country is Estonia and allow_direct=True but Estonia
+        # not in effective_allowed, the gate sets _geo_force_tunnel=True
+        # and continues to pin logic.  If station already in allowed, it
+        # returns None (pass).  If not, it blocks or pins.
+        # The key assertion: _geo_force_tunnel should be True
+        # (the gate did NOT short-circuit with direct allowed)
+        if result is None:
+            # Gate passed via pin — that's fine, but tunnel must be forced
+            assert getattr(req.state, "_geo_force_tunnel", False) is True, (
+                "Direct Estonia NOT in allowed → _geo_force_tunnel must be True"
+            )
+
+        # --- Case B: direct country = Germany (in allowed) + allow_direct=True → direct OK ---
+        async def _direct_germany():
+            return "Germany"
+        monkeypatch.setattr(opencode, "_direct_country", _direct_germany)
+        req2 = _FakeRequest()
+        result2 = asyncio.run(opencode._enforce_geo_gate(route, req2, is_stream=False, protocol="openai"))
+        # Direct IP Germany in allowed + allow_direct=True → pass through
+        assert result2 is None, "Direct Germany in allowed + allow_direct=True → gate must pass"
+        assert getattr(req2.state, "_geo_force_tunnel", False) is False, (
+            "Direct in allowed → _geo_force_tunnel must be False"
+        )
+
+        # --- Case C: direct country = Germany + allow_direct=False → tunnel forced ---
+        monkeypatch.setattr(st, "GEO_ALLOW_DIRECT_WHEN_COMPATIBLE", False)
+        req3 = _FakeRequest()
+        result3 = asyncio.run(opencode._enforce_geo_gate(route, req3, is_stream=False, protocol="openai"))
+        # Even though Germany is in allowed, allow_direct=False → must force tunnel
+        if result3 is None:
+            assert getattr(req3.state, "_geo_force_tunnel", False) is True, (
+                "allow_direct=False → _geo_force_tunnel must be True even when direct IP in allowed"
+            )
+
+    def test_streaming_geo_block_sse_paid(self, monkeypatch):
+        """Streaming request with strict geo and VPN down must return
+        SSE geo_blocked event with status 451."""
+        import opencode
+        import config.settings as st
+
+        monkeypatch.setattr(st, "GEO_ENABLED", True)
+        monkeypatch.setattr(st, "IP_ROTATION", {"enabled": True, "server_countries": "Germany,France"})
+        monkeypatch.setattr(st, "GEO_POLICIES", {"meta": {"allowed_countries": ["United States"], "mode": "strict", "require_vpn": True}})
+        monkeypatch.setattr(st, "GEO_ALLOW_DIRECT_WHEN_COMPATIBLE", True)
+
+        route = {"model": "x", "geo": {"extends": "meta"}}
+
+        # VPN is DOWN: vpn_managers is empty → require_vpn blocks
+        import shared_state
+        monkeypatch.setattr(shared_state, "vpn_managers", [], raising=False)
+
+        class _FakeState:
+            pass
+        class _FakeRequest:
+            def __init__(self):
+                self.headers = {}
+                self.state = _FakeState()
+        req = _FakeRequest()
+
+        result = asyncio.run(opencode._enforce_geo_gate(route, req, is_stream=True, protocol="openai"))
+        assert result is not None, "VPN down + strict + require_vpn must block"
+        # Must be a StreamingResponse (SSE)
+        from starlette.responses import StreamingResponse
+        assert isinstance(result, StreamingResponse)
+        # Read the SSE body and check for geo_blocked 451
+        body_parts = []
+        async def _consume():
+            async for chunk in result.body_iterator:
+                body_parts.append(chunk)
+        asyncio.run(_consume())
+        full_body = b"".join(body_parts)
+        assert b"geo_blocked" in full_body, "SSE must contain geo_blocked"
+        assert b"451" in full_body, "SSE must contain status 451"
+        assert result.headers.get("X-Geo-Blocked") == "1"
+
+    def test_quota_rotation_respects_forced_pool(self, monkeypatch):
+        """on_quota_exhausted with forced_pool must propagate it so the
+        background rotation never pins to Estonia."""
+        from vpn_manager import VPNManager
+
+        # Build a minimal FreeIPPool mock
+        from free_ip_pool import FreeIPPool
+        pool = object.__new__(FreeIPPool)
+        pool._vpn = MagicMock()
+        pool._vpn.enabled = True
+        pool._vpn.proxy_mode = "vpn"
+        pool._active_station = MagicMock()
+        pool._bad_ttl = 60.0
+        pool._per_station = lambda s: {"bad_until": 0, "request_count": 0, "session_start": 0, "last_confirmed_ip": None}
+        pool._any_other_usable = lambda s, forced_pool=None: True
+        pool._stations = []  # dual_station property needs this
+
+        # Capture forced_pool passed to _launch_rotation
+        captured_forced_pool = {}
+        def _fake_launch(station, forced_pool=None):
+            captured_forced_pool["value"] = forced_pool
+            # Tag the station with forced_pool (same as real code)
+            if forced_pool is not None:
+                station._geo_forced_pool = forced_pool
+        pool._launch_rotation = _fake_launch
+
+        station = MagicMock()
+        station._station = 1
+        station._current_country = "Germany"
+
+        # forced_pool excludes Estonia
+        fp = {"Germany", "France", "United States"}
+        pool.on_quota_exhausted(station, forced_pool=fp)
+
+        # Verify _launch_rotation was called with the forced_pool
+        assert "value" in captured_forced_pool, "_launch_rotation must have been called"
+        assert captured_forced_pool["value"] is fp, "forced_pool must be propagated"
+        # Verify station was tagged
+        assert getattr(station, "_geo_forced_pool", None) is fp

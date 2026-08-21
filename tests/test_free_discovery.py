@@ -240,7 +240,8 @@ class TestApplyPersist:
         yaml_data = {"server": {"host": "0.0.0.0", "port": 4000}, "models": {}, "free_model_map": {}}
         st, *old = _isolated_settings(tmp_path, monkeypatch, yaml_data)
         try:
-            assert st._free_endpoint_for("muse-spark-1.2-contributor-free") == st.API_BASE_FREE
+            # muse-spark models use /v1/responses (Responses API), not /chat/completions
+            assert st._free_endpoint_for("muse-spark-1.2-contributor-free") == "https://opencode.ai/zen/v1/responses"
             assert st._free_endpoint_for("mimo-v2.5-free") == st.API_BASE_FREE
         finally:
             _restore_settings(st, old)
@@ -288,3 +289,90 @@ class TestApplyPersist:
             assert "hy3-free" in st.MODELS
         finally:
             _restore_settings(st, old)
+
+
+# ── Axe D: forced_pool rotation for free pool ──────────────────────
+
+class TestForcedPoolRotation:
+    """Verify that FreeIPPool.on_quota_exhausted propagates forced_pool
+    so background rotations stay within geo-allowed countries (Estonia
+    excluded)."""
+
+    def test_quota_rotation_respects_forced_pool_free(self):
+        """on_quota_exhausted with forced_pool must tag the station and
+        pass forced_pool to _launch_rotation — rotation never picks
+        Estonia when forced_pool excludes it."""
+        from unittest.mock import MagicMock
+        from free_ip_pool import FreeIPPool
+
+        # Build a minimal FreeIPPool in-memory (no network/docker)
+        pool = object.__new__(FreeIPPool)
+        pool._vpn = MagicMock()
+        pool._vpn.enabled = True
+        pool._vpn.proxy_mode = "vpn"
+        pool._active_station = MagicMock()
+        pool._bad_ttl = 60.0
+        pool._stations = []  # dual_station property needs this
+
+        # Capture forced_pool and station passed to _launch_rotation
+        captured = {}
+        def _fake_launch(station, forced_pool=None):
+            captured["station"] = station
+            captured["forced_pool"] = forced_pool
+            if forced_pool is not None:
+                station._geo_forced_pool = forced_pool
+        pool._launch_rotation = _fake_launch
+
+        # C1 guard: there must be another usable station
+        pool._any_other_usable = lambda s, forced_pool=None: True
+
+        station = MagicMock()
+        station._station = 1
+        station._current_country = "Germany"
+
+        # forced_pool: 3 countries, NO Estonia
+        fp = {"Germany", "France", "United States"}
+        assert "Estonia" not in fp
+
+        pool.on_quota_exhausted(station, forced_pool=fp)
+
+        # Verify _launch_rotation received the forced_pool
+        assert "forced_pool" in captured, "_launch_rotation must have been called"
+        assert captured["forced_pool"] is fp, "forced_pool must be passed through"
+        # Verify station was tagged with geo constraint
+        assert getattr(station, "_geo_forced_pool", None) is fp, (
+            "station._geo_forced_pool must be set to forced_pool"
+        )
+
+    def test_quota_rotation_without_forced_pool_no_tag(self):
+        """When forced_pool is None, station must NOT be tagged with
+        _geo_forced_pool — background rotation uses default country list."""
+        from unittest.mock import MagicMock
+        from free_ip_pool import FreeIPPool
+
+        pool = object.__new__(FreeIPPool)
+        pool._vpn = MagicMock()
+        pool._vpn.enabled = True
+        pool._vpn.proxy_mode = "vpn"
+        pool._active_station = MagicMock()
+        pool._bad_ttl = 60.0
+        pool._stations = []  # dual_station property needs this
+
+        captured = {}
+        def _fake_launch(station, forced_pool=None):
+            captured["forced_pool"] = forced_pool
+        pool._launch_rotation = _fake_launch
+        pool._any_other_usable = lambda s, forced_pool=None: True
+
+        station = MagicMock()
+        station._station = 2
+        station._current_country = "France"
+        # Pre-set _geo_forced_pool to something — it should NOT be overwritten
+        station._geo_forced_pool = {"Previous"}
+
+        pool.on_quota_exhausted(station, forced_pool=None)
+
+        assert captured.get("forced_pool") is None
+        # Without forced_pool, _launch_rotation should not overwrite the tag
+        # (the real code only sets station._geo_forced_pool when forced_pool is not None)
+        assert station._geo_forced_pool == {"Previous"}

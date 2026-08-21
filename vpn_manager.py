@@ -2414,12 +2414,26 @@ class VPNManager:
         return nxt
 
     def _countries_list_for_pool(self, forced_pool: Optional[set] = None) -> list:
-        """Countries list filtered to forced_pool when provided (P3 geo)."""
+        """Countries list filtered to forced_pool when provided (P3 geo).
+
+        Axe B: also intersects with geo_strict_union() when GEO strict
+        policies exist and forced_pool is not explicitly provided — ensures
+        background rotations never pin outside strict-allowed countries.
+        """
         base = self._countries_list()
-        if forced_pool is None:
-            return base
-        # forced_pool is already normalized via _normalize_country
-        return [c for c in base if c in forced_pool]
+        if forced_pool is not None:
+            # forced_pool is already normalized via _normalize_country
+            return [c for c in base if c in forced_pool]
+        # Axe B: when no forced_pool but GEO strict policies exist, narrow
+        # to the union of all strict-allowed countries
+        try:
+            from config.settings import geo_strict_union
+            _gsu = geo_strict_union()
+            if _gsu:
+                return [c for c in base if c in _gsu]
+        except Exception:
+            pass
+        return base
 
     _geo_coalesce: dict = {}  # class-level: frozenset(allowed) -> Future
 
@@ -2469,6 +2483,15 @@ class VPNManager:
             if probe_ok:
                 return True
         candidates = set(self._countries_list()) & set(allowed)
+        # Axe B: intersect with geo_strict_union() when GEO strict policies
+        # exist — prevents pinning to countries outside all strict-allowed sets
+        try:
+            from config.settings import geo_strict_union
+            _gsu = geo_strict_union()
+            if _gsu:
+                candidates &= _gsu
+        except Exception:
+            pass
         candidates = {c for c in candidates if not self._host_blacklisted(c)} if hasattr(self, '_host_blacklisted') else candidates
         if not candidates:
             return False
@@ -2523,6 +2546,11 @@ class VPNManager:
         """
         if not self._country_rotation or not self._control_enabled:
             return None
+        # Axe B: fallback to station-level geo constraint set by _open_via_pool
+        # when forced_pool is not passed explicitly (background rotations from
+        # on_quota_exhausted / on_disconnect_retry)
+        if forced_pool is None:
+            forced_pool = getattr(self, "_geo_forced_pool", None)
         countries = self._countries_list_for_pool(forced_pool)
         if len(countries) < 2:
             # forced_pool single-country pin still allowed
