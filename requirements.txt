@@ -1,6 +1,6 @@
 fastapi>=0.100,<1
 uvicorn[standard]>=0.20,<1
-httpx[socks]>=0.24,<1
+httpx[socks,http2]>=0.24,<1
 rich>=13,<15
 tiktoken>=0.7.0
 pystray>=0.19,<1
@@ -9,3 +9,8 @@ pywebview>=5,<7
 pyyaml>=6,<7
 duckduckgo-search>=7,<8
 curl_cffi>=0.5,<1
+orjson>=3.9,<4
+uvloop>=0.19; sys_platform != "win32"
+httptools>=0.6
+redis>=5,<7
+gunicorn>=21,<23

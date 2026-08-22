@@ -151,6 +151,8 @@ def free_env(monkeypatch, echo_server):
     monkeypatch.setattr(oc, "_log", lambda *a, **k: None)
     monkeypatch.setattr(oc, "FREE_MODEL_MAP", {"paid-test-model": "free-test-model"})
     oc._free_model_cooldowns.clear()
+    oc._current_free_attempt.set({})
+    oc._current_user_agent.set(None)
     return oc
 
 

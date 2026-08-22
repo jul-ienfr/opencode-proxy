@@ -10,13 +10,13 @@ upstream:
   free_models_url: ''
   proxy: ''
   timeout:
-    connect: 30
+    connect: 5
     read: 600
-    write: 30
-    pool: 10
-  max_connections: 200
-  max_keepalive: 50
-  keepalive_expiry: 120
+    write: 10
+    pool: 5
+  max_connections: 500
+  max_keepalive: 200
+  keepalive_expiry: 30
   max_body_size: 10485760
 routing:
   opus_model: kimi-k2.6
@@ -267,8 +267,8 @@ circuit_breaker:
   failure_threshold: 5
   recovery_timeout: 60
 rate_limit:
-  rps: 50
-  burst: 100
+  rps: 200
+  burst: 400
   stale_ttl: 300
 key_pause:
   default_pause: 60
@@ -325,5 +325,5 @@ free_discovery:
 traffic:
   enabled: true
   max_frames: 500
-  body_cap: 131072
+  body_cap: 65536
   max_bytes: 33554432
