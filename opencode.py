@@ -1143,18 +1143,33 @@ async def lifespan(app):
     # Restore persisted key pause state from disk
     _key_pauser.load(API_KEYS)
 
-    # Start background quota fetcher (no-op if env vars not set)
-    await start_quota_fetcher(app)
-
-    # Toggle "Use Balance" on for all workspaces (so Go falls back to Zen balance)
+    # Start background quota fetcher (non-bloquant, ne retarde pas le 1er GET)
     try:
-        from dashboard import toggle_use_balance_all
-        balance_results = await toggle_use_balance_all()
-        if balance_results:
-            ok = sum(1 for v in balance_results.values() if v)
-            _debug(f"  [lifespan] use-balance toggle: {ok}/{len(balance_results)} workspaces enabled")
+        await start_quota_fetcher(app)
     except Exception as e:
-        _debug(f"  [lifespan] use-balance toggle failed: {e}")
+        _debug(f"  [lifespan] quota fetcher start failed: {e}")
+
+    # Toggle "Use Balance" en arrière-plan (POST https://opencode.ai/_server peut prendre 5-30s)
+    async def _toggle_balance_bg():
+        try:
+            from dashboard import toggle_use_balance_all
+            # Timeout global 6s pour ne pas bloquer le démarrage
+            try:
+                balance_results = await asyncio.wait_for(toggle_use_balance_all(), timeout=6.0)
+            except asyncio.TimeoutError:
+                _debug("  [lifespan] use-balance toggle timeout (6s) — continuera en arrière-plan")
+                return
+            if balance_results:
+                ok = sum(1 for v in balance_results.values() if v)
+                _debug(f"  [lifespan] use-balance toggle: {ok}/{len(balance_results)} workspaces enabled")
+        except Exception as e:
+            _debug(f"  [lifespan] use-balance toggle failed: {e}")
+
+    try:
+        asyncio.create_task(_toggle_balance_bg())
+        _debug("  [lifespan] use-balance toggle lancé en arrière-plan")
+    except Exception as e:
+        _debug(f"  [lifespan] use-balance bg launch failed: {e}")
 
     # Register recovery callback: unpause API keys when workspace returns to ok
     from dashboard.quota import set_on_workspace_recovered_callback
