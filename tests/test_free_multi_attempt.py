@@ -194,7 +194,8 @@ def free_cfg():
     """Save/restore the hot-reload keys on the LIVE IP_ROTATION dict
     (the same dict POST /api/vpn-config mutates in place)."""
     saved = {k: oc.IP_ROTATION.get(k)
-             for k in ("max_free_attempts", "free_exception_fallback", "strict_free")}
+             for k in ("max_free_attempts", "free_exception_fallback", "strict_free",
+                       "auto_max_free_attempts")}
     yield
     for k, v in saved.items():
         if v is None:
@@ -357,6 +358,7 @@ async def test_socks5_mode_single_proxy_429_budget_exhausted(free_vpn_env, free_
     the cooldowned one) → the loop breaks and — identically to a single vpn
     station — the last-resort residential direct fallback runs; its 429
     answer is swallowed and the caller pays (None). No infinite loop."""
+    oc.IP_ROTATION["auto_max_free_attempts"] = False
     oc.IP_ROTATION["max_free_attempts"] = 2
     a = _Socks5Ep(1)
     pool = _Socks5PoolMulti([a])
@@ -660,6 +662,7 @@ def test_hot_reload_in_place_mutation(free_cfg):
     """The GUI POST mutates IP_ROTATION in place (dashboard/api.py
     _persist_vpn_config) — the next request reads the NEW strategy with no
     restart. Clamps, enum validation, degraded values all covered."""
+    oc.IP_ROTATION["auto_max_free_attempts"] = False
     # 1 → legacy: no extra free strikes, active() False in direct mode
     oc.IP_ROTATION["max_free_attempts"] = 1
     oc.IP_ROTATION["free_exception_fallback"] = "direct"

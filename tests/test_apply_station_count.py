@@ -129,7 +129,8 @@ async def test_upscale_3_syncs_env_stack_before_any_start(tmp_path, monkeypatch)
 
     assert m1.cmds == [] and m2.cmds == [], \
         "no compose recreate on a no-op stack sync"
-    assert persisted == [{"station_count": 3}]
+    assert persisted[0].get("station_count") == 3
+    assert "max_free_attempts" in persisted[0]
     assert [m._station for m in pool.stations] == [1, 2, 3]
     assert set(watcher.managers) == {"opencode-vpn", "opencode-vpn-2",
                                      "opencode-vpn-3"}
@@ -165,6 +166,7 @@ async def test_downscale_3_to_2_stops_container_no_stack_call(tmp_path, monkeypa
     assert not stubs[0].stopped and not stubs[1].stopped
     assert [m._station for m in pool.stations] == [1, 2]
     assert set(watcher.managers) == {"opencode-vpn", "opencode-vpn-2"}
-    assert persisted == [{"station_count": 2}]
+    assert persisted[0].get("station_count") == 2
+    assert "max_free_attempts" in persisted[0]
     assert shared_state.vpn_managers == stubs[:2]
     assert shared_state.vpn_manager_2 is stubs[1]

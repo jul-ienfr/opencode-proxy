@@ -401,7 +401,7 @@
                                         <option value="9">9</option>
                                         <option value="10">10</option>
                                     </select>
-                                    <button class="btn" onclick="vpnSaveStationCount()" style="font-size:12px;padding:4px 12px" data-i18n="vpn.stations.save">Appliquer</button>
+                                    <button id="vpn-station-apply-btn" class="btn" onclick="vpnSaveStationCount()" style="font-size:12px;padding:4px 12px" data-i18n="vpn.stations.save">Appliquer</button>
                                 </div>
                             </div>
                             <div style="font-size:11px;color:var(--text-muted);margin-top:4px" data-i18n="vpn.stations.hint">N tunnels simultanés : quand une station est épuisée (429) ou approche du quota, une autre prend le relais immédiatement pendant que la première rotate en arrière-plan. Appliqué à chaud, sans redémarrage du proxy.</div>
@@ -992,6 +992,6 @@
     </div>
 
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7"></script>
-    <script src="/static/app.js?v=2"></script>
+    <script src="/static/app.js?v=3"></script>
 </body>
 </html>

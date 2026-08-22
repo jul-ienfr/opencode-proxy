@@ -66,7 +66,7 @@ def _pool(st1, st2=None, *, bad_ttl=60):
     pool._bad_ttl = float(bad_ttl)
     # Stub the background-rotation launcher: keep tests free of loop tasks.
     pool.rotated = []
-    pool._launch_rotation = lambda station: pool.rotated.append(station)
+    pool._launch_rotation = lambda station, forced_pool=None, **kw: pool.rotated.append(station)
     return pool
 
 

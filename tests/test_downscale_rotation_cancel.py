@@ -320,5 +320,6 @@ async def test_apply_station_count_downscale_cancels_before_stop(
     assert [m._station for m in shared_state.vpn_managers] == [1, 2]
     assert pool._station_ids == {1, 2}
     assert set(watcher.managers) == {"opencode-vpn", "opencode-vpn-2"}
-    assert persisted == {"station_count": 2}
+    assert persisted.get("station_count") == 2
+    assert "max_free_attempts" in persisted
     gate.set()                          # release (already unwound, harmless)

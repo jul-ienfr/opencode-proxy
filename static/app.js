@@ -722,6 +722,11 @@ let totalPages = 1;
 // Config state
 let configData = null;
 let availableModels = [];
+// [fix] Flags anti-écrasement (global, utilisés par renderConfig et refreshVPNStatus)
+let _vpnStationPending = null;
+let _vpnSaving = false;
+let _crSaving = false;
+let _crDirty = false;
 
 function escHtml(s) {
     return (s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
@@ -2164,6 +2169,7 @@ function setupConfig() {
         // Remove empty state
         if (tbody.querySelector('td[colspan]')) tbody.innerHTML = '';
         tbody.appendChild(row);
+        _crDirty = true;
         document.getElementById('cr-match').value = '';
         document.getElementById('cr-model').selectedIndex = 0;
     });
@@ -2174,14 +2180,20 @@ function setupConfig() {
         if (!btn) return;
         const row = btn.closest('tr');
         if (row) row.remove();
+        _crDirty = true;
         const tbody = document.getElementById('custom-routes-tbody');
         if (!tbody.querySelector('tr')) {
             tbody.innerHTML = '<tr><td colspan="6">' + t('config.cr_no_routes') + '</td></tr>';
         }
     });
+    // Marque dirty sur toute édition (input/select/checkbox) dans le tableau
+    document.getElementById('custom-routes-tbody').addEventListener('input', () => { _crDirty = true; });
+    document.getElementById('custom-routes-tbody').addEventListener('change', () => { _crDirty = true; });
 
-    // Custom routes: save
+    // Custom routes: save — [fix] 1 clic suffit (feedback + anti-écrasement)
     document.getElementById('cr-save-btn').addEventListener('click', async () => {
+        if (_crSaving) return;
+        const btn = document.getElementById('cr-save-btn');
         const tbody = document.getElementById('custom-routes-tbody');
         const rows = tbody.querySelectorAll('tr');
         const routes = {};
@@ -2203,6 +2215,9 @@ function setupConfig() {
             routes[key] = routeData;
         }
         const status = document.getElementById('cr-save-status');
+        _crSaving = true;
+        const _origText = btn ? btn.textContent : '';
+        if (btn) { btn.disabled = true; btn.textContent = 'En cours...'; btn.style.opacity = '0.6'; }
         try {
             await apiFetch('/api/config/custom-routes', {
                 method: 'POST',
@@ -2212,11 +2227,18 @@ function setupConfig() {
             status.textContent = t('config.cr_saved');
             status.className = 'save-status success';
             setTimeout(() => { status.textContent = ''; }, 3000);
-            fetchConfig().then(renderConfig);
+            // libère avant fetch pour que renderConfig puisse peindre le frais
+            _crSaving = false;
+            _crDirty = false;
+            const fresh = await fetchConfig();
+            if (fresh) renderConfig(fresh);
         } catch (e) {
             status.textContent = 'Error saving';
             status.className = 'save-status error';
             console.error(e);
+        } finally {
+            _crSaving = false;
+            if (btn) { btn.disabled = false; btn.textContent = _origText || t('config.cr_save'); btn.style.opacity = ''; }
         }
     });
 
@@ -2820,8 +2842,29 @@ document.addEventListener('DOMContentLoaded', () => {
             // [plan 18/08 §4] N-station selector (1-10) + exhaust mode
             const stationCountSelect = document.getElementById('vpn-station-count');
             if (stationCountSelect) {
-                // keep static 1-10 options (injected in HTML) — just set value
-                stationCountSelect.value = String(cfgData.station_count || 1);
+                const persistedVal = String(cfgData.station_count || 1);
+                // [fix] Ne pas écraser la sélection utilisateur pendant interaction/sauvegarde.
+                const isFocused = document.activeElement === stationCountSelect;
+                const isSaving = typeof _vpnSaving !== 'undefined' && _vpnSaving;
+                const hasPending = typeof _vpnStationPending !== 'undefined' && _vpnStationPending !== null;
+                if (!stationCountSelect._vpnListenerAttached) {
+                    stationCountSelect.addEventListener('change', () => {
+                        _vpnStationPending = stationCountSelect.value;
+                        const btn = document.getElementById('vpn-station-apply-btn');
+                        if (btn) btn.style.outline = '2px solid var(--accent, #4fc3f7)';
+                    });
+                    stationCountSelect._vpnListenerAttached = true;
+                }
+                if (isFocused || isSaving) {
+                    // L'utilisateur interagit ou sauvegarde en cours — on ne touche pas.
+                } else if (hasPending && _vpnStationPending !== persistedVal) {
+                    stationCountSelect.value = _vpnStationPending;
+                } else {
+                    stationCountSelect.value = persistedVal;
+                    if (hasPending && _vpnStationPending === persistedVal) _vpnStationPending = null;
+                    const btn = document.getElementById('vpn-station-apply-btn');
+                    if (btn) btn.style.outline = '';
+                }
             }
             const exhaustMode = document.getElementById('vpn-exhaust-mode');
             if (exhaustMode) exhaustMode.value = cfgData.strict_free ? 'strict' : 'fallback';
@@ -3412,13 +3455,22 @@ document.addEventListener('DOMContentLoaded', () => {
         refreshVPNStatus();
     };
 
-    // [plan 18/08 §4] N-station hot reload — pick 1-10, POST the new count,
-    // then refresh status + config + stack info (start/stop compose
-    // containers at runtime, no proxy restart). Replaces the dual toggle.
+    // [fix] Stations VPN : 1 clic suffit — feedback + anti-race
+    // Le bug : refreshVPNStatus écrasait le <select> toutes les 10s et le bouton
+    // n'avait ni disabled ni spinner, donc l'utilisateur re-cliquait en boucle.
     window.vpnSaveStationCount = async function() {
         const select = document.getElementById('vpn-station-count');
+        const btn = document.getElementById('vpn-station-apply-btn') || document.querySelector('#vpn-dual-section button[onclick*="vpnSaveStationCount"]');
         const n = select ? parseInt(select.value, 10) : 0;
         if (!n || n < 1 || n > 10) return;
+        if (btn && btn.disabled) return;
+        if (typeof _vpnSaving !== 'undefined' && _vpnSaving) return;
+        _vpnSaving = true;
+        _vpnStationPending = String(n);
+        const origText = btn ? btn.textContent : '';
+        const origOutline = btn ? btn.style.outline : '';
+        if (btn) { btn.disabled = true; btn.textContent = 'En cours...'; btn.style.opacity = '0.6'; btn.style.cursor = 'wait'; }
+        if (select) select.disabled = true;
         let data = null;
         try {
             const resp = await fetchWithToken('/api/vpn-config', {
@@ -3426,17 +3478,24 @@ document.addEventListener('DOMContentLoaded', () => {
                 body: JSON.stringify({station_count: n})
             });
             data = await resp.json();
-            if (data.error) alert('Erreur: ' + data.error);
-        } catch (e) { alert('Erreur: ' + e); }
-        // Re-sync the selector from the persisted config (short-circuit:
-        // a no-op POST leaves it where it was).
-        if (data && data.config) {
-            const persisted = parseInt(data.config.station_count, 10);
-            if (persisted) document.getElementById('vpn-station-count').value = String(persisted);
+            if (!resp.ok || data.error) throw new Error(data.error || `HTTP ${resp.status}`);
+            if (data.config && data.config.station_count) {
+                const persisted = String(parseInt(data.config.station_count, 10));
+                if (select) select.value = persisted;
+                _vpnStationPending = null;
+                if (btn) btn.style.outline = '';
+            }
+        } catch (e) {
+            alert('Erreur: ' + (e.message || e));
+            _vpnStationPending = null;
+        } finally {
+            if (btn) { btn.disabled = false; btn.textContent = origText || (typeof t !== 'undefined' ? t('vpn.stations.save') : 'Appliquer'); btn.style.opacity = ''; btn.style.cursor = ''; if (!origOutline) btn.style.outline = ''; }
+            if (select) select.disabled = false;
+            _vpnSaving = false;
+            try { await refreshVPNStatus(); } catch(e2) {}
+            if (typeof refreshStackInfo === 'function') { try { await refreshStackInfo(); } catch(e3) {} }
+            try { fetchConfig(); } catch(e4) {}
         }
-        refreshVPNStatus();
-        if (typeof refreshStackInfo === 'function') refreshStackInfo();
-        fetchConfig();
     };
 
     window.vpnSaveExhaustMode = async function() {

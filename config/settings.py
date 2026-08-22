@@ -412,6 +412,40 @@ def resolved_station_count(cfg: dict) -> int:
         return max(1, min(10, n))
     return 2 if cfg.get("dual_station", False) else 1
 
+
+# [plan v2 auto-sync] auto_max_free_attempts defaults to True (derived
+# effective_max = clamp(N,1,3)). Legacy config.yaml missing the key: WARN
+# when the stored value diverges from the derived one so the operator knows
+# to set ``auto_max_free_attempts=false`` to keep a deliberate manual value.
+# Placed AFTER resolved_station_count so the helper is available. Idempotent
+# on reload — the same guard runs in maybe_reload_custom_routes.
+def _ensure_auto_max_free_attempts_warn(cfg: dict, source: str = "boot") -> None:
+    if not isinstance(cfg, dict) or "auto_max_free_attempts" in cfg:
+        return
+    try:
+        stored = int(cfg.get("max_free_attempts", 2) or 2)
+    except (TypeError, ValueError):
+        stored = 2
+    stored = max(1, min(stored, 3))
+    derived = max(1, min(int(resolved_station_count(cfg) or 1), 3))
+    if stored != derived:
+        logger.warning(
+            "[config] manual max_free_attempts=%s differs from derived=%s "
+            "(station_count=%s) — enabling auto_max_free_attempts=true; "
+            "set auto_max_free_attempts=false to keep manual",
+            stored, derived, resolved_station_count(cfg))
+    cfg["auto_max_free_attempts"] = True
+    # keep the in-yaml mirror consistent so a later save_yaml doesn't drop it
+    try:
+        sec = _yaml_data.get("ip_rotation")
+        if isinstance(sec, dict) and "auto_max_free_attempts" not in sec:
+            sec["auto_max_free_attempts"] = True
+    except Exception:
+        pass
+
+
+_ensure_auto_max_free_attempts_warn(IP_ROTATION, source="boot")
+
 # ── Server ──────────────────────────────────────────────────────────
 HOST = _env("OPENCODE_HOST", yaml_get("server", "host", "0.0.0.0"))
 PORT = _env_int("OPENCODE_PORT", yaml_get("server", "port", 4000))
@@ -1009,11 +1043,26 @@ def save_api_keys(configs: list[dict]):
     API_KEYS[:] = configs  # Atomic replacement — readers never see empty list
 
 
+def load_tool_capabilities() -> dict:
+    """Load tool compat capabilities (optional, fallback to empty if missing)."""
+    compat_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "tool_compat_results.json")
+    if os.path.exists(compat_path):
+        try:
+            with open(compat_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    return data
+        except Exception:
+            pass
+    return {}
+
+
 # ── Module-level state ──────────────────────────────────────────────
 
 CUSTOM_ROUTES = load_custom_routes()
 ROUTES = load_routes()
 API_KEYS = load_api_keys()
+TOOL_CAPABILITIES = load_tool_capabilities()
 
 
 # ── Hot-reload: Custom Routes ───────────────────────────────────────
@@ -1090,6 +1139,11 @@ def maybe_reload_custom_routes():
                     IP_ROTATION.clear()
                     if isinstance(new_ip, dict):
                         IP_ROTATION.update(new_ip)
+                    # [plan v2 auto-sync] ensure auto flag + WARN on divergence (idempotent)
+                    try:
+                        _ensure_auto_max_free_attempts_warn(IP_ROTATION, source="reload")
+                    except Exception:
+                        pass
                     # GEO in-place
                     geo_sec = new_yaml.get("geo", {}) if isinstance(new_yaml.get("geo"), dict) else {}
                     GEO_ENABLED = bool(geo_sec.get("enabled", False))

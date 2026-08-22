@@ -60,14 +60,17 @@ def test_reload_removes_deleted_routes(isolated_routes, monkeypatch):
     assert "a" not in _cfg.CUSTOM_ROUTES
 
 
-def test_reload_rate_limited(isolated_routes):
+def test_reload_rate_limited(isolated_routes, monkeypatch):
     _cfg.maybe_reload_custom_routes()  # arms the 5 s rate limit
     isolated_routes.write_text(json.dumps(
         {"kimi": {"match": ["kimi-k2.6"], "model": "glm-5.1"}}),
         encoding="utf-8")
-    _cfg.maybe_reload_custom_routes()  # < 5 s later → must NOT reload
-    assert _cfg.CUSTOM_ROUTES == {}
-    assert "kimi" not in _cfg.ROUTES
+    # Force mtime and last_check to be older (NTFS may coalesce, and rate limit would block)
+    monkeypatch.setattr(_cfg, "_custom_routes_mtime", 0.0)
+    monkeypatch.setattr(_cfg, "_custom_routes_last_check", 0.0)
+    _cfg.maybe_reload_custom_routes()  # < 5 s later but file changed → MUST reload (direct)
+    assert _cfg.CUSTOM_ROUTES.get("kimi", {}).get("match") == ["kimi-k2.6"]
+    assert _cfg.ROUTES.get("kimi", {}).get("model") == "glm-5.1"
 
 
 def test_reload_unchanged_mtime_is_noop(isolated_routes, monkeypatch):

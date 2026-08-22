@@ -252,6 +252,12 @@ upstream:
 
 When `DASHBOARD_TOKEN` is set, sensitive endpoints (`/api/config*`, `/api/vpn-config`, `/api/vpn/credentials`, `/api/vpn/import`, `/api/vpn/export`, `/api/requests/{req_id}`) require the `X-Dashboard-Token` header.
 
+## Security
+
+- **Bind address**: default `OPENCODE_HOST=0.0.0.0` exposes dashboard to LAN. Use `127.0.0.1` for local-only or set `DASHBOARD_TOKEN` (header `X-Dashboard-Token`) for any `0.0.0.0` deployment — the proxy warns at startup if `0.0.0.0` is open without a token.
+- **Secrets**: `api_keys.json`, `.env`, `credentials.env` are gitignored and never returned raw (API returns `*_masked` only; `dashboard/api.py:912`, `1093`). Rotate `OPENCODE_GO_AUTH_COOKIE` regularly — it is a session token.
+- **`.ovpn` files**: tracked `vpn/configs/*.ovpn` contain no inline credentials (`auth-user-pass` absent) — verified at audit.
+
 ## Keyboard shortcuts (Terminal)
 
 - `j`/`↓`: Scroll down

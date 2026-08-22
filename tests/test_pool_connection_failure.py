@@ -58,7 +58,7 @@ def _pool(st1, st2=None, *, bad_ttl=60, grace=20.0):
     pool._late_signal_grace = float(grace)
     # Stub the background-rotation launcher: notify must NEVER call it.
     pool.rotated = []
-    pool._launch_rotation = lambda station: pool.rotated.append(station)
+    pool._launch_rotation = lambda station, forced_pool=None, **kw: pool.rotated.append(station)
     return pool
 
 
@@ -366,6 +366,8 @@ class TestRequestPathWiring:
                                                   "extra_headers": {}})
         monkeypatch.setattr("curl_cffi.requests.AsyncSession",
                             lambda **kw: session)
+        # Clear pooled curl sessions: previous test may have cached a fake that raises RuntimeError
+        oc._curl_pool.clear()
         return rec
 
     @pytest.mark.asyncio

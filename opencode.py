@@ -1069,32 +1069,6 @@ def _ensure_http_client() -> httpx.AsyncClient:
             retries=0,
         )
         _client = httpx.AsyncClient(transport=_transport, timeout=_build_http_timeout())
-
-# ── Curl TLS pool (reuse AsyncSession per proxy+impersonate) ──
-_curl_pool: dict[str, tuple] = {}  # key -> (AsyncSession, asyncio.Lock)
-_curl_pool_lock = asyncio.Lock()
-
-async def _get_pooled_curl_session(proxy_url: str | None, impersonate: str):
-    """Get or create a pooled curl session for (proxy, impersonate)."""
-    key = f"{proxy_url or ''}|{impersonate}"
-    async with _curl_pool_lock:
-        if key in _curl_pool:
-            return _curl_pool[key]
-        from curl_cffi.requests import AsyncSession
-        sess = AsyncSession(impersonate=impersonate, proxy=_curl_proxy_url(proxy_url))
-        lock = asyncio.Lock()
-        _curl_pool[key] = (sess, lock)
-        return sess, lock
-
-async def _close_curl_pool():
-    """Close all pooled curl sessions (lifespan shutdown)."""
-    async with _curl_pool_lock:
-        for sess, _ in _curl_pool.values():
-            try:
-                await sess.close()
-            except Exception:
-                pass
-        _curl_pool.clear()
         _debug("[http] shared upstream client re-created (was closed)")
     return _client
 
@@ -1167,8 +1141,9 @@ async def _apply_station_count(new_n: int) -> None:
             # No-op path writes the env, docker stays untouched.
             if managers:
                 await managers[0]._apply_stack(managers[0]._stack_effective)
-            for m in managers[old_n:]:
-                await m.start()  # compose up -d <service> (fail-soft)
+            # [fix] Parallélise les compose up — 1→10 en // (gain 5-40s, 1 clic suffit)
+            if managers[old_n:]:
+                await asyncio.gather(*(m.start() for m in managers[old_n:]))
         else:
             pool = getattr(shared_state, "free_ip_pool", None)
             if pool is not None:
@@ -1178,9 +1153,11 @@ async def _apply_station_count(new_n: int) -> None:
                 # that stop_container is about to delete.
                 await pool.cancel_rotations(
                     [m._station for m in managers[new_n:]])
-            for m in reversed(managers[new_n:]):
-                await m.stop()  # state-only (tunnel dies only via compose)
-                await m.stop_container()  # compose stop + rm -f (fix 19/08)
+            # [fix] Parallélise les stops (même gain en downscale)
+            _retired = managers[new_n:]
+            if _retired:
+                await asyncio.gather(*(m.stop() for m in _retired))
+                await asyncio.gather(*(m.stop_container() for m in reversed(_retired)))
             managers = managers[:new_n]
             shared_state.vpn_managers = managers
             pool = getattr(shared_state, "free_ip_pool", None)
@@ -1193,10 +1170,20 @@ async def _apply_station_count(new_n: int) -> None:
         # Retro-compat aliases converge too
         shared_state.vpn_manager = managers[0]
         shared_state.vpn_manager_2 = managers[1] if new_n >= 2 else None
+        # [plan v2 auto-sync] derive AFTER set_stations+watcher, persist LAST
+        # Strict: shared_state → pool.set_stations → watcher → derive → persist
+        try:
+            _eff = effective_free_max_attempts()
+            IP_ROTATION["max_free_attempts"] = _eff
+        except Exception:
+            _eff = max(1, min(int(IP_ROTATION.get("max_free_attempts", 2) or 2), 3))
+            IP_ROTATION["max_free_attempts"] = _eff
         from dashboard.api import _persist_vpn_config
-        _persist_vpn_config({"station_count": new_n})
+        _res = _persist_vpn_config({"station_count": new_n, "max_free_attempts": _eff})
+        if asyncio.iscoroutine(_res):
+            await _res
         _debug(f"  [vpn] station_count hot-reload {old_n} → {new_n} "
-               f"({len(managers)} active)")
+               f"({len(managers)} active) effective_max={_eff}")
 
 
 # ── Debug helpers ──────────────────────────────────────────────────
@@ -1438,6 +1425,14 @@ async def lifespan(app):
         except Exception as e:
             _debug(f"  [lifespan] docker event watcher failed to start: {e}")
             shared_state.docker_event_watcher = None
+    # [plan v2 auto-sync] boot derive — mirrors _apply_station_count strict order
+    # shared_state → pool.set_stations already done; watcher started; now derive
+    try:
+        _eff_boot = effective_free_max_attempts()
+        IP_ROTATION["max_free_attempts"] = _eff_boot
+        _debug(f"  [lifespan] effective_max boot derived={_eff_boot} (auto={IP_ROTATION.get('auto_max_free_attempts', True)})")
+    except Exception as _e:
+        _debug(f"  [lifespan] effective_max boot derive failed: {_e}")
     _debug(f"  [lifespan] VPN manager initialized (enabled={_managers[0].enabled}, "
            f"mode={_managers[0]._mode}, station_count={n})")
 
@@ -2598,18 +2593,80 @@ class _FreeTunnelFailure(Exception):
         self.cause = cause
 
 
-def _free_max_attempts() -> int:
-    """[plan 19/08 §1] max free attempts per request (GUI: max_free_attempts).
+def effective_free_max_attempts(forced_pool=None) -> int:
+    """[plan v2] effective free attempts — single source of truth.
 
-    Each attempt lands on a DIFFERENT egress IP (station exclusion before
-    open). 1 = legacy behavior (one free try, then paid). Hot-reloaded: the
-    value is read from the live IP_ROTATION mirror per request.
+    Auto mode (``auto_max_free_attempts`` true, default): derived from the
+    number of *usable* egresses — ``len(_socks5_enabled_eps())`` in socks5
+    mode, else ``resolved_station_count`` filtered by ``forced_pool`` when
+    present (geo). Clamped to [1, 3]; direct is never counted.
+
+    Manual mode (auto false): respects ``max_free_attempts`` clamped to
+    [1, 3] + WARN if it exceeds the usable count (operator asked for more
+    attempts than stations exist).
     """
+    # Manual override — respect the stored value, but warn when incoherent
+    if not IP_ROTATION.get("auto_max_free_attempts", True):
+        try:
+            v = int(IP_ROTATION.get("max_free_attempts", 2) or 2)
+        except (TypeError, ValueError):
+            v = 2
+        manual = max(1, min(v, 3))
+        # WARN when manual exceeds usable (only when we can compute usable)
+        try:
+            if _free_ip_pool is not None and getattr(_free_ip_pool, "socks5_mode", False):
+                usable = len(_free_ip_pool._socks5_enabled_eps())
+            else:
+                usable = _cfg_settings.resolved_station_count(IP_ROTATION)
+                if forced_pool is not None and _free_ip_pool is not None:
+                    # count stations whose country is in forced_pool (via
+                    # the same predicate _station_usable uses for geo)
+                    cnt = 0
+                    for _st in getattr(_free_ip_pool, "_stations", []) or []:
+                        if _free_ip_pool._station_usable(_st, exclude_approaching=False, forced_pool=forced_pool):
+                            cnt += 1
+                    # only narrow, never widen (None-country stations stay usable)
+                    if cnt < usable:
+                        usable = cnt
+                usable = max(1, min(int(usable or 1), 3))
+            if manual > usable:
+                _debug(f"  [free] WARN manual max_free_attempts={manual} > usable={usable} (auto=false) — clamping effective to {usable} would waste retries")
+        except Exception:
+            pass
+        return manual
+
+    # Auto mode — derive from usable egresses
     try:
-        v = int(IP_ROTATION.get("max_free_attempts", 2) or 2)
-    except (TypeError, ValueError):
-        v = 2
-    return max(1, min(v, 3))
+        if _free_ip_pool is not None and getattr(_free_ip_pool, "socks5_mode", False):
+            # SOCKS5: number of enabled proxies (capped 3); forced_pool has
+            # no country semantic for static proxies so it is ignored here
+            try:
+                n = len(_free_ip_pool._socks5_enabled_eps())
+            except Exception:
+                n = _cfg_settings.resolved_station_count(IP_ROTATION)
+        else:
+            n = _cfg_settings.resolved_station_count(IP_ROTATION)
+            if forced_pool is not None and _free_ip_pool is not None:
+                cnt = 0
+                for _st in getattr(_free_ip_pool, "_stations", []) or []:
+                    if _free_ip_pool._station_usable(_st, exclude_approaching=False, forced_pool=forced_pool):
+                        cnt += 1
+                if cnt < n:
+                    n = cnt
+                # if pool has no stations yet (boot), keep resolved count
+                if cnt == 0 and n == 0:
+                    n = _cfg_settings.resolved_station_count(IP_ROTATION)
+        return max(1, min(int(n or 1), 3))
+    except Exception:
+        try:
+            return max(1, min(int(_cfg_settings.resolved_station_count(IP_ROTATION) or 1), 3))
+        except Exception:
+            return 2
+
+
+def _free_max_attempts() -> int:
+    """[plan 19/08 §1] alias — kept for compat, delegates to effective helper."""
+    return effective_free_max_attempts()
 
 
 def _free_exception_fallback_mode() -> str:
@@ -2623,9 +2680,9 @@ def _free_exception_fallback_mode() -> str:
     return mode if mode in ("station-first", "direct") else "station-first"
 
 
-def _free_attempts_active() -> bool:
+def _free_attempts_active(forced_pool=None) -> bool:
     """Free re-strike budget is active (>1 attempt or station-first)."""
-    return _free_max_attempts() > 1 or _free_exception_fallback_mode() == "station-first"
+    return effective_free_max_attempts(forced_pool) > 1 or _free_exception_fallback_mode() == "station-first"
 
 
 @asynccontextmanager
@@ -2783,7 +2840,8 @@ async def _open_free_stream(endpoint, body, headers, use_free: bool, count_reque
                                    "identity": profile.get("impersonate") or "",
                                    "station": _prev_attempt.get("station"),
                                    "proxy_url": None})
-        free_headers = {"Content-Type": "application/json"}
+        free_headers = _apply_identity(_free_request_headers(headers), profile, use_curated_ua=True)
+        free_headers["Content-Type"] = "application/json"
         async with _ensure_http_client().stream("POST", endpoint, json=body, headers=free_headers) as resp:
             yield resp
         return
@@ -3322,13 +3380,16 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
     free_profile = _current_free_identity(station)
     _current_free_attempt.set({"ip": free_ip, "identity": free_profile.get("impersonate") or "",
                                "station": station})
-    free_headers = {"Content-Type": "application/json"}
+    free_headers = _apply_identity({"Content-Type": "application/json"}, free_profile, use_curated_ua=True)
     free_api_key = "free (no auth)"
     free_workspace = "free (no auth)"
 
     _is_responses = "/responses" in free_endpoint
     if _is_responses:
-        if protocol == "anthropic":
+        if "input" in body:
+            free_body = dict(body)
+            free_body["model"] = free_model
+        elif protocol == "anthropic":
             free_body = _anthropic_to_responses_request({**body, "model": free_model})
         else:
             free_body = _chat_to_responses_request({**body, "model": free_model})
@@ -3360,7 +3421,7 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
         # direct fallback on tunnel failure — its bucket is long consumed,
         # so direct is reached only when every tunnel is down: paid
         # fallback is correct behaviour then).
-        free_max = _free_max_attempts()
+        free_max = effective_free_max_attempts(forced_pool)
         station_first = _free_exception_fallback_mode() == "station-first"
         tried: set = set()
         if station is not None:
@@ -3919,6 +3980,7 @@ def _route_for(model_name: str) -> dict | None:
         _route_cache[cache_key] = None
         return None
     # When DISABLE_MAPPING, only check custom routes (not auto-generated aliases)
+    # but keep manual opus/sonnet/haiku aliases (they are defined in ROUTES even when auto-mapping is off)
     if DISABLE_MAPPING:
         for r in _cfg_settings.SORTED_CUSTOM_ROUTES:
             if any(m in name for m in r.get("match", [])):
@@ -3927,6 +3989,17 @@ def _route_for(model_name: str) -> dict | None:
                 _route_cache[cache_key] = r
                 _debug(f"  [route] DISABLE_MAPPING custom match: '{name}' → {r.get('model')}")
                 return r
+        # Manual opus/sonnet/haiku routes must remain available even with DISABLE_MAPPING (Claude Code defaults)
+        for r in _cfg_settings.SORTED_ROUTES:
+            # Only the 3 manual aliases have match == opus/sonnet/haiku (checked via small set)
+            mlist = [m.lower() for m in r.get("match", []) if isinstance(m, str)]
+            if any(m in ("opus", "sonnet", "haiku") for m in mlist):
+                if any(m in name for m in r.get("match", [])):
+                    if len(_route_cache) >= _ROUTE_CACHE_MAX:
+                        _route_cache.clear()
+                    _route_cache[cache_key] = r
+                    _debug(f"  [route] DISABLE_MAPPING manual alias match: '{name}' → {r.get('model')}")
+                    return r
         # No custom route matched — check if the model exists directly
         if name in MODELS:
             res = {"match": [name], "model": model_name}
@@ -4175,12 +4248,15 @@ def _find_split_point(text: str) -> int:
     """Find the best split point between static instructions and dynamic content.
 
     Looks for the last double-newline in the first 8000 chars to split cleanly.
+    Search up to 75% of text (capped at 8000) so split near boundary (e.g. 8000/13000)
+    is found, while still keeping prefix stable for cache.
     """
-    search_limit = min(8000, len(text) // 2)
-    last_double = text.rfind("\n\n", 0, search_limit)
+    search_limit = min(8000, max(2000, len(text) * 3 // 4))
+    # +2 to include delimiter starting at exactly search_limit (rfind end is exclusive)
+    last_double = text.rfind("\n\n", 0, search_limit + 2)
     if last_double > 500:
         return last_double
-    last_newline = text.rfind("\n", 0, search_limit)
+    last_newline = text.rfind("\n", 0, search_limit + 1)
     if last_newline > 500:
         return last_newline
     return 0
@@ -5013,6 +5089,8 @@ def openai_chat_to_responses(chat_resp: dict, model: str) -> dict:
 
 
 def _chat_to_responses_request(chat: dict) -> dict:
+    if "input" in chat and "messages" not in chat:
+        return dict(chat)
     inp = []
     for m in chat.get("messages", []) or []:
         role = m.get("role", "user")
@@ -5083,6 +5161,8 @@ def _chat_to_responses_request(chat: dict) -> dict:
 
 
 def _anthropic_to_responses_request(anthro: dict) -> dict:
+    if "input" in anthro and "messages" not in anthro:
+        return dict(anthro)
     chat = anthropic_to_openai(anthro, anthro.get("model", ""))
     return _chat_to_responses_request(chat)
 
@@ -5155,6 +5235,10 @@ def _responses_to_anthropic_response(resp: dict, model: str) -> dict:
     return {"id": f"msg_{uuid.uuid4().hex[:24]}", "type": "message", "role": "assistant", "content": blocks, "model": model, "stop_reason": stop, "stop_sequence": None, "usage": {"input_tokens": usage.get("input_tokens", 0), "output_tokens": usage.get("output_tokens", 0), "cache_read_input_tokens": _cache_read}}
 
 
+# ── Responses API tool mapping cache (item_id/output_index → tool info) ──
+_responses_tool_cache: dict = {}
+_responses_tool_index_map: dict = {}  # output_index -> sequential tool index (0,1,2...)
+
 def _responses_sse_to_chat_deltas(raw_line: str):
     """Convert one Responses API SSE data line to chat/completions delta chunks.
 
@@ -5197,8 +5281,66 @@ def _responses_sse_to_chat_deltas(raw_line: str):
             return {"choices": [{"delta": {"reasoning_content": text}, "finish_reason": None}]}
         return None
 
+    # response.reasoning_summary_text.delta — thinking delta (alternative event name)
+    if etype == "response.reasoning_summary_text.delta":
+        text = chunk.get("delta", "")
+        if not text:
+            return None
+        return {"choices": [{"delta": {"reasoning_content": text}, "finish_reason": None}]}
+
+    # response.output_item.added — start of function_call (tool_use)
+    if etype == "response.output_item.added":
+        item = chunk.get("item", {}) if isinstance(chunk.get("item"), dict) else {}
+        if item.get("type") == "function_call":
+            out_idx = chunk.get("output_index", 0)
+            # Map output_index to sequential tool index
+            if out_idx not in _responses_tool_index_map:
+                _responses_tool_index_map[out_idx] = len(_responses_tool_index_map)
+            tool_idx = _responses_tool_index_map[out_idx]
+            call_id = item.get("call_id") or item.get("id") or f"call_{uuid.uuid4().hex[:12]}"
+            name = item.get("name", "")
+            # Cache for later delta events (by item_id and output_index)
+            iid = item.get("id") or call_id
+            _responses_tool_cache[iid] = {"index": tool_idx, "call_id": call_id, "name": name, "output_index": out_idx}
+            _responses_tool_cache[f"idx_{out_idx}"] = {"index": tool_idx, "call_id": call_id, "name": name}
+            _debug(f"  [responses-sse] function_call start idx={tool_idx} (out_idx={out_idx}) name={name!r} call_id={call_id}")
+            return {"choices": [{"delta": {"tool_calls": [{"index": tool_idx, "id": call_id, "type": "function", "function": {"name": name, "arguments": ""}}]}, "finish_reason": None}]}
+
+    # response.function_call_arguments.delta — streaming tool arguments
+    if etype == "response.function_call_arguments.delta":
+        delta = chunk.get("delta", "")
+        if not delta:
+            return None
+        out_idx = chunk.get("output_index", 0)
+        iid = chunk.get("item_id", "")
+        # Lookup tool index
+        info = _responses_tool_cache.get(iid) or _responses_tool_cache.get(f"idx_{out_idx}")
+        if info is None:
+            # Fallback: create entry if we missed the 'added' event
+            if out_idx not in _responses_tool_index_map:
+                _responses_tool_index_map[out_idx] = len(_responses_tool_index_map)
+            tool_idx = _responses_tool_index_map[out_idx]
+            _debug(f"  [responses-sse] function_call delta without prior added — fallback idx={tool_idx} out_idx={out_idx}")
+        else:
+            tool_idx = info["index"]
+        return {"choices": [{"delta": {"tool_calls": [{"index": tool_idx, "function": {"arguments": delta}}]}, "finish_reason": None}]}
+
+    # response.function_call_arguments.done — final tool arguments (optional, ensure completeness)
+    if etype == "response.function_call_arguments.done":
+        # This contains the full arguments but deltas already streamed; we can skip or emit final check
+        # Don't emit extra delta if already streamed via .delta events; just ensure cache is updated
+        iid = chunk.get("item_id", "")
+        args = chunk.get("arguments", "")
+        name = chunk.get("name", "")
+        if iid and iid in _responses_tool_cache and name:
+            _responses_tool_cache[iid]["name"] = name
+        return None
+
     # response.completed — final event with usage
     if etype == "response.completed":
+        # Clear tool cache for next request
+        _responses_tool_cache.clear()
+        _responses_tool_index_map.clear()
         resp = chunk.get("response", {})
         usage = resp.get("usage", {})
         # Cache tokens come from input_tokens_details, NOT output_tokens_details
@@ -5215,6 +5357,8 @@ def _responses_sse_to_chat_deltas(raw_line: str):
 
     # response.incomplete — model didn't generate output, treat as stream end
     if etype == "response.incomplete":
+        _responses_tool_cache.clear()
+        _responses_tool_index_map.clear()
         _debug(f"  [responses-sse] response.incomplete received — model produced no output")
         resp = chunk.get("response", {})
         usage = resp.get("usage", {}) if isinstance(resp.get("usage"), dict) else {}
@@ -5226,8 +5370,7 @@ def _responses_sse_to_chat_deltas(raw_line: str):
         return {"choices": [], "usage": chat_usage}
 
     # All other event types (response.created, response.in_progress,
-    # response.output_item.added/done, response.content_part.added/done,
-    # response.function_call_arguments.delta/done) — skip
+    # response.output_item.done, response.content_part.added/done, etc.) — skip
     return None
 
 
@@ -5683,12 +5826,13 @@ async def messages(request: Request):
             stop_reason = "end_turn"
             _handle_429 = _make_stream_retry_loop("anthropic")
             _geo_tunnel = getattr(request.state, "_geo_force_tunnel", False)
+            _free_forced_pool = getattr(request.state, "_geo_forced_pool", None)
             _free_bound = yaml_get("streaming", "retry_attempts", 2)
-            if _using_free and _free_attempts_active():
+            if _using_free and _free_attempts_active(_free_forced_pool):
                 # [plan 19/08 §1] free multi-attempt: extra free strikes on
                 # fresh stations; paid retry budget preserved
                 # (max_free_attempts=1 ⇒ exact legacy behaviour).
-                _free_bound += max(0, _free_max_attempts() - 1)
+                _free_bound += max(0, effective_free_max_attempts(_free_forced_pool) - 1)
             for _attempt in range(_free_bound):
                 used_tools = []  # Reset on each retry attempt
                 _line_buf = ""  # fresh per attempt — avoids stale truncated data: re-parse
@@ -5697,14 +5841,14 @@ async def messages(request: Request):
                     # Axe A: geo-restricted paid streaming → route through tunnel station
                     _stream_ctx = (_open_via_pool(endpoint, body, headers,
                                                   is_stream=True,
-                                                  forced_pool=getattr(request.state, "_geo_forced_pool", None))
+                                                  forced_pool=_free_forced_pool)
                                    if _geo_tunnel else
                                    _open_free_stream(endpoint, body, headers, _using_free,
                                                      count_request=(_attempt == 0),
                                                      fresh_station=(_attempt > 0 and _using_free),
                                                      direct_fallback=(_free_exception_fallback_mode() != "station-first"
-                                                                      or _attempt + 1 >= _free_max_attempts()),
-                                                     forced_pool=getattr(request.state, "_geo_forced_pool", None)))
+                                                                      or _attempt + 1 >= effective_free_max_attempts(_free_forced_pool)),
+                                                     forced_pool=_free_forced_pool))
                     async with _stream_ctx as resp:
                         _debug(f"  [stream] connected status={resp.status_code}")
                         if resp.status_code != 200:
@@ -5715,8 +5859,8 @@ async def messages(request: Request):
                                 # about the paid account (CRITIC(2)/CRITIC(3)).
                                 if resp.status_code == 429:
                                     _refuse = _on_free_429_stream(free_model, resp.headers.get('retry-after', ''),
-                                                                   forced_pool=getattr(request.state, "_geo_forced_pool", None))
-                                    if not _refuse and _attempt + 1 < _free_max_attempts():
+                                                                   forced_pool=_free_forced_pool)
+                                    if not _refuse and _attempt + 1 < effective_free_max_attempts(_free_forced_pool):
                                         # [plan 19/08 §1] budget left → retry free on a
                                         # FRESH station (fresh IP = fresh quota); keep
                                         # _using_free so the next attempt re-enters free
@@ -5724,7 +5868,7 @@ async def messages(request: Request):
                                         # for the exhausted IP already done above.
                                         _log_free_model_usage(model_id, free_model, "free (no auth)", "free (no auth)",
                                                               resp.status_code, ip=_free_usage_ip())
-                                        _log(f"  FREE {free_model!r} RATE LIMITED (429) → retry station fraîche (essai {_attempt + 2}/{_free_max_attempts()})")
+                                        _log(f"  FREE {free_model!r} RATE LIMITED (429) → retry station fraîche (essai {_attempt + 2}/{effective_free_max_attempts(_free_forced_pool)})")
                                         if _stream_has_yielded(started, open_blocks, stream_out, _line_buf):
                                             _cb_record_failure(endpoint)
                                             _log(f"  stream_retry_suppressed_after_started attempt={_attempt+1}")
@@ -6048,6 +6192,15 @@ async def messages(request: Request):
     is_stream = oai_body["stream"]
 
     if not is_stream:
+        # Cache check for OpenAI-protocol via /v1/messages (mirrors anthropic branch)
+        cache_key = _response_cache.make_key(body, body_bytes=body_bytes)
+        cached = cache_key and _response_cache.get(cache_key)
+        if cached:
+            cached_body, cached_headers = cached
+            _debug(f"  cache HIT key={cache_key[:16]}… size={len(cached_body)} bytes (openai via messages)")
+            _log(f"  ← {model_id} | cache HIT")
+            return Response(content=cached_body, headers={**cached_headers, "X-Cache": "HIT"}, media_type="application/json")
+        _debug(f"  cache MISS key={cache_key[:16] if cache_key else 'none'}… (openai via messages)")
         # Try free model first if available
         _geo_tunnel = getattr(request.state, "_geo_force_tunnel", False)
         try:
@@ -6150,8 +6303,10 @@ async def messages(request: Request):
                      effort=effort, client_ip=client_ip, account_alias=account_alias, tools=tool_names,
                      tools_used=used if used else None,
                      request_body=request_body, response_body=data)
-        return Response(content=_json_dumps_str(anthro_resp, ensure_ascii=False),
-                        media_type="application/json")
+        anthro_bytes = _json_dumps_str(anthro_resp, ensure_ascii=False).encode()
+        if cache_key:
+            _response_cache.put(cache_key, anthro_bytes, {"Content-Type": "application/json"})
+        return Response(content=anthro_bytes, headers={"X-Cache": "MISS"}, media_type="application/json")
 
     # Streaming
     msg_id = _fast_id("msg")
@@ -6205,12 +6360,13 @@ async def messages(request: Request):
         _free_bound = yaml_get("streaming", "retry_attempts", 2)
         _debug(f"  [stream-oai] _free_bound={_free_bound}")
         _geo_tunnel = getattr(request.state, "_geo_force_tunnel", False)
+        _free_forced_pool = getattr(request.state, "_geo_forced_pool", None)
         _debug(f"  [stream-oai] _geo_tunnel={_geo_tunnel} _using_free={_using_free}")
-        if _using_free and _free_attempts_active():
+        if _using_free and _free_attempts_active(_free_forced_pool):
             # [plan 19/08 §1] free multi-attempt: extra free strikes on
             # fresh stations; paid retry budget preserved
             # (max_free_attempts=1 ⇒ exact legacy behaviour).
-            _free_bound += max(0, _free_max_attempts() - 1)
+            _free_bound += max(0, effective_free_max_attempts(_free_forced_pool) - 1)
         _debug(f"  [stream-oai] final _free_bound={_free_bound}, starting for loop")
         for _attempt in range(_free_bound):
             used_tools = []  # Reset on each retry attempt
@@ -6222,14 +6378,14 @@ async def messages(request: Request):
                 _debug(f"  [stream-oai] attempt {_attempt}/{_free_bound} _geo_tunnel={_geo_tunnel} _using_free={_using_free} endpoint={endpoint}")
                 _stream_ctx = (_open_via_pool(endpoint, oai_body, hdrs,
                                               is_stream=True,
-                                              forced_pool=getattr(request.state, "_geo_forced_pool", None))
+                                              forced_pool=_free_forced_pool)
                                if _geo_tunnel else
                                _open_free_stream(endpoint, oai_body, hdrs, _using_free,
                                                  count_request=(_attempt == 0),
                                                  fresh_station=(_attempt > 0 and _using_free),
                                                  direct_fallback=(_free_exception_fallback_mode() != "station-first"
-                                                                  or _attempt + 1 >= _free_max_attempts()),
-                                                 forced_pool=getattr(request.state, "_geo_forced_pool", None)))
+                                                                  or _attempt + 1 >= effective_free_max_attempts(_free_forced_pool)),
+                                                 forced_pool=_free_forced_pool))
                 _debug(f"  [stream-oai] entering stream context")
                 async with _stream_ctx as resp:
                     _debug(f"  [stream-oai] stream context entered, status={resp.status_code}")
@@ -6241,8 +6397,8 @@ async def messages(request: Request):
                             # about the paid account (CRITIC(2)/CRITIC(3)).
                             if resp.status_code == 429:
                                 _refuse = _on_free_429_stream(free_model, resp.headers.get('retry-after', ''),
-                                                               forced_pool=getattr(request.state, "_geo_forced_pool", None))
-                                if not _refuse and _attempt + 1 < _free_max_attempts():
+                                                               forced_pool=_free_forced_pool)
+                                if not _refuse and _attempt + 1 < effective_free_max_attempts(_free_forced_pool):
                                     # [plan 19/08 §1] budget left → retry free on a
                                     # FRESH station (fresh IP = fresh quota); keep
                                     # _using_free so the next attempt re-enters free
@@ -6250,7 +6406,7 @@ async def messages(request: Request):
                                     # for the exhausted IP already done above.
                                     _log_free_model_usage(_paid_model_id, free_model, "free (no auth)", "free (no auth)",
                                                           resp.status_code, ip=_free_usage_ip())
-                                    _log(f"  FREE {free_model!r} RATE LIMITED (429) → retry station fraîche (essai {_attempt + 2}/{_free_max_attempts()})")
+                                    _log(f"  FREE {free_model!r} RATE LIMITED (429) → retry station fraîche (essai {_attempt + 2}/{effective_free_max_attempts(_free_forced_pool)})")
                                     if _stream_has_yielded(started, open_blocks, stream_out_tokens, ""):
                                         _cb_record_failure(endpoint)
                                         _log(f"  stream_retry_suppressed_after_started attempt={_attempt+1}")
@@ -6825,6 +6981,44 @@ async def chat_completions(request: Request):
 
     # Tool filtering removed — all tools are forwarded as-is
 
+    # Normalize effort/thinking -> reasoning_effort for OpenAI direct clients (mimo/spark)
+    # Claude Code via /v1/messages already maps via anthropic_to_openai, but
+    # clients talking OpenAI directly (e.g. via /v1/chat/completions with effort)
+    # need the same mapping so spark/mimo get correct reasoning level.
+    if "reasoning_effort" not in body:
+        _effort_level = body.get("effort")
+        _thinking_param = body.get("thinking") if isinstance(body.get("thinking"), dict) else {}
+        _ttype = _thinking_param.get("type", "") if isinstance(_thinking_param, dict) else ""
+        _budget = _thinking_param.get("budget_tokens", 0) if isinstance(_thinking_param, dict) else 0
+        _wants = False
+        _mapped_effort = _effort_level
+        if _effort_level and _effort_level != "none":
+            _wants = True
+        elif _ttype in ("enabled", "adaptive") or _budget:
+            _wants = True
+            if _budget and _budget < 4000:
+                _mapped_effort = "low"
+            elif _budget and _budget < 10000:
+                _mapped_effort = "medium"
+            elif _budget and _budget < 16000:
+                _mapped_effort = "high"
+            elif _ttype == "adaptive":
+                _mapped_effort = "medium"
+            elif _budget:
+                _mapped_effort = "xhigh"
+            else:
+                _mapped_effort = "low" if _ttype == "enabled" else "medium"
+        if _wants and _mapped_effort and _mapped_effort != "none":
+            if model_id.startswith("glm-5"):
+                body["reasoning_effort"] = "high" if _mapped_effort in ("xhigh","max","high") else ("medium" if _mapped_effort=="medium" else "low")
+            elif model_id.startswith("deepseek-v4"):
+                body["reasoning_effort"] = "max" if _mapped_effort in ("xhigh","max") else "high"
+            else:
+                body["reasoning_effort"] = "high" if _mapped_effort in ("xhigh","max","high") else ("medium" if _mapped_effort=="medium" else "low")
+            # Keep original effort for logging, but ensure reasoning_effort is set
+            if effort == "none":
+                effort = _mapped_effort
+
     # Handle web_search tool (DuckDuckGo or model routing)
     await _handle_web_search(body, model_id, protocol)
 
@@ -6996,12 +7190,13 @@ async def chat_completions(request: Request):
             _oai_has_yielded = False
             actual_usage = None
             _handle_429 = _make_stream_retry_loop("openai")
+            _free_forced_pool = getattr(request.state, "_geo_forced_pool", None)
             _free_bound = yaml_get("streaming", "retry_attempts", 2)
-            if _using_free and _free_attempts_active():
+            if _using_free and _free_attempts_active(_free_forced_pool):
                 # [plan 19/08 §1] free multi-attempt: extra free strikes on
                 # fresh stations; paid retry budget preserved
                 # (max_free_attempts=1 ⇒ exact legacy behaviour).
-                _free_bound += max(0, _free_max_attempts() - 1)
+                _free_bound += max(0, effective_free_max_attempts(_free_forced_pool) - 1)
             for _attempt in range(_free_bound):
                 used_tools = []
                 seen_tool_indices = set()  # dedup tool calls by index
@@ -7010,8 +7205,8 @@ async def chat_completions(request: Request):
                                              count_request=(_attempt == 0),
                                              fresh_station=(_attempt > 0 and _using_free),
                                              direct_fallback=(_free_exception_fallback_mode() != "station-first"
-                                                              or _attempt + 1 >= _free_max_attempts()),
-                                                  forced_pool=getattr(request.state, "_geo_forced_pool", None)) as resp:
+                                                              or _attempt + 1 >= effective_free_max_attempts(_free_forced_pool)),
+                                                  forced_pool=_free_forced_pool) as resp:
                         if resp.status_code != 200:
                             if _using_free:
                                 # Free endpoint non-200 (429 quota, 5xx...) → cooldown
@@ -7020,8 +7215,8 @@ async def chat_completions(request: Request):
                                 # about the paid account (CRITIC(2)/CRITIC(3)).
                                 if resp.status_code == 429:
                                     _refuse = _on_free_429_stream(free_model, resp.headers.get('retry-after', ''),
-                                                                   forced_pool=getattr(request.state, "_geo_forced_pool", None))
-                                    if not _refuse and _attempt + 1 < _free_max_attempts():
+                                                                   forced_pool=_free_forced_pool)
+                                    if not _refuse and _attempt + 1 < effective_free_max_attempts(_free_forced_pool):
                                         # [plan 19/08 §1] budget left → retry free on a
                                         # FRESH station (fresh IP = fresh quota); keep
                                         # _using_free so the next attempt re-enters free
@@ -7029,7 +7224,7 @@ async def chat_completions(request: Request):
                                         # for the exhausted IP already done above.
                                         _log_free_model_usage(model_id, free_model, "free (no auth)", "free (no auth)",
                                                               resp.status_code, ip=_free_usage_ip())
-                                        _log(f"  FREE {free_model!r} RATE LIMITED (429) → retry station fraîche (essai {_attempt + 2}/{_free_max_attempts()})")
+                                        _log(f"  FREE {free_model!r} RATE LIMITED (429) → retry station fraîche (essai {_attempt + 2}/{effective_free_max_attempts(_free_forced_pool)})")
                                         if _oai_has_yielded or stream_out > 0:
                                             _cb_record_failure(endpoint)
                                             _log(f"  stream_retry_suppressed_after_started attempt={_attempt+1}")
@@ -7128,9 +7323,24 @@ async def chat_completions(request: Request):
                             chunk_usage = chunk.get("usage")
                             if isinstance(chunk_usage, dict):
                                 actual_usage = chunk_usage
+                            # Responses API stream (muse) : convertir avant de tester choices
+                            if chunk.get("type", "").startswith("response."):
+                                converted = _responses_sse_to_chat_deltas(data_str)
+                                if converted is not None:
+                                    chunk = converted
+                                    # usage-only (completed/incomplete) → finaliser
+                                    if not chunk.get("choices") and isinstance(chunk, dict) and "usage" in chunk:
+                                        _debug(f"  [oai-stream] response stream-end signal, breaking to finalize")
+                                        break
+                                    yield f"data: {_json_dumps_str(chunk, ensure_ascii=False)}\n\n".encode()
+                                    # reasoning_content / content compté plus bas via choices
+                                    choices = chunk.get("choices", [])
+                                    # ne pas re-tomber dans le test choices vide ci-dessous
+                                    if not choices:
+                                        continue
                             choices = chunk.get("choices", [])
                             if not choices or not isinstance(choices, list):
-                                #可能是 Responses API format — try converting
+                                #可能是 Responses API format — try converting (fallback legacy)
                                 converted = _responses_sse_to_chat_deltas(data_str)
                                 if converted is not None:
                                     chunk = converted
@@ -7411,26 +7621,27 @@ async def chat_completions(request: Request):
             return b"data: " + _json_dumps_str(c, ensure_ascii=False).encode() + b"\n\n"
 
         _geo_tunnel = getattr(request.state, "_geo_force_tunnel", False)
+        _free_forced_pool = getattr(request.state, "_geo_forced_pool", None)
         _free_bound = yaml_get("streaming", "retry_attempts", 2)
-        if _using_free and _free_attempts_active():
+        if _using_free and _free_attempts_active(_free_forced_pool):
             # [plan 19/08 §1] free multi-attempt: extra free strikes on
             # fresh stations; paid retry budget preserved
             # (max_free_attempts=1 ⇒ exact legacy behaviour).
-            _free_bound += max(0, _free_max_attempts() - 1)
+            _free_bound += max(0, effective_free_max_attempts(_free_forced_pool) - 1)
         for _attempt in range(_free_bound):
             _line_buf = ""  # fresh per attempt — avoids stale truncated data:
             try:
                 # Axe A: geo-restricted paid streaming → route through tunnel station
                 _stream_ctx = (_open_via_pool(endpoint, anthro_body, hdrs,
                                               is_stream=True,
-                                              forced_pool=getattr(request.state, "_geo_forced_pool", None))
+                                              forced_pool=_free_forced_pool)
                                if _geo_tunnel else
                                _open_free_stream(endpoint, anthro_body, hdrs, _using_free,
                                                  count_request=(_attempt == 0),
                                                  fresh_station=(_attempt > 0 and _using_free),
                                                  direct_fallback=(_free_exception_fallback_mode() != "station-first"
-                                                                  or _attempt + 1 >= _free_max_attempts()),
-                                                 forced_pool=getattr(request.state, "_geo_forced_pool", None)))
+                                                                  or _attempt + 1 >= effective_free_max_attempts(_free_forced_pool)),
+                                                 forced_pool=_free_forced_pool))
                 async with _stream_ctx as resp:
                     if resp.status_code != 200:
                         if _using_free:
@@ -7440,8 +7651,8 @@ async def chat_completions(request: Request):
                             # about the paid account (CRITIC(2)/CRITIC(3)).
                             if resp.status_code == 429:
                                 _refuse = _on_free_429_stream(free_model, resp.headers.get('retry-after', ''),
-                                                               forced_pool=getattr(request.state, "_geo_forced_pool", None))
-                                if not _refuse and _attempt + 1 < _free_max_attempts():
+                                                               forced_pool=_free_forced_pool)
+                                if not _refuse and _attempt + 1 < effective_free_max_attempts(_free_forced_pool):
                                     # [plan 19/08 §1] budget left → retry free on a
                                     # FRESH station (fresh IP = fresh quota); keep
                                     # _using_free so the next attempt re-enters free
@@ -7449,7 +7660,7 @@ async def chat_completions(request: Request):
                                     # for the exhausted IP already done above.
                                     _log_free_model_usage(model_id, free_model, "free (no auth)", "free (no auth)",
                                                           resp.status_code, ip=_free_usage_ip())
-                                    _log(f"  FREE {free_model!r} RATE LIMITED (429) → retry station fraîche (essai {_attempt + 2}/{_free_max_attempts()})")
+                                    _log(f"  FREE {free_model!r} RATE LIMITED (429) → retry station fraîche (essai {_attempt + 2}/{effective_free_max_attempts(_free_forced_pool)})")
                                     if _stream_has_yielded(started, open_blocks, stream_out, _line_buf):
                                         _cb_record_failure(endpoint)
                                         _log(f"  stream_retry_suppressed_after_started attempt={_attempt+1}")

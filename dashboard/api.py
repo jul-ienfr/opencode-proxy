@@ -77,8 +77,26 @@ _local_ips_cache: tuple[float, list] | None = None
 # When DASHBOARD_TOKEN is set, sensitive endpoints require the header
 # `X-Dashboard-Token` (constant-time comparison). Unset → legacy open access
 # (documented: set DASHBOARD_TOKEN when the server is exposed beyond localhost).
+# [P1.3] Warn at import when host 0.0.0.0 is exposed without a token.
 
 _DASHBOARD_TOKEN = os.getenv("DASHBOARD_TOKEN", "").strip()
+try:
+    _host_for_warning = (os.getenv("OPENCODE_HOST", "") or "").strip()
+    if not _host_for_warning:
+        import yaml as _yaml_warn
+        try:
+            with open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.yaml"), "r", encoding="utf-8") as _f:
+                _yw = _yaml_warn.safe_load(_f) or {}
+                _host_for_warning = str(_yw.get("server", {}).get("host", "0.0.0.0"))
+        except Exception:
+            _host_for_warning = "0.0.0.0"
+    if _host_for_warning == "0.0.0.0" and not _DASHBOARD_TOKEN:
+        import logging as _logging_warn
+        _logging_warn.getLogger("dashboard").warning(
+            "DASHBOARD_TOKEN not set while host is 0.0.0.0 — dashboard is open to LAN. "
+            "Set DASHBOARD_TOKEN in .env (header X-Dashboard-Token) for any non-localhost deployment.")
+except Exception:
+    pass
 
 # [Axe 3.4] config.yaml manual-edit detector. Hot-reload is push-only BY
 # DESIGN (no file watcher auto-reload) — this only tracks whether the file
