@@ -2980,227 +2980,123 @@ document.addEventListener('DOMContentLoaded', () => {
     });
 
     // ── VPN tab refresh ──
-    // ── VPN tab refresh (parallélisé + état chargement) ──
-    let _vpnRefreshInFlight = false;
     async function refreshVPNStatus() {
-        if (_vpnRefreshInFlight) return;
-        _vpnRefreshInFlight = true;
-        const fmToggle = document.getElementById('fm-toggle');
-        const statusEl = document.getElementById('vpn-status-text');
-        const statusDot = document.getElementById('vpn-status-dot');
-        const prevEnabled = fmToggle ? fmToggle.checked : null;
-        if (fmToggle) fmToggle.disabled = true;
-        if (statusEl && !statusEl.dataset.loading) {
-            statusEl.dataset.orig = statusEl.textContent;
-            statusEl.textContent = 'Chargement...';
-            statusEl.dataset.loading = '1';
-            if (statusDot) statusDot.style.background = 'var(--warning)';
-        }
         try {
-            const cached = localStorage.getItem('vpn_enabled_cache');
-            if (cached !== null && fmToggle && prevEnabled === false) {
-                const cachedEnabled = cached === '1';
-                if (cachedEnabled) fmToggle.checked = true;
+            const resp = await fetchWithToken('/api/vpn-status');
+            const data = await resp.json();
+            updateVPNUI(data);
+            try {
+                const cfgR = await fetchWithToken('/api/vpn-config');
+                const cfgJ = await cfgR.json();
+                if (cfgJ.proxy_mode) updateGeoWarning(cfgJ.proxy_mode);
+            } catch (e2) {}
+        } catch (e) {
+            console.error('VPN status error:', e);
+        }
+        // Also check credential status
+        try {
+            const credResp = await fetchWithToken('/api/vpn/credentials');
+            const credData = await credResp.json();
+            const credStatus = document.getElementById('vpn-cred-status');
+            const usernameEl = document.getElementById('vpn-cred-username');
+            const passwordEl = document.getElementById('vpn-cred-password');
+            const fileEl = document.getElementById('vpn-cred-file');
+
+            if (credData.exists) {
+                if (credStatus) credStatus.innerHTML = '<span style="color:var(--success)">&#10003;</span> ' + (t('vpn.credentials_saved') || 'Enregistré');
+                if (usernameEl) usernameEl.textContent = credData.username_preview || '****';
+                if (passwordEl) passwordEl.textContent = '••••••••';
+                if (fileEl) fileEl.textContent = 'credentials.env';
+            } else {
+                if (credStatus) credStatus.innerHTML = '<span style="color:var(--warning)">!</span> ' + (t('vpn.credentials_missing') || 'Aucun identifiant');
+                if (usernameEl) usernameEl.textContent = '—';
+                if (passwordEl) passwordEl.textContent = '—';
+                if (fileEl) fileEl.textContent = '—';
+            }
+        } catch (e) {
+            console.error('Credential status error:', e);
+        }
+        // Also load server list from config
+        try {
+            const cfgResp = await fetchWithToken('/api/vpn-config');
+            const cfgData = await cfgResp.json();
+            renderServerList(cfgData.servers || []);
+            // Initialize config fields
+            if (cfgData.mode) document.getElementById('vpn-mode').value = cfgData.mode;
+            if (cfgData.proxy_port) document.getElementById('vpn-proxy-port').value = cfgData.proxy_port;
+            if (cfgData.switch_delay) document.getElementById('vpn-switch-delay').value = cfgData.switch_delay;
+            if (cfgData.quota_per_ip) document.getElementById('vpn-quota-per-ip').value = cfgData.quota_per_ip;
+            if (cfgData.docker_image) {
+                const dockerSelect = document.getElementById('vpn-docker-image');
+                // Check if it's a known option or custom
+                const knownImages = ['qmcgaw/gluetun', 'nordvpn-official'];
+                if (knownImages.includes(cfgData.docker_image)) {
+                    dockerSelect.value = cfgData.docker_image;
+                } else {
+                    dockerSelect.value = 'custom';
+                    const customInput = document.getElementById('vpn-docker-image-custom');
+                    if (customInput) {
+                        customInput.style.display = 'block';
+                        customInput.value = cfgData.docker_image;
+                    }
+                }
+                vpnDockerImageChanged();
+            }
+            vpnInitConfig(cfgData.mode);
+
+            // Load advanced config fields
+            if (cfgData.circuit_breaker_threshold) document.getElementById('vpn-cb-threshold').value = cfgData.circuit_breaker_threshold;
+            if (cfgData.circuit_breaker_recovery) document.getElementById('vpn-cb-recovery').value = cfgData.circuit_breaker_recovery;
+            if (cfgData.backoff_max_delay) document.getElementById('vpn-backoff-max').value = cfgData.backoff_max_delay;
+            if (cfgData.watchdog_interval !== undefined) document.getElementById('vpn-watchdog').value = cfgData.watchdog_interval;
+            if (cfgData.api_cache_ttl) document.getElementById('vpn-api-cache').value = cfgData.api_cache_ttl;
+
+            // Initialize proxy mode UI
+            if (cfgData.proxy_mode) {
+                setProxyModeUI(cfgData.proxy_mode);
+            }
+
+            // [plan 18/08 §4] N-station selector (1-10) + exhaust mode
+            const stationCountSelect = document.getElementById('vpn-station-count');
+            if (stationCountSelect) {
+                // keep static 1-10 options (injected in HTML) — just set value
+                stationCountSelect.value = String(cfgData.station_count || 1);
+            }
+            const exhaustMode = document.getElementById('vpn-exhaust-mode');
+            if (exhaustMode) exhaustMode.value = cfgData.strict_free ? 'strict' : 'fallback';
+
+            // [plan 19/08 §1/§2] free multi-attempt cap (1-3) + exception
+            // ordering (station-first / direct) — read from config.
+            const freeAttempts = document.getElementById('vpn-free-attempts');
+            if (freeAttempts) freeAttempts.value = String(cfgData.max_free_attempts || 2);
+            const exceptionMode = document.getElementById('vpn-exception-mode');
+            if (exceptionMode) exceptionMode.value = cfgData.free_exception_fallback || 'station-first';
+
+            // [plan 18/08 §3d] VPN technology selector
+            const stackSelect = document.getElementById('vpn-stack-select');
+            if (stackSelect && cfgData.vpn_stack) stackSelect.value = cfgData.vpn_stack;
+
+            // Initialize free models master toggle
+            const fmToggle = document.getElementById('fm-toggle');
+            const fmLabel = document.getElementById('fm-toggle-label');
+            if (fmToggle) {
+                fmToggle.checked = cfgData.enabled || false;
+                if (fmLabel) fmLabel.textContent = cfgData.enabled
+                    ? (t('free_models.enable') || 'Activer les modèles gratuits')
+                    : (t('free_models.enable') || 'Activer les modèles gratuits');
             }
         } catch (e) {}
 
-        const fetchTimeout = (url, ms=4000) => {
-            const ctrl = new AbortController();
-            const id = setTimeout(()=> ctrl.abort(), ms);
-            return fetchWithToken(url, {signal: ctrl.signal}).then(r=> {
-                clearTimeout(id);
-                if (!r.ok) throw new Error('HTTP '+r.status);
-                return r.json();
-            }).catch(e=> {
-                clearTimeout(id);
-                throw e;
-            });
-        };
+        // Load SOCKS5 proxies
+        try {
+            const socks5Resp = await fetchWithToken('/api/vpn/socks5');
+            const socks5Data = await socks5Resp.json();
+            renderSocks5List(socks5Data.proxies || []);
+            const rotateToggle = document.getElementById('fm-socks5-rotate');
+            if (rotateToggle) rotateToggle.checked = socks5Data.rotate !== false;
+        } catch (e) {}
 
-        const results = await Promise.allSettled([
-            fetchTimeout('/api/vpn-status', 5000),
-            fetchTimeout('/api/vpn/credentials', 4000),
-            fetchTimeout('/api/vpn-config', 4000),
-            fetchTimeout('/api/vpn/socks5', 4000),
-            fetchTimeout('/api/config/free-model-map', 4000),
-            fetchTimeout('/api/vpn/rotation-rules', 4000),
-            fetchTimeout('/api/vpn/schedule', 4000),
-        ]);
-
-        const [vpnStatusRes, credRes, cfgRes, socks5Res, freeMapRes, rotationRes, scheduleRes] = results;
-
-        if (vpnStatusRes.status === 'fulfilled' && vpnStatusRes.value) {
-            try { updateVPNUI(vpnStatusRes.value); } catch (e) { console.error('updateVPNUI', e); }
-            // geo warning from same config if available, else try cfgRes
-            try {
-                const cfgJ = vpnStatusRes.value.proxy_mode ? vpnStatusRes.value : (cfgRes.status==='fulfilled'? cfgRes.value : null);
-                if (cfgJ && cfgJ.proxy_mode) updateGeoWarning(cfgJ.proxy_mode);
-            } catch (e2) {}
-            // Also try to get proxy_mode from cfgRes if vpnStatus didn't have it
-            if (cfgRes.status === 'fulfilled' && cfgRes.value && cfgRes.value.proxy_mode) {
-                try { updateGeoWarning(cfgRes.value.proxy_mode); } catch (e) {}
-            }
-        } else {
-            console.warn('vpn-status slow/failed:', vpnStatusRes.reason?.message);
-        }
-
-        if (credRes.status === 'fulfilled' && credRes.value) {
-            try {
-                const credData = credRes.value;
-                const credStatus = document.getElementById('vpn-cred-status');
-                const usernameEl = document.getElementById('vpn-cred-username');
-                const passwordEl = document.getElementById('vpn-cred-password');
-                const fileEl = document.getElementById('vpn-cred-file');
-                if (credData.exists) {
-                    if (credStatus) credStatus.innerHTML = '<span style="color:var(--success)">&#10003;</span> ' + (t('vpn.credentials_saved') || 'Enregistré');
-                    if (usernameEl) usernameEl.textContent = credData.username_preview || '****';
-                    if (passwordEl) passwordEl.textContent = '••••••••';
-                    if (fileEl) fileEl.textContent = credData.path || 'credentials.env';
-                } else {
-                    if (credStatus) credStatus.innerHTML = '<span style="color:var(--warning)">!</span> ' + (t('vpn.credentials_missing') || 'Aucun identifiant');
-                    if (usernameEl) usernameEl.textContent = '—';
-                    if (passwordEl) passwordEl.textContent = '—';
-                    if (fileEl) fileEl.textContent = '—';
-                }
-            } catch (e) { console.error('cred UI', e); }
-        }
-
-        if (cfgRes.status === 'fulfilled' && cfgRes.value) {
-            try {
-                const cfgData = cfgRes.value;
-                renderServerList(cfgData.servers || []);
-                if (cfgData.mode) document.getElementById('vpn-mode').value = cfgData.mode;
-                if (cfgData.proxy_port) document.getElementById('vpn-proxy-port').value = cfgData.proxy_port;
-                if (cfgData.switch_delay) document.getElementById('vpn-switch-delay').value = cfgData.switch_delay;
-                if (cfgData.quota_per_ip) document.getElementById('vpn-quota-per-ip').value = cfgData.quota_per_ip;
-                if (cfgData.docker_image) {
-                    const dockerSelect = document.getElementById('vpn-docker-image');
-                    const knownImages = ['qmcgaw/gluetun', 'nordvpn-official'];
-                    if (knownImages.includes(cfgData.docker_image)) {
-                        dockerSelect.value = cfgData.docker_image;
-                    } else {
-                        dockerSelect.value = 'custom';
-                        const customInput = document.getElementById('vpn-docker-image-custom');
-                        if (customInput) {
-                            customInput.style.display = 'block';
-                            customInput.value = cfgData.docker_image;
-                        }
-                    }
-                    vpnDockerImageChanged();
-                }
-                vpnInitConfig(cfgData.mode);
-                if (cfgData.circuit_breaker_threshold) document.getElementById('vpn-cb-threshold').value = cfgData.circuit_breaker_threshold;
-                if (cfgData.circuit_breaker_recovery) document.getElementById('vpn-cb-recovery').value = cfgData.circuit_breaker_recovery;
-                if (cfgData.backoff_max_delay) document.getElementById('vpn-backoff-max').value = cfgData.backoff_max_delay;
-                if (cfgData.watchdog_interval !== undefined) document.getElementById('vpn-watchdog').value = cfgData.watchdog_interval;
-                if (cfgData.api_cache_ttl) document.getElementById('vpn-api-cache').value = cfgData.api_cache_ttl;
-                if (cfgData.proxy_mode) setProxyModeUI(cfgData.proxy_mode);
-                const stationCountSelect = document.getElementById('vpn-station-count');
-                if (stationCountSelect) {
-                    stationCountSelect.innerHTML = '';
-                    for (let n = 1; n <= 10; n++) {
-                        const opt = document.createElement('option');
-                        opt.value = String(n);
-                        opt.textContent = String(n);
-                        stationCountSelect.appendChild(opt);
-                    }
-                    stationCountSelect.value = String(cfgData.station_count || 1);
-                }
-                const exhaustMode = document.getElementById('vpn-exhaust-mode');
-                if (exhaustMode) exhaustMode.value = cfgData.strict_free ? 'strict' : 'fallback';
-                const freeAttempts = document.getElementById('vpn-free-attempts');
-                if (freeAttempts) freeAttempts.value = String(cfgData.max_free_attempts || 2);
-                const exceptionMode = document.getElementById('vpn-exception-mode');
-                if (exceptionMode) exceptionMode.value = cfgData.free_exception_fallback || 'station-first';
-                const stackSelect = document.getElementById('vpn-stack-select');
-                if (stackSelect && cfgData.vpn_stack) stackSelect.value = cfgData.vpn_stack;
-                const fmT = document.getElementById('fm-toggle');
-                const fmLabel = document.getElementById('fm-toggle-label');
-                if (fmT) {
-                    fmT.checked = !!cfgData.enabled;
-                    try { localStorage.setItem('vpn_enabled_cache', cfgData.enabled ? '1' : '0'); } catch (e) {}
-                    if (fmLabel) fmLabel.textContent = cfgData.enabled
-                        ? (t('free_models.enable') || 'Activer les modèles gratuits')
-                        : (t('free_models.enable') || 'Activer les modèles gratuits');
-                }
-            } catch (e) { console.error('cfg UI', e); }
-        } else {
-            console.warn('vpn-config slow/failed:', cfgRes.reason?.message);
-        }
-
-        if (socks5Res.status === 'fulfilled' && socks5Res.value) {
-            try {
-                renderSocks5List(socks5Res.value.proxies || []);
-                const rotateToggle = document.getElementById('fm-socks5-rotate');
-                if (rotateToggle) rotateToggle.checked = socks5Res.value.rotate !== false;
-            } catch (e) {}
-        }
-
-        if (freeMapRes.status === 'fulfilled' && freeMapRes.value) {
-            try {
-                const fm = freeMapRes.value.free_model_map || freeMapRes.value || {};
-                if (fm && typeof fm === 'object') {
-                    // update global map if present
-                    if (typeof _freeModelMap !== 'undefined') {
-                        _freeModelMap = fm.free_model_map || fm;
-                        if (typeof renderFreeModelMap === 'function') renderFreeModelMap();
-                    }
-                }
-                // Also handle available_models for selects
-                const models = freeMapRes.value.available_models || (typeof availableModels !== 'undefined' ? availableModels : []);
-                const paidSel = document.getElementById('fmm-paid');
-                const freeSel = document.getElementById('fmm-free');
-                if (paidSel && models.length) {
-                    const curPaid = paidSel.value;
-                    paidSel.innerHTML = '<option value="">— choisir —</option>' + models.map(m=> `<option value="${escHtml(m)}">${escHtml(m)}</option>`).join('');
-                    if (curPaid) paidSel.value = curPaid;
-                }
-                if (freeSel && models.length) {
-                    const curFree = freeSel.value;
-                    const freeModels = models.filter(m=> m.endsWith('-free')).concat(models.filter(m=> !models.includes(m+'-free')).map(m=> m+'-free'));
-                    const uniq = [...new Set(freeModels)];
-                    freeSel.innerHTML = '<option value="">— choisir —</option>' + uniq.map(m=> `<option value="${escHtml(m)}">${escHtml(m)}</option>`).join('');
-                    if (curFree) freeSel.value = curFree;
-                }
-            } catch (e) { console.error('freeMap parallel', e); }
-        } else {
-            try { if (typeof refreshFreeModelMap === 'function') await refreshFreeModelMap(); } catch (e) {}
-        }
-
-        if (rotationRes.status === 'fulfilled' && rotationRes.value) {
-            try {
-                if (typeof _rotationRules !== 'undefined') {
-                    _rotationRules = rotationRes.value.rules || rotationRes.value || [];
-                    if (typeof renderRotationRules === 'function') renderRotationRules();
-                }
-            } catch (e) {}
-        } else {
-            try { if (typeof refreshRotationRules === 'function') await refreshRotationRules(); } catch (e) {}
-        }
-
-        if (scheduleRes.status === 'fulfilled' && scheduleRes.value) {
-            try {
-                const data = scheduleRes.value;
-                if (typeof _schedule !== 'undefined') {
-                    _schedule = data && typeof data.enabled !=='undefined' ? data : {enabled:false, rules: data.rules||[]};
-                    if (typeof renderSchedule === 'function') renderSchedule();
-                    const tog = document.getElementById('vpn-schedule-enabled');
-                    if (tog) tog.checked = !!_schedule.enabled;
-                }
-            } catch (e) {}
-        } else {
-            try { if (typeof refreshSchedule === 'function') await refreshSchedule(); } catch (e) {}
-        }
-
-        if (fmToggle) fmToggle.disabled = false;
-        if (statusEl && statusEl.dataset.loading) {
-            delete statusEl.dataset.loading;
-            if (statusEl.textContent === 'Chargement...') {
-                statusEl.textContent = statusEl.dataset.orig || '—';
-                delete statusEl.dataset.orig;
-            }
-        }
-        _vpnRefreshInFlight = false;
+        // [plan 18/08 §3d] VPN technology selector state
         refreshStackInfo();
     }
 
