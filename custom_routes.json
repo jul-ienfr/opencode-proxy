@@ -3,7 +3,7 @@
     "match": [
       "mimo-v2.5"
     ],
-    "model": "mimo-v2.5",
+    "model": "muse-spark-1.2-contributor",
     "thinking": "adaptive"
   },
   "mimov25pro": {
@@ -41,6 +41,6 @@
     "match": [
       "deepseek-v4-flash"
     ],
-    "model": "mimo-v2.5"
+    "model": "muse-spark-1.2-contributor"
   }
 }

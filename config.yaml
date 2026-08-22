@@ -131,11 +131,11 @@ free_model_map:
   muse-spark-1.2-contributor: muse-spark-1.2-contributor-free
 ip_rotation:
   enabled: true
-  proxy_mode: direct
+  proxy_mode: vpn
   dual_station: true
   station_count: 3
   strict_free: false
-  quota_per_ip: 15
+  quota_per_ip: 500
   switch_delay: 1
   docker_container: opencode-vpn
   docker_compose_file: docker-compose.yml
@@ -226,7 +226,7 @@ custom_routes:
   mimov25:
     match:
     - mimo-v2.5
-    model: mimo-v2.5
+    model: muse-spark-1.2-contributor
     thinking: adaptive
   mimov25pro:
     match:
@@ -252,7 +252,7 @@ custom_routes:
   deepseekv4flash:
     match:
     - deepseek-v4-flash
-    model: mimo-v2.5
+    model: muse-spark-1.2-contributor
 api_keys: []
 tool_capabilities:
   _default:

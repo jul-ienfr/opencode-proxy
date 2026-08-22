@@ -2623,21 +2623,25 @@ function setupConfig() {
 }
 
 var _refreshing = false;
+var _refreshPending = false;
 async function refreshAll() {
-    if (_refreshing) return;
+    if (_refreshing) { _refreshPending = true; return; }
     _refreshing = true;
     try {
-        const [stats, history, quotas] = await Promise.all([
-            fetchStats(filterFrom, filterTo),
-            fetchHistory(filterFrom, filterTo, currentPage),
-            fetchQuotas()
-        ]);
-        renderStats(stats);
-        renderCharts(stats);
-        renderHistory(history);
-        renderQuotas(quotas);
-        renderTimeSeriesCharts(filterFrom, filterTo);
-        document.getElementById('last-update').textContent = t('last.update') + formatTime();
+        do {
+            _refreshPending = false;
+            const [stats, history, quotas] = await Promise.all([
+                fetchStats(filterFrom, filterTo),
+                fetchHistory(filterFrom, filterTo, currentPage),
+                fetchQuotas()
+            ]);
+            renderStats(stats);
+            renderCharts(stats);
+            renderHistory(history);
+            renderQuotas(quotas);
+            renderTimeSeriesCharts(filterFrom, filterTo);
+            document.getElementById('last-update').textContent = t('last.update') + formatTime();
+        } while (_refreshPending);
     } finally {
         _refreshing = false;
     }

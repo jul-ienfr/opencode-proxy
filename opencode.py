@@ -3322,8 +3322,12 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
 
     # Other errors → cooldown (60 s) so the next request doesn't retry the
     # free model immediately, then fall back to paid
+    try:
+        _dbg_body = _truncate(free_body) if 'free_body' in locals() else ""
+        _dbg_resp = _redact(getattr(resp, 'text', '')[:2000]) if hasattr(resp, 'text') else ""
+    except: _dbg_body,_dbg_resp="",""
+    _debug(f"  [free] {free_model!r} returned {resp.status_code} body={_dbg_body[:2500]} resp={_dbg_resp[:2000]} → falling back to paid")
     _set_free_cooldown(free_model, 60, station)
-    _debug(f"  [free] {free_model!r} returned {resp.status_code} → falling back to paid")
     return None
 
 
@@ -3336,7 +3340,7 @@ async def _do_request_with_retry(endpoint, body, headers, protocol, retry_on_429
     Returns (response, final_headers) -- headers may differ after retry.
     Raises UpstreamError on connection/timeout/protocol failures.
     """
-    _RETRYABLE_STATUSES = {502, 503, 504, 499}
+    _RETRYABLE_STATUSES = {500, 502, 503, 504, 499}
     max_retries = yaml_get("streaming", "retry_attempts", 2)
     attempt = 0
 
@@ -4571,7 +4575,7 @@ def openai_responses_to_anthropic(body: dict) -> dict:
                 "role": "assistant",
                 "content": [{
                     "type": "tool_use",
-                    "id": item.get("id", f"toolu_{uuid.uuid4().hex[:12]}"),
+                    "id": item.get("call_id") or item.get("id") or f"toolu_{uuid.uuid4().hex[:12]}",
                     "name": item.get("name", ""),
                     "input": inp,
                 }]
@@ -4833,28 +4837,36 @@ def _chat_to_responses_request(chat: dict) -> dict:
         content = m.get("content", "")
         # Preserve cache_control from the chat message for prefix caching
         cache_ctrl = m.get("cache_control")
+        # Tool results must be function_call_output only — never a "role": "tool" input_text (invalid for Responses)
+        if role == "tool":
+            cid = m.get("tool_call_id", "")
+            if not cid:
+                continue
+            inp.append({"type": "function_call_output", "call_id": cid, "output": content if isinstance(content, str) else str(content)})
+            continue
         if isinstance(content, str):
             if content:
-                item = {"role": role, "content": [{"type": "input_text", "text": content}]}
+                ctype = "output_text" if role == "assistant" else "input_text"
+                item = {"role": role, "content": [{"type": ctype, "text": content}]}
                 if cache_ctrl:
                     item["cache_control"] = cache_ctrl
                 inp.append(item)
         elif isinstance(content, list):
             txt = "\n".join(b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text")
             if txt:
-                item = {"role": role, "content": [{"type": "input_text", "text": txt}]}
+                ctype = "output_text" if role == "assistant" else "input_text"
+                item = {"role": role, "content": [{"type": ctype, "text": txt}]}
                 if cache_ctrl:
                     item["cache_control"] = cache_ctrl
                 inp.append(item)
         for tc in m.get("tool_calls", []) or []:
             fn = tc.get("function", {}) if isinstance(tc.get("function"), dict) else {}
-            inp.append({"type": "function_call", "call_id": tc.get("call_id", tc.get("id", "")), "name": fn.get("name", ""), "arguments": fn.get("arguments", "{}")})
-        if role == "tool":
-            cid = m.get("tool_call_id", "")
-            if not cid:
-                # Defensive: skip function_call_output with missing/empty call_id
-                continue
-            inp.append({"type": "function_call_output", "call_id": cid, "output": content if isinstance(content, str) else str(content)})
+            _cid = tc.get("call_id") or tc.get("id") or f"call_{uuid.uuid4().hex[:12]}"
+            inp.append({"type": "function_call", "call_id": _cid, "name": fn.get("name", ""), "arguments": fn.get("arguments", "{}")})
+    # Guard: Responses input must be non-empty; log original chat for audit if empty
+    if not inp:
+        _debug(f"  [free] _chat_to_responses_request empty input for model {chat.get('model','')} — original messages={len(chat.get('messages',[]))} — injecting fallback")
+        inp.append({"role": "user", "content": [{"type": "input_text", "text": "hello"}]})
     req = {"model": chat.get("model", ""), "input": inp, "stream": bool(chat.get("stream", False))}
     if "max_tokens" in chat:
         req["max_output_tokens"] = chat["max_tokens"]
