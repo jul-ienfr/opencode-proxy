@@ -144,6 +144,8 @@ DEBUG = _env_bool("OPENCODE_DEBUG", yaml_get("server", "debug", False))
 API_BASE_OPENAI = yaml_get("upstream", "openai_base", "https://opencode.ai/zen/go/v1/chat/completions")
 API_BASE_ANTHROPIC = yaml_get("upstream", "anthropic_base", "https://opencode.ai/zen/go/v1/messages")
 API_BASE_FREE = yaml_get("upstream", "free_base", "https://opencode.ai/zen/v1/chat/completions")
+API_BASE_RESPONSES = yaml_get("upstream", "responses_base", "https://opencode.ai/zen/go/v1/responses")
+API_BASE_RESPONSES_FREE = yaml_get("upstream", "responses_free_base", "https://opencode.ai/zen/v1/responses")
 
 # ── Free model mapping (paid → free equivalent) ────────────────────
 FREE_MODEL_MAP = yaml_get("free_model_map", default={})
@@ -166,6 +168,8 @@ KNOWN_PROTOCOLS = {
     "kimi":     "openai",
     "deepseek": "openai",
     "mimo":     "openai",
+    "muse":     "openai",
+    "spark":    "openai",
     # Anthropic protocol models
     "minimax":  "anthropic",
     "qwen":     "anthropic",

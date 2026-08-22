@@ -24,7 +24,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse as StarletteJSONResponse
 from starlette.requests import ClientDisconnect
 
-from config import API_KEY, PROXY, MODELS, ROUTES, get_model_config, HOST, PORT, WEB_PORT, DISABLE_MAPPING, API_KEYS, API_KEY_ROUTING, CUSTOM_ROUTES, maybe_reload_custom_routes, CACHE_MIN_PROMPT_SIZE, DEBUG, yaml_get, API_BASE_FREE, FREE_MODEL_MAP, IP_ROTATION
+from config import API_KEY, PROXY, MODELS, ROUTES, get_model_config, HOST, PORT, WEB_PORT, DISABLE_MAPPING, API_KEYS, API_KEY_ROUTING, CUSTOM_ROUTES, maybe_reload_custom_routes, CACHE_MIN_PROMPT_SIZE, DEBUG, yaml_get, API_BASE_FREE, API_BASE_RESPONSES, API_BASE_RESPONSES_FREE, FREE_MODEL_MAP, IP_ROTATION
 import config.settings as _cfg_settings
 
 import itertools
@@ -1665,8 +1665,349 @@ async def _get_cached_public_ip() -> str:
         return _public_ip_cache["ip"] or "unknown"
 
 
-# Free model cooldown: after a 429, skip free model for this many seconds
-_free_model_cooldown_until = 0.0  # monotonic timestamp
+# Free model cooldown: after a 429, skip free model per free-model for 60s
+_free_model_cooldown: dict[str, float] = {}  # free_model -> monotonic deadline
+_free_model_cooldown_until = 0.0  # legacy alias (kept for compat, unused)
+
+
+def _should_try_free(model_id: str, thinking_type: str = "none", effort: str = "none") -> bool:
+    """Centralized guard for free model usage.
+
+    Policy: if a free mapping exists (option gratuit activee), always try
+    free first — avec ou sans reasoning/thinking (gratuit-first inconditionnel).
+    Seul fallback: 429 + cooldown; pas de retry sur 200 vide (bug payload corrige a la source).
+    """
+    has_free = FREE_MODEL_MAP.get(model_id) is not None
+    if has_free:
+        _debug(f"  [free] will try free for {model_id} (thinking={thinking_type} effort={effort})")
+    return has_free
+
+
+def _map_reasoning(model: str, effort_level: str) -> dict:
+    """Map effort_level → reasoning payload for upstream OpenAI endpoint.
+
+    Order matters: kimi/glm/deepseek/muse-spark before generic else,
+    because custom_routes alias mimo-v2.5 → muse-spark.
+    """
+    if model.startswith("kimi-k2.6"):
+        _debug(f"  [thinking] {model}: reasoning=True (effort={effort_level})")
+        return {"reasoning": True}
+    elif model.startswith("glm-5"):
+        lvl = "high" if effort_level in ("xhigh", "max", "high") else "medium" if effort_level == "medium" else "low"
+        _debug(f"  [thinking] {model}: reasoning_effort={lvl} (effort={effort_level})")
+        return {"reasoning_effort": lvl}
+    elif model.startswith("deepseek-v4"):
+        lvl = "max" if effort_level in ("xhigh", "max") else "high"
+        _debug(f"  [thinking] {model}: reasoning_effort={lvl} (effort={effort_level})")
+        return {"reasoning_effort": lvl}
+    elif model.startswith("muse-spark"):
+        # Corrigé 22/08 — xhigh bien accepté par muse : ne pas plafonner
+        # xhigh → xhigh, max → max, high → high, medium → medium, low → low
+        lvl = "xhigh" if effort_level == "xhigh" else "max" if effort_level == "max" else "high" if effort_level == "high" else "medium" if effort_level == "medium" else "low"
+        _debug(f"  [thinking] {model}: reasoning_effort={lvl} (effort={effort_level}) [muse-spark]")
+        return {"reasoning_effort": lvl}
+    else:
+        lvl = "high" if effort_level in ("xhigh", "max", "high") else "medium" if effort_level == "medium" else "low"
+        _debug(f"  [thinking] {model}: reasoning_effort={lvl} (effort={effort_level})")
+        return {"reasoning_effort": lvl}
+
+
+def _map_reasoning_responses(model: str, effort_level: str) -> dict:
+    """Mapping for OpenAI Responses API: reasoning -> {effort: lvl}"""
+    if model.startswith("kimi-k2.6"):
+        _debug(f"  [thinking] {model}: reasoning={{effort: high}} (effort={effort_level}) [responses]")
+        return {"reasoning": {"effort": "high"}}
+    elif model.startswith("glm-5"):
+        lvl = "high" if effort_level in ("xhigh", "max", "high") else "medium" if effort_level == "medium" else "low"
+        _debug(f"  [thinking] {model}: reasoning={{effort:{lvl}}} (effort={effort_level}) [responses]")
+        return {"reasoning": {"effort": lvl}}
+    elif model.startswith("deepseek-v4"):
+        lvl = "max" if effort_level in ("xhigh", "max") else "high"
+        _debug(f"  [thinking] {model}: reasoning={{effort:{lvl}}} (effort={effort_level}) [responses]")
+        return {"reasoning": {"effort": lvl}}
+    elif model.startswith("muse-spark"):
+        lvl = "xhigh" if effort_level == "xhigh" else "max" if effort_level == "max" else "high" if effort_level == "high" else "medium" if effort_level == "medium" else "low"
+        _debug(f"  [thinking] {model}: reasoning={{effort:{lvl}}} (effort={effort_level}) [muse-spark responses]")
+        return {"reasoning": {"effort": lvl}}
+    else:
+        lvl = "high" if effort_level in ("xhigh", "max", "high") else "medium" if effort_level == "medium" else "low"
+        _debug(f"  [thinking] {model}: reasoning={{effort:{lvl}}} (effort={effort_level}) [responses]")
+        return {"reasoning": {"effort": lvl}}
+
+
+def _is_muse_spark(model: str) -> bool:
+    return model.startswith("muse-spark")
+
+
+def anthropic_messages_to_responses_input(messages):
+    """Convert Anthropic messages to Responses input list (simplified)."""
+    out = []
+    for msg in messages:
+        role = msg.get("role", "user")
+        content = msg.get("content", "")
+        if role == "tool":
+            out.append({"type": "function_call_output", "call_id": msg.get("tool_call_id", ""), "output": content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)})
+            continue
+        parts = []
+        if isinstance(content, str):
+            if content:
+                parts.append({"type": "input_text", "text": content})
+        elif isinstance(content, list):
+            for b in content:
+                if not isinstance(b, dict):
+                    continue
+                t = b.get("type", "")
+                if t == "text":
+                    parts.append({"type": "input_text", "text": b.get("text", "")})
+                elif t == "thinking":
+                    continue
+                elif t == "tool_use":
+                    try:
+                        args = json.dumps(b.get("input", {}), ensure_ascii=False)
+                    except Exception:
+                        args = "{}"
+                    out.append({"type": "function_call", "id": b.get("id", f"call_{uuid.uuid4().hex[:12]}"), "name": b.get("name", ""), "arguments": args})
+                    continue
+                elif t == "tool_result":
+                    out.append({"type": "function_call_output", "call_id": b.get("tool_use_id", ""), "output": b.get("content", "") if isinstance(b.get("content"), str) else json.dumps(b.get("content"), ensure_ascii=False)})
+                    continue
+        if parts:
+            if role == "assistant":
+                out.append({"role": "assistant", "content": parts})
+            else:
+                out.append({"role": role, "content": parts})
+    return out
+
+
+def anthropic_to_responses_request(body: dict, model: str) -> dict:
+    """Anthropic Messages request -> Responses request."""
+    effort_level = body.get("effort")
+    thinking = body.get("thinking") if isinstance(body.get("thinking"), dict) else {}
+    ttype = thinking.get("type", "") if isinstance(thinking, dict) else ""
+    budget = thinking.get("budget_tokens", 0) if isinstance(thinking, dict) else 0
+    if effort_level and effort_level != "none":
+        wants_thinking = True
+    elif ttype in ("enabled", "adaptive") or budget > 0:
+        wants_thinking = True
+        if budget >= 16000 or budget == 0:
+            effort_level = "xhigh"
+        elif budget >= 10000:
+            effort_level = "high"
+        elif budget >= 4000:
+            effort_level = "medium"
+        elif ttype == "adaptive":
+            effort_level = "medium"
+        else:
+            effort_level = "low"
+    else:
+        wants_thinking = False
+        effort_level = effort_level or "none"
+    system_text = body.get("system", "")
+    if isinstance(system_text, list):
+        system_text = "\n".join(s.get("text", "") if isinstance(s, dict) else str(s) for s in system_text)
+    messages = body.get("messages", [])
+    req = {"model": model, "input": anthropic_messages_to_responses_input(messages)}
+    if system_text:
+        req["instructions"] = system_text
+    if wants_thinking:
+        req.update(_map_reasoning_responses(model, effort_level))
+    if "max_tokens" in body:
+        req["max_output_tokens"] = body["max_tokens"]
+    elif "max_output_tokens" in body:
+        req["max_output_tokens"] = body["max_output_tokens"]
+    if body.get("stream"):
+        req["stream"] = True
+    for k in ("temperature", "top_p", "tool_choice"):
+        if k in body:
+            req[k] = body[k]
+    if "tools" in body:
+        tools = body["tools"]
+        resp_tools = []
+        for t in tools:
+            if isinstance(t, dict) and "name" in t:
+                resp_tools.append({"type": "function", "name": t["name"], "description": t.get("description", ""), "parameters": t.get("input_schema") or t.get("parameters") or {}})
+        if resp_tools:
+            req["tools"] = resp_tools
+    return req
+
+
+def openai_chat_to_responses_request(chat_body: dict, model: str) -> dict:
+    """Chat Completions request -> Responses request."""
+    wants_thinking = False
+    effort_level = chat_body.get("effort") or chat_body.get("reasoning_effort") or "none"
+    if chat_body.get("reasoning") is True:
+        wants_thinking = True
+        effort_level = "high"
+    elif effort_level and effort_level != "none":
+        wants_thinking = True
+    elif isinstance(chat_body.get("thinking"), dict) and chat_body["thinking"].get("type") in ("enabled", "adaptive"):
+        wants_thinking = True
+        effort_level = "xhigh" if chat_body["thinking"].get("type") == "adaptive" else "medium"
+    elif "reasoning_effort" in chat_body:
+        wants_thinking = True
+        effort_level = chat_body["reasoning_effort"]
+    inp = []
+    instructions = None
+    for m in chat_body.get("messages", []):
+        role = m.get("role", "user")
+        if role in ("system", "developer"):
+            instructions = m.get("content", "") if isinstance(m.get("content"), str) else ""
+            continue
+        content = m.get("content", "")
+        parts = []
+        if isinstance(content, str):
+            if content:
+                parts.append({"type": "input_text", "text": content})
+        elif isinstance(content, list):
+            for p in content:
+                if isinstance(p, dict) and p.get("type") == "text":
+                    parts.append({"type": "input_text", "text": p.get("text", "")})
+        if m.get("tool_calls"):
+            for tc in m["tool_calls"]:
+                fn = tc.get("function", {})
+                inp.append({"type": "function_call", "id": tc.get("id", ""), "name": fn.get("name", ""), "arguments": fn.get("arguments", "{}")})
+            if parts:
+                inp.append({"role": role, "content": parts})
+            continue
+        if role == "tool":
+            inp.append({"type": "function_call_output", "call_id": m.get("tool_call_id", ""), "output": content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)})
+            continue
+        if parts:
+            inp.append({"role": role, "content": parts})
+        elif not parts and role in ("user", "assistant") and not m.get("tool_calls"):
+            inp.append({"role": role, "content": [{"type": "input_text", "text": ""}]})
+    req = {"model": model, "input": inp}
+    if instructions:
+        req["instructions"] = instructions
+    if wants_thinking:
+        req.update(_map_reasoning_responses(model, effort_level))
+    if "max_tokens" in chat_body:
+        req["max_output_tokens"] = chat_body["max_tokens"]
+    if "max_output_tokens" in chat_body:
+        req["max_output_tokens"] = chat_body["max_output_tokens"]
+    if chat_body.get("stream"):
+        req["stream"] = True
+    for k in ("temperature", "top_p", "tool_choice"):
+        if k in chat_body:
+            req[k] = chat_body[k]
+    if "tools" in chat_body:
+        chat_tools = chat_body["tools"]
+        resp_tools = []
+        for t in chat_tools:
+            if isinstance(t, dict) and t.get("type") == "function":
+                fn = t.get("function", {})
+                resp_tools.append({"type": "function", "name": fn.get("name", ""), "description": fn.get("description", ""), "parameters": fn.get("parameters") or {}})
+            elif isinstance(t, dict) and "name" in t:
+                resp_tools.append({"type": "function", "name": t["name"], "description": t.get("description", ""), "parameters": t.get("input_schema") or {}})
+        if resp_tools:
+            req["tools"] = resp_tools
+    return req
+
+
+def responses_output_to_anthropic_content(output, model=""):
+    """Responses output list -> Anthropic content blocks."""
+    blocks = []
+    for item in output or []:
+        if not isinstance(item, dict):
+            continue
+        itype = item.get("type", "")
+        if itype == "reasoning":
+            summary = item.get("summary") or []
+            txt = "".join(s.get("text", "") for s in summary if isinstance(s, dict))
+            if not txt:
+                txt = "(reasoning)"
+            blocks.append({"type": "thinking", "thinking": txt})
+        elif itype == "message":
+            for c in item.get("content") or []:
+                if c.get("type") in ("output_text", "text", "input_text"):
+                    blocks.append({"type": "text", "text": c.get("text", "")})
+        elif itype == "function_call":
+            try:
+                inp = json.loads(item.get("arguments", "{}"))
+            except Exception:
+                inp = {}
+            blocks.append({"type": "tool_use", "id": item.get("id", f"toolu_{uuid.uuid4().hex[:8]}"), "name": item.get("name", ""), "input": inp})
+    if not blocks:
+        blocks.append({"type": "text", "text": ""})
+    return blocks
+
+
+def responses_to_anthropic(resp: dict, original_model: str) -> dict:
+    """Convert Responses API response to Anthropic Messages response."""
+    output = resp.get("output", [])
+    content = responses_output_to_anthropic_content(output, resp.get("model", ""))
+    status = resp.get("status", "completed")
+    if status == "incomplete":
+        stop = "max_tokens"
+    elif any(b.get("type") == "tool_use" for b in content):
+        stop = "tool_use"
+    else:
+        stop = "end_turn"
+    usage = resp.get("usage", {})
+    in_t = usage.get("input_tokens", 0)
+    out_t = usage.get("output_tokens", 0)
+    cache = usage.get("input_tokens_details", {}).get("cached_tokens", 0) if isinstance(usage.get("input_tokens_details"), dict) else 0
+    return {
+        "id": f"msg_{uuid.uuid4().hex[:24]}",
+        "type": "message",
+        "role": "assistant",
+        "model": original_model,
+        "content": content,
+        "stop_reason": stop,
+        "stop_sequence": None,
+        "usage": {"input_tokens": in_t, "output_tokens": out_t, "cache_read_input_tokens": cache}
+    }
+
+
+async def _try_free_responses_first(body, headers, model_id):
+    """Free fallback for Responses API (uses responses_free_base)."""
+    free_model = FREE_MODEL_MAP.get(model_id)
+    if not free_model:
+        return None
+    _dl = _free_model_cooldown.get(free_model, 0)
+    if time.monotonic() < _dl:
+        _debug(f"  [free] skipping free responses {free_model!r} (cooldown)")
+        return None
+    _debug(f"  [free] trying free responses {free_model!r} instead of {model_id!r}")
+    free_body = dict(body)
+    free_body["model"] = free_model
+    try:
+        endpoint = API_BASE_RESPONSES_FREE
+    except NameError:
+        endpoint = "https://opencode.ai/zen/v1/responses"
+    free_headers = {"Content-Type": "application/json"}
+    free_ip = ""
+    try:
+        free_ip = _vpn_manager.current_ip if _vpn_manager and _vpn_manager.current_ip else await _get_cached_public_ip()
+    except Exception:
+        free_ip = ""
+    t0 = time.monotonic()
+    try:
+        resp, resp_headers = await _do_request_with_retry(endpoint, free_body, free_headers, "openai", retry_on_429=False)
+    except UpstreamError:
+        _log_free_model_usage(model_id, free_model, "free (no auth)", "free (no auth)", 502, ip=free_ip)
+        return None
+    elapsed_ms = int((time.monotonic() - t0) * 1000)
+    tokens_in = tokens_out = 0
+    if resp.status_code == 200:
+        try:
+            data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+            usage = data.get("usage", {})
+            tokens_in = usage.get("input_tokens", 0) or usage.get("prompt_tokens", 0)
+            tokens_out = usage.get("output_tokens", 0) or usage.get("completion_tokens", 0)
+        except Exception:
+            pass
+    _log_free_model_usage(model_id, free_model, "free (no auth)", "free (no auth)", resp.status_code, tokens_in, tokens_out, elapsed_ms, ip=free_ip)
+    if resp.status_code == 200:
+        _debug(f"  [free] {free_model!r} succeeded (responses)")
+        return resp, resp_headers, free_model, free_ip
+    if resp.status_code == 429:
+        _free_model_cooldown[free_model] = time.monotonic() + 60
+        if _free_ip_pool and _free_ip_pool.enabled:
+            asyncio.create_task(_free_ip_pool.on_quota_exhausted())
+        return None
+    _debug(f"  [free] {free_model!r} returned {resp.status_code} (responses) -> fallback")
+    return None
 
 
 async def _try_free_model_first(body, headers, protocol, model_id,
@@ -1692,10 +2033,10 @@ async def _try_free_model_first(body, headers, protocol, model_id,
     if not free_model:
         return None  # No free equivalent, proceed with paid
 
-    # Skip free model if recently rate-limited (cooldown avoids sequential free→paid latency)
-    global _free_model_cooldown_until
-    if time.monotonic() < _free_model_cooldown_until:
-        _debug(f"  [free] skipping free model (cooldown active)")
+    # Skip free model if recently rate-limited (per-model cooldown)
+    _dl = _free_model_cooldown.get(free_model, 0)
+    if time.monotonic() < _dl:
+        _debug(f"  [free] skipping free model {free_model!r} (cooldown active)")
         return None
 
     _debug(f"  [free] trying free model {free_model!r} instead of {model_id!r}")
@@ -1820,8 +2161,8 @@ async def _try_free_model_first(body, headers, protocol, model_id,
         _debug(f"  [free] {free_model!r} 429 body={body_429!r} headers={headers_429}")
         _log(f"  FREE {free_model!r} RATE LIMITED (429) retry-after={retry_after}s → falling back to paid {model_id!r}")
 
-        # Set cooldown to skip free model for 60s (avoids sequential free→paid latency)
-        _free_model_cooldown_until = time.monotonic() + 60
+        # Per-model cooldown 60s (avoids sequential free→paid latency for this free variant only)
+        _free_model_cooldown[free_model] = time.monotonic() + 60
 
         # If VPN rotation is enabled, switch IP on 429
         if _free_ip_pool and _free_ip_pool.enabled:
@@ -1850,6 +2191,7 @@ async def _do_request_with_retry(endpoint, body, headers, protocol, retry_on_429
     while attempt < max_retries:
         if DEBUG:
             _debug(f"  → upstream POST {endpoint} attempt {attempt+1}/{max_retries} headers={_sanitize_headers(headers)}")
+            _debug(f"  [oai-send] model={body.get('model') if isinstance(body, dict) else '?'} keys={list(body.keys()) if isinstance(body, dict) else '?'} reasoning_effort={body.get('reasoning_effort') if isinstance(body, dict) else '?'} reasoning={body.get('reasoning') if isinstance(body, dict) else '?'}")
         t0 = time.monotonic()
         try:
             resp = await _client.post(endpoint, json=body, headers=headers)
@@ -2521,7 +2863,34 @@ def _strip_billing_header(text: str) -> str:
 
 
 def anthropic_to_openai(body: dict, model: str) -> dict:
-    thinking = isinstance(body.get("thinking"), dict) and body["thinking"].get("type") in ("enabled", "adaptive")
+    # wants_thinking early — needed for placeholder reasoning_content guard
+    # (uses effort + thinking.type + budget_tokens, same logic as later)
+    _eff = body.get("effort")
+    _tp = body.get("thinking") if isinstance(body.get("thinking"), dict) else {}
+    _tt = _tp.get("type", "")
+    _bd = _tp.get("budget_tokens", 0)
+    if _eff and _eff != "none":
+        wants_thinking = True
+        effort_level = _eff
+    elif _tt in ("enabled", "adaptive") or _bd > 0:
+        wants_thinking = True
+        if _bd >= 16000 or _bd == 0:
+            effort_level = "xhigh"
+        elif _bd >= 10000:
+            effort_level = "high"
+        elif _bd >= 4000:
+            effort_level = "medium"
+        elif _tt == "adaptive":
+            effort_level = "medium"
+        else:
+            effort_level = "low"
+        # keep original effort if already set
+        if _eff and _eff != "none":
+            effort_level = _eff
+    else:
+        wants_thinking = False
+        effort_level = _eff
+    thinking = wants_thinking  # alias — placeholder guards must use wants_thinking
     # GLM-5.x models don't support cache_control — skip it
     supports_cache_control = not model.startswith("glm-5")
 
@@ -2551,7 +2920,7 @@ def anthropic_to_openai(body: dict, model: str) -> dict:
         # Simple string content
         if isinstance(content, str):
             out = {"role": role, "content": content}
-            if thinking and is_asst:
+            if wants_thinking and is_asst:
                 out["reasoning_content"] = " "
             messages.append(out)
             continue
@@ -2607,16 +2976,16 @@ def anthropic_to_openai(body: dict, model: str) -> dict:
             }
             if joined_thinking:
                 out["reasoning_content"] = joined_thinking
-            elif thinking and is_asst:
+            elif wants_thinking and not joined_thinking and is_asst:
                 out["reasoning_content"] = " "
             if last_cache_control and not is_asst:
                 out["cache_control"] = last_cache_control
             messages.append(out)
-        elif text_parts or thinking_parts or (thinking and is_asst):
+        elif text_parts or thinking_parts or (wants_thinking and not joined_thinking and is_asst):
             out = {"role": role, "content": "\n".join(text_parts) if text_parts else ""}
             if joined_thinking:
                 out["reasoning_content"] = joined_thinking
-            elif thinking and is_asst:
+            elif wants_thinking and not joined_thinking and is_asst:
                 out["reasoning_content"] = " "
             if last_cache_control and not is_asst and supports_cache_control:
                 out["cache_control"] = last_cache_control
@@ -2675,64 +3044,8 @@ def anthropic_to_openai(body: dict, model: str) -> dict:
         else:
             oai["tool_choice"] = tc
 
-    # Convert Anthropic thinking/effort → OpenAI reasoning parameters
-    # Claude Code sends: thinking: {type: "adaptive"} OR effort: "low"/"medium"/"high"/"xhigh"/"max"
-    effort_level = body.get("effort")
-    thinking_param = body.get("thinking") if isinstance(body.get("thinking"), dict) else {}
-    ttype = thinking_param.get("type", "")
-    budget = thinking_param.get("budget_tokens", 0)
-
-    if effort_level and effort_level != "none":
-        wants_thinking = True
-    elif ttype in ("enabled", "adaptive") or budget > 0:
-        wants_thinking = True
-        if budget >= 16000 or budget == 0:
-            effort_level = "xhigh"
-        elif budget >= 10000:
-            effort_level = "high"
-        elif budget >= 4000:
-            effort_level = "medium"
-        elif ttype == "adaptive":
-            effort_level = "medium"
-        else:
-            effort_level = "low"
-    else:
-        wants_thinking = False
-
     if wants_thinking:
-        if model.startswith("kimi-k2.6"):
-            # Kimi K2.6 uses reasoning: true (not reasoning_effort)
-            oai["reasoning"] = True
-            _debug(f"  [thinking] {model}: reasoning=True (effort={effort_level})")
-        elif model.startswith("glm-5"):
-            # GLM-5.x supports reasoning_effort like mimo-v2.5
-            if effort_level in ("xhigh", "max"):
-                oai["reasoning_effort"] = "high"
-            elif effort_level in ("high",):
-                oai["reasoning_effort"] = "high"
-            elif effort_level in ("medium",):
-                oai["reasoning_effort"] = "medium"
-            else:
-                oai["reasoning_effort"] = "low"
-            _debug(f"  [thinking] {model}: reasoning_effort={oai['reasoning_effort']} (effort={effort_level})")
-        elif model.startswith("deepseek-v4"):
-            # DeepSeek V4 only supports high and max
-            if effort_level in ("xhigh", "max"):
-                oai["reasoning_effort"] = "max"
-            else:
-                oai["reasoning_effort"] = "high"
-            _debug(f"  [thinking] {model}: reasoning_effort={oai['reasoning_effort']} (effort={effort_level})")
-        else:
-            # MiMo V2.5 etc. supports low/medium/high
-            if effort_level in ("xhigh", "max"):
-                oai["reasoning_effort"] = "high"
-            elif effort_level in ("high",):
-                oai["reasoning_effort"] = "high"
-            elif effort_level in ("medium",):
-                oai["reasoning_effort"] = "medium"
-            else:
-                oai["reasoning_effort"] = "low"
-            _debug(f"  [thinking] {model}: reasoning_effort={oai['reasoning_effort']} (effort={effort_level})")
+        oai.update(_map_reasoning(model, effort_level))
 
     # Restructure system prompt for models without semantic caching
     oai = _restructure_for_cache(oai, model)
@@ -3085,39 +3398,8 @@ def openai_responses_to_anthropic(body: dict) -> dict:
         wants_thinking = False
 
     if wants_thinking:
-        if model.startswith("kimi-k2.6"):
-            # Kimi K2.6 uses reasoning: true (not reasoning_effort)
-            result["reasoning"] = True
-            _debug(f"  [thinking] {model}: reasoning=True (effort={effort_level})")
-        elif model.startswith("glm-5"):
-            # GLM-5.x supports reasoning_effort like mimo-v2.5
-            if effort_level in ("xhigh", "max"):
-                result["reasoning_effort"] = "high"
-            elif effort_level in ("high",):
-                result["reasoning_effort"] = "high"
-            elif effort_level in ("medium",):
-                result["reasoning_effort"] = "medium"
-            else:
-                result["reasoning_effort"] = "low"
-            _debug(f"  [thinking] {model}: reasoning_effort={result['reasoning_effort']} (effort={effort_level})")
-        elif model.startswith("deepseek-v4"):
-            # DeepSeek V4 only supports high and max
-            if effort_level in ("xhigh", "max"):
-                result["reasoning_effort"] = "max"
-            else:
-                result["reasoning_effort"] = "high"
-            _debug(f"  [thinking] {model}: reasoning_effort={result['reasoning_effort']} (effort={effort_level})")
-        else:
-            # MiMo V2.5 etc. supports low/medium/high
-            if effort_level in ("xhigh", "max"):
-                result["reasoning_effort"] = "high"
-            elif effort_level in ("high",):
-                result["reasoning_effort"] = "high"
-            elif effort_level in ("medium",):
-                result["reasoning_effort"] = "medium"
-            else:
-                result["reasoning_effort"] = "low"
-            _debug(f"  [thinking] {model}: reasoning_effort={result['reasoning_effort']} (effort={effort_level})")
+        _model_for_reasoning = body.get("model", "")
+        result.update(_map_reasoning(_model_for_reasoning, effort_level))
 
     return result
 
@@ -3256,22 +3538,28 @@ _thinking_cfg = yaml_get("thinking", "min_tokens", {})
 THINKING_MODELS = {k: int(v) for k, v in _thinking_cfg.items()} if isinstance(_thinking_cfg, dict) else {
     "deepseek-v4-flash": 2048,
     "deepseek-v4-pro": 4096,
+    "muse-spark-1.2-contributor": 1024,
+    "muse-spark-1.2-contributor-free": 1024,
 }
 
 def ensure_min_tokens(body: dict, default: int = None) -> dict:
-    if default is None:
-        default = yaml_get("thinking", "default_min_tokens", 256)
     """Ajuste max_output_tokens pour les modèles thinking afin qu'il
     reste des tokens pour la réponse après le reasoning."""
+    if default is None:
+        default = yaml_get("thinking", "default_min_tokens", 256)
     model = body.get("model", "")
     min_tokens = default
     for prefix, tokens in THINKING_MODELS.items():
         if model.startswith(prefix) or model == prefix:
             min_tokens = max(min_tokens, tokens)
             break
+    had_max_output = "max_output_tokens" in body
+    had_max = "max_tokens" in body
     current = body.get("max_output_tokens") or body.get("max_tokens")
     if current is not None and current < min_tokens:
         body["max_output_tokens"] = min_tokens
+        if had_max:
+            body["max_tokens"] = min_tokens
         _log(f"  ⚠️ {model}: max_tokens ajusté {current} → {min_tokens}")
     return body
 
@@ -3432,6 +3720,7 @@ async def messages(request: Request):
 
     body = dict(body)
     body["model"] = model_id
+    body = ensure_min_tokens(body)
 
     # Apply custom route overrides for thinking/effort
     thinking_override = route.get("thinking")
@@ -3474,7 +3763,8 @@ async def messages(request: Request):
         is_stream = _is_stream_requested(body)
 
         # ── Free model: try BEFORE auth (free models don't need API keys) ──
-        if not is_stream and FREE_MODEL_MAP.get(model_id):
+        # Gratuit-first inconditionnel — pas de bypass sur thinking/effort, fallback uniquement 429
+        if not is_stream and _should_try_free(model_id, thinking_type, effort):
             try:
                 free_result = await _try_free_model_first(body, {}, "anthropic", model_id)
                 if free_result is not None:
@@ -3498,7 +3788,7 @@ async def messages(request: Request):
             a_headers = _get_auth_headers("anthropic")
         except AllKeysPausedError as e:
             # If a free model exists, try streaming with empty headers before giving up
-            if is_stream and FREE_MODEL_MAP.get(model_id):
+            if is_stream and _should_try_free(model_id, thinking_type, effort):
                 async def anthropic_stream_free_fallback():
                     # Re-use the existing generator — it already handles free model swap
                     async for chunk in anthropic_stream({}):
@@ -3523,20 +3813,26 @@ async def messages(request: Request):
                 return Response(content=cached_body, headers={**cached_headers, "X-Cache": "HIT"}, media_type="application/json")
             _debug(f"  cache MISS key={cache_key[:16] if cache_key else 'none'}…")
 
-            # Try free model first if available
-            try:
-                _ak = _key_from_headers(a_headers, "anthropic")
-                free_result = await _try_free_model_first(body, a_headers, "anthropic", model_id,
-                                                          api_key=_ak, workspace_id=_workspace_for_key(_ak),
-                                                          api_keys=API_KEYS)
-                if free_result is not None:
-                    resp, a_headers, _actual_model, _actual_ip = free_result
-                    model_id = _actual_model  # Log as free model
-                else:
+            if _should_try_free(model_id, thinking_type, effort):
+                try:
+                    _ak = _key_from_headers(a_headers, "anthropic")
+                    free_result = await _try_free_model_first(body, a_headers, "anthropic", model_id,
+                                                              api_key=_ak, workspace_id=_workspace_for_key(_ak),
+                                                              api_keys=API_KEYS)
+                    if free_result is not None:
+                        resp, a_headers, _actual_model, _actual_ip = free_result
+                        model_id = _actual_model
+                    else:
+                        resp, a_headers = await _do_request_with_retry(endpoint, body, a_headers, "anthropic")
+                except UpstreamError as e:
+                    _debug(f"  ✗ upstream error: {e}")
+                    return JSONResponse(status_code=e.status_code, content={"error": str(e)})
+            else:
+                try:
                     resp, a_headers = await _do_request_with_retry(endpoint, body, a_headers, "anthropic")
-            except UpstreamError as e:
-                _debug(f"  ✗ upstream error: {e}")
-                return JSONResponse(status_code=e.status_code, content={"error": str(e)})
+                except UpstreamError as e:
+                    _debug(f"  ✗ upstream error: {e}")
+                    return JSONResponse(status_code=e.status_code, content={"error": str(e)})
             account_alias = _alias_for_key(a_headers.get("x-api-key", ""))
             if resp.status_code != 200:
                 # Convert 429/401 → 503 to avoid Claude Code auth window
@@ -3607,7 +3903,7 @@ async def messages(request: Request):
             # UnboundLocalError in Python 3.12+ (nonlocal + assignment conflict).
             _track_model = model_id
             # Try free model for streaming: swap endpoint/model before starting stream
-            free_model = FREE_MODEL_MAP.get(model_id)
+            free_model = FREE_MODEL_MAP.get(model_id) if _should_try_free(model_id, thinking_type, effort) else None
             if free_model:
                 _debug(f"  [stream] attempting free model {free_model!r} first")
                 # Save paid config in case we need to fall back
@@ -3632,9 +3928,11 @@ async def messages(request: Request):
             started = False
             open_blocks = []
             stop_reason = "end_turn"
+            _thinking_seen = False
             _handle_429 = _make_stream_retry_loop("anthropic")
             for _attempt in range(yaml_get("streaming", "retry_attempts", 2)):
                 used_tools = []  # Reset on each retry attempt
+                _thinking_seen = False
                 _debug(f"  [stream] attempt {_attempt+1}/2")
                 try:
                     async with _client.stream("POST", endpoint, json=body, headers=headers) as resp:
@@ -3730,6 +4028,8 @@ async def messages(request: Request):
                                 elif etype == "content_block_start":
                                     block = event.get("content_block", {})
                                     _debug(f"  [stream] content_block_start: type={block.get('type')} name={block.get('name', '')} index={event.get('index')}")
+                                    if block.get("type") == "thinking":
+                                        _thinking_seen = True
                                     if block.get("type") == "tool_use" and block.get("name"):
                                         used_tools.append(block["name"])
                                     open_blocks.append(event.get("index"))
@@ -3822,6 +4122,169 @@ async def messages(request: Request):
                                  headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
 
     # ── OpenAI-protocol ─────────────────────────────────────────
+    # Systematic Responses routing for muse-spark (toujours via /v1/responses)
+    if _is_muse_spark(model_id):
+        # Build Responses request (paid endpoint) via helper
+        try:
+            responses_req = anthropic_to_responses_request(body, model_id)
+            responses_req = ensure_min_tokens(responses_req)
+            _debug(f"[messages] muse-spark routed to Responses: {_truncate(responses_req, 2000)}")
+        except Exception as e:
+            _debug(f"[messages] ✗ responses conversion failed: {e}")
+            _log(f"  CONVERSION ERROR: anthropic_to_responses_request failed: {type(e).__name__}: {e}")
+            return _anthropic_error(400, f"Request conversion failed: {e}")
+        # Non-stream path for muse-spark
+        if not is_stream:
+            # Gratuit-first via Responses free endpoint
+            if _should_try_free(model_id, thinking_type, effort):
+                free_resp = await _try_free_responses_first(responses_req, {}, model_id)
+                if free_resp is not None:
+                    resp, _, _actual_model, _actual_ip = free_resp
+                    data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+                    # Convert Responses -> Anthropic
+                    anthro = responses_to_anthropic(data, original_model)
+                    usage = anthro.get("usage", {})
+                    req_in = usage.get("input_tokens", 0)
+                    req_out = usage.get("output_tokens", 0)
+                    req_cache = usage.get("cache_read_input_tokens", 0)
+                    _update_token_usage(_actual_model, req_in, req_out, req_cache)
+                    used = [b["name"] for b in anthro.get("content", []) if b.get("type") == "tool_use"]
+                    await _save_and_log_request(req_id, _actual_model, original_model, start_time, req_in, req_out, req_cache, protocol, False, thinking_type, effort, client_ip, "free (no auth)", tool_names, tools_used=used, request_body=request_body, response_body=data, free_model_ip=_actual_ip)
+                    return Response(content=json.dumps(anthro, ensure_ascii=False), media_type="application/json")
+            # Paid path
+            try:
+                headers_rs = _get_auth_headers("openai")
+            except AllKeysPausedError as e:
+                retry_after = int(e.retry_after) + 1
+                return Response(content=json.dumps({"type": "error", "error": {"type": "api_error", "message": f"All API keys exhausted. Retry after {retry_after}s."}}), status_code=503, media_type="application/json", headers={"Retry-After": str(retry_after)})
+            # Determine paid Responses endpoint
+            try:
+                from config import API_BASE_RESPONSES as _paid_resp_ep
+                paid_endpoint = _paid_resp_ep
+            except Exception:
+                paid_endpoint = "https://opencode.ai/zen/go/v1/responses"
+            try:
+                resp, headers_rs = await _do_request_with_retry(paid_endpoint, responses_req, headers_rs, "openai")
+            except UpstreamError as e:
+                return JSONResponse(status_code=e.status_code, content={"error": str(e)})
+            account_alias = _alias_for_key(_key_from_headers(headers_rs, "openai"))
+            if resp.status_code != 200:
+                await _log_and_save_error(req_id, model_id, original_model, start_time, resp.status_code, resp.text, protocol, is_stream, thinking_type, effort, client_ip, account_alias, tool_names, request_body=request_body, response_body={"error": resp.text[:2000]})
+                return Response(content=resp.content, status_code=resp.status_code, media_type="application/json")
+            try:
+                data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+            except Exception:
+                return _anthropic_error(502, "Upstream returned non-JSON response")
+            anthro = responses_to_anthropic(data, original_model)
+            usage = anthro.get("usage", {})
+            req_in = usage.get("input_tokens", 0)
+            req_out = usage.get("output_tokens", 0)
+            req_cache = usage.get("cache_read_input_tokens", 0)
+            _update_token_usage(model_id, req_in, req_out, req_cache)
+            used = [b["name"] for b in anthro.get("content", []) if b.get("type") == "tool_use"]
+            await _save_and_log_request(req_id, model_id, original_model, start_time, req_in, req_out, req_cache, protocol, False, thinking_type, effort, client_ip, account_alias, tool_names, tools_used=used if used else None, request_body=request_body, response_body=data)
+            return Response(content=json.dumps(anthro, ensure_ascii=False), media_type="application/json")
+        # Streaming for muse-spark: collect via non-stream then synthesize SSE (collect-then-emit, TODO incremental)
+        # For now, handle streaming by internally calling non-stream Responses and emitting Anthropic SSE
+        _debug(f"  [messages] muse-spark streaming via Responses collect-then-emit (is_stream={is_stream})")
+        # Reuse non-stream logic but emit as SSE
+        async def muse_spark_stream(headers_rs):
+            # Try free first
+            responses_req_stream = dict(responses_req)
+            responses_req_stream["stream"] = False
+            data = None
+            actual_model = model_id
+            account_alias_s = ""
+            client_ip_s = client_ip
+            # Attempt free
+            if _should_try_free(model_id, thinking_type, effort):
+                free_resp = await _try_free_responses_first(responses_req_stream, {}, model_id)
+                if free_resp is not None:
+                    resp_f, _, _actual_model, _actual_ip = free_resp
+                    data = resp_f.json() if resp_f.headers.get("content-type", "").startswith("application/json") else {}
+                    actual_model = _actual_model
+                    account_alias_s = "free (no auth)"
+                else:
+                    # fallback to paid
+                    try:
+                        headers_tmp = _get_auth_headers("openai")
+                    except AllKeysPausedError:
+                        data = None
+                        # will handle error below
+                        pass
+                    if data is None:
+                        try:
+                            from config import API_BASE_RESPONSES as _paid_ep2
+                            paid_ep2 = _paid_ep2
+                        except Exception:
+                            paid_ep2 = "https://opencode.ai/zen/go/v1/responses"
+                        try:
+                            resp_p, headers_tmp = await _do_request_with_retry(paid_ep2, responses_req_stream, headers_tmp, "openai")
+                            if resp_p.status_code == 200:
+                                data = resp_p.json() if resp_p.headers.get("content-type", "").startswith("application/json") else {}
+                                account_alias_s = _alias_for_key(_key_from_headers(headers_tmp, "openai"))
+                            else:
+                                # error path
+                                yield await _stream_error_response(req_id, model_id, original_model, start_time, resp_p.status_code, resp_p.text, protocol, thinking_type, effort, client_ip, account_alias_s, tool_names, {"type": "error", "error": {"type": "api_error", "message": resp_p.text[:200]}}, request_body=request_body)
+                                return
+                        except UpstreamError as e:
+                            yield await _stream_error_response(req_id, model_id, original_model, start_time, e.status_code, str(e), protocol, thinking_type, effort, client_ip, account_alias_s, tool_names, {"type": "error", "error": {"type": "api_error", "message": str(e)}}, request_body=request_body)
+                            return
+            else:
+                try:
+                    headers_tmp = _get_auth_headers("openai")
+                    from config import API_BASE_RESPONSES as _paid_ep3
+                    paid_ep3 = _paid_ep3
+                except Exception:
+                    paid_ep3 = "https://opencode.ai/zen/go/v1/responses"
+                try:
+                    resp_p, headers_tmp = await _do_request_with_retry(paid_ep3, responses_req_stream, headers_tmp, "openai")
+                    if resp_p.status_code == 200:
+                        data = resp_p.json() if resp_p.headers.get("content-type", "").startswith("application/json") else {}
+                        account_alias_s = _alias_for_key(_key_from_headers(headers_tmp, "openai"))
+                    else:
+                        yield await _stream_error_response(req_id, model_id, original_model, start_time, resp_p.status_code, resp_p.text, protocol, thinking_type, effort, client_ip, account_alias_s, tool_names, {"type": "error", "error": {"type": "api_error", "message": resp_p.text[:200]}}, request_body=request_body)
+                        return
+                except UpstreamError as e:
+                    yield await _stream_error_response(req_id, model_id, original_model, start_time, e.status_code, str(e), protocol, thinking_type, effort, client_ip, account_alias_s, tool_names, {"type": "error", "error": {"type": "api_error", "message": str(e)}}, request_body=request_body)
+                    return
+            if data is None:
+                yield await _stream_error_response(req_id, model_id, original_model, start_time, 503, "No data", protocol, thinking_type, effort, client_ip, account_alias_s, tool_names, {"type": "error", "error": {"type": "api_error", "message": "No data"}}, request_body=request_body)
+                return
+            anthro = responses_to_anthropic(data, original_model)
+            usage = anthro.get("usage", {})
+            req_in = usage.get("input_tokens", 0)
+            req_out = usage.get("output_tokens", 0)
+            req_cache = usage.get("cache_read_input_tokens", 0)
+            _update_token_usage(actual_model, req_in, req_out, req_cache)
+            # Synthesize Anthropic SSE
+            msg_id = _fast_id("msg")
+            yield _sse("message_start", {"type": "message_start", "message": {"id": msg_id, "type": "message", "role": "assistant", "content": [], "model": original_model, "stop_reason": None, "stop_sequence": None, "usage": {"input_tokens": req_in, "output_tokens": 0, "cache_read_input_tokens": req_cache}}})
+            # Emit each content block
+            for idx, block in enumerate(anthro.get("content", [])):
+                btype = block.get("type", "")
+                if btype == "thinking":
+                    yield _sse("content_block_start", {"type": "content_block_start", "index": idx, "content_block": {"type": "thinking", "thinking": ""}})
+                    yield _sse("content_block_delta", {"type": "content_block_delta", "index": idx, "delta": {"type": "thinking_delta", "thinking": block.get("thinking", "")}})
+                    yield _sse("content_block_stop", {"type": "content_block_stop", "index": idx})
+                elif btype == "text":
+                    yield _sse("content_block_start", {"type": "content_block_start", "index": idx, "content_block": {"type": "text", "text": ""}})
+                    yield _sse("content_block_delta", {"type": "content_block_delta", "index": idx, "delta": {"type": "text_delta", "text": block.get("text", "")}})
+                    yield _sse("content_block_stop", {"type": "content_block_stop", "index": idx})
+                elif btype == "tool_use":
+                    yield _sse("content_block_start", {"type": "content_block_start", "index": idx, "content_block": {"type": "tool_use", "id": block.get("id", ""), "name": block.get("name", ""), "input": {}}})
+                    yield _sse("content_block_delta", {"type": "content_block_delta", "index": idx, "delta": {"type": "input_json_delta", "partial_json": json.dumps(block.get("input", {}), ensure_ascii=False)}})
+                    yield _sse("content_block_stop", {"type": "content_block_stop", "index": idx})
+            yield _sse("message_delta", {"type": "message_delta", "delta": {"stop_reason": anthro.get("stop_reason", "end_turn")}, "usage": {"output_tokens": req_out, "cache_read_input_tokens": req_cache}})
+            yield _sse("message_stop", {"type": "message_stop"})
+            await _save_and_log_request(req_id, actual_model, original_model, start_time, req_in, req_out, req_cache, protocol, True, thinking_type, effort, client_ip, account_alias_s, tool_names, tools_used=[b["name"] for b in anthro.get("content", []) if b.get("type")=="tool_use"], request_body=request_body, response_body=data)
+        # Need headers for stream wrapper
+        try:
+            headers_for_stream = _get_auth_headers("openai")
+        except AllKeysPausedError:
+            headers_for_stream = {}
+        return StreamingResponse(_sse_keepalive(muse_spark_stream(headers_for_stream)), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
+
     try:
         oai_body = anthropic_to_openai(body, model_id)
         _debug(f"[messages] converted to openai: {_truncate(oai_body, 2000)}")
@@ -3833,7 +4296,7 @@ async def messages(request: Request):
         headers = _get_auth_headers("openai")
     except AllKeysPausedError as e:
         # If a free model exists, try it before giving up
-        if FREE_MODEL_MAP.get(model_id):
+        if _should_try_free(model_id, thinking_type, effort):
             try:
                 free_result = await _try_free_model_first(oai_body, {}, "openai", model_id)
                 if free_result is not None:
@@ -3864,20 +4327,26 @@ async def messages(request: Request):
 
     if not is_stream:
         _debug(f"  → non-stream branch taken (is_stream={is_stream!r} oai_raw={oai_body.get('stream')!r})")
-        # Try free model first if available
-        try:
-            _ak = _key_from_headers(headers, "openai")
-            free_result = await _try_free_model_first(oai_body, headers, "openai", model_id,
-                                                      api_key=_ak, workspace_id=_workspace_for_key(_ak),
-                                                      api_keys=API_KEYS)
-            if free_result is not None:
-                resp, headers, _actual_model, _actual_ip = free_result
-                model_id = _actual_model
-            else:
+        if _should_try_free(model_id, thinking_type, effort):
+            try:
+                _ak = _key_from_headers(headers, "openai")
+                free_result = await _try_free_model_first(oai_body, headers, "openai", model_id,
+                                                          api_key=_ak, workspace_id=_workspace_for_key(_ak),
+                                                          api_keys=API_KEYS)
+                if free_result is not None:
+                    resp, headers, _actual_model, _actual_ip = free_result
+                    model_id = _actual_model
+                else:
+                    resp, headers = await _do_request_with_retry(endpoint, oai_body, headers, "openai")
+            except UpstreamError as e:
+                _debug(f"  ✗ upstream error: {e}")
+                return JSONResponse(status_code=e.status_code, content={"error": str(e)})
+        else:
+            try:
                 resp, headers = await _do_request_with_retry(endpoint, oai_body, headers, "openai")
-        except UpstreamError as e:
-            _debug(f"  ✗ upstream error: {e}")
-            return JSONResponse(status_code=e.status_code, content={"error": str(e)})
+            except UpstreamError as e:
+                _debug(f"  ✗ upstream error: {e}")
+                return JSONResponse(status_code=e.status_code, content={"error": str(e)})
         account_alias = _alias_for_key(_key_from_headers(headers, "openai"))
         _debug(f"  response status={resp.status_code} size={len(resp.content)} bytes")
         if resp.status_code != 200:
@@ -3934,7 +4403,7 @@ async def messages(request: Request):
         used = [tc["function"]["name"] for tc in data.get("choices", [{}])[0].get("message", {}).get("tool_calls", [])]
         msg_data = data.get("choices", [{}])[0].get("message", {})
         if not (msg_data.get("reasoning_content") or msg_data.get("reasoning")) and thinking_type != "none":
-            _debug(f"  [non-stream] WARNING: thinking requested (type={thinking_type}, effort={effort}) but upstream returned no reasoning_content")
+            _debug(f"  [non-stream] WARNING: thinking requested (type={thinking_type}, effort={effort}) but upstream returned no reasoning_content model={model_id} endpoint={endpoint} free={endpoint==API_BASE_FREE} oai_keys={list(oai_body.keys())}")
         _debug(f"  [non-stream] blocks: text={bool(msg_data.get('content'))} thinking={bool(msg_data.get('reasoning_content') or msg_data.get('reasoning'))} tools={used}")
         await _save_and_log_request(req_id, model_id, original_model, start_time,
                      req_in, req_out, cache, protocol, is_stream=False, thinking_type=thinking_type,
@@ -3954,7 +4423,7 @@ async def messages(request: Request):
         _req_model_id = model_id
         # Try free model for streaming
         _paid_model_id = _req_model_id  # Save original for fallback
-        free_model = FREE_MODEL_MAP.get(_req_model_id)
+        free_model = FREE_MODEL_MAP.get(_req_model_id) if _should_try_free(_req_model_id, thinking_type, effort) else None
         if free_model:
             _debug(f"  [stream-oai] attempting free model {free_model!r} first")
             paid_endpoint = endpoint
@@ -4033,7 +4502,7 @@ async def messages(request: Request):
                             has_tools = bool(tool_block_idx)
                             _debug(f"  [stream-oai] summary: text={text_block_idx is not None} thinking={reasoning_block_idx is not None} tools={list(tool_block_idx.keys())} stop={'tool_use' if has_tools else 'end_turn'} out_tokens={final_out}")
                             if reasoning_block_idx is None and thinking_type != "none":
-                                _debug(f"  [stream-oai] WARNING: thinking requested (type={thinking_type}, effort={effort}) but upstream returned no reasoning_content")
+                                _debug(f"  [stream-oai] WARNING: thinking requested (type={thinking_type}, effort={effort}) but upstream returned no reasoning_content model={_req_model_id} endpoint={endpoint} free={_using_free} oai_keys={list(oai_body.keys())}")
                             yield _sse("message_delta", {"type": "message_delta", "delta": {"stop_reason": "tool_use" if has_tools else "end_turn"}, "usage": {"output_tokens": final_out, "cache_read_input_tokens": final_cache}})
                             yield _sse("message_stop", {"type": "message_stop"})
                             ak_h = _alias_for_key(_key_from_headers(hdrs, "openai"))
@@ -4401,6 +4870,7 @@ async def chat_completions(request: Request):
 
     body = dict(body)
     body["model"] = model_id
+    body = ensure_min_tokens(body)
 
     thinking_raw = body.get("thinking") if isinstance(body.get("thinking"), dict) else {}
     thinking_type = thinking_raw.get("type", "none") if isinstance(thinking_raw, dict) and thinking_raw else "none"
@@ -4433,7 +4903,7 @@ async def chat_completions(request: Request):
             headers = _get_auth_headers("openai")
         except AllKeysPausedError as e:
             # If a free model exists, try it before giving up
-            if FREE_MODEL_MAP.get(model_id):
+            if _should_try_free(model_id, thinking_type, effort):
                 if is_stream:
                     # Streaming: pass empty headers — generator handles free model swap
                     return StreamingResponse(_sse_keepalive(openai_stream({})), media_type="text/event-stream",
@@ -4466,19 +4936,24 @@ async def chat_completions(request: Request):
                 headers={"Retry-After": str(retry_after)})
 
         if not is_stream:
-            # Try free model first if available
-            try:
-                _ak = _key_from_headers(headers, "openai")
-                free_result = await _try_free_model_first(body, headers, "openai", model_id,
-                                                          api_key=_ak, workspace_id=_workspace_for_key(_ak),
-                                                          api_keys=API_KEYS)
-                if free_result is not None:
-                    resp, headers, _actual_model, _actual_ip = free_result
-                    model_id = _actual_model
-                else:
+            if _should_try_free(model_id, thinking_type, effort):
+                try:
+                    _ak = _key_from_headers(headers, "openai")
+                    free_result = await _try_free_model_first(body, headers, "openai", model_id,
+                                                              api_key=_ak, workspace_id=_workspace_for_key(_ak),
+                                                              api_keys=API_KEYS)
+                    if free_result is not None:
+                        resp, headers, _actual_model, _actual_ip = free_result
+                        model_id = _actual_model
+                    else:
+                        resp, headers = await _do_request_with_retry(endpoint, body, headers, "openai")
+                except UpstreamError as e:
+                    return JSONResponse(status_code=e.status_code, content={"error": str(e)})
+            else:
+                try:
                     resp, headers = await _do_request_with_retry(endpoint, body, headers, "openai")
-            except UpstreamError as e:
-                return JSONResponse(status_code=e.status_code, content={"error": str(e)})
+                except UpstreamError as e:
+                    return JSONResponse(status_code=e.status_code, content={"error": str(e)})
             account_alias = _alias_for_key(_key_from_headers(headers, "openai"))
             if resp.status_code != 200:
                 await _log_and_save_error(req_id, model_id, original_model, start_time,
@@ -4532,7 +5007,7 @@ async def chat_completions(request: Request):
             # UnboundLocalError in Python 3.12+ (nonlocal + assignment conflict).
             _track_model = model_id
             # Try free model for streaming: swap endpoint/model before starting stream
-            free_model = FREE_MODEL_MAP.get(model_id)
+            free_model = FREE_MODEL_MAP.get(model_id) if _should_try_free(model_id, thinking_type, effort) else None
             if free_model:
                 _debug(f"  [chat-stream] attempting free model {free_model!r} first")
                 # Save paid config
@@ -4551,10 +5026,13 @@ async def chat_completions(request: Request):
             _debug(f"  [chat-stream] est_input={est_input}")
             stream_out = 0
             actual_usage = None
+            _thinking_seen = False
             _handle_429 = _make_stream_retry_loop("openai")
             for _attempt in range(yaml_get("streaming", "retry_attempts", 2)):
                 used_tools = []
                 seen_tool_indices = set()  # dedup tool calls by index
+                if _attempt > 0:
+                    _thinking_seen = False
                 try:
                     async with _client.stream("POST", endpoint, json=oai_body, headers=hdrs) as resp:
                         if resp.status_code != 200:
@@ -4627,6 +5105,8 @@ async def chat_completions(request: Request):
                                         stream_out += _estimate_tokens(c)
                                     rc = delta.get("reasoning_content") or delta.get("reasoning")
                                     if isinstance(rc, str):
+                                        if rc:
+                                            _thinking_seen = True
                                         stream_out += _estimate_tokens(rc)
                                     for tc in delta.get("tool_calls", []):
                                         if isinstance(tc, dict) and "name" in tc.get("function", {}):
@@ -4715,7 +5195,7 @@ async def chat_completions(request: Request):
         a_headers = _get_auth_headers("anthropic")
     except AllKeysPausedError as e:
         # If a free model exists, try it before giving up
-        if FREE_MODEL_MAP.get(model_id):
+        if _should_try_free(model_id, thinking_type, effort):
             if is_stream:
                 # Streaming: pass empty headers — generator handles free model swap
                 return StreamingResponse(_sse_keepalive(_anthro_to_oai_stream({})), media_type="text/event-stream",
@@ -4749,19 +5229,24 @@ async def chat_completions(request: Request):
             headers={"Retry-After": str(retry_after)})
 
     if not is_stream:
-        # Try free model first if available
-        try:
-            _ak = a_headers.get("x-api-key", "")
-            free_result = await _try_free_model_first(anthro_body, a_headers, "anthropic", model_id,
-                                                      api_key=_ak, workspace_id=_workspace_for_key(_ak),
-                                                      api_keys=API_KEYS)
-            if free_result is not None:
-                resp, a_headers, _actual_model, _actual_ip = free_result
-                model_id = _actual_model
-            else:
+        if _should_try_free(model_id, thinking_type, effort):
+            try:
+                _ak = a_headers.get("x-api-key", "")
+                free_result = await _try_free_model_first(anthro_body, a_headers, "anthropic", model_id,
+                                                          api_key=_ak, workspace_id=_workspace_for_key(_ak),
+                                                          api_keys=API_KEYS)
+                if free_result is not None:
+                    resp, a_headers, _actual_model, _actual_ip = free_result
+                    model_id = _actual_model
+                else:
+                    resp, a_headers = await _do_request_with_retry(endpoint, anthro_body, a_headers, "anthropic")
+            except UpstreamError as e:
+                return JSONResponse(status_code=e.status_code, content={"error": str(e)})
+        else:
+            try:
                 resp, a_headers = await _do_request_with_retry(endpoint, anthro_body, a_headers, "anthropic")
-        except UpstreamError as e:
-            return JSONResponse(status_code=e.status_code, content={"error": str(e)})
+            except UpstreamError as e:
+                return JSONResponse(status_code=e.status_code, content={"error": str(e)})
         account_alias = _alias_for_key(a_headers.get("x-api-key", ""))
         if resp.status_code != 200:
             await _log_and_save_error(req_id, model_id, original_model, start_time,
@@ -4800,7 +5285,7 @@ async def chat_completions(request: Request):
     async def _anthro_to_oai_stream(hdrs):
         nonlocal endpoint, model_id
         # Try free model for streaming: swap endpoint/model before starting stream
-        free_model = FREE_MODEL_MAP.get(model_id)
+        free_model = FREE_MODEL_MAP.get(model_id) if _should_try_free(model_id, thinking_type, effort) else None
         if free_model:
             _debug(f"  [anthro-to-oai-stream] attempting free model {free_model!r} first")
             paid_endpoint = endpoint
@@ -4827,6 +5312,7 @@ async def chat_completions(request: Request):
         total_input = 0
         cache_read = 0
         _line_buf = ""
+        _thinking_seen = False
         _handle_429 = _make_stream_retry_loop("anthropic")
 
         def _chunk(delta_override, finish):
@@ -4838,6 +5324,19 @@ async def chat_completions(request: Request):
             return b"data: " + json.dumps(c, ensure_ascii=False).encode() + b"\n\n"
 
         for _attempt in range(yaml_get("streaming", "retry_attempts", 2)):
+            # reset thinking tracker per attempt
+            if _attempt > 0:
+                _thinking_seen = False
+                content_types.clear()
+                text_data.clear()
+                thinking_data.clear()
+                tool_data.clear()
+                open_blocks.clear()
+                stream_out = 0
+                total_input = 0
+                cache_read = 0
+                _line_buf = ""
+                started = False
             try:
                 async with _client.stream("POST", endpoint, json=anthro_body, headers=hdrs) as resp:
                     if resp.status_code != 200:
@@ -4946,6 +5445,8 @@ async def chat_completions(request: Request):
                                     yield _chunk({"content": txt}, None)
                                 elif dtype == "thinking_delta":
                                     th = delta.get("thinking", "")
+                                    if th:
+                                        _thinking_seen = True
                                     thinking_data[idx] = thinking_data.get(idx, "") + th
                                     stream_out += _estimate_tokens(th)
                                     yield _chunk({"reasoning_content": th}, None)
@@ -5150,7 +5651,7 @@ async def responses(request: Request):
             a_headers = _get_auth_headers("anthropic")
         except AllKeysPausedError as e:
             # If a free model exists, try it before giving up
-            if FREE_MODEL_MAP.get(model_id):
+            if _should_try_free(model_id, thinking_type, effort):
                 if is_stream:
                     # Streaming: pass empty headers — generator handles free model swap
                     return StreamingResponse(_sse_keepalive(_anthro_to_oai_stream({})), media_type="text/event-stream",
@@ -5186,19 +5687,24 @@ async def responses(request: Request):
                 status_code=503, media_type="application/json",
                 headers={"Retry-After": str(retry_after)})
         if not is_stream:
-            # Try free model first if available
-            try:
-                _ak = a_headers.get("x-api-key", "")
-                free_result = await _try_free_model_first(anthro_body, a_headers, "anthropic", model_id,
-                                                          api_key=_ak, workspace_id=_workspace_for_key(_ak),
-                                                          api_keys=API_KEYS)
-                if free_result is not None:
-                    resp, a_headers, _actual_model, _actual_ip = free_result
-                    model_id = _actual_model
-                else:
+            if _should_try_free(model_id, thinking_type, effort):
+                try:
+                    _ak = a_headers.get("x-api-key", "")
+                    free_result = await _try_free_model_first(anthro_body, a_headers, "anthropic", model_id,
+                                                              api_key=_ak, workspace_id=_workspace_for_key(_ak),
+                                                              api_keys=API_KEYS)
+                    if free_result is not None:
+                        resp, a_headers, _actual_model, _actual_ip = free_result
+                        model_id = _actual_model
+                    else:
+                        resp, a_headers = await _do_request_with_retry(endpoint, anthro_body, a_headers, "anthropic")
+                except UpstreamError as e:
+                    return JSONResponse(status_code=e.status_code, content={"error": str(e)})
+            else:
+                try:
                     resp, a_headers = await _do_request_with_retry(endpoint, anthro_body, a_headers, "anthropic")
-            except UpstreamError as e:
-                return JSONResponse(status_code=e.status_code, content={"error": str(e)})
+                except UpstreamError as e:
+                    return JSONResponse(status_code=e.status_code, content={"error": str(e)})
             account_alias = _alias_for_key(a_headers.get("x-api-key", ""))
             if resp.status_code != 200:
                 await _log_and_save_error(req_id, model_id, original_model, start_time,
@@ -5248,19 +5754,24 @@ async def responses(request: Request):
             return Response(content=json.dumps(oai_resp, ensure_ascii=False), media_type="application/json")
         # Anthropic streaming → collect, then emit SSE
         anthro_body["stream"] = False
-        # Try free model first if available
-        try:
-            _ak = a_headers.get("x-api-key", "")
-            free_result = await _try_free_model_first(anthro_body, a_headers, "anthropic", model_id,
-                                                      api_key=_ak, workspace_id=_workspace_for_key(_ak),
-                                                      api_keys=API_KEYS)
-            if free_result is not None:
-                resp, a_headers, _actual_model, _actual_ip = free_result
-                model_id = _actual_model
-            else:
+        if _should_try_free(model_id, thinking_type, effort):
+            try:
+                _ak = a_headers.get("x-api-key", "")
+                free_result = await _try_free_model_first(anthro_body, a_headers, "anthropic", model_id,
+                                                          api_key=_ak, workspace_id=_workspace_for_key(_ak),
+                                                          api_keys=API_KEYS)
+                if free_result is not None:
+                    resp, a_headers, _actual_model, _actual_ip = free_result
+                    model_id = _actual_model
+                else:
+                    resp, a_headers = await _do_request_with_retry(endpoint, anthro_body, a_headers, "anthropic")
+            except UpstreamError as e:
+                return JSONResponse(status_code=e.status_code, content={"error": str(e)})
+        else:
+            try:
                 resp, a_headers = await _do_request_with_retry(endpoint, anthro_body, a_headers, "anthropic")
-        except UpstreamError as e:
-            return JSONResponse(status_code=e.status_code, content={"error": str(e)})
+            except UpstreamError as e:
+                return JSONResponse(status_code=e.status_code, content={"error": str(e)})
         account_alias = _alias_for_key(a_headers.get("x-api-key", ""))
         if resp.status_code != 200:
             await _log_and_save_error(req_id, model_id, original_model, start_time,
@@ -5305,7 +5816,7 @@ async def responses(request: Request):
         headers = _get_auth_headers("openai")
     except AllKeysPausedError as e:
         # If a free model exists, try it before giving up
-        if FREE_MODEL_MAP.get(model_id):
+        if _should_try_free(model_id, thinking_type, effort):
             try:
                 free_result = await _try_free_model_first(oai_body, {}, "openai", model_id)
                 if free_result is not None:
@@ -5342,19 +5853,24 @@ async def responses(request: Request):
 
     if not is_stream:
         _debug(f"  → non-stream branch taken (is_stream={is_stream!r} oai_raw={oai_body.get('stream')!r})")
-        # Try free model first if available
-        try:
-            _ak = _key_from_headers(headers, "openai")
-            free_result = await _try_free_model_first(oai_body, headers, "openai", model_id,
-                                                      api_key=_ak, workspace_id=_workspace_for_key(_ak),
-                                                      api_keys=API_KEYS)
-            if free_result is not None:
-                resp, headers, _actual_model, _actual_ip = free_result
-                model_id = _actual_model
-            else:
+        if _should_try_free(model_id, thinking_type, effort):
+            try:
+                _ak = _key_from_headers(headers, "openai")
+                free_result = await _try_free_model_first(oai_body, headers, "openai", model_id,
+                                                          api_key=_ak, workspace_id=_workspace_for_key(_ak),
+                                                          api_keys=API_KEYS)
+                if free_result is not None:
+                    resp, headers, _actual_model, _actual_ip = free_result
+                    model_id = _actual_model
+                else:
+                    resp, headers = await _do_request_with_retry(endpoint, oai_body, headers, "openai")
+            except UpstreamError as e:
+                return JSONResponse(status_code=e.status_code, content={"error": str(e)})
+        else:
+            try:
                 resp, headers = await _do_request_with_retry(endpoint, oai_body, headers, "openai")
-        except UpstreamError as e:
-            return JSONResponse(status_code=e.status_code, content={"error": str(e)})
+            except UpstreamError as e:
+                return JSONResponse(status_code=e.status_code, content={"error": str(e)})
         account_alias = _alias_for_key(_key_from_headers(headers, "openai"))
         if resp.status_code != 200:
             await _log_and_save_error(req_id, model_id, original_model, start_time,
@@ -5389,19 +5905,24 @@ async def responses(request: Request):
 
     # ── Streaming (OpenAI backend) — collect, then emit SSE ──
     oai_body["stream"] = False
-    # Try free model first if available
-    try:
-        _ak = _key_from_headers(headers, "openai")
-        free_result = await _try_free_model_first(oai_body, headers, "openai", model_id,
-                                                  api_key=_ak, workspace_id=_workspace_for_key(_ak),
-                                                  api_keys=API_KEYS)
-        if free_result is not None:
-            resp, headers, _actual_model, _actual_ip = free_result
-            model_id = _actual_model
-        else:
+    if _should_try_free(model_id, thinking_type, effort):
+        try:
+            _ak = _key_from_headers(headers, "openai")
+            free_result = await _try_free_model_first(oai_body, headers, "openai", model_id,
+                                                      api_key=_ak, workspace_id=_workspace_for_key(_ak),
+                                                      api_keys=API_KEYS)
+            if free_result is not None:
+                resp, headers, _actual_model, _actual_ip = free_result
+                model_id = _actual_model
+            else:
+                resp, headers = await _do_request_with_retry(endpoint, oai_body, headers, "openai")
+        except UpstreamError as e:
+            return JSONResponse(status_code=e.status_code, content={"error": str(e)})
+    else:
+        try:
             resp, headers = await _do_request_with_retry(endpoint, oai_body, headers, "openai")
-    except UpstreamError as e:
-        return JSONResponse(status_code=e.status_code, content={"error": str(e)})
+        except UpstreamError as e:
+            return JSONResponse(status_code=e.status_code, content={"error": str(e)})
     account_alias = _alias_for_key(_key_from_headers(headers, "openai"))
     if resp.status_code != 200:
         await _log_and_save_error(req_id, model_id, original_model, start_time,

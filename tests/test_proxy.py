@@ -37,6 +37,13 @@ from opencode import (
     RATE_LIMIT_BURST,
     _normalize_stream_flag,
     _is_stream_requested,
+    _map_reasoning,
+    _map_reasoning_responses,
+    _should_try_free,
+    anthropic_to_responses_request,
+    openai_chat_to_responses_request,
+    responses_to_anthropic,
+    _is_muse_spark,
 )
 from config.settings import _resolve_protocol, KNOWN_PROTOCOLS
 
@@ -1020,3 +1027,157 @@ class TestStreamPropagation:
     def test_int_stream_variants(self):
         assert _is_stream_requested({"stream": 1}) is True
         assert _is_stream_requested({"stream": 0}) is False
+
+
+# ── Muse-Spark Reasoning (Étape 2) ─────────────────────────────
+
+class TestMuseSparkReasoning:
+    """Vérifie le mapping reasoning dédié muse-spark (xhigh distinct)."""
+
+    def test_anthropic_to_openai_muse_spark_xhigh(self):
+        # thinking adaptive + effort xhigh -> reasoning_effort xhigh (pas high)
+        body = {
+            "model": "muse-spark-1.2-contributor",
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking": {"type": "adaptive"},
+            "effort": "xhigh",
+            "max_tokens": 256,
+        }
+        result = anthropic_to_openai(body, "muse-spark-1.2-contributor")
+        assert result.get("reasoning_effort") == "xhigh"
+        # max reste distinct aussi
+        body_max = dict(body)
+        body_max["effort"] = "max"
+        result_max = anthropic_to_openai(body_max, "muse-spark-1.2-contributor")
+        assert result_max.get("reasoning_effort") == "max"
+
+    def test_anthropic_to_openai_kimi_still_reasoning_true(self):
+        # Non-régression: kimi-k2.6 -> reasoning:true
+        body = {
+            "model": "kimi-k2.6",
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking": {"type": "adaptive"},
+            "effort": "xhigh",
+            "max_tokens": 256,
+        }
+        result = anthropic_to_openai(body, "kimi-k2.6")
+        assert result.get("reasoning") is True
+        assert "reasoning_effort" not in result
+
+    def test_no_reasoning_without_thinking(self):
+        # Sans thinking/effort -> ni reasoning ni reasoning_effort
+        body = {
+            "model": "muse-spark-1.2-contributor",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 256,
+        }
+        result = anthropic_to_openai(body, "muse-spark-1.2-contributor")
+        assert "reasoning" not in result
+        assert "reasoning_effort" not in result
+        # aussi pour kimi sans thinking
+        result_kimi = anthropic_to_openai(body, "kimi-k2.6")
+        assert "reasoning" not in result_kimi
+
+    def test_map_reasoning_muse_spark_levels(self):
+        # _map_reasoning direct
+        assert _map_reasoning("muse-spark-1.2-contributor", "xhigh") == {"reasoning_effort": "xhigh"}
+        assert _map_reasoning("muse-spark-1.2-contributor", "max") == {"reasoning_effort": "max"}
+        assert _map_reasoning("muse-spark-1.2-contributor", "high") == {"reasoning_effort": "high"}
+        assert _map_reasoning("muse-spark-1.2-contributor", "medium") == {"reasoning_effort": "medium"}
+        assert _map_reasoning("muse-spark-1.2-contributor", "low") == {"reasoning_effort": "low"}
+        # deepseek garde mapping distinct max
+        assert _map_reasoning("deepseek-v4-flash", "xhigh") == {"reasoning_effort": "max"}
+        assert _map_reasoning("deepseek-v4-flash", "max") == {"reasoning_effort": "max"}
+
+    def test_responses_mapping_muse_spark(self):
+        # anthropic_to_responses_request avec muse-spark -> reasoning.effort xhigh
+        body = {
+            "model": "muse-spark-1.2-contributor",
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking": {"type": "adaptive"},
+            "effort": "xhigh",
+            "max_tokens": 256,
+        }
+        req = anthropic_to_responses_request(body, "muse-spark-1.2-contributor")
+        assert req.get("reasoning") == {"effort": "xhigh"}
+        # via _map_reasoning_responses direct
+        assert _map_reasoning_responses("muse-spark-1.2-contributor", "xhigh") == {"reasoning": {"effort": "xhigh"}}
+        assert _map_reasoning_responses("muse-spark-1.2-contributor", "max") == {"reasoning": {"effort": "max"}}
+        # chat -> responses aussi
+        chat_body = {
+            "model": "muse-spark-1.2-contributor",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "xhigh",
+            "max_tokens": 256,
+        }
+        req2 = openai_chat_to_responses_request(chat_body, "muse-spark-1.2-contributor")
+        assert req2.get("reasoning") == {"effort": "xhigh"}
+
+    def test_is_muse_spark(self):
+        assert _is_muse_spark("muse-spark-1.2-contributor") is True
+        assert _is_muse_spark("muse-spark-1.2-contributor-free") is True
+        assert _is_muse_spark("kimi-k2.6") is False
+
+
+class TestShouldTryFree:
+    """Gratuit-first inconditionnel (Étape 1)."""
+
+    def test_should_try_free_even_when_thinking(self):
+        # Avec thinking adaptive, gratuit doit être tenté si mapping existe
+        assert _should_try_free("muse-spark-1.2-contributor", "adaptive", "xhigh") is True
+        assert _should_try_free("muse-spark-1.2-contributor", "none", "none") is True
+        assert _should_try_free("mimo-v2.5", "adaptive", "xhigh") is True
+        assert _should_try_free("deepseek-v4-flash", "adaptive", "high") is True
+
+    def test_should_not_try_free_without_mapping(self):
+        assert _should_try_free("glm-5.1", "adaptive", "xhigh") is False
+        assert _should_try_free("unknown-model", "none", "none") is False
+
+    def test_no_free_200_retry(self):
+        # Le repli 200 vide -> retry paid est supprimé (Étape 1bis)
+        # _should_try_free ne doit pas dépendre du contenu de la réponse, seulement du mapping
+        # Ici on vérifie qu'il n'y a pas de helper _free_response_has_reasoning qui impliquerait un retry
+        import opencode as m
+
+        assert not hasattr(m, "_free_response_has_reasoning")
+        assert not hasattr(m, "_free_retry_pending")
+
+
+class TestResponsesToAnthropic:
+    """Responses output -> Anthropic conversion (encrypted_content handling)."""
+
+    def test_reasoning_and_text(self):
+        resp = {
+            "id": "resp_test",
+            "status": "completed",
+            "model": "muse-spark-1.2-contributor-free",
+            "output": [
+                {"type": "reasoning", "summary": [{"type": "summary_text", "text": "Let me think"}], "encrypted_content": "enc123"},
+                {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Bonjour"}]},
+            ],
+            "usage": {"input_tokens": 10, "output_tokens": 20, "input_tokens_details": {"cached_tokens": 2}},
+        }
+        anthro = responses_to_anthropic(resp, "muse-spark-1.2-contributor")
+        assert anthro["content"][0]["type"] == "thinking"
+        assert anthro["content"][0]["thinking"] == "Let me think"
+        assert anthro["content"][1]["type"] == "text"
+        assert anthro["content"][1]["text"] == "Bonjour"
+        assert anthro["stop_reason"] == "end_turn"
+        assert anthro["usage"]["input_tokens"] == 10
+        assert anthro["usage"]["cache_read_input_tokens"] == 2
+
+    def test_empty_summary_fallback(self):
+        resp = {
+            "id": "resp_test2",
+            "status": "completed",
+            "model": "muse-spark-1.2-contributor-free",
+            "output": [
+                {"type": "reasoning", "summary": [], "encrypted_content": "enc"},
+                {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "hi"}]},
+            ],
+            "usage": {"input_tokens": 5, "output_tokens": 10},
+        }
+        anthro = responses_to_anthropic(resp, "muse-spark-1.2-contributor")
+        # Doit quand même émettre un bloc thinking (même si summary vide -> placeholder)
+        assert anthro["content"][0]["type"] == "thinking"
+        assert anthro["content"][1]["type"] == "text"

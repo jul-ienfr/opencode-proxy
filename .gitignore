@@ -18,12 +18,15 @@ logs/*.db-wal
 
 # Logs
 *.log
+logs/debug.log*
 logs/paused_keys.yaml
 startup.err
 test_free_quota.py
 tool_capabilities.json
 tool_compat_results.json
 vpn/credentials.txt
+vpn_configs/credentials.txt
+credentials.txt
 
 # IDE
 .vscode/
