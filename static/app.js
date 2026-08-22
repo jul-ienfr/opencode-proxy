@@ -96,6 +96,14 @@ const LOCALE = {
         'vpn.switch_delay': 'Switch delay (s)',
         'vpn.docker_image': 'Docker image',
         'vpn.config_summary': 'Config saved automatically',
+        'vpn.free_map': 'Free Model Map',
+        'vpn.free_map_desc': 'Map each paid model to its free equivalent (hot-reload, no restart).',
+        'vpn.rotation_rules': 'Rotation Rules',
+        'vpn.rotation_rules_desc': 'Model-based rotation rules (hot-reload).',
+        'vpn.schedule': 'Schedule',
+        'vpn.schedule_desc': 'Cron-based rotation schedule (hot-reload).',
+        'vpn.schedule_enabled': 'Enabled',
+        'config.web_port': 'Web UI Port',
         'last.update': 'Last update: ',
         'stats.overview': 'Overview',
         'stats.input': 'Input',
@@ -337,6 +345,13 @@ const LOCALE = {
         'vpn.switch_delay': 'Délai switch (s)',
         'vpn.docker_image': 'Image Docker',
         'vpn.config_summary': 'Config sauvée automatiquement',
+        'vpn.free_map': 'Mapping gratuit',
+        'vpn.free_map_desc': 'Associe chaque modèle payant à son équivalent gratuit (hot-reload, pas de restart).',
+        'vpn.rotation_rules': 'Règles de rotation',
+        'vpn.rotation_rules_desc': 'Règles de rotation par modèle (hot-reload).',
+        'vpn.schedule': 'Planning',
+        'vpn.schedule_desc': 'Planning cron pour rotation (hot-reload).',
+        'vpn.schedule_enabled': 'Activé',
         'last.update': 'Dernière mise à jour : ',
         'stats.overview': 'Aperçu',
         'stats.input': 'Entrée',
@@ -1352,11 +1367,29 @@ function renderConfig(data) {
         statusLan.style.display = 'none';
     }
 
-    // Port settings
+    // Port settings (hot-reload aware)
+    const clampPort = (v, def) => { const n = parseInt(v); return (isNaN(n) || n<1 || n>65535)? def : n; };
     document.getElementById('cfg-port').value = data.port;
+    const webPortEl = document.getElementById('cfg-web-port');
+    if (webPortEl) {
+        webPortEl.value = data.web_port || 8082;
+        // Hint visibility
+        const hint = document.getElementById('web-port-hint');
+        if (hint) hint.style.display = ''; // always show hint per Phase3 spec (hot-restart ~1s)
+    }
     document.getElementById('cfg-bind-address').value = data.host || '0.0.0.0';
     document.getElementById('cfg-routing').value = data.routing || 'round-robin';
     document.getElementById('cfg-disable-mapping').checked = data.disable_mapping || false;
+    // Upstream models empty → banner (Phase3)
+    if (!data.models || Object.keys(data.models).length === 0) {
+        const saveSt = document.getElementById('config-save-status');
+        if (saveSt) {
+            saveSt.textContent = '⚠️ Modèles distants inaccessibles (curl timeout) — vérifiez upstream';
+            saveSt.className = 'save-status error';
+            setTimeout(()=> saveSt.textContent='', 6000);
+        }
+        console.warn('[config] upstream models empty — possible _fetch_upstream_models timeout');
+    }
 
     // Debug mode state
     fetchDebugStatus().then(debugData => {
@@ -1899,35 +1932,87 @@ function setupConfig() {
         }
     });
 
-    // Save config
+    // Save config (hot-reload aware, Phase3: web_port hot-restart, no full_restart)
     const saveBtn = document.getElementById('btn-save-config');
     const saveStatus = document.getElementById('config-save-status');
     saveBtn.addEventListener('click', async () => {
+        const clampPort = (elId, def) => {
+            const v = parseInt(document.getElementById(elId)?.value);
+            if (isNaN(v) || v<1 || v>65535) {
+                const el = document.getElementById(elId);
+                if (el) { el.style.borderColor='var(--danger)'; setTimeout(()=> el.style.borderColor='',2000); }
+                return null;
+            }
+            return v;
+        };
+        const port = clampPort('cfg-port', 4000);
+        const webPort = clampPort('cfg-web-port', 8082);
+        if (port===null || webPort===null) {
+            saveStatus.textContent = 'Port invalide (1-65535)';
+            saveStatus.className='save-status error';
+            return;
+        }
         const payload = {
             routes: {
                 opus: document.getElementById('route-opus').value,
                 sonnet: document.getElementById('route-sonnet').value,
                 haiku: document.getElementById('route-haiku').value,
             },
-            port: parseInt(document.getElementById('cfg-port').value),
+            port: port,
+            web_port: webPort,
             host: document.getElementById('cfg-bind-address').value,
             routing: document.getElementById('cfg-routing').value,
             disable_mapping: document.getElementById('cfg-disable-mapping').checked,
         };
+        const prevPort = configData?.port;
+        const prevWebPort = configData?.web_port;
+        const prevHost = configData?.host;
+        const willRestart = (port!==prevPort || webPort!==prevWebPort || payload.host!==prevHost);
+        if (willRestart) {
+            const notice = document.getElementById('restart-notice');
+            if (notice) { notice.textContent = 'Redémarrage gracieux en cours… (~1s)'; notice.style.display=''; }
+            saveStatus.textContent = 'Redémarrage gracieux…';
+            saveStatus.className='save-status';
+        }
         try {
             const result = await apiFetch('/api/config', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(payload),
             });
-            document.getElementById('restart-notice').style.display = result.needs_restart ? '' : 'none';
+            // Phase3: never needs_restart true for GUI — hot-restart is transient
+            const notice = document.getElementById('restart-notice');
+            if (notice) {
+                if (result.needs_restart) {
+                    notice.textContent = t('proxy.restart_notice');
+                    notice.style.display='';
+                } else {
+                    // hide after brief toast if we showed hot-restart
+                    if (willRestart) setTimeout(()=> notice.style.display='none', 4000);
+                    else notice.style.display='none';
+                }
+            }
+            if (result.status==='error') throw new Error(result.message);
             saveStatus.textContent = result.message || t('config.saved');
             saveStatus.className = 'save-status success';
             setTimeout(() => { saveStatus.textContent = ''; }, 3000);
-            // Refresh config display
+            // If hot-restart happened, wait a bit then refresh (server may be briefly down)
+            if (willRestart) {
+                await new Promise(r=> setTimeout(r, 1500));
+                // Try new web_port if changed
+                if (webPort!==prevWebPort) {
+                    // attempt to fetch via new port — but we stay on same origin, so just retry
+                    let retries=3;
+                    while(retries-->0){
+                        try{ await fetchConfig(); break; }catch(e){ await new Promise(r=>setTimeout(r,800)); }
+                    }
+                }
+            }
             fetchConfig().then(renderConfig);
         } catch (e) {
-            saveStatus.textContent = 'Error saving';
+            const notice = document.getElementById('restart-notice');
+            if (notice) notice.style.display='none';
+            saveStatus.textContent = e.message || 'Error saving';
             saveStatus.className = 'save-status error';
             console.error('Failed to save config:', e);
         }
@@ -2601,6 +2686,11 @@ document.addEventListener('DOMContentLoaded', () => {
             const rotateToggle = document.getElementById('fm-socks5-rotate');
             if (rotateToggle) rotateToggle.checked = socks5Data.rotate !== false;
         } catch (e) {}
+        // Load Free Model Map (hot-reload)
+        try { await refreshFreeModelMap(); } catch (e) {}
+        // Load Rotation Rules & Schedule (hot-reload)
+        try { await refreshRotationRules(); } catch (e) {}
+        try { await refreshSchedule(); } catch (e) {}
     }
 
     function renderServerList(servers) {
@@ -2693,8 +2783,20 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     window.toggleVPN = async function(enabled) {
-        await fetch('/api/vpn/toggle', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({enabled}) });
-        refreshVPNStatus();
+        const toggle = document.getElementById('vpn-toggle');
+        const prev = toggle ? !enabled : enabled;
+        try {
+            const resp = await fetch('/api/vpn/toggle', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({enabled}) });
+            if (!resp.ok) throw new Error('HTTP '+resp.status);
+            const data = await resp.json().catch(()=>({}));
+            if (data.error) throw new Error(data.error);
+            refreshVPNStatus();
+        } catch(e){
+            console.error('toggleVPN failed', e);
+            if (toggle) toggle.checked = prev;
+            const status=document.getElementById('vpn-health-result');
+            if(status){ status.innerHTML=`<span style="color:var(--danger)">✗ ${escHtml(e.message)}</span>`; setTimeout(()=>status.textContent='',3000); }
+        }
     };
 
     window.vpnConnect = async function() {
@@ -2733,39 +2835,72 @@ document.addEventListener('DOMContentLoaded', () => {
     };
 
     window.vpnSaveConfig = async function() {
+        const clamp = (id, min, max, def) => {
+            const el = document.getElementById(id);
+            if (!el) return def;
+            let v = parseInt(el.value);
+            if (isNaN(v)) v = def;
+            v = Math.max(min, Math.min(max, v));
+            el.value = v;
+            return v;
+        };
         const mode = document.getElementById('vpn-mode').value;
-        const proxyPort = parseInt(document.getElementById('vpn-proxy-port').value) || 8888;
-        const switchDelay = parseInt(document.getElementById('vpn-switch-delay').value) || 5;
+        const proxyPort = clamp('vpn-proxy-port', 1, 65535, 8888);
+        const switchDelay = clamp('vpn-switch-delay', 1, 60, 5);
         let dockerImage = document.getElementById('vpn-docker-image')?.value || 'qmcgaw/gluetun';
         if (dockerImage === 'custom') {
-            dockerImage = document.getElementById('vpn-docker-image-custom')?.value || 'qmcgaw/gluetun';
+            dockerImage = document.getElementById('vpn-docker-image-custom')?.value?.trim() || 'qmcgaw/gluetun';
+            if (!dockerImage) return alert('Image Docker requise');
         }
-        const cbThreshold = parseInt(document.getElementById('vpn-cb-threshold')?.value) || 3;
-        const cbRecovery = parseInt(document.getElementById('vpn-cb-recovery')?.value) || 300;
-        const backoffMax = parseInt(document.getElementById('vpn-backoff-max')?.value) || 60;
-        const watchdog = parseInt(document.getElementById('vpn-watchdog')?.value) || 60;
-        const apiCache = parseInt(document.getElementById('vpn-api-cache')?.value) || 900;
+        const cbThreshold = clamp('vpn-cb-threshold', 1, 10, 3);
+        const cbRecovery = clamp('vpn-cb-recovery', 30, 3600, 300);
+        const backoffMax = clamp('vpn-backoff-max', 10, 300, 60);
+        const watchdog = clamp('vpn-watchdog', 0, 600, 60);
+        const apiCache = clamp('vpn-api-cache', 60, 7200, 900);
 
-        await fetch('/api/vpn-config', {
-            method: 'POST', headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({
-                mode, proxy_port: proxyPort, switch_delay: switchDelay, docker_image: dockerImage,
-                circuit_breaker_threshold: cbThreshold, circuit_breaker_recovery: cbRecovery,
-                backoff_max_delay: backoffMax, watchdog_interval: watchdog, api_cache_ttl: apiCache
-            })
-        });
+        const statusEl = document.getElementById('vpn-health-result');
+        try {
+            const resp = await fetch('/api/vpn-config', {
+                method: 'POST', headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({
+                    mode, proxy_port: proxyPort, switch_delay: switchDelay, docker_image: dockerImage,
+                    circuit_breaker_threshold: cbThreshold, circuit_breaker_recovery: cbRecovery,
+                    backoff_max_delay: backoffMax, watchdog_interval: watchdog, api_cache_ttl: apiCache
+                })
+            });
+            const data = await resp.json().catch(()=>({}));
+            if (!resp.ok || data.error) throw new Error(data.error|| 'HTTP '+resp.status);
+            if (statusEl) { statusEl.innerHTML='<span style="color:var(--success)">✓ Sauvegardé (hot-reload)</span>'; setTimeout(()=> statusEl.textContent='',3000); }
+        } catch(e){
+            console.error('vpnSaveConfig failed', e);
+            if (statusEl) { statusEl.innerHTML=`<span style="color:var(--danger)">✗ ${escHtml(e.message)}</span>`; setTimeout(()=> statusEl.textContent='',4000); }
+        }
 
-        // Show/hide Docker options
+        // Show/hide Docker options (local UI, no fetch rollback needed)
         document.getElementById('vpn-docker-row').style.display = mode === 'docker' ? 'flex' : 'none';
-        document.getElementById('vpn-mode-hint').textContent = mode === 'docker' ? 'Docker (reproductible, isolé)' : 'WSL2 (léger, déjà installé)';
+        const hints = { auto: 'Auto-détecte le meilleur mode disponible', docker: 'Docker (reproductible, isolé)', native: 'Windows natif (OpenVPN installé)', 'nordvpn-app': 'NordVPN App (application desktop Windows)', wsl2: 'WSL2 (léger, déjà installé)' };
+        const hintEl = document.getElementById('vpn-mode-hint');
+        if (hintEl) hintEl.textContent = hints[mode] || hints.wsl2;
     };
 
     window.saveQuotaPerIp = async function() {
-        const quotaPerIp = parseInt(document.getElementById('vpn-quota-per-ip').value) || 300;
-        await fetch('/api/vpn-config', {
-            method: 'POST', headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({ quota_per_ip: quotaPerIp })
-        });
+        const el = document.getElementById('vpn-quota-per-ip');
+        let quotaPerIp = parseInt(el?.value) || 300;
+        quotaPerIp = Math.max(1, Math.min(10000, quotaPerIp));
+        if (el) el.value = quotaPerIp;
+        const statusEl = document.getElementById('vpn-health-result');
+        try {
+            const resp = await fetch('/api/vpn-config', {
+                method: 'POST', headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ quota_per_ip: quotaPerIp })
+            });
+            const data = await resp.json().catch(()=>({}));
+            if (!resp.ok || data.error) throw new Error(data.error||'HTTP '+resp.status);
+            if (statusEl) { statusEl.innerHTML='<span style="color:var(--success)">✓ Quota sauvegardé</span>'; setTimeout(()=> statusEl.textContent='',2000); }
+        } catch(e){
+            console.error('saveQuotaPerIp failed', e);
+            if (statusEl) { statusEl.innerHTML=`<span style="color:var(--danger)">✗ ${escHtml(e.message)}</span>`; }
+        }
     };
 
     // Initialize mode selector from config
@@ -3098,16 +3233,28 @@ document.addEventListener('DOMContentLoaded', () => {
         input.click();
     };
 
-    // ── Free Models master toggle ──
+    // ── Free Models master toggle (robust, rollback on error) ──
     window.toggleFreeModels = async function(enabled) {
-        await fetch('/api/vpn/toggle', {
-            method: 'POST', headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({enabled})
-        });
-        refreshVPNStatus();
+        const toggle = document.getElementById('fm-toggle');
+        const prev = toggle ? !enabled : enabled;
+        try {
+            const resp = await fetch('/api/vpn/toggle', {
+                method: 'POST', headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({enabled})
+            });
+            if (!resp.ok) throw new Error('HTTP ' + resp.status);
+            const data = await resp.json().catch(()=>({}));
+            if (data.error) throw new Error(data.error);
+            refreshVPNStatus();
+        } catch (e) {
+            console.error('toggleFreeModels failed:', e);
+            if (toggle) toggle.checked = prev;
+            const status = document.getElementById('vpn-health-result');
+            if (status) { status.innerHTML = `<span style="color:var(--danger)">✗ ${escHtml(e.message)}</span>`; setTimeout(()=> status.textContent='', 3000); }
+        }
     };
 
-    // ── Proxy mode switching ──
+    // ── Proxy mode switching (robust, rollback) ──
     function setProxyModeUI(mode) {
         // Update radio buttons
         document.querySelectorAll('.proxy-mode-btn').forEach(btn => btn.classList.remove('active'));
@@ -3122,12 +3269,200 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     window.switchProxyMode = async function(mode) {
+        // Capture previous mode for rollback
+        const prevMode = document.querySelector('.proxy-mode-btn.active')?.id?.replace('fm-mode-','') || 'vpn';
         setProxyModeUI(mode);
-        await fetch('/api/vpn/proxy-mode', {
-            method: 'POST', headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({mode})
-        });
-        refreshVPNStatus();
+        try {
+            const resp = await fetch('/api/vpn/proxy-mode', {
+                method: 'POST', headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({mode})
+            });
+            if (!resp.ok) throw new Error('HTTP ' + resp.status);
+            const data = await resp.json().catch(()=>({}));
+            if (data.error) throw new Error(data.error);
+            refreshVPNStatus();
+        } catch (e) {
+            console.error('switchProxyMode failed:', e);
+            setProxyModeUI(prevMode);
+            const status = document.getElementById('vpn-health-result');
+            if (status) { status.innerHTML = `<span style="color:var(--danger)">✗ ${escHtml(e.message)}</span>`; setTimeout(()=> status.textContent='', 3000); }
+        }
+    };
+
+    // ── Free Model Map (hot-reload) ──
+    let _freeModelMap = {};
+    async function refreshFreeModelMap() {
+        try {
+            const resp = await fetch('/api/config/free-model-map');
+            const data = await resp.json();
+            _freeModelMap = data.free_model_map || {};
+            renderFreeModelMap();
+            // Populate selects for adding
+            const paidSel = document.getElementById('fmm-paid');
+            const freeSel = document.getElementById('fmm-free');
+            const models = data.available_models || availableModels || [];
+            if (paidSel) {
+                const curPaid = paidSel.value;
+                paidSel.innerHTML = '<option value="">— choisir —</option>' + models.map(m=> `<option value="${escHtml(m)}">${escHtml(m)}</option>`).join('');
+                if (curPaid) paidSel.value = curPaid;
+            }
+            if (freeSel) {
+                const curFree = freeSel.value;
+                const freeModels = models.filter(m=> m.endsWith('-free')).concat(models.filter(m=> !models.includes(m+'-free')).map(m=> m+'-free'));
+                // dedup
+                const uniq = [...new Set(freeModels)];
+                freeSel.innerHTML = '<option value="">— choisir —</option>' + uniq.map(m=> `<option value="${escHtml(m)}">${escHtml(m)}</option>`).join('');
+                if (curFree) freeSel.value = curFree;
+            }
+        } catch (e) { console.error('refreshFreeModelMap failed', e); }
+    }
+    function renderFreeModelMap() {
+        const tbody = document.getElementById('free-model-map-tbody');
+        if (!tbody) return;
+        const entries = Object.entries(_freeModelMap);
+        if (!entries.length) {
+            tbody.innerHTML = '<tr><td colspan="3" style="color:var(--text-muted);padding:8px">Aucun mapping (tous les modèles passent en payant)</td></tr>';
+            return;
+        }
+        tbody.innerHTML = entries.map(([paid, free])=> `
+            <tr>
+                <td style="font-family:monospace">${escHtml(paid)}</td>
+                <td style="font-family:monospace">${escHtml(free)}</td>
+                <td><button class="btn btn-sm btn-danger" onclick="removeFreeModelMapEntry('${escHtml(paid)}')" style="font-size:11px;padding:2px 6px">✕</button></td>
+            </tr>
+        `).join('');
+    }
+    window.addFreeModelMap = function() {
+        const paid = document.getElementById('fmm-paid')?.value?.trim();
+        const free = document.getElementById('fmm-free')?.value?.trim();
+        if (!paid || !free) return alert('Choisissez payant et gratuit');
+        _freeModelMap[paid] = free;
+        renderFreeModelMap();
+        document.getElementById('fmm-paid').value = '';
+        document.getElementById('fmm-free').value = '';
+    };
+    window.removeFreeModelMapEntry = function(paid) {
+        if (!confirm('Supprimer ce mapping ?')) return;
+        delete _freeModelMap[paid];
+        renderFreeModelMap();
+    };
+    window.saveFreeModelMap = async function() {
+        const status = document.getElementById('fmm-save-status');
+        if (status) status.textContent = 'Sauvegarde...';
+        try {
+            const resp = await fetch('/api/config/free-model-map', {
+                method: 'POST', headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({free_model_map: _freeModelMap})
+            });
+            const data = await resp.json();
+            if (!resp.ok || data.error) throw new Error(data.error || 'HTTP '+resp.status);
+            _freeModelMap = data.free_model_map || _freeModelMap;
+            renderFreeModelMap();
+            if (status) { status.textContent = '✓ Sauvegardé (hot-reload)'; status.style.color='var(--success)'; setTimeout(()=> status.textContent='',3000); }
+        } catch (e) {
+            console.error('saveFreeModelMap failed', e);
+            if (status) { status.textContent = '✗ ' + e.message; status.style.color='var(--danger)'; }
+        }
+    };
+
+    // ── Rotation Rules (hot-reload) ──
+    let _rotationRules = [];
+    async function refreshRotationRules() {
+        try {
+            const resp = await fetch('/api/vpn/rotation-rules');
+            const data = await resp.json();
+            _rotationRules = data.rules || [];
+            renderRotationRules();
+        } catch(e){ console.error('refreshRotationRules',e); }
+    }
+    function renderRotationRules() {
+        const el = document.getElementById('vpn-rotation-rules-list');
+        if (!el) return;
+        if (!_rotationRules.length) { el.innerHTML = '<div style="color:var(--text-muted);padding:6px">Aucune règle (rotation par défaut)</div>'; return; }
+        el.innerHTML = _rotationRules.map((r,i)=> `
+            <div style="display:flex;justify-content:space-between;align-items:center;padding:6px 8px;background:var(--bg);border-radius:6px;margin-bottom:4px">
+                <span><code>${escHtml(r.model_pattern||r.pattern||'')}</code> → ${escHtml(r.strategy||'round-robin')} ${r.quota? '('+r.quota+')':''} ${r.countries? '['+ (r.countries||[]).join(',')+']':''}</span>
+                <button class="btn btn-sm btn-danger" onclick="removeRotationRule(${i})" style="font-size:11px;padding:2px 6px">✕</button>
+            </div>
+        `).join('');
+    }
+    window.addRotationRule = function() {
+        const pattern = document.getElementById('rr-pattern')?.value?.trim();
+        const strategy = document.getElementById('rr-strategy')?.value || 'round-robin';
+        const quota = parseInt(document.getElementById('rr-quota')?.value) || undefined;
+        if (!pattern) return alert('Pattern requis');
+        const rule = {model_pattern: pattern, strategy};
+        if (quota) rule.quota = quota;
+        _rotationRules.push(rule);
+        renderRotationRules();
+        document.getElementById('rr-pattern').value=''; document.getElementById('rr-quota').value='';
+    };
+    window.removeRotationRule = function(idx) {
+        if (!confirm('Supprimer cette règle ?')) return;
+        _rotationRules.splice(idx,1);
+        renderRotationRules();
+    };
+    window.saveRotationRules = async function() {
+        const status = document.getElementById('rr-save-status');
+        if (status) status.textContent='Sauvegarde...';
+        try {
+            const resp = await fetch('/api/vpn/rotation-rules', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({rules:_rotationRules})});
+            const data = await resp.json();
+            if (!resp.ok || data.error) throw new Error(data.error||'HTTP '+resp.status);
+            _rotationRules = data.rules||_rotationRules;
+            renderRotationRules();
+            if (status){ status.textContent='✓ Sauvegardé (hot-reload)'; status.style.color='var(--success)'; setTimeout(()=> status.textContent='',3000); }
+        } catch(e){ console.error(e); if(status){ status.textContent='✗ '+e.message; status.style.color='var(--danger)'; } }
+    };
+
+    // ── Schedule (hot-reload) ──
+    let _schedule = {enabled:false, rules:[]};
+    async function refreshSchedule() {
+        try {
+            const resp = await fetch('/api/vpn/schedule');
+            const data = await resp.json();
+            _schedule = data && typeof data.enabled !=='undefined' ? data : {enabled:false, rules: data.rules||[]};
+            renderSchedule();
+            const tog = document.getElementById('vpn-schedule-enabled');
+            if (tog) tog.checked = !!_schedule.enabled;
+        } catch(e){ console.error('refreshSchedule',e); }
+    }
+    function renderSchedule() {
+        const el = document.getElementById('vpn-schedule-list');
+        if (!el) return;
+        const rules = _schedule.rules||[];
+        if (!rules.length) { el.innerHTML='<div style="color:var(--text-muted);padding:6px">Aucun planning</div>'; return; }
+        el.innerHTML = rules.map((r,i)=> `
+            <div style="display:flex;justify-content:space-between;align-items:center;padding:6px 8px;background:var(--bg);border-radius:6px;margin-bottom:4px">
+                <span><code>${escHtml(r.cron||'')}</code> → ${escHtml(r.action||'rotate')}</span>
+                <button class="btn btn-sm btn-danger" onclick="removeScheduleRule(${i})" style="font-size:11px;padding:2px 6px">✕</button>
+            </div>
+        `).join('');
+    }
+    window.addScheduleRule = function() {
+        const cron = document.getElementById('sched-cron')?.value?.trim();
+        const action = document.getElementById('sched-action')?.value || 'rotate';
+        if (!cron) return alert('Cron requis (ex: 0 */2 * * *)');
+        const parts = cron.split(/\s+/);
+        if (parts.length!==5) return alert('Cron doit avoir 5 champs');
+        if (!_schedule.rules) _schedule.rules=[];
+        _schedule.rules.push({cron, action});
+        renderSchedule();
+        document.getElementById('sched-cron').value='';
+    };
+    window.removeScheduleRule = function(idx){ if(!confirm('Supprimer ?')) return; _schedule.rules.splice(idx,1); renderSchedule(); };
+    window.toggleSchedule = function(enabled){ _schedule.enabled = !!enabled; };
+    window.saveSchedule = async function(){
+        const status=document.getElementById('sched-save-status');
+        if(status) status.textContent='Sauvegarde...';
+        try{
+            const resp=await fetch('/api/vpn/schedule',{method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(_schedule)});
+            const data=await resp.json();
+            if(!resp.ok||data.error) throw new Error(data.error||'HTTP '+resp.status);
+            _schedule=data.schedule||_schedule;
+            renderSchedule();
+            if(status){ status.textContent='✓ Sauvegardé (hot-reload)'; status.style.color='var(--success)'; setTimeout(()=>status.textContent='',3000); }
+        }catch(e){ console.error(e); if(status){ status.textContent='✗ '+e.message; status.style.color='var(--danger)'; } }
     };
 
     // ── SOCKS5 proxy management ──

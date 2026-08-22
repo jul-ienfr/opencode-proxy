@@ -541,6 +541,64 @@
                             <div id="vpn-nordvpn-app-status" style="font-size:12px;color:var(--text-muted)">—</div>
                             <div id="vpn-nordvpn-app-countries" style="margin-top:6px;font-size:11px;color:var(--text-muted)"></div>
                         </div>
+
+                        <!-- Free Model Map Editor (hot-reload) -->
+                        <div style="margin-top:18px;padding:14px;background:var(--bg-secondary);border-radius:8px">
+                            <h3 style="margin:0 0 8px 0">Mapping gratuit</h3>
+                            <p class="config-hint">Associe chaque modèle payant à son équivalent gratuit (hot-reload, pas de restart).</p>
+                            <div style="overflow-x:auto;">
+                                <table id="free-model-map-table" style="width:100%;font-size:13px">
+                                    <thead><tr><th style="text-align:left">Modèle payant</th><th style="text-align:left">Modèle gratuit (-free)</th><th style="width:60px"></th></tr></thead>
+                                    <tbody id="free-model-map-tbody"><tr><td colspan="3" style="color:var(--text-muted)">Chargement…</td></tr></tbody>
+                                </table>
+                            </div>
+                            <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:end;margin-top:10px">
+                                <div><label style="font-size:11px;color:var(--text-muted);display:block;margin-bottom:2px">Payant</label><select id="fmm-paid" class="config-select" style="min-width:160px;font-size:12px"><option value="">— choisir —</option></select></div>
+                                <div><label style="font-size:11px;color:var(--text-muted);display:block;margin-bottom:2px">Gratuit</label><select id="fmm-free" class="config-select" style="min-width:160px;font-size:12px"><option value="">— choisir —</option></select></div>
+                                <button class="btn" onclick="addFreeModelMap()" style="font-size:12px">Ajouter</button>
+                                <button class="btn btn-primary" onclick="saveFreeModelMap()" style="font-size:12px">Sauvegarder</button>
+                                <span id="fmm-save-status" class="save-status" style="font-size:12px"></span>
+                            </div>
+                        </div>
+
+                        <!-- Rotation Rules & Schedule (hot-reload) -->
+                        <div style="margin-top:18px;padding:14px;background:var(--bg-secondary);border-radius:8px">
+                            <h3 style="margin:0 0 8px 0">Règles & Planning</h3>
+                            <p class="config-hint">Règles de rotation par modèle et planning cron (hot-reload).</p>
+                            <!-- Rotation Rules -->
+                            <div style="margin-bottom:14px">
+                                <h4 style="margin:0 0 6px 0;font-size:13px">Règles de rotation</h4>
+                                <div id="vpn-rotation-rules-list" style="max-height:160px;overflow-y:auto;margin-bottom:8px;font-size:12px"></div>
+                                <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:end">
+                                    <div><label style="font-size:11px;color:var(--text-muted);display:block;margin-bottom:2px">Pattern (ex: mimo-*-free)</label><input type="text" id="rr-pattern" class="config-input" placeholder="mimo-*-free" style="width:140px;font-size:12px"></div>
+                                    <div><label style="font-size:11px;color:var(--text-muted);display:block;margin-bottom:2px">Stratégie</label><select id="rr-strategy" class="config-select" style="width:120px;font-size:12px"><option value="round-robin">round-robin</option><option value="random">random</option><option value="latency">latency</option><option value="geo">geo</option></select></div>
+                                    <div><label style="font-size:11px;color:var(--text-muted);display:block;margin-bottom:2px">Quota/IP</label><input type="number" id="rr-quota" class="config-input" placeholder="300" style="width:70px;font-size:12px"></div>
+                                    <button class="btn" onclick="addRotationRule()" style="font-size:12px">Ajouter</button>
+                                </div>
+                                <div style="display:flex;gap:6px;margin-top:8px;align-items:center">
+                                    <button class="btn btn-primary" onclick="saveRotationRules()" style="font-size:12px">Sauvegarder règles</button>
+                                    <span id="rr-save-status" class="save-status" style="font-size:12px"></span>
+                                </div>
+                            </div>
+                            <!-- Schedule -->
+                            <div style="border-top:1px solid var(--border);padding-top:12px">
+                                <div style="display:flex;align-items:center;gap:12px;margin-bottom:8px">
+                                    <h4 style="margin:0;font-size:13px">Planning</h4>
+                                    <label class="toggle-switch" style="margin:0"><input type="checkbox" id="vpn-schedule-enabled" onchange="toggleSchedule(this.checked)"><span class="toggle-slider"></span></label>
+                                    <span style="font-size:12px">Activer</span>
+                                </div>
+                                <div id="vpn-schedule-list" style="max-height:120px;overflow-y:auto;margin-bottom:8px;font-size:12px"></div>
+                                <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:end">
+                                    <div><label style="font-size:11px;color:var(--text-muted);display:block;margin-bottom:2px">Cron (5 champs)</label><input type="text" id="sched-cron" class="config-input" placeholder="0 */2 * * *" style="width:140px;font-size:12px"></div>
+                                    <div><label style="font-size:11px;color:var(--text-muted);display:block;margin-bottom:2px">Action</label><select id="sched-action" class="config-select" style="width:100px;font-size:12px"><option value="rotate">rotate</option></select></div>
+                                    <button class="btn" onclick="addScheduleRule()" style="font-size:12px">Ajouter</button>
+                                </div>
+                                <div style="display:flex;gap:6px;margin-top:8px;align-items:center">
+                                    <button class="btn btn-primary" onclick="saveSchedule()" style="font-size:12px">Sauvegarder planning</button>
+                                    <span id="sched-save-status" class="save-status" style="font-size:12px"></span>
+                                </div>
+                            </div>
+                        </div>
                     </div>
 
                     <!-- SOCKS5 Proxy Section (shown when mode=socks5) -->
@@ -615,6 +673,10 @@
                             <input type="number" id="cfg-port" class="config-input" min="1" max="65535">
                         </div>
                         <div class="config-field">
+                            <label for="cfg-web-port" data-i18n="config.web_port">Web UI Port</label>
+                            <input type="number" id="cfg-web-port" class="config-input" min="1" max="65535" placeholder="8082">
+                        </div>
+                        <div class="config-field">
                             <label for="cfg-bind-address" data-i18n="config.bind_address">Bind Address</label>
                             <select id="cfg-bind-address" class="config-select">
                                 <option value="0.0.0.0" data-i18n="config.bind_lan">Local network (0.0.0.0)</option>
@@ -629,6 +691,7 @@
                             </select>
                         </div>
                     </div>
+                    <div id="web-port-hint" class="config-hint" style="margin-top:6px;display:none">Changement de port Web → hot-restart gracieux (~1s) sans full_restart.</div>
                     <div class="config-actions" style="margin-top: 15px;">
                         <button class="btn btn-primary" id="btn-save-config" data-i18n="config.save">Save Configuration</button>
                         <span id="config-save-status" class="save-status"></span>

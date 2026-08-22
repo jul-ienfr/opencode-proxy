@@ -140,20 +140,37 @@ def daysAgo(n: int) -> str:
     return (datetime.now() - timedelta(days=n)).strftime("%Y-%m-%d")
 
 
-def _persist_vpn_config(updates: dict):
-    """Persist VPN config changes to config.yaml (non-blocking, best-effort)."""
+def _get_canonical_vpn_paths():
+    """Return canonical (configs_dir, auth_file) from config.yaml with fallback defaults."""
     try:
-        import yaml
-        config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "config.yaml")
-        if not os.path.exists(config_path):
-            return
+        import config.settings as cfg
+        openvpn_cfg = cfg.yaml_get("ip_rotation", "openvpn", {}) or {}
+        if not isinstance(openvpn_cfg, dict):
+            openvpn_cfg = {}
+        configs_dir = openvpn_cfg.get("configs_dir") or "vpn/configs"
+        auth_file = openvpn_cfg.get("auth_file") or "vpn/credentials.txt"
+        # Resolve relative to project root
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if not os.path.isabs(configs_dir):
+            configs_dir = os.path.join(root, configs_dir)
+        if not os.path.isabs(auth_file):
+            auth_file = os.path.join(root, auth_file)
+        return configs_dir, auth_file
+    except Exception:
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        return os.path.join(root, "vpn", "configs"), os.path.join(root, "vpn", "credentials.txt")
 
-        with open(config_path, "r", encoding="utf-8") as f:
-            config = yaml.safe_load(f) or {}
 
-        ip_rot = config.get("ip_rotation", {})
+def _persist_vpn_config(updates: dict):
+    """Persist VPN config changes to config.yaml (hot-reload, best-effort).
 
-        # Map update keys to config.yaml paths
+    Uses config.settings YAML layer so _yaml_data stays in sync,
+    then hot-reloads vpn_manager in-memory and emits SSE events.
+    Supports alias keys (proxy_port ↔ vpn_proxy_port, vpn-api-cache ↔ api_cache_ttl).
+    """
+    try:
+        import config.settings as cfg
+        # Map API keys (incl. frontend aliases) → yaml keys in ip_rotation
         key_map = {
             "enabled": "enabled",
             "mode": "mode",
@@ -164,6 +181,8 @@ def _persist_vpn_config(updates: dict):
             "quota_per_ip": "quota_per_ip",
             "switch_delay": "switch_delay",
             "vpn_proxy_port": "vpn_proxy_port",
+            "proxy_port": "vpn_proxy_port",
+            "vpn-proxy-port": "vpn_proxy_port",
             "nordvpn_token": "nordvpn_token",
             "nordvpn_country": "nordvpn_country",
             "nordvpn_group": "nordvpn_group",
@@ -173,29 +192,103 @@ def _persist_vpn_config(updates: dict):
             "docker_dns_over_tls": "docker_dns_over_tls",
             "use_nordvpn_api": "use_nordvpn_api",
             "api_cache_ttl": "api_cache_ttl",
+            "vpn-api-cache": "api_cache_ttl",
             "circuit_breaker_threshold": "circuit_breaker_threshold",
             "circuit_breaker_recovery": "circuit_breaker_recovery",
             "backoff_max_delay": "backoff_max_delay",
             "watchdog_interval": "watchdog_interval",
         }
 
-        changed = False
-        for key, yaml_key in key_map.items():
-            if key in updates:
-                old_val = ip_rot.get(yaml_key)
-                new_val = updates[key]
-                if old_val != new_val:
-                    ip_rot[yaml_key] = new_val
-                    changed = True
+        ip_rot = cfg.yaml_get("ip_rotation", default={}) or {}
+        if not isinstance(ip_rot, dict):
+            ip_rot = {}
 
-        if changed:
-            config["ip_rotation"] = ip_rot
-            with open(config_path, "w", encoding="utf-8") as f:
-                yaml.dump(config, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
-            _debug(f"  [vpn] config persisted to {config_path}")
+        changed_keys: dict = {}
+        for api_key, yaml_key in key_map.items():
+            if api_key in updates:
+                new_val = updates[api_key]
+                if ip_rot.get(yaml_key) != new_val:
+                    ip_rot[yaml_key] = new_val
+                    changed_keys[yaml_key] = new_val
+
+        if changed_keys:
+            cfg._yaml_data["ip_rotation"] = ip_rot
+            cfg.save_yaml_config()
+            # Keep module-level IP_ROTATION in sync (opencode.py imports it at startup)
+            try:
+                cfg.IP_ROTATION.clear()
+                cfg.IP_ROTATION.update(ip_rot)
+            except Exception:
+                pass
+            # Hot-reload vpn_manager in-memory (no restart)
+            try:
+                import shared_state
+                if shared_state.vpn_manager:
+                    mgr_updates: dict = {}
+                    for yk, val in changed_keys.items():
+                        if yk == "vpn_proxy_port":
+                            mgr_updates["proxy_port"] = val
+                            mgr_updates["vpn_proxy_port"] = val
+                        else:
+                            mgr_updates[yk] = val
+                    # Also forward original alias values for manager keys that use different naming
+                    for k in ("api_cache_ttl", "docker_image_custom", "free_only", "use_nordvpn_api"):
+                        if k in updates and k not in mgr_updates:
+                            mgr_updates[k] = updates[k]
+                    shared_state.vpn_manager.update_config(mgr_updates)
+            except Exception as e:
+                _debug(f"  [vpn] hot-reload after persist failed: {e}")
+            # SSE — notify GUI without restart/polling
+            try:
+                mgr = get_event_manager()
+                mgr.publish("vpn_config_changed", {"changed": list(changed_keys.keys())})
+                mgr.publish("stats_updated", {"time": time.strftime("%Y-%m-%dT%H:%M:%S")})
+            except Exception:
+                pass
+            _debug(f"  [vpn] config persisted (hot-reload): {list(changed_keys.keys())}")
 
     except Exception as e:
         _debug(f"  [vpn] failed to persist config: {e}")
+
+
+def _persist_vpn_servers(servers: list):
+    """Persist full openvpn.servers list to config.yaml (hot-reload in-memory)."""
+    try:
+        import config.settings as cfg
+        ip_rot = cfg.yaml_get("ip_rotation", default={}) or {}
+        if not isinstance(ip_rot, dict):
+            ip_rot = {}
+        openvpn_cfg = ip_rot.get("openvpn") or {}
+        if not isinstance(openvpn_cfg, dict):
+            openvpn_cfg = {}
+        openvpn_cfg["servers"] = servers
+        # Ensure canonical paths are set
+        if "configs_dir" not in openvpn_cfg:
+            openvpn_cfg["configs_dir"] = "vpn/configs"
+        if "auth_file" not in openvpn_cfg:
+            openvpn_cfg["auth_file"] = "vpn/credentials.txt"
+        ip_rot["openvpn"] = openvpn_cfg
+        cfg._yaml_data["ip_rotation"] = ip_rot
+        cfg.save_yaml_config()
+        try:
+            cfg.IP_ROTATION.clear()
+            cfg.IP_ROTATION.update(ip_rot)
+        except Exception:
+            pass
+        # Hot-reload manager servers
+        try:
+            import shared_state
+            if shared_state.vpn_manager:
+                shared_state.vpn_manager.update_config({"servers": servers})
+        except Exception as e:
+            _debug(f"  [vpn] persist servers hot-reload failed: {e}")
+        try:
+            get_event_manager().publish("vpn_config_changed", {"changed": ["openvpn.servers"]})
+        except Exception:
+            pass
+        _debug(f"  [vpn] servers persisted: {len(servers)} entries")
+    except Exception as e:
+        _debug(f"  [vpn] failed to persist servers: {e}")
 
 
 def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_usage=None, token_lock=None):
@@ -379,6 +472,78 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
         if "routing" in body:
             save_env({"API_KEY_ROUTING": body["routing"]})
         return {"status": "ok", "message": "API keys saved."}
+
+    @app.get("/api/config/free-model-map")
+    async def get_free_model_map():
+        """Get free model mapping (paid → free)."""
+        import config.settings as cfg
+        fmap = cfg.yaml_get("free_model_map", default={}) or {}
+        if not fmap:
+            # Fallback to in-memory global
+            try:
+                import opencode as _oc
+                fmap = getattr(_oc, "FREE_MODEL_MAP", {}) or cfg.FREE_MODEL_MAP
+            except Exception:
+                fmap = cfg.FREE_MODEL_MAP
+        return {"free_model_map": fmap, "available_models": sorted(MODELS.keys())}
+
+    @app.post("/api/config/free-model-map")
+    async def update_free_model_map(request: Request):
+        """Update free model mapping (hot-reload, no restart)."""
+        body = await request.json()
+        # Accept either {free_model_map: {...}} or raw dict
+        if "free_model_map" in body and isinstance(body["free_model_map"], dict):
+            new_map = body["free_model_map"]
+        elif isinstance(body, dict) and all(isinstance(v, str) for v in body.values()):
+            # Raw map passed directly
+            new_map = {k: v for k, v in body.items() if k not in ("status", "message")}
+            # If body was wrapper with other keys, treat accordingly
+            if not new_map and "free_model_map" not in body:
+                new_map = body
+        else:
+            new_map = body.get("free_model_map", body)
+            if not isinstance(new_map, dict):
+                return JSONResponse(status_code=400, content={"error": "free_model_map must be an object"})
+        # Validate: values should be known models or free variants
+        # Allow empty string to delete entry (handled below)
+        cleaned = {}
+        for k, v in new_map.items():
+            if not isinstance(k, str) or not isinstance(v, str):
+                continue
+            k = k.strip()
+            v = v.strip()
+            if not k:
+                continue
+            if v == "":
+                continue  # skip empty = deletion
+            cleaned[k] = v
+        # Persist to YAML (top-level key)
+        try:
+            import config.settings as cfg
+            cfg._yaml_data["free_model_map"] = cleaned
+            cfg.save_yaml_config()
+            # Hot-reload in-memory globals (config + opencode)
+            cfg.FREE_MODEL_MAP.clear()
+            cfg.FREE_MODEL_MAP.update(cleaned)
+            try:
+                import opencode as _oc
+                # Update opencode's imported reference in-place if same object, else reassign
+                if hasattr(_oc, "FREE_MODEL_MAP"):
+                    # If it's same dict object, already updated via cfg; else replace
+                    if _oc.FREE_MODEL_MAP is not cfg.FREE_MODEL_MAP:
+                        _oc.FREE_MODEL_MAP.clear()
+                        _oc.FREE_MODEL_MAP.update(cleaned)
+            except Exception as e:
+                _debug(f"  [config] free_model_map opencode hot-reload failed: {e}")
+            try:
+                get_event_manager().publish("config_changed", {"changed": ["free_model_map"]})
+            except Exception:
+                pass
+            _debug(f"  [config] free_model_map updated (hot-reload): {len(cleaned)} entries")
+        except Exception as e:
+            _debug(f"  [config] free_model_map persist failed: {e}")
+            return JSONResponse(status_code=500, content={"error": str(e)})
+        return {"status": "ok", "free_model_map": cleaned, "message": "Free model map updated (hot-reload)."}
 
     @app.post("/api/config")
     async def update_config(request: Request):
@@ -942,41 +1107,196 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
 
     @app.post("/api/vpn-config")
     async def update_vpn_config(request: Request):
-        """Update VPN configuration (hot-reload + persist to config.yaml)."""
+        """Update VPN configuration (hot-reload + persist to config.yaml, reboot-safe)."""
         import shared_state
         import os
         body = await request.json()
 
-        # Handle credentials - always save to file (no VPN manager needed)
+        # Handle credentials - save to canonical auth_file (no VPN manager needed)
         if "credentials" in body:
             creds = body.pop("credentials")
             username = creds.get("username", "")
             password = creds.get("password", "")
             if username and password:
-                configs_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "vpn_configs")
-                os.makedirs(configs_dir, exist_ok=True)
-                cred_path = os.path.join(configs_dir, "credentials.txt")
-                with open(cred_path, "w", newline='\n') as f:
+                # Canonical path from config.yaml
+                _, cred_path = _get_canonical_vpn_paths()
+                os.makedirs(os.path.dirname(cred_path), exist_ok=True)
+                with open(cred_path, "w", newline='\n', encoding="utf-8") as f:
                     f.write(f"{username}\n{password}\n")
                 try:
                     os.chmod(cred_path, 0o600)
                 except Exception:
                     pass
+                # Also mirror to legacy path for compat
+                try:
+                    legacy_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "vpn_configs")
+                    os.makedirs(legacy_dir, exist_ok=True)
+                    legacy_path = os.path.join(legacy_dir, "credentials.txt")
+                    if os.path.abspath(legacy_path) != os.path.abspath(cred_path):
+                        with open(legacy_path, "w", newline='\n', encoding="utf-8") as lf:
+                            lf.write(f"{username}\n{password}\n")
+                        try:
+                            os.chmod(legacy_path, 0o600)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
                 if shared_state.vpn_manager:
                     shared_state.vpn_manager._auth_file = cred_path
+                    # Persist auth_file if changed? not needed — canonical already
 
-        # Handle other operations (need VPN manager)
-        if shared_state.vpn_manager:
-            if "add_server" in body:
-                srv = body.pop("add_server")
-                shared_state.vpn_manager.add_server(srv["name"], srv["config"])
-            if "remove_server" in body:
-                shared_state.vpn_manager.remove_server(body.pop("remove_server"))
-            if body:
-                shared_state.vpn_manager.update_config(body)
+        # Handle server removal with YAML persistence + file unlink (reboot-safe, hot-reload)
+        if "remove_server" in body:
+            name_to_remove = body.pop("remove_server")
+            # Remove from YAML first
+            try:
+                import config.settings as cfg
+                ip_rot = cfg.yaml_get("ip_rotation", default={}) or {}
+                openvpn_cfg = ip_rot.get("openvpn") or {}
+                servers = list(openvpn_cfg.get("servers", []) or [])
+                new_servers = [s for s in servers if s.get("name") != name_to_remove]
+                _debug(f"  [vpn] remove debug: {name_to_remove} servers {len(servers)} -> {len(new_servers)} list={servers} new={new_servers}")
+                if len(new_servers) != len(servers):
+                    _persist_vpn_servers(new_servers)
+                    _debug(f"  [vpn] _persist_vpn_servers called for remove {name_to_remove}")
+                else:
+                    _debug(f"  [vpn] remove no diff, fallback to manager remove")
+                    # Fallback: at least update manager
+                    if shared_state.vpn_manager:
+                        shared_state.vpn_manager.remove_server(name_to_remove)
+                # Unlink .ovpn file (canonical + legacy)
+                for base_dir in [_get_canonical_vpn_paths()[0],
+                                 os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "vpn_configs")]:
+                    try:
+                        ovpn_path = os.path.join(base_dir, f"{name_to_remove}.ovpn")
+                        if os.path.exists(ovpn_path):
+                            os.remove(ovpn_path)
+                            _debug(f"  [vpn] removed ovpn file: {ovpn_path}")
+                    except Exception as e:
+                        _debug(f"  [vpn] failed to remove {name_to_remove}.ovpn: {e}")
+                # Ensure manager in sync even if YAML path already handled
+                if shared_state.vpn_manager and len(new_servers) == len(servers):
+                    # already called remove above
+                    pass
+                elif shared_state.vpn_manager:
+                    # _persist_vpn_servers already hot-reloaded, ensure cycle rebuilt
+                    pass
+            except Exception as e:
+                _debug(f"  [vpn] remove_server error: {e}")
+                if shared_state.vpn_manager:
+                    try:
+                        shared_state.vpn_manager.remove_server(name_to_remove)
+                    except Exception:
+                        pass
 
-                # Persist changes to config.yaml
-                _persist_vpn_config(body)
+        # Handle explicit add_server via JSON (rare, but keep)
+        if "add_server" in body:
+            srv = body.pop("add_server")
+            try:
+                import config.settings as cfg
+                ip_rot = cfg.yaml_get("ip_rotation", default={}) or {}
+                openvpn_cfg = ip_rot.get("openvpn") or {}
+                servers = list(openvpn_cfg.get("servers", []) or [])
+                # Deduplicate by name
+                servers = [s for s in servers if s.get("name") != srv.get("name")]
+                # Ensure config path is canonical
+                raw_cfg = srv.get("config", "")
+                if raw_cfg:
+                    # Normalize to canonical relative path
+                    fname = os.path.basename(raw_cfg)
+                    canonical_path = f"vpn/configs/{fname}"
+                    srv["config"] = canonical_path
+                servers.append(srv)
+                _persist_vpn_servers(servers)
+                if shared_state.vpn_manager:
+                    # add_server will cycle rebuild; but _persist already updated manager
+                    # Ensure file exists check not needed
+                    pass
+            except Exception as e:
+                _debug(f"  [vpn] add_server error: {e}")
+                if shared_state.vpn_manager:
+                    shared_state.vpn_manager.add_server(srv["name"], srv["config"])
+
+        # Handle remaining generic keys with hot-reload + persist (with validation per Phase3)
+        if body and shared_state.vpn_manager:
+            # Normalize aliases before persist/hot-reload
+            normalized: dict = {}
+            for k, v in body.items():
+                if k == "proxy_port":
+                    normalized["vpn_proxy_port"] = v
+                    normalized["proxy_port"] = v
+                elif k == "vpn-proxy-port":
+                    normalized["vpn_proxy_port"] = v
+                elif k == "vpn-api-cache":
+                    normalized["api_cache_ttl"] = v
+                else:
+                    normalized[k] = v
+            # Validation (Phase3: clamp app.js + 400 api.py)
+            def _bad(msg): return JSONResponse(status_code=400, content={"error": msg})
+            if "vpn_proxy_port" in normalized:
+                try:
+                    p = int(normalized["vpn_proxy_port"])
+                    if not (1 <= p <= 65535): return _bad("vpn_proxy_port must be 1-65535")
+                    normalized["vpn_proxy_port"] = p
+                    normalized["proxy_port"] = p
+                except (ValueError, TypeError): return _bad("Invalid vpn_proxy_port")
+            if "proxy_port" in normalized and "vpn_proxy_port" not in normalized:
+                try:
+                    p = int(normalized["proxy_port"])
+                    if not (1 <= p <= 65535): return _bad("proxy_port must be 1-65535")
+                except (ValueError, TypeError): return _bad("Invalid proxy_port")
+            if "quota_per_ip" in normalized:
+                try:
+                    q = int(normalized["quota_per_ip"])
+                    if not (1 <= q <= 10000): return _bad("quota_per_ip must be 1-10000")
+                    normalized["quota_per_ip"] = q
+                except (ValueError, TypeError): return _bad("Invalid quota_per_ip")
+            if "switch_delay" in normalized:
+                try:
+                    sd = int(normalized["switch_delay"])
+                    if not (1 <= sd <= 60): return _bad("switch_delay must be 1-60")
+                    normalized["switch_delay"] = sd
+                except (ValueError, TypeError): return _bad("Invalid switch_delay")
+            if "circuit_breaker_threshold" in normalized:
+                try:
+                    cb = int(normalized["circuit_breaker_threshold"])
+                    if not (1 <= cb <= 10): return _bad("circuit_breaker_threshold must be 1-10")
+                    normalized["circuit_breaker_threshold"] = cb
+                except (ValueError, TypeError): return _bad("Invalid circuit_breaker_threshold")
+            if "circuit_breaker_recovery" in normalized:
+                try:
+                    cr = int(normalized["circuit_breaker_recovery"])
+                    if not (30 <= cr <= 3600): return _bad("circuit_breaker_recovery must be 30-3600")
+                    normalized["circuit_breaker_recovery"] = cr
+                except (ValueError, TypeError): return _bad("Invalid circuit_breaker_recovery")
+            if "backoff_max_delay" in normalized:
+                try:
+                    bd = int(normalized["backoff_max_delay"])
+                    if not (10 <= bd <= 300): return _bad("backoff_max_delay must be 10-300")
+                    normalized["backoff_max_delay"] = bd
+                except (ValueError, TypeError): return _bad("Invalid backoff_max_delay")
+            if "watchdog_interval" in normalized:
+                try:
+                    wd = int(normalized["watchdog_interval"])
+                    if not (0 <= wd <= 600): return _bad("watchdog_interval must be 0-600")
+                    normalized["watchdog_interval"] = wd
+                except (ValueError, TypeError): return _bad("Invalid watchdog_interval")
+            if "api_cache_ttl" in normalized:
+                try:
+                    ac = int(normalized["api_cache_ttl"])
+                    if not (60 <= ac <= 7200): return _bad("api_cache_ttl must be 60-7200")
+                    normalized["api_cache_ttl"] = ac
+                except (ValueError, TypeError): return _bad("Invalid api_cache_ttl")
+            # Persist first (writes YAML + hot-reloads manager inside)
+            _persist_vpn_config(normalized)
+            # Ensure manager also gets any keys not covered by _persist (e.g., socks5, geo_filter fallback)
+            try:
+                shared_state.vpn_manager.update_config(normalized)
+            except Exception as e:
+                _debug(f"  [vpn] update_config fallback failed: {e}")
+        elif body:
+            # No manager but still persist (validate as above for api_cache etc if present)
+            _persist_vpn_config(body)
 
         config = shared_state.vpn_manager.get_config() if shared_state.vpn_manager else {}
         return {"ok": True, "config": config}
@@ -1055,81 +1375,148 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
 
     @app.post("/api/vpn/upload-config")
     async def upload_vpn_config(request: Request):
-        """Upload an OpenVPN .ovpn config file."""
+        """Upload an OpenVPN .ovpn config file (reboot-safe + hot-reload)."""
         import shared_state
         import os
-        import uuid
 
         form = await request.form()
         name = form.get("name", "")
         file = form.get("config")
 
         if not name:
-            return {"error": "Server name required"}
+            return JSONResponse(status_code=400, content={"error": "Server name required"})
         if not file:
-            return {"error": "Config file required"}
+            return JSONResponse(status_code=400, content={"error": "Config file required"})
 
-        # Save to configs directory
-        configs_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "vpn_configs")
+        # Basic name sanitization (alphanum, dash, underscore)
+        import re
+        if not re.match(r'^[a-zA-Z0-9._-]+$', name):
+            return JSONResponse(status_code=400, content={"error": "Invalid server name (use letters, numbers, - _ .)"})
+        # Validate file extension/content
+        filename = getattr(file, 'filename', '') or ''
+        if filename and not filename.lower().endswith('.ovpn'):
+            # still allow but warn
+            _debug(f"  [vpn] upload warning: filename {filename!r} not .ovpn")
+
+        # Canonical directory from config.yaml
+        configs_dir, _ = _get_canonical_vpn_paths()
         os.makedirs(configs_dir, exist_ok=True)
-
-        # Save the file
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        # Relative path stored in YAML (portable)
+        rel_path = f"vpn/configs/{name}.ovpn"
         file_path = os.path.join(configs_dir, f"{name}.ovpn")
         content = await file.read()
+        # Basic ovpn validation — must contain 'remote' or 'client'
+        try:
+            text = content.decode('utf-8', errors='ignore')
+            if 'remote' not in text.lower() and 'client' not in text.lower():
+                _debug(f"  [vpn] upload warning: {name}.ovpn may be invalid (no 'remote' found)")
+        except Exception:
+            pass
+        # Prevent path traversal via name already sanitized
         with open(file_path, "wb") as f:
             f.write(content)
+        # Mirror to legacy dir for compat (best-effort)
+        try:
+            legacy_dir = os.path.join(root, "vpn_configs")
+            os.makedirs(legacy_dir, exist_ok=True)
+            legacy_path = os.path.join(legacy_dir, f"{name}.ovpn")
+            if os.path.abspath(legacy_path) != os.path.abspath(file_path):
+                with open(legacy_path, "wb") as lf:
+                    lf.write(content)
+        except Exception as e:
+            _debug(f"  [vpn] legacy mirror failed: {e}")
 
-        # Add to VPN manager
+        # Persist to config.yaml openvpn.servers (reboot-safe) + hot-reload manager
+        try:
+            import config.settings as cfg
+            ip_rot = cfg.yaml_get("ip_rotation", default={}) or {}
+            openvpn_cfg = ip_rot.get("openvpn") or {}
+            servers = list(openvpn_cfg.get("servers", []) or [])
+            # Deduplicate by name — replace existing
+            servers = [s for s in servers if s.get("name") != name]
+            servers.append({"name": name, "config": rel_path})
+            _persist_vpn_servers(servers)
+        except Exception as e:
+            _debug(f"  [vpn] persist after upload failed: {e}")
+            if shared_state.vpn_manager:
+                shared_state.vpn_manager.add_server(name, rel_path)
+
+        # Also ensure manager has it (persist already did, but double-ensure)
         if shared_state.vpn_manager:
-            shared_state.vpn_manager.add_server(name, file_path)
+            try:
+                # If persist succeeded, manager already has new list; ensure file path accessible
+                # No extra add needed; but if manager list missing, add
+                if not any(s.get("name") == name for s in shared_state.vpn_manager._servers):
+                    shared_state.vpn_manager.add_server(name, rel_path)
+            except Exception:
+                pass
 
-        return {"ok": True, "path": file_path, "name": name}
+        return {"ok": True, "path": rel_path, "name": name, "servers": len(servers) if 'servers' in locals() else 0}
 
     @app.get("/api/vpn/credentials")
     async def get_vpn_credentials():
-        """Check if VPN credentials exist (does not return actual values)."""
+        """Check if VPN credentials exist (does not return actual values). Supports canonical + legacy fallback."""
         import os
-        configs_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "vpn_configs")
-        cred_path = os.path.join(configs_dir, "credentials.txt")
+        _, canonical = _get_canonical_vpn_paths()
+        legacy = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "vpn_configs", "credentials.txt")
+        cred_path = canonical if os.path.exists(canonical) and os.path.getsize(canonical) > 0 else legacy
+        # If neither has content, still check canonical first
+        if not os.path.exists(cred_path):
+            cred_path = canonical
         exists = os.path.exists(cred_path) and os.path.getsize(cred_path) > 0
+        # Fallback: check alternative if primary empty
+        if not exists:
+            alt = legacy if cred_path == canonical else canonical
+            if os.path.exists(alt) and os.path.getsize(alt) > 0:
+                cred_path = alt
+                exists = True
         username_saved = ""
         if exists:
             try:
-                with open(cred_path, "r") as f:
+                with open(cred_path, "r", encoding="utf-8", errors="ignore") as f:
                     lines = f.read().strip().split("\n")
                     if lines:
                         username_saved = lines[0]
             except Exception:
                 pass
-        return {"exists": exists, "username_preview": username_saved[:4] + "****" if username_saved else ""}
+        return {"exists": exists, "username_preview": username_saved[:4] + "****" if username_saved else "", "path": os.path.basename(cred_path)}
 
     @app.post("/api/vpn/credentials")
     async def save_vpn_credentials(request: Request):
-        """Save NordVPN credentials."""
+        """Save NordVPN credentials (canonical + legacy mirror, hot-reload)."""
         import shared_state
         body = await request.json()
         username = body.get("username", "")
         password = body.get("password", "")
 
         if not username or not password:
-            return {"error": "Username and password required"}
+            return JSONResponse(status_code=400, content={"error": "Username and password required"})
 
-        # Save to credentials file
         import os
-        configs_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "vpn_configs")
-        os.makedirs(configs_dir, exist_ok=True)
-        cred_path = os.path.join(configs_dir, "credentials.txt")
-
-        with open(cred_path, "w") as f:
+        _, cred_path = _get_canonical_vpn_paths()
+        os.makedirs(os.path.dirname(cred_path), exist_ok=True)
+        with open(cred_path, "w", newline='\n', encoding="utf-8") as f:
             f.write(f"{username}\n{password}\n")
-
-        # Make readable only by owner
         try:
             os.chmod(cred_path, 0o600)
         except Exception:
             pass
+        # Mirror to legacy
+        try:
+            legacy_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "vpn_configs")
+            os.makedirs(legacy_dir, exist_ok=True)
+            legacy_path = os.path.join(legacy_dir, "credentials.txt")
+            if os.path.abspath(legacy_path) != os.path.abspath(cred_path):
+                with open(legacy_path, "w", newline='\n', encoding="utf-8") as lf:
+                    lf.write(f"{username}\n{password}\n")
+                try:
+                    os.chmod(legacy_path, 0o600)
+                except Exception:
+                    pass
+        except Exception as e:
+            _debug(f"  [vpn] legacy cred mirror failed: {e}")
 
-        # Update VPN manager
         if shared_state.vpn_manager:
             shared_state.vpn_manager._auth_file = cred_path
 
@@ -1344,45 +1731,119 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
 
     @app.get("/api/vpn/rotation-rules")
     async def get_rotation_rules():
-        """Get rotation rules configuration."""
+        """Get rotation rules configuration (hot-reload aware)."""
         import shared_state
-        if shared_state.vpn_manager:
-            return {"rules": shared_state.vpn_manager._rotation_rules}
-        return {"rules": []}
+        try:
+            import config.settings as cfg
+            ip_rot = cfg.yaml_get("ip_rotation", default={}) or {}
+            rules = ip_rot.get("rotation_rules", [])
+            # Prefer in-memory manager if available and non-empty, else YAML
+            if shared_state.vpn_manager and shared_state.vpn_manager._rotation_rules:
+                rules = shared_state.vpn_manager._rotation_rules
+            return {"rules": rules}
+        except Exception:
+            if shared_state.vpn_manager:
+                return {"rules": shared_state.vpn_manager._rotation_rules}
+            return {"rules": []}
 
     @app.post("/api/vpn/rotation-rules")
     async def set_rotation_rules(request: Request):
-        """Update rotation rules configuration."""
+        """Update rotation rules configuration (hot-reload + persist)."""
         import shared_state
         body = await request.json()
         rules = body.get("rules", [])
+        if not isinstance(rules, list):
+            return JSONResponse(status_code=400, content={"error": "rules must be a list"})
+        # Validate each rule has at least model_pattern or strategy
+        for r in rules:
+            if not isinstance(r, dict):
+                return JSONResponse(status_code=400, content={"error": "each rule must be an object"})
+        # Persist to YAML (hot-reload)
+        try:
+            import config.settings as cfg
+            ip_rot = cfg.yaml_get("ip_rotation", default={}) or {}
+            ip_rot["rotation_rules"] = rules
+            cfg._yaml_data["ip_rotation"] = ip_rot
+            cfg.save_yaml_config()
+            try:
+                cfg.IP_ROTATION["rotation_rules"] = rules
+            except Exception:
+                pass
+        except Exception as e:
+            _debug(f"  [vpn] persist rotation_rules failed: {e}")
         if shared_state.vpn_manager:
             shared_state.vpn_manager.set_rotation_rules(rules)
+            # also update_config for generic path
+            try:
+                shared_state.vpn_manager.update_config({"rotation_rules": rules})
+            except Exception:
+                pass
+            try:
+                get_event_manager().publish("vpn_config_changed", {"changed": ["rotation_rules"]})
+            except Exception:
+                pass
             return {"ok": True, "rules": rules}
-        return {"error": "VPN manager not initialized"}
+        return {"ok": True, "rules": rules, "persisted": True}
 
     @app.get("/api/vpn/schedule")
     async def get_vpn_schedule():
-        """Get VPN rotation schedule configuration."""
+        """Get VPN rotation schedule configuration (hot-reload aware)."""
         import shared_state
-        if shared_state.vpn_manager:
-            from config.settings import IP_ROTATION
-            schedule = IP_ROTATION.get("schedule", {"enabled": False, "rules": []})
+        try:
+            import config.settings as cfg
+            ip_rot = cfg.yaml_get("ip_rotation", default={}) or {}
+            schedule = ip_rot.get("schedule", {"enabled": False, "rules": []})
+            # Merge with manager config if present
+            if shared_state.vpn_manager:
+                mgr_sched = shared_state.vpn_manager._config.get("schedule")
+                if mgr_sched:
+                    schedule = mgr_sched
             return schedule
-        return {"enabled": False, "rules": []}
+        except Exception:
+            if shared_state.vpn_manager:
+                from config.settings import IP_ROTATION
+                schedule = IP_ROTATION.get("schedule", {"enabled": False, "rules": []})
+                return schedule
+            return {"enabled": False, "rules": []}
 
     @app.post("/api/vpn/schedule")
     async def set_vpn_schedule(request: Request):
-        """Update VPN rotation schedule configuration."""
+        """Update VPN rotation schedule configuration (hot-reload + persist)."""
         import shared_state
         body = await request.json()
+        # Accept either {enabled, rules} or raw schedule dict
+        schedule = body if isinstance(body, dict) else {}
+        if "enabled" not in schedule:
+            schedule["enabled"] = False
+        if "rules" not in schedule:
+            schedule["rules"] = []
+        if not isinstance(schedule["rules"], list):
+            return JSONResponse(status_code=400, content={"error": "rules must be a list"})
+        # Persist to YAML
+        try:
+            import config.settings as cfg
+            ip_rot = cfg.yaml_get("ip_rotation", default={}) or {}
+            ip_rot["schedule"] = schedule
+            cfg._yaml_data["ip_rotation"] = ip_rot
+            cfg.save_yaml_config()
+            try:
+                cfg.IP_ROTATION["schedule"] = schedule
+            except Exception:
+                pass
+        except Exception as e:
+            _debug(f"  [vpn] persist schedule failed: {e}")
         if shared_state.vpn_manager:
-            if not hasattr(shared_state.vpn_manager, '_schedule_config'):
-                shared_state.vpn_manager._schedule_config = body
-            else:
-                shared_state.vpn_manager._schedule_config = body
-            return {"ok": True, "schedule": body}
-        return {"error": "VPN manager not initialized"}
+            shared_state.vpn_manager._schedule_config = schedule
+            try:
+                shared_state.vpn_manager.update_config({"schedule": schedule})
+            except Exception:
+                pass
+            try:
+                get_event_manager().publish("vpn_config_changed", {"changed": ["schedule"]})
+            except Exception:
+                pass
+            return {"ok": True, "schedule": schedule}
+        return {"ok": True, "schedule": schedule, "persisted": True}
 
     # ── NordVPN App endpoints ──
 

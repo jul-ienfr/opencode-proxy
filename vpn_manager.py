@@ -1544,9 +1544,12 @@ class VPNManager:
             "auth_file": self._auth_file,
             "vpn_config_dir": self._vpn_config_dir,
             "proxy_port": self._proxy_port,
+            "vpn_proxy_port": self._proxy_port,
             "switch_delay": self._switch_delay,
             "quota_per_ip": self._quota_per_ip,
             "docker_image": self._docker_image,
+            "docker_image_custom": self._config.get("docker_image_custom", ""),
+            "free_only": self._config.get("free_only", True),
             "socks5_proxies": self.get_socks5_proxies(),
             "socks5_rotate": self._socks5_rotate,
             # NordVPN settings
@@ -1558,11 +1561,15 @@ class VPNManager:
             "docker_killswitch": self._config.get("docker_killswitch", True),
             "docker_dns_over_tls": self._config.get("docker_dns_over_tls", True),
             "use_nordvpn_api": self._config.get("use_nordvpn_api", False),
+            "api_cache_ttl": self._config.get("api_cache_ttl", 900),
             # Reliability
             "circuit_breaker_threshold": self._circuit_breaker._failure_threshold,
             "circuit_breaker_recovery": self._circuit_breaker._recovery_time,
             "backoff_max_delay": self._backoff._max_delay,
             "watchdog_interval": self._config.get("watchdog_interval", 60),
+            "geo_filter": self._config.get("geo_filter", {"include": [], "exclude": []}),
+            "rotation_rules": self._rotation_rules,
+            "schedule": self._config.get("schedule", {"enabled": False, "rules": []}),
         }
 
     def update_config(self, updates: dict):
@@ -1573,22 +1580,50 @@ class VPNManager:
             self._proxy_mode = updates["proxy_mode"]
         if "mode" in updates:
             self._mode = updates["mode"]
+        # proxy_port aliases: vpn_proxy_port, proxy_port, vpn-proxy-port
         if "proxy_port" in updates:
             self._proxy_port = updates["proxy_port"]
+            self._config["vpn_proxy_port"] = updates["proxy_port"]
+        if "vpn_proxy_port" in updates:
+            self._proxy_port = updates["vpn_proxy_port"]
+            self._config["vpn_proxy_port"] = updates["vpn_proxy_port"]
+        if "vpn-proxy-port" in updates:
+            self._proxy_port = updates["vpn-proxy-port"]
+            self._config["vpn_proxy_port"] = updates["vpn-proxy-port"]
         if "switch_delay" in updates:
             self._switch_delay = updates["switch_delay"]
+            self._config["switch_delay"] = updates["switch_delay"]
         if "quota_per_ip" in updates:
             self._quota_per_ip = updates["quota_per_ip"]
+            self._config["quota_per_ip"] = updates["quota_per_ip"]
         if "auth_file" in updates:
             self._auth_file = updates["auth_file"]
+        if "vpn_config_dir" in updates:
+            self._vpn_config_dir = updates["vpn_config_dir"]
         if "servers" in updates:
             self._servers = updates["servers"]
             self._cycle = itertools.cycle(self._servers) if self._servers else None
         if "socks5_rotate" in updates:
             self._socks5_rotate = updates["socks5_rotate"]
+            self._config.setdefault("socks5_proxies", {})["rotate_socks5"] = updates["socks5_rotate"]
+        if "rotate_socks5" in updates:
+            self._socks5_rotate = updates["rotate_socks5"]
+            self._config.setdefault("socks5_proxies", {})["rotate_socks5"] = updates["rotate_socks5"]
         # Docker settings
         if "docker_image" in updates:
             self._docker_image = updates["docker_image"]
+            self._config["docker_image"] = updates["docker_image"]
+        if "docker_image_custom" in updates:
+            self._config["docker_image_custom"] = updates["docker_image_custom"]
+        # General flags
+        if "free_only" in updates:
+            self._config["free_only"] = updates["free_only"]
+        if "use_nordvpn_api" in updates:
+            self._config["use_nordvpn_api"] = updates["use_nordvpn_api"]
+        if "api_cache_ttl" in updates:
+            self._config["api_cache_ttl"] = updates["api_cache_ttl"]
+        if "vpn-api-cache" in updates:
+            self._config["api_cache_ttl"] = updates["vpn-api-cache"]
         # NordVPN settings (token, country, group, technology)
         if "nordvpn_token" in updates:
             self._config["nordvpn_token"] = updates["nordvpn_token"]
@@ -1604,24 +1639,58 @@ class VPNManager:
             self._config["docker_killswitch"] = updates["docker_killswitch"]
         if "docker_dns_over_tls" in updates:
             self._config["docker_dns_over_tls"] = updates["docker_dns_over_tls"]
-        if "use_nordvpn_api" in updates:
-            self._config["use_nordvpn_api"] = updates["use_nordvpn_api"]
+        # Geo filter / rotation rules / schedule (stored in _config, hot-reload in-memory)
+        if "geo_filter" in updates:
+            self._config["geo_filter"] = updates["geo_filter"]
+            # also update scorer preferences if available
+            try:
+                if self._server_scorer:
+                    geo = updates["geo_filter"] or {}
+                    self._server_scorer.set_preferences(
+                        preferred_countries=geo.get("include", []),
+                        excluded_countries=geo.get("exclude", []),
+                    )
+            except Exception:
+                pass
+        if "rotation_rules" in updates:
+            self._rotation_rules = updates["rotation_rules"]
+            self._config["rotation_rules"] = updates["rotation_rules"]
+        if "schedule" in updates:
+            self._config["schedule"] = updates["schedule"]
+            # scheduler will pick up next loop via config poll or manual restart
+        if "socks5_proxies" in updates:
+            # full socks5 config replacement
+            self._config["socks5_proxies"] = updates["socks5_proxies"]
+            # rebuild internal list if needed
+            try:
+                sc = updates["socks5_proxies"]
+                if isinstance(sc, dict) and "list" in sc:
+                    self._socks5_proxies = sc.get("list", [])
+                    self._rebuild_socks5_cycle()
+            except Exception:
+                pass
         # Circuit breaker / backoff
         if "circuit_breaker_threshold" in updates or "circuit_breaker_recovery" in updates:
             threshold = updates.get("circuit_breaker_threshold", self._circuit_breaker._failure_threshold)
             recovery = updates.get("circuit_breaker_recovery", self._circuit_breaker._recovery_time)
             self._circuit_breaker = CircuitBreaker(failure_threshold=threshold, recovery_time=recovery)
+            self._config["circuit_breaker_threshold"] = threshold
+            self._config["circuit_breaker_recovery"] = recovery
         if "backoff_max_delay" in updates:
             max_delay = updates["backoff_max_delay"]
             self._backoff = BackoffTimer(base_delay=self._switch_delay, max_delay=max_delay)
+            self._config["backoff_max_delay"] = max_delay
         # Watchdog interval (restart task with new interval)
         if "watchdog_interval" in updates:
             self._config["watchdog_interval"] = updates["watchdog_interval"]
             interval = updates["watchdog_interval"]
-            if interval > 0:
-                self.restart_watchdog(interval)
-            else:
-                self.stop_watchdog()
+            try:
+                if interval and int(interval) > 0:
+                    self.restart_watchdog(int(interval))
+                else:
+                    self.stop_watchdog()
+            except Exception as e:
+                logger.debug("[vpn] watchdog restart failed: %s", e)
 
     def add_server(self, name: str, config_path: str):
         """Add a VPN server to the rotation list."""
