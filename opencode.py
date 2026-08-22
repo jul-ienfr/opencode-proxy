@@ -1749,16 +1749,17 @@ def anthropic_messages_to_responses_input(messages):
             out.append({"type": "function_call_output", "call_id": msg.get("tool_call_id", ""), "output": content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)})
             continue
         parts = []
+        text_type = "output_text" if role == "assistant" else "input_text"
         if isinstance(content, str):
             if content:
-                parts.append({"type": "input_text", "text": content})
+                parts.append({"type": text_type, "text": content})
         elif isinstance(content, list):
             for b in content:
                 if not isinstance(b, dict):
                     continue
                 t = b.get("type", "")
                 if t == "text":
-                    parts.append({"type": "input_text", "text": b.get("text", "")})
+                    parts.append({"type": text_type, "text": b.get("text", "")})
                 elif t == "thinking":
                     continue
                 elif t == "tool_use":
@@ -1855,13 +1856,14 @@ def openai_chat_to_responses_request(chat_body: dict, model: str) -> dict:
             continue
         content = m.get("content", "")
         parts = []
+        text_type = "output_text" if role == "assistant" else "input_text"
         if isinstance(content, str):
             if content:
-                parts.append({"type": "input_text", "text": content})
+                parts.append({"type": text_type, "text": content})
         elif isinstance(content, list):
             for p in content:
                 if isinstance(p, dict) and p.get("type") == "text":
-                    parts.append({"type": "input_text", "text": p.get("text", "")})
+                    parts.append({"type": text_type, "text": p.get("text", "")})
         if m.get("tool_calls"):
             for tc in m["tool_calls"]:
                 fn = tc.get("function", {})
@@ -1875,7 +1877,8 @@ def openai_chat_to_responses_request(chat_body: dict, model: str) -> dict:
         if parts:
             inp.append({"role": role, "content": parts})
         elif not parts and role in ("user", "assistant") and not m.get("tool_calls"):
-            inp.append({"role": role, "content": [{"type": "input_text", "text": ""}]})
+            t = "output_text" if role == "assistant" else "input_text"
+            inp.append({"role": role, "content": [{"type": t, "text": ""}]})
     req = {"model": model, "input": inp}
     if instructions:
         req["instructions"] = instructions
@@ -2036,7 +2039,8 @@ async def _handle_chat_muse_spark_via_responses(req_id, start_time, client_ip, b
         return _openai_error(400, f"Request conversion failed: {e}")
     wants_thinking_rs = (thinking_type != "none" or effort != "none" or body.get("reasoning") is True or body.get("reasoning_effort") not in (None, "none", ""))
     if not is_stream:
-        cache_key_rs = _response_cache.make_key(responses_req)
+        _raw_key = _response_cache.make_key(responses_req)
+        cache_key_rs = f"chat:{_raw_key}" if _raw_key else None
         cached_rs = cache_key_rs and _response_cache.get(cache_key_rs)
         if cached_rs:
             cached_body, cached_headers = cached_rs
@@ -4362,12 +4366,13 @@ async def messages(request: Request):
         # Non-stream path for muse-spark (cache + wants_thinking)
         if not _is_stream_norm:
             wants_thinking_rs = (thinking_type != "none" or effort != "none")
-            # Check cache first
-            cache_key_rs = _response_cache.make_key(responses_req)
+            # Check cache first (isolated by client format)
+            _raw_key = _response_cache.make_key(responses_req)
+            cache_key_rs = f"anthropic:{_raw_key}" if _raw_key else None
             cached_rs = cache_key_rs and _response_cache.get(cache_key_rs)
             if cached_rs:
                 cached_body, cached_headers = cached_rs
-                _log(f"  ← {model_id} | cache HIT (responses)")
+                _log(f"  ← {model_id} | cache HIT (responses-anthropic)")
                 return Response(content=cached_body, headers={**cached_headers, "X-Cache": "HIT"}, media_type="application/json")
             # Gratuit-first via Responses free endpoint
             if _should_try_free(model_id, thinking_type, effort):
