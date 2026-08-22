@@ -1728,26 +1728,30 @@ def _map_reasoning(model: str, effort_level: str) -> dict:
 
 
 def _map_reasoning_responses(model: str, effort_level: str) -> dict:
-    """Mapping for OpenAI Responses API: reasoning -> {effort: lvl}"""
+    """Mapping for OpenAI Responses API: reasoning -> {effort: lvl, summary: auto}
+
+    summary:auto is required to get visible reasoning summary; without it
+    upstream returns only encrypted_content and proxy emits placeholder "(reasoning)".
+    """
     if model.startswith("kimi-k2.6"):
-        _debug(f"  [thinking] {model}: reasoning={{effort: high}} (effort={effort_level}) [responses]")
-        return {"reasoning": {"effort": "high"}}
+        _debug(f"  [thinking] {model}: reasoning={{effort: high, summary: auto}} (effort={effort_level}) [responses]")
+        return {"reasoning": {"effort": "high", "summary": "auto"}}
     elif model.startswith("glm-5"):
         lvl = "high" if effort_level in ("xhigh", "max", "high") else "medium" if effort_level == "medium" else "low"
-        _debug(f"  [thinking] {model}: reasoning={{effort:{lvl}}} (effort={effort_level}) [responses]")
-        return {"reasoning": {"effort": lvl}}
+        _debug(f"  [thinking] {model}: reasoning={{effort:{lvl}, summary: auto}} (effort={effort_level}) [responses]")
+        return {"reasoning": {"effort": lvl, "summary": "auto"}}
     elif model.startswith("deepseek-v4"):
         lvl = "max" if effort_level in ("xhigh", "max") else "high"
-        _debug(f"  [thinking] {model}: reasoning={{effort:{lvl}}} (effort={effort_level}) [responses]")
-        return {"reasoning": {"effort": lvl}}
+        _debug(f"  [thinking] {model}: reasoning={{effort:{lvl}, summary: auto}} (effort={effort_level}) [responses]")
+        return {"reasoning": {"effort": lvl, "summary": "auto"}}
     elif model.startswith("muse-spark"):
         lvl = "xhigh" if effort_level == "xhigh" else "max" if effort_level == "max" else "high" if effort_level == "high" else "medium" if effort_level == "medium" else "low"
-        _debug(f"  [thinking] {model}: reasoning={{effort:{lvl}}} (effort={effort_level}) [muse-spark responses]")
-        return {"reasoning": {"effort": lvl}}
+        _debug(f"  [thinking] {model}: reasoning={{effort:{lvl}, summary: auto}} (effort={effort_level}) [muse-spark responses]")
+        return {"reasoning": {"effort": lvl, "summary": "auto"}}
     else:
         lvl = "high" if effort_level in ("xhigh", "max", "high") else "medium" if effort_level == "medium" else "low"
-        _debug(f"  [thinking] {model}: reasoning={{effort:{lvl}}} (effort={effort_level}) [responses]")
-        return {"reasoning": {"effort": lvl}}
+        _debug(f"  [thinking] {model}: reasoning={{effort:{lvl}, summary: auto}} (effort={effort_level}) [responses]")
+        return {"reasoning": {"effort": lvl, "summary": "auto"}}
 
 
 def _is_muse_spark(model: str) -> bool:
