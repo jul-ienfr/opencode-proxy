@@ -465,17 +465,22 @@ for _model_id, _model_data in _models_cfg.items():
                 _endpoint = API_BASE_OPENAI if _proto == "openai" else API_BASE_ANTHROPIC
         MODELS[_model_id] = {"endpoint": _endpoint, "protocol": _proto}
 
-def _fetch_upstream_models():
-    """Fetch available models from upstream API and add them to MODELS."""
+def _fetch_upstream_models(timeout: float = 3.0):
+    """Fetch available models from upstream API and add them to MODELS.
+
+    Timeout réduit à 3s (vs 10s avant) pour ne pas bloquer le démarrage.
+    Appelé en arrière-plan, jamais bloquant pour le 1er chargement GUI.
+    """
     import subprocess
     try:
         url = f"{API_BASE_OPENAI.rsplit('/chat/completions', 1)[0]}/models"
+        # --max-time 3s + connect 2s : échec rapide si upstream lent
         result = subprocess.run(
-            ["curl", "-s", "--max-time", "10", url],
-            capture_output=True, text=True, timeout=15
+            ["curl", "-s", "--max-time", str(int(timeout)), "--connect-timeout", "2", url],
+            capture_output=True, text=True, timeout=timeout + 2
         )
         if result.returncode != 0:
-            raise Exception(f"curl failed: {result.stderr}")
+            raise Exception(f"curl failed: {result.stderr[:200]}")
         data = json.loads(result.stdout)
         models = data.get("data", [])
         added = 0
@@ -487,10 +492,26 @@ def _fetch_upstream_models():
                 MODELS[model_id] = {"endpoint": endpoint, "protocol": proto}
                 added += 1
         logger.info("[config] upstream models: fetched %d, added %d new", len(models), added)
+        return added
     except Exception as e:
-        logger.warning("[config] upstream models fetch failed: %s", e)
+        logger.debug("[config] upstream models fetch failed (non-bloquant): %s", e)
+        return 0
 
-_fetch_upstream_models()
+
+# Lancement non-bloquant en arrière-plan (daemon thread) — ne retarde pas l'import
+def _fetch_upstream_models_background():
+    try:
+        time.sleep(0.5)
+        _fetch_upstream_models(timeout=3.0)
+    except Exception:
+        pass
+
+try:
+    _bg_thread = threading.Thread(target=_fetch_upstream_models_background, daemon=True, name="upstream-models-fetch")
+    _bg_thread.start()
+    logger.debug("[config] upstream fetch lancé en arrière-plan (3s timeout)")
+except Exception as e:
+    logger.debug("[config] impossible de lancer le thread upstream: %s", e)
 
 # ── Free discovery (auto-detect -free models) ─────────────────────
 FREE_DISCOVERY = yaml_get("free_discovery", default={}) if isinstance(yaml_get("free_discovery", default={}), dict) else {}

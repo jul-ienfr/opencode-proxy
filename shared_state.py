@@ -7,6 +7,7 @@ shared objects like VPN manager and free IP pool.
 """
 
 vpn_manager = None
+vpn_manager_2 = None  # retro-compat alias for station 2 (see vpn_managers)
 free_ip_pool = None
 # Cross-station shared rotation registry (SharedRotationState) — created by
 # opencode.py's lifespan once the VPN subsystem boots (None before then).

@@ -2959,7 +2959,10 @@ def _on_free_429_stream(free_model: str, retry_after: str = "",
     station = _free_attempt_station()
     _set_free_cooldown(free_model, _free_429_cooldown_seconds(retry_after), station)
     if _free_ip_pool:
-        _free_ip_pool.on_quota_exhausted(station, forced_pool=forced_pool)
+        try:
+            _free_ip_pool.on_quota_exhausted(station, forced_pool=forced_pool)
+        except TypeError:
+            _free_ip_pool.on_quota_exhausted(station)
     return bool(IP_ROTATION.get("strict_free", False)) and _free_stations_exhausted(free_model)
 
 
@@ -3180,7 +3183,10 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
                                        _free_429_cooldown_seconds(resp.headers.get('retry-after', '') or ''),
                                        attempt)
                     if _free_ip_pool:
-                        _free_ip_pool.on_quota_exhausted(attempt, forced_pool=forced_pool)
+                        try:
+                            _free_ip_pool.on_quota_exhausted(attempt, forced_pool=forced_pool)
+                        except TypeError:
+                            _free_ip_pool.on_quota_exhausted(attempt)
                     _log(f"  FREE {free_model!r} RATE LIMITED (429) on station {attempt._station} → "
                          f"retry station fraîche (essai {_free_used + 1}/{free_max})")
                     resp = None
@@ -3298,7 +3304,10 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
         # multi-attempt loop — idempotent here.)
         _set_free_cooldown(free_model, _free_429_cooldown_seconds(retry_after), station)
         if _free_ip_pool:
-            _free_ip_pool.on_quota_exhausted(station, forced_pool=forced_pool)
+            try:
+                _free_ip_pool.on_quota_exhausted(station, forced_pool=forced_pool)
+            except TypeError:
+                _free_ip_pool.on_quota_exhausted(station)
 
         # strict_free (GUI): when EVERY station is exhausted, refuse
         # instead of paying — the caller answers 429/503 with Retry-After.
@@ -4705,7 +4714,7 @@ def anthropic_to_openai_responses(anthro: dict, model: str) -> dict:
         elif btype == "tool_use":
             function_calls.append({
                 "type": "function_call",
-                "id": block.get("id", f"call_{uuid.uuid4().hex[:12]}"),
+                "call_id": block.get("id", f"call_{uuid.uuid4().hex[:12]}"),
                 "name": block.get("name", ""),
                 "arguments": json.dumps(block.get("input", {}), ensure_ascii=False),
                 "status": "completed",
@@ -4776,7 +4785,7 @@ def openai_chat_to_responses(chat_resp: dict, model: str) -> dict:
         fn = tc.get("function", {})
         output_items.append({
             "type": "function_call",
-            "id": tc.get("id", f"call_{uuid.uuid4().hex[:12]}"),
+            "call_id": tc.get("id", f"call_{uuid.uuid4().hex[:12]}"),
             "name": fn.get("name", ""),
             "arguments": fn.get("arguments", "{}"),
             "status": "completed",
@@ -4835,7 +4844,7 @@ def _chat_to_responses_request(chat: dict) -> dict:
                 inp.append(item)
         for tc in m.get("tool_calls", []) or []:
             fn = tc.get("function", {}) if isinstance(tc.get("function"), dict) else {}
-            inp.append({"type": "function_call", "id": tc.get("id", ""), "name": fn.get("name", ""), "arguments": fn.get("arguments", "{}")})
+            inp.append({"type": "function_call", "call_id": tc.get("call_id", tc.get("id", "")), "name": fn.get("name", ""), "arguments": fn.get("arguments", "{}")})
         if role == "tool":
             cid = m.get("tool_call_id", "")
             if not cid:
@@ -4853,9 +4862,9 @@ def _chat_to_responses_request(chat: dict) -> dict:
     # Forward reasoning parameters to Responses API format
     if "reasoning_effort" in chat:
         effort = chat["reasoning_effort"]
-        # "auto" returns encrypted_content (unusable by proxy); "concise" forces
-        # plaintext summary that _responses_to_anthropic_response can convert.
-        req["reasoning"] = {"summary": "concise", "effort": effort}
+        # summary:auto is required to get visible reasoning summary; without it
+        # upstream returns only encrypted_content and proxy emits placeholder.
+        req["reasoning"] = {"summary": "auto", "effort": effort}
     elif "reasoning" in chat:
         req["reasoning"] = chat["reasoning"]
     if "tools" in chat:
@@ -4897,7 +4906,7 @@ def _responses_to_chat_response(resp: dict, model: str) -> dict:
                 if isinstance(s, dict):
                     reasoning += s.get("text", "")
         elif item.get("type") == "function_call":
-            tool_calls.append({"id": item.get("id", ""), "type": "function", "function": {"name": item.get("name", ""), "arguments": item.get("arguments", "{}")}})
+            tool_calls.append({"id": item.get("call_id", item.get("id", "")), "type": "function", "function": {"name": item.get("name", ""), "arguments": item.get("arguments", "{}")}})
     msg = {"role": "assistant", "content": "\n".join(texts)}
     if reasoning:
         msg["reasoning_content"] = reasoning
@@ -4933,7 +4942,7 @@ def _responses_to_anthropic_response(resp: dict, model: str) -> dict:
                 inp = json.loads(item.get("arguments", "{}"))
             except Exception:
                 inp = {}
-            blocks.append({"type": "tool_use", "id": item.get("id", ""), "name": item.get("name", ""), "input": inp})
+            blocks.append({"type": "tool_use", "id": item.get("call_id", item.get("id", "")), "name": item.get("name", ""), "input": inp})
     if not blocks:
         blocks.append({"type": "text", "text": ""})
     usage = resp.get("usage", {}) if isinstance(resp.get("usage"), dict) else {}
