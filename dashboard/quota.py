@@ -35,7 +35,8 @@ async def _get_http_client() -> httpx.AsyncClient:
     """Get or create a shared httpx client for the quota fetcher."""
     global _http_client
     if _http_client is None or _http_client.is_closed:
-        _http_client = httpx.AsyncClient(timeout=30, follow_redirects=True)
+        # Timeout réduit de 30s à 8s pour le 1er chargement GUI (évite minutes d'attente)
+        _http_client = httpx.AsyncClient(timeout=8, follow_redirects=True)
     return _http_client
 
 # ── Env var validation ──
@@ -658,29 +659,59 @@ async def start_quota_fetcher(app):
     """
     logger.debug("[quota] start_quota_fetcher called")
 
-    # Fetch model limits + available models on startup
+    # Fetch model limits + available models on startup (parallèle, non-bloquant)
     async def _startup_fetch():
         global _models_cache
 
-        # Model limits from docs
-        try:
-            limits = await fetch_model_limits()
-            async with _get_model_limits_lock():
-                global _model_limits_cache
-                _model_limits_cache = limits
-        except Exception:
-            logger.info("Using fallback model limits (docs fetch failed)")
+        async def _fetch_limits_safe():
+            try:
+                return await asyncio.wait_for(fetch_model_limits(), timeout=4.0)
+            except asyncio.TimeoutError:
+                logger.debug("[quota] docs fetch timeout (4s) — fallback")
+                return None
+            except Exception as e:
+                logger.debug("[quota] docs fetch failed: %s", e)
+                return None
 
-        # Available models from upstream
-        try:
-            models = await fetch_available_models()
+        async def _fetch_models_safe():
+            try:
+                return await asyncio.wait_for(fetch_available_models(), timeout=4.0)
+            except asyncio.TimeoutError:
+                logger.debug("[quota] models fetch timeout (4s)")
+                return None
+            except Exception as e:
+                logger.debug("[quota] models fetch failed: %s", e)
+                return None
+
+        limits, models = await asyncio.gather(_fetch_limits_safe(), _fetch_models_safe())
+
+        if limits is not None:
+            try:
+                async with _get_model_limits_lock():
+                    global _model_limits_cache
+                    _model_limits_cache = limits
+            except Exception:
+                pass
+        else:
+            logger.info("Using fallback model limits (docs fetch failed/timeout)")
+
+        if models is not None:
             _models_cache = models
             logger.debug("[quota] discovered %d models from upstream", len(models))
             logger.info("Discovered %d models from upstream", len(models))
-        except Exception:
-            logger.info("Using local models only (upstream fetch failed)")
+        else:
+            logger.info("Using local models only (upstream fetch failed/timeout)")
 
-    await _startup_fetch()
+    # Lance en arrière-plan sans bloquer le lifespan (ne retarde pas le 1er GET /api/config)
+    try:
+        asyncio.create_task(_startup_fetch())
+        logger.debug("[quota] startup fetch lancé en arrière-plan (parallèle 4s)")
+    except Exception as e:
+        logger.debug("[quota] impossible de lancer startup fetch: %s", e)
+        try:
+            await asyncio.wait_for(_startup_fetch(), timeout=4.5)
+        except Exception:
+            pass
 
     async def _poll():
         while True:

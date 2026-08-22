@@ -335,8 +335,30 @@ def _persist_vpn_config(updates: dict):
 
         if changed:
             config["ip_rotation"] = ip_rot
-            with open(config_path, "w", encoding="utf-8") as f:
-                yaml.dump(config, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+            # Atomic write via tempfile + fsync + replace (fiabilise sur panne disque)
+            import tempfile
+            try:
+                dir_name = os.path.dirname(config_path) or "."
+                fd, tmp_path = tempfile.mkstemp(dir=dir_name, prefix=".config.yaml.tmp.")
+                try:
+                    with os.fdopen(fd, "w", encoding="utf-8") as f:
+                        yaml.dump(config, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+                        f.flush()
+                        try:
+                            os.fsync(f.fileno())
+                        except OSError:
+                            pass
+                    os.replace(tmp_path, config_path)
+                finally:
+                    try:
+                        if os.path.exists(tmp_path):
+                            os.remove(tmp_path)
+                    except Exception:
+                        pass
+            except Exception:
+                # Fallback non-atomique
+                with open(config_path, "w", encoding="utf-8") as f:
+                    yaml.dump(config, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
             # [32] keep the in-memory mirror in sync — otherwise the next
             # settings.yaml_set() re-dumps the stale _yaml_data and reverts
             # what we just wrote to disk.
@@ -350,6 +372,30 @@ def _persist_vpn_config(updates: dict):
                     cur.update(ip_rot)
                 else:
                     _st._yaml_data["ip_rotation"] = dict(ip_rot)
+            except Exception:
+                pass
+            # Best-effort hot-reload des managers pour appels directs (tests, SSE)
+            try:
+                import shared_state
+                mgrs = getattr(shared_state, 'vpn_managers', None) or []
+                if not mgrs and getattr(shared_state, 'vpn_manager', None):
+                    mgrs = [shared_state.vpn_manager]
+                for m in mgrs:
+                    if m and hasattr(m, '_config'):
+                        for k in updates:
+                            if k in key_map:
+                                yaml_key = key_map[k]
+                                if yaml_key in ip_rot:
+                                    m._config[yaml_key] = ip_rot[yaml_key]
+                        if "circuit_breaker_threshold" in updates or "circuit_breaker_recovery" in updates:
+                            try:
+                                from vpn_manager import CircuitBreaker
+                                m._circuit_breaker = CircuitBreaker(
+                                    failure_threshold=m._config.get("circuit_breaker_threshold", 3),
+                                    recovery_time=m._config.get("circuit_breaker_recovery", 300),
+                                )
+                            except Exception:
+                                pass
             except Exception:
                 pass
             _debug(f"  [vpn] config persisted to {config_path}")

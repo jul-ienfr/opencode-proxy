@@ -1170,10 +1170,14 @@ async def lifespan(app):
     # Start background quota fetcher (no-op if env vars not set)
     await start_quota_fetcher(app)
 
-    # Toggle "Use Balance" on for all workspaces (so Go falls back to Zen balance)
+    # Toggle "Use Balance" on for all workspaces (non-bloquant, 6s max)
     try:
         from dashboard import toggle_use_balance_all
-        balance_results = await toggle_use_balance_all()
+        try:
+            balance_results = await asyncio.wait_for(toggle_use_balance_all(), timeout=6.0)
+        except asyncio.TimeoutError:
+            _debug("  [lifespan] use-balance toggle timeout (6s) — non-bloquant")
+            balance_results = {}
         if balance_results:
             ok = sum(1 for v in balance_results.values() if v)
             _debug(f"  [lifespan] use-balance toggle: {ok}/{len(balance_results)} workspaces enabled")
