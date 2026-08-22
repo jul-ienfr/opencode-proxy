@@ -799,6 +799,10 @@ def _apply_discovered_free_models(free_ids: set, source: str = "none") -> int:
             fallback = FREE_MODEL_POOL[0] if FREE_MODEL_POOL else dt
             logger.warning("[free-discovery] default_target %r not in FREE_MODELS — fallback %r", dt, fallback)
         logger.info("[free-discovery] fetched %d free ids, added %d new MODELS, source=%s", len(free_ids), added, source)
+        try:
+            get_model_config.cache_clear()
+        except Exception:
+            pass
     finally:
         if lock is not None:
             try:
@@ -1131,8 +1135,11 @@ def maybe_reload_custom_routes():
         logging.warning("Failed to reload config: %s", e)
 
 
+from functools import lru_cache as _lru_cache
+
+@_lru_cache(maxsize=512)
 def get_model_config(model_id: str) -> dict:
-    """Return merged config for model_id with sensible defaults."""
+    """Return merged config for model_id with sensible defaults (LRU cached)."""
     cfg = MODELS.get(model_id, {})
     defaults = {"endpoint": API_BASE_OPENAI, "protocol": "openai"}
     return {**defaults, **cfg}

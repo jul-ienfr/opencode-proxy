@@ -3905,10 +3905,18 @@ async def _sse_keepalive(stream_gen, interval: float = _SSE_KEEPALIVE_INTERVAL):
             read_task.cancel()
 
 
+# ── Routing fast cache (O(1) exact + substring) ──
+_route_cache: dict[str, dict | None] = {}
+_ROUTE_CACHE_MAX = 2048
+
 def _route_for(model_name: str) -> dict | None:
+    cache_key = model_name.lower().strip()
+    if cache_key in _route_cache:
+        return _route_cache[cache_key]
     maybe_reload_custom_routes()
     name = model_name.lower().strip()
     if not name:
+        _route_cache[cache_key] = None
         return None
     # When DISABLE_MAPPING, only check custom routes (not auto-generated aliases)
     if DISABLE_MAPPING:
@@ -3949,6 +3957,9 @@ def _route_for(model_name: str) -> dict | None:
         if r.get("enabled") is False:
             continue
         if any(m in name for m in r.get("match", [])):
+            if len(_route_cache) >= _ROUTE_CACHE_MAX:
+                _route_cache.clear()
+            _route_cache[cache_key] = r
             _debug(f"  [route] model match: {r.get('model')} (pattern in '{name}')")
             return r
     # 3. Wildcard catch-all: if a custom route "*" (or legacy "") exists, use it
