@@ -5115,10 +5115,17 @@ async def chat_completions(request: Request):
 
     thinking_raw = body.get("thinking") if isinstance(body.get("thinking"), dict) else {}
     thinking_type = thinking_raw.get("type", "none") if isinstance(thinking_raw, dict) and thinking_raw else "none"
+    _openai_reasoning_effort = body.get("reasoning_effort")
+    _openai_reasoning_flag = body.get("reasoning")
     effort = (body.get("effort")
               or (thinking_raw.get("effort") if isinstance(thinking_raw, dict) else None)
               or (body.get("output_config", {}).get("effort") if isinstance(body.get("output_config"), dict) else None)
+              or _openai_reasoning_effort
+              or ("high" if _openai_reasoning_flag is True else None)
               or "none")
+    # OpenAI chat reasoning implies thinking
+    if thinking_type == "none" and (_openai_reasoning_effort or _openai_reasoning_flag is True):
+        thinking_type = "enabled"
 
     # Filter tools based on model capabilities
     tool_names = _filter_tools_for_model(body, model_id)
