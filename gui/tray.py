@@ -57,9 +57,13 @@ class TrayApp:
 
     def _on_copy_api_url(self, icon, item):
         import subprocess
+        import sys
         url = self._api_url()
         try:
-            subprocess.run(["clip"], input=url.encode(), check=True, capture_output=True)
+            kwargs = {}
+            if sys.platform == "win32" and hasattr(subprocess, "CREATE_NO_WINDOW"):
+                kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+            subprocess.run(["clip"], input=url.encode(), check=True, capture_output=True, **kwargs)
         except Exception:
             pass
 

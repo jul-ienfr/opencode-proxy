@@ -133,7 +133,7 @@ ip_rotation:
   enabled: true
   proxy_mode: vpn
   dual_station: true
-  station_count: 3
+  station_count: 5
   strict_free: false
   quota_per_ip: 500
   switch_delay: 1

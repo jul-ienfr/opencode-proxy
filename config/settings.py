@@ -1,4 +1,6 @@
 import os
+import sys
+import subprocess
 import json
 import logging
 import time
@@ -6,6 +8,9 @@ import re
 import random
 import threading
 import tempfile
+
+# Windows: masquer la fenêtre console des subprocess (évite le flash noir 1s)
+_CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
 
 try:
     from vpn_manager import _normalize_country as _vpn_normalize_country  # single source (no duplication)
@@ -93,6 +98,18 @@ def save_yaml_config():
         try:
             globals()["_config_yaml_mtime"] = os.path.getmtime(CONFIG_PATH)
         except OSError:
+            pass
+        # [fix dirty-banner] keep dashboard's mtime in sync for background saves
+        # (free-discovery, geo) — otherwise dashboard/config_yaml_dirty stays true
+        # after every auto-persist even though file was written by the proxy itself.
+        try:
+            import dashboard.api as _dash  # may not be imported yet at boot
+            if hasattr(_dash, "_config_yaml_known_mtime"):
+                try:
+                    _dash._config_yaml_known_mtime = os.path.getmtime(CONFIG_PATH)
+                except OSError:
+                    pass
+        except Exception:
             pass
         logger.debug("[config] saved config.yaml (atomic)")
     finally:
@@ -471,13 +488,13 @@ def _fetch_upstream_models(timeout: float = 3.0):
     Timeout réduit à 3s (vs 10s avant) pour ne pas bloquer le démarrage.
     Appelé en arrière-plan, jamais bloquant pour le 1er chargement GUI.
     """
-    import subprocess
     try:
         url = f"{API_BASE_OPENAI.rsplit('/chat/completions', 1)[0]}/models"
         # --max-time 3s + connect 2s : échec rapide si upstream lent
         result = subprocess.run(
             ["curl", "-s", "--max-time", str(int(timeout)), "--connect-timeout", "2", url],
-            capture_output=True, text=True, timeout=timeout + 2
+            capture_output=True, text=True, timeout=timeout + 2,
+            creationflags=_CREATE_NO_WINDOW,
         )
         if result.returncode != 0:
             raise Exception(f"curl failed: {result.stderr[:200]}")
@@ -616,10 +633,10 @@ def _fetch_free_models_sync(timeout: float = 10) -> tuple:
                     import httpx as _httpx
                 except ImportError:
                     # Fallback to curl subprocess (Windows may lack curl but try)
-                    import subprocess as _sp
                     import json as _json
-                    r = _sp.run(["curl", "-s", "--max-time", str(int(timeout)), url],
-                                capture_output=True, text=True, timeout=timeout + 5)
+                    r = subprocess.run(["curl", "-s", "--max-time", str(int(timeout)), url],
+                                       capture_output=True, text=True, timeout=timeout + 5,
+                                       creationflags=_CREATE_NO_WINDOW)
                     if r.returncode != 0:
                         raise RuntimeError(f"curl failed: {r.stderr[:200]}")
                     data = _json.loads(r.stdout)

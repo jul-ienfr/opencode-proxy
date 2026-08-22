@@ -33,6 +33,16 @@ if errorlevel 1 (
 echo Lancement du proxy OpenCode...
 echo API + Dashboard: http://localhost:4000
 echo.
-python opencode.py
 
-pause
+REM -- Lancement silencieux : pythonw n'ouvre aucune fenetre MS-DOS,
+REM    et les appels docker/curl/wsl internes utilisent CREATE_NO_WINDOW
+REM    (config/settings.py, dashboard/api.py, vpn_manager.py).
+REM    Si pythonw est absent, on retombe sur python (fenetre console).
+where pythonw >nul 2>nul
+if %errorlevel%==0 (
+    echo   ^> pythonw detecte : lancement sans fenetre MS-DOS...
+    start "" pythonw opencode.py
+) else (
+    python opencode.py
+    pause
+)

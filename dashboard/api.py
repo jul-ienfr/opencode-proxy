@@ -4,6 +4,7 @@ Dashboard API endpoints: stats, logs, history, config, static files.
 
 import json
 import os
+import sys
 import time
 import asyncio
 import hmac
@@ -11,6 +12,11 @@ import re
 import socket
 import subprocess
 import threading
+
+# Windows: masquer la fenêtre console des subprocess (évite le flash noir 1s)
+_CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
+if hasattr(subprocess, "CREATE_NO_WINDOW"):
+    _CREATE_NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 from datetime import datetime, timedelta, timezone
 from fastapi import Request, Response
 from fastapi.responses import StreamingResponse, JSONResponse
@@ -252,6 +258,7 @@ _persist_lock = __import__("threading").Lock()
 
 def _persist_vpn_config(updates: dict):
     """Persist VPN config changes to config.yaml (non-blocking, best-effort). [32]"""
+    global _config_yaml_known_mtime
     try:
         import yaml
         config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "config.yaml")
@@ -400,6 +407,12 @@ def _persist_vpn_config(updates: dict):
                 pass
             _debug(f"  [vpn] config persisted to {config_path}")
             _config_yaml_known_mtime = _config_yaml_mtime()
+            # keep config/settings mtime in sync so maybe_reload doesn't refire
+            try:
+                from config import settings as _st2
+                _st2._config_yaml_mtime = _config_yaml_known_mtime
+            except Exception:
+                pass
 
     except Exception as e:
         _debug(f"  [vpn] failed to persist config: {e}")
@@ -427,6 +440,11 @@ def _persist_free_model_map(mapping: dict):
         # [Axe 3.4] dashboard wrote the file → not manually dirty.
         global _config_yaml_known_mtime
         _config_yaml_known_mtime = _config_yaml_mtime()
+        try:
+            from config import settings as _st2
+            _st2._config_yaml_mtime = _config_yaml_known_mtime
+        except Exception:
+            pass
     except Exception as e:
         _debug(f"  [free] failed to persist free_model_map: {e}")
 
@@ -783,7 +801,8 @@ def _docker_diag() -> dict:
     try:
         r = subprocess.run(
             ["docker", "version", "--format", "{{.Server.Version}}"],
-            capture_output=True, text=True, timeout=10)
+            capture_output=True, text=True, timeout=10,
+            creationflags=_CREATE_NO_WINDOW)
         if r.returncode == 0:
             diag["available"] = True
             diag["version"] = (r.stdout or r.stderr).strip() or None
@@ -793,7 +812,8 @@ def _docker_diag() -> dict:
     try:
         info = subprocess.run(
             ["docker", "info", "--format", "{{.ServerVersion}}"],
-            capture_output=True, text=True, timeout=10)
+            capture_output=True, text=True, timeout=10,
+            creationflags=_CREATE_NO_WINDOW)
         diag["running"] = info.returncode == 0
     except Exception:
         diag["running"] = False
@@ -815,7 +835,8 @@ def _docker_compose_config() -> list:
             continue
         try:
             r = subprocess.run(["docker", "compose", "-f", df, "config"],
-                               capture_output=True, text=True, timeout=15)
+                               capture_output=True, text=True, timeout=15,
+                               creationflags=_CREATE_NO_WINDOW)
             out.append(f"=== {df}\n{(r.stdout or r.stderr).strip()}")
         except Exception as e:
             out.append(f"=== {df}\n(erreur: {e})")
@@ -2594,7 +2615,8 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
             r = await asyncio.to_thread(
                 lambda: subprocess.run(["wsl", "--status"],
                                        capture_output=True, text=True,
-                                       timeout=5))
+                                       timeout=5,
+                                       creationflags=_CREATE_NO_WINDOW))
             wsl2["available"] = r.returncode == 0
         except Exception:
             pass
@@ -2625,6 +2647,8 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
             "recommendation": rec,
             "config_yaml_dirty": (
                 _config_yaml_mtime() != _config_yaml_known_mtime),
+            "config_yaml_mtime": _config_yaml_mtime(),
+            "config_yaml_known": _config_yaml_known_mtime,
             "compose_config": await asyncio.to_thread(_docker_compose_config),
         }
 

@@ -1016,7 +1016,7 @@ async def _apply_station_count(new_n: int) -> None:
         shared_state.vpn_manager = managers[0]
         shared_state.vpn_manager_2 = managers[1] if new_n >= 2 else None
         from dashboard.api import _persist_vpn_config
-        await _persist_vpn_config({"station_count": new_n})
+        _persist_vpn_config({"station_count": new_n})
         _debug(f"  [vpn] station_count hot-reload {old_n} → {new_n} "
                f"({len(managers)} active)")
 

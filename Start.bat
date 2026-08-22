@@ -12,5 +12,10 @@ if errorlevel 1 (
     )
 )
 
-REM --- Lancer le proxy ---
-python opencode.py
+REM --- Lancer le proxy (silencieux : pythonw = aucune fenetre MS-DOS) ---
+where pythonw >nul 2>nul
+if %errorlevel%==0 (
+    start "" /B pythonw opencode.py
+) else (
+    python opencode.py
+)
