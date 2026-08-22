@@ -43,3 +43,6 @@ credentials.txt
 venv/
 env/
 ENV/
+
+.kilo/
+.kilo
