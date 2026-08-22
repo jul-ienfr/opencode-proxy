@@ -1934,6 +1934,68 @@ def responses_output_to_anthropic_content(output, model="", wants_thinking=True)
     return blocks
 
 
+def responses_to_chat(resp: dict, original_model: str, wants_thinking=True) -> dict:
+    """Convert Responses API response to OpenAI Chat Completions response."""
+    output = resp.get("output", [])
+    # Build reasoning_content and content/text
+    reasoning_text = ""
+    text_parts = []
+    tool_calls = []
+    for item in output or []:
+        if not isinstance(item, dict):
+            continue
+        itype = item.get("type", "")
+        if itype == "reasoning" and wants_thinking:
+            summary = item.get("summary") or []
+            txt = "".join(s.get("text", "") for s in summary if isinstance(s, dict))
+            if not txt:
+                txt = "(reasoning)"
+            reasoning_text = txt
+        elif itype == "message":
+            for c in item.get("content") or []:
+                if c.get("type") in ("output_text", "text"):
+                    text_parts.append(c.get("text", ""))
+        elif itype == "function_call":
+            try:
+                args = item.get("arguments", "{}")
+                # ensure string
+                if not isinstance(args, str):
+                    args = json.dumps(args, ensure_ascii=False)
+            except Exception:
+                args = "{}"
+            tool_calls.append({"id": item.get("id", f"call_{uuid.uuid4().hex[:8]}"), "type": "function", "function": {"name": item.get("name", ""), "arguments": args}})
+    # Fallback: if no message item but text in other
+    content_text = "\n".join(text_parts)
+    usage = resp.get("usage", {})
+    prompt_tokens = usage.get("input_tokens", 0)
+    completion_tokens = usage.get("output_tokens", 0)
+    cache = usage.get("input_tokens_details", {}).get("cached_tokens", 0) if isinstance(usage.get("input_tokens_details"), dict) else 0
+    oai_usage = {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens, "total_tokens": prompt_tokens + completion_tokens}
+    if cache:
+        oai_usage["prompt_tokens_details"] = {"cached_tokens": cache}
+    status = resp.get("status", "completed")
+    # stop reason mapping
+    if status == "incomplete":
+        finish = "length"
+    elif tool_calls:
+        finish = "tool_calls"
+    else:
+        finish = "stop"
+    message = {"role": "assistant", "content": content_text}
+    if reasoning_text and wants_thinking:
+        message["reasoning_content"] = reasoning_text
+    if tool_calls:
+        message["tool_calls"] = tool_calls
+    return {
+        "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": original_model,
+        "choices": [{"index": 0, "message": message, "finish_reason": finish}],
+        "usage": oai_usage,
+    }
+
+
 def responses_to_anthropic(resp: dict, original_model: str, wants_thinking=True) -> dict:
     """Convert Responses API response to Anthropic Messages response."""
     output = resp.get("output", [])
@@ -1959,6 +2021,168 @@ def responses_to_anthropic(resp: dict, original_model: str, wants_thinking=True)
         "stop_sequence": None,
         "usage": {"input_tokens": in_t, "output_tokens": out_t, "cache_read_input_tokens": cache}
     }
+
+
+# helper for chat muse-spark via Responses
+async def _handle_chat_muse_spark_via_responses(req_id, start_time, client_ip, body, model_id, original_model, thinking_type, effort, tool_names, request_body, is_stream, endpoint, protocol):
+    # This helper is called from chat_completions when _is_muse_spark true
+    # It routes via Responses API systematically
+    try:
+        responses_req = openai_chat_to_responses_request(body, model_id)
+        responses_req = ensure_min_tokens(responses_req)
+        _debug(f"[chat] muse-spark routed to Responses (openai client): {_truncate(responses_req, 2000)}")
+    except Exception as e:
+        _debug(f"[chat] x responses conversion failed: {e}")
+        return _openai_error(400, f"Request conversion failed: {e}")
+    wants_thinking_rs = (thinking_type != "none" or effort != "none" or body.get("reasoning") is True or body.get("reasoning_effort") not in (None, "none", ""))
+    if not is_stream:
+        cache_key_rs = _response_cache.make_key(responses_req)
+        cached_rs = cache_key_rs and _response_cache.get(cache_key_rs)
+        if cached_rs:
+            cached_body, cached_headers = cached_rs
+            _log(f"  <- {model_id} | cache HIT (responses-chat)")
+            return Response(content=cached_body, headers={**cached_headers, "X-Cache": "HIT"}, media_type="application/json")
+        if _should_try_free(model_id, thinking_type, effort):
+            free_resp = await _try_free_responses_first(responses_req, {}, model_id)
+            if free_resp is not None:
+                resp, _, _actual_model, _actual_ip = free_resp
+                data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+                chat_resp = responses_to_chat(data, original_model, wants_thinking=wants_thinking_rs)
+                usage = chat_resp.get("usage", {})
+                req_in = usage.get("prompt_tokens", 0)
+                req_out = usage.get("completion_tokens", 0)
+                cache = _extract_cache_tokens(usage)
+                _update_token_usage(_actual_model, req_in, req_out, cache)
+                used = [tc["function"]["name"] for tc in chat_resp.get("choices", [{}])[0].get("message", {}).get("tool_calls", [])]
+                await _save_and_log_request(req_id, _actual_model, original_model, start_time, req_in, req_out, cache, protocol, False, thinking_type, effort, client_ip, "free (no auth)", tool_names, tools_used=used, request_body=request_body, response_body=data, free_model_ip=_actual_ip)
+                body_b = json.dumps(chat_resp, ensure_ascii=False).encode()
+                if cache_key_rs:
+                    _response_cache.put(cache_key_rs, body_b, {"Content-Type": "application/json"})
+                return Response(content=body_b, headers={"X-Cache": "MISS"}, media_type="application/json")
+        try:
+            headers_rs = _get_auth_headers("openai")
+        except AllKeysPausedError as e:
+            retry_after = int(e.retry_after) + 1
+            return Response(content=json.dumps({"error": {"message": f"All API keys exhausted. Retry after {retry_after}s.", "type": "api_error", "code": "503"}}), status_code=503, media_type="application/json", headers={"Retry-After": str(retry_after)})
+        try:
+            from config import API_BASE_RESPONSES as _paid_ep
+            paid_ep = _paid_ep
+        except Exception:
+            paid_ep = "https://opencode.ai/zen/go/v1/responses"
+        try:
+            resp, headers_rs = await _do_request_with_retry(paid_ep, responses_req, headers_rs, "openai")
+        except UpstreamError as e:
+            return JSONResponse(status_code=e.status_code, content={"error": str(e)})
+        account_alias = _alias_for_key(_key_from_headers(headers_rs, "openai"))
+        if resp.status_code != 200:
+            await _log_and_save_error(req_id, model_id, original_model, start_time, resp.status_code, resp.text, protocol, is_stream, thinking_type, effort, client_ip, account_alias, tool_names, request_body=request_body, response_body={"error": resp.text[:2000]})
+            return Response(content=resp.content, status_code=resp.status_code, media_type="application/json")
+        try:
+            data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+        except Exception:
+            return _openai_error(502, "Upstream returned non-JSON response")
+        chat_resp = responses_to_chat(data, original_model, wants_thinking=wants_thinking_rs)
+        usage = chat_resp.get("usage", {})
+        req_in = usage.get("prompt_tokens", 0)
+        req_out = usage.get("completion_tokens", 0)
+        cache = _extract_cache_tokens(usage)
+        _update_token_usage(model_id, req_in, req_out, cache)
+        used = [tc["function"]["name"] for tc in chat_resp.get("choices", [{}])[0].get("message", {}).get("tool_calls", [])]
+        await _save_and_log_request(req_id, model_id, original_model, start_time, req_in, req_out, cache, protocol, False, thinking_type, effort, client_ip, account_alias, tool_names, tools_used=used if used else None, request_body=request_body, response_body=data)
+        body_b = json.dumps(chat_resp, ensure_ascii=False).encode()
+        if cache_key_rs:
+            _response_cache.put(cache_key_rs, body_b, {"Content-Type": "application/json"})
+        return Response(content=body_b, headers={"X-Cache": "MISS"}, media_type="application/json")
+    # Streaming
+    _debug(f"  [chat] muse-spark streaming via Responses collect-then-emit (is_stream={is_stream})")
+    async def muse_spark_chat_stream(headers_rs):
+        responses_req_s = dict(responses_req)
+        responses_req_s["stream"] = False
+        data = None
+        actual_model = model_id
+        account_alias_s = ""
+        if _should_try_free(model_id, thinking_type, effort):
+            free_resp = await _try_free_responses_first(responses_req_s, {}, model_id)
+            if free_resp is not None:
+                resp_f, _, _actual_model, _actual_ip = free_resp
+                data = resp_f.json() if resp_f.headers.get("content-type", "").startswith("application/json") else {}
+                actual_model = _actual_model
+                account_alias_s = "free (no auth)"
+            else:
+                try:
+                    headers_tmp = _get_auth_headers("openai")
+                except AllKeysPausedError:
+                    data = None
+                if data is None:
+                    try:
+                        from config import API_BASE_RESPONSES as _paid2
+                        paid2 = _paid2
+                    except Exception:
+                        paid2 = "https://opencode.ai/zen/go/v1/responses"
+                    try:
+                        resp_p, headers_tmp = await _do_request_with_retry(paid2, responses_req_s, headers_tmp, "openai")
+                        if resp_p.status_code == 200:
+                            data = resp_p.json() if resp_p.headers.get("content-type", "").startswith("application/json") else {}
+                            account_alias_s = _alias_for_key(_key_from_headers(headers_tmp, "openai"))
+                        else:
+                            yield b"data: " + json.dumps({"error": {"message": f"HTTP {resp_p.status_code}"}}, ensure_ascii=False).encode() + b"\n\ndata: [DONE]\n\n"
+                            return
+                    except UpstreamError as e:
+                        yield b"data: " + json.dumps({"error": {"message": str(e)}}, ensure_ascii=False).encode() + b"\n\ndata: [DONE]\n\n"
+                        return
+        else:
+            try:
+                headers_tmp = _get_auth_headers("openai")
+                from config import API_BASE_RESPONSES as _paid3
+                paid3 = _paid3
+            except Exception:
+                paid3 = "https://opencode.ai/zen/go/v1/responses"
+            try:
+                resp_p, headers_tmp = await _do_request_with_retry(paid3, responses_req_s, headers_tmp, "openai")
+                if resp_p.status_code == 200:
+                    data = resp_p.json() if resp_p.headers.get("content-type", "").startswith("application/json") else {}
+                    account_alias_s = _alias_for_key(_key_from_headers(headers_tmp, "openai"))
+                else:
+                    yield b"data: " + json.dumps({"error": {"message": f"HTTP {resp_p.status_code}"}}, ensure_ascii=False).encode() + b"\n\ndata: [DONE]\n\n"
+                    return
+            except UpstreamError as e:
+                yield b"data: " + json.dumps({"error": {"message": str(e)}}, ensure_ascii=False).encode() + b"\n\ndata: [DONE]\n\n"
+                return
+        if data is None:
+            yield b"data: " + json.dumps({"error": {"message": "No data"}}, ensure_ascii=False).encode() + b"\n\ndata: [DONE]\n\n"
+            return
+        chat_resp = responses_to_chat(data, original_model, wants_thinking=wants_thinking_rs)
+        usage = chat_resp.get("usage", {})
+        req_in = usage.get("prompt_tokens", 0)
+        req_out = usage.get("completion_tokens", 0)
+        cache = _extract_cache_tokens(usage)
+        _update_token_usage(actual_model, req_in, req_out, cache)
+        _id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+        _created = int(time.time())
+        msg = chat_resp.get("choices", [{}])[0].get("message", {})
+        reasoning = msg.get("reasoning_content", "")
+        content = msg.get("content", "")
+        if reasoning and wants_thinking_rs:
+            chunk = {"id": _id, "object": "chat.completion.chunk", "created": _created, "model": original_model, "choices": [{"index": 0, "delta": {"reasoning_content": reasoning}, "finish_reason": None}]}
+            yield b"data: " + json.dumps(chunk, ensure_ascii=False).encode() + b"\n\n"
+        if content:
+            chunk = {"id": _id, "object": "chat.completion.chunk", "created": _created, "model": original_model, "choices": [{"index": 0, "delta": {"content": content}, "finish_reason": None}]}
+            yield b"data: " + json.dumps(chunk, ensure_ascii=False).encode() + b"\n\n"
+        for tc in msg.get("tool_calls", []):
+            chunk = {"id": _id, "object": "chat.completion.chunk", "created": _created, "model": original_model, "choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "id": tc.get("id"), "type": "function", "function": {"name": tc["function"]["name"], "arguments": tc["function"]["arguments"]}}]}, "finish_reason": None}]}
+            yield b"data: " + json.dumps(chunk, ensure_ascii=False).encode() + b"\n\n"
+        finish = chat_resp.get("choices", [{}])[0].get("finish_reason", "stop")
+        final = {"id": _id, "object": "chat.completion.chunk", "created": _created, "model": original_model, "choices": [{"index": 0, "delta": {}, "finish_reason": finish}]}
+        yield b"data: " + json.dumps(final, ensure_ascii=False).encode() + b"\n\n"
+        yield b"data: [DONE]\n\n"
+        await _save_and_log_request(req_id, actual_model, original_model, start_time, req_in, req_out, cache, protocol, True, thinking_type, effort, client_ip, account_alias_s, tool_names, tools_used=[tc["function"]["name"] for tc in msg.get("tool_calls", [])] if msg.get("tool_calls") else None, request_body=request_body, response_body=data)
+    try:
+        headers_for_stream = _get_auth_headers("openai")
+    except AllKeysPausedError:
+        headers_for_stream = {}
+    return StreamingResponse(_sse_keepalive(muse_spark_chat_stream(headers_for_stream)), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
+
+
 
 
 async def _try_free_responses_first(body, headers, model_id):
@@ -4914,8 +5138,10 @@ async def chat_completions(request: Request):
         _log(f"  CIRCUIT BREAKER OPEN — fast-failing request to {endpoint}")
         return _openai_error(503, "Service temporarily unavailable (circuit breaker open)")
 
-    # ── OpenAI passthrough ─────────────────────────────────────
+    # ── OpenAI passthrough (muse-spark via Responses) ─────────────────────────────────────
     if protocol == "openai":
+        if _is_muse_spark(model_id):
+            return await _handle_chat_muse_spark_via_responses(req_id, start_time, client_ip, body, model_id, original_model, thinking_type, effort, tool_names, request_body, is_stream, endpoint, protocol)
         try:
             headers = _get_auth_headers("openai")
         except AllKeysPausedError as e:
