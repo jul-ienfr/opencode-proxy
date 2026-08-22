@@ -108,6 +108,7 @@ models:
   deepseek-v4-flash-vision-exp:
     protocol: openai
 free_model_map:
+  minimax-m2.5: mimo-v2.5-free
   mimo-v2.5: deepseek-v4-flash-free
   deepseek-v4-flash: deepseek-v4-flash-free
   hy3: hy3-free

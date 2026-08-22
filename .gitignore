@@ -18,9 +18,12 @@ logs/requests.db.bak*
 # Logs
 *.log
 logs/debug.log*
-logs/opencode.lock
+logs/opencode*.lock
 logs/paused_keys.yaml
 startup.err
+startup.log
+proxy_debug.log
+proxy_test_*.log
 test_free_quota.py
 tool_capabilities.json
 tool_compat_results.json
