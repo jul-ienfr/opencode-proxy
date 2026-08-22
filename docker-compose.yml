@@ -21,7 +21,7 @@ x-gluetun-multi-base: &gluetun-multi-base
   # the container expands the key from its own env).
   healthcheck:
     test: ["CMD-SHELL", "wget -q -O - -T 5 --header=\"X-API-Key: $$VPN_CONTROL_API_KEY\" http://127.0.0.1:8000/v1/vpn/status"]
-    interval: 10s
+    interval: 30s
     timeout: 5s
     retries: 3
     start_period: 60s
@@ -179,7 +179,7 @@ services:
     # container expands it from its own env (credentials.env).
     healthcheck:
       test: ["CMD-SHELL", "wget -q -O - -T 5 --header=\"X-API-Key: $$VPN_CONTROL_API_KEY\" http://127.0.0.1:8000/v1/vpn/status"]
-      interval: 10s
+      interval: 30s
       timeout: 5s
       retries: 3
       start_period: 60s
@@ -254,7 +254,7 @@ services:
     # [plan] local healthcheck — control server instead of external egress.
     healthcheck:
       test: ["CMD-SHELL", "wget -q -O - -T 5 --header=\"X-API-Key: $$VPN_CONTROL_API_KEY\" http://127.0.0.1:8000/v1/vpn/status"]
-      interval: 10s
+      interval: 30s
       timeout: 5s
       retries: 3
       start_period: 60s
@@ -462,7 +462,7 @@ services:
     # [plan] local healthcheck — control server instead of external egress.
     healthcheck:
       test: ["CMD-SHELL", "wget -q -O - -T 5 --header=\"X-API-Key: $$VPN_CONTROL_API_KEY\" http://127.0.0.1:8000/v1/vpn/status"]
-      interval: 10s
+      interval: 30s
       timeout: 5s
       retries: 3
       start_period: 60s

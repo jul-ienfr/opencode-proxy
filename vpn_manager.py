@@ -721,7 +721,7 @@ class VPNManager:
         # full refresh costs 2 docker subprocess calls + a tunnel HTTP probe.
         # Within _STATUS_CACHE_SECONDS of a completed refresh, refresh_status
         # returns the live in-memory state instead of re-probing docker.
-        self._STATUS_CACHE_SECONDS = max(0.5, float(cfg.get("status_cache_seconds", 5.0)))
+        self._STATUS_CACHE_SECONDS = max(0.5, float(cfg.get("status_cache_seconds", 10.0)))
         self._last_status_refresh_at: Optional[float] = None
         # Free streams currently open (updated by opencode.py via
         # note_free_stream_start/end) — auto-update must not interrupt them ([21]).
