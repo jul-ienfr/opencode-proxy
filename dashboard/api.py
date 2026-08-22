@@ -199,20 +199,25 @@ def _persist_vpn_config(updates: dict):
             "watchdog_interval": "watchdog_interval",
         }
 
-        ip_rot = cfg.yaml_get("ip_rotation", default={}) or {}
-        if not isinstance(ip_rot, dict):
-            ip_rot = {}
+        with cfg._yaml_lock:
+            ip_rot = cfg._yaml_data.get("ip_rotation") or {}
+            if not isinstance(ip_rot, dict):
+                ip_rot = {}
+            else:
+                import copy as _copy
+                ip_rot = _copy.deepcopy(ip_rot)
 
-        changed_keys: dict = {}
-        for api_key, yaml_key in key_map.items():
-            if api_key in updates:
-                new_val = updates[api_key]
-                if ip_rot.get(yaml_key) != new_val:
-                    ip_rot[yaml_key] = new_val
-                    changed_keys[yaml_key] = new_val
+            changed_keys: dict = {}
+            for api_key, yaml_key in key_map.items():
+                if api_key in updates:
+                    new_val = updates[api_key]
+                    if ip_rot.get(yaml_key) != new_val:
+                        ip_rot[yaml_key] = new_val
+                        changed_keys[yaml_key] = new_val
 
+            if changed_keys:
+                cfg._yaml_data["ip_rotation"] = ip_rot
         if changed_keys:
-            cfg._yaml_data["ip_rotation"] = ip_rot
             cfg.save_yaml_config()
             # Keep module-level IP_ROTATION in sync (opencode.py imports it at startup)
             try:
@@ -252,23 +257,30 @@ def _persist_vpn_config(updates: dict):
 
 
 def _persist_vpn_servers(servers: list):
-    """Persist full openvpn.servers list to config.yaml (hot-reload in-memory)."""
+    """Persist full openvpn.servers list to config.yaml (hot-reload in-memory, thread-safe)."""
     try:
         import config.settings as cfg
-        ip_rot = cfg.yaml_get("ip_rotation", default={}) or {}
-        if not isinstance(ip_rot, dict):
-            ip_rot = {}
-        openvpn_cfg = ip_rot.get("openvpn") or {}
-        if not isinstance(openvpn_cfg, dict):
-            openvpn_cfg = {}
-        openvpn_cfg["servers"] = servers
-        # Ensure canonical paths are set
-        if "configs_dir" not in openvpn_cfg:
-            openvpn_cfg["configs_dir"] = "vpn/configs"
-        if "auth_file" not in openvpn_cfg:
-            openvpn_cfg["auth_file"] = "vpn/credentials.txt"
-        ip_rot["openvpn"] = openvpn_cfg
-        cfg._yaml_data["ip_rotation"] = ip_rot
+        with cfg._yaml_lock:
+            ip_rot = cfg._yaml_data.get("ip_rotation") or {}
+            if not isinstance(ip_rot, dict):
+                ip_rot = {}
+            else:
+                # Copie pour éviter mutation concurrente
+                import copy as _copy
+                ip_rot = _copy.deepcopy(ip_rot)
+            openvpn_cfg = ip_rot.get("openvpn") or {}
+            if not isinstance(openvpn_cfg, dict):
+                openvpn_cfg = {}
+            else:
+                import copy as _copy2
+                openvpn_cfg = _copy2.deepcopy(openvpn_cfg)
+            openvpn_cfg["servers"] = list(servers)
+            if "configs_dir" not in openvpn_cfg:
+                openvpn_cfg["configs_dir"] = "vpn/configs"
+            if "auth_file" not in openvpn_cfg:
+                openvpn_cfg["auth_file"] = "vpn/credentials.txt"
+            ip_rot["openvpn"] = openvpn_cfg
+            cfg._yaml_data["ip_rotation"] = ip_rot
         cfg.save_yaml_config()
         try:
             cfg.IP_ROTATION.clear()
@@ -517,10 +529,11 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
             if v == "":
                 continue  # skip empty = deletion
             cleaned[k] = v
-        # Persist to YAML (top-level key)
+        # Persist to YAML (top-level key, thread-safe)
         try:
             import config.settings as cfg
-            cfg._yaml_data["free_model_map"] = cleaned
+            with cfg._yaml_lock:
+                cfg._yaml_data["free_model_map"] = dict(cleaned)
             cfg.save_yaml_config()
             # Hot-reload in-memory globals (config + opencode)
             cfg.FREE_MODEL_MAP.clear()
@@ -1087,14 +1100,18 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
 
     @app.get("/api/vpn-status")
     async def get_vpn_status():
-        """Get current VPN status, IP, server, and usage stats."""
+        """Get current VPN status, IP, server, and usage stats (non-bloquant, cache 30s)."""
         import shared_state
         if shared_state.vpn_manager:
-            # Check for existing Docker container
-            shared_state.vpn_manager._check_existing_docker()
+            # Check Docker en arrière-plan sans bloquer l'event loop (cache 30s dans le manager)
+            try:
+                await asyncio.to_thread(shared_state.vpn_manager._check_existing_docker)
+            except Exception:
+                pass
             if shared_state.free_ip_pool:
-                return shared_state.free_ip_pool.get_status()
-            return shared_state.vpn_manager.get_status()
+                # free_ip_pool.get_status est synchrone rapide
+                return await asyncio.to_thread(shared_state.free_ip_pool.get_status)
+            return await asyncio.to_thread(shared_state.vpn_manager.get_status)
         return {"enabled": False, "status": "not_configured"}
 
     @app.get("/api/vpn-config")
@@ -1758,15 +1775,19 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
         for r in rules:
             if not isinstance(r, dict):
                 return JSONResponse(status_code=400, content={"error": "each rule must be an object"})
-        # Persist to YAML (hot-reload)
+        # Persist to YAML (hot-reload, thread-safe)
         try:
             import config.settings as cfg
-            ip_rot = cfg.yaml_get("ip_rotation", default={}) or {}
-            ip_rot["rotation_rules"] = rules
-            cfg._yaml_data["ip_rotation"] = ip_rot
+            import copy as _copy
+            with cfg._yaml_lock:
+                ip_rot = _copy.deepcopy(cfg._yaml_data.get("ip_rotation") or {})
+                if not isinstance(ip_rot, dict):
+                    ip_rot = {}
+                ip_rot["rotation_rules"] = list(rules)
+                cfg._yaml_data["ip_rotation"] = ip_rot
             cfg.save_yaml_config()
             try:
-                cfg.IP_ROTATION["rotation_rules"] = rules
+                cfg.IP_ROTATION["rotation_rules"] = list(rules)
             except Exception:
                 pass
         except Exception as e:
@@ -1819,15 +1840,19 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
             schedule["rules"] = []
         if not isinstance(schedule["rules"], list):
             return JSONResponse(status_code=400, content={"error": "rules must be a list"})
-        # Persist to YAML
+        # Persist to YAML (thread-safe)
         try:
             import config.settings as cfg
-            ip_rot = cfg.yaml_get("ip_rotation", default={}) or {}
-            ip_rot["schedule"] = schedule
-            cfg._yaml_data["ip_rotation"] = ip_rot
+            import copy as _copy
+            with cfg._yaml_lock:
+                ip_rot = _copy.deepcopy(cfg._yaml_data.get("ip_rotation") or {})
+                if not isinstance(ip_rot, dict):
+                    ip_rot = {}
+                ip_rot["schedule"] = dict(schedule)
+                cfg._yaml_data["ip_rotation"] = ip_rot
             cfg.save_yaml_config()
             try:
-                cfg.IP_ROTATION["schedule"] = schedule
+                cfg.IP_ROTATION["schedule"] = dict(schedule)
             except Exception:
                 pass
         except Exception as e:

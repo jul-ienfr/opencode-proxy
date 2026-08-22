@@ -383,9 +383,17 @@ class VPNManager:
             max_delay=config.get("backoff_max_delay", 60),
         )
 
-        # Check if Docker VPN is already running on startup
+        # Docker check cache (évite 10s de subprocess à chaque GET /api/vpn-status)
+        self._docker_check_last: float = 0.0
+        self._docker_check_cache: tuple | None = None
+        self._docker_check_ttl: float = 30.0  # secondes
+
+        # Check if Docker VPN is already running on startup (non-bloquant si Docker absent)
         if self._mode == "docker":
-            self._check_existing_docker()
+            try:
+                self._check_existing_docker()
+            except Exception:
+                pass
 
         # Clean up unused .ovpn files on startup
         self._cleanup_old_configs()
@@ -1248,22 +1256,49 @@ class VPNManager:
 
     # ── Common ─────────────────────────────────────────────────
 
-    def _check_existing_docker(self):
-        """Check if Docker VPN container is already running on startup."""
+    def _check_existing_docker(self, force: bool = False):
+        """Check if Docker VPN container is already running (caché 30s, timeout 2s).
+
+        Cache évite 10s de subprocess à chaque GET /api/vpn-status.
+        force=True ignore le cache (ex: bouton Connect).
+        """
+        # Cache 30s sauf force
+        now = time.monotonic()
+        if not force and self._docker_check_cache is not None and (now - self._docker_check_last) < self._docker_check_ttl:
+            # Restaure l'état depuis le cache sans subprocess
+            cached_status, cached_ip, cached_at = self._docker_check_cache
+            if cached_status == "connected" and cached_ip:
+                self._current_ip = cached_ip
+                self._status = VPNState.CONNECTED
+                if cached_at:
+                    self._connected_at = cached_at
+            return
+
+        # Vérif rapide: si docker introuvable, pas de container
+        try:
+            import shutil
+            if not shutil.which(self._find_docker()):
+                # Pas de docker installé → cache négatif
+                self._docker_check_last = now
+                self._docker_check_cache = ("disconnected", None, None)
+                return
+        except Exception:
+            pass
+
         try:
             docker_cmd = self._find_docker()
             r = subprocess.run(
                 [docker_cmd, "ps", "-a", "--filter", "name=" + self._docker_container, "--format", "{{.Status}}"],
-                capture_output=True, text=True, timeout=5,
+                capture_output=True, text=True, timeout=2,
                 creationflags=CREATE_NO_WINDOW,
                 encoding="utf-8", errors="replace",
             )
             if "Up" in r.stdout:
                 logger.info("[vpn] Docker VPN container already running")
-                # Get the IP from the container logs
+                # Get the IP from the container logs (timeout réduit)
                 r2 = subprocess.run(
-                    [docker_cmd, "logs", self._docker_container],
-                    capture_output=True, text=True, timeout=5,
+                    [docker_cmd, "logs", "--tail", "50", self._docker_container],
+                    capture_output=True, text=True, timeout=2,
                     creationflags=CREATE_NO_WINDOW,
                     encoding="utf-8", errors="replace",
                 )
@@ -1284,9 +1319,16 @@ class VPNManager:
                             "time": time.strftime("%Y-%m-%dT%H:%M:%S"),
                         })
                         logger.info("[vpn] detected existing VPN connection, IP: %s", ip)
+                        self._docker_check_last = time.monotonic()
+                        self._docker_check_cache = (self._status, self._current_ip, self._connected_at)
                         return
+            # Cache le résultat négatif (pas Up ou pas d'IP)
+            self._docker_check_last = time.monotonic()
+            self._docker_check_cache = (self._status, self._current_ip, self._connected_at)
         except Exception as e:
             logger.debug("[vpn] could not check existing Docker container: %s", e)
+            self._docker_check_last = time.monotonic()
+            self._docker_check_cache = (self._status, self._current_ip, self._connected_at)
 
     async def _get_public_ip(self) -> str:
         """Get current public IP by querying an external service."""

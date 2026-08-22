@@ -3,6 +3,7 @@ import json
 import logging
 import time
 import threading
+import copy
 
 logger = logging.getLogger(__name__)
 
@@ -22,43 +23,78 @@ CONFIG_KEYS = ["OPENCODE_PROXY", "OPENCODE_HOST", "OPENCODE_PORT", "OPENCODE_WEB
 # ── YAML Config Loader ───────────────────────────────────────────────
 
 _yaml_data = {}
+_yaml_lock = threading.Lock()
 
 
 def load_yaml_config() -> dict:
-    """Load config.yaml as the primary configuration source."""
+    """Load config.yaml as the primary configuration source (thread-safe)."""
     global _yaml_data
     try:
         import yaml
     except ImportError:
         logger.warning("[config] pyyaml not installed — falling back to .env only")
-        _yaml_data = {}
+        with _yaml_lock:
+            _yaml_data = {}
         return {}
 
     if not os.path.exists(CONFIG_PATH):
         logger.info("[config] config.yaml not found at %s — using .env defaults", CONFIG_PATH)
-        _yaml_data = {}
+        with _yaml_lock:
+            _yaml_data = {}
         return {}
 
     try:
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-            _yaml_data = yaml.safe_load(f) or {}
-        logger.info("[config] loaded config.yaml (%d top-level keys)", len(_yaml_data))
-        return _yaml_data
+            data = yaml.safe_load(f) or {}
+        with _yaml_lock:
+            _yaml_data = data
+        logger.info("[config] loaded config.yaml (%d top-level keys)", len(data))
+        return data
     except Exception as e:
         logger.error("[config] failed to load config.yaml: %s", e)
-        _yaml_data = {}
+        with _yaml_lock:
+            _yaml_data = {}
         return {}
 
 
 def save_yaml_config():
-    """Write current config back to config.yaml."""
+    """Write current config back to config.yaml (thread-safe, atomic)."""
     global _yaml_data
     try:
         import yaml
     except ImportError:
         return
-    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-        yaml.dump(_yaml_data, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+    # Copie sous lock pour éviter race avec load
+    with _yaml_lock:
+        data_copy = copy.deepcopy(_yaml_data) if isinstance(_yaml_data, dict) else {}
+    # Écriture atomique via fichier temporaire
+    import tempfile
+    try:
+        dir_name = os.path.dirname(CONFIG_PATH) or "."
+        fd, tmp_path = tempfile.mkstemp(dir=dir_name, prefix=".config.yaml.tmp.")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                yaml.dump(data_copy, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+            # Remplacement atomique
+            os.replace(tmp_path, CONFIG_PATH)
+        finally:
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except Exception:
+                pass
+    except Exception as e:
+        logger.error("[config] save failed: %s", e)
+        # Fallback non-atomique
+        try:
+            with _yaml_lock:
+                # Re-vérifie que _yaml_data n'a pas été écrasé entre temps
+                if _yaml_data is data_copy:
+                    pass
+            with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+                yaml.dump(data_copy, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+        except Exception:
+            pass
     logger.debug("[config] saved config.yaml")
 
 
@@ -203,17 +239,22 @@ for _model_id, _model_data in _models_cfg.items():
         _endpoint = API_BASE_OPENAI if _proto == "openai" else API_BASE_ANTHROPIC
         MODELS[_model_id] = {"endpoint": _endpoint, "protocol": _proto}
 
-def _fetch_upstream_models():
-    """Fetch available models from upstream API and add them to MODELS."""
+def _fetch_upstream_models(timeout: float = 3.0):
+    """Fetch available models from upstream API and add them to MODELS.
+
+    Timeout réduit à 3s (vs 10s avant) pour ne pas bloquer le démarrage.
+    Appelé en arrière-plan, jamais bloquant pour le 1er chargement GUI.
+    """
     import subprocess
     try:
         url = f"{API_BASE_OPENAI.rsplit('/chat/completions', 1)[0]}/models"
+        # --max-time 3s + connect 2s : échec rapide si upstream lent
         result = subprocess.run(
-            ["curl", "-s", "--max-time", "10", url],
-            capture_output=True, text=True, timeout=15
+            ["curl", "-s", "--max-time", str(int(timeout)), "--connect-timeout", "2", url],
+            capture_output=True, text=True, timeout=timeout + 2
         )
         if result.returncode != 0:
-            raise Exception(f"curl failed: {result.stderr}")
+            raise Exception(f"curl failed: {result.stderr[:200]}")
         data = json.loads(result.stdout)
         models = data.get("data", [])
         added = 0
@@ -225,10 +266,27 @@ def _fetch_upstream_models():
                 MODELS[model_id] = {"endpoint": endpoint, "protocol": proto}
                 added += 1
         logger.info("[config] upstream models: fetched %d, added %d new", len(models), added)
+        return added
     except Exception as e:
-        logger.warning("[config] upstream models fetch failed: %s", e)
+        logger.debug("[config] upstream models fetch failed (non-bloquant): %s", e)
+        return 0
 
-_fetch_upstream_models()
+
+# Lancement non-bloquant en arrière-plan (daemon thread) — ne retarde pas l'import
+def _fetch_upstream_models_background():
+    try:
+        # Petit délai pour laisser le serveur démarrer avant le fetch
+        time.sleep(0.5)
+        _fetch_upstream_models(timeout=3.0)
+    except Exception:
+        pass
+
+try:
+    _bg_thread = threading.Thread(target=_fetch_upstream_models_background, daemon=True, name="upstream-models-fetch")
+    _bg_thread.start()
+    logger.debug("[config] upstream fetch lancé en arrière-plan (3s timeout)")
+except Exception as e:
+    logger.debug("[config] impossible de lancer le thread upstream: %s", e)
 
 # ── Routing ─────────────────────────────────────────────────────────
 DISABLE_MAPPING = _env_bool("DISABLE_MAPPING", yaml_get("routing", "disable_mapping", False))
