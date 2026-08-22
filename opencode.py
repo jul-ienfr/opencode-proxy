@@ -1904,7 +1904,7 @@ def openai_chat_to_responses_request(chat_body: dict, model: str) -> dict:
     return req
 
 
-def responses_output_to_anthropic_content(output, model=""):
+def responses_output_to_anthropic_content(output, model="", wants_thinking=True):
     """Responses output list -> Anthropic content blocks."""
     blocks = []
     for item in output or []:
@@ -1912,6 +1912,8 @@ def responses_output_to_anthropic_content(output, model=""):
             continue
         itype = item.get("type", "")
         if itype == "reasoning":
+            if not wants_thinking:
+                continue
             summary = item.get("summary") or []
             txt = "".join(s.get("text", "") for s in summary if isinstance(s, dict))
             if not txt:
@@ -1932,10 +1934,10 @@ def responses_output_to_anthropic_content(output, model=""):
     return blocks
 
 
-def responses_to_anthropic(resp: dict, original_model: str) -> dict:
+def responses_to_anthropic(resp: dict, original_model: str, wants_thinking=True) -> dict:
     """Convert Responses API response to Anthropic Messages response."""
     output = resp.get("output", [])
-    content = responses_output_to_anthropic_content(output, resp.get("model", ""))
+    content = responses_output_to_anthropic_content(output, resp.get("model", ""), wants_thinking=wants_thinking)
     status = resp.get("status", "completed")
     if status == "incomplete":
         stop = "max_tokens"
@@ -4133,16 +4135,24 @@ async def messages(request: Request):
             _debug(f"[messages] ✗ responses conversion failed: {e}")
             _log(f"  CONVERSION ERROR: anthropic_to_responses_request failed: {type(e).__name__}: {e}")
             return _anthropic_error(400, f"Request conversion failed: {e}")
-        # Non-stream path for muse-spark
+        # Non-stream path for muse-spark (cache + wants_thinking)
         if not _is_stream_norm:
+            wants_thinking_rs = (thinking_type != "none" or effort != "none")
+            # Check cache first
+            cache_key_rs = _response_cache.make_key(responses_req)
+            cached_rs = cache_key_rs and _response_cache.get(cache_key_rs)
+            if cached_rs:
+                cached_body, cached_headers = cached_rs
+                _log(f"  ← {model_id} | cache HIT (responses)")
+                return Response(content=cached_body, headers={**cached_headers, "X-Cache": "HIT"}, media_type="application/json")
             # Gratuit-first via Responses free endpoint
             if _should_try_free(model_id, thinking_type, effort):
                 free_resp = await _try_free_responses_first(responses_req, {}, model_id)
                 if free_resp is not None:
                     resp, _, _actual_model, _actual_ip = free_resp
                     data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
-                    # Convert Responses -> Anthropic
-                    anthro = responses_to_anthropic(data, original_model)
+                    # Convert Responses -> Anthropic (respect wants_thinking)
+                    anthro = responses_to_anthropic(data, original_model, wants_thinking=wants_thinking_rs)
                     usage = anthro.get("usage", {})
                     req_in = usage.get("input_tokens", 0)
                     req_out = usage.get("output_tokens", 0)
@@ -4150,7 +4160,10 @@ async def messages(request: Request):
                     _update_token_usage(_actual_model, req_in, req_out, req_cache)
                     used = [b["name"] for b in anthro.get("content", []) if b.get("type") == "tool_use"]
                     await _save_and_log_request(req_id, _actual_model, original_model, start_time, req_in, req_out, req_cache, protocol, False, thinking_type, effort, client_ip, "free (no auth)", tool_names, tools_used=used, request_body=request_body, response_body=data, free_model_ip=_actual_ip)
-                    return Response(content=json.dumps(anthro, ensure_ascii=False), media_type="application/json")
+                    body_bytes_rs = json.dumps(anthro, ensure_ascii=False).encode()
+                    if cache_key_rs:
+                        _response_cache.put(cache_key_rs, body_bytes_rs, {"Content-Type": "application/json"})
+                    return Response(content=body_bytes_rs, headers={"X-Cache": "MISS"}, media_type="application/json")
             # Paid path
             try:
                 headers_rs = _get_auth_headers("openai")
@@ -4175,7 +4188,7 @@ async def messages(request: Request):
                 data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
             except Exception:
                 return _anthropic_error(502, "Upstream returned non-JSON response")
-            anthro = responses_to_anthropic(data, original_model)
+            anthro = responses_to_anthropic(data, original_model, wants_thinking=wants_thinking_rs)
             usage = anthro.get("usage", {})
             req_in = usage.get("input_tokens", 0)
             req_out = usage.get("output_tokens", 0)
@@ -4183,7 +4196,10 @@ async def messages(request: Request):
             _update_token_usage(model_id, req_in, req_out, req_cache)
             used = [b["name"] for b in anthro.get("content", []) if b.get("type") == "tool_use"]
             await _save_and_log_request(req_id, model_id, original_model, start_time, req_in, req_out, req_cache, protocol, False, thinking_type, effort, client_ip, account_alias, tool_names, tools_used=used if used else None, request_body=request_body, response_body=data)
-            return Response(content=json.dumps(anthro, ensure_ascii=False), media_type="application/json")
+            body_bytes_rs = json.dumps(anthro, ensure_ascii=False).encode()
+            if cache_key_rs:
+                _response_cache.put(cache_key_rs, body_bytes_rs, {"Content-Type": "application/json"})
+            return Response(content=body_bytes_rs, headers={"X-Cache": "MISS"}, media_type="application/json")
         # Streaming for muse-spark: collect via non-stream then synthesize SSE (collect-then-emit, TODO incremental)
         # For now, handle streaming by internally calling non-stream Responses and emitting Anthropic SSE
         _debug(f"  [messages] muse-spark streaming via Responses collect-then-emit (is_stream={_is_stream_norm})")
@@ -4251,7 +4267,8 @@ async def messages(request: Request):
             if data is None:
                 yield await _stream_error_response(req_id, model_id, original_model, start_time, 503, "No data", protocol, thinking_type, effort, client_ip, account_alias_s, tool_names, {"type": "error", "error": {"type": "api_error", "message": "No data"}}, request_body=request_body)
                 return
-            anthro = responses_to_anthropic(data, original_model)
+            wants_thinking_rs = (thinking_type != "none" or effort != "none")
+            anthro = responses_to_anthropic(data, original_model, wants_thinking=wants_thinking_rs)
             usage = anthro.get("usage", {})
             req_in = usage.get("input_tokens", 0)
             req_out = usage.get("output_tokens", 0)
