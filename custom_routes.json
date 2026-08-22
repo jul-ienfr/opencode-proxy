@@ -3,7 +3,7 @@
     "match": [
       "mimo-v2.5"
     ],
-    "model": "muse-spark-1.2-contributor",
+    "model": "mimo-v2.5",
     "thinking": "adaptive"
   },
   "mimov25pro": {
@@ -31,15 +31,9 @@
     ],
     "model": "muse-spark-1.2-contributor"
   },
-  "minimaxm25": {
+  "gpt56luna": {
     "match": [
-      "minimax-m2.5"
-    ],
-    "model": "muse-spark-1.2-contributor"
-  },
-  "glm51": {
-    "match": [
-      "glm-5.1"
+      "gpt-5.6-luna"
     ],
     "model": "muse-spark-1.2-contributor"
   },
@@ -47,12 +41,6 @@
     "match": [
       "deepseek-v4-flash"
     ],
-    "model": "muse-spark-1.2-contributor"
-  },
-  "musespark12contributor": {
-    "match": [
-      "muse-spark-1.2-contributor"
-    ],
-    "model": "muse-spark-1.2-contributor"
+    "model": "mimo-v2.5"
   }
 }

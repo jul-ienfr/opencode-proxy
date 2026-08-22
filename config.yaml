@@ -1,15 +1,13 @@
 server:
   host: 0.0.0.0
   port: 4000
-  web_port: 8082
   debug: false
   log_dir: logs
 upstream:
   openai_base: https://opencode.ai/zen/go/v1/chat/completions
   anthropic_base: https://opencode.ai/zen/go/v1/messages
   free_base: https://opencode.ai/zen/v1/chat/completions
-  responses_base: https://opencode.ai/zen/go/v1/responses
-  responses_free_base: https://opencode.ai/zen/v1/responses
+  free_models_url: ''
   proxy: ''
   timeout:
     connect: 30
@@ -67,64 +65,168 @@ models:
     protocol: anthropic
   qwen3.5-plus:
     protocol: anthropic
+  kimi-k3:
+    protocol: openai
+  kimi-k2.7-code:
+    protocol: openai
+  glm-5.3:
+    protocol: openai
+  qwen3.8-max:
+    protocol: anthropic
+  hy3:
+    protocol: openai
+  hy3-preview:
+    protocol: openai
+  gpt-5.6-luna:
+    protocol: openai
+  grok-4.5:
+    protocol: openai
   muse-spark-1.2-contributor:
     protocol: openai
+    geo:
+      extends: meta-muse-spark
   muse-spark-1.2-contributor-free:
     protocol: openai
+    geo:
+      extends: meta-muse-spark
   deepseek-v4-flash-free:
+    protocol: openai
+  hy3-free:
+    protocol: openai
+  laguna-s-2.1-free:
     protocol: openai
   mimo-v2.5-free:
     protocol: openai
+  nemotron-3-ultra-free:
+    protocol: openai
+  nemotron-3.5-lightning-free:
+    protocol: openai
+  x-preview-f-free:
+    protocol: openai
+  ox-alpha-free:
+    protocol: openai
+  deepseek-v4-flash-vision-exp:
+    protocol: openai
 free_model_map:
-  deepseek-v4-flash: deepseek-v4-flash-free
   mimo-v2.5: mimo-v2.5-free
+  glm-5.2: deepseek-v4-flash-free
+  glm-5.1: deepseek-v4-flash-free
+  glm-5: deepseek-v4-flash-free
+  kimi-k2.5: deepseek-v4-flash-free
+  kimi-k2.6: deepseek-v4-flash-free
+  kimi-k2.7: deepseek-v4-flash-free
+  deepseek-v4-pro: deepseek-v4-flash-free
+  deepseek-v4-flash: deepseek-v4-flash-free
+  mimo-v2-pro: deepseek-v4-flash-free
+  mimo-v2-omni: deepseek-v4-flash-free
+  mimo-v2.5-pro: deepseek-v4-flash-free
+  minimax-m2.7: mimo-v2.5-free
+  minimax-m3: mimo-v2.5-free
+  minimax-m2.5: mimo-v2.5-free
+  qwen3.7-max: mimo-v2.5-free
+  qwen3.7-plus: mimo-v2.5-free
+  qwen3.6-plus: mimo-v2.5-free
+  qwen3.5-plus: mimo-v2.5-free
+  hy3: hy3-free
   muse-spark-1.2-contributor: muse-spark-1.2-contributor-free
 ip_rotation:
   enabled: true
-  proxy_mode: vpn
-  mode: docker
-  free_only: true
+  proxy_mode: direct
+  dual_station: true
+  station_count: 3
+  strict_free: false
+  quota_per_ip: 15
+  switch_delay: 1
+  docker_container: opencode-vpn
+  docker_compose_file: docker-compose.yml
   vpn_proxy_port: 8888
-  openvpn:
-    configs_dir: vpn/configs
-    auth_file: vpn/credentials.txt
-    servers:
-    - name: de1227
-      config: vpn/configs/de1227.ovpn
-    - name: de1223
-      config: vpn/configs/de1223.ovpn
-  quota_per_ip: 300
-  switch_delay: 5
-  docker_image: qmcgaw/gluetun
-  docker_image_custom: ''
-  nordvpn_token: ''
-  nordvpn_technology: NordLynx
-  nordvpn_country: Germany
-  nordvpn_group: ''
-  docker_killswitch: true
-  docker_dns_over_tls: true
-  nordvpn_exe: ''
-  socks5_proxies:
-    rotate_socks5: true
-    list: []
+  socks5_proxy_port: 1080
+  socks5_proxy_port_2: 1081
+  socks5_proxies: []
+  socks5_auto_rotate: true
   use_nordvpn_api: false
-  api_cache_ttl: 900
+  custom_ovpn_file: ''
+  vpn_proxy_port_2: 8889
+  docker_container_2: opencode-vpn-2
+  compose_service_2: vpn-gluetun-2
+  state_file_2: logs/vpn_state2.json
+  credentials_file: vpn_configs/credentials.txt
+  server_countries: Germany,Netherlands,France,Spain,Poland,Sweden,Denmark,Finland,Norway,Belgium,Switzerland,Austria,Portugal,Italy,Ireland,United
+    Kingdom,Czech Republic,Estonia,Latvia,Lithuania,Romania,Hungary,Greece,Slovakia,Slovenia,Croatia,Bulgaria,Luxembourg,Iceland,Cyprus,Malta,United
+    States,Canada,Australia,Japan,Singapore
   circuit_breaker_threshold: 3
   circuit_breaker_recovery: 300
   backoff_max_delay: 60
-  watchdog_interval: 60
-  geo_filter:
-    include: []
-    exclude: []
-  rotation_rules: []
-  schedule:
-    enabled: false
-    rules: []
+  bad_ttl: 60
+  ip_check_url: https://api.ipify.org
+  ip_check_urls:
+  - https://api.ipify.org
+  - https://icanhazip.com
+  - https://ifconfig.me/ip
+  - https://checkip.amazonaws.com
+  identity_rotation: true
+  identity_diversity: true
+  identity_max_profiles: 256
+  identity_profiles:
+  - impersonate: chrome131
+    user_agent: null
+    extra_headers: {}
+  update_enabled: true
+  update_check_interval: 21600
+  update_apply_window: 03:00-05:00
+  update_apply_idle_minutes: 15
+  update_apply_max_defer_hours: 24
+  watchdog_interval: 5
+  watchdog_backoff_base: 15
+  watchdog_backoff_max: 60
+  wait_healthy_poll: 0.5
+  status_cache_seconds: 2.0
+  connect_retry_interval: 20
+  rotation_fail_cooldown: 60
+  rotation_stagger: 2
+  recent_ip_window: 20
+  recent_ip_max_age: 1800
+  shared_rotation_file: logs/shared_rotation.json
+  server_provider: nordvpn
+  control_api_key: ''
+  control_enabled: true
+  vpn_stack: wireguard
+  auto_ov_fail_threshold: 3
+  auto_ov_return_min: 60
+  auto_wg_egress_ticks: 3
+  egress_failure_tick_interval: 2.0
+  ip_probe_budget: 8.0
+  control_pin_timeout: 20
+  control_pin_catchup: 25
+  auto_flip_cooldown_min: 30
+  rotation_wait_timeout: 20
+  rotation_max_duration: 240
+  country_rotation: true
+  country_offset: 14
+  docker_events: true
+  max_free_attempts: 3
+  free_exception_fallback: station-first
+geo:
+  enabled: true
+  version: 1
+  allow_direct_when_compatible: true
+  policies:
+    meta-muse-spark:
+      allowed_countries:
+      - United States
+      - Canada
+      - United Kingdom
+      - Australia
+      - Japan
+      - Singapore
+      mode: strict
+      require_vpn: true
+      last_checked_at: '2026-08-20T00:00:00Z'
 custom_routes:
   mimov25:
     match:
     - mimo-v2.5
-    model: muse-spark-1.2-contributor
+    model: mimo-v2.5
     thinking: adaptive
   mimov25pro:
     match:
@@ -143,22 +245,14 @@ custom_routes:
     match:
     - kimi-k2.6
     model: muse-spark-1.2-contributor
-  minimaxm25:
+  gpt56luna:
     match:
-    - minimax-m2.5
-    model: muse-spark-1.2-contributor
-  glm51:
-    match:
-    - glm-5.1
+    - gpt-5.6-luna
     model: muse-spark-1.2-contributor
   deepseekv4flash:
     match:
     - deepseek-v4-flash
-    model: muse-spark-1.2-contributor
-  musespark12contributor:
-    match:
-    - muse-spark-1.2-contributor
-    model: muse-spark-1.2-contributor
+    model: mimo-v2.5
 api_keys: []
 tool_capabilities:
   _default:
@@ -242,3 +336,13 @@ dashboard:
   - Glob
   - WebSearch
   display_lines: 35
+free_discovery:
+  enabled: true
+  interval: 3600
+  auto_persist: true
+  default_target: mimo-v2.5-free
+traffic:
+  enabled: true
+  max_frames: 500
+  body_cap: 131072
+  max_bytes: 33554432

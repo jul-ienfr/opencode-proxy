@@ -1,84 +1,481 @@
+# [plan 18/08 §1] Multi-station anchors (stations 3-10) — docker compose
+# supports YAML merge keys (`<<`), so the eight extra gluetun services
+# share one stanza instead of duplicating it. Stations 1-2 keep their
+# historical literal blocks.
+x-gluetun-multi-base: &gluetun-multi-base
+  image: qmcgaw/gluetun
+  cap_add:
+    - NET_ADMIN
+  devices:
+    - /dev/net/tun:/dev/net/tun
+  env_file:
+    - credentials.env
+    # [plan 18/08 §2b/3a] NordLynx key — always loaded, inert while
+    # VPN_TYPE=openvpn (gluetun ignores settings of the unselected type).
+    # required: false — fresh-clone safety (see vpn-gluetun comment).
+    - path: vpn_configs/wireguard.env
+      required: false
+  restart: unless-stopped
+  # [plan] local healthcheck — control server instead of external egress
+  # (see vpn-gluetun comment: $$ escapes compose interpolation so the sh in
+  # the container expands the key from its own env).
+  healthcheck:
+    test: ["CMD-SHELL", "wget -q -O - -T 5 --header=\"X-API-Key: $$VPN_CONTROL_API_KEY\" http://127.0.0.1:8000/v1/vpn/status"]
+    interval: 10s
+    timeout: 5s
+    retries: 3
+    start_period: 60s
+
+x-gluetun-multi-env: &gluetun-multi-env
+  # Environment shared by stations 3-10 — the per-station VPN_TYPE and
+  # listening addresses live in each service stanza (merged below).
+  # Mapping form on purpose: `<<` merge keys only work on mappings.
+  VPN_SERVICE_PROVIDER: nordvpn
+  OPENVPN_VERBOSITY: '4'   # hostname in logs (see vpn-gluetun comment)
+  SERVER_COUNTRIES: Germany,Netherlands,France,Spain,Poland,Sweden,Denmark,Finland,Norway,Belgium,Switzerland,Austria,Portugal,Italy,Ireland,United Kingdom,Czech Republic,Estonia,Latvia,Lithuania,Romania,Hungary,Greece,Slovakia,Slovenia,Croatia,Bulgaria,Luxembourg,Iceland,Cyprus,Malta
+  UPDATER_PERIOD: 480h
+  HTTPPROXY: 'on'
+  SOCKS5_ENABLED: 'on'
+  DNS_OVER_TLS: 'on'
+  FIREWALL: 'on'
+  PUID: '1000'
+  PGID: '1000'
+  HTTP_CONTROL_SERVER: 'on'   # role JSON in credentials.env (see vpn-gluetun comment)
+  # [fix 20/08][Axe 3.1] Custom .ovpn uploaded via the dashboard (POST
+  # /api/vpn/upload-config → config.yaml custom_ovpn_file). vpn_manager's
+  # _compose_env injects the variable when a custom file is configured and
+  # the stack is openvpn; `/vpn-custom` is the bind mount below. Empty by
+  # default → gluetun ignores the setting entirely (inert on a fresh clone).
+  OPENVPN_CUSTOM_CONFIG: ${OPENVPN_CUSTOM_CONFIG:-}
+
 services:
   opencode-proxy:
     build: .
+    container_name: opencode-proxy
     ports:
       - "4000:4000"
-      - "8082:8082"
     env_file:
       - .env
+    environment:
+      # [13] gluetun's proxies bind host loopback only — unreachable from
+      # this container. Reach them over the compose internal network.
+      - VPN_SOCKS5_URL=socks5://vpn-gluetun:1080
+      - VPN_PROXY_URL=http://vpn-gluetun:8888
+      # Station 2 ("double embrayage") — same reachability rule, port 1081/8889.
+      - VPN_SOCKS5_URL_2=socks5://vpn-gluetun-2:1081
+      - VPN_PROXY_URL_2=http://vpn-gluetun-2:8889
+      # Stations 3-10 ("multi-station", plan 18/08) — same reachability rule;
+      # ports derived: socks5 1079+N, http 8887+N (container side).
+      - VPN_SOCKS5_URL_3=socks5://vpn-gluetun-3:1082
+      - VPN_PROXY_URL_3=http://vpn-gluetun-3:8890
+      - VPN_SOCKS5_URL_4=socks5://vpn-gluetun-4:1083
+      - VPN_PROXY_URL_4=http://vpn-gluetun-4:8891
+      - VPN_SOCKS5_URL_5=socks5://vpn-gluetun-5:1084
+      - VPN_PROXY_URL_5=http://vpn-gluetun-5:8892
+      - VPN_SOCKS5_URL_6=socks5://vpn-gluetun-6:1085
+      - VPN_PROXY_URL_6=http://vpn-gluetun-6:8893
+      - VPN_SOCKS5_URL_7=socks5://vpn-gluetun-7:1086
+      - VPN_PROXY_URL_7=http://vpn-gluetun-7:8894
+      - VPN_SOCKS5_URL_8=socks5://vpn-gluetun-8:1087
+      - VPN_PROXY_URL_8=http://vpn-gluetun-8:8895
+      - VPN_SOCKS5_URL_9=socks5://vpn-gluetun-9:1088
+      - VPN_PROXY_URL_9=http://vpn-gluetun-9:8896
+      - VPN_SOCKS5_URL_10=socks5://vpn-gluetun-10:1089
+      - VPN_PROXY_URL_10=http://vpn-gluetun-10:8897
+      # [13] docker compose runs from inside this container against the HOST
+      # daemon (docker.sock below), so its relative paths (./logs, .env,
+      # credentials.env...) resolve on the host. Point it at the host project
+      # dir — mounted read-only at the same path below — and adjust
+      # /opt/opencode-proxy to the real deployment directory.
+      - VPN_DOCKER_COMPOSE_FILE=/opt/opencode-proxy/docker-compose.yml
     volumes:
       - ./logs:/app/logs
+      - ./config.yaml:/app/config.yaml:ro
+      - ./api_keys.json:/app/api_keys.json:ro
+      # [13] docker CLI inside this container talks to the HOST daemon.
+      - /var/run/docker.sock:/var/run/docker.sock
+      # [13] host project dir read-only, mounted at the SAME absolute path as
+      # on the host, so `docker compose -f ...` resolves its relative paths
+      # against the real host directory.
+      - /opt/opencode-proxy:/opt/opencode-proxy:ro
+    group_add:
+      - "${DOCKER_GID:-998}"   # host docker group GID — `id -g docker`, or set DOCKER_GID in .env
     restart: unless-stopped
+    depends_on:
+      vpn-gluetun:
+        condition: service_healthy
 
-  # ── Option A: Gluetun (recommandé) ──
-  # Multi-provider VPN client, WireGuard, proxy intégré, 43 MB
-  # Documentation: https://github.com/qdm12/gluetun
   vpn-gluetun:
     image: qmcgaw/gluetun
+    container_name: opencode-vpn
     cap_add:
       - NET_ADMIN
     devices:
       - /dev/net/tun:/dev/net/tun
     ports:
-      - "8888:8888"    # HTTP proxy
-      - "1080:1080"    # SOCKS5 proxy
+      - "127.0.0.1:8888:8888"    # HTTP proxy (loopback only)
+      - "127.0.0.1:1080:1080"    # SOCKS5 proxy (loopback only)
+    env_file:
+      - credentials.env
+      # [plan 18/08 §2b/3a] NordLynx key — always loaded, inert while
+      # VPN_TYPE=openvpn (gluetun ignores settings of the unselected type).
+      # required: false — a fresh clone has no vpn_configs/wireguard.env
+      # yet (gitignored); `docker compose up` must not fail before the key
+      # exists, and _apply_stack refuses a flip to wireguard without it
+      # (GUI hint). Audit 18/08: short-form list entry is required by
+      # default → breaks the whole model on a fresh clone.
+      - path: vpn_configs/wireguard.env
+        required: false
     environment:
       - VPN_SERVICE_PROVIDER=nordvpn
-      - VPN_TYPE=openvpn
-      - OPENVPN_USER=${NORDVPN_USER:-}
-      - OPENVPN_PASSWORD=${NORDVPN_PASSWORD:-}
-      - SERVER_COUNTRIES=${NORDVPN_COUNTRY:-Germany}
-      - HTTP_PROXY=on
-      - HTTP_PROXY_PORT=8888
-      - SOCKS5_PROXY=on
-      - SOCKS5_PROXY_PORT=1080
+      # [plan 18/08 §3a] stack per station, driven by the .env next to this
+      # compose file (VPN_TYPE_STATION{1,2}); defaults to openvpn so the
+      # file works on a fresh clone (Phase 1 stays armed as fallback).
+      - VPN_TYPE=${VPN_TYPE_STATION1:-openvpn}
+      # [audit 18/08] the real OpenVPN hostname line is
+      # "[<host>] Peer Connection Initiated with [AF_INET]<ip>:1194" — an
+      # M_INFO message, visible from the DEFAULT verbosity (1). So extraction
+      # works without tuning; OPENVPN_VERBOSITY=4 is kept only for its ~1
+      # line/attempt debug detail (hostname at connect start).
+      - OPENVPN_VERBOSITY=4
+      # [fix 20/08][Axe 3.1] custom .ovpn from the dashboard upload — path is
+      # the in-container bind mount /vpn-custom; empty default = inert.
+      - OPENVPN_CUSTOM_CONFIG=${OPENVPN_CUSTOM_CONFIG:-}
+      # [incident 17/08] gluetun's country enum uses SPACED names
+      # ("United Kingdom", "Czech Republic") — NordVPN file-style
+      # "United_Kingdom"/"Czechia" are rejected with a WARN "not in
+      # choices" and silently break the rotation.
+      - SERVER_COUNTRIES=Germany,Netherlands,France,Spain,Poland,Sweden,Denmark,Finland,Norway,Belgium,Switzerland,Austria,Portugal,Italy,Ireland,United Kingdom,Czech Republic,Estonia,Latvia,Lithuania,Romania,Hungary,Greece,Slovakia,Slovenia,Croatia,Bulgaria,Luxembourg,Iceland,Cyprus,Malta
+      - UPDATER_PERIOD=480h   # gluetun refreshes its own servers list every 20 days (prevent stale list)
+      - HTTPPROXY=on
+      - HTTPPROXY_LISTENING_ADDRESS=:8888
+      - SOCKS5_ENABLED=on
+      - SOCKS5_LISTENING_ADDRESS=:1080
       - DNS_OVER_TLS=on
+      - FIREWALL=on
       - PUID=1000
       - PGID=1000
+      # [incident P0] control server — local healthchecks + country pinning
+      # via /v1/vpn/settings. Auth is mandatory since gluetun v3.39.1: the
+      # default role is a JSON ROLE OBJECT, not a bare name — '=normal' made
+      # every boot panic ("missing code for authentication method",
+      # auth.Role.ToLinesNode settings.go:178, restart loop). The JSON role
+      # with the api key lives in credentials.env as
+      # HTTP_CONTROL_SERVER_AUTH_DEFAULT_ROLE (same value as
+      # VPN_CONTROL_API_KEY) — never hard-coded in compose, env_file wins
+      # because no environment: entry repeats the var here. Port 8000 is NOT
+      # published: reached via docker exec / the compose network.
+      - HTTP_CONTROL_SERVER=on
     volumes:
       - gluetun:/gluetun
+      # [fix 20/08][Axe 3.1] custom .ovpn upload dir (read-only) — the
+      # OPENVPN_CUSTOM_CONFIG env above points inside it.
+      - ./vpn_configs/custom:/vpn-custom:ro
     restart: unless-stopped
-    profiles:
-      - vpn
-      - gluetun
+    # [plan] local healthcheck — hits the control server, NOT external
+    # egress (api.ipify.org at every 30s wasted bandwidth and depended on
+    # an external resolver). $$VPN_CONTROL_API_KEY: the escaped dollar keeps
+    # compose from interpolating it from the HOST env — the sh in the
+    # container expands it from its own env (credentials.env).
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - -T 5 --header=\"X-API-Key: $$VPN_CONTROL_API_KEY\" http://127.0.0.1:8000/v1/vpn/status"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
 
-  # ── Option B: NordVPN Officiel ──
-  # Client NordVPN Linux natif + tinyproxy
-  vpn-nordvpn-official:
-    build:
-      context: .
-      dockerfile: Dockerfile.nordvpn
+  # Station 2 ("double embrayage"): a second independent tunnel on its own
+  # loopback ports — two fresh IPs available simultaneously, one station
+  # rotates in background while the other serves free requests.
+  #
+  # Gated behind the "dual-station" profile: with ip_rotation.dual_station
+  # off (the default) the proxy must start WITHOUT waiting on station-2 —
+  # a stuck vpn-gluetun-2 would otherwise block the whole HTTP server at
+  # boot (compose `depends_on` blocks unconditionally). The proxy's own
+  # VPNManager brings station-2 up itself via `docker compose up
+  # vpn-gluetun-2` when dual_station is enabled — explicitly targeting a
+  # profiled service runs it regardless of its profile.
+  vpn-gluetun-2:
+    image: qmcgaw/gluetun
+    profiles: ["dual-station", "multi-station"]
+    container_name: opencode-vpn-2
     cap_add:
       - NET_ADMIN
     devices:
       - /dev/net/tun:/dev/net/tun
     ports:
-      - "8888:8888"
+      - "127.0.0.1:8889:8889"    # HTTP proxy (loopback only)
+      - "127.0.0.1:1081:1081"    # SOCKS5 proxy (loopback only)
+    env_file:
+      - credentials.env
+      # [plan 18/08 §2b/3a] NordLynx key — always loaded, inert while
+      # VPN_TYPE=openvpn (gluetun ignores settings of the unselected type).
+      # required: false — fresh-clone safety (see vpn-gluetun comment).
+      - path: vpn_configs/wireguard.env
+        required: false
     environment:
-      - NORDVPN_TOKEN=${NORDVPN_TOKEN:-}
-      - NORDVPN_COUNTRY=${NORDVPN_COUNTRY:-}
-      - NORDVPN_TECHNOLOGY=${NORDVPN_TECHNOLOGY:-NordLynx}
-      - NORDVPN_KILLSWITCH=on
-      - VPN_PROXY_PORT=8888
-    restart: unless-stopped
-    profiles:
-      - vpn
-      - nordvpn-official
-
-  # ── Option C: Legacy (OpenVPN brut) ──
-  # Configuration manuelle avec fichiers .ovpn
-  vpn-legacy:
-    build:
-      context: .
-      dockerfile: Dockerfile.vpn
-    ports:
-      - "8888:8888"
+      - VPN_SERVICE_PROVIDER=nordvpn
+      # [plan 18/08 §3a] stack per station, driven by the .env next to this
+      # compose file (VPN_TYPE_STATION{1,2}); defaults to openvpn so the
+      # file works on a fresh clone (Phase 1 stays armed as fallback).
+      - VPN_TYPE=${VPN_TYPE_STATION2:-openvpn}
+      # [audit 18/08] the real OpenVPN hostname line is
+      # "[<host>] Peer Connection Initiated with [AF_INET]<ip>:1194" — an
+      # M_INFO message, visible from the DEFAULT verbosity (1). So extraction
+      # works without tuning; OPENVPN_VERBOSITY=4 is kept only for its ~1
+      # line/attempt debug detail (hostname at connect start).
+      - OPENVPN_VERBOSITY=4
+      # [fix 20/08][Axe 3.1] custom .ovpn from the dashboard upload — path is
+      # the in-container bind mount /vpn-custom; empty default = inert.
+      - OPENVPN_CUSTOM_CONFIG=${OPENVPN_CUSTOM_CONFIG:-}
+      # [incident 17/08] gluetun's country enum uses SPACED names
+      # ("United Kingdom", "Czech Republic") — NordVPN file-style
+      # "United_Kingdom"/"Czechia" are rejected with a WARN "not in
+      # choices" and silently break the rotation.
+      - SERVER_COUNTRIES=Germany,Netherlands,France,Spain,Poland,Sweden,Denmark,Finland,Norway,Belgium,Switzerland,Austria,Portugal,Italy,Ireland,United Kingdom,Czech Republic,Estonia,Latvia,Lithuania,Romania,Hungary,Greece,Slovakia,Slovenia,Croatia,Bulgaria,Luxembourg,Iceland,Cyprus,Malta
+      - UPDATER_PERIOD=480h   # gluetun refreshes its own servers list every 20 days (prevent stale list)
+      - HTTPPROXY=on
+      - HTTPPROXY_LISTENING_ADDRESS=:8889
+      - SOCKS5_ENABLED=on
+      - SOCKS5_LISTENING_ADDRESS=:1081
+      - DNS_OVER_TLS=on
+      - FIREWALL=on
+      - PUID=1000
+      - PGID=1000
+      # [incident P0] control server — idem (see vpn-gluetun above): role
+      # JSON in credentials.env, no bare '=normal' here.
+      - HTTP_CONTROL_SERVER=on
     volumes:
-      - ./vpn:/vpn
+      - gluetun2:/gluetun
+      # [fix 20/08][Axe 3.1] custom .ovpn upload dir (read-only) — the
+      # OPENVPN_CUSTOM_CONFIG env above points inside it.
+      - ./vpn_configs/custom:/vpn-custom:ro
     restart: unless-stopped
-    profiles:
-      - vpn
-      - legacy
+    # [plan] local healthcheck — control server instead of external egress.
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - -T 5 --header=\"X-API-Key: $$VPN_CONTROL_API_KEY\" http://127.0.0.1:8000/v1/vpn/status"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+
+  # Stations 3-10 ("multi-station", plan 18/08): N parallel tunnels on
+  # derived loopback ports (http 8887+N, socks5 1079+N; N=3 → 8890/1082).
+  # Same profile gating as station 2 — a plain `docker compose up -d`
+  # starts only station 1; VPNManager brings each station up BY NAME
+  # (`up -d vpn-gluetun-N`), which runs a profiled service regardless.
+  # Shared config comes from the x-gluetun-multi-* anchors above.
+  vpn-gluetun-3:
+    <<: *gluetun-multi-base
+    profiles: ["dual-station", "multi-station"]
+    container_name: opencode-vpn-3
+    ports:
+      - "127.0.0.1:8890:8890"    # HTTP proxy (loopback only)
+      - "127.0.0.1:1082:1082"    # SOCKS5 proxy (loopback only)
+    environment:
+      <<: *gluetun-multi-env
+      VPN_TYPE: ${VPN_TYPE_STATION3:-openvpn}
+      HTTPPROXY_LISTENING_ADDRESS: :8890
+      SOCKS5_LISTENING_ADDRESS: :1082
+    volumes:
+      - gluetun3:/gluetun
+      # [fix 20/08][Axe 3.1] custom .ovpn upload dir (read-only) — the
+      # OPENVPN_CUSTOM_CONFIG env above points inside it.
+      - ./vpn_configs/custom:/vpn-custom:ro
+
+  vpn-gluetun-4:
+    <<: *gluetun-multi-base
+    profiles: ["dual-station", "multi-station"]
+    container_name: opencode-vpn-4
+    ports:
+      - "127.0.0.1:8891:8891"    # HTTP proxy (loopback only)
+      - "127.0.0.1:1083:1083"    # SOCKS5 proxy (loopback only)
+    environment:
+      <<: *gluetun-multi-env
+      VPN_TYPE: ${VPN_TYPE_STATION4:-openvpn}
+      HTTPPROXY_LISTENING_ADDRESS: :8891
+      SOCKS5_LISTENING_ADDRESS: :1083
+    volumes:
+      - gluetun4:/gluetun
+      # [fix 20/08][Axe 3.1] custom .ovpn upload dir (read-only) — the
+      # OPENVPN_CUSTOM_CONFIG env above points inside it.
+      - ./vpn_configs/custom:/vpn-custom:ro
+
+  vpn-gluetun-5:
+    <<: *gluetun-multi-base
+    profiles: ["dual-station", "multi-station"]
+    container_name: opencode-vpn-5
+    ports:
+      - "127.0.0.1:8892:8892"    # HTTP proxy (loopback only)
+      - "127.0.0.1:1084:1084"    # SOCKS5 proxy (loopback only)
+    environment:
+      <<: *gluetun-multi-env
+      VPN_TYPE: ${VPN_TYPE_STATION5:-openvpn}
+      HTTPPROXY_LISTENING_ADDRESS: :8892
+      SOCKS5_LISTENING_ADDRESS: :1084
+    volumes:
+      - gluetun5:/gluetun
+      # [fix 20/08][Axe 3.1] custom .ovpn upload dir (read-only) — the
+      # OPENVPN_CUSTOM_CONFIG env above points inside it.
+      - ./vpn_configs/custom:/vpn-custom:ro
+
+  vpn-gluetun-6:
+    <<: *gluetun-multi-base
+    profiles: ["dual-station", "multi-station"]
+    container_name: opencode-vpn-6
+    ports:
+      - "127.0.0.1:8893:8893"    # HTTP proxy (loopback only)
+      - "127.0.0.1:1085:1085"    # SOCKS5 proxy (loopback only)
+    environment:
+      <<: *gluetun-multi-env
+      VPN_TYPE: ${VPN_TYPE_STATION6:-openvpn}
+      HTTPPROXY_LISTENING_ADDRESS: :8893
+      SOCKS5_LISTENING_ADDRESS: :1085
+    volumes:
+      - gluetun6:/gluetun
+      # [fix 20/08][Axe 3.1] custom .ovpn upload dir (read-only) — the
+      # OPENVPN_CUSTOM_CONFIG env above points inside it.
+      - ./vpn_configs/custom:/vpn-custom:ro
+
+  vpn-gluetun-7:
+    <<: *gluetun-multi-base
+    profiles: ["dual-station", "multi-station"]
+    container_name: opencode-vpn-7
+    ports:
+      - "127.0.0.1:8894:8894"    # HTTP proxy (loopback only)
+      - "127.0.0.1:1086:1086"    # SOCKS5 proxy (loopback only)
+    environment:
+      <<: *gluetun-multi-env
+      VPN_TYPE: ${VPN_TYPE_STATION7:-openvpn}
+      HTTPPROXY_LISTENING_ADDRESS: :8894
+      SOCKS5_LISTENING_ADDRESS: :1086
+    volumes:
+      - gluetun7:/gluetun
+      # [fix 20/08][Axe 3.1] custom .ovpn upload dir (read-only) — the
+      # OPENVPN_CUSTOM_CONFIG env above points inside it.
+      - ./vpn_configs/custom:/vpn-custom:ro
+
+  vpn-gluetun-8:
+    <<: *gluetun-multi-base
+    profiles: ["dual-station", "multi-station"]
+    container_name: opencode-vpn-8
+    ports:
+      - "127.0.0.1:8895:8895"    # HTTP proxy (loopback only)
+      - "127.0.0.1:1087:1087"    # SOCKS5 proxy (loopback only)
+    environment:
+      <<: *gluetun-multi-env
+      VPN_TYPE: ${VPN_TYPE_STATION8:-openvpn}
+      HTTPPROXY_LISTENING_ADDRESS: :8895
+      SOCKS5_LISTENING_ADDRESS: :1087
+    volumes:
+      - gluetun8:/gluetun
+      # [fix 20/08][Axe 3.1] custom .ovpn upload dir (read-only) — the
+      # OPENVPN_CUSTOM_CONFIG env above points inside it.
+      - ./vpn_configs/custom:/vpn-custom:ro
+
+  vpn-gluetun-9:
+    <<: *gluetun-multi-base
+    profiles: ["dual-station", "multi-station"]
+    container_name: opencode-vpn-9
+    ports:
+      - "127.0.0.1:8896:8896"    # HTTP proxy (loopback only)
+      - "127.0.0.1:1088:1088"    # SOCKS5 proxy (loopback only)
+    environment:
+      <<: *gluetun-multi-env
+      VPN_TYPE: ${VPN_TYPE_STATION9:-openvpn}
+      HTTPPROXY_LISTENING_ADDRESS: :8896
+      SOCKS5_LISTENING_ADDRESS: :1088
+    volumes:
+      - gluetun9:/gluetun
+      # [fix 20/08][Axe 3.1] custom .ovpn upload dir (read-only) — the
+      # OPENVPN_CUSTOM_CONFIG env above points inside it.
+      - ./vpn_configs/custom:/vpn-custom:ro
+
+  vpn-gluetun-10:
+    <<: *gluetun-multi-base
+    profiles: ["dual-station", "multi-station"]
+    container_name: opencode-vpn-10
+    ports:
+      - "127.0.0.1:8897:8897"    # HTTP proxy (loopback only)
+      - "127.0.0.1:1089:1089"    # SOCKS5 proxy (loopback only)
+    environment:
+      <<: *gluetun-multi-env
+      VPN_TYPE: ${VPN_TYPE_STATION10:-openvpn}
+      HTTPPROXY_LISTENING_ADDRESS: :8897
+      SOCKS5_LISTENING_ADDRESS: :1089
+    volumes:
+      - gluetun10:/gluetun
+      # [fix 20/08][Axe 3.1] custom .ovpn upload dir (read-only) — the
+      # OPENVPN_CUSTOM_CONFIG env above points inside it.
+      - ./vpn_configs/custom:/vpn-custom:ro
+
+  # [plan 18/08 §2c] Canary WireGuard/NordLynx — validates the shared
+  # NordLynx key (vpn_configs/wireguard.env, gitignored) BEFORE any station
+  # flips. One station at a time runs WireGuard during the test, so the
+  # single-account key never contends (NordGen issue #26: 2 devices sharing
+  # one key cannot hit the SAME server simultaneously — also guaranteed in
+  # production by the shared-rotation pass-1, countries differ per station).
+  #
+  # Deviation from the plan ("sans profiles"): the env_file here lists
+  # vpn_configs/wireguard.env which does NOT exist on a fresh clone — and
+  # Compose v5.3.1 treats a missing env_file in an UNPROFILED service as a
+  # FATAL error that breaks `docker compose up` of the whole model (stations
+  # included). The profile gates the file requirement away; an explicit
+  # `docker compose up -d vpn-wg-test` still runs the profiled service (same
+  # mechanism as vpn-gluetun-2, see comment above) and the canary never
+  # starts automatically.
+  vpn-wg-test:
+    image: qmcgaw/gluetun
+    profiles: ["wg-test"]
+    container_name: opencode-wg-test
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    ports:
+      # [plan 18/08 §1] Renumbered 8890/1082 → 8898/1090: the derived
+      # station-3 ports (8887+3 / 1079+3) would collide with the old values.
+      - "127.0.0.1:8898:8898"    # HTTP proxy (loopback only, test port)
+      - "127.0.0.1:1090:1090"    # SOCKS5 proxy (loopback only, test port)
+    env_file:
+      - credentials.env
+      - vpn_configs/wireguard.env   # NordLynx key — shared by both stations
+    environment:
+      - VPN_SERVICE_PROVIDER=nordvpn
+      - VPN_TYPE=wireguard
+      # Single country: validation checks the public IP lands in Switzerland
+      # (spaced name — gluetun enum, see comment on SERVER_COUNTRIES above).
+      - SERVER_COUNTRIES=Switzerland
+      - UPDATER_PERIOD=480h
+      - HTTPPROXY=on
+      - HTTPPROXY_LISTENING_ADDRESS=:8898
+      - SOCKS5_ENABLED=on
+      - SOCKS5_LISTENING_ADDRESS=:1090
+      - DNS_OVER_TLS=on
+      - FIREWALL=on
+      - PUID=1000
+      - PGID=1000
+      - HTTP_CONTROL_SERVER=on
+    volumes:
+      - gluetun-wg-test:/gluetun
+    restart: unless-stopped
+    # [plan] local healthcheck — control server instead of external egress.
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - -T 5 --header=\"X-API-Key: $$VPN_CONTROL_API_KEY\" http://127.0.0.1:8000/v1/vpn/status"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
 
 volumes:
   gluetun:
+  gluetun2:
+  gluetun3:
+  gluetun4:
+  gluetun5:
+  gluetun6:
+  gluetun7:
+  gluetun8:
+  gluetun9:
+  gluetun10:
+  gluetun-wg-test:

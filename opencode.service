@@ -8,7 +8,7 @@ Type=simple
 User=opencode
 Group=opencode
 WorkingDirectory=/opt/opencode-proxy
-ExecStart=/opt/opencode-proxy/.venv/bin/python opencode.py
+ExecStart=/opt/opencode-proxy/.venv/bin/python opencode.py --no-gui
 Restart=always
 RestartSec=5
 

@@ -1,0 +1,29 @@
+# Source: https://ai.developer.meta.com/legal/geographic-use-policy
+# Snapshot 2026-08-20: JS-rendered — WebFetch returned empty skeleton (Model API),
+#   manual transcription required. Do NOT treat this file as loaded config.
+# Usage: copy the policy block(s) below into config.yaml under geo.policies
+#   (single source). This file is documentation only — the loader reads
+#   config.yaml:geo.policies, not this file. Keep geo.enabled=false until
+#   allowed_countries are filled.
+#
+# Example — fill allowed_countries from the Meta page via _normalize_country
+# aliases (USA→United States, UK→United Kingdom, UAE→United Arab Emirates,
+# Czechia→Czech Republic). Gluetun names are Title Case, comma-separated in
+# ip_rotation.server_countries. See vpn_manager._normalize_country (single source).
+#
+# geo:
+#   enabled: false          # kill-switch — keep false until verified
+#   version: 1              # bump on each manual update
+#   policies:
+#     meta-muse-spark:
+#       # allowed_countries: [United States, Canada, United Kingdom, Australia, Japan, Singapore]
+#       mode: strict
+#       require_vpn: true
+#       last_checked_at: null  # ISO8601 — update on each manual relevé
+#
+# Per-route usage (extends DRY — no YAML anchors, explicit extends resolved at load):
+#   custom_routes:
+#     mimov25:
+#       match: [mimo-v2.5]
+#       model: muse-spark-1.2-contributor
+#       geo: { extends: meta-muse-spark }

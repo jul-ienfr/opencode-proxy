@@ -1,5 +1,6 @@
 # Environment variables
 .env
+.env.bak-*
 api_keys.json
 
 # Python
@@ -11,22 +12,19 @@ __pycache__/
 *.so
 
 # Database
-logs/requests.db
-logs/*.db
-logs/*.db-shm
-logs/*.db-wal
+logs/*.db*
+logs/requests.db.bak*
 
 # Logs
 *.log
 logs/debug.log*
+logs/opencode.lock
 logs/paused_keys.yaml
 startup.err
 test_free_quota.py
 tool_capabilities.json
 tool_compat_results.json
 vpn/credentials.txt
-vpn_configs/credentials.txt
-credentials.txt
 
 # IDE
 .vscode/
@@ -44,5 +42,21 @@ venv/
 env/
 ENV/
 
-.kilo/
-.kilo
+# Secrets
+vpn_configs/
+credentials.env
+logs/vpn_state*.json*
+logs/shared_rotation.json
+env_dump.json
+*.ovpn
+
+# Debug dumps / transient scratch (debugging artifacts, not source)
+logs/_*
+logs/panel_dump.json
+logs/commit-*-msg.txt
+logs/env_vpn_type_backup_*
+vpn_cfg*.json
+pp1.json
+tmp/
+tests/_*.txt
+*_diff_tmp.txt
