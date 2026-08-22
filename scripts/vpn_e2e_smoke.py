@@ -43,6 +43,8 @@ import sys
 
 import httpx
 
+_CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
+
 FAKE_KEY = "sk-e2e-test"                      # proxy picks its own key for upstream
 CONTAINER = "opencode-vpn"
 FAILED = 0
@@ -57,7 +59,8 @@ def check(name: str, ok: bool, detail: str = "") -> None:
 
 def docker(args: list[str]) -> str:
     out = subprocess.run(["docker", *args], capture_output=True, text=True,
-                         encoding="utf-8", errors="replace", timeout=120)
+                         encoding="utf-8", errors="replace", timeout=120,
+                         creationflags=_CREATE_NO_WINDOW)
     return out.stdout.strip()
 
 
