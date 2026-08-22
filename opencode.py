@@ -1665,8 +1665,8 @@ async def _get_cached_public_ip() -> str:
         return _public_ip_cache["ip"] or "unknown"
 
 
-# Free model cooldown: after a 429, skip free model per free-model for 60s
-_free_model_cooldown: dict[str, float] = {}  # free_model -> monotonic deadline
+# Free model cooldown: after a 429, skip free model per (free_model, ip) with Retry-After
+_free_model_cooldown: dict[tuple[str, str], float] = {}  # (free_model, ip) -> monotonic deadline
 _free_model_cooldown_until = 0.0  # legacy alias (kept for compat, unused)
 
 
@@ -2190,15 +2190,21 @@ async def _handle_chat_muse_spark_via_responses(req_id, start_time, client_ip, b
 
 
 async def _try_free_responses_first(body, headers, model_id):
-    """Free fallback for Responses API (uses responses_free_base)."""
+    """Free fallback for Responses API (uses responses_free_base). Per-IP + Retry-After."""
     free_model = FREE_MODEL_MAP.get(model_id)
     if not free_model:
         return None
-    _dl = _free_model_cooldown.get(free_model, 0)
+    # Determine IP before cooldown check (per-IP isolation, direct + vpn)
+    free_ip = ""
+    try:
+        free_ip = _vpn_manager.current_ip if _vpn_manager and _vpn_manager.current_ip else await _get_cached_public_ip()
+    except Exception:
+        free_ip = ""
+    _dl = _free_model_cooldown.get((free_model, free_ip), 0)
     if time.monotonic() < _dl:
-        _debug(f"  [free] skipping free responses {free_model!r} (cooldown)")
+        _debug(f"  [free] skipping free responses {free_model!r} ip={free_ip!r} (cooldown per-IP)")
         return None
-    _debug(f"  [free] trying free responses {free_model!r} instead of {model_id!r}")
+    _debug(f"  [free] trying free responses {free_model!r} ip={free_ip!r} instead of {model_id!r}")
     free_body = dict(body)
     free_body["model"] = free_model
     try:
@@ -2206,11 +2212,6 @@ async def _try_free_responses_first(body, headers, model_id):
     except NameError:
         endpoint = "https://opencode.ai/zen/v1/responses"
     free_headers = {"Content-Type": "application/json"}
-    free_ip = ""
-    try:
-        free_ip = _vpn_manager.current_ip if _vpn_manager and _vpn_manager.current_ip else await _get_cached_public_ip()
-    except Exception:
-        free_ip = ""
     t0 = time.monotonic()
     try:
         resp, resp_headers = await _do_request_with_retry(endpoint, free_body, free_headers, "openai", retry_on_429=False)
@@ -2232,11 +2233,16 @@ async def _try_free_responses_first(body, headers, model_id):
         _debug(f"  [free] {free_model!r} succeeded (responses)")
         return resp, resp_headers, free_model, free_ip
     if resp.status_code == 429:
-        _free_model_cooldown[free_model] = time.monotonic() + 60
+        try:
+            retry_after, reason = _parse_rate_limit_pause(resp.headers)
+        except Exception:
+            retry_after, reason = 60, "default"
+        _free_model_cooldown[(free_model, free_ip)] = time.monotonic() + retry_after
+        _debug(f"  [free] cooldown ip={free_ip!r} model={free_model!r} {retry_after:.0f}s ({reason}) per-IP")
         if _free_ip_pool and _free_ip_pool.enabled:
             asyncio.create_task(_free_ip_pool.on_quota_exhausted())
         return None
-    _debug(f"  [free] {free_model!r} returned {resp.status_code} (responses) -> fallback")
+    _debug(f"  [free] {free_model!r} returned {resp.status_code} (responses) ip={free_ip!r} -> fallback")
     return None
 
 
@@ -2261,28 +2267,38 @@ async def _try_free_model_first(body, headers, protocol, model_id,
 
     free_model = FREE_MODEL_MAP.get(model_id)
     if not free_model:
-        return None  # No free equivalent, proceed with paid
-
-    # Skip free model if recently rate-limited (per-model cooldown)
-    _dl = _free_model_cooldown.get(free_model, 0)
-    if time.monotonic() < _dl:
-        _debug(f"  [free] skipping free model {free_model!r} (cooldown active)")
         return None
 
-    _debug(f"  [free] trying free model {free_model!r} instead of {model_id!r}")
-
-    # Get current public IP for logging (VPN or direct)
+    # Determine IP before cooldown check (per-IP isolation, direct + vpn)
     free_ip = ""
     if _vpn_manager and _vpn_manager.current_ip:
         free_ip = _vpn_manager.current_ip
     else:
-        free_ip = await _get_cached_public_ip()
+        try:
+            free_ip = await _get_cached_public_ip()
+        except Exception:
+            free_ip = ""
 
-    # Ensure VPN is connected if rotation is enabled
+    # Skip free model if recently rate-limited per-IP
+    _dl = _free_model_cooldown.get((free_model, free_ip), 0)
+    if time.monotonic() < _dl:
+        _debug(f"  [free] skipping free model {free_model!r} ip={free_ip!r} (cooldown per-IP)")
+        return None
+
+    _debug(f"  [free] trying free model {free_model!r} ip={free_ip!r} instead of {model_id!r}")
+
+    # Ensure VPN is connected if rotation is enabled (may update IP)
     if _free_ip_pool and _free_ip_pool.enabled:
         await _free_ip_pool.on_request()
         if _vpn_manager and _vpn_manager.current_ip:
-            free_ip = _vpn_manager.current_ip
+            # Re-check per-IP after rotation (IP may have changed)
+            new_ip = _vpn_manager.current_ip
+            if new_ip != free_ip:
+                free_ip = new_ip
+                _dl2 = _free_model_cooldown.get((free_model, free_ip), 0)
+                if time.monotonic() < _dl2:
+                    _debug(f"  [free] skipping free model {free_model!r} ip={free_ip!r} after VPN rotation (cooldown per-IP)")
+                    return None
 
     # Free models don't need authentication — send minimal headers
     free_headers = {"Content-Type": "application/json"}
@@ -2391,8 +2407,13 @@ async def _try_free_model_first(body, headers, protocol, model_id,
         _debug(f"  [free] {free_model!r} 429 body={body_429!r} headers={headers_429}")
         _log(f"  FREE {free_model!r} RATE LIMITED (429) retry-after={retry_after}s → falling back to paid {model_id!r}")
 
-        # Per-model cooldown 60s (avoids sequential free→paid latency for this free variant only)
-        _free_model_cooldown[free_model] = time.monotonic() + 60
+        # Per-IP cooldown with Retry-After (direct + vpn)
+        try:
+            retry_after, reason = _parse_rate_limit_pause(resp.headers)
+        except Exception:
+            retry_after, reason = 60, "default"
+        _free_model_cooldown[(free_model, free_ip)] = time.monotonic() + retry_after
+        _debug(f"  [free] cooldown ip={free_ip!r} model={free_model!r} {retry_after:.0f}s ({reason}) per-IP")
 
         # If VPN rotation is enabled, switch IP on 429
         if _free_ip_pool and _free_ip_pool.enabled:
@@ -2400,8 +2421,8 @@ async def _try_free_model_first(body, headers, protocol, model_id,
 
         return None
 
-    # Other errors → fall back to paid
-    _debug(f"  [free] {free_model!r} returned {resp.status_code} → falling back to paid")
+    # Other errors → fall back to paid (no cooldown, 400 etc. ne bloque pas)
+    _debug(f"  [free] {free_model!r} returned {resp.status_code} ip={free_ip!r} → falling back to paid")
     return None
 
 
