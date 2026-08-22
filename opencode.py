@@ -4134,7 +4134,7 @@ async def messages(request: Request):
             _log(f"  CONVERSION ERROR: anthropic_to_responses_request failed: {type(e).__name__}: {e}")
             return _anthropic_error(400, f"Request conversion failed: {e}")
         # Non-stream path for muse-spark
-        if not is_stream:
+        if not _is_stream_norm:
             # Gratuit-first via Responses free endpoint
             if _should_try_free(model_id, thinking_type, effort):
                 free_resp = await _try_free_responses_first(responses_req, {}, model_id)
@@ -4169,7 +4169,7 @@ async def messages(request: Request):
                 return JSONResponse(status_code=e.status_code, content={"error": str(e)})
             account_alias = _alias_for_key(_key_from_headers(headers_rs, "openai"))
             if resp.status_code != 200:
-                await _log_and_save_error(req_id, model_id, original_model, start_time, resp.status_code, resp.text, protocol, is_stream, thinking_type, effort, client_ip, account_alias, tool_names, request_body=request_body, response_body={"error": resp.text[:2000]})
+                await _log_and_save_error(req_id, model_id, original_model, start_time, resp.status_code, resp.text, protocol, _is_stream_norm, thinking_type, effort, client_ip, account_alias, tool_names, request_body=request_body, response_body={"error": resp.text[:2000]})
                 return Response(content=resp.content, status_code=resp.status_code, media_type="application/json")
             try:
                 data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
@@ -4186,7 +4186,7 @@ async def messages(request: Request):
             return Response(content=json.dumps(anthro, ensure_ascii=False), media_type="application/json")
         # Streaming for muse-spark: collect via non-stream then synthesize SSE (collect-then-emit, TODO incremental)
         # For now, handle streaming by internally calling non-stream Responses and emitting Anthropic SSE
-        _debug(f"  [messages] muse-spark streaming via Responses collect-then-emit (is_stream={is_stream})")
+        _debug(f"  [messages] muse-spark streaming via Responses collect-then-emit (is_stream={_is_stream_norm})")
         # Reuse non-stream logic but emit as SSE
         async def muse_spark_stream(headers_rs):
             # Try free first
