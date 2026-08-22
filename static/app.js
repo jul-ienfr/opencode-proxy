@@ -763,16 +763,6 @@ async function fetchStats(from, to) {
     }
 }
 
-async function fetchToolRoutes(days = 7, showAll = false) {
-    try {
-        const params = `days=${days}` + (showAll ? '&all=true' : '');
-        return await apiFetch(`/api/tools?${params}`);
-    } catch (e) {
-        console.error('Failed to fetch tool routes:', e);
-        return [];
-    }
-}
-
 async function fetchHistory(from, to, page = 1) {
     try {
         const offset = (page - 1) * perPage;
@@ -1793,12 +1783,6 @@ function renderConfig(data) {
     // Custom routes table
     renderCustomRoutes(data.custom_routes || {}, modelIds);
 
-    // Tool routes table — fetch and render
-    fetchToolRoutes().then(tools => renderToolRoutes(tools, modelIds));
-
-    // Tool compatibility matrix — fetch and render
-    fetchToolCapabilities().then(data => renderToolCompatMatrix(data, modelIds));
-
     // Apply server-side language if different
     if (data.lang && data.lang !== getLang()) {
         setLang(data.lang);
@@ -1836,185 +1820,6 @@ function renderCustomRoutes(routes, modelIds) {
         </tr>`;
     }
     tbody.innerHTML = html;
-}
-
-function renderToolRoutes(tools, modelIds) {
-    const tbody = document.getElementById('tool-routes-tbody');
-    if (!tools || tools.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="4">' + t('config.tr_no_tools') + '</td></tr>';
-        return;
-    }
-    const opts = modelIds.map(id => `<option value="${id}">${id}</option>`).join('');
-    let html = '';
-    for (const tool of tools) {
-        const selectedRouted = tool.routed_to || '';
-        const isRouted = !!selectedRouted;
-        html += `<tr>
-            <td><code>${escHtml(tool.name)}</code></td>
-            <td>${tool.count}</td>
-            <td><select class="config-select tr-model-select" style="width:100%" data-tool="${escHtml(tool.name)}">
-                <option value="">—</option>
-                ${opts.replace(`value="${selectedRouted}"`, `value="${selectedRouted}" selected`)}
-            </select></td>
-            <td>${isRouted ? '<span class="status-ok">' + t('config.tr_routed') + '</span>' : '<span class="text-dim">' + t('config.tr_unrouted') + '</span>'}</td>
-        </tr>`;
-    }
-    tbody.innerHTML = html;
-}
-
-function gatherToolRoutes() {
-    const rows = document.querySelectorAll('#tool-routes-tbody tr');
-    const toolRoutes = {};
-    for (const row of rows) {
-        const select = row.querySelector('.tr-model-select');
-        if (!select) continue;
-        const toolName = select.dataset.tool;
-        const model = select.value;
-        if (toolName && model) {
-            const key = makeRouteKey(toolName);
-            toolRoutes[key] = { match: [toolName], model: model };
-        }
-    }
-    return toolRoutes;
-}
-
-// ── Tool Compatibility Matrix ──
-
-let _toolCompatData = null;
-
-async function fetchToolCapabilities() {
-    try {
-        return await apiFetch('/api/config/tool-capabilities');
-    } catch (e) {
-        console.error('Failed to fetch tool capabilities:', e);
-        return null;
-    }
-}
-
-function renderToolCompatMatrix(data, modelIds) {
-    const tbody = document.getElementById('tool-compat-tbody');
-    if (!data || !data.all_tools || data.all_tools.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="100">No tool data available yet. Make some requests first.</td></tr>';
-        return;
-    }
-    const caps = data.capabilities || {};
-    const tools = data.all_tools;
-    const models = data.all_models || modelIds;
-    const protocols = {};
-    // Build protocol map from MODELS config or default
-    for (const m of models) {
-        protocols[m] = 'openai'; // default
-    }
-
-    // Header row with tool names
-    let headerHtml = '<tr><th style="min-width:140px">Model</th><th>Protocol</th>';
-    for (const tool of tools) {
-        headerHtml += `<th style="writing-mode:vertical-lr;text-orientation:mixed;font-size:0.75em;min-width:36px">${escHtml(tool)}</th>`;
-    }
-    headerHtml += '<th>System Hint</th></tr>';
-
-    // Data rows
-    let bodyHtml = '';
-    for (const model of models) {
-        if (model === '_default' || model === '_doc') continue;
-        const cfg = caps[model] || {};
-        const defaults = caps['_default'] || {};
-        const supported = cfg.supported_tools || defaults.supported_tools;
-        const unsupported = cfg.unsupported_tools || defaults.unsupported_tools || [];
-        const hint = cfg.system_hint || defaults.system_hint || '';
-
-        bodyHtml += '<tr>';
-        bodyHtml += `<td><code style="font-size:0.85em">${escHtml(model)}</code></td>`;
-        bodyHtml += `<td class="text-dim" style="font-size:0.8em">${protocols[model] || 'openai'}</td>`;
-
-        for (const tool of tools) {
-            let supported_val;
-            if (supported !== null && supported !== undefined) {
-                supported_val = supported.includes(tool);
-            } else {
-                supported_val = !unsupported.includes(tool);
-            }
-            const cls = supported_val ? 'tc-supported' : 'tc-unsupported';
-            const icon = supported_val ? '✓' : '✗';
-            bodyHtml += `<td class="${cls}" style="text-align:center;cursor:pointer" data-model="${escHtml(model)}" data-tool="${escHtml(tool)}" onclick="toggleToolCompat(this)">${icon}</td>`;
-        }
-
-        const hintIcon = hint ? '💡' : '—';
-        bodyHtml += `<td style="text-align:center;font-size:0.9em" title="${escHtml(hint)}">${hintIcon}</td>`;
-        bodyHtml += '</tr>';
-    }
-
-    // Default row
-    if (caps['_default']) {
-        const def = caps['_default'];
-        bodyHtml += '<tr style="border-top:2px solid var(--border)">';
-        bodyHtml += '<td><code style="font-size:0.85em">_default</code></td>';
-        bodyHtml += '<td class="text-dim" style="font-size:0.8em">—</td>';
-        for (const tool of tools) {
-            const supported_val = def.unsupported_tools ? !def.unsupported_tools.includes(tool) : true;
-            const cls = supported_val ? 'tc-supported' : 'tc-unsupported';
-            const icon = supported_val ? '✓' : '✗';
-            bodyHtml += `<td class="${cls}" style="text-align:center;cursor:pointer" data-model="_default" data-tool="${escHtml(tool)}" onclick="toggleToolCompat(this)">${icon}</td>`;
-        }
-        bodyHtml += '<td style="text-align:center;font-size:0.9em">—</td>';
-        bodyHtml += '</tr>';
-    }
-
-    tbody.innerHTML = headerHtml + bodyHtml;
-    _toolCompatData = data;
-}
-
-function toggleToolCompat(td) {
-    const model = td.dataset.model;
-    const tool = td.dataset.tool;
-    const isCurrentlySupported = td.textContent.trim() === '✓';
-    td.textContent = isCurrentlySupported ? '✗' : '✓';
-    td.className = isCurrentlySupported ? 'tc-unsupported' : 'tc-supported';
-
-    // Update _toolCompatData
-    if (_toolCompatData && _toolCompatData.capabilities) {
-        const caps = _toolCompatData.capabilities;
-        const defaults = caps['_default'] || {};
-        const modelCfg = caps[model] || {};
-
-        // Switch between whitelist and blacklist modes
-        if (isCurrentlySupported) {
-            // Was supported, now unsupported — add to unsupported_tools
-            const unsupported = modelCfg.unsupported_tools || [];
-            if (!unsupported.includes(tool)) {
-                unsupported.push(tool);
-            }
-            caps[model] = { ...modelCfg, unsupported_tools: unsupported };
-        } else {
-            // Was unsupported, now supported — remove from unsupported_tools
-            let unsupported = modelCfg.unsupported_tools || [];
-            unsupported = unsupported.filter(t => t !== tool);
-            if (unsupported.length === 0 && !modelCfg.supported_tools) {
-                delete caps[model].unsupported_tools;
-            } else {
-                caps[model] = { ...modelCfg, unsupported_tools: unsupported };
-            }
-        }
-    }
-}
-
-async function saveToolCapabilities() {
-    if (!_toolCompatData || !_toolCompatData.capabilities) return;
-    const status = document.getElementById('tc-save-status');
-    try {
-        await apiFetch('/api/config/tool-capabilities', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(_toolCompatData.capabilities),
-        });
-        status.textContent = 'Saved!';
-        status.className = 'save-status success';
-        setTimeout(() => { status.textContent = ''; }, 3000);
-    } catch (e) {
-        status.textContent = 'Error saving';
-        status.className = 'save-status error';
-        console.error(e);
-    }
 }
 
 // ── Web Search config ──
@@ -2414,54 +2219,6 @@ function setupConfig() {
             console.error(e);
         }
     });
-
-    // ── Tool Routes: toggle universal tools visibility ──
-    document.getElementById('tr-show-all').addEventListener('change', async (e) => {
-        const tools = await fetchToolRoutes(7, e.target.checked);
-        renderToolRoutes(tools, availableModels);
-    });
-
-    // ── Tool Routes: save ──
-    document.getElementById('tr-save-btn').addEventListener('click', async () => {
-        const toolRoutes = gatherToolRoutes();
-
-        // Fetch existing custom routes and merge
-        const configData = await apiFetch('/api/config');
-        const existingRoutes = configData.custom_routes || {};
-
-        // Remove old tool routes (those matching known tool names from the current data)
-        const currentTools = await fetchToolRoutes(7, true); // fetch all including universal
-        const currentToolNames = new Set(currentTools.map(t => t.name));
-        for (const key of Object.keys(existingRoutes)) {
-            const matches = existingRoutes[key].match || [];
-            if (matches.some(m => currentToolNames.has(m))) {
-                delete existingRoutes[key];
-            }
-        }
-
-        // Merge new tool routes
-        const mergedRoutes = { ...existingRoutes, ...toolRoutes };
-
-        const status = document.getElementById('tr-save-status');
-        try {
-            await apiFetch('/api/config/custom-routes', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(mergedRoutes),
-            });
-            status.textContent = t('config.tr_saved');
-            status.className = 'save-status success';
-            setTimeout(() => { status.textContent = ''; }, 3000);
-            fetchConfig().then(renderConfig);
-        } catch (e) {
-            status.textContent = 'Error saving';
-            status.className = 'save-status error';
-            console.error(e);
-        }
-    });
-
-    // ── Tool Capabilities save ──
-    document.getElementById('tc-save-btn').addEventListener('click', saveToolCapabilities);
 
     // ── Web Search config ──
     fetchWebSearchConfig();

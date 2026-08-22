@@ -254,24 +254,6 @@ custom_routes:
     - deepseek-v4-flash
     model: muse-spark-1.2-contributor
 api_keys: []
-tool_capabilities:
-  _default:
-    supported_tools: null
-    unsupported_tools: []
-    system_hint: null
-  mimo-v2-pro:
-    supported_tools: []
-    unsupported_tools:
-    - Read
-    - Write
-    - Edit
-    - Bash
-    - Grep
-    - Glob
-    - WebSearch
-    - WebFetch
-    - TodoWrite
-    system_hint: null
 web_search:
   mode: duckduckgo
   target_model: null
@@ -304,7 +286,6 @@ background:
   health_cache_ttl: 15
   health_timeout: 5
   custom_routes_check_interval: 5
-  tool_cap_check_interval: 5
 streaming:
   sse_keepalive_interval: 15
   line_buffer_max: 1000000

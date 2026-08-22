@@ -69,7 +69,6 @@ class _TTLCache:
             self._store.clear()
 
 _stats_cache = _TTLCache(ttl=10.0)
-_tools_cache = _TTLCache(ttl=30.0)
 
 # Cache for local IP resolution (rarely changes)
 _local_ips_cache: tuple[float, list] | None = None
@@ -1050,43 +1049,6 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
         _debug(f"  [config] custom routes updated ({len(body)} routes)")
         save_custom_routes(body)
         return {"status": "ok", "message": "Custom routes updated."}
-
-    @app.get("/api/config/tool-capabilities")
-    async def get_tool_capabilities():
-        from config import TOOL_CAPABILITIES, MODELS
-        # Get all known tools from the database
-        where, params = _build_where(daysAgo(30), None)
-        def _query_all_tools():
-            return conn.execute(
-                "SELECT tools FROM requests " + where + " AND tools IS NOT NULL AND tools != '[]'",
-                params,
-            ).fetchall()
-        rows = await _db_query_sync(_query_all_tools)
-        all_tools = set()
-        for row in rows:
-            try:
-                tools = json.loads(row["tools"]) if isinstance(row["tools"], str) else []
-                for t in tools:
-                    if isinstance(t, str):
-                        all_tools.add(t)
-            except (json.JSONDecodeError, TypeError):
-                continue
-        return {
-            "capabilities": TOOL_CAPABILITIES,
-            "all_tools": sorted(all_tools),
-            "all_models": sorted(MODELS.keys()),
-        }
-
-    @app.post("/api/config/tool-capabilities")
-    async def update_tool_capabilities(request: Request):
-        err = _check_dashboard_token(request)
-        if err:
-            return err
-        body = await request.json()
-        from config import save_tool_capabilities
-        _debug(f"  [config] tool capabilities updated ({len(body)} entries)")
-        save_tool_capabilities(body)
-        return {"status": "ok", "message": "Tool capabilities updated."}
 
     @app.get("/api/config/web-search")
     async def get_web_search_config():
@@ -2715,54 +2677,6 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
         if err:
             return err
         return _traffic_capture.stats(window=max(1.0, window))
-
-    @app.get("/api/tools")
-    async def get_tools(days: int = 7, all: bool = False):
-        """Aggregate tool names from recent requests.
-        Set ?all=true to include universal tools (Read, Write, etc.)."""
-        cache_key = f"tools:{days}:{all}"
-        cached = _tools_cache.get(cache_key)
-        if cached is not None:
-            return cached
-
-        where, params = _build_where(daysAgo(days), None)
-        def _query_tools():
-            return conn.execute(
-                "SELECT tools FROM requests " + where + " AND tools IS NOT NULL AND tools != '[]'",
-                params,
-            ).fetchall()
-        rows = await _db_query_sync(_query_tools)
-
-        # Aggregate tool names and count occurrences
-        tool_counts = {}
-        for row in rows:
-            try:
-                tools = json.loads(row["tools"]) if isinstance(row["tools"], str) else []
-                for tool in tools:
-                    if isinstance(tool, str):
-                        tool_counts[tool] = tool_counts.get(tool, 0) + 1
-            except (json.JSONDecodeError, TypeError):
-                continue
-
-        # Sort by frequency descending
-        sorted_tools = sorted(tool_counts.items(), key=lambda x: -x[1])
-
-        # Filter out universal tools unless ?all=true
-        if not all:
-            sorted_tools = [(n, c) for n, c in sorted_tools if n not in UNIVERSAL_TOOLS]
-
-        # Check if any tool matches an existing custom route
-        custom_routes = CUSTOM_ROUTES
-        result = []
-        for name, count in sorted_tools:
-            routed_to = None
-            for route_key, route_info in custom_routes.items():
-                if route_info.get("match") and name in route_info["match"]:
-                    routed_to = route_info.get("model")
-                    break
-            result.append({"name": name, "count": count, "routed_to": routed_to})
-        _tools_cache.set(cache_key, result)
-        return result
 
     # ── Stats & history ──
 

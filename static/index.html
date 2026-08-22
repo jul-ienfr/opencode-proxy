@@ -815,57 +815,7 @@
                     </div>
                 </div>
 
-                <!-- Tool Routing -->
-                <div class="card">
-                    <h2 data-i18n="config.tool_routing">Tool Routing</h2>
-                    <p class="config-hint" data-i18n="config.tool_routing_desc">Assign a backend model to each tool detected in recent requests. Routes are created automatically as custom mappings.</p>
-                    <label style="display:flex;align-items:center;gap:8px;margin-bottom:8px;cursor:pointer;font-size:0.85em;">
-                        <input type="checkbox" id="tr-show-all"> <span data-i18n="config.tr_show_all">Show universal tools (Read, Write, Bash…)</span>
-                    </label>
-                    <div class="tool-routes-table">
-                        <table id="tool-routes-table">
-                            <thead>
-                                <tr>
-                                    <th data-i18n="config.tr_tool">Tool</th>
-                                    <th data-i18n="config.tr_count">Uses</th>
-                                    <th data-i18n="config.tr_backend">Backend Model</th>
-                                    <th data-i18n="config.tr_status">Status</th>
-                                </tr>
-                            </thead>
-                            <tbody id="tool-routes-tbody">
-                                <tr><td colspan="4" data-i18n="stats.loading">Loading...</td></tr>
-                            </tbody>
-                        </table>
-                    </div>
-                    <div class="config-actions" style="margin-top: 10px;">
-                        <button class="btn btn-primary" id="tr-save-btn" data-i18n="config.tr_save">Save Tool Routes</button>
-                        <span id="tr-save-status" class="save-status"></span>
-                    </div>
-                </div>
 
-                <!-- Tool Compatibility Matrix -->
-                <div class="card">
-                    <h2>Tool Compatibility</h2>
-                    <p class="config-hint">Configure which tools each model supports. Unsupported tools are filtered out before sending requests to the model.</p>
-                    <div class="tool-compat-table" style="overflow-x:auto;">
-                        <table id="tool-compat-table">
-                            <thead>
-                                <tr>
-                                    <th style="min-width:140px">Model</th>
-                                    <th>Protocol</th>
-                                    <th colspan="100" style="text-align:center">Tools (✓ = supported, ✗ = filtered)</th>
-                                </tr>
-                            </thead>
-                            <tbody id="tool-compat-tbody">
-                                <tr><td colspan="100" data-i18n="stats.loading">Loading...</td></tr>
-                            </tbody>
-                        </table>
-                    </div>
-                    <div class="config-actions" style="margin-top: 10px;">
-                        <button class="btn btn-primary" id="tc-save-btn">Save Tool Capabilities</button>
-                        <span id="tc-save-status" class="save-status"></span>
-                    </div>
-                </div>
 
                 <!-- Web Search -->
                 <div class="card">

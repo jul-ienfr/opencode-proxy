@@ -27,7 +27,6 @@ CONFIG_PATH = os.path.join(ROOT, "config.yaml")
 ENV_PATH = os.path.join(ROOT, ".env")
 CUSTOM_ROUTES_PATH = os.path.join(ROOT, "custom_routes.json")
 API_KEYS_PATH = os.path.join(ROOT, "api_keys.json")
-TOOL_CAPABILITIES_PATH = os.path.join(ROOT, "tool_capabilities.json")
 
 # Config keys safe to expose via API (not secrets)
 CONFIG_KEYS = ["OPENCODE_PROXY", "OPENCODE_HOST", "OPENCODE_PORT", "OPENCODE_WEB_PORT",
@@ -970,40 +969,6 @@ def save_custom_routes(routes: dict):
     save_yaml_config()
 
 
-# ── Tool Capabilities ───────────────────────────────────────────────
-
-def load_tool_capabilities() -> dict:
-    """Load tool capabilities from YAML or JSON file."""
-    yaml_tc = yaml_get("tool_capabilities", default={})
-    if yaml_tc:
-        return yaml_tc
-    if os.path.exists(TOOL_CAPABILITIES_PATH):
-        try:
-            with open(TOOL_CAPABILITIES_PATH, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                if isinstance(data, dict):
-                    return data
-        except Exception as e:
-            logging.warning("Failed to load tool_capabilities.json: %s", e)
-    return {}
-
-
-def save_tool_capabilities(capabilities: dict):
-    """Save tool capabilities to YAML config."""
-    _yaml_data["tool_capabilities"] = capabilities
-    save_yaml_config()
-    TOOL_CAPABILITIES.clear()
-    TOOL_CAPABILITIES.update(capabilities)
-
-
-def get_tool_config(model_id: str) -> dict:
-    """Return tool config for a model, falling back to _default."""
-    defaults = {"supported_tools": None, "unsupported_tools": [], "system_hint": None, "fallback_model": None}
-    model_cfg = TOOL_CAPABILITIES.get(model_id, {})
-    default_cfg = TOOL_CAPABILITIES.get("_default", {})
-    return {**defaults, **default_cfg, **model_cfg}
-
-
 # ── API Keys ────────────────────────────────────────────────────────
 
 def load_api_keys() -> list[dict]:
@@ -1045,7 +1010,6 @@ def save_api_keys(configs: list[dict]):
 CUSTOM_ROUTES = load_custom_routes()
 ROUTES = load_routes()
 API_KEYS = load_api_keys()
-TOOL_CAPABILITIES = load_tool_capabilities()
 
 
 # ── Hot-reload: Custom Routes ───────────────────────────────────────
@@ -1165,39 +1129,6 @@ def maybe_reload_custom_routes():
                 logging.info("Reloaded routes (%d routes, cfg_changed=%s)", len(ROUTES), cfg_changed)
     except Exception as e:
         logging.warning("Failed to reload config: %s", e)
-
-
-# ── Hot-reload: Tool Capabilities ───────────────────────────────────
-
-_tool_cap_mtime = _get_mtime(TOOL_CAPABILITIES_PATH)
-_tool_cap_last_check = 0.0
-_TOOL_CAP_CHECK_INTERVAL = yaml_get("background", "tool_cap_check_interval", 5)
-_tool_cap_lock = threading.Lock()
-
-
-def maybe_reload_tool_capabilities():
-    """Re-read tool_capabilities.json if modified. Rate-limited, thread-safe."""
-    global _tool_cap_mtime, _tool_cap_last_check
-    now = time.time()
-    if now - _tool_cap_last_check < _TOOL_CAP_CHECK_INTERVAL:
-        return
-    _tool_cap_last_check = now
-    try:
-        mtime = _get_mtime(TOOL_CAPABILITIES_PATH)
-        if mtime == _tool_cap_mtime:
-            return
-        _tool_cap_mtime = mtime
-
-        new_tc = load_tool_capabilities()
-        with _tool_cap_lock:
-            old_keys = set(TOOL_CAPABILITIES.keys())
-            new_keys = set(new_tc.keys())
-            for k in (new_keys - old_keys) | (new_keys & old_keys):
-                TOOL_CAPABILITIES[k] = new_tc[k]
-            for k in old_keys - new_keys:
-                del TOOL_CAPABILITIES[k]
-    except Exception as e:
-        logging.warning("Failed to reload tool_capabilities.json: %s", e)
 
 
 def get_model_config(model_id: str) -> dict:
