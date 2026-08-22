@@ -1782,7 +1782,7 @@ def anthropic_messages_to_responses_input(messages):
                         args = json.dumps(b.get("input", {}), ensure_ascii=False)
                     except Exception:
                         args = "{}"
-                    out.append({"type": "function_call", "id": b.get("id", f"call_{uuid.uuid4().hex[:12]}"), "name": b.get("name", ""), "arguments": args})
+                    out.append({"type": "function_call", "call_id": b.get("id", f"call_{uuid.uuid4().hex[:12]}"), "name": b.get("name", ""), "arguments": args})
                     continue
                 elif t == "tool_result":
                     out.append({"type": "function_call_output", "call_id": b.get("tool_use_id", ""), "output": b.get("content", "") if isinstance(b.get("content"), str) else json.dumps(b.get("content"), ensure_ascii=False)})
@@ -1882,7 +1882,7 @@ def openai_chat_to_responses_request(chat_body: dict, model: str) -> dict:
         if m.get("tool_calls"):
             for tc in m["tool_calls"]:
                 fn = tc.get("function", {})
-                inp.append({"type": "function_call", "id": tc.get("id", ""), "name": fn.get("name", ""), "arguments": fn.get("arguments", "{}")})
+                inp.append({"type": "function_call", "call_id": tc.get("id", ""), "name": fn.get("name", ""), "arguments": fn.get("arguments", "{}")})
             if parts:
                 inp.append({"role": role, "content": parts})
             continue
@@ -1946,7 +1946,7 @@ def responses_output_to_anthropic_content(output, model="", wants_thinking=True)
                 inp = json.loads(item.get("arguments", "{}"))
             except Exception:
                 inp = {}
-            blocks.append({"type": "tool_use", "id": item.get("id", f"toolu_{uuid.uuid4().hex[:8]}"), "name": item.get("name", ""), "input": inp})
+            blocks.append({"type": "tool_use", "id": item.get("call_id", item.get("id", f"toolu_{uuid.uuid4().hex[:8]}")), "name": item.get("name", ""), "input": inp})
     if not blocks:
         blocks.append({"type": "text", "text": ""})
     return blocks
@@ -1981,7 +1981,7 @@ def responses_to_chat(resp: dict, original_model: str, wants_thinking=True) -> d
                     args = json.dumps(args, ensure_ascii=False)
             except Exception:
                 args = "{}"
-            tool_calls.append({"id": item.get("id", f"call_{uuid.uuid4().hex[:8]}"), "type": "function", "function": {"name": item.get("name", ""), "arguments": args}})
+            tool_calls.append({"id": item.get("call_id", item.get("id", f"call_{uuid.uuid4().hex[:8]}")), "type": "function", "function": {"name": item.get("name", ""), "arguments": args}})
     # Fallback: if no message item but text in other
     content_text = "\n".join(text_parts)
     usage = resp.get("usage", {})
@@ -3572,7 +3572,7 @@ def openai_responses_to_anthropic(body: dict) -> dict:
                 "role": "assistant",
                 "content": [{
                     "type": "tool_use",
-                    "id": item.get("id", f"toolu_{uuid.uuid4().hex[:12]}"),
+                    "id": item.get("call_id", item.get("id", f"toolu_{uuid.uuid4().hex[:12]}")),
                     "name": item.get("name", ""),
                     "input": inp,
                 }]
@@ -3691,7 +3691,7 @@ def anthropic_to_openai_responses(anthro: dict, model: str) -> dict:
         elif btype == "tool_use":
             function_calls.append({
                 "type": "function_call",
-                "id": block.get("id", f"call_{uuid.uuid4().hex[:12]}"),
+                "call_id": block.get("id", f"call_{uuid.uuid4().hex[:12]}"),
                 "name": block.get("name", ""),
                 "arguments": json.dumps(block.get("input", {}), ensure_ascii=False),
                 "status": "completed",
@@ -3762,7 +3762,7 @@ def openai_chat_to_responses(chat_resp: dict, model: str) -> dict:
         fn = tc.get("function", {})
         output_items.append({
             "type": "function_call",
-            "id": tc.get("id", f"call_{uuid.uuid4().hex[:12]}"),
+            "call_id": tc.get("id", f"call_{uuid.uuid4().hex[:12]}"),
             "name": fn.get("name", ""),
             "arguments": fn.get("arguments", "{}"),
             "status": "completed",
