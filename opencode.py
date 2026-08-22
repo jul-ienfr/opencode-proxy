@@ -2242,7 +2242,7 @@ async def _try_free_responses_first(body, headers, model_id):
         if _free_ip_pool and _free_ip_pool.enabled:
             asyncio.create_task(_free_ip_pool.on_quota_exhausted())
         return None
-    _debug(f"  [free] {free_model!r} returned {resp.status_code} (responses) ip={free_ip!r} -> fallback")
+    _debug(f"  [free] {free_model!r} returned {resp.status_code} (responses) ip={free_ip!r} body={resp.text[:2000]!r} -> fallback")
     return None
 
 
@@ -2422,7 +2422,7 @@ async def _try_free_model_first(body, headers, protocol, model_id,
         return None
 
     # Other errors → fall back to paid (no cooldown, 400 etc. ne bloque pas)
-    _debug(f"  [free] {free_model!r} returned {resp.status_code} ip={free_ip!r} → falling back to paid")
+    _debug(f"  [free] {free_model!r} returned {resp.status_code} ip={free_ip!r} body={resp.text[:2000]!r} → falling back to paid")
     return None
 
 
