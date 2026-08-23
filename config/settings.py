@@ -1281,28 +1281,11 @@ def save_api_keys(configs: list[dict]):
     API_KEYS[:] = configs  # Atomic replacement — readers never see empty list
 
 
-def load_tool_capabilities() -> dict:
-    """Load tool compat capabilities (optional, fallback to empty if missing)."""
-    compat_path = os.path.join(
-        os.path.dirname(os.path.dirname(__file__)), "tool_compat_results.json"
-    )
-    if os.path.exists(compat_path):
-        try:
-            with open(compat_path, encoding="utf-8") as f:
-                data = json.load(f)
-                if isinstance(data, dict):
-                    return data
-        except Exception:
-            pass
-    return {}
-
-
 # ── Module-level state ──────────────────────────────────────────────
 
 CUSTOM_ROUTES = load_custom_routes()
 ROUTES = load_routes()
 API_KEYS = load_api_keys()
-TOOL_CAPABILITIES = load_tool_capabilities()
 
 
 # ── Hot-reload: Custom Routes ───────────────────────────────────────
