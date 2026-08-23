@@ -119,7 +119,7 @@ docker run -d \
 
 ## Remote Server Maintenance (192.168.31.101)
 
-Le serveur distant est une Ubuntu 24.04 qui héberge l'opencode-proxy ainsi que d'autres workloads (P-core, etc.).
+Le serveur distant est une Ubuntu 24.04 qui héberge d'autres workloads (P-core, etc.).
 
 ### Problème connu : VS Code Remote-SSH
 
