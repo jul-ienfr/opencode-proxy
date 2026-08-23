@@ -23,6 +23,14 @@ except ImportError:
         return c
 
 
+"""
+Contrat config — audit F-H4:
+- YAML (config.yaml) = source primaire (upstream, routing, models, ip_rotation, geo, cache, etc.)
+- ENV (.env) = secrets only (OPENCODE_API_KEY, OPENCODE_PROXY, DASHBOARD_TOKEN, OPENCODE_GO_*, PROXY)
+- ENV_DIVERGENCE guard: warn when VPN_*/GEO_* env differs from .env file (compose children inherit process env, file not reloaded)
+- Hot-reload: maybe_reload_custom_routes() poll 5s (vs inotify: cross-platform Windows/Linux, cheap mtime stat, no watchdog dep)
+"""
+
 logger = logging.getLogger(__name__)
 
 # ── Paths ────────────────────────────────────────────────────────────
@@ -1331,6 +1339,8 @@ def maybe_reload_custom_routes():
 
     Single source: config.yaml holds geo policies; single poller + single
     _reload_lock. Atomic order: yaml_data -> IP_ROTATION -> geo -> routes -> SORTED_*.
+    Poll 5s vs inotify: mtime check is O(1), cross-platform (Windows + Linux),
+    no extra dep (watchdog), negligible cost vs per-request stat; 5s coalesces bursts.
     """
     global _custom_routes_mtime, _custom_routes_last_check, _config_yaml_mtime
     global \

@@ -69,10 +69,13 @@ import email.utils
 import datetime
 
 # ── API key routing ──
-_key_cycle = None
-_key_cycle_keys = []
+# F-H3: threading.Lock kept (sync+async mix avoids asyncio.Lock deadlock from sync thread).
+# itertools.cycle replaced by atomic index modulo under lock — no async-unsafe cycle.
+_key_cycle = None  # legacy, kept for compat (now unused)
+_key_cycle_keys: list[str] = []
+_key_cycle_index: int = 0
 _key_failover_index = 0
-_key_cycle_lock = threading.Lock()
+_key_cycle_lock = threading.Lock()  # protects _key_cycle_keys/_key_cycle_index
 
 
 def _get_enabled_keys() -> list[dict]:
@@ -141,17 +144,20 @@ def get_next_api_key() -> dict:
         _debug(f"  [apikey] failover exhausted, falling back to .env key")
         return _env_key_or_raise()
 
-    # Round-robin: rebuild cycle from available keys only
+    # Round-robin: atomic index modulo under threading.Lock (no itertools.cycle)
+    global _key_cycle_index, _key_cycle_keys
     with _key_cycle_lock:
         current_ids = [k.get("api_key") for k in available]
-        if _key_cycle is None or _key_cycle_keys != current_ids:
-            _key_cycle = itertools.cycle(available)
+        if _key_cycle_keys != current_ids:
             _key_cycle_keys = current_ids
+            _key_cycle_index = 0
             _debug(
-                f"  [apikey] round-robin cycle rebuilt: {len(available)} available keys (filtered from {len(enabled)} enabled)"
+                f"  [apikey] round-robin index reset: {len(available)} available keys (filtered from {len(enabled)} enabled)"
             )
-        selected = next(_key_cycle)
-        _debug(f"  [apikey] round-robin selected alias={selected.get('alias', '?')}")
+        idx = _key_cycle_index % len(available) if available else 0
+        selected = available[idx]
+        _key_cycle_index = (idx + 1) % len(available) if available else 0
+        _debug(f"  [apikey] round-robin selected alias={selected.get('alias', '?')} idx={idx}")
         return selected
 
 
