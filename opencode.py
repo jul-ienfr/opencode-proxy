@@ -1283,7 +1283,9 @@ def _drop_orphan_tool_messages(messages: list[dict]) -> list[dict]:
             if cid in _seen_ids:
                 filtered.append(m)
             else:
-                _debug(f"  [orphan] DROP tool output call_id={cid!r} — no preceding tool_call (compaction or empty-name skip)")
+                _debug(
+                    f"  [orphan] DROP tool output call_id={cid!r} — no preceding tool_call (compaction or empty-name skip)"
+                )
         else:
             filtered.append(m)
     return filtered
@@ -1305,7 +1307,9 @@ def _drop_orphan_responses_input(inp: list[dict]) -> list[dict]:
             if cid in _known:
                 _filt.append(it)
             else:
-                _debug(f"  [orphan] DROP function_call_output call_id={cid!r} — no preceding function_call")
+                _debug(
+                    f"  [orphan] DROP function_call_output call_id={cid!r} — no preceding function_call"
+                )
         else:
             _filt.append(it)
     return _filt
@@ -5159,11 +5163,13 @@ from protocol_mapping import (
     _json_dumps,
     _json_dumps_str,
 )
+
 # Re-export _orig for internal wrapper compatibility (used by cache logic)
 try:
     from protocol_mapping import _orig_anthropic_to_openai, _anthropic_cache, _anthropic_cache_max
 except ImportError:
     pass
+
 
 async def _finalize_and_close_stream(
     started,

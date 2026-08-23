@@ -166,8 +166,16 @@ class TestAnthropicToOpenAI:
             "model": "kimi-k2.6",
             "max_tokens": 100,
             "messages": [
-                {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_abc", "name": "", "input": {}}]},
-                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_abc", "content": "ok"}]},
+                {
+                    "role": "assistant",
+                    "content": [{"type": "tool_use", "id": "toolu_abc", "name": "", "input": {}}],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "tool_result", "tool_use_id": "toolu_abc", "content": "ok"}
+                    ],
+                },
             ],
             "tools": [{"name": "web_search", "input_schema": {"type": "object", "properties": {}}}],
         }
@@ -178,7 +186,12 @@ class TestAnthropicToOpenAI:
         body = {
             "model": "kimi-k2.6",
             "messages": [
-                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_c147b7bf", "content": "data"}]},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "tool_result", "tool_use_id": "toolu_c147b7bf", "content": "data"}
+                    ],
+                },
                 {"role": "user", "content": "next turn"},
             ],
         }
@@ -189,13 +202,24 @@ class TestAnthropicToOpenAI:
         chat = {
             "model": "muse-test",
             "messages": [
-                {"role": "assistant", "tool_calls": [{"id": "call_keep", "type": "function", "function": {"name": "lookup", "arguments": "{}"}}]},
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call_keep",
+                            "type": "function",
+                            "function": {"name": "lookup", "arguments": "{}"},
+                        }
+                    ],
+                },
                 {"role": "tool", "tool_call_id": "call_keep", "content": "ok"},
                 {"role": "tool", "tool_call_id": "toolu_orphan", "content": "orphan"},
             ],
         }
         req = _chat_to_responses_request(chat)
-        out_ids = {i.get("call_id") for i in req["input"] if i.get("type") == "function_call_output"}
+        out_ids = {
+            i.get("call_id") for i in req["input"] if i.get("type") == "function_call_output"
+        }
         assert "toolu_orphan" not in out_ids
         assert "call_keep" in out_ids
 
@@ -204,7 +228,16 @@ class TestAnthropicToOpenAI:
             "model": "muse-test",
             "messages": [
                 {"role": "tool", "tool_call_id": "call_future", "content": "early"},
-                {"role": "assistant", "tool_calls": [{"id": "call_future", "type": "function", "function": {"name": "f", "arguments": "{}"}}]},
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call_future",
+                            "type": "function",
+                            "function": {"name": "f", "arguments": "{}"},
+                        }
+                    ],
+                },
             ],
         }
         req = _chat_to_responses_request(chat)
