@@ -16,12 +16,106 @@ try:
 except Exception:
     _encoding = None
 
-CACHE_REWRITE_MODELS = set(
-    yaml_get(
-        "cache_rewrite_models",
-        default=["mimo-v2.5", "mimo-v2-pro", "mimo-v2-omni", "mimo-v2.5-pro"],
-    )
-)
+# ── orjson fast-path (5-10x vs stdlib json on large bodies) ──
+try:
+    import orjson as _orjson  # type: ignore
+
+    def _json_loads(b: bytes | str, **kw):
+        if isinstance(b, str):
+            b = b.encode()
+        return _orjson.loads(b)
+
+    def _json_dumps(obj, **kw) -> bytes:
+        if kw.get("indent") is not None:
+            return json.dumps(
+                obj, ensure_ascii=False, indent=kw.get("indent"), default=str
+            ).encode()
+        return _orjson.dumps(obj)
+
+    def _json_dumps_str(obj, **kw) -> str:
+        if kw.get("indent") is not None:
+            return json.dumps(obj, ensure_ascii=False, indent=kw.get("indent"), default=str)
+        if kw:
+            return _orjson.dumps(obj).decode()
+        return _orjson.dumps(obj).decode()
+
+    _JSON_LIB = "orjson"
+except ImportError:
+
+    def _json_loads(b: bytes | str, **kw):  # type: ignore[no-redef]
+        if isinstance(b, bytes):
+            b = b.decode()
+        return json.loads(b, **kw)
+
+    def _json_dumps(obj, **kw) -> bytes:  # type: ignore[no-redef]
+        if "indent" in kw:
+            return json.dumps(
+                obj, ensure_ascii=False, indent=kw.get("indent"), default=str
+            ).encode()
+        return json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode()
+
+    def _json_dumps_str(obj, **kw) -> str:  # type: ignore[no-redef]
+        if "indent" in kw:
+            return json.dumps(obj, ensure_ascii=False, indent=kw.get("indent"), default=str)
+        return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+
+    _JSON_LIB = "json"
+
+
+def _drop_orphan_tool_messages(messages: list[dict]) -> list[dict]:
+    """Filter role:tool messages whose tool_call_id has no preceding tool_calls id."""
+    _seen_ids: set[str] = set()
+    filtered: list[dict] = []
+    for m in messages:
+        if m.get("tool_calls"):
+            for tc in m["tool_calls"]:
+                tid = tc.get("id")
+                if tid:
+                    _seen_ids.add(tid)
+            filtered.append(m)
+        elif m.get("role") == "tool":
+            cid = m.get("tool_call_id", "")
+            if cid in _seen_ids:
+                filtered.append(m)
+            else:
+                _debug(f"  [orphan] DROP tool output call_id={cid!r} — no preceding tool_call (compaction or empty-name skip)")
+        else:
+            filtered.append(m)
+    return filtered
+
+
+def _drop_orphan_responses_input(inp: list[dict]) -> list[dict]:
+    """Filter function_call_output items whose call_id has no preceding function_call."""
+    _known: set[str] = set()
+    _filt: list[dict] = []
+    for it in inp:
+        t = it.get("type")
+        if t == "function_call":
+            cid = it.get("call_id") or it.get("id") or ""
+            if cid:
+                _known.add(cid)
+            _filt.append(it)
+        elif t == "function_call_output":
+            cid = it.get("call_id") or ""
+            if cid in _known:
+                _filt.append(it)
+            else:
+                _debug(f"  [orphan] DROP function_call_output call_id={cid!r} — no preceding function_call")
+        else:
+            _filt.append(it)
+    return _filt
+
+
+def _extract_cache_tokens(usage: dict) -> int:
+    details = usage.get("prompt_tokens_details") or {}
+    if "cached_tokens" in details:
+        return details["cached_tokens"]
+    if "cached_tokens" in usage:
+        return usage["cached_tokens"]
+    if "cache_read_input_tokens" in usage:
+        return usage["cache_read_input_tokens"]
+    return 0
+
 
 _thinking_cfg = yaml_get("thinking", "min_tokens", {})
 THINKING_MODELS = (
@@ -83,6 +177,27 @@ def _find_split_point(text: str) -> int:
     if last_newline > 500:
         return last_newline
     return 0
+
+
+def _effort_to_reasoning(effort_level: str, model: str) -> str:
+    """Map generic effort (xhigh/high/medium/low) to model-specific reasoning_effort.
+
+    Deduplicates logic at 477 and 932 (audit F-M7): single source for glm-5/deepseek/mimo.
+    """
+    if model.startswith("glm-5"):
+        if effort_level in ("xhigh", "max", "high"):
+            return "high"
+        if effort_level == "medium":
+            return "medium"
+        return "low"
+    if model.startswith("deepseek-v4"):
+        return "max" if effort_level in ("xhigh", "max") else "high"
+    # mimo etc.
+    if effort_level in ("xhigh", "max", "high"):
+        return "high"
+    if effort_level == "medium":
+        return "medium"
+    return "low"
 
 
 def _restructure_for_cache(oai_body: dict, model_id: str) -> dict:
@@ -231,12 +346,16 @@ def anthropic_to_openai(body: dict, model: str) -> dict:
             elif btype == "thinking":
                 thinking_parts.append(block.get("thinking", ""))
             elif btype == "tool_use":
+                _tool_name = block.get("name", "")
+                if not isinstance(_tool_name, str) or not _tool_name.strip():
+                    _debug(f"  [convert] SKIP tool_use with empty name id={block.get('id', '?')}")
+                    continue
                 tool_calls.append(
                     {
                         "id": block.get("id", f"call_{uuid.uuid4().hex[:8]}"),
                         "type": "function",
                         "function": {
-                            "name": block.get("name", ""),
+                            "name": _tool_name.strip(),
                             "arguments": _json_dumps_str(block.get("input", {})),
                         },
                     }
@@ -287,6 +406,9 @@ def anthropic_to_openai(body: dict, model: str) -> dict:
             if last_cache_control and not is_asst and supports_cache_control:
                 out["cache_control"] = last_cache_control
             messages.append(out)
+
+    # ── Orphan filter: drop role:tool without preceding tool_calls id ──
+    messages = _drop_orphan_tool_messages(messages)
 
     # Add cache_control to the last user message for optimal prefix caching
     # (Anthropic best practice: cache system + last user turn)
@@ -391,41 +513,10 @@ def anthropic_to_openai(body: dict, model: str) -> dict:
         wants_thinking = False
 
     if wants_thinking:
-        if model.startswith("glm-5"):
-            # GLM-5.x supports reasoning_effort like mimo-v2.5
-            if effort_level in ("xhigh", "max"):
-                oai["reasoning_effort"] = "high"
-            elif effort_level in ("high",):
-                oai["reasoning_effort"] = "high"
-            elif effort_level in ("medium",):
-                oai["reasoning_effort"] = "medium"
-            else:
-                oai["reasoning_effort"] = "low"
-            _debug(
-                f"  [thinking] {model}: reasoning_effort={oai['reasoning_effort']} (effort={effort_level})"
-            )
-        elif model.startswith("deepseek-v4"):
-            # DeepSeek V4 only supports high and max
-            if effort_level in ("xhigh", "max"):
-                oai["reasoning_effort"] = "max"
-            else:
-                oai["reasoning_effort"] = "high"
-            _debug(
-                f"  [thinking] {model}: reasoning_effort={oai['reasoning_effort']} (effort={effort_level})"
-            )
-        else:
-            # MiMo V2.5 etc. supports low/medium/high
-            if effort_level in ("xhigh", "max"):
-                oai["reasoning_effort"] = "high"
-            elif effort_level in ("high",):
-                oai["reasoning_effort"] = "high"
-            elif effort_level in ("medium",):
-                oai["reasoning_effort"] = "medium"
-            else:
-                oai["reasoning_effort"] = "low"
-            _debug(
-                f"  [thinking] {model}: reasoning_effort={oai['reasoning_effort']} (effort={effort_level})"
-            )
+        oai["reasoning_effort"] = _effort_to_reasoning(effort_level, model)
+        _debug(
+            f"  [thinking] {model}: reasoning_effort={oai['reasoning_effort']} (effort={effort_level})"
+        )
 
     # Restructure system prompt for models without semantic caching
     oai = _restructure_for_cache(oai, model)
@@ -439,6 +530,11 @@ _anthropic_cache_max = 512
 
 def anthropic_to_openai(body: dict, model: str) -> dict:  # cached wrapper
     try:
+        # B2c: invalidate cache if body contains role None (poison)
+        for _m in body.get("messages", []) or []:
+            if isinstance(_m, dict) and _m.get("role") is None:
+                _debug("  [cache] skip cache — role None detected")
+                return _orig_anthropic_to_openai(body, model)
         b = _json_dumps(body)
         key = (model, hash(b))
         hit = _anthropic_cache.get(key)
@@ -844,41 +940,10 @@ def openai_responses_to_anthropic(body: dict) -> dict:
 
     if wants_thinking:
         _model = result.get("model", "")
-        if _model.startswith("glm-5"):
-            # GLM-5.x supports reasoning_effort like mimo-v2.5
-            if effort_level in ("xhigh", "max"):
-                result["reasoning_effort"] = "high"
-            elif effort_level in ("high",):
-                result["reasoning_effort"] = "high"
-            elif effort_level in ("medium",):
-                result["reasoning_effort"] = "medium"
-            else:
-                result["reasoning_effort"] = "low"
-            _debug(
-                f"  [thinking] {_model}: reasoning_effort={result['reasoning_effort']} (effort={effort_level})"
-            )
-        elif _model.startswith("deepseek-v4"):
-            # DeepSeek V4 only supports high and max
-            if effort_level in ("xhigh", "max"):
-                result["reasoning_effort"] = "max"
-            else:
-                result["reasoning_effort"] = "high"
-            _debug(
-                f"  [thinking] {_model}: reasoning_effort={result['reasoning_effort']} (effort={effort_level})"
-            )
-        else:
-            # MiMo V2.5 etc. supports low/medium/high
-            if effort_level in ("xhigh", "max"):
-                result["reasoning_effort"] = "high"
-            elif effort_level in ("high",):
-                result["reasoning_effort"] = "high"
-            elif effort_level in ("medium",):
-                result["reasoning_effort"] = "medium"
-            else:
-                result["reasoning_effort"] = "low"
-            _debug(
-                f"  [thinking] {_model}: reasoning_effort={result['reasoning_effort']} (effort={effort_level})"
-            )
+        result["reasoning_effort"] = _effort_to_reasoning(effort_level, _model)
+        _debug(
+            f"  [thinking] {_model}: reasoning_effort={result['reasoning_effort']} (effort={effort_level})"
+        )
 
     return result
 
@@ -1070,15 +1135,24 @@ def _chat_to_responses_request(chat: dict) -> dict:
                 inp.append(item)
         for tc in m.get("tool_calls", []) or []:
             fn = tc.get("function", {}) if isinstance(tc.get("function"), dict) else {}
+            _fn_name = fn.get("name", "")
+            if not isinstance(_fn_name, str) or not _fn_name.strip():
+                _debug(
+                    f"  [convert] SKIP function_call with empty name call_id={tc.get('call_id') or tc.get('id', '?')}"
+                )
+                continue
             _cid = tc.get("call_id") or tc.get("id") or f"call_{uuid.uuid4().hex[:12]}"
             inp.append(
                 {
                     "type": "function_call",
                     "call_id": _cid,
-                    "name": fn.get("name", ""),
+                    "name": _fn_name.strip(),
                     "arguments": fn.get("arguments", "{}"),
                 }
             )
+    # Orphan filter for Responses input
+    inp = _drop_orphan_responses_input(inp)
+
     # Guard: Responses input must be non-empty; log original chat for audit if empty
     if not inp:
         _debug(

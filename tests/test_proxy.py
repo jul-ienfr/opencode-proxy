@@ -105,9 +105,21 @@ class TestAnthropicToOpenAI:
         assert json.loads(msg["tool_calls"][0]["function"]["arguments"]) == {"query": "test"}
 
     def test_tool_results_conversion(self):
+        # Paired tool_use → tool_result (not orphan) should be preserved
         body = {
             "model": "claude-3-opus",
             "messages": [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_123",
+                            "name": "web_search",
+                            "input": {"query": "test"},
+                        },
+                    ],
+                },
                 {
                     "role": "user",
                     "content": [
@@ -117,14 +129,86 @@ class TestAnthropicToOpenAI:
                             "content": "result text",
                         },
                     ],
-                }
+                },
             ],
         }
         result = anthropic_to_openai(body, "claude-3-opus")
-        msg = result["messages"][0]
-        assert msg["role"] == "tool"
+        # Find the tool message (orphan filter keeps it because preceding tool_calls exists)
+        tool_msgs = [m for m in result["messages"] if m.get("role") == "tool"]
+        assert len(tool_msgs) == 1
+        msg = tool_msgs[0]
         assert msg["tool_call_id"] == "toolu_123"
         assert msg["content"] == "result text"
+
+    def test_tool_result_orphan_dropped(self):
+        # Orphan tool_result without preceding tool_use should be dropped (compaction case)
+        body = {
+            "model": "claude-3-opus",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_orphan",
+                            "content": "orphan",
+                        },
+                    ],
+                },
+                {"role": "user", "content": "next turn"},
+            ],
+        }
+        result = anthropic_to_openai(body, "claude-3-opus")
+        assert all(m.get("tool_call_id") != "toolu_orphan" for m in result["messages"])
+
+    def test_anthropic_empty_name_orphan_dropped(self):
+        body = {
+            "model": "kimi-k2.6",
+            "max_tokens": 100,
+            "messages": [
+                {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_abc", "name": "", "input": {}}]},
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_abc", "content": "ok"}]},
+            ],
+            "tools": [{"name": "web_search", "input_schema": {"type": "object", "properties": {}}}],
+        }
+        oai = anthropic_to_openai(body, "kimi-k2.6")
+        assert not any(m.get("role") == "tool" for m in oai["messages"])
+
+    def test_anthropic_compaction_orphan_dropped(self):
+        body = {
+            "model": "kimi-k2.6",
+            "messages": [
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_c147b7bf", "content": "data"}]},
+                {"role": "user", "content": "next turn"},
+            ],
+        }
+        oai = anthropic_to_openai(body, "kimi-k2.6")
+        assert all(m.get("tool_call_id") != "toolu_c147b7bf" for m in oai["messages"])
+
+    def test_chat_to_responses_orphan_dropped(self):
+        chat = {
+            "model": "muse-test",
+            "messages": [
+                {"role": "assistant", "tool_calls": [{"id": "call_keep", "type": "function", "function": {"name": "lookup", "arguments": "{}"}}]},
+                {"role": "tool", "tool_call_id": "call_keep", "content": "ok"},
+                {"role": "tool", "tool_call_id": "toolu_orphan", "content": "orphan"},
+            ],
+        }
+        req = _chat_to_responses_request(chat)
+        out_ids = {i.get("call_id") for i in req["input"] if i.get("type") == "function_call_output"}
+        assert "toolu_orphan" not in out_ids
+        assert "call_keep" in out_ids
+
+    def test_responses_input_order_matters(self):
+        chat = {
+            "model": "muse-test",
+            "messages": [
+                {"role": "tool", "tool_call_id": "call_future", "content": "early"},
+                {"role": "assistant", "tool_calls": [{"id": "call_future", "type": "function", "function": {"name": "f", "arguments": "{}"}}]},
+            ],
+        }
+        req = _chat_to_responses_request(chat)
+        assert not any(i.get("type") == "function_call_output" for i in req["input"])
 
     def test_thinking_blocks(self):
         body = {
