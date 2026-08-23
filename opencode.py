@@ -63,7 +63,6 @@ import itertools
 # ── API key routing ──
 # F-H3: threading.Lock kept (sync+async mix avoids asyncio.Lock deadlock from sync thread).
 # itertools.cycle replaced by atomic index modulo under lock — no async-unsafe cycle.
-_key_cycle = None  # legacy, kept for compat (now unused)
 _key_cycle_keys: list[str] = []
 _key_cycle_index: int = 0
 _key_failover_index = 0
@@ -92,7 +91,7 @@ def _env_key_or_raise() -> dict:
 
 
 def get_next_api_key() -> dict:
-    global _key_cycle, _key_cycle_keys, _key_failover_index
+    global _key_cycle_keys, _key_failover_index
     if not API_KEYS:
         _debug("  [apikey] no API_KEYS configured, falling back to .env key")
         return _env_key_or_raise()
@@ -1417,7 +1416,6 @@ def _ensure_http_client() -> httpx.AsyncClient:
 _vpn_manager = None
 _free_ip_pool = None
 # ── Geo gate isolation (P2) ──────────────────────────────────
-_geo_rotation_task = None
 _geo_breaker: dict = {}  # (country, station_id) -> consecutive failures
 _geo_breaker_threshold: int = 3
 _geo_pin_duration: list = []  # histogram buckets (ms)

@@ -300,14 +300,6 @@ cache_rewrite_models:
 - mimo-v2-omni
 - mimo-v2.5-pro
 dashboard:
-  universal_tools:
-  - Read
-  - Write
-  - Edit
-  - Bash
-  - Grep
-  - Glob
-  - WebSearch
   display_lines: 35
 free_discovery:
   enabled: true

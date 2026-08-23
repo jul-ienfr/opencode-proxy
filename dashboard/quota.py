@@ -41,11 +41,6 @@ async def _get_http_client() -> httpx.AsyncClient:
     return _http_client
 
 
-# ── Env var validation ──
-
-_WORKSPACE_ID_ENV = "OPENCODE_GO_WORKSPACE_ID"
-_AUTH_COOKIE_ENV = "OPENCODE_GO_AUTH_COOKIE"
-
 # ── Per-model capabilities ──
 
 MODEL_CAPABILITIES: dict[str, list[str]] = {
@@ -360,10 +355,6 @@ _OBJECT_START_PATTERNS = [
     lambda name: re.compile(rf"{re.escape(name)}\s*:\s*\{{"),
     lambda name: re.compile(rf"{re.escape(name)}\s*=\s*\{{"),
 ]
-
-
-def _is_string_char(ch: str, quote: str) -> bool:
-    return quote != "" and ch != quote
 
 
 def _read_object_literal(text: str, start_pos: int) -> str:

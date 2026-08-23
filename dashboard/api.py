@@ -50,9 +50,6 @@ _CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
 if hasattr(subprocess, "CREATE_NO_WINDOW"):
     _CREATE_NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
-# Tools that work on all models — hidden from routing UI by default
-UNIVERSAL_TOOLS = {"Read", "Write", "Edit", "Bash", "Grep", "Glob", "WebSearch"}
-
 
 # ── Simple TTL cache for expensive dashboard queries ──
 
