@@ -56,6 +56,7 @@ const LOCALE = {
         'vpn.hint': 'Rotate IP addresses for free model quota via OpenVPN',
         'vpn.status': 'Status',
         'vpn.current_ip': 'Current IP',
+        'vpn.identity': 'Identity',
         'vpn.current_server': 'Server',
         'vpn.requests_this_ip': 'Requests this IP',
         'vpn.total_free': 'Total free requests',
@@ -68,6 +69,13 @@ const LOCALE = {
         'vpn.servers': 'VPN Servers',
         'vpn.add_server': 'Add Server',
         'vpn.ip_history': 'IP History',
+        'vpn.ip': 'IP',
+        'vpn.ip_total': 'Total',
+        'vpn.ip_free': 'Free',
+        'vpn.ip_paid': 'Paid',
+        'vpn.ip_identity': 'Identity',
+        'vpn.ip_last_seen': 'Last seen',
+        'vpn.ip_no_data': 'No IP usage yet',
         'vpn.credentials': 'NordVPN Credentials',
         'vpn.credentials_hint': 'Service credentials from NordVPN dashboard (Manual Setup)',
         'vpn.save_credentials': 'Save',
@@ -83,6 +91,28 @@ const LOCALE = {
         'vpn.rotation_off': 'Disabled',
         'vpn.ips_used': 'IPs used',
         'vpn.switches': 'Switches',
+        'vpn.stack.title': 'VPN technology',
+        'vpn.stack.hint': 'WireGuard/NordLynx preferred (no AUTH_FAILED); OpenVPN kept as fallback. Auto flips on reliability counters.',
+        'vpn.stations.title': 'Parallel VPN stations',
+        'vpn.stations.save': 'Apply',
+        'vpn.stations.hint': 'N simultaneous tunnels: when a station is exhausted (429) or near its quota, another takes over instantly while the first rotates in the background. Hot-applied, no proxy restart.',
+        'vpn.stack.auto': 'Auto (recommended)',
+        'vpn.stack.wireguard': 'WireGuard',
+        'vpn.stack.openvpn': 'OpenVPN',
+        'vpn.stack.save': 'Save',
+        'vpn.stack.station': 'Station',
+        'vpn.stack.effective': 'Effective',
+        'vpn.stack.keys': 'WG keys',
+        'vpn.stack.keys_present': 'present',
+        'vpn.stack.keys_missing': 'missing',
+        'vpn.stack.egress_fail': 'Egress failures',
+        'vpn.stack.egress_ticks': 'Egress dead ticks',
+        'vpn.stack.auth_failed': 'AUTH_FAILED / 30 min',
+        'vpn.stack.threshold': 'Flip threshold',
+        'vpn.stack.cooldown': 'Flip cooldown',
+        'vpn.stack.last_flip': 'Last flip',
+        'vpn.stack.history': 'Flip history (last 5)',
+        'vpn.stack.none': 'none',
         'vpn.servers_hint': 'NordVPN .ovpn configs',
         'vpn.confirm_remove': 'Remove this server?',
         'vpn.server_added': 'Server added',
@@ -96,14 +126,6 @@ const LOCALE = {
         'vpn.switch_delay': 'Switch delay (s)',
         'vpn.docker_image': 'Docker image',
         'vpn.config_summary': 'Config saved automatically',
-        'vpn.free_map': 'Free Model Map',
-        'vpn.free_map_desc': 'Map each paid model to its free equivalent (hot-reload, no restart).',
-        'vpn.rotation_rules': 'Rotation Rules',
-        'vpn.rotation_rules_desc': 'Model-based rotation rules (hot-reload).',
-        'vpn.schedule': 'Schedule',
-        'vpn.schedule_desc': 'Cron-based rotation schedule (hot-reload).',
-        'vpn.schedule_enabled': 'Enabled',
-        'config.web_port': 'Web UI Port',
         'last.update': 'Last update: ',
         'stats.overview': 'Overview',
         'stats.input': 'Input',
@@ -219,6 +241,40 @@ const LOCALE = {
         'config.debug_off': 'Debug logging off',
         'config.debug_save': 'Toggle',
         'nav.debug_logs': 'Debug Logs',
+        'nav.traffic': 'Traffic',
+        'traffic.title': 'Traffic (Wireshark)',
+        'traffic.hint': 'Raw view of every client request on the wire — methods, paths, headers, body bytes, timing, tempo, and abrupt disconnects (RST).',
+        'traffic.capture': 'Capture',
+        'traffic.clear': 'Clear',
+        'traffic.auto_refresh': 'Auto-refresh',
+        'traffic.loading': 'Loading…',
+        'traffic.no_data': 'No frames captured yet.',
+        'traffic.time': 'Time',
+        'traffic.delta': 'Δms',
+        'traffic.method': 'Method',
+        'traffic.path': 'Path',
+        'traffic.status': 'Status',
+        'traffic.ttfb': 'TTFB',
+        'traffic.duration': 'Dur',
+        'traffic.size': 'Size',
+        'traffic.flags': 'Flags',
+        'traffic.frames': 'frames',
+        'traffic.rps': 'req/s',
+        'traffic.aborted': 'aborted',
+        'traffic.in_flight': 'in flight',
+        'traffic.slowest': 'slowest',
+        'traffic.avg_delta': 'avg Δ',
+        'traffic.p95_delta': 'p95 Δ',
+        'traffic.p95_ttfb': 'p95 TTFB',
+        'traffic.detail_title': 'Frame {id} — {method} {path}',
+        'traffic.headers': 'Headers',
+        'traffic.body_hex': 'Body (hex dump, {n} bytes)',
+        'traffic.body_trunc': ' (truncated)',
+        'traffic.aborted_by': 'Aborted: {r}',
+        'traffic.no_body': 'No body',
+        'traffic.unknown': '?',
+        'traffic.settings_changed': 'Capture settings saved.',
+        'traffic.cleared': 'Capture cleared.',
         'debug.title': 'Debug Log Viewer',
         'debug.clear': 'Clear Log',
         'debug.cleared': 'Log cleared.',
@@ -226,6 +282,7 @@ const LOCALE = {
         'debug.no_data': 'No debug logs. Enable debug mode in Configuration first.',
         'debug.loading': 'Loading...',
         'debug.lines': 'lines',
+        'dashboard_token_prompt': 'Enter dashboard token (DASHBOARD_TOKEN):',
         'config.api_keys': 'API Keys',
         'config.api_keys_desc': 'Configure API keys for upstream access. Each key can have its own Go workspace credentials.',
         'config.ak_alias': 'Alias',
@@ -305,6 +362,7 @@ const LOCALE = {
         'vpn.hint': 'Rotation des adresses IP pour le quota gratuit via OpenVPN',
         'vpn.status': 'Statut',
         'vpn.current_ip': 'IP actuelle',
+        'vpn.identity': 'Identité',
         'vpn.current_server': 'Serveur',
         'vpn.requests_this_ip': 'Requêtes cette IP',
         'vpn.total_free': 'Total requêtes gratuites',
@@ -317,6 +375,13 @@ const LOCALE = {
         'vpn.servers': 'Serveurs VPN',
         'vpn.add_server': 'Ajouter',
         'vpn.ip_history': 'Historique des IP',
+        'vpn.ip': 'IP',
+        'vpn.ip_total': 'Total',
+        'vpn.ip_free': 'Gratuites',
+        'vpn.ip_paid': 'Payantes',
+        'vpn.ip_identity': 'Identité',
+        'vpn.ip_last_seen': 'Dernière vue',
+        'vpn.ip_no_data': 'Aucune utilisation d\'IP',
         'vpn.credentials': 'Identifiants NordVPN',
         'vpn.credentials_hint': 'Identifiants de service depuis le dashboard NordVPN (Configuration manuelle)',
         'vpn.save_credentials': 'Enregistrer',
@@ -332,6 +397,28 @@ const LOCALE = {
         'vpn.rotation_off': 'Désactivé',
         'vpn.ips_used': 'IPs utilisées',
         'vpn.switches': 'Changements',
+        'vpn.stack.title': 'Technologie VPN',
+        'vpn.stack.hint': 'WireGuard/NordLynx préféré (aucun AUTH_FAILED) ; OpenVPN conservé en filet. Auto bascule sur compteurs de fiabilité.',
+        'vpn.stations.title': 'Stations VPN parallèles',
+        'vpn.stations.save': 'Appliquer',
+        'vpn.stations.hint': 'N tunnels simultanés : quand une station est épuisée (429) ou approche du quota, une autre prend le relais immédiatement pendant que la première rotate en arrière-plan. Appliqué à chaud, sans redémarrage du proxy.',
+        'vpn.stack.auto': 'Auto (recommandé)',
+        'vpn.stack.wireguard': 'WireGuard',
+        'vpn.stack.openvpn': 'OpenVPN',
+        'vpn.stack.save': 'Enregistrer',
+        'vpn.stack.station': 'Station',
+        'vpn.stack.effective': 'Effectif',
+        'vpn.stack.keys': 'Clés WG',
+        'vpn.stack.keys_present': 'présentes',
+        'vpn.stack.keys_missing': 'absentes',
+        'vpn.stack.egress_fail': 'Échecs egress',
+        'vpn.stack.egress_ticks': 'Ticks egress morts',
+        'vpn.stack.auth_failed': 'AUTH_FAILED / 30 min',
+        'vpn.stack.threshold': 'Seuil de bascule',
+        'vpn.stack.cooldown': 'Cooldown bascule',
+        'vpn.stack.last_flip': 'Dernière bascule',
+        'vpn.stack.history': 'Historique bascules (5 derniers)',
+        'vpn.stack.none': 'aucune',
         'vpn.servers_hint': 'Configs .ovpn NordVPN',
         'vpn.confirm_remove': 'Supprimer ce serveur ?',
         'vpn.server_added': 'Serveur ajouté',
@@ -345,13 +432,6 @@ const LOCALE = {
         'vpn.switch_delay': 'Délai switch (s)',
         'vpn.docker_image': 'Image Docker',
         'vpn.config_summary': 'Config sauvée automatiquement',
-        'vpn.free_map': 'Mapping gratuit',
-        'vpn.free_map_desc': 'Associe chaque modèle payant à son équivalent gratuit (hot-reload, pas de restart).',
-        'vpn.rotation_rules': 'Règles de rotation',
-        'vpn.rotation_rules_desc': 'Règles de rotation par modèle (hot-reload).',
-        'vpn.schedule': 'Planning',
-        'vpn.schedule_desc': 'Planning cron pour rotation (hot-reload).',
-        'vpn.schedule_enabled': 'Activé',
         'last.update': 'Dernière mise à jour : ',
         'stats.overview': 'Aperçu',
         'stats.input': 'Entrée',
@@ -466,6 +546,40 @@ const LOCALE = {
         'config.debug_off': 'Debug désactivé',
         'config.debug_save': 'Basculer',
         'nav.debug_logs': 'Logs Debug',
+        'nav.traffic': 'Trafic',
+        'traffic.title': 'Trafic (Wireshark)',
+        'traffic.hint': 'Vue brute de chaque requête client sur le fil — méthodes, chemins, en-têtes, octets du corps, timing, tempo, et déconnexions abruptes (RST).',
+        'traffic.capture': 'Capture',
+        'traffic.clear': 'Vider',
+        'traffic.auto_refresh': 'Actualisation auto',
+        'traffic.loading': 'Chargement…',
+        'traffic.no_data': 'Aucune frame capturée pour l\'instant.',
+        'traffic.time': 'Heure',
+        'traffic.delta': 'Δms',
+        'traffic.method': 'Méthode',
+        'traffic.path': 'Chemin',
+        'traffic.status': 'Statut',
+        'traffic.ttfb': 'TTFB',
+        'traffic.duration': 'Durée',
+        'traffic.size': 'Taille',
+        'traffic.flags': 'Drapeaux',
+        'traffic.frames': 'frames',
+        'traffic.rps': 'req/s',
+        'traffic.aborted': 'avortées',
+        'traffic.in_flight': 'en vol',
+        'traffic.slowest': 'plus lente',
+        'traffic.avg_delta': 'Δ moy',
+        'traffic.p95_delta': 'Δ p95',
+        'traffic.p95_ttfb': 'TTFB p95',
+        'traffic.detail_title': 'Frame {id} — {method} {path}',
+        'traffic.headers': 'En-têtes',
+        'traffic.body_hex': 'Corps (dump hex, {n} octets)',
+        'traffic.body_trunc': ' (tronqué)',
+        'traffic.aborted_by': 'Avorté : {r}',
+        'traffic.no_body': 'Pas de corps',
+        'traffic.unknown': '?',
+        'traffic.settings_changed': 'Paramètres de capture enregistrés.',
+        'traffic.cleared': 'Capture vidée.',
         'debug.title': 'Visionneuse de Logs Debug',
         'debug.clear': 'Vider le log',
         'debug.cleared': 'Log vidé.',
@@ -473,6 +587,7 @@ const LOCALE = {
         'debug.no_data': 'Aucun log debug. Activez le mode debug dans Configuration.',
         'debug.loading': 'Chargement...',
         'debug.lines': 'lignes',
+        'dashboard_token_prompt': 'Entrez le jeton du dashboard (DASHBOARD_TOKEN) :',
         'config.api_keys': 'Clés API',
         'config.api_keys_desc': 'Configurez les clés API. Chaque clé peut avoir ses propres identifiants Go workspace.',
         'config.ak_alias': 'Alias',
@@ -598,7 +713,6 @@ let filterOriginalModel = '';
 let filterAccount = '';
 let filterTool = '';
 let filterSearch = '';
-let filterStream = '';
 
 // Pagination state
 let currentPage = 1;
@@ -608,18 +722,38 @@ let totalPages = 1;
 // Config state
 let configData = null;
 let availableModels = [];
+// [fix] Flags anti-écrasement (global, utilisés par renderConfig et refreshVPNStatus)
+let _vpnStationPending = null;
+let _vpnSaving = false;
+let _crSaving = false;
+let _crDirty = false;
 
 function escHtml(s) {
     return (s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
 async function apiFetch(url, options = {}) {
-    const resp = await fetch(url, options);
+    let resp = await fetchWithToken(url, options);
+    if (resp.status === 401 && localStorage.getItem('dashboard_token')) {
+        // Token rejected or expired — ask again, then retry once
+        const token = prompt(t('dashboard_token_prompt'));
+        if (token) {
+            localStorage.setItem('dashboard_token', token.trim());
+            resp = await fetchWithToken(url, options);
+        }
+    }
     if (!resp.ok) {
         const text = await resp.text().catch(() => '');
         throw new Error(`HTTP ${resp.status}: ${text.slice(0, 200)}`);
     }
     return resp.json();
+}
+
+async function fetchWithToken(url, options = {}) {
+    const token = localStorage.getItem('dashboard_token');
+    const headers = { ...(options.headers || {}) };
+    if (token) headers['X-Dashboard-Token'] = token;
+    return fetch(url, { ...options, headers });
 }
 
 async function fetchStats(from, to) {
@@ -631,16 +765,6 @@ async function fetchStats(from, to) {
     } catch (e) {
         console.error('Failed to fetch stats:', e);
         return null;
-    }
-}
-
-async function fetchToolRoutes(days = 7, showAll = false) {
-    try {
-        const params = `days=${days}` + (showAll ? '&all=true' : '');
-        return await apiFetch(`/api/tools?${params}`);
-    } catch (e) {
-        console.error('Failed to fetch tool routes:', e);
-        return [];
     }
 }
 
@@ -656,7 +780,6 @@ async function fetchHistory(from, to, page = 1) {
         if (filterAccount) url += `&account=${encodeURIComponent(filterAccount)}`;
         if (filterTool) url += `&tool=${encodeURIComponent(filterTool)}`;
         if (filterSearch) url += `&search=${encodeURIComponent(filterSearch)}`;
-        if (filterStream) url += `&is_stream=${encodeURIComponent(filterStream)}`;
         return await apiFetch(url);
     } catch (e) {
         console.error('Failed to fetch history:', e);
@@ -750,6 +873,228 @@ function renderDebugLogLines(data) {
     nextBtn.disabled = debugLogPage >= debugLogTotalPages;
 }
 
+// ── Traffic / Wireshark-like raw capture ──
+
+function debounce(fn, ms) {
+    let timer = null;
+    return (...args) => {
+        if (timer) clearTimeout(timer);
+        timer = setTimeout(() => { timer = null; fn(...args); }, ms);
+    };
+}
+
+let trafficFilter = '';
+let trafficLastStats = null;
+
+async function fetchTrafficStatus() {
+    try {
+        return await apiFetch('/api/traffic/status');
+    } catch (e) {
+        console.error('Failed to fetch traffic status:', e);
+        return null;
+    }
+}
+
+async function toggleTrafficCapture(enabled) {
+    const statusEl = document.getElementById('traffic-status');
+    try {
+        await apiFetch('/api/traffic/config', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ enabled })
+        });
+        if (statusEl) {
+            statusEl.textContent = t('traffic.settings_changed');
+            statusEl.className = 'save-status success';
+            setTimeout(() => { statusEl.textContent = ''; }, 2500);
+        }
+    } catch (e) {
+        console.error('Failed to toggle capture:', e);
+        if (statusEl) {
+            statusEl.textContent = 'Error';
+            statusEl.className = 'save-status error';
+        }
+    }
+}
+
+async function clearTrafficCapture() {
+    const statusEl = document.getElementById('traffic-status');
+    try {
+        await apiFetch('/api/traffic/clear', { method: 'POST' });
+        if (statusEl) {
+            statusEl.textContent = t('traffic.cleared');
+            statusEl.className = 'save-status success';
+            setTimeout(() => { statusEl.textContent = ''; }, 2500);
+        }
+        const tbody = document.getElementById('traffic-tbody');
+        if (tbody) {
+            tbody.innerHTML = `<tr><td colspan="9">${t('traffic.no_data')}</td></tr>`;
+        }
+        const detail = document.getElementById('traffic-detail');
+        if (detail) detail.style.display = 'none';
+        trafficRefresh();
+    } catch (e) {
+        console.error('Failed to clear capture:', e);
+        if (statusEl) {
+            statusEl.textContent = 'Error';
+            statusEl.className = 'save-status error';
+        }
+    }
+}
+
+const METHOD_COLORS = {
+    GET: 'var(--success)',
+    POST: 'var(--accent)',
+    PUT: 'var(--warn)',
+    DELETE: 'var(--danger)',
+    PATCH: 'var(--warn)',
+    OPTIONS: 'var(--text-dim)',
+};
+
+function formatDur(ms) {
+    if (ms === null || ms === undefined || isNaN(ms)) return t('traffic.unknown');
+    if (ms < 1000) return Math.round(ms) + 'ms';
+    return (ms / 1000).toFixed(2) + 's';
+}
+
+function renderTrafficStatsBar(status, stats, frames) {
+    const bar = document.getElementById('traffic-stats-bar');
+    if (!bar) return;
+    let chips = [];
+    if (status) {
+        chips.push(`${status.frames} <b>${t('traffic.frames')}</b>`);
+        chips.push(`${status.bytes_stored ? (status.bytes_stored / 1024).toFixed(0) + 'KB' : '0B'} cap`);
+    }
+    if (stats) {
+        chips.push(`${stats.rps} <b>${t('traffic.rps')}</b>`);
+        if (stats.tempo_delta_ms) chips.push(`${t('traffic.avg_delta')} <b>${stats.tempo_delta_ms.p50}ms</b> / p95 <b>${stats.tempo_delta_ms.p95}ms</b>`);
+        if (stats.ttfb_ms) chips.push(`${t('traffic.p95_ttfb')} <b>${formatDur(stats.ttfb_ms.p95)}</b>`);
+        if (stats.duration_ms) chips.push(`${t('traffic.slowest')} <b>${formatDur(stats.duration_ms.max)}</b>`);
+        if (stats.aborted > 0) chips.push(`${t('traffic.aborted')} <b style="color:var(--danger)">${stats.aborted}</b>`);
+        if (stats.in_flight > 0) chips.push(`${t('traffic.in_flight')} <b style="color:var(--warn)">${stats.in_flight}</b>`);
+    }
+    let spark = '';
+    if (frames && frames.length > 1) {
+        // Tempo sparkline: inter-arrival delta per frame, oldest → newest
+        const deltas = frames.slice().reverse().map(f => f.delta_ms || 0);
+        const maxD = Math.max(...deltas, 1);
+        spark = '<span style="display:inline-flex;align-items:flex-end;gap:1px;height:22px;margin-left:6px;">'
+            + deltas.map(d => {
+                const h = Math.max(2, Math.round((d / maxD) * 20));
+                const hot = d > 0 && d < 5;
+                return `<span title="${d}ms" style="width:3px;height:${h}px;background:${hot ? 'var(--danger)' : 'var(--accent)'};opacity:.85"></span>`;
+            }).join('')
+            + '</span>';
+    }
+    bar.innerHTML = chips.map(c => `<span style="white-space:nowrap">${c}</span>`).join(' &nbsp;·&nbsp; ') + spark;
+}
+
+function renderTrafficFrames(data) {
+    const tbody = document.getElementById('traffic-tbody');
+    if (!tbody) return;
+    // Sync capture toggle with server state (baited by config page posts)
+    const capCb = document.getElementById('traffic-enabled');
+    if (capCb && data.status) capCb.checked = !!data.status.enabled;
+    renderTrafficStatsBar(data.status, trafficLastStats, data.frames);
+
+    if (!data.frames || data.frames.length === 0) {
+        tbody.innerHTML = `<tr><td colspan="9" style="color:var(--text-dim)">${t('traffic.no_data')}</td></tr>`;
+        return;
+    }
+    tbody.innerHTML = data.frames.map(f => {
+        const flags = [];
+        if (f.aborted) flags.push(`<span class="flag-abort" title="${escHtml(f.abort_reason || '')}">ABORT</span>`);
+        if (f.truncated) flags.push(`<span class="flag-trunc">TRUNC</span>`);
+        if (f.status === null) flags.push(`<span class="flag-flight">…</span>`);
+        const methodColor = METHOD_COLORS[f.method] || 'var(--text)';
+        const statusCell = f.status !== null
+            ? `<span style="color:${f.status >= 500 ? 'var(--danger)' : f.status >= 400 ? 'var(--warn)' : 'var(--success)'}">${f.status}</span>`
+            : '<span style="color:var(--text-dim)">…</span>';
+        const reqTarget = f.query ? `${f.path}?${f.query}` : f.path;
+        return `<tr data-fid="${f.id}" ${f.aborted ? 'class="row-abort"' : ''} style="cursor:pointer" title="${escHtml(f.request_line)} — ${escHtml(f.client_ip || '')}:${f.client_port ?? ''}">
+            <td style="white-space:nowrap;font-family:monospace;font-size:0.9em">${f.time}<span style="color:var(--text-dim)">.${String(f.time_ms).padStart(3, '0')}</span></td>
+            <td style="white-space:nowrap;text-align:right;font-family:monospace">${f.delta_ms !== null && f.delta_ms !== undefined ? f.delta_ms.toFixed(1) : '-'}</td>
+            <td style="color:${methodColor};font-weight:600">${escHtml(f.method)}</td>
+            <td style="max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:monospace;font-size:0.9em">${escHtml(reqTarget)}</td>
+            <td>${statusCell}</td>
+            <td style="white-space:nowrap;text-align:right;font-family:monospace">${f.ttfb_ms !== null && f.ttfb_ms !== undefined ? f.ttfb_ms.toFixed(0) : '-'}</td>
+            <td style="white-space:nowrap;text-align:right;font-family:monospace">${f.duration_ms !== null && f.duration_ms !== undefined ? f.duration_ms.toFixed(0) : '-'}</td>
+            <td style="white-space:nowrap;text-align:right;font-family:monospace">${f.body_len > 0 ? (f.body_len / 1024).toFixed(1) + 'KB' : '–'}</td>
+            <td style="white-space:nowrap">${flags.join(' ')}</td>
+        </tr>`;
+    }).join('');
+}
+
+async function trafficRefresh() {
+    trafficFilter = (document.getElementById('traffic-filter')?.value || '').trim();
+    const params = new URLSearchParams({ limit: '200' });
+    if (trafficFilter) params.set('path', trafficFilter);
+    try {
+        const [framesData, statsData, statusData] = await Promise.all([
+            apiFetch(`/api/traffic/frames?${params}`),
+            apiFetch('/api/traffic/stats?window=60.0'),
+            apiFetch('/api/traffic/status'),
+        ]);
+        trafficLastStats = statsData;
+        renderTrafficFrames({ ...framesData, status: statusData });
+    } catch (e) {
+        console.error('Failed to refresh traffic:', e);
+        const tbody = document.getElementById('traffic-tbody');
+        if (tbody) tbody.innerHTML = `<tr><td colspan="9" style="color:var(--danger)">Error</td></tr>`;
+    }
+}
+
+async function fetchTrafficFrameDetail(fid) {
+    const detail = document.getElementById('traffic-detail');
+    if (!detail) return;
+    try {
+        detail.style.display = 'block';
+        detail.innerHTML = '<span style="color:var(--text-dim)">' + t('traffic.loading') + '</span>';
+        const f = await apiFetch(`/api/traffic/frames/${fid}`);
+        renderTrafficDetail(detail, f);
+    } catch (e) {
+        console.error('Failed to fetch frame detail:', e);
+        detail.innerHTML = '<span style="color:var(--danger)">Error</span>';
+    }
+}
+
+function renderTrafficDetail(detail, f) {
+    const methodColor = METHOD_COLORS[f.method] || 'var(--text)';
+    const flags = [];
+    if (f.aborted) flags.push(`<span class="flag-abort">ABORT</span>`);
+    if (f.truncated) flags.push(`<span class="flag-trunc">TRUNC</span>`);
+    const metaLines = [
+        `<span style="color:${methodColor};font-weight:700">${escHtml(f.method)}</span> <span style="font-family:monospace">${escHtml(f.request_line)}</span> ${flags.join(' ')}`,
+        `${f.client_ip || '?'}:${f.client_port ?? '?'} &nbsp;·&nbsp; ${f.time}.${String(f.time_ms).padStart(3, '0')} &nbsp;·&nbsp; Δ ${f.delta_ms?.toFixed(1) ?? '-'}ms &nbsp;·&nbsp; TTFB ${f.ttfb_ms != null ? f.ttfb_ms.toFixed(1) + 'ms' : '-'} &nbsp;·&nbsp; dur ${f.duration_ms != null ? f.duration_ms.toFixed(1) + 'ms' : '-'}`,
+    ];
+    if (f.aborted && f.abort_reason) {
+        metaLines.push(`<span style="color:var(--danger)">⚠ ${escHtml(f.abort_reason)}</span>`);
+    }
+    let headersHtml = f.headers && f.headers.length
+        ? f.headers.map(h => `<div><span style="color:var(--text-dim)">${escHtml(h.name)}</span>: <span style="font-family:monospace">${escHtml(h.value)}</span></div>`).join('')
+        : `<span style="color:var(--text-dim)">—</span>`;
+    let hexHtml;
+    if (f.body_hex && f.body_hex.length) {
+        hexHtml = f.body_hex.map(row =>
+            `<div style="display:flex;gap:12px;white-space:pre;font-family:monospace;font-size:0.85em">
+                <span style="color:var(--text-dim);min-width:48px">${row.offset}</span>
+                <span style="min-width:150px">${row.hex}</span>
+                <span>${row.ascii}</span>
+            </div>`).join('');
+    } else {
+        hexHtml = `<span style="color:var(--text-dim)">${t('traffic.no_body')}</span>`;
+    }
+    detail.innerHTML = `
+        <div style="border-bottom:1px solid var(--border);padding-bottom:6px;margin-bottom:8px">
+            <div style="font-weight:600">${t('traffic.detail_title').replace('{id}', f.id).replace('{method}', f.method).replace('{path}', escHtml(f.path))}</div>
+            ${metaLines.join('<br>')}
+        </div>
+        <div style="margin-bottom:8px"><b>${t('traffic.headers')}</b> (${f.headers ? f.headers.length : 0})</div>
+        <div style="margin-bottom:8px;display:grid;grid-template-columns:1fr;gap:1px;max-height:220px;overflow-y:auto">${headersHtml}</div>
+        <div style="margin-bottom:4px"><b>${t('traffic.body_hex').replace('{n}', f.body_len ?? 0)}</b>${f.truncated ? t('traffic.body_trunc') : ''}</div>
+        <div style="background:var(--bg);border:1px solid var(--border);border-radius:4px;padding:8px;overflow-x:auto;max-height:360px;overflow-y:auto">${hexHtml}</div>`;
+}
+
 function formatResetTime(seconds) {
     if (seconds <= 0) return t('filter.now');
     const d = Math.floor(seconds / 86400);
@@ -766,7 +1111,13 @@ function renderQuotas(data) {
     const container = document.getElementById('quota-workspaces');
     const statusMsg = document.getElementById('quota-status-message');
 
-    if (!data || Object.keys(data).length === 0) {
+    if (data === null) {
+        // [35] Fetch failed — distinguish from "nothing configured"
+        statusMsg.textContent = t('quotas.error');
+        container.innerHTML = '';
+        return;
+    }
+    if (Object.keys(data).length === 0) {
         statusMsg.textContent = t('quotas.not_configured');
         container.innerHTML = '';
         return;
@@ -862,7 +1213,7 @@ function renderStats(data) {
     document.getElementById('total-fail').textContent = formatNumber(totals.fail_count);
     document.getElementById('avg-duration').textContent = totals.avg_duration_ms ? formatNumber(totals.avg_duration_ms) : '-';
     document.getElementById('cache-hit-rate').textContent = totals.cache_hit_rate != null ? totals.cache_hit_rate + '%' : '0%';
-    document.getElementById('success-rate').textContent = totals.success_rate != null ? totals.success_rate + '%' : '0%';
+    document.getElementById('success-rate').textContent = totals.success_rate != null ? totals.success_rate + '%' : '—';
     document.getElementById('total-requests').textContent = formatNumber(totals.count);
 
     const tbody = document.getElementById('model-tbody');
@@ -881,7 +1232,7 @@ function renderStats(data) {
                 <td>${formatNumber(s.total)}</td>
                 <td>${s.pct}</td>
                 <td>${s.cache_hit_rate != null ? s.cache_hit_rate + '%' : '0%'}</td>
-                <td>${s.success_rate != null ? s.success_rate + '%' : '0%'}</td>
+                <td>${s.success_rate != null ? s.success_rate + '%' : '—'}</td>
                 <td>${formatNumber(s.success_count)}</td>
                 <td>${formatNumber(s.fail_count)}</td>
                 <td>${s.avg_duration_ms ? formatNumber(s.avg_duration_ms) : '-'}</td>
@@ -906,7 +1257,7 @@ function renderStats(data) {
                 <td>${formatNumber(s.total)}</td>
                 <td>${s.pct}</td>
                 <td>${s.cache_hit_rate != null ? s.cache_hit_rate + '%' : '0%'}</td>
-                <td>${s.success_rate != null ? s.success_rate + '%' : '0%'}</td>
+                <td>${s.success_rate != null ? s.success_rate + '%' : '—'}</td>
                 <td>${formatNumber(s.success_count)}</td>
                 <td>${formatNumber(s.fail_count)}</td>
                 <td>${s.avg_duration_ms ? formatNumber(s.avg_duration_ms) : '-'}</td>
@@ -1239,7 +1590,7 @@ function showRequestDetail(reqId) {
 function renderHistory(data) {
     const tbody = document.getElementById('history-tbody');
     if (!data || data.logs.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="14">' + t('logs.no_data') + '</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="13">' + t('logs.no_data') + '</td></tr>';
         updatePagination(1, 1);
         return;
     }
@@ -1291,7 +1642,6 @@ function renderHistory(data) {
             <td>${effort}</td>
             <td>${toolsHtml}</td>
             <td>${escHtml(log.client_ip) || '-'}</td>
-            <td>${log.is_stream ? '<span class="tool-badge used">Stream</span>' : '<span style="color:#888">-</span>'}</td>
             <td>${duration}</td>
             <td>${status}</td>
         </tr>`;
@@ -1367,29 +1717,11 @@ function renderConfig(data) {
         statusLan.style.display = 'none';
     }
 
-    // Port settings (hot-reload aware)
-    const clampPort = (v, def) => { const n = parseInt(v); return (isNaN(n) || n<1 || n>65535)? def : n; };
+    // Port settings
     document.getElementById('cfg-port').value = data.port;
-    const webPortEl = document.getElementById('cfg-web-port');
-    if (webPortEl) {
-        webPortEl.value = data.web_port || 8082;
-        // Hint visibility
-        const hint = document.getElementById('web-port-hint');
-        if (hint) hint.style.display = ''; // always show hint per Phase3 spec (hot-restart ~1s)
-    }
     document.getElementById('cfg-bind-address').value = data.host || '0.0.0.0';
     document.getElementById('cfg-routing').value = data.routing || 'round-robin';
     document.getElementById('cfg-disable-mapping').checked = data.disable_mapping || false;
-    // Upstream models empty → banner (Phase3)
-    if (!data.models || Object.keys(data.models).length === 0) {
-        const saveSt = document.getElementById('config-save-status');
-        if (saveSt) {
-            saveSt.textContent = '⚠️ Modèles distants inaccessibles (curl timeout) — vérifiez upstream';
-            saveSt.className = 'save-status error';
-            setTimeout(()=> saveSt.textContent='', 6000);
-        }
-        console.warn('[config] upstream models empty — possible _fetch_upstream_models timeout');
-    }
 
     // Debug mode state
     fetchDebugStatus().then(debugData => {
@@ -1456,12 +1788,6 @@ function renderConfig(data) {
     // Custom routes table
     renderCustomRoutes(data.custom_routes || {}, modelIds);
 
-    // Tool routes table — fetch and render
-    fetchToolRoutes().then(tools => renderToolRoutes(tools, modelIds));
-
-    // Tool compatibility matrix — fetch and render
-    fetchToolCapabilities().then(data => renderToolCompatMatrix(data, modelIds));
-
     // Apply server-side language if different
     if (data.lang && data.lang !== getLang()) {
         setLang(data.lang);
@@ -1499,185 +1825,6 @@ function renderCustomRoutes(routes, modelIds) {
         </tr>`;
     }
     tbody.innerHTML = html;
-}
-
-function renderToolRoutes(tools, modelIds) {
-    const tbody = document.getElementById('tool-routes-tbody');
-    if (!tools || tools.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="4">' + t('config.tr_no_tools') + '</td></tr>';
-        return;
-    }
-    const opts = modelIds.map(id => `<option value="${id}">${id}</option>`).join('');
-    let html = '';
-    for (const tool of tools) {
-        const selectedRouted = tool.routed_to || '';
-        const isRouted = !!selectedRouted;
-        html += `<tr>
-            <td><code>${escHtml(tool.name)}</code></td>
-            <td>${tool.count}</td>
-            <td><select class="config-select tr-model-select" style="width:100%" data-tool="${escHtml(tool.name)}">
-                <option value="">—</option>
-                ${opts.replace(`value="${selectedRouted}"`, `value="${selectedRouted}" selected`)}
-            </select></td>
-            <td>${isRouted ? '<span class="status-ok">' + t('config.tr_routed') + '</span>' : '<span class="text-dim">' + t('config.tr_unrouted') + '</span>'}</td>
-        </tr>`;
-    }
-    tbody.innerHTML = html;
-}
-
-function gatherToolRoutes() {
-    const rows = document.querySelectorAll('#tool-routes-tbody tr');
-    const toolRoutes = {};
-    for (const row of rows) {
-        const select = row.querySelector('.tr-model-select');
-        if (!select) continue;
-        const toolName = select.dataset.tool;
-        const model = select.value;
-        if (toolName && model) {
-            const key = makeRouteKey(toolName);
-            toolRoutes[key] = { match: [toolName], model: model };
-        }
-    }
-    return toolRoutes;
-}
-
-// ── Tool Compatibility Matrix ──
-
-let _toolCompatData = null;
-
-async function fetchToolCapabilities() {
-    try {
-        return await apiFetch('/api/config/tool-capabilities');
-    } catch (e) {
-        console.error('Failed to fetch tool capabilities:', e);
-        return null;
-    }
-}
-
-function renderToolCompatMatrix(data, modelIds) {
-    const tbody = document.getElementById('tool-compat-tbody');
-    if (!data || !data.all_tools || data.all_tools.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="100">No tool data available yet. Make some requests first.</td></tr>';
-        return;
-    }
-    const caps = data.capabilities || {};
-    const tools = data.all_tools;
-    const models = data.all_models || modelIds;
-    const protocols = {};
-    // Build protocol map from MODELS config or default
-    for (const m of models) {
-        protocols[m] = 'openai'; // default
-    }
-
-    // Header row with tool names
-    let headerHtml = '<tr><th style="min-width:140px">Model</th><th>Protocol</th>';
-    for (const tool of tools) {
-        headerHtml += `<th style="writing-mode:vertical-lr;text-orientation:mixed;font-size:0.75em;min-width:36px">${escHtml(tool)}</th>`;
-    }
-    headerHtml += '<th>System Hint</th></tr>';
-
-    // Data rows
-    let bodyHtml = '';
-    for (const model of models) {
-        if (model === '_default' || model === '_doc') continue;
-        const cfg = caps[model] || {};
-        const defaults = caps['_default'] || {};
-        const supported = cfg.supported_tools || defaults.supported_tools;
-        const unsupported = cfg.unsupported_tools || defaults.unsupported_tools || [];
-        const hint = cfg.system_hint || defaults.system_hint || '';
-
-        bodyHtml += '<tr>';
-        bodyHtml += `<td><code style="font-size:0.85em">${escHtml(model)}</code></td>`;
-        bodyHtml += `<td class="text-dim" style="font-size:0.8em">${protocols[model] || 'openai'}</td>`;
-
-        for (const tool of tools) {
-            let supported_val;
-            if (supported !== null && supported !== undefined) {
-                supported_val = supported.includes(tool);
-            } else {
-                supported_val = !unsupported.includes(tool);
-            }
-            const cls = supported_val ? 'tc-supported' : 'tc-unsupported';
-            const icon = supported_val ? '✓' : '✗';
-            bodyHtml += `<td class="${cls}" style="text-align:center;cursor:pointer" data-model="${escHtml(model)}" data-tool="${escHtml(tool)}" onclick="toggleToolCompat(this)">${icon}</td>`;
-        }
-
-        const hintIcon = hint ? '💡' : '—';
-        bodyHtml += `<td style="text-align:center;font-size:0.9em" title="${escHtml(hint)}">${hintIcon}</td>`;
-        bodyHtml += '</tr>';
-    }
-
-    // Default row
-    if (caps['_default']) {
-        const def = caps['_default'];
-        bodyHtml += '<tr style="border-top:2px solid var(--border)">';
-        bodyHtml += '<td><code style="font-size:0.85em">_default</code></td>';
-        bodyHtml += '<td class="text-dim" style="font-size:0.8em">—</td>';
-        for (const tool of tools) {
-            const supported_val = def.unsupported_tools ? !def.unsupported_tools.includes(tool) : true;
-            const cls = supported_val ? 'tc-supported' : 'tc-unsupported';
-            const icon = supported_val ? '✓' : '✗';
-            bodyHtml += `<td class="${cls}" style="text-align:center;cursor:pointer" data-model="_default" data-tool="${escHtml(tool)}" onclick="toggleToolCompat(this)">${icon}</td>`;
-        }
-        bodyHtml += '<td style="text-align:center;font-size:0.9em">—</td>';
-        bodyHtml += '</tr>';
-    }
-
-    tbody.innerHTML = headerHtml + bodyHtml;
-    _toolCompatData = data;
-}
-
-function toggleToolCompat(td) {
-    const model = td.dataset.model;
-    const tool = td.dataset.tool;
-    const isCurrentlySupported = td.textContent.trim() === '✓';
-    td.textContent = isCurrentlySupported ? '✗' : '✓';
-    td.className = isCurrentlySupported ? 'tc-unsupported' : 'tc-supported';
-
-    // Update _toolCompatData
-    if (_toolCompatData && _toolCompatData.capabilities) {
-        const caps = _toolCompatData.capabilities;
-        const defaults = caps['_default'] || {};
-        const modelCfg = caps[model] || {};
-
-        // Switch between whitelist and blacklist modes
-        if (isCurrentlySupported) {
-            // Was supported, now unsupported — add to unsupported_tools
-            const unsupported = modelCfg.unsupported_tools || [];
-            if (!unsupported.includes(tool)) {
-                unsupported.push(tool);
-            }
-            caps[model] = { ...modelCfg, unsupported_tools: unsupported };
-        } else {
-            // Was unsupported, now supported — remove from unsupported_tools
-            let unsupported = modelCfg.unsupported_tools || [];
-            unsupported = unsupported.filter(t => t !== tool);
-            if (unsupported.length === 0 && !modelCfg.supported_tools) {
-                delete caps[model].unsupported_tools;
-            } else {
-                caps[model] = { ...modelCfg, unsupported_tools: unsupported };
-            }
-        }
-    }
-}
-
-async function saveToolCapabilities() {
-    if (!_toolCompatData || !_toolCompatData.capabilities) return;
-    const status = document.getElementById('tc-save-status');
-    try {
-        await apiFetch('/api/config/tool-capabilities', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(_toolCompatData.capabilities),
-        });
-        status.textContent = 'Saved!';
-        status.className = 'save-status success';
-        setTimeout(() => { status.textContent = ''; }, 3000);
-    } catch (e) {
-        status.textContent = 'Error saving';
-        status.className = 'save-status error';
-        console.error(e);
-    }
 }
 
 // ── Web Search config ──
@@ -1783,6 +1930,8 @@ function setupTabs() {
             } else if (target === 'debug-logs') {
                 debugLogPage = 1;
                 fetchDebugLogs(1).then(renderDebugLogLines);
+            } else if (target === 'traffic') {
+                trafficRefresh();
             }
         });
     });
@@ -1865,7 +2014,6 @@ function setupHistoryFilters() {
             filterOriginalModel = document.getElementById('filter-original-model').value;
             filterAccount = document.getElementById('filter-account').value;
             filterTool = document.getElementById('filter-tool').value;
-            filterStream = document.getElementById('filter-stream').value;
             filterSearch = document.getElementById('filter-search').value;
             currentPage = 1;
             refreshAll();
@@ -1879,15 +2027,12 @@ function setupHistoryFilters() {
             document.getElementById('filter-original-model').value = '';
             document.getElementById('filter-account').value = '';
             document.getElementById('filter-tool').value = '';
-            const _fs = document.getElementById('filter-stream');
-            if (_fs) _fs.value = '';
             document.getElementById('filter-search').value = '';
             filterStatus = '';
             filterModel = '';
             filterOriginalModel = '';
             filterAccount = '';
             filterTool = '';
-            filterStream = '';
             filterSearch = '';
             currentPage = 1;
             refreshAll();
@@ -1932,87 +2077,35 @@ function setupConfig() {
         }
     });
 
-    // Save config (hot-reload aware, Phase3: web_port hot-restart, no full_restart)
+    // Save config
     const saveBtn = document.getElementById('btn-save-config');
     const saveStatus = document.getElementById('config-save-status');
     saveBtn.addEventListener('click', async () => {
-        const clampPort = (elId, def) => {
-            const v = parseInt(document.getElementById(elId)?.value);
-            if (isNaN(v) || v<1 || v>65535) {
-                const el = document.getElementById(elId);
-                if (el) { el.style.borderColor='var(--danger)'; setTimeout(()=> el.style.borderColor='',2000); }
-                return null;
-            }
-            return v;
-        };
-        const port = clampPort('cfg-port', 4000);
-        const webPort = clampPort('cfg-web-port', 8082);
-        if (port===null || webPort===null) {
-            saveStatus.textContent = 'Port invalide (1-65535)';
-            saveStatus.className='save-status error';
-            return;
-        }
         const payload = {
             routes: {
                 opus: document.getElementById('route-opus').value,
                 sonnet: document.getElementById('route-sonnet').value,
                 haiku: document.getElementById('route-haiku').value,
             },
-            port: port,
-            web_port: webPort,
+            port: parseInt(document.getElementById('cfg-port').value),
             host: document.getElementById('cfg-bind-address').value,
             routing: document.getElementById('cfg-routing').value,
             disable_mapping: document.getElementById('cfg-disable-mapping').checked,
         };
-        const prevPort = configData?.port;
-        const prevWebPort = configData?.web_port;
-        const prevHost = configData?.host;
-        const willRestart = (port!==prevPort || webPort!==prevWebPort || payload.host!==prevHost);
-        if (willRestart) {
-            const notice = document.getElementById('restart-notice');
-            if (notice) { notice.textContent = 'Redémarrage gracieux en cours… (~1s)'; notice.style.display=''; }
-            saveStatus.textContent = 'Redémarrage gracieux…';
-            saveStatus.className='save-status';
-        }
         try {
             const result = await apiFetch('/api/config', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(payload),
             });
-            // Phase3: never needs_restart true for GUI — hot-restart is transient
-            const notice = document.getElementById('restart-notice');
-            if (notice) {
-                if (result.needs_restart) {
-                    notice.textContent = t('proxy.restart_notice');
-                    notice.style.display='';
-                } else {
-                    // hide after brief toast if we showed hot-restart
-                    if (willRestart) setTimeout(()=> notice.style.display='none', 4000);
-                    else notice.style.display='none';
-                }
-            }
-            if (result.status==='error') throw new Error(result.message);
+            document.getElementById('restart-notice').style.display = result.needs_restart ? '' : 'none';
             saveStatus.textContent = result.message || t('config.saved');
             saveStatus.className = 'save-status success';
             setTimeout(() => { saveStatus.textContent = ''; }, 3000);
-            // If hot-restart happened, wait a bit then refresh (server may be briefly down)
-            if (willRestart) {
-                await new Promise(r=> setTimeout(r, 1500));
-                // Try new web_port if changed
-                if (webPort!==prevWebPort) {
-                    // attempt to fetch via new port — but we stay on same origin, so just retry
-                    let retries=3;
-                    while(retries-->0){
-                        try{ await fetchConfig(); break; }catch(e){ await new Promise(r=>setTimeout(r,800)); }
-                    }
-                }
-            }
+            // Refresh config display
             fetchConfig().then(renderConfig);
         } catch (e) {
-            const notice = document.getElementById('restart-notice');
-            if (notice) notice.style.display='none';
-            saveStatus.textContent = e.message || 'Error saving';
+            saveStatus.textContent = 'Error saving';
             saveStatus.className = 'save-status error';
             console.error('Failed to save config:', e);
         }
@@ -2076,6 +2169,7 @@ function setupConfig() {
         // Remove empty state
         if (tbody.querySelector('td[colspan]')) tbody.innerHTML = '';
         tbody.appendChild(row);
+        _crDirty = true;
         document.getElementById('cr-match').value = '';
         document.getElementById('cr-model').selectedIndex = 0;
     });
@@ -2086,14 +2180,20 @@ function setupConfig() {
         if (!btn) return;
         const row = btn.closest('tr');
         if (row) row.remove();
+        _crDirty = true;
         const tbody = document.getElementById('custom-routes-tbody');
         if (!tbody.querySelector('tr')) {
             tbody.innerHTML = '<tr><td colspan="6">' + t('config.cr_no_routes') + '</td></tr>';
         }
     });
+    // Marque dirty sur toute édition (input/select/checkbox) dans le tableau
+    document.getElementById('custom-routes-tbody').addEventListener('input', () => { _crDirty = true; });
+    document.getElementById('custom-routes-tbody').addEventListener('change', () => { _crDirty = true; });
 
-    // Custom routes: save
+    // Custom routes: save — [fix] 1 clic suffit (feedback + anti-écrasement)
     document.getElementById('cr-save-btn').addEventListener('click', async () => {
+        if (_crSaving) return;
+        const btn = document.getElementById('cr-save-btn');
         const tbody = document.getElementById('custom-routes-tbody');
         const rows = tbody.querySelectorAll('tr');
         const routes = {};
@@ -2115,6 +2215,9 @@ function setupConfig() {
             routes[key] = routeData;
         }
         const status = document.getElementById('cr-save-status');
+        _crSaving = true;
+        const _origText = btn ? btn.textContent : '';
+        if (btn) { btn.disabled = true; btn.textContent = 'En cours...'; btn.style.opacity = '0.6'; }
         try {
             await apiFetch('/api/config/custom-routes', {
                 method: 'POST',
@@ -2124,61 +2227,20 @@ function setupConfig() {
             status.textContent = t('config.cr_saved');
             status.className = 'save-status success';
             setTimeout(() => { status.textContent = ''; }, 3000);
-            fetchConfig().then(renderConfig);
+            // libère avant fetch pour que renderConfig puisse peindre le frais
+            _crSaving = false;
+            _crDirty = false;
+            const fresh = await fetchConfig();
+            if (fresh) renderConfig(fresh);
         } catch (e) {
             status.textContent = 'Error saving';
             status.className = 'save-status error';
             console.error(e);
+        } finally {
+            _crSaving = false;
+            if (btn) { btn.disabled = false; btn.textContent = _origText || t('config.cr_save'); btn.style.opacity = ''; }
         }
     });
-
-    // ── Tool Routes: toggle universal tools visibility ──
-    document.getElementById('tr-show-all').addEventListener('change', async (e) => {
-        const tools = await fetchToolRoutes(7, e.target.checked);
-        renderToolRoutes(tools, availableModels);
-    });
-
-    // ── Tool Routes: save ──
-    document.getElementById('tr-save-btn').addEventListener('click', async () => {
-        const toolRoutes = gatherToolRoutes();
-
-        // Fetch existing custom routes and merge
-        const configData = await apiFetch('/api/config');
-        const existingRoutes = configData.custom_routes || {};
-
-        // Remove old tool routes (those matching known tool names from the current data)
-        const currentTools = await fetchToolRoutes(7, true); // fetch all including universal
-        const currentToolNames = new Set(currentTools.map(t => t.name));
-        for (const key of Object.keys(existingRoutes)) {
-            const matches = existingRoutes[key].match || [];
-            if (matches.some(m => currentToolNames.has(m))) {
-                delete existingRoutes[key];
-            }
-        }
-
-        // Merge new tool routes
-        const mergedRoutes = { ...existingRoutes, ...toolRoutes };
-
-        const status = document.getElementById('tr-save-status');
-        try {
-            await apiFetch('/api/config/custom-routes', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(mergedRoutes),
-            });
-            status.textContent = t('config.tr_saved');
-            status.className = 'save-status success';
-            setTimeout(() => { status.textContent = ''; }, 3000);
-            fetchConfig().then(renderConfig);
-        } catch (e) {
-            status.textContent = 'Error saving';
-            status.className = 'save-status error';
-            console.error(e);
-        }
-    });
-
-    // ── Tool Capabilities save ──
-    document.getElementById('tc-save-btn').addEventListener('click', saveToolCapabilities);
 
     // ── Web Search config ──
     fetchWebSearchConfig();
@@ -2283,24 +2345,82 @@ function setupConfig() {
             if (debugLogsTabBtn) debugLogsTabBtn.style.display = enabled ? '' : 'none';
         });
     }
+
+    // ── Traffic tab ──
+    let trafficTimer = null;
+    const trafficCapCb = document.getElementById('traffic-enabled');
+    if (trafficCapCb) {
+        trafficCapCb.addEventListener('change', () => toggleTrafficCapture(trafficCapCb.checked));
+    }
+
+    const trafficClearBtn = document.getElementById('btn-traffic-clear');
+    if (trafficClearBtn) trafficClearBtn.addEventListener('click', clearTrafficCapture);
+
+    // Sync toggle + stats bar with the live server state on load
+    fetchTrafficStatus().then(status => {
+        if (!status) return;
+        if (trafficCapCb) trafficCapCb.checked = !!status.enabled;
+        if (status.frames > 0 && document.querySelector('.tab.active')?.dataset.tab === 'traffic') {
+            trafficRefresh();
+        }
+    });
+
+    const trafficAutoCb = document.getElementById('traffic-auto-refresh');
+    if (trafficAutoCb) {
+        trafficAutoCb.addEventListener('change', (e) => {
+            if (e.target.checked) {
+                trafficRefresh();
+                trafficTimer = setInterval(() => {
+                    const activeTab = document.querySelector('.tab.active');
+                    if (activeTab && activeTab.dataset.tab === 'traffic') trafficRefresh();
+                }, 3000);
+            } else {
+                if (trafficTimer) { clearInterval(trafficTimer); trafficTimer = null; }
+            }
+        });
+    }
+
+    const trafficFilterInput = document.getElementById('traffic-filter');
+    if (trafficFilterInput) {
+        trafficFilterInput.addEventListener('input', debounce(() => {
+            const activeTab = document.querySelector('.tab.active');
+            if (activeTab && activeTab.dataset.tab === 'traffic') trafficRefresh();
+        }, 300));
+    }
+
+    // Clicking a frame row loads its detail (headers + hex dump)
+    const trafficTbody = document.getElementById('traffic-tbody');
+    if (trafficTbody) {
+        trafficTbody.addEventListener('click', (e) => {
+            const row = e.target.closest('tr[data-fid]');
+            if (!row) return;
+            trafficTbody.querySelectorAll('tr.selected').forEach(r => r.classList.remove('selected'));
+            row.classList.add('selected');
+            fetchTrafficFrameDetail(row.dataset.fid);
+        });
+    }
 }
 
 var _refreshing = false;
+var _refreshPending = false;
 async function refreshAll() {
-    if (_refreshing) return;
+    if (_refreshing) { _refreshPending = true; return; }
     _refreshing = true;
     try {
-        const [stats, history, quotas] = await Promise.all([
-            fetchStats(filterFrom, filterTo),
-            fetchHistory(filterFrom, filterTo, currentPage),
-            fetchQuotas()
-        ]);
-        renderStats(stats);
-        renderCharts(stats);
-        renderHistory(history);
-        renderQuotas(quotas);
-        renderTimeSeriesCharts(filterFrom, filterTo);
-        document.getElementById('last-update').textContent = t('last.update') + formatTime();
+        do {
+            _refreshPending = false;
+            const [stats, history, quotas] = await Promise.all([
+                fetchStats(filterFrom, filterTo),
+                fetchHistory(filterFrom, filterTo, currentPage),
+                fetchQuotas()
+            ]);
+            renderStats(stats);
+            renderCharts(stats);
+            renderHistory(history);
+            renderQuotas(quotas);
+            renderTimeSeriesCharts(filterFrom, filterTo);
+            document.getElementById('last-update').textContent = t('last.update') + formatTime();
+        } while (_refreshPending);
     } finally {
         _refreshing = false;
     }
@@ -2386,7 +2506,9 @@ document.addEventListener('DOMContentLoaded', () => {
     let eventSource = null;
     let pollTimer = null;
     let sseRetryDelay = 1000;
+    let lastEventTs = Date.now();
     const SSE_MAX_DELAY = 30000;
+    const SSE_SILENCE_MS = 45000; // server pings every 30s of idle → 45s = 1 missed ping
 
     function startPolling(intervalMs) {
         if (pollTimer) clearInterval(pollTimer);
@@ -2397,13 +2519,29 @@ document.addEventListener('DOMContentLoaded', () => {
         if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
     }
 
+    function sseScheduleReconnect() {
+        if (!pollTimer) startPolling(15000);
+        if (!window._sseRetry) {
+            window._sseRetry = setTimeout(() => {
+                window._sseRetry = null;
+                connectSSE();
+            }, sseRetryDelay);
+            sseRetryDelay = Math.min(sseRetryDelay * 2, SSE_MAX_DELAY);
+        }
+    }
+
     function connectSSE() {
         if (window._sseRetry) { clearTimeout(window._sseRetry); window._sseRetry = null; }
         if (eventSource) eventSource.close();
         const es = new EventSource('/api/events');
         eventSource = es;
+        lastEventTs = Date.now();
 
+        // [31] Any event proves the stream is alive; the server also emits a
+        // `ping` event every 30s of idle (keepalive comments are invisible to JS).
+        es.addEventListener('ping', () => { lastEventTs = Date.now(); });
         es.addEventListener('stats_updated', () => {
+            lastEventTs = Date.now();
             // Debounce: coalesce rapid events into a single refresh
             if (window._sseRefresh) clearTimeout(window._sseRefresh);
             window._sseRefresh = setTimeout(() => {
@@ -2411,29 +2549,46 @@ document.addEventListener('DOMContentLoaded', () => {
                 refreshAll();
             }, 200);
         });
-        es.addEventListener('connected', () => { stopPolling(); sseRetryDelay = 1000; });
+        es.addEventListener('connected', () => { lastEventTs = Date.now(); stopPolling(); sseRetryDelay = 1000; });
         es.addEventListener('quotas_updated', () => {
+            lastEventTs = Date.now();
             fetchQuotas().then(renderQuotas);
         });
         es.addEventListener('models_updated', () => {
+            lastEventTs = Date.now();
             fetchConfig().then(data => {
                 if (data) { configData = data; renderConfig(data); }
             });
+        });
+        // [plan] C: real-time vpn container events (die/start/restart/health)
+        // — refresh the VPN panel immediately. Server-side coalescing caps
+        // this at ≤1 event / 500 ms per subscriber (kill/restart cascades).
+        es.addEventListener('vpn_event', () => {
+            lastEventTs = Date.now();
+            if (window._sseVpnRefresh) clearTimeout(window._sseVpnRefresh);
+            window._sseVpnRefresh = setTimeout(() => {
+                window._sseVpnRefresh = null;
+                refreshVPNStatus();
+            }, 250);
         });
 
         es.onerror = () => {
             if (es !== eventSource) return; // stale
             if (eventSource) { eventSource.close(); eventSource = null; }
-            if (!pollTimer) startPolling(15000);
-            if (!window._sseRetry) {
-                window._sseRetry = setTimeout(() => {
-                    window._sseRetry = null;
-                    connectSSE();
-                }, sseRetryDelay);
-                sseRetryDelay = Math.min(sseRetryDelay * 2, SSE_MAX_DELAY);
-            }
+            sseScheduleReconnect();
         };
     }
+
+    // [31] Reconnect on silence: without this, a stalled stream with an open
+    // socket (and no events) would look healthy forever — onerror never fires.
+    setInterval(() => {
+        if (!eventSource) return;
+        if (Date.now() - lastEventTs > SSE_SILENCE_MS) {
+            eventSource.close();
+            eventSource = null;
+            sseScheduleReconnect();
+        }
+    }, 15000);
 
     connectSSE();
 
@@ -2457,7 +2612,19 @@ document.addEventListener('DOMContentLoaded', () => {
             const target = parseInt(el.dataset.resetTarget || '0', 10);
             if (!target) return;
             const remaining = target - Math.floor(Date.now() / 1000);
-            el.textContent = remaining <= 0 ? t('quotas.resetting') : t('quotas.resets_in') + formatResetTime(remaining);
+            if (remaining <= 0) {
+                // [35] Bounded « Resetting… »: once the countdown hits 0 the
+                // quota may already be available server-side; the next poll
+                // (≤5 min) refreshes the target. After a 10 s grace show « — »
+                // so the UI never claims "resetting" for minutes.
+                if (Date.now() - target * 1000 > 10000) {
+                    el.textContent = '—';
+                    return;
+                }
+                el.textContent = t('quotas.resetting');
+            } else {
+                el.textContent = t('quotas.resets_in') + formatResetTime(remaining);
+            }
         });
     }, 1000);
 
@@ -2595,200 +2762,206 @@ document.addEventListener('DOMContentLoaded', () => {
         }).catch(() => {});
     });
 
-    // ── VPN tab refresh (parallélisé + état chargement) ──
-    let _vpnRefreshInFlight = false;
+    // ── VPN tab refresh ──
     async function refreshVPNStatus() {
-        if (_vpnRefreshInFlight) return;
-        _vpnRefreshInFlight = true;
-        const fmToggle = document.getElementById('fm-toggle');
-        const statusEl = document.getElementById('vpn-status-text');
-        const statusDot = document.getElementById('vpn-status-dot');
-        // État chargement : désactive le toggle, affiche "Chargement..." sans perdre enabled
-        const prevEnabled = fmToggle ? fmToggle.checked : null;
-        if (fmToggle) fmToggle.disabled = true;
-        if (statusEl && !statusEl.dataset.loading) {
-            statusEl.dataset.orig = statusEl.textContent;
-            statusEl.textContent = 'Chargement...';
-            statusEl.dataset.loading = '1';
-            if (statusDot) statusDot.style.background = 'var(--warning)';
-        }
-        // Optimiste : affiche dernier état connu depuis localStorage pendant le chargement
         try {
-            const cached = localStorage.getItem('vpn_enabled_cache');
-            if (cached !== null && fmToggle && prevEnabled === false) {
-                const cachedEnabled = cached === '1';
-                if (cachedEnabled) {
-                    fmToggle.checked = true;
+            const resp = await fetchWithToken('/api/vpn-status');
+            const data = await resp.json();
+            updateVPNUI(data);
+            try {
+                const cfgR = await fetchWithToken('/api/vpn-config');
+                const cfgJ = await cfgR.json();
+                if (cfgJ.proxy_mode) updateGeoWarning(cfgJ.proxy_mode);
+            } catch (e2) {}
+        } catch (e) {
+            console.error('VPN status error:', e);
+        }
+        // Also check credential status
+        try {
+            const credResp = await fetchWithToken('/api/vpn/credentials');
+            const credData = await credResp.json();
+            const credStatus = document.getElementById('vpn-cred-status');
+            const usernameEl = document.getElementById('vpn-cred-username');
+            const passwordEl = document.getElementById('vpn-cred-password');
+            const fileEl = document.getElementById('vpn-cred-file');
+
+            if (credData.exists) {
+                if (credStatus) credStatus.innerHTML = '<span style="color:var(--success)">&#10003;</span> ' + (t('vpn.credentials_saved') || 'Enregistré');
+                if (usernameEl) usernameEl.textContent = credData.username_preview || '****';
+                if (passwordEl) passwordEl.textContent = '••••••••';
+                if (fileEl) fileEl.textContent = 'credentials.env';
+            } else {
+                if (credStatus) credStatus.innerHTML = '<span style="color:var(--warning)">!</span> ' + (t('vpn.credentials_missing') || 'Aucun identifiant');
+                if (usernameEl) usernameEl.textContent = '—';
+                if (passwordEl) passwordEl.textContent = '—';
+                if (fileEl) fileEl.textContent = '—';
+            }
+        } catch (e) {
+            console.error('Credential status error:', e);
+        }
+        // Also load server list from config
+        try {
+            const cfgResp = await fetchWithToken('/api/vpn-config');
+            const cfgData = await cfgResp.json();
+            renderServerList(cfgData.servers || []);
+            // Initialize config fields
+            if (cfgData.mode) document.getElementById('vpn-mode').value = cfgData.mode;
+            if (cfgData.proxy_port) document.getElementById('vpn-proxy-port').value = cfgData.proxy_port;
+            if (cfgData.switch_delay) document.getElementById('vpn-switch-delay').value = cfgData.switch_delay;
+            if (cfgData.quota_per_ip) document.getElementById('vpn-quota-per-ip').value = cfgData.quota_per_ip;
+            if (cfgData.docker_image) {
+                const dockerSelect = document.getElementById('vpn-docker-image');
+                // Check if it's a known option or custom
+                const knownImages = ['qmcgaw/gluetun', 'nordvpn-official'];
+                if (knownImages.includes(cfgData.docker_image)) {
+                    dockerSelect.value = cfgData.docker_image;
+                } else {
+                    dockerSelect.value = 'custom';
+                    const customInput = document.getElementById('vpn-docker-image-custom');
+                    if (customInput) {
+                        customInput.style.display = 'block';
+                        customInput.value = cfgData.docker_image;
+                    }
                 }
+                vpnDockerImageChanged();
+            }
+            vpnInitConfig(cfgData.mode);
+
+            // Load advanced config fields
+            if (cfgData.circuit_breaker_threshold) document.getElementById('vpn-cb-threshold').value = cfgData.circuit_breaker_threshold;
+            if (cfgData.circuit_breaker_recovery) document.getElementById('vpn-cb-recovery').value = cfgData.circuit_breaker_recovery;
+            if (cfgData.backoff_max_delay) document.getElementById('vpn-backoff-max').value = cfgData.backoff_max_delay;
+            if (cfgData.watchdog_interval !== undefined) document.getElementById('vpn-watchdog').value = cfgData.watchdog_interval;
+            if (cfgData.api_cache_ttl) document.getElementById('vpn-api-cache').value = cfgData.api_cache_ttl;
+
+            // Initialize proxy mode UI
+            if (cfgData.proxy_mode) {
+                setProxyModeUI(cfgData.proxy_mode);
+            }
+
+            // [plan 18/08 §4] N-station selector (1-10) + exhaust mode
+            const stationCountSelect = document.getElementById('vpn-station-count');
+            if (stationCountSelect) {
+                const persistedVal = String(cfgData.station_count || 1);
+                // [fix] Ne pas écraser la sélection utilisateur pendant interaction/sauvegarde.
+                const isFocused = document.activeElement === stationCountSelect;
+                const isSaving = typeof _vpnSaving !== 'undefined' && _vpnSaving;
+                const hasPending = typeof _vpnStationPending !== 'undefined' && _vpnStationPending !== null;
+                if (!stationCountSelect._vpnListenerAttached) {
+                    stationCountSelect.addEventListener('change', () => {
+                        _vpnStationPending = stationCountSelect.value;
+                        const btn = document.getElementById('vpn-station-apply-btn');
+                        if (btn) btn.style.outline = '2px solid var(--accent, #4fc3f7)';
+                    });
+                    stationCountSelect._vpnListenerAttached = true;
+                }
+                if (isFocused || isSaving) {
+                    // L'utilisateur interagit ou sauvegarde en cours — on ne touche pas.
+                } else if (hasPending && _vpnStationPending !== persistedVal) {
+                    stationCountSelect.value = _vpnStationPending;
+                } else {
+                    stationCountSelect.value = persistedVal;
+                    if (hasPending && _vpnStationPending === persistedVal) _vpnStationPending = null;
+                    const btn = document.getElementById('vpn-station-apply-btn');
+                    if (btn) btn.style.outline = '';
+                }
+            }
+            const exhaustMode = document.getElementById('vpn-exhaust-mode');
+            if (exhaustMode) exhaustMode.value = cfgData.strict_free ? 'strict' : 'fallback';
+
+            // [plan 19/08 §1/§2] free multi-attempt cap (1-3) + exception
+            // ordering (station-first / direct) — read from config.
+            const freeAttempts = document.getElementById('vpn-free-attempts');
+            if (freeAttempts) freeAttempts.value = String(cfgData.max_free_attempts || 2);
+            const exceptionMode = document.getElementById('vpn-exception-mode');
+            if (exceptionMode) exceptionMode.value = cfgData.free_exception_fallback || 'station-first';
+
+            // [plan 18/08 §3d] VPN technology selector
+            const stackSelect = document.getElementById('vpn-stack-select');
+            if (stackSelect && cfgData.vpn_stack) stackSelect.value = cfgData.vpn_stack;
+
+            // Initialize free models master toggle
+            const fmToggle = document.getElementById('fm-toggle');
+            const fmLabel = document.getElementById('fm-toggle-label');
+            if (fmToggle) {
+                fmToggle.checked = cfgData.enabled || false;
+                if (fmLabel) fmLabel.textContent = cfgData.enabled
+                    ? (t('free_models.enable') || 'Activer les modèles gratuits')
+                    : (t('free_models.enable') || 'Activer les modèles gratuits');
             }
         } catch (e) {}
 
-        const fetchTimeout = (url, ms=4000) => {
-            const ctrl = new AbortController();
-            const id = setTimeout(()=> ctrl.abort(), ms);
-            return fetch(url, {signal: ctrl.signal}).then(r=> {
-                clearTimeout(id);
-                if (!r.ok) throw new Error('HTTP '+r.status);
-                return r.json();
-            }).catch(e=> {
-                clearTimeout(id);
-                throw e;
-            });
-        };
+        // Load SOCKS5 proxies
+        try {
+            const socks5Resp = await fetchWithToken('/api/vpn/socks5');
+            const socks5Data = await socks5Resp.json();
+            renderSocks5List(socks5Data.proxies || []);
+            const rotateToggle = document.getElementById('fm-socks5-rotate');
+            if (rotateToggle) rotateToggle.checked = socks5Data.rotate !== false;
+        } catch (e) {}
 
-        // Parallélise les 7 fetches (au lieu de 7 await séquentiels)
-        const results = await Promise.allSettled([
-            fetchTimeout('/api/vpn-status', 5000),
-            fetchTimeout('/api/vpn/credentials', 4000),
-            fetchTimeout('/api/vpn-config', 4000),
-            fetchTimeout('/api/vpn/socks5', 4000),
-            fetchTimeout('/api/config/free-model-map', 4000),
-            fetchTimeout('/api/vpn/rotation-rules', 4000),
-            fetchTimeout('/api/vpn/schedule', 4000),
-        ]);
-
-        const [vpnStatusRes, credRes, cfgRes, socks5Res, freeMapRes, rotationRes, scheduleRes] = results;
-
-        // 1) VPN status
-        if (vpnStatusRes.status === 'fulfilled' && vpnStatusRes.value) {
-            try { updateVPNUI(vpnStatusRes.value); } catch (e) { console.error('updateVPNUI', e); }
-        } else {
-            console.warn('vpn-status slow/failed:', vpnStatusRes.reason?.message);
-        }
-
-        // 2) Credentials
-        if (credRes.status === 'fulfilled' && credRes.value) {
-            try {
-                const credData = credRes.value;
-                const credStatus = document.getElementById('vpn-cred-status');
-                const usernameEl = document.getElementById('vpn-cred-username');
-                const passwordEl = document.getElementById('vpn-cred-password');
-                const fileEl = document.getElementById('vpn-cred-file');
-                if (credData.exists) {
-                    if (credStatus) credStatus.innerHTML = '<span style="color:var(--success)">&#10003;</span> ' + (t('vpn.credentials_saved') || 'Enregistré');
-                    if (usernameEl) usernameEl.textContent = credData.username_preview || '****';
-                    if (passwordEl) passwordEl.textContent = '••••••••';
-                    if (fileEl) fileEl.textContent = credData.path || 'vpn/credentials.txt';
-                } else {
-                    if (credStatus) credStatus.innerHTML = '<span style="color:var(--warning)">!</span> ' + (t('vpn.credentials_missing') || 'Aucun identifiant');
-                    if (usernameEl) usernameEl.textContent = '—';
-                    if (passwordEl) passwordEl.textContent = '—';
-                    if (fileEl) fileEl.textContent = '—';
-                }
-            } catch (e) { console.error('cred UI', e); }
-        }
-
-        // 3) VPN config (contient enabled)
-        if (cfgRes.status === 'fulfilled' && cfgRes.value) {
-            try {
-                const cfgData = cfgRes.value;
-                renderServerList(cfgData.servers || []);
-                if (cfgData.mode) document.getElementById('vpn-mode').value = cfgData.mode;
-                if (cfgData.proxy_port) document.getElementById('vpn-proxy-port').value = cfgData.proxy_port;
-                if (cfgData.switch_delay) document.getElementById('vpn-switch-delay').value = cfgData.switch_delay;
-                if (cfgData.quota_per_ip) document.getElementById('vpn-quota-per-ip').value = cfgData.quota_per_ip;
-                if (cfgData.docker_image) {
-                    const dockerSelect = document.getElementById('vpn-docker-image');
-                    const knownImages = ['qmcgaw/gluetun', 'nordvpn-official'];
-                    if (knownImages.includes(cfgData.docker_image)) {
-                        dockerSelect.value = cfgData.docker_image;
-                    } else {
-                        dockerSelect.value = 'custom';
-                        const customInput = document.getElementById('vpn-docker-image-custom');
-                        if (customInput) {
-                            customInput.style.display = 'block';
-                            customInput.value = cfgData.docker_image;
-                        }
-                    }
-                    vpnDockerImageChanged();
-                }
-                vpnInitConfig(cfgData.mode);
-                if (cfgData.circuit_breaker_threshold) document.getElementById('vpn-cb-threshold').value = cfgData.circuit_breaker_threshold;
-                if (cfgData.circuit_breaker_recovery) document.getElementById('vpn-cb-recovery').value = cfgData.circuit_breaker_recovery;
-                if (cfgData.backoff_max_delay) document.getElementById('vpn-backoff-max').value = cfgData.backoff_max_delay;
-                if (cfgData.watchdog_interval !== undefined) document.getElementById('vpn-watchdog').value = cfgData.watchdog_interval;
-                if (cfgData.api_cache_ttl) document.getElementById('vpn-api-cache').value = cfgData.api_cache_ttl;
-                if (cfgData.proxy_mode) setProxyModeUI(cfgData.proxy_mode);
-                const fmT = document.getElementById('fm-toggle');
-                if (fmT) {
-                    fmT.checked = !!cfgData.enabled;
-                    try { localStorage.setItem('vpn_enabled_cache', cfgData.enabled ? '1' : '0'); } catch (e) {}
-                }
-            } catch (e) { console.error('cfg UI', e); }
-        } else {
-            console.warn('vpn-config slow/failed:', cfgRes.reason?.message);
-        }
-
-        // 4) SOCKS5
-        if (socks5Res.status === 'fulfilled' && socks5Res.value) {
-            try {
-                renderSocks5List(socks5Res.value.proxies || []);
-                const rotateToggle = document.getElementById('fm-socks5-rotate');
-                if (rotateToggle) rotateToggle.checked = socks5Res.value.rotate !== false;
-            } catch (e) {}
-        }
-
-        // 5) Free Model Map (utilise déjà le résultat parallèle, évite 2e fetch)
-        if (freeMapRes.status === 'fulfilled' && freeMapRes.value) {
-            try {
-                _freeModelMap = freeMapRes.value.free_model_map || {};
-                renderFreeModelMap();
-                const paidSel = document.getElementById('fmm-paid');
-                const freeSel = document.getElementById('fmm-free');
-                const models = freeMapRes.value.available_models || availableModels || [];
-                if (paidSel) {
-                    const curPaid = paidSel.value;
-                    paidSel.innerHTML = '<option value="">— choisir —</option>' + models.map(m=> `<option value="${escHtml(m)}">${escHtml(m)}</option>`).join('');
-                    if (curPaid) paidSel.value = curPaid;
-                }
-                if (freeSel) {
-                    const curFree = freeSel.value;
-                    const freeModels = models.filter(m=> m.endsWith('-free')).concat(models.filter(m=> !models.includes(m+'-free')).map(m=> m+'-free'));
-                    const uniq = [...new Set(freeModels)];
-                    freeSel.innerHTML = '<option value="">— choisir —</option>' + uniq.map(m=> `<option value="${escHtml(m)}">${escHtml(m)}</option>`).join('');
-                    if (curFree) freeSel.value = curFree;
-                }
-            } catch (e) { console.error('freeMap parallel', e); }
-        } else {
-            // Fallback ancien comportement si fetch parallèle a échoué
-            try { await refreshFreeModelMap(); } catch (e) {}
-        }
-
-        // 6) Rotation Rules
-        if (rotationRes.status === 'fulfilled' && rotationRes.value) {
-            try {
-                _rotationRules = rotationRes.value.rules || [];
-                renderRotationRules();
-            } catch (e) {}
-        } else {
-            try { await refreshRotationRules(); } catch (e) {}
-        }
-
-        // 7) Schedule
-        if (scheduleRes.status === 'fulfilled' && scheduleRes.value) {
-            try {
-                const data = scheduleRes.value;
-                _schedule = data && typeof data.enabled !=='undefined' ? data : {enabled:false, rules: data.rules||[]};
-                renderSchedule();
-                const tog = document.getElementById('vpn-schedule-enabled');
-                if (tog) tog.checked = !!_schedule.enabled;
-            } catch (e) {}
-        } else {
-            try { await refreshSchedule(); } catch (e) {}
-        }
-
-        // Fin chargement
-        if (fmToggle) fmToggle.disabled = false;
-        if (statusEl && statusEl.dataset.loading) {
-            delete statusEl.dataset.loading;
-            // Laisse updateVPNUI avoir déjà mis le bon label, sinon restaure
-            if (statusEl.textContent === 'Chargement...') {
-                statusEl.textContent = statusEl.dataset.orig || '—';
-                delete statusEl.dataset.orig;
-            }
-        }
-        _vpnRefreshInFlight = false;
+        // [plan 18/08 §3d] VPN technology selector state
+        refreshStackInfo();
     }
+
+    // [plan 18/08 §3d] Render per-station stack info from GET /api/vpn-stack-info
+    async function refreshStackInfo() {
+        const container = document.getElementById('vpn-stack-stations');
+        if (!container) return;
+        try {
+            const resp = await fetchWithToken('/api/vpn-stack-info');
+            const data = await resp.json();
+            const stations = data.stations || {};
+            const keys = Object.keys(stations);
+            if (!keys.length) {
+                container.innerHTML = '<div style="color:var(--text-muted)">—</div>';
+                return;
+            }
+            container.innerHTML = keys.map(num => {
+                const s = stations[num];
+                const keysOk = s.keys_present
+                    ? '<span style="color:var(--success)">&#10003; ' + (t('vpn.stack.keys_present') || 'présentes') + '</span>'
+                    : '<span style="color:var(--warning)">! ' + (t('vpn.stack.keys_missing') || 'absentes') + '</span>';
+                const effLabel = s.effective === 'wireguard' ? (t('vpn.stack.wireguard') || 'WireGuard')
+                    : s.effective === 'openvpn' ? (t('vpn.stack.openvpn') || 'OpenVPN') : (s.effective || '—');
+                const lastFlip = (s.flips && s.flips.length)
+                    ? s.flips[s.flips.length - 1].time + ' ' + (s.flips[s.flips.length - 1].from || '?') + '→' + (s.flips[s.flips.length - 1].to || '?')
+                    : (t('vpn.stack.none') || 'aucune');
+                const hist = (s.flips && s.flips.length)
+                    ? '<div style="font-family:monospace;font-size:11px;margin-top:4px;color:var(--text-muted)">' +
+                        s.flips.slice(-5).map(f => escHtml(f.time + ' ' + (f.from || '?') + '→' + (f.to || '?') + ' (' + (f.reason || '') + ')')).join('<br>') +
+                      '</div>'
+                    : '';
+                return `
+                <div style="margin-top:8px;padding:8px;background:var(--bg-primary);border-radius:6px">
+                    <div style="display:flex;justify-content:space-between;align-items:center">
+                        <strong>${escHtml(t('vpn.stack.station') || 'Station')} ${num}</strong>
+                        <span>${effLabel} · ${keysOk}</span>
+                    </div>
+                    <div style="display:flex;gap:16px;margin-top:6px;font-size:11px;color:var(--text-muted);flex-wrap:wrap">
+                        <span>${escHtml(t('vpn.stack.egress_fail') || 'Échecs egress')}: ${s.egress_failures ?? 0}</span>
+                        <span>${escHtml(t('vpn.stack.egress_ticks') || 'Ticks egress morts')}: ${s.wg_egress_ticks ?? 0}</span>
+                        <span>${escHtml(t('vpn.stack.auth_failed') || 'AUTH_FAILED / 30 min')}: ${s.auth_failed_window ?? 0} / ${s.auth_failed_threshold ?? 3}</span>
+                        <span>${escHtml(t('vpn.stack.last_flip') || 'Dernière bascule')}: ${escHtml(lastFlip)}</span>
+                    </div>
+                    ${hist}
+                </div>`;
+            }).join('');
+        } catch (e) {
+            console.error('Stack info error:', e);
+            container.innerHTML = '<div style="color:var(--text-muted)">—</div>';
+        }
+    }
+
+    window.vpnSaveStack = async function() {
+        const select = document.getElementById('vpn-stack-select');
+        if (!select) return;
+        await fetchWithToken('/api/vpn-config', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({vpn_stack: select.value})
+        });
+        refreshVPNStatus();
+    };
 
     function renderServerList(servers) {
         const list = document.getElementById('vpn-servers-list');
@@ -2812,6 +2985,7 @@ document.addEventListener('DOMContentLoaded', () => {
         const statusEl = document.getElementById('vpn-status-text');
         const statusDot = document.getElementById('vpn-status-dot');
         const ipEl = document.getElementById('vpn-ip');
+        const identityEl = document.getElementById('vpn-identity');
         const serverEl = document.getElementById('vpn-server');
         const requestsEl = document.getElementById('vpn-requests');
         const totalEl = document.getElementById('vpn-total-free');
@@ -2834,6 +3008,10 @@ document.addEventListener('DOMContentLoaded', () => {
         if (statusDot) statusDot.style.background = s.color;
 
         ipEl.textContent = data.current_ip || '—';
+        if (identityEl) {
+            const ident = data.vpn && data.vpn.current_identity;
+            identityEl.textContent = ident ? `${ident.impersonate} #${data.vpn.identity_index}` : '—';
+        }
         serverEl.textContent = data.current_server || '—';
         requestsEl.textContent = `${data.requests_this_ip || 0} / ${data.quota_per_ip || 300}`;
         totalEl.textContent = data.total_free_requests || 0;
@@ -2843,15 +3021,188 @@ document.addEventListener('DOMContentLoaded', () => {
         toggleEl.checked = data.enabled || false;
         toggleLabel.textContent = data.enabled ? (t('vpn.rotation_on') || 'Activé') : (t('vpn.rotation_off') || 'Désactivé');
 
-        // IP History
+        // [plan 18/08 §2.1] Env périmé (cause racine 19/08): le .env diffère
+        // de l'env du process — les enfants docker compose héritent de l'env,
+        // qui gagne sur le fichier. Le volet déterministe (_compose_env) force
+        // déjà VPN_TYPE_STATION{n} dans chaque enfant ; cette bannière signale
+        // la divergence restante (autres clés VPN_*) jusqu'au restart/re-push.
+        const envBanner = document.getElementById('vpn-env-divergence-banner');
+        if (envBanner) {
+            if (Array.isArray(data.env_divergence) && data.env_divergence.length) {
+                const keys = data.env_divergence.map(d => `<code>${escHtml(d.key)}</code>`).join(', ');
+                envBanner.innerHTML = '⚠ <strong>Env périmé</strong> — le .env diffère de l\'env du process pour : ' + keys +
+                    '. Redémarrez le proxy ou re-poussez la config pour re-synchroniser.';
+                envBanner.style.display = 'block';
+            } else {
+                envBanner.style.display = 'none';
+            }
+        }
+
+        // [plan 18/08 axe 3.4] config.yaml modifié à la main sans POST dashboard.
+        // Le hot-reload est push-only par design : on SIGNALE, on ne recharge
+        // jamais en auto (un état divergent serait invisible pour le pool).
+        const dirtyBanner = document.getElementById('vpn-config-dirty-banner');
+        if (dirtyBanner) {
+            if (data.config_yaml_dirty) {
+                dirtyBanner.innerHTML = '⚠ <strong>config.yaml modifié à la main</strong> — le détecteur M-time le signale mais le serveur ne recharge pas tout seul. Redémarrez le proxy ou re-poussez la config pour appliquer.';
+                dirtyBanner.style.display = 'block';
+            } else {
+                dirtyBanner.style.display = 'none';
+            }
+        }
+
+        // [vivid-hinton P4] geo banner + badges + kill-switch (strict/best_effort/warn)
+        const geoBanner = document.getElementById('geo-banner');
+        const geoToggleBtn = document.getElementById('geo-toggle-btn');
+        const geoBadge = document.getElementById('geo-badge');
+        if (geoBanner) {
+            const geo = data.geo || {};
+            const cur = data.current_country || '';
+            const allowedFor = data.current_country_allowed_for || [];
+            if (geoToggleBtn) geoToggleBtn.textContent = geo.enabled ? '🌍 Géo: ON' : '🌍 Géo: OFF';
+            const geoDirectBtn = document.getElementById('geo-direct-btn');
+            if (geoDirectBtn) geoDirectBtn.textContent = geo.allow_direct_when_compatible ? 'Autoriser direct si IP compatible: ON' : 'Autoriser direct si IP compatible: OFF';
+            if (geoBadge) {
+                const badgeMap = { strict: '🔴 strict', prefer: '🟠 best_effort', warn: '⚪ warn' };
+                // derive dominant mode from vpn-status geo if available
+                geoBadge.textContent = geo.enabled ? (badgeMap[geo.mode] || '') : '';
+            }
+            if (!geo.enabled) {
+                geoBanner.innerHTML = '🌍 <strong>Géo</strong> désactivée (kill-switch) — aucune restriction active.';
+                geoBanner.style.display = 'block';
+                geoBanner.style.background = 'rgba(120,120,120,0.12)';
+                geoBanner.style.border = '1px solid var(--border,#555)';
+                geoBanner.style.color = 'var(--text-muted)';
+            } else if (cur) {
+                const n = allowedFor.length;
+                geoBanner.innerHTML = '🌍 Pays actuel <strong>' + escHtml(cur) + '</strong> — ' + n + ' route(s) autorisée(s)' + (n ? ': ' + allowedFor.map(escHtml).join(', ') : '');
+                geoBanner.style.display = 'block';
+                geoBanner.style.background = 'rgba(80,160,255,0.10)';
+                geoBanner.style.border = '1px solid rgba(80,160,255,0.35)';
+                geoBanner.style.color = 'var(--text)';
+            } else {
+                geoBanner.style.display = 'none';
+            }
+        }
+
+        // [plan 18/08 §4] N-station — one row per active tunnel, rendered
+        // from the pool's stations[] payload (was a fixed station-2 block).
+        // Countries overlay comes from data.countries (below); active_station
+        // marks the tunnel the pool currently routes through.
+        const countries = data.countries || {};
+        const stationRowsEl = document.getElementById('vpn-station-rows');
+        if (stationRowsEl) {
+            const stations = data.stations || [];
+            const sMap = { connected: t('vpn.connected') || 'Connecté', connecting: t('vpn.connecting') || 'Connexion...', disconnected: t('vpn.disconnected') || 'Déconnecté', error: t('vpn.error') || 'Erreur' };
+            stationRowsEl.innerHTML = stations.map(s => {
+                const cn = countries[s.station] || {};
+                let errText = '—';
+                if (s.last_rotation_error) errText = '⚠ ' + escHtml(s.last_rotation_error);
+                else if (s.bad_remaining > 0) errText = 'Cooldown (429) — ' + Math.ceil(s.bad_remaining) + 's';
+                const statusText = (sMap[s.vpn_status] || s.vpn_status || '—') +
+                    (data.active_station === s.station ? ' · active' : '');
+                return '<div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border,#444)">' +
+                    '<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">' +
+                    '<strong style="font-size:12px">' + (t('vpn.stack.station') || 'Station') + ' ' + s.station + '</strong>' +
+                    '<span style="font-size:12px">' + statusText + '</span>' +
+                    '<button class="btn" onclick="vpnNext(' + s.station + ')" style="font-size:11px;padding:2px 8px">' +
+                    t('vpn.switch_ip') + '</button></div>' +
+                    '<div class="config-grid">' +
+                    '<div class="config-row"><span class="label">' + t('vpn.current_ip') + '</span>' +
+                    '<span class="value" style="font-family:monospace;font-weight:bold">' + escHtml(s.current_ip || '—') + '</span></div>' +
+                    '<div class="config-row"><span class="label">' + t('vpn.current_server') + '</span>' +
+                    '<span class="value">' + escHtml(s.current_server || '—') + '</span></div>' +
+                    '<div class="config-row"><span class="label">' + t('vpn.requests_this_ip') + '</span>' +
+                    '<span class="value">' + (s.requests_this_ip || 0) + ' / ' + (s.quota_per_ip || 300) + '</span></div>' +
+                    '<div class="config-row"><span class="label">Pays</span>' +
+                    '<span class="value">' + escHtml(cn.current_country || '—') + '</span></div>' +
+                    '<div class="config-row"><span class="label">Prochain pays</span>' +
+                    '<span class="value">' + escHtml(cn.next_country || '—') + '</span></div>' +
+                    '<div class="config-row"><span class="label">État</span>' +
+                    '<span class="value">' + errText + '</span></div>' +
+                    '</div></div>';
+            }).join('');
+        }
+
+        // IP History — stats par IP (payload ip_stats injecté par /api/vpn-status)
         const historyEl = document.getElementById('vpn-ip-history');
-        if (historyEl && data.vpn && data.vpn.ip_history) {
-            historyEl.innerHTML = data.vpn.ip_history.slice().reverse().map(h =>
-                `<div style="padding:3px 0;border-bottom:1px solid var(--border)">
-                    <span style="font-family:monospace">${h.ip}</span>
-                    <span style="color:var(--text-muted)"> — ${h.server} — ${h.time}</span>
-                </div>`
-            ).join('') || '<div style="color:var(--text-muted);padding:4px">Aucun historique</div>';
+        if (historyEl) {
+            const rows = data.ip_stats ? Object.entries(data.ip_stats) : [];
+            if (!rows.length) {
+                historyEl.innerHTML = `<div style="color:var(--text-muted);padding:4px">${t('vpn.ip_no_data') || 'Aucune utilisation d\'IP'}</div>`;
+            } else {
+                historyEl.innerHTML =
+                    '<table style="width:100%"><thead><tr>' +
+                    `<th style="text-align:left">${t('vpn.ip') || 'IP'}</th>` +
+                    `<th>${t('vpn.ip_total') || 'Total'}</th>` +
+                    `<th>${t('vpn.ip_free') || 'Gratuites'}</th>` +
+                    `<th>${t('vpn.ip_paid') || 'Payantes'}</th>` +
+                    `<th>${t('vpn.ip_identity') || 'Identité'}</th>` +
+                    `<th>${t('vpn.ip_last_seen') || 'Dernière vue'}</th>` +
+                    '</tr></thead><tbody>' +
+                    rows.map(([ip, s]) =>
+                        `<tr><td style="font-family:monospace;font-size:12px">${escHtml(ip)}` +
+                        (s.server ? `<div style="font-size:10px;color:var(--text-muted)">${escHtml(s.server)}${s.last_rotation ? ' — ' + formatDateTime(s.last_rotation) : ''}</div>` : '') +
+                        `</td><td style="font-size:12px">${formatNumber(s.total)}</td>` +
+                        `<td style="font-size:12px">${formatNumber(s.free_count)}</td>` +
+                        `<td style="font-size:12px">${formatNumber(s.paid_count)}</td>` +
+                        `<td style="font-size:12px">${escHtml(s.identity) || '—'}</td>` +
+                        `<td style="font-size:12px">${formatDateTime(s.last_seen)}</td></tr>`
+                    ).join('') +
+                    '</tbody></table>';
+            }
+        }
+
+        // [plan] C: real-time panel — country per station, shared cursor,
+        // docker event watcher + invariant state (all fail-open to '—').
+        // Station 1 keeps the fixed vpn-country/vpn-next-country slots; the
+        // station ≥2 countries were rendered inside the N-station rows above.
+        const c1c = countries[1];
+        const countryEl = document.getElementById('vpn-country');
+        const nextEl = document.getElementById('vpn-next-country');
+        if (countryEl) countryEl.textContent = (c1c && c1c.current_country) || '—';
+        if (nextEl) nextEl.textContent = (c1c && c1c.next_country) || '—';
+
+        const rt = document.getElementById('vpn-realtime');
+        if (rt) {
+            const we = data.watch_events;
+            if (we) {
+                rt.style.display = '';
+                const watcherEl = document.getElementById('vpn-watcher');
+                if (watcherEl) {
+                    const alive = we.running ? 'live' : 'off';
+                    const color = we.running ? 'var(--success)' : 'var(--warning)';
+                    watcherEl.innerHTML = '<span style="color:' + color + '">● docker events ' + escHtml(alive) + '</span>' +
+                        ' <span style="color:var(--text-muted)">' + (we.events_seen || 0) + ' évts</span>';
+                }
+                const cursorEl = document.getElementById('vpn-country-cursor');
+                if (cursorEl) {
+                    const sr = data.shared_rotation || {};
+                    const cc = sr.country_cursor;
+                    const bySt = sr.last_country_by_station || {};
+                    const byStText = Object.keys(bySt).sort((a, b) => a - b)
+                        .map(k => 's' + k + ':' + (bySt[k] || '—')).join(' · ');
+                    cursorEl.textContent = (cc !== undefined && cc !== null ? cc : '—') +
+                        (byStText ? ' · ' + byStText : '');
+                }
+                const pendingEl = document.getElementById('vpn-rotate-pending');
+                if (pendingEl) {
+                    const pend = (data.rotate_pending || []).join(',') || 'aucune';
+                    pendingEl.textContent = (data.rotation_stagger || 0) + ' · ' + pend;
+                }
+                const eventLogEl = document.getElementById('vpn-event-log');
+                if (eventLogEl) {
+                    const rows = Object.entries(we.last_seen || {});
+                    eventLogEl.innerHTML = rows.length
+                        ? rows.map(([ctn, e]) =>
+                            '<div style="white-space:nowrap">' + escHtml(ctn) + ' → ' +
+                            escHtml(e.status) + ' <span style="opacity:.6">' +
+                            escHtml(e.time) + '</span></div>').join('')
+                        : '<div style="opacity:.7;font-style:italic">Aucun événement docker observé</div>';
+                }
+            } else {
+                rt.style.display = 'none';
+            }
         }
 
         // Circuit breaker status
@@ -2877,23 +3228,20 @@ document.addEventListener('DOMContentLoaded', () => {
                 cbStatusEl.innerHTML = '<span style="color:var(--success)">✓ Aucun échec enregistré</span>';
             }
         }
+        // [36] G7 — last rotation error of the active station, appended last
+        // so the circuit-breaker block above can't overwrite it.
+        if (cbStatusEl) {
+            const s1 = (data.stations || [])[0];
+            const rotErr = (s1 && s1.last_rotation_error) || (data.vpn && data.vpn.last_rotation_error);
+            if (rotErr) {
+                cbStatusEl.innerHTML += `<div style="color:var(--danger);margin-top:6px">⚠ Rotation: ${escHtml(rotErr)}</div>`;
+            }
+        }
     }
 
     window.toggleVPN = async function(enabled) {
-        const toggle = document.getElementById('vpn-toggle');
-        const prev = toggle ? !enabled : enabled;
-        try {
-            const resp = await fetch('/api/vpn/toggle', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({enabled}) });
-            if (!resp.ok) throw new Error('HTTP '+resp.status);
-            const data = await resp.json().catch(()=>({}));
-            if (data.error) throw new Error(data.error);
-            refreshVPNStatus();
-        } catch(e){
-            console.error('toggleVPN failed', e);
-            if (toggle) toggle.checked = prev;
-            const status=document.getElementById('vpn-health-result');
-            if(status){ status.innerHTML=`<span style="color:var(--danger)">✗ ${escHtml(e.message)}</span>`; setTimeout(()=>status.textContent='',3000); }
-        }
+        await fetchWithToken('/api/vpn/toggle', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({enabled}) });
+        refreshVPNStatus();
     };
 
     window.vpnConnect = async function() {
@@ -2901,7 +3249,7 @@ document.addEventListener('DOMContentLoaded', () => {
         if (resultEl) resultEl.innerHTML = '<span style="color:var(--warning)">Connexion en cours...</span>';
 
         try {
-            const resp = await fetch('/api/vpn/connect', { method: 'POST' });
+            const resp = await fetchWithToken('/api/vpn/connect', { method: 'POST' });
             const data = await resp.json();
             if (data.error) {
                 // Parse error for specific messages
@@ -2932,72 +3280,39 @@ document.addEventListener('DOMContentLoaded', () => {
     };
 
     window.vpnSaveConfig = async function() {
-        const clamp = (id, min, max, def) => {
-            const el = document.getElementById(id);
-            if (!el) return def;
-            let v = parseInt(el.value);
-            if (isNaN(v)) v = def;
-            v = Math.max(min, Math.min(max, v));
-            el.value = v;
-            return v;
-        };
         const mode = document.getElementById('vpn-mode').value;
-        const proxyPort = clamp('vpn-proxy-port', 1, 65535, 8888);
-        const switchDelay = clamp('vpn-switch-delay', 1, 60, 5);
+        const proxyPort = parseInt(document.getElementById('vpn-proxy-port').value) || 8888;
+        const switchDelay = parseInt(document.getElementById('vpn-switch-delay').value) || 5;
         let dockerImage = document.getElementById('vpn-docker-image')?.value || 'qmcgaw/gluetun';
         if (dockerImage === 'custom') {
-            dockerImage = document.getElementById('vpn-docker-image-custom')?.value?.trim() || 'qmcgaw/gluetun';
-            if (!dockerImage) return alert('Image Docker requise');
+            dockerImage = document.getElementById('vpn-docker-image-custom')?.value || 'qmcgaw/gluetun';
         }
-        const cbThreshold = clamp('vpn-cb-threshold', 1, 10, 3);
-        const cbRecovery = clamp('vpn-cb-recovery', 30, 3600, 300);
-        const backoffMax = clamp('vpn-backoff-max', 10, 300, 60);
-        const watchdog = clamp('vpn-watchdog', 0, 600, 60);
-        const apiCache = clamp('vpn-api-cache', 60, 7200, 900);
+        const cbThreshold = parseInt(document.getElementById('vpn-cb-threshold')?.value) || 3;
+        const cbRecovery = parseInt(document.getElementById('vpn-cb-recovery')?.value) || 300;
+        const backoffMax = parseInt(document.getElementById('vpn-backoff-max')?.value) || 60;
+        const watchdog = parseInt(document.getElementById('vpn-watchdog')?.value) || 60;
+        const apiCache = parseInt(document.getElementById('vpn-api-cache')?.value) || 900;
 
-        const statusEl = document.getElementById('vpn-health-result');
-        try {
-            const resp = await fetch('/api/vpn-config', {
-                method: 'POST', headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({
-                    mode, proxy_port: proxyPort, switch_delay: switchDelay, docker_image: dockerImage,
-                    circuit_breaker_threshold: cbThreshold, circuit_breaker_recovery: cbRecovery,
-                    backoff_max_delay: backoffMax, watchdog_interval: watchdog, api_cache_ttl: apiCache
-                })
-            });
-            const data = await resp.json().catch(()=>({}));
-            if (!resp.ok || data.error) throw new Error(data.error|| 'HTTP '+resp.status);
-            if (statusEl) { statusEl.innerHTML='<span style="color:var(--success)">✓ Sauvegardé (hot-reload)</span>'; setTimeout(()=> statusEl.textContent='',3000); }
-        } catch(e){
-            console.error('vpnSaveConfig failed', e);
-            if (statusEl) { statusEl.innerHTML=`<span style="color:var(--danger)">✗ ${escHtml(e.message)}</span>`; setTimeout(()=> statusEl.textContent='',4000); }
-        }
+        await fetchWithToken('/api/vpn-config', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
+                mode, proxy_port: proxyPort, switch_delay: switchDelay, docker_image: dockerImage,
+                circuit_breaker_threshold: cbThreshold, circuit_breaker_recovery: cbRecovery,
+                backoff_max_delay: backoffMax, watchdog_interval: watchdog, api_cache_ttl: apiCache
+            })
+        });
 
-        // Show/hide Docker options (local UI, no fetch rollback needed)
+        // Show/hide Docker options
         document.getElementById('vpn-docker-row').style.display = mode === 'docker' ? 'flex' : 'none';
-        const hints = { auto: 'Auto-détecte le meilleur mode disponible', docker: 'Docker (reproductible, isolé)', native: 'Windows natif (OpenVPN installé)', 'nordvpn-app': 'NordVPN App (application desktop Windows)', wsl2: 'WSL2 (léger, déjà installé)' };
-        const hintEl = document.getElementById('vpn-mode-hint');
-        if (hintEl) hintEl.textContent = hints[mode] || hints.wsl2;
+        document.getElementById('vpn-mode-hint').textContent = mode === 'docker' ? 'Docker (reproductible, isolé)' : 'WSL2 (léger, déjà installé)';
     };
 
     window.saveQuotaPerIp = async function() {
-        const el = document.getElementById('vpn-quota-per-ip');
-        let quotaPerIp = parseInt(el?.value) || 300;
-        quotaPerIp = Math.max(1, Math.min(10000, quotaPerIp));
-        if (el) el.value = quotaPerIp;
-        const statusEl = document.getElementById('vpn-health-result');
-        try {
-            const resp = await fetch('/api/vpn-config', {
-                method: 'POST', headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({ quota_per_ip: quotaPerIp })
-            });
-            const data = await resp.json().catch(()=>({}));
-            if (!resp.ok || data.error) throw new Error(data.error||'HTTP '+resp.status);
-            if (statusEl) { statusEl.innerHTML='<span style="color:var(--success)">✓ Quota sauvegardé</span>'; setTimeout(()=> statusEl.textContent='',2000); }
-        } catch(e){
-            console.error('saveQuotaPerIp failed', e);
-            if (statusEl) { statusEl.innerHTML=`<span style="color:var(--danger)">✗ ${escHtml(e.message)}</span>`; }
-        }
+        const quotaPerIp = parseInt(document.getElementById('vpn-quota-per-ip').value) || 300;
+        await fetchWithToken('/api/vpn-config', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ quota_per_ip: quotaPerIp })
+        });
     };
 
     // Initialize mode selector from config
@@ -3024,7 +3339,7 @@ document.addEventListener('DOMContentLoaded', () => {
         resultEl.innerHTML = '<span style="color:var(--warning)">Diagnostic en cours...</span>';
 
         try {
-            const resp = await fetch('/api/vpn/diagnostic');
+            const resp = await fetchWithToken('/api/vpn/diagnostic');
             const data = await resp.json();
 
             let html = '<strong>🩺 Diagnostic VPN</strong><br>';
@@ -3074,7 +3389,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
         try {
             // Check if available
-            const availResp = await fetch('/api/vpn/nordvpn-available');
+            const availResp = await fetchWithToken('/api/vpn/nordvpn-available');
             const availData = await availResp.json();
             if (!availData.available) {
                 if (statusEl) statusEl.innerHTML = '<span style="color:var(--danger)">✗ NordVPN non installé</span>';
@@ -3082,7 +3397,7 @@ document.addEventListener('DOMContentLoaded', () => {
             }
 
             // Get status
-            const statusResp = await fetch('/api/vpn/nordvpn-status');
+            const statusResp = await fetchWithToken('/api/vpn/nordvpn-status');
             const statusData = await statusResp.json();
             if (statusData.connected) {
                 if (statusEl) statusEl.innerHTML = `<span style="color:var(--success)">✓ Connecté</span> — ${statusData.country || '?'} / ${statusData.city || '?'} / IP: ${statusData.ip || '?'}`;
@@ -3091,7 +3406,7 @@ document.addEventListener('DOMContentLoaded', () => {
             }
 
             // Get countries count
-            const countriesResp = await fetch('/api/vpn/nordvpn-countries');
+            const countriesResp = await fetchWithToken('/api/vpn/nordvpn-countries');
             const countriesData = await countriesResp.json();
             if (countriesEl && countriesData.countries) {
                 countriesEl.textContent = `${countriesData.countries.length} pays disponibles`;
@@ -3124,20 +3439,99 @@ document.addEventListener('DOMContentLoaded', () => {
     };
 
     window.vpnDisconnect = async function() {
-        await fetch('/api/vpn/disconnect', { method: 'POST' });
+        await fetchWithToken('/api/vpn/disconnect', { method: 'POST' });
         refreshVPNStatus();
     };
 
-    window.vpnNext = async function() {
-        const resp = await fetch('/api/vpn/next', { method: 'POST' });
-        const data = await resp.json();
-        if (data.error) alert('Erreur: ' + data.error);
+    window.vpnNext = async function(station) {
+        try {
+            const resp = await fetchWithToken('/api/vpn/next', {
+                method: 'POST', headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({station: station || 0})
+            });
+            const data = await resp.json();
+            if (data.error) alert('Erreur: ' + data.error);
+        } catch (e) { alert('Erreur: ' + e); }
+        refreshVPNStatus();
+    };
+
+    // [fix] Stations VPN : 1 clic suffit — feedback + anti-race
+    // Le bug : refreshVPNStatus écrasait le <select> toutes les 10s et le bouton
+    // n'avait ni disabled ni spinner, donc l'utilisateur re-cliquait en boucle.
+    window.vpnSaveStationCount = async function() {
+        const select = document.getElementById('vpn-station-count');
+        const btn = document.getElementById('vpn-station-apply-btn') || document.querySelector('#vpn-dual-section button[onclick*="vpnSaveStationCount"]');
+        const n = select ? parseInt(select.value, 10) : 0;
+        if (!n || n < 1 || n > 10) return;
+        if (btn && btn.disabled) return;
+        if (typeof _vpnSaving !== 'undefined' && _vpnSaving) return;
+        _vpnSaving = true;
+        _vpnStationPending = String(n);
+        const origText = btn ? btn.textContent : '';
+        const origOutline = btn ? btn.style.outline : '';
+        if (btn) { btn.disabled = true; btn.textContent = 'En cours...'; btn.style.opacity = '0.6'; btn.style.cursor = 'wait'; }
+        if (select) select.disabled = true;
+        let data = null;
+        try {
+            const resp = await fetchWithToken('/api/vpn-config', {
+                method: 'POST', headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({station_count: n})
+            });
+            data = await resp.json();
+            if (!resp.ok || data.error) throw new Error(data.error || `HTTP ${resp.status}`);
+            if (data.config && data.config.station_count) {
+                const persisted = String(parseInt(data.config.station_count, 10));
+                if (select) select.value = persisted;
+                _vpnStationPending = null;
+                if (btn) btn.style.outline = '';
+            }
+        } catch (e) {
+            alert('Erreur: ' + (e.message || e));
+            _vpnStationPending = null;
+        } finally {
+            if (btn) { btn.disabled = false; btn.textContent = origText || (typeof t !== 'undefined' ? t('vpn.stations.save') : 'Appliquer'); btn.style.opacity = ''; btn.style.cursor = ''; if (!origOutline) btn.style.outline = ''; }
+            if (select) select.disabled = false;
+            _vpnSaving = false;
+            try { await refreshVPNStatus(); } catch(e2) {}
+            if (typeof refreshStackInfo === 'function') { try { await refreshStackInfo(); } catch(e3) {} }
+            try { fetchConfig(); } catch(e4) {}
+        }
+    };
+
+    window.vpnSaveExhaustMode = async function() {
+        const strict = document.getElementById('vpn-exhaust-mode').value === 'strict';
+        await fetchWithToken('/api/vpn-config', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({strict_free: strict})
+        });
+        refreshVPNStatus();
+    };
+
+    // [plan 19/08 §1] free multi-attempt cap (1-3) — persisted + hot-reload
+    // (read per-request via IP_ROTATION.get, no restart).
+    window.vpnSaveMaxFreeAttempts = async function() {
+        const n = parseInt(document.getElementById('vpn-free-attempts').value, 10) || 2;
+        await fetchWithToken('/api/vpn-config', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({max_free_attempts: n})
+        });
+        refreshVPNStatus();
+    };
+
+    // [plan 19/08 §2] exception ordering: dead tunnel → next station first,
+    // or direct residential fallback immediately.
+    window.vpnSaveExceptionFallback = async function() {
+        const mode = document.getElementById('vpn-exception-mode').value;
+        await fetchWithToken('/api/vpn-config', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({free_exception_fallback: mode})
+        });
         refreshVPNStatus();
     };
 
     window.vpnRemoveServer = async function(name) {
         if (!confirm(t('vpn.confirm_remove') || 'Supprimer ce serveur ?')) return;
-        await fetch('/api/vpn-config', {
+        await fetchWithToken('/api/vpn-config', {
             method: 'POST', headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({remove_server: name})
         });
@@ -3148,7 +3542,7 @@ document.addEventListener('DOMContentLoaded', () => {
         const username = document.getElementById('vpn-username').value.trim();
         const password = document.getElementById('vpn-password').value.trim();
         if (!username || !password) return alert('Username and password required');
-        const resp = await fetch('/api/vpn-config', {
+        const resp = await fetchWithToken('/api/vpn-config', {
             method: 'POST', headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({credentials: {username, password}})
         });
@@ -3184,7 +3578,7 @@ document.addEventListener('DOMContentLoaded', () => {
             formData.append('name', name);
             formData.append('config', _vpnSelectedFile);
 
-            const resp = await fetch('/api/vpn/upload-config', {
+            const resp = await fetchWithToken('/api/vpn/upload-config', {
                 method: 'POST',
                 body: formData
             });
@@ -3206,7 +3600,7 @@ document.addEventListener('DOMContentLoaded', () => {
         const resultEl = document.getElementById('vpn-health-result');
         if (resultEl) resultEl.textContent = 'Test en cours...';
         try {
-            const resp = await fetch('/api/vpn/health-check', { method: 'POST' });
+            const resp = await fetchWithToken('/api/vpn/health-check', { method: 'POST' });
             const data = await resp.json();
             if (data.ok) {
                 const latency = data.latency_ms ? ` (${data.latency_ms}ms)` : '';
@@ -3223,7 +3617,7 @@ document.addEventListener('DOMContentLoaded', () => {
     // ── VPN Save State ──
     window.vpnSaveState = async function() {
         try {
-            await fetch('/api/vpn/save-state', { method: 'POST' });
+            await fetchWithToken('/api/vpn/save-state', { method: 'POST' });
             const resultEl = document.getElementById('vpn-health-result');
             if (resultEl) resultEl.innerHTML = '<span style="color:var(--success)">✓ État sauvegardé</span>';
         } catch (e) {
@@ -3235,7 +3629,7 @@ document.addEventListener('DOMContentLoaded', () => {
     window.vpnToggleApi = async function(enabled) {
         const section = document.getElementById('vpn-api-section');
         if (section) section.style.display = enabled ? 'block' : 'none';
-        await fetch('/api/vpn-config', {
+        await fetchWithToken('/api/vpn-config', {
             method: 'POST', headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({ use_nordvpn_api: enabled })
         });
@@ -3247,7 +3641,7 @@ document.addEventListener('DOMContentLoaded', () => {
     // ── Load Countries for API ──
     async function vpnLoadCountries() {
         try {
-            const resp = await fetch('/api/vpn/countries');
+            const resp = await fetchWithToken('/api/vpn/countries');
             const data = await resp.json();
             const select = document.getElementById('vpn-api-country');
             if (select && data.countries) {
@@ -3268,7 +3662,7 @@ document.addEventListener('DOMContentLoaded', () => {
         if (resultsEl) resultsEl.textContent = 'Découverte en cours...';
 
         try {
-            const resp = await fetch('/api/vpn/discover-and-add', {
+            const resp = await fetchWithToken('/api/vpn/discover-and-add', {
                 method: 'POST', headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({ country: country || null, group: group || null, limit })
             });
@@ -3287,7 +3681,7 @@ document.addEventListener('DOMContentLoaded', () => {
     // ── Export VPN Config ──
     window.vpnExportConfig = async function() {
         try {
-            const resp = await fetch('/api/vpn/export');
+            const resp = await fetchWithToken('/api/vpn/export');
             const data = await resp.json();
             const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
             const url = URL.createObjectURL(blob);
@@ -3312,7 +3706,7 @@ document.addEventListener('DOMContentLoaded', () => {
             try {
                 const text = await file.text();
                 const data = JSON.parse(text);
-                const resp = await fetch('/api/vpn/import', {
+                const resp = await fetchWithToken('/api/vpn/import', {
                     method: 'POST', headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify(data)
                 });
@@ -3330,236 +3724,81 @@ document.addEventListener('DOMContentLoaded', () => {
         input.click();
     };
 
-    // ── Free Models master toggle (robust, rollback on error) ──
+    // ── Free Models master toggle ──
     window.toggleFreeModels = async function(enabled) {
-        const toggle = document.getElementById('fm-toggle');
-        const prev = toggle ? !enabled : enabled;
-        try {
-            const resp = await fetch('/api/vpn/toggle', {
-                method: 'POST', headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({enabled})
-            });
-            if (!resp.ok) throw new Error('HTTP ' + resp.status);
-            const data = await resp.json().catch(()=>({}));
-            if (data.error) throw new Error(data.error);
-            refreshVPNStatus();
-        } catch (e) {
-            console.error('toggleFreeModels failed:', e);
-            if (toggle) toggle.checked = prev;
-            const status = document.getElementById('vpn-health-result');
-            if (status) { status.innerHTML = `<span style="color:var(--danger)">✗ ${escHtml(e.message)}</span>`; setTimeout(()=> status.textContent='', 3000); }
-        }
+        await fetchWithToken('/api/vpn/toggle', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({enabled})
+        });
+        refreshVPNStatus();
     };
 
-    // ── Proxy mode switching (robust, rollback) ──
+    // ── Proxy mode switching ──
+    let _geoCache = null;
+    let _geoCacheTs = 0;
+    async function updateGeoWarning(mode) {
+        const el = document.getElementById('fm-geo-warning');
+        if (!el) return;
+        if (mode === 'vpn') { el.style.display = 'none'; return; }
+        try {
+            const now = Date.now();
+            if (!_geoCache || now - _geoCacheTs > 60000) {
+                const r = await fetchWithToken('/api/routes?geo_status=ok&limit=100');
+                const j = await r.json();
+                _geoCache = j.routes || [];
+                _geoCacheTs = now;
+            }
+            const geoRoutes = _geoCache.filter(x => x.geo && (x.geo.require_vpn || x.mode === 'strict'));
+            if (!geoRoutes.length) { el.style.display = 'none'; return; }
+            const isDirect = mode === 'direct';
+            const head = isDirect
+                ? '⚠️ Mode direct : les modèles géo-restreints risquent de ne pas fonctionner (403). Passez en VPN.'
+                : '⚠️ SOCKS5 : vérifiez que vos proxies sont dans les pays autorisés, sinon 403.';
+            const byModel = {};
+            for (const r of geoRoutes) {
+                const m = r.model || r.key;
+                if (!byModel[m]) byModel[m] = { countries: r.effective_allowed || [], matches: [] };
+                for (const mt of (r.match || [])) if (!byModel[m].matches.includes(mt)) byModel[m].matches.push(mt);
+            }
+            const lines = Object.entries(byModel).map(([model, v]) => {
+                const via = v.matches.filter(x => x !== model).join(', ');
+                const c = (v.countries || []).join(', ') || '—';
+                return `<div style="margin-bottom:6px"><strong>${escHtml(model)}</strong>${via ? ' <span style="opacity:.7">(via ' + escHtml(via) + ')</span>' : ''}<br><span style="opacity:.8">Autorisé : ${escHtml(c)} (strict, VPN requis)</span></div>`;
+            }).join('');
+            el.innerHTML = `<div style="display:flex;gap:8px;align-items:flex-start"><span style="flex:1">${head}</span><span class="geo-info" tabindex="0" aria-label="Détails géo" style="cursor:help;flex-shrink:0;width:20px;height:20px;display:inline-flex;align-items:center;justify-content:center;border-radius:50%;background:var(--warning,#e6a000);color:#fff;font-weight:700;font-size:12px">ⓘ<span class="geo-tooltip" role="tooltip" style="display:none;position:absolute;right:0;top:28px;min-width:320px;max-width:420px;padding:12px;background:var(--bg-card,#222);border:1px solid var(--border);border-radius:8px;box-shadow:0 8px 24px rgba(0,0,0,.4);font-size:11px;line-height:1.5;z-index:10">${lines}</span></span></div>`;
+            el.style.display = 'block';
+            const info = el.querySelector('.geo-info');
+            const tip = el.querySelector('.geo-tooltip');
+            if (info && tip) {
+                const show = () => tip.style.display = 'block';
+                const hide = () => tip.style.display = 'none';
+                info.addEventListener('mouseenter', show);
+                info.addEventListener('mouseleave', hide);
+                info.addEventListener('focus', show);
+                info.addEventListener('blur', hide);
+                el.style.position = 'relative';
+            }
+        } catch (e) { el.style.display = 'none'; }
+    }
+
     function setProxyModeUI(mode) {
-        // Update radio buttons
         document.querySelectorAll('.proxy-mode-btn').forEach(btn => btn.classList.remove('active'));
         const activeBtn = document.getElementById('fm-mode-' + mode);
         if (activeBtn) activeBtn.classList.add('active');
-
-        // Show/hide sections
         const vpnSection = document.getElementById('fm-vpn-section');
         const socks5Section = document.getElementById('fm-socks5-section');
         if (vpnSection) vpnSection.style.display = mode === 'vpn' ? 'block' : 'none';
         if (socks5Section) socks5Section.style.display = mode === 'socks5' ? 'block' : 'none';
+        updateGeoWarning(mode);
     }
 
     window.switchProxyMode = async function(mode) {
-        // Capture previous mode for rollback
-        const prevMode = document.querySelector('.proxy-mode-btn.active')?.id?.replace('fm-mode-','') || 'vpn';
         setProxyModeUI(mode);
-        try {
-            const resp = await fetch('/api/vpn/proxy-mode', {
-                method: 'POST', headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({mode})
-            });
-            if (!resp.ok) throw new Error('HTTP ' + resp.status);
-            const data = await resp.json().catch(()=>({}));
-            if (data.error) throw new Error(data.error);
-            refreshVPNStatus();
-        } catch (e) {
-            console.error('switchProxyMode failed:', e);
-            setProxyModeUI(prevMode);
-            const status = document.getElementById('vpn-health-result');
-            if (status) { status.innerHTML = `<span style="color:var(--danger)">✗ ${escHtml(e.message)}</span>`; setTimeout(()=> status.textContent='', 3000); }
-        }
-    };
-
-    // ── Free Model Map (hot-reload) ──
-    let _freeModelMap = {};
-    async function refreshFreeModelMap() {
-        try {
-            const resp = await fetch('/api/config/free-model-map');
-            const data = await resp.json();
-            _freeModelMap = data.free_model_map || {};
-            renderFreeModelMap();
-            // Populate selects for adding
-            const paidSel = document.getElementById('fmm-paid');
-            const freeSel = document.getElementById('fmm-free');
-            const models = data.available_models || availableModels || [];
-            if (paidSel) {
-                const curPaid = paidSel.value;
-                paidSel.innerHTML = '<option value="">— choisir —</option>' + models.map(m=> `<option value="${escHtml(m)}">${escHtml(m)}</option>`).join('');
-                if (curPaid) paidSel.value = curPaid;
-            }
-            if (freeSel) {
-                const curFree = freeSel.value;
-                const freeModels = models.filter(m=> m.endsWith('-free')).concat(models.filter(m=> !models.includes(m+'-free')).map(m=> m+'-free'));
-                // dedup
-                const uniq = [...new Set(freeModels)];
-                freeSel.innerHTML = '<option value="">— choisir —</option>' + uniq.map(m=> `<option value="${escHtml(m)}">${escHtml(m)}</option>`).join('');
-                if (curFree) freeSel.value = curFree;
-            }
-        } catch (e) { console.error('refreshFreeModelMap failed', e); }
-    }
-    function renderFreeModelMap() {
-        const tbody = document.getElementById('free-model-map-tbody');
-        if (!tbody) return;
-        const entries = Object.entries(_freeModelMap);
-        if (!entries.length) {
-            tbody.innerHTML = '<tr><td colspan="3" style="color:var(--text-muted);padding:8px">Aucun mapping (tous les modèles passent en payant)</td></tr>';
-            return;
-        }
-        tbody.innerHTML = entries.map(([paid, free])=> `
-            <tr>
-                <td style="font-family:monospace">${escHtml(paid)}</td>
-                <td style="font-family:monospace">${escHtml(free)}</td>
-                <td><button class="btn btn-sm btn-danger" onclick="removeFreeModelMapEntry('${escHtml(paid)}')" style="font-size:11px;padding:2px 6px">✕</button></td>
-            </tr>
-        `).join('');
-    }
-    window.addFreeModelMap = function() {
-        const paid = document.getElementById('fmm-paid')?.value?.trim();
-        const free = document.getElementById('fmm-free')?.value?.trim();
-        if (!paid || !free) return alert('Choisissez payant et gratuit');
-        _freeModelMap[paid] = free;
-        renderFreeModelMap();
-        document.getElementById('fmm-paid').value = '';
-        document.getElementById('fmm-free').value = '';
-    };
-    window.removeFreeModelMapEntry = function(paid) {
-        if (!confirm('Supprimer ce mapping ?')) return;
-        delete _freeModelMap[paid];
-        renderFreeModelMap();
-    };
-    window.saveFreeModelMap = async function() {
-        const status = document.getElementById('fmm-save-status');
-        if (status) status.textContent = 'Sauvegarde...';
-        try {
-            const resp = await fetch('/api/config/free-model-map', {
-                method: 'POST', headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({free_model_map: _freeModelMap})
-            });
-            const data = await resp.json();
-            if (!resp.ok || data.error) throw new Error(data.error || 'HTTP '+resp.status);
-            _freeModelMap = data.free_model_map || _freeModelMap;
-            renderFreeModelMap();
-            if (status) { status.textContent = '✓ Sauvegardé (hot-reload)'; status.style.color='var(--success)'; setTimeout(()=> status.textContent='',3000); }
-        } catch (e) {
-            console.error('saveFreeModelMap failed', e);
-            if (status) { status.textContent = '✗ ' + e.message; status.style.color='var(--danger)'; }
-        }
-    };
-
-    // ── Rotation Rules (hot-reload) ──
-    let _rotationRules = [];
-    async function refreshRotationRules() {
-        try {
-            const resp = await fetch('/api/vpn/rotation-rules');
-            const data = await resp.json();
-            _rotationRules = data.rules || [];
-            renderRotationRules();
-        } catch(e){ console.error('refreshRotationRules',e); }
-    }
-    function renderRotationRules() {
-        const el = document.getElementById('vpn-rotation-rules-list');
-        if (!el) return;
-        if (!_rotationRules.length) { el.innerHTML = '<div style="color:var(--text-muted);padding:6px">Aucune règle (rotation par défaut)</div>'; return; }
-        el.innerHTML = _rotationRules.map((r,i)=> `
-            <div style="display:flex;justify-content:space-between;align-items:center;padding:6px 8px;background:var(--bg);border-radius:6px;margin-bottom:4px">
-                <span><code>${escHtml(r.model_pattern||r.pattern||'')}</code> → ${escHtml(r.strategy||'round-robin')} ${r.quota? '('+r.quota+')':''} ${r.countries? '['+ (r.countries||[]).join(',')+']':''}</span>
-                <button class="btn btn-sm btn-danger" onclick="removeRotationRule(${i})" style="font-size:11px;padding:2px 6px">✕</button>
-            </div>
-        `).join('');
-    }
-    window.addRotationRule = function() {
-        const pattern = document.getElementById('rr-pattern')?.value?.trim();
-        const strategy = document.getElementById('rr-strategy')?.value || 'round-robin';
-        const quota = parseInt(document.getElementById('rr-quota')?.value) || undefined;
-        if (!pattern) return alert('Pattern requis');
-        const rule = {model_pattern: pattern, strategy};
-        if (quota) rule.quota = quota;
-        _rotationRules.push(rule);
-        renderRotationRules();
-        document.getElementById('rr-pattern').value=''; document.getElementById('rr-quota').value='';
-    };
-    window.removeRotationRule = function(idx) {
-        if (!confirm('Supprimer cette règle ?')) return;
-        _rotationRules.splice(idx,1);
-        renderRotationRules();
-    };
-    window.saveRotationRules = async function() {
-        const status = document.getElementById('rr-save-status');
-        if (status) status.textContent='Sauvegarde...';
-        try {
-            const resp = await fetch('/api/vpn/rotation-rules', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({rules:_rotationRules})});
-            const data = await resp.json();
-            if (!resp.ok || data.error) throw new Error(data.error||'HTTP '+resp.status);
-            _rotationRules = data.rules||_rotationRules;
-            renderRotationRules();
-            if (status){ status.textContent='✓ Sauvegardé (hot-reload)'; status.style.color='var(--success)'; setTimeout(()=> status.textContent='',3000); }
-        } catch(e){ console.error(e); if(status){ status.textContent='✗ '+e.message; status.style.color='var(--danger)'; } }
-    };
-
-    // ── Schedule (hot-reload) ──
-    let _schedule = {enabled:false, rules:[]};
-    async function refreshSchedule() {
-        try {
-            const resp = await fetch('/api/vpn/schedule');
-            const data = await resp.json();
-            _schedule = data && typeof data.enabled !=='undefined' ? data : {enabled:false, rules: data.rules||[]};
-            renderSchedule();
-            const tog = document.getElementById('vpn-schedule-enabled');
-            if (tog) tog.checked = !!_schedule.enabled;
-        } catch(e){ console.error('refreshSchedule',e); }
-    }
-    function renderSchedule() {
-        const el = document.getElementById('vpn-schedule-list');
-        if (!el) return;
-        const rules = _schedule.rules||[];
-        if (!rules.length) { el.innerHTML='<div style="color:var(--text-muted);padding:6px">Aucun planning</div>'; return; }
-        el.innerHTML = rules.map((r,i)=> `
-            <div style="display:flex;justify-content:space-between;align-items:center;padding:6px 8px;background:var(--bg);border-radius:6px;margin-bottom:4px">
-                <span><code>${escHtml(r.cron||'')}</code> → ${escHtml(r.action||'rotate')}</span>
-                <button class="btn btn-sm btn-danger" onclick="removeScheduleRule(${i})" style="font-size:11px;padding:2px 6px">✕</button>
-            </div>
-        `).join('');
-    }
-    window.addScheduleRule = function() {
-        const cron = document.getElementById('sched-cron')?.value?.trim();
-        const action = document.getElementById('sched-action')?.value || 'rotate';
-        if (!cron) return alert('Cron requis (ex: 0 */2 * * *)');
-        const parts = cron.split(/\s+/);
-        if (parts.length!==5) return alert('Cron doit avoir 5 champs');
-        if (!_schedule.rules) _schedule.rules=[];
-        _schedule.rules.push({cron, action});
-        renderSchedule();
-        document.getElementById('sched-cron').value='';
-    };
-    window.removeScheduleRule = function(idx){ if(!confirm('Supprimer ?')) return; _schedule.rules.splice(idx,1); renderSchedule(); };
-    window.toggleSchedule = function(enabled){ _schedule.enabled = !!enabled; };
-    window.saveSchedule = async function(){
-        const status=document.getElementById('sched-save-status');
-        if(status) status.textContent='Sauvegarde...';
-        try{
-            const resp=await fetch('/api/vpn/schedule',{method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(_schedule)});
-            const data=await resp.json();
-            if(!resp.ok||data.error) throw new Error(data.error||'HTTP '+resp.status);
-            _schedule=data.schedule||_schedule;
-            renderSchedule();
-            if(status){ status.textContent='✓ Sauvegardé (hot-reload)'; status.style.color='var(--success)'; setTimeout(()=>status.textContent='',3000); }
-        }catch(e){ console.error(e); if(status){ status.textContent='✗ '+e.message; status.style.color='var(--danger)'; } }
+        await fetchWithToken('/api/vpn/proxy-mode', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({mode})
+        });
+        refreshVPNStatus();
     };
 
     // ── SOCKS5 proxy management ──
@@ -3596,7 +3835,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
         if (!host) return alert('Hôte requis');
 
-        const resp = await fetch('/api/vpn/socks5', {
+        const resp = await fetchWithToken('/api/vpn/socks5', {
             method: 'POST', headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({host, port, username, password})
         });
@@ -3615,7 +3854,7 @@ document.addEventListener('DOMContentLoaded', () => {
     window.removeSocks5Proxy = async function(index) {
         if (!confirm(t('free_models.socks5_remove') || 'Supprimer ce proxy ?')) return;
 
-        const resp = await fetch('/api/vpn/socks5/remove', {
+        const resp = await fetchWithToken('/api/vpn/socks5/remove', {
             method: 'POST', headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({index})
         });
@@ -3624,7 +3863,7 @@ document.addEventListener('DOMContentLoaded', () => {
     };
 
     window.toggleSocks5Proxy = async function(index, enabled) {
-        await fetch('/api/vpn/socks5/toggle', {
+        await fetchWithToken('/api/vpn/socks5/toggle', {
             method: 'POST', headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({index, enabled})
         });
@@ -3637,7 +3876,7 @@ document.addEventListener('DOMContentLoaded', () => {
         btn.disabled = true;
 
         try {
-            const resp = await fetch('/api/vpn/socks5/test', {
+            const resp = await fetchWithToken('/api/vpn/socks5/test', {
                 method: 'POST', headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({host, port})
             });
@@ -3669,10 +3908,27 @@ document.addEventListener('DOMContentLoaded', () => {
     };
 
     window.toggleSocks5Rotation = async function(enabled) {
-        await fetch('/api/vpn/socks5/rotate', {
+        await fetchWithToken('/api/vpn/socks5/rotate', {
             method: 'POST', headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({rotate: enabled})
         });
+    };
+
+    window.toggleGeo = async function() {
+        const cur = await fetchWithToken('/api/geo-policies').then(r => r.json());
+        const enabled = !cur.enabled;
+        await fetchWithToken('/api/geo-policies', { method: 'PUT', headers: {'Content-Type': 'application/json', 'If-Match': String(Date.now())}, body: JSON.stringify({enabled, version: cur.version}) });
+        refreshVPNStatus();
+    };
+    window.toggleGeoDirect = async function() {
+        const cur = await fetchWithToken('/api/geo-policies').then(r => r.json());
+        const allow_direct_when_compatible = !cur.allow_direct_when_compatible;
+        await fetchWithToken('/api/geo-policies', { method: 'PUT', headers: {'Content-Type': 'application/json', 'If-Match': String(Date.now())}, body: JSON.stringify({allow_direct_when_compatible, version: cur.version, enabled: cur.enabled}) });
+        refreshVPNStatus();
+    };
+    window.rollbackGeo = async function() {
+        await fetchWithToken('/api/geo-policies/rollback', { method: 'POST' });
+        refreshVPNStatus();
     };
 
     // Refresh VPN status every 10 seconds when VPN tab is active

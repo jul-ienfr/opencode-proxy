@@ -111,7 +111,32 @@ API_BASE_ANTHROPIC = "https://opencode.ai/zen/go/v1/messages"
 
 
 async def fetch_available_models() -> list[str]:
-    """Fetch model IDs from the upstream OpenCode /v1/models endpoint."""
+    """Fetch model IDs from the upstream OpenCode /v1/models endpoint.
+
+    Dédup free-discovery (plan §D) : si config.settings.FREE_MODELS est frais
+    (< FREE_DISCOVERY_INTERVAL), on réutilise le cache local au lieu de
+    refetcher zen/go/v1/models — évite le double httpx par cycle 300s.
+    """
+    # Dédup: reuse fresh free-discovery cache if available
+    try:
+        import config.settings as _cs
+        lr = _cs._FREE_DISCOVERY_STATE.get("last_refresh") if hasattr(_cs, "_FREE_DISCOVERY_STATE") else None
+        if lr and getattr(_cs, "FREE_MODELS", None):
+            try:
+                import datetime as _dt2
+                last = _dt2.datetime.fromisoformat(str(lr))
+                if last.tzinfo is None:
+                    last = last.replace(tzinfo=_dt2.timezone.utc)
+                age = (_dt2.datetime.now(_dt2.timezone.utc) - last).total_seconds()
+                interval = int(getattr(_cs, "FREE_DISCOVERY_INTERVAL", 3600) or 3600)
+                if 0 <= age < interval:
+                    logger.debug("[quota] reusing fresh FREE_MODELS (age %.0fs < %ds) — skip upstream fetch", age, interval)
+                    # Return union of local MODELS + known free ids (source de vérité)
+                    return sorted(set(_cs.MODELS.keys()) | set(_cs.FREE_MODELS))
+            except Exception:
+                pass
+    except Exception:
+        pass
     try:
         client = await _get_http_client()
         resp = await client.get(MODELS_URL)
@@ -362,12 +387,47 @@ def _read_object_literal(text: str, start_pos: int) -> str:
     raise ValueError("Unbalanced object literal (no closing '}' found)")
 
 
+def _js_string_to_json(m) -> str:
+    """Convert a single-quoted JS string match into a valid JSON string.
+
+    ([27]) The old regex copied escape sequences verbatim, which broke on
+    ``\\'`` (invalid JSON escape) and raw backslashes (``'C:\\Users'`` →
+    ``"C:\\Users"`` is invalid JSON) — the whole quota object then failed
+    to parse and the UI showed a green 0 %.
+    """
+    content = m.group(1)
+    out = []
+    i = 0
+    while i < len(content):
+        ch = content[i]
+        if ch == "\\" and i + 1 < len(content):
+            nxt = content[i + 1]
+            if nxt == "'":
+                out.append("'")  # \' → ' — the only escape invalid in JSON
+                i += 2
+                continue
+            if nxt in '"\\/bfnrtu':
+                out.append(ch)  # valid JSON escape with identical meaning
+                out.append(nxt)  # (\\ \" \/ \b \f \n \r \t \uXXXX) — copy verbatim
+                i += 2
+                continue
+            out.append("\\\\")  # literal backslash → must be doubled
+            i += 1
+            continue
+        if ch == '"':
+            out.append('\\"')  # literal double quote → escape
+        else:
+            out.append(ch)
+        i += 1
+    return '"' + "".join(out) + '"'
+
+
 def _normalize_js_object(raw: str) -> str:
     """Normalize a loose JS object literal into valid JSON."""
     # Quote unquoted keys: `{foo:` or `,foo:` → `{"foo":`
     s = re.sub(r'([{,]\s*)([A-Za-z_$][A-Za-z0-9_$]*)(\s*:)', r'\1"\2"\3', raw)
-    # Single-quoted strings → double-quoted
-    s = re.sub(r"'((?:\\.|[^'\\])*)'", lambda m: '"' + m.group(1).replace('"', '\\"') + '"', s)
+    # Single-quoted strings → double-quoted ([27] backslash-safe)
+    s = re.sub(r"'((?:\\.|[^'\\])*)'", _js_string_to_json, s)
     # Bare undefined → null (but not inside strings)
     s = re.sub(r'(?:"(?:[^"\\]|\\.)*")|\bundefined\b', lambda m: m.group(0) if m.group(0).startswith('"') else "null", s)
     # Trailing commas before } or ]
@@ -483,9 +543,19 @@ async def toggle_use_balance(workspace_id: str, auth_cookie: str, enabled: bool 
         try:
             resp = await client.post(url, data=form_data, headers=headers)
             if resp.status_code == 200:
-                logger.info("[balance] toggle useBalance=%s for workspace %s (action %s)",
-                            enabled, workspace_id[:12], action_hash[:12])
-                return True
+                # [33] A 200 alone is not proof of success: SolidJS server
+                # actions return {"error": ...} on failure. Verify the body.
+                try:
+                    body = resp.json()
+                except ValueError:
+                    body = None  # non-JSON body (redirect page) — treat as success
+                if body and body.get("error"):
+                    logger.debug("[balance] action %s returned error for workspace %s: %s",
+                                 action_hash[:12], workspace_id[:12], str(body.get("error"))[:200])
+                else:
+                    logger.info("[balance] toggle useBalance=%s for workspace %s (action %s)",
+                                enabled, workspace_id[:12], action_hash[:12])
+                    return True
             else:
                 logger.debug("[balance] action %s returned HTTP %d for workspace %s",
                              action_hash[:12], resp.status_code, workspace_id[:12])
@@ -518,7 +588,11 @@ async def toggle_use_balance_all(enabled: bool = True) -> dict[str, bool]:
 
 
 async def fetch_quotas(workspace_id: str, auth_cookie: str) -> dict:
-    """Fetch and parse quota data from opencode.ai for a given workspace."""
+    """Fetch and parse quota data from opencode.ai for a given workspace.
+
+    Retries transient failures (network errors, 5xx) up to 2 times with
+    backoff ([28]) — auth failures (401/403) and parse errors never retry.
+    """
     from urllib.parse import quote
     url = f"https://opencode.ai/workspace/{quote(workspace_id, safe='')}/go"
 
@@ -529,22 +603,49 @@ async def fetch_quotas(workspace_id: str, auth_cookie: str) -> dict:
     }
 
     client = await _get_http_client()
-    resp = await client.get(url, headers=headers)
+    last_err: Exception | None = None
+    for attempt in range(3):
+        try:
+            resp = await client.get(url, headers=headers)
+        except Exception as e:
+            last_err = e
+            if attempt < 2:
+                await asyncio.sleep(1.5 * (2 ** attempt))  # 1.5s, 3s
+                continue
+            raise
 
-    if resp.status_code in (401, 403):
-        logger.debug("[quota] auth failed for workspace %s (HTTP %d)", workspace_id[:8], resp.status_code)
-        raise RuntimeError("OpenCode Go authentication failed. Refresh your auth cookie.")
-    if resp.status_code != 200:
-        raise RuntimeError(f"OpenCode Go request failed with HTTP {resp.status_code}.")
+        if resp.status_code in (401, 403):
+            logger.debug("[quota] auth failed for workspace %s (HTTP %d)", workspace_id[:8], resp.status_code)
+            raise RuntimeError("OpenCode Go authentication failed. Refresh your auth cookie.")
+        if resp.status_code >= 500 and attempt < 2:
+            last_err = RuntimeError(f"OpenCode Go request failed with HTTP {resp.status_code}.")
+            await asyncio.sleep(1.5 * (2 ** attempt))
+            continue
+        if resp.status_code != 200:
+            raise RuntimeError(f"OpenCode Go request failed with HTTP {resp.status_code}.")
 
-    return parse_quota_html(resp.text)
+        try:
+            return parse_quota_html(resp.text)
+        except Exception as e:
+            last_err = e
+            if attempt < 2:
+                await asyncio.sleep(1.5 * (2 ** attempt))
+                continue
+            raise
+    raise last_err  # pragma: no cover — loop always returns or raises above
 
 
 # ── API accessor ──
 
-def get_quota_snapshot() -> dict:
-    """Return a JSON-serializable snapshot for the API endpoint."""
-    return dict(_caches)
+async def get_quota_snapshot() -> dict:
+    """Return a JSON-serializable snapshot for the API endpoint.
+
+    [34] Copied under _cache_lock (the poller mutates _caches concurrently),
+    one level deep so the in-place status updates can't race the JSON
+    serialization of a returned snapshot.
+    """
+    async with _cache_lock:
+        return {wid: dict(cache) for wid, cache in _caches.items()}
 
 
 # ── Background poller ──
@@ -553,8 +654,8 @@ async def start_quota_fetcher(app):
     """Start a background task that polls OpenCode Go quotas every 5 minutes
     and fetches model limits from docs at startup.
 
-    Startup fetch est parallélisé + timeout 4s pour ne pas bloquer le 1er
-    affichage de Modèles Gratuits (avant: 30s+30s séquentiel).
+    The poller always runs and checks env vars dynamically at each cycle,
+    so config changes (workspace ID, auth cookie) take effect without restart.
     """
     logger.debug("[quota] start_quota_fetcher called")
 
@@ -564,7 +665,6 @@ async def start_quota_fetcher(app):
 
         async def _fetch_limits_safe():
             try:
-                # Timeout court pour le 1er affichage
                 return await asyncio.wait_for(fetch_model_limits(), timeout=4.0)
             except asyncio.TimeoutError:
                 logger.debug("[quota] docs fetch timeout (4s) — fallback")
@@ -583,7 +683,6 @@ async def start_quota_fetcher(app):
                 logger.debug("[quota] models fetch failed: %s", e)
                 return None
 
-        # Parallélise les 2 fetches
         limits, models = await asyncio.gather(_fetch_limits_safe(), _fetch_models_safe())
 
         if limits is not None:
@@ -609,7 +708,6 @@ async def start_quota_fetcher(app):
         logger.debug("[quota] startup fetch lancé en arrière-plan (parallèle 4s)")
     except Exception as e:
         logger.debug("[quota] impossible de lancer startup fetch: %s", e)
-        # Fallback synchrone rapide
         try:
             await asyncio.wait_for(_startup_fetch(), timeout=4.5)
         except Exception:
@@ -654,7 +752,7 @@ async def start_quota_fetcher(app):
                         _caches[wid] = {
                             "status": "ok",
                             "error": None,
-                            "fetched_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                            "fetched_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                             "quotas": quotas,
                         }
                     get_event_manager().publish("quotas_updated", {"workspace_id": wid, "status": "ok"})

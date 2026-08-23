@@ -16,3 +16,9 @@ debug_dash.py
 proxy_debug.log
 CLAUDE.md
 .claude/
+config.yaml
+vpn/
+vpn_configs/
+credentials.env
+*.ovpn
+*.db

@@ -24,26 +24,15 @@ from opencode import (
     openai_chat_to_responses,
     openai_responses_to_anthropic,
     anthropic_to_openai_responses,
+    _chat_to_responses_request,
     _estimate_tokens,
     _route_for,
-    _tool_name,
-    _inject_system_hint,
-    _filter_tools_for_model,
     _CircuitBreaker,
     _CB_FAILURE_THRESHOLD,
     _CB_RECOVERY_TIMEOUT,
     _Bucket,
     RATE_LIMIT_RPS,
     RATE_LIMIT_BURST,
-    _normalize_stream_flag,
-    _is_stream_requested,
-    _map_reasoning,
-    _map_reasoning_responses,
-    _should_try_free,
-    anthropic_to_responses_request,
-    openai_chat_to_responses_request,
-    responses_to_anthropic,
-    _is_muse_spark,
 )
 from config.settings import _resolve_protocol, KNOWN_PROTOCOLS
 
@@ -435,22 +424,27 @@ class TestBucket:
 
 @pytest.fixture(autouse=True)
 def _disable_mapping_off(monkeypatch):
-    """Force DISABLE_MAPPING=False and clear custom routes for route tests.
-
-    Must also rebuild SORTED_* lists — _route_for() iterates over
-    config.settings.SORTED_CUSTOM_ROUTES / SORTED_ROUTES, not the dicts
-    directly, so patching only the dicts leaves stale shadowing entries.
-    """
+    """Force DISABLE_MAPPING=False and clear custom routes for route tests."""
     monkeypatch.setattr(_opencode_mod, "DISABLE_MAPPING", False)
+    # Rebuild ROUTES without custom route overrides (use config.load_routes with empty custom)
     from config import settings as _cfg_settings
     monkeypatch.setattr(_cfg_settings, "CUSTOM_ROUTES", {})
-    monkeypatch.setattr(_cfg_settings, "DISABLE_MAPPING", False)
     _clean_routes = _cfg_settings.load_routes()
-    monkeypatch.setattr(_cfg_settings, "ROUTES", _clean_routes)
-    monkeypatch.setattr(_cfg_settings, "SORTED_ROUTES", _cfg_settings._sort_routes_by_match(_clean_routes))
-    monkeypatch.setattr(_cfg_settings, "SORTED_CUSTOM_ROUTES", [])
     monkeypatch.setattr(_opencode_mod, "ROUTES", _clean_routes)
     monkeypatch.setattr(_opencode_mod, "CUSTOM_ROUTES", {})
+    # SORTED_* are computed at import from the real custom_routes.json —
+    # rebuild after replacing the dicts, or _route_for matches the stale
+    # production overrides ([43]).
+    monkeypatch.setattr(_cfg_settings, "SORTED_ROUTES",
+                        _cfg_settings._sort_routes_by_match(_clean_routes))
+    monkeypatch.setattr(_cfg_settings, "SORTED_CUSTOM_ROUTES", [])
+    # Prevent maybe_reload_custom_routes (called at top of _route_for) from
+    # re-reading config.yaml/custom_routes.json on disk and re-introducing
+    # the production custom_routes (e.g. kimik26: kimi-k2.6 → muse-spark)
+    # between tests — especially when the suite runs with other modules that
+    # may have touched the file mtime. Both references are patched.
+    monkeypatch.setattr(_cfg_settings, "maybe_reload_custom_routes", lambda: None)
+    monkeypatch.setattr(_opencode_mod, "maybe_reload_custom_routes", lambda: None)
 
 
 class TestRouteFor:
@@ -459,10 +453,7 @@ class TestRouteFor:
     def test_direct_model_match(self):
         route = _route_for("kimi-k2.6")
         assert route is not None
-        # Allow either direct or custom-mapped (custom_routes.json may remap kimi-k2.6 → muse-spark)
-        assert route["model"] in ("kimi-k2.6", "muse-spark-1.2-contributor", "muse-spark-1.2-contributor-free")
-        # Ensure the route contains the requested pattern in its match list or is a custom alias
-        assert "kimi-k2.6" in str(route.get("match", [])).lower() or route["model"]
+        assert route["model"] == "kimi-k2.6"
 
     def test_alias_match_opus(self):
         route = _route_for("claude-opus-4-20250514")
@@ -696,174 +687,6 @@ class TestAnthropicToOpenAIResponses:
         assert usage["output_tokens_details"]["cached_tokens"] == 5
 
 
-# ── Tool Name Extraction ────────────────────────────────────────
-
-class TestToolName:
-    """Test _tool_name() with both Anthropic and OpenAI formats."""
-
-    def test_anthropic_format(self):
-        tool = {"name": "Bash", "description": "Run bash", "input_schema": {}}
-        assert _tool_name(tool) == "Bash"
-
-    def test_openai_format(self):
-        tool = {"type": "function", "function": {"name": "Read", "parameters": {}}}
-        assert _tool_name(tool) == "Read"
-
-    def test_non_dict_returns_empty(self):
-        assert _tool_name("not a dict") == ""
-        assert _tool_name(None) == ""
-        assert _tool_name(42) == ""
-
-    def test_missing_name_returns_empty(self):
-        assert _tool_name({"description": "no name"}) == ""
-        assert _tool_name({"type": "function", "function": {}}) == ""
-
-
-# ── System Hint Injection ───────────────────────────────────────
-
-class TestInjectSystemHint:
-    """Test _inject_system_hint() for Anthropic and OpenAI formats."""
-
-    def test_anthropic_string_system(self):
-        body = {"system": "You are helpful.", "messages": []}
-        _inject_system_hint(body, "HINT: use tools")
-        assert body["system"] == "HINT: use tools\n\nYou are helpful."
-
-    def test_anthropic_empty_system(self):
-        body = {"system": "", "messages": []}
-        _inject_system_hint(body, "HINT: use tools")
-        assert body["system"] == "HINT: use tools"
-
-    def test_anthropic_list_system(self):
-        body = {"system": [{"type": "text", "text": "Existing"}], "messages": []}
-        _inject_system_hint(body, "HINT")
-        assert body["system"][0]["text"] == "HINT"
-        assert body["system"][1]["text"] == "Existing"
-
-    def test_openai_system_role(self):
-        body = {"messages": [{"role": "system", "content": "Existing"}]}
-        _inject_system_hint(body, "HINT")
-        assert body["messages"][0]["content"] == "HINT\n\nExisting"
-
-    def test_openai_developer_role(self):
-        body = {"messages": [{"role": "developer", "content": "Devs"}]}
-        _inject_system_hint(body, "HINT")
-        assert body["messages"][0]["content"] == "HINT\n\nDevs"
-
-    def test_openai_no_system_inserts(self):
-        body = {"messages": [{"role": "user", "content": "Hi"}]}
-        _inject_system_hint(body, "HINT")
-        assert body["messages"][0]["role"] == "system"
-        assert body["messages"][0]["content"] == "HINT"
-
-    def test_empty_hint_noop(self):
-        body = {"system": "Existing"}
-        _inject_system_hint(body, "")
-        assert body["system"] == "Existing"
-        _inject_system_hint(body, None)
-        assert body["system"] == "Existing"
-
-
-# ── Tool Filtering ──────────────────────────────────────────────
-
-class TestFilterToolsForModel:
-    """Test _filter_tools_for_model() with config-driven filtering."""
-
-    ANTHROPIC_TOOLS = [
-        {"name": "Read", "description": "Read", "input_schema": {}},
-        {"name": "Write", "description": "Write", "input_schema": {}},
-        {"name": "Bash", "description": "Bash", "input_schema": {}},
-        {"name": "WebSearch", "description": "Search", "input_schema": {}},
-    ]
-
-    OPENAI_TOOLS = [
-        {"type": "function", "function": {"name": "Read", "parameters": {}}},
-        {"type": "function", "function": {"name": "Write", "parameters": {}}},
-        {"type": "function", "function": {"name": "Bash", "parameters": {}}},
-        {"type": "function", "function": {"name": "WebSearch", "parameters": {}}},
-    ]
-
-    def _patch_config(self, monkeypatch, config):
-        """Helper to patch TOOL_CAPABILITIES for tests.
-
-        Patches both config.TOOL_CAPABILITIES and config.get_tool_config
-        so the filtering function sees our test config.
-        """
-        import config as cfg
-        monkeypatch.setattr(cfg, "TOOL_CAPABILITIES", config)
-
-        # Also patch get_tool_config to use our config
-        def _mock_get_tool_config(model_id):
-            defaults = {"supported_tools": None, "unsupported_tools": [], "system_hint": None, "fallback_model": None}
-            model_cfg = config.get(model_id, {})
-            default_cfg = config.get("_default", {})
-            return {**defaults, **default_cfg, **model_cfg}
-
-        monkeypatch.setattr(cfg, "get_tool_config", _mock_get_tool_config)
-
-    def test_whitelist_filters_anthropic(self, monkeypatch):
-        config = {"test-model": {"supported_tools": ["Read", "Write"]}}
-        self._patch_config(monkeypatch, config)
-        body = {"tools": list(self.ANTHROPIC_TOOLS)}
-        result = _filter_tools_for_model(body, "test-model")
-        assert result == ["Read", "Write"]
-        assert len(body["tools"]) == 2
-
-    def test_whitelist_filters_openai(self, monkeypatch):
-        config = {"test-model": {"supported_tools": ["Read"]}}
-        self._patch_config(monkeypatch, config)
-        body = {"tools": list(self.OPENAI_TOOLS)}
-        result = _filter_tools_for_model(body, "test-model")
-        assert result == ["Read"]
-        assert len(body["tools"]) == 1
-
-    def test_blacklist_removes_tools(self, monkeypatch):
-        config = {"test-model": {"unsupported_tools": ["WebSearch", "Bash"]}}
-        self._patch_config(monkeypatch, config)
-        body = {"tools": list(self.ANTHROPIC_TOOLS)}
-        result = _filter_tools_for_model(body, "test-model")
-        assert "WebSearch" not in result
-        assert "Bash" not in result
-        assert "Read" in result
-        assert "Write" in result
-
-    def test_no_config_passthrough(self, monkeypatch):
-        self._patch_config(monkeypatch, {})
-        body = {"tools": list(self.ANTHROPIC_TOOLS)}
-        result = _filter_tools_for_model(body, "unknown-model")
-        assert result == ["Read", "Write", "Bash", "WebSearch"]
-
-    def test_default_fallback(self, monkeypatch):
-        config = {"_default": {"unsupported_tools": ["WebSearch"]}}
-        self._patch_config(monkeypatch, config)
-        body = {"tools": list(self.ANTHROPIC_TOOLS)}
-        result = _filter_tools_for_model(body, "unknown-model")
-        assert "WebSearch" not in result
-        assert "Read" in result
-
-    def test_system_hint_injected(self, monkeypatch):
-        config = {"test-model": {"system_hint": "Use tools!", "unsupported_tools": []}}
-        self._patch_config(monkeypatch, config)
-        body = {"system": "Original", "tools": list(self.ANTHROPIC_TOOLS)}
-        _filter_tools_for_model(body, "test-model")
-        assert "Use tools!" in body["system"]
-
-    def test_no_tools_no_filtering(self, monkeypatch):
-        config = {"test-model": {"supported_tools": ["Read"]}}
-        self._patch_config(monkeypatch, config)
-        body = {"messages": [{"role": "user", "content": "Hi"}]}
-        result = _filter_tools_for_model(body, "test-model")
-        assert result == []
-
-    def test_whitelist_precedence_over_blacklist(self, monkeypatch):
-        config = {"test-model": {"supported_tools": ["Read"], "unsupported_tools": ["Write"]}}
-        self._patch_config(monkeypatch, config)
-        body = {"tools": list(self.ANTHROPIC_TOOLS)}
-        result = _filter_tools_for_model(body, "test-model")
-        # Whitelist wins: only Read kept
-        assert result == ["Read"]
-
-
 # ── Protocol Resolution ──────────────────────────────────────────
 
 class TestResolveProtocol:
@@ -924,263 +747,81 @@ class TestResolveProtocol:
         ))
 
 
-# ── Stream Flag Normalization ──────────────────────────────────
+# ── Chat-to-Responses reasoning forwarding ──────────────────────
 
-class TestNormalizeStreamFlag:
-    """Test _normalize_stream_flag handles bool / string / int variants."""
+class TestChatToResponsesRequest:
+    """Test _chat_to_responses_request() forwards reasoning parameters."""
 
-    def test_true_bool(self):
-        assert _normalize_stream_flag(True) is True
-
-    def test_false_bool(self):
-        assert _normalize_stream_flag(False) is False
-
-    def test_none_is_false(self):
-        assert _normalize_stream_flag(None) is False
-
-    def test_string_true_variants(self):
-        for v in ("true", "True", "TRUE", "  true  ", "1", "yes", "YES"):
-            assert _normalize_stream_flag(v) is True, f"expected True for {v!r}"
-
-    def test_string_false_variants(self):
-        for v in ("false", "False", "0", "no", "", "  ", "maybe"):
-            assert _normalize_stream_flag(v) is False, f"expected False for {v!r}"
-
-    def test_int_nonzero_true(self):
-        assert _normalize_stream_flag(1) is True
-        assert _normalize_stream_flag(2) is True
-
-    def test_int_zero_false(self):
-        assert _normalize_stream_flag(0) is False
-
-    def test_other_truthy_is_true(self):
-        assert _normalize_stream_flag([1]) is True
-        assert _normalize_stream_flag({"a": 1}) is True
-
-
-class TestIsStreamRequested:
-    """Test _is_stream_requested reads body[stream] via normalization."""
-
-    def test_missing_key_is_false(self):
-        assert _is_stream_requested({}) is False
-        assert _is_stream_requested({"model": "glm-5.1"}) is False
-
-    def test_false_and_none(self):
-        assert _is_stream_requested({"stream": False}) is False
-        assert _is_stream_requested({"stream": None}) is False
-
-    def test_true_bool(self):
-        assert _is_stream_requested({"stream": True}) is True
-
-    def test_string_variants(self):
-        assert _is_stream_requested({"stream": "true"}) is True
-        assert _is_stream_requested({"stream": "1"}) is True
-        assert _is_stream_requested({"stream": "yes"}) is True
-        assert _is_stream_requested({"stream": "false"}) is False
-        assert _is_stream_requested({"stream": "0"}) is False
-
-    def test_int_variants(self):
-        assert _is_stream_requested({"stream": 1}) is True
-        assert _is_stream_requested({"stream": 0}) is False
-
-    def test_non_dict_is_false(self):
-        assert _is_stream_requested(None) is False
-        assert _is_stream_requested("true") is False
-        assert _is_stream_requested([]) is False
-
-
-class TestStreamPropagation:
-    """Test anthropic_to_openai propagates stream flag and normalization is decoupled."""
-
-    def _base_body(self, stream_val=None):
-        body = {
-            "model": "claude-3-opus",
-            "messages": [{"role": "user", "content": "Hi"}],
-        }
-        if stream_val is not None or stream_val == False:  # allow explicit False
-            body["stream"] = stream_val
-        return body
-
-    def test_propagates_true(self):
-        body = {"model": "claude-3-opus", "messages": [{"role": "user", "content": "Hi"}], "stream": True}
-        result = anthropic_to_openai(body, "claude-3-opus")
-        assert result["stream"] is True
-        assert _is_stream_requested(body) is True
-
-    def test_propagates_false(self):
-        body = {"model": "claude-3-opus", "messages": [{"role": "user", "content": "Hi"}], "stream": False}
-        result = anthropic_to_openai(body, "claude-3-opus")
-        assert result["stream"] is False
-        assert _is_stream_requested(body) is False
-
-    def test_missing_stream_defaults_false(self):
-        body = {"model": "claude-3-opus", "messages": [{"role": "user", "content": "Hi"}]}
-        result = anthropic_to_openai(body, "claude-3-opus")
-        assert result["stream"] is False
-        assert _is_stream_requested(body) is False
-
-    def test_string_true_normalizes_but_oai_keeps_raw(self):
-        body = {"model": "claude-3-opus", "messages": [{"role": "user", "content": "Hi"}], "stream": "true"}
-        # Proxy branching must treat it as streaming
-        assert _is_stream_requested(body) is True
-        # anthropic_to_openai currently keeps raw value (string) — branching uses normalized flag, not raw
-        result = anthropic_to_openai(body, "claude-3-opus")
-        assert result["stream"] == "true"
-
-    def test_int_stream_variants(self):
-        assert _is_stream_requested({"stream": 1}) is True
-        assert _is_stream_requested({"stream": 0}) is False
-
-
-# ── Muse-Spark Reasoning (Étape 2) ─────────────────────────────
-
-class TestMuseSparkReasoning:
-    """Vérifie le mapping reasoning dédié muse-spark (xhigh distinct)."""
-
-    def test_anthropic_to_openai_muse_spark_xhigh(self):
-        # thinking adaptive + effort xhigh -> reasoning_effort xhigh (pas high)
-        body = {
+    def test_reasoning_effort_forwarded(self):
+        """reasoning_effort must become reasoning: {summary: auto, effort: ...} in Responses API format."""
+        chat = {
             "model": "muse-spark-1.2-contributor",
-            "messages": [{"role": "user", "content": "hi"}],
-            "thinking": {"type": "adaptive"},
-            "effort": "xhigh",
-            "max_tokens": 256,
+            "messages": [{"role": "user", "content": "Think about 2+2"}],
+            "reasoning_effort": "high",
         }
-        result = anthropic_to_openai(body, "muse-spark-1.2-contributor")
-        assert result.get("reasoning_effort") == "xhigh"
-        # max reste distinct aussi
-        body_max = dict(body)
-        body_max["effort"] = "max"
-        result_max = anthropic_to_openai(body_max, "muse-spark-1.2-contributor")
-        assert result_max.get("reasoning_effort") == "max"
+        result = _chat_to_responses_request(chat)
+        assert "reasoning" in result
+        assert result["reasoning"] == {"summary": "auto", "effort": "high"}
 
-    def test_anthropic_to_openai_kimi_still_reasoning_true(self):
-        # Non-régression: kimi-k2.6 -> reasoning:true
-        body = {
-            "model": "kimi-k2.6",
-            "messages": [{"role": "user", "content": "hi"}],
-            "thinking": {"type": "adaptive"},
-            "effort": "xhigh",
-            "max_tokens": 256,
-        }
-        result = anthropic_to_openai(body, "kimi-k2.6")
-        assert result.get("reasoning") is True
-        assert "reasoning_effort" not in result
-
-    def test_no_reasoning_without_thinking(self):
-        # Sans thinking/effort -> ni reasoning ni reasoning_effort
-        body = {
+    def test_reasoning_effort_medium(self):
+        chat = {
             "model": "muse-spark-1.2-contributor",
-            "messages": [{"role": "user", "content": "hi"}],
-            "max_tokens": 256,
+            "messages": [{"role": "user", "content": "test"}],
+            "reasoning_effort": "medium",
         }
-        result = anthropic_to_openai(body, "muse-spark-1.2-contributor")
+        result = _chat_to_responses_request(chat)
+        assert result["reasoning"] == {"summary": "auto", "effort": "medium"}
+
+    def test_reasoning_effort_low(self):
+        chat = {
+            "model": "muse-spark-1.2-contributor",
+            "messages": [{"role": "user", "content": "test"}],
+            "reasoning_effort": "low",
+        }
+        result = _chat_to_responses_request(chat)
+        assert result["reasoning"] == {"summary": "auto", "effort": "low"}
+
+    def test_reasoning_object_forwarded(self):
+        """If reasoning is already a dict (Responses API format), pass it through."""
+        reasoning = {"summary": "auto", "effort": "high"}
+        chat = {
+            "model": "muse-spark-1.2-contributor",
+            "messages": [{"role": "user", "content": "test"}],
+            "reasoning": reasoning,
+        }
+        result = _chat_to_responses_request(chat)
+        assert result["reasoning"] == reasoning
+
+    def test_no_reasoning_when_absent(self):
+        """No reasoning param → no reasoning in output."""
+        chat = {
+            "model": "muse-spark-1.2-contributor",
+            "messages": [{"role": "user", "content": "test"}],
+        }
+        result = _chat_to_responses_request(chat)
         assert "reasoning" not in result
-        assert "reasoning_effort" not in result
-        # aussi pour kimi sans thinking
-        result_kimi = anthropic_to_openai(body, "kimi-k2.6")
-        assert "reasoning" not in result_kimi
 
-    def test_map_reasoning_muse_spark_levels(self):
-        # _map_reasoning direct
-        assert _map_reasoning("muse-spark-1.2-contributor", "xhigh") == {"reasoning_effort": "xhigh"}
-        assert _map_reasoning("muse-spark-1.2-contributor", "max") == {"reasoning_effort": "max"}
-        assert _map_reasoning("muse-spark-1.2-contributor", "high") == {"reasoning_effort": "high"}
-        assert _map_reasoning("muse-spark-1.2-contributor", "medium") == {"reasoning_effort": "medium"}
-        assert _map_reasoning("muse-spark-1.2-contributor", "low") == {"reasoning_effort": "low"}
-        # deepseek garde mapping distinct max
-        assert _map_reasoning("deepseek-v4-flash", "xhigh") == {"reasoning_effort": "max"}
-        assert _map_reasoning("deepseek-v4-flash", "max") == {"reasoning_effort": "max"}
-
-    def test_responses_mapping_muse_spark(self):
-        # anthropic_to_responses_request avec muse-spark -> reasoning.effort xhigh
-        body = {
+    def test_reasoning_effort_takes_precedence(self):
+        """If both reasoning_effort and reasoning are present, reasoning_effort wins."""
+        chat = {
             "model": "muse-spark-1.2-contributor",
-            "messages": [{"role": "user", "content": "hi"}],
-            "thinking": {"type": "adaptive"},
-            "effort": "xhigh",
-            "max_tokens": 256,
+            "messages": [{"role": "user", "content": "test"}],
+            "reasoning_effort": "low",
+            "reasoning": {"summary": "auto", "effort": "high"},
         }
-        req = anthropic_to_responses_request(body, "muse-spark-1.2-contributor")
-        assert req.get("reasoning") == {"effort": "xhigh"}
-        # via _map_reasoning_responses direct
-        assert _map_reasoning_responses("muse-spark-1.2-contributor", "xhigh") == {"reasoning": {"effort": "xhigh"}}
-        assert _map_reasoning_responses("muse-spark-1.2-contributor", "max") == {"reasoning": {"effort": "max"}}
-        # chat -> responses aussi
-        chat_body = {
+        result = _chat_to_responses_request(chat)
+        assert result["reasoning"] == {"summary": "auto", "effort": "low"}
+
+    def test_temperature_and_top_p_preserved(self):
+        """temperature and top_p must still be forwarded."""
+        chat = {
             "model": "muse-spark-1.2-contributor",
-            "messages": [{"role": "user", "content": "hi"}],
-            "reasoning_effort": "xhigh",
-            "max_tokens": 256,
+            "messages": [{"role": "user", "content": "test"}],
+            "temperature": 0.7,
+            "top_p": 0.9,
+            "reasoning_effort": "high",
         }
-        req2 = openai_chat_to_responses_request(chat_body, "muse-spark-1.2-contributor")
-        assert req2.get("reasoning") == {"effort": "xhigh"}
-
-    def test_is_muse_spark(self):
-        assert _is_muse_spark("muse-spark-1.2-contributor") is True
-        assert _is_muse_spark("muse-spark-1.2-contributor-free") is True
-        assert _is_muse_spark("kimi-k2.6") is False
-
-
-class TestShouldTryFree:
-    """Gratuit-first inconditionnel (Étape 1)."""
-
-    def test_should_try_free_even_when_thinking(self):
-        # Avec thinking adaptive, gratuit doit être tenté si mapping existe
-        assert _should_try_free("muse-spark-1.2-contributor", "adaptive", "xhigh") is True
-        assert _should_try_free("muse-spark-1.2-contributor", "none", "none") is True
-        assert _should_try_free("mimo-v2.5", "adaptive", "xhigh") is True
-        assert _should_try_free("deepseek-v4-flash", "adaptive", "high") is True
-
-    def test_should_not_try_free_without_mapping(self):
-        assert _should_try_free("glm-5.1", "adaptive", "xhigh") is False
-        assert _should_try_free("unknown-model", "none", "none") is False
-
-    def test_no_free_200_retry(self):
-        # Le repli 200 vide -> retry paid est supprimé (Étape 1bis)
-        # _should_try_free ne doit pas dépendre du contenu de la réponse, seulement du mapping
-        # Ici on vérifie qu'il n'y a pas de helper _free_response_has_reasoning qui impliquerait un retry
-        import opencode as m
-
-        assert not hasattr(m, "_free_response_has_reasoning")
-        assert not hasattr(m, "_free_retry_pending")
-
-
-class TestResponsesToAnthropic:
-    """Responses output -> Anthropic conversion (encrypted_content handling)."""
-
-    def test_reasoning_and_text(self):
-        resp = {
-            "id": "resp_test",
-            "status": "completed",
-            "model": "muse-spark-1.2-contributor-free",
-            "output": [
-                {"type": "reasoning", "summary": [{"type": "summary_text", "text": "Let me think"}], "encrypted_content": "enc123"},
-                {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Bonjour"}]},
-            ],
-            "usage": {"input_tokens": 10, "output_tokens": 20, "input_tokens_details": {"cached_tokens": 2}},
-        }
-        anthro = responses_to_anthropic(resp, "muse-spark-1.2-contributor")
-        assert anthro["content"][0]["type"] == "thinking"
-        assert anthro["content"][0]["thinking"] == "Let me think"
-        assert anthro["content"][1]["type"] == "text"
-        assert anthro["content"][1]["text"] == "Bonjour"
-        assert anthro["stop_reason"] == "end_turn"
-        assert anthro["usage"]["input_tokens"] == 10
-        assert anthro["usage"]["cache_read_input_tokens"] == 2
-
-    def test_empty_summary_fallback(self):
-        resp = {
-            "id": "resp_test2",
-            "status": "completed",
-            "model": "muse-spark-1.2-contributor-free",
-            "output": [
-                {"type": "reasoning", "summary": [], "encrypted_content": "enc"},
-                {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "hi"}]},
-            ],
-            "usage": {"input_tokens": 5, "output_tokens": 10},
-        }
-        anthro = responses_to_anthropic(resp, "muse-spark-1.2-contributor")
-        # Doit quand même émettre un bloc thinking (même si summary vide -> placeholder)
-        assert anthro["content"][0]["type"] == "thinking"
-        assert anthro["content"][1]["type"] == "text"
+        result = _chat_to_responses_request(chat)
+        assert result["temperature"] == 0.7
+        assert result["top_p"] == 0.9
+        assert result["reasoning"] == {"summary": "auto", "effort": "high"}

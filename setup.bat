@@ -44,7 +44,7 @@ REM --- Lancer le proxy ---
 echo.
 echo ========================================
 echo   Lancement du proxy...
-echo   Dashboard: http://localhost:8082
+echo   API + Dashboard: http://localhost:4000
 echo ========================================
 echo.
 python opencode.py
