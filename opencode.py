@@ -819,8 +819,9 @@ async def _save_request(req_id, model, original_model, duration_ms,
 	                  identity=None, geo_country=None, geo_blocked=None):
     tools_json = json.dumps(tools) if tools else "[]"
     tools_used_json = json.dumps(list(dict.fromkeys(tools_used))) if tools_used else "[]"
-    request_body_json = _truncate_body_for_storage(request_body) if request_body else None
-    response_body_json = _truncate_body_for_storage(response_body) if response_body else None
+    # B1: redact before DB INSERT (was only on _debug)
+    request_body_json = _redact(_truncate_body_for_storage(request_body)) if request_body else None
+    response_body_json = _redact(_truncate_body_for_storage(response_body)) if response_body else None
     client_user_agent = _current_user_agent.get()
     # Leaf reader for the free-channel stamp: the two writers set
     # _current_free_attempt (IP + identity profile) right before the free
@@ -3800,8 +3801,11 @@ def _make_stream_retry_loop(protocol):
     Returns (attempt_headers, should_retry) where should_retry=True means
     the caller should `continue` the outer loop.
     """
-    async def _handle_429(headers, status_code, attempt, resp_headers=None):
-        if attempt == 0 and len(API_KEYS) > 1 and status_code in (429, 401, 403, 400):
+    async def _handle_429(headers, status_code, attempt, resp_headers=None, resp_text=None):
+        # B4 idempotence: 400 never retries here (param=name would pause_key uselessly).
+        # Credit 400 retry is handled explicitly in the non-stream caller after checking
+        # "Insufficient balance" / "Monthly usage limit" in resp.text (see messages() P2).
+        if attempt == 0 and len(API_KEYS) > 1 and status_code in (429, 401, 403):
             failed_key = _key_from_headers(headers, protocol)
             if status_code == 429:
                 # Fetch fresh quotas and pause key until exact reset time
@@ -4153,15 +4157,21 @@ def _strip_web_search_tool(body: dict, protocol: str):
         if not body["tools"]:
             del body["tools"]
 
-    # Remove forced tool_choice
+    # Remove forced tool_choice (+ orphan empty name → auto)
     tc = body.get("tool_choice")
     if isinstance(tc, dict):
-        is_forced_web_search = (
-            (tc.get("type") == "tool" and tc.get("name") == "web_search") or
-            (tc.get("type") == "function" and tc.get("function", {}).get("name") == "web_search")
-        )
-        if is_forced_web_search:
-            del body["tool_choice"]
+        _tc_name = tc.get("name", "") or tc.get("function", {}).get("name", "")
+        if not isinstance(_tc_name, str) or not _tc_name.strip():
+            # Empty tool_choice name (B2b) — reset to auto (orphan after web_search strip)
+            _debug("  [convert] _strip_web_search_tool: empty tool_choice name → auto")
+            body["tool_choice"] = "auto"
+        else:
+            is_forced_web_search = (
+                (tc.get("type") == "tool" and tc.get("name") == "web_search") or
+                (tc.get("type") == "function" and tc.get("function", {}).get("name") == "web_search")
+            )
+            if is_forced_web_search:
+                del body["tool_choice"]
 
 
 async def _handle_web_search(body: dict, model_id: str, protocol: str) -> bool:
@@ -4363,7 +4373,8 @@ def anthropic_to_openai(body: dict, model: str) -> dict:
         messages.append(msg)
 
     for msg in body.get("messages", []):
-        role, content = msg["role"], msg.get("content", "")
+        role = msg.get("role") or "user"
+        content = msg.get("content", "")
         is_asst = role == "assistant"
 
         # Simple string content
@@ -4395,11 +4406,15 @@ def anthropic_to_openai(body: dict, model: str) -> dict:
             elif btype == "thinking":
                 thinking_parts.append(block.get("thinking", ""))
             elif btype == "tool_use":
+                _tool_name = block.get("name", "")
+                if not isinstance(_tool_name, str) or not _tool_name.strip():
+                    _debug(f"  [convert] SKIP tool_use with empty name id={block.get('id','?')}")
+                    continue
                 tool_calls.append({
                     "id": block.get("id", f"call_{uuid.uuid4().hex[:8]}"),
                     "type": "function",
                     "function": {
-                        "name": block.get("name", ""),
+                        "name": _tool_name.strip(),
                         "arguments": _json_dumps_str(block.get("input", {})),
                     },
                 })
@@ -4465,33 +4480,52 @@ def anthropic_to_openai(body: dict, model: str) -> dict:
 
     if "tools" in body:
         # Support both Anthropic format (name at top level) and OpenAI format (function.name)
+        def _norm_params(raw):
+            if not isinstance(raw, dict) or raw is None:
+                return {"type": "object", "properties": {}}
+            return raw
+        _web_search_fallback = {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}
         oai_tools = []
         for t in body["tools"]:
             if "name" in t:
-                # Anthropic format: {"name": "...", "description": "...", "input_schema": {...}}
+                params = _norm_params(t.get("input_schema", {}))
+                if t.get("name") == "web_search" and (not params or params.get("type") != "object"):
+                    params = _web_search_fallback
+                    _debug("  [convert] web_search input_schema null/invalid → fallback schema")
                 oai_tools.append({"type": "function", "function": {
                     "name": t["name"], "description": t.get("description", ""),
-                    "parameters": t.get("input_schema", {}),
+                    "parameters": params,
                 }})
             elif "function" in t:
-                # OpenAI format: {"type": "function", "function": {"name": "...", ...}}
                 fn = t["function"]
+                params = _norm_params(fn.get("parameters", {}))
+                if fn.get("name") == "web_search" and (not params or params.get("type") != "object"):
+                    params = _web_search_fallback
+                    _debug("  [convert] web_search parameters null/invalid → fallback schema")
                 oai_tools.append({"type": "function", "function": {
                     "name": fn.get("name", ""), "description": fn.get("description", ""),
-                    "parameters": fn.get("parameters", {}),
+                    "parameters": params,
                 }})
             else:
-                # Unknown format, try best effort
+                raw = t.get("input_schema", t.get("parameters", {}))
+                params = _norm_params(raw)
+                if t.get("name") == "web_search" and (not params or params.get("type") != "object"):
+                    params = _web_search_fallback
                 oai_tools.append({"type": "function", "function": {
                     "name": t.get("name", ""), "description": t.get("description", ""),
-                    "parameters": t.get("input_schema", t.get("parameters", {})),
+                    "parameters": params,
                 }})
         oai["tools"] = oai_tools
         tc = body.get("tool_choice", "auto")
         if isinstance(tc, dict):
             tc_type = tc.get("type", "auto")
             if tc_type == "tool":
-                oai["tool_choice"] = {"type": "function", "function": {"name": tc.get("name", "")}}
+                _tc_name = tc.get("name", "")
+                if not isinstance(_tc_name, str) or not _tc_name.strip():
+                    _debug("  [convert] SKIP empty tool_choice name → auto")
+                    oai["tool_choice"] = "auto"
+                else:
+                    oai["tool_choice"] = {"type": "function", "function": {"name": _tc_name.strip()}}
             elif tc_type == "any":
                 oai["tool_choice"] = "required"
             else:
@@ -4565,6 +4599,11 @@ _anthropic_cache_max = 512
 
 def anthropic_to_openai(body: dict, model: str) -> dict:  # cached wrapper
     try:
+        # B2c: invalidate cache if body contains role None (poison)
+        for _m in body.get("messages", []) or []:
+            if isinstance(_m, dict) and _m.get("role") is None:
+                _debug("  [cache] skip cache — role None detected")
+                return _orig_anthropic_to_openai(body, model)
         b = _json_dumps(body)
         key = (model, hash(b))
         hit = _anthropic_cache.get(key)
@@ -5093,7 +5132,7 @@ def _chat_to_responses_request(chat: dict) -> dict:
         return dict(chat)
     inp = []
     for m in chat.get("messages", []) or []:
-        role = m.get("role", "user")
+        role = m.get("role") or "user"
         content = m.get("content", "")
         # Preserve cache_control from the chat message for prefix caching
         cache_ctrl = m.get("cache_control")
@@ -5121,8 +5160,12 @@ def _chat_to_responses_request(chat: dict) -> dict:
                 inp.append(item)
         for tc in m.get("tool_calls", []) or []:
             fn = tc.get("function", {}) if isinstance(tc.get("function"), dict) else {}
+            _fn_name = fn.get("name", "")
+            if not isinstance(_fn_name, str) or not _fn_name.strip():
+                _debug(f"  [convert] SKIP function_call with empty name call_id={tc.get('call_id') or tc.get('id','?')}")
+                continue
             _cid = tc.get("call_id") or tc.get("id") or f"call_{uuid.uuid4().hex[:12]}"
-            inp.append({"type": "function_call", "call_id": _cid, "name": fn.get("name", ""), "arguments": fn.get("arguments", "{}")})
+            inp.append({"type": "function_call", "call_id": _cid, "name": _fn_name.strip(), "arguments": fn.get("arguments", "{}")})
     # Guard: Responses input must be non-empty; log original chat for audit if empty
     if not inp:
         _debug(f"  [free] _chat_to_responses_request empty input for model {chat.get('model','')} — original messages={len(chat.get('messages',[]))} — injecting fallback")
@@ -5824,6 +5867,7 @@ async def messages(request: Request):
             open_blocks = []
             _yielded = False
             stop_reason = "end_turn"
+            emitted_finish = False
             _handle_429 = _make_stream_retry_loop("anthropic")
             _geo_tunnel = getattr(request.state, "_geo_force_tunnel", False)
             _free_forced_pool = getattr(request.state, "_geo_forced_pool", None)
@@ -5966,7 +6010,15 @@ async def messages(request: Request):
                             yield chunk
                             _line_buf += chunk.decode("utf-8", errors="replace")
                             if len(_line_buf) > yaml_get("streaming", "line_buffer_max", 1_000_000):
-                                _line_buf = _line_buf[-1000:]
+                                # Truncate on newline boundary to avoid splitting JSON (fix truncation mid-JSON)
+                                _keep = 1000
+                                _tail = _line_buf[-_keep:]
+                                _nl = _tail.find("\n")
+                                if _nl != -1:
+                                    _line_buf = _tail[_nl + 1 :]
+                                else:
+                                    _debug(f"  [stream] line_buf truncated mid-JSON (no newline in last {_keep})")
+                                    _line_buf = _tail
                             while "\n" in _line_buf:
                                 line, _line_buf = _line_buf.split("\n", 1)
                                 line = line.strip()
@@ -6013,6 +6065,23 @@ async def messages(request: Request):
                                     stream_out = usage.get("output_tokens", 0)
                                     stop_reason = event.get("delta", {}).get("stop_reason", stop_reason)
                                     _debug(f"  [stream] message_delta: stop_reason={stop_reason} output_tokens={stream_out}")
+                                elif etype == "message_stop":
+                                    emitted_finish = True
+                                    _debug(f"  [stream] message_stop received → emitted_finish=True")
+                        # After stream ends, handle truncated stream (EOF without message_stop)
+                        # Check remaining buffer for a final event before synthesis
+                        if _line_buf.strip() and not emitted_finish:
+                            _rem = _line_buf.strip()
+                            if _rem.startswith("data:"):
+                                _rem = _rem[5:].strip()
+                            try:
+                                _ev = _json_loads(_rem)
+                                if isinstance(_ev, dict) and _ev.get("type") in ("message_stop", "message_delta"):
+                                    # If we have a buffered final event, consider it emitted
+                                    if _ev.get("type") == "message_stop" or _ev.get("delta", {}).get("stop_reason"):
+                                        emitted_finish = True
+                            except Exception:
+                                pass
                         # After stream ends, apply final output token count
                         if stream_out:
                             try:
@@ -6128,6 +6197,13 @@ async def messages(request: Request):
             else:
                 # Exhausted retries without success → error already yielded
                 return
+            # Fix: guarantee finish_reason on truncated stream (EOF without message_stop)
+            if started and not emitted_finish:
+                _debug(f"  [stream] truncated without finish_reason → synthesizing stop")
+                _log(f"  stream truncated without finish_reason → synthesizing stop")
+                async for ev in _terminate_after_started(open_blocks, stream_out):
+                    yield ev
+                emitted_finish = True
             logged_in = stream_in if stream_in is not None else est_input
             _debug(f"  [stream] done: in={logged_in} out={stream_out} cache={stream_cache} tools={used_tools}")
             if _using_free:
@@ -6354,6 +6430,7 @@ async def messages(request: Request):
         next_block_idx = 0
         stream_out_tokens = 0
         actual_usage = None
+        emitted_finish = False
         _handle_429 = _make_stream_retry_loop("openai")
         _debug(f"  [stream-oai] _handle_429 ready, about to yaml_get")
 
@@ -6494,6 +6571,7 @@ async def messages(request: Request):
                                 thinking_type, effort, client_ip, hdrs, tool_names, used_tools,
                                 request_body):
                                 yield ev
+                            emitted_finish = True
                             break
 
                         try:
@@ -6683,7 +6761,7 @@ async def messages(request: Request):
         # Responses API: response.completed / response.incomplete was received
         # but the upstream didn't close the connection (so the for loop
         # continued until the timeout). Finalize the stream properly.
-        if got_response_completed:
+        if got_response_completed and not emitted_finish:
             _debug(f"  [stream-oai] post-loop: finalizing Responses API stream")
             async for ev in _finalize_and_close_stream(
                 started, open_blocks, text_block_idx, reasoning_block_idx,
@@ -6694,6 +6772,20 @@ async def messages(request: Request):
                 thinking_type, effort, client_ip, hdrs, tool_names, used_tools,
                 request_body):
                 yield ev
+            emitted_finish = True
+        # Fix: guarantee finish_reason on truncated stream (EOF without [DONE] / response.completed)
+        if started and not emitted_finish:
+            _debug(f"  [stream-oai] truncated without finish_reason → synthesizing stop")
+            _log(f"  stream truncated without finish_reason → synthesizing stop")
+            async for ev in _terminate_after_started(open_blocks, stream_out_tokens):
+                yield ev
+            emitted_finish = True
+        elif got_response_completed and not emitted_finish:
+            # Incomplete Responses API without prior finalize (should be covered above, but keep for safety)
+            _debug(f"  [stream-oai] truncated Responses without finalize → synthesizing")
+            async for ev in _terminate_after_started(open_blocks, stream_out_tokens):
+                yield ev
+            emitted_finish = True
         return
 
     return StreamingResponse(_sse_keepalive(stream_gen(headers)), media_type="text/event-stream",
@@ -7189,6 +7281,7 @@ async def chat_completions(request: Request):
             _has_yielded = False
             _oai_has_yielded = False
             actual_usage = None
+            emitted_finish = False
             _handle_429 = _make_stream_retry_loop("openai")
             _free_forced_pool = getattr(request.state, "_geo_forced_pool", None)
             _free_bound = yaml_get("streaming", "retry_attempts", 2)
@@ -7331,7 +7424,9 @@ async def chat_completions(request: Request):
                                     # usage-only (completed/incomplete) → finaliser
                                     if not chunk.get("choices") and isinstance(chunk, dict) and "usage" in chunk:
                                         _debug(f"  [oai-stream] response stream-end signal, breaking to finalize")
+                                        actual_usage = chunk.get("usage") or actual_usage
                                         break
+                                    _oai_has_yielded = True
                                     yield f"data: {_json_dumps_str(chunk, ensure_ascii=False)}\n\n".encode()
                                     # reasoning_content / content compté plus bas via choices
                                     choices = chunk.get("choices", [])
@@ -7350,8 +7445,10 @@ async def chat_completions(request: Request):
                                         # stream-end signal; don't yield raw Responses
                                         # API event, just break to finalize.
                                         _debug(f"  [oai-stream] response stream-end signal, breaking to finalize")
+                                        actual_usage = chunk.get("usage") or actual_usage
                                         break
                                     # Yield converted chunk as chat/completions SSE
+                                    _oai_has_yielded = True
                                     yield f"data: {_json_dumps_str(chunk, ensure_ascii=False)}\n\n".encode()
                                     continue
                             if choices and isinstance(choices, list) and len(choices) > 0:
@@ -7369,8 +7466,35 @@ async def chat_completions(request: Request):
                                             if tc_idx not in seen_tool_indices:
                                                 seen_tool_indices.add(tc_idx)
                                                 used_tools.append(tc["function"]["name"])
+                                # Track finish_reason for truncated-stream detection
+                                _fr = choices[0].get("finish_reason") if isinstance(choices[0], dict) else None
+                                if _fr is not None:
+                                    emitted_finish = True
+                            _oai_has_yielded = True
                             yield line.encode() + b"\n\n"
 
+                        # Fix: synthesize finish_reason if truncated (EOF without finish_reason)
+                        if not emitted_finish:
+                            if _oai_has_yielded or stream_out > 0:
+                                _debug(f"  [oai-stream] truncated without finish_reason → synthesizing stop")
+                                _log(f"  stream truncated without finish_reason → synthesizing stop")
+                                _synth = {"id": f"chatcmpl-{uuid.uuid4().hex[:8]}", "object": "chat.completion.chunk", "created": int(time.time()), "model": original_model, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
+                                yield f"data: {_json_dumps_str(_synth, ensure_ascii=False)}\n\n".encode()
+                                yield b"data: [DONE]\n\n"
+                                emitted_finish = True
+                            elif actual_usage is not None:
+                                # Responses API completed but no finish yet — also synthesize
+                                _debug(f"  [oai-stream] synthesizing finish for Responses/empty stream")
+                                _synth = {"id": f"chatcmpl-{uuid.uuid4().hex[:8]}", "object": "chat.completion.chunk", "created": int(time.time()), "model": original_model, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
+                                yield f"data: {_json_dumps_str(_synth, ensure_ascii=False)}\n\n".encode()
+                                yield b"data: [DONE]\n\n"
+                                emitted_finish = True
+                            else:
+                                # Nothing yielded — emit error to avoid silent failure
+                                _debug(f"  [oai-stream] no content yielded, emitting error termination")
+                                _err = {"error": {"message": "stream truncated without content", "type": "api_error"}}
+                                yield b"data: " + _json_dumps_str(_err, ensure_ascii=False).encode() + b"\n\ndata: [DONE]\n\n"
+                                emitted_finish = True
                         # Stream ended — finalize tracking
                         final_in, final_out, final_cache, log_tag = _finalize_stream_tokens(
                             _track_model, est_input, None, stream_out, 0,
@@ -7610,6 +7734,7 @@ async def chat_completions(request: Request):
         actual_usage = None
         total_input = 0
         cache_read = 0
+        emitted_finish = False
         _handle_429 = _make_stream_retry_loop("anthropic")
 
         def _chunk(delta_override, finish):
@@ -7753,7 +7878,15 @@ async def chat_completions(request: Request):
                     async for raw in resp.aiter_bytes():
                         _line_buf += raw.decode("utf-8", errors="replace")
                         if len(_line_buf) > 1_000_000:
-                            _line_buf = _line_buf[-1000:]
+                            # Truncate on newline boundary to avoid splitting JSON
+                            _keep = 1000
+                            _tail = _line_buf[-_keep:]
+                            _nl = _tail.find("\n")
+                            if _nl != -1:
+                                _line_buf = _tail[_nl + 1 :]
+                            else:
+                                _debug(f"  [_anthro_to_oai] line_buf truncated mid-JSON (no newline in last {_keep})")
+                                _line_buf = _tail
                         while "\n" in _line_buf:
                             line, _line_buf = _line_buf.split("\n", 1)
                             line = line.strip()
@@ -7841,6 +7974,7 @@ async def chat_completions(request: Request):
                                 else:
                                     finish = "stop"
                                 yield _chunk({}, finish)
+                                emitted_finish = True
 
                             elif etype == "message_stop":
                                 _update_token_usage(_track_model, total_input, stream_out, cache_read)
@@ -7957,11 +8091,36 @@ async def chat_completions(request: Request):
                 if started:
                     yield _chunk({}, "stop")
                     yield b"data: [DONE]\n\n"
+                    emitted_finish = True
                 return
             else:
                 break
         else:
             return
+        # Fix: guarantee finish_reason on truncated stream (EOF without message_stop)
+        if started and not emitted_finish:
+            # Check remaining buffer for a final event before synthesis
+            if _line_buf.strip():
+                _rem = _line_buf.strip()
+                if _rem.startswith("data:"):
+                    _rem = _rem[5:].strip()
+                try:
+                    _ev = _json_loads(_rem)
+                    if isinstance(_ev, dict) and _ev.get("type") == "message_stop":
+                        emitted_finish = True
+                    elif isinstance(_ev, dict) and _ev.get("type") == "message_delta" and _ev.get("delta", {}).get("stop_reason"):
+                        emitted_finish = True
+                        yield _chunk({}, "stop")
+                        yield b"data: [DONE]\n\n"
+                        return
+                except Exception:
+                    pass
+            if not emitted_finish:
+                _debug(f"  [_anthro_to_oai] truncated without finish_reason → synthesizing stop")
+                _log(f"  stream truncated without finish_reason → synthesizing stop")
+                yield _chunk({}, "stop")
+                yield b"data: [DONE]\n\n"
+                emitted_finish = True
 
     return StreamingResponse(_sse_keepalive(_anthro_to_oai_stream(a_headers)), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
