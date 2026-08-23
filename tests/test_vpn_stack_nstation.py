@@ -30,9 +30,9 @@ import os
 import subprocess
 
 import pytest
+from test_vpn_freshness import FakeVPNManager, _cfg
 
 import shared_state
-from test_vpn_freshness import FakeVPNManager, _cfg
 
 
 class _Rec(FakeVPNManager):
@@ -55,7 +55,7 @@ def _env_map(path):
     """Parse a KEY=VALUE .env (or tmp) file into a dict — no exports."""
     vals = {}
     if os.path.exists(path):
-        for ln in open(path, "r", encoding="utf-8"):
+        for ln in open(path, encoding="utf-8"):
             line = ln.strip()
             if not line or line.startswith("#") or "=" not in line:
                 continue
@@ -213,7 +213,7 @@ async def test_apply_stack_fallback_legacy_pair_when_registry_empty(tmp_path, mo
     os.remove(tmp_path / ".env")  # fresh env for station 3
     assert await m3._apply_stack("wireguard") is True
     env3 = _env_map(tmp_path / ".env")
-    assert set(k for k in env3 if k.startswith("VPN_TYPE_STATION")) == {"VPN_TYPE_STATION3"}
+    assert {k for k in env3 if k.startswith("VPN_TYPE_STATION")} == {"VPN_TYPE_STATION3"}
     assert m3.cmds[-1][0][-1] == "vpn-gluetun-3"
 
 

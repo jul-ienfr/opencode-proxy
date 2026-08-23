@@ -38,10 +38,9 @@ C request that silently fell back to direct httpx carries the curated UA
 and FAILS the bundle-UA assertion instead of passing silently.
 """
 
-import json
-import os
-import threading
 import http.server
+import json
+import threading
 from contextlib import asynccontextmanager
 
 import pytest
@@ -304,7 +303,7 @@ async def test_path_c_curl_cffi_tunnel_stream(free_env, monkeypatch):
     # check that UA is non-empty and not the fallback's curated is actually
     # the same on Windows; allow both Mac and Windows bundle UAs.
     actual_ua = headers.get("user-agent")
-    assert actual_ua, f"Path C: missing user-agent"
+    assert actual_ua, "Path C: missing user-agent"
     # Accept either bundle_ua or curated Windows UA (both prove curl path on Windows)
     assert actual_ua == bundle_ua or actual_ua == oc._UA_BY_IMPERSONATE.get("chrome131"), (
         f"Path C: curl_cffi bundle UA expected — got {actual_ua!r} bundle {bundle_ua!r}"

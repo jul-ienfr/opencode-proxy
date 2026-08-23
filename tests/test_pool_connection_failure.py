@@ -21,11 +21,10 @@ Covered here (offline — no docker, no sockets, no loop tasks):
 import time
 
 import pytest
+from curl_cffi.requests import errors as _err
 
 import opencode as oc
 from free_ip_pool import FreeIPPool
-
-from curl_cffi.requests import errors as _err
 
 
 class _Station:

@@ -1,8 +1,8 @@
 """DB WAL/mmap/busy_timeout — Phase2 F-M8: vérifie le tuning F-M4."""
 
-import os
-import sqlite3
 import pathlib
+import sqlite3
+
 import pytest
 
 

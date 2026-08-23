@@ -35,17 +35,16 @@ Covered here:
 import logging
 import os
 import sqlite3
-import subprocess
 
 import pytest
 from fastapi import FastAPI
 from starlette.testclient import TestClient
+from test_vpn_freshness import FakeVPNManager, _cfg
 
-import vpn_manager as vm
 import config.settings as settings
 import shared_state
+import vpn_manager as vm
 from dashboard.api import register_dashboard
-from test_vpn_freshness import FakeVPNManager, _cfg
 
 
 class _EnvRecFake(FakeVPNManager):

@@ -18,7 +18,6 @@ import json
 import logging
 import subprocess
 import time
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -34,8 +33,8 @@ class DockerEventWatcher:
         self._managers = dict(managers or {})
         self._enabled = bool(enabled)
         self._stopped = False
-        self._proc: Optional[asyncio.subprocess.Process] = None
-        self._task: Optional[asyncio.Task] = None
+        self._proc: asyncio.subprocess.Process | None = None
+        self._task: asyncio.Task | None = None
         self._events_seen = 0
         self._started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         # Last observed status per watched container ({name: {"status", "time"}})

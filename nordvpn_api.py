@@ -9,11 +9,9 @@ Based on patterns from:
 - vpn-profile-switcher (UriShX) - .ovpn download, recommendation filtering
 """
 
+import logging
 import os
 import time
-import asyncio
-import logging
-from typing import Optional
 from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
@@ -156,7 +154,7 @@ class NordVPNClient:
             logger.error("[nordvpn-api] recommendations failed: %s", e)
             return []
 
-    async def download_ovpn_config(self, server: ServerInfo, dest_dir: str) -> Optional[str]:
+    async def download_ovpn_config(self, server: ServerInfo, dest_dir: str) -> str | None:
         """Download .ovpn config file for a server.
 
         Returns the path to the downloaded file, or None on failure.
@@ -212,7 +210,7 @@ class NordVPNClient:
             logger.error("[nordvpn-api] countries fetch failed: %s", e)
             return []
 
-    async def _get_country_id(self, code: str) -> Optional[int]:
+    async def _get_country_id(self, code: str) -> int | None:
         """Get numeric country ID from 2-letter code."""
         countries = await self.get_countries()
         for c in countries:
@@ -220,7 +218,7 @@ class NordVPNClient:
                 return c["id"]
         return None
 
-    def _parse_server(self, data: dict) -> Optional[ServerInfo]:
+    def _parse_server(self, data: dict) -> ServerInfo | None:
         """Parse raw API server data into ServerInfo."""
         try:
             server = data.get("station", {})
@@ -257,7 +255,7 @@ class NordVPNClient:
 
 
 # Singleton instance
-_client: Optional[NordVPNClient] = None
+_client: NordVPNClient | None = None
 
 
 def get_nordvpn_client(cache_ttl: int = DEFAULT_CACHE_TTL) -> NordVPNClient:

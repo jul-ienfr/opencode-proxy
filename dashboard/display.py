@@ -2,20 +2,20 @@
 Rich terminal display: token usage table, log panel, keyboard input.
 """
 
-import sys
-import time
-import os
 import collections
-import threading
 import logging
+import os
+import sys
+import threading
+import time
+
+from rich import box
+from rich.console import Group
+from rich.live import Live
+from rich.panel import Panel
+from rich.table import Table
 
 import config.settings as _cfg_settings
-
-from rich.live import Live
-from rich.table import Table
-from rich.panel import Panel
-from rich.console import Group
-from rich import box
 
 log_lines = collections.deque(maxlen=200)
 LOG_VISIBLE = 35
@@ -242,7 +242,7 @@ def build_display(routes, token_usage, token_lock):
         f"[bold yellow]{sum_in:,}[/]",
         f"[bold yellow]{sum_out:,}[/]",
         f"[bold yellow]{sum_cache:,}[/]",
-        f"[bold yellow]100%[/]",
+        "[bold yellow]100%[/]",
     )
 
     start = max(0, min(_log_scroll, len(log_lines) - LOG_VISIBLE))
@@ -304,7 +304,9 @@ def start_input_thread():
                 else:
                     time.sleep(0.05)
         else:
-            import tty, termios, select
+            import select
+            import termios
+            import tty
 
             fd = sys.stdin.fileno()
             old = termios.tcgetattr(fd)

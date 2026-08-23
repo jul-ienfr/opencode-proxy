@@ -1,7 +1,7 @@
 """SSE e2e — Phase2 F-M8: streaming StreamingResponse + orphan filter."""
 
 import json
-import pytest
+
 from fastapi.testclient import TestClient
 
 

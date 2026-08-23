@@ -6,8 +6,8 @@ DI via app.state (ou config.settings direct pour compat).
 """
 
 from config import get_model_config as get_model_config
-from config.settings import SORTED_ROUTES as SORTED_ROUTES
 from config.settings import SORTED_CUSTOM_ROUTES as SORTED_CUSTOM_ROUTES
+from config.settings import SORTED_ROUTES as SORTED_ROUTES
 
 # _route_for reste dans opencode.py pour l'instant (import circulaire évité)
 # Prochaine PR: déplacer _route_for ici et faire opencode.py re-export:

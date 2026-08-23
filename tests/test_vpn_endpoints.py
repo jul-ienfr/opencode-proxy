@@ -29,7 +29,6 @@ read-only GETs open) and the axe 3.4 config_yaml_dirty flag surfaced by
 """
 
 import io
-import os
 import sqlite3
 from types import SimpleNamespace
 
@@ -37,9 +36,8 @@ import pytest
 from fastapi import FastAPI
 from starlette.testclient import TestClient
 
-import shared_state
-import config.settings as config_settings
 import dashboard.api as api
+import shared_state
 from dashboard.api import register_dashboard
 
 
@@ -544,7 +542,7 @@ def test_upload_config_sanitizes_name(ctx, monkeypatch):
         if "vpn_configs" in str(path):
             opened.append(str(path))
             return io.BytesIO()
-        return io.open(path, mode, *a, **k)
+        return open(path, mode, *a, **k)
 
     monkeypatch.setattr(__import__("builtins"), "open", _fake_open)
     with TestClient(fast) as client:

@@ -18,10 +18,8 @@ Covered here (offline — no docker, no shared state):
 
 import os
 
-import pytest
-
-from config.settings import resolved_station_count
 import vpn_manager as vm
+from config.settings import resolved_station_count
 
 
 def _mgr(station, **over):

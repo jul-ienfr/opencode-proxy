@@ -33,12 +33,10 @@ import asyncio
 import time
 
 import pytest
-
-import free_ip_pool as fip
-import vpn_manager as vm
 from test_downscale_rotation_cancel import _blocking_switch, _pool, _wait_registered
 from test_vpn_freshness import FakeVPNManager, _cfg
 
+import vpn_manager as vm
 
 # ── F1a — cancel_rotations retire eager (guards fermés immédiatement) ──
 

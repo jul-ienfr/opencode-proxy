@@ -11,10 +11,16 @@ Centralise aussi free_ip_pool + shared_rotation pour P3.2.
 # Re-export depuis opencode pour compat
 try:
     from opencode import (
-        _free_cooldown_key as _free_cooldown_key,
-        _free_429_cooldown_seconds as _free_429_cooldown_seconds,
-        _free_stations_exhausted as _free_stations_exhausted,
         FreeQuotaExhausted as FreeQuotaExhausted,
+    )
+    from opencode import (
+        _free_429_cooldown_seconds as _free_429_cooldown_seconds,
+    )
+    from opencode import (
+        _free_cooldown_key as _free_cooldown_key,
+    )
+    from opencode import (
+        _free_stations_exhausted as _free_stations_exhausted,
     )
 except ImportError:
     pass

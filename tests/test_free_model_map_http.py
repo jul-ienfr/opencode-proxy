@@ -32,15 +32,15 @@ real writer against a tmp config.yaml):
 
 import sqlite3
 
-import yaml
 import pytest
+import yaml
 from fastapi import FastAPI
 from starlette.testclient import TestClient
 
-import shared_state
-import config.settings as st
 import config  # the re-exported FREE_MODEL_MAP object
+import config.settings as st
 import dashboard.api as api
+import shared_state
 from dashboard.api import register_dashboard
 
 

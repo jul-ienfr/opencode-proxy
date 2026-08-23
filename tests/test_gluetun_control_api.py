@@ -24,9 +24,9 @@ import subprocess
 import time
 
 import pytest
+from test_vpn_freshness import FakeVPNManager, _cfg
 
 import vpn_manager as vm
-from test_vpn_freshness import FakeVPNManager, _cfg, _shared
 
 
 class ControlFakeVPNManager(FakeVPNManager):
@@ -135,7 +135,7 @@ def _fast_mgr(tmp_path, ip="9.9.9.9", clears_on_pin=1, **over):
     mgr.stdout_by_fragment = {
         "/v1/vpn/settings": "",  # accepted (204-equivalent)
         "/v1/vpn/status": '{"status":"running"}',
-        "/v1/publicip/ip": '{"public_ip":"%s"}' % ip,
+        "/v1/publicip/ip": f'{{"public_ip":"{ip}"}}',
     }
     return mgr
 

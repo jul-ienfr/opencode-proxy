@@ -12,7 +12,7 @@ STATE_FILE = os.path.join(
 def _load_state():
     """Load saved window state from disk."""
     try:
-        with open(STATE_FILE, "r") as f:
+        with open(STATE_FILE) as f:
             return json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         return None
@@ -52,13 +52,13 @@ if __name__ == "__main__":
         try:
             import webview
 
-            kwargs = dict(
-                width=win_width,
-                height=win_height,
-                min_size=(800, 600),
-                text_select=True,
-                background_color="#1a1a2e",
-            )
+            kwargs = {
+                "width": win_width,
+                "height": win_height,
+                "min_size": (800, 600),
+                "text_select": True,
+                "background_color": "#1a1a2e",
+            }
             if win_x is not None and win_y is not None:
                 kwargs["x"] = win_x
                 kwargs["y"] = win_y

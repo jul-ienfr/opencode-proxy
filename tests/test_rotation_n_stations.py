@@ -1,7 +1,7 @@
 """Rotation N-stations — Phase2 F-M8: N=2..10, FakeVPNManager, shared_rotation."""
 
+
 import pytest
-from unittest.mock import MagicMock
 
 
 def test_resolved_station_count_range():

@@ -29,10 +29,9 @@ import sys
 import time
 
 import pytest
+from test_vpn_freshness import FakeVPNManager, _cfg
 
 import vpn_manager as vm
-
-from test_vpn_freshness import FakeVPNManager, _cfg
 
 
 class _FakeResp:

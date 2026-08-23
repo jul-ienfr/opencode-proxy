@@ -42,5 +42,11 @@
       "deepseek-v4-flash"
     ],
     "model": "muse-spark-1.2-contributor"
+  },
+  "qwen37max": {
+    "match": [
+      "qwen3.7-max"
+    ],
+    "model": "muse-spark-1.2-contributor"
   }
 }

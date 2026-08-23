@@ -1,13 +1,14 @@
-import os
-import sys
-import subprocess
 import json
 import logging
-import time
-import re
+import os
 import random
+import re
 import secrets
+import subprocess
+import sys
 import threading
+import time
+from functools import lru_cache as _lru_cache
 
 # Windows: masquer la fenêtre console des subprocess (évite le flash noir 1s)
 _CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
@@ -78,7 +79,7 @@ def load_yaml_config() -> dict:
         return {}
 
     try:
-        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+        with open(CONFIG_PATH, encoding="utf-8") as f:
             _yaml_data = yaml.safe_load(f) or {}
         try:
             _config_yaml_mtime = os.path.getmtime(CONFIG_PATH)
@@ -103,7 +104,7 @@ def load_yaml_config() -> dict:
                     _lock_acquired = True
                     # Re-read under lock: another worker may have just generated it
                     try:
-                        with open(CONFIG_PATH, "r", encoding="utf-8") as _rf:
+                        with open(CONFIG_PATH, encoding="utf-8") as _rf:
                             _reloaded = yaml.safe_load(_rf) or {}
                         _re_ir = (
                             _reloaded.get("ip_rotation", {})
@@ -269,7 +270,7 @@ def load_env_file():
     count = 0
     divergence = []
     loaded = set()
-    with open(ENV_PATH, "r", encoding="utf-8") as f:
+    with open(ENV_PATH, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if line and not line.startswith("#") and "=" in line:
@@ -754,7 +755,7 @@ FREE_DISCOVERY_AUTO_PERSIST = bool(FREE_DISCOVERY.get("auto_persist", True))
 FREE_DISCOVERY_DEFAULT_TARGET = FREE_DISCOVERY.get("default_target", "mimo-v2.5-free")
 
 # Seed FREE_MODELS from existing free_model_map values (known frees at boot)
-FREE_MODELS: set = set(v for v in FREE_MODEL_MAP.values() if isinstance(v, str) and v)
+FREE_MODELS: set = {v for v in FREE_MODEL_MAP.values() if isinstance(v, str) and v}
 FREE_MODEL_POOL: list = sorted(FREE_MODELS)
 # Observability state (exposed via GET /api/free-models)
 _FREE_DISCOVERY_STATE = {
@@ -1103,7 +1104,7 @@ def _ensure_free_models_sync() -> int:
         _FREE_DISCOVERY_STATE["consecutive_failures"] = 0
         import datetime as _dt
 
-        now_iso = _dt.datetime.now(_dt.timezone.utc).isoformat()
+        now_iso = _dt.datetime.now(_dt.UTC).isoformat()
         _FREE_DISCOVERY_STATE["last_refresh"] = now_iso
         # next_refresh computed by caller (interval + jitter)
         return added
@@ -1213,7 +1214,7 @@ def load_custom_routes() -> dict:
     # Fallback to JSON file
     if os.path.exists(CUSTOM_ROUTES_PATH):
         try:
-            with open(CUSTOM_ROUTES_PATH, "r", encoding="utf-8") as f:
+            with open(CUSTOM_ROUTES_PATH, encoding="utf-8") as f:
                 data = json.load(f)
                 if isinstance(data, dict):
                     return data
@@ -1246,7 +1247,7 @@ def load_api_keys() -> list[dict]:
     """Load API key configs from api_keys.json (gitignored, primary). Falls back to YAML, then .env single-key."""
     if os.path.exists(API_KEYS_PATH):
         try:
-            with open(API_KEYS_PATH, "r", encoding="utf-8") as f:
+            with open(API_KEYS_PATH, encoding="utf-8") as f:
                 data = json.load(f)
                 if isinstance(data, list) and len(data) > 0:
                     for i, k in enumerate(data):
@@ -1287,7 +1288,7 @@ def load_tool_capabilities() -> dict:
     )
     if os.path.exists(compat_path):
         try:
-            with open(compat_path, "r", encoding="utf-8") as f:
+            with open(compat_path, encoding="utf-8") as f:
                 data = json.load(f)
                 if isinstance(data, dict):
                     return data
@@ -1374,7 +1375,7 @@ def maybe_reload_custom_routes():
                 try:
                     import yaml as _yaml
 
-                    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                    with open(CONFIG_PATH, encoding="utf-8") as f:
                         new_yaml = _yaml.safe_load(f) or {}
                 except Exception as e:
                     logging.warning("[config] reload config.yaml failed: %s", e)
@@ -1457,9 +1458,6 @@ def maybe_reload_custom_routes():
         logging.warning("Failed to reload config: %s", e)
 
 
-from functools import lru_cache as _lru_cache
-
-
 @_lru_cache(maxsize=512)
 def get_model_config(model_id: str) -> dict:
     """Return merged config for model_id with sensible defaults (LRU cached)."""
@@ -1475,7 +1473,7 @@ def save_env(updates: dict):
     """Update .env file and apply values at runtime."""
     existing = {}
     if os.path.exists(ENV_PATH):
-        with open(ENV_PATH, "r", encoding="utf-8") as f:
+        with open(ENV_PATH, encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if line and not line.startswith("#") and "=" in line:

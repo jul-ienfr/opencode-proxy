@@ -27,9 +27,9 @@ import pytest
 from fastapi import FastAPI
 from starlette.testclient import TestClient
 
+import dashboard.api as api
 import opencode
 import shared_state
-import dashboard.api as api
 from dashboard.api import register_dashboard
 
 

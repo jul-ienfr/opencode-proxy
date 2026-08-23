@@ -2,8 +2,8 @@
 """Simple HTTP proxy that routes through tun0 (VPN tunnel)."""
 
 import socket
-import threading
 import sys
+import threading
 
 PROXY_PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8888
 
@@ -44,7 +44,7 @@ def handle_client(client_socket):
                     if not data:
                         break
                     client_socket.sendall(data)
-            except Exception as e:
+            except Exception:
                 pass
             finally:
                 try:
@@ -75,14 +75,14 @@ def handle_client(client_socket):
                 remote.sendall(new_request.encode())
                 response = remote.recv(4096)
                 client_socket.sendall(response)
-            except Exception as e:
+            except Exception:
                 pass
             finally:
                 try:
                     remote.close()
                 except:
                     pass
-    except Exception as e:
+    except Exception:
         pass
     finally:
         try:

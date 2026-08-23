@@ -1,10 +1,6 @@
 """Dashboard auth HMAC — Phase2 F-M8: compare_digest + 0.0.0.0 warning."""
 
-import os
 import hmac
-import importlib
-import pytest
-from fastapi.testclient import TestClient
 
 
 def test_hmac_compare_digest():
@@ -26,8 +22,8 @@ def test_dashboard_token_401_when_set(monkeypatch):
     monkeypatch.setattr(api, "_DASHBOARD_REQUIRE_TOKEN", False, raising=False)
     monkeypatch.setattr(api, "_host_for_warning", "127.0.0.1", raising=False)
 
+
     from dashboard.api import _check_dashboard_token
-    from fastapi import Request
 
     class FakeReq:
         def __init__(self, headers):

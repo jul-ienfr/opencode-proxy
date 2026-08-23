@@ -117,6 +117,16 @@ docker run -d \
 - Static files in `static/` directory
 - Token usage stats and request history via API endpoints
 
+## Claude Code — Hygiène contexte (anti-thrashing Autocompact)
+
+Pour éviter `Autocompact thrashing` (contexte qui se remplit en 2-3 tours) :
+- `Read` toujours avec `limit` (ex: `Read opencode.py limit 100 offset 1200`) sur les gros fichiers.
+- `Grep` toujours avec `glob`/`path` ciblé (`glob: "*.py"` ou `path: "app/"`) + `output_mode: "files_with_matches"` + `head_limit: 30` d'abord.
+- `Glob` jamais `**/*` nu → `app/**/*.py`, `dashboard/**/*.py`.
+- `git diff --stat` d'abord, puis `git diff -- <fichier>` ciblé si besoin ; `git log --oneline -20`.
+- Logs/DB : jamais `Read` sur `logs/requests.db` (3 Go) ou `logs/debug.log` → `Bash: tail -n 50 logs/debug.log` ou `sqlite3 logs/requests.db "SELECT ... LIMIT 20"`.
+- Fichiers ignorés par `.claudeignore` : `logs/`, `.kilo/`, `*.db`, `*.log` — ne pas les forcer.
+
 ## Remote Server Maintenance (192.168.31.101)
 
 Le serveur distant est une Ubuntu 24.04 qui héberge d'autres workloads (P-core, etc.).

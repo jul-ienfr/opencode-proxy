@@ -5,11 +5,12 @@ Fetches subscription quota data (5h rolling, weekly, monthly)
 from the OpenCode Go workspace page by scraping embedded JS objects.
 """
 
-import re
-import json
-import time
 import asyncio
+import json
 import logging
+import re
+import time
+
 import httpx
 
 from .events import get_event_manager
@@ -134,8 +135,8 @@ async def fetch_available_models() -> list[str]:
 
                 last = _dt2.datetime.fromisoformat(str(lr))
                 if last.tzinfo is None:
-                    last = last.replace(tzinfo=_dt2.timezone.utc)
-                age = (_dt2.datetime.now(_dt2.timezone.utc) - last).total_seconds()
+                    last = last.replace(tzinfo=_dt2.UTC)
+                age = (_dt2.datetime.now(_dt2.UTC) - last).total_seconds()
                 interval = int(getattr(_cs, "FREE_DISCOVERY_INTERVAL", 3600) or 3600)
                 if 0 <= age < interval:
                     logger.debug(
@@ -156,7 +157,7 @@ async def fetch_available_models() -> list[str]:
             raise RuntimeError(f"Models endpoint HTTP {resp.status_code}")
         data = resp.json()
         ids = sorted(
-            set(m["id"] for m in data.get("data", []) if isinstance(m, dict) and "id" in m)
+            {m["id"] for m in data.get("data", []) if isinstance(m, dict) and "id" in m}
         )
         if not ids:
             raise RuntimeError("No models returned from upstream")
@@ -541,8 +542,8 @@ async def toggle_use_balance(workspace_id: str, auth_cookie: str, enabled: bool 
 
     Returns True on success, False on failure.
     """
-    from urllib.parse import quote
     import uuid
+    from urllib.parse import quote
 
     client = await _get_http_client()
     instance_id = f"server-fn:{uuid.uuid4().hex[:8]}"
@@ -711,7 +712,7 @@ async def start_quota_fetcher(app):
         async def _fetch_limits_safe():
             try:
                 return await asyncio.wait_for(fetch_model_limits(), timeout=4.0)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 logger.debug("[quota] docs fetch timeout (4s) — fallback")
                 return None
             except Exception as e:
@@ -721,7 +722,7 @@ async def start_quota_fetcher(app):
         async def _fetch_models_safe():
             try:
                 return await asyncio.wait_for(fetch_available_models(), timeout=4.0)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 logger.debug("[quota] models fetch timeout (4s)")
                 return None
             except Exception as e:
@@ -759,6 +760,7 @@ async def start_quota_fetcher(app):
             pass
 
     async def _poll():
+        global _models_cache
         while True:
             # Periodically refresh upstream model list (every cycle = ~5 min)
             try:

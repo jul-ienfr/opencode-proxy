@@ -28,10 +28,10 @@ import logging
 import time
 from pathlib import Path
 
-import vpn_manager as vm
-import opencode as oc
 from test_vpn_freshness import FakeVPNManager, _cfg
 
+import opencode as oc
+import vpn_manager as vm
 
 # ── §4.1 save_state: last-good .bak + non-fatal failures ─────────
 

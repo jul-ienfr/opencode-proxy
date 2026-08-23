@@ -9,12 +9,11 @@ Usage:
     python tests/test_tool_compat.py [--proxy http://localhost:4000] [--output tool_compat_results.json]
 """
 
+import argparse
 import asyncio
 import json
 import sys
-import time
-import argparse
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 try:
     import httpx
@@ -310,7 +309,7 @@ class ToolCompatibilityTester:
         """Run tests for all models and save results."""
         models = models or MODELS_TO_TEST
         all_results = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": datetime.now(UTC).isoformat(),
             "proxy": self.proxy_base,
             "models": {},
         }

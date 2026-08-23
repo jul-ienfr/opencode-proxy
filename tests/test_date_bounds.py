@@ -15,7 +15,7 @@ import os
 import re
 import sys
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime
 
 import pytest
 
@@ -23,9 +23,9 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from dashboard.api import (
+    _DATE_ONLY_RE,
     _date_bound_to_utc,
     _normalize_date_bound,
-    _DATE_ONLY_RE,
     daysAgo,
 )
 
@@ -116,7 +116,7 @@ class TestDaysAgo:
         assert Z_RE.match(daysAgo(30))
 
     def test_value_is_instant_now_minus_n_days(self):
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         ts = datetime.fromisoformat(daysAgo(0))
         assert abs((now - ts).total_seconds()) < 10
         assert daysAgo(1) < daysAgo(0)

@@ -19,12 +19,9 @@ Hermetic matrix (no network, tmp_path only):
 import re
 import sys
 import time
-import json
-
-import yaml
-import pytest
 from pathlib import Path
 
+import yaml
 
 # ── helpers ─────────────────────────────────────────────────────────
 
@@ -103,7 +100,7 @@ def _isolated_settings(tmp_path, monkeypatch, yaml_data):
     cfg = tmp_path / "config.yaml"
     cfg.write_text(yaml.dump(yaml_data, sort_keys=False), encoding="utf-8")
     # force re-import under tmp CONFIG_PATH
-    for mod in [k for k in sys.modules if k in ("config.settings", "config")]:
+    for _mod in [k for k in sys.modules if k in ("config.settings", "config")]:
         # keep module objects but point them at tmp_path
         pass
     import config.settings as st
@@ -316,7 +313,7 @@ class TestApplyPersist:
             payload = _payload("mimo-v2.5-free", "hy3-free")
             mapping = {u: _FakeResp(200, payload) for u in urls}
             _install_fake_httpx(monkeypatch, mapping)
-            added = st._ensure_free_models_sync()
+            st._ensure_free_models_sync()
             # both frees discovered, both in MODELS
             assert {"mimo-v2.5-free", "hy3-free"} <= st.FREE_MODELS
             assert {"mimo-v2.5-free", "hy3-free"} <= set(st.MODELS.keys())
@@ -355,6 +352,7 @@ class TestForcedPoolRotation:
         pass forced_pool to _launch_rotation — rotation never picks
         Estonia when forced_pool excludes it."""
         from unittest.mock import MagicMock
+
         from free_ip_pool import FreeIPPool
 
         # Build a minimal FreeIPPool in-memory (no network/docker)
@@ -402,6 +400,7 @@ class TestForcedPoolRotation:
         """When forced_pool is None, station must NOT be tagged with
         _geo_forced_pool — background rotation uses default country list."""
         from unittest.mock import MagicMock
+
         from free_ip_pool import FreeIPPool
 
         pool = object.__new__(FreeIPPool)

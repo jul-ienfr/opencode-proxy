@@ -6,7 +6,11 @@ Usage:
   python scripts/bench.py --url http://localhost:4000 --stream  # test SSE
 """
 
-import argparse, asyncio, time, json, statistics
+import argparse
+import asyncio
+import statistics
+import time
+
 import httpx
 
 

@@ -1,4 +1,5 @@
-import urllib.request, json
+import json
+import urllib.request
 
 # Check history API on port 4000
 r = urllib.request.urlopen("http://localhost:4000/api/history?limit=3", timeout=5)

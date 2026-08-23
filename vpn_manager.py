@@ -15,16 +15,15 @@ proxy_mode:
   - "direct": no proxy
 """
 
+import asyncio
+import json
+import logging
 import os
 import re
-import sys
-import time
-import json
-import asyncio
-import logging
 import shutil
 import subprocess
-from typing import Optional
+import sys
+import time
 
 # Cross-module registry of active VPN managers ([plan 18/08 §1]): set by
 # opencode.py's lifespan / _apply_station_count, read by _apply_stack to
@@ -483,7 +482,7 @@ def _classify_probe_exc(exc: BaseException) -> str:
     return "error"
 
 
-def _extract_current_hostname(text: str) -> Optional[str]:
+def _extract_current_hostname(text: str) -> str | None:
     """Last NordVPN hostname present in gluetun log text.
 
     gluetun's SIGUSR1 retry loop re-logs the SAME remote every ~11 s, so
@@ -528,7 +527,7 @@ class VPNManager:
         concern degrades to per-station local behavior — exact backward
         compatibility.
         """
-        self._shared: Optional[object] = shared
+        self._shared: object | None = shared
         self._config = cfg
         self._station = station
         self._mode = "docker"  # sole mode: compose-managed gluetun (free_ip_pool compat)
@@ -595,8 +594,8 @@ class VPNManager:
         self._control_enabled = bool(cfg.get("control_enabled", bool(self._control_api_key)))
         self._country_rotation = bool(cfg.get("country_rotation", False))
         self._country_offset = max(0, int(cfg.get("country_offset", 0) or 0))
-        self._current_country: Optional[str] = None  # pinned country (control server)
-        self._country_pinned_at: Optional[float] = None
+        self._current_country: str | None = None  # pinned country (control server)
+        self._country_pinned_at: float | None = None
         self._country_index = 0  # local cursor fallback (no shared state)
         # [plan 18/08] Hostname blacklist (LIVE AUTH_FAILED, TTL 24 h) —
         # consumed ONLY by the fast-pin path (Phase 1c); free_ip_pool never
@@ -681,15 +680,15 @@ class VPNManager:
         # so a stale worker thread finishing late skips its decrement instead
         # of corrupting the NEXT rotation's count (see _docker_run).
         self._rotation_op_generation = 0
-        self._rotation_op_event: Optional[asyncio.Event] = None
-        self._rotation_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._rotation_op_event: asyncio.Event | None = None
+        self._rotation_loop: asyncio.AbstractEventLoop | None = None
         # Pool-signal observability (am.23): the last real connection-
         # failure report (time + count) and the skipped-tick trace — per
         # ROTATION TASK, not a global flag (a flag that resets on any normal
         # tick loses the "lost pool wake on rotation X" trace; a per-task
         # pointer re-logs for each distinct rotation).
-        self._skipped_rotation_task: Optional[asyncio.Task] = None
-        self._last_conn_failure_at: Optional[float] = None
+        self._skipped_rotation_task: asyncio.Task | None = None
+        self._last_conn_failure_at: float | None = None
         self._conn_failure_signal_count = 0
         # [plan 18/08 §3c] Auto-mode reliability counters. Clock is
         # INJECTABLE (_now_fn) so tests can advance time without patching
@@ -697,13 +696,13 @@ class VPNManager:
         # time.monotonic.
         self._now_fn = time.monotonic
         self._auth_failed_window: list[float] = []  # monotonic ts, 30-min sliding
-        self._last_auto_flip_at: Optional[float] = None  # cooldown (monotonic)
-        self._stack_since: Optional[float] = None  # when the effective stack took over
+        self._last_auto_flip_at: float | None = None  # cooldown (monotonic)
+        self._stack_since: float | None = None  # when the effective stack took over
         self._auto_ov_fail_threshold = max(1, int(cfg.get("auto_ov_fail_threshold", 3)))
         self._auto_ov_return_min = max(1, int(cfg.get("auto_ov_return_min", 60)))
         self._auto_flip_cooldown_min = max(1, int(cfg.get("auto_flip_cooldown_min", 30)))
         self._flips: list[dict] = []  # journal [{time, from, to, reason}], cap 20
-        self._pending_flip: Optional[tuple] = None  # set inside the tick lock,
+        self._pending_flip: tuple | None = None  # set inside the tick lock,
         # applied AFTER it (_apply_stack takes the lock — not reentrant).
 
         # Identity rotation (client fingerprint, advanced on IP rotation).
@@ -720,7 +719,7 @@ class VPNManager:
             self._identity_profiles_base, self._identity_diversity, self._identity_max_profiles
         )
         self._identity_index = 0  # restored/clamped by load_state()
-        self._rotation_task: Optional[asyncio.Task] = None  # single-flight rotation ([1]+[18])
+        self._rotation_task: asyncio.Task | None = None  # single-flight rotation ([1]+[18])
 
         # Auto-update (gluetun image)
         self._update_enabled = cfg.get("update_enabled", True)
@@ -735,29 +734,29 @@ class VPNManager:
         self._update_apply_window = cfg.get("update_apply_window", "03:00-05:00")
         self._update_idle_minutes = cfg.get("update_apply_idle_minutes", 15)
         self._update_max_defer_hours = cfg.get("update_apply_max_defer_hours", 24)
-        self._update_task: Optional[asyncio.Task] = None
-        self._watchdog_task: Optional[asyncio.Task] = None
+        self._update_task: asyncio.Task | None = None
+        self._watchdog_task: asyncio.Task | None = None
         # Docker-events wake-up for the watchdog ([plan] C): created in
         # start() — inside the running loop — so a container die/restart is
         # acted on immediately instead of at the next interval.
-        self._watchdog_event: Optional[asyncio.Event] = None
-        self._startup_connect_task: Optional[asyncio.Task] = None
+        self._watchdog_event: asyncio.Event | None = None
+        self._startup_connect_task: asyncio.Task | None = None
         self._update_available = False
-        self._update_current_digest: Optional[str] = None
-        self._update_new_digest: Optional[str] = None
-        self._update_old_image_id: Optional[str] = None
-        self._update_known_since: Optional[float] = None
-        self._update_checked_at: Optional[str] = None
-        self._update_applied_at: Optional[str] = None
-        self._update_last_error: Optional[str] = None
-        self._last_free_request_at: Optional[float] = None
+        self._update_current_digest: str | None = None
+        self._update_new_digest: str | None = None
+        self._update_old_image_id: str | None = None
+        self._update_known_since: float | None = None
+        self._update_checked_at: str | None = None
+        self._update_applied_at: str | None = None
+        self._update_last_error: str | None = None
+        self._last_free_request_at: float | None = None
 
         # Runtime state
         self._status = VPNState.DISCONNECTED
-        self._error: Optional[str] = None
-        self._current_ip: Optional[str] = None
-        self._current_server: Optional[dict] = None
-        self._connected_at: Optional[float] = None
+        self._error: str | None = None
+        self._current_ip: str | None = None
+        self._current_server: dict | None = None
+        self._connected_at: float | None = None
         self._auth_failed = False
         self._server_issue = False  # TLS negotiation failure (stale/crashed server)
         # [plan 20/08] Healthcheck-restart loop visible in the container
@@ -768,7 +767,7 @@ class VPNManager:
         # bound against) — the scan window snaps to after it so a healed
         # tunnel is not re-flagged from its own pre-recovery history.
         self._restart_churn = False
-        self._restart_churn_recovered_at: Optional[float] = None
+        self._restart_churn_recovered_at: float | None = None
         self._total_switches = 0
         self._ip_history: list[dict] = []
         self._lock = asyncio.Lock()
@@ -778,16 +777,16 @@ class VPNManager:
         # (ensure_connected, switch_ip, on_quota_exhausted, manual) instead
         # of the old per-caller timer in free_ip_pool only.
         self._ROTATION_FAIL_COOLDOWN = max(5.0, float(cfg.get("rotation_fail_cooldown", 300)))
-        self._last_rotation_failed_at: Optional[float] = None
+        self._last_rotation_failed_at: float | None = None
         # Last rotation failure detail (G7): exposed via get_status — a dead
         # rotation must be visible in the dashboard/debug.log, not silent.
-        self._last_rotation_error: Optional[str] = None
+        self._last_rotation_error: str | None = None
         # [37] Dashboard cache: /api/vpn-status polls every 10 s and each
         # full refresh costs 2 docker subprocess calls + a tunnel HTTP probe.
         # Within _STATUS_CACHE_SECONDS of a completed refresh, refresh_status
         # returns the live in-memory state instead of re-probing docker.
         self._STATUS_CACHE_SECONDS = max(0.5, float(cfg.get("status_cache_seconds", 10.0)))
-        self._last_status_refresh_at: Optional[float] = None
+        self._last_status_refresh_at: float | None = None
         # Free streams currently open (updated by opencode.py via
         # note_free_stream_start/end) — auto-update must not interrupt them ([21]).
         self._active_free_streams = 0
@@ -809,7 +808,7 @@ class VPNManager:
         _wbase = max(1.0, float(cfg.get("watchdog_backoff_base", 30.0)))
         _wmax = max(_wbase, float(cfg.get("watchdog_backoff_max", 300.0)))
         self._watchdog_backoff = BackoffTimer(base_delay=_wbase, max_delay=_wmax)
-        self._watchdog_escalated_at: Optional[float] = None  # escalation re-arm: 30 min
+        self._watchdog_escalated_at: float | None = None  # escalation re-arm: 30 min
 
         self.load_state()
         if self._shared is not None:
@@ -850,7 +849,7 @@ class VPNManager:
         return self._status
 
     @property
-    def current_ip(self) -> Optional[str]:
+    def current_ip(self) -> str | None:
         return self._current_ip
 
     @property
@@ -888,7 +887,7 @@ class VPNManager:
         return self._identity_profiles[self._identity_index % len(self._identity_profiles)]
 
     @property
-    def current_server(self) -> Optional[dict]:
+    def current_server(self) -> dict | None:
         return self._current_server
 
     @property
@@ -1163,7 +1162,7 @@ class VPNManager:
                 raise RuntimeError(f"Cannot transition from {self._status} to connecting")
 
             old_ip = self._current_ip
-            last_error: Optional[Exception] = None
+            last_error: Exception | None = None
             # [plan 18/08 §C] per-rotation reset — the flag lives only for
             # this rotation's lifetime.
             self._rotation_probe_dead = False
@@ -1281,7 +1280,7 @@ class VPNManager:
                         self._set_status(VPNState.ERROR)
                         self._error = "rotation cancelled by client disconnect"
                         raise
-                    except asyncio.TimeoutError:
+                    except TimeoutError:
                         # The attempt burnt its budget. am.8: whatever
                         # docker op it left running is NOT finished
                         # (to_thread cannot be cancelled) — wait for its
@@ -1615,7 +1614,7 @@ class VPNManager:
             logger.error("[vpn] health check failed: %s", e)
         return result
 
-    async def _probe_url(self, url: str) -> Optional[str]:
+    async def _probe_url(self, url: str) -> str | None:
         """[plan 18/08 §A] One bounded IP GET through the SOCKS5 tunnel —
         the parallel unit of get_public_ip. Fresh coroutine per endpoint:
         the sweep's wait_for cancels it on budget overrun, __aexit__ closes
@@ -1631,7 +1630,7 @@ class VPNManager:
         except Exception:
             return None
 
-    async def get_public_ip(self) -> Optional[str]:
+    async def get_public_ip(self) -> str | None:
         """Query the public IP through the SOCKS5 tunnel (127.0.0.1:1080).
 
         Tries the ordered ``ip_check_urls`` chain (``ip_check_url`` stays
@@ -1652,7 +1651,7 @@ class VPNManager:
             results = await asyncio.wait_for(
                 asyncio.gather(*(self._probe_url(u) for u in urls)), self._ip_probe_budget
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             results = []  # sweep cancelled → total failure
         for i in range(len(urls)):
             idx = (base + i) % len(urls)  # scan in rotated order...
@@ -1685,7 +1684,6 @@ class VPNManager:
         declaring death — a slow-but-alive tunnel is no longer bad-marked
         as dead.
         """
-        import httpx
 
         try:
             urls = self._ip_check_urls or [self._ip_check_url]
@@ -2167,7 +2165,7 @@ class VPNManager:
     # ── Docker helpers (all blocking — run via asyncio.to_thread) ──
 
     def _docker_run(
-        self, args: list[str], timeout: int = 30, env: Optional[dict] = None
+        self, args: list[str], timeout: int = 30, env: dict | None = None
     ) -> subprocess.CompletedProcess:
         """Run a docker CLI command (blocking — call via asyncio.to_thread).
 
@@ -2222,7 +2220,7 @@ class VPNManager:
                 except RuntimeError:
                     pass  # loop already closed at shutdown — nothing to wake
 
-    def _compose_env(self, *, stations: Optional[list] = None, stack: Optional[str] = None) -> dict:
+    def _compose_env(self, *, stations: list | None = None, stack: str | None = None) -> dict:
         """Explicit environment for `docker compose` children.
 
         [plan 18/08 §2.1] The 19/08 root cause: settings.load_env_file()
@@ -2331,7 +2329,7 @@ class VPNManager:
     # discloses credentials; we track the country in our own state.
 
     async def _control_exec(
-        self, method: str, path: str, body: Optional[str] = None, timeout: float = 10.0
+        self, method: str, path: str, body: str | None = None, timeout: float = 10.0
     ) -> list[str]:
         """Run one wget call against gluetun's control server inside the
         container. Returns the decoded stdout lines on success, [] on any
@@ -2364,7 +2362,7 @@ class VPNManager:
         out = (result.stdout or "").splitlines()
         return [ln.strip() for ln in out if ln.strip()]
 
-    async def _control_status(self) -> Optional[bool]:
+    async def _control_status(self) -> bool | None:
         """True when gluetun reports the VPN running, False when stopped,
         None when the control server is unreachable (fail toward the
         SOCKS5/status fallback chain)."""
@@ -2378,7 +2376,7 @@ class VPNManager:
                 continue
         return None
 
-    async def _control_public_ip(self) -> Optional[str]:
+    async def _control_public_ip(self) -> str | None:
         """IP as reported BY gluetun (self-reported, not a tunnel probe)."""
         if not self._control_enabled:
             return None
@@ -2436,9 +2434,9 @@ class VPNManager:
                 hint = ""
                 if "choices" in lines[0].lower():
                     hint = (
-                        f" (gluetun reported this country name as "
-                        f'invalid / "not in choices" — check '
-                        f"server_countries)"
+                        " (gluetun reported this country name as "
+                        'invalid / "not in choices" — check '
+                        "server_countries)"
                     )
                 logger.warning("[vpn] control pin %s rejected: %s%s", country, lines[0][:200], hint)
                 return False
@@ -2516,7 +2514,7 @@ class VPNManager:
                 out.append(c)
         return out
 
-    def _local_next_country(self, previous: Optional[str]) -> Optional[str]:
+    def _local_next_country(self, previous: str | None) -> str | None:
         """Deterministic local fallback when the shared state / control
         server isn't available: walk the config list from the last pinned
         country. Never returns the same country twice in a row."""
@@ -2531,7 +2529,7 @@ class VPNManager:
         self._country_index = (self._country_index + 1) % len(countries)
         return nxt
 
-    def _countries_list_for_pool(self, forced_pool: Optional[set] = None) -> list:
+    def _countries_list_for_pool(self, forced_pool: set | None = None) -> list:
         """Countries list filtered to forced_pool when provided (P3 geo).
 
         Axe B: also intersects with geo_strict_union() when GEO strict
@@ -2646,7 +2644,7 @@ class VPNManager:
                 if ok:
                     self._current_country = pick
                     return True
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 logger.debug("[vpn] ensure_geo_egress timeout for %s", pick)
                 return False
             except Exception as e:
@@ -2658,10 +2656,10 @@ class VPNManager:
 
     async def _pin_country_for_rotation(
         self,
-        timeout: Optional[float] = None,
-        catchup: Optional[float] = None,
-        forced_pool: Optional[set] = None,
-    ) -> Optional[str]:
+        timeout: float | None = None,
+        catchup: float | None = None,
+        forced_pool: set | None = None,
+    ) -> str | None:
         """Advance the shared country cursor and pin the next country via
         the control server (PUT /v1/vpn/settings — a real reconnect).
 
@@ -2727,7 +2725,7 @@ class VPNManager:
             return nxt
         return None
 
-    async def _current_hostname(self, since: str) -> Optional[str]:
+    async def _current_hostname(self, since: str) -> str | None:
         """Hostname gluetun is currently trying — the LAST "[<host>] Peer
         Connection Initiated with [AF_INET]<ip>:1194" line (M_INFO, visible
         from the DEFAULT verbosity 1) in container logs written since
@@ -2808,7 +2806,7 @@ class VPNManager:
             # Finalize failed to land a fresh IP — try the next country.
         return False
 
-    def _next_country_preview(self) -> Optional[str]:
+    def _next_country_preview(self) -> str | None:
         """Best-effort preview of the next pinned country for the dashboard
         (the 'next country' cell). Mirrors _pin_country_for_rotation's pick
         WITHOUT advancing the shared cursor or the local fallback cursor."""
@@ -2851,7 +2849,7 @@ class VPNManager:
                 f"docker compose up failed: {result.stderr.strip() or result.stdout.strip()}"
             )
 
-    async def _ensure_container(self, force_recreate: Optional[bool] = None) -> None:
+    async def _ensure_container(self, force_recreate: bool | None = None) -> None:
         """Compose up if the container is absent, else restart it.
 
         ``force_recreate``: None → recreate when the last restart was a
@@ -2873,7 +2871,7 @@ class VPNManager:
     # [plan 18/08 §3b/3c] Stack selector (auto / wireguard / openvpn)
     # ------------------------------------------------------------------
 
-    def _auto_flip_decision(self) -> Optional[tuple]:
+    def _auto_flip_decision(self) -> tuple | None:
         """Auto-mode policy, called every watchdog tick INSIDE the lock with
         fresh counters. Returns (mode, reason) when a flip is due, else None.
         Only meaningful when self._stack == "auto"; a manual selection never
@@ -2973,7 +2971,7 @@ class VPNManager:
             # live there) — only the active stations' VPN_TYPE_STATION vars.
             data = ""
             try:
-                with open(env_path, "r", encoding="utf-8") as f:
+                with open(env_path, encoding="utf-8") as f:
                     data = f.read()
             except FileNotFoundError:
                 pass
@@ -3230,7 +3228,7 @@ class VPNManager:
             return True
         return False
 
-    async def _wait_healthy(self, timeout: float = 120.0) -> Optional[str]:
+    async def _wait_healthy(self, timeout: float = 120.0) -> str | None:
         """Wait until the container runs AND the SOCKS5 tunnel answers.
 
         Returns the container's StartedAt on success — callers bind their
@@ -3276,7 +3274,7 @@ class VPNManager:
         if self._active_free_streams > 0:
             self._active_free_streams -= 1
 
-    async def _docker_image_id(self, image: str) -> Optional[str]:
+    async def _docker_image_id(self, image: str) -> str | None:
         result = await asyncio.to_thread(
             self._docker_run, ["image", "inspect", image, "--format", "{{.Id}}"], 30
         )
@@ -3284,7 +3282,7 @@ class VPNManager:
             return None
         return result.stdout.strip() or None
 
-    async def _docker_repo_digest(self, image: str) -> Optional[str]:
+    async def _docker_repo_digest(self, image: str) -> str | None:
         result = await asyncio.to_thread(
             self._docker_run,
             ["image", "inspect", image, "--format", "{{index .RepoDigests 0}}"],
@@ -3439,7 +3437,7 @@ class VPNManager:
             finally:
                 self._release_update_lock()
 
-    async def _rollback_update(self, old_image_id: Optional[str]) -> None:
+    async def _rollback_update(self, old_image_id: str | None) -> None:
         """Best-effort rollback: re-tag the previous image and recreate."""
         if not old_image_id:
             logger.error("[vpn-update] no previous image ID — cannot roll back")
@@ -3605,7 +3603,7 @@ class VPNManager:
                 try:
                     await asyncio.wait_for(self._watchdog_event.wait(), timeout=delay)
                     self._watchdog_event.clear()
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     pass
             else:
                 await asyncio.sleep(delay)
@@ -3645,7 +3643,7 @@ class VPNManager:
                 tunnel_alive = await asyncio.wait_for(
                     self._probe_tunnel_light(), self._ip_probe_budget
                 )
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 # [plan 19/08] Half-open tunnel (TCP accepted, SOCKS5/CONNECT
                 # never answers — gluetun healthcheck-restart signature): the
                 # sweep worst case (n endpoints × probe + close) exceeds the
@@ -3940,7 +3938,7 @@ class VPNManager:
             state_path = self._get_state_path()
             if not os.path.exists(state_path):
                 return
-            with open(state_path, "r") as f:
+            with open(state_path) as f:
                 state = json.load(f)
             self._ip_history = state.get("ip_history", [])
             self._total_switches = state.get("total_switches", 0)
@@ -4004,7 +4002,7 @@ class VPNManager:
 
 
 def _docker_cli(
-    args: list[str], timeout: int = 30, env: Optional[dict] = None
+    args: list[str], timeout: int = 30, env: dict | None = None
 ) -> subprocess.CompletedProcess:
     """Blocking docker CLI call WITHOUT the rotation funnel.
 
@@ -4028,7 +4026,7 @@ def _docker_cli(
         raise RuntimeError("docker CLI not found on PATH")
 
 
-def _env_value_from_inspect(info: dict, key: str) -> Optional[str]:
+def _env_value_from_inspect(info: dict, key: str) -> str | None:
     """Read one Config.Env entry from a docker inspect payload.
 
     Config.Env is a list of "KEY=VALUE" strings; the compose interpolation

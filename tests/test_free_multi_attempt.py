@@ -265,7 +265,7 @@ async def test_non_stream_429_retries_fresh_station(free_vpn_env, free_cfg, monk
     # Quota counter advances exactly once for the whole request
     assert pool.requests == 1
     # Invariant A.0 on EVERY free attempt (each station sees clean headers)
-    for i, (headers, body) in enumerate(zip(fake.headers, fake.bodies)):
+    for i, (headers, body) in enumerate(zip(fake.headers, fake.bodies, strict=False)):
         assert_no_paid_artifacts(f"non-stream attempt {i + 1}", headers, json.dumps(body))
         assert json.loads(json.dumps(body))["model"] == FREE_MODEL
 
@@ -594,8 +594,8 @@ async def test_stream_tunnel_failure_raises_free_tunnel_failure(
     with pytest.raises(oc._FreeTunnelFailure) as excinfo:
         async with oc._open_free_stream(
             oc.API_BASE_FREE, body, dict(PAID_HEADERS), use_free=True, direct_fallback=False
-        ) as resp:
-            assert False, "the CM must not yield on a dead tunnel in station-first mode"
+        ):
+            raise AssertionError("the CM must not yield on a dead tunnel in station-first mode")
     assert excinfo.value.station is a, (
         "the re-raised failure must carry the DEAD station (next attempt excludes it)"
     )

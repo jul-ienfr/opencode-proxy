@@ -8,7 +8,8 @@ CRITIC(5)(6) rotation failure honesty, CRITIC(11) quota hot-reload,
 Run: python scripts/smoke_todo10.py
 """
 
-import sys, time
+import sys
+import time
 
 sys.path.insert(0, ".")
 
@@ -68,6 +69,7 @@ def main():
 
     # ---- [0]/[42] rotation scheduled on 429 (restored per user demand) ----
     import asyncio
+
     import free_ip_pool
 
     async def _check_429_rotation():
@@ -122,7 +124,11 @@ def main():
     print("PASS Path A timeout (30, 600) ([6])")
 
     # ============ TODO-8: [17][19][20][21][27][46] + CRITIC(5)(6)(11) + [25] ============
-    import vpn_manager, tempfile, json as json_mod, os
+    import json as json_mod
+    import os
+    import tempfile
+
+    import vpn_manager
 
     def _bare_vpn():
         """VPNManager without __init__ — never touches live state/state file."""

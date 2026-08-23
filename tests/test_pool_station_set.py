@@ -18,7 +18,6 @@ test_pool_connection_failure.py, no docker, no loop tasks unless noted):
 """
 
 import asyncio
-import time
 
 import pytest
 

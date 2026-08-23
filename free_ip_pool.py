@@ -20,11 +20,10 @@ strict-free GUI option refusing to pay when every station is
 exhausted.
 """
 
-import time
-import logging
 import asyncio
+import logging
+import time
 import urllib.parse
-from typing import Optional
 
 from vpn_manager import RotationFailed, VPNManager
 
@@ -111,7 +110,7 @@ class FreeIPPool:
     # a persistently flapping tunnel must not hot-loop the docker stack.
     _POST_COMMIT_RETRY_MAX = 2
 
-    def __init__(self, vpn_manager: VPNManager, vpn_manager_2: Optional[VPNManager] = None):
+    def __init__(self, vpn_manager: VPNManager, vpn_manager_2: VPNManager | None = None):
         self._vpn = vpn_manager  # station 1 (legacy attribute — always present)
         self._stations = [vpn_manager]
         if vpn_manager_2 is not None:
@@ -121,7 +120,7 @@ class FreeIPPool:
         # request handler holding a RETIRED manager must not re-queue it
         # after a downscale).
         self._station_ids = {m._station for m in self._stations}
-        self._active_station: Optional[VPNManager] = None  # last station used by on_request
+        self._active_station: VPNManager | None = None  # last station used by on_request
         self._total_free_requests = 0
         # Per-station state (request counters, IP stats, 429-bad TTL...)
         self._per: dict[int, dict] = {}
@@ -191,7 +190,7 @@ class FreeIPPool:
         return len(self._stations) > 1
 
     @property
-    def proxy_url(self) -> Optional[str]:
+    def proxy_url(self) -> str | None:
         """Return the SOCKS5 proxy URL of the best available station.
 
         Gluetun is the only backend (compose-managed Docker): free requests
@@ -214,7 +213,7 @@ class FreeIPPool:
         return best.socks5_url
 
     @property
-    def active_station(self) -> Optional[VPNManager]:
+    def active_station(self) -> VPNManager | None:
         """The station used by the last ``on_request()`` call.
 
         ``None`` when no free request went through the pool yet, or the
@@ -297,7 +296,7 @@ class FreeIPPool:
             return False
         return True
 
-    def _best_station(self, forced_pool=None) -> Optional[VPNManager]:
+    def _best_station(self, forced_pool=None) -> VPNManager | None:
         """Best station for the next request — preference A (station 1)
         unless it is bad (recent 429) or its tunnel is down.
 
@@ -315,7 +314,7 @@ class FreeIPPool:
 
     def _best_station_excluding(
         self, station: VPNManager, forced_pool=None
-    ) -> Optional[VPNManager]:
+    ) -> VPNManager | None:
         """Best station other than ``station`` (for an immediate dual-clutch
         switch when the current one approaches quota)."""
         for exclude_approaching in (True, False):
@@ -328,7 +327,7 @@ class FreeIPPool:
                     return st
         return None
 
-    def _best_station_excluding_many(self, excluded: set, forced_pool=None) -> Optional[VPNManager]:
+    def _best_station_excluding_many(self, excluded: set, forced_pool=None) -> VPNManager | None:
         """Best station NOT in ``excluded`` (cumulative retries: never
         re-strike an IP/bucket already used in this request's free attempts)."""
         for exclude_approaching in (True, False):
@@ -373,7 +372,7 @@ class FreeIPPool:
             return False
         return self._station_usable(ep, exclude_approaching=exclude_approaching)
 
-    def _socks5_next(self, excluded=None) -> Optional[Socks5Endpoint]:
+    def _socks5_next(self, excluded=None) -> Socks5Endpoint | None:
         """Next static proxy in round-robin order.
 
         Two passes (like ``_best_station_excluding``): the preferred pass
@@ -400,7 +399,7 @@ class FreeIPPool:
                     return ep
         return None
 
-    def _socks5_best_excluding(self, ep) -> Optional[Socks5Endpoint]:
+    def _socks5_best_excluding(self, ep) -> Socks5Endpoint | None:
         """Next usable proxy that is NOT ``ep`` (for a dual-clutch switch
         when the current one approaches quota)."""
         return self._socks5_next(excluded={ep})
@@ -542,7 +541,7 @@ class FreeIPPool:
         per["last_connect_attempt"] = now
         self._launch_rotation(station)
 
-    async def on_request(self, forced_pool=None) -> tuple[Optional[str], Optional[VPNManager]]:
+    async def on_request(self, forced_pool=None) -> tuple[str | None, VPNManager | None]:
         """Called before each free model request.
 
         Returns ``(proxy_url, station)`` — the SOCKS5 URL of the best
@@ -740,7 +739,7 @@ class FreeIPPool:
 
         return None, None
 
-    async def switch_ip(self, station: Optional[VPNManager] = None) -> str:
+    async def switch_ip(self, station: VPNManager | None = None) -> str:
         """Switch the given station (default: the active/last used one) to
         a fresh VPN IP — honest single attempt (CRITIC(5)).
 
@@ -775,7 +774,7 @@ class FreeIPPool:
         return new_ip
 
     def on_quota_exhausted(
-        self, station: Optional[VPNManager] = None, forced_pool: Optional[set] = None
+        self, station: VPNManager | None = None, forced_pool: set | None = None
     ):
         """Free quota exhausted (429): mark the station bad and rotate it
         in the background — the next request lands on the other station.
@@ -833,8 +832,8 @@ class FreeIPPool:
         self._launch_rotation(station, forced_pool=forced_pool)
 
     async def on_disconnect_retry(
-        self, failed: Optional[VPNManager] = None, forced_pool=None
-    ) -> tuple[Optional[str], Optional[VPNManager]]:
+        self, failed: VPNManager | None = None, forced_pool=None
+    ) -> tuple[str | None, VPNManager | None]:
         """Pick a DIFFERENT station for a retry after an upstream disconnect.
 
         The stream retry loop used to re-strike the SAME station/proxy that
@@ -1048,7 +1047,7 @@ class FreeIPPool:
                 try:
                     if remaining > 0:
                         await asyncio.wait_for(asyncio.shield(task), remaining)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     return False
                 # [Revue 19/08] The post-commit probe [Axe 1.2] can stamp a
                 # bad_until on the FRESH IP BEFORE this waiter wakes (the
@@ -1078,7 +1077,7 @@ class FreeIPPool:
         for _ in range(self._ROTATION_CONCURRENCY - len(self._worker_tasks)):
             self._worker_tasks.append(asyncio.create_task(self._rotation_worker()))
 
-    def _launch_rotation(self, station: VPNManager, forced_pool: Optional[set] = None) -> None:
+    def _launch_rotation(self, station: VPNManager, forced_pool: set | None = None) -> None:
         """Queue a background rotation for one station (C4/C5).
 
         Bounded concurrency [Axe 1.1]: up to ``_ROTATION_CONCURRENCY``

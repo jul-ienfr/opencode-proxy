@@ -9,8 +9,8 @@ delivered event per subscriber per 500 ms — the dashboard only needs the
 freshest snapshot, and the SSE stream must not be flooded.
 """
 
-import json
 import asyncio
+import json
 import logging
 import threading
 import time
@@ -36,7 +36,7 @@ class EventManager:
         #                   vpn_event (replaced on each new burst frame).
         self._vpn_last: dict = {}
         self._vpn_pending: dict = {}
-        self._flush_task: "asyncio.Task | None" = None
+        self._flush_task: asyncio.Task | None = None
 
     async def subscribe(self):
         queue = asyncio.Queue(maxsize=256)

@@ -8,7 +8,9 @@ and yields httpx-style STR lines.
 Run: python scripts/smoke_todo41.py
 """
 
-import sys, json, asyncio
+import asyncio
+import json
+import sys
 
 sys.path.insert(0, ".")
 
@@ -51,7 +53,7 @@ async def main():
     ]  # cut between \r and \n
     mid += [3, 15, 40, 52, 66, 79, 90, 105]
     chunks = _chunks(payload, sorted(set(mid)))
-    assert any(c.endswith(b"\r") and n.startswith(b"\n") for c, n in zip(chunks, chunks[1:])), (
+    assert any(c.endswith(b"\r") and n.startswith(b"\n") for c, n in zip(chunks, chunks[1:], strict=False)), (
         "test must split \\r from \\n across chunks"
     )
 

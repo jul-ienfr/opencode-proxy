@@ -5,37 +5,35 @@ Tests protocol conversions, circuit breaker, rate limiter,
 token estimation, and route matching.
 """
 
-import json
-import time
 import asyncio
-import pytest
-import sys
+import json
 import os
+import sys
+import time
+
+import pytest
 
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import opencode as _opencode_mod
+from config.settings import KNOWN_PROTOCOLS, _resolve_protocol
 from opencode import (
-    anthropic_to_openai,
-    anthropic_to_openai_response,
-    openai_to_anthropic,
-    openai_to_anthropic_request,
-    openai_chat_to_responses,
-    openai_responses_to_anthropic,
-    anthropic_to_openai_responses,
-    _chat_to_responses_request,
-    _estimate_tokens,
-    _route_for,
-    _CircuitBreaker,
     _CB_FAILURE_THRESHOLD,
     _CB_RECOVERY_TIMEOUT,
     _Bucket,
-    RATE_LIMIT_RPS,
-    RATE_LIMIT_BURST,
+    _chat_to_responses_request,
+    _CircuitBreaker,
+    _estimate_tokens,
+    _route_for,
+    anthropic_to_openai,
+    anthropic_to_openai_response,
+    anthropic_to_openai_responses,
+    openai_chat_to_responses,
+    openai_responses_to_anthropic,
+    openai_to_anthropic,
+    openai_to_anthropic_request,
 )
-from config.settings import _resolve_protocol, KNOWN_PROTOCOLS
-
 
 # ── Protocol Conversions ────────────────────────────────────────
 
@@ -923,9 +921,9 @@ class TestResolveProtocol:
         """Verify all expected families are in the registry."""
         expected_openai = {"glm", "kimi", "deepseek", "mimo"}
         expected_anthropic = {"minimax", "qwen"}
-        assert expected_openai.issubset(set(k for k, v in KNOWN_PROTOCOLS.items() if v == "openai"))
+        assert expected_openai.issubset({k for k, v in KNOWN_PROTOCOLS.items() if v == "openai"})
         assert expected_anthropic.issubset(
-            set(k for k, v in KNOWN_PROTOCOLS.items() if v == "anthropic")
+            {k for k, v in KNOWN_PROTOCOLS.items() if v == "anthropic"}
         )
 
 

@@ -3,10 +3,48 @@ Middleware: rate limiting (token bucket) + circuit breaker.
 Extracted from opencode.py (P3.10).
 """
 
-import time
+import asyncio
+import json
 import os
-import threading
+import time
+
 from config import yaml_get
+from traffic_capture import (
+    capture as _traffic_capture,  # noqa: E402  # configure after class defs, import kept top-level
+)
+
+try:
+    from dashboard.display import debug as _debug
+    from dashboard.display import log as _log
+except ImportError:  # pragma: no cover - fallback for tests without dashboard
+
+    def _debug(msg: str) -> None:  # type: ignore[no-redef]
+        pass
+
+    def _log(msg: str) -> None:  # type: ignore[no-redef]
+        print(msg)
+
+
+def _json_dumps(obj) -> bytes:
+    try:
+        import orjson as _orjson
+
+        return _orjson.dumps(obj)
+    except ImportError:
+        return json.dumps(obj, ensure_ascii=False).encode()
+
+
+def _json_loads(data: bytes | str):
+    try:
+        import orjson as _orjson
+
+        if isinstance(data, str):
+            data = data.encode()
+        return _orjson.loads(data)
+    except ImportError:
+        if isinstance(data, bytes):
+            data = data.decode()
+        return json.loads(data)
 
 RATE_LIMIT_RPS = float(os.environ.get("RATE_LIMIT_RPS", str(yaml_get("rate_limit", "rps", 50))))
 RATE_LIMIT_BURST = float(
@@ -165,8 +203,6 @@ class AccessLogMiddleware:
 # ring buffer served by /api/traffic/*. Excludes /static, /health and
 # itself. Configurable via the `traffic:` block in config.yaml.
 
-from traffic_capture import capture as _traffic_capture, TrafficCaptureMiddleware
-
 _traffic_capture.configure(
     enabled=bool(yaml_get("traffic", "enabled", True)),
     max_frames=int(yaml_get("traffic", "max_frames", 500)),
@@ -225,7 +261,7 @@ class _CircuitBreaker:
             # Failure during half-open test → immediately reopen
             self.state = "open"
             self.opened_at = time.monotonic()
-            _debug(f"  [cb] half_open → open (test request failed)")
+            _debug("  [cb] half_open → open (test request failed)")
         elif self.failures >= _CB_FAILURE_THRESHOLD:
             self.state = "open"
             self.opened_at = time.monotonic()
@@ -237,7 +273,7 @@ class _CircuitBreaker:
         if self.state == "open":
             if time.monotonic() - self.opened_at >= _CB_RECOVERY_TIMEOUT:
                 self.state = "half_open"
-                _debug(f"  [cb] open → half_open (cooldown expired)")
+                _debug("  [cb] open → half_open (cooldown expired)")
                 return True  # allow one test request
             remaining = _CB_RECOVERY_TIMEOUT - (time.monotonic() - self.opened_at)
             _debug(f"  [cb] DENIED (state=open, cooldown={remaining:.0f}s remaining)")

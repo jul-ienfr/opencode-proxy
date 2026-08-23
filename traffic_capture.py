@@ -24,8 +24,6 @@ from __future__ import annotations
 import re
 import time
 from collections import deque
-from typing import Optional
-
 
 # Body stored per frame, above which the raw dump is truncated (bytes).
 _DEF_BODY_CAP = 131072  # 128 KiB
@@ -127,7 +125,7 @@ class _Frame:
         query: str,
         version: str,
         client_ip: str,
-        client_port: Optional[int],
+        client_port: int | None,
         headers: list[tuple[str, str]],
     ):
         self.id = fid
@@ -140,14 +138,14 @@ class _Frame:
         self.client_ip = client_ip
         self.client_port = client_port
         self.headers = headers
-        self.body: Optional[bytes] = None  # set at completion
+        self.body: bytes | None = None  # set at completion
         self.body_len = 0  # full wire byte count
         self.truncated = False
-        self.status: Optional[int] = None  # None while in flight
-        self.ttfb_ms: Optional[float] = None
-        self.duration_ms: Optional[float] = None
+        self.status: int | None = None  # None while in flight
+        self.ttfb_ms: float | None = None
+        self.duration_ms: float | None = None
         self.aborted = False
-        self.abort_reason: Optional[str] = None
+        self.abort_reason: str | None = None
 
     # ── JSON projections (kept out of this module's hot path) ──
     @property
@@ -183,7 +181,13 @@ class _Frame:
 class TrafficCapture:
     """Bounded ring buffer of raw client request frames."""
 
-    def __init__(self):
+    def __init__(
+        self,
+        max_frames: int | None = None,
+        body_cap: int | None = None,
+        max_bytes: int | None = None,
+        enabled: bool | None = None,
+    ):
         self.enabled = True
         self.max_frames = _DEF_MAX_FRAMES
         self.body_cap = _DEF_BODY_CAP
@@ -192,7 +196,11 @@ class TrafficCapture:
         self._by_id: dict[int, _Frame] = {}
         self._counter = 0
         self._bytes = 0
-        self._last_ts: Optional[float] = None
+        self._last_ts: float | None = None
+        if any(v is not None for v in (max_frames, body_cap, max_bytes, enabled)):
+            self.configure(
+                enabled=enabled, max_frames=max_frames, body_cap=body_cap, max_bytes=max_bytes
+            )
 
     def configure(
         self,
@@ -224,7 +232,7 @@ class TrafficCapture:
         query: str,
         version: str,
         client_ip: str,
-        client_port: Optional[int],
+        client_port: int | None,
         headers: list[tuple[str, str]],
     ) -> _Frame:
         """Register a pending frame; evict when over the budgets."""
@@ -268,11 +276,11 @@ class TrafficCapture:
     def _finish(
         self,
         frame: _Frame,
-        status: Optional[int],
-        ttfb_ms: Optional[float],
+        status: int | None,
+        ttfb_ms: float | None,
         duration_ms: float,
         aborted: bool,
-        abort_reason: Optional[str],
+        abort_reason: str | None,
     ) -> None:
         """Complete a pending frame (called exactly once at the end)."""
         if frame.id not in self._by_id:
@@ -336,11 +344,11 @@ class TrafficCapture:
         self,
         limit: int = 200,
         offset: int = 0,
-        method: Optional[str] = None,
-        path: Optional[str] = None,
-        status: Optional[int] = None,
-        aborted: Optional[bool] = None,
-        since: Optional[float] = None,
+        method: str | None = None,
+        path: str | None = None,
+        status: int | None = None,
+        aborted: bool | None = None,
+        since: float | None = None,
     ) -> list[dict]:
         """Newest-first slice of frame metadata (no bodies)."""
         limit = max(1, min(limit, 1000))
@@ -364,7 +372,7 @@ class TrafficCapture:
                 break
         return out
 
-    def frame_detail(self, fid: int) -> Optional[dict]:
+    def frame_detail(self, fid: int) -> dict | None:
         f = self._by_id.get(fid)
         if f is None:
             return None
@@ -401,7 +409,7 @@ class TrafficCapture:
 
         top_paths = sorted(paths.items(), key=lambda kv: (-kv[1], kv[0]))[:10]
 
-        def _summ(vals: list[float]) -> Optional[dict]:
+        def _summ(vals: list[float]) -> dict | None:
             if not vals:
                 return None
             s = sorted(vals)
@@ -455,7 +463,7 @@ class TrafficCaptureMiddleware:
     pass straight through to the handler.
     """
 
-    def __init__(self, app, capture: Optional[TrafficCapture] = None):
+    def __init__(self, app, capture: TrafficCapture | None = None):
         self.app = app
         self._capture = capture or capture
 
@@ -514,7 +522,7 @@ class TrafficCaptureMiddleware:
                 frame.ttfb_ms = (time.monotonic() - start) * 1000.0
             await send(message)
 
-        error: Optional[Exception] = None
+        error: Exception | None = None
         try:
             await self.app(scope, receive_wrapper, send_wrapper)
         except Exception as e:  # noqa: BLE001 — record, then re-raise

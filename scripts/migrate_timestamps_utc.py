@@ -32,7 +32,7 @@ import re
 import shutil
 import sqlite3
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_DB = os.path.join(ROOT, "logs", "requests.db")
@@ -141,7 +141,7 @@ def _migrate(conn: sqlite3.Connection) -> tuple[dict, int]:
             new_ts = (
                 datetime.fromisoformat(ts)
                 .astimezone()
-                .astimezone(timezone.utc)
+                .astimezone(UTC)
                 .strftime("%Y-%m-%dT%H:%M:%SZ")
             )
             conn.execute(

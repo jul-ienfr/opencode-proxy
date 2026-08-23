@@ -23,8 +23,6 @@ class is pure sync — mutate + persist in one call, no await.
 import json
 import time
 
-import pytest
-
 from shared_rotation import SharedRotationState
 
 

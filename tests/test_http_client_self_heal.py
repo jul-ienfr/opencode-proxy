@@ -28,7 +28,6 @@ Covered here (offline, monkeypatched doubles — no sockets, no VPN, no DB):
 
 from contextlib import asynccontextmanager
 
-import httpx
 import pytest
 
 import opencode as oc  # module-level import (established pattern)

@@ -28,10 +28,10 @@ import asyncio
 import time
 
 import pytest
+from test_vpn_freshness import FakeVPNManager, _cfg
 
 import free_ip_pool as fip
 import shared_state
-from test_vpn_freshness import FakeVPNManager, _cfg
 
 
 def _pool(tmp_path, n):
@@ -278,8 +278,8 @@ async def test_apply_station_count_downscale_cancels_before_stop(tmp_path, monke
     the retired station's in-flight rotation BEFORE stop()/stop_container()
     — no docker op of the rotation lands after the cancel, the registry /
     pool / watcher converge, and config.yaml persists the new count."""
-    import opencode
     import dashboard.api as dapi
+    import opencode
 
     ms = [FakeVPNManager(_cfg(tmp_path), station=s, tmp_path=tmp_path) for s in range(1, 4)]
     pool = fip.FreeIPPool(ms[0], ms[1])

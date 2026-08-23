@@ -1,4 +1,5 @@
 import pystray
+
 from .icon import running_icon, stopped_icon
 from .window import DashboardWindow
 

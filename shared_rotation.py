@@ -24,12 +24,11 @@ gracefully — the existing len<=1 gate in VPNManager.current_identity
 already pins everyone to profile[0].
 """
 
+import calendar
+import json
+import logging
 import os
 import time
-import json
-import calendar
-import logging
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +39,7 @@ def _now_utc() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
-def _parse_utc(value: str) -> Optional[float]:
+def _parse_utc(value: str) -> float | None:
     """Parse a UTC 'YYYY-mm-ddTHH:MM:SSZ' timestamp into epoch seconds."""
     try:
         return calendar.timegm(time.strptime(value, "%Y-%m-%dT%H:%M:%SZ"))
@@ -79,7 +78,7 @@ class SharedRotationState:
         self._last_index_by_station: dict[int, int] = {}
         self._country_cursor: int = 0  # ABSOLUTE monotone country counter
         self._last_country_by_station: dict[int, int] = {}
-        self._saved_at: Optional[str] = None
+        self._saved_at: str | None = None
         self._load()
 
     # ── Registry access ─────────────────────────────────────────
@@ -310,7 +309,7 @@ class SharedRotationState:
         try:
             if not os.path.exists(self._file):
                 return
-            with open(self._file, "r") as f:
+            with open(self._file) as f:
                 state = json.load(f)
             events = state.get("ip_events")
             if isinstance(events, list):

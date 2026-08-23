@@ -2,51 +2,53 @@
 Dashboard API endpoints: stats, logs, history, config, static files.
 """
 
-import json
-import os
-import sys
-import time
 import asyncio
 import hmac
+import json
+import os
 import re
 import socket
 import subprocess
+import sys
 import threading
+import time
+from datetime import UTC, datetime, timedelta
+
+from fastapi import Request, Response
+from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+
+import config.settings as config_settings
+from config import (
+    API_KEY,
+    API_KEY_ROUTING,
+    API_KEYS,
+    HOST,
+    MODELS,
+    PORT,
+    PROXY,
+    WEB_PORT,
+    apply_server_changes,
+    save_api_keys,
+    save_custom_routes,
+    save_env,
+)
+from traffic_capture import capture as _traffic_capture
+
+from .display import debug as _debug
+from .display import log_lines
+from .events import get_event_manager
+from .quota import (
+    get_available_models,
+    get_model_capabilities_for_all,
+    get_model_limits_for_all,
+    get_quota_snapshot,
+)
 
 # Windows: masquer la fenêtre console des subprocess (évite le flash noir 1s)
 _CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
 if hasattr(subprocess, "CREATE_NO_WINDOW"):
     _CREATE_NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-from datetime import datetime, timedelta, timezone
-from fastapi import Request, Response
-from fastapi.responses import StreamingResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
-
-from config import (
-    MODELS,
-    HOST,
-    PORT,
-    WEB_PORT,
-    PROXY,
-    API_KEY,
-    save_env,
-    apply_server_changes,
-    save_custom_routes,
-    API_KEYS,
-    save_api_keys,
-    API_KEY_ROUTING,
-)
-import config.settings as config_settings
-from .display import log_lines, debug as _debug
-from .events import get_event_manager
-from .quota import (
-    get_quota_snapshot,
-    get_available_models,
-    get_model_limits_for_all,
-    get_model_capabilities_for_all,
-)
-
-from traffic_capture import capture as _traffic_capture
 
 # Tools that work on all models — hidden from routing UI by default
 UNIVERSAL_TOOLS = {"Read", "Write", "Edit", "Bash", "Grep", "Glob", "WebSearch"}
@@ -117,7 +119,6 @@ try:
                 os.path.join(
                     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.yaml"
                 ),
-                "r",
                 encoding="utf-8",
             ) as _f:
                 _yw = _yaml_warn.safe_load(_f) or {}
@@ -318,7 +319,7 @@ def _date_bound_to_utc(date_str: str, end_of_day: bool) -> str:
     local = (
         local_midnight + timedelta(days=1) - timedelta(seconds=1) if end_of_day else local_midnight
     )
-    return local.astimezone().astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return local.astimezone().astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _normalize_date_bound(value, end_of_day: bool):
@@ -330,7 +331,7 @@ def _normalize_date_bound(value, end_of_day: bool):
 
 def daysAgo(n: int) -> str:
     """Instant UTC exact à J-n (timestamp complet avec Z ; passe _build_where inchangé)."""
-    return (datetime.now(timezone.utc) - timedelta(days=n)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return (datetime.now(UTC) - timedelta(days=n)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 _persist_lock = __import__("threading").Lock()
@@ -346,7 +347,7 @@ def _persist_vpn_config(updates: dict):
         if not os.path.exists(config_path):
             return
         with _persist_lock:
-            with open(config_path, "r", encoding="utf-8") as f:
+            with open(config_path, encoding="utf-8") as f:
                 config = yaml.safe_load(f) or {}
 
             ip_rot = config.get("ip_rotation", {})
@@ -524,7 +525,7 @@ def _persist_free_model_map(mapping: dict):
         config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "config.yaml")
         if not os.path.exists(config_path):
             return
-        with open(config_path, "r", encoding="utf-8") as f:
+        with open(config_path, encoding="utf-8") as f:
             config = yaml.safe_load(f) or {}
         config["free_model_map"] = dict(mapping)
         with open(config_path, "w", encoding="utf-8") as f:
@@ -709,8 +710,8 @@ def _socks5_raw_get(proxy_host: str, proxy_port: int, target: str, timeout: floa
     socks-extras dependency). Returns (status, body, elapsed_seconds);
     raises on connectivity failure. The CONNECT handshake doubles as the
     proxy liveness probe."""
-    import ssl
     import ipaddress
+    import ssl
     from urllib.parse import urlsplit
 
     u = urlsplit(target)
@@ -1588,7 +1589,7 @@ def register_dashboard(
                 "COALESCE(SUM(tokens_output), 0) as output_tokens, "
                 "COALESCE(SUM(tokens_cache), 0) as cache_tokens, "
                 "COALESCE(AVG(duration_ms), 0) as avg_duration "
-                "FROM requests " + where + f" GROUP BY period ORDER BY period",
+                "FROM requests " + where + " GROUP BY period ORDER BY period",
                 params,
             ).fetchall()
             return rows
@@ -1667,7 +1668,7 @@ def register_dashboard(
 
             def _read_all():
                 """Read the whole file (fine for files up to 50 MB)."""
-                with open(debug_log_path, "r", encoding="utf-8", errors="replace") as f:
+                with open(debug_log_path, encoding="utf-8", errors="replace") as f:
                     all_lines = f.readlines()
                 total = len(all_lines)
                 # Most-recent-first, paginated
@@ -1735,7 +1736,7 @@ def register_dashboard(
     async def event_stream(request: Request):
         manager = get_event_manager()
         queue = await manager.subscribe()
-        _debug(f"  [sse] new SSE subscriber")
+        _debug("  [sse] new SSE subscriber")
 
         async def event_generator():
             try:
@@ -1744,7 +1745,7 @@ def register_dashboard(
                     try:
                         payload = await asyncio.wait_for(queue.get(), timeout=30)
                         yield payload
-                    except asyncio.TimeoutError:
+                    except TimeoutError:
                         # Check if client disconnected during idle period
                         if await request.is_disconnected():
                             break
@@ -1867,7 +1868,7 @@ def register_dashboard(
 
         QUOTA_WINDOW_HOURS = 48
         now = datetime.utcnow()
-        for ip_addr, ip_data in by_ip.items():
+        for _ip_addr, ip_data in by_ip.items():
             try:
                 last = datetime.fromisoformat(ip_data["last_seen"])
                 if last.tzinfo is not None:
@@ -2468,7 +2469,7 @@ def register_dashboard(
         username_saved = ""
         if exists:
             try:
-                with open(cred_path, "r", encoding="utf-8") as f:
+                with open(cred_path, encoding="utf-8") as f:
                     for line in f:
                         if line.startswith("OPENVPN_USER="):
                             username_saved = line.split("=", 1)[1].strip()

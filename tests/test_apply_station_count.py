@@ -17,16 +17,15 @@ Offline: ``vpn_manager.VPNManager`` is monkeypatched by a stub whose
 exercised for real. Nothing touches the live system.
 """
 
-import os
 
 import pytest
+from test_vpn_freshness import _cfg
+from test_vpn_stack_nstation import _env_map, _Rec, _seed_env
 
+import dashboard.api as api
 import opencode
 import shared_state
 import vpn_manager
-import dashboard.api as api
-from test_vpn_freshness import _cfg
-from test_vpn_stack_nstation import _Rec, _env_map, _seed_env
 
 
 class _StubMgr:

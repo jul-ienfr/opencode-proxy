@@ -27,9 +27,9 @@ import subprocess
 import time
 
 import pytest
+from test_vpn_freshness import FakeVPNManager, _cfg
 
 import vpn_manager as vm
-from test_vpn_freshness import FakeVPNManager, _cfg
 
 MARKER = "restarting VPN because it failed to pass the healthcheck: vpn tunnel down"
 

@@ -11,12 +11,22 @@ testable (discover_free_models) et le point d'entrée unique.
 """
 
 from config.settings import (
-    FREE_MODEL_MAP as FREE_MODEL_MAP,
-    FREE_MODELS as FREE_MODELS,
-    FREE_DISCOVERY_ENABLED as FREE_DISCOVERY_ENABLED,
-    FREE_DISCOVERY_INTERVAL as FREE_DISCOVERY_INTERVAL,
     FREE_DISCOVERY_AUTO_PERSIST as FREE_DISCOVERY_AUTO_PERSIST,
+)
+from config.settings import (
     FREE_DISCOVERY_DEFAULT_TARGET as FREE_DISCOVERY_DEFAULT_TARGET,
+)
+from config.settings import (
+    FREE_DISCOVERY_ENABLED as FREE_DISCOVERY_ENABLED,
+)
+from config.settings import (
+    FREE_DISCOVERY_INTERVAL as FREE_DISCOVERY_INTERVAL,
+)
+from config.settings import (
+    FREE_MODEL_MAP as FREE_MODEL_MAP,
+)
+from config.settings import (
+    FREE_MODELS as FREE_MODELS,
 )
 
 

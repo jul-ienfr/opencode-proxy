@@ -30,8 +30,8 @@ import pytest
 from fastapi import FastAPI
 from starlette.testclient import TestClient
 
-import shared_state
 import dashboard.api as api
+import shared_state
 from dashboard.api import register_dashboard
 
 

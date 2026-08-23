@@ -12,14 +12,14 @@ paths need raw ASGI control, so those feed the middleware a fake scope
 directly.
 """
 
-import sys
 import os
+import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pytest
 from starlette.applications import Starlette
-from starlette.responses import JSONResponse, Response
+from starlette.responses import JSONResponse
 from starlette.routing import Route
 from starlette.testclient import TestClient
 
@@ -28,7 +28,6 @@ from traffic_capture import (
     TrafficCaptureMiddleware,
     hex_dump,
 )
-
 
 # ── helpers ───────────────────────────────────────────────────────
 
@@ -206,7 +205,7 @@ class TestEviction:
         cap = _new_cap(body_cap=1024, max_bytes=4096)
         app = _make_app(cap)
         with TestClient(app) as client:
-            for i in range(6):
+            for _i in range(6):
                 client.post("/v1/messages", content=(b"x" * 1024))
         status = cap.status()
         # 6x1KB = 6144 over budget → oldest evicted until <= 4096 (4 frames).
@@ -250,7 +249,7 @@ class TestToggleAndSkip:
 
     def test_health_and_traffic_paths_skipped(self):
         cap = _new_cap()
-        app = _make_app(cap)
+        _make_app(cap)
         starlette = Starlette(
             routes=[
                 Route("/health", _echo_route),

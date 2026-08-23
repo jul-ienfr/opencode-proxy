@@ -5,19 +5,18 @@ Usage : lance le proxy dans un terminal, puis ce script dans un autre.
 
 import json
 import sys
-import os
 import time
 
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8")
 
-from config.settings import ROUTES, CUSTOM_ROUTES, maybe_reload_custom_routes
+from config.settings import ROUTES, maybe_reload_custom_routes
 
 ROUTES_FILE = "custom_routes.json"
 
 
 def read_routes():
-    with open(ROUTES_FILE, "r", encoding="utf-8") as f:
+    with open(ROUTES_FILE, encoding="utf-8") as f:
         return json.load(f)
 
 

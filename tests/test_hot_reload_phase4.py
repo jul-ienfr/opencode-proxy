@@ -3,19 +3,19 @@ Phase 4 — Hot-reload tests (sans full_restart)
 Vérifie que chaque réglage GUI prend effet sans restart complet.
 """
 
-import os
-import json
-import yaml
-import pytest
 import copy
-from unittest.mock import MagicMock, AsyncMock, patch
+import os
+from unittest.mock import MagicMock, patch
+
+import pytest
+import yaml
 
 ROOT = os.path.dirname(os.path.dirname(__file__))
 CONFIG_PATH = os.path.join(ROOT, "config.yaml")
 
 
 def _backup_config():
-    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+    with open(CONFIG_PATH, encoding="utf-8") as f:
         data = yaml.safe_load(f)
     # deep copy
     return copy.deepcopy(data)
@@ -81,7 +81,7 @@ def test_free_model_map_hot_reload_no_restart(config_backup):
                 oc.FREE_MODEL_MAP.update(new_map)
 
         # Verify YAML persisted
-        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+        with open(CONFIG_PATH, encoding="utf-8") as f:
             on_disk = yaml.safe_load(f)
         assert on_disk.get("free_model_map") == new_map, "YAML not persisted"
 
@@ -98,7 +98,6 @@ def test_free_model_map_hot_reload_no_restart(config_backup):
 
 def test_vpn_config_watchdog_hot_reload_no_restart(config_backup):
     """vpn watchdog interval → persist + hot-reload, sans full_restart (N-station compat)."""
-    import config.settings as cfg
     import dashboard.api as api_module
 
     new_interval = 42
@@ -107,7 +106,7 @@ def test_vpn_config_watchdog_hot_reload_no_restart(config_backup):
         mock_em.publish = MagicMock()
         mock_get_em.return_value = mock_em
         api_module._persist_vpn_config({"watchdog_interval": new_interval})
-        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+        with open(CONFIG_PATH, encoding="utf-8") as f:
             on_disk = yaml.safe_load(f)
         assert on_disk["ip_rotation"]["watchdog_interval"] == new_interval
         # IP_ROTATION may be updated via _persist (best-effort) — check persisted value
@@ -116,7 +115,6 @@ def test_vpn_config_watchdog_hot_reload_no_restart(config_backup):
 
 def test_vpn_circuit_breaker_hot_reload_no_restart(config_backup):
     """circuit breaker threshold/recovery → persist YAML (N-station via update_config)."""
-    import config.settings as cfg
     import dashboard.api as api_module
 
     new_threshold = 5
@@ -128,7 +126,7 @@ def test_vpn_circuit_breaker_hot_reload_no_restart(config_backup):
         api_module._persist_vpn_config(
             {"circuit_breaker_threshold": new_threshold, "circuit_breaker_recovery": new_recovery}
         )
-        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+        with open(CONFIG_PATH, encoding="utf-8") as f:
             on_disk = yaml.safe_load(f)
         assert on_disk["ip_rotation"]["circuit_breaker_threshold"] == new_threshold
         assert on_disk["ip_rotation"]["circuit_breaker_recovery"] == new_recovery
@@ -147,7 +145,7 @@ def test_rotation_rules_hot_reload_no_restart(config_backup):
         cfg._yaml_data.setdefault("ip_rotation", {})["rotation_rules"] = new_rules
         cfg.save_yaml_config()
         cfg.IP_ROTATION["rotation_rules"] = new_rules
-        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+        with open(CONFIG_PATH, encoding="utf-8") as f:
             on_disk = yaml.safe_load(f)
         assert on_disk["ip_rotation"]["rotation_rules"] == new_rules
         assert cfg.IP_ROTATION.get("rotation_rules") == new_rules
@@ -172,7 +170,7 @@ def test_schedule_hot_reload_no_restart(config_backup):
         cfg.IP_ROTATION["schedule"] = new_schedule
         mgr.update_config({"schedule": new_schedule})
 
-        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+        with open(CONFIG_PATH, encoding="utf-8") as f:
             on_disk = yaml.safe_load(f)
         assert on_disk["ip_rotation"]["schedule"] == new_schedule
         assert mgr._config.get("schedule") == new_schedule
@@ -183,10 +181,10 @@ def test_schedule_hot_reload_no_restart(config_backup):
 @pytest.mark.asyncio
 async def test_web_port_hot_restart_not_full_restart(config_backup):
     """web_port change → hot-restart (mgr.restart) not full_restart."""
-    import config.settings as cfg
-    from dashboard.api import register_dashboard
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
+
+    from dashboard.api import register_dashboard
 
     # Mock server manager
     mock_mgr = MagicMock()
@@ -209,7 +207,6 @@ async def test_web_port_hot_restart_not_full_restart(config_backup):
 
     register_dashboard(app, static_dir, conn, server_manager_getter=lambda: mock_mgr)
 
-    from fastapi.testclient import TestClient
 
     client = TestClient(app)
 
@@ -217,7 +214,7 @@ async def test_web_port_hot_restart_not_full_restart(config_backup):
     resp = client.get("/api/config")
     assert resp.status_code == 200
     data = resp.json()
-    orig_port = data["port"]
+    data["port"]
     orig_web = data["web_port"]
     new_web = orig_web + 1 if orig_web < 65535 else orig_web - 1
     # Ensure we use a valid unused port (avoid conflict, just test logic — don't actually bind)
@@ -265,7 +262,7 @@ def test_vpn_servers_persist_reboot_safe(config_backup):
     cfg._yaml_data.setdefault("ip_rotation", {}).setdefault("openvpn", {})["servers"] = new_servers
     cfg.save_yaml_config()
     cfg.IP_ROTATION.setdefault("openvpn", {})["servers"] = new_servers
-    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+    with open(CONFIG_PATH, encoding="utf-8") as f:
         on_disk = yaml.safe_load(f)
     assert on_disk["ip_rotation"]["openvpn"]["servers"] == new_servers
 

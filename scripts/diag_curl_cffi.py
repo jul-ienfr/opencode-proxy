@@ -5,7 +5,6 @@ Timeout court (12s) pour itérer vite.
 """
 
 import asyncio
-import sys
 import time
 
 from curl_cffi.requests import AsyncSession
@@ -49,7 +48,7 @@ async def main():
                 label = f"{proxy:28s} | {imp or 'none':10s} | {name}"
                 tasks.append((label, asyncio.create_task(attempt(label, proxy, imp, url))))
     results = await asyncio.gather(*[t for _, t in tasks])
-    for (label, _), res in zip(tasks, results):
+    for (label, _), res in zip(tasks, results, strict=False):
         print(f"{label} -> {res}")
 
 

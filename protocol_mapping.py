@@ -3,11 +3,13 @@ Protocol mapping: Anthropic <-> OpenAI <-> Responses
 Extracted from opencode.py (P3.10) - pure move, no behavior change.
 """
 
-import uuid
 import json
 import time
+import uuid
+
 from config import CACHE_MIN_PROMPT_SIZE, yaml_get
-from dashboard.display import log as _log, debug as _debug
+from dashboard.display import debug as _debug
+from dashboard.display import log as _log
 
 try:
     import tiktoken
@@ -370,7 +372,7 @@ def anthropic_to_openai(body: dict, model: str) -> dict:
                     # Defensive: skip tool_result with missing/empty tool_use_id
                     # (can happen after context compaction loses the id)
                     _debug(
-                        f"  [compact] SKIP tool_result with missing tool_use_id in anthropic_to_openai"
+                        "  [compact] SKIP tool_result with missing tool_use_id in anthropic_to_openai"
                     )
                     continue
                 tool_results.append(
@@ -1237,6 +1239,7 @@ def _responses_to_chat_response(resp: dict, model: str) -> dict:
                     },
                 }
             )
+    # vrai seulement : pas de placeholder si pas de summary visible
     msg = {"role": "assistant", "content": "\n".join(texts)}
     if reasoning:
         msg["reasoning_content"] = reasoning
@@ -1331,6 +1334,8 @@ def _responses_to_anthropic_response(resp: dict, model: str) -> dict:
 # ── Responses API tool mapping cache (item_id/output_index → tool info) ──
 _responses_tool_cache: dict = {}
 _responses_tool_index_map: dict = {}  # output_index -> sequential tool index (0,1,2...)
+# Track reasoning item_ids for which a delta was already emitted (dedupe delta vs done)
+_reasoning_seen_ids: set = set()
 
 
 def _responses_sse_to_chat_deltas(raw_line: str):
@@ -1382,6 +1387,44 @@ def _responses_sse_to_chat_deltas(raw_line: str):
         text = chunk.get("delta", "")
         if not text:
             return None
+        # per-summary_index dedupe (item_id:summary_index) — two parts of same item must not clobber each other
+        _iid = chunk.get("item_id", "")
+        _sidx = chunk.get("summary_index", 0)
+        _key = f"{_iid}:{_sidx}" if _iid else f"delta:{_sidx}:{text[:8]}"
+        if _key:
+            _reasoning_seen_ids.add(_key)
+        return {"choices": [{"delta": {"reasoning_content": text}, "finish_reason": None}]}
+
+    # response.reasoning_summary_text.done — fallback when delta missing (short reasoning)
+    if etype == "response.reasoning_summary_text.done":
+        _iid = chunk.get("item_id", "")
+        _sidx = chunk.get("summary_index", 0)
+        _key = f"{_iid}:{_sidx}" if _iid else ""
+        if _key and _key in _reasoning_seen_ids:
+            _debug(f"  [responses-sse] reasoning_summary_text.done deduped (delta already emitted) key={_key!r}")
+            return None
+        text = chunk.get("text", "") or chunk.get("delta", "")
+        if not text:
+            return None
+        if _key:
+            _reasoning_seen_ids.add(_key)
+        return {"choices": [{"delta": {"reasoning_content": text}, "finish_reason": None}]}
+
+    # response.reasoning_summary_part.done — part-level summary (contains summary_text)
+    if etype == "response.reasoning_summary_part.done":
+        part = chunk.get("part", {}) if isinstance(chunk.get("part"), dict) else {}
+        text = part.get("text", "") if isinstance(part, dict) else ""
+        if not text:
+            text = chunk.get("text", "")
+        if not text:
+            return None
+        _iid = chunk.get("item_id", "")
+        _sidx = chunk.get("summary_index", 0)
+        _key = f"{_iid}:{_sidx}" if _iid else f"part:{text[:8]}"
+        if _key and _key in _reasoning_seen_ids:
+            return None
+        if _key:
+            _reasoning_seen_ids.add(_key)
         return {"choices": [{"delta": {"reasoning_content": text}, "finish_reason": None}]}
 
     # response.output_item.added — start of function_call (tool_use)
@@ -1464,17 +1507,50 @@ def _responses_sse_to_chat_deltas(raw_line: str):
         # This contains the full arguments but deltas already streamed; we can skip or emit final check
         # Don't emit extra delta if already streamed via .delta events; just ensure cache is updated
         iid = chunk.get("item_id", "")
-        args = chunk.get("arguments", "")
+        chunk.get("arguments", "")
         name = chunk.get("name", "")
         if iid and iid in _responses_tool_cache and name:
             _responses_tool_cache[iid]["name"] = name
         return None
 
+    # response.output_item.done — reasoning item final with summary array (fallback + 100% guarantee)
+    if etype == "response.output_item.done":
+        item = chunk.get("item", {}) if isinstance(chunk.get("item"), dict) else {}
+        if isinstance(item, dict) and item.get("type") == "reasoning":
+            iid = item.get("id", "") or f"rs_{chunk.get('output_index', 0)}"
+            # dedupe: if any summary part for this item already emitted, skip (check prefix)
+            if iid and any(k == iid or k.startswith(f"{iid}:") for k in _reasoning_seen_ids):
+                return None
+            summary = item.get("summary", [])
+            reasoning = ""
+            if isinstance(summary, list):
+                for s in summary:
+                    if isinstance(s, dict) and s.get("text"):
+                        reasoning += s.get("text", "")
+                    elif isinstance(s, dict) and s.get("type") == "summary_text":
+                        reasoning += s.get("text", "")
+            if not reasoning and isinstance(item.get("summary"), dict):
+                reasoning = item["summary"].get("text", "")
+            # 100% fallback: if no summary text but encrypted_content exists, synthesize placeholder so client always sees thinking
+            if not reasoning:
+                # vrai seulement : pas de placeholder synthétique — si pas de summary visible, on ne remonte rien (le vrai)
+                _debug(f"  [responses-sse] output_item.done no visible summary, skip (vrai seulement) iid={iid!r} encrypted={bool(item.get('encrypted_content'))}")
+                return None
+            if reasoning:
+                if iid:
+                    _reasoning_seen_ids.add(iid)
+                    # also mark per-index to prevent double emit from summary_text.done
+                    _reasoning_seen_ids.add(f"{iid}:0")
+                _debug(f"  [responses-sse] output_item.done reasoning fallback len={len(reasoning)} iid={iid!r}")
+                return {"choices": [{"delta": {"reasoning_content": reasoning}, "finish_reason": None}]}
+        return None
+
     # response.completed — final event with usage
     if etype == "response.completed":
-        # Clear tool cache for next request
+        # Clear tool cache + reasoning dedupe for next request
         _responses_tool_cache.clear()
         _responses_tool_index_map.clear()
+        _reasoning_seen_ids.clear()
         resp = chunk.get("response", {})
         usage = resp.get("usage", {})
         # Cache tokens come from input_tokens_details, NOT output_tokens_details
@@ -1499,7 +1575,8 @@ def _responses_sse_to_chat_deltas(raw_line: str):
     if etype == "response.incomplete":
         _responses_tool_cache.clear()
         _responses_tool_index_map.clear()
-        _debug(f"  [responses-sse] response.incomplete received — model produced no output")
+        _reasoning_seen_ids.clear()
+        _debug("  [responses-sse] response.incomplete received — model produced no output")
         resp = chunk.get("response", {})
         usage = resp.get("usage", {}) if isinstance(resp.get("usage"), dict) else {}
         chat_usage = {

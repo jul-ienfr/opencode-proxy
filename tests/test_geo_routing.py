@@ -1,6 +1,6 @@
-import pytest
 import asyncio
-from unittest.mock import patch, MagicMock, AsyncMock
+from unittest.mock import AsyncMock, MagicMock
+
 import config.settings as st
 
 
@@ -136,7 +136,7 @@ class TestGeoGateIntegration:
         m._host_blacklisted = lambda x: False
         try:
             asyncio.run(m.ensure_geo_egress({"NewCountry"}, timeout=0.1))
-            assert False, "should have raised"
+            raise AssertionError("should have raised")
         except RuntimeError as e:
             assert "503" in str(e) or "saturated" in str(e)
         finally:
@@ -157,8 +157,9 @@ class TestGeoGateIntegration:
         assert resp.status_code == 400
 
     def test_coalescing_same_allowed(self):
-        from vpn_manager import VPNManager
         import asyncio
+
+        from vpn_manager import VPNManager
 
         VPNManager._geo_coalesce.clear()
         m = VPNManager.__new__(VPNManager)
@@ -186,8 +187,9 @@ class TestGeoGateIntegration:
         assert "Germany" in r["effective_allowed"]
 
     def test_budget_timeout(self):
-        from vpn_manager import VPNManager
         import asyncio
+
+        from vpn_manager import VPNManager
 
         VPNManager._geo_coalesce.clear()
         m = VPNManager.__new__(VPNManager)
@@ -220,8 +222,9 @@ class TestGeoGateIntegration:
         }
         r = st.resolve_geo(route)
         assert "Germany" in r["effective_allowed"]
-        from vpn_manager import VPNManager
         import asyncio
+
+        from vpn_manager import VPNManager
 
         VPNManager._geo_coalesce.clear()
         m = VPNManager.__new__(VPNManager)
@@ -250,7 +253,6 @@ class TestGeoGateIntegration:
         import opencode
 
         before = opencode._geo_block_total
-        route = {"model": "x", "geo": {"allowed_countries": ["United States"], "mode": "strict"}}
         opencode._geo_block_total += 1
         assert opencode._geo_block_total == before + 1
         opencode._geo_block_total = before
@@ -361,8 +363,8 @@ class TestEstoniaNonRegression:
         must NOT allow httpx direct — it must force tunnel.  When
         _direct_country returns an allowed country and GEO_ALLOW_DIRECT is
         True, direct is permitted; when False, tunnel is forced."""
-        import opencode
         import config.settings as st
+        import opencode
 
         monkeypatch.setattr(st, "GEO_ENABLED", True)
         monkeypatch.setattr(
@@ -457,8 +459,8 @@ class TestEstoniaNonRegression:
     def test_streaming_geo_block_sse_paid(self, monkeypatch):
         """Streaming request with strict geo and VPN down must return
         SSE geo_blocked event with status 451."""
-        import opencode
         import config.settings as st
+        import opencode
 
         monkeypatch.setattr(st, "GEO_ENABLED", True)
         monkeypatch.setattr(
@@ -518,7 +520,6 @@ class TestEstoniaNonRegression:
     def test_quota_rotation_respects_forced_pool(self, monkeypatch):
         """on_quota_exhausted with forced_pool must propagate it so the
         background rotation never pins to Estonia."""
-        from vpn_manager import VPNManager
 
         # Build a minimal FreeIPPool mock
         from free_ip_pool import FreeIPPool

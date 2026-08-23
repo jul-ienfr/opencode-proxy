@@ -10,8 +10,8 @@ Usage:
 
 import argparse
 import asyncio
-import time
 import statistics
+import time
 
 
 async def bench(url: str, concurrency: int, total: int = 500):
@@ -22,7 +22,7 @@ async def bench(url: str, concurrency: int, total: int = 500):
         try:
             r = await client.get(f"{url}/health", timeout=5.0)
             return time.monotonic() - t0, r.status_code
-        except Exception as e:
+        except Exception:
             return time.monotonic() - t0, 0
 
     limits = httpx.Limits(max_connections=500, max_keepalive_connections=200, keepalive_expiry=30)

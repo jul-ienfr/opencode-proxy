@@ -12,10 +12,9 @@ Based on patterns from:
 - nordvpn-switcher-pro - smart caching, criteria-based rotation
 """
 
-import time
-import random
 import logging
-from typing import Optional
+import random
+import time
 from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
@@ -30,8 +29,8 @@ class ServerScore:
     country_code: str
     city: str
     load: int  # 0-100 from NordVPN API
-    latency_ms: Optional[int] = None  # measured ping
-    last_used: Optional[float] = None  # timestamp
+    latency_ms: int | None = None  # measured ping
+    last_used: float | None = None  # timestamp
     consecutive_failures: int = 0
     total_uses: int = 0
 
@@ -136,7 +135,7 @@ class ServerScorer:
         if name in self._servers:
             self._servers[name].consecutive_failures = 0
 
-    def select_best(self, exclude_recent: int = 3) -> Optional[str]:
+    def select_best(self, exclude_recent: int = 3) -> str | None:
         """Select the best available server.
 
         Args:
@@ -197,7 +196,7 @@ class ServerScorer:
         )
         return chosen.name
 
-    def get_random_from_pool(self, pool_size: int = 10) -> Optional[str]:
+    def get_random_from_pool(self, pool_size: int = 10) -> str | None:
         """Get a random server from the top N by score.
 
         Used for "complete rotation" mode where we want diversity.

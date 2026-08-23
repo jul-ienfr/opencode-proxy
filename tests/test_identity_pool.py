@@ -22,7 +22,6 @@ Covered here (plan "Vérification" section 1, offline):
 Pure module-level functions — no asyncio, no docker, no state file.
 """
 
-import pytest
 
 import vpn_manager as vm
 

@@ -30,13 +30,12 @@ own rotation workers, which are cancelled at the end of each test):
 """
 
 import asyncio
-import time
 
 import pytest
 
 import opencode as oc
-from free_ip_pool import FreeIPPool
 import vpn_manager as vm
+from free_ip_pool import FreeIPPool
 
 
 class _Station:
@@ -455,7 +454,7 @@ def test_free_stations_exhausted_getattr_duck_safe(monkeypatch):
 
 
 def test_classify_probe_exc_timeout():
-    assert vm._classify_probe_exc(asyncio.TimeoutError()) == "timeout"
+    assert vm._classify_probe_exc(TimeoutError()) == "timeout"
     assert vm._classify_probe_exc(TimeoutError()) == "timeout"
 
     class _Named(Exception):
