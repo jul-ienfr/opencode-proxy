@@ -98,9 +98,15 @@ _local_ips_cache: tuple[float, list] | None = None
 # When DASHBOARD_TOKEN is set, sensitive endpoints require the header
 # `X-Dashboard-Token` (constant-time comparison). Unset → legacy open access
 # (documented: set DASHBOARD_TOKEN when the server is exposed beyond localhost).
-# [P1.3] Warn at import when host 0.0.0.0 is exposed without a token.
+# [F-H6] Fail-closed when DASHBOARD_REQUIRE_TOKEN=true and host 0.0.0.0 without token.
 
 _DASHBOARD_TOKEN = os.getenv("DASHBOARD_TOKEN", "").strip()
+_DASHBOARD_REQUIRE_TOKEN = os.getenv("DASHBOARD_REQUIRE_TOKEN", "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
+_host_for_warning = "0.0.0.0"
 try:
     _host_for_warning = (os.getenv("OPENCODE_HOST", "") or "").strip()
     if not _host_for_warning:
@@ -121,10 +127,13 @@ try:
     if _host_for_warning == "0.0.0.0" and not _DASHBOARD_TOKEN:
         import logging as _logging_warn
 
-        _logging_warn.getLogger("dashboard").warning(
+        _msg = (
             "DASHBOARD_TOKEN not set while host is 0.0.0.0 — dashboard is open to LAN. "
             "Set DASHBOARD_TOKEN in .env (header X-Dashboard-Token) for any non-localhost deployment."
         )
+        if _DASHBOARD_REQUIRE_TOKEN:
+            _msg += " DASHBOARD_REQUIRE_TOKEN=true — dashboard will deny sensitive endpoints (403)."
+        _logging_warn.getLogger("dashboard").warning(_msg)
 except Exception:
     pass
 
@@ -151,8 +160,16 @@ _config_yaml_known_mtime = _config_yaml_mtime()
 
 
 def _check_dashboard_token(request: Request):
-    """Return a 401 response if the token is configured and not provided."""
+    """Return a 401/403 response if the token is configured (or required) and not provided."""
     if not _DASHBOARD_TOKEN:
+        if _DASHBOARD_REQUIRE_TOKEN and _host_for_warning == "0.0.0.0":
+            return JSONResponse(
+                status_code=403,
+                content={
+                    "error": "forbidden",
+                    "message": "DASHBOARD_TOKEN required when host is 0.0.0.0 (set DASHBOARD_TOKEN env or DASHBOARD_REQUIRE_TOKEN=false).",
+                },
+            )
         return None
     provided = request.headers.get("X-Dashboard-Token", "")
     if provided and hmac.compare_digest(provided, _DASHBOARD_TOKEN):

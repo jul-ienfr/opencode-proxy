@@ -6,6 +6,7 @@ import logging
 import time
 import re
 import random
+import secrets
 import threading
 
 # Windows: masquer la fenêtre console des subprocess (évite le flash noir 1s)
@@ -76,6 +77,98 @@ def load_yaml_config() -> dict:
         except OSError:
             _config_yaml_mtime = 0.0
         logger.info("[config] loaded config.yaml (%d top-level keys)", len(_yaml_data))
+        # F-H6: generate control_api_key once if empty (boot single-flight, portalocker if available)
+        try:
+            _ir = _yaml_data.get("ip_rotation", {})
+            if isinstance(_ir, dict) and not str(_ir.get("control_api_key") or "").strip():
+                _new_key = secrets.token_urlsafe(32)
+                _ir["control_api_key"] = _new_key
+                _yaml_data["ip_rotation"] = _ir
+                # Try file-lock for gunicorn multi-worker (portalocker optional)
+                _lock_acquired = False
+                _lock_file = None
+                try:
+                    import portalocker  # type: ignore
+
+                    _lock_file = open(CONFIG_PATH + ".lock", "a+", encoding="utf-8")
+                    portalocker.lock(_lock_file, portalocker.LOCK_EX)
+                    _lock_acquired = True
+                    # Re-read under lock: another worker may have just generated it
+                    try:
+                        with open(CONFIG_PATH, "r", encoding="utf-8") as _rf:
+                            _reloaded = yaml.safe_load(_rf) or {}
+                        _re_ir = (
+                            _reloaded.get("ip_rotation", {})
+                            if isinstance(_reloaded.get("ip_rotation"), dict)
+                            else {}
+                        )
+                        if str(_re_ir.get("control_api_key") or "").strip():
+                            _yaml_data = _reloaded
+                            _ir = _re_ir
+                        else:
+                            # Still empty — persist our generated key
+                            raise FileNotFoundError  # fall through to save
+                    except Exception:
+                        # Save our generated key
+                        tmp = CONFIG_PATH + ".tmp"
+                        with open(tmp, "w", encoding="utf-8") as _wf:
+                            yaml.dump(
+                                _yaml_data,
+                                _wf,
+                                default_flow_style=False,
+                                allow_unicode=True,
+                                sort_keys=False,
+                            )
+                            _wf.flush()
+                            try:
+                                os.fsync(_wf.fileno())
+                            except OSError:
+                                pass
+                        os.replace(tmp, CONFIG_PATH)
+                        try:
+                            _config_yaml_mtime = os.path.getmtime(CONFIG_PATH)
+                        except OSError:
+                            pass
+                        logger.info("[config] generated control_api_key (persisted to config.yaml)")
+                except ImportError:
+                    # No portalocker — atomic save without lock (single-worker safe)
+                    tmp = CONFIG_PATH + ".tmp"
+                    with open(tmp, "w", encoding="utf-8") as _wf:
+                        yaml.dump(
+                            _yaml_data,
+                            _wf,
+                            default_flow_style=False,
+                            allow_unicode=True,
+                            sort_keys=False,
+                        )
+                        _wf.flush()
+                        try:
+                            os.fsync(_wf.fileno())
+                        except OSError:
+                            pass
+                    os.replace(tmp, CONFIG_PATH)
+                    try:
+                        _config_yaml_mtime = os.path.getmtime(CONFIG_PATH)
+                    except OSError:
+                        pass
+                    logger.info("[config] generated control_api_key (persisted, no lock)")
+                except Exception as _e:
+                    logger.warning("[config] control_api_key generation race: %s", _e)
+                finally:
+                    if _lock_acquired and _lock_file is not None:
+                        try:
+                            import portalocker
+
+                            portalocker.unlock(_lock_file)
+                            _lock_file.close()
+                            try:
+                                os.remove(CONFIG_PATH + ".lock")
+                            except OSError:
+                                pass
+                        except Exception:
+                            pass
+        except Exception as _e:
+            logger.debug("[config] control_api_key ensure skipped: %s", _e)
         return _yaml_data
     except Exception as e:
         logger.error("[config] failed to load config.yaml: %s", e)
