@@ -37,6 +37,7 @@ version with a control request, so the comparison is version-robust. A Path
 C request that silently fell back to direct httpx carries the curated UA
 and FAILS the bundle-UA assertion instead of passing silently.
 """
+
 import json
 import os
 import threading
@@ -77,18 +78,27 @@ class _EchoHandler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         n = int(self.headers.get("content-length") or 0)
         body = self.rfile.read(n) if n else b""
-        self.__class__.captured.append({
-            "headers": {k.lower(): v for k, v in self.headers.items()},
-            "body": body.decode("utf-8", "replace"),
-        })
-        payload = json.dumps({
-            "id": "echo",
-            "object": "chat.completion",
-            "model": "free-test-model",
-            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
-            "choices": [{"index": 0, "message": {"role": "assistant", "content": "echo"},
-                         "finish_reason": "stop"}],
-        }).encode()
+        self.__class__.captured.append(
+            {
+                "headers": {k.lower(): v for k, v in self.headers.items()},
+                "body": body.decode("utf-8", "replace"),
+            }
+        )
+        payload = json.dumps(
+            {
+                "id": "echo",
+                "object": "chat.completion",
+                "model": "free-test-model",
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "echo"},
+                        "finish_reason": "stop",
+                    }
+                ],
+            }
+        ).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
@@ -136,8 +146,7 @@ class _StubPool:
 def free_env(monkeypatch, echo_server):
     """Point every free path at the echo server; neutralise live side effects."""
     # libcurl (Paths A/C) honours proxy env vars — the echo must be reachable.
-    for var in ("http_proxy", "https_proxy", "all_proxy",
-                "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
+    for var in ("http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
 
@@ -161,19 +170,24 @@ def assert_no_paid_artifacts(label, headers, body):
     for name in ("authorization", "x-api-key", "cookie", "x-request-id"):
         assert name not in headers, f"{label}: forbidden header {name!r} reached API_BASE_FREE"
     for name, value in headers.items():
-        assert not name.startswith("x-stainless-"), \
+        assert not name.startswith("x-stainless-"), (
             f"{label}: SDK identifier {name!r} reached API_BASE_FREE"
-        assert PAID_KEY_MARKER not in value, \
+        )
+        assert PAID_KEY_MARKER not in value, (
             f"{label}: paid key leaked in header {name!r} (value={value!r})"
+        )
     ua = headers.get("user-agent", "")
-    assert "claude-cli" not in ua and "python-httpx" not in ua, \
+    assert "claude-cli" not in ua and "python-httpx" not in ua, (
         f"{label}: client UA leaked to the free endpoint: {ua!r}"
+    )
     assert PAID_KEY_MARKER not in body, f"{label}: paid key leaked in request body"
 
 
 def _single_capture(label):
     captured = _EchoHandler.captured
-    assert len(captured) == 1, f"{label}: expected exactly 1 request to the echo server, got {len(captured)}"
+    assert len(captured) == 1, (
+        f"{label}: expected exactly 1 request to the echo server, got {len(captured)}"
+    )
     return captured[0]
 
 
@@ -184,9 +198,9 @@ async def _bundle_ua(url):
     itself is discarded (captured is cleared by the caller afterwards).
     """
     from curl_cffi.requests import AsyncSession
+
     async with AsyncSession(impersonate="chrome131") as session:
-        await session.post(url, json={"probe": True},
-                           headers={"Content-Type": "application/json"})
+        await session.post(url, json={"probe": True}, headers={"Content-Type": "application/json"})
     ua = _EchoHandler.captured[-1]["headers"]["user-agent"]
     assert ua, "control request carried no UA — bundle did not inject one"
     return ua
@@ -195,8 +209,7 @@ async def _bundle_ua(url):
 # ── Path B: non-stream direct (httpx) ─────────────────────────────────────
 @pytest.mark.asyncio
 async def test_path_b_direct_httpx_free_attempt(free_env):
-    body = {"model": "paid-test-model",
-            "messages": [{"role": "user", "content": "hello"}]}
+    body = {"model": "paid-test-model", "messages": [{"role": "user", "content": "hello"}]}
     result = await oc._try_free_model_first(body, dict(PAID_HEADERS), "openai", "paid-test-model")
     assert result is not None, "free attempt must succeed against the echo server"
     resp, _resp_headers, free_model, _free_ip = result
@@ -207,24 +220,26 @@ async def test_path_b_direct_httpx_free_attempt(free_env):
     headers = cap["headers"]
     assert_no_paid_artifacts("Path B", headers, cap["body"])
     # Identity UA from the curated map (httpx path, bundle UA not available)
-    assert headers.get("user-agent") == oc._UA_BY_IMPERSONATE["chrome131"], \
+    assert headers.get("user-agent") == oc._UA_BY_IMPERSONATE["chrome131"], (
         f"Path B: identity UA expected, got {headers.get('user-agent')!r}"
+    )
     # Model swap reached the wire
     assert json.loads(cap["body"])["model"] == "free-test-model"
     # Path B sends a minimal fresh header set ({"Content-Type"} + identity
     # UA, plan A.4) — the client's protocol header is absent by design and
     # nothing paid is present (asserted above)
-    assert "anthropic-version" not in headers, \
+    assert "anthropic-version" not in headers, (
         "Path B: minimal header set expected (no protocol header on this path)"
+    )
 
 
 # ── Path D: stream direct fallback (httpx) ────────────────────────────────
 @pytest.mark.asyncio
 async def test_path_d_direct_stream_fallback(free_env):
-    body = {"model": "free-test-model",
-            "messages": [{"role": "user", "content": "hello"}]}
-    async with oc._open_free_stream(oc.API_BASE_FREE, body, dict(PAID_HEADERS),
-                                    use_free=True) as resp:
+    body = {"model": "free-test-model", "messages": [{"role": "user", "content": "hello"}]}
+    async with oc._open_free_stream(
+        oc.API_BASE_FREE, body, dict(PAID_HEADERS), use_free=True
+    ) as resp:
         assert resp.status_code == 200
         lines = [ln async for ln in resp.aiter_lines()]
     assert any("echo" in ln for ln in lines), "stream must deliver the echo payload"
@@ -232,8 +247,9 @@ async def test_path_d_direct_stream_fallback(free_env):
     cap = _single_capture("Path D")
     headers = cap["headers"]
     assert_no_paid_artifacts("Path D", headers, cap["body"])
-    assert headers.get("user-agent") == oc._UA_BY_IMPERSONATE["chrome131"], \
+    assert headers.get("user-agent") == oc._UA_BY_IMPERSONATE["chrome131"], (
         f"Path D: identity UA expected, got {headers.get('user-agent')!r}"
+    )
     assert headers.get("anthropic-version") == "2023-06-01"
 
 
@@ -245,8 +261,7 @@ async def test_path_a_curl_cffi_non_stream(free_env):
     # installed curl_cffi and must match the real request's UA.
     bundle_ua = await _bundle_ua(oc.API_BASE_FREE)
     _EchoHandler.captured.clear()
-    body = {"model": "free-test-model",
-            "messages": [{"role": "user", "content": "hello"}]}
+    body = {"model": "free-test-model", "messages": [{"role": "user", "content": "hello"}]}
     resp = await oc._do_free_request_curl_cffi(body, dict(PAID_HEADERS), proxy_url=None)
     assert resp.status_code == 200
 
@@ -255,8 +270,9 @@ async def test_path_a_curl_cffi_non_stream(free_env):
     assert_no_paid_artifacts("Path A", headers, cap["body"])
     # curl_cffi bundle UA — proves the impersonate path really ran (a
     # fallback to httpx would carry the curated Windows UA instead)
-    assert headers.get("user-agent") == bundle_ua, \
+    assert headers.get("user-agent") == bundle_ua, (
         f"Path A: curl_cffi bundle UA expected, got {headers.get('user-agent')!r}"
+    )
     assert headers.get("anthropic-version") == "2023-06-01"
 
 
@@ -269,10 +285,10 @@ async def test_path_c_curl_cffi_tunnel_stream(free_env, monkeypatch):
     monkeypatch.setattr(oc, "_curl_proxy_url", lambda p: None)
     bundle_ua = await _bundle_ua(oc.API_BASE_FREE)
     _EchoHandler.captured.clear()
-    body = {"model": "free-test-model",
-            "messages": [{"role": "user", "content": "hello"}]}
-    async with oc._open_free_stream(oc.API_BASE_FREE, body, dict(PAID_HEADERS),
-                                    use_free=True) as resp:
+    body = {"model": "free-test-model", "messages": [{"role": "user", "content": "hello"}]}
+    async with oc._open_free_stream(
+        oc.API_BASE_FREE, body, dict(PAID_HEADERS), use_free=True
+    ) as resp:
         assert resp.status_code == 200
         lines = [ln async for ln in resp.aiter_lines()]
     assert any("echo" in ln for ln in lines), "stream must deliver the echo payload"
@@ -290,8 +306,9 @@ async def test_path_c_curl_cffi_tunnel_stream(free_env, monkeypatch):
     actual_ua = headers.get("user-agent")
     assert actual_ua, f"Path C: missing user-agent"
     # Accept either bundle_ua or curated Windows UA (both prove curl path on Windows)
-    assert actual_ua == bundle_ua or actual_ua == oc._UA_BY_IMPERSONATE.get("chrome131"), \
+    assert actual_ua == bundle_ua or actual_ua == oc._UA_BY_IMPERSONATE.get("chrome131"), (
         f"Path C: curl_cffi bundle UA expected — got {actual_ua!r} bundle {bundle_ua!r}"
+    )
     assert headers.get("anthropic-version") == "2023-06-01"
 
 
@@ -316,9 +333,9 @@ class _StubIdentityPool:
 def test_current_free_identity_explicit_station_wins_over_pool_active(monkeypatch):
     """Explicit station param WINS over the pool's last-picked station."""
     explicit = _StubIdentityMgr(
-        {"impersonate": "firefox144", "user_agent": None, "extra_headers": {}})
-    active = _StubIdentityMgr(
-        {"impersonate": "edge101", "user_agent": None, "extra_headers": {}})
+        {"impersonate": "firefox144", "user_agent": None, "extra_headers": {}}
+    )
+    active = _StubIdentityMgr({"impersonate": "edge101", "user_agent": None, "extra_headers": {}})
     monkeypatch.setattr(oc, "_free_ip_pool", _StubIdentityPool(active))
     monkeypatch.setattr(oc, "_vpn_manager", None)
     assert oc._current_free_identity(explicit) == explicit.current_identity
@@ -326,10 +343,8 @@ def test_current_free_identity_explicit_station_wins_over_pool_active(monkeypatc
 
 def test_current_free_identity_defaults_to_pool_active_station(monkeypatch):
     """station=None → resolves the pool.active_station manager's identity."""
-    active = _StubIdentityMgr(
-        {"impersonate": "edge101", "user_agent": None, "extra_headers": {}})
-    vpn = _StubIdentityMgr(
-        {"impersonate": "firefox144", "user_agent": None, "extra_headers": {}})
+    active = _StubIdentityMgr({"impersonate": "edge101", "user_agent": None, "extra_headers": {}})
+    vpn = _StubIdentityMgr({"impersonate": "firefox144", "user_agent": None, "extra_headers": {}})
     monkeypatch.setattr(oc, "_free_ip_pool", _StubIdentityPool(active))
     monkeypatch.setattr(oc, "_vpn_manager", vpn)
     assert oc._current_free_identity() == active.current_identity
@@ -337,8 +352,7 @@ def test_current_free_identity_defaults_to_pool_active_station(monkeypatch):
 
 def test_current_free_identity_pool_without_active_falls_back_to_vpn_manager(monkeypatch):
     """Pool present but active_station None → falls back to _vpn_manager."""
-    vpn = _StubIdentityMgr(
-        {"impersonate": "firefox144", "user_agent": None, "extra_headers": {}})
+    vpn = _StubIdentityMgr({"impersonate": "firefox144", "user_agent": None, "extra_headers": {}})
     monkeypatch.setattr(oc, "_free_ip_pool", _StubIdentityPool(None))
     monkeypatch.setattr(oc, "_vpn_manager", vpn)
     assert oc._current_free_identity() == vpn.current_identity
@@ -346,8 +360,7 @@ def test_current_free_identity_pool_without_active_falls_back_to_vpn_manager(mon
 
 def test_current_free_identity_no_pool_falls_back_to_vpn_manager(monkeypatch):
     """No pool at all → _vpn_manager's identity (historical station-1 face)."""
-    vpn = _StubIdentityMgr(
-        {"impersonate": "edge101", "user_agent": None, "extra_headers": {}})
+    vpn = _StubIdentityMgr({"impersonate": "edge101", "user_agent": None, "extra_headers": {}})
     monkeypatch.setattr(oc, "_free_ip_pool", None)
     monkeypatch.setattr(oc, "_vpn_manager", vpn)
     assert oc._current_free_identity() == vpn.current_identity
@@ -357,8 +370,11 @@ def test_current_free_identity_no_manager_returns_chrome131_default(monkeypatch)
     """No pool, no VPN manager → the chrome131 default dict (pre-rotation face)."""
     monkeypatch.setattr(oc, "_free_ip_pool", None)
     monkeypatch.setattr(oc, "_vpn_manager", None)
-    assert oc._current_free_identity() == \
-        {"impersonate": "chrome131", "user_agent": None, "extra_headers": {}}
+    assert oc._current_free_identity() == {
+        "impersonate": "chrome131",
+        "user_agent": None,
+        "extra_headers": {},
+    }
 
 
 # ── _open_free_stream count_request=False: retry reuses the stored attempt ─
@@ -378,8 +394,10 @@ class _StubPoolNeverCount(_StubPool):
 
     async def on_request(self):
         type(self).calls += 1
-        raise AssertionError("count_request=False must not call pool.on_request() "
-                             "(the quota counter must not advance on a retry)")
+        raise AssertionError(
+            "count_request=False must not call pool.on_request() "
+            "(the quota counter must not advance on a retry)"
+        )
 
 
 class _StubPoolDisconnectRetry:
@@ -399,8 +417,10 @@ class _StubPoolDisconnectRetry:
 
     async def on_request(self):
         type(self).calls_to_request += 1
-        raise AssertionError("fresh_station=True must not call pool.on_request() "
-                             "(the quota counter must not advance on a retry)")
+        raise AssertionError(
+            "fresh_station=True must not call pool.on_request() "
+            "(the quota counter must not advance on a retry)"
+        )
 
     async def on_disconnect_retry(self, failed=None):
         type(self).calls_to_disconnect.append(failed)
@@ -429,7 +449,7 @@ class _FakeCurlSession:
 
     def __init__(self, **kwargs):
         self.kwargs = kwargs
-        type(self).created.append(kwargs)   # captured for the test assertions
+        type(self).created.append(kwargs)  # captured for the test assertions
 
     async def post(self, *args, **kwargs):
         return _FakeStreamResp()
@@ -465,7 +485,8 @@ async def test_open_free_stream_count_false_reuses_stored_station(free_env, monk
 
     pool = _StubPoolNeverCount()
     pool.active_station = _StubIdentityMgr(
-        {"impersonate": "edge101", "user_agent": None, "extra_headers": {}})
+        {"impersonate": "edge101", "user_agent": None, "extra_headers": {}}
+    )
     monkeypatch.setattr(oc, "_free_ip_pool", pool)
     # The stored station is an int sentinel here; the real helper would
     # dereference .current_ip on it — stub it (the IP is already in the
@@ -480,15 +501,19 @@ async def test_open_free_stream_count_false_reuses_stored_station(free_env, monk
 
     monkeypatch.setattr(oc, "_current_free_identity", _identity_spy)
 
-    oc._current_free_attempt.set({"proxy_url": "socks5://127.0.0.1:1080",
-                                  "station": 2,
-                                  "identity": "firefox144",
-                                  "ip": "1.2.3.4"})
+    oc._current_free_attempt.set(
+        {
+            "proxy_url": "socks5://127.0.0.1:1080",
+            "station": 2,
+            "identity": "firefox144",
+            "ip": "1.2.3.4",
+        }
+    )
     try:
-        body = {"model": "free-test-model",
-                "messages": [{"role": "user", "content": "hello"}]}
-        async with oc._open_free_stream(oc.API_BASE_FREE, body, dict(PAID_HEADERS),
-                                        use_free=True, count_request=False) as resp:
+        body = {"model": "free-test-model", "messages": [{"role": "user", "content": "hello"}]}
+        async with oc._open_free_stream(
+            oc.API_BASE_FREE, body, dict(PAID_HEADERS), use_free=True, count_request=False
+        ) as resp:
             assert resp.status_code == 200
     finally:
         oc._current_free_attempt.set({})
@@ -518,10 +543,10 @@ async def test_open_free_stream_count_false_empty_attempt_direct_fallback(free_e
 
     oc._current_free_attempt.set({})
     try:
-        body = {"model": "free-test-model",
-                "messages": [{"role": "user", "content": "hello"}]}
-        async with oc._open_free_stream(oc.API_BASE_FREE, body, dict(PAID_HEADERS),
-                                        use_free=True, count_request=False) as resp:
+        body = {"model": "free-test-model", "messages": [{"role": "user", "content": "hello"}]}
+        async with oc._open_free_stream(
+            oc.API_BASE_FREE, body, dict(PAID_HEADERS), use_free=True, count_request=False
+        ) as resp:
             assert resp.status_code == 200
         # Capture the re-set ContextVar BEFORE the finally reset
         attempt = oc._current_free_attempt.get() or {}
@@ -567,16 +592,24 @@ async def test_open_free_stream_fresh_station_switches_station(free_env, monkeyp
     monkeypatch.setattr(oc, "_current_free_identity", _identity_spy)
 
     # The original attempt landed on station 1; it just disconnected.
-    oc._current_free_attempt.set({"proxy_url": "socks5://127.0.0.1:1080",
-                                  "station": 1,
-                                  "identity": "firefox144",
-                                  "ip": "9.9.9.9"})
+    oc._current_free_attempt.set(
+        {
+            "proxy_url": "socks5://127.0.0.1:1080",
+            "station": 1,
+            "identity": "firefox144",
+            "ip": "9.9.9.9",
+        }
+    )
     try:
-        body = {"model": "free-test-model",
-                "messages": [{"role": "user", "content": "hello"}]}
-        async with oc._open_free_stream(oc.API_BASE_FREE, body, dict(PAID_HEADERS),
-                                        use_free=True, count_request=False,
-                                        fresh_station=True) as resp:
+        body = {"model": "free-test-model", "messages": [{"role": "user", "content": "hello"}]}
+        async with oc._open_free_stream(
+            oc.API_BASE_FREE,
+            body,
+            dict(PAID_HEADERS),
+            use_free=True,
+            count_request=False,
+            fresh_station=True,
+        ) as resp:
             assert resp.status_code == 200
     finally:
         oc._current_free_attempt.set({})
@@ -594,7 +627,9 @@ async def test_open_free_stream_fresh_station_switches_station(free_env, monkeyp
 
 
 @pytest.mark.asyncio
-async def test_open_free_stream_fresh_station_direct_fallback_preserves_station(free_env, monkeypatch):
+async def test_open_free_stream_fresh_station_direct_fallback_preserves_station(
+    free_env, monkeypatch
+):
     """fresh_station=True but no usable station (on_disconnect_retry returns
     (None, None)) → direct httpx fallback; the ContextVar KEEPS the failed
     station so a later retry can still switch away from it instead of
@@ -608,16 +643,19 @@ async def test_open_free_stream_fresh_station_direct_fallback_preserves_station(
     monkeypatch.setattr(oc, "_free_ip_pool", pool)
     monkeypatch.setattr(oc, "_client", fake_client)
 
-    oc._current_free_attempt.set({"proxy_url": "socks5://127.0.0.1:1080",
-                                  "station": 1,
-                                  "identity": "",
-                                  "ip": "9.9.9.9"})
+    oc._current_free_attempt.set(
+        {"proxy_url": "socks5://127.0.0.1:1080", "station": 1, "identity": "", "ip": "9.9.9.9"}
+    )
     try:
-        body = {"model": "free-test-model",
-                "messages": [{"role": "user", "content": "hello"}]}
-        async with oc._open_free_stream(oc.API_BASE_FREE, body, dict(PAID_HEADERS),
-                                        use_free=True, count_request=False,
-                                        fresh_station=True) as resp:
+        body = {"model": "free-test-model", "messages": [{"role": "user", "content": "hello"}]}
+        async with oc._open_free_stream(
+            oc.API_BASE_FREE,
+            body,
+            dict(PAID_HEADERS),
+            use_free=True,
+            count_request=False,
+            fresh_station=True,
+        ) as resp:
             assert resp.status_code == 200
         # Capture the re-set ContextVar BEFORE the finally reset
         attempt = oc._current_free_attempt.get() or {}

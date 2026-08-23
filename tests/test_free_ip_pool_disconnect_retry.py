@@ -25,6 +25,7 @@ tasks: ``_launch_rotation`` is stubbed per instance):
   * single-station mode: no other station → (None, None), the failed
     station is still rotated in the background
 """
+
 import time
 
 import pytest
@@ -35,9 +36,17 @@ from free_ip_pool import FreeIPPool
 class _StubStation:
     """Minimal VPNManager double exposing the attrs the pool reads."""
 
-    def __init__(self, sid, *, enabled=True, proxy_mode="vpn",
-                 status="connected", quota_per_ip=15, ip="1.1.1.1",
-                 server_name="se-1"):
+    def __init__(
+        self,
+        sid,
+        *,
+        enabled=True,
+        proxy_mode="vpn",
+        status="connected",
+        quota_per_ip=15,
+        ip="1.1.1.1",
+        server_name="se-1",
+    ):
         self._station = sid
         self.enabled = enabled
         self.proxy_mode = proxy_mode
@@ -47,7 +56,7 @@ class _StubStation:
         self.current_server = {"name": server_name}
         self.socks5_url = f"socks5://127.0.0.1:1{sid}080"
         self._last_rotation_error = None
-        self.armed = []                     # [plan 18/08 §1c] egress-watchdog arms
+        self.armed = []  # [plan 18/08 §1c] egress-watchdog arms
 
     def note_free_request(self):
         pass
@@ -119,8 +128,9 @@ class TestDualStationSwitch:
 
         await p.on_disconnect_retry(st1)
 
-        assert p._per_station(st1)["bad_until"] is not None, \
+        assert p._per_station(st1)["bad_until"] is not None, (
             "failed station must be bad-marked so subsequent requests skip it"
+        )
         assert p.rotated == [st1], "background rotation launched for the failed station"
         # Bad-mark is time-bounded (bad_ttl)
         assert p._per_station(st1)["bad_until"] > time.monotonic()
@@ -153,10 +163,12 @@ class TestDualStationSwitch:
 
         proxy, station = await p.on_disconnect_retry(st1)
 
-        assert proxy is None and station is None, \
+        assert proxy is None and station is None, (
             "none usable → caller falls back to direct/paid instead of a dead IP"
-        assert p._per_station(st1)["bad_until"] is None, \
+        )
+        assert p._per_station(st1)["bad_until"] is None, (
             "C1: last standing station must NOT be bad-marked"
+        )
         # The failed station still rotates in the background (plus the down
         # station's reconnect from ensure_connected — a reconnect IS a rotation).
         assert st1 in p.rotated, "the failed station still rotates in the background"
@@ -205,8 +217,9 @@ class TestSingleStation:
         proxy, station = await p.on_disconnect_retry(st1)
 
         assert proxy is None and station is None
-        assert p._per_station(st1)["bad_until"] is None, \
+        assert p._per_station(st1)["bad_until"] is None, (
             "single station = last standing → must not be bad-marked"
+        )
         assert p.rotated == [st1]
 
     @pytest.mark.asyncio

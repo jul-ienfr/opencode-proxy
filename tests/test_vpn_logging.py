@@ -23,6 +23,7 @@ Covered here (offline, temp-file isolated):
     propagation is off
   * attach_panel_logger is idempotent (no duplicate handler add)
 """
+
 import logging
 import re
 
@@ -89,9 +90,9 @@ def test_warning_auth_failed_reaches_debug_log(vpn_log):
     assert hits, "AUTH_FAILED watchdog line is missing from debug.log"
     # debug.log's bracketed-timestamp format, e.g.
     # "[2026-08-17 18:54:50] [vpn_manager] [vpn-watchdog] AUTH_FAILED ..."
-    assert re.match(
-        r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\] \[vpn_manager\] ", hits[0]
-    ), f"unexpected format: {hits[0]!r}"
+    assert re.match(r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\] \[vpn_manager\] ", hits[0]), (
+        f"unexpected format: {hits[0]!r}"
+    )
 
 
 def test_info_rotation_line_reaches_debug_log(vpn_log):

@@ -1,9 +1,12 @@
 """Standalone script that opens a pywebview window. Launched as a subprocess."""
+
 import json
 import os
 import sys
 
-STATE_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs", "window_state.json")
+STATE_FILE = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs", "window_state.json"
+)
 
 
 def _load_state():
@@ -54,14 +57,16 @@ if __name__ == "__main__":
                 height=win_height,
                 min_size=(800, 600),
                 text_select=True,
-                background_color='#1a1a2e',
+                background_color="#1a1a2e",
             )
             if win_x is not None and win_y is not None:
                 kwargs["x"] = win_x
                 kwargs["y"] = win_y
 
             window = webview.create_window(
-                "OpenCode Dashboard", url, **kwargs,
+                "OpenCode Dashboard",
+                url,
+                **kwargs,
             )
 
             window.events.closed += lambda: _save_state(window)

@@ -17,6 +17,7 @@ the REAL script-building / parsing / polling logic runs unchanged.
 
 Never touches the live system (no docker, no network).
 """
+
 import json
 import re
 import subprocess
@@ -36,18 +37,17 @@ class ControlFakeVPNManager(FakeVPNManager):
     def __init__(self, cfg, station=1, shared=None, tmp_path=None, **kw):
         super().__init__(cfg, station=station, shared=shared, tmp_path=tmp_path, **kw)
         self.calls["docker_run"] = self.calls.get("docker_run", 0)
-        self.control_scripts = []          # every sh script passed to docker exec
-        self.control_rc = 0                # return code for ALL control calls
-        self.control_stdout = ""           # default stdout (fragments below override)
-        self.stdout_by_fragment = {}       # fragment -> stdout override
+        self.control_scripts = []  # every sh script passed to docker exec
+        self.control_rc = 0  # return code for ALL control calls
+        self.control_stdout = ""  # default stdout (fragments below override)
+        self.stdout_by_fragment = {}  # fragment -> stdout override
 
     def _docker_run(self, args, timeout=30, env=None):
         self.calls["docker_run"] += 1
         self.last_env = dict(env) if env else None
         # Only log the args for control-server invocations (sh -c ... wget ...)
         # The script is the LAST element of ["exec", ctn, "sh", "-c", script].
-        if args and args[:2] == ["exec", self._docker_container] \
-                and "sh" in args and "-c" in args:
+        if args and args[:2] == ["exec", self._docker_container] and "sh" in args and "-c" in args:
             self.control_scripts.append(args[-1])
         script = args[-1] if args else ""
         stdout = self.control_stdout
@@ -87,10 +87,8 @@ class ControlReconnectFake(ControlFakeVPNManager):
     good one (marker clears, pin succeeds). Default 1 = the very first pin
     recovers (T1/T3)."""
 
-    def __init__(self, cfg, clears_on_pin=1, station=1, shared=None,
-                 tmp_path=None, **kw):
-        super().__init__(cfg, station=station, shared=shared,
-                         tmp_path=tmp_path, **kw)
+    def __init__(self, cfg, clears_on_pin=1, station=1, shared=None, tmp_path=None, **kw):
+        super().__init__(cfg, station=station, shared=shared, tmp_path=tmp_path, **kw)
         self.clears_on_pin = clears_on_pin
         self._pins = 0
 
@@ -108,8 +106,7 @@ def _fast_cfg(tmp_path, **over):
     country makes _pin_country_for_rotation return None — the fast path
     would be dead on arrival.)"""
     over.setdefault("server_countries", "Germany,France,Spain")
-    cfg = _cfg(tmp_path, control_api_key="k", country_rotation=True,
-               wait_healthy_poll=0.01, **over)
+    cfg = _cfg(tmp_path, control_api_key="k", country_rotation=True, wait_healthy_poll=0.01, **over)
     return cfg
 
 
@@ -127,16 +124,16 @@ def _fast_mgr(tmp_path, ip="9.9.9.9", clears_on_pin=1, **over):
     cascade re-pins (vpn_manager 1466). The real parallel bounded sweep
     (commit 2) answers on the first call whenever the tunnel lives — a
     constant IP models that."""
-    mgr = ControlReconnectFake(_fast_cfg(tmp_path, **over), station=1,
-                               tmp_path=tmp_path,
-                               clears_on_pin=clears_on_pin)
+    mgr = ControlReconnectFake(
+        _fast_cfg(tmp_path, **over), station=1, tmp_path=tmp_path, clears_on_pin=clears_on_pin
+    )
 
     async def _constant_ip():
         return ip
 
-    mgr.get_public_ip = _constant_ip          # type: ignore[assignment]
+    mgr.get_public_ip = _constant_ip  # type: ignore[assignment]
     mgr.stdout_by_fragment = {
-        "/v1/vpn/settings": "",                       # accepted (204-equivalent)
+        "/v1/vpn/settings": "",  # accepted (204-equivalent)
         "/v1/vpn/status": '{"status":"running"}',
         "/v1/publicip/ip": '{"public_ip":"%s"}' % ip,
     }
@@ -151,6 +148,7 @@ def _put_scripts(mgr):
 
 # ── _control_exec: script shape + key secrecy ────────────────────
 
+
 class TestControlExec:
     @pytest.mark.asyncio
     async def test_get_script_shape_and_key_secrecy(self, tmp_path):
@@ -158,13 +156,12 @@ class TestControlExec:
         $VPN_CONTROL_API_KEY (expanded inside the container) — the raw key
         value NEVER appears in any argparse element."""
         secret = "s3cr3t-k3y-!!"
-        mgr = ControlFakeVPNManager(
-            _cfg(tmp_path, control_api_key=secret), tmp_path=tmp_path)
+        mgr = ControlFakeVPNManager(_cfg(tmp_path, control_api_key=secret), tmp_path=tmp_path)
         lines = await mgr._control_exec("GET", "/v1/vpn/status", timeout=5)
-        assert lines == []                       # empty stdout -> []
+        assert lines == []  # empty stdout -> []
         script = mgr.last_script()
         assert "wget -q -O - -T 5" in script
-        assert "--header=\"X-API-Key: $VPN_CONTROL_API_KEY\"" in script
+        assert '--header="X-API-Key: $VPN_CONTROL_API_KEY"' in script
         assert " http://127.0.0.1:8000/v1/vpn/status" in script
         # Key secrecy: the raw value is in the container env, not the argv.
         argv_flat = json.dumps(mgr.calls) + "|" + str(mgr.control_scripts)
@@ -174,17 +171,20 @@ class TestControlExec:
     async def test_put_payload_and_method(self, tmp_path):
         """PUT /v1/vpn/settings carries --method=PUT and the EXACT
         country payload the plan specifies, sh-quoted for --body-data."""
-        mgr = ControlFakeVPNManager(
-            _cfg(tmp_path, control_api_key="k"), tmp_path=tmp_path)
-        await mgr._control_exec("PUT", "/v1/vpn/settings",
-                                body=json.dumps({"provider": {
-                                    "server_selection": {"countries": ["France"]}}},
-                                    separators=(",", ":")),
-                                timeout=10)
+        mgr = ControlFakeVPNManager(_cfg(tmp_path, control_api_key="k"), tmp_path=tmp_path)
+        await mgr._control_exec(
+            "PUT",
+            "/v1/vpn/settings",
+            body=json.dumps(
+                {"provider": {"server_selection": {"countries": ["France"]}}}, separators=(",", ":")
+            ),
+            timeout=10,
+        )
         script = mgr.last_script()
         assert " --method=PUT" in script
-        assert "--body-data='{\"provider\":{\"server_selection\":{\"countries\":[\"France\"]}}}'" \
-            in script
+        assert (
+            '--body-data=\'{"provider":{"server_selection":{"countries":["France"]}}}\'' in script
+        )
         assert " http://127.0.0.1:8000/v1/vpn/settings" in script
 
     @pytest.mark.asyncio
@@ -198,17 +198,17 @@ class TestControlExec:
     async def test_nonzero_rc_returns_empty(self, tmp_path):
         """A failing wget (rc != 0) degrades to [] — the callers treat [] as
         'unavailable' and fall back to the legacy path."""
-        mgr = ControlFakeVPNManager(
-            _cfg(tmp_path, control_api_key="k"), tmp_path=tmp_path)
+        mgr = ControlFakeVPNManager(_cfg(tmp_path, control_api_key="k"), tmp_path=tmp_path)
         mgr.control_rc = 1
         assert await mgr._control_exec("GET", "/v1/vpn/status", timeout=5) == []
 
     @pytest.mark.asyncio
     async def test_missing_docker_cli_returns_empty(self, tmp_path):
         """docker CLI absent (RuntimeError from _docker_run) -> [] (fail-open)."""
-        mgr = ControlFakeVPNManager(
-            _cfg(tmp_path, control_api_key="k"), tmp_path=tmp_path)
-        mgr._docker_run = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("docker CLI not found"))
+        mgr = ControlFakeVPNManager(_cfg(tmp_path, control_api_key="k"), tmp_path=tmp_path)
+        mgr._docker_run = lambda *a, **k: (_ for _ in ()).throw(
+            RuntimeError("docker CLI not found")
+        )
         assert await mgr._control_exec("GET", "/v1/vpn/status", timeout=5) == []
 
     @pytest.mark.asyncio
@@ -222,46 +222,44 @@ class TestControlExec:
 
 # ── _control_status / _control_public_ip parsing ─────────────────
 
+
 class TestControlReading:
     @pytest.mark.asyncio
     async def test_status_running(self, tmp_path):
-        mgr = ControlFakeVPNManager(
-            _cfg(tmp_path, control_api_key="k"), tmp_path=tmp_path)
+        mgr = ControlFakeVPNManager(_cfg(tmp_path, control_api_key="k"), tmp_path=tmp_path)
         mgr.control_stdout = '{"status":"running"}'
         assert await mgr._control_status() is True
 
     @pytest.mark.asyncio
     async def test_status_stopped(self, tmp_path):
-        mgr = ControlFakeVPNManager(
-            _cfg(tmp_path, control_api_key="k"), tmp_path=tmp_path)
+        mgr = ControlFakeVPNManager(_cfg(tmp_path, control_api_key="k"), tmp_path=tmp_path)
         mgr.control_stdout = '{"status":"stopped"}'
         assert await mgr._control_status() is False
 
     @pytest.mark.asyncio
     async def test_status_garbage_returns_none(self, tmp_path):
-        mgr = ControlFakeVPNManager(
-            _cfg(tmp_path, control_api_key="k"), tmp_path=tmp_path)
+        mgr = ControlFakeVPNManager(_cfg(tmp_path, control_api_key="k"), tmp_path=tmp_path)
         mgr.control_stdout = "not json"
         assert await mgr._control_status() is None
 
     @pytest.mark.asyncio
     async def test_public_ip(self, tmp_path):
-        mgr = ControlFakeVPNManager(
-            _cfg(tmp_path, control_api_key="k"), tmp_path=tmp_path)
+        mgr = ControlFakeVPNManager(_cfg(tmp_path, control_api_key="k"), tmp_path=tmp_path)
         mgr.control_stdout = '{"public_ip":"1.2.3.4"}'
         assert await mgr._control_public_ip() == "1.2.3.4"
 
 
 # ── _control_pin_country: PUT + poll-until-running ───────────────
 
+
 class TestControlPinCountry:
     @pytest.mark.asyncio
     async def test_pin_success_polls_to_running(self, tmp_path):
         """204 (empty stdout) → poll status until 'running' → True."""
         mgr = ControlFakeVPNManager(
-            _cfg(tmp_path, control_api_key="k",
-                 wait_healthy_poll=0.01),  # fast poll for the test
-            tmp_path=tmp_path)
+            _cfg(tmp_path, control_api_key="k", wait_healthy_poll=0.01),  # fast poll for the test
+            tmp_path=tmp_path,
+        )
         # PUT returns [] (204 success); status returns running.
         mgr.stdout_by_fragment = {
             "/v1/vpn/settings": "",
@@ -274,18 +272,19 @@ class TestControlPinCountry:
 
     @pytest.mark.asyncio
     async def test_pin_normalizes_country_alias(self, tmp_path):
-        """"[incident 17/08] A NordVPN file-style country name is normalized
+        """ "[incident 17/08] A NordVPN file-style country name is normalized
         to gluetun's canonical name BEFORE the PUT — 'Czechia' must be sent
         as 'Czech Republic' (never a 'not in choices' WARN)."""
-        mgr = ControlFakeVPNManager(
-            _cfg(tmp_path, control_api_key="k"), tmp_path=tmp_path)
+        mgr = ControlFakeVPNManager(_cfg(tmp_path, control_api_key="k"), tmp_path=tmp_path)
         mgr.stdout_by_fragment = {
             "/v1/vpn/settings": "",
             "/v1/vpn/status": '{"status":"running"}',
         }
         assert await mgr._control_pin_country("Czechia", timeout=2) is True
-        assert '{"provider":{"server_selection":{"countries":["Czech Republic"]}}}' \
+        assert (
+            '{"provider":{"server_selection":{"countries":["Czech Republic"]}}}'
             in mgr.settings_script()
+        )
         assert "Czechia" not in mgr.settings_script()
 
     @pytest.mark.asyncio
@@ -297,8 +296,8 @@ class TestControlPinCountry:
         self-correction: the 18:11:55Z AUTH_FAILED took ~2 min to clear
         before this fix."""
         mgr = ControlFakeVPNManager(
-            _cfg(tmp_path, control_api_key="k",
-                 wait_healthy_poll=0.01), tmp_path=tmp_path)
+            _cfg(tmp_path, control_api_key="k", wait_healthy_poll=0.01), tmp_path=tmp_path
+        )
         mgr.stdout_by_fragment = {
             "/v1/vpn/settings": "",
             # even if gluetun claims "running", the auth scan decides first
@@ -317,14 +316,13 @@ class TestControlPinCountry:
         the fake; this pins the wider failure surface: BOTH dead-server
         signatures short-circuit a pin."""
         mgr = ControlFakeVPNManager(
-            _cfg(tmp_path, control_api_key="k",
-                 wait_healthy_poll=0.01), tmp_path=tmp_path)
+            _cfg(tmp_path, control_api_key="k", wait_healthy_poll=0.01), tmp_path=tmp_path
+        )
         mgr.stdout_by_fragment = {
             "/v1/vpn/settings": "",
             "/v1/vpn/status": '{"status":"stopped"}',
         }
-        mgr._check_server_issue = \
-            _server_issue_true  # flag-driven TLS failure
+        mgr._check_server_issue = _server_issue_true  # flag-driven TLS failure
         assert await mgr._control_pin_country("Germany", timeout=5) is False
         assert mgr.calls["docker_run"] == 1
 
@@ -337,8 +335,8 @@ class TestControlPinCountry:
         (2.5 min rotations). The body "running" must be ACCEPTED and the
         status poll must then confirm the tunnel is up."""
         mgr = ControlFakeVPNManager(
-            _cfg(tmp_path, control_api_key="k",
-                 wait_healthy_poll=0.01), tmp_path=tmp_path)
+            _cfg(tmp_path, control_api_key="k", wait_healthy_poll=0.01), tmp_path=tmp_path
+        )
         # PUT answers 200 + "running" (the real gluetun success signature);
         # the trailing status poll then confirms running.
         mgr.stdout_by_fragment = {
@@ -346,8 +344,7 @@ class TestControlPinCountry:
             "/v1/vpn/status": '{"status":"running"}',
         }
         assert await mgr._control_pin_country("Poland", timeout=2) is True
-        assert '{"provider":{"server_selection":{"countries":["Poland"]}}}' \
-            in mgr.settings_script()
+        assert '{"provider":{"server_selection":{"countries":["Poland"]}}}' in mgr.settings_script()
         # PUT accepted -> the status poll ran (2 calls total: PUT + poll).
         assert mgr.calls["docker_run"] == 2
 
@@ -357,8 +354,8 @@ class TestControlPinCountry:
         flicker 'stopped' mid-reconnect before 'running'. The poll must keep
         waiting through the transient stop (never report the pin failed)."""
         mgr = ControlFakeVPNManager(
-            _cfg(tmp_path, control_api_key="k",
-                 wait_healthy_poll=0.01), tmp_path=tmp_path)
+            _cfg(tmp_path, control_api_key="k", wait_healthy_poll=0.01), tmp_path=tmp_path
+        )
         mgr.stdout_by_fragment = {
             "/v1/vpn/settings": "running",
             "/v1/vpn/status": '{"status":"stopped"}',
@@ -370,43 +367,45 @@ class TestControlPinCountry:
                 return next(seq)["status"] == "running"
             except StopIteration:
                 return True
+
         mgr._control_status = _flaky_status
         assert await mgr._control_pin_country("France", timeout=3) is True
 
     @pytest.mark.asyncio
     async def test_pin_rejected_nonempty_stdout(self, tmp_path):
         """A non-empty PUT response is an error body → False, no status poll."""
-        mgr = ControlFakeVPNManager(
-            _cfg(tmp_path, control_api_key="k"), tmp_path=tmp_path)
+        mgr = ControlFakeVPNManager(_cfg(tmp_path, control_api_key="k"), tmp_path=tmp_path)
         mgr.control_stdout = '{"message":"bad request"}'
         assert await mgr._control_pin_country("France", timeout=1) is False
-        assert mgr.calls["docker_run"] == 1     # only the PUT, no status poll
+        assert mgr.calls["docker_run"] == 1  # only the PUT, no status poll
 
     @pytest.mark.asyncio
     async def test_pin_rejection_flags_invalid_country_name(self, tmp_path, caplog):
-        """"[incident 17/08] A 'not in choices' rejection (an unknown/typo'd
+        """ "[incident 17/08] A 'not in choices' rejection (an unknown/typo'd
         country name) must be surfaced to the operator with an explicit
         'invalid name → check server_countries' hint, not swallowed as a
         generic error — that WARN is exactly what went unnoticed in the
         live log."""
         import logging
-        mgr = ControlFakeVPNManager(
-            _cfg(tmp_path, control_api_key="k"), tmp_path=tmp_path)
-        mgr.control_stdout = ('ERROR: provider.server_selection.countries: '
-                              'values atlantis are not in choices Afghanistan, '
-                              'Albania, ... Malta')
+
+        mgr = ControlFakeVPNManager(_cfg(tmp_path, control_api_key="k"), tmp_path=tmp_path)
+        mgr.control_stdout = (
+            "ERROR: provider.server_selection.countries: "
+            "values atlantis are not in choices Afghanistan, "
+            "Albania, ... Malta"
+        )
         with caplog.at_level(logging.WARNING, logger="vpn_manager"):
             assert await mgr._control_pin_country("Atlantis", timeout=1) is False
         joined = "\n".join(r.getMessage() for r in caplog.records)
         assert "not in choices" in joined
-        assert "server_countries" in joined             # the actionable hint
+        assert "server_countries" in joined  # the actionable hint
 
     @pytest.mark.asyncio
     async def test_pin_stopped_until_timeout(self, tmp_path):
         """Status stays 'stopped' → poll until the deadline → False."""
         mgr = ControlFakeVPNManager(
-            _cfg(tmp_path, control_api_key="k",
-                 wait_healthy_poll=0.01), tmp_path=tmp_path)
+            _cfg(tmp_path, control_api_key="k", wait_healthy_poll=0.01), tmp_path=tmp_path
+        )
         mgr.stdout_by_fragment = {
             "/v1/vpn/settings": "",
             "/v1/vpn/status": '{"status":"stopped"}',
@@ -417,18 +416,17 @@ class TestControlPinCountry:
     async def test_pin_control_down_falls_back(self, tmp_path):
         """Control server unreachable (rc != 0) → pin fails → the rotation
         path falls back to the legacy container-restart branch."""
-        mgr = ControlFakeVPNManager(
-            _cfg(tmp_path, control_api_key="k"), tmp_path=tmp_path)
+        mgr = ControlFakeVPNManager(_cfg(tmp_path, control_api_key="k"), tmp_path=tmp_path)
         mgr.control_rc = 1
         mgr.ips = ["1.2.3.4"]
         mgr._status = vm.VPNState.DISCONNECTED
         old = await mgr._pin_country_for_rotation()
-        assert old is None                       # no pin, no docker calls
+        assert old is None  # no pin, no docker calls
         # Legacy fallback still rotates fine (compose up + fresh IP).
         new_ip = await mgr.connect_next()
         assert new_ip == "1.2.3.4"
         assert mgr._status == vm.VPNState.CONNECTED
-        assert mgr._current_country is None      # nothing pinned
+        assert mgr._current_country is None  # nothing pinned
 
     @pytest.mark.asyncio
     async def test_catchup_waits_for_real_ip_through_tunnel(self, tmp_path):
@@ -437,8 +435,8 @@ class TestControlPinCountry:
         445 s stall class was a 'connected' tunnel that never answered.
         True the moment an IP answers, not at the catch-up wall."""
         mgr = ControlFakeVPNManager(
-            _cfg(tmp_path, control_api_key="k",
-                 wait_healthy_poll=0.01), tmp_path=tmp_path)
+            _cfg(tmp_path, control_api_key="k", wait_healthy_poll=0.01), tmp_path=tmp_path
+        )
         mgr.stdout_by_fragment = {
             "/v1/vpn/settings": "",
             "/v1/vpn/status": '{"status":"running"}',
@@ -448,11 +446,12 @@ class TestControlPinCountry:
         async def _ip_probe():
             probes.append(1)
             return None if len(probes) < 3 else "1.2.3.4"
-        mgr.get_public_ip = _ip_probe            # type: ignore[assignment]
+
+        mgr.get_public_ip = _ip_probe  # type: ignore[assignment]
 
         assert await mgr._control_pin_country("France", timeout=2, catchup=5) is True
-        assert len(probes) == 3                  # 2 misses, then the IP answers
-        assert len(_put_scripts(mgr)) == 1       # one PUT, no re-pin cascade
+        assert len(probes) == 3  # 2 misses, then the IP answers
+        assert len(_put_scripts(mgr)) == 1  # one PUT, no re-pin cascade
 
     @pytest.mark.asyncio
     async def test_catchup_aborts_fast_on_server_issue(self, tmp_path, caplog):
@@ -462,9 +461,10 @@ class TestControlPinCountry:
         (the pre-status one) so the abort lands only inside the catch-up
         (audit 18/08: an unconditional flag would never enter it)."""
         import logging
+
         mgr = ControlFakeVPNManager(
-            _cfg(tmp_path, control_api_key="k",
-                 wait_healthy_poll=0.01), tmp_path=tmp_path)
+            _cfg(tmp_path, control_api_key="k", wait_healthy_poll=0.01), tmp_path=tmp_path
+        )
         mgr.stdout_by_fragment = {
             "/v1/vpn/settings": "",
             "/v1/vpn/status": '{"status":"running"}',
@@ -475,27 +475,29 @@ class TestControlPinCountry:
         async def _ip_probe():
             probes.append(1)
             return None
-        mgr.get_public_ip = _ip_probe            # type: ignore[assignment]
+
+        mgr.get_public_ip = _ip_probe  # type: ignore[assignment]
 
         async def _failing_in_catchup(*a, **k):
             scans[0] += 1
-            return scans[0] > 1                  # 1st scan passes, catch-up aborts
+            return scans[0] > 1  # 1st scan passes, catch-up aborts
+
         mgr._check_server_issue = _failing_in_catchup
 
         with caplog.at_level(logging.WARNING, logger="vpn_manager"):
             assert await mgr._control_pin_country("Germany", timeout=2, catchup=5) is False
         joined = "\n".join(r.getMessage() for r in caplog.records)
-        assert "during catch-up" in joined       # the INNER abort WARN (audit 18/08)
+        assert "during catch-up" in joined  # the INNER abort WARN (audit 18/08)
         assert "auth/TLS failure" in joined
-        assert len(probes) == 0                  # aborted before any IP probe
+        assert len(probes) == 0  # aborted before any IP probe
 
     @pytest.mark.asyncio
     async def test_catchup_zero_preserves_legacy_pin(self, tmp_path):
         """catchup=0 (the rotation-pin default): 'running' IS the verdict —
         True immediately, ZERO IP probes. Exact legacy behavior."""
         mgr = ControlFakeVPNManager(
-            _cfg(tmp_path, control_api_key="k",
-                 wait_healthy_poll=0.01), tmp_path=tmp_path)
+            _cfg(tmp_path, control_api_key="k", wait_healthy_poll=0.01), tmp_path=tmp_path
+        )
         mgr.stdout_by_fragment = {
             "/v1/vpn/settings": "",
             "/v1/vpn/status": '{"status":"running"}',
@@ -505,7 +507,8 @@ class TestControlPinCountry:
         async def _ip_probe():
             probes.append(1)
             return "1.2.3.4"
-        mgr.get_public_ip = _ip_probe            # type: ignore[assignment]
+
+        mgr.get_public_ip = _ip_probe  # type: ignore[assignment]
 
         assert await mgr._control_pin_country("France", timeout=2) is True
         assert probes == []
@@ -516,23 +519,24 @@ class TestControlPinCountry:
         WARN per pin (59 identical lines in debug.log.1 → this dedupe is
         LOCAL to the pin: a NEW pin warns again, never 59×)."""
         import logging
+
         mgr = ControlFakeVPNManager(
-            _cfg(tmp_path, control_api_key="k",
-                 wait_healthy_poll=0.01), tmp_path=tmp_path)
+            _cfg(tmp_path, control_api_key="k", wait_healthy_poll=0.01), tmp_path=tmp_path
+        )
         mgr.stdout_by_fragment = {
             "/v1/vpn/settings": "",
             "/v1/vpn/status": '{"status":"stopped"}',
         }
-        for _ in range(2):                       # two independent pins
+        for _ in range(2):  # two independent pins
             with caplog.at_level(logging.WARNING, logger="vpn_manager"):
                 assert await mgr._control_pin_country("France", timeout=0.1) is False
-            stopped = [r for r in caplog.records
-                       if "VPN reports stopped" in r.getMessage()]
-            assert len(stopped) == 1             # once per pin, never 59×
+            stopped = [r for r in caplog.records if "VPN reports stopped" in r.getMessage()]
+            assert len(stopped) == 1  # once per pin, never 59×
             caplog.clear()
 
 
 # ── RECOVERY-AWARE log scans ([incident 17/08, live]) ────────────
+
 
 class TestRecoveryAwareScan:
     """[incident 17/08, live] gluetun's OpenVPN retry loop logs an
@@ -559,8 +563,7 @@ class TestRecoveryAwareScan:
         the log_text marker fake — call the REAL VPNManager implementations
         explicitly so the actual scanning logic (docker logs parse, rfind
         ordering, rc handling) is what the tests pin."""
-        mgr = ControlFakeVPNManager(
-            _cfg(tmp_path, control_api_key="k"), tmp_path=tmp_path)
+        mgr = ControlFakeVPNManager(_cfg(tmp_path, control_api_key="k"), tmp_path=tmp_path)
         mgr.control_stdout = log_text
         return mgr
 
@@ -575,27 +578,34 @@ class TestRecoveryAwareScan:
         """AUTH_FAILED followed (gluetun retry loop) by 'Initialization
         Sequence Completed' = the tunnel RECOVERED → _check_auth_failed
         returns False. THIS IS THE LIVE-NO-PAID REGRESSION for 17/08."""
-        mgr = await self._mgr(tmp_path, (
-            "2026-01-01T00:00:00Z AUTH: Received control message: AUTH_FAILED, restarting\n"
-            "2026-01-01T00:00:01Z openvpn: TLS: Initial packet received from [AF_INET]1.1.1.1\n"
-            "2026-01-01T00:00:02Z openvpn: Initialization Sequence Completed\n"))
+        mgr = await self._mgr(
+            tmp_path,
+            (
+                "2026-01-01T00:00:00Z AUTH: Received control message: AUTH_FAILED, restarting\n"
+                "2026-01-01T00:00:01Z openvpn: TLS: Initial packet received from [AF_INET]1.1.1.1\n"
+                "2026-01-01T00:00:02Z openvpn: Initialization Sequence Completed\n"
+            ),
+        )
         assert await self._real_auth(mgr) is False
 
     @pytest.mark.asyncio
     async def test_auth_failed_after_success_is_live(self, tmp_path):
         """AUTH_FAILED as the LAST logged event (rejected on the current
         server, no success after) → live rejection → True."""
-        mgr = await self._mgr(tmp_path, (
-            "2026-01-01T00:00:00Z openvpn: Initialization Sequence Completed\n"
-            "2026-01-01T00:00:01Z AUTH: Received control message: AUTH_FAILED, restarting\n"))
+        mgr = await self._mgr(
+            tmp_path,
+            (
+                "2026-01-01T00:00:00Z openvpn: Initialization Sequence Completed\n"
+                "2026-01-01T00:00:01Z AUTH: Received control message: AUTH_FAILED, restarting\n"
+            ),
+        )
         assert await self._real_auth(mgr) is True
 
     @pytest.mark.asyncio
     async def test_auth_failed_without_any_success_is_live(self, tmp_path):
         """Only AUTH_FAILED lines, never a success → still live → True
         (rfind success = -1, which sorts before any AUTH_FAILED index)."""
-        mgr = await self._mgr(tmp_path,
-                              "AUTH: Received control message: AUTH_FAILED, restarting")
+        mgr = await self._mgr(tmp_path, "AUTH: Received control message: AUTH_FAILED, restarting")
         assert await self._real_auth(mgr) is True
 
     @pytest.mark.asyncio
@@ -608,10 +618,8 @@ class TestRecoveryAwareScan:
     async def test_lowercase_auth_failed_detected(self, tmp_path):
         """The 'auth failed' lowercase signature is also scanned, and the
         ordering rule applies to it too."""
-        mgr = await self._mgr(tmp_path, (
-            "auth failed\n"
-            "Initialization Sequence Completed\n"))
-        assert await self._real_auth(mgr) is False        # recovered
+        mgr = await self._mgr(tmp_path, ("auth failed\nInitialization Sequence Completed\n"))
+        assert await self._real_auth(mgr) is False  # recovered
 
     @pytest.mark.asyncio
     async def test_docker_error_degrades_to_false(self, tmp_path):
@@ -626,17 +634,25 @@ class TestRecoveryAwareScan:
     async def test_tls_then_success_is_stale(self, tmp_path):
         """TLS key negotiation failure superseded by a later success = stale
         (same recovery-aware bounding on the server-issue scan)."""
-        mgr = await self._mgr(tmp_path, (
-            "2026-01-01T00:00:00Z openvpn: TLS Error: TLS key negotiation failed\n"
-            "2026-01-01T00:00:02Z openvpn: Initialization Sequence Completed\n"))
+        mgr = await self._mgr(
+            tmp_path,
+            (
+                "2026-01-01T00:00:00Z openvpn: TLS Error: TLS key negotiation failed\n"
+                "2026-01-01T00:00:02Z openvpn: Initialization Sequence Completed\n"
+            ),
+        )
         assert await self._real_tls(mgr) is False
 
     @pytest.mark.asyncio
     async def test_tls_after_success_is_live(self, tmp_path):
         """TLS failure as the LAST logged event → live server issue → True."""
-        mgr = await self._mgr(tmp_path, (
-            "2026-01-01T00:00:00Z openvpn: Initialization Sequence Completed\n"
-            "2026-01-01T00:00:01Z openvpn: TLS Error: TLS key negotiation failed\n"))
+        mgr = await self._mgr(
+            tmp_path,
+            (
+                "2026-01-01T00:00:00Z openvpn: Initialization Sequence Completed\n"
+                "2026-01-01T00:00:01Z openvpn: TLS Error: TLS key negotiation failed\n"
+            ),
+        )
         assert await self._real_tls(mgr) is True
 
     # --- Phase 1b: LIVE AUTH_FAILED blacklists the current hostname ---
@@ -647,13 +663,17 @@ class TestRecoveryAwareScan:
         event) records the current hostname into _failed_hosts with a 24 h
         TTL — the fast-pin (Phase 1c) will skip that host instead of
         re-pinning it forever."""
-        mgr = await self._mgr(tmp_path, (
-            "2026-01-01T00:00:00Z openvpn: Connecting to [uk2757.nordvpn.com]:443\n"
-            "2026-01-01T00:00:01Z AUTH: Received control message: AUTH_FAILED, restarting\n"))
+        mgr = await self._mgr(
+            tmp_path,
+            (
+                "2026-01-01T00:00:00Z openvpn: Connecting to [uk2757.nordvpn.com]:443\n"
+                "2026-01-01T00:00:01Z AUTH: Received control message: AUTH_FAILED, restarting\n"
+            ),
+        )
         assert await self._real_auth(mgr) is True
         entry = mgr._failed_hosts["uk2757.nordvpn.com"]
         assert entry["failures"] == 1
-        assert entry["bad_until"] - time.time() > 23 * 3600   # ~24 h TTL
+        assert entry["bad_until"] - time.time() > 23 * 3600  # ~24 h TTL
 
     @pytest.mark.asyncio
     async def test_recovered_auth_failed_never_blacklists(self, tmp_path):
@@ -661,10 +681,14 @@ class TestRecoveryAwareScan:
         'Initialization Sequence Completed' (the gluetun retry loop recovered)
         is stale — it must NOT blacklist the host: the tunnel is serving
         traffic through it RIGHT NOW."""
-        mgr = await self._mgr(tmp_path, (
-            "2026-01-01T00:00:00Z openvpn: Connecting to [uk2757.nordvpn.com]:443\n"
-            "2026-01-01T00:00:01Z AUTH: Received control message: AUTH_FAILED, restarting\n"
-            "2026-01-01T00:00:02Z openvpn: Initialization Sequence Completed\n"))
+        mgr = await self._mgr(
+            tmp_path,
+            (
+                "2026-01-01T00:00:00Z openvpn: Connecting to [uk2757.nordvpn.com]:443\n"
+                "2026-01-01T00:00:01Z AUTH: Received control message: AUTH_FAILED, restarting\n"
+                "2026-01-01T00:00:02Z openvpn: Initialization Sequence Completed\n"
+            ),
+        )
         assert await self._real_auth(mgr) is False
         assert mgr._failed_hosts == {}
 
@@ -685,15 +709,21 @@ class TestExtractCurrentHostname:
     {2,4} digits: hu73/gr80/ee77 (2 digits) exist in the 17/08 failure sets
     and a {3,4} pattern would silently miss them → blacklist dead."""
 
-    @pytest.mark.parametrize("text,expected", [
-        # verbosity-4 line, as produced by OPENVPN_VERBOSITY=4
-        ("2026-01-01T00:00:00Z openvpn: Connecting to [uk2757.nordvpn.com]:443 (via xx)"
-         "[AF_INET]1.2.3.4", "uk2757.nordvpn.com"),
-        # two-digit host — the {2,4} regression case (hu73 failed 17/08 ×27)
-        ("Connecting to [hu73.nordvpn.com]:443", "hu73.nordvpn.com"),
-        # bare hostname fallback (no brackets, e.g. older openvpn versions)
-        ("warn: remote host uk1372.nordvpn.com unreachable", "uk1372.nordvpn.com"),
-    ])
+    @pytest.mark.parametrize(
+        "text,expected",
+        [
+            # verbosity-4 line, as produced by OPENVPN_VERBOSITY=4
+            (
+                "2026-01-01T00:00:00Z openvpn: Connecting to [uk2757.nordvpn.com]:443 (via xx)"
+                "[AF_INET]1.2.3.4",
+                "uk2757.nordvpn.com",
+            ),
+            # two-digit host — the {2,4} regression case (hu73 failed 17/08 ×27)
+            ("Connecting to [hu73.nordvpn.com]:443", "hu73.nordvpn.com"),
+            # bare hostname fallback (no brackets, e.g. older openvpn versions)
+            ("warn: remote host uk1372.nordvpn.com unreachable", "uk1372.nordvpn.com"),
+        ],
+    )
     def test_extract(self, text, expected):
         assert vm._extract_current_hostname(text) == expected
 
@@ -706,7 +736,8 @@ class TestExtractCurrentHostname:
             "openvpn: SIGUSR1[soft,auth-failure] received, process restarting\n"
             "openvpn: Connecting to [de707.nordvpn.com]:443\n"
             "openvpn: SIGUSR1[soft,auth-failure] received, process restarting\n"
-            "openvpn: Connecting to [de707.nordvpn.com]:443\n")
+            "openvpn: Connecting to [de707.nordvpn.com]:443\n"
+        )
         assert vm._extract_current_hostname(text) == "de707.nordvpn.com"
 
     def test_no_hostname_returns_none(self):
@@ -716,8 +747,7 @@ class TestExtractCurrentHostname:
     def test_other_provider_ignored(self):
         """gluetun under another provider must never match the NordVPN regex
         (a false positive would blacklist a healthy host)."""
-        assert vm._extract_current_hostname(
-            "Connecting to [srv42.mullvad.net]:443") is None
+        assert vm._extract_current_hostname("Connecting to [srv42.mullvad.net]:443") is None
 
 
 class TestFastRecoverControl:
@@ -794,18 +824,21 @@ class TestFastRecoverControl:
         mgr = _fast_mgr(tmp_path, ip="7.7.7.7")
         now = time.time()
         mgr._failed_hosts["de707.nordvpn.com"] = {
-            "failures": 2, "first_failed_at": now - 300, "bad_until": now + 3600}
+            "failures": 2,
+            "first_failed_at": now - 300,
+            "bad_until": now + 3600,
+        }
         hostnames = iter(["de707.nordvpn.com", "de712.nordvpn.com"])
 
         async def fake_current_hostname(since):
             return next(hostnames, None)
 
-        mgr._current_hostname = fake_current_hostname   # type: ignore[assignment]
+        mgr._current_hostname = fake_current_hostname  # type: ignore[assignment]
         mgr.log_text = "AUTH: Received control message: AUTH_FAILED, restarting"
         await mgr._watchdog_tick()
         puts = _put_scripts(mgr)
-        assert len(puts) in (0, 2)                       # 1st pin → skip, 2nd → keep (0 on Windows httpx path)
-        assert mgr.finalize_calls == 1              # only the un-blacklisted host finalized
+        assert len(puts) in (0, 2)  # 1st pin → skip, 2nd → keep (0 on Windows httpx path)
+        assert mgr.finalize_calls == 1  # only the un-blacklisted host finalized
         assert mgr.calls["compose_up"] == 0
         assert mgr._status == vm.VPNState.CONNECTED
 
@@ -820,21 +853,32 @@ class TestFastRecoverControl:
         healthy stack."""
         mgr = _fast_mgr(tmp_path)
         now = time.time()
-        for host in ("de707.nordvpn.com", "de712.nordvpn.com",
-                     "de1372.nordvpn.com", "uk2757.nordvpn.com"):
+        for host in (
+            "de707.nordvpn.com",
+            "de712.nordvpn.com",
+            "de1372.nordvpn.com",
+            "uk2757.nordvpn.com",
+        ):
             mgr._failed_hosts[host] = {
-                "failures": 2, "first_failed_at": now - 300, "bad_until": now + 3600}
-        async def fake_hostname(since):
-            return "de707.nordvpn.com"   # always blacklisted
+                "failures": 2,
+                "first_failed_at": now - 300,
+                "bad_until": now + 3600,
+            }
 
-        mgr._current_hostname = fake_hostname   # type: ignore[assignment]
+        async def fake_hostname(since):
+            return "de707.nordvpn.com"  # always blacklisted
+
+        mgr._current_hostname = fake_hostname  # type: ignore[assignment]
         mgr.log_text = "AUTH: Received control message: AUTH_FAILED, restarting"
         await mgr._watchdog_tick()
-        assert len(_put_scripts(mgr)) in (0, 5)   # 4 fast-pin skips + recovery-tail re-pin (0 on Windows httpx path)
-        assert mgr.calls["restart"] == 1         # the light rung healed the tunnel
-        assert mgr.calls["compose_up"] == 0      # compose never needed
+        assert len(_put_scripts(mgr)) in (
+            0,
+            5,
+        )  # 4 fast-pin skips + recovery-tail re-pin (0 on Windows httpx path)
+        assert mgr.calls["restart"] == 1  # the light rung healed the tunnel
+        assert mgr.calls["compose_up"] == 0  # compose never needed
         assert mgr.finalize_calls == 1
-        assert mgr._status == vm.VPNState.CONNECTED   # fresh IP on the new server
+        assert mgr._status == vm.VPNState.CONNECTED  # fresh IP on the new server
 
     @pytest.mark.asyncio
     async def test_no_pin_possible_restart_rung_recovers(self, tmp_path):
@@ -849,8 +893,8 @@ class TestFastRecoverControl:
         mgr.log_text = "AUTH: Received control message: AUTH_FAILED, restarting"
         await mgr._watchdog_tick()
         assert len(_put_scripts(mgr)) == 0
-        assert mgr.calls["restart"] == 1         # the light rung healed the tunnel
-        assert mgr.calls["compose_up"] == 0      # compose never needed
+        assert mgr.calls["restart"] == 1  # the light rung healed the tunnel
+        assert mgr.calls["compose_up"] == 0  # compose never needed
         assert mgr._status == vm.VPNState.CONNECTED
 
     @pytest.mark.asyncio
@@ -861,9 +905,11 @@ class TestFastRecoverControl:
         compose is 2 rungs deeper) — single-station control-less configs
         keep working through the restart rung, which heals the tunnel and
         finalizes a fresh IP without compose."""
-        mgr = FakeVPNManager(_cfg(tmp_path, country_rotation=True,
-                                  server_countries="Germany,France,Spain"),
-                             tmp_path=tmp_path)
+        mgr = FakeVPNManager(
+            _cfg(tmp_path, country_rotation=True, server_countries="Germany,France,Spain"),
+            tmp_path=tmp_path,
+        )
+
         # CONSTANT probe, not the base fake's one-shot FIFO: the recovery
         # tail probes TWICE (finalize pops, then refresh_status re-probes
         # for CONNECTED) — a consumed FIFO would starve the second call
@@ -872,11 +918,11 @@ class TestFastRecoverControl:
         async def _constant_ip():
             return "5.6.7.8"
 
-        mgr.get_public_ip = _constant_ip      # type: ignore[assignment]
+        mgr.get_public_ip = _constant_ip  # type: ignore[assignment]
         mgr.log_text = "AUTH_FAILED"
         await mgr._watchdog_tick()
-        assert mgr.calls["restart"] == 1         # the light rung healed the tunnel
-        assert mgr.calls["compose_up"] == 0      # compose never needed
+        assert mgr.calls["restart"] == 1  # the light rung healed the tunnel
+        assert mgr.calls["compose_up"] == 0  # compose never needed
         assert mgr._status == vm.VPNState.CONNECTED
 
 
@@ -891,8 +937,10 @@ class TestFailedHostsPersistence:
         mgr = _fast_mgr(tmp_path)
         bad_until = time.time() + 3600
         mgr._failed_hosts["de707.nordvpn.com"] = {
-            "failures": 3, "first_failed_at": time.time() - 300,
-            "bad_until": bad_until}
+            "failures": 3,
+            "first_failed_at": time.time() - 300,
+            "bad_until": bad_until,
+        }
         mgr.save_state()
         mgr._failed_hosts = {}
         mgr.load_state()
@@ -903,7 +951,10 @@ class TestFailedHostsPersistence:
     def test_expired_blacklist_pruned_on_load(self, tmp_path):
         mgr = _fast_mgr(tmp_path)
         mgr._failed_hosts["fr869.nordvpn.com"] = {
-            "failures": 31, "first_failed_at": 1000.0, "bad_until": 1000.0}
+            "failures": 31,
+            "first_failed_at": 1000.0,
+            "bad_until": 1000.0,
+        }
         mgr.save_state()
         mgr._failed_hosts = {}
         mgr.load_state()
@@ -912,7 +963,10 @@ class TestFailedHostsPersistence:
     def test_blacklist_pruned_when_checked_after_ttl(self, tmp_path):
         mgr = _fast_mgr(tmp_path)
         mgr._failed_hosts["fr869.nordvpn.com"] = {
-            "failures": 31, "first_failed_at": 1000.0, "bad_until": 1000.0}
+            "failures": 31,
+            "first_failed_at": 1000.0,
+            "bad_until": 1000.0,
+        }
         assert mgr._host_blacklisted("fr869.nordvpn.com") is False
         assert mgr._failed_hosts == {}
 
@@ -923,8 +977,7 @@ class StackFakeVPNManager(ControlFakeVPNManager):
     tests must assert the compose argv itself (both stations, no pull)."""
 
     def __init__(self, cfg, station=1, shared=None, tmp_path=None, **kw):
-        super().__init__(cfg, station=station, shared=shared,
-                         tmp_path=tmp_path, **kw)
+        super().__init__(cfg, station=station, shared=shared, tmp_path=tmp_path, **kw)
         self.run_args = []
 
     def _docker_run(self, args, timeout=30, env=None):
@@ -938,8 +991,7 @@ def _stack_mgr(tmp_path, monkeypatch, key=True, **cfg_over):
     read-modify-write and the compose argv both stay in tmp (the real .env
     holds secrets). ``key=True`` pre-creates tmp_path/wireguard.env so the
     "auto" resolution (and the wireguard flip guard) see a key."""
-    monkeypatch.setenv("VPN_DOCKER_COMPOSE_FILE",
-                       str(tmp_path / "docker-compose.yml"))
+    monkeypatch.setenv("VPN_DOCKER_COMPOSE_FILE", str(tmp_path / "docker-compose.yml"))
     if key:
         (tmp_path / "wireguard.env").write_text("WIREGUARD_PRIVATE_KEY=abc\n")
     return StackFakeVPNManager(_cfg(tmp_path, **cfg_over), tmp_path=tmp_path)
@@ -967,8 +1019,8 @@ class TestStackSelector:
         # The .env next to the compose file already holds unrelated keys —
         # the read-modify-write must preserve them.
         (tmp_path / ".env").write_text(
-            "# secrets must survive\nOPENCODE_API_KEY=super-secret\n"
-            "VPN_TYPE_STATION1=openvpn\n")
+            "# secrets must survive\nOPENCODE_API_KEY=super-secret\nVPN_TYPE_STATION1=openvpn\n"
+        )
         res = await mgr.set_stack("wireguard")
         assert res == {"ok": True, "effective": "wireguard"}
         assert mgr._stack == "wireguard"
@@ -979,9 +1031,15 @@ class TestStackSelector:
         # Exactly ONE compose call for BOTH stations, no pull.
         assert mgr.calls["docker_run"] == 1
         assert mgr.run_args[-1] == [
-            "compose", "-f", str(tmp_path / "docker-compose.yml"),
-            "up", "-d", "--force-recreate",
-            "vpn-gluetun", "vpn-gluetun-2"]
+            "compose",
+            "-f",
+            str(tmp_path / "docker-compose.yml"),
+            "up",
+            "-d",
+            "--force-recreate",
+            "vpn-gluetun",
+            "vpn-gluetun-2",
+        ]
         assert "pull" not in mgr.run_args[-1]
         # Flip journal (cap 20, ISO-Z timestamp).
         assert len(mgr._flips) == 1
@@ -999,16 +1057,13 @@ class TestStackSelector:
         mgr._now_fn = lambda: clock["t"]
         mgr._stack_effective = "openvpn"
         mgr._stack_since = clock["t"]
-        mgr._auth_failed_window = [clock["t"] - 1000, clock["t"] - 900,
-                                   clock["t"] - 800]
+        mgr._auth_failed_window = [clock["t"] - 1000, clock["t"] - 900, clock["t"] - 800]
         assert mgr._auto_flip_decision() == ("wireguard", "3 AUTH_FAILED/30min")
         # Stale entries outside the 30-min window are pruned, not counted.
-        mgr._auth_failed_window = [clock["t"] - 2000, clock["t"] - 1000,
-                                   clock["t"] - 900]
+        mgr._auth_failed_window = [clock["t"] - 2000, clock["t"] - 1000, clock["t"] - 900]
         assert mgr._auto_flip_decision() is None
         # A manual selection (non-auto) never flips on its own.
-        mgr._auth_failed_window = [clock["t"] - 1000, clock["t"] - 900,
-                                   clock["t"] - 800]
+        mgr._auth_failed_window = [clock["t"] - 1000, clock["t"] - 900, clock["t"] - 800]
         mgr._stack = "openvpn"
         assert mgr._auto_flip_decision() is None
 
@@ -1018,8 +1073,7 @@ class TestStackSelector:
         clock = {"t": 1_000_000.0}
         mgr._now_fn = lambda: clock["t"]
         mgr._stack_effective = "openvpn"
-        mgr._auth_failed_window = [clock["t"] - 1000, clock["t"] - 900,
-                                   clock["t"] - 800]
+        mgr._auth_failed_window = [clock["t"] - 1000, clock["t"] - 900, clock["t"] - 800]
         # Flipped 100 s ago: inside the 30-min cooldown → no second flip.
         mgr._last_auto_flip_at = clock["t"] - 100
         assert mgr._auto_flip_decision() is None
@@ -1040,7 +1094,9 @@ class TestStackSelector:
         # 5/5: the flip IS the recovery.
         mgr._egress_failures = mgr._auto_wg_egress_ticks
         assert mgr._auto_flip_decision() == (
-            "openvpn", f"egress dead {mgr._auto_wg_egress_ticks} ticks")
+            "openvpn",
+            f"egress dead {mgr._auto_wg_egress_ticks} ticks",
+        )
 
     @pytest.mark.asyncio
     async def test_t6d_healthy_ov_returns_to_wireguard(self, tmp_path, monkeypatch):
@@ -1050,8 +1106,7 @@ class TestStackSelector:
         mgr._stack_effective = "openvpn"
         # Healthy OV for > 60 min, zero failures → back to the preferred WG.
         mgr._stack_since = clock["t"] - 3601
-        assert mgr._auto_flip_decision() == (
-            "wireguard", "OV healthy 60 min — return to WG")
+        assert mgr._auto_flip_decision() == ("wireguard", "OV healthy 60 min — return to WG")
         # Not yet 60 min → stay on OpenVPN.
         mgr._stack_since = clock["t"] - 3599
         assert mgr._auto_flip_decision() is None
@@ -1071,10 +1126,9 @@ class TestStackSelector:
         mgr._egress_failures = mgr._auto_wg_egress_ticks - 1
         await mgr._watchdog_tick()
         assert mgr._stack_effective == "openvpn"
-        assert mgr._stack == "auto"          # auto mode is NOT deselected
+        assert mgr._stack == "auto"  # auto mode is NOT deselected
         assert mgr.calls["docker_run"] == 1  # exactly the flip compose
-        assert mgr.run_args[-1][:3] == ["compose", "-f",
-                                        str(tmp_path / "docker-compose.yml")]
+        assert mgr.run_args[-1][:3] == ["compose", "-f", str(tmp_path / "docker-compose.yml")]
         assert mgr._last_auto_flip_at is not None  # cooldown armed
         flip = mgr._flips[-1]
         assert flip["from"] == "wireguard" and flip["to"] == "openvpn"
@@ -1091,11 +1145,11 @@ class TestStackSelector:
         """3 live AUTH_FAILED in the 30-min window on a healthy-but-OV
         station → the next tick flips to WG (preferred stack)."""
         mgr = _stack_mgr(tmp_path, monkeypatch)
-        mgr._stack_effective = "openvpn"     # e.g. after an auto flip to OV
+        mgr._stack_effective = "openvpn"  # e.g. after an auto flip to OV
         mgr._stack_since = mgr._now_fn()
         t = mgr._now_fn()
         mgr._auth_failed_window = [t - 500, t - 400, t - 300]
-        mgr.ips = ["1.2.3.4"]                # tunnel healthy — no recovery needed
+        mgr.ips = ["1.2.3.4"]  # tunnel healthy — no recovery needed
         await mgr._watchdog_tick()
         assert mgr._stack_effective == "wireguard"
         assert mgr._stack == "auto"
@@ -1120,8 +1174,8 @@ class TestStackSelector:
         assert not mgr._wg_key_present()
         res = await mgr.set_stack("wireguard")
         assert res["ok"] is False
-        assert mgr.calls["docker_run"] == 0       # compose never called
-        assert not (tmp_path / ".env").exists()   # nothing written
+        assert mgr.calls["docker_run"] == 0  # compose never called
+        assert not (tmp_path / ".env").exists()  # nothing written
         assert mgr._stack_effective == "openvpn"
         assert mgr._flips == []
         # Auto mode on a keyless box can never decide a WG flip either.

@@ -63,3 +63,6 @@ pp1.json
 tmp/
 tests/_*.txt
 *_diff_tmp.txt
+
+# Kilo Code
+.kilo/

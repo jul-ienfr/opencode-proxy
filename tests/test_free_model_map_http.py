@@ -29,6 +29,7 @@ real writer against a tmp config.yaml):
     monkeypatched ``api.__file__`` — the repo config.yaml is never
     written).
 """
+
 import sqlite3
 
 import yaml
@@ -46,6 +47,7 @@ from dashboard.api import register_dashboard
 class _FakeMgr:
     """Station manager slice: update_config only (free_model_map must
     never reach it)."""
+
     def __init__(self, station):
         self._station = station
         self.config_updates = []
@@ -83,10 +85,9 @@ def ctx(tmp_path, monkeypatch):
     persisted = []
     monkeypatch.setattr(api, "_persist_vpn_config", lambda u: persisted.append(dict(u)))
     fmm_persisted = []
-    monkeypatch.setattr(api, "_persist_free_model_map",
-                        lambda m: fmm_persisted.append(dict(m)))
+    monkeypatch.setattr(api, "_persist_free_model_map", lambda m: fmm_persisted.append(dict(m)))
 
-    saved = dict(st.FREE_MODEL_MAP)           # restore the live map on exit
+    saved = dict(st.FREE_MODEL_MAP)  # restore the live map on exit
     yield fast, s1, s2, pool, persisted, fmm_persisted
     st.FREE_MODEL_MAP.clear()
     st.FREE_MODEL_MAP.update(saved)
@@ -104,6 +105,7 @@ def _get_config(app):
 
 # ── hot-reload semantics ─────────────────────────────────────────
 
+
 def test_free_model_map_replaces_map_in_place(ctx):
     """A partial POST replaces the WHOLE map (clear+update — the handler
     is a full-map endpoint, not a merge)."""
@@ -114,8 +116,9 @@ def test_free_model_map_replaces_map_in_place(ctx):
 
     assert resp["ok"] is True
     assert st.FREE_MODEL_MAP == posted, "whole-map replacement"
-    assert st.FREE_MODEL_MAP is api.config_settings.FREE_MODEL_MAP, \
+    assert st.FREE_MODEL_MAP is api.config_settings.FREE_MODEL_MAP, (
         "the shared dict was mutated in place (no rebind)"
+    )
 
 
 def test_free_model_map_visible_without_restart(ctx):
@@ -140,10 +143,8 @@ def test_free_model_map_consumed_not_fanned_out(ctx):
     resp = _post(fast, {"free_model_map": posted, "quota_per_ip": 9})
 
     assert resp["ok"] is True
-    assert persisted == [{"quota_per_ip": 9}], \
-        "free_model_map excluded from _persist_vpn_config"
-    assert fmm_persisted == [posted], \
-        "free_model_map persisted through its own helper"
+    assert persisted == [{"quota_per_ip": 9}], "free_model_map excluded from _persist_vpn_config"
+    assert fmm_persisted == [posted], "free_model_map persisted through its own helper"
     assert s1.config_updates == [{"quota_per_ip": 9}]
     assert s2.config_updates == [{"quota_per_ip": 9}]
     assert pool.updates == [{"quota_per_ip": 9}]
@@ -164,39 +165,34 @@ def test_free_model_map_mirror_synced(ctx):
 
 # ── the real writer (end-to-end against a tmp config.yaml) ───────
 
+
 def test_persist_free_model_map_writes_top_level_key(tmp_path, monkeypatch):
     """The writer puts free_model_map at the TOP LEVEL — ip_rotation and
     the other sections must survive untouched. ``api.__file__`` is
     monkeypatched so the resolver finds the tmp config.yaml (the repo
     file is never written by tests)."""
-    monkeypatch.setattr(api, "__file__",
-                        str(tmp_path / "dashboard" / "api.py"))
+    monkeypatch.setattr(api, "__file__", str(tmp_path / "dashboard" / "api.py"))
     repo_yaml = {
         "server": {"host": "0.0.0.0", "port": 4000},
-        "ip_rotation": {"enabled": True, "station_count": 3,
-                        "vpn_stack": "wireguard"},
-        "custom_routes": {"kimik26": {"match": ["kimi-k2.6"],
-                                      "model": "deepseek-v4-flash"}},
+        "ip_rotation": {"enabled": True, "station_count": 3, "vpn_stack": "wireguard"},
+        "custom_routes": {"kimik26": {"match": ["kimi-k2.6"], "model": "deepseek-v4-flash"}},
     }
     (tmp_path / "config.yaml").write_text(
-        yaml.dump(repo_yaml, default_flow_style=False, sort_keys=False),
-        encoding="utf-8")
+        yaml.dump(repo_yaml, default_flow_style=False, sort_keys=False), encoding="utf-8"
+    )
 
     api._persist_free_model_map({"glm-5.1": "deepseek-v4-flash-free"})
 
     got = yaml.safe_load((tmp_path / "config.yaml").read_text(encoding="utf-8"))
     assert got["free_model_map"] == {"glm-5.1": "deepseek-v4-flash-free"}
-    assert got["ip_rotation"] == repo_yaml["ip_rotation"], \
-        "ip_rotation block untouched"
-    assert got["custom_routes"] == repo_yaml["custom_routes"], \
-        "other sections untouched"
+    assert got["ip_rotation"] == repo_yaml["ip_rotation"], "ip_rotation block untouched"
+    assert got["custom_routes"] == repo_yaml["custom_routes"], "other sections untouched"
     assert got["server"] == repo_yaml["server"]
 
 
 def test_persist_free_model_map_missing_file_is_noop(tmp_path, monkeypatch):
     """config.yaml absent → best-effort no-op, no exception."""
-    monkeypatch.setattr(api, "__file__",
-                        str(tmp_path / "dashboard" / "api.py"))
+    monkeypatch.setattr(api, "__file__", str(tmp_path / "dashboard" / "api.py"))
     api._persist_free_model_map({"glm-5.1": "deepseek-v4-flash-free"})
     assert not (tmp_path / "config.yaml").exists()
 

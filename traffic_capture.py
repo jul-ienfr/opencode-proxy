@@ -28,8 +28,8 @@ from typing import Optional
 
 
 # Body stored per frame, above which the raw dump is truncated (bytes).
-_DEF_BODY_CAP = 131072            # 128 KiB
-_DEF_MAX_FRAMES = 500             # ring buffer length
+_DEF_BODY_CAP = 131072  # 128 KiB
+_DEF_MAX_FRAMES = 500  # ring buffer length
 _DEF_MAX_BYTES = 32 * 1024 * 1024  # global stored-body budget (32 MiB)
 
 # Paths excluded from capture (dashboard self-noise / health probes).
@@ -39,10 +39,15 @@ _SKIP_PREFIXES = ("/static/", "/health", "/api/traffic")
 # dashboard — credential-shaped values must never be stored. Header values
 # are replaced at capture time; bodies/query get a single regex pass at
 # frame completion (values → "[REDACTED]", so the dump keeps its shape).
-_SENSITIVE_HEADERS = frozenset({
-    "authorization", "proxy-authorization", "x-api-key", "cookie",
-    "set-cookie",
-})
+_SENSITIVE_HEADERS = frozenset(
+    {
+        "authorization",
+        "proxy-authorization",
+        "x-api-key",
+        "cookie",
+        "set-cookie",
+    }
+)
 
 
 def _header_is_sensitive(name: str) -> bool:
@@ -55,10 +60,12 @@ def _header_is_sensitive(name: str) -> bool:
 
 _BODY_SECRET_RE = re.compile(
     r'(?i)("[a-z0-9_.-]*(?:api[_-]?key|auth|cookie|token|password|secret|credential)'
-    r'[a-z0-9_.-]*"\s*:\s*")([^"\\]*(?:\\.[^"\\]*)*)(")')
-_BEARER_RE = re.compile(r'(?i)(\bbearer\s+)[A-Za-z0-9._~+/\-=]+')
+    r'[a-z0-9_.-]*"\s*:\s*")([^"\\]*(?:\\.[^"\\]*)*)(")'
+)
+_BEARER_RE = re.compile(r"(?i)(\bbearer\s+)[A-Za-z0-9._~+/\-=]+")
 _FORM_SECRET_RE = re.compile(
-    r'(?i)([?&](?:api[_-]?key|go_auth_cookie|auth|token|password|secret|credential)=)[^&\s]+')
+    r"(?i)([?&](?:api[_-]?key|go_auth_cookie|auth|token|password|secret|credential)=)[^&\s]+"
+)
 
 
 def _redact_body(raw: bytes) -> bytes:
@@ -71,9 +78,9 @@ def _redact_body(raw: bytes) -> bytes:
         text = raw.decode("utf-8", "replace")
     except Exception:
         return raw
-    text = _BODY_SECRET_RE.sub(r'\1[REDACTED]\3', text)
-    text = _BEARER_RE.sub(r'\1[REDACTED]', text)
-    text = _FORM_SECRET_RE.sub(r'\1[REDACTED]', text)
+    text = _BODY_SECRET_RE.sub(r"\1[REDACTED]\3", text)
+    text = _BEARER_RE.sub(r"\1[REDACTED]", text)
+    text = _FORM_SECRET_RE.sub(r"\1[REDACTED]", text)
     return text.encode("utf-8")
 
 
@@ -90,16 +97,39 @@ class _Frame:
     """One captured client request (appended at request start, completed later)."""
 
     __slots__ = (
-        "id", "ts", "delta_ms", "method", "path", "query", "version",
-        "client_ip", "client_port", "headers",
-        "body", "body_len", "truncated",
-        "status", "ttfb_ms", "duration_ms", "aborted", "abort_reason",
+        "id",
+        "ts",
+        "delta_ms",
+        "method",
+        "path",
+        "query",
+        "version",
+        "client_ip",
+        "client_port",
+        "headers",
+        "body",
+        "body_len",
+        "truncated",
+        "status",
+        "ttfb_ms",
+        "duration_ms",
+        "aborted",
+        "abort_reason",
     )
 
-    def __init__(self, fid: int, ts: float, delta_ms: float, method: str,
-                 path: str, query: str, version: str,
-                 client_ip: str, client_port: Optional[int],
-                 headers: list[tuple[str, str]]):
+    def __init__(
+        self,
+        fid: int,
+        ts: float,
+        delta_ms: float,
+        method: str,
+        path: str,
+        query: str,
+        version: str,
+        client_ip: str,
+        client_port: Optional[int],
+        headers: list[tuple[str, str]],
+    ):
         self.id = fid
         self.ts = ts
         self.delta_ms = delta_ms
@@ -110,10 +140,10 @@ class _Frame:
         self.client_ip = client_ip
         self.client_port = client_port
         self.headers = headers
-        self.body: Optional[bytes] = None   # set at completion
-        self.body_len = 0                    # full wire byte count
+        self.body: Optional[bytes] = None  # set at completion
+        self.body_len = 0  # full wire byte count
         self.truncated = False
-        self.status: Optional[int] = None    # None while in flight
+        self.status: Optional[int] = None  # None while in flight
         self.ttfb_ms: Optional[float] = None
         self.duration_ms: Optional[float] = None
         self.aborted = False
@@ -164,8 +194,13 @@ class TrafficCapture:
         self._bytes = 0
         self._last_ts: Optional[float] = None
 
-    def configure(self, enabled: bool | None = None, max_frames: int | None = None,
-                  body_cap: int | None = None, max_bytes: int | None = None) -> None:
+    def configure(
+        self,
+        enabled: bool | None = None,
+        max_frames: int | None = None,
+        body_cap: int | None = None,
+        max_bytes: int | None = None,
+    ) -> None:
         if enabled is not None:
             self.enabled = bool(enabled)
         if max_frames is not None:
@@ -182,9 +217,16 @@ class TrafficCapture:
 
     # ── lifecycle (called by the middleware) ─────────────────────
 
-    def _start(self, method: str, path: str, query: str, version: str,
-               client_ip: str, client_port: Optional[int],
-               headers: list[tuple[str, str]]) -> _Frame:
+    def _start(
+        self,
+        method: str,
+        path: str,
+        query: str,
+        version: str,
+        client_ip: str,
+        client_port: Optional[int],
+        headers: list[tuple[str, str]],
+    ) -> _Frame:
         """Register a pending frame; evict when over the budgets."""
         self._counter += 1
         now = time.time()
@@ -193,9 +235,10 @@ class TrafficCapture:
             delta = (now - self._last_ts) * 1000.0
         self._last_ts = now
         # Query strings can carry credentials (?api_key=...) — redact.
-        query = _FORM_SECRET_RE.sub(r'\1[REDACTED]', query)
-        frame = _Frame(self._counter, now, delta, method, path, query,
-                       version, client_ip, client_port, headers)
+        query = _FORM_SECRET_RE.sub(r"\1[REDACTED]", query)
+        frame = _Frame(
+            self._counter, now, delta, method, path, query, version, client_ip, client_port, headers
+        )
         self._frames.append(frame)
         self._by_id[frame.id] = frame
         while len(self._frames) > self.max_frames:
@@ -222,9 +265,15 @@ class TrafficCapture:
             self._evict_oldest()
         return self._bytes
 
-    def _finish(self, frame: _Frame, status: Optional[int],
-                ttfb_ms: Optional[float], duration_ms: float,
-                aborted: bool, abort_reason: Optional[str]) -> None:
+    def _finish(
+        self,
+        frame: _Frame,
+        status: Optional[int],
+        ttfb_ms: Optional[float],
+        duration_ms: float,
+        aborted: bool,
+        abort_reason: Optional[str],
+    ) -> None:
         """Complete a pending frame (called exactly once at the end)."""
         if frame.id not in self._by_id:
             return  # already evicted by the byte budget — drop
@@ -283,10 +332,16 @@ class TrafficCapture:
             "newest_ts": newest.ts if newest else None,
         }
 
-    def frames(self, limit: int = 200, offset: int = 0,
-               method: Optional[str] = None, path: Optional[str] = None,
-               status: Optional[int] = None, aborted: Optional[bool] = None,
-               since: Optional[float] = None) -> list[dict]:
+    def frames(
+        self,
+        limit: int = 200,
+        offset: int = 0,
+        method: Optional[str] = None,
+        path: Optional[str] = None,
+        status: Optional[int] = None,
+        aborted: Optional[bool] = None,
+        since: Optional[float] = None,
+    ) -> list[dict]:
         """Newest-first slice of frame metadata (no bodies)."""
         limit = max(1, min(limit, 1000))
         out: list[dict] = []
@@ -379,19 +434,16 @@ def hex_dump(data: bytes, bytes_per_row: int = 16) -> list[dict]:
     rows: list[dict] = []
     n = len(data)
     for off in range(0, n, bytes_per_row):
-        chunk = data[off: off + bytes_per_row]
+        chunk = data[off : off + bytes_per_row]
         hex_parts = []
         for g in range(0, len(chunk), 2):
-            pair = chunk[g: g + 2]
+            pair = chunk[g : g + 2]
             hex_parts.append("".join(f"{b:02x}" for b in pair))
-        ascii_gutter = "".join(
-            chr(b) if 0x20 <= b < 0x7F else "." for b in chunk
-        )
+        ascii_gutter = "".join(chr(b) if 0x20 <= b < 0x7F else "." for b in chunk)
         hex_str = " ".join(hex_parts)
         if len(hex_str) < (bytes_per_row * 3 - 1):  # pad groups for alignment
             hex_str = hex_str.ljust(bytes_per_row * 3 - 1)
-        rows.append({"offset": off, "hex": hex_str, "ascii": ascii_gutter,
-                     "len": len(chunk)})
+        rows.append({"offset": off, "hex": hex_str, "ascii": ascii_gutter, "len": len(chunk)})
     return rows
 
 
@@ -432,7 +484,7 @@ class TrafficCaptureMiddleware:
                 name = k.decode("latin-1")
                 value = v.decode("latin-1")
                 if _header_is_sensitive(name):
-                    value = "[REDACTED]"   # never store a raw credential (finding i)
+                    value = "[REDACTED]"  # never store a raw credential (finding i)
                 headers.append((name, value))
         except Exception:
             pass
@@ -480,10 +532,14 @@ class TrafficCaptureMiddleware:
         elif send_aborted and response_started:
             aborted, reason = True, "client reset while response streaming (RST)"
         elif send_aborted:
-            aborted, reason = True, f"request aborted: {type(error).__name__}" if error else "request aborted"
+            aborted, reason = (
+                True,
+                f"request aborted: {type(error).__name__}" if error else "request aborted",
+            )
 
-        cap._finish(frame, status, frame.ttfb_ms,
-                    (time.monotonic() - start) * 1000.0, aborted, reason)
+        cap._finish(
+            frame, status, frame.ttfb_ms, (time.monotonic() - start) * 1000.0, aborted, reason
+        )
 
         if error is not None:
             raise error

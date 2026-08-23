@@ -21,6 +21,7 @@ Trois volets :
     loop »), CONNECTED sur IP fraîche, flag déposé par la borne recovery,
     tick suivant sain sans second restart.
 """
+
 import logging
 import subprocess
 import time
@@ -48,33 +49,35 @@ class _ChurnScanMgr(FakeVPNManager):
         self.log_rc = 0
 
     def _docker_run(self, args, timeout=30, env=None):
-        super()._docker_run(args, timeout=timeout, env=env)   # call counter
+        super()._docker_run(args, timeout=timeout, env=env)  # call counter
         self.docker_log_args.append(args)
-        return subprocess.CompletedProcess(
-            args, self.log_rc, stdout=self.log_stdout, stderr="")
+        return subprocess.CompletedProcess(args, self.log_rc, stdout=self.log_stdout, stderr="")
 
 
 # ── real scan: _check_restart_churn ──────────────────────────────
+
 
 @pytest.mark.asyncio
 async def test_scan_counts_markers_against_threshold(tmp_path):
     """The REAL scan: < threshold markers → False, ≥ threshold → True. No
     recovery boundary yet → the scan window is `--since {window}m`."""
     mgr = _ChurnScanMgr(_cfg(tmp_path, vpn_stack="wireguard"), tmp_path=tmp_path)
-    mgr.log_stdout = MARKER * 3            # 3 markers < default threshold 4
+    mgr.log_stdout = MARKER * 3  # 3 markers < default threshold 4
     assert await mgr._check_restart_churn(mgr._restart_churn_window_min) is False
-    mgr.log_stdout = MARKER * 4            # threshold reached
+    mgr.log_stdout = MARKER * 4  # threshold reached
     assert await mgr._check_restart_churn(mgr._restart_churn_window_min) is True
     assert mgr.docker_log_args[-1] == [
-        "logs", "--since", f"{mgr._restart_churn_window_min}m",
-        mgr._docker_container]
+        "logs",
+        "--since",
+        f"{mgr._restart_churn_window_min}m",
+        mgr._docker_container,
+    ]
 
 
 @pytest.mark.asyncio
 async def test_scan_respects_configured_threshold(tmp_path):
     """restart_churn_threshold from the config (not the hard default)."""
-    mgr = _ChurnScanMgr(_cfg(tmp_path, restart_churn_threshold=2),
-                        tmp_path=tmp_path)
+    mgr = _ChurnScanMgr(_cfg(tmp_path, restart_churn_threshold=2), tmp_path=tmp_path)
     mgr.log_stdout = MARKER * 2
     assert await mgr._check_restart_churn(mgr._restart_churn_window_min) is True
 
@@ -96,11 +99,10 @@ async def test_scan_snaps_to_recovery_boundary(tmp_path):
     filters the pre-recovery markers out, so a healed tunnel is NOT
     re-flagged from its own history (no recovery loop at vpn_manager)."""
     mgr = _ChurnScanMgr(_cfg(tmp_path, vpn_stack="wireguard"), tmp_path=tmp_path)
-    mgr._restart_churn_recovered_at = time.time()   # recovered just now
-    mgr.log_stdout = ""                 # post-boundary window: nothing fresh
+    mgr._restart_churn_recovered_at = time.time()  # recovered just now
+    mgr.log_stdout = ""  # post-boundary window: nothing fresh
     assert await mgr._check_restart_churn(10) is False
-    assert mgr.docker_log_args[-1] == [
-        "logs", "--since", "1s", mgr._docker_container]
+    assert mgr.docker_log_args[-1] == ["logs", "--since", "1s", mgr._docker_container]
 
 
 @pytest.mark.asyncio
@@ -110,13 +112,14 @@ async def test_scan_fresh_markers_after_recovery_rearm(tmp_path):
     them (docker returns only post-boundary lines)."""
     mgr = _ChurnScanMgr(_cfg(tmp_path, vpn_stack="wireguard"), tmp_path=tmp_path)
     mgr._restart_churn_recovered_at = time.time() - 5
-    mgr.log_stdout = MARKER * 4          # fresh markers, post-boundary
+    mgr.log_stdout = MARKER * 4  # fresh markers, post-boundary
     assert await mgr._check_restart_churn(mgr._restart_churn_window_min) is True
     since = mgr.docker_log_args[-1][2]
     assert since.endswith("s") and since != f"{mgr._restart_churn_window_min}m"
 
 
 # ── refresh_status wiring ────────────────────────────────────────
+
 
 @pytest.mark.asyncio
 async def test_refresh_status_churn_arms_watchdog(tmp_path):
@@ -148,6 +151,7 @@ async def test_refresh_status_clean_logs_no_churn(tmp_path):
 
 # ── watchdog tick: churn avec probe VIVANTE ──────────────────────
 
+
 @pytest.mark.asyncio
 async def test_watchdog_tick_churn_recovers_immediately(tmp_path, caplog):
     """Le cas central du plan : probe SOCKS5 VIVANTE (fenêtre vivante) mais
@@ -160,14 +164,15 @@ async def test_watchdog_tick_churn_recovers_immediately(tmp_path, caplog):
     # refresh (1) — FIFO exact du flux.
     mgr.ips = ["5.5.5.5"] * 4
     mgr.log_text = MARKER * 4
-    await mgr.refresh_status(force=True)        # arms via the scan
+    await mgr.refresh_status(force=True)  # arms via the scan
     assert mgr._restart_churn is True
 
     with caplog.at_level(logging.WARNING, logger="vpn_manager"):
         await mgr._watchdog_tick()
 
-    assert any("healthcheck restart loop" in r.getMessage()
-               for r in caplog.records), "kind du failing block"
+    assert any("healthcheck restart loop" in r.getMessage() for r in caplog.records), (
+        "kind du failing block"
+    )
     assert mgr.calls["restart"] == 1
     assert mgr.calls["compose_up"] == 0, "recovery légère suffit"
     assert mgr._status == vm.VPNState.CONNECTED
@@ -175,15 +180,15 @@ async def test_watchdog_tick_churn_recovers_immediately(tmp_path, caplog):
     assert mgr._restart_churn_recovered_at is not None, "borne posée"
     assert mgr._restart_churn is False, "flag déposé par le scan borné"
 
-    await mgr._watchdog_tick()                  # tick sain
+    await mgr._watchdog_tick()  # tick sain
 
     assert mgr.calls["restart"] == 1, "pas de second restart"
     assert mgr._egress_failures == 0
-    assert mgr.scan_since == [10, 10, 10], \
-        "3 scans: arm, recovery interne, tick sain"
+    assert mgr.scan_since == [10, 10, 10], "3 scans: arm, recovery interne, tick sain"
 
 
 # ── apply/rollback : borne du scan sur le refresh post-recreate ───
+
 
 @pytest.mark.asyncio
 async def test_apply_update_snaps_churn_scan_after_recreate(tmp_path):
@@ -193,8 +198,8 @@ async def test_apply_update_snaps_churn_scan_after_recreate(tmp_path):
     les marqueurs de churn antérieurs à l'update ne re-arment pas le
     watchdog pour un restart docker inutile après chaque mise à jour."""
     mgr = _ChurnScanMgr(_cfg(tmp_path, vpn_stack="wireguard"), tmp_path=tmp_path)
-    mgr.log_stdout = MARKER * 4          # churn actif avant l'update
-    mgr.ips = ["9.9.9.9"]                # refresh interne après recreate
+    mgr.log_stdout = MARKER * 4  # churn actif avant l'update
+    mgr.ips = ["9.9.9.9"]  # refresh interne après recreate
     mgr._update_available = True
     mgr._update_old_image_id = "sha256:old"
     mgr._UPDATE_LOCK_PATH = str(tmp_path / "vpn_update.lock")
@@ -202,6 +207,7 @@ async def test_apply_update_snaps_churn_scan_after_recreate(tmp_path):
     async def _finalize(allow_stale=False):
         mgr._current_ip = "9.9.9.9"
         return True
+
     mgr._finalize_ip = _finalize
 
     res = await mgr.apply_update(check_opportune=False)
@@ -209,8 +215,7 @@ async def test_apply_update_snaps_churn_scan_after_recreate(tmp_path):
     assert res.get("ok") is True
     scans = [a for a in mgr.docker_log_args if a[:2] == ["logs", "--since"]]
     assert scans, "le refresh interne a scanné les logs du conteneur"
-    assert scans[-1][2] == "1s", \
-        "fenêtre bornée APRÈS le recreate (anti stale-marker)"
+    assert scans[-1][2] == "1s", "fenêtre bornée APRÈS le recreate (anti stale-marker)"
 
 
 @pytest.mark.asyncio
@@ -230,10 +235,12 @@ async def test_rollback_snaps_churn_scan_after_recreate(tmp_path):
     async def _finalize(allow_stale=False):
         mgr._current_ip = "9.9.9.9"
         return True
+
     mgr._finalize_ip = _finalize
 
     async def _unhealthy(timeout=120.0):
-        return None                     # tunnel pas healthy → rollback
+        return None  # tunnel pas healthy → rollback
+
     mgr._wait_healthy = _unhealthy
 
     res = await mgr.apply_update(check_opportune=False)
@@ -242,5 +249,4 @@ async def test_rollback_snaps_churn_scan_after_recreate(tmp_path):
     assert "tunnel not healthy" in res.get("error", ""), "rollback déclenché"
     scans = [a for a in mgr.docker_log_args if a[:2] == ["logs", "--since"]]
     assert scans, "le refresh du rollback a scanné les logs"
-    assert scans[-1][2] == "1s", \
-        "rollback: fenêtre bornée APRÈS le recreate (anti stale-marker)"
+    assert scans[-1][2] == "1s", "rollback: fenêtre bornée APRÈS le recreate (anti stale-marker)"

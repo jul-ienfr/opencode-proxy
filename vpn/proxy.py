@@ -11,28 +11,28 @@ PROXY_PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8888
 def handle_client(client_socket):
     """Forward HTTP requests through tun0."""
     try:
-        request = client_socket.recv(4096).decode('utf-8', errors='replace')
+        request = client_socket.recv(4096).decode("utf-8", errors="replace")
         if not request:
             client_socket.close()
             return
 
         # Parse the request
-        first_line = request.split('\n')[0]
-        method = first_line.split(' ')[0]
-        url = first_line.split(' ')[1]
+        first_line = request.split("\n")[0]
+        method = first_line.split(" ")[0]
+        url = first_line.split(" ")[1]
 
-        if method == 'CONNECT':
+        if method == "CONNECT":
             # HTTPS tunnel
-            host, port = url.split(':')
+            host, port = url.split(":")
             port = int(port)
             try:
                 # Connect to target through tun0
                 remote = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 remote.settimeout(30)
                 # Force through tun0 by setting source interface
-                remote.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, b'tun0')
+                remote.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, b"tun0")
                 remote.connect((host, port))
-                client_socket.send(b'HTTP/1.1 200 Connection Established\r\n\r\n')
+                client_socket.send(b"HTTP/1.1 200 Connection Established\r\n\r\n")
 
                 # Forward data
                 while True:
@@ -54,23 +54,23 @@ def handle_client(client_socket):
         else:
             # HTTP request
             # Extract host from URL
-            if url.startswith('http://'):
-                host = url.split('/')[2]
-                path = '/' + '/'.join(url.split('/')[3:])
+            if url.startswith("http://"):
+                host = url.split("/")[2]
+                path = "/" + "/".join(url.split("/")[3:])
             else:
-                host = first_line.split(' ')[1]
-                path = '/'
+                host = first_line.split(" ")[1]
+                path = "/"
 
             try:
                 remote = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 remote.settimeout(30)
-                remote.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, b'tun0')
+                remote.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, b"tun0")
                 remote.connect((host, 80))
 
                 # Rebuild request with just the path
-                lines = request.split('\n')
-                lines[0] = f'{method} {path} HTTP/1.1'
-                new_request = '\n'.join(lines)
+                lines = request.split("\n")
+                lines[0] = f"{method} {path} HTTP/1.1"
+                new_request = "\n".join(lines)
 
                 remote.sendall(new_request.encode())
                 response = remote.recv(4096)
@@ -94,9 +94,9 @@ def handle_client(client_socket):
 def main():
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind(('0.0.0.0', PROXY_PORT))
+    server.bind(("0.0.0.0", PROXY_PORT))
     server.listen(5)
-    print(f'HTTP proxy listening on port {PROXY_PORT}')
+    print(f"HTTP proxy listening on port {PROXY_PORT}")
 
     while True:
         client_socket, addr = server.accept()
@@ -105,5 +105,5 @@ def main():
         thread.start()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

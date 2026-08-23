@@ -25,6 +25,7 @@ system):
     real reason ("No such container" is success). stop() (shutdown) never
     calls docker.
 """
+
 import os
 import subprocess
 
@@ -42,8 +43,7 @@ class _Rec(FakeVPNManager):
     so the recorder witnesses the exact compose argv."""
 
     def __init__(self, cfg, station=1, shared=None, tmp_path=None, **kw):
-        super().__init__(cfg, station=station, shared=shared,
-                         tmp_path=tmp_path, **kw)
+        super().__init__(cfg, station=station, shared=shared, tmp_path=tmp_path, **kw)
         self.cmds = []
 
     def _docker_run(self, args, timeout=30, env=None):
@@ -72,11 +72,11 @@ def _seed_env(tmp_path, **kv):
 
 def _managers(tmp_path, n):
     """n recorder managers wired into the live registry."""
-    return [_Rec(_cfg(tmp_path), station=s, tmp_path=tmp_path)
-            for s in range(1, n + 1)]
+    return [_Rec(_cfg(tmp_path), station=s, tmp_path=tmp_path) for s in range(1, n + 1)]
 
 
 # ── _apply_stack over the N-station registry ─────────────────────
+
 
 @pytest.mark.asyncio
 async def test_apply_stack_four_stations_writes_env_and_composes(tmp_path, monkeypatch):
@@ -90,8 +90,13 @@ async def test_apply_stack_four_stations_writes_env_and_composes(tmp_path, monke
     # .env next to the compose file carries OTHER keys (VPN_TYPE plain, a
     # secret) plus stale per-station vars from a former N=7 deployment.
     compose = tmp_path / "docker-compose.yml"
-    _seed_env(tmp_path, VPN_TYPE="openvpn", SOME_SECRET="abc123",
-              VPN_TYPE_STATION5="openvpn", VPN_TYPE_STATION7="wireguard")
+    _seed_env(
+        tmp_path,
+        VPN_TYPE="openvpn",
+        SOME_SECRET="abc123",
+        VPN_TYPE_STATION5="openvpn",
+        VPN_TYPE_STATION7="wireguard",
+    )
     monkeypatch.setenv("VPN_DOCKER_COMPOSE_FILE", str(compose))
 
     assert await managers[0]._apply_stack("wireguard") is True
@@ -104,9 +109,18 @@ async def test_apply_stack_four_stations_writes_env_and_composes(tmp_path, monke
     assert env["VPN_TYPE"] == "openvpn", "non-station vars preserved"
     assert env["SOME_SECRET"] == "abc123", "secrets preserved"
     (args, timeout, _env) = managers[0].cmds[-1]
-    assert args == ["compose", "-f", str(compose), "up", "-d",
-                    "--force-recreate", "vpn-gluetun", "vpn-gluetun-2",
-                    "vpn-gluetun-3", "vpn-gluetun-4"]
+    assert args == [
+        "compose",
+        "-f",
+        str(compose),
+        "up",
+        "-d",
+        "--force-recreate",
+        "vpn-gluetun",
+        "vpn-gluetun-2",
+        "vpn-gluetun-3",
+        "vpn-gluetun-4",
+    ]
     assert timeout == 300
     assert managers[0]._stack_effective == "wireguard"
     assert managers[0]._flips[-1]["to"] == "wireguard"
@@ -120,11 +134,11 @@ async def test_apply_stack_noop_when_already_effective(tmp_path, monkeypatch):
     # defeat the setup) — hence the key file is seeded BEFORE construction.
     (tmp_path / "wireguard.env").write_text("PRIVATE_KEY=x\n", encoding="utf-8")
     m = _Rec(_cfg(tmp_path, vpn_stack="auto"), tmp_path=tmp_path)
-    assert m._stack_effective == "wireguard"      # key present + auto stack
+    assert m._stack_effective == "wireguard"  # key present + auto stack
     monkeypatch.setattr(shared_state, "vpn_managers", [m], raising=False)
     monkeypatch.setenv("VPN_DOCKER_COMPOSE_FILE", str(tmp_path / "c.yml"))
 
-    assert await m._apply_stack("wireguard") is True    # short-circuit
+    assert await m._apply_stack("wireguard") is True  # short-circuit
     assert m.cmds == [], "no compose call on a no-op"
     assert not m._flips, "no flip journaled"
     # [fix 19/08] the no-op still re-syncs the .env: an upscaled station
@@ -137,7 +151,7 @@ async def test_apply_stack_noop_when_already_effective(tmp_path, monkeypatch):
 @pytest.mark.asyncio
 async def test_apply_stack_refuses_wireguard_without_key(tmp_path, monkeypatch):
     m = _Rec(_cfg(tmp_path), tmp_path=tmp_path)
-    m._stack_effective = "openvpn"                # no wireguard.env present
+    m._stack_effective = "openvpn"  # no wireguard.env present
     monkeypatch.setattr(shared_state, "vpn_managers", [m], raising=False)
     monkeypatch.setenv("VPN_DOCKER_COMPOSE_FILE", str(tmp_path / "c.yml"))
 
@@ -148,7 +162,7 @@ async def test_apply_stack_refuses_wireguard_without_key(tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_apply_stack_downscale_prunes_stale_keys(tmp_path, monkeypatch):
-    managers = _managers(tmp_path, 3)             # registry now 3 stations
+    managers = _managers(tmp_path, 3)  # registry now 3 stations
     monkeypatch.setattr(shared_state, "vpn_managers", managers, raising=False)
     for m in managers:
         m._stack_effective = "wireguard"
@@ -164,9 +178,17 @@ async def test_apply_stack_downscale_prunes_stale_keys(tmp_path, monkeypatch):
     assert "VPN_TYPE_STATION4" not in env, "downscaled station-4 var pruned"
     assert "VPN_TYPE_STATION6" not in env
     (args, _, _) = managers[0].cmds[-1]
-    assert args == ["compose", "-f", str(compose), "up", "-d",
-                    "--force-recreate", "vpn-gluetun", "vpn-gluetun-2",
-                    "vpn-gluetun-3"]
+    assert args == [
+        "compose",
+        "-f",
+        str(compose),
+        "up",
+        "-d",
+        "--force-recreate",
+        "vpn-gluetun",
+        "vpn-gluetun-2",
+        "vpn-gluetun-3",
+    ]
 
 
 @pytest.mark.asyncio
@@ -188,11 +210,10 @@ async def test_apply_stack_fallback_legacy_pair_when_registry_empty(tmp_path, mo
 
     m3 = _Rec(_cfg(tmp_path), station=3, tmp_path=tmp_path)
     m3._stack_effective = "openvpn"
-    os.remove(tmp_path / ".env")                  # fresh env for station 3
+    os.remove(tmp_path / ".env")  # fresh env for station 3
     assert await m3._apply_stack("wireguard") is True
     env3 = _env_map(tmp_path / ".env")
-    assert set(k for k in env3 if k.startswith("VPN_TYPE_STATION")) == \
-        {"VPN_TYPE_STATION3"}
+    assert set(k for k in env3 if k.startswith("VPN_TYPE_STATION")) == {"VPN_TYPE_STATION3"}
     assert m3.cmds[-1][0][-1] == "vpn-gluetun-3"
 
 
@@ -201,8 +222,8 @@ async def test_apply_stack_compose_failure_does_not_advance(tmp_path, monkeypatc
     class _Fail(_Rec):
         def _docker_run(self, args, timeout=30, env=None):
             self.cmds.append((list(args), timeout, dict(env) if env else None))
-            return subprocess.CompletedProcess(args, 1, stdout="",
-                                               stderr="boom")
+            return subprocess.CompletedProcess(args, 1, stdout="", stderr="boom")
+
     m = _Fail(_cfg(tmp_path), tmp_path=tmp_path)
     (tmp_path / "wireguard.env").write_text("PRIVATE_KEY=x\n", encoding="utf-8")
     m._stack_effective = "openvpn"
@@ -216,6 +237,7 @@ async def test_apply_stack_compose_failure_does_not_advance(tmp_path, monkeypatc
 
 # ── stop_container (downscale) vs stop (shutdown) ────────────────
 
+
 @pytest.mark.asyncio
 async def test_stop_container_argv_exact(tmp_path, monkeypatch):
     """[fix 19/08] downscale = compose stop THEN docker rm -f (the retired
@@ -225,11 +247,11 @@ async def test_stop_container_argv_exact(tmp_path, monkeypatch):
     compose = tmp_path / "docker-compose.yml"
     monkeypatch.setenv("VPN_DOCKER_COMPOSE_FILE", str(compose))
     await m.stop_container()
-    assert m.cmds[0][0] == ["compose", "-f", str(compose), "stop",
-                            "vpn-gluetun"]
+    assert m.cmds[0][0] == ["compose", "-f", str(compose), "stop", "vpn-gluetun"]
     assert m.cmds[0][1] == 120
-    assert m.cmds[0][2]["VPN_TYPE_STATION1"] == m._stack_effective, \
+    assert m.cmds[0][2]["VPN_TYPE_STATION1"] == m._stack_effective, (
         "compose stop child carries the explicit stack env (garde 2.1)"
+    )
     assert m.cmds[1] == (["rm", "-f", "opencode-vpn"], 120, None)
 
 
@@ -237,12 +259,12 @@ async def test_stop_container_argv_exact(tmp_path, monkeypatch):
 async def test_stop_container_rm_failed_is_real_error(tmp_path, monkeypatch):
     """compose stop failure is best-effort (container may already be dead) —
     only a docker rm failure that is NOT 'No such container' raises."""
+
     class _Fail(_Rec):
         def _docker_run(self, args, timeout=30, env=None):
-            self.cmds.append((list(args), timeout,
-                              dict(env) if env else None))   # record, then fail
-            return subprocess.CompletedProcess(args, 1, stdout="",
-                                               stderr="boom")
+            self.cmds.append((list(args), timeout, dict(env) if env else None))  # record, then fail
+            return subprocess.CompletedProcess(args, 1, stdout="", stderr="boom")
+
     m = _Fail(_cfg(tmp_path), tmp_path=tmp_path)
     monkeypatch.setenv("VPN_DOCKER_COMPOSE_FILE", str(tmp_path / "c.yml"))
     # "docker rm failed" (not "compose stop failed") proves the rm WAS
@@ -255,14 +277,15 @@ async def test_stop_container_rm_failed_is_real_error(tmp_path, monkeypatch):
 async def test_stop_container_already_removed_is_ok(tmp_path, monkeypatch):
     """'No such container' from docker rm is success — a station deleted by
     an earlier pass must not raise (downscale is idempotent)."""
+
     class _Gone(_Rec):
         def _docker_run(self, args, timeout=30, env=None):
-            stderr = "Not Found: No such container: opencode-vpn" \
-                if args[0] == "rm" else ""
+            stderr = "Not Found: No such container: opencode-vpn" if args[0] == "rm" else ""
             return subprocess.CompletedProcess(args, 1, stdout="", stderr=stderr)
+
     m = _Gone(_cfg(tmp_path), tmp_path=tmp_path)
     monkeypatch.setenv("VPN_DOCKER_COMPOSE_FILE", str(tmp_path / "c.yml"))
-    await m.stop_container()      # must NOT raise
+    await m.stop_container()  # must NOT raise
 
 
 @pytest.mark.asyncio
@@ -274,5 +297,4 @@ async def test_stop_never_calls_docker(tmp_path, monkeypatch):
     monkeypatch.setenv("VPN_DOCKER_COMPOSE_FILE", str(tmp_path / "c.yml"))
     await m.stop()
     assert m.cmds == [], "stop() must never touch docker"
-    assert m._state_file and os.path.exists(m._state_file), \
-        "stop() persists the vpn state"
+    assert m._state_file and os.path.exists(m._state_file), "stop() persists the vpn state"

@@ -13,6 +13,7 @@ the read on timeout.
 Test 1 (test_stall_is_bridged_not_killed) is the regression: with the old
 code the data chunk after the stall never arrives.
 """
+
 import asyncio
 
 import pytest
@@ -55,6 +56,7 @@ class TestKeepalive:
         and the chunk wakeup, so load can't flip the order; under load a
         second ping may fire, and the invariant that matters is the bridge.
         """
+
         async def gen():
             yield b"a"
             await asyncio.sleep(0.15)
@@ -74,8 +76,7 @@ class TestKeepalive:
         arrived. New behaviour: the ping fires, the read keeps waiting, and
         the chunk arrives once the upstream wakes up.
         """
-        out = await _consume(oc._sse_keepalive(
-            _gen_that_stalls(0.10, b"late"), interval=0.05))
+        out = await _consume(oc._sse_keepalive(_gen_that_stalls(0.10, b"late"), interval=0.05))
         assert out == [b"first", b": ping\n\n", b"late"]
 
     @pytest.mark.asyncio
@@ -87,8 +88,7 @@ class TestKeepalive:
         flip run-to-run. interval 0.02 (>=1 tick) vs stall 0.20 (>=12 ticks)
         leaves the ping count far from the assertion boundary.
         """
-        out = await _consume(oc._sse_keepalive(
-            _gen_that_stalls(0.20, b"late"), interval=0.02))
+        out = await _consume(oc._sse_keepalive(_gen_that_stalls(0.20, b"late"), interval=0.02))
         pings = [c for c in out if c == b": ping\n\n"]
         assert len(pings) >= 3
         assert out[-1] == b"late"
@@ -101,11 +101,12 @@ class TestKeepalive:
         fires before the chunk; gap 0.02 (1 tick) is always under the
         interval, so it can never produce a second ping.
         """
+
         async def gen():
             yield b"a"
-            await asyncio.sleep(0.09)   # one ping
+            await asyncio.sleep(0.09)  # one ping
             yield b"b"
-            await asyncio.sleep(0.02)   # under interval — no ping
+            await asyncio.sleep(0.02)  # under interval — no ping
             yield b"c"
 
         out = await _consume(oc._sse_keepalive(gen(), interval=0.05))
@@ -122,6 +123,7 @@ class TestKeepalive:
     @pytest.mark.asyncio
     async def test_upstream_error_ends_gracefully(self):
         """An upstream exception is logged and the stream ends (no raise)."""
+
         async def gen():
             yield b"a"
             raise RuntimeError("upstream exploded")

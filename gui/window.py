@@ -19,7 +19,10 @@ class DashboardWindow:
         try:
             for line in iter(proc.stderr.readline, b""):
                 if line.strip():
-                    print(f"[dashboard] {line.decode('utf-8', errors='replace').strip()}", file=sys.stderr)
+                    print(
+                        f"[dashboard] {line.decode('utf-8', errors='replace').strip()}",
+                        file=sys.stderr,
+                    )
         except ValueError:
             pass  # pipe closed
 

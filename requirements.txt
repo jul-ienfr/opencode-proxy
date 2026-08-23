@@ -1,16 +1,20 @@
-fastapi>=0.100,<1
-uvicorn[standard]>=0.20,<1
-httpx[socks,http2]>=0.24,<1
-rich>=13,<15
-tiktoken>=0.7.0
-pystray>=0.19,<1
-Pillow>=10,<11
-pywebview>=5,<7
-pyyaml>=6,<7
-duckduckgo-search>=7,<8
-curl_cffi>=0.5,<1
-orjson>=3.9,<4
-uvloop>=0.19; sys_platform != "win32"
-httptools>=0.6
-redis>=5,<7
-gunicorn>=21,<23
+# Pinned 2026-08-23 — generated from ranges via `pip freeze` / `pip index versions`
+# Source unique: requirements.txt (requirements.lock removed — see audit F-H7)
+# To regenerate with hashes: `pip install pip-tools && pip-compile --generate-hashes requirements.in -o requirements.txt`
+# or `uv pip compile requirements.in --generate-hashes -o requirements.txt`
+fastapi==0.129.2
+uvicorn[standard]==0.41.0
+httpx[socks,http2]==0.28.1
+rich==14.3.3
+tiktoken==0.12.0
+pystray==0.19.5
+Pillow==10.4.0
+pywebview==6.1
+pyyaml==6.0.2
+duckduckgo-search==7.5.5
+curl_cffi==0.14.0
+orjson==3.11.7
+uvloop==0.22.1; sys_platform != "win32"
+httptools==0.7.1
+redis==6.4.0
+gunicorn==22.0.0

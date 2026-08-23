@@ -35,6 +35,7 @@ Never touches the live system: fake docker (inspect/restart/compose-up),
 FIFO get_public_ip, flag-driven log scans, escalation chain stubbed to
 record-only, per-station state files in tmp_path.
 """
+
 import asyncio
 import contextlib
 import os
@@ -70,9 +71,9 @@ def _cfg(tmp_path, **over):
         "proxy_mode": "vpn",
         "switch_delay": 0,
         "identity_rotation": True,
-        "identity_diversity": False,          # explicit profiles, no expansion
+        "identity_diversity": False,  # explicit profiles, no expansion
         "identity_profiles": [dict(p) for p in PROFILES],
-        "watchdog_backoff_base": 15.0,        # config.yaml ships 15/60
+        "watchdog_backoff_base": 15.0,  # config.yaml ships 15/60
         "watchdog_backoff_max": 60.0,
         # [plan 18/08 §1d] armed tick cadence + probe budget + threshold.
         # Symbolic values — tests read mgr._auto_wg_egress_ticks, never a
@@ -123,29 +124,33 @@ class FakeVPNManager(vm.VPNManager):
             self._stack_effective = "openvpn"
         else:
             self._stack_effective = "wireguard" if os.path.exists(self._wg_key_file) else "openvpn"
-        self.ips = []                       # FIFO answers for get_public_ip()
-        self.probe_delay = 0.0              # sleep before answering (wall test)
+        self.ips = []  # FIFO answers for get_public_ip()
+        self.probe_delay = 0.0  # sleep before answering (wall test)
         self.container_present = True
-        self.log_text = ""                  # container logs: AUTH_FAILED marker
+        self.log_text = ""  # container logs: AUTH_FAILED marker
         self.clear_logs_on_restart = True
-        self.calls = {"restart": 0, "compose_up": 0, "inspect": 0,
-                      "force_recreate": 0}
+        self.calls = {"restart": 0, "compose_up": 0, "inspect": 0, "force_recreate": 0}
         self.escalations = 0
         self.finalize_calls = 0
-        self.scan_since = []                # windows passed to the churn scan
+        self.scan_since = []  # windows passed to the churn scan
 
     # ── docker fakes ─────────────────────────────────────────────
     async def _docker_inspect(self):
         self.calls["inspect"] += 1
         if not self.container_present:
             return {}
-        return {"running": True, "healthy": True, "restarting": False,
-                "started_at": "2026-01-01T00:00:00Z", "mounts": []}
+        return {
+            "running": True,
+            "healthy": True,
+            "restarting": False,
+            "started_at": "2026-01-01T00:00:00Z",
+            "mounts": [],
+        }
 
     async def _docker_restart(self):
         self.calls["restart"] += 1
         if self.clear_logs_on_restart:
-            self.log_text = ""              # fresh logs after restart
+            self.log_text = ""  # fresh logs after restart
 
     async def _compose_up(self, force_recreate=False):
         self.calls["compose_up"] += 1
@@ -203,21 +208,24 @@ class FakeVPNManager(vm.VPNManager):
     async def _watchdog_escalate(self):
         self.escalations += 1
 
-    async def _finalize_ip(self, allow_stale=False):   # spy over the real one
+    async def _finalize_ip(self, allow_stale=False):  # spy over the real one
         self.finalize_calls += 1
         return await super()._finalize_ip(allow_stale=allow_stale)
 
 
 def _shared(tmp_path):
     """One real SharedRotationState on a tmp file (cross-station tests)."""
-    return shared_rotation.SharedRotationState({
-        "shared_rotation_file": str(tmp_path / "shared_rotation.json"),
-        "recent_ip_window": 20,
-        "recent_ip_max_age": 1800,
-    })
+    return shared_rotation.SharedRotationState(
+        {
+            "shared_rotation_file": str(tmp_path / "shared_rotation.json"),
+            "recent_ip_window": 20,
+            "recent_ip_max_age": 1800,
+        }
+    )
 
 
 # ── _finalize_ip ─────────────────────────────────────────────────
+
 
 class TestFinalizeIp:
     @pytest.mark.asyncio
@@ -228,27 +236,26 @@ class TestFinalizeIp:
         mgr.ips = ["9.9.9.9"]
         assert await mgr._finalize_ip(allow_stale=False) is True
         assert mgr._current_ip == "9.9.9.9"
-        assert shared.is_recent("9.9.9.9")             # registry records it
+        assert shared.is_recent("9.9.9.9")  # registry records it
         assert mgr._auth_failed is False
         # Advance BEFORE journalize — the entry carries the NEW face (index 1)
         assert mgr._identity_index == 1
         assert mgr._ip_history[-1]["ip"] == "9.9.9.9"
         assert mgr._ip_history[-1]["identity"] == "firefox144"
         assert mgr._ip_history[-1]["identity_index"] == 1
-        assert mgr._ip_history[-1]["identity"] == \
-            mgr._live_identity.get("impersonate") or ""
+        assert mgr._ip_history[-1]["identity"] == mgr._live_identity.get("impersonate") or ""
 
     @pytest.mark.asyncio
     async def test_recent_ip_rejected_then_fresh(self, tmp_path):
         """A recent IP is rejected on round 0 → container restart → fresh
         IP accepted on round 1."""
         shared = _shared(tmp_path)
-        shared.record_ip("1.1.1.1", 1)                 # used recently
+        shared.record_ip("1.1.1.1", 1)  # used recently
         mgr = FakeVPNManager(_cfg(tmp_path), shared=shared, tmp_path=tmp_path)
         mgr.ips = ["1.1.1.1", "2.2.2.2"]
         assert await mgr._finalize_ip(allow_stale=False) is True
         assert mgr._current_ip == "2.2.2.2"
-        assert mgr.calls["restart"] >= 1               # re-picked a server
+        assert mgr.calls["restart"] >= 1  # re-picked a server
         assert mgr._ip_history[-1]["ip"] == "2.2.2.2"
         assert mgr._ip_history[-1]["identity"] == "firefox144"
 
@@ -262,8 +269,8 @@ class TestFinalizeIp:
         mgr.ips = ["1.1.1.1", "1.1.1.1", "1.1.1.1"]
         assert await mgr._finalize_ip(allow_stale=False) is False
         assert mgr._current_ip is None
-        assert mgr._identity_index == 0                # nothing committed
-        assert mgr.calls["restart"] == 2               # rounds 0,1 only
+        assert mgr._identity_index == 0  # nothing committed
+        assert mgr.calls["restart"] == 2  # rounds 0,1 only
 
     @pytest.mark.asyncio
     async def test_allow_stale_accepts_on_last_attempt(self, tmp_path):
@@ -275,15 +282,17 @@ class TestFinalizeIp:
         mgr.ips = ["1.1.1.1", "1.1.1.1", "1.1.1.1"]
         assert await mgr._finalize_ip(allow_stale=True) is True
         assert mgr._current_ip == "1.1.1.1"
-        assert mgr._identity_index == 1                # advanced, face committed
+        assert mgr._identity_index == 1  # advanced, face committed
 
     @pytest.mark.asyncio
     async def test_dead_probe_never_escapes(self, tmp_path):
         """A probe exception (network dead) is a failed attempt, never an
         exception escaping to _watchdog_tick / connect."""
         mgr = FakeVPNManager(_cfg(tmp_path), tmp_path=tmp_path)
+
         async def boom():
             raise RuntimeError("network dead")
+
         mgr.get_public_ip = boom
         assert await mgr._finalize_ip(allow_stale=False) is False
         assert mgr._current_ip is None
@@ -292,8 +301,7 @@ class TestFinalizeIp:
     async def test_identity_rotation_off_pins_index(self, tmp_path):
         """identity_rotation: false → no advance, chrome131 forever
         (retrocompat gate)."""
-        mgr = FakeVPNManager(_cfg(tmp_path, identity_rotation=False),
-                             tmp_path=tmp_path)
+        mgr = FakeVPNManager(_cfg(tmp_path, identity_rotation=False), tmp_path=tmp_path)
         mgr.ips = ["6.6.6.6"]
         assert await mgr._finalize_ip(allow_stale=False) is True
         assert mgr._identity_index == 0
@@ -314,6 +322,7 @@ class TestFinalizeIp:
 
 # ── connect(): cold boot with containers up ─────────────────────
 
+
 class TestConnect:
     @pytest.mark.asyncio
     async def test_cold_boot_with_recent_ip_forces_rotation(self, tmp_path):
@@ -329,8 +338,8 @@ class TestConnect:
         assert mgr._status == vm.VPNState.CONNECTED
         assert mgr._current_ip == "5.6.7.8"
         assert mgr.calls["compose_up"] == 1
-        assert mgr.calls["restart"] >= 1                # rotation inside connect
-        assert mgr._total_switches == 0                 # boot is not a rotation
+        assert mgr.calls["restart"] >= 1  # rotation inside connect
+        assert mgr._total_switches == 0  # boot is not a rotation
         assert mgr._ip_history[-1]["ip"] == "5.6.7.8"
         assert mgr._ip_history[-1]["identity"] == "firefox144"
         assert mgr._ip_history[-1]["identity_index"] == 1
@@ -349,9 +358,9 @@ class TestConnect:
         mgr.ips = ["1.1.1.1", "1.1.1.1", "1.1.1.1"]
         await mgr.connect()
         assert mgr._status == vm.VPNState.CONNECTED
-        assert mgr._current_ip == "1.1.1.1"          # accepted on the last attempt
-        assert mgr.calls["restart"] == 2             # two rotations were attempted
-        assert mgr._identity_index == 1              # NEW face, still advanced
+        assert mgr._current_ip == "1.1.1.1"  # accepted on the last attempt
+        assert mgr.calls["restart"] == 2  # two rotations were attempted
+        assert mgr._identity_index == 1  # NEW face, still advanced
         assert mgr._ip_history[-1]["identity_index"] == 1
         assert mgr._watchdog_backoff.consecutive_failures == 0
 
@@ -362,11 +371,12 @@ class TestConnect:
         mgr.ips = ["1.2.3.4"]
         await mgr.connect()
         compose_calls = mgr.calls["compose_up"]
-        await mgr.connect()                            # already connected
+        await mgr.connect()  # already connected
         assert mgr.calls["compose_up"] == compose_calls
 
 
 # ── _connect_next_impl: rotation ────────────────────────────────
+
 
 class TestConnectNext:
     @pytest.mark.asyncio
@@ -393,15 +403,15 @@ class TestConnectNext:
         shared.record_ip("1.1.1.1", 1)
         mgr = FakeVPNManager(_cfg(tmp_path), shared=shared, tmp_path=tmp_path)
         mgr.ips = ["1.1.1.1", "2.2.2.2", "2.2.2.2", "3.3.3.3"]
-        await mgr.connect_next()                       # → 2.2.2.2
+        await mgr.connect_next()  # → 2.2.2.2
         assert mgr._ip_history[-1]["identity_index"] == 1
-        await mgr.connect_next()                       # → 3.3.3.3
+        await mgr.connect_next()  # → 3.3.3.3
         assert mgr._total_switches == 2
         assert mgr._ip_history[-1]["ip"] == "3.3.3.3"
         assert mgr._ip_history[-1]["identity_index"] == 2
         assert mgr._ip_history[-1]["identity"] == "edge101"
         assert {e["identity_index"] for e in mgr._ip_history} == {1, 2}
-        assert shared.get_status()["cursor"] == 2      # monotone, never rewound
+        assert shared.get_status()["cursor"] == 2  # monotone, never rewound
 
     @pytest.mark.asyncio
     async def test_all_recent_raises_and_cooldown(self, tmp_path):
@@ -412,11 +422,11 @@ class TestConnectNext:
         shared = _shared(tmp_path)
         shared.record_ip("1.1.1.1", 1)
         mgr = FakeVPNManager(_cfg(tmp_path), shared=shared, tmp_path=tmp_path)
-        mgr.ips = ["1.1.1.1", "1.1.1.1", None]           # recent, recent, dead
+        mgr.ips = ["1.1.1.1", "1.1.1.1", None]  # recent, recent, dead
         with pytest.raises(vm.RotationFailed, match="public IP"):
             await mgr.connect_next()
         assert mgr._status == vm.VPNState.ERROR
-        assert mgr._last_rotation_failed_at is not None   # CRITIC(6) armed
+        assert mgr._last_rotation_failed_at is not None  # CRITIC(6) armed
         # Fail-fast cooldown: the next rotation is refused immediately
         with pytest.raises(vm.RotationFailed, match="cooldown"):
             await mgr.connect_next()
@@ -432,24 +442,24 @@ class TestConnectNext:
         shared = _shared(tmp_path)
         shared.record_ip("1.1.1.1", 1)
         mgr = FakeVPNManager(_cfg(tmp_path), shared=shared, tmp_path=tmp_path)
-        mgr.ips = ["1.1.1.1", "1.1.1.1", None]           # recent, recent, dead
-        mgr._watchdog_event = asyncio.Event()            # fake: start() never runs
+        mgr.ips = ["1.1.1.1", "1.1.1.1", None]  # recent, recent, dead
+        mgr._watchdog_event = asyncio.Event()  # fake: start() never runs
         with pytest.raises(vm.RotationFailed, match="public IP"):
             await mgr.connect_next()
         assert mgr._rotation_probe_dead is True
         assert mgr._egress_failures == mgr._auto_wg_egress_ticks
-        assert mgr._watchdog_event.is_set()              # wake → live tick
+        assert mgr._watchdog_event.is_set()  # wake → live tick
 
     @pytest.mark.asyncio
     async def test_rotation_unchanged_ip_never_arms(self, tmp_path):
-        """"IP unchanged" proves the tunnel ANSWERS — the rotation lost
+        """ "IP unchanged" proves the tunnel ANSWERS — the rotation lost
         the lottery but the tunnel is alive. No arm: arming on this class
         would send the watchdog repairing a perfectly healthy tunnel."""
         shared = _shared(tmp_path)
         shared.record_ip("1.1.1.1", 1)
         mgr = FakeVPNManager(_cfg(tmp_path), shared=shared, tmp_path=tmp_path)
-        mgr._current_ip = "1.1.1.1"                      # old_ip non-None
-        mgr.ips = ["1.1.1.1", "1.1.1.1", "1.1.1.1"]      # unchanged ×3
+        mgr._current_ip = "1.1.1.1"  # old_ip non-None
+        mgr.ips = ["1.1.1.1", "1.1.1.1", "1.1.1.1"]  # unchanged ×3
         mgr._watchdog_event = asyncio.Event()
         with pytest.raises(vm.RotationFailed, match="unchanged"):
             await mgr.connect_next()
@@ -465,7 +475,7 @@ class TestConnectNext:
         shared.record_ip("1.1.1.1", 1)
         mgr = FakeVPNManager(_cfg(tmp_path), shared=shared, tmp_path=tmp_path)
         mgr.ips = ["1.1.1.1", "1.1.1.1", None]
-        mgr._egress_failures = 5                         # pre-armed higher
+        mgr._egress_failures = 5  # pre-armed higher
         with pytest.raises(vm.RotationFailed, match="public IP"):
             await mgr.connect_next()
         assert mgr._egress_failures == 5
@@ -481,11 +491,11 @@ class TestConnectNext:
         shared.record_ip("1.1.1.1", 1)
         mgr = FakeVPNManager(_cfg(tmp_path), shared=shared, tmp_path=tmp_path)
         mgr._current_ip = "1.1.1.1"
-        mgr.ips = [None, "1.1.1.1", "1.1.1.1"]             # dead, live→unchanged ×2
+        mgr.ips = [None, "1.1.1.1", "1.1.1.1"]  # dead, live→unchanged ×2
         mgr._watchdog_event = asyncio.Event()
         with pytest.raises(vm.RotationFailed, match="unchanged"):
             await mgr.connect_next()
-        assert mgr._rotation_probe_dead is False           # probe answered
+        assert mgr._rotation_probe_dead is False  # probe answered
         assert mgr._egress_failures == 0
         assert not mgr._watchdog_event.is_set()
 
@@ -499,16 +509,16 @@ class TestConnectNext:
         scoped op accounting is torn down (no leak into the next rotation)."""
         shared = _shared(tmp_path)
         mgr = FakeVPNManager(_cfg(tmp_path), shared=shared, tmp_path=tmp_path)
-        mgr._rotation_max_duration = 0.3                   # floor is 5 s at init,
+        mgr._rotation_max_duration = 0.3  # floor is 5 s at init,
         # so poke the attr directly — the wall semantics are what is tested.
-        mgr.ips = ["1.1.1.1"]                              # the probe never answers
-        mgr.probe_delay = 1.5                              # slower than the budget
+        mgr.ips = ["1.1.1.1"]  # the probe never answers
+        mgr.probe_delay = 1.5  # slower than the budget
         with pytest.raises(vm.RotationFailed, match="wall"):
             await mgr.connect_next()
         assert mgr._status == vm.VPNState.ERROR
-        assert mgr.ips == ["1.1.1.1"]                      # probe 1 started, 0 answered
-        assert mgr._rotation_probe_dead is False           # no probe evidence
-        assert mgr._egress_failures == 0                   # wall ≠ dead tunnel
+        assert mgr.ips == ["1.1.1.1"]  # probe 1 started, 0 answered
+        assert mgr._rotation_probe_dead is False  # no probe evidence
+        assert mgr._egress_failures == 0  # wall ≠ dead tunnel
         # cleanup: a new rotation must not inherit the old accounting
         assert mgr._rotation_op_count == 0
         assert mgr._rotation_op_event is None
@@ -523,13 +533,13 @@ class TestConnectNext:
         shared = _shared(tmp_path)
         mgr = FakeVPNManager(_cfg(tmp_path), shared=shared, tmp_path=tmp_path)
         mgr._current_ip = "1.1.1.1"
-        mgr.ips = [None, "2.2.2.2"]                        # dead probe, then fresh
+        mgr.ips = [None, "2.2.2.2"]  # dead probe, then fresh
         await mgr.connect_next()
         assert mgr._status == vm.VPNState.CONNECTED
         assert mgr._current_ip == "2.2.2.2"
-        assert mgr._rotation_probe_dead is False           # the answer cleared it
+        assert mgr._rotation_probe_dead is False  # the answer cleared it
         assert mgr._ip_history[-1]["ip"] == "2.2.2.2"
-        assert mgr._rotation_op_count == 0                 # torn down on success
+        assert mgr._rotation_op_count == 0  # torn down on success
         assert mgr._rotation_op_event is None
         assert mgr._rotation_loop is None
 
@@ -546,7 +556,7 @@ class TestConnectNext:
         # (a) stale-set hazard: event already set but the op is still alive
         mgr._rotation_loop = loop
         mgr._rotation_op_event = asyncio.Event()
-        mgr._rotation_op_event.set()                       # stale set (level-triggered)
+        mgr._rotation_op_event.set()  # stale set (level-triggered)
         mgr._rotation_op_count = 1
 
         def _slow_worker():
@@ -559,7 +569,7 @@ class TestConnectNext:
         await mgr._await_rotation_ops_drained()
         elapsed = time.monotonic() - t0
         await task
-        assert elapsed >= 0.04                    # blocked on the REAL end
+        assert elapsed >= 0.04  # blocked on the REAL end
         assert mgr._rotation_op_count == 0
 
         # (b) nothing in flight → returns immediately
@@ -571,6 +581,7 @@ class TestConnectNext:
 
 # ── _watchdog_tick: AUTH_FAILED recovery ────────────────────────
 
+
 class TestWatchdogTick:
     @pytest.mark.asyncio
     async def test_auth_failed_recovery_lands_on_fresh_ip(self, tmp_path):
@@ -578,7 +589,7 @@ class TestWatchdogTick:
         a FRESH IP with a NEW identity → recovered (backoff reset, CONNECTED).
         The watchdog must never land back on the failed server/IP."""
         shared = _shared(tmp_path)
-        shared.record_ip("4.4.4.4", 1)                 # the failed IP is recent
+        shared.record_ip("4.4.4.4", 1)  # the failed IP is recent
         mgr = FakeVPNManager(_cfg(tmp_path), shared=shared, tmp_path=tmp_path)
         mgr.log_text = "AUTH_FAILED - credentials rejected"
         # round 0 → recent failed IP rejected; round 1 → FRESH IP committed;
@@ -587,7 +598,7 @@ class TestWatchdogTick:
         await mgr._watchdog_tick()
         assert mgr._status == vm.VPNState.CONNECTED
         assert mgr._auth_failed is False
-        assert mgr._current_ip == "5.5.5.5"              # NEVER back on 4.4.4.4
+        assert mgr._current_ip == "5.5.5.5"  # NEVER back on 4.4.4.4
         assert mgr._ip_history[-1]["identity_index"] == 1  # NEW face
         assert mgr._ip_history[-1]["identity"] == "firefox144"
         assert mgr._watchdog_backoff.consecutive_failures == 0
@@ -615,17 +626,17 @@ class TestWatchdogTick:
         shared.record_ip("4.4.4.4", 1)
         mgr = FakeVPNManager(_cfg(tmp_path), shared=shared, tmp_path=tmp_path)
         mgr.log_text = "AUTH_FAILED"
-        mgr.ips = ["4.4.4.4", "4.4.4.4", "4.4.4.4"]     # only the recent IP exists
+        mgr.ips = ["4.4.4.4", "4.4.4.4", "4.4.4.4"]  # only the recent IP exists
         await mgr._watchdog_tick()
         assert mgr._status == vm.VPNState.ERROR
         # The flag reflects the last DETECTED failure: the tick's refresh saw
         # AUTH_FAILED and nothing committed since → still True (it is cleared
         # by the next healthy refresh / commit).
         assert mgr._auth_failed is True
-        assert mgr._ip_history == []                     # nothing committed
+        assert mgr._ip_history == []  # nothing committed
         assert mgr._watchdog_backoff.consecutive_failures == 1
         assert mgr.escalations == 0
-        assert mgr.finalize_calls == 1                   # finalize really ran
+        assert mgr.finalize_calls == 1  # finalize really ran
 
     @pytest.mark.asyncio
     async def test_persistent_failure_escalates_after_two(self, tmp_path):
@@ -638,20 +649,20 @@ class TestWatchdogTick:
         (re-check still dirty)."""
         mgr = FakeVPNManager(_cfg(tmp_path), tmp_path=tmp_path)
         mgr.log_text = "AUTH_FAILED"
-        mgr.clear_logs_on_restart = False                # recreate changes nothing
+        mgr.clear_logs_on_restart = False  # recreate changes nothing
         mgr.ips = []
         await mgr._watchdog_tick()
         assert mgr._watchdog_backoff.consecutive_failures == 1
-        assert mgr._watchdog_backoff.delay == 30         # 15 * 2^1
+        assert mgr._watchdog_backoff.delay == 30  # 15 * 2^1
         assert mgr.escalations == 0
         await mgr._watchdog_tick()
         assert mgr._watchdog_backoff.consecutive_failures == 2
-        assert mgr._watchdog_backoff.delay == 60         # capped at backoff_max
-        assert mgr.escalations == 1                      # escalated, ≥2 failures
-        assert mgr.calls["restart"] == 2                 # light restart per tick
-        assert mgr.calls["compose_up"] == 2              # one recreate per tick
-        assert mgr.calls["force_recreate"] == 2          # marker survived → widen
-        assert mgr.finalize_calls == 0                   # never recovered
+        assert mgr._watchdog_backoff.delay == 60  # capped at backoff_max
+        assert mgr.escalations == 1  # escalated, ≥2 failures
+        assert mgr.calls["restart"] == 2  # light restart per tick
+        assert mgr.calls["compose_up"] == 2  # one recreate per tick
+        assert mgr.calls["force_recreate"] == 2  # marker survived → widen
+        assert mgr.finalize_calls == 0  # never recovered
 
     @pytest.mark.asyncio
     async def test_healthy_tick_resets_backoff(self, tmp_path):
@@ -660,7 +671,7 @@ class TestWatchdogTick:
         mgr._watchdog_backoff.record_failure()
         mgr._watchdog_backoff.record_failure()
         assert mgr._watchdog_backoff.consecutive_failures == 2
-        mgr.ips = ["1.2.3.4"]                            # probe answer
+        mgr.ips = ["1.2.3.4"]  # probe answer
         await mgr._watchdog_tick()
         assert mgr._watchdog_backoff.consecutive_failures == 0
         assert mgr._watchdog_backoff.delay == 15
@@ -678,19 +689,19 @@ class TestWatchdogTick:
         marker → no --force-recreate; the tick's restart + the 2 finalize
         re-pick rounds). Threshold read symbolically — never a literal."""
         mgr = FakeVPNManager(_cfg(tmp_path, vpn_stack="wireguard"), tmp_path=tmp_path)
-        mgr.probe_alive = False              # dead tunnel: probe answers nothing
+        mgr.probe_alive = False  # dead tunnel: probe answers nothing
         seuil = mgr._auto_wg_egress_ticks
         for _ in range(seuil - 1):
             await mgr._watchdog_tick()
         assert mgr._egress_failures == seuil - 1
-        assert mgr.calls["restart"] == 0      # waiting — no recovery action
+        assert mgr.calls["restart"] == 0  # waiting — no recovery action
         assert mgr.calls["compose_up"] == 0
         assert mgr._watchdog_backoff.consecutive_failures == 0
         await mgr._watchdog_tick()
         assert mgr._egress_failures == seuil
-        assert mgr.calls["restart"] == 3      # tick's restart + 2 finalize rounds
-        assert mgr.calls["compose_up"] == 0   # no OpenVPN marker → plain restart
-        assert mgr.escalations == 0           # first failure — no escalation yet
+        assert mgr.calls["restart"] == 3  # tick's restart + 2 finalize rounds
+        assert mgr.calls["compose_up"] == 0  # no OpenVPN marker → plain restart
+        assert mgr.escalations == 0  # first failure — no escalation yet
 
     @pytest.mark.asyncio
     async def test_wg_egress_recovery_lands_on_fresh_ip(self, tmp_path):
@@ -710,13 +721,13 @@ class TestWatchdogTick:
         await mgr._watchdog_tick()
         assert mgr._status == vm.VPNState.CONNECTED
         assert mgr._current_ip == "9.9.9.9"
-        assert mgr.calls["restart"] == 1      # tick's restart only
+        assert mgr.calls["restart"] == 1  # tick's restart only
         assert mgr._egress_failures == seuil  # reset on the next probe success
         mgr.probe_alive = True
-        mgr.ips = ["9.9.9.9"]                 # armed tick skips refresh — no pop
+        mgr.ips = ["9.9.9.9"]  # armed tick skips refresh — no pop
         await mgr._watchdog_tick()
         assert mgr._egress_failures == 0
-        assert mgr.calls["restart"] == 1      # healthy — no restart
+        assert mgr.calls["restart"] == 1  # healthy — no restart
 
     @pytest.mark.asyncio
     async def test_wg_egress_success_resets_counter(self, tmp_path):
@@ -725,9 +736,9 @@ class TestWatchdogTick:
         absorbed — ZERO recovery, no restart, no compose."""
         mgr = FakeVPNManager(_cfg(tmp_path, vpn_stack="wireguard"), tmp_path=tmp_path)
         seuil = mgr._auto_wg_egress_ticks
-        mgr._egress_failures = seuil - 1      # nearly armed
-        mgr.probe_alive = True                # healthy probe (explicit)
-        mgr.ips = ["1.1.1.1"]                 # armed tick skips refresh — no pop
+        mgr._egress_failures = seuil - 1  # nearly armed
+        mgr.probe_alive = True  # healthy probe (explicit)
+        mgr.ips = ["1.1.1.1"]  # armed tick skips refresh — no pop
         await mgr._watchdog_tick()
         assert mgr._egress_failures == 0
         assert mgr.calls["restart"] == 0
@@ -770,7 +781,7 @@ class TestWatchdogTick:
         absorbed: counter reset, ZERO recovery, ZERO cancel — the streams on
         a healthy tunnel keep streaming."""
         mgr = FakeVPNManager(_cfg(tmp_path, vpn_stack="wireguard"), tmp_path=tmp_path)
-        mgr._egress_failures = mgr._auto_wg_egress_ticks - 1   # nearly armed
+        mgr._egress_failures = mgr._auto_wg_egress_ticks - 1  # nearly armed
 
         class _RecPool:
             def __init__(self):
@@ -781,8 +792,8 @@ class TestWatchdogTick:
 
         rec = _RecPool()
         monkeypatch.setattr(shared_state, "free_ip_pool", rec, raising=False)
-        mgr.probe_alive = True                 # healthy probe — blip absorbed
-        mgr.ips = ["1.1.1.1"]                  # armed tick skips refresh — no pop
+        mgr.probe_alive = True  # healthy probe — blip absorbed
+        mgr.ips = ["1.1.1.1"]  # armed tick skips refresh — no pop
         await mgr._watchdog_tick()
         assert mgr._egress_failures == 0
         assert rec.cancelled == [], "a healthy tunnel's streams are never cancelled"
@@ -816,8 +827,8 @@ class TestWatchdogTick:
         await mgr._watchdog_tick()
         assert mgr._status == vm.VPNState.CONNECTED
         assert mgr._current_ip == "5.5.5.5"
-        assert mgr.calls["restart"] == 1       # the light rung only
-        assert mgr.calls["compose_up"] == 0    # never escalated — marker cleared
+        assert mgr.calls["restart"] == 1  # the light rung only
+        assert mgr.calls["compose_up"] == 0  # never escalated — marker cleared
         assert mgr.calls["force_recreate"] == 0
         assert mgr._watchdog_backoff.consecutive_failures == 0
         assert mgr.escalations == 0
@@ -830,13 +841,13 @@ class TestWatchdogTick:
         restart could never apply the widened SERVER_COUNTRIES pool)."""
         mgr = FakeVPNManager(_cfg(tmp_path), tmp_path=tmp_path)
         mgr.log_text = "AUTH_FAILED"
-        mgr.clear_logs_on_restart = False      # restart + recreate change nothing
+        mgr.clear_logs_on_restart = False  # restart + recreate change nothing
         mgr.ips = []
         await mgr._watchdog_tick()
-        assert mgr.calls["restart"] == 1       # light rung attempted
-        assert mgr.calls["compose_up"] == 1    # …then the compose escalation
+        assert mgr.calls["restart"] == 1  # light rung attempted
+        assert mgr.calls["compose_up"] == 1  # …then the compose escalation
         assert mgr.calls["force_recreate"] == 1
-        assert mgr.finalize_calls == 0         # re-check still dirty
+        assert mgr.finalize_calls == 0  # re-check still dirty
         assert mgr._watchdog_backoff.consecutive_failures == 1
 
     @pytest.mark.asyncio
@@ -848,19 +859,20 @@ class TestWatchdogTick:
         compose wall."""
         shared = _shared(tmp_path)
         shared.record_ip("1.1.1.1", 1)
-        mgr = FakeVPNManager(_cfg(tmp_path, vpn_stack="wireguard"),
-                             shared=shared, tmp_path=tmp_path)
+        mgr = FakeVPNManager(
+            _cfg(tmp_path, vpn_stack="wireguard"), shared=shared, tmp_path=tmp_path
+        )
         mgr.probe_alive = False
-        mgr.ips = ["1.1.1.1"] * 4              # tick1 refresh + 3 finalize rounds
+        mgr.ips = ["1.1.1.1"] * 4  # tick1 refresh + 3 finalize rounds
         seuil = mgr._auto_wg_egress_ticks
         for _ in range(seuil - 1):
             await mgr._watchdog_tick()
-        mgr.ips = ["1.1.1.1"] * 3              # recovery tick: 3 finalize rounds
+        mgr.ips = ["1.1.1.1"] * 3  # recovery tick: 3 finalize rounds
         await mgr._watchdog_tick()
-        assert mgr._ip_history == []           # never committed 1.1.1.1
-        assert mgr.calls["compose_up"] == 0    # healed → compose rung skipped
+        assert mgr._ip_history == []  # never committed 1.1.1.1
+        assert mgr.calls["compose_up"] == 0  # healed → compose rung skipped
         assert mgr.calls["force_recreate"] == 0
-        assert mgr.calls["restart"] == 3       # light rung + 2 finalize re-picks
+        assert mgr.calls["restart"] == 3  # light rung + 2 finalize re-picks
         assert mgr._watchdog_backoff.consecutive_failures == 1
         assert mgr.escalations == 0
 
@@ -876,17 +888,20 @@ class TestWatchdogTick:
         async def boom():
             mgr.calls["restart"] += 1
             raise RuntimeError("docker daemon unreachable")
+
         mgr._docker_restart = boom
 
         await mgr._watchdog_tick()
         assert mgr._status == vm.VPNState.CONNECTED
         assert mgr._current_ip == "6.6.6.6"
-        assert mgr.calls["restart"] == 1       # the failed light rung
-        assert mgr.calls["compose_up"] == 1    # compose took over
+        assert mgr.calls["restart"] == 1  # the failed light rung
+        assert mgr.calls["compose_up"] == 1  # compose took over
         assert mgr.calls["force_recreate"] == 1
         assert mgr._watchdog_backoff.consecutive_failures == 0
 
+
 # ── retrocompat: shared=None ────────────────────────────────────
+
 
 class TestRetroCompat:
     @pytest.mark.asyncio
@@ -899,7 +914,7 @@ class TestRetroCompat:
         assert mgr._identity_index == 1
         mgr.ips = ["7.7.7.7", "8.8.8.8"]
         assert await mgr._finalize_ip(allow_stale=False) is True
-        assert mgr._current_ip == "8.8.8.8"              # 7.7.7.7 rejected (local)
+        assert mgr._current_ip == "8.8.8.8"  # 7.7.7.7 rejected (local)
         assert mgr._identity_index == 2
 
     @pytest.mark.asyncio
@@ -908,9 +923,9 @@ class TestRetroCompat:
         left off (no reset to chrome131) and the history survives."""
         mgr = FakeVPNManager(_cfg(tmp_path), tmp_path=tmp_path)
         mgr.ips = ["1.1.1.1"]
-        await mgr._finalize_ip(allow_stale=False)        # index 1
+        await mgr._finalize_ip(allow_stale=False)  # index 1
         mgr.ips = ["2.2.2.2"]
-        await mgr._finalize_ip(allow_stale=False)        # index 2
+        await mgr._finalize_ip(allow_stale=False)  # index 2
         reloaded = FakeVPNManager(_cfg(tmp_path), tmp_path=tmp_path)
         assert reloaded._identity_index == 2
         assert reloaded._ip_history[-1]["ip"] == "2.2.2.2"
@@ -919,20 +934,19 @@ class TestRetroCompat:
 
 # ── cross-station: one shared registry, two fakes ───────────────
 
+
 class TestCrossStation:
     @pytest.mark.asyncio
     async def test_other_stations_ip_is_recent(self, tmp_path):
         """Station 2 must never land on an IP station 1 just used."""
         shared = _shared(tmp_path)
-        m1 = FakeVPNManager(_cfg(tmp_path), station=1, shared=shared,
-                            tmp_path=tmp_path)
-        m2 = FakeVPNManager(_cfg(tmp_path), station=2, shared=shared,
-                            tmp_path=tmp_path)
+        m1 = FakeVPNManager(_cfg(tmp_path), station=1, shared=shared, tmp_path=tmp_path)
+        m2 = FakeVPNManager(_cfg(tmp_path), station=2, shared=shared, tmp_path=tmp_path)
         m1.ips = ["3.3.3.3"]
         assert await m1._finalize_ip(allow_stale=False) is True
         m2.ips = ["3.3.3.3", "4.4.4.4"]
         assert await m2._finalize_ip(allow_stale=False) is True
-        assert m2._current_ip == "4.4.4.4"               # 3.3.3.3 rejected
+        assert m2._current_ip == "4.4.4.4"  # 3.3.3.3 rejected
         # Attribution recorded per station
         assert {e["station"] for e in shared._ip_events} == {1, 2}
 
@@ -941,10 +955,8 @@ class TestCrossStation:
         """The two stations advance through the SHARED absolute cursor →
         live identity indexes stay distinct."""
         shared = _shared(tmp_path)
-        m1 = FakeVPNManager(_cfg(tmp_path), station=1, shared=shared,
-                            tmp_path=tmp_path)
-        m2 = FakeVPNManager(_cfg(tmp_path), station=2, shared=shared,
-                            tmp_path=tmp_path)
+        m1 = FakeVPNManager(_cfg(tmp_path), station=1, shared=shared, tmp_path=tmp_path)
+        m2 = FakeVPNManager(_cfg(tmp_path), station=2, shared=shared, tmp_path=tmp_path)
         m1.ips = ["1.1.1.1"]
         await m1.connect()
         m2.ips = ["2.2.2.2"]
@@ -952,11 +964,11 @@ class TestCrossStation:
         assert m1._identity_index != m2._identity_index
         assert m1.current_identity["impersonate"] != m2.current_identity["impersonate"]
         st = shared.get_status()
-        assert st["last_index_by_station"] == {1: m1._identity_index,
-                                               2: m2._identity_index}
+        assert st["last_index_by_station"] == {1: m1._identity_index, 2: m2._identity_index}
 
 
 # ── _watchdog_loop: cadence interval ↔ backoff ───────────────────
+
 
 class TestWatchdogLoop:
     @pytest.mark.asyncio
@@ -970,9 +982,9 @@ class TestWatchdogLoop:
         async def fake_tick():
             ticks["n"] += 1
             if ticks["n"] == 2:
-                mgr._watchdog_backoff.record_failure()   # AUTH_FAILED detected
+                mgr._watchdog_backoff.record_failure()  # AUTH_FAILED detected
             elif ticks["n"] == 3:
-                mgr._watchdog_backoff.record_success()   # recovered
+                mgr._watchdog_backoff.record_success()  # recovered
 
         mgr._watchdog_tick = fake_tick
         recorded = []
@@ -986,9 +998,8 @@ class TestWatchdogLoop:
         with pytest.raises(asyncio.CancelledError):
             await mgr._watchdog_loop()
         assert ticks["n"] == 4
-        assert recorded[:3] == [mgr._watchdog_interval, 30.0,
-                                mgr._watchdog_interval]
-        assert len(recorded) == 4                 # 4th sleep never taken
+        assert recorded[:3] == [mgr._watchdog_interval, 30.0, mgr._watchdog_interval]
+        assert len(recorded) == 4  # 4th sleep never taken
 
     @pytest.mark.asyncio
     async def test_cadence_armed_interval_while_egress_failures(self, tmp_path, monkeypatch):
@@ -1001,7 +1012,7 @@ class TestWatchdogLoop:
 
         async def fake_tick():
             ticks["n"] += 1
-            mgr._egress_failures = 1          # armed on every tick
+            mgr._egress_failures = 1  # armed on every tick
 
         mgr._watchdog_tick = fake_tick
         recorded = []
@@ -1021,6 +1032,7 @@ class TestWatchdogLoop:
 
 # ── [plan 18/08 §1c] pool signal → arm + wake ────────────────
 
+
 class TestArmEgressWatchdog:
     @pytest.mark.asyncio
     async def test_arm_sets_counter_to_threshold(self, tmp_path):
@@ -1029,7 +1041,7 @@ class TestArmEgressWatchdog:
         absorbs a signal that arrives mid-arming."""
         mgr = FakeVPNManager(_cfg(tmp_path), tmp_path=tmp_path)
         seuil = mgr._auto_wg_egress_ticks
-        mgr._egress_failures = 1          # already mid-arming (WG ticks)
+        mgr._egress_failures = 1  # already mid-arming (WG ticks)
 
         mgr.arm_egress_watchdog()
 
@@ -1041,7 +1053,7 @@ class TestArmEgressWatchdog:
         wait(timeout) returns immediately → live tick in ~0-2 s instead
         of the next idle cadence."""
         mgr = FakeVPNManager(_cfg(tmp_path), tmp_path=tmp_path)
-        mgr._watchdog_event = asyncio.Event()   # manual (am.6)
+        mgr._watchdog_event = asyncio.Event()  # manual (am.6)
 
         mgr.arm_egress_watchdog()
 
@@ -1054,7 +1066,7 @@ class TestArmEgressWatchdog:
         mgr = FakeVPNManager(_cfg(tmp_path), tmp_path=tmp_path)
         assert mgr._watchdog_event is None
 
-        mgr.arm_egress_watchdog()         # must not raise
+        mgr.arm_egress_watchdog()  # must not raise
 
         assert mgr._egress_failures == mgr._auto_wg_egress_ticks
 
@@ -1092,15 +1104,15 @@ class TestArmEgressWatchdog:
 
     @pytest.mark.asyncio
     async def test_arm_then_healthy_probe_absorbs_blip(self, tmp_path):
-        """"sonde saine annule la réparation armée": a real failure then
+        """ "sonde saine annule la réparation armée": a real failure then
         a HEALTHY probe = a transient blip — the armed tick resets the
         counter, ZERO recovery (no restart, no compose, no escalation).
         One arm + one tick, and the tunnel is exactly where it was."""
         mgr = FakeVPNManager(_cfg(tmp_path), tmp_path=tmp_path)
         mgr.arm_egress_watchdog()
         assert mgr._egress_failures == mgr._auto_wg_egress_ticks
-        mgr.probe_alive = True            # the blip already passed
-        mgr.ips = []                      # armed tick skips refresh — no pop
+        mgr.probe_alive = True  # the blip already passed
+        mgr.ips = []  # armed tick skips refresh — no pop
 
         await mgr._watchdog_tick()
 
@@ -1119,7 +1131,7 @@ class TestArmEgressWatchdog:
         follow-up cadence right after a recovery."""
         mgr = FakeVPNManager(_cfg(tmp_path, vpn_stack="wireguard"), tmp_path=tmp_path)
         mgr.arm_egress_watchdog()
-        mgr.probe_alive = False           # tunnel still dead
+        mgr.probe_alive = False  # tunnel still dead
 
         await mgr._watchdog_tick()
 
@@ -1154,16 +1166,17 @@ class TestArmEgressWatchdog:
         rotation = asyncio.get_running_loop().create_future()
         mgr._rotation_task = rotation
 
-        await mgr._watchdog_tick()        # skip — rotation in flight
+        await mgr._watchdog_tick()  # skip — rotation in flight
 
-        assert mgr._skipped_rotation_task is rotation, \
+        assert mgr._skipped_rotation_task is rotation, (
             "the skip is traced per rotation task (not a resettable flag)"
+        )
         assert mgr.calls["restart"] == 0
         assert mgr.escalations == 0
         assert mgr._egress_failures == mgr._auto_wg_egress_ticks  # unchanged
 
-        mgr._rotation_task = None         # rotation done
-        mgr.probe_alive = True            # the blip passed
+        mgr._rotation_task = None  # rotation done
+        mgr.probe_alive = True  # the blip passed
         await mgr._watchdog_tick()
 
         assert mgr._egress_failures == 0  # healthy probe absorbs the arm
@@ -1171,6 +1184,7 @@ class TestArmEgressWatchdog:
 
 
 # ── health_check: tunnel re-picked an IP outside a rotation ──────
+
 
 @contextlib.contextmanager
 def _ip_probe(ip):
@@ -1185,12 +1199,16 @@ def _ip_probe(ip):
 class _IpProbeServer:
     def __init__(self, ip):
         self._ip = ip
-        handler = type("_IpProbeHandler", (BaseHTTPRequestHandler,), {
-            # "self" below is the HANDLER instance; bound methods of the
-            # outer _IpProbeServer must not be used (no send_response etc.)
-            "do_GET": lambda self: _IpProbeServer._serve(self, ip),
-            "log_message": staticmethod(lambda *a, **k: None),
-        })
+        handler = type(
+            "_IpProbeHandler",
+            (BaseHTTPRequestHandler,),
+            {
+                # "self" below is the HANDLER instance; bound methods of the
+                # outer _IpProbeServer must not be used (no send_response etc.)
+                "do_GET": lambda self: _IpProbeServer._serve(self, ip),
+                "log_message": staticmethod(lambda *a, **k: None),
+            },
+        )
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
         self.url = f"http://127.0.0.1:{self._server.server_address[1]}/"
         threading.Thread(target=self._server.serve_forever, daemon=True).start()
@@ -1224,13 +1242,13 @@ class TestHealthCheckIpChanged:
             result = await mgr.health_check()
         assert result["ok"] is True and result["ip_changed"] is True
         assert mgr._current_ip == "203.0.113.77"
-        assert mgr._identity_index == 1           # advanced to a NEW face
+        assert mgr._identity_index == 1  # advanced to a NEW face
         assert mgr._ip_history[-1]["ip"] == "203.0.113.77"
         assert mgr._ip_history[-1]["identity"] == "firefox144"
         assert mgr._ip_history[-1]["identity_index"] == 1
-        assert shared.is_recent("203.0.113.77")   # registry in sync
+        assert shared.is_recent("203.0.113.77")  # registry in sync
         state = (tmp_path / "vpn_state1.json").read_text()
-        assert '"203.0.113.77"' in state          # persisted, not just memory
+        assert '"203.0.113.77"' in state  # persisted, not just memory
 
     @pytest.mark.asyncio
     async def test_same_ip_no_double_advance(self, tmp_path, monkeypatch):
@@ -1252,6 +1270,7 @@ class TestHealthCheckIpChanged:
 
 # ── apply_update: post-recreate finalize + rollback ──────────────
 
+
 class TestApplyUpdate:
     def _mgr(self, tmp_path):
         mgr = FakeVPNManager(_cfg(tmp_path), tmp_path=tmp_path)
@@ -1267,6 +1286,7 @@ class TestApplyUpdate:
             if outcome:
                 mgr._current_ip = "9.9.9.9"
             return outcome
+
         return _finalize
 
     @pytest.mark.asyncio
@@ -1274,17 +1294,17 @@ class TestApplyUpdate:
         """Compose recreated the container → _finalize_ip(allow_stale=False)
         commits a FRESH ip; the update is marked applied, nothing rolled back."""
         mgr = self._mgr(tmp_path)
-        mgr.ips = ["9.9.9.9"]                     # refresh probe after apply
+        mgr.ips = ["9.9.9.9"]  # refresh probe after apply
         log = {"calls": 0}
         mgr._finalize_ip = self._finalize_stub(mgr, True, log)
         result = await mgr.apply_update()
         assert result["ok"] is True and result["ip"] == "9.9.9.9"
         assert log["calls"] == 1
-        assert log["allow_stale"] is False        # strict post-update freshness
-        assert mgr.calls["docker_run"] == 1       # only the apply compose
+        assert log["allow_stale"] is False  # strict post-update freshness
+        assert mgr.calls["docker_run"] == 1  # only the apply compose
         assert mgr._update_available is False
         assert mgr._update_applied_at is not None
-        assert mgr._update_old_image_id is None   # rollback state cleared
+        assert mgr._update_old_image_id is None  # rollback state cleared
         assert mgr._update_last_error is None
 
     @pytest.mark.asyncio
@@ -1300,8 +1320,8 @@ class TestApplyUpdate:
         assert "AUTH_FAILED" in result["error"]
         assert mgr._auth_failed is True
         assert log["calls"] == 0
-        assert mgr.calls["docker_run"] == 3       # apply + rollback tag + compose
-        assert mgr._update_available is True      # never marked applied
+        assert mgr.calls["docker_run"] == 3  # apply + rollback tag + compose
+        assert mgr._update_available is True  # never marked applied
 
     @pytest.mark.asyncio
     async def test_finalize_failure_rolls_back(self, tmp_path):
@@ -1321,6 +1341,7 @@ class TestApplyUpdate:
 
 # ── Hot-reload: watchdog interval + config echo-back (review fixes) ──
 
+
 class TestConfigHotReload:
     def test_watchdog_interval_below_30_honored(self, tmp_path):
         """config.yaml ships watchdog_interval: 7 for fast AUTH_FAILED
@@ -1329,7 +1350,7 @@ class TestConfigHotReload:
         mismatch. The floor must only catch pathological values."""
         mgr = FakeVPNManager(_cfg(tmp_path, watchdog_interval=7), tmp_path=tmp_path)
         assert mgr._watchdog_interval == 7
-        assert mgr._watchdog_backoff._base_delay == 15.0   # backoff untouched
+        assert mgr._watchdog_backoff._base_delay == 15.0  # backoff untouched
 
     @pytest.mark.asyncio
     async def test_watchdog_interval_hot_reload_honors_value(self, tmp_path):
@@ -1344,12 +1365,21 @@ class TestConfigHotReload:
         re-showed the OLD value and a re-submit silently reverted the live
         registry back to it."""
         mgr = FakeVPNManager(
-            _cfg(tmp_path, recent_ip_window=20, recent_ip_max_age=1800,
-                 shared_rotation_file="logs/shared_rotation.json"),
-            tmp_path=tmp_path)
+            _cfg(
+                tmp_path,
+                recent_ip_window=20,
+                recent_ip_max_age=1800,
+                shared_rotation_file="logs/shared_rotation.json",
+            ),
+            tmp_path=tmp_path,
+        )
         cfg = await mgr.update_config(
-            {"recent_ip_window": 60, "recent_ip_max_age": 900,
-             "shared_rotation_file": "logs/shared_new.json"})
+            {
+                "recent_ip_window": 60,
+                "recent_ip_max_age": 900,
+                "shared_rotation_file": "logs/shared_new.json",
+            }
+        )
         assert cfg["recent_ip_window"] == 60
         assert cfg["recent_ip_max_age"] == 900
         assert cfg["shared_rotation_file"] == "logs/shared_new.json"
@@ -1363,16 +1393,20 @@ class TestConfigHotReload:
         WHOLE fan-out was aborted (piège 8). One bad key must skip itself
         with a warning; the VALID sibling still lands."""
         mgr = FakeVPNManager(_cfg(tmp_path), tmp_path=tmp_path)
-        await mgr.update_config({
-            "egress_failure_tick_interval": "nope",   # float("nope") raises
-            "auto_wg_egress_ticks": None,             # int(None) raises
-            "ip_probe_budget": 5,                     # valid sibling
-        })
+        await mgr.update_config(
+            {
+                "egress_failure_tick_interval": "nope",  # float("nope") raises
+                "auto_wg_egress_ticks": None,  # int(None) raises
+                "ip_probe_budget": 5,  # valid sibling
+            }
+        )
         assert mgr._egress_failure_tick_interval == 2.0  # untouched (default)
-        assert mgr._auto_wg_egress_ticks == 3             # untouched (default)
-        assert mgr._ip_probe_budget == 5.0                # applied — fan-out alive
+        assert mgr._auto_wg_egress_ticks == 3  # untouched (default)
+        assert mgr._ip_probe_budget == 5.0  # applied — fan-out alive
+
 
 # ── [review 18/08 F2] real light probe: multi-endpoint fallback ──
+
 
 class _FakeHttpxResp:
     """Minimal httpx.Response stand-in: the probe only closes it."""
@@ -1439,8 +1473,7 @@ class TestProbeTunnelLightEndpoints:
 
     def _patch(self, monkeypatch, behavior):
         record = []
-        monkeypatch.setitem(sys.modules, "httpx",
-                            _FakeHttpx(behavior, record))
+        monkeypatch.setitem(sys.modules, "httpx", _FakeHttpx(behavior, record))
         return record
 
     @pytest.mark.asyncio
@@ -1476,9 +1509,7 @@ class TestProbeTunnelLightEndpoints:
         """Every endpoint dead → False (the tick ramps egress_dead), the
         full chain is swept, and the index stays where it was."""
         mgr = self._mgr(tmp_path, ["http://a", "http://b", "http://c"])
-        record = self._patch(monkeypatch,
-                             {"http://a": False, "http://b": False,
-                              "http://c": False})
+        record = self._patch(monkeypatch, {"http://a": False, "http://b": False, "http://c": False})
 
         ok = await mgr._probe_tunnel_light()
 

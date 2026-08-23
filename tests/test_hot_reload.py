@@ -9,6 +9,7 @@ scripts/hot_reload_check.py (run it manually against a live instance).
 
 These tests exercise the same reload machinery against a tmp file.
 """
+
 import json
 
 import pytest
@@ -24,8 +25,7 @@ def isolated_routes(tmp_path, monkeypatch):
     monkeypatch.setattr(_cfg, "CUSTOM_ROUTES_PATH", str(routes_file))
     # load_custom_routes() prefers the YAML config — bypass it so the JSON
     # file is actually read.
-    monkeypatch.setattr(_cfg, "yaml_get",
-                        lambda section, key=None, default=None: default)
+    monkeypatch.setattr(_cfg, "yaml_get", lambda section, key=None, default=None: default)
     # Reset the hot-reload bookkeeping so every test starts fresh.
     monkeypatch.setattr(_cfg, "_custom_routes_mtime", 0.0)
     monkeypatch.setattr(_cfg, "_custom_routes_last_check", 0.0)
@@ -36,9 +36,9 @@ def isolated_routes(tmp_path, monkeypatch):
 
 
 def test_reload_picks_up_new_routes(isolated_routes):
-    isolated_routes.write_text(json.dumps(
-        {"kimi": {"match": ["kimi-k2.6"], "model": "glm-5.1"}}),
-        encoding="utf-8")
+    isolated_routes.write_text(
+        json.dumps({"kimi": {"match": ["kimi-k2.6"], "model": "glm-5.1"}}), encoding="utf-8"
+    )
     _cfg.maybe_reload_custom_routes()
     assert _cfg.ROUTES.get("kimi", {}).get("model") == "glm-5.1"
     assert _cfg.CUSTOM_ROUTES.get("kimi", {}).get("match") == ["kimi-k2.6"]
@@ -46,8 +46,7 @@ def test_reload_picks_up_new_routes(isolated_routes):
 
 def test_reload_removes_deleted_routes(isolated_routes, monkeypatch):
     monkeypatch.setattr(_cfg, "_CUSTOM_ROUTES_CHECK_INTERVAL", 0.0)
-    isolated_routes.write_text(json.dumps(
-        {"a": {"match": ["a"], "model": "m1"}}), encoding="utf-8")
+    isolated_routes.write_text(json.dumps({"a": {"match": ["a"], "model": "m1"}}), encoding="utf-8")
     _cfg.maybe_reload_custom_routes()
     assert "a" in _cfg.ROUTES
     assert "a" in _cfg.CUSTOM_ROUTES
@@ -62,9 +61,9 @@ def test_reload_removes_deleted_routes(isolated_routes, monkeypatch):
 
 def test_reload_rate_limited(isolated_routes, monkeypatch):
     _cfg.maybe_reload_custom_routes()  # arms the 5 s rate limit
-    isolated_routes.write_text(json.dumps(
-        {"kimi": {"match": ["kimi-k2.6"], "model": "glm-5.1"}}),
-        encoding="utf-8")
+    isolated_routes.write_text(
+        json.dumps({"kimi": {"match": ["kimi-k2.6"], "model": "glm-5.1"}}), encoding="utf-8"
+    )
     # Force mtime and last_check to be older (NTFS may coalesce, and rate limit would block)
     monkeypatch.setattr(_cfg, "_custom_routes_mtime", 0.0)
     monkeypatch.setattr(_cfg, "_custom_routes_last_check", 0.0)

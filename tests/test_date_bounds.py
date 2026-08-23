@@ -80,13 +80,20 @@ class TestNormalizeDateBound:
         assert isinstance(out, str) and out.endswith("Z") and out.startswith("2026-08-15")
 
     def test_z_timestamp_passes_through(self):
-        assert _normalize_date_bound("2026-08-16T15:21:29Z", end_of_day=False) == "2026-08-16T15:21:29Z"
-        assert _normalize_date_bound("2026-08-16T15:21:29Z", end_of_day=True) == "2026-08-16T15:21:29Z"
+        assert (
+            _normalize_date_bound("2026-08-16T15:21:29Z", end_of_day=False)
+            == "2026-08-16T15:21:29Z"
+        )
+        assert (
+            _normalize_date_bound("2026-08-16T15:21:29Z", end_of_day=True) == "2026-08-16T15:21:29Z"
+        )
 
     def test_complete_timestamp_without_z_passes_through(self):
         # Space-separated or any non-bare-date string is left alone (daysAgo
         # and the DB now converge on UTC+Z, so nothing else should appear).
-        assert _normalize_date_bound("2026-08-16 15:21:29", end_of_day=False) == "2026-08-16 15:21:29"
+        assert (
+            _normalize_date_bound("2026-08-16 15:21:29", end_of_day=False) == "2026-08-16 15:21:29"
+        )
 
     def test_non_string_passes_through(self):
         assert _normalize_date_bound(None, end_of_day=False) is None

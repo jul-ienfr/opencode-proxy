@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class ServerScore:
     """Scored server with selection metadata."""
+
     name: str
     hostname: str
     country_code: str
@@ -63,10 +64,7 @@ class ServerScore:
         failure_score = min(100, self.consecutive_failures * 33)
 
         return (
-            load_score * 0.40 +
-            latency_score * 0.30 +
-            freshness_score * 0.20 +
-            failure_score * 0.10
+            load_score * 0.40 + latency_score * 0.30 + freshness_score * 0.20 + failure_score * 0.10
         )
 
 
@@ -152,8 +150,7 @@ class ServerScorer:
 
         # Filter out excluded countries
         candidates = [
-            s for s in self._servers.values()
-            if s.country_code not in self._excluded_countries
+            s for s in self._servers.values() if s.country_code not in self._excluded_countries
         ]
 
         if not candidates:
@@ -188,11 +185,16 @@ class ServerScorer:
         available.sort(key=sort_key)
 
         # Add some randomness: pick from top 3
-        top_n = available[:min(3, len(available))]
+        top_n = available[: min(3, len(available))]
         chosen = random.choice(top_n)
 
-        logger.info("[scorer] selected %s (score: %.1f, load: %d, country: %s)",
-                    chosen.name, chosen.score, chosen.load, chosen.country_code)
+        logger.info(
+            "[scorer] selected %s (score: %.1f, load: %d, country: %s)",
+            chosen.name,
+            chosen.score,
+            chosen.load,
+            chosen.country_code,
+        )
         return chosen.name
 
     def get_random_from_pool(self, pool_size: int = 10) -> Optional[str]:
@@ -204,15 +206,14 @@ class ServerScorer:
             return None
 
         candidates = [
-            s for s in self._servers.values()
-            if s.country_code not in self._excluded_countries
+            s for s in self._servers.values() if s.country_code not in self._excluded_countries
         ]
 
         if not candidates:
             candidates = list(self._servers.values())
 
         candidates.sort(key=lambda s: s.score)
-        pool = candidates[:min(pool_size, len(candidates))]
+        pool = candidates[: min(pool_size, len(candidates))]
         chosen = random.choice(pool)
 
         return chosen.name

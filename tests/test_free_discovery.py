@@ -15,6 +15,7 @@ Hermetic matrix (no network, tmp_path only):
   * _try_free_model_first e2e — a homonyme now routes via FREE_MODEL_MAP
     (the router was already live; discovery just mutates the map).
 """
+
 import re
 import sys
 import time
@@ -26,6 +27,7 @@ from pathlib import Path
 
 
 # ── helpers ─────────────────────────────────────────────────────────
+
 
 def _payload(*ids, pricing=None, **flags):
     data = []
@@ -81,14 +83,18 @@ class _FakeClient:
 def _install_fake_httpx(monkeypatch, mapping, record=None):
     if record is None:
         record = []
+
     class _FakeHttpx:
         class Client:
             def __init__(self, **kw):
                 self._kw = kw
+
             def __enter__(self):
                 return _FakeClient(mapping, record)
+
             def __exit__(self, *a):
                 return False
+
     monkeypatch.setitem(sys.modules, "httpx", _FakeHttpx())
     return record
 
@@ -101,6 +107,7 @@ def _isolated_settings(tmp_path, monkeypatch, yaml_data):
         # keep module objects but point them at tmp_path
         pass
     import config.settings as st
+
     old_path = st.CONFIG_PATH
     old_yaml = dict(st._yaml_data)
     old_models = dict(st.MODELS)
@@ -114,13 +121,27 @@ def _isolated_settings(tmp_path, monkeypatch, yaml_data):
     # rebuild MODELS/free map from yaml
     st.MODELS.clear()
     for k, v in (st._yaml_data.get("models") or {}).items():
-        st.MODELS[k] = {"endpoint": "https://x", "protocol": v.get("protocol", "openai") if isinstance(v, dict) else "openai"}
+        st.MODELS[k] = {
+            "endpoint": "https://x",
+            "protocol": v.get("protocol", "openai") if isinstance(v, dict) else "openai",
+        }
     st.FREE_MODEL_MAP.clear()
     for k, v in (st._yaml_data.get("free_model_map") or {}).items():
         st.FREE_MODEL_MAP[k] = v
-    st.FREE_MODELS.clear(); st.FREE_MODELS.update(set(st.FREE_MODEL_MAP.values()))
+    st.FREE_MODELS.clear()
+    st.FREE_MODELS.update(set(st.FREE_MODEL_MAP.values()))
     st.FREE_MODEL_POOL[:] = sorted(st.FREE_MODELS)
-    st._FREE_DISCOVERY_STATE.clear(); st._FREE_DISCOVERY_STATE.update({"last_refresh": None, "next_refresh": None, "source": "none", "consecutive_failures": 0, "removed": [], "detected": sorted(st.FREE_MODELS)})
+    st._FREE_DISCOVERY_STATE.clear()
+    st._FREE_DISCOVERY_STATE.update(
+        {
+            "last_refresh": None,
+            "next_refresh": None,
+            "source": "none",
+            "consecutive_failures": 0,
+            "removed": [],
+            "detected": sorted(st.FREE_MODELS),
+        }
+    )
     st.FREE_DISCOVERY_ENABLED = True
     st.FREE_DISCOVERY_AUTO_PERSIST = True
     return st, old_path, old_yaml, old_models, old_map, old_pool, old_free, old_state, cfg
@@ -129,44 +150,56 @@ def _isolated_settings(tmp_path, monkeypatch, yaml_data):
 def _restore_settings(st, old):
     old_path, old_yaml, old_models, old_map, old_pool, old_free, old_state, _cfg = old
     st.CONFIG_PATH = old_path
-    st._yaml_data.clear(); st._yaml_data.update(old_yaml)
-    st.MODELS.clear(); st.MODELS.update(old_models)
-    st.FREE_MODEL_MAP.clear(); st.FREE_MODEL_MAP.update(old_map)
-    st.FREE_MODELS.clear(); st.FREE_MODELS.update(old_free)
+    st._yaml_data.clear()
+    st._yaml_data.update(old_yaml)
+    st.MODELS.clear()
+    st.MODELS.update(old_models)
+    st.FREE_MODEL_MAP.clear()
+    st.FREE_MODEL_MAP.update(old_map)
+    st.FREE_MODELS.clear()
+    st.FREE_MODELS.update(old_free)
     st.FREE_MODEL_POOL[:] = old_pool
-    st._FREE_DISCOVERY_STATE.clear(); st._FREE_DISCOVERY_STATE.update(old_state)
+    st._FREE_DISCOVERY_STATE.clear()
+    st._FREE_DISCOVERY_STATE.update(old_state)
 
 
 # ── pure detects ───────────────────────────────────────────────────
 
+
 class TestDetectPure:
     def test_pricing_zero_zero(self):
         import config.settings as st
+
         assert st._is_free_model({"id": "any-model", "pricing": {"input": 0, "output": 0}}) is True
 
     def test_pricing_nonzero(self):
         import config.settings as st
+
         assert st._is_free_model({"id": "glm-5", "pricing": {"input": 1, "output": 1}}) is False
 
     def test_is_free_flag(self):
         import config.settings as st
+
         assert st._is_free_model({"id": "x", "is_free": True}) is True
         assert st._is_free_model({"id": "x", "free": True}) is True
         assert st._is_free_model({"id": "x", "capabilities": {"free": True}}) is True
 
     def test_suffix_free(self):
         import config.settings as st
+
         assert st._is_free_model({"id": "mimo-v2.5-free"}) is True
         assert st._is_free_model({"id": "mimo-v2.5"}) is False
 
     def test_detect_union(self):
         import config.settings as st
+
         p1 = _payload("mimo-v2.5-free", "glm-5")
         p2 = _payload("hy3-free")
         assert st._detect_free_ids([p1, p2]) == {"mimo-v2.5-free", "hy3-free"}
 
     def test_detect_skips_non_dict(self):
         import config.settings as st
+
         assert st._detect_free_ids([None, {"data": "bad"}]) == set()
 
     def test_html_regex_case_insensitive(self):
@@ -176,6 +209,7 @@ class TestDetectPure:
 
 
 # ── apply / persist / delta / endpoints / dedup ───────────────────
+
 
 class TestApplyPersist:
     def test_delta_no_op_does_not_bump_mtime(self, tmp_path, monkeypatch):
@@ -187,7 +221,8 @@ class TestApplyPersist:
         st, *old = _isolated_settings(tmp_path, monkeypatch, yaml_data)
         try:
             # seed FREE_MODELS to {hy3-free}
-            st.FREE_MODELS.clear(); st.FREE_MODELS.update({"hy3-free"})
+            st.FREE_MODELS.clear()
+            st.FREE_MODELS.update({"hy3-free"})
             st.FREE_MODEL_POOL[:] = ["hy3-free"]
             st._FREE_DISCOVERY_STATE["detected"] = ["hy3-free"]
             st.MODELS["hy3-free"] = {"endpoint": st.API_BASE_FREE, "protocol": "openai"}
@@ -237,27 +272,43 @@ class TestApplyPersist:
             _restore_settings(st, old)
 
     def test_endpoint_responses_for_muse_spark(self, tmp_path, monkeypatch):
-        yaml_data = {"server": {"host": "0.0.0.0", "port": 4000}, "models": {}, "free_model_map": {}}
+        yaml_data = {
+            "server": {"host": "0.0.0.0", "port": 4000},
+            "models": {},
+            "free_model_map": {},
+        }
         st, *old = _isolated_settings(tmp_path, monkeypatch, yaml_data)
         try:
             # muse-spark models use /v1/responses (Responses API), not /chat/completions
-            assert st._free_endpoint_for("muse-spark-1.2-contributor-free") == "https://opencode.ai/zen/v1/responses"
+            assert (
+                st._free_endpoint_for("muse-spark-1.2-contributor-free")
+                == "https://opencode.ai/zen/v1/responses"
+            )
             assert st._free_endpoint_for("mimo-v2.5-free") == st.API_BASE_FREE
         finally:
             _restore_settings(st, old)
 
     def test_removed_is_logged_in_state(self, tmp_path, monkeypatch):
-        yaml_data = {"server": {"host": "0.0.0.0", "port": 4000}, "models": {}, "free_model_map": {"hy3": "hy3-free"}}
+        yaml_data = {
+            "server": {"host": "0.0.0.0", "port": 4000},
+            "models": {},
+            "free_model_map": {"hy3": "hy3-free"},
+        }
         st, *old = _isolated_settings(tmp_path, monkeypatch, yaml_data)
         try:
-            st.FREE_MODELS.clear(); st.FREE_MODELS.update({"hy3-free", "mimo-v2.5-free"})
+            st.FREE_MODELS.clear()
+            st.FREE_MODELS.update({"hy3-free", "mimo-v2.5-free"})
             st._apply_discovered_free_models({"hy3-free"}, source="test")
             assert st._FREE_DISCOVERY_STATE["removed"] == ["mimo-v2.5-free"]
         finally:
             _restore_settings(st, old)
 
     def test_ensure_fetch_union_dedups(self, tmp_path, monkeypatch):
-        yaml_data = {"server": {"host": "0.0.0.0", "port": 4000}, "models": {}, "free_model_map": {}}
+        yaml_data = {
+            "server": {"host": "0.0.0.0", "port": 4000},
+            "models": {},
+            "free_model_map": {},
+        }
         st, *old = _isolated_settings(tmp_path, monkeypatch, yaml_data)
         try:
             urls = st._free_discovery_urls()
@@ -293,6 +344,7 @@ class TestApplyPersist:
 
 # ── Axe D: forced_pool rotation for free pool ──────────────────────
 
+
 class TestForcedPoolRotation:
     """Verify that FreeIPPool.on_quota_exhausted propagates forced_pool
     so background rotations stay within geo-allowed countries (Estonia
@@ -316,11 +368,13 @@ class TestForcedPoolRotation:
 
         # Capture forced_pool and station passed to _launch_rotation
         captured = {}
+
         def _fake_launch(station, forced_pool=None):
             captured["station"] = station
             captured["forced_pool"] = forced_pool
             if forced_pool is not None:
                 station._geo_forced_pool = forced_pool
+
         pool._launch_rotation = _fake_launch
 
         # C1 guard: there must be another usable station
@@ -359,8 +413,10 @@ class TestForcedPoolRotation:
         pool._stations = []  # dual_station property needs this
 
         captured = {}
+
         def _fake_launch(station, forced_pool=None):
             captured["forced_pool"] = forced_pool
+
         pool._launch_rotation = _fake_launch
         pool._any_other_usable = lambda s, forced_pool=None: True
 

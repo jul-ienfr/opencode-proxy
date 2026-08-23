@@ -30,9 +30,12 @@ x-gluetun-multi-env: &gluetun-multi-env
   # Environment shared by stations 3-10 — the per-station VPN_TYPE and
   # listening addresses live in each service stanza (merged below).
   # Mapping form on purpose: `<<` merge keys only work on mappings.
+  # Source unique for SERVER_COUNTRIES is config.yaml:ip_rotation.server_countries
+  # Compose interpolates ${SERVER_COUNTRIES} from host .env (generated from config.yaml)
+  # or falls back to the default below — keep the fallback in sync with config.yaml.
   VPN_SERVICE_PROVIDER: nordvpn
   OPENVPN_VERBOSITY: '4'   # hostname in logs (see vpn-gluetun comment)
-  SERVER_COUNTRIES: Germany,Netherlands,France,Spain,Poland,Sweden,Denmark,Finland,Norway,Belgium,Switzerland,Austria,Portugal,Italy,Ireland,United Kingdom,Czech Republic,Estonia,Latvia,Lithuania,Romania,Hungary,Greece,Slovakia,Slovenia,Croatia,Bulgaria,Luxembourg,Iceland,Cyprus,Malta
+  SERVER_COUNTRIES: ${SERVER_COUNTRIES:-Germany,Netherlands,France,Spain,Poland,Sweden,Denmark,Finland,Norway,Belgium,Switzerland,Austria,Portugal,Italy,Ireland,United Kingdom,Czech Republic,Estonia,Latvia,Lithuania,Romania,Hungary,Greece,Slovakia,Slovenia,Croatia,Bulgaria,Luxembourg,Iceland,Cyprus,Malta,United States,Canada,Australia,Japan,Singapore}
   UPDATER_PERIOD: 480h
   HTTPPROXY: 'on'
   SOCKS5_ENABLED: 'on'
@@ -145,7 +148,8 @@ services:
       # ("United Kingdom", "Czech Republic") — NordVPN file-style
       # "United_Kingdom"/"Czechia" are rejected with a WARN "not in
       # choices" and silently break the rotation.
-      - SERVER_COUNTRIES=Germany,Netherlands,France,Spain,Poland,Sweden,Denmark,Finland,Norway,Belgium,Switzerland,Austria,Portugal,Italy,Ireland,United Kingdom,Czech Republic,Estonia,Latvia,Lithuania,Romania,Hungary,Greece,Slovakia,Slovenia,Croatia,Bulgaria,Luxembourg,Iceland,Cyprus,Malta
+      # Source unique: config.yaml ip_rotation.server_countries (fallback below)
+      - SERVER_COUNTRIES=${SERVER_COUNTRIES:-Germany,Netherlands,France,Spain,Poland,Sweden,Denmark,Finland,Norway,Belgium,Switzerland,Austria,Portugal,Italy,Ireland,United Kingdom,Czech Republic,Estonia,Latvia,Lithuania,Romania,Hungary,Greece,Slovakia,Slovenia,Croatia,Bulgaria,Luxembourg,Iceland,Cyprus,Malta,United States,Canada,Australia,Japan,Singapore}
       - UPDATER_PERIOD=480h   # gluetun refreshes its own servers list every 20 days (prevent stale list)
       - HTTPPROXY=on
       - HTTPPROXY_LISTENING_ADDRESS=:8888
@@ -232,7 +236,8 @@ services:
       # ("United Kingdom", "Czech Republic") — NordVPN file-style
       # "United_Kingdom"/"Czechia" are rejected with a WARN "not in
       # choices" and silently break the rotation.
-      - SERVER_COUNTRIES=Germany,Netherlands,France,Spain,Poland,Sweden,Denmark,Finland,Norway,Belgium,Switzerland,Austria,Portugal,Italy,Ireland,United Kingdom,Czech Republic,Estonia,Latvia,Lithuania,Romania,Hungary,Greece,Slovakia,Slovenia,Croatia,Bulgaria,Luxembourg,Iceland,Cyprus,Malta
+      # Source unique: config.yaml ip_rotation.server_countries (fallback below)
+      - SERVER_COUNTRIES=${SERVER_COUNTRIES:-Germany,Netherlands,France,Spain,Poland,Sweden,Denmark,Finland,Norway,Belgium,Switzerland,Austria,Portugal,Italy,Ireland,United Kingdom,Czech Republic,Estonia,Latvia,Lithuania,Romania,Hungary,Greece,Slovakia,Slovenia,Croatia,Bulgaria,Luxembourg,Iceland,Cyprus,Malta,United States,Canada,Australia,Japan,Singapore}
       - UPDATER_PERIOD=480h   # gluetun refreshes its own servers list every 20 days (prevent stale list)
       - HTTPPROXY=on
       - HTTPPROXY_LISTENING_ADDRESS=:8889

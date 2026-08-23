@@ -2,6 +2,7 @@
 Phase 4 — Hot-reload tests (sans full_restart)
 Vérifie que chaque réglage GUI prend effet sans restart complet.
 """
+
 import os
 import json
 import yaml
@@ -25,6 +26,7 @@ def _restore_config(backup):
         yaml.dump(backup, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
     # reload in-memory
     import config.settings as cfg
+
     cfg.load_yaml_config()
     # Re-sync globals that depend on YAML
     try:
@@ -72,6 +74,7 @@ def test_free_model_map_hot_reload_no_restart(config_backup):
         cfg.FREE_MODEL_MAP.clear()
         cfg.FREE_MODEL_MAP.update(new_map)
         import opencode as oc
+
         if hasattr(oc, "FREE_MODEL_MAP"):
             if oc.FREE_MODEL_MAP is not cfg.FREE_MODEL_MAP:
                 oc.FREE_MODEL_MAP.clear()
@@ -86,6 +89,7 @@ def test_free_model_map_hot_reload_no_restart(config_backup):
         assert cfg.FREE_MODEL_MAP == new_map
         # opencode should see new mapping immediately
         from config import FREE_MODEL_MAP as cfg_fmm
+
         assert cfg_fmm.get("test-paid") == "test-free"
         # No restart should have been called
         mock_mgr.restart.assert_not_called()
@@ -114,16 +118,16 @@ def test_vpn_circuit_breaker_hot_reload_no_restart(config_backup):
     """circuit breaker threshold/recovery → persist YAML (N-station via update_config)."""
     import config.settings as cfg
     import dashboard.api as api_module
+
     new_threshold = 5
     new_recovery = 600
     with patch.object(api_module, "get_event_manager") as mock_get_em:
         mock_em = MagicMock()
         mock_em.publish = MagicMock()
         mock_get_em.return_value = mock_em
-        api_module._persist_vpn_config({
-            "circuit_breaker_threshold": new_threshold,
-            "circuit_breaker_recovery": new_recovery
-        })
+        api_module._persist_vpn_config(
+            {"circuit_breaker_threshold": new_threshold, "circuit_breaker_recovery": new_recovery}
+        )
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
             on_disk = yaml.safe_load(f)
         assert on_disk["ip_rotation"]["circuit_breaker_threshold"] == new_threshold
@@ -134,6 +138,7 @@ def test_rotation_rules_hot_reload_no_restart(config_backup):
     """rotation_rules → persist YAML (N-station compat)."""
     import config.settings as cfg
     import dashboard.api as api_module
+
     new_rules = [{"model_pattern": "mimo-*-free", "strategy": "round-robin", "quota": 100}]
     with patch.object(api_module, "get_event_manager") as mock_get_em:
         mock_em = MagicMock()
@@ -194,14 +199,18 @@ async def test_web_port_hot_restart_not_full_restart(config_backup):
     app = FastAPI()
     # Use in-memory sqlite connection for dashboard
     import sqlite3
+
     conn = sqlite3.connect(":memory:", check_same_thread=False)
     conn.row_factory = sqlite3.Row
-    conn.execute("CREATE TABLE IF NOT EXISTS requests (id TEXT PRIMARY KEY, timestamp TEXT, model TEXT, original_model TEXT, duration_ms INTEGER, tokens_input INTEGER, tokens_output INTEGER, tokens_cache INTEGER, success INTEGER, error TEXT)")
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS requests (id TEXT PRIMARY KEY, timestamp TEXT, model TEXT, original_model TEXT, duration_ms INTEGER, tokens_input INTEGER, tokens_output INTEGER, tokens_cache INTEGER, success INTEGER, error TEXT)"
+    )
     static_dir = os.path.join(ROOT, "static")
 
     register_dashboard(app, static_dir, conn, server_manager_getter=lambda: mock_mgr)
 
     from fastapi.testclient import TestClient
+
     client = TestClient(app)
 
     # Get current config to know current ports
@@ -247,6 +256,7 @@ async def test_web_port_hot_restart_not_full_restart(config_backup):
 def test_vpn_servers_persist_reboot_safe(config_backup):
     """servers persist → reboot-safe YAML persistence (N-station compat)."""
     import config.settings as cfg
+
     new_servers = [
         {"name": "test1", "config": "vpn/configs/test1.ovpn"},
         {"name": "test2", "config": "vpn/configs/test2.ovpn"},
@@ -263,10 +273,12 @@ def test_vpn_servers_persist_reboot_safe(config_backup):
 def test_ttl_cache_stats_not_regression():
     """_TTLCache still works (non-regression Phase4)."""
     from dashboard.api import _TTLCache
+
     c = _TTLCache(ttl=0.2)
     c.set("k", "v")
     assert c.get("k") == "v"
     import time
+
     time.sleep(0.25)
     assert c.get("k") is None
     c.set("a", 1)

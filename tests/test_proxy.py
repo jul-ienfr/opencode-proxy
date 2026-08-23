@@ -39,6 +39,7 @@ from config.settings import _resolve_protocol, KNOWN_PROTOCOLS
 
 # ── Protocol Conversions ────────────────────────────────────────
 
+
 class TestAnthropicToOpenAI:
     """Test Anthropic Messages → OpenAI Chat Completions conversion."""
 
@@ -51,7 +52,9 @@ class TestAnthropicToOpenAI:
         result = anthropic_to_openai(body, "claude-3-opus")
         assert result["model"] == "claude-3-opus"
         # cache_control is added to the last user message for prefix caching
-        assert result["messages"] == [{"role": "user", "content": "Hello", "cache_control": {"type": "ephemeral"}}]
+        assert result["messages"] == [
+            {"role": "user", "content": "Hello", "cache_control": {"type": "ephemeral"}}
+        ]
         assert result["max_tokens"] == 1024
         assert result["stream"] is False
 
@@ -79,13 +82,20 @@ class TestAnthropicToOpenAI:
     def test_tool_calls_conversion(self):
         body = {
             "model": "claude-3-opus",
-            "messages": [{
-                "role": "assistant",
-                "content": [
-                    {"type": "text", "text": "Let me search."},
-                    {"type": "tool_use", "id": "toolu_123", "name": "web_search", "input": {"query": "test"}},
-                ],
-            }],
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "text", "text": "Let me search."},
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_123",
+                            "name": "web_search",
+                            "input": {"query": "test"},
+                        },
+                    ],
+                }
+            ],
         }
         result = anthropic_to_openai(body, "claude-3-opus")
         msg = result["messages"][0]
@@ -97,12 +107,18 @@ class TestAnthropicToOpenAI:
     def test_tool_results_conversion(self):
         body = {
             "model": "claude-3-opus",
-            "messages": [{
-                "role": "user",
-                "content": [
-                    {"type": "tool_result", "tool_use_id": "toolu_123", "content": "result text"},
-                ],
-            }],
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_123",
+                            "content": "result text",
+                        },
+                    ],
+                }
+            ],
         }
         result = anthropic_to_openai(body, "claude-3-opus")
         msg = result["messages"][0]
@@ -113,13 +129,15 @@ class TestAnthropicToOpenAI:
     def test_thinking_blocks(self):
         body = {
             "model": "claude-3-opus",
-            "messages": [{
-                "role": "assistant",
-                "content": [
-                    {"type": "thinking", "thinking": "Let me think..."},
-                    {"type": "text", "text": "Here's my answer."},
-                ],
-            }],
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": "Let me think..."},
+                        {"type": "text", "text": "Here's my answer."},
+                    ],
+                }
+            ],
         }
         result = anthropic_to_openai(body, "claude-3-opus")
         msg = result["messages"][0]
@@ -143,11 +161,13 @@ class TestAnthropicToOpenAI:
         body = {
             "model": "claude-3-opus",
             "messages": [{"role": "user", "content": "Hi"}],
-            "tools": [{
-                "name": "get_weather",
-                "description": "Get weather",
-                "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}},
-            }],
+            "tools": [
+                {
+                    "name": "get_weather",
+                    "description": "Get weather",
+                    "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}},
+                }
+            ],
             "tool_choice": {"type": "any"},
         }
         result = anthropic_to_openai(body, "claude-3-opus")
@@ -155,7 +175,10 @@ class TestAnthropicToOpenAI:
         tool = result["tools"][0]
         assert tool["type"] == "function"
         assert tool["function"]["name"] == "get_weather"
-        assert tool["function"]["parameters"] == {"type": "object", "properties": {"city": {"type": "string"}}}
+        assert tool["function"]["parameters"] == {
+            "type": "object",
+            "properties": {"city": {"type": "string"}},
+        }
         assert result["tool_choice"] == "required"
 
 
@@ -177,16 +200,20 @@ class TestOpenAIToAnthropic:
 
     def test_tool_calls_response(self):
         resp = {
-            "choices": [{
-                "message": {
-                    "content": "",
-                    "tool_calls": [{
-                        "id": "call_123",
-                        "function": {"name": "search", "arguments": '{"q":"test"}'},
-                    }],
-                },
-                "finish_reason": "tool_calls",
-            }],
+            "choices": [
+                {
+                    "message": {
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "call_123",
+                                "function": {"name": "search", "arguments": '{"q":"test"}'},
+                            }
+                        ],
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ],
             "usage": {"prompt_tokens": 10, "completion_tokens": 5},
         }
         result = openai_to_anthropic(resp, "claude-3-opus")
@@ -198,13 +225,15 @@ class TestOpenAIToAnthropic:
 
     def test_reasoning_content(self):
         resp = {
-            "choices": [{
-                "message": {
-                    "content": "Answer",
-                    "reasoning_content": "Thinking...",
-                },
-                "finish_reason": "stop",
-            }],
+            "choices": [
+                {
+                    "message": {
+                        "content": "Answer",
+                        "reasoning_content": "Thinking...",
+                    },
+                    "finish_reason": "stop",
+                }
+            ],
             "usage": {"prompt_tokens": 10, "completion_tokens": 5},
         }
         result = openai_to_anthropic(resp, "claude-3-opus")
@@ -254,16 +283,23 @@ class TestOpenAIChatToResponses:
 
     def test_tool_calls(self):
         resp = {
-            "choices": [{
-                "message": {
-                    "content": "",
-                    "tool_calls": [{
-                        "id": "call_abc",
-                        "function": {"name": "run_code", "arguments": '{"code":"print(1)"}'},
-                    }],
-                },
-                "finish_reason": "tool_calls",
-            }],
+            "choices": [
+                {
+                    "message": {
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "call_abc",
+                                "function": {
+                                    "name": "run_code",
+                                    "arguments": '{"code":"print(1)"}',
+                                },
+                            }
+                        ],
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ],
             "usage": {"prompt_tokens": 10, "completion_tokens": 5},
         }
         result = openai_chat_to_responses(resp, "gpt-4o")
@@ -275,13 +311,15 @@ class TestOpenAIChatToResponses:
 
     def test_reasoning_content(self):
         resp = {
-            "choices": [{
-                "message": {
-                    "content": "Answer",
-                    "reasoning_content": "Thinking...",
-                },
-                "finish_reason": "stop",
-            }],
+            "choices": [
+                {
+                    "message": {
+                        "content": "Answer",
+                        "reasoning_content": "Thinking...",
+                    },
+                    "finish_reason": "stop",
+                }
+            ],
             "usage": {"prompt_tokens": 10, "completion_tokens": 5},
         }
         result = openai_chat_to_responses(resp, "gpt-4o")
@@ -308,6 +346,7 @@ class TestOpenAIChatToResponses:
 
 # ── Token Estimation ────────────────────────────────────────────
 
+
 class TestEstimateTokens:
     """Test token estimation function."""
 
@@ -333,6 +372,7 @@ class TestEstimateTokens:
 
 
 # ── Circuit Breaker ─────────────────────────────────────────────
+
 
 class TestCircuitBreaker:
     """Test circuit breaker state machine."""
@@ -390,6 +430,7 @@ class TestCircuitBreaker:
 
 # ── Rate Limiter ────────────────────────────────────────────────
 
+
 class TestBucket:
     """Test token bucket implementation."""
 
@@ -422,12 +463,14 @@ class TestBucket:
 
 # ── Route Matching ──────────────────────────────────────────────
 
+
 @pytest.fixture(autouse=True)
 def _disable_mapping_off(monkeypatch):
     """Force DISABLE_MAPPING=False and clear custom routes for route tests."""
     monkeypatch.setattr(_opencode_mod, "DISABLE_MAPPING", False)
     # Rebuild ROUTES without custom route overrides (use config.load_routes with empty custom)
     from config import settings as _cfg_settings
+
     monkeypatch.setattr(_cfg_settings, "CUSTOM_ROUTES", {})
     _clean_routes = _cfg_settings.load_routes()
     monkeypatch.setattr(_opencode_mod, "ROUTES", _clean_routes)
@@ -435,8 +478,9 @@ def _disable_mapping_off(monkeypatch):
     # SORTED_* are computed at import from the real custom_routes.json —
     # rebuild after replacing the dicts, or _route_for matches the stale
     # production overrides ([43]).
-    monkeypatch.setattr(_cfg_settings, "SORTED_ROUTES",
-                        _cfg_settings._sort_routes_by_match(_clean_routes))
+    monkeypatch.setattr(
+        _cfg_settings, "SORTED_ROUTES", _cfg_settings._sort_routes_by_match(_clean_routes)
+    )
     monkeypatch.setattr(_cfg_settings, "SORTED_CUSTOM_ROUTES", [])
     # Prevent maybe_reload_custom_routes (called at top of _route_for) from
     # re-reading config.yaml/custom_routes.json on disk and re-introducing
@@ -487,6 +531,7 @@ class TestRouteFor:
 
 # ── Integration: Full Round-Trip ────────────────────────────────
 
+
 class TestRoundTrip:
     """Test that conversions are lossless for simple cases."""
 
@@ -507,16 +552,20 @@ class TestRoundTrip:
     def test_tool_call_round_trip(self):
         """Tool calls should survive the round-trip."""
         original = {
-            "choices": [{
-                "message": {
-                    "content": "",
-                    "tool_calls": [{
-                        "id": "call_123",
-                        "function": {"name": "search", "arguments": '{"q":"test"}'},
-                    }],
-                },
-                "finish_reason": "tool_calls",
-            }],
+            "choices": [
+                {
+                    "message": {
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "call_123",
+                                "function": {"name": "search", "arguments": '{"q":"test"}'},
+                            }
+                        ],
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ],
             "usage": {"prompt_tokens": 10, "completion_tokens": 5},
         }
         anthro = openai_to_anthropic(original, "test-model")
@@ -530,6 +579,7 @@ class TestRoundTrip:
 
 
 # ── openai_to_anthropic_request ──────────────────────────────────
+
 
 class TestOpenAIToAnthropicRequest:
     """Test OpenAI Chat Completions request → Anthropic Messages request conversion."""
@@ -563,9 +613,16 @@ class TestOpenAIToAnthropicRequest:
             "model": "gpt-4o",
             "messages": [
                 {"role": "user", "content": "Search for cats"},
-                {"role": "assistant", "content": "", "tool_calls": [
-                    {"id": "call_123", "function": {"name": "search", "arguments": '{"q":"cats"}'}}
-                ]},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call_123",
+                            "function": {"name": "search", "arguments": '{"q":"cats"}'},
+                        }
+                    ],
+                },
                 {"role": "tool", "tool_call_id": "call_123", "content": "Found cats"},
             ],
         }
@@ -582,6 +639,7 @@ class TestOpenAIToAnthropicRequest:
 
 
 # ── openai_responses_to_anthropic ────────────────────────────────
+
 
 class TestOpenAIResponsesToAnthropic:
     """Test OpenAI Responses API request → Anthropic Messages request conversion."""
@@ -603,7 +661,12 @@ class TestOpenAIResponsesToAnthropic:
         body = {
             "model": "gpt-4o",
             "input": [
-                {"type": "function_call", "id": "fc_123", "name": "search", "arguments": '{"q":"test"}'},
+                {
+                    "type": "function_call",
+                    "id": "fc_123",
+                    "name": "search",
+                    "arguments": '{"q":"test"}',
+                },
                 {"type": "function_call_output", "call_id": "fc_123", "output": "Found results"},
             ],
         }
@@ -634,6 +697,7 @@ class TestOpenAIResponsesToAnthropic:
 
 # ── anthropic_to_openai_responses ────────────────────────────────
 
+
 class TestAnthropicToOpenAIResponses:
     """Test Anthropic Messages response → OpenAI Responses API response conversion."""
 
@@ -653,7 +717,9 @@ class TestAnthropicToOpenAIResponses:
 
     def test_tool_use_response(self):
         anthro = {
-            "content": [{"type": "tool_use", "id": "toolu_123", "name": "search", "input": {"q": "test"}}],
+            "content": [
+                {"type": "tool_use", "id": "toolu_123", "name": "search", "input": {"q": "test"}}
+            ],
             "stop_reason": "tool_use",
             "usage": {"input_tokens": 10, "output_tokens": 5},
         }
@@ -688,6 +754,7 @@ class TestAnthropicToOpenAIResponses:
 
 
 # ── Protocol Resolution ──────────────────────────────────────────
+
 
 class TestResolveProtocol:
     """Test _resolve_protocol() maps model IDs to correct protocols."""
@@ -739,15 +806,14 @@ class TestResolveProtocol:
         """Verify all expected families are in the registry."""
         expected_openai = {"glm", "kimi", "deepseek", "mimo"}
         expected_anthropic = {"minimax", "qwen"}
-        assert expected_openai.issubset(set(
-            k for k, v in KNOWN_PROTOCOLS.items() if v == "openai"
-        ))
-        assert expected_anthropic.issubset(set(
-            k for k, v in KNOWN_PROTOCOLS.items() if v == "anthropic"
-        ))
+        assert expected_openai.issubset(set(k for k, v in KNOWN_PROTOCOLS.items() if v == "openai"))
+        assert expected_anthropic.issubset(
+            set(k for k, v in KNOWN_PROTOCOLS.items() if v == "anthropic")
+        )
 
 
 # ── Chat-to-Responses reasoning forwarding ──────────────────────
+
 
 class TestChatToResponsesRequest:
     """Test _chat_to_responses_request() forwards reasoning parameters."""

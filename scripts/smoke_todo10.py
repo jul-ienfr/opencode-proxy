@@ -7,12 +7,15 @@ CRITIC(5)(6) rotation failure honesty, CRITIC(11) quota hot-reload,
 
 Run: python scripts/smoke_todo10.py
 """
+
 import sys, time
+
 sys.path.insert(0, ".")
 
 
 class _StubVPN:
     """Minimal VPNManager stand-in for FreeIPPool smoke tests."""
+
     enabled = True
     proxy_mode = "vpn"
     status = "connected"
@@ -79,7 +82,8 @@ def main():
         await pool._rotation_task
         assert pool._rotation_task is None, "rotation task cleared after completion"
         # direct mode -> no rotation, but cooldown still set
-        vpn_direct = _StubVPN("1.2.3.4"); vpn_direct.proxy_mode = "direct"
+        vpn_direct = _StubVPN("1.2.3.4")
+        vpn_direct.proxy_mode = "direct"
         pool2 = free_ip_pool.FreeIPPool(vpn_direct)
         oc._free_ip_pool = pool2
         oc._free_model_cooldowns.clear()
@@ -93,22 +97,26 @@ def main():
 
     # ---- [2] pause_key cap semantics ----
     import threading
+
     p = oc._KeyPauser.__new__(oc._KeyPauser)  # bare instance, no deps needed for cap logic
     p._max_pause = 600
     # explicit 401 (quota_based=False) honored in full
     p._paused, p._reasons, p._lock = {}, {}, threading.Lock()
     p._save = lambda: None
     p.pause_key("sk-test-aaaaaaaa", 86400, "401 Unauthorized (key likely revoked)")
-    assert abs(p._paused[p._prefix("sk-test-aaaaaaaa")] - (time.monotonic() + 86400)) < 2, \
+    assert abs(p._paused[p._prefix("sk-test-aaaaaaaa")] - (time.monotonic() + 86400)) < 2, (
         "401 pause must NOT be capped at max_pause"
+    )
     # quota-based capped
     p.pause_key("sk-test-bbbbbbbb", 99999, "quota reset", quota_based=True)
-    assert abs(p._paused[p._prefix("sk-test-bbbbbbbb")] - (time.monotonic() + 600)) < 2, \
+    assert abs(p._paused[p._prefix("sk-test-bbbbbbbb")] - (time.monotonic() + 600)) < 2, (
         "quota pause MUST be capped at max_pause"
+    )
     print("PASS pause_key cap semantics ([2])")
 
     # ---- [6] timeout present on Path A ----
     import inspect
+
     src = inspect.getsource(oc._do_free_request_curl_cffi)
     assert "timeout=(30, 600)" in src, "Path A timeout must be (30, 600)"
     print("PASS Path A timeout (30, 600) ([6])")
@@ -147,8 +155,10 @@ def main():
     async def _check_rotation_failure():
         # CRITIC(5): total rotation failure raises RotationFailed (never None)
         v = _bare_vpn()
+
         async def _docker_down():
             raise RuntimeError("docker daemon unreachable")
+
         v._ensure_container = _docker_down
         raised = False
         try:
@@ -158,8 +168,9 @@ def main():
             assert "3 attempts" in str(e), f"unexpected message: {e}"
         assert raised, "CRITIC(5): connect_next must RAISE on total failure"
         assert v._status == vpn_manager.VPNState.ERROR, "status must be ERROR"
-        assert v._last_rotation_failed_at is not None, \
+        assert v._last_rotation_failed_at is not None, (
             "CRITIC(6): fail-fast cooldown must be armed after a failure"
+        )
         # CRITIC(6): second call within 300 s is refused immediately, no task
         raised = False
         try:
@@ -189,8 +200,10 @@ def main():
     async def _check_cancel():
         # [17]: CancelledError mid-rotation / mid-connect -> ERROR, not CONNECTING
         v3 = _bare_vpn()
+
         async def _boom():
             raise asyncio.CancelledError()
+
         v3._ensure_container = _boom
         raised = False
         try:
@@ -198,11 +211,14 @@ def main():
         except asyncio.CancelledError:
             raised = True
         assert raised, "CancelledError must propagate"
-        assert v3._status == vpn_manager.VPNState.ERROR, \
+        assert v3._status == vpn_manager.VPNState.ERROR, (
             "[17]: cancelled rotation must not stay CONNECTING"
+        )
         v7 = _bare_vpn()
+
         async def _boom2():
             raise asyncio.CancelledError()
+
         v7._compose_up = _boom2
         raised = False
         try:
@@ -210,8 +226,9 @@ def main():
         except asyncio.CancelledError:
             raised = True
         assert raised, "CancelledError must propagate from connect()"
-        assert v7._status == vpn_manager.VPNState.ERROR, \
+        assert v7._status == vpn_manager.VPNState.ERROR, (
             "[17]: cancelled connect() must not stay CONNECTING"
+        )
         print("PASS [17] CancelledError -> ERROR status")
 
     asyncio.run(_check_cancel())
@@ -225,13 +242,11 @@ def main():
         v4._current_ip = "10.0.0.77"
         v4._total_switches = 5
         v4._identity_index = 2
-        v4._identity_profiles = [
-            {"impersonate": "a"}, {"impersonate": "b"}, {"impersonate": "c"}]
+        v4._identity_profiles = [{"impersonate": "a"}, {"impersonate": "b"}, {"impersonate": "c"}]
         v4._ip_history = [{"ip": "10.0.0.77", "server": "smoke-test", "time": "t"}]
         v4._circuit_breaker.record_failure("smoke-test")  # 1 failure, still closed
         v4.save_state()
-        assert not os.path.exists(state_path + ".tmp"), \
-            "[20]: no .tmp left after atomic save"
+        assert not os.path.exists(state_path + ".tmp"), "[20]: no .tmp left after atomic save"
         v5 = _bare_vpn()
         v5._get_state_path = lambda: state_path
         v5._identity_profiles = v4._identity_profiles
@@ -239,8 +254,9 @@ def main():
         assert v5._current_ip == "10.0.0.77", "[20]: current_ip restored"
         assert v5._identity_index == 2, "[20]: identity_index restored"
         assert v5._total_switches == 5, "[20]: total_switches restored"
-        assert v5._circuit_breaker._servers["smoke-test"]["failures"] == 1, \
+        assert v5._circuit_breaker._servers["smoke-test"]["failures"] == 1, (
             "[20]: CB failure count restored"
+        )
         # clamp: config shrank between restarts
         v5._identity_profiles = [{"impersonate": "a"}]
         v5.load_state()
@@ -257,8 +273,9 @@ def main():
         v6._active_free_streams = 0
         v6._update_opportune = lambda: False
         r = await v6.apply_update(check_opportune=True)
-        assert r["error"] == "not opportune (traffic active)", \
+        assert r["error"] == "not opportune (traffic active)", (
             "[21]: not-opportune must skip inside the lock"
+        )
         v6._update_opportune = lambda: True
         v6._active_free_streams = 2
         r = await v6.apply_update(check_opportune=True)
@@ -267,14 +284,17 @@ def main():
         # the next gate) and must NOT consult _update_opportune
         v6._active_free_streams = 0
         called = {"n": 0}
+
         def _opp():
             called["n"] += 1
             return True
+
         v6._update_opportune = _opp
         v6._acquire_update_lock = lambda: False  # stop before docker
         r = await v6.apply_update(check_opportune=False)
-        assert r["error"] == "another instance is applying an update", \
+        assert r["error"] == "another instance is applying an update", (
             "[21]: check_opportune=False proceeds past the skips"
+        )
         assert called["n"] == 0, "[21]: _update_opportune must not be called"
         print("PASS [21] apply_update TOCTOU (check_opportune inside lock)")
 
@@ -282,13 +302,15 @@ def main():
 
     # [19]: 4 stream call sites count each request exactly once (attempt 0)
     src19 = open("opencode.py", encoding="utf-8").read()
-    assert src19.count("count_request=(_attempt == 0)") == 4, \
+    assert src19.count("count_request=(_attempt == 0)") == 4, (
         "[19]: expected exactly 4 count_request=(_attempt == 0) call sites"
+    )
     print("PASS [19] count_request once per request (4 call sites)")
 
     # [46]: VPN loggers routed into the rich log panel
-    assert '"vpn_manager", "free_ip_pool"' in src19, \
+    assert '"vpn_manager", "free_ip_pool"' in src19, (
         "[46]: handler must be attached to vpn_manager/free_ip_pool loggers"
+    )
     print("PASS [46] VPN loggers attached to the app log panel")
 
     # CRITIC(11): hot-reload of quota_per_ip resets the request counter
@@ -299,8 +321,7 @@ def main():
         assert pool._request_count == 1, "first request counts"
         vpn._quota_per_ip = 500  # hot-reload change
         assert await pool.on_request() is not None
-        assert pool._request_count == 1, \
-            "CRITIC(11): counter must reset when quota_per_ip changes"
+        assert pool._request_count == 1, "CRITIC(11): counter must reset when quota_per_ip changes"
         assert pool._last_quota_per_ip == 500
         assert await pool.on_request() is not None
         assert pool._request_count == 2, "counting resumes under new quota"
@@ -310,6 +331,7 @@ def main():
 
     # [27]: JS->JSON quota parser handles backslashes/quotes correctly
     from dashboard.quota import _normalize_js_object
+
     samples = [
         ("{label: 'it\\'s ok', pct: 42}", {"label": "it's ok", "pct": 42}),
         ("{path: 'C:\\Users\\x', pct: 1}", {"path": "C:\\Users\\x", "pct": 1}),

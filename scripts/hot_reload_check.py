@@ -2,13 +2,14 @@
 Test du hot-reload : vérifie que custom_routes.json est rechargé sans redémarrage.
 Usage : lance le proxy dans un terminal, puis ce script dans un autre.
 """
+
 import json
 import sys
 import os
 import time
 
 if sys.platform == "win32":
-    sys.stdout.reconfigure(encoding='utf-8')
+    sys.stdout.reconfigure(encoding="utf-8")
 
 from config.settings import ROUTES, CUSTOM_ROUTES, maybe_reload_custom_routes
 
@@ -34,7 +35,7 @@ print(f"\n[1] État initial: mimov25 = {ROUTES.get('mimov25', {}).get('model')}"
 # Modifier : mimo-v2.5 → mimo-v2.5 (changement de contenu)
 new_routes = {
     "mimov25": {"match": ["mimo-v2.5"], "model": "mimo-v2.5"},
-    "*": {"match": ["*"], "model": "mimo-v2.5"}
+    "*": {"match": ["*"], "model": "mimo-v2.5"},
 }
 write_routes(new_routes)
 time.sleep(1)

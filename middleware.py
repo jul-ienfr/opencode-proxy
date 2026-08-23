@@ -2,18 +2,24 @@
 Middleware: rate limiting (token bucket) + circuit breaker.
 Extracted from opencode.py (P3.10).
 """
+
 import time
 import os
 import threading
 from config import yaml_get
 
 RATE_LIMIT_RPS = float(os.environ.get("RATE_LIMIT_RPS", str(yaml_get("rate_limit", "rps", 50))))
-RATE_LIMIT_BURST = float(os.environ.get("RATE_LIMIT_BURST", str(yaml_get("rate_limit", "burst", 100))))
-_STALE_BUCKET_TTL = yaml_get("rate_limit", "stale_ttl", 300)  # seconds — remove buckets inactive for 5 min
+RATE_LIMIT_BURST = float(
+    os.environ.get("RATE_LIMIT_BURST", str(yaml_get("rate_limit", "burst", 100)))
+)
+_STALE_BUCKET_TTL = yaml_get(
+    "rate_limit", "stale_ttl", 300
+)  # seconds — remove buckets inactive for 5 min
 
 
 class _Bucket:
     """Token bucket for a single client IP — lock-free (single-threaded event loop)."""
+
     __slots__ = ("tokens", "last_refill", "max_tokens", "refill_rate", "last_access")
 
     def __init__(self, rate: float, burst: float):
@@ -90,7 +96,10 @@ class RateLimitMiddleware:
             return
         retry_after_int = max(1, int(retry_after) + 1)
         body = _json_dumps({"error": "Rate limit exceeded. Try again shortly."})
-        headers = [(b"content-type", b"application/json"), (b"retry-after", str(retry_after_int).encode())]
+        headers = [
+            (b"content-type", b"application/json"),
+            (b"retry-after", str(retry_after_int).encode()),
+        ]
         await send({"type": "http.response.start", "status": 503, "headers": headers})
         await send({"type": "http.response.body", "body": body})
 
@@ -98,16 +107,19 @@ class RateLimitMiddleware:
         while True:
             await asyncio.sleep(60)
             now = time.monotonic()
-            stale = [ip for ip, b in self._buckets.items() if now - b.last_access > _STALE_BUCKET_TTL]
+            stale = [
+                ip for ip, b in self._buckets.items() if now - b.last_access > _STALE_BUCKET_TTL
+            ]
             for ip in stale:
                 self._buckets.pop(ip, None)
             if stale:
-                _debug(f"  [ratelimit] cleanup: {len(stale)} stale buckets removed, {len(self._buckets)} active")
-
-
+                _debug(
+                    f"  [ratelimit] cleanup: {len(stale)} stale buckets removed, {len(self._buckets)} active"
+                )
 
 
 # ── Access Log Middleware ─────────────────────────────────────────
+
 
 class AccessLogMiddleware:
     """Pure-ASGI access log — zero copy, streaming-safe, no BaseHTTPMiddleware buffering."""
@@ -147,8 +159,6 @@ class AccessLogMiddleware:
         _log(f"{method} {path} {status} {elapsed_ms:.0f}ms {client_ip}")
 
 
-
-
 # ── Traffic Capture (Wireshark-like raw request view) ──────────────
 # Outermost middleware: records every client request — raw body bytes,
 # headers, timing, tempo, abrupt disconnects (RST) — into a bounded
@@ -167,13 +177,26 @@ _traffic_capture.configure(
 
 # ── Circuit Breaker (per-endpoint) ──────────────────────────────
 
-_CB_FAILURE_THRESHOLD = yaml_get("circuit_breaker", "failure_threshold", 5)     # trips open after N consecutive failures
-_CB_RECOVERY_TIMEOUT = float(yaml_get("circuit_breaker", "recovery_timeout", 60))   # seconds before half-open test
+_CB_FAILURE_THRESHOLD = yaml_get(
+    "circuit_breaker", "failure_threshold", 5
+)  # trips open after N consecutive failures
+_CB_RECOVERY_TIMEOUT = float(
+    yaml_get("circuit_breaker", "recovery_timeout", 60)
+)  # seconds before half-open test
 
 
 class _CircuitBreaker:
     """Per-endpoint circuit breaker: CLOSED → OPEN → HALF_OPEN → CLOSED."""
-    __slots__ = ("failures", "state", "opened_at", "total_requests", "total_failures", "last_failure_time", "created_at")
+
+    __slots__ = (
+        "failures",
+        "state",
+        "opened_at",
+        "total_requests",
+        "total_failures",
+        "last_failure_time",
+        "created_at",
+    )
 
     def __init__(self):
         self.failures = 0
@@ -263,13 +286,16 @@ def _cb_record_failure(endpoint: str):
 
 # ── HTTP helpers with circuit breaker ────────────────────────────
 
+
 class CircuitOpenError(Exception):
     """Raised when the circuit breaker is open for an endpoint."""
+
     pass
 
 
 class UpstreamError(Exception):
     """Raised when an upstream HTTP request fails (connection, timeout, etc.)."""
+
     def __init__(self, message: str, status_code: int = 502, original: Exception = None):
         super().__init__(message)
         self.status_code = status_code
@@ -278,6 +304,7 @@ class UpstreamError(Exception):
 
 class AllKeysPausedError(Exception):
     """Raised when all API keys are paused and no request can be made."""
+
     def __init__(self, retry_after: float):
         super().__init__(f"All API keys paused, retry after {retry_after:.0f}s")
         self.retry_after = retry_after

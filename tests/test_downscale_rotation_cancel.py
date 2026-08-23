@@ -23,6 +23,7 @@ End-to-end : ``_apply_station_count`` (opencode.py) downscale appelle
 cancel_rotations AVANT stop()/stop_container(), avec un pool réel et une
 rotation en vol bloquée.
 """
+
 import asyncio
 import time
 
@@ -35,8 +36,7 @@ from test_vpn_freshness import FakeVPNManager, _cfg
 
 def _pool(tmp_path, n):
     """n fake managers wired into a real FreeIPPool (stations 1..n)."""
-    ms = [FakeVPNManager(_cfg(tmp_path), station=s, tmp_path=tmp_path)
-          for s in range(1, n + 1)]
+    ms = [FakeVPNManager(_cfg(tmp_path), station=s, tmp_path=tmp_path) for s in range(1, n + 1)]
     pool = fip.FreeIPPool(ms[0], ms[1] if n >= 2 else None)
     pool.set_stations(ms)
     return pool, ms
@@ -61,6 +61,7 @@ def _blocking_switch(pool, gate, switched, cancelled_at):
     task.cancelled()/cancelling() flags are NOT reliable after the swallow —
     the behavioral contract is: registration popped + switch never
     completed + a CancelledError was delivered at the blocking await."""
+
     async def fake_switch_ip(station):
         switched.append(station._station)
         try:
@@ -68,10 +69,12 @@ def _blocking_switch(pool, gate, switched, cancelled_at):
         except asyncio.CancelledError:
             cancelled_at.append(station._station)
             raise
+
     pool.switch_ip = fake_switch_ip
 
 
 # ── cancel_rotations ─────────────────────────────────────────────
+
 
 @pytest.mark.asyncio
 async def test_cancel_rotations_cancels_and_awaits_unwind(tmp_path):
@@ -84,7 +87,7 @@ async def test_cancel_rotations_cancels_and_awaits_unwind(tmp_path):
     cancelled_at = []
 
     _blocking_switch(pool, gate, switched, cancelled_at)
-    pool._launch_rotation(ms[1])        # station 2 rotation
+    pool._launch_rotation(ms[1])  # station 2 rotation
     await _wait_registered(pool, 2)
 
     await pool.cancel_rotations([2])
@@ -92,7 +95,7 @@ async def test_cancel_rotations_cancels_and_awaits_unwind(tmp_path):
     assert cancelled_at == [2], "CancelledError delivered at the blocking await"
     assert 2 not in pool._rotation_tasks, "registration popped by finally"
     assert switched == [2]
-    gate.set()                          # release (already unwound, harmless)
+    gate.set()  # release (already unwound, harmless)
 
 
 @pytest.mark.asyncio
@@ -105,8 +108,8 @@ async def test_cancel_rotations_leaves_other_stations_alone(tmp_path):
     cancelled_at = []
 
     _blocking_switch(pool, gate, switched, cancelled_at)
-    pool._launch_rotation(ms[1])        # station 2 rotation
-    pool._launch_rotation(ms[2])        # station 3 rotation
+    pool._launch_rotation(ms[1])  # station 2 rotation
+    pool._launch_rotation(ms[2])  # station 3 rotation
     await _wait_registered(pool, 2)
     await _wait_registered(pool, 3)
 
@@ -132,12 +135,11 @@ async def test_cancel_rotations_unknown_and_empty_noop(tmp_path):
     t = asyncio.create_task(asyncio.sleep(0))
     await t
     pool._rotation_tasks[1] = t
-    await pool.cancel_rotations([1])    # must not cancel a done task
+    await pool.cancel_rotations([1])  # must not cancel a done task
 
 
 @pytest.mark.asyncio
-async def test_cancel_rotations_stuck_rotation_caps_at_deadline(
-        tmp_path, monkeypatch):
+async def test_cancel_rotations_stuck_rotation_caps_at_deadline(tmp_path, monkeypatch):
     """A rotation that SWALLOWS the cancellation (thread-like, stuck inside
     to_thread) cannot be killed: cancel_rotations polls its registration,
     caps at 5 s (patched to ~0 here) and returns best-effort — the
@@ -156,7 +158,7 @@ async def test_cancel_rotations_stuck_rotation_caps_at_deadline(
                 await asyncio.sleep(0.01)
 
     t = asyncio.create_task(stuck())
-    await asyncio.sleep(0)              # let it start and block on gate.wait()
+    await asyncio.sleep(0)  # let it start and block on gate.wait()
     pool._rotation_tasks[1] = t
     # fast-forward the deadline: the 5 s cap must not be paid in a test
     real_mono = time.monotonic
@@ -165,12 +167,12 @@ async def test_cancel_rotations_stuck_rotation_caps_at_deadline(
     def fake_monotonic():
         n["calls"] += 1
         if n["calls"] >= 3:
-            return real_mono() + 10.0     # past the deadline on iteration 3
+            return real_mono() + 10.0  # past the deadline on iteration 3
         return real_mono()
 
     monkeypatch.setattr(time, "monotonic", fake_monotonic)
 
-    await pool.cancel_rotations([1])      # returns, no exception
+    await pool.cancel_rotations([1])  # returns, no exception
 
     assert calls == ["swallowed"]
     # [Revue 19/08 F1a] Best-effort au cap = la tâche coincée survit (un
@@ -182,7 +184,7 @@ async def test_cancel_rotations_stuck_rotation_caps_at_deadline(
     assert 1 not in pool._station_ids, "sid retiré"
     assert pool._stations == [], "station retirée de l'ensemble actif"
     assert not t.done(), "tâche coincée toujours vivante (thread non tuable)"
-    pool._launch_rotation(ms[0])          # tout handler 429 tardif est refusé
+    pool._launch_rotation(ms[0])  # tout handler 429 tardif est refusé
     assert pool._pending == set(), "rien re-queué"
     assert pool._rotation_queue.empty(), "file vierge"
     release.set()
@@ -190,6 +192,7 @@ async def test_cancel_rotations_stuck_rotation_caps_at_deadline(
 
 
 # ── worker survival ──────────────────────────────────────────────
+
 
 @pytest.mark.asyncio
 async def test_worker_survives_cancelled_rotation_and_drains(tmp_path):
@@ -203,7 +206,7 @@ async def test_worker_survives_cancelled_rotation_and_drains(tmp_path):
     cancelled_at = []
 
     _blocking_switch(pool, gate, switched, cancelled_at)
-    pool._launch_rotation(ms[0])        # station 1 rotation, blocks
+    pool._launch_rotation(ms[0])  # station 1 rotation, blocks
     await _wait_registered(pool, 1)
 
     await pool.cancel_rotations([1])
@@ -229,6 +232,7 @@ async def test_worker_survives_cancelled_rotation_and_drains(tmp_path):
 
 # ── _launch_rotation / set_stations guards ───────────────────────
 
+
 @pytest.mark.asyncio
 async def test_launch_rotation_ignores_retired_station(tmp_path):
     """A request handler holding a RETIRED manager (429 arrived mid-swap)
@@ -250,8 +254,8 @@ async def test_set_stations_refreshes_ids_and_sweeps_stale(tmp_path):
     pool, ms = _pool(tmp_path, 2)
     done_task = asyncio.create_task(asyncio.sleep(0))
     await done_task
-    pool._pending.add(3)                        # stale queue entry
-    pool._rotation_tasks[3] = done_task         # stale in-flight entry
+    pool._pending.add(3)  # stale queue entry
+    pool._rotation_tasks[3] = done_task  # stale in-flight entry
     pool._rotation_tasks[99] = done_task
 
     pool.set_stations([ms[0]])
@@ -267,9 +271,9 @@ async def test_set_stations_refreshes_ids_and_sweeps_stale(tmp_path):
 
 # ── end-to-end: _apply_station_count downscale ───────────────────
 
+
 @pytest.mark.asyncio
-async def test_apply_station_count_downscale_cancels_before_stop(
-        tmp_path, monkeypatch):
+async def test_apply_station_count_downscale_cancels_before_stop(tmp_path, monkeypatch):
     """Full wiring: the downscale branch of _apply_station_count cancels
     the retired station's in-flight rotation BEFORE stop()/stop_container()
     — no docker op of the rotation lands after the cancel, the registry /
@@ -277,8 +281,7 @@ async def test_apply_station_count_downscale_cancels_before_stop(
     import opencode
     import dashboard.api as dapi
 
-    ms = [FakeVPNManager(_cfg(tmp_path), station=s, tmp_path=tmp_path)
-          for s in range(1, 4)]
+    ms = [FakeVPNManager(_cfg(tmp_path), station=s, tmp_path=tmp_path) for s in range(1, 4)]
     pool = fip.FreeIPPool(ms[0], ms[1])
     pool.set_stations(ms)
     gate = asyncio.Event()
@@ -286,7 +289,7 @@ async def test_apply_station_count_downscale_cancels_before_stop(
     cancelled_at = []
 
     _blocking_switch(pool, gate, switched, cancelled_at)
-    pool._launch_rotation(ms[2])        # station 3 rotation in flight
+    pool._launch_rotation(ms[2])  # station 3 rotation in flight
     await _wait_registered(pool, 3)
 
     class _Watcher:
@@ -304,8 +307,7 @@ async def test_apply_station_count_downscale_cancels_before_stop(
 
     monkeypatch.setattr(shared_state, "vpn_managers", ms, raising=False)
     monkeypatch.setattr(shared_state, "free_ip_pool", pool, raising=False)
-    monkeypatch.setattr(shared_state, "docker_event_watcher", watcher,
-                        raising=False)
+    monkeypatch.setattr(shared_state, "docker_event_watcher", watcher, raising=False)
     monkeypatch.setattr(dapi, "_persist_vpn_config", fake_persist)
 
     await opencode._apply_station_count(2)
@@ -322,4 +324,4 @@ async def test_apply_station_count_downscale_cancels_before_stop(
     assert set(watcher.managers) == {"opencode-vpn", "opencode-vpn-2"}
     assert persisted.get("station_count") == 2
     assert "max_free_attempts" in persisted
-    gate.set()                          # release (already unwound, harmless)
+    gate.set()  # release (already unwound, harmless)

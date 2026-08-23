@@ -41,6 +41,7 @@ fake curl).
 Never touches the live system: no real curl/httpx (both faked), no VPN,
 no DB write (free-usage logging no-op'd).
 """
+
 import json
 from contextlib import asynccontextmanager
 
@@ -68,16 +69,18 @@ PAID_MODEL = "paid-test-model"
 def assert_no_paid_artifacts(label, headers, body=""):
     """Invariant A.0 (voir test_invariant_a0.py) — aucun artefact payant."""
     for name in ("authorization", "x-api-key", "cookie", "x-request-id"):
-        assert name not in headers, \
-            f"{label}: forbidden header {name!r} reached API_BASE_FREE"
+        assert name not in headers, f"{label}: forbidden header {name!r} reached API_BASE_FREE"
     for name, value in headers.items():
-        assert not name.startswith("x-stainless-"), \
+        assert not name.startswith("x-stainless-"), (
             f"{label}: SDK identifier {name!r} reached API_BASE_FREE"
-        assert PAID_KEY_MARKER not in value, \
+        )
+        assert PAID_KEY_MARKER not in value, (
             f"{label}: paid key leaked in header {name!r} (value={value!r})"
+        )
     ua = headers.get("user-agent", "")
-    assert "claude-cli" not in ua and "python-httpx" not in ua, \
+    assert "claude-cli" not in ua and "python-httpx" not in ua, (
         f"{label}: client UA leaked to the free endpoint: {ua!r}"
+    )
     if body:
         assert PAID_KEY_MARKER not in body, f"{label}: paid key leaked in request body"
 
@@ -91,8 +94,11 @@ class _Station:
         self.current_ip = ip
         self.socks5_url = socks5_url
         self._quota_per_ip = 15
-        self.current_identity = {"impersonate": "chrome131",
-                                 "user_agent": None, "extra_headers": {}}
+        self.current_identity = {
+            "impersonate": "chrome131",
+            "user_agent": None,
+            "extra_headers": {},
+        }
 
 
 class _StubVpn:
@@ -113,8 +119,10 @@ class _FakeResp:
         self.text = text
 
     def json(self):
-        return {"usage": self._usage,
-                "choices": [{"message": {"role": "assistant", "content": "echo"}}]}
+        return {
+            "usage": self._usage,
+            "choices": [{"message": {"role": "assistant", "content": "echo"}}],
+        }
 
 
 class _FakeFreeCurl:
@@ -123,9 +131,9 @@ class _FakeFreeCurl:
 
     def __init__(self, responses):
         self.responses = list(responses)
-        self.calls = []          # [(proxy_url, station), ...]
-        self.bodies = []         # body per attempt (model swap check)
-        self.headers = []        # headers per attempt (invariant A.0)
+        self.calls = []  # [(proxy_url, station), ...]
+        self.bodies = []  # body per attempt (model swap check)
+        self.headers = []  # headers per attempt (invariant A.0)
 
     async def __call__(self, body, headers, proxy_url=None, station=None, endpoint=None, **kwargs):
         self.calls.append((proxy_url, station))
@@ -146,8 +154,8 @@ class _PoolMulti:
 
     def __init__(self, stations):
         self._stations = stations
-        self.rotated = []        # on_quota_exhausted(station) calls
-        self.requests = 0        # on_request() calls (quota counter)
+        self.rotated = []  # on_quota_exhausted(station) calls
+        self.requests = 0  # on_request() calls (quota counter)
 
     async def on_request(self):
         self.requests += 1
@@ -193,9 +201,15 @@ def free_vpn_env(monkeypatch):
 def free_cfg():
     """Save/restore the hot-reload keys on the LIVE IP_ROTATION dict
     (the same dict POST /api/vpn-config mutates in place)."""
-    saved = {k: oc.IP_ROTATION.get(k)
-             for k in ("max_free_attempts", "free_exception_fallback", "strict_free",
-                       "auto_max_free_attempts")}
+    saved = {
+        k: oc.IP_ROTATION.get(k)
+        for k in (
+            "max_free_attempts",
+            "free_exception_fallback",
+            "strict_free",
+            "auto_max_free_attempts",
+        )
+    }
     yield
     for k, v in saved.items():
         if v is None:
@@ -220,16 +234,23 @@ async def test_non_stream_429_retries_fresh_station(free_vpn_env, free_cfg, monk
     b = _Station(2, "2.2.2.2", "socks5://127.0.0.1:1081")
     pool = _PoolMulti([a, b])
     monkeypatch.setattr(oc, "_free_ip_pool", pool)
-    fake = _FakeFreeCurl([
-        _FakeResp(429, {"retry-after": "30", "content-type": "application/json"},
-                  text='{"error": "rate limited"}'),
-        _FakeResp(200, {"content-type": "application/json"},
-                  usage={"prompt_tokens": 3, "completion_tokens": 5}),
-    ])
+    fake = _FakeFreeCurl(
+        [
+            _FakeResp(
+                429,
+                {"retry-after": "30", "content-type": "application/json"},
+                text='{"error": "rate limited"}',
+            ),
+            _FakeResp(
+                200,
+                {"content-type": "application/json"},
+                usage={"prompt_tokens": 3, "completion_tokens": 5},
+            ),
+        ]
+    )
     monkeypatch.setattr(oc, "_do_free_request_curl_cffi", fake)
 
-    result = await oc._try_free_model_first(_free_body(), dict(PAID_HEADERS),
-                                            "openai", PAID_MODEL)
+    result = await oc._try_free_model_first(_free_body(), dict(PAID_HEADERS), "openai", PAID_MODEL)
     assert result is not None, "free attempt 2 must succeed on station B"
     resp, _resp_headers, free_model, free_ip = result
     assert resp.status_code == 200
@@ -245,8 +266,7 @@ async def test_non_stream_429_retries_fresh_station(free_vpn_env, free_cfg, monk
     assert pool.requests == 1
     # Invariant A.0 on EVERY free attempt (each station sees clean headers)
     for i, (headers, body) in enumerate(zip(fake.headers, fake.bodies)):
-        assert_no_paid_artifacts(f"non-stream attempt {i + 1}", headers,
-                                 json.dumps(body))
+        assert_no_paid_artifacts(f"non-stream attempt {i + 1}", headers, json.dumps(body))
         assert json.loads(json.dumps(body))["model"] == FREE_MODEL
 
 
@@ -258,7 +278,7 @@ class _Socks5Ep:
         self._station = -idx
         self.enabled = enabled
         self._usable = usable
-        self.current_ip = None          # socks5 has no docker IP
+        self.current_ip = None  # socks5 has no docker IP
         self.pid = f"1.2.3.4:10{idx}80"
         self.socks5_url = f"socks5://1.2.3.4:10{idx}80"
         self._quota_per_ip = 15
@@ -284,8 +304,8 @@ class _Socks5PoolMulti:
     def __init__(self, eps):
         self._eps = eps
         self._rr = -1
-        self.rotated = []        # on_quota_exhausted(ep) calls
-        self.requests = 0        # on_request() calls (quota counter)
+        self.rotated = []  # on_quota_exhausted(ep) calls
+        self.requests = 0  # on_request() calls (quota counter)
 
     async def on_request(self):
         self.requests += 1
@@ -294,7 +314,7 @@ class _Socks5PoolMulti:
         return ep.socks5_url if ep else None, ep
 
     def _best_station(self):
-        return None              # no docker stations in socks5 mode
+        return None  # no docker stations in socks5 mode
 
     def _socks5_enabled_eps(self):
         return [ep for ep in self._eps if ep.enabled]
@@ -331,15 +351,19 @@ async def test_socks5_mode_429_retries_next_proxy(free_vpn_env, free_cfg, monkey
     b = _Socks5Ep(2)
     pool = _Socks5PoolMulti([a, b])
     monkeypatch.setattr(oc, "_free_ip_pool", pool)
-    fake = _FakeFreeCurl([
-        _FakeResp(429, {"retry-after": "30"}, text="{}"),
-        _FakeResp(200, {"content-type": "application/json"},
-                  usage={"prompt_tokens": 3, "completion_tokens": 5}),
-    ])
+    fake = _FakeFreeCurl(
+        [
+            _FakeResp(429, {"retry-after": "30"}, text="{}"),
+            _FakeResp(
+                200,
+                {"content-type": "application/json"},
+                usage={"prompt_tokens": 3, "completion_tokens": 5},
+            ),
+        ]
+    )
     monkeypatch.setattr(oc, "_do_free_request_curl_cffi", fake)
 
-    result = await oc._try_free_model_first(_free_body(), dict(PAID_HEADERS),
-                                            "openai", PAID_MODEL)
+    result = await oc._try_free_model_first(_free_body(), dict(PAID_HEADERS), "openai", PAID_MODEL)
     assert result is not None and result[0].status_code == 200
     resp, _resp_headers, free_model, free_ip = result
     assert free_model == FREE_MODEL
@@ -373,8 +397,7 @@ async def test_socks5_mode_single_proxy_429_budget_exhausted(free_vpn_env, free_
 
     monkeypatch.setattr(oc, "_do_request_with_retry", _fake_direct)
 
-    result = await oc._try_free_model_first(_free_body(), dict(PAID_HEADERS),
-                                            "openai", PAID_MODEL)
+    result = await oc._try_free_model_first(_free_body(), dict(PAID_HEADERS), "openai", PAID_MODEL)
     assert result is None, "no second proxy → paid fallback (None)"
     assert [s for _p, s in fake.calls] == [a], "the sole proxy struck exactly once"
     assert len(direct_calls) == 1, "last-resort residential fallback attempted"
@@ -392,10 +415,12 @@ async def test_non_stream_budget_exhausted_returns_none(free_vpn_env, free_cfg, 
     b = _Station(2, "2.2.2.2", "socks5://127.0.0.1:1081")
     pool = _PoolMulti([a, b])
     monkeypatch.setattr(oc, "_free_ip_pool", pool)
-    fake = _FakeFreeCurl([
-        _FakeResp(429, {"retry-after": "30"}, text="{}"),
-        _FakeResp(429, {"retry-after": "60"}, text="{}"),
-    ])
+    fake = _FakeFreeCurl(
+        [
+            _FakeResp(429, {"retry-after": "30"}, text="{}"),
+            _FakeResp(429, {"retry-after": "60"}, text="{}"),
+        ]
+    )
     monkeypatch.setattr(oc, "_do_free_request_curl_cffi", fake)
     direct_calls = []
 
@@ -405,8 +430,7 @@ async def test_non_stream_budget_exhausted_returns_none(free_vpn_env, free_cfg, 
 
     monkeypatch.setattr(oc, "_do_request_with_retry", _fake_direct)
 
-    result = await oc._try_free_model_first(_free_body(), dict(PAID_HEADERS),
-                                            "openai", PAID_MODEL)
+    result = await oc._try_free_model_first(_free_body(), dict(PAID_HEADERS), "openai", PAID_MODEL)
     assert result is None, "budget exhausted → paid fallback (None)"
     assert [s for _p, s in fake.calls] == [a, b], "both stations struck once"
     assert pool.rotated == [a, b], "both exhausted stations rotated"
@@ -424,11 +448,16 @@ async def test_non_stream_tunnel_failure_retries_station(free_vpn_env, free_cfg,
     b = _Station(2, "2.2.2.2", "socks5://127.0.0.1:1081")
     pool = _PoolMulti([a, b])
     monkeypatch.setattr(oc, "_free_ip_pool", pool)
-    fake = _FakeFreeCurl([
-        RuntimeError("SOCKS5 tunnel dead"),
-        _FakeResp(200, {"content-type": "application/json"},
-                  usage={"prompt_tokens": 3, "completion_tokens": 5}),
-    ])
+    fake = _FakeFreeCurl(
+        [
+            RuntimeError("SOCKS5 tunnel dead"),
+            _FakeResp(
+                200,
+                {"content-type": "application/json"},
+                usage={"prompt_tokens": 3, "completion_tokens": 5},
+            ),
+        ]
+    )
     monkeypatch.setattr(oc, "_do_free_request_curl_cffi", fake)
     direct_calls = []
 
@@ -438,12 +467,12 @@ async def test_non_stream_tunnel_failure_retries_station(free_vpn_env, free_cfg,
 
     monkeypatch.setattr(oc, "_do_request_with_retry", _fake_direct)
 
-    result = await oc._try_free_model_first(_free_body(), dict(PAID_HEADERS),
-                                            "openai", PAID_MODEL)
+    result = await oc._try_free_model_first(_free_body(), dict(PAID_HEADERS), "openai", PAID_MODEL)
     assert result is not None
     assert result[0].status_code == 200
-    assert [s for _p, s in fake.calls] == [a, b], \
+    assert [s for _p, s in fake.calls] == [a, b], (
         "station-first: dead tunnel on A must retry B, not go direct"
+    )
     assert direct_calls == [], "direct residential fallback never reached"
 
 
@@ -468,11 +497,11 @@ async def test_non_stream_direct_mode_legacy_fallback(free_vpn_env, free_cfg, mo
 
     monkeypatch.setattr(oc, "_do_request_with_retry", _fake_direct)
 
-    result = await oc._try_free_model_first(_free_body(), dict(PAID_HEADERS),
-                                            "openai", PAID_MODEL)
+    result = await oc._try_free_model_first(_free_body(), dict(PAID_HEADERS), "openai", PAID_MODEL)
     assert result is not None and result[0].status_code == 200
-    assert [s for _p, s in fake.calls] == [a], \
+    assert [s for _p, s in fake.calls] == [a], (
         "direct mode: exactly ONE tunnel strike, then direct fallback"
+    )
     assert len(direct_calls) == 1, "legacy direct fallback ran"
     assert direct_calls[0] == oc.API_BASE_FREE
 
@@ -502,11 +531,11 @@ async def test_stream_429_cooldown_rotation_refuse(free_vpn_env, free_cfg, monke
     refuse = oc._on_free_429_stream(FREE_MODEL, "30")
     assert refuse is False, "strict_free off → paid fallback (False)"
     # (model, IP) cooldown on the attempted station's IP…
-    assert oc._free_cooldown_active(FREE_MODEL, a), \
-        "cooldown key must be set for the 429'd station"
+    assert oc._free_cooldown_active(FREE_MODEL, a), "cooldown key must be set for the 429'd station"
     # …but station B carries a different IP → its key stays FRESH
-    assert not oc._free_cooldown_active(FREE_MODEL, b), \
+    assert not oc._free_cooldown_active(FREE_MODEL, b), (
         "fresh station must NOT inherit the exhausted station's cooldown"
+    )
     assert pool.rotated == [a], "background rotation fired for the 429'd station"
 
     # strict_free: every station exhausted → refuse instead of paying
@@ -543,7 +572,9 @@ class _FakeStreamResp:
 
 
 @pytest.mark.asyncio
-async def test_stream_tunnel_failure_raises_free_tunnel_failure(free_vpn_env, free_cfg, monkeypatch):
+async def test_stream_tunnel_failure_raises_free_tunnel_failure(
+    free_vpn_env, free_cfg, monkeypatch
+):
     """station-first stream: a tunnel exception with direct_fallback=False
     RE-RAISES _FreeTunnelFailure (carrying the dead station) instead of
     falling through to the direct httpx path — the caller's loop then
@@ -561,11 +592,13 @@ async def test_stream_tunnel_failure_raises_free_tunnel_failure(free_vpn_env, fr
 
     body = {"model": FREE_MODEL, "messages": [{"role": "user", "content": "hello"}]}
     with pytest.raises(oc._FreeTunnelFailure) as excinfo:
-        async with oc._open_free_stream(oc.API_BASE_FREE, body, dict(PAID_HEADERS),
-                                        use_free=True, direct_fallback=False) as resp:
+        async with oc._open_free_stream(
+            oc.API_BASE_FREE, body, dict(PAID_HEADERS), use_free=True, direct_fallback=False
+        ) as resp:
             assert False, "the CM must not yield on a dead tunnel in station-first mode"
-    assert excinfo.value.station is a, \
+    assert excinfo.value.station is a, (
         "the re-raised failure must carry the DEAD station (next attempt excludes it)"
+    )
     assert "tunnel dead" in str(excinfo.value.cause)
     # Tunnel branch really ran with the station's tunnel
     assert len(_FakeCurlSessionRaise.created) == 1
@@ -609,8 +642,9 @@ async def test_stream_direct_mode_legacy_direct_fallback(free_vpn_env, free_cfg,
     monkeypatch.setattr(oc, "_client", fake_client)
 
     body = {"model": FREE_MODEL, "messages": [{"role": "user", "content": "hello"}]}
-    async with oc._open_free_stream(oc.API_BASE_FREE, body, dict(PAID_HEADERS),
-                                    use_free=True, direct_fallback=True) as resp:
+    async with oc._open_free_stream(
+        oc.API_BASE_FREE, body, dict(PAID_HEADERS), use_free=True, direct_fallback=True
+    ) as resp:
         assert resp.status_code == 200
 
     assert len(fake_client.calls) == 1, "legacy direct httpx fallback ran"
@@ -650,11 +684,12 @@ def test_excluding_many_skips_bad_station_even_when_excluded_empty():
     a station marked bad / tunnel down is never picked."""
     a = _Station(1, "1.1.1.1", "socks5://127.0.0.1:1080")
     b = _Station(2, "2.2.2.2", "socks5://127.0.0.1:1081")
-    b.status = "disconnected"          # tunnel down
+    b.status = "disconnected"  # tunnel down
     pool = _pool_with([a, b])
     assert pool._best_station_excluding_many(set()) is a
-    assert pool._best_station_excluding_many({a}) is None, \
+    assert pool._best_station_excluding_many({a}) is None, (
         "no usable station left → None (caller goes direct/paid)"
+    )
 
 
 # ── (f) hot-reload: mutation EN PLACE d'IP_ROTATION = POST /api/vpn-config ─

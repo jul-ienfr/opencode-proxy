@@ -28,6 +28,7 @@ Aucun docker réel, aucun réseau (invariant de la suite).
     PAS un succès — la requête retombe sur paid au lieu de servir une IP
     qui 429 à coup sûr.
 """
+
 import asyncio
 import time
 
@@ -35,12 +36,12 @@ import pytest
 
 import free_ip_pool as fip
 import vpn_manager as vm
-from test_downscale_rotation_cancel import _blocking_switch, _pool, \
-    _wait_registered
+from test_downscale_rotation_cancel import _blocking_switch, _pool, _wait_registered
 from test_vpn_freshness import FakeVPNManager, _cfg
 
 
 # ── F1a — cancel_rotations retire eager (guards fermés immédiatement) ──
+
 
 @pytest.mark.asyncio
 async def test_cancel_rotations_retires_state_before_teardown(tmp_path):
@@ -53,15 +54,14 @@ async def test_cancel_rotations_retires_state_before_teardown(tmp_path):
     cancelled_at = []
     _blocking_switch(pool, gate, switched, cancelled_at)
 
-    pool._launch_rotation(ms[1])            # station 2 tourne (bloquée)
-    await _wait_registered(pool, 2)         # in-flight registration posée
+    pool._launch_rotation(ms[1])  # station 2 tourne (bloquée)
+    await _wait_registered(pool, 2)  # in-flight registration posée
 
     await pool.cancel_rotations([2])
 
     assert cancelled_at == [2], "CancelledError délivré à la rotation"
     assert 2 not in pool._station_ids, "sid retiré"
-    assert [s._station for s in pool._stations] == [1], \
-        "station retirée de _stations"
+    assert [s._station for s in pool._stations] == [1], "station retirée de _stations"
     assert 2 not in pool._pending
     assert 2 not in pool._rotation_tasks, "registration popée par le finally"
     assert 2 not in pool._per, "état per-station pruné"
@@ -70,10 +70,11 @@ async def test_cancel_rotations_retires_state_before_teardown(tmp_path):
     pool._launch_rotation(ms[1])
     assert pool._pending == set()
     assert pool._rotation_queue.empty()
-    gate.set()                              # release (déjà déroulé, inoffensif)
+    gate.set()  # release (déjà déroulé, inoffensif)
 
 
 # ── F1b — stop() bascule _enabled → le gate RotationFailed prend ──
+
 
 @pytest.mark.asyncio
 async def test_stop_flips_enabled_and_connect_refuses(tmp_path):
@@ -93,6 +94,7 @@ async def test_stop_flips_enabled_and_connect_refuses(tmp_path):
 
 # ── F2 — plancher _rotation_threshold + embrayage dégénéré ─────────
 
+
 def test_rotation_threshold_floor_never_zero(tmp_path):
     """Quota 15 / stagger 2 : stations 4-6 → tête de quota négative →
     plancher 1 (les requêtes croisent toujours le seuil, mais le callable
@@ -102,15 +104,14 @@ def test_rotation_threshold_floor_never_zero(tmp_path):
     pool._rotation_stagger = 2
     for m in ms:
         m._quota_per_ip = 15
-    assert pool._rotation_threshold(ms[0]) == 5    # 15-10-0
-    assert pool._rotation_threshold(ms[1]) == 3    # 15-10-2
-    assert pool._rotation_threshold(ms[2]) == 1    # 15-10-4
-    assert pool._rotation_threshold(ms[3]) == 1    # 15-10-6 → max(1, -1)
+    assert pool._rotation_threshold(ms[0]) == 5  # 15-10-0
+    assert pool._rotation_threshold(ms[1]) == 3  # 15-10-2
+    assert pool._rotation_threshold(ms[2]) == 1  # 15-10-4
+    assert pool._rotation_threshold(ms[3]) == 1  # 15-10-6 → max(1, -1)
 
 
 @pytest.mark.asyncio
-async def test_on_request_degenerate_threshold_uses_throttled_kick(
-        tmp_path, monkeypatch):
+async def test_on_request_degenerate_threshold_uses_throttled_kick(tmp_path, monkeypatch):
     """Seuil dégénéré (== 1, marge de quota effondrée) : on_request route
     vers le kick THROTTLÉ (last_connect_attempt / connect_retry_interval) —
     pas de _launch_rotation non throttlé par requête (churn, hot-loop
@@ -118,14 +119,12 @@ async def test_on_request_degenerate_threshold_uses_throttled_kick(
     pool, ms = _pool(tmp_path, 2)
     for m in ms:
         m._status = vm.VPNState.CONNECTED
-    ms[0]._quota_per_ip = 11                # seuil station 1 = max(1, 1)
-    pool._per_station(ms[0])["request_count"] = 1   # 1 >= 1 → croise
+    ms[0]._quota_per_ip = 11  # seuil station 1 = max(1, 1)
+    pool._per_station(ms[0])["request_count"] = 1  # 1 >= 1 → croise
 
     kicked, launched = [], []
-    monkeypatch.setattr(pool, "_kick_connect",
-                        lambda st: kicked.append(st))
-    monkeypatch.setattr(pool, "_launch_rotation",
-                        lambda st: launched.append(st))
+    monkeypatch.setattr(pool, "_kick_connect", lambda st: kicked.append(st))
+    monkeypatch.setattr(pool, "_launch_rotation", lambda st: launched.append(st))
 
     url, station = await pool.on_request()
 
@@ -141,14 +140,12 @@ async def test_on_request_healthy_threshold_uses_launch(tmp_path, monkeypatch):
     pool, ms = _pool(tmp_path, 2)
     for m in ms:
         m._status = vm.VPNState.CONNECTED
-    ms[0]._quota_per_ip = 15                # seuil station 1 = 5
-    pool._per_station(ms[0])["request_count"] = 5   # 5 >= 5 → croise
+    ms[0]._quota_per_ip = 15  # seuil station 1 = 5
+    pool._per_station(ms[0])["request_count"] = 5  # 5 >= 5 → croise
 
     kicked, launched = [], []
-    monkeypatch.setattr(pool, "_kick_connect",
-                        lambda st: kicked.append(st))
-    monkeypatch.setattr(pool, "_launch_rotation",
-                        lambda st: launched.append(st))
+    monkeypatch.setattr(pool, "_kick_connect", lambda st: kicked.append(st))
+    monkeypatch.setattr(pool, "_launch_rotation", lambda st: launched.append(st))
 
     url, station = await pool.on_request()
 
@@ -159,15 +156,18 @@ async def test_on_request_healthy_threshold_uses_launch(tmp_path, monkeypatch):
 
 # ── F3 — un proxy socks5 désactivé n'est jamais serviable ──────────
 
+
 def test_socks5_usable_refuses_disabled(tmp_path):
     """_station_usable (bâti pour VPNManager) ne connaît pas `enabled` —
     le correctif F3 met le check AVANT la délégation : un proxy désactivé
     (toggle GUI ou hot-reload) n'est jamais usable."""
     pool, ms = _pool(tmp_path, 1)
-    pool.set_socks5_proxies([
-        {"host": "127.0.0.1", "port": 1080, "enabled": True},
-        {"host": "127.0.0.1", "port": 1081, "enabled": True},
-    ])
+    pool.set_socks5_proxies(
+        [
+            {"host": "127.0.0.1", "port": 1080, "enabled": True},
+            {"host": "127.0.0.1", "port": 1081, "enabled": True},
+        ]
+    )
     eps = pool._socks5_eps
     assert len(eps) == 2
 
@@ -181,39 +181,47 @@ def test_socks5_rebuild_resolves_current_to_enabled(tmp_path):
     vers un endpoint ACTIVÉ (round-robin) — jamais vers le désactivé ; tout
     désactivé → None (retombée paid), pas de proxy mort servi."""
     pool, ms = _pool(tmp_path, 1)
-    pool.set_socks5_proxies([
-        {"host": "127.0.0.1", "port": 1080, "enabled": True},
-        {"host": "127.0.0.1", "port": 1081, "enabled": True},
-    ])
+    pool.set_socks5_proxies(
+        [
+            {"host": "127.0.0.1", "port": 1080, "enabled": True},
+            {"host": "127.0.0.1", "port": 1081, "enabled": True},
+        ]
+    )
     pool._socks5_current = pool._socks5_eps[0]
 
     # current (1080) re-poussé désactivé → re-résolution vers 1081
-    pool.set_socks5_proxies([
-        {"host": "127.0.0.1", "port": 1080, "enabled": False},
-        {"host": "127.0.0.1", "port": 1081, "enabled": True},
-    ])
+    pool.set_socks5_proxies(
+        [
+            {"host": "127.0.0.1", "port": 1080, "enabled": False},
+            {"host": "127.0.0.1", "port": 1081, "enabled": True},
+        ]
+    )
     assert pool._socks5_current is not None
-    assert pool._socks5_current.pid == "127.0.0.1:1081", \
-        "re-resolve saute le proxy désactivé"
+    assert pool._socks5_current.pid == "127.0.0.1:1081", "re-resolve saute le proxy désactivé"
 
     # tout désactivé → aucun courant (retombée paid)
-    pool.set_socks5_proxies([
-        {"host": "127.0.0.1", "port": 1080, "enabled": False},
-        {"host": "127.0.0.1", "port": 1081, "enabled": False},
-    ])
+    pool.set_socks5_proxies(
+        [
+            {"host": "127.0.0.1", "port": 1080, "enabled": False},
+            {"host": "127.0.0.1", "port": 1081, "enabled": False},
+        ]
+    )
     assert pool._socks5_current is None
 
 
 # ── F4 — _await_rotation ne sert pas une IP fraîche bad-marquée ────
 
+
 async def _rotation_landing(pool, station, *, bad):
     """In-caractère rotation de fond : pose une IP fraîche, et (bad=True)
     bad-marque cette IP comme le fait la probe post-commit [Axe 1.2] juste
     avant la fin de la tâche."""
+
     async def fake_rotation():
         station._current_ip = "10.0.0.2"
         if bad:
             pool._per_station(station)["bad_until"] = time.monotonic() + 60
+
     t = asyncio.create_task(fake_rotation())
     pool._rotation_tasks[station._station] = t
 

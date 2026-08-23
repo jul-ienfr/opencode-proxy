@@ -66,15 +66,18 @@ class SharedRotationState:
         self._recent_ip_window = max(2, int(cfg.get("recent_ip_window", 20)))
         self._recent_ip_max_age = max(60.0, float(cfg.get("recent_ip_max_age", 1800)))
         file_cfg = cfg.get("shared_rotation_file")
-        self._file = (file_cfg if isinstance(file_cfg, str) and file_cfg.strip()
-                      else os.path.join(ROOT, "logs", "shared_rotation.json"))
+        self._file = (
+            file_cfg
+            if isinstance(file_cfg, str) and file_cfg.strip()
+            else os.path.join(ROOT, "logs", "shared_rotation.json")
+        )
         if not os.path.isabs(self._file):
             self._file = os.path.join(ROOT, self._file)
 
         self._ip_events: list[dict] = []  # [{ip, station, time}]
-        self._cursor: int = 0             # ABSOLUTE monotone identity counter
+        self._cursor: int = 0  # ABSOLUTE monotone identity counter
         self._last_index_by_station: dict[int, int] = {}
-        self._country_cursor: int = 0     # ABSOLUTE monotone country counter
+        self._country_cursor: int = 0  # ABSOLUTE monotone country counter
         self._last_country_by_station: dict[int, int] = {}
         self._saved_at: Optional[str] = None
         self._load()
@@ -102,11 +105,13 @@ class SharedRotationState:
         if not ip:
             return
         self._ip_events = [e for e in self._ip_events if e["ip"] != ip]
-        self._ip_events.append({
-            "ip": ip,
-            "station": int(station),
-            "time": _now_utc(),
-        })
+        self._ip_events.append(
+            {
+                "ip": ip,
+                "station": int(station),
+                "time": _now_utc(),
+            }
+        )
         self._trim()
         self._saved_at = _now_utc()
         self._persist()
@@ -294,12 +299,11 @@ class SharedRotationState:
         if not self._ip_events:
             return
         cutoff = time.time() - self._recent_ip_max_age
-        window_new = self._ip_events[-self._recent_ip_window:]
-        window_old = [e for e in self._ip_events[:-self._recent_ip_window]
-                      if _fresh(e, cutoff)]
+        window_new = self._ip_events[-self._recent_ip_window :]
+        window_old = [e for e in self._ip_events[: -self._recent_ip_window] if _fresh(e, cutoff)]
         self._ip_events = window_old + window_new
         if len(self._ip_events) > self._WINDOW_CAP:
-            self._ip_events = self._ip_events[-self._WINDOW_CAP:]
+            self._ip_events = self._ip_events[-self._WINDOW_CAP :]
 
     def _load(self) -> None:
         """Load persisted state from disk (fail-open)."""
@@ -311,8 +315,11 @@ class SharedRotationState:
             events = state.get("ip_events")
             if isinstance(events, list):
                 self._ip_events = [
-                    {"ip": str(e.get("ip")), "station": int(e.get("station", 0)),
-                     "time": str(e.get("time", ""))}
+                    {
+                        "ip": str(e.get("ip")),
+                        "station": int(e.get("station", 0)),
+                        "time": str(e.get("time", "")),
+                    }
                     for e in events
                     if isinstance(e, dict) and e.get("ip") and e.get("time")
                 ]
@@ -342,8 +349,12 @@ class SharedRotationState:
                         continue
             self._saved_at = state.get("saved_at")
             self._trim()
-            logger.debug("[shared-rotation] state loaded from %s (%d IPs, cursor %d)",
-                         self._file, len(self._ip_events), self._cursor)
+            logger.debug(
+                "[shared-rotation] state loaded from %s (%d IPs, cursor %d)",
+                self._file,
+                len(self._ip_events),
+                self._cursor,
+            )
         except Exception as e:
             logger.debug("[shared-rotation] failed to load state: %s", e)
             self._ip_events = []

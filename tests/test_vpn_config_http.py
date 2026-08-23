@@ -20,6 +20,7 @@ as test_vpn_stack_persist.py; ``opencode._apply_station_count`` and
 - regression: POST {dual_station: false} (legacy toggle) is a plain config
   update — no _apply_station_count, value persisted and fanned out.
 """
+
 import sqlite3
 
 import pytest
@@ -34,6 +35,7 @@ from dashboard.api import register_dashboard
 
 class _FakeMgr:
     """Station manager slice: update_config/get_config (+ station)."""
+
     def __init__(self, station, station_count=2):
         self._station = station
         self.station_count = station_count
@@ -44,8 +46,7 @@ class _FakeMgr:
         return {}
 
     def get_config(self) -> dict:
-        return {"enabled": True, "vpn_stack": "auto",
-                "station_count": self.station_count}
+        return {"enabled": True, "vpn_stack": "auto", "station_count": self.station_count}
 
 
 class _FakePool:
@@ -72,12 +73,13 @@ def ctx(tmp_path, monkeypatch):
     monkeypatch.setattr(shared_state, "free_ip_pool", pool, raising=False)
 
     applied = []
+
     async def _fake_apply(n):
         applied.append(int(n))
+
     monkeypatch.setattr(opencode, "_apply_station_count", _fake_apply)
     persisted = []
-    monkeypatch.setattr(api, "_persist_vpn_config",
-                        lambda u: persisted.append(dict(u)))
+    monkeypatch.setattr(api, "_persist_vpn_config", lambda u: persisted.append(dict(u)))
     return fast, s1, s2, pool, applied, persisted
 
 
@@ -88,6 +90,7 @@ def _post(app, body):
 
 # ── GET echoes station_count ─────────────────────────────────────
 
+
 def test_get_echoes_station_count(ctx):
     fast, s1, s2, pool, applied, persisted = ctx
     with TestClient(fast) as client:
@@ -96,6 +99,7 @@ def test_get_echoes_station_count(ctx):
 
 
 # ── POST {station_count: N} → hot-reload, key consumed ───────────
+
 
 def test_post_station_count_applies_hot_reload(ctx):
     """4 ≠ 2 active stations → _apply_station_count(4); the key is consumed
@@ -114,6 +118,7 @@ def test_post_station_count_applies_hot_reload(ctx):
 
 # ── POST without change → short-circuit ──────────────────────────
 
+
 def test_post_station_count_same_value_short_circuits(ctx):
     """2 == 2 active stations → no _apply_station_count; the key is still
     consumed (never persisted, never fanned out)."""
@@ -127,6 +132,7 @@ def test_post_station_count_same_value_short_circuits(ctx):
 
 
 # ── POST invalid value → HTTP 400 (axe 3.3, plan 18/08) ──────────
+
 
 def test_post_station_count_non_int_is_400(ctx):
     """A non-integer string is a caller bug: explicit 400 rather than a
@@ -155,6 +161,7 @@ def test_post_station_count_out_of_range_is_400(ctx):
 
 
 # ── regression: legacy dual_station toggle ───────────────────────
+
 
 def test_post_dual_station_legacy_is_plain_config(ctx):
     """The old toggle key is NOT the station_count branch: no hot-reload,

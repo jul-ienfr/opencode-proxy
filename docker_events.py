@@ -95,9 +95,11 @@ class DockerEventWatcher:
             try:
                 proc = await self._spawn()
             except FileNotFoundError:
-                logger.warning("[docker-events] docker CLI not found — "
-                               "real-time VPN events disabled (watchdog "
-                               "falls back to interval pacing)")
+                logger.warning(
+                    "[docker-events] docker CLI not found — "
+                    "real-time VPN events disabled (watchdog "
+                    "falls back to interval pacing)"
+                )
                 return
             except Exception as e:
                 logger.warning("[docker-events] failed to start watcher: %s", e)
@@ -128,14 +130,17 @@ class DockerEventWatcher:
 
     async def _spawn(self) -> asyncio.subprocess.Process:
         return await asyncio.create_subprocess_exec(
-            "docker", "events",
-            "--type", "container",
-            "--format", "{{json .}}",
+            "docker",
+            "events",
+            "--type",
+            "container",
+            "--format",
+            "{{json .}}",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
             creationflags=(
-                subprocess.CREATE_NO_WINDOW
-                if hasattr(subprocess, "CREATE_NO_WINDOW") else 0),
+                subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
+            ),
         )
 
     # ── Event handling ─────────────────────────────────────────
@@ -178,6 +183,7 @@ class DockerEventWatcher:
             payload["health"] = attributes["status"]
         try:
             from dashboard.events import get_event_manager
+
             get_event_manager().publish("vpn_event", payload)
         except Exception as e:
             logger.debug("[docker-events] vpn_event publish failed: %s", e)

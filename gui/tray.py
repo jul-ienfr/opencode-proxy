@@ -58,6 +58,7 @@ class TrayApp:
     def _on_copy_api_url(self, icon, item):
         import subprocess
         import sys
+
         url = self._api_url()
         try:
             kwargs = {}
@@ -71,6 +72,7 @@ class TrayApp:
         self.dashboard.close()
         # Stop servers in background; don't block the tray message loop.
         import threading
+
         threading.Thread(target=self.server_manager.stop, daemon=True).start()
         try:
             icon.stop()
@@ -83,7 +85,9 @@ class TrayApp:
         self._icon = pystray.Icon(
             "opencode",
             running_icon() if self.server_manager.is_running else stopped_icon(),
-            f"OpenCode Proxy — {self._api_url()}" if self.server_manager.is_running else "OpenCode Proxy — Arrete",
+            f"OpenCode Proxy — {self._api_url()}"
+            if self.server_manager.is_running
+            else "OpenCode Proxy — Arrete",
             menu=self._build_menu(),
         )
         self._icon.run()

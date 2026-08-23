@@ -27,6 +27,7 @@ Plus the axe 3.3 auth invariant (all POSTs guarded via _check_dashboard_token,
 read-only GETs open) and the axe 3.4 config_yaml_dirty flag surfaced by
 /api/vpn-status.
 """
+
 import io
 import os
 import sqlite3
@@ -47,7 +48,7 @@ class _FakeMgr:
 
     def __init__(self, station, status="connected", ip="1.2.3.4"):
         self._station = station
-        self.status = status            # plain attribute (diagnostic/nordvpn-status)
+        self.status = status  # plain attribute (diagnostic/nordvpn-status)
         self.current_ip = ip
         self.proxy_mode = "vpn"
         self._docker_compose_file = None
@@ -71,8 +72,7 @@ class _FakeMgr:
         return {"enabled": True, "vpn_stack": "auto", "station_count": 2}
 
     def stack_info(self):
-        return {"station": self._station, "status": self.status,
-                "stack": "wireguard"}
+        return {"station": self._station, "status": self.status, "stack": "wireguard"}
 
     async def update_config(self, updates: dict) -> dict:
         self.config_updates.append(dict(updates))
@@ -103,8 +103,7 @@ class _FakePool:
         return SimpleNamespace(pid="nxt.example.com")
 
     def get_status(self):
-        return {"enabled": True, "status": "connected",
-                "current_country": "France"}
+        return {"enabled": True, "status": "connected", "current_country": "France"}
 
 
 @pytest.fixture
@@ -118,12 +117,24 @@ def ctx(tmp_path, monkeypatch):
 
     s1 = _FakeMgr(1)
     s2 = _FakeMgr(2)
-    pool = _FakePool(rows=[
-        {"host": "p1.example.com", "port": 1080, "enabled": True,
-         "username": "u1", "password": "s3cr3t"},
-        {"host": "p2.example.com", "port": 1081, "enabled": False,
-         "username": None, "password": None},
-    ])
+    pool = _FakePool(
+        rows=[
+            {
+                "host": "p1.example.com",
+                "port": 1080,
+                "enabled": True,
+                "username": "u1",
+                "password": "s3cr3t",
+            },
+            {
+                "host": "p2.example.com",
+                "port": 1081,
+                "enabled": False,
+                "username": None,
+                "password": None,
+            },
+        ]
+    )
     monkeypatch.setattr(shared_state, "vpn_managers", [s1, s2], raising=False)
     monkeypatch.setattr(shared_state, "free_ip_pool", pool, raising=False)
     monkeypatch.setattr(shared_state, "vpn_manager", s1, raising=False)
@@ -131,14 +142,12 @@ def ctx(tmp_path, monkeypatch):
     # divergence noise from vpn-status.
     cfg = {"server_provider": "nordvpn", "server_countries": "Netherlands"}
     monkeypatch.setattr(api.config_settings, "IP_ROTATION", cfg, raising=False)
-    monkeypatch.setattr(api.config_settings, "ENV_DIVERGENCE", [],
-                        raising=False)
+    monkeypatch.setattr(api.config_settings, "ENV_DIVERGENCE", [], raising=False)
     # Dashboard auth OFF by default (each auth test sets os.environ-free token).
     monkeypatch.setattr(api, "_DASHBOARD_TOKEN", "", raising=False)
     # Persist recorder — never touches config.yaml.
     persisted = []
-    monkeypatch.setattr(api, "_persist_vpn_config",
-                        lambda u: (persisted.append(dict(u)), None)[1])
+    monkeypatch.setattr(api, "_persist_vpn_config", lambda u: (persisted.append(dict(u)), None)[1])
     return fast, s1, s2, pool, cfg, persisted
 
 
@@ -149,11 +158,12 @@ def _post(app, path, body=None):
 
 # ── GET /api/vpn/socks5 — passwords never leak ────────────────────
 
+
 def test_socks5_get_masks_passwords(ctx):
     fast, s1, s2, pool, cfg, persisted = ctx
     with TestClient(fast) as client:
         resp = client.get("/api/vpn/socks5").json()
-    assert resp["rotate"] is True          # pool toggle (cfg has no key)
+    assert resp["rotate"] is True  # pool toggle (cfg has no key)
     proxies = {p["host"]: p for p in resp["proxies"]}
     assert set(proxies) == {"p1.example.com", "p2.example.com"}
     for p in resp["proxies"]:
@@ -167,6 +177,7 @@ def test_socks5_get_masks_passwords(ctx):
 
 # ── Auth (axe 3.2): POSTs guarded, read-only GETs open ────────────
 
+
 def test_posts_require_token_when_configured(ctx, monkeypatch):
     fast, s1, s2, pool, cfg, persisted = ctx
     monkeypatch.setattr(api, "_DASHBOARD_TOKEN", "sekret")
@@ -175,12 +186,14 @@ def test_posts_require_token_when_configured(ctx, monkeypatch):
         r = client.post("/api/vpn/proxy-mode", json={"mode": "socks5"})
         assert r.status_code == 401
         # Wrong token → 401.
-        r = client.post("/api/vpn/proxy-mode", json={"mode": "socks5"},
-                        headers={"X-Dashboard-Token": "nope"})
+        r = client.post(
+            "/api/vpn/proxy-mode", json={"mode": "socks5"}, headers={"X-Dashboard-Token": "nope"}
+        )
         assert r.status_code == 401
         # Right token → 200.
-        r = client.post("/api/vpn/proxy-mode", json={"mode": "socks5"},
-                        headers={"X-Dashboard-Token": "sekret"})
+        r = client.post(
+            "/api/vpn/proxy-mode", json={"mode": "socks5"}, headers={"X-Dashboard-Token": "sekret"}
+        )
         assert r.status_code == 200
         assert s1.proxy_mode == "socks5"
         # Read-only GET stays open (the dashboard itself polls it).
@@ -188,6 +201,7 @@ def test_posts_require_token_when_configured(ctx, monkeypatch):
 
 
 # ── POST /api/vpn/proxy-mode ──────────────────────────────────────
+
 
 def test_proxy_mode_sets_all_managers_and_persists(ctx):
     fast, s1, s2, pool, cfg, persisted = ctx
@@ -208,20 +222,42 @@ def test_proxy_mode_invalid_is_error(ctx):
 
 # ── POST /api/vpn/socks5 (append) ─────────────────────────────────
 
+
 def test_socks5_add_persists_cleaned_row(ctx):
     fast, s1, s2, pool, cfg, persisted = ctx
-    resp = _post(fast, "/api/vpn/socks5",
-                 {"host": "p3.example.com", "port": 1090,
-                  "username": "u3", "password": "pw3"})
+    resp = _post(
+        fast,
+        "/api/vpn/socks5",
+        {"host": "p3.example.com", "port": 1090, "username": "u3", "password": "pw3"},
+    )
     assert resp["ok"] is True
-    assert persisted == [{"socks5_proxies": [
-        {"host": "p1.example.com", "port": 1080, "enabled": True,
-         "username": "u1", "password": "s3cr3t"},
-        {"host": "p2.example.com", "port": 1081, "enabled": False,
-         "username": None, "password": None},
-        {"host": "p3.example.com", "port": 1090, "enabled": True,
-         "username": "u3", "password": "pw3"},
-    ]}]
+    assert persisted == [
+        {
+            "socks5_proxies": [
+                {
+                    "host": "p1.example.com",
+                    "port": 1080,
+                    "enabled": True,
+                    "username": "u1",
+                    "password": "s3cr3t",
+                },
+                {
+                    "host": "p2.example.com",
+                    "port": 1081,
+                    "enabled": False,
+                    "username": None,
+                    "password": None,
+                },
+                {
+                    "host": "p3.example.com",
+                    "port": 1090,
+                    "enabled": True,
+                    "username": "u3",
+                    "password": "pw3",
+                },
+            ]
+        }
+    ]
     assert len(pool._socks5_proxies) == 3
     # The response payload re-masks the password.
     for p in resp["proxies"]:
@@ -247,6 +283,7 @@ def test_socks5_add_port_out_of_range_is_error(ctx):
 
 
 # ── POST /api/vpn/socks5/remove + toggle ──────────────────────────
+
 
 def test_socks5_remove_by_index(ctx):
     fast, s1, s2, pool, cfg, persisted = ctx
@@ -274,6 +311,7 @@ def test_socks5_toggle(ctx):
 
 # ── POST /api/vpn/socks5/rotate ───────────────────────────────────
 
+
 def test_socks5_rotate_toggle_persists(ctx):
     fast, s1, s2, pool, cfg, persisted = ctx
     resp = _post(fast, "/api/vpn/socks5/rotate", {"rotate": False})
@@ -291,47 +329,44 @@ def test_socks5_rotate_manual_returns_next(ctx):
 
 # ── POST /api/vpn/socks5/test (probe) ─────────────────────────────
 
+
 def test_socks5_test_delegates_to_probe(ctx, monkeypatch):
     fast, s1, s2, pool, cfg, persisted = ctx
     calls = []
 
     async def _fake_probe(host, port):
         calls.append((host, port))
-        return {"ok": True, "ip": "5.5.5.5", "opencode_ok": True,
-                "latency_ms": 12.3}
+        return {"ok": True, "ip": "5.5.5.5", "opencode_ok": True, "latency_ms": 12.3}
 
     monkeypatch.setattr(api, "_socks5_probe", _fake_probe)
-    resp = _post(fast, "/api/vpn/socks5/test", {"host": "p1.example.com",
-                                                "port": 1080})
-    assert resp == {"ok": True, "ip": "5.5.5.5", "opencode_ok": True,
-                    "latency_ms": 12.3}
+    resp = _post(fast, "/api/vpn/socks5/test", {"host": "p1.example.com", "port": 1080})
+    assert resp == {"ok": True, "ip": "5.5.5.5", "opencode_ok": True, "latency_ms": 12.3}
     assert calls == [("p1.example.com", 1080)]
 
 
 # ── GET nordvpn-available / nordvpn-status ────────────────────────
+
 
 def test_nordvpn_available_depends_on_creds_and_provider(ctx, monkeypatch):
     fast, s1, s2, pool, cfg, persisted = ctx
 
     def _exists(p):
         return p.replace("\\", "/").endswith("/credentials.env")
+
     monkeypatch.setattr(api.os.path, "exists", _exists)
     monkeypatch.setattr(api.os.path, "getsize", lambda p: 1024)
 
     cfg["server_provider"] = "nordvpn"
     with TestClient(fast) as client:
-        assert client.get("/api/vpn/nordvpn-available").json() == {
-            "available": True}
+        assert client.get("/api/vpn/nordvpn-available").json() == {"available": True}
     cfg["server_provider"] = "openvpn"
     with TestClient(fast) as client:
-        assert client.get("/api/vpn/nordvpn-available").json() == {
-            "available": False}
+        assert client.get("/api/vpn/nordvpn-available").json() == {"available": False}
     # Credentials missing → False regardless of provider.
     monkeypatch.setattr(api.os.path, "exists", lambda p: False)
     cfg["server_provider"] = "nordvpn"
     with TestClient(fast) as client:
-        assert client.get("/api/vpn/nordvpn-available").json() == {
-            "available": False}
+        assert client.get("/api/vpn/nordvpn-available").json() == {"available": False}
 
 
 def test_nordvpn_status_is_honest_adapter(ctx):
@@ -348,14 +383,14 @@ def test_nordvpn_status_is_honest_adapter(ctx):
 
 # ── GET nordvpn-countries / countries ─────────────────────────────
 
+
 def test_countries_static_when_api_off(ctx, monkeypatch):
     fast, s1, s2, pool, cfg, persisted = ctx
     small = [{"code": "DE", "name": "Germany"}, {"code": "FR", "name": "France"}]
     monkeypatch.setattr(api, "_NORDVPN_STATIC_COUNTRIES", small)
     cfg["use_nordvpn_api"] = False
     with TestClient(fast) as client:
-        assert client.get("/api/vpn/nordvpn-countries").json() == {
-            "countries": small}
+        assert client.get("/api/vpn/nordvpn-countries").json() == {"countries": small}
         assert client.get("/api/vpn/countries").json() == {"countries": small}
 
 
@@ -372,11 +407,11 @@ def test_countries_via_api_when_enabled(ctx, monkeypatch):
     with TestClient(fast) as client:
         got = client.get("/api/vpn/countries").json()["countries"]
     # sorted by name: France < Germany.
-    assert got == [{"code": "FR", "name": "France"},
-                   {"code": "DE", "name": "Germany"}]
+    assert got == [{"code": "FR", "name": "France"}, {"code": "DE", "name": "Germany"}]
 
 
 # ── POST /api/vpn/discover-and-add ────────────────────────────────
+
 
 def test_discover_and_add_merges_country(ctx, monkeypatch):
     fast, s1, s2, pool, cfg, persisted = ctx
@@ -385,8 +420,7 @@ def test_discover_and_add_merges_country(ctx, monkeypatch):
     async def _fake_servers(code, limit=20):
         seen["code"] = code
         seen["limit"] = limit
-        return [{"hostname": f"{code.lower()}1.nordvpn.com", "country": code,
-                 "load": 12}]
+        return [{"hostname": f"{code.lower()}1.nordvpn.com", "country": code, "load": 12}]
 
     async def _fake_countries(use_api):
         return [{"code": "DE", "name": "Germany"}]
@@ -395,8 +429,7 @@ def test_discover_and_add_merges_country(ctx, monkeypatch):
     monkeypatch.setattr(api, "_nordvpn_countries", _fake_countries)
     cfg["server_countries"] = "Netherlands, France"
 
-    resp = _post(fast, "/api/vpn/discover-and-add",
-                 {"country": "de", "limit": 999})
+    resp = _post(fast, "/api/vpn/discover-and-add", {"country": "de", "limit": 999})
     assert resp == {"count": 1, "country": "Germany"}
     assert seen["code"] == "DE"
     assert seen["limit"] == 50, "limit clamped to 50"
@@ -408,6 +441,7 @@ def test_discover_and_add_no_servers_is_error(ctx, monkeypatch):
 
     async def _fake_servers(code, limit=20):
         return []
+
     async def _fake_countries(use_api):
         return []
 
@@ -423,6 +457,7 @@ def test_discover_and_add_dedups_existing_country(ctx, monkeypatch):
 
     async def _fake_servers(code, limit=20):
         return [{"hostname": "de1.nordvpn.com", "country": "DE", "load": 5}]
+
     async def _fake_countries(use_api):
         return [{"code": "DE", "name": "Germany"}]
 
@@ -443,12 +478,14 @@ def test_discover_and_add_missing_code_is_error(ctx):
 
 # ── POST /api/vpn/upload-config (FormData, filesystem intercepted) ─
 
+
 class _UploadSink:
     """Capture the bytes written by the endpoint's ``with open(path) as f``.
 
     The endpoint closes the handle on exit — a real BytesIO would be closed
     before the assertion could call getvalue() — so capture at write-time.
     """
+
     def __init__(self, path):
         self.path = path
         self.data = bytearray()
@@ -463,12 +500,10 @@ class _UploadSink:
         return False
 
 
-def test_upload_config_writes_custom_dir_and_persists(ctx, monkeypatch,
-                                                      tmp_path):
+def test_upload_config_writes_custom_dir_and_persists(ctx, monkeypatch, tmp_path):
     fast, s1, s2, pool, cfg, persisted = ctx
     makedirs_calls = []
-    monkeypatch.setattr(api.os, "makedirs",
-                        lambda *a, **k: makedirs_calls.append((a, k)))
+    monkeypatch.setattr(api.os, "makedirs", lambda *a, **k: makedirs_calls.append((a, k)))
     opened = []
     real_open = io.open
 
@@ -491,11 +526,11 @@ def test_upload_config_writes_custom_dir_and_persists(ctx, monkeypatch,
             files={"config": ("nordvigre.ovpn", body, "text/plain")},
         ).json()
 
-    assert resp == {"ok": True,
-                    "path": "vpn_configs/custom/nordvigre.ovpn"}
+    assert resp == {"ok": True, "path": "vpn_configs/custom/nordvigre.ovpn"}
     assert persisted == [{"custom_ovpn_file": "vpn_configs/custom/nordvigre.ovpn"}]
     assert opened and opened[0].path.replace("\\", "/").endswith(
-        "vpn_configs/custom/nordvigre.ovpn")
+        "vpn_configs/custom/nordvigre.ovpn"
+    )
     assert bytes(opened[0].data) == body
     assert makedirs_calls, "custom dir ensured before write"
 
@@ -529,24 +564,24 @@ def test_upload_config_missing_file_is_error(ctx):
         resp = client.post(
             "/api/vpn/upload-config",
             data={"name": "x.ovpn"},
-            files={"config": ("x.ovpn", b"", "text/plain")}).json()
+            files={"config": ("x.ovpn", b"", "text/plain")},
+        ).json()
     assert "fichier config manquant" in resp["error"]
     assert persisted == []
 
 
 # ── GET /api/vpn/diagnostic (docker/wsl/subprocess all stubbed) ───
 
+
 def test_diagnostic_bundle(ctx, monkeypatch):
     fast, s1, s2, pool, cfg, persisted = ctx
     s1.status = "connected"
     s1.current_ip = "7.7.7.7"
-    monkeypatch.setattr(api, "_docker_diag",
-                        lambda: {"available": True, "running": True,
-                                 "version": "v1.2"})
-    monkeypatch.setattr(api, "_docker_compose_config",
-                        lambda: ["=== compose: OK"])
-    monkeypatch.setattr(api.subprocess, "run",
-                        lambda *a, **k: SimpleNamespace(returncode=0))
+    monkeypatch.setattr(
+        api, "_docker_diag", lambda: {"available": True, "running": True, "version": "v1.2"}
+    )
+    monkeypatch.setattr(api, "_docker_compose_config", lambda: ["=== compose: OK"])
+    monkeypatch.setattr(api.subprocess, "run", lambda *a, **k: SimpleNamespace(returncode=0))
     monkeypatch.setattr(api.os.path, "exists", lambda p: False)
     monkeypatch.setattr("shutil.which", lambda name: None)
     monkeypatch.setattr(api, "_config_yaml_mtime", lambda: 123.0)
@@ -563,11 +598,11 @@ def test_diagnostic_bundle(ctx, monkeypatch):
     assert d["docker"]["version"] == "v1.2"
     assert d["config_yaml_dirty"] is True
     assert d["compose_config"] == ["=== compose: OK"]
-    assert "Docker OK" in d["recommendation"] or \
-        "Connexion VPN active" in d["recommendation"]
+    assert "Docker OK" in d["recommendation"] or "Connexion VPN active" in d["recommendation"]
 
 
 # ── GET /api/vpn-stack-info (shared) ──────────────────────────────
+
 
 def test_vpn_stack_info_per_station(ctx):
     fast, s1, s2, pool, cfg, persisted = ctx
@@ -579,6 +614,7 @@ def test_vpn_stack_info_per_station(ctx):
 
 
 # ── axe 3.4: config_yaml_dirty surfaced by /api/vpn-status ────────
+
 
 def test_vpn_status_exposes_config_yaml_dirty(ctx, monkeypatch):
     fast, s1, s2, pool, cfg, persisted = ctx

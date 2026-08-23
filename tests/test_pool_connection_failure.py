@@ -17,6 +17,7 @@ Covered here (offline — no docker, no sockets, no loop tasks):
   * signal: oc._signal_connection_failure forwards to the pool and
     swallows any pool error (never blocks the request path).
 """
+
 import time
 
 import pytest
@@ -32,8 +33,7 @@ class _Station:
     reads: proxy_mode/enabled/status (via _station_usable) + the arm
     recorder (never the real loop)."""
 
-    def __init__(self, sid, *, enabled=True, proxy_mode="vpn",
-                 status="connected", current_ip=None):
+    def __init__(self, sid, *, enabled=True, proxy_mode="vpn", status="connected", current_ip=None):
         self._station = sid
         self.enabled = enabled
         self.proxy_mode = proxy_mode
@@ -43,7 +43,7 @@ class _Station:
         # session_start — notify detects the change via this attr.
         self.current_ip = current_ip
         self.socks5_url = f"socks5://127.0.0.1:1{sid}080"
-        self.armed = []                     # [plan 18/08 §1c] egress-watchdog arms
+        self.armed = []  # [plan 18/08 §1c] egress-watchdog arms
 
     def arm_egress_watchdog(self):
         self.armed.append(self._station)
@@ -75,11 +75,11 @@ class TestPoolSignalling:
 
         p.notify_connection_failure(st1)
 
-        assert p._per_station(st1)["bad_until"] is not None, \
+        assert p._per_station(st1)["bad_until"] is not None, (
             "étage 0: bad-mark immediately so _station_usable refuses it"
+        )
         assert p._per_station(st1)["bad_until"] > time.monotonic()
-        assert p._per_station(st2)["bad_until"] is None, \
-            "the healthy station stays untouched"
+        assert p._per_station(st2)["bad_until"] is None, "the healthy station stays untouched"
 
     def test_arms_egress_watchdog(self):
         """[étage 1] the manager must hear about the real failure — the arm
@@ -100,8 +100,9 @@ class TestPoolSignalling:
 
         p.notify_connection_failure(st1)
 
-        assert p._per_station(st1)["bad_until"] is None, \
+        assert p._per_station(st1)["bad_until"] is None, (
             "C1: last standing station must not be bad-marked"
+        )
         assert st1.armed == [1], "arm happens even under C1 (mono-station too)"
 
     def test_mono_station_arms_without_mark(self):
@@ -138,8 +139,9 @@ class TestPoolSignalling:
 
         p.notify_connection_failure(st1)
 
-        assert p._per_station(st1)["bad_until"] is None, \
+        assert p._per_station(st1)["bad_until"] is None, (
             "fresh rotation (< bad_ttl) absorbs the late signal"
+        )
         assert st1.armed == [1]
 
     def test_stale_signal_bad_marks(self):
@@ -180,8 +182,9 @@ class TestPoolSignalling:
 
         p.notify_connection_failure(st1)
 
-        assert p._per_station(st1)["bad_until"] is not None, \
+        assert p._per_station(st1)["bad_until"] is not None, (
             "first genuine failure must bad-mark even without an anchor"
+        )
 
     def test_repair_refresh_absorbs_late_signal(self):
         """[review F1b] the manager repair path re-pins a FRESH IP
@@ -193,16 +196,14 @@ class TestPoolSignalling:
         st2 = _Station(2)
         p = _pool(st1, st2)
         per = p._per_station(st1)
-        per["last_confirmed_ip"] = "1.1.1.1"       # pool rotation recorded it
+        per["last_confirmed_ip"] = "1.1.1.1"  # pool rotation recorded it
         per["session_start"] = time.monotonic() - 120
-        st1.current_ip = "2.2.2.2"                 # the repair re-pin
+        st1.current_ip = "2.2.2.2"  # the repair re-pin
 
         p.notify_connection_failure(st1)
 
-        assert per["last_confirmed_ip"] == "2.2.2.2", \
-            "anchor must follow the repair re-pin"
-        assert per["bad_until"] is None, \
-            "fresh repair IP absorbs the late signal"
+        assert per["last_confirmed_ip"] == "2.2.2.2", "anchor must follow the repair re-pin"
+        assert per["bad_until"] is None, "fresh repair IP absorbs the late signal"
 
     def test_repair_refresh_then_genuine_failure_marks(self):
         """After the repair-anchor refresh, a signal beyond the grace window
@@ -216,9 +217,9 @@ class TestPoolSignalling:
         per["session_start"] = time.monotonic() - 120
         st1.current_ip = "2.2.2.2"
 
-        p.notify_connection_failure(st1)              # absorbed + anchor refresh
+        p.notify_connection_failure(st1)  # absorbed + anchor refresh
         per["session_start"] = time.monotonic() - 30  # grace elapsed
-        p.notify_connection_failure(st1)              # genuine failure now
+        p.notify_connection_failure(st1)  # genuine failure now
 
         assert per["bad_until"] is not None
 
@@ -253,8 +254,7 @@ class TestIsConnectError:
 
     def test_http_429_not_connect_error(self):
         """A 429 response means the tunnel is ALIVE — never a connect signal."""
-        assert not oc._is_connect_error(
-            _err.RequestsError("Too many requests for this IP", 429))
+        assert not oc._is_connect_error(_err.RequestsError("Too many requests for this IP", 429))
 
     def test_non_network_error_false(self):
         assert not oc._is_connect_error(ValueError("boom"))
@@ -268,8 +268,7 @@ class TestIsConnectError:
     def test_http_message_not_connect(self):
         """HTTP messages avoid the words socks/connect/proxy → False (and the
         code isn't in the tunnel-death set)."""
-        assert not oc._is_connect_error(
-            _err.RequestsError("client error 429 - please retry", 429))
+        assert not oc._is_connect_error(_err.RequestsError("client error 429 - please retry", 429))
 
 
 class TestPoolSignal:
@@ -304,9 +303,9 @@ class TestPoolSignal:
         with pytest.raises(RuntimeError, match="pool broke"):
             oc._signal_connection_failure("st1")
 
-        assert any("notify_connection_failure raised" in r.message
-                   for r in caplog.records), \
+        assert any("notify_connection_failure raised" in r.message for r in caplog.records), (
             "the defect must be logged with context, not silenced"
+        )
 
     def test_signal_noop_without_pool(self, monkeypatch):
         """No VPN → pool absent (self-heal mode). The signal is a no-op."""
@@ -360,12 +359,16 @@ class TestRequestPathWiring:
     def _patch(self, monkeypatch, session):
         rec = self._RecorderPool()
         monkeypatch.setattr(oc, "_free_ip_pool", rec)
-        monkeypatch.setattr(oc, "_current_free_identity",
-                            lambda station=None: {"impersonate": "chrome131",
-                                                  "user_agent": None,
-                                                  "extra_headers": {}})
-        monkeypatch.setattr("curl_cffi.requests.AsyncSession",
-                            lambda **kw: session)
+        monkeypatch.setattr(
+            oc,
+            "_current_free_identity",
+            lambda station=None: {
+                "impersonate": "chrome131",
+                "user_agent": None,
+                "extra_headers": {},
+            },
+        )
+        monkeypatch.setattr("curl_cffi.requests.AsyncSession", lambda **kw: session)
         # Clear pooled curl sessions: previous test may have cached a fake that raises RuntimeError
         oc._curl_pool.clear()
         return rec
@@ -375,12 +378,12 @@ class TestRequestPathWiring:
         """RequestsError code 7 (connection failed — the dead-tunnel class)
         → notified + re-raised: the caller keeps its fallback, the pool
         bad-marks and the manager arms."""
-        rec = self._patch(monkeypatch, self._FakeSession(
-            error=_err.RequestsError("connect failed", 7)))
+        rec = self._patch(
+            monkeypatch, self._FakeSession(error=_err.RequestsError("connect failed", 7))
+        )
 
         with pytest.raises(_err.RequestsError):
-            await oc._do_free_request_curl_cffi(
-                {}, {}, "socks5://127.0.0.1:1080", "st1")
+            await oc._do_free_request_curl_cffi({}, {}, "socks5://127.0.0.1:1080", "st1")
 
         assert rec.notified == ["st1"]
 
@@ -388,11 +391,9 @@ class TestRequestPathWiring:
     async def test_real_helper_no_signal_on_http_response(self, monkeypatch):
         """A 429 response means the tunnel is ALIVE — no signal, the helper
         returns the wrapped response normally."""
-        rec = self._patch(monkeypatch, self._FakeSession(
-            response=self._FakeResponse()))
+        rec = self._patch(monkeypatch, self._FakeSession(response=self._FakeResponse()))
 
-        resp = await oc._do_free_request_curl_cffi(
-            {}, {}, "socks5://127.0.0.1:1080", "st1")
+        resp = await oc._do_free_request_curl_cffi({}, {}, "socks5://127.0.0.1:1080", "st1")
 
         assert isinstance(resp, oc._CurlCffiResponse)
         assert resp.status_code == 429
@@ -441,15 +442,15 @@ class TestStreamsCancelled:
     def test_noop_when_nothing_registered(self):
         st1 = _Station(1)
         pool = _pool(st1)
-        pool.cancel_streams(st1)               # must not raise
-        pool.cancel_streams(_Station(2))       # unknown station → no raise
+        pool.cancel_streams(st1)  # must not raise
+        pool.cancel_streams(_Station(2))  # unknown station → no raise
         assert not pool.is_watchdog_cancelled(st1, _Task("x"))
 
     def test_genuine_client_cancel_not_classified(self):
         st1 = _Station(1)
         pool = _pool(st1)
         reg = _Task("stream")
-        client = _Task("client")               # uvicorn cancels this one directly
+        client = _Task("client")  # uvicorn cancels this one directly
         pool.register_stream(st1, reg)
 
         pool.cancel_streams(st1)
@@ -470,15 +471,16 @@ class TestStreamsCancelled:
         pool.register_stream(st1, t1)
         pool.cancel_streams(st1)
         assert pool.is_watchdog_cancelled(st1, t1)
-        pool.unregister_stream(st1, t1)       # handler propagated → gone
+        pool.unregister_stream(st1, t1)  # handler propagated → gone
 
-        t2 = _Task("second burst")             # fresh burst on a NEW stream
+        t2 = _Task("second burst")  # fresh burst on a NEW stream
         pool.register_stream(st1, t2)
         pool.cancel_streams(st1)
 
         assert pool.is_watchdog_cancelled(st1, t2)
-        assert not pool.is_watchdog_cancelled(st1, t1), \
+        assert not pool.is_watchdog_cancelled(st1, t1), (
             "stale burst id must not survive the overwrite"
+        )
 
     def test_re_registered_stream_marked_again(self):
         """A stream still REGISTERED at the next burst is re-marked (still
@@ -488,7 +490,7 @@ class TestStreamsCancelled:
         t = _Task("long stream")
         pool.register_stream(st1, t)
         pool.cancel_streams(st1)
-        pool.cancel_streams(st1)              # still registered/in-flight
+        pool.cancel_streams(st1)  # still registered/in-flight
         assert t.cancelled == 2
         assert pool.is_watchdog_cancelled(st1, t)
 
@@ -500,6 +502,6 @@ class TestStreamsCancelled:
         t = _Task("s")
         pool.register_stream(st1, t)
         pool.unregister_stream(st1, t)
-        pool.cancel_streams(st1)               # registry empty → no cancel
+        pool.cancel_streams(st1)  # registry empty → no cancel
         assert t.cancelled == 0
         assert not pool.is_watchdog_cancelled(st1, t)

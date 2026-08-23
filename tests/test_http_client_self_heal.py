@@ -25,6 +25,7 @@ Covered here (offline, monkeypatched doubles — no sockets, no VPN, no DB):
     same
   * _forward_post issues its POST through the helper too
 """
+
 from contextlib import asynccontextmanager
 
 import httpx
@@ -117,9 +118,9 @@ async def test_paid_stream_path_goes_through_helper(monkeypatch):
     monkeypatch.setattr(oc, "_ensure_http_client", _spy_ensure)
 
     body = {"model": "mimo-v2.5", "messages": [{"role": "user", "content": "hi"}]}
-    async with oc._open_free_stream("http://upstream.local/v1/messages", body,
-                                    {"Authorization": "Bearer k"},
-                                    use_free=False) as resp:
+    async with oc._open_free_stream(
+        "http://upstream.local/v1/messages", body, {"Authorization": "Bearer k"}, use_free=False
+    ) as resp:
         assert resp.status_code == 200
 
     assert spy_calls, "_open_free_stream must consult _ensure_http_client()"
@@ -134,10 +135,11 @@ async def test_free_direct_fallback_goes_through_helper(monkeypatch):
     model and takes exactly this branch."""
     monkeypatch.setattr(oc, "_debug", lambda *a, **k: None)
     monkeypatch.setattr(oc, "_free_ip_pool", None)
-    monkeypatch.setattr(oc, "_current_free_identity",
-                        lambda station=None: {"impersonate": "chrome131",
-                                              "user_agent": None,
-                                              "extra_headers": {}})
+    monkeypatch.setattr(
+        oc,
+        "_current_free_identity",
+        lambda station=None: {"impersonate": "chrome131", "user_agent": None, "extra_headers": {}},
+    )
     monkeypatch.setattr(oc, "_free_usage_ip", lambda station=None: "1.2.3.4")
     closed = _ClosedClient()
     monkeypatch.setattr(oc, "_client", closed)
@@ -150,9 +152,12 @@ async def test_free_direct_fallback_goes_through_helper(monkeypatch):
     monkeypatch.setattr(oc, "_ensure_http_client", _spy_ensure)
 
     body = {"model": "deepseek-v4-flash", "messages": [{"role": "user", "content": "hi"}]}
-    async with oc._open_free_stream("http://upstream.local/v1/chat/completions", body,
-                                    {"Authorization": "Bearer k", "Content-Type": "application/json"},
-                                    use_free=True) as resp:
+    async with oc._open_free_stream(
+        "http://upstream.local/v1/chat/completions",
+        body,
+        {"Authorization": "Bearer k", "Content-Type": "application/json"},
+        use_free=True,
+    ) as resp:
         assert resp.status_code == 200
 
     assert spy_calls, "free fallback must consult _ensure_http_client()"
@@ -175,7 +180,8 @@ async def test_forward_post_goes_through_helper(monkeypatch):
 
     monkeypatch.setattr(oc, "_ensure_http_client", _spy_ensure)
 
-    resp = await oc._forward_post("http://upstream.local/v1/messages",
-                                  {"model": "glm-5.1"}, {"Authorization": "Bearer k"})
+    resp = await oc._forward_post(
+        "http://upstream.local/v1/messages", {"model": "glm-5.1"}, {"Authorization": "Bearer k"}
+    )
     assert resp.status_code == 200
     assert spy_calls, "_forward_post must consult _ensure_http_client()"

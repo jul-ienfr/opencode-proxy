@@ -23,6 +23,7 @@ vpn_manager):
     _rotation_recovery_timeout (per-round, not the old flat 120 s that
     summed to the measured 445 s stall over 3 rounds)
 """
+
 import asyncio
 import sys
 import time
@@ -65,7 +66,7 @@ class _FakeClient:
     async def get(self, url):
         self._record.append(url)
         if self._hang:
-            await asyncio.sleep(3600)       # cancelled by the sweep budget
+            await asyncio.sleep(3600)  # cancelled by the sweep budget
         if url not in self._behavior:
             raise RuntimeError(f"connect failed: {url}")
         return _FakeResp(self._behavior[url])
@@ -115,18 +116,22 @@ class TestParallelBoundedProbe:
         the parallel signature: the old sequential code stopped after
         the first hit. First success in endpoint order wins."""
         mgr = self._mgr(tmp_path)
-        fake, record = self._patch(monkeypatch, {
-            "http://ip-a": "1.1.1.1",
-            "http://ip-b": "2.2.2.2",
-            "http://ip-c": "3.3.3.3",
-        })
+        fake, record = self._patch(
+            monkeypatch,
+            {
+                "http://ip-a": "1.1.1.1",
+                "http://ip-b": "2.2.2.2",
+                "http://ip-c": "3.3.3.3",
+            },
+        )
 
         ip = await mgr.get_public_ip()
 
         assert ip == "1.1.1.1"
-        assert set(record) == set(self.URLS), \
+        assert set(record) == set(self.URLS), (
             "every endpoint is probed concurrently — no short-circuit"
-        assert mgr._ip_check_idx == 0          # first success = index 0, kept
+        )
+        assert mgr._ip_check_idx == 0  # first success = index 0, kept
         assert all(c.closed for c in fake.clients)
 
     @pytest.mark.asyncio
@@ -135,10 +140,13 @@ class TestParallelBoundedProbe:
         FIRST success in that order wins and the index advances to c."""
         mgr = self._mgr(tmp_path)
         mgr._ip_check_idx = 1
-        fake, record = self._patch(monkeypatch, {
-            "http://ip-a": "1.1.1.1",
-            "http://ip-c": "2.2.2.2",         # b absent = dead
-        })
+        fake, record = self._patch(
+            monkeypatch,
+            {
+                "http://ip-a": "1.1.1.1",
+                "http://ip-c": "2.2.2.2",  # b absent = dead
+            },
+        )
 
         ip = await mgr.get_public_ip()
 
@@ -152,11 +160,14 @@ class TestParallelBoundedProbe:
         no gratuitous endpoint churn on a healthy chain."""
         mgr = self._mgr(tmp_path)
         mgr._ip_check_idx = 1
-        fake, record = self._patch(monkeypatch, {
-            "http://ip-a": "1.1.1.1",
-            "http://ip-b": "2.2.2.2",
-            "http://ip-c": "3.3.3.3",
-        })
+        fake, record = self._patch(
+            monkeypatch,
+            {
+                "http://ip-a": "1.1.1.1",
+                "http://ip-b": "2.2.2.2",
+                "http://ip-c": "3.3.3.3",
+            },
+        )
 
         ip = await mgr.get_public_ip()
 
@@ -191,11 +202,11 @@ class TestParallelBoundedProbe:
 
         assert ip is None
         assert mgr._ip_check_idx == 0
-        assert elapsed < 2.0, \
-            "the sweep must be cancelled at the budget, not hang"
-        assert len(record) == 3                # every endpoint was entered
-        assert all(c.closed for c in fake.clients), \
+        assert elapsed < 2.0, "the sweep must be cancelled at the budget, not hang"
+        assert len(record) == 3  # every endpoint was entered
+        assert all(c.closed for c in fake.clients), (
             "cancelled clients must be closed (__aexit__ on CancelledError)"
+        )
 
 
 class TestFinalizePerRoundBound:
@@ -217,7 +228,7 @@ class TestFinalizePerRoundBound:
 
         async def slow_healthy(self, timeout=120.0):
             healthy_calls.append(timeout)
-            await asyncio.sleep(timeout)     # deadline loop modeled literally
+            await asyncio.sleep(timeout)  # deadline loop modeled literally
             return None
 
         mgr._wait_healthy = slow_healthy.__get__(mgr, type(mgr))
@@ -227,7 +238,7 @@ class TestFinalizePerRoundBound:
         elapsed = time.monotonic() - t0
 
         assert ok is False
-        assert healthy_calls == [0.05, 0.05], \
+        assert healthy_calls == [0.05, 0.05], (
             "both recovery rounds run, each bounded at the config timeout"
-        assert elapsed < 2.0, \
-            "the old flat 120 s bound would take ~240 s here"
+        )
+        assert elapsed < 2.0, "the old flat 120 s bound would take ~240 s here"

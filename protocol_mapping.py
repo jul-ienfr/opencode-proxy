@@ -2,6 +2,7 @@
 Protocol mapping: Anthropic <-> OpenAI <-> Responses
 Extracted from opencode.py (P3.10) - pure move, no behavior change.
 """
+
 import uuid
 import json
 import time
@@ -10,20 +11,31 @@ from dashboard.display import log as _log, debug as _debug
 
 try:
     import tiktoken
+
     _encoding = tiktoken.get_encoding("cl100k_base")
 except Exception:
     _encoding = None
 
-CACHE_REWRITE_MODELS = set(yaml_get("cache_rewrite_models", default=["mimo-v2.5", "mimo-v2-pro", "mimo-v2-omni", "mimo-v2.5-pro"]))
+CACHE_REWRITE_MODELS = set(
+    yaml_get(
+        "cache_rewrite_models",
+        default=["mimo-v2.5", "mimo-v2-pro", "mimo-v2-omni", "mimo-v2.5-pro"],
+    )
+)
 
 _thinking_cfg = yaml_get("thinking", "min_tokens", {})
-THINKING_MODELS = {k: int(v) for k, v in _thinking_cfg.items()} if isinstance(_thinking_cfg, dict) else {
-    "deepseek-v4-flash": 2048,
-    "deepseek-v4-pro": 4096,
-}
+THINKING_MODELS = (
+    {k: int(v) for k, v in _thinking_cfg.items()}
+    if isinstance(_thinking_cfg, dict)
+    else {
+        "deepseek-v4-flash": 2048,
+        "deepseek-v4-pro": 4096,
+    }
+)
 
 _responses_tool_cache: dict = {}
 _responses_tool_index_map: dict = {}
+
 
 def _extract_text(content) -> str:
     if isinstance(content, str):
@@ -47,7 +59,12 @@ def _extract_text(content) -> str:
 
 
 # ── Cache restructuration for models without semantic caching ──
-CACHE_REWRITE_MODELS = set(yaml_get("cache_rewrite_models", default=["mimo-v2.5", "mimo-v2-pro", "mimo-v2-omni", "mimo-v2.5-pro"]))
+CACHE_REWRITE_MODELS = set(
+    yaml_get(
+        "cache_rewrite_models",
+        default=["mimo-v2.5", "mimo-v2-pro", "mimo-v2-omni", "mimo-v2.5-pro"],
+    )
+)
 
 
 def _find_split_point(text: str) -> int:
@@ -94,23 +111,29 @@ def _restructure_for_cache(oai_body: dict, model_id: str) -> dict:
 
     sys_content = messages[sys_idx].get("content", "")
     if not isinstance(sys_content, str) or len(sys_content) < CACHE_MIN_PROMPT_SIZE:
-        _debug(f"  [cache-restructure] skipped: sys_content len={len(sys_content) if isinstance(sys_content, str) else 0} < min={CACHE_MIN_PROMPT_SIZE}")
+        _debug(
+            f"  [cache-restructure] skipped: sys_content len={len(sys_content) if isinstance(sys_content, str) else 0} < min={CACHE_MIN_PROMPT_SIZE}"
+        )
         return oai_body  # Small prompt, no need to restructure
 
     split_point = _find_split_point(sys_content)
     if split_point <= 0:
-        _debug(f"  [cache-restructure] skipped: no valid split point found in {len(sys_content)} chars")
+        _debug(
+            f"  [cache-restructure] skipped: no valid split point found in {len(sys_content)} chars"
+        )
         return oai_body
 
     static_part = sys_content[:split_point].strip()
     dynamic_part = sys_content[split_point:].strip()
 
     # Rebuild: static system message with cache_control + dynamic as user message
-    new_messages = [{
-        "role": "system",
-        "content": static_part,
-        "cache_control": {"type": "ephemeral"},
-    }]
+    new_messages = [
+        {
+            "role": "system",
+            "content": static_part,
+            "cache_control": {"type": "ephemeral"},
+        }
+    ]
 
     if dynamic_part:
         new_messages.append({"role": "user", "content": dynamic_part})
@@ -121,8 +144,12 @@ def _restructure_for_cache(oai_body: dict, model_id: str) -> dict:
             new_messages.append(m)
 
     oai_body["messages"] = new_messages
-    _debug(f"  [cache-restructure] split at point={split_point}: static={len(static_part)} dynamic={len(dynamic_part)} chars")
-    _log(f"  [cache] split system prompt: static={len(static_part)} dynamic={len(dynamic_part)} chars")
+    _debug(
+        f"  [cache-restructure] split at point={split_point}: static={len(static_part)} dynamic={len(dynamic_part)} chars"
+    )
+    _log(
+        f"  [cache] split system prompt: static={len(static_part)} dynamic={len(dynamic_part)} chars"
+    )
     return oai_body
 
 
@@ -138,14 +165,17 @@ def _strip_billing_header(text: str) -> str:
     first_nl = text.find("\n")
     if first_nl == -1:
         return text
-    rest = text[first_nl + 1:]
+    rest = text[first_nl + 1 :]
     if rest.startswith("\n"):
         rest = rest[1:]
     return rest
 
 
 def anthropic_to_openai(body: dict, model: str) -> dict:
-    thinking = isinstance(body.get("thinking"), dict) and body["thinking"].get("type") in ("enabled", "adaptive")
+    thinking = isinstance(body.get("thinking"), dict) and body["thinking"].get("type") in (
+        "enabled",
+        "adaptive",
+    )
     # GLM-5.x models don't support cache_control — skip it
     supports_cache_control = not model.startswith("glm-5")
 
@@ -201,26 +231,32 @@ def anthropic_to_openai(body: dict, model: str) -> dict:
             elif btype == "thinking":
                 thinking_parts.append(block.get("thinking", ""))
             elif btype == "tool_use":
-                tool_calls.append({
-                    "id": block.get("id", f"call_{uuid.uuid4().hex[:8]}"),
-                    "type": "function",
-                    "function": {
-                        "name": block.get("name", ""),
-                        "arguments": _json_dumps_str(block.get("input", {})),
-                    },
-                })
+                tool_calls.append(
+                    {
+                        "id": block.get("id", f"call_{uuid.uuid4().hex[:8]}"),
+                        "type": "function",
+                        "function": {
+                            "name": block.get("name", ""),
+                            "arguments": _json_dumps_str(block.get("input", {})),
+                        },
+                    }
+                )
             elif btype == "tool_result":
                 tid = block.get("tool_use_id", "")
                 if not tid:
                     # Defensive: skip tool_result with missing/empty tool_use_id
                     # (can happen after context compaction loses the id)
-                    _debug(f"  [compact] SKIP tool_result with missing tool_use_id in anthropic_to_openai")
+                    _debug(
+                        f"  [compact] SKIP tool_result with missing tool_use_id in anthropic_to_openai"
+                    )
                     continue
-                tool_results.append({
-                    "role": "tool",
-                    "tool_call_id": tid,
-                    "content": _extract_text(block.get("content", "")),
-                })
+                tool_results.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tid,
+                        "content": _extract_text(block.get("content", "")),
+                    }
+                )
                 if "cache_control" in block:
                     last_cache_control = block["cache_control"]
 
@@ -261,11 +297,18 @@ def anthropic_to_openai(body: dict, model: str) -> dict:
                 break
 
     # Build request
-    oai = {"model": model, "messages": messages,
-           "max_tokens": body.get("max_tokens", 16384),
-           "stream": body.get("stream", False)}
+    oai = {
+        "model": model,
+        "messages": messages,
+        "max_tokens": body.get("max_tokens", 16384),
+        "stream": body.get("stream", False),
+    }
 
-    for key, oai_key in [("temperature", "temperature"), ("top_p", "top_p"), ("stop_sequences", "stop")]:
+    for key, oai_key in [
+        ("temperature", "temperature"),
+        ("top_p", "top_p"),
+        ("stop_sequences", "stop"),
+    ]:
         if key in body:
             oai[oai_key] = body[key]
 
@@ -275,23 +318,41 @@ def anthropic_to_openai(body: dict, model: str) -> dict:
         for t in body["tools"]:
             if "name" in t:
                 # Anthropic format: {"name": "...", "description": "...", "input_schema": {...}}
-                oai_tools.append({"type": "function", "function": {
-                    "name": t["name"], "description": t.get("description", ""),
-                    "parameters": t.get("input_schema", {}),
-                }})
+                oai_tools.append(
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": t["name"],
+                            "description": t.get("description", ""),
+                            "parameters": t.get("input_schema", {}),
+                        },
+                    }
+                )
             elif "function" in t:
                 # OpenAI format: {"type": "function", "function": {"name": "...", ...}}
                 fn = t["function"]
-                oai_tools.append({"type": "function", "function": {
-                    "name": fn.get("name", ""), "description": fn.get("description", ""),
-                    "parameters": fn.get("parameters", {}),
-                }})
+                oai_tools.append(
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": fn.get("name", ""),
+                            "description": fn.get("description", ""),
+                            "parameters": fn.get("parameters", {}),
+                        },
+                    }
+                )
             else:
                 # Unknown format, try best effort
-                oai_tools.append({"type": "function", "function": {
-                    "name": t.get("name", ""), "description": t.get("description", ""),
-                    "parameters": t.get("input_schema", t.get("parameters", {})),
-                }})
+                oai_tools.append(
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": t.get("name", ""),
+                            "description": t.get("description", ""),
+                            "parameters": t.get("input_schema", t.get("parameters", {})),
+                        },
+                    }
+                )
         oai["tools"] = oai_tools
         tc = body.get("tool_choice", "auto")
         if isinstance(tc, dict):
@@ -340,14 +401,18 @@ def anthropic_to_openai(body: dict, model: str) -> dict:
                 oai["reasoning_effort"] = "medium"
             else:
                 oai["reasoning_effort"] = "low"
-            _debug(f"  [thinking] {model}: reasoning_effort={oai['reasoning_effort']} (effort={effort_level})")
+            _debug(
+                f"  [thinking] {model}: reasoning_effort={oai['reasoning_effort']} (effort={effort_level})"
+            )
         elif model.startswith("deepseek-v4"):
             # DeepSeek V4 only supports high and max
             if effort_level in ("xhigh", "max"):
                 oai["reasoning_effort"] = "max"
             else:
                 oai["reasoning_effort"] = "high"
-            _debug(f"  [thinking] {model}: reasoning_effort={oai['reasoning_effort']} (effort={effort_level})")
+            _debug(
+                f"  [thinking] {model}: reasoning_effort={oai['reasoning_effort']} (effort={effort_level})"
+            )
         else:
             # MiMo V2.5 etc. supports low/medium/high
             if effort_level in ("xhigh", "max"):
@@ -358,7 +423,9 @@ def anthropic_to_openai(body: dict, model: str) -> dict:
                 oai["reasoning_effort"] = "medium"
             else:
                 oai["reasoning_effort"] = "low"
-            _debug(f"  [thinking] {model}: reasoning_effort={oai['reasoning_effort']} (effort={effort_level})")
+            _debug(
+                f"  [thinking] {model}: reasoning_effort={oai['reasoning_effort']} (effort={effort_level})"
+            )
 
     # Restructure system prompt for models without semantic caching
     oai = _restructure_for_cache(oai, model)
@@ -369,6 +436,7 @@ _orig_anthropic_to_openai = anthropic_to_openai
 _anthropic_cache: dict = {}
 _anthropic_cache_max = 512
 
+
 def anthropic_to_openai(body: dict, model: str) -> dict:  # cached wrapper
     try:
         b = _json_dumps(body)
@@ -376,14 +444,17 @@ def anthropic_to_openai(body: dict, model: str) -> dict:  # cached wrapper
         hit = _anthropic_cache.get(key)
         if hit is not None:
             import copy
+
             return copy.deepcopy(hit)
         res = _orig_anthropic_to_openai(body, model)
         if len(_anthropic_cache) < _anthropic_cache_max:
             import copy
+
             _anthropic_cache[key] = copy.deepcopy(res)
         return res
     except Exception:
         return _orig_anthropic_to_openai(body, model)
+
 
 def openai_to_anthropic(resp: dict, model: str) -> dict:
     choice = resp.get("choices", [{}])[0]
@@ -395,14 +466,20 @@ def openai_to_anthropic(resp: dict, model: str) -> dict:
         blocks.append({"type": "thinking", "thinking": reasoning})
     if msg.get("content"):
         blocks.append({"type": "text", "text": msg["content"]})
-    for tc in (msg.get("tool_calls") or []):
+    for tc in msg.get("tool_calls") or []:
         fn = tc.get("function", {})
         try:
             inp = _json_loads(fn.get("arguments", "{}"))
         except Exception:
             inp = {}
-        blocks.append({"type": "tool_use", "id": tc.get("id", f"toolu_{uuid.uuid4().hex[:8]}"),
-                        "name": fn.get("name", ""), "input": inp})
+        blocks.append(
+            {
+                "type": "tool_use",
+                "id": tc.get("id", f"toolu_{uuid.uuid4().hex[:8]}"),
+                "name": fn.get("name", ""),
+                "input": inp,
+            }
+        )
 
     if not blocks:
         blocks.append({"type": "text", "text": ""})
@@ -412,12 +489,21 @@ def openai_to_anthropic(resp: dict, model: str) -> dict:
         stop = "max_tokens"
 
     return {
-        "id": f"msg_{uuid.uuid4().hex[:24]}", "type": "message", "role": "assistant",
-        "content": blocks, "model": model, "stop_reason": stop, "stop_sequence": None,
-        "usage": {"input_tokens": usage.get("prompt_tokens", 0),
-                "output_tokens": usage.get("completion_tokens", 0),
-                "cache_creation_input_tokens": 0,
-                "cache_read_input_tokens": usage.get("prompt_tokens_details", {}).get("cached_tokens", 0)},
+        "id": f"msg_{uuid.uuid4().hex[:24]}",
+        "type": "message",
+        "role": "assistant",
+        "content": blocks,
+        "model": model,
+        "stop_reason": stop,
+        "stop_sequence": None,
+        "usage": {
+            "input_tokens": usage.get("prompt_tokens", 0),
+            "output_tokens": usage.get("completion_tokens", 0),
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": usage.get("prompt_tokens_details", {}).get(
+                "cached_tokens", 0
+            ),
+        },
     }
 
 
@@ -435,11 +521,13 @@ def openai_to_anthropic_request(oai_body: dict) -> dict:
             continue
 
         if role == "tool":
-            pending_tool_results.append({
-                "type": "tool_result",
-                "tool_use_id": msg.get("tool_call_id", ""),
-                "content": _extract_text(msg.get("content", "")),
-            })
+            pending_tool_results.append(
+                {
+                    "type": "tool_result",
+                    "tool_use_id": msg.get("tool_call_id", ""),
+                    "content": _extract_text(msg.get("content", "")),
+                }
+            )
             continue
 
         if role not in ("user", "assistant"):
@@ -470,12 +558,14 @@ def openai_to_anthropic_request(oai_body: dict) -> dict:
                 inp = _json_loads(fn.get("arguments", "{}"))
             except Exception:
                 inp = {}
-            blocks.append({
-                "type": "tool_use",
-                "id": tc.get("id", f"toolu_{uuid.uuid4().hex[:8]}"),
-                "name": fn.get("name", ""),
-                "input": inp,
-            })
+            blocks.append(
+                {
+                    "type": "tool_use",
+                    "id": tc.get("id", f"toolu_{uuid.uuid4().hex[:8]}"),
+                    "name": fn.get("name", ""),
+                    "input": inp,
+                }
+            )
 
         # Convert reasoning_content → thinking block (assistant only)
         if role == "assistant":
@@ -504,25 +594,35 @@ def openai_to_anthropic_request(oai_body: dict) -> dict:
         result["system"] = system_text
 
     # Map simple params
-    for key, anthro_key in [("temperature", "temperature"), ("top_p", "top_p"),
-                             ("stop", "stop_sequences")]:
+    for key, anthro_key in [
+        ("temperature", "temperature"),
+        ("top_p", "top_p"),
+        ("stop", "stop_sequences"),
+    ]:
         if key in oai_body:
             result[anthro_key] = oai_body[key]
 
     # Convert tools
     if "tools" in oai_body:
-        result["tools"] = [{
-            "name": t["function"]["name"],
-            "description": t["function"].get("description", ""),
-            "input_schema": t["function"].get("parameters", {}),
-        } for t in oai_body["tools"] if t.get("type") == "function"]
+        result["tools"] = [
+            {
+                "name": t["function"]["name"],
+                "description": t["function"].get("description", ""),
+                "input_schema": t["function"].get("parameters", {}),
+            }
+            for t in oai_body["tools"]
+            if t.get("type") == "function"
+        ]
 
         # Convert tool_choice
         tc = oai_body.get("tool_choice", "auto")
         if isinstance(tc, dict):
             tc_type = tc.get("type", "auto")
             if tc_type == "function":
-                result["tool_choice"] = {"type": "tool", "name": tc.get("function", {}).get("name", "")}
+                result["tool_choice"] = {
+                    "type": "tool",
+                    "name": tc.get("function", {}).get("name", ""),
+                }
             elif tc_type == "any":
                 result["tool_choice"] = {"type": "any"}
             else:
@@ -549,14 +649,16 @@ def anthropic_to_openai_response(anthro: dict, model: str) -> dict:
         elif t == "thinking":
             reasoning_text = block.get("thinking", "")
         elif t == "tool_use":
-            tool_calls.append({
-                "id": block.get("id", f"call_{uuid.uuid4().hex[:12]}"),
-                "type": "function",
-                "function": {
-                    "name": block.get("name", ""),
-                    "arguments": _json_dumps_str(block.get("input", {}), ensure_ascii=False),
-                },
-            })
+            tool_calls.append(
+                {
+                    "id": block.get("id", f"call_{uuid.uuid4().hex[:12]}"),
+                    "type": "function",
+                    "function": {
+                        "name": block.get("name", ""),
+                        "arguments": _json_dumps_str(block.get("input", {}), ensure_ascii=False),
+                    },
+                }
+            )
 
     # Determine finish_reason
     sr = anthro.get("stop_reason", "")
@@ -595,11 +697,13 @@ def anthropic_to_openai_response(anthro: dict, model: str) -> dict:
         "object": "chat.completion",
         "created": int(time.time()),
         "model": model,
-        "choices": [{
-            "index": 0,
-            "message": message,
-            "finish_reason": finish,
-        }],
+        "choices": [
+            {
+                "index": 0,
+                "message": message,
+                "finish_reason": finish,
+            }
+        ],
         "usage": oai_usage,
     }
 
@@ -616,17 +720,19 @@ def openai_responses_to_anthropic(body: dict) -> dict:
         role = item.get("role", item.get("type", "user"))
 
         if role in ("system", "developer"):
-            for block in (item.get("content") or []):
+            for block in item.get("content") or []:
                 if isinstance(block, dict) and block.get("type") == "input_text":
                     system_text += block.get("text", "")
             continue
 
         if item.get("type") == "function_call_output":
-            pending_tool_results.append({
-                "type": "tool_result",
-                "tool_use_id": item.get("call_id", item.get("id", "")),
-                "content": item.get("output", ""),
-            })
+            pending_tool_results.append(
+                {
+                    "type": "tool_result",
+                    "tool_use_id": item.get("call_id", item.get("id", "")),
+                    "content": item.get("output", ""),
+                }
+            )
             continue
 
         # Convert previous-turn function_call items to assistant tool_use blocks
@@ -635,15 +741,21 @@ def openai_responses_to_anthropic(body: dict) -> dict:
                 inp = _json_loads(item.get("arguments", "{}"))
             except Exception:
                 inp = {}
-            anthro_messages.append({
-                "role": "assistant",
-                "content": [{
-                    "type": "tool_use",
-                    "id": item.get("call_id") or item.get("id") or f"toolu_{uuid.uuid4().hex[:12]}",
-                    "name": item.get("name", ""),
-                    "input": inp,
-                }]
-            })
+            anthro_messages.append(
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": item.get("call_id")
+                            or item.get("id")
+                            or f"toolu_{uuid.uuid4().hex[:12]}",
+                            "name": item.get("name", ""),
+                            "input": inp,
+                        }
+                    ],
+                }
+            )
             continue
 
         if role not in ("user", "assistant"):
@@ -654,7 +766,7 @@ def openai_responses_to_anthropic(body: dict) -> dict:
             blocks.extend(pending_tool_results)
             pending_tool_results = []
 
-        for block in (item.get("content") or []):
+        for block in item.get("content") or []:
             if not isinstance(block, dict):
                 continue
             btype = block.get("type", "")
@@ -742,14 +854,18 @@ def openai_responses_to_anthropic(body: dict) -> dict:
                 result["reasoning_effort"] = "medium"
             else:
                 result["reasoning_effort"] = "low"
-            _debug(f"  [thinking] {_model}: reasoning_effort={result['reasoning_effort']} (effort={effort_level})")
+            _debug(
+                f"  [thinking] {_model}: reasoning_effort={result['reasoning_effort']} (effort={effort_level})"
+            )
         elif _model.startswith("deepseek-v4"):
             # DeepSeek V4 only supports high and max
             if effort_level in ("xhigh", "max"):
                 result["reasoning_effort"] = "max"
             else:
                 result["reasoning_effort"] = "high"
-            _debug(f"  [thinking] {_model}: reasoning_effort={result['reasoning_effort']} (effort={effort_level})")
+            _debug(
+                f"  [thinking] {_model}: reasoning_effort={result['reasoning_effort']} (effort={effort_level})"
+            )
         else:
             # MiMo V2.5 etc. supports low/medium/high
             if effort_level in ("xhigh", "max"):
@@ -760,7 +876,9 @@ def openai_responses_to_anthropic(body: dict) -> dict:
                 result["reasoning_effort"] = "medium"
             else:
                 result["reasoning_effort"] = "low"
-            _debug(f"  [thinking] {_model}: reasoning_effort={result['reasoning_effort']} (effort={effort_level})")
+            _debug(
+                f"  [thinking] {_model}: reasoning_effort={result['reasoning_effort']} (effort={effort_level})"
+            )
 
     return result
 
@@ -779,18 +897,23 @@ def anthropic_to_openai_responses(anthro: dict, model: str) -> dict:
         if btype == "text":
             text_content.append({"type": "output_text", "text": block.get("text", "")})
         elif btype == "thinking":
-            output_items.insert(0, {
-                "type": "reasoning",
-                "summary": [{"type": "summary_text", "text": block.get("thinking", "")}],
-            })
+            output_items.insert(
+                0,
+                {
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": block.get("thinking", "")}],
+                },
+            )
         elif btype == "tool_use":
-            function_calls.append({
-                "type": "function_call",
-                "call_id": block.get("id", f"call_{uuid.uuid4().hex[:12]}"),
-                "name": block.get("name", ""),
-                "arguments": _json_dumps_str(block.get("input", {}), ensure_ascii=False),
-                "status": "completed",
-            })
+            function_calls.append(
+                {
+                    "type": "function_call",
+                    "call_id": block.get("id", f"call_{uuid.uuid4().hex[:12]}"),
+                    "name": block.get("name", ""),
+                    "arguments": _json_dumps_str(block.get("input", {}), ensure_ascii=False),
+                    "status": "completed",
+                }
+            )
 
     if text_content:
         output_items.append({"type": "message", "role": "assistant", "content": text_content})
@@ -811,7 +934,10 @@ def anthropic_to_openai_responses(anthro: dict, model: str) -> dict:
         "input_tokens": in_t,
         "output_tokens": out_t,
         "total_tokens": in_t + out_t,
-        "output_tokens_details": {"reasoning_tokens": 0, "cached_tokens": usage.get("cache_read_input_tokens", 0)},
+        "output_tokens_details": {
+            "reasoning_tokens": 0,
+            "cached_tokens": usage.get("cache_read_input_tokens", 0),
+        },
     }
 
     return {
@@ -838,30 +964,37 @@ def openai_chat_to_responses(chat_resp: dict, model: str) -> dict:
     # Reasoning content -> reasoning item
     reasoning = msg.get("reasoning_content") or msg.get("reasoning")
     if reasoning:
-        output_items.insert(0, {
-            "type": "reasoning",
-            "summary": [{"type": "summary_text", "text": reasoning}],
-        })
+        output_items.insert(
+            0,
+            {
+                "type": "reasoning",
+                "summary": [{"type": "summary_text", "text": reasoning}],
+            },
+        )
 
     # Text content -> message item with output_text
     content = msg.get("content", "")
     if content:
-        output_items.append({
-            "type": "message",
-            "role": "assistant",
-            "content": [{"type": "output_text", "text": content}],
-        })
+        output_items.append(
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": content}],
+            }
+        )
 
     # Tool calls -> function_call items
-    for tc in (msg.get("tool_calls") or []):
+    for tc in msg.get("tool_calls") or []:
         fn = tc.get("function", {})
-        output_items.append({
-            "type": "function_call",
-            "call_id": tc.get("id", f"call_{uuid.uuid4().hex[:12]}"),
-            "name": fn.get("name", ""),
-            "arguments": fn.get("arguments", "{}"),
-            "status": "completed",
-        })
+        output_items.append(
+            {
+                "type": "function_call",
+                "call_id": tc.get("id", f"call_{uuid.uuid4().hex[:12]}"),
+                "name": fn.get("name", ""),
+                "arguments": fn.get("arguments", "{}"),
+                "status": "completed",
+            }
+        )
 
     # Status mapping
     finish = choice.get("finish_reason", "")
@@ -908,7 +1041,13 @@ def _chat_to_responses_request(chat: dict) -> dict:
             cid = m.get("tool_call_id", "")
             if not cid:
                 continue
-            inp.append({"type": "function_call_output", "call_id": cid, "output": content if isinstance(content, str) else str(content)})
+            inp.append(
+                {
+                    "type": "function_call_output",
+                    "call_id": cid,
+                    "output": content if isinstance(content, str) else str(content),
+                }
+            )
             continue
         if isinstance(content, str):
             if content:
@@ -918,7 +1057,11 @@ def _chat_to_responses_request(chat: dict) -> dict:
                     item["cache_control"] = cache_ctrl
                 inp.append(item)
         elif isinstance(content, list):
-            txt = "\n".join(b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text")
+            txt = "\n".join(
+                b.get("text", "")
+                for b in content
+                if isinstance(b, dict) and b.get("type") == "text"
+            )
             if txt:
                 ctype = "output_text" if role == "assistant" else "input_text"
                 item = {"role": role, "content": [{"type": ctype, "text": txt}]}
@@ -928,10 +1071,19 @@ def _chat_to_responses_request(chat: dict) -> dict:
         for tc in m.get("tool_calls", []) or []:
             fn = tc.get("function", {}) if isinstance(tc.get("function"), dict) else {}
             _cid = tc.get("call_id") or tc.get("id") or f"call_{uuid.uuid4().hex[:12]}"
-            inp.append({"type": "function_call", "call_id": _cid, "name": fn.get("name", ""), "arguments": fn.get("arguments", "{}")})
+            inp.append(
+                {
+                    "type": "function_call",
+                    "call_id": _cid,
+                    "name": fn.get("name", ""),
+                    "arguments": fn.get("arguments", "{}"),
+                }
+            )
     # Guard: Responses input must be non-empty; log original chat for audit if empty
     if not inp:
-        _debug(f"  [free] _chat_to_responses_request empty input for model {chat.get('model','')} — original messages={len(chat.get('messages',[]))} — injecting fallback")
+        _debug(
+            f"  [free] _chat_to_responses_request empty input for model {chat.get('model', '')} — original messages={len(chat.get('messages', []))} — injecting fallback"
+        )
         inp.append({"role": "user", "content": [{"type": "input_text", "text": "hello"}]})
     req = {"model": chat.get("model", ""), "input": inp, "stream": bool(chat.get("stream", False))}
     if "max_tokens" in chat:
@@ -954,7 +1106,14 @@ def _chat_to_responses_request(chat: dict) -> dict:
         for t in chat["tools"]:
             if isinstance(t, dict) and "function" in t:
                 fn = t["function"]
-                tools.append({"type": "function", "name": fn.get("name", ""), "description": fn.get("description", ""), "parameters": fn.get("parameters", {})})
+                tools.append(
+                    {
+                        "type": "function",
+                        "name": fn.get("name", ""),
+                        "description": fn.get("description", ""),
+                        "parameters": fn.get("parameters", {}),
+                    }
+                )
         if tools:
             req["tools"] = tools
         tc = chat.get("tool_choice")
@@ -990,7 +1149,16 @@ def _responses_to_chat_response(resp: dict, model: str) -> dict:
                 if isinstance(s, dict):
                     reasoning += s.get("text", "")
         elif item.get("type") == "function_call":
-            tool_calls.append({"id": item.get("call_id", item.get("id", "")), "type": "function", "function": {"name": item.get("name", ""), "arguments": item.get("arguments", "{}")}})
+            tool_calls.append(
+                {
+                    "id": item.get("call_id", item.get("id", "")),
+                    "type": "function",
+                    "function": {
+                        "name": item.get("name", ""),
+                        "arguments": item.get("arguments", "{}"),
+                    },
+                }
+            )
     msg = {"role": "assistant", "content": "\n".join(texts)}
     if reasoning:
         msg["reasoning_content"] = reasoning
@@ -998,14 +1166,31 @@ def _responses_to_chat_response(resp: dict, model: str) -> dict:
         msg["tool_calls"] = tool_calls
     usage = resp.get("usage", {}) if isinstance(resp.get("usage"), dict) else {}
     # Cache tokens come from input_tokens_details, NOT output_tokens_details
-    _inp_details = usage.get("input_tokens_details") if isinstance(usage.get("input_tokens_details"), dict) else {}
+    _inp_details = (
+        usage.get("input_tokens_details")
+        if isinstance(usage.get("input_tokens_details"), dict)
+        else {}
+    )
     _cached = _inp_details.get("cached_tokens", 0)
-    chat_usage = {"prompt_tokens": usage.get("input_tokens", 0), "completion_tokens": usage.get("output_tokens", 0), "total_tokens": usage.get("total_tokens", usage.get("input_tokens", 0) + usage.get("output_tokens", 0))}
+    chat_usage = {
+        "prompt_tokens": usage.get("input_tokens", 0),
+        "completion_tokens": usage.get("output_tokens", 0),
+        "total_tokens": usage.get(
+            "total_tokens", usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
+        ),
+    }
     if _cached:
         chat_usage["prompt_tokens_details"] = {"cached_tokens": _cached}
     status = resp.get("status", "completed")
     finish = "stop" if status == "completed" else "length"
-    return {"id": resp.get("id", f"chatcmpl-{uuid.uuid4().hex[:8]}"), "object": "chat.completion", "created": int(time.time()), "model": model, "choices": [{"index": 0, "message": msg, "finish_reason": finish}], "usage": chat_usage}
+    return {
+        "id": resp.get("id", f"chatcmpl-{uuid.uuid4().hex[:8]}"),
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [{"index": 0, "message": msg, "finish_reason": finish}],
+        "usage": chat_usage,
+    }
 
 
 def _responses_to_anthropic_response(resp: dict, model: str) -> dict:
@@ -1026,7 +1211,14 @@ def _responses_to_anthropic_response(resp: dict, model: str) -> dict:
                 inp = _json_loads(item.get("arguments", "{}"))
             except Exception:
                 inp = {}
-            blocks.append({"type": "tool_use", "id": item.get("call_id", item.get("id", "")), "name": item.get("name", ""), "input": inp})
+            blocks.append(
+                {
+                    "type": "tool_use",
+                    "id": item.get("call_id", item.get("id", "")),
+                    "name": item.get("name", ""),
+                    "input": inp,
+                }
+            )
     if not blocks:
         blocks.append({"type": "text", "text": ""})
     usage = resp.get("usage", {}) if isinstance(resp.get("usage"), dict) else {}
@@ -1036,14 +1228,32 @@ def _responses_to_anthropic_response(resp: dict, model: str) -> dict:
     if has_tools:
         stop = "tool_use"
     # Cache tokens come from input_tokens_details, NOT output_tokens_details
-    _inp_details = usage.get("input_tokens_details") if isinstance(usage.get("input_tokens_details"), dict) else {}
+    _inp_details = (
+        usage.get("input_tokens_details")
+        if isinstance(usage.get("input_tokens_details"), dict)
+        else {}
+    )
     _cache_read = _inp_details.get("cached_tokens", 0)
-    return {"id": f"msg_{uuid.uuid4().hex[:24]}", "type": "message", "role": "assistant", "content": blocks, "model": model, "stop_reason": stop, "stop_sequence": None, "usage": {"input_tokens": usage.get("input_tokens", 0), "output_tokens": usage.get("output_tokens", 0), "cache_read_input_tokens": _cache_read}}
+    return {
+        "id": f"msg_{uuid.uuid4().hex[:24]}",
+        "type": "message",
+        "role": "assistant",
+        "content": blocks,
+        "model": model,
+        "stop_reason": stop,
+        "stop_sequence": None,
+        "usage": {
+            "input_tokens": usage.get("input_tokens", 0),
+            "output_tokens": usage.get("output_tokens", 0),
+            "cache_read_input_tokens": _cache_read,
+        },
+    }
 
 
 # ── Responses API tool mapping cache (item_id/output_index → tool info) ──
 _responses_tool_cache: dict = {}
 _responses_tool_index_map: dict = {}  # output_index -> sequential tool index (0,1,2...)
+
 
 def _responses_sse_to_chat_deltas(raw_line: str):
     """Convert one Responses API SSE data line to chat/completions delta chunks.
@@ -1078,7 +1288,9 @@ def _responses_sse_to_chat_deltas(raw_line: str):
         delta_obj = chunk.get("delta", {})
         dtype = delta_obj.get("type", "")
         text = delta_obj.get("text", "")
-        _debug(f"  [responses-sse] content_part.delta dtype={dtype!r} text={text[:80]!r} full_delta_keys={list(delta_obj.keys())[:10]}")
+        _debug(
+            f"  [responses-sse] content_part.delta dtype={dtype!r} text={text[:80]!r} full_delta_keys={list(delta_obj.keys())[:10]}"
+        )
         if not text:
             return None
         if dtype == "output_text":
@@ -1107,10 +1319,37 @@ def _responses_sse_to_chat_deltas(raw_line: str):
             name = item.get("name", "")
             # Cache for later delta events (by item_id and output_index)
             iid = item.get("id") or call_id
-            _responses_tool_cache[iid] = {"index": tool_idx, "call_id": call_id, "name": name, "output_index": out_idx}
-            _responses_tool_cache[f"idx_{out_idx}"] = {"index": tool_idx, "call_id": call_id, "name": name}
-            _debug(f"  [responses-sse] function_call start idx={tool_idx} (out_idx={out_idx}) name={name!r} call_id={call_id}")
-            return {"choices": [{"delta": {"tool_calls": [{"index": tool_idx, "id": call_id, "type": "function", "function": {"name": name, "arguments": ""}}]}, "finish_reason": None}]}
+            _responses_tool_cache[iid] = {
+                "index": tool_idx,
+                "call_id": call_id,
+                "name": name,
+                "output_index": out_idx,
+            }
+            _responses_tool_cache[f"idx_{out_idx}"] = {
+                "index": tool_idx,
+                "call_id": call_id,
+                "name": name,
+            }
+            _debug(
+                f"  [responses-sse] function_call start idx={tool_idx} (out_idx={out_idx}) name={name!r} call_id={call_id}"
+            )
+            return {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": tool_idx,
+                                    "id": call_id,
+                                    "type": "function",
+                                    "function": {"name": name, "arguments": ""},
+                                }
+                            ]
+                        },
+                        "finish_reason": None,
+                    }
+                ]
+            }
 
     # response.function_call_arguments.delta — streaming tool arguments
     if etype == "response.function_call_arguments.delta":
@@ -1126,10 +1365,21 @@ def _responses_sse_to_chat_deltas(raw_line: str):
             if out_idx not in _responses_tool_index_map:
                 _responses_tool_index_map[out_idx] = len(_responses_tool_index_map)
             tool_idx = _responses_tool_index_map[out_idx]
-            _debug(f"  [responses-sse] function_call delta without prior added — fallback idx={tool_idx} out_idx={out_idx}")
+            _debug(
+                f"  [responses-sse] function_call delta without prior added — fallback idx={tool_idx} out_idx={out_idx}"
+            )
         else:
             tool_idx = info["index"]
-        return {"choices": [{"delta": {"tool_calls": [{"index": tool_idx, "function": {"arguments": delta}}]}, "finish_reason": None}]}
+        return {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [{"index": tool_idx, "function": {"arguments": delta}}]
+                    },
+                    "finish_reason": None,
+                }
+            ]
+        }
 
     # response.function_call_arguments.done — final tool arguments (optional, ensure completeness)
     if etype == "response.function_call_arguments.done":
@@ -1150,12 +1400,18 @@ def _responses_sse_to_chat_deltas(raw_line: str):
         resp = chunk.get("response", {})
         usage = resp.get("usage", {})
         # Cache tokens come from input_tokens_details, NOT output_tokens_details
-        _inp_details = usage.get("input_tokens_details") if isinstance(usage.get("input_tokens_details"), dict) else {}
+        _inp_details = (
+            usage.get("input_tokens_details")
+            if isinstance(usage.get("input_tokens_details"), dict)
+            else {}
+        )
         _cached = _inp_details.get("cached_tokens", 0)
         chat_usage = {
             "prompt_tokens": usage.get("input_tokens", 0),
             "completion_tokens": usage.get("output_tokens", 0),
-            "total_tokens": usage.get("total_tokens", usage.get("input_tokens", 0) + usage.get("output_tokens", 0)),
+            "total_tokens": usage.get(
+                "total_tokens", usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
+            ),
         }
         if _cached:
             chat_usage["prompt_tokens_details"] = {"cached_tokens": _cached}
@@ -1171,12 +1427,12 @@ def _responses_sse_to_chat_deltas(raw_line: str):
         chat_usage = {
             "prompt_tokens": usage.get("input_tokens", 0),
             "completion_tokens": usage.get("output_tokens", 0),
-            "total_tokens": usage.get("total_tokens", usage.get("input_tokens", 0) + usage.get("output_tokens", 0)),
+            "total_tokens": usage.get(
+                "total_tokens", usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
+            ),
         }
         return {"choices": [], "usage": chat_usage}
 
     # All other event types (response.created, response.in_progress,
     # response.output_item.done, response.content_part.added/done, etc.) — skip
     return None
-
-

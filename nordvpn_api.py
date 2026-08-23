@@ -31,6 +31,7 @@ DEFAULT_CACHE_TTL = 900  # 15 minutes
 @dataclass
 class ServerInfo:
     """Parsed NordVPN server information."""
+
     id: int
     name: str  # e.g. "de1227"
     hostname: str  # e.g. "de1227.nordvpn.com"
@@ -88,6 +89,7 @@ class NordVPNClient:
         """Get or create shared HTTP client."""
         if self._http_client is None or self._http_client.is_closed:
             import httpx
+
             self._http_client = httpx.AsyncClient(
                 timeout=15,
                 headers={"User-Agent": "OpenCode-Proxy/1.0"},
@@ -145,8 +147,9 @@ class NordVPNClient:
             servers = [s for s in servers if s]  # filter None
 
             self._cache.set(cache_key, servers)
-            logger.info("[nordvpn-api] got %d recommendations for %s",
-                        len(servers), country_code or "any")
+            logger.info(
+                "[nordvpn-api] got %d recommendations for %s", len(servers), country_code or "any"
+            )
             return servers
 
         except Exception as e:
@@ -201,10 +204,7 @@ class NordVPNClient:
             resp.raise_for_status()
             data = resp.json()
 
-            countries = [
-                {"id": c["id"], "code": c["code"], "name": c["name"]}
-                for c in data
-            ]
+            countries = [{"id": c["id"], "code": c["code"], "name": c["name"]} for c in data]
             self._cache.set(cache_key, countries)
             return countries
 

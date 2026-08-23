@@ -7,17 +7,20 @@ import time
 import re
 import random
 import threading
-import tempfile
 
 # Windows: masquer la fenêtre console des subprocess (évite le flash noir 1s)
 _CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
 
 try:
-    from vpn_manager import _normalize_country as _vpn_normalize_country  # single source (no duplication)
+    from vpn_manager import (
+        _normalize_country as _vpn_normalize_country,
+    )  # single source (no duplication)
 except ImportError:
+
     def _vpn_normalize_country(name: str) -> str:  # fallback before vpn_manager importable
         c = name.strip().replace("_", " ").strip().title()
         return c
+
 
 logger = logging.getLogger(__name__)
 
@@ -29,8 +32,16 @@ CUSTOM_ROUTES_PATH = os.path.join(ROOT, "custom_routes.json")
 API_KEYS_PATH = os.path.join(ROOT, "api_keys.json")
 
 # Config keys safe to expose via API (not secrets)
-CONFIG_KEYS = ["OPENCODE_PROXY", "OPENCODE_HOST", "OPENCODE_PORT", "OPENCODE_WEB_PORT",
-               "OPUS_MAP_MODEL", "SONNET_MAP_MODEL", "HAIKU_MAP_MODEL", "DISABLE_MAPPING"]
+CONFIG_KEYS = [
+    "OPENCODE_PROXY",
+    "OPENCODE_HOST",
+    "OPENCODE_PORT",
+    "OPENCODE_WEB_PORT",
+    "OPUS_MAP_MODEL",
+    "SONNET_MAP_MODEL",
+    "HAIKU_MAP_MODEL",
+    "DISABLE_MAPPING",
+]
 
 
 # ── YAML Config Loader ───────────────────────────────────────────────
@@ -103,6 +114,7 @@ def save_yaml_config():
         # after every auto-persist even though file was written by the proxy itself.
         try:
             import dashboard.api as _dash  # may not be imported yet at boot
+
             if hasattr(_dash, "_config_yaml_known_mtime"):
                 try:
                     _dash._config_yaml_known_mtime = os.path.getmtime(CONFIG_PATH)
@@ -167,8 +179,11 @@ def load_env_file():
                     os.environ[key] = value
                     count += 1
                     loaded.add(key)
-                elif (key.startswith("VPN_") or key.startswith("GEO_")) and value != os.environ[key] \
-                        and key not in loaded:
+                elif (
+                    (key.startswith("VPN_") or key.startswith("GEO_"))
+                    and value != os.environ[key]
+                    and key not in loaded
+                ):
                     # Stale parent env: the .env value was already there at
                     # boot but the process env is ahead of it — compose
                     # children inherit that env, so the file is NOT what the
@@ -183,7 +198,11 @@ def load_env_file():
                 "[config] env divergence: %s=%r in .env but %r in process env — "
                 "compose children inherit the process env, which WINS over the "
                 "file (19/08 root cause); restart the proxy or re-push the "
-                "config to re-sync", key, file_val, env_val)
+                "config to re-sync",
+                key,
+                file_val,
+                env_val,
+            )
         ENV_DIVERGENCE[:] = divergence
     logger.debug("[config] load_env_file: loaded %d new vars from .env", count)
 
@@ -225,12 +244,18 @@ OPENCODE_GO_WORKSPACE_ID = _env("OPENCODE_GO_WORKSPACE_ID", "")
 OPENCODE_GO_AUTH_COOKIE = _env("OPENCODE_GO_AUTH_COOKIE", "")
 OPENCODE_GO_USE_BALANCE = _env_bool("OPENCODE_GO_USE_BALANCE", True)
 API_KEY_ROUTING = _env("API_KEY_ROUTING", yaml_get("routing", "key_routing", "round-robin"))
-CACHE_MIN_PROMPT_SIZE = _env_int("CACHE_MIN_PROMPT_SIZE", yaml_get("cache", "min_prompt_size", 2000))
+CACHE_MIN_PROMPT_SIZE = _env_int(
+    "CACHE_MIN_PROMPT_SIZE", yaml_get("cache", "min_prompt_size", 2000)
+)
 DEBUG = _env_bool("OPENCODE_DEBUG", yaml_get("server", "debug", False))
 
 # ── Upstream endpoints ──────────────────────────────────────────────
-API_BASE_OPENAI = yaml_get("upstream", "openai_base", "https://opencode.ai/zen/go/v1/chat/completions")
-API_BASE_ANTHROPIC = yaml_get("upstream", "anthropic_base", "https://opencode.ai/zen/go/v1/messages")
+API_BASE_OPENAI = yaml_get(
+    "upstream", "openai_base", "https://opencode.ai/zen/go/v1/chat/completions"
+)
+API_BASE_ANTHROPIC = yaml_get(
+    "upstream", "anthropic_base", "https://opencode.ai/zen/go/v1/messages"
+)
 API_BASE_FREE = yaml_get("upstream", "free_base", "https://opencode.ai/zen/v1/chat/completions")
 
 # ── Free model mapping (paid → free equivalent) ────────────────────
@@ -246,7 +271,9 @@ IP_ROTATION = yaml_get("ip_rotation", default={})
 # live in config.yaml:geo.policies, routes reference via geo: {extends: name}.
 GEO_ENABLED: bool = bool(yaml_get("geo", "enabled", False))
 GEO_VERSION: int = int(yaml_get("geo", "version", 1) or 1)
-GEO_POLICIES: dict = yaml_get("geo", "policies", {}) if isinstance(yaml_get("geo", "policies", {}), dict) else {}
+GEO_POLICIES: dict = (
+    yaml_get("geo", "policies", {}) if isinstance(yaml_get("geo", "policies", {}), dict) else {}
+)
 SORTED_GEO_POLICIES: list = sorted(GEO_POLICIES.items()) if isinstance(GEO_POLICIES, dict) else []
 GEO_ALLOW_DIRECT_WHEN_COMPATIBLE: bool = bool(yaml_get("geo", "allow_direct_when_compatible", True))
 
@@ -304,7 +331,11 @@ def _normalize_geo_list(countries, server_set: set) -> tuple[set, list]:
             continue
         norm = _vpn_normalize_country(c)
         if norm not in server_set:
-            logger.warning("[geo] country %r → %r not in server_countries — dropping (intersection check)", c, norm)
+            logger.warning(
+                "[geo] country %r → %r not in server_countries — dropping (intersection check)",
+                c,
+                norm,
+            )
             dropped.append(c)
             continue
         valid.add(norm)
@@ -321,13 +352,28 @@ def resolve_geo(route: dict) -> dict:
     else server_countries - blocked if only blocked. Empty effective + strict => misconfigured.
     """
     if not isinstance(route, dict):
-        return {"effective_allowed": set(), "mode": "strict", "require_vpn": False, "geo_status": "disabled" if not GEO_ENABLED else "ok"}
+        return {
+            "effective_allowed": set(),
+            "mode": "strict",
+            "require_vpn": False,
+            "geo_status": "disabled" if not GEO_ENABLED else "ok",
+        }
     raw_geo = route.get("geo")
     if not raw_geo or not isinstance(raw_geo, dict):
-        return {"effective_allowed": set(), "mode": "strict", "require_vpn": False, "geo_status": "disabled" if not GEO_ENABLED else "ok"}
+        return {
+            "effective_allowed": set(),
+            "mode": "strict",
+            "require_vpn": False,
+            "geo_status": "disabled" if not GEO_ENABLED else "ok",
+        }
     if not GEO_ENABLED:
         # Kill-switch: passthrough but still report disabled status (P1 no enforcement)
-        return {"effective_allowed": set(), "mode": str(raw_geo.get("mode", "strict")), "require_vpn": bool(raw_geo.get("require_vpn", False)), "geo_status": "disabled"}
+        return {
+            "effective_allowed": set(),
+            "mode": str(raw_geo.get("mode", "strict")),
+            "require_vpn": bool(raw_geo.get("require_vpn", False)),
+            "geo_status": "disabled",
+        }
     geo = _resolve_geo_extends(raw_geo)
     mode = str(geo.get("mode", "strict")).lower()
     if mode not in ("strict", "prefer", "warn"):
@@ -353,7 +399,12 @@ def resolve_geo(route: dict) -> dict:
     has_allowed = allowed_raw is not None
     has_blocked = blocked_raw is not None
     if not has_allowed and not has_blocked:
-        return {"effective_allowed": set(server_set) if server_set else set(), "mode": mode, "require_vpn": require_vpn, "geo_status": "ok"}
+        return {
+            "effective_allowed": set(server_set) if server_set else set(),
+            "mode": mode,
+            "require_vpn": require_vpn,
+            "geo_status": "ok",
+        }
     if allowed_set and blocked_set:
         effective = (allowed_set - blocked_set) & server_set
     elif allowed_set:
@@ -368,9 +419,19 @@ def resolve_geo(route: dict) -> dict:
         else:
             # only blocked declared but all invalid => nothing to block
             effective = set(server_set) if server_set else set()
-            return {"effective_allowed": effective, "mode": mode, "require_vpn": require_vpn, "geo_status": "ok"}
+            return {
+                "effective_allowed": effective,
+                "mode": mode,
+                "require_vpn": require_vpn,
+                "geo_status": "ok",
+            }
     geo_status = "misconfigured" if (not effective and mode == "strict") else "ok"
-    return {"effective_allowed": effective, "mode": mode, "require_vpn": require_vpn, "geo_status": geo_status}
+    return {
+        "effective_allowed": effective,
+        "mode": mode,
+        "require_vpn": require_vpn,
+        "geo_status": geo_status,
+    }
 
 
 def geo_strict_union() -> set:
@@ -382,7 +443,7 @@ def geo_strict_union() -> set:
     if not GEO_ENABLED:
         return set()
     union: set = set()
-    for _name, _pol in (GEO_POLICIES.items() if isinstance(GEO_POLICIES, dict) else []):
+    for _name, _pol in GEO_POLICIES.items() if isinstance(GEO_POLICIES, dict) else []:
         # La policy brute peut ne pas avoir blocked/allowed — on passe par
         # un faux route {geo: {extends: name}} pour réutiliser resolve_geo
         # (normalisation + intersection server_countries).
@@ -390,7 +451,11 @@ def geo_strict_union() -> set:
             _info = resolve_geo({"geo": {"extends": _name}})
         except Exception:
             continue
-        if _info.get("mode") == "strict" and _info.get("require_vpn") and _info.get("geo_status") != "misconfigured":
+        if (
+            _info.get("mode") == "strict"
+            and _info.get("require_vpn")
+            and _info.get("geo_status") != "misconfigured"
+        ):
             eff = _info.get("effective_allowed")
             if isinstance(eff, set):
                 union |= eff
@@ -433,7 +498,10 @@ def _ensure_auto_max_free_attempts_warn(cfg: dict, source: str = "boot") -> None
             "[config] manual max_free_attempts=%s differs from derived=%s "
             "(station_count=%s) — enabling auto_max_free_attempts=true; "
             "set auto_max_free_attempts=false to keep manual",
-            stored, derived, resolved_station_count(cfg))
+            stored,
+            derived,
+            resolved_station_count(cfg),
+        )
     cfg["auto_max_free_attempts"] = True
     # keep the in-yaml mirror consistent so a later save_yaml doesn't drop it
     try:
@@ -457,20 +525,20 @@ WEB_PORT = _env_int("OPENCODE_WEB_PORT", yaml_get("server", "web_port", 8082))
 # When opencode.ai adds a new model family, add its prefix here.
 KNOWN_PROTOCOLS = {
     # OpenAI protocol models
-    "glm":      "openai",
-    "kimi":     "openai",
+    "glm": "openai",
+    "kimi": "openai",
     "deepseek": "openai",
-    "mimo":     "openai",
-    "hy":       "openai",
+    "mimo": "openai",
+    "hy": "openai",
     "nemotron": "openai",
-    "muse":     "openai",
-    "spark":    "openai",
-    "big":      "openai",
-    "laguna":   "openai",
-    "north":    "openai",
+    "muse": "openai",
+    "spark": "openai",
+    "big": "openai",
+    "laguna": "openai",
+    "north": "openai",
     # Anthropic protocol models
-    "minimax":  "anthropic",
-    "qwen":     "anthropic",
+    "minimax": "anthropic",
+    "qwen": "anthropic",
 }
 
 
@@ -487,6 +555,7 @@ def _resolve_protocol(model_id: str) -> str:
         "glm-5.2"      -> "glm"   -> "openai"
     """
     import re
+
     prefix = model_id.split("-")[0].split(".")[0].lower()
     prefix = re.sub(r"\d+$", "", prefix)  # "qwen3" -> "qwen"
     return KNOWN_PROTOCOLS.get(prefix, "openai")
@@ -515,6 +584,7 @@ for _model_id, _model_data in _models_cfg.items():
                 _endpoint = API_BASE_OPENAI if _proto == "openai" else API_BASE_ANTHROPIC
         MODELS[_model_id] = {"endpoint": _endpoint, "protocol": _proto}
 
+
 def _fetch_upstream_models(timeout: float = 3.0):
     """Fetch available models from upstream API and add them to MODELS.
 
@@ -526,7 +596,9 @@ def _fetch_upstream_models(timeout: float = 3.0):
         # --max-time 3s + connect 2s : échec rapide si upstream lent
         result = subprocess.run(
             ["curl", "-s", "--max-time", str(int(timeout)), "--connect-timeout", "2", url],
-            capture_output=True, text=True, timeout=timeout + 2,
+            capture_output=True,
+            text=True,
+            timeout=timeout + 2,
             creationflags=_CREATE_NO_WINDOW,
         )
         if result.returncode != 0:
@@ -556,16 +628,26 @@ def _fetch_upstream_models_background():
     except Exception:
         pass
 
+
 try:
-    _bg_thread = threading.Thread(target=_fetch_upstream_models_background, daemon=True, name="upstream-models-fetch")
+    _bg_thread = threading.Thread(
+        target=_fetch_upstream_models_background, daemon=True, name="upstream-models-fetch"
+    )
     _bg_thread.start()
     logger.debug("[config] upstream fetch lancé en arrière-plan (3s timeout)")
 except Exception as e:
     logger.debug("[config] impossible de lancer le thread upstream: %s", e)
 
 # ── Free discovery (auto-detect -free models) ─────────────────────
-FREE_DISCOVERY = yaml_get("free_discovery", default={}) if isinstance(yaml_get("free_discovery", default={}), dict) else {}
-FREE_DISCOVERY_INTERVAL = int(FREE_DISCOVERY.get("interval", yaml_get("background", "free_models_refresh_interval", 3600)) or 3600)
+FREE_DISCOVERY = (
+    yaml_get("free_discovery", default={})
+    if isinstance(yaml_get("free_discovery", default={}), dict)
+    else {}
+)
+FREE_DISCOVERY_INTERVAL = int(
+    FREE_DISCOVERY.get("interval", yaml_get("background", "free_models_refresh_interval", 3600))
+    or 3600
+)
 FREE_DISCOVERY_ENABLED = bool(FREE_DISCOVERY.get("enabled", True))
 FREE_DISCOVERY_AUTO_PERSIST = bool(FREE_DISCOVERY.get("auto_persist", True))
 FREE_DISCOVERY_DEFAULT_TARGET = FREE_DISCOVERY.get("default_target", "mimo-v2.5-free")
@@ -667,9 +749,14 @@ def _fetch_free_models_sync(timeout: float = 10) -> tuple:
                 except ImportError:
                     # Fallback to curl subprocess (Windows may lack curl but try)
                     import json as _json
-                    r = subprocess.run(["curl", "-s", "--max-time", str(int(timeout)), url],
-                                       capture_output=True, text=True, timeout=timeout + 5,
-                                       creationflags=_CREATE_NO_WINDOW)
+
+                    r = subprocess.run(
+                        ["curl", "-s", "--max-time", str(int(timeout)), url],
+                        capture_output=True,
+                        text=True,
+                        timeout=timeout + 5,
+                        creationflags=_CREATE_NO_WINDOW,
+                    )
                     if r.returncode != 0:
                         raise RuntimeError(f"curl failed: {r.stderr[:200]}")
                     data = _json.loads(r.stdout)
@@ -706,14 +793,21 @@ def _fetch_free_models_sync(timeout: float = 10) -> tuple:
             except Exception as e:
                 last_err = e
                 msg = str(e)
-                is_retryable = ("5xx" in msg or "timeout" in msg.lower()
-                                or "timed out" in msg.lower() or "connect" in msg.lower()
-                                or "ConnectTimeout" in msg or "ReadTimeout" in msg)
+                is_retryable = (
+                    "5xx" in msg
+                    or "timeout" in msg.lower()
+                    or "timed out" in msg.lower()
+                    or "connect" in msg.lower()
+                    or "ConnectTimeout" in msg
+                    or "ReadTimeout" in msg
+                )
                 if not is_retryable or attempt == 2:
                     if not success:
-                        logger.debug("[free-discovery] fetch failed %s attempt %d: %s", url, attempt + 1, e)
+                        logger.debug(
+                            "[free-discovery] fetch failed %s attempt %d: %s", url, attempt + 1, e
+                        )
                     break
-                delay = (1.5 ** attempt) + random.uniform(-0.1, 0.1)
+                delay = (1.5**attempt) + random.uniform(-0.1, 0.1)
                 # jitter ±10% already via random; clamp min 0
                 if delay < 0:
                     delay = 0
@@ -730,6 +824,7 @@ def _fetch_free_models_sync(timeout: float = 10) -> tuple:
             docs_url = "https://opencode.ai/docs/fr/zen/"
             try:
                 import httpx as _httpx2
+
                 _kwargs2 = {"timeout": timeout}
                 if PROXY:
                     _kwargs2["proxy"] = PROXY
@@ -737,7 +832,9 @@ def _fetch_free_models_sync(timeout: float = 10) -> tuple:
                     _r2 = _c2.get(docs_url)
                     if _r2.status_code == 200:
                         _html = _r2.text
-                        _ids = set(re.findall(r"(?i)<td[^>]*>\s*([a-z0-9.\-]+-free)\s*</td>", _html))
+                        _ids = set(
+                            re.findall(r"(?i)<td[^>]*>\s*([a-z0-9.\-]+-free)\s*</td>", _html)
+                        )
                         if _ids:
                             free_ids = _ids
                             source_parts.append("docs:html")
@@ -781,13 +878,18 @@ def _apply_discovered_free_models(free_ids: set, source: str = "none") -> int:
                 if _cur and _cur != _exp:
                     MODELS[_fid]["endpoint"] = _exp
                     logger.info("[free-discovery] corrected endpoint %s → %s", _fid, _exp)
-        logger.debug("[free-discovery] no delta (still %d free ids) source=%s", len(free_ids), source)
+        logger.debug(
+            "[free-discovery] no delta (still %d free ids) source=%s", len(free_ids), source
+        )
         _FREE_DISCOVERY_STATE["detected"] = sorted(free_ids)
         _FREE_DISCOVERY_STATE["source"] = source
         return 0
     removed = sorted(FREE_MODELS - free_ids) if FREE_MODELS else []
     if removed:
-        logger.info("[free-discovery] upstream removed %s — keeping local, manual cleanup needed", ", ".join(removed))
+        logger.info(
+            "[free-discovery] upstream removed %s — keeping local, manual cleanup needed",
+            ", ".join(removed),
+        )
         _FREE_DISCOVERY_STATE["removed"] = removed
     else:
         _FREE_DISCOVERY_STATE["removed"] = []
@@ -805,7 +907,9 @@ def _apply_discovered_free_models(free_ids: set, source: str = "none") -> int:
                 prefix = fid.split("-")[0].split(".")[0].lower()
                 prefix_clean = re.sub(r"\d+$", "", prefix)
                 if prefix_clean not in KNOWN_PROTOCOLS:
-                    logger.warning("[free-discovery] unknown family %s for %s → openai", prefix_clean, fid)
+                    logger.warning(
+                        "[free-discovery] unknown family %s for %s → openai", prefix_clean, fid
+                    )
             else:
                 cur = MODELS[fid].get("endpoint", "")
                 if cur != expected and ("muse" in fid.lower() or "spark" in fid.lower()):
@@ -831,8 +935,15 @@ def _apply_discovered_free_models(free_ids: set, source: str = "none") -> int:
         dt = FREE_DISCOVERY_DEFAULT_TARGET
         if dt and dt not in free_ids and free_ids:
             fallback = FREE_MODEL_POOL[0] if FREE_MODEL_POOL else dt
-            logger.warning("[free-discovery] default_target %r not in FREE_MODELS — fallback %r", dt, fallback)
-        logger.info("[free-discovery] fetched %d free ids, added %d new MODELS, source=%s", len(free_ids), added, source)
+            logger.warning(
+                "[free-discovery] default_target %r not in FREE_MODELS — fallback %r", dt, fallback
+            )
+        logger.info(
+            "[free-discovery] fetched %d free ids, added %d new MODELS, source=%s",
+            len(free_ids),
+            added,
+            source,
+        )
         try:
             get_model_config.cache_clear()
         except Exception:
@@ -852,7 +963,9 @@ def _persist_free_mappings():
         return
     try:
         # Ensure sections exist
-        if "free_model_map" not in _yaml_data or not isinstance(_yaml_data.get("free_model_map"), dict):
+        if "free_model_map" not in _yaml_data or not isinstance(
+            _yaml_data.get("free_model_map"), dict
+        ):
             _yaml_data["free_model_map"] = {}
         if "models" not in _yaml_data or not isinstance(_yaml_data.get("models"), dict):
             _yaml_data["models"] = {}
@@ -888,23 +1001,31 @@ def _ensure_free_models_sync() -> int:
         # Reset consecutive failures on success
         _FREE_DISCOVERY_STATE["consecutive_failures"] = 0
         import datetime as _dt
+
         now_iso = _dt.datetime.now(_dt.timezone.utc).isoformat()
         _FREE_DISCOVERY_STATE["last_refresh"] = now_iso
         # next_refresh computed by caller (interval + jitter)
         return added
     except Exception as e:
-        _FREE_DISCOVERY_STATE["consecutive_failures"] = _FREE_DISCOVERY_STATE.get("consecutive_failures", 0) + 1
-        logger.warning("[free-discovery] ensure failed (%d consecutive): %s",
-                       _FREE_DISCOVERY_STATE["consecutive_failures"], e)
+        _FREE_DISCOVERY_STATE["consecutive_failures"] = (
+            _FREE_DISCOVERY_STATE.get("consecutive_failures", 0) + 1
+        )
+        logger.warning(
+            "[free-discovery] ensure failed (%d consecutive): %s",
+            _FREE_DISCOVERY_STATE["consecutive_failures"],
+            e,
+        )
         return 0
 
 
 def _ensure_free_models_async():
     try:
         import threading as _th
+
         _th.Thread(target=_ensure_free_models_sync, daemon=True).start()
     except Exception:
         pass
+
 
 try:
     if FREE_DISCOVERY_ENABLED:
@@ -963,14 +1084,24 @@ def load_routes():
         routes[key] = value
 
     # Model route overrides
-    routes["opus"]   = {"match": ["opus"],   "model": _env("OPUS_MAP_MODEL", yaml_get("routing", "opus_model", "kimi-k2.6"))}
-    routes["sonnet"] = {"match": ["sonnet"], "model": _env("SONNET_MAP_MODEL", yaml_get("routing", "sonnet_model", "glm-5.1"))}
-    routes["haiku"]  = {"match": ["haiku"],  "model": _env("HAIKU_MAP_MODEL", yaml_get("routing", "haiku_model", "minimax-m2.5"))}
+    routes["opus"] = {
+        "match": ["opus"],
+        "model": _env("OPUS_MAP_MODEL", yaml_get("routing", "opus_model", "kimi-k2.6")),
+    }
+    routes["sonnet"] = {
+        "match": ["sonnet"],
+        "model": _env("SONNET_MAP_MODEL", yaml_get("routing", "sonnet_model", "glm-5.1")),
+    }
+    routes["haiku"] = {
+        "match": ["haiku"],
+        "model": _env("HAIKU_MAP_MODEL", yaml_get("routing", "haiku_model", "minimax-m2.5")),
+    }
     logger.debug("[config] load_routes: %d routes loaded", len(routes))
     return routes
 
 
 # ── Custom Routes ───────────────────────────────────────────────────
+
 
 def load_custom_routes() -> dict:
     """Load custom routes from YAML or JSON file."""
@@ -1009,6 +1140,7 @@ def save_custom_routes(routes: dict):
 
 # ── API Keys ────────────────────────────────────────────────────────
 
+
 def load_api_keys() -> list[dict]:
     """Load API key configs from api_keys.json (gitignored, primary). Falls back to YAML, then .env single-key."""
     if os.path.exists(API_KEYS_PATH):
@@ -1018,7 +1150,7 @@ def load_api_keys() -> list[dict]:
                 if isinstance(data, list) and len(data) > 0:
                     for i, k in enumerate(data):
                         if not k.get("alias"):
-                            k["alias"] = f"Compte {i+1}"
+                            k["alias"] = f"Compte {i + 1}"
                     return data
         except Exception as e:
             logging.warning("Failed to load api_keys.json: %s", e)
@@ -1026,13 +1158,17 @@ def load_api_keys() -> list[dict]:
     if yaml_keys:
         for i, k in enumerate(yaml_keys):
             if not k.get("alias"):
-                k["alias"] = f"Compte {i+1}"
+                k["alias"] = f"Compte {i + 1}"
         return yaml_keys
     # Fallback: single key from .env
     if API_KEY:
-        return [{"api_key": API_KEY,
-                 "go_workspace_id": OPENCODE_GO_WORKSPACE_ID,
-                 "go_auth_cookie": OPENCODE_GO_AUTH_COOKIE}]
+        return [
+            {
+                "api_key": API_KEY,
+                "go_workspace_id": OPENCODE_GO_WORKSPACE_ID,
+                "go_auth_cookie": OPENCODE_GO_AUTH_COOKIE,
+            }
+        ]
     return []
 
 
@@ -1045,7 +1181,9 @@ def save_api_keys(configs: list[dict]):
 
 def load_tool_capabilities() -> dict:
     """Load tool compat capabilities (optional, fallback to empty if missing)."""
-    compat_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "tool_compat_results.json")
+    compat_path = os.path.join(
+        os.path.dirname(os.path.dirname(__file__)), "tool_compat_results.json"
+    )
     if os.path.exists(compat_path):
         try:
             with open(compat_path, "r", encoding="utf-8") as f:
@@ -1067,6 +1205,7 @@ TOOL_CAPABILITIES = load_tool_capabilities()
 
 # ── Hot-reload: Custom Routes ───────────────────────────────────────
 
+
 def _get_mtime(path):
     try:
         return os.path.getmtime(path)
@@ -1085,7 +1224,7 @@ def _sort_routes_by_match(routes: dict) -> list:
     return sorted(
         routes.values(),
         key=lambda r: max((len(m) for m in r.get("match", [])), default=0),
-        reverse=True
+        reverse=True,
     )
 
 
@@ -1101,7 +1240,13 @@ def maybe_reload_custom_routes():
     _reload_lock. Atomic order: yaml_data -> IP_ROTATION -> geo -> routes -> SORTED_*.
     """
     global _custom_routes_mtime, _custom_routes_last_check, _config_yaml_mtime
-    global SORTED_ROUTES, SORTED_CUSTOM_ROUTES, SORTED_GEO_POLICIES, GEO_ENABLED, GEO_VERSION, GEO_ALLOW_DIRECT_WHEN_COMPATIBLE
+    global \
+        SORTED_ROUTES, \
+        SORTED_CUSTOM_ROUTES, \
+        SORTED_GEO_POLICIES, \
+        GEO_ENABLED, \
+        GEO_VERSION, \
+        GEO_ALLOW_DIRECT_WHEN_COMPATIBLE
     now = time.time()
     if now - _custom_routes_last_check < _CUSTOM_ROUTES_CHECK_INTERVAL:
         return
@@ -1125,6 +1270,7 @@ def maybe_reload_custom_routes():
             if cfg_changed:
                 try:
                     import yaml as _yaml
+
                     with open(CONFIG_PATH, "r", encoding="utf-8") as f:
                         new_yaml = _yaml.safe_load(f) or {}
                 except Exception as e:
@@ -1135,7 +1281,11 @@ def maybe_reload_custom_routes():
                     _yaml_data.update(new_yaml)
                     _config_yaml_mtime = cfg_mtime
                     # IP_ROTATION in-place (keep object identity)
-                    new_ip = new_yaml.get("ip_rotation", {}) if isinstance(new_yaml.get("ip_rotation"), dict) else {}
+                    new_ip = (
+                        new_yaml.get("ip_rotation", {})
+                        if isinstance(new_yaml.get("ip_rotation"), dict)
+                        else {}
+                    )
                     IP_ROTATION.clear()
                     if isinstance(new_ip, dict):
                         IP_ROTATION.update(new_ip)
@@ -1145,20 +1295,33 @@ def maybe_reload_custom_routes():
                     except Exception:
                         pass
                     # GEO in-place
-                    geo_sec = new_yaml.get("geo", {}) if isinstance(new_yaml.get("geo"), dict) else {}
+                    geo_sec = (
+                        new_yaml.get("geo", {}) if isinstance(new_yaml.get("geo"), dict) else {}
+                    )
                     GEO_ENABLED = bool(geo_sec.get("enabled", False))
                     try:
                         GEO_VERSION = int(geo_sec.get("version", 1) or 1)
                     except Exception:
                         GEO_VERSION = 1
-                    new_policies = geo_sec.get("policies", {}) if isinstance(geo_sec.get("policies"), dict) else {}
+                    new_policies = (
+                        geo_sec.get("policies", {})
+                        if isinstance(geo_sec.get("policies"), dict)
+                        else {}
+                    )
                     GEO_POLICIES.clear()
                     if isinstance(new_policies, dict):
                         GEO_POLICIES.update(new_policies)
                     SORTED_GEO_POLICIES[:] = sorted(GEO_POLICIES.items())
-                    GEO_ALLOW_DIRECT_WHEN_COMPATIBLE = bool(geo_sec.get("allow_direct_when_compatible", True))
-                    logging.info("[config] reloaded config.yaml geo.enabled=%s version=%s policies=%d allow_direct=%s",
-                                 GEO_ENABLED, GEO_VERSION, len(GEO_POLICIES), GEO_ALLOW_DIRECT_WHEN_COMPATIBLE)
+                    GEO_ALLOW_DIRECT_WHEN_COMPATIBLE = bool(
+                        geo_sec.get("allow_direct_when_compatible", True)
+                    )
+                    logging.info(
+                        "[config] reloaded config.yaml geo.enabled=%s version=%s policies=%d allow_direct=%s",
+                        GEO_ENABLED,
+                        GEO_VERSION,
+                        len(GEO_POLICIES),
+                        GEO_ALLOW_DIRECT_WHEN_COMPATIBLE,
+                    )
                 # custom_routes may live in yaml: need to reload after yaml swap
                 new_cr = load_custom_routes()
                 cr_changed = True  # force route rebuild after yaml change
@@ -1184,12 +1347,15 @@ def maybe_reload_custom_routes():
 
                 SORTED_ROUTES = _sort_routes_by_match(ROUTES)
                 SORTED_CUSTOM_ROUTES = _sort_routes_by_match(CUSTOM_ROUTES)
-                logging.info("Reloaded routes (%d routes, cfg_changed=%s)", len(ROUTES), cfg_changed)
+                logging.info(
+                    "Reloaded routes (%d routes, cfg_changed=%s)", len(ROUTES), cfg_changed
+                )
     except Exception as e:
         logging.warning("Failed to reload config: %s", e)
 
 
 from functools import lru_cache as _lru_cache
+
 
 @_lru_cache(maxsize=512)
 def get_model_config(model_id: str) -> dict:
@@ -1200,6 +1366,7 @@ def get_model_config(model_id: str) -> dict:
 
 
 # ── Runtime updates (called by dashboard API) ───────────────────────
+
 
 def save_env(updates: dict):
     """Update .env file and apply values at runtime."""
@@ -1220,23 +1387,32 @@ def save_env(updates: dict):
     for key, value in updates.items():
         os.environ[key] = value
         if key == "OPENCODE_PROXY":
-            global PROXY; PROXY = value
+            global PROXY
+            PROXY = value
         elif key == "OPENCODE_API_KEY":
-            global API_KEY; API_KEY = value
+            global API_KEY
+            API_KEY = value
         elif key == "OPENCODE_GO_WORKSPACE_ID":
-            global OPENCODE_GO_WORKSPACE_ID; OPENCODE_GO_WORKSPACE_ID = value
+            global OPENCODE_GO_WORKSPACE_ID
+            OPENCODE_GO_WORKSPACE_ID = value
         elif key == "OPENCODE_GO_AUTH_COOKIE":
-            global OPENCODE_GO_AUTH_COOKIE; OPENCODE_GO_AUTH_COOKIE = value
+            global OPENCODE_GO_AUTH_COOKIE
+            OPENCODE_GO_AUTH_COOKIE = value
         elif key == "API_KEY_ROUTING":
-            global API_KEY_ROUTING; API_KEY_ROUTING = value
+            global API_KEY_ROUTING
+            API_KEY_ROUTING = value
         elif key == "DISABLE_MAPPING":
-            global DISABLE_MAPPING; DISABLE_MAPPING = value.lower() in ("1", "true", "yes")
+            global DISABLE_MAPPING
+            DISABLE_MAPPING = value.lower() in ("1", "true", "yes")
         elif key == "OPENCODE_HOST":
-            global HOST; HOST = value
+            global HOST
+            HOST = value
         elif key == "OPENCODE_DEBUG":
-            global DEBUG; DEBUG = value.lower() in ("1", "true", "yes")
+            global DEBUG
+            DEBUG = value.lower() in ("1", "true", "yes")
         elif key == "OPENCODE_GO_USE_BALANCE":
-            global OPENCODE_GO_USE_BALANCE; OPENCODE_GO_USE_BALANCE = value.lower() in ("1", "true", "yes")
+            global OPENCODE_GO_USE_BALANCE
+            OPENCODE_GO_USE_BALANCE = value.lower() in ("1", "true", "yes")
 
     global ROUTES
     ROUTES = load_routes()

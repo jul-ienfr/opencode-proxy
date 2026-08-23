@@ -21,6 +21,7 @@ Covered here (plan "Vérification" section 1, offline):
 
 Pure module-level functions — no asyncio, no docker, no state file.
 """
+
 import pytest
 
 import vpn_manager as vm
@@ -34,22 +35,28 @@ _FIREFOX_SAFARI_VARIANTS = 5
 def _assert_valid_profile(p):
     assert isinstance(p, dict)
     assert p["impersonate"] in vm._KNOWN_IMPERSONATIONS
-    assert p["user_agent"] is None, "pool must never pin a UA — curl_cffi bundle / curated map are the sources"
+    assert p["user_agent"] is None, (
+        "pool must never pin a UA — curl_cffi bundle / curated map are the sources"
+    )
     assert isinstance(p["extra_headers"], dict)
     if p["extra_headers"]:
         assert "Accept-Language" in p["extra_headers"] or "sec-ch-ua" in p["extra_headers"]
-        assert "sec-ch-ua" not in p["extra_headers"] or p["impersonate"].startswith(("chrome", "edge"))
+        assert "sec-ch-ua" not in p["extra_headers"] or p["impersonate"].startswith(
+            ("chrome", "edge")
+        )
 
 
 class TestRetroCompat:
     def test_diversity_off_returns_base_untouched(self):
         base = [{"impersonate": "chrome131", "user_agent": None, "extra_headers": {}}]
         pool = vm._build_identity_pool(base, diversity=False, max_profiles=256)
-        assert pool == base                          # exact identity, no expansion
+        assert pool == base  # exact identity, no expansion
 
     def test_diversity_off_multi_profile_kept(self):
-        base = [{"impersonate": "chrome131", "user_agent": None, "extra_headers": {}},
-                {"impersonate": "firefox144", "user_agent": None, "extra_headers": {}}]
+        base = [
+            {"impersonate": "chrome131", "user_agent": None, "extra_headers": {}},
+            {"impersonate": "firefox144", "user_agent": None, "extra_headers": {}},
+        ]
         pool = vm._build_identity_pool(base, diversity=False, max_profiles=256)
         assert len(pool) == 2
         assert {p["impersonate"] for p in pool} == {"chrome131", "firefox144"}
@@ -90,6 +97,7 @@ class TestIdentityHeaderVariants:
 
 # ── expansion, dedup, determinism, cap ───────────────────────────
 
+
 class TestPool:
     def test_every_known_target_covered(self):
         base = vm._normalize_identity_profiles(None)  # ["chrome131"]
@@ -100,11 +108,12 @@ class TestPool:
     def test_pool_size_matches_grid(self):
         base = vm._normalize_identity_profiles(None)
         pool = vm._build_identity_pool(base, diversity=True, max_profiles=256)
-        chrome_edge = sum(1 for t in vm._KNOWN_IMPERSONATIONS
-                          if t.startswith(("chrome", "edge")))
+        chrome_edge = sum(1 for t in vm._KNOWN_IMPERSONATIONS if t.startswith(("chrome", "edge")))
         ff_safari = len(vm._KNOWN_IMPERSONATIONS) - chrome_edge
-        expected = len(base) + chrome_edge * _CHROME_EDGE_VARIANTS + ff_safari * _FIREFOX_SAFARI_VARIANTS
-        assert expected > 150                        # "quasi-illimité"
+        expected = (
+            len(base) + chrome_edge * _CHROME_EDGE_VARIANTS + ff_safari * _FIREFOX_SAFARI_VARIANTS
+        )
+        assert expected > 150  # "quasi-illimité"
         assert len(pool) == expected
 
     def test_all_profiles_valid_and_deduped(self):
@@ -113,7 +122,7 @@ class TestPool:
         for p in pool:
             _assert_valid_profile(p)
         keys = {(p["impersonate"], vm._headers_key(p["extra_headers"])) for p in pool}
-        assert len(keys) == len(pool)                # no duplicate fingerprint
+        assert len(keys) == len(pool)  # no duplicate fingerprint
 
     def test_deterministic_order(self):
         base = vm._normalize_identity_profiles(None)
@@ -136,13 +145,16 @@ class TestPool:
 
 # ── normalize ────────────────────────────────────────────────────
 
+
 class TestNormalize:
     def test_invalid_entries_skipped(self):
-        base = vm._normalize_identity_profiles([
-            {"impersonate": "chrome131", "user_agent": "UA", "extra_headers": {"X": "1"}},
-            {"impersonate": "totally-unknown-target", "user_agent": None, "extra_headers": {}},
-            "not-a-dict",
-        ])
+        base = vm._normalize_identity_profiles(
+            [
+                {"impersonate": "chrome131", "user_agent": "UA", "extra_headers": {"X": "1"}},
+                {"impersonate": "totally-unknown-target", "user_agent": None, "extra_headers": {}},
+                "not-a-dict",
+            ]
+        )
         assert len(base) == 1
         assert base[0]["impersonate"] == "chrome131"
         assert base[0]["user_agent"] == "UA"
@@ -154,12 +166,14 @@ class TestNormalize:
 
     def test_blank_ua_normalized_to_none(self):
         base = vm._normalize_identity_profiles(
-            [{"impersonate": "firefox144", "user_agent": "   ", "extra_headers": None}])
+            [{"impersonate": "firefox144", "user_agent": "   ", "extra_headers": None}]
+        )
         assert base[0]["user_agent"] is None
         assert base[0]["extra_headers"] == {}
 
 
 # ── curated UA map ───────────────────────────────────────────────
+
 
 class TestUAByImpersonate:
     def test_every_target_has_desktop_ua(self):

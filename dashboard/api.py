@@ -22,11 +22,29 @@ from fastapi import Request, Response
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from config import MODELS, HOST, PORT, WEB_PORT, PROXY, API_KEY, CONFIG_KEYS, save_env, apply_server_changes, CUSTOM_ROUTES, save_custom_routes, API_KEYS, save_api_keys, API_KEY_ROUTING
+from config import (
+    MODELS,
+    HOST,
+    PORT,
+    WEB_PORT,
+    PROXY,
+    API_KEY,
+    save_env,
+    apply_server_changes,
+    save_custom_routes,
+    API_KEYS,
+    save_api_keys,
+    API_KEY_ROUTING,
+)
 import config.settings as config_settings
 from .display import log_lines, debug as _debug
 from .events import get_event_manager
-from .quota import get_quota_snapshot, get_available_models, get_model_limits_for_all, get_model_capabilities_for_all
+from .quota import (
+    get_quota_snapshot,
+    get_available_models,
+    get_model_limits_for_all,
+    get_model_capabilities_for_all,
+)
 
 from traffic_capture import capture as _traffic_capture
 
@@ -36,8 +54,10 @@ UNIVERSAL_TOOLS = {"Read", "Write", "Edit", "Bash", "Grep", "Glob", "WebSearch"}
 
 # ── Simple TTL cache for expensive dashboard queries ──
 
+
 class _TTLCache:
     """In-memory cache with TTL for reducing redundant DB scans."""
+
     def __init__(self, ttl: float = 10.0):
         self._ttl = ttl
         self._store: dict[str, tuple[float, any]] = {}
@@ -68,6 +88,7 @@ class _TTLCache:
         else:
             self._store.clear()
 
+
 _stats_cache = _TTLCache(ttl=10.0)
 
 # Cache for local IP resolution (rarely changes)
@@ -84,17 +105,26 @@ try:
     _host_for_warning = (os.getenv("OPENCODE_HOST", "") or "").strip()
     if not _host_for_warning:
         import yaml as _yaml_warn
+
         try:
-            with open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.yaml"), "r", encoding="utf-8") as _f:
+            with open(
+                os.path.join(
+                    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.yaml"
+                ),
+                "r",
+                encoding="utf-8",
+            ) as _f:
                 _yw = _yaml_warn.safe_load(_f) or {}
                 _host_for_warning = str(_yw.get("server", {}).get("host", "0.0.0.0"))
         except Exception:
             _host_for_warning = "0.0.0.0"
     if _host_for_warning == "0.0.0.0" and not _DASHBOARD_TOKEN:
         import logging as _logging_warn
+
         _logging_warn.getLogger("dashboard").warning(
             "DASHBOARD_TOKEN not set while host is 0.0.0.0 — dashboard is open to LAN. "
-            "Set DASHBOARD_TOKEN in .env (header X-Dashboard-Token) for any non-localhost deployment.")
+            "Set DASHBOARD_TOKEN in .env (header X-Dashboard-Token) for any non-localhost deployment."
+        )
 except Exception:
     pass
 
@@ -105,7 +135,8 @@ except Exception:
 #  Never auto-reload: a user editing config.yaml by hand must restart or
 # re-push to get a consistent state.
 __CONFIG_YAML_PATH = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.yaml")
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.yaml"
+)
 _config_yaml_known_mtime: float = 0.0
 
 
@@ -126,10 +157,13 @@ def _check_dashboard_token(request: Request):
     provided = request.headers.get("X-Dashboard-Token", "")
     if provided and hmac.compare_digest(provided, _DASHBOARD_TOKEN):
         return None
-    return JSONResponse(status_code=401, content={
-        "error": "unauthorized",
-        "message": "Valid X-Dashboard-Token header required (DASHBOARD_TOKEN env).",
-    })
+    return JSONResponse(
+        status_code=401,
+        content={
+            "error": "unauthorized",
+            "message": "Valid X-Dashboard-Token header required (DASHBOARD_TOKEN env).",
+        },
+    )
 
 
 # Secret fields that are never shipped to the browser (masked instead) and
@@ -199,7 +233,7 @@ def _get_local_ips() -> list:
         hostname = socket.gethostname()
         for info in socket.getaddrinfo(hostname, None):
             addr = info[4][0]
-            if addr and not addr.startswith("127.") and '.' in addr:
+            if addr and not addr.startswith("127.") and "." in addr:
                 if addr not in ips:
                     ips.append(addr)
     except Exception:
@@ -218,7 +252,16 @@ def _get_local_ips() -> list:
     return ips
 
 
-def _build_where(from_date=None, to_date=None, status=None, model=None, original_model=None, account=None, tool=None, search=None):
+def _build_where(
+    from_date=None,
+    to_date=None,
+    status=None,
+    model=None,
+    original_model=None,
+    account=None,
+    tool=None,
+    search=None,
+):
     conditions, params = [], []
     if from_date:
         conditions.append("timestamp >= ?")
@@ -255,7 +298,9 @@ _DATE_ONLY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 def _date_bound_to_utc(date_str: str, end_of_day: bool) -> str:
     """Jour calendaire local → borne UTC+Z, via le fuseau système (DST-correct)."""
     local_midnight = datetime.fromisoformat(date_str + "T00:00:00")  # naive = heure locale
-    local = local_midnight + timedelta(days=1) - timedelta(seconds=1) if end_of_day else local_midnight
+    local = (
+        local_midnight + timedelta(days=1) - timedelta(seconds=1) if end_of_day else local_midnight
+    )
     return local.astimezone().astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
@@ -273,11 +318,13 @@ def daysAgo(n: int) -> str:
 
 _persist_lock = __import__("threading").Lock()
 
+
 def _persist_vpn_config(updates: dict):
     """Persist VPN config changes to config.yaml (non-blocking, best-effort). [32]"""
     global _config_yaml_known_mtime
     try:
         import yaml
+
         config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "config.yaml")
         if not os.path.exists(config_path):
             return
@@ -291,62 +338,62 @@ def _persist_vpn_config(updates: dict):
             key_map = {
                 "enabled": "enabled",
                 "proxy_mode": "proxy_mode",
-            "dual_station": "dual_station",
-            "strict_free": "strict_free",
-            "quota_per_ip": "quota_per_ip",
-            "switch_delay": "switch_delay",
-            "docker_container": "docker_container",
-            "docker_compose_file": "docker_compose_file",
-            "vpn_proxy_port": "vpn_proxy_port",
-            "socks5_proxy_port": "socks5_proxy_port",
-            "credentials_file": "credentials_file",
-            "server_countries": "server_countries",
-            "ip_check_url": "ip_check_url",
-            "circuit_breaker_threshold": "circuit_breaker_threshold",
-            "circuit_breaker_recovery": "circuit_breaker_recovery",
-            "backoff_max_delay": "backoff_max_delay",
-            "watchdog_interval": "watchdog_interval",
-            "identity_rotation": "identity_rotation",
-            "server_provider": "server_provider",
-            "identity_profiles": "identity_profiles",
-            # Identity pool ("un profil par IP") + freshness windows + watchdog
-            "identity_diversity": "identity_diversity",
-            "identity_max_profiles": "identity_max_profiles",
-            "recent_ip_window": "recent_ip_window",
-            "recent_ip_max_age": "recent_ip_max_age",
-            "watchdog_backoff_base": "watchdog_backoff_base",
-            "watchdog_backoff_max": "watchdog_backoff_max",
-            "shared_rotation_file": "shared_rotation_file",
-            # Station 2 ("double embrayage")
-            "socks5_proxy_port_2": "socks5_proxy_port_2",
-            "vpn_proxy_port_2": "vpn_proxy_port_2",
-            "docker_container_2": "docker_container_2",
-            "compose_service_2": "compose_service_2",
-            "state_file_2": "state_file_2",
-            # [plan 18/08 §4] N-station selector (GUI dropdown 1-10, hot
-            # reload) — persisted so the runtime count survives a restart.
-            # `dual_station` remains mapped (legacy toggle, inoffensive).
-            "station_count": "station_count",
-            # [plan 18/08 §3d] VPN technology selector (auto/wireguard/openvpn)
-            # + auto-mode thresholds — persisted here so the selection is a
-            # first-class config.yaml key (hot-reloaded via the mirror).
-            "vpn_stack": "vpn_stack",
-            "auto_ov_fail_threshold": "auto_ov_fail_threshold",
-            "auto_ov_return_min": "auto_ov_return_min",
-            "auto_wg_egress_ticks": "auto_wg_egress_ticks",
-            "auto_flip_cooldown_min": "auto_flip_cooldown_min",
-            # [plan 19/08 §1/§2] free multi-attempt + exception ordering —
-            # no container effect (read per-request via IP_ROTATION.get),
-            # persisted so the GUI selection survives a restart.
-            "max_free_attempts": "max_free_attempts",
-            "free_exception_fallback": "free_exception_fallback",
-            # [Axe 3.1] socks5 backend (static proxy list, auto-rotate toggle,
-            # NordVPN country API, custom .ovpn file) — all persisted config.
-            "socks5_proxies": "socks5_proxies",
-            "socks5_auto_rotate": "socks5_auto_rotate",
-            "use_nordvpn_api": "use_nordvpn_api",
-            "custom_ovpn_file": "custom_ovpn_file",
-        }
+                "dual_station": "dual_station",
+                "strict_free": "strict_free",
+                "quota_per_ip": "quota_per_ip",
+                "switch_delay": "switch_delay",
+                "docker_container": "docker_container",
+                "docker_compose_file": "docker_compose_file",
+                "vpn_proxy_port": "vpn_proxy_port",
+                "socks5_proxy_port": "socks5_proxy_port",
+                "credentials_file": "credentials_file",
+                "server_countries": "server_countries",
+                "ip_check_url": "ip_check_url",
+                "circuit_breaker_threshold": "circuit_breaker_threshold",
+                "circuit_breaker_recovery": "circuit_breaker_recovery",
+                "backoff_max_delay": "backoff_max_delay",
+                "watchdog_interval": "watchdog_interval",
+                "identity_rotation": "identity_rotation",
+                "server_provider": "server_provider",
+                "identity_profiles": "identity_profiles",
+                # Identity pool ("un profil par IP") + freshness windows + watchdog
+                "identity_diversity": "identity_diversity",
+                "identity_max_profiles": "identity_max_profiles",
+                "recent_ip_window": "recent_ip_window",
+                "recent_ip_max_age": "recent_ip_max_age",
+                "watchdog_backoff_base": "watchdog_backoff_base",
+                "watchdog_backoff_max": "watchdog_backoff_max",
+                "shared_rotation_file": "shared_rotation_file",
+                # Station 2 ("double embrayage")
+                "socks5_proxy_port_2": "socks5_proxy_port_2",
+                "vpn_proxy_port_2": "vpn_proxy_port_2",
+                "docker_container_2": "docker_container_2",
+                "compose_service_2": "compose_service_2",
+                "state_file_2": "state_file_2",
+                # [plan 18/08 §4] N-station selector (GUI dropdown 1-10, hot
+                # reload) — persisted so the runtime count survives a restart.
+                # `dual_station` remains mapped (legacy toggle, inoffensive).
+                "station_count": "station_count",
+                # [plan 18/08 §3d] VPN technology selector (auto/wireguard/openvpn)
+                # + auto-mode thresholds — persisted here so the selection is a
+                # first-class config.yaml key (hot-reloaded via the mirror).
+                "vpn_stack": "vpn_stack",
+                "auto_ov_fail_threshold": "auto_ov_fail_threshold",
+                "auto_ov_return_min": "auto_ov_return_min",
+                "auto_wg_egress_ticks": "auto_wg_egress_ticks",
+                "auto_flip_cooldown_min": "auto_flip_cooldown_min",
+                # [plan 19/08 §1/§2] free multi-attempt + exception ordering —
+                # no container effect (read per-request via IP_ROTATION.get),
+                # persisted so the GUI selection survives a restart.
+                "max_free_attempts": "max_free_attempts",
+                "free_exception_fallback": "free_exception_fallback",
+                # [Axe 3.1] socks5 backend (static proxy list, auto-rotate toggle,
+                # NordVPN country API, custom .ovpn file) — all persisted config.
+                "socks5_proxies": "socks5_proxies",
+                "socks5_auto_rotate": "socks5_auto_rotate",
+                "use_nordvpn_api": "use_nordvpn_api",
+                "custom_ovpn_file": "custom_ovpn_file",
+            }
 
         changed = False
         for key, yaml_key in key_map.items():
@@ -361,12 +408,15 @@ def _persist_vpn_config(updates: dict):
             config["ip_rotation"] = ip_rot
             # Atomic write via tempfile + fsync + replace (fiabilise sur panne disque)
             import tempfile
+
             try:
                 dir_name = os.path.dirname(config_path) or "."
                 fd, tmp_path = tempfile.mkstemp(dir=dir_name, prefix=".config.yaml.tmp.")
                 try:
                     with os.fdopen(fd, "w", encoding="utf-8") as f:
-                        yaml.dump(config, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+                        yaml.dump(
+                            config, f, default_flow_style=False, allow_unicode=True, sort_keys=False
+                        )
                         f.flush()
                         try:
                             os.fsync(f.fileno())
@@ -382,12 +432,15 @@ def _persist_vpn_config(updates: dict):
             except Exception:
                 # Fallback non-atomique
                 with open(config_path, "w", encoding="utf-8") as f:
-                    yaml.dump(config, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+                    yaml.dump(
+                        config, f, default_flow_style=False, allow_unicode=True, sort_keys=False
+                    )
             # [32] keep the in-memory mirror in sync — otherwise the next
             # settings.yaml_set() re-dumps the stale _yaml_data and reverts
             # what we just wrote to disk.
             try:
                 from config import settings as _st
+
                 cur = _st._yaml_data.get("ip_rotation")
                 if isinstance(cur, dict):
                     # [33] in-place update: settings.IP_ROTATION is a live
@@ -401,19 +454,24 @@ def _persist_vpn_config(updates: dict):
             # Best-effort hot-reload des managers pour appels directs (tests, SSE)
             try:
                 import shared_state
-                mgrs = getattr(shared_state, 'vpn_managers', None) or []
-                if not mgrs and getattr(shared_state, 'vpn_manager', None):
+
+                mgrs = getattr(shared_state, "vpn_managers", None) or []
+                if not mgrs and getattr(shared_state, "vpn_manager", None):
                     mgrs = [shared_state.vpn_manager]
                 for m in mgrs:
-                    if m and hasattr(m, '_config'):
+                    if m and hasattr(m, "_config"):
                         for k in updates:
                             if k in key_map:
                                 yaml_key = key_map[k]
                                 if yaml_key in ip_rot:
                                     m._config[yaml_key] = ip_rot[yaml_key]
-                        if "circuit_breaker_threshold" in updates or "circuit_breaker_recovery" in updates:
+                        if (
+                            "circuit_breaker_threshold" in updates
+                            or "circuit_breaker_recovery" in updates
+                        ):
                             try:
                                 from vpn_manager import CircuitBreaker
+
                                 m._circuit_breaker = CircuitBreaker(
                                     failure_threshold=m._config.get("circuit_breaker_threshold", 3),
                                     recovery_time=m._config.get("circuit_breaker_recovery", 300),
@@ -427,6 +485,7 @@ def _persist_vpn_config(updates: dict):
             # keep config/settings mtime in sync so maybe_reload doesn't refire
             try:
                 from config import settings as _st2
+
                 _st2._config_yaml_mtime = _config_yaml_known_mtime
             except Exception:
                 pass
@@ -444,21 +503,21 @@ def _persist_free_model_map(mapping: dict):
     """
     try:
         import yaml
-        config_path = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), "..", "config.yaml")
+
+        config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "config.yaml")
         if not os.path.exists(config_path):
             return
         with open(config_path, "r", encoding="utf-8") as f:
             config = yaml.safe_load(f) or {}
         config["free_model_map"] = dict(mapping)
         with open(config_path, "w", encoding="utf-8") as f:
-            yaml.dump(config, f, default_flow_style=False,
-                      allow_unicode=True, sort_keys=False)
+            yaml.dump(config, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
         # [Axe 3.4] dashboard wrote the file → not manually dirty.
         global _config_yaml_known_mtime
         _config_yaml_known_mtime = _config_yaml_mtime()
         try:
             from config import settings as _st2
+
             _st2._config_yaml_mtime = _config_yaml_known_mtime
         except Exception:
             pass
@@ -475,6 +534,7 @@ def _write_credentials_env(username: str, password: str):
     the new values.
     """
     import os
+
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     cred_path = os.path.join(root, "credentials.env")
     with open(cred_path, "w", encoding="utf-8", newline="\n") as f:
@@ -491,12 +551,14 @@ def _write_credentials_env(username: str, password: str):
 # these small isolated helpers so the dashboard endpoints stay testable
 # offline (monkeypatch the helper, never the live system).
 
+
 def _vpn_proxy_mode() -> str:
     """Current proxy mode for the GUI (vpn | socks5 | direct). Reads the
     live manager registry first, then the config mirror, then defaults to
     'vpn' (clients must never see an empty mode)."""
     try:
         import shared_state
+
         mgrs = getattr(shared_state, "vpn_managers", None) or []
         if isinstance(mgrs, list) and mgrs:
             pm = getattr(mgrs[0], "proxy_mode", None)
@@ -519,12 +581,14 @@ def _socks5_payload(pool) -> list:
     for r in rows:
         if not isinstance(r, dict):
             continue
-        out.append({
-            "host": r.get("host", ""),
-            "port": r.get("port", 0),
-            "enabled": bool(r.get("enabled", True)),
-            "has_password": bool(r.get("password")),
-        })
+        out.append(
+            {
+                "host": r.get("host", ""),
+                "port": r.get("port", 0),
+                "enabled": bool(r.get("enabled", True)),
+                "has_password": bool(r.get("password")),
+            }
+        )
     return out
 
 
@@ -532,6 +596,7 @@ def _dashboard_pool():
     """The free-IP pool behind the VPN tab endpoints (None-safe)."""
     try:
         import shared_state
+
         return getattr(shared_state, "free_ip_pool", None)
     except Exception:
         return None
@@ -541,6 +606,7 @@ def _dashboard_managers() -> list:
     """The active VPN manager registry ([] when uninitialized)."""
     try:
         import shared_state
+
         return getattr(shared_state, "vpn_managers", None) or []
     except Exception:
         return []
@@ -572,17 +638,20 @@ def _apply_socks5_rows(rows: list) -> dict | None:
             return {"error": f"ligne {i}: port invalide"}
         if not (1 <= port <= 65535):
             return {"error": f"ligne {i}: port hors bornes (1-65535)"}
-        cleaned.append({
-            "host": host,
-            "port": port,
-            "enabled": bool(r.get("enabled", True)),
-            "username": str(r.get("username") or "").strip() or None,
-            "password": str(r.get("password") or "").strip() or None,
-        })
+        cleaned.append(
+            {
+                "host": host,
+                "port": port,
+                "enabled": bool(r.get("enabled", True)),
+                "username": str(r.get("username") or "").strip() or None,
+                "password": str(r.get("password") or "").strip() or None,
+            }
+        )
     err = _persist_vpn_config({"socks5_proxies": cleaned})
     if not err:
         try:
             import shared_state
+
             pool = getattr(shared_state, "free_ip_pool", None)
             if pool is not None and hasattr(pool, "set_socks5_proxies"):
                 pool.set_socks5_proxies(cleaned)
@@ -598,6 +667,7 @@ def _socks5_auto_rotate_state() -> bool:
         if "socks5_auto_rotate" in cfg:
             return bool(cfg["socks5_auto_rotate"])
         import shared_state
+
         pool = getattr(shared_state, "free_ip_pool", None)
         if pool is not None and hasattr(pool, "_socks5_auto_rotate"):
             return bool(pool._socks5_auto_rotate)
@@ -612,14 +682,12 @@ def _read_exact(sock, n: int) -> bytes:
     while len(buf) < n:
         chunk = sock.recv(n - len(buf))
         if not chunk:
-            raise ConnectionError(
-                "fermeture de la connexion pendant la réponse SOCKS5")
+            raise ConnectionError("fermeture de la connexion pendant la réponse SOCKS5")
         buf += chunk
     return buf
 
 
-def _socks5_raw_get(proxy_host: str, proxy_port: int, target: str,
-                    timeout: float = 8.0) -> tuple:
+def _socks5_raw_get(proxy_host: str, proxy_port: int, target: str, timeout: float = 8.0) -> tuple:
     """Full HTTP(S) GET through a SOCKS5 proxy using raw sockets + ssl (no
     socks-extras dependency). Returns (status, body, elapsed_seconds);
     raises on connectivity failure. The CONNECT handshake doubles as the
@@ -627,34 +695,32 @@ def _socks5_raw_get(proxy_host: str, proxy_port: int, target: str,
     import ssl
     import ipaddress
     from urllib.parse import urlsplit
+
     u = urlsplit(target)
     host, port = u.hostname, u.port or 443
     started = time.monotonic()
-    sock = socket.create_connection((proxy_host, int(proxy_port)),
-                                    timeout=timeout)
+    sock = socket.create_connection((proxy_host, int(proxy_port)), timeout=timeout)
     try:
         sock.settimeout(timeout)
         sock.sendall(b"\x05\x01\x00")  # version 5, 1 method, no-auth
         ver, nmeth = _read_exact(sock, 2)
         if ver != 5 or nmeth != 0:
-            raise ConnectionError(
-                f"proxy SOCKS5 a refusé le handshake ({ver}/{nmeth})")
+            raise ConnectionError(f"proxy SOCKS5 a refusé le handshake ({ver}/{nmeth})")
         try:
             ipaddress.ip_address(host)
             atyp, addr = 0x01, socket.inet_aton(host)
         except ValueError:
             atyp, hb = 0x03, host.encode()  # hostname ATYP
             addr = bytes([len(hb)]) + hb
-        sock.sendall(b"\x05\x01\x00" + bytes([atyp]) + addr
-                     + int(port).to_bytes(2, "big"))
+        sock.sendall(b"\x05\x01\x00" + bytes([atyp]) + addr + int(port).to_bytes(2, "big"))
         rep = _read_exact(sock, 4)
         if rep[1] != 0:
             raise ConnectionError(f"CONNECT SOCKS5 refusé (code {rep[1]})")
         atyp = rep[3]
         if atyp == 0x01:
-            _read_exact(sock, 6)      # IPv4 addr + port
+            _read_exact(sock, 6)  # IPv4 addr + port
         elif atyp == 0x04:
-            _read_exact(sock, 18)     # IPv6 addr + port
+            _read_exact(sock, 18)  # IPv6 addr + port
         elif atyp == 0x03:
             ln = _read_exact(sock, 1)[0]
             _read_exact(sock, ln + 2)  # hostname + port
@@ -663,10 +729,11 @@ def _socks5_raw_get(proxy_host: str, proxy_port: int, target: str,
         path = u.path or "/"
         if u.query:
             path += "?" + u.query
-        req = (f"GET {path} HTTP/1.1\r\nHost: {host}\r\n"
-               f"User-Agent: opencode-proxy/1.0\r\nConnection: close\r\n\r\n")
-        with ssl.create_default_context().wrap_socket(
-                sock, server_hostname=host) as tls:
+        req = (
+            f"GET {path} HTTP/1.1\r\nHost: {host}\r\n"
+            f"User-Agent: opencode-proxy/1.0\r\nConnection: close\r\n\r\n"
+        )
+        with ssl.create_default_context().wrap_socket(sock, server_hostname=host) as tls:
             tls.sendall(req.encode())
             data = b""
             while True:
@@ -693,8 +760,7 @@ async def _socks5_probe(host: str, port: int) -> dict:
         return {"ok": False, "error": "host manquant"}
 
     def _run():
-        status, body, elapsed = _socks5_raw_get(
-            host, port, "https://api.ipify.org/")
+        status, body, elapsed = _socks5_raw_get(host, port, "https://api.ipify.org/")
         ip = body.strip()
         try:
             s2, _, _ = _socks5_raw_get(host, port, "https://opencode.ai/")
@@ -707,19 +773,21 @@ async def _socks5_probe(host: str, port: int) -> dict:
         ip, ok, elapsed, oc_ok = await asyncio.to_thread(_run)
     except Exception as e:
         return {"ok": False, "error": str(e)}
-    return {"ok": ok, "ip": ip, "opencode_ok": oc_ok,
-            "latency_ms": round(elapsed * 1000, 1)}
+    return {"ok": ok, "ip": ip, "opencode_ok": oc_ok, "latency_ms": round(elapsed * 1000, 1)}
 
 
 async def _nordvpn_api_fetch(url: str, timeout: float = 10.0) -> dict:
     """One GET against the (free, keyless) NordVPN server API. Isolated so
     tests monkeypatch it — the live HTTP path never runs offline."""
+
     def _do():
         import httpx
+
         with httpx.Client(timeout=timeout, follow_redirects=True) as c:
             r = c.get(url)
             r.raise_for_status()
             return r.json()
+
     return await asyncio.to_thread(_do)
 
 
@@ -759,8 +827,7 @@ async def _nordvpn_countries(use_api: bool) -> list:
     on, else the static fallback (offline-safe)."""
     if use_api:
         try:
-            data = await _nordvpn_api_fetch(
-                "https://api.nordvpn.com/v1/servers/countries")
+            data = await _nordvpn_api_fetch("https://api.nordvpn.com/v1/servers/countries")
             out = []
             for row in data or []:
                 if not isinstance(row, dict):
@@ -783,8 +850,7 @@ async def _nordvpn_servers_by_country(code: str, limit: int = 20) -> list:
     if not code:
         return []
     try:
-        countries = await _nordvpn_api_fetch(
-            "https://api.nordvpn.com/v1/servers/countries")
+        countries = await _nordvpn_api_fetch("https://api.nordvpn.com/v1/servers/countries")
         cid = None
         for row in countries or []:
             if isinstance(row, dict) and str(row.get("code", "")).upper() == code:
@@ -796,15 +862,15 @@ async def _nordvpn_servers_by_country(code: str, limit: int = 20) -> list:
             "https://api.nordvpn.com/v1/servers/recommendations"
             f"?limit={int(limit)}"
             "&filters[servers_technologies][identifier]=openvpn_udp"
-            f"&filters[country_id]={int(cid)}")
+            f"&filters[country_id]={int(cid)}"
+        )
         out = []
         for row in data or []:
             if not isinstance(row, dict):
                 continue
             host = str(row.get("hostname", "")).strip()
             if host:
-                out.append({"hostname": host, "country": code,
-                            "load": row.get("load", 0)})
+                out.append({"hostname": host, "country": code, "load": row.get("load", 0)})
         return out
     except Exception as e:
         _debug(f"  [nordvpn] servers_by_country({code}) failed: {e}")
@@ -818,8 +884,11 @@ def _docker_diag() -> dict:
     try:
         r = subprocess.run(
             ["docker", "version", "--format", "{{.Server.Version}}"],
-            capture_output=True, text=True, timeout=10,
-            creationflags=_CREATE_NO_WINDOW)
+            capture_output=True,
+            text=True,
+            timeout=10,
+            creationflags=_CREATE_NO_WINDOW,
+        )
         if r.returncode == 0:
             diag["available"] = True
             diag["version"] = (r.stdout or r.stderr).strip() or None
@@ -829,8 +898,11 @@ def _docker_diag() -> dict:
     try:
         info = subprocess.run(
             ["docker", "info", "--format", "{{.ServerVersion}}"],
-            capture_output=True, text=True, timeout=10,
-            creationflags=_CREATE_NO_WINDOW)
+            capture_output=True,
+            text=True,
+            timeout=10,
+            creationflags=_CREATE_NO_WINDOW,
+        )
         diag["running"] = info.returncode == 0
     except Exception:
         diag["running"] = False
@@ -842,6 +914,7 @@ def _docker_compose_config() -> list:
     bundle). Empty list when no managers or docker is absent."""
     try:
         import shared_state
+
         mgrs = getattr(shared_state, "vpn_managers", None) or []
     except Exception:
         mgrs = []
@@ -851,16 +924,28 @@ def _docker_compose_config() -> list:
         if not df:
             continue
         try:
-            r = subprocess.run(["docker", "compose", "-f", df, "config"],
-                               capture_output=True, text=True, timeout=15,
-                               creationflags=_CREATE_NO_WINDOW)
+            r = subprocess.run(
+                ["docker", "compose", "-f", df, "config"],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                creationflags=_CREATE_NO_WINDOW,
+            )
             out.append(f"=== {df}\n{(r.stdout or r.stderr).strip()}")
         except Exception as e:
             out.append(f"=== {df}\n(erreur: {e})")
     return out
 
 
-def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_usage=None, token_lock=None, db_lock=None):
+def register_dashboard(
+    app,
+    static_dir,
+    conn,
+    server_manager_getter=None,
+    token_usage=None,
+    token_lock=None,
+    db_lock=None,
+):
     # Serialize dashboard DB reads with the proxy's writers: opencode.py passes
     # its `_db_commit_lock`; without it a private lock still protects the
     # dashboard's own concurrent reads.
@@ -869,12 +954,14 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
         _db_lock = db_lock
     # Add Cache-Control headers for static assets (JS/CSS/HTML)
     from starlette.middleware.base import BaseHTTPMiddleware
+
     class _StaticCacheMiddleware(BaseHTTPMiddleware):
         async def dispatch(self, request, call_next):
             response = await call_next(request)
             if request.url.path.startswith("/static/"):
                 response.headers["Cache-Control"] = "public, max-age=3600"
             return response
+
     app.add_middleware(_StaticCacheMiddleware)
 
     app.mount("/static", StaticFiles(directory=static_dir), name="static")
@@ -892,6 +979,7 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
         if _index_html_cache is not None:
             return Response(content=_index_html_cache, media_type="text/html; charset=utf-8")
         from fastapi.responses import FileResponse
+
         return FileResponse(os.path.join(static_dir, "index.html"))
 
     # ── Config endpoints ──
@@ -911,7 +999,9 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
         return {
             "proxy": PROXY or "",
             "api_key_set": bool(API_KEY),
-            "api_key_masked": (API_KEY[:4] + "****" + API_KEY[-4:]) if API_KEY and len(API_KEY) > 8 else ("****" if API_KEY else ""),
+            "api_key_masked": (API_KEY[:4] + "****" + API_KEY[-4:])
+            if API_KEY and len(API_KEY) > 8
+            else ("****" if API_KEY else ""),
             "host": HOST,
             "port": PORT,
             "local_ips": await asyncio.to_thread(_get_local_ips),
@@ -920,18 +1010,32 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
             "models": models_info,
             "model_limits": get_model_limits_for_all(models_info),
             "model_capabilities": get_model_capabilities_for_all(models_info),
-            "proxy_running": server_manager_getter().is_running if server_manager_getter and server_manager_getter() else True,
+            "proxy_running": server_manager_getter().is_running
+            if server_manager_getter and server_manager_getter()
+            else True,
             "disable_mapping": config_settings.DISABLE_MAPPING,
             "custom_routes": config_settings.CUSTOM_ROUTES,
             "go_workspace_id_set": bool(config_settings.OPENCODE_GO_WORKSPACE_ID),
-            "go_workspace_id_masked": (config_settings.OPENCODE_GO_WORKSPACE_ID[:4] + "****") if config_settings.OPENCODE_GO_WORKSPACE_ID and len(config_settings.OPENCODE_GO_WORKSPACE_ID) > 4 else (config_settings.OPENCODE_GO_WORKSPACE_ID or ""),
+            "go_workspace_id_masked": (config_settings.OPENCODE_GO_WORKSPACE_ID[:4] + "****")
+            if config_settings.OPENCODE_GO_WORKSPACE_ID
+            and len(config_settings.OPENCODE_GO_WORKSPACE_ID) > 4
+            else (config_settings.OPENCODE_GO_WORKSPACE_ID or ""),
             "go_auth_cookie_set": bool(config_settings.OPENCODE_GO_AUTH_COOKIE),
-            "go_auth_cookie_masked": (config_settings.OPENCODE_GO_AUTH_COOKIE[:6] + "****") if config_settings.OPENCODE_GO_AUTH_COOKIE and len(config_settings.OPENCODE_GO_AUTH_COOKIE) > 6 else (""),
+            "go_auth_cookie_masked": (config_settings.OPENCODE_GO_AUTH_COOKIE[:6] + "****")
+            if config_settings.OPENCODE_GO_AUTH_COOKIE
+            and len(config_settings.OPENCODE_GO_AUTH_COOKIE) > 6
+            else (""),
             "api_keys": [
                 {
-                    "api_key_masked": (k["api_key"][:4] + "****" + k["api_key"][-4:]) if len(k.get("api_key", "")) > 8 else "****",
-                    "go_workspace_id_masked": (k.get("go_workspace_id", "")[:4] + "****") if len(k.get("go_workspace_id", "")) > 4 else "",
-                    "go_auth_cookie_masked": (k.get("go_auth_cookie", "")[:6] + "****") if len(k.get("go_auth_cookie", "")) > 6 else "",
+                    "api_key_masked": (k["api_key"][:4] + "****" + k["api_key"][-4:])
+                    if len(k.get("api_key", "")) > 8
+                    else "****",
+                    "go_workspace_id_masked": (k.get("go_workspace_id", "")[:4] + "****")
+                    if len(k.get("go_workspace_id", "")) > 4
+                    else "",
+                    "go_auth_cookie_masked": (k.get("go_auth_cookie", "")[:6] + "****")
+                    if len(k.get("go_auth_cookie", "")) > 6
+                    else "",
                     # Finding i: never ship full secrets to the browser. The UI
                     # (static/app.js) shows *_masked placeholders and posts ''
                     # for unchanged fields — the merge in update_api_keys_config
@@ -947,7 +1051,9 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
         }
 
     @app.get("/api/routes")
-    async def get_routes(request: Request, q: str = None, geo_status: str = None, limit: int = 50, offset: int = 0):
+    async def get_routes(
+        request: Request, q: str = None, geo_status: str = None, limit: int = 50, offset: int = 0
+    ):
         """Routes with geo enrichment + pagination (vivid-hinton P4)."""
         limit = max(1, min(200, int(limit or 50)))
         offset = max(0, int(offset or 0))
@@ -956,27 +1062,44 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
             try:
                 g = config_settings.resolve_geo(route)
             except Exception:
-                g = {"effective_allowed": set(), "mode": "strict", "require_vpn": False, "geo_status": "ok"}
+                g = {
+                    "effective_allowed": set(),
+                    "mode": "strict",
+                    "require_vpn": False,
+                    "geo_status": "ok",
+                }
             status = str(g.get("geo_status", "ok"))
             if geo_status and status != geo_status:
                 continue
-            if q and q.lower() not in key.lower() and q.lower() not in str(route.get("model", "")).lower():
+            if (
+                q
+                and q.lower() not in key.lower()
+                and q.lower() not in str(route.get("model", "")).lower()
+            ):
                 continue
             eff = g.get("effective_allowed", set())
-            items.append({
-                "key": key,
-                "match": route.get("match", []),
-                "model": route.get("model", ""),
-                "thinking": route.get("thinking"),
-                "geo": route.get("geo"),
-                "geo_status": status,
-                "effective_allowed": sorted(eff) if isinstance(eff, set) else [],
-                "mode": g.get("mode", "strict"),
-                "require_vpn": bool(g.get("require_vpn", False)),
-            })
+            items.append(
+                {
+                    "key": key,
+                    "match": route.get("match", []),
+                    "model": route.get("model", ""),
+                    "thinking": route.get("thinking"),
+                    "geo": route.get("geo"),
+                    "geo_status": status,
+                    "effective_allowed": sorted(eff) if isinstance(eff, set) else [],
+                    "mode": g.get("mode", "strict"),
+                    "require_vpn": bool(g.get("require_vpn", False)),
+                }
+            )
         total = len(items)
-        page = items[offset:offset + limit]
-        return {"routes": page, "total": total, "limit": limit, "offset": offset, "has_more": offset + limit < total}
+        page = items[offset : offset + limit]
+        return {
+            "routes": page,
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "has_more": offset + limit < total,
+        }
 
     @app.get("/api/geo-policies")
     async def get_geo_policies(request: Request):
@@ -987,7 +1110,9 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
             "enabled": bool(getattr(config_settings, "GEO_ENABLED", False)),
             "version": int(getattr(config_settings, "GEO_VERSION", 1) or 1),
             "policies": dict(getattr(config_settings, "GEO_POLICIES", {}) or {}),
-            "allow_direct_when_compatible": bool(getattr(config_settings, "GEO_ALLOW_DIRECT_WHEN_COMPATIBLE", True)),
+            "allow_direct_when_compatible": bool(
+                getattr(config_settings, "GEO_ALLOW_DIRECT_WHEN_COMPATIBLE", True)
+            ),
         }
 
     @app.put("/api/geo-policies")
@@ -999,13 +1124,22 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
         ctrl_key = str(config_settings.yaml_get("ip_rotation", "control_api_key", "") or "").strip()
         provided_ctrl = request.headers.get("X-API-Key", "")
         if ctrl_key and provided_ctrl != ctrl_key:
-            return JSONResponse(status_code=401, content={"error": "unauthorized", "message": "Valid X-API-Key required"})
+            return JSONResponse(
+                status_code=401,
+                content={"error": "unauthorized", "message": "Valid X-API-Key required"},
+            )
         # ETag via mtime
         current_mtime = _config_yaml_mtime()
         etag = str(int(current_mtime))
         if_match = request.headers.get("If-Match", "")
         if if_match and if_match != etag and if_match != f'"{etag}"':
-            return JSONResponse(status_code=412, content={"error": "precondition_failed", "message": "Stale ETag — reload and retry"})
+            return JSONResponse(
+                status_code=412,
+                content={
+                    "error": "precondition_failed",
+                    "message": "Stale ETag — reload and retry",
+                },
+            )
         body = await request.json()
         # Validate schema
         if "enabled" in body:
@@ -1036,7 +1170,13 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
             _config_yaml_known_mtime = _config_yaml_mtime()
         except Exception as e:
             return JSONResponse(status_code=500, content={"error": str(e)})
-        return {"ok": True, "enabled": bool(config_settings.GEO_ENABLED), "version": int(config_settings.GEO_VERSION), "allow_direct_when_compatible": bool(config_settings.GEO_ALLOW_DIRECT_WHEN_COMPATIBLE), "etag": str(int(_config_yaml_mtime()))}
+        return {
+            "ok": True,
+            "enabled": bool(config_settings.GEO_ENABLED),
+            "version": int(config_settings.GEO_VERSION),
+            "allow_direct_when_compatible": bool(config_settings.GEO_ALLOW_DIRECT_WHEN_COMPATIBLE),
+            "etag": str(int(_config_yaml_mtime())),
+        }
 
     @app.post("/api/geo-policies/rollback")
     async def geo_rollback(request: Request):
@@ -1071,6 +1211,7 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
     @app.get("/api/config/web-search")
     async def get_web_search_config():
         from config import yaml_get
+
         mode = yaml_get("web_search", "mode", "duckduckgo")
         target_model = yaml_get("web_search", "target_model", None)
         max_results = yaml_get("web_search", "max_results", 5)
@@ -1091,6 +1232,7 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
             return err
         body = await request.json()
         from config import yaml_set
+
         if "mode" in body:
             yaml_set("web_search", "mode", body["mode"])
         if "target_model" in body:
@@ -1099,7 +1241,9 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
             yaml_set("web_search", "max_results", int(body["max_results"]))
         if "timeout" in body:
             yaml_set("web_search", "timeout", int(body["timeout"]))
-        _debug(f"  [config] web search updated: mode={body.get('mode')}, model={body.get('target_model')}")
+        _debug(
+            f"  [config] web search updated: mode={body.get('mode')}, model={body.get('target_model')}"
+        )
         return {"status": "ok", "message": "Web search config updated."}
 
     @app.get("/api/config/api-keys")
@@ -1110,7 +1254,9 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
         return {
             "api_keys": [
                 {
-                    "api_key_masked": (k["api_key"][:4] + "****" + k["api_key"][-4:]) if len(k.get("api_key", "")) > 8 else "****",
+                    "api_key_masked": (k["api_key"][:4] + "****" + k["api_key"][-4:])
+                    if len(k.get("api_key", "")) > 8
+                    else "****",
                     "has_go_workspace": bool(k.get("go_workspace_id")),
                     "has_go_cookie": bool(k.get("go_auth_cookie")),
                     # Finding i: never ship full secrets to the browser —
@@ -1313,10 +1459,13 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
             success_rate = (total_success / total_count * 100) if total_count > 0 else None
 
             totals = {
-                "input": total_input, "output": row[1], "cache": total_cache,
+                "input": total_input,
+                "output": row[1],
+                "cache": total_cache,
                 "total": total_input + row[1] + total_cache,
                 "count": total_count,
-                "success_count": total_success, "fail_count": total_fail,
+                "success_count": total_success,
+                "fail_count": total_fail,
                 "avg_duration_ms": int(row[6]),
                 "cache_hit_rate": round(cache_hit_rate, 1),
                 "success_rate": round(success_rate, 1) if success_rate is not None else None,
@@ -1328,8 +1477,7 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
                 "       SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END),"
                 "       SUM(CASE WHEN success = 0 OR success IS NULL THEN 1 ELSE 0 END),"
                 "       COALESCE(AVG(duration_ms), 0)"
-                " FROM requests " + where +
-                " GROUP BY model",
+                " FROM requests " + where + " GROUP BY model",
                 params,
             ).fetchall()
 
@@ -1339,8 +1487,9 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
                 "       SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END),"
                 "       SUM(CASE WHEN success = 0 OR success IS NULL THEN 1 ELSE 0 END),"
                 "       COALESCE(AVG(duration_ms), 0)"
-                " FROM requests " + where +
-                " GROUP BY COALESCE(NULLIF(free_model_ip, ''), account_alias, '')",
+                " FROM requests "
+                + where
+                + " GROUP BY COALESCE(NULLIF(free_model_ip, ''), account_alias, '')",
                 params,
             ).fetchall()
 
@@ -1356,9 +1505,14 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
             # [36] null (not 100%) when no requests — the UI shows « — »
             m_success_rate = (r[5] / r[4] * 100) if r[4] > 0 else None
             models[r[0]] = {
-                "input": r[1], "output": r[2], "cache": r[3], "total": t,
-                "pct": f"{t/sum_total*100:.1f}%" if sum_total else "0%",
-                "count": r[4], "success_count": r[5], "fail_count": r[6],
+                "input": r[1],
+                "output": r[2],
+                "cache": r[3],
+                "total": t,
+                "pct": f"{t / sum_total * 100:.1f}%" if sum_total else "0%",
+                "count": r[4],
+                "success_count": r[5],
+                "fail_count": r[6],
                 "avg_duration_ms": int(r[7]),
                 "cache_hit_rate": round(m_cache_rate, 1),
                 "success_rate": round(m_success_rate, 1) if m_success_rate is not None else None,
@@ -1373,9 +1527,14 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
             # [36] null (not 100%) when no requests — the UI shows « — »
             a_success_rate = (r[5] / r[4] * 100) if r[4] > 0 else None
             accounts[label] = {
-                "input": r[1], "output": r[2], "cache": r[3], "total": t,
-                "pct": f"{t/sum_total*100:.1f}%" if sum_total else "0%",
-                "count": r[4], "success_count": r[5], "fail_count": r[6],
+                "input": r[1],
+                "output": r[2],
+                "cache": r[3],
+                "total": t,
+                "pct": f"{t / sum_total * 100:.1f}%" if sum_total else "0%",
+                "count": r[4],
+                "success_count": r[5],
+                "fail_count": r[6],
                 "avg_duration_ms": int(r[7]),
                 "cache_hit_rate": round(a_cache_rate, 1),
                 "success_rate": round(a_success_rate, 1) if a_success_rate is not None else None,
@@ -1386,7 +1545,9 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
         return result
 
     @app.get("/api/stats/timeseries")
-    async def get_stats_timeseries(from_date: str = None, to_date: str = None, granularity: str = "hour"):
+    async def get_stats_timeseries(
+        from_date: str = None, to_date: str = None, granularity: str = "hour"
+    ):
         """Return time-series data for charts: requests count, tokens, avg duration per time bucket."""
         where, params = _build_where(from_date, to_date)
 
@@ -1410,8 +1571,7 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
                 "COALESCE(SUM(tokens_output), 0) as output_tokens, "
                 "COALESCE(SUM(tokens_cache), 0) as cache_tokens, "
                 "COALESCE(AVG(duration_ms), 0) as avg_duration "
-                "FROM requests " + where +
-                f" GROUP BY period ORDER BY period",
+                "FROM requests " + where + f" GROUP BY period ORDER BY period",
                 params,
             ).fetchall()
             return rows
@@ -1439,9 +1599,9 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
     async def get_logs(limit: int = 100, offset: int = 0):
         lines = list(log_lines)
         return {
-            "logs": lines[offset:offset+limit],
+            "logs": lines[offset : offset + limit],
             "total": len(lines),
-            "has_more": offset + limit < len(lines)
+            "has_more": offset + limit < len(lines),
         }
 
     # ── Debug toggle ──
@@ -1459,12 +1619,15 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
         save_env({"OPENCODE_DEBUG": "1" if enabled else "0"})
         # Update display module's debug function too
         from dashboard.display import set_debug_log_file
+
         if enabled:
-            from config import settings
-            log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs")
+            log_dir = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs"
+            )
             debug_log_path = os.path.join(log_dir, "debug.log")
             set_debug_log_file(debug_log_path)
         from dashboard.display import debug as _debug_fn
+
         _debug_fn(f"Debug mode {'ENABLED' if enabled else 'DISABLED'} via API")
         return {"enabled": config_settings.DEBUG}
 
@@ -1492,7 +1655,7 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
                 total = len(all_lines)
                 # Most-recent-first, paginated
                 reversed_lines = [line.rstrip("\n") for line in reversed(all_lines)]
-                page = reversed_lines[offset:offset + limit]
+                page = reversed_lines[offset : offset + limit]
                 return page, total
 
             def _read_tail():
@@ -1517,7 +1680,7 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
 
                 total = len(lines)
                 reversed_lines = list(reversed(lines))
-                page = reversed_lines[offset:offset + limit]
+                page = reversed_lines[offset : offset + limit]
                 return page, total
 
             if file_size <= MAX_FULL_READ:
@@ -1543,6 +1706,7 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
                 with open(debug_log_path, "w", encoding="utf-8") as f:
                     f.truncate(0)
             from dashboard.display import debug as _debug_fn
+
             _debug_fn("Debug log cleared via API")
             return {"status": "ok", "message": "Debug log cleared."}
         except Exception as e:
@@ -1577,8 +1741,11 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
             finally:
                 await manager.unsubscribe(queue)
 
-        return StreamingResponse(event_generator(), media_type="text/event-stream",
-                                 headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
+        return StreamingResponse(
+            event_generator(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+        )
 
     # ── Quota endpoints ──
 
@@ -1594,6 +1761,7 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
         total requests, tokens, and success/failure counts.
         Also calculates quota reset times per IP.
         """
+
         def _query():
             where = "WHERE timestamp >= strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?)"
             params = [f"-{days} days"]
@@ -1614,9 +1782,13 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
         by_ip = {}
         timeline = []
         for r in rows:
-            ts, paid, free, key, ws, status, tok_in, tok_out, dur, ip = r if len(r) > 9 else (*r, "")
+            ts, paid, free, key, ws, status, tok_in, tok_out, dur, ip = (
+                r if len(r) > 9 else (*r, "")
+            )
             # By model
-            m = by_model.setdefault(free, {"requests": 0, "tokens_in": 0, "tokens_out": 0, "success": 0, "fail": 0})
+            m = by_model.setdefault(
+                free, {"requests": 0, "tokens_in": 0, "tokens_out": 0, "success": 0, "fail": 0}
+            )
             m["requests"] += 1
             m["tokens_in"] += tok_in or 0
             m["tokens_out"] += tok_out or 0
@@ -1636,11 +1808,20 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
             w["tokens_out"] += tok_out or 0
             # By IP (track quota usage and reset time)
             if ip:
-                ip_data = by_ip.setdefault(ip, {
-                    "requests": 0, "tokens_in": 0, "tokens_out": 0,
-                    "first_seen": ts, "last_seen": ts, "success": 0, "fail": 0,
-                    "reset_at": None, "available": False,
-                })
+                ip_data = by_ip.setdefault(
+                    ip,
+                    {
+                        "requests": 0,
+                        "tokens_in": 0,
+                        "tokens_out": 0,
+                        "first_seen": ts,
+                        "last_seen": ts,
+                        "success": 0,
+                        "fail": 0,
+                        "reset_at": None,
+                        "available": False,
+                    },
+                )
                 ip_data["requests"] += 1
                 ip_data["tokens_in"] += tok_in or 0
                 ip_data["tokens_out"] += tok_out or 0
@@ -1654,10 +1835,19 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
                 if ts < ip_data["first_seen"]:
                     ip_data["first_seen"] = ts
             # Timeline
-            timeline.append({"ts": ts, "model": free, "status": status, "tokens": (tok_in or 0) + (tok_out or 0), "ip": ip})
+            timeline.append(
+                {
+                    "ts": ts,
+                    "model": free,
+                    "status": status,
+                    "tokens": (tok_in or 0) + (tok_out or 0),
+                    "ip": ip,
+                }
+            )
 
         # Calculate reset times for each IP (quota window = 48h from last request)
         from datetime import datetime, timedelta
+
         QUOTA_WINDOW_HOURS = 48
         now = datetime.utcnow()
         for ip_addr, ip_data in by_ip.items():
@@ -1700,11 +1890,13 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
         100 IPs by request count.
         """
         import shared_state
+
         cached = _stats_cache.get("ip_stats")
         if cached is not None:
             return cached
         stats: dict = {}
         try:
+
             def _query_grouped():
                 return conn.execute(
                     "SELECT free_model_ip, COUNT(*) AS total,"
@@ -1735,6 +1927,7 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
 
             rows = await _db_query_sync(_query_grouped)
             id_rows = await _db_query_sync(_query_identity)
+
             # Both stations' _ip_history merged — the newer entry wins
             # (dedup by IP so the free_ip_model table's per-IP rotation data
             # reflects whichever tunnel last served that IP).
@@ -1743,8 +1936,7 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
                 # [plan 18/08 §4] N-station: merge history from EVERY
                 # active station (was mgr1+mgr2 fixed pair); falls back to
                 # the caller's manager when no registry is present.
-                for mgr in (list(getattr(shared_state, "vpn_managers", None) or [])
-                            or [vpn_manager]):
+                for mgr in list(getattr(shared_state, "vpn_managers", None) or []) or [vpn_manager]:
                     if mgr is None:
                         continue
                     for h in mgr._ip_history:
@@ -1781,6 +1973,7 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
     async def get_vpn_status():
         """Get current VPN status, IP, server, and usage stats."""
         import shared_state
+
         managers = getattr(shared_state, "vpn_managers", None) or []
         if managers:
             # [plan 18/08 §4] N-station: refresh every active tunnel so the
@@ -1817,13 +2010,12 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
             # dashboard s'affiche quand ce champ est présent.
             if config_settings.ENV_DIVERGENCE:
                 data["env_divergence"] = [
-                    {"key": k, "file": f, "env": e}
-                    for k, f, e in config_settings.ENV_DIVERGENCE]
+                    {"key": k, "file": f, "env": e} for k, f, e in config_settings.ENV_DIVERGENCE
+                ]
             # [Axe 3.4] config.yaml modifié à la main sans POST dashboard →
             # dirty: le hot-reload est push-only par design, une bannière GUI
             # demande un restart ou une re-push (jamais d'auto-reload).
-            data["config_yaml_dirty"] = (
-                _config_yaml_mtime() != _config_yaml_known_mtime)
+            data["config_yaml_dirty"] = _config_yaml_mtime() != _config_yaml_known_mtime
             # [Axe 3.1] socks5 backend state — the GUI's proxy table + the
             # auto-rotate toggle (never ship passwords).
             data["proxy_mode"] = _vpn_proxy_mode()
@@ -1834,6 +2026,7 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
             # [vivid-hinton P4] geo enrichment for vpn-status
             try:
                 import opencode as _oc
+
                 _dur = getattr(_oc, "_geo_pin_duration", [])
                 _avg = sum(_dur) / len(_dur) if _dur else 0
             except Exception:
@@ -1841,12 +2034,16 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
             data["geo"] = {
                 "enabled": bool(getattr(config_settings, "GEO_ENABLED", False)),
                 "version": int(getattr(config_settings, "GEO_VERSION", 1) or 1),
-                "block_total": int(getattr(_oc, "_geo_block_total", 0)) if '_oc' in locals() else 0,
+                "block_total": int(getattr(_oc, "_geo_block_total", 0)) if "_oc" in locals() else 0,
                 "pin_latency_avg_ms": round(_avg, 1),
-                "pin_latency_p95_ms": round(sorted(_dur)[int(len(_dur)*0.95)] if _dur else 0, 1),
-                "queue_depth": len(getattr(_oc, "_geo_breaker", {})) if '_oc' in locals() else 0,
-                "allow_direct_when_compatible": bool(getattr(config_settings, "GEO_ALLOW_DIRECT_WHEN_COMPATIBLE", True)),
-                "geo_allow_direct": bool(getattr(config_settings, "GEO_ALLOW_DIRECT_WHEN_COMPATIBLE", True)),
+                "pin_latency_p95_ms": round(sorted(_dur)[int(len(_dur) * 0.95)] if _dur else 0, 1),
+                "queue_depth": len(getattr(_oc, "_geo_breaker", {})) if "_oc" in locals() else 0,
+                "allow_direct_when_compatible": bool(
+                    getattr(config_settings, "GEO_ALLOW_DIRECT_WHEN_COMPATIBLE", True)
+                ),
+                "geo_allow_direct": bool(
+                    getattr(config_settings, "GEO_ALLOW_DIRECT_WHEN_COMPATIBLE", True)
+                ),
             }
             # [Axe C] geo_strict_union: union of all effective_allowed countries
             # across all geo-enabled routes — lets the GUI show which countries
@@ -1922,6 +2119,7 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
     async def get_vpn_config():
         """Get current VPN configuration."""
         import shared_state
+
         if shared_state.vpn_manager:
             return shared_state.vpn_manager.get_config()
         return {"enabled": False, "servers": [], "auth_file": "", "protocol": "udp"}
@@ -1931,6 +2129,7 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
         """[plan 18/08 §3d] VPN technology selector state — per-station
         effective stack, key presence, reliability counters, flip journal."""
         import shared_state
+
         # [plan 18/08 §4] N-station: one entry per active station (was a
         # fixed mgr1+mgr2 pair).
         info = {"stations": {}}
@@ -1945,7 +2144,7 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
         if err:
             return err
         import shared_state
-        import os
+
         body = await request.json()
 
         # Handle credentials — [24] write the single source gluetun actually
@@ -1968,6 +2167,7 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
             if isinstance(_fmm, dict):
                 try:
                     from config import settings as _st
+
                     _st.FREE_MODEL_MAP.clear()
                     _st.FREE_MODEL_MAP.update(_fmm)
                     _st._yaml_data["free_model_map"] = dict(_fmm)
@@ -2014,12 +2214,15 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
                 if not (1 <= _new_n <= 10):
                     return JSONResponse(
                         status_code=400,
-                        content={"error": "station_count must be an integer "
-                                         f"in [1,10], got {_raw_n!r}"})
+                        content={
+                            "error": f"station_count must be an integer in [1,10], got {_raw_n!r}"
+                        },
+                    )
                 body.pop("station_count")  # consumed — never fanned out
                 if _new_n != len(managers):
                     try:
                         from opencode import _apply_station_count
+
                         await _apply_station_count(_new_n)
                     except Exception as e:
                         _debug(f"  [vpn] station_count hot-reload failed: {e}")
@@ -2053,13 +2256,14 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
             if "vpn_stack" in body:
                 _stack_ok = False
                 try:
-                    _stack_res = await managers[0].set_stack(
-                        str(body["vpn_stack"]))
+                    _stack_res = await managers[0].set_stack(str(body["vpn_stack"]))
                     _stack_ok = bool(_stack_res.get("ok"))
                     if _stack_ok:
                         _persist_vpn_config({"vpn_stack": str(body["vpn_stack"])})
                     else:
-                        _debug(f"  [vpn] set_stack refused: {_stack_res.get('error')} — config.yaml keeps the previous stack")
+                        _debug(
+                            f"  [vpn] set_stack refused: {_stack_res.get('error')} — config.yaml keeps the previous stack"
+                        )
                 except Exception as e:
                     _debug(f"  [vpn] set_stack failed: {e}")
                 # only on success — a refused flip must not desync the other
@@ -2082,6 +2286,7 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
         if err:
             return err
         import shared_state
+
         body = await request.json()
         enabled = body.get("enabled", True)
         if shared_state.vpn_manager:
@@ -2098,18 +2303,25 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
         if err:
             return err
         import shared_state
+
         if not shared_state.vpn_manager:
             return {"error": "VPN manager not initialized"}
 
         await shared_state.vpn_manager.refresh_status()
         if shared_state.vpn_manager.status == "connected":
-            return {"ok": True, "ip": shared_state.vpn_manager.current_ip,
-                    "server": shared_state.vpn_manager.current_server}
+            return {
+                "ok": True,
+                "ip": shared_state.vpn_manager.current_ip,
+                "server": shared_state.vpn_manager.current_server,
+            }
 
         try:
             await shared_state.vpn_manager.connect()
-            return {"ok": True, "ip": shared_state.vpn_manager.current_ip,
-                    "server": shared_state.vpn_manager.current_server}
+            return {
+                "ok": True,
+                "ip": shared_state.vpn_manager.current_ip,
+                "server": shared_state.vpn_manager.current_server,
+            }
         except Exception as e:
             return {"error": str(e)}
 
@@ -2120,6 +2332,7 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
         if err:
             return err
         import shared_state
+
         if not shared_state.vpn_manager:
             return {"error": "VPN manager not initialized"}
         await shared_state.vpn_manager.disconnect()
@@ -2132,6 +2345,7 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
         if err:
             return err
         import shared_state
+
         if not shared_state.vpn_manager:
             return {"error": "VPN manager not initialized"}
         result = await shared_state.vpn_manager.health_check()
@@ -2148,6 +2362,7 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
         if err:
             return err
         import shared_state
+
         managers = getattr(shared_state, "vpn_managers", None) or []
         if not managers:
             return {"error": "VPN manager not initialized"}
@@ -2163,8 +2378,9 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
         if station:
             # [plan 18/08 §4] N-station: 1-indexed lookup in the registry.
             if not (1 <= station <= len(managers)):
-                return {"error": f"station {station} not configured "
-                                f"(station_count={len(managers)})"}
+                return {
+                    "error": f"station {station} not configured (station_count={len(managers)})"
+                }
             mgr = managers[station - 1]
         else:
             # 0 → the station the pool currently routes through.
@@ -2202,13 +2418,17 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
         if err:
             return err
         import shared_state
+
         if not shared_state.vpn_manager:
             return {"error": "VPN manager not initialized"}
         try:
             available = await shared_state.vpn_manager.check_update()
             if not available:
-                return {"ok": False, "error": "no update available",
-                        "update": shared_state.vpn_manager.get_status()["update"]}
+                return {
+                    "ok": False,
+                    "error": "no update available",
+                    "update": shared_state.vpn_manager.get_status()["update"],
+                }
             # check_opportune=True ([21]): the manual endpoint must not cut
             # live free streams either — the check runs inside the lock.
             result = await shared_state.vpn_manager.apply_update(check_opportune=True)
@@ -2224,6 +2444,7 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
         if err:
             return err
         import os
+
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         cred_path = os.path.join(root, "credentials.env")
         exists = os.path.exists(cred_path) and os.path.getsize(cred_path) > 0
@@ -2237,7 +2458,10 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
                             break
             except Exception:
                 pass
-        return {"exists": exists, "username_preview": username_saved[:4] + "****" if username_saved else ""}
+        return {
+            "exists": exists,
+            "username_preview": username_saved[:4] + "****" if username_saved else "",
+        }
 
     @app.post("/api/vpn/credentials")
     async def save_vpn_credentials(request: Request):
@@ -2253,7 +2477,10 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
             return {"error": "Username and password required"}
 
         _write_credentials_env(username, password)
-        return {"ok": True, "note": "restart the VPN container (docker compose up -d) for gluetun to pick up new credentials"}
+        return {
+            "ok": True,
+            "note": "restart the VPN container (docker compose up -d) for gluetun to pick up new credentials",
+        }
 
     @app.post("/api/vpn/save-state")
     async def save_vpn_state(request: Request):
@@ -2262,6 +2489,7 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
         if err:
             return err
         import shared_state
+
         if shared_state.vpn_manager:
             shared_state.vpn_manager.save_state()
             return {"ok": True}
@@ -2274,12 +2502,11 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
         if err:
             return err
         import shared_state
-        import json
+
         if not shared_state.vpn_manager:
             return {"error": "VPN manager not initialized"}
 
         config = shared_state.vpn_manager.get_config()
-        status = shared_state.vpn_manager.get_status()
         state = {
             "ip_history": shared_state.vpn_manager._ip_history,
             "total_switches": shared_state.vpn_manager._total_switches,
@@ -2300,6 +2527,7 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
         if err:
             return err
         import shared_state
+
         body = await request.json()
 
         if "config" in body:
@@ -2328,8 +2556,7 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
         """Static SOCKS5 proxy list for the GUI (app.js socks5 GET →
         ``{proxies, rotate}``; proxies never carry passwords)."""
         pool = _dashboard_pool()
-        return {"proxies": _socks5_payload(pool),
-                "rotate": _socks5_auto_rotate_state()}
+        return {"proxies": _socks5_payload(pool), "rotate": _socks5_auto_rotate_state()}
 
     @app.post("/api/vpn/socks5")
     async def add_vpn_socks5(request: Request):
@@ -2345,13 +2572,15 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
         except (TypeError, ValueError):
             return {"error": f"port invalide: {body.get('port')!r}"}
         rows = list(getattr(pool, "_socks5_proxies", None) or [])
-        rows.append({
-            "host": str(body.get("host", "") or ""),
-            "port": port,
-            "enabled": True,
-            "username": body.get("username"),
-            "password": body.get("password"),
-        })
+        rows.append(
+            {
+                "host": str(body.get("host", "") or ""),
+                "port": port,
+                "enabled": True,
+                "username": body.get("username"),
+                "password": body.get("password"),
+            }
+        )
         err = _apply_socks5_rows(rows)
         if err:
             return err
@@ -2428,8 +2657,10 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
         if pool is None or not hasattr(pool, "rotate_socks5_now"):
             return {"error": "pool socks5 non disponible"}
         nxt = pool.rotate_socks5_now()
-        return {"ok": nxt is not None,
-                "next": getattr(nxt, "pid", None) if nxt is not None else None}
+        return {
+            "ok": nxt is not None,
+            "next": getattr(nxt, "pid", None) if nxt is not None else None,
+        }
 
     @app.post("/api/vpn/proxy-mode")
     async def set_vpn_proxy_mode(request: Request):
@@ -2486,16 +2717,14 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
         """``{countries}`` — API NordVPN quand use_nordvpn_api, sinon liste
         statique (offline-safe)."""
         cfg = getattr(config_settings, "IP_ROTATION", None) or {}
-        return {"countries": await _nordvpn_countries(
-            bool(cfg.get("use_nordvpn_api")))}
+        return {"countries": await _nordvpn_countries(bool(cfg.get("use_nordvpn_api")))}
 
     @app.get("/api/vpn/countries")
     async def vpn_countries_ep():
         """``{countries}`` — même source que nordvpn-countries (app.js
         vpnLoadCountries consomme ``data.countries``)."""
         cfg = getattr(config_settings, "IP_ROTATION", None) or {}
-        return {"countries": await _nordvpn_countries(
-            bool(cfg.get("use_nordvpn_api")))}
+        return {"countries": await _nordvpn_countries(bool(cfg.get("use_nordvpn_api")))}
 
     @app.post("/api/vpn/discover-and-add")
     async def vpn_discover_and_add(request: Request):
@@ -2508,7 +2737,6 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
             return err
         body = await request.json()
         code = str(body.get("country") or "").strip().upper()
-        group = str(body.get("group") or "").strip()
         try:
             limit = max(1, min(50, int(body.get("limit") or 5)))
         except (TypeError, ValueError):
@@ -2564,18 +2792,16 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
         NordVPN app, docker, WSL2, OpenVPN natif, recommandation. Tout
         l'I/O externe est dans les helpers isolés (monkeypatchables)."""
         import shutil
-        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
         managers = _dashboard_managers()
         mode = _vpn_proxy_mode()
         # État agrégé des stations actives.
         status, ip = "not_configured", None
         if managers:
-            connected = [m for m in managers
-                         if getattr(m, "status", None) == "connected"]
+            connected = [m for m in managers if getattr(m, "status", None) == "connected"]
             if connected:
                 status = "connected"
-            elif any(getattr(m, "status", None) in ("connecting",
-                                                    "rotating") for m in managers):
+            elif any(getattr(m, "status", None) in ("connecting", "rotating") for m in managers):
                 status = "connecting"
             elif managers:
                 status = "not_connected"
@@ -2593,10 +2819,14 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
         wsl2 = {"available": False}
         try:
             r = await asyncio.to_thread(
-                lambda: subprocess.run(["wsl", "--status"],
-                                       capture_output=True, text=True,
-                                       timeout=5,
-                                       creationflags=_CREATE_NO_WINDOW))
+                lambda: subprocess.run(
+                    ["wsl", "--status"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                    creationflags=_CREATE_NO_WINDOW,
+                )
+            )
             wsl2["available"] = r.returncode == 0
         except Exception:
             pass
@@ -2625,8 +2855,7 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
             "wsl2": wsl2,
             "openvpn": openvpn,
             "recommendation": rec,
-            "config_yaml_dirty": (
-                _config_yaml_mtime() != _config_yaml_known_mtime),
+            "config_yaml_dirty": (_config_yaml_mtime() != _config_yaml_known_mtime),
             "config_yaml_mtime": _config_yaml_mtime(),
             "config_yaml_known": _config_yaml_known_mtime,
             "compose_config": await asyncio.to_thread(_docker_compose_config),
@@ -2657,17 +2886,28 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
         return {"ok": True, **(_traffic_capture.status())}
 
     @app.get("/api/traffic/frames")
-    async def get_traffic_frames(request: Request, limit: int = 200, offset: int = 0,
-                                 method: str = None, path: str = None,
-                                 status: int = None, aborted: bool = None,
-                                 since: float = None):
+    async def get_traffic_frames(
+        request: Request,
+        limit: int = 200,
+        offset: int = 0,
+        method: str = None,
+        path: str = None,
+        status: int = None,
+        aborted: bool = None,
+        since: float = None,
+    ):
         err = _check_dashboard_token(request)
         if err:
             return err
-        frames = _traffic_capture.frames(limit=limit, offset=offset,
-                                         method=method, path=path,
-                                         status=status, aborted=aborted,
-                                         since=since)
+        frames = _traffic_capture.frames(
+            limit=limit,
+            offset=offset,
+            method=method,
+            path=path,
+            status=status,
+            aborted=aborted,
+            since=since,
+        )
         return {"frames": frames, "total": len(frames), "status": _traffic_capture.status()}
 
     @app.get("/api/traffic/frames/{frame_id}")
@@ -2699,10 +2939,21 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
     # ── Stats & history ──
 
     @app.get("/api/history")
-    async def get_history(from_date: str = None, to_date: str = None, limit: int = 20, offset: int = 0,
-                          status: str = None, model: str = None, original_model: str = None,
-                          account: str = None, tool: str = None, search: str = None):
-        where, params = _build_where(from_date, to_date, status, model, original_model, account, tool, search)
+    async def get_history(
+        from_date: str = None,
+        to_date: str = None,
+        limit: int = 20,
+        offset: int = 0,
+        status: str = None,
+        model: str = None,
+        original_model: str = None,
+        account: str = None,
+        tool: str = None,
+        search: str = None,
+    ):
+        where, params = _build_where(
+            from_date, to_date, status, model, original_model, account, tool, search
+        )
         query = "SELECT * FROM requests " + where + " ORDER BY timestamp DESC LIMIT ? OFFSET ?"
         params.extend([limit, offset])
 
@@ -2735,16 +2986,22 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
                     "client_ip": r["client_ip"] if "client_ip" in r.keys() else None,
                     "account_alias": r["account_alias"] if "account_alias" in r.keys() else None,
                     "is_free_model": "-free" in (r["model"] or ""),
-                    "free_ip": r["free_model_ip"] if "free_model_ip" in r.keys() and r["free_model_ip"] else "",
-                    "tools": json.loads(r["tools"]) if "tools" in r.keys() and r["tools"] and r["tools"] != "[]" else [],
-                    "tools_used": json.loads(r["tools_used"]) if "tools_used" in r.keys() and r["tools_used"] and r["tools_used"] != "[]" else [],
+                    "free_ip": r["free_model_ip"]
+                    if "free_model_ip" in r.keys() and r["free_model_ip"]
+                    else "",
+                    "tools": json.loads(r["tools"])
+                    if "tools" in r.keys() and r["tools"] and r["tools"] != "[]"
+                    else [],
+                    "tools_used": json.loads(r["tools_used"])
+                    if "tools_used" in r.keys() and r["tools_used"] and r["tools_used"] != "[]"
+                    else [],
                 }
                 for r in rows
             ],
             "total": total_count,
             "page": offset // limit + 1,
             "per_page": limit,
-            "has_more": offset + limit < total_count
+            "has_more": offset + limit < total_count,
         }
 
     @app.get("/api/requests/{req_id}")
@@ -2786,27 +3043,50 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
             "thinking": row["thinking"] if "thinking" in row.keys() else None,
             "effort": row["effort"] if "effort" in row.keys() else None,
             "client_ip": row["client_ip"] if "client_ip" in row.keys() else None,
-            "client_user_agent": row["client_user_agent"] if "client_user_agent" in row.keys() else None,
+            "client_user_agent": row["client_user_agent"]
+            if "client_user_agent" in row.keys()
+            else None,
             "account_alias": row["account_alias"] if "account_alias" in row.keys() else None,
             "tools": _parse_json_field(row["tools"]) if "tools" in row.keys() else [],
-            "tools_used": _parse_json_field(row["tools_used"]) if "tools_used" in row.keys() else [],
-            "request_body": _parse_json_field(row["request_body"]) if "request_body" in row.keys() else None,
-            "response_body": _parse_json_field(row["response_body"]) if "response_body" in row.keys() else None,
+            "tools_used": _parse_json_field(row["tools_used"])
+            if "tools_used" in row.keys()
+            else [],
+            "request_body": _parse_json_field(row["request_body"])
+            if "request_body" in row.keys()
+            else None,
+            "response_body": _parse_json_field(row["response_body"])
+            if "response_body" in row.keys()
+            else None,
         }
 
     @app.get("/api/history/filters")
     async def get_history_filters():
         """Return unique values for history filter dropdowns."""
+
         def _query_filters():
-            models = [r[0] for r in conn.execute(
-                "SELECT DISTINCT model FROM requests WHERE model IS NOT NULL ORDER BY model").fetchall()]
-            orig_models = [r[0] for r in conn.execute(
-                "SELECT DISTINCT original_model FROM requests WHERE original_model IS NOT NULL ORDER BY original_model").fetchall()]
-            accounts = [r[0] for r in conn.execute(
-                "SELECT DISTINCT account_alias FROM requests WHERE account_alias IS NOT NULL ORDER BY account_alias").fetchall()]
+            models = [
+                r[0]
+                for r in conn.execute(
+                    "SELECT DISTINCT model FROM requests WHERE model IS NOT NULL ORDER BY model"
+                ).fetchall()
+            ]
+            orig_models = [
+                r[0]
+                for r in conn.execute(
+                    "SELECT DISTINCT original_model FROM requests WHERE original_model IS NOT NULL ORDER BY original_model"
+                ).fetchall()
+            ]
+            accounts = [
+                r[0]
+                for r in conn.execute(
+                    "SELECT DISTINCT account_alias FROM requests WHERE account_alias IS NOT NULL ORDER BY account_alias"
+                ).fetchall()
+            ]
             # Extract all unique tool names from tools_used JSON arrays
             tool_set = set()
-            for row in conn.execute("SELECT tools_used FROM requests WHERE tools_used IS NOT NULL AND tools_used != '[]'"):
+            for row in conn.execute(
+                "SELECT tools_used FROM requests WHERE tools_used IS NOT NULL AND tools_used != '[]'"
+            ):
                 try:
                     tools = json.loads(row[0])
                     if isinstance(tools, list):
@@ -2819,6 +3099,7 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
                 "accounts": accounts,
                 "tools_used": sorted(tool_set),
             }
+
         return await _db_query_sync(_query_filters)
 
     @app.delete("/api/history")
@@ -2838,9 +3119,14 @@ def register_dashboard(app, static_dir, conn, server_manager_getter=None, token_
                 conn.execute("DELETE FROM requests WHERE model = ?", (model,))
                 if token_usage and model in token_usage:
                     with token_lock:
-                        token_usage[model]["input"] = token_usage[model]["output"] = token_usage[model]["cache"] = 0
+                        token_usage[model]["input"] = token_usage[model]["output"] = token_usage[
+                            model
+                        ]["cache"] = 0
             elif before:
-                conn.execute("DELETE FROM requests WHERE timestamp < ?", (_normalize_date_bound(before, end_of_day=True),))
+                conn.execute(
+                    "DELETE FROM requests WHERE timestamp < ?",
+                    (_normalize_date_bound(before, end_of_day=True),),
+                )
                 # Recalculate all counters from remaining rows
                 if token_usage:
                     rows = conn.execute(

@@ -26,15 +26,43 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse as StarletteJSONResponse
 from starlette.requests import ClientDisconnect
 
-from config import API_KEY, PROXY, MODELS, ROUTES, get_model_config, HOST, PORT, WEB_PORT, DISABLE_MAPPING, API_KEYS, API_KEY_ROUTING, CUSTOM_ROUTES, maybe_reload_custom_routes, CACHE_MIN_PROMPT_SIZE, DEBUG, yaml_get, API_BASE_FREE, FREE_MODEL_MAP, IP_ROTATION
+from config import (
+    API_KEY,
+    PROXY,
+    MODELS,
+    ROUTES,
+    get_model_config,
+    HOST,
+    PORT,
+    WEB_PORT,
+    DISABLE_MAPPING,
+    API_KEYS,
+    API_KEY_ROUTING,
+    CUSTOM_ROUTES,
+    maybe_reload_custom_routes,
+    CACHE_MIN_PROMPT_SIZE,
+    DEBUG,
+    yaml_get,
+    API_BASE_FREE,
+    FREE_MODEL_MAP,
+    IP_ROTATION,
+)
 import config.settings as _cfg_settings
+
 # P2 geo: dynamic GEO_ENABLED via settings (hot-reload), base resolver alias
-from config.settings import GEO_ENABLED as _GEO_ENABLED_STATIC, GEO_VERSION, GEO_ALLOW_DIRECT_WHEN_COMPATIBLE as _GEO_ALLOW_DIRECT_COMPAT  # static snapshot
+from config.settings import (
+    GEO_ENABLED as _GEO_ENABLED_STATIC,
+    GEO_VERSION,
+    GEO_ALLOW_DIRECT_WHEN_COMPATIBLE as _GEO_ALLOW_DIRECT_COMPAT,
+)  # static snapshot
+
 try:
     from vpn_manager import _normalize_country as _vpn_normalize_country
 except ImportError:
+
     def _vpn_normalize_country(n):  # fallback never invents beyond title()
         return n.strip().replace("_", " ").strip().title()
+
 
 import itertools
 import email.utils
@@ -46,8 +74,10 @@ _key_cycle_keys = []
 _key_failover_index = 0
 _key_cycle_lock = threading.Lock()
 
+
 def _get_enabled_keys() -> list[dict]:
     return [k for k in API_KEYS if k.get("enabled", True)]
+
 
 def _env_key_or_raise() -> dict:
     """Return the .env fallback key, or raise AllKeysPausedError if paused.
@@ -59,9 +89,12 @@ def _env_key_or_raise() -> dict:
     """
     if _key_pauser.is_paused(API_KEY):
         remaining = _key_pauser.remaining(API_KEY)
-        _debug(f"  [apikey] .env fallback key paused ({remaining:.0f}s) — raising AllKeysPausedError")
+        _debug(
+            f"  [apikey] .env fallback key paused ({remaining:.0f}s) — raising AllKeysPausedError"
+        )
         raise AllKeysPausedError(remaining if remaining > 0 else 1)
     return {"api_key": API_KEY}
+
 
 def get_next_api_key() -> dict:
     global _key_cycle, _key_cycle_keys, _key_failover_index
@@ -78,31 +111,31 @@ def get_next_api_key() -> dict:
 
     if not available:
         # All paused — raise with shortest wait time instead of reusing a paused key
-        min_rem = min(
-            (_key_pauser.remaining(k.get("api_key", "")) for k in enabled),
-            default=0
-        )
+        min_rem = min((_key_pauser.remaining(k.get("api_key", "")) for k in enabled), default=0)
         if min_rem > 0:
-            _debug(f"  [apikey] ALL keys paused, min remaining={min_rem:.0f}s — raising AllKeysPausedError")
+            _debug(
+                f"  [apikey] ALL keys paused, min remaining={min_rem:.0f}s — raising AllKeysPausedError"
+            )
             raise AllKeysPausedError(min_rem)
         _debug(f"  [apikey] no keys available, falling back to .env key")
         return _env_key_or_raise()
 
     if len(available) == 1:
-        _debug(f"  [apikey] single available key: alias={available[0].get('alias','?')}")
+        _debug(f"  [apikey] single available key: alias={available[0].get('alias', '?')}")
         return available[0]
 
     if API_KEY_ROUTING == "failover":
         for i in range(len(API_KEYS)):
             idx = (_key_failover_index + i) % len(API_KEYS)
-            if API_KEYS[idx].get("enabled", True) and not _key_pauser.is_paused(API_KEYS[idx].get("api_key", "")):
-                _debug(f"  [apikey] failover selected alias={API_KEYS[idx].get('alias','?')} (idx={idx})")
+            if API_KEYS[idx].get("enabled", True) and not _key_pauser.is_paused(
+                API_KEYS[idx].get("api_key", "")
+            ):
+                _debug(
+                    f"  [apikey] failover selected alias={API_KEYS[idx].get('alias', '?')} (idx={idx})"
+                )
                 return API_KEYS[idx]
         # Fallback to shortest-paused
-        min_rem = min(
-            (_key_pauser.remaining(k.get("api_key", "")) for k in enabled),
-            default=0
-        )
+        min_rem = min((_key_pauser.remaining(k.get("api_key", "")) for k in enabled), default=0)
         if min_rem > 0:
             raise AllKeysPausedError(min_rem)
         _debug(f"  [apikey] failover exhausted, falling back to .env key")
@@ -114,20 +147,24 @@ def get_next_api_key() -> dict:
         if _key_cycle is None or _key_cycle_keys != current_ids:
             _key_cycle = itertools.cycle(available)
             _key_cycle_keys = current_ids
-            _debug(f"  [apikey] round-robin cycle rebuilt: {len(available)} available keys (filtered from {len(enabled)} enabled)")
+            _debug(
+                f"  [apikey] round-robin cycle rebuilt: {len(available)} available keys (filtered from {len(enabled)} enabled)"
+            )
         selected = next(_key_cycle)
-        _debug(f"  [apikey] round-robin selected alias={selected.get('alias','?')}")
+        _debug(f"  [apikey] round-robin selected alias={selected.get('alias', '?')}")
         return selected
+
 
 def _find_alternative_key(failed_key: str) -> dict | None:
     """Return the first enabled, non-paused key different from failed_key, or None."""
     for k in API_KEYS:
         if k.get("api_key") != failed_key and k.get("enabled", True):
             if not _key_pauser.is_paused(k.get("api_key", "")):
-                _debug(f"  [apikey] alternative key found alias={k.get('alias','?')}")
+                _debug(f"  [apikey] alternative key found alias={k.get('alias', '?')}")
                 return k
     _debug(f"  [apikey] no alternative key for {failed_key[:8]}...")
     return None
+
 
 _key_alias_cache: dict[str, str] = {}
 
@@ -135,7 +172,9 @@ _key_alias_cache: dict[str, str] = {}
 def _rebuild_key_cache():
     """Rebuild the API key → alias lookup dict."""
     global _key_alias_cache
-    _key_alias_cache = {k["api_key"]: k.get("alias", "") or "" for k in API_KEYS if k.get("api_key")}
+    _key_alias_cache = {
+        k["api_key"]: k.get("alias", "") or "" for k in API_KEYS if k.get("api_key")
+    }
 
 
 def _alias_for_key(api_key: str) -> str:
@@ -145,19 +184,22 @@ def _alias_for_key(api_key: str) -> str:
 
 # ── Key pause tracker ─────────────────────────────────────────
 
+
 class _KeyPauser:
     """Per-key rate limit pause tracker. Pauses a key when upstream returns 429.
 
     Persists pause state to logs/paused_keys.yaml so pauses survive reboots.
     """
 
-    _PAUSED_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "paused_keys.yaml")
+    _PAUSED_FILE = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "logs", "paused_keys.yaml"
+    )
 
     def __init__(self, max_pause: float = None):
         if max_pause is None:
             max_pause = float(yaml_get("key_pause", "max_pause", 600))
-        self._paused: dict[str, float] = {}   # key_prefix -> monotonic expiry
-        self._reasons: dict[str, str] = {}    # key_prefix -> reason string
+        self._paused: dict[str, float] = {}  # key_prefix -> monotonic expiry
+        self._reasons: dict[str, str] = {}  # key_prefix -> reason string
         self._lock = threading.Lock()
         self._max_pause = max_pause
 
@@ -185,10 +227,12 @@ class _KeyPauser:
             # Offload file I/O to thread pool (non-blocking)
             payload = {"paused_keys": data}
             file_path = self._PAUSED_FILE
+
             def _write_yaml():
                 os.makedirs(os.path.dirname(file_path), exist_ok=True)
                 with open(file_path, "w", encoding="utf-8") as f:
                     yaml.dump(payload, f, default_flow_style=False)
+
             try:
                 loop = asyncio.get_running_loop()
                 loop.run_in_executor(None, _write_yaml)
@@ -251,7 +295,9 @@ class _KeyPauser:
                 self._reasons[prefix] = reason
                 self._save()
         alias = _alias_for_key(api_key)
-        _debug(f"  [keypauser] PAUSED alias={alias} prefix={prefix} for {duration:.0f}s reason={reason}")
+        _debug(
+            f"  [keypauser] PAUSED alias={alias} prefix={prefix} for {duration:.0f}s reason={reason}"
+        )
         _log(f"  KEY PAUSED: alias={alias} for {duration:.0f}s ({reason})")
 
     def is_paused(self, api_key: str) -> bool:
@@ -366,6 +412,7 @@ async def _pause_key_for_quota_reset(api_key: str):
     """
     try:
         from dashboard.quota import fetch_quotas, get_configured_workspaces
+
         # Find workspace for this key
         ws_entry = None
         for k in API_KEYS:
@@ -388,10 +435,15 @@ async def _pause_key_for_quota_reset(api_key: str):
                 alias = _alias_for_key(api_key)
                 re_enable_at = time.time() + reset_sec
                 re_enable_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(re_enable_at))
-                _key_pauser.pause_key(api_key, reset_sec,
-                                      f"quota {window} {usage:.0f}% → réactivation {re_enable_str}",
-                                      quota_based=True)
-                _log(f"  QUOTA {window.upper()} AT {usage:.0f}% — key {alias} paused until {re_enable_str} (in {reset_sec:.0f}s)")
+                _key_pauser.pause_key(
+                    api_key,
+                    reset_sec,
+                    f"quota {window} {usage:.0f}% → réactivation {re_enable_str}",
+                    quota_based=True,
+                )
+                _log(
+                    f"  QUOTA {window.upper()} AT {usage:.0f}% — key {alias} paused until {re_enable_str} (in {reset_sec:.0f}s)"
+                )
                 return
 
         # No quota at 100% — use default pause
@@ -412,6 +464,7 @@ def _key_from_headers(headers: dict | None, protocol: str) -> str:
         return headers.get("x-api-key", "")
     return headers.get("Authorization", "").replace("Bearer ", "")
 
+
 def _workspace_for_key(api_key: str) -> str:
     """Look up workspace ID for an API key."""
     for k in API_KEYS:
@@ -419,18 +472,23 @@ def _workspace_for_key(api_key: str) -> str:
             return k.get("go_workspace_id", "unknown")
     return "unknown"
 
+
 def _get_auth_headers(protocol: str, entry: dict | None = None) -> dict:
     if entry is None:
         entry = get_next_api_key()
     ak = entry.get("api_key", API_KEY)
     if protocol == "anthropic":
-        return {"x-api-key": ak, "Content-Type": "application/json",
-                "anthropic-version": "2023-06-01"}
+        return {
+            "x-api-key": ak,
+            "Content-Type": "application/json",
+            "anthropic-version": "2023-06-01",
+        }
     return {"Authorization": f"Bearer {ak}", "Content-Type": "application/json"}
 
 
 try:
     import tiktoken
+
     _encoding = tiktoken.get_encoding("cl100k_base")
 except Exception:
     _encoding = None
@@ -438,13 +496,24 @@ except Exception:
 # Fast monotonic ID generator — avoids /dev/urandom syscall of uuid4()
 # Used for request IDs (logging/DB keys only, not security-critical)
 _id_counter = itertools.count()
+
+
 def _fast_id(prefix: str = "id") -> str:
     """Generate a fast, unique-enough ID within this process. ~0.01ms vs ~0.5ms for uuid4."""
     return f"{prefix}_{time.monotonic_ns():x}-{next(_id_counter):x}"
 
+
 from dashboard import register_dashboard
 from dashboard import start_quota_fetcher
-from dashboard.display import log as _log, debug as _debug, set_debug_log_file, attach_module_logger, attach_panel_logger, RichLogHandler, run_terminal_loop
+from dashboard.display import (
+    log as _log,
+    debug as _debug,
+    set_debug_log_file,
+    attach_module_logger,
+    attach_panel_logger,
+    RichLogHandler,
+    run_terminal_loop,
+)
 from dashboard.events import get_event_manager
 
 # Call after all imports are resolved (requires _debug for logging)
@@ -495,18 +564,21 @@ def _truncate_body_for_storage(body: dict, max_chars: int = MAX_BODY_STORAGE) ->
 
     if estimate <= max_chars:
         # Likely fits — do full serialization (single pass)
-        full = json.dumps(body, ensure_ascii=False, separators=(',', ':'))
+        full = json.dumps(body, ensure_ascii=False, separators=(",", ":"))
         if len(full) <= max_chars:
             return full
         # Fell through: full was too big, build truncated version
     # Build truncated version (skip full serialization of large body)
     truncated = {k: v for k, v in body.items() if k != "messages"}
     if messages:
-        truncated["messages"] = messages[:2] + [{"_truncated": True, "original_count": len(messages)}]
-    result = json.dumps(truncated, ensure_ascii=False, separators=(',', ':'))
+        truncated["messages"] = messages[:2] + [
+            {"_truncated": True, "original_count": len(messages)}
+        ]
+    result = json.dumps(truncated, ensure_ascii=False, separators=(",", ":"))
     if len(result) > max_chars:
         result = result[:max_chars]
     return result
+
 
 # SQLite setup — synchronous connection, all DB ops run in thread pool
 _db_path = os.path.join(LOG_DIR, "requests.db")
@@ -514,10 +586,12 @@ _conn = sqlite3.connect(_db_path, check_same_thread=False)
 _conn.row_factory = sqlite3.Row
 _conn.execute("PRAGMA journal_mode=WAL")
 _conn.execute(f"PRAGMA busy_timeout={yaml_get('database', 'busy_timeout', 5000)}")
-_conn.execute("PRAGMA synchronous=NORMAL")       # WAL+NORMAL: safe crash-resilient, 50-90% fewer fsyncs
+_conn.execute("PRAGMA synchronous=NORMAL")  # WAL+NORMAL: safe crash-resilient, 50-90% fewer fsyncs
 _conn.execute(f"PRAGMA cache_size=-{yaml_get('database', 'cache_size', 64000)}")  # page cache
-_conn.execute("PRAGMA temp_store=MEMORY")        # temp tables in RAM
-_conn.execute(f"PRAGMA mmap_size={yaml_get('database', 'mmap_size', 268435456)}")  # memory-mapped I/O
+_conn.execute("PRAGMA temp_store=MEMORY")  # temp tables in RAM
+_conn.execute(
+    f"PRAGMA mmap_size={yaml_get('database', 'mmap_size', 268435456)}"
+)  # memory-mapped I/O
 _conn.execute("""
     CREATE TABLE IF NOT EXISTS requests (
         id TEXT PRIMARY KEY,
@@ -542,7 +616,23 @@ _conn.execute("CREATE INDEX IF NOT EXISTS idx_success ON requests(success)")
 _conn.execute("CREATE INDEX IF NOT EXISTS idx_account ON requests(account_alias)")
 _conn.execute("CREATE INDEX IF NOT EXISTS idx_ts_model ON requests(timestamp, model)")
 _conn.execute("CREATE INDEX IF NOT EXISTS idx_free_ip ON requests(free_model_ip)")
-for col, default in [("protocol", "NULL"), ("is_stream", "0"), ("thinking", "NULL"), ("effort", "NULL"), ("client_ip", "NULL"), ("account_alias", "NULL"), ("tools", "NULL"), ("tools_used", "NULL"), ("request_body", "NULL"), ("response_body", "NULL"), ("client_user_agent", "NULL"), ("free_model_ip", "NULL"), ("identity", "NULL"), ("geo_country", "NULL"), ("geo_blocked", "0")]:
+for col, default in [
+    ("protocol", "NULL"),
+    ("is_stream", "0"),
+    ("thinking", "NULL"),
+    ("effort", "NULL"),
+    ("client_ip", "NULL"),
+    ("account_alias", "NULL"),
+    ("tools", "NULL"),
+    ("tools_used", "NULL"),
+    ("request_body", "NULL"),
+    ("response_body", "NULL"),
+    ("client_user_agent", "NULL"),
+    ("free_model_ip", "NULL"),
+    ("identity", "NULL"),
+    ("geo_country", "NULL"),
+    ("geo_blocked", "0"),
+]:
     try:
         _conn.execute(f"ALTER TABLE requests ADD COLUMN {col} TEXT DEFAULT {default}")
     except Exception:
@@ -553,9 +643,13 @@ _debug(f"  [db] SQLite connection established: {_db_path}")
 # [30] Canary: mixed naive/UTC timestamps break ORDER BY timestamp DESC (BINARY
 # collation) — warn the operator that scripts/migrate_timestamps_utc.py is pending.
 try:
-    _naive = _conn.execute("SELECT COUNT(*) FROM requests WHERE timestamp NOT LIKE '%Z'").fetchone()[0]
+    _naive = _conn.execute(
+        "SELECT COUNT(*) FROM requests WHERE timestamp NOT LIKE '%Z'"
+    ).fetchone()[0]
     if _naive:
-        _log(f"  WARNING: {_naive} requests row(s) with naive timestamps (mixed local/UTC) — run scripts/migrate_timestamps_utc.py")
+        _log(
+            f"  WARNING: {_naive} requests row(s) with naive timestamps (mixed local/UTC) — run scripts/migrate_timestamps_utc.py"
+        )
 except Exception:
     pass
 
@@ -589,8 +683,8 @@ _debug(f"  [db] free_model_usage table ready")
 
 _db_pending_inserts = 0
 _db_last_commit = time.monotonic()
-_DB_COMMIT_INTERVAL = yaml_get("database", "commit_interval", 5)   # seconds between periodic commits
-_DB_COMMIT_BATCH = yaml_get("database", "commit_batch", 10)       # force commit after N inserts
+_DB_COMMIT_INTERVAL = yaml_get("database", "commit_interval", 5)  # seconds between periodic commits
+_DB_COMMIT_BATCH = yaml_get("database", "commit_batch", 10)  # force commit after N inserts
 _db_commit_lock = threading.Lock()
 # Ultra-fast async DB queue — single writer, no per-request to_thread
 _db_queue: asyncio.Queue = asyncio.Queue(maxsize=10000)
@@ -598,14 +692,19 @@ _db_writer_task: asyncio.Task | None = None
 
 # Context variable to pass client user-agent from endpoint handlers to _save_request
 # without threading it through every intermediate function call.
-_current_user_agent: contextvars.ContextVar[str] = contextvars.ContextVar('_current_user_agent', default=None)
+_current_user_agent: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "_current_user_agent", default=None
+)
 
 # Context variable carrying the free-channel attempt (egress IP + identity profile)
 # from the two places a free request actually leaves (_try_free_model_first,
 # _open_free_stream) to the leaf _save_request — same pattern as _current_user_agent.
 # Scoped to the asyncio task handling one client request; never leaks between requests.
 # Value: {"ip": str, "identity": str} — identity = profile impersonate (fingerprint).
-_current_free_attempt: contextvars.ContextVar[dict | None] = contextvars.ContextVar('_current_free_attempt', default=None)
+_current_free_attempt: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "_current_free_attempt", default=None
+)
+
 
 def _db_flush():
     """Force a pending commit. Called periodically and before shutdown."""
@@ -665,26 +764,36 @@ def _db_cleanup_old_bodies(retention_days: int = 7, delete_after_days: int = 30)
     """
     try:
         # Phase 1: Delete old rows entirely
-        cutoff_delete = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - delete_after_days * 86400))
+        cutoff_delete = time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - delete_after_days * 86400)
+        )
         cursor = _conn.execute("DELETE FROM requests WHERE timestamp < ?", (cutoff_delete,))
         deleted = cursor.rowcount
-        cursor2 = _conn.execute("DELETE FROM free_model_usage WHERE timestamp < ?", (cutoff_delete,))
+        cursor2 = _conn.execute(
+            "DELETE FROM free_model_usage WHERE timestamp < ?", (cutoff_delete,)
+        )
         deleted2 = cursor2.rowcount
 
         # Phase 2: Nullify bodies for 7-30 day old rows
-        cutoff_null = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - retention_days * 86400))
+        cutoff_null = time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - retention_days * 86400)
+        )
         cursor3 = _conn.execute(
             "UPDATE requests SET request_body = NULL, response_body = NULL "
             "WHERE timestamp < ? AND (request_body IS NOT NULL OR response_body IS NOT NULL)",
-            (cutoff_null,)
+            (cutoff_null,),
         )
         cleaned = cursor3.rowcount
 
         total = deleted + deleted2 + cleaned
         if total > 0:
             _conn.commit()
-            _debug(f"  [db] cleanup: deleted {deleted}+{deleted2} old rows, cleared bodies from {cleaned} requests")
-            _log(f"  DB CLEANUP: deleted {deleted+deleted2} old rows, cleared {cleaned} bodies (>{retention_days}d)")
+            _debug(
+                f"  [db] cleanup: deleted {deleted}+{deleted2} old rows, cleared bodies from {cleaned} requests"
+            )
+            _log(
+                f"  DB CLEANUP: deleted {deleted + deleted2} old rows, cleared {cleaned} bodies (>{retention_days}d)"
+            )
             _db_vacuum_if_needed(deleted + deleted2)
         return deleted + deleted2 + cleaned
     except Exception as e:
@@ -697,18 +806,43 @@ def _normalize_timestamp_utc(timestamp: str) -> str:
     if timestamp.endswith("Z"):
         return timestamp
     try:
-        return (datetime.datetime.fromisoformat(timestamp)
-                .astimezone().astimezone(datetime.timezone.utc)
-                .strftime("%Y-%m-%dT%H:%M:%SZ"))
+        return (
+            datetime.datetime.fromisoformat(timestamp)
+            .astimezone()
+            .astimezone(datetime.timezone.utc)
+            .strftime("%Y-%m-%dT%H:%M:%SZ")
+        )
     except ValueError:
         return timestamp  # unparseable — store as-is rather than dropping the row
 
 
-def _db_insert_sync(req_id, timestamp, model, original_model, duration_ms,
-                    tokens_input, tokens_output, tokens_cache, success, error,
-                    protocol, is_stream, thinking, effort, client_ip, account_alias,
-                    tools_json, tools_used_json, request_body_json=None, response_body_json=None,
-                    client_user_agent=None, free_model_ip=None, identity=None, geo_country=None, geo_blocked=None):
+def _db_insert_sync(
+    req_id,
+    timestamp,
+    model,
+    original_model,
+    duration_ms,
+    tokens_input,
+    tokens_output,
+    tokens_cache,
+    success,
+    error,
+    protocol,
+    is_stream,
+    thinking,
+    effort,
+    client_ip,
+    account_alias,
+    tools_json,
+    tools_used_json,
+    request_body_json=None,
+    response_body_json=None,
+    client_user_agent=None,
+    free_model_ip=None,
+    identity=None,
+    geo_country=None,
+    geo_blocked=None,
+):
     """Synchronous DB insert — called via asyncio.to_thread().
 
     Batches commits: accumulates INSERTs and commits every _DB_COMMIT_BATCH
@@ -723,17 +857,42 @@ def _db_insert_sync(req_id, timestamp, model, original_model, duration_ms,
     # Lock the entire execute+commit block to prevent InterfaceError when
     # _db_flush or _wal_checkpoint runs concurrently on another thread.
     with _db_commit_lock:
-        _conn.execute("""
+        _conn.execute(
+            """
             INSERT OR REPLACE INTO requests (id, timestamp, model, original_model, duration_ms,
                 tokens_input, tokens_output, tokens_cache, success, error,
                 protocol, is_stream, thinking, effort, client_ip, account_alias, tools, tools_used,
                 request_body, response_body, client_user_agent, free_model_ip, identity, geo_country, geo_blocked)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (req_id, timestamp, model, original_model, duration_ms,
-              tokens_input, tokens_output, tokens_cache, 1 if success else 0, error,
-              protocol, 1 if is_stream else 0, thinking, effort,
-              client_ip, account_alias, tools_json, tools_used_json,
-              request_body_json, response_body_json, client_user_agent, free_model_ip, identity, geo_country, geo_blocked))
+        """,
+            (
+                req_id,
+                timestamp,
+                model,
+                original_model,
+                duration_ms,
+                tokens_input,
+                tokens_output,
+                tokens_cache,
+                1 if success else 0,
+                error,
+                protocol,
+                1 if is_stream else 0,
+                thinking,
+                effort,
+                client_ip,
+                account_alias,
+                tools_json,
+                tools_used_json,
+                request_body_json,
+                response_body_json,
+                client_user_agent,
+                free_model_ip,
+                identity,
+                geo_country,
+                geo_blocked,
+            ),
+        )
         # Batch commit logic
         _db_pending_inserts += 1
         now = time.monotonic()
@@ -741,7 +900,9 @@ def _db_insert_sync(req_id, timestamp, model, original_model, duration_ms,
         if _db_pending_inserts >= _DB_COMMIT_BATCH or elapsed >= _DB_COMMIT_INTERVAL:
             try:
                 _conn.commit()
-                _debug(f"  [db] _db_insert_sync: batch-committed {_db_pending_inserts} inserts ({elapsed:.1f}s) in {(time.monotonic()-t0)*1000:.1f}ms")
+                _debug(
+                    f"  [db] _db_insert_sync: batch-committed {_db_pending_inserts} inserts ({elapsed:.1f}s) in {(time.monotonic() - t0) * 1000:.1f}ms"
+                )
             except Exception as e:
                 _debug(f"  [db] _db_insert_sync commit FAILED: {type(e).__name__}: {e}")
                 try:
@@ -752,7 +913,9 @@ def _db_insert_sync(req_id, timestamp, model, original_model, duration_ms,
             _db_pending_inserts = 0
             _db_last_commit = now
         else:
-            _debug(f"  [db] _db_insert_sync: queued req_id={req_id} (pending={_db_pending_inserts}, {elapsed:.1f}s since last commit)")
+            _debug(
+                f"  [db] _db_insert_sync: queued req_id={req_id} (pending={_db_pending_inserts}, {elapsed:.1f}s since last commit)"
+            )
 
 
 def _db_execute_batch_sync(batch: list[tuple]):
@@ -761,13 +924,16 @@ def _db_execute_batch_sync(batch: list[tuple]):
         return 0
     with _db_commit_lock:
         for item in batch:
-            _conn.execute("""
+            _conn.execute(
+                """
                 INSERT OR REPLACE INTO requests (id, timestamp, model, original_model, duration_ms,
                     tokens_input, tokens_output, tokens_cache, success, error,
                     protocol, is_stream, thinking, effort, client_ip, account_alias, tools, tools_used,
                     request_body, response_body, client_user_agent, free_model_ip, identity, geo_country, geo_blocked)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, item)
+            """,
+                item,
+            )
         try:
             _conn.commit()
         except Exception as e:
@@ -811,17 +977,38 @@ async def _db_writer_loop():
             await asyncio.sleep(0.1)
 
 
-async def _save_request(req_id, model, original_model, duration_ms,
-	                  tokens_input, tokens_output, tokens_cache, success=True, error=None,
-	                  protocol=None, is_stream=False, thinking=None, effort=None,
-	                  client_ip=None, account_alias=None, tools=None, tools_used=None,
-	                  request_body=None, response_body=None, free_model_ip=None,
-	                  identity=None, geo_country=None, geo_blocked=None):
+async def _save_request(
+    req_id,
+    model,
+    original_model,
+    duration_ms,
+    tokens_input,
+    tokens_output,
+    tokens_cache,
+    success=True,
+    error=None,
+    protocol=None,
+    is_stream=False,
+    thinking=None,
+    effort=None,
+    client_ip=None,
+    account_alias=None,
+    tools=None,
+    tools_used=None,
+    request_body=None,
+    response_body=None,
+    free_model_ip=None,
+    identity=None,
+    geo_country=None,
+    geo_blocked=None,
+):
     tools_json = json.dumps(tools) if tools else "[]"
     tools_used_json = json.dumps(list(dict.fromkeys(tools_used))) if tools_used else "[]"
     # B1: redact before DB INSERT (was only on _debug)
     request_body_json = _redact(_truncate_body_for_storage(request_body)) if request_body else None
-    response_body_json = _redact(_truncate_body_for_storage(response_body)) if response_body else None
+    response_body_json = (
+        _redact(_truncate_body_for_storage(response_body)) if response_body else None
+    )
     client_user_agent = _current_user_agent.get()
     # Leaf reader for the free-channel stamp: the two writers set
     # _current_free_attempt (IP + identity profile) right before the free
@@ -837,59 +1024,119 @@ async def _save_request(req_id, model, original_model, duration_ms,
     # [30] UTC everywhere — Z suffix
     timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     timestamp = _normalize_timestamp_utc(timestamp)
-    item = (req_id, timestamp, model, original_model, duration_ms,
-            tokens_input, tokens_output, tokens_cache, 1 if success else 0, error,
-            protocol, 1 if is_stream else 0, thinking, effort,
-            client_ip, account_alias, tools_json, tools_used_json,
-            request_body_json, response_body_json, client_user_agent, free_model_ip, identity, geo_country, geo_blocked)
+    item = (
+        req_id,
+        timestamp,
+        model,
+        original_model,
+        duration_ms,
+        tokens_input,
+        tokens_output,
+        tokens_cache,
+        1 if success else 0,
+        error,
+        protocol,
+        1 if is_stream else 0,
+        thinking,
+        effort,
+        client_ip,
+        account_alias,
+        tools_json,
+        tools_used_json,
+        request_body_json,
+        response_body_json,
+        client_user_agent,
+        free_model_ip,
+        identity,
+        geo_country,
+        geo_blocked,
+    )
     try:
         _db_queue.put_nowait(item)
     except asyncio.QueueFull:
-        _debug(f"  [db] queue full ({_db_queue.qsize()}), dropping req_id={req_id} — fallback to direct")
+        _debug(
+            f"  [db] queue full ({_db_queue.qsize()}), dropping req_id={req_id} — fallback to direct"
+        )
         try:
-            await asyncio.to_thread(_db_insert_sync, req_id, timestamp, model, original_model, duration_ms,
-                tokens_input, tokens_output, tokens_cache, success, error,
-                protocol, is_stream, thinking, effort, client_ip, account_alias,
-                tools_json, tools_used_json, request_body_json, response_body_json,
-                client_user_agent, free_model_ip, identity, geo_country, geo_blocked)
+            await asyncio.to_thread(
+                _db_insert_sync,
+                req_id,
+                timestamp,
+                model,
+                original_model,
+                duration_ms,
+                tokens_input,
+                tokens_output,
+                tokens_cache,
+                success,
+                error,
+                protocol,
+                is_stream,
+                thinking,
+                effort,
+                client_ip,
+                account_alias,
+                tools_json,
+                tools_used_json,
+                request_body_json,
+                response_body_json,
+                client_user_agent,
+                free_model_ip,
+                identity,
+                geo_country,
+                geo_blocked,
+            )
         except Exception as e:
             _debug(f"  [db] fallback insert failed: {e}")
     else:
-        _debug(f"  [db] _save_request: queued req_id={req_id} model={model} success={success} qsize={_db_queue.qsize()}")
+        _debug(
+            f"  [db] _save_request: queued req_id={req_id} model={model} success={success} qsize={_db_queue.qsize()}"
+        )
     # Notify dashboard SSE clients about the update
     try:
         get_event_manager().publish("stats_updated", {"time": timestamp})
         # Also publish request detail via SSE — reuse original Python objects
         tools_used_deduped = list(dict.fromkeys(tools_used)) if tools_used else []
-        get_event_manager().publish("request_completed", {
-            "id": req_id,
-            "timestamp": timestamp,
-            "model": model,
-            "original_model": original_model,
-            "duration_ms": duration_ms,
-            "tokens_input": tokens_input,
-            "tokens_output": tokens_output,
-            "tokens_cache": tokens_cache,
-            "success": success,
-            "error": error,
-            "protocol": protocol,
-            "is_stream": is_stream,
-            "thinking": thinking,
-            "effort": effort,
-            "client_ip": client_ip,
-            "account_alias": account_alias,
-            "free_model_ip": free_model_ip,
-            "identity": identity,
-            "tools": tools or [],
-            "tools_used": tools_used_deduped,
-        })
+        get_event_manager().publish(
+            "request_completed",
+            {
+                "id": req_id,
+                "timestamp": timestamp,
+                "model": model,
+                "original_model": original_model,
+                "duration_ms": duration_ms,
+                "tokens_input": tokens_input,
+                "tokens_output": tokens_output,
+                "tokens_cache": tokens_cache,
+                "success": success,
+                "error": error,
+                "protocol": protocol,
+                "is_stream": is_stream,
+                "thinking": thinking,
+                "effort": effort,
+                "client_ip": client_ip,
+                "account_alias": account_alias,
+                "free_model_ip": free_model_ip,
+                "identity": identity,
+                "tools": tools or [],
+                "tools_used": tools_used_deduped,
+            },
+        )
     except Exception as e:
         _debug(f"  ✗ SSE publish failed: {type(e).__name__}: {e}")
 
 
-def _log_free_model_usage(paid_model: str, free_model: str, api_key: str,
-                          workspace_id: str, status: int, tokens_in: int = 0,
-                          tokens_out: int = 0, duration_ms: int = 0, ip: str = ""):
+def _log_free_model_usage(
+    paid_model: str,
+    free_model: str,
+    api_key: str,
+    workspace_id: str,
+    status: int,
+    tokens_in: int = 0,
+    tokens_out: int = 0,
+    duration_ms: int = 0,
+    ip: str = "",
+):
     """Log a free model request to the database for quota analysis."""
     timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())  # [30] UTC
     timestamp = _normalize_timestamp_utc(timestamp)
@@ -900,12 +1147,24 @@ def _log_free_model_usage(paid_model: str, free_model: str, api_key: str,
                 "(timestamp, paid_model, free_model, api_key, workspace_id, status, "
                 " tokens_input, tokens_output, duration_ms, ip) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (timestamp, paid_model, free_model, api_key[:16] + "...", workspace_id,
-                 status, tokens_in, tokens_out, duration_ms, ip)
+                (
+                    timestamp,
+                    paid_model,
+                    free_model,
+                    api_key[:16] + "...",
+                    workspace_id,
+                    status,
+                    tokens_in,
+                    tokens_out,
+                    duration_ms,
+                    ip,
+                ),
             )
             _conn.commit()
-        _debug(f"  [free-usage] logged: {free_model} key={api_key[:8]}... ws={workspace_id[:12]}... "
-               f"status={status} ip={ip} in={tokens_in} out={tokens_out}")
+        _debug(
+            f"  [free-usage] logged: {free_model} key={api_key[:8]}... ws={workspace_id[:12]}... "
+            f"status={status} ip={ip} in={tokens_in} out={tokens_out}"
+        )
     except Exception as e:
         _debug(f"  [free-usage] log failed: {e}")
 
@@ -913,6 +1172,7 @@ def _log_free_model_usage(paid_model: str, free_model: str, api_key: str,
 # Token usage tracking (in-memory, restored from SQLite on startup)
 _token_usage = {model: {"input": 0, "output": 0, "cache": 0} for model in MODELS}
 _token_lock = threading.Lock()
+
 
 def _restore_token_counters():
     """Restore in-memory token counters from SQLite on startup."""
@@ -933,11 +1193,14 @@ def _restore_token_counters():
                 total_in += row[1]
                 total_out += row[2]
                 total_cache += row[3]
-        _debug(f"  [db] token counters restored: {len(rows)} models, total in={total_in} out={total_out} cache={total_cache}")
+        _debug(
+            f"  [db] token counters restored: {len(rows)} models, total in={total_in} out={total_out} cache={total_cache}"
+        )
         _log(f"  Restored token counters for {len(rows)} models from database")
     except Exception as e:
         _debug(f"  [db] restore token counters FAILED: {type(e).__name__}: {e}")
         _log(f"  Warning: Could not restore token counters: {e}")
+
 
 _restore_token_counters()
 
@@ -951,37 +1214,50 @@ def _wal_checkpoint():
     except Exception as e:
         _debug(f"  [db] WAL checkpoint FAILED: {type(e).__name__}: {e}")
 
+
 # ── orjson fast-path (5-10x vs stdlib json on large bodies) ──
 try:
     import orjson as _orjson  # type: ignore
+
     def _json_loads(b: bytes | str, **kw):
         if isinstance(b, str):
             b = b.encode()
         return _orjson.loads(b)
+
     def _json_dumps(obj, **kw) -> bytes:
         if kw.get("indent") is not None:
-            return json.dumps(obj, ensure_ascii=False, indent=kw.get("indent"), default=str).encode()
+            return json.dumps(
+                obj, ensure_ascii=False, indent=kw.get("indent"), default=str
+            ).encode()
         return _orjson.dumps(obj)
+
     def _json_dumps_str(obj, **kw) -> str:
         if kw.get("indent") is not None:
             return json.dumps(obj, ensure_ascii=False, indent=kw.get("indent"), default=str)
         if kw:
             return _orjson.dumps(obj).decode()
         return _orjson.dumps(obj).decode()
+
     _JSON_LIB = "orjson"
 except ImportError:
+
     def _json_loads(b: bytes | str, **kw):  # type: ignore[no-redef]
         if isinstance(b, bytes):
             b = b.decode()
         return json.loads(b, **kw)
+
     def _json_dumps(obj, **kw) -> bytes:  # type: ignore[no-redef]
         if "indent" in kw:
-            return json.dumps(obj, ensure_ascii=False, indent=kw.get("indent"), default=str).encode()
-        return json.dumps(obj, ensure_ascii=False, separators=(',', ':')).encode()
+            return json.dumps(
+                obj, ensure_ascii=False, indent=kw.get("indent"), default=str
+            ).encode()
+        return json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode()
+
     def _json_dumps_str(obj, **kw) -> str:  # type: ignore[no-redef]
         if "indent" in kw:
             return json.dumps(obj, ensure_ascii=False, indent=kw.get("indent"), default=str)
-        return json.dumps(obj, ensure_ascii=False, separators=(',', ':'))
+        return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+
     _JSON_LIB = "json"
 
 
@@ -995,7 +1271,11 @@ def _build_http_limits() -> httpx.Limits:
 
 
 def _build_http_timeout() -> httpx.Timeout:
-    t2 = yaml_get("upstream", "timeout", {}) if isinstance(yaml_get("upstream", "timeout", {}), dict) else {}
+    t2 = (
+        yaml_get("upstream", "timeout", {})
+        if isinstance(yaml_get("upstream", "timeout", {}), dict)
+        else {}
+    )
     return httpx.Timeout(
         connect=float(t2.get("connect", 5) if isinstance(t2, dict) else 5),
         read=float(t2.get("read", 600) if isinstance(t2, dict) else 600),
@@ -1005,21 +1285,26 @@ def _build_http_timeout() -> httpx.Timeout:
 
 
 # Shared HTTP client (reused across requests) with connection pooling + HTTP/2 multiplex
-_transport = httpx.AsyncHTTPTransport(
-    proxy=PROXY,
-    limits=_build_http_limits(),
-    http2=True,
-    retries=0,
-) if PROXY else httpx.AsyncHTTPTransport(
-    limits=_build_http_limits(),
-    http2=True,
-    retries=0,
+_transport = (
+    httpx.AsyncHTTPTransport(
+        proxy=PROXY,
+        limits=_build_http_limits(),
+        http2=True,
+        retries=0,
+    )
+    if PROXY
+    else httpx.AsyncHTTPTransport(
+        limits=_build_http_limits(),
+        http2=True,
+        retries=0,
+    )
 )
 _client = httpx.AsyncClient(transport=_transport, timeout=_build_http_timeout())
 
 # ── Curl TLS pool (reuse AsyncSession per proxy+impersonate) ──
 _curl_pool: dict[str, tuple] = {}  # key -> (AsyncSession, asyncio.Lock)
 _curl_pool_lock = asyncio.Lock()
+
 
 async def _get_pooled_curl_session(proxy_url: str | None, impersonate: str):
     """Get or create a pooled curl session for (proxy, impersonate)."""
@@ -1028,10 +1313,12 @@ async def _get_pooled_curl_session(proxy_url: str | None, impersonate: str):
         if key in _curl_pool:
             return _curl_pool[key]
         from curl_cffi.requests import AsyncSession
+
         sess = AsyncSession(impersonate=impersonate, proxy=_curl_proxy_url(proxy_url))
         lock = asyncio.Lock()
         _curl_pool[key] = (sess, lock)
         return sess, lock
+
 
 async def _close_curl_pool():
     """Close all pooled curl sessions (lifespan shutdown)."""
@@ -1059,15 +1346,19 @@ def _ensure_http_client() -> httpx.AsyncClient:
     # getattr: real httpx clients always expose .is_closed; test doubles that
     # omit it are treated as alive rather than closed.
     if _client is None or getattr(_client, "is_closed", False):
-        _transport = httpx.AsyncHTTPTransport(
-            proxy=PROXY,
-            limits=_build_http_limits(),
-            http2=True,
-            retries=0,
-        ) if PROXY else httpx.AsyncHTTPTransport(
-            limits=_build_http_limits(),
-            http2=True,
-            retries=0,
+        _transport = (
+            httpx.AsyncHTTPTransport(
+                proxy=PROXY,
+                limits=_build_http_limits(),
+                http2=True,
+                retries=0,
+            )
+            if PROXY
+            else httpx.AsyncHTTPTransport(
+                limits=_build_http_limits(),
+                http2=True,
+                retries=0,
+            )
         )
         _client = httpx.AsyncClient(transport=_transport, timeout=_build_http_timeout())
         _debug("[http] shared upstream client re-created (was closed)")
@@ -1118,15 +1409,16 @@ async def _apply_station_count(new_n: int) -> None:
     new_n = max(1, min(10, new_n))
     async with _apply_station_lock:
         import shared_state
+
         managers = list(getattr(shared_state, "vpn_managers", None) or [])
         old_n = len(managers)
         if new_n == old_n:
             return
         from vpn_manager import VPNManager
+
         if new_n > old_n:
             for k in range(old_n + 1, new_n + 1):
-                m = VPNManager(IP_ROTATION, station=k,
-                               shared=shared_state.shared_rotation)
+                m = VPNManager(IP_ROTATION, station=k, shared=shared_state.shared_rotation)
                 m.enabled = IP_ROTATION.get("enabled", False)
                 managers.append(m)
             # Registry + pool converge BEFORE any docker call: _apply_stack
@@ -1152,8 +1444,7 @@ async def _apply_station_count(new_n: int) -> None:
                 # stations' in-flight rotations BEFORE their containers are
                 # stopped/removed — a rotation must not land on a container
                 # that stop_container is about to delete.
-                await pool.cancel_rotations(
-                    [m._station for m in managers[new_n:]])
+                await pool.cancel_rotations([m._station for m in managers[new_n:]])
             # [fix] Parallélise les stops (même gain en downscale)
             _retired = managers[new_n:]
             if _retired:
@@ -1166,8 +1457,7 @@ async def _apply_station_count(new_n: int) -> None:
                 pool.set_stations(managers)
         watcher = getattr(shared_state, "docker_event_watcher", None)
         if watcher is not None:
-            watcher.set_managers(
-                {m._docker_container: m for m in managers})
+            watcher.set_managers({m._docker_container: m for m in managers})
         # Retro-compat aliases converge too
         shared_state.vpn_manager = managers[0]
         shared_state.vpn_manager_2 = managers[1] if new_n >= 2 else None
@@ -1180,14 +1470,18 @@ async def _apply_station_count(new_n: int) -> None:
             _eff = max(1, min(int(IP_ROTATION.get("max_free_attempts", 2) or 2), 3))
             IP_ROTATION["max_free_attempts"] = _eff
         from dashboard.api import _persist_vpn_config
+
         _res = _persist_vpn_config({"station_count": new_n, "max_free_attempts": _eff})
         if asyncio.iscoroutine(_res):
             await _res
-        _debug(f"  [vpn] station_count hot-reload {old_n} → {new_n} "
-               f"({len(managers)} active) effective_max={_eff}")
+        _debug(
+            f"  [vpn] station_count hot-reload {old_n} → {new_n} "
+            f"({len(managers)} active) effective_max={_eff}"
+        )
 
 
 # ── Debug helpers ──────────────────────────────────────────────────
+
 
 def _sanitize_headers(headers) -> dict:
     """Mask sensitive header values for debug logging."""
@@ -1221,7 +1515,12 @@ _REDACT_PATTERNS = [
     # Bearer tokens
     (re.compile(r"(?i)\b(bearer\s+)[A-Za-z0-9._\-]{16,}"), r"\1***"),
     # Sensitive header values in logged text: "x-api-key": "v", Authorization: v, cookie: v
-    (re.compile(r'(?i)("?(?:x-api-key|authorization|cookie|set-cookie)"?\s*[:=]\s*"?)[^"\s,}]{4,}'), r"\1***"),
+    (
+        re.compile(
+            r'(?i)("?(?:x-api-key|authorization|cookie|set-cookie)"?\s*[:=]\s*"?)[^"\s,}]{4,}'
+        ),
+        r"\1***",
+    ),
     # JSON fields / query params: api_key=..., apikey: ...
     (re.compile(r'(?i)\b(api[_-]?key\s*[:=]\s*"?)[^"\s,}]{4,}'), r"\1***"),
 ]
@@ -1244,6 +1543,7 @@ def _redact(text, max_len=None) -> str:
 
 # ── Response Cache (non-streaming only) ──────────────────────────
 
+
 class _ResponseCache:
     """LRU cache for non-streaming API responses with TTL and size limit.
 
@@ -1251,6 +1551,7 @@ class _ResponseCache:
     Returns (body_bytes, headers_dict) or None on miss.
     Uses OrderedDict for O(1) LRU operations instead of list-based O(n).
     """
+
     def __init__(self, max_size: int = 1000, ttl: float = 300.0):
         self._max_size = max_size
         self._ttl = ttl
@@ -1264,7 +1565,9 @@ class _ResponseCache:
             self._store.pop(oldest, None)
             evicted += 1
         if evicted > 0:
-            _debug(f"  [cache] _evict: evicted {evicted} entries, store_size={len(self._store)}/{self._max_size}")
+            _debug(
+                f"  [cache] _evict: evicted {evicted} entries, store_size={len(self._store)}/{self._max_size}"
+            )
 
     def get(self, key: str) -> tuple[bytes, dict] | None:
         entry = self._store.get(key)
@@ -1272,7 +1575,9 @@ class _ResponseCache:
             return None
         ts, body, headers = entry
         if time.monotonic() - ts > self._ttl:
-            _debug(f"  [cache] get: TTL expired (age={time.monotonic()-ts:.1f}s > ttl={self._ttl}s), evicting key={key[:16]}...")
+            _debug(
+                f"  [cache] get: TTL expired (age={time.monotonic() - ts:.1f}s > ttl={self._ttl}s), evicting key={key[:16]}..."
+            )
             self._store.pop(key, None)
             self._access_order.pop(key, None)
             return None
@@ -1309,12 +1614,16 @@ class _ResponseCache:
                         return None
         try:
             import hashlib
+
             if body_bytes:
                 # Fast path: hash raw bytes directly (avoids json.dumps + sort_keys)
                 key = hashlib.blake2b(body_bytes, digest_size=16).hexdigest()
             else:
                 # Fallback: deterministic JSON serialization + blake2b
-                key = hashlib.blake2b(_json_dumps_str(body, separators=(',', ':'), default=str).encode(), digest_size=16).hexdigest()
+                key = hashlib.blake2b(
+                    _json_dumps_str(body, separators=(",", ":"), default=str).encode(),
+                    digest_size=16,
+                ).hexdigest()
             _debug(f"  [cache] make_key: generated hash={key[:16]}...")
             return key
         except Exception:
@@ -1339,6 +1648,7 @@ async def lifespan(app):
     # Toggle "Use Balance" on for all workspaces (non-bloquant, 6s max)
     try:
         from dashboard import toggle_use_balance_all
+
         try:
             balance_results = await asyncio.wait_for(toggle_use_balance_all(), timeout=6.0)
         except asyncio.TimeoutError:
@@ -1346,12 +1656,15 @@ async def lifespan(app):
             balance_results = {}
         if balance_results:
             ok = sum(1 for v in balance_results.values() if v)
-            _debug(f"  [lifespan] use-balance toggle: {ok}/{len(balance_results)} workspaces enabled")
+            _debug(
+                f"  [lifespan] use-balance toggle: {ok}/{len(balance_results)} workspaces enabled"
+            )
     except Exception as e:
         _debug(f"  [lifespan] use-balance toggle failed: {e}")
 
     # Register recovery callback: unpause API keys when workspace returns to ok
     from dashboard.quota import set_on_workspace_recovered_callback
+
     set_on_workspace_recovered_callback(on_workspace_recovered)
     _debug("  [lifespan] workspace recovery callback registered")
 
@@ -1360,6 +1673,7 @@ async def lifespan(app):
     from vpn_manager import VPNManager
     from shared_rotation import SharedRotationState
     from free_ip_pool import FreeIPPool
+
     # Cross-station shared state: recent-IP registry + one absolute identity
     # cursor. Both stations read/write it so neither re-enters an IP the
     # other used recently and their live identities never collide.
@@ -1370,9 +1684,10 @@ async def lifespan(app):
     # resolved count >= N; _apply_station_count() grows/shrinks this set at
     # runtime (start/stop_container) without a proxy restart.
     n = _cfg_settings.resolved_station_count(IP_ROTATION)
-    _managers = [VPNManager(IP_ROTATION, station=k,
-                            shared=shared_state.shared_rotation)
-                 for k in range(1, n + 1)]
+    _managers = [
+        VPNManager(IP_ROTATION, station=k, shared=shared_state.shared_rotation)
+        for k in range(1, n + 1)
+    ]
     for m in _managers:
         m.enabled = IP_ROTATION.get("enabled", False)
     # Registry — SOURCE OF TRUTH for hot reload (1-indexed, [0] = station 1).
@@ -1381,8 +1696,7 @@ async def lifespan(app):
     shared_state.vpn_managers = _managers
     shared_state.vpn_manager = _managers[0]
     shared_state.vpn_manager_2 = _managers[1] if n >= 2 else None
-    shared_state.free_ip_pool = FreeIPPool(_managers[0],
-                                           _managers[1] if n >= 2 else None)
+    shared_state.free_ip_pool = FreeIPPool(_managers[0], _managers[1] if n >= 2 else None)
     shared_state.free_ip_pool.set_stations(_managers)
     # [plan] E: boot-time fan-out of the ip_rotation timings (connect retry,
     # bad TTL, rotation stagger) — the pool's built-in defaults are the
@@ -1399,6 +1713,7 @@ async def lifespan(app):
     # (a broken docker daemon must not block boot — start() handles it).
     try:
         from vpn_manager import reconcile_orphan_containers
+
         _removed = await reconcile_orphan_containers(_managers)
         if _removed:
             _debug(f"  [lifespan] boot reconcile removed: {_removed}")
@@ -1416,13 +1731,14 @@ async def lifespan(app):
     shared_state.docker_event_watcher = None
     if IP_ROTATION.get("docker_events", True) and _managers:
         from docker_events import DockerEventWatcher
+
         try:
-            _watcher = DockerEventWatcher(
-                {m._docker_container: m for m in _managers})
+            _watcher = DockerEventWatcher({m._docker_container: m for m in _managers})
             await _watcher.start()
             shared_state.docker_event_watcher = _watcher
-            _debug(f"  [lifespan] docker event watcher started "
-                   f"({len(_watcher._managers)} containers)")
+            _debug(
+                f"  [lifespan] docker event watcher started ({len(_watcher._managers)} containers)"
+            )
         except Exception as e:
             _debug(f"  [lifespan] docker event watcher failed to start: {e}")
             shared_state.docker_event_watcher = None
@@ -1431,11 +1747,15 @@ async def lifespan(app):
     try:
         _eff_boot = effective_free_max_attempts()
         IP_ROTATION["max_free_attempts"] = _eff_boot
-        _debug(f"  [lifespan] effective_max boot derived={_eff_boot} (auto={IP_ROTATION.get('auto_max_free_attempts', True)})")
+        _debug(
+            f"  [lifespan] effective_max boot derived={_eff_boot} (auto={IP_ROTATION.get('auto_max_free_attempts', True)})"
+        )
     except Exception as _e:
         _debug(f"  [lifespan] effective_max boot derive failed: {_e}")
-    _debug(f"  [lifespan] VPN manager initialized (enabled={_managers[0].enabled}, "
-           f"mode={_managers[0]._mode}, station_count={n})")
+    _debug(
+        f"  [lifespan] VPN manager initialized (enabled={_managers[0].enabled}, "
+        f"mode={_managers[0]._mode}, station_count={n})"
+    )
 
     # Periodic WAL checkpoint
     async def _periodic_checkpoint():
@@ -1494,7 +1814,9 @@ async def lifespan(app):
                 await asyncio.sleep(3600)
 
     db_cleanup_task = asyncio.create_task(_periodic_db_cleanup())
-    _debug("  [lifespan] background tasks created (WAL checkpoint, DB flush, key pause cleanup, DB body cleanup, quota fetcher)")
+    _debug(
+        "  [lifespan] background tasks created (WAL checkpoint, DB flush, key pause cleanup, DB body cleanup, quota fetcher)"
+    )
 
     # [free-discovery] periodic refresh (±10% jitter, backoff after 3 failures)
     app.state._free_discovery_lock = asyncio.Lock()
@@ -1506,21 +1828,39 @@ async def lifespan(app):
         # loop just schedules the next refreshes.
         while True:
             try:
-                interval = int(yaml_get("free_discovery", "interval", yaml_get("background", "free_models_refresh_interval", _cfg_settings.FREE_DISCOVERY_INTERVAL)) or _cfg_settings.FREE_DISCOVERY_INTERVAL)
+                interval = int(
+                    yaml_get(
+                        "free_discovery",
+                        "interval",
+                        yaml_get(
+                            "background",
+                            "free_models_refresh_interval",
+                            _cfg_settings.FREE_DISCOVERY_INTERVAL,
+                        ),
+                    )
+                    or _cfg_settings.FREE_DISCOVERY_INTERVAL
+                )
                 if interval < 60:
                     interval = 60
                 # jitter ±10%
                 jitter = 0.9 + random.random() * 0.2
-                failures = int(_cfg_settings._FREE_DISCOVERY_STATE.get("consecutive_failures", 0) or 0)
+                failures = int(
+                    _cfg_settings._FREE_DISCOVERY_STATE.get("consecutive_failures", 0) or 0
+                )
                 if failures >= 3:
                     sleep_s = min(7200, interval * 2) * jitter
-                    _debug(f"  [free-discovery] backoff active failures={failures} sleep={sleep_s:.0f}s")
+                    _debug(
+                        f"  [free-discovery] backoff active failures={failures} sleep={sleep_s:.0f}s"
+                    )
                 else:
                     sleep_s = interval * jitter
                 # expose next_refresh for observability
                 try:
                     import datetime as _dt
-                    _cfg_settings._FREE_DISCOVERY_STATE["next_refresh"] = (_dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(seconds=sleep_s)).isoformat()
+
+                    _cfg_settings._FREE_DISCOVERY_STATE["next_refresh"] = (
+                        _dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(seconds=sleep_s)
+                    ).isoformat()
                 except Exception:
                     pass
                 await asyncio.sleep(sleep_s)
@@ -1534,10 +1874,14 @@ async def lifespan(app):
                     # publish event for SSE/dashboard if available
                     try:
                         from dashboard.events import get_event_manager
-                        get_event_manager().publish("free_models_updated", {
-                            "detected": _cfg_settings._FREE_DISCOVERY_STATE.get("detected", []),
-                            "source": _cfg_settings._FREE_DISCOVERY_STATE.get("source", "none"),
-                        })
+
+                        get_event_manager().publish(
+                            "free_models_updated",
+                            {
+                                "detected": _cfg_settings._FREE_DISCOVERY_STATE.get("detected", []),
+                                "source": _cfg_settings._FREE_DISCOVERY_STATE.get("source", "none"),
+                            },
+                        )
                     except Exception:
                         pass
             except asyncio.CancelledError:
@@ -1603,7 +1947,7 @@ async def lifespan(app):
             _debug(f"  [lifespan] docker event watcher stop failed: {e}")
         shared_state.docker_event_watcher = None
 
-    task = getattr(app.state, '_quota_task', None)
+    task = getattr(app.state, "_quota_task", None)
     if task:
         task.cancel()
         try:
@@ -1611,7 +1955,7 @@ async def lifespan(app):
         except asyncio.CancelledError:
             pass
         _debug("  [lifespan] quota fetcher task cancelled")
-    fd_task = getattr(app.state, '_free_discovery_task', None)
+    fd_task = getattr(app.state, "_free_discovery_task", None)
     if fd_task:
         fd_task.cancel()
         try:
@@ -1635,11 +1979,14 @@ async def lifespan(app):
     _debug(f"  [lifespan] VPN state saved ({len(shared_state.vpn_managers)} stations)")
     # Close quota fetcher shared client
     from dashboard.quota import _http_client as _quota_client
+
     if _quota_client and not _quota_client.is_closed:
         await _quota_client.aclose()
         _debug("  [lifespan] quota fetcher HTTP client closed")
 
+
 app = FastAPI(lifespan=lifespan)
+
 
 @app.exception_handler(Exception)
 async def debug_exception(request: Request, exc: Exception):
@@ -1650,21 +1997,35 @@ async def debug_exception(request: Request, exc: Exception):
     # Don't expose tracebacks to clients — log them server-side only
     return JSONResponse(status_code=500, content={"error": "Internal server error"})
 
+
 # Server manager set later in __main__ for GUI mode; None means always-running
 _server_manager = None
 
-register_dashboard(app, STATIC_DIR, _conn, server_manager_getter=lambda: _server_manager, token_usage=_token_usage, token_lock=_token_lock, db_lock=_db_commit_lock)
+register_dashboard(
+    app,
+    STATIC_DIR,
+    _conn,
+    server_manager_getter=lambda: _server_manager,
+    token_usage=_token_usage,
+    token_lock=_token_lock,
+    db_lock=_db_commit_lock,
+)
 
 
 # ── Rate Limiting (token bucket, per-IP) ────────────────────────
 
 RATE_LIMIT_RPS = float(os.environ.get("RATE_LIMIT_RPS", str(yaml_get("rate_limit", "rps", 50))))
-RATE_LIMIT_BURST = float(os.environ.get("RATE_LIMIT_BURST", str(yaml_get("rate_limit", "burst", 100))))
-_STALE_BUCKET_TTL = yaml_get("rate_limit", "stale_ttl", 300)  # seconds — remove buckets inactive for 5 min
+RATE_LIMIT_BURST = float(
+    os.environ.get("RATE_LIMIT_BURST", str(yaml_get("rate_limit", "burst", 100)))
+)
+_STALE_BUCKET_TTL = yaml_get(
+    "rate_limit", "stale_ttl", 300
+)  # seconds — remove buckets inactive for 5 min
 
 
 class _Bucket:
     """Token bucket for a single client IP — lock-free (single-threaded event loop)."""
+
     __slots__ = ("tokens", "last_refill", "max_tokens", "refill_rate", "last_access")
 
     def __init__(self, rate: float, burst: float):
@@ -1741,7 +2102,10 @@ class RateLimitMiddleware:
             return
         retry_after_int = max(1, int(retry_after) + 1)
         body = _json_dumps({"error": "Rate limit exceeded. Try again shortly."})
-        headers = [(b"content-type", b"application/json"), (b"retry-after", str(retry_after_int).encode())]
+        headers = [
+            (b"content-type", b"application/json"),
+            (b"retry-after", str(retry_after_int).encode()),
+        ]
         await send({"type": "http.response.start", "status": 503, "headers": headers})
         await send({"type": "http.response.body", "body": body})
 
@@ -1749,17 +2113,22 @@ class RateLimitMiddleware:
         while True:
             await asyncio.sleep(60)
             now = time.monotonic()
-            stale = [ip for ip, b in self._buckets.items() if now - b.last_access > _STALE_BUCKET_TTL]
+            stale = [
+                ip for ip, b in self._buckets.items() if now - b.last_access > _STALE_BUCKET_TTL
+            ]
             for ip in stale:
                 self._buckets.pop(ip, None)
             if stale:
-                _debug(f"  [ratelimit] cleanup: {len(stale)} stale buckets removed, {len(self._buckets)} active")
+                _debug(
+                    f"  [ratelimit] cleanup: {len(stale)} stale buckets removed, {len(self._buckets)} active"
+                )
 
 
 app.add_middleware(RateLimitMiddleware)
 
 
 # ── Access Log Middleware ─────────────────────────────────────────
+
 
 class AccessLogMiddleware:
     """Pure-ASGI access log — zero copy, streaming-safe, no BaseHTTPMiddleware buffering."""
@@ -1821,13 +2190,26 @@ app.add_middleware(TrafficCaptureMiddleware, capture=_traffic_capture)
 
 # ── Circuit Breaker (per-endpoint) ──────────────────────────────
 
-_CB_FAILURE_THRESHOLD = yaml_get("circuit_breaker", "failure_threshold", 5)     # trips open after N consecutive failures
-_CB_RECOVERY_TIMEOUT = float(yaml_get("circuit_breaker", "recovery_timeout", 60))   # seconds before half-open test
+_CB_FAILURE_THRESHOLD = yaml_get(
+    "circuit_breaker", "failure_threshold", 5
+)  # trips open after N consecutive failures
+_CB_RECOVERY_TIMEOUT = float(
+    yaml_get("circuit_breaker", "recovery_timeout", 60)
+)  # seconds before half-open test
 
 
 class _CircuitBreaker:
     """Per-endpoint circuit breaker: CLOSED → OPEN → HALF_OPEN → CLOSED."""
-    __slots__ = ("failures", "state", "opened_at", "total_requests", "total_failures", "last_failure_time", "created_at")
+
+    __slots__ = (
+        "failures",
+        "state",
+        "opened_at",
+        "total_requests",
+        "total_failures",
+        "last_failure_time",
+        "created_at",
+    )
 
     def __init__(self):
         self.failures = 0
@@ -1917,13 +2299,16 @@ def _cb_record_failure(endpoint: str):
 
 # ── HTTP helpers with circuit breaker ────────────────────────────
 
+
 class CircuitOpenError(Exception):
     """Raised when the circuit breaker is open for an endpoint."""
+
     pass
 
 
 class UpstreamError(Exception):
     """Raised when an upstream HTTP request fails (connection, timeout, etc.)."""
+
     def __init__(self, message: str, status_code: int = 502, original: Exception = None):
         super().__init__(message)
         self.status_code = status_code
@@ -1932,6 +2317,7 @@ class UpstreamError(Exception):
 
 class AllKeysPausedError(Exception):
     """Raised when all API keys are paused and no request can be made."""
+
     def __init__(self, retry_after: float):
         super().__init__(f"All API keys paused, retry after {retry_after:.0f}s")
         self.retry_after = retry_after
@@ -1939,18 +2325,28 @@ class AllKeysPausedError(Exception):
 
 # ── Standardized error response helpers ──
 
+
 def _anthropic_error(status_code: int, message: str, error_type: str = "api_error") -> JSONResponse:
     """Return an error in Anthropic Messages API format."""
-    return JSONResponse(status_code=status_code, content={
-        "type": "error",
-        "error": {"type": error_type, "message": message},
-    })
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "type": "error",
+            "error": {"type": error_type, "message": message},
+        },
+    )
 
-def _openai_error(status_code: int, message: str, error_type: str = "invalid_request_error") -> JSONResponse:
+
+def _openai_error(
+    status_code: int, message: str, error_type: str = "invalid_request_error"
+) -> JSONResponse:
     """Return an error in OpenAI API format."""
-    return JSONResponse(status_code=status_code, content={
-        "error": {"message": message, "type": error_type, "code": str(status_code)},
-    })
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "error": {"message": message, "type": error_type, "code": str(status_code)},
+        },
+    )
 
 
 def _geo_headers(route: dict, pinned: bool = False, current_country: str | None = None) -> dict:
@@ -1967,11 +2363,17 @@ def _geo_headers(route: dict, pinned: bool = False, current_country: str | None 
     status = str(resolved.get("geo_status", "ok")) if isinstance(resolved, dict) else "ok"
     # UI label: prefer -> best_effort
     ui_mode = "best_effort" if mode == "prefer" else mode
-    h = {"X-Geo-Mode": ui_mode, "X-Geo-Status": status, "X-Geo-Pinned": "true" if pinned else "false"}
+    h = {
+        "X-Geo-Mode": ui_mode,
+        "X-Geo-Status": status,
+        "X-Geo-Pinned": "true" if pinned else "false",
+    }
     return h
 
 
-def _geo_block_response(route: dict, current_country: str | None, protocol: str, passthrough_451: bool = False) -> JSONResponse:
+def _geo_block_response(
+    route: dict, current_country: str | None, protocol: str, passthrough_451: bool = False
+) -> JSONResponse:
     """403 (Anthropic 400) + error.type=geo_blocked + {status:451} + X-Geo-* + Retry-After:0.
 
     Compat: never raw 451 unless X-Geo-Passthrough:1 (C2/S2). SSE caller
@@ -1999,11 +2401,24 @@ def _geo_block_response(route: dict, current_country: str | None, protocol: str,
     code = 451 if passthrough_451 else (400 if protocol == "anthropic" else 403)
     payload_anthropic = {
         "type": "error",
-        "error": {"type": "geo_blocked", "message": f"Geographic restriction: model not available from {current_country or 'current egress'} — allowed: {body_allowed or 'none'}"},
-        "status": 451, "code": "geo_unavailable", "allowed": allowed_list, "current": current_country,
+        "error": {
+            "type": "geo_blocked",
+            "message": f"Geographic restriction: model not available from {current_country or 'current egress'} — allowed: {body_allowed or 'none'}",
+        },
+        "status": 451,
+        "code": "geo_unavailable",
+        "allowed": allowed_list,
+        "current": current_country,
     }
     payload_openai = {
-        "error": {"message": payload_anthropic["error"]["message"], "type": "geo_blocked", "code": "geo_unavailable", "status": 451, "allowed": allowed_list, "current": current_country},
+        "error": {
+            "message": payload_anthropic["error"]["message"],
+            "type": "geo_blocked",
+            "code": "geo_unavailable",
+            "status": 451,
+            "allowed": allowed_list,
+            "current": current_country,
+        },
     }
     content = payload_anthropic if protocol == "anthropic" else payload_openai
     # Passthrough 451 natif only if header present (C2)
@@ -2020,7 +2435,17 @@ def _geo_sse_error(route: dict, current_country: str | None) -> bytes:
         resolved = {}
     effective = resolved.get("effective_allowed", set()) if isinstance(resolved, dict) else set()
     allowed_list = sorted(effective) if isinstance(effective, set) else []
-    payload = {"type": "error", "error": {"type": "geo_blocked", "message": f"Geographic restriction — allowed: {', '.join(allowed_list) or 'none'}", "status": 451, "code": "geo_unavailable", "allowed": allowed_list, "current": current_country}}
+    payload = {
+        "type": "error",
+        "error": {
+            "type": "geo_blocked",
+            "message": f"Geographic restriction — allowed: {', '.join(allowed_list) or 'none'}",
+            "status": 451,
+            "code": "geo_unavailable",
+            "allowed": allowed_list,
+            "current": current_country,
+        },
+    }
     return _sse("error", payload)
 
 
@@ -2036,7 +2461,12 @@ async def _enforce_geo_gate(route: dict, request: Request, *, is_stream: bool, p
     try:
         _geo_info = _cfg_settings.resolve_geo(route)
     except Exception:
-        _geo_info = {"effective_allowed": set(), "mode": "strict", "require_vpn": False, "geo_status": "ok"}
+        _geo_info = {
+            "effective_allowed": set(),
+            "mode": "strict",
+            "require_vpn": False,
+            "geo_status": "ok",
+        }
     _geo_has = isinstance(route, dict) and isinstance(route.get("geo"), dict)
     _geo_enabled = bool(getattr(_cfg_settings, "GEO_ENABLED", False))
     if not (_geo_has and _geo_enabled):
@@ -2049,30 +2479,71 @@ async def _enforce_geo_gate(route: dict, request: Request, *, is_stream: bool, p
     if _geo_status == "misconfigured":
         _geo_block_total += 1
         if is_stream:
+
             async def _geo_err_stream():
                 yield _geo_sse_error(route, None)
-            return StreamingResponse(_geo_err_stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Geo-Blocked": "1", "X-Geo-Status": "misconfigured"})
+
+            return StreamingResponse(
+                _geo_err_stream(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Geo-Blocked": "1",
+                    "X-Geo-Status": "misconfigured",
+                },
+            )
         return _geo_block_response(route, None, protocol, passthrough_451=_geo_passthrough)
-    _vpn_on = bool(getattr(_cfg_settings.IP_ROTATION, "get", lambda *a, **k: None)("enabled", False)) if isinstance(getattr(_cfg_settings, "IP_ROTATION", None), dict) else False
+    _vpn_on = (
+        bool(getattr(_cfg_settings.IP_ROTATION, "get", lambda *a, **k: None)("enabled", False))
+        if isinstance(getattr(_cfg_settings, "IP_ROTATION", None), dict)
+        else False
+    )
     try:
         import shared_state as _ss_geo
+
         _vpn_on = _vpn_on and bool(getattr(_ss_geo, "vpn_managers", None))
     except Exception:
         pass
     if _geo_require and not _vpn_on:
         _geo_block_total += 1
         if is_stream:
+
             async def _geo_req_stream():
                 yield _geo_sse_error(route, None)
-            return StreamingResponse(_geo_req_stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Geo-Blocked": "1", "X-Geo-Status": _geo_status})
+
+            return StreamingResponse(
+                _geo_req_stream(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Geo-Blocked": "1",
+                    "X-Geo-Status": _geo_status,
+                },
+            )
         return _geo_block_response(route, None, protocol, passthrough_451=_geo_passthrough)
     if _geo_mode == "strict" and not _vpn_on and not _geo_require:
-        if _geo_effective is not None and isinstance(_geo_effective, set) and len(_geo_effective) > 0:
+        if (
+            _geo_effective is not None
+            and isinstance(_geo_effective, set)
+            and len(_geo_effective) > 0
+        ):
             _geo_block_total += 1
             if is_stream:
+
                 async def _geo_novpn_stream():
                     yield _geo_sse_error(route, None)
-                return StreamingResponse(_geo_novpn_stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Geo-Blocked": "1"})
+
+                return StreamingResponse(
+                    _geo_novpn_stream(),
+                    media_type="text/event-stream",
+                    headers={
+                        "Cache-Control": "no-cache",
+                        "Connection": "keep-alive",
+                        "X-Geo-Blocked": "1",
+                    },
+                )
             return _geo_block_response(route, None, protocol, passthrough_451=_geo_passthrough)
     # [Axe C] Read ALL managers, collect every _current_country, prefer a
     # station already in effective_allowed.  Older code broke at the first
@@ -2081,6 +2552,7 @@ async def _enforce_geo_gate(route: dict, request: Request, *, is_stream: bool, p
     _geo_all_countries: list[str] = []
     try:
         import shared_state as _ss_geo2
+
         for _m in getattr(_ss_geo2, "vpn_managers", None) or []:
             if _m and getattr(_m, "_current_country", None):
                 _cc = _m._current_country
@@ -2122,24 +2594,43 @@ async def _enforce_geo_gate(route: dict, request: Request, *, is_stream: bool, p
             request.state._geo_forced_pool = _geo_forced_pool  # type: ignore
             return None
         try:
-            _probe_budget = float(_cfg_settings.IP_ROTATION.get("ip_probe_budget", 8.0) or 8.0) if isinstance(getattr(_cfg_settings, "IP_ROTATION", None), dict) else 8.0
+            _probe_budget = (
+                float(_cfg_settings.IP_ROTATION.get("ip_probe_budget", 8.0) or 8.0)
+                if isinstance(getattr(_cfg_settings, "IP_ROTATION", None), dict)
+                else 8.0
+            )
         except Exception:
             _probe_budget = 8.0
         _geo_budget = min(8.0, _probe_budget)
         _geo_ok = False
         _geo_candidates = set(_geo_effective)
         try:
-            _geo_candidates = {c for c in _geo_candidates if _geo_breaker.get((c, 0), 0) < _geo_breaker_threshold}
+            _geo_candidates = {
+                c for c in _geo_candidates if _geo_breaker.get((c, 0), 0) < _geo_breaker_threshold
+            }
         except Exception:
             pass
         if not _geo_candidates:
             if _geo_mode == "strict":
                 _geo_block_total += 1
                 if is_stream:
+
                     async def _geo_no_cand_stream():
                         yield _geo_sse_error(route, _geo_current)
-                    return StreamingResponse(_geo_no_cand_stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Geo-Blocked": "1", "Retry-After": "0"})
-                return _geo_block_response(route, _geo_current, protocol, passthrough_451=_geo_passthrough)
+
+                    return StreamingResponse(
+                        _geo_no_cand_stream(),
+                        media_type="text/event-stream",
+                        headers={
+                            "Cache-Control": "no-cache",
+                            "Connection": "keep-alive",
+                            "X-Geo-Blocked": "1",
+                            "Retry-After": "0",
+                        },
+                    )
+                return _geo_block_response(
+                    route, _geo_current, protocol, passthrough_451=_geo_passthrough
+                )
             request.state._geo_fallback = True  # type: ignore
             request.state._geo_pinned = False  # type: ignore
             request.state._geo_current = _geo_current  # type: ignore
@@ -2147,6 +2638,7 @@ async def _enforce_geo_gate(route: dict, request: Request, *, is_stream: bool, p
             return None
         try:
             import shared_state as _ss_pin
+
             _pin_mgr = None
             for _m in getattr(_ss_pin, "vpn_managers", None) or []:
                 if _m and hasattr(_m, "ensure_geo_egress"):
@@ -2154,7 +2646,10 @@ async def _enforce_geo_gate(route: dict, request: Request, *, is_stream: bool, p
                     break
             if _pin_mgr is not None:
                 _t0 = time.monotonic()
-                _geo_ok = await asyncio.wait_for(_pin_mgr.ensure_geo_egress(_geo_candidates, timeout=_geo_budget), timeout=_geo_budget + 1.0)
+                _geo_ok = await asyncio.wait_for(
+                    _pin_mgr.ensure_geo_egress(_geo_candidates, timeout=_geo_budget),
+                    timeout=_geo_budget + 1.0,
+                )
                 _elapsed_ms = int((time.monotonic() - _t0) * 1000)
                 _geo_pin_duration.append(_elapsed_ms)
                 if len(_geo_pin_duration) > _geo_pin_duration_max:
@@ -2168,6 +2663,7 @@ async def _enforce_geo_gate(route: dict, request: Request, *, is_stream: bool, p
                     # fallback to prefer — re-pin or block 403.
                     try:
                         import shared_state as _ss_verify
+
                         _v_station = None
                         if getattr(_ss_verify, "free_ip_pool", None):
                             _v_station = _ss_verify.free_ip_pool._best_station(set(_geo_effective))
@@ -2182,10 +2678,25 @@ async def _enforce_geo_gate(route: dict, request: Request, *, is_stream: bool, p
                                 if _geo_mode == "strict":
                                     _geo_block_total += 1
                                     if is_stream:
+
                                         async def _geo_verify_fail_stream():
                                             yield _geo_sse_error(route, _v_cc)
-                                        return StreamingResponse(_geo_verify_fail_stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Geo-Blocked": "1", "X-Geo-Mode": "strict", "X-Geo-Pinned": "false", "Retry-After": "0"})
-                                    return _geo_block_response(route, _v_cc, protocol, passthrough_451=_geo_passthrough)
+
+                                        return StreamingResponse(
+                                            _geo_verify_fail_stream(),
+                                            media_type="text/event-stream",
+                                            headers={
+                                                "Cache-Control": "no-cache",
+                                                "Connection": "keep-alive",
+                                                "X-Geo-Blocked": "1",
+                                                "X-Geo-Mode": "strict",
+                                                "X-Geo-Pinned": "false",
+                                                "Retry-After": "0",
+                                            },
+                                        )
+                                    return _geo_block_response(
+                                        route, _v_cc, protocol, passthrough_451=_geo_passthrough
+                                    )
                                 _geo_ok = False  # prefer: fallback mode
                                 request.state._geo_fallback = True  # type: ignore
                             else:
@@ -2193,7 +2704,9 @@ async def _enforce_geo_gate(route: dict, request: Request, *, is_stream: bool, p
                     except Exception:
                         pass
                     _geo_pinned_country = _geo_current
-                    _log(f"  [geo] pin verified country={_geo_current} in effective_allowed={sorted(_geo_effective)}")
+                    _log(
+                        f"  [geo] pin verified country={_geo_current} in effective_allowed={sorted(_geo_effective)}"
+                    )
                     for c in _geo_candidates:
                         _geo_breaker.pop((c, 0), None)
                 else:
@@ -2212,7 +2725,16 @@ async def _enforce_geo_gate(route: dict, request: Request, *, is_stream: bool, p
                     _geo_breaker[(c, 0)] = _geo_breaker.get((c, 0), 0) + 1
                 if _geo_mode == "strict":
                     _geo_block_total += 1
-                    return JSONResponse(status_code=503, content={"error": {"message": "Geo pin queue saturated", "type": "geo_unavailable"}}, headers={"X-Geo-Blocked": "1", "Retry-After": "0"})
+                    return JSONResponse(
+                        status_code=503,
+                        content={
+                            "error": {
+                                "message": "Geo pin queue saturated",
+                                "type": "geo_unavailable",
+                            }
+                        },
+                        headers={"X-Geo-Blocked": "1", "Retry-After": "0"},
+                    )
                 request.state._geo_fallback = True  # type: ignore
                 request.state._geo_pinned = False  # type: ignore
                 return None
@@ -2224,10 +2746,25 @@ async def _enforce_geo_gate(route: dict, request: Request, *, is_stream: bool, p
         if _geo_mode == "strict" and not _geo_ok:
             _geo_block_total += 1
             if is_stream:
+
                 async def _geo_pin_fail_stream():
                     yield _geo_sse_error(route, _geo_current)
-                return StreamingResponse(_geo_pin_fail_stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Geo-Blocked": "1", "X-Geo-Mode": "strict", "X-Geo-Pinned": "false", "Retry-After": "0"})
-            return _geo_block_response(route, _geo_current, protocol, passthrough_451=_geo_passthrough)
+
+                return StreamingResponse(
+                    _geo_pin_fail_stream(),
+                    media_type="text/event-stream",
+                    headers={
+                        "Cache-Control": "no-cache",
+                        "Connection": "keep-alive",
+                        "X-Geo-Blocked": "1",
+                        "X-Geo-Mode": "strict",
+                        "X-Geo-Pinned": "false",
+                        "Retry-After": "0",
+                    },
+                )
+            return _geo_block_response(
+                route, _geo_current, protocol, passthrough_451=_geo_passthrough
+            )
         elif _geo_mode == "prefer" and not _geo_ok:
             request.state._geo_fallback = True  # type: ignore
         else:
@@ -2266,8 +2803,10 @@ def _auth_window_message(status: int) -> str:
     if status == 401:
         return "All API keys exhausted (unauthorized). Check your API keys."
     if status == 403:
-        return ("Upstream access denied (403) — model/region may be restricted for "
-                "this key. Try again later or check key permissions.")
+        return (
+            "Upstream access denied (403) — model/region may be restricted for "
+            "this key. Try again later or check key permissions."
+        )
     return f"Upstream error (HTTP {status}). Try again later."
 
 
@@ -2284,7 +2823,6 @@ async def _forward_post(endpoint, json, headers):
     except Exception:
         _cb_record_failure(endpoint)
         raise
-
 
 
 # ── Shared helper functions for endpoint handlers ──────────────
@@ -2315,9 +2853,11 @@ def _current_free_identity(station=None) -> dict:
     default when no VPN manager is present — identical behavior to before
     identity rotation existed.
     """
-    mgr = (station if station is not None
-           else (_free_ip_pool.active_station if _free_ip_pool else None)
-           or _vpn_manager)
+    mgr = (
+        station
+        if station is not None
+        else (_free_ip_pool.active_station if _free_ip_pool else None) or _vpn_manager
+    )
     if mgr:
         # [Axe 3.1] A static SOCKS5 proxy has no docker identity machinery
         # (no current_identity) — the chrome131 default below is correct
@@ -2362,9 +2902,12 @@ def _free_request_headers(headers: dict) -> dict:
     x-stainless-* SDK identifiers. Protocol headers (anthropic-version)
     survive — they identify the API shape, not the account.
     """
-    return {k: v for k, v in headers.items()
-            if k.lower() not in ("authorization", "x-api-key", "cookie", "x-request-id")
-            and not k.lower().startswith("x-stainless-")}
+    return {
+        k: v
+        for k, v in headers.items()
+        if k.lower() not in ("authorization", "x-api-key", "cookie", "x-request-id")
+        and not k.lower().startswith("x-stainless-")
+    }
 
 
 def _is_connect_error(e: Exception) -> bool:
@@ -2380,6 +2923,7 @@ def _is_connect_error(e: Exception) -> bool:
     (raise_for_status is False).
     """
     import curl_cffi.requests.errors as _err
+
     if not isinstance(e, _err.RequestsError):
         return False
     try:
@@ -2418,12 +2962,18 @@ def _signal_connection_failure(station) -> None:
         sid = getattr(station, "_station", "?")
         _log(f"[free-ip] notify_connection_failure raised (station {sid})")
         logging.getLogger(__name__).exception(
-            "[free-ip] notify_connection_failure raised (station %s):", sid)
+            "[free-ip] notify_connection_failure raised (station %s):", sid
+        )
         raise
 
 
-async def _do_free_request_curl_cffi(body: dict, headers: dict, proxy_url: str | None = None,
-                                     station=None, endpoint: str | None = None):
+async def _do_free_request_curl_cffi(
+    body: dict,
+    headers: dict,
+    proxy_url: str | None = None,
+    station=None,
+    endpoint: str | None = None,
+):
     """Make a free model request using curl_cffi for TLS fingerprint evasion.
 
     Uses the current identity profile's TLS fingerprint (default chrome131)
@@ -2451,13 +3001,23 @@ async def _do_free_request_curl_cffi(body: dict, headers: dict, proxy_url: str |
         _ep = endpoint
     else:
         _ep = _cfg_settings._free_endpoint_for(body.get("model", ""))
-        if not _ep or _ep == _cfg_settings.API_BASE_FREE or _ep == _cfg_settings.API_BASE_FREE.replace("/chat/completions", "/v1/responses"):
+        if (
+            not _ep
+            or _ep == _cfg_settings.API_BASE_FREE
+            or _ep == _cfg_settings.API_BASE_FREE.replace("/chat/completions", "/v1/responses")
+        ):
             _ep = API_BASE_FREE
         if not _ep:
             _ep = API_BASE_FREE
             _ep = API_BASE_FREE
         elif "/responses" in _ep and API_BASE_FREE != _cfg_settings.API_BASE_FREE:
-            _ep = API_BASE_FREE.replace("/chat/completions", "/responses").replace("/v1/chat/completions", "/v1/responses") if "/chat/completions" in API_BASE_FREE else _ep
+            _ep = (
+                API_BASE_FREE.replace("/chat/completions", "/responses").replace(
+                    "/v1/chat/completions", "/v1/responses"
+                )
+                if "/chat/completions" in API_BASE_FREE
+                else _ep
+            )
     try:
         async with sess_lock:
             resp = await sess.post(
@@ -2494,7 +3054,7 @@ def _curl_proxy_url(proxy_url: str | None) -> str | None:
     answers in <1 s. httpx is untouched — it never sees this conversion.
     """
     if proxy_url and proxy_url.startswith("socks5://"):
-        return "socks5h://" + proxy_url[len("socks5://"):]
+        return "socks5h://" + proxy_url[len("socks5://") :]
     return proxy_url
 
 
@@ -2508,28 +3068,29 @@ class _CurlCffiResponse:
 
     @property
     def text(self) -> str:
-        if hasattr(self, '_text_override'):
+        if hasattr(self, "_text_override"):
             return self._text_override
         if isinstance(self._resp.content, bytes):
             return self._resp.content.decode("utf-8", errors="replace")
         return str(self._resp.content)
-    
+
     @text.setter
     def text(self, value: str):
         self._text_override = value
 
     @property
     def content(self) -> bytes:
-        if hasattr(self, '_content_override'):
+        if hasattr(self, "_content_override"):
             return self._content_override
         return self._resp.content
-    
+
     @content.setter
     def content(self, value: bytes):
         self._content_override = value
 
     def json(self):
         import json
+
         return _json_loads(self.text)
 
 
@@ -2589,7 +3150,9 @@ class _FreeTunnelFailure(Exception):
     """
 
     def __init__(self, station, cause):
-        super().__init__(f"free tunnel failure on station {getattr(station, '_station', '?')}: {cause}")
+        super().__init__(
+            f"free tunnel failure on station {getattr(station, '_station', '?')}: {cause}"
+        )
         self.station = station
         self.cause = cause
 
@@ -2624,14 +3187,18 @@ def effective_free_max_attempts(forced_pool=None) -> int:
                     # the same predicate _station_usable uses for geo)
                     cnt = 0
                     for _st in getattr(_free_ip_pool, "_stations", []) or []:
-                        if _free_ip_pool._station_usable(_st, exclude_approaching=False, forced_pool=forced_pool):
+                        if _free_ip_pool._station_usable(
+                            _st, exclude_approaching=False, forced_pool=forced_pool
+                        ):
                             cnt += 1
                     # only narrow, never widen (None-country stations stay usable)
                     if cnt < usable:
                         usable = cnt
                 usable = max(1, min(int(usable or 1), 3))
             if manual > usable:
-                _debug(f"  [free] WARN manual max_free_attempts={manual} > usable={usable} (auto=false) — clamping effective to {usable} would waste retries")
+                _debug(
+                    f"  [free] WARN manual max_free_attempts={manual} > usable={usable} (auto=false) — clamping effective to {usable} would waste retries"
+                )
         except Exception:
             pass
         return manual
@@ -2650,7 +3217,9 @@ def effective_free_max_attempts(forced_pool=None) -> int:
             if forced_pool is not None and _free_ip_pool is not None:
                 cnt = 0
                 for _st in getattr(_free_ip_pool, "_stations", []) or []:
-                    if _free_ip_pool._station_usable(_st, exclude_approaching=False, forced_pool=forced_pool):
+                    if _free_ip_pool._station_usable(
+                        _st, exclude_approaching=False, forced_pool=forced_pool
+                    ):
                         cnt += 1
                 if cnt < n:
                     n = cnt
@@ -2683,12 +3252,23 @@ def _free_exception_fallback_mode() -> str:
 
 def _free_attempts_active(forced_pool=None) -> bool:
     """Free re-strike budget is active (>1 attempt or station-first)."""
-    return effective_free_max_attempts(forced_pool) > 1 or _free_exception_fallback_mode() == "station-first"
+    return (
+        effective_free_max_attempts(forced_pool) > 1
+        or _free_exception_fallback_mode() == "station-first"
+    )
 
 
 @asynccontextmanager
-async def _open_free_stream(endpoint, body, headers, use_free: bool, count_request: bool = True,
-                            fresh_station: bool = False, direct_fallback: bool = True, forced_pool=None):
+async def _open_free_stream(
+    endpoint,
+    body,
+    headers,
+    use_free: bool,
+    count_request: bool = True,
+    fresh_station: bool = False,
+    direct_fallback: bool = True,
+    forced_pool=None,
+):
     """Context manager: upstream stream, routed through the VPN when free.
 
     use_free=True and VPN available → curl_cffi stream via the SOCKS5 tunnel
@@ -2716,7 +3296,9 @@ async def _open_free_stream(endpoint, body, headers, use_free: bool, count_reque
     another station (fresh IP = fresh quota). True = legacy behavior (the
     direct fallback is the existing semantics).
     """
-    _debug(f"  [free-stream] _open_free_stream called: use_free={use_free} pool={_free_ip_pool is not None} pool_enabled={_free_ip_pool.enabled if _free_ip_pool else False}")
+    _debug(
+        f"  [free-stream] _open_free_stream called: use_free={use_free} pool={_free_ip_pool is not None} pool_enabled={_free_ip_pool.enabled if _free_ip_pool else False}"
+    )
     if use_free and _free_ip_pool and _free_ip_pool.enabled:
         _debug(f"  [free-stream] getting proxy from pool...")
         if count_request:
@@ -2728,10 +3310,10 @@ async def _open_free_stream(endpoint, body, headers, use_free: bool, count_reque
             _prev = _current_free_attempt.get() or {}
             try:
                 proxy_url, station = await _free_ip_pool.on_disconnect_retry(
-                    _prev.get("station"), forced_pool)
+                    _prev.get("station"), forced_pool
+                )
             except TypeError:
-                proxy_url, station = await _free_ip_pool.on_disconnect_retry(
-                    _prev.get("station"))
+                proxy_url, station = await _free_ip_pool.on_disconnect_retry(_prev.get("station"))
         else:
             # Retry after a network error: re-use the SAME station/proxy as
             # the original attempt. Reading the fresh ``proxy_url`` property
@@ -2745,25 +3327,35 @@ async def _open_free_stream(endpoint, body, headers, use_free: bool, count_reque
             station = _attempt.get("station") if proxy_url else None
         _debug(f"  [free-stream] pool result: proxy_url={proxy_url is not None}")
         if not proxy_url:
-            _debug(f"  [free-stream] ⚠️ no VPN proxy — free endpoint is geo-restricted, direct connection will likely 400")
+            _debug(
+                f"  [free-stream] ⚠️ no VPN proxy — free endpoint is geo-restricted, direct connection will likely 400"
+            )
         if proxy_url:
             try:
                 from curl_cffi.requests import AsyncSession
+
                 station = station or (_free_ip_pool.active_station if proxy_url else None)
                 profile = _current_free_identity(station)
-                _current_free_attempt.set({"ip": _free_usage_ip(station),
-                                           "identity": profile.get("impersonate") or "",
-                                           "station": station,
-                                           "proxy_url": proxy_url})
-                req_headers = _apply_identity(_free_request_headers(headers),
-                                              profile, use_curated_ua=False)
+                _current_free_attempt.set(
+                    {
+                        "ip": _free_usage_ip(station),
+                        "identity": profile.get("impersonate") or "",
+                        "station": station,
+                        "proxy_url": proxy_url,
+                    }
+                )
+                req_headers = _apply_identity(
+                    _free_request_headers(headers), profile, use_curated_ua=False
+                )
                 req_headers["Content-Type"] = "application/json"
                 # [plan 18/08 §1a/am.21] connect timeout 30 → 10: in mono-station
                 # the request IS the arming signal (bad-mark is C1-forbidden) —
                 # the first failure reaches the manager in ≤10-15 s, not 30. Read
                 # 600 unchanged (long streams). SOCKS5+TLS handshake ≈ 1-2 s on a
                 # healthy tunnel — no legitimate request is impacted.
-                _debug(f"  [free-stream] creating curl_cffi session proxy={_curl_proxy_url(proxy_url)} (pooled)")
+                _debug(
+                    f"  [free-stream] creating curl_cffi session proxy={_curl_proxy_url(proxy_url)} (pooled)"
+                )
                 sess2, lock2 = await _get_pooled_curl_session(proxy_url, profile["impersonate"])
                 async with lock2:
                     _debug(f"  [free-stream] posting to {endpoint} (pooled)")
@@ -2778,14 +3370,12 @@ async def _open_free_stream(endpoint, body, headers, use_free: bool, count_reque
                 # here). Unregistered in the finally below. The registry is
                 # OPTIONAL pool protocol — a double without it (invariant
                 # tests) must not break the request path: hasattr guard.
-                if _free_ip_pool is not None and hasattr(
-                        _free_ip_pool, "register_stream"):
+                if _free_ip_pool is not None and hasattr(_free_ip_pool, "register_stream"):
                     _free_ip_pool.register_stream(station, asyncio.current_task())
                 try:
                     yield wrapped
                 finally:
-                    if _free_ip_pool is not None and hasattr(
-                            _free_ip_pool, "unregister_stream"):
+                    if _free_ip_pool is not None and hasattr(_free_ip_pool, "unregister_stream"):
                         _free_ip_pool.unregister_stream(station, asyncio.current_task())
                     try:
                         await resp.aclose()
@@ -2818,17 +3408,23 @@ async def _open_free_stream(endpoint, body, headers, use_free: bool, count_reque
                     try:
                         _signal_connection_failure(station)
                     except Exception:
-                        _log("[free-ip] notify-step raised at the call site "
-                             "(traceback above) — swallowed to preserve the "
-                             "station-first retry")
+                        _log(
+                            "[free-ip] notify-step raised at the call site "
+                            "(traceback above) — swallowed to preserve the "
+                            "station-first retry"
+                        )
                 if not direct_fallback:
                     # [plan 19/08 §2] station-first mode with remaining free
                     # budget → re-raise so the caller's retry loop strikes
                     # ANOTHER station (fresh IP = fresh quota) before the
                     # residential-IP direct fallback is ever considered.
                     raise _FreeTunnelFailure(station, e) from e
-                _debug(f"  [stream] curl_cffi proxy stream failed: {e}, falling back to direct stream")
-                _log(f"  FREE STREAM via VPN tunnel FAILED ({e}) → direct fallback (residential IP)")
+                _debug(
+                    f"  [stream] curl_cffi proxy stream failed: {e}, falling back to direct stream"
+                )
+                _log(
+                    f"  FREE STREAM via VPN tunnel FAILED ({e}) → direct fallback (residential IP)"
+                )
     if use_free:
         # Direct fallback to the free endpoint: never forward the paid key,
         # cookies or SDK identifiers (invariant A.0), stamp the identity UA.
@@ -2837,13 +3433,19 @@ async def _open_free_stream(endpoint, body, headers, use_free: bool, count_reque
         # it in the ContextVar before the accident): a disconnect retry must
         # switch AWAY from it on_disconnect_retry, not re-strike the same IP.
         _prev_attempt = _current_free_attempt.get() or {}
-        _current_free_attempt.set({"ip": _free_usage_ip(),
-                                   "identity": profile.get("impersonate") or "",
-                                   "station": _prev_attempt.get("station"),
-                                   "proxy_url": None})
+        _current_free_attempt.set(
+            {
+                "ip": _free_usage_ip(),
+                "identity": profile.get("impersonate") or "",
+                "station": _prev_attempt.get("station"),
+                "proxy_url": None,
+            }
+        )
         free_headers = _apply_identity(_free_request_headers(headers), profile, use_curated_ua=True)
         free_headers["Content-Type"] = "application/json"
-        async with _ensure_http_client().stream("POST", endpoint, json=body, headers=free_headers) as resp:
+        async with _ensure_http_client().stream(
+            "POST", endpoint, json=body, headers=free_headers
+        ) as resp:
             yield resp
         return
     # [Axe A] Paid request with forced tunnel: route through VPN pool when
@@ -2851,8 +3453,9 @@ async def _open_free_stream(endpoint, body, headers, use_free: bool, count_reque
     # Reuses _open_via_pool which selects a station from forced_pool via
     # _free_ip_pool.on_request() and streams through curl_cffi + SOCKS5.
     if forced_pool and _free_ip_pool and _free_ip_pool.enabled:
-        async with _open_via_pool(endpoint, body, headers, is_stream=True,
-                                  forced_pool=forced_pool) as resp:
+        async with _open_via_pool(
+            endpoint, body, headers, is_stream=True, forced_pool=forced_pool
+        ) as resp:
             yield resp
         return
     async with _ensure_http_client().stream("POST", endpoint, json=body, headers=headers) as resp:
@@ -2901,25 +3504,26 @@ async def _open_via_pool(endpoint, body, headers, *, is_stream=False, forced_poo
     resp = None
     try:
         from curl_cffi.requests import AsyncSession
+
         session = AsyncSession(
             impersonate=profile.get("impersonate", "chrome131"),
             proxy=_curl_proxy_url(proxy_url),
             timeout=(10, 600),  # connect 10 / read 600
         )
         if is_stream:
-            resp = await session.post(
-                endpoint, json=body, headers=req_headers, stream=True)
+            resp = await session.post(endpoint, json=body, headers=req_headers, stream=True)
             yield _CurlCffiStreamResponse(resp)
         else:
-            resp = await session.post(
-                endpoint, json=body, headers=req_headers, stream=False)
+            resp = await session.post(endpoint, json=body, headers=req_headers, stream=False)
             yield _CurlCffiResponse(resp)
     except UpstreamError:
         raise
     except Exception as e:
         _signal_connection_failure(station)
         raise UpstreamError(
-            f"Geo tunnel request failed: {e}", status_code=502, original=e,
+            f"Geo tunnel request failed: {e}",
+            status_code=502,
+            original=e,
         ) from e
     finally:
         if resp is not None:
@@ -2941,6 +3545,7 @@ async def _open_via_pool(endpoint, body, headers, *, is_stream=False, forced_poo
 # the direct egress (or vice versa) across a VPN transition.
 _public_ip_cache = {"ip": "", "ts": 0.0, "via_tunnel": False}
 
+
 async def _get_cached_public_ip() -> str:
     """Get the real egress IP, cached for 60s to avoid flooding.
 
@@ -2949,17 +3554,18 @@ async def _get_cached_public_ip() -> str:
     residential IP. Falls back to the direct egress only when there is no
     tunnel. Never raises.
     """
-    expect_tunnel = bool(_vpn_manager and _vpn_manager.current_ip
-                         and getattr(_vpn_manager, "socks5_url", None))
+    expect_tunnel = bool(
+        _vpn_manager and _vpn_manager.current_ip and getattr(_vpn_manager, "socks5_url", None)
+    )
     now = time.monotonic()
     cached = _public_ip_cache
     if cached["ip"] and now - cached["ts"] < 60 and cached["via_tunnel"] == expect_tunnel:
         return cached["ip"]
     try:
         import httpx
+
         proxy = _vpn_manager.socks5_url if expect_tunnel else None
-        async with httpx.AsyncClient(timeout=10 if expect_tunnel else 5,
-                                     proxy=proxy) as client:
+        async with httpx.AsyncClient(timeout=10 if expect_tunnel else 5, proxy=proxy) as client:
             resp = await client.get("https://api.ipify.org")
             ip = resp.text.strip()
     except Exception:
@@ -2980,6 +3586,7 @@ async def _get_direct_ip() -> str:
     resolve the residential egress IP regardless of VPN state.
     """
     import httpx as _httpx_ip
+
     try:
         async with _httpx_ip.AsyncClient(timeout=5) as _client:
             resp = await _client.get("https://api.ipify.org")
@@ -2992,6 +3599,7 @@ async def _get_direct_ip() -> str:
 
 
 _direct_ip_cache = {"ip": "", "ts": 0.0}
+
 
 async def _direct_country() -> str:
     """Resolve the direct (non-tunnel) egress country, cached 10 min.
@@ -3028,6 +3636,7 @@ async def _direct_country() -> str:
     country = "unknown"
     try:
         import httpx as _httpx_geo
+
         # Direct lookup — never via tunnel (we want the residential egress)
         async with _httpx_geo.AsyncClient(timeout=5) as _client:
             # ip-api.com line format: country is plain text field
@@ -3183,8 +3792,9 @@ def _is_watchdog_cancelled(station) -> bool:
     pool = _free_ip_pool
     if station is None or pool is None:
         return False
-    return getattr(pool, "is_watchdog_cancelled",
-                   lambda *a, **k: False)(station, asyncio.current_task())
+    return getattr(pool, "is_watchdog_cancelled", lambda *a, **k: False)(
+        station, asyncio.current_task()
+    )
 
 
 def _free_stations_exhausted(free_model: str) -> bool:
@@ -3216,8 +3826,7 @@ def _free_stations_exhausted(free_model: str) -> bool:
         return True
     if not _free_ip_pool._stations:
         return True
-    if getattr(_free_ip_pool, "any_rotation_in_flight",
-               lambda: False)():
+    if getattr(_free_ip_pool, "any_rotation_in_flight", lambda: False)():
         return False
     for st in _free_ip_pool._stations:
         if _free_ip_pool._station_usable(st, exclude_approaching=False):
@@ -3226,8 +3835,7 @@ def _free_stations_exhausted(free_model: str) -> bool:
     return True
 
 
-def _on_free_429_stream(free_model: str, retry_after: str = "",
-                        forced_pool=None) -> bool:
+def _on_free_429_stream(free_model: str, retry_after: str = "", forced_pool=None) -> bool:
     """Free endpoint 429 during streaming: cooldown + paid fallback.
 
     Returns True when the request must be REFUSED (strict_free mode and
@@ -3288,11 +3896,17 @@ def _free_quota_exhausted_response(exc: FreeQuotaExhausted, protocol: str):
     """HTTP refusal for strict_free exhaustion (non-stream requests)."""
     retry_after = exc.retry_after or "60"
     if protocol == "anthropic":
-        resp = _anthropic_error(429, f"Free quota exhausted on all VPN stations. Retry after {retry_after}s.",
-                                error_type="rate_limit_error")
+        resp = _anthropic_error(
+            429,
+            f"Free quota exhausted on all VPN stations. Retry after {retry_after}s.",
+            error_type="rate_limit_error",
+        )
     else:
-        resp = _openai_error(429, f"Free quota exhausted on all VPN stations. Retry after {retry_after}s.",
-                             error_type="rate_limit_error")
+        resp = _openai_error(
+            429,
+            f"Free quota exhausted on all VPN stations. Retry after {retry_after}s.",
+            error_type="rate_limit_error",
+        )
     resp.headers["Retry-After"] = retry_after
     return resp
 
@@ -3330,7 +3944,13 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
     free_endpoint = _cfg_settings._free_endpoint_for(free_model)
     if API_BASE_FREE != _cfg_settings.API_BASE_FREE:
         if "/responses" in free_endpoint:
-            free_endpoint = API_BASE_FREE.replace("/chat/completions", "/responses").replace("/v1/chat/completions", "/v1/responses") if "/chat/completions" in API_BASE_FREE else free_endpoint
+            free_endpoint = (
+                API_BASE_FREE.replace("/chat/completions", "/responses").replace(
+                    "/v1/chat/completions", "/v1/responses"
+                )
+                if "/chat/completions" in API_BASE_FREE
+                else free_endpoint
+            )
         else:
             free_endpoint = API_BASE_FREE
 
@@ -3379,9 +3999,12 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
 
     # Free models don't need authentication — minimal headers + identity UA
     free_profile = _current_free_identity(station)
-    _current_free_attempt.set({"ip": free_ip, "identity": free_profile.get("impersonate") or "",
-                               "station": station})
-    free_headers = _apply_identity({"Content-Type": "application/json"}, free_profile, use_curated_ua=True)
+    _current_free_attempt.set(
+        {"ip": free_ip, "identity": free_profile.get("impersonate") or "", "station": station}
+    )
+    free_headers = _apply_identity(
+        {"Content-Type": "application/json"}, free_profile, use_curated_ua=True
+    )
     free_api_key = "free (no auth)"
     free_workspace = "free (no auth)"
 
@@ -3440,8 +4063,11 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
                     # pass so a request still gets its free shot.
                     attempt = _free_ip_pool._socks5_next(excluded=tried)
                 else:
-                    attempt = (_free_ip_pool._best_station_excluding_many(tried, forced_pool) if tried
-                               else _free_ip_pool._best_station(forced_pool))
+                    attempt = (
+                        _free_ip_pool._best_station_excluding_many(tried, forced_pool)
+                        if tried
+                        else _free_ip_pool._best_station(forced_pool)
+                    )
                 if attempt is not None:
                     tried.add(attempt)
             else:
@@ -3451,17 +4077,26 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
             _free_used += 1
             _free_elapsed = int((time.monotonic() - t0) * 1000)
             try:
-                resp = await _do_free_request_curl_cffi(free_body, free_headers,
-                                                        attempt.socks5_url, station=attempt, endpoint=free_endpoint)
+                resp = await _do_free_request_curl_cffi(
+                    free_body,
+                    free_headers,
+                    attempt.socks5_url,
+                    station=attempt,
+                    endpoint=free_endpoint,
+                )
                 if attempt.current_ip:
                     free_ip = attempt.current_ip
                 elif getattr(attempt, "pid", None):
                     # [Axe 3.1] Static proxy: no docker IP — log its id so
                     # usage rows distinguish the proxies.
                     free_ip = attempt.pid
-                _current_free_attempt.set({"ip": free_ip,
-                                           "identity": _current_free_identity(attempt).get("impersonate") or "",
-                                           "station": attempt})
+                _current_free_attempt.set(
+                    {
+                        "ip": free_ip,
+                        "identity": _current_free_identity(attempt).get("impersonate") or "",
+                        "station": attempt,
+                    }
+                )
                 station = attempt  # cooldown key + on_quota_exhausted must target THIS IP
                 if resp.status_code == 429 and _free_used < free_max:
                     # 429 = this station's bucket exhausted → cooldown
@@ -3469,19 +4104,31 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
                     # FRESH station while the budget lasts ([plan 19/08 §1]:
                     # each attempt a fresh IP; a same-IP retry would burn
                     # the budget on a guaranteed ✘).
-                    _log_free_model_usage(model_id, free_model, free_api_key,
-                                          free_workspace, 429, 0, 0,
-                                          _free_elapsed, ip=free_ip)
-                    _set_free_cooldown(free_model,
-                                       _free_429_cooldown_seconds(resp.headers.get('retry-after', '') or ''),
-                                       attempt)
+                    _log_free_model_usage(
+                        model_id,
+                        free_model,
+                        free_api_key,
+                        free_workspace,
+                        429,
+                        0,
+                        0,
+                        _free_elapsed,
+                        ip=free_ip,
+                    )
+                    _set_free_cooldown(
+                        free_model,
+                        _free_429_cooldown_seconds(resp.headers.get("retry-after", "") or ""),
+                        attempt,
+                    )
                     if _free_ip_pool:
                         try:
                             _free_ip_pool.on_quota_exhausted(attempt, forced_pool=forced_pool)
                         except TypeError:
                             _free_ip_pool.on_quota_exhausted(attempt)
-                    _log(f"  FREE {free_model!r} RATE LIMITED (429) on station {attempt._station} → "
-                         f"retry station fraîche (essai {_free_used + 1}/{free_max})")
+                    _log(
+                        f"  FREE {free_model!r} RATE LIMITED (429) on station {attempt._station} → "
+                        f"retry station fraîche (essai {_free_used + 1}/{free_max})"
+                    )
                     resp = None
                     continue
                 break  # 200, final-429 or other status → shared handling below
@@ -3491,11 +4138,15 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
                     # [plan 19/08 §2] station-first: a dead tunnel retries
                     # another station BEFORE the residential-IP direct
                     # fallback (whose bucket is long exhausted).
-                    _log(f"  FREE via station {attempt._station} tunnel FAILED ({e}) → "
-                         f"retry station fraîche (essai {_free_used + 1}/{free_max})")
+                    _log(
+                        f"  FREE via station {attempt._station} tunnel FAILED ({e}) → "
+                        f"retry station fraîche (essai {_free_used + 1}/{free_max})"
+                    )
                     continue
                 # station-first budget spent, or direct mode → legacy fallback
-                _log(f"  FREE via station {attempt._station} tunnel FAILED ({e}) → direct fallback (residential IP)")
+                _log(
+                    f"  FREE via station {attempt._station} tunnel FAILED ({e}) → direct fallback (residential IP)"
+                )
                 resp = None
                 break
         if resp is None:
@@ -3505,8 +4156,9 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
                     free_endpoint, free_body, free_headers, protocol, retry_on_429=False
                 )
             except UpstreamError:
-                _log_free_model_usage(model_id, free_model, free_api_key,
-                                      free_workspace, 502, ip=free_ip)
+                _log_free_model_usage(
+                    model_id, free_model, free_api_key, free_workspace, 502, ip=free_ip
+                )
                 return None
     else:
         try:
@@ -3514,21 +4166,30 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
                 free_endpoint, free_body, free_headers, protocol, retry_on_429=False
             )
         except UpstreamError:
-            _log_free_model_usage(model_id, free_model, free_api_key,
-                                  free_workspace, 502, ip=free_ip)
+            _log_free_model_usage(
+                model_id, free_model, free_api_key, free_workspace, 502, ip=free_ip
+            )
             return None
 
     elapsed_ms = int((time.monotonic() - t0) * 1000)
 
     if _free_is_responses and resp.status_code == 200:
         try:
-            rdata = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
-            _debug(f"  [free] raw response keys: {list(rdata.keys()) if isinstance(rdata, dict) else 'not dict'}")
-            if isinstance(rdata, dict) and 'output' in rdata:
+            rdata = (
+                resp.json()
+                if resp.headers.get("content-type", "").startswith("application/json")
+                else {}
+            )
+            _debug(
+                f"  [free] raw response keys: {list(rdata.keys()) if isinstance(rdata, dict) else 'not dict'}"
+            )
+            if isinstance(rdata, dict) and "output" in rdata:
                 _debug(f"  [free] output items: {len(rdata.get('output', []))} items")
-                for i, item in enumerate(rdata.get('output', [])[:3]):
+                for i, item in enumerate(rdata.get("output", [])[:3]):
                     if isinstance(item, dict):
-                        _debug(f"  [free] item {i}: type={item.get('type')}, keys={list(item.keys())}")
+                        _debug(
+                            f"  [free] item {i}: type={item.get('type')}, keys={list(item.keys())}"
+                        )
             if protocol == "anthropic":
                 cdata = _responses_to_anthropic_response(rdata, free_model)
                 usage = cdata.get("usage", {})
@@ -3539,8 +4200,20 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
                 usage = cdata.get("usage", {})
                 tokens_in = usage.get("prompt_tokens", 0)
                 tokens_out = usage.get("completion_tokens", 0)
-            _log_free_model_usage(model_id, free_model, free_api_key, free_workspace, resp.status_code, tokens_in, tokens_out, elapsed_ms, ip=free_ip)
-            _debug(f"  [free] {free_model!r} succeeded ({tokens_in}+{tokens_out} tokens) via /responses")
+            _log_free_model_usage(
+                model_id,
+                free_model,
+                free_api_key,
+                free_workspace,
+                resp.status_code,
+                tokens_in,
+                tokens_out,
+                elapsed_ms,
+                ip=free_ip,
+            )
+            _debug(
+                f"  [free] {free_model!r} succeeded ({tokens_in}+{tokens_out} tokens) via /responses"
+            )
             wrapped = _CurlCffiResponse.__new__(_CurlCffiResponse)
             wrapped._resp = resp._resp if hasattr(resp, "_resp") else resp
             wrapped.status_code = 200
@@ -3557,16 +4230,28 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
     tokens_in = tokens_out = 0
     if resp.status_code == 200:
         try:
-            data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+            data = (
+                resp.json()
+                if resp.headers.get("content-type", "").startswith("application/json")
+                else {}
+            )
             usage = data.get("usage", {})
             tokens_in = usage.get("prompt_tokens", 0) or usage.get("input_tokens", 0)
             tokens_out = usage.get("completion_tokens", 0) or usage.get("output_tokens", 0)
         except Exception:
             pass
 
-    _log_free_model_usage(model_id, free_model, free_api_key,
-                          free_workspace, resp.status_code,
-                          tokens_in, tokens_out, elapsed_ms, ip=free_ip)
+    _log_free_model_usage(
+        model_id,
+        free_model,
+        free_api_key,
+        free_workspace,
+        resp.status_code,
+        tokens_in,
+        tokens_out,
+        elapsed_ms,
+        ip=free_ip,
+    )
 
     if resp.status_code == 200:
         _debug(f"  [free] {free_model!r} succeeded ({tokens_in}+{tokens_out} tokens)")
@@ -3577,18 +4262,28 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
     if resp.status_code == 429:
         # Read and log the 429 response body for quota analysis
         try:
-            body_429 = resp.text[:500] if hasattr(resp, 'text') else ''
+            body_429 = resp.text[:500] if hasattr(resp, "text") else ""
         except Exception:
-            body_429 = ''
+            body_429 = ""
         # Extract retry-after header (seconds until quota resets)
-        retry_after = resp.headers.get('retry-after', '')
+        retry_after = resp.headers.get("retry-after", "")
         # Also log response headers (may contain X-RateLimit-*)
-        headers_429 = {k: v for k, v in resp.headers.items()
-                       if k.lower() in ('retry-after', 'x-ratelimit-limit',
-                                         'x-ratelimit-remaining', 'x-ratelimit-reset',
-                                         'content-type')}
+        headers_429 = {
+            k: v
+            for k, v in resp.headers.items()
+            if k.lower()
+            in (
+                "retry-after",
+                "x-ratelimit-limit",
+                "x-ratelimit-remaining",
+                "x-ratelimit-reset",
+                "content-type",
+            )
+        }
         _debug(f"  [free] {free_model!r} 429 body={_redact(body_429)!r} headers={headers_429}")
-        _log(f"  FREE {free_model!r} RATE LIMITED (429) retry-after={retry_after}s → falling back to paid {model_id!r}")
+        _log(
+            f"  FREE {free_model!r} RATE LIMITED (429) retry-after={retry_after}s → falling back to paid {model_id!r}"
+        )
 
         # Per-(model, IP) cooldown honoring the upstream retry-after ([4])
         # + background IP rotation ([0]/[42]): the key is (model, the
@@ -3612,10 +4307,13 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
     # Other errors → cooldown (60 s) so the next request doesn't retry the
     # free model immediately, then fall back to paid
     try:
-        _dbg_body = _truncate(free_body) if 'free_body' in locals() else ""
-        _dbg_resp = _redact(getattr(resp, 'text', '')[:2000]) if hasattr(resp, 'text') else ""
-    except: _dbg_body,_dbg_resp="",""
-    _debug(f"  [free] {free_model!r} returned {resp.status_code} body={_dbg_body[:2500]} resp={_dbg_resp[:2000]} → falling back to paid")
+        _dbg_body = _truncate(free_body) if "free_body" in locals() else ""
+        _dbg_resp = _redact(getattr(resp, "text", "")[:2000]) if hasattr(resp, "text") else ""
+    except:
+        _dbg_body, _dbg_resp = "", ""
+    _debug(
+        f"  [free] {free_model!r} returned {resp.status_code} body={_dbg_body[:2500]} resp={_dbg_resp[:2000]} → falling back to paid"
+    )
     _set_free_cooldown(free_model, 60, station)
     return None
 
@@ -3635,25 +4333,35 @@ async def _do_request_with_retry(endpoint, body, headers, protocol, retry_on_429
 
     while attempt < max_retries:
         if DEBUG:
-            _debug(f"  → upstream POST {endpoint} attempt {attempt+1}/{max_retries} headers={_sanitize_headers(headers)}")
+            _debug(
+                f"  → upstream POST {endpoint} attempt {attempt + 1}/{max_retries} headers={_sanitize_headers(headers)}"
+            )
         t0 = time.monotonic()
         try:
             resp = await _ensure_http_client().post(endpoint, json=body, headers=headers)
         except httpx.ConnectError as e:
-            _debug(f"  ✗ connect error after {(time.monotonic()-t0)*1000:.0f}ms: {e}")
+            _debug(f"  ✗ connect error after {(time.monotonic() - t0) * 1000:.0f}ms: {e}")
             _log(f"  UPSTREAM CONNECT ERROR: {type(e).__name__}: {e}")
-            raise UpstreamError(f"Cannot connect to upstream: {e}", status_code=502, original=e) from e
+            raise UpstreamError(
+                f"Cannot connect to upstream: {e}", status_code=502, original=e
+            ) from e
         except httpx.TimeoutException as e:
-            _debug(f"  ✗ timeout after {(time.monotonic()-t0)*1000:.0f}ms: {e}")
+            _debug(f"  ✗ timeout after {(time.monotonic() - t0) * 1000:.0f}ms: {e}")
             _log(f"  UPSTREAM TIMEOUT: {type(e).__name__}: {e}")
-            raise UpstreamError(f"Upstream request timed out: {e}", status_code=504, original=e) from e
+            raise UpstreamError(
+                f"Upstream request timed out: {e}", status_code=504, original=e
+            ) from e
         except httpx.RequestError as e:
-            _debug(f"  ✗ request error after {(time.monotonic()-t0)*1000:.0f}ms: {e}")
+            _debug(f"  ✗ request error after {(time.monotonic() - t0) * 1000:.0f}ms: {e}")
             _log(f"  UPSTREAM REQUEST ERROR: {type(e).__name__}: {e}")
-            raise UpstreamError(f"Upstream request failed: {type(e).__name__}: {e}", status_code=502, original=e) from e
+            raise UpstreamError(
+                f"Upstream request failed: {type(e).__name__}: {e}", status_code=502, original=e
+            ) from e
 
         elapsed_ms = (time.monotonic() - t0) * 1000
-        _debug(f"  ← upstream {resp.status_code} in {elapsed_ms:.0f}ms | content-type={resp.headers.get('content-type', '?')}")
+        _debug(
+            f"  ← upstream {resp.status_code} in {elapsed_ms:.0f}ms | content-type={resp.headers.get('content-type', '?')}"
+        )
 
         # Key failover on 429 — does NOT consume a retry attempt
         if retry_on_429 and resp.status_code == 429 and len(API_KEYS) > 1:
@@ -3672,7 +4380,7 @@ async def _do_request_with_retry(endpoint, body, headers, protocol, retry_on_429
             failed_key = _key_from_headers(headers, protocol)
             # Log the 401 response body to help diagnose dead/revoked keys
             try:
-                _err_body = resp.text[:500] if hasattr(resp, 'text') else str(resp.content[:500])
+                _err_body = resp.text[:500] if hasattr(resp, "text") else str(resp.content[:500])
             except Exception:
                 _err_body = "(unable to read response body)"
             _debug(f"  [auth] 401 response body: {_redact(_err_body, 500)}")
@@ -3691,7 +4399,7 @@ async def _do_request_with_retry(endpoint, body, headers, protocol, retry_on_429
         if retry_on_429 and resp.status_code == 403 and len(API_KEYS) > 1:
             failed_key = _key_from_headers(headers, protocol)
             try:
-                _err_body = resp.text[:500] if hasattr(resp, 'text') else str(resp.content[:500])
+                _err_body = resp.text[:500] if hasattr(resp, "text") else str(resp.content[:500])
             except Exception:
                 _err_body = "(unable to read response body)"
             _debug(f"  [auth] 403 response body: {_redact(_err_body, 500)}")
@@ -3705,9 +4413,11 @@ async def _do_request_with_retry(endpoint, body, headers, protocol, retry_on_429
 
         # Retry on 502/503/504 with backoff — DOES consume a retry attempt
         if resp.status_code in _RETRYABLE_STATUSES and attempt < max_retries - 1:
-            wait = 1.0 * (2 ** attempt)  # 1s, 2s
+            wait = 1.0 * (2**attempt)  # 1s, 2s
             _debug(f"  ⟳ retry {resp.status_code} in {wait:.1f}s")
-            _log(f"  RETRY {resp.status_code} after {wait:.1f}s (attempt {attempt+1}/{max_retries})")
+            _log(
+                f"  RETRY {resp.status_code} after {wait:.1f}s (attempt {attempt + 1}/{max_retries})"
+            )
             await asyncio.sleep(wait)
             attempt += 1
             continue
@@ -3727,17 +4437,36 @@ def _update_token_usage(model_id, inp, out, cache):
             _token_usage[model_id]["input"] += inp
             _token_usage[model_id]["output"] += out
             _token_usage[model_id]["cache"] += cache
-        _debug(f"  [tokens] _update_token_usage: model={model_id} +{inp} in +{out} out +{cache} cache | totals: {_token_usage[model_id]}")
+        _debug(
+            f"  [tokens] _update_token_usage: model={model_id} +{inp} in +{out} out +{cache} cache | totals: {_token_usage[model_id]}"
+        )
     except Exception as e:
         _debug(f"  ✗ _update_token_usage failed: {type(e).__name__}: {e}")
         _log(f"  WARN: _update_token_usage failed for {model_id!r}: {type(e).__name__}: {e}")
 
 
-async def _save_and_log_request(req_id, model_id, original_model, start_time,
-                                 inp, out, cache, protocol, is_stream, thinking_type,
-                                 effort, client_ip, account_alias, tools, log_tag="",
-                                 tools_used=None, request_body=None, response_body=None,
-                                 free_model_ip=None, identity=None):
+async def _save_and_log_request(
+    req_id,
+    model_id,
+    original_model,
+    start_time,
+    inp,
+    out,
+    cache,
+    protocol,
+    is_stream,
+    thinking_type,
+    effort,
+    client_ip,
+    account_alias,
+    tools,
+    log_tag="",
+    tools_used=None,
+    request_body=None,
+    response_body=None,
+    free_model_ip=None,
+    identity=None,
+):
     """Log success and save to DB with success=True."""
     # Free-channel stamp first: the IP/identity of the free attempt beats the
     # current IP (mid-stream 429 + background rotation must keep the pre-rotation
@@ -3765,29 +4494,75 @@ async def _save_and_log_request(req_id, model_id, original_model, start_time,
         alias_tag = f" | vpn_ip={free_model_ip}"
     _log(f"  ← {model_id} | +{inp} in{log_tag} | +{out} out{log_tag} | +{cache} cache{alias_tag}")
     try:
-        await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
-                     inp, out, cache, success=True,
-                     protocol=protocol, is_stream=is_stream, thinking=thinking_type, effort=effort,
-                     client_ip=client_ip, account_alias=account_alias, tools=tools,
-                     tools_used=tools_used, request_body=request_body, response_body=response_body,
-                     free_model_ip=free_model_ip, identity=identity)
+        await _save_request(
+            req_id,
+            model_id,
+            original_model,
+            _elapsed_ms(start_time),
+            inp,
+            out,
+            cache,
+            success=True,
+            protocol=protocol,
+            is_stream=is_stream,
+            thinking=thinking_type,
+            effort=effort,
+            client_ip=client_ip,
+            account_alias=account_alias,
+            tools=tools,
+            tools_used=tools_used,
+            request_body=request_body,
+            response_body=response_body,
+            free_model_ip=free_model_ip,
+            identity=identity,
+        )
     except Exception as e:
         _debug(f"  ✗ save_request failed: {type(e).__name__}: {e}")
         _log(f"  WARN: save_request failed: {type(e).__name__}: {e}")
 
 
-async def _log_and_save_error(req_id, model_id, original_model, start_time,
-                               status_code, resp_text, protocol, is_stream, thinking_type,
-                               effort, client_ip, account_alias, tools, tools_used=None,
-                               request_body=None, response_body=None):
+async def _log_and_save_error(
+    req_id,
+    model_id,
+    original_model,
+    start_time,
+    status_code,
+    resp_text,
+    protocol,
+    is_stream,
+    thinking_type,
+    effort,
+    client_ip,
+    account_alias,
+    tools,
+    tools_used=None,
+    request_body=None,
+    response_body=None,
+):
     """Log error and save to DB with success=False."""
     _log(f"  ERROR {status_code}: {_redact(resp_text, 300)}")
     try:
-        await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
-                     0, 0, 0, success=False, error=f"HTTP {status_code}",
-                     protocol=protocol, is_stream=is_stream, thinking=thinking_type, effort=effort,
-                     client_ip=client_ip, account_alias=account_alias, tools=tools,
-                     tools_used=tools_used, request_body=request_body, response_body=response_body)
+        await _save_request(
+            req_id,
+            model_id,
+            original_model,
+            _elapsed_ms(start_time),
+            0,
+            0,
+            0,
+            success=False,
+            error=f"HTTP {status_code}",
+            protocol=protocol,
+            is_stream=is_stream,
+            thinking=thinking_type,
+            effort=effort,
+            client_ip=client_ip,
+            account_alias=account_alias,
+            tools=tools,
+            tools_used=tools_used,
+            request_body=request_body,
+            response_body=response_body,
+        )
     except Exception as e:
         _debug(f"  ✗ save_request (error path) failed: {type(e).__name__}: {e}")
         _log(f"  WARN: save_request (error path) failed: {type(e).__name__}: {e}")
@@ -3795,12 +4570,14 @@ async def _log_and_save_error(req_id, model_id, original_model, start_time,
 
 # ── Streaming helpers ───────────────────────────────────────────
 
+
 def _make_stream_retry_loop(protocol):
     """Return a retry function for streaming 429/401 handling.
 
     Returns (attempt_headers, should_retry) where should_retry=True means
     the caller should `continue` the outer loop.
     """
+
     async def _handle_429(headers, status_code, attempt, resp_headers=None, resp_text=None):
         # B4 idempotence: 400 never retries here (param=name would pause_key uselessly).
         # Credit 400 retry is handled explicitly in the non-stream caller after checking
@@ -3825,25 +4602,62 @@ def _make_stream_retry_loop(protocol):
                 _log(f"  {status_code} on key, retrying with alternative key")
                 return _get_auth_headers(protocol, entry=alt), True
         return headers, False
+
     return _handle_429
 
 
-async def _stream_error_response(req_id, model_id, original_model, start_time,
-                                  status_code, resp_body, protocol, thinking_type,
-                                  effort, client_ip, account_alias, tools,
-                                  error_payload, tools_used=None, request_body=None):
+async def _stream_error_response(
+    req_id,
+    model_id,
+    original_model,
+    start_time,
+    status_code,
+    resp_body,
+    protocol,
+    thinking_type,
+    effort,
+    client_ip,
+    account_alias,
+    tools,
+    error_payload,
+    tools_used=None,
+    request_body=None,
+):
     """Handle streaming error: log, save DB, yield error SSE event. Returns the error event bytes."""
     _log(f"  ERROR {status_code}: {_redact(resp_body, 300)}")
-    await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
-                 0, 0, 0, success=False, error=f"HTTP {status_code}",
-                 protocol=protocol, is_stream=True, thinking=thinking_type, effort=effort,
-                 client_ip=client_ip, account_alias=account_alias, tools=tools,
-                 tools_used=tools_used, request_body=request_body)
+    await _save_request(
+        req_id,
+        model_id,
+        original_model,
+        _elapsed_ms(start_time),
+        0,
+        0,
+        0,
+        success=False,
+        error=f"HTTP {status_code}",
+        protocol=protocol,
+        is_stream=True,
+        thinking=thinking_type,
+        effort=effort,
+        client_ip=client_ip,
+        account_alias=account_alias,
+        tools=tools,
+        tools_used=tools_used,
+        request_body=request_body,
+    )
     return _sse("error", error_payload)
 
 
-def _finalize_stream_tokens(model_id, est_input, stream_in, stream_out, stream_cache,
-                             actual_usage, _token_usage, _token_lock):
+def _finalize_stream_tokens(
+    model_id,
+    est_input,
+    stream_in,
+    stream_out,
+    stream_cache,
+    actual_usage,
+    _token_usage,
+    _token_lock,
+):
     """Reconcile estimated vs actual token counts after stream ends.
 
     Returns (final_in, final_out, final_cache, log_tag).
@@ -3875,7 +4689,9 @@ def _finalize_stream_tokens(model_id, est_input, stream_in, stream_out, stream_c
             log_tag = " (est)"
             with _token_lock:
                 _token_usage[model_id]["output"] += stream_out
-            _debug(f"  [tokens] _finalize_stream_tokens: model={model_id} fallback (no actual_usage) est_in={est_input} stream_out={stream_out}")
+            _debug(
+                f"  [tokens] _finalize_stream_tokens: model={model_id} fallback (no actual_usage) est_in={est_input} stream_out={stream_out}"
+            )
     except Exception as e:
         _debug(f"  ✗ _finalize_stream_tokens failed: {type(e).__name__}: {e}")
         _log(f"  WARN: _finalize_stream_tokens failed for {model_id!r}: {type(e).__name__}: {e}")
@@ -3897,14 +4713,23 @@ def _stream_has_yielded(started, open_blocks, stream_out, line_buf: str = "") ->
         has_out = int(stream_out or 0) > 0
     except Exception:
         has_out = bool(stream_out)
-    return bool(started or has_blocks or has_out or (isinstance(line_buf, str) and bool(line_buf.strip())))
+    return bool(
+        started or has_blocks or has_out or (isinstance(line_buf, str) and bool(line_buf.strip()))
+    )
 
 
 async def _terminate_after_started(open_blocks, stream_out):
     """Graceful SSE termination after a mid-stream failure (avoids concat retry)."""
     for idx in list(open_blocks):
         yield _sse("content_block_stop", {"type": "content_block_stop", "index": idx})
-    yield _sse("message_delta", {"type": "message_delta", "delta": {"stop_reason": "error"}, "usage": {"output_tokens": stream_out}})
+    yield _sse(
+        "message_delta",
+        {
+            "type": "message_delta",
+            "delta": {"stop_reason": "error"},
+            "usage": {"output_tokens": stream_out},
+        },
+    )
     yield _sse("message_stop", {"type": "message_stop"})
 
 
@@ -3935,7 +4760,8 @@ async def _sse_keepalive(stream_gen, interval: float = _SSE_KEEPALIVE_INTERVAL):
             if ping_task is None or ping_task.done():
                 ping_task = asyncio.ensure_future(asyncio.sleep(interval))
             done, _pending = await asyncio.wait(
-                {read_task, ping_task}, return_when=asyncio.FIRST_COMPLETED)
+                {read_task, ping_task}, return_when=asyncio.FIRST_COMPLETED
+            )
             if read_task in done:
                 ping_task.cancel()
                 # NOTE: a cancelled task still reports done() == False until the
@@ -3951,9 +4777,13 @@ async def _sse_keepalive(stream_gen, interval: float = _SSE_KEEPALIVE_INTERVAL):
                     # ClientDisconnect, ConnectionResetError, etc. — client gone, stop gracefully
                     # Log traceback for unexpected errors (like UnboundLocalError) to aid debugging
                     if isinstance(e, (ConnectionError, OSError)):
-                        _debug(f"  [stream] keepalive exiting (client gone): {type(e).__name__}: {e}")
+                        _debug(
+                            f"  [stream] keepalive exiting (client gone): {type(e).__name__}: {e}"
+                        )
                     else:
-                        _debug(f"  [stream] keepalive exiting: {type(e).__name__}: {e}\n{traceback.format_exc()}")
+                        _debug(
+                            f"  [stream] keepalive exiting: {type(e).__name__}: {e}\n{traceback.format_exc()}"
+                        )
                     return
                 yield chunk
             else:
@@ -3973,6 +4803,7 @@ async def _sse_keepalive(stream_gen, interval: float = _SSE_KEEPALIVE_INTERVAL):
 # ── Routing fast cache (O(1) exact + substring) ──
 _route_cache: dict[str, dict | None] = {}
 _ROUTE_CACHE_MAX = 2048
+
 
 def _route_for(model_name: str) -> dict | None:
     cache_key = model_name.lower().strip()
@@ -4002,7 +4833,9 @@ def _route_for(model_name: str) -> dict | None:
                     if len(_route_cache) >= _ROUTE_CACHE_MAX:
                         _route_cache.clear()
                     _route_cache[cache_key] = r
-                    _debug(f"  [route] DISABLE_MAPPING manual alias match: '{name}' → {r.get('model')}")
+                    _debug(
+                        f"  [route] DISABLE_MAPPING manual alias match: '{name}' → {r.get('model')}"
+                    )
                     return r
         # No custom route matched — check if the model exists directly
         if name in MODELS:
@@ -4041,7 +4874,12 @@ def _route_for(model_name: str) -> dict | None:
             return r
     # 3. Wildcard catch-all: if a custom route "*" (or legacy "") exists, use it
     wildcard = CUSTOM_ROUTES.get("*") or CUSTOM_ROUTES.get("")
-    if wildcard and isinstance(wildcard, dict) and wildcard.get("model") and wildcard.get("enabled") is not False:
+    if (
+        wildcard
+        and isinstance(wildcard, dict)
+        and wildcard.get("model")
+        and wildcard.get("enabled") is not False
+    ):
         if len(_route_cache) >= _ROUTE_CACHE_MAX:
             _route_cache.clear()
         _route_cache[cache_key] = wildcard
@@ -4074,6 +4912,7 @@ def _extract_tool_names(body: dict) -> list:
 
 
 # ── Web Search Handler ───────────────────────────────────────────────
+
 
 def _is_web_search_forced(body: dict, protocol: str) -> bool:
     """Check if tool_choice is forced to web_search."""
@@ -4115,6 +4954,7 @@ def _execute_ddg_search(query: str, max_results: int = 5) -> str:
     """Execute a DuckDuckGo search and return formatted results."""
     try:
         from duckduckgo_search import DDGS
+
         with DDGS() as ddgs:
             results = list(ddgs.text(query, max_results=max_results))
         if not results:
@@ -4152,8 +4992,9 @@ def _strip_web_search_tool(body: dict, protocol: str):
         if protocol == "anthropic":
             body["tools"] = [t for t in body["tools"] if t.get("name") != "web_search"]
         else:
-            body["tools"] = [t for t in body["tools"]
-                            if t.get("function", {}).get("name") != "web_search"]
+            body["tools"] = [
+                t for t in body["tools"] if t.get("function", {}).get("name") != "web_search"
+            ]
         if not body["tools"]:
             del body["tools"]
 
@@ -4167,8 +5008,9 @@ def _strip_web_search_tool(body: dict, protocol: str):
             body["tool_choice"] = "auto"
         else:
             is_forced_web_search = (
-                (tc.get("type") == "tool" and tc.get("name") == "web_search") or
-                (tc.get("type") == "function" and tc.get("function", {}).get("name") == "web_search")
+                tc.get("type") == "tool" and tc.get("name") == "web_search"
+            ) or (
+                tc.get("type") == "function" and tc.get("function", {}).get("name") == "web_search"
             )
             if is_forced_web_search:
                 del body["tool_choice"]
@@ -4251,7 +5093,12 @@ def _extract_text(content) -> str:
 
 
 # ── Cache restructuration for models without semantic caching ──
-CACHE_REWRITE_MODELS = set(yaml_get("cache_rewrite_models", default=["mimo-v2.5", "mimo-v2-pro", "mimo-v2-omni", "mimo-v2.5-pro"]))
+CACHE_REWRITE_MODELS = set(
+    yaml_get(
+        "cache_rewrite_models",
+        default=["mimo-v2.5", "mimo-v2-pro", "mimo-v2-omni", "mimo-v2.5-pro"],
+    )
+)
 
 
 def _find_split_point(text: str) -> int:
@@ -4298,23 +5145,29 @@ def _restructure_for_cache(oai_body: dict, model_id: str) -> dict:
 
     sys_content = messages[sys_idx].get("content", "")
     if not isinstance(sys_content, str) or len(sys_content) < CACHE_MIN_PROMPT_SIZE:
-        _debug(f"  [cache-restructure] skipped: sys_content len={len(sys_content) if isinstance(sys_content, str) else 0} < min={CACHE_MIN_PROMPT_SIZE}")
+        _debug(
+            f"  [cache-restructure] skipped: sys_content len={len(sys_content) if isinstance(sys_content, str) else 0} < min={CACHE_MIN_PROMPT_SIZE}"
+        )
         return oai_body  # Small prompt, no need to restructure
 
     split_point = _find_split_point(sys_content)
     if split_point <= 0:
-        _debug(f"  [cache-restructure] skipped: no valid split point found in {len(sys_content)} chars")
+        _debug(
+            f"  [cache-restructure] skipped: no valid split point found in {len(sys_content)} chars"
+        )
         return oai_body
 
     static_part = sys_content[:split_point].strip()
     dynamic_part = sys_content[split_point:].strip()
 
     # Rebuild: static system message with cache_control + dynamic as user message
-    new_messages = [{
-        "role": "system",
-        "content": static_part,
-        "cache_control": {"type": "ephemeral"},
-    }]
+    new_messages = [
+        {
+            "role": "system",
+            "content": static_part,
+            "cache_control": {"type": "ephemeral"},
+        }
+    ]
 
     if dynamic_part:
         new_messages.append({"role": "user", "content": dynamic_part})
@@ -4325,8 +5178,12 @@ def _restructure_for_cache(oai_body: dict, model_id: str) -> dict:
             new_messages.append(m)
 
     oai_body["messages"] = new_messages
-    _debug(f"  [cache-restructure] split at point={split_point}: static={len(static_part)} dynamic={len(dynamic_part)} chars")
-    _log(f"  [cache] split system prompt: static={len(static_part)} dynamic={len(dynamic_part)} chars")
+    _debug(
+        f"  [cache-restructure] split at point={split_point}: static={len(static_part)} dynamic={len(dynamic_part)} chars"
+    )
+    _log(
+        f"  [cache] split system prompt: static={len(static_part)} dynamic={len(dynamic_part)} chars"
+    )
     return oai_body
 
 
@@ -4342,14 +5199,17 @@ def _strip_billing_header(text: str) -> str:
     first_nl = text.find("\n")
     if first_nl == -1:
         return text
-    rest = text[first_nl + 1:]
+    rest = text[first_nl + 1 :]
     if rest.startswith("\n"):
         rest = rest[1:]
     return rest
 
 
 def anthropic_to_openai(body: dict, model: str) -> dict:
-    thinking = isinstance(body.get("thinking"), dict) and body["thinking"].get("type") in ("enabled", "adaptive")
+    thinking = isinstance(body.get("thinking"), dict) and body["thinking"].get("type") in (
+        "enabled",
+        "adaptive",
+    )
     # GLM-5.x models don't support cache_control — skip it
     supports_cache_control = not model.startswith("glm-5")
 
@@ -4408,28 +5268,34 @@ def anthropic_to_openai(body: dict, model: str) -> dict:
             elif btype == "tool_use":
                 _tool_name = block.get("name", "")
                 if not isinstance(_tool_name, str) or not _tool_name.strip():
-                    _debug(f"  [convert] SKIP tool_use with empty name id={block.get('id','?')}")
+                    _debug(f"  [convert] SKIP tool_use with empty name id={block.get('id', '?')}")
                     continue
-                tool_calls.append({
-                    "id": block.get("id", f"call_{uuid.uuid4().hex[:8]}"),
-                    "type": "function",
-                    "function": {
-                        "name": _tool_name.strip(),
-                        "arguments": _json_dumps_str(block.get("input", {})),
-                    },
-                })
+                tool_calls.append(
+                    {
+                        "id": block.get("id", f"call_{uuid.uuid4().hex[:8]}"),
+                        "type": "function",
+                        "function": {
+                            "name": _tool_name.strip(),
+                            "arguments": _json_dumps_str(block.get("input", {})),
+                        },
+                    }
+                )
             elif btype == "tool_result":
                 tid = block.get("tool_use_id", "")
                 if not tid:
                     # Defensive: skip tool_result with missing/empty tool_use_id
                     # (can happen after context compaction loses the id)
-                    _debug(f"  [compact] SKIP tool_result with missing tool_use_id in anthropic_to_openai")
+                    _debug(
+                        f"  [compact] SKIP tool_result with missing tool_use_id in anthropic_to_openai"
+                    )
                     continue
-                tool_results.append({
-                    "role": "tool",
-                    "tool_call_id": tid,
-                    "content": _extract_text(block.get("content", "")),
-                })
+                tool_results.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tid,
+                        "content": _extract_text(block.get("content", "")),
+                    }
+                )
                 if "cache_control" in block:
                     last_cache_control = block["cache_control"]
 
@@ -4470,11 +5336,18 @@ def anthropic_to_openai(body: dict, model: str) -> dict:
                 break
 
     # Build request
-    oai = {"model": model, "messages": messages,
-           "max_tokens": body.get("max_tokens", 16384),
-           "stream": body.get("stream", False)}
+    oai = {
+        "model": model,
+        "messages": messages,
+        "max_tokens": body.get("max_tokens", 16384),
+        "stream": body.get("stream", False),
+    }
 
-    for key, oai_key in [("temperature", "temperature"), ("top_p", "top_p"), ("stop_sequences", "stop")]:
+    for key, oai_key in [
+        ("temperature", "temperature"),
+        ("top_p", "top_p"),
+        ("stop_sequences", "stop"),
+    ]:
         if key in body:
             oai[oai_key] = body[key]
 
@@ -4484,7 +5357,12 @@ def anthropic_to_openai(body: dict, model: str) -> dict:
             if not isinstance(raw, dict) or raw is None:
                 return {"type": "object", "properties": {}}
             return raw
-        _web_search_fallback = {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}
+
+        _web_search_fallback = {
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+            "required": ["query"],
+        }
         oai_tools = []
         for t in body["tools"]:
             if "name" in t:
@@ -4492,29 +5370,49 @@ def anthropic_to_openai(body: dict, model: str) -> dict:
                 if t.get("name") == "web_search" and (not params or params.get("type") != "object"):
                     params = _web_search_fallback
                     _debug("  [convert] web_search input_schema null/invalid → fallback schema")
-                oai_tools.append({"type": "function", "function": {
-                    "name": t["name"], "description": t.get("description", ""),
-                    "parameters": params,
-                }})
+                oai_tools.append(
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": t["name"],
+                            "description": t.get("description", ""),
+                            "parameters": params,
+                        },
+                    }
+                )
             elif "function" in t:
                 fn = t["function"]
                 params = _norm_params(fn.get("parameters", {}))
-                if fn.get("name") == "web_search" and (not params or params.get("type") != "object"):
+                if fn.get("name") == "web_search" and (
+                    not params or params.get("type") != "object"
+                ):
                     params = _web_search_fallback
                     _debug("  [convert] web_search parameters null/invalid → fallback schema")
-                oai_tools.append({"type": "function", "function": {
-                    "name": fn.get("name", ""), "description": fn.get("description", ""),
-                    "parameters": params,
-                }})
+                oai_tools.append(
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": fn.get("name", ""),
+                            "description": fn.get("description", ""),
+                            "parameters": params,
+                        },
+                    }
+                )
             else:
                 raw = t.get("input_schema", t.get("parameters", {}))
                 params = _norm_params(raw)
                 if t.get("name") == "web_search" and (not params or params.get("type") != "object"):
                     params = _web_search_fallback
-                oai_tools.append({"type": "function", "function": {
-                    "name": t.get("name", ""), "description": t.get("description", ""),
-                    "parameters": params,
-                }})
+                oai_tools.append(
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": t.get("name", ""),
+                            "description": t.get("description", ""),
+                            "parameters": params,
+                        },
+                    }
+                )
         oai["tools"] = oai_tools
         tc = body.get("tool_choice", "auto")
         if isinstance(tc, dict):
@@ -4525,7 +5423,10 @@ def anthropic_to_openai(body: dict, model: str) -> dict:
                     _debug("  [convert] SKIP empty tool_choice name → auto")
                     oai["tool_choice"] = "auto"
                 else:
-                    oai["tool_choice"] = {"type": "function", "function": {"name": _tc_name.strip()}}
+                    oai["tool_choice"] = {
+                        "type": "function",
+                        "function": {"name": _tc_name.strip()},
+                    }
             elif tc_type == "any":
                 oai["tool_choice"] = "required"
             else:
@@ -4568,14 +5469,18 @@ def anthropic_to_openai(body: dict, model: str) -> dict:
                 oai["reasoning_effort"] = "medium"
             else:
                 oai["reasoning_effort"] = "low"
-            _debug(f"  [thinking] {model}: reasoning_effort={oai['reasoning_effort']} (effort={effort_level})")
+            _debug(
+                f"  [thinking] {model}: reasoning_effort={oai['reasoning_effort']} (effort={effort_level})"
+            )
         elif model.startswith("deepseek-v4"):
             # DeepSeek V4 only supports high and max
             if effort_level in ("xhigh", "max"):
                 oai["reasoning_effort"] = "max"
             else:
                 oai["reasoning_effort"] = "high"
-            _debug(f"  [thinking] {model}: reasoning_effort={oai['reasoning_effort']} (effort={effort_level})")
+            _debug(
+                f"  [thinking] {model}: reasoning_effort={oai['reasoning_effort']} (effort={effort_level})"
+            )
         else:
             # MiMo V2.5 etc. supports low/medium/high
             if effort_level in ("xhigh", "max"):
@@ -4586,7 +5491,9 @@ def anthropic_to_openai(body: dict, model: str) -> dict:
                 oai["reasoning_effort"] = "medium"
             else:
                 oai["reasoning_effort"] = "low"
-            _debug(f"  [thinking] {model}: reasoning_effort={oai['reasoning_effort']} (effort={effort_level})")
+            _debug(
+                f"  [thinking] {model}: reasoning_effort={oai['reasoning_effort']} (effort={effort_level})"
+            )
 
     # Restructure system prompt for models without semantic caching
     oai = _restructure_for_cache(oai, model)
@@ -4596,6 +5503,7 @@ def anthropic_to_openai(body: dict, model: str) -> dict:
 _orig_anthropic_to_openai = anthropic_to_openai
 _anthropic_cache: dict = {}
 _anthropic_cache_max = 512
+
 
 def anthropic_to_openai(body: dict, model: str) -> dict:  # cached wrapper
     try:
@@ -4609,14 +5517,17 @@ def anthropic_to_openai(body: dict, model: str) -> dict:  # cached wrapper
         hit = _anthropic_cache.get(key)
         if hit is not None:
             import copy
+
             return copy.deepcopy(hit)
         res = _orig_anthropic_to_openai(body, model)
         if len(_anthropic_cache) < _anthropic_cache_max:
             import copy
+
             _anthropic_cache[key] = copy.deepcopy(res)
         return res
     except Exception:
         return _orig_anthropic_to_openai(body, model)
+
 
 def openai_to_anthropic(resp: dict, model: str) -> dict:
     choice = resp.get("choices", [{}])[0]
@@ -4628,14 +5539,20 @@ def openai_to_anthropic(resp: dict, model: str) -> dict:
         blocks.append({"type": "thinking", "thinking": reasoning})
     if msg.get("content"):
         blocks.append({"type": "text", "text": msg["content"]})
-    for tc in (msg.get("tool_calls") or []):
+    for tc in msg.get("tool_calls") or []:
         fn = tc.get("function", {})
         try:
             inp = _json_loads(fn.get("arguments", "{}"))
         except Exception:
             inp = {}
-        blocks.append({"type": "tool_use", "id": tc.get("id", f"toolu_{uuid.uuid4().hex[:8]}"),
-                        "name": fn.get("name", ""), "input": inp})
+        blocks.append(
+            {
+                "type": "tool_use",
+                "id": tc.get("id", f"toolu_{uuid.uuid4().hex[:8]}"),
+                "name": fn.get("name", ""),
+                "input": inp,
+            }
+        )
 
     if not blocks:
         blocks.append({"type": "text", "text": ""})
@@ -4645,12 +5562,21 @@ def openai_to_anthropic(resp: dict, model: str) -> dict:
         stop = "max_tokens"
 
     return {
-        "id": f"msg_{uuid.uuid4().hex[:24]}", "type": "message", "role": "assistant",
-        "content": blocks, "model": model, "stop_reason": stop, "stop_sequence": None,
-        "usage": {"input_tokens": usage.get("prompt_tokens", 0),
-                "output_tokens": usage.get("completion_tokens", 0),
-                "cache_creation_input_tokens": 0,
-                "cache_read_input_tokens": usage.get("prompt_tokens_details", {}).get("cached_tokens", 0)},
+        "id": f"msg_{uuid.uuid4().hex[:24]}",
+        "type": "message",
+        "role": "assistant",
+        "content": blocks,
+        "model": model,
+        "stop_reason": stop,
+        "stop_sequence": None,
+        "usage": {
+            "input_tokens": usage.get("prompt_tokens", 0),
+            "output_tokens": usage.get("completion_tokens", 0),
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": usage.get("prompt_tokens_details", {}).get(
+                "cached_tokens", 0
+            ),
+        },
     }
 
 
@@ -4668,11 +5594,13 @@ def openai_to_anthropic_request(oai_body: dict) -> dict:
             continue
 
         if role == "tool":
-            pending_tool_results.append({
-                "type": "tool_result",
-                "tool_use_id": msg.get("tool_call_id", ""),
-                "content": _extract_text(msg.get("content", "")),
-            })
+            pending_tool_results.append(
+                {
+                    "type": "tool_result",
+                    "tool_use_id": msg.get("tool_call_id", ""),
+                    "content": _extract_text(msg.get("content", "")),
+                }
+            )
             continue
 
         if role not in ("user", "assistant"):
@@ -4703,12 +5631,14 @@ def openai_to_anthropic_request(oai_body: dict) -> dict:
                 inp = _json_loads(fn.get("arguments", "{}"))
             except Exception:
                 inp = {}
-            blocks.append({
-                "type": "tool_use",
-                "id": tc.get("id", f"toolu_{uuid.uuid4().hex[:8]}"),
-                "name": fn.get("name", ""),
-                "input": inp,
-            })
+            blocks.append(
+                {
+                    "type": "tool_use",
+                    "id": tc.get("id", f"toolu_{uuid.uuid4().hex[:8]}"),
+                    "name": fn.get("name", ""),
+                    "input": inp,
+                }
+            )
 
         # Convert reasoning_content → thinking block (assistant only)
         if role == "assistant":
@@ -4737,25 +5667,35 @@ def openai_to_anthropic_request(oai_body: dict) -> dict:
         result["system"] = system_text
 
     # Map simple params
-    for key, anthro_key in [("temperature", "temperature"), ("top_p", "top_p"),
-                             ("stop", "stop_sequences")]:
+    for key, anthro_key in [
+        ("temperature", "temperature"),
+        ("top_p", "top_p"),
+        ("stop", "stop_sequences"),
+    ]:
         if key in oai_body:
             result[anthro_key] = oai_body[key]
 
     # Convert tools
     if "tools" in oai_body:
-        result["tools"] = [{
-            "name": t["function"]["name"],
-            "description": t["function"].get("description", ""),
-            "input_schema": t["function"].get("parameters", {}),
-        } for t in oai_body["tools"] if t.get("type") == "function"]
+        result["tools"] = [
+            {
+                "name": t["function"]["name"],
+                "description": t["function"].get("description", ""),
+                "input_schema": t["function"].get("parameters", {}),
+            }
+            for t in oai_body["tools"]
+            if t.get("type") == "function"
+        ]
 
         # Convert tool_choice
         tc = oai_body.get("tool_choice", "auto")
         if isinstance(tc, dict):
             tc_type = tc.get("type", "auto")
             if tc_type == "function":
-                result["tool_choice"] = {"type": "tool", "name": tc.get("function", {}).get("name", "")}
+                result["tool_choice"] = {
+                    "type": "tool",
+                    "name": tc.get("function", {}).get("name", ""),
+                }
             elif tc_type == "any":
                 result["tool_choice"] = {"type": "any"}
             else:
@@ -4782,14 +5722,16 @@ def anthropic_to_openai_response(anthro: dict, model: str) -> dict:
         elif t == "thinking":
             reasoning_text = block.get("thinking", "")
         elif t == "tool_use":
-            tool_calls.append({
-                "id": block.get("id", f"call_{uuid.uuid4().hex[:12]}"),
-                "type": "function",
-                "function": {
-                    "name": block.get("name", ""),
-                    "arguments": _json_dumps_str(block.get("input", {}), ensure_ascii=False),
-                },
-            })
+            tool_calls.append(
+                {
+                    "id": block.get("id", f"call_{uuid.uuid4().hex[:12]}"),
+                    "type": "function",
+                    "function": {
+                        "name": block.get("name", ""),
+                        "arguments": _json_dumps_str(block.get("input", {}), ensure_ascii=False),
+                    },
+                }
+            )
 
     # Determine finish_reason
     sr = anthro.get("stop_reason", "")
@@ -4828,11 +5770,13 @@ def anthropic_to_openai_response(anthro: dict, model: str) -> dict:
         "object": "chat.completion",
         "created": int(time.time()),
         "model": model,
-        "choices": [{
-            "index": 0,
-            "message": message,
-            "finish_reason": finish,
-        }],
+        "choices": [
+            {
+                "index": 0,
+                "message": message,
+                "finish_reason": finish,
+            }
+        ],
         "usage": oai_usage,
     }
 
@@ -4849,17 +5793,19 @@ def openai_responses_to_anthropic(body: dict) -> dict:
         role = item.get("role", item.get("type", "user"))
 
         if role in ("system", "developer"):
-            for block in (item.get("content") or []):
+            for block in item.get("content") or []:
                 if isinstance(block, dict) and block.get("type") == "input_text":
                     system_text += block.get("text", "")
             continue
 
         if item.get("type") == "function_call_output":
-            pending_tool_results.append({
-                "type": "tool_result",
-                "tool_use_id": item.get("call_id", item.get("id", "")),
-                "content": item.get("output", ""),
-            })
+            pending_tool_results.append(
+                {
+                    "type": "tool_result",
+                    "tool_use_id": item.get("call_id", item.get("id", "")),
+                    "content": item.get("output", ""),
+                }
+            )
             continue
 
         # Convert previous-turn function_call items to assistant tool_use blocks
@@ -4868,15 +5814,21 @@ def openai_responses_to_anthropic(body: dict) -> dict:
                 inp = _json_loads(item.get("arguments", "{}"))
             except Exception:
                 inp = {}
-            anthro_messages.append({
-                "role": "assistant",
-                "content": [{
-                    "type": "tool_use",
-                    "id": item.get("call_id") or item.get("id") or f"toolu_{uuid.uuid4().hex[:12]}",
-                    "name": item.get("name", ""),
-                    "input": inp,
-                }]
-            })
+            anthro_messages.append(
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": item.get("call_id")
+                            or item.get("id")
+                            or f"toolu_{uuid.uuid4().hex[:12]}",
+                            "name": item.get("name", ""),
+                            "input": inp,
+                        }
+                    ],
+                }
+            )
             continue
 
         if role not in ("user", "assistant"):
@@ -4887,7 +5839,7 @@ def openai_responses_to_anthropic(body: dict) -> dict:
             blocks.extend(pending_tool_results)
             pending_tool_results = []
 
-        for block in (item.get("content") or []):
+        for block in item.get("content") or []:
             if not isinstance(block, dict):
                 continue
             btype = block.get("type", "")
@@ -4975,14 +5927,18 @@ def openai_responses_to_anthropic(body: dict) -> dict:
                 result["reasoning_effort"] = "medium"
             else:
                 result["reasoning_effort"] = "low"
-            _debug(f"  [thinking] {_model}: reasoning_effort={result['reasoning_effort']} (effort={effort_level})")
+            _debug(
+                f"  [thinking] {_model}: reasoning_effort={result['reasoning_effort']} (effort={effort_level})"
+            )
         elif _model.startswith("deepseek-v4"):
             # DeepSeek V4 only supports high and max
             if effort_level in ("xhigh", "max"):
                 result["reasoning_effort"] = "max"
             else:
                 result["reasoning_effort"] = "high"
-            _debug(f"  [thinking] {_model}: reasoning_effort={result['reasoning_effort']} (effort={effort_level})")
+            _debug(
+                f"  [thinking] {_model}: reasoning_effort={result['reasoning_effort']} (effort={effort_level})"
+            )
         else:
             # MiMo V2.5 etc. supports low/medium/high
             if effort_level in ("xhigh", "max"):
@@ -4993,7 +5949,9 @@ def openai_responses_to_anthropic(body: dict) -> dict:
                 result["reasoning_effort"] = "medium"
             else:
                 result["reasoning_effort"] = "low"
-            _debug(f"  [thinking] {_model}: reasoning_effort={result['reasoning_effort']} (effort={effort_level})")
+            _debug(
+                f"  [thinking] {_model}: reasoning_effort={result['reasoning_effort']} (effort={effort_level})"
+            )
 
     return result
 
@@ -5012,18 +5970,23 @@ def anthropic_to_openai_responses(anthro: dict, model: str) -> dict:
         if btype == "text":
             text_content.append({"type": "output_text", "text": block.get("text", "")})
         elif btype == "thinking":
-            output_items.insert(0, {
-                "type": "reasoning",
-                "summary": [{"type": "summary_text", "text": block.get("thinking", "")}],
-            })
+            output_items.insert(
+                0,
+                {
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": block.get("thinking", "")}],
+                },
+            )
         elif btype == "tool_use":
-            function_calls.append({
-                "type": "function_call",
-                "call_id": block.get("id", f"call_{uuid.uuid4().hex[:12]}"),
-                "name": block.get("name", ""),
-                "arguments": _json_dumps_str(block.get("input", {}), ensure_ascii=False),
-                "status": "completed",
-            })
+            function_calls.append(
+                {
+                    "type": "function_call",
+                    "call_id": block.get("id", f"call_{uuid.uuid4().hex[:12]}"),
+                    "name": block.get("name", ""),
+                    "arguments": _json_dumps_str(block.get("input", {}), ensure_ascii=False),
+                    "status": "completed",
+                }
+            )
 
     if text_content:
         output_items.append({"type": "message", "role": "assistant", "content": text_content})
@@ -5044,7 +6007,10 @@ def anthropic_to_openai_responses(anthro: dict, model: str) -> dict:
         "input_tokens": in_t,
         "output_tokens": out_t,
         "total_tokens": in_t + out_t,
-        "output_tokens_details": {"reasoning_tokens": 0, "cached_tokens": usage.get("cache_read_input_tokens", 0)},
+        "output_tokens_details": {
+            "reasoning_tokens": 0,
+            "cached_tokens": usage.get("cache_read_input_tokens", 0),
+        },
     }
 
     return {
@@ -5071,30 +6037,37 @@ def openai_chat_to_responses(chat_resp: dict, model: str) -> dict:
     # Reasoning content -> reasoning item
     reasoning = msg.get("reasoning_content") or msg.get("reasoning")
     if reasoning:
-        output_items.insert(0, {
-            "type": "reasoning",
-            "summary": [{"type": "summary_text", "text": reasoning}],
-        })
+        output_items.insert(
+            0,
+            {
+                "type": "reasoning",
+                "summary": [{"type": "summary_text", "text": reasoning}],
+            },
+        )
 
     # Text content -> message item with output_text
     content = msg.get("content", "")
     if content:
-        output_items.append({
-            "type": "message",
-            "role": "assistant",
-            "content": [{"type": "output_text", "text": content}],
-        })
+        output_items.append(
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": content}],
+            }
+        )
 
     # Tool calls -> function_call items
-    for tc in (msg.get("tool_calls") or []):
+    for tc in msg.get("tool_calls") or []:
         fn = tc.get("function", {})
-        output_items.append({
-            "type": "function_call",
-            "call_id": tc.get("id", f"call_{uuid.uuid4().hex[:12]}"),
-            "name": fn.get("name", ""),
-            "arguments": fn.get("arguments", "{}"),
-            "status": "completed",
-        })
+        output_items.append(
+            {
+                "type": "function_call",
+                "call_id": tc.get("id", f"call_{uuid.uuid4().hex[:12]}"),
+                "name": fn.get("name", ""),
+                "arguments": fn.get("arguments", "{}"),
+                "status": "completed",
+            }
+        )
 
     # Status mapping
     finish = choice.get("finish_reason", "")
@@ -5141,7 +6114,13 @@ def _chat_to_responses_request(chat: dict) -> dict:
             cid = m.get("tool_call_id", "")
             if not cid:
                 continue
-            inp.append({"type": "function_call_output", "call_id": cid, "output": content if isinstance(content, str) else str(content)})
+            inp.append(
+                {
+                    "type": "function_call_output",
+                    "call_id": cid,
+                    "output": content if isinstance(content, str) else str(content),
+                }
+            )
             continue
         if isinstance(content, str):
             if content:
@@ -5151,7 +6130,11 @@ def _chat_to_responses_request(chat: dict) -> dict:
                     item["cache_control"] = cache_ctrl
                 inp.append(item)
         elif isinstance(content, list):
-            txt = "\n".join(b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text")
+            txt = "\n".join(
+                b.get("text", "")
+                for b in content
+                if isinstance(b, dict) and b.get("type") == "text"
+            )
             if txt:
                 ctype = "output_text" if role == "assistant" else "input_text"
                 item = {"role": role, "content": [{"type": ctype, "text": txt}]}
@@ -5162,13 +6145,24 @@ def _chat_to_responses_request(chat: dict) -> dict:
             fn = tc.get("function", {}) if isinstance(tc.get("function"), dict) else {}
             _fn_name = fn.get("name", "")
             if not isinstance(_fn_name, str) or not _fn_name.strip():
-                _debug(f"  [convert] SKIP function_call with empty name call_id={tc.get('call_id') or tc.get('id','?')}")
+                _debug(
+                    f"  [convert] SKIP function_call with empty name call_id={tc.get('call_id') or tc.get('id', '?')}"
+                )
                 continue
             _cid = tc.get("call_id") or tc.get("id") or f"call_{uuid.uuid4().hex[:12]}"
-            inp.append({"type": "function_call", "call_id": _cid, "name": _fn_name.strip(), "arguments": fn.get("arguments", "{}")})
+            inp.append(
+                {
+                    "type": "function_call",
+                    "call_id": _cid,
+                    "name": _fn_name.strip(),
+                    "arguments": fn.get("arguments", "{}"),
+                }
+            )
     # Guard: Responses input must be non-empty; log original chat for audit if empty
     if not inp:
-        _debug(f"  [free] _chat_to_responses_request empty input for model {chat.get('model','')} — original messages={len(chat.get('messages',[]))} — injecting fallback")
+        _debug(
+            f"  [free] _chat_to_responses_request empty input for model {chat.get('model', '')} — original messages={len(chat.get('messages', []))} — injecting fallback"
+        )
         inp.append({"role": "user", "content": [{"type": "input_text", "text": "hello"}]})
     req = {"model": chat.get("model", ""), "input": inp, "stream": bool(chat.get("stream", False))}
     if "max_tokens" in chat:
@@ -5191,7 +6185,14 @@ def _chat_to_responses_request(chat: dict) -> dict:
         for t in chat["tools"]:
             if isinstance(t, dict) and "function" in t:
                 fn = t["function"]
-                tools.append({"type": "function", "name": fn.get("name", ""), "description": fn.get("description", ""), "parameters": fn.get("parameters", {})})
+                tools.append(
+                    {
+                        "type": "function",
+                        "name": fn.get("name", ""),
+                        "description": fn.get("description", ""),
+                        "parameters": fn.get("parameters", {}),
+                    }
+                )
         if tools:
             req["tools"] = tools
         tc = chat.get("tool_choice")
@@ -5227,7 +6228,16 @@ def _responses_to_chat_response(resp: dict, model: str) -> dict:
                 if isinstance(s, dict):
                     reasoning += s.get("text", "")
         elif item.get("type") == "function_call":
-            tool_calls.append({"id": item.get("call_id", item.get("id", "")), "type": "function", "function": {"name": item.get("name", ""), "arguments": item.get("arguments", "{}")}})
+            tool_calls.append(
+                {
+                    "id": item.get("call_id", item.get("id", "")),
+                    "type": "function",
+                    "function": {
+                        "name": item.get("name", ""),
+                        "arguments": item.get("arguments", "{}"),
+                    },
+                }
+            )
     msg = {"role": "assistant", "content": "\n".join(texts)}
     if reasoning:
         msg["reasoning_content"] = reasoning
@@ -5235,14 +6245,31 @@ def _responses_to_chat_response(resp: dict, model: str) -> dict:
         msg["tool_calls"] = tool_calls
     usage = resp.get("usage", {}) if isinstance(resp.get("usage"), dict) else {}
     # Cache tokens come from input_tokens_details, NOT output_tokens_details
-    _inp_details = usage.get("input_tokens_details") if isinstance(usage.get("input_tokens_details"), dict) else {}
+    _inp_details = (
+        usage.get("input_tokens_details")
+        if isinstance(usage.get("input_tokens_details"), dict)
+        else {}
+    )
     _cached = _inp_details.get("cached_tokens", 0)
-    chat_usage = {"prompt_tokens": usage.get("input_tokens", 0), "completion_tokens": usage.get("output_tokens", 0), "total_tokens": usage.get("total_tokens", usage.get("input_tokens", 0) + usage.get("output_tokens", 0))}
+    chat_usage = {
+        "prompt_tokens": usage.get("input_tokens", 0),
+        "completion_tokens": usage.get("output_tokens", 0),
+        "total_tokens": usage.get(
+            "total_tokens", usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
+        ),
+    }
     if _cached:
         chat_usage["prompt_tokens_details"] = {"cached_tokens": _cached}
     status = resp.get("status", "completed")
     finish = "stop" if status == "completed" else "length"
-    return {"id": resp.get("id", f"chatcmpl-{uuid.uuid4().hex[:8]}"), "object": "chat.completion", "created": int(time.time()), "model": model, "choices": [{"index": 0, "message": msg, "finish_reason": finish}], "usage": chat_usage}
+    return {
+        "id": resp.get("id", f"chatcmpl-{uuid.uuid4().hex[:8]}"),
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [{"index": 0, "message": msg, "finish_reason": finish}],
+        "usage": chat_usage,
+    }
 
 
 def _responses_to_anthropic_response(resp: dict, model: str) -> dict:
@@ -5263,7 +6290,14 @@ def _responses_to_anthropic_response(resp: dict, model: str) -> dict:
                 inp = _json_loads(item.get("arguments", "{}"))
             except Exception:
                 inp = {}
-            blocks.append({"type": "tool_use", "id": item.get("call_id", item.get("id", "")), "name": item.get("name", ""), "input": inp})
+            blocks.append(
+                {
+                    "type": "tool_use",
+                    "id": item.get("call_id", item.get("id", "")),
+                    "name": item.get("name", ""),
+                    "input": inp,
+                }
+            )
     if not blocks:
         blocks.append({"type": "text", "text": ""})
     usage = resp.get("usage", {}) if isinstance(resp.get("usage"), dict) else {}
@@ -5273,14 +6307,32 @@ def _responses_to_anthropic_response(resp: dict, model: str) -> dict:
     if has_tools:
         stop = "tool_use"
     # Cache tokens come from input_tokens_details, NOT output_tokens_details
-    _inp_details = usage.get("input_tokens_details") if isinstance(usage.get("input_tokens_details"), dict) else {}
+    _inp_details = (
+        usage.get("input_tokens_details")
+        if isinstance(usage.get("input_tokens_details"), dict)
+        else {}
+    )
     _cache_read = _inp_details.get("cached_tokens", 0)
-    return {"id": f"msg_{uuid.uuid4().hex[:24]}", "type": "message", "role": "assistant", "content": blocks, "model": model, "stop_reason": stop, "stop_sequence": None, "usage": {"input_tokens": usage.get("input_tokens", 0), "output_tokens": usage.get("output_tokens", 0), "cache_read_input_tokens": _cache_read}}
+    return {
+        "id": f"msg_{uuid.uuid4().hex[:24]}",
+        "type": "message",
+        "role": "assistant",
+        "content": blocks,
+        "model": model,
+        "stop_reason": stop,
+        "stop_sequence": None,
+        "usage": {
+            "input_tokens": usage.get("input_tokens", 0),
+            "output_tokens": usage.get("output_tokens", 0),
+            "cache_read_input_tokens": _cache_read,
+        },
+    }
 
 
 # ── Responses API tool mapping cache (item_id/output_index → tool info) ──
 _responses_tool_cache: dict = {}
 _responses_tool_index_map: dict = {}  # output_index -> sequential tool index (0,1,2...)
+
 
 def _responses_sse_to_chat_deltas(raw_line: str):
     """Convert one Responses API SSE data line to chat/completions delta chunks.
@@ -5315,7 +6367,9 @@ def _responses_sse_to_chat_deltas(raw_line: str):
         delta_obj = chunk.get("delta", {})
         dtype = delta_obj.get("type", "")
         text = delta_obj.get("text", "")
-        _debug(f"  [responses-sse] content_part.delta dtype={dtype!r} text={text[:80]!r} full_delta_keys={list(delta_obj.keys())[:10]}")
+        _debug(
+            f"  [responses-sse] content_part.delta dtype={dtype!r} text={text[:80]!r} full_delta_keys={list(delta_obj.keys())[:10]}"
+        )
         if not text:
             return None
         if dtype == "output_text":
@@ -5344,10 +6398,37 @@ def _responses_sse_to_chat_deltas(raw_line: str):
             name = item.get("name", "")
             # Cache for later delta events (by item_id and output_index)
             iid = item.get("id") or call_id
-            _responses_tool_cache[iid] = {"index": tool_idx, "call_id": call_id, "name": name, "output_index": out_idx}
-            _responses_tool_cache[f"idx_{out_idx}"] = {"index": tool_idx, "call_id": call_id, "name": name}
-            _debug(f"  [responses-sse] function_call start idx={tool_idx} (out_idx={out_idx}) name={name!r} call_id={call_id}")
-            return {"choices": [{"delta": {"tool_calls": [{"index": tool_idx, "id": call_id, "type": "function", "function": {"name": name, "arguments": ""}}]}, "finish_reason": None}]}
+            _responses_tool_cache[iid] = {
+                "index": tool_idx,
+                "call_id": call_id,
+                "name": name,
+                "output_index": out_idx,
+            }
+            _responses_tool_cache[f"idx_{out_idx}"] = {
+                "index": tool_idx,
+                "call_id": call_id,
+                "name": name,
+            }
+            _debug(
+                f"  [responses-sse] function_call start idx={tool_idx} (out_idx={out_idx}) name={name!r} call_id={call_id}"
+            )
+            return {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": tool_idx,
+                                    "id": call_id,
+                                    "type": "function",
+                                    "function": {"name": name, "arguments": ""},
+                                }
+                            ]
+                        },
+                        "finish_reason": None,
+                    }
+                ]
+            }
 
     # response.function_call_arguments.delta — streaming tool arguments
     if etype == "response.function_call_arguments.delta":
@@ -5363,10 +6444,21 @@ def _responses_sse_to_chat_deltas(raw_line: str):
             if out_idx not in _responses_tool_index_map:
                 _responses_tool_index_map[out_idx] = len(_responses_tool_index_map)
             tool_idx = _responses_tool_index_map[out_idx]
-            _debug(f"  [responses-sse] function_call delta without prior added — fallback idx={tool_idx} out_idx={out_idx}")
+            _debug(
+                f"  [responses-sse] function_call delta without prior added — fallback idx={tool_idx} out_idx={out_idx}"
+            )
         else:
             tool_idx = info["index"]
-        return {"choices": [{"delta": {"tool_calls": [{"index": tool_idx, "function": {"arguments": delta}}]}, "finish_reason": None}]}
+        return {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [{"index": tool_idx, "function": {"arguments": delta}}]
+                    },
+                    "finish_reason": None,
+                }
+            ]
+        }
 
     # response.function_call_arguments.done — final tool arguments (optional, ensure completeness)
     if etype == "response.function_call_arguments.done":
@@ -5387,12 +6479,18 @@ def _responses_sse_to_chat_deltas(raw_line: str):
         resp = chunk.get("response", {})
         usage = resp.get("usage", {})
         # Cache tokens come from input_tokens_details, NOT output_tokens_details
-        _inp_details = usage.get("input_tokens_details") if isinstance(usage.get("input_tokens_details"), dict) else {}
+        _inp_details = (
+            usage.get("input_tokens_details")
+            if isinstance(usage.get("input_tokens_details"), dict)
+            else {}
+        )
         _cached = _inp_details.get("cached_tokens", 0)
         chat_usage = {
             "prompt_tokens": usage.get("input_tokens", 0),
             "completion_tokens": usage.get("output_tokens", 0),
-            "total_tokens": usage.get("total_tokens", usage.get("input_tokens", 0) + usage.get("output_tokens", 0)),
+            "total_tokens": usage.get(
+                "total_tokens", usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
+            ),
         }
         if _cached:
             chat_usage["prompt_tokens_details"] = {"cached_tokens": _cached}
@@ -5408,7 +6506,9 @@ def _responses_sse_to_chat_deltas(raw_line: str):
         chat_usage = {
             "prompt_tokens": usage.get("input_tokens", 0),
             "completion_tokens": usage.get("output_tokens", 0),
-            "total_tokens": usage.get("total_tokens", usage.get("input_tokens", 0) + usage.get("output_tokens", 0)),
+            "total_tokens": usage.get(
+                "total_tokens", usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
+            ),
         }
         return {"choices": [], "usage": chat_usage}
 
@@ -5418,13 +6518,34 @@ def _responses_sse_to_chat_deltas(raw_line: str):
 
 
 async def _finalize_and_close_stream(
-    started, open_blocks, text_block_idx, reasoning_block_idx,
-    tool_block_idx, stream_out_tokens, actual_usage,
-    model_id, stream_in_est, msg_id, original_model,
-    _token_usage, _token_lock, _using_free, _paid_model_id,
-    free_model, start_time, req_id, _req_model_id, protocol,
-    thinking_type, effort, client_ip, hdrs, tool_names, used_tools,
-    request_body, log_tag="",
+    started,
+    open_blocks,
+    text_block_idx,
+    reasoning_block_idx,
+    tool_block_idx,
+    stream_out_tokens,
+    actual_usage,
+    model_id,
+    stream_in_est,
+    msg_id,
+    original_model,
+    _token_usage,
+    _token_lock,
+    _using_free,
+    _paid_model_id,
+    free_model,
+    start_time,
+    req_id,
+    _req_model_id,
+    protocol,
+    thinking_type,
+    effort,
+    client_ip,
+    hdrs,
+    tool_names,
+    used_tools,
+    request_body,
+    log_tag="",
 ):
     """Yield closing SSE events for a stream and persist the request.
 
@@ -5432,40 +6553,94 @@ async def _finalize_and_close_stream(
     response.completed path can share the same finalization logic.
     """
     final_in, final_out, final_cache, log_tag = _finalize_stream_tokens(
-        model_id, stream_in_est, None, stream_out_tokens, 0,
-        actual_usage, _token_usage, _token_lock)
+        model_id, stream_in_est, None, stream_out_tokens, 0, actual_usage, _token_usage, _token_lock
+    )
     if not started:
         started = True
-        yield _sse("message_start", {"type": "message_start", "message": {
-            "id": msg_id, "type": "message", "role": "assistant", "content": [],
-            "model": original_model, "stop_reason": None, "stop_sequence": None,
-            "usage": {"input_tokens": final_in, "output_tokens": 0, "cache_read_input_tokens": final_cache}}})
+        yield _sse(
+            "message_start",
+            {
+                "type": "message_start",
+                "message": {
+                    "id": msg_id,
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [],
+                    "model": original_model,
+                    "stop_reason": None,
+                    "stop_sequence": None,
+                    "usage": {
+                        "input_tokens": final_in,
+                        "output_tokens": 0,
+                        "cache_read_input_tokens": final_cache,
+                    },
+                },
+            },
+        )
     for idx in open_blocks:
         yield _sse("content_block_stop", {"type": "content_block_stop", "index": idx})
     has_tools = bool(tool_block_idx)
-    _debug(f"  [stream-oai] summary: text={text_block_idx is not None} thinking={reasoning_block_idx is not None} tools={list(tool_block_idx.keys())} stop={'tool_use' if has_tools else 'end_turn'} out_tokens={final_out}")
+    _debug(
+        f"  [stream-oai] summary: text={text_block_idx is not None} thinking={reasoning_block_idx is not None} tools={list(tool_block_idx.keys())} stop={'tool_use' if has_tools else 'end_turn'} out_tokens={final_out}"
+    )
     if reasoning_block_idx is None and thinking_type != "none":
-        _debug(f"  [stream-oai] WARNING: thinking requested (type={thinking_type}, effort={effort}) but upstream returned no reasoning_content")
-    yield _sse("message_delta", {"type": "message_delta", "delta": {"stop_reason": "tool_use" if has_tools else "end_turn"}, "usage": {"output_tokens": final_out, "cache_read_input_tokens": final_cache}})
+        _debug(
+            f"  [stream-oai] WARNING: thinking requested (type={thinking_type}, effort={effort}) but upstream returned no reasoning_content"
+        )
+    yield _sse(
+        "message_delta",
+        {
+            "type": "message_delta",
+            "delta": {"stop_reason": "tool_use" if has_tools else "end_turn"},
+            "usage": {"output_tokens": final_out, "cache_read_input_tokens": final_cache},
+        },
+    )
     yield _sse("message_stop", {"type": "message_stop"})
     ak_h = _alias_for_key(_key_from_headers(hdrs, "openai"))
     if _using_free:
-        _log_free_model_usage(_paid_model_id, free_model, "free (no auth)", "free (no auth)",
-                              200, final_in or 0, final_out or 0,
-                              _elapsed_ms(start_time), ip=_free_usage_ip())
-    await _save_and_log_request(req_id, _req_model_id, original_model, start_time,
-                                 final_in, final_out, final_cache, protocol, True, thinking_type,
-                                 effort, client_ip, ak_h, tool_names, log_tag,
-                                 tools_used=used_tools if used_tools else None,
-                                 request_body=request_body)
+        _log_free_model_usage(
+            _paid_model_id,
+            free_model,
+            "free (no auth)",
+            "free (no auth)",
+            200,
+            final_in or 0,
+            final_out or 0,
+            _elapsed_ms(start_time),
+            ip=_free_usage_ip(),
+        )
+    await _save_and_log_request(
+        req_id,
+        _req_model_id,
+        original_model,
+        start_time,
+        final_in,
+        final_out,
+        final_cache,
+        protocol,
+        True,
+        thinking_type,
+        effort,
+        client_ip,
+        ak_h,
+        tool_names,
+        log_tag,
+        tools_used=used_tools if used_tools else None,
+        request_body=request_body,
+    )
 
 
 # ── Thinking models token guard ────────────────────────────
 _thinking_cfg = yaml_get("thinking", "min_tokens", {})
-THINKING_MODELS = {k: int(v) for k, v in _thinking_cfg.items()} if isinstance(_thinking_cfg, dict) else {
-    "deepseek-v4-flash": 2048,
-    "deepseek-v4-pro": 4096,
-}
+THINKING_MODELS = (
+    {k: int(v) for k, v in _thinking_cfg.items()}
+    if isinstance(_thinking_cfg, dict)
+    else {
+        "deepseek-v4-flash": 2048,
+        "deepseek-v4-pro": 4096,
+    }
+)
+
 
 def ensure_min_tokens(body: dict, default: int = None) -> dict:
     if default is None:
@@ -5474,13 +6649,17 @@ def ensure_min_tokens(body: dict, default: int = None) -> dict:
     reste des tokens pour la réponse après le reasoning."""
     model = body.get("model", "")
     min_tokens = default
-    _debug(f"  [thinking] ensure_min_tokens: model={model!r} THINKING_MODELS={THINKING_MODELS} keys={list(body.keys())}")
+    _debug(
+        f"  [thinking] ensure_min_tokens: model={model!r} THINKING_MODELS={THINKING_MODELS} keys={list(body.keys())}"
+    )
     for prefix, tokens in THINKING_MODELS.items():
         if model.startswith(prefix) or model == prefix:
             min_tokens = max(min_tokens, tokens)
             break
     current = body.get("max_output_tokens") or body.get("max_tokens")
-    _debug(f"  [thinking] ensure_min_tokens: current={current} min_tokens={min_tokens} will_bump={current is not None and current < min_tokens}")
+    _debug(
+        f"  [thinking] ensure_min_tokens: current={current} min_tokens={min_tokens} will_bump={current is not None and current < min_tokens}"
+    )
     if current is not None and current < min_tokens:
         body["max_output_tokens"] = min_tokens
         # Also bump max_tokens — anthropic_to_openai() reads max_tokens, not max_output_tokens
@@ -5579,11 +6758,15 @@ def _extract_usage_tool_names(data: dict) -> list:
     msg = choices[0].get("message") if isinstance(choices[0], dict) else None
     if not msg or not isinstance(msg, dict):
         return []
-    return [tc["function"]["name"] for tc in (msg.get("tool_calls") or [])
-            if isinstance(tc, dict) and isinstance(tc.get("function"), dict)]
+    return [
+        tc["function"]["name"]
+        for tc in (msg.get("tool_calls") or [])
+        if isinstance(tc, dict) and isinstance(tc.get("function"), dict)
+    ]
 
 
 # ── Shared helpers for endpoint handlers ──────────────────────────
+
 
 def _get_client_ip(request: Request) -> str:
     """Extract client IP from the socket peer only.
@@ -5604,10 +6787,14 @@ async def messages(request: Request):
     _current_user_agent.set(request.headers.get("user-agent"))
 
     body_bytes = await request.body()
-    _debug(f"  [body] read {len(body_bytes)} bytes in {(time.monotonic() - start_time) * 1000:.0f}ms")
+    _debug(
+        f"  [body] read {len(body_bytes)} bytes in {(time.monotonic() - start_time) * 1000:.0f}ms"
+    )
     if len(body_bytes) > MAX_BODY_SIZE:
         _debug(f"  413: body too large ({len(body_bytes)} bytes)")
-        return _anthropic_error(413, f"Request body too large ({len(body_bytes)} bytes, max {MAX_BODY_SIZE})")
+        return _anthropic_error(
+            413, f"Request body too large ({len(body_bytes)} bytes, max {MAX_BODY_SIZE})"
+        )
 
     try:
         body = _json_loads(body_bytes)
@@ -5622,10 +6809,12 @@ async def messages(request: Request):
 
     # [fix 20/08] Compact request detection + diagnostics
     _thinking = body.get("thinking")
-    _is_compact = (isinstance(_thinking, dict) and _thinking.get("type") == "compact")
+    _is_compact = isinstance(_thinking, dict) and _thinking.get("type") == "compact"
     _msg_count = len(body.get("messages", []))
     if _is_compact or _msg_count > 50 or len(body_bytes) > 500000:
-        _log(f"  [compact?] req_id={req_id} model={original_model!r} thinking={_thinking} msgs={_msg_count} body={len(body_bytes)}B")
+        _log(
+            f"  [compact?] req_id={req_id} model={original_model!r} thinking={_thinking} msgs={_msg_count} body={len(body_bytes)}B"
+        )
     if DEBUG:
         _debug(f"[messages] headers={_sanitize_headers(dict(request.headers))}")
         _debug(f"[messages] body=\n{_redact(_truncate(body))}")
@@ -5634,8 +6823,11 @@ async def messages(request: Request):
         _debug(f"[messages] ✗ no route found for {original_model!r}")
         available = sorted(MODELS.keys())
         return Response(
-            content=_json_dumps_str({"error": f"Model not found: {original_model!r}", "available_models": available}),
-            status_code=404, media_type="application/json",
+            content=_json_dumps_str(
+                {"error": f"Model not found: {original_model!r}", "available_models": available}
+            ),
+            status_code=404,
+            media_type="application/json",
         )
     model_id = route["model"]
     cfg = get_model_config(model_id)
@@ -5666,14 +6858,24 @@ async def messages(request: Request):
     # Extract thinking for logging
     thinking = body.get("thinking", {})
     thinking_type = thinking.get("type", "none") if isinstance(thinking, dict) else "none"
-    effort = (body.get("effort")
-              or (thinking.get("effort") if isinstance(thinking, dict) else None)
-              or (body.get("output_config", {}).get("effort") if isinstance(body.get("output_config"), dict) else None)
-              or "none")
+    effort = (
+        body.get("effort")
+        or (thinking.get("effort") if isinstance(thinking, dict) else None)
+        or (
+            body.get("output_config", {}).get("effort")
+            if isinstance(body.get("output_config"), dict)
+            else None
+        )
+        or "none"
+    )
 
-    _log(f"→ {original_model!r} → {model_id} | {protocol} | stream={body.get('stream', False)} | thinking={thinking_type} | effort={effort} | ip={client_ip}")
+    _log(
+        f"→ {original_model!r} → {model_id} | {protocol} | stream={body.get('stream', False)} | thinking={thinking_type} | effort={effort} | ip={client_ip}"
+    )
 
-    _geo_gate = await _enforce_geo_gate(route, request, is_stream=bool(body.get("stream", False)), protocol=protocol)
+    _geo_gate = await _enforce_geo_gate(
+        route, request, is_stream=bool(body.get("stream", False)), protocol=protocol
+    )
     if _geo_gate is not None:
         return _geo_gate
 
@@ -5689,20 +6891,48 @@ async def messages(request: Request):
         # ── Free model: try BEFORE auth (free models don't need API keys) ──
         if not is_stream and FREE_MODEL_MAP.get(model_id):
             try:
-                free_result = await _try_free_model_first(body, {}, "anthropic", model_id, forced_pool=getattr(request.state, "_geo_forced_pool", None))
+                free_result = await _try_free_model_first(
+                    body,
+                    {},
+                    "anthropic",
+                    model_id,
+                    forced_pool=getattr(request.state, "_geo_forced_pool", None),
+                )
                 if free_result is not None:
                     resp, _, _actual_model, _actual_ip = free_result
-                    data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+                    data = (
+                        resp.json()
+                        if resp.headers.get("content-type", "").startswith("application/json")
+                        else {}
+                    )
                     usage = data.get("usage", {})
                     req_in = usage.get("input_tokens", 0) or usage.get("prompt_tokens", 0)
                     req_out = usage.get("output_tokens", 0) or usage.get("completion_tokens", 0)
                     req_cache = usage.get("cache_read_input_tokens", 0)
                     _update_token_usage(_actual_model, req_in, req_out, req_cache)
-                    used = [b["name"] for b in data.get("content", []) if b.get("type") == "tool_use"]
-                    await _save_and_log_request(req_id, _actual_model, original_model, start_time,
-                                 req_in, req_out, req_cache, protocol, False, thinking_type,
-                                 effort, client_ip, "free (no auth)", tool_names, tools_used=used,
-                                 request_body=request_body, response_body=data, free_model_ip=_actual_ip)
+                    used = [
+                        b["name"] for b in data.get("content", []) if b.get("type") == "tool_use"
+                    ]
+                    await _save_and_log_request(
+                        req_id,
+                        _actual_model,
+                        original_model,
+                        start_time,
+                        req_in,
+                        req_out,
+                        req_cache,
+                        protocol,
+                        False,
+                        thinking_type,
+                        effort,
+                        client_ip,
+                        "free (no auth)",
+                        tool_names,
+                        tools_used=used,
+                        request_body=request_body,
+                        response_body=data,
+                        free_model_ip=_actual_ip,
+                    )
                     return Response(content=resp.content, media_type="application/json")
             except FreeQuotaExhausted as e:
                 return _free_quota_exhausted_response(e, "anthropic")
@@ -5714,18 +6944,32 @@ async def messages(request: Request):
         except AllKeysPausedError as e:
             # If a free model exists, try streaming with empty headers before giving up
             if is_stream and FREE_MODEL_MAP.get(model_id):
+
                 async def anthropic_stream_free_fallback():
                     # Re-use the existing generator — it already handles free model swap
                     async for chunk in anthropic_stream({}):
                         yield chunk
-                return StreamingResponse(_sse_keepalive(anthropic_stream_free_fallback()), media_type="text/event-stream",
-                                         headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
+
+                return StreamingResponse(
+                    _sse_keepalive(anthropic_stream_free_fallback()),
+                    media_type="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+                )
             retry_after = int(e.retry_after) + 1
             return Response(
-                content=_json_dumps_str({"type": "error", "error": {"type": "api_error",
-                    "message": f"All API keys exhausted. Retry after {retry_after}s."}}),
-                status_code=503, media_type="application/json",
-                headers={"Retry-After": str(retry_after)})
+                content=_json_dumps_str(
+                    {
+                        "type": "error",
+                        "error": {
+                            "type": "api_error",
+                            "message": f"All API keys exhausted. Retry after {retry_after}s.",
+                        },
+                    }
+                ),
+                status_code=503,
+                media_type="application/json",
+                headers={"Retry-After": str(retry_after)},
+            )
 
         if not is_stream:
             # Check cache
@@ -5735,24 +6979,40 @@ async def messages(request: Request):
                 cached_body, cached_headers = cached
                 _debug(f"  cache HIT key={cache_key[:16]}… size={len(cached_body)} bytes")
                 _log(f"  ← {model_id} | cache HIT")
-                return Response(content=cached_body, headers={**cached_headers, "X-Cache": "HIT"}, media_type="application/json")
+                return Response(
+                    content=cached_body,
+                    headers={**cached_headers, "X-Cache": "HIT"},
+                    media_type="application/json",
+                )
             _debug(f"  cache MISS key={cache_key[:16] if cache_key else 'none'}…")
 
             # Try free model first if available
             _geo_tunnel = getattr(request.state, "_geo_force_tunnel", False)
             try:
-                free_result = await _try_free_model_first(body, a_headers, "anthropic", model_id, forced_pool=getattr(request.state, "_geo_forced_pool", None))
+                free_result = await _try_free_model_first(
+                    body,
+                    a_headers,
+                    "anthropic",
+                    model_id,
+                    forced_pool=getattr(request.state, "_geo_forced_pool", None),
+                )
                 if free_result is not None:
                     resp, a_headers, _actual_model, _actual_ip = free_result
                     model_id = _actual_model  # Log as free model
                 elif _geo_tunnel:
                     # Axe A: geo-restricted paid → must route through tunnel station
-                    async with _open_via_pool(endpoint, body, a_headers,
-                                             is_stream=False,
-                                             forced_pool=getattr(request.state, "_geo_forced_pool", None)) as resp:
+                    async with _open_via_pool(
+                        endpoint,
+                        body,
+                        a_headers,
+                        is_stream=False,
+                        forced_pool=getattr(request.state, "_geo_forced_pool", None),
+                    ) as resp:
                         a_headers = dict(resp.headers)
                 else:
-                    resp, a_headers = await _do_request_with_retry(endpoint, body, a_headers, "anthropic")
+                    resp, a_headers = await _do_request_with_retry(
+                        endpoint, body, a_headers, "anthropic"
+                    )
             except FreeQuotaExhausted as e:
                 return _free_quota_exhausted_response(e, "anthropic")
             except UpstreamError as e:
@@ -5774,34 +7034,68 @@ async def messages(request: Request):
                 else:
                     msg = resp.text[:500]
                 _debug(f"  ✗ upstream {resp.status_code} → client {status}: {_redact(msg, 300)}")
-                await _log_and_save_error(req_id, model_id, original_model, start_time,
-                             resp.status_code, resp.text, protocol, is_stream, thinking_type,
-                             effort, client_ip, account_alias, tool_names,
-                             request_body=request_body, response_body={"error": resp.text[:2000]})
+                await _log_and_save_error(
+                    req_id,
+                    model_id,
+                    original_model,
+                    start_time,
+                    resp.status_code,
+                    resp.text,
+                    protocol,
+                    is_stream,
+                    thinking_type,
+                    effort,
+                    client_ip,
+                    account_alias,
+                    tool_names,
+                    request_body=request_body,
+                    response_body={"error": resp.text[:2000]},
+                )
                 # Pause key on credit/balance errors (400) and retry with alt key
-                if resp.status_code == 400 and any(x in resp.text for x in ("Insufficient balance", "Monthly usage limit")):
+                if resp.status_code == 400 and any(
+                    x in resp.text for x in ("Insufficient balance", "Monthly usage limit")
+                ):
                     failed_key = headers.get("x-api-key", "")
-                    _key_pauser.pause_key(failed_key, _key_pauser._max_pause, f"400 credit error: {_redact(resp.text, 80)}")
+                    _key_pauser.pause_key(
+                        failed_key,
+                        _key_pauser._max_pause,
+                        f"400 credit error: {_redact(resp.text, 80)}",
+                    )
                     alt = _find_alternative_key(failed_key)
                     if alt:
                         _log(f"  400 credit error on key, retrying with alternative key")
-                        headers = {"x-api-key": alt.get("api_key", ""), "Content-Type": "application/json",
-                                   "anthropic-version": "2023-06-01"}
+                        headers = {
+                            "x-api-key": alt.get("api_key", ""),
+                            "Content-Type": "application/json",
+                            "anthropic-version": "2023-06-01",
+                        }
                         try:
-                            resp, headers = await _do_request_with_retry(endpoint, body, headers, "anthropic")
+                            resp, headers = await _do_request_with_retry(
+                                endpoint, body, headers, "anthropic"
+                            )
                             if resp.status_code == 200:
                                 account_alias = _alias_for_key(headers.get("x-api-key", ""))
                             else:
-                                return _anthropic_error(503, "All API keys exhausted. Check your billing.")
+                                return _anthropic_error(
+                                    503, "All API keys exhausted. Check your billing."
+                                )
                         except UpstreamError as e:
                             return _anthropic_error(e.status_code, str(e))
                 if resp.status_code in (429, 401, 403):
                     return _anthropic_error(503, msg)
                 if resp.status_code == 499:
                     return _anthropic_error(502, msg)
-                return Response(content=resp.content, status_code=resp.status_code, media_type="application/json")
+                return Response(
+                    content=resp.content,
+                    status_code=resp.status_code,
+                    media_type="application/json",
+                )
             try:
-                data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+                data = (
+                    resp.json()
+                    if resp.headers.get("content-type", "").startswith("application/json")
+                    else {}
+                )
             except Exception:
                 _debug(f"  ✗ non-JSON response from {endpoint}")
                 _log(f"  UPSTREAM DECODE ERROR: non-JSON response from {endpoint}")
@@ -5814,10 +7108,25 @@ async def messages(request: Request):
             _debug(f"  response=\n{_redact(_truncate(data))}")
             _update_token_usage(model_id, req_in, req_out, req_cache)
             used = [b["name"] for b in data.get("content", []) if b.get("type") == "tool_use"]
-            await _save_and_log_request(req_id, model_id, original_model, start_time,
-                         req_in, req_out, req_cache, protocol, is_stream, thinking_type,
-                         effort, client_ip, account_alias, tool_names, tools_used=used,
-                         request_body=request_body, response_body=data)
+            await _save_and_log_request(
+                req_id,
+                model_id,
+                original_model,
+                start_time,
+                req_in,
+                req_out,
+                req_cache,
+                protocol,
+                is_stream,
+                thinking_type,
+                effort,
+                client_ip,
+                account_alias,
+                tool_names,
+                tools_used=used,
+                request_body=request_body,
+                response_body=data,
+            )
             if cache_key:
                 _response_cache.put(cache_key, resp.content, {"Content-Type": "application/json"})
             # success headers (minimized X-Geo-*)
@@ -5829,8 +7138,11 @@ async def messages(request: Request):
                     _succ_geo = _geo_headers(route, pinned=_pinned, current_country=_cur)
             except Exception:
                 pass
-            return Response(content=resp.content, headers={"X-Cache": "MISS", **_succ_geo}, media_type="application/json")
-
+            return Response(
+                content=resp.content,
+                headers={"X-Cache": "MISS", **_succ_geo},
+                media_type="application/json",
+            )
 
         async def anthropic_stream(headers):
             nonlocal endpoint, body, model_id
@@ -5850,7 +7162,13 @@ async def messages(request: Request):
                 endpoint = _cfg_settings._free_endpoint_for(free_model)
                 if API_BASE_FREE != _cfg_settings.API_BASE_FREE:
                     if "/responses" in endpoint:
-                        endpoint = API_BASE_FREE.replace("/chat/completions", "/responses").replace("/v1/chat/completions", "/v1/responses") if "/chat/completions" in API_BASE_FREE else endpoint
+                        endpoint = (
+                            API_BASE_FREE.replace("/chat/completions", "/responses").replace(
+                                "/v1/chat/completions", "/v1/responses"
+                            )
+                            if "/chat/completions" in API_BASE_FREE
+                            else endpoint
+                        )
                     else:
                         endpoint = API_BASE_FREE
                 _using_free = True
@@ -5880,19 +7198,28 @@ async def messages(request: Request):
             for _attempt in range(_free_bound):
                 used_tools = []  # Reset on each retry attempt
                 _line_buf = ""  # fresh per attempt — avoids stale truncated data: re-parse
-                _debug(f"  [stream] attempt {_attempt+1}/{_free_bound}")
+                _debug(f"  [stream] attempt {_attempt + 1}/{_free_bound}")
                 try:
                     # Axe A: geo-restricted paid streaming → route through tunnel station
-                    _stream_ctx = (_open_via_pool(endpoint, body, headers,
-                                                  is_stream=True,
-                                                  forced_pool=_free_forced_pool)
-                                   if _geo_tunnel else
-                                   _open_free_stream(endpoint, body, headers, _using_free,
-                                                     count_request=(_attempt == 0),
-                                                     fresh_station=(_attempt > 0 and _using_free),
-                                                     direct_fallback=(_free_exception_fallback_mode() != "station-first"
-                                                                      or _attempt + 1 >= effective_free_max_attempts(_free_forced_pool)),
-                                                     forced_pool=_free_forced_pool))
+                    _stream_ctx = (
+                        _open_via_pool(
+                            endpoint, body, headers, is_stream=True, forced_pool=_free_forced_pool
+                        )
+                        if _geo_tunnel
+                        else _open_free_stream(
+                            endpoint,
+                            body,
+                            headers,
+                            _using_free,
+                            count_request=(_attempt == 0),
+                            fresh_station=(_attempt > 0 and _using_free),
+                            direct_fallback=(
+                                _free_exception_fallback_mode() != "station-first"
+                                or _attempt + 1 >= effective_free_max_attempts(_free_forced_pool)
+                            ),
+                            forced_pool=_free_forced_pool,
+                        )
+                    )
                     async with _stream_ctx as resp:
                         _debug(f"  [stream] connected status={resp.status_code}")
                         if resp.status_code != 200:
@@ -5902,21 +7229,40 @@ async def messages(request: Request):
                                 # keys: a status from the free endpoint says nothing
                                 # about the paid account (CRITIC(2)/CRITIC(3)).
                                 if resp.status_code == 429:
-                                    _refuse = _on_free_429_stream(free_model, resp.headers.get('retry-after', ''),
-                                                                   forced_pool=_free_forced_pool)
-                                    if not _refuse and _attempt + 1 < effective_free_max_attempts(_free_forced_pool):
+                                    _refuse = _on_free_429_stream(
+                                        free_model,
+                                        resp.headers.get("retry-after", ""),
+                                        forced_pool=_free_forced_pool,
+                                    )
+                                    if not _refuse and _attempt + 1 < effective_free_max_attempts(
+                                        _free_forced_pool
+                                    ):
                                         # [plan 19/08 §1] budget left → retry free on a
                                         # FRESH station (fresh IP = fresh quota); keep
                                         # _using_free so the next attempt re-enters free
                                         # with fresh_station=True. Cooldown + rotation
                                         # for the exhausted IP already done above.
-                                        _log_free_model_usage(model_id, free_model, "free (no auth)", "free (no auth)",
-                                                              resp.status_code, ip=_free_usage_ip())
-                                        _log(f"  FREE {free_model!r} RATE LIMITED (429) → retry station fraîche (essai {_attempt + 2}/{effective_free_max_attempts(_free_forced_pool)})")
-                                        if _stream_has_yielded(started, open_blocks, stream_out, _line_buf):
+                                        _log_free_model_usage(
+                                            model_id,
+                                            free_model,
+                                            "free (no auth)",
+                                            "free (no auth)",
+                                            resp.status_code,
+                                            ip=_free_usage_ip(),
+                                        )
+                                        _log(
+                                            f"  FREE {free_model!r} RATE LIMITED (429) → retry station fraîche (essai {_attempt + 2}/{effective_free_max_attempts(_free_forced_pool)})"
+                                        )
+                                        if _stream_has_yielded(
+                                            started, open_blocks, stream_out, _line_buf
+                                        ):
                                             _cb_record_failure(endpoint)
-                                            _log(f"  stream_retry_suppressed_after_started attempt={_attempt+1}")
-                                            async for ev in _terminate_after_started(open_blocks, stream_out):
+                                            _log(
+                                                f"  stream_retry_suppressed_after_started attempt={_attempt + 1}"
+                                            )
+                                            async for ev in _terminate_after_started(
+                                                open_blocks, stream_out
+                                            ):
                                                 yield ev
                                             return
                                         continue
@@ -5927,60 +7273,112 @@ async def messages(request: Request):
                                 endpoint = paid_endpoint
                                 _using_free = False
                                 _track_model = model_id  # Revert tracking to paid model
-                                _debug(f"  [stream] free model {resp.status_code} → falling back to paid {_track_model!r}")
-                                _log(f"  FREE model {resp.status_code} → falling back to paid {_track_model!r}")
-                                _log_free_model_usage(model_id, free_model, "free (no auth)", "free (no auth)",
-                                                      resp.status_code, ip=_free_usage_ip())
+                                _debug(
+                                    f"  [stream] free model {resp.status_code} → falling back to paid {_track_model!r}"
+                                )
+                                _log(
+                                    f"  FREE model {resp.status_code} → falling back to paid {_track_model!r}"
+                                )
+                                _log_free_model_usage(
+                                    model_id,
+                                    free_model,
+                                    "free (no auth)",
+                                    "free (no auth)",
+                                    resp.status_code,
+                                    ip=_free_usage_ip(),
+                                )
                                 if _refuse:
                                     # strict_free (GUI): every station exhausted
                                     # (bad/down + (model, IP) cooldown active) —
                                     # refuse instead of paying.
-                                    _retry_after = resp.headers.get('retry-after', '') or "60"
+                                    _retry_after = resp.headers.get("retry-after", "") or "60"
                                     yield await _stream_error_response(
-                                        req_id, free_model, original_model, start_time,
-                                        429, await resp.aread(), protocol, thinking_type,
-                                        effort, client_ip, "free (no auth)", tool_names,
-                                        {"type": "error",
-                                         "error": {"type": "rate_limit_error",
-                                                   "message": f"Free quota exhausted on all VPN stations. Retry after {_retry_after}s."}},
-                                        request_body=request_body)
+                                        req_id,
+                                        free_model,
+                                        original_model,
+                                        start_time,
+                                        429,
+                                        await resp.aread(),
+                                        protocol,
+                                        thinking_type,
+                                        effort,
+                                        client_ip,
+                                        "free (no auth)",
+                                        tool_names,
+                                        {
+                                            "type": "error",
+                                            "error": {
+                                                "type": "rate_limit_error",
+                                                "message": f"Free quota exhausted on all VPN stations. Retry after {_retry_after}s.",
+                                            },
+                                        },
+                                        request_body=request_body,
+                                    )
                                     return
                                 continue
-                            headers, should_retry = await _handle_429(headers, resp.status_code, _attempt, resp.headers)
+                            headers, should_retry = await _handle_429(
+                                headers, resp.status_code, _attempt, resp.headers
+                            )
                             if should_retry:
                                 _debug(f"  [stream] 429 retry, key swapped")
                                 if _stream_has_yielded(started, open_blocks, stream_out, _line_buf):
                                     _cb_record_failure(endpoint)
-                                    _log(f"  stream_retry_suppressed_after_started attempt={_attempt+1}")
-                                    async for ev in _terminate_after_started(open_blocks, stream_out):
+                                    _log(
+                                        f"  stream_retry_suppressed_after_started attempt={_attempt + 1}"
+                                    )
+                                    async for ev in _terminate_after_started(
+                                        open_blocks, stream_out
+                                    ):
                                         yield ev
                                     return
                                 continue
                             if resp.status_code == 499:
-                                wait = 1.0 * (2 ** _attempt)
-                                _debug(f"  [stream] upstream 499, retrying in {wait:.1f}s (attempt {_attempt+1})")
+                                wait = 1.0 * (2**_attempt)
+                                _debug(
+                                    f"  [stream] upstream 499, retrying in {wait:.1f}s (attempt {_attempt + 1})"
+                                )
                                 await asyncio.sleep(wait)
                                 if _stream_has_yielded(started, open_blocks, stream_out, _line_buf):
                                     _cb_record_failure(endpoint)
-                                    _log(f"  stream_retry_suppressed_after_started attempt={_attempt+1}")
-                                    async for ev in _terminate_after_started(open_blocks, stream_out):
+                                    _log(
+                                        f"  stream_retry_suppressed_after_started attempt={_attempt + 1}"
+                                    )
+                                    async for ev in _terminate_after_started(
+                                        open_blocks, stream_out
+                                    ):
                                         yield ev
                                     return
                                 continue
                             err = await resp.aread()
                             # Pause key on credit/balance errors (400)
-                            if resp.status_code == 400 and any(x in err.decode(errors='ignore') for x in ("Insufficient balance", "Monthly usage limit")):
+                            if resp.status_code == 400 and any(
+                                x in err.decode(errors="ignore")
+                                for x in ("Insufficient balance", "Monthly usage limit")
+                            ):
                                 failed_key = headers.get("x-api-key", "")
-                                _key_pauser.pause_key(failed_key, _key_pauser._max_pause, f"400 credit error")
+                                _key_pauser.pause_key(
+                                    failed_key, _key_pauser._max_pause, f"400 credit error"
+                                )
                                 alt = _find_alternative_key(failed_key)
                                 if alt:
-                                    _log(f"  400 credit error on key, retrying with alternative key")
-                                    headers = {"x-api-key": alt.get("api_key", ""), "Content-Type": "application/json",
-                                               "anthropic-version": "2023-06-01"}
-                                    if _stream_has_yielded(started, open_blocks, stream_out, _line_buf):
+                                    _log(
+                                        f"  400 credit error on key, retrying with alternative key"
+                                    )
+                                    headers = {
+                                        "x-api-key": alt.get("api_key", ""),
+                                        "Content-Type": "application/json",
+                                        "anthropic-version": "2023-06-01",
+                                    }
+                                    if _stream_has_yielded(
+                                        started, open_blocks, stream_out, _line_buf
+                                    ):
                                         _cb_record_failure(endpoint)
-                                        _log(f"  stream_retry_suppressed_after_started attempt={_attempt+1}")
-                                        async for ev in _terminate_after_started(open_blocks, stream_out):
+                                        _log(
+                                            f"  stream_retry_suppressed_after_started attempt={_attempt + 1}"
+                                        )
+                                        async for ev in _terminate_after_started(
+                                            open_blocks, stream_out
+                                        ):
                                             yield ev
                                         return
                                     continue
@@ -5998,13 +7396,27 @@ async def messages(request: Request):
                                 err_msg = _auth_window_message(resp.status_code)
                             else:
                                 err_msg = f"HTTP {resp.status_code}: {err.decode('utf-8', errors='replace')[:200]}"
-                            error_payload = {"type": "error", "error": {"type": "api_error",
-                                           "message": err_msg}}
+                            error_payload = {
+                                "type": "error",
+                                "error": {"type": "api_error", "message": err_msg},
+                            }
                             # DB/console gardent le vrai statut upstream (resp.status_code)
-                            yield await _stream_error_response(req_id, _track_model, original_model, start_time,
-                                         resp.status_code, err, protocol, thinking_type, effort,
-                                         client_ip, ak, tool_names, error_payload,
-                                         request_body=request_body)
+                            yield await _stream_error_response(
+                                req_id,
+                                _track_model,
+                                original_model,
+                                start_time,
+                                resp.status_code,
+                                err,
+                                protocol,
+                                thinking_type,
+                                effort,
+                                client_ip,
+                                ak,
+                                tool_names,
+                                error_payload,
+                                request_body=request_body,
+                            )
                             return
                         async for chunk in resp.aiter_bytes():
                             yield chunk
@@ -6017,7 +7429,9 @@ async def messages(request: Request):
                                 if _nl != -1:
                                     _line_buf = _tail[_nl + 1 :]
                                 else:
-                                    _debug(f"  [stream] line_buf truncated mid-JSON (no newline in last {_keep})")
+                                    _debug(
+                                        f"  [stream] line_buf truncated mid-JSON (no newline in last {_keep})"
+                                    )
                                     _line_buf = _tail
                             while "\n" in _line_buf:
                                 line, _line_buf = _line_buf.split("\n", 1)
@@ -6036,7 +7450,9 @@ async def messages(request: Request):
                                 if etype == "message_start":
                                     usage = event.get("message", {}).get("usage", {})
                                     stream_in = usage.get("input_tokens")
-                                    _debug(f"  [stream] message_start: input_tokens={stream_in} cache_read={usage.get('cache_read_input_tokens', 0)}")
+                                    _debug(
+                                        f"  [stream] message_start: input_tokens={stream_in} cache_read={usage.get('cache_read_input_tokens', 0)}"
+                                    )
                                     started = True
                                     stream_cache = usage.get("cache_read_input_tokens", 0)
                                     # Consolidated: single lock acquisition for input + cache update
@@ -6044,14 +7460,22 @@ async def messages(request: Request):
                                         try:
                                             with _token_lock:
                                                 if stream_in is not None:
-                                                    _token_usage[_track_model]["input"] += stream_in - est_input
+                                                    _token_usage[_track_model]["input"] += (
+                                                        stream_in - est_input
+                                                    )
                                                 if stream_cache:
-                                                    _token_usage[_track_model]["cache"] += stream_cache
+                                                    _token_usage[_track_model]["cache"] += (
+                                                        stream_cache
+                                                    )
                                         except Exception as e:
-                                            _debug(f"  ✗ token rollback failed: {type(e).__name__}: {e}")
+                                            _debug(
+                                                f"  ✗ token rollback failed: {type(e).__name__}: {e}"
+                                            )
                                 elif etype == "content_block_start":
                                     block = event.get("content_block", {})
-                                    _debug(f"  [stream] content_block_start: type={block.get('type')} name={block.get('name', '')} index={event.get('index')}")
+                                    _debug(
+                                        f"  [stream] content_block_start: type={block.get('type')} name={block.get('name', '')} index={event.get('index')}"
+                                    )
                                     if block.get("type") == "tool_use" and block.get("name"):
                                         used_tools.append(block["name"])
                                     open_blocks.append(event.get("index"))
@@ -6063,11 +7487,17 @@ async def messages(request: Request):
                                 elif etype == "message_delta":
                                     usage = event.get("usage", {})
                                     stream_out = usage.get("output_tokens", 0)
-                                    stop_reason = event.get("delta", {}).get("stop_reason", stop_reason)
-                                    _debug(f"  [stream] message_delta: stop_reason={stop_reason} output_tokens={stream_out}")
+                                    stop_reason = event.get("delta", {}).get(
+                                        "stop_reason", stop_reason
+                                    )
+                                    _debug(
+                                        f"  [stream] message_delta: stop_reason={stop_reason} output_tokens={stream_out}"
+                                    )
                                 elif etype == "message_stop":
                                     emitted_finish = True
-                                    _debug(f"  [stream] message_stop received → emitted_finish=True")
+                                    _debug(
+                                        f"  [stream] message_stop received → emitted_finish=True"
+                                    )
                         # After stream ends, handle truncated stream (EOF without message_stop)
                         # Check remaining buffer for a final event before synthesis
                         if _line_buf.strip() and not emitted_finish:
@@ -6076,9 +7506,14 @@ async def messages(request: Request):
                                 _rem = _rem[5:].strip()
                             try:
                                 _ev = _json_loads(_rem)
-                                if isinstance(_ev, dict) and _ev.get("type") in ("message_stop", "message_delta"):
+                                if isinstance(_ev, dict) and _ev.get("type") in (
+                                    "message_stop",
+                                    "message_delta",
+                                ):
                                     # If we have a buffered final event, consider it emitted
-                                    if _ev.get("type") == "message_stop" or _ev.get("delta", {}).get("stop_reason"):
+                                    if _ev.get("type") == "message_stop" or _ev.get(
+                                        "delta", {}
+                                    ).get("stop_reason"):
                                         emitted_finish = True
                             except Exception:
                                 pass
@@ -6102,13 +7537,16 @@ async def messages(request: Request):
                     # registered → re-raised unchanged. Attempts exhausted →
                     # honest error (client-side retry) instead of a dead re-strike.
                     st = _free_attempt_station()
-                    if (st is not None and _attempt == 0
-                            and _is_watchdog_cancelled(st)):
-                        _debug(f"  ⟳ stream watchdog-cancelled (dead tunnel, station {getattr(st, '_station', '?')}) — failover retry")
-                        _log(f"  FREE STREAM on confirmed-dead tunnel cancelled → switching station")
+                    if st is not None and _attempt == 0 and _is_watchdog_cancelled(st):
+                        _debug(
+                            f"  ⟳ stream watchdog-cancelled (dead tunnel, station {getattr(st, '_station', '?')}) — failover retry"
+                        )
+                        _log(
+                            f"  FREE STREAM on confirmed-dead tunnel cancelled → switching station"
+                        )
                         if _stream_has_yielded(started, open_blocks, stream_out, _line_buf):
                             _cb_record_failure(endpoint)
-                            _log(f"  stream_retry_suppressed_after_started attempt={_attempt+1}")
+                            _log(f"  stream_retry_suppressed_after_started attempt={_attempt + 1}")
                             async for ev in _terminate_after_started(open_blocks, stream_out):
                                 yield ev
                             return
@@ -6121,10 +7559,12 @@ async def messages(request: Request):
                     # next attempt re-enters free with fresh_station=True
                     # (bad-mark → exclusion of the dead station).
                     _cb_record_failure(endpoint)  # Record failure for circuit breaker
-                    _log(f"  FREE STREAM via station {getattr(ftf.station, '_station', '?')} tunnel FAILED ({ftf.cause}) → retry station fraîche")
+                    _log(
+                        f"  FREE STREAM via station {getattr(ftf.station, '_station', '?')} tunnel FAILED ({ftf.cause}) → retry station fraîche"
+                    )
                     if _stream_has_yielded(started, open_blocks, stream_out, _line_buf):
                         _cb_record_failure(endpoint)
-                        _log(f"  stream_retry_suppressed_after_started attempt={_attempt+1}")
+                        _log(f"  stream_retry_suppressed_after_started attempt={_attempt + 1}")
                         async for ev in _terminate_after_started(open_blocks, stream_out):
                             yield ev
                         return
@@ -6132,19 +7572,33 @@ async def messages(request: Request):
                 except Exception as e:
                     _cb_record_failure(endpoint)  # Record failure for circuit breaker
                     ak = _alias_for_key(headers.get("x-api-key", "")) if headers else ""
-                    _debug(f"  [stream] exception on attempt {_attempt+1}: {type(e).__name__}: {e}")
-                    _log(f"  ERROR stream (attempt {_attempt+1}): {type(e).__name__}: {e}")
+                    _debug(
+                        f"  [stream] exception on attempt {_attempt + 1}: {type(e).__name__}: {e}"
+                    )
+                    _log(f"  ERROR stream (attempt {_attempt + 1}): {type(e).__name__}: {e}")
                     if _attempt == 0:
                         # Network errors (server disconnect, timeout) → retry with same key first
-                        _is_network_error = isinstance(e, (httpx.RemoteProtocolError, httpx.ReadError,
-                                                           ConnectionError, OSError)) or "disconnected" in str(e).lower()
+                        _is_network_error = (
+                            isinstance(
+                                e,
+                                (
+                                    httpx.RemoteProtocolError,
+                                    httpx.ReadError,
+                                    ConnectionError,
+                                    OSError,
+                                ),
+                            )
+                            or "disconnected" in str(e).lower()
+                        )
                         if _is_network_error:
                             _debug(f"  ⟳ stream retry (network error, same key)")
                             _log(f"  Retrying stream (network error, same key)")
                             await asyncio.sleep(1.0)
                             if _stream_has_yielded(started, open_blocks, stream_out, _line_buf):
                                 _cb_record_failure(endpoint)
-                                _log(f"  stream_retry_suppressed_after_started attempt={_attempt+1}")
+                                _log(
+                                    f"  stream_retry_suppressed_after_started attempt={_attempt + 1}"
+                                )
                                 async for ev in _terminate_after_started(open_blocks, stream_out):
                                     yield ev
                                 return
@@ -6156,7 +7610,9 @@ async def messages(request: Request):
                                 await _pause_key_for_quota_reset(failed_key)
                             except Exception:
                                 _default_pause = float(yaml_get("key_pause", "default_pause", 60))
-                                _key_pauser.pause_key(failed_key, _default_pause, "stream exception")
+                                _key_pauser.pause_key(
+                                    failed_key, _default_pause, "stream exception"
+                                )
                         alt = _find_alternative_key(failed_key)
                         if alt:
                             _debug(f"  ⟳ stream retry with alt key: alias={alt.get('alias', '?')}")
@@ -6164,7 +7620,7 @@ async def messages(request: Request):
                             headers = _get_auth_headers("anthropic", entry=alt)
                         if _stream_has_yielded(started, open_blocks, stream_out, _line_buf):
                             _cb_record_failure(endpoint)
-                            _log(f"  stream_retry_suppressed_after_started attempt={_attempt+1}")
+                            _log(f"  stream_retry_suppressed_after_started attempt={_attempt + 1}")
                             async for ev in _terminate_after_started(open_blocks, stream_out):
                                 yield ev
                             return
@@ -6179,16 +7635,39 @@ async def messages(request: Request):
                                     _token_usage[_track_model]["output"] += stream_out
                         except Exception as e:
                             _debug(f"  ✗ token rollback failed: {type(e).__name__}: {e}")
-                    await _save_request(req_id, _track_model, original_model, _elapsed_ms(start_time),
-                                 stream_in if stream_in is not None else est_input, stream_out, stream_cache, success=False, error=str(e),
-                                 protocol=protocol, is_stream=True, thinking=thinking_type, effort=effort,
-                                 client_ip=client_ip, account_alias=ak, tools=tool_names,
-                                 tools_used=used_tools if used_tools else None,
-                                 request_body=request_body)
+                    await _save_request(
+                        req_id,
+                        _track_model,
+                        original_model,
+                        _elapsed_ms(start_time),
+                        stream_in if stream_in is not None else est_input,
+                        stream_out,
+                        stream_cache,
+                        success=False,
+                        error=str(e),
+                        protocol=protocol,
+                        is_stream=True,
+                        thinking=thinking_type,
+                        effort=effort,
+                        client_ip=client_ip,
+                        account_alias=ak,
+                        tools=tool_names,
+                        tools_used=used_tools if used_tools else None,
+                        request_body=request_body,
+                    )
                     if started:
                         for idx in open_blocks:
-                            yield _sse("content_block_stop", {"type": "content_block_stop", "index": idx})
-                        yield _sse("message_delta", {"type": "message_delta", "delta": {"stop_reason": "error"}, "usage": {"output_tokens": stream_out}})
+                            yield _sse(
+                                "content_block_stop", {"type": "content_block_stop", "index": idx}
+                            )
+                        yield _sse(
+                            "message_delta",
+                            {
+                                "type": "message_delta",
+                                "delta": {"stop_reason": "error"},
+                                "usage": {"output_tokens": stream_out},
+                            },
+                        )
                         yield _sse("message_stop", {"type": "message_stop"})
                     return
                 else:
@@ -6205,22 +7684,49 @@ async def messages(request: Request):
                     yield ev
                 emitted_finish = True
             logged_in = stream_in if stream_in is not None else est_input
-            _debug(f"  [stream] done: in={logged_in} out={stream_out} cache={stream_cache} tools={used_tools}")
+            _debug(
+                f"  [stream] done: in={logged_in} out={stream_out} cache={stream_cache} tools={used_tools}"
+            )
             if _using_free:
-                _log_free_model_usage(model_id, free_model, "free (no auth)", "free (no auth)",
-                                      200, logged_in or 0, stream_out or 0,
-                                      _elapsed_ms(start_time), ip=_free_usage_ip())
+                _log_free_model_usage(
+                    model_id,
+                    free_model,
+                    "free (no auth)",
+                    "free (no auth)",
+                    200,
+                    logged_in or 0,
+                    stream_out or 0,
+                    _elapsed_ms(start_time),
+                    ip=_free_usage_ip(),
+                )
             if stream_in is not None or stream_out:
                 ak = _alias_for_key(headers.get("x-api-key", ""))
-                await _save_and_log_request(req_id, _track_model, original_model, start_time,
-                             logged_in, stream_out, stream_cache, protocol, True, thinking_type,
-                             effort, client_ip, ak, tool_names, tools_used=used_tools if used_tools else None,
-                             request_body=request_body)
+                await _save_and_log_request(
+                    req_id,
+                    _track_model,
+                    original_model,
+                    start_time,
+                    logged_in,
+                    stream_out,
+                    stream_cache,
+                    protocol,
+                    True,
+                    thinking_type,
+                    effort,
+                    client_ip,
+                    ak,
+                    tool_names,
+                    tools_used=used_tools if used_tools else None,
+                    request_body=request_body,
+                )
 
         # For streaming: if free model exists, pass empty headers (free models don't need auth)
         _stream_headers = a_headers if a_headers.get("x-api-key") else {}
-        return StreamingResponse(_sse_keepalive(anthropic_stream(_stream_headers)), media_type="text/event-stream",
-                                 headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
+        return StreamingResponse(
+            _sse_keepalive(anthropic_stream(_stream_headers)),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+        )
 
     # ── OpenAI-protocol ─────────────────────────────────────────
     try:
@@ -6239,32 +7745,71 @@ async def messages(request: Request):
         # If a free model exists, try it before giving up
         if FREE_MODEL_MAP.get(model_id):
             try:
-                free_result = await _try_free_model_first(oai_body, {}, "openai", model_id, forced_pool=getattr(request.state, "_geo_forced_pool", None))
+                free_result = await _try_free_model_first(
+                    oai_body,
+                    {},
+                    "openai",
+                    model_id,
+                    forced_pool=getattr(request.state, "_geo_forced_pool", None),
+                )
                 if free_result is not None:
                     resp, _, _actual_model, _actual_ip = free_result
-                    data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+                    data = (
+                        resp.json()
+                        if resp.headers.get("content-type", "").startswith("application/json")
+                        else {}
+                    )
                     usage = data.get("usage", {})
                     req_in = usage.get("prompt_tokens", 0)
                     req_out = usage.get("completion_tokens", 0)
                     cache = _extract_cache_tokens(usage)
                     _update_token_usage(_actual_model, req_in, req_out, cache)
                     used = _extract_usage_tool_names(data)
-                    await _save_and_log_request(req_id, _actual_model, original_model, start_time,
-                                 req_in, req_out, cache, protocol, False, thinking_type,
-                                 effort, client_ip, "free (no auth)", tool_names, tools_used=used,
-                                 request_body=request_body, response_body=data, free_model_ip=_actual_ip)
-                    return Response(content=_json_dumps_str(openai_to_anthropic(data, original_model), ensure_ascii=False),
-                                    media_type="application/json")
+                    await _save_and_log_request(
+                        req_id,
+                        _actual_model,
+                        original_model,
+                        start_time,
+                        req_in,
+                        req_out,
+                        cache,
+                        protocol,
+                        False,
+                        thinking_type,
+                        effort,
+                        client_ip,
+                        "free (no auth)",
+                        tool_names,
+                        tools_used=used,
+                        request_body=request_body,
+                        response_body=data,
+                        free_model_ip=_actual_ip,
+                    )
+                    return Response(
+                        content=_json_dumps_str(
+                            openai_to_anthropic(data, original_model), ensure_ascii=False
+                        ),
+                        media_type="application/json",
+                    )
             except FreeQuotaExhausted as e:
                 return _free_quota_exhausted_response(e, "openai")
             except Exception as e:
                 _debug(f"  [free] free model attempt failed: {e}")
         retry_after = int(e.retry_after) + 1
         return Response(
-            content=_json_dumps_str({"type": "error", "error": {"type": "api_error",
-                "message": f"All API keys exhausted. Retry after {retry_after}s."}}),
-            status_code=503, media_type="application/json",
-            headers={"Retry-After": str(retry_after)})
+            content=_json_dumps_str(
+                {
+                    "type": "error",
+                    "error": {
+                        "type": "api_error",
+                        "message": f"All API keys exhausted. Retry after {retry_after}s.",
+                    },
+                }
+            ),
+            status_code=503,
+            media_type="application/json",
+            headers={"Retry-After": str(retry_after)},
+        )
     is_stream = oai_body["stream"]
 
     if not is_stream:
@@ -6273,22 +7818,38 @@ async def messages(request: Request):
         cached = cache_key and _response_cache.get(cache_key)
         if cached:
             cached_body, cached_headers = cached
-            _debug(f"  cache HIT key={cache_key[:16]}… size={len(cached_body)} bytes (openai via messages)")
+            _debug(
+                f"  cache HIT key={cache_key[:16]}… size={len(cached_body)} bytes (openai via messages)"
+            )
             _log(f"  ← {model_id} | cache HIT")
-            return Response(content=cached_body, headers={**cached_headers, "X-Cache": "HIT"}, media_type="application/json")
+            return Response(
+                content=cached_body,
+                headers={**cached_headers, "X-Cache": "HIT"},
+                media_type="application/json",
+            )
         _debug(f"  cache MISS key={cache_key[:16] if cache_key else 'none'}… (openai via messages)")
         # Try free model first if available
         _geo_tunnel = getattr(request.state, "_geo_force_tunnel", False)
         try:
-            free_result = await _try_free_model_first(oai_body, headers, "openai", model_id, forced_pool=getattr(request.state, "_geo_forced_pool", None))
+            free_result = await _try_free_model_first(
+                oai_body,
+                headers,
+                "openai",
+                model_id,
+                forced_pool=getattr(request.state, "_geo_forced_pool", None),
+            )
             if free_result is not None:
                 resp, headers, _actual_model, _actual_ip = free_result
                 model_id = _actual_model
             elif _geo_tunnel:
                 # Axe A: geo-restricted paid → must route through tunnel station
-                async with _open_via_pool(endpoint, oai_body, headers,
-                                         is_stream=False,
-                                         forced_pool=getattr(request.state, "_geo_forced_pool", None)) as resp:
+                async with _open_via_pool(
+                    endpoint,
+                    oai_body,
+                    headers,
+                    is_stream=False,
+                    forced_pool=getattr(request.state, "_geo_forced_pool", None),
+                ) as resp:
                     headers = dict(resp.headers)
             else:
                 resp, headers = await _do_request_with_retry(endpoint, oai_body, headers, "openai")
@@ -6300,25 +7861,46 @@ async def messages(request: Request):
         account_alias = _alias_for_key(_key_from_headers(headers, "openai"))
         _debug(f"  response status={resp.status_code} size={len(resp.content)} bytes")
         if resp.status_code != 200:
-            await _log_and_save_error(req_id, model_id, original_model, start_time,
-                         resp.status_code, resp.text, protocol, is_stream, thinking_type,
-                         effort, client_ip, account_alias, tool_names,
-                         request_body=request_body, response_body={"error": resp.text[:2000]})
+            await _log_and_save_error(
+                req_id,
+                model_id,
+                original_model,
+                start_time,
+                resp.status_code,
+                resp.text,
+                protocol,
+                is_stream,
+                thinking_type,
+                effort,
+                client_ip,
+                account_alias,
+                tool_names,
+                request_body=request_body,
+                response_body={"error": resp.text[:2000]},
+            )
             # Pause key on credit/balance errors (400)
-            if resp.status_code == 400 and any(x in resp.text for x in ("Insufficient balance", "Monthly usage limit")):
+            if resp.status_code == 400 and any(
+                x in resp.text for x in ("Insufficient balance", "Monthly usage limit")
+            ):
                 failed_key = _key_from_headers(headers, "openai")
-                _key_pauser.pause_key(failed_key, _key_pauser._max_pause, f"400 credit error: {resp.text[:80]}")
+                _key_pauser.pause_key(
+                    failed_key, _key_pauser._max_pause, f"400 credit error: {resp.text[:80]}"
+                )
                 alt = _find_alternative_key(failed_key)
                 if alt:
                     _log(f"  400 credit error on key, retrying with alternative key")
                     headers = _get_auth_headers("openai", entry=alt)
                     # Retry once with alt key
                     try:
-                        resp, headers = await _do_request_with_retry(endpoint, oai_body, headers, "openai")
+                        resp, headers = await _do_request_with_retry(
+                            endpoint, oai_body, headers, "openai"
+                        )
                         if resp.status_code == 200:
                             account_alias = _alias_for_key(_key_from_headers(headers, "openai"))
                         else:
-                            return _anthropic_error(503, "All API keys exhausted. Check your billing.")
+                            return _anthropic_error(
+                                503, "All API keys exhausted. Check your billing."
+                            )
                     except UpstreamError as e:
                         return _anthropic_error(e.status_code, str(e))
             # Convert 429/401/403 → 503 to avoid Claude Code auth window
@@ -6333,11 +7915,25 @@ async def messages(request: Request):
                     err_msg = err_msg.get("message", resp.text[:200])
             except Exception:
                 err_msg = resp.text[:200]
-            anthro_err = _json_dumps_str({"type": "error", "error": {"type": "api_error", "message": f"HTTP {resp.status_code}: {err_msg}"}},
-                                    ensure_ascii=False)
-            return Response(content=anthro_err, status_code=resp.status_code, media_type="application/json")
+            anthro_err = _json_dumps_str(
+                {
+                    "type": "error",
+                    "error": {
+                        "type": "api_error",
+                        "message": f"HTTP {resp.status_code}: {err_msg}",
+                    },
+                },
+                ensure_ascii=False,
+            )
+            return Response(
+                content=anthro_err, status_code=resp.status_code, media_type="application/json"
+            )
         try:
-            data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+            data = (
+                resp.json()
+                if resp.headers.get("content-type", "").startswith("application/json")
+                else {}
+            )
         except Exception:
             _debug(f"  ✗ non-JSON response from {endpoint}")
             _log(f"  UPSTREAM DECODE ERROR: non-JSON response from {endpoint}")
@@ -6348,41 +7944,78 @@ async def messages(request: Request):
         if is_responses_format:
             req_in = usage.get("input_tokens", 0)
             req_out = usage.get("output_tokens", 0)
-            _inp_det = usage.get("input_tokens_details") if isinstance(usage.get("input_tokens_details"), dict) else {}
+            _inp_det = (
+                usage.get("input_tokens_details")
+                if isinstance(usage.get("input_tokens_details"), dict)
+                else {}
+            )
             cache = _inp_det.get("cached_tokens", 0)
         else:
             req_in = usage.get("prompt_tokens", 0)
             req_out = usage.get("completion_tokens", 0)
             cache = _extract_cache_tokens(usage)
-        _debug(f"  usage: in={req_in} out={req_out} cache={cache} format={'responses' if is_responses_format else 'chat'}")
+        _debug(
+            f"  usage: in={req_in} out={req_out} cache={cache} format={'responses' if is_responses_format else 'chat'}"
+        )
         _update_token_usage(model_id, req_in, req_out, cache)
         if is_responses_format:
-            _debug(f"  [non-stream] Responses API output items: {[(item.get('type'), list(item.keys())[:6]) for item in data.get('output', []) if isinstance(item, dict)]}")
-            used = [b["name"] for b in data.get("output", []) if isinstance(b, dict) and b.get("type") == "function_call"]
+            _debug(
+                f"  [non-stream] Responses API output items: {[(item.get('type'), list(item.keys())[:6]) for item in data.get('output', []) if isinstance(item, dict)]}"
+            )
+            used = [
+                b["name"]
+                for b in data.get("output", [])
+                if isinstance(b, dict) and b.get("type") == "function_call"
+            ]
             # Check for reasoning in Responses API format
             has_reasoning = any(
                 isinstance(item, dict) and item.get("type") == "reasoning"
                 for item in data.get("output", [])
             )
             if not has_reasoning and thinking_type != "none":
-                _debug(f"  [non-stream] WARNING: thinking requested (type={thinking_type}, effort={effort}) but upstream returned no reasoning in Responses API response")
+                _debug(
+                    f"  [non-stream] WARNING: thinking requested (type={thinking_type}, effort={effort}) but upstream returned no reasoning in Responses API response"
+                )
             anthro_resp = _responses_to_anthropic_response(data, original_model)
         else:
             used = _extract_usage_tool_names(data)
             msg_data = ((data.get("choices") or [{}])[0] or {}).get("message") or {}
-            if not (msg_data.get("reasoning_content") or msg_data.get("reasoning")) and thinking_type != "none":
-                _debug(f"  [non-stream] WARNING: thinking requested (type={thinking_type}, effort={effort}) but upstream returned no reasoning_content")
-            _debug(f"  [non-stream] blocks: text={bool(msg_data.get('content'))} thinking={bool(msg_data.get('reasoning_content') or msg_data.get('reasoning'))} tools={used}")
+            if (
+                not (msg_data.get("reasoning_content") or msg_data.get("reasoning"))
+                and thinking_type != "none"
+            ):
+                _debug(
+                    f"  [non-stream] WARNING: thinking requested (type={thinking_type}, effort={effort}) but upstream returned no reasoning_content"
+                )
+            _debug(
+                f"  [non-stream] blocks: text={bool(msg_data.get('content'))} thinking={bool(msg_data.get('reasoning_content') or msg_data.get('reasoning'))} tools={used}"
+            )
             anthro_resp = openai_to_anthropic(data, original_model)
-        await _save_and_log_request(req_id, model_id, original_model, start_time,
-                     req_in, req_out, cache, protocol, is_stream=False, thinking_type=thinking_type,
-                     effort=effort, client_ip=client_ip, account_alias=account_alias, tools=tool_names,
-                     tools_used=used if used else None,
-                     request_body=request_body, response_body=data)
+        await _save_and_log_request(
+            req_id,
+            model_id,
+            original_model,
+            start_time,
+            req_in,
+            req_out,
+            cache,
+            protocol,
+            is_stream=False,
+            thinking_type=thinking_type,
+            effort=effort,
+            client_ip=client_ip,
+            account_alias=account_alias,
+            tools=tool_names,
+            tools_used=used if used else None,
+            request_body=request_body,
+            response_body=data,
+        )
         anthro_bytes = _json_dumps_str(anthro_resp, ensure_ascii=False).encode()
         if cache_key:
             _response_cache.put(cache_key, anthro_bytes, {"Content-Type": "application/json"})
-        return Response(content=anthro_bytes, headers={"X-Cache": "MISS"}, media_type="application/json")
+        return Response(
+            content=anthro_bytes, headers={"X-Cache": "MISS"}, media_type="application/json"
+        )
 
     # Streaming
     msg_id = _fast_id("msg")
@@ -6449,20 +8082,33 @@ async def messages(request: Request):
             used_tools = []  # Reset on each retry attempt
             tool_block_idx = {}  # Reset tracking dict on each retry
             got_response_completed = False  # Responses API: set on response.completed
-            _responses_stream_done = False  # True after response.completed/incomplete → break inner loop
+            _responses_stream_done = (
+                False  # True after response.completed/incomplete → break inner loop
+            )
             try:
                 # Axe A: geo-restricted paid streaming → route through tunnel station
-                _debug(f"  [stream-oai] attempt {_attempt}/{_free_bound} _geo_tunnel={_geo_tunnel} _using_free={_using_free} endpoint={endpoint}")
-                _stream_ctx = (_open_via_pool(endpoint, oai_body, hdrs,
-                                              is_stream=True,
-                                              forced_pool=_free_forced_pool)
-                               if _geo_tunnel else
-                               _open_free_stream(endpoint, oai_body, hdrs, _using_free,
-                                                 count_request=(_attempt == 0),
-                                                 fresh_station=(_attempt > 0 and _using_free),
-                                                 direct_fallback=(_free_exception_fallback_mode() != "station-first"
-                                                                  or _attempt + 1 >= effective_free_max_attempts(_free_forced_pool)),
-                                                 forced_pool=_free_forced_pool))
+                _debug(
+                    f"  [stream-oai] attempt {_attempt}/{_free_bound} _geo_tunnel={_geo_tunnel} _using_free={_using_free} endpoint={endpoint}"
+                )
+                _stream_ctx = (
+                    _open_via_pool(
+                        endpoint, oai_body, hdrs, is_stream=True, forced_pool=_free_forced_pool
+                    )
+                    if _geo_tunnel
+                    else _open_free_stream(
+                        endpoint,
+                        oai_body,
+                        hdrs,
+                        _using_free,
+                        count_request=(_attempt == 0),
+                        fresh_station=(_attempt > 0 and _using_free),
+                        direct_fallback=(
+                            _free_exception_fallback_mode() != "station-first"
+                            or _attempt + 1 >= effective_free_max_attempts(_free_forced_pool)
+                        ),
+                        forced_pool=_free_forced_pool,
+                    )
+                )
                 _debug(f"  [stream-oai] entering stream context")
                 async with _stream_ctx as resp:
                     _debug(f"  [stream-oai] stream context entered, status={resp.status_code}")
@@ -6473,31 +8119,60 @@ async def messages(request: Request):
                             # keys: a status from the free endpoint says nothing
                             # about the paid account (CRITIC(2)/CRITIC(3)).
                             if resp.status_code == 429:
-                                _refuse = _on_free_429_stream(free_model, resp.headers.get('retry-after', ''),
-                                                               forced_pool=_free_forced_pool)
-                                if not _refuse and _attempt + 1 < effective_free_max_attempts(_free_forced_pool):
+                                _refuse = _on_free_429_stream(
+                                    free_model,
+                                    resp.headers.get("retry-after", ""),
+                                    forced_pool=_free_forced_pool,
+                                )
+                                if not _refuse and _attempt + 1 < effective_free_max_attempts(
+                                    _free_forced_pool
+                                ):
                                     # [plan 19/08 §1] budget left → retry free on a
                                     # FRESH station (fresh IP = fresh quota); keep
                                     # _using_free so the next attempt re-enters free
                                     # with fresh_station=True. Cooldown + rotation
                                     # for the exhausted IP already done above.
-                                    _log_free_model_usage(_paid_model_id, free_model, "free (no auth)", "free (no auth)",
-                                                          resp.status_code, ip=_free_usage_ip())
-                                    _log(f"  FREE {free_model!r} RATE LIMITED (429) → retry station fraîche (essai {_attempt + 2}/{effective_free_max_attempts(_free_forced_pool)})")
-                                    if _stream_has_yielded(started, open_blocks, stream_out_tokens, ""):
+                                    _log_free_model_usage(
+                                        _paid_model_id,
+                                        free_model,
+                                        "free (no auth)",
+                                        "free (no auth)",
+                                        resp.status_code,
+                                        ip=_free_usage_ip(),
+                                    )
+                                    _log(
+                                        f"  FREE {free_model!r} RATE LIMITED (429) → retry station fraîche (essai {_attempt + 2}/{effective_free_max_attempts(_free_forced_pool)})"
+                                    )
+                                    if _stream_has_yielded(
+                                        started, open_blocks, stream_out_tokens, ""
+                                    ):
                                         _cb_record_failure(endpoint)
-                                        _log(f"  stream_retry_suppressed_after_started attempt={_attempt+1}")
-                                        async for ev in _terminate_after_started(open_blocks, stream_out_tokens):
+                                        _log(
+                                            f"  stream_retry_suppressed_after_started attempt={_attempt + 1}"
+                                        )
+                                        async for ev in _terminate_after_started(
+                                            open_blocks, stream_out_tokens
+                                        ):
                                             yield ev
                                         return
                                     continue
                             else:
                                 _set_free_cooldown(free_model, 60, _free_attempt_station())
                                 _refuse = False
-                            _debug(f"  [stream-oai] free model {resp.status_code} → falling back to paid {_paid_model_id!r}")
-                            _log(f"  FREE model {resp.status_code} → falling back to paid {_paid_model_id!r}")
-                            _log_free_model_usage(_paid_model_id, free_model, "free (no auth)", "free (no auth)",
-                                                  resp.status_code, ip=_free_usage_ip())
+                            _debug(
+                                f"  [stream-oai] free model {resp.status_code} → falling back to paid {_paid_model_id!r}"
+                            )
+                            _log(
+                                f"  FREE model {resp.status_code} → falling back to paid {_paid_model_id!r}"
+                            )
+                            _log_free_model_usage(
+                                _paid_model_id,
+                                free_model,
+                                "free (no auth)",
+                                "free (no auth)",
+                                resp.status_code,
+                                ip=_free_usage_ip(),
+                            )
                             oai_body = paid_oai_body
                             endpoint = paid_endpoint
                             model_id = _paid_model_id
@@ -6507,50 +8182,85 @@ async def messages(request: Request):
                                 # strict_free (GUI): every station exhausted
                                 # (bad/down + (model, IP) cooldown active) —
                                 # refuse instead of paying.
-                                _retry_after = resp.headers.get('retry-after', '') or "60"
+                                _retry_after = resp.headers.get("retry-after", "") or "60"
                                 yield await _stream_error_response(
-                                    req_id, free_model, original_model, start_time,
-                                    429, await resp.aread(), protocol, thinking_type,
-                                    effort, client_ip, "free (no auth)", tool_names,
-                                    {"type": "error",
-                                     "error": {"type": "rate_limit_error",
-                                               "message": f"Free quota exhausted on all VPN stations. Retry after {_retry_after}s."}},
-                                    request_body=request_body)
+                                    req_id,
+                                    free_model,
+                                    original_model,
+                                    start_time,
+                                    429,
+                                    await resp.aread(),
+                                    protocol,
+                                    thinking_type,
+                                    effort,
+                                    client_ip,
+                                    "free (no auth)",
+                                    tool_names,
+                                    {
+                                        "type": "error",
+                                        "error": {
+                                            "type": "rate_limit_error",
+                                            "message": f"Free quota exhausted on all VPN stations. Retry after {_retry_after}s.",
+                                        },
+                                    },
+                                    request_body=request_body,
+                                )
                                 return
                             continue
-                        hdrs, should_retry = await _handle_429(hdrs, resp.status_code, _attempt, resp.headers)
+                        hdrs, should_retry = await _handle_429(
+                            hdrs, resp.status_code, _attempt, resp.headers
+                        )
                         if should_retry:
                             if _stream_has_yielded(started, open_blocks, stream_out_tokens, ""):
                                 _cb_record_failure(endpoint)
-                                _log(f"  stream_retry_suppressed_after_started attempt={_attempt+1}")
-                                async for ev in _terminate_after_started(open_blocks, stream_out_tokens):
+                                _log(
+                                    f"  stream_retry_suppressed_after_started attempt={_attempt + 1}"
+                                )
+                                async for ev in _terminate_after_started(
+                                    open_blocks, stream_out_tokens
+                                ):
                                     yield ev
                                 return
                             continue
                         if resp.status_code == 499:
-                            wait = 1.0 * (2 ** _attempt)
-                            _debug(f"  [stream-oai] upstream 499, retrying in {wait:.1f}s (attempt {_attempt+1})")
+                            wait = 1.0 * (2**_attempt)
+                            _debug(
+                                f"  [stream-oai] upstream 499, retrying in {wait:.1f}s (attempt {_attempt + 1})"
+                            )
                             await asyncio.sleep(wait)
                             if _stream_has_yielded(started, open_blocks, stream_out_tokens, ""):
                                 _cb_record_failure(endpoint)
-                                _log(f"  stream_retry_suppressed_after_started attempt={_attempt+1}")
-                                async for ev in _terminate_after_started(open_blocks, stream_out_tokens):
+                                _log(
+                                    f"  stream_retry_suppressed_after_started attempt={_attempt + 1}"
+                                )
+                                async for ev in _terminate_after_started(
+                                    open_blocks, stream_out_tokens
+                                ):
                                     yield ev
                                 return
                             continue
                         err = await resp.aread()
                         # Pause key on credit/balance errors (400)
-                        if resp.status_code == 400 and any(x in err.decode(errors='ignore') for x in ("Insufficient balance", "Monthly usage limit")):
+                        if resp.status_code == 400 and any(
+                            x in err.decode(errors="ignore")
+                            for x in ("Insufficient balance", "Monthly usage limit")
+                        ):
                             failed_key = _key_from_headers(hdrs, "openai")
-                            _key_pauser.pause_key(failed_key, _key_pauser._max_pause, f"400 credit error")
+                            _key_pauser.pause_key(
+                                failed_key, _key_pauser._max_pause, f"400 credit error"
+                            )
                             alt = _find_alternative_key(failed_key)
                             if alt:
                                 _log(f"  400 credit error on key, retrying with alternative key")
                                 hdrs = _get_auth_headers("openai", entry=alt)
                                 if _stream_has_yielded(started, open_blocks, stream_out_tokens, ""):
                                     _cb_record_failure(endpoint)
-                                    _log(f"  stream_retry_suppressed_after_started attempt={_attempt+1}")
-                                    async for ev in _terminate_after_started(open_blocks, stream_out_tokens):
+                                    _log(
+                                        f"  stream_retry_suppressed_after_started attempt={_attempt + 1}"
+                                    )
+                                    async for ev in _terminate_after_started(
+                                        open_blocks, stream_out_tokens
+                                    ):
                                         yield ev
                                     return
                                 continue
@@ -6563,13 +8273,34 @@ async def messages(request: Request):
 
                         if data == "[DONE]":
                             async for ev in _finalize_and_close_stream(
-                                started, open_blocks, text_block_idx, reasoning_block_idx,
-                                tool_block_idx, stream_out_tokens, actual_usage,
-                                model_id, stream_in_est, msg_id, original_model,
-                                _token_usage, _token_lock, _using_free, _paid_model_id,
-                                free_model, start_time, req_id, _req_model_id, protocol,
-                                thinking_type, effort, client_ip, hdrs, tool_names, used_tools,
-                                request_body):
+                                started,
+                                open_blocks,
+                                text_block_idx,
+                                reasoning_block_idx,
+                                tool_block_idx,
+                                stream_out_tokens,
+                                actual_usage,
+                                model_id,
+                                stream_in_est,
+                                msg_id,
+                                original_model,
+                                _token_usage,
+                                _token_lock,
+                                _using_free,
+                                _paid_model_id,
+                                free_model,
+                                start_time,
+                                req_id,
+                                _req_model_id,
+                                protocol,
+                                thinking_type,
+                                effort,
+                                client_ip,
+                                hdrs,
+                                tool_names,
+                                used_tools,
+                                request_body,
+                            ):
                                 yield ev
                             emitted_finish = True
                             break
@@ -6587,8 +8318,10 @@ async def messages(request: Request):
 
                         choices = chunk.get("choices", [])
                         if not choices or not isinstance(choices, list):
-                            #可能是 Responses API format — try converting
-                            _debug(f"  [stream-oai] no choices, trying responses_sse convert: {data[:200]!r}")
+                            # 可能是 Responses API format — try converting
+                            _debug(
+                                f"  [stream-oai] no choices, trying responses_sse convert: {data[:200]!r}"
+                            )
                             converted = _responses_sse_to_chat_deltas(data)
                             if converted is None:
                                 continue
@@ -6600,25 +8333,45 @@ async def messages(request: Request):
                                 # response.completed (with usage) or
                                 # response.incomplete (model didn't produce output).
                                 # Both signal end-of-stream.
-                                if (isinstance(chunk, dict) and "usage" in chunk):
+                                if isinstance(chunk, dict) and "usage" in chunk:
                                     got_response_completed = True
                                     _responses_stream_done = True
                                     actual_usage = chunk.get("usage") or actual_usage
-                                    _debug(f"  [stream-oai] response stream-end signal received — breaking inner loop")
+                                    _debug(
+                                        f"  [stream-oai] response stream-end signal received — breaking inner loop"
+                                    )
                                     break
                                 continue
 
                         first_choice = choices[0] if choices else {}
-                        delta = first_choice.get("delta", {}) if isinstance(first_choice, dict) else {}
+                        delta = (
+                            first_choice.get("delta", {}) if isinstance(first_choice, dict) else {}
+                        )
                         if not delta or not isinstance(delta, dict):
                             delta = {}
 
                         if not started:
                             started = True
-                            yield _sse("message_start", {"type": "message_start", "message": {
-                                "id": msg_id, "type": "message", "role": "assistant", "content": [],
-                                "model": original_model, "stop_reason": None, "stop_sequence": None,
-                                "usage": {"input_tokens": stream_in_est, "output_tokens": 0, "cache_read_input_tokens": 0}}})
+                            yield _sse(
+                                "message_start",
+                                {
+                                    "type": "message_start",
+                                    "message": {
+                                        "id": msg_id,
+                                        "type": "message",
+                                        "role": "assistant",
+                                        "content": [],
+                                        "model": original_model,
+                                        "stop_reason": None,
+                                        "stop_sequence": None,
+                                        "usage": {
+                                            "input_tokens": stream_in_est,
+                                            "output_tokens": 0,
+                                            "cache_read_input_tokens": 0,
+                                        },
+                                    },
+                                },
+                            )
 
                         # Text
                         text = ""
@@ -6626,18 +8379,34 @@ async def messages(request: Request):
                         if isinstance(c, str):
                             text = c
                         elif isinstance(c, list):
-                            text = "".join(p.get("text", "") for p in c if isinstance(p, dict) and p.get("type") == "text")
+                            text = "".join(
+                                p.get("text", "")
+                                for p in c
+                                if isinstance(p, dict) and p.get("type") == "text"
+                            )
 
                         if text:
                             if text_block_idx is None:
                                 text_block_idx = next_block_idx
                                 next_block_idx += 1
-                                yield _sse("content_block_start", {"type": "content_block_start", "index": text_block_idx,
-                                           "content_block": {"type": "text", "text": ""}})
+                                yield _sse(
+                                    "content_block_start",
+                                    {
+                                        "type": "content_block_start",
+                                        "index": text_block_idx,
+                                        "content_block": {"type": "text", "text": ""},
+                                    },
+                                )
                                 open_blocks.append(text_block_idx)
                             stream_out_tokens += _estimate_tokens(text)
-                            yield _sse("content_block_delta", {"type": "content_block_delta", "index": text_block_idx,
-                                       "delta": {"type": "text_delta", "text": text}})
+                            yield _sse(
+                                "content_block_delta",
+                                {
+                                    "type": "content_block_delta",
+                                    "index": text_block_idx,
+                                    "delta": {"type": "text_delta", "text": text},
+                                },
+                            )
 
                         # Reasoning content
                         reasoning = delta.get("reasoning_content") or delta.get("reasoning")
@@ -6645,16 +8414,30 @@ async def messages(request: Request):
                             if reasoning_block_idx is None:
                                 reasoning_block_idx = next_block_idx
                                 next_block_idx += 1
-                                _debug(f"  [stream-oai] reasoning_content block_start idx={reasoning_block_idx}")
-                                yield _sse("content_block_start", {"type": "content_block_start", "index": reasoning_block_idx,
-                                           "content_block": {"type": "thinking", "thinking": ""}})
+                                _debug(
+                                    f"  [stream-oai] reasoning_content block_start idx={reasoning_block_idx}"
+                                )
+                                yield _sse(
+                                    "content_block_start",
+                                    {
+                                        "type": "content_block_start",
+                                        "index": reasoning_block_idx,
+                                        "content_block": {"type": "thinking", "thinking": ""},
+                                    },
+                                )
                                 open_blocks.append(reasoning_block_idx)
                             stream_out_tokens += _estimate_tokens(reasoning)
-                            yield _sse("content_block_delta", {"type": "content_block_delta", "index": reasoning_block_idx,
-                                       "delta": {"type": "thinking_delta", "thinking": reasoning}})
+                            yield _sse(
+                                "content_block_delta",
+                                {
+                                    "type": "content_block_delta",
+                                    "index": reasoning_block_idx,
+                                    "delta": {"type": "thinking_delta", "thinking": reasoning},
+                                },
+                            )
 
                         # Tool calls
-                        for tc in (delta.get("tool_calls") or []):
+                        for tc in delta.get("tool_calls") or []:
                             api_idx = tc.get("index", 0)
                             if api_idx not in tool_block_idx:
                                 block_idx = next_block_idx
@@ -6664,15 +8447,33 @@ async def messages(request: Request):
                                 tc_name = tc.get("function", {}).get("name", "")
                                 if tc_name:
                                     used_tools.append(tc_name)
-                                _debug(f"  [stream-oai] tool_call block_start idx={block_idx} name={tc_name!r} id={tc_id}")
-                                yield _sse("content_block_start", {"type": "content_block_start", "index": block_idx,
-                                           "content_block": {"type": "tool_use", "id": tc_id,
-                                           "name": tc_name, "input": {}}})
+                                _debug(
+                                    f"  [stream-oai] tool_call block_start idx={block_idx} name={tc_name!r} id={tc_id}"
+                                )
+                                yield _sse(
+                                    "content_block_start",
+                                    {
+                                        "type": "content_block_start",
+                                        "index": block_idx,
+                                        "content_block": {
+                                            "type": "tool_use",
+                                            "id": tc_id,
+                                            "name": tc_name,
+                                            "input": {},
+                                        },
+                                    },
+                                )
                                 open_blocks.append(block_idx)
                             if args := tc.get("function", {}).get("arguments", ""):
                                 stream_out_tokens += _estimate_tokens(args)
-                                yield _sse("content_block_delta", {"type": "content_block_delta", "index": tool_block_idx[api_idx],
-                                           "delta": {"type": "input_json_delta", "partial_json": args}})
+                                yield _sse(
+                                    "content_block_delta",
+                                    {
+                                        "type": "content_block_delta",
+                                        "index": tool_block_idx[api_idx],
+                                        "delta": {"type": "input_json_delta", "partial_json": args},
+                                    },
+                                )
 
                     # Responses API: if response.completed/incomplete was
                     # received, the upstream may not close the connection.
@@ -6683,13 +8484,14 @@ async def messages(request: Request):
                 # [plan 18/08 §am.22/piège 19] — same watchdog-cancel
                 # handling as the anthropic stream handler (see there).
                 st = _free_attempt_station()
-                if (st is not None and _attempt == 0
-                        and _is_watchdog_cancelled(st)):
-                    _debug(f"  ⟳ stream watchdog-cancelled (dead tunnel, station {getattr(st, '_station', '?')}) — failover retry")
+                if st is not None and _attempt == 0 and _is_watchdog_cancelled(st):
+                    _debug(
+                        f"  ⟳ stream watchdog-cancelled (dead tunnel, station {getattr(st, '_station', '?')}) — failover retry"
+                    )
                     _log(f"  FREE STREAM on confirmed-dead tunnel cancelled → switching station")
                     if _stream_has_yielded(started, open_blocks, stream_out_tokens, ""):
                         _cb_record_failure(endpoint)
-                        _log(f"  stream_retry_suppressed_after_started attempt={_attempt+1}")
+                        _log(f"  stream_retry_suppressed_after_started attempt={_attempt + 1}")
                         async for ev in _terminate_after_started(open_blocks, stream_out_tokens):
                             yield ev
                         return
@@ -6701,16 +8503,18 @@ async def messages(request: Request):
                 # direct residential fallback. _using_free stays True →
                 # next attempt re-enters free with fresh_station=True
                 # (bad-mark → exclusion of the dead station).
-                _log(f"  FREE STREAM via station {getattr(ftf.station, '_station', '?')} tunnel FAILED ({ftf.cause}) → retry station fraîche")
+                _log(
+                    f"  FREE STREAM via station {getattr(ftf.station, '_station', '?')} tunnel FAILED ({ftf.cause}) → retry station fraîche"
+                )
                 if _stream_has_yielded(started, open_blocks, stream_out_tokens, ""):
                     _cb_record_failure(endpoint)
-                    _log(f"  stream_retry_suppressed_after_started attempt={_attempt+1}")
+                    _log(f"  stream_retry_suppressed_after_started attempt={_attempt + 1}")
                     async for ev in _terminate_after_started(open_blocks, stream_out_tokens):
                         yield ev
                     return
                 continue
             except Exception as e:
-                _log(f"  ERROR stream (attempt {_attempt+1}): {type(e).__name__}: {e}")
+                _log(f"  ERROR stream (attempt {_attempt + 1}): {type(e).__name__}: {e}")
                 _debug(f"  ✗ stream exception: {type(e).__name__}: {e}\n{traceback.format_exc()}")
                 if _attempt == 0:
                     # Try alternative key on retry (handles rate-limit disguised as disconnect)
@@ -6728,7 +8532,7 @@ async def messages(request: Request):
                         hdrs = _get_auth_headers("openai", entry=alt)
                     if _stream_has_yielded(started, open_blocks, stream_out_tokens, ""):
                         _cb_record_failure(endpoint)
-                        _log(f"  stream_retry_suppressed_after_started attempt={_attempt+1}")
+                        _log(f"  stream_retry_suppressed_after_started attempt={_attempt + 1}")
                         async for ev in _terminate_after_started(open_blocks, stream_out_tokens):
                             yield ev
                         return
@@ -6739,16 +8543,39 @@ async def messages(request: Request):
                 except Exception:
                     pass
                 ak_h = _alias_for_key(_key_from_headers(hdrs, "openai"))
-                await _save_request(req_id, _req_model_id, original_model, _elapsed_ms(start_time),
-                             stream_in_est, stream_out_tokens, 0, success=False, error=str(e),
-                             protocol=protocol, is_stream=True, thinking=thinking_type, effort=effort,
-                             client_ip=client_ip, account_alias=ak_h, tools=tool_names,
-                             tools_used=used_tools if used_tools else None,
-                             request_body=request_body)
+                await _save_request(
+                    req_id,
+                    _req_model_id,
+                    original_model,
+                    _elapsed_ms(start_time),
+                    stream_in_est,
+                    stream_out_tokens,
+                    0,
+                    success=False,
+                    error=str(e),
+                    protocol=protocol,
+                    is_stream=True,
+                    thinking=thinking_type,
+                    effort=effort,
+                    client_ip=client_ip,
+                    account_alias=ak_h,
+                    tools=tool_names,
+                    tools_used=used_tools if used_tools else None,
+                    request_body=request_body,
+                )
                 if started:
                     for idx in open_blocks:
-                        yield _sse("content_block_stop", {"type": "content_block_stop", "index": idx})
-                    yield _sse("message_delta", {"type": "message_delta", "delta": {"stop_reason": "error"}, "usage": {"output_tokens": stream_out_tokens}})
+                        yield _sse(
+                            "content_block_stop", {"type": "content_block_stop", "index": idx}
+                        )
+                    yield _sse(
+                        "message_delta",
+                        {
+                            "type": "message_delta",
+                            "delta": {"stop_reason": "error"},
+                            "usage": {"output_tokens": stream_out_tokens},
+                        },
+                    )
                     yield _sse("message_stop", {"type": "message_stop"})
                 return
             else:
@@ -6764,13 +8591,34 @@ async def messages(request: Request):
         if got_response_completed and not emitted_finish:
             _debug(f"  [stream-oai] post-loop: finalizing Responses API stream")
             async for ev in _finalize_and_close_stream(
-                started, open_blocks, text_block_idx, reasoning_block_idx,
-                tool_block_idx, stream_out_tokens, actual_usage,
-                model_id, stream_in_est, msg_id, original_model,
-                _token_usage, _token_lock, _using_free, _paid_model_id,
-                free_model, start_time, req_id, _req_model_id, protocol,
-                thinking_type, effort, client_ip, hdrs, tool_names, used_tools,
-                request_body):
+                started,
+                open_blocks,
+                text_block_idx,
+                reasoning_block_idx,
+                tool_block_idx,
+                stream_out_tokens,
+                actual_usage,
+                model_id,
+                stream_in_est,
+                msg_id,
+                original_model,
+                _token_usage,
+                _token_lock,
+                _using_free,
+                _paid_model_id,
+                free_model,
+                start_time,
+                req_id,
+                _req_model_id,
+                protocol,
+                thinking_type,
+                effort,
+                client_ip,
+                hdrs,
+                tool_names,
+                used_tools,
+                request_body,
+            ):
                 yield ev
             emitted_finish = True
         # Fix: guarantee finish_reason on truncated stream (EOF without [DONE] / response.completed)
@@ -6788,12 +8636,16 @@ async def messages(request: Request):
             emitted_finish = True
         return
 
-    return StreamingResponse(_sse_keepalive(stream_gen(headers)), media_type="text/event-stream",
-                             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
+    return StreamingResponse(
+        _sse_keepalive(stream_gen(headers)),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+    )
 
 
 _health_cache: tuple[float, bool] | None = None  # (timestamp, upstream_ok)
 _health_lock = asyncio.Lock()
+
 
 @app.get("/health")
 async def health():
@@ -6801,8 +8653,10 @@ async def health():
     await asyncio.to_thread(_conn.execute, "SELECT 1")
     _debug("  [health] DB connectivity OK")
 
-    usage = {model: {"input": d["input"], "output": d["output"], "cache": d["cache"]}
-             for model, d in _token_usage.items()}
+    usage = {
+        model: {"input": d["input"], "output": d["output"], "cache": d["cache"]}
+        for model, d in _token_usage.items()
+    }
 
     # Check circuit breaker status
     cb_status = {}
@@ -6818,13 +8672,18 @@ async def health():
     upstream_ok = True
     now = time.monotonic()
     async with _health_lock:
-        if _health_cache and (now - _health_cache[0]) < yaml_get("background", "health_cache_ttl", 15):
+        if _health_cache and (now - _health_cache[0]) < yaml_get(
+            "background", "health_cache_ttl", 15
+        ):
             upstream_ok = _health_cache[1]
             _debug(f"  [health] upstream check (cached): {'ok' if upstream_ok else 'unreachable'}")
         else:
             # Cache miss — perform actual check
             try:
-                resp = await _ensure_http_client().get("https://opencode.ai", timeout=float(yaml_get("background", "health_timeout", 5)))
+                resp = await _ensure_http_client().get(
+                    "https://opencode.ai",
+                    timeout=float(yaml_get("background", "health_timeout", 5)),
+                )
                 upstream_ok = resp.status_code < 500
             except Exception:
                 upstream_ok = False
@@ -6843,8 +8702,13 @@ async def health():
     _debug(f"  [health] key pauses: {len(key_pause_status)} active, status={status}")
 
     _debug(f"  [health] overall status={status}")
-    return {"status": status, "usage": usage, "upstream": "ok" if upstream_ok else "unreachable",
-            "circuit_breakers": cb_status, "key_pauses": key_pause_status}
+    return {
+        "status": status,
+        "usage": usage,
+        "upstream": "ok" if upstream_ok else "unreachable",
+        "circuit_breakers": cb_status,
+        "key_pauses": key_pause_status,
+    }
 
 
 @app.get("/api/circuit-breakers")
@@ -6931,18 +8795,24 @@ async def free_discovery_refresh(request: Request):
     if _dash:
         provided = request.headers.get("X-Dashboard-Token", "")
         if not provided or not hmac.compare_digest(provided, _dash):
-            return JSONResponse(status_code=401, content={
-                "error": "unauthorized",
-                "message": "Valid X-Dashboard-Token header required (DASHBOARD_TOKEN env).",
-            })
+            return JSONResponse(
+                status_code=401,
+                content={
+                    "error": "unauthorized",
+                    "message": "Valid X-Dashboard-Token header required (DASHBOARD_TOKEN env).",
+                },
+            )
     # control_api guard (ip_rotation.control_enabled requires a key)
     _ctrl_enabled = bool(yaml_get("ip_rotation", "control_enabled", False))
     _ctrl_key = str(yaml_get("ip_rotation", "control_api_key", "") or "").strip()
     if _ctrl_enabled and not _ctrl_key:
-        return JSONResponse(status_code=403, content={
-            "error": "forbidden",
-            "message": "control_enabled requires control_api_key — set ip_rotation.control_api_key",
-        })
+        return JSONResponse(
+            status_code=403,
+            content={
+                "error": "forbidden",
+                "message": "control_enabled requires control_api_key — set ip_rotation.control_api_key",
+            },
+        )
     # Rate-limit 1/min per IP
     ip = request.client.host if request.client else "unknown"
     _rl = getattr(app.state, "_free_refresh_last_minute", None)
@@ -6953,9 +8823,11 @@ async def free_discovery_refresh(request: Request):
     last = _rl.get(ip, 0)
     if last and (now_m - last) < 60:
         retry = int(60 - (now_m - last)) + 1
-        return JSONResponse(status_code=429,
-                            content={"error": "rate_limited", "retry_after": retry},
-                            headers={"Retry-After": str(retry)})
+        return JSONResponse(
+            status_code=429,
+            content={"error": "rate_limited", "retry_after": retry},
+            headers={"Retry-After": str(retry)},
+        )
     # Singleflight
     lock = getattr(app.state, "_free_discovery_lock", None)
     if lock is None:
@@ -6967,22 +8839,31 @@ async def free_discovery_refresh(request: Request):
         last2 = _rl.get(ip, 0)
         if last2 and (now2 - last2) < 60:
             retry = int(60 - (now2 - last2)) + 1
-            return JSONResponse(status_code=429,
-                                content={"error": "rate_limited", "retry_after": retry},
-                                headers={"Retry-After": str(retry)})
+            return JSONResponse(
+                status_code=429,
+                content={"error": "rate_limited", "retry_after": retry},
+                headers={"Retry-After": str(retry)},
+            )
         added = await asyncio.to_thread(_cfg_settings._ensure_free_models_sync)
         _rl[ip] = time.monotonic()
         try:
             from dashboard.events import get_event_manager
-            get_event_manager().publish("free_models_updated", {
-                "detected": sorted(_cfg_settings.FREE_MODELS),
-                "source": _cfg_settings._FREE_DISCOVERY_STATE.get("source", "none"),
-            })
+
+            get_event_manager().publish(
+                "free_models_updated",
+                {
+                    "detected": sorted(_cfg_settings.FREE_MODELS),
+                    "source": _cfg_settings._FREE_DISCOVERY_STATE.get("source", "none"),
+                },
+            )
         except Exception:
             pass
-    return {"refreshed": True, "added": int(added or 0),
-            "detected": sorted(_cfg_settings.FREE_MODELS),
-            "source": _cfg_settings._FREE_DISCOVERY_STATE.get("source", "none")}
+    return {
+        "refreshed": True,
+        "added": int(added or 0),
+        "detected": sorted(_cfg_settings.FREE_MODELS),
+        "source": _cfg_settings._FREE_DISCOVERY_STATE.get("source", "none"),
+    }
 
 
 @app.get("/v1/models")
@@ -6997,11 +8878,20 @@ async def list_models():
             cb = _circuit_breakers.get(endpoint)
             cb_state = cb.state if cb else "unknown"
             usage = _token_usage.get(model_id, {})
-            data.append({
-                "id": model_id, "object": "model", "created": now, "owned_by": "opencode",
-                "status": cb_state,
-                "requests": {"input": usage.get("input", 0), "output": usage.get("output", 0), "cache": usage.get("cache", 0)},
-            })
+            data.append(
+                {
+                    "id": model_id,
+                    "object": "model",
+                    "created": now,
+                    "owned_by": "opencode",
+                    "status": cb_state,
+                    "requests": {
+                        "input": usage.get("input", 0),
+                        "output": usage.get("output", 0),
+                        "cache": usage.get("cache", 0),
+                    },
+                }
+            )
             seen.add(model_id)
     for alias in ["gpt-5-codex", "gpt-5", "gpt-4o", "codex", "deepseek-chat"]:
         if alias not in seen:
@@ -7028,10 +8918,14 @@ async def chat_completions(request: Request):
     _current_user_agent.set(request.headers.get("user-agent"))
 
     body_bytes = await request.body()
-    _debug(f"  [body] read {len(body_bytes)} bytes in {(time.monotonic() - start_time) * 1000:.0f}ms")
+    _debug(
+        f"  [body] read {len(body_bytes)} bytes in {(time.monotonic() - start_time) * 1000:.0f}ms"
+    )
     if len(body_bytes) > MAX_BODY_SIZE:
         _debug(f"  413: body too large ({len(body_bytes)} bytes)")
-        return _openai_error(413, f"Request body too large ({len(body_bytes)} bytes, max {MAX_BODY_SIZE})")
+        return _openai_error(
+            413, f"Request body too large ({len(body_bytes)} bytes, max {MAX_BODY_SIZE})"
+        )
 
     try:
         body = _json_loads(body_bytes)
@@ -7050,10 +8944,13 @@ async def chat_completions(request: Request):
     if route is None:
         _debug(f"[chat] ✗ no route found for {original_model!r}")
         available = sorted(MODELS.keys())
-        return JSONResponse(status_code=404, content={
-            "error": f"Model not found: {original_model!r}",
-            "available_models": available,
-        })
+        return JSONResponse(
+            status_code=404,
+            content={
+                "error": f"Model not found: {original_model!r}",
+                "available_models": available,
+            },
+        )
     model_id = route["model"]
     cfg = get_model_config(model_id)
     endpoint = cfg["endpoint"]
@@ -7065,11 +8962,21 @@ async def chat_completions(request: Request):
     is_stream = body.get("stream", False)
 
     thinking_raw = body.get("thinking") if isinstance(body.get("thinking"), dict) else {}
-    thinking_type = thinking_raw.get("type", "none") if isinstance(thinking_raw, dict) and thinking_raw else "none"
-    effort = (body.get("effort")
-              or (thinking_raw.get("effort") if isinstance(thinking_raw, dict) else None)
-              or (body.get("output_config", {}).get("effort") if isinstance(body.get("output_config"), dict) else None)
-              or "none")
+    thinking_type = (
+        thinking_raw.get("type", "none")
+        if isinstance(thinking_raw, dict) and thinking_raw
+        else "none"
+    )
+    effort = (
+        body.get("effort")
+        or (thinking_raw.get("effort") if isinstance(thinking_raw, dict) else None)
+        or (
+            body.get("output_config", {}).get("effort")
+            if isinstance(body.get("output_config"), dict)
+            else None
+        )
+        or "none"
+    )
 
     # Tool filtering removed — all tools are forwarded as-is
 
@@ -7081,7 +8988,9 @@ async def chat_completions(request: Request):
         _effort_level = body.get("effort")
         _thinking_param = body.get("thinking") if isinstance(body.get("thinking"), dict) else {}
         _ttype = _thinking_param.get("type", "") if isinstance(_thinking_param, dict) else ""
-        _budget = _thinking_param.get("budget_tokens", 0) if isinstance(_thinking_param, dict) else 0
+        _budget = (
+            _thinking_param.get("budget_tokens", 0) if isinstance(_thinking_param, dict) else 0
+        )
         _wants = False
         _mapped_effort = _effort_level
         if _effort_level and _effort_level != "none":
@@ -7102,11 +9011,19 @@ async def chat_completions(request: Request):
                 _mapped_effort = "low" if _ttype == "enabled" else "medium"
         if _wants and _mapped_effort and _mapped_effort != "none":
             if model_id.startswith("glm-5"):
-                body["reasoning_effort"] = "high" if _mapped_effort in ("xhigh","max","high") else ("medium" if _mapped_effort=="medium" else "low")
+                body["reasoning_effort"] = (
+                    "high"
+                    if _mapped_effort in ("xhigh", "max", "high")
+                    else ("medium" if _mapped_effort == "medium" else "low")
+                )
             elif model_id.startswith("deepseek-v4"):
-                body["reasoning_effort"] = "max" if _mapped_effort in ("xhigh","max") else "high"
+                body["reasoning_effort"] = "max" if _mapped_effort in ("xhigh", "max") else "high"
             else:
-                body["reasoning_effort"] = "high" if _mapped_effort in ("xhigh","max","high") else ("medium" if _mapped_effort=="medium" else "low")
+                body["reasoning_effort"] = (
+                    "high"
+                    if _mapped_effort in ("xhigh", "max", "high")
+                    else ("medium" if _mapped_effort == "medium" else "low")
+                )
             # Keep original effort for logging, but ensure reasoning_effort is set
             if effort == "none":
                 effort = _mapped_effort
@@ -7114,9 +9031,13 @@ async def chat_completions(request: Request):
     # Handle web_search tool (DuckDuckGo or model routing)
     await _handle_web_search(body, model_id, protocol)
 
-    _log(f"→ {original_model!r} → {model_id} | {protocol} | chat/completions | stream={is_stream} | thinking={thinking_type} | effort={effort} | ip={client_ip}")
+    _log(
+        f"→ {original_model!r} → {model_id} | {protocol} | chat/completions | stream={is_stream} | thinking={thinking_type} | effort={effort} | ip={client_ip}"
+    )
 
-    _geo_gate = await _enforce_geo_gate(route, request, is_stream=bool(is_stream), protocol="openai")
+    _geo_gate = await _enforce_geo_gate(
+        route, request, is_stream=bool(is_stream), protocol="openai"
+    )
     if _geo_gate is not None:
         return _geo_gate
 
@@ -7134,36 +9055,79 @@ async def chat_completions(request: Request):
             if FREE_MODEL_MAP.get(model_id):
                 if is_stream:
                     # Streaming: pass empty headers — generator handles free model swap
-                    return StreamingResponse(_sse_keepalive(openai_stream({})), media_type="text/event-stream",
-                                             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
+                    return StreamingResponse(
+                        _sse_keepalive(openai_stream({})),
+                        media_type="text/event-stream",
+                        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+                    )
                 else:
                     # Non-streaming: try free model
                     try:
-                        free_result = await _try_free_model_first(body, {}, "openai", model_id, forced_pool=getattr(request.state, "_geo_forced_pool", None))
+                        free_result = await _try_free_model_first(
+                            body,
+                            {},
+                            "openai",
+                            model_id,
+                            forced_pool=getattr(request.state, "_geo_forced_pool", None),
+                        )
                         if free_result is not None:
                             resp, _, _actual_model, _actual_ip = free_result
-                            data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+                            data = (
+                                resp.json()
+                                if resp.headers.get("content-type", "").startswith(
+                                    "application/json"
+                                )
+                                else {}
+                            )
                             usage = data.get("usage", {})
                             req_in = usage.get("prompt_tokens", 0)
                             req_out = usage.get("completion_tokens", 0)
                             cache = _extract_cache_tokens(usage)
                             _update_token_usage(_actual_model, req_in, req_out, cache)
                             used = _extract_usage_tool_names(data)
-                            await _save_and_log_request(req_id, _actual_model, original_model, start_time,
-                                         req_in, req_out, cache, protocol, False, thinking_type,
-                                         effort, client_ip, "free (no auth)", tool_names, tools_used=used,
-                                         request_body=request_body, response_body=data, free_model_ip=_actual_ip)
-                            return Response(content=_json_dumps_str(data, ensure_ascii=False), media_type="application/json")
+                            await _save_and_log_request(
+                                req_id,
+                                _actual_model,
+                                original_model,
+                                start_time,
+                                req_in,
+                                req_out,
+                                cache,
+                                protocol,
+                                False,
+                                thinking_type,
+                                effort,
+                                client_ip,
+                                "free (no auth)",
+                                tool_names,
+                                tools_used=used,
+                                request_body=request_body,
+                                response_body=data,
+                                free_model_ip=_actual_ip,
+                            )
+                            return Response(
+                                content=_json_dumps_str(data, ensure_ascii=False),
+                                media_type="application/json",
+                            )
                     except FreeQuotaExhausted as e:
                         return _free_quota_exhausted_response(e, "openai")
                     except Exception as e:
                         _debug(f"  [free] free model attempt failed: {e}")
             retry_after = int(e.retry_after) + 1
             return Response(
-                content=_json_dumps_str({"error": {"message": f"All API keys exhausted. Retry after {retry_after}s.",
-                    "type": "api_error", "code": "503"}}),
-                status_code=503, media_type="application/json",
-                headers={"Retry-After": str(retry_after)})
+                content=_json_dumps_str(
+                    {
+                        "error": {
+                            "message": f"All API keys exhausted. Retry after {retry_after}s.",
+                            "type": "api_error",
+                            "code": "503",
+                        }
+                    }
+                ),
+                status_code=503,
+                media_type="application/json",
+                headers={"Retry-After": str(retry_after)},
+            )
 
         if not is_stream:
             # Response cache (mirrors the anthropic non-stream handler) [8]
@@ -7172,58 +9136,104 @@ async def chat_completions(request: Request):
             if cached:
                 cached_body, cached_headers = cached
                 _debug(f"  [chat] response cache HIT ({len(cached_body)} bytes)")
-                return Response(content=cached_body, headers={**cached_headers, "X-Cache": "HIT"},
-                                media_type="application/json")
+                return Response(
+                    content=cached_body,
+                    headers={**cached_headers, "X-Cache": "HIT"},
+                    media_type="application/json",
+                )
             # Try free model first if available
             _geo_tunnel = getattr(request.state, "_geo_force_tunnel", False)
             try:
-                free_result = await _try_free_model_first(body, headers, "openai", model_id, forced_pool=getattr(request.state, "_geo_forced_pool", None))
+                free_result = await _try_free_model_first(
+                    body,
+                    headers,
+                    "openai",
+                    model_id,
+                    forced_pool=getattr(request.state, "_geo_forced_pool", None),
+                )
                 if free_result is not None:
                     resp, headers, _actual_model, _actual_ip = free_result
                     model_id = _actual_model
                 else:
                     # Convert to Responses API format if endpoint requires it (muse-spark)
-                    paid_body = _chat_to_responses_request(body) if "/responses" in endpoint else body
+                    paid_body = (
+                        _chat_to_responses_request(body) if "/responses" in endpoint else body
+                    )
                     if _geo_tunnel:
                         # Axe A: geo-restricted paid → must route through tunnel station
-                        async with _open_via_pool(endpoint, paid_body, headers,
-                                                 is_stream=False,
-                                                 forced_pool=getattr(request.state, "_geo_forced_pool", None)) as resp:
+                        async with _open_via_pool(
+                            endpoint,
+                            paid_body,
+                            headers,
+                            is_stream=False,
+                            forced_pool=getattr(request.state, "_geo_forced_pool", None),
+                        ) as resp:
                             headers = dict(resp.headers)
                     else:
-                        resp, headers = await _do_request_with_retry(endpoint, paid_body, headers, "openai")
+                        resp, headers = await _do_request_with_retry(
+                            endpoint, paid_body, headers, "openai"
+                        )
             except FreeQuotaExhausted as e:
                 return _free_quota_exhausted_response(e, "openai")
             except UpstreamError as e:
                 return JSONResponse(status_code=e.status_code, content={"error": str(e)})
             account_alias = _alias_for_key(_key_from_headers(headers, "openai"))
             if resp.status_code != 200:
-                await _log_and_save_error(req_id, model_id, original_model, start_time,
-                             resp.status_code, resp.text, protocol, is_stream, thinking_type,
-                             effort, client_ip, account_alias, tool_names,
-                             request_body=request_body, response_body={"error": resp.text[:2000]})
+                await _log_and_save_error(
+                    req_id,
+                    model_id,
+                    original_model,
+                    start_time,
+                    resp.status_code,
+                    resp.text,
+                    protocol,
+                    is_stream,
+                    thinking_type,
+                    effort,
+                    client_ip,
+                    account_alias,
+                    tool_names,
+                    request_body=request_body,
+                    response_body={"error": resp.text[:2000]},
+                )
                 # Pause key on credit/balance errors (400) and retry with alt key
-                if resp.status_code == 400 and any(x in resp.text for x in ("Insufficient balance", "Monthly usage limit")):
+                if resp.status_code == 400 and any(
+                    x in resp.text for x in ("Insufficient balance", "Monthly usage limit")
+                ):
                     failed_key = _key_from_headers(headers, "openai")
-                    _key_pauser.pause_key(failed_key, _key_pauser._max_pause, f"400 credit error: {_redact(resp.text, 80)}")
+                    _key_pauser.pause_key(
+                        failed_key,
+                        _key_pauser._max_pause,
+                        f"400 credit error: {_redact(resp.text, 80)}",
+                    )
                     alt = _find_alternative_key(failed_key)
                     if alt:
                         _log(f"  400 credit error on key, retrying with alternative key")
                         headers = _get_auth_headers("openai", entry=alt)
                         try:
-                            resp, headers = await _do_request_with_retry(endpoint, body, headers, "openai")
+                            resp, headers = await _do_request_with_retry(
+                                endpoint, body, headers, "openai"
+                            )
                             if resp.status_code == 200:
                                 account_alias = _alias_for_key(_key_from_headers(headers, "openai"))
                             else:
-                                return _openai_error(503, "All API keys exhausted. Check your billing.")
+                                return _openai_error(
+                                    503, "All API keys exhausted. Check your billing."
+                                )
                         except UpstreamError as e:
-                            return JSONResponse(status_code=e.status_code, content={"error": str(e)})
+                            return JSONResponse(
+                                status_code=e.status_code, content={"error": str(e)}
+                            )
                 # Convert 429/401/403 → 503 to avoid Claude Code auth window
                 if resp.status_code in (429, 401, 403):
                     return _openai_error(503, _auth_window_message(resp.status_code))
                 if resp.status_code == 499:
                     return _openai_error(502, "Upstream disconnected (499). Retrying may help.")
-                return Response(content=resp.content, status_code=resp.status_code, media_type="application/json")
+                return Response(
+                    content=resp.content,
+                    status_code=resp.status_code,
+                    media_type="application/json",
+                )
             try:
                 data = resp.json()
             except Exception:
@@ -7237,12 +9247,29 @@ async def chat_completions(request: Request):
             _debug(f"  usage: in={req_in} out={req_out} cache={cache}")
             _update_token_usage(model_id, req_in, req_out, cache)
             used = _extract_usage_tool_names(data)
-            await _save_and_log_request(req_id, model_id, original_model, start_time,
-                         req_in, req_out, cache, protocol, is_stream, thinking_type,
-                         effort, client_ip, account_alias, tool_names, tools_used=used if used else None,
-                         request_body=request_body, response_body=data)
+            await _save_and_log_request(
+                req_id,
+                model_id,
+                original_model,
+                start_time,
+                req_in,
+                req_out,
+                cache,
+                protocol,
+                is_stream,
+                thinking_type,
+                effort,
+                client_ip,
+                account_alias,
+                tool_names,
+                tools_used=used if used else None,
+                request_body=request_body,
+                response_body=data,
+            )
             _response_cache.put(cache_key, resp.content, {"Content-Type": "application/json"})
-            return Response(content=resp.content, headers={"X-Cache": "MISS"}, media_type="application/json")
+            return Response(
+                content=resp.content, headers={"X-Cache": "MISS"}, media_type="application/json"
+            )
 
         # ── OpenAI streaming passthrough ──
         oai_body = dict(body)
@@ -7294,12 +9321,19 @@ async def chat_completions(request: Request):
                 used_tools = []
                 seen_tool_indices = set()  # dedup tool calls by index
                 try:
-                    async with _open_free_stream(endpoint, oai_body, hdrs, _using_free,
-                                             count_request=(_attempt == 0),
-                                             fresh_station=(_attempt > 0 and _using_free),
-                                             direct_fallback=(_free_exception_fallback_mode() != "station-first"
-                                                              or _attempt + 1 >= effective_free_max_attempts(_free_forced_pool)),
-                                                  forced_pool=_free_forced_pool) as resp:
+                    async with _open_free_stream(
+                        endpoint,
+                        oai_body,
+                        hdrs,
+                        _using_free,
+                        count_request=(_attempt == 0),
+                        fresh_station=(_attempt > 0 and _using_free),
+                        direct_fallback=(
+                            _free_exception_fallback_mode() != "station-first"
+                            or _attempt + 1 >= effective_free_max_attempts(_free_forced_pool)
+                        ),
+                        forced_pool=_free_forced_pool,
+                    ) as resp:
                         if resp.status_code != 200:
                             if _using_free:
                                 # Free endpoint non-200 (429 quota, 5xx...) → cooldown
@@ -7307,21 +9341,43 @@ async def chat_completions(request: Request):
                                 # keys: a status from the free endpoint says nothing
                                 # about the paid account (CRITIC(2)/CRITIC(3)).
                                 if resp.status_code == 429:
-                                    _refuse = _on_free_429_stream(free_model, resp.headers.get('retry-after', ''),
-                                                                   forced_pool=_free_forced_pool)
-                                    if not _refuse and _attempt + 1 < effective_free_max_attempts(_free_forced_pool):
+                                    _refuse = _on_free_429_stream(
+                                        free_model,
+                                        resp.headers.get("retry-after", ""),
+                                        forced_pool=_free_forced_pool,
+                                    )
+                                    if not _refuse and _attempt + 1 < effective_free_max_attempts(
+                                        _free_forced_pool
+                                    ):
                                         # [plan 19/08 §1] budget left → retry free on a
                                         # FRESH station (fresh IP = fresh quota); keep
                                         # _using_free so the next attempt re-enters free
                                         # with fresh_station=True. Cooldown + rotation
                                         # for the exhausted IP already done above.
-                                        _log_free_model_usage(model_id, free_model, "free (no auth)", "free (no auth)",
-                                                              resp.status_code, ip=_free_usage_ip())
-                                        _log(f"  FREE {free_model!r} RATE LIMITED (429) → retry station fraîche (essai {_attempt + 2}/{effective_free_max_attempts(_free_forced_pool)})")
+                                        _log_free_model_usage(
+                                            model_id,
+                                            free_model,
+                                            "free (no auth)",
+                                            "free (no auth)",
+                                            resp.status_code,
+                                            ip=_free_usage_ip(),
+                                        )
+                                        _log(
+                                            f"  FREE {free_model!r} RATE LIMITED (429) → retry station fraîche (essai {_attempt + 2}/{effective_free_max_attempts(_free_forced_pool)})"
+                                        )
                                         if _oai_has_yielded or stream_out > 0:
                                             _cb_record_failure(endpoint)
-                                            _log(f"  stream_retry_suppressed_after_started attempt={_attempt+1}")
-                                            yield b"data: " + _json_dumps_str({"error": {"message": "stream interrupted"}}, ensure_ascii=False).encode() + b"\n\ndata: [DONE]\n\n"
+                                            _log(
+                                                f"  stream_retry_suppressed_after_started attempt={_attempt + 1}"
+                                            )
+                                            yield (
+                                                b"data: "
+                                                + _json_dumps_str(
+                                                    {"error": {"message": "stream interrupted"}},
+                                                    ensure_ascii=False,
+                                                ).encode()
+                                                + b"\n\ndata: [DONE]\n\n"
+                                            )
                                             return
                                         continue
                                 else:
@@ -7331,56 +9387,118 @@ async def chat_completions(request: Request):
                                 endpoint = paid_endpoint
                                 _using_free = False
                                 _track_model = model_id  # Revert tracking to paid model
-                                _debug(f"  [chat-stream] free model {resp.status_code} → falling back to paid {_track_model!r}")
-                                _log(f"  FREE model {resp.status_code} → falling back to paid {_track_model!r}")
-                                _log_free_model_usage(model_id, free_model, "free (no auth)", "free (no auth)",
-                                                      resp.status_code, ip=_free_usage_ip())
+                                _debug(
+                                    f"  [chat-stream] free model {resp.status_code} → falling back to paid {_track_model!r}"
+                                )
+                                _log(
+                                    f"  FREE model {resp.status_code} → falling back to paid {_track_model!r}"
+                                )
+                                _log_free_model_usage(
+                                    model_id,
+                                    free_model,
+                                    "free (no auth)",
+                                    "free (no auth)",
+                                    resp.status_code,
+                                    ip=_free_usage_ip(),
+                                )
                                 if _refuse:
                                     # strict_free (GUI): every station exhausted
                                     # (bad/down + (model, IP) cooldown active) —
                                     # refuse instead of paying.
-                                    _retry_after = resp.headers.get('retry-after', '') or "60"
+                                    _retry_after = resp.headers.get("retry-after", "") or "60"
                                     yield await _stream_error_response(
-                                        req_id, free_model, original_model, start_time,
-                                        429, await resp.aread(), protocol, thinking_type,
-                                        effort, client_ip, "free (no auth)", tool_names,
-                                        {"type": "error",
-                                         "error": {"type": "rate_limit_error",
-                                                   "message": f"Free quota exhausted on all VPN stations. Retry after {_retry_after}s."}},
-                                        request_body=request_body)
+                                        req_id,
+                                        free_model,
+                                        original_model,
+                                        start_time,
+                                        429,
+                                        await resp.aread(),
+                                        protocol,
+                                        thinking_type,
+                                        effort,
+                                        client_ip,
+                                        "free (no auth)",
+                                        tool_names,
+                                        {
+                                            "type": "error",
+                                            "error": {
+                                                "type": "rate_limit_error",
+                                                "message": f"Free quota exhausted on all VPN stations. Retry after {_retry_after}s.",
+                                            },
+                                        },
+                                        request_body=request_body,
+                                    )
                                     return
                                 continue
-                            hdrs, should_retry = await _handle_429(hdrs, resp.status_code, _attempt, resp.headers)
+                            hdrs, should_retry = await _handle_429(
+                                hdrs, resp.status_code, _attempt, resp.headers
+                            )
                             if should_retry:
                                 if _oai_has_yielded or stream_out > 0:
                                     _cb_record_failure(endpoint)
-                                    _log(f"  stream_retry_suppressed_after_started attempt={_attempt+1}")
-                                    yield b"data: " + _json_dumps_str({"error": {"message": "stream interrupted"}}, ensure_ascii=False).encode() + b"\n\ndata: [DONE]\n\n"
+                                    _log(
+                                        f"  stream_retry_suppressed_after_started attempt={_attempt + 1}"
+                                    )
+                                    yield (
+                                        b"data: "
+                                        + _json_dumps_str(
+                                            {"error": {"message": "stream interrupted"}},
+                                            ensure_ascii=False,
+                                        ).encode()
+                                        + b"\n\ndata: [DONE]\n\n"
+                                    )
                                     return
                                 continue
                             if resp.status_code == 499:
-                                wait = 1.0 * (2 ** _attempt)
-                                _debug(f"  [chat-stream] upstream 499, retrying in {wait:.1f}s (attempt {_attempt+1})")
+                                wait = 1.0 * (2**_attempt)
+                                _debug(
+                                    f"  [chat-stream] upstream 499, retrying in {wait:.1f}s (attempt {_attempt + 1})"
+                                )
                                 await asyncio.sleep(wait)
                                 if _oai_has_yielded or stream_out > 0:
                                     _cb_record_failure(endpoint)
-                                    _log(f"  stream_retry_suppressed_after_started attempt={_attempt+1}")
-                                    yield b"data: " + _json_dumps_str({"error": {"message": "stream interrupted"}}, ensure_ascii=False).encode() + b"\n\ndata: [DONE]\n\n"
+                                    _log(
+                                        f"  stream_retry_suppressed_after_started attempt={_attempt + 1}"
+                                    )
+                                    yield (
+                                        b"data: "
+                                        + _json_dumps_str(
+                                            {"error": {"message": "stream interrupted"}},
+                                            ensure_ascii=False,
+                                        ).encode()
+                                        + b"\n\ndata: [DONE]\n\n"
+                                    )
                                     return
                                 continue
                             err = await resp.aread()
                             # Pause key on credit/balance errors (400)
-                            if resp.status_code == 400 and any(x in err.decode(errors='ignore') for x in ("Insufficient balance", "Monthly usage limit")):
+                            if resp.status_code == 400 and any(
+                                x in err.decode(errors="ignore")
+                                for x in ("Insufficient balance", "Monthly usage limit")
+                            ):
                                 failed_key = _key_from_headers(hdrs, "openai")
-                                _key_pauser.pause_key(failed_key, _key_pauser._max_pause, f"400 credit error")
+                                _key_pauser.pause_key(
+                                    failed_key, _key_pauser._max_pause, f"400 credit error"
+                                )
                                 alt = _find_alternative_key(failed_key)
                                 if alt:
-                                    _log(f"  400 credit error on key, retrying with alternative key")
+                                    _log(
+                                        f"  400 credit error on key, retrying with alternative key"
+                                    )
                                     hdrs = _get_auth_headers("openai", entry=alt)
                                     if _oai_has_yielded or stream_out > 0:
                                         _cb_record_failure(endpoint)
-                                        _log(f"  stream_retry_suppressed_after_started attempt={_attempt+1}")
-                                        yield b"data: " + _json_dumps_str({"error": {"message": "stream interrupted"}}, ensure_ascii=False).encode() + b"\n\ndata: [DONE]\n\n"
+                                        _log(
+                                            f"  stream_retry_suppressed_after_started attempt={_attempt + 1}"
+                                        )
+                                        yield (
+                                            b"data: "
+                                            + _json_dumps_str(
+                                                {"error": {"message": "stream interrupted"}},
+                                                ensure_ascii=False,
+                                            ).encode()
+                                            + b"\n\ndata: [DONE]\n\n"
+                                        )
                                         return
                                     continue
                             ak_h = _alias_for_key(_key_from_headers(hdrs, "openai"))
@@ -7388,14 +9506,22 @@ async def chat_completions(request: Request):
                             if resp.status_code == 401:
                                 _debug(f"  [auth] 401 response body: {_redact(err, 500)}")
                             # Convert 429/401/403 → 503 to avoid Claude Code auth window
-                            err_status = 503 if resp.status_code in (429, 401, 403) else resp.status_code
+                            err_status = (
+                                503 if resp.status_code in (429, 401, 403) else resp.status_code
+                            )
                             if resp.status_code == 429:
                                 err_msg = "All API keys exhausted (rate limited). Try again later."
                             elif resp.status_code in (401, 403):
                                 err_msg = _auth_window_message(resp.status_code)
                             else:
                                 err_msg = f"HTTP {resp.status_code}"
-                            yield b"data: " + _json_dumps_str({"error": {"message": err_msg}}, ensure_ascii=False).encode() + b"\n\ndata: [DONE]\n\n"
+                            yield (
+                                b"data: "
+                                + _json_dumps_str(
+                                    {"error": {"message": err_msg}}, ensure_ascii=False
+                                ).encode()
+                                + b"\n\ndata: [DONE]\n\n"
+                            )
                             return
 
                         async for line in resp.aiter_lines():
@@ -7422,8 +9548,14 @@ async def chat_completions(request: Request):
                                 if converted is not None:
                                     chunk = converted
                                     # usage-only (completed/incomplete) → finaliser
-                                    if not chunk.get("choices") and isinstance(chunk, dict) and "usage" in chunk:
-                                        _debug(f"  [oai-stream] response stream-end signal, breaking to finalize")
+                                    if (
+                                        not chunk.get("choices")
+                                        and isinstance(chunk, dict)
+                                        and "usage" in chunk
+                                    ):
+                                        _debug(
+                                            f"  [oai-stream] response stream-end signal, breaking to finalize"
+                                        )
                                         actual_usage = chunk.get("usage") or actual_usage
                                         break
                                     _oai_has_yielded = True
@@ -7435,7 +9567,7 @@ async def chat_completions(request: Request):
                                         continue
                             choices = chunk.get("choices", [])
                             if not choices or not isinstance(choices, list):
-                                #可能是 Responses API format — try converting (fallback legacy)
+                                # 可能是 Responses API format — try converting (fallback legacy)
                                 converted = _responses_sse_to_chat_deltas(data_str)
                                 if converted is not None:
                                     chunk = converted
@@ -7444,7 +9576,9 @@ async def chat_completions(request: Request):
                                         # response.completed or response.incomplete —
                                         # stream-end signal; don't yield raw Responses
                                         # API event, just break to finalize.
-                                        _debug(f"  [oai-stream] response stream-end signal, breaking to finalize")
+                                        _debug(
+                                            f"  [oai-stream] response stream-end signal, breaking to finalize"
+                                        )
                                         actual_usage = chunk.get("usage") or actual_usage
                                         break
                                     # Yield converted chunk as chat/completions SSE
@@ -7452,7 +9586,11 @@ async def chat_completions(request: Request):
                                     yield f"data: {_json_dumps_str(chunk, ensure_ascii=False)}\n\n".encode()
                                     continue
                             if choices and isinstance(choices, list) and len(choices) > 0:
-                                delta = choices[0].get("delta", {}) if isinstance(choices[0], dict) else {}
+                                delta = (
+                                    choices[0].get("delta", {})
+                                    if isinstance(choices[0], dict)
+                                    else {}
+                                )
                                 if isinstance(delta, dict):
                                     c = delta.get("content")
                                     if isinstance(c, str):
@@ -7460,14 +9598,20 @@ async def chat_completions(request: Request):
                                     rc = delta.get("reasoning_content") or delta.get("reasoning")
                                     if isinstance(rc, str):
                                         stream_out += _estimate_tokens(rc)
-                                    for tc in (delta.get("tool_calls") or []):
-                                        if isinstance(tc, dict) and "name" in tc.get("function", {}):
+                                    for tc in delta.get("tool_calls") or []:
+                                        if isinstance(tc, dict) and "name" in tc.get(
+                                            "function", {}
+                                        ):
                                             tc_idx = tc.get("index", len(seen_tool_indices))
                                             if tc_idx not in seen_tool_indices:
                                                 seen_tool_indices.add(tc_idx)
                                                 used_tools.append(tc["function"]["name"])
                                 # Track finish_reason for truncated-stream detection
-                                _fr = choices[0].get("finish_reason") if isinstance(choices[0], dict) else None
+                                _fr = (
+                                    choices[0].get("finish_reason")
+                                    if isinstance(choices[0], dict)
+                                    else None
+                                )
                                 if _fr is not None:
                                     emitted_finish = True
                             _oai_has_yielded = True
@@ -7476,52 +9620,119 @@ async def chat_completions(request: Request):
                         # Fix: synthesize finish_reason if truncated (EOF without finish_reason)
                         if not emitted_finish:
                             if _oai_has_yielded or stream_out > 0:
-                                _debug(f"  [oai-stream] truncated without finish_reason → synthesizing stop")
-                                _log(f"  stream truncated without finish_reason → synthesizing stop")
-                                _synth = {"id": f"chatcmpl-{uuid.uuid4().hex[:8]}", "object": "chat.completion.chunk", "created": int(time.time()), "model": original_model, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
+                                _debug(
+                                    f"  [oai-stream] truncated without finish_reason → synthesizing stop"
+                                )
+                                _log(
+                                    f"  stream truncated without finish_reason → synthesizing stop"
+                                )
+                                _synth = {
+                                    "id": f"chatcmpl-{uuid.uuid4().hex[:8]}",
+                                    "object": "chat.completion.chunk",
+                                    "created": int(time.time()),
+                                    "model": original_model,
+                                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                                }
                                 yield f"data: {_json_dumps_str(_synth, ensure_ascii=False)}\n\n".encode()
                                 yield b"data: [DONE]\n\n"
                                 emitted_finish = True
                             elif actual_usage is not None:
                                 # Responses API completed but no finish yet — also synthesize
-                                _debug(f"  [oai-stream] synthesizing finish for Responses/empty stream")
-                                _synth = {"id": f"chatcmpl-{uuid.uuid4().hex[:8]}", "object": "chat.completion.chunk", "created": int(time.time()), "model": original_model, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
+                                _debug(
+                                    f"  [oai-stream] synthesizing finish for Responses/empty stream"
+                                )
+                                _synth = {
+                                    "id": f"chatcmpl-{uuid.uuid4().hex[:8]}",
+                                    "object": "chat.completion.chunk",
+                                    "created": int(time.time()),
+                                    "model": original_model,
+                                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                                }
                                 yield f"data: {_json_dumps_str(_synth, ensure_ascii=False)}\n\n".encode()
                                 yield b"data: [DONE]\n\n"
                                 emitted_finish = True
                             else:
                                 # Nothing yielded — emit error to avoid silent failure
-                                _debug(f"  [oai-stream] no content yielded, emitting error termination")
-                                _err = {"error": {"message": "stream truncated without content", "type": "api_error"}}
-                                yield b"data: " + _json_dumps_str(_err, ensure_ascii=False).encode() + b"\n\ndata: [DONE]\n\n"
+                                _debug(
+                                    f"  [oai-stream] no content yielded, emitting error termination"
+                                )
+                                _err = {
+                                    "error": {
+                                        "message": "stream truncated without content",
+                                        "type": "api_error",
+                                    }
+                                }
+                                yield (
+                                    b"data: "
+                                    + _json_dumps_str(_err, ensure_ascii=False).encode()
+                                    + b"\n\ndata: [DONE]\n\n"
+                                )
                                 emitted_finish = True
                         # Stream ended — finalize tracking
                         final_in, final_out, final_cache, log_tag = _finalize_stream_tokens(
-                            _track_model, est_input, None, stream_out, 0,
-                            actual_usage, _token_usage, _token_lock)
+                            _track_model,
+                            est_input,
+                            None,
+                            stream_out,
+                            0,
+                            actual_usage,
+                            _token_usage,
+                            _token_lock,
+                        )
                         ak_h = _alias_for_key(_key_from_headers(hdrs, "openai"))
                         if _using_free:
-                            _log_free_model_usage(model_id, free_model, "free (no auth)", "free (no auth)",
-                                                  200, final_in or 0, final_out or 0,
-                                                  _elapsed_ms(start_time), ip=_free_usage_ip())
-                        await _save_and_log_request(req_id, _track_model, original_model, start_time,
-                                     final_in, final_out, final_cache, protocol, True, thinking_type,
-                                     effort, client_ip, ak_h, tool_names, log_tag,
-                                     tools_used=used_tools if used_tools else None,
-                                     request_body=request_body)
+                            _log_free_model_usage(
+                                model_id,
+                                free_model,
+                                "free (no auth)",
+                                "free (no auth)",
+                                200,
+                                final_in or 0,
+                                final_out or 0,
+                                _elapsed_ms(start_time),
+                                ip=_free_usage_ip(),
+                            )
+                        await _save_and_log_request(
+                            req_id,
+                            _track_model,
+                            original_model,
+                            start_time,
+                            final_in,
+                            final_out,
+                            final_cache,
+                            protocol,
+                            True,
+                            thinking_type,
+                            effort,
+                            client_ip,
+                            ak_h,
+                            tool_names,
+                            log_tag,
+                            tools_used=used_tools if used_tools else None,
+                            request_body=request_body,
+                        )
                         _cb_record_success(endpoint)  # Stream completed successfully
                 except asyncio.CancelledError:
                     # [plan 18/08 §am.22/piège 19] — same watchdog-cancel
                     # handling as the anthropic stream handler (see there).
                     st = _free_attempt_station()
-                    if (st is not None and _attempt == 0
-                            and _is_watchdog_cancelled(st)):
-                        _debug(f"  ⟳ stream watchdog-cancelled (dead tunnel, station {getattr(st, '_station', '?')}) — failover retry")
-                        _log(f"  FREE STREAM on confirmed-dead tunnel cancelled → switching station")
+                    if st is not None and _attempt == 0 and _is_watchdog_cancelled(st):
+                        _debug(
+                            f"  ⟳ stream watchdog-cancelled (dead tunnel, station {getattr(st, '_station', '?')}) — failover retry"
+                        )
+                        _log(
+                            f"  FREE STREAM on confirmed-dead tunnel cancelled → switching station"
+                        )
                         if _oai_has_yielded or stream_out > 0:
                             _cb_record_failure(endpoint)
-                            _log(f"  stream_retry_suppressed_after_started attempt={_attempt+1}")
-                            yield b"data: " + _json_dumps_str({"error": {"message": "stream interrupted"}}, ensure_ascii=False).encode() + b"\n\ndata: [DONE]\n\n"
+                            _log(f"  stream_retry_suppressed_after_started attempt={_attempt + 1}")
+                            yield (
+                                b"data: "
+                                + _json_dumps_str(
+                                    {"error": {"message": "stream interrupted"}}, ensure_ascii=False
+                                ).encode()
+                                + b"\n\ndata: [DONE]\n\n"
+                            )
                             return
                         continue
                     raise
@@ -7532,29 +9743,58 @@ async def chat_completions(request: Request):
                     # next attempt re-enters free with fresh_station=True
                     # (bad-mark → exclusion of the dead station).
                     _cb_record_failure(endpoint)  # Record failure for circuit breaker
-                    _log(f"  FREE STREAM via station {getattr(ftf.station, '_station', '?')} tunnel FAILED ({ftf.cause}) → retry station fraîche")
+                    _log(
+                        f"  FREE STREAM via station {getattr(ftf.station, '_station', '?')} tunnel FAILED ({ftf.cause}) → retry station fraîche"
+                    )
                     if _oai_has_yielded or stream_out > 0:
                         _cb_record_failure(endpoint)
-                        _log(f"  stream_retry_suppressed_after_started attempt={_attempt+1}")
-                        yield b"data: " + _json_dumps_str({"error": {"message": "stream interrupted"}}, ensure_ascii=False).encode() + b"\n\ndata: [DONE]\n\n"
+                        _log(f"  stream_retry_suppressed_after_started attempt={_attempt + 1}")
+                        yield (
+                            b"data: "
+                            + _json_dumps_str(
+                                {"error": {"message": "stream interrupted"}}, ensure_ascii=False
+                            ).encode()
+                            + b"\n\ndata: [DONE]\n\n"
+                        )
                         return
                     continue
                 except Exception as e:
                     _cb_record_failure(endpoint)  # Record failure for circuit breaker
-                    _log(f"  ERROR stream (attempt {_attempt+1}): {type(e).__name__}: {e}")
-                    _debug(f"  ✗ stream exception: {type(e).__name__}: {e}\n{traceback.format_exc()}")
+                    _log(f"  ERROR stream (attempt {_attempt + 1}): {type(e).__name__}: {e}")
+                    _debug(
+                        f"  ✗ stream exception: {type(e).__name__}: {e}\n{traceback.format_exc()}"
+                    )
                     if _attempt == 0:
                         # Network errors (server disconnect, timeout) → retry with same key first
-                        _is_network_error = isinstance(e, (httpx.RemoteProtocolError, httpx.ReadError,
-                                                           ConnectionError, OSError)) or "disconnected" in str(e).lower()
+                        _is_network_error = (
+                            isinstance(
+                                e,
+                                (
+                                    httpx.RemoteProtocolError,
+                                    httpx.ReadError,
+                                    ConnectionError,
+                                    OSError,
+                                ),
+                            )
+                            or "disconnected" in str(e).lower()
+                        )
                         if _is_network_error:
                             _debug(f"  ⟳ stream retry (network error, same key)")
                             _log(f"  Retrying stream (network error, same key)")
                             await asyncio.sleep(1.0)
                             if _oai_has_yielded or stream_out > 0:
                                 _cb_record_failure(endpoint)
-                                _log(f"  stream_retry_suppressed_after_started attempt={_attempt+1}")
-                                yield b"data: " + _json_dumps_str({"error": {"message": "stream interrupted"}}, ensure_ascii=False).encode() + b"\n\ndata: [DONE]\n\n"
+                                _log(
+                                    f"  stream_retry_suppressed_after_started attempt={_attempt + 1}"
+                                )
+                                yield (
+                                    b"data: "
+                                    + _json_dumps_str(
+                                        {"error": {"message": "stream interrupted"}},
+                                        ensure_ascii=False,
+                                    ).encode()
+                                    + b"\n\ndata: [DONE]\n\n"
+                                )
                                 return
                             continue
                         # Auth/quota errors → try alternative key
@@ -7564,7 +9804,9 @@ async def chat_completions(request: Request):
                                 await _pause_key_for_quota_reset(failed_key)
                             except Exception:
                                 _default_pause = float(yaml_get("key_pause", "default_pause", 60))
-                                _key_pauser.pause_key(failed_key, _default_pause, "stream exception")
+                                _key_pauser.pause_key(
+                                    failed_key, _default_pause, "stream exception"
+                                )
                         alt = _find_alternative_key(failed_key)
                         if alt:
                             _debug(f"  ⟳ stream retry with alt key: alias={alt.get('alias', '?')}")
@@ -7572,8 +9814,14 @@ async def chat_completions(request: Request):
                             hdrs = _get_auth_headers("openai", entry=alt)
                         if _oai_has_yielded or stream_out > 0:
                             _cb_record_failure(endpoint)
-                            _log(f"  stream_retry_suppressed_after_started attempt={_attempt+1}")
-                            yield b"data: " + _json_dumps_str({"error": {"message": "stream interrupted"}}, ensure_ascii=False).encode() + b"\n\ndata: [DONE]\n\n"
+                            _log(f"  stream_retry_suppressed_after_started attempt={_attempt + 1}")
+                            yield (
+                                b"data: "
+                                + _json_dumps_str(
+                                    {"error": {"message": "stream interrupted"}}, ensure_ascii=False
+                                ).encode()
+                                + b"\n\ndata: [DONE]\n\n"
+                            )
                             return
                         continue
                     try:
@@ -7582,18 +9830,33 @@ async def chat_completions(request: Request):
                     except Exception as e:
                         _debug(f"  ✗ token rollback failed: {type(e).__name__}: {e}")
                     ak_h = _alias_for_key(_key_from_headers(hdrs, "openai"))
-                    await _log_and_save_error(req_id, _track_model, original_model, start_time,
-                                 0, str(e), protocol, True, thinking_type,
-                                 effort, client_ip, ak_h, tool_names,
-                                 request_body=request_body)
+                    await _log_and_save_error(
+                        req_id,
+                        _track_model,
+                        original_model,
+                        start_time,
+                        0,
+                        str(e),
+                        protocol,
+                        True,
+                        thinking_type,
+                        effort,
+                        client_ip,
+                        ak_h,
+                        tool_names,
+                        request_body=request_body,
+                    )
                     return
                 else:
                     break
             else:
                 return
 
-        return StreamingResponse(_sse_keepalive(openai_stream(headers)), media_type="text/event-stream",
-                                 headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
+        return StreamingResponse(
+            _sse_keepalive(openai_stream(headers)),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+        )
 
     # ── Anthropic protocol (double conversion) ──────────────────
     anthro_body = openai_to_anthropic_request(body)
@@ -7610,9 +9873,11 @@ async def chat_completions(request: Request):
 
     thinking = anthro_body.get("thinking", {})
     thinking_type = thinking.get("type", "none") if isinstance(thinking, dict) else "none"
-    effort = (anthro_body.get("effort")
-              or (thinking.get("effort") if isinstance(thinking, dict) else None)
-              or "none")
+    effort = (
+        anthro_body.get("effort")
+        or (thinking.get("effort") if isinstance(thinking, dict) else None)
+        or "none"
+    )
     try:
         a_headers = _get_auth_headers("anthropic")
     except AllKeysPausedError as e:
@@ -7620,57 +9885,122 @@ async def chat_completions(request: Request):
         if FREE_MODEL_MAP.get(model_id):
             if is_stream:
                 # Streaming: pass empty headers — generator handles free model swap
-                return StreamingResponse(_sse_keepalive(_anthro_to_oai_stream({})), media_type="text/event-stream",
-                                         headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
+                return StreamingResponse(
+                    _sse_keepalive(_anthro_to_oai_stream({})),
+                    media_type="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+                )
             else:
                 # Non-streaming: try free model
                 try:
-                    free_result = await _try_free_model_first(anthro_body, {}, "anthropic", model_id, forced_pool=getattr(request.state, "_geo_forced_pool", None))
+                    free_result = await _try_free_model_first(
+                        anthro_body,
+                        {},
+                        "anthropic",
+                        model_id,
+                        forced_pool=getattr(request.state, "_geo_forced_pool", None),
+                    )
                     if free_result is not None:
                         resp, _, _actual_model, _actual_ip = free_result
-                        data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+                        data = (
+                            resp.json()
+                            if resp.headers.get("content-type", "").startswith("application/json")
+                            else {}
+                        )
                         usage = data.get("usage", {})
                         req_in = usage.get("input_tokens", 0) or usage.get("prompt_tokens", 0)
                         req_out = usage.get("output_tokens", 0) or usage.get("completion_tokens", 0)
                         req_cache = usage.get("cache_read_input_tokens", 0)
                         _update_token_usage(_actual_model, req_in, req_out, req_cache)
-                        used = [b["name"] for b in data.get("content", []) if b.get("type") == "tool_use"]
-                        await _save_and_log_request(req_id, _actual_model, original_model, start_time,
-                                     req_in, req_out, req_cache, protocol, False, thinking_type,
-                                     effort, client_ip, "free (no auth)", tool_names, tools_used=used,
-                                     request_body=request_body, response_body=data, free_model_ip=_actual_ip)
+                        used = [
+                            b["name"]
+                            for b in data.get("content", [])
+                            if b.get("type") == "tool_use"
+                        ]
+                        await _save_and_log_request(
+                            req_id,
+                            _actual_model,
+                            original_model,
+                            start_time,
+                            req_in,
+                            req_out,
+                            req_cache,
+                            protocol,
+                            False,
+                            thinking_type,
+                            effort,
+                            client_ip,
+                            "free (no auth)",
+                            tool_names,
+                            tools_used=used,
+                            request_body=request_body,
+                            response_body=data,
+                            free_model_ip=_actual_ip,
+                        )
                         oai_response = anthropic_to_openai_response(data, original_model)
-                        return Response(content=_json_dumps_str(oai_response, ensure_ascii=False), media_type="application/json")
+                        return Response(
+                            content=_json_dumps_str(oai_response, ensure_ascii=False),
+                            media_type="application/json",
+                        )
                 except FreeQuotaExhausted as e:
                     return _free_quota_exhausted_response(e, "anthropic")
                 except Exception as e:
                     _debug(f"  [free] free model attempt failed: {e}")
         retry_after = int(e.retry_after) + 1
         return Response(
-            content=_json_dumps_str({"error": {"message": f"All API keys exhausted. Retry after {retry_after}s.",
-                "type": "api_error"}}),
-            status_code=503, media_type="application/json",
-            headers={"Retry-After": str(retry_after)})
+            content=_json_dumps_str(
+                {
+                    "error": {
+                        "message": f"All API keys exhausted. Retry after {retry_after}s.",
+                        "type": "api_error",
+                    }
+                }
+            ),
+            status_code=503,
+            media_type="application/json",
+            headers={"Retry-After": str(retry_after)},
+        )
 
     if not is_stream:
         # Try free model first if available
         try:
-            free_result = await _try_free_model_first(anthro_body, a_headers, "anthropic", model_id, forced_pool=getattr(request.state, "_geo_forced_pool", None))
+            free_result = await _try_free_model_first(
+                anthro_body,
+                a_headers,
+                "anthropic",
+                model_id,
+                forced_pool=getattr(request.state, "_geo_forced_pool", None),
+            )
             if free_result is not None:
                 resp, a_headers, _actual_model, _actual_ip = free_result
                 model_id = _actual_model
             else:
-                resp, a_headers = await _do_request_with_retry(endpoint, anthro_body, a_headers, "anthropic")
+                resp, a_headers = await _do_request_with_retry(
+                    endpoint, anthro_body, a_headers, "anthropic"
+                )
         except FreeQuotaExhausted as e:
             return _free_quota_exhausted_response(e, "anthropic")
         except UpstreamError as e:
             return JSONResponse(status_code=e.status_code, content={"error": str(e)})
         account_alias = _alias_for_key(a_headers.get("x-api-key", ""))
         if resp.status_code != 200:
-            await _log_and_save_error(req_id, model_id, original_model, start_time,
-                         resp.status_code, resp.text, protocol, is_stream, thinking_type,
-                         effort, client_ip, account_alias, tool_names,
-                         request_body=request_body, response_body={"error": resp.text[:2000]})
+            await _log_and_save_error(
+                req_id,
+                model_id,
+                original_model,
+                start_time,
+                resp.status_code,
+                resp.text,
+                protocol,
+                is_stream,
+                thinking_type,
+                effort,
+                client_ip,
+                account_alias,
+                tool_names,
+                request_body=request_body,
+                response_body={"error": resp.text[:2000]},
+            )
             # Convert 429/401/403 → 503 to avoid Claude Code auth window
             if resp.status_code in (429, 401, 403):
                 return _openai_error(503, _auth_window_message(resp.status_code))
@@ -7681,11 +10011,19 @@ async def chat_completions(request: Request):
                 err_msg = err_data.get("error", {}).get("message", resp.text[:200])
             except Exception:
                 err_msg = resp.text[:200]
-            oai_err = _json_dumps_str({"error": {"message": err_msg, "type": "api_error"}}, ensure_ascii=False)
-            return Response(content=oai_err, status_code=resp.status_code, media_type="application/json")
+            oai_err = _json_dumps_str(
+                {"error": {"message": err_msg, "type": "api_error"}}, ensure_ascii=False
+            )
+            return Response(
+                content=oai_err, status_code=resp.status_code, media_type="application/json"
+            )
 
         try:
-            data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+            data = (
+                resp.json()
+                if resp.headers.get("content-type", "").startswith("application/json")
+                else {}
+            )
         except Exception:
             _debug(f"  ✗ non-JSON response from {endpoint}")
             _log(f"  UPSTREAM DECODE ERROR: non-JSON response from {endpoint}")
@@ -7696,13 +10034,30 @@ async def chat_completions(request: Request):
         req_cache = usage.get("cache_read_input_tokens", 0)
         _update_token_usage(model_id, req_in, req_out, req_cache)
         used = [b["name"] for b in data.get("content", []) if b.get("type") == "tool_use"]
-        await _save_and_log_request(req_id, model_id, original_model, start_time,
-                     req_in, req_out, req_cache, protocol, is_stream, thinking_type,
-                     effort, client_ip, account_alias, tool_names, tools_used=used if used else None,
-                     request_body=request_body, response_body=data)
+        await _save_and_log_request(
+            req_id,
+            model_id,
+            original_model,
+            start_time,
+            req_in,
+            req_out,
+            req_cache,
+            protocol,
+            is_stream,
+            thinking_type,
+            effort,
+            client_ip,
+            account_alias,
+            tool_names,
+            tools_used=used if used else None,
+            request_body=request_body,
+            response_body=data,
+        )
 
         oai_response = anthropic_to_openai_response(data, original_model)
-        return Response(content=_json_dumps_str(oai_response, ensure_ascii=False), media_type="application/json")
+        return Response(
+            content=_json_dumps_str(oai_response, ensure_ascii=False), media_type="application/json"
+        )
 
     # ── Streaming with Anthropic backend (true streaming) ──
     async def _anthro_to_oai_stream(hdrs):
@@ -7739,7 +10094,9 @@ async def chat_completions(request: Request):
 
         def _chunk(delta_override, finish):
             c = {
-                "id": _id, "object": "chat.completion.chunk", "created": _created,
+                "id": _id,
+                "object": "chat.completion.chunk",
+                "created": _created,
                 "model": original_model,
                 "choices": [{"index": 0, "delta": delta_override, "finish_reason": finish}],
             }
@@ -7757,16 +10114,25 @@ async def chat_completions(request: Request):
             _line_buf = ""  # fresh per attempt — avoids stale truncated data:
             try:
                 # Axe A: geo-restricted paid streaming → route through tunnel station
-                _stream_ctx = (_open_via_pool(endpoint, anthro_body, hdrs,
-                                              is_stream=True,
-                                              forced_pool=_free_forced_pool)
-                               if _geo_tunnel else
-                               _open_free_stream(endpoint, anthro_body, hdrs, _using_free,
-                                                 count_request=(_attempt == 0),
-                                                 fresh_station=(_attempt > 0 and _using_free),
-                                                 direct_fallback=(_free_exception_fallback_mode() != "station-first"
-                                                                  or _attempt + 1 >= effective_free_max_attempts(_free_forced_pool)),
-                                                 forced_pool=_free_forced_pool))
+                _stream_ctx = (
+                    _open_via_pool(
+                        endpoint, anthro_body, hdrs, is_stream=True, forced_pool=_free_forced_pool
+                    )
+                    if _geo_tunnel
+                    else _open_free_stream(
+                        endpoint,
+                        anthro_body,
+                        hdrs,
+                        _using_free,
+                        count_request=(_attempt == 0),
+                        fresh_station=(_attempt > 0 and _using_free),
+                        direct_fallback=(
+                            _free_exception_fallback_mode() != "station-first"
+                            or _attempt + 1 >= effective_free_max_attempts(_free_forced_pool)
+                        ),
+                        forced_pool=_free_forced_pool,
+                    )
+                )
                 async with _stream_ctx as resp:
                     if resp.status_code != 200:
                         if _using_free:
@@ -7775,20 +10141,37 @@ async def chat_completions(request: Request):
                             # keys: a status from the free endpoint says nothing
                             # about the paid account (CRITIC(2)/CRITIC(3)).
                             if resp.status_code == 429:
-                                _refuse = _on_free_429_stream(free_model, resp.headers.get('retry-after', ''),
-                                                               forced_pool=_free_forced_pool)
-                                if not _refuse and _attempt + 1 < effective_free_max_attempts(_free_forced_pool):
+                                _refuse = _on_free_429_stream(
+                                    free_model,
+                                    resp.headers.get("retry-after", ""),
+                                    forced_pool=_free_forced_pool,
+                                )
+                                if not _refuse and _attempt + 1 < effective_free_max_attempts(
+                                    _free_forced_pool
+                                ):
                                     # [plan 19/08 §1] budget left → retry free on a
                                     # FRESH station (fresh IP = fresh quota); keep
                                     # _using_free so the next attempt re-enters free
                                     # with fresh_station=True. Cooldown + rotation
                                     # for the exhausted IP already done above.
-                                    _log_free_model_usage(model_id, free_model, "free (no auth)", "free (no auth)",
-                                                          resp.status_code, ip=_free_usage_ip())
-                                    _log(f"  FREE {free_model!r} RATE LIMITED (429) → retry station fraîche (essai {_attempt + 2}/{effective_free_max_attempts(_free_forced_pool)})")
-                                    if _stream_has_yielded(started, open_blocks, stream_out, _line_buf):
+                                    _log_free_model_usage(
+                                        model_id,
+                                        free_model,
+                                        "free (no auth)",
+                                        "free (no auth)",
+                                        resp.status_code,
+                                        ip=_free_usage_ip(),
+                                    )
+                                    _log(
+                                        f"  FREE {free_model!r} RATE LIMITED (429) → retry station fraîche (essai {_attempt + 2}/{effective_free_max_attempts(_free_forced_pool)})"
+                                    )
+                                    if _stream_has_yielded(
+                                        started, open_blocks, stream_out, _line_buf
+                                    ):
                                         _cb_record_failure(endpoint)
-                                        _log(f"  stream_retry_suppressed_after_started attempt={_attempt+1}")
+                                        _log(
+                                            f"  stream_retry_suppressed_after_started attempt={_attempt + 1}"
+                                        )
                                         yield _chunk({}, "stop")
                                         yield b"data: [DONE]\n\n"
                                         return
@@ -7800,58 +10183,100 @@ async def chat_completions(request: Request):
                             endpoint = paid_endpoint
                             _using_free = False
                             _track_model = model_id
-                            _debug(f"  [anthro-to-oai-stream] free model {resp.status_code} → falling back to paid {_track_model!r}")
-                            _log(f"  FREE model {resp.status_code} → falling back to paid {_track_model!r}")
-                            _log_free_model_usage(model_id, free_model, "free (no auth)", "free (no auth)",
-                                                  resp.status_code, ip=_free_usage_ip())
+                            _debug(
+                                f"  [anthro-to-oai-stream] free model {resp.status_code} → falling back to paid {_track_model!r}"
+                            )
+                            _log(
+                                f"  FREE model {resp.status_code} → falling back to paid {_track_model!r}"
+                            )
+                            _log_free_model_usage(
+                                model_id,
+                                free_model,
+                                "free (no auth)",
+                                "free (no auth)",
+                                resp.status_code,
+                                ip=_free_usage_ip(),
+                            )
                             if _refuse:
                                 # strict_free (GUI): every station exhausted
                                 # (bad/down + (model, IP) cooldown active) —
                                 # refuse instead of paying.
-                                _retry_after = resp.headers.get('retry-after', '') or "60"
+                                _retry_after = resp.headers.get("retry-after", "") or "60"
                                 yield await _stream_error_response(
-                                    req_id, free_model, original_model, start_time,
-                                    429, await resp.aread(), protocol, thinking_type,
-                                    effort, client_ip, "free (no auth)", tool_names,
-                                    {"type": "error",
-                                     "error": {"type": "rate_limit_error",
-                                               "message": f"Free quota exhausted on all VPN stations. Retry after {_retry_after}s."}},
-                                    request_body=request_body)
+                                    req_id,
+                                    free_model,
+                                    original_model,
+                                    start_time,
+                                    429,
+                                    await resp.aread(),
+                                    protocol,
+                                    thinking_type,
+                                    effort,
+                                    client_ip,
+                                    "free (no auth)",
+                                    tool_names,
+                                    {
+                                        "type": "error",
+                                        "error": {
+                                            "type": "rate_limit_error",
+                                            "message": f"Free quota exhausted on all VPN stations. Retry after {_retry_after}s.",
+                                        },
+                                    },
+                                    request_body=request_body,
+                                )
                                 return
                             continue
-                        hdrs, should_retry = await _handle_429(hdrs, resp.status_code, _attempt, resp.headers)
+                        hdrs, should_retry = await _handle_429(
+                            hdrs, resp.status_code, _attempt, resp.headers
+                        )
                         if should_retry:
                             if _stream_has_yielded(started, open_blocks, stream_out, _line_buf):
                                 _cb_record_failure(endpoint)
-                                _log(f"  stream_retry_suppressed_after_started attempt={_attempt+1}")
+                                _log(
+                                    f"  stream_retry_suppressed_after_started attempt={_attempt + 1}"
+                                )
                                 yield _chunk({}, "stop")
                                 yield b"data: [DONE]\n\n"
                                 return
                             continue
                         if resp.status_code == 499:
-                            wait = 1.0 * (2 ** _attempt)
-                            _debug(f"  [anthro-to-oai-stream] upstream 499, retrying in {wait:.1f}s (attempt {_attempt+1})")
+                            wait = 1.0 * (2**_attempt)
+                            _debug(
+                                f"  [anthro-to-oai-stream] upstream 499, retrying in {wait:.1f}s (attempt {_attempt + 1})"
+                            )
                             await asyncio.sleep(wait)
                             if _stream_has_yielded(started, open_blocks, stream_out, _line_buf):
                                 _cb_record_failure(endpoint)
-                                _log(f"  stream_retry_suppressed_after_started attempt={_attempt+1}")
+                                _log(
+                                    f"  stream_retry_suppressed_after_started attempt={_attempt + 1}"
+                                )
                                 yield _chunk({}, "stop")
                                 yield b"data: [DONE]\n\n"
                                 return
                             continue
                         err = await resp.aread()
                         # Pause key on credit/balance errors (400)
-                        if resp.status_code == 400 and any(x in err.decode(errors='ignore') for x in ("Insufficient balance", "Monthly usage limit")):
+                        if resp.status_code == 400 and any(
+                            x in err.decode(errors="ignore")
+                            for x in ("Insufficient balance", "Monthly usage limit")
+                        ):
                             failed_key = hdrs.get("x-api-key", "")
-                            _key_pauser.pause_key(failed_key, _key_pauser._max_pause, f"400 credit error")
+                            _key_pauser.pause_key(
+                                failed_key, _key_pauser._max_pause, f"400 credit error"
+                            )
                             alt = _find_alternative_key(failed_key)
                             if alt:
                                 _log(f"  400 credit error on key, retrying with alternative key")
-                                hdrs = {"x-api-key": alt.get("api_key", ""), "Content-Type": "application/json",
-                                       "anthropic-version": "2023-06-01"}
+                                hdrs = {
+                                    "x-api-key": alt.get("api_key", ""),
+                                    "Content-Type": "application/json",
+                                    "anthropic-version": "2023-06-01",
+                                }
                                 if _stream_has_yielded(started, open_blocks, stream_out, _line_buf):
                                     _cb_record_failure(endpoint)
-                                    _log(f"  stream_retry_suppressed_after_started attempt={_attempt+1}")
+                                    _log(
+                                        f"  stream_retry_suppressed_after_started attempt={_attempt + 1}"
+                                    )
                                     yield _chunk({}, "stop")
                                     yield b"data: [DONE]\n\n"
                                     return
@@ -7860,19 +10285,39 @@ async def chat_completions(request: Request):
                         # Log 401 body specifically for key diagnosis
                         if resp.status_code == 401:
                             _debug(f"  [auth] 401 response body: {_redact(err, 500)}")
-                        await _log_and_save_error(req_id, model_id, original_model, start_time,
-                                     resp.status_code, str(resp.status_code), protocol, True, thinking_type,
-                                     effort, client_ip, ak, tool_names,
-                                     request_body=request_body)
+                        await _log_and_save_error(
+                            req_id,
+                            model_id,
+                            original_model,
+                            start_time,
+                            resp.status_code,
+                            str(resp.status_code),
+                            protocol,
+                            True,
+                            thinking_type,
+                            effort,
+                            client_ip,
+                            ak,
+                            tool_names,
+                            request_body=request_body,
+                        )
                         # Convert 429/401/403 → 503 to avoid Claude Code auth window
-                        err_status = 503 if resp.status_code in (429, 401, 403) else resp.status_code
+                        err_status = (
+                            503 if resp.status_code in (429, 401, 403) else resp.status_code
+                        )
                         if resp.status_code == 429:
                             err_msg = "All API keys exhausted (rate limited). Try again later."
                         elif resp.status_code in (401, 403):
                             err_msg = _auth_window_message(resp.status_code)
                         else:
                             err_msg = f"HTTP {resp.status_code}"
-                        yield b"data: " + _json_dumps_str({"error": {"message": err_msg}}, ensure_ascii=False).encode() + b"\n\ndata: [DONE]\n\n"
+                        yield (
+                            b"data: "
+                            + _json_dumps_str(
+                                {"error": {"message": err_msg}}, ensure_ascii=False
+                            ).encode()
+                            + b"\n\ndata: [DONE]\n\n"
+                        )
                         return
 
                     async for raw in resp.aiter_bytes():
@@ -7885,7 +10330,9 @@ async def chat_completions(request: Request):
                             if _nl != -1:
                                 _line_buf = _tail[_nl + 1 :]
                             else:
-                                _debug(f"  [_anthro_to_oai] line_buf truncated mid-JSON (no newline in last {_keep})")
+                                _debug(
+                                    f"  [_anthro_to_oai] line_buf truncated mid-JSON (no newline in last {_keep})"
+                                )
                                 _line_buf = _tail
                         while "\n" in _line_buf:
                             line, _line_buf = _line_buf.split("\n", 1)
@@ -7919,13 +10366,22 @@ async def chat_completions(request: Request):
                                         "name": block.get("name", ""),
                                         "args": "",
                                     }
-                                    yield _chunk({
-                                        "tool_calls": [{
-                                            "index": idx, "id": tool_data[idx]["id"],
-                                            "type": "function",
-                                            "function": {"name": tool_data[idx]["name"], "arguments": ""},
-                                        }]
-                                    }, None)
+                                    yield _chunk(
+                                        {
+                                            "tool_calls": [
+                                                {
+                                                    "index": idx,
+                                                    "id": tool_data[idx]["id"],
+                                                    "type": "function",
+                                                    "function": {
+                                                        "name": tool_data[idx]["name"],
+                                                        "arguments": "",
+                                                    },
+                                                }
+                                            ]
+                                        },
+                                        None,
+                                    )
 
                             elif etype == "content_block_delta":
                                 idx = ev.get("index")
@@ -7946,13 +10402,22 @@ async def chat_completions(request: Request):
                                     if idx in tool_data:
                                         tool_data[idx]["args"] += pj
                                         stream_out += _estimate_tokens(pj)
-                                        yield _chunk({
-                                            "tool_calls": [{
-                                                "index": idx, "id": tool_data[idx]["id"],
-                                                "type": "function",
-                                                "function": {"name": tool_data[idx]["name"], "arguments": pj},
-                                            }]
-                                        }, None)
+                                        yield _chunk(
+                                            {
+                                                "tool_calls": [
+                                                    {
+                                                        "index": idx,
+                                                        "id": tool_data[idx]["id"],
+                                                        "type": "function",
+                                                        "function": {
+                                                            "name": tool_data[idx]["name"],
+                                                            "arguments": pj,
+                                                        },
+                                                    }
+                                                ]
+                                            },
+                                            None,
+                                        )
 
                             elif etype == "content_block_stop":
                                 idx = ev.get("index")
@@ -7977,32 +10442,66 @@ async def chat_completions(request: Request):
                                 emitted_finish = True
 
                             elif etype == "message_stop":
-                                _update_token_usage(_track_model, total_input, stream_out, cache_read)
+                                _update_token_usage(
+                                    _track_model, total_input, stream_out, cache_read
+                                )
                                 ak = _alias_for_key(hdrs.get("x-api-key", ""))
                                 if _using_free:
-                                    _log_free_model_usage(model_id, free_model, "free (no auth)", "free (no auth)",
-                                                          200, total_input or 0, stream_out or 0,
-                                                          _elapsed_ms(start_time), ip=_free_usage_ip())
-                                used_tools = [v["name"] for v in tool_data.values() if v.get("name")]
-                                await _save_and_log_request(req_id, _track_model, original_model, start_time,
-                                             total_input, stream_out, cache_read, protocol, True, thinking_type,
-                                             effort, client_ip, ak, tool_names, tools_used=used_tools if used_tools else None,
-                                             request_body=request_body)
+                                    _log_free_model_usage(
+                                        model_id,
+                                        free_model,
+                                        "free (no auth)",
+                                        "free (no auth)",
+                                        200,
+                                        total_input or 0,
+                                        stream_out or 0,
+                                        _elapsed_ms(start_time),
+                                        ip=_free_usage_ip(),
+                                    )
+                                used_tools = [
+                                    v["name"] for v in tool_data.values() if v.get("name")
+                                ]
+                                await _save_and_log_request(
+                                    req_id,
+                                    _track_model,
+                                    original_model,
+                                    start_time,
+                                    total_input,
+                                    stream_out,
+                                    cache_read,
+                                    protocol,
+                                    True,
+                                    thinking_type,
+                                    effort,
+                                    client_ip,
+                                    ak,
+                                    tool_names,
+                                    tools_used=used_tools if used_tools else None,
+                                    request_body=request_body,
+                                )
                                 # Send final usage chunk for OpenAI streaming client
                                 total = total_input + stream_out
                                 usage_chunk = {
-                                    "id": _id, "object": "chat.completion.chunk", "created": _created,
+                                    "id": _id,
+                                    "object": "chat.completion.chunk",
+                                    "created": _created,
                                     "model": original_model,
                                     "choices": [],
                                     "usage": {
                                         "prompt_tokens": total_input,
                                         "completion_tokens": stream_out,
                                         "total_tokens": total,
-                                    }
+                                    },
                                 }
                                 if cache_read:
-                                    usage_chunk["usage"]["prompt_tokens_details"] = {"cached_tokens": cache_read}
-                                yield b"data: " + _json_dumps_str(usage_chunk, ensure_ascii=False).encode() + b"\n\n"
+                                    usage_chunk["usage"]["prompt_tokens_details"] = {
+                                        "cached_tokens": cache_read
+                                    }
+                                yield (
+                                    b"data: "
+                                    + _json_dumps_str(usage_chunk, ensure_ascii=False).encode()
+                                    + b"\n\n"
+                                )
                                 yield b"data: [DONE]\n\n"
                                 _cb_record_success(endpoint)  # Stream completed successfully
                                 return
@@ -8010,13 +10509,14 @@ async def chat_completions(request: Request):
                 # [plan 18/08 §am.22/piège 19] — same watchdog-cancel
                 # handling as the anthropic stream handler (see there).
                 st = _free_attempt_station()
-                if (st is not None and _attempt == 0
-                        and _is_watchdog_cancelled(st)):
-                    _debug(f"  ⟳ stream watchdog-cancelled (dead tunnel, station {getattr(st, '_station', '?')}) — failover retry")
+                if st is not None and _attempt == 0 and _is_watchdog_cancelled(st):
+                    _debug(
+                        f"  ⟳ stream watchdog-cancelled (dead tunnel, station {getattr(st, '_station', '?')}) — failover retry"
+                    )
                     _log(f"  FREE STREAM on confirmed-dead tunnel cancelled → switching station")
                     if _stream_has_yielded(started, open_blocks, stream_out, _line_buf):
                         _cb_record_failure(endpoint)
-                        _log(f"  stream_retry_suppressed_after_started attempt={_attempt+1}")
+                        _log(f"  stream_retry_suppressed_after_started attempt={_attempt + 1}")
                         yield _chunk({}, "stop")
                         yield b"data: [DONE]\n\n"
                         return
@@ -8029,29 +10529,36 @@ async def chat_completions(request: Request):
                 # next attempt re-enters free with fresh_station=True
                 # (bad-mark → exclusion of the dead station).
                 _cb_record_failure(endpoint)  # Record failure for circuit breaker
-                _log(f"  FREE STREAM via station {getattr(ftf.station, '_station', '?')} tunnel FAILED ({ftf.cause}) → retry station fraîche")
+                _log(
+                    f"  FREE STREAM via station {getattr(ftf.station, '_station', '?')} tunnel FAILED ({ftf.cause}) → retry station fraîche"
+                )
                 if _stream_has_yielded(started, open_blocks, stream_out, _line_buf):
                     _cb_record_failure(endpoint)
-                    _log(f"  stream_retry_suppressed_after_started attempt={_attempt+1}")
+                    _log(f"  stream_retry_suppressed_after_started attempt={_attempt + 1}")
                     yield _chunk({}, "stop")
                     yield b"data: [DONE]\n\n"
                     return
                 continue
             except Exception as e:
                 _cb_record_failure(endpoint)  # Record failure for circuit breaker
-                _log(f"  ERROR stream (attempt {_attempt+1}): {type(e).__name__}: {e}")
+                _log(f"  ERROR stream (attempt {_attempt + 1}): {type(e).__name__}: {e}")
                 _debug(f"  ✗ stream exception: {type(e).__name__}: {e}\n{traceback.format_exc()}")
                 if _attempt == 0:
                     # Network errors (server disconnect, timeout) → retry with same key first
-                    _is_network_error = isinstance(e, (httpx.RemoteProtocolError, httpx.ReadError,
-                                                       ConnectionError, OSError)) or "disconnected" in str(e).lower()
+                    _is_network_error = (
+                        isinstance(
+                            e,
+                            (httpx.RemoteProtocolError, httpx.ReadError, ConnectionError, OSError),
+                        )
+                        or "disconnected" in str(e).lower()
+                    )
                     if _is_network_error:
                         _debug(f"  ⟳ stream retry (network error, same key)")
                         _log(f"  Retrying stream (network error, same key)")
                         await asyncio.sleep(1.0)
                         if _stream_has_yielded(started, open_blocks, stream_out, _line_buf):
                             _cb_record_failure(endpoint)
-                            _log(f"  stream_retry_suppressed_after_started attempt={_attempt+1}")
+                            _log(f"  stream_retry_suppressed_after_started attempt={_attempt + 1}")
                             yield _chunk({}, "stop")
                             yield b"data: [DONE]\n\n"
                             return
@@ -8071,17 +10578,31 @@ async def chat_completions(request: Request):
                         hdrs = _get_auth_headers("anthropic", entry=alt)
                     if _stream_has_yielded(started, open_blocks, stream_out, _line_buf):
                         _cb_record_failure(endpoint)
-                        _log(f"  stream_retry_suppressed_after_started attempt={_attempt+1}")
+                        _log(f"  stream_retry_suppressed_after_started attempt={_attempt + 1}")
                         yield _chunk({}, "stop")
                         yield b"data: [DONE]\n\n"
                         return
                     continue
                 ak = _alias_for_key(hdrs.get("x-api-key", ""))
-                await _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
-                             total_input or 0, stream_out, 0, success=False, error=str(e),
-                             protocol=protocol, is_stream=True, thinking=thinking_type, effort=effort,
-                             client_ip=client_ip, account_alias=ak, tools=tool_names,
-                             request_body=request_body)
+                await _save_request(
+                    req_id,
+                    model_id,
+                    original_model,
+                    _elapsed_ms(start_time),
+                    total_input or 0,
+                    stream_out,
+                    0,
+                    success=False,
+                    error=str(e),
+                    protocol=protocol,
+                    is_stream=True,
+                    thinking=thinking_type,
+                    effort=effort,
+                    client_ip=client_ip,
+                    account_alias=ak,
+                    tools=tool_names,
+                    request_body=request_body,
+                )
                 if total_input:
                     try:
                         with _token_lock:
@@ -8108,7 +10629,11 @@ async def chat_completions(request: Request):
                     _ev = _json_loads(_rem)
                     if isinstance(_ev, dict) and _ev.get("type") == "message_stop":
                         emitted_finish = True
-                    elif isinstance(_ev, dict) and _ev.get("type") == "message_delta" and _ev.get("delta", {}).get("stop_reason"):
+                    elif (
+                        isinstance(_ev, dict)
+                        and _ev.get("type") == "message_delta"
+                        and _ev.get("delta", {}).get("stop_reason")
+                    ):
                         emitted_finish = True
                         yield _chunk({}, "stop")
                         yield b"data: [DONE]\n\n"
@@ -8122,8 +10647,11 @@ async def chat_completions(request: Request):
                 yield b"data: [DONE]\n\n"
                 emitted_finish = True
 
-    return StreamingResponse(_sse_keepalive(_anthro_to_oai_stream(a_headers)), media_type="text/event-stream",
-                             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
+    return StreamingResponse(
+        _sse_keepalive(_anthro_to_oai_stream(a_headers)),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+    )
 
 
 @app.post("/v1/responses")
@@ -8134,10 +10662,14 @@ async def responses(request: Request):
     _current_user_agent.set(request.headers.get("user-agent"))
 
     body_bytes = await request.body()
-    _debug(f"  [body] read {len(body_bytes)} bytes in {(time.monotonic() - start_time) * 1000:.0f}ms")
+    _debug(
+        f"  [body] read {len(body_bytes)} bytes in {(time.monotonic() - start_time) * 1000:.0f}ms"
+    )
     if len(body_bytes) > MAX_BODY_SIZE:
         _debug(f"  413: body too large ({len(body_bytes)} bytes)")
-        return _openai_error(413, f"Request body too large ({len(body_bytes)} bytes, max {MAX_BODY_SIZE})")
+        return _openai_error(
+            413, f"Request body too large ({len(body_bytes)} bytes, max {MAX_BODY_SIZE})"
+        )
 
     try:
         body = _json_loads(body_bytes)
@@ -8153,19 +10685,26 @@ async def responses(request: Request):
     route = _route_for(original_model)
     if route is None:
         available = sorted(MODELS.keys())
-        return JSONResponse(status_code=404, content={
-            "error": f"Model not found: {original_model!r}",
-            "available_models": available,
-        })
+        return JSONResponse(
+            status_code=404,
+            content={
+                "error": f"Model not found: {original_model!r}",
+                "available_models": available,
+            },
+        )
     model_id = route["model"]
     cfg = get_model_config(model_id)
     endpoint = cfg["endpoint"]
     protocol = cfg["protocol"]
     is_stream = body.get("stream", False)
 
-    _log(f"→ {original_model!r} → {model_id} | {protocol} | responses | stream={is_stream} | ip={client_ip}")
+    _log(
+        f"→ {original_model!r} → {model_id} | {protocol} | responses | stream={is_stream} | ip={client_ip}"
+    )
 
-    _geo_gate = await _enforce_geo_gate(route, request, is_stream=bool(is_stream), protocol=protocol)
+    _geo_gate = await _enforce_geo_gate(
+        route, request, is_stream=bool(is_stream), protocol=protocol
+    )
     if _geo_gate is not None:
         return _geo_gate
 
@@ -8195,9 +10734,11 @@ async def responses(request: Request):
 
     thinking = anthro_body.get("thinking", {})
     thinking_type = thinking.get("type", "none") if isinstance(thinking, dict) else "none"
-    effort = (anthro_body.get("effort")
-              or (thinking.get("effort") if isinstance(thinking, dict) else None)
-              or "none")
+    effort = (
+        anthro_body.get("effort")
+        or (thinking.get("effort") if isinstance(thinking, dict) else None)
+        or "none"
+    )
 
     # ── Anthropic backend (passthrough) ─────────────────────
     if protocol == "anthropic":
@@ -8208,40 +10749,91 @@ async def responses(request: Request):
             if FREE_MODEL_MAP.get(model_id):
                 if is_stream:
                     # Streaming: pass empty headers — generator handles free model swap
-                    return StreamingResponse(_sse_keepalive(_anthro_to_oai_stream({})), media_type="text/event-stream",
-                                             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
+                    return StreamingResponse(
+                        _sse_keepalive(_anthro_to_oai_stream({})),
+                        media_type="text/event-stream",
+                        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+                    )
                 else:
                     # Non-streaming: try free model
                     try:
-                        free_result = await _try_free_model_first(anthro_body, {}, "anthropic", model_id, forced_pool=getattr(request.state, "_geo_forced_pool", None))
+                        free_result = await _try_free_model_first(
+                            anthro_body,
+                            {},
+                            "anthropic",
+                            model_id,
+                            forced_pool=getattr(request.state, "_geo_forced_pool", None),
+                        )
                         if free_result is not None:
                             resp, _, _actual_model, _actual_ip = free_result
-                            data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+                            data = (
+                                resp.json()
+                                if resp.headers.get("content-type", "").startswith(
+                                    "application/json"
+                                )
+                                else {}
+                            )
                             usage = data.get("usage", {})
                             req_in = usage.get("input_tokens", 0) or usage.get("prompt_tokens", 0)
-                            req_out = usage.get("output_tokens", 0) or usage.get("completion_tokens", 0)
+                            req_out = usage.get("output_tokens", 0) or usage.get(
+                                "completion_tokens", 0
+                            )
                             req_cache = usage.get("cache_read_input_tokens", 0)
                             _update_token_usage(_actual_model, req_in, req_out, req_cache)
-                            used = [b["name"] for b in data.get("content", []) if b.get("type") == "tool_use"]
-                            await _save_and_log_request(req_id, _actual_model, original_model, start_time,
-                                         req_in, req_out, req_cache, protocol, False, thinking_type,
-                                         effort, client_ip, "free (no auth)", tool_names, tools_used=used,
-                                         request_body=request_body, response_body=data, free_model_ip=_actual_ip)
+                            used = [
+                                b["name"]
+                                for b in data.get("content", [])
+                                if b.get("type") == "tool_use"
+                            ]
+                            await _save_and_log_request(
+                                req_id,
+                                _actual_model,
+                                original_model,
+                                start_time,
+                                req_in,
+                                req_out,
+                                req_cache,
+                                protocol,
+                                False,
+                                thinking_type,
+                                effort,
+                                client_ip,
+                                "free (no auth)",
+                                tool_names,
+                                tools_used=used,
+                                request_body=request_body,
+                                response_body=data,
+                                free_model_ip=_actual_ip,
+                            )
                             oai_resp = anthropic_to_openai_responses(data, original_model)
-                            payload = _json_dumps_str({"type": "response.completed", "response": oai_resp}, ensure_ascii=False)
+                            payload = _json_dumps_str(
+                                {"type": "response.completed", "response": oai_resp},
+                                ensure_ascii=False,
+                            )
                             sse_body = f"data: {payload}\n\ndata: [DONE]\n\n".encode()
-                            return Response(content=sse_body, media_type="text/event-stream",
-                                            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
+                            return Response(
+                                content=sse_body,
+                                media_type="text/event-stream",
+                                headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+                            )
                     except FreeQuotaExhausted as e:
                         return _free_quota_exhausted_response(e, "anthropic")
                     except Exception as e:
                         _debug(f"  [free] free model attempt failed: {e}")
             retry_after = int(e.retry_after) + 1
             return Response(
-                content=_json_dumps_str({"error": {"message": f"All API keys exhausted. Retry after {retry_after}s.",
-                    "type": "api_error"}}),
-                status_code=503, media_type="application/json",
-                headers={"Retry-After": str(retry_after)})
+                content=_json_dumps_str(
+                    {
+                        "error": {
+                            "message": f"All API keys exhausted. Retry after {retry_after}s.",
+                            "type": "api_error",
+                        }
+                    }
+                ),
+                status_code=503,
+                media_type="application/json",
+                headers={"Retry-After": str(retry_after)},
+            )
         if not is_stream:
             # Response cache (mirrors the anthropic/chat handlers)
             cache_key = _response_cache.make_key(body, body_bytes=body_bytes)
@@ -8249,50 +10841,101 @@ async def responses(request: Request):
             if cached:
                 cached_body, cached_headers = cached
                 _debug(f"  [responses] response cache HIT ({len(cached_body)} bytes)")
-                return Response(content=cached_body, headers={**cached_headers, "X-Cache": "HIT"},
-                                media_type="application/json")
+                return Response(
+                    content=cached_body,
+                    headers={**cached_headers, "X-Cache": "HIT"},
+                    media_type="application/json",
+                )
             # Try free model first if available
             _geo_tunnel = getattr(request.state, "_geo_force_tunnel", False)
             try:
-                free_result = await _try_free_model_first(anthro_body, a_headers, "anthropic", model_id, forced_pool=getattr(request.state, "_geo_forced_pool", None))
+                free_result = await _try_free_model_first(
+                    anthro_body,
+                    a_headers,
+                    "anthropic",
+                    model_id,
+                    forced_pool=getattr(request.state, "_geo_forced_pool", None),
+                )
                 if free_result is not None:
                     resp, a_headers, _actual_model, _actual_ip = free_result
                     model_id = _actual_model
                 elif _geo_tunnel:
                     # Axe A: geo-restricted paid → must route through tunnel station
-                    async with _open_via_pool(endpoint, anthro_body, a_headers,
-                                             is_stream=False,
-                                             forced_pool=getattr(request.state, "_geo_forced_pool", None)) as resp:
+                    async with _open_via_pool(
+                        endpoint,
+                        anthro_body,
+                        a_headers,
+                        is_stream=False,
+                        forced_pool=getattr(request.state, "_geo_forced_pool", None),
+                    ) as resp:
                         a_headers = dict(resp.headers)
                 else:
-                    resp, a_headers = await _do_request_with_retry(endpoint, anthro_body, a_headers, "anthropic")
+                    resp, a_headers = await _do_request_with_retry(
+                        endpoint, anthro_body, a_headers, "anthropic"
+                    )
             except FreeQuotaExhausted as e:
                 return _free_quota_exhausted_response(e, "anthropic")
             except UpstreamError as e:
                 return JSONResponse(status_code=e.status_code, content={"error": str(e)})
             account_alias = _alias_for_key(a_headers.get("x-api-key", ""))
             if resp.status_code != 200:
-                await _log_and_save_error(req_id, model_id, original_model, start_time,
-                             resp.status_code, resp.text, protocol, is_stream, thinking_type,
-                             effort, client_ip, account_alias, tool_names,
-                             request_body=request_body, response_body={"error": resp.text[:2000]})
+                await _log_and_save_error(
+                    req_id,
+                    model_id,
+                    original_model,
+                    start_time,
+                    resp.status_code,
+                    resp.text,
+                    protocol,
+                    is_stream,
+                    thinking_type,
+                    effort,
+                    client_ip,
+                    account_alias,
+                    tool_names,
+                    request_body=request_body,
+                    response_body={"error": resp.text[:2000]},
+                )
                 # Pause key on credit/balance errors (400) and retry with alt key
-                if resp.status_code == 400 and any(x in resp.text for x in ("Insufficient balance", "Monthly usage limit")):
+                if resp.status_code == 400 and any(
+                    x in resp.text for x in ("Insufficient balance", "Monthly usage limit")
+                ):
                     failed_key = a_headers.get("x-api-key", "")
-                    _key_pauser.pause_key(failed_key, _key_pauser._max_pause, f"400 credit error: {_redact(resp.text, 80)}")
+                    _key_pauser.pause_key(
+                        failed_key,
+                        _key_pauser._max_pause,
+                        f"400 credit error: {_redact(resp.text, 80)}",
+                    )
                     alt = _find_alternative_key(failed_key)
                     if alt:
                         _log(f"  400 credit error on key, retrying with alternative key")
-                        a_headers = {"x-api-key": alt.get("api_key", ""), "Content-Type": "application/json",
-                                     "anthropic-version": "2023-06-01"}
+                        a_headers = {
+                            "x-api-key": alt.get("api_key", ""),
+                            "Content-Type": "application/json",
+                            "anthropic-version": "2023-06-01",
+                        }
                         try:
-                            resp, a_headers = await _do_request_with_retry(endpoint, anthro_body, a_headers, "anthropic")
+                            resp, a_headers = await _do_request_with_retry(
+                                endpoint, anthro_body, a_headers, "anthropic"
+                            )
                             if resp.status_code == 200:
                                 account_alias = _alias_for_key(a_headers.get("x-api-key", ""))
                             else:
-                                return Response(content=_json_dumps_str({"error": {"message": "All API keys exhausted. Check your billing."}}), status_code=503, media_type="application/json")
+                                return Response(
+                                    content=_json_dumps_str(
+                                        {
+                                            "error": {
+                                                "message": "All API keys exhausted. Check your billing."
+                                            }
+                                        }
+                                    ),
+                                    status_code=503,
+                                    media_type="application/json",
+                                )
                         except UpstreamError as e:
-                            return JSONResponse(status_code=e.status_code, content={"error": str(e)})
+                            return JSONResponse(
+                                status_code=e.status_code, content={"error": str(e)}
+                            )
                 # Convert 429/401/403 → 503 to avoid Claude Code auth window
                 if resp.status_code in (429, 401, 403):
                     return _openai_error(503, _auth_window_message(resp.status_code))
@@ -8303,9 +10946,17 @@ async def responses(request: Request):
                     err_msg = err_data.get("error", {}).get("message", resp.text[:200])
                 except Exception:
                     err_msg = resp.text[:200]
-                return Response(content=_json_dumps_str({"error": {"message": err_msg}}), status_code=resp.status_code, media_type="application/json")
+                return Response(
+                    content=_json_dumps_str({"error": {"message": err_msg}}),
+                    status_code=resp.status_code,
+                    media_type="application/json",
+                )
             try:
-                data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+                data = (
+                    resp.json()
+                    if resp.headers.get("content-type", "").startswith("application/json")
+                    else {}
+                )
             except Exception:
                 _debug(f"  ✗ non-JSON response from {endpoint}")
                 _log(f"  UPSTREAM DECODE ERROR: non-JSON response from {endpoint}")
@@ -8316,10 +10967,25 @@ async def responses(request: Request):
             req_cache = usage.get("cache_read_input_tokens", 0)
             _update_token_usage(model_id, req_in, req_out, req_cache)
             used = [b["name"] for b in data.get("content", []) if b.get("type") == "tool_use"]
-            await _save_and_log_request(req_id, model_id, original_model, start_time,
-                         req_in, req_out, req_cache, protocol, is_stream, thinking_type,
-                         effort, client_ip, account_alias, tool_names, tools_used=used if used else None,
-                         request_body=request_body, response_body=data)
+            await _save_and_log_request(
+                req_id,
+                model_id,
+                original_model,
+                start_time,
+                req_in,
+                req_out,
+                req_cache,
+                protocol,
+                is_stream,
+                thinking_type,
+                effort,
+                client_ip,
+                account_alias,
+                tool_names,
+                tools_used=used if used else None,
+                request_body=request_body,
+                response_body=data,
+            )
             oai_resp = anthropic_to_openai_responses(data, original_model)
             _response_body = _json_dumps_str(oai_resp, ensure_ascii=False).encode()
             if cache_key:
@@ -8330,34 +10996,68 @@ async def responses(request: Request):
         # Try free model first if available
         _geo_tunnel = getattr(request.state, "_geo_force_tunnel", False)
         try:
-            free_result = await _try_free_model_first(anthro_body, a_headers, "anthropic", model_id, forced_pool=getattr(request.state, "_geo_forced_pool", None))
+            free_result = await _try_free_model_first(
+                anthro_body,
+                a_headers,
+                "anthropic",
+                model_id,
+                forced_pool=getattr(request.state, "_geo_forced_pool", None),
+            )
             if free_result is not None:
                 resp, a_headers, _actual_model, _actual_ip = free_result
                 model_id = _actual_model
             elif _geo_tunnel:
                 # Axe A: geo-restricted paid → must route through tunnel station
-                async with _open_via_pool(endpoint, anthro_body, a_headers,
-                                         is_stream=False,
-                                         forced_pool=getattr(request.state, "_geo_forced_pool", None)) as resp:
+                async with _open_via_pool(
+                    endpoint,
+                    anthro_body,
+                    a_headers,
+                    is_stream=False,
+                    forced_pool=getattr(request.state, "_geo_forced_pool", None),
+                ) as resp:
                     a_headers = dict(resp.headers)
             else:
-                resp, a_headers = await _do_request_with_retry(endpoint, anthro_body, a_headers, "anthropic")
+                resp, a_headers = await _do_request_with_retry(
+                    endpoint, anthro_body, a_headers, "anthropic"
+                )
         except FreeQuotaExhausted as e:
             return _free_quota_exhausted_response(e, "anthropic")
         except UpstreamError as e:
             return JSONResponse(status_code=e.status_code, content={"error": str(e)})
         account_alias = _alias_for_key(a_headers.get("x-api-key", ""))
         if resp.status_code != 200:
-            await _log_and_save_error(req_id, model_id, original_model, start_time,
-                         resp.status_code, resp.text, protocol, True, thinking_type,
-                         effort, client_ip, account_alias, tool_names,
-                         request_body=request_body, response_body={"error": resp.text[:2000]})
+            await _log_and_save_error(
+                req_id,
+                model_id,
+                original_model,
+                start_time,
+                resp.status_code,
+                resp.text,
+                protocol,
+                True,
+                thinking_type,
+                effort,
+                client_ip,
+                account_alias,
+                tool_names,
+                request_body=request_body,
+                response_body={"error": resp.text[:2000]},
+            )
+
             async def err_stream():
                 yield b"data: [DONE]\n\n"
-            return StreamingResponse(err_stream(), media_type="text/event-stream",
-                                     headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
+
+            return StreamingResponse(
+                err_stream(),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+            )
         try:
-            data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+            data = (
+                resp.json()
+                if resp.headers.get("content-type", "").startswith("application/json")
+                else {}
+            )
         except Exception:
             _debug(f"  ✗ non-JSON response from {endpoint}")
             _log(f"  UPSTREAM DECODE ERROR: non-JSON response from {endpoint}")
@@ -8368,15 +11068,35 @@ async def responses(request: Request):
         req_cache = usage.get("cache_read_input_tokens", 0)
         _update_token_usage(model_id, req_in, req_out, req_cache)
         used = [b["name"] for b in data.get("content", []) if b.get("type") == "tool_use"]
-        await _save_and_log_request(req_id, model_id, original_model, start_time,
-                     req_in, req_out, req_cache, protocol, True, thinking_type,
-                     effort, client_ip, account_alias, tool_names, tools_used=used if used else None,
-                     request_body=request_body, response_body=data)
+        await _save_and_log_request(
+            req_id,
+            model_id,
+            original_model,
+            start_time,
+            req_in,
+            req_out,
+            req_cache,
+            protocol,
+            True,
+            thinking_type,
+            effort,
+            client_ip,
+            account_alias,
+            tool_names,
+            tools_used=used if used else None,
+            request_body=request_body,
+            response_body=data,
+        )
         oai_resp = anthropic_to_openai_responses(data, original_model)
-        payload = _json_dumps_str({"type": "response.completed", "response": oai_resp}, ensure_ascii=False)
+        payload = _json_dumps_str(
+            {"type": "response.completed", "response": oai_resp}, ensure_ascii=False
+        )
         sse_body = f"data: {payload}\n\ndata: [DONE]\n\n".encode()
-        return Response(content=sse_body, media_type="text/event-stream",
-                        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
+        return Response(
+            content=sse_body,
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+        )
 
     # ── OpenAI backend (double conversion) ──────────────────
     # Convert Anthropic → Chat Completions for the backend
@@ -8395,35 +11115,75 @@ async def responses(request: Request):
         # If a free model exists, try it before giving up
         if FREE_MODEL_MAP.get(model_id):
             try:
-                free_result = await _try_free_model_first(oai_body, {}, "openai", model_id, forced_pool=getattr(request.state, "_geo_forced_pool", None))
+                free_result = await _try_free_model_first(
+                    oai_body,
+                    {},
+                    "openai",
+                    model_id,
+                    forced_pool=getattr(request.state, "_geo_forced_pool", None),
+                )
                 if free_result is not None:
                     resp, _, _actual_model, _actual_ip = free_result
-                    data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+                    data = (
+                        resp.json()
+                        if resp.headers.get("content-type", "").startswith("application/json")
+                        else {}
+                    )
                     usage = data.get("usage", {})
                     req_in = usage.get("prompt_tokens", 0)
                     req_out = usage.get("completion_tokens", 0)
                     cache = _extract_cache_tokens(usage)
                     _update_token_usage(_actual_model, req_in, req_out, cache)
                     used = _extract_usage_tool_names(data)
-                    await _save_and_log_request(req_id, _actual_model, original_model, start_time,
-                                 req_in, req_out, cache, protocol, False, thinking_type,
-                                 effort, client_ip, "free (no auth)", tool_names, tools_used=used,
-                                 request_body=request_body, response_body=data, free_model_ip=_actual_ip)
+                    await _save_and_log_request(
+                        req_id,
+                        _actual_model,
+                        original_model,
+                        start_time,
+                        req_in,
+                        req_out,
+                        cache,
+                        protocol,
+                        False,
+                        thinking_type,
+                        effort,
+                        client_ip,
+                        "free (no auth)",
+                        tool_names,
+                        tools_used=used,
+                        request_body=request_body,
+                        response_body=data,
+                        free_model_ip=_actual_ip,
+                    )
                     oai_resp = openai_chat_to_responses(data, original_model)
-                    payload = _json_dumps_str({"type": "response.completed", "response": oai_resp}, ensure_ascii=False)
+                    payload = _json_dumps_str(
+                        {"type": "response.completed", "response": oai_resp}, ensure_ascii=False
+                    )
                     sse_body = f"data: {payload}\n\ndata: [DONE]\n\n".encode()
-                    return Response(content=sse_body, media_type="text/event-stream",
-                                    headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
+                    return Response(
+                        content=sse_body,
+                        media_type="text/event-stream",
+                        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+                    )
             except FreeQuotaExhausted as e:
                 return _free_quota_exhausted_response(e, "openai")
             except Exception as e:
                 _debug(f"  [free] free model attempt failed: {e}")
         retry_after = int(e.retry_after) + 1
         return Response(
-            content=_json_dumps_str({"error": {"message": f"All API keys exhausted. Retry after {retry_after}s.",
-                "type": "api_error", "code": "503"}}),
-            status_code=503, media_type="application/json",
-            headers={"Retry-After": str(retry_after)})
+            content=_json_dumps_str(
+                {
+                    "error": {
+                        "message": f"All API keys exhausted. Retry after {retry_after}s.",
+                        "type": "api_error",
+                        "code": "503",
+                    }
+                }
+            ),
+            status_code=503,
+            media_type="application/json",
+            headers={"Retry-After": str(retry_after)},
+        )
     is_stream = oai_body["stream"]
 
     if not is_stream:
@@ -8433,20 +11193,33 @@ async def responses(request: Request):
         if cached:
             cached_body, cached_headers = cached
             _debug(f"  [responses] response cache HIT ({len(cached_body)} bytes)")
-            return Response(content=cached_body, headers={**cached_headers, "X-Cache": "HIT"},
-                            media_type="application/json")
+            return Response(
+                content=cached_body,
+                headers={**cached_headers, "X-Cache": "HIT"},
+                media_type="application/json",
+            )
         # Try free model first if available
         _geo_tunnel = getattr(request.state, "_geo_force_tunnel", False)
         try:
-            free_result = await _try_free_model_first(oai_body, headers, "openai", model_id, forced_pool=getattr(request.state, "_geo_forced_pool", None))
+            free_result = await _try_free_model_first(
+                oai_body,
+                headers,
+                "openai",
+                model_id,
+                forced_pool=getattr(request.state, "_geo_forced_pool", None),
+            )
             if free_result is not None:
                 resp, headers, _actual_model, _actual_ip = free_result
                 model_id = _actual_model
             elif _geo_tunnel:
                 # Axe A: geo-restricted paid → must route through tunnel station
-                async with _open_via_pool(endpoint, oai_body, headers,
-                                         is_stream=False,
-                                         forced_pool=getattr(request.state, "_geo_forced_pool", None)) as resp:
+                async with _open_via_pool(
+                    endpoint,
+                    oai_body,
+                    headers,
+                    is_stream=False,
+                    forced_pool=getattr(request.state, "_geo_forced_pool", None),
+                ) as resp:
                     headers = dict(resp.headers)
             else:
                 resp, headers = await _do_request_with_retry(endpoint, oai_body, headers, "openai")
@@ -8456,10 +11229,23 @@ async def responses(request: Request):
             return JSONResponse(status_code=e.status_code, content={"error": str(e)})
         account_alias = _alias_for_key(_key_from_headers(headers, "openai"))
         if resp.status_code != 200:
-            await _log_and_save_error(req_id, model_id, original_model, start_time,
-                         resp.status_code, resp.text, protocol, is_stream, thinking_type,
-                         effort, client_ip, account_alias, tool_names,
-                         request_body=request_body, response_body={"error": resp.text[:2000]})
+            await _log_and_save_error(
+                req_id,
+                model_id,
+                original_model,
+                start_time,
+                resp.status_code,
+                resp.text,
+                protocol,
+                is_stream,
+                thinking_type,
+                effort,
+                client_ip,
+                account_alias,
+                tool_names,
+                request_body=request_body,
+                response_body={"error": resp.text[:2000]},
+            )
             # Convert 429/401/403 → 503 to avoid Claude Code auth window
             if resp.status_code in (429, 401, 403):
                 return _openai_error(503, _auth_window_message(resp.status_code))
@@ -8470,7 +11256,11 @@ async def responses(request: Request):
                 err_msg = err_data.get("error", {}).get("message", resp.text[:200])
             except Exception:
                 err_msg = resp.text[:200]
-            return Response(content=_json_dumps_str({"error": {"message": err_msg}}), status_code=resp.status_code, media_type="application/json")
+            return Response(
+                content=_json_dumps_str({"error": {"message": err_msg}}),
+                status_code=resp.status_code,
+                media_type="application/json",
+            )
         try:
             data = resp.json()
         except Exception:
@@ -8483,7 +11273,11 @@ async def responses(request: Request):
         if is_responses_format:
             req_in = usage.get("input_tokens", 0)
             req_out = usage.get("output_tokens", 0)
-            _inp_det = usage.get("input_tokens_details") if isinstance(usage.get("input_tokens_details"), dict) else {}
+            _inp_det = (
+                usage.get("input_tokens_details")
+                if isinstance(usage.get("input_tokens_details"), dict)
+                else {}
+            )
             cache = _inp_det.get("cached_tokens", 0)
         else:
             req_in = usage.get("prompt_tokens", 0)
@@ -8491,13 +11285,32 @@ async def responses(request: Request):
             cache = _extract_cache_tokens(usage)
         _update_token_usage(model_id, req_in, req_out, cache)
         if is_responses_format:
-            used = [b["name"] for b in data.get("output", []) if isinstance(b, dict) and b.get("type") == "function_call"]
+            used = [
+                b["name"]
+                for b in data.get("output", [])
+                if isinstance(b, dict) and b.get("type") == "function_call"
+            ]
         else:
             used = _extract_usage_tool_names(data)
-        await _save_and_log_request(req_id, model_id, original_model, start_time,
-                     req_in, req_out, cache, protocol, is_stream, thinking_type,
-                     effort, client_ip, account_alias, tool_names, tools_used=used if used else None,
-                     request_body=request_body, response_body=data)
+        await _save_and_log_request(
+            req_id,
+            model_id,
+            original_model,
+            start_time,
+            req_in,
+            req_out,
+            cache,
+            protocol,
+            is_stream,
+            thinking_type,
+            effort,
+            client_ip,
+            account_alias,
+            tool_names,
+            tools_used=used if used else None,
+            request_body=request_body,
+            response_body=data,
+        )
         if is_responses_format:
             # Upstream already returned Responses API format — normalize and pass through
             oai_resp = data
@@ -8516,7 +11329,13 @@ async def responses(request: Request):
     # Try free model first if available
     _geo_tunnel = getattr(request.state, "_geo_force_tunnel", False)
     try:
-        free_result = await _try_free_model_first(oai_body, headers, "openai", model_id, forced_pool=getattr(request.state, "_geo_forced_pool", None))
+        free_result = await _try_free_model_first(
+            oai_body,
+            headers,
+            "openai",
+            model_id,
+            forced_pool=getattr(request.state, "_geo_forced_pool", None),
+        )
         if free_result is not None:
             resp, headers, _actual_model, _actual_ip = free_result
             model_id = _actual_model
@@ -8524,20 +11343,42 @@ async def responses(request: Request):
             # Axe A: geo-restricted paid → must route through tunnel station.
             # _open_via_pool closes the response on exit, so the entire
             # streaming collection must happen inside this block.
-            async with _open_via_pool(endpoint, oai_body, headers,
-                                     is_stream=True,
-                                     forced_pool=getattr(request.state, "_geo_forced_pool", None)) as resp:
+            async with _open_via_pool(
+                endpoint,
+                oai_body,
+                headers,
+                is_stream=True,
+                forced_pool=getattr(request.state, "_geo_forced_pool", None),
+            ) as resp:
                 headers = dict(resp.headers)
                 account_alias = _alias_for_key(_key_from_headers(headers, "openai"))
                 if resp.status_code != 200:
-                    await _log_and_save_error(req_id, model_id, original_model, start_time,
-                                 resp.status_code, resp.text, protocol, True, thinking_type,
-                                 effort, client_ip, account_alias, tool_names,
-                                 request_body=request_body, response_body={"error": resp.text[:2000]})
+                    await _log_and_save_error(
+                        req_id,
+                        model_id,
+                        original_model,
+                        start_time,
+                        resp.status_code,
+                        resp.text,
+                        protocol,
+                        True,
+                        thinking_type,
+                        effort,
+                        client_ip,
+                        account_alias,
+                        tool_names,
+                        request_body=request_body,
+                        response_body={"error": resp.text[:2000]},
+                    )
+
                     async def err_stream():
                         yield b"data: [DONE]\n\n"
-                    return StreamingResponse(err_stream(), media_type="text/event-stream",
-                                             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
+
+                    return StreamingResponse(
+                        err_stream(),
+                        media_type="text/event-stream",
+                        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+                    )
                 collected_chunks = []
                 collected_reasoning_chunks = []
                 final_usage = None
@@ -8558,7 +11399,7 @@ async def responses(request: Request):
                         final_usage = chunk_usage
                     choices = chunk.get("choices", [])
                     if not choices or not isinstance(choices, list):
-                        #可能是 Responses API format — try converting
+                        # 可能是 Responses API format — try converting
                         converted = _responses_sse_to_chat_deltas(data_str)
                         if converted is None:
                             continue
@@ -8578,17 +11419,28 @@ async def responses(request: Request):
                 full_content = "".join(collected_chunks) or ""
                 full_reasoning = "".join(collected_reasoning_chunks) or ""
                 chat_resp = {
-                    "choices": [{
-                        "message": {"content": full_content, "role": "assistant", "reasoning_content": full_reasoning},
-                        "finish_reason": "stop"
-                    }],
-                    "usage": final_usage or {"prompt_tokens": 0, "completion_tokens": 0}
+                    "choices": [
+                        {
+                            "message": {
+                                "content": full_content,
+                                "role": "assistant",
+                                "reasoning_content": full_reasoning,
+                            },
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    "usage": final_usage or {"prompt_tokens": 0, "completion_tokens": 0},
                 }
                 oai_resp = openai_chat_to_responses(chat_resp, original_model)
-                payload = _json_dumps_str({"type": "response.completed", "response": oai_resp}, ensure_ascii=False)
+                payload = _json_dumps_str(
+                    {"type": "response.completed", "response": oai_resp}, ensure_ascii=False
+                )
                 sse_body = f"data: {payload}\n\ndata: [DONE]\n\n".encode()
-                return Response(content=sse_body, media_type="text/event-stream",
-                                headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
+                return Response(
+                    content=sse_body,
+                    media_type="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+                )
         else:
             resp, headers = await _do_request_with_retry(endpoint, oai_body, headers, "openai")
     except FreeQuotaExhausted as e:
@@ -8597,14 +11449,32 @@ async def responses(request: Request):
         return JSONResponse(status_code=e.status_code, content={"error": str(e)})
     account_alias = _alias_for_key(_key_from_headers(headers, "openai"))
     if resp.status_code != 200:
-        await _log_and_save_error(req_id, model_id, original_model, start_time,
-                     resp.status_code, resp.text, protocol, True, thinking_type,
-                     effort, client_ip, account_alias, tool_names,
-                     request_body=request_body, response_body={"error": resp.text[:2000]})
+        await _log_and_save_error(
+            req_id,
+            model_id,
+            original_model,
+            start_time,
+            resp.status_code,
+            resp.text,
+            protocol,
+            True,
+            thinking_type,
+            effort,
+            client_ip,
+            account_alias,
+            tool_names,
+            request_body=request_body,
+            response_body={"error": resp.text[:2000]},
+        )
+
         async def err_stream():
             yield b"data: [DONE]\n\n"
-        return StreamingResponse(err_stream(), media_type="text/event-stream",
-                                 headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
+
+        return StreamingResponse(
+            err_stream(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+        )
 
     # Collect streaming response and convert to Responses API format
     collected_chunks = []
@@ -8629,7 +11499,7 @@ async def responses(request: Request):
         # Collect text content from delta
         choices = chunk.get("choices", [])
         if not choices or not isinstance(choices, list):
-            #可能是 Responses API format — try converting
+            # 可能是 Responses API format — try converting
             converted = _responses_sse_to_chat_deltas(data_str)
             if converted is None:
                 continue
@@ -8658,20 +11528,31 @@ async def responses(request: Request):
 
     # Create Chat Completions format response for conversion
     chat_resp = {
-        "choices": [{
-            "message": {"content": full_content, "role": "assistant", "reasoning_content": full_reasoning},
-            "finish_reason": "stop"
-        }],
-        "usage": final_usage or {"prompt_tokens": 0, "completion_tokens": 0}
+        "choices": [
+            {
+                "message": {
+                    "content": full_content,
+                    "role": "assistant",
+                    "reasoning_content": full_reasoning,
+                },
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": final_usage or {"prompt_tokens": 0, "completion_tokens": 0},
     }
 
     # Convert to Responses API format
     oai_resp = openai_chat_to_responses(chat_resp, original_model)
     # Return as single SSE block (data-only format)
-    payload = _json_dumps_str({"type": "response.completed", "response": oai_resp}, ensure_ascii=False)
+    payload = _json_dumps_str(
+        {"type": "response.completed", "response": oai_resp}, ensure_ascii=False
+    )
     sse_body = f"data: {payload}\n\ndata: [DONE]\n\n".encode()
-    return Response(content=sse_body, media_type="text/event-stream",
-                    headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
+    return Response(
+        content=sse_body,
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+    )
 
 
 class ServerManager:
@@ -8689,6 +11570,7 @@ class ServerManager:
 
     def start(self):
         from uvicorn import Config, Server
+
         with self._lock:
             if self.is_running:
                 _debug(f"  [server] start skipped — already running on {self.host}:{self.port}")
@@ -8709,12 +11591,24 @@ class ServerManager:
 
             try:
                 import uvloop  # noqa: F401
+
                 _loop = "uvloop"
             except ImportError:
                 _loop = "asyncio"
-            config = Config(self.app, host=self.host, port=self.port, log_level="info", log_config=None,
-                            timeout_keep_alive=15, backlog=4096, limit_concurrency=2000,
-                            loop=_loop, http="httptools", ws="none", timeout_graceful_shutdown=5)
+            config = Config(
+                self.app,
+                host=self.host,
+                port=self.port,
+                log_level="info",
+                log_config=None,
+                timeout_keep_alive=15,
+                backlog=4096,
+                limit_concurrency=2000,
+                loop=_loop,
+                http="httptools",
+                ws="none",
+                timeout_graceful_shutdown=5,
+            )
             self._server = Server(config)
             self._thread = threading.Thread(target=self._server.run, daemon=True)
             self._thread.start()
@@ -8763,6 +11657,7 @@ class ServerManager:
         avoiding zombie child processes from subprocess.Popen + os._exit.
         """
         import sys
+
         _log("Full restart: replacing process...")
         # Flush all output before exec
         for stream in (sys.stdout, sys.stderr):
@@ -8773,6 +11668,7 @@ class ServerManager:
 # ── Mono-instance lock [CRITIC(7)] ────────────────────────────────────
 _INSTANCE_LOCK_FDS = []  # keep fds referenced: GC closing them would release the lock
 
+
 def _acquire_instance_lock(lock_path: str = os.path.join("logs", "opencode.lock")) -> None:
     """Take a non-blocking exclusive file lock; exit if another instance holds it.
 
@@ -8782,24 +11678,32 @@ def _acquire_instance_lock(lock_path: str = os.path.join("logs", "opencode.lock"
     message instead of corrupting state.
     """
     import sys
+
     try:
         os.makedirs(os.path.dirname(lock_path) or ".", exist_ok=True)
         fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
     except OSError as e:
-        _log(f"WARNING: cannot create lock file {lock_path}: {e} — continuing without mono-instance guard")
+        _log(
+            f"WARNING: cannot create lock file {lock_path}: {e} — continuing without mono-instance guard"
+        )
         return
     try:
         if os.name == "nt":
             import msvcrt
+
             msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
         else:
             import fcntl
+
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
         # stderr print: the Rich log panel is never built when we exit here,
         # so this is the only place the user sees why the instance refused to start.
-        print(f"FATAL: another opencode-proxy instance is already running (lock held: {lock_path})",
-              file=sys.stderr, flush=True)
+        print(
+            f"FATAL: another opencode-proxy instance is already running (lock held: {lock_path})",
+            file=sys.stderr,
+            flush=True,
+        )
         _log(f"FATAL: another opencode-proxy instance is already running (lock held: {lock_path})")
         try:
             os.close(fd)
@@ -8822,7 +11726,9 @@ if __name__ == "__main__":
     import traceback as _traceback
 
     parser = argparse.ArgumentParser(description="OpenCode Proxy")
-    parser.add_argument("--no-gui", action="store_true", help="Force terminal mode (no system tray)")
+    parser.add_argument(
+        "--no-gui", action="store_true", help="Force terminal mode (no system tray)"
+    )
     parser.add_argument("--gui", action="store_true", help="(default, no-op for backward compat)")
     parser.add_argument("--port", type=int, default=None, help=f"API port (default: {PORT})")
     _cli_args = parser.parse_args()
@@ -8862,8 +11768,12 @@ if __name__ == "__main__":
             from gui import run_gui
         except ImportError:
             # GUI is the default — fall back to terminal mode instead of exiting.
-            print("GUI dependencies not installed (pystray Pillow pywebview). Falling back to terminal mode.")
-            print("Install with: pip install pystray Pillow pywebview  (or use --no-gui to skip this check)")
+            print(
+                "GUI dependencies not installed (pystray Pillow pywebview). Falling back to terminal mode."
+            )
+            print(
+                "Install with: pip install pystray Pillow pywebview  (or use --no-gui to skip this check)"
+            )
             use_gui = False
     if use_gui:
         run_gui(mgr, HOST, PORT, WEB_PORT)

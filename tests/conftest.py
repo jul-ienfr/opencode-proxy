@@ -9,5 +9,6 @@ def _reset_disable_mapping():
     """Ensure DISABLE_MAPPING is False during tests unless explicitly set."""
     os.environ.pop("DISABLE_MAPPING", None)
     import config.settings as s
+
     s.DISABLE_MAPPING = False
     yield

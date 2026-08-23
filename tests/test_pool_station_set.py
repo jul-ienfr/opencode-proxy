@@ -16,6 +16,7 @@ test_pool_connection_failure.py, no docker, no loop tasks unless noted):
   * downscale 4→2 with a station-3 entry already queued → the worker
     drains it as a no-op (single-flight C4/C5 intact, nothing rotated).
 """
+
 import asyncio
 import time
 
@@ -28,8 +29,9 @@ class _Station:
     """Minimal station double (same shape as test_pool_connection_failure,
     plus the slice get_status() reads)."""
 
-    def __init__(self, sid, *, enabled=True, proxy_mode="vpn",
-                 status="connected", current_ip=None, quota=15):
+    def __init__(
+        self, sid, *, enabled=True, proxy_mode="vpn", status="connected", current_ip=None, quota=15
+    ):
         self._station = sid
         self.enabled = enabled
         self.proxy_mode = proxy_mode
@@ -65,9 +67,11 @@ def _stations3(p):
 
 # ── best-station selection (double embrayage over N > 2) ─────────
 
+
 def test_best_station_prefers_first_usable():
     s1, s2, s3 = _stations3(p := _pool(_Station(1)))
     assert p._best_station() is s1, "preference A unchanged with N=3"
+
 
 def test_best_station_skips_bad_stations_down_to_the_last():
     s1, s2, s3 = _stations3(p := _pool(_Station(1)))
@@ -76,6 +80,7 @@ def test_best_station_skips_bad_stations_down_to_the_last():
     p.notify_connection_failure(s2)
     assert p._best_station() is s3, "a single surviving healthy station is found"
 
+
 def test_best_station_none_when_all_bad():
     """C1 only protects the LAST STANDING station — a station that is
     merely disconnected (e.g. compose up failed) is not usable either,
@@ -83,8 +88,9 @@ def test_best_station_none_when_all_bad():
     s1, s2, s3 = _stations3(p := _pool(_Station(1)))
     p.notify_connection_failure(s1)
     p.notify_connection_failure(s2)
-    s3.status = "disconnected"          # not bad-marked, but not connected
+    s3.status = "disconnected"  # not bad-marked, but not connected
     assert p._best_station() is None
+
 
 def test_c1_last_standing_holds_with_3():
     """Never bad-mark the last standing station — with 3 stations the guard
@@ -92,26 +98,29 @@ def test_c1_last_standing_holds_with_3():
     s1, s2, s3 = _stations3(p := _pool(_Station(1)))
     p.notify_connection_failure(s1)
     p.notify_connection_failure(s2)
-    p.notify_connection_failure(s3)     # last one standing
-    assert p._per_station(s3)["bad_until"] is None, \
+    p.notify_connection_failure(s3)  # last one standing
+    assert p._per_station(s3)["bad_until"] is None, (
         "C1: the last usable station is never bad-marked"
+    )
     assert p._best_station() is s3
 
 
 # ── set_stations (hot-reload swap) ───────────────────────────────
 
+
 def test_set_stations_sorts_numerically():
     s1, s2, s3 = _Station(1), _Station(2), _Station(3)
     p = _pool(s1)
-    p.set_stations([s3, s1, s2])        # out of order input
-    assert [s._station for s in p._stations] == [1, 2, 3], \
-        "station 1 stays the preferred pass"
+    p.set_stations([s3, s1, s2])  # out of order input
+    assert [s._station for s in p._stations] == [1, 2, 3], "station 1 stays the preferred pass"
+
 
 def test_set_stations_filters_none():
     s1, s2 = _Station(1), _Station(2)
     p = _pool(s1)
     p.set_stations([s1, None, s2])
     assert [s._station for s in p._stations] == [1, 2]
+
 
 def test_downscale_prunes_removed_stations_only():
     """4→2: the removed stations' per-state, pending flag and in-flight
@@ -122,7 +131,7 @@ def test_downscale_prunes_removed_stations_only():
     p._per_station(s1)["request_count"] = 5
     p._per_station(s3)["request_count"] = 7
     p._pending.add(3)
-    p._rotation_tasks[3] = object()     # dummy in-flight marker (sync test)
+    p._rotation_tasks[3] = object()  # dummy in-flight marker (sync test)
     p._rotation_tasks[4] = object()
 
     p.set_stations([s1, s2])
@@ -130,8 +139,8 @@ def test_downscale_prunes_removed_stations_only():
     assert [s._station for s in p._stations] == [1, 2]
     assert p._per_station(s1)["request_count"] == 5, "survivor state preserved"
     assert 3 not in p._per and 4 not in p._per
-    assert 3 not in p._pending and 3 not in p._rotation_tasks \
-        and 4 not in p._rotation_tasks
+    assert 3 not in p._pending and 3 not in p._rotation_tasks and 4 not in p._rotation_tasks
+
 
 def test_get_status_after_downscale_only_lists_active():
     s1, s2, s3 = _Station(1), _Station(2), _Station(3)
@@ -144,17 +153,19 @@ def test_get_status_after_downscale_only_lists_active():
 
 # ── worker guard: stale queue entries are no-ops ─────────────────
 
+
 def test_queued_entry_for_downscaled_station_is_noop():
     """A station queued BEFORE the downscale must drain as a no-op: the
     worker survives the swap, nothing rotates, single-flight stays intact."""
+
     async def _go():
         s1, s2, s3 = _Station(1), _Station(2), _Station(3)
         p = _pool(s1)
         p.set_stations([s1, s2, s3])
-        p._rotation_queue.put_nowait(s3)    # queued, then downscaled
+        p._rotation_queue.put_nowait(s3)  # queued, then downscaled
         p.set_stations([s1, s2])
         task = asyncio.create_task(p._rotation_worker())
-        await asyncio.sleep(0.05)           # let the worker drain the queue
+        await asyncio.sleep(0.05)  # let the worker drain the queue
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
