@@ -54,7 +54,6 @@ x-gluetun-multi-env: &gluetun-multi-env
   # OV protocol fallback (udp 1194 vs tcp 443) — global fallback, per-station
   # OPENVPN_PROTOCOL_STATIONn (auto hétérogène) overrides it. Inert under WG.
   OPENVPN_PROTOCOL: ${OPENVPN_PROTOCOL:-udp}
-  OPENVPN_ENDPOINT_PORT: ${OPENVPN_ENDPOINT_PORT:-1194}
 
 services:
   opencode-proxy:
@@ -152,7 +151,6 @@ services:
       # OV protocol udp/tcp (1194 vs 443) — per-station, inert under WG.
       # Auto hétérogène: chaque station a son propre proto (STATIONn), global fallback.
       - OPENVPN_PROTOCOL=${OPENVPN_PROTOCOL_STATION1:-${OPENVPN_PROTOCOL:-udp}}
-      - OPENVPN_ENDPOINT_PORT=${OPENVPN_ENDPOINT_PORT_STATION1:-${OPENVPN_ENDPOINT_PORT:-1194}}
       # [incident 17/08] gluetun's country enum uses SPACED names
       # ("United Kingdom", "Czech Republic") — NordVPN file-style
       # "United_Kingdom"/"Czechia" are rejected with a WARN "not in
@@ -243,7 +241,6 @@ services:
       - OPENVPN_CUSTOM_CONFIG=${OPENVPN_CUSTOM_CONFIG:-}
       # OV protocol udp/tcp — per-station hétérogène, inert sous WG.
       - OPENVPN_PROTOCOL=${OPENVPN_PROTOCOL_STATION2:-${OPENVPN_PROTOCOL:-udp}}
-      - OPENVPN_ENDPOINT_PORT=${OPENVPN_ENDPOINT_PORT_STATION2:-${OPENVPN_ENDPOINT_PORT:-1194}}
       # [incident 17/08] gluetun's country enum uses SPACED names
       # ("United Kingdom", "Czech Republic") — NordVPN file-style
       # "United_Kingdom"/"Czechia" are rejected with a WARN "not in
@@ -293,7 +290,6 @@ services:
       <<: *gluetun-multi-env
       VPN_TYPE: ${VPN_TYPE_STATION3:-openvpn}
       OPENVPN_PROTOCOL: ${OPENVPN_PROTOCOL_STATION3:-${OPENVPN_PROTOCOL:-udp}}
-      OPENVPN_ENDPOINT_PORT: ${OPENVPN_ENDPOINT_PORT_STATION3:-${OPENVPN_ENDPOINT_PORT:-1194}}
       HTTPPROXY_LISTENING_ADDRESS: :8890
       SOCKS5_LISTENING_ADDRESS: :1082
     volumes:
@@ -313,7 +309,6 @@ services:
       <<: *gluetun-multi-env
       VPN_TYPE: ${VPN_TYPE_STATION4:-openvpn}
       OPENVPN_PROTOCOL: ${OPENVPN_PROTOCOL_STATION4:-${OPENVPN_PROTOCOL:-udp}}
-      OPENVPN_ENDPOINT_PORT: ${OPENVPN_ENDPOINT_PORT_STATION4:-${OPENVPN_ENDPOINT_PORT:-1194}}
       HTTPPROXY_LISTENING_ADDRESS: :8891
       SOCKS5_LISTENING_ADDRESS: :1083
     volumes:
@@ -333,7 +328,6 @@ services:
       <<: *gluetun-multi-env
       VPN_TYPE: ${VPN_TYPE_STATION5:-openvpn}
       OPENVPN_PROTOCOL: ${OPENVPN_PROTOCOL_STATION5:-${OPENVPN_PROTOCOL:-udp}}
-      OPENVPN_ENDPOINT_PORT: ${OPENVPN_ENDPOINT_PORT_STATION5:-${OPENVPN_ENDPOINT_PORT:-1194}}
       HTTPPROXY_LISTENING_ADDRESS: :8892
       SOCKS5_LISTENING_ADDRESS: :1084
     volumes:
@@ -353,7 +347,6 @@ services:
       <<: *gluetun-multi-env
       VPN_TYPE: ${VPN_TYPE_STATION6:-openvpn}
       OPENVPN_PROTOCOL: ${OPENVPN_PROTOCOL_STATION6:-${OPENVPN_PROTOCOL:-udp}}
-      OPENVPN_ENDPOINT_PORT: ${OPENVPN_ENDPOINT_PORT_STATION6:-${OPENVPN_ENDPOINT_PORT:-1194}}
       HTTPPROXY_LISTENING_ADDRESS: :8893
       SOCKS5_LISTENING_ADDRESS: :1085
     volumes:
@@ -373,7 +366,6 @@ services:
       <<: *gluetun-multi-env
       VPN_TYPE: ${VPN_TYPE_STATION7:-openvpn}
       OPENVPN_PROTOCOL: ${OPENVPN_PROTOCOL_STATION7:-${OPENVPN_PROTOCOL:-udp}}
-      OPENVPN_ENDPOINT_PORT: ${OPENVPN_ENDPOINT_PORT_STATION7:-${OPENVPN_ENDPOINT_PORT:-1194}}
       HTTPPROXY_LISTENING_ADDRESS: :8894
       SOCKS5_LISTENING_ADDRESS: :1086
     volumes:
@@ -393,7 +385,6 @@ services:
       <<: *gluetun-multi-env
       VPN_TYPE: ${VPN_TYPE_STATION8:-openvpn}
       OPENVPN_PROTOCOL: ${OPENVPN_PROTOCOL_STATION8:-${OPENVPN_PROTOCOL:-udp}}
-      OPENVPN_ENDPOINT_PORT: ${OPENVPN_ENDPOINT_PORT_STATION8:-${OPENVPN_ENDPOINT_PORT:-1194}}
       HTTPPROXY_LISTENING_ADDRESS: :8895
       SOCKS5_LISTENING_ADDRESS: :1087
     volumes:
@@ -413,7 +404,6 @@ services:
       <<: *gluetun-multi-env
       VPN_TYPE: ${VPN_TYPE_STATION9:-openvpn}
       OPENVPN_PROTOCOL: ${OPENVPN_PROTOCOL_STATION9:-${OPENVPN_PROTOCOL:-udp}}
-      OPENVPN_ENDPOINT_PORT: ${OPENVPN_ENDPOINT_PORT_STATION9:-${OPENVPN_ENDPOINT_PORT:-1194}}
       HTTPPROXY_LISTENING_ADDRESS: :8896
       SOCKS5_LISTENING_ADDRESS: :1088
     volumes:
@@ -433,7 +423,6 @@ services:
       <<: *gluetun-multi-env
       VPN_TYPE: ${VPN_TYPE_STATION10:-openvpn}
       OPENVPN_PROTOCOL: ${OPENVPN_PROTOCOL_STATION10:-${OPENVPN_PROTOCOL:-udp}}
-      OPENVPN_ENDPOINT_PORT: ${OPENVPN_ENDPOINT_PORT_STATION10:-${OPENVPN_ENDPOINT_PORT:-1194}}
       HTTPPROXY_LISTENING_ADDRESS: :8897
       SOCKS5_LISTENING_ADDRESS: :1089
     volumes:

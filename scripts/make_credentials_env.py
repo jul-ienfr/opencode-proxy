@@ -119,11 +119,7 @@ def _sync_control_api_key() -> bool:
     if not key:
         print(f"WARN: could not read ip_rotation.control_api_key from {CONFIG_PATH} — credentials.env not updated")
         return False
-    # Gluetun control server auth: VPN_CONTROL_API_KEY is used by healthcheck and vpn_manager
-    # Also set HTTP_CONTROL_SERVER_AUTH for compatibility (some gluetun versions)
     _upsert_env_var(DST, "VPN_CONTROL_API_KEY", key)
-    # HTTP_CONTROL_SERVER_AUTH is a JSON role, but for simple key auth, set to key as well
-    # The docker-compose healthcheck uses X-API-Key: $$VPN_CONTROL_API_KEY
     print(f"OK: {DST} VPN_CONTROL_API_KEY synced from config.yaml")
     return True
 
