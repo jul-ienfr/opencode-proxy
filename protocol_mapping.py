@@ -743,7 +743,7 @@ def openai_to_anthropic_request(oai_body: dict) -> dict:
             if t.get("type") == "function":
                 fn = t.get("function", {})
                 if not fn.get("name"):
-                    _debug(f"  [convert] SKIP function tool without name")
+                    _debug("  [convert] SKIP function tool without name")
                     continue
                 anthro_tools.append(
                     {

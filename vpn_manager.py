@@ -23,7 +23,15 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
+
+import shared_state
+
+# [plan v10 §14.1.9] Sérialise le read-modify-write du .env entre managers
+# concurrents (hot-reload vs auto-flip hétérogène). La section critique est
+# 100% synchrone (file I/O, aucun await) → threading.Lock suffit.
+_ENV_RW_LOCK = threading.Lock()
 
 # ── Docker Desktop auto-launch (Windows) ───────────────────────────────
 # If Docker Desktop is not running, `docker ps` fails with "error during connect".
@@ -138,9 +146,9 @@ async def ensure_docker_running(timeout: int = 60) -> bool:
 
 # Cross-module registry of active VPN managers ([plan 18/08 §1]): set by
 # opencode.py's lifespan / _apply_station_count, read by _apply_stack to
-# scope a stack flip to the currently configured stations. shared_state is
-# a plain data module (no imports) — no import cycle.
-import shared_state
+# scope a stack flip to the currently configured stations. shared_state est
+# un module de données pur (aucun import) — l'import en tête ne crée aucun
+# cycle (fix E402 v10).
 
 logger = logging.getLogger(__name__)
 
@@ -1821,7 +1829,7 @@ class VPNManager:
             if ip:
                 logger.debug("[vpn] probe ok %s via %s", url, self.socks5_url)
             return ip or None
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.debug("[vpn] probe timeout %s (%.1fs) via %s", url, per_attempt, self.socks5_url)
             return None
         except Exception as e:
@@ -3346,6 +3354,7 @@ class VPNManager:
             station_keys = {f"VPN_TYPE_STATION{s}" for s in stations}
         compose_path = self._compose_file_path()
         env_path = os.path.join(os.path.dirname(compose_path), ".env")
+        _ENV_RW_LOCK.acquire()
         try:
             # Read-modify-write: NEVER touch the other .env keys (secrets
             # live there) — only the active stations' VPN_TYPE_STATION vars.
@@ -3385,6 +3394,8 @@ class VPNManager:
         except OSError as e:
             logger.error("[vpn] _apply_stack: cannot write %s: %s", env_path, e)
             return False
+        finally:
+            _ENV_RW_LOCK.release()
         # [fix 19/08] No-op check AFTER the .env write: the env must be
         # re-synced even when the stack is already effective — the compose
         # default ${VPN_TYPE_STATIONn:-openvpn} would otherwise boot a newly
@@ -4550,8 +4561,20 @@ class VPNManager:
             state_path = self._get_state_path()
             if not os.path.exists(state_path):
                 return
-            with open(state_path) as f:
-                state = json.load(f)
+            try:
+                with open(state_path) as f:
+                    state = json.load(f)
+            except (json.JSONDecodeError, OSError) as _corrupt:
+                # [plan v10 §14.3.7] le .bak last-good (écrit AVANT chaque
+                # overwrite §4.1) n'était JAMAIS tenté au chargement : une
+                # corruption du fichier principal persistait jusqu'au
+                # prochain save réussi. Fallback last-good maintenant.
+                bak = state_path + ".bak"
+                logger.warning(
+                    "[vpn] state corrupt (%s) — retry last-good %s", _corrupt, bak
+                )
+                with open(bak) as f:
+                    state = json.load(f)
             self._ip_history = state.get("ip_history", [])
             self._total_switches = state.get("total_switches", 0)
             # Restore identity index with clamp (config may have shrunk)

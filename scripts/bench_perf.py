@@ -20,8 +20,8 @@ import argparse
 import asyncio
 import json
 import os
-import statistics
 import sqlite3
+import statistics
 import sys
 import tempfile
 import time

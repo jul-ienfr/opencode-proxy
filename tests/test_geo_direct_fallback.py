@@ -1,5 +1,5 @@
 import asyncio
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import config.settings as st
 import opencode
@@ -115,7 +115,7 @@ def test_direct_incompatible_via_warning_headers_and_state(monkeypatch):
         assert "United States" in h.get("X-Geo-Allowed", "")
         return req_inner
 
-    req = asyncio.run(_run())
+    asyncio.run(_run())
 
 
 def test_unknown_direct_via_warning(monkeypatch):
@@ -138,7 +138,7 @@ def test_unknown_direct_via_warning(monkeypatch):
     opencode._direct_ip_cache["ip"] = "unknown"
     opencode._direct_country_cache.update({"country": "unknown", "ip": "unknown", "ts": 9999999999})
     req = _fake_request()
-    res = asyncio.run(opencode._enforce_geo_gate(route, req, is_stream=False, protocol="openai"))
+    asyncio.run(opencode._enforce_geo_gate(route, req, is_stream=False, protocol="openai"))
     assert getattr(req.state, "_geo_via_vpn_while_direct", False) is True
     # i18n unknown message
     msg = opencode._geo_i18n("direct_via_vpn_unknown", "fr").format(station=1, vpnCountry="United States", vpnIp="5.5.5.5", model="x", allowed="United States")

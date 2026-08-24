@@ -1336,7 +1336,11 @@ class FreeIPPool:
 
             _sr = getattr(_ss_prune, "shared_rotation", None)
             if _sr is not None and hasattr(_sr, "prune_stations"):
-                _sr.prune_stations(len(self._stations))
+                # [plan v10 §14.3.12] passer le MAX des sids ACTIFS, pas le
+                # count : un ensemble non contigu {1,3} avec count=2 ferait
+                # prune_stations(2) supprimer l'état de la station 3 active.
+                if self._station_ids:
+                    _sr.prune_stations(max(self._station_ids))
         except Exception:
             pass
         # [plan 18/08 §2.3] Sweep any stale registrations whose sid is not in

@@ -19,3 +19,9 @@ shared_rotation = None
 # manager_2 references in callers) remain retro-compat aliases — all reads
 # here must go through the registry.
 vpn_managers: list = []
+# [plan v10 §4 Lot 1] Superviseurs par station (StationSupervisor) — alignés
+# 1:1 avec vpn_managers (même ordre, même sid). Les managers NUS restent la
+# registry source de vérité pour les consumers existants ; les superviseurs
+# portent l'état d'isolation (tracker latence, breaker local, warm-up).
+# Escape hatch : supervisor.enabled=false dans config.yaml → liste vide.
+station_supervisors: list = []

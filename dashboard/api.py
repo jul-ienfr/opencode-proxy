@@ -1366,7 +1366,7 @@ def register_dashboard(
 
     @app.get("/api/config/web-search")
     async def get_web_search_config():
-        from config import yaml_get, WEB_SEARCH_NATIVE_MODELS
+        from config import WEB_SEARCH_NATIVE_MODELS, yaml_get
 
         # web_search
         ws_mode = yaml_get("web_search", "mode", "duckduckgo")
@@ -1516,7 +1516,7 @@ def register_dashboard(
 
     @app.get("/api/config/web-fetch")
     async def get_web_fetch_config():
-        from config import yaml_get, WEB_SEARCH_NATIVE_MODELS
+        from config import WEB_SEARCH_NATIVE_MODELS, yaml_get
 
         return {
             "mode": yaml_get("web_fetch", "mode", "direct"),
@@ -2311,7 +2311,7 @@ def register_dashboard(
                         refresh_error = f"{type(_r).__name__}: {_r}"
                         break
                 refreshed_at = datetime.now(UTC).isoformat()
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 stale = True
                 refresh_error = "refresh timeout after 2.0s"
                 refreshed_at = datetime.now(UTC).isoformat()
@@ -3111,14 +3111,13 @@ def register_dashboard(
         # must not block the API).
         if mode in ("vpn", "socks5"):
             try:
-                import asyncio as _aio
 
                 # Ensure every configured station (station_count) is present.
                 # If the registry is short (e.g. boot direct with 1), rebuild
                 # it via _apply_station_count to restore the missing managers.
                 try:
-                    from config.settings import resolved_station_count as _rsc
                     import config.settings as _cs
+                    from config.settings import resolved_station_count as _rsc
 
                     want = _rsc(getattr(_cs, "IP_ROTATION", {}) or {})
                     have = len(managers)

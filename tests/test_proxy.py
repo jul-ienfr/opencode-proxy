@@ -1167,8 +1167,8 @@ class TestWebSearchWebFetch:
 
     @pytest.mark.asyncio
     async def test_responses_protocol_openai_injects_body_not_anthro(self, monkeypatch):
+
         import opencode as m
-        from unittest.mock import AsyncMock
 
         # Simulate /v1/responses openai protocol branching: body should be mutated, anthro resynced
         body = {
@@ -1180,7 +1180,7 @@ class TestWebSearchWebFetch:
         # Use anthropic body conversion then handler
         from protocol_mapping import openai_responses_to_anthropic
 
-        anthro = openai_responses_to_anthropic(body)
+        openai_responses_to_anthropic(body)
         # mock native false to force local
         monkeypatch.setattr(m, "_is_web_tool_native", lambda x: False)
 
@@ -1196,8 +1196,9 @@ class TestWebSearchWebFetch:
 
     @pytest.mark.asyncio
     async def test_ddg_timeout_bounded(self, monkeypatch):
-        import opencode as m
         import asyncio
+
+        import opencode as m
 
         # Simulate DDG hang -> wait_for timeout+2
         async def fake_hang(*a, **kw):
@@ -1205,25 +1206,22 @@ class TestWebSearchWebFetch:
             return "never"
 
         monkeypatch.setattr(m, "_execute_ddg_search", fake_hang)
-        body = {
-            "tools": [{"name": "web_search"}],
-            "tool_choice": "auto",
-            "messages": [{"role": "user", "content": "hello"}],
-        }
         monkeypatch.setattr(m, "_is_web_tool_native", lambda x: False)
         # handler has retry and timeout handling; we test that _execute_ddg_search itself is bounded via wait_for in handler
         # Instead test directly wait_for
         try:
             await asyncio.wait_for(m._execute_ddg_search("q", 5, timeout=1), timeout=3)
             assert False, "should timeout"
-        except asyncio.TimeoutError:
+        except TimeoutError:
             pass
 
     @pytest.mark.asyncio
     async def test_ddg_cache_dog_pile(self, monkeypatch):
-        import opencode as m
-        import asyncio, time
+        import asyncio
+        import time
         from unittest.mock import patch
+
+        import opencode as m
 
         class FakeDDGS:
             def __init__(self, *a, **kw):
@@ -1267,9 +1265,9 @@ class TestWebSearchWebFetch:
 
     @pytest.mark.asyncio
     async def test_ddg_lock_eviction(self, monkeypatch):
-        import opencode as m
         from unittest.mock import patch
-        import time
+
+        import opencode as m
 
         class FakeDDGS:
             def __init__(self, *a, **kw):
@@ -1294,9 +1292,9 @@ class TestWebSearchWebFetch:
 
     @pytest.mark.asyncio
     async def test_fetch_rejected_content_type(self, monkeypatch):
+
+
         import opencode as m
-        import httpx
-        from unittest.mock import AsyncMock, patch
 
         # Mock httpx to return octet-stream
         class FakeResp:

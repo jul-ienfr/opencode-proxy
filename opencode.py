@@ -5,14 +5,18 @@ Convert Anthropic /v1/messages ↔ OpenAI chat/completions
 
 import asyncio
 import contextvars
-import hmac
-import json
 import copy
+import datetime
+import email.utils
+import hmac
 import ipaddress
+import itertools
+import json
 import logging
 import os
 import random
 import re
+import re as _re_norm
 import socket
 import sqlite3
 import threading
@@ -66,7 +70,9 @@ except ImportError:
         from config import PROXY as _PROXY_FALLBACK
     except ImportError:
         _PROXY_FALLBACK = ""
-    get_socks5_proxy_url = lambda: _PROXY_FALLBACK  # type: ignore
+
+    def get_socks5_proxy_url() -> str:
+        return _PROXY_FALLBACK
 
 # ── Web search/fetch shared primitives (v3.3) ──
 _DDG_CACHE: OrderedDict = OrderedDict()  # kstr -> (expiry, formatted)
@@ -92,9 +98,6 @@ _BLOCKED_NETS = [
 ]
 
 
-import datetime
-import email.utils
-import itertools
 
 # ── API key routing ──
 # F-H3: threading.Lock kept (sync+async mix avoids asyncio.Lock deadlock from sync thread).
@@ -1545,6 +1548,24 @@ _geo_forced_pool: set | None = None
 _apply_station_lock = asyncio.Lock()
 
 
+def _sync_station_supervisors(shared_state) -> None:
+    """[plan v10 §4 Lot 1] Aligne shared_state.station_supervisors sur
+    vpn_managers (crée manquants, conserve l'état isolé des persistantes).
+    Fail-soft : jamais bloquer le hot-reload pour une erreur superviseur."""
+    if not bool(yaml_get("supervisor", "enabled", True)):
+        shared_state.station_supervisors = []
+        return
+    try:
+        from station_supervisor import sync_supervisors as _sync_sup
+
+        shared_state.station_supervisors = _sync_sup(
+            list(getattr(shared_state, "station_supervisors", None) or []),
+            list(getattr(shared_state, "vpn_managers", None) or []),
+        )
+    except Exception as e:
+        _debug(f"  [vpn] supervisor sync failed (fail-soft): {e}")
+
+
 async def _apply_station_count(new_n: int) -> None:
     """[plan 18/08 §4] Hot-reload the number of parallel VPN stations.
 
@@ -1571,6 +1592,10 @@ async def _apply_station_count(new_n: int) -> None:
     async with _apply_station_lock:
         import shared_state
 
+        # [plan v10 §4 Lot 1] Escape hatch : supervisor.enabled=false → aucun
+        # superviseur, chemin legacy intact (rollback du refactor jusqu'au
+        # jalon Train 1 vert).
+        _sup_enabled = bool(yaml_get("supervisor", "enabled", True))
         managers = list(getattr(shared_state, "vpn_managers", None) or [])
         old_n = len(managers)
         if new_n == old_n:
@@ -1589,6 +1614,7 @@ async def _apply_station_count(new_n: int) -> None:
                     managers.append(mm)
                 managers.sort(key=lambda m: m._station)
                 shared_state.vpn_managers = managers
+                _sync_station_supervisors(shared_state)
                 pool = getattr(shared_state, "free_ip_pool", None)
                 if pool is not None:
                     pool.set_stations(managers)
@@ -1622,6 +1648,7 @@ async def _apply_station_count(new_n: int) -> None:
                 # Registry + pool converge BEFORE any docker call: _apply_stack
                 # reads the registry for the active set.
                 shared_state.vpn_managers = managers
+                _sync_station_supervisors(shared_state)
                 pool = getattr(shared_state, "free_ip_pool", None)
                 if pool is not None:
                     pool.set_stations(managers)
@@ -1663,6 +1690,7 @@ async def _apply_station_count(new_n: int) -> None:
                 # rollback to old_n — config stays at old_n, runtime converges
                 _debug(f"  [vpn] upscale {old_n}→{new_n} failed, rollback: {e}")
                 shared_state.vpn_managers = _snapshot
+                _sync_station_supervisors(shared_state)
                 pool = getattr(shared_state, "free_ip_pool", None)
                 if pool is not None:
                     try:
@@ -1691,22 +1719,27 @@ async def _apply_station_count(new_n: int) -> None:
             if _retired:
                 await asyncio.gather(*(m.stop() for m in _retired))
                 await asyncio.gather(*(m.stop_container() for m in reversed(_retired)))
-                # P2 garde-fou: orphan rm -f fallback (compose stop peut laisser Exited)
-                for m in _retired:
-                    try:
-                        import subprocess as _sp
+            # P2 garde-fou: orphan rm -f fallback (compose stop peut laisser Exited)
+            for m in _retired:
+                try:
+                    import subprocess as _sp
 
-                        _sp.run(
-                            ["docker", "rm", "-f", m._docker_container],
-                            capture_output=True,
-                            timeout=10,
-                            creationflags=0x08000000 if __import__("sys").platform == "win32" else 0,
-                        )
-                    except Exception:
-                        pass
-                    _debug(f"  [vpn] orphan garde-fou rm -f {m._docker_container}")
+                    # [plan v10 §14.1.19] subprocess.run DIRECT dans ce handler
+                    # async gelait l'event loop jusqu'à 10s × N stations — tous
+                    # les flux LLM en cours stagnaient pendant le hot-reload.
+                    await asyncio.to_thread(
+                        _sp.run,
+                        ["docker", "rm", "-f", m._docker_container],
+                        capture_output=True,
+                        timeout=10,
+                        creationflags=0x08000000 if __import__("sys").platform == "win32" else 0,
+                    )
+                except Exception:
+                    pass
+                _debug(f"  [vpn] orphan garde-fou rm -f {m._docker_container}")
             managers = managers[:new_n]
             shared_state.vpn_managers = managers
+            _sync_station_supervisors(shared_state)
             pool = getattr(shared_state, "free_ip_pool", None)
             if pool is not None:
                 pool.set_stations(managers)
@@ -1963,7 +1996,7 @@ async def lifespan(app):
                                 _ck_env2 = _ln2.strip().split("=", 1)[1].strip()
                                 break
                     if _ck_yaml != _ck_env2:
-                        _debug(f"  [lifespan] ERROR fail-closed: clé toujours divergente après resync — VPN non démarré (corriger config.yaml/credentials.env)")
+                        _debug("  [lifespan] ERROR fail-closed: clé toujours divergente après resync — VPN non démarré (corriger config.yaml/credentials.env)")
                         IP_ROTATION["_fail_closed"] = True
                 except Exception:
                     pass
@@ -2018,6 +2051,7 @@ async def lifespan(app):
     # vpn_manager / vpn_manager_2 stay retro-compat aliases for the legacy
     # single/dual reads; all runtime readers use shared_state.vpn_managers.
     shared_state.vpn_managers = _managers
+    _sync_station_supervisors(shared_state)
     shared_state.vpn_manager = _managers[0]
     shared_state.vpn_manager_2 = _managers[1] if n >= 2 else None
     shared_state.free_ip_pool = FreeIPPool(_managers[0], _managers[1] if n >= 2 else None)
@@ -2792,7 +2826,6 @@ def _notify_geo_tray_throttled(msg: str, model: str | None = None):
         # Fallback: write notification file polled by tray / dashboard SSE
         try:
             import json as _js
-            import os as _os
 
             p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "geo_notifications.json")
             os.makedirs(os.path.dirname(p), exist_ok=True)
@@ -3843,7 +3876,6 @@ async def _hedged_fetch(cands, body: dict, headers: dict, endpoint: str, forced_
     last_exc = None
     try:
         # stagger loop: sleep stagger, launch next if primary still pending
-        stagger_idx = 0
         while pending_stagger or tasks:
             # wait for any task with timeout = stagger if still have pending to launch
             timeout = stagger if pending_stagger else None
@@ -5899,7 +5931,6 @@ def _extract_tool_names(body: dict) -> list:
 
 # ── Web Search / Web Fetch Handler (v3.3) ───────────────────────────────
 
-import re as _re_norm
 
 def _normalize_tool_name(t: dict) -> str:
     raw = t.get("name") or t.get("function", {}).get("name") or ""
@@ -6090,7 +6121,7 @@ async def _execute_ddg_search(query: str, max_results: int = 5, timeout: int = 1
 
                     try:
                         results = await asyncio.wait_for(asyncio.to_thread(_sync_ddg), timeout + 2)
-                    except asyncio.TimeoutError:
+                    except TimeoutError:
                         _log(f"  WEB SEARCH: DDG timeout {timeout}s query='{qnorm[:60]}' queue={3 - _DDG_SEM._value}")
                         raise
                     except ImportError:
@@ -6214,7 +6245,7 @@ def _strip_web_tool(body: dict, protocol: str, name: str):
         # empty orphan -> auto
         if not isinstance(tc_name, str) or not tc_name.strip():
             if tc_type in ("tool", "function") and not tc_name.strip():
-                _debug(f"  [convert] _strip_web_tool: empty tool_choice name → auto")
+                _debug("  [convert] _strip_web_tool: empty tool_choice name → auto")
                 body["tool_choice"] = "auto"
                 return
         if is_target and tc.get("type") in ("tool", "function"):
@@ -6271,18 +6302,12 @@ async def _handle_web_search(body: dict, model_id: str, protocol: str) -> bool:
     if not yaml_get("web_search", "enabled", True):
         if _has_tool(body, "web_search"):
             _strip_web_tool(body, protocol, "web_search")
-            _log(f"  WEB SEARCH: disabled via config → stripped")
+            _log("  WEB SEARCH: disabled via config → stripped")
         return False
     if not _has_tool(body, "web_search"):
         return False
-    # forced detection via tool_choice normalized
-    is_forced = False
-    tc = body.get("tool_choice")
-    if isinstance(tc, dict):
-        tc_name = tc.get("name", "") or tc.get("function", {}).get("name", "")
-        if _normalize_tool_name({"name": tc_name}) == "web_search" and tc.get("type") in ("tool", "function"):
-            is_forced = True
-    is_auto = _is_tool_choice_auto(body)
+    # [plan v10 §14.4.15] branches mortes purgées : is_forced/is_auto étaient
+    # calculés mais jamais lus (le passthrough Q4A utilise mode/target_model).
     # passthrough if native
     mode = yaml_get("web_search", "mode", "duckduckgo")
     target_model = yaml_get("web_search", "target_model", None)
@@ -6312,7 +6337,7 @@ async def _handle_web_search(body: dict, model_id: str, protocol: str) -> bool:
             _log(f"  WEB SEARCH: routed to {target_model} for web_search")
         else:
             _strip_web_tool(body, protocol, "web_search")
-            _log(f"  WEB SEARCH: stripped (model mode but no target)")
+            _log("  WEB SEARCH: stripped (model mode but no target)")
         return False
     if mode == "model_then_ddg":
         if target_model:
@@ -6322,7 +6347,7 @@ async def _handle_web_search(body: dict, model_id: str, protocol: str) -> bool:
     # duckduckgo and ddg_then_model → local execution
     query = _extract_search_query(body)
     if not query.strip():
-        _log(f"  WEB SEARCH: empty query → stripped")
+        _log("  WEB SEARCH: empty query → stripped")
         _strip_web_tool(body, protocol, "web_search")
         return False
     _debug(f"  [web-search] mode={mode} model={model_id} query={query[:80]}...")
@@ -6345,7 +6370,7 @@ async def _handle_web_search(body: dict, model_id: str, protocol: str) -> bool:
             _strip_web_tool(body, protocol, "web_search")
             _log(f"  WEB SEARCH: DuckDuckGo query='{query[:60]}' → injected results")
             return False
-        except asyncio.TimeoutError:
+        except TimeoutError:
             if attempt == 0:
                 await asyncio.sleep(0.3)
                 continue
@@ -6420,17 +6445,12 @@ async def _handle_web_fetch(body: dict, model_id: str, protocol: str) -> bool:
     if not yaml_get("web_fetch", "enabled", True):
         if _has_tool(body, "web_fetch"):
             _strip_web_tool(body, protocol, "web_fetch")
-            _log(f"  WEB FETCH: disabled via config → stripped")
+            _log("  WEB FETCH: disabled via config → stripped")
         return False
     if not _has_tool(body, "web_fetch"):
         return False
-    # detect forced vs auto
-    tc = body.get("tool_choice")
-    is_forced = False
-    if isinstance(tc, dict):
-        tc_name = tc.get("name", "") or tc.get("function", {}).get("name", "")
-        if _normalize_tool_name({"name": tc_name}) == "web_fetch" and tc.get("type") in ("tool", "function"):
-            is_forced = True
+    # [plan v10 §14.4.15] branche morte purgée : is_forced calculé jamais lu.
+    # is_auto, lui, EST consommé par la décision URL-gated Q2A ci-dessous.
     is_auto = _is_tool_choice_auto(body)
     # URL-gated for auto
     url = _extract_fetch_url(body)
@@ -6444,14 +6464,14 @@ async def _handle_web_fetch(body: dict, model_id: str, protocol: str) -> bool:
                     prompt = block.get("input", {}).get("prompt", "") or ""
     if not url and is_auto:
         # Q2A: no URL in last user → passthrough (strip)
-        _log(f"  WEB FETCH: auto but no URL found → stripped (Q2A)")
+        _log("  WEB FETCH: auto but no URL found → stripped (Q2A)")
         _strip_web_tool(body, protocol, "web_fetch")
         return False
     if not url:
         # try extract from last user anyway for forced
         url = _extract_fetch_url(body)
         if not url:
-            _log(f"  WEB FETCH: no URL → stripped")
+            _log("  WEB FETCH: no URL → stripped")
             _strip_web_tool(body, protocol, "web_fetch")
             return False
     mode = yaml_get("web_fetch", "mode", "direct")
@@ -6497,7 +6517,7 @@ async def _handle_web_fetch(body: dict, model_id: str, protocol: str) -> bool:
         _strip_web_tool(body, protocol, "web_fetch")
         _log(f"  WEB FETCH: fetched {url[:60]} → injected {len(content)} chars")
         return False
-    except asyncio.TimeoutError:
+    except TimeoutError:
         _log(f"  WEB FETCH: TimeoutError url={url[:60]} → stripped")
         _strip_web_tool(body, protocol, "web_fetch")
         return False
