@@ -25,6 +25,7 @@ import logging
 import random
 import time
 import urllib.parse
+import weakref
 
 from vpn_manager import RotationFailed, VPNManager
 
@@ -1178,7 +1179,11 @@ class FreeIPPool:
         # stream of a PREVIOUS burst has either propagated already (re-raised
         # or retried to another station) or re-registered, so carrying stale
         # IDs forward would only risk misclassifying a genuine client cancel.
-        per["watchdog_cancelled"] = {id(t) for t in tasks}
+        # [plan v10 §14.3.9] WeakSet d'OBJETS et plus {id(t)} : un id réutilisé
+        # par une nouvelle tâche post-GC était classé à tort "watchdog-cancelled".
+        _cancelled_ws = weakref.WeakSet()
+        _cancelled_ws.update(tasks)
+        per["watchdog_cancelled"] = _cancelled_ws
         for t in list(tasks):
             t.cancel()
 
@@ -1189,7 +1194,7 @@ class FreeIPPool:
         BEFORE the handler's ``except asyncio.CancelledError`` inspects the
         task, so the decision must not depend on the task still being listed."""
         return any(
-            id(task) in (per.get("watchdog_cancelled") or set())
+            task in (per.get("watchdog_cancelled") or set())
             for per in self._per.values()
             if per.get("watchdog_cancelled")
         )

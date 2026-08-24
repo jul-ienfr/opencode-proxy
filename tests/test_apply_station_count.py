@@ -42,6 +42,7 @@ class _StubMgr:
         self.started = False
         self.stopped = False
         self.stopped_container = False
+        self.cancel_requested = False  # [v10 §14.1.2]
         type(self).created.append(station)
 
     async def start(self):
@@ -49,6 +50,10 @@ class _StubMgr:
 
     async def stop(self):
         self.stopped = True
+
+    async def request_rotation_cancel(self, cap: float = 5.0):
+        """[v10 §14.1.2] downscale pose le flag AVANT stop_container."""
+        self.cancel_requested = True
 
     async def stop_container(self):
         self.stopped_container = True
@@ -163,7 +168,9 @@ async def test_downscale_3_to_2_stops_container_no_stack_call(tmp_path, monkeypa
     await opencode._apply_station_count(2)
 
     assert pool.cancelled_sids == [3], "downscale cancels the retired rotations"
+    assert stubs[2].cancel_requested, "[v10 §14.1.2] rotation cancel coopératif AVANT stop_container"
     assert stubs[2].stopped and stubs[2].stopped_container
+    assert not stubs[0].cancel_requested and not stubs[1].cancel_requested
     assert not stubs[0].stopped and not stubs[1].stopped
     assert [m._station for m in pool.stations] == [1, 2]
     assert set(watcher.managers) == {"opencode-vpn", "opencode-vpn-2"}

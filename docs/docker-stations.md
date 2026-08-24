@@ -41,15 +41,30 @@ les autres clés (secrets NordVPN) ne sont jamais touchées.
   à chaque `_apply_station_count`) supprime tous les superviseurs et rend
   le chemin 100% legacy. Rollback du refactor jusqu'au jalon Train 1 vert.
 
-## Décision ADR-001 (brouillon — finalisé Lot 2)
+## Décision ADR-001 (finalisée Lot 2)
 
-**Contexte** : le fichier `vpn_manager.py` (4770 lignes) portait l'état de
+**Contexte** : le fichier `vpn_manager.py` (~4800 lignes) portait l'état de
 TOUTES les stations en attributs d'instances parallèles sans isolation
-garantie (un bug d'un manager corrompait l'état partagé global).
+garantie (un bug d'un manager corrompait l'état partagé global). De plus,
+deux P0 lifecycle ont été trouvés par l'audit v8 : le boot reconcile
+détruisait une flotte saine sur une heuristique de stack erronée
+(§14.1.1), et un downscale pendant une rotation pouvait ressusciter le
+conteneur retiré via le shield asyncio (§14.1.2).
 
-**Décision** : wrapper par COMPOSITION (`StationSupervisor` porte l'état
-isolé, délègue les opérations), pas de fork ni d'héritage — réversible,
-zero-risk pour les consumers existants, testable en mock pur.
+**Décision** :
+1. Wrapper par **COMPOSITION** (`StationSupervisor` porte l'état isolé —
+   tracker latence, breaker local, warm-up — et délègue les opérations au
+   manager), pas de fork ni d'héritage ; registry managers nus inchangée ;
+   escape hatch `supervisor.enabled: false`.
+2. Lifecycle déterministe : la stack attendue au boot vient du **`.env`
+   persisté par station** (source écrite par chaque `_apply_stack`), et tout
+   downscale passe par `request_rotation_cancel()` (abandon coopératif aux
+   checkpoints de `_connect_next_impl`) avant `stop_container`.
 
 **Alternatives écartées** : fork du fichier (dérive de maintenance),
-refonte complète (risque big-bang, contradictoire avec §10).
+refonte complète (big-ban contradictoire avec §10), cancel brutal des tasks
+de rotation (CancelledError sauvage chez les callers 429).
+
+**Conséquences** : rollback du refactor possible jusqu'au jalon Train 1 vert ;
+les deux P0 sont couverts par `tests/test_chaos_lifecycle.py` (volet mocké
+au gate, volet docker réel opt-in `-m docker`).

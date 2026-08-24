@@ -2313,8 +2313,9 @@ def register_dashboard(
     async def get_station_logs(station_id: int, lines: int = 50):
         """[plan v10 §4 Lot 4] derniers logs docker de la station N — MTTR
         per-station sans ouvrir un terminal."""
-        import shared_state
         import subprocess as _sp
+
+        import shared_state
 
         mgr = next(
             (
@@ -3203,15 +3204,32 @@ def register_dashboard(
                 # start() is idempotent and triggers background connect when
                 # status != connected, so this resurrects the 2..N that
                 # stayed disconnected in direct.
+                # [plan v10 §14.1.12] starts PARALLÈLES + réponse immédiate :
+                # l'ancien await séquentiel par station suspendait l'endpoint
+                # des minutes, SSE/GUI gelées. Le suivi d'état passe par les
+                # vpn_event SSE déjà émis par _set_status.
+                _starts = []
                 for mm in managers:
-                    try:
-                        if getattr(mm, "enabled", True) and getattr(mm, "status", "disconnected") != "connected":
-                            await mm.start()
-                    except Exception as _e2:
-                        _debug(f"  [vpn] proxy-mode start station {getattr(mm, '_station', '?')} failed: {_e2}")
+                    if getattr(mm, "enabled", True) and getattr(mm, "status", "disconnected") != "connected":
+                        _starts.append(
+                            asyncio.create_task(
+                                mm.start(),
+                                name=f"proxy-mode-start-st{getattr(mm, '_station', '?')}",
+                            )
+                        )
+                if _starts:
+                    asyncio.create_task(_reap_proxy_mode_starts(_starts))
             except Exception as _e:
                 _debug(f"  [vpn] proxy-mode resurrect failed: {_e}")
         return {"ok": True, "mode": mode}
+
+    async def _reap_proxy_mode_starts(tasks):
+        """[v10 §14.1.12] récolte les starts détachés : erreurs journalisées,
+        jamais perdues silencieusement."""
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for t, r in zip(tasks, results):
+            if isinstance(r, Exception):
+                _debug(f"  [vpn] proxy-mode detached start failed ({t.get_name()}): {r}")
 
     @app.get("/api/vpn/nordvpn-available")
     async def nordvpn_available():

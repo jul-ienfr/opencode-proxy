@@ -1743,6 +1743,13 @@ async def _apply_station_count(new_n: int) -> None:
             # [fix] Parallélise les stops (même gain en downscale) + garde-fou rm -f
             _retired = managers[new_n:]
             if _retired:
+                # [plan v10 §14.1.2 P0] abandon COOPÉRATIF des rotations manager
+                # encore en vol (shield connect_next) AVANT stop_container —
+                # sinon l'implémentation détachée recréait le conteneur condamné.
+                await asyncio.gather(
+                    *(m.request_rotation_cancel(cap=5.0) for m in _retired),
+                    return_exceptions=True,
+                )
                 await asyncio.gather(*(m.stop() for m in _retired))
                 await asyncio.gather(*(m.stop_container() for m in reversed(_retired)))
             # P2 garde-fou: orphan rm -f fallback (compose stop peut laisser Exited)
@@ -2327,6 +2334,12 @@ async def lifespan(app):
         pass
     try:
         await cooldown_sweep_task
+    except asyncio.CancelledError:
+        pass
+    # [plan v10 §14.3.17] cancel() sans await = "task destroyed pending" +
+    # commit en vol perdu à l'arrêt.
+    try:
+        await db_cleanup_task
     except asyncio.CancelledError:
         pass
     _debug("  [lifespan] background tasks cancelled")

@@ -86,12 +86,18 @@ class _DockerStub:
 
 
 def _managers(tmp_path, n, stack="wireguard"):
-    """n fake managers with the registry names opencode-vpn[,-N]."""
+    """n fake managers with the registry names opencode-vpn[,-N].
+
+    [v10 §14.1.1] hermétique : reconcile lit désormais le `.env` PERSISTÉ
+    à côté du compose — on force ce chemin vers le tmp du test pour ne
+    JAMAIS consulter le vrai `.env` du projet (sinon les résultats dépendent
+    de la flotte live de la machine)."""
     managers = [
         FakeVPNManager(_cfg(tmp_path), station=s, tmp_path=tmp_path) for s in range(1, n + 1)
     ]
     for m in managers:
         m._stack_effective = stack
+        m._compose_file_path = lambda: str(tmp_path / "docker-compose.yml")
     return managers
 
 
@@ -180,7 +186,11 @@ async def test_expected_unknown_stack_kept(tmp_path):
 
 @pytest.mark.asyncio
 async def test_mixed_fleet_removes_both_kinds(tmp_path):
-    """Orphan + stale-stack expected → both removed in one pass."""
+    """Orphan + stale-stack expected → both removed in one pass.
+
+    [v10 §14.1.1] la stack attendue vient du `.env` PERSISTÉ par station
+    (écrit à chaque _apply_stack depuis le fix §14.1.9) — le test écrit donc
+    le .env cohérent avec sa flotte : st1=wireguard, st2=openvpn."""
     stub = _DockerStub(
         {
             "opencode-vpn": "openvpn",  # stale boot (mgr: WG)
@@ -190,6 +200,9 @@ async def test_mixed_fleet_removes_both_kinds(tmp_path):
     )  # orphan
     managers = _managers(tmp_path, 2, stack="wireguard")
     managers[1]._stack_effective = "openvpn"  # station 2 effective = OV
+    (tmp_path / ".env").write_text(
+        "VPN_TYPE_STATION1=wireguard\nVPN_TYPE_STATION2=openvpn\n", encoding="utf-8"
+    )
 
     removed = await vm.reconcile_orphan_containers(managers, stub.run)
 

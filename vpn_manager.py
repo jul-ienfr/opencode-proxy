@@ -84,7 +84,7 @@ async def ensure_docker_running(timeout: int = 60) -> bool:
             except Exception:
                 pass
         return False
-    _DOCKER_DESKTOP_LAUNCHED = True
+    # [v10 §14.3.13] latch posé uniquement après un Popen RÉUSSI (voir plus bas)
     # Common install paths
     candidates = [
         r"C:\Program Files\Docker\Docker\Docker Desktop.exe",
@@ -122,8 +122,12 @@ async def ensure_docker_running(timeout: int = 60) -> bool:
                 stderr=subprocess.DEVNULL,
             )
         except Exception as e:
+            # [plan v10 §14.3.13] le latch ne se pose qu'après un lancement
+            # EFFECTIF : sinon un Popen raté verrouillait _LAUNCHED=True pour
+            # tout le process → plus aucune relance jusqu'au restart.
             logging.getLogger(__name__).warning("[docker] failed to launch Desktop %s: %s", exe, e)
             return False
+        _DOCKER_DESKTOP_LAUNCHED = True
     # Wait for daemon to become reachable
     for _ in range(timeout // 2):
         await asyncio.sleep(2)
@@ -936,6 +940,10 @@ class VPNManager:
         )
         self._identity_index = 0  # restored/clamped by load_state()
         self._rotation_task: asyncio.Task | None = None  # single-flight rotation ([1]+[18])
+        # [plan v10 §14.1.2] downscale : abandon COOPÉRATIF d'une rotation en
+        # vol avant stop_container (le shield de connect_next détache sinon
+        # l'implémentation, qui recréerait le conteneur condamné).
+        self._rotation_cancel_requested = False
 
         # Auto-update (gluetun image)
         self._update_enabled = cfg.get("update_enabled", True)
@@ -1363,6 +1371,20 @@ class VPNManager:
             if self._rotation_task is task:
                 self._rotation_task = None
 
+    async def request_rotation_cancel(self, cap: float = 5.0) -> None:
+        """[v10 §14.1.2] Appelé par le downscale AVANT stop_container : pose
+        le flag coopératif (checké aux checkpoints de _connect_next_impl) puis
+        attend la fin de la rotation en vol (cap `cap` s). Aucun CancelledError
+        sauvage chez les callers 429 — la rotation sort par RotationFailed."""
+        self._rotation_cancel_requested = True
+        task = getattr(self, "_rotation_task", None)
+        if task is not None and not task.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=cap)
+            except Exception:
+                pass  # timeout/RotationFailed/cancel : on rend la main au teardown
+        self._rotation_cancel_requested = False
+
     async def _connect_next_impl(self) -> str:
         """Actual rotation: compose up if the container is absent,
         else restart it. Validates the new IP (different from current and
@@ -1399,6 +1421,10 @@ class VPNManager:
             self._rotation_op_count = 0
 
             async def _attempt() -> str:
+                # [plan v10 §14.1.2] checkpoint d'abandon coopératif : un
+                # downscale en cours ne doit pas voir sa station recréée.
+                if self._rotation_cancel_requested:
+                    raise RotationFailed("rotation annulée (downscale en cours)")
                 # One rotation attempt: pin country via the control server
                 # (a real reconnect when it works), else the legacy
                 # container-restart branch; then probe a REAL IP through the
@@ -1411,9 +1437,13 @@ class VPNManager:
                 # country. When the pin is unavailable or fails, fall
                 # through to the legacy container-restart branch.
                 pinned = await self._pin_country_for_rotation()
+                if self._rotation_cancel_requested:
+                    raise RotationFailed("rotation annulée (downscale en cours)")
                 if pinned is None:
                     await self._ensure_container()
                     started_at = await self._wait_healthy(timeout=120)
+                    if self._rotation_cancel_requested:
+                        raise RotationFailed("rotation annulée (downscale en cours)")
                     if started_at is None:
                         raise RuntimeError("gluetun non sain après redémarrage")
                     if await self._check_auth_failed(started_at):
@@ -1432,6 +1462,8 @@ class VPNManager:
                 new_ip = await self.get_public_ip()
                 if not new_ip:
                     raise RuntimeError("impossible de déterminer l'IP publique")
+                if self._rotation_cancel_requested:
+                    raise RotationFailed("rotation annulée (downscale en cours)")
                 # [review 18/08 §C] the probe ANSWERED — the tunnel
                 # lives. Clear the latch: a later "IP unchanged"/
                 # "recently used" failure is the lottery, not death,
@@ -1798,14 +1830,29 @@ class VPNManager:
             import httpx
 
             start = time.monotonic()
+            new_ip = None
+            elapsed_ms = None
             async with httpx.AsyncClient(timeout=15, proxy=self.socks5_url) as client:
                 # [plan 18/08 §A] same stall class as get_public_ip: an
                 # httpx timeout does NOT bound a stuck SOCKS5 CONNECT —
                 # wait_for ip_probe_budget; the except below absorbs the
                 # TimeoutError into the error result.
-                resp = await asyncio.wait_for(client.get(self._ip_check_url), self._ip_probe_budget)
-                elapsed_ms = int((time.monotonic() - start) * 1000)
-            new_ip = resp.text.strip()
+                # [plan v10 §14.3.4] même CHAÎNE sticky que get_public_ip
+                # (fallback complet) au lieu d'un endpoint legacy unique qui
+                # déclarait la station morte dès que CE endpoint tombait.
+                urls = list(getattr(self, "_ip_check_urls", None) or [self._ip_check_url])
+                for _url in urls:
+                    try:
+                        resp = await asyncio.wait_for(
+                            client.get(_url), max(1.0, self._ip_probe_budget / len(urls))
+                        )
+                    except Exception:
+                        continue
+                    candidate = resp.text.strip()
+                    if candidate:
+                        new_ip = candidate
+                        elapsed_ms = int((time.monotonic() - start) * 1000)
+                        break
             result["latency_ms"] = elapsed_ms
             if new_ip:
                 result["ok"] = True
@@ -3846,6 +3893,7 @@ class VPNManager:
         Returns None on failure/timeout.
         """
         deadline = time.monotonic() + timeout
+        empty_inspects = 0
         while time.monotonic() < deadline:
             info = await self._docker_inspect()
             if info.get("running") and await self.get_public_ip():
@@ -3853,9 +3901,18 @@ class VPNManager:
             # Fail fast: AUTH_FAILED (rejected credentials) and TLS negotiation
             # failures (dead server) never recover on their own — do not sit
             # out the timeout, report immediately (TLS fails in ~20 s).
+            # [plan v10 §14.3.14] inspect VIDE (glitch CLI docker, daemon busy)
+            # = transitoire : 3 tolérés avant de déclarer mort — l'ancien code
+            # tuait la rotation sur un simple inspect raté.
+            if not info:
+                empty_inspects += 1
+                if empty_inspects >= 3:
+                    return None
+                await asyncio.sleep(self._wait_healthy_poll)
+                continue
+            empty_inspects = 0
             if (
-                not info
-                or not info.get("running")
+                not info.get("running")
                 or await self._check_auth_failed(info.get("started_at", ""))
                 or await self._check_server_issue(info.get("started_at", ""))
             ):
@@ -4738,6 +4795,29 @@ def _env_value_from_inspect(info: dict, key: str) -> str | None:
     return None
 
 
+def _stack_from_env_file(env_path: str, station: int) -> str | None:
+    """[plan v10 §14.1.1] stack RÉELLE de la station depuis le .env persisté
+    (clé ``VPN_TYPE_STATION{n}`` écrite par chaque _apply_stack).
+
+    L'ancienne heuristique boot (_stack_effective = wireguard si le fichier
+    clé WG existe) faisait rm -f de TOUTE une flotte OpenVPN saine à chaque
+    reboot dès que wireguard.env traînait encore sur disque. None = clé
+    absente/fichier illisible → l'appelant retombe sur l'heuristique."""
+    try:
+        with open(env_path, encoding="utf-8") as f:
+            prefix = f"VPN_TYPE_STATION{station}="
+            for line in f:
+                stripped = line.strip()
+                if stripped.startswith(prefix):
+                    val = stripped.split("=", 1)[1].strip().lower()
+                    if val in ("wireguard", "openvpn"):
+                        return val
+                    return None
+    except OSError:
+        pass
+    return None
+
+
 async def reconcile_orphan_containers(managers: list, runner=None) -> list[str]:
     """[plan 18/08 §2.2] Remove fleet containers the boot must not keep.
 
@@ -4825,7 +4905,18 @@ async def reconcile_orphan_containers(managers: list, runner=None) -> list[str]:
         except (json.JSONDecodeError, IndexError):
             continue
         vpn_type = _env_value_from_inspect(info, "VPN_TYPE")
-        if vpn_type is not None and vpn_type != (m._stack_effective or "openvpn"):
+        # [plan v10 §14.1.1] stack attendue = .env PERSISTÉ par station, pas
+        # l'heuristique fichier-clé recalculée au boot : une flotte basculée
+        # OpenVPN avec wireguard.env encore présent voyait tous ses tunnels
+        # sains rm -f puis recréés WG à chaque reboot.
+        try:
+            _env_path = os.path.join(os.path.dirname(m._compose_file_path()), ".env")
+            expected_stack = _stack_from_env_file(_env_path, m._station)
+        except Exception:
+            expected_stack = None
+        if expected_stack is None:
+            expected_stack = m._stack_effective or "openvpn"  # fallback historique
+        if vpn_type is not None and vpn_type != expected_stack:
             removed.append(name)
             await _rm(name)
     if removed:
