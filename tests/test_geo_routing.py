@@ -126,14 +126,14 @@ class TestGeoGateIntegration:
         from vpn_manager import VPNManager
 
         VPNManager._geo_coalesce.clear()
+        # [v10 §14.3.3] les clés incluent désormais le marqueur de station
         for i in range(8):
-            VPNManager._geo_coalesce[frozenset({f"C{i}"})] = object()
+            VPNManager._geo_coalesce[frozenset({f"C{i}", "__station_1"})] = object()
         import asyncio
 
         m = VPNManager.__new__(VPNManager)
         m._current_country = None
         m._countries_list = lambda: ["Germany"]
-        m._host_blacklisted = lambda x: False
         try:
             asyncio.run(m.ensure_geo_egress({"NewCountry"}, timeout=0.1))
             raise AssertionError("should have raised")
@@ -171,7 +171,6 @@ class TestGeoGateIntegration:
             return True
 
         m._probe_tunnel_light = _probe  # type: ignore
-        m._host_blacklisted = lambda x: False
         ok = asyncio.run(m.ensure_geo_egress({"United States"}, timeout=1.0))
         assert ok is True
         VPNManager._geo_coalesce.clear()
@@ -202,7 +201,6 @@ class TestGeoGateIntegration:
             return True
 
         m._probe_tunnel_light = _slow_probe  # type: ignore
-        m._host_blacklisted = lambda x: False
 
         async def _never_pin(*a, **k):
             await asyncio.sleep(1)
@@ -214,6 +212,10 @@ class TestGeoGateIntegration:
         VPNManager._geo_coalesce.clear()
 
     def test_blacklist_filtered(self, monkeypatch):
+        """[v10 §14.3.34] le filtre _host_blacklisted sur les PAYS était un
+        no-op retiré : la blacklist ne contient que des hostnames NordVPN.
+        Le test vérifie désormais le fallback séquentiel de pin : Germany
+        refusée par le control server → essai suivant → United States."""
         monkeypatch.setattr(st, "GEO_ENABLED", True)
         monkeypatch.setattr(st, "IP_ROTATION", {"server_countries": "Germany,United States,France"})
         route = {
@@ -228,9 +230,9 @@ class TestGeoGateIntegration:
 
         VPNManager._geo_coalesce.clear()
         m = VPNManager.__new__(VPNManager)
+        m._station = 1
         m._current_country = None
         m._countries_list = lambda: ["Germany", "United States", "France"]
-        m._host_blacklisted = lambda c: c == "Germany"
         m._ip_probe_budget = 8.0
 
         async def _pin_ok(country, **kw):

@@ -31,16 +31,20 @@ class IpLatencySnapshot:
 
 @dataclass
 class IpLatencyTracker:
-    """Ring buffer par (station, ip) — mécanique uniquement (Lot 1).
+    """Ring buffer par (station, ip) — EWMA log-space + p95 glissant (v6).
 
-    EWMA calculée en espace log (v6 §3.6.1) : latences LLM heavy-tail,
-    l'EWMA brute est dominée par les outliers. Re-transformée à la lecture.
+    Décisions Lot 3 actives dans ``should_soft_rotate`` :
+    ``consecutive_slow >= consecutive_slow_limit``
+    OU (ewma > threshold_for ET count >= min_requests)
+    OU (p95 > p95_threshold ET count >= min_requests).
     """
 
     station: int
     ip: str
     window: int = 20
     alpha: float = 0.3
+    min_requests_before_eval: int = 5
+    consecutive_slow_limit: int = 3
     _ring: deque[float] = field(default_factory=lambda: deque(maxlen=20))
     _ewma_log: float | None = None
     consecutive_slow: int = 0
@@ -53,9 +57,10 @@ class IpLatencyTracker:
     def record(self, duration_ms: float, slow_threshold_ms: float) -> None:
         """Enregistre une latence (succès comme échec — timeout = slow).
 
-        Mécanique neutre Lot 1 : ring + EWMA log + p95 + compteurs.
-        Aucune décision de rotation ici (gelée au Lot 3).
-        """
+        Warm-up v6 §3.6.5 : la 1ʳᵉ requête sur une IP neuve (count==0 avant
+        enregistrement) paie le handshake TLS/SOCKS — elle alimente ring et
+        EWMA mais ne compte JAMAIS comme slow."""
+        first_on_ip = self.request_count == 0
         duration_ms = max(0.0, float(duration_ms))
         self._ring.append(duration_ms)
         self.request_count += 1
@@ -64,6 +69,8 @@ class IpLatencyTracker:
             self._ewma_log = ln
         else:
             self._ewma_log = self.alpha * ln + (1 - self.alpha) * self._ewma_log
+        if first_on_ip:
+            return  # warm-up exclu du comptage slow
         if slow_threshold_ms > 0 and duration_ms > slow_threshold_ms:
             self.consecutive_slow += 1
         else:
@@ -75,10 +82,19 @@ class IpLatencyTracker:
         self.consecutive_slow = 0
 
     def should_soft_rotate(self, threshold_for: float, p95_threshold: float) -> bool:
-        """Gelé Lot 1 — toujours False. Lot 3 implémente :
-        consecutive_slow>=3 ou (ewma>threshold_for et count>=5) ou
-        (p95>p95_threshold et count>=5), min_requests_before_eval inclus."""
-        del threshold_for, p95_threshold
+        """Décision soft §3.6.1 (Lot 3) : 3 lentes consécutives OU ewma>p seuil
+        OU p95>p-seuil — chaque voie exige min_requests_before_eval sauf la
+        rafale consecutive (3 requêtes suffisent par définition)."""
+        if self.request_count < self.min_requests_before_eval:
+            return self.consecutive_slow >= self.consecutive_slow_limit
+        if self.consecutive_slow >= self.consecutive_slow_limit:
+            return True
+        ewma = self.ewma_ms
+        if ewma is not None and ewma > threshold_for:
+            return True
+        p95 = self.p95_ms()
+        if p95 is not None and p95 > p95_threshold:
+            return True
         return False
 
     @property

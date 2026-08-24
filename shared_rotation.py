@@ -199,8 +199,12 @@ class SharedRotationState:
             return 0
         others = {idx for s, idx in self._last_country_by_station.items() if s != station}
         own = self._last_country_by_station.get(station)
+        # [plan v10 v6 §3.4 Lot 3] offset effectif par station :
+        # offset + stride×(station-1) — sinon 2 stations tirent les mêmes
+        # pays en boucle quand offset est petit. stride=0 → legacy exact.
+        eff = offset + self._country_offset_stride() * (station - 1)
         self._country_cursor += 1
-        idx = (self._country_cursor + offset * (station - 1)) % n
+        idx = (self._country_cursor + eff) % n
         # Pass 1: a country free of every other station's live slot AND
         # different from this station's OWN last country — a new country.
         for _ in range(n):
@@ -221,6 +225,14 @@ class SharedRotationState:
         self._persist()
         return idx
 
+    def _country_offset_stride(self) -> int:
+        """[v6 §3.4] `ip_rotation.country_offset_stride` — écart structurel
+        supplémentaire entre stations (0 = legacy offset×(station-1))."""
+        try:
+            return max(0, int((self._cfg or {}).get("country_offset_stride", 0) or 0))
+        except Exception:
+            return 0
+
     def peek_next_country(self, station: int, offset: int, n: int) -> int:
         """Preview the next country index for ``station`` WITHOUT advancing
         or persisting anything (dashboard 'next country' cell). Mirrors
@@ -233,7 +245,8 @@ class SharedRotationState:
             return 0
         others = {idx for s, idx in self._last_country_by_station.items() if s != station}
         own = self._last_country_by_station.get(station)
-        idx = ((self._country_cursor + 1) + offset * (station - 1)) % n
+        eff = offset + self._country_offset_stride() * (station - 1)
+        idx = ((self._country_cursor + 1) + eff) % n
         for _ in range(n):
             if idx not in others and idx != own:
                 break

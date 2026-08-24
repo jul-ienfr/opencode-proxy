@@ -221,6 +221,11 @@ def _alias_for_key(api_key: str) -> str:
 # ── Key pause tracker ─────────────────────────────────────────
 
 
+# [plan v10 §14.1.15] même condition HTTP = même durée, stream ou non :
+# 401 = clé temporairement indisponible (quota) — 1h des deux côtés.
+KEY_PAUSE_401_SEC = 3600.0
+
+
 class _KeyPauser:
     """Per-key rate limit pause tracker. Pauses a key when upstream returns 429.
 
@@ -2052,6 +2057,15 @@ async def lifespan(app):
     # single/dual reads; all runtime readers use shared_state.vpn_managers.
     shared_state.vpn_managers = _managers
     _sync_station_supervisors(shared_state)
+    # [plan v10 §3.6 Lot 3] moteur latence-adaptive : singleton partagé,
+    # config canonique `ip_rotation.latency_rotation` (hot-reload via pool).
+    try:
+        from latency_rotation import get_engine as _get_leng
+
+        shared_state.latency_engine = _get_leng()
+        shared_state.latency_engine.update_config(dict(IP_ROTATION.get("latency_rotation") or {}))
+    except Exception as _e_leng:
+        _debug(f"  [lifespan] latency engine init failed (fail-soft): {_e_leng}")
     shared_state.vpn_manager = _managers[0]
     shared_state.vpn_manager_2 = _managers[1] if n >= 2 else None
     shared_state.free_ip_pool = FreeIPPool(_managers[0], _managers[1] if n >= 2 else None)
@@ -5265,6 +5279,29 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
         ip=free_ip,
     )
 
+    # [plan v10 §3.6.1 Lot 3] mesure latence-adaptive par (station, ip) —
+    # succès ET échec ; décision soft/hard + garde-fous (anti-flap, paused,
+    # global_degraded) appliqués par le moteur/superviseur, fail-soft total.
+    try:
+        import shared_state as _ss_lat
+
+        _eng = getattr(_ss_lat, "latency_engine", None)
+        if _eng is None:
+            from latency_rotation import get_engine as _get_eng
+
+            _eng = _get_eng()
+            _ss_lat.latency_engine = _eng
+        if isinstance(station, object) and getattr(station, "_station", None) is not None:
+            _sid = int(station._station)
+            _dec = _eng.record_request(_sid, str(free_ip or "direct"), float(elapsed_ms), free_model, resp.status_code)
+            if _dec.get("action") in ("soft", "hard"):
+                for _sup in getattr(_ss_lat, "station_supervisors", None) or []:
+                    if _sup.station == _sid:
+                        await _sup.react_to_decision(_dec, station_obj=station)
+                        break
+    except Exception as _e_lat:
+        _debug(f"  [free] latency engine skip: {_e_lat}")
+
     if resp.status_code == 200:
         _debug(f"  [free] {free_model!r} succeeded ({tokens_in}+{tokens_out} tokens)")
         _log(f"  FREE {free_model!r} OK ({tokens_in}+{tokens_out} tokens, saved paid quota)")
@@ -5403,7 +5440,7 @@ async def _do_request_with_retry(endpoint, body, headers, protocol, retry_on_429
                 _err_body = "(unable to read response body)"
             _debug(f"  [auth] 401 response body: {_redact(_err_body, 500)}")
             # 401 = key temporarily unavailable (quota exhausted) → pause 1h
-            _key_pauser.pause_key(failed_key, 3600, "401 Unauthorized (temporary)")
+            _key_pauser.pause_key(failed_key, KEY_PAUSE_401_SEC, "401 Unauthorized (temporary)")
             alt = _find_alternative_key(failed_key)
             if alt:
                 _debug(f"  ⟳ 401 failover: {failed_key[:8]}… → alias={alt.get('alias', '?')}")
@@ -5606,8 +5643,9 @@ def _make_stream_retry_loop(protocol):
                 # Fetch fresh quotas and pause key until exact reset time
                 await _pause_key_for_quota_reset(failed_key)
             elif status_code == 401:
-                # 401 = key permanently invalid/revoked → pause 24h
-                _key_pauser.pause_key(failed_key, 86400, "401 Unauthorized (key likely revoked)")
+                # [§14.1.15 v10] aligné sur le non-stream : même code HTTP =
+                # même pause (l'ancien 24h créait une incohérence stream/non).
+                _key_pauser.pause_key(failed_key, KEY_PAUSE_401_SEC, "401 Unauthorized (temporary)")
             elif status_code == 403:
                 # 403 = region/model blocked for key → pause 30min
                 _key_pauser.pause_key(failed_key, 1800, "403 Forbidden (region/model not allowed)")

@@ -207,6 +207,7 @@ ip_rotation:
   rotation_max_duration: 240
   country_rotation: true
   country_offset: 14
+  country_offset_stride: 17
   docker_events: true
   auto_max_free_attempts: true
   free_parallel:

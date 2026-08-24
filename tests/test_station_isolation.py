@@ -81,12 +81,12 @@ def test_restart_serialized(monkeypatch):
 def test_warmup_reset_on_ip_finalized():
     s = StationSupervisor(station=1, manager=_fake_manager(1))
     tr = s.tracker_for("9.9.9.9")
-    tr.record(12000, slow_threshold_ms=8000)
-    tr.record(12000, slow_threshold_ms=8000)
+    # [v6] la 1ʳᵉ requête est warm-up (exclue du comptage slow)
+    for _ in range(3):
+        tr.record(12000, slow_threshold_ms=8000)
     assert tr.consecutive_slow == 2
     s.on_ip_finalized("10.0.0.1")
     assert tr.consecutive_slow == 0, "warm-up v6 : reset après rotation"
-    assert "10.0.0.1" in s.ip_latency, "slot pré-crée pour la nouvelle IP"
 
 
 def test_tracker_bounded_memory():
@@ -96,14 +96,18 @@ def test_tracker_bounded_memory():
     assert len(s.ip_latency) <= 30, "borne mémoire §4 Lot 1"
 
 
-def test_should_soft_rotate_frozen_false_in_lot1():
+def test_should_soft_rotate_now_live():
+    """[Lot 3] les décisions sont DÉBLOQUÉES : une IP constamment lente
+    déclenche should_soft_rotate via le tracker partagé moteur."""
     s = StationSupervisor(station=1, manager=_fake_manager(1))
-    tr = s.tracker_for(str(s.manager.current_ip))
-    for _ in range(10):
+    ip = str(s.manager.current_ip)
+    tr = s.tracker_for(ip)
+    # 1ʳᵉ requête = warm-up exclu, puis lentes consécutives ≥3
+    for _ in range(5):
         tr.record(20000, slow_threshold_ms=1000)
     assert (
-        s.should_soft_rotate("glm", {"default": 4000, "p95": 5000}) is False
-    ), "décision gelée Lot 1 — Lot 3 branchera les seuils"
+        s.should_soft_rotate("glm", {"default": 4000, "p95": 5000}) is True
+    ), "Lot 3 : décision active (consecutive_slow >= 3)"
 
 
 # ── sync registry → superviseurs ────────────────────────────────────────

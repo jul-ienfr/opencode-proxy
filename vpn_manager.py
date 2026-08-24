@@ -429,37 +429,57 @@ class CircuitBreaker:
         self._failure_threshold = failure_threshold
         self._recovery_time = recovery_time
         self._servers: dict[str, dict] = {}  # server_name -> {failures, opened_at, state}
+        # [plan v10 §14.1.11] sonde half-open UNIQUE : sans ce garde, toutes
+        # les coroutines qui arrivent pendant la fenêtre de recovery passent
+        # (thundering herd sur un endpoint malade à chaque recovery).
+        self._half_open_probe: set[str] = set()
 
     def record_success(self, server_name: str):
         """Record a successful connection — reset failure count."""
         self._servers[server_name] = {"failures": 0, "opened_at": 0, "state": "closed"}
+        self._half_open_probe.discard(server_name)
 
     def record_failure(self, server_name: str):
-        """Record a failed connection — increment count, open if threshold reached."""
+        """Record a failed connection — increment count, open if threshold reached.
+
+        [§14.1.11] une sonde half-open qui échoue RE-OUVRE immédiatement
+        (sinon les appelants suivants repassaient tous jusqu'au threshold)."""
         info = self._servers.get(server_name, {"failures": 0, "opened_at": 0, "state": "closed"})
+        was_half_open = info.get("state") == "half-open"
         info["failures"] += 1
-        if info["failures"] >= self._failure_threshold:
+        if was_half_open or info["failures"] >= self._failure_threshold:
             info["state"] = "open"
             info["opened_at"] = time.monotonic()
             logger.warning(
-                "[circuit-breaker] server %s OPEN after %d failures", server_name, info["failures"]
+                "[circuit-breaker] server %s OPEN after %d failures%s",
+                server_name,
+                info["failures"],
+                " (sonde half-open échouée — re-open immédiat)" if was_half_open else "",
             )
         self._servers[server_name] = info
+        self._half_open_probe.discard(server_name)
 
     def is_available(self, server_name: str) -> bool:
-        """Check if a server is available (circuit closed or half-open ready)."""
+        """Check if a server is available (circuit closed or half-open ready).
+
+        [§14.1.11] half-open = UNE seule sonde en vol ; les appelants suivants
+        reçoivent False jusqu'au verdict (success/failure) de la sonde."""
         info = self._servers.get(server_name)
         if not info or info["state"] == "closed":
             return True
         if info["state"] == "open":
             # Check if recovery time has passed -> half-open
             if time.monotonic() - info["opened_at"] >= self._recovery_time:
+                if server_name in self._half_open_probe:
+                    return False  # une sonde est déjà en cours
                 info["state"] = "half-open"
-                logger.info("[circuit-breaker] server %s -> half-open (testing)", server_name)
+                self._half_open_probe.add(server_name)
+                logger.info("[circuit-breaker] server %s -> half-open (testing, sonde unique)", server_name)
                 return True
             return False
-        # half-open: allow one attempt
-        return True
+        # half-open: la sonde unique détient le volant — tout autre appelant
+        # attend le verdict (record_success→closed / record_failure→open).
+        return False
 
     def get_status(self) -> dict:
         """Return status of all tracked servers."""
@@ -488,10 +508,15 @@ class BackoffTimer:
         self._current_delay = self._base_delay
 
     def record_failure(self):
-        """Increase backoff on failure."""
+        """Increase backoff on failure.
+
+        [plan v10 §14.3.6] off-by-one corrigé : l'incrément AVANT le calcul
+        donnait base×mult¹ au premier échec (10s au lieu de 5s) — toute
+        l'échelle était décalée d'un cran. Le 1er échec attend `base`."""
         self._consecutive_failures += 1
         self._current_delay = min(
-            self._base_delay * (self._multiplier**self._consecutive_failures), self._max_delay
+            self._base_delay * (self._multiplier ** (self._consecutive_failures - 1)),
+            self._max_delay,
         )
 
     @property
@@ -751,9 +776,14 @@ class VPNManager:
         self._control_enabled = bool(cfg.get("control_enabled", bool(self._control_api_key)))
         self._country_rotation = bool(cfg.get("country_rotation", False))
         self._country_offset = max(0, int(cfg.get("country_offset", 0) or 0))
+        # [plan v10 v6 §3.4] écart structurel par station (0 = legacy)
+        self._country_offset_stride = max(0, int(cfg.get("country_offset_stride", 0) or 0))
         self._current_country: str | None = None  # pinned country (control server)
         self._country_pinned_at: float | None = None
-        self._country_index = 0  # local cursor fallback (no shared state)
+        # local cursor fallback (no shared state) — décalé par offset effectif
+        self._country_index = (
+            self._country_offset + self._country_offset_stride * (self._station - 1)
+        ) % 1000000
         # [plan 18/08] Hostname blacklist (LIVE AUTH_FAILED, TTL 24 h) —
         # consumed ONLY by the fast-pin path (Phase 1c); free_ip_pool never
         # sees it. Wall-clock epoch timestamps so the TTL survives restarts.
@@ -1571,6 +1601,13 @@ class VPNManager:
                     "name": self._docker_container,
                     "country": self._current_country or self._server_countries,
                 }
+                # [plan v10 §14.3.5] l'IP était posée SANS _record_ip_change →
+                # hors registry croisé anti-réutilisation (une IP servie via
+                # connect_wait pouvait être re-tirée par l'autre station).
+                try:
+                    self._record_ip_change(ip)
+                except Exception:
+                    pass
                 return True
             await asyncio.sleep(3)
         self._set_status(VPNState.ERROR)
@@ -2244,6 +2281,10 @@ class VPNManager:
             self._country_rotation = bool(updates["country_rotation"])
         if "country_offset" in updates:
             self._country_offset = max(0, int(updates["country_offset"] or 0))
+        if "country_offset_stride" in updates:
+            self._country_offset_stride = max(
+                0, int(updates.get("country_offset_stride", 0) or 0)
+            )
         if "wait_healthy_poll" in updates:
             self._wait_healthy_poll = max(0.1, float(updates["wait_healthy_poll"]))
         if "rotation_fail_cooldown" in updates:
@@ -2882,7 +2923,11 @@ class VPNManager:
         """
         if not allowed:
             return False
-        key = frozenset(allowed)
+        # [plan v10 §14.3.3] clé de coalescing AVEC la station : l'ancien
+        # frozenset(allowed) seul faisait coalescer deux stations sur UN pin
+        # exécuté par l'autre tunnel (résultat qui ne concerne pas sa propre
+        # sortie géo). getattr défensif (instances de test via __new__).
+        key = frozenset(allowed) | {f"__station_{getattr(self, '_station', 0)}"}
         # Coalescing: share in-flight pin for same allowed set
         existing = VPNManager._geo_coalesce.get(key)
         if existing is not None and not existing.done():
@@ -2932,11 +2977,9 @@ class VPNManager:
                 candidates &= _gsu
         except Exception:
             pass
-        candidates = (
-            {c for c in candidates if not self._host_blacklisted(c)}
-            if hasattr(self, "_host_blacklisted")
-            else candidates
-        )
+        # [plan v10 §14.3.34] _host_blacklisted appliqué aux PAYS = no-op
+        # dangereux : la blacklist ne contient que des HOSTNAMES NordVPN
+        # (_record_auth_failure), jamais des noms de pays. Filtre retiré.
         if not candidates:
             return False
         try:
@@ -2947,9 +2990,8 @@ class VPNManager:
         for _ in range(max_tries):
             pick = None
             for c in sorted(candidates):
-                if not (hasattr(self, "_host_blacklisted") and self._host_blacklisted(c)):
-                    pick = c
-                    break
+                pick = c
+                break
             if pick is None:
                 pick = sorted(candidates)[0]
             try:

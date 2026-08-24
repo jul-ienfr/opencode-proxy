@@ -226,6 +226,32 @@ def save_yaml_config():
         import yaml
     except ImportError:
         return
+    # [plan v10 §14.0.2 v10 — anti-écrasement] Un process démarré AVANT
+    # l'ajout de nouvelles sections ré-écrit le fichier sans elles (incident
+    # Lot D : dashboard_trust/client_auth/supervisor effacés 2× par un proxy
+    # live à l'état mémoire ancien). Fusion conservatrice : toute section
+    # protégée présente sur disque mais absente de la mémoire est RESTAURÉE.
+    _PROTECTED_SECTIONS = ("dashboard_trust", "client_auth", "supervisor")
+    _PROTECTED_NESTED = {"ip_rotation": ("latency_rotation",)}
+    try:
+        with open(CONFIG_PATH, encoding="utf-8") as _f_disk:
+            _on_disk = yaml.safe_load(_f_disk) or {}
+        if not isinstance(_on_disk, dict):
+            _on_disk = {}
+        for _sec in _PROTECTED_SECTIONS:
+            if _sec not in _yaml_data and isinstance(_on_disk.get(_sec), dict):
+                globals()["_yaml_data"][_sec] = _on_disk[_sec]
+        for _parent, _subs in _PROTECTED_NESTED.items():
+            _disk_parent = _on_disk.get(_parent)
+            if not isinstance(_disk_parent, dict):
+                continue
+            mem_parent = _yaml_data.setdefault(_parent, {})
+            if isinstance(mem_parent, dict):
+                for _sub in _subs:
+                    if _sub not in mem_parent and _sub in _disk_parent:
+                        mem_parent[_sub] = _disk_parent[_sub]
+    except Exception:
+        pass  # jamais bloquer la sauvegarde pour une fusion manquée
     # _reload_lock may not yet be defined at import time; resolve at call time
     lock = globals().get("_reload_lock")
     # Use lock if available, else write without lock (boot path)

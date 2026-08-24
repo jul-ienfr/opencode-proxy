@@ -134,6 +134,14 @@ class FreeIPPool:
         # update_config() (config.yaml `ip_rotation`, hot-reloadable).
         self._connect_retry_interval = float(self._CONNECT_RETRY_INTERVAL)
         self._bad_ttl = float(self._BAD_TTL)
+        # [plan v10 §3.6 Lot 3] Moteur de rotation latence-adaptive — partagé
+        # (singleton), config canonique `ip_rotation.latency_rotation`.
+        try:
+            from latency_rotation import get_engine
+
+            self.latency_engine = get_engine()
+        except Exception:
+            self.latency_engine = None
         # [review 18/08 F1a] Late-signal absorption window — SHORT on
         # purpose (20 s, NOT bad_ttl): long enough for the dial queue of a
         # request launched before a rotation (connect timeout 10 s +
@@ -279,14 +287,22 @@ class FreeIPPool:
         )
 
     def _station_usable(
-        self, station: VPNManager, *, exclude_approaching: bool, forced_pool=None
+        self,
+        station: VPNManager,
+        *,
+        exclude_approaching: bool,
+        forced_pool=None,
+        ignore_latency_cool: bool = False,
     ) -> bool:
         """A station is usable when its tunnel is up and it is not marked
         bad by a recent 429. ``exclude_approaching`` also rules out stations
         at (or beyond) their rotation threshold (preferred pass) — the
         second pass admits them so the request still gets a shot at the
         free tier instead of falling back to paid while a background
-        rotation is in flight."""
+        rotation is in flight.
+        [plan v10 §3.6.4 Lot 3] ``ignore_latency_cool`` = passe de secours
+        LRU : admet une station dont l'IP courante est hard-cooled quand
+        AUCUNE autre n'est disponible (jamais zéro candidat)."""
         if forced_pool is not None:
             cc = getattr(station, "_current_country", None) or getattr(
                 station, "current_country", None
@@ -305,6 +321,16 @@ class FreeIPPool:
             return False
         if station.status != "connected":
             return False
+        if not ignore_latency_cool:
+            try:
+                from latency_rotation import get_engine
+
+                eng = getattr(self, "latency_engine", None) or get_engine()
+                cur_ip = str(getattr(station, "current_ip", "") or "")
+                if cur_ip and eng.ip_hard_cooled(int(station._station), cur_ip):
+                    return False
+            except Exception:
+                pass
         if exclude_approaching and per["request_count"] >= self._rotation_threshold(station):
             return False
         return True
@@ -413,7 +439,35 @@ class FreeIPPool:
         # collect usable with exclude_approaching=False (hedge veut même au seuil)
         usable = [st for st in self._stations if self._station_usable(st, exclude_approaching=False, forced_pool=forced_pool)]
         if not usable:
-            return []
+            # [plan v10 §3.6.5 GARANTIE LRU] toutes hard-cooled/indisponibles →
+            # second pass ignorant le cooldown latence : on sert quand même la
+            # moins mauvaise (jamais de fallback paid par refroidissement seul).
+            usable = [
+                st
+                for st in self._stations
+                if self._station_usable(
+                    st,
+                    exclude_approaching=False,
+                    forced_pool=forced_pool,
+                    ignore_latency_cool=True,
+                )
+            ]
+            if not usable:
+                return []
+            try:
+                from latency_rotation import get_engine
+
+                eng = getattr(self, "latency_engine", None) or get_engine()
+                usable.sort(
+                    key=lambda st: (
+                        eng.cooldown_kind(int(st._station), str(getattr(st, "current_ip", "") or ""))
+                        == "hard",
+                        st._station,
+                    )
+                )
+            except Exception:
+                pass
+            return [usable[0]]
         # if free_parallel disabled, return only best (no hedge)
         if not self._free_parallel_enabled:
             return [usable[0]] if usable else []
@@ -711,7 +765,22 @@ class FreeIPPool:
                                 self._active_station = station
                                 per = self._per_station(station)
                                 per["last_quota_per_ip"] = station._quota_per_ip
+                                # [plan v10 §14.3.10] la branche geo incrémentait
+                                # request_count SANS jamais consulter le seuil :
+                                # une station au seuil servait indéfiniment sous
+                                # geo-pool. Même logique que le chemin normal.
                                 per["request_count"] += 1
+                                if per["request_count"] >= self._rotation_threshold(station):
+                                    logger.info(
+                                        "[free-ip] st%d geo-branch over quota threshold (%d/%d) — rotation kick",
+                                        station._station,
+                                        per["request_count"],
+                                        station._quota_per_ip,
+                                    )
+                                    if self._rotation_threshold(station) <= 1:
+                                        self._kick_connect(station)
+                                    else:
+                                        self._launch_rotation(station)
                                 station.note_free_request()
                                 ip = station.current_ip or "unknown"
                                 if ip not in per["ip_stats"]:
@@ -859,6 +928,20 @@ class FreeIPPool:
         # station.current_ip against this to detect a MANAGER repair (re-pin
         # with no pool rotation involved) and absorb its late-signal tail.
         per["last_confirmed_ip"] = new_ip
+        # [plan v10 §3.6.5 Lot 3] warm-up post-rotation : reset consecutive_slow
+        # du superviseur + note rotation au moteur (anti-flap/global_degraded).
+        try:
+            eng = getattr(self, "latency_engine", None)
+            if eng is not None:
+                eng._note_rotation(int(station._station))
+            import shared_state as _ss
+
+            for sup in getattr(_ss, "station_supervisors", None) or []:
+                if sup.station == station._station:
+                    sup.on_ip_finalized(new_ip)
+                    break
+        except Exception:
+            pass
         return new_ip
 
     def on_quota_exhausted(
@@ -1137,6 +1220,16 @@ class FreeIPPool:
                         await asyncio.wait_for(asyncio.shield(task), remaining)
                 except TimeoutError:
                     return False
+                except Exception as exc:
+                    # [plan v10 §14.1.7] RotationFailed (breaker ouvert,
+                    # fail-fast 300s, socks5 interdit…) sortait du handler en
+                    # 500 au lieu du fallback paid promis. Fail-soft : False.
+                    import logging as _lg
+
+                    _lg.getLogger(__name__).debug(
+                        "[pool] rotation task failed for st%s: %s", station._station, exc
+                    )
+                    return False
                 # [Revue 19/08] The post-commit probe [Axe 1.2] can stamp a
                 # bad_until on the FRESH IP BEFORE this waiter wakes (the
                 # probe runs inside _rotate_station, right before the task
@@ -1297,6 +1390,16 @@ class FreeIPPool:
             )
         finally:
             self._rotation_tasks.pop(sid, None)
+            # [plan v10 §14.1.8] le tag géo était posé par _launch_rotation et
+            # JAMAIS nettoyé : après UN 429 géo, toutes les rotations futures
+            # de la station restaient verrouillées sur ces pays jusqu'au
+            # restart process. Le pin a consommé le tag — on le lève ici.
+            try:
+                if getattr(station, "_geo_forced_pool", None) is not None:
+                    station._geo_forced_pool = None
+                    logger.info("[free-ip] st%d _geo_forced_pool cleared after rotation", sid)
+            except Exception:
+                pass
         if needs_retry:
             # [Axe 1.2] Re-queue AFTER the finally-pop: _launch_rotation
             # dedups on _rotation_tasks, which is still registered until
@@ -1443,6 +1546,15 @@ class FreeIPPool:
         # `ip_rotation.socks5_proxies` / `quota_per_ip`, hot-reloadable).
         if "socks5_proxies" in cfg and isinstance(cfg["socks5_proxies"], list):
             self.set_socks5_proxies(cfg["socks5_proxies"])
+        # [plan v10 §3.6.2 Lot 3] bloc canonique latency_rotation → moteur
+        # (hot-reload, même corps que le dashboard envoie aux managers).
+        if "latency_rotation" in cfg:
+            eng = getattr(self, "latency_engine", None)
+            if eng is not None:
+                try:
+                    eng.update_config(cfg["latency_rotation"] or {})
+                except Exception:
+                    pass
         # [Axe 3.1] Auto-rotate OFF = stick to the current proxy while
         # usable (rotation only via bad-mark or the rotate endpoint).
         if "socks5_auto_rotate" in cfg:

@@ -653,11 +653,11 @@ class TestWatchdogTick:
         mgr.ips = []
         await mgr._watchdog_tick()
         assert mgr._watchdog_backoff.consecutive_failures == 1
-        assert mgr._watchdog_backoff.delay == 30  # 15 * 2^1
+        assert mgr._watchdog_backoff.delay == 15  # [v10 §14.3.6] 1er échec = base (off-by-one corrigé)
         assert mgr.escalations == 0
         await mgr._watchdog_tick()
         assert mgr._watchdog_backoff.consecutive_failures == 2
-        assert mgr._watchdog_backoff.delay == 60  # capped at backoff_max
+        assert mgr._watchdog_backoff.delay == 30  # [v10 §14.3.6] base×mult^1
         assert mgr.escalations == 1  # escalated, ≥2 failures
         assert mgr.calls["restart"] == 2  # light restart per tick
         assert mgr.calls["compose_up"] == 2  # one recreate per tick
@@ -998,7 +998,11 @@ class TestWatchdogLoop:
         with pytest.raises(asyncio.CancelledError):
             await mgr._watchdog_loop()
         assert ticks["n"] == 4
-        assert recorded[:3] == [mgr._watchdog_interval, 30.0, mgr._watchdog_interval]
+        assert recorded[:3] == [
+            mgr._watchdog_interval,
+            15.0,
+            mgr._watchdog_interval,
+        ]  # [v10 §14.3.6] 1er échec = base 15s (off-by-one corrigé)
         assert len(recorded) == 4  # 4th sleep never taken
 
     @pytest.mark.asyncio
