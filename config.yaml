@@ -118,6 +118,16 @@ free_model_map:
   deepseek-v4-flash: deepseek-v4-flash-free
   hy3: hy3-free
   muse-spark-1.2-contributor: muse-spark-1.2-contributor-free
+dashboard_trust:
+  mode: lan
+  lan_cidrs:
+  - 192.168.0.0/16
+  - 10.0.0.0/8
+  - 172.16.0.0/12
+  require_token: false
+client_auth:
+  mode: none
+  key: ''
 ip_rotation:
   enabled: true
   proxy_mode: vpn
