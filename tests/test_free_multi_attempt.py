@@ -208,14 +208,52 @@ def free_cfg():
             "free_exception_fallback",
             "strict_free",
             "auto_max_free_attempts",
+            "station_count",
+            "free_parallel",
         )
     }
+    # deep copy for dict values
+    if isinstance(saved.get("free_parallel"), dict):
+        saved["free_parallel"] = dict(saved["free_parallel"])
+    # ensure known clean state for this test (station_count 2, free_parallel OFF)
+    # otherwise a previous test file that changed station_count to 5 would leak
+    oc.IP_ROTATION["station_count"] = 2
+    oc.IP_ROTATION["free_parallel"] = {
+        "enabled": False,
+        "routing": "round-robin",
+        "mode": "load-balance",
+        "hedge_delay_ms": 300,
+        "hedge_max_attempts": 1,
+    }
+    try:
+        import config.settings as _st
+
+        _st.FREE_PARALLEL.clear()
+        _st.FREE_PARALLEL.update(_st._normalize_free_parallel(oc.IP_ROTATION["free_parallel"]))
+        if hasattr(oc, "_free_ip_pool") and oc._free_ip_pool and hasattr(oc._free_ip_pool, "update_config"):
+            oc._free_ip_pool.update_config(oc.IP_ROTATION)
+    except Exception:
+        pass
     yield
     for k, v in saved.items():
         if v is None:
             oc.IP_ROTATION.pop(k, None)
         else:
-            oc.IP_ROTATION[k] = v
+            # restore dict copy to avoid aliasing
+            oc.IP_ROTATION[k] = dict(v) if isinstance(v, dict) else v
+    # also sync settings mirror and pool if free_parallel changed
+    try:
+        import config.settings as _st
+
+        _st.FREE_PARALLEL.clear()
+        _st.FREE_PARALLEL.update(_st._normalize_free_parallel(oc.IP_ROTATION.get("free_parallel", {})))
+    except Exception:
+        pass
+    try:
+        if oc._free_ip_pool and hasattr(oc._free_ip_pool, "update_config"):
+            oc._free_ip_pool.update_config(oc.IP_ROTATION)
+    except Exception:
+        pass
 
 
 def _free_body():

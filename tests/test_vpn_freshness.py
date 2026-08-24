@@ -423,7 +423,7 @@ class TestConnectNext:
         shared.record_ip("1.1.1.1", 1)
         mgr = FakeVPNManager(_cfg(tmp_path), shared=shared, tmp_path=tmp_path)
         mgr.ips = ["1.1.1.1", "1.1.1.1", None]  # recent, recent, dead
-        with pytest.raises(vm.RotationFailed, match="public IP"):
+        with pytest.raises(vm.RotationFailed, match="public IP|IP publique"):
             await mgr.connect_next()
         assert mgr._status == vm.VPNState.ERROR
         assert mgr._last_rotation_failed_at is not None  # CRITIC(6) armed
@@ -444,7 +444,7 @@ class TestConnectNext:
         mgr = FakeVPNManager(_cfg(tmp_path), shared=shared, tmp_path=tmp_path)
         mgr.ips = ["1.1.1.1", "1.1.1.1", None]  # recent, recent, dead
         mgr._watchdog_event = asyncio.Event()  # fake: start() never runs
-        with pytest.raises(vm.RotationFailed, match="public IP"):
+        with pytest.raises(vm.RotationFailed, match="public IP|IP publique"):
             await mgr.connect_next()
         assert mgr._rotation_probe_dead is True
         assert mgr._egress_failures == mgr._auto_wg_egress_ticks
@@ -461,7 +461,7 @@ class TestConnectNext:
         mgr._current_ip = "1.1.1.1"  # old_ip non-None
         mgr.ips = ["1.1.1.1", "1.1.1.1", "1.1.1.1"]  # unchanged ×3
         mgr._watchdog_event = asyncio.Event()
-        with pytest.raises(vm.RotationFailed, match="unchanged"):
+        with pytest.raises(vm.RotationFailed, match="unchanged|inchangée"):
             await mgr.connect_next()
         assert mgr._rotation_probe_dead is False
         assert mgr._egress_failures == 0
@@ -476,7 +476,7 @@ class TestConnectNext:
         mgr = FakeVPNManager(_cfg(tmp_path), shared=shared, tmp_path=tmp_path)
         mgr.ips = ["1.1.1.1", "1.1.1.1", None]
         mgr._egress_failures = 5  # pre-armed higher
-        with pytest.raises(vm.RotationFailed, match="public IP"):
+        with pytest.raises(vm.RotationFailed, match="public IP|IP publique"):
             await mgr.connect_next()
         assert mgr._egress_failures == 5
 
@@ -493,7 +493,7 @@ class TestConnectNext:
         mgr._current_ip = "1.1.1.1"
         mgr.ips = [None, "1.1.1.1", "1.1.1.1"]  # dead, live→unchanged ×2
         mgr._watchdog_event = asyncio.Event()
-        with pytest.raises(vm.RotationFailed, match="unchanged"):
+        with pytest.raises(vm.RotationFailed, match="unchanged|inchangée"):
             await mgr.connect_next()
         assert mgr._rotation_probe_dead is False  # probe answered
         assert mgr._egress_failures == 0
@@ -513,7 +513,7 @@ class TestConnectNext:
         # so poke the attr directly — the wall semantics are what is tested.
         mgr.ips = ["1.1.1.1"]  # the probe never answers
         mgr.probe_delay = 1.5  # slower than the budget
-        with pytest.raises(vm.RotationFailed, match="wall"):
+        with pytest.raises(vm.RotationFailed, match="wall|délai"):
             await mgr.connect_next()
         assert mgr._status == vm.VPNState.ERROR
         assert mgr.ips == ["1.1.1.1"]  # probe 1 started, 0 answered
@@ -1332,7 +1332,7 @@ class TestApplyUpdate:
         mgr._finalize_ip = self._finalize_stub(mgr, False, log)
         result = await mgr.apply_update()
         assert result["ok"] is False
-        assert "could not finalize a fresh IP" in result["error"]
+        assert ("could not finalize a fresh IP" in result["error"] or "impossible de finaliser" in result["error"])
         assert log["calls"] == 1
         assert log["allow_stale"] is False
         assert mgr.calls["docker_run"] == 3

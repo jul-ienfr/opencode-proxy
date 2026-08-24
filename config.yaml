@@ -108,11 +108,11 @@ models:
   deepseek-v4-flash-vision-exp:
     protocol: openai
 free_model_map:
+  mimo-v2.5: deepseek-v4-flash-free
   glm-5.1: deepseek-v4-flash-free
   kimi-k2.6: mimo-v2.5-free
   qwen3.7-max: mimo-v2.5-free
   minimax-m2.5: mimo-v2.5-free
-  mimo-v2.5: deepseek-v4-flash-free
   deepseek-v4-flash: deepseek-v4-flash-free
   hy3: hy3-free
   muse-spark-1.2-contributor: muse-spark-1.2-contributor-free
@@ -120,7 +120,7 @@ ip_rotation:
   enabled: true
   proxy_mode: vpn
   dual_station: true
-  station_count: 2
+  station_count: 3
   strict_free: false
   quota_per_ip: 500
   switch_delay: 1
@@ -177,22 +177,29 @@ ip_rotation:
   server_provider: nordvpn
   control_api_key: ***REMOVED-ROTATE-ME***
   control_enabled: true
-  vpn_stack: wireguard
+  vpn_stack: auto
+  ovpn_protocol: tcp
   auto_ov_fail_threshold: 3
   auto_ov_return_min: 60
-  auto_wg_egress_ticks: 3
-  egress_failure_tick_interval: 2.0
+  auto_wg_egress_ticks: 1
+  egress_failure_tick_interval: 0.5
   ip_probe_budget: 8.0
   control_pin_timeout: 20
   control_pin_catchup: 25
-  auto_flip_cooldown_min: 30
+  auto_flip_cooldown_min: 0
   rotation_wait_timeout: 20
   rotation_max_duration: 240
   country_rotation: true
   country_offset: 14
   docker_events: true
   auto_max_free_attempts: true
-  max_free_attempts: 2
+  free_parallel:
+    enabled: true
+    routing: round-robin
+    mode: strict
+    hedge_delay_ms: 300
+    hedge_max_attempts: 1
+  max_free_attempts: 3
   free_exception_fallback: station-first
 geo:
   enabled: true

@@ -57,7 +57,7 @@ if hasattr(subprocess, "CREATE_NO_WINDOW"):
 class _TTLCache:
     """In-memory cache with TTL for reducing redundant DB scans."""
 
-    def __init__(self, ttl: float = 10.0):
+    def __init__(self, ttl: float = 2.0):
         self._ttl = ttl
         self._store: dict[str, tuple[float, any]] = {}
         self._cleanup_counter = 0
@@ -88,7 +88,7 @@ class _TTLCache:
             self._store.clear()
 
 
-_stats_cache = _TTLCache(ttl=10.0)
+_stats_cache = _TTLCache(ttl=2.0)
 
 # Cache for local IP resolution (rarely changes)
 _local_ips_cache: tuple[float, list] | None = None
@@ -165,7 +165,7 @@ def _check_dashboard_token(request: Request):
                 status_code=403,
                 content={
                     "error": "forbidden",
-                    "message": "DASHBOARD_TOKEN required when host is 0.0.0.0 (set DASHBOARD_TOKEN env or DASHBOARD_REQUIRE_TOKEN=false).",
+                    "message": "DASHBOARD_TOKEN requis quand host est 0.0.0.0 (définissez DASHBOARD_TOKEN env ou DASHBOARD_REQUIRE_TOKEN=false).",
                 },
             )
         return None
@@ -176,7 +176,7 @@ def _check_dashboard_token(request: Request):
         status_code=401,
         content={
             "error": "unauthorized",
-            "message": "Valid X-Dashboard-Token header required (DASHBOARD_TOKEN env).",
+            "message": "En-tête X-Dashboard-Token valide requis (env DASHBOARD_TOKEN).",
         },
     )
 
@@ -410,7 +410,26 @@ def _persist_vpn_config(updates: dict):
                 "custom_ovpn_file": "custom_ovpn_file",
             }
 
-        changed = False
+        # [free_parallel] nested dict (B) Stations free — validate + merge (preserve existing keys)
+        _fp_changed = False
+        if "free_parallel" in updates and isinstance(updates["free_parallel"], dict):
+            try:
+                import config.settings as _st_fp
+
+                existing_fp = ip_rot.get("free_parallel", {}) if isinstance(ip_rot.get("free_parallel"), dict) else {}
+                merged_fp = {**existing_fp, **updates["free_parallel"]}
+                norm = _st_fp._normalize_free_parallel(merged_fp)
+            except Exception:
+                # fallback: shallow merge without normalization
+                existing_fp = ip_rot.get("free_parallel", {}) if isinstance(ip_rot.get("free_parallel"), dict) else {}
+                norm = {**existing_fp, **updates["free_parallel"]}
+            old_fp = ip_rot.get("free_parallel", {})
+            if old_fp != norm:
+                ip_rot["free_parallel"] = norm
+                _fp_changed = True
+            # remove so key_map loop doesn't see it
+            updates = {k: v for k, v in updates.items() if k != "free_parallel"}
+        changed = _fp_changed
         for key, yaml_key in key_map.items():
             if key in updates:
                 old_val = ip_rot.get(yaml_key)
@@ -418,6 +437,43 @@ def _persist_vpn_config(updates: dict):
                 if old_val != new_val:
                     ip_rot[yaml_key] = new_val
                     changed = True
+        # flat free_parallel_* keys (dashboard compat: free_parallel_routing plat)
+        _flat_fp_map = {
+            "free_parallel_enabled": ("enabled", lambda v: bool(v)),
+            "free_parallel_routing": (
+                "routing",
+                lambda v: str(v).lower() if str(v).lower() in ("round-robin", "failover") else "round-robin",
+            ),
+            "free_parallel_mode": (
+                "mode",
+                lambda v: str(v).lower() if str(v).lower() in ("load-balance", "strict", "hedge") else "load-balance",
+            ),
+            "free_parallel_hedge_delay_ms": ("hedge_delay_ms", lambda v: max(0, min(2000, int(v)))),
+            "free_parallel_hedge_max_attempts": ("hedge_max_attempts", lambda v: max(1, min(3, int(v)))),
+        }
+        for flat_key, (sub, coerce) in _flat_fp_map.items():
+            if flat_key in updates:
+                try:
+                    new_val = coerce(updates[flat_key])
+                except Exception:
+                    continue
+                if "free_parallel" not in ip_rot or not isinstance(ip_rot.get("free_parallel"), dict):
+                    ip_rot["free_parallel"] = {}
+                old_val = ip_rot["free_parallel"].get(sub)
+                if old_val != new_val:
+                    ip_rot["free_parallel"][sub] = new_val
+                    changed = True
+        # normalize final free_parallel after flat merges (clamp, defaults)
+        if "free_parallel" in ip_rot and isinstance(ip_rot["free_parallel"], dict):
+            try:
+                import config.settings as _st_fp2
+
+                norm2 = _st_fp2._normalize_free_parallel(ip_rot["free_parallel"])
+                if ip_rot["free_parallel"] != norm2:
+                    ip_rot["free_parallel"] = norm2
+                    changed = True
+            except Exception:
+                pass
 
         if changed:
             config["ip_rotation"] = ip_rot
@@ -464,6 +520,21 @@ def _persist_vpn_config(updates: dict):
                     cur.update(ip_rot)
                 else:
                     _st._yaml_data["ip_rotation"] = dict(ip_rot)
+                # [free_parallel] keep FREE_PARALLEL mirror in sync
+                try:
+                    _st.FREE_PARALLEL.clear()
+                    _st.FREE_PARALLEL.update(_st._normalize_free_parallel(ip_rot.get("free_parallel", {})))
+                except Exception:
+                    pass
+            except Exception:
+                pass
+            # [free_parallel] pool hot-reload for direct _persist calls
+            try:
+                import shared_state as _ss
+
+                _pool = getattr(_ss, "free_ip_pool", None)
+                if _pool is not None and hasattr(_pool, "update_config"):
+                    _pool.update_config(ip_rot)
             except Exception:
                 pass
             # Best-effort hot-reload des managers pour appels directs (tests, SSE)
@@ -1010,7 +1081,24 @@ def register_dashboard(
                 "match": info["match"],
                 "model": info["model"],
             }
-        models_info = get_available_models()
+        # Fast path: local_ips and models are slow (socket, disk), return cached/instant
+        try:
+            models_info = get_available_models()
+        except Exception:
+            models_info = []
+        # local_ips: use cache if available, otherwise don't block (empty, next poll will fill)
+        try:
+            if _local_ips_cache and (time.monotonic() - _local_ips_cache[0]) < 60:
+                local_ips = _local_ips_cache[1]
+            else:
+                # don't await — return cached or empty, refresh in background
+                local_ips = _local_ips_cache[1] if _local_ips_cache else []
+                try:
+                    asyncio.create_task(asyncio.to_thread(_get_local_ips))
+                except Exception:
+                    pass
+        except Exception:
+            local_ips = []
         return {
             "proxy": PROXY or "",
             "api_key_set": bool(API_KEY),
@@ -1019,7 +1107,7 @@ def register_dashboard(
             else ("****" if API_KEY else ""),
             "host": HOST,
             "port": PORT,
-            "local_ips": await asyncio.to_thread(_get_local_ips),
+            "local_ips": local_ips,
             "web_port": WEB_PORT,
             "routes": routes_info,
             "models": models_info,
@@ -1061,6 +1149,7 @@ def register_dashboard(
                 for k in API_KEYS
             ],
             "routing": API_KEY_ROUTING,
+            "free_parallel": dict(getattr(config_settings, "FREE_PARALLEL", {})),
             "free_model_map": config_settings.FREE_MODEL_MAP,
             "lang": os.getenv("PROXY_LANG", "en"),
         }
@@ -1141,7 +1230,7 @@ def register_dashboard(
         if ctrl_key and provided_ctrl != ctrl_key:
             return JSONResponse(
                 status_code=401,
-                content={"error": "unauthorized", "message": "Valid X-API-Key required"},
+                content={"error": "unauthorized", "message": "X-API-Key valide requise"},
             )
         # ETag via mtime
         current_mtime = _config_yaml_mtime()
@@ -1152,7 +1241,7 @@ def register_dashboard(
                 status_code=412,
                 content={
                     "error": "precondition_failed",
-                    "message": "Stale ETag — reload and retry",
+                    "message": "ETag obsolète — rechargez et réessayez",
                 },
             )
         body = await request.json()
@@ -1165,11 +1254,11 @@ def register_dashboard(
                 config_settings.GEO_VERSION = int(body["version"])
                 config_settings._yaml_data.setdefault("geo", {})["version"] = int(body["version"])
             except Exception:
-                return JSONResponse(status_code=400, content={"error": "version must be int"})
+                return JSONResponse(status_code=400, content={"error": "version doit être un entier"})
         if "policies" in body:
             pol = body["policies"]
             if not isinstance(pol, dict):
-                return JSONResponse(status_code=400, content={"error": "policies must be object"})
+                return JSONResponse(status_code=400, content={"error": "policies doit être un objet"})
             config_settings.GEO_POLICIES.clear()
             config_settings.GEO_POLICIES.update(pol)
             config_settings.SORTED_GEO_POLICIES[:] = sorted(pol.items())
@@ -1345,9 +1434,9 @@ def register_dashboard(
             try:
                 new_port = int(body["port"])
             except (ValueError, TypeError):
-                return {"status": "error", "message": "Invalid port value"}
+                return {"status": "error", "message": "Valeur de port invalide"}
             if not (1 <= new_port <= 65535):
-                return {"status": "error", "message": "Port must be between 1 and 65535"}
+                return {"status": "error", "message": "Le port doit être entre 1 et 65535"}
             if new_port != PORT:
                 env_updates["OPENCODE_PORT"] = str(new_port)
                 restart_needed = True
@@ -1356,9 +1445,9 @@ def register_dashboard(
             try:
                 new_web_port = int(body["web_port"])
             except (ValueError, TypeError):
-                return {"status": "error", "message": "Invalid web port value"}
+                return {"status": "error", "message": "Valeur de port web invalide"}
             if not (1 <= new_web_port <= 65535):
-                return {"status": "error", "message": "Web port must be between 1 and 65535"}
+                return {"status": "error", "message": "Le port web doit être entre 1 et 65535"}
             if new_web_port != WEB_PORT:
                 env_updates["OPENCODE_WEB_PORT"] = str(new_web_port)
                 restart_needed = True
@@ -1390,13 +1479,13 @@ def register_dashboard(
                     return {
                         "status": "error",
                         "needs_restart": True,
-                        "message": f"Hot-restart failed: {e}. Manual restart required.",
+                        "message": f"Échec redémarrage à chaud : {e}. Redémarrage manuel requis.",
                     }
 
         return {
             "status": "ok",
             "needs_restart": False,
-            "message": "Configuration updated.",
+            "message": "Configuration mise à jour.",
         }
 
     # ── Proxy control ──
@@ -1412,34 +1501,34 @@ def register_dashboard(
     async def proxy_start():
         mgr = server_manager_getter() if server_manager_getter else None
         if not mgr:
-            return {"status": "ok", "message": "No server manager available"}
+            return {"status": "ok", "message": "Aucun gestionnaire de serveur disponible"}
         if mgr.is_running:
-            return {"status": "ok", "message": "Already running"}
+            return {"status": "ok", "message": "Déjà en cours"}
         mgr.start()
-        return {"status": "ok", "message": "Proxy started"}
+        return {"status": "ok", "message": "Proxy démarré"}
 
     @app.post("/api/proxy/stop")
     async def proxy_stop():
         mgr = server_manager_getter() if server_manager_getter else None
         if not mgr:
-            return {"status": "ok", "message": "No server manager available"}
+            return {"status": "ok", "message": "Aucun gestionnaire de serveur disponible"}
         if not mgr.is_running:
-            return {"status": "ok", "message": "Already stopped"}
+            return {"status": "ok", "message": "Déjà arrêté"}
         mgr.stop()
-        return {"status": "ok", "message": "Proxy stopped"}
+        return {"status": "ok", "message": "Proxy arrêté"}
 
     @app.post("/api/proxy/restart")
     async def proxy_restart(full: bool = False):
         mgr = server_manager_getter() if server_manager_getter else None
         if not mgr:
-            return {"status": "error", "message": "No server manager available"}
+            return {"status": "error", "message": "Aucun gestionnaire de serveur disponible"}
         if full:
             # Schedule full restart after response is sent
             loop = asyncio.get_event_loop()
             loop.call_soon(mgr.full_restart)
-            return {"status": "ok", "message": "Full restart triggered"}
+            return {"status": "ok", "message": "Redémarrage complet déclenché"}
         mgr.restart()
-        return {"status": "ok", "message": "Proxy restarted"}
+        return {"status": "ok", "message": "Proxy redémarré"}
 
     # ── Stats & history ──
 
@@ -1990,22 +2079,71 @@ def register_dashboard(
         import shared_state
 
         managers = getattr(shared_state, "vpn_managers", None) or []
+        refreshed_at = datetime.now(UTC).isoformat()
+        refresh_error = None
+        stale = False
         if managers:
-            # [plan 18/08 §4] N-station: refresh every active tunnel so the
-            # IPs / servers shown in the VPN tab stay live (was mgr1+mgr2).
-            for mgr in managers:
-                await mgr.refresh_status()
+            try:
+                _results = await asyncio.wait_for(
+                    asyncio.gather(*(mgr.refresh_status(force=False) for mgr in managers), return_exceptions=True),
+                    timeout=2.0,
+                )
+                for _r in _results:
+                    if isinstance(_r, Exception):
+                        refresh_error = f"{type(_r).__name__}: {_r}"
+                        break
+                refreshed_at = datetime.now(UTC).isoformat()
+            except asyncio.TimeoutError:
+                stale = True
+                refresh_error = "refresh timeout after 2.0s"
+                refreshed_at = datetime.now(UTC).isoformat()
+                try:
+                    asyncio.create_task(
+                        asyncio.gather(*(mgr.refresh_status() for mgr in managers), return_exceptions=True)
+                    )
+                except Exception:
+                    pass
+            except Exception as _e:
+                refresh_error = f"{type(_e).__name__}: {_e}"
             if shared_state.free_ip_pool:
                 data = shared_state.free_ip_pool.get_status()
             else:
-                data = managers[0].get_status()
+                try:
+                    _all = [m.get_status() for m in managers]
+                    _connected = sum(1 for _s in _all if _s.get("status") == "connected")
+                    _total = len(_all)
+                    _agg = "connected" if _connected > 0 else ("error" if all(_s.get("status") == "error" for _s in _all) else _all[0].get("status", "not_configured"))
+                    data = _all[0].copy()
+                    data["status"] = _agg
+                    data["vpn_status"] = _agg
+                    data["healthy"] = _connected
+                    data["total"] = _total
+                    data["stations"] = [
+                        {"station": _s.get("station"), "vpn_status": _s.get("status"), "current_ip": _s.get("ip"), "current_server": _s.get("server"), "vpn": _s}
+                        for _s in _all
+                    ]
+                except Exception:
+                    try:
+                        data = managers[0].get_status()
+                    except Exception:
+                        data = {"enabled": False, "status": "not_configured"}
         else:
             data = {"enabled": False, "status": "not_configured"}
         # Per-IP usage stats — injected unconditionally (works in direct mode
         # too: free_ip is then the residential IP). Frontend polls this
         # endpoint every 10s while the vpn tab is active.
+        # Fast path: instant GUI — return cached or empty, refresh in background
         if isinstance(data, dict):
-            data["ip_stats"] = await _ip_stats_db(shared_state.vpn_manager)
+            cached_ip = _stats_cache.get("ip_stats")
+            if cached_ip is not None:
+                data["ip_stats"] = cached_ip
+            else:
+                data["ip_stats"] = {}
+            # refresh in background (don't block)
+            try:
+                asyncio.create_task(_ip_stats_db(shared_state.vpn_manager))
+            except Exception:
+                pass
             # [plan] F: cross-station shared state (recent-IP registry +
             # identity cursor) — lets the VPN tab show why an IP is skipped.
             rot = getattr(shared_state, "shared_rotation", None)
@@ -2128,6 +2266,21 @@ def register_dashboard(
                 }
             if countries:
                 data["countries"] = countries
+            # [prancy-unicorn Phase1] staleness + refresh observability for GUI spinner/tooltip
+            data["stale"] = stale
+            data["refreshed_at"] = refreshed_at
+            data["refresh_error"] = refresh_error
+            # [prancy-unicorn Phase1 Q5] garde-fou clone frais : warning si N>=2 && !free_parallel
+            try:
+                _fp_cfg = config_settings.FREE_PARALLEL if hasattr(config_settings, "FREE_PARALLEL") else {}
+                _fp_enabled = bool(_fp_cfg.get("enabled")) if isinstance(_fp_cfg, dict) else False
+                _n = int(data.get("total") or len(managers) or 0)
+                if _n >= 2 and not _fp_enabled:
+                    data["free_parallel_warning"] = "tout sur station 1 — activer free_parallel"
+                else:
+                    data["free_parallel_warning"] = None
+            except Exception:
+                pass
         return data
 
     @app.get("/api/vpn-config")
@@ -2188,7 +2341,7 @@ def register_dashboard(
                     _st._yaml_data["free_model_map"] = dict(_fmm)
                 except Exception as e:
                     _debug(f"  [free] free_model_map hot-reload failed: {e}")
-                    return {"error": f"free_model_map hot-reload failed: {e}"}
+                    return {"error": f"échec hot-reload free_model_map : {e}"}
                 _persist_free_model_map(_fmm)
 
         # [plan 19/08 §1/§2] free multi-attempt + exception ordering —
@@ -2200,11 +2353,33 @@ def register_dashboard(
             try:
                 body["max_free_attempts"] = max(1, min(3, int(body["max_free_attempts"])))
             except (TypeError, ValueError):
-                return {"error": "max_free_attempts must be an integer in [1,3]"}
+                return {"error": "max_free_attempts doit être un entier entre 1 et 3"}
         if "free_exception_fallback" in body:
             if str(body["free_exception_fallback"]) not in ("station-first", "direct"):
-                return {"error": "free_exception_fallback must be 'station-first' or 'direct'"}
+                return {"error": "free_exception_fallback doit être 'station-first' ou 'direct'"}
             body["free_exception_fallback"] = str(body["free_exception_fallback"])
+        # [free_parallel] validate nested + flat keys
+        if "free_parallel" in body:
+            if not isinstance(body["free_parallel"], dict):
+                return {"error": "free_parallel doit être un objet"}
+            try:
+                import config.settings as _st_fp
+
+                body["free_parallel"] = _st_fp._normalize_free_parallel(body["free_parallel"])
+            except Exception as e:
+                return {"error": f"free_parallel invalide : {e}"}
+        for _fk in ("free_parallel_enabled", "free_parallel_routing", "free_parallel_mode", "free_parallel_hedge_delay_ms"):
+            if _fk in body:
+                # will be validated in _persist_vpn_config / pool.update_config; keep as is
+                pass
+        if "free_parallel_routing" in body:
+            if str(body["free_parallel_routing"]).lower() not in ("round-robin", "failover"):
+                return {"error": "free_parallel_routing doit être 'round-robin' ou 'failover'"}
+            body["free_parallel_routing"] = str(body["free_parallel_routing"]).lower()
+        if "free_parallel_mode" in body:
+            if str(body["free_parallel_mode"]).lower() not in ("load-balance", "strict", "hedge"):
+                return {"error": "free_parallel_mode doit être 'load-balance', 'strict' ou 'hedge'"}
+            body["free_parallel_mode"] = str(body["free_parallel_mode"]).lower()
 
         # Handle config updates (need VPN manager). [plan] F: fan-out to
         # ALL stations — identity pool, watchdog backoff and freshness
@@ -2230,7 +2405,7 @@ def register_dashboard(
                     return JSONResponse(
                         status_code=400,
                         content={
-                            "error": f"station_count must be an integer in [1,10], got {_raw_n!r}"
+                            "error": f"station_count doit être un entier entre 1 et 10, reçu {_raw_n!r}"
                         },
                     )
                 body.pop("station_count")  # consumed — never fanned out
@@ -2241,7 +2416,7 @@ def register_dashboard(
                         await _apply_station_count(_new_n)
                     except Exception as e:
                         _debug(f"  [vpn] station_count hot-reload failed: {e}")
-                        return {"error": f"station_count hot-reload failed: {e}"}
+                        return {"error": f"échec hot-reload station_count : {e}"}
                     managers = getattr(shared_state, "vpn_managers", None) or []
             for mgr in managers:
                 await mgr.update_config(body)
@@ -2309,7 +2484,7 @@ def register_dashboard(
             if shared_state.free_ip_pool:
                 shared_state.free_ip_pool._vpn = shared_state.vpn_manager
             return {"ok": True, "enabled": enabled}
-        return {"error": "VPN manager not initialized"}
+        return {"error": "gestionnaire VPN non initialisé"}
 
     @app.post("/api/vpn/connect")
     async def connect_vpn(request: Request):
@@ -2320,7 +2495,7 @@ def register_dashboard(
         import shared_state
 
         if not shared_state.vpn_manager:
-            return {"error": "VPN manager not initialized"}
+            return {"error": "gestionnaire VPN non initialisé"}
 
         await shared_state.vpn_manager.refresh_status()
         if shared_state.vpn_manager.status == "connected":
@@ -2349,7 +2524,7 @@ def register_dashboard(
         import shared_state
 
         if not shared_state.vpn_manager:
-            return {"error": "VPN manager not initialized"}
+            return {"error": "gestionnaire VPN non initialisé"}
         await shared_state.vpn_manager.disconnect()
         return {"ok": True}
 
@@ -2362,7 +2537,7 @@ def register_dashboard(
         import shared_state
 
         if not shared_state.vpn_manager:
-            return {"error": "VPN manager not initialized"}
+            return {"error": "gestionnaire VPN non initialisé"}
         result = await shared_state.vpn_manager.health_check()
         return result
 
@@ -2380,7 +2555,7 @@ def register_dashboard(
 
         managers = getattr(shared_state, "vpn_managers", None) or []
         if not managers:
-            return {"error": "VPN manager not initialized"}
+            return {"error": "gestionnaire VPN non initialisé"}
         try:
             body = await request.json()
         except Exception:
@@ -2394,7 +2569,7 @@ def register_dashboard(
             # [plan 18/08 §4] N-station: 1-indexed lookup in the registry.
             if not (1 <= station <= len(managers)):
                 return {
-                    "error": f"station {station} not configured (station_count={len(managers)})"
+                    "error": f"station {station} non configurée (station_count={len(managers)})"
                 }
             mgr = managers[station - 1]
         else:
@@ -2435,13 +2610,13 @@ def register_dashboard(
         import shared_state
 
         if not shared_state.vpn_manager:
-            return {"error": "VPN manager not initialized"}
+            return {"error": "gestionnaire VPN non initialisé"}
         try:
             available = await shared_state.vpn_manager.check_update()
             if not available:
                 return {
                     "ok": False,
-                    "error": "no update available",
+                    "error": "aucune mise à jour disponible",
                     "update": shared_state.vpn_manager.get_status()["update"],
                 }
             # check_opportune=True ([21]): the manual endpoint must not cut
@@ -2489,7 +2664,7 @@ def register_dashboard(
         password = body.get("password", "")
 
         if not username or not password:
-            return {"error": "Username and password required"}
+            return {"error": "Nom d'utilisateur et mot de passe requis"}
 
         _write_credentials_env(username, password)
         return {
@@ -2508,7 +2683,7 @@ def register_dashboard(
         if shared_state.vpn_manager:
             shared_state.vpn_manager.save_state()
             return {"ok": True}
-        return {"error": "VPN manager not initialized"}
+        return {"error": "gestionnaire VPN non initialisé"}
 
     @app.get("/api/vpn/export")
     async def export_vpn_config(request: Request):
@@ -2519,7 +2694,7 @@ def register_dashboard(
         import shared_state
 
         if not shared_state.vpn_manager:
-            return {"error": "VPN manager not initialized"}
+            return {"error": "gestionnaire VPN non initialisé"}
 
         config = shared_state.vpn_manager.get_config()
         state = {
@@ -2691,7 +2866,7 @@ def register_dashboard(
             return {"error": f"mode doit être vpn|socks5|direct, reçu {mode!r}"}
         managers = _dashboard_managers()
         if not managers:
-            return {"error": "VPN manager non initialisé"}
+            return {"error": "gestionnaire VPN non initialisé"}
         for m in managers:
             m.proxy_mode = mode
         _persist_vpn_config({"proxy_mode": mode})
@@ -2932,7 +3107,7 @@ def register_dashboard(
             return err
         frame = _traffic_capture.frame_detail(frame_id)
         if frame is None:
-            return JSONResponse(status_code=404, content={"error": "frame not found"})
+            return JSONResponse(status_code=404, content={"error": "frame non trouvée"})
         return frame
 
     @app.post("/api/traffic/clear")
@@ -3032,7 +3207,7 @@ def register_dashboard(
 
         row = await _db_query_sync(_query_request)
         if not row:
-            return JSONResponse(status_code=404, content={"error": "Request not found"})
+            return JSONResponse(status_code=404, content={"error": "Requête non trouvée"})
 
         def _parse_json_field(val):
             if not val or val == "[]" or val == "null":
@@ -3121,7 +3296,7 @@ def register_dashboard(
     async def delete_history(before: str = None, all: bool = False, model: str = None):
         _debug(f"  [history] delete: all={all} model={model} before={before}")
         if not all and not before and not model:
-            return {"error": "Specify 'before' date, 'model' name, or 'all=true'"}
+            return {"error": "Spécifiez une date 'before', un nom de 'model' ou 'all=true'"}
 
         def _delete():
             if all:

@@ -269,7 +269,7 @@ async def test_stop_container_rm_failed_is_real_error(tmp_path, monkeypatch):
     monkeypatch.setenv("VPN_DOCKER_COMPOSE_FILE", str(tmp_path / "c.yml"))
     # "docker rm failed" (not "compose stop failed") proves the rm WAS
     # attempted after the degraded compose stop.
-    with pytest.raises(RuntimeError, match="docker rm failed"):
+    with pytest.raises(RuntimeError, match="docker rm failed|suppression docker"):
         await m.stop_container()
 
 

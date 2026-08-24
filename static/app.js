@@ -1,24 +1,24 @@
 // HTTP status code explanations for common/proxy-relevant codes
 const HTTP_STATUS_EXPLANATIONS = {
-    400: 'Bad Request — the request was malformed',
-    401: 'Unauthorized — invalid or missing API key',
-    403: 'Forbidden — access denied',
-    404: 'Not Found — the requested resource is not available',
-    408: 'Request Timeout — the server timed out waiting for the request',
-    413: 'Payload Too Large — request exceeds the maximum allowed size',
-    429: 'Rate Limited — too many requests, please slow down',
-    500: 'Internal Server Error — the upstream server encountered an error',
-    502: 'Bad Gateway — the upstream server returned an invalid response',
-    503: 'Service Unavailable — the service is temporarily unavailable',
-    504: 'Gateway Timeout — the upstream server timed out',
-    520: 'Cloudflare 520 — origin server returned an empty or unknown response',
-    521: 'Cloudflare 521 — the origin server is down or refused the connection',
-    522: 'Cloudflare 522 — connection to the origin server timed out',
-    523: 'Cloudflare 523 — the origin server is unreachable',
-    524: 'Cloudflare 524 — a connection timeout occurred (origin too slow)',
-    525: 'Cloudflare 525 — SSL handshake failed between Cloudflare and the origin',
-    526: 'Cloudflare 526 — invalid SSL certificate on the origin server',
-    530: 'Cloudflare 530 — origin DNS error (domain does not resolve)',
+    400: 'Requête incorrecte — la requête est mal formée',
+    401: 'Non autorisé — clé API invalide ou manquante',
+    403: 'Interdit — accès refusé',
+    404: 'Non trouvé — ressource demandée indisponible',
+    408: 'Délai dépassé — le serveur a expiré en attendant la requête',
+    413: 'Charge trop volumineuse — requête dépasse la taille maximale autorisée',
+    429: 'Limite dépassée — trop de requêtes, veuillez ralentir',
+    500: 'Erreur interne — le serveur a rencontré une erreur',
+    502: 'Mauvaise passerelle — le serveur amont a renvoyé une réponse invalide',
+    503: 'Service indisponible — service temporairement indisponible',
+    504: 'Délai passerelle dépassé — le serveur amont a expiré',
+    520: 'Cloudflare 520 — le serveur d\'origine a renvoyé une réponse vide ou inconnue',
+    521: 'Cloudflare 521 — le serveur d\'origine est hors ligne ou a refusé la connexion',
+    522: 'Cloudflare 522 — délai de connexion au serveur d\'origine dépassé',
+    523: 'Cloudflare 523 — le serveur d\'origine est injoignable',
+    524: 'Cloudflare 524 — délai de connexion dépassé (origine trop lente)',
+    525: 'Cloudflare 525 — échec handshake SSL entre Cloudflare et l\'origine',
+    526: 'Cloudflare 526 — certificat SSL invalide sur le serveur d\'origine',
+    530: 'Cloudflare 530 — erreur DNS d\'origine (domaine non résolu)',
 };
 
 // ── i18n ──
@@ -152,6 +152,7 @@ const LOCALE = {
         'filter.apply': 'Apply',
         'filter.to': 'to',
         'filter.now': 'now',
+        'filter.all': 'All',
         'logs.title': 'Request History',
         'logs.time': 'Time',
         'logs.original_model': 'Original Model',
@@ -182,6 +183,11 @@ const LOCALE = {
         'config.key_routing': 'Key Routing',
         'config.routing_rr': 'Round-Robin',
         'config.routing_failover': 'Failover',
+        'config.free_parallel': 'Parallelize free stations',
+        'config.free_parallel_hint': 'Round-Robin = least-loaded (spread on N), Failover = sticky 1 then switch on failure/quota. Hedge = N race, first wins (disabled for streaming).',
+        'config.free_routing': 'Free stations routing',
+        'config.free_routing_rr': 'Round-Robin (spread)',
+        'config.free_routing_failover': 'Failover (switch)',
         'config.save': 'Save Configuration',
         'config.saved': 'Configuration updated.',
         'proxy.running': 'Running',
@@ -458,6 +464,7 @@ const LOCALE = {
         'filter.apply': 'Appliquer',
         'filter.to': 'au',
         'filter.now': 'maintenant',
+        'filter.all': 'Tous',
         'logs.title': 'Historique des Requêtes',
         'logs.time': 'Heure',
         'logs.original_model': "Modèle d'origine",
@@ -487,6 +494,11 @@ const LOCALE = {
         'config.key_routing': 'Routage des clés',
         'config.routing_rr': 'Round-Robin',
         'config.routing_failover': 'Failover',
+        'config.free_parallel': 'Paralléliser les stations free',
+        'config.free_parallel_hint': 'Round-Robin = least-loaded (répartit sur N), Failover = sticky 1 puis bascule sur panne/quota. Hedge = course N stations, premier gagne (désactivé en streaming).',
+        'config.free_routing': 'Routage stations free',
+        'config.free_routing_rr': 'Round-Robin (répartir)',
+        'config.free_routing_failover': 'Failover (bascule)',
         'config.save': 'Sauvegarder',
         'config.saved': 'Configuration mise à jour.',
         'proxy.running': 'En cours',
@@ -911,7 +923,7 @@ async function toggleTrafficCapture(enabled) {
     } catch (e) {
         console.error('Failed to toggle capture:', e);
         if (statusEl) {
-            statusEl.textContent = 'Error';
+            statusEl.textContent = t('status.error');
             statusEl.className = 'save-status error';
         }
     }
@@ -936,7 +948,7 @@ async function clearTrafficCapture() {
     } catch (e) {
         console.error('Failed to clear capture:', e);
         if (statusEl) {
-            statusEl.textContent = 'Error';
+            statusEl.textContent = t('status.error');
             statusEl.className = 'save-status error';
         }
     }
@@ -1040,7 +1052,7 @@ async function trafficRefresh() {
     } catch (e) {
         console.error('Failed to refresh traffic:', e);
         const tbody = document.getElementById('traffic-tbody');
-        if (tbody) tbody.innerHTML = `<tr><td colspan="9" style="color:var(--danger)">Error</td></tr>`;
+        if (tbody) tbody.innerHTML = `<tr><td colspan="9" style="color:var(--danger)">${t('status.error')}</td></tr>`;
     }
 }
 
@@ -1054,7 +1066,7 @@ async function fetchTrafficFrameDetail(fid) {
         renderTrafficDetail(detail, f);
     } catch (e) {
         console.error('Failed to fetch frame detail:', e);
-        detail.innerHTML = '<span style="color:var(--danger)">Error</span>';
+        detail.innerHTML = `<span style="color:var(--danger)">${t('status.error')}</span>`;
     }
 }
 
@@ -1402,8 +1414,8 @@ async function renderTimeSeriesCharts(from, to) {
                     data: {
                         labels,
                         datasets: [
-                            { label: 'Success', data: reqData, backgroundColor: 'rgba(75,192,192,0.7)' },
-                            { label: 'Errors', data: failData, backgroundColor: 'rgba(255,99,132,0.7)' }
+                            { label: t('stats.success'), data: reqData, backgroundColor: 'rgba(75,192,192,0.7)' },
+                            { label: t('stats.failed'), data: failData, backgroundColor: 'rgba(255,99,132,0.7)' }
                         ]
                     },
                     options: { ...tsOpts, plugins: { legend: { display: true, labels: { color: textColor } } } }
@@ -1428,9 +1440,9 @@ async function renderTimeSeriesCharts(from, to) {
                     data: {
                         labels,
                         datasets: [
-                            { label: 'Input', data: inputData, borderColor: '#4fc3f7', fill: true, backgroundColor: 'rgba(79,195,247,0.1)' },
-                            { label: 'Output', data: outputData, borderColor: '#ff8a65', fill: true, backgroundColor: 'rgba(255,138,101,0.1)' },
-                            { label: 'Cache', data: cacheData, borderColor: '#81c784', fill: true, backgroundColor: 'rgba(129,199,132,0.1)' }
+                            { label: t('stats.input'), data: inputData, borderColor: '#4fc3f7', fill: true, backgroundColor: 'rgba(79,195,247,0.1)' },
+                            { label: t('stats.output'), data: outputData, borderColor: '#ff8a65', fill: true, backgroundColor: 'rgba(255,138,101,0.1)' },
+                            { label: t('stats.cache'), data: cacheData, borderColor: '#81c784', fill: true, backgroundColor: 'rgba(129,199,132,0.1)' }
                         ]
                     },
                     options: { ...tsOpts, plugins: { legend: { display: true, labels: { color: textColor } } } }
@@ -1471,8 +1483,8 @@ async function renderTimeSeriesCharts(from, to) {
                     data: {
                         labels,
                         datasets: [
-                            { label: 'Success', data: successData, backgroundColor: 'rgba(75,192,192,0.7)' },
-                            { label: 'Error', data: failData, backgroundColor: 'rgba(255,99,132,0.7)' }
+                            { label: t('stats.success'), data: successData, backgroundColor: 'rgba(75,192,192,0.7)' },
+                            { label: t('status.error'), data: failData, backgroundColor: 'rgba(255,99,132,0.7)' }
                         ]
                     },
                     options: { ...tsOpts, plugins: { legend: { display: true, labels: { color: textColor } } }, scales: { ...tsOpts.scales, x: { ...tsOpts.scales.x, stacked: true }, y: { ...tsOpts.scales.y, stacked: true } } }
@@ -1496,7 +1508,7 @@ function showRequestDetail(reqId) {
     const content = document.getElementById('req-detail-content');
 
     // Show loading state while fetching full details
-    content.innerHTML = '<p style="color:#888;text-align:center;padding:20px">Loading details...</p>';
+    content.innerHTML = `<p style="color:#888;text-align:center;padding:20px">${t('stats.loading')}</p>`;
     modal.style.display = 'flex';
 
     // Fetch full details from API
@@ -1504,8 +1516,8 @@ function showRequestDetail(reqId) {
         .then(r => r.json())
         .then(detail => {
             const statusHtml = detail.success
-                ? '<span class="status-ok">&#10004; Success</span>'
-                : `<span class="status-fail">&#10008; ${escHtml(detail.error || 'Error')}</span>`;
+                ? `<span class="status-ok">&#10004; ${t('stats.success')}</span>`
+                : `<span class="status-fail">&#10008; ${escHtml(detail.error || t('status.error'))}</span>`;
 
             const toolsUsedHtml = (detail.tools_used && detail.tools_used.length)
                 ? [...new Set(detail.tools_used)].map(t => `<span class="tool-badge used">${escHtml(t)}</span>`).join(' ')
@@ -1611,7 +1623,7 @@ function renderHistory(data) {
             const escError = escHtml(log.error);
             const escExplanation = errDetail.explanation ? escHtml(errDetail.explanation) : '';
             // Build a rich tooltip: error → explanation → context
-            const tooltipParts = ['Error: ' + escError];
+            const tooltipParts = [t('status.error') + ': ' + escError];
             if (escExplanation) tooltipParts.push(escExplanation);
             tooltipParts.push('Model: ' + escHtml(log.model || '-') + ' | Protocol: ' + escHtml(log.protocol || '-'));
             const tooltipText = tooltipParts.join('&#10;');
@@ -1868,11 +1880,11 @@ async function saveWebSearchConfig() {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ mode, target_model, max_results }),
         });
-        status.textContent = 'Saved!';
+        status.textContent = t('config.cr_saved');
         status.className = 'save-status success';
         setTimeout(() => { status.textContent = ''; }, 3000);
     } catch (e) {
-        status.textContent = 'Error saving';
+        status.textContent = t('status.error');
         status.className = 'save-status error';
         console.error(e);
     }
@@ -1991,7 +2003,7 @@ function populateFilterDropdown(id, values) {
     const select = document.getElementById(id);
     if (!select) return;
     const current = select.value;
-    select.innerHTML = '<option value="">All</option>';
+    select.innerHTML = `<option value="">${t('filter.all') || 'Tous'}</option>`;
     values.forEach(v => {
         if (!v) return;
         const opt = document.createElement('option');
@@ -2105,7 +2117,7 @@ function setupConfig() {
             // Refresh config display
             fetchConfig().then(renderConfig);
         } catch (e) {
-            saveStatus.textContent = 'Error saving';
+            saveStatus.textContent = t('status.error');
             saveStatus.className = 'save-status error';
             console.error('Failed to save config:', e);
         }
@@ -2233,7 +2245,7 @@ function setupConfig() {
             const fresh = await fetchConfig();
             if (fresh) renderConfig(fresh);
         } catch (e) {
-            status.textContent = 'Error saving';
+            status.textContent = t('status.error');
             status.className = 'save-status error';
             console.error(e);
         } finally {
@@ -2322,7 +2334,7 @@ function setupConfig() {
             setTimeout(() => { status.textContent = ''; }, 3000);
             fetchConfig().then(renderConfig);
         } catch (e) {
-            status.textContent = 'Error saving';
+            status.textContent = t('status.error');
             status.className = 'save-status error';
             console.error(e);
         }
@@ -2520,7 +2532,7 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     function sseScheduleReconnect() {
-        if (!pollTimer) startPolling(15000);
+        if (!pollTimer) startPolling(5000);
         if (!window._sseRetry) {
             window._sseRetry = setTimeout(() => {
                 window._sseRetry = null;
@@ -2561,15 +2573,34 @@ document.addEventListener('DOMContentLoaded', () => {
             });
         });
         // [plan] C: real-time vpn container events (die/start/restart/health)
-        // — refresh the VPN panel immediately. Server-side coalescing caps
-        // this at ≤1 event / 500 ms per subscriber (kill/restart cascades).
-        es.addEventListener('vpn_event', () => {
+        // Instantané : chaque station pousse son vpn_event dès _set_status
+        // Server-side coalesce 500ms, client debounce 50ms -> quasi-direct.
+        es.addEventListener('vpn_event', (ev) => {
             lastEventTs = Date.now();
+            // Si le payload est présent, maj instantanée sans HTTP (0ms)
+            try {
+                if (ev && ev.data) {
+                    const payload = JSON.parse(ev.data);
+                    // payload peut être un get_status complet (per-station) ou un wrapper
+                    // On tente update direct, sinon fallback fetch
+                    if (payload && (payload.station || payload.status || payload.vpn_status)) {
+                        // Petit debounce 50ms pour coalescer les bursts kill/restart
+                        if (window._sseVpnRefresh) clearTimeout(window._sseVpnRefresh);
+                        window._sseVpnRefresh = setTimeout(() => {
+                            window._sseVpnRefresh = null;
+                            // Si payload est un station single, on fetch l'agrégat pour garder la vue d'ensemble
+                            // mais on peut aussi patcher directement le cache
+                            refreshVPNStatus();
+                        }, 50);
+                        return;
+                    }
+                }
+            } catch(e) {}
             if (window._sseVpnRefresh) clearTimeout(window._sseVpnRefresh);
             window._sseVpnRefresh = setTimeout(() => {
                 window._sseVpnRefresh = null;
                 refreshVPNStatus();
-            }, 250);
+            }, 50);
         });
 
         es.onerror = () => {
@@ -2592,8 +2623,8 @@ document.addEventListener('DOMContentLoaded', () => {
 
     connectSSE();
 
-    // Backup poll in case SSE never connects
-    if (!pollTimer) startPolling(30000);
+    // Backup poll in case SSE never connects - 5s for direct live
+    if (!pollTimer) startPolling(5000);
 
     document.addEventListener('visibilitychange', () => {
         if (document.hidden) {
@@ -2602,7 +2633,7 @@ document.addEventListener('DOMContentLoaded', () => {
         } else {
             refreshAll();
             if (!eventSource) connectSSE();
-            if (!pollTimer) startPolling(30000);
+            if (!pollTimer) startPolling(5000);
         }
     });
 
@@ -2709,7 +2740,7 @@ document.addEventListener('DOMContentLoaded', () => {
             debugLogPage = 1;
             fetchDebugLogs(1).then(renderDebugLogLines);
         } catch (e) {
-            status.textContent = 'Error';
+            status.textContent = t('status.error');
             status.className = 'save-status error';
         }
     });
@@ -2764,18 +2795,90 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // ── VPN tab refresh ──
     async function refreshVPNStatus() {
-        try {
-            const resp = await fetchWithToken('/api/vpn-status');
-            const data = await resp.json();
+        // Fetch vpn-status (slow, 5x refresh_status) and config (fast, station_count+free_parallel) in parallel
+        // so GUI shows parameters instantly without waiting for 5 docker probes
+        const vpnStatusP = fetchWithToken('/api/vpn-status').then(r=>r.json()).then(data=>{
             updateVPNUI(data);
+            // also update free_parallel from vpn-status if present (fast path for hedge_wins)
             try {
-                const cfgR = await fetchWithToken('/api/vpn-config');
-                const cfgJ = await cfgR.json();
-                if (cfgJ.proxy_mode) updateGeoWarning(cfgJ.proxy_mode);
-            } catch (e2) {}
-        } catch (e) {
-            console.error('VPN status error:', e);
-        }
+                const fp = data.free_parallel;
+                if (fp) {
+                    const fpEnabledEl = document.getElementById('cfg-free-parallel-enabled');
+                    const fpRoutingEl = document.getElementById('cfg-free-parallel-routing');
+                    const fpModeEl = document.getElementById('cfg-free-parallel-mode');
+                    const fpRow = document.getElementById('free-parallel-routing-row');
+                    const fpStatus = document.getElementById('free-parallel-status');
+                    if (fpEnabledEl && document.activeElement !== fpEnabledEl) fpEnabledEl.checked = !!fp.enabled;
+                    if (fpRoutingEl && document.activeElement !== fpRoutingEl) fpRoutingEl.value = fp.routing || 'round-robin';
+                    if (fpModeEl && document.activeElement !== fpModeEl) fpModeEl.value = fp.mode || 'load-balance';
+                    if (fpRow) fpRow.style.display = (fp.enabled ? 'flex' : 'none');
+                    if (fpStatus) fpStatus.textContent = fp.enabled ? `ON · ${fp.routing || 'round-robin'} · ${fp.mode || 'load-balance'}` : 'OFF';
+                }
+            } catch(e) {}
+            // also update station_count from vpn-status if present (stations.length)
+            try {
+                if (data.stations && data.stations.length) {
+                    const sel = document.getElementById('vpn-station-count');
+                    if (sel && document.activeElement !== sel && !sel.disabled) {
+                        // don't override pending user selection
+                        const hasPending = typeof _vpnStationPending !== 'undefined' && _vpnStationPending !== null;
+                        if (!hasPending) sel.value = String(data.stations.length);
+                    }
+                }
+            } catch(e) {}
+            return data;
+        }).catch(e=>{ console.error('VPN status error:', e); });
+        const vpnConfigP = fetchWithToken('/api/vpn-config').then(r=>r.json()).then(cfgJ=>{
+            if (cfgJ.proxy_mode) try{ updateGeoWarning(cfgJ.proxy_mode); }catch(e){}
+            // instant station_count + free_parallel from fast vpn-config (no docker probe)
+            try {
+                const sel = document.getElementById('vpn-station-count');
+                if (sel && cfgJ.station_count && document.activeElement !== sel) {
+                    const hasPending = typeof _vpnStationPending !== 'undefined' && _vpnStationPending !== null;
+                    const isSaving = typeof _vpnSaving !== 'undefined' && _vpnSaving;
+                    if (!hasPending && !isSaving) sel.value = String(cfgJ.station_count);
+                }
+                if (cfgJ.free_parallel) {
+                    const fp = cfgJ.free_parallel;
+                    const fpEnabledEl = document.getElementById('cfg-free-parallel-enabled');
+                    const fpRoutingEl = document.getElementById('cfg-free-parallel-routing');
+                    const fpModeEl = document.getElementById('cfg-free-parallel-mode');
+                    const fpRow = document.getElementById('free-parallel-routing-row');
+                    const fpStatus = document.getElementById('free-parallel-status');
+                    if (fpEnabledEl && document.activeElement !== fpEnabledEl) fpEnabledEl.checked = !!fp.enabled;
+                    if (fpRoutingEl && document.activeElement !== fpRoutingEl) fpRoutingEl.value = fp.routing || 'round-robin';
+                    if (fpModeEl && document.activeElement !== fpModeEl) fpModeEl.value = fp.mode || 'load-balance';
+                    if (fpRow) fpRow.style.display = (fp.enabled ? 'flex' : 'none');
+                    if (fpStatus) fpStatus.textContent = fp.enabled ? `ON · ${fp.routing || 'round-robin'} · ${fp.mode || 'load-balance'}` : 'OFF';
+                }
+            } catch(e){}
+            return cfgJ;
+        }).catch(e=>{});
+        const configP = fetchWithToken('/api/config').then(r=>r.json()).then(cfg=>{
+            // also update free_parallel from /api/config (fast, no docker)
+            try {
+                if (cfg.free_parallel) {
+                    const fp = cfg.free_parallel;
+                    const fpEnabledEl = document.getElementById('cfg-free-parallel-enabled');
+                    const fpRoutingEl = document.getElementById('cfg-free-parallel-routing');
+                    const fpModeEl = document.getElementById('cfg-free-parallel-mode');
+                    const fpRow = document.getElementById('free-parallel-routing-row');
+                    const fpStatus = document.getElementById('free-parallel-status');
+                    if (fpEnabledEl && document.activeElement !== fpEnabledEl) fpEnabledEl.checked = !!fp.enabled;
+                    if (fpRoutingEl && document.activeElement !== fpRoutingEl) fpRoutingEl.value = fp.routing || 'round-robin';
+                    if (fpModeEl && document.activeElement !== fpModeEl) fpModeEl.value = fp.mode || 'load-balance';
+                    if (fpRow) fpRow.style.display = (fp.enabled ? 'flex' : 'none');
+                    if (fpStatus) fpStatus.textContent = fp.enabled ? `ON · ${fp.routing || 'round-robin'} · ${fp.mode || 'load-balance'}` : 'OFF';
+                }
+                if (cfg.routing) {
+                    const sel = document.getElementById('cfg-routing');
+                    if (sel && document.activeElement !== sel) sel.value = cfg.routing;
+                }
+            } catch(e){}
+            return cfg;
+        }).catch(e=>{});
+        // Wait for all three in parallel, but don't block UI updates (they already updated as they arrived)
+        await Promise.allSettled([vpnStatusP, vpnConfigP, configP]);
         // Also check credential status
         try {
             const credResp = await fetchWithToken('/api/vpn/credentials');
@@ -3003,9 +3106,24 @@ document.addEventListener('DOMContentLoaded', () => {
             error: { color: 'var(--danger)', label: t('vpn.error') || 'Erreur' }
         };
         const s = statusMap[data.status] || statusMap.disconnected;
-        statusEl.textContent = s.label;
+        // [prancy-unicorn Phase1] N/M healthy agrégat + stale spinner + error_detail tooltip
+        let _healthy = data.healthy;
+        let _total = data.total;
+        if ((_healthy == null || _total == null) && Array.isArray(data.stations)) {
+            _total = data.stations.length;
+            _healthy = data.stations.filter(x => x.vpn_status === 'connected').length;
+        }
+        let bannerLabel = s.label;
+        if (_healthy != null && _total != null) bannerLabel += ` — ${_healthy}/${_total} healthy`;
+        if (data.stale) bannerLabel += ' ⟳';
+        statusEl.textContent = bannerLabel;
         statusEl.style.color = s.color;
-        if (statusDot) statusDot.style.background = s.color;
+        if (statusDot) {
+            statusDot.style.background = s.color;
+            statusDot.style.opacity = data.stale ? '0.45' : '1';
+            statusDot.title = data.stale ? `stale — ${data.refresh_error || ''}` : '';
+        }
+        statusEl.title = data.refresh_error ? String(data.refresh_error) : (data.stale ? `stale — ${data.refreshed_at || ''}` : '');
 
         ipEl.textContent = data.current_ip || '—';
         if (identityEl) {
@@ -3049,6 +3167,15 @@ document.addEventListener('DOMContentLoaded', () => {
             } else {
                 dirtyBanner.style.display = 'none';
             }
+        }
+
+        // [prancy-unicorn Phase1 Q5] N>=2 && !free_parallel → tout sur station 1
+        const fpWarnEl = document.getElementById('vpn-free-parallel-warning');
+        if (fpWarnEl) {
+            if (data.free_parallel_warning) {
+                fpWarnEl.textContent = '⚠ ' + data.free_parallel_warning;
+                fpWarnEl.style.display = 'block';
+            } else fpWarnEl.style.display = 'none';
         }
 
         // [vivid-hinton P4] geo banner + badges + kill-switch (strict/best_effort/warn)
@@ -3099,7 +3226,19 @@ document.addEventListener('DOMContentLoaded', () => {
                 let errText = '—';
                 if (s.last_rotation_error) errText = '⚠ ' + escHtml(s.last_rotation_error);
                 else if (s.bad_remaining > 0) errText = 'Cooldown (429) — ' + Math.ceil(s.bad_remaining) + 's';
-                const statusText = (sMap[s.vpn_status] || s.vpn_status || '—') +
+                else if (s.vpn && s.vpn.error) errText = escHtml(s.vpn.error);
+                // État réel : si le tunnel a une IP et n'est pas en cooldown, même un vpn_status error
+                // dû à une sonde transitoire (DNS) ne doit pas afficher "Erreur" alors qu'il sert.
+                let realStatus = s.vpn_status;
+                if (s.vpn_status === 'error' && s.current_ip && s.bad_remaining === 0 && !s.last_rotation_error) {
+                    const vpnErr = (s.vpn && s.vpn.error) || '';
+                    // "tunnel not answering" avec IP existante = sonde ratée mais tunnel a servi récemment
+                    if (vpnErr.includes('tunnel not answering') || vpnErr.includes('not answering')) {
+                        realStatus = 'connected';
+                        if (!errText || errText === '—') errText = 'Sonde échouée mais IP active';
+                    }
+                }
+                const statusText = (sMap[realStatus] || realStatus || '—') +
                     (data.active_station === s.station ? ' · active' : '');
                 return '<div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border,#444)">' +
                     '<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">' +
@@ -3123,6 +3262,31 @@ document.addEventListener('DOMContentLoaded', () => {
                     '</div></div>';
             }).join('');
         }
+
+        // [free_parallel] Stations free — toggle + routing + mode (vpn tab)
+        try {
+            const fp = data.free_parallel || data.freeParallel || {};
+            const fpEnabledEl = document.getElementById('cfg-free-parallel-enabled');
+            const fpRoutingEl = document.getElementById('cfg-free-parallel-routing');
+            const fpModeEl = document.getElementById('cfg-free-parallel-mode');
+            const fpRow = document.getElementById('free-parallel-routing-row');
+            const fpStatus = document.getElementById('free-parallel-status');
+            if (fpEnabledEl) {
+                // don't clobber user interaction while focused
+                if (document.activeElement !== fpEnabledEl) fpEnabledEl.checked = !!fp.enabled;
+            }
+            if (fpRoutingEl && document.activeElement !== fpRoutingEl) fpRoutingEl.value = fp.routing || 'round-robin';
+            if (fpModeEl && document.activeElement !== fpModeEl) fpModeEl.value = fp.mode || 'load-balance';
+            if (fpRow) fpRow.style.display = (fp.enabled ? 'flex' : 'none');
+            if (fpStatus) fpStatus.textContent = fp.enabled ? `ON · ${fp.routing || 'round-robin'} · ${fp.mode || 'load-balance'}` : 'OFF';
+            // also update hedge observability if present
+            if (data.hedge_wins) {
+                const hw = data.hedge_wins;
+                if (fpStatus && fp.enabled && hw.total) {
+                    fpStatus.textContent += ` · hedge ${hw.primary}/${hw.hedge}/${hw.total}`;
+                }
+            }
+        } catch(e) {}
 
         // IP History — stats par IP (payload ip_stats injecté par /api/vpn-status)
         const historyEl = document.getElementById('vpn-ip-history');
@@ -3525,6 +3689,41 @@ document.addEventListener('DOMContentLoaded', () => {
         await fetchWithToken('/api/vpn-config', {
             method: 'POST', headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({free_exception_fallback: mode})
+        });
+        refreshVPNStatus();
+    };
+
+    // [free_parallel] Deux routings découplés — (B) Stations free
+    window.toggleFreeParallel = async function(enabled) {
+        const routing = document.getElementById('cfg-free-parallel-routing')?.value || 'round-robin';
+        const mode = document.getElementById('cfg-free-parallel-mode')?.value || 'load-balance';
+        const row = document.getElementById('free-parallel-routing-row');
+        if (row) row.style.display = enabled ? 'flex' : 'none';
+        const status = document.getElementById('free-parallel-status');
+        if (status) status.textContent = enabled ? `ON · ${routing} · ${mode}` : 'OFF';
+        await fetchWithToken('/api/vpn-config', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({free_parallel: {enabled: !!enabled, routing, mode}})
+        });
+        refreshVPNStatus();
+    };
+    window.saveFreeParallelRouting = async function() {
+        const enabled = document.getElementById('cfg-free-parallel-enabled')?.checked || false;
+        const routing = document.getElementById('cfg-free-parallel-routing')?.value || 'round-robin';
+        const mode = document.getElementById('cfg-free-parallel-mode')?.value || 'load-balance';
+        await fetchWithToken('/api/vpn-config', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({free_parallel: {enabled: !!enabled, routing, mode}})
+        });
+        refreshVPNStatus();
+    };
+    window.saveFreeParallelMode = async function() {
+        const enabled = document.getElementById('cfg-free-parallel-enabled')?.checked || false;
+        const routing = document.getElementById('cfg-free-parallel-routing')?.value || 'round-robin';
+        const mode = document.getElementById('cfg-free-parallel-mode')?.value || 'load-balance';
+        await fetchWithToken('/api/vpn-config', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({free_parallel: {enabled: !!enabled, routing, mode}})
         });
         refreshVPNStatus();
     };

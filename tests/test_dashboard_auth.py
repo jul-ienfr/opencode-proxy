@@ -53,7 +53,7 @@ def test_dashboard_require_token_403_on_0000(monkeypatch):
     resp = _check_dashboard_token(FakeReq())
     assert resp is not None
     assert resp.status_code == 403
-    assert "DASHBOARD_TOKEN required" in resp.body.decode()
+    assert "DASHBOARD_TOKEN" in resp.body.decode()
 
 
 def test_dashboard_open_when_no_token_no_require(monkeypatch):

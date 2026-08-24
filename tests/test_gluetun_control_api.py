@@ -1070,6 +1070,7 @@ class TestStackSelector:
     @pytest.mark.asyncio
     async def test_t6b_cooldown_blocks_second_flip(self, tmp_path, monkeypatch):
         mgr = _stack_mgr(tmp_path, monkeypatch)
+        mgr._auto_flip_cooldown_min = 30
         clock = {"t": 1_000_000.0}
         mgr._now_fn = lambda: clock["t"]
         mgr._stack_effective = "openvpn"
@@ -1135,10 +1136,10 @@ class TestStackSelector:
         assert flip["reason"] == f"auto: egress dead {mgr._auto_wg_egress_ticks} ticks"
         # The flip superseded the escalation: no compose escalation fired.
         assert mgr.escalations == 0
-        # .env switched for BOTH stations.
+        # Per-station auto hétérogène: only this station flipped (independent)
         env = (tmp_path / ".env").read_text()
         assert "VPN_TYPE_STATION1=openvpn" in env
-        assert "VPN_TYPE_STATION2=openvpn" in env
+        # STATION2 not touched in per-station mode (its own watchdog would flip it if needed)
 
     @pytest.mark.asyncio
     async def test_t6f_watchdog_tick_auth_failed_flips_to_wireguard(self, tmp_path, monkeypatch):
@@ -1160,7 +1161,7 @@ class TestStackSelector:
         assert flip["reason"] == "auto: 3 AUTH_FAILED/30min"
         env = (tmp_path / ".env").read_text()
         assert "VPN_TYPE_STATION1=wireguard" in env
-        assert "VPN_TYPE_STATION2=wireguard" in env
+        # Per-station: STATION2 untouched
 
     # ── T7 ─────────────────────────────────────────────────────────
     @pytest.mark.asyncio

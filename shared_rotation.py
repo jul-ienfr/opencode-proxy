@@ -247,6 +247,37 @@ class SharedRotationState:
 
     # ── Config hot-reload / status / config ─────────────────────
 
+    def prune_stations(self, max_station: int) -> None:
+        """Drop ghost sids >N after a downscale (P1 melodic-pearl).
+
+        Removes ip_events + last_index/country entries whose station > N so a
+        later upscale does not resurrect stale IPs/identities. Called by
+        FreeIPPool.set_stations() and opencode._apply_station_count().
+        """
+        try:
+            max_station = int(max_station)
+        except (TypeError, ValueError):
+            return
+        if max_station < 1:
+            max_station = 1
+        changed = False
+        before = len(self._ip_events)
+        self._ip_events = [e for e in self._ip_events if int(e.get("station", 0)) <= max_station]
+        if len(self._ip_events) != before:
+            changed = True
+        for key in list(self._last_index_by_station.keys()):
+            if int(key) > max_station:
+                self._last_index_by_station.pop(key, None)
+                changed = True
+        for key in list(self._last_country_by_station.keys()):
+            if int(key) > max_station:
+                self._last_country_by_station.pop(key, None)
+                changed = True
+        if changed:
+            self._saved_at = _now_utc()
+            self._persist()
+            logger.info("[shared-rotation] pruned ghost stations >%d (%d events removed)", max_station, before - len(self._ip_events))
+
     def set_window(self, cfg: dict) -> None:
         """Re-read recent_ip_window/recent_ip_max_age on config change
         and re-trim the registry to the new windows."""

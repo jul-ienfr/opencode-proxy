@@ -631,6 +631,8 @@ for col, default in [
     ("identity", "NULL"),
     ("geo_country", "NULL"),
     ("geo_blocked", "0"),
+    ("hedged", "0"),
+    ("winner_station", "NULL"),
 ]:
     try:
         _conn.execute(f"ALTER TABLE requests ADD COLUMN {col} TEXT DEFAULT {default}")
@@ -1459,30 +1461,110 @@ async def _apply_station_count(new_n: int) -> None:
         managers = list(getattr(shared_state, "vpn_managers", None) or [])
         old_n = len(managers)
         if new_n == old_n:
+            # [fix 2→3 idempotent] old==new but a container may be absent
+            # (previous upscale failed fail-soft). Converge: create any
+            # missing station numbers, restart any enabled but disconnected
+            # station without bumping config.
+            existing_sids = {m._station for m in managers}
+            missing = [k for k in range(1, new_n + 1) if k not in existing_sids]
+            if missing:
+                from vpn_manager import VPNManager as _VM
+
+                for k in missing:
+                    mm = _VM(IP_ROTATION, station=k, shared=shared_state.shared_rotation)
+                    mm.enabled = IP_ROTATION.get("enabled", False)
+                    managers.append(mm)
+                managers.sort(key=lambda m: m._station)
+                shared_state.vpn_managers = managers
+                pool = getattr(shared_state, "free_ip_pool", None)
+                if pool is not None:
+                    pool.set_stations(managers)
+                watcher = getattr(shared_state, "docker_event_watcher", None)
+                if watcher is not None:
+                    watcher.set_managers({m._docker_container: m for m in managers})
+                shared_state.vpn_manager = managers[0] if managers else None
+                shared_state.vpn_manager_2 = managers[1] if len(managers) >= 2 else None
+            # ensure enabled stations are started (idempotent)
+            to_start = [m for m in managers if m.enabled and m.proxy_mode == "vpn" and m.status != "connected"]
+            if to_start:
+                try:
+                    await asyncio.gather(*(m.start() for m in to_start))
+                    # also ensure real managers are actually connected (blocking)
+                    _real_connect = [m.connect() for m in to_start if hasattr(m, "_compose_up") and hasattr(m, "connect")]
+                    if _real_connect:
+                        await asyncio.gather(*_real_connect)
+                except Exception as e:
+                    _debug(f"  [vpn] idempotent start failed: {e}")
             return
         from vpn_manager import VPNManager
 
         if new_n > old_n:
-            for k in range(old_n + 1, new_n + 1):
-                m = VPNManager(IP_ROTATION, station=k, shared=shared_state.shared_rotation)
-                m.enabled = IP_ROTATION.get("enabled", False)
-                managers.append(m)
-            # Registry + pool converge BEFORE any docker call: _apply_stack
-            # reads the registry for the active set.
-            shared_state.vpn_managers = managers
-            pool = getattr(shared_state, "free_ip_pool", None)
-            if pool is not None:
-                pool.set_stations(managers)
-            # [fix 19/08] Sync the .env substitution keys FIRST: without
-            # VPN_TYPE_STATION{1..N}, a new station boots on the compose
-            # default ${VPN_TYPE_STATIONn:-openvpn} — OpenVPN under a
-            # running WireGuard fleet (the 2-new-stations-on-openvpn bug).
-            # No-op path writes the env, docker stays untouched.
-            if managers:
-                await managers[0]._apply_stack(managers[0]._stack_effective)
-            # [fix] Parallélise les compose up — 1→10 en // (gain 5-40s, 1 clic suffit)
-            if managers[old_n:]:
-                await asyncio.gather(*(m.start() for m in managers[old_n:]))
+            # snapshot for rollback on failure (config must not claim 3 when only 2 run)
+            _snapshot = list(managers)
+            try:
+                for k in range(old_n + 1, new_n + 1):
+                    m = VPNManager(IP_ROTATION, station=k, shared=shared_state.shared_rotation)
+                    m.enabled = IP_ROTATION.get("enabled", False)
+                    managers.append(m)
+                # Registry + pool converge BEFORE any docker call: _apply_stack
+                # reads the registry for the active set.
+                shared_state.vpn_managers = managers
+                pool = getattr(shared_state, "free_ip_pool", None)
+                if pool is not None:
+                    pool.set_stations(managers)
+                # [fix 19/08] Sync the .env substitution keys FIRST: without
+                # VPN_TYPE_STATION{1..N}, a new station boots on the compose
+                # default ${VPN_TYPE_STATIONn:-openvpn} — OpenVPN under a
+                # running WireGuard fleet (the 2-new-stations-on-openvpn bug).
+                # No-op path writes the env, docker stays untouched.
+                if managers:
+                    await managers[0]._apply_stack(managers[0]._stack_effective)
+                # [fix] Parallélise les compose up — 1→10 en // (gain 5-40s, 1 clic suffit)
+                # Use connect() for new stations so the container is actually up (start() only schedules background task)
+                if managers[old_n:]:
+                    new_managers = managers[old_n:]
+                    # start() for all to init watchdog/state, then connect() for new ones to block until healthy
+                    await asyncio.gather(*(m.start() for m in new_managers))
+                    # Now actually bring up the new tunnels (blocking) — real VPNManager has _compose_up, stub (tests) does not
+                    connect_tasks = []
+                    for m in new_managers:
+                        if not getattr(m, "enabled", True):
+                            continue
+                        if getattr(m, "proxy_mode", "vpn") != "vpn":
+                            continue
+                        # real manager has _compose_up / connect, stub does not
+                        if hasattr(m, "_compose_up") and hasattr(m, "connect"):
+                            connect_tasks.append(m.connect())
+                    if connect_tasks:
+                        # Fail-soft: a new station may be unhealthy for 120s (WG UDP blocked,
+                        # DNS timeout, MTU) — the watchdog will heal it (re-pin, protocol
+                        # flip udp->tcp). Hot-reload must not rollback the station_count
+                        # because of a transient tunnel health — it would leave config
+                        # and runtime desynced and block scaling. Gather with
+                        # return_exceptions and log, but keep the new registry.
+                        results = await asyncio.gather(*connect_tasks, return_exceptions=True)
+                        for _r in results:
+                            if isinstance(_r, Exception):
+                                _debug(f"  [vpn] upscale connect soft-failed (watchdog will heal): {_r}")
+            except Exception as e:
+                # rollback to old_n — config stays at old_n, runtime converges
+                _debug(f"  [vpn] upscale {old_n}→{new_n} failed, rollback: {e}")
+                shared_state.vpn_managers = _snapshot
+                pool = getattr(shared_state, "free_ip_pool", None)
+                if pool is not None:
+                    try:
+                        pool.set_stations(_snapshot)
+                    except Exception:
+                        pass
+                watcher = getattr(shared_state, "docker_event_watcher", None)
+                if watcher is not None:
+                    try:
+                        watcher.set_managers({m._docker_container: m for m in _snapshot})
+                    except Exception:
+                        pass
+                shared_state.vpn_manager = _snapshot[0] if _snapshot else None
+                shared_state.vpn_manager_2 = _snapshot[1] if len(_snapshot) >= 2 else None
+                raise
         else:
             pool = getattr(shared_state, "free_ip_pool", None)
             if pool is not None:
@@ -1713,6 +1795,17 @@ async def lifespan(app):
 
     set_on_workspace_recovered_callback(on_workspace_recovered)
     _debug("  [lifespan] workspace recovery callback registered")
+
+    # ── Docker Desktop auto-launch (Windows) ───────────────────────────
+    # User request: if Docker Desktop is not running after a reboot, the proxy
+    # must launch it — otherwise 5 stations stay `disconnected`.
+    try:
+        from vpn_manager import ensure_docker_running
+
+        ok = await asyncio.wait_for(ensure_docker_running(timeout=60), timeout=65)
+        _debug(f"  [lifespan] docker daemon ready={ok}")
+    except Exception as e:
+        _debug(f"  [lifespan] docker ensure failed (fail-soft): {e}")
 
     # ── VPN / IP rotation for free models ──
     import shared_state
@@ -2041,7 +2134,7 @@ async def debug_exception(request: Request, exc: Exception):
     _log(f"ERROR {request.method} {request.url.path} from {client_ip}: {type(exc).__name__}: {exc}")
     _debug(f"Traceback (500):\n{tb}")
     # Don't expose tracebacks to clients — log them server-side only
-    return JSONResponse(status_code=500, content={"error": "Internal server error"})
+    return JSONResponse(status_code=500, content={"error": "Erreur interne du serveur"})
 
 
 # Server manager set later in __main__ for GUI mode; None means always-running
@@ -2147,7 +2240,7 @@ class RateLimitMiddleware:
             await self.app(scope, receive, send)
             return
         retry_after_int = max(1, int(retry_after) + 1)
-        body = _json_dumps({"error": "Rate limit exceeded. Try again shortly."})
+        body = _json_dumps({"error": "Limite de débit dépassée. Veuillez réessayer sous peu."})
         headers = [
             (b"content-type", b"application/json"),
             (b"retry-after", str(retry_after_int).encode()),
@@ -3034,7 +3127,7 @@ async def _do_free_request_curl_cffi(
     try:
         from curl_cffi.requests import errors as _err
     except ImportError:
-        raise RuntimeError("curl_cffi not installed: pip install curl_cffi")
+        raise RuntimeError("curl_cffi non installé : pip install curl_cffi")
 
     # Strip paid-account artifacts, stamp the identity (bundle UA wins)
     profile = _current_free_identity(station)
@@ -3089,6 +3182,172 @@ async def _do_free_request_curl_cffi(
         raise
     # Wrap in a compatible response object
     return _CurlCffiResponse(resp)
+
+
+def _free_parallel_should_hedge(body: dict, forced_pool=None) -> bool:
+    """True when hedge is enabled, not streaming, and ≥2 candidates."""
+    try:
+        if body and body.get("stream"):
+            return False
+        if not _free_ip_pool or not _free_ip_pool.enabled:
+            return False
+        # pool attributes are hot-reloaded via update_config
+        if not getattr(_free_ip_pool, "_free_parallel_enabled", False):
+            return False
+        if getattr(_free_ip_pool, "_free_parallel_mode", "load-balance") != "hedge":
+            return False
+        # need at least 2 usable candidates
+        cands = _free_ip_pool.pick_candidates(forced_pool)
+        return len(cands) >= 2
+    except Exception:
+        return False
+
+
+async def _hedged_fetch(cands, body: dict, headers: dict, endpoint: str, forced_pool=None):
+    """Hedge N stations: stagger + FIRST_COMPLETED, winner-only compta.
+
+    cands: list of stations sorted by routing preference (pick_candidates).
+    Limited to hedge_max+1 to avoid abuse. Stagger = hedge_delay_ms per station.
+    Returns (resp, winner_station). Losers are cancelled (CancelledError silent,
+    no bad-mark). Only winner increments quota via pool.note_hedge_winner().
+    """
+    if not cands or len(cands) < 2:
+        raise ValueError("hedge needs ≥2 candidates")
+    # bound to hedge_max+1 (default 2 fetches)
+    try:
+        hedge_max = int(getattr(_free_ip_pool, "_free_parallel_hedge_max", 1) or 1)
+    except Exception:
+        hedge_max = 1
+    hedge_max = max(1, min(3, hedge_max))
+    max_cands = min(len(cands), hedge_max + 1)
+    cands = cands[:max_cands]
+    try:
+        stagger = float(getattr(_free_ip_pool, "_free_parallel_hedge_delay_ms", 300) or 300) / 1000.0
+    except Exception:
+        stagger = 0.3
+    stagger = max(0.0, min(2.0, stagger))
+
+    # helper to fetch one candidate
+    async def _one(station):
+        return await _do_free_request_curl_cffi(
+            body, headers, station.socks5_url, station=station, endpoint=endpoint
+        )
+
+    tasks = {}
+    # launch primary immediately
+    primary = cands[0]
+    t0 = asyncio.create_task(_one(primary))
+    tasks[t0] = primary
+    # hedge tasks will be launched with stagger if primary not done
+    pending_stagger = cands[1:]
+
+    winner_resp = None
+    winner_station = None
+    winner_task = None
+    # overall hedge timeout: generous (connect 10 + read 600, but hedge should not wait forever)
+    # we wait until first success; if all fail, raise last error
+    last_exc = None
+    try:
+        # stagger loop: sleep stagger, launch next if primary still pending
+        stagger_idx = 0
+        while pending_stagger or tasks:
+            # wait for any task with timeout = stagger if still have pending to launch
+            timeout = stagger if pending_stagger else None
+            done, pending = await asyncio.wait(tasks.keys(), timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
+            if done:
+                # pick first successful response (any HTTP status counts as success)
+                # prioritize 200 over 429? Actually first to respond wins regardless
+                for d in done:
+                    try:
+                        resp = d.result()
+                        # success: got HTTP response (even 429)
+                        winner_resp = resp
+                        winner_station = tasks[d]
+                        winner_task = d
+                        break
+                    except asyncio.CancelledError:
+                        continue
+                    except Exception as e:
+                        last_exc = e
+                        # this candidate failed, continue to wait for others
+                        continue
+                if winner_resp is not None:
+                    break
+                # if no winner yet, continue waiting / launching next
+                # remove done failed tasks from dict
+                for d in list(done):
+                    tasks.pop(d, None)
+                    # pending set already empty for done
+                # if no pending tasks and still have stagger candidates, launch next
+                if pending_stagger and not tasks:
+                    # all launched so far failed, launch next immediately
+                    nxt = pending_stagger.pop(0)
+                    nt = asyncio.create_task(_one(nxt))
+                    tasks[nt] = nxt
+                    continue
+            else:
+                # timeout: primary not done, launch next hedge
+                if pending_stagger:
+                    nxt = pending_stagger.pop(0)
+                    nt = asyncio.create_task(_one(nxt))
+                    tasks[nt] = nxt
+                else:
+                    # no more to launch, wait indefinitely for remaining
+                    if not tasks:
+                        break
+                    # continue loop with indefinite wait
+                    continue
+            # also handle tasks dict sync: pending contains tasks not done
+            # rebuild tasks dict to keep only pending
+            new_tasks = {}
+            for t in pending:
+                if t in tasks:
+                    new_tasks[t] = tasks[t]
+            # add any stagger-launched tasks not in pending (just launched)
+            for t, st in list(tasks.items()):
+                if t not in new_tasks and t not in done:
+                    new_tasks[t] = st
+            tasks = new_tasks
+            if not tasks and not pending_stagger:
+                break
+        # if winner found, cancel losers
+        if winner_resp is not None:
+            for t in list(tasks.keys()):
+                if t is not winner_task:
+                    t.cancel()
+                    try:
+                        await t
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception:
+                        pass
+            # record winner compta
+            try:
+                if _free_ip_pool and hasattr(_free_ip_pool, "note_hedge_winner"):
+                    _free_ip_pool.note_hedge_winner(winner_station, primary=primary)
+            except Exception:
+                pass
+            # need to ensure free_ip / identity context for downstream logging
+            try:
+                ip = getattr(winner_station, "current_ip", None) or getattr(winner_station, "pid", "") or ""
+                prof = _current_free_identity(winner_station)
+                _current_free_attempt.set({"ip": ip, "identity": prof.get("impersonate") or "", "station": winner_station})
+            except Exception:
+                pass
+            return winner_resp, winner_station
+        # no winner: all failed
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("échec de tous les candidats hedge")
+    finally:
+        # cleanup any remaining tasks on exception path
+        for t in list(tasks.keys()):
+            if t is not winner_task and not t.done():
+                t.cancel()
+                try:
+                    await t
+                except Exception:
+                    pass
 
 
 def _curl_proxy_url(proxy_url: str | None) -> str | None:
@@ -4032,7 +4291,16 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
     # Ensure VPN is connected if rotation is enabled; on_request returns
     # the BEST station (may differ from the pre-flight pick — e.g. the
     # preferred one rotated while we were fetching the public IP).
-    if _free_ip_pool and _free_ip_pool.enabled:
+    # [free_parallel hedge] skip pre-increment when hedge will race —
+    # winner-only compta (loser not counted).
+    _hedge_pre = False
+    try:
+        if _free_ip_pool and _free_ip_pool.enabled and _free_parallel_should_hedge(body, forced_pool):
+            _hedge_pre = True
+            _debug("  [free] hedge pre-check true — skipping on_request")
+    except Exception:
+        _hedge_pre = False
+    if _free_ip_pool and _free_ip_pool.enabled and not _hedge_pre:
         try:
             _, station = await _free_ip_pool.on_request(forced_pool)
         except TypeError:
@@ -4091,12 +4359,46 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
         # fallback is correct behaviour then).
         free_max = effective_free_max_attempts(forced_pool)
         station_first = _free_exception_fallback_mode() == "station-first"
-        tried: set = set()
-        if station is not None:
-            tried.add(station)  # on_request pick = first strike (dual-clutch)
+        # [free_parallel hedge] N-wide race, first wins, winner-only compta, streaming OFF
+        _hedge_done = False
         resp = resp_headers = None
-        _free_used = 0
-        while resp is None and _free_used < free_max:
+        _hedge_cands = []
+        try:
+            if (not free_body.get("stream") and _free_ip_pool and not getattr(_free_ip_pool, "socks5_mode", False)
+                and _free_parallel_should_hedge(free_body, forced_pool)):
+                _hedge_cands = _free_ip_pool.pick_candidates(forced_pool)
+                # bound already in _hedged_fetch via hedge_max, but we check length
+                if len(_hedge_cands) >= 2:
+                    _debug(f"  [free] hedge start N={len(_hedge_cands)} stagger={_free_ip_pool._free_parallel_hedge_delay_ms}ms")
+                    try:
+                        resp, winner = await _hedged_fetch(_hedge_cands, free_body, free_headers, free_endpoint, forced_pool)
+                        # hedged_fetch already did note_hedge_winner + _current_free_attempt
+                        station = winner
+                        if winner and getattr(winner, "current_ip", None):
+                            free_ip = winner.current_ip
+                        elif winner and getattr(winner, "pid", None):
+                            free_ip = winner.pid
+                        # set headers for outer shared handling (resp_headers stays None for hedge)
+                        _hedge_done = True
+                        _debug(f"  [free] hedge winner station {getattr(winner,'_station','?')} status={resp.status_code if resp else '?'}")
+                    except Exception as he:
+                        _debug(f"  [free] hedge failed, fallback sequential: {he}")
+                        resp = None
+                        _hedge_done = False
+        except Exception as he:
+            _debug(f"  [free] hedge check failed: {he}")
+        # if hedge succeeded (resp is HTTP response, even 429), skip sequential loop and go to shared handling
+        # if hedge failed or not enabled, run sequential multi-attempt loop
+        tried: set = set()
+        if not _hedge_done:
+            if station is not None:
+                tried.add(station)  # on_request pick = first strike (dual-clutch)
+            _free_used = 0
+        else:
+            # hedge consumed 1 logical attempt; shared handling below will treat resp
+            _free_used = 1
+            tried = set(_hedge_cands)  # mark all hedged candidates as tried to avoid re-strike in fallback
+        while not _hedge_done and resp is None and _free_used < free_max:
             if _free_used == 0 and station is not None:
                 attempt = station
             elif _free_ip_pool:

@@ -25,6 +25,117 @@ import subprocess
 import sys
 import time
 
+# ── Docker Desktop auto-launch (Windows) ───────────────────────────────
+# If Docker Desktop is not running, `docker ps` fails with "error during connect".
+# On Windows, the proxy must auto-launch it (user request) — otherwise 5 stations
+# stay `disconnected` after a reboot. Fail-soft: if launch fails, the caller logs
+# and continues (watchdog will retry).
+_DOCKER_DESKTOP_LAUNCHED = False
+
+
+async def ensure_docker_running(timeout: int = 60) -> bool:
+    """Ensure the Docker daemon is reachable; on Windows auto-launch Desktop if needed.
+
+    Returns True if `docker ps` succeeds within `timeout` seconds, False otherwise.
+    Launch is best-effort: if Docker Desktop is not installed or fails to start,
+    the caller should log and continue (watchdog will retry).
+    """
+    global _DOCKER_DESKTOP_LAUNCHED
+    # Quick probe: is daemon already reachable?
+    try:
+        r = await asyncio.to_thread(
+            subprocess.run,
+            ["docker", "ps"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            creationflags=CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+        )
+        if r.returncode == 0:
+            return True
+    except Exception:
+        pass
+    if sys.platform != "win32":
+        return False
+    # Windows: try to launch Docker Desktop if not already attempted this boot
+    if _DOCKER_DESKTOP_LAUNCHED:
+        # Already tried once this process — don't loop forever, just wait a bit
+        for _ in range(timeout // 2):
+            await asyncio.sleep(2)
+            try:
+                r = await asyncio.to_thread(
+                    subprocess.run,
+                    ["docker", "ps"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                    creationflags=CREATE_NO_WINDOW,
+                )
+                if r.returncode == 0:
+                    return True
+            except Exception:
+                pass
+        return False
+    _DOCKER_DESKTOP_LAUNCHED = True
+    # Common install paths
+    candidates = [
+        r"C:\Program Files\Docker\Docker\Docker Desktop.exe",
+        r"C:\Program Files\Docker\Docker\resources\bin\docker.exe",
+        os.path.expandvars(r"%ProgramFiles%\Docker\Docker\Docker Desktop.exe"),
+        os.path.expandvars(r"%LocalAppData%\Docker\Docker Desktop.exe"),
+    ]
+    exe = None
+    for p in candidates:
+        try:
+            if p and os.path.exists(p) and p.lower().endswith("docker desktop.exe"):
+                exe = p
+                break
+        except Exception:
+            continue
+    if not exe:
+        # Fallback: try `start` via shell (may be on PATH)
+        try:
+            await asyncio.to_thread(
+                subprocess.run,
+                ["cmd", "/c", "start", "", "Docker Desktop"],
+                capture_output=True,
+                timeout=10,
+                creationflags=CREATE_NO_WINDOW,
+            )
+        except Exception:
+            pass
+    else:
+        try:
+            # Use Popen to not block; Desktop will daemonize
+            subprocess.Popen(
+                [exe],
+                creationflags=CREATE_NO_WINDOW,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception as e:
+            logging.getLogger(__name__).warning("[docker] failed to launch Desktop %s: %s", exe, e)
+            return False
+    # Wait for daemon to become reachable
+    for _ in range(timeout // 2):
+        await asyncio.sleep(2)
+        try:
+            r = await asyncio.to_thread(
+                subprocess.run,
+                ["docker", "ps"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                creationflags=CREATE_NO_WINDOW,
+            )
+            if r.returncode == 0:
+                logging.getLogger(__name__).info("[docker] daemon reachable after Desktop launch")
+                return True
+        except Exception:
+            pass
+    logging.getLogger(__name__).warning("[docker] daemon still not reachable after %ds", timeout)
+    return False
+
 # Cross-module registry of active VPN managers ([plan 18/08 §1]): set by
 # opencode.py's lifespan / _apply_station_count, read by _apply_stack to
 # scope a stack flip to the currently configured stations. shared_state is
@@ -620,6 +731,16 @@ class VPNManager:
             self._stack_effective = "openvpn"
         else:  # auto
             self._stack_effective = "wireguard" if os.path.exists(self._wg_key_file) else "openvpn"
+        # OpenVPN protocol fallback (udp/tcp) — gluetun OPENVPN_PROTOCOL, defaults udp.
+        # WG is always UDP 51820, OV can be udp 1194 or tcp 443/8443. The protocol
+        # is the remote-port dimension for the OV stack; all OV stations share it
+        # (global .env OPENVPN_PROTOCOL) and the watchdog cycles udp->tcp when
+        # OV UDP is dead (firewall that filters UDP but passes TCP 443).
+        _proto = str(cfg.get("ovpn_protocol", cfg.get("openvpn_protocol", "udp"))).lower()
+        if _proto not in ("udp", "tcp"):
+            _proto = "udp"
+        self._ovpn_protocol = _proto  # selected
+        self._ovpn_protocol_effective = _proto if self._stack_effective == "openvpn" else "udp"
         # [plan 18/08 §1d/§E2] Shared dead-tunnel counter (WG AND OpenVPN):
         # the light egress probe below is the single authority for egress_dead
         # on both stacks — the old "stack not WG: counter is meaningless" reset
@@ -700,7 +821,8 @@ class VPNManager:
         self._stack_since: float | None = None  # when the effective stack took over
         self._auto_ov_fail_threshold = max(1, int(cfg.get("auto_ov_fail_threshold", 3)))
         self._auto_ov_return_min = max(1, int(cfg.get("auto_ov_return_min", 60)))
-        self._auto_flip_cooldown_min = max(1, int(cfg.get("auto_flip_cooldown_min", 30)))
+        # Cooldown 0 = instantané (utilisateur: pas d'attente, toute station doit être dispo immédiatement)
+        self._auto_flip_cooldown_min = max(0, int(cfg.get("auto_flip_cooldown_min", 0)))
         self._flips: list[dict] = []  # journal [{time, from, to, reason}], cap 20
         self._pending_flip: tuple | None = None  # set inside the tick lock,
         # applied AFTER it (_apply_stack takes the lock — not reentrant).
@@ -1040,7 +1162,7 @@ class VPNManager:
         #    container" is success — already removed by an earlier pass.
         rm = await asyncio.to_thread(self._docker_run, ["rm", "-f", self._docker_container], 120)
         if rm.returncode != 0 and "No such container" not in (rm.stderr or ""):
-            raise RuntimeError(f"docker rm failed: {rm.stderr.strip() or rm.stdout.strip()}")
+            raise RuntimeError(f"échec suppression docker : {rm.stderr.strip() or rm.stdout.strip()}")
 
     async def connect(self) -> None:
         """Bring the tunnel up: compose up + wait healthy + record IP."""
@@ -1048,18 +1170,18 @@ class VPNManager:
             if self._status == VPNState.CONNECTED and self._current_ip:
                 return
             if not VPNState.can_transition(self._status, VPNState.CONNECTING):
-                raise RuntimeError(f"Cannot transition from {self._status} to connecting")
+                raise RuntimeError(f"Transition impossible de {self._status} vers connecting")
             self._set_status(VPNState.CONNECTING)
             self._error = None
             try:
                 await self._compose_up()
                 started_at = await self._wait_healthy(timeout=120)
                 if started_at is None:
-                    raise RuntimeError("gluetun not healthy within 120s")
+                    raise RuntimeError("gluetun non sain dans les 120s")
                 if await self._check_auth_failed(started_at):
                     self._auth_failed = True
                     self._current_ip = None  # stale IP must not be served ([5])
-                    raise RuntimeError("AUTH_FAILED - NordVPN service credentials rejected")
+                    raise RuntimeError("AUTH_FAILED - identifiants NordVPN rejetés")
                 self._auth_failed = False
                 # Boot with country rotation: pin the next country via the
                 # control server — the SAME machine as rotation ([plan] A).
@@ -1078,7 +1200,7 @@ class VPNManager:
                 # looping forever (the watchdog/update paths instead escalate
                 # or roll back on False, so they must stay strict).
                 if not await self._finalize_ip(allow_stale=True):
-                    raise RuntimeError("could not finalize a fresh IP through tunnel")
+                    raise RuntimeError("impossible de finaliser une nouvelle IP via le tunnel")
                 self._connected_at = time.monotonic()
                 self._set_status(VPNState.CONNECTED)
                 self._current_server = {
@@ -1095,7 +1217,7 @@ class VPNManager:
                 # Client disconnect mid-connect must not leave the state
                 # stuck in CONNECTING ([17]).
                 self._set_status(VPNState.ERROR)
-                self._error = "connect cancelled"
+                self._error = "connexion annulée"
                 raise
             except Exception as e:
                 self._set_status(VPNState.ERROR)
@@ -1134,11 +1256,11 @@ class VPNManager:
             since = time.monotonic() - self._last_rotation_failed_at
             if since < self._ROTATION_FAIL_COOLDOWN:
                 raise RotationFailed(
-                    f"rotation cooldown active ({self._ROTATION_FAIL_COOLDOWN - int(since)}s left)"
+                    f"cooldown rotation actif ({self._ROTATION_FAIL_COOLDOWN - int(since)}s restant)"
                 )
         # Circuit breaker gate ([25]): no rotation while the breaker is open.
         if not self._circuit_breaker.is_available(self._docker_container):
-            raise RotationFailed("circuit breaker open — skipping rotation")
+            raise RotationFailed("circuit breaker ouvert — rotation ignorée")
         task = asyncio.create_task(self._connect_next_impl())
         self._rotation_task = task
         try:
@@ -1157,9 +1279,9 @@ class VPNManager:
         """
         async with self._lock:
             if not self._enabled:
-                raise RotationFailed("VPN disabled — cannot rotate")
+                raise RotationFailed("VPN désactivé — rotation impossible")
             if not VPNState.can_transition(self._status, VPNState.CONNECTING):
-                raise RuntimeError(f"Cannot transition from {self._status} to connecting")
+                raise RuntimeError(f"Transition impossible de {self._status} vers connecting")
 
             old_ip = self._current_ip
             last_error: Exception | None = None
@@ -1199,11 +1321,11 @@ class VPNManager:
                     await self._ensure_container()
                     started_at = await self._wait_healthy(timeout=120)
                     if started_at is None:
-                        raise RuntimeError("gluetun not healthy after restart")
+                        raise RuntimeError("gluetun non sain après redémarrage")
                     if await self._check_auth_failed(started_at):
                         self._auth_failed = True
                         self._current_ip = None  # stale IP must not be served ([5])
-                        raise RuntimeError("AUTH_FAILED after restart")
+                        raise RuntimeError("AUTH_FAILED après redémarrage")
                     self._auth_failed = False
                 else:
                     # The pin polled status:running inside the control
@@ -1215,7 +1337,7 @@ class VPNManager:
 
                 new_ip = await self.get_public_ip()
                 if not new_ip:
-                    raise RuntimeError("could not determine public IP")
+                    raise RuntimeError("impossible de déterminer l'IP publique")
                 # [review 18/08 §C] the probe ANSWERED — the tunnel
                 # lives. Clear the latch: a later "IP unchanged"/
                 # "recently used" failure is the lottery, not death,
@@ -1223,9 +1345,9 @@ class VPNManager:
                 # final WARN would overstate — attempt 1 did answer).
                 self._rotation_probe_dead = False
                 if old_ip and new_ip == old_ip:
-                    raise RuntimeError(f"IP unchanged after restart ({new_ip})")
+                    raise RuntimeError(f"IP inchangée après redémarrage ({new_ip})")
                 if self._ip_recent(new_ip) and attempt < 2:
-                    raise RuntimeError(f"IP {new_ip} recently used")
+                    raise RuntimeError(f"IP {new_ip} récemment utilisée")
 
                 # Success — advance the identity BEFORE journalizing so
                 # the history entry carries the NEW face ([plan] C.2 —
@@ -1267,7 +1389,7 @@ class VPNManager:
                         # overshoot it. last_error may still be None when
                         # the wall expired before the first attempt.
                         deadline_hit = True
-                        last_error = last_error or RuntimeError("rotation wall exceeded")
+                        last_error = last_error or RuntimeError("délai de rotation dépassé")
                         break
                     remaining = deadline - self._now_fn()
                     self._set_status(VPNState.CONNECTING)
@@ -1278,7 +1400,7 @@ class VPNManager:
                         # Client disconnect mid-rotation must not leave the
                         # state stuck in CONNECTING ([17]).
                         self._set_status(VPNState.ERROR)
-                        self._error = "rotation cancelled by client disconnect"
+                        self._error = "rotation annulée par déconnexion client"
                         raise
                     except TimeoutError:
                         # The attempt burnt its budget. am.8: whatever
@@ -1288,7 +1410,7 @@ class VPNManager:
                         # never races it. The loop-top check then decides:
                         # budget left → next attempt, else bail.
                         deadline_hit = True
-                        last_error = RuntimeError("rotation deadline exceeded")
+                        last_error = RuntimeError("délai de rotation dépassé")
                         self._circuit_breaker.record_failure(self._docker_container)
                         self._backoff.record_failure()
                         logger.warning(
@@ -1300,7 +1422,7 @@ class VPNManager:
                         await self._await_rotation_ops_drained()
                     except Exception as e:
                         last_error = e
-                        if "could not determine public IP" in str(e):
+                        if "could not determine public IP" in str(e) or "impossible de déterminer l'IP publique" in str(e):
                             # The rotation died asking for a REAL IP through
                             # the tunnel — the tunnel itself is dead (the
                             # 445 s stall class, incident 18/08 S2). NOT set
@@ -1337,11 +1459,11 @@ class VPNManager:
             self._set_status(VPNState.ERROR)
             if deadline_hit:
                 self._error = (
-                    f"IP rotation gave up after {self._rotation_max_duration:.0f}s"
-                    f" (wall; last: {last_error})"
+                    f"Rotation IP abandonnée après {self._rotation_max_duration:.0f}s"
+                    f" (délai dépassé ; dernier : {last_error})"
                 )
             else:
-                self._error = f"IP rotation failed after 3 attempts (last: {last_error})"
+                self._error = f"Échec rotation IP après 3 tentatives (dernier : {last_error})"
             logger.error("[vpn] %s", self._error)
             # CRITIC(5): a failed rotation is a failure, not a silent None —
             # raise so callers can react honestly. Also arm the fail-fast
@@ -1388,7 +1510,7 @@ class VPNManager:
                 return True
             await asyncio.sleep(3)
         self._set_status(VPNState.ERROR)
-        self._error = f"Timeout waiting for VPN connection ({int(timeout)}s)"
+        self._error = f"Délai dépassé en attente de connexion VPN ({int(timeout)}s)"
         logger.error("[vpn] %s", self._error)
         return False
 
@@ -1442,7 +1564,7 @@ class VPNManager:
             status = event.get("status")
             if status in ("die", "stop", "kill") and self._status == VPNState.CONNECTED:
                 self._set_status(VPNState.ERROR)
-                self._error = f"container event {status} -- VPN down"
+                self._error = f"événement conteneur {status} -- VPN hors ligne"
         except Exception as e:
             logger.debug("[vpn] container event handling failed: %s", e)
 
@@ -1482,7 +1604,7 @@ class VPNManager:
 
         if not info.get("running"):
             self._set_status(VPNState.ERROR)
-            self._error = "container not running"
+            self._error = "conteneur arrêté"
             return self.get_status()
 
         auth_failed = await self._check_auth_failed(info.get("started_at", ""))
@@ -1492,9 +1614,9 @@ class VPNManager:
             self._server_issue = server_issue
             self._set_status(VPNState.ERROR)
             self._error = (
-                "AUTH_FAILED - NordVPN service credentials rejected"
+                "AUTH_FAILED - identifiants NordVPN rejetés"
                 if auth_failed
-                else "VPN server unreachable - TLS negotiation failed (stale server list?)"
+                else "Serveur VPN injoignable - échec négociation TLS (liste serveurs obsolète ?)"
             )
             self._current_ip = None  # stale IP must not be served ([5])
             logger.error("[vpn] %s", self._error)
@@ -1536,7 +1658,7 @@ class VPNManager:
                 # gluetun itself reports the VPN stopped — honest error, no
                 # SOCKS5 probe needed.
                 self._set_status(VPNState.ERROR)
-                self._error = "gluetun control server reports VPN stopped"
+                self._error = "serveur de contrôle gluetun signale VPN arrêté"
                 return self.get_status()
             # ctl is None (control server unreachable) → fall through to the
             # SOCKS5 probe below; "can't ask" must not read as "stopped".
@@ -1553,14 +1675,14 @@ class VPNManager:
             }
         else:
             self._set_status(VPNState.ERROR)
-            self._error = "container running but tunnel not answering"
+            self._error = "conteneur actif mais tunnel sans réponse"
         return self.get_status()
 
     async def health_check(self) -> dict:
         """Probe the tunnel through SOCKS5 and measure latency."""
         result = {"ok": False, "ip_changed": False, "latency_ms": None, "error": None}
         if self._status != VPNState.CONNECTED:
-            result["error"] = "Not connected"
+            result["error"] = "Non connecté"
             return result
         try:
             import httpx
@@ -1608,26 +1730,37 @@ class VPNManager:
                         self._ip_history = self._ip_history[-100:]
                         self.save_state()
             else:
-                result["error"] = "Could not determine IP"
+                result["error"] = "Impossible de déterminer l'IP"
         except Exception as e:
             result["error"] = str(e)
             logger.error("[vpn] health check failed: %s", e)
         return result
 
-    async def _probe_url(self, url: str) -> str | None:
-        """[plan 18/08 §A] One bounded IP GET through the SOCKS5 tunnel —
-        the parallel unit of get_public_ip. Fresh coroutine per endpoint:
-        the sweep's wait_for cancels it on budget overrun, __aexit__ closes
-        the client on cancellation — no orphan task, no leaked client.
+    async def _probe_url(self, url: str, *, per_attempt: float = 2.0) -> str | None:
+        """[plan 18/08 §A / prancy-unicorn §2] One bounded IP GET through the
+        SOCKS5 tunnel — the parallel unit of get_public_ip. Fresh coroutine
+        per endpoint: the sweep's wait_for cancels it on budget overrun,
+        __aexit__ closes the client on cancellation — no orphan task, no
+        leaked client. [unicorn] per-probe wait_for(min(2.0, budget)) so a
+        stuck SOCKS CONNECT (445 s stall) never leaks past httpx timeout=5.
         Returns the IP text (None on any failure)."""
         try:
             import httpx
 
+            # [unicorn] httpx timeout alone does NOT bound SOCKS CONNECT
+            # — wrap the GET in wait_for(per_attempt) (min(2.0, budget))
+            per_attempt = max(0.5, min(2.0, float(per_attempt or 2.0)))
             async with httpx.AsyncClient(timeout=5, proxy=self.socks5_url) as client:
-                resp = await client.get(url)
+                resp = await asyncio.wait_for(client.get(url), timeout=per_attempt)
                 ip = resp.text.strip()
+            if ip:
+                logger.debug("[vpn] probe ok %s via %s", url, self.socks5_url)
             return ip or None
-        except Exception:
+        except asyncio.TimeoutError:
+            logger.debug("[vpn] probe timeout %s (%.1fs) via %s", url, per_attempt, self.socks5_url)
+            return None
+        except Exception as e:
+            logger.debug("[vpn] probe fail %s via %s: %s", url, self.socks5_url, e)
             return None
 
     async def get_public_ip(self) -> str | None:
@@ -1895,12 +2028,17 @@ class VPNManager:
             _exc_fallback = _cfg_data.get("ip_rotation", {}).get(
                 "free_exception_fallback", "station-first"
             )
+            # [free_parallel] Stations free parallel routing (persisted)
+            _free_parallel = _cfg_data.get("ip_rotation", {}).get("free_parallel", {})
+            if not isinstance(_free_parallel, dict):
+                _free_parallel = {}
         except Exception:
             _dual = _strict = False
             _vpn_stack = "auto"
             _station_count = 2 if _dual else 1
             _free_attempts = 2
             _exc_fallback = "station-first"
+            _free_parallel = {}
         return {
             "enabled": self._enabled,
             "proxy_mode": self._proxy_mode,
@@ -1959,6 +2097,8 @@ class VPNManager:
             # read from the config mirror so the dashboard reflects what was
             # persisted, like dual_station above.
             "vpn_stack": _vpn_stack,
+            "ovpn_protocol": getattr(self, "_ovpn_protocol", "udp"),
+            "ovpn_protocol_effective": getattr(self, "_ovpn_protocol_effective", "udp"),
             # [plan 18/08 §1] parallel station count (1-10, resolved from
             # station_count / dual_station — same canonical value the
             # dropdown posts back).
@@ -1967,6 +2107,8 @@ class VPNManager:
             # ordering (station-first / direct) — same mirror pattern.
             "max_free_attempts": _free_attempts,
             "free_exception_fallback": _exc_fallback,
+            # [free_parallel] Stations free parallel routing (persisted)
+            "free_parallel": _free_parallel,
         }
 
     async def update_config(self, updates: dict) -> dict:
@@ -2083,6 +2225,14 @@ class VPNManager:
                 float(updates.get("watchdog_backoff_max", self._watchdog_backoff._max_delay)),
             )
             self._watchdog_backoff = BackoffTimer(base_delay=_wbase, max_delay=_wmax)
+        if "ovpn_protocol" in updates or "openvpn_protocol" in updates:
+            _p = str(updates.get("ovpn_protocol", updates.get("openvpn_protocol", "udp"))).lower()
+            if _p not in ("udp", "tcp"):
+                _p = "udp"
+            self._ovpn_protocol = _p
+            # Effective follows selected when on OV, else stays udp (inert under WG)
+            if self._stack_effective == "openvpn":
+                self._ovpn_protocol_effective = _p
         if self._shared is not None and any(
             k in updates for k in ("recent_ip_window", "recent_ip_max_age", "shared_rotation_file")
         ):
@@ -2112,6 +2262,8 @@ class VPNManager:
             "error": self._error,
             "auth_failed": self._auth_failed,
             "last_rotation_error": self._last_rotation_error,
+            "ovpn_protocol": getattr(self, "_ovpn_protocol", "udp"),
+            "ovpn_protocol_effective": getattr(self, "_ovpn_protocol_effective", "udp"),
             "rotation_failed_at": (
                 time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self._last_rotation_failed_at))
                 if self._last_rotation_failed_at
@@ -2207,7 +2359,7 @@ class VPNManager:
                 env=env,
             )
         except FileNotFoundError:
-            raise RuntimeError("docker CLI not found on PATH")
+            raise RuntimeError("CLI docker introuvable dans le PATH")
         finally:
             if loop is not None and op_ev is not None:
                 # Stale-decrement guard: the rotation's teardown bumped the
@@ -2244,6 +2396,12 @@ class VPNManager:
             stack = self._stack_effective or "openvpn"
         for s in stations or [self._station]:
             env[f"VPN_TYPE_STATION{s}"] = stack
+            if stack == "openvpn":
+                _proto = getattr(self, "_ovpn_protocol_effective", "udp")
+                if _proto not in ("udp", "tcp"):
+                    _proto = "udp"
+                env[f"OPENVPN_PROTOCOL_STATION{s}"] = _proto
+                env["OPENVPN_PROTOCOL"] = _proto
         # [fix 20/08][Axe 3.1] Custom .ovpn (dashboard upload): compose's
         # volume block bind-mounts vpn_configs/custom/ → /vpn-custom (ro)
         # and stanzas interpolate ${OPENVPN_CUSTOM_CONFIG:-}. The uploaded
@@ -2311,7 +2469,7 @@ class VPNManager:
         result = await asyncio.to_thread(self._docker_run, ["restart", self._docker_container], 60)
         if result.returncode != 0:
             raise RuntimeError(
-                f"docker restart failed: {result.stderr.strip() or result.stdout.strip()}"
+                f"échec redémarrage docker : {result.stderr.strip() or result.stdout.strip()}"
             )
 
     # ── gluetun control server client ────────────────────────────
@@ -2574,7 +2732,7 @@ class VPNManager:
                 pass
         # Queue max guard
         if len(VPNManager._geo_coalesce) >= 8:
-            raise RuntimeError("geo pin queue saturated (503)")
+            raise RuntimeError("file d'attente geo pin saturée (503)")
         loop = asyncio.get_event_loop()
         fut = loop.create_future()
         VPNManager._geo_coalesce[key] = fut
@@ -2846,7 +3004,7 @@ class VPNManager:
         result = await asyncio.to_thread(self._docker_run, cmd, 120, env=self._compose_env())
         if result.returncode != 0:
             raise RuntimeError(
-                f"docker compose up failed: {result.stderr.strip() or result.stdout.strip()}"
+                f"échec docker compose up : {result.stderr.strip() or result.stdout.strip()}"
             )
 
     async def _ensure_container(self, force_recreate: bool | None = None) -> None:
@@ -2905,6 +3063,15 @@ class VPNManager:
         # Effective OpenVPN below.
         if self._stack_effective != "openvpn":
             return None
+        # OV UDP dead -> TCP is cheaper than jumping back to WG (firewall blocks UDP)
+        if self._egress_failures >= self._auto_wg_egress_ticks:
+            if getattr(self, "_ovpn_protocol_effective", "udp") == "udp":
+                return ("openvpn", f"egress dead {self._egress_failures} ticks UDP -> TCP")
+            # UDP already tried, TCP also dead -> fall through to WG flip via auth/window or direct
+            # If TCP dead persistently, the next egress tick will still be dead and the auth-free
+            # path below will eventually flip to WG (preferred). Keep egress->WG as fallback
+            # when protocol already tcp to avoid flip-flop loop.
+            return ("wireguard", f"egress dead {self._egress_failures} ticks TCP")
         if not self._wg_key_present():
             return None  # cannot flip to wireguard without the key
         if len(self._auth_failed_window) >= self._auto_ov_fail_threshold:
@@ -2917,23 +3084,77 @@ class VPNManager:
             return ("wireguard", f"OV healthy {self._auto_ov_return_min} min — return to WG")
         return None
 
+    def _emergency_flip_decision(self) -> tuple | None:
+        """Emergency flip for manual stacks after persistent failure.
+
+        Auto policy respects the user's choice (``_stack != 'auto'`` → never
+        flip). In production all stations in the logs failed on WG with
+        ``i/o timeout`` on every handshake, so a manual ``wireguard`` stack
+        looped forever on the same recovery (re-pin → restart → compose).
+        This decision allows a *manual* stack to heal itself after one
+        failed recovery cycle: same thresholds as auto, but gated on
+        ``watchdog_backoff ≥ 1`` (at least one heal attempt actually failed)
+        and the same cooldown. Returns (mode, reason) or None.
+        """
+
+        if self._stack == "auto":
+            return None
+        now = self._now_fn()
+        cutoff = now - 30 * 60
+        self._auth_failed_window = [t for t in self._auth_failed_window if t >= cutoff]
+        if (
+            self._last_auto_flip_at is not None
+            and now - self._last_auto_flip_at < self._auto_flip_cooldown_min * 60
+        ):
+            return None  # cooldown — anti-flapping (shared with auto)
+        # Manual = stay in type, try all ports/protocols of that type only
+        # WireGuard manual: never flip to OV, just keep healing WG (re-pin country,
+        # blacklist, server refresh). The tunnel stays wireguard tout port (51820
+        # + country rotation). Return None -> watchdog heals same stack.
+        if self._stack_effective == "wireguard":
+            # Port dimension for WG is server/country rotation (51820 fixe), so
+            # no protocol flip — let the normal recovery (fast-pin, restart,
+            # escalate refresh) do the work. No emergency stack flip in manual.
+            return None
+        if self._stack_effective == "openvpn":
+            # OV manual: try all OV ports/protocols (udp 1194 -> tcp 443 -> tcp 8443
+            # via OPENVPN_ENDPOINT_PORT if needed) but never flip to WG.
+            if self._egress_failures >= self._auto_wg_egress_ticks:
+                if self._watchdog_backoff.consecutive_failures >= 1 or self._restart_churn:
+                    if getattr(self, "_ovpn_protocol_effective", "udp") == "udp":
+                        return ("openvpn", "emergency OV UDP dead -> TCP, recovery failed")
+                    else:
+                        # TCP also dead -> stay in OV, escalate will refresh servers
+                        # and watchdog will retry same TCP with new country.
+                        return None
+            if self._restart_churn and self._watchdog_backoff.consecutive_failures >= 1:
+                if getattr(self, "_ovpn_protocol_effective", "udp") == "udp":
+                    return ("openvpn", "emergency OV healthcheck loop UDP -> TCP, recovery failed")
+                else:
+                    return None
+            # AUTH_FAILED in manual OV: stay in OV, just blacklist host (no WG flip)
+            return None
+        return None
+
     def _wg_key_present(self) -> bool:
         try:
             return os.path.isfile(self._wg_key_file)
         except Exception:
             return False
 
-    async def _apply_stack(self, mode: str, reason: str = "manual", auto: bool = False) -> bool:
-        """Switch the effective stack of ALL ACTIVE stations (compose
-        substitution) and record the flip. mode ∈ {"wireguard", "openvpn"}
-        (auto is resolved by the caller). Refuses wireguard when
-        vpn_configs/wireguard.env is missing — the keys are NEVER generated
-        or stored by the proxy.
+    async def _apply_stack(self, mode: str, reason: str = "manual", auto: bool = False, stations: list | None = None) -> bool:
+        """Switch the effective stack (compose substitution) and record the flip.
+        mode ∈ {"wireguard", "openvpn"} (auto is resolved by the caller).
+        Refuses wireguard when vpn_configs/wireguard.env is missing.
 
-        Writes VPN_TYPE_STATION{1..N} for the active stations into the .env
+        By default flips ALL ACTIVE stations (global, manual). When ``stations``
+        is set (auto hétérogène per-station), only those stations are flipped
+        and recreated — the fleet becomes heterogeneous (WG + OV UDP + OV TCP).
+
+        Writes VPN_TYPE_STATION{1..N} for the target stations into the .env
         next to the compose file (read-modify-write + os.replace, atomic —
         same pattern as save_state) and PRUNES stale keys from downscaled
-        stations, then `compose up -d --force-recreate` on the active
+        stations, then `compose up -d --force-recreate` on the target
         services.
 
         No-op semantics [fix 19/08]: when ``mode == _stack_effective`` the
@@ -2953,17 +3174,24 @@ class VPNManager:
         # 1/2 pair when there is no registry (standalone manager, unit
         # tests) so past dual-station behavior is unchanged.
         _managers = list(getattr(shared_state, "vpn_managers", None) or [])
-        stations, services = [], []
-        for _m in _managers:
-            if _m is not None and _m._station not in stations:
-                stations.append(_m._station)
-                services.append(_m._compose_service)
-        if not stations:
-            stations = [1, 2] if self._station <= 2 else [self._station]
-            services = (
-                ["vpn-gluetun", "vpn-gluetun-2"] if self._station <= 2 else [self._compose_service]
-            )
-        station_keys = {f"VPN_TYPE_STATION{s}" for s in stations}
+        _is_global_flip = stations is None
+        if stations is not None:
+            # Per-station flip (auto hétérogène): explicit station list
+            _map = {m._station: m._compose_service for m in _managers if m is not None}
+            services = [_map.get(s, f"vpn-gluetun-{s}" if s > 1 else "vpn-gluetun") for s in stations]
+            station_keys = {f"VPN_TYPE_STATION{s}" for s in stations}
+        else:
+            stations, services = [], []
+            for _m in _managers:
+                if _m is not None and _m._station not in stations:
+                    stations.append(_m._station)
+                    services.append(_m._compose_service)
+            if not stations:
+                stations = [1, 2] if self._station <= 2 else [self._station]
+                services = (
+                    ["vpn-gluetun", "vpn-gluetun-2"] if self._station <= 2 else [self._compose_service]
+                )
+            station_keys = {f"VPN_TYPE_STATION{s}" for s in stations}
         compose_path = self._compose_file_path()
         env_path = os.path.join(os.path.dirname(compose_path), ".env")
         try:
@@ -2992,7 +3220,8 @@ class VPNManager:
                     continue
                 # Prune stale per-station vars from downscaled stations so a
                 # later upscale never resurrects a leftover value.
-                if key.startswith("VPN_TYPE_STATION") and re.fullmatch(r"VPN_TYPE_STATION\d+", key):
+                # Per-station flip (auto hétérogène) must NOT prune other stations.
+                if _is_global_flip and key.startswith("VPN_TYPE_STATION") and re.fullmatch(r"VPN_TYPE_STATION\d+", key):
                     continue
                 out.append(ln)
             for key in sorted(station_keys - seen):
@@ -3042,6 +3271,104 @@ class VPNManager:
         )
         self._flips = self._flips[-20:]
         logger.info("[vpn] stack: %s→%s (%s)", previous, mode, reason)
+        # When flipping to OV, ensure protocol is tracked (default udp)
+        if mode == "openvpn" and not hasattr(self, "_ovpn_protocol_effective"):
+            self._ovpn_protocol_effective = getattr(self, "_ovpn_protocol", "udp")
+        return True
+
+    async def _apply_ovpn_protocol(self, protocol: str, reason: str = "protocol fallback") -> bool:
+        """Flip OpenVPN protocol udp<->tcp without changing VPN_TYPE.
+
+        Writes ``OPENVPN_PROTOCOL`` for all active OV stations and recreates
+        them. Returns True on success, False if protocol invalid or compose fails.
+        Propagates effective protocol to sibling managers (same pattern as stack).
+        """
+
+        if protocol not in ("udp", "tcp"):
+            logger.error("[vpn] _apply_ovpn_protocol: invalid %r", protocol)
+            return False
+        if protocol == getattr(self, "_ovpn_protocol_effective", "udp"):
+            logger.info("[vpn] ovpn protocol already %s — no-op", protocol)
+            return True
+        if self._stack_effective != "openvpn":
+            logger.warning("[vpn] _apply_ovpn_protocol: not on OV stack (%s)", self._stack_effective)
+            return False
+        # Per-station independent: only this station flips protocol (auto hétérogène)
+        stations = [self._station]
+        services = [self._compose_service]
+        compose_path = self._compose_file_path()
+        env_path = os.path.join(os.path.dirname(compose_path), ".env")
+        try:
+            data = ""
+            try:
+                with open(env_path, encoding="utf-8") as f:
+                    data = f.read()
+            except FileNotFoundError:
+                pass
+            lines = data.splitlines()
+            out = []
+            seen = False
+            per_key = f"OPENVPN_PROTOCOL_STATION{self._station}"
+            for ln in lines:
+                stripped = ln.strip()
+                if stripped.startswith(per_key + "="):
+                    out.append(f"{per_key}={protocol}")
+                    seen = True
+                elif stripped.startswith("OPENVPN_PROTOCOL=") and not stripped.startswith("OPENVPN_PROTOCOL_STATION"):
+                    # Keep global fallback in sync for fresh clones / other stations
+                    out.append(ln)
+                else:
+                    out.append(ln)
+            if not seen:
+                out.append(f"{per_key}={protocol}")
+            # Ensure global fallback exists
+            if not any(l.strip().startswith("OPENVPN_PROTOCOL=") for l in out):
+                out.append(f"OPENVPN_PROTOCOL={protocol}")
+            else:
+                # Also update global to last flipped value for backward compat
+                for i, l in enumerate(out):
+                    if l.strip().startswith("OPENVPN_PROTOCOL=") and not l.strip().startswith("OPENVPN_PROTOCOL_STATION"):
+                        out[i] = f"OPENVPN_PROTOCOL={protocol}"
+                        break
+            tmp = env_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write("\n".join(out) + "\n")
+            os.replace(tmp, env_path)
+        except OSError as e:
+            logger.error("[vpn] _apply_ovpn_protocol: cannot write %s: %s", env_path, e)
+            return False
+        try:
+            prev = getattr(self, "_ovpn_protocol_effective", "udp")
+            self._ovpn_protocol_effective = protocol
+            self._ovpn_protocol = protocol
+            cmd = ["compose", "-f", compose_path, "up", "-d", "--force-recreate"] + sorted(services)
+            env = self._compose_env(stations=stations, stack="openvpn")
+            result = await asyncio.to_thread(self._docker_run, cmd, 300, env=env)
+            if result.returncode != 0:
+                self._ovpn_protocol_effective = prev
+                self._ovpn_protocol = prev
+                raise RuntimeError(result.stderr.strip() or result.stdout.strip())
+        except Exception as e:
+            logger.error("[vpn] _apply_ovpn_protocol: compose failed: %s", e)
+            return False
+        # Per-station independent: no propagate to siblings (auto hétérogène)
+        # Persist selected (global fallback)
+        try:
+            from config.settings import yaml_set
+
+            yaml_set("ip_rotation", "ovpn_protocol", protocol)
+        except Exception:
+            pass
+        self._flips.append(
+            {
+                "time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "from": f"openvpn-{prev}",
+                "to": f"openvpn-{protocol}",
+                "reason": reason,
+            }
+        )
+        self._flips = self._flips[-20:]
+        logger.warning("[vpn] ovpn protocol: %s→%s (%s)", prev, protocol, reason)
         return True
 
     async def set_stack(self, mode: str, propagate: bool = True) -> dict:
@@ -3081,6 +3408,8 @@ class VPNManager:
         return {
             "selected": self._stack,
             "effective": self._stack_effective,
+            "ovpn_protocol": getattr(self, "_ovpn_protocol", "udp"),
+            "ovpn_protocol_effective": getattr(self, "_ovpn_protocol_effective", "udp"),
             "keys_present": self._wg_key_present(),
             "egress_failures": self._egress_failures,
             "egress_armed": self._egress_failures > 0,
@@ -3373,13 +3702,13 @@ class VPNManager:
         """
         async with self._lock:
             if not self._update_available:
-                return {"ok": False, "error": "no update available"}
+                return {"ok": False, "error": "aucune mise à jour disponible"}
             if check_opportune and not self._update_opportune():
-                return {"ok": False, "error": "not opportune (traffic active)"}
+                return {"ok": False, "error": "pas opportun (trafic actif)"}
             if check_opportune and self._active_free_streams > 0:
-                return {"ok": False, "error": "free streams active — deferring update"}
+                return {"ok": False, "error": "streams gratuits actifs — mise à jour reportée"}
             if not self._acquire_update_lock():
-                return {"ok": False, "error": "another instance is applying an update"}
+                return {"ok": False, "error": "une autre instance applique déjà une mise à jour"}
             try:
                 compose_file = self._compose_file_path()
                 result = await asyncio.to_thread(
@@ -3401,16 +3730,16 @@ class VPNManager:
                     raise RuntimeError(result.stderr.strip() or result.stdout.strip())
                 started_at = await self._wait_healthy(timeout=120)
                 if started_at is None:
-                    raise RuntimeError("tunnel not healthy after update")
+                    raise RuntimeError("tunnel non sain après mise à jour")
                 if await self._check_auth_failed(started_at):
                     self._auth_failed = True
-                    raise RuntimeError("AUTH_FAILED after update")
+                    raise RuntimeError("AUTH_FAILED après mise à jour")
                 self._auth_failed = False
                 # Fresh IP + NEW identity: the recreate re-picked a server, so
                 # validate the IP is not recent on either station and advance
                 # the identity ([plan] C.4). Failure rolls back below.
                 if not await self._finalize_ip(allow_stale=False):
-                    raise RuntimeError("could not finalize a fresh IP after update")
+                    raise RuntimeError("impossible de finaliser une nouvelle IP après mise à jour")
                 # force: container was just recreated — a cached status
                 # would report the pre-update container ([37]).
                 # The recreate IS a gluetun recovery: snap the churn scan
@@ -3683,6 +4012,11 @@ class VPNManager:
             # fresh counters, applied AFTER it (_apply_stack takes the lock;
             # asyncio.Lock is not reentrant, calling it here would deadlock).
             self._pending_flip = self._auto_flip_decision()
+            # Emergency flip for manual stacks: same thresholds but gated on
+            # at least one failed heal attempt, so a transient blip is first
+            # healed on the current stack before flipping.
+            if self._pending_flip is None and self._stack != "auto":
+                self._pending_flip = self._emergency_flip_decision()
             # [plan 20/08] _restart_churn: the healthcheck-restart LOOP is a
             # failing tunnel even while the SOCKS5 probe happens to land in a
             # live window — the flag alone routes the tick into the recovery
@@ -3776,6 +4110,8 @@ class VPNManager:
                     # except below records the same single failure.
                     self._watchdog_backoff.record_failure()
                     escalate = self._watchdog_backoff.consecutive_failures >= 2
+                    if self._pending_flip is None and self._stack != "auto":
+                        self._pending_flip = self._emergency_flip_decision()
                     logger.error(
                         "[vpn-watchdog] restart did not recover — next "
                         "attempt in %ds (failure #%d)",
@@ -3785,20 +4121,64 @@ class VPNManager:
                 except Exception as e:
                     self._watchdog_backoff.record_failure()
                     escalate = self._watchdog_backoff.consecutive_failures >= 2
+                    if self._pending_flip is None and self._stack != "auto":
+                        self._pending_flip = self._emergency_flip_decision()
                     logger.error(
                         "[vpn-watchdog] restart failed: %s — next attempt in %ds",
                         e,
                         int(self._watchdog_backoff.delay),
                     )
-        # [plan 18/08 §3c] auto flip — applied OUTSIDE the lock (compose).
+        # [plan 18/08 §3c] auto flip (+ emergency manual flip) — applied OUTSIDE the lock (compose).
         # A successful flip supersedes the escalation: the tunnel was just
         # recreated in the other stack, no need to refresh servers/image too.
         if self._pending_flip is not None:
             mode, reason = self._pending_flip
             self._pending_flip = None
-            ok = await self._apply_stack(mode, reason="auto: " + reason, auto=True)
-            if ok:
-                return
+            is_emergency = reason.startswith("emergency")
+            # OV protocol flip (udp->tcp) is a lighter heal than full stack flip:
+            # same VPN_TYPE=openvpn, only OPENVPN_PROTOCOL changes (1194->443).
+            # Works for both auto and emergency (firewall blocks UDP but TCP 443 passes).
+            if mode == "openvpn" and "UDP" in reason and "-> TCP" in reason:
+                ok = await self._apply_ovpn_protocol("tcp", reason=reason)
+                if ok:
+                    return
+                # Protocol flip failed -> fall through to stack flip as escalation
+            if is_emergency:
+                ok = await self._apply_stack(mode, reason=reason, auto=True)
+                if ok:
+                    # Propagate to sibling stations (registry sync) — the compose call recreated ALL
+                    # active services, so every manager must reflect the new effective stack.
+                    for _m in getattr(shared_state, "vpn_managers", []) or []:
+                        if _m is not None and _m is not self:
+                            _m._stack_effective = mode
+                            _m._stack_since = self._stack_since
+                            _m._last_auto_flip_at = self._last_auto_flip_at
+                            if _m._stack != "auto":
+                                _m._stack = mode
+                    if self._stack != "auto":
+                        prev = self._stack
+                        self._stack = mode
+                        try:
+                            from config.settings import yaml_set  # persist selected (survives reboot)
+
+                            yaml_set("ip_rotation", "vpn_stack", mode)
+                        except Exception:
+                            pass
+                        logger.warning(
+                            "[vpn-watchdog] emergency flip %s→%s applied (manual stack overridden, now %s)",
+                            prev,
+                            mode,
+                            mode,
+                        )
+                    return
+            else:
+                # Auto hétérogène: per-station independent (each station heals itself)
+                ok = await self._apply_stack(mode, reason="auto: " + reason, auto=True, stations=[self._station])
+                if ok:
+                    # No global propagate in per-station auto — each station keeps its own
+                    # effective stack/protocol. The fleet becomes heterogeneous (WG + OV UDP + OV TCP)
+                    # which is the resilience the user requested.
+                    return
             # Flip failed (e.g. compose error): fall through to the escalation
             # below if the tick was failing — recovery is still needed.
             escalate = escalate or self._watchdog_backoff.consecutive_failures >= 2
@@ -3916,6 +4296,8 @@ class VPNManager:
                 "failed_hosts": self._failed_hosts,
                 # [plan 18/08 §3b] stack selection + flip journal (cap 20)
                 "stack": self._stack,
+                "ovpn_protocol": getattr(self, "_ovpn_protocol", "udp"),
+                "ovpn_protocol_effective": getattr(self, "_ovpn_protocol_effective", "udp"),
                 "flips": self._flips,
                 "saved_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             }
@@ -3986,6 +4368,13 @@ class VPNManager:
             restored_stack = state.get("stack")
             if restored_stack in ("auto", "wireguard", "openvpn"):
                 self._stack = restored_stack
+            # OV protocol persistence (udp/tcp)
+            _rp = state.get("ovpn_protocol")
+            if _rp in ("udp", "tcp"):
+                self._ovpn_protocol = _rp
+            _rpe = state.get("ovpn_protocol_effective")
+            if _rpe in ("udp", "tcp"):
+                self._ovpn_protocol_effective = _rpe
             restored_flips = state.get("flips")
             if isinstance(restored_flips, list):
                 self._flips = [f for f in restored_flips if isinstance(f, dict)][-20:]
@@ -4023,7 +4412,7 @@ def _docker_cli(
             env=env,
         )
     except FileNotFoundError:
-        raise RuntimeError("docker CLI not found on PATH")
+        raise RuntimeError("CLI docker introuvable dans le PATH")
 
 
 def _env_value_from_inspect(info: dict, key: str) -> str | None:

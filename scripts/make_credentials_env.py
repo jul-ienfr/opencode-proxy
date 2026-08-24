@@ -81,6 +81,29 @@ def _upsert_env_var(path: str, key: str, value: str) -> None:
         pass  # Windows may not support chmod 0600
 
 
+def _load_control_api_key() -> str | None:
+    """Read ip_rotation.control_api_key from config.yaml (single source)."""
+    if not os.path.exists(CONFIG_PATH):
+        return None
+    try:
+        import yaml  # type: ignore[import-untyped]
+
+        data = yaml.safe_load(open(CONFIG_PATH, encoding="utf-8"))
+        val = (data or {}).get("ip_rotation", {}).get("control_api_key")
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+        return None
+    except Exception:
+        try:
+            text = open(CONFIG_PATH, encoding="utf-8").read()
+            m = re.search(r"control_api_key:\s*['\"]?([^\n'\"\s]+)['\"]?", text)
+            if m:
+                return m.group(1).strip()
+            return None
+        except Exception:
+            return None
+
+
 def _sync_server_countries() -> bool:
     countries = _load_server_countries()
     if not countries:
@@ -88,6 +111,20 @@ def _sync_server_countries() -> bool:
         return False
     _upsert_env_var(ENV_PATH, "SERVER_COUNTRIES", countries)
     print(f"OK: {ENV_PATH} SERVER_COUNTRIES synced from config.yaml ({len(countries.split(','))} countries)")
+    return True
+
+
+def _sync_control_api_key() -> bool:
+    key = _load_control_api_key()
+    if not key:
+        print(f"WARN: could not read ip_rotation.control_api_key from {CONFIG_PATH} — credentials.env not updated")
+        return False
+    # Gluetun control server auth: VPN_CONTROL_API_KEY is used by healthcheck and vpn_manager
+    # Also set HTTP_CONTROL_SERVER_AUTH for compatibility (some gluetun versions)
+    _upsert_env_var(DST, "VPN_CONTROL_API_KEY", key)
+    # HTTP_CONTROL_SERVER_AUTH is a JSON role, but for simple key auth, set to key as well
+    # The docker-compose healthcheck uses X-API-Key: $$VPN_CONTROL_API_KEY
+    print(f"OK: {DST} VPN_CONTROL_API_KEY synced from config.yaml")
     return True
 
 
@@ -108,8 +145,9 @@ def main() -> None:
         print(f"INFO: {SRC} not found — skipping credentials.env generation (already migrated)")
 
     synced = _sync_server_countries()
-    if not did_credentials and not synced:
-        raise SystemExit(f"ERROR: nothing to do — no {SRC} and no server_countries in {CONFIG_PATH}")
+    synced_key = _sync_control_api_key()
+    if not did_credentials and not synced and not synced_key:
+        raise SystemExit(f"ERROR: nothing to do — no {SRC} and no server_countries/control_api_key in {CONFIG_PATH}")
 
 
 if __name__ == "__main__":

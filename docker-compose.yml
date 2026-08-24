@@ -36,7 +36,7 @@ x-gluetun-multi-env: &gluetun-multi-env
   # No inline fallback (audit F-H5): the single source is config.yaml.
   VPN_SERVICE_PROVIDER: nordvpn
   OPENVPN_VERBOSITY: '4'   # hostname in logs (see vpn-gluetun comment)
-  SERVER_COUNTRIES: ${SERVER_COUNTRIES:?Set SERVER_COUNTRIES from config.yaml - run: python scripts/make_credentials_env.py}
+  SERVER_COUNTRIES: ${SERVER_COUNTRIES:?Set SERVER_COUNTRIES from config.yaml - run python scripts/make_credentials_env.py}
   UPDATER_PERIOD: 480h
   HTTPPROXY: 'on'
   SOCKS5_ENABLED: 'on'
@@ -51,6 +51,9 @@ x-gluetun-multi-env: &gluetun-multi-env
   # the stack is openvpn; `/vpn-custom` is the bind mount below. Empty by
   # default → gluetun ignores the setting entirely (inert on a fresh clone).
   OPENVPN_CUSTOM_CONFIG: ${OPENVPN_CUSTOM_CONFIG:-}
+  # OV protocol fallback (udp 1194 vs tcp 443) — global fallback, per-station
+  # OPENVPN_PROTOCOL_STATIONn (auto hétérogène) overrides it. Inert under WG.
+  OPENVPN_PROTOCOL: ${OPENVPN_PROTOCOL:-udp}
 
 services:
   opencode-proxy:
@@ -145,6 +148,9 @@ services:
       # [fix 20/08][Axe 3.1] custom .ovpn from the dashboard upload — path is
       # the in-container bind mount /vpn-custom; empty default = inert.
       - OPENVPN_CUSTOM_CONFIG=${OPENVPN_CUSTOM_CONFIG:-}
+      # OV protocol udp/tcp (1194 vs 443) — per-station, inert under WG.
+      # Auto hétérogène: chaque station a son propre proto (STATIONn), global fallback.
+      - OPENVPN_PROTOCOL=${OPENVPN_PROTOCOL_STATION1:-${OPENVPN_PROTOCOL:-udp}}
       # [incident 17/08] gluetun's country enum uses SPACED names
       # ("United Kingdom", "Czech Republic") — NordVPN file-style
       # "United_Kingdom"/"Czechia" are rejected with a WARN "not in
@@ -233,6 +239,8 @@ services:
       # [fix 20/08][Axe 3.1] custom .ovpn from the dashboard upload — path is
       # the in-container bind mount /vpn-custom; empty default = inert.
       - OPENVPN_CUSTOM_CONFIG=${OPENVPN_CUSTOM_CONFIG:-}
+      # OV protocol udp/tcp — per-station hétérogène, inert sous WG.
+      - OPENVPN_PROTOCOL=${OPENVPN_PROTOCOL_STATION2:-${OPENVPN_PROTOCOL:-udp}}
       # [incident 17/08] gluetun's country enum uses SPACED names
       # ("United Kingdom", "Czech Republic") — NordVPN file-style
       # "United_Kingdom"/"Czechia" are rejected with a WARN "not in
@@ -281,6 +289,7 @@ services:
     environment:
       <<: *gluetun-multi-env
       VPN_TYPE: ${VPN_TYPE_STATION3:-openvpn}
+      OPENVPN_PROTOCOL: ${OPENVPN_PROTOCOL_STATION3:-${OPENVPN_PROTOCOL:-udp}}
       HTTPPROXY_LISTENING_ADDRESS: :8890
       SOCKS5_LISTENING_ADDRESS: :1082
     volumes:
@@ -299,6 +308,7 @@ services:
     environment:
       <<: *gluetun-multi-env
       VPN_TYPE: ${VPN_TYPE_STATION4:-openvpn}
+      OPENVPN_PROTOCOL: ${OPENVPN_PROTOCOL_STATION4:-${OPENVPN_PROTOCOL:-udp}}
       HTTPPROXY_LISTENING_ADDRESS: :8891
       SOCKS5_LISTENING_ADDRESS: :1083
     volumes:
@@ -317,6 +327,7 @@ services:
     environment:
       <<: *gluetun-multi-env
       VPN_TYPE: ${VPN_TYPE_STATION5:-openvpn}
+      OPENVPN_PROTOCOL: ${OPENVPN_PROTOCOL_STATION5:-${OPENVPN_PROTOCOL:-udp}}
       HTTPPROXY_LISTENING_ADDRESS: :8892
       SOCKS5_LISTENING_ADDRESS: :1084
     volumes:
@@ -335,6 +346,7 @@ services:
     environment:
       <<: *gluetun-multi-env
       VPN_TYPE: ${VPN_TYPE_STATION6:-openvpn}
+      OPENVPN_PROTOCOL: ${OPENVPN_PROTOCOL_STATION6:-${OPENVPN_PROTOCOL:-udp}}
       HTTPPROXY_LISTENING_ADDRESS: :8893
       SOCKS5_LISTENING_ADDRESS: :1085
     volumes:
@@ -353,6 +365,7 @@ services:
     environment:
       <<: *gluetun-multi-env
       VPN_TYPE: ${VPN_TYPE_STATION7:-openvpn}
+      OPENVPN_PROTOCOL: ${OPENVPN_PROTOCOL_STATION7:-${OPENVPN_PROTOCOL:-udp}}
       HTTPPROXY_LISTENING_ADDRESS: :8894
       SOCKS5_LISTENING_ADDRESS: :1086
     volumes:
@@ -371,6 +384,7 @@ services:
     environment:
       <<: *gluetun-multi-env
       VPN_TYPE: ${VPN_TYPE_STATION8:-openvpn}
+      OPENVPN_PROTOCOL: ${OPENVPN_PROTOCOL_STATION8:-${OPENVPN_PROTOCOL:-udp}}
       HTTPPROXY_LISTENING_ADDRESS: :8895
       SOCKS5_LISTENING_ADDRESS: :1087
     volumes:
@@ -389,6 +403,7 @@ services:
     environment:
       <<: *gluetun-multi-env
       VPN_TYPE: ${VPN_TYPE_STATION9:-openvpn}
+      OPENVPN_PROTOCOL: ${OPENVPN_PROTOCOL_STATION9:-${OPENVPN_PROTOCOL:-udp}}
       HTTPPROXY_LISTENING_ADDRESS: :8896
       SOCKS5_LISTENING_ADDRESS: :1088
     volumes:
@@ -407,6 +422,7 @@ services:
     environment:
       <<: *gluetun-multi-env
       VPN_TYPE: ${VPN_TYPE_STATION10:-openvpn}
+      OPENVPN_PROTOCOL: ${OPENVPN_PROTOCOL_STATION10:-${OPENVPN_PROTOCOL:-udp}}
       HTTPPROXY_LISTENING_ADDRESS: :8897
       SOCKS5_LISTENING_ADDRESS: :1089
     volumes:

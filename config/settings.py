@@ -616,6 +616,76 @@ def _ensure_auto_max_free_attempts_warn(cfg: dict, source: str = "boot") -> None
 
 _ensure_auto_max_free_attempts_warn(IP_ROTATION, source="boot")
 
+# ── Free parallel (stations free) — two routings découplés ─────────
+# (B) Stations free: enabled bool, routing round-robin|failover,
+#     mode load-balance|hedge, hedge_delay_ms 0-2000, hedge_max_attempts 1-3
+# Defaults conservateurs OFF (pas de parallélisation sans action GUI).
+_FREE_PARALLEL_DEFAULTS = {
+    "enabled": False,
+    "routing": "round-robin",
+    "mode": "load-balance",
+    "hedge_delay_ms": 300,
+    "hedge_max_attempts": 1,
+}
+
+
+def _normalize_free_parallel(raw) -> dict:
+    if not isinstance(raw, dict):
+        raw = {}
+    try:
+        enabled = bool(raw.get("enabled", _FREE_PARALLEL_DEFAULTS["enabled"]))
+    except Exception:
+        enabled = False
+    routing = str(raw.get("routing", _FREE_PARALLEL_DEFAULTS["routing"]) or "round-robin").lower()
+    if routing not in ("round-robin", "failover"):
+        logger.warning("[config] free_parallel.routing invalid %r — fallback to round-robin", routing)
+        routing = "round-robin"
+    mode = str(raw.get("mode", _FREE_PARALLEL_DEFAULTS["mode"]) or "load-balance").lower()
+    if mode not in ("load-balance", "strict", "hedge"):
+        logger.warning("[config] free_parallel.mode invalid %r — fallback to load-balance", mode)
+        mode = "load-balance"
+    try:
+        delay = int(raw.get("hedge_delay_ms", _FREE_PARALLEL_DEFAULTS["hedge_delay_ms"]))
+    except Exception:
+        delay = 300
+    delay = max(0, min(2000, delay))
+    try:
+        max_att = int(raw.get("hedge_max_attempts", _FREE_PARALLEL_DEFAULTS["hedge_max_attempts"]))
+    except Exception:
+        max_att = 1
+    max_att = max(1, min(3, max_att))
+    return {
+        "enabled": enabled,
+        "routing": routing,
+        "mode": mode,
+        "hedge_delay_ms": delay,
+        "hedge_max_attempts": max_att,
+    }
+
+
+FREE_PARALLEL: dict = _normalize_free_parallel(IP_ROTATION.get("free_parallel", {}))
+# back-fill IP_ROTATION mirror so save_yaml keeps it
+try:
+    if "free_parallel" not in IP_ROTATION or not isinstance(IP_ROTATION.get("free_parallel"), dict):
+        IP_ROTATION["free_parallel"] = dict(FREE_PARALLEL)
+    else:
+        # ensure normalized values are persisted back
+        IP_ROTATION["free_parallel"] = dict(FREE_PARALLEL)
+    # keep _yaml_data mirror
+    sec = _yaml_data.get("ip_rotation")
+    if isinstance(sec, dict):
+        sec["free_parallel"] = dict(FREE_PARALLEL)
+except Exception:
+    pass
+
+
+def get_free_parallel() -> dict:
+    return FREE_PARALLEL
+
+
+def free_parallel_enabled() -> bool:
+    return bool(FREE_PARALLEL.get("enabled", False))
+
 # ── Server ──────────────────────────────────────────────────────────
 HOST = _env("OPENCODE_HOST", yaml_get("server", "host", "0.0.0.0"))
 PORT = _env_int("OPENCODE_PORT", yaml_get("server", "port", 4000))
@@ -1333,7 +1403,8 @@ def maybe_reload_custom_routes():
         SORTED_GEO_POLICIES, \
         GEO_ENABLED, \
         GEO_VERSION, \
-        GEO_ALLOW_DIRECT_WHEN_COMPATIBLE
+        GEO_ALLOW_DIRECT_WHEN_COMPATIBLE, \
+        FREE_PARALLEL
     now = time.time()
     if now - _custom_routes_last_check < _CUSTOM_ROUTES_CHECK_INTERVAL:
         return
@@ -1379,6 +1450,15 @@ def maybe_reload_custom_routes():
                     # [plan v2 auto-sync] ensure auto flag + WARN on divergence (idempotent)
                     try:
                         _ensure_auto_max_free_attempts_warn(IP_ROTATION, source="reload")
+                    except Exception:
+                        pass
+                    # free_parallel in-place (hot-reload without restart)
+                    try:
+                        _norm = _normalize_free_parallel(IP_ROTATION.get("free_parallel", {}))
+                        FREE_PARALLEL.clear()
+                        FREE_PARALLEL.update(_norm)
+                        # keep IP_ROTATION mirror normalized
+                        IP_ROTATION["free_parallel"] = dict(_norm)
                     except Exception:
                         pass
                     # GEO in-place

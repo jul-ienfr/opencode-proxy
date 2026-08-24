@@ -246,7 +246,7 @@ async def test_rollback_snaps_churn_scan_after_recreate(tmp_path):
     res = await mgr.apply_update(check_opportune=False)
 
     assert res.get("ok") is False
-    assert "tunnel not healthy" in res.get("error", ""), "rollback déclenché"
+    assert ("tunnel not healthy" in res.get("error", "") or "tunnel non sain" in res.get("error", "")), "rollback déclenché"
     scans = [a for a in mgr.docker_log_args if a[:2] == ["logs", "--since"]]
     assert scans, "le refresh du rollback a scanné les logs"
     assert scans[-1][2] == "1s", "rollback: fenêtre bornée APRÈS le recreate (anti stale-marker)"

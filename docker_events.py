@@ -171,6 +171,19 @@ class DockerEventWatcher:
             mgr._on_container_event(event)
         except Exception as e:
             logger.debug("[docker-events] station callback failed: %s", e)
+        # [prancy-unicorn Phase1/2] invalidate VPN status cache so the next
+        # /api/vpn-status probe is not served stale for 2 s after a container
+        # event (health, die, start).
+        try:
+            mgr._last_status_refresh_at = 0  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        try:
+            from dashboard.api import _stats_cache as _dac  # type: ignore
+
+            _dac.invalidate("ip_stats")
+        except Exception:
+            pass
         # Real-time dashboard push (coalesced on the SSE side).
         payload = {
             "container": name,

@@ -22,6 +22,7 @@ exhausted.
 
 import asyncio
 import logging
+import random
 import time
 import urllib.parse
 
@@ -167,6 +168,18 @@ class FreeIPPool:
         # bad-mark or the manual rotate endpoint).
         self._socks5_auto_rotate = True
 
+        # [free_parallel] Deux routings découplés — (B) Stations free
+        # enabled=false → pas de parallélisation (sticky), routing
+        # round-robin = strict tour 1,2,3… (change à chaque requête), failover = sticky 1..N
+        self._free_parallel_enabled = False
+        self._free_parallel_routing = "round-robin"
+        self._free_parallel_mode = "load-balance"
+        self._free_parallel_hedge_delay_ms = 300
+        self._free_parallel_hedge_max = 1
+        self._rr_idx = 0  # strict round-robin compteur
+        # observability hedge_wins counter
+        self._hedge_wins = {"primary": 0, "hedge": 0, "total": 0}
+
     # ── Properties ─────────────────────────────────────────────
 
     @property
@@ -296,21 +309,54 @@ class FreeIPPool:
             return False
         return True
 
-    def _best_station(self, forced_pool=None) -> VPNManager | None:
-        """Best station for the next request — preference A (station 1)
-        unless it is bad (recent 429) or its tunnel is down.
+    def _free_parallel_is_rr(self) -> bool:
+        """True when free_parallel enabled + routing round-robin (tout mode sauf failover)."""
+        return bool(self._free_parallel_enabled) and self._free_parallel_routing == "round-robin"
 
-        Approaching quota is NOT excluded here: the caller's threshold
-        branch in ``on_request`` performs the dual-clutch switch (other
-        station now, departed station rotating in the background).
-        Excluding it here would return the other station directly and
-        never launch the departed station's rotation — it would sit
-        parked at quota until both stations were exhausted.
+    def _best_station(self, forced_pool=None) -> VPNManager | None:
+        """Best station for the next request.
+
+        - enabled==false  → sticky station 1
+        - enabled==true + failover → sticky 1..N (premier usable)
+        - enabled==true + round-robin + load-balance → least-loaded (min request_count)
+        - enabled==true + round-robin + strict → compteur strict 1,2,3… change à chaque requête
+        - enabled==true + round-robin + hedge → primaire strict (hedge en course)
+        Approaching quota NOT excluded here (dual-clutch géré dans on_request).
         """
-        for st in self._stations:
-            if self._station_usable(st, exclude_approaching=False, forced_pool=forced_pool):
-                return st
-        return None
+        usable = [
+            st for st in self._stations if self._station_usable(st, exclude_approaching=False, forced_pool=forced_pool)
+        ]
+        if not usable:
+            return None
+        if not self._free_parallel_is_rr():
+            return usable[0]
+        # round-robin : selon mode
+        if self._free_parallel_mode == "strict":
+            usable.sort(key=lambda s: s._station)
+            try:
+                idx = self._rr_idx % len(usable)
+                self._rr_idx = (self._rr_idx + 1) % 1000000
+                return usable[idx]
+            except Exception:
+                return usable[0]
+        if self._free_parallel_mode == "hedge":
+            # hedge primaire = strict aussi (course)
+            usable.sort(key=lambda s: s._station)
+            try:
+                idx = self._rr_idx % len(usable)
+                self._rr_idx = (self._rr_idx + 1) % 1000000
+                return usable[idx]
+            except Exception:
+                return usable[0]
+        # load-balance (défaut) → least-loaded
+        try:
+            min_cnt = min(self._per_station(st)["request_count"] for st in usable)
+            least = [st for st in usable if self._per_station(st)["request_count"] == min_cnt]
+            if len(least) == 1:
+                return least[0]
+            return random.choice(least)
+        except Exception:
+            return usable[0]
 
     def _best_station_excluding(
         self, station: VPNManager, forced_pool=None
@@ -349,6 +395,48 @@ class FreeIPPool:
             if self._station_usable(st, exclude_approaching=False, forced_pool=forced_pool):
                 return True
         return False
+
+    def pick_candidates(self, forced_pool=None) -> list:
+        """[free_parallel] Return up to N usable stations sorted by routing.
+
+        - enabled==false or N==1 → 1 seule (pas de hedge)
+        - round-robin → least-loaded d'abord (tri par request_count)
+        - failover → ordre 1..N (sticky)
+        Filtre bad_until/status/geo via _station_usable(exclude_approaching=False
+        si hedge pour brûler 1 slot mais prendre le premier qui répond).
+        Borne à N = len(_stations) (1..10). Si N>=2 et enabled+mode hedge,
+        l'appelant peut hedger sur len(cands) candidates.
+        """
+        if not self._stations:
+            return []
+        # if disabled and single station, still return 1 usable (fallback seq)
+        # collect usable with exclude_approaching=False (hedge veut même au seuil)
+        usable = [st for st in self._stations if self._station_usable(st, exclude_approaching=False, forced_pool=forced_pool)]
+        if not usable:
+            return []
+        # if free_parallel disabled, return only best (no hedge)
+        if not self._free_parallel_enabled:
+            return [usable[0]] if usable else []
+        if len(usable) == 1:
+            return usable
+        # sort according to routing
+        if self._free_parallel_is_rr():
+            # least-loaded first
+            try:
+                usable.sort(key=lambda st: self._per_station(st)["request_count"])
+            except Exception:
+                pass
+        else:
+            # failover: already in _station order, keep sticky
+            usable.sort(key=lambda st: st._station)
+        # cap to N (all) — caller may hedge on all, but limit burst to 3 for N=10
+        # plan: staggers évite burst simultané; on retourne toutes, l'appelant borne
+        return usable
+
+    # Back-compat alias for plan's pick_two (2 stations max)
+    def pick_two(self, forced_pool=None) -> list:
+        cands = self.pick_candidates(forced_pool)
+        return cands[:2]
 
     # [Axe 3.1] Static SOCKS5 proxies (socks5 mode — NO docker is ever
     # touched). The proxy list is an alternative backend to the docker
@@ -758,12 +846,12 @@ class FreeIPPool:
         if isinstance(station, Socks5Endpoint):
             # [Axe 3.1] Static proxies have no docker rotation — nothing to
             # switch. A stray call is a programming error, fail loudly.
-            raise RotationFailed(f"socks5 proxy {station.pid} has no docker rotation")
+            raise RotationFailed(f"proxy socks5 {station.pid} n'a pas de rotation docker")
         new_ip = await station.connect_next()
         if not new_ip:
             # Defensive: connect_next is typed to return str now, but a
             # None would silently reset counters below — fail loudly instead.
-            raise RotationFailed("connect_next returned no IP")
+            raise RotationFailed("connect_next n'a retourné aucune IP")
         per = self._per_station(station)
         per["request_count"] = 0
         per["session_start"] = time.monotonic()
@@ -1242,6 +1330,15 @@ class FreeIPPool:
             self._per.pop(sid, None)
             self._pending.discard(sid)
             self._rotation_tasks.pop(sid, None)
+        # [prancy-unicorn Phase1 P1] prune ghost sids >N in shared_rotation
+        try:
+            import shared_state as _ss_prune
+
+            _sr = getattr(_ss_prune, "shared_rotation", None)
+            if _sr is not None and hasattr(_sr, "prune_stations"):
+                _sr.prune_stations(len(self._stations))
+        except Exception:
+            pass
         # [plan 18/08 §2.3] Sweep any stale registrations whose sid is not in
         # the new set (belt-and-braces: an entry can outlive the removed-set
         # computation if a station object was swapped mid-reload) — unknown
@@ -1355,6 +1452,91 @@ class FreeIPPool:
                 if per is not None and per["last_quota_per_ip"] != q:
                     per["request_count"] = 0
                     per["last_quota_per_ip"] = q
+        # [free_parallel] hot-reload (nested dict + flat keys for dashboard compat)
+        if "free_parallel" in cfg and isinstance(cfg["free_parallel"], dict):
+            fp = cfg["free_parallel"]
+            try:
+                self._free_parallel_enabled = bool(fp.get("enabled", False))
+            except Exception:
+                self._free_parallel_enabled = False
+            routing = str(fp.get("routing", "round-robin") or "round-robin").lower()
+            self._free_parallel_routing = routing if routing in ("round-robin", "failover") else "round-robin"
+            mode = str(fp.get("mode", "load-balance") or "load-balance").lower()
+            self._free_parallel_mode = mode if mode in ("load-balance", "strict", "hedge") else "load-balance"
+            try:
+                self._free_parallel_hedge_delay_ms = max(0, min(2000, int(fp.get("hedge_delay_ms", 300))))
+            except Exception:
+                self._free_parallel_hedge_delay_ms = 300
+            try:
+                self._free_parallel_hedge_max = max(1, min(3, int(fp.get("hedge_max_attempts", 1))))
+            except Exception:
+                self._free_parallel_hedge_max = 1
+        # flat keys (dashboard sends free_parallel_routing plat)
+        if "free_parallel_enabled" in cfg:
+            try:
+                self._free_parallel_enabled = bool(cfg["free_parallel_enabled"])
+            except Exception:
+                pass
+        if "free_parallel_routing" in cfg:
+            r = str(cfg["free_parallel_routing"] or "round-robin").lower()
+            if r in ("round-robin", "failover"):
+                self._free_parallel_routing = r
+        if "free_parallel_mode" in cfg:
+            m = str(cfg["free_parallel_mode"] or "load-balance").lower()
+            if m in ("load-balance", "strict", "hedge"):
+                self._free_parallel_mode = m
+        if "free_parallel_hedge_delay_ms" in cfg:
+            try:
+                self._free_parallel_hedge_delay_ms = max(0, min(2000, int(cfg["free_parallel_hedge_delay_ms"])))
+            except Exception:
+                pass
+
+    def note_hedge_winner(self, winner, primary=None) -> None:
+        """Record hedge winner — compta winner-only (loser not counted).
+
+        Increments per["request_count"], ip_stats, note_free_request(),
+        and hedge_wins counter. Called AFTER _hedged_fetch picks winner.
+        """
+        if winner is None:
+            return
+        try:
+            per = self._per_station(winner)
+            # hot-reload guard like on_request
+            if per["last_quota_per_ip"] is not None and per["last_quota_per_ip"] != getattr(winner, "_quota_per_ip", 0):
+                per["request_count"] = 0
+            per["last_quota_per_ip"] = getattr(winner, "_quota_per_ip", 0)
+            per["request_count"] += 1
+            try:
+                winner.note_free_request()
+            except Exception:
+                pass
+            ip = getattr(winner, "current_ip", None) or getattr(winner, "pid", "unknown") or "unknown"
+            if ip not in per["ip_stats"]:
+                per["ip_stats"][ip] = {
+                    "requests": 0,
+                    "start": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "server": getattr(winner, "current_server", {}).get("name", "?") if getattr(winner, "current_server", None) else "?",
+                }
+                # socks5 server
+                if getattr(winner, "pid", None) and not getattr(winner, "current_server", None):
+                    per["ip_stats"][ip]["server"] = "socks5"
+            per["ip_stats"][ip]["requests"] += 1
+            self._active_station = winner
+            if getattr(winner, "pid", None) and isinstance(winner, Socks5Endpoint):
+                self._socks5_current = winner
+            # hedge observability
+            try:
+                self._hedge_wins["total"] += 1
+                if primary is not None and winner is primary:
+                    self._hedge_wins["primary"] += 1
+                elif primary is not None:
+                    self._hedge_wins["hedge"] += 1
+                else:
+                    self._hedge_wins["primary"] += 1
+            except Exception:
+                pass
+        except Exception as e:
+            logger.debug("[free-ip] note_hedge_winner failed: %s", e)
 
     def any_rotation_in_flight(self) -> bool:
         """[Axe 1.4] True while at least one station rotation is running.
@@ -1399,6 +1581,15 @@ class FreeIPPool:
             )
         active = self._active_station or self._vpn
         s1 = stations[0]
+        # [prancy-unicorn Phase1] agrégat honnête N/M healthy — connected si une station l'est, error seulement si toutes error
+        _healthy = sum(1 for _s in stations if _s.get("vpn_status") == "connected")
+        _total = len(stations)
+        if _healthy > 0:
+            _agg_status = "connected"
+        elif all(_s.get("vpn_status") == "error" for _s in stations):
+            _agg_status = "error"
+        else:
+            _agg_status = s1["vpn_status"]
 
         # [Axe 3.1] Static SOCKS5 view (socks5 mode — no docker stations).
         socks5_proxies = []
@@ -1427,13 +1618,16 @@ class FreeIPPool:
             "dual_station": self.dual_station,
             "active_station": active._station,
             "stations": stations,
+            "healthy": _healthy,
+            "total": _total,
             "socks5_mode": self.socks5_mode,
             "socks5_current": (
                 self._socks5_current.pid if self._socks5_current is not None else None
             ),
             "socks5_proxies": socks5_proxies,
-            # Legacy top-level fields = station 1 (dashboard backward compat)
-            "vpn_status": s1["vpn_status"],
+            # Aggregated banner (N/M healthy) — legacy s1 fields kept for compat but vpn_status/status is aggregated
+            "status": _agg_status,
+            "vpn_status": _agg_status,
             "current_ip": s1["current_ip"],
             "current_server": s1["current_server"],
             "requests_this_ip": s1["requests_this_ip"],
@@ -1449,4 +1643,13 @@ class FreeIPPool:
             "ips_used": len({ip for p in self._per.values() for ip in p["ip_stats"]}),
             "ip_stats": {ip: st for p in self._per.values() for ip, st in p["ip_stats"].items()},
             "vpn": self._vpn.get_status(),
+            # [free_parallel] observability
+            "free_parallel": {
+                "enabled": self._free_parallel_enabled,
+                "routing": self._free_parallel_routing,
+                "mode": self._free_parallel_mode,
+                "hedge_delay_ms": self._free_parallel_hedge_delay_ms,
+                "hedge_max_attempts": self._free_parallel_hedge_max,
+            },
+            "hedge_wins": dict(self._hedge_wins),
         }

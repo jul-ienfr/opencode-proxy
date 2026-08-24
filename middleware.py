@@ -133,7 +133,7 @@ class RateLimitMiddleware:
             await self.app(scope, receive, send)
             return
         retry_after_int = max(1, int(retry_after) + 1)
-        body = _json_dumps({"error": "Rate limit exceeded. Try again shortly."})
+        body = _json_dumps({"error": "Limite de débit dépassée. Veuillez réessayer sous peu."})
         headers = [
             (b"content-type", b"application/json"),
             (b"retry-after", str(retry_after_int).encode()),
