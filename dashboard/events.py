@@ -37,6 +37,7 @@ class EventManager:
         self._vpn_last: dict = {}
         self._vpn_pending: dict = {}
         self._flush_task: asyncio.Task | None = None
+        self._bound_loop: asyncio.AbstractEventLoop | None = None
 
     async def subscribe(self):
         queue = asyncio.Queue(maxsize=256)
@@ -104,12 +105,26 @@ class EventManager:
         """Start the pending-vpn_event flusher (caller holds ``_lock``).
 
         Only when a loop is running — otherwise inline delivery on the
-        next publish covers it (no loop = no async subscribers either)."""
+        next publish covers it (no loop = no async subscribers either).
+        [v10 §14.3.20] appelé depuis un thread sync : create_task échoue →
+        on schedule sur la boucle capturée via run_coroutine_threadsafe."""
         if self._flush_task is None or self._flush_task.done():
             try:
                 self._flush_task = asyncio.create_task(self._flush_loop())
             except RuntimeError:
-                self._flush_task = None  # no running loop — skip flusher
+                loop = getattr(self, "_bound_loop", None)
+                if loop is not None and loop.is_running():
+                    asyncio.run_coroutine_threadsafe(self._bind_flusher(), loop)
+                self._flush_task = None
+
+    def bind_loop(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Capture la boucle principale au boot — publish() thread-safe."""
+        self._bound_loop = loop
+
+    async def _bind_flusher(self):
+        with self._lock:
+            if self._flush_task is None or self._flush_task.done():
+                self._flush_task = asyncio.create_task(self._flush_loop())
 
     async def _flush_loop(self):
         """Deliver pending (coalesced) vpn_events once their coalesce

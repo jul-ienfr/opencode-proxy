@@ -1696,7 +1696,25 @@ class FreeIPPool:
                 }
             )
         active = self._active_station or self._vpn
-        s1 = stations[0]
+        # [plan v10 §14.3.8] stations[0] sans garde → IndexError (500 sur
+        # /api/pool-status) dès que la registry est vide (retrait total).
+        if not stations:
+            s1 = {
+                "station": None,
+                "vpn_status": "error",
+                "current_ip": None,
+                "current_server": None,
+                "requests_this_ip": 0,
+                "quota_per_ip": 0,
+                "rotation_threshold": 0,
+                "remaining": 0,
+                "bad_until": None,
+                "bad_remaining": 0,
+                "last_rotation_error": "no station configured",
+                "vpn": {},
+            }
+        else:
+            s1 = stations[0]
         # [prancy-unicorn Phase1] agrégat honnête N/M healthy — connected si une station l'est, error seulement si toutes error
         _healthy = sum(1 for _s in stations if _s.get("vpn_status") == "connected")
         _total = len(stations)

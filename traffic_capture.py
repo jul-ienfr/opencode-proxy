@@ -66,20 +66,26 @@ _FORM_SECRET_RE = re.compile(
 )
 
 
-def _redact_body(raw: bytes) -> bytes:
-    """One pass over a stored frame body: mask credential-shaped JSON
-    values, ``Bearer <token>`` and ``key=value`` form pairs. Keeps
-    structure — a value becomes ``[REDACTED]``, never removed."""
-    if not raw:
-        return raw
-    try:
-        text = raw.decode("utf-8", "replace")
-    except Exception:
-        return raw
+def _redact_text(text: str) -> str:
+    """Masque credential-shaped JSON values / Bearer / form pairs (structure conservée)."""
     text = _BODY_SECRET_RE.sub(r"\1[REDACTED]\3", text)
     text = _BEARER_RE.sub(r"\1[REDACTED]", text)
     text = _FORM_SECRET_RE.sub(r"\1[REDACTED]", text)
-    return text.encode("utf-8")
+    return text
+
+
+def _redact_body(raw: bytes) -> bytes:
+    """One pass over a stored frame body (see _redact_text).
+
+    [plan v10 §14.1.18] binaire : décodage impossible → octets BRUTS rendus
+    tels quels (l'ancien decode('utf-8','replace') corrompait les octets)."""
+    if not raw:
+        return raw
+    try:
+        text = raw.decode("utf-8")
+    except Exception:
+        return raw
+    return _redact_text(text).encode("utf-8")
 
 
 def _pct(sorted_vals: list[float], p: float) -> float:
@@ -113,6 +119,8 @@ class _Frame:
         "duration_ms",
         "aborted",
         "abort_reason",
+        "binary",
+        "tail",
     )
 
     def __init__(
@@ -146,6 +154,9 @@ class _Frame:
         self.duration_ms: float | None = None
         self.aborted = False
         self.abort_reason: str | None = None
+        # [v10 §14.1.18] redaction incrémentale : binaire détecté / queue UTF-8
+        self.binary = False
+        self.tail: bytes = b""  # ≤3 octets multi-octets en attente de décodage
 
     # ── JSON projections (kept out of this module's hot path) ──
     @property
@@ -254,21 +265,45 @@ class TrafficCapture:
         return frame
 
     def _add_body(self, frame: _Frame, chunk: bytes) -> int:
-        """Append a wire chunk to the frame body (capped). Returns stored bytes."""
+        """Append a wire chunk to the frame body (capped). Returns stored bytes.
+
+        [plan v10 §14.1.18] redaction INCRÉMENTALE : chaque chunk est masqué
+        AVANT stockage — l'hexdump servi pendant le vol n'expose plus de
+        secrets pendant toute la durée de vie de la requête (l'ancien code ne
+        redactait qu'à _finish). Frontières UTF-8 multi-octets coupées entre
+        deux chunks → ≤3 octets gardés en attente ; binaire détecté → octets
+        bruts stockés, jamais re-redactés."""
         if not chunk:
             return 0
         if frame.body is None:
             frame.body = b""
-        # Keep the first body_cap bytes; flag truncation but keep counting.
+        before = len(frame.body)
         if len(frame.body) < self.body_cap:
             take = chunk[: self.body_cap - len(frame.body)]
-            frame.body += take
-            self._bytes += len(take)
+            data = (getattr(frame, "tail", b"") or b"") + take
+            frame.tail = b""
+            if getattr(frame, "binary", False):
+                to_store = data  # binaire confirmé : brut
+            else:
+                try:
+                    text = data.decode("utf-8")
+                    to_store = _redact_text(text).encode("utf-8")
+                except UnicodeDecodeError as e:
+                    if e.start >= max(0, len(data) - 3):
+                        # séquence multi-octets tronquée en fin → bufferiser
+                        head = data[: e.start].decode("utf-8", "replace")
+                        to_store = _redact_text(head).encode("utf-8")
+                        frame.tail = data[e.start :]
+                    else:
+                        frame.binary = True  # vraie donnée binaire
+                        to_store = data
+            frame.body += to_store
             if len(take) < len(chunk):
                 frame.truncated = True
         else:
             frame.truncated = True
         frame.body_len += len(chunk)
+        self._bytes += len(frame.body) - before
         while self._bytes > self.max_bytes and len(self._frames) > 1:
             self._evict_oldest()
         return self._bytes
@@ -295,10 +330,13 @@ class TrafficCapture:
         # Redaction pass: credential-shaped values in the stored body become
         # "[REDACTED]" (structure kept). Lengths change, so the global byte
         # budget must be recounted to stay honest (finding i).
-        redacted = _redact_body(frame.body)
-        if redacted != frame.body:
-            frame.body = redacted
-            self._recount_bytes()
+        # [v10 §14.1.18] redaction déjà faite INCRÉMENTALEMENT dans _add_body ;
+        # frames binaires : octets bruts, jamais décodés.
+        if not getattr(frame, "binary", False):
+            redacted = _redact_body(frame.body)
+            if redacted != frame.body:
+                frame.body = redacted
+                self._recount_bytes()
 
     def _evict_oldest(self) -> None:
         if not self._frames:

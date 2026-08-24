@@ -65,12 +65,30 @@ class TrayApp:
     # ── Tray callbacks ──
 
     def _on_start_proxy(self, icon, item):
-        self.server_manager.start()
-        self._update_icon()
+        # [plan v10 §14.3.28] start/stop sont LENTS (boot proxy complet) —
+        # exécutés dans la boucle pystray ils gèlent icône + menu. Offload
+        # thread daemon (même pattern que _on_quit), l'icône se rafraîchit
+        # au retour via le poll d'état.
+        import threading
+
+        threading.Thread(target=self._start_bg, daemon=True).start()
+
+    def _start_bg(self):
+        try:
+            self.server_manager.start()
+        finally:
+            self._update_icon()
 
     def _on_stop_proxy(self, icon, item):
-        self.server_manager.stop()
-        self._update_icon()
+        import threading
+
+        threading.Thread(target=self._stop_bg, daemon=True).start()
+
+    def _stop_bg(self):
+        try:
+            self.server_manager.stop()
+        finally:
+            self._update_icon()
 
     def _on_open_dashboard(self, icon, item):
         self.dashboard.open()

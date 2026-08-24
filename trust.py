@@ -173,7 +173,19 @@ class _MutationRateLimiter:
 class DashboardTrustMiddleware:
     """Garde `/api/*` : GET/HEAD → confiance réseau (+token sinon) ;
     mutations → confiance + Origin même-host + rate-limit.
-    `require_token=true` (opt-in WAN) force le token hors loopback."""
+    `require_token=true` (opt-in WAN) force le token hors loopback.
+    [v10 §14.2.4] security headers posés sur TOUTES les réponses."""
+
+    SECURITY_HEADERS: tuple[tuple[bytes, bytes], ...] = (
+        (
+            b"content-security-policy",
+            b"default-src 'self'; script-src 'self' https://cdn.jsdelivr.net 'unsafe-inline'; "
+            b"style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; "
+            b"object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'",
+        ),
+        (b"x-content-type-options", b"nosniff"),
+        (b"referrer-policy", b"same-origin"),
+    )
 
     def __init__(
         self,
@@ -188,8 +200,12 @@ class DashboardTrustMiddleware:
         self._limiter = rate_limiter or _MutationRateLimiter()
 
     async def __call__(self, scope: MutableScope, receive: Receive, send: Send) -> None:
-        if scope.get("type") != "http" or not str(scope.get("path", "")).startswith("/api/"):
+        if scope.get("type") != "http":
             await self.app(scope, receive, send)
+            return
+        if not str(scope.get("path", "")).startswith("/api/"):
+            # hors /api : pas de logique trust, mais security headers quand même
+            await self.app(scope, receive, self._wrap_send_headers(send))
             return
         try:
             status_body = self._check(scope)
@@ -200,7 +216,20 @@ class DashboardTrustMiddleware:
             status, body = status_body
             await send_json(send, status, body)
             return
-        await self.app(scope, receive, send)
+        await self.app(scope, receive, self._wrap_send_headers(send))
+
+    def _wrap_send_headers(self, send: Send) -> Send:
+        async def wrapped(message: Any) -> None:
+            if message.get("type") == "http.response.start":
+                headers = list(message.get("headers") or [])
+                have = {bytes(k).lower() for k, _ in headers}
+                for hk, hv in self.SECURITY_HEADERS:
+                    if hk not in have:
+                        headers.append((hk, hv))
+                message["headers"] = headers
+            await send(message)
+
+        return wrapped
 
     def _check(self, scope: MutableScope) -> tuple[int, dict[str, str]] | None:
         method = str(scope.get("method", "GET")).upper()

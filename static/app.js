@@ -1626,7 +1626,12 @@ function renderHistory(data) {
     }
 
     // Cache logs for detail modal
+    // [v10 §14.3.23] cache borné : session longue = croissance illimitée sinon
     for (const log of data.logs) {
+        const keys = Object.keys(_historyLogsCache);
+        if (keys.length >= 500) {
+            delete _historyLogsCache[keys[0]];
+        }
         _historyLogsCache[log.id] = log;
     }
 
@@ -1860,7 +1865,7 @@ function renderCustomRoutes(routes, modelIds) {
         const thinkVal = info.thinking || 'auto';
         const effortVal = info.effort || 'auto';
         html += `<tr>
-            <td><input type="text" class="config-input cr-edit-match" value="${match}" style="width:100%"></td>
+            <td><input type="text" class="config-input cr-edit-match" value="${escHtml(match)}" style="width:100%"></td>
             <td><select class="config-select cr-edit-model" style="width:100%"><option value="">${t('config.cr_select_model')}</option>${opts.replace(`value="${model}"`, `value="${model}" selected`)}</select></td>
             <td style="text-align:center"><input type="checkbox" class="cr-edit-enabled" ${checked}></td>
             <td><select class="config-select cr-edit-thinking" style="width:100%">${thinkOpts.replace(`value="${thinkVal}"`, `value="${thinkVal}" selected`)}</select></td>
@@ -1993,10 +1998,10 @@ function renderApiKeysTable(apiKeys) {
         const wsPlaceholder = k.go_workspace_id_masked || ws.slice(0, 4) + '****' || '';
         const cookiePlaceholder = k.go_auth_cookie_masked || '****';
         return `<tr data-index="${i}">
-            <td><input type="text" class="config-input ak-alias" value="${k.alias || ''}" placeholder="${t('config.ak_alias')}" style="width:100%"></td>
-            <td><div class="api-key-row"><input type="password" class="config-input ak-key" value="${k.api_key || ''}" placeholder="${keyPlaceholder}" style="width:100%;font-family:monospace"><button class="btn btn-sm btn-toggle-secret" title="${t('show_hide')}">&#128065;</button></div></td>
-            <td><input type="text" class="config-input ak-workspace" value="${ws}" style="width:100%"></td>
-            <td><div class="api-key-row"><input type="password" class="config-input ak-cookie" value="${k.go_auth_cookie || ''}" placeholder="${cookiePlaceholder}" style="width:100%;font-family:monospace"><button class="btn btn-sm btn-toggle-secret" title="${t('show_hide')}">&#128065;</button></div></td>
+            <td><input type="text" class="config-input ak-alias" value="${escHtml(k.alias || '')}" placeholder="${t('config.ak_alias')}" style="width:100%"></td>
+            <td><div class="api-key-row"><input type="password" class="config-input ak-key" value="${escHtml(k.api_key || '')}" placeholder="${keyPlaceholder}" style="width:100%;font-family:monospace"><button class="btn btn-sm btn-toggle-secret" title="${t('show_hide')}">&#128065;</button></div></td>
+            <td><input type="text" class="config-input ak-workspace" value="${escHtml(ws)}" style="width:100%"></td>
+            <td><div class="api-key-row"><input type="password" class="config-input ak-cookie" value="${escHtml(k.go_auth_cookie || '')}" placeholder="${cookiePlaceholder}" style="width:100%;font-family:monospace"><button class="btn btn-sm btn-toggle-secret" title="${t('show_hide')}">&#128065;</button></div></td>
             <td style="text-align:center"><input type="checkbox" class="ak-enabled" ${k.enabled !== false ? 'checked' : ''}></td>
             <td><button class="btn btn-danger btn-sm ak-delete-btn">${t('config.ak_delete')}</button></td>
         </tr>`;
@@ -2263,7 +2268,7 @@ function setupConfig() {
             `<option value="${v}">${t('config.cr_effort_' + v)}</option>`).join('');
         const thinking = document.getElementById('cr-thinking').value;
         const effort = document.getElementById('cr-effort').value;
-        row.innerHTML = `<td><input type="text" class="config-input cr-edit-match" value="${match}" style="width:100%"></td>
+        row.innerHTML = `<td><input type="text" class="config-input cr-edit-match" value="${escHtml(match)}" style="width:100%"></td>
             <td><select class="config-select cr-edit-model" style="width:100%"><option value="">${t('config.cr_select_model')}</option>${opts}</select></td>
             <td style="text-align:center"><input type="checkbox" class="cr-edit-enabled" checked></td>
             <td><select class="config-select cr-edit-thinking" style="width:100%">${thinkOptsA.replace(`value="${thinking}"`, `value="${thinking}" selected`)}</select></td>
@@ -2731,7 +2736,8 @@ document.addEventListener('DOMContentLoaded', () => {
     setInterval(pollGeoFallback, 10000);
 
     // Backup poll in case SSE never connects - 5s for direct live
-    if (!pollTimer) startPolling(5000);
+    // [v10 §14.3.22] uniquement tant que le flux SSE n'est PAS établi
+    if (!eventSource && !pollTimer) startPolling(5000);
 
     document.addEventListener('visibilitychange', () => {
         if (document.hidden) {
@@ -2740,7 +2746,8 @@ document.addEventListener('DOMContentLoaded', () => {
         } else {
             refreshAll();
             if (!eventSource) connectSSE();
-            if (!pollTimer) startPolling(5000);
+            // [v10 §14.3.22] pas de polling de secours si SSE est vivante
+            if (!eventSource && !pollTimer) startPolling(5000);
         }
     });
 
@@ -2901,11 +2908,108 @@ document.addEventListener('DOMContentLoaded', () => {
     });
 
     // ── VPN tab refresh ──
+    // [v10 §4 Lot 4] cartes per-station + sparkline EWMA/p95 (canvas 240×40)
+    window._latencyHistory = window._latencyHistory || {}; // sid -> [{ewma,p95}]
+    function renderStationCards(data) {
+        const wrap = document.getElementById('vpn-station-cards');
+        if (!wrap) return;
+        const stations = data.stations || [];
+        const lat = data.latency || {};
+        let html = '';
+        const perSid = {};
+        for (const key in lat) {
+            const sid = key.split('|')[0];
+            const snap = lat[key];
+            if (!snap || !snap.count) continue;
+            (perSid[sid] = perSid[sid] || []).push(snap);
+        }
+        for (const st of stations) {
+            const sid = String(st.station);
+            const snaps = (perSid[sid] || []).filter(s => s.ewma_ms != null);
+            snaps.sort((a, b) => b.count - a.count);
+            const cur = snaps[0] || null;
+            const statusColor = st.vpn_status === 'connected' ? 'var(--success,#7ec699)'
+                : (st.vpn_status === 'error' ? 'var(--danger,#e06c50)' : 'var(--warning,#e6a000)');
+            const ewma = cur ? Math.round(cur.ewma_ms) : null;
+            const p95 = cur && cur.p95_ms != null ? Math.round(cur.p95_ms) : null;
+            html += `<div style="flex:0 0 auto;min-width:150px;padding:8px 10px;background:var(--bg-secondary);border-radius:8px;border-left:3px solid ${statusColor};font-size:12px">`
+                + `<div><strong>Station ${escHtml(String(st.station))}</strong> <span style="color:${statusColor}">●</span></div>`
+                + `<div style="font-family:monospace;font-size:11px">${escHtml(st.current_ip || '—')}</div>`
+                + `<div>Req IP: ${st.requests_this_ip}/${st.quota_per_ip}</div>`
+                + `<div title="EWMA / p95 (ms)">lat: ${ewma != null ? ewma + 'ms' : '—'} · p95: ${p95 != null ? p95 + 'ms' : '—'}</div>`
+                + `<button class="btn btn-sm js-station-logs" data-sid="${parseInt(sid,10)||0}" style="margin-top:4px;font-size:11px;padding:2px 8px">Logs</button>`
+                + `</div>`;
+            // historique sparkline (60 derniers points par station)
+            if (ewma != null) {
+                const h = (window._latencyHistory[sid] = window._latencyHistory[sid] || []);
+                h.push({ ewma: ewma, p95: p95 });
+                if (h.length > 60) h.shift();
+            }
+        }
+        if (data.rotation_paused) {
+            html += `<div style="flex:0 0 auto;padding:8px 10px;background:rgba(230,160,0,0.12);border:1px solid var(--warning,#e6a000);border-radius:8px;font-size:12px;color:var(--warning,#e6a000)">⏸ rotations en pause${data.global_degraded_remaining > 0 ? ' (' + Math.round(data.global_degraded_remaining) + 's)' : ''}</div>`;
+        }
+        wrap.innerHTML = html;
+        drawLatencySparkline();
+    }
+
+    function drawLatencySparkline() {
+        const cv = document.getElementById('vpn-latency-sparkline');
+        if (!cv) return;
+        const series = Object.values(window._latencyHistory).filter(h => h.length > 1);
+        if (!series.length) { cv.style.display = 'none'; return; }
+        cv.style.display = 'block';
+        const ctx = cv.getContext('2d');
+        ctx.clearRect(0, 0, cv.width, cv.height);
+        const colors = ['#7ec699', '#61afef', '#e6a000', '#e06c50', '#c678dd', '#56b6c2', '#d19a66', '#98c379', '#be5046', '#528bff'];
+        let si = 0;
+        for (const hist of series) {
+            const color = colors[si % colors.length]; si++;
+            const vals = hist.map(p => p.ewma);
+            const max = Math.max(...vals, 1000);
+            ctx.strokeStyle = color;
+            ctx.lineWidth = 1.5;
+            ctx.beginPath();
+            vals.forEach((v, i) => {
+                const x = i / Math.max(1, vals.length - 1) * (cv.width - 4) + 2;
+                const y = cv.height - 4 - (v / max) * (cv.height - 8);
+                if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+            });
+            ctx.stroke();
+        }
+        ctx.fillStyle = 'rgba(128,128,128,0.9)';
+        ctx.font = '9px monospace';
+        ctx.fillText('EWMA/station (auto-échelle)', 4, 10);
+    }
+
+    // Logs per-station : délégation (pas d'onclick inline — cf. §14.1.16)
+    document.addEventListener('click', async function(ev) {
+        const btn = ev.target.closest('.js-station-logs');
+        if (!btn) return;
+        const sid = parseInt(btn.getAttribute('data-sid'), 10) || 0;
+        btn.textContent = '…';
+        try {
+            const resp = await fetchWithToken(`/api/vpn/station/${sid}/logs?lines=80`);
+            const data = await resp.json();
+            const dlg = document.getElementById('vpn-event-log');
+            if (dlg) {
+                dlg.style.display = 'block';
+                dlg.textContent = (data.logs || data.error || '(vide)').split('\n').slice(-80).join('\n');
+                dlg.scrollTop = dlg.scrollHeight;
+            }
+            btn.textContent = 'Logs';
+        } catch (e) {
+            btn.textContent = 'Logs ✕';
+        }
+    });
+
     async function refreshVPNStatus() {
         // Fetch vpn-status (slow, 5x refresh_status) and config (fast, station_count+free_parallel) in parallel
         // so GUI shows parameters instantly without waiting for 5 docker probes
         const vpnStatusP = fetchWithToken('/api/vpn-status').then(r=>r.json()).then(data=>{
             updateVPNUI(data);
+            // [v10 §4 Lot 4] cartes per-station + sparkline EWMA/p95
+            try { renderStationCards(data); } catch(e) {}
             // also update free_parallel from vpn-status if present (fast path for hedge_wins)
             try {
                 const fp = data.free_parallel;
@@ -2960,7 +3064,12 @@ document.addEventListener('DOMContentLoaded', () => {
                 }
             } catch(e){}
             return cfgJ;
-        }).catch(e=>{});
+        }).catch(e=>{
+            // [v10 §14.3.33] échec visible : badge d'erreur sur le panneau VPN
+            console.error('VPN config error:', e);
+            const vp = document.getElementById('vpn-panel-error');
+            if (vp) { vp.textContent = '⚠ API /api/vpn-config injoignable'; vp.style.display = 'block'; }
+        });
         const configP = fetchWithToken('/api/config').then(r=>r.json()).then(cfg=>{
             // also update free_parallel from /api/config (fast, no docker)
             try {
@@ -3952,7 +4061,7 @@ document.addEventListener('DOMContentLoaded', () => {
             const select = document.getElementById('vpn-api-country');
             if (select && data.countries) {
                 select.innerHTML = '<option value="">Tous</option>' +
-                    data.countries.map(c => `<option value="${c.code}">${c.name} (${c.code})</option>`).join('');
+                    data.countries.map(c => `<option value="${escHtml(c.code)}">${escHtml(c.name)} (${escHtml(c.code)})</option>`).join('');
             }
         } catch (e) {
             console.error('Load countries error:', e);
@@ -4179,7 +4288,7 @@ document.addEventListener('DOMContentLoaded', () => {
                     ${p.has_password ? '<span style="font-size:11px;color:var(--text-muted)">🔒</span>' : ''}
                 </div>
                 <div style="display:flex;gap:4px">
-                    <button class="btn btn-sm" onclick="testSocks5Proxy('${escHtml(p.host)}', ${p.port})" style="font-size:11px;padding:2px 8px" data-i18n="free_models.socks5_test">Tester</button>
+                    <button class="btn btn-sm js-test-socks5" data-host="${escHtml(p.host)}" data-port="${parseInt(p.port,10)||0}" style="font-size:11px;padding:2px 8px" data-i18n="free_models.socks5_test">Tester</button>
                     <button class="btn btn-sm btn-danger" onclick="removeSocks5Proxy(${i})" style="font-size:11px;padding:2px 8px">✕</button>
                 </div>
             </div>
@@ -4228,8 +4337,10 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     };
 
-    window.testSocks5Proxy = async function(host, port) {
-        const btn = event.target;
+    window.testSocks5Proxy = async function(host, port, btn) {
+        // [v10 §14.3.24] plus de global `event` (Firefox/Safari ReferenceError)
+        btn = btn || document.querySelector('.js-test-socks5[data-host="' + CSS.escape(String(host)) + '"]');
+        if (!btn) return;
         const origText = btn.textContent;
         btn.textContent = t('free_models.socks5_testing') || 'Test...';
         btn.disabled = true;
@@ -4265,6 +4376,17 @@ document.addEventListener('DOMContentLoaded', () => {
             btn.title = '';
         }, 3000);
     };
+
+    // [v10 §14.1.16/14.3.24] délégation : plus de onclick inline avec
+    // interpolation dans un contexte JS-string (vecteur XSS + event global).
+    document.addEventListener('click', function(ev) {
+        const testBtn = ev.target.closest('.js-test-socks5');
+        if (testBtn) {
+            const host = testBtn.getAttribute('data-host') || '';
+            const port = parseInt(testBtn.getAttribute('data-port'), 10) || 0;
+            window.testSocks5Proxy(host, port, testBtn);
+        }
+    });
 
     window.toggleSocks5Rotation = async function(enabled) {
         await fetchWithToken('/api/vpn/socks5/rotate', {

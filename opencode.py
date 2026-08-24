@@ -699,6 +699,15 @@ for col, default in [
         _conn.execute(f"ALTER TABLE requests ADD COLUMN {col} TEXT DEFAULT {default}")
     except Exception:
         pass
+# [plan v10 §4 Lot 4] colonne station INTEGER (filtres ?station= dashboard) +
+# index composé station+timestamp (budget §7 : pas de scan à chaque filtre).
+try:
+    _conn.execute("ALTER TABLE requests ADD COLUMN station INTEGER DEFAULT NULL")
+except Exception:
+    pass
+_conn.execute(
+    "CREATE INDEX IF NOT EXISTS idx_requests_station_ts ON requests(station, timestamp)"
+)
 _conn.commit()
 _debug(f"  [db] SQLite connection established: {_db_path}")
 
@@ -914,6 +923,7 @@ def _db_insert_sync(
     geo_direct_ip=None,
     geo_via_vpn=None,
     geo_allowed=None,
+    station=None,
 ):
     """Synchronous DB insert — called via asyncio.to_thread().
 
@@ -935,8 +945,8 @@ def _db_insert_sync(
                 tokens_input, tokens_output, tokens_cache, success, error,
                 protocol, is_stream, thinking, effort, client_ip, account_alias, tools, tools_used,
                 request_body, response_body, client_user_agent, free_model_ip, identity, geo_country, geo_blocked,
-                geo_direct_country, geo_direct_ip, geo_via_vpn, geo_allowed)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                geo_direct_country, geo_direct_ip, geo_via_vpn, geo_allowed, station)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
             (
                 req_id,
@@ -968,6 +978,7 @@ def _db_insert_sync(
                 geo_direct_ip,
                 1 if geo_via_vpn else 0,
                 geo_allowed,
+                station,
             ),
         )
         # Batch commit logic
@@ -1007,8 +1018,8 @@ def _db_execute_batch_sync(batch: list[tuple]):
                     tokens_input, tokens_output, tokens_cache, success, error,
                     protocol, is_stream, thinking, effort, client_ip, account_alias, tools, tools_used,
                     request_body, response_body, client_user_agent, free_model_ip, identity, geo_country, geo_blocked,
-                    geo_direct_country, geo_direct_ip, geo_via_vpn, geo_allowed)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    geo_direct_country, geo_direct_ip, geo_via_vpn, geo_allowed, station)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
                 item,
             )
@@ -1083,6 +1094,7 @@ async def _save_request(
     geo_direct_ip=None,
     geo_via_vpn=None,
     geo_allowed=None,
+    station=None,
 ):
     tools_json = json.dumps(tools) if tools else "[]"
     tools_used_json = json.dumps(list(dict.fromkeys(tools_used))) if tools_used else "[]"
@@ -1103,6 +1115,14 @@ async def _save_request(
                 free_model_ip = _attempt.get("ip") or None
             if identity is None:
                 identity = _attempt.get("identity") or None
+    # [plan v10 §4 Lot 4] n° de station pour les filtres ?station= dashboard :
+    # lu depuis le contextvar free si non fourni explicitement.
+    if station is None:
+        try:
+            _att_st = (_current_free_attempt.get() or {}).get("station")
+            station = int(getattr(_att_st, "_station", 0) or 0) or None
+        except Exception:
+            station = None
     # [30] UTC everywhere — Z suffix
     timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     timestamp = _normalize_timestamp_utc(timestamp)
@@ -1162,6 +1182,7 @@ async def _save_request(
         geo_direct_ip,
         1 if geo_via_vpn else 0,
         geo_allowed,
+        station,
     )
     try:
         _db_queue.put_nowait(item)

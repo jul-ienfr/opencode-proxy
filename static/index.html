@@ -301,11 +301,15 @@
 
                     <!-- Real-time Status -->
                     <div id="vpn-status" class="vpn-status" style="margin-bottom:18px">
+                        <div id="vpn-panel-error" style="display:none;margin-bottom:10px;padding:8px 12px;background:rgba(230,108,80,0.14);border:1px solid var(--danger,#e06c50);border-radius:6px;font-size:12px;color:var(--danger,#e06c50)"></div>
                         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
                             <div>
                                 <span id="vpn-status-dot" class="status-dot" style="display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:8px"></span>
                                 <strong id="vpn-status-text" data-i18n="vpn.disconnected">Déconnecté</strong>
                             </div>
+                            <!-- [v10 §4 Lot 4] cartes per-station + sparkline latence -->
+                            <div id="vpn-station-cards" style="display:flex;flex-wrap:wrap;gap:8px;margin:10px 0"></div>
+                            <canvas id="vpn-latency-sparkline" width="240" height="40" style="display:none;margin-top:4px" title="EWMA/p95 par station (ms)"></canvas>
                             <div id="vpn-rotation-section">
                                 <label class="toggle-switch" style="margin:0">
                                     <input type="checkbox" id="vpn-toggle" onchange="toggleVPN(this.checked)">

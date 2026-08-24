@@ -288,6 +288,7 @@ def _build_where(
     account=None,
     tool=None,
     search=None,
+    station=None,
 ):
     conditions, params = [], []
     if from_date:
@@ -300,6 +301,14 @@ def _build_where(
         conditions.append("success = 1")
     elif status == "error":
         conditions.append("success = 0")
+    # [plan v10 §4 Lot 4] filtre per-station (?station=N) — colonne ajoutée
+    # au Lot 4 (NULL = requêtes payées/directes).
+    if station is not None and str(station).strip() != "":
+        try:
+            conditions.append("station = ?")
+            params.append(int(station))
+        except (TypeError, ValueError):
+            pass
     if model:
         conditions.append("model = ?")
         params.append(model)
@@ -1146,10 +1155,14 @@ def register_dashboard(
             "disable_mapping": config_settings.DISABLE_MAPPING,
             "custom_routes": config_settings.CUSTOM_ROUTES,
             "go_workspace_id_set": bool(config_settings.OPENCODE_GO_WORKSPACE_ID),
-            "go_workspace_id_masked": (config_settings.OPENCODE_GO_WORKSPACE_ID[:4] + "****")
+            # [plan v10 §14.2.2] ≤4 chars = valeur EN CLAIR sinon — toujours masquer
+            "go_workspace_id_masked": (
+                config_settings.OPENCODE_GO_WORKSPACE_ID[:4] + "****"
+                if len(config_settings.OPENCODE_GO_WORKSPACE_ID) > 4
+                else "****"
+            )
             if config_settings.OPENCODE_GO_WORKSPACE_ID
-            and len(config_settings.OPENCODE_GO_WORKSPACE_ID) > 4
-            else (config_settings.OPENCODE_GO_WORKSPACE_ID or ""),
+            else "",
             "go_auth_cookie_set": bool(config_settings.OPENCODE_GO_AUTH_COOKIE),
             "go_auth_cookie_masked": (config_settings.OPENCODE_GO_AUTH_COOKIE[:6] + "****")
             if config_settings.OPENCODE_GO_AUTH_COOKIE
@@ -1751,8 +1764,8 @@ def register_dashboard(
     # ── Stats & history ──
 
     @app.get("/api/stats")
-    async def get_stats(from_date: str = None, to_date: str = None):
-        where, params = _build_where(from_date, to_date)
+    async def get_stats(from_date: str = None, to_date: str = None, station: int = None):
+        where, params = _build_where(from_date, to_date, station=station)
         cache_key = f"stats:{where}:{tuple(params)}"
 
         # Return cached result if fresh (< 10s old)
@@ -1868,10 +1881,10 @@ def register_dashboard(
 
     @app.get("/api/stats/timeseries")
     async def get_stats_timeseries(
-        from_date: str = None, to_date: str = None, granularity: str = "hour"
+        from_date: str = None, to_date: str = None, granularity: str = "hour", station: int = None
     ):
         """Return time-series data for charts: requests count, tokens, avg duration per time bucket."""
-        where, params = _build_where(from_date, to_date)
+        where, params = _build_where(from_date, to_date, station=station)
 
         def _query_timeseries():
             # Group by truncated timestamp
@@ -2039,6 +2052,11 @@ def register_dashboard(
     @app.get("/api/events")
     async def event_stream(request: Request):
         manager = get_event_manager()
+        # [v10 §14.3.20] capture la boucle pour publish() thread-safe
+        try:
+            manager.bind_loop(asyncio.get_running_loop())
+        except Exception:
+            pass
         queue = await manager.subscribe()
         _debug("  [sse] new SSE subscriber")
 
@@ -2291,6 +2309,41 @@ def register_dashboard(
         _stats_cache.set("ip_stats", stats)
         return stats
 
+    @app.get("/api/vpn/station/{station_id}/logs")
+    async def get_station_logs(station_id: int, lines: int = 50):
+        """[plan v10 §4 Lot 4] derniers logs docker de la station N — MTTR
+        per-station sans ouvrir un terminal."""
+        import shared_state
+        import subprocess as _sp
+
+        mgr = next(
+            (
+                m
+                for m in (getattr(shared_state, "vpn_managers", None) or [])
+                if getattr(m, "_station", None) == station_id
+            ),
+            None,
+        )
+        if mgr is None:
+            return JSONResponse(
+                status_code=404, content={"error": f"station {station_id} introuvable"}
+            )
+        n = max(10, min(int(lines or 50), 300))
+        try:
+            proc = await asyncio.to_thread(
+                _sp.run,
+                ["docker", "logs", "--tail", str(n), mgr._docker_container],
+                capture_output=True,
+                timeout=8,
+                creationflags=0x08000000 if sys.platform == "win32" else 0,
+            )
+            text = ((proc.stdout or b"") + (proc.stderr or b"")).decode(
+                "utf-8", errors="replace"
+            )[-20000:]
+            return {"station": station_id, "tail": n, "logs": text}
+        except Exception as e:
+            return JSONResponse(status_code=502, content={"error": str(e)})
+
     @app.get("/api/vpn-status")
     async def get_vpn_status():
         """Get current VPN status, IP, server, and usage stats."""
@@ -2390,6 +2443,21 @@ def register_dashboard(
             # [Axe 3.1] socks5 backend state — the GUI's proxy table + the
             # auto-rotate toggle (never ship passwords).
             data["proxy_mode"] = _vpn_proxy_mode()
+            # [plan v10 §4 Lot 4] latence-adaptive per-station (moteur §3.6)
+            try:
+                from latency_rotation import get_engine as _get_leng
+
+                _leng = getattr(shared_state, "latency_engine", None) or _get_leng()
+                _lat = {}
+                for (_lsid, _lip), _tr in list(_leng._trackers.items())[:80]:
+                    _lat[f"{_lsid}|{_lip}"] = _tr.snapshot().__dict__
+                data["latency"] = _lat
+                data["rotation_paused"] = bool(getattr(_leng, "paused", False))
+                data["global_degraded_remaining"] = round(
+                    max(0.0, float(_leng._global_paused_until) - _leng._now()), 1
+                )
+            except Exception:
+                pass
             data["socks5"] = {
                 "proxies": _socks5_payload(shared_state.free_ip_pool),
                 "rotate": _socks5_auto_rotate_state(),
@@ -3413,9 +3481,14 @@ def register_dashboard(
         account: str = None,
         tool: str = None,
         search: str = None,
+        station: int = None,
     ):
+        # [plan v10 §14.2.3] limit/offset NON bornés = dump table entière par
+        # requête → clamp défensif (comme /api/routes).
+        limit = max(1, min(int(limit or 20), 200))
+        offset = max(0, int(offset or 0))
         where, params = _build_where(
-            from_date, to_date, status, model, original_model, account, tool, search
+            from_date, to_date, status, model, original_model, account, tool, search, station=station
         )
         query = "SELECT * FROM requests " + where + " ORDER BY timestamp DESC LIMIT ? OFFSET ?"
         params.extend([limit, offset])
@@ -3449,6 +3522,7 @@ def register_dashboard(
                     "client_ip": r["client_ip"] if "client_ip" in r.keys() else None,
                     "account_alias": r["account_alias"] if "account_alias" in r.keys() else None,
                     "is_free_model": "-free" in (r["model"] or ""),
+                    "station": r["station"] if "station" in r.keys() else None,
                     "free_ip": r["free_model_ip"]
                     if "free_model_ip" in r.keys() and r["free_model_ip"]
                     else "",
