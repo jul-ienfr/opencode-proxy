@@ -118,6 +118,17 @@ free_model_map:
   deepseek-v4-flash: deepseek-v4-flash-free
   hy3: hy3-free
   muse-spark-1.2-contributor: muse-spark-1.2-contributor-free
+# [plan v10 §14.0.3 — v9 zéro friction] Dashboard : loopback + LAN de confiance
+# sans AUCUN identifiant à saisir ; mutations protégées anti-CSRF (même-host) ;
+# require_token=true uniquement si exposition WAN un jour.
+dashboard_trust:
+  mode: lan                  # lan | open | off
+  lan_cidrs: ["192.168.0.0/16", "10.0.0.0/8", "172.16.0.0/12"]
+  require_token: false
+# [plan v10 §14.0.4] Auth client /v1/* : none = historique inchangé (opt-in).
+client_auth:
+  mode: none                 # none | lan | key
+  key: ""                    # utilisée seulement si mode: key
 ip_rotation:
   enabled: true
   proxy_mode: vpn
@@ -203,7 +214,7 @@ ip_rotation:
     mode: load-balance
     hedge_delay_ms: 150
     hedge_max_attempts: 2
-  max_free_attempts: 3
+  max_free_attempts: 4
   free_exception_fallback: station-first
 geo:
   enabled: true

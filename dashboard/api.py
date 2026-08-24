@@ -159,6 +159,18 @@ _config_yaml_known_mtime = _config_yaml_mtime()
 
 def _check_dashboard_token(request: Request):
     """Return a 401/403 response if the token is configured (or required) and not provided."""
+    # [plan v10 §14.0.3 — v9 zéro friction] loopback + LAN de confiance passent
+    # SANS token : le réseau est le seul identifiant. Le token reste exigé pour
+    # les réseaux non approuvés et quand DASHBOARD_REQUIRE_TOKEN est actif.
+    try:
+        _client = getattr(request, "client", None)
+        _ip = str(getattr(_client, "host", "") or "") if _client else ""
+        from trust import ip_trusted, is_loopback
+
+        if (_ip and (is_loopback(_ip) or ip_trusted(_ip))) and not _DASHBOARD_REQUIRE_TOKEN:
+            return None
+    except Exception:
+        pass  # décision réseau indisponible → comportement historique ci-dessous
     if not _DASHBOARD_TOKEN:
         if _DASHBOARD_REQUIRE_TOKEN and _host_for_warning == "0.0.0.0":
             return JSONResponse(
@@ -1053,6 +1065,17 @@ def register_dashboard(
             return response
 
     app.add_middleware(_StaticCacheMiddleware)
+
+    # [plan v10 §14.0.3] Confiance réseau zéro-friction : loopback + LAN CIDRs
+    # passent sans identifiant ; mutations → même-host anti-CSRF + rate-limit ;
+    # réseaux inconnus → 403 (ou token si DASHBOARD_TOKEN configuré).
+    from trust import DashboardTrustMiddleware
+
+    app.add_middleware(
+        DashboardTrustMiddleware,
+        token_getter=lambda: _DASHBOARD_TOKEN,
+        require_token_getter=lambda: _DASHBOARD_REQUIRE_TOKEN,
+    )
 
     app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
