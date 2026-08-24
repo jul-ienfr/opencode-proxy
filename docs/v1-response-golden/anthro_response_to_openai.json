@@ -1,0 +1,58 @@
+{
+  "fn": "anthropic_to_openai_response",
+  "input": {
+    "anthro": {
+      "id": "msg_01XYZ",
+      "type": "message",
+      "role": "assistant",
+      "content": [
+        {
+          "type": "thinking",
+          "thinking": "hmm",
+          "signature": "sig1"
+        },
+        {
+          "type": "text",
+          "text": "Answer."
+        }
+      ],
+      "model": "claude-sonnet-4-5",
+      "stop_reason": "end_turn",
+      "stop_sequence": null,
+      "usage": {
+        "input_tokens": 11,
+        "output_tokens": 7,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 3
+      }
+    },
+    "model": "claude-sonnet-4-5"
+  },
+  "expected": {
+    "id": "chatcmpl-90f0b273d37d42b387945443",
+    "object": "chat.completion",
+    "created": 1787594444,
+    "model": "claude-sonnet-4-5",
+    "choices": [
+      {
+        "index": 0,
+        "message": {
+          "role": "assistant",
+          "content": "Answer.",
+          "reasoning_content": "hmm"
+        },
+        "finish_reason": "stop"
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 11,
+      "completion_tokens": 7,
+      "total_tokens": 18,
+      "prompt_tokens_details": {
+        "cached_tokens": 3
+      }
+    }
+  },
+  "_note": "thinking -> reasoning_content ; usage inverse cache_* conservé si mappé",
+  "_generated_by": "scripts/gen_golden_fixtures.py (plan v10 §11.5)"
+}

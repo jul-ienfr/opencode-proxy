@@ -1,0 +1,46 @@
+{
+  "fn": "openai_to_anthropic",
+  "input": {
+    "resp": {
+      "choices": [
+        {
+          "message": {
+            "role": "assistant",
+            "content": "Bonjour ! Comment puis-je aider ?"
+          },
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 12,
+        "completion_tokens": 9,
+        "prompt_tokens_details": {
+          "cached_tokens": 4
+        }
+      }
+    },
+    "model": "deepseek-v4-flash-free"
+  },
+  "expected": {
+    "id": "msg_f4b6bcc0f8984e048550d549",
+    "type": "message",
+    "role": "assistant",
+    "content": [
+      {
+        "type": "text",
+        "text": "Bonjour ! Comment puis-je aider ?"
+      }
+    ],
+    "model": "deepseek-v4-flash-free",
+    "stop_reason": "end_turn",
+    "stop_sequence": null,
+    "usage": {
+      "input_tokens": 12,
+      "output_tokens": 9,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 4
+    }
+  },
+  "_note": "usage prompt/completion -> input/output tokens ; cached_tokens -> cache_read",
+  "_generated_by": "scripts/gen_golden_fixtures.py (plan v10 §11.5)"
+}

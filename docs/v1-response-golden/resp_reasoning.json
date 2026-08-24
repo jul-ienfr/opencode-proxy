@@ -1,0 +1,48 @@
+{
+  "fn": "openai_to_anthropic",
+  "input": {
+    "resp": {
+      "choices": [
+        {
+          "message": {
+            "role": "assistant",
+            "content": "La réponse est 42.",
+            "reasoning_content": "Je réfléchis... 6*7=42."
+          },
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 30,
+        "completion_tokens": 25
+      }
+    },
+    "model": "glm-5.1-free"
+  },
+  "expected": {
+    "id": "msg_80070a63798b45fbbb2a9ea2",
+    "type": "message",
+    "role": "assistant",
+    "content": [
+      {
+        "type": "thinking",
+        "thinking": "Je réfléchis... 6*7=42."
+      },
+      {
+        "type": "text",
+        "text": "La réponse est 42."
+      }
+    ],
+    "model": "glm-5.1-free",
+    "stop_reason": "end_turn",
+    "stop_sequence": null,
+    "usage": {
+      "input_tokens": 30,
+      "output_tokens": 25,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0
+    }
+  },
+  "_note": "reasoning_content -> block type=thinking AVANT le text (ordre §11.5)",
+  "_generated_by": "scripts/gen_golden_fixtures.py (plan v10 §11.5)"
+}
