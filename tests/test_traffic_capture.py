@@ -23,11 +23,21 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route
 from starlette.testclient import TestClient
 
+import traffic_capture as tc_module
 from traffic_capture import (
     TrafficCapture,
     TrafficCaptureMiddleware,
     hex_dump,
 )
+
+
+def test_middleware_default_capture_singleton():
+    """[plan v10 §14.3.29] `capture or capture` auto-référence corrigé :
+    monter le middleware sans argument doit retomber sur le singleton
+    module-level, pas lever AttributeError au premier hit."""
+    mw = TrafficCaptureMiddleware(app=None)  # jamais vu en prod avant fix
+    assert mw._capture is tc_module.capture
+    assert mw._capture.enabled is tc_module.capture.enabled
 
 # ── helpers ───────────────────────────────────────────────────────
 

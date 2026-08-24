@@ -6,11 +6,8 @@ mutations, DashboardTrustMiddleware (/api/*), ClientAuthMiddleware
 _check_dashboard_token.
 """
 
-import asyncio
-
 import pytest
 
-import trust
 from trust import (
     ClientAuthMiddleware,
     DashboardTrustMiddleware,
@@ -21,7 +18,6 @@ from trust import (
     parse_cidrs,
     send_json,
 )
-
 
 # ── helpers ──────────────────────────────────────────────────────────────
 
@@ -174,6 +170,21 @@ async def test_dash_external_with_valid_token_passes(monkeypatch):
             mw, make_scope(ip="203.0.113.9", headers={"X-Dashboard-Token": "tok123"})
         )
         == 200
+    )
+
+
+@pytest.mark.asyncio
+async def test_dash_external_token_configured_missing_or_wrong_is_401(monkeypatch):
+    """[v10] Sémantique historique préservée hors réseau de confiance : token
+    configuré → 401 sans/avec mauvais token ; 403 réservé à l'absence de token."""
+    set_cfg(monkeypatch, "dashboard_trust", {"mode": "lan"})
+    mw = DashboardTrustMiddleware(None, token_getter=lambda: "tok123")
+    assert await run_through(mw, make_scope(ip="203.0.113.9")) == 401
+    assert (
+        await run_through(
+            mw, make_scope(ip="203.0.113.9", headers={"X-Dashboard-Token": "nope"})
+        )
+        == 401
     )
 
 

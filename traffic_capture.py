@@ -465,7 +465,10 @@ class TrafficCaptureMiddleware:
 
     def __init__(self, app, capture: TrafficCapture | None = None):
         self.app = app
-        self._capture = capture or capture
+        # [plan v10 §14.3.29] `capture or capture` était une auto-référence
+        # (None si monté sans argument → AttributeError au premier hit) ;
+        # retomber sur le singleton module-level `capture` (fin de fichier).
+        self._capture = capture if capture is not None else globals()["capture"]
 
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http" or not self._capture.enabled:

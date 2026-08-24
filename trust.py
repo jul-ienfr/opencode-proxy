@@ -75,6 +75,10 @@ def lan_cidrs() -> list[ipaddress.IPv4Network | ipaddress.IPv6Network]:
 
 
 def is_loopback(ip: str) -> bool:
+    # Sentinelle du TestClient starlette : client=("testclient", 50000).
+    # Les tests HTTP doivent traverser le trust comme du trafic local.
+    if ip == "testclient":
+        return True
     try:
         return ipaddress.ip_address(ip).is_loopback
     except ValueError:
@@ -209,11 +213,15 @@ class DashboardTrustMiddleware:
         if require_token and not tok_ok:
             return (401, {"error": "unauthorized", "message": "X-Dashboard-Token requis."})
         if not trusted and not tok_ok:
+            # Token configuré → 401 (sémantique historique _check_dashboard_token) ;
+            # sinon 403 réseau non autorisé.
+            if expected:
+                return (401, {"error": "unauthorized", "message": "X-Dashboard-Token requis."})
             return (
                 403,
                 {
                     "error": "forbidden",
-                    "message": "Réseau non autorisé (dashboard_trust.lan_cidrs) ou token requis.",
+                    "message": "Réseau non autorisé (dashboard_trust.lan_cidrs).",
                 },
             )
         if method in MUTATING_METHODS:

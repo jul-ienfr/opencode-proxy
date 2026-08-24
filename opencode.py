@@ -2439,7 +2439,7 @@ app.add_middleware(RateLimitMiddleware)
 
 # [plan v10 §14.0.4] Toggle client_auth none|lan|key pour /v1/* + resets.
 # Défaut "none" = comportement historique inchangé (bind 0.0.0.0 volontaire).
-from trust import ClientAuthMiddleware
+from trust import ClientAuthMiddleware  # noqa: E402  # module local, import tardif conventionnel
 
 app.add_middleware(ClientAuthMiddleware)
 

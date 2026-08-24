@@ -9,7 +9,9 @@ venv/
 .pytest_cache/
 test_*.py
 tests/
-scripts/
+# [plan v10 §14.0.5] make_credentials_env est importé au boot (settings.py/opencode.py)
+scripts/*
+!scripts/make_credentials_env.py
 *.log
 *.err
 debug_dash.py

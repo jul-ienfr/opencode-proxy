@@ -34,11 +34,15 @@ RUN groupadd -r opencode && useradd -r -g opencode -d /app -s /sbin/nologin open
     && mkdir -p /app/logs /app/vpn_configs && chown -R opencode:opencode /app
 
 # Explicit COPY only — never `COPY . .` (would bake config.yaml / vpn_configs secrets into the image)
+# [plan v10 §14.0.5] Liste alignée sur les imports réels au boot :
+#   opencode.py → traffic_capture (:2561), protocol_mapping (:6505), trust (:2442)
+#   opencode.py lifespan → shared_rotation (:1965), scripts.make_credentials_env (:1926)
 COPY --chown=opencode:opencode requirements.txt ./
-COPY --chown=opencode:opencode opencode.py vpn_manager.py free_ip_pool.py shared_state.py ./
+COPY --chown=opencode:opencode opencode.py trust.py vpn_manager.py free_ip_pool.py shared_state.py shared_rotation.py traffic_capture.py protocol_mapping.py ./
 COPY --chown=opencode:opencode config/ ./config/
 COPY --chown=opencode:opencode dashboard/ ./dashboard/
 COPY --chown=opencode:opencode static/ ./static/
+COPY --chown=opencode:opencode scripts/make_credentials_env.py ./scripts/make_credentials_env.py
 
 USER opencode
 

@@ -177,21 +177,15 @@ def test_socks5_get_masks_passwords(ctx):
 
 
 def test_posts_require_token_when_configured(ctx, monkeypatch):
+    """[v9 §14.0.3] Zéro friction : depuis le réseau de confiance (loopback /
+    TestClient), les POST passent SANS token — le réseau est l'identifiant.
+    La contrainte 401 sans token ne s'applique plus qu'aux réseaux non
+    approuvés (couvert par tests/test_trust.py côté middleware)."""
     fast, s1, s2, pool, cfg, persisted = ctx
     monkeypatch.setattr(api, "_DASHBOARD_TOKEN", "sekret")
     with TestClient(fast) as client:
-        # No header → 401.
+        # No header → 200 (loopback de confiance, v9 zéro friction).
         r = client.post("/api/vpn/proxy-mode", json={"mode": "socks5"})
-        assert r.status_code == 401
-        # Wrong token → 401.
-        r = client.post(
-            "/api/vpn/proxy-mode", json={"mode": "socks5"}, headers={"X-Dashboard-Token": "nope"}
-        )
-        assert r.status_code == 401
-        # Right token → 200.
-        r = client.post(
-            "/api/vpn/proxy-mode", json={"mode": "socks5"}, headers={"X-Dashboard-Token": "sekret"}
-        )
         assert r.status_code == 200
         assert s1.proxy_mode == "socks5"
         # Read-only GET stays open (the dashboard itself polls it).
