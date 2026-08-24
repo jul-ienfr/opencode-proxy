@@ -2412,8 +2412,15 @@ def register_dashboard(
             else:
                 data["ip_stats"] = {}
             # refresh in background (don't block)
+            # [v10 §14.3.21] dédoublonnage : chaque GET /vpn-status spawnait
+            # une tâche même si une autre tournait déjà → accumulation si la
+            # DB ralentit. Une seule tâche vivante à la fois.
             try:
-                asyncio.create_task(_ip_stats_db(shared_state.vpn_manager))
+                _running = getattr(_ip_stats_db, "_running_task", None)
+                if _running is None or _running.done():
+                    _ip_stats_db._running_task = asyncio.create_task(
+                        _ip_stats_db(shared_state.vpn_manager)
+                    )
             except Exception:
                 pass
             # [plan] F: cross-station shared state (recent-IP registry +

@@ -1048,12 +1048,18 @@ async def _db_writer_loop():
                     batch.append(nxt)
                 except TimeoutError:
                     break
-            cnt = await asyncio.to_thread(_db_execute_batch_sync, batch)
-            for _ in batch:
-                _db_queue.task_done()
-            batch.clear()
-            if cnt:
-                _debug(f"  [db] writer batch {cnt} committed")
+            # [plan v10 §14.3.15] si to_thread lève, l'ancien code laissait le
+            # batch rempli → ré-exécution des mêmes items au prochain tour
+            # (doublons) + task_done décalé. Vidange/tâches dans finally.
+            try:
+                await asyncio.to_thread(_db_execute_batch_sync, batch)
+            finally:
+                n_done = len(batch)
+                batch = []
+                for _ in range(n_done):
+                    _db_queue.task_done()
+            if n_done >= 32:
+                _debug(f"  [db] writer batch {n_done} committed")
         except asyncio.CancelledError:
             if batch:
                 try:
@@ -3901,6 +3907,19 @@ async def _hedged_fetch(cands, body: dict, headers: dict, endpoint: str, forced_
     except Exception:
         stagger = 0.3
     stagger = max(0.0, min(2.0, stagger))
+    # [v10 §12.1.2/Lot 5] hedge_delay PER-MODEL optionnel + jitter ±20 % :
+    # les modèles rapides haussent le seuil trop tard sinon.
+    try:
+        _pmap = getattr(_free_ip_pool, "_free_parallel_hedge_delay_ms_per_model", None)
+        _model_name = str(body.get("model") or body.get("original_model") or "")
+        if isinstance(_pmap, dict) and _pmap:
+            _base_ms = float(
+                _pmap.get(_model_name, _pmap.get("default", stagger * 1000.0))
+            )
+            stagger = max(0.0, min(2.0, _base_ms / 1000.0))
+        stagger *= random.uniform(0.8, 1.2)  # jitter ±20 %
+    except Exception:
+        pass
 
     # helper to fetch one candidate
     async def _one(station):
@@ -3919,6 +3938,13 @@ async def _hedged_fetch(cands, body: dict, headers: dict, endpoint: str, forced_
     winner_resp = None
     winner_station = None
     winner_task = None
+    # [v10 §14.1.5] filet : la première ERREUR HTTP (>=400) est retenue au cas
+    # où TOUS les candidats finissent en erreur — mais elle ne gagne JAMAIS
+    # contre un <400 encore en vol (l'ancien code faisait gagner un 429 rapide
+    # sur un 200 lent → cooldown + fallback paid injustifiés).
+    err_resp = None
+    err_station = None
+    err_task = None
     # overall hedge timeout: generous (connect 10 + read 600, but hedge should not wait forever)
     # we wait until first success; if all fail, raise last error
     last_exc = None
@@ -3929,22 +3955,23 @@ async def _hedged_fetch(cands, body: dict, headers: dict, endpoint: str, forced_
             timeout = stagger if pending_stagger else None
             done, pending = await asyncio.wait(tasks.keys(), timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
             if done:
-                # pick first successful response (any HTTP status counts as success)
-                # prioritize 200 over 429? Actually first to respond wins regardless
+                # pick first SUCCESSFUL response (<400) ; une erreur HTTP est
+                # mise en filet mais ne clôt pas la course (§14.1.5)
                 for d in done:
                     try:
                         resp = d.result()
-                        # success: got HTTP response (even 429)
-                        winner_resp = resp
-                        winner_station = tasks[d]
-                        winner_task = d
-                        break
                     except asyncio.CancelledError:
                         continue
                     except Exception as e:
                         last_exc = e
-                        # this candidate failed, continue to wait for others
                         continue
+                    if getattr(resp, "status_code", 500) < 400:
+                        winner_resp = resp
+                        winner_station = tasks.get(d)
+                        winner_task = d
+                        break
+                    if err_resp is None:
+                        err_resp, err_station, err_task = resp, tasks.get(d), d
                 if winner_resp is not None:
                     break
                 # if no winner yet, continue waiting / launching next
@@ -3995,12 +4022,19 @@ async def _hedged_fetch(cands, body: dict, headers: dict, endpoint: str, forced_
                         pass
                     except Exception:
                         pass
-            # record winner compta
-            try:
-                if _free_ip_pool and hasattr(_free_ip_pool, "note_hedge_winner"):
-                    _free_ip_pool.note_hedge_winner(winner_station, primary=primary)
-            except Exception:
-                pass
+        # no winner <400 : filet = la première erreur HTTP reçue (comportement
+        # historique préservé en dernier recours), sinon raise.
+        if err_resp is not None:
+            winner_resp, winner_station, winner_task = err_resp, err_station, err_task
+        if winner_resp is not None:
+            # [v10 §14.1.5] la compta hedge ne compte que les VRAIS wins :
+            # une réponse >=400 ne consomme pas le quota du perdant-sans-le-savoir.
+            if getattr(winner_resp, "status_code", 500) < 400:
+                try:
+                    if _free_ip_pool and hasattr(_free_ip_pool, "note_hedge_winner"):
+                        _free_ip_pool.note_hedge_winner(winner_station, primary=primary)
+                except Exception:
+                    pass
             # need to ensure free_ip / identity context for downstream logging
             try:
                 ip = getattr(winner_station, "current_ip", None) or getattr(winner_station, "pid", "") or ""
@@ -4084,6 +4118,33 @@ class _CurlCffiStreamResponse:
         self._resp = resp
         self.status_code = resp.status_code
         self.headers = dict(resp.headers)
+        # [v10 §3.6.1 Lot 5] TTFB streaming : contexte (station, t0, model)
+        # posé par _open_free_stream ; la PREMIÈRE lecture du consommateur
+        # déclenche le record moteur (warm-up/anti-flap inclus).
+        self._ttfb_ctx = None
+        self._ttfb_recorded = False
+
+    def _record_ttfb_once(self):
+        if self._ttfb_recorded or not self._ttfb_ctx:
+            return
+        self._ttfb_recorded = True
+        try:
+            import shared_state as _ss_lat
+
+            eng = getattr(_ss_lat, "latency_engine", None)
+            if eng is None:
+                from latency_rotation import get_engine as _get_eng
+
+                eng = _get_eng()
+            if eng.cfg.stream_metric != "ttfb":
+                return  # mode total : mesuré en fin de stream par les callers
+            station, t0, model = self._ttfb_ctx
+            ttfb_ms = (time.monotonic() - t0) * 1000.0
+            sid = int(getattr(station, "_station", 0) or 0)
+            ip = str((_current_free_attempt.get() or {}).get("ip") or "")
+            eng.record_request(sid, ip, ttfb_ms, model, self.status_code)
+        except Exception:
+            pass
 
     async def aiter_lines(self):
         """Yield SSE lines as str, split manually from raw bytes ([41]).
@@ -4094,6 +4155,7 @@ class _CurlCffiStreamResponse:
         lines — so iterate aiter_content() and split on \n here,
         buffering a partial line across chunks.
         """
+        self._record_ttfb_once()
         buf = b""
         async for chunk in self._resp.aiter_content():
             buf += chunk
@@ -4104,10 +4166,12 @@ class _CurlCffiStreamResponse:
             yield buf.rstrip(b"\r").decode("utf-8", errors="replace")
 
     async def aiter_bytes(self):
+        self._record_ttfb_once()
         async for chunk in self._resp.aiter_content():
             yield chunk
 
     async def aread(self):
+        self._record_ttfb_once()
         return await self._resp.acontent()
 
     async def aclose(self):
@@ -4336,9 +4400,17 @@ async def _open_free_stream(
                 sess2, lock2 = await _get_pooled_curl_session(proxy_url, profile["impersonate"])
                 async with lock2:
                     _debug(f"  [free-stream] posting to {endpoint} (pooled)")
+                    _t0_ttfb = time.monotonic()
                     resp = await sess2.post(endpoint, json=body, headers=req_headers, stream=True)
                     _debug(f"  [free-stream] response status={resp.status_code}")
                     wrapped = _CurlCffiStreamResponse(resp)
+                    # [v10 §3.6.1 Lot 5] TTFB streaming : la 1ʳᵉ lecture du
+                    # consommateur recordera la mesure au moteur.
+                    wrapped._ttfb_ctx = (
+                        station,
+                        _t0_ttfb,
+                        str(body.get("model") or body.get("original_model") or ""),
+                    )
                 # [plan 18/08 §am.22] register the in-flight stream so the
                 # watchdog can cancel it the moment egress death is CONFIRMED
                 # (egress_dead) — a client reading a dead tunnel must get the
@@ -8744,13 +8816,20 @@ async def messages(request: Request):
 
 
 _health_cache: tuple[float, bool] | None = None  # (timestamp, upstream_ok)
-_health_lock = asyncio.Lock()
+_health_lock = asyncio.Lock()  # sérialise le check upstream caché (§14.3.16 garde le writer lock séparé)
 
 
 @app.get("/health")
 async def health():
     _debug("  [health] health check started")
-    await asyncio.to_thread(_conn.execute, "SELECT 1")
+
+    def _health_probe():
+        # [v10 §14.3.16] SELECT 1 sous le MÊME lock que le batch writer :
+        # un check concurrent au commit levait InterfaceError ponctuel.
+        with _db_commit_lock:
+            _conn.execute("SELECT 1")
+
+    await asyncio.to_thread(_health_probe)
     _debug("  [health] DB connectivity OK")
 
     usage = {
@@ -9369,7 +9448,10 @@ async def chat_completions(request: Request):
                 request_body=request_body,
                 response_body=data,
             )
-            _response_cache.put(cache_key, resp.content, {"Content-Type": "application/json"})
+            # [v10 §14.3.26] garde manquante sur cette branche : cache_key None
+            # polluait le store LRU d'une entrée clé None.
+            if cache_key:
+                _response_cache.put(cache_key, resp.content, {"Content-Type": "application/json"})
             return Response(
                 content=resp.content, headers={"X-Cache": "MISS"}, media_type="application/json"
             )

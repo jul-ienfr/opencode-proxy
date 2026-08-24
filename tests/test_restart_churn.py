@@ -184,7 +184,10 @@ async def test_watchdog_tick_churn_recovers_immediately(tmp_path, caplog):
 
     assert mgr.calls["restart"] == 1, "pas de second restart"
     assert mgr._egress_failures == 0
-    assert mgr.scan_since == [10, 10, 10], "3 scans: arm, recovery interne, tick sain"
+    # [v10 §14.1.10] scan churn CADENCÉ à 60 s : arm + recovery interne = 2
+    # scans ; le tick sain (<60 s) réutilise l'état courant — c'est le gain
+    # subprocess visé (martèlement Docker Desktop ÷3).
+    assert mgr.scan_since == [10, 10], "2 scans: arm, recovery interne (tick sain cadencé)"
 
 
 # ── apply/rollback : borne du scan sur le refresh post-recreate ───

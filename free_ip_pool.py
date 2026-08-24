@@ -1588,6 +1588,11 @@ class FreeIPPool:
                 self._free_parallel_hedge_delay_ms = max(0, min(2000, int(fp.get("hedge_delay_ms", 300))))
             except Exception:
                 self._free_parallel_hedge_delay_ms = 300
+            # [v10 Lot 5] hedge_delay per-model (§12.1.2 v6) — optionnel
+            pmap = fp.get("hedge_delay_ms_per_model")
+            self._free_parallel_hedge_delay_ms_per_model = (
+                {str(k): float(v) for k, v in pmap.items()} if isinstance(pmap, dict) and pmap else None
+            )
             try:
                 self._free_parallel_hedge_max = max(1, min(3, int(fp.get("hedge_max_attempts", 1))))
             except Exception:

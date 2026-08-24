@@ -992,6 +992,8 @@ class VPNManager:
         # tunnel is not re-flagged from its own pre-recovery history.
         self._restart_churn = False
         self._restart_churn_recovered_at: float | None = None
+        # [v10 §14.1.10] cadence du scan churn (recovery → re-scan immédiat)
+        self._churn_next_due = 0.0
         self._total_switches = 0
         self._ip_history: list[dict] = []
         self._lock = asyncio.Lock()
@@ -1703,6 +1705,24 @@ class VPNManager:
 
     # ── Status & health ────────────────────────────────────────
 
+    def _auth_check_supports_text(self) -> bool:
+        """[v10 §14.1.10] True si ``_check_auth_failed`` accepte le kwarg
+        ``text`` (fetch partagé). Mémoïsé par instance — les stubs de test
+        sans le paramètre déclenchent le chemin historique automatiquement."""
+        flag = getattr(self, "_auth_check_text_flag", None)
+        if flag is None:
+            import inspect as _inspect
+
+            try:
+                flag = "text" in _inspect.signature(self._check_auth_failed).parameters
+            except (TypeError, ValueError):
+                flag = False
+            try:
+                self._auth_check_text_flag = bool(flag)
+            except Exception:
+                pass
+        return bool(flag)
+
     async def refresh_status(self, force: bool = False) -> dict:
         """Reconcile state with container reality:
         - container absent          → disconnected
@@ -1740,8 +1760,27 @@ class VPNManager:
             self._error = "conteneur arrêté"
             return self.get_status()
 
-        auth_failed = await self._check_auth_failed(info.get("started_at", ""))
-        server_issue = await self._check_server_issue(info.get("started_at", ""))
+        # [plan v10 §14.1.10] un SEUL docker logs pour auth+server_issue
+        # (même fenêtre started_at) — budget subprocess watchdog ÷2.
+        # Détection de signature : les sous-classes/stubs qui n'exposent pas
+        # ``text`` retombent sur les appels séparés historiques.
+        _started_at = info.get("started_at", "")
+        if _started_at and self._auth_check_supports_text():
+            _res = await asyncio.to_thread(
+                self._docker_run, ["logs", "--since", _started_at, self._docker_container], 30
+            )
+            _shared_log = _res.stdout if _res.returncode == 0 else None
+            auth_failed = await self._check_auth_failed(_started_at, text=_shared_log)
+            server_issue = (
+                await self._check_server_issue(_started_at, text=_shared_log)
+                if not auth_failed
+                else False
+            )
+        else:
+            auth_failed = await self._check_auth_failed(_started_at)
+            server_issue = (
+                await self._check_server_issue(_started_at) if not auth_failed else False
+            )
         if auth_failed or server_issue:
             self._auth_failed = auth_failed
             self._server_issue = server_issue
@@ -1763,7 +1802,13 @@ class VPNManager:
         # The log scan sees the loop; arming the egress watchdog routes it
         # into the existing recovery chain (fresh IP/country → restart →
         # flip). Not an ERROR state: the tunnel may be answering right now.
-        churn = await self._check_restart_churn(self._restart_churn_window_min)
+        # [v10 §14.1.10] scan CADENCÉ à 60 s (le plus coûteux : full logs) —
+        # un recovery force un re-scan immédiat via _churn_next_due=0.
+        if self._now_fn() >= self._churn_next_due:
+            churn = await self._check_restart_churn(self._restart_churn_window_min)
+            self._churn_next_due = self._now_fn() + 60.0
+        else:
+            churn = self._restart_churn  # état courant conservé entre scans
         self._restart_churn = churn
         if churn:
             self.arm_egress_watchdog()
@@ -3206,6 +3251,7 @@ class VPNManager:
                 # recoveries, so pre-recovery churn markers are stale — the
                 # scan snaps to after this instant.
                 self._restart_churn_recovered_at = time.time()
+                self._churn_next_due = 0.0  # [v10 §14.1.10] re-scan frais immédiat
                 await self.refresh_status(force=True)
                 self.save_state()
                 logger.info("[vpn] fast-pin: recovered — tunnel healthy (IP %s)", self._current_ip)
@@ -3750,7 +3796,7 @@ class VPNManager:
             "socks5_eof_count": getattr(self, "_socks5_eof_count", 0),
         }
 
-    async def _check_auth_failed(self, started_at: str = "") -> bool:
+    async def _check_auth_failed(self, started_at: str = "", text: str | None = None) -> bool:
         """Scan container logs for AUTH_FAILED (OpenVPN auth rejection).
 
         RECOVERY-AWARE ([incident 17/08]: gluetun's OpenVPN retry loop logs
@@ -3762,14 +3808,17 @@ class VPNManager:
         also covers the old StartedAt-bounding case: a pre-restart failure
         in the window is likewise followed by a success after the restart.
         Falls back to a 10-minute window when the start time is unknown.
+        [v10 §14.1.10] ``text`` pré-fetché par refresh_status → un SEUL docker
+        logs par tick pour auth+server_issue (budget subprocess ÷2).
         """
-        since = started_at if started_at else "10m"
-        result = await asyncio.to_thread(
-            self._docker_run, ["logs", "--since", since, self._docker_container], 30
-        )
-        if result.returncode != 0:
-            return False
-        text = result.stdout
+        if text is None:
+            since = started_at if started_at else "10m"
+            result = await asyncio.to_thread(
+                self._docker_run, ["logs", "--since", since, self._docker_container], 30
+            )
+            if result.returncode != 0:
+                return False
+            text = result.stdout
         if "AUTH_FAILED" not in text and "auth failed" not in text.lower():
             return False  # never auth-failed
         # Recovered tunnel: the last logged openvpn success supersedes the
@@ -3823,20 +3872,21 @@ class VPNManager:
             return False
         return True
 
-    async def _check_server_issue(self, started_at: str = "") -> bool:
+    async def _check_server_issue(self, started_at: str = "", text: str | None = None) -> bool:
         """Scan container logs for a TLS negotiation failure (stale server
         IP or crashed server — gluetun's 🔌 'server no longer valid'
         guidance). Detection: the raw openvpn line that guidance attaches to
         in internal/openvpn/logs.go. Same recovery-aware bounding as
         _check_auth_failed: a TLS failure superseded by a later successful
-        connection is stale, not live."""
-        since = started_at if started_at else "10m"
-        result = await asyncio.to_thread(
-            self._docker_run, ["logs", "--since", since, self._docker_container], 30
-        )
-        if result.returncode != 0:
-            return False
-        text = result.stdout.lower()
+        connection is stale, not live. [v10 §14.1.10] ``text`` partagé."""
+        if text is None:
+            since = started_at if started_at else "10m"
+            result = await asyncio.to_thread(
+                self._docker_run, ["logs", "--since", since, self._docker_container], 30
+            )
+            if result.returncode != 0:
+                return False
+            text = result.stdout.lower()
         if "tls key negotiation failed" not in text:
             return False
         return text.rfind("initialization sequence completed") < text.rfind(
@@ -4084,6 +4134,7 @@ class VPNManager:
                 # re-arm the egress watchdog for nothing (same anti
                 # stale-marker pattern as the watchdog recovery).
                 self._restart_churn_recovered_at = time.time()
+                self._churn_next_due = 0.0  # [v10 §14.1.10] re-scan frais immédiat
                 await self.refresh_status(force=True)
                 self._update_available = False
                 self._update_applied_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -4131,6 +4182,7 @@ class VPNManager:
             # Same churn-scan snap as _apply_update (the recreate is a
             # recovery; pre-rollback markers must not re-arm the watchdog).
             self._restart_churn_recovered_at = time.time()
+            self._churn_next_due = 0.0  # [v10 §14.1.10] re-scan frais immédiat
             await self.refresh_status(force=True)
             logger.warning("[vpn-update] rolled back to previous image %s", old_image_id[:19])
         except Exception as e:
@@ -4222,6 +4274,7 @@ class VPNManager:
         # stale (docker logs span recoveries) — set BEFORE the internal
         # refresh so its churn scan snaps to after this instant.
         self._restart_churn_recovered_at = time.time()
+        self._churn_next_due = 0.0  # [v10 §14.1.10] re-scan frais immédiat
         await self.refresh_status(force=True)
         self.save_state()
         logger.info("[vpn-watchdog] recovered — tunnel healthy (IP %s)", self._current_ip)
