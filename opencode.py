@@ -238,8 +238,21 @@ class _KeyPauser:
 
     @staticmethod
     def _prefix(api_key: str) -> str:
-        """Use first 12 chars as key identifier (safe for logging, unique enough)."""
-        return api_key[:12] if len(api_key) >= 12 else api_key
+        """Slot stable par clé ENTIÈRE.
+
+        [plan v10 Lot 0 filet — bug réel] l'ancien `api_key[:12]` fusionnait
+        toutes les clés partageant le préfixe fournisseur (« sk-ant-api03 » =
+        exactement 12 caractères) : mettre en pause UNE clé mettait en pause
+        TOUTES les clés Anthropic, et la sémantique « seulement étendre »
+        collait la plus longue pause à tout le monde. Hash tronqué = slot
+        unique par clé, toujours non réversible pour les logs. Les entrées
+        persistées sous l'ancien schéma deviennent orphelines et expirent
+        naturellement (jamais re-matchées)."""
+        if not api_key:
+            return ""
+        import hashlib
+
+        return hashlib.sha256(api_key.encode("utf-8")).hexdigest()[:12]
 
     def _save(self):
         """Persist current pause state to YAML file (wall clock times).
