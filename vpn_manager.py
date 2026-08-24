@@ -1937,23 +1937,34 @@ class VPNManager:
         """
         import httpx
 
+        # warm-avalanche Etape2: GET via socks5 (laisse httpcore[socks] faire SOCKS handshake)
+        # Ne jamais utiliser CONNECT via proxy=socks5:// (double sémantique HTTP proxy vs SOCKS)
+        # Un seul wait_for (pas de double httpx.Timeout + asyncio.wait_for)
+        try:
+            # vérifie httpcore[socks] installé, sinon proxy=socks5 ouvre TCP direct (faux positif)
+            import httpcore  # noqa: F401
+
+            _has_socks = True
+        except ImportError:
+            _has_socks = False
+            logger.debug("[vpn] httpcore[socks] non installé — probe via socks5 peut être direct")
         client = httpx.AsyncClient(proxy=self.socks5_url, timeout=httpx.Timeout(per_attempt))
         try:
-            resp = await asyncio.wait_for(
-                client.send(httpx.Request("CONNECT", url), stream=True), per_attempt
-            )
-            # Release the unread stream without downloading the body
-            # (bounded — a stuck tunnel must not cost the whole budget).
-            await asyncio.wait_for(resp.aclose(), 1.0)
-            return "ok"
+            # GET via SOCKS (httpcore fait SOCKS handshake + DNS via proxy) — compatible FakeHttpx.send
+            resp = await asyncio.wait_for(client.send(httpx.Request("GET", url)), timeout=per_attempt)
+            if getattr(resp, "status_code", 200) < 500:
+                return "ok"
+            return "error"
         except Exception as e:
             verdict = _classify_probe_exc(e)
-            # warm-avalanche: compte EOF en fenêtre 5min
-            if verdict == "refused" and ("eof" in str(e).lower() or "reading header" in str(e).lower()):
+            # filets supplémentaires pour tunnel mort DNS (second mode)
+            _msg = str(e).lower()
+            if "server misbehaving" in _msg or "i/o timeout" in _msg:
+                verdict = "refused"
+            if verdict == "refused" and ("eof" in _msg or "reading header" in _msg):
                 try:
                     now = time.time()
                     self._socks5_eof_window.append(now)
-                    # purge >5min
                     self._socks5_eof_window = [t for t in self._socks5_eof_window if now - t < 300]
                     self._socks5_eof_count = len(self._socks5_eof_window)
                     if self._socks5_eof_count >= 4:
@@ -2504,6 +2515,17 @@ class VPNManager:
                     _proto = "udp"
                 env[f"OPENVPN_PROTOCOL_STATION{s}"] = _proto
                 env["OPENVPN_PROTOCOL"] = _proto
+                # Q6: endpoint port diversification (custom ovpn only — nordvpn rejects custom port)
+                if self._config.get("custom_ovpn_file"):
+                    _port = getattr(self, "_ovpn_endpoint_port_effective", "1194" if _proto == "udp" else "443")
+                    try:
+                        _port = str(int(_port))
+                        if _port not in ("1194", "443", "8443"):
+                            _port = "1194" if _proto == "udp" else "443"
+                    except Exception:
+                        _port = "1194" if _proto == "udp" else "443"
+                    env[f"OPENVPN_ENDPOINT_PORT_STATION{s}"] = _port
+                    env["OPENVPN_ENDPOINT_PORT"] = _port
         # [fix 20/08][Axe 3.1] Custom .ovpn (dashboard upload): compose's
         # volume block bind-mounts vpn_configs/custom/ → /vpn-custom (ro)
         # and stanzas interpolate ${OPENVPN_CUSTOM_CONFIG:-}. The uploaded
@@ -3421,9 +3443,37 @@ class VPNManager:
             logger.warning("[vpn] _apply_ovpn_protocol: not on OV stack (%s)", self._stack_effective)
             return False
         cur_proto = getattr(self, "_ovpn_protocol_effective", "udp")
-        if protocol == cur_proto:
-            logger.info("[vpn] ovpn protocol already %s — no-op", cur_proto)
-            return True
+        cur_port = getattr(self, "_ovpn_endpoint_port_effective", "1194" if cur_proto == "udp" else "443")
+        # Q6: cycle complet udp:1194→tcp:443→tcp:8443 (custom only, nordvpn ignore port)
+        if self._config.get("custom_ovpn_file"):
+            cur_key = f"{cur_proto}:{cur_port}"
+            try:
+                cur_idx = self._ovpn_ports.index(cur_key)
+            except ValueError:
+                cur_idx = 0 if cur_proto == "udp" else 1
+                if cur_port == "8443":
+                    cur_idx = 2
+            nxt = None
+            for offset in range(1, len(self._ovpn_ports) + 1):
+                cand = self._ovpn_ports[(cur_idx + offset) % len(self._ovpn_ports)]
+                cand_proto = cand.split(":")[0]
+                if protocol != cur_proto and cand_proto != protocol:
+                    continue
+                nxt = cand
+                break
+            if nxt is None:
+                nxt = self._ovpn_ports[(cur_idx + 1) % len(self._ovpn_ports)]
+            target_proto, target_port_str = nxt.split(":")
+            if target_proto == cur_proto and target_port_str == cur_port:
+                logger.info("[vpn] ovpn endpoint already %s:%s — no-op", cur_proto, cur_port)
+                return True
+            protocol = target_proto
+        else:
+            # nordvpn: protocol toggle only (custom port not allowed)
+            if protocol == cur_proto:
+                logger.info("[vpn] ovpn protocol already %s — no-op", cur_proto)
+                return True
+            target_port_str = "1194" if protocol == "udp" else "443"
         # Per-station independent: only this station flips protocol (auto hétérogène)
         stations = [self._station]
         services = [self._compose_service]
@@ -3439,28 +3489,43 @@ class VPNManager:
             lines = data.splitlines()
             out = []
             seen = False
+            seen_port = False
             per_key = f"OPENVPN_PROTOCOL_STATION{self._station}"
+            per_port_key = f"OPENVPN_ENDPOINT_PORT_STATION{self._station}"
             for ln in lines:
                 stripped = ln.strip()
                 if stripped.startswith(per_key + "="):
                     out.append(f"{per_key}={protocol}")
                     seen = True
+                elif self._config.get("custom_ovpn_file") and stripped.startswith(per_port_key + "="):
+                    out.append(f"{per_port_key}={target_port_str}")
+                    seen_port = True
                 elif stripped.startswith("OPENVPN_PROTOCOL=") and not stripped.startswith("OPENVPN_PROTOCOL_STATION"):
-                    # Keep global fallback in sync for fresh clones / other stations
+                    out.append(ln)
+                elif self._config.get("custom_ovpn_file") and stripped.startswith("OPENVPN_ENDPOINT_PORT=") and not stripped.startswith("OPENVPN_ENDPOINT_PORT_STATION"):
                     out.append(ln)
                 else:
                     out.append(ln)
             if not seen:
                 out.append(f"{per_key}={protocol}")
+            if self._config.get("custom_ovpn_file") and not seen_port:
+                out.append(f"{per_port_key}={target_port_str}")
             # Ensure global fallback exists
             if not any(l.strip().startswith("OPENVPN_PROTOCOL=") for l in out):
                 out.append(f"OPENVPN_PROTOCOL={protocol}")
             else:
-                # Also update global to last flipped value for backward compat
                 for i, l in enumerate(out):
                     if l.strip().startswith("OPENVPN_PROTOCOL=") and not l.strip().startswith("OPENVPN_PROTOCOL_STATION"):
                         out[i] = f"OPENVPN_PROTOCOL={protocol}"
                         break
+            if self._config.get("custom_ovpn_file"):
+                if not any(l.strip().startswith("OPENVPN_ENDPOINT_PORT=") for l in out):
+                    out.append(f"OPENVPN_ENDPOINT_PORT={target_port_str}")
+                else:
+                    for i, l in enumerate(out):
+                        if l.strip().startswith("OPENVPN_ENDPOINT_PORT=") and not l.strip().startswith("OPENVPN_ENDPOINT_PORT_STATION"):
+                            out[i] = f"OPENVPN_ENDPOINT_PORT={target_port_str}"
+                            break
             tmp = env_path + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
                 f.write("\n".join(out) + "\n")
@@ -3470,14 +3535,25 @@ class VPNManager:
             return False
         try:
             prev = getattr(self, "_ovpn_protocol_effective", "udp")
+            prev_port = getattr(self, "_ovpn_endpoint_port_effective", "1194" if prev == "udp" else "443")
             self._ovpn_protocol_effective = protocol
             self._ovpn_protocol = protocol
+            if self._config.get("custom_ovpn_file"):
+                self._ovpn_endpoint_port_effective = target_port_str
+                self._ovpn_endpoint_port = target_port_str
+                try:
+                    self._ovpn_port_idx = self._ovpn_ports.index(f"{protocol}:{target_port_str}")
+                except ValueError:
+                    pass
             cmd = ["compose", "-f", compose_path, "up", "-d", "--force-recreate"] + sorted(services)
             env = self._compose_env(stations=stations, stack="openvpn")
             result = await asyncio.to_thread(self._docker_run, cmd, 300, env=env)
             if result.returncode != 0:
                 self._ovpn_protocol_effective = prev
                 self._ovpn_protocol = prev
+                if self._config.get("custom_ovpn_file"):
+                    self._ovpn_endpoint_port_effective = prev_port
+                    self._ovpn_endpoint_port = prev_port
                 raise RuntimeError(result.stderr.strip() or result.stdout.strip())
         except Exception as e:
             logger.error("[vpn] _apply_ovpn_protocol: compose failed: %s", e)
@@ -3488,18 +3564,32 @@ class VPNManager:
             from config.settings import yaml_set
 
             yaml_set("ip_rotation", "ovpn_protocol", protocol)
+            if self._config.get("custom_ovpn_file"):
+                yaml_set("ip_rotation", "ovpn_endpoint_port", target_port_str)
         except Exception:
             pass
-        self._flips.append(
-            {
-                "time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                "from": f"openvpn-{prev}",
-                "to": f"openvpn-{protocol}",
-                "reason": reason,
-            }
-        )
-        self._flips = self._flips[-20:]
-        logger.warning("[vpn] ovpn protocol: %s→%s (%s)", prev, protocol, reason)
+        if self._config.get("custom_ovpn_file"):
+            self._flips.append(
+                {
+                    "time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "from": f"openvpn-{prev}:{prev_port}",
+                    "to": f"openvpn-{protocol}:{target_port_str}",
+                    "reason": reason,
+                }
+            )
+            self._flips = self._flips[-20:]
+            logger.warning("[vpn] ovpn endpoint: %s:%s→%s:%s (%s)", prev, prev_port, protocol, target_port_str, reason)
+        else:
+            self._flips.append(
+                {
+                    "time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "from": f"openvpn-{prev}",
+                    "to": f"openvpn-{protocol}",
+                    "reason": reason,
+                }
+            )
+            self._flips = self._flips[-20:]
+            logger.warning("[vpn] ovpn protocol: %s→%s (%s)", prev, protocol, reason)
         return True
 
     async def set_stack(self, mode: str, propagate: bool = True) -> dict:
