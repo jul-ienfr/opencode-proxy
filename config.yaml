@@ -128,6 +128,8 @@ dashboard_trust:
 client_auth:
   mode: none
   key: ''
+supervisor:
+  enabled: true
 ip_rotation:
   enabled: true
   proxy_mode: vpn
