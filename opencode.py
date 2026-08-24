@@ -1841,6 +1841,19 @@ async def lifespan(app):
             if IP_ROTATION.get("control_enabled", True) and _ck_yaml and _ck_yaml != _ck_env:
                 _debug(f"  [lifespan] WARN control 401 risque: config.yaml key != credentials.env ({_ck_yaml[:4]}... vs {_ck_env[:4]}...) — resync forcé")
                 _boot_sync_ck()
+                # R3-Q2 fail-closed: si toujours divergent après resync, refuse VPN (pas de conteneur stale)
+                try:
+                    _ck_env2 = ""
+                    if os.path.exists(_creds_path):
+                        for _ln2 in open(_creds_path, encoding="utf-8"):
+                            if _ln2.strip().startswith("VPN_CONTROL_API_KEY="):
+                                _ck_env2 = _ln2.strip().split("=", 1)[1].strip()
+                                break
+                    if _ck_yaml != _ck_env2:
+                        _debug(f"  [lifespan] ERROR fail-closed: clé toujours divergente après resync — VPN non démarré (corriger config.yaml/credentials.env)")
+                        IP_ROTATION["_fail_closed"] = True
+                except Exception:
+                    pass
         except Exception as _e_boot:
             _debug(f"  [lifespan] boot control sync check failed: {_e_boot}")
     except Exception as _e_boot2:
@@ -1867,10 +1880,12 @@ async def lifespan(app):
         for k in range(1, n + 1)
     ]
     for m in _managers:
-        m.enabled = IP_ROTATION.get("enabled", False)
+        m.enabled = False if IP_ROTATION.get("_fail_closed") else IP_ROTATION.get("enabled", False)
+    if IP_ROTATION.get("_fail_closed"):
+        _debug("  [lifespan] fail-closed: VPN désactivé (clé divergente)")
     # warm-avalanche Q7: hetero-boot opt-in (false par défaut) — S1 WG / S2 OV UDP en // au boot
     try:
-        if IP_ROTATION.get("auto_hetero_boot", False) and len(_managers) >= 2 and IP_ROTATION.get("vpn_stack", "auto") == "auto":
+        if not IP_ROTATION.get("_fail_closed") and IP_ROTATION.get("auto_hetero_boot", False) and len(_managers) >= 2 and IP_ROTATION.get("vpn_stack", "auto") == "auto":
             _wg_present = os.path.exists(os.path.join(os.path.dirname(os.path.abspath(__file__)), "vpn_configs", "wireguard.env"))
             if _wg_present:
                 _managers[0]._stack = "auto"
