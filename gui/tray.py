@@ -4,6 +4,23 @@ from .icon import running_icon, stopped_icon
 from .window import DashboardWindow
 
 
+def notify_geo(message: str, title: str = "OpenCode — repli géo"):
+    """Module-level helper: try to notify via running tray, else no-op."""
+    try:
+        # Try to find running tray instance via global (if any)
+        import gc as _gc
+
+        for obj in _gc.get_objects():
+            try:
+                if isinstance(obj, TrayApp) and obj._icon is not None:
+                    obj.notify_geo(message, title)
+                    return
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+
 class TrayApp:
     """System tray icon with menu to control the proxy and open the dashboard."""
 
@@ -13,6 +30,8 @@ class TrayApp:
         self.port = port
         self.dashboard = DashboardWindow(port)
         self._icon = None
+        self._geo_last_time = ""
+        self._geo_poll_thread = None
 
     def _api_url(self):
         return f"http://{self.host}:{self.port}"
@@ -80,9 +99,54 @@ class TrayApp:
         except Exception:
             pass
 
+    def notify_geo(self, message: str, title: str = "OpenCode — repli géo"):
+        """Show Windows tray balloon (pystray) — throttling is backend-side."""
+        try:
+            if self._icon is not None and hasattr(self._icon, "notify"):
+                # pystray: notify(msg, title)
+                try:
+                    self._icon.notify(message, title)
+                except TypeError:
+                    self._icon.notify(message)
+        except Exception:
+            pass
+
+    def _geo_poll_loop(self):
+        """Poll logs/geo_notifications.json every 10s and notify on new entry."""
+        import json as _js
+        import os as _os
+        import time as _tm
+
+        root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+        p = _os.path.join(root, "logs", "geo_notifications.json")
+        while True:
+            try:
+                if _os.path.exists(p):
+                    with open(p, encoding="utf-8") as _f:
+                        data = _js.load(_f) or []
+                    if data:
+                        last = data[-1]
+                        t = last.get("time", "")
+                        if t and t != self._geo_last_time:
+                            self._geo_last_time = t
+                            msg = last.get("message", "") or "Repli géo direct→VPN"
+                            self.notify_geo(msg)
+            except Exception:
+                pass
+            _tm.sleep(10)
+
     # ── Entry point ──
 
     def run(self):
+        # start geo poll thread (daemon)
+        try:
+            import threading as _th
+
+            if self._geo_poll_thread is None or not self._geo_poll_thread.is_alive():
+                self._geo_poll_thread = _th.Thread(target=self._geo_poll_loop, daemon=True)
+                self._geo_poll_thread.start()
+        except Exception:
+            pass
         self._icon = pystray.Icon(
             "opencode",
             running_icon() if self.server_manager.is_running else stopped_icon(),

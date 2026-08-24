@@ -107,11 +107,13 @@ models:
     protocol: openai
   deepseek-v4-flash-vision-exp:
     protocol: openai
+  longcat-2.0:
+    protocol: openai
 free_model_map:
   mimo-v2.5: deepseek-v4-flash-free
+  qwen3.7-max: mimo-v2.5-free
   glm-5.1: deepseek-v4-flash-free
   kimi-k2.6: mimo-v2.5-free
-  qwen3.7-max: mimo-v2.5-free
   minimax-m2.5: mimo-v2.5-free
   deepseek-v4-flash: deepseek-v4-flash-free
   hy3: hy3-free
@@ -120,8 +122,8 @@ ip_rotation:
   enabled: true
   proxy_mode: vpn
   dual_station: true
-  station_count: 3
-  strict_free: false
+  station_count: 4
+  strict_free: true
   quota_per_ip: 500
   switch_delay: 1
   docker_container: opencode-vpn
@@ -183,9 +185,9 @@ ip_rotation:
   auto_hetero_boot: false
   auto_ov_fail_threshold: 3
   auto_ov_return_min: 60
-  auto_wg_egress_ticks: 1
-  egress_failure_tick_interval: 0.5
-  ip_probe_budget: 8.0
+  auto_wg_egress_ticks: 2
+  egress_failure_tick_interval: 2.0
+  ip_probe_budget: 10.0
   control_pin_timeout: 20
   control_pin_catchup: 25
   auto_flip_cooldown_min: 0
@@ -198,7 +200,7 @@ ip_rotation:
   free_parallel:
     enabled: true
     routing: round-robin
-    mode: strict
+    mode: load-balance
     hedge_delay_ms: 150
     hedge_max_attempts: 2
   max_free_attempts: 3
@@ -256,10 +258,21 @@ custom_routes:
     model: muse-spark-1.2-contributor
 api_keys: []
 web_search:
+  enabled: true
   mode: duckduckgo
   target_model: null
   max_results: 5
   timeout: 10
+  via_vpn: false
+  on_error: strip
+web_fetch:
+  enabled: true
+  mode: direct
+  target_model: null
+  timeout: 15
+  max_bytes: 12000
+  via_vpn: false
+  on_error: strip
 cache:
   max_size: 1000
   ttl: 300

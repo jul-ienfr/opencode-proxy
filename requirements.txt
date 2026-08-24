@@ -13,6 +13,8 @@ Pillow==12.3.0
 pywebview==6.1
 pyyaml==6.0.2
 duckduckgo-search==7.5.5
+beautifulsoup4==4.12.3
+trafilatura>=1.8,<3
 curl_cffi==0.16.1
 orjson==3.11.7
 uvloop==0.22.1; sys_platform != "win32"

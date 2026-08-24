@@ -335,6 +335,15 @@ const LOCALE = {
         'chart.token_dist': 'Token Distribution',
         'chart.token_pct': 'Token % by Model',
         'chart.req_pct': 'Requests % by Model',
+        'geo.direct_via_vpn': 'You are in Direct mode, but routed via VPN (station {station} {vpnCountry} {vpnIp}) because model {model} requires [{allowed}] and your direct egress {directIp} ({directCountry}) is outside that zone.',
+        'geo.direct_via_vpn_unknown': 'You are in Direct mode, but routed via VPN (station {station} {vpnCountry} {vpnIp}) because model {model} requires [{allowed}] and your direct IP is unknown.',
+        'geo.direct_via_vpn_short': 'Direct → VPN (geo fallback)',
+        'geo.badge_vpn': 'via VPN',
+        'geo.badge_direct': 'direct',
+        'geo.tooltip_allowed': 'Allowed: {allowed}',
+        'geo.toast_title': 'Geo fallback',
+        'geo.banner_direct_ok': 'Direct IP {directCountry} ({directIp}) compatible — no VPN needed',
+        'geo.banner_via_vpn': 'Direct {directCountry} ({directIp}) → VPN {vpnCountry} ({vpnIp}) for {model} — requires [{allowed}]',
     },
     fr: {
         'nav.stats': 'Statistiques',
@@ -646,6 +655,15 @@ const LOCALE = {
         'chart.token_dist': 'Distribution des tokens',
         'chart.token_pct': 'Tokens % par modèle',
         'chart.req_pct': 'Requêtes % par modèle',
+        'geo.direct_via_vpn': 'Vous êtes en mode Direct, mais routé via VPN (station {station} {vpnCountry} {vpnIp}) car le modèle {model} exige [{allowed}] et votre IP directe {directIp} ({directCountry}) est hors zone.',
+        'geo.direct_via_vpn_unknown': 'Vous êtes en mode Direct, mais routé via VPN (station {station} {vpnCountry} {vpnIp}) car le modèle {model} exige [{allowed}] et votre IP directe est indéterminée.',
+        'geo.direct_via_vpn_short': 'Direct → VPN (repli géo)',
+        'geo.badge_vpn': 'via VPN',
+        'geo.badge_direct': 'direct',
+        'geo.tooltip_allowed': 'Autorisé : {allowed}',
+        'geo.toast_title': 'Repli géo',
+        'geo.banner_direct_ok': 'IP directe {directCountry} ({directIp}) compatible — pas de VPN nécessaire',
+        'geo.banner_via_vpn': 'Direct {directCountry} ({directIp}) → VPN {vpnCountry} ({vpnIp}) pour {model} — exige [{allowed}]',
     },
 };
 
@@ -1642,11 +1660,25 @@ function renderHistory(data) {
         } else if (log.tools && log.tools.length) {
             toolsHtml = `<span title="${escHtml(log.tools.join(', '))}"><span class="tool-badge declared">${log.tools.length} declared</span></span>`;
         }
+        // Geo fallback badge (direct → VPN)
+        let geoHtml = '';
+        if (log.geo_via_vpn) {
+            const allowed = (log.geo_allowed || '').split(',').map(s=>s.trim()).filter(Boolean).join(', ');
+            const dc = log.geo_direct_country || '?';
+            const di = log.geo_direct_ip || '?';
+            const vc = log.geo_country || '?';
+            const vi = log.free_ip || log.geo_country || '';
+            const model = log.model || '';
+            const tip = t('geo.direct_via_vpn').replace('{station}', '?').replace('{vpnCountry}', vc).replace('{vpnIp}', vi).replace('{model}', model).replace('{allowed}', allowed).replace('{directIp}', di).replace('{directCountry}', dc);
+            geoHtml = `<br><span class="tool-badge" style="background:var(--warning,#e6a000);color:#fff" title="${escHtml(tip)}">${escHtml(t('geo.badge_vpn'))} ${escHtml(dc)}→${escHtml(vc)}</span> <span style="font-size:10px;color:var(--text-muted)">${escHtml(di)} → ${escHtml(vi)}</span>`;
+        } else if (log.geo_direct_country) {
+            geoHtml = `<br><span class="tool-badge" style="background:var(--bg);border:1px solid var(--border)" title="${escHtml(log.geo_direct_country + ' ' + (log.geo_direct_ip||''))}">${escHtml(t('geo.badge_direct'))} ${escHtml(log.geo_direct_country)}</span>`;
+        }
         html += `<tr class="detail-row" data-req-id="${escHtml(log.id)}">
             <td>${log.is_free_model ? '<span title="Modèle gratuit — pas de compte utilisé" style="color:var(--success);font-weight:bold">' + escHtml(log.free_ip || 'GRATUIT') + '</span>' : escHtml(log.account_alias) || '-'}</td>
             <td>${formatDateTime(log.timestamp)}</td>
             <td>${escHtml(log.original_model) || '-'}</td>
-            <td>${escHtml(log.model) || '-'}</td>
+            <td>${escHtml(log.model) || '-'}${geoHtml}</td>
             <td>${formatNumber(log.tokens_input)}</td>
             <td>${formatNumber(log.tokens_output)}</td>
             <td>${formatNumber(log.tokens_cache)}</td>
@@ -1839,16 +1871,22 @@ function renderCustomRoutes(routes, modelIds) {
     tbody.innerHTML = html;
 }
 
-// ── Web Search config ──
+// ── Web Search / Web Fetch config (v3.3 symétrique) ──
 async function fetchWebSearchConfig() {
     try {
         const data = await apiFetch('/api/config/web-search');
         const modeSelect = document.getElementById('ws-mode-select');
         const modelSelect = document.getElementById('ws-model-select');
         const maxResults = document.getElementById('ws-max-results');
+        const timeoutEl = document.getElementById('ws-timeout');
+        const enabledEl = document.getElementById('ws-enabled');
+        const viaEl = document.getElementById('ws-via-vpn');
 
         modeSelect.value = data.mode || 'duckduckgo';
         maxResults.value = data.max_results || 5;
+        if (timeoutEl) timeoutEl.value = data.timeout || 10;
+        if (enabledEl) enabledEl.value = String(data.enabled !== false);
+        if (viaEl) viaEl.value = String(!!data.via_vpn);
 
         // Populate model dropdown
         modelSelect.innerHTML = '<option value="">-- select model --</option>';
@@ -1863,6 +1901,32 @@ async function fetchWebSearchConfig() {
         // Show/hide model selector based on mode
         const showModel = data.mode !== 'duckduckgo';
         document.getElementById('ws-model-group').style.display = showModel ? '' : 'none';
+
+        // WebFetch
+        const wf = data.web_fetch || {};
+        const wfMode = document.getElementById('wf-mode-select');
+        const wfModel = document.getElementById('wf-model-select');
+        const wfMax = document.getElementById('wf-max-bytes');
+        const wfTimeout = document.getElementById('wf-timeout');
+        const wfEnabled = document.getElementById('wf-enabled');
+        const wfVia = document.getElementById('wf-via-vpn');
+        if (wfMode) wfMode.value = wf.mode || 'direct';
+        if (wfMax) wfMax.value = wf.max_bytes || 12000;
+        if (wfTimeout) wfTimeout.value = wf.timeout || 15;
+        if (wfEnabled) wfEnabled.value = String(wf.enabled !== false);
+        if (wfVia) wfVia.value = String(!!wf.via_vpn);
+        if (wfModel) {
+            wfModel.innerHTML = '<option value="">-- select model --</option>';
+            (data.available_models || []).forEach(m => {
+                const opt = document.createElement('option');
+                opt.value = m;
+                opt.textContent = m;
+                if (m === wf.target_model) opt.selected = true;
+                wfModel.appendChild(opt);
+            });
+            const showWfModel = (wf.mode || 'direct') !== 'direct';
+            document.getElementById('wf-model-group').style.display = showWfModel ? '' : 'none';
+        }
     } catch (e) {
         console.error('Failed to fetch web search config:', e);
     }
@@ -1874,11 +1938,38 @@ async function saveWebSearchConfig() {
         const mode = document.getElementById('ws-mode-select').value;
         const target_model = document.getElementById('ws-model-select').value || null;
         const max_results = parseInt(document.getElementById('ws-max-results').value) || 5;
+        const timeout = parseInt(document.getElementById('ws-timeout').value) || 10;
+        const enabled = document.getElementById('ws-enabled').value === 'true';
+        const via_vpn = document.getElementById('ws-via-vpn').value === 'true';
 
         await apiFetch('/api/config/web-search', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ mode, target_model, max_results }),
+            body: JSON.stringify({ mode, target_model, max_results, timeout, enabled, via_vpn }),
+        });
+        status.textContent = t('config.cr_saved');
+        status.className = 'save-status success';
+        setTimeout(() => { status.textContent = ''; }, 3000);
+    } catch (e) {
+        status.textContent = t('status.error');
+        status.className = 'save-status error';
+        console.error(e);
+    }
+}
+
+async function saveWebFetchConfig() {
+    const status = document.getElementById('wf-save-status');
+    try {
+        const mode = document.getElementById('wf-mode-select').value;
+        const target_model = document.getElementById('wf-model-select').value || null;
+        const max_bytes = parseInt(document.getElementById('wf-max-bytes').value) || 12000;
+        const timeout = parseInt(document.getElementById('wf-timeout').value) || 15;
+        const enabled = document.getElementById('wf-enabled').value === 'true';
+        const via_vpn = document.getElementById('wf-via-vpn').value === 'true';
+        await apiFetch('/api/config/web-fetch', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ mode, target_model, max_bytes, timeout, enabled, via_vpn }),
         });
         status.textContent = t('config.cr_saved');
         status.className = 'save-status success';
@@ -2254,12 +2345,17 @@ function setupConfig() {
         }
     });
 
-    // ── Web Search config ──
+    // ── Web Search / Web Fetch config ──
     fetchWebSearchConfig();
     document.getElementById('ws-save-btn').addEventListener('click', saveWebSearchConfig);
     document.getElementById('ws-mode-select').addEventListener('change', (e) => {
         const showModel = e.target.value !== 'duckduckgo';
         document.getElementById('ws-model-group').style.display = showModel ? '' : 'none';
+    });
+    document.getElementById('wf-save-btn').addEventListener('click', saveWebFetchConfig);
+    document.getElementById('wf-mode-select').addEventListener('change', (e) => {
+        const showModel = e.target.value !== 'direct';
+        document.getElementById('wf-model-group').style.display = showModel ? '' : 'none';
     });
 
     // ── API Keys management ──
@@ -2602,6 +2698,14 @@ document.addEventListener('DOMContentLoaded', () => {
                 refreshVPNStatus();
             }, 50);
         });
+        es.addEventListener('geo_warning', (ev) => {
+            lastEventTs = Date.now();
+            try {
+                const data = JSON.parse(ev.data);
+                if (data && data.message) showGeoToast(data.message);
+            } catch(e) {}
+            pollGeoFallback();
+        });
 
         es.onerror = () => {
             if (es !== eventSource) return; // stale
@@ -2622,6 +2726,9 @@ document.addEventListener('DOMContentLoaded', () => {
     }, 15000);
 
     connectSSE();
+    // Geo fallback poll (direct → VPN) every 10s + immediate
+    pollGeoFallback();
+    setInterval(pollGeoFallback, 10000);
 
     // Backup poll in case SSE never connects - 5s for direct live
     if (!pollTimer) startPolling(5000);
@@ -3978,6 +4085,59 @@ document.addEventListener('DOMContentLoaded', () => {
                 el.style.position = 'relative';
             }
         } catch (e) { el.style.display = 'none'; }
+    }
+
+    // ── Geo direct → VPN fallback banner + toast + tray (poll /api/geo/notifications)
+    let _lastGeoNotifTime = '';
+    async function pollGeoFallback() {
+        try {
+            const j = await apiFetch('/api/geo/notifications');
+            const notifs = j.notifications || [];
+            const banner = document.getElementById('geo-banner');
+            // Banner: only when direct incompatible → show warning, otherwise hide (spec: ne rien dire)
+            // Only show if last notification is recent (<10 min), else stale
+            if (notifs.length) {
+                const last = notifs[notifs.length - 1];
+                let recent = true;
+                try { recent = (Date.now() - new Date(last.time).getTime()) < 600000; } catch(e){}
+                if (recent) {
+                    const msg = escHtml(last.message || '');
+                    if (banner) {
+                        banner.innerHTML = '⚠️ <strong>' + escHtml(t('geo.toast_title')) + '</strong> — ' + msg;
+                        banner.style.display = 'block';
+                        banner.style.background = 'rgba(255,170,0,0.16)';
+                        banner.style.border = '1px solid var(--warning,#e6a000)';
+                        banner.style.color = 'var(--text)';
+                    }
+                    // toast once per new time
+                    if (last.time && last.time !== _lastGeoNotifTime) {
+                        _lastGeoNotifTime = last.time;
+                        showGeoToast(last.message);
+                    }
+                } else if (banner && banner.innerHTML.includes(escHtml(t('geo.toast_title')))) {
+                    banner.style.display = 'none';
+                }
+            } else {
+                // No fallback active — hide geo fallback banner (spec: ne rien dire quand direct OK)
+                // Do not clear the main geo status banner managed by refreshVPNStatus; only hide fallback warning
+                // We distinguish by checking if banner currently shows fallback (contains toast_title)
+                if (banner && banner.innerHTML.includes(escHtml(t('geo.toast_title')))) {
+                    banner.style.display = 'none';
+                }
+            }
+        } catch (e) {}
+    }
+    function showGeoToast(msg) {
+        let toast = document.getElementById('geo-toast');
+        if (!toast) {
+            toast = document.createElement('div');
+            toast.id = 'geo-toast';
+            toast.style.cssText = 'position:fixed;bottom:16px;right:16px;max-width:420px;padding:12px 16px;background:var(--bg-card,#222);border:1px solid var(--warning,#e6a000);border-radius:8px;box-shadow:0 8px 24px rgba(0,0,0,.4);font-size:12px;z-index:9999;display:none';
+            document.body.appendChild(toast);
+        }
+        toast.textContent = msg;
+        toast.style.display = 'block';
+        setTimeout(()=>{ toast.style.display='none'; }, 6000);
     }
 
     function setProxyModeUI(mode) {

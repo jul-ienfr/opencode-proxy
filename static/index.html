@@ -865,10 +865,74 @@
                         </div>
                         <div>
                             <label style="font-size:0.85em;color:#888;">Max Results</label>
-                            <input type="number" id="ws-max-results" class="config-input" value="5" min="1" max="20" style="width:80px">
+                            <input type="number" id="ws-max-results" class="config-input" value="5" min="1" max="10" style="width:80px">
+                        </div>
+                        <div>
+                            <label style="font-size:0.85em;color:#888;">Timeout (s)</label>
+                            <input type="number" id="ws-timeout" class="config-input" value="10" min="5" max="30" style="width:80px">
+                        </div>
+                        <div>
+                            <label style="font-size:0.85em;color:#888;">Enabled</label>
+                            <select id="ws-enabled" class="config-select" style="min-width:100px">
+                                <option value="true">Oui</option>
+                                <option value="false">Non</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label style="font-size:0.85em;color:#888;">Via VPN</label>
+                            <select id="ws-via-vpn" class="config-select" style="min-width:100px">
+                                <option value="false">Non (egress direct)</option>
+                                <option value="true">Oui</option>
+                            </select>
                         </div>
                         <button class="btn btn-primary" id="ws-save-btn">Save</button>
                         <span id="ws-save-status" class="save-status"></span>
+                    </div>
+                </div>
+
+                <!-- Web Fetch -->
+                <div class="card">
+                    <h2>Fetch Web</h2>
+                    <p class="config-hint">Configure la gestion des appels outil web_fetch (SSRF guard, extraction trafilatura).</p>
+                    <div style="display:flex;gap:20px;align-items:flex-end;flex-wrap:wrap;">
+                        <div>
+                            <label style="font-size:0.85em;color:#888;">Mode</label>
+                            <select id="wf-mode-select" class="config-select" style="min-width:200px">
+                                <option value="direct">Direct (local)</option>
+                                <option value="model">Model (passthrough)</option>
+                                <option value="direct_then_model">Direct → Model</option>
+                            </select>
+                        </div>
+                        <div id="wf-model-group">
+                            <label style="font-size:0.85em;color:#888;">Target Model</label>
+                            <select id="wf-model-select" class="config-select" style="min-width:200px">
+                                <option value="">-- select model --</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label style="font-size:0.85em;color:#888;">Max Bytes</label>
+                            <input type="number" id="wf-max-bytes" class="config-input" value="12000" min="2000" max="50000" step="1000" style="width:100px">
+                        </div>
+                        <div>
+                            <label style="font-size:0.85em;color:#888;">Timeout (s)</label>
+                            <input type="number" id="wf-timeout" class="config-input" value="15" min="5" max="30" style="width:80px">
+                        </div>
+                        <div>
+                            <label style="font-size:0.85em;color:#888;">Enabled</label>
+                            <select id="wf-enabled" class="config-select" style="min-width:100px">
+                                <option value="true">Oui</option>
+                                <option value="false">Non</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label style="font-size:0.85em;color:#888;">Via VPN</label>
+                            <select id="wf-via-vpn" class="config-select" style="min-width:100px">
+                                <option value="false">Non (egress direct)</option>
+                                <option value="true">Oui</option>
+                            </select>
+                        </div>
+                        <button class="btn btn-primary" id="wf-save-btn">Save</button>
+                        <span id="wf-save-status" class="save-status"></span>
                     </div>
                 </div>
 

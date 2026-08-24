@@ -1813,8 +1813,8 @@ class VPNManager:
             import httpx
 
             # [unicorn] httpx timeout alone does NOT bound SOCKS CONNECT
-            # — wrap the GET in wait_for(per_attempt) (min(2.0, budget))
-            per_attempt = max(0.5, min(2.0, float(per_attempt or 2.0)))
+            # — wrap the GET in wait_for(per_attempt) (min(3.0, budget))
+            per_attempt = max(0.5, min(3.0, float(per_attempt or 3.0)))
             async with httpx.AsyncClient(timeout=5, proxy=self.socks5_url) as client:
                 resp = await asyncio.wait_for(client.get(url), timeout=per_attempt)
                 ip = resp.text.strip()
@@ -1875,7 +1875,7 @@ class VPNManager:
         NOT bound the SOCKS5 CONNECT (the 445 s stall bug class).
 
         [Axe 1.3] Two-phase: phase 1 = quick rotated sweep (per_attempt
-        min(2.0, budget)) that distinguishes CONNECT-REFUSED (tunnel dead,
+        min(3.0, budget)) that distinguishes CONNECT-REFUSED (tunnel dead,
         definitive) from TIMEOUT (tunnel slow — may still be alive). On
         timeout-only failure, phase 2 = one grace attempt (remaining
         budget, only if > 0.5 s) on the sticky-first endpoint before
@@ -1888,9 +1888,9 @@ class VPNManager:
             # [review F2] the single-endpoint probe would false-death a
             # healthy tunnel when the ip_check endpoint itself is down.
             # Rotated sweep over ALL endpoints, sticky-first, bounded PER
-            # attempt: `min(2.0, budget)` keeps the worst case under budget
+            # attempt: `min(3.0, budget)` keeps the worst case under budget
             # across the sweep (n endpoints × per_attempt).
-            per_attempt = min(2.0, self._ip_probe_budget)
+            per_attempt = min(3.0, self._ip_probe_budget)
             base = self._ip_check_idx
             timeout_seen = False
             for i in range(len(urls)):

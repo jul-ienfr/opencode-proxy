@@ -7,14 +7,18 @@ import asyncio
 import contextvars
 import hmac
 import json
+import copy
+import ipaddress
 import logging
 import os
 import random
 import re
+import socket
 import sqlite3
 import threading
 import time
 import traceback
+import urllib.parse
 import uuid
 from collections import OrderedDict
 from contextlib import asynccontextmanager
@@ -54,6 +58,38 @@ except ImportError:
 
     def _vpn_normalize_country(n):  # fallback never invents beyond title()
         return n.strip().replace("_", " ").strip().title()
+
+try:
+    from vpn_manager import get_socks5_proxy_url
+except ImportError:
+    try:
+        from config import PROXY as _PROXY_FALLBACK
+    except ImportError:
+        _PROXY_FALLBACK = ""
+    get_socks5_proxy_url = lambda: _PROXY_FALLBACK  # type: ignore
+
+# ── Web search/fetch shared primitives (v3.3) ──
+_DDG_CACHE: OrderedDict = OrderedDict()  # kstr -> (expiry, formatted)
+_DDG_LOCKS: dict[str, asyncio.Lock] = {}
+_DDG_SEM = asyncio.Semaphore(3)
+FETCH_SEM = asyncio.Semaphore(5)
+_BLOCKED_NETS = [
+    ipaddress.ip_network(c)
+    for c in (
+        "0.0.0.0/8",
+        "169.254.0.0/16",
+        "100.64.0.0/10",
+        "192.0.2.0/24",
+        "198.51.100.0/24",
+        "203.0.113.0/24",
+        "224.0.0.0/4",
+        "::/128",
+        "::1/128",
+        "fe80::/10",
+        "fc00::/7",
+        "ff00::/8",
+    )
+]
 
 
 import datetime
@@ -633,6 +669,10 @@ for col, default in [
     ("geo_blocked", "0"),
     ("hedged", "0"),
     ("winner_station", "NULL"),
+    ("geo_direct_country", "NULL"),
+    ("geo_direct_ip", "NULL"),
+    ("geo_via_vpn", "0"),
+    ("geo_allowed", "NULL"),
 ]:
     try:
         _conn.execute(f"ALTER TABLE requests ADD COLUMN {col} TEXT DEFAULT {default}")
@@ -704,6 +744,12 @@ _current_user_agent: contextvars.ContextVar[str] = contextvars.ContextVar(
 # Value: {"ip": str, "identity": str} — identity = profile impersonate (fingerprint).
 _current_free_attempt: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
     "_current_free_attempt", default=None
+)
+
+# Geo direct → VPN fallback context (IP+pays direct, allowed, via flag)
+# Set by _enforce_geo_gate per request, read by _save_request / _geo_headers / tray.
+_current_geo: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "_current_geo", default=None
 )
 
 
@@ -843,6 +889,10 @@ def _db_insert_sync(
     identity=None,
     geo_country=None,
     geo_blocked=None,
+    geo_direct_country=None,
+    geo_direct_ip=None,
+    geo_via_vpn=None,
+    geo_allowed=None,
 ):
     """Synchronous DB insert — called via asyncio.to_thread().
 
@@ -863,8 +913,9 @@ def _db_insert_sync(
             INSERT OR REPLACE INTO requests (id, timestamp, model, original_model, duration_ms,
                 tokens_input, tokens_output, tokens_cache, success, error,
                 protocol, is_stream, thinking, effort, client_ip, account_alias, tools, tools_used,
-                request_body, response_body, client_user_agent, free_model_ip, identity, geo_country, geo_blocked)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                request_body, response_body, client_user_agent, free_model_ip, identity, geo_country, geo_blocked,
+                geo_direct_country, geo_direct_ip, geo_via_vpn, geo_allowed)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
             (
                 req_id,
@@ -892,6 +943,10 @@ def _db_insert_sync(
                 identity,
                 geo_country,
                 geo_blocked,
+                geo_direct_country,
+                geo_direct_ip,
+                1 if geo_via_vpn else 0,
+                geo_allowed,
             ),
         )
         # Batch commit logic
@@ -930,8 +985,9 @@ def _db_execute_batch_sync(batch: list[tuple]):
                 INSERT OR REPLACE INTO requests (id, timestamp, model, original_model, duration_ms,
                     tokens_input, tokens_output, tokens_cache, success, error,
                     protocol, is_stream, thinking, effort, client_ip, account_alias, tools, tools_used,
-                    request_body, response_body, client_user_agent, free_model_ip, identity, geo_country, geo_blocked)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    request_body, response_body, client_user_agent, free_model_ip, identity, geo_country, geo_blocked,
+                    geo_direct_country, geo_direct_ip, geo_via_vpn, geo_allowed)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
                 item,
             )
@@ -1002,6 +1058,10 @@ async def _save_request(
     identity=None,
     geo_country=None,
     geo_blocked=None,
+    geo_direct_country=None,
+    geo_direct_ip=None,
+    geo_via_vpn=None,
+    geo_allowed=None,
 ):
     tools_json = json.dumps(tools) if tools else "[]"
     tools_used_json = json.dumps(list(dict.fromkeys(tools_used))) if tools_used else "[]"
@@ -1025,6 +1085,32 @@ async def _save_request(
     # [30] UTC everywhere — Z suffix
     timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     timestamp = _normalize_timestamp_utc(timestamp)
+    # Geo direct extra — pull from ContextVar set by _enforce_geo_gate
+    if geo_direct_country is None or geo_direct_ip is None or geo_via_vpn is None or geo_allowed is None:
+        try:
+            _g = _current_geo.get()
+            if _g:
+                if geo_direct_country is None:
+                    geo_direct_country = _g.get("direct_country")
+                if geo_direct_ip is None:
+                    geo_direct_ip = _g.get("direct_ip")
+                if geo_via_vpn is None:
+                    geo_via_vpn = _g.get("via_vpn")
+                if geo_allowed is None:
+                    _al = _g.get("allowed")
+                    if isinstance(_al, list):
+                        geo_allowed = ",".join(_al)
+                    elif isinstance(_al, str):
+                        geo_allowed = _al
+                if geo_country is None and _g.get("current_country"):
+                    geo_country = _g.get("current_country")
+                if geo_blocked is None and _g.get("blocked") is not None:
+                    geo_blocked = _g.get("blocked")
+        except Exception:
+            pass
+    # normalize geo_allowed list → string for DB
+    if isinstance(geo_allowed, list):
+        geo_allowed = ",".join(geo_allowed)
     item = (
         req_id,
         timestamp,
@@ -1051,6 +1137,10 @@ async def _save_request(
         identity,
         geo_country,
         geo_blocked,
+        geo_direct_country,
+        geo_direct_ip,
+        1 if geo_via_vpn else 0,
+        geo_allowed,
     )
     try:
         _db_queue.put_nowait(item)
@@ -1086,6 +1176,10 @@ async def _save_request(
                 identity,
                 geo_country,
                 geo_blocked,
+                geo_direct_country,
+                geo_direct_ip,
+                geo_via_vpn,
+                geo_allowed,
             )
         except Exception as e:
             _debug(f"  [db] fallback insert failed: {e}")
@@ -1119,6 +1213,12 @@ async def _save_request(
                 "account_alias": account_alias,
                 "free_model_ip": free_model_ip,
                 "identity": identity,
+                "geo_country": geo_country,
+                "geo_blocked": geo_blocked,
+                "geo_direct_country": geo_direct_country,
+                "geo_direct_ip": geo_direct_ip,
+                "geo_via_vpn": bool(geo_via_vpn),
+                "geo_allowed": geo_allowed,
                 "tools": tools or [],
                 "tools_used": tools_used_deduped,
             },
@@ -2382,6 +2482,70 @@ class AccessLogMiddleware:
 app.add_middleware(AccessLogMiddleware)
 
 
+class GeoWarningMiddleware:
+    """Inject X-Geo-* warning headers when direct → VPN fallback is active.
+
+    Reads _current_geo ContextVar set by _enforce_geo_gate. Runs as pure ASGI
+    so it adds headers to both JSON and streaming responses without buffering.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        # Capture current geo at request start (may be None for non-geo routes)
+        async def send_wrapper(message):
+            if message["type"] == "http.response.start":
+                try:
+                    _g = _current_geo.get()
+                    if _g and _g.get("via_vpn"):
+                        # Build headers from context (route not available here, use stored allowed)
+                        h = {}
+                        # Use stored values; also fallback to _geo_headers with dummy route
+                        try:
+                            _route = {}
+                            # try to get allowed from context
+                            allowed = _g.get("allowed")
+                            if isinstance(allowed, list):
+                                h["X-Geo-Allowed"] = ", ".join(allowed)
+                            elif isinstance(allowed, str):
+                                h["X-Geo-Allowed"] = allowed
+                            if _g.get("direct_country"):
+                                h["X-Geo-Direct-Country"] = str(_g["direct_country"])
+                            if _g.get("direct_ip"):
+                                h["X-Geo-Direct-Ip"] = str(_g["direct_ip"])
+                            if _g.get("current_country"):
+                                h["X-Geo-Current"] = str(_g["current_country"])
+                            if _g.get("vpn_ip"):
+                                h["X-Geo-Vpn-Ip"] = str(_g["vpn_ip"])
+                            if _g.get("station"):
+                                h["X-Geo-Station"] = str(_g["station"])
+                            if _g.get("model"):
+                                h["X-Geo-Model"] = str(_g["model"])
+                            h["X-Geo-Warning"] = "direct incompatible — tunneled"
+                            h["X-Geo-Pinned"] = "true"
+                        except Exception:
+                            pass
+                        if h:
+                            # Merge into existing headers (list of tuples)
+                            existing = list(message.get("headers") or [])
+                            # headers are bytes pairs; convert new ones
+                            for k, v in h.items():
+                                existing.append((k.lower().encode(), str(v).encode()))
+                            message["headers"] = existing
+                except Exception:
+                    pass
+            await send(message)
+
+        await self.app(scope, receive, send_wrapper)
+
+
+app.add_middleware(GeoWarningMiddleware)
+
+
 # ── Traffic Capture (Wireshark-like raw request view) ──────────────
 # Outermost middleware: records every client request — raw body bytes,
 # headers, timing, tempo, abrupt disconnects (RST) — into a bounded
@@ -2561,25 +2725,149 @@ def _openai_error(
     )
 
 
-def _geo_headers(route: dict, pinned: bool = False, current_country: str | None = None) -> dict:
+def _geo_i18n(key: str, lang: str | None = None) -> str:
+    """Tiny i18n for geo warning messages — PROXY_LANG driven (en/fr)."""
+    try:
+        l = (lang or os.getenv("PROXY_LANG", "en") or "en").lower().strip()[:2]
+    except Exception:
+        l = "en"
+    if l not in ("en", "fr"):
+        l = "en"
+    msgs = {
+        "en": {
+            "direct_via_vpn": "You are in Direct mode, but routed via VPN (station {station} {vpnCountry} {vpnIp}) because model {model} requires [{allowed}] and your direct egress {directIp} ({directCountry}) is outside that zone.",
+            "direct_via_vpn_unknown": "You are in Direct mode, but routed via VPN (station {station} {vpnCountry} {vpnIp}) because model {model} requires [{allowed}] and your direct IP is unknown.",
+            "direct_via_vpn_short": "Direct → VPN (geo fallback)",
+        },
+        "fr": {
+            "direct_via_vpn": "Vous êtes en mode Direct, mais routé via VPN (station {station} {vpnCountry} {vpnIp}) car le modèle {model} exige [{allowed}] et votre IP directe {directIp} ({directCountry}) est hors zone.",
+            "direct_via_vpn_unknown": "Vous êtes en mode Direct, mais routé via VPN (station {station} {vpnCountry} {vpnIp}) car le modèle {model} exige [{allowed}] et votre IP directe est indéterminée.",
+            "direct_via_vpn_short": "Direct → VPN (repli géo)",
+        },
+    }
+    return msgs.get(l, msgs["en"]).get(key, key)
+
+
+_geo_tray_last: dict = {}  # model -> monotonic ts throttle
+_GEO_TRAY_THROTTLE = 60.0  # sec per model
+
+
+def _notify_geo_tray_throttled(msg: str, model: str | None = None):
+    """Notify system tray (if GUI) + file fallback, throttled per model."""
+    try:
+        now = time.monotonic()
+        key = model or "__global__"
+        last = _geo_tray_last.get(key, 0)
+        if now - last < _GEO_TRAY_THROTTLE:
+            return
+        _geo_tray_last[key] = now
+        # Try GUI tray if running
+        try:
+            import gui.tray as _gt
+
+            if hasattr(_gt, "notify_geo"):
+                _gt.notify_geo(msg)  # type: ignore
+                return
+        except Exception:
+            pass
+        # Fallback: write notification file polled by tray / dashboard SSE
+        try:
+            import json as _js
+            import os as _os
+
+            p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "geo_notifications.json")
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            entry = {"time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "model": model or "", "message": msg}
+            # keep last 20
+            try:
+                old = []
+                if os.path.exists(p):
+                    with open(p, encoding="utf-8") as _f:
+                        old = _js.load(_f) or []
+            except Exception:
+                old = []
+            old.append(entry)
+            old = old[-20:]
+            with open(p, "w", encoding="utf-8") as _f:
+                _js.dump(old, _f, ensure_ascii=False, indent=2)
+            # also publish SSE for dashboard toast
+            try:
+                from dashboard.events import get_event_manager
+
+                get_event_manager().publish("geo_warning", entry)
+            except Exception:
+                pass
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+def _geo_headers(
+    route: dict,
+    pinned: bool = False,
+    current_country: str | None = None,
+    *,
+    direct_country: str | None = None,
+    direct_ip: str | None = None,
+    via_vpn_while_direct: bool = False,
+    allowed: list | None = None,
+    vpn_ip: str | None = None,
+    station: str | None = None,
+    model: str | None = None,
+) -> dict:
     """Centralized X-Geo-* headers (plan vivid-hinton §2).
 
     Minimized on success (X-Geo-Status/Mode/Pinned only); detailed
-    X-Geo-Allowed/Current only on 403 (caller merges).
+    X-Geo-Allowed/Current only on 403 or on direct→VPN fallback (caller merges).
+    Auto-enriches from _current_geo ContextVar when via flag set there.
     """
+    # Auto-enrich from ContextVar if caller didn't pass explicit via data
+    if not via_vpn_while_direct:
+        try:
+            _cg = _current_geo.get()
+            if _cg and _cg.get("via_vpn"):
+                via_vpn_while_direct = True
+                direct_country = direct_country or _cg.get("direct_country")
+                direct_ip = direct_ip or _cg.get("direct_ip")
+                allowed = allowed if allowed is not None else _cg.get("allowed")
+                vpn_ip = vpn_ip or _cg.get("vpn_ip")
+                station = station or _cg.get("station")
+                model = model or _cg.get("model")
+                # current_country fallback to context if not passed
+                if not current_country:
+                    current_country = _cg.get("current_country")
+        except Exception:
+            pass
     try:
         resolved = _cfg_settings.resolve_geo(route) if isinstance(route, dict) else {}
     except Exception:
         resolved = {}
     mode = str(resolved.get("mode", "strict")) if isinstance(resolved, dict) else "strict"
     status = str(resolved.get("geo_status", "ok")) if isinstance(resolved, dict) else "ok"
-    # UI label: prefer -> best_effort
     ui_mode = "best_effort" if mode == "prefer" else mode
     h = {
         "X-Geo-Mode": ui_mode,
         "X-Geo-Status": status,
         "X-Geo-Pinned": "true" if pinned else "false",
     }
+    if via_vpn_while_direct:
+        # Verbose warning headers for direct incompatible case
+        h["X-Geo-Warning"] = "direct incompatible — tunneled"
+        if direct_country:
+            h["X-Geo-Direct-Country"] = str(direct_country)
+        if direct_ip:
+            h["X-Geo-Direct-Ip"] = str(direct_ip)
+        if current_country:
+            h["X-Geo-Current"] = str(current_country)
+        if vpn_ip:
+            h["X-Geo-Vpn-Ip"] = str(vpn_ip)
+        if allowed is not None:
+            h["X-Geo-Allowed"] = ", ".join(allowed) if isinstance(allowed, list) else str(allowed)
+        if station:
+            h["X-Geo-Station"] = str(station)
+        if model:
+            h["X-Geo-Model"] = str(model)
     return h
 
 
@@ -2682,6 +2970,10 @@ async def _enforce_geo_gate(route: dict, request: Request, *, is_stream: bool, p
     _geo_has = isinstance(route, dict) and isinstance(route.get("geo"), dict)
     _geo_enabled = bool(getattr(_cfg_settings, "GEO_ENABLED", False))
     if not (_geo_has and _geo_enabled):
+        try:
+            _current_geo.set(None)
+        except Exception:
+            pass
         return None
     _geo_mode = str(_geo_info.get("mode", "strict"))
     _geo_status = str(_geo_info.get("geo_status", "ok"))
@@ -2779,23 +3071,103 @@ async def _enforce_geo_gate(route: dict, request: Request, *, is_stream: bool, p
     # If allow_direct_when_compatible is True and the residential (direct)
     # IP is already in effective_allowed, the paid forward can go direct
     # without VPN tunnel — skip the entire pin logic below.
+    # Otherwise we force VPN but keep direct IP/country for the i18n warning
+    # "Direct → VPN (geo fallback)" (IP + pays affichés, tray + badge).
+    _direct_country_val: str | None = None
+    _direct_ip_val: str | None = None
+    _allowed_list = sorted(_geo_effective) if isinstance(_geo_effective, set) else []
+    _allowed_str = ", ".join(_allowed_list) if _allowed_list else ""
     if _geo_effective and isinstance(_geo_effective, set) and len(_geo_effective) > 0:
         _allow_direct = bool(getattr(_cfg_settings, "GEO_ALLOW_DIRECT_WHEN_COMPATIBLE", True))
         if _allow_direct:
             try:
-                _direct = await _direct_country()
+                _direct_country_val = await _direct_country()
             except Exception:
-                _direct = "unknown"
-            if _direct and _direct.lower() != "unknown" and _direct in _geo_effective:
+                _direct_country_val = "unknown"
+            # also fetch direct IP (cached, no extra I/O if country cache hit)
+            try:
+                _direct_ip_val = _direct_ip_cache.get("ip") or _direct_country_cache.get("ip") or await _get_direct_ip()
+            except Exception:
+                _direct_ip_val = "unknown"
+            if not _direct_ip_val:
+                _direct_ip_val = "unknown"
+            if not _direct_country_val:
+                _direct_country_val = "unknown"
+            # store for downstream headers/DB/tray
+            request.state._geo_direct_country = _direct_country_val  # type: ignore
+            request.state._geo_direct_ip = _direct_ip_val  # type: ignore
+            request.state._geo_allowed = _allowed_list  # type: ignore
+            request.state._geo_model = route.get("model", "") if isinstance(route, dict) else ""  # type: ignore
+            if _direct_country_val and _direct_country_val.lower() != "unknown" and _direct_country_val in _geo_effective:
                 request.state._geo_force_tunnel = False  # type: ignore
+                request.state._geo_via_vpn_while_direct = False  # type: ignore
                 request.state._geo_pinned = False  # type: ignore
-                request.state._geo_current = _direct  # type: ignore
+                request.state._geo_current = _direct_country_val  # type: ignore
                 request.state._geo_mode = _geo_mode  # type: ignore
                 request.state._geo_fallback = False  # type: ignore
-                _log(f"  geo: direct IP {_direct} ∈ allowed → httpx direct allowed (no tunnel)")
+                # ContextVar for DB/headers/tray
+                try:
+                    _current_geo.set(
+                        {
+                            "direct_country": _direct_country_val,
+                            "direct_ip": _direct_ip_val,
+                            "allowed": _allowed_list,
+                            "via_vpn": False,
+                            "current_country": _direct_country_val,
+                            "model": route.get("model", "") if isinstance(route, dict) else "",
+                        }
+                    )
+                except Exception:
+                    pass
+                _log(f"  geo: direct IP {_direct_country_val} ({_direct_ip_val}) ∈ [{_allowed_str}] → httpx direct allowed (no tunnel)")
                 return None
-        # Either allow_direct=False or direct IP not compatible → must tunnel
-        request.state._geo_force_tunnel = True  # type: ignore
+            # direct incompatible → must tunnel, keep flag for warning
+            request.state._geo_force_tunnel = True  # type: ignore
+            request.state._geo_via_vpn_while_direct = True  # type: ignore
+            # current will be filled after pin (or keep direct as placeholder)
+            request.state._geo_current = _direct_country_val  # type: ignore
+            try:
+                _current_geo.set(
+                    {
+                        "direct_country": _direct_country_val,
+                        "direct_ip": _direct_ip_val,
+                        "allowed": _allowed_list,
+                        "via_vpn": True,
+                        "current_country": _direct_country_val,
+                        "model": route.get("model", "") if isinstance(route, dict) else "",
+                    }
+                )
+            except Exception:
+                pass
+        else:
+            # allow_direct disabled → always tunnel, but still capture direct for warning
+            try:
+                _direct_country_val = await _direct_country()
+            except Exception:
+                _direct_country_val = "unknown"
+            try:
+                _direct_ip_val = _direct_ip_cache.get("ip") or _direct_country_cache.get("ip") or await _get_direct_ip()
+            except Exception:
+                _direct_ip_val = "unknown"
+            request.state._geo_direct_country = _direct_country_val  # type: ignore
+            request.state._geo_direct_ip = _direct_ip_val or "unknown"  # type: ignore
+            request.state._geo_allowed = _allowed_list  # type: ignore
+            request.state._geo_model = route.get("model", "") if isinstance(route, dict) else ""  # type: ignore
+            request.state._geo_via_vpn_while_direct = True  # type: ignore
+            request.state._geo_force_tunnel = True  # type: ignore
+            try:
+                _current_geo.set(
+                    {
+                        "direct_country": _direct_country_val,
+                        "direct_ip": _direct_ip_val,
+                        "allowed": _allowed_list,
+                        "via_vpn": True,
+                        "current_country": _direct_country_val,
+                        "model": route.get("model", "") if isinstance(route, dict) else "",
+                    }
+                )
+            except Exception:
+                pass
     if _vpn_on and _geo_effective and isinstance(_geo_effective, set) and len(_geo_effective) > 0:
         if _geo_current and _geo_current in _geo_effective:
             request.state._geo_pinned = True  # type: ignore
@@ -2804,6 +3176,68 @@ async def _enforce_geo_gate(route: dict, request: Request, *, is_stream: bool, p
             request.state._geo_fallback = False  # type: ignore
             _geo_forced_pool = set(_geo_effective)
             request.state._geo_forced_pool = _geo_forced_pool  # type: ignore
+            # If we are here because direct was incompatible, emit warning context
+            _via = bool(getattr(request.state, "_geo_via_vpn_while_direct", False))
+            if _via:
+                # enrich context var with final VPN country
+                try:
+                    _cur_g = _current_geo.get() or {}
+                    _cur_g["current_country"] = _geo_current
+                    _cur_g["via_vpn"] = True
+                    # try to fetch VPN ip for this country
+                    _vpn_ip = None
+                    _station_n = None
+                    try:
+                        import shared_state as _ss_cur
+
+                        for _mm in getattr(_ss_cur, "vpn_managers", None) or []:
+                            if _mm and getattr(_mm, "_current_country", None) == _geo_current:
+                                _vpn_ip = getattr(_mm, "current_ip", None)
+                                _station_n = getattr(_mm, "_station", None)
+                                break
+                    except Exception:
+                        pass
+                    if _vpn_ip:
+                        _cur_g["vpn_ip"] = _vpn_ip
+                    if _station_n:
+                        _cur_g["station"] = str(_station_n)
+                    _current_geo.set(_cur_g)
+                    # i18n log
+                    _model = _cur_g.get("model", "") or route.get("model", "") if isinstance(route, dict) else ""
+                    _allowed = _cur_g.get("allowed", _allowed_list)
+                    _direct_c = _cur_g.get("direct_country", "unknown")
+                    _direct_i = _cur_g.get("direct_ip", "unknown")
+                    if _direct_c and _direct_c.lower() != "unknown":
+                        _msg = _geo_i18n("direct_via_vpn").format(
+                            station=_station_n or "?",
+                            vpnCountry=_geo_current or "?",
+                            vpnIp=_vpn_ip or "?",
+                            model=_model or "?",
+                            allowed=", ".join(_allowed) if isinstance(_allowed, list) else str(_allowed),
+                            directIp=_direct_i or "unknown",
+                            directCountry=_direct_c or "unknown",
+                        )
+                    else:
+                        _msg = _geo_i18n("direct_via_vpn_unknown").format(
+                            station=_station_n or "?",
+                            vpnCountry=_geo_current or "?",
+                            vpnIp=_vpn_ip or "?",
+                            model=_model or "?",
+                            allowed=", ".join(_allowed) if isinstance(_allowed, list) else str(_allowed),
+                        )
+                    _log(f"  geo fallback: {_msg}")
+                    # tray notify (throttled)
+                    try:
+                        _notify_geo_tray_throttled(_msg, model=_model)
+                    except Exception:
+                        try:
+                            import gui.tray as _gt  # type: ignore
+                            if hasattr(_gt, "notify_geo"):
+                                _gt.notify_geo(_msg)  # type: ignore
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
             return None
         try:
             _probe_budget = (
@@ -2919,6 +3353,75 @@ async def _enforce_geo_gate(route: dict, request: Request, *, is_stream: bool, p
                     _log(
                         f"  [geo] pin verified country={_geo_current} in effective_allowed={sorted(_geo_effective)}"
                     )
+                    # If direct was incompatible, enrich context and emit warning/tray
+                    try:
+                        _via2 = bool(getattr(request.state, "_geo_via_vpn_while_direct", False))
+                        if _via2:
+                            _cur2 = _current_geo.get() or {}
+                            _cur2["current_country"] = _geo_current
+                            _cur2["via_vpn"] = True
+                            # enrich with vpn ip/station
+                            try:
+                                import shared_state as _ss_cur2
+
+                                for _mm2 in getattr(_ss_cur2, "vpn_managers", None) or []:
+                                    if _mm2 and getattr(_mm2, "_current_country", None) == _geo_current:
+                                        _cur2["vpn_ip"] = getattr(_mm2, "current_ip", None) or _cur2.get("vpn_ip")
+                                        _cur2["station"] = str(getattr(_mm2, "_station", ""))
+                                        break
+                                # fallback: best station
+                                if "vpn_ip" not in _cur2:
+                                    _vst = None
+                                    try:
+                                        _vst = getattr(_ss_cur2, "free_ip_pool", None) and _ss_cur2.free_ip_pool._best_station(set(_geo_effective))
+                                    except Exception:
+                                        pass
+                                    if _vst:
+                                        _cur2["vpn_ip"] = getattr(_vst, "current_ip", None) or getattr(_vst, "pid", "")
+                                        _cur2["station"] = str(getattr(_vst, "_station", ""))
+                            except Exception:
+                                pass
+                            _current_geo.set(_cur2)
+                            # also keep request.state in sync for response headers
+                            request.state._geo_current = _geo_current  # type: ignore
+                            # i18n log
+                            _model2 = _cur2.get("model", "") or route.get("model", "") if isinstance(route, dict) else ""
+                            _allowed2 = _cur2.get("allowed", _allowed_list)
+                            _direct_c2 = _cur2.get("direct_country", "unknown")
+                            _direct_i2 = _cur2.get("direct_ip", "unknown")
+                            _vpn_ip2 = _cur2.get("vpn_ip", "?")
+                            _st2 = _cur2.get("station", "?")
+                            if _direct_c2 and _direct_c2.lower() != "unknown":
+                                _msg2 = _geo_i18n("direct_via_vpn").format(
+                                    station=_st2 or "?",
+                                    vpnCountry=_geo_current or "?",
+                                    vpnIp=_vpn_ip2 or "?",
+                                    model=_model2 or "?",
+                                    allowed=", ".join(_allowed2) if isinstance(_allowed2, list) else str(_allowed2),
+                                    directIp=_direct_i2 or "unknown",
+                                    directCountry=_direct_c2 or "unknown",
+                                )
+                            else:
+                                _msg2 = _geo_i18n("direct_via_vpn_unknown").format(
+                                    station=_st2 or "?",
+                                    vpnCountry=_geo_current or "?",
+                                    vpnIp=_vpn_ip2 or "?",
+                                    model=_model2 or "?",
+                                    allowed=", ".join(_allowed2) if isinstance(_allowed2, list) else str(_allowed2),
+                                )
+                            _log(f"  geo fallback: {_msg2}")
+                            try:
+                                _notify_geo_tray_throttled(_msg2, model=_model2)
+                            except Exception:
+                                try:
+                                    import gui.tray as _gt2  # type: ignore
+
+                                    if hasattr(_gt2, "notify_geo"):
+                                        _gt2.notify_geo(_msg2)  # type: ignore
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
                     for c in _geo_candidates:
                         _geo_breaker.pop((c, 0), None)
                 else:
@@ -3849,9 +4352,23 @@ async def _open_via_pool(endpoint, body, headers, *, is_stream=False, forced_poo
     unavailable.  Raises UpstreamError on connection/timeout failures.
     """
     # 1) Get station from pool, or fall back to vpn_manager
+    # When forced_pool is set (geo fallback), we must pick a station
+    # IGNORING proxy_mode=direct — direct mode still tunnels geo-restricted
+    # models. Use _best_station directly (proxy_mode agnostic) before
+    # falling back to on_request / single manager.
     proxy_url = None
     station = None
-    if _free_ip_pool is not None:
+    if forced_pool is not None and _free_ip_pool is not None:
+        try:
+            # Geo path: pick best station whose country ∈ forced_pool, regardless of proxy_mode
+            st = _free_ip_pool._best_station(forced_pool)
+            if st is not None and getattr(st, "socks5_url", None):
+                # ensure still usable (status check already in _best_station)
+                proxy_url = st.socks5_url
+                station = st
+        except Exception:
+            pass
+    if not proxy_url and _free_ip_pool is not None:
         try:
             proxy_url, station = await _free_ip_pool.on_request(forced_pool)
         except Exception:
@@ -5361,164 +5878,618 @@ def _extract_tool_names(body: dict) -> list:
     return names
 
 
-# ── Web Search Handler ───────────────────────────────────────────────
+# ── Web Search / Web Fetch Handler (v3.3) ───────────────────────────────
+
+import re as _re_norm
+
+def _normalize_tool_name(t: dict) -> str:
+    raw = t.get("name") or t.get("function", {}).get("name") or ""
+    if not raw:
+        tp = t.get("type", "")
+        if tp.startswith("web_search"):
+            raw = "web_search"
+        elif tp.startswith("web_fetch"):
+            raw = "web_fetch"
+        else:
+            return ""
+    low = raw.strip().lower()
+    low = _re_norm.sub(r"_20\d{2}_\d{2}_\d{2}$", "", low)
+    if low in ("websearch", "web_search"):
+        return "web_search"
+    if low in ("webfetch", "web_fetch"):
+        return "web_fetch"
+    return low
+
+
+def _has_tool(body: dict, name: str) -> bool:
+    return any(_normalize_tool_name(t) == name for t in body.get("tools", []) if isinstance(t, dict))
+
+
+def _is_tool_choice_auto(body: dict) -> bool:
+    tc = body.get("tool_choice")
+    if tc is None:
+        return True
+    if tc == "auto" or tc == "any":
+        return True
+    if isinstance(tc, dict) and tc.get("type") in ("auto", "any"):
+        return True
+    return False
 
 
 def _is_web_search_forced(body: dict, protocol: str) -> bool:
-    """Check if tool_choice is forced to web_search."""
+    """Check if tool_choice is forced to web_search (legacy compat)."""
     tc = body.get("tool_choice")
     if not isinstance(tc, dict):
         return False
+    # use normalized name
+    name = tc.get("name", "") or tc.get("function", {}).get("name", "")
+    if _normalize_tool_name({"name": name}) == "web_search":
+        return tc.get("type") in ("tool", "function")
+    # also handle type-based forced without name
+    if tc.get("type") == "tool" and _normalize_tool_name({"type": tc.get("name", "")}) == "web_search":
+        return True
     if protocol == "anthropic":
-        return tc.get("type") == "tool" and tc.get("name") == "web_search"
+        return tc.get("type") == "tool" and _normalize_tool_name(tc) == "web_search"
     else:
-        return tc.get("type") == "function" and tc.get("function", {}).get("name") == "web_search"
+        return tc.get("type") == "function" and _normalize_tool_name(tc) == "web_search"
 
 
 def _extract_search_query(body: dict) -> str:
-    """Extract the search query from the last user message."""
+    """Extract the search query from the last user message. Q6B F6: takes last 500 chars, not first."""
     messages = body.get("messages", [])
     for msg in reversed(messages):
         if msg.get("role") == "user":
             content = msg.get("content", "")
+            text = ""
             if isinstance(content, str):
-                # Look for "Perform a web search for the query: ..." pattern
-                if "web search" in content.lower():
-                    for line in content.split("\n"):
-                        if "query:" in line.lower():
-                            return line.split(":", 1)[1].strip()
-                return content[:500]
+                text = content
             elif isinstance(content, list):
                 for block in content:
                     if isinstance(block, dict) and block.get("type") == "text":
                         text = block.get("text", "")
-                        if "web search" in text.lower():
-                            for line in text.split("\n"):
-                                if "query:" in line.lower():
-                                    return line.split(":", 1)[1].strip()
-                        return text[:500]
+                        break
+            if not text:
+                continue
+            # Look for "Perform a web search for the query: ..." pattern
+            if "web search" in text.lower():
+                for line in text.split("\n"):
+                    if "query:" in line.lower():
+                        return line.split(":", 1)[1].strip()[-500:]
+            # general: last 500 chars, not first
+            return text.strip()[-500:] if len(text) > 500 else text.strip()
     return ""
 
 
-def _execute_ddg_search(query: str, max_results: int = 5) -> str:
-    """Execute a DuckDuckGo search and return formatted results."""
+def _normalize_query(q: str) -> str:
+    return re.sub(r"\s+", " ", q.strip().lower())[:500]
+
+
+def _format_ddg(results: list, query: str) -> str:
+    if not results:
+        return f"No results found for: {query}"
+    lines = [f"Web search results for '{query}':\n"]
+    for i, r in enumerate(results, 1):
+        title = r.get("title", "")
+        body_text = r.get("body", "")
+        href = r.get("href", "")
+        lines.append(f"{i}. **{title}**\n   {body_text}\n   {href}\n")
+    return "\n".join(lines)
+
+
+async def _is_safe_fetch_url(url: str) -> bool:
+    """SSRF guard F1+R1+R4: async, fail-closed, budgeted via outer wait_for."""
     try:
-        from duckduckgo_search import DDGS
+        p = urllib.parse.urlparse(url)
+        if p.scheme not in ("http", "https"):
+            return False
+        host = (p.hostname or "").lower().rstrip(".")
+        if not host or host in ("localhost", "localhost."):
+            return False
+        # IP literal
+        try:
+            ip = ipaddress.ip_address(host)
+            if any([ip.is_private, ip.is_loopback, ip.is_link_local, ip.is_reserved, ip.is_multicast]) or any(ip in n for n in _BLOCKED_NETS):
+                return False
+            return True
+        except ValueError:
+            pass
+        # DNS rebinding - to_thread, outer wait_for budgets it
+        try:
+            infos = await asyncio.to_thread(socket.getaddrinfo, host, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
+            for _, _, _, _, sa in infos:
+                ip = ipaddress.ip_address(sa[0])
+                if any([ip.is_private, ip.is_loopback, ip.is_link_local, ip.is_reserved, ip.is_multicast]) or any(ip in n for n in _BLOCKED_NETS):
+                    return False
+        except Exception:
+            return False
+        return True
+    except Exception:
+        return False
 
-        with DDGS() as ddgs:
-            results = list(ddgs.text(query, max_results=max_results))
-        if not results:
-            return f"No results found for: {query}"
-        lines = [f"Web search results for '{query}':\n"]
-        for i, r in enumerate(results, 1):
-            title = r.get("title", "")
-            body_text = r.get("body", "")
-            href = r.get("href", "")
-            lines.append(f"{i}. **{title}**\n   {body_text}\n   {href}\n")
-        return "\n".join(lines)
-    except Exception as e:
-        return f"Search error: {type(e).__name__}: {e}"
+
+async def _execute_ddg_search(query: str, max_results: int = 5, timeout: int = 10, proxy=None) -> str:
+    """Execute DDG with cache, semaphore, lock per key, wait_for budget unique."""
+    # clamps Q8A
+    try:
+        timeout = max(5, min(30, int(timeout)))
+    except Exception:
+        timeout = 10
+    try:
+        max_results = max(1, min(10, int(max_results)))
+    except Exception:
+        max_results = 5
+    qnorm = _normalize_query(query)
+    kstr = f"{qnorm}:{max_results}"
+    now = time.monotonic()
+    # LRU hit
+    if kstr in _DDG_CACHE:
+        exp, val = _DDG_CACHE[kstr]
+        if now < exp:
+            _DDG_CACHE.move_to_end(kstr)
+            return copy.deepcopy(val)
+        else:
+            try:
+                del _DDG_CACHE[kstr]
+            except KeyError:
+                pass
+    # lock per key (v3.3 R3: pop after lock released, finally)
+    lock = _DDG_LOCKS.get(kstr)
+    if lock is None:
+        lock = asyncio.Lock()
+        _DDG_LOCKS[kstr] = lock
+    _hit_val = None
+    _hit = False
+    try:
+        async with lock:
+            # double-check
+            if kstr in _DDG_CACHE:
+                exp2, val2 = _DDG_CACHE[kstr]
+                if time.monotonic() < exp2:
+                    _DDG_CACHE.move_to_end(kstr)
+                    _hit_val = copy.deepcopy(val2)
+                    _hit = True
+                else:
+                    _hit = False
+            else:
+                _hit = False
+            if not _hit:
+                # semaphore + wait_for
+                async with _DDG_SEM:
+
+                    def _sync_ddg():
+                        try:
+                            from duckduckgo_search import DDGS
+
+                            try:
+                                ddgs = DDGS(timeout=timeout, proxy=proxy)
+                            except TypeError:
+                                ddgs = DDGS()
+                            with ddgs:
+                                return list(ddgs.text(qnorm, max_results=max_results))
+                        except ImportError as e:
+                            raise ImportError(f"duckduckgo-search not installed: {e}")
+
+                    try:
+                        results = await asyncio.wait_for(asyncio.to_thread(_sync_ddg), timeout + 2)
+                    except asyncio.TimeoutError:
+                        _log(f"  WEB SEARCH: DDG timeout {timeout}s query='{qnorm[:60]}' queue={3 - _DDG_SEM._value}")
+                        raise
+                    except ImportError:
+                        raise
+                    except Exception as e:
+                        # on_error strip - raise to let handler strip
+                        raise RuntimeError(f"DDG error: {e}") from e
+                formatted = _format_ddg(results, qnorm)
+                _DDG_CACHE[kstr] = (now + 300, formatted)
+                if len(_DDG_CACHE) > 512:
+                    _DDG_CACHE.popitem(last=False)
+                _hit_val = copy.deepcopy(formatted)
+    finally:
+        # outside lock: evict lock conditionnel (R3 sans race) - always
+        try:
+            if not lock.locked() and not getattr(lock, "_waiters", None):
+                _DDG_LOCKS.pop(kstr, None)
+            if len(_DDG_LOCKS) > 512:
+                oldest = next(iter(_DDG_LOCKS))
+                _DDG_LOCKS.pop(oldest, None)
+        except Exception:
+            try:
+                _DDG_LOCKS.pop(kstr, None)
+            except Exception:
+                pass
+    return _hit_val
 
 
-def _inject_search_results(body: dict, results: str, protocol: str):
-    """Inject search results as a system message in the request body."""
+async def _execute_web_fetch(url: str, prompt: str = "", timeout: int = 15, max_bytes: int = 12000, via_vpn: bool = False) -> str:
+    """Fetch URL with SSRF guard, redirect re-validation, content guards, sem."""
+    # clamps Q8A
+    try:
+        timeout = max(5, min(30, int(timeout)))
+    except Exception:
+        timeout = 15
+    try:
+        max_bytes = max(2000, min(50000, int(max_bytes)))
+    except Exception:
+        max_bytes = 12000
+    # SSRF initial - budgeted via outer wait_for, no inner wait_for
+    if not await _is_safe_fetch_url(url):
+        raise ValueError(f"SSRF rejected: {url}")
+    proxy = get_socks5_proxy_url() if via_vpn else None
+    async with FETCH_SEM:
+        async with httpx.AsyncClient(follow_redirects=False, timeout=timeout, proxy=proxy) as c:
+            r = await c.get(url, headers={"User-Agent": "opencode-proxy/1.0"})
+            for _ in range(3):
+                if r.status_code in (301, 302, 303, 307, 308):
+                    loc = r.headers.get("location", "")
+                    nxt = urllib.parse.urljoin(url, loc)
+                    if not loc or not await _is_safe_fetch_url(nxt):
+                        raise ValueError(f"SSRF redirect rejected: {loc}")
+                    url = nxt
+                    r = await c.get(url, headers={"User-Agent": "opencode-proxy/1.0"})
+                else:
+                    break
+            # R4 guards
+            ct = r.headers.get("content-type", "").split(";")[0].strip().lower()
+            if ct and not (ct.startswith("text/") or "json" in ct or "xml" in ct):
+                raise ValueError(f"Rejected Content-Type: {ct}")
+            if int(r.headers.get("content-length", "0") or 0) > 5_000_000 or len(r.content) > 5_000_000:
+                raise ValueError("Content too large")
+            r.raise_for_status()
+            html = r.text[: max_bytes * 3]
+    # extraction to_thread
+    try:
+        import trafilatura
+
+        extracted = await asyncio.to_thread(trafilatura.extract, html) or ""
+    except ImportError:
+        extracted = ""
+    if not extracted:
+        try:
+            from bs4 import BeautifulSoup
+
+            extracted = await asyncio.to_thread(lambda: BeautifulSoup(html, "html.parser").get_text(separator="\n", strip=True))
+        except ImportError:
+            extracted = re.sub(r"<[^>]+>", " ", html)
+    extracted = extracted[:max_bytes].strip()
+    return f"Content of {url} (extracted {len(extracted)} chars):\n{extracted}"
+
+
+def _inject_as_user_prefix(body: dict, content: str, protocol: str, tag: str):
+    """Inject as user prefix split protocol R5: anthropic pos0, openai pos1 if system."""
+    block = f"<{tag}>\n{content}\n</{tag}>"
+    msgs = body.get("messages", [])
+    if not isinstance(msgs, list):
+        msgs = []
+        body["messages"] = msgs
     if protocol == "anthropic":
-        existing = body.get("system", "")
-        if isinstance(existing, str):
-            body["system"] = results + "\n\n" + existing if existing else results
-        elif isinstance(existing, list):
-            body["system"] = [{"type": "text", "text": results}] + existing
+        pos = 0
     else:
-        # OpenAI format — inject as system message at the beginning
-        messages = body.get("messages", [])
-        messages.insert(0, {"role": "system", "content": results})
-        body["messages"] = messages
+        pos = 1 if msgs and isinstance(msgs[0], dict) and msgs[0].get("role") == "system" else 0
+    if protocol == "anthropic":
+        msgs.insert(pos, {"role": "user", "content": [{"type": "text", "text": block}]})
+    else:
+        msgs.insert(pos, {"role": "user", "content": block})
+    body["messages"] = msgs
+
+
+def _strip_web_tool(body: dict, protocol: str, name: str):
+    """Remove web_* tool and forced tool_choice."""
+    if "tools" in body and isinstance(body["tools"], list):
+        body["tools"] = [t for t in body["tools"] if _normalize_tool_name(t) != name]
+        if not body["tools"]:
+            try:
+                del body["tools"]
+            except KeyError:
+                pass
+    tc = body.get("tool_choice")
+    if isinstance(tc, dict):
+        # check if tc references the tool being stripped
+        tc_name = tc.get("name", "") or tc.get("function", {}).get("name", "")
+        # also check type containing web_*
+        tc_type = tc.get("type", "")
+        is_target = False
+        if _normalize_tool_name({"name": tc_name}) == name:
+            is_target = True
+        elif isinstance(tc_type, str) and name in tc_type:
+            is_target = True
+        # empty orphan -> auto
+        if not isinstance(tc_name, str) or not tc_name.strip():
+            if tc_type in ("tool", "function") and not tc_name.strip():
+                _debug(f"  [convert] _strip_web_tool: empty tool_choice name → auto")
+                body["tool_choice"] = "auto"
+                return
+        if is_target and tc.get("type") in ("tool", "function"):
+            try:
+                del body["tool_choice"]
+            except KeyError:
+                pass
+        # also strip type web_* without name
+        if isinstance(tc_type, str) and tc_type.startswith(name):
+            try:
+                del body["tool_choice"]
+            except KeyError:
+                pass
 
 
 def _strip_web_search_tool(body: dict, protocol: str):
-    """Remove web_search tool and forced tool_choice from the body."""
-    # Remove web_search from tools
-    if "tools" in body:
-        if protocol == "anthropic":
-            body["tools"] = [t for t in body["tools"] if t.get("name") != "web_search"]
-        else:
-            body["tools"] = [
-                t for t in body["tools"] if t.get("function", {}).get("name") != "web_search"
-            ]
-        if not body["tools"]:
-            del body["tools"]
+    return _strip_web_tool(body, protocol, "web_search")
 
-    # Remove forced tool_choice (+ orphan empty name → auto)
-    tc = body.get("tool_choice")
-    if isinstance(tc, dict):
-        _tc_name = tc.get("name", "") or tc.get("function", {}).get("name", "")
-        if not isinstance(_tc_name, str) or not _tc_name.strip():
-            # Empty tool_choice name (B2b) — reset to auto (orphan after web_search strip)
-            _debug("  [convert] _strip_web_search_tool: empty tool_choice name → auto")
-            body["tool_choice"] = "auto"
-        else:
-            is_forced_web_search = (
-                tc.get("type") == "tool" and tc.get("name") == "web_search"
-            ) or (
-                tc.get("type") == "function" and tc.get("function", {}).get("name") == "web_search"
-            )
-            if is_forced_web_search:
-                del body["tool_choice"]
+
+def _is_web_tool_native(model_id: str) -> bool:
+    """Check if model natively supports web_search (capabilities + allowlist)."""
+    # allowlist fallback
+    try:
+        from config.settings import WEB_SEARCH_NATIVE_MODELS as _ALLOW
+    except ImportError:
+        _ALLOW = ["muse-spark-1.2-contributor", "muse-spark-1.2-contributor-free"]
+    if model_id in _ALLOW:
+        return True
+    # capabilities live
+    try:
+        cfg = get_model_config(model_id)
+        caps = cfg.get("capabilities") if isinstance(cfg, dict) else None
+        if isinstance(caps, dict) and caps.get("web-search"):
+            return True
+        # also check dashboard/quota capabilities if available
+        try:
+            from dashboard.quota import get_model_capabilities_for_all  # type: ignore
+
+            all_caps = get_model_capabilities_for_all()
+            if isinstance(all_caps, dict):
+                mc = all_caps.get(model_id, {})
+                if isinstance(mc, dict) and mc.get("web-search"):
+                    return True
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return False
 
 
 async def _handle_web_search(body: dict, model_id: str, protocol: str) -> bool:
-    """Handle web_search tool by executing locally or routing to a compatible model.
-
-    Returns True if the request was handled locally (caller should return synthetic response).
-    Returns False if the request should proceed normally to upstream.
-    """
-    if not _is_web_search_forced(body, protocol):
+    """Handle web_search tool (Q1A auto + passthrough)."""
+    # R6 kill-switch
+    if not yaml_get("web_search", "enabled", True):
+        if _has_tool(body, "web_search"):
+            _strip_web_tool(body, protocol, "web_search")
+            _log(f"  WEB SEARCH: disabled via config → stripped")
         return False
-
+    if not _has_tool(body, "web_search"):
+        return False
+    # forced detection via tool_choice normalized
+    is_forced = False
+    tc = body.get("tool_choice")
+    if isinstance(tc, dict):
+        tc_name = tc.get("name", "") or tc.get("function", {}).get("name", "")
+        if _normalize_tool_name({"name": tc_name}) == "web_search" and tc.get("type") in ("tool", "function"):
+            is_forced = True
+    is_auto = _is_tool_choice_auto(body)
+    # passthrough if native
     mode = yaml_get("web_search", "mode", "duckduckgo")
     target_model = yaml_get("web_search", "target_model", None)
     max_results = yaml_get("web_search", "max_results", 5)
-    query = _extract_search_query(body)
-
-    _debug(f"  [web-search] mode={mode} model={model_id} query={query[:80]}...")
-
-    if mode == "duckduckgo":
-        # Execute search locally and inject results (offload to thread to avoid blocking event loop)
-        results = await asyncio.to_thread(_execute_ddg_search, query, max_results)
-        _inject_search_results(body, results, protocol)
-        _strip_web_search_tool(body, protocol)
-        _log(f"  WEB SEARCH: DuckDuckGo query='{query[:60]}' → injected results")
-        return False  # Let upstream process the request with search context
-
-    elif mode == "model" and target_model:
-        # Replace model with one that supports web_search
-        body["model"] = target_model
-        _log(f"  WEB SEARCH: routed to {target_model} for web_search")
-        return False  # Let upstream process with the compatible model
-
-    elif mode == "ddg_then_model" and target_model:
-        # Try DuckDuckGo first, fallback to model on failure (offload to thread)
-        results = await asyncio.to_thread(_execute_ddg_search, query, max_results)
-        if "error" in results.lower() or "no results" in results.lower():
-            body["model"] = target_model
-            _log(f"  WEB SEARCH: DDG failed, routed to {target_model}")
-        else:
-            _inject_search_results(body, results, protocol)
-            _strip_web_search_tool(body, protocol)
-            _log(f"  WEB SEARCH: DuckDuckGo query='{query[:60]}' → injected results")
+    timeout = yaml_get("web_search", "timeout", 10)
+    via_vpn = bool(yaml_get("web_search", "via_vpn", False))
+    # validate target_model
+    if target_model and target_model not in MODELS:
+        _log(f"  WEB SEARCH: target_model {target_model!r} not in MODELS → ignore")
+        target_model = None
+    if mode not in ("duckduckgo", "model", "ddg_then_model", "model_then_ddg"):
+        _log(f"  WEB SEARCH: invalid mode {mode!r} → strip")
+        _strip_web_tool(body, protocol, "web_search")
         return False
-
-    elif mode == "model_then_ddg":
-        # Let upstream try first (will handle via 400 fallback)
+    # passthrough decision Q4A
+    is_native = _is_web_tool_native(model_id)
+    if is_native:
+        _log(f"  WEB SEARCH: passthrough to native model {model_id}")
+        return False
+    # non-native → local or model routing
+    # if mode == model → route
+    if mode == "model":
+        if target_model and not _is_web_tool_native(target_model):
+            _log(f"  WEB SEARCH: target {target_model} also non-native but routing anyway")
+        if target_model:
+            body["model"] = target_model
+            _log(f"  WEB SEARCH: routed to {target_model} for web_search")
+        else:
+            _strip_web_tool(body, protocol, "web_search")
+            _log(f"  WEB SEARCH: stripped (model mode but no target)")
+        return False
+    if mode == "model_then_ddg":
         if target_model:
             body["model"] = target_model
         _log("  WEB SEARCH: model-first for web_search (fallback=DDG)")
         return False
-
-    # Default: strip the tool and let upstream handle without it
-    _strip_web_search_tool(body, protocol)
-    _log(f"  WEB SEARCH: stripped web_search tool (mode={mode})")
+    # duckduckgo and ddg_then_model → local execution
+    query = _extract_search_query(body)
+    if not query.strip():
+        _log(f"  WEB SEARCH: empty query → stripped")
+        _strip_web_tool(body, protocol, "web_search")
+        return False
+    _debug(f"  [web-search] mode={mode} model={model_id} query={query[:80]}...")
+    # clamp
+    try:
+        max_results = max(1, min(10, int(max_results)))
+    except Exception:
+        max_results = 5
+    try:
+        timeout = max(5, min(30, int(timeout)))
+    except Exception:
+        timeout = 10
+    proxy = get_socks5_proxy_url() if via_vpn else None
+    # execute with retry 1x TimeoutError
+    for attempt in range(2):
+        try:
+            results = await _execute_ddg_search(query, max_results, timeout, proxy)
+            # success
+            _inject_as_user_prefix(body, results, protocol, "local_search_results")
+            _strip_web_tool(body, protocol, "web_search")
+            _log(f"  WEB SEARCH: DuckDuckGo query='{query[:60]}' → injected results")
+            return False
+        except asyncio.TimeoutError:
+            if attempt == 0:
+                await asyncio.sleep(0.3)
+                continue
+            _log(f"  WEB SEARCH: DDG TimeoutError query='{query[:60]}' → stripped (on_error: strip)")
+            _strip_web_tool(body, protocol, "web_search")
+            return False
+        except ImportError as e:
+            _log(f"  WEB SEARCH: ImportError {e} → strip/fallback")
+            if target_model and mode == "ddg_then_model":
+                body["model"] = target_model
+                _log(f"  WEB SEARCH: DDG import failed, routed to {target_model}")
+            else:
+                _strip_web_tool(body, protocol, "web_search")
+            return False
+        except Exception as e:
+            # check if ddg_then_model fallback
+            if mode == "ddg_then_model" and target_model:
+                body["model"] = target_model
+                _log(f"  WEB SEARCH: DDG failed ({e}), routed to {target_model}")
+                return False
+            _log(f"  WEB SEARCH: DDG error {type(e).__name__}: {e} → stripped")
+            _strip_web_tool(body, protocol, "web_search")
+            return False
+    _strip_web_tool(body, protocol, "web_search")
     return False
+
+
+def _extract_fetch_url(body: dict) -> str:
+    """Extract URL for web_fetch Q2A: tool_use.input.url priority, else last user http."""
+    # check tool_use input
+    for msg in body.get("messages", []) or []:
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "tool_use" and _normalize_tool_name(block) == "web_fetch":
+                    url = block.get("input", {}).get("url", "")
+                    if isinstance(url, str) and url.strip().startswith("http"):
+                        return url.strip()
+        # also check assistant tool_calls
+        if msg.get("tool_calls"):
+            for tc in msg.get("tool_calls", []):
+                fn = tc.get("function", {})
+                if _normalize_tool_name(fn) == "web_fetch":
+                    try:
+                        args = json.loads(fn.get("arguments", "{}"))
+                        url = args.get("url", "")
+                        if isinstance(url, str) and url.strip().startswith("http"):
+                            return url.strip()
+                    except Exception:
+                        pass
+    # fallback: last user message http
+    for msg in reversed(body.get("messages", []) or []):
+        if msg.get("role") == "user":
+            c = msg.get("content", "")
+            txt = ""
+            if isinstance(c, str):
+                txt = c
+            elif isinstance(c, list):
+                for b in c:
+                    if isinstance(b, dict) and b.get("type") == "text":
+                        txt = b.get("text", "")
+                        break
+            if txt:
+                m = re.search(r"https?://\S+", txt)
+                if m:
+                    return m.group(0).strip().rstrip(".,)\"'")
+    return ""
+
+
+async def _handle_web_fetch(body: dict, model_id: str, protocol: str) -> bool:
+    """Handle web_fetch Q2A URL-gated."""
+    if not yaml_get("web_fetch", "enabled", True):
+        if _has_tool(body, "web_fetch"):
+            _strip_web_tool(body, protocol, "web_fetch")
+            _log(f"  WEB FETCH: disabled via config → stripped")
+        return False
+    if not _has_tool(body, "web_fetch"):
+        return False
+    # detect forced vs auto
+    tc = body.get("tool_choice")
+    is_forced = False
+    if isinstance(tc, dict):
+        tc_name = tc.get("name", "") or tc.get("function", {}).get("name", "")
+        if _normalize_tool_name({"name": tc_name}) == "web_fetch" and tc.get("type") in ("tool", "function"):
+            is_forced = True
+    is_auto = _is_tool_choice_auto(body)
+    # URL-gated for auto
+    url = _extract_fetch_url(body)
+    prompt = ""
+    # extract prompt from tool_use input if present
+    for msg in body.get("messages", []) or []:
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "tool_use" and _normalize_tool_name(block) == "web_fetch":
+                    prompt = block.get("input", {}).get("prompt", "") or ""
+    if not url and is_auto:
+        # Q2A: no URL in last user → passthrough (strip)
+        _log(f"  WEB FETCH: auto but no URL found → stripped (Q2A)")
+        _strip_web_tool(body, protocol, "web_fetch")
+        return False
+    if not url:
+        # try extract from last user anyway for forced
+        url = _extract_fetch_url(body)
+        if not url:
+            _log(f"  WEB FETCH: no URL → stripped")
+            _strip_web_tool(body, protocol, "web_fetch")
+            return False
+    mode = yaml_get("web_fetch", "mode", "direct")
+    target_model = yaml_get("web_fetch", "target_model", None)
+    timeout = yaml_get("web_fetch", "timeout", 15)
+    max_bytes = yaml_get("web_fetch", "max_bytes", 12000)
+    via_vpn = bool(yaml_get("web_fetch", "via_vpn", False))
+    if target_model and target_model not in MODELS:
+        _log(f"  WEB FETCH: target_model {target_model!r} not in MODELS → ignore")
+        target_model = None
+    if mode not in ("direct", "model", "direct_then_model"):
+        _log(f"  WEB FETCH: invalid mode {mode!r} → strip")
+        _strip_web_tool(body, protocol, "web_fetch")
+        return False
+    # passthrough if native? For fetch, assume not native unless allowlist
+    is_native = _is_web_tool_native(model_id)  # reuse same
+    if is_native and mode != "direct":
+        _log(f"  WEB FETCH: passthrough to native model {model_id}")
+        return False
+    if mode == "model":
+        if target_model:
+            body["model"] = target_model
+            _log(f"  WEB FETCH: routed to {target_model}")
+        else:
+            _strip_web_tool(body, protocol, "web_fetch")
+        return False
+    # direct and direct_then_model → local
+    try:
+        timeout = max(5, min(30, int(timeout)))
+    except Exception:
+        timeout = 15
+    try:
+        max_bytes = max(2000, min(50000, int(max_bytes)))
+    except Exception:
+        max_bytes = 12000
+    # outer wait_for budget unique
+    async def _inner():
+        return await _execute_web_fetch(url, prompt, timeout, max_bytes, via_vpn)
+
+    try:
+        content = await asyncio.wait_for(_inner(), timeout + 2)
+        _inject_as_user_prefix(body, content, protocol, "local_fetch_content")
+        _strip_web_tool(body, protocol, "web_fetch")
+        _log(f"  WEB FETCH: fetched {url[:60]} → injected {len(content)} chars")
+        return False
+    except asyncio.TimeoutError:
+        _log(f"  WEB FETCH: TimeoutError url={url[:60]} → stripped")
+        _strip_web_tool(body, protocol, "web_fetch")
+        return False
+    except Exception as e:
+        _log(f"  WEB FETCH: error {type(e).__name__}: {e} → stripped (on_error: strip)")
+        if mode == "direct_then_model" and target_model:
+            body["model"] = target_model
+            _log(f"  WEB FETCH: direct failed, routed to {target_model}")
+            return False
+        _strip_web_tool(body, protocol, "web_fetch")
+        return False
 
 
 # ── Protocol mapping (single source: protocol_mapping.py) ──
@@ -5861,8 +6832,9 @@ async def messages(request: Request):
 
     # Tool filtering removed — all tools are forwarded as-is
 
-    # Handle web_search tool (DuckDuckGo or model routing)
+    # Handle web_search / web_fetch (v3.3)
     await _handle_web_search(body, model_id, protocol)
+    await _handle_web_fetch(body, model_id, protocol)
 
     # Extract thinking for logging
     thinking = body.get("thinking", {})
@@ -8045,8 +9017,9 @@ async def chat_completions(request: Request):
             if effort == "none":
                 effort = _mapped_effort
 
-    # Handle web_search tool (DuckDuckGo or model routing)
+    # Handle web_search / web_fetch (v3.3)
     await _handle_web_search(body, model_id, protocol)
+    await _handle_web_fetch(body, model_id, protocol)
     # ── Orphan guard (handler-level) ──
     if isinstance(body, dict):
         if "messages" in body:
@@ -9726,8 +10699,16 @@ async def responses(request: Request):
 
     # Tool filtering removed — all tools are forwarded as-is
 
-    # Handle web_search tool (DuckDuckGo or model routing)
-    await _handle_web_search(anthro_body, model_id, "anthropic")
+    # Handle web_search / web_fetch (v3.3) — F3 protocol-correct
+    if protocol == "anthropic":
+        await _handle_web_search(anthro_body, model_id, "anthropic")
+        await _handle_web_fetch(anthro_body, model_id, "anthropic")
+    else:
+        await _handle_web_search(body, model_id, "openai")
+        await _handle_web_fetch(body, model_id, "openai")
+        # resync anthro_body from mutated body (F3)
+        anthro_body = openai_responses_to_anthropic(body)
+        anthro_body["model"] = model_id
     # ── Orphan guard (handler-level) ──
     if isinstance(body, dict):
         if "messages" in body:

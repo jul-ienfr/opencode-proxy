@@ -31,6 +31,7 @@ from .settings import SORTED_CUSTOM_ROUTES as SORTED_CUSTOM_ROUTES
 from .settings import SORTED_GEO_POLICIES as SORTED_GEO_POLICIES
 from .settings import SORTED_ROUTES as SORTED_ROUTES
 from .settings import WEB_PORT as WEB_PORT
+from .settings import WEB_SEARCH_NATIVE_MODELS as WEB_SEARCH_NATIVE_MODELS
 from .settings import _free_endpoint_for as _free_endpoint_for
 from .settings import _normalize_geo_list as _normalize_geo_list
 from .settings import _resolve_geo_extends as _resolve_geo_extends
@@ -82,6 +83,7 @@ __all__ = [
     "SORTED_GEO_POLICIES",
     "SORTED_ROUTES",
     "WEB_PORT",
+    "WEB_SEARCH_NATIVE_MODELS",
     "_free_endpoint_for",
     "_normalize_geo_list",
     "_resolve_geo_extends",

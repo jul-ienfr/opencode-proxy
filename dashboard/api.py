@@ -1302,6 +1302,31 @@ def register_dashboard(
             return JSONResponse(status_code=500, content={"error": str(e)})
         return {"ok": True, "enabled": False}
 
+    @app.get("/api/geo/notifications")
+    async def get_geo_notifications(request: Request):
+        """Last geo fallback warnings (direct → VPN) for badge/tray toast polling."""
+        try:
+            import json as _js
+
+            p = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs", "geo_notifications.json")
+            if not os.path.exists(p):
+                return {"notifications": []}
+            with open(p, encoding="utf-8") as _f:
+                data = _js.load(_f) or []
+            # also enrich with live direct IP/country for current banner
+            try:
+                from opencode import _direct_country_cache, _direct_ip_cache
+
+                current = {
+                    "direct_country": _direct_country_cache.get("country", ""),
+                    "direct_ip": _direct_country_cache.get("ip", "") or _direct_ip_cache.get("ip", ""),
+                }
+            except Exception:
+                current = {}
+            return {"notifications": data[-20:], "current": current}
+        except Exception as e:
+            return {"notifications": [], "error": str(e)}
+
     @app.get("/api/config/custom-routes")
     async def get_custom_routes():
         return config_settings.CUSTOM_ROUTES
@@ -1318,19 +1343,45 @@ def register_dashboard(
 
     @app.get("/api/config/web-search")
     async def get_web_search_config():
-        from config import yaml_get
+        from config import yaml_get, WEB_SEARCH_NATIVE_MODELS
 
-        mode = yaml_get("web_search", "mode", "duckduckgo")
-        target_model = yaml_get("web_search", "target_model", None)
-        max_results = yaml_get("web_search", "max_results", 5)
-        timeout = yaml_get("web_search", "timeout", 10)
+        # web_search
+        ws_mode = yaml_get("web_search", "mode", "duckduckgo")
+        ws_target = yaml_get("web_search", "target_model", None)
+        ws_max = yaml_get("web_search", "max_results", 5)
+        ws_timeout = yaml_get("web_search", "timeout", 10)
+        ws_enabled = yaml_get("web_search", "enabled", True)
+        ws_via = yaml_get("web_search", "via_vpn", False)
+        ws_onerr = yaml_get("web_search", "on_error", "strip")
+        # web_fetch
+        wf_mode = yaml_get("web_fetch", "mode", "direct")
+        wf_target = yaml_get("web_fetch", "target_model", None)
+        wf_maxb = yaml_get("web_fetch", "max_bytes", 12000)
+        wf_timeout = yaml_get("web_fetch", "timeout", 15)
+        wf_enabled = yaml_get("web_fetch", "enabled", True)
+        wf_via = yaml_get("web_fetch", "via_vpn", False)
+        wf_onerr = yaml_get("web_fetch", "on_error", "strip")
         return {
-            "mode": mode,
-            "target_model": target_model,
-            "max_results": max_results,
-            "timeout": timeout,
+            "mode": ws_mode,
+            "target_model": ws_target,
+            "max_results": ws_max,
+            "timeout": ws_timeout,
+            "enabled": bool(ws_enabled),
+            "via_vpn": bool(ws_via),
+            "on_error": ws_onerr,
+            "web_fetch": {
+                "mode": wf_mode,
+                "target_model": wf_target,
+                "max_bytes": wf_maxb,
+                "timeout": wf_timeout,
+                "enabled": bool(wf_enabled),
+                "via_vpn": bool(wf_via),
+                "on_error": wf_onerr,
+            },
             "available_models": sorted(MODELS.keys()),
             "modes": ["duckduckgo", "model", "ddg_then_model", "model_then_ddg"],
+            "web_fetch_modes": ["direct", "model", "direct_then_model"],
+            "native_models": WEB_SEARCH_NATIVE_MODELS,
         }
 
     @app.post("/api/config/web-search")
@@ -1341,18 +1392,158 @@ def register_dashboard(
         body = await request.json()
         from config import yaml_set
 
+        # helper to coerce bool
+        def _to_bool(v):
+            if isinstance(v, bool):
+                return v
+            if isinstance(v, str):
+                return v.lower() in ("1", "true", "yes", "on")
+            return bool(v)
+
+        # web_search clamps
         if "mode" in body:
-            yaml_set("web_search", "mode", body["mode"])
+            m = str(body["mode"])
+            if m in ("duckduckgo", "model", "ddg_then_model", "model_then_ddg"):
+                yaml_set("web_search", "mode", m)
+            else:
+                _debug(f"  [config] web_search invalid mode {m!r} → ignored")
         if "target_model" in body:
-            yaml_set("web_search", "target_model", body["target_model"])
+            tm = body["target_model"]
+            if tm is None or tm in MODELS:
+                yaml_set("web_search", "target_model", tm)
+            else:
+                _debug(f"  [config] web_search invalid target_model {tm!r}")
         if "max_results" in body:
-            yaml_set("web_search", "max_results", int(body["max_results"]))
+            try:
+                v = max(1, min(10, int(body["max_results"])))
+                yaml_set("web_search", "max_results", v)
+            except Exception:
+                pass
         if "timeout" in body:
-            yaml_set("web_search", "timeout", int(body["timeout"]))
+            try:
+                v = max(5, min(30, int(body["timeout"])))
+                yaml_set("web_search", "timeout", v)
+            except Exception:
+                pass
+        if "enabled" in body:
+            yaml_set("web_search", "enabled", _to_bool(body["enabled"]))
+        if "via_vpn" in body:
+            yaml_set("web_search", "via_vpn", _to_bool(body["via_vpn"]))
+        if "on_error" in body and body["on_error"] == "strip":
+            yaml_set("web_search", "on_error", "strip")
+        # web_fetch via nested or flat
+        wf = body.get("web_fetch") if isinstance(body.get("web_fetch"), dict) else body
+        # detect if web_fetch fields present
+        if isinstance(wf, dict):
+            if "mode" in wf and wf is not body:
+                m = str(wf["mode"])
+                if m in ("direct", "model", "direct_then_model"):
+                    yaml_set("web_fetch", "mode", m)
+            elif "web_fetch_mode" in body:
+                m = str(body["web_fetch_mode"])
+                if m in ("direct", "model", "direct_then_model"):
+                    yaml_set("web_fetch", "mode", m)
+            # flat keys for web_fetch with prefix
+            if "web_fetch_target_model" in body:
+                tm = body["web_fetch_target_model"]
+                if tm is None or tm in MODELS:
+                    yaml_set("web_fetch", "target_model", tm)
+            if "target_model" in wf and wf is not body and "web_fetch" in body:
+                tm = wf["target_model"]
+                if tm is None or tm in MODELS:
+                    yaml_set("web_fetch", "target_model", tm)
+            if "max_bytes" in wf:
+                try:
+                    v = max(2000, min(50000, int(wf["max_bytes"])))
+                    yaml_set("web_fetch", "max_bytes", v)
+                except Exception:
+                    pass
+            if "web_fetch_max_bytes" in body:
+                try:
+                    v = max(2000, min(50000, int(body["web_fetch_max_bytes"])))
+                    yaml_set("web_fetch", "max_bytes", v)
+                except Exception:
+                    pass
+            if "timeout" in wf and wf is not body:
+                try:
+                    v = max(5, min(30, int(wf["timeout"])))
+                    yaml_set("web_fetch", "timeout", v)
+                except Exception:
+                    pass
+            if "web_fetch_timeout" in body:
+                try:
+                    v = max(5, min(30, int(body["web_fetch_timeout"])))
+                    yaml_set("web_fetch", "timeout", v)
+                except Exception:
+                    pass
+            if "enabled" in wf and wf is not body:
+                yaml_set("web_fetch", "enabled", _to_bool(wf["enabled"]))
+            if "web_fetch_enabled" in body:
+                yaml_set("web_fetch", "enabled", _to_bool(body["web_fetch_enabled"]))
+            if "via_vpn" in wf and wf is not body:
+                yaml_set("web_fetch", "via_vpn", _to_bool(wf["via_vpn"]))
+            if "web_fetch_via_vpn" in body:
+                yaml_set("web_fetch", "via_vpn", _to_bool(body["web_fetch_via_vpn"]))
+            if "on_error" in wf and wf is not body and wf["on_error"] == "strip":
+                yaml_set("web_fetch", "on_error", "strip")
         _debug(
-            f"  [config] web search updated: mode={body.get('mode')}, model={body.get('target_model')}"
+            f"  [config] web search updated: mode={body.get('mode')}, model={body.get('target_model')} web_fetch={body.get('web_fetch')}"
         )
         return {"status": "ok", "message": "Web search config updated."}
+
+    @app.get("/api/config/web-fetch")
+    async def get_web_fetch_config():
+        from config import yaml_get, WEB_SEARCH_NATIVE_MODELS
+
+        return {
+            "mode": yaml_get("web_fetch", "mode", "direct"),
+            "target_model": yaml_get("web_fetch", "target_model", None),
+            "max_bytes": yaml_get("web_fetch", "max_bytes", 12000),
+            "timeout": yaml_get("web_fetch", "timeout", 15),
+            "enabled": bool(yaml_get("web_fetch", "enabled", True)),
+            "via_vpn": bool(yaml_get("web_fetch", "via_vpn", False)),
+            "on_error": yaml_get("web_fetch", "on_error", "strip"),
+            "available_models": sorted(MODELS.keys()),
+            "modes": ["direct", "model", "direct_then_model"],
+            "native_models": WEB_SEARCH_NATIVE_MODELS,
+        }
+
+    @app.post("/api/config/web-fetch")
+    async def update_web_fetch_config(request: Request):
+        err = _check_dashboard_token(request)
+        if err:
+            return err
+        body = await request.json()
+        from config import yaml_set
+
+        def _to_bool2(v):
+            if isinstance(v, bool):
+                return v
+            if isinstance(v, str):
+                return v.lower() in ("1", "true", "yes", "on")
+            return bool(v)
+
+        if "mode" in body and str(body["mode"]) in ("direct", "model", "direct_then_model"):
+            yaml_set("web_fetch", "mode", str(body["mode"]))
+        if "target_model" in body and (body["target_model"] is None or body["target_model"] in MODELS):
+            yaml_set("web_fetch", "target_model", body["target_model"])
+        if "max_bytes" in body:
+            try:
+                yaml_set("web_fetch", "max_bytes", max(2000, min(50000, int(body["max_bytes"]))))
+            except Exception:
+                pass
+        if "timeout" in body:
+            try:
+                yaml_set("web_fetch", "timeout", max(5, min(30, int(body["timeout"]))))
+            except Exception:
+                pass
+        if "enabled" in body:
+            yaml_set("web_fetch", "enabled", _to_bool2(body["enabled"]))
+        if "via_vpn" in body:
+            yaml_set("web_fetch", "via_vpn", _to_bool2(body["via_vpn"]))
+        if "on_error" in body and body["on_error"] == "strip":
+            yaml_set("web_fetch", "on_error", "strip")
+        return {"status": "ok", "message": "Web fetch config updated."}
 
     @app.get("/api/config/api-keys")
     async def get_api_keys_config(request: Request):
@@ -2889,6 +3080,47 @@ def register_dashboard(
         for m in managers:
             m.proxy_mode = mode
         _persist_vpn_config({"proxy_mode": mode})
+        # When switching from direct → vpn/socks5, the boot gate
+        # `vpn_manager.start()` only dials when proxy_mode==vpn, so
+        # stations 2..N that were left disconnected in direct must be
+        # resurrected now. Fire-and-forget start() for every enabled
+        # manager that is not already connected; fail-soft (docker down
+        # must not block the API).
+        if mode in ("vpn", "socks5"):
+            try:
+                import asyncio as _aio
+
+                # Ensure every configured station (station_count) is present.
+                # If the registry is short (e.g. boot direct with 1), rebuild
+                # it via _apply_station_count to restore the missing managers.
+                try:
+                    from config.settings import resolved_station_count as _rsc
+                    import config.settings as _cs
+
+                    want = _rsc(getattr(_cs, "IP_ROTATION", {}) or {})
+                    have = len(managers)
+                    if want > have:
+                        from opencode import _apply_station_count as _asc
+
+                        await _asc(want)
+                        # re-read after upscale
+                        managers = _dashboard_managers()
+                        for mm in managers:
+                            mm.proxy_mode = mode
+                except Exception as _e:
+                    _debug(f"  [vpn] proxy-mode upscale check failed: {_e}")
+                # Now ensure every enabled manager is at least started.
+                # start() is idempotent and triggers background connect when
+                # status != connected, so this resurrects the 2..N that
+                # stayed disconnected in direct.
+                for mm in managers:
+                    try:
+                        if getattr(mm, "enabled", True) and getattr(mm, "status", "disconnected") != "connected":
+                            await mm.start()
+                    except Exception as _e2:
+                        _debug(f"  [vpn] proxy-mode start station {getattr(mm, '_station', '?')} failed: {_e2}")
+            except Exception as _e:
+                _debug(f"  [vpn] proxy-mode resurrect failed: {_e}")
         return {"ok": True, "mode": mode}
 
     @app.get("/api/vpn/nordvpn-available")
@@ -3198,6 +3430,12 @@ def register_dashboard(
                     "free_ip": r["free_model_ip"]
                     if "free_model_ip" in r.keys() and r["free_model_ip"]
                     else "",
+                    "geo_country": r["geo_country"] if "geo_country" in r.keys() else None,
+                    "geo_blocked": bool(r["geo_blocked"]) if "geo_blocked" in r.keys() and r["geo_blocked"] else False,
+                    "geo_direct_country": r["geo_direct_country"] if "geo_direct_country" in r.keys() else None,
+                    "geo_direct_ip": r["geo_direct_ip"] if "geo_direct_ip" in r.keys() else None,
+                    "geo_via_vpn": bool(r["geo_via_vpn"]) if "geo_via_vpn" in r.keys() and r["geo_via_vpn"] else False,
+                    "geo_allowed": r["geo_allowed"] if "geo_allowed" in r.keys() else None,
                     "tools": json.loads(r["tools"])
                     if "tools" in r.keys() and r["tools"] and r["tools"] != "[]"
                     else [],

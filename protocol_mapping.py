@@ -442,8 +442,20 @@ def anthropic_to_openai(body: dict, model: str) -> dict:
 
     if "tools" in body:
         # Support both Anthropic format (name at top level) and OpenAI format (function.name)
+        # v3.3: preserve server tools (web_search/web_fetch) natively, fix else branch B4
         oai_tools = []
         for t in body["tools"]:
+            # Server tools: preserve natively if type is web_*
+            t_type = t.get("type", "")
+            if isinstance(t_type, str) and t_type.startswith("web_"):
+                # Keep server tool as-is (e.g., web_search_2025_03_05)
+                # If converting to OpenAI and target is anthropic-native, preserve; otherwise keep type
+                if "name" in t and t.get("name"):
+                    oai_tools.append({"type": t_type, "name": t.get("name"), "description": t.get("description", ""), "input_schema": t.get("input_schema", {})})
+                else:
+                    # type without name, e.g., {"type":"web_search_2025_03_05"} -> keep
+                    oai_tools.append({"type": t_type, "name": t.get("name", "web_search")})
+                continue
             if "name" in t:
                 # Anthropic format: {"name": "...", "description": "...", "input_schema": {...}}
                 oai_tools.append(
@@ -470,18 +482,26 @@ def anthropic_to_openai(body: dict, model: str) -> dict:
                     }
                 )
             else:
-                # Unknown format, try best effort
-                oai_tools.append(
-                    {
-                        "type": "function",
-                        "function": {
-                            "name": t.get("name", ""),
-                            "description": t.get("description", ""),
-                            "parameters": t.get("input_schema", t.get("parameters", {})),
-                        },
-                    }
-                )
-        oai["tools"] = oai_tools
+                # Unknown format: B4 fix - don't produce {"name":""}; check if web_* type without name
+                if isinstance(t_type, str) and t_type.startswith("web_"):
+                    oai_tools.append({"type": t_type, "name": t.get("name", "web_search")})
+                elif t.get("name"):
+                    oai_tools.append(
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": t.get("name", ""),
+                                "description": t.get("description", ""),
+                                "parameters": t.get("input_schema", t.get("parameters", {})),
+                            },
+                        }
+                    )
+                else:
+                    # skip invalid tool without name
+                    _debug(f"  [convert] SKIP tool without name type={t_type!r}")
+                    continue
+        if oai_tools:
+            oai["tools"] = oai_tools
         tc = body.get("tool_choice", "auto")
         if isinstance(tc, dict):
             tc_type = tc.get("type", "auto")
@@ -704,17 +724,47 @@ def openai_to_anthropic_request(oai_body: dict) -> dict:
         if key in oai_body:
             result[anthro_key] = oai_body[key]
 
-    # Convert tools
+    # Convert tools - v3.3: preserve server tools B4
     if "tools" in oai_body:
-        result["tools"] = [
-            {
-                "name": t["function"]["name"],
-                "description": t["function"].get("description", ""),
-                "input_schema": t["function"].get("parameters", {}),
-            }
-            for t in oai_body["tools"]
-            if t.get("type") == "function"
-        ]
+        anthro_tools = []
+        for t in oai_body["tools"]:
+            t_type = t.get("type", "")
+            # Server tools (web_search/web_fetch) - preserve
+            if isinstance(t_type, str) and t_type.startswith("web_"):
+                # OpenAI server tool format: {"type":"web_search_2025_03_05", "name":"web_search"} or similar
+                name = t.get("name") or t.get("function", {}).get("name", "web_search")
+                # normalize
+                if "web_search" in t_type:
+                    name = "web_search"
+                elif "web_fetch" in t_type:
+                    name = "web_fetch"
+                anthro_tools.append({"name": name, "description": t.get("description", ""), "input_schema": t.get("input_schema", t.get("parameters", {}))})
+                continue
+            if t.get("type") == "function":
+                fn = t.get("function", {})
+                if not fn.get("name"):
+                    _debug(f"  [convert] SKIP function tool without name")
+                    continue
+                anthro_tools.append(
+                    {
+                        "name": fn.get("name", ""),
+                        "description": fn.get("description", ""),
+                        "input_schema": fn.get("parameters", {}),
+                    }
+                )
+            elif "function" in t:
+                fn = t["function"]
+                if not fn.get("name"):
+                    continue
+                anthro_tools.append(
+                    {
+                        "name": fn["name"],
+                        "description": fn.get("description", ""),
+                        "input_schema": fn.get("parameters", {}),
+                    }
+                )
+        if anthro_tools:
+            result["tools"] = anthro_tools
 
         # Convert tool_choice
         tc = oai_body.get("tool_choice", "auto")

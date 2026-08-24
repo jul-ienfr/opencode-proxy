@@ -845,6 +845,11 @@ try:
 except Exception as e:
     logger.debug("[config] impossible de lancer le thread upstream: %s", e)
 
+# ── Web search native allowlist (v3.3) ─────────────────────────
+WEB_SEARCH_NATIVE_MODELS: list = yaml_get("web_search_native", default=["muse-spark-1.2-contributor", "muse-spark-1.2-contributor-free"])
+if not isinstance(WEB_SEARCH_NATIVE_MODELS, list):
+    WEB_SEARCH_NATIVE_MODELS = ["muse-spark-1.2-contributor", "muse-spark-1.2-contributor-free"]
+
 # ── Free discovery (auto-detect -free models) ─────────────────────
 FREE_DISCOVERY = (
     yaml_get("free_discovery", default={})
@@ -1439,7 +1444,8 @@ def maybe_reload_custom_routes():
         GEO_ENABLED, \
         GEO_VERSION, \
         GEO_ALLOW_DIRECT_WHEN_COMPATIBLE, \
-        FREE_PARALLEL
+        FREE_PARALLEL, \
+        WEB_SEARCH_NATIVE_MODELS
     now = time.time()
     if now - _custom_routes_last_check < _CUSTOM_ROUTES_CHECK_INTERVAL:
         return
@@ -1517,6 +1523,13 @@ def maybe_reload_custom_routes():
                     GEO_ALLOW_DIRECT_WHEN_COMPATIBLE = bool(
                         geo_sec.get("allow_direct_when_compatible", True)
                     )
+                    # v3.3: WEB_SEARCH_NATIVE_MODELS hot-reload
+                    try:
+                        new_wsn = new_yaml.get("web_search_native", ["muse-spark-1.2-contributor", "muse-spark-1.2-contributor-free"])
+                        if isinstance(new_wsn, list) and new_wsn:
+                            WEB_SEARCH_NATIVE_MODELS[:] = new_wsn
+                    except Exception:
+                        pass
                     # P2: server_countries change → regen .env via make_credentials_env
                     try:
                         _old_sc = IP_ROTATION.get("server_countries", "")

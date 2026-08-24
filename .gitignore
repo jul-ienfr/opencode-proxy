@@ -64,5 +64,8 @@ tmp/
 tests/_*.txt
 *_diff_tmp.txt
 
+# AI transcripts / temp extracts at repo root (plan v10 §14.4.6)
+_tmp_*
+
 # Kilo Code
 .kilo/
