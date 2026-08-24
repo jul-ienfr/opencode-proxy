@@ -40,7 +40,17 @@ x-gluetun-multi-env: &gluetun-multi-env
   UPDATER_PERIOD: 480h
   HTTPPROXY: 'on'
   SOCKS5_ENABLED: 'on'
-  DNS_OVER_TLS: 'on'
+  # [incident v10] DoT par défaut de cette image flanche à travers certains
+  # tunnels WG -> résolutions intermittentes -> probes proxy en erreur.
+  # Plain UDP 53 vers 1.1.1.1 dans le tunnel : fiable.
+  # (DNS_ADDRESS marche mais est legacy — nom moderne ci-dessous.)
+  DNS_UPSTREAM_PLAIN_ADDRESSES: 1.1.1.1:53
+  # [incident v10] PMTUD échoue systématiquement sur ce réseau (ICMP+TCP) ->
+  # MTU retombé à 1320 insuffisant : les gros paquets TLS des probes
+  # black-holent -> stations en error intermittentes. Knob officiel FAQ
+  # healthcheck : baisser le MTU explicitement.
+  WIREGUARD_MTU: '1280'
+  OPENVPN_MSSFIX: '1280'
   FIREWALL: 'on'
   PUID: '1000'
   PGID: '1000'
@@ -164,7 +174,11 @@ services:
       - HTTPPROXY_LISTENING_ADDRESS=:8888
       - SOCKS5_ENABLED=on
       - SOCKS5_LISTENING_ADDRESS=:1080
-      - DNS_OVER_TLS=on
+      - DNS_ADDRESS=1.1.1.1
+      # [incident v10] blocs littéraux st1/st2 : le MTU de l'ancre partagée
+      # n'atteint pas ces services — TLS black-holait au-delà de ~1300 octets.
+      - WIREGUARD_MTU=1280
+      - OPENVPN_MSSFIX=1280
       - FIREWALL=on
       - PUID=1000
       - PGID=1000
@@ -255,7 +269,9 @@ services:
       - HTTPPROXY_LISTENING_ADDRESS=:8889
       - SOCKS5_ENABLED=on
       - SOCKS5_LISTENING_ADDRESS=:1081
-      - DNS_OVER_TLS=on
+      - DNS_ADDRESS=1.1.1.1
+      - WIREGUARD_MTU=1280
+      - OPENVPN_MSSFIX=1280
       - FIREWALL=on
       - PUID=1000
       - PGID=1000
@@ -484,7 +500,7 @@ services:
       - HTTPPROXY_LISTENING_ADDRESS=:8898
       - SOCKS5_ENABLED=on
       - SOCKS5_LISTENING_ADDRESS=:1090
-      - DNS_OVER_TLS=on
+      - DNS_ADDRESS=1.1.1.1
       - FIREWALL=on
       - PUID=1000
       - PGID=1000

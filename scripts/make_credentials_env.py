@@ -131,11 +131,18 @@ def main() -> None:
             lines = f.read().strip().splitlines()
         if len(lines) < 2 or not lines[0].strip() or not lines[1].strip():
             raise SystemExit(f"ERROR: {SRC} has no valid user/password (2 non-empty lines)")
-        with open(DST, "w", encoding="utf-8") as f:
-            f.write(f"OPENVPN_USER={lines[0].strip()}\n")
-            f.write(f"OPENVPN_PASSWORD={lines[1].strip()}\n")
-        os.chmod(DST, stat.S_IRUSR | stat.S_IWUSR)  # 0o600
-        print(f"OK: {DST} written (permissions 0600). Values never displayed.")
+        # [plan v10 Lot 6 — incident P0] UPSERT et plus OVERWRITE : l'ancien
+        # `open(DST,"w")` réécrivait credentials.env avec 2 lignes, effaçant
+        # VPN_CONTROL_API_KEY ET HTTP_CONTROL_SERVER_AUTH_DEFAULT_ROLE — les
+        # conteneurs recréés ensuite rejetaient leur PROPRE healthcheck en
+        # 401 (boucle unhealthy/churn infinie). Upsert = préserve tout le reste.
+        _upsert_env_var(DST, "OPENVPN_USER", lines[0].strip())
+        _upsert_env_var(DST, "OPENVPN_PASSWORD", lines[1].strip())
+        try:
+            os.chmod(DST, stat.S_IRUSR | stat.S_IWUSR)  # 0o600
+        except Exception:
+            pass  # Windows may not support chmod 0600
+        print(f"OK: {DST} upserted (other keys preserved). Values never displayed.")
         did_credentials = True
     else:
         print(f"INFO: {SRC} not found — skipping credentials.env generation (already migrated)")
