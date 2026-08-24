@@ -218,6 +218,11 @@ def free_cfg():
     # ensure known clean state for this test (station_count 2, free_parallel OFF)
     # otherwise a previous test file that changed station_count to 5 would leak
     oc.IP_ROTATION["station_count"] = 2
+    # [v10 §15.1.3 hermeticity] force strict_free OFF: the live IP_ROTATION dict
+    # is seeded from the machine's config.yaml (strict_free: true) and leaked
+    # into the "budget exhausted → paid fallback" tests. Tests wanting strict
+    # mode set it explicitly.
+    oc.IP_ROTATION["strict_free"] = False
     oc.IP_ROTATION["free_parallel"] = {
         "enabled": False,
         "routing": "round-robin",

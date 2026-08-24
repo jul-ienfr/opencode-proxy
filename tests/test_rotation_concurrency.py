@@ -510,7 +510,8 @@ def _light(mgr):
 def test_probe_timeout_then_ok_advances_sticky():
     mgr = _ProbeMgr(["timeout", "ok"])
     assert asyncio.run(_light(mgr)) is True
-    assert mgr.calls == [("http://a", 2.0), ("http://b", 2.0)]
+    # [v10 baseline] per-attempt cap raised 2.0 → 3.0 (vpn_manager min(3.0, budget))
+    assert mgr.calls == [("http://a", 3.0), ("http://b", 3.0)]
     assert mgr._ip_check_idx == 1, "sticky advance on a later endpoint"
 
 
@@ -520,7 +521,8 @@ def test_probe_timeout_only_gets_grace_attempt():
     answers here was never dead."""
     mgr = _ProbeMgr(["timeout", "timeout", "ok"])
     assert asyncio.run(_light(mgr)) is True
-    assert mgr.calls == [("http://a", 2.0), ("http://b", 2.0), ("http://a", 4.0)], (
+    # sweep burns 2×3.0 of the 8.0 budget → grace gets the 2.0 remainder
+    assert mgr.calls == [("http://a", 3.0), ("http://b", 3.0), ("http://a", 2.0)], (
         "grace uses budget - sweep cost"
     )
     assert mgr._ip_check_idx == 0, "grace does not advance the sticky index"
@@ -529,7 +531,7 @@ def test_probe_timeout_only_gets_grace_attempt():
 def test_probe_grace_fails_then_dead():
     mgr = _ProbeMgr(["timeout", "timeout", "timeout"])
     assert asyncio.run(_light(mgr)) is False
-    assert mgr.calls == [("http://a", 2.0), ("http://b", 2.0), ("http://a", 4.0)]
+    assert mgr.calls == [("http://a", 3.0), ("http://b", 3.0), ("http://a", 2.0)]
 
 
 def test_probe_refused_is_definitive_no_grace():
@@ -537,7 +539,7 @@ def test_probe_refused_is_definitive_no_grace():
     grace phase (only timeouts mean "might be slow")."""
     mgr = _ProbeMgr(["refused", "refused"])
     assert asyncio.run(_light(mgr)) is False
-    assert mgr.calls == [("http://a", 2.0), ("http://b", 2.0)], (
+    assert mgr.calls == [("http://a", 3.0), ("http://b", 3.0)], (
         "no third (grace) attempt after refused verdicts"
     )
 
@@ -547,25 +549,25 @@ def test_probe_error_is_definitive_no_grace():
     keeps the F2 offline tests' exact record assertions."""
     mgr = _ProbeMgr(["error", "error"])
     assert asyncio.run(_light(mgr)) is False
-    assert mgr.calls == [("http://a", 2.0), ("http://b", 2.0)]
+    assert mgr.calls == [("http://a", 3.0), ("http://b", 3.0)]
 
 
 def test_probe_refused_then_alive_falls_through():
     mgr = _ProbeMgr(["refused", "ok"])
     assert asyncio.run(_light(mgr)) is True
-    assert mgr.calls == [("http://a", 2.0), ("http://b", 2.0)]
+    assert mgr.calls == [("http://a", 3.0), ("http://b", 3.0)]
 
 
 def test_probe_grace_skipped_when_budget_exhausted():
-    """budget 3.0: the sweep (2 × 2.0) already burns more than the budget —
-    no leftover > 0.5 s → no grace attempt."""
+    """budget 3.0: per_attempt = min(3.0, budget) = 3.0 → the 2-endpoint sweep
+    consumes ≥ budget → no leftover > 0.5 s → no grace attempt."""
     mgr = _ProbeMgr(["timeout", "timeout"], budget=3.0)
     assert asyncio.run(_light(mgr)) is False
-    assert mgr.calls == [("http://a", 2.0), ("http://b", 2.0)]
+    assert mgr.calls == [("http://a", 3.0), ("http://b", 3.0)]
 
 
 def test_probe_single_endpoint_grace_uses_full_remaining():
-    """One-endpoint config: sweep cost 2.0, grace gets the rest (6.0)."""
+    """One-endpoint config: sweep cost 3.0, grace gets the rest (8−3 = 5.0)."""
     mgr = _ProbeMgr(["timeout", "ok"], urls=["http://a"])
     assert asyncio.run(_light(mgr)) is True
-    assert mgr.calls == [("http://a", 2.0), ("http://a", 6.0)]
+    assert mgr.calls == [("http://a", 3.0), ("http://a", 5.0)]
