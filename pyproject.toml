@@ -39,6 +39,11 @@ python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
 addopts = "-q --tb=short"
+# [plan v10 §4 Lot 0 t2] Marqueur pour les tests exigeant un daemon Docker live
+# (chaos tests Lot 2, e2e §13). Gate par défaut : `pytest -k "not docker" -q`.
+markers = [
+    "docker: requires a live Docker daemon — excluded from the default gate via -k 'not docker'",
+]
 
 [tool.coverage.run]
 source = ["."]
