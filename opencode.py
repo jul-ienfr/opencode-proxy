@@ -1573,11 +1573,25 @@ async def _apply_station_count(new_n: int) -> None:
                 # stopped/removed — a rotation must not land on a container
                 # that stop_container is about to delete.
                 await pool.cancel_rotations([m._station for m in managers[new_n:]])
-            # [fix] Parallélise les stops (même gain en downscale)
+            # [fix] Parallélise les stops (même gain en downscale) + garde-fou rm -f
             _retired = managers[new_n:]
             if _retired:
                 await asyncio.gather(*(m.stop() for m in _retired))
                 await asyncio.gather(*(m.stop_container() for m in reversed(_retired)))
+                # P2 garde-fou: orphan rm -f fallback (compose stop peut laisser Exited)
+                for m in _retired:
+                    try:
+                        import subprocess as _sp
+
+                        _sp.run(
+                            ["docker", "rm", "-f", m._docker_container],
+                            capture_output=True,
+                            timeout=10,
+                            creationflags=0x08000000 if __import__("sys").platform == "win32" else 0,
+                        )
+                    except Exception:
+                        pass
+                    _debug(f"  [vpn] orphan garde-fou rm -f {m._docker_container}")
             managers = managers[:new_n]
             shared_state.vpn_managers = managers
             pool = getattr(shared_state, "free_ip_pool", None)
@@ -1595,7 +1609,7 @@ async def _apply_station_count(new_n: int) -> None:
             _eff = effective_free_max_attempts()
             IP_ROTATION["max_free_attempts"] = _eff
         except Exception:
-            _eff = max(1, min(int(IP_ROTATION.get("max_free_attempts", 2) or 2), 3))
+            _eff = max(1, min(int(IP_ROTATION.get("max_free_attempts", 2) or 2), 5))
             IP_ROTATION["max_free_attempts"] = _eff
         from dashboard.api import _persist_vpn_config
 
@@ -3479,7 +3493,7 @@ def effective_free_max_attempts(forced_pool=None) -> int:
             v = int(IP_ROTATION.get("max_free_attempts", 2) or 2)
         except (TypeError, ValueError):
             v = 2
-        manual = max(1, min(v, 3))
+        manual = max(1, min(v, 5))
         # WARN when manual exceeds usable (only when we can compute usable)
         try:
             if _free_ip_pool is not None and getattr(_free_ip_pool, "socks5_mode", False):
@@ -3498,7 +3512,7 @@ def effective_free_max_attempts(forced_pool=None) -> int:
                     # only narrow, never widen (None-country stations stay usable)
                     if cnt < usable:
                         usable = cnt
-                usable = max(1, min(int(usable or 1), 3))
+                usable = max(1, min(int(usable or 1), 5))
             if manual > usable:
                 _debug(
                     f"  [free] WARN manual max_free_attempts={manual} > usable={usable} (auto=false) — clamping effective to {usable} would waste retries"
@@ -3530,10 +3544,10 @@ def effective_free_max_attempts(forced_pool=None) -> int:
                 # if pool has no stations yet (boot), keep resolved count
                 if cnt == 0 and n == 0:
                     n = _cfg_settings.resolved_station_count(IP_ROTATION)
-        return max(1, min(int(n or 1), 3))
+        return max(1, min(int(n or 1), 5))
     except Exception:
         try:
-            return max(1, min(int(_cfg_settings.resolved_station_count(IP_ROTATION) or 1), 3))
+            return max(1, min(int(_cfg_settings.resolved_station_count(IP_ROTATION) or 1), 5))
         except Exception:
             return 2
 

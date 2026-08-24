@@ -593,8 +593,8 @@ def _ensure_auto_max_free_attempts_warn(cfg: dict, source: str = "boot") -> None
         stored = int(cfg.get("max_free_attempts", 2) or 2)
     except (TypeError, ValueError):
         stored = 2
-    stored = max(1, min(stored, 3))
-    derived = max(1, min(int(resolved_station_count(cfg) or 1), 3))
+    stored = max(1, min(stored, 5))
+    derived = max(1, min(int(resolved_station_count(cfg) or 1), 5))
     if stored != derived:
         logger.warning(
             "[config] manual max_free_attempts=%s differs from derived=%s "
@@ -620,12 +620,13 @@ _ensure_auto_max_free_attempts_warn(IP_ROTATION, source="boot")
 # (B) Stations free: enabled bool, routing round-robin|failover,
 #     mode load-balance|hedge, hedge_delay_ms 0-2000, hedge_max_attempts 1-3
 # Defaults conservateurs OFF (pas de parallélisation sans action GUI).
+# P1 melodic-pearl: hedge 300→150ms / 1→2 pour N=10 (cap burst 3)
 _FREE_PARALLEL_DEFAULTS = {
     "enabled": False,
     "routing": "round-robin",
     "mode": "load-balance",
-    "hedge_delay_ms": 300,
-    "hedge_max_attempts": 1,
+    "hedge_delay_ms": 150,
+    "hedge_max_attempts": 2,
 }
 
 
@@ -1482,6 +1483,22 @@ def maybe_reload_custom_routes():
                     GEO_ALLOW_DIRECT_WHEN_COMPATIBLE = bool(
                         geo_sec.get("allow_direct_when_compatible", True)
                     )
+                    # P2: server_countries change → regen .env via make_credentials_env
+                    try:
+                        _old_sc = IP_ROTATION.get("server_countries", "")
+                        _new_sc = new_ip.get("server_countries", "")
+                        if _old_sc != _new_sc and _new_sc:
+                            import subprocess as _sp2
+
+                            _sp2.run(
+                                [__import__("sys").executable, os.path.join(ROOT, "scripts", "make_credentials_env.py")],
+                                capture_output=True,
+                                timeout=10,
+                                creationflags=_CREATE_NO_WINDOW,
+                            )
+                            logging.info("[config] server_countries changed → .env regen")
+                    except Exception:
+                        pass
                     logging.info(
                         "[config] reloaded config.yaml geo.enabled=%s version=%s policies=%d allow_direct=%s",
                         GEO_ENABLED,

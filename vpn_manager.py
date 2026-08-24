@@ -593,6 +593,41 @@ def _classify_probe_exc(exc: BaseException) -> str:
     return "error"
 
 
+def _classify_error_kind(manager) -> dict:
+    """Build error_detail for dashboard — kind enum + control/probe flags.
+
+    kind ∈ {timeout, refused, auth_failed, tls, control_unreachable, budget_exceeded, error, none}
+    """
+    err = (getattr(manager, "_error", "") or "") + " " + (getattr(manager, "_last_rotation_error", "") or "")
+    low = err.lower()
+    if getattr(manager, "_auth_failed", False) or "auth_failed" in low:
+        kind = "auth_failed"
+    elif "timeout" in low or "délai dépassé" in low:
+        kind = "timeout"
+    elif "refused" in low or "refusé" in low or "10061" in low or "econnrefused" in low:
+        kind = "refused"
+    elif "tls" in low or "negotiation" in low or "négociation" in low:
+        kind = "tls"
+    elif "budget" in low or "probe" in low and "dead" in low:
+        kind = "budget_exceeded"
+    elif "control" in low and ("unreachable" in low or "injoignable" in low):
+        kind = "control_unreachable"
+    elif low.strip():
+        kind = "error"
+    else:
+        kind = "none"
+    # probe/control observability — cheap synchronous flags
+    try:
+        control_ok = bool(getattr(manager, "_control_api_key", "")) and bool(getattr(manager, "_control_enabled", False))
+    except Exception:
+        control_ok = False
+    try:
+        probe = getattr(manager, "_last_rotation_error", None) or getattr(manager, "_error", None)
+    except Exception:
+        probe = None
+    return {"kind": kind, "probe": str(probe or "")[:200], "control_ok": control_ok}
+
+
 def _extract_current_hostname(text: str) -> str | None:
     """Last NordVPN hostname present in gluetun log text.
 
@@ -2260,6 +2295,7 @@ class VPNManager:
             "total_switches": self._total_switches,
             "station": self._station,
             "error": self._error,
+            "error_detail": _classify_error_kind(self),
             "auth_failed": self._auth_failed,
             "last_rotation_error": self._last_rotation_error,
             "ovpn_protocol": getattr(self, "_ovpn_protocol", "udp"),

@@ -751,9 +751,9 @@ def test_hot_reload_in_place_mutation(free_cfg):
     assert oc._free_attempts_active() is True
     assert max(0, oc._free_max_attempts() - 1) == 2, "2 extra free strikes"
 
-    # Clamps: GUI validates, but the code must never trust the mirror
+    # Clamps: GUI validates, but the code must never trust the mirror (P1 melodic-pearl 5)
     oc.IP_ROTATION["max_free_attempts"] = 99
-    assert oc._free_max_attempts() == 3
+    assert oc._free_max_attempts() == 5
     oc.IP_ROTATION["max_free_attempts"] = 0
     assert oc._free_max_attempts() == 2, "0 is treated as unset → default 2"
     oc.IP_ROTATION["max_free_attempts"] = "abc"

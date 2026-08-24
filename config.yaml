@@ -197,8 +197,8 @@ ip_rotation:
     enabled: true
     routing: round-robin
     mode: strict
-    hedge_delay_ms: 300
-    hedge_max_attempts: 1
+    hedge_delay_ms: 150
+    hedge_max_attempts: 2
   max_free_attempts: 3
   free_exception_fallback: station-first
 geo:
