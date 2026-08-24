@@ -355,15 +355,56 @@ def daysAgo(n: int) -> str:
 _persist_lock = __import__("threading").Lock()
 
 
+async def _apply_import_payload(mgrs, body: dict, fallback_manager=None):
+    """[v10 §14.3.31] applique ``{config, state}`` aux managers fournis.
+
+    Retourne ``(response_dict, status_code)``. Validation schéma AVANT
+    application ; fan-out TOUTES les stations (l'ancien code n'appliquait
+    la config qu'à la station 1)."""
+    if "config" in body and not isinstance(body["config"], dict):
+        return {"error": "'config' doit être un objet"}, 400
+    if "state" in body:
+        state = body["state"]
+        if not isinstance(state, dict) or not all(k in ("ip_history", "total_switches") for k in state):
+            return {"error": "'state' ne supporte que ip_history/total_switches"}, 400
+
+    applied = 0
+    if "config" in body:
+        config = body["config"]
+        targets = list(mgrs or [])
+        if not targets and fallback_manager is not None:
+            targets = [fallback_manager]
+        for m in targets:
+            try:
+                await m.update_config(config)
+                applied += 1
+            except Exception as e:
+                _debug(f"  [vpn] import config st{getattr(m, '_station', '?')} failed: {e}")
+
+    if "state" in body and fallback_manager is not None:
+        state = body["state"]
+        if "ip_history" in state:
+            fallback_manager._ip_history = state["ip_history"]
+        if "total_switches" in state:
+            fallback_manager._total_switches = state["total_switches"]
+
+    return {"ok": True, "stations_applied": applied}, 200
+
+
 def _persist_vpn_config(updates: dict):
-    """Persist VPN config changes to config.yaml (non-blocking, best-effort). [32]"""
+    """Persist VPN config changes to config.yaml (non-blocking, best-effort). [32]
+
+    [v10 §14.3.30] retourne **None en cas de succès**, une STRING d'erreur
+    sinon — le contrat implicite des callers (`err = _persist...; if not err:`)
+    devient enfin réel (l'ancienne version ne retournait jamais rien → les
+    gardes d'erreur étaient mortes)."""
     global _config_yaml_known_mtime
     try:
         import yaml
 
         config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "config.yaml")
         if not os.path.exists(config_path):
-            return
+            return f"config.yaml introuvable: {config_path}"
         with _persist_lock:
             with open(config_path, encoding="utf-8") as f:
                 config = yaml.safe_load(f) or {}
@@ -603,6 +644,8 @@ def _persist_vpn_config(updates: dict):
 
     except Exception as e:
         _debug(f"  [vpn] failed to persist config: {e}")
+        return f"persist config.yaml échoué: {type(e).__name__}: {e}"
+    return None
 
 
 def _persist_free_model_map(mapping: dict):
@@ -1373,6 +1416,13 @@ def register_dashboard(
         if err:
             return err
         body = await request.json()
+        # [v10 §14.2.5] validation schéma AVANT persistance (l'ancien code
+        # persistait du JSON brut → crash différé au prochain reload).
+        from config.settings import validate_custom_routes as _vcr
+
+        v_err = _vcr(body)
+        if v_err:
+            return JSONResponse(status_code=400, content={"error": f"custom_routes invalide: {v_err}"})
         _debug(f"  [config] custom routes updated ({len(body)} routes)")
         save_custom_routes(body)
         return {"status": "ok", "message": "Custom routes updated."}
@@ -3019,6 +3069,30 @@ def register_dashboard(
         }
         return export
 
+    @app.post("/api/vpn/rotation-paused")
+    async def set_rotation_paused(request: Request):
+        """[v10 §3.8/§4 Lot 6] Mode maintenance : gèle soft/hard rotate du
+        moteur §3.6. Éphémère PAR DESIGN (non persisté) — évite un oubli ON
+        après un restart ; le badge dashboard l'affiche tant qu'il actif."""
+        err = _check_dashboard_token(request)
+        if err:
+            return err
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        paused = bool(body.get("paused"))
+        import shared_state
+
+        eng = getattr(shared_state, "latency_engine", None)
+        if eng is None:
+            from latency_rotation import get_engine as _ge
+
+            eng = _ge()
+        eng.paused = paused
+        _debug(f"  [vpn] rotation_paused → {paused}")
+        return {"ok": True, "paused": paused}
+
     @app.post("/api/vpn/import")
     async def import_vpn_config(request: Request):
         """Import VPN configuration from JSON."""
@@ -3028,21 +3102,14 @@ def register_dashboard(
         import shared_state
 
         body = await request.json()
-
-        if "config" in body:
-            config = body["config"]
-            if shared_state.vpn_manager:
-                await shared_state.vpn_manager.update_config(config)
-
-        if "state" in body:
-            state = body["state"]
-            if shared_state.vpn_manager:
-                if "ip_history" in state:
-                    shared_state.vpn_manager._ip_history = state["ip_history"]
-                if "total_switches" in state:
-                    shared_state.vpn_manager._total_switches = state["total_switches"]
-
-        return {"ok": True}
+        resp, status = _apply_import_payload(
+            list(getattr(shared_state, "vpn_managers", None) or []),
+            body,
+            fallback_manager=shared_state.vpn_manager,
+        )
+        if status != 200:
+            return JSONResponse(status_code=status, content=resp)
+        return resp
 
     # ── [Axe 3.1] SOCKS5 backend / NordVPN / diagnostic endpoints ──
     # Contracts pinned from static/app.js (verified 19/08). All state-chan

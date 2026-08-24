@@ -1359,13 +1359,40 @@ def load_custom_routes() -> dict:
     return {}
 
 
+def validate_custom_routes(routes) -> str | None:
+    """[plan v10 §14.2.5 Lot 6] None si le payload est valide, sinon un
+    message d'erreur exploitable par l'endpoint (→ 400)."""
+    if not isinstance(routes, dict):
+        return "custom_routes doit être un objet {modèle: règles}"
+    for model, rules in routes.items():
+        if not isinstance(model, str) or not model.strip():
+            return f"clé modèle invalide: {model!r}"
+        if not isinstance(rules, dict):
+            return f"{model}: les règles doivent être un objet"
+        for k, v in rules.items():
+            if not isinstance(k, str):
+                return f"{model}: clé de règle non-string {k!r}"
+            if not (
+                isinstance(v, (str, int, float, bool))
+                or (isinstance(v, list) and all(isinstance(x, str) for x in v))
+            ):
+                return f"{model}.{k}: type non supporté ({type(v).__name__})"
+    return None
+
+
 def save_custom_routes(routes: dict):
-    """Save custom routes to YAML config and reload ROUTES."""
+    """Save custom routes to the YAML config and reload ROUTES.
+
+    [plan v10 §14.4.11] source UNIQUE : l'écriture parallèle du
+    custom_routes.json legacy est SUPPRIMÉE (deux sources qui divergeaient à
+    chaque save). Les anciens fichiers JSON restent LUS par
+    load_custom_routes en fallback (installs existants). Lève ValueError sur
+    payload invalide — l'endpoint le mappe en 400 (§14.2.5)."""
+    err = validate_custom_routes(routes)
+    if err:
+        raise ValueError(err)
     global SORTED_ROUTES, SORTED_CUSTOM_ROUTES
     _yaml_data.setdefault("custom_routes", {}).update(routes)
-    # Also keep JSON file for backward compat
-    with open(CUSTOM_ROUTES_PATH, "w", encoding="utf-8") as f:
-        json.dump(routes, f, indent=2)
     with _reload_lock:
         CUSTOM_ROUTES.clear()
         CUSTOM_ROUTES.update(routes)

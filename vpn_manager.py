@@ -714,9 +714,23 @@ class VPNManager:
         compatibility.
         """
         self._shared: object | None = shared
+        # [plan v10 §4 Lot 6] overrides PER-STATION : `ip_rotation.per_station`
+        # = {«2»: {quota_per_ip: 500, country_offset: 3}} — fusionné PAR-DESSUS
+        # la base pour CETTE instance uniquement (copie, jamais la référence
+        # live partagée). Hot-reload : update_config ré-applique le merge.
+        _per = cfg.get("per_station") if isinstance(cfg.get("per_station"), dict) else None
+        _ovr = None
+        if _per:
+            _ovr = _per.get(str(station)) or _per.get(station)
+        if isinstance(_ovr, dict) and _ovr:
+            cfg = {**cfg, **_ovr}
+            logging.getLogger(__name__).info(
+                "[vpn] per_station overrides appliqués st%s: %s", station, sorted(_ovr)
+            )
         self._config = cfg
         self._station = station
         self._mode = "docker"  # sole mode: compose-managed gluetun (free_ip_pool compat)
+
         self._enabled = cfg.get("enabled", False)
         self._proxy_mode = cfg.get("proxy_mode", "vpn")  # vpn | socks5 | direct
         self._quota_per_ip = cfg.get("quota_per_ip", 300)
@@ -2377,6 +2391,14 @@ class VPNManager:
             self._country_offset_stride = max(
                 0, int(updates.get("country_offset_stride", 0) or 0)
             )
+        # [v10 §4 Lot 6] per_station hot-reload : les overrides de CETTE
+        # station sont re-fusionnés par-dessus les updates globaux.
+        _per = updates.get("per_station") if isinstance(updates.get("per_station"), dict) else None
+        if _per:
+            _ovr = _per.get(str(self._station)) or _per.get(self._station)
+            if isinstance(_ovr, dict):
+                for k, v in _ovr.items():
+                    self._config[k] = v
         if "wait_healthy_poll" in updates:
             self._wait_healthy_poll = max(0.1, float(updates["wait_healthy_poll"]))
         if "rotation_fail_cooldown" in updates:
