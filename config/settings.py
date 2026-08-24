@@ -139,6 +139,34 @@ def load_yaml_config() -> dict:
                         except OSError:
                             pass
                         logger.info("[config] generated control_api_key (persisted to config.yaml)")
+                        # warm-avalanche: resync immédiat credentials.env (évite window divergent)
+                        try:
+                            from scripts.make_credentials_env import _sync_control_api_key as _scak
+
+                            _scak()
+                        except Exception:
+                            try:
+                                _creds = os.path.join(ROOT, "credentials.env")
+                                _up = _new_key
+                                # inline upsert fallback
+                                _lines = []
+                                _found = False
+                                if os.path.exists(_creds):
+                                    with open(_creds, encoding="utf-8") as _rf:
+                                        for _ln in _rf:
+                                            if _ln.strip().startswith("VPN_CONTROL_API_KEY="):
+                                                _lines.append(f"VPN_CONTROL_API_KEY={_up}\n")
+                                                _found = True
+                                            else:
+                                                _lines.append(_ln)
+                                if not _found:
+                                    if _lines and not _lines[-1].endswith("\n"):
+                                        _lines[-1] += "\n"
+                                    _lines.append(f"VPN_CONTROL_API_KEY={_up}\n")
+                                with open(_creds, "w", encoding="utf-8") as _wf2:
+                                    _wf2.writelines(_lines)
+                            except Exception:
+                                pass
                 except ImportError:
                     # No portalocker — atomic save without lock (single-worker safe)
                     tmp = CONFIG_PATH + ".tmp"
@@ -161,6 +189,12 @@ def load_yaml_config() -> dict:
                     except OSError:
                         pass
                     logger.info("[config] generated control_api_key (persisted, no lock)")
+                    try:
+                        from scripts.make_credentials_env import _sync_control_api_key as _scak2
+
+                        _scak2()
+                    except Exception:
+                        pass
                 except Exception as _e:
                     logger.warning("[config] control_api_key generation race: %s", _e)
                 finally:

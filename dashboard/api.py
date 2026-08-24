@@ -408,6 +408,10 @@ def _persist_vpn_config(updates: dict):
                 "socks5_auto_rotate": "socks5_auto_rotate",
                 "use_nordvpn_api": "use_nordvpn_api",
                 "custom_ovpn_file": "custom_ovpn_file",
+                # warm-avalanche
+                "ovpn_protocol": "ovpn_protocol",
+                "ovpn_endpoint_port": "ovpn_endpoint_port",
+                "auto_hetero_boot": "auto_hetero_boot",
             }
 
         # [free_parallel] nested dict (B) Stations free — validate + merge (preserve existing keys)
@@ -2279,6 +2283,21 @@ def register_dashboard(
                     data["free_parallel_warning"] = "tout sur station 1 — activer free_parallel"
                 else:
                     data["free_parallel_warning"] = None
+            except Exception:
+                pass
+            # warm-avalanche Q9: control 401 + socks5 EOF observability
+            try:
+                _c401 = None
+                _eof = 0
+                for _m in managers:
+                    _c = getattr(_m, "_control_last_401_at", None)
+                    if _c and (_c401 is None or _c > _c401):
+                        _c401 = _c
+                    _eof = max(_eof, int(getattr(_m, "_socks5_eof_count", 0) or 0))
+                data["control_last_401_at"] = _c401
+                data["socks5_eof_count"] = _eof
+                # badge 300s
+                data["control_401_badge"] = bool(_c401 and (time.time() - _c401) < 300)
             except Exception:
                 pass
         return data

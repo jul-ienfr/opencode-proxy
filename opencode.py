@@ -1821,6 +1821,31 @@ async def lifespan(app):
     except Exception as e:
         _debug(f"  [lifespan] docker ensure failed (fail-soft): {e}")
 
+    # warm-avalanche: sync déterministe control_api_key → credentials.env avant tout compose up (Q3 C fail-closed)
+    try:
+        from scripts.make_credentials_env import _sync_control_api_key as _boot_sync_ck
+
+        _boot_sync_ck()
+        # fail-closed: si control_enabled mais clé divergente après sync, WARN (boot refuse si fichier manquant)
+        try:
+            import yaml as _yboot
+
+            _ck_yaml = str((_yboot.safe_load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.yaml"), encoding="utf-8")) or {}).get("ip_rotation", {}).get("control_api_key") or "").strip()
+            _ck_env = ""
+            _creds_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "credentials.env")
+            if os.path.exists(_creds_path):
+                for _ln in open(_creds_path, encoding="utf-8"):
+                    if _ln.strip().startswith("VPN_CONTROL_API_KEY="):
+                        _ck_env = _ln.strip().split("=", 1)[1].strip()
+                        break
+            if IP_ROTATION.get("control_enabled", True) and _ck_yaml and _ck_yaml != _ck_env:
+                _debug(f"  [lifespan] WARN control 401 risque: config.yaml key != credentials.env ({_ck_yaml[:4]}... vs {_ck_env[:4]}...) — resync forcé")
+                _boot_sync_ck()
+        except Exception as _e_boot:
+            _debug(f"  [lifespan] boot control sync check failed: {_e_boot}")
+    except Exception as _e_boot2:
+        _debug(f"  [lifespan] boot control sync failed: {_e_boot2}")
+
     # ── VPN / IP rotation for free models ──
     import shared_state
     from free_ip_pool import FreeIPPool
@@ -1843,6 +1868,24 @@ async def lifespan(app):
     ]
     for m in _managers:
         m.enabled = IP_ROTATION.get("enabled", False)
+    # warm-avalanche Q7: hetero-boot opt-in (false par défaut) — S1 WG / S2 OV UDP en // au boot
+    try:
+        if IP_ROTATION.get("auto_hetero_boot", False) and len(_managers) >= 2 and IP_ROTATION.get("vpn_stack", "auto") == "auto":
+            _wg_present = os.path.exists(os.path.join(os.path.dirname(os.path.abspath(__file__)), "vpn_configs", "wireguard.env"))
+            if _wg_present:
+                _managers[0]._stack = "auto"
+                _managers[0]._stack_effective = "wireguard"
+                _managers[0]._auto_hetero_boot = True
+                _managers[1]._stack = "auto"
+                _managers[1]._stack_effective = "openvpn"
+                _managers[1]._ovpn_protocol = "udp"
+                _managers[1]._ovpn_protocol_effective = "udp"
+                _managers[1]._ovpn_endpoint_port = "1194"
+                _managers[1]._ovpn_endpoint_port_effective = "1194"
+                _managers[1]._auto_hetero_boot = True
+                _debug("  [lifespan] hetero-boot: S1 WG / S2 OV udp:1194")
+    except Exception as _e_hetero:
+        _debug(f"  [lifespan] hetero-boot failed: {_e_hetero}")
     # Registry — SOURCE OF TRUTH for hot reload (1-indexed, [0] = station 1).
     # vpn_manager / vpn_manager_2 stay retro-compat aliases for the legacy
     # single/dual reads; all runtime readers use shared_state.vpn_managers.

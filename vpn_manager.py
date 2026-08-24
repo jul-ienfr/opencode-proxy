@@ -576,6 +576,9 @@ def _classify_probe_exc(exc: BaseException) -> str:
     msg = str(exc).lower()
     if name.endswith("timeout") or "timed out" in msg:
         return "timeout"
+    # warm-avalanche Q4: EOF = refused immédiat (pas de grace timeout)
+    if "eof" in msg or "reading header" in msg or "connection closed" in msg:
+        return "refused"
     if (
         isinstance(exc, ConnectionRefusedError)
         or "refused" in msg
@@ -776,6 +779,16 @@ class VPNManager:
             _proto = "udp"
         self._ovpn_protocol = _proto  # selected
         self._ovpn_protocol_effective = _proto if self._stack_effective == "openvpn" else "udp"
+        # warm-avalanche Q6: endpoint port cycle 1194→443→8443
+        _port_cfg = str(cfg.get("ovpn_endpoint_port", cfg.get("endpoint_port", "1194" if _proto == "udp" else "443"))).strip()
+        try:
+            _port_int = int(_port_cfg)
+            if _port_int not in (1194, 443, 8443):
+                _port_int = 1194 if _proto == "udp" else 443
+        except Exception:
+            _port_int = 1194 if _proto == "udp" else 443
+        self._ovpn_endpoint_port = str(_port_int)
+        self._ovpn_endpoint_port_effective = str(_port_int) if self._stack_effective == "openvpn" else ("1194" if _proto == "udp" else "443")
         # [plan 18/08 §1d/§E2] Shared dead-tunnel counter (WG AND OpenVPN):
         # the light egress probe below is the single authority for egress_dead
         # on both stacks — the old "stack not WG: counter is meaningless" reset
@@ -861,6 +874,14 @@ class VPNManager:
         self._flips: list[dict] = []  # journal [{time, from, to, reason}], cap 20
         self._pending_flip: tuple | None = None  # set inside the tick lock,
         # applied AFTER it (_apply_stack takes the lock — not reentrant).
+        # warm-avalanche: 401 control + SOCKS5 EOF observability
+        self._control_last_401_at: float | None = None
+        self._control_last_error: str | None = None
+        self._socks5_eof_count: int = 0
+        self._socks5_eof_window: list[float] = []  # 5-min sliding
+        self._ovpn_ports = ["udp:1194", "tcp:443", "tcp:8443"]
+        self._ovpn_port_idx = 0
+        self._auto_hetero_boot = bool(cfg.get("auto_hetero_boot", False))
 
         # Identity rotation (client fingerprint, advanced on IP rotation).
         # identity_diversity (default False, backward-compatible) expands the
@@ -1697,6 +1718,15 @@ class VPNManager:
                 return self.get_status()
             # ctl is None (control server unreachable) → fall through to the
             # SOCKS5 probe below; "can't ask" must not read as "stopped".
+            # warm-avalanche Q8 garde défensive: 401 récent (<30s) arme watchdog même si ctl is None
+            if self._control_last_401_at and time.time() - self._control_last_401_at < 30:
+                logger.debug("[vpn] refresh_status ctl None but 401 <30s → arm watchdog station %s", self._station)
+                self.arm_egress_watchdog()
+                try:
+                    if self._watchdog_event is not None:
+                        self._watchdog_event.set()
+                except Exception:
+                    pass
 
         ip = await self.get_public_ip()
         if ip:
@@ -1917,7 +1947,26 @@ class VPNManager:
             await asyncio.wait_for(resp.aclose(), 1.0)
             return "ok"
         except Exception as e:
-            return _classify_probe_exc(e)
+            verdict = _classify_probe_exc(e)
+            # warm-avalanche: compte EOF en fenêtre 5min
+            if verdict == "refused" and ("eof" in str(e).lower() or "reading header" in str(e).lower()):
+                try:
+                    now = time.time()
+                    self._socks5_eof_window.append(now)
+                    # purge >5min
+                    self._socks5_eof_window = [t for t in self._socks5_eof_window if now - t < 300]
+                    self._socks5_eof_count = len(self._socks5_eof_window)
+                    if self._socks5_eof_count >= 4:
+                        logger.warning("[vpn] socks5 EOF burst x%d station %s — egress dead", self._socks5_eof_count, self._station)
+                        self.arm_egress_watchdog()
+                        try:
+                            if self._watchdog_event is not None:
+                                self._watchdog_event.set()
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+            return verdict
         finally:
             await client.aclose()
 
@@ -2268,6 +2317,19 @@ class VPNManager:
             # Effective follows selected when on OV, else stays udp (inert under WG)
             if self._stack_effective == "openvpn":
                 self._ovpn_protocol_effective = _p
+        if "ovpn_endpoint_port" in updates or "endpoint_port" in updates:
+            _pe = str(updates.get("ovpn_endpoint_port", updates.get("endpoint_port", "1194"))).strip()
+            try:
+                _pei = int(_pe)
+                if _pei not in (1194, 443, 8443):
+                    _pei = 1194
+            except Exception:
+                _pei = 1194
+            self._ovpn_endpoint_port = str(_pei)
+            if self._stack_effective == "openvpn":
+                self._ovpn_endpoint_port_effective = str(_pei)
+        if "auto_hetero_boot" in updates:
+            self._auto_hetero_boot = bool(updates["auto_hetero_boot"])
         if self._shared is not None and any(
             k in updates for k in ("recent_ip_window", "recent_ip_max_age", "shared_rotation_file")
         ):
@@ -2300,6 +2362,10 @@ class VPNManager:
             "last_rotation_error": self._last_rotation_error,
             "ovpn_protocol": getattr(self, "_ovpn_protocol", "udp"),
             "ovpn_protocol_effective": getattr(self, "_ovpn_protocol_effective", "udp"),
+            "control_last_401_at": self._control_last_401_at,
+            "control_last_error": self._control_last_error,
+            "socks5_eof_count": self._socks5_eof_count,
+            "socks5_eof_window": list(self._socks5_eof_window)[-10:],
             "rotation_failed_at": (
                 time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self._last_rotation_failed_at))
                 if self._last_rotation_failed_at
@@ -2438,6 +2504,14 @@ class VPNManager:
                     _proto = "udp"
                 env[f"OPENVPN_PROTOCOL_STATION{s}"] = _proto
                 env["OPENVPN_PROTOCOL"] = _proto
+                # warm-avalanche Q6: port diversifié
+                _port = getattr(self, "_ovpn_endpoint_port_effective", "1194" if _proto == "udp" else "443")
+                try:
+                    _port = str(int(_port))
+                except Exception:
+                    _port = "1194" if _proto == "udp" else "443"
+                env[f"OPENVPN_ENDPOINT_PORT_STATION{s}"] = _port
+                env["OPENVPN_ENDPOINT_PORT"] = _port
         # [fix 20/08][Axe 3.1] Custom .ovpn (dashboard upload): compose's
         # volume block bind-mounts vpn_configs/custom/ → /vpn-custom (ro)
         # and stanzas interpolate ${OPENVPN_CUSTOM_CONFIG:-}. The uploaded
@@ -2544,15 +2618,43 @@ class VPNManager:
         except RuntimeError as e:
             logger.debug("[vpn] control server call %s %s failed: %s", method, path, e)
             return []
+        combined = (result.stderr or "") + (result.stdout or "")
         if result.returncode != 0:
+            # warm-avalanche Q3+Q8: 401 = clé désynchronisée → resync + arm watchdog immédiat
+            if "401" in combined or "Unauthorized" in combined:
+                self._control_last_401_at = time.time()
+                self._control_last_error = combined.strip()[:200]
+                logger.warning(
+                    "[vpn] control 401 — clé désynchronisée station %s, resync credentials.env (egress %d/%d)",
+                    self._station,
+                    self._egress_failures,
+                    self._auto_wg_egress_ticks,
+                )
+                self.arm_egress_watchdog()
+                try:
+                    if self._watchdog_event is not None:
+                        self._watchdog_event.set()
+                except Exception:
+                    pass
             logger.debug(
                 "[vpn] control server %s %s rc=%d: %s",
                 method,
                 path,
                 result.returncode,
-                (result.stderr or result.stdout or "").strip()[:200],
+                combined.strip()[:200],
             )
             return []
+        # même en rc 0, wget peut avoir rendu un body 401 JSON
+        if "401" in combined or "Unauthorized" in combined:
+            self._control_last_401_at = time.time()
+            self._control_last_error = combined.strip()[:200]
+            logger.warning("[vpn] control 401 (body) station %s — arm watchdog", self._station)
+            self.arm_egress_watchdog()
+            try:
+                if self._watchdog_event is not None:
+                    self._watchdog_event.set()
+            except Exception:
+                pass
         out = (result.stdout or "").splitlines()
         return [ln.strip() for ln in out if ln.strip()]
 
@@ -3313,22 +3415,50 @@ class VPNManager:
         return True
 
     async def _apply_ovpn_protocol(self, protocol: str, reason: str = "protocol fallback") -> bool:
-        """Flip OpenVPN protocol udp<->tcp without changing VPN_TYPE.
+        """Flip OpenVPN protocol/port without changing VPN_TYPE.
 
-        Writes ``OPENVPN_PROTOCOL`` for all active OV stations and recreates
-        them. Returns True on success, False if protocol invalid or compose fails.
-        Propagates effective protocol to sibling managers (same pattern as stack).
+        Cycle complet Q6: udp:1194 → tcp:443 → tcp:8443 → WG (via _auto_flip).
+        Writes ``OPENVPN_PROTOCOL``+``OPENVPN_ENDPOINT_PORT`` for all active OV
+        stations and recreates them. Logs proto:port à chaque transition.
         """
 
         if protocol not in ("udp", "tcp"):
             logger.error("[vpn] _apply_ovpn_protocol: invalid %r", protocol)
             return False
-        if protocol == getattr(self, "_ovpn_protocol_effective", "udp"):
-            logger.info("[vpn] ovpn protocol already %s — no-op", protocol)
-            return True
         if self._stack_effective != "openvpn":
             logger.warning("[vpn] _apply_ovpn_protocol: not on OV stack (%s)", self._stack_effective)
             return False
+        # Q6: détermine port cible via cycle complet, pas simple toggle udp↔tcp
+        cur_proto = getattr(self, "_ovpn_protocol_effective", "udp")
+        cur_port = getattr(self, "_ovpn_endpoint_port_effective", "1194" if cur_proto == "udp" else "443")
+        cur_key = f"{cur_proto}:{cur_port}"
+        try:
+            cur_idx = self._ovpn_ports.index(cur_key)
+        except ValueError:
+            # fallback: map protocol → port par défaut
+            cur_idx = 0 if cur_proto == "udp" else 1
+            if cur_port == "8443":
+                cur_idx = 2
+        # si appelé avec protocol différent, avance au prochain qui matche ce protocol dans le cycle
+        # sinon avance simplement au suivant
+        nxt = None
+        for offset in range(1, len(self._ovpn_ports) + 1):
+            cand = self._ovpn_ports[(cur_idx + offset) % len(self._ovpn_ports)]
+            cand_proto = cand.split(":")[0]
+            # si caller a forcé un protocol, respecte-le (utile watchdog UDP→TCP)
+            if protocol != cur_proto and cand_proto != protocol:
+                continue
+            nxt = cand
+            break
+        if nxt is None:
+            nxt = self._ovpn_ports[(cur_idx + 1) % len(self._ovpn_ports)]
+        target_proto, target_port = nxt.split(":")
+        # no-op si même proto:port déjà effectif
+        if target_proto == cur_proto and target_port == cur_port:
+            logger.info("[vpn] ovpn endpoint already %s:%s — no-op", cur_proto, cur_port)
+            return True
+        protocol = target_proto
+        target_port_str = target_port
         # Per-station independent: only this station flips protocol (auto hétérogène)
         stations = [self._station]
         services = [self._compose_service]
@@ -3344,27 +3474,41 @@ class VPNManager:
             lines = data.splitlines()
             out = []
             seen = False
+            seen_port = False
             per_key = f"OPENVPN_PROTOCOL_STATION{self._station}"
+            per_port_key = f"OPENVPN_ENDPOINT_PORT_STATION{self._station}"
             for ln in lines:
                 stripped = ln.strip()
                 if stripped.startswith(per_key + "="):
                     out.append(f"{per_key}={protocol}")
                     seen = True
+                elif stripped.startswith(per_port_key + "="):
+                    out.append(f"{per_port_key}={target_port_str}")
+                    seen_port = True
                 elif stripped.startswith("OPENVPN_PROTOCOL=") and not stripped.startswith("OPENVPN_PROTOCOL_STATION"):
-                    # Keep global fallback in sync for fresh clones / other stations
+                    out.append(ln)
+                elif stripped.startswith("OPENVPN_ENDPOINT_PORT=") and not stripped.startswith("OPENVPN_ENDPOINT_PORT_STATION"):
                     out.append(ln)
                 else:
                     out.append(ln)
             if not seen:
                 out.append(f"{per_key}={protocol}")
-            # Ensure global fallback exists
+            if not seen_port:
+                out.append(f"{per_port_key}={target_port_str}")
+            # Ensure global fallbacks
             if not any(l.strip().startswith("OPENVPN_PROTOCOL=") for l in out):
                 out.append(f"OPENVPN_PROTOCOL={protocol}")
             else:
-                # Also update global to last flipped value for backward compat
                 for i, l in enumerate(out):
                     if l.strip().startswith("OPENVPN_PROTOCOL=") and not l.strip().startswith("OPENVPN_PROTOCOL_STATION"):
                         out[i] = f"OPENVPN_PROTOCOL={protocol}"
+                        break
+            if not any(l.strip().startswith("OPENVPN_ENDPOINT_PORT=") for l in out):
+                out.append(f"OPENVPN_ENDPOINT_PORT={target_port_str}")
+            else:
+                for i, l in enumerate(out):
+                    if l.strip().startswith("OPENVPN_ENDPOINT_PORT=") and not l.strip().startswith("OPENVPN_ENDPOINT_PORT_STATION"):
+                        out[i] = f"OPENVPN_ENDPOINT_PORT={target_port_str}"
                         break
             tmp = env_path + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
@@ -3375,14 +3519,23 @@ class VPNManager:
             return False
         try:
             prev = getattr(self, "_ovpn_protocol_effective", "udp")
+            prev_port = getattr(self, "_ovpn_endpoint_port_effective", "1194")
             self._ovpn_protocol_effective = protocol
             self._ovpn_protocol = protocol
+            self._ovpn_endpoint_port_effective = target_port_str
+            self._ovpn_endpoint_port = target_port_str
+            try:
+                self._ovpn_port_idx = self._ovpn_ports.index(f"{protocol}:{target_port_str}")
+            except ValueError:
+                pass
             cmd = ["compose", "-f", compose_path, "up", "-d", "--force-recreate"] + sorted(services)
             env = self._compose_env(stations=stations, stack="openvpn")
             result = await asyncio.to_thread(self._docker_run, cmd, 300, env=env)
             if result.returncode != 0:
                 self._ovpn_protocol_effective = prev
                 self._ovpn_protocol = prev
+                self._ovpn_endpoint_port_effective = prev_port
+                self._ovpn_endpoint_port = prev_port
                 raise RuntimeError(result.stderr.strip() or result.stdout.strip())
         except Exception as e:
             logger.error("[vpn] _apply_ovpn_protocol: compose failed: %s", e)
@@ -3393,18 +3546,19 @@ class VPNManager:
             from config.settings import yaml_set
 
             yaml_set("ip_rotation", "ovpn_protocol", protocol)
+            yaml_set("ip_rotation", "ovpn_endpoint_port", target_port_str)
         except Exception:
             pass
         self._flips.append(
             {
                 "time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                "from": f"openvpn-{prev}",
-                "to": f"openvpn-{protocol}",
+                "from": f"openvpn-{prev}:{prev_port}",
+                "to": f"openvpn-{protocol}:{target_port_str}",
                 "reason": reason,
             }
         )
         self._flips = self._flips[-20:]
-        logger.warning("[vpn] ovpn protocol: %s→%s (%s)", prev, protocol, reason)
+        logger.warning("[vpn] ovpn endpoint: %s:%s→%s:%s (%s)", prev, prev_port, protocol, target_port_str, reason)
         return True
 
     async def set_stack(self, mode: str, propagate: bool = True) -> dict:
@@ -3446,6 +3600,9 @@ class VPNManager:
             "effective": self._stack_effective,
             "ovpn_protocol": getattr(self, "_ovpn_protocol", "udp"),
             "ovpn_protocol_effective": getattr(self, "_ovpn_protocol_effective", "udp"),
+            "ovpn_ports": getattr(self, "_ovpn_ports", ["udp:1194","tcp:443","tcp:8443"]),
+            "ovpn_port_idx": getattr(self, "_ovpn_port_idx", 0),
+            "auto_hetero_boot": getattr(self, "_auto_hetero_boot", False),
             "keys_present": self._wg_key_present(),
             "egress_failures": self._egress_failures,
             "egress_armed": self._egress_failures > 0,
@@ -3457,6 +3614,9 @@ class VPNManager:
             "cooldown_min": self._auto_flip_cooldown_min,
             "stack_since": self._stack_since,
             "flips": self._flips[-5:],
+            "control_last_401_at": getattr(self, "_control_last_401_at", None),
+            "control_last_error": getattr(self, "_control_last_error", None),
+            "socks5_eof_count": getattr(self, "_socks5_eof_count", 0),
         }
 
     async def _check_auth_failed(self, started_at: str = "") -> bool:
@@ -4334,6 +4494,9 @@ class VPNManager:
                 "stack": self._stack,
                 "ovpn_protocol": getattr(self, "_ovpn_protocol", "udp"),
                 "ovpn_protocol_effective": getattr(self, "_ovpn_protocol_effective", "udp"),
+                "ovpn_endpoint_port": getattr(self, "_ovpn_endpoint_port", "1194"),
+                "ovpn_endpoint_port_effective": getattr(self, "_ovpn_endpoint_port_effective", "1194"),
+                "auto_hetero_boot": getattr(self, "_auto_hetero_boot", False),
                 "flips": self._flips,
                 "saved_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             }
@@ -4404,13 +4567,23 @@ class VPNManager:
             restored_stack = state.get("stack")
             if restored_stack in ("auto", "wireguard", "openvpn"):
                 self._stack = restored_stack
-            # OV protocol persistence (udp/tcp)
+            # OV protocol/port persistence (udp/tcp + 1194/443/8443)
             _rp = state.get("ovpn_protocol")
             if _rp in ("udp", "tcp"):
                 self._ovpn_protocol = _rp
             _rpe = state.get("ovpn_protocol_effective")
             if _rpe in ("udp", "tcp"):
                 self._ovpn_protocol_effective = _rpe
+            _rpep = state.get("ovpn_endpoint_port")
+            if _rpep in ("1194", "443", "8443", 1194, 443, 8443):
+                self._ovpn_endpoint_port = str(_rpep)
+            _rpepe = state.get("ovpn_endpoint_port_effective")
+            if _rpepe in ("1194", "443", "8443", 1194, 443, 8443):
+                self._ovpn_endpoint_port_effective = str(_rpepe)
+            # hetero-boot flag
+            _rhetero = state.get("auto_hetero_boot")
+            if isinstance(_rhetero, bool):
+                self._auto_hetero_boot = _rhetero
             restored_flips = state.get("flips")
             if isinstance(restored_flips, list):
                 self._flips = [f for f in restored_flips if isinstance(f, dict)][-20:]
