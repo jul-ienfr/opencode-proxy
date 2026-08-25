@@ -4774,23 +4774,26 @@ async def _open_via_pool(endpoint, body, headers, *, is_stream=False, forced_poo
     req_headers = _apply_identity(dict(headers), profile, use_curated_ua=False)
     req_headers["Content-Type"] = "application/json"
 
-    # 3) curl_cffi through SOCKS5 tunnel
-    session = None
+    # 3) curl_cffi through SOCKS5 tunnel — POOL partagé avec le chemin free.
+    # [v10 PLAN-commun 1.1] fini la AsyncSession jetable (handshake SOCKS5+TLS
+    # par requête, ~300-1000 ms via tunnel) : session poolée par (proxy,
+    # impersonate), lock tenu seulement pour les headers (stream=True),
+    # consommation du corps HORS verrou — même sémantique que le chemin free.
     resp = None
     try:
-        from curl_cffi.requests import AsyncSession
-
-        session = AsyncSession(
-            impersonate=profile.get("impersonate", "chrome131"),
-            proxy=_curl_proxy_url(proxy_url),
-            timeout=(10, 600),  # connect 10 / read 600
+        sess, sess_lock = await _get_pooled_curl_session(
+            proxy_url, profile.get("impersonate", "chrome131")
         )
-        if is_stream:
-            resp = await session.post(endpoint, json=body, headers=req_headers, stream=True)
-            yield _CurlCffiStreamResponse(resp)
-        else:
-            resp = await session.post(endpoint, json=body, headers=req_headers, stream=False)
-            yield _CurlCffiResponse(resp)
+        async with sess_lock:
+            raw = await sess.post(
+                endpoint, json=body, headers=req_headers, stream=True
+            )
+        resp = (
+            _CurlCffiStreamResponse(raw)
+            if is_stream
+            else _CurlCffiResponse(raw)
+        )
+        yield resp
     except UpstreamError:
         raise
     except Exception as e:
@@ -4804,11 +4807,6 @@ async def _open_via_pool(endpoint, body, headers, *, is_stream=False, forced_poo
         if resp is not None:
             try:
                 await resp.aclose()
-            except Exception:
-                pass
-        if session is not None:
-            try:
-                await session.close()
             except Exception:
                 pass
 
@@ -7570,10 +7568,22 @@ async def messages(request: Request):
                 _track_model = free_model
             else:
                 _using_free = False
-            # Defer token estimation to first chunk — reduces pre-response latency
-            est_input = await asyncio.to_thread(_estimate_input_tokens, body)
-            _debug(f"  [stream] est_input={est_input}")
-            _update_token_usage(_track_model, est_input, 0, 0)
+            # Defer token estimation — [v10 PLAN-commun 1.3] TTFB : l'estimation
+            # tiktoken tourne en TÂCHE concurrente avec la connexion upstream ;
+            # le premier yield n'attend plus le comptage. Résolue paresseusement
+            # au premier besoin réel (usage upstream / finalisation).
+            est_input = None
+
+            async def _ensure_est_input():
+                nonlocal est_input
+                if est_input is None:
+                    est_input = await asyncio.to_thread(_estimate_input_tokens, body)
+                    _debug(f"  [stream] est_input={est_input}")
+                    _update_token_usage(_track_model, est_input, 0, 0)
+                return est_input
+
+            _est_task = asyncio.create_task(_ensure_est_input())
+
             stream_in = None
             stream_out = stream_cache = 0
             started = False
@@ -7854,6 +7864,7 @@ async def messages(request: Request):
                                     if stream_in is not None or stream_cache:
                                         try:
                                             with _token_lock:
+                                                est_input = await _est_task
                                                 if stream_in is not None:
                                                     _token_usage[_track_model]["input"] += (
                                                         stream_in - est_input
@@ -8025,11 +8036,13 @@ async def messages(request: Request):
                         try:
                             with _token_lock:
                                 if stream_in is None:
+                                    est_input = await _est_task
                                     _token_usage[_track_model]["input"] -= est_input
                                 if stream_out:
                                     _token_usage[_track_model]["output"] += stream_out
                         except Exception as e:
                             _debug(f"  ✗ token rollback failed: {type(e).__name__}: {e}")
+                    est_input = await _est_task
                     await _save_request(
                         req_id,
                         _track_model,
@@ -8078,6 +8091,7 @@ async def messages(request: Request):
                 async for ev in _terminate_after_started(open_blocks, stream_out):
                     yield ev
                 emitted_finish = True
+            est_input = await _est_task
             logged_in = stream_in if stream_in is not None else est_input
             _debug(
                 f"  [stream] done: in={logged_in} out={stream_out} cache={stream_cache} tools={used_tools}"

@@ -327,16 +327,10 @@ class TrafficCapture:
         frame.abort_reason = abort_reason
         if frame.body is None:
             frame.body = b""
-        # Redaction pass: credential-shaped values in the stored body become
-        # "[REDACTED]" (structure kept). Lengths change, so the global byte
-        # budget must be recounted to stay honest (finding i).
-        # [v10 §14.1.18] redaction déjà faite INCRÉMENTALEMENT dans _add_body ;
-        # frames binaires : octets bruts, jamais décodés.
-        if not getattr(frame, "binary", False):
-            redacted = _redact_body(frame.body)
-            if redacted != frame.body:
-                frame.body = redacted
-                self._recount_bytes()
+        # [v10 PLAN-commun 1.2] AUCUNE passe finale : la redaction incrémentale
+        # de _add_body couvre chaque chunk (UTF-8 bufferisé, binaires bruts).
+        # L'ancien re-redact global coûtait 0,5-3 ms/grosse requête pour un
+        # résultat idempotent.
 
     def _evict_oldest(self) -> None:
         if not self._frames:
