@@ -27,8 +27,6 @@ def _reset_curl_pool():
     """
     yield
     try:
-        import asyncio as _aio
-
         pool = getattr(__import__("opencode"), "_curl_pool", None)
         if pool:
             # Les sessions réelles ne doivent PAS être fermées ici si elles

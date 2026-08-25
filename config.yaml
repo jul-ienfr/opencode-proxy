@@ -304,6 +304,10 @@ custom_routes:
     match:
     - glm-5.1
     model: x-preview-f-free
+  musespark12contributor:
+    match:
+    - muse-spark-1.2-contributor
+    model: x-preview-f-free
 api_keys: []
 pricing:
   currency: USD

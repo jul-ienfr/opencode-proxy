@@ -646,6 +646,100 @@ def _truncate_body_for_storage(body: dict, max_chars: int = MAX_BODY_STORAGE) ->
     return result
 
 
+_DB_RAW_SIZE_CAP = 2_000_000  # [D1] au-delà : résumé compact mis en queue
+
+
+def _quick_body_size(body) -> int:
+    """[D1 perf] Estimation O(texte) SANS sérialisation ni repr — somme des
+    longueurs des chaînes directement accessibles (champs top-level +
+    contenus de messages). Suffisante pour décider si un corps est trop
+    volumineux pour la queue ; le tronquage exact reste dans le writer."""
+    if not isinstance(body, dict):
+        return 0
+    total = 0
+    for v in body.values():
+        if type(v) is str:
+            total += len(v)
+    msgs = body.get("messages")
+    if isinstance(msgs, list):
+        for m in msgs:
+            if not isinstance(m, dict):
+                continue
+            c = m.get("content")
+            if type(c) is str:
+                total += len(c)
+            elif isinstance(c, list):
+                for p in c:
+                    if isinstance(p, dict):
+                        t = p.get("text") or p.get("thinking") or ""
+                        if type(t) is str:
+                            total += len(t)
+                        if p.get("input") is not None and not isinstance(
+                            p.get("input"), (str, int, float, bool)
+                        ):
+                            total += 256  # tool_use input : borne grossière
+    return total
+
+
+def _compact_body_stub(body) -> dict:
+    """[D1] Corps > _DB_RAW_SIZE_CAP → résumé compact (le writer appliquera
+    truncate+redact comme à tout autre corps). Évite d'épingler 10 Mo dans
+    la queue sous stall DB."""
+    stub: dict = {"_oversize": True}
+    if isinstance(body, dict):
+        for k in ("model", "stream", "max_tokens"):
+            if k in body:
+                stub[k] = body[k]
+        sysv = body.get("system")
+        if isinstance(sysv, str):
+            stub["system_head"] = sysv[:500]
+        elif isinstance(sysv, list) and sysv and isinstance(sysv[0], dict):
+            stub["system_head"] = str(sysv[0].get("text", ""))[:500]
+        msgs = body.get("messages")
+        if isinstance(msgs, list):
+            stub["_message_count"] = len(msgs)
+            first = msgs[0] if msgs else None
+            if isinstance(first, dict):
+                c = first.get("content")
+                stub["first_message_role"] = first.get("role")
+                stub["first_message_head"] = (
+                    c[:300] if isinstance(c, str) else str(c)[:300]
+                )
+    return stub
+
+
+class _DbRowRaw:
+    """[D1 perf] Ligne DB brute : dumps tools + tronquage + redaction
+    s'exécutent dans le THREAD WRITER (_materialize_db_row), plus dans la
+    coroutine appelante — 0,5-3 ms/requête rendus à l'event loop.
+    L'ordre d'écriture est préservé (même queue unique)."""
+
+    __slots__ = ("head", "tail", "request_body", "response_body", "tools", "tools_used")
+
+    def __init__(self, head: tuple, tail: tuple, *, request_body, response_body, tools, tools_used):
+        # head = champs SQL avant tools_json (id..account_alias),
+        # tail = champs après response_body_json (client_user_agent..station).
+        self.head = head
+        self.tail = tail
+        self.request_body = request_body
+        self.response_body = response_body
+        self.tools = tools
+        self.tools_used = tools_used
+
+
+def _materialize_db_row(raw: "_DbRowRaw") -> tuple:
+    """Thread writer : sérialise/tronque/redige une ligne brute (CPU hors loop)."""
+    tools_json = json.dumps(raw.tools) if raw.tools else "[]"
+    tools_used_json = json.dumps(list(dict.fromkeys(raw.tools_used))) if raw.tools_used else "[]"
+    request_body_json = (
+        _redact(_truncate_body_for_storage(raw.request_body)) if raw.request_body else None
+    )
+    response_body_json = (
+        _redact(_truncate_body_for_storage(raw.response_body)) if raw.response_body else None
+    )
+    return raw.head + (tools_json, tools_used_json, request_body_json, response_body_json) + raw.tail
+
+
 # SQLite setup — synchronous connection, all DB ops run in thread pool
 _db_path = os.path.join(LOG_DIR, "requests.db")
 _conn = sqlite3.connect(_db_path, check_same_thread=False)
@@ -1016,12 +1110,15 @@ def _db_insert_sync(
             )
 
 
-def _db_execute_batch_sync(batch: list[tuple]):
+def _db_execute_batch_sync(batch: list):
     """Execute a batch of DB inserts in a single transaction (called in thread pool)."""
     if not batch:
         return 0
     with _db_commit_lock:
         for item in batch:
+            # [D1 perf] les lignes brutes sont sérialisées/tronquées/redactées
+            # ICI (thread writer), plus dans l'event loop.
+            row = _materialize_db_row(item) if isinstance(item, _DbRowRaw) else item
             _conn.execute(
                 """
                 INSERT OR REPLACE INTO requests (id, timestamp, model, original_model, duration_ms,
@@ -1031,7 +1128,7 @@ def _db_execute_batch_sync(batch: list[tuple]):
                     geo_direct_country, geo_direct_ip, geo_via_vpn, geo_allowed, station)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-                item,
+                row,
             )
         try:
             _conn.commit()
@@ -1112,13 +1209,13 @@ async def _save_request(
     geo_allowed=None,
     station=None,
 ):
-    tools_json = json.dumps(tools) if tools else "[]"
-    tools_used_json = json.dumps(list(dict.fromkeys(tools_used))) if tools_used else "[]"
-    # B1: redact before DB INSERT (was only on _debug)
-    request_body_json = _redact(_truncate_body_for_storage(request_body)) if request_body else None
-    response_body_json = (
-        _redact(_truncate_body_for_storage(response_body)) if response_body else None
-    )
+    # [D1 perf] plus de sérialisation inline : tools_json / truncate / redact
+    # sont exécutés dans le thread writer (_materialize_db_row). Estimation
+    # rapide côté caller uniquement pour ne PAS épingler 10 Mo en queue.
+    if request_body is not None and _quick_body_size(request_body) > _DB_RAW_SIZE_CAP:
+        request_body = _compact_body_stub(request_body)
+    if response_body is not None and _quick_body_size(response_body) > _DB_RAW_SIZE_CAP:
+        response_body = _compact_body_stub(response_body)
     client_user_agent = _current_user_agent.get()
     # Leaf reader for the free-channel stamp: the two writers set
     # _current_free_attempt (IP + identity profile) right before the free
@@ -1168,7 +1265,7 @@ async def _save_request(
     # normalize geo_allowed list → string for DB
     if isinstance(geo_allowed, list):
         geo_allowed = ",".join(geo_allowed)
-    item = (
+    head = (
         req_id,
         timestamp,
         model,
@@ -1185,10 +1282,8 @@ async def _save_request(
         effort,
         client_ip,
         account_alias,
-        tools_json,
-        tools_used_json,
-        request_body_json,
-        response_body_json,
+    )
+    tail = (
         client_user_agent,
         free_model_ip,
         identity,
@@ -1200,6 +1295,14 @@ async def _save_request(
         geo_allowed,
         station,
     )
+    item = _DbRowRaw(
+        head,
+        tail,
+        request_body=request_body,
+        response_body=response_body,
+        tools=tools,
+        tools_used=tools_used,
+    )
     try:
         _db_queue.put_nowait(item)
     except asyncio.QueueFull:
@@ -1207,38 +1310,9 @@ async def _save_request(
             f"  [db] queue full ({_db_queue.qsize()}), dropping req_id={req_id} — fallback to direct"
         )
         try:
-            await asyncio.to_thread(
-                _db_insert_sync,
-                req_id,
-                timestamp,
-                model,
-                original_model,
-                duration_ms,
-                tokens_input,
-                tokens_output,
-                tokens_cache,
-                success,
-                error,
-                protocol,
-                is_stream,
-                thinking,
-                effort,
-                client_ip,
-                account_alias,
-                tools_json,
-                tools_used_json,
-                request_body_json,
-                response_body_json,
-                client_user_agent,
-                free_model_ip,
-                identity,
-                geo_country,
-                geo_blocked,
-                geo_direct_country,
-                geo_direct_ip,
-                geo_via_vpn,
-                geo_allowed,
-            )
+            # [D1] matérialisation dans le thread (fallback = même CPU hors loop)
+            row = await asyncio.to_thread(_materialize_db_row, item)
+            await asyncio.to_thread(_db_insert_sync, *row)
         except Exception as e:
             _debug(f"  [db] fallback insert failed: {e}")
     else:
