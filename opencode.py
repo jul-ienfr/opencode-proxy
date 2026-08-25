@@ -1579,6 +1579,14 @@ _geo_forced_pool: set | None = None
 # or the pool's set_stations swap.
 _apply_station_lock = asyncio.Lock()
 
+# [plan v10 incident 25/08] Le reconcile ne doit tourner qu'UNE fois par
+# PROCESS : un redémarrage in-process du server manager (tray stop/start)
+# ré-exécute le lifespan, et son reconcile entrait alors en course avec les
+# watchdogs/watchers du run précédent — supprimant des conteneurs légitimes
+# (vpn-3 rm à 08:18 alors que son tunnel répondait). Les conteneurs d'un
+# redémarrage in-process sont les NOTRES : pas des orphelins.
+_RECONCILE_DONE_THIS_PROCESS = False
+
 
 def _sync_station_supervisors(shared_state) -> None:
     """[plan v10 §4 Lot 1] Aligne shared_state.station_supervisors sur
@@ -2118,11 +2126,16 @@ async def lifespan(app):
     # NOW so start() recreates the fleet exactly as configured; fail-soft
     # (a broken docker daemon must not block boot — start() handles it).
     try:
+        global _RECONCILE_DONE_THIS_PROCESS
         from vpn_manager import reconcile_orphan_containers
 
-        _removed = await reconcile_orphan_containers(_managers)
-        if _removed:
-            _debug(f"  [lifespan] boot reconcile removed: {_removed}")
+        if _RECONCILE_DONE_THIS_PROCESS:
+            _debug("  [lifespan] boot reconcile skipped (in-process restart — containers are ours)")
+        else:
+            _removed = await reconcile_orphan_containers(_managers)
+            _RECONCILE_DONE_THIS_PROCESS = True
+            if _removed:
+                _debug(f"  [lifespan] boot reconcile removed: {_removed}")
     except Exception as e:
         _debug(f"  [lifespan] boot reconcile failed (fail-soft): {e}")
     # Start every enabled station in PARALLEL (multi-station would otherwise
