@@ -352,6 +352,61 @@ def daysAgo(n: int) -> str:
     return (datetime.now(UTC) - timedelta(days=n)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _compute_costs(rows, pricing: dict | None = None) -> dict:
+    """[v10 §12.3.10] Coût payant + économies free à partir de lignes agrégées.
+
+    ``rows`` : iterable de dicts {model, tokens_input, tokens_output}.
+    ``pricing`` : {"currency", "defaults": {input/output_per_mtok},
+    "per_model": {modèle: {...}}} — sinon défauts Anthropic Sonnet-class.
+
+    Les modèles `-free` ne coûtent rien mais génèrent ``free_saved_usd``
+    (ce qu'ils auraient coûté au tarif par défaut)."""
+    p = pricing or {}
+    currency = str(p.get("currency", "USD"))
+    defaults = p.get("defaults") if isinstance(p.get("defaults"), dict) else {}
+    rate_in = float(defaults.get("input_per_mtok", 3.0))
+    rate_out = float(defaults.get("output_per_mtok", 15.0))
+    per_model_cfg = p.get("per_model") if isinstance(p.get("per_model"), dict) else {}
+
+    paid_usd = 0.0
+    saved_usd = 0.0
+    per_model_out = []
+    seen = set()
+    for row in rows:
+        model = str(row.get("model") or "?")
+        ti = float(row.get("tokens_input") or 0)
+        to_ = float(row.get("tokens_output") or 0)
+        key = (model, ti, to_)
+        if key in seen:
+            continue
+        seen.add(key)
+        rates = per_model_cfg.get(model) or {}
+        ri = float(rates.get("input_per_mtok", rate_in))
+        ro_ = float(rates.get("output_per_mtok", rate_out))
+        cost = ti / 1e6 * ri + to_ / 1e6 * ro_
+        is_free = model.endswith("-free")
+        if is_free:
+            saved_usd += cost
+        else:
+            paid_usd += cost
+        per_model_out.append(
+            {
+                "model": model,
+                "tokens_input": int(ti),
+                "tokens_output": int(to_),
+                "cost_usd": round(cost, 4),
+                "free": is_free,
+            }
+        )
+    per_model_out.sort(key=lambda x: -x["cost_usd"])
+    return {
+        "currency": currency,
+        "paid_usd": round(paid_usd, 4),
+        "free_saved_usd": round(saved_usd, 4),
+        "per_model": per_model_out,
+    }
+
+
 _persist_lock = __import__("threading").Lock()
 
 
@@ -3269,6 +3324,39 @@ def register_dashboard(
         except Exception as e:
             return JSONResponse(status_code=502, content={"error": str(e)[:200]})
         return {"ok": True, "station": sid, "queued": True}
+
+    @app.get("/api/costs")
+    async def get_costs(from_date: str = None, to_date: str = None, station: int = None):
+        """[v10 §12.3.10] Coût payant + économies réalisées via le free tier.
+
+        Tarification : section `pricing` de config.yaml (défauts Sonnet-class).
+        Les modèles `-free` coûtent 0 et créditent `free_saved_usd`."""
+        where, params = _build_where(from_date, to_date, station=station)
+        pricing = {}
+        try:
+            import config.settings as _st_c
+
+            _p = _st_c._yaml_data.get("pricing")
+            if isinstance(_p, dict):
+                pricing = _p
+        except Exception:
+            pass
+
+        def _query():
+            conn = _get_conn()
+            rows = conn.execute(
+                "SELECT model, SUM(tokens_input) AS tokens_input, "
+                "SUM(tokens_output) AS tokens_output FROM requests "
+                + where
+                + " GROUP BY model",
+                params,
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+        rows = await asyncio.to_thread(_query)
+        result = _compute_costs(rows, pricing)
+        result["window"] = {"from": from_date, "to": to_date, "station": station}
+        return result
 
     @app.post("/api/vpn-config/validate")
     async def validate_vpn_config(request: Request):

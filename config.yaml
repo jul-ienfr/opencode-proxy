@@ -298,6 +298,12 @@ custom_routes:
     - oxalpha
     model: x-preview-f-free
 api_keys: []
+pricing:
+  currency: USD
+  defaults:
+    input_per_mtok: 3.0
+    output_per_mtok: 15.0
+  per_model: {}
 web_search:
   enabled: true
   mode: duckduckgo
