@@ -1,7 +1,7 @@
 {
   "version": 1,
   "_doc": "[plan v10 §11.6 v6] Source machine-lisible du test_docs_drift — le test lit CE fichier, jamais la prose markdown. Étendre ici, pas dans le test.",
-  "bloquant_familles": ["v1", "conversion", "clients", "docker"],
+  "bloquant_familles": ["v1", "conversion", "clients", "docker", "provider"],
   "checks": [
     {
       "type": "golden_dir",
@@ -91,6 +91,30 @@
         "WIREGUARD_MTU",
         "DNS_UPSTREAM_PLAIN_ADDRESSES",
         "AUTH_FAILED"
+      ]
+    },
+    {
+      "type": "doc_must_mention",
+      "famille": "provider",
+      "doc": "docs/provider-opencode.md",
+      "must_contain": [
+        "?station=",
+        "idx_requests_station_ts",
+        "latency_rotation",
+        "rotation_paused",
+        "per_station",
+        "hedge_delay_ms_per_model",
+        "wal_checkpoint"
+      ]
+    },
+    {
+      "type": "config_keys_exist_and_documented",
+      "famille": "provider",
+      "doc": "docs/provider-opencode.md",
+      "config_file": "config.yaml",
+      "keys": [
+        "ip_rotation.latency_rotation.enabled",
+        "ip_rotation.country_offset_stride"
       ]
     }
   ]
