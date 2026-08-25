@@ -12150,7 +12150,14 @@ if __name__ == "__main__":
     if _cli_args.port is not None:
         PORT = _cli_args.port
 
-    _acquire_instance_lock(f"logs/opencode-{PORT}.lock")
+    _acquire_instance_lock(
+        # [v10 incident 25/08] chemin ANCRÉ au projet : un chemin relatif
+        # dépendait du CWD du lanceur — deux lancements depuis des CWD
+        # différents créaient deux locks distincts et deux instances vives.
+        os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "logs", f"opencode-{PORT}.lock"
+        )
+    )
 
     # GUI by default (system tray + dashboard window); --no-gui forces terminal mode.
     use_gui = not _cli_args.no_gui
