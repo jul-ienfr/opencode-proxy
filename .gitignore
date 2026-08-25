@@ -66,8 +66,13 @@ tests/_*.txt
 
 # AI transcripts / temp extracts at repo root (plan v10 §14.4.6)
 _tmp_*
+# Scripts jetables a la racine (ex: tmp_decrypt.py, tmp_extract*.py)
+tmp_*.py
 # Perf baselines : timings machine-spécifiques (plan v10 §15.1/§13.5)
 logs/bench_baseline.json
+# Runtime state du boot proxy (jamais versionner)
+logs/*.err
+logs/config-*.json
 
 # Kilo Code
 .kilo/
