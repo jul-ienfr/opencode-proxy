@@ -100,3 +100,53 @@ Fichiers : chemins free (`opencode.py` curl_cffi wrap) + payés-B.
 
 - Décodage de vraies signatures Anthropic (impossible, crypto propriétaire)
 - TOTP/2FA des rôles gluetun (sans rapport)
+
+---
+
+## 5. Correctif post-livraison — parité multi-tours (2026-08-25)
+
+### Diagnostic
+
+La sonde live multi-tours (muse-spark, thinking enabled) a révélé que le strip
+sélectif de la Phase D cassait la **mémoire du raisonnement** : au tour 2, le
+proxy strippait les blocs thinking synthétiques de l'historique renvoyé vers
+l'upstream → l'upstream recevait `reasoning_content = " "` et perdait toute
+mémoire de son raisonnement du tour 1 (**0/2** fragments distinctifs retrouvés
+par le modèle). Sans le proxy, ce raisonnement remonterait au tour suivant :
+le strip était un comportement anormal d'économie de tokens au prix d'une
+perte de mémoire du modèle.
+
+### Nouvelle règle (remplace D.2 ; D.4 redacted inchangé)
+
+1. **Strip réservé à Anthropic direct** — `strip_synthetic_thinking` n'est plus
+   appelé que dans la branche `protocol == "anthropic"` (jamais de fausse
+   signature vers un upstream qui valide cryptographiquement).
+2. **Vers les upstreams openai-compatibles** — les blocs thinking SYNTHÉTIQUES
+   voyagent comme les ORIGINAUX : leur texte devient `reasoning_content`
+   (`anthropic_to_openai`). Les signatures ne transitent de toute façon jamais
+   vers ces endpoints (seul le texte).
+3. **Vers l'API Responses** — `_chat_to_responses_request` émet désormais un
+   item `{"type": "reasoning", "summary": [{"type": "summary_text", …}]}` pour
+   chaque message assistant porteur de `reasoning_content`, inséré
+   immédiatement avant l'item `output_text` du même tour. Même format que celui
+   que le proxy produit dans ses propres réponses Responses. Défense : sur
+   400/422 upstream avec items reasoning présents → retry transparent UNE fois
+   sans eux (marqueur interne `_has_synthetic_reasoning_items`, consommé dans
+   `_do_request_with_retry`, jamais transmis à l'upstream).
+
+### Asymétrie intentionnelle (ne pas classer en bug lors d'un audit futur)
+
+En sens inverse, `openai_responses_to_anthropic` (protocol_mapping.py:1047-1059)
+reconnaît les items `{"type": "reasoning"}` envoyés par le client mais DROPPE
+leur summary vers un upstream Anthropic — cohérent avec la règle intangible
+« jamais de fausse signature vers Anthropic direct » : re-synthétiser un bloc
+thinking signé à partir d'un summary client reviendrait à lui mentir.
+
+### Validation
+
+- Suite complète : 778 passed / 1 skipped / EXIT=0 (baseline conservée,
+  +3 tests nouveaux sur `_chat_to_responses_request`).
+- Fixture golden `multiturn_thinking_strip.json` régénérée :
+  assistant A porte désormais `"reasoning_content": "raisonnement converti par
+  le proxy"` (au lieu de `" "`), blob redacted toujours absent.
+- Sonde live multi-tours muse-spark + glm-5.1 : voir commit associé.

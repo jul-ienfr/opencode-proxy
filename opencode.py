@@ -1508,34 +1508,156 @@ _transport = (
 )
 _client = httpx.AsyncClient(transport=_transport, timeout=_build_http_timeout())
 
-# ── Curl TLS pool (reuse AsyncSession per proxy+impersonate) ──
-_curl_pool: dict[str, tuple] = {}  # key -> (AsyncSession, asyncio.Lock)
-_curl_pool_lock = asyncio.Lock()
+# ── Curl TLS pool (M reusable AsyncSessions per proxy+impersonate) ──
+# [A1 perf / audit vitesse §2] L'ancien schéma « 1 session + lock global par
+# clé » sérialisait chaque POST non-streaming derrière le téléchargement
+# complet (head-of-line blocking : toutes les requêtes d'une station en
+# file invisible, read timeout 600 s). Un pool de M sessions avec
+# checkout/checkin rend le parallélisme intra-station. Sûr quelle que soit
+# la version curl_cffi : une session n'est JAMAIS partagée concurrentment
+# (un seul emprunteur à la fois) ; les streams ne tiennent une session que
+# jusqu'aux headers, comme avant.
+
+
+class _CurlSessionSlot:
+    __slots__ = ("sess", "busy")
+
+    def __init__(self, sess):
+        self.sess = sess
+        self.busy = False
+
+
+class _CurlSessionPool:
+    """Pool FIFO de M sessions curl pour une clé (proxy, impersonate).
+
+    checkout() réutilise une session libre, sinon crée dans la limite M,
+    sinon attend une restitution (Condition — rare : concurrence > M).
+    checkin() restitue ; evict() ferme une session fautive et libère sa
+    place (l'éviction de la session fautive est conservée de l'ancien code).
+    """
+
+    __slots__ = ("slots", "_cond", "max_size")
+
+    def __init__(self, max_size: int = 3):
+        self.slots: list[_CurlSessionSlot] = []
+        self._cond = asyncio.Condition()
+        self.max_size = max(1, int(max_size))
+
+    def _try_checkout(self) -> _CurlSessionSlot | None:
+        for slot in self.slots:
+            if not slot.busy:
+                slot.busy = True
+                return slot
+        return None
+
+    async def checkout(self, factory) -> _CurlSessionSlot:
+        async with self._cond:
+            slot = self._try_checkout()
+            while slot is None:
+                if len(self.slots) < self.max_size:
+                    slot = _CurlSessionSlot(factory())
+                    slot.busy = True
+                    self.slots.append(slot)
+                    return slot
+                # M/M occupées → attendre une restitution (aucune session
+                # jamais partagée concurrentment).
+                await self._cond.wait()
+                slot = self._try_checkout()
+            return slot
+
+    async def checkin(self, slot: _CurlSessionSlot) -> None:
+        async with self._cond:
+            if slot in self.slots:
+                slot.busy = False
+            self._cond.notify()
+
+    async def evict(self, slot: _CurlSessionSlot) -> None:
+        """Ferme une session fautive et la retire du pool."""
+        async with self._cond:
+            try:
+                self.slots.remove(slot)
+            except ValueError:
+                pass
+            try:
+                await slot.sess.close()
+            except Exception:
+                pass
+            self._cond.notify()
+
+    def discard(self, slot: _CurlSessionSlot) -> None:
+        """Retire sans fermer (chemin annulation : pas d'await possible)."""
+        try:
+            self.slots.remove(slot)
+        except ValueError:
+            pass
+
+    async def close_all(self) -> None:
+        for slot in list(self.slots):
+            try:
+                await slot.sess.close()
+            except Exception:
+                pass
+        self.slots.clear()
+
+
+def _curl_pool_size() -> int:
+    """[A1] Taille M du pool par (proxy, impersonate), hot-reloadable."""
+    try:
+        return max(1, int(yaml_get("upstream", "curl_sessions_per_station", 3)))
+    except Exception:
+        return 3
+
+
+_curl_pool: dict[str, _CurlSessionPool] = {}  # key -> pool (E2: get direct mono-thread)
+
+
+def _evict_later(pool: "_CurlSessionPool", slot: "_CurlSessionSlot") -> None:
+    """Fire-and-forget eviction — utilisable depuis un except CancelledError."""
+
+    async def _do():
+        try:
+            await pool.evict(slot)
+        except Exception:
+            pass
+
+    try:
+        asyncio.get_running_loop().create_task(_do())
+    except RuntimeError:
+        pool.discard(slot)
 
 
 async def _get_pooled_curl_session(proxy_url: str | None, impersonate: str):
-    """Get or create a pooled curl session for (proxy, impersonate)."""
+    """Emprunte une session du pool pour (proxy, impersonate).
+
+    Retourne (pool, slot) : l'appelant POSTe via ``slot.sess`` SANS tenir de
+    verrou pendant le transfert, puis ``await pool.checkin(slot)`` (succès)
+    ou éviction (session fautive). Les streams ne gardent l'emprunt que
+    jusqu'aux headers.
+    """
     key = f"{proxy_url or ''}|{impersonate}"
-    async with _curl_pool_lock:
-        if key in _curl_pool:
-            return _curl_pool[key]
+    # [E2 perf] dict.get mono-thread — pas de lock global ; seul l'état du
+    # pool lui-même est sous Condition (dans checkout/checkin/evict).
+    pool = _curl_pool.get(key)
+    if pool is None:
         from curl_cffi.requests import AsyncSession
 
-        sess = AsyncSession(impersonate=impersonate, proxy=_curl_proxy_url(proxy_url))
-        lock = asyncio.Lock()
-        _curl_pool[key] = (sess, lock)
-        return sess, lock
+        pool = _CurlSessionPool(_curl_pool_size())
+        _curl_pool[key] = pool
+        slot = await pool.checkout(lambda: AsyncSession(impersonate=impersonate, proxy=_curl_proxy_url(proxy_url)))
+        return pool, slot
+    from curl_cffi.requests import AsyncSession
+
+    slot = await pool.checkout(
+        lambda: AsyncSession(impersonate=impersonate, proxy=_curl_proxy_url(proxy_url))
+    )
+    return pool, slot
 
 
 async def _close_curl_pool():
     """Close all pooled curl sessions (lifespan shutdown)."""
-    async with _curl_pool_lock:
-        for sess, _ in _curl_pool.values():
-            try:
-                await sess.close()
-            except Exception:
-                pass
-        _curl_pool.clear()
+    for pool in list(_curl_pool.values()):
+        await pool.close_all()
+    _curl_pool.clear()
 
 
 def _ensure_http_client() -> httpx.AsyncClient:
@@ -4027,8 +4149,9 @@ async def _do_free_request_curl_cffi(
     req_headers = _apply_identity(_free_request_headers(headers), profile, use_curated_ua=False)
     req_headers["Content-Type"] = "application/json"
 
-    # Pooled session (reuse TLS) — lock per (proxy, impersonate) to avoid concurrent use of same session
-    sess, sess_lock = await _get_pooled_curl_session(proxy_url, profile["impersonate"])
+    # Pooled session — [A1 perf] checkout/checkin SANS verrou pendant le
+    # transfert : le POST non-streaming ne sérialise plus la station.
+    pool, slot = await _get_pooled_curl_session(proxy_url, profile["impersonate"])
     if endpoint:
         _ep = endpoint
     else:
@@ -4051,13 +4174,17 @@ async def _do_free_request_curl_cffi(
                 else _ep
             )
     try:
-        async with sess_lock:
-            resp = await sess.post(
-                _ep,
-                json=body,
-                headers=req_headers,
-                timeout=(10, 600),  # (connect, read) — read 600: long streams
-            )
+        resp = await slot.sess.post(
+            _ep,
+            json=body,
+            headers=req_headers,
+            timeout=(10, 600),  # (connect, read) — read 600: long streams
+        )
+    except asyncio.CancelledError:
+        # État transport inconnu → on jette l'emprunt sans await (pas de
+        # close dans une tâche annulée) ; le shutdown fermera le reste.
+        pool.discard(slot)
+        raise
     except _err.RequestsError as e:
         # [plan 18/08 §1a] a REAL connection failure (dead SOCKS5 tunnel)
         # is invisible to the pool — the station stays "connected" and
@@ -4069,11 +4196,14 @@ async def _do_free_request_curl_cffi(
         if station is not None and _is_connect_error(e):
             _signal_connection_failure(station)
         # On pooled session error, evict it so next request gets fresh TLS
-        async with _curl_pool_lock:
-            key = f"{proxy_url or ''}|{profile['impersonate']}"
-            _curl_pool.pop(key, None)
+        # ([A1] éviction de la seule session fautive, le pool survit).
+        await pool.evict(slot)
+        raise
+    except Exception:
+        await pool.evict(slot)
         raise
     # Wrap in a compatible response object
+    await pool.checkin(slot)
     return _CurlCffiResponse(resp)
 
 
@@ -4609,20 +4739,32 @@ async def _open_free_stream(
                 _debug(
                     f"  [free-stream] creating curl_cffi session proxy={_curl_proxy_url(proxy_url)} (pooled)"
                 )
-                sess2, lock2 = await _get_pooled_curl_session(proxy_url, profile["impersonate"])
-                async with lock2:
+                pool2, slot2 = await _get_pooled_curl_session(proxy_url, profile["impersonate"])
+                # [A1 perf] emprunt SANS verrou pendant le POST : seuls les
+                # headers transitent sous l'emprunt, le corps est consommé
+                # après restitution — sémantique inchangée, parallélisme OK.
+                try:
                     _debug(f"  [free-stream] posting to {endpoint} (pooled)")
                     _t0_ttfb = time.monotonic()
-                    resp = await sess2.post(endpoint, json=body, headers=req_headers, stream=True)
-                    _debug(f"  [free-stream] response status={resp.status_code}")
-                    wrapped = _CurlCffiStreamResponse(resp)
-                    # [v10 §3.6.1 Lot 5] TTFB streaming : la 1ʳᵉ lecture du
-                    # consommateur recordera la mesure au moteur.
-                    wrapped._ttfb_ctx = (
-                        station,
-                        _t0_ttfb,
-                        str(body.get("model") or body.get("original_model") or ""),
+                    resp = await slot2.sess.post(
+                        endpoint, json=body, headers=req_headers, stream=True
                     )
+                except asyncio.CancelledError:
+                    pool2.discard(slot2)
+                    raise
+                except BaseException:
+                    _evict_later(pool2, slot2)
+                    raise
+                await pool2.checkin(slot2)
+                _debug(f"  [free-stream] response status={resp.status_code}")
+                wrapped = _CurlCffiStreamResponse(resp)
+                # [v10 §3.6.1 Lot 5] TTFB streaming : la 1ʳᵉ lecture du
+                # consommateur recordera la mesure au moteur.
+                wrapped._ttfb_ctx = (
+                    station,
+                    _t0_ttfb,
+                    str(body.get("model") or body.get("original_model") or ""),
+                )
                 # [plan 18/08 §am.22] register the in-flight stream so the
                 # watchdog can cancel it the moment egress death is CONFIRMED
                 # (egress_dead) — a client reading a dead tunnel must get the
@@ -4776,18 +4918,27 @@ async def _open_via_pool(endpoint, body, headers, *, is_stream=False, forced_poo
 
     # 3) curl_cffi through SOCKS5 tunnel — POOL partagé avec le chemin free.
     # [v10 PLAN-commun 1.1] fini la AsyncSession jetable (handshake SOCKS5+TLS
-    # par requête, ~300-1000 ms via tunnel) : session poolée par (proxy,
-    # impersonate), lock tenu seulement pour les headers (stream=True),
-    # consommation du corps HORS verrou — même sémantique que le chemin free.
+    # par requête, ~300-1000 ms via tunnel). [A1 perf] checkout/checkin sans
+    # verrou pendant le transfert : M sessions par (proxy, impersonate), le
+    # POST geo non-streaming ne sérialise plus la station.
     resp = None
+    pool = None
+    slot = None
     try:
-        sess, sess_lock = await _get_pooled_curl_session(
+        pool, slot = await _get_pooled_curl_session(
             proxy_url, profile.get("impersonate", "chrome131")
         )
-        async with sess_lock:
-            raw = await sess.post(
+        try:
+            raw = await slot.sess.post(
                 endpoint, json=body, headers=req_headers, stream=True
             )
+        except asyncio.CancelledError:
+            pool.discard(slot)
+            raise
+        except BaseException:
+            _evict_later(pool, slot)
+            raise
+        await pool.checkin(slot)
         resp = (
             _CurlCffiStreamResponse(raw)
             if is_stream
@@ -8861,10 +9012,11 @@ async def messages(request: Request):
                         choices = chunk.get("choices", [])
                         if not choices or not isinstance(choices, list):
                             # 可能是 Responses API format — try converting
-                            _debug(
-                                f"  [stream-oai] no choices, trying responses_sse convert: {data[:200]!r}"
-                            )
-                            converted = _responses_sse_to_chat_deltas(data)
+                            if _cfg_settings.DEBUG:
+                                _debug(
+                                    f"  [stream-oai] no choices, trying responses_sse convert: {data[:200]!r}"
+                                )
+                            converted = _responses_sse_to_chat_deltas(data, parsed=chunk)
                             if converted is None:
                                 continue
                             chunk = converted
@@ -10140,7 +10292,7 @@ async def chat_completions(request: Request):
                                 actual_usage = chunk_usage
                             # Responses API stream (muse) : convertir avant de tester choices
                             if chunk.get("type", "").startswith("response."):
-                                converted = _responses_sse_to_chat_deltas(data_str)
+                                converted = _responses_sse_to_chat_deltas(data_str, parsed=chunk)
                                 if converted is not None:
                                     chunk = converted
                                     # usage-only (completed/incomplete) → finaliser
@@ -10164,7 +10316,7 @@ async def chat_completions(request: Request):
                             choices = chunk.get("choices", [])
                             if not choices or not isinstance(choices, list):
                                 # 可能是 Responses API format — try converting (fallback legacy)
-                                converted = _responses_sse_to_chat_deltas(data_str)
+                                converted = _responses_sse_to_chat_deltas(data_str, parsed=chunk)
                                 if converted is not None:
                                     chunk = converted
                                     choices = chunk.get("choices", [])
@@ -12004,7 +12156,7 @@ async def responses(request: Request):
                     choices = chunk.get("choices", [])
                     if not choices or not isinstance(choices, list):
                         # 可能是 Responses API format — try converting
-                        converted = _responses_sse_to_chat_deltas(data_str)
+                        converted = _responses_sse_to_chat_deltas(data_str, parsed=chunk)
                         if converted is None:
                             continue
                         chunk = converted
@@ -12104,7 +12256,7 @@ async def responses(request: Request):
         choices = chunk.get("choices", [])
         if not choices or not isinstance(choices, list):
             # 可能是 Responses API format — try converting
-            converted = _responses_sse_to_chat_deltas(data_str)
+            converted = _responses_sse_to_chat_deltas(data_str, parsed=chunk)
             if converted is None:
                 continue
             chunk = converted

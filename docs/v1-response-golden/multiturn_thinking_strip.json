@@ -89,6 +89,6 @@
     "stream": false,
     "reasoning_effort": "max"
   },
-  "_note": "multi-tours : thinking synthétique strippé, original préservé, redacted_thinking strippé (PLAN-raisonnement D.2/D.4)",
+  "_note": "multi-tours : thinking synthétique ET original préservés en reasoning_content (parité multi-tours), redacted_thinking strippé (correctif post-livraison PLAN-raisonnement)",
   "_generated_by": "scripts/gen_golden_fixtures.py (plan v10 §11.5)"
 }

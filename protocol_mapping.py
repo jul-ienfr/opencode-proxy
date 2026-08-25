@@ -13,6 +13,15 @@ from dashboard.display import debug as _debug
 from dashboard.display import log as _log
 
 try:
+    import config.settings as _cfg_settings
+except ImportError:  # pragma: no cover
+
+    class _CfgFallback:
+        DEBUG = False
+
+    _cfg_settings = _CfgFallback()
+
+try:
     import tiktoken
 
     _encoding = tiktoken.get_encoding("cl100k_base")
@@ -1540,26 +1549,35 @@ _responses_tool_index_map: dict = {}  # output_index -> sequential tool index (0
 _reasoning_seen_ids: set = set()
 
 
-def _responses_sse_to_chat_deltas(raw_line: str):
+def _responses_sse_to_chat_deltas(raw_line: str, parsed=None):
     """Convert one Responses API SSE data line to chat/completions delta chunks.
 
     Yields 0..N dicts in chat/completions streaming format:
       {"choices": [{"delta": {"content": "...", "reasoning_content": "..."}, "finish_reason": null}]}
     so the existing stream parser in stream_gen() works unchanged.
 
+    [C2 perf] ``parsed``: dict déjà parsé par l'appelant (son propre
+    _json_loads(data_str)) — évite un second parse identique par chunk SSE.
+    Ignoré quand None (compatibilité appelants legacy / fixtures golden).
+
     Returns None if the line is [DONE] or not parseable.
     """
     if raw_line == "[DONE]":
         return None
-    try:
-        chunk = _json_loads(raw_line)
-    except Exception:
-        return None
-    if not isinstance(chunk, dict):
-        return None
+    if parsed is not None and isinstance(parsed, dict):
+        chunk = parsed
+    else:
+        try:
+            chunk = _json_loads(raw_line)
+        except Exception:
+            return None
+        if not isinstance(chunk, dict):
+            return None
 
     etype = chunk.get("type", "")
-    _debug(f"  [responses-sse] event type={etype!r} keys={list(chunk.keys())[:8]}")
+    if _cfg_settings.DEBUG:
+        # [B4 perf] f-string par delta — construite seulement quand DEBUG on
+        _debug(f"  [responses-sse] event type={etype!r} keys={list(chunk.keys())[:8]}")
 
     # response.output_text.delta — direct text delta (Responses API streaming format)
     if etype == "response.output_text.delta":
@@ -1573,9 +1591,11 @@ def _responses_sse_to_chat_deltas(raw_line: str):
         delta_obj = chunk.get("delta", {})
         dtype = delta_obj.get("type", "")
         text = delta_obj.get("text", "")
-        _debug(
-            f"  [responses-sse] content_part.delta dtype={dtype!r} text={text[:80]!r} full_delta_keys={list(delta_obj.keys())[:10]}"
-        )
+        if _cfg_settings.DEBUG:
+            # [B4 perf] slice+repr par delta — construits seulement DEBUG on
+            _debug(
+                f"  [responses-sse] content_part.delta dtype={dtype!r} text={text[:80]!r} full_delta_keys={list(delta_obj.keys())[:10]}"
+            )
         if not text:
             return None
         if dtype == "output_text":
