@@ -1880,13 +1880,19 @@ def register_dashboard(
         mgr = server_manager_getter() if server_manager_getter else None
         if not mgr:
             return {"status": "error", "message": "Aucun gestionnaire de serveur disponible"}
-        if full:
-            # Schedule full restart after response is sent
-            loop = asyncio.get_event_loop()
-            loop.call_soon(mgr.full_restart)
-            return {"status": "ok", "message": "Redémarrage complet déclenché"}
-        mgr.restart()
-        return {"status": "ok", "message": "Proxy redémarré"}
+        # [v10 fix P1 incident 25/08] Le handler tourne SUR la boucle uvicorn
+        # qu'on va éteindre : stop()+start() dans ce call-stack couraient
+        # contre le démontage de la boucle (serveur parfois laissé mort).
+        # Redémarrage sur THREAD DÉDIÉ + réponse immédiate — le thread survit
+        # au démontage et le start() s'exécute dans de bonnes conditions.
+        import threading
+
+        target = mgr.full_restart if full else mgr.restart
+        threading.Thread(target=target, name="proxy-restart", daemon=False).start()
+        msg = (
+            "Redémarrage complet déclenché" if full else "Redémarrage déclenché"
+        )
+        return {"status": "ok", "message": msg}
 
     # ── Stats & history ──
 
