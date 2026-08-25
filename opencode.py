@@ -6455,16 +6455,29 @@ async def _sse_coalesce(stream, max_group_bytes: int = _SSE_COALESCE_MAX_BYTES):
 # ── Routing fast cache (O(1) exact + substring) ──
 _route_cache: dict[str, dict | None] = {}
 _ROUTE_CACHE_MAX = 2048
+# Dernière génération de routes vue par ce cache : une divergence avec
+# _cfg_settings.ROUTE_VERSION (incrémenté par save_custom_routes / le reload
+# mtime / save_env) déclenche un clear unique du cache.
+_seen_route_version = -1
 
 
 def _route_for(model_name: str) -> dict | None:
+    global _seen_route_version
+    # Check reload AVANT le lookup cache — il est throttlé à 5 s via
+    # _custom_routes_last_check (≈ 2 stat() par fenêtre), donc le coût est
+    # négligeable ; sans lui, un cache chaud ne verrait jamais les éditions
+    # externes de config.yaml.
+    maybe_reload_custom_routes()
+    rv = _cfg_settings.ROUTE_VERSION
+    if rv != _seen_route_version:
+        _seen_route_version = rv
+        if _route_cache:
+            _route_cache.clear()
     cache_key = model_name.lower().strip()
     if cache_key in _route_cache:
         return _route_cache[cache_key]
-    maybe_reload_custom_routes()
     name = model_name.lower().strip()
     if not name:
-        _route_cache[cache_key] = None
         return None
     # When DISABLE_MAPPING, only check custom routes (not auto-generated aliases)
     # but keep manual opus/sonnet/haiku aliases (they are defined in ROUTES even when auto-mapping is off)
@@ -6498,7 +6511,7 @@ def _route_for(model_name: str) -> dict | None:
             _debug(f"  [route] DISABLE_MAPPING direct model: '{name}'")
             return res
         _debug(f"  [route] DISABLE_MAPPING no match for '{name}'")
-        _route_cache[cache_key] = None
+        # None NON caché : une route ajoutée plus tard doit être détectée.
         return None
     # 0. Exact MODELS lookup first (fastest, O(1) — covers 90% of prod traffic)
     if name in MODELS:
@@ -6539,9 +6552,8 @@ def _route_for(model_name: str) -> dict | None:
         return wildcard
     # 5. No match found
     _debug(f"  [route] no match for '{name}'")
-    if len(_route_cache) >= _ROUTE_CACHE_MAX:
-        _route_cache.clear()
-    _route_cache[cache_key] = None
+    # None NON caché : une route ajoutée plus tard pour ce modèle doit être
+    # détectée au prochain passage.
     return None
 
 
@@ -9054,6 +9066,8 @@ async def messages(request: Request):
 
                         if data == "[DONE]":
                             _ti, _ts = _thinking_flush()
+                            # [B1] résout l'estimation différée avant réconciliation
+                            stream_in_est = await _ensure_stream_in_est()
                             async for ev in _finalize_and_close_stream(
                                 started,
                                 open_blocks,
@@ -9136,6 +9150,9 @@ async def messages(request: Request):
 
                         if not started:
                             started = True
+                            # [B1] l'estimation a tourné en parallèle de la
+                            # connexion upstream — résolue ici sans coût TTFB.
+                            stream_in_est = await _ensure_stream_in_est()
                             yield _sse(
                                 "message_start",
                                 {

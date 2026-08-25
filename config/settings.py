@@ -1426,7 +1426,10 @@ def save_custom_routes(routes: dict):
     if err:
         raise ValueError(err)
     global SORTED_ROUTES, SORTED_CUSTOM_ROUTES
-    _yaml_data.setdefault("custom_routes", {}).update(routes)
+    # Remplacement TOTAL (et non .update) : l'unique appelant (dashboard
+    # /api/config/custom-routes) poste l'état complet reconstruit par le GUI.
+    # Un merge ferait ressusciter les routes supprimées côté GUI.
+    _yaml_data["custom_routes"] = dict(routes)
     with _reload_lock:
         CUSTOM_ROUTES.clear()
         CUSTOM_ROUTES.update(routes)
@@ -1434,6 +1437,7 @@ def save_custom_routes(routes: dict):
         ROUTES.update(load_routes())
         SORTED_ROUTES = _sort_routes_by_match(ROUTES)
         SORTED_CUSTOM_ROUTES = _sort_routes_by_match(CUSTOM_ROUTES)
+        _bump_route_version_unlocked()
     save_yaml_config()
 
 
@@ -1513,6 +1517,34 @@ def _sort_routes_by_match(routes: dict) -> list:
 # Pre-sorted route lists (rebuilt on load/reload)
 SORTED_ROUTES = _sort_routes_by_match(ROUTES)
 SORTED_CUSTOM_ROUTES = _sort_routes_by_match(CUSTOM_ROUTES)
+
+# Monotonic route-generation counter: bumped on every mutation of
+# ROUTES/CUSTOM_ROUTES/SORTED_* (save_custom_routes, maybe_reload, save_env).
+# opencode._route_for compares it to its last-seen value to invalidate the
+# O(1) _route_cache — one int compare per request.
+ROUTE_VERSION: int = 0
+
+
+def _bump_route_version_unlocked():
+    """Variante SANS verrou — à n'appeler QUE en tenant déjà _reload_lock."""
+    global ROUTE_VERSION
+    ROUTE_VERSION += 1
+    try:
+        get_model_config.cache_clear()
+    except AttributeError:
+        pass
+
+
+def _bump_route_version():
+    """Invalider tous les caches de routage après une mutation des routes.
+
+    Point d'invalidation UNIQUE : tout site qui reconstruit ROUTES/CUSTOM_ROUTES
+    doit appeler ce helper (ou la variante unlocked s'il tient déjà le verrou).
+    Lock non réentrant : ne JAMAIS appeler save_yaml_config() depuis un with
+    _reload_lock.
+    """
+    with _reload_lock:
+        _bump_route_version_unlocked()
 
 
 def maybe_reload_custom_routes():
@@ -1680,6 +1712,9 @@ def maybe_reload_custom_routes():
 
                 SORTED_ROUTES = _sort_routes_by_match(ROUTES)
                 SORTED_CUSTOM_ROUTES = _sort_routes_by_match(CUSTOM_ROUTES)
+                # Invalidation centralisée : on tient déjà le verrou → variante
+                # unlocked (Lock non réentrant).
+                _bump_route_version_unlocked()
                 logging.info(
                     "Reloaded routes (%d routes, cfg_changed=%s)", len(ROUTES), cfg_changed
                 )
@@ -1744,8 +1779,10 @@ def save_env(updates: dict):
             global OPENCODE_GO_USE_BALANCE
             OPENCODE_GO_USE_BALANCE = value.lower() in ("1", "true", "yes")
 
-    global ROUTES
+    global ROUTES, SORTED_ROUTES
     ROUTES = load_routes()
+    SORTED_ROUTES = _sort_routes_by_match(ROUTES)
+    _bump_route_version()  # pas de verrou tenu ici → variante lockée
     logger.debug("[config] save_env: applied %d vars", len(updates))
 
 
