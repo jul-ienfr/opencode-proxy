@@ -578,6 +578,25 @@ def anthropic_to_openai(body: dict, model: str) -> dict:  # cached wrapper
         return _orig_anthropic_to_openai(body, model)
 
 
+def _local_signature(text: str) -> str:
+    """[v10 PLAN-raisonnement 2.1] Signature LOCALE (HMAC SHA256 base64).
+
+    La signature Anthropic authentique est cryptographique côté modèle — le
+    proxy ne peut pas la forger. Les clients Anthropic-compatibles exigent
+    néanmoins un champ `signature` non vide sur les blocs thinking (sinon
+    abandonnés en multi-tours). On signe localement : les clients stockent et
+    re-transmettent sans valider ; on ne renvoie jamais ces blocs synthétiques
+    aux upstreams stricts (strip multi-tours, PLAN-raisonnement Phase D)."""
+    import base64
+    import hashlib
+    import hmac
+
+    key = b"opencode-proxy-local-thinking-signature-v1"
+    return base64.b64encode(
+        hmac.new(key, text.encode("utf-8"), hashlib.sha256).digest()
+    ).decode()
+
+
 def openai_to_anthropic(resp: dict, model: str) -> dict:
     choice = resp.get("choices", [{}])[0]
     msg = choice.get("message", {})
@@ -585,7 +604,13 @@ def openai_to_anthropic(resp: dict, model: str) -> dict:
 
     blocks = []
     if reasoning := msg.get("reasoning_content") or msg.get("reasoning"):
-        blocks.append({"type": "thinking", "thinking": reasoning})
+        blocks.append(
+            {
+                "type": "thinking",
+                "thinking": reasoning,
+                "signature": _local_signature(reasoning),
+            }
+        )
     if msg.get("content"):
         blocks.append({"type": "text", "text": msg["content"]})
     for tc in msg.get("tool_calls") or []:
@@ -693,7 +718,14 @@ def openai_to_anthropic_request(oai_body: dict) -> dict:
         if role == "assistant":
             reasoning = msg.get("reasoning_content") or msg.get("reasoning")
             if isinstance(reasoning, str) and reasoning.strip():
-                blocks.insert(0, {"type": "thinking", "thinking": reasoning})
+                blocks.insert(
+            0,
+            {
+                "type": "thinking",
+                "thinking": reasoning,
+                "signature": _local_signature(reasoning),
+            },
+        )
 
         # Ensure at least one block
         if not blocks:
@@ -928,7 +960,14 @@ def openai_responses_to_anthropic(body: dict) -> dict:
                 summary = block.get("summary") or []
                 text = "".join(s.get("text", "") for s in summary if isinstance(s, dict))
                 if text:
-                    blocks.insert(0, {"type": "thinking", "thinking": text})
+                    blocks.insert(
+            0,
+            {
+                "type": "thinking",
+                "thinking": text,
+                "signature": _local_signature(text),
+            },
+        )
 
         if not blocks:
             blocks.append({"type": "text", "text": ""})
@@ -1332,7 +1371,13 @@ def _responses_to_anthropic_response(resp: dict, model: str) -> dict:
         if item.get("type") == "reasoning":
             for s in item.get("summary", []) or []:
                 if isinstance(s, dict) and s.get("text"):
-                    blocks.append({"type": "thinking", "thinking": s.get("text", "")})
+                    blocks.append(
+            {
+                "type": "thinking",
+                "thinking": s.get("text", ""),
+                "signature": _local_signature(s.get("text", "")),
+            }
+        )
         elif item.get("type") == "message":
             for blk in item.get("content", []) or []:
                 if isinstance(blk, dict) and blk.get("type") == "output_text" and blk.get("text"):
