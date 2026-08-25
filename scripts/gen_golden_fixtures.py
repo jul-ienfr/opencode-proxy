@@ -281,11 +281,14 @@ def case_sse_deltas():
 
 
 def case_multiturn_thinking_strip():
-    """[PLAN-raisonnement Phase D] Historique multi-tours vers upstream openai.
+    """[Correctif parité multi-tours — remplace Phase D.2] Historique multi-tours
+    vers upstream openai-compatible.
 
-    Bloc SYNTHÉTIQUE (signature locale du proxy) -> supprimé ; bloc ORIGINAL
-    (signature authentique) -> conservé en reasoning_content ;
-    redacted_thinking -> strippé (réservé aux upstreams Anthropic)."""
+    Bloc SYNTHÉTIQUE (signature locale du proxy) et bloc ORIGINAL (signature
+    authentique) -> tous deux préservés en reasoning_content (parité avec
+    l'usage direct : les signatures ne transitent jamais, seul le texte) ;
+    redacted_thinking -> strippé (donnée chiffrée non interprétable hors
+    upstreams Anthropic)."""
     anthro = {
         "model": "claude-sonnet-4-5",
         "max_tokens": 512,
@@ -323,8 +326,9 @@ def case_multiturn_thinking_strip():
         "fn": "anthropic_to_openai",
         "input": {"body": anthro, "model": "deepseek-v4-flash"},
         "note": (
-            "multi-tours : thinking synthétique strippé, original préservé, "
-            "redacted_thinking strippé (PLAN-raisonnement D.2/D.4)"
+            "multi-tours : thinking synthétique ET original préservés en "
+            "reasoning_content (parité multi-tours), redacted_thinking strippé "
+            "(correctif post-livraison PLAN-raisonnement)"
         ),
     }
 

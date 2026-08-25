@@ -110,6 +110,8 @@ models:
     protocol: openai
   longcat-2.0:
     protocol: openai
+  grok-4.6:
+    protocol: openai
 free_model_map:
   mimo-v2.5: deepseek-v4-flash-free
   qwen3.7-max: mimo-v2.5-free
@@ -265,16 +267,16 @@ custom_routes:
   mimov25pro:
     match:
     - mimo-v2.5-pro
-    model: x-preview-f-free
+    model: muse-spark-1.2-contributor
   qwen35plus:
     match:
     - qwen3.5-plus
-    model: x-preview-f-free
+    model: muse-spark-1.2-contributor
     thinking: adaptive
   gpt54mini:
     match:
     - gpt-5.4-mini
-    model: x-preview-f-free
+    model: muse-spark-1.2-contributor
   kimik26:
     match:
     - kimi-k2.6
@@ -296,6 +298,10 @@ custom_routes:
     - 0xalpha
     - ox-alpha
     - oxalpha
+    model: x-preview-f-free
+  glm51:
+    match:
+    - glm-5.1
     model: x-preview-f-free
 api_keys: []
 pricing:

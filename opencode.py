@@ -4314,8 +4314,8 @@ class _CurlCffiResponse:
         self._content_override = value
 
     def json(self):
-
-        return _json_loads(self.text)
+        # [E3 perf] parse direct des bytes — évite le détour str(bytes)
+        return _json_loads(self.content)
 
 
 class _CurlCffiStreamResponse:
@@ -5563,8 +5563,10 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
             wrapped._converted = cdata
             orig_json = wrapped._resp.json if hasattr(wrapped._resp, "json") else (lambda: cdata)
             wrapped.json = lambda: cdata
-            wrapped.content = _json_dumps_str(cdata, ensure_ascii=False).encode()
-            wrapped.text = _json_dumps_str(cdata, ensure_ascii=False)
+            # [C3 perf] un seul dump : content (bytes) puis text = decode()
+            _c3_bytes = _json_dumps(cdata)
+            wrapped.content = _c3_bytes
+            wrapped.text = _c3_bytes.decode()
             return wrapped, resp_headers, free_model, free_ip
         except Exception as e:
             _debug(f"  [free] /responses conversion failed: {e}")
@@ -5709,6 +5711,15 @@ async def _do_request_with_retry(endpoint, body, headers, protocol, retry_on_429
     Returns (response, final_headers) -- headers may differ after retry.
     Raises UpstreamError on connection/timeout/protocol failures.
     """
+    # ── Orphan guard (defense in depth) ──
+    if isinstance(body, dict):
+        if "messages" in body:
+            body["messages"] = _drop_orphan_tool_messages(body["messages"])
+        elif "input" in body:
+            body["input"] = _drop_orphan_responses_input(body["input"])
+            # [Correctif parité multi-tours] marqueur interne jamais envoyé à
+            # l'upstream — consommé par le retry-once du caller.
+            body.pop("_has_synthetic_reasoning_items", None)
     # ── Orphan guard (defense in depth) ──
     if isinstance(body, dict):
         if "messages" in body:
@@ -7260,21 +7271,6 @@ async def messages(request: Request):
 
     body = ensure_min_tokens(body)
 
-    # [PLAN-raisonnement Phase D] Strip sélectif multi-tours : les blocs
-    # thinking signés LOCALEMENT par le proxy (synthétisés depuis
-    # reasoning_content) ne partent jamais vers un upstream — seul Anthropic
-    # direct valide cryptographiquement les signatures, et on ne lui ment pas.
-    # Les blocs ORIGINAUX (signature authentique) et redacted_thinking passent
-    # intacts (passthrough Anthropic préservé).
-    try:
-        _stripped_thinking = strip_synthetic_thinking(body)
-        if _stripped_thinking:
-            _log(
-                f"  [thinking] {_stripped_thinking} bloc(s) thinking à signature locale strippé(s) de l'historique"
-            )
-    except Exception as e:
-        _debug(f"  [thinking] strip_synthetic_thinking failed: {type(e).__name__}: {e}")
-
     # Apply custom route overrides for thinking/effort
     thinking_override = route.get("thinking")
     if thinking_override and thinking_override != "auto":
@@ -7322,6 +7318,22 @@ async def messages(request: Request):
 
     # ── Anthropic pass-through ──────────────────────────────────
     if protocol == "anthropic":
+        # [PLAN-raisonnement Phase D + correctif parité multi-tours] Strip
+        # sélectif RÉSERVÉ à Anthropic direct : les blocs thinking signés
+        # LOCALEMENT par le proxy (synthétisés depuis reasoning_content) ne lui
+        # sont jamais envoyés — il valide cryptographiquement les signatures et
+        # on ne lui ment pas. Vers les upstreams openai-compatibles, le texte
+        # voyage tel quel en reasoning_content (parité avec l'usage direct —
+        # les signatures n'y voyagent de toute façon jamais).
+        try:
+            _stripped_thinking = strip_synthetic_thinking(body)
+            if _stripped_thinking:
+                _log(
+                    f"  [thinking] {_stripped_thinking} bloc(s) thinking à signature locale strippé(s) de l'historique (upstream anthropic)"
+                )
+        except Exception as e:
+            _debug(f"  [thinking] strip_synthetic_thinking failed: {type(e).__name__}: {e}")
+
         is_stream = body.get("stream", False)
 
         # ── Free model: try BEFORE auth (free models don't need API keys) ──
@@ -7645,6 +7657,8 @@ async def messages(request: Request):
                 # fresh stations; paid retry budget preserved
                 # (max_free_attempts=1 ⇒ exact legacy behaviour).
                 _free_bound += max(0, effective_free_max_attempts(_free_forced_pool) - 1)
+            # [E1 perf] hoisté hors de la boucle par chunk (dict lookups/chunk sinon)
+            _line_buf_max = yaml_get("streaming", "line_buffer_max", 1_000_000)
             for _attempt in range(_free_bound):
                 used_tools = []  # Reset on each retry attempt
                 _line_buf = ""  # fresh per attempt — avoids stale truncated data: re-parse
@@ -7871,7 +7885,7 @@ async def messages(request: Request):
                         async for chunk in resp.aiter_bytes():
                             yield chunk
                             _line_buf += chunk.decode("utf-8", errors="replace")
-                            if len(_line_buf) > yaml_get("streaming", "line_buffer_max", 1_000_000):
+                            if len(_line_buf) > _line_buf_max:
                                 # Truncate on newline boundary to avoid splitting JSON (fix truncation mid-JSON)
                                 _keep = 1000
                                 _tail = _line_buf[-_keep:]
@@ -7908,8 +7922,11 @@ async def messages(request: Request):
                                     # Consolidated: single lock acquisition for input + cache update
                                     if stream_in is not None or stream_cache:
                                         try:
+                                            # [E4 perf] l'await reste HORS du
+                                            # threading.Lock — un await sous
+                                            # verrou bloquant peut geler le loop.
+                                            est_input = await _est_task
                                             with _token_lock:
-                                                est_input = await _est_task
                                                 if stream_in is not None:
                                                     _token_usage[_track_model]["input"] += (
                                                         stream_in - est_input
@@ -8320,6 +8337,29 @@ async def messages(request: Request):
             return JSONResponse(status_code=e.status_code, content={"error": str(e)})
         account_alias = _alias_for_key(_key_from_headers(headers, "openai"))
         _debug(f"  response status={resp.status_code} size={len(resp.content)} bytes")
+        _debug(f"  response status={resp.status_code} size={len(resp.content)} bytes")
+        # [Correctif parité multi-tours] Retry-once défensif : si l'upstream
+        # /responses rejette les items reasoning synthétiques (400/422),
+        # retenter UNE fois sans eux plutôt que de casser le tour entier
+        # (texte + tool calls) pour tous les clients routés sur ce endpoint.
+        if (
+            resp.status_code in (400, 422)
+            and isinstance(oai_body, dict)
+            and oai_body.get("input") is not None
+            and oai_body.pop("_has_synthetic_reasoning_items", False)
+        ):
+            _pre = len(oai_body["input"])
+            oai_body["input"] = [
+                i for i in oai_body["input"] if not (isinstance(i, dict) and i.get("type") == "reasoning")
+            ]
+            _log(
+                f"  [thinking] upstream {resp.status_code} avec items reasoning → retry sans ({_pre}→{len(oai_body['input'])} items)"
+            )
+            try:
+                resp, headers = await _do_request_with_retry(endpoint, oai_body, headers, "openai")
+            except UpstreamError as e:
+                return JSONResponse(status_code=e.status_code, content={"error": str(e)})
+            _debug(f"  [retry-no-reasoning] response status={resp.status_code}")
         if resp.status_code != 200:
             await _log_and_save_error(
                 req_id,
@@ -8511,11 +8551,23 @@ async def messages(request: Request):
             _using_free = True
         else:
             _using_free = False
-        stream_in_est = await asyncio.to_thread(_estimate_input_tokens, body)
-        _debug(f"  [stream-oai] est_input={stream_in_est}")
-        _debug(f"  [stream-oai] before _update_token_usage model={_req_model_id}")
-        _update_token_usage(_req_model_id, stream_in_est, 0, 0)
-        _debug("  [stream-oai] after _update_token_usage")
+        # [B1 perf / v10 PLAN-commun 1.3] estimation tiktoken DIFFÉRÉE : elle
+        # tourne en tâche concurrente avec la connexion upstream — le premier
+        # yield n'attend plus le comptage (−20 à −150 ms de TTFB sur gros
+        # contexte). Résolue paresseusement au premier besoin réel
+        # (message_start / usage upstream / finalisation).
+        stream_in_est = None
+
+        async def _ensure_stream_in_est():
+            nonlocal stream_in_est
+            if stream_in_est is None:
+                stream_in_est = await asyncio.to_thread(_estimate_input_tokens, body)
+                if _cfg_settings.DEBUG:
+                    _debug(f"  [stream-oai] est_input={stream_in_est}")
+                _update_token_usage(_req_model_id, stream_in_est, 0, 0)
+            return stream_in_est
+
+        _est_task = asyncio.create_task(_ensure_stream_in_est())
         started = False
         open_blocks = []
         text_block_idx = None
@@ -9038,6 +9090,8 @@ async def messages(request: Request):
                         return
                     continue
                 try:
+                    # [B1] résout l'estimation différée avant le rollback
+                    stream_in_est = await _ensure_stream_in_est()
                     with _token_lock:
                         _token_usage[_req_model_id]["input"] -= stream_in_est
                 except Exception:
@@ -9101,6 +9155,8 @@ async def messages(request: Request):
         if got_response_completed and not emitted_finish:
             _debug("  [stream-oai] post-loop: finalizing Responses API stream")
             _ti, _ts = _thinking_flush()
+            # [B1] résout l'estimation différée avant réconciliation
+            stream_in_est = await _ensure_stream_in_est()
             async for ev in _finalize_and_close_stream(
                 started,
                 open_blocks,
@@ -9832,9 +9888,21 @@ async def chat_completions(request: Request):
                 _track_model = free_model
             else:
                 _using_free = False
-            est_input = await asyncio.to_thread(_estimate_input_tokens, body)
-            _update_token_usage(_track_model, est_input, 0, 0)
-            _debug(f"  [chat-stream] est_input={est_input}")
+            # [B1 perf] estimation tiktoken DIFFÉRÉE (même motif que
+            # anthropic_stream) : tâche concurrente avec la connexion upstream,
+            # résolue paresseusement à la finalisation / rollback.
+            est_input = None
+
+            async def _ensure_est_input():
+                nonlocal est_input
+                if est_input is None:
+                    est_input = await asyncio.to_thread(_estimate_input_tokens, body)
+                    _update_token_usage(_track_model, est_input, 0, 0)
+                    if _cfg_settings.DEBUG:
+                        _debug(f"  [chat-stream] est_input={est_input}")
+                return est_input
+
+            _est_task = asyncio.create_task(_ensure_est_input())
             stream_out = 0
             _has_yielded = False
             _oai_has_yielded = False
@@ -10197,6 +10265,8 @@ async def chat_completions(request: Request):
                                 )
                                 emitted_finish = True
                         # Stream ended — finalize tracking
+                        # [B1] résout l'estimation différée avant réconciliation
+                        est_input = await _ensure_est_input()
                         final_in, final_out, final_cache, log_tag = _finalize_stream_tokens(
                             _track_model,
                             est_input,
@@ -10353,6 +10423,8 @@ async def chat_completions(request: Request):
                             return
                         continue
                     try:
+                        # [B1] résout l'estimation différée avant le rollback
+                        est_input = await _ensure_est_input()
                         with _token_lock:
                             _token_usage[_track_model]["input"] -= est_input
                     except Exception as e:
@@ -10634,7 +10706,7 @@ async def chat_completions(request: Request):
             # (max_free_attempts=1 ⇒ exact legacy behaviour).
             _free_bound += max(0, effective_free_max_attempts(_free_forced_pool) - 1)
         for _attempt in range(_free_bound):
-            _line_buf = ""  # fresh per attempt — avoids stale truncated data:
+            _line_buf = ""  # fresh per attempt — avoids stale truncated data: re-parse
             try:
                 # Axe A: geo-restricted paid streaming → route through tunnel station
                 _stream_ctx = (

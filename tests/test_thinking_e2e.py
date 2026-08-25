@@ -183,7 +183,7 @@ async def test_terminate_without_thinking_no_signature_delta():
 # ── Multi-tours (Phase D) ─────────────────────────────────────────────
 
 
-def test_multitour_roundtrip_synthetic_stripped_original_kept():
+def test_multitour_synthetic_reasoning_preserved_for_openai_upstream():
     # 1) réponse upstream openai → réponse anthropic signée localement
     resp = {
         "choices": [
@@ -213,8 +213,11 @@ def test_multitour_roundtrip_synthetic_stripped_original_kept():
     }
     conv = pm.anthropic_to_openai(body, "upstream-model")
     asst = next(m for m in conv["messages"] if m["role"] == "assistant")
-    # bloc SYNTHÉTIQUE supprimé de l'historique upstream
-    assert "raisonnement du modèle tiers" not in json.dumps(conv)
+    # [Correctif parité multi-tours] le raisonnement synthétique voyage tel
+    # quel vers l'upstream openai-compatible (parité avec l'usage direct) —
+    # seules les signatures ne transitent jamais.
+    assert asst["reasoning_content"] == "raisonnement du modèle tiers"
+    assert "raisonnement du modèle tiers" not in json.dumps(conv["messages"][0]["content"])
     # le bloc servi au client était complet (signature locale)
     assert thinking_block["signature"] == pm._local_signature("raisonnement du modèle tiers")
 
@@ -256,6 +259,78 @@ def test_multitour_redacted_stripped_for_openai_upstream():
     }
     conv = pm.anthropic_to_openai(body, "upstream")
     assert "BLOB" not in json.dumps(conv)
+
+
+# ── Correctif parité multi-tours : /responses (fix 3) ─────────────────
+
+
+def test_chat_to_responses_emits_reasoning_item_before_output_text():
+    chat = {
+        "model": "muse-spark",
+        "stream": False,
+        "messages": [
+            {"role": "user", "content": "Q"},
+            {
+                "role": "assistant",
+                "content": "Réponse.",
+                "reasoning_content": "réflexion interne du tour précédent",
+            },
+            {"role": "user", "content": "Q2"},
+        ],
+    }
+    req = pm._chat_to_responses_request(chat)
+    inp = req["input"]
+
+    types = [i.get("type") or f'message:{i.get("role")}' for i in inp]
+    # ordre : user → reasoning → assistant(output_text) → user
+    assert types == ["message:user", "reasoning", "message:assistant", "message:user"]
+
+    ritem = inp[1]
+    assert ritem["type"] == "reasoning"
+    assert ritem["summary"] == [{"type": "summary_text", "text": "réflexion interne du tour précédent"}]
+    # le marqueur de retry-once est posé
+    assert req["_has_synthetic_reasoning_items"] is True
+
+
+def test_chat_to_responses_reasoning_item_with_tool_calls_ordering():
+    chat = {
+        "model": "muse-spark",
+        "messages": [
+            {
+                "role": "assistant",
+                "content": "",
+                "reasoning_content": "je vais appeler l'outil",
+                "tool_calls": [
+                    {
+                        "id": "call_abc",
+                        "type": "function",
+                        "function": {"name": "get_weather", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_abc", "content": "22°C"},
+        ],
+    }
+    req = pm._chat_to_responses_request(chat)
+    inp = req["input"]
+    types = [i.get("type") for i in inp]
+    # reasoning AVANT function_call ; function_call_output après
+    assert types == ["reasoning", "function_call", "function_call_output"]
+
+
+def test_chat_to_responses_no_reasoning_item_without_reasoning_content():
+    for rc in (None, "", "   \n  "):
+        chat = {
+            "model": "m",
+            "messages": [
+                {"role": "assistant", "content": "Réponse.", "reasoning_content": rc},
+            ],
+        }
+        req = pm._chat_to_responses_request(chat)
+        assert not any(
+            isinstance(i, dict) and i.get("type") == "reasoning" for i in req["input"]
+        ), f"reasoning item émis à tort pour reasoning_content={rc!r}"
+        assert "_has_synthetic_reasoning_items" not in req
 
 
 def test_strip_synthetic_thinking_keeps_original_and_redacted():

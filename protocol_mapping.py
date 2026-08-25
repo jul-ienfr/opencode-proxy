@@ -351,14 +351,11 @@ def anthropic_to_openai(body: dict, model: str) -> dict:
                 if "cache_control" in block:
                     last_cache_control = block["cache_control"]
             elif btype == "thinking":
-                if _is_local_signature(block.get("thinking", ""), block.get("signature", "")):
-                    # [PLAN-raisonnement Phase D.2] bloc SYNTHÉTIQUE (signé par
-                    # le proxy) : inutile aux upstreams openai-compatibles,
-                    # supprimé de l'historique. Les ORIGINAUX passent.
-                    _debug(
-                        "  [convert] DROP thinking synthétique (signature locale) → upstream openai"
-                    )
-                    continue
+                # [Correctif parité multi-tours — remplace Phase D.2] les blocs
+                # SYNTHÉTIQUES (signature locale) voyagent désormais comme les
+                # ORIGINAUX : leur texte devient reasoning_content, exactement
+                # ce que l'upstream recevrait sans le proxy. Les signatures ne
+                # transitent jamais vers openai-compatible (seul le texte).
                 thinking_parts.append(block.get("thinking", ""))
             elif btype == "redacted_thinking":
                 # [PLAN-raisonnement Phase D.4] donnée chiffrée authentique :
@@ -1280,6 +1277,7 @@ def _chat_to_responses_request(chat: dict) -> dict:
     if "input" in chat and "messages" not in chat:
         return dict(chat)
     inp = []
+    _has_reasoning_items = False
     for m in chat.get("messages", []) or []:
         role = m.get("role", "user")
         content = m.get("content", "")
@@ -1298,6 +1296,21 @@ def _chat_to_responses_request(chat: dict) -> dict:
                 }
             )
             continue
+        # [Correctif parité multi-tours] raisonnement du tour précédent :
+        # re-émis comme item reasoning plaine-texte, même représentation que
+        # celle que le proxy produit dans SES réponses Responses et que
+        # l'upstream nous renvoie (summary[].text ; pas d'id ni
+        # encrypted_content). Inséré IMMÉDIATEMENT AVANT le message assistant
+        # porteur du reasoning_content — jamais avant un function_call_output.
+        _reasoning_txt = m.get("reasoning_content") or ""
+        if role == "assistant" and isinstance(_reasoning_txt, str) and _reasoning_txt.strip():
+            inp.append(
+                {
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": _reasoning_txt}],
+                }
+            )
+            _has_reasoning_items = True
         if isinstance(content, str):
             if content:
                 ctype = "output_text" if role == "assistant" else "input_text"
@@ -1344,6 +1357,11 @@ def _chat_to_responses_request(chat: dict) -> dict:
         )
         inp.append({"role": "user", "content": [{"type": "input_text", "text": "hello"}]})
     req = {"model": chat.get("model", ""), "input": inp, "stream": bool(chat.get("stream", False))}
+    # [Correctif parité multi-tours] marqueur pour le retry-once : si l'upstream
+    # rejette les items reasoning synthétiques (400/422), /responses retente
+    # une fois sans eux (même payload sinon) au lieu de casser le tour entier.
+    if _has_reasoning_items:
+        req["_has_synthetic_reasoning_items"] = True
     if "max_tokens" in chat:
         req["max_output_tokens"] = chat["max_tokens"]
     if "max_output_tokens" in chat:
