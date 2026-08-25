@@ -3,6 +3,7 @@ Protocol mapping: Anthropic <-> OpenAI <-> Responses
 Extracted from opencode.py (P3.10) - pure move, no behavior change.
 """
 
+import hashlib
 import json
 import re
 import time
@@ -575,26 +576,47 @@ _anthropic_cache: dict = {}
 _anthropic_cache_max = 512
 
 
-def anthropic_to_openai(body: dict, model: str) -> dict:  # cached wrapper
+def _anthropic_cache_key(model: str, body: dict, raw: bytes | None = None) -> str:
+    """[C1 perf/correctesse] clé de cache blake2b(body_bytes ‖ model).
+
+    Remplace ``hash(json.dumps(body))`` : plus de dumps complet par requête
+    quand les bytes bruts sont disponibles chez l'appelant, et surtout plus
+    de collisions ``hash()`` Python (randomisé + 64-bit collisionnable →
+    une MAUVAISE conversion pouvait être servie). blake2b-128 : collision
+    pratiquement impossible ; le model est mélangé séparément (séparateur
+    nul) pour éviter toute ambiguïté de concaténation.
+    """
+    h = hashlib.blake2b(digest_size=16)
+    if raw is not None:
+        h.update(raw)
+    else:
+        h.update(_json_dumps(body))
+    h.update(b"\x00")
+    h.update(model.encode("utf-8", "replace"))
+    return h.hexdigest()
+
+
+def anthropic_to_openai(body: dict, model: str, raw: bytes | None = None) -> dict:
     try:
         # B2c: invalidate cache if body contains role None (poison)
         for _m in body.get("messages", []) or []:
             if isinstance(_m, dict) and _m.get("role") is None:
                 _debug("  [cache] skip cache — role None detected")
                 return _orig_anthropic_to_openai(body, model)
-        b = _json_dumps(body)
-        key = (model, hash(b))
+        key = _anthropic_cache_key(model, body, raw)
         hit = _anthropic_cache.get(key)
         if hit is not None:
-            import copy
-
-            return copy.deepcopy(hit)
+            # [C1] shallow copy TOP-LEVEL uniquement : audit plan §3 — les
+            # mutations post-conversion des callers touchent des clés racine
+            # (model / stream_options / min_tokens), jamais les structures
+            # imbriquées partagées. Fini les deepcopy hit ET miss.
+            return dict(hit)
         res = _orig_anthropic_to_openai(body, model)
         if len(_anthropic_cache) < _anthropic_cache_max:
-            import copy
-
-            _anthropic_cache[key] = copy.deepcopy(res)
-        return res
+            # Objet stocké JAMAIS exposé tel quel (le caller reçoit une
+            # copie racine) → le cache reste pristine sans deepcopy.
+            _anthropic_cache[key] = res
+        return dict(res)
     except Exception:
         return _orig_anthropic_to_openai(body, model)
 

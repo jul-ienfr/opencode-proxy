@@ -6316,24 +6316,42 @@ async def _sse_keepalive(stream_gen, interval: float = _SSE_KEEPALIVE_INTERVAL):
     terminated the whole stream with EOF and no message_stop. Here the read
     task keeps waiting across pings: a slow first chunk or a stalled VPN
     tunnel no longer kills the stream, it just gets bridged by pings.
+
+    [B2 perf] recyclage des tâches : le timer de ping n'est plus annulé/
+    recréé À CHAQUE chunk (~2 Tasks + un asyncio.wait par delta à 50-200
+    deltas/s). Un ``asyncio.Event`` réarme la fenêtre d'idle en place ; le
+    task timer n'est recréé qu'après un VRAI ping (silence réel), et la
+    read-task reste la seule recréée par chunk (un seul anext à la fois).
     """
-    read_task = ping_task = None
+    read_task = None
+    timer_task = None
+    activity = asyncio.Event()
+
+    async def _idle_timer():
+        # Se TERMINE seulement après `interval` SANS activité — l'Event
+        # réarmé par chaque chunk relance la fenêtre sans recycle.
+        while True:
+            activity.clear()
+            try:
+                await asyncio.wait_for(activity.wait(), timeout=interval)
+            except TimeoutError:
+                return
+
     try:
         while True:
             if read_task is None or read_task.done():
                 read_task = asyncio.ensure_future(anext(stream_gen))
-            if ping_task is None or ping_task.done():
-                ping_task = asyncio.ensure_future(asyncio.sleep(interval))
+            if timer_task is None or timer_task.done():
+                timer_task = asyncio.ensure_future(_idle_timer())
             done, _pending = await asyncio.wait(
-                {read_task, ping_task}, return_when=asyncio.FIRST_COMPLETED
+                {read_task, timer_task}, return_when=asyncio.FIRST_COMPLETED
             )
+            if timer_task in done:
+                # Recyclé UNIQUEMENT après un vrai ping (plus de churn/chunk)
+                timer_task = None
+                yield b": ping\n\n"
             if read_task in done:
-                ping_task.cancel()
-                # NOTE: a cancelled task still reports done() == False until the
-                # event loop delivers the cancellation, so the loop-top guard
-                # would re-pass the STALE cancelled task to asyncio.wait → it
-                # completes instantly → bogus ping at t=0. Recycle explicitly.
-                ping_task = None
+                activity.set()  # [B2] réarme le timer sans le recréer
                 try:
                     chunk = read_task.result()
                 except StopAsyncIteration:
@@ -6351,18 +6369,82 @@ async def _sse_keepalive(stream_gen, interval: float = _SSE_KEEPALIVE_INTERVAL):
                         )
                     return
                 yield chunk
-            else:
-                # Ping fired while the upstream read is still pending — keep
-                # the read alive (it stays pending in read_task) and let the
-                # client know the proxy is still there.
-                yield b": ping\n\n"
     finally:
-        if ping_task is not None:
-            ping_task.cancel()
+        if timer_task is not None and not timer_task.done():
+            timer_task.cancel()
         if read_task is not None and not read_task.done():
             # Only reached on a client disconnect / generator teardown —
             # THERE the upstream abort is correct (client is gone).
             read_task.cancel()
+
+
+_SSE_COALESCE_MAX_BYTES = 64 * 1024
+
+
+async def _sse_coalesce(stream, max_group_bytes: int = _SSE_COALESCE_MAX_BYTES):
+    """[B3 perf] Micro-batch SSE : regroupe les chunks DÉJÀ disponibles.
+
+    Après chaque lecture, UN seul tick de scheduler laisse se terminer les
+    lectures déjà prêtes (burst upstream bufferisé dans httpx/curl) ; tout
+    ce qui est arrivé est émis en un seul bytes groupé → un send ASGI au
+    lieu de N. Drain STRICTEMENT non-bloquant : aucun await d'attente, aucun
+    timeout — latence inchangée (≤ 1 tick de boucle par groupe émis), juste
+    moins de syscalls réseau par delta. Les frames SSE étant complètes et
+    auto-délimitées (\\n\\n), la concaténation est transparente pour tout
+    client SSE conforme.
+    """
+    it = stream.__aiter__()
+    pending = None
+    try:
+        while True:
+            if pending is None:
+                pending = asyncio.ensure_future(anext(it))
+            done, _rest = await asyncio.wait(
+                {pending}, return_when=asyncio.FIRST_COMPLETED
+            )
+            pending = None
+            try:
+                first = done.pop().result()
+            except StopAsyncIteration:
+                return
+            except Exception:
+                # mêmes sémantiques que _sse_keepalive : fin propre
+                return
+            if not isinstance(first, (bytes, bytearray)):
+                yield first
+                continue
+            groups = [first]
+            size = len(first)
+            exhausted = False
+            while size < max_group_bytes:
+                nxt = asyncio.ensure_future(anext(it))
+                await asyncio.sleep(0)  # LE drain non-bloquant (1 tick max)
+                if not nxt.done():
+                    pending = nxt  # rien de prêt : on rend la main
+                    break
+                try:
+                    chunk = nxt.result()
+                except StopAsyncIteration:
+                    exhausted = True
+                    break
+                except Exception:
+                    exhausted = True
+                    break
+                if isinstance(chunk, (bytes, bytearray)):
+                    groups.append(chunk)
+                    size += len(chunk)
+                else:
+                    yield b"".join(groups)
+                    groups = []
+                    yield chunk
+                    break
+            if groups:
+                yield b"".join(groups)
+            if exhausted:
+                return
+    finally:
+        if pending is not None and not pending.done():
+            pending.cancel()
 
 
 # ── Routing fast cache (O(1) exact + substring) ──
@@ -8352,7 +8434,8 @@ async def messages(request: Request):
 
     # ── OpenAI-protocol ─────────────────────────────────────────
     try:
-        oai_body = anthropic_to_openai(body, model_id)
+        # [C1 perf] raw bytes disponibles → clé de cache sans re-dumps
+        oai_body = anthropic_to_openai(body, model_id, raw=body_bytes)
         # Convert to Responses API format if endpoint requires it (muse-spark)
         if "/responses" in endpoint:
             oai_body = _chat_to_responses_request(oai_body)
@@ -11857,7 +11940,9 @@ async def responses(request: Request):
     # ── OpenAI backend (double conversion) ──────────────────
     # Convert Anthropic → Chat Completions for the backend
     try:
-        oai_body = anthropic_to_openai(anthro_body, model_id)
+        # [C1 perf] raw bytes du body client (dérivation déterministe vers
+        # anthro_body) → clé de cache sans re-dumps
+        oai_body = anthropic_to_openai(anthro_body, model_id, raw=body_bytes)
         # Convert to Responses API format if endpoint requires it (muse-spark)
         if "/responses" in endpoint:
             oai_body = _chat_to_responses_request(oai_body)
