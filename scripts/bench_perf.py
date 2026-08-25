@@ -130,8 +130,18 @@ def compare(baseline: dict, current: dict) -> list[str]:
         old = baseline.get(name, {}).get("value")
         if isinstance(old, (int, float)) and old > 0:
             delta = (cur["value"] - old) / old
-            if delta > REGRESSION_THRESHOLD:
-                regressions.append(f"{name}: {old} -> {cur['value']} ms (+{delta:.0%} > {REGRESSION_THRESHOLD:.0%})")
+            # [v10 correctif] plancher absolu : +40% sur 0.005 ms = bruit de
+            # mesure (2 microsecondes), pas une régression. Ne signaler que
+            # si dégradation relative ET absolue sont significatives.
+            MIN_ABS_DELTA_MS = 0.5
+            if (
+                delta > REGRESSION_THRESHOLD
+                and (float(cur["value"]) - old) >= MIN_ABS_DELTA_MS
+            ):
+                regressions.append(
+                    f"{name}: {old} -> {cur['value']} ms "
+                    f"(+{delta:.0%} > {REGRESSION_THRESHOLD:.0%})"
+                )
     return regressions
 
 
