@@ -135,24 +135,32 @@ def test_discovery_adds_go_only_id_when_filter_disabled(monkeypatch):
 
 
 # ── Alias de saisie (custom route oxalpha) ──────────────────────────
+# [v10 25/08 — commit 78e9285] ox-alpha-free a disparu de la découverte
+# upstream (plus dans /api/free-models detected) : les alias et l'identité
+# directe sont routés gracieusement vers le free vivant x-preview-f-free.
 
 
-def test_alias_routes_to_ox_alpha_free():
+def test_alias_routes_to_live_free_target():
     for name in ("0xalpha", "ox-alpha", "oxalpha"):
         route = oc._route_for(name)
         assert route is not None, f"no route for {name!r}"
-        assert route["model"] == "ox-alpha-free", name
+        assert route["model"] == "x-preview-f-free", name
 
 
 def test_alias_case_insensitive():
     route = oc._route_for("0XAlpha")
     assert route is not None
-    assert route["model"] == "ox-alpha-free"
+    assert route["model"] == "x-preview-f-free"
 
 
-def test_direct_identity_not_shadowed_by_alias_pattern():
+def test_dead_identity_falls_through_to_live_free():
+    """Ancien garde « identité non écrasée » : inverse aujourd'hui — le
+    modèle ox-alpha-free étant mort upstream, la demande tombe sur le free
+    vivant plutôt que d'échouer (dégradation gracieuse §12.2.6)."""
     route = oc._route_for("ox-alpha-free")
     assert route is not None
-    assert route["model"] == "ox-alpha-free"
+    assert route["model"] == "x-preview-f-free"
     cfg = st.get_model_config(route["model"])
-    assert cfg["endpoint"] == st.API_BASE_OPENAI
+    # free anonyme : endpoint zen standard, PAS l'endpoint Go authentifié
+    assert cfg["endpoint"].endswith("/chat/completions")
+    assert "/go/" not in cfg["endpoint"]
