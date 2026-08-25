@@ -3343,7 +3343,6 @@ def register_dashboard(
             pass
 
         def _query():
-            conn = _get_conn()
             rows = conn.execute(
                 "SELECT model, SUM(tokens_input) AS tokens_input, "
                 "SUM(tokens_output) AS tokens_output FROM requests "
