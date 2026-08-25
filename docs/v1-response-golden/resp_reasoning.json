@@ -20,13 +20,14 @@
     "model": "glm-5.1-free"
   },
   "expected": {
-    "id": "msg_80070a63798b45fbbb2a9ea2",
+    "id": "msg_7025d5b1f54e4c0e84137552",
     "type": "message",
     "role": "assistant",
     "content": [
       {
         "type": "thinking",
-        "thinking": "Je réfléchis... 6*7=42."
+        "thinking": "Je réfléchis... 6*7=42.",
+        "signature": "FBzcDoUS/sqRnVKU0J3VcsrA/lC2EY1H8/DBm5j/SLw="
       },
       {
         "type": "text",

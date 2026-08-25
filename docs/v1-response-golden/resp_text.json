@@ -22,7 +22,7 @@
     "model": "deepseek-v4-flash-free"
   },
   "expected": {
-    "id": "msg_f4b6bcc0f8984e048550d549",
+    "id": "msg_ba059f37abf24ce5969003c6",
     "type": "message",
     "role": "assistant",
     "content": [

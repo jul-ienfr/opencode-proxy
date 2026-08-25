@@ -29,9 +29,9 @@
     "model": "claude-sonnet-4-5"
   },
   "expected": {
-    "id": "chatcmpl-90f0b273d37d42b387945443",
+    "id": "chatcmpl-a8b40483e0a7477fa0909a17",
     "object": "chat.completion",
-    "created": 1787594444,
+    "created": 1787667604,
     "model": "claude-sonnet-4-5",
     "choices": [
       {
