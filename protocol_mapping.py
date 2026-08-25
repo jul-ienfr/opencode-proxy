@@ -4,6 +4,7 @@ Extracted from opencode.py (P3.10) - pure move, no behavior change.
 """
 
 import json
+import re
 import time
 import uuid
 
@@ -350,7 +351,21 @@ def anthropic_to_openai(body: dict, model: str) -> dict:
                 if "cache_control" in block:
                     last_cache_control = block["cache_control"]
             elif btype == "thinking":
+                if _is_local_signature(block.get("thinking", ""), block.get("signature", "")):
+                    # [PLAN-raisonnement Phase D.2] bloc SYNTHÉTIQUE (signé par
+                    # le proxy) : inutile aux upstreams openai-compatibles,
+                    # supprimé de l'historique. Les ORIGINAUX passent.
+                    _debug(
+                        "  [convert] DROP thinking synthétique (signature locale) → upstream openai"
+                    )
+                    continue
                 thinking_parts.append(block.get("thinking", ""))
+            elif btype == "redacted_thinking":
+                # [PLAN-raisonnement Phase D.4] donnée chiffrée authentique :
+                # préservée telle quelle vers Anthropic (passthrough), strippée
+                # vers les autres upstreams (non déchiffrable, non interprétable)
+                _debug("  [convert] DROP redacted_thinking → upstream non-Anthropic")
+                continue
             elif btype == "tool_use":
                 _tool_name = block.get("name", "")
                 if not isinstance(_tool_name, str) or not _tool_name.strip():
@@ -597,6 +612,73 @@ def _local_signature(text: str) -> str:
     ).decode()
 
 
+def _is_local_signature(text: str, signature: str) -> bool:
+    """[PLAN-raisonnement Phase D] Détecte une signature FORGÉE par le proxy.
+
+    Provenance stateless : on recalcule le HMAC local du texte et on compare.
+    Une signature authentique (Anthropic) ne peut pas correspondre — elle
+    n'est pas produite par notre clé. Un bloc thinking re-émis par le client
+    avec NOTRE signature est donc identifiable sans table d'état."""
+    if not isinstance(signature, str) or not signature:
+        return False
+    if not isinstance(text, str) or not text:
+        return False
+    try:
+        import hmac as _hmac
+
+        return _hmac.compare_digest(_local_signature(text), signature)
+    except Exception:
+        return False
+
+
+def _looks_encrypted_reasoning(text: str) -> bool:
+    """Heuristique `reasoning_content` chiffré/binaire → redacted_thinking.
+
+    Un raisonnement réel contient espaces et ponctuation ; un blob chiffré
+    (base64) est une longue chaîne sans espace, multiple de 4, charset base64.
+    """
+    if not isinstance(text, str):
+        return False
+    t = text.strip()
+    if len(t) < 64 or len(t) % 4 != 0 or " " in t:
+        return False
+    return re.fullmatch(r"[A-Za-z0-9+/]+={0,2}", t) is not None
+
+
+def strip_synthetic_thinking(body: dict) -> int:
+    """[PLAN-raisonnement Phase D.3] Strip sélectif dans l'historique Anthropic.
+
+    Retire des messages les blocs `thinking` dont la signature est une
+    signature LOCALE du proxy (blocs synthétisés par conversion reasoning_content).
+    Ces blocs ne partent JAMAIS vers un upstream : seul Anthropic direct valide
+    cryptographiquement les signatures au tour suivant, et on ne lui ment pas.
+
+    Les blocs ORIGINAUX (signature authentique du modèle source) et
+    `redacted_thinking` (donnée chiffrée authentique) passent intacts.
+    Retourne le nombre de blocs strippés."""
+    stripped = 0
+    for msg in body.get("messages", []) or []:
+        content = msg.get("content") if isinstance(msg, dict) else None
+        if not isinstance(content, list):
+            continue
+        kept = []
+        for block in content:
+            if (
+                isinstance(block, dict)
+                and block.get("type") == "thinking"
+                and _is_local_signature(block.get("thinking", ""), block.get("signature", ""))
+            ):
+                stripped += 1
+                _debug(
+                    "  [thinking] DROP bloc thinking à signature LOCALE de l'historique "
+                    "(jamais transmis aux upstreams, PLAN-raisonnement D)"
+                )
+                continue
+            kept.append(block)
+        msg["content"] = kept
+    return stripped
+
+
 def openai_to_anthropic(resp: dict, model: str) -> dict:
     choice = resp.get("choices", [{}])[0]
     msg = choice.get("message", {})
@@ -604,13 +686,19 @@ def openai_to_anthropic(resp: dict, model: str) -> dict:
 
     blocks = []
     if reasoning := msg.get("reasoning_content") or msg.get("reasoning"):
-        blocks.append(
-            {
-                "type": "thinking",
-                "thinking": reasoning,
-                "signature": _local_signature(reasoning),
-            }
-        )
+        if _looks_encrypted_reasoning(reasoning):
+            # [PLAN-raisonnement Phase B.2] raisonnement chiffré/binaire de
+            # l'upstream → bloc redacted_thinking (pas de signature forgée sur
+            # une donnée qu'on ne peut pas signer)
+            blocks.append({"type": "redacted_thinking", "data": reasoning})
+        else:
+            blocks.append(
+                {
+                    "type": "thinking",
+                    "thinking": reasoning,
+                    "signature": _local_signature(reasoning),
+                }
+            )
     if msg.get("content"):
         blocks.append({"type": "text", "text": msg["content"]})
     for tc in msg.get("tool_calls") or []:
@@ -714,18 +802,18 @@ def openai_to_anthropic_request(oai_body: dict) -> dict:
                 }
             )
 
-        # Convert reasoning_content → thinking block (assistant only)
-        if role == "assistant":
-            reasoning = msg.get("reasoning_content") or msg.get("reasoning")
-            if isinstance(reasoning, str) and reasoning.strip():
-                blocks.insert(
-            0,
-            {
-                "type": "thinking",
-                "thinking": reasoning,
-                "signature": _local_signature(reasoning),
-            },
-        )
+        # [PLAN-raisonnement Phase D.3] PAS de conversion reasoning_content →
+        # thinking ici : ce corps part vers un UPSTREAM Anthropic, qui valide
+        # cryptographiquement les signatures. Forger une signature locale
+        # produirait un 400 au tour suivant ; le raisonnement est simplement
+        # omis de l'historique (jamais de fausse signature vers Anthropic).
+        if isinstance(msg.get("reasoning_content") or msg.get("reasoning"), str) and (
+            msg.get("reasoning_content") or msg.get("reasoning")
+        ).strip():
+            _debug(
+                "  [convert] DROP reasoning_content historique → upstream Anthropic "
+                "(pas de signature forgée)"
+            )
 
         # Ensure at least one block
         if not blocks:
@@ -957,17 +1045,18 @@ def openai_responses_to_anthropic(body: dict) -> dict:
             if btype in ("input_text", "text"):
                 blocks.append({"type": "text", "text": block.get("text", "")})
             elif btype == "reasoning":
-                summary = block.get("summary") or []
-                text = "".join(s.get("text", "") for s in summary if isinstance(s, dict))
-                if text:
-                    blocks.insert(
-            0,
-            {
-                "type": "thinking",
-                "thinking": text,
-                "signature": _local_signature(text),
-            },
-        )
+                # [PLAN-raisonnement Phase D.3] pas de thinking forgé vers
+                # l'upstream Anthropic (signature cryptographique exigée) —
+                # le summary est omis de l'historique.
+                _summary = block.get("summary") or []
+                _has_text = any(
+                    isinstance(s, dict) and s.get("text") for s in _summary
+                )
+                if _has_text:
+                    _debug(
+                        "  [convert] DROP reasoning summary historique → upstream Anthropic "
+                        "(pas de signature forgée)"
+                    )
 
         if not blocks:
             blocks.append({"type": "text", "text": ""})

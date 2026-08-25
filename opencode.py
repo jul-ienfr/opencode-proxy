@@ -6107,9 +6107,23 @@ def _stream_has_yielded(started, open_blocks, stream_out, line_buf: str = "") ->
     )
 
 
-async def _terminate_after_started(open_blocks, stream_out):
-    """Graceful SSE termination after a mid-stream failure (avoids concat retry)."""
+async def _terminate_after_started(open_blocks, stream_out, thinking_idx=None, thinking_sig=""):
+    """Graceful SSE termination after a mid-stream failure (avoids concat retry).
+
+    [PLAN-raisonnement Phase C.2] si un bloc thinking est encore ouvert,
+    son `signature_delta` local est émis AVANT le content_block_stop — même
+    en fin de stream brutale, le client reçoit un bloc thinking complet
+    (thinking_delta* → signature_delta → stop), sinon il l'abandonne."""
     for idx in list(open_blocks):
+        if thinking_idx is not None and idx == thinking_idx and thinking_sig:
+            yield _sse(
+                "content_block_delta",
+                {
+                    "type": "content_block_delta",
+                    "index": idx,
+                    "delta": {"type": "signature_delta", "signature": thinking_sig},
+                },
+            )
         yield _sse("content_block_stop", {"type": "content_block_stop", "index": idx})
     yield _sse(
         "message_delta",
@@ -6917,6 +6931,7 @@ from protocol_mapping import (  # noqa: E402  # re-export after function defs fo
     _json_dumps,
     _json_dumps_str,
     _json_loads,
+    _local_signature,
     _responses_sse_to_chat_deltas,
     _responses_to_anthropic_response,
     _responses_to_chat_response,
@@ -6927,6 +6942,7 @@ from protocol_mapping import (  # noqa: E402  # re-export after function defs fo
     openai_responses_to_anthropic,
     openai_to_anthropic,
     openai_to_anthropic_request,
+    strip_synthetic_thinking,
 )
 
 
@@ -6959,6 +6975,7 @@ async def _finalize_and_close_stream(
     used_tools,
     request_body,
     log_tag="",
+    reasoning_signature="",
 ):
     """Yield closing SSE events for a stream and persist the request.
 
@@ -6999,6 +7016,19 @@ async def _finalize_and_close_stream(
             f"  [stream-oai] WARNING: thinking requested (type={thinking_type}, effort={effort}) but upstream returned no reasoning_content"
         )
     for idx in open_blocks:
+        if idx == reasoning_block_idx and reasoning_signature:
+            # [PLAN-raisonnement Phase C.1] signature locale AVANT le stop du
+            # bloc thinking : ordre contractuel thinking_delta* → signature_delta
+            # → content_block_stop (sinon les clients Anthropic-compatibles
+            # abandonnent le bloc en multi-tours).
+            yield _sse(
+                "content_block_delta",
+                {
+                    "type": "content_block_delta",
+                    "index": idx,
+                    "delta": {"type": "signature_delta", "signature": reasoning_signature},
+                },
+            )
         yield _sse("content_block_stop", {"type": "content_block_stop", "index": idx})
     yield _sse(
         "message_delta",
@@ -7229,6 +7259,21 @@ async def messages(request: Request):
     body["model"] = model_id
 
     body = ensure_min_tokens(body)
+
+    # [PLAN-raisonnement Phase D] Strip sélectif multi-tours : les blocs
+    # thinking signés LOCALEMENT par le proxy (synthétisés depuis
+    # reasoning_content) ne partent jamais vers un upstream — seul Anthropic
+    # direct valide cryptographiquement les signatures, et on ne lui ment pas.
+    # Les blocs ORIGINAUX (signature authentique) et redacted_thinking passent
+    # intacts (passthrough Anthropic préservé).
+    try:
+        _stripped_thinking = strip_synthetic_thinking(body)
+        if _stripped_thinking:
+            _log(
+                f"  [thinking] {_stripped_thinking} bloc(s) thinking à signature locale strippé(s) de l'historique"
+            )
+    except Exception as e:
+        _debug(f"  [thinking] strip_synthetic_thinking failed: {type(e).__name__}: {e}")
 
     # Apply custom route overrides for thinking/effort
     thinking_override = route.get("thinking")
@@ -8475,10 +8520,20 @@ async def messages(request: Request):
         open_blocks = []
         text_block_idx = None
         reasoning_block_idx = None
+        reasoning_acc = ""
         next_block_idx = 0
         stream_out_tokens = 0
         actual_usage = None
         emitted_finish = False
+
+        def _thinking_flush():
+            """[PLAN-raisonnement Phase C] (idx, signature locale) du bloc
+            thinking ouvert, ou (None, ""). La signature couvre le texte
+            ACCUMULÉ complet — elle n'est calculée qu'au moment du flush."""
+            if reasoning_block_idx is not None and reasoning_acc:
+                return reasoning_block_idx, _local_signature(reasoning_acc)
+            return None, ""
+
         _handle_429 = _make_stream_retry_loop("openai")
         _debug("  [stream-oai] _handle_429 ready, about to yaml_get")
 
@@ -8565,8 +8620,12 @@ async def messages(request: Request):
                                         _log(
                                             f"  stream_retry_suppressed_after_started attempt={_attempt + 1}"
                                         )
+                                        _ti, _ts = _thinking_flush()
                                         async for ev in _terminate_after_started(
-                                            open_blocks, stream_out_tokens
+                                            open_blocks,
+                                            stream_out_tokens,
+                                            thinking_idx=_ti,
+                                            thinking_sig=_ts,
                                         ):
                                             yield ev
                                         return
@@ -8631,8 +8690,12 @@ async def messages(request: Request):
                                 _log(
                                     f"  stream_retry_suppressed_after_started attempt={_attempt + 1}"
                                 )
+                                _ti, _ts = _thinking_flush()
                                 async for ev in _terminate_after_started(
-                                    open_blocks, stream_out_tokens
+                                    open_blocks,
+                                    stream_out_tokens,
+                                    thinking_idx=_ti,
+                                    thinking_sig=_ts,
                                 ):
                                     yield ev
                                 return
@@ -8648,8 +8711,12 @@ async def messages(request: Request):
                                 _log(
                                     f"  stream_retry_suppressed_after_started attempt={_attempt + 1}"
                                 )
+                                _ti, _ts = _thinking_flush()
                                 async for ev in _terminate_after_started(
-                                    open_blocks, stream_out_tokens
+                                    open_blocks,
+                                    stream_out_tokens,
+                                    thinking_idx=_ti,
+                                    thinking_sig=_ts,
                                 ):
                                     yield ev
                                 return
@@ -8668,13 +8735,19 @@ async def messages(request: Request):
                             if alt:
                                 _log("  400 credit error on key, retrying with alternative key")
                                 hdrs = _get_auth_headers("openai", entry=alt)
-                                if _stream_has_yielded(started, open_blocks, stream_out_tokens, ""):
+                                if _stream_has_yielded(
+                                    started, open_blocks, stream_out_tokens, ""
+                                ):
                                     _cb_record_failure(endpoint)
                                     _log(
                                         f"  stream_retry_suppressed_after_started attempt={_attempt + 1}"
                                     )
+                                    _ti, _ts = _thinking_flush()
                                     async for ev in _terminate_after_started(
-                                        open_blocks, stream_out_tokens
+                                        open_blocks,
+                                        stream_out_tokens,
+                                        thinking_idx=_ti,
+                                        thinking_sig=_ts,
                                     ):
                                         yield ev
                                     return
@@ -8687,6 +8760,7 @@ async def messages(request: Request):
                         data = line[5:].strip()
 
                         if data == "[DONE]":
+                            _ti, _ts = _thinking_flush()
                             async for ev in _finalize_and_close_stream(
                                 started,
                                 open_blocks,
@@ -8715,6 +8789,7 @@ async def messages(request: Request):
                                 tool_names,
                                 used_tools,
                                 request_body,
+                                reasoning_signature=_ts,
                             ):
                                 yield ev
                             emitted_finish = True
@@ -8842,6 +8917,7 @@ async def messages(request: Request):
                                 )
                                 open_blocks.append(reasoning_block_idx)
                             stream_out_tokens += _estimate_tokens(reasoning)
+                            reasoning_acc += reasoning
                             yield _sse(
                                 "content_block_delta",
                                 {
@@ -8907,7 +8983,10 @@ async def messages(request: Request):
                     if _stream_has_yielded(started, open_blocks, stream_out_tokens, ""):
                         _cb_record_failure(endpoint)
                         _log(f"  stream_retry_suppressed_after_started attempt={_attempt + 1}")
-                        async for ev in _terminate_after_started(open_blocks, stream_out_tokens):
+                        _ti, _ts = _thinking_flush()
+                        async for ev in _terminate_after_started(
+                            open_blocks, stream_out_tokens, thinking_idx=_ti, thinking_sig=_ts
+                        ):
                             yield ev
                         return
                     continue
@@ -8924,7 +9003,10 @@ async def messages(request: Request):
                 if _stream_has_yielded(started, open_blocks, stream_out_tokens, ""):
                     _cb_record_failure(endpoint)
                     _log(f"  stream_retry_suppressed_after_started attempt={_attempt + 1}")
-                    async for ev in _terminate_after_started(open_blocks, stream_out_tokens):
+                    _ti, _ts = _thinking_flush()
+                    async for ev in _terminate_after_started(
+                        open_blocks, stream_out_tokens, thinking_idx=_ti, thinking_sig=_ts
+                    ):
                         yield ev
                     return
                 continue
@@ -8948,7 +9030,10 @@ async def messages(request: Request):
                     if _stream_has_yielded(started, open_blocks, stream_out_tokens, ""):
                         _cb_record_failure(endpoint)
                         _log(f"  stream_retry_suppressed_after_started attempt={_attempt + 1}")
-                        async for ev in _terminate_after_started(open_blocks, stream_out_tokens):
+                        _ti, _ts = _thinking_flush()
+                        async for ev in _terminate_after_started(
+                            open_blocks, stream_out_tokens, thinking_idx=_ti, thinking_sig=_ts
+                        ):
                             yield ev
                         return
                     continue
@@ -8979,7 +9064,17 @@ async def messages(request: Request):
                     request_body=request_body,
                 )
                 if started:
+                    _ti, _ts = _thinking_flush()
                     for idx in open_blocks:
+                        if _ti is not None and idx == _ti and _ts:
+                            yield _sse(
+                                "content_block_delta",
+                                {
+                                    "type": "content_block_delta",
+                                    "index": idx,
+                                    "delta": {"type": "signature_delta", "signature": _ts},
+                                },
+                            )
                         yield _sse(
                             "content_block_stop", {"type": "content_block_stop", "index": idx}
                         )
@@ -9005,6 +9100,7 @@ async def messages(request: Request):
         # continued until the timeout). Finalize the stream properly.
         if got_response_completed and not emitted_finish:
             _debug("  [stream-oai] post-loop: finalizing Responses API stream")
+            _ti, _ts = _thinking_flush()
             async for ev in _finalize_and_close_stream(
                 started,
                 open_blocks,
@@ -9033,6 +9129,7 @@ async def messages(request: Request):
                 tool_names,
                 used_tools,
                 request_body,
+                reasoning_signature=_ts,
             ):
                 yield ev
             emitted_finish = True
@@ -9040,13 +9137,19 @@ async def messages(request: Request):
         if started and not emitted_finish:
             _debug("  [stream-oai] truncated without finish_reason → synthesizing stop")
             _log("  stream truncated without finish_reason → synthesizing stop")
-            async for ev in _terminate_after_started(open_blocks, stream_out_tokens):
+            _ti, _ts = _thinking_flush()
+            async for ev in _terminate_after_started(
+                open_blocks, stream_out_tokens, thinking_idx=_ti, thinking_sig=_ts
+            ):
                 yield ev
             emitted_finish = True
         elif got_response_completed and not emitted_finish:
             # Incomplete Responses API without prior finalize (should be covered above, but keep for safety)
             _debug("  [stream-oai] truncated Responses without finalize → synthesizing")
-            async for ev in _terminate_after_started(open_blocks, stream_out_tokens):
+            _ti, _ts = _thinking_flush()
+            async for ev in _terminate_after_started(
+                open_blocks, stream_out_tokens, thinking_idx=_ti, thinking_sig=_ts
+            ):
                 yield ev
             emitted_finish = True
         return

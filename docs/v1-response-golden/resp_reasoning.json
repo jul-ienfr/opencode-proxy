@@ -20,7 +20,7 @@
     "model": "glm-5.1-free"
   },
   "expected": {
-    "id": "msg_7025d5b1f54e4c0e84137552",
+    "id": "<msg_id>",
     "type": "message",
     "role": "assistant",
     "content": [

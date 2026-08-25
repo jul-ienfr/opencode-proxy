@@ -1,0 +1,94 @@
+{
+  "fn": "anthropic_to_openai",
+  "input": {
+    "body": {
+      "model": "claude-sonnet-4-5",
+      "max_tokens": 512,
+      "thinking": {
+        "type": "enabled"
+      },
+      "messages": [
+        {
+          "role": "user",
+          "content": "Question"
+        },
+        {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "thinking",
+              "thinking": "raisonnement converti par le proxy",
+              "signature": "DREIHM7viWWctliYmGYrFtpivUhoDCpr8kzywxqksXw="
+            },
+            {
+              "type": "text",
+              "text": "Réponse A."
+            }
+          ]
+        },
+        {
+          "role": "user",
+          "content": "Suite"
+        },
+        {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "thinking",
+              "thinking": "vraie réflexion du modèle source",
+              "signature": "SIGNATURE-AUTHENTIQUE-ANTHROPIC=="
+            },
+            {
+              "type": "redacted_thinking",
+              "data": "BLOBCHIFFREAUTHENTIQUE"
+            },
+            {
+              "type": "text",
+              "text": "Réponse B."
+            }
+          ]
+        },
+        {
+          "role": "user",
+          "content": "Encore"
+        }
+      ]
+    },
+    "model": "deepseek-v4-flash"
+  },
+  "expected": {
+    "model": "deepseek-v4-flash",
+    "messages": [
+      {
+        "role": "user",
+        "content": "Question"
+      },
+      {
+        "role": "assistant",
+        "content": "Réponse A.",
+        "reasoning_content": " "
+      },
+      {
+        "role": "user",
+        "content": "Suite"
+      },
+      {
+        "role": "assistant",
+        "content": "Réponse B.",
+        "reasoning_content": "vraie réflexion du modèle source"
+      },
+      {
+        "role": "user",
+        "content": "Encore",
+        "cache_control": {
+          "type": "ephemeral"
+        }
+      }
+    ],
+    "max_tokens": 512,
+    "stream": false,
+    "reasoning_effort": "max"
+  },
+  "_note": "multi-tours : thinking synthétique strippé, original préservé, redacted_thinking strippé (PLAN-raisonnement D.2/D.4)",
+  "_generated_by": "scripts/gen_golden_fixtures.py (plan v10 §11.5)"
+}

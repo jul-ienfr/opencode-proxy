@@ -15,6 +15,7 @@ connus vs spec officielle (ex: 14.1.6 images perdues).
 from __future__ import annotations
 
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -24,6 +25,32 @@ sys.path.insert(0, str(ROOT))
 import protocol_mapping as pm  # noqa: E402
 
 GOLDEN_DIR = ROOT / "docs" / "v1-response-golden"
+
+# Même normalisation que tests/test_conversion_golden.py : les ids générés
+# (uuid4) ne doivent pas produire de faux drift à chaque régénération.
+_NONDETERMINISTIC_IDS = [
+    (re.compile(r"^msg_[0-9a-f]{24}$"), "<msg_id>"),
+    (re.compile(r"^toolu_[0-9a-f]{8}$"), "<toolu_id>"),
+    (re.compile(r"^chatcmpl-[0-9a-f]{24}$"), "<chatcmpl_id>"),
+]
+
+
+def _normalize(obj):
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            if k == "created" and isinstance(v, int):
+                out[k] = "<epoch>"  # timestamp généré à chaque réponse
+            else:
+                out[k] = _normalize(v)
+        return out
+    if isinstance(obj, list):
+        return [_normalize(v) for v in obj]
+    if isinstance(obj, str):
+        for pat, repl in _NONDETERMINISTIC_IDS:
+            if pat.match(obj):
+                return repl
+    return obj
 
 
 def case_req_simple():
@@ -253,6 +280,55 @@ def case_sse_deltas():
     }
 
 
+def case_multiturn_thinking_strip():
+    """[PLAN-raisonnement Phase D] Historique multi-tours vers upstream openai.
+
+    Bloc SYNTHÉTIQUE (signature locale du proxy) -> supprimé ; bloc ORIGINAL
+    (signature authentique) -> conservé en reasoning_content ;
+    redacted_thinking -> strippé (réservé aux upstreams Anthropic)."""
+    anthro = {
+        "model": "claude-sonnet-4-5",
+        "max_tokens": 512,
+        "thinking": {"type": "enabled"},
+        "messages": [
+            {"role": "user", "content": "Question"},
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "thinking",
+                        "thinking": "raisonnement converti par le proxy",
+                        "signature": pm._local_signature("raisonnement converti par le proxy"),
+                    },
+                    {"type": "text", "text": "Réponse A."},
+                ],
+            },
+            {"role": "user", "content": "Suite"},
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "thinking",
+                        "thinking": "vraie réflexion du modèle source",
+                        "signature": "SIGNATURE-AUTHENTIQUE-ANTHROPIC==",
+                    },
+                    {"type": "redacted_thinking", "data": "BLOBCHIFFREAUTHENTIQUE"},
+                    {"type": "text", "text": "Réponse B."},
+                ],
+            },
+            {"role": "user", "content": "Encore"},
+        ],
+    }
+    return {
+        "fn": "anthropic_to_openai",
+        "input": {"body": anthro, "model": "deepseek-v4-flash"},
+        "note": (
+            "multi-tours : thinking synthétique strippé, original préservé, "
+            "redacted_thinking strippé (PLAN-raisonnement D.2/D.4)"
+        ),
+    }
+
+
 CASES = [
     case_req_simple,
     case_req_tools,
@@ -263,6 +339,7 @@ CASES = [
     case_anthro_response_to_openai,
     case_responses_api_entry,
     case_sse_deltas,
+    case_multiturn_thinking_strip,
 ]
 
 
@@ -292,7 +369,7 @@ def main() -> int:
         payload = {
             "fn": c["fn"],
             "input": c["input"],
-            "expected": out,
+            "expected": _normalize(out),
             "_note": c["note"],
             "_generated_by": "scripts/gen_golden_fixtures.py (plan v10 §11.5)",
         }

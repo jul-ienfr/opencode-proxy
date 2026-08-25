@@ -1,6 +1,14 @@
 # PLAN — Raisonnement incomplet côté client (diagnostic + correctif)
 
 > 2026-08-25 · Priorité P1 · Effort estimé : 1 à 1,5 j · Prérequis : aucun
+>
+> **STATUT : TERMINÉ ✅** — Phases B, C, D, E livrées. Gate finale :
+> suite complète 778 passed / EXIT=0, drift golden vert
+> (`tests/test_thinking_e2e.py` 12/12). Signatures locales HMAC sur les 4
+> sites de blocs thinking synthétisés, `signature_delta` en streaming
+> (y compris flush final sur fin brutale), strip sélectif multi-tours,
+> `redacted_thinking` géré. Générateur de fixtures rendu déterministe
+> (normalisation ids/epoch identique au test golden).
 
 ## 1. Diagnostic confirmé (sondes live + audit code)
 
