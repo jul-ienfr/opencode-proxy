@@ -25,6 +25,7 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import UTC
 
 import shared_state
 
@@ -4991,26 +4992,49 @@ async def reconcile_orphan_containers(managers: list, runner=None) -> list[str]:
     by_name = {m._docker_container: m for m in managers}
 
     for name in names:
-        if name not in expected:
-            removed.append(name)
-            await _rm(name)
-            continue
-        # Expected name: check the booted stack against the manager's
-        # effective stack (stale-env survivor / flip that crashed mid-way).
-        m = by_name.get(name)
-        if m is None:
-            continue
+        # inspect une seule fois : sert à la grâce ET au check de stack
         try:
             insp = await run(["inspect", name], 15, None)
         except (RuntimeError, subprocess.SubprocessError):
+            insp = None
+        info = None
+        if insp is not None and insp.returncode == 0:
+            try:
+                info = json.loads(insp.stdout)[0]
+            except (json.JSONDecodeError, IndexError, KeyError):
+                info = None  # payload vide/malformé : traité comme inconnu
+
+        # [plan v10 incident 25/08 matin] PÉRIODE DE GRÂCE : un conteneur
+        # démarré depuis <120 s n'est JAMAIS un orphelin — les courses
+        # (watchdog qui recrée vs reconcile qui purge) supprimaient des
+        # stations fraîchement recréées, en boucle. Si l'âge est
+        # indéterminable, comportement historique (purge des orphelins).
+        started_at = str((info or {}).get("State") or {}).get("StartedAt") if isinstance((info or {}).get("State"), dict) else None
+        age_sec = None
+        if started_at:
+            try:
+                from datetime import datetime as _dt
+
+                born = _dt.fromisoformat(started_at[:19].replace("Z", "")).replace(tzinfo=UTC)
+                age_sec = max(0.0, time.time() - born.timestamp())
+            except Exception:
+                age_sec = None
+
+        m = by_name.get(name)
+        if name not in expected:
+            if age_sec is not None and age_sec < 120:
+                logger.warning(
+                    "[vpn] boot reconcile: %s a seulement %.0fs — grâce (course probable), conservé",
+                    name,
+                    age_sec,
+                )
+                continue
+            removed.append(name)
+            await _rm(name)
             continue
-        if insp.returncode != 0:
+        if m is None:
             continue
-        try:
-            info = json.loads(insp.stdout)[0]
-        except (json.JSONDecodeError, IndexError):
-            continue
-        vpn_type = _env_value_from_inspect(info, "VPN_TYPE")
+        vpn_type = _env_value_from_inspect(info or {}, "VPN_TYPE")
         # [plan v10 §14.1.1] stack attendue = .env PERSISTÉ par station, pas
         # l'heuristique fichier-clé recalculée au boot : une flotte basculée
         # OpenVPN avec wireguard.env encore présent voyait tous ses tunnels
