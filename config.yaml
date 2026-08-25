@@ -260,7 +260,7 @@ custom_routes:
   mimov25:
     match:
     - mimo-v2.5
-    model: ox-alpha-free
+    model: x-preview-f-free
     thinking: adaptive
   mimov25pro:
     match:
@@ -296,7 +296,7 @@ custom_routes:
     - 0xalpha
     - ox-alpha
     - oxalpha
-    model: ox-alpha-free
+    model: x-preview-f-free
 api_keys: []
 web_search:
   enabled: true
