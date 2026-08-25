@@ -18,7 +18,6 @@ upstream:
   max_keepalive: 200
   keepalive_expiry: 30
   max_body_size: 10485760
-  curl_sessions_per_station: 3
 routing:
   opus_model: kimi-k2.6
   sonnet_model: glm-5.1

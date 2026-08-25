@@ -825,7 +825,27 @@ class VPNManager:
         elif self._stack == "openvpn":
             self._stack_effective = "openvpn"
         else:  # auto
-            self._stack_effective = "wireguard" if os.path.exists(self._wg_key_file) else "openvpn"
+            # [drift-fix 25/08] En auto, la stack effective au boot suit le
+            # .env PERSISTÉ par station — la MÊME source que
+            # reconcile_orphan_containers ([plan v10 §14.1.1]). L'ancienne
+            # heuristique « clé WG présente ⇒ WG » faisait que chaque
+            # redémarrage du proxy réimposait WireGuard via l'env explicite
+            # des chemins de recovery (_compose_env), écrasant une flotte
+            # OpenVPN saine : c'est LE moteur du bug « stations 2-3/4 »
+            # persistant quand le chemin WG du fournisseur est muet.
+            # La clé ne décide plus que de la PERMISSION d'un retour WG
+            # ultérieur — retour désormais validé par le canari egress.
+            try:
+                _boot_env = os.path.join(
+                    os.path.dirname(self._compose_file_path()), ".env"
+                )
+                self._stack_effective = _stack_from_env_file(_boot_env, self._station)
+            except Exception:
+                self._stack_effective = None
+            if self._stack_effective is None:
+                self._stack_effective = (
+                    "wireguard" if os.path.exists(self._wg_key_file) else "openvpn"
+                )
         # OpenVPN protocol fallback (udp/tcp) — gluetun OPENVPN_PROTOCOL, defaults udp.
         # WG is always UDP 51820, OV can be udp 1194 or tcp 443/8443. The protocol
         # is the remote-port dimension for the OV stack; all OV stations share it
@@ -858,6 +878,14 @@ class VPNManager:
         # there — the rotation just lost the lottery).
         self._rotation_probe_dead = False
         self._auto_wg_egress_ticks = max(1, int(cfg.get("auto_wg_egress_ticks", 3)))
+        # [canari WG 25/08] Preuve d'egress AVANT tout retour en WireGuard :
+        # le fournisseur peut black-holer WG en silence (handshake local OK,
+        # zéro trafic — DNS interne mort), et le retour automatique « OV sain
+        # → WG préféré » se faisait À L'AVEUGLE après auto_ov_return_min → la
+        # flotte flappait indéfiniment tant que le chemin WG était cassé.
+        # Le canari (compose vpn-wg-test, SOCKS5 loopback 1090) valide le
+        # chemin WG RÉEL ; verdict TTL-caché pour ne pas marteler docker.
+        self._wg_canary_state: dict = {"ok": None, "at": None}
         # [plan 20/08] Gluetun healthcheck-restart churn: a marginal WG
         # tunnel makes gluetun's INTERNAL healthcheck restart the VPN every
         # ~12 s — invisible to the SOCKS5 probe (it samples the live
@@ -2572,6 +2600,14 @@ class VPNManager:
                 # [review 18/08] key aligned with stack_info's signal_count
                 # (the dashboard static reads egress_failures only).
                 "signal_count": self._conn_failure_signal_count,
+                # [canari WG 25/08] dernier verdict egress WireGuard — None
+                # = jamais testé ; âge en s vs l'horloge du manager.
+                "wg_canary_ok": self._wg_canary_state["ok"],
+                "wg_canary_age_s": (
+                    None
+                    if self._wg_canary_state["at"] is None
+                    else max(0, int(self._now_fn() - self._wg_canary_state["at"]))
+                ),
             },
             "identity_index": self._identity_index,
             "profiles_count": len(self._identity_profiles),
@@ -3413,6 +3449,20 @@ class VPNManager:
         if self._stack_effective == "wireguard":
             if self._egress_failures >= self._auto_wg_egress_ticks:
                 return ("openvpn", f"egress dead {self._egress_failures} ticks")
+            # [churn→OV 25/08] la boucle healthcheck gluetun PREUVE que le
+            # tunnel ne passe pas : le compteur egress peut ne jamais
+            # atteindre le seuil (la sonde tombe parfois dans une fenêtre
+            # vivante du cycle de restart) et la station restait coincée en
+            # WG pour toujours. Un churn confirmé + un heal raté = sortie
+            # déterministe vers OpenVPN (le canari protège le retour).
+            if (
+                getattr(self, "_restart_churn", False)
+                and self._watchdog_backoff.consecutive_failures >= 1
+            ):
+                return (
+                    "openvpn",
+                    f"healthcheck restart loop x{self._restart_churn_threshold} + heal failed",
+                )
             return None
         # Effective OpenVPN below.
         if self._stack_effective != "openvpn":
@@ -3495,6 +3545,142 @@ class VPNManager:
             return os.path.isfile(self._wg_key_file)
         except Exception:
             return False
+
+    # ── [canari WG 25/08] validation egress avant flip vers WireGuard ──
+
+    _WG_CANARY_SERVICE = "vpn-wg-test"
+    _WG_CANARY_TTL_S = 600  # verdict réutilisé 10 min (anti-marteau docker)
+    _WG_CANARY_BOOT_TIMEOUT_S = 90
+    _WG_CANARY_PORT = 1090  # SOCKS5 du canari (compose, loopback uniquement)
+    _WG_CANARY_POLL_INTERVAL_S = 4.0
+
+    async def _canary_probe_once(self) -> bool:
+        """Une sonde GET bornée via SOCKS5 du canari. Même chaîne que
+        _probe_connect (httpcore[socks] requis — sinon pas de faux positif).
+        Injectable dans les tests."""
+        import httpx
+
+        try:
+            import httpcore  # noqa: F401
+
+            _has_socks = True
+        except ImportError:
+            return False
+        if not _has_socks:
+            return False
+        try:
+            client = httpx.AsyncClient(
+                proxy=f"socks5://127.0.0.1:{self._WG_CANARY_PORT}",
+                timeout=httpx.Timeout(4.0),
+            )
+        except Exception:
+            return False
+        try:
+            resp = await asyncio.wait_for(
+                client.send(httpx.Request("GET", self._ip_check_url)), timeout=5.0
+            )
+            return getattr(resp, "status_code", 500) < 500
+        except Exception:
+            return False
+        finally:
+            try:
+                await client.aclose()
+            except Exception:
+                pass
+
+    async def _wg_canary_alive(self, reason: str) -> bool:
+        """True si le chemin WireGuard fait VRAIMENT passer du trafic.
+
+        Bring-up compose du service vpn-wg-test (VPN_TYPE=wireguard épinglé,
+        profil wg-test), sondes répétées jusqu'au budget, teardown
+        systématique. Verdict mis en cache TTL (_WG_CANARY_TTL_S) : un
+        fournisseur WG cassé coûte au plus UNE validation par TTL et par
+        station — jamais de marteau docker, jamais de flip à l'aveugle.
+        """
+        now = self._now_fn()
+        st = self._wg_canary_state
+        if (
+            st["ok"] is not None
+            and st["at"] is not None
+            and now - st["at"] < self._WG_CANARY_TTL_S
+        ):
+            return bool(st["ok"])
+        logger.warning("[vpn-canary] validation egress WireGuard (%s)…", reason)
+        compose_path = self._compose_file_path()
+        ok = False
+        t0 = self._now_fn()
+        try:
+            result = await asyncio.to_thread(
+                self._docker_run,
+                ["compose", "-f", compose_path, "up", "-d", self._WG_CANARY_SERVICE],
+                240,
+            )
+            if result.returncode != 0:
+                raise RuntimeError(result.stderr.strip() or result.stdout.strip())
+            deadline = t0 + self._WG_CANARY_BOOT_TIMEOUT_S
+            # Borne d'itérations : un budget en secondes ne suffit pas si une
+            # horloge est pathologique (tests) — jamais de boucle infinie.
+            max_iters = (
+                int(self._WG_CANARY_BOOT_TIMEOUT_S / max(self._WG_CANARY_POLL_INTERVAL_S, 0.001))
+                + 2
+            )
+            iters = 0
+            while self._now_fn() < deadline and iters < max_iters:
+                iters += 1
+                if await self._canary_probe_once():
+                    ok = True
+                    break
+                await asyncio.sleep(self._WG_CANARY_POLL_INTERVAL_S)
+        except Exception as e:
+            logger.warning("[vpn-canary] bring-up échoué: %s", e)
+        finally:
+            try:
+                await asyncio.to_thread(
+                    self._docker_run,
+                    [
+                        "compose",
+                        "-f",
+                        compose_path,
+                        "rm",
+                        "-sf",
+                        self._WG_CANARY_SERVICE,
+                    ],
+                    120,
+                )
+            except Exception:
+                pass
+        st["ok"] = ok
+        st["at"] = self._now_fn()
+        logger.warning(
+            "[vpn-canary] verdict: WireGuard %s (%.0fs)",
+            "PASS" if ok else "SANS EGRESS",
+            st["at"] - t0,
+        )
+        return ok
+
+    async def _cancel_wg_flip_if_canary_dead(self) -> bool:
+        """Verrou d'application : annule un flip wireguard non prouvé.
+
+        Appelé JUSTE AVANT l'application de ``_pending_flip`` (hors lock,
+        comme le reste du bloc). Retourne True quand un flip a été annulé —
+        ``_pending_flip`` est alors None et la station RESTE sur son stack
+        courant (la re-décision se fera au prochain tick, au rythme du TTL
+        canari ; quand OV est sain c'est exactement le comportement voulu :
+        ne jamais rejoindre un chemin WG mort « parce qu'il est préféré »).
+        """
+        pf = self._pending_flip
+        if pf is None or pf[0] != "wireguard":
+            return False
+        if await self._wg_canary_alive(pf[1]):
+            return False
+        self._pending_flip = None
+        logger.error(
+            "[vpn-watchdog] flip →wireguard ANNULÉ — canari WG sans egress "
+            "(%s) ; maintien sur %s jusqu'à preuve du chemin WG",
+            pf[1],
+            self._stack_effective,
+        )
+        return True
 
     async def _apply_stack(self, mode: str, reason: str = "manual", auto: bool = False, stations: list | None = None) -> bool:
         """Switch the effective stack (compose substitution) and record the flip.
@@ -4580,6 +4766,11 @@ class VPNManager:
         # [plan 18/08 §3c] auto flip (+ emergency manual flip) — applied OUTSIDE the lock (compose).
         # A successful flip supersedes the escalation: the tunnel was just
         # recreated in the other stack, no need to refresh servers/image too.
+        # [canari WG 25/08] AUCUN flip vers wireguard sans preuve d'egress :
+        # le canari valide le chemin WG réel ; sans lui, le retour « OV sain
+        # → WG préféré » rejouait la panne en boucle (bug stations 2-3/4).
+        if self._pending_flip is not None:
+            await self._cancel_wg_flip_if_canary_dead()
         if self._pending_flip is not None:
             mode, reason = self._pending_flip
             self._pending_flip = None

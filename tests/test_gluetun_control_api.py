@@ -1144,13 +1144,19 @@ class TestStackSelector:
     @pytest.mark.asyncio
     async def test_t6f_watchdog_tick_auth_failed_flips_to_wireguard(self, tmp_path, monkeypatch):
         """3 live AUTH_FAILED in the 30-min window on a healthy-but-OV
-        station → the next tick flips to WG (preferred stack)."""
+        station → the next tick flips to WG (preferred stack) — PROVIDED
+        the WG canary proves egress ([canari WG 25/08] gate)."""
         mgr = _stack_mgr(tmp_path, monkeypatch)
         mgr._stack_effective = "openvpn"  # e.g. after an auto flip to OV
         mgr._stack_since = mgr._now_fn()
         t = mgr._now_fn()
         mgr._auth_failed_window = [t - 500, t - 400, t - 300]
         mgr.ips = ["1.2.3.4"]  # tunnel healthy — no recovery needed
+
+        async def _canary_ok(reason):
+            return True  # chemin WG prouvé vivant
+
+        monkeypatch.setattr(mgr, "_wg_canary_alive", _canary_ok)
         await mgr._watchdog_tick()
         assert mgr._stack_effective == "wireguard"
         assert mgr._stack == "auto"
@@ -1162,6 +1168,30 @@ class TestStackSelector:
         env = (tmp_path / ".env").read_text()
         assert "VPN_TYPE_STATION1=wireguard" in env
         # Per-station: STATION2 untouched
+
+    @pytest.mark.asyncio
+    async def test_t6g_watchdog_tick_wg_flip_cancelled_when_canary_dead(
+        self, tmp_path, monkeypatch
+    ):
+        """[canari WG 25/08] Même décision (« return to WG »), mais le
+        canari constate un chemin WG muet → le flip est ANNULÉ : pas de
+        compose, pas de cooldown armé, la station RESTE sur OpenVPN. C'est
+        le verrou qui tue le flap persistant OV→WG mort→OV."""
+        mgr = _stack_mgr(tmp_path, monkeypatch)
+        mgr._stack_effective = "openvpn"
+        mgr._stack_since = mgr._now_fn() - 61 * 60  # OV sain > auto_ov_return_min
+        mgr._auth_failed_window = []
+        mgr.ips = ["1.2.3.4"]  # tunnel OV sain
+
+        async def _canary_dead(reason):
+            return False  # provider WG black-hole silencieux
+
+        monkeypatch.setattr(mgr, "_wg_canary_alive", _canary_dead)
+        await mgr._watchdog_tick()
+        assert mgr._stack_effective == "openvpn", "flip WG bloqué → reste OV"
+        assert mgr.calls["docker_run"] == 0, "aucun compose de flip"
+        assert mgr._flips == [], "rien n'est journalisé (pas de flip appliqué)"
+        assert mgr._last_auto_flip_at is None, "le cooldown n'est PAS armé"
 
     # ── T7 ─────────────────────────────────────────────────────────
     @pytest.mark.asyncio

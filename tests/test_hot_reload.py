@@ -32,7 +32,14 @@ def isolated_routes(tmp_path, monkeypatch):
     # Isolate the route dicts from whatever earlier modules left behind.
     monkeypatch.setattr(_cfg, "CUSTOM_ROUTES", {})
     monkeypatch.setattr(_cfg, "ROUTES", {})
-    return routes_file
+    # The code under test reassigns the SORTED_* globals (plain `global`
+    # rebinding — not restorable by monkeypatch); snapshot them explicitly,
+    # otherwise later tests find empty sorted-route tables.
+    saved_sorted = (_cfg.SORTED_ROUTES, _cfg.SORTED_CUSTOM_ROUTES)
+    try:
+        yield routes_file
+    finally:
+        _cfg.SORTED_ROUTES, _cfg.SORTED_CUSTOM_ROUTES = saved_sorted
 
 
 def test_reload_picks_up_new_routes(isolated_routes):
@@ -87,9 +94,23 @@ def test_reload_unchanged_mtime_is_noop(isolated_routes, monkeypatch):
 
 @pytest.fixture
 def isolated_yaml(tmp_path, monkeypatch):
-    """Point CONFIG_PATH at a tmp YAML with an empty custom_routes section."""
+    """Point CONFIG_PATH at a tmp YAML with an empty custom_routes section.
+
+    The tmp document is a copy of the live ``_yaml_data`` (custom_routes
+    emptied) rather than a bare ``custom_routes: {}``: the tests below call
+    ``_route_for()`` → ``maybe_reload_custom_routes()``, whose cfg_changed
+    branch re-applies every yaml-driven global in place (GO_ONLY_IDS,
+    IP_ROTATION, GEO_*, WEB_SEARCH_NATIVE_MODELS…). A minimal document would
+    wipe them process-wide and poison later tests (order-dependent failures).
+    """
+    import copy as _copy
+
+    import yaml as _yaml
+
+    base = _copy.deepcopy(dict(_cfg._yaml_data)) if getattr(_cfg, "_yaml_data", None) else {}
+    base["custom_routes"] = {}
     yaml_file = tmp_path / "config.yaml"
-    yaml_file.write_text("custom_routes: {}\n", encoding="utf-8")
+    yaml_file.write_text(_yaml.safe_dump(base), encoding="utf-8")
     monkeypatch.setattr(_cfg, "CONFIG_PATH", str(yaml_file))
     monkeypatch.setattr(_cfg, "_config_yaml_mtime", 0.0)
     monkeypatch.setattr(_cfg, "_custom_routes_mtime", 0.0)
@@ -97,7 +118,21 @@ def isolated_yaml(tmp_path, monkeypatch):
     # Isolate in-memory state: fresh dicts (identity preserved for reload).
     monkeypatch.setattr(_cfg, "CUSTOM_ROUTES", {})
     monkeypatch.setattr(_cfg, "ROUTES", {})
-    return yaml_file
+    # Belt-and-braces: globals mutated IN PLACE by the code under test —
+    # monkeypatch can't restore those, snapshot them around the test.
+    # GO_ONLY_IDS: wiped/rebuilt by the reload's go_only_ids branch.
+    # _yaml_data: save_custom_routes() writes routes straight into it.
+    saved_goi = set(_cfg.GO_ONLY_IDS)
+    saved_yaml = dict(_cfg._yaml_data)
+    saved_sorted = (_cfg.SORTED_ROUTES, _cfg.SORTED_CUSTOM_ROUTES)
+    try:
+        yield yaml_file
+    finally:
+        _cfg.GO_ONLY_IDS.clear()
+        _cfg.GO_ONLY_IDS.update(saved_goi)
+        _cfg._yaml_data.clear()
+        _cfg._yaml_data.update(saved_yaml)
+        _cfg.SORTED_ROUTES, _cfg.SORTED_CUSTOM_ROUTES = saved_sorted
 
 
 def test_save_custom_routes_total_replacement_no_resurrection(isolated_yaml):
