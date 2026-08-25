@@ -3217,6 +3217,59 @@ def register_dashboard(
             return JSONResponse(status_code=502, content={"error": str(e)[:200]})
         return {"ok": bool(ok), "station": sid}
 
+    @app.post("/api/vpn/station/{sid}/restart")
+    async def restart_station(sid: int, request: Request):
+        """[v10 §9.4] Redémarre la station {id} (docker restart léger).
+        Le statut converge via les vpn_event SSE (~15-45 s)."""
+        err = _check_dashboard_token(request)
+        if err:
+            return err
+        import shared_state
+
+        mgr = next(
+            (
+                m
+                for m in (getattr(shared_state, "vpn_managers", None) or [])
+                if getattr(m, "_station", None) == sid
+            ),
+            None,
+        )
+        if mgr is None:
+            return JSONResponse(status_code=404, content={"error": f"station {sid} introuvable"})
+        try:
+            await asyncio.wait_for(mgr.restart(), timeout=150)
+        except TimeoutError:
+            return {"ok": True, "station": sid, "note": "restart en cours — suivre via SSE"}
+        except Exception as e:
+            return JSONResponse(status_code=502, content={"error": str(e)[:200]})
+        return {"ok": True, "station": sid}
+
+    @app.post("/api/vpn/station/{sid}/soft-rotate")
+    async def soft_rotate_station(sid: int, request: Request):
+        """[v10 §9.4] Déclenche une rotation d'IP pour la station {id}
+        (queue pool, anti-flapping et garde-fous §3.6 applicables)."""
+        err = _check_dashboard_token(request)
+        if err:
+            return err
+        import shared_state
+
+        mgr = next(
+            (
+                m
+                for m in (getattr(shared_state, "vpn_managers", None) or [])
+                if getattr(m, "_station", None) == sid
+            ),
+            None,
+        )
+        pool = getattr(shared_state, "free_ip_pool", None)
+        if mgr is None or pool is None or not hasattr(pool, "_launch_rotation"):
+            return JSONResponse(status_code=404, content={"error": f"station {sid} ou pool indisponible"})
+        try:
+            pool._launch_rotation(mgr)
+        except Exception as e:
+            return JSONResponse(status_code=502, content={"error": str(e)[:200]})
+        return {"ok": True, "station": sid, "queued": True}
+
     @app.post("/api/vpn-config/validate")
     async def validate_vpn_config(request: Request):
         """[v10 §12.1.4] DRY-RUN : valide un payload de config VPN SANS

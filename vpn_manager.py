@@ -2746,6 +2746,11 @@ class VPNManager:
             "mounts": info.get("Mounts", []),
         }
 
+    async def restart(self) -> None:
+        """[v10 §9.4] Redémarrage léger du conteneur — API publique utilisée
+        par le dashboard et StationSupervisor.restart()."""
+        await self._docker_restart()
+
     async def _docker_restart(self) -> None:
         """Restart the gluetun container to get a fresh IP.
 
