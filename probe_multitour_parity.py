@@ -7,7 +7,7 @@ import re
 import sys
 import urllib.request
 
-BASE = "http://localhost:4000/v1/messages"
+BASE = f"http://localhost:{sys.argv[2] if len(sys.argv) > 2 else 4000}/v1/messages"
 MODEL = sys.argv[1] if len(sys.argv) > 1 else "muse-spark-1.2-contributor"
 
 Q1 = "Explique en deux phrases pourquoi le ciel est bleu, puis réfléchis longuement avant de répondre."
