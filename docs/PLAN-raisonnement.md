@@ -144,9 +144,31 @@ thinking signé à partir d'un summary client reviendrait à lui mentir.
 
 ### Validation
 
-- Suite complète : 778 passed / 1 skipped / EXIT=0 (baseline conservée,
+- Suite complète : 781 passed / 1 skipped / EXIT=0 (baseline 778 conservée,
   +3 tests nouveaux sur `_chat_to_responses_request`).
 - Fixture golden `multiturn_thinking_strip.json` régénérée :
   assistant A porte désormais `"reasoning_content": "raisonnement converti par
   le proxy"` (au lieu de `" "`), blob redacted toujours absent.
-- Sonde live multi-tours muse-spark + glm-5.1 : voir commit associé.
+- **Sonde live multi-tours (muse-spark + glm-5.1) — résultat nuancé** :
+  - **Côté proxy : correctif validé de bout en bout** (logs DEBUG). Au tour 2,
+    le texte intégral du raisonnement part upstream — item
+    `{"type":"reasoning","summary":[...]}` pour muse-spark (chemin `/responses`),
+    `reasoning_content` intégral pour glm-5.1 (chemin `/chat/completions`) ;
+    l'upstream répond 200 ; le retry défensif n'a jamais été déclenché
+    (correct : il ne doit tirer que sur 400/422). Sonde contrôle : quand le
+    secret est planté dans le **texte visible**, les 2 modèles le retrouvent ✅.
+  - **Mémoire live : non restaurée (0/2)** — mais la cause est côté upstream,
+    hors contrôle du proxy. Les endpoints zen **acceptent** le raisonnement
+    plaintext rejoué (200, aucune rejection) sans **l'utiliser** comme mémoire
+    du modèle : secret dans le raisonnement → non retrouvé ❌ sur les 2
+    modèles ; secret dans le texte → retrouvé ✅. De plus, leurs propres items
+    reasoning reviennent systématiquement `encrypted=True` avec
+    `encrypted_content` — c'est ce canal chiffré qui porte la vraie mémoire,
+    et il ne peut pas être forgé par un proxy.
+  - **Conclusion** : le strip d'origine restait un vrai bug corrigé (perte
+    garantie du raisonnement + comportement `" "`), et le correctif rétablit
+    la parité protocolaire avec l'usage direct. Mais la parité *fonctionnelle*
+    complète (le modèle « se souvient » de son raisonnement au tour suivant)
+    exige une coopération upstream (passthrough du raisonnement chiffré),
+    hors périmètre proxy. Le fallback `" "` ne s'applique plus qu'aux messages
+    assistant sans aucun bloc thinking à préserver.
