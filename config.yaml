@@ -208,6 +208,27 @@ ip_rotation:
   country_rotation: true
   country_offset: 14
   country_offset_stride: 17
+  latency_rotation:
+    enabled: true
+    slow_threshold_ms: 8000
+    ewma_threshold_ms: 6000
+    p95_threshold_ms: 9000
+    consecutive_slow: 3
+    min_requests_before_eval: 5
+    soft_cooldown_sec: 600
+    hard_cooldown_sec: 1800
+    ewma_alpha: 0.3
+    window: 20
+    slow_threshold_ms_per_model:
+      default: 8000
+      glm: 4000
+      deepseek: 5000
+      muse-spark: 6000
+    floor_ms: 3000
+    global_degraded_threshold: 0.5
+    global_degraded_cooldown_sec: 300
+    max_soft_rotates_per_hour: 6
+    stream_metric: ttfb
   docker_events: true
   auto_max_free_attempts: true
   free_parallel:
@@ -216,7 +237,7 @@ ip_rotation:
     mode: load-balance
     hedge_delay_ms: 150
     hedge_max_attempts: 2
-  max_free_attempts: 4
+  max_free_attempts: 3
   free_exception_fallback: station-first
 geo:
   enabled: true
