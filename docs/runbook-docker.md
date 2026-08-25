@@ -54,3 +54,29 @@ Desktop à la main, vérifier `docker ps` hors proxy, WSL à jour
 un conteneur jetable `opencode-chaos-*`. Jamais dans le gate par défaut ;
 ne touche JAMAIS aux stations gluetun réelles. Les scénarios de churn mockés
 vivent dans `tests/test_restart_churn.py` et tournent à chaque gate.
+
+## Incident type : flotte 0/4 + unhealthy + 401 en boucle
+
+Post-mortem complet : `docs/adr/ADR-005-incident-25-08-role-control-server.md`.
+Référence config : `docs/gluetun-station.md`.
+
+Symptômes signature :
+- logs conteneur : `401 GET /v1/vpn/status wrote 13B` en rafale (y compris
+  depuis le healthcheck interne de gluetun) ;
+- docker unhealthy / boucle `Restarting` ; churn « N restarts in 10m » ;
+- proxy : stations flip connected↔error, GUI tout rouge.
+
+Checks dans l'ordre (⚠️ les timeouts/EPERM sont des conséquences, pas des
+causes — FAQ healthcheck) :
+1. **Rôle control server présent ?** `grep AUTH_DEFAULT_ROLE credentials.env`
+   — attendu : `{"auth":"apikey","apikey":...}`. Absent/`{}` = cause racine
+   ADR-005 → restaurer la ligne puis recréer les conteneurs.
+2. Egress interne par station :
+   `docker exec <ctn> wget -q -O - -T 6 http://api.ipify.org`.
+3. DNS interne vs egress pur : hostname qui échoue alors qu'une IP brute
+   répond = problème DoT/DNS (cf. gluetun-station.md §DNS).
+4. MTU effectif : `docker exec <ctn> cat /sys/class/net/tun0/mtu` — si 1320
+   et TLS black-hole, vérifier WIREGUARD_MTU=1280 appliqué.
+5. Canary clé WG : `docker compose --profile wg-test up -d vpn-wg-test`.
+6. Dernier recours : `rotation_paused: true` (§3.8) pour geler les rotations,
+   laisser les backoffs s'apaiser, diagnostiquer à froid.
