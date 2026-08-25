@@ -114,6 +114,9 @@ class LatencyRotationEngine:
         self._global_log: deque[tuple[float, int]] = deque(maxlen=64)
         self._global_paused_until: float = 0.0
         self.paused: bool = False
+        # compteurs Prometheus §12.2.7
+        self.total_soft: int = 0
+        self.total_hard: int = 0
         self._now: Any = time.monotonic  # point d'injection tests
 
     # ── config ────────────────────────────────────────────────────────
@@ -175,6 +178,11 @@ class LatencyRotationEngine:
     def mark(self, sid: int, ip: str, kind: str) -> None:
         dur = self.cfg.soft_cooldown_sec if kind == COOLDOWN_SOFT else self.cfg.hard_cooldown_sec
         self._cooldowns[(int(sid), str(ip))] = (kind, self._now() + dur)
+        # [v10 §12.2.7] compteur Prometheus par type
+        if kind == COOLDOWN_HARD:
+            self.total_hard += 1
+        else:
+            self.total_soft += 1
         logger.info("[latency] %s cooldown st%s ip=%s %.0fs", kind, sid, ip, dur)
 
     def cooldown_kind(self, sid: int, ip: str) -> str | None:

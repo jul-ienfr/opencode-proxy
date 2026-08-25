@@ -2241,8 +2241,54 @@ async def lifespan(app):
             except Exception as e:
                 _debug(f"  [db] periodic cleanup error: {type(e).__name__}: {e}")
                 await asyncio.sleep(3600)
-
     db_cleanup_task = asyncio.create_task(_periodic_db_cleanup())
+
+    async def _db_maintenance_loop():
+        """[plan v10 §9.2.8] Dimanche 03h00 local : wal_checkpoint(TRUNCATE)
+        + VACUUM (DB cible < 1 Go). Tolérant au busy, jamais fatal.
+        Sleep par tranches d'1 h -> annuable proprement à l'arrêt."""
+
+        def _next_run():
+            import datetime as _dtm
+
+            now = _dtm.datetime.now()
+            days_ahead = (6 - now.weekday()) % 7  # 6 = dimanche
+            target = (now + _dtm.timedelta(days=days_ahead)).replace(
+                hour=3, minute=0, second=0, microsecond=0
+            )
+            if target <= now:
+                target += _dtm.timedelta(weeks=1)
+            return target
+
+        while True:
+            target = _next_run()
+            import datetime as _dtm2
+
+            while True:
+                wait = (target - _dtm2.datetime.now()).total_seconds()
+                if wait <= 0:
+                    break
+                await asyncio.sleep(min(3600.0, wait))
+            try:
+                t0 = time.monotonic()
+
+                def _maint():
+                    with _db_commit_lock:
+                        _conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                        _conn.execute("VACUUM")
+                    return round(os.path.getsize(_db_path) / 1024 / 1024, 1)
+
+                size_mo = await asyncio.to_thread(_maint)
+                _debug(
+                    f"  [db] maintenance hebdo OK en {time.monotonic() - t0:.1f}s "
+                    f"(checkpoint+VACUUM, {_db_path} = {size_mo} Mo)"
+                )
+            except Exception as e:
+                _debug(f"  [db] maintenance hebdo échouée (fail-soft): {type(e).__name__}: {e}")
+            await asyncio.sleep(3600)  # re-programme l'année suivante au prochain calcul
+
+    db_maintenance_task = asyncio.create_task(_db_maintenance_loop())
+
     _debug(
         "  [lifespan] background tasks created (WAL checkpoint, DB flush, key pause cleanup, DB body cleanup, quota fetcher)"
     )
@@ -2369,6 +2415,11 @@ async def lifespan(app):
     # commit en vol perdu à l'arrêt.
     try:
         await db_cleanup_task
+    except asyncio.CancelledError:
+        pass
+    # [v10 §9.2.8] la tâche de maintenance hebdo aussi (checkpoint+VACUUM)
+    try:
+        await db_maintenance_task
     except asyncio.CancelledError:
         pass
     _debug("  [lifespan] background tasks cancelled")
@@ -2561,10 +2612,148 @@ class RateLimitMiddleware:
 
 app.add_middleware(RateLimitMiddleware)
 
-# [plan v10 §14.0.4] Toggle client_auth none|lan|key pour /v1/* + resets.
-# Défaut "none" = comportement historique inchangé (bind 0.0.0.0 volontaire).
+# [plan v10 §9.1.5] Limite de taille APPLIQUÉE au niveau ASGI : l'ancien
+# contrôle post-lecture (3 handlers) bufferisait d'abord tout le body en
+# mémoire. Content-Length > MAX_BODY_SIZE -> 413 immédiat, sans lecture.
+# Les bodies chunked sans Content-Length restent gérés par le 413 post-lecture.
 from trust import ClientAuthMiddleware  # noqa: E402  # module local, import tardif conventionnel
 
+
+class _RequestBodyLimitMiddleware:
+    """Pure ASGI — rejette 413 avant bufferisation si Content-Length dépasse
+    la limite configurée (`upstream.max_body_size`, défaut 10 Mo)."""
+
+    def __init__(self, app, limit_getter):
+        self.app = app
+        self._limit_getter = limit_getter
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") == "http" and str(scope.get("method", "")).upper() in (
+            "POST",
+            "PUT",
+            "PATCH",
+        ):
+            try:
+                limit = int(self._limit_getter() or 0)
+            except Exception:
+                limit = 0
+            if limit > 0:
+                for raw_key, raw_val in scope.get("headers") or ():
+                    if bytes(raw_key).lower() == b"content-length":
+                        try:
+                            if int(raw_val) > limit:
+                                from trust import send_json as _sj
+
+                                await _sj(
+                                    send,
+                                    413,
+                                    {
+                                        "error": "payload_too_large",
+                                        "message": f"Body > {limit} octets (upstream.max_body_size).",
+                                    },
+                                )
+                                return
+                        except ValueError:
+                            pass
+                        break
+        await self.app(scope, receive, send)
+
+
+app.add_middleware(_RequestBodyLimitMiddleware, limit_getter=lambda: MAX_BODY_SIZE)
+
+
+def _build_metrics_text() -> str:
+    """[v10 §12.2.7] Exposition Prometheus (format texte, zéro dépendance).
+
+    Sources : moteur §3.6 (EWMA/p95/slow par station·ip), états stations,
+    compteurs rotations, cooldowns actifs, mode maintenance.
+    Fail-soft : toute source indisponible est sautée."""
+    lines = []
+
+    def gauge(name: str, help_txt: str, rows):
+        if not rows:
+            return
+        lines.append(f"# HELP {name} {help_txt}")
+        lines.append(f"# TYPE {name} gauge")
+        for labels, value in rows:
+            lines.append(f"{name}{{{labels}}} {value}")
+
+    try:
+        import shared_state as _ss
+
+        eng = getattr(_ss, "latency_engine", None)
+        mgrs = list(getattr(_ss, "vpn_managers", None) or [])
+
+        st_rows = []
+        for m in mgrs:
+            status = str(getattr(m, "status", "") or "")
+            st_rows.append((f'station="{m._station}"', 1 if status == "connected" else 0))
+        gauge("vpn_station_connected", "1 si la station est connectée", st_rows)
+
+        ewma_rows, p95_rows, slow_rows = [], [], []
+        if eng is not None:
+            for (_sid, _ip), tr in eng._trackers.items():
+                snap = tr.snapshot()
+                lbl = f'station="{_sid}",ip="{_ip}"'
+                if snap.ewma_ms is not None:
+                    ewma_rows.append((lbl, snap.ewma_ms))
+                if snap.p95_ms is not None:
+                    p95_rows.append((lbl, snap.p95_ms))
+                slow_rows.append((lbl, snap.consecutive_slow))
+        gauge("vpn_latency_ewma_ms", "EWMA par station·ip (ms)", ewma_rows)
+        gauge("vpn_latency_p95_ms", "p95 glissant par station·ip (ms)", p95_rows)
+        gauge(
+            "vpn_latency_consecutive_slow",
+            "requêtes lentes consécutives par station·ip",
+            slow_rows,
+        )
+
+        if eng is not None:
+            gauge(
+                "vpn_rotations_total",
+                "rotations déclenchées par type",
+                [
+                    ('kind="soft"', getattr(eng, "total_soft", 0)),
+                    ('kind="hard"', getattr(eng, "total_hard", 0)),
+                ],
+            )
+            cds = getattr(eng, "_cooldowns", {})
+            now = time.monotonic()
+            soft_n = sum(1 for _k, (kind, until) in cds.items() if kind == "soft" and until > now)
+            hard_n = sum(1 for _k, (kind, until) in cds.items() if kind == "hard" and until > now)
+            gauge(
+                "vpn_cooldown_active",
+                "cooldowns actifs par kind",
+                [('kind="soft"', soft_n), ('kind="hard"', hard_n)],
+            )
+            gauge(
+                "vpn_rotation_paused",
+                "mode maintenance actif",
+                [('paused="true"' if getattr(eng, "paused", False) else 'paused="false"', 1 if getattr(eng, "paused", False) else 0)],
+            )
+    except Exception as e:
+        _debug(f"  [metrics] build échoué (partiel): {e}")
+
+    return "\n".join(lines) + "\n"
+
+
+from fastapi import Response as _FastResponse  # noqa: E402
+
+
+@app.get("/metrics")
+async def prometheus_metrics(request: Request):
+    """[v10 §12.2.7] Métriques Prometheus. Clé dédiée optionnelle :
+    VPN_METRICS_API_KEY (séparée du control plane) ; sinon posture LAN-trust v9."""
+    metrics_key = os.environ.get("VPN_METRICS_API_KEY") or ""
+    if metrics_key:
+        provided = request.headers.get("X-API-Key") or ""
+        if not hmac.compare_digest(provided, metrics_key):
+            return _openai_error(401, "X-API-Key requis pour /metrics")
+    body = _build_metrics_text()
+    return _FastResponse(content=body, media_type="text/plain; version=0.0.4")
+
+
+# [v10 §12.2.7] /metrics Prometheus + ClientAuthMiddleware ci-dessous
 app.add_middleware(ClientAuthMiddleware)
 
 
