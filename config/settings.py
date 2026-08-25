@@ -801,20 +801,40 @@ MODELS = {}
 # Paid: https://opencode.ai/zen/go/v1/responses, Free: https://opencode.ai/zen/v1/responses
 _RESPONSES_ENDPOINT = "https://opencode.ai/zen/go/v1/responses"
 _RESPONSES_FREE_ENDPOINT = "https://opencode.ai/zen/v1/responses"
+
+
+def _resolve_model_endpoint(model_id: str, model_data: dict, protocol: str) -> str:
+    """Resolve the upstream endpoint for a configured model.
+
+    An explicit per-model `endpoint` key wins over the -free / muse-spark
+    heuristics: 'go' → Go chat completions (authenticated subscription),
+    'free' → free chat completions, any other value is used verbatim as a
+    full URL. Example: ox-alpha-free lives on the Go endpoint despite its
+    -free suffix (its free-tier twin is x-preview-f-free).
+    """
+    explicit = model_data.get("endpoint")
+    if explicit:
+        value = str(explicit).strip()
+        lowered = value.lower()
+        if lowered == "go":
+            return API_BASE_OPENAI
+        if lowered == "free":
+            return API_BASE_FREE
+        return value
+    lid = model_id.lower()
+    if lid.endswith("-free"):
+        if "muse" in lid or "spark" in lid:
+            return _RESPONSES_FREE_ENDPOINT
+        return API_BASE_FREE
+    if "muse" in lid or "spark" in lid:
+        return _RESPONSES_ENDPOINT
+    return API_BASE_OPENAI if protocol == "openai" else API_BASE_ANTHROPIC
+
+
 for _model_id, _model_data in _models_cfg.items():
     if isinstance(_model_data, dict):
         _proto = _model_data.get("protocol", "openai")
-        _lid = _model_id.lower()
-        if _lid.endswith("-free"):
-            if "muse" in _lid or "spark" in _lid:
-                _endpoint = _RESPONSES_FREE_ENDPOINT
-            else:
-                _endpoint = API_BASE_FREE
-        else:
-            if "muse" in _lid or "spark" in _lid:
-                _endpoint = _RESPONSES_ENDPOINT
-            else:
-                _endpoint = API_BASE_OPENAI if _proto == "openai" else API_BASE_ANTHROPIC
+        _endpoint = _resolve_model_endpoint(_model_id, _model_data, _proto)
         MODELS[_model_id] = {"endpoint": _endpoint, "protocol": _proto}
 
 
@@ -889,6 +909,12 @@ FREE_DISCOVERY_INTERVAL = int(
 FREE_DISCOVERY_ENABLED = bool(FREE_DISCOVERY.get("enabled", True))
 FREE_DISCOVERY_AUTO_PERSIST = bool(FREE_DISCOVERY.get("auto_persist", True))
 FREE_DISCOVERY_DEFAULT_TARGET = FREE_DISCOVERY.get("default_target", "mimo-v2.5-free")
+# -free ids served only via the authenticated Go endpoint (e.g. ox-alpha-free):
+# never added to the anonymous free pool / FREE_MODELS by auto-discovery.
+GO_ONLY_IDS: set = set()
+_goi_raw = FREE_DISCOVERY.get("go_only_ids", [])
+if isinstance(_goi_raw, list):
+    GO_ONLY_IDS.update(str(x).strip().lower() for x in _goi_raw if str(x).strip())
 
 # Seed FREE_MODELS from existing free_model_map values (known frees at boot)
 FREE_MODELS: set = {v for v in FREE_MODEL_MAP.values() if isinstance(v, str) and v}
@@ -1108,6 +1134,14 @@ def _apply_discovered_free_models(free_ids: set, source: str = "none") -> int:
     global FREE_MODEL_POOL
     if not isinstance(free_ids, set):
         free_ids = set(free_ids)
+    if GO_ONLY_IDS:
+        _go_only_hits = {f for f in free_ids if str(f).lower() in GO_ONLY_IDS}
+        if _go_only_hits:
+            logger.info(
+                "[free-discovery] go-only ids excluded from anonymous pool: %s",
+                ", ".join(sorted(_go_only_hits)),
+            )
+            free_ids -= _go_only_hits
     if free_ids == FREE_MODELS:
         for _fid in sorted(free_ids):
             if "muse" in _fid.lower() or "spark" in _fid.lower():
@@ -1581,6 +1615,21 @@ def maybe_reload_custom_routes():
                         new_wsn = new_yaml.get("web_search_native", ["muse-spark-1.2-contributor", "muse-spark-1.2-contributor-free"])
                         if isinstance(new_wsn, list) and new_wsn:
                             WEB_SEARCH_NATIVE_MODELS[:] = new_wsn
+                    except Exception:
+                        pass
+                    # go_only_ids hot-reload (in-place set — discovery filter stays live)
+                    try:
+                        _fd_sec = (
+                            new_yaml.get("free_discovery", {})
+                            if isinstance(new_yaml.get("free_discovery"), dict)
+                            else {}
+                        )
+                        _new_goi = _fd_sec.get("go_only_ids", [])
+                        if isinstance(_new_goi, list):
+                            GO_ONLY_IDS.clear()
+                            GO_ONLY_IDS.update(
+                                str(x).strip().lower() for x in _new_goi if str(x).strip()
+                            )
                     except Exception:
                         pass
                     # P2: server_countries change → regen .env via make_credentials_env

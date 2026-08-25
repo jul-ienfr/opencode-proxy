@@ -2928,12 +2928,14 @@ document.addEventListener('DOMContentLoaded', () => {
             const snaps = (perSid[sid] || []).filter(s => s.ewma_ms != null);
             snaps.sort((a, b) => b.count - a.count);
             const cur = snaps[0] || null;
-            const statusColor = st.vpn_status === 'connected' ? 'var(--success,#7ec699)'
-                : (st.vpn_status === 'error' ? 'var(--danger,#e06c50)' : 'var(--warning,#e6a000)');
+            const statusColor = st.vpn_status === 'connected'
+                ? ((cur && cur.consecutive_slow >= 2) ? 'var(--warning,#e6a000)' : 'var(--success,#7ec699)')
+                : (st.vpn_status === 'error' ? 'var(--danger,#e06c50)' : 'var(--text-muted,#8a8a8a)');
             const ewma = cur ? Math.round(cur.ewma_ms) : null;
             const p95 = cur && cur.p95_ms != null ? Math.round(cur.p95_ms) : null;
+            const slowBadge = (cur && cur.consecutive_slow >= 2) ? ' ⚠ ralentit' : '';
             html += `<div style="flex:0 0 auto;min-width:150px;padding:8px 10px;background:var(--bg-secondary);border-radius:8px;border-left:3px solid ${statusColor};font-size:12px">`
-                + `<div><strong>Station ${escHtml(String(st.station))}</strong> <span style="color:${statusColor}">●</span></div>`
+                + `<div><strong>Station ${escHtml(String(st.station))}</strong> <span style="color:${statusColor}">●</span>${slowBadge}</div>`
                 + `<div style="font-family:monospace;font-size:11px">${escHtml(st.current_ip || '—')}</div>`
                 + `<div>Req IP: ${st.requests_this_ip}/${st.quota_per_ip}</div>`
                 + `<div title="EWMA / p95 (ms)">lat: ${ewma != null ? ewma + 'ms' : '—'} · p95: ${p95 != null ? p95 + 'ms' : '—'}</div>`

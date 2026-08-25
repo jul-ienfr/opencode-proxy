@@ -284,8 +284,18 @@ class _KeyPauser:
 
             def _write_yaml():
                 os.makedirs(os.path.dirname(file_path), exist_ok=True)
-                with open(file_path, "w", encoding="utf-8") as f:
+                # [plan v10 §9.1.2] tmp+fsync+replace — l'écriture directe
+                # pouvait laisser un YAML tronqué sur crash/kill (les clés
+                # pausées disparaissaient alors au prochain load).
+                tmp = file_path + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
                     yaml.dump(payload, f, default_flow_style=False)
+                    f.flush()
+                    try:
+                        os.fsync(f.fileno())
+                    except OSError:
+                        pass
+                os.replace(tmp, file_path)
 
             try:
                 loop = asyncio.get_running_loop()
@@ -5413,6 +5423,23 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
         if isinstance(station, object) and getattr(station, "_station", None) is not None:
             _sid = int(station._station)
             _dec = _eng.record_request(_sid, str(free_ip or "direct"), float(elapsed_ms), free_model, resp.status_code)
+            # [v10 §12.1.3] alerte proactive SSE : une lente avant le seuil
+            if _dec.get("action") == "warn":
+                try:
+                    from dashboard.events import get_event_manager as _gem
+
+                    _gem().publish(
+                        "vpn_event",
+                        {
+                            "reason": "slow_ip_warn",
+                            "station": _sid,
+                            "ip": str(free_ip or ""),
+                            "ewma_ms": _dec.get("ewma"),
+                            "consecutive_slow": 1,
+                        },
+                    )
+                except Exception:
+                    pass
             if _dec.get("action") in ("soft", "hard"):
                 for _sup in getattr(_ss_lat, "station_supervisors", None) or []:
                     if _sup.station == _sid:

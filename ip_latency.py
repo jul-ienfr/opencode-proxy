@@ -49,6 +49,8 @@ class IpLatencyTracker:
     _ewma_log: float | None = None
     consecutive_slow: int = 0
     request_count: int = 0
+    # [v10 §12.1.1] échantillons (request_count, ewma_ms) pour la tendance
+    _samples: deque = field(default_factory=lambda: deque(maxlen=12))
 
     def __post_init__(self) -> None:
         if self._ring.maxlen != self.window:
@@ -71,10 +73,32 @@ class IpLatencyTracker:
             self._ewma_log = self.alpha * ln + (1 - self.alpha) * self._ewma_log
         if first_on_ip:
             return  # warm-up exclu du comptage slow
+        self._samples.append((self.request_count, round(self.ewma_ms or 0.0, 1)))
         if slow_threshold_ms > 0 and duration_ms > slow_threshold_ms:
             self.consecutive_slow += 1
         else:
             self.consecutive_slow = 0
+
+    def trend_pct(self, over: int = 5) -> float | None:
+        """[v10 §12.1.1] pente EWMA en % entre il y a `over` requêtes et
+        maintenant. None si pas d'historique ou base nulle.
+        Rotation prédictive : pente > +30 % = dégradation qui arrive.
+        Repli : si aucun échantillon <= target (warm-up exclu du comptage),
+        on compare au plus ancien disponible."""
+        if not self._samples:
+            return None
+        target_count = self.request_count - over
+        past = None
+        for cnt, val in reversed(self._samples):
+            if cnt <= target_count:
+                past = val
+                break
+        if past is None:
+            past = self._samples[0][1]  # le plus ancien disponible
+        cur = self.ewma_ms
+        if not past or cur is None:
+            return None
+        return round((cur - past) / past * 100, 1)
 
     def reset_consecutive_slow(self) -> None:
         """Appelé par StationSupervisor après finalize_ip (warm-up post-rotation,

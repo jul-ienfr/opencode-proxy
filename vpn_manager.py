@@ -3128,6 +3128,37 @@ class VPNManager:
                 break
         return False
 
+    async def pin_country(self, country: str, timeout: float = 30.0) -> bool:
+        """[v10 §12.1.5] Pin MANUEL d'un pays pour cette station (dashboard).
+
+        Réutilise _control_pin_country (PUT settings + scan auth/TLS fail-fast).
+        Le pays est épinglé jusqu'à unpin_country() ou la prochaine rotation."""
+        return await self._control_pin_country(country, timeout=timeout)
+
+    async def unpin_country(self) -> bool:
+        """[v10 §12.1.5] Restaure la sélection complète (SERVER_COUNTRIES) :
+        met fin au pin manuel. Le curseur de rotation reprend son cours."""
+        if not self._control_enabled:
+            return False
+        try:
+            countries = [str(c) for c in (self._countries_list() or [])]
+        except Exception:
+            countries = []
+        if not countries:
+            logger.warning("[vpn] unpin: aucune liste de pays configurée")
+            return False
+        payload = json.dumps(
+            {"provider": {"server_selection": {"countries": [_normalize_country(c) for c in countries]}}},
+            separators=(",", ":"),
+        )
+        lines = await self._control_exec("PUT", "/v1/vpn/settings", body=payload, timeout=15)
+        ok = bool(lines) and lines[0].strip().lower() == "running"
+        if ok:
+            self._current_country = None
+            self._country_pinned_at = None
+            logger.info("[vpn] unpin: sélection multi-pays restaurée (%d pays)", len(countries))
+        return ok
+
     async def _pin_country_for_rotation(
         self,
         timeout: float | None = None,

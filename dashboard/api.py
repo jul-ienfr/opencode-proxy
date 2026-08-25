@@ -355,6 +355,83 @@ def daysAgo(n: int) -> str:
 _persist_lock = __import__("threading").Lock()
 
 
+def _validate_vpn_config_payload(body) -> list:
+    """[v10 §12.1.4] validation DRY-RUN d'un payload VPN — retourne la liste
+    des erreurs (vide = valide). Mêmes règles que les endpoints d'application,
+    sans toucher au moindre état."""
+    errors: list = []
+    if not isinstance(body, dict):
+        return ["le payload doit être un objet"]
+
+    if "station_count" in body:
+        try:
+            v = int(body["station_count"])
+            if not 1 <= v <= 10:
+                errors.append("station_count doit être entre 1 et 10")
+        except (TypeError, ValueError):
+            errors.append("station_count doit être un entier")
+
+    lr = body.get("latency_rotation")
+    if lr is not None:
+        if not isinstance(lr, dict):
+            errors.append("latency_rotation doit être un objet")
+        else:
+            _ranges = {
+                "slow_threshold_ms": (100, 60000),
+                "ewma_threshold_ms": (100, 60000),
+                "p95_threshold_ms": (100, 120000),
+                "soft_cooldown_sec": (30, 7200),
+                "hard_cooldown_sec": (30, 14400),
+                "floor_ms": (0, 30000),
+            }
+            for k, (lo, hi) in _ranges.items():
+                if k in lr:
+                    try:
+                        v = float(lr[k])
+                        if not lo <= v <= hi:
+                            errors.append(f"latency_rotation.{k}={v} hors bornes [{lo}, {hi}]")
+                    except (TypeError, ValueError):
+                        errors.append(f"latency_rotation.{k} doit être numérique")
+            for k in ("consecutive_slow", "min_requests_before_eval", "max_soft_rotates_per_hour"):
+                if k in lr:
+                    try:
+                        v = int(lr[k])
+                        if not 1 <= v <= 50:
+                            errors.append(f"latency_rotation.{k}={v} hors bornes [1, 50]")
+                    except (TypeError, ValueError):
+                        errors.append(f"latency_rotation.{k} doit être un entier")
+            sm = lr.get("stream_metric")
+            if sm is not None and sm not in ("ttfb", "total"):
+                errors.append("latency_rotation.stream_metric doit valoir ttfb|total")
+            pm = lr.get("slow_threshold_ms_per_model")
+            if pm is not None and not isinstance(pm, dict):
+                errors.append("slow_threshold_ms_per_model doit être un objet {modèle: ms}")
+
+    per = body.get("per_station")
+    if per is not None:
+        if not isinstance(per, dict):
+            errors.append("per_station doit être un objet {\"N\": {...}}")
+        else:
+            allowed_keys = {"quota_per_ip", "country_offset", "country_offset_stride",
+                            "watchdog_interval", "proxy_mode"}
+            for sid_key, ov in per.items():
+                if str(sid_key).strip() not in {str(i) for i in range(1, 11)}:
+                    errors.append(f"per_station: station invalide {sid_key!r} (1..10)")
+                    continue
+                if not isinstance(ov, dict):
+                    errors.append(f"per_station[{sid_key}] doit être un objet")
+                    continue
+                unknown = set(ov) - allowed_keys
+                if unknown:
+                    errors.append(f"per_station[{sid_key}]: clés non supportées {sorted(unknown)}")
+
+    tr = body.get("trust") if isinstance(body.get("trust"), dict) else None
+    if tr is not None and tr.get("mode") not in (None, "lan", "open", "off"):
+        errors.append("dashboard_trust.mode doit valoir lan|open|off")
+
+    return errors
+
+
 async def _apply_import_payload(mgrs, body: dict, fallback_manager=None):
     """[v10 §14.3.31] applique ``{config, state}`` aux managers fournis.
 
@@ -3068,6 +3145,86 @@ def register_dashboard(
             "version": "1.0",
         }
         return export
+
+    @app.post("/api/vpn/station/{sid}/pin_country")
+    async def pin_station_country(sid: int, request: Request):
+        """[v10 §12.1.5] Pin manuel d'un pays pour la station {id}.
+        Body : {"country": "Japan"} — le control server gluetun fait une
+        vraie reconnexion (~8-15 s)."""
+        err = _check_dashboard_token(request)
+        if err:
+            return err
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse(status_code=400, content={"error": "JSON invalide"})
+        country = str((body or {}).get("country") or "").strip()
+        if not country:
+            return JSONResponse(status_code=400, content={"error": "'country' requis"})
+        import shared_state
+
+        mgr = next(
+            (
+                m
+                for m in (getattr(shared_state, "vpn_managers", None) or [])
+                if getattr(m, "_station", None) == sid
+            ),
+            None,
+        )
+        if mgr is None:
+            return JSONResponse(status_code=404, content={"error": f"station {sid} introuvable"})
+        try:
+            ok = await asyncio.wait_for(mgr.pin_country(country), timeout=60)
+        except TypeError:
+            return JSONResponse(status_code=500, content={"error": "manager sans pin_country"})
+        except Exception as e:
+            return JSONResponse(status_code=502, content={"error": str(e)[:200]})
+        if ok:
+            return {"ok": True, "station": sid, "country": country}
+        return JSONResponse(
+            status_code=502,
+            content={"error": "pin refusé par le control server (pays invalide ou tunnel KO)"},
+        )
+
+    @app.delete("/api/vpn/station/{sid}/pin_country")
+    async def unpin_station_country(sid: int, request: Request):
+        """[v10 §12.1.5] Retire le pin manuel : restaure la sélection
+        multi-pays complète (SERVER_COUNTRIES)."""
+        err = _check_dashboard_token(request)
+        if err:
+            return err
+        import shared_state
+
+        mgr = next(
+            (
+                m
+                for m in (getattr(shared_state, "vpn_managers", None) or [])
+                if getattr(m, "_station", None) == sid
+            ),
+            None,
+        )
+        if mgr is None:
+            return JSONResponse(status_code=404, content={"error": f"station {sid} introuvable"})
+        try:
+            ok = await asyncio.wait_for(mgr.unpin_country(), timeout=45)
+        except Exception as e:
+            return JSONResponse(status_code=502, content={"error": str(e)[:200]})
+        return {"ok": bool(ok), "station": sid}
+
+    @app.post("/api/vpn-config/validate")
+    async def validate_vpn_config(request: Request):
+        """[v10 §12.1.4] DRY-RUN : valide un payload de config VPN SANS
+        l'appliquer. Retourne {valid, errors[]} — l'UI peut l'appeler avant
+        chaque POST réel."""
+        err = _check_dashboard_token(request)
+        if err:
+            return err
+        try:
+            body = await request.json()
+        except Exception as e:
+            return JSONResponse(status_code=400, content={"valid": False, "errors": [str(e)]})
+        errors = _validate_vpn_config_payload(body)
+        return {"valid": not errors, "errors": errors}
 
     @app.post("/api/vpn/rotation-paused")
     async def set_rotation_paused(request: Request):

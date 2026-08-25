@@ -48,6 +48,9 @@ class EngineConfig:
     max_soft_rotates_per_hour: int = 6
     stream_metric: str = "ttfb"  # ttfb | total (v5 §3.6.1)
     prewarm_after_rotate: bool = True
+    # [v10 §12.1.1] rotation prédictive : pente EWMA (%) sur 5 requêtes ;
+    # 0 = désactivé.
+    predictive_trend_pct: float = 30.0
 
     @classmethod
     def from_cfg(cls, cfg: dict[str, Any]) -> EngineConfig:
@@ -83,6 +86,10 @@ class EngineConfig:
         sm = str(g("stream_metric", c.stream_metric)).lower()
         c.stream_metric = sm if sm in ("ttfb", "total") else "ttfb"
         c.prewarm_after_rotate = bool(g("prewarm_after_rotate", True))
+        try:
+            c.predictive_trend_pct = float(g("predictive_trend_pct", 30.0))
+        except (TypeError, ValueError):
+            c.predictive_trend_pct = 30.0
         return c
 
     def threshold_for(self, model: str) -> tuple[float, float]:
@@ -274,21 +281,42 @@ class LatencyRotationEngine:
             reason = f"http_{status_code}"
         elif warmup_skip:
             reason = "warmup_excluded"
-        elif not tr.should_soft_rotate(threshold_for, p95_threshold):
-            pass  # seuils non atteints
-        elif prev_kind is not None:
-            # déjà sous cooldown ACTIF → rien à faire, attendre la rotation
-            # (sinon chaque requête lente post-mark ré-escaladerait)
-            action, reason = "none", f"{prev_kind}_active"
-        elif key in self._soft_history:
-            # soft déjà subi par ce couple puis expiré et re-slow (l'IP est
-            # revenue en service via fallback LRU et reste mauvaise) → hard
-            self.mark(sid, ip, COOLDOWN_HARD)
-            action, reason = "hard", "repeated_slow_after_soft"
         else:
-            self._soft_history.add(key)
-            self.mark(sid, ip, COOLDOWN_SOFT)
-            action, reason = "soft", "latency_thresholds"
+            should = tr.should_soft_rotate(threshold_for, p95_threshold)
+            # [v10 §12.1.1] rotation PRÉDICTIVE : pente EWMA > +X % sur les
+            # 5 dernières requêtes — anticipe la lenteur avant les seuils.
+            trend_hit = False
+            if (
+                not should
+                and self.cfg.predictive_trend_pct > 0
+                and prev_kind is None
+                and tr.request_count >= self.cfg.min_requests_before_eval
+            ):
+                t = tr.trend_pct(5)
+                trend_hit = t is not None and t >= self.cfg.predictive_trend_pct
+
+            if should or trend_hit:
+                if prev_kind is not None:
+                    # déjà sous cooldown ACTIF → rien à faire, attendre la
+                    # rotation (sinon ré-escalade intra-rafale)
+                    action, reason = "none", f"{prev_kind}_active"
+                elif key in self._soft_history:
+                    # soft déjà subi par ce couple puis expiré et re-slow → hard
+                    self.mark(sid, ip, COOLDOWN_HARD)
+                    action, reason = "hard", "repeated_slow_after_soft"
+                else:
+                    self._soft_history.add(key)
+                    self.mark(sid, ip, COOLDOWN_SOFT)
+                    action = "soft"
+                    reason = "predictive_trend" if trend_hit else "latency_thresholds"
+            elif (
+                status_code in (None, 200)
+                and prev_kind is None
+                and tr.consecutive_slow == max(1, self.cfg.consecutive_slow - 1)
+            ):
+                # [v10 §12.1.3] alerte proactive : une lente avant le seuil —
+                # le front-end l'affiche en badge jaune (pas de rotation).
+                action, reason = "warn", "approaching_slow"
         return {
             "action": action,
             "reason": reason,

@@ -105,6 +105,7 @@ models:
     protocol: openai
   ox-alpha-free:
     protocol: openai
+    endpoint: go
   deepseek-v4-flash-vision-exp:
     protocol: openai
   longcat-2.0:
@@ -237,7 +238,7 @@ ip_rotation:
     mode: load-balance
     hedge_delay_ms: 150
     hedge_max_attempts: 2
-  max_free_attempts: 3
+  max_free_attempts: 4
   free_exception_fallback: station-first
 geo:
   enabled: true
@@ -259,7 +260,7 @@ custom_routes:
   mimov25:
     match:
     - mimo-v2.5
-    model: muse-spark-1.2-contributor
+    model: x-preview-f-free
     thinking: adaptive
   mimov25pro:
     match:
@@ -290,6 +291,12 @@ custom_routes:
     match:
     - qwen3.7-max
     model: muse-spark-1.2-contributor
+  oxalpha:
+    match:
+    - 0xalpha
+    - ox-alpha
+    - oxalpha
+    model: ox-alpha-free
 api_keys: []
 web_search:
   enabled: true
@@ -362,6 +369,8 @@ free_discovery:
   interval: 3600
   auto_persist: true
   default_target: mimo-v2.5-free
+  go_only_ids:
+  - ox-alpha-free
 traffic:
   enabled: true
   max_frames: 500
