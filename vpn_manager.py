@@ -5027,11 +5027,16 @@ async def reconcile_orphan_containers(managers: list, runner=None) -> list[str]:
 
         m = by_name.get(name)
         if name not in expected:
-            if age_sec is not None and age_sec < 120:
+            # [incident 25/08 v2] conteneur VIVANT absent du registre = course
+            # probable (watchdog qui recrée vs lifespan qui purge) → JAMAIS
+            # supprimé tant qu'il tourne. Seuls les conteneurs arrêtés sortis
+            # du registre sont purgés (vrais restes de downscale).
+            running = bool((info or {}).get("State", {}).get("Running"))
+            if running:
                 logger.warning(
-                    "[vpn] boot reconcile: %s a seulement %.0fs — grâce (course probable), conservé",
+                    "[vpn] boot reconcile: %s running mais absent du registre — "
+                    "conservé (course probable)",
                     name,
-                    age_sec,
                 )
                 continue
             removed.append(name)
@@ -5052,6 +5057,12 @@ async def reconcile_orphan_containers(managers: list, runner=None) -> list[str]:
         if expected_stack is None:
             expected_stack = m._stack_effective or "openvpn"  # fallback historique
         if vpn_type is not None and vpn_type != expected_stack:
+            logger.warning(
+                "[vpn] boot reconcile: %s stack=%s != attendu=%s (source .env) -> rm",
+                name,
+                vpn_type,
+                expected_stack,
+            )
             removed.append(name)
             await _rm(name)
     if removed:
