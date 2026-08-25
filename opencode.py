@@ -6346,11 +6346,9 @@ async def _sse_keepalive(stream_gen, interval: float = _SSE_KEEPALIVE_INTERVAL):
             done, _pending = await asyncio.wait(
                 {read_task, timer_task}, return_when=asyncio.FIRST_COMPLETED
             )
-            if timer_task in done:
-                # Recyclé UNIQUEMENT après un vrai ping (plus de churn/chunk)
-                timer_task = None
-                yield b": ping\n\n"
             if read_task in done:
+                # Read PRIORITAIRE : un chunk prêt au même instant qu'un ping
+                # est émis sans ping parasite avant/après (ordre contractuel).
                 activity.set()  # [B2] réarme le timer sans le recréer
                 try:
                     chunk = read_task.result()
@@ -6369,6 +6367,13 @@ async def _sse_keepalive(stream_gen, interval: float = _SSE_KEEPALIVE_INTERVAL):
                         )
                     return
                 yield chunk
+            elif timer_task in done:
+                # Recyclé UNIQUEMENT après un vrai ping (plus de churn/chunk)
+                timer_task = None
+                # Ping fired while the upstream read is still pending — keep
+                # the read alive (it stays pending in read_task) and let the
+                # client know the proxy is still there.
+                yield b": ping\n\n"
     finally:
         if timer_task is not None and not timer_task.done():
             timer_task.cancel()
@@ -7632,7 +7637,7 @@ async def messages(request: Request):
                         yield chunk
 
                 return StreamingResponse(
-                    _sse_keepalive(anthropic_stream_free_fallback()),
+                    _sse_keepalive(_sse_coalesce(anthropic_stream_free_fallback())),
                     media_type="text/event-stream",
                     headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
                 )
@@ -7895,7 +7900,8 @@ async def messages(request: Request):
             for _attempt in range(_free_bound):
                 used_tools = []  # Reset on each retry attempt
                 _line_buf = ""  # fresh per attempt — avoids stale truncated data: re-parse
-                _debug(f"  [stream] attempt {_attempt + 1}/{_free_bound}")
+                if _cfg_settings.DEBUG:
+                    _debug(f"  [stream] attempt {_attempt + 1}/{_free_bound}")
                 try:
                     # Axe A: geo-restricted paid streaming → route through tunnel station
                     _stream_ctx = (
@@ -8427,7 +8433,7 @@ async def messages(request: Request):
         # For streaming: if free model exists, pass empty headers (free models don't need auth)
         _stream_headers = a_headers if a_headers.get("x-api-key") else {}
         return StreamingResponse(
-            _sse_keepalive(anthropic_stream(_stream_headers)),
+            _sse_keepalive(_sse_coalesce(anthropic_stream(_stream_headers))),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
         )
@@ -8843,9 +8849,10 @@ async def messages(request: Request):
             )
             try:
                 # Axe A: geo-restricted paid streaming → route through tunnel station
-                _debug(
-                    f"  [stream-oai] attempt {_attempt}/{_free_bound} _geo_tunnel={_geo_tunnel} _using_free={_using_free} endpoint={endpoint}"
-                )
+                if _cfg_settings.DEBUG:
+                    _debug(
+                        f"  [stream-oai] attempt {_attempt}/{_free_bound} _geo_tunnel={_geo_tunnel} _using_free={_using_free} endpoint={endpoint}"
+                    )
                 _stream_ctx = (
                     _open_via_pool(
                         endpoint, oai_body, hdrs, is_stream=True, forced_pool=_free_forced_pool
@@ -9446,7 +9453,7 @@ async def messages(request: Request):
         return
 
     return StreamingResponse(
-        _sse_keepalive(stream_gen(headers)),
+        _sse_keepalive(_sse_coalesce(stream_gen(headers))),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
     )
@@ -10688,7 +10695,7 @@ async def chat_completions(request: Request):
                 return
 
         return StreamingResponse(
-            _sse_keepalive(openai_stream(headers)),
+            _sse_keepalive(_sse_coalesce(openai_stream(headers))),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
         )
@@ -11474,7 +11481,7 @@ async def chat_completions(request: Request):
                 emitted_finish = True
 
     return StreamingResponse(
-        _sse_keepalive(_anthro_to_oai_stream(a_headers)),
+        _sse_keepalive(_sse_coalesce(_anthro_to_oai_stream(a_headers))),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
     )
