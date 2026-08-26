@@ -19,6 +19,7 @@ from typing import Any
 from fastapi import Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.datastructures import MutableHeaders
 
 import config.settings as config_settings
 from config import (
@@ -50,6 +51,89 @@ from .quota import (
 _CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
 if hasattr(subprocess, "CREATE_NO_WINDOW"):
     _CREATE_NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+
+
+def _precompress_static_assets(static_dir) -> dict[str, tuple[bytes, str]]:
+    """[P1.3 perf] Compresse UNE FOIS au demarrage les assets JS/CSS du
+    dashboard (zlib niveau 6, format gzip). Le middleware statique sert ces
+    octets directement si le client accepte gzip : zero compression ni I/O
+    disque par requete. Retour {path_url: (gz_bytes, content_type)}."""
+    import mimetypes
+    import zlib
+
+    out: dict[str, tuple[bytes, str]] = {}
+    try:
+        names = sorted(os.listdir(static_dir))
+    except Exception:
+        return out
+    for name in names:
+        if not name.endswith((".js", ".css")):
+            continue
+        try:
+            with open(os.path.join(static_dir, name), "rb") as f:
+                raw = f.read()
+            co = zlib.compressobj(6, zlib.DEFLATED, 16 + zlib.MAX_WBITS)
+            gz = co.compress(raw) + co.flush()
+            if len(gz) < len(raw):
+                ctype = mimetypes.guess_type(name)[0] or "application/octet-stream"
+                out["/static/" + name] = (gz, ctype)
+        except Exception:
+            continue
+    return out
+
+
+class _StaticCacheMiddleware:
+    """[P1.3 perf] Middleware statique PUR ASGI : Cache-Control sur /static/*
+    + service direct des octets .gz pré-compressés si le client accepte
+    gzip. Remplace la version BaseHTTPMiddleware (~1-8 ms/requête sur TOUTES
+    les requêtes y compris SSE) par ~0.05 ms : pas de task enveloppe, pas de
+    canaux recréés — un simple wrap du send ASGI."""
+
+    def __init__(self, app, precompressed=None):
+        self.app = app
+        self._pre = precompressed or {}
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        path = scope.get("path", "")
+        hit = self._pre.get(path)
+        if hit is not None and scope.get("method") in ("GET", "HEAD"):
+            accept = ""
+            for k, v in scope.get("headers") or []:
+                if k == b"accept-encoding":
+                    accept = v.decode("latin-1", "ignore")
+                    break
+            if "gzip" in accept.lower():
+                gz, ctype = hit
+                is_head = scope.get("method") == "HEAD"
+                body = b"" if is_head else gz
+                headers = [
+                    (b"content-type", ctype.encode("latin-1")),
+                    (b"content-length", str(len(gz)).encode("latin-1")),
+                    (b"content-encoding", b"gzip"),
+                    (b"vary", b"Accept-Encoding"),
+                    (b"cache-control", b"public, max-age=3600"),
+                ]
+                await send(
+                    {"type": "http.response.start", "status": 200, "headers": headers}
+                )
+                await send(
+                    {"type": "http.response.body", "body": body, "more_body": False}
+                )
+                return
+        if not path.startswith("/static/"):
+            await self.app(scope, receive, send)
+            return
+
+        async def _send_cc(message):
+            if message["type"] == "http.response.start":
+                resp_headers = MutableHeaders(scope=message)
+                resp_headers["cache-control"] = "public, max-age=3600"
+            await send(message)
+
+        await self.app(scope, receive, _send_cc)
 
 
 # ── Simple TTL cache for expensive dashboard queries ──
@@ -1366,17 +1450,14 @@ def register_dashboard(
     _shared_conn = conn
     _tools_provider = tools_provider
     _ro_db_path = _resolve_ro_path(conn)
-    # Add Cache-Control headers for static assets (JS/CSS/HTML)
-    from starlette.middleware.base import BaseHTTPMiddleware
-
-    class _StaticCacheMiddleware(BaseHTTPMiddleware):
-        async def dispatch(self, request, call_next):
-            response = await call_next(request)
-            if request.url.path.startswith("/static/"):
-                response.headers["Cache-Control"] = "public, max-age=3600"
-            return response
-
-    app.add_middleware(_StaticCacheMiddleware)
+    # [P1.3 perf] Cache-Control + gzip pré-compressé via middleware PUR ASGI
+    # (module-level _StaticCacheMiddleware) : ~0.05 ms/requête au lieu de
+    # ~1-8 ms avec BaseHTTPMiddleware sur TOUTES les requêtes y compris SSE.
+    # PAS de GZipMiddleware global : il compresserait les flux SSE
+    # (tampon → casse le temps réel). Compression statique calculée UNE FOIS
+    # au démarrage ; zéro coût par requête.
+    _pre_static_gz = _precompress_static_assets(static_dir)
+    app.add_middleware(_StaticCacheMiddleware, precompressed=_pre_static_gz)
 
     # [plan v10 §14.0.3] Confiance réseau zéro-friction : loopback + LAN CIDRs
     # passent sans identifiant ; mutations → même-host anti-CSRF + rate-limit ;
