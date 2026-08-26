@@ -26,6 +26,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from typing import Any
 
 ROOT = Path(__file__).resolve().parent.parent
 BASELINE_PATH = ROOT / "logs" / "bench_baseline.json"
@@ -116,7 +117,7 @@ BUDGETS = {
 }
 
 
-def run_benches() -> dict[str, dict[str, object]]:
+def run_benches() -> dict[str, dict[str, Any]]:
     out: dict[str, dict[str, object]] = {}
     for name, (fn, budget, desc) in BUDGETS.items():
         value = round(fn(), 3)
@@ -151,7 +152,7 @@ def main() -> int:
     parser.add_argument("--json", action="store_true", help="sortie JSON pure")
     args = parser.parse_args()
 
-    results = run_benches()
+    results: dict[str, dict[str, Any]] = run_benches()
     lines: list[str] = []
     for name, r in results.items():
         budget = f" (budget {r['budget']}ms)" if r["budget"] else ""

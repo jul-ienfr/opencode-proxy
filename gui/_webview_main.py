@@ -68,10 +68,13 @@ if __name__ == "__main__":
                 url,
                 **kwargs,
             )
+            if window is None:
+                # pywebview n'a pas pu créer la fenêtre (backend indisponible)
+                continue
 
             window.events.closed += lambda: _save_state(window)
 
-            webview.start(gui=gui_backend, debug=debug)
+            webview.start(gui=gui_backend, debug=debug)  # type: ignore[arg-type]
             break  # success, window was shown and closed normally
         except Exception as e:
             print(f"[dashboard] pywebview backend '{gui_backend}' failed: {e}", file=sys.stderr)
