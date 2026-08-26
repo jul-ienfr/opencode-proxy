@@ -120,7 +120,16 @@ def _sync_control_api_key() -> bool:
         print(f"WARN: could not read ip_rotation.control_api_key from {CONFIG_PATH} — credentials.env not updated")
         return False
     _upsert_env_var(DST, "VPN_CONTROL_API_KEY", key)
-    print(f"OK: {DST} VPN_CONTROL_API_KEY synced from config.yaml")
+    # [fix SEC-1 26/08] le rôle d'auth du control server gluetun embarque la
+    # MÊME clé dans son JSON (HTTP_CONTROL_SERVER_AUTH_DEFAULT_ROLE) —
+    # l'ancien code ne mettait à jour que VPN_CONTROL_API_KEY : après
+    # rotation + recréation des conteneurs, le control API répondait 401
+    # (rôle encore sur l'ancienne clé). Les deux variables sont syncd.
+    import json as _json
+
+    role = {"name": "normal", "auth": "apikey", "apikey": key}
+    _upsert_env_var(DST, "HTTP_CONTROL_SERVER_AUTH_DEFAULT_ROLE", _json.dumps(role))
+    print(f"OK: {DST} VPN_CONTROL_API_KEY + HTTP_CONTROL_SERVER_AUTH_DEFAULT_ROLE synced from config.yaml")
     return True
 
 
