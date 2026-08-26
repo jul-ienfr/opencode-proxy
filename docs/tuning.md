@@ -46,7 +46,7 @@ upstream:
 | Prod (systemd) | `gunicorn -c gunicorn.conf.py opencode:app` | `cpu_count` (4 on 4c) | 15 | 600 |
 | Dev | `python opencode.py --no-gui` | 1 (uvicorn) | 15 | 600 |
 
-- `worker_connections 2000`, `graceful_timeout 5`, `max_requests 10000 ±1000 jitter` — recycle workers to curb leaks.
+- `worker_connections 2000`, `graceful_timeout 5` — [P1.4] pas de `max_requests` : le recycle périodique de l'unique worker détruirait l'état mémoire (piles VPN, SSE, caches) et couperait les streams en pleine session.
 
 ## Cache prompt
 
