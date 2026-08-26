@@ -7202,12 +7202,15 @@ def ensure_min_tokens(body: dict, default: int = None) -> dict:
 
 
 def _estimate_tokens(text: str) -> int:
-    """Fast token estimation — uses char-length for small strings, tiktoken for large."""
-    if len(text) < 200:
-        # Fast path: ~4 chars per token for English, ~2 for CJK — use 3 as compromise
-        return max(1, len(text) // 3)
-    if _encoding:
-        return len(_encoding.encode(text))
+    """Fast token estimation — char-length only (P1.5).
+
+    [P1.5 perf] Plus de branche tiktoken ≥200 chars : cette fonction n'est
+    appelée QUE par les compteurs incrémentaux de stream (deltas, boucle
+    d'émission) — un encode tiktoken par delta à fort débit coûte cher sur
+    la boucle. Dérive chars//3 vs tiktoken acceptable : affichage stats
+    dashboard uniquement (usage réel lu dans `usage` quand l'upstream le
+    fournit). tiktoken CONSERVÉ pour _estimate_input_tokens / count_tokens
+    (offloadés to_thread)."""
     return max(1, len(text) // 3)
 
 
