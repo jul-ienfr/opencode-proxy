@@ -146,6 +146,118 @@ async def test_eviction_removes_only_faulty_session(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_pooled_sessions_inherit_bounded_timeout(monkeypatch):
+    """[P1.1 perf] La factory de session poolée pose timeout=(10, 600) :
+    tout POST qui n'en passe pas (streams free, geo) hérite d'une borne
+    connect/read au lieu du défaut curl_cffi (illimité)."""
+    captured_kwargs: list[dict] = []
+
+    def _factory(**kw):
+        captured_kwargs.append(kw)
+        return _FakeCurlSession([], 0)
+
+    monkeypatch.setattr("curl_cffi.requests.AsyncSession", _factory)
+    monkeypatch.setattr(oc, "_curl_proxy_url", lambda p: p)
+
+    pool, slot = await oc._get_pooled_curl_session("socks5://t:1080", "chrome131")
+    await pool.checkin(slot)
+    assert captured_kwargs, "la factory doit être invoquée"
+    assert captured_kwargs[0].get("timeout") == (10, 600), (
+        "session poolée sans timeout borné — POST stream/geo peut pendre indéfiniment"
+    )
+    assert captured_kwargs[0].get("impersonate") == "chrome131"
+
+
+@pytest.mark.asyncio
+async def test_cancelled_post_evicts_and_closes_session(monkeypatch):
+    """[P2.1] Un POST annulé (stop client) doit FERMER la session via
+    _evict_later — discard() seul la retirait du tracking sans close
+    (fuite socket à chaque stop Claude Code pendant un POST)."""
+    created: list = []
+
+    def _factory(**kw):
+        sess = _FakeCurlSession([], 0.5)  # POST long → annulé en cours
+        created.append(sess)
+        return sess
+
+    monkeypatch.setattr("curl_cffi.requests.AsyncSession", _factory)
+
+    pool, slot = await oc._get_pooled_curl_session("socks5://c:1080", "chrome131")
+
+    async def _cancelled_request():
+        try:
+            await slot.sess.post("http://x")
+        except asyncio.CancelledError:
+            oc._evict_later(pool, slot)
+            raise
+
+    task = asyncio.ensure_future(_cancelled_request())
+    await asyncio.sleep(0.05)  # laisse le POST entrer
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await asyncio.sleep(0.05)  # laisse tourner la tâche d'éviction différée
+
+    assert created[0].closed, "session fermée après annulation (pas de fuite socket)"
+    assert all(s is not slot for s in pool.slots), "slot évicté du pool"
+
+
+@pytest.mark.asyncio
+async def test_idle_orphan_pool_evicted_by_sweep(monkeypatch):
+    """[P2.2] Un pool sans slot emprunté, idle > TTL, est pop du dict PUIS
+    fermé ; un pool avec un slot busy est JAMAIS touché (garde vital :
+    close_all() toucherait les slots empruntés restés listés)."""
+    created: list = []
+
+    def _factory(**kw):
+        sess = _FakeCurlSession([], 0)
+        created.append(sess)
+        return sess
+
+    monkeypatch.setattr("curl_cffi.requests.AsyncSession", _factory)
+
+    # Pool A : idle depuis > TTL
+    pool_a, slot_a = await oc._get_pooled_curl_session("socks5://a:1080", "chrome131")
+    await pool_a.checkin(slot_a)
+    pool_a.last_used -= oc._CURL_POOL_IDLE_TTL + 1.0
+
+    # Pool B : idle > TTL MAIS un slot emprunté (busy)
+    pool_b, slot_b = await oc._get_pooled_curl_session("socks5://b:1080", "chrome131")
+    pool_b.last_used -= oc._CURL_POOL_IDLE_TTL + 1.0
+
+    # Pool C : récent (idle < TTL) → intouché
+    pool_c, slot_c = await oc._get_pooled_curl_session("socks5://c:1080", "chrome131")
+    await pool_c.checkin(slot_c)
+
+    key_a = "socks5://a:1080|chrome131"
+    key_b = "socks5://b:1080|chrome131"
+    key_c = "socks5://c:1080|chrome131"
+    assert key_a in oc._curl_pool and key_b in oc._curl_pool and key_c in oc._curl_pool
+
+    freed = await oc._evict_idle_curl_pools()
+    assert freed == 1
+    assert key_a not in oc._curl_pool, "pool orphelin idle évité"
+    assert created[0].closed, "sessions du pool évité fermées"
+    assert key_b in oc._curl_pool, "pool avec slot busy JAMAIS évité"
+    assert not created[1].closed
+    assert key_c in oc._curl_pool, "pool récent conservé"
+
+
+@pytest.mark.asyncio
+async def test_busy_count_property_tracks_checkout():
+    """[P2.2] busy_count reflète les slots empruntés (les busy restent listés)."""
+    pool = oc._CurlSessionPool(3)
+    s1 = await pool.checkout(lambda: _FakeCurlSession([], 0))
+    assert pool.busy_count == 1 and len(pool.slots) == 1
+    s2 = await pool.checkout(lambda: _FakeCurlSession([], 0))
+    assert pool.busy_count == 2 and len(pool.slots) == 2
+    await pool.checkin(s1)
+    assert pool.busy_count == 1
+    await pool.checkin(s2)
+    assert pool.busy_count == 0
+
+
+@pytest.mark.asyncio
 async def test_do_free_request_parallel_via_helper(monkeypatch):
     """Bout-en-bout _do_free_request_curl_cffi : 4 appels concurrents vers la
     même station se chevauchent (fin du head-of-line blocking) via le chemin

@@ -90,7 +90,8 @@ async def test_save_request_enqueues_raw_row(monkeypatch):
         tools_used=["read", "read", "grep"],
     )
     assert len(captured) == 1
-    raw = captured[0]
+    assert captured[0][0] == "requests", "item taggé requests dans la queue writer"
+    raw = captured[0][1]
     assert isinstance(raw, oc._DbRowRaw)
     assert raw.request_body is body, "le corps doit voyager BRUT (pas de copie sérialisée)"
     assert raw.tools_used == ["read", "read", "grep"], "dédup effectué au writer, pas au caller"
@@ -169,7 +170,8 @@ async def test_batch_writer_accepts_raw_rows_end_to_end(monkeypatch, tmp_path):
         0,
         request_body={"messages": [{"role": "user", "content": "hello"}]},
     )
-    assert isinstance(captured[0], oc._DbRowRaw)
+    assert captured[0][0] == "requests"
+    assert isinstance(captured[0][1], oc._DbRowRaw)
     n = oc._db_execute_batch_sync(list(captured))
     assert n == 1
     db_row = conn.execute(
@@ -178,3 +180,136 @@ async def test_batch_writer_accepts_raw_rows_end_to_end(monkeypatch, tmp_path):
     assert db_row is not None
     assert db_row[1] == "glm-5.1"
     assert "hello" in db_row[2]
+
+
+class _RecordingConn:
+    """Connexion factice qui enregistre tout accès execute/commit côté loop."""
+
+    def __init__(self):
+        self.calls: list[str] = []
+
+    def execute(self, *a, **k):
+        self.calls.append("execute")
+        raise AssertionError("sqlite exécuté sur la boucle (P1.2 violé)")
+
+    def commit(self):
+        self.calls.append("commit")
+        raise AssertionError("commit sur la boucle (P1.2 violé)")
+
+
+@pytest.mark.asyncio
+async def test_log_free_model_usage_enqueues_without_sqlite_on_loop(monkeypatch):
+    """[P1.2] _log_free_model_usage ne touche JAMAIS sqlite sur la boucle :
+    la ligne part dans la queue writer sous forme de tuple taggé."""
+    rec = _RecordingConn()
+    monkeypatch.setattr(oc, "_conn", rec)
+
+    captured = []
+    monkeypatch.setattr(oc, "_db_queue", _FakeQueue(captured))
+
+    oc._log_free_model_usage(
+        "claude-sonnet", "glm-5.1", "sk-ant-api03-abcdef1234567890", "wrk_x", 200,
+        tokens_in=11, tokens_out=22, duration_ms=33, ip="1.2.3.4",
+    )
+    assert rec.calls == [], "aucun appel sqlite synchrone sur la boucle"
+    assert len(captured) == 1
+    table, row = captured[0]
+    assert table == "free_usage"
+    assert len(row) == 10
+    ts, paid, free, key_masked, ws, status, t_in, t_out, dur, ip = row
+    assert free == "glm-5.1" and paid == "claude-sonnet"
+    assert key_masked == "sk-ant-api03-abc...", "clé tronquée à 16 chars + ellipsis"
+    assert "sk-ant-api03-abcdef1234567890" not in key_masked, "clé pleine jamais en queue"
+    assert status == 200 and t_in == 11 and t_out == 22 and dur == 33 and ip == "1.2.3.4"
+    assert ts.endswith("Z")
+
+
+@pytest.mark.asyncio
+async def test_free_usage_tagged_row_inserts_end_to_end(monkeypatch):
+    """Garde-fou régression P1.2 : le writer batché insère VRAIMENT un tuple
+    taggé ("free_usage", row) dans la table free_model_usage."""
+    import sqlite3
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute(_FREE_USAGE_DDL)
+    monkeypatch.setattr(oc, "_conn", conn)
+
+    batch = [
+        ("free_usage",
+         ("2026-08-26T10:00:00Z", "claude-sonnet", "glm-5.1", "sk-...mask",
+          "wrk_x", 200, 5, 7, 42, "1.2.3.4")),
+        ("requests", ("id-r",) + ("x",)) ,  # type ignoré : table absente → item sauté fail-soft
+    ]
+    # La ligne requests ci-dessus vise une table inexistante : le contrat
+    # fail-soft du writer veut qu'elle soit sautée SANT casser le batch.
+    n = oc._db_execute_batch_sync(batch)
+    assert n == 1, "seul l'item free_usage valide est compté"
+    rows = conn.execute(
+        "SELECT timestamp, paid_model, free_model, api_key, workspace_id, status,"
+        " tokens_input, tokens_output, duration_ms, ip FROM free_model_usage"
+    ).fetchall()
+    assert len(rows) == 1
+    assert rows[0][0] == "2026-08-26T10:00:00Z"
+    assert rows[0][2] == "glm-5.1"
+    assert rows[0][9] == "1.2.3.4"
+
+
+_FREE_USAGE_DDL = """
+CREATE TABLE free_model_usage (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT NOT NULL,
+    paid_model TEXT NOT NULL,
+    free_model TEXT NOT NULL,
+    api_key TEXT NOT NULL,
+    workspace_id TEXT NOT NULL,
+    status INTEGER NOT NULL,
+    tokens_input INTEGER DEFAULT 0,
+    tokens_output INTEGER DEFAULT 0,
+    duration_ms INTEGER DEFAULT 0,
+    ip TEXT DEFAULT ''
+)
+"""
+
+
+@pytest.mark.asyncio
+async def test_mixed_batch_requests_and_free_usage(monkeypatch):
+    """Batch mixte taggé : les deux tables sont alimentées par le même
+    passage writer (un seul lock, un seul commit)."""
+    import sqlite3
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute(
+        """
+        CREATE TABLE requests (
+            id TEXT PRIMARY KEY, timestamp TEXT NOT NULL, model TEXT NOT NULL,
+            original_model TEXT, duration_ms INTEGER, tokens_input INTEGER,
+            tokens_output INTEGER, tokens_cache INTEGER, success INTEGER,
+            error TEXT, protocol TEXT, is_stream INTEGER, thinking TEXT,
+            effort TEXT, client_ip TEXT, account_alias TEXT, tools TEXT,
+            tools_used TEXT, request_body TEXT, response_body TEXT,
+            client_user_agent TEXT, free_model_ip TEXT, identity TEXT,
+            geo_country TEXT, geo_blocked TEXT, geo_direct_country TEXT,
+            geo_direct_ip TEXT, geo_via_vpn TEXT, geo_allowed TEXT, station TEXT
+        )
+        """
+    )
+    conn.execute(_FREE_USAGE_DDL)
+    monkeypatch.setattr(oc, "_conn", conn)
+
+    raw_req = oc._DbRowRaw(
+        ("id-mix", "2026-08-26T10:00:00Z", "glm-5.1") + (None,) * 13,
+        (None,) * 10,
+        request_body=None,
+        response_body=None,
+        tools=None,
+        tools_used=None,
+    )
+    batch = [
+        ("requests", raw_req),
+        ("free_usage",
+         ("2026-08-26T10:00:01Z", "opus", "minimax-m2.5", "k", "w", 200, 1, 2, 3, "")),
+    ]
+    n = oc._db_execute_batch_sync(batch)
+    assert n == 2
+    assert conn.execute("SELECT COUNT(*) FROM requests").fetchone()[0] == 1
+    assert conn.execute("SELECT COUNT(*) FROM free_model_usage").fetchone()[0] == 1

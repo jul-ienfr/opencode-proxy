@@ -23,7 +23,6 @@ import threading
 import time
 import traceback
 import urllib.parse
-import uuid
 from collections import OrderedDict
 from contextlib import asynccontextmanager
 from typing import Any
@@ -1025,7 +1024,7 @@ async def _save_request(
         tools_used=tools_used,
     )
     try:
-        _db_queue.put_nowait(item)
+        _db_queue.put_nowait(("requests", item))
     except asyncio.QueueFull:
         _debug(
             f"  [db] queue full ({_db_queue.qsize()}), dropping req_id={req_id} — fallback to direct"
@@ -1093,26 +1092,33 @@ def _log_free_model_usage(
 ):
     """Log a free model request to the database for quota analysis.
 
-    [P5 tranche 4] INSERT délégué à app/db.log_free_usage (lock + commit
-    gérés là-bas) ; le masquage de clé reste ici (seam visible)."""
+    [P1.2 perf] Zéro SQLite sur la boucle : la ligne part dans la queue
+    writer batchée (_db_queue) sous forme de tuple taggé ("free_usage", row) ;
+    l'INSERT+commit s'exécute dans le thread writer, commits groupés.
+    Sémantique fail-soft inchangée : erreur SQL loguée côté writer, jamais
+    propagée à la requête. Le masquage de clé reste ici (seam visible).
+    Fraîcheur dashboard : instant → ≤5 s (table display-only, aucun routage)."""
     try:
-        _app_db.log_free_usage(
-            _conn,
-            _db_commit_lock,
-            paid_model=paid_model,
-            free_model=free_model,
-            api_key_masked=api_key[:16] + "...",
-            workspace_id=workspace_id,
-            status=status,
-            tokens_in=tokens_in,
-            tokens_out=tokens_out,
-            duration_ms=duration_ms,
-            ip=ip,
+        timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        row = (
+            timestamp,
+            paid_model,
+            free_model,
+            api_key[:16] + "...",
+            workspace_id,
+            status,
+            tokens_in,
+            tokens_out,
+            duration_ms,
+            ip,
         )
+        _db_queue.put_nowait(("free_usage", row))
         _debug(
-            f"  [free-usage] logged: {free_model} key={api_key[:8]}... ws={workspace_id[:12]}... "
+            f"  [free-usage] queued: {free_model} key={api_key[:8]}... ws={workspace_id[:12]}... "
             f"status={status} ip={ip} in={tokens_in} out={tokens_out}"
         )
+    except asyncio.QueueFull:
+        _debug(f"  [free-usage] queue full — dropped usage row for {free_model}")
     except Exception as e:
         _debug(f"  [free-usage] log failed: {e}")
 
@@ -1245,6 +1251,9 @@ def _resp_json_or_empty(resp):
 
 def _drop_orphan_tool_messages(messages: list[dict]) -> list[dict]:
     """Filter role:tool messages whose tool_call_id has no preceding tool_calls id."""
+    # [P5.2 perf] early-exit sans rebuild quand aucun role=="tool" (99% des requêtes)
+    if not any(m.get("role") == "tool" for m in messages):
+        return messages
     _seen_ids: set[str] = set()
     filtered: list[dict] = []
     for m in messages:
@@ -1269,6 +1278,9 @@ def _drop_orphan_tool_messages(messages: list[dict]) -> list[dict]:
 
 def _drop_orphan_responses_input(inp: list[dict]) -> list[dict]:
     """Filter function_call_output items whose call_id has no preceding function_call."""
+    # [P5.2 perf] early-exit sans rebuild quand aucun function_call_output
+    if not any(it.get("type") == "function_call_output" for it in inp):
+        return inp
     _known: set[str] = set()
     _filt: list[dict] = []
     for it in inp:
@@ -1292,10 +1304,14 @@ def _drop_orphan_responses_input(inp: list[dict]) -> list[dict]:
 
 
 def _build_http_limits() -> httpx.Limits:
-    """Tuned for extreme speed: 500 conns, 200 keepalive, 30s expiry."""
+    """Tuned for extreme speed: 64 conns, 32 keepalive, 30s expiry.
+
+    [P2.5 perf] défauts 500/200 → 64/32 : un proxy mono-utilisateur n'a
+    jamais besoin de 500 connexions concurrentes ; les FDs/mémoire libérés
+    et le pool httpx restent chauds (hot-reloadable via config.yaml)."""
     return httpx.Limits(
-        max_connections=int(yaml_get("upstream", "max_connections", 500)),
-        max_keepalive_connections=int(yaml_get("upstream", "max_keepalive", 200)),
+        max_connections=int(yaml_get("upstream", "max_connections", 64)),
+        max_keepalive_connections=int(yaml_get("upstream", "max_keepalive", 32)),
         keepalive_expiry=float(yaml_get("upstream", "keepalive_expiry", 30)),
     )
 
@@ -1330,6 +1346,7 @@ _transport = (
     )
 )
 _client = httpx.AsyncClient(transport=_transport, timeout=_build_http_timeout())
+_client_lock = threading.Lock()  # [P2.4] self-heal sync + double-check (asyncio.Lock impossible depuis sync)
 
 # ── Curl TLS pool (M reusable AsyncSessions per proxy+impersonate) ──
 # [A1 perf / audit vitesse §2] L'ancien schéma « 1 session + lock global par
@@ -1378,12 +1395,22 @@ class _CurlSessionPool:
     place (l'éviction de la session fautive est conservée de l'ancien code).
     """
 
-    __slots__ = ("slots", "_cond", "max_size")
+    # [P2.2] last_used/closing : éviction TTL des pools orphelins + drainage
+    # swap-and-close à la rotation IP. busy_count est une propriété (classe).
+    __slots__ = ("slots", "_cond", "max_size", "last_used", "closing")
 
     def __init__(self, max_size: int = 3):
         self.slots: list[_CurlSessionSlot] = []
         self._cond = asyncio.Condition()
         self.max_size = max(1, int(max_size))
+        self.last_used = time.monotonic()
+        self.closing = False
+
+    @property
+    def busy_count(self) -> int:
+        """Slots empruntés (les slots restent listés dans self.slots même
+        busy — le garde busy est VITAL avant tout close_all())."""
+        return sum(1 for s in self.slots if s.busy)
 
     def _try_checkout(self) -> _CurlSessionSlot | None:
         for slot in self.slots:
@@ -1394,6 +1421,7 @@ class _CurlSessionPool:
 
     async def checkout(self, factory) -> _CurlSessionSlot:
         async with self._cond:
+            self.last_used = time.monotonic()
             slot = self._try_checkout()
             while slot is None:
                 if len(self.slots) < self.max_size:
@@ -1416,6 +1444,20 @@ class _CurlSessionPool:
 
     async def checkin(self, slot: _CurlSessionSlot) -> None:
         async with self._cond:
+            if self.closing:
+                # [P2.3] pool en drainage (swap post-rotation) : fermer la
+                # session au lieu de la restocker — le drain se termine
+                # naturellement au dernier checkin.
+                try:
+                    self.slots.remove(slot)
+                except ValueError:
+                    pass
+                try:
+                    await slot.sess.close()
+                except Exception:
+                    pass
+                self._cond.notify()
+                return
             if slot in self.slots:
                 slot.busy = False
                 if slot.overflow:
@@ -1500,7 +1542,15 @@ async def _get_pooled_curl_session(proxy_url: str | None, impersonate: str):
         _curl_pool[key] = pool
     slot = await pool.checkout(
         lambda: _curl_requests_mod.AsyncSession(
-            impersonate=impersonate, proxy=_curl_proxy_url(proxy_url)
+            impersonate=impersonate,
+            proxy=_curl_proxy_url(proxy_url),
+            # [P1.1 perf] timeout=(connect 10, read 600) AU NIVEAU SESSION :
+            # toutes les sessions poolées l'héritent — POST non-stream,
+            # streams free et requêtes geo, y compris les appels qui ne
+            # passent pas de timeout explicite. Read 600 : longs streams ;
+            # le watchdog cancel_streams reste la 2ᵉ couche (détection
+            # egress-mort < timeout read).
+            timeout=(10, 600),
         )
     )
     return pool, slot
@@ -1513,6 +1563,93 @@ async def _close_curl_pool():
     _curl_pool.clear()
 
 
+def _flush_curl_pools_for_proxy(proxy_url: str | None) -> None:
+    """[P2.3 perf] Swap-and-close des pools curl d'un proxy après rotation
+    IP réussie — posé dans shared_state par le lifespan, appelé par
+    free_ip_pool depuis la branche ``alive:`` de _rotate_station.
+
+    Économise 1 aller-retour échoué (+1-3 s) sur la première requête
+    post-rotation : les sessions de l'ancien tunnel ne sont plus jamais
+    réempruntées. Protocole SANS casser les requêtes en vol :
+      - pop de la clé + pool NEUF immédiat dans le dict ;
+      - busy_count == 0 → close_all() fire-and-forget (task) ;
+      - sinon pool.closing = True : les checkins ferment leurs sessions au
+        lieu de restocker, et une task de drainage ferme le reste dès que
+        busy_count retombe à 0.
+    """
+    if not proxy_url:
+        return
+    prefix = f"{proxy_url}|"
+    flushed = 0
+    for key, old_pool in list(_curl_pool.items()):
+        if not key.startswith(prefix):
+            continue
+        new_pool = _CurlSessionPool(_curl_pool_size())
+        _curl_pool[key] = new_pool  # remplace AVANT tout close
+        old_pool.closing = True
+        if old_pool.busy_count == 0:
+
+            async def _close_now(p=old_pool):
+                await p.close_all()
+
+            try:
+                asyncio.get_running_loop().create_task(_close_now())
+            except RuntimeError:
+                pass
+        else:
+
+            async def _drain(p=old_pool):
+                while True:
+                    async with p._cond:
+                        if p.busy_count == 0:
+                            break
+                    await asyncio.sleep(0.5)
+                await p.close_all()
+
+            try:
+                asyncio.get_running_loop().create_task(_drain())
+            except RuntimeError:
+                pass
+        flushed += 1
+    if flushed:
+        _debug(f"  [curl-pool] {flushed} pool(s) swapped after IP rotation")
+
+
+# [P2.2 perf] TTL d'idle au-delà de laquelle un pool sans slot emprunté est
+# évité : jusqu'à 256 profils d'identité ⇒ jusqu'à 256 clés (proxy|impersonate),
+# et les pools abandonnés gardent sinon leurs handles TLS ouverts pour toujours.
+_CURL_POOL_IDLE_TTL = 600.0
+
+
+async def _evict_idle_curl_pools(ttl: float = _CURL_POOL_IDLE_TTL) -> int:
+    """Éviction TTL/LRU des pools curl orphelins — appelée par le tick
+    background existant (30 s). Retourne le nombre de pools fermés.
+
+    Protocole : pop de la clé du dict AVANT close_all() — un checkout
+    concurrent reçoit None → crée un pool neuf. Garde busy_count == 0
+    VITAL : les slots empruntés restent listés dans self.slots et
+    close_all() les toucherait. La double vérification se fait SOUS la
+    Condition du pool pour fermer la course avec un checkout en vol.
+    """
+    now = time.monotonic()
+    freed = 0
+    for key, pool in list(_curl_pool.items()):
+        if pool.closing or (now - pool.last_used) < ttl:
+            continue
+        async with pool._cond:
+            # Re-vérification sous verrou : un checkout qui a gagné la course
+            # a posé last_used à jour ET rendu un slot busy.
+            if (
+                pool.busy_count != 0
+                or (time.monotonic() - pool.last_used) < ttl
+            ):
+                continue
+            _curl_pool.pop(key, None)
+            await pool.close_all()
+            freed += 1
+    return freed
+
+
 def _ensure_http_client() -> httpx.AsyncClient:
     """Lazy self-heal for the shared upstream client.
 
@@ -1523,27 +1660,33 @@ def _ensure_http_client() -> httpx.AsyncClient:
     That error was surfacing as a confusing ✘ failure in dashboard history.
     Re-create the client on demand instead — same pattern as
     dashboard/quota.py::_get_http_client.
+
+    [P2.4] threading.Lock + double vérification : fonction sync (asyncio.Lock
+    impossible), deux coroutines peuvent recréer chacune un transport → le
+    perdant fuirait (FD leak). Lock jamais tenu sur I/O (construction µs).
     """
     global _client, _transport
-    # getattr: real httpx clients always expose .is_closed; test doubles that
-    # omit it are treated as alive rather than closed.
-    if _client is None or getattr(_client, "is_closed", False):
-        _transport = (
-            httpx.AsyncHTTPTransport(
-                proxy=PROXY,
-                limits=_build_http_limits(),
-                http2=True,
-                retries=0,
+    # fast-path sans lock
+    if _client is not None and not getattr(_client, "is_closed", False):
+        return _client
+    with _client_lock:
+        if _client is None or getattr(_client, "is_closed", False):
+            _transport = (
+                httpx.AsyncHTTPTransport(
+                    proxy=PROXY,
+                    limits=_build_http_limits(),
+                    http2=True,
+                    retries=0,
+                )
+                if PROXY
+                else httpx.AsyncHTTPTransport(
+                    limits=_build_http_limits(),
+                    http2=True,
+                    retries=0,
+                )
             )
-            if PROXY
-            else httpx.AsyncHTTPTransport(
-                limits=_build_http_limits(),
-                http2=True,
-                retries=0,
-            )
-        )
-        _client = httpx.AsyncClient(transport=_transport, timeout=_build_http_timeout())
-        _debug("[http] shared upstream client re-created (was closed)")
+            _client = httpx.AsyncClient(transport=_transport, timeout=_build_http_timeout())
+            _debug("[http] shared upstream client re-created (was closed)")
     return _client
 
 
@@ -2202,6 +2345,11 @@ async def lifespan(app):
             await asyncio.sleep(yaml_get("background", "cooldown_sweep_interval", 30))
             try:
                 _sweep_free_cooldowns()
+                # [P2.2 perf/fuite] même tick : éviction des pools curl
+                # orphelins (identités abandonnées, handles TLS ouverts).
+                freed = await _evict_idle_curl_pools()
+                if freed:
+                    _debug(f"  [curl-pool] {freed} orphan pool(s) evicted (TTL)")
             except Exception as e:
                 _debug(f"  [cooldown] sweep error: {type(e).__name__}: {e}")
 
@@ -4034,9 +4182,11 @@ async def _do_free_request_curl_cffi(
             timeout=(10, 600),  # (connect, read) — read 600: long streams
         )
     except asyncio.CancelledError:
-        # État transport inconnu → on jette l'emprunt sans await (pas de
-        # close dans une tâche annulée) ; le shutdown fermera le reste.
-        pool.discard(slot)
+        # [P2.1 perf/fuite] _evict_later au lieu de discard() : le slot est
+        # RETIRÉ du tracking par discard sans close → socket TLS qui fuit à
+        # chaque stop Claude Code pendant un POST. L'éviction différée
+        # (fire-and-forget) ferme la session hors de la tâche annulée.
+        _evict_later(pool, slot)
         raise
     except _curl_err.RequestsError as e:
         # [plan 18/08 §1a] a REAL connection failure (dead SOCKS5 tunnel)
@@ -4584,11 +4734,13 @@ async def _open_free_stream(
                     _free_request_headers(headers), profile, use_curated_ua=False
                 )
                 req_headers["Content-Type"] = "application/json"
-                # [plan 18/08 §1a/am.21] connect timeout 30 → 10: in mono-station
-                # the request IS the arming signal (bad-mark is C1-forbidden) —
-                # the first failure reaches the manager in ≤10-15 s, not 30. Read
-                # 600 unchanged (long streams). SOCKS5+TLS handshake ≈ 1-2 s on a
-                # healthy tunnel — no legitimate request is impacted.
+                # [P1.1 perf] timeout=(10, 600) posé AU NIVEAU DE LA FACTORY
+                # de session poolée (_get_pooled_curl_session) : le POST
+                # ci-dessous n'a plus besoin d'un timeout par appel — toutes
+                # les sessions poolées l'héritent. Read 600 inchangé (longs
+                # streams). SOCKS5+TLS handshake ≈ 1-2 s sur un tunnel sain —
+                # aucune requête légitime n'est impactée ; un tunnel mort est
+                # détecté par le watchdog cancel_streams AVANT le read 600.
                 _debug(
                     f"  [free-stream] creating curl_cffi session proxy={_curl_proxy_url(proxy_url)} (pooled)"
                 )
@@ -4606,7 +4758,9 @@ async def _open_free_stream(
                         stream=True,
                     )
                 except asyncio.CancelledError:
-                    pool2.discard(slot2)
+                    # [P2.1] éviction différée : close réel au lieu du
+                    # discard (socket qui fuyait à chaque stop client en stream).
+                    _evict_later(pool2, slot2)
                     raise
                 except BaseException:
                     _evict_later(pool2, slot2)
@@ -4813,7 +4967,8 @@ async def _open_via_pool(endpoint, body, headers, *, is_stream=False, forced_poo
                 stream=True,
             )
         except asyncio.CancelledError:
-            pool.discard(slot)
+            # [P2.1] éviction différée (close réel) au lieu de discard.
+            _evict_later(pool, slot)
             raise
         except BaseException:
             _evict_later(pool, slot)
@@ -6181,154 +6336,119 @@ async def _terminate_after_started(open_blocks, stream_out, thinking_idx=None, t
 _SSE_KEEPALIVE_INTERVAL = yaml_get("streaming", "sse_keepalive_interval", 15)  # seconds
 
 
-async def _sse_keepalive(stream_gen, interval: float = _SSE_KEEPALIVE_INTERVAL):
-    """Wrap an async generator to inject SSE keepalive comments during idle periods.
+async def _sse_pump(stream, *, ping_interval: float = _SSE_KEEPALIVE_INTERVAL, coalesce_max: int = 64 * 1024):
+    """[P4.5 perf] Pompe SSE fusionnée — remplace _sse_keepalive+_sse_coalesce séparés.
 
-    When no chunk is yielded for `interval` seconds, sends `: ping\\n\\n`
-    (a comment line, ignored by SSE clients) to keep the connection alive.
+    Un seul `read_task` + timer idle réarmé par `asyncio.Event` (B2) + drain
+    non-bloquant après le 1er chunk, ≤1 `sleep(0)`/groupe, plafond 64 KiB (B3).
+    Priorité read > ping (ordre contractuel), retour propre sur Exception
+    upstream, `finally` cancel pending/read. Ne touche PAS à
+    `_CurlCffiStreamResponse.aiter_lines` [41] — uniquement la pompe d'émission.
 
-    IMPORTANT: the ping timer RACES the upstream read and never cancels it.
-    asyncio.wait_for(anext(...), timeout=interval) would CANCEL the pending
-    anext on a long upstream silence — CancelledError (a BaseException that
-    `except Exception` in the stream generators cannot catch) is thrown into
-    the inner generator, killing the upstream connection, so a stall > 15s
-    terminated the whole stream with EOF and no message_stop. Here the read
-    task keeps waiting across pings: a slow first chunk or a stalled VPN
-    tunnel no longer kills the stream, it just gets bridged by pings.
-
-    [B2 perf] recyclage des tâches : le timer de ping n'est plus annulé/
-    recréé À CHAQUE chunk (~2 Tasks + un asyncio.wait par delta à 50-200
-    deltas/s). Un ``asyncio.Event`` réarme la fenêtre d'idle en place ; le
-    task timer n'est recréé qu'après un VRAI ping (silence réel), et la
-    read-task reste la seule recréée par chunk (un seul anext à la fois).
+    `ping_interval` falsy → pas de pings, `coalesce_max` falsy → pas de coalesce.
     """
+    # normalise en aiter
+    try:
+        aiter = stream.__aiter__()
+    except AttributeError:
+        aiter = stream
     read_task = None
     timer_task = None
+    pending = None
     activity = asyncio.Event()
 
     async def _idle_timer():
-        # Se TERMINE seulement après `interval` SANS activité — l'Event
-        # réarmé par chaque chunk relance la fenêtre sans recycle.
         while True:
             activity.clear()
             try:
-                await asyncio.wait_for(activity.wait(), timeout=interval)
+                await asyncio.wait_for(activity.wait(), timeout=ping_interval)
             except TimeoutError:
                 return
 
     try:
         while True:
-            if read_task is None or read_task.done():
-                read_task = asyncio.ensure_future(anext(stream_gen))
-            if timer_task is None or timer_task.done():
-                timer_task = asyncio.ensure_future(_idle_timer())
-            done, _pending = await asyncio.wait(
-                {read_task, timer_task}, return_when=asyncio.FIRST_COMPLETED
-            )
+            if pending is not None:
+                read_task = pending
+                pending = None
+            elif read_task is None or read_task.done():
+                read_task = asyncio.ensure_future(anext(aiter))
+            # timer seulement si ping activé
+            if ping_interval and ping_interval > 0:
+                if timer_task is None or timer_task.done():
+                    timer_task = asyncio.ensure_future(_idle_timer())
+                wait_tasks = {read_task, timer_task}
+            else:
+                wait_tasks = {read_task}
+                timer_task = None
+            done, _ = await asyncio.wait(wait_tasks, return_when=asyncio.FIRST_COMPLETED)
             if read_task in done:
-                # Read PRIORITAIRE : un chunk prêt au même instant qu'un ping
-                # est émis sans ping parasite avant/après (ordre contractuel).
-                activity.set()  # [B2] réarme le timer sans le recréer
+                activity.set()
                 try:
-                    chunk = read_task.result()
+                    first = read_task.result()
                 except StopAsyncIteration:
                     return
-                except Exception as e:
-                    # ClientDisconnect, ConnectionResetError, etc. — client gone, stop gracefully
-                    # Log traceback for unexpected errors (like UnboundLocalError) to aid debugging
-                    if isinstance(e, (ConnectionError, OSError)):
-                        _debug(
-                            f"  [stream] keepalive exiting (client gone): {type(e).__name__}: {e}"
-                        )
-                    else:
-                        _debug(
-                            f"  [stream] keepalive exiting: {type(e).__name__}: {e}\n{traceback.format_exc()}"
-                        )
+                except Exception:
                     return
-                yield chunk
-            elif timer_task in done:
-                # Recyclé UNIQUEMENT après un vrai ping (plus de churn/chunk)
+                read_task = None
+                # coalesce si activé et bytes
+                if coalesce_max and coalesce_max > 0 and isinstance(first, (bytes, bytearray)):
+                    groups = [first]
+                    size = len(first)
+                    exhausted = False
+                    while size < coalesce_max:
+                        nxt = asyncio.ensure_future(anext(aiter))
+                        await asyncio.sleep(0)
+                        if not nxt.done():
+                            pending = nxt
+                            break
+                        try:
+                            chunk = nxt.result()
+                        except StopAsyncIteration:
+                            exhausted = True
+                            break
+                        except Exception:
+                            exhausted = True
+                            break
+                        if not isinstance(chunk, (bytes, bytearray)):
+                            # flush bytes group puis yield non-bytes isolé
+                            if groups:
+                                yield b"".join(groups)
+                                groups = []
+                            yield chunk
+                            break
+                        groups.append(chunk)
+                        size += len(chunk)
+                    if groups:
+                        yield b"".join(groups)
+                    if exhausted:
+                        return
+                else:
+                    yield first
+            elif timer_task is not None and timer_task in done:
                 timer_task = None
-                # Ping fired while the upstream read is still pending — keep
-                # the read alive (it stays pending in read_task) and let the
-                # client know the proxy is still there.
                 yield b": ping\n\n"
     finally:
         if timer_task is not None and not timer_task.done():
             timer_task.cancel()
         if read_task is not None and not read_task.done():
-            # Only reached on a client disconnect / generator teardown —
-            # THERE the upstream abort is correct (client is gone).
             read_task.cancel()
+        if pending is not None and not pending.done():
+            pending.cancel()
+
+
+async def _sse_keepalive(stream_gen, interval: float = _SSE_KEEPALIVE_INTERVAL):
+    """Wrapper fin pour compat tests — ping seul, pas de coalesce."""
+    async for chunk in _sse_pump(stream_gen, ping_interval=interval, coalesce_max=0):
+        yield chunk
 
 
 _SSE_COALESCE_MAX_BYTES = 64 * 1024
 
 
 async def _sse_coalesce(stream, max_group_bytes: int = _SSE_COALESCE_MAX_BYTES):
-    """[B3 perf] Micro-batch SSE : regroupe les chunks DÉJÀ disponibles.
-
-    Après chaque lecture, UN seul tick de scheduler laisse se terminer les
-    lectures déjà prêtes (burst upstream bufferisé dans httpx/curl) ; tout
-    ce qui est arrivé est émis en un seul bytes groupé → un send ASGI au
-    lieu de N. Drain STRICTEMENT non-bloquant : aucun await d'attente, aucun
-    timeout — latence inchangée (≤ 1 tick de boucle par groupe émis), juste
-    moins de syscalls réseau par delta. Les frames SSE étant complètes et
-    auto-délimitées (\\n\\n), la concaténation est transparente pour tout
-    client SSE conforme.
-    """
-    it = stream.__aiter__()
-    pending = None
-    try:
-        while True:
-            if pending is None:
-                pending = asyncio.ensure_future(anext(it))
-            done, _rest = await asyncio.wait(
-                {pending}, return_when=asyncio.FIRST_COMPLETED
-            )
-            pending = None
-            try:
-                first = done.pop().result()
-            except StopAsyncIteration:
-                return
-            except Exception:
-                # mêmes sémantiques que _sse_keepalive : fin propre
-                return
-            if not isinstance(first, (bytes, bytearray)):
-                yield first
-                continue
-            groups = [first]
-            size = len(first)
-            exhausted = False
-            while size < max_group_bytes:
-                nxt = asyncio.ensure_future(anext(it))
-                await asyncio.sleep(0)  # LE drain non-bloquant (1 tick max)
-                if not nxt.done():
-                    pending = nxt  # rien de prêt : on rend la main
-                    break
-                try:
-                    chunk = nxt.result()
-                except StopAsyncIteration:
-                    exhausted = True
-                    break
-                except Exception:
-                    exhausted = True
-                    break
-                if isinstance(chunk, (bytes, bytearray)):
-                    groups.append(chunk)
-                    size += len(chunk)
-                else:
-                    yield b"".join(groups)
-                    groups = []
-                    yield chunk
-                    break
-            if groups:
-                yield b"".join(groups)
-            if exhausted:
-                return
-    finally:
-        if pending is not None and not pending.done():
-            pending.cancel()
+    """Wrapper fin pour compat tests — coalesce seul, pas de ping."""
+    async for chunk in _sse_pump(stream, ping_interval=0, coalesce_max=max_group_bytes):
+        yield chunk
 
 
 # ── Routing fast cache (O(1) exact + substring) ──
@@ -7181,12 +7301,15 @@ def ensure_min_tokens(body: dict, default: int = None) -> dict:
 
 
 def _estimate_tokens(text: str) -> int:
-    """Fast token estimation — uses char-length for small strings, tiktoken for large."""
-    if len(text) < 200:
-        # Fast path: ~4 chars per token for English, ~2 for CJK — use 3 as compromise
-        return max(1, len(text) // 3)
-    if _encoding:
-        return len(_encoding.encode(text))
+    """Fast token estimation — char-length only (P1.5).
+
+    [P1.5 perf] Plus de branche tiktoken ≥200 chars : cette fonction n'est
+    appelée QUE par les compteurs incrémentaux de stream (deltas, boucle
+    d'émission) — un encode tiktoken par delta à fort débit coûte cher sur
+    la boucle. Dérive chars//3 vs tiktoken acceptable : affichage stats
+    dashboard uniquement (usage réel lu dans `usage` quand l'upstream le
+    fournit). tiktoken CONSERVÉ pour _estimate_input_tokens / count_tokens
+    (offloadés to_thread)."""
     return max(1, len(text) // 3)
 
 
@@ -7464,7 +7587,7 @@ async def messages(request: Request):
                         yield chunk
 
                 return StreamingResponse(
-                    _sse_keepalive(_sse_coalesce(anthropic_stream_free_fallback())),
+                    _sse_pump(anthropic_stream_free_fallback()),
                     media_type="text/event-stream",
                     headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
                 )
@@ -7707,6 +7830,17 @@ async def messages(request: Request):
             stream_out = stream_cache = 0
             started = False
             open_blocks = []
+            # [PLAN-raisonnement Patch A] thinking synthétique : accumulation
+            # du contenu thinking passthrough pour pouvoir forger
+            # signature_delta côté synthétique (timeout/CancelledError/EOF).
+            # Passthrough nominal : sig upstream authentique déjà forwardée.
+            # Mais si passthrough tronqué brutalement, le client a encore un
+            # content_block_start thinking ouvert sans signature_delta — il
+            # l'abandonne au tour suivant. On capture donc ici l'index +
+            # accumulateur pour pouvoir injecter signature_delta via
+            # _terminate_after_started(thinking_idx, thinking_sig).
+            thinking_block_idx = None
+            thinking_acc = ""
             _yielded = False
             stop_reason = "end_turn"
             emitted_finish = False
@@ -7788,7 +7922,10 @@ async def messages(request: Request):
                                                 f"  stream_retry_suppressed_after_started attempt={_attempt + 1}"
                                             )
                                             async for ev in _terminate_after_started(
-                                                open_blocks, stream_out
+                                                open_blocks,
+                                                stream_out,
+                                                thinking_idx=thinking_block_idx,
+                                                thinking_sig=_local_signature(thinking_acc) if thinking_block_idx is not None and thinking_acc else "",
                                             ):
                                                 yield ev
                                             return
@@ -7854,7 +7991,10 @@ async def messages(request: Request):
                                         f"  stream_retry_suppressed_after_started attempt={_attempt + 1}"
                                     )
                                     async for ev in _terminate_after_started(
-                                        open_blocks, stream_out
+                                        open_blocks,
+                                        stream_out,
+                                        thinking_idx=thinking_block_idx,
+                                        thinking_sig=_local_signature(thinking_acc) if thinking_block_idx is not None and thinking_acc else "",
                                     ):
                                         yield ev
                                     return
@@ -7871,7 +8011,10 @@ async def messages(request: Request):
                                         f"  stream_retry_suppressed_after_started attempt={_attempt + 1}"
                                     )
                                     async for ev in _terminate_after_started(
-                                        open_blocks, stream_out
+                                        open_blocks,
+                                        stream_out,
+                                        thinking_idx=thinking_block_idx,
+                                        thinking_sig=_local_signature(thinking_acc) if thinking_block_idx is not None and thinking_acc else "",
                                     ):
                                         yield ev
                                     return
@@ -7904,8 +8047,11 @@ async def messages(request: Request):
                                             f"  stream_retry_suppressed_after_started attempt={_attempt + 1}"
                                         )
                                         async for ev in _terminate_after_started(
-                                            open_blocks, stream_out
-                                        ):
+                                        open_blocks,
+                                        stream_out,
+                                        thinking_idx=thinking_block_idx,
+                                        thinking_sig=_local_signature(thinking_acc) if thinking_block_idx is not None and thinking_acc else "",
+                                    ):
                                             yield ev
                                         return
                                     continue
@@ -8010,11 +8156,22 @@ async def messages(request: Request):
                                     if block.get("type") == "tool_use" and block.get("name"):
                                         used_tools.append(block["name"])
                                     open_blocks.append(event.get("index"))
+                                    if block.get("type") == "thinking":
+                                        thinking_block_idx = event.get("index")
+                                        thinking_acc = ""
+                                elif etype == "content_block_delta":
+                                    # Accumulate thinking deltas for synthetic termination signature
+                                    _delta = event.get("delta", {})
+                                    if _delta.get("type") == "thinking_delta" and thinking_block_idx is not None:
+                                        thinking_acc += _delta.get("thinking", "") or ""
                                 elif etype == "content_block_stop":
                                     idx = event.get("index")
                                     _debug(f"  [stream] content_block_stop: index={idx}")
                                     if idx in open_blocks:
                                         open_blocks.remove(idx)
+                                    if idx == thinking_block_idx:
+                                        thinking_block_idx = None
+                                        thinking_acc = ""
                                 elif etype == "message_delta":
                                     usage = event.get("usage", {})
                                     stream_out = usage.get("output_tokens", 0)
@@ -8078,7 +8235,7 @@ async def messages(request: Request):
                         if _stream_has_yielded(started, open_blocks, stream_out, _line_buf):
                             _cb_record_failure(endpoint)
                             _log(f"  stream_retry_suppressed_after_started attempt={_attempt + 1}")
-                            async for ev in _terminate_after_started(open_blocks, stream_out):
+                            async for ev in _terminate_after_started(open_blocks, stream_out, thinking_idx=thinking_block_idx, thinking_sig=_local_signature(thinking_acc) if thinking_block_idx is not None and thinking_acc else ""):
                                 yield ev
                             return
                         continue
@@ -8096,7 +8253,7 @@ async def messages(request: Request):
                     if _stream_has_yielded(started, open_blocks, stream_out, _line_buf):
                         _cb_record_failure(endpoint)
                         _log(f"  stream_retry_suppressed_after_started attempt={_attempt + 1}")
-                        async for ev in _terminate_after_started(open_blocks, stream_out):
+                        async for ev in _terminate_after_started(open_blocks, stream_out, thinking_idx=thinking_block_idx, thinking_sig=_local_signature(thinking_acc) if thinking_block_idx is not None and thinking_acc else ""):
                             yield ev
                         return
                     continue
@@ -8130,7 +8287,7 @@ async def messages(request: Request):
                                 _log(
                                     f"  stream_retry_suppressed_after_started attempt={_attempt + 1}"
                                 )
-                                async for ev in _terminate_after_started(open_blocks, stream_out):
+                                async for ev in _terminate_after_started(open_blocks, stream_out, thinking_idx=thinking_block_idx, thinking_sig=_local_signature(thinking_acc) if thinking_block_idx is not None and thinking_acc else ""):
                                     yield ev
                                 return
                             continue
@@ -8152,7 +8309,7 @@ async def messages(request: Request):
                         if _stream_has_yielded(started, open_blocks, stream_out, _line_buf):
                             _cb_record_failure(endpoint)
                             _log(f"  stream_retry_suppressed_after_started attempt={_attempt + 1}")
-                            async for ev in _terminate_after_started(open_blocks, stream_out):
+                            async for ev in _terminate_after_started(open_blocks, stream_out, thinking_idx=thinking_block_idx, thinking_sig=_local_signature(thinking_acc) if thinking_block_idx is not None and thinking_acc else ""):
                                 yield ev
                             return
                         continue
@@ -8189,7 +8346,17 @@ async def messages(request: Request):
                         request_body=request_body,
                     )
                     if started:
-                        for idx in open_blocks:
+                        # [Patch A] synthetic thinking termination: signature_delta before stop
+                        for idx in list(open_blocks):
+                            if thinking_block_idx is not None and idx == thinking_block_idx and thinking_acc:
+                                yield _sse(
+                                    "content_block_delta",
+                                    {
+                                        "type": "content_block_delta",
+                                        "index": idx,
+                                        "delta": {"type": "signature_delta", "signature": _local_signature(thinking_acc)},
+                                    },
+                                )
                             yield _sse(
                                 "content_block_stop", {"type": "content_block_stop", "index": idx}
                             )
@@ -8213,7 +8380,7 @@ async def messages(request: Request):
             if started and not emitted_finish:
                 _debug("  [stream] truncated without finish_reason → synthesizing stop")
                 _log("  stream truncated without finish_reason → synthesizing stop")
-                async for ev in _terminate_after_started(open_blocks, stream_out):
+                async for ev in _terminate_after_started(open_blocks, stream_out, thinking_idx=thinking_block_idx, thinking_sig=_local_signature(thinking_acc) if thinking_block_idx is not None and thinking_acc else ""):
                     yield ev
                 emitted_finish = True
             est_input = await _est_task
@@ -8257,7 +8424,7 @@ async def messages(request: Request):
         # For streaming: if free model exists, pass empty headers (free models don't need auth)
         _stream_headers = a_headers if a_headers.get("x-api-key") else {}
         return StreamingResponse(
-            _sse_keepalive(_sse_coalesce(anthropic_stream(_stream_headers))),
+            _sse_pump(anthropic_stream(_stream_headers)),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
         )
@@ -8275,6 +8442,15 @@ async def messages(request: Request):
         # Convert to Responses API format if endpoint requires it (muse-spark)
         if "/responses" in endpoint:
             oai_body = _chat_to_responses_request(oai_body)
+        # Internal marker for retry-once without synthetic reasoning items
+        # on 400/422 from /responses — kept on oai_body for the retry at
+        # 8543, with a marker-free copy sent to the free-model attempt.
+        _has_synthetic = bool(oai_body.get("_has_synthetic_reasoning_items"))
+        _oai_body_for_free = (
+            {k: v for k, v in oai_body.items() if k != "_has_synthetic_reasoning_items"}
+            if _has_synthetic
+            else oai_body
+        )
         if _cfg_settings.DEBUG:
             _debug(f"[messages] converted to openai: {_redact(_truncate(oai_body, 2000))}")
         # ── Orphan guard (handler-level, plan api-error-400) ──
@@ -8294,7 +8470,7 @@ async def messages(request: Request):
         if FREE_MODEL_MAP.get(model_id):
             try:
                 free_result = await _try_free_model_first(
-                    oai_body,
+                    _oai_body_for_free,
                     {},
                     "openai",
                     model_id,
@@ -8376,7 +8552,7 @@ async def messages(request: Request):
         _geo_tunnel = getattr(request.state, "_geo_force_tunnel", False)
         try:
             free_result = await _try_free_model_first(
-                oai_body,
+                _oai_body_for_free,
                 headers,
                 "openai",
                 model_id,
@@ -9063,7 +9239,7 @@ async def messages(request: Request):
                                 block_idx = next_block_idx
                                 next_block_idx += 1
                                 tool_block_idx[api_idx] = block_idx
-                                tc_id = tc.get("id", f"toolu_{uuid.uuid4().hex[:8]}")
+                                tc_id = tc.get("id", _fast_id("toolu"))
                                 tc_name = tc.get("function", {}).get("name", "")
                                 if tc_name:
                                     used_tools.append(tc_name)
@@ -9288,7 +9464,7 @@ async def messages(request: Request):
         return
 
     return StreamingResponse(
-        _sse_keepalive(_sse_coalesce(stream_gen(headers))),
+        _sse_pump(stream_gen(headers)),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
     )
@@ -10306,7 +10482,7 @@ async def chat_completions(request: Request):
                                     "  stream truncated without finish_reason → synthesizing stop"
                                 )
                                 _synth = {
-                                    "id": f"chatcmpl-{uuid.uuid4().hex[:8]}",
+                                    "id": _fast_id("chatcmpl"),
                                     "object": "chat.completion.chunk",
                                     "created": int(time.time()),
                                     "model": original_model,
@@ -10321,7 +10497,7 @@ async def chat_completions(request: Request):
                                     "  [oai-stream] synthesizing finish for Responses/empty stream"
                                 )
                                 _synth = {
-                                    "id": f"chatcmpl-{uuid.uuid4().hex[:8]}",
+                                    "id": _fast_id("chatcmpl"),
                                     "object": "chat.completion.chunk",
                                     "created": int(time.time()),
                                     "model": original_model,
@@ -10536,7 +10712,7 @@ async def chat_completions(request: Request):
                 return
 
         return StreamingResponse(
-            _sse_keepalive(_sse_coalesce(openai_stream(headers))),
+            _sse_pump(openai_stream(headers)),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
         )
@@ -10752,7 +10928,7 @@ async def chat_completions(request: Request):
         else:
             _using_free = False
             _track_model = model_id
-        _id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+        _id = _fast_id("chatcmpl")
         _created = int(time.time())
         started = False
         content_types = {}
@@ -11033,7 +11209,7 @@ async def chat_completions(request: Request):
                                 open_blocks.add(idx)
                                 if btype == "tool_use":
                                     tool_data[idx] = {
-                                        "id": block.get("id", f"toolu_{uuid.uuid4().hex[:8]}"),
+                                        "id": block.get("id", _fast_id("toolu")),
                                         "name": block.get("name", ""),
                                         "args": "",
                                     }
@@ -11318,7 +11494,7 @@ async def chat_completions(request: Request):
                 emitted_finish = True
 
     return StreamingResponse(
-        _sse_keepalive(_sse_coalesce(_anthro_to_oai_stream(a_headers))),
+        _sse_pump(_anthro_to_oai_stream(a_headers)),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
     )
@@ -11998,7 +12174,7 @@ async def responses(request: Request):
             oai_resp = data
             oai_resp["model"] = original_model
             if "id" not in oai_resp or not oai_resp["id"].startswith("resp_"):
-                oai_resp["id"] = f"resp_{uuid.uuid4().hex[:24]}"
+                oai_resp["id"] = _fast_id("resp")
         else:
             # Chat Completions format — convert to Responses API
             oai_resp = openai_chat_to_responses(data, original_model)

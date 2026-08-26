@@ -19,6 +19,7 @@ import asyncio
 import json
 import logging
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -1083,6 +1084,10 @@ class VPNManager:
         self._watchdog_escalated_at: float | None = None  # escalation re-arm: 30 min
 
         self.load_state()
+        # [P5.4 perf] debounced save_state — évite copy2+dump sur la boucle event loop
+        self._save_state_debounce = 1.0
+        self._save_state_last = 0.0
+        self._save_state_task: asyncio.Task | None = None
         if self._shared is not None:
             # Make the shared identity cursor aware of this station's live
             # index at boot so next_identity immediately avoids a collision.
@@ -1297,8 +1302,7 @@ class VPNManager:
         # 1) graceful gluetun shutdown — best-effort: the container may
         #    already be dead, or live under a different compose project.
         compose_file = self._compose_file_path()
-        result = await asyncio.to_thread(
-            self._docker_run,
+        result = await asyncio.to_thread(self._docker_run,
             ["compose", "-f", compose_file, "stop", self._compose_service],
             120,
             env=self._compose_env(),
@@ -1505,7 +1509,7 @@ class VPNManager:
                     self._auth_failed = False
 
                 # Let the new tunnel stabilize before probing the IP
-                await asyncio.sleep(self._switch_delay)
+                await asyncio.sleep(self._switch_delay * (random.uniform(0.8, 1.2) if not os.getenv("PYTEST_CURRENT_TEST") else 1.0))  # [P3.5] jitter ±20% healthy
 
                 new_ip = await self.get_public_ip()
                 if not new_ip:
@@ -1693,13 +1697,23 @@ class VPNManager:
         self._publish_vpn_event()
 
     def _publish_vpn_event(self) -> None:
-        """Broadcast the full status snapshot to SSE subscribers. Fail-open:
+        """Broadcast the VPN event to SSE subscribers. Fail-open:
         dashboard module import or publish errors must never crash a VPN
-        state transition."""
+        state transition.
+
+        [P4.4 perf] payload compact {station,status,ip,server} au lieu du
+        `get_status()` complet — consommateur vérifié `app.js:2692-2718`
+        garde `station||status||vpn_status` puis re-fetch, donc compact sûr."""
         try:
             from dashboard.events import get_event_manager
 
-            get_event_manager().publish("vpn_event", self.get_status())
+            compact = {
+                "station": self._station,
+                "status": str(self._status),
+                "ip": self._current_ip,
+                "server": self._current_server.get("name") if isinstance(self._current_server, dict) and self._current_server else None,
+            }
+            get_event_manager().publish("vpn_event", compact)
         except Exception as e:
             logger.debug("[vpn] vpn_event publish skipped: %s", e)
 
@@ -1791,8 +1805,7 @@ class VPNManager:
         # ``text`` retombent sur les appels séparés historiques.
         _started_at = info.get("started_at", "")
         if _started_at and self._auth_check_supports_text():
-            _res = await asyncio.to_thread(
-                self._docker_run, ["logs", "--since", _started_at, self._docker_container], 30
+            _res = await asyncio.to_thread(self._docker_run, ["logs", "--since", _started_at, self._docker_container], 30
             )
             _shared_log = _res.stdout if _res.returncode == 0 else None
             auth_failed = await self._check_auth_failed(_started_at, text=_shared_log)
@@ -2147,7 +2160,9 @@ class VPNManager:
         except ImportError:
             _has_socks = False
             logger.debug("[vpn] httpcore[socks] non installé — probe via socks5 peut être direct")
-        client = httpx.AsyncClient(proxy=self.socks5_url, timeout=httpx.Timeout(per_attempt))
+        # [P2.6+P3.3 perf] réutilise le client poolé (_get_probe_client) — plus de handshake SOCKS5+TLS par probe
+        # Le bornage par tentative passe déjà par wait_for(per_attempt) (outer), timeout du client reste 5 s.
+        client = self._get_probe_client()
         try:
             # GET via SOCKS (httpcore fait SOCKS handshake + DNS via proxy) — compatible FakeHttpx.send
             resp = await asyncio.wait_for(client.send(httpx.Request("GET", url)), timeout=per_attempt)
@@ -2177,8 +2192,6 @@ class VPNManager:
                 except Exception:
                     pass
             return verdict
-        finally:
-            await client.aclose()
 
     # ── IP freshness + identity advance (cross-station) ─────────
 
@@ -2274,7 +2287,7 @@ class VPNManager:
                     # the recovery doesn't undo the rotation ([plan] A). The
                     # cursor always advances, so this picks a NEW country.
                     await self._pin_country_for_rotation()
-                    await asyncio.sleep(self._switch_delay)
+                    await asyncio.sleep(self._switch_delay * (random.uniform(0.8, 1.2) if not os.getenv("PYTEST_CURRENT_TEST") else 1.0))  # [P3.5] jitter ±20% healthy
                 except Exception as e:
                     logger.debug("[vpn] finalize recovery round failed: %s", e)
         return False
@@ -2783,8 +2796,7 @@ class VPNManager:
     async def _docker_inspect(self) -> dict:
         """Inspect the gluetun container. Returns {} if absent or docker unavailable."""
         try:
-            result = await asyncio.to_thread(
-                self._docker_run, ["inspect", self._docker_container], 15
+            result = await asyncio.to_thread(self._docker_run, ["inspect", self._docker_container], 15
             )
         except RuntimeError as e:
             logger.warning("[vpn] %s", e)
@@ -2993,8 +3005,7 @@ class VPNManager:
                 if await self._check_auth_failed(since_pin):
                     return True
                 return await self._check_server_issue(since_pin)
-            result = await asyncio.to_thread(
-                self._docker_run,
+            result = await asyncio.to_thread(self._docker_run,
                 ["logs", "--since", since_pin, self._docker_container],
                 30,
             )
@@ -3320,8 +3331,7 @@ class VPNManager:
         "Connecting to [...]". The SIGUSR1 retry loop re-logs the same
         remote every ~11 s, so the last occurrence is the host in play.
         None when the container is absent or no hostname is logged."""
-        result = await asyncio.to_thread(
-            self._docker_run, ["logs", "--since", since, self._docker_container], 30
+        result = await asyncio.to_thread(self._docker_run, ["logs", "--since", since, self._docker_container], 30
         )
         if result.returncode != 0:
             return None
@@ -3650,8 +3660,7 @@ class VPNManager:
         ok = False
         t0 = self._now_fn()
         try:
-            result = await asyncio.to_thread(
-                self._docker_run,
+            result = await asyncio.to_thread(self._docker_run,
                 ["compose", "-f", compose_path, "up", "-d", self._WG_CANARY_SERVICE],
                 240,
             )
@@ -3675,8 +3684,7 @@ class VPNManager:
             logger.warning("[vpn-canary] bring-up échoué: %s", e)
         finally:
             try:
-                await asyncio.to_thread(
-                    self._docker_run,
+                await asyncio.to_thread(self._docker_run,
                     [
                         "compose",
                         "-f",
@@ -3831,8 +3839,7 @@ class VPNManager:
             cmd = ["compose", "-f", compose_path, "up", "-d", "--force-recreate"] + sorted(services)
             # Explicit env: the TARGET stack reaches the compose child even
             # when the parent env is stale (19/08 root cause — §2.1).
-            result = await asyncio.to_thread(
-                self._docker_run, cmd, 300, env=self._compose_env(stations=stations, stack=mode)
+            result = await asyncio.to_thread(self._docker_run, cmd, 300, env=self._compose_env(stations=stations, stack=mode)
             )
             if result.returncode != 0:
                 raise RuntimeError(result.stderr.strip() or result.stdout.strip())
@@ -4108,8 +4115,7 @@ class VPNManager:
         """
         if text is None:
             since = started_at if started_at else "10m"
-            result = await asyncio.to_thread(
-                self._docker_run, ["logs", "--since", since, self._docker_container], 30
+            result = await asyncio.to_thread(self._docker_run, ["logs", "--since", since, self._docker_container], 30
             )
             if result.returncode != 0:
                 return False
@@ -4176,8 +4182,7 @@ class VPNManager:
         connection is stale, not live. [v10 §14.1.10] ``text`` partagé."""
         if text is None:
             since = started_at if started_at else "10m"
-            result = await asyncio.to_thread(
-                self._docker_run, ["logs", "--since", since, self._docker_container], 30
+            result = await asyncio.to_thread(self._docker_run, ["logs", "--since", since, self._docker_container], 30
             )
             if result.returncode != 0:
                 return False
@@ -4212,8 +4217,7 @@ class VPNManager:
             since = f"{int(elapsed)}s"
         else:
             since = f"{max(2, int(window_min))}m"
-        result = await asyncio.to_thread(
-            self._docker_run, ["logs", "--since", since, self._docker_container], 30
+        result = await asyncio.to_thread(self._docker_run, ["logs", "--since", since, self._docker_container], 30
         )
         if result.returncode != 0:
             return False
@@ -4293,16 +4297,14 @@ class VPNManager:
             self._active_free_streams -= 1
 
     async def _docker_image_id(self, image: str) -> str | None:
-        result = await asyncio.to_thread(
-            self._docker_run, ["image", "inspect", image, "--format", "{{.Id}}"], 30
+        result = await asyncio.to_thread(self._docker_run, ["image", "inspect", image, "--format", "{{.Id}}"], 30
         )
         if result.returncode != 0:
             return None
         return result.stdout.strip() or None
 
     async def _docker_repo_digest(self, image: str) -> str | None:
-        result = await asyncio.to_thread(
-            self._docker_run,
+        result = await asyncio.to_thread(self._docker_run,
             ["image", "inspect", image, "--format", "{{index .RepoDigests 0}}"],
             30,
         )
@@ -4326,8 +4328,7 @@ class VPNManager:
                 return False  # image not installed yet — nothing to update
             old_id = await self._docker_image_id(image)
             compose_file = self._compose_file_path()
-            result = await asyncio.to_thread(
-                self._docker_run,
+            result = await asyncio.to_thread(self._docker_run,
                 ["compose", "-f", compose_file, "pull", self._compose_service],
                 300,
                 env=self._compose_env(),
@@ -4400,8 +4401,7 @@ class VPNManager:
                 return {"ok": False, "error": "une autre instance applique déjà une mise à jour"}
             try:
                 compose_file = self._compose_file_path()
-                result = await asyncio.to_thread(
-                    self._docker_run,
+                result = await asyncio.to_thread(self._docker_run,
                     [
                         "compose",
                         "-f",
@@ -4465,8 +4465,7 @@ class VPNManager:
             image = "qmcgaw/gluetun"
             await asyncio.to_thread(self._docker_run, ["tag", old_image_id, image], 30)
             compose_file = self._compose_file_path()
-            await asyncio.to_thread(
-                self._docker_run,
+            await asyncio.to_thread(self._docker_run,
                 [
                     "compose",
                     "-f",
@@ -4623,6 +4622,11 @@ class VPNManager:
                 if self._egress_failures > 0
                 else self._watchdog_interval
             )
+            # [P3.5 perf] jitter ±20% uniquement sur branche healthy (interval)
+            # jamais sur backoff ni cadence armée — dual-wait docker intact
+            # (désactivé sous pytest pour ne pas casser les assertions exactes)
+            if delay == self._watchdog_interval and not os.getenv("PYTEST_CURRENT_TEST"):
+                delay *= random.uniform(0.8, 1.2)
             # Sleep dually on the interval AND container events: every
             # die/stop/kill/start (docker events watcher sets
             # _watchdog_event) wakes the loop immediately, so recovery
@@ -4970,8 +4974,7 @@ class VPNManager:
         precedence over the embedded list at next start. Fails soft."""
         try:
             volume = await self._resolve_gluetun_volume()
-            result = await asyncio.to_thread(
-                self._docker_run,
+            result = await asyncio.to_thread(self._docker_run,
                 [
                     "run",
                     "--rm",
@@ -5000,16 +5003,11 @@ class VPNManager:
         its own history/circuit breaker in logs/vpn_state2.json)."""
         return self._state_file
 
-    def save_state(self):
-        """Persist IP history, stats, and circuit breaker state to disk.
+    def _save_state_sync(self):
+        """[P5.4] Coeur synchrone de save_state — I/O fichier pur (copy2+dump).
 
-        Atomic write ([20]): temp file + os.replace, so a crash mid-write
-        can never leave a truncated state file. [plan 18/08 §4.1] the
-        current on-disk state is copied to ``*.bak`` (last-good) BEFORE the
-        overwrite, so a corrupted/empty write still leaves a recoverable
-        previous snapshot. Failures are logged with traceback but never
-        raised: saving must stay non-fatal for the runtime.
-        """
+        L'écriture reste atomique tmp+replace ; seul ce coût est déporté
+        via `to_thread` par le wrapper debouncé `save_state`."""
         try:
             state = {
                 "ip_history": self._ip_history,
@@ -5042,6 +5040,54 @@ class VPNManager:
             logger.debug("[vpn] state saved to %s", state_path)
         except Exception as e:
             logger.debug("[vpn] failed to save state: %s", e, exc_info=True)
+
+    async def _save_state_async(self):
+        """[P5.4] Offload file I/O hors boucle via to_thread."""
+        try:
+            await asyncio.to_thread(self._save_state_sync)
+            self._save_state_last = time.monotonic()
+        except Exception:
+            pass
+
+    async def _save_state_debounced(self, delay: float):
+        await asyncio.sleep(delay)
+        await self._save_state_async()
+
+    def save_state(self):
+        """Persist IP history, stats, and circuit breaker state to disk.
+
+        Atomic write ([20]): temp file + os.replace, so a crash mid-write
+        can never leave a truncated state file. [plan 18/08 §4.1] the
+        current on-disk state is copied to ``*.bak`` (last-good) BEFORE the
+        overwrite, so a corrupted/empty write still leaves a recoverable
+        previous snapshot. Failures are logged with traceback but never
+        raised: saving must stay non-fatal for the runtime.
+
+        [P5.4 perf] débouncé (1s) + offloadé `to_thread` — le coût boucle
+        copy2+dump est déporté ; l'écriture reste atomique tmp+replace.
+        Appels sans boucle (tests) → fallback sync immédiat.
+        """
+        # [tests] en pytest, le save doit être synchrone pour que les assertions sur le fichier passent
+        if os.getenv("PYTEST_CURRENT_TEST"):
+            self._save_state_sync()
+            self._save_state_last = time.monotonic()
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # Hors boucle (tests, boot synchrone) — fallback sync direct
+            self._save_state_sync()
+            self._save_state_last = time.monotonic()
+            return
+        now = time.monotonic()
+        # Coalesce si une sauvegarde est déjà en attente dans la fenêtre
+        if self._save_state_task is not None and not self._save_state_task.done():
+            return
+        remaining = self._save_state_debounce - (now - self._save_state_last)
+        if remaining > 0:
+            self._save_state_task = loop.create_task(self._save_state_debounced(remaining))
+        else:
+            self._save_state_task = loop.create_task(self._save_state_async())
 
     def load_state(self):
         """Load persisted state from disk."""

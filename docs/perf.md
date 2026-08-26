@@ -10,8 +10,8 @@
 
 ## Pool httpx
 
-- `max_connections 500` / `max_keepalive 200` / `keepalive_expiry 30` — bench_pool.py mesure rps sous 200/400/800 concurrents
-- Backpressure: >500 → queue 5s → 503, évite OOM
+- `max_connections 64` / `max_keepalive 32` / `keepalive_expiry 30` — bench_pool.py mesure rps sous 200/400/800 concurrents ([P2.5 perf] 500/200→64/32)
+- Backpressure: >64 → queue 5s → 503, évite OOM
 
 ## DB WAL
 

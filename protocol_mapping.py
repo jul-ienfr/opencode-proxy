@@ -81,6 +81,9 @@ except ImportError:
 
 def _drop_orphan_tool_messages(messages: list[dict]) -> list[dict]:
     """Filter role:tool messages whose tool_call_id has no preceding tool_calls id."""
+    # [P5.2 perf] early-exit sans rebuild quand aucun role=="tool" (99% des requêtes)
+    if not any(m.get("role") == "tool" for m in messages):
+        return messages
     _seen_ids: set[str] = set()
     filtered: list[dict] = []
     for m in messages:
@@ -105,6 +108,9 @@ def _drop_orphan_tool_messages(messages: list[dict]) -> list[dict]:
 
 def _drop_orphan_responses_input(inp: list[dict]) -> list[dict]:
     """Filter function_call_output items whose call_id has no preceding function_call."""
+    # [P5.2 perf] early-exit sans rebuild quand aucun function_call_output
+    if not any(it.get("type") == "function_call_output" for it in inp):
+        return inp
     _known: set[str] = set()
     _filt: list[dict] = []
     for it in inp:
@@ -663,21 +669,45 @@ def _local_signature(text: str) -> str:
     ).decode()
 
 
+# [P5.1 perf] LRU bornée pour _is_local_signature — les historiques multi-tours
+# ré-émettent les mêmes blocs → hit-rate élevé, zéro changement sémantique.
+_is_local_sig_cache: OrderedDict[bytes, bool] = OrderedDict()
+_IS_LOCAL_SIG_CACHE_MAX = 2048
+
+
 def _is_local_signature(text: str, signature: str) -> bool:
     """[PLAN-raisonnement Phase D] Détecte une signature FORGÉE par le proxy.
 
     Provenance stateless : on recalcule le HMAC local du texte et on compare.
     Une signature authentique (Anthropic) ne peut pas correspondre — elle
     n'est pas produite par notre clé. Un bloc thinking re-émis par le client
-    avec NOTRE signature est donc identifiable sans table d'état."""
+    avec NOTRE signature est donc identifiable sans table d'état.
+
+    [P5.1 perf] Mémoïsation LRU bornée (clé blake2b(text+signature), 2048 entrées)
+    pour éviter le recalcul HMAC par bloc/requête."""
     if not isinstance(signature, str) or not signature:
         return False
     if not isinstance(text, str) or not text:
         return False
     try:
+        # clé 128-bit blake2b : collision négligeable, calcul rapide
+        h = hashlib.blake2b(digest_size=16)
+        h.update(text.encode("utf-8"))
+        h.update(b"\x00")
+        h.update(signature.encode("utf-8"))
+        key = h.digest()
+        cached = _is_local_sig_cache.get(key)
+        if cached is not None:
+            _is_local_sig_cache.move_to_end(key)
+            return cached
         import hmac as _hmac
 
-        return _hmac.compare_digest(_local_signature(text), signature)
+        result = _hmac.compare_digest(_local_signature(text), signature)
+        _is_local_sig_cache[key] = result
+        _is_local_sig_cache.move_to_end(key)
+        if len(_is_local_sig_cache) > _IS_LOCAL_SIG_CACHE_MAX:
+            _is_local_sig_cache.popitem(last=False)
+        return result
     except Exception:
         return False
 
@@ -1827,10 +1857,12 @@ def _responses_sse_to_chat_deltas(raw_line: str, parsed=None, state: "ResponsesS
         item = chunk.get("item", {}) if isinstance(chunk.get("item"), dict) else {}
         if isinstance(item, dict) and item.get("type") == "reasoning":
             iid = item.get("id", "") or f"rs_{chunk.get('output_index', 0)}"
-            # dedupe: if any summary part for this item already emitted, skip (check prefix)
-            if iid and any(k == iid or k.startswith(f"{iid}:") for k in reasoning_seen):
-                return None
             summary = item.get("summary", [])
+            # [Correctif B2] Pass-through 200% : même si un index a déjà été
+            # streamé en delta (i vu → déjà visible côté client), le fallback
+            # intégral doit TOUJOURS remonter la queue perdue (les i NON vus).
+            # Pas de early-return ici — la dedup se fait au NIVEAU PART : chaque
+            # part non vue est émise ci-dessous, les parts déjà vues sont droppées.
             reasoning = ""
             if isinstance(summary, list):
                 for s in summary:
@@ -1846,12 +1878,38 @@ def _responses_sse_to_chat_deltas(raw_line: str, parsed=None, state: "ResponsesS
                 _debug(f"  [responses-sse] output_item.done no visible summary, skip (vrai seulement) iid={iid!r} encrypted={bool(item.get('encrypted_content'))}")
                 return None
             if reasoning:
-                if iid:
+                # N'émètre QUE les parts non vues (per-index) — évite doublon
+                # (cas 1-part où delta déjà vu → on émet rien ; N-parts → on
+                # émet seulement les indices jamais vus).
+                _unseen = ""
+                _seen_any = False
+                if iid and isinstance(summary, list) and summary:
+                    for i, s in enumerate(summary):
+                        if f"{iid}:{i}" not in reasoning_seen:
+                            if isinstance(s, dict):
+                                _unseen += s.get("text", "") or ""
+                    _seen_any = any(f"{iid}:{i}" in reasoning_seen for i in range(len(summary)))
+                    for i in range(len(summary)):
+                        reasoning_seen.add(f"{iid}:{i}")
+                elif iid:
+                    if iid in reasoning_seen:
+                        return None
                     reasoning_seen.add(iid)
-                    # also mark per-index to prevent double emit from summary_text.done
-                    reasoning_seen.add(f"{iid}:0")
-                _debug(f"  [responses-sse] output_item.done reasoning fallback len={len(reasoning)} iid={iid!r}")
-                return {"choices": [{"delta": {"reasoning_content": reasoning}, "finish_reason": None}]}
+                    _unseen = reasoning
+                else:
+                    _unseen = reasoning
+                # si tout le summary avait déjà été delta-streamé → rien à émettre
+                if iid and isinstance(summary, list) and summary and not _unseen:
+                    _debug(f"  [responses-sse] output_item.done fully deduped iid={iid!r}")
+                    return None
+                # cas particulier single-part : le client a déjà le texte complet
+                # via delta — on ne renvoie PAS d'intégral redondant (même per-index
+                # présent → done fully dedupé ci-dessus l'a déjà absorbé).
+                _emit = _unseen if (iid and isinstance(summary, list) and summary and _seen_any) else reasoning
+                # mais si le seen_any était seulement partiel (N>1), _emit==_unseen
+                # (queue seule) ; si single-part seen → déjà return None ci-dessus.
+                _debug(f"  [responses-sse] output_item.done reasoning fallback len={len(_emit)} iid={iid!r} unseen={len(_unseen)} seen_any={_seen_any}")
+                return {"choices": [{"delta": {"reasoning_content": _emit}, "finish_reason": None}]}
         return None
 
     # response.completed — final event with usage

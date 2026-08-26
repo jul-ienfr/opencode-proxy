@@ -78,13 +78,18 @@ def quick_body_size(body) -> int:
     """[D1 perf] Estimation O(texte) SANS sérialisation ni repr — somme des
     longueurs des chaînes directement accessibles (champs top-level +
     contenus de messages). Suffisante pour décider si un corps est trop
-    volumineux pour la queue ; le tronquage exact reste dans le writer."""
+    volumineux pour la queue ; le tronquage exact reste dans le writer.
+
+    [P5.5 perf] early-exit dès DB_RAW_SIZE_CAP atteint — inutile de scanner
+    10 Mo de messages quand on sait déjà qu'on va stubber."""
     if not isinstance(body, dict):
         return 0
     total = 0
     for v in body.values():
         if type(v) is str:
             total += len(v)
+            if total > DB_RAW_SIZE_CAP:
+                return total
     msgs = body.get("messages")
     if isinstance(msgs, list):
         for m in msgs:
@@ -93,16 +98,22 @@ def quick_body_size(body) -> int:
             c = m.get("content")
             if type(c) is str:
                 total += len(c)
+                if total > DB_RAW_SIZE_CAP:
+                    return total
             elif isinstance(c, list):
                 for p in c:
                     if isinstance(p, dict):
                         t = p.get("text") or p.get("thinking") or ""
                         if type(t) is str:
                             total += len(t)
+                            if total > DB_RAW_SIZE_CAP:
+                                return total
                         if p.get("input") is not None and not isinstance(
                             p.get("input"), (str, int, float, bool)
                         ):
                             total += 256  # tool_use input : borne grossière
+                            if total > DB_RAW_SIZE_CAP:
+                                return total
     return total
 
 
@@ -261,6 +272,15 @@ _INSERT_REQUESTS_SQL = """
         geo_direct_country, geo_direct_ip, geo_via_vpn, geo_allowed, station)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """
+
+# [P1.2] INSERT free_model_usage préparé par l'appelant (timestamp inclus) —
+# consommé par le writer batché ; le masquage de clé reste côté caller.
+_INSERT_FREE_USAGE_SQL = (
+    "INSERT INTO free_model_usage "
+    "(timestamp, paid_model, free_model, api_key, workspace_id, status, "
+    " tokens_input, tokens_output, duration_ms, ip) "
+    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+)
 
 
 def init_requests_schema(
@@ -426,13 +446,33 @@ def execute_batch_sync(
 
     ``materialize_fn(item)`` transforme une _DbRowRaw brute en tuple SQL
     (sérialisation/tronquage/redaction ICI, thread writer — [D1]).
+
+    [P1.2 perf] Les items peuvent être des tuples taggés
+    ``(table, payload)`` avec ``table`` ∈ {"requests", "free_usage"} :
+    le writer matérialise et INSERT dans la table cible ICI (thread),
+    commits groupés inchangés. Sémantique fail-soft : une erreur SQL sur
+    un item est loguée et l'item sauté — jamais propagée à la requête.
+    Les items nus (_DbRowRaw / tuple SQL) restent acceptés (= requests).
     """
     if not batch:
         return 0
+    inserted = 0
     with lock:
         for item in batch:
-            row = materialize_fn(item) if isinstance(item, DbRowRaw) else item
-            conn.execute(_INSERT_REQUESTS_SQL, row)
+            try:
+                if isinstance(item, tuple) and item and isinstance(item[0], str):
+                    table, payload = item[0], item[1]
+                else:
+                    table, payload = "requests", item
+                if table == "free_usage":
+                    conn.execute(_INSERT_FREE_USAGE_SQL, payload)
+                    inserted += 1
+                    continue
+                row = materialize_fn(payload) if isinstance(payload, DbRowRaw) else payload
+                conn.execute(_INSERT_REQUESTS_SQL, row)
+                inserted += 1
+            except Exception as e:
+                debug_fn(f"  [db] batch item skipped ({type(e).__name__}: {e})")
         try:
             conn.commit()
         except Exception as e:
@@ -442,7 +482,7 @@ def execute_batch_sync(
             except Exception:
                 pass
             return 0
-        return len(batch)
+        return inserted
 
 
 # ── Maintenance ─────────────────────────────────────────────────────
@@ -556,10 +596,7 @@ def log_free_usage(
     timestamp = _dt.datetime.now(_dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     with lock:
         conn.execute(
-            "INSERT INTO free_model_usage "
-            "(timestamp, paid_model, free_model, api_key, workspace_id, status, "
-            " tokens_input, tokens_output, duration_ms, ip) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            _INSERT_FREE_USAGE_SQL,
             (
                 timestamp,
                 paid_model,
