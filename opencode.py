@@ -627,6 +627,7 @@ MAX_BODY_SIZE = yaml_get("upstream", "max_body_size", 10 * 1024 * 1024)
 # chaque wrapper lit ses globales À L'APPEL — un patch d'oc._conn ou
 # oc._db_queue continue de couler dans la logique déléguée.
 from app import db as _app_db  # noqa: E402
+from app.router import route_for as _app_router_route_for  # noqa: E402  # [P5 tranche 3]
 
 MAX_BODY_STORAGE = _app_db.MAX_BODY_STORAGE
 
@@ -6346,99 +6347,30 @@ _seen_route_version = -1
 
 
 def _route_for(model_name: str) -> dict | None:
+    """[P5 tranche 3] logique déléguée à app/router.route_for — l'état
+    (_route_cache, _seen_route_version) et les globales restent ici, lus À
+    L'APPEL : monkeypatch.setattr(oc, "DISABLE_MAPPING"|...) coule toujours."""
     global _seen_route_version
-    # Check reload AVANT le lookup cache — il est throttlé à 5 s via
-    # _custom_routes_last_check (≈ 2 stat() par fenêtre), donc le coût est
-    # négligeable ; sans lui, un cache chaud ne verrait jamais les éditions
-    # externes de config.yaml.
-    maybe_reload_custom_routes()
-    rv = _cfg_settings.ROUTE_VERSION
-    if rv != _seen_route_version:
-        _seen_route_version = rv
-        if _route_cache:
-            _route_cache.clear()
-    cache_key = model_name.lower().strip()
-    if cache_key in _route_cache:
-        return _route_cache[cache_key]
-    name = model_name.lower().strip()
-    if not name:
-        return None
-    # When DISABLE_MAPPING, only check custom routes (not auto-generated aliases)
-    # but keep manual opus/sonnet/haiku aliases (they are defined in ROUTES even when auto-mapping is off)
-    if DISABLE_MAPPING:
-        for r in _cfg_settings.SORTED_CUSTOM_ROUTES:
-            if any(m in name for m in r.get("match", [])):
-                if len(_route_cache) >= _ROUTE_CACHE_MAX:
-                    _route_cache.clear()
-                _route_cache[cache_key] = r
-                _debug(f"  [route] DISABLE_MAPPING custom match: '{name}' → {r.get('model')}")
-                return r
-        # Manual opus/sonnet/haiku routes must remain available even with DISABLE_MAPPING (Claude Code defaults)
-        for r in _cfg_settings.SORTED_ROUTES:
-            # Only the 3 manual aliases have match == opus/sonnet/haiku (checked via small set)
-            mlist = [m.lower() for m in r.get("match", []) if isinstance(m, str)]
-            if any(m in ("opus", "sonnet", "haiku") for m in mlist):
-                if any(m in name for m in r.get("match", [])):
-                    if len(_route_cache) >= _ROUTE_CACHE_MAX:
-                        _route_cache.clear()
-                    _route_cache[cache_key] = r
-                    _debug(
-                        f"  [route] DISABLE_MAPPING manual alias match: '{name}' → {r.get('model')}"
-                    )
-                    return r
-        # No custom route matched — check if the model exists directly
-        if name in MODELS:
-            res = {"match": [name], "model": model_name}
-            if len(_route_cache) >= _ROUTE_CACHE_MAX:
-                _route_cache.clear()
-            _route_cache[cache_key] = res
-            _debug(f"  [route] DISABLE_MAPPING direct model: '{name}'")
-            return res
-        _debug(f"  [route] DISABLE_MAPPING no match for '{name}'")
-        # None NON caché : une route ajoutée plus tard doit être détectée.
-        return None
-    # 0. Exact MODELS lookup first (fastest, O(1) — covers 90% of prod traffic)
-    if name in MODELS:
-        res = {"match": [name], "model": name}
-        for r in _cfg_settings.SORTED_CUSTOM_ROUTES:
-            if r.get("enabled") is False:
-                continue
-            if any(m == name for m in r.get("match", [])):
-                res = r
-                break
-        if len(_route_cache) >= _ROUTE_CACHE_MAX:
-            _route_cache.clear()
-        _route_cache[cache_key] = res
-        _debug(f"  [route] exact MODELS hit: '{name}' → {res.get('model')}")
-        return res
-    # 1. Model-based routing (sorted by longest match first)
-    for r in _cfg_settings.SORTED_ROUTES:
-        if r.get("enabled") is False:
-            continue
-        if any(m in name for m in r.get("match", [])):
-            if len(_route_cache) >= _ROUTE_CACHE_MAX:
-                _route_cache.clear()
-            _route_cache[cache_key] = r
-            _debug(f"  [route] model match: {r.get('model')} (pattern in '{name}')")
-            return r
-    # 3. Wildcard catch-all: if a custom route "*" (or legacy "") exists, use it
-    wildcard = CUSTOM_ROUTES.get("*") or CUSTOM_ROUTES.get("")
-    if (
-        wildcard
-        and isinstance(wildcard, dict)
-        and wildcard.get("model")
-        and wildcard.get("enabled") is not False
-    ):
-        if len(_route_cache) >= _ROUTE_CACHE_MAX:
-            _route_cache.clear()
-        _route_cache[cache_key] = wildcard
-        _debug(f"  [route] wildcard catch-all: {wildcard.get('model')}")
-        return wildcard
-    # 5. No match found
-    _debug(f"  [route] no match for '{name}'")
-    # None NON caché : une route ajoutée plus tard pour ce modèle doit être
-    # détectée au prochain passage.
-    return None
+    res, _seen_route_version = _app_router_route_for(
+        model_name,
+        models=MODELS,
+        custom_routes=CUSTOM_ROUTES,
+        disable_mapping=DISABLE_MAPPING,
+        route_cache=_route_cache,
+        route_cache_max=_ROUTE_CACHE_MAX,
+        seen_version=_seen_route_version,
+        current_version=_cfg_settings.ROUTE_VERSION,
+        reload_fn=maybe_reload_custom_routes,
+        # listes + version lus À FRAIS après le reload throttlé (sinon le
+        # snapshot kwargs précéderait la détection d'édition externe)
+        snapshot_fn=lambda: (
+            _cfg_settings.SORTED_ROUTES,
+            _cfg_settings.SORTED_CUSTOM_ROUTES,
+            _cfg_settings.ROUTE_VERSION,
+        ),
+        debug_fn=_debug,
+    )
+    return res
 
 
 def _extract_tool_names(body: dict) -> list:

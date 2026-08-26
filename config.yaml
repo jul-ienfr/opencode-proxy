@@ -134,114 +134,114 @@ client_auth:
 supervisor:
   enabled: true
 ip_rotation:
-  enabled: true
-  proxy_mode: vpn
-  dual_station: true
-  station_count: 4
-  strict_free: true
-  quota_per_ip: 500
-  switch_delay: 1
-  docker_container: opencode-vpn
-  docker_compose_file: docker-compose.yml
-  vpn_proxy_port: 8888
-  socks5_proxy_port: 1080
-  socks5_proxy_port_2: 1081
-  socks5_proxies: []
-  socks5_auto_rotate: true
-  use_nordvpn_api: false
-  custom_ovpn_file: ''
-  vpn_proxy_port_2: 8889
-  docker_container_2: opencode-vpn-2
-  compose_service_2: vpn-gluetun-2
-  state_file_2: logs/vpn_state2.json
-  credentials_file: vpn_configs/credentials.txt
-  server_countries: Germany,Netherlands,France,Spain,Poland,Sweden,Denmark,Finland,Norway,Belgium,Switzerland,Austria,Portugal,Italy,Ireland,United
-    Kingdom,Czech Republic,Estonia,Latvia,Lithuania,Romania,Hungary,Greece,Slovakia,Slovenia,Croatia,Bulgaria,Luxembourg,Iceland,Cyprus,Malta,United
-    States,Canada,Australia,Japan,Singapore
-  circuit_breaker_threshold: 3
-  circuit_breaker_recovery: 300
-  backoff_max_delay: 60
-  bad_ttl: 60
-  ip_check_url: https://api.ipify.org
-  ip_check_urls:
-  - https://api.ipify.org
-  - https://icanhazip.com
-  - https://ifconfig.me/ip
-  - https://checkip.amazonaws.com
-  identity_rotation: true
-  identity_diversity: true
-  identity_max_profiles: 256
-  identity_profiles:
-  - impersonate: chrome131
-    user_agent: null
-    extra_headers: {}
-  update_enabled: true
-  update_check_interval: 21600
-  update_apply_window: 03:00-05:00
-  update_apply_idle_minutes: 15
-  update_apply_max_defer_hours: 24
-  watchdog_interval: 20
-  watchdog_backoff_base: 15
-  watchdog_backoff_max: 60
-  wait_healthy_poll: 0.5
-  status_cache_seconds: 2.0
-  connect_retry_interval: 20
-  rotation_fail_cooldown: 60
-  rotation_stagger: 2
-  recent_ip_window: 20
-  recent_ip_max_age: 1800
-  shared_rotation_file: logs/shared_rotation.json
-  server_provider: nordvpn
-  control_api_key: VqdLMB1w_vBdO3rzfXYnlosN7PUEgOsnQgFtk3poXnE
-  control_enabled: true
-  vpn_stack: auto
-  ovpn_protocol: tcp
-  ovpn_endpoint_port: '443'
+  auto_flip_cooldown_min: 0
   auto_hetero_boot: false
+  auto_max_free_attempts: true
   auto_ov_fail_threshold: 3
   auto_ov_return_min: 60
   auto_wg_egress_ticks: 2
-  egress_failure_tick_interval: 2.0
-  ip_probe_budget: 10.0
-  control_pin_timeout: 20
+  backoff_max_delay: 60
+  bad_ttl: 60
+  circuit_breaker_recovery: 300
+  circuit_breaker_threshold: 3
+  compose_service_2: vpn-gluetun-2
+  connect_retry_interval: 20
+  control_api_key: VqdLMB1w_vBdO3rzfXYnlosN7PUEgOsnQgFtk3poXnE
+  control_enabled: true
   control_pin_catchup: 25
-  auto_flip_cooldown_min: 0
-  rotation_wait_timeout: 20
-  rotation_max_duration: 240
-  country_rotation: true
+  control_pin_timeout: 20
   country_offset: 14
   country_offset_stride: 17
-  latency_rotation:
-    enabled: true
-    slow_threshold_ms: 8000
-    ewma_threshold_ms: 6000
-    p95_threshold_ms: 9000
-    consecutive_slow: 3
-    min_requests_before_eval: 5
-    soft_cooldown_sec: 600
-    hard_cooldown_sec: 1800
-    ewma_alpha: 0.3
-    window: 20
-    slow_threshold_ms_per_model:
-      default: 8000
-      glm: 4000
-      deepseek: 5000
-      muse-spark: 6000
-    floor_ms: 3000
-    global_degraded_threshold: 0.5
-    global_degraded_cooldown_sec: 300
-    max_soft_rotates_per_hour: 6
-    stream_metric: ttfb
+  country_rotation: true
+  credentials_file: vpn_configs/credentials.txt
+  custom_ovpn_file: ''
+  docker_compose_file: docker-compose.yml
+  docker_container: opencode-vpn
+  docker_container_2: opencode-vpn-2
   docker_events: true
-  auto_max_free_attempts: true
+  dual_station: true
+  egress_failure_tick_interval: 2.0
+  enabled: true
+  free_exception_fallback: station-first
   free_parallel:
     enabled: true
     routing: round-robin
     mode: load-balance
     hedge_delay_ms: 150
     hedge_max_attempts: 2
+  identity_diversity: true
+  identity_max_profiles: 256
+  identity_profiles:
+  - extra_headers: {}
+    impersonate: chrome131
+    user_agent: null
+  identity_rotation: true
+  ip_check_url: https://api.ipify.org
+  ip_check_urls:
+  - https://api.ipify.org
+  - https://icanhazip.com
+  - https://ifconfig.me/ip
+  - https://checkip.amazonaws.com
+  ip_probe_budget: 10.0
+  latency_rotation:
+    consecutive_slow: 3
+    enabled: true
+    ewma_alpha: 0.3
+    ewma_threshold_ms: 6000
+    floor_ms: 3000
+    global_degraded_cooldown_sec: 300
+    global_degraded_threshold: 0.5
+    hard_cooldown_sec: 1800
+    max_soft_rotates_per_hour: 6
+    min_requests_before_eval: 5
+    p95_threshold_ms: 9000
+    slow_threshold_ms: 8000
+    slow_threshold_ms_per_model:
+      deepseek: 5000
+      default: 8000
+      glm: 4000
+      muse-spark: 6000
+    soft_cooldown_sec: 600
+    stream_metric: ttfb
+    window: 20
   max_free_attempts: 4
-  free_exception_fallback: station-first
+  ovpn_endpoint_port: '443'
+  ovpn_protocol: tcp
+  proxy_mode: vpn
+  quota_per_ip: 500
+  recent_ip_max_age: 1800
+  recent_ip_window: 20
+  rotation_fail_cooldown: 60
+  rotation_max_duration: 240
+  rotation_stagger: 2
+  rotation_wait_timeout: 20
+  server_countries: Germany,Netherlands,France,Spain,Poland,Sweden,Denmark,Finland,Norway,Belgium,Switzerland,Austria,Portugal,Italy,Ireland,United
+    Kingdom,Czech Republic,Estonia,Latvia,Lithuania,Romania,Hungary,Greece,Slovakia,Slovenia,Croatia,Bulgaria,Luxembourg,Iceland,Cyprus,Malta,United
+    States,Canada,Australia,Japan,Singapore
+  server_provider: nordvpn
+  shared_rotation_file: logs/shared_rotation.json
+  socks5_auto_rotate: true
+  socks5_proxies: []
+  socks5_proxy_port: 1080
+  socks5_proxy_port_2: 1081
+  state_file_2: logs/vpn_state2.json
+  station_count: 4
+  status_cache_seconds: 2.0
+  strict_free: true
+  switch_delay: 1
+  update_apply_idle_minutes: 15
+  update_apply_max_defer_hours: 24
+  update_apply_window: 03:00-05:00
+  update_check_interval: 21600
+  update_enabled: true
+  use_nordvpn_api: false
+  vpn_proxy_port: 8888
+  vpn_proxy_port_2: 8889
+  vpn_stack: auto
+  wait_healthy_poll: 0.5
+  watchdog_backoff_base: 15
+  watchdog_backoff_max: 60
+  watchdog_interval: 20
 geo:
   enabled: true
   version: 1
@@ -255,9 +255,9 @@ geo:
       - Australia
       - Japan
       - Singapore
+      last_checked_at: '2026-08-20T00:00:00Z'
       mode: strict
       require_vpn: true
-      last_checked_at: '2026-08-20T00:00:00Z'
 custom_routes:
   mimov25:
     match:
