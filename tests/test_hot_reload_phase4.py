@@ -191,10 +191,10 @@ async def test_port_hot_restart_not_full_restart(config_backup, monkeypatch):
     chaque run de la suite (4000 → 4010 au fil des exécutions). Aucun test
     ne doit muter l'environnement disque réel.
     """
-    import dashboard.api as _api
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
 
+    import dashboard.api as _api
     from dashboard.api import register_dashboard
 
     # Mock server manager
@@ -234,11 +234,26 @@ async def test_port_hot_restart_not_full_restart(config_backup, monkeypatch):
     orig_port = int(data["port"])
     new_port = orig_port + 1 if orig_port < 65535 else orig_port - 1
     payload = {"port": new_port}
+    # [fix ticket P1] capture du thread d'exécution de restart
+    import threading as _th
+
+    seen_threads = []
+    mock_mgr.restart.side_effect = lambda *a, **kw: seen_threads.append(
+        _th.current_thread().name
+    )
+
     resp2 = client.post("/api/config", json=payload)
     assert resp2.status_code == 200
     j = resp2.json()
     assert j["status"] == "ok"
     assert j["needs_restart"] is False, "hot-restart should return needs_restart:false, not true"
+    # [fix ticket P1] restart tourne sur un thread dédié ("proxy-restart") —
+    # l'appel est ASYNCHRONE par rapport à la réponse : on attend l'appel.
+    import time as _t
+
+    deadline = _t.monotonic() + 2.0
+    while mock_mgr.restart.call_count == 0 and _t.monotonic() < deadline:
+        _t.sleep(0.01)
     # Verify hot-restart was called, not full_restart
     mock_mgr.restart.assert_called()
     mock_mgr.full_restart.assert_not_called()
@@ -247,11 +262,77 @@ async def test_port_hot_restart_not_full_restart(config_backup, monkeypatch):
     found = any(str(v) == str(new_port) for v in list(kwargs.values()) + list(args))
     assert found, f"mgr.restart should be called with port={new_port}, got {call_args}"
 
+    # [fix ticket P1 incident 25/08] restart NE doit PAS s'exécuter sur le
+    # thread du handler (la boucle uvicorn) : join(current_thread) dans
+    # stop() = serveur mort. Thread dédié "proxy-restart" obligatoire.
+    assert seen_threads and seen_threads[0] == "proxy-restart", (
+        f"restart doit tourner sur 'proxy-restart', pas {seen_threads}"
+    )
+
     # [INCIDENT 26/08] l'update est bien INTERCEPTÉ, jamais écrit sur disque
     assert saved_updates.get("OPENCODE_PORT") == str(new_port)
 
     # [P6] plus aucun champ web_port exposé par l'API
     assert "web_port" not in data
+
+
+def test_server_stop_from_own_thread_does_not_self_join():
+    """[fix ticket P1 incident 25/08] stop() appelé DEPUIS le thread serveur
+    (handler HTTP sur la boucle uvicorn) : join(current_thread) lèverait
+    RuntimeError et restart() mourrait avant start() — « shutdown OK,
+    startup jamais relancé ». Le garde doit ignorer le join, pas lever."""
+    import threading
+
+    import opencode as oc
+
+    mgr = oc.ServerManager(app=None, host="127.0.0.1", port=1)
+    mgr.is_running = True
+    mgr._server = None  # pas de vrai serveur : should_exit no-op
+    # Simule l'appel depuis le thread serveur lui-même
+    mgr._thread = threading.current_thread()
+
+    mgr.stop(timeout=0.01)  # NE doit PAS lever RuntimeError
+
+    assert mgr.is_running is False
+    assert mgr._thread is None
+
+
+def test_server_stop_from_other_thread_joins_normally():
+    """Chemin nominal : stop() depuis un AUTRE thread joint bien le thread
+    serveur (attente du shutdown gracieux)."""
+    import threading
+    import time as _t
+
+    import opencode as oc
+
+    mgr = oc.ServerManager(app=None, host="127.0.0.1", port=1)
+    mgr.is_running = True
+    mgr._server = None
+
+    released = threading.Event()
+
+    def _fake_serve():
+        while not released.is_set():
+            _t.sleep(0.005)
+
+    t = threading.Thread(target=_fake_serve, name="fake-uvicorn", daemon=True)
+    t.start()
+    mgr._thread = t
+
+    result: list = []
+
+    def _stopper():
+        mgr.stop(timeout=2)
+        result.append("stopped")
+
+    stopper = threading.Thread(target=_stopper)
+    stopper.start()
+    _t.sleep(0.05)  # laisse stop() entrer dans le join
+    released.set()
+    stopper.join(timeout=3)
+
+    assert result == ["stopped"], "stop() doit joindre le thread serveur sans blocage"
+    assert mgr.is_running is False
 
 
 def test_vpn_servers_persist_reboot_safe(config_backup):

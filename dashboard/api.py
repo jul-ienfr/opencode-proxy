@@ -1992,22 +1992,35 @@ def register_dashboard(
             )
             mgr = server_manager_getter() if server_manager_getter else None
             if mgr:
-                try:
-                    mgr.restart(
-                        port=body.get("port"),
-                        host=body.get("host"),
-                    )
-                except Exception as e:
-                    return {
-                        "status": "error",
-                        "needs_restart": True,
-                        "message": f"Échec redémarrage à chaud : {e}. Redémarrage manuel requis.",
-                    }
+                # [fix ticket P1 incident 25/08] mgr.restart() ne doit JAMAIS
+                # s'exécuter sur la boucle uvicorn courante : stop() fait
+                # self._thread.join() → join du thread COURANT → RuntimeError
+                # avant start() = serveur mort (« shutdown OK, startup jamais
+                # relancé »). Même pattern que POST /api/proxy/restart :
+                # thread dédié qui survit au démontage.
+                import threading
+
+                def _do_restart():
+                    try:
+                        mgr.restart(
+                            port=body.get("port"),
+                            host=body.get("host"),
+                        )
+                    except Exception as e:
+                        _debug(f"  [config] hot-restart FAILED: {type(e).__name__}: {e}")
+
+                threading.Thread(
+                    target=_do_restart,
+                    name="proxy-restart",
+                    daemon=False,
+                ).start()
 
         return {
             "status": "ok",
             "needs_restart": False,
-            "message": "Configuration mise à jour.",
+            "message": "Configuration mise à jour. Redémarrage à chaud déclenché."
+            if restart_needed
+            else "Configuration mise à jour.",
         }
 
     # ── Proxy control ──
@@ -2026,7 +2039,8 @@ def register_dashboard(
             return {"status": "ok", "message": "Aucun gestionnaire de serveur disponible"}
         if mgr.is_running:
             return {"status": "ok", "message": "Déjà en cours"}
-        mgr.start()
+        # [fix P1] start() dort jusqu'à 5 s (attente bind) — hors loop.
+        await asyncio.to_thread(mgr.start)
         return {"status": "ok", "message": "Proxy démarré"}
 
     @app.post("/api/proxy/stop")
@@ -2036,7 +2050,9 @@ def register_dashboard(
             return {"status": "ok", "message": "Aucun gestionnaire de serveur disponible"}
         if not mgr.is_running:
             return {"status": "ok", "message": "Déjà arrêté"}
-        mgr.stop()
+        # [fix ticket P1] stop() joint le thread serveur : depuis la boucle
+        # uvicorn (ce handler), join(current_thread) lèverait RuntimeError.
+        await asyncio.to_thread(mgr.stop)
         return {"status": "ok", "message": "Proxy arrêté"}
 
     @app.post("/api/proxy/restart")

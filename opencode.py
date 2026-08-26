@@ -12382,7 +12382,15 @@ class ServerManager:
                 self._server.should_exit = True
             self.is_running = False
         if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=timeout)
+            if self._thread is threading.current_thread():
+                # [fix ticket P1 incident 25/08] appel DEPUIS le thread serveur
+                # lui-même (handler HTTP sur la boucle) : join(current_thread)
+                # lèverait RuntimeError et tuerait restart() avant start()
+                # (« shutdown OK, startup jamais relancé »). On signale
+                # seulement — le should_exit ci-dessus termine le serveur seul.
+                _debug("  [server] stop() depuis le thread serveur : join ignoré")
+            else:
+                self._thread.join(timeout=timeout)
         self._server = None
         self._thread = None
         _debug("  [server] stopped")
