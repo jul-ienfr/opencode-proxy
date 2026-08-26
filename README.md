@@ -125,6 +125,7 @@ ip_rotation:
   update_check_interval: 21600   # check every 6 h
   update_apply_window: 03:00-05:00
   update_apply_idle_minutes: 15  # apply only after this much idle time
+  rotation_wait_timeout: 5       # max s a request waits for a fresh IP before paid fallback
 ```
 
 The compose service runs with `FIREWALL=on`: the container only talks through the VPN tunnel — no accidental leaks. The default config uses a single `chrome131` profile, so behavior is unchanged until you add more profiles.

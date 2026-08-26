@@ -156,7 +156,9 @@ class FreeIPPool:
         # when the best station is over-threshold and no other station is
         # usable. Bounded: on timeout the request falls back to paid (None,
         # None) instead of serving the burned IP (guaranteed 429 → paid).
-        self._rotation_wait_timeout = 20.0
+        # [P3.1-A perf] défaut 20 s → 5 s : le repli paid garanti existe déjà
+        # (l.869-870) ; au-delà de 5 s d'attente d'IP fraîche, TTFB pire cas.
+        self._rotation_wait_timeout = 5.0
         # [Axe 1.1] Bounded rotation coordinator: up to _ROTATION_CONCURRENCY
         # workers drain the queue in parallel, so a blocked rotation on one
         # station (budget wait + docker ops) no longer freezes the fleet.

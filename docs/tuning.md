@@ -24,14 +24,14 @@ Mesure: `scripts/rotate_db.sh` (see `scripts/rotate_db.sh --vacuum`) + `SELECT C
 
 ```yaml
 upstream:
-  max_connections: 500
-  max_keepalive: 200
+  max_connections: 64
+  max_keepalive: 32
   keepalive_expiry: 30
   pool: 5
 ```
 
-- `max_connections 500` backpressure: above 500 concurrent upstream, httpx queues (timeout `pool 5` s) → 503 if saturated, protects Opencode.
-- `max_keepalive 200` reuse: 200 idle keep-alive slots, expiry 30 s — avoids TIME_WAIT storm.
+- `max_connections 64` backpressure: above 64 concurrent upstream, httpx queues (timeout `pool 5` s) → 503 if saturated, protects Opencode. [P2.5 perf] défaut 500→64 : un proxy mono-utilisateur n'a jamais besoin de 500 conns ; FDs/mémoire libérés, pool toujours chaud. Hot-reloadable.
+- `max_keepalive 32` reuse: 32 idle keep-alive slots, expiry 30 s — avoids TIME_WAIT storm.
 - Bench: `scripts/bench.py --url http://localhost:4000 --stream`.
 
 ## Health caches

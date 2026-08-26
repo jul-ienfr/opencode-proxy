@@ -1299,10 +1299,14 @@ def _drop_orphan_responses_input(inp: list[dict]) -> list[dict]:
 
 
 def _build_http_limits() -> httpx.Limits:
-    """Tuned for extreme speed: 500 conns, 200 keepalive, 30s expiry."""
+    """Tuned for extreme speed: 64 conns, 32 keepalive, 30s expiry.
+
+    [P2.5 perf] défauts 500/200 → 64/32 : un proxy mono-utilisateur n'a
+    jamais besoin de 500 connexions concurrentes ; les FDs/mémoire libérés
+    et le pool httpx restent chauds (hot-reloadable via config.yaml)."""
     return httpx.Limits(
-        max_connections=int(yaml_get("upstream", "max_connections", 500)),
-        max_keepalive_connections=int(yaml_get("upstream", "max_keepalive", 200)),
+        max_connections=int(yaml_get("upstream", "max_connections", 64)),
+        max_keepalive_connections=int(yaml_get("upstream", "max_keepalive", 32)),
         keepalive_expiry=float(yaml_get("upstream", "keepalive_expiry", 30)),
     )
 
