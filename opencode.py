@@ -1025,7 +1025,7 @@ async def _save_request(
         tools_used=tools_used,
     )
     try:
-        _db_queue.put_nowait(item)
+        _db_queue.put_nowait(("requests", item))
     except asyncio.QueueFull:
         _debug(
             f"  [db] queue full ({_db_queue.qsize()}), dropping req_id={req_id} — fallback to direct"
@@ -1093,26 +1093,33 @@ def _log_free_model_usage(
 ):
     """Log a free model request to the database for quota analysis.
 
-    [P5 tranche 4] INSERT délégué à app/db.log_free_usage (lock + commit
-    gérés là-bas) ; le masquage de clé reste ici (seam visible)."""
+    [P1.2 perf] Zéro SQLite sur la boucle : la ligne part dans la queue
+    writer batchée (_db_queue) sous forme de tuple taggé ("free_usage", row) ;
+    l'INSERT+commit s'exécute dans le thread writer, commits groupés.
+    Sémantique fail-soft inchangée : erreur SQL loguée côté writer, jamais
+    propagée à la requête. Le masquage de clé reste ici (seam visible).
+    Fraîcheur dashboard : instant → ≤5 s (table display-only, aucun routage)."""
     try:
-        _app_db.log_free_usage(
-            _conn,
-            _db_commit_lock,
-            paid_model=paid_model,
-            free_model=free_model,
-            api_key_masked=api_key[:16] + "...",
-            workspace_id=workspace_id,
-            status=status,
-            tokens_in=tokens_in,
-            tokens_out=tokens_out,
-            duration_ms=duration_ms,
-            ip=ip,
+        timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        row = (
+            timestamp,
+            paid_model,
+            free_model,
+            api_key[:16] + "...",
+            workspace_id,
+            status,
+            tokens_in,
+            tokens_out,
+            duration_ms,
+            ip,
         )
+        _db_queue.put_nowait(("free_usage", row))
         _debug(
-            f"  [free-usage] logged: {free_model} key={api_key[:8]}... ws={workspace_id[:12]}... "
+            f"  [free-usage] queued: {free_model} key={api_key[:8]}... ws={workspace_id[:12]}... "
             f"status={status} ip={ip} in={tokens_in} out={tokens_out}"
         )
+    except asyncio.QueueFull:
+        _debug(f"  [free-usage] queue full — dropped usage row for {free_model}")
     except Exception as e:
         _debug(f"  [free-usage] log failed: {e}")
 
