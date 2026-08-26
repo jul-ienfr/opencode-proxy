@@ -31,20 +31,20 @@ Covered here:
     reads VPN_TYPE_STATION*); absent keys loaded
   * /api/vpn-status exposes env_divergence (the dashboard wiring)
 """
+
 import logging
 import os
 import sqlite3
-import subprocess
 
 import pytest
 from fastapi import FastAPI
 from starlette.testclient import TestClient
+from test_vpn_freshness import FakeVPNManager, _cfg
 
-import vpn_manager as vm
 import config.settings as settings
 import shared_state
+import vpn_manager as vm
 from dashboard.api import register_dashboard
-from test_vpn_freshness import FakeVPNManager, _cfg
 
 
 class _EnvRecFake(FakeVPNManager):
@@ -58,11 +58,10 @@ class _EnvRecFake(FakeVPNManager):
     returncode check — the fake runner always succeeds."""
 
     def __init__(self, cfg, station=1, shared=None, tmp_path=None, **kw):
-        super().__init__(cfg, station=station, shared=shared,
-                         tmp_path=tmp_path, **kw)
-        self.digest = "sha256:same"        # same before/after → no update
+        super().__init__(cfg, station=station, shared=shared, tmp_path=tmp_path, **kw)
+        self.digest = "sha256:same"  # same before/after → no update
         self.image_id = "sha256:old"
-        self.envs = []                     # env of every _docker_run call
+        self.envs = []  # env of every _docker_run call
 
     async def _docker_repo_digest(self, image):
         return self.digest
@@ -94,6 +93,7 @@ def _compose(tmp_path, monkeypatch):
 
 # ── _compose_env (déterministe — construction du dict env) ─────────
 
+
 class TestComposeEnv:
     def test_single_station_carries_station_var(self, tmp_path, monkeypatch):
         # Importing config.settings already loaded the repo .env into
@@ -109,13 +109,13 @@ class TestComposeEnv:
 
         env = m._compose_env()
 
-        assert env["VPN_TYPE_STATION3"] == "wireguard", \
-            "own station's var = effective stack"
-        assert env["SOME_PARENT_MARKER"] == "yes", \
+        assert env["VPN_TYPE_STATION3"] == "wireguard", "own station's var = effective stack"
+        assert env["SOME_PARENT_MARKER"] == "yes", (
             "parent env inherited (compose needs ALL the other vars)"
+        )
         assert os.environ.get("VPN_TYPE_STATION3") is None, (
-            "parent env must NOT be mutated (the divergence detector "
-            "relies on it staying stale)")
+            "parent env must NOT be mutated (the divergence detector relies on it staying stale)"
+        )
 
     def test_multiple_stations_all_present(self, tmp_path):
         cfg, _ = _cfg_with(tmp_path)
@@ -143,6 +143,7 @@ class TestComposeEnv:
 
 # ── custom .ovpn — gate OPENVPN_CUSTOM_CONFIG (Axe 3.1) ────────────
 
+
 class TestCustomOvpnEnv:
     """[fix 20/08][Axe 3.1] The dashboard upload persists `custom_ovpn_file`
     (compose-root-relative, `vpn_configs/custom/…`). `_compose_env` must
@@ -152,13 +153,12 @@ class TestCustomOvpnEnv:
     silent no-op (compose's ${VAR:-} interpolation stays inert), not an
     error."""
 
-    def _ovpn_mgr(self, tmp_path, monkeypatch, *, stack="openvpn", rel=None,
-                  create_file=True):
+    def _ovpn_mgr(self, tmp_path, monkeypatch, *, stack="openvpn", rel=None, create_file=True):
         cfg, _ = _cfg_with(tmp_path, vpn_stack=stack)
         if rel is not None:
             cfg["custom_ovpn_file"] = rel
         m = _EnvRecFake(cfg, station=1, tmp_path=tmp_path)
-        _compose(tmp_path, monkeypatch)        # VPN_DOCKER_COMPOSE_FILE
+        _compose(tmp_path, monkeypatch)  # VPN_DOCKER_COMPOSE_FILE
         if create_file and rel is not None:
             p = tmp_path / rel
             p.parent.mkdir(parents=True, exist_ok=True)
@@ -166,25 +166,26 @@ class TestCustomOvpnEnv:
         return m
 
     def test_openvpn_file_present_sets_var(self, tmp_path, monkeypatch):
-        m = self._ovpn_mgr(tmp_path, monkeypatch,
-                           rel="vpn_configs/custom/nl-01.ovpn")
+        m = self._ovpn_mgr(tmp_path, monkeypatch, rel="vpn_configs/custom/nl-01.ovpn")
         env = m._compose_env()
-        assert env["OPENVPN_CUSTOM_CONFIG"] == "/vpn-custom/nl-01.ovpn", \
+        assert env["OPENVPN_CUSTOM_CONFIG"] == "/vpn-custom/nl-01.ovpn", (
             "in-container path = bind-mount mirror of the uploaded file"
+        )
 
     def test_openvpn_without_custom_key_no_var(self, tmp_path, monkeypatch):
         m = self._ovpn_mgr(tmp_path, monkeypatch, rel=None)
         env = m._compose_env()
-        assert "OPENVPN_CUSTOM_CONFIG" not in env, \
+        assert "OPENVPN_CUSTOM_CONFIG" not in env, (
             "no custom configured → compose's ${VAR:-} interpolation is inert"
+        )
 
     def test_openvpn_missing_file_no_var(self, tmp_path, monkeypatch):
         """Upload persisted but the file vanished (manual cleanup / partial
         deploy) — the gate must NOT fabricate a path the container can't
         see (gluetun would fail on a missing /vpn-custom/… file)."""
-        m = self._ovpn_mgr(tmp_path, monkeypatch,
-                           rel="vpn_configs/custom/gone.ovpn",
-                           create_file=False)
+        m = self._ovpn_mgr(
+            tmp_path, monkeypatch, rel="vpn_configs/custom/gone.ovpn", create_file=False
+        )
         env = m._compose_env()
         assert "OPENVPN_CUSTOM_CONFIG" not in env
 
@@ -192,8 +193,9 @@ class TestCustomOvpnEnv:
         """Stale custom_ovpn_file + wireguard stack → no var (gluetun would
         ignore the setting under WG anyway; the guard keeps the surface
         honest — the 19/08 lesson: the env must never leak across stacks)."""
-        m = self._ovpn_mgr(tmp_path, monkeypatch, stack="wireguard",
-                           rel="vpn_configs/custom/nl-01.ovpn")
+        m = self._ovpn_mgr(
+            tmp_path, monkeypatch, stack="wireguard", rel="vpn_configs/custom/nl-01.ovpn"
+        )
         assert m._stack_effective == "wireguard"
         env = m._compose_env()
         assert "OPENVPN_CUSTOM_CONFIG" not in env
@@ -203,14 +205,15 @@ class TestCustomOvpnEnv:
         forward slashes, but hand-edited config.yaml may not) — the gate
         normalizes before the existence check, so /vpn-custom/<basename>
         stays stable on every host."""
-        m = self._ovpn_mgr(tmp_path, monkeypatch,
-                           rel=os.path.join("vpn_configs", "custom",
-                                            "nl-01.ovpn"))
+        m = self._ovpn_mgr(
+            tmp_path, monkeypatch, rel=os.path.join("vpn_configs", "custom", "nl-01.ovpn")
+        )
         env = m._compose_env()
         assert env["OPENVPN_CUSTOM_CONFIG"] == "/vpn-custom/nl-01.ovpn"
 
 
 # ── call sites — env passe à travers le runner factice ─────────────
+
 
 class TestCallSitesPassEnv:
     def _mgr(self, tmp_path, monkeypatch, station=1, **over):
@@ -232,59 +235,60 @@ class TestCallSitesPassEnv:
         parent env (openvpn) and effective openvpn, a plain effective-stack
         env would recreate the fleet on OpenVPN — the bug being killed."""
         cfg, _ = _cfg_with(tmp_path)
-        managers = [_EnvRecFake(cfg, station=s, tmp_path=tmp_path)
-                    for s in (1, 2, 3)]
+        managers = [_EnvRecFake(cfg, station=s, tmp_path=tmp_path) for s in (1, 2, 3)]
         for m in managers:
-            m._stack_effective = "openvpn"     # stale parent / effective
-        monkeypatch.setattr(shared_state, "vpn_managers", managers,
-                            raising=False)
+            m._stack_effective = "openvpn"  # stale parent / effective
+        monkeypatch.setattr(shared_state, "vpn_managers", managers, raising=False)
         _compose(tmp_path, monkeypatch)
 
         assert await managers[0]._apply_stack("wireguard") is True
         env = managers[0].last_env
         for s in (1, 2, 3):
-            assert env[f"VPN_TYPE_STATION{s}"] == "wireguard", \
-                "TARGET stack reaches the compose child despite the stale " \
+            assert env[f"VPN_TYPE_STATION{s}"] == "wireguard", (
+                "TARGET stack reaches the compose child despite the stale "
                 "parent env (19/08 root cause)"
+            )
         assert managers[0]._stack_effective == "wireguard"
 
     @pytest.mark.asyncio
-    async def test_stop_container_env_is_effective_stack(self, tmp_path,
-                                                         monkeypatch):
+    async def test_stop_container_env_is_effective_stack(self, tmp_path, monkeypatch):
         m = self._mgr(tmp_path, monkeypatch)
         await m.stop_container()
         assert m.envs[0]["VPN_TYPE_STATION1"] == "wireguard", (
             "compose stop child (the FIRST docker op) sees the stack; the "
-            "`docker rm` that follows carries no env")
+            "`docker rm` that follows carries no env"
+        )
         assert m.envs[-1] is None, "docker rm -f needs no compose env"
 
     @pytest.mark.asyncio
     async def test_check_update_pull_passes_env(self, tmp_path, monkeypatch):
         m = self._mgr(tmp_path, monkeypatch)
         m._update_enabled = True
-        assert await m.check_update() is False     # same digest → no update
-        assert m.last_env["VPN_TYPE_STATION1"] == "wireguard", \
+        assert await m.check_update() is False  # same digest → no update
+        assert m.last_env["VPN_TYPE_STATION1"] == "wireguard", (
             "`compose pull` child inherits the explicit stack too"
+        )
 
     @pytest.mark.asyncio
-    async def test_apply_update_compose_passes_env(self, tmp_path,
-                                                   monkeypatch):
+    async def test_apply_update_compose_passes_env(self, tmp_path, monkeypatch):
         m = self._mgr(tmp_path, monkeypatch)
         m._update_available = True
         m._update_old_image_id = "sha256:old"
         m._UPDATE_LOCK_PATH = str(tmp_path / "vpn_update.lock")
         m.ips = ["9.9.9.9"]
-        m._finalize_ip = lambda: None            # never reached — see below
+        m._finalize_ip = lambda: None  # never reached — see below
 
         async def _finalize(allow_stale=False):
             m._current_ip = "9.9.9.9"
             return True
+
         m._finalize_ip = _finalize
         result = await m.apply_update()
 
         assert result["ok"] is True
-        assert m.envs[-1]["VPN_TYPE_STATION1"] == "wireguard", \
+        assert m.envs[-1]["VPN_TYPE_STATION1"] == "wireguard", (
             "recreate child after update sees the effective stack"
+        )
 
     @pytest.mark.asyncio
     async def test_rollback_compose_passes_env(self, tmp_path, monkeypatch):
@@ -294,11 +298,12 @@ class TestCallSitesPassEnv:
         m._update_available = True
         m._update_old_image_id = "sha256:old"
         m._UPDATE_LOCK_PATH = str(tmp_path / "vpn_update.lock")
-        m.log_text = "AUTH_FAILED"               # post-recreate auth failure
+        m.log_text = "AUTH_FAILED"  # post-recreate auth failure
 
         async def _finalize(allow_stale=False):
             m._current_ip = "9.9.9.9"
             return True
+
         m._finalize_ip = _finalize
         result = await m.apply_update()
 
@@ -309,6 +314,7 @@ class TestCallSitesPassEnv:
 
 
 # ── detection — load_env_file vs process env (boot) ────────────────
+
 
 @pytest.fixture
 def _env_file(tmp_path, monkeypatch):
@@ -333,31 +339,31 @@ def _write_env(path, **kv):
 
 class TestLoadEnvFile:
     @pytest.mark.asyncio
-    async def test_divergent_vpn_key_flagged_and_warned(self, _env_file,
-                                                        monkeypatch,
-                                                        caplog):
+    async def test_divergent_vpn_key_flagged_and_warned(self, _env_file, monkeypatch, caplog):
         env = _env_file
         monkeypatch.setenv("VPN_TYPE_STATION1", "openvpn")  # stale parent
-        _write_env(env, VPN_TYPE="openvpn",
-                   VPN_TYPE_STATION1="wireguard",           # file says WG
-                   SOME_SECRET="abc123")
-        with caplog.at_level(logging.WARNING,
-                             logger="config.settings"):
+        _write_env(
+            env,
+            VPN_TYPE="openvpn",
+            VPN_TYPE_STATION1="wireguard",  # file says WG
+            SOME_SECRET="abc123",
+        )
+        with caplog.at_level(logging.WARNING, logger="config.settings"):
             settings.load_env_file()
-        assert settings.ENV_DIVERGENCE == [
-            ("VPN_TYPE_STATION1", "wireguard", "openvpn")]
+        assert settings.ENV_DIVERGENCE == [("VPN_TYPE_STATION1", "wireguard", "openvpn")]
         assert "env divergence" in caplog.text
         assert "VPN_TYPE_STATION1" in caplog.text
         # the 19/08 read-back: file and process disagree on what the fleet
         # runs — the process env (openvpn) is what compose would inherit.
-        assert os.environ["VPN_TYPE_STATION1"] == "openvpn", \
+        assert os.environ["VPN_TYPE_STATION1"] == "openvpn", (
             "stale env NOT overwritten (a later compose would inherit it)"
+        )
 
     @pytest.mark.asyncio
     async def test_aligned_key_not_flagged(self, _env_file, monkeypatch):
         env = _env_file
         monkeypatch.setenv("VPN_TYPE_STATION1", "wireguard")
-        _write_env(env, VPN_TYPE_STATION1="wireguard")     # file matches
+        _write_env(env, VPN_TYPE_STATION1="wireguard")  # file matches
         settings.load_env_file()
         assert settings.ENV_DIVERGENCE == []
 
@@ -369,16 +375,14 @@ class TestLoadEnvFile:
         env = _env_file
         monkeypatch.setenv("OPENCODE_API_KEY", "from-process")
         monkeypatch.setenv("VPN_TYPE_STATION1", "openvpn")
-        _write_env(env, VPN_TYPE_STATION1="openvpn",
-                   OPENCODE_API_KEY="from-file")
+        _write_env(env, VPN_TYPE_STATION1="openvpn", OPENCODE_API_KEY="from-file")
         settings.load_env_file()
         assert settings.ENV_DIVERGENCE == []
 
     @pytest.mark.asyncio
     async def test_absent_key_loaded_not_flagged(self, _env_file, monkeypatch):
         env = _env_file
-        _write_env(env, VPN_TYPE_STATION1="wireguard",
-                   VPN_TYPE_STATION2="openvpn")
+        _write_env(env, VPN_TYPE_STATION1="wireguard", VPN_TYPE_STATION2="openvpn")
         settings.load_env_file()
         assert settings.ENV_DIVERGENCE == []
         assert os.environ["VPN_TYPE_STATION1"] == "wireguard"
@@ -391,20 +395,21 @@ class TestLoadEnvFile:
         assert settings.ENV_DIVERGENCE == []
 
     @pytest.mark.asyncio
-    async def test_partially_aligned_and_divergent_mixed(self, _env_file,
-                                                         monkeypatch,
-                                                         caplog):
+    async def test_partially_aligned_and_divergent_mixed(self, _env_file, monkeypatch, caplog):
         """Only the divergent VPN_* keys are journaled; aligned stations and
         non-VPN_* keys stay quiet — the banner list is precise, not noisy."""
         env = _env_file
-        monkeypatch.setenv("VPN_TYPE_STATION1", "openvpn")   # stale
-        monkeypatch.setenv("VPN_TYPE_STATION2", "openvpn")   # aligned
-        monkeypatch.setenv("VPN_TYPE_STATION3", "edge")      # stale
+        monkeypatch.setenv("VPN_TYPE_STATION1", "openvpn")  # stale
+        monkeypatch.setenv("VPN_TYPE_STATION2", "openvpn")  # aligned
+        monkeypatch.setenv("VPN_TYPE_STATION3", "edge")  # stale
         monkeypatch.setenv("OPENCODE_API_KEY", "proc-key")
-        _write_env(env, VPN_TYPE_STATION1="wireguard",
-                   VPN_TYPE_STATION2="openvpn",
-                   VPN_TYPE_STATION3="openvpn",
-                   OPENCODE_API_KEY="file-key")
+        _write_env(
+            env,
+            VPN_TYPE_STATION1="wireguard",
+            VPN_TYPE_STATION2="openvpn",
+            VPN_TYPE_STATION3="openvpn",
+            OPENCODE_API_KEY="file-key",
+        )
         with caplog.at_level(logging.WARNING, logger="config.settings"):
             settings.load_env_file()
         assert settings.ENV_DIVERGENCE == [
@@ -414,8 +419,7 @@ class TestLoadEnvFile:
         assert caplog.text.count("env divergence") == 2
 
     @pytest.mark.asyncio
-    async def test_runtime_rewrite_after_apply_stack_not_flagged(
-            self, _env_file, monkeypatch):
+    async def test_runtime_rewrite_after_apply_stack_not_flagged(self, _env_file, monkeypatch):
         """A boot-time load writes the file values into os.environ (absent
         keys); a focused re-test call after _apply_stack has synced BOTH the
         file AND os.environ to the new stack sees aligned values and flags
@@ -423,7 +427,7 @@ class TestLoadEnvFile:
         env every _apply_stack call, even on a stack no-op)."""
         env = _env_file
         _write_env(env, VPN_TYPE_STATION1="wireguard")
-        settings.load_env_file()                       # boot load
+        settings.load_env_file()  # boot load
         # _apply_stack's read-modify-write has now synced the process env:
         assert os.environ["VPN_TYPE_STATION1"] == "wireguard"
         # …so the re-test call must NOT report a divergence.
@@ -433,6 +437,7 @@ class TestLoadEnvFile:
 
 
 # ── dashboard wiring — /api/vpn-status exposes the flag ────────────
+
 
 class TestDashboardExposesDivergence:
     """/api/vpn-status carries env_divergence when settings.ENV_DIVERGENCE is
@@ -448,16 +453,17 @@ class TestDashboardExposesDivergence:
         return TestClient(fast)
 
     def test_env_divergence_field_present_when_flag(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(settings, "ENV_DIVERGENCE",
-                            [("VPN_TYPE_STATION1", "wireguard", "openvpn")])
+        monkeypatch.setattr(
+            settings, "ENV_DIVERGENCE", [("VPN_TYPE_STATION1", "wireguard", "openvpn")]
+        )
         with self._client(tmp_path, monkeypatch) as client:
             data = client.get("/api/vpn-status").json()
         assert data["env_divergence"] == [
-            {"key": "VPN_TYPE_STATION1", "file": "wireguard", "env": "openvpn"}]
+            {"key": "VPN_TYPE_STATION1", "file": "wireguard", "env": "openvpn"}
+        ]
 
     def test_env_divergence_absent_when_flag_empty(self, tmp_path, monkeypatch):
         monkeypatch.setattr(settings, "ENV_DIVERGENCE", [])
         with self._client(tmp_path, monkeypatch) as client:
             data = client.get("/api/vpn-status").json()
-        assert "env_divergence" not in data, \
-            "no banner field when the process env matches the .env"
+        assert "env_divergence" not in data, "no banner field when the process env matches the .env"

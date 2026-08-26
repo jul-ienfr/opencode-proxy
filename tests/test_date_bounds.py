@@ -15,7 +15,7 @@ import os
 import re
 import sys
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime
 
 import pytest
 
@@ -23,9 +23,9 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from dashboard.api import (
+    _DATE_ONLY_RE,
     _date_bound_to_utc,
     _normalize_date_bound,
-    _DATE_ONLY_RE,
     daysAgo,
 )
 
@@ -80,13 +80,20 @@ class TestNormalizeDateBound:
         assert isinstance(out, str) and out.endswith("Z") and out.startswith("2026-08-15")
 
     def test_z_timestamp_passes_through(self):
-        assert _normalize_date_bound("2026-08-16T15:21:29Z", end_of_day=False) == "2026-08-16T15:21:29Z"
-        assert _normalize_date_bound("2026-08-16T15:21:29Z", end_of_day=True) == "2026-08-16T15:21:29Z"
+        assert (
+            _normalize_date_bound("2026-08-16T15:21:29Z", end_of_day=False)
+            == "2026-08-16T15:21:29Z"
+        )
+        assert (
+            _normalize_date_bound("2026-08-16T15:21:29Z", end_of_day=True) == "2026-08-16T15:21:29Z"
+        )
 
     def test_complete_timestamp_without_z_passes_through(self):
         # Space-separated or any non-bare-date string is left alone (daysAgo
         # and the DB now converge on UTC+Z, so nothing else should appear).
-        assert _normalize_date_bound("2026-08-16 15:21:29", end_of_day=False) == "2026-08-16 15:21:29"
+        assert (
+            _normalize_date_bound("2026-08-16 15:21:29", end_of_day=False) == "2026-08-16 15:21:29"
+        )
 
     def test_non_string_passes_through(self):
         assert _normalize_date_bound(None, end_of_day=False) is None
@@ -109,7 +116,7 @@ class TestDaysAgo:
         assert Z_RE.match(daysAgo(30))
 
     def test_value_is_instant_now_minus_n_days(self):
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         ts = datetime.fromisoformat(daysAgo(0))
         assert abs((now - ts).total_seconds()) < 10
         assert daysAgo(1) < daysAgo(0)

@@ -23,19 +23,21 @@ so the real repo config.yaml is never touched):
 - body without vpn_stack → persist once with the whole body, set_stack
   never called.
 """
+
 import sqlite3
 
 import pytest
 from fastapi import FastAPI
 from starlette.testclient import TestClient
 
-import shared_state
 import dashboard.api as api
+import shared_state
 from dashboard.api import register_dashboard
 
 
 class _FakeMgr:
     """Station manager slice: update_config/set_stack/get_config."""
+
     def __init__(self, station, set_result=None):
         self._station = station
         self.set_result = set_result or {"ok": True}
@@ -92,6 +94,7 @@ def _post(app, body):
 
 # ── the audit scenario: set_stack refuses → vpn_stack NOT persisted ──
 
+
 def test_refusal_keeps_old_stack_persisted(ctx):
     """wireguard without a key → set_stack refuses → config.yaml must NOT
     end up saying wireguard: the filtered body is persisted, the stack
@@ -112,6 +115,7 @@ def test_refusal_keeps_old_stack_persisted(ctx):
 
 # ── success → vpn_stack persisted only after set_stack ok ──
 
+
 def test_success_persists_stack_after_apply(ctx):
     """set_stack ok → second persist call carries vpn_stack; station 2
     mirrors the state once (propagate=False → no second compose)."""
@@ -121,14 +125,15 @@ def test_success_persists_stack_after_apply(ctx):
 
     assert resp["ok"] is True
     assert persisted == [
-        {"quota_per_ip": 12},              # unconditional, stack filtered out
-        {"vpn_stack": "wireguard"},        # only after set_stack succeeded
+        {"quota_per_ip": 12},  # unconditional, stack filtered out
+        {"vpn_stack": "wireguard"},  # only after set_stack succeeded
     ]
     assert s1.set_calls == [{"mode": "wireguard", "propagate": True}]
     assert s2.set_calls == [{"mode": "wireguard", "propagate": False}]
 
 
 # ── no vpn_stack in the body → set_stack never called ──
+
 
 def test_body_without_stack_never_calls_set_stack(ctx):
     fast, s1, s2, pool, persisted = ctx

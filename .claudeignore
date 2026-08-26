@@ -1,0 +1,14 @@
+logs/
+.kilo/
+.venv/
+venv/
+__pycache__/
+.ruff_cache/
+.pytest_cache/
+*.db
+*.db-*
+*.log
+logs/_*
+logs/vpn_state*.json
+logs/shared_rotation.json
+tool_compat_results.json

@@ -18,7 +18,6 @@ import json
 import logging
 import subprocess
 import time
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -34,8 +33,8 @@ class DockerEventWatcher:
         self._managers = dict(managers or {})
         self._enabled = bool(enabled)
         self._stopped = False
-        self._proc: Optional[asyncio.subprocess.Process] = None
-        self._task: Optional[asyncio.Task] = None
+        self._proc: asyncio.subprocess.Process | None = None
+        self._task: asyncio.Task | None = None
         self._events_seen = 0
         self._started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         # Last observed status per watched container ({name: {"status", "time"}})
@@ -95,9 +94,11 @@ class DockerEventWatcher:
             try:
                 proc = await self._spawn()
             except FileNotFoundError:
-                logger.warning("[docker-events] docker CLI not found — "
-                               "real-time VPN events disabled (watchdog "
-                               "falls back to interval pacing)")
+                logger.warning(
+                    "[docker-events] docker CLI not found — "
+                    "real-time VPN events disabled (watchdog "
+                    "falls back to interval pacing)"
+                )
                 return
             except Exception as e:
                 logger.warning("[docker-events] failed to start watcher: %s", e)
@@ -106,6 +107,8 @@ class DockerEventWatcher:
             logger.info("[docker-events] watcher started (docker events)")
             try:
                 while not self._stopped:
+                    if proc.stdout is None:  # pragma: no cover — PIPE toujours fourni
+                        break
                     line = await proc.stdout.readline()
                     if not line:
                         break  # stream ended (daemon restart, CLI killed)
@@ -128,14 +131,17 @@ class DockerEventWatcher:
 
     async def _spawn(self) -> asyncio.subprocess.Process:
         return await asyncio.create_subprocess_exec(
-            "docker", "events",
-            "--type", "container",
-            "--format", "{{json .}}",
+            "docker",
+            "events",
+            "--type",
+            "container",
+            "--format",
+            "{{json .}}",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
             creationflags=(
-                subprocess.CREATE_NO_WINDOW
-                if hasattr(subprocess, "CREATE_NO_WINDOW") else 0),
+                subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
+            ),
         )
 
     # ── Event handling ─────────────────────────────────────────
@@ -167,6 +173,19 @@ class DockerEventWatcher:
             mgr._on_container_event(event)
         except Exception as e:
             logger.debug("[docker-events] station callback failed: %s", e)
+        # [prancy-unicorn Phase1/2] invalidate VPN status cache so the next
+        # /api/vpn-status probe is not served stale for 2 s after a container
+        # event (health, die, start).
+        try:
+            mgr._last_status_refresh_at = 0  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        try:
+            from dashboard.api import _stats_cache as _dac  # type: ignore
+
+            _dac.invalidate("ip_stats")
+        except Exception:
+            pass
         # Real-time dashboard push (coalesced on the SSE side).
         payload = {
             "container": name,
@@ -178,6 +197,7 @@ class DockerEventWatcher:
             payload["health"] = attributes["status"]
         try:
             from dashboard.events import get_event_manager
+
             get_event_manager().publish("vpn_event", payload)
         except Exception as e:
             logger.debug("[docker-events] vpn_event publish failed: %s", e)

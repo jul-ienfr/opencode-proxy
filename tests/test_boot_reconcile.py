@@ -26,14 +26,15 @@ Covered here:
   * rm racing a teardown ("No such container") is not an error
   * no managers → no docker calls at all
 """
+
 import json
 import logging
 import subprocess
 
 import pytest
+from test_vpn_freshness import FakeVPNManager, _cfg
 
 import vpn_manager as vm
-from test_vpn_freshness import FakeVPNManager, _cfg
 
 
 class _DockerStub:
@@ -43,30 +44,30 @@ class _DockerStub:
     inspect / rm from the inventory or the fail flags."""
 
     def __init__(self, fleet, ps_fails=False, inspect="ok"):
-        self.fleet = dict(fleet)        # running containers by name
-        self.calls = []                 # (args, timeout, env) of every call
-        self.removed = []               # names actually rm -f'd
-        self.ps_fails = ps_fails        # True → ps returns rc!=0
-        self.inspect = inspect          # "ok" | "rc" | "bad-json"
+        self.fleet = dict(fleet)  # running containers by name
+        self.calls = []  # (args, timeout, env) of every call
+        self.removed = []  # names actually rm -f'd
+        self.ps_fails = ps_fails  # True → ps returns rc!=0
+        self.inspect = inspect  # "ok" | "rc" | "bad-json"
 
     async def run(self, args, timeout=30, env=None):
         self.calls.append((list(args), timeout, env))
         kind = args[0]
         if kind == "ps":
             if self.ps_fails:
-                return subprocess.CompletedProcess(args, 1, stdout="",
-                                                   stderr="daemon down")
+                return subprocess.CompletedProcess(args, 1, stdout="", stderr="daemon down")
             return subprocess.CompletedProcess(
-                args, 0, stdout="\n".join(self.fleet) + "\n", stderr="")
+                args, 0, stdout="\n".join(self.fleet) + "\n", stderr=""
+            )
         if kind == "inspect":
             if self.inspect == "rc":
-                return subprocess.CompletedProcess(args, 1, stdout="",
-                                                   stderr="not found")
+                return subprocess.CompletedProcess(args, 1, stdout="", stderr="not found")
             name = args[1]
             vpn_type = self.fleet.get(name)
             if vpn_type is None:
-                return subprocess.CompletedProcess(args, 1, stdout="",
-                                                   stderr=f"No such object: {name}")
+                return subprocess.CompletedProcess(
+                    args, 1, stdout="", stderr=f"No such object: {name}"
+                )
             if self.inspect == "bad-json":
                 payload = "not json"
             else:
@@ -74,8 +75,7 @@ class _DockerStub:
                 if vpn_type is not None:
                     env_vars.append(f"VPN_TYPE={vpn_type}")
                 payload = json.dumps([{"Config": {"Env": env_vars}}])
-            return subprocess.CompletedProcess(args, 0, stdout=payload,
-                                               stderr="")
+            return subprocess.CompletedProcess(args, 0, stdout=payload, stderr="")
         if kind == "rm":
             name = args[2]
             if name in self.fleet:
@@ -86,32 +86,39 @@ class _DockerStub:
 
 
 def _managers(tmp_path, n, stack="wireguard"):
-    """n fake managers with the registry names opencode-vpn[,-N]."""
-    managers = [FakeVPNManager(_cfg(tmp_path), station=s, tmp_path=tmp_path)
-                for s in range(1, n + 1)]
+    """n fake managers with the registry names opencode-vpn[,-N].
+
+    [v10 §14.1.1] hermétique : reconcile lit désormais le `.env` PERSISTÉ
+    à côté du compose — on force ce chemin vers le tmp du test pour ne
+    JAMAIS consulter le vrai `.env` du projet (sinon les résultats dépendent
+    de la flotte live de la machine)."""
+    managers = [
+        FakeVPNManager(_cfg(tmp_path), station=s, tmp_path=tmp_path) for s in range(1, n + 1)
+    ]
     for m in managers:
         m._stack_effective = stack
+        m._compose_file_path = lambda: str(tmp_path / "docker-compose.yml")
     return managers
 
 
 # ── orphan containers outside the registry ─────────────────────────
+
 
 @pytest.mark.asyncio
 async def test_orphan_retired_station_removed(tmp_path):
     """A station retired by a downscale that crashed before its `docker
     rm -f`: the name is gone from the registry but still exists in docker →
     removed at boot, before any start()."""
-    stub = _DockerStub({"opencode-vpn": "wireguard",
-                        "opencode-vpn-2": "wireguard",
-                        "opencode-vpn-3": "wireguard"})
-    managers = _managers(tmp_path, 2)          # registry: station 1-2 only
+    stub = _DockerStub(
+        {"opencode-vpn": "wireguard", "opencode-vpn-2": "wireguard", "opencode-vpn-3": "wireguard"}
+    )
+    managers = _managers(tmp_path, 2)  # registry: station 1-2 only
 
     removed = await vm.reconcile_orphan_containers(managers, stub.run)
 
     assert removed == ["opencode-vpn-3"]
     assert stub.removed == ["opencode-vpn-3"]
-    assert stub.fleet == {"opencode-vpn": "wireguard",
-                          "opencode-vpn-2": "wireguard"}
+    assert stub.fleet == {"opencode-vpn": "wireguard", "opencode-vpn-2": "wireguard"}
     # exact argv: ps → inspect → rm, rm WITHOUT -v (named volume survives)
     rms = [c[0] for c in stub.calls if c[0][0] == "rm"]
     assert rms == [["rm", "-f", "opencode-vpn-3"]]
@@ -121,8 +128,7 @@ async def test_orphan_retired_station_removed(tmp_path):
 async def test_keep_station_1_ever_clean(tmp_path):
     """A container named opencode-vpn-10 from a former N=10 deployment is
     pruned; station 1 (legacy name) is never mistaken for an orphan."""
-    stub = _DockerStub({"opencode-vpn": "wireguard",
-                        "opencode-vpn-10": "openvpn"})
+    stub = _DockerStub({"opencode-vpn": "wireguard", "opencode-vpn-10": "openvpn"})
     managers = _managers(tmp_path, 1)
 
     removed = await vm.reconcile_orphan_containers(managers, stub.run)
@@ -133,11 +139,11 @@ async def test_keep_station_1_ever_clean(tmp_path):
 
 # ── expected containers: stack check ───────────────────────────────
 
+
 @pytest.mark.asyncio
 async def test_expected_on_right_stack_untouched(tmp_path):
     """No downscale, no stale env: nothing is removed, only ps + inspects."""
-    stub = _DockerStub({"opencode-vpn": "wireguard",
-                        "opencode-vpn-2": "wireguard"})
+    stub = _DockerStub({"opencode-vpn": "wireguard", "opencode-vpn-2": "wireguard"})
     managers = _managers(tmp_path, 2, stack="wireguard")
 
     removed = await vm.reconcile_orphan_containers(managers, stub.run)
@@ -153,8 +159,9 @@ async def test_expected_on_wrong_stack_removed(tmp_path):
     """The 19/08 survivor: the container runs openvpn but the manager's
     effective stack is wireguard → it is removed so start() recreates it on
     the right stack (no wait for the watchdog flip)."""
-    stub = _DockerStub({"opencode-vpn": "wireguard",
-                        "opencode-vpn-2": "openvpn"})   # stale-boot station 2
+    stub = _DockerStub(
+        {"opencode-vpn": "wireguard", "opencode-vpn-2": "openvpn"}
+    )  # stale-boot station 2
     managers = _managers(tmp_path, 2, stack="wireguard")
 
     removed = await vm.reconcile_orphan_containers(managers, stub.run)
@@ -168,7 +175,7 @@ async def test_expected_on_wrong_stack_removed(tmp_path):
 async def test_expected_unknown_stack_kept(tmp_path):
     """A container with no VPN_TYPE entry (pre-stack-era container) is kept —
     conservative: we cannot prove it is on the wrong stack."""
-    stub = _DockerStub({"opencode-vpn": None})    # absent from Config.Env
+    stub = _DockerStub({"opencode-vpn": None})  # absent from Config.Env
     managers = _managers(tmp_path, 1, stack="wireguard")
 
     removed = await vm.reconcile_orphan_containers(managers, stub.run)
@@ -179,12 +186,23 @@ async def test_expected_unknown_stack_kept(tmp_path):
 
 @pytest.mark.asyncio
 async def test_mixed_fleet_removes_both_kinds(tmp_path):
-    """Orphan + stale-stack expected → both removed in one pass."""
-    stub = _DockerStub({"opencode-vpn": "openvpn",     # stale boot (mgr: WG)
-                        "opencode-vpn-2": "openvpn",   # aligned (mgr: OV)
-                        "opencode-vpn-5": "wireguard"})  # orphan
+    """Orphan + stale-stack expected → both removed in one pass.
+
+    [v10 §14.1.1] la stack attendue vient du `.env` PERSISTÉ par station
+    (écrit à chaque _apply_stack depuis le fix §14.1.9) — le test écrit donc
+    le .env cohérent avec sa flotte : st1=wireguard, st2=openvpn."""
+    stub = _DockerStub(
+        {
+            "opencode-vpn": "openvpn",  # stale boot (mgr: WG)
+            "opencode-vpn-2": "openvpn",  # aligned (mgr: OV)
+            "opencode-vpn-5": "wireguard",
+        }
+    )  # orphan
     managers = _managers(tmp_path, 2, stack="wireguard")
-    managers[1]._stack_effective = "openvpn"   # station 2 effective = OV
+    managers[1]._stack_effective = "openvpn"  # station 2 effective = OV
+    (tmp_path / ".env").write_text(
+        "VPN_TYPE_STATION1=wireguard\nVPN_TYPE_STATION2=openvpn\n", encoding="utf-8"
+    )
 
     removed = await vm.reconcile_orphan_containers(managers, stub.run)
 
@@ -194,6 +212,7 @@ async def test_mixed_fleet_removes_both_kinds(tmp_path):
 
 
 # ── prefix safety / failure modes ──────────────────────────────────
+
 
 @pytest.mark.asyncio
 async def test_prefix_filter_excludes_canary_and_proxy(tmp_path):
@@ -212,8 +231,7 @@ async def test_prefix_filter_excludes_canary_and_proxy(tmp_path):
     assert removed == []
     # assert the FILTER argv itself is anchored on the fleet prefix
     ps_calls = [c[0] for c in stub.calls if c[0][0] == "ps"]
-    assert ps_calls == [["ps", "-a", "--filter", "name=^/opencode-vpn",
-                         "--format", "{{.Names}}"]]
+    assert ps_calls == [["ps", "-a", "--filter", "name=^/opencode-vpn", "--format", "{{.Names}}"]]
 
 
 @pytest.mark.asyncio
@@ -245,23 +263,25 @@ async def test_rm_no_such_container_is_success(tmp_path):
     """rm racing a compose teardown: 'No such container' is not an error —
     the reconcile does not raise and reports the name as removed (it IS
     gone, which is the goal)."""
+
     class _Gone:
         def __init__(self):
             self.removed = []
 
         async def run(self, args, timeout=30, env=None):
             if args[0] == "ps":
-                return subprocess.CompletedProcess(
-                    args, 0, stdout="opencode-vpn-9\n", stderr="")
+                return subprocess.CompletedProcess(args, 0, stdout="opencode-vpn-9\n", stderr="")
             if args[0] == "rm":
                 self.removed.append(args[2])
                 return subprocess.CompletedProcess(
-                    args, 1, stdout="", stderr="Not Found: No such container: x")
+                    args, 1, stdout="", stderr="Not Found: No such container: x"
+                )
             return subprocess.CompletedProcess(args, 0, stdout="{}", stderr="")
+
     stub = _Gone()
     managers = _managers(tmp_path, 1)
     removed = await vm.reconcile_orphan_containers(managers, stub.run)
-    assert removed == ["opencode-vpn-9"]     # gone either way
+    assert removed == ["opencode-vpn-9"]  # gone either way
     assert stub.removed == ["opencode-vpn-9"]
 
 
@@ -291,5 +311,4 @@ async def test_default_runner_uses_docker_cli(tmp_path, monkeypatch):
     assert await vm.reconcile_orphan_containers(managers) == []
     assert recorded and recorded[0][0] == "ps"
     # passthrough kwargs arrive intact (defensive: the lambda shim)
-    assert recorded[0] == ["ps", "-a", "--filter", "name=^/opencode-vpn",
-                           "--format", "{{.Names}}"]
+    assert recorded[0] == ["ps", "-a", "--filter", "name=^/opencode-vpn", "--format", "{{.Names}}"]

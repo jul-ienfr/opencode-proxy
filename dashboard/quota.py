@@ -5,12 +5,12 @@ Fetches subscription quota data (5h rolling, weekly, monthly)
 from the OpenCode Go workspace page by scraping embedded JS objects.
 """
 
-import os
-import re
-import json
-import time
 import asyncio
+import json
 import logging
+import re
+import time
+
 import httpx
 
 from .events import get_event_manager
@@ -27,6 +27,7 @@ def set_on_workspace_recovered_callback(callback):
     global _on_workspace_recovered_callback
     _on_workspace_recovered_callback = callback
 
+
 # Shared HTTP client for quota fetcher (reused across calls, avoids fd leaks)
 _http_client: httpx.AsyncClient | None = None
 
@@ -39,54 +40,50 @@ async def _get_http_client() -> httpx.AsyncClient:
         _http_client = httpx.AsyncClient(timeout=8, follow_redirects=True)
     return _http_client
 
-# ── Env var validation ──
-
-_WORKSPACE_ID_ENV = "OPENCODE_GO_WORKSPACE_ID"
-_AUTH_COOKIE_ENV = "OPENCODE_GO_AUTH_COOKIE"
 
 # ── Per-model capabilities ──
 
 MODEL_CAPABILITIES: dict[str, list[str]] = {
-    "glm-5.1":          ["chat", "tools", "vision"],
-    "glm-5":            ["chat", "tools", "vision"],
-    "kimi-k2.5":        ["chat", "tools", "vision", "code", "web-search"],
-    "kimi-k2.6":        ["chat", "tools", "vision", "code", "web-search"],
-    "deepseek-v4-pro":  ["chat", "tools", "code"],
-    "deepseek-v4-flash":["chat", "tools", "code"],
-    "mimo-v2-pro":      ["chat", "tools"],
-    "mimo-v2-omni":     ["chat", "tools", "vision"],
-    "mimo-v2.5-pro":    ["chat", "tools", "vision"],
-    "mimo-v2.5":        ["chat", "tools", "vision"],
-    "minimax-m2.7":     ["chat", "tools", "vision"],
-    "minimax-m2.5":     ["chat", "tools", "vision"],
-    "qwen3.6-plus":     ["chat", "tools", "vision", "code", "web-search"],
-    "qwen3.5-plus":     ["chat", "tools", "vision", "code", "web-search"],
+    "glm-5.1": ["chat", "tools", "vision"],
+    "glm-5": ["chat", "tools", "vision"],
+    "kimi-k2.5": ["chat", "tools", "vision", "code", "web-search"],
+    "kimi-k2.6": ["chat", "tools", "vision", "code", "web-search"],
+    "deepseek-v4-pro": ["chat", "tools", "code"],
+    "deepseek-v4-flash": ["chat", "tools", "code"],
+    "mimo-v2-pro": ["chat", "tools"],
+    "mimo-v2-omni": ["chat", "tools", "vision"],
+    "mimo-v2.5-pro": ["chat", "tools", "vision"],
+    "mimo-v2.5": ["chat", "tools", "vision"],
+    "minimax-m2.7": ["chat", "tools", "vision"],
+    "minimax-m2.5": ["chat", "tools", "vision"],
+    "qwen3.6-plus": ["chat", "tools", "vision", "code", "web-search"],
+    "qwen3.5-plus": ["chat", "tools", "vision", "code", "web-search"],
     # Free models (OpenCode Zen, no Go subscription required)
-    "big-pickle":               ["chat"],
-    "deepseek-v4-flash-free":   ["chat", "code"],
-    "mimo-v2.5-free":           ["chat", "vision"],
-    "north-mini-code-free":     ["chat", "code"],
-    "nemotron-3-ultra-free":    ["chat"],
+    "big-pickle": ["chat"],
+    "deepseek-v4-flash-free": ["chat", "code"],
+    "mimo-v2.5-free": ["chat", "vision"],
+    "north-mini-code-free": ["chat", "code"],
+    "nemotron-3-ultra-free": ["chat"],
 }
 
 # ── Per-model estimated request limits ──
 # Fetched from docs at startup; fallback if offline.
 
 _MODEL_LIMITS_FALLBACK: dict[str, list[int]] = {
-    "glm-5.1":          [880,   2150,   4300],
-    "glm-5":            [1150,  2880,   5750],
-    "kimi-k2.5":        [1850,  4630,   9250],
-    "kimi-k2.6":        [1150,  2880,   5750],
-    "deepseek-v4-pro":  [3450,  8550,  17150],
-    "deepseek-v4-flash":[31650, 79050, 158150],
-    "mimo-v2-pro":      [1290,  3225,   6450],
-    "mimo-v2-omni":     [2150,  5450,  10900],
-    "mimo-v2.5-pro":    [1290,  3225,   6450],
-    "mimo-v2.5":        [2150,  5450,  10900],
-    "minimax-m2.7":     [3400,  8500,  17000],
-    "minimax-m2.5":     [6300,  15900, 31800],
-    "qwen3.6-plus":     [3300,  8200,  16300],
-    "qwen3.5-plus":     [10200, 25200, 50500],
+    "glm-5.1": [880, 2150, 4300],
+    "glm-5": [1150, 2880, 5750],
+    "kimi-k2.5": [1850, 4630, 9250],
+    "kimi-k2.6": [1150, 2880, 5750],
+    "deepseek-v4-pro": [3450, 8550, 17150],
+    "deepseek-v4-flash": [31650, 79050, 158150],
+    "mimo-v2-pro": [1290, 3225, 6450],
+    "mimo-v2-omni": [2150, 5450, 10900],
+    "mimo-v2.5-pro": [1290, 3225, 6450],
+    "mimo-v2.5": [2150, 5450, 10900],
+    "minimax-m2.7": [3400, 8500, 17000],
+    "minimax-m2.5": [6300, 15900, 31800],
+    "qwen3.6-plus": [3300, 8200, 16300],
+    "qwen3.5-plus": [10200, 25200, 50500],
 }
 
 _model_limits_cache: dict[str, list[int]] | None = None
@@ -99,6 +96,7 @@ def _get_model_limits_lock() -> asyncio.Lock:
         _model_limits_lock = asyncio.Lock()
     return _model_limits_lock
 
+
 DOCS_URL = "https://opencode.ai/docs/fr/go/"
 MODELS_URL = "https://opencode.ai/zen/go/v1/models"
 
@@ -106,7 +104,7 @@ MODELS_URL = "https://opencode.ai/zen/go/v1/models"
 
 _models_cache: list[str] | None = None
 
-API_BASE_OPENAI    = "https://opencode.ai/zen/go/v1/chat/completions"
+API_BASE_OPENAI = "https://opencode.ai/zen/go/v1/chat/completions"
 API_BASE_ANTHROPIC = "https://opencode.ai/zen/go/v1/messages"
 
 
@@ -120,17 +118,27 @@ async def fetch_available_models() -> list[str]:
     # Dédup: reuse fresh free-discovery cache if available
     try:
         import config.settings as _cs
-        lr = _cs._FREE_DISCOVERY_STATE.get("last_refresh") if hasattr(_cs, "_FREE_DISCOVERY_STATE") else None
+
+        lr = (
+            _cs._FREE_DISCOVERY_STATE.get("last_refresh")
+            if hasattr(_cs, "_FREE_DISCOVERY_STATE")
+            else None
+        )
         if lr and getattr(_cs, "FREE_MODELS", None):
             try:
                 import datetime as _dt2
+
                 last = _dt2.datetime.fromisoformat(str(lr))
                 if last.tzinfo is None:
-                    last = last.replace(tzinfo=_dt2.timezone.utc)
-                age = (_dt2.datetime.now(_dt2.timezone.utc) - last).total_seconds()
+                    last = last.replace(tzinfo=_dt2.UTC)
+                age = (_dt2.datetime.now(_dt2.UTC) - last).total_seconds()
                 interval = int(getattr(_cs, "FREE_DISCOVERY_INTERVAL", 3600) or 3600)
                 if 0 <= age < interval:
-                    logger.debug("[quota] reusing fresh FREE_MODELS (age %.0fs < %ds) — skip upstream fetch", age, interval)
+                    logger.debug(
+                        "[quota] reusing fresh FREE_MODELS (age %.0fs < %ds) — skip upstream fetch",
+                        age,
+                        interval,
+                    )
                     # Return union of local MODELS + known free ids (source de vérité)
                     return sorted(set(_cs.MODELS.keys()) | set(_cs.FREE_MODELS))
             except Exception:
@@ -143,7 +151,9 @@ async def fetch_available_models() -> list[str]:
         if resp.status_code != 200:
             raise RuntimeError(f"Models endpoint HTTP {resp.status_code}")
         data = resp.json()
-        ids = sorted(set(m["id"] for m in data.get("data", []) if isinstance(m, dict) and "id" in m))
+        ids = sorted(
+            {m["id"] for m in data.get("data", []) if isinstance(m, dict) and "id" in m}
+        )
         if not ids:
             raise RuntimeError("No models returned from upstream")
         return ids
@@ -155,6 +165,7 @@ async def fetch_available_models() -> list[str]:
 def get_available_models() -> dict:
     """Return merged model info: local config + auto-discovered upstream."""
     from config.settings import MODELS
+
     result = {}
     for mid, cfg in MODELS.items():
         result[mid] = {
@@ -202,16 +213,21 @@ def get_configured_workspaces() -> list[dict]:
     """Return list of API key configs that have workspace_id + auth_cookie."""
     try:
         from config.settings import API_KEYS
+
         return [
-            k for k in API_KEYS
-            if k.get("go_workspace_id") and re.match(r"^wrk_[A-Za-z0-9_-]+$", k["go_workspace_id"])
-               and k.get("go_auth_cookie") and len(k["go_auth_cookie"]) >= 10
+            k
+            for k in API_KEYS
+            if k.get("go_workspace_id")
+            and re.match(r"^wrk_[A-Za-z0-9_-]+$", k["go_workspace_id"])
+            and k.get("go_auth_cookie")
+            and len(k["go_auth_cookie"]) >= 10
         ]
     except (ImportError, AttributeError):
         return []
 
 
 # ── Model limits fetcher ──
+
 
 async def fetch_model_limits() -> dict[str, list[int]]:
     """Fetch per-model request limits from the OpenCode docs page."""
@@ -333,16 +349,12 @@ def get_model_limits_for_all(models: dict) -> dict[str, list[int]]:
 
 _OBJECT_START_PATTERNS = [
     # Order matters: most specific first
-    lambda name: re.compile(rf'{re.escape(name)}\s*:\s*\$R\[\d+\]\s*=\s*\{{'),
+    lambda name: re.compile(rf"{re.escape(name)}\s*:\s*\$R\[\d+\]\s*=\s*\{{"),
     lambda name: re.compile(rf'"{re.escape(name)}"\s*:\s*\{{'),
     lambda name: re.compile(rf"'{re.escape(name)}'\s*:\s*\{{"),
-    lambda name: re.compile(rf'{re.escape(name)}\s*:\s*\{{'),
-    lambda name: re.compile(rf'{re.escape(name)}\s*=\s*\{{'),
+    lambda name: re.compile(rf"{re.escape(name)}\s*:\s*\{{"),
+    lambda name: re.compile(rf"{re.escape(name)}\s*=\s*\{{"),
 ]
-
-
-def _is_string_char(ch: str, quote: str) -> bool:
-    return quote != "" and ch != quote
 
 
 def _read_object_literal(text: str, start_pos: int) -> str:
@@ -425,13 +437,17 @@ def _js_string_to_json(m) -> str:
 def _normalize_js_object(raw: str) -> str:
     """Normalize a loose JS object literal into valid JSON."""
     # Quote unquoted keys: `{foo:` or `,foo:` → `{"foo":`
-    s = re.sub(r'([{,]\s*)([A-Za-z_$][A-Za-z0-9_$]*)(\s*:)', r'\1"\2"\3', raw)
+    s = re.sub(r"([{,]\s*)([A-Za-z_$][A-Za-z0-9_$]*)(\s*:)", r'\1"\2"\3', raw)
     # Single-quoted strings → double-quoted ([27] backslash-safe)
     s = re.sub(r"'((?:\\.|[^'\\])*)'", _js_string_to_json, s)
     # Bare undefined → null (but not inside strings)
-    s = re.sub(r'(?:"(?:[^"\\]|\\.)*")|\bundefined\b', lambda m: m.group(0) if m.group(0).startswith('"') else "null", s)
+    s = re.sub(
+        r'(?:"(?:[^"\\]|\\.)*")|\bundefined\b',
+        lambda m: m.group(0) if m.group(0).startswith('"') else "null",
+        s,
+    )
     # Trailing commas before } or ]
-    s = re.sub(r',\s*([}\]])', r'\1', s)
+    s = re.sub(r",\s*([}\]])", r"\1", s)
     return s
 
 
@@ -517,8 +533,8 @@ async def toggle_use_balance(workspace_id: str, auth_cookie: str, enabled: bool 
 
     Returns True on success, False on failure.
     """
-    from urllib.parse import quote
     import uuid
+    from urllib.parse import quote
 
     client = await _get_http_client()
     instance_id = f"server-fn:{uuid.uuid4().hex[:8]}"
@@ -550,18 +566,34 @@ async def toggle_use_balance(workspace_id: str, auth_cookie: str, enabled: bool 
                 except ValueError:
                     body = None  # non-JSON body (redirect page) — treat as success
                 if body and body.get("error"):
-                    logger.debug("[balance] action %s returned error for workspace %s: %s",
-                                 action_hash[:12], workspace_id[:12], str(body.get("error"))[:200])
+                    logger.debug(
+                        "[balance] action %s returned error for workspace %s: %s",
+                        action_hash[:12],
+                        workspace_id[:12],
+                        str(body.get("error"))[:200],
+                    )
                 else:
-                    logger.info("[balance] toggle useBalance=%s for workspace %s (action %s)",
-                                enabled, workspace_id[:12], action_hash[:12])
+                    logger.info(
+                        "[balance] toggle useBalance=%s for workspace %s (action %s)",
+                        enabled,
+                        workspace_id[:12],
+                        action_hash[:12],
+                    )
                     return True
             else:
-                logger.debug("[balance] action %s returned HTTP %d for workspace %s",
-                             action_hash[:12], resp.status_code, workspace_id[:12])
+                logger.debug(
+                    "[balance] action %s returned HTTP %d for workspace %s",
+                    action_hash[:12],
+                    resp.status_code,
+                    workspace_id[:12],
+                )
         except Exception as e:
-            logger.debug("[balance] action %s failed for workspace %s: %s",
-                         action_hash[:12], workspace_id[:12], e)
+            logger.debug(
+                "[balance] action %s failed for workspace %s: %s",
+                action_hash[:12],
+                workspace_id[:12],
+                e,
+            )
 
     logger.warning("[balance] all toggle actions failed for workspace %s", workspace_id[:12])
     return False
@@ -594,6 +626,7 @@ async def fetch_quotas(workspace_id: str, auth_cookie: str) -> dict:
     backoff ([28]) — auth failures (401/403) and parse errors never retry.
     """
     from urllib.parse import quote
+
     url = f"https://opencode.ai/workspace/{quote(workspace_id, safe='')}/go"
 
     headers = {
@@ -610,16 +643,18 @@ async def fetch_quotas(workspace_id: str, auth_cookie: str) -> dict:
         except Exception as e:
             last_err = e
             if attempt < 2:
-                await asyncio.sleep(1.5 * (2 ** attempt))  # 1.5s, 3s
+                await asyncio.sleep(1.5 * (2**attempt))  # 1.5s, 3s
                 continue
             raise
 
         if resp.status_code in (401, 403):
-            logger.debug("[quota] auth failed for workspace %s (HTTP %d)", workspace_id[:8], resp.status_code)
+            logger.debug(
+                "[quota] auth failed for workspace %s (HTTP %d)", workspace_id[:8], resp.status_code
+            )
             raise RuntimeError("OpenCode Go authentication failed. Refresh your auth cookie.")
         if resp.status_code >= 500 and attempt < 2:
             last_err = RuntimeError(f"OpenCode Go request failed with HTTP {resp.status_code}.")
-            await asyncio.sleep(1.5 * (2 ** attempt))
+            await asyncio.sleep(1.5 * (2**attempt))
             continue
         if resp.status_code != 200:
             raise RuntimeError(f"OpenCode Go request failed with HTTP {resp.status_code}.")
@@ -629,13 +664,14 @@ async def fetch_quotas(workspace_id: str, auth_cookie: str) -> dict:
         except Exception as e:
             last_err = e
             if attempt < 2:
-                await asyncio.sleep(1.5 * (2 ** attempt))
+                await asyncio.sleep(1.5 * (2**attempt))
                 continue
             raise
     raise last_err  # pragma: no cover — loop always returns or raises above
 
 
 # ── API accessor ──
+
 
 async def get_quota_snapshot() -> dict:
     """Return a JSON-serializable snapshot for the API endpoint.
@@ -649,6 +685,7 @@ async def get_quota_snapshot() -> dict:
 
 
 # ── Background poller ──
+
 
 async def start_quota_fetcher(app):
     """Start a background task that polls OpenCode Go quotas every 5 minutes
@@ -666,7 +703,7 @@ async def start_quota_fetcher(app):
         async def _fetch_limits_safe():
             try:
                 return await asyncio.wait_for(fetch_model_limits(), timeout=4.0)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 logger.debug("[quota] docs fetch timeout (4s) — fallback")
                 return None
             except Exception as e:
@@ -676,7 +713,7 @@ async def start_quota_fetcher(app):
         async def _fetch_models_safe():
             try:
                 return await asyncio.wait_for(fetch_available_models(), timeout=4.0)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 logger.debug("[quota] models fetch timeout (4s)")
                 return None
             except Exception as e:
@@ -714,6 +751,7 @@ async def start_quota_fetcher(app):
             pass
 
     async def _poll():
+        global _models_cache
         while True:
             # Periodically refresh upstream model list (every cycle = ~5 min)
             try:
@@ -755,14 +793,18 @@ async def start_quota_fetcher(app):
                             "fetched_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                             "quotas": quotas,
                         }
-                    get_event_manager().publish("quotas_updated", {"workspace_id": wid, "status": "ok"})
+                    get_event_manager().publish(
+                        "quotas_updated", {"workspace_id": wid, "status": "ok"}
+                    )
                     logger.debug("Quotas refreshed for workspace %s", wid[:8])
                     # Notify recovery: unpause API key if it was paused due to 401
                     if was_error and _on_workspace_recovered_callback:
                         try:
                             _on_workspace_recovered_callback(wid)
                         except Exception as cb_err:
-                            logger.debug("Recovery callback error for workspace %s: %s", wid[:8], cb_err)
+                            logger.debug(
+                                "Recovery callback error for workspace %s: %s", wid[:8], cb_err
+                            )
                 except Exception as e:
                     logger.warning("Quota fetch failed for workspace %s: %s", wid[:8], e)
                     async with _cache_lock:
@@ -771,12 +813,14 @@ async def start_quota_fetcher(app):
                             _caches[wid]["error"] = str(e)
                         else:
                             _caches[wid] = _new_cache("error", str(e))
-                    get_event_manager().publish("quotas_updated", {"workspace_id": wid, "status": "error", "error": str(e)})
+                    get_event_manager().publish(
+                        "quotas_updated", {"workspace_id": wid, "status": "error", "error": str(e)}
+                    )
 
             await asyncio.sleep(QUOTA_FETCH_INTERVAL)
 
     # Cancel existing task if called again (double-invocation guard)
-    existing = getattr(app.state, '_quota_task', None)
+    existing = getattr(app.state, "_quota_task", None)
     if existing and not existing.done():
         existing.cancel()
     task = asyncio.create_task(_poll())

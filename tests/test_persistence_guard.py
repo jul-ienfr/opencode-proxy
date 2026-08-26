@@ -22,17 +22,19 @@ IP's key behind (expiry only cleaned lazily on that exact key's next lookup).
 The sweep drops expired entries; the len()>32 guard is now a soft-limit for
 the gap between ticks (expired dropped, live keys untouched).
 """
+
 import json
 import logging
 import time
 from pathlib import Path
 
-import vpn_manager as vm
-import opencode as oc
 from test_vpn_freshness import FakeVPNManager, _cfg
 
+import opencode as oc
+import vpn_manager as vm
 
 # ── §4.1 save_state: last-good .bak + non-fatal failures ─────────
+
 
 def test_save_state_first_save_no_bak(tmp_path):
     """Fresh state file: nothing to back up yet → no .bak sidecar."""
@@ -62,10 +64,10 @@ def test_save_state_bak_holds_last_good(tmp_path):
     mgr.save_state()
 
     assert bak.exists()
-    assert json.loads(bak.read_text())["current_ip"] == "1.2.3.4", \
+    assert json.loads(bak.read_text())["current_ip"] == "1.2.3.4", (
         ".bak holds the previous good snapshot"
-    assert json.loads(p.read_text())["current_ip"] == "5.6.7.8", \
-        "live file holds the newest state"
+    )
+    assert json.loads(p.read_text())["current_ip"] == "5.6.7.8", "live file holds the newest state"
 
 
 def test_save_state_write_failure_preserves_bak(tmp_path, caplog, monkeypatch):
@@ -83,11 +85,12 @@ def test_save_state_write_failure_preserves_bak(tmp_path, caplog, monkeypatch):
     # Fail the atomic replace on the NEXT save — after the .bak copy ran.
     def _boom(src, dst):
         raise OSError(28, "No space left on device")
+
     monkeypatch.setattr(vm.os, "replace", _boom)
 
     with caplog.at_level(logging.DEBUG, logger="vpn_manager"):
         mgr._current_ip = "5.6.7.8"
-        mgr.save_state()          # must NOT raise
+        mgr.save_state()  # must NOT raise
 
     # live file untouched (the replace failed) — still the last committed state
     assert json.loads(p.read_text())["current_ip"] == "1.2.3.4"
@@ -101,11 +104,12 @@ def test_save_state_write_failure_preserves_bak(tmp_path, caplog, monkeypatch):
 
 # ── §4.2 cooldown sweep: bound the (model, IP) map ───────────────
 
+
 def test_sweep_free_cooldowns_removes_expired_only(monkeypatch):
     monkeypatch.setattr(oc, "_free_model_cooldowns", {})
     now = time.monotonic()
-    oc._free_model_cooldowns["expired|1.2.3.4"] = now - 1       # dead
-    oc._free_model_cooldowns["fresh|5.6.7.8"] = now + 3600       # live
+    oc._free_model_cooldowns["expired|1.2.3.4"] = now - 1  # dead
+    oc._free_model_cooldowns["fresh|5.6.7.8"] = now + 3600  # live
 
     n = oc._sweep_free_cooldowns()
 
@@ -119,16 +123,17 @@ def test_set_free_cooldown_soft_limit_sweeps_expired_not_fresh(monkeypatch):
     (the periodic tick is the real bound) and never drops a live key."""
     monkeypatch.setattr(oc, "_free_model_cooldowns", {})
     now = time.monotonic()
-    for i in range(32):                       # 32 expired → map > 32
+    for i in range(32):  # 32 expired → map > 32
         oc._free_model_cooldowns[f"exp|{i}"] = now - 10
     oc._free_model_cooldowns["live|key"] = now + 3600
     assert len(oc._free_model_cooldowns) == 33
 
-    oc._set_free_cooldown("m", 60)            # triggers the soft-limit sweep
+    oc._set_free_cooldown("m", 60)  # triggers the soft-limit sweep
 
     assert "live|key" in oc._free_model_cooldowns, "live key survives the sweep"
-    assert not [k for k in oc._free_model_cooldowns if k.startswith("exp|")], \
+    assert not [k for k in oc._free_model_cooldowns if k.startswith("exp|")], (
         "expired keys dropped (map ≤ 32 again — soft-limit, no forced eviction)"
+    )
     assert oc._free_model_cooldowns["live|key"] > now
 
 

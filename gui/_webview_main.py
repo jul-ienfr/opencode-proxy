@@ -1,15 +1,18 @@
 """Standalone script that opens a pywebview window. Launched as a subprocess."""
+
 import json
 import os
 import sys
 
-STATE_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs", "window_state.json")
+STATE_FILE = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs", "window_state.json"
+)
 
 
 def _load_state():
     """Load saved window state from disk."""
     try:
-        with open(STATE_FILE, "r") as f:
+        with open(STATE_FILE) as f:
             return json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         return None
@@ -49,24 +52,29 @@ if __name__ == "__main__":
         try:
             import webview
 
-            kwargs = dict(
-                width=win_width,
-                height=win_height,
-                min_size=(800, 600),
-                text_select=True,
-                background_color='#1a1a2e',
-            )
+            kwargs = {
+                "width": win_width,
+                "height": win_height,
+                "min_size": (800, 600),
+                "text_select": True,
+                "background_color": "#1a1a2e",
+            }
             if win_x is not None and win_y is not None:
                 kwargs["x"] = win_x
                 kwargs["y"] = win_y
 
             window = webview.create_window(
-                "OpenCode Dashboard", url, **kwargs,
+                "OpenCode Dashboard",
+                url,
+                **kwargs,
             )
+            if window is None:
+                # pywebview n'a pas pu créer la fenêtre (backend indisponible)
+                continue
 
             window.events.closed += lambda: _save_state(window)
 
-            webview.start(gui=gui_backend, debug=debug)
+            webview.start(gui=gui_backend, debug=debug)  # type: ignore[arg-type]
             break  # success, window was shown and closed normally
         except Exception as e:
             print(f"[dashboard] pywebview backend '{gui_backend}' failed: {e}", file=sys.stderr)

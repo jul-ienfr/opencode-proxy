@@ -3,8 +3,8 @@ alors que curl GNU passe. Instance 4001 only — aucun vrai client.
 Teste socks5://127.0.0.1:1080 et http://127.0.0.1:8888, 2 URLs, 2 impersonations.
 Timeout court (12s) pour itérer vite.
 """
+
 import asyncio
-import sys
 import time
 
 from curl_cffi.requests import AsyncSession
@@ -23,7 +23,10 @@ async def attempt(name: str, proxy: str, imp: str, url: str) -> str:
         async with AsyncSession(impersonate=imp, proxy=proxy) as s:
             resp = await s.post(
                 url,
-                json={"model": "deepseek-v4-flash", "messages": [{"role": "user", "content": "hi"}]},
+                json={
+                    "model": "deepseek-v4-flash",
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
                 timeout=12,
             )
         dt = time.monotonic() - t0
@@ -45,7 +48,7 @@ async def main():
                 label = f"{proxy:28s} | {imp or 'none':10s} | {name}"
                 tasks.append((label, asyncio.create_task(attempt(label, proxy, imp, url))))
     results = await asyncio.gather(*[t for _, t in tasks])
-    for (label, _), res in zip(tasks, results):
+    for (label, _), res in zip(tasks, results, strict=False):
         print(f"{label} -> {res}")
 
 

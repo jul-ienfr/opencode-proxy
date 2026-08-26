@@ -1,0 +1,46 @@
+{
+  "fn": "_responses_sse_to_chat_deltas_lines",
+  "input": {
+    "lines": [
+      "{\"type\": \"response.output_text.delta\", \"delta\": \"Hel\"}",
+      "{\"type\": \"response.output_text.delta\", \"delta\": \"lo\"}",
+      "{\"type\": \"response.content_part.delta\", \"delta\": {\"type\": \"reasoning_summary_text\", \"text\": \"hm\"}}",
+      "[DONE]"
+    ]
+  },
+  "expected": [
+    {
+      "choices": [
+        {
+          "delta": {
+            "content": "Hel"
+          },
+          "finish_reason": null
+        }
+      ]
+    },
+    {
+      "choices": [
+        {
+          "delta": {
+            "content": "lo"
+          },
+          "finish_reason": null
+        }
+      ]
+    },
+    {
+      "choices": [
+        {
+          "delta": {
+            "reasoning_content": "hm"
+          },
+          "finish_reason": null
+        }
+      ]
+    },
+    null
+  ],
+  "_note": "contrat streaming /v1/responses — [DONE]/non-parseable -> None",
+  "_generated_by": "scripts/gen_golden_fixtures.py (plan v10 §11.5)"
+}

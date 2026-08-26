@@ -24,12 +24,11 @@ gracefully — the existing len<=1 gate in VPNManager.current_identity
 already pins everyone to profile[0].
 """
 
+import calendar
+import json
+import logging
 import os
 import time
-import json
-import calendar
-import logging
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +39,7 @@ def _now_utc() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
-def _parse_utc(value: str) -> Optional[float]:
+def _parse_utc(value: str) -> float | None:
     """Parse a UTC 'YYYY-mm-ddTHH:MM:SSZ' timestamp into epoch seconds."""
     try:
         return calendar.timegm(time.strptime(value, "%Y-%m-%dT%H:%M:%SZ"))
@@ -66,17 +65,20 @@ class SharedRotationState:
         self._recent_ip_window = max(2, int(cfg.get("recent_ip_window", 20)))
         self._recent_ip_max_age = max(60.0, float(cfg.get("recent_ip_max_age", 1800)))
         file_cfg = cfg.get("shared_rotation_file")
-        self._file = (file_cfg if isinstance(file_cfg, str) and file_cfg.strip()
-                      else os.path.join(ROOT, "logs", "shared_rotation.json"))
+        self._file = (
+            file_cfg
+            if isinstance(file_cfg, str) and file_cfg.strip()
+            else os.path.join(ROOT, "logs", "shared_rotation.json")
+        )
         if not os.path.isabs(self._file):
             self._file = os.path.join(ROOT, self._file)
 
         self._ip_events: list[dict] = []  # [{ip, station, time}]
-        self._cursor: int = 0             # ABSOLUTE monotone identity counter
+        self._cursor: int = 0  # ABSOLUTE monotone identity counter
         self._last_index_by_station: dict[int, int] = {}
-        self._country_cursor: int = 0     # ABSOLUTE monotone country counter
+        self._country_cursor: int = 0  # ABSOLUTE monotone country counter
         self._last_country_by_station: dict[int, int] = {}
-        self._saved_at: Optional[str] = None
+        self._saved_at: str | None = None
         self._load()
 
     # ── Registry access ─────────────────────────────────────────
@@ -102,11 +104,13 @@ class SharedRotationState:
         if not ip:
             return
         self._ip_events = [e for e in self._ip_events if e["ip"] != ip]
-        self._ip_events.append({
-            "ip": ip,
-            "station": int(station),
-            "time": _now_utc(),
-        })
+        self._ip_events.append(
+            {
+                "ip": ip,
+                "station": int(station),
+                "time": _now_utc(),
+            }
+        )
         self._trim()
         self._saved_at = _now_utc()
         self._persist()
@@ -195,8 +199,12 @@ class SharedRotationState:
             return 0
         others = {idx for s, idx in self._last_country_by_station.items() if s != station}
         own = self._last_country_by_station.get(station)
+        # [plan v10 v6 §3.4 Lot 3] offset effectif par station :
+        # offset + stride×(station-1) — sinon 2 stations tirent les mêmes
+        # pays en boucle quand offset est petit. stride=0 → legacy exact.
+        eff = offset + self._country_offset_stride() * (station - 1)
         self._country_cursor += 1
-        idx = (self._country_cursor + offset * (station - 1)) % n
+        idx = (self._country_cursor + eff) % n
         # Pass 1: a country free of every other station's live slot AND
         # different from this station's OWN last country — a new country.
         for _ in range(n):
@@ -217,6 +225,14 @@ class SharedRotationState:
         self._persist()
         return idx
 
+    def _country_offset_stride(self) -> int:
+        """[v6 §3.4] `ip_rotation.country_offset_stride` — écart structurel
+        supplémentaire entre stations (0 = legacy offset×(station-1))."""
+        try:
+            return max(0, int((self._cfg or {}).get("country_offset_stride", 0) or 0))
+        except Exception:
+            return 0
+
     def peek_next_country(self, station: int, offset: int, n: int) -> int:
         """Preview the next country index for ``station`` WITHOUT advancing
         or persisting anything (dashboard 'next country' cell). Mirrors
@@ -229,7 +245,8 @@ class SharedRotationState:
             return 0
         others = {idx for s, idx in self._last_country_by_station.items() if s != station}
         own = self._last_country_by_station.get(station)
-        idx = ((self._country_cursor + 1) + offset * (station - 1)) % n
+        eff = offset + self._country_offset_stride() * (station - 1)
+        idx = ((self._country_cursor + 1) + eff) % n
         for _ in range(n):
             if idx not in others and idx != own:
                 break
@@ -242,6 +259,37 @@ class SharedRotationState:
         return idx
 
     # ── Config hot-reload / status / config ─────────────────────
+
+    def prune_stations(self, max_station: int) -> None:
+        """Drop ghost sids >N after a downscale (P1 melodic-pearl).
+
+        Removes ip_events + last_index/country entries whose station > N so a
+        later upscale does not resurrect stale IPs/identities. Called by
+        FreeIPPool.set_stations() and opencode._apply_station_count().
+        """
+        try:
+            max_station = int(max_station)
+        except (TypeError, ValueError):
+            return
+        if max_station < 1:
+            max_station = 1
+        changed = False
+        before = len(self._ip_events)
+        self._ip_events = [e for e in self._ip_events if int(e.get("station", 0)) <= max_station]
+        if len(self._ip_events) != before:
+            changed = True
+        for key in list(self._last_index_by_station.keys()):
+            if int(key) > max_station:
+                self._last_index_by_station.pop(key, None)
+                changed = True
+        for key in list(self._last_country_by_station.keys()):
+            if int(key) > max_station:
+                self._last_country_by_station.pop(key, None)
+                changed = True
+        if changed:
+            self._saved_at = _now_utc()
+            self._persist()
+            logger.info("[shared-rotation] pruned ghost stations >%d (%d events removed)", max_station, before - len(self._ip_events))
 
     def set_window(self, cfg: dict) -> None:
         """Re-read recent_ip_window/recent_ip_max_age on config change
@@ -294,25 +342,27 @@ class SharedRotationState:
         if not self._ip_events:
             return
         cutoff = time.time() - self._recent_ip_max_age
-        window_new = self._ip_events[-self._recent_ip_window:]
-        window_old = [e for e in self._ip_events[:-self._recent_ip_window]
-                      if _fresh(e, cutoff)]
+        window_new = self._ip_events[-self._recent_ip_window :]
+        window_old = [e for e in self._ip_events[: -self._recent_ip_window] if _fresh(e, cutoff)]
         self._ip_events = window_old + window_new
         if len(self._ip_events) > self._WINDOW_CAP:
-            self._ip_events = self._ip_events[-self._WINDOW_CAP:]
+            self._ip_events = self._ip_events[-self._WINDOW_CAP :]
 
     def _load(self) -> None:
         """Load persisted state from disk (fail-open)."""
         try:
             if not os.path.exists(self._file):
                 return
-            with open(self._file, "r") as f:
+            with open(self._file) as f:
                 state = json.load(f)
             events = state.get("ip_events")
             if isinstance(events, list):
                 self._ip_events = [
-                    {"ip": str(e.get("ip")), "station": int(e.get("station", 0)),
-                     "time": str(e.get("time", ""))}
+                    {
+                        "ip": str(e.get("ip")),
+                        "station": int(e.get("station", 0)),
+                        "time": str(e.get("time", "")),
+                    }
                     for e in events
                     if isinstance(e, dict) and e.get("ip") and e.get("time")
                 ]
@@ -342,8 +392,12 @@ class SharedRotationState:
                         continue
             self._saved_at = state.get("saved_at")
             self._trim()
-            logger.debug("[shared-rotation] state loaded from %s (%d IPs, cursor %d)",
-                         self._file, len(self._ip_events), self._cursor)
+            logger.debug(
+                "[shared-rotation] state loaded from %s (%d IPs, cursor %d)",
+                self._file,
+                len(self._ip_events),
+                self._cursor,
+            )
         except Exception as e:
             logger.debug("[shared-rotation] failed to load state: %s", e)
             self._ip_events = []

@@ -1,0 +1,63 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+extend-exclude = [".kilo/", ".venv/", "logs/", "__pycache__/", ".git/"]
+
+[tool.ruff.lint]
+# [P6] ignore dédoublonné ; E722/B904 RETIRÉS des ignores et corrigés dans
+# le code (bare except → except Exception ; raise ... from e).
+select = ["E", "F", "I", "UP", "B", "C4"]
+ignore = ["E501", "B007", "B905", "B011", "C401", "E741", "B023", "UP031"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["app", "config", "dashboard", "free_discovery", "vpn", "vpn_manager", "free_ip_pool", "shared_rotation", "shared_state", "traffic_capture", "docker_events", "protocol_mapping"]
+known-third-party = ["fastapi", "httpx", "uvicorn", "rich", "yaml", "pydantic"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = false
+warn_unused_configs = true
+ignore_missing_imports = true
+disallow_untyped_defs = false
+check_untyped_defs = false
+no_implicit_optional = false
+strict = false
+exclude = ["\\.kilo/", "\\.venv/", "logs/"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "-q --tb=short"
+# [plan v10 §4 Lot 0 t2] Marqueur pour les tests exigeant un daemon Docker live
+# (chaos tests Lot 2, e2e §13). Gate par défaut : `pytest -k "not docker" -q`.
+markers = [
+    "docker: requires a live Docker daemon — excluded from the default gate via -k 'not docker'",
+]
+
+[tool.coverage.run]
+source = ["."]
+omit = ["tests/*", "scripts/*", "static/*", "__pycache__/*", ".venv/*", ".kilo/*", "logs/*"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+]

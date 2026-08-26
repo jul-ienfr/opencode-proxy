@@ -19,8 +19,38 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install ruff pytest pytest-asyncio httpx
+          pip install ruff pytest pytest-asyncio pytest-cov httpx mypy pip-audit
       - name: Ruff check
-        run: ruff check . --output-format=github || true
-      - name: Tests
-        run: pytest -q --tb=short
+        run: ruff check . --output-format=github
+      - name: Ruff format
+        run: ruff format --check .
+      # [P6] mypy bloquant sur TOUT le code de production (26/08 : rachat
+      # terminé — 0 erreur sur les 15 cibles). Le pas progressif ne couvre
+      # plus que tests/ pour visibilité.
+      - name: Mypy (gate code production)
+        run: >-
+          mypy traffic_capture.py docker_events.py trust.py shared_rotation.py
+          shared_state.py config/__init__.py config/settings.py dashboard/api.py
+          protocol_mapping.py opencode.py vpn_manager.py
+          gui/window.py gui/tray.py gui/__init__.py gui/icon.py gui/_webview_main.py
+          scripts/make_credentials_env.py scripts/bench_perf.py scripts/bench.py
+          --ignore-missing-imports --follow-imports=silent
+      - name: Mypy (progressif, non bloquant)
+        run: mypy . --ignore-missing-imports
+        continue-on-error: true
+      - name: Tests with coverage
+        run: pytest -q --cov --cov-report=term-missing --cov-fail-under=35
+        # Phase1 gate 35% (current 39%), Phase2 → 60, Phase3 → 75
+      - name: pip-audit
+        run: pip-audit --desc --local
+      # [SEC-1 résolu 26/08] historique purgé (filter-repo + rotation) :
+      # gitleaks passe BLOQUANT. Allowlist ciblée dans .gitleaks.toml
+      # (clé locale by-design de config.yaml uniquement).
+      - name: gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: docker compose config
+        run: docker compose config > /dev/null || echo "docker compose config skipped (no docker)"
+      - name: gunicorn check
+        run: gunicorn -c gunicorn.conf.py opencode:app --check-config || echo "gunicorn check skipped"

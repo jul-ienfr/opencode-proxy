@@ -8,12 +8,12 @@ which tools each model accepts and can invoke correctly.
 Usage:
     python tests/test_tool_compat.py [--proxy http://localhost:4000] [--output tool_compat_results.json]
 """
+
+import argparse
 import asyncio
 import json
 import sys
-import time
-import argparse
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 try:
     import httpx
@@ -30,23 +30,18 @@ TOOL_DEFINITIONS = {
         "description": "Read a file from the filesystem.",
         "input_schema": {
             "type": "object",
-            "properties": {
-                "file_path": {"type": "string", "description": "Path to the file"}
-            },
-            "required": ["file_path"]
-        }
+            "properties": {"file_path": {"type": "string", "description": "Path to the file"}},
+            "required": ["file_path"],
+        },
     },
     "Write": {
         "name": "Write",
         "description": "Write content to a file.",
         "input_schema": {
             "type": "object",
-            "properties": {
-                "file_path": {"type": "string"},
-                "content": {"type": "string"}
-            },
-            "required": ["file_path", "content"]
-        }
+            "properties": {"file_path": {"type": "string"}, "content": {"type": "string"}},
+            "required": ["file_path", "content"],
+        },
     },
     "Edit": {
         "name": "Edit",
@@ -56,67 +51,55 @@ TOOL_DEFINITIONS = {
             "properties": {
                 "file_path": {"type": "string"},
                 "old_string": {"type": "string"},
-                "new_string": {"type": "string"}
+                "new_string": {"type": "string"},
             },
-            "required": ["file_path", "old_string", "new_string"]
-        }
+            "required": ["file_path", "old_string", "new_string"],
+        },
     },
     "Bash": {
         "name": "Bash",
         "description": "Execute a bash command.",
         "input_schema": {
             "type": "object",
-            "properties": {
-                "command": {"type": "string", "description": "The command to execute"}
-            },
-            "required": ["command"]
-        }
+            "properties": {"command": {"type": "string", "description": "The command to execute"}},
+            "required": ["command"],
+        },
     },
     "Grep": {
         "name": "Grep",
         "description": "Search for a pattern in files.",
         "input_schema": {
             "type": "object",
-            "properties": {
-                "pattern": {"type": "string"},
-                "path": {"type": "string"}
-            },
-            "required": ["pattern"]
-        }
+            "properties": {"pattern": {"type": "string"}, "path": {"type": "string"}},
+            "required": ["pattern"],
+        },
     },
     "Glob": {
         "name": "Glob",
         "description": "Find files matching a glob pattern.",
         "input_schema": {
             "type": "object",
-            "properties": {
-                "pattern": {"type": "string"}
-            },
-            "required": ["pattern"]
-        }
+            "properties": {"pattern": {"type": "string"}},
+            "required": ["pattern"],
+        },
     },
     "WebSearch": {
         "name": "WebSearch",
         "description": "Search the web.",
         "input_schema": {
             "type": "object",
-            "properties": {
-                "query": {"type": "string"}
-            },
-            "required": ["query"]
-        }
+            "properties": {"query": {"type": "string"}},
+            "required": ["query"],
+        },
     },
     "WebFetch": {
         "name": "WebFetch",
         "description": "Fetch content from a URL.",
         "input_schema": {
             "type": "object",
-            "properties": {
-                "url": {"type": "string"},
-                "prompt": {"type": "string"}
-            },
-            "required": ["url", "prompt"]
-        }
+            "properties": {"url": {"type": "string"}, "prompt": {"type": "string"}},
+            "required": ["url", "prompt"],
+        },
     },
     "TodoWrite": {
         "name": "TodoWrite",
@@ -128,27 +111,24 @@ TOOL_DEFINITIONS = {
                     "type": "array",
                     "items": {
                         "type": "object",
-                        "properties": {
-                            "content": {"type": "string"},
-                            "status": {"type": "string"}
-                        }
-                    }
+                        "properties": {"content": {"type": "string"}, "status": {"type": "string"}},
+                    },
                 }
             },
-            "required": ["todos"]
-        }
+            "required": ["todos"],
+        },
     },
 }
 
 # ── Test prompts per tool ────────────────────────────────────────────
 
 TEST_PROMPTS = {
-    "Read":     "Read the file /etc/hostname",
-    "Write":    "Write 'hello' to /tmp/test_tool_compat.txt",
-    "Edit":     "In /tmp/test_tool_compat.txt, replace 'hello' with 'world'",
-    "Bash":     "Run the command: echo hello",
-    "Grep":     "Search for 'error' in /tmp/test_tool_compat.log",
-    "Glob":     "Find all .py files in /tmp",
+    "Read": "Read the file /etc/hostname",
+    "Write": "Write 'hello' to /tmp/test_tool_compat.txt",
+    "Edit": "In /tmp/test_tool_compat.txt, replace 'hello' with 'world'",
+    "Bash": "Run the command: echo hello",
+    "Grep": "Search for 'error' in /tmp/test_tool_compat.log",
+    "Glob": "Find all .py files in /tmp",
     "WebSearch": "Search for Python documentation online",
     "WebFetch": "Fetch the content of https://example.com",
     "TodoWrite": "Create a todo item: Buy groceries",
@@ -156,12 +136,12 @@ TEST_PROMPTS = {
 
 # Expected keys in tool call arguments
 EXPECTED_KEYS = {
-    "Read":     ["file_path"],
-    "Write":    ["file_path", "content"],
-    "Edit":     ["file_path", "old_string", "new_string"],
-    "Bash":     ["command"],
-    "Grep":     ["pattern"],
-    "Glob":     ["pattern"],
+    "Read": ["file_path"],
+    "Write": ["file_path", "content"],
+    "Edit": ["file_path", "old_string", "new_string"],
+    "Bash": ["command"],
+    "Grep": ["pattern"],
+    "Glob": ["pattern"],
     "WebSearch": ["query"],
     "WebFetch": ["url"],
     "TodoWrite": ["todos"],
@@ -169,16 +149,16 @@ EXPECTED_KEYS = {
 
 # Models to test
 MODELS_TO_TEST = [
-    ("deepseek-v4-pro",  "openai"),
-    ("deepseek-v4-flash","openai"),
-    ("kimi-k2.6",        "openai"),
-    ("glm-5.1",          "openai"),
-    ("mimo-v2.5",        "openai"),
-    ("mimo-v2-pro",      "openai"),
-    ("minimax-m2.5",     "anthropic"),
-    ("minimax-m2.7",     "anthropic"),
-    ("qwen3.5-plus",     "anthropic"),
-    ("qwen3.6-plus",     "anthropic"),
+    ("deepseek-v4-pro", "openai"),
+    ("deepseek-v4-flash", "openai"),
+    ("kimi-k2.6", "openai"),
+    ("glm-5.1", "openai"),
+    ("mimo-v2.5", "openai"),
+    ("mimo-v2-pro", "openai"),
+    ("minimax-m2.5", "anthropic"),
+    ("minimax-m2.7", "anthropic"),
+    ("qwen3.5-plus", "anthropic"),
+    ("qwen3.6-plus", "anthropic"),
 ]
 
 
@@ -196,9 +176,7 @@ class ToolCompatibilityTester:
             "model": model,
             "max_tokens": 1024,
             "tools": tools,
-            "messages": [
-                {"role": "user", "content": prompt}
-            ],
+            "messages": [{"role": "user", "content": prompt}],
         }
         try:
             resp = await self.client.post(
@@ -210,7 +188,10 @@ class ToolCompatibilityTester:
                     "anthropic-version": "2023-06-01",
                 },
             )
-            return {"status": resp.status_code, "body": resp.json() if resp.status_code == 200 else {"error": resp.text[:500]}}
+            return {
+                "status": resp.status_code,
+                "body": resp.json() if resp.status_code == 200 else {"error": resp.text[:500]},
+            }
         except httpx.TimeoutException:
             return {"status": 408, "body": {"error": "timeout"}}
         except Exception as e:
@@ -235,7 +216,11 @@ class ToolCompatibilityTester:
                     expected = EXPECTED_KEYS.get(tool_name, [])
                     missing = [k for k in expected if k not in args]
                     if missing:
-                        return {"called": True, "args_valid": False, "error": f"missing keys: {missing}"}
+                        return {
+                            "called": True,
+                            "args_valid": False,
+                            "error": f"missing keys: {missing}",
+                        }
                     return {"called": True, "args_valid": True, "error": None}
                 except Exception as e:
                     return {"called": True, "args_valid": False, "error": str(e)}
@@ -246,7 +231,11 @@ class ToolCompatibilityTester:
             # There might be tool_use blocks we didn't match by name
             for block in content:
                 if isinstance(block, dict) and block.get("type") == "tool_use":
-                    return {"called": True, "args_valid": None, "error": f"tool called but name mismatch: got '{block.get('name')}' expected '{tool_name}'"}
+                    return {
+                        "called": True,
+                        "args_valid": None,
+                        "error": f"tool called but name mismatch: got '{block.get('name')}' expected '{tool_name}'",
+                    }
 
         return {"called": False, "args_valid": None, "error": "No tool_use block found in response"}
 
@@ -255,7 +244,13 @@ class ToolCompatibilityTester:
         tool_def = TOOL_DEFINITIONS.get(tool_name)
         prompt = TEST_PROMPTS.get(tool_name)
         if not tool_def or not prompt:
-            return {"tool": tool_name, "accepted": False, "called": False, "args_valid": None, "error": "Unknown tool"}
+            return {
+                "tool": tool_name,
+                "accepted": False,
+                "called": False,
+                "args_valid": None,
+                "error": "Unknown tool",
+            }
 
         result = await self._send_request(model, [tool_def], prompt)
 
@@ -293,10 +288,12 @@ class ToolCompatibilityTester:
         tool_names = tools or list(TOOL_DEFINITIONS.keys())
         results = []
         for i, tool_name in enumerate(tool_names):
-            print(f"    [{i+1}/{len(tool_names)}] Testing {tool_name}...", end=" ", flush=True)
+            print(f"    [{i + 1}/{len(tool_names)}] Testing {tool_name}...", end=" ", flush=True)
             result = await self.test_single_tool(model, tool_name)
             status = "OK" if result["called"] else ("PARTIAL" if result["accepted"] else "FAIL")
-            print(f"{status} (accepted={result['accepted']}, called={result['called']}, args={result['args_valid']})")
+            print(
+                f"{status} (accepted={result['accepted']}, called={result['called']}, args={result['args_valid']})"
+            )
             if result.get("error"):
                 print(f"         error: {result['error'][:100]}")
             results.append(result)
@@ -304,19 +301,23 @@ class ToolCompatibilityTester:
                 await asyncio.sleep(self.delay)
         return {"model": model, "results": results}
 
-    async def run_all(self, models: list[tuple[str, str]] | None = None, output_path: str = "tool_compat_results.json") -> dict:
+    async def run_all(
+        self,
+        models: list[tuple[str, str]] | None = None,
+        output_path: str = "tool_compat_results.json",
+    ) -> dict:
         """Run tests for all models and save results."""
         models = models or MODELS_TO_TEST
         all_results = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": datetime.now(UTC).isoformat(),
             "proxy": self.proxy_base,
             "models": {},
         }
 
         for model, protocol in models:
-            print(f"\n{'='*60}")
+            print(f"\n{'=' * 60}")
             print(f"Testing model: {model} (protocol: {protocol})")
-            print(f"{'='*60}")
+            print(f"{'=' * 60}")
             try:
                 result = await self.test_model(model)
                 all_results["models"][model] = {
@@ -335,7 +336,7 @@ class ToolCompatibilityTester:
         # Save results
         with open(output_path, "w", encoding="utf-8") as f:
             json.dump(all_results, f, indent=2, ensure_ascii=False)
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print(f"Results saved to {output_path}")
 
         # Print summary
@@ -344,9 +345,9 @@ class ToolCompatibilityTester:
 
     def _print_summary(self, results: dict):
         """Print a summary matrix."""
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print("SUMMARY: Tool Compatibility Matrix")
-        print(f"{'='*60}")
+        print(f"{'=' * 60}")
 
         # Collect all tool names
         all_tools = set()
@@ -379,7 +380,9 @@ class ToolCompatibilityTester:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Test tool compatibility across models via opencode-proxy")
+    parser = argparse.ArgumentParser(
+        description="Test tool compatibility across models via opencode-proxy"
+    )
     parser.add_argument("--proxy", default="http://localhost:4000", help="Proxy base URL")
     parser.add_argument("--output", default="tool_compat_results.json", help="Output file path")
     parser.add_argument("--delay", type=float, default=1.0, help="Delay between requests (seconds)")

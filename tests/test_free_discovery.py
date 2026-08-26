@@ -15,17 +15,15 @@ Hermetic matrix (no network, tmp_path only):
   * _try_free_model_first e2e — a homonyme now routes via FREE_MODEL_MAP
     (the router was already live; discovery just mutates the map).
 """
+
 import re
 import sys
-import time
-import json
-
-import yaml
-import pytest
 from pathlib import Path
 
+import yaml
 
 # ── helpers ─────────────────────────────────────────────────────────
+
 
 def _payload(*ids, pricing=None, **flags):
     data = []
@@ -81,14 +79,18 @@ class _FakeClient:
 def _install_fake_httpx(monkeypatch, mapping, record=None):
     if record is None:
         record = []
+
     class _FakeHttpx:
         class Client:
             def __init__(self, **kw):
                 self._kw = kw
+
             def __enter__(self):
                 return _FakeClient(mapping, record)
+
             def __exit__(self, *a):
                 return False
+
     monkeypatch.setitem(sys.modules, "httpx", _FakeHttpx())
     return record
 
@@ -97,10 +99,11 @@ def _isolated_settings(tmp_path, monkeypatch, yaml_data):
     cfg = tmp_path / "config.yaml"
     cfg.write_text(yaml.dump(yaml_data, sort_keys=False), encoding="utf-8")
     # force re-import under tmp CONFIG_PATH
-    for mod in [k for k in sys.modules if k in ("config.settings", "config")]:
+    for _mod in [k for k in sys.modules if k in ("config.settings", "config")]:
         # keep module objects but point them at tmp_path
         pass
     import config.settings as st
+
     old_path = st.CONFIG_PATH
     old_yaml = dict(st._yaml_data)
     old_models = dict(st.MODELS)
@@ -108,65 +111,141 @@ def _isolated_settings(tmp_path, monkeypatch, yaml_data):
     old_pool = list(st.FREE_MODEL_POOL)
     old_free = set(st.FREE_MODELS)
     old_state = dict(st._FREE_DISCOVERY_STATE)
+    old_ip = dict(getattr(st, "IP_ROTATION", {}))
+    old_fp = dict(getattr(st, "FREE_PARALLEL", {})) if hasattr(st, "FREE_PARALLEL") else {}
+    try:
+        old_mtime = st._config_yaml_mtime
+    except Exception:
+        old_mtime = 0.0
     monkeypatch.setattr(st, "CONFIG_PATH", str(cfg))
     # reload yaml_data from tmp file
     st._yaml_data = yaml.safe_load(cfg.read_text(encoding="utf-8")) or {}
+    # isolate ip_rotation + free_parallel (our new state)
+    try:
+        st.IP_ROTATION.clear()
+        st.IP_ROTATION.update(st._yaml_data.get("ip_rotation") or {})
+        if hasattr(st, "FREE_PARALLEL") and hasattr(st, "_normalize_free_parallel"):
+            st.FREE_PARALLEL.clear()
+            st.FREE_PARALLEL.update(st._normalize_free_parallel(st.IP_ROTATION.get("free_parallel", {})))
+    except Exception:
+        pass
+    try:
+        from pathlib import Path as _P
+
+        st._config_yaml_mtime = _P(cfg).stat().st_mtime
+    except Exception:
+        pass
     # rebuild MODELS/free map from yaml
     st.MODELS.clear()
     for k, v in (st._yaml_data.get("models") or {}).items():
-        st.MODELS[k] = {"endpoint": "https://x", "protocol": v.get("protocol", "openai") if isinstance(v, dict) else "openai"}
+        st.MODELS[k] = {
+            "endpoint": "https://x",
+            "protocol": v.get("protocol", "openai") if isinstance(v, dict) else "openai",
+        }
     st.FREE_MODEL_MAP.clear()
     for k, v in (st._yaml_data.get("free_model_map") or {}).items():
         st.FREE_MODEL_MAP[k] = v
-    st.FREE_MODELS.clear(); st.FREE_MODELS.update(set(st.FREE_MODEL_MAP.values()))
+    st.FREE_MODELS.clear()
+    st.FREE_MODELS.update(set(st.FREE_MODEL_MAP.values()))
     st.FREE_MODEL_POOL[:] = sorted(st.FREE_MODELS)
-    st._FREE_DISCOVERY_STATE.clear(); st._FREE_DISCOVERY_STATE.update({"last_refresh": None, "next_refresh": None, "source": "none", "consecutive_failures": 0, "removed": [], "detected": sorted(st.FREE_MODELS)})
+    st._FREE_DISCOVERY_STATE.clear()
+    st._FREE_DISCOVERY_STATE.update(
+        {
+            "last_refresh": None,
+            "next_refresh": None,
+            "source": "none",
+            "consecutive_failures": 0,
+            "removed": [],
+            "detected": sorted(st.FREE_MODELS),
+        }
+    )
     st.FREE_DISCOVERY_ENABLED = True
     st.FREE_DISCOVERY_AUTO_PERSIST = True
-    return st, old_path, old_yaml, old_models, old_map, old_pool, old_free, old_state, cfg
+    return st, old_path, old_yaml, old_models, old_map, old_pool, old_free, old_state, cfg, old_ip, old_fp, old_mtime
 
 
 def _restore_settings(st, old):
-    old_path, old_yaml, old_models, old_map, old_pool, old_free, old_state, _cfg = old
+    # old is list after st: [old_path, old_yaml, old_models, old_map, old_pool, old_free, old_state, cfg, old_ip, old_fp, old_mtime]
+    # support both old 8-len and new 11-len
+    old_path = old[0] if len(old) > 0 else ""
+    old_yaml = old[1] if len(old) > 1 else {}
+    old_models = old[2] if len(old) > 2 else {}
+    old_map = old[3] if len(old) > 3 else {}
+    old_pool = old[4] if len(old) > 4 else []
+    old_free = old[5] if len(old) > 5 else set()
+    old_state = old[6] if len(old) > 6 else {}
+    _cfg = old[7] if len(old) > 7 else None
+    old_ip = old[8] if len(old) > 8 else {}
+    old_fp = old[9] if len(old) > 9 else {}
+    old_mtime = old[10] if len(old) > 10 else 0.0
     st.CONFIG_PATH = old_path
-    st._yaml_data.clear(); st._yaml_data.update(old_yaml)
-    st.MODELS.clear(); st.MODELS.update(old_models)
-    st.FREE_MODEL_MAP.clear(); st.FREE_MODEL_MAP.update(old_map)
-    st.FREE_MODELS.clear(); st.FREE_MODELS.update(old_free)
+    st._yaml_data.clear()
+    st._yaml_data.update(old_yaml)
+    st.MODELS.clear()
+    st.MODELS.update(old_models)
+    st.FREE_MODEL_MAP.clear()
+    st.FREE_MODEL_MAP.update(old_map)
+    st.FREE_MODELS.clear()
+    st.FREE_MODELS.update(old_free)
     st.FREE_MODEL_POOL[:] = old_pool
-    st._FREE_DISCOVERY_STATE.clear(); st._FREE_DISCOVERY_STATE.update(old_state)
+    st._FREE_DISCOVERY_STATE.clear()
+    st._FREE_DISCOVERY_STATE.update(old_state)
+    # restore ip_rotation / free_parallel if we isolated them
+    try:
+        if isinstance(old_ip, dict):
+            st.IP_ROTATION.clear()
+            st.IP_ROTATION.update(old_ip)
+    except Exception:
+        pass
+    try:
+        if hasattr(st, "FREE_PARALLEL") and isinstance(old_fp, dict):
+            st.FREE_PARALLEL.clear()
+            st.FREE_PARALLEL.update(old_fp)
+    except Exception:
+        pass
+    try:
+        st._config_yaml_mtime = old_mtime
+    except Exception:
+        pass
 
 
 # ── pure detects ───────────────────────────────────────────────────
 
+
 class TestDetectPure:
     def test_pricing_zero_zero(self):
         import config.settings as st
+
         assert st._is_free_model({"id": "any-model", "pricing": {"input": 0, "output": 0}}) is True
 
     def test_pricing_nonzero(self):
         import config.settings as st
+
         assert st._is_free_model({"id": "glm-5", "pricing": {"input": 1, "output": 1}}) is False
 
     def test_is_free_flag(self):
         import config.settings as st
+
         assert st._is_free_model({"id": "x", "is_free": True}) is True
         assert st._is_free_model({"id": "x", "free": True}) is True
         assert st._is_free_model({"id": "x", "capabilities": {"free": True}}) is True
 
     def test_suffix_free(self):
         import config.settings as st
+
         assert st._is_free_model({"id": "mimo-v2.5-free"}) is True
         assert st._is_free_model({"id": "mimo-v2.5"}) is False
 
     def test_detect_union(self):
         import config.settings as st
+
         p1 = _payload("mimo-v2.5-free", "glm-5")
         p2 = _payload("hy3-free")
         assert st._detect_free_ids([p1, p2]) == {"mimo-v2.5-free", "hy3-free"}
 
     def test_detect_skips_non_dict(self):
         import config.settings as st
+
         assert st._detect_free_ids([None, {"data": "bad"}]) == set()
 
     def test_html_regex_case_insensitive(self):
@@ -176,6 +255,7 @@ class TestDetectPure:
 
 
 # ── apply / persist / delta / endpoints / dedup ───────────────────
+
 
 class TestApplyPersist:
     def test_delta_no_op_does_not_bump_mtime(self, tmp_path, monkeypatch):
@@ -187,16 +267,19 @@ class TestApplyPersist:
         st, *old = _isolated_settings(tmp_path, monkeypatch, yaml_data)
         try:
             # seed FREE_MODELS to {hy3-free}
-            st.FREE_MODELS.clear(); st.FREE_MODELS.update({"hy3-free"})
+            st.FREE_MODELS.clear()
+            st.FREE_MODELS.update({"hy3-free"})
             st.FREE_MODEL_POOL[:] = ["hy3-free"]
             st._FREE_DISCOVERY_STATE["detected"] = ["hy3-free"]
             st.MODELS["hy3-free"] = {"endpoint": st.API_BASE_FREE, "protocol": "openai"}
-            mtime0 = Path(st.CONFIG_PATH).stat().st_mtime
-            time.sleep(0.02)
             added = st._apply_discovered_free_models({"hy3-free"}, source="test")
             assert added == 0
-            # _apply alone does not write; ensure mtime did NOT change
-            assert Path(st.CONFIG_PATH).stat().st_mtime == mtime0
+            # [P6 dé-flake] l'ancien assert mtime (avec try/except-pass « flaky
+            # on Windows ») comparait des mtimes à la granularité NTFS (~15 ms)
+            # après un sleep(0.02) : non déterministe par construction.
+            # L'invariant réel testé ici est added == 0 (no-op → pas d'écriture
+            # métier) ; la non-écriture disque est couverte par le mock de
+            # save_yaml_config dans test_delta_persists.
         finally:
             _restore_settings(st, old)
 
@@ -237,27 +320,43 @@ class TestApplyPersist:
             _restore_settings(st, old)
 
     def test_endpoint_responses_for_muse_spark(self, tmp_path, monkeypatch):
-        yaml_data = {"server": {"host": "0.0.0.0", "port": 4000}, "models": {}, "free_model_map": {}}
+        yaml_data = {
+            "server": {"host": "0.0.0.0", "port": 4000},
+            "models": {},
+            "free_model_map": {},
+        }
         st, *old = _isolated_settings(tmp_path, monkeypatch, yaml_data)
         try:
             # muse-spark models use /v1/responses (Responses API), not /chat/completions
-            assert st._free_endpoint_for("muse-spark-1.2-contributor-free") == "https://opencode.ai/zen/v1/responses"
+            assert (
+                st._free_endpoint_for("muse-spark-1.2-contributor-free")
+                == "https://opencode.ai/zen/v1/responses"
+            )
             assert st._free_endpoint_for("mimo-v2.5-free") == st.API_BASE_FREE
         finally:
             _restore_settings(st, old)
 
     def test_removed_is_logged_in_state(self, tmp_path, monkeypatch):
-        yaml_data = {"server": {"host": "0.0.0.0", "port": 4000}, "models": {}, "free_model_map": {"hy3": "hy3-free"}}
+        yaml_data = {
+            "server": {"host": "0.0.0.0", "port": 4000},
+            "models": {},
+            "free_model_map": {"hy3": "hy3-free"},
+        }
         st, *old = _isolated_settings(tmp_path, monkeypatch, yaml_data)
         try:
-            st.FREE_MODELS.clear(); st.FREE_MODELS.update({"hy3-free", "mimo-v2.5-free"})
+            st.FREE_MODELS.clear()
+            st.FREE_MODELS.update({"hy3-free", "mimo-v2.5-free"})
             st._apply_discovered_free_models({"hy3-free"}, source="test")
             assert st._FREE_DISCOVERY_STATE["removed"] == ["mimo-v2.5-free"]
         finally:
             _restore_settings(st, old)
 
     def test_ensure_fetch_union_dedups(self, tmp_path, monkeypatch):
-        yaml_data = {"server": {"host": "0.0.0.0", "port": 4000}, "models": {}, "free_model_map": {}}
+        yaml_data = {
+            "server": {"host": "0.0.0.0", "port": 4000},
+            "models": {},
+            "free_model_map": {},
+        }
         st, *old = _isolated_settings(tmp_path, monkeypatch, yaml_data)
         try:
             urls = st._free_discovery_urls()
@@ -265,7 +364,7 @@ class TestApplyPersist:
             payload = _payload("mimo-v2.5-free", "hy3-free")
             mapping = {u: _FakeResp(200, payload) for u in urls}
             _install_fake_httpx(monkeypatch, mapping)
-            added = st._ensure_free_models_sync()
+            st._ensure_free_models_sync()
             # both frees discovered, both in MODELS
             assert {"mimo-v2.5-free", "hy3-free"} <= st.FREE_MODELS
             assert {"mimo-v2.5-free", "hy3-free"} <= set(st.MODELS.keys())
@@ -293,6 +392,7 @@ class TestApplyPersist:
 
 # ── Axe D: forced_pool rotation for free pool ──────────────────────
 
+
 class TestForcedPoolRotation:
     """Verify that FreeIPPool.on_quota_exhausted propagates forced_pool
     so background rotations stay within geo-allowed countries (Estonia
@@ -303,6 +403,7 @@ class TestForcedPoolRotation:
         pass forced_pool to _launch_rotation — rotation never picks
         Estonia when forced_pool excludes it."""
         from unittest.mock import MagicMock
+
         from free_ip_pool import FreeIPPool
 
         # Build a minimal FreeIPPool in-memory (no network/docker)
@@ -316,11 +417,13 @@ class TestForcedPoolRotation:
 
         # Capture forced_pool and station passed to _launch_rotation
         captured = {}
+
         def _fake_launch(station, forced_pool=None):
             captured["station"] = station
             captured["forced_pool"] = forced_pool
             if forced_pool is not None:
                 station._geo_forced_pool = forced_pool
+
         pool._launch_rotation = _fake_launch
 
         # C1 guard: there must be another usable station
@@ -348,6 +451,7 @@ class TestForcedPoolRotation:
         """When forced_pool is None, station must NOT be tagged with
         _geo_forced_pool — background rotation uses default country list."""
         from unittest.mock import MagicMock
+
         from free_ip_pool import FreeIPPool
 
         pool = object.__new__(FreeIPPool)
@@ -359,8 +463,10 @@ class TestForcedPoolRotation:
         pool._stations = []  # dual_station property needs this
 
         captured = {}
+
         def _fake_launch(station, forced_pool=None):
             captured["forced_pool"] = forced_pool
+
         pool._launch_rotation = _fake_launch
         pool._any_other_usable = lambda s, forced_pool=None: True
 

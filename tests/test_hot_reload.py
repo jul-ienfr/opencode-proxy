@@ -9,6 +9,7 @@ scripts/hot_reload_check.py (run it manually against a live instance).
 
 These tests exercise the same reload machinery against a tmp file.
 """
+
 import json
 
 import pytest
@@ -24,21 +25,27 @@ def isolated_routes(tmp_path, monkeypatch):
     monkeypatch.setattr(_cfg, "CUSTOM_ROUTES_PATH", str(routes_file))
     # load_custom_routes() prefers the YAML config — bypass it so the JSON
     # file is actually read.
-    monkeypatch.setattr(_cfg, "yaml_get",
-                        lambda section, key=None, default=None: default)
+    monkeypatch.setattr(_cfg, "yaml_get", lambda section, key=None, default=None: default)
     # Reset the hot-reload bookkeeping so every test starts fresh.
     monkeypatch.setattr(_cfg, "_custom_routes_mtime", 0.0)
     monkeypatch.setattr(_cfg, "_custom_routes_last_check", 0.0)
     # Isolate the route dicts from whatever earlier modules left behind.
     monkeypatch.setattr(_cfg, "CUSTOM_ROUTES", {})
     monkeypatch.setattr(_cfg, "ROUTES", {})
-    return routes_file
+    # The code under test reassigns the SORTED_* globals (plain `global`
+    # rebinding — not restorable by monkeypatch); snapshot them explicitly,
+    # otherwise later tests find empty sorted-route tables.
+    saved_sorted = (_cfg.SORTED_ROUTES, _cfg.SORTED_CUSTOM_ROUTES)
+    try:
+        yield routes_file
+    finally:
+        _cfg.SORTED_ROUTES, _cfg.SORTED_CUSTOM_ROUTES = saved_sorted
 
 
 def test_reload_picks_up_new_routes(isolated_routes):
-    isolated_routes.write_text(json.dumps(
-        {"kimi": {"match": ["kimi-k2.6"], "model": "glm-5.1"}}),
-        encoding="utf-8")
+    isolated_routes.write_text(
+        json.dumps({"kimi": {"match": ["kimi-k2.6"], "model": "glm-5.1"}}), encoding="utf-8"
+    )
     _cfg.maybe_reload_custom_routes()
     assert _cfg.ROUTES.get("kimi", {}).get("model") == "glm-5.1"
     assert _cfg.CUSTOM_ROUTES.get("kimi", {}).get("match") == ["kimi-k2.6"]
@@ -46,8 +53,7 @@ def test_reload_picks_up_new_routes(isolated_routes):
 
 def test_reload_removes_deleted_routes(isolated_routes, monkeypatch):
     monkeypatch.setattr(_cfg, "_CUSTOM_ROUTES_CHECK_INTERVAL", 0.0)
-    isolated_routes.write_text(json.dumps(
-        {"a": {"match": ["a"], "model": "m1"}}), encoding="utf-8")
+    isolated_routes.write_text(json.dumps({"a": {"match": ["a"], "model": "m1"}}), encoding="utf-8")
     _cfg.maybe_reload_custom_routes()
     assert "a" in _cfg.ROUTES
     assert "a" in _cfg.CUSTOM_ROUTES
@@ -62,9 +68,9 @@ def test_reload_removes_deleted_routes(isolated_routes, monkeypatch):
 
 def test_reload_rate_limited(isolated_routes, monkeypatch):
     _cfg.maybe_reload_custom_routes()  # arms the 5 s rate limit
-    isolated_routes.write_text(json.dumps(
-        {"kimi": {"match": ["kimi-k2.6"], "model": "glm-5.1"}}),
-        encoding="utf-8")
+    isolated_routes.write_text(
+        json.dumps({"kimi": {"match": ["kimi-k2.6"], "model": "glm-5.1"}}), encoding="utf-8"
+    )
     # Force mtime and last_check to be older (NTFS may coalesce, and rate limit would block)
     monkeypatch.setattr(_cfg, "_custom_routes_mtime", 0.0)
     monkeypatch.setattr(_cfg, "_custom_routes_last_check", 0.0)
@@ -81,3 +87,176 @@ def test_reload_unchanged_mtime_is_noop(isolated_routes, monkeypatch):
     _cfg.maybe_reload_custom_routes()  # same mtime → no-op
     assert _cfg.ROUTES == before
     assert _cfg.CUSTOM_ROUTES == {}
+
+
+# ── Tests audit 2026-08-25 (fixes B1/B2 + ROUTE_VERSION) ─────────────
+
+
+@pytest.fixture
+def isolated_yaml(tmp_path, monkeypatch):
+    """Point CONFIG_PATH at a tmp YAML with an empty custom_routes section.
+
+    The tmp document is a copy of the live ``_yaml_data`` (custom_routes
+    emptied) rather than a bare ``custom_routes: {}``: the tests below call
+    ``_route_for()`` → ``maybe_reload_custom_routes()``, whose cfg_changed
+    branch re-applies every yaml-driven global in place (GO_ONLY_IDS,
+    IP_ROTATION, GEO_*, WEB_SEARCH_NATIVE_MODELS…). A minimal document would
+    wipe them process-wide and poison later tests (order-dependent failures).
+    """
+    import copy as _copy
+
+    import yaml as _yaml
+
+    base = _copy.deepcopy(dict(_cfg._yaml_data)) if getattr(_cfg, "_yaml_data", None) else {}
+    base["custom_routes"] = {}
+    yaml_file = tmp_path / "config.yaml"
+    yaml_file.write_text(_yaml.safe_dump(base), encoding="utf-8")
+    monkeypatch.setattr(_cfg, "CONFIG_PATH", str(yaml_file))
+    monkeypatch.setattr(_cfg, "_config_yaml_mtime", 0.0)
+    monkeypatch.setattr(_cfg, "_custom_routes_mtime", 0.0)
+    monkeypatch.setattr(_cfg, "_custom_routes_last_check", 0.0)
+    # Isolate in-memory state: fresh dicts (identity preserved for reload).
+    monkeypatch.setattr(_cfg, "CUSTOM_ROUTES", {})
+    monkeypatch.setattr(_cfg, "ROUTES", {})
+    # Belt-and-braces: globals mutated IN PLACE by the code under test —
+    # monkeypatch can't restore those, snapshot them around the test.
+    # GO_ONLY_IDS: wiped/rebuilt by the reload's go_only_ids branch.
+    # _yaml_data: save_custom_routes() writes routes straight into it.
+    saved_goi = set(_cfg.GO_ONLY_IDS)
+    saved_yaml = dict(_cfg._yaml_data)
+    saved_sorted = (_cfg.SORTED_ROUTES, _cfg.SORTED_CUSTOM_ROUTES)
+    try:
+        yield yaml_file
+    finally:
+        _cfg.GO_ONLY_IDS.clear()
+        _cfg.GO_ONLY_IDS.update(saved_goi)
+        _cfg._yaml_data.clear()
+        _cfg._yaml_data.update(saved_yaml)
+        _cfg.SORTED_ROUTES, _cfg.SORTED_CUSTOM_ROUTES = saved_sorted
+
+
+def test_save_custom_routes_total_replacement_no_resurrection(isolated_yaml):
+    """[B2] Une route supprimée côté GUI ne doit PAS ressusciter dans le YAML."""
+    _cfg.save_custom_routes(
+        {
+            "a": {"match": ["model-a"], "model": "mimo-v2.5-free"},
+            "b": {"match": ["model-b"], "model": "glm-5.1"},
+        }
+    )
+    import yaml as _yaml
+
+    with open(isolated_yaml, encoding="utf-8") as f:
+        on_disk = _yaml.safe_load(f)
+    assert set(on_disk["custom_routes"]) == {"a", "b"}
+
+    # Le GUI renvoie l'état complet SANS la route b → b doit disparaître du disque.
+    _cfg.save_custom_routes({"a": {"match": ["model-a"], "model": "mimo-v2.5-free"}})
+    with open(isolated_yaml, encoding="utf-8") as f:
+        on_disk = _yaml.safe_load(f)
+    assert set(on_disk["custom_routes"]) == {"a"}
+    assert "b" not in _cfg.CUSTOM_ROUTES
+
+    # Cas extrême : vidage complet → section vide sur disque (pas de résurrection).
+    _cfg.save_custom_routes({})
+    with open(isolated_yaml, encoding="utf-8") as f:
+        on_disk = _yaml.safe_load(f)
+    assert not on_disk.get("custom_routes")
+    assert _cfg.CUSTOM_ROUTES == {}
+
+
+def test_route_version_bumped_on_mutations(isolated_yaml):
+    """ROUTE_VERSION s'incrémente à chaque mutation effective des routes."""
+    v0 = _cfg.ROUTE_VERSION
+    _cfg.save_custom_routes({"a": {"match": ["model-a"], "model": "glm-5.1"}})
+    v1 = _cfg.ROUTE_VERSION
+    assert v1 > v0
+
+    # Reload effectif (fichier modifié) → bump
+    import time as _time
+
+    import yaml as _yml
+
+    _time.sleep(0.01)  # mtime granularity
+    with open(isolated_yaml, encoding="utf-8") as f:
+        doc = _yml.safe_load(f) or {}
+    doc.setdefault("custom_routes", {})["c"] = {
+        "match": ["model-c"],
+        "model": "mimo-v2.5-free",
+    }
+    with open(isolated_yaml, "w", encoding="utf-8") as f:
+        _yml.safe_dump(doc, f)
+    _cfg._config_yaml_mtime -= 1  # ≠ mtime réel → force le re-read du YAML
+    _cfg._custom_routes_last_check = 0.0  # désarme le rate-limit
+    _cfg.maybe_reload_custom_routes()
+    assert _cfg.ROUTE_VERSION > v1
+    assert _cfg.CUSTOM_ROUTES.get("c", {}).get("model") == "mimo-v2.5-free"
+
+
+def test_save_env_rebuilds_sorted_routes_and_bumps():
+    """[B4] save_env doit rebâtir SORTED_ROUTES et invalider les caches."""
+    old_sorted = _cfg.SORTED_ROUTES
+    old_version = _cfg.ROUTE_VERSION
+    _cfg.save_env({"OPUS_MAP_MODEL": _cfg.load_routes().get("opus", {}).get("model", "kimi-k2.6")})
+    try:
+        assert _cfg.SORTED_ROUTES is not None
+        assert isinstance(_cfg.SORTED_ROUTES, list)
+        assert _cfg.ROUTE_VERSION > old_version
+    finally:
+        _cfg.SORTED_ROUTES = old_sorted
+
+
+def test_warm_cache_reroutes_immediately_on_inprocess_change(isolated_yaml):
+    """[B1 côté in-process] Un cache chaud re-route dès la mutation in-process."""
+    import opencode as _oc
+
+    _oc._route_cache.clear()
+    _oc._seen_route_version = -1
+    try:
+        first = _oc._route_for("zz-model-warm")
+        assert first is None  # pas de route encore
+
+        _cfg.save_custom_routes(
+            {"warm": {"match": ["zz-model-warm"], "model": "glm-5.1"}}
+        )
+
+        second = _oc._route_for("zz-model-warm")
+        assert second is not None and second.get("model") == "glm-5.1"
+    finally:
+        _oc._route_cache.clear()
+        _oc._seen_route_version = -1
+
+
+def test_external_edit_detected_after_rate_limit_window(isolated_yaml, monkeypatch):
+    """[B1 côté externe] Édition directe de config.yaml : le cache chaud est
+    invalidé par le polling mtime dès que la fenêtre de rate-limit passe.
+
+    Couvre exactement le trou du bug d'origine : le lookup cache AVANT le
+    check de reload faisait qu'un modèle déjà vu ne re-route jamais."""
+    import time as _time
+
+    import opencode as _oc
+
+    _oc._route_cache.clear()
+    _oc._seen_route_version = -1
+    monkeypatch.setattr(_cfg, "_CUSTOM_ROUTES_CHECK_INTERVAL", 0.0)
+    try:
+        assert _oc._route_for("zz-model-ext") is None
+
+        _time.sleep(0.01)  # mtime granularity NTFS
+        import yaml as _yml
+
+        with open(isolated_yaml, encoding="utf-8") as f:
+            doc = _yml.safe_load(f) or {}
+        doc.setdefault("custom_routes", {})["ext"] = {
+            "match": ["zz-model-ext"],
+            "model": "glm-5.1",
+        }
+        with open(isolated_yaml, "w", encoding="utf-8") as f:
+            _yml.safe_dump(doc, f)
+
+        # Requête suivante : le reload doit passer AVANT le lookup cache.
+        res = _oc._route_for("zz-model-ext")
+        assert res is not None and res.get("model") == "glm-5.1"
+    finally:
+        _oc._route_cache.clear()
+        _oc._seen_route_version = -1

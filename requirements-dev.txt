@@ -1,0 +1,7 @@
+# Dev/test dependencies — plan v10 §15.1.2 (item 14.4.8)
+# Runtime deps live in requirements.txt; these are the gates of §3.7.
+pytest>=8.0
+pytest-asyncio>=0.23
+ruff>=0.6
+mypy>=1.11
+respx>=0.21

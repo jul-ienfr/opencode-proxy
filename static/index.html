@@ -1,9 +1,9 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="fr">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>OpenCode Dashboard</title>
+    <title>Tableau de bord OpenCode</title>
     <link rel="stylesheet" href="/static/styles.css">
 </head>
 <body>
@@ -107,22 +107,22 @@
                 <!-- Time-series charts -->
                 <div class="charts-row">
                     <div class="card chart-card" style="flex:1;min-width:400px">
-                        <h2>Requests over Time</h2>
-                        <canvas id="chart-ts-requests" height="200" role="img" aria-label="Requests over time chart"></canvas>
+                        <h2>Requêtes au fil du temps</h2>
+                        <canvas id="chart-ts-requests" height="200" role="img" aria-label="Requêtes au fil du temps"></canvas>
                     </div>
                     <div class="card chart-card" style="flex:1;min-width:400px">
-                        <h2>Tokens over Time</h2>
-                        <canvas id="chart-ts-tokens" height="200" role="img" aria-label="Tokens over time chart"></canvas>
+                        <h2>Tokens au fil du temps</h2>
+                        <canvas id="chart-ts-tokens" height="200" role="img" aria-label="Tokens au fil du temps"></canvas>
                     </div>
                 </div>
                 <div class="charts-row">
                     <div class="card chart-card" style="flex:1;min-width:400px">
-                        <h2>Avg Duration (ms)</h2>
-                        <canvas id="chart-ts-duration" height="200" role="img" aria-label="Average duration over time chart"></canvas>
+                        <h2>Durée moyenne (ms)</h2>
+                        <canvas id="chart-ts-duration" height="200" role="img" aria-label="Durée moyenne au fil du temps"></canvas>
                     </div>
                     <div class="card chart-card" style="flex:1;min-width:400px">
-                        <h2>Success vs Error Rate</h2>
-                        <canvas id="chart-ts-success" height="200" role="img" aria-label="Success vs error rate chart"></canvas>
+                        <h2>Taux de succès vs erreurs</h2>
+                        <canvas id="chart-ts-success" height="200" role="img" aria-label="Taux de succès vs erreurs"></canvas>
                     </div>
                 </div>
 
@@ -183,44 +183,44 @@
                     <div class="history-filters" id="history-filters">
                         <div class="filter-row">
                             <div class="filter-group">
-                                <label>Status</label>
+                                <label>Statut</label>
                                 <select id="filter-status" class="config-select">
-                                    <option value="">All</option>
-                                    <option value="success">Success</option>
-                                    <option value="error">Error</option>
+                                    <option value="">Tous</option>
+                                    <option value="success">Succès</option>
+                                    <option value="error">Erreur</option>
                                 </select>
                             </div>
                             <div class="filter-group">
-                                <label>Model</label>
+                                <label>Modèle</label>
                                 <select id="filter-model" class="config-select">
-                                    <option value="">All</option>
+                                    <option value="">Tous</option>
                                 </select>
                             </div>
                             <div class="filter-group">
-                                <label>Original Model</label>
+                                <label>Modèle d'origine</label>
                                 <select id="filter-original-model" class="config-select">
-                                    <option value="">All</option>
+                                    <option value="">Tous</option>
                                 </select>
                             </div>
                             <div class="filter-group">
-                                <label>Account</label>
+                                <label>Compte</label>
                                 <select id="filter-account" class="config-select">
-                                    <option value="">All</option>
+                                    <option value="">Tous</option>
                                 </select>
                             </div>
                             <div class="filter-group">
-                                <label>Tool Used</label>
+                                <label>Outil utilisé</label>
                                 <select id="filter-tool" class="config-select">
-                                    <option value="">All</option>
+                                    <option value="">Tous</option>
                                 </select>
                             </div>
                             <div class="filter-group">
-                                <label>Search</label>
-                                <input type="text" id="filter-search" class="config-input" placeholder="Error text, model..." style="width:160px">
+                                <label>Recherche</label>
+                                <input type="text" id="filter-search" class="config-input" placeholder="Texte d'erreur, modèle..." style="width:160px">
                             </div>
                             <div class="filter-group" style="align-self:flex-end">
-                                <button class="btn btn-primary btn-sm" id="filter-apply-btn">Apply</button>
-                                <button class="btn btn-sm" id="filter-reset-btn">Reset</button>
+                                <button class="btn btn-primary btn-sm" id="filter-apply-btn">Appliquer</button>
+                                <button class="btn btn-sm" id="filter-reset-btn">Réinitialiser</button>
                             </div>
                         </div>
                     </div>
@@ -257,7 +257,7 @@
 
             <section id="quotas" class="tab-content">
                 <div class="card" id="quota-card">
-                    <h2>OpenCode Go Quotas</h2>
+                    <h2 data-i18n="quotas.title">Quotas OpenCode Go</h2>
                     <p id="quota-status-message" class="config-hint"></p>
                     <div id="quota-workspaces"></div>
                 </div>
@@ -301,11 +301,15 @@
 
                     <!-- Real-time Status -->
                     <div id="vpn-status" class="vpn-status" style="margin-bottom:18px">
+                        <div id="vpn-panel-error" style="display:none;margin-bottom:10px;padding:8px 12px;background:rgba(230,108,80,0.14);border:1px solid var(--danger,#e06c50);border-radius:6px;font-size:12px;color:var(--danger,#e06c50)"></div>
                         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
                             <div>
                                 <span id="vpn-status-dot" class="status-dot" style="display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:8px"></span>
                                 <strong id="vpn-status-text" data-i18n="vpn.disconnected">Déconnecté</strong>
                             </div>
+                            <!-- [v10 §4 Lot 4] cartes per-station + sparkline latence -->
+                            <div id="vpn-station-cards" style="display:flex;flex-wrap:wrap;gap:8px;margin:10px 0"></div>
+                            <canvas id="vpn-latency-sparkline" width="240" height="40" style="display:none;margin-top:4px" title="EWMA/p95 par station (ms)"></canvas>
                             <div id="vpn-rotation-section">
                                 <label class="toggle-switch" style="margin:0">
                                     <input type="checkbox" id="vpn-toggle" onchange="toggleVPN(this.checked)">
@@ -318,6 +322,8 @@
                         <div id="vpn-env-divergence-banner" style="display:none;margin-bottom:12px;padding:8px 12px;background:rgba(255,170,0,0.12);border:1px solid var(--warning);border-radius:6px;font-size:12px;color:var(--warning)"></div>
                         <!-- [plan 18/08 axe 3.4] config.yaml modifié à la main sans POST dashboard — le hot-reload est push-only, il faut redémarrer ou re-pousser (jamais d'auto-reload). Rempli par updateVPNUI quand /api/vpn-status expose config_yaml_dirty. -->
                         <div id="vpn-config-dirty-banner" style="display:none;margin-bottom:12px;padding:8px 12px;background:rgba(255,110,60,0.12);border:1px solid var(--danger,#e06c50);border-radius:6px;font-size:12px;color:var(--danger,#e06c50)"></div>
+                        <!-- [prancy-unicorn Phase1 Q5] clone frais N>=2 && !free_parallel → tout sur station 1 -->
+                        <div id="vpn-free-parallel-warning" style="display:none;margin-bottom:12px;padding:8px 12px;background:rgba(255,193,7,0.14);border:1px solid var(--warning,#e6a000);border-radius:6px;font-size:12px;color:var(--warning,#b77900)"></div>
                         <!-- [vivid-hinton P4] geo banner (strict/best_effort/warn) -->
                         <div id="geo-banner" style="display:none;margin-bottom:12px;padding:8px 12px;border-radius:6px;font-size:12px"></div>
                         <div id="geo-controls" style="display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap">
@@ -426,6 +432,30 @@
                                     <option value="station-first">Station suivante d'abord (recommandé)</option>
                                     <option value="direct">IP résidentielle directe</option>
                                 </select>
+                            </div>
+                            <!-- [free_parallel] Deux routings découplés — (B) Stations free -->
+                            <div id="free-parallel-section" style="margin-top:14px;padding:10px;background:var(--bg);border-radius:6px;border:1px solid var(--border)">
+                                <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+                                    <label class="toggle-switch" style="margin:0">
+                                        <input type="checkbox" id="cfg-free-parallel-enabled" onchange="toggleFreeParallel(this.checked)">
+                                        <span class="toggle-slider"></span>
+                                    </label>
+                                    <span style="font-size:13px;font-weight:500" data-i18n="config.free_parallel">Paralléliser les stations free</span>
+                                    <span id="free-parallel-status" style="font-size:11px;color:var(--text-muted)"></span>
+                                </div>
+                                <div id="free-parallel-routing-row" style="display:flex;align-items:center;gap:8px;margin-top:10px;flex-wrap:wrap">
+                                    <span class="label" style="font-size:12px" data-i18n="config.free_routing">Routage stations free</span>
+                                    <select id="cfg-free-parallel-routing" class="config-input" style="width:160px;font-size:12px" onchange="saveFreeParallelRouting()">
+                                        <option value="round-robin" data-i18n="config.free_routing_rr">Round-Robin (répartir)</option>
+                                        <option value="failover" data-i18n="config.free_routing_failover">Failover (bascule)</option>
+                                    </select>
+                                    <select id="cfg-free-parallel-mode" class="config-input" style="width:160px;font-size:12px" onchange="saveFreeParallelMode()">
+                                        <option value="load-balance">Round Robin (least)</option>
+                                        <option value="strict">Compteur strict (1,2,3…)</option>
+                                        <option value="hedge">Hedge (course)</option>
+                                    </select>
+                                </div>
+                                <div style="font-size:11px;color:var(--text-muted);margin-top:4px" data-i18n="config.free_parallel_hint">Round-Robin = least-loaded (répartit sur N), Failover = sticky 1 puis bascule sur panne/quota. Hedge = course N stations, premier gagne (désactivé en streaming).</div>
                             </div>
                             <!-- Station rows — rendered by JS (one per active station) -->
                             <div id="vpn-station-rows" style="margin-top:10px"></div>
@@ -794,7 +824,7 @@
                         </table>
                     </div>
                     <div class="custom-route-add">
-                        <input type="text" id="cr-match" class="config-input" placeholder="e.g. nimo, web_search">
+                        <input type="text" id="cr-match" class="config-input" placeholder="ex : nimo, web_search">
                         <select id="cr-thinking" class="config-select" style="width:auto">
                             <option value="auto" data-i18n="config.cr_thinking_auto">Auto</option>
                             <option value="adaptive" data-i18n="config.cr_thinking_adaptive">Adaptive</option>
@@ -819,8 +849,8 @@
 
                 <!-- Web Search -->
                 <div class="card">
-                    <h2>Web Search</h2>
-                    <p class="config-hint">Configure how the proxy handles web_search tool calls from Claude Code.</p>
+                    <h2>Recherche Web</h2>
+                    <p class="config-hint">Configure la gestion des appels outil web_search de Claude Code.</p>
                     <div style="display:flex;gap:20px;align-items:flex-end;flex-wrap:wrap;">
                         <div>
                             <label style="font-size:0.85em;color:#888;">Mode</label>
@@ -839,10 +869,74 @@
                         </div>
                         <div>
                             <label style="font-size:0.85em;color:#888;">Max Results</label>
-                            <input type="number" id="ws-max-results" class="config-input" value="5" min="1" max="20" style="width:80px">
+                            <input type="number" id="ws-max-results" class="config-input" value="5" min="1" max="10" style="width:80px">
+                        </div>
+                        <div>
+                            <label style="font-size:0.85em;color:#888;">Timeout (s)</label>
+                            <input type="number" id="ws-timeout" class="config-input" value="10" min="5" max="30" style="width:80px">
+                        </div>
+                        <div>
+                            <label style="font-size:0.85em;color:#888;">Enabled</label>
+                            <select id="ws-enabled" class="config-select" style="min-width:100px">
+                                <option value="true">Oui</option>
+                                <option value="false">Non</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label style="font-size:0.85em;color:#888;">Via VPN</label>
+                            <select id="ws-via-vpn" class="config-select" style="min-width:100px">
+                                <option value="false">Non (egress direct)</option>
+                                <option value="true">Oui</option>
+                            </select>
                         </div>
                         <button class="btn btn-primary" id="ws-save-btn">Save</button>
                         <span id="ws-save-status" class="save-status"></span>
+                    </div>
+                </div>
+
+                <!-- Web Fetch -->
+                <div class="card">
+                    <h2>Fetch Web</h2>
+                    <p class="config-hint">Configure la gestion des appels outil web_fetch (SSRF guard, extraction trafilatura).</p>
+                    <div style="display:flex;gap:20px;align-items:flex-end;flex-wrap:wrap;">
+                        <div>
+                            <label style="font-size:0.85em;color:#888;">Mode</label>
+                            <select id="wf-mode-select" class="config-select" style="min-width:200px">
+                                <option value="direct">Direct (local)</option>
+                                <option value="model">Model (passthrough)</option>
+                                <option value="direct_then_model">Direct → Model</option>
+                            </select>
+                        </div>
+                        <div id="wf-model-group">
+                            <label style="font-size:0.85em;color:#888;">Target Model</label>
+                            <select id="wf-model-select" class="config-select" style="min-width:200px">
+                                <option value="">-- select model --</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label style="font-size:0.85em;color:#888;">Max Bytes</label>
+                            <input type="number" id="wf-max-bytes" class="config-input" value="12000" min="2000" max="50000" step="1000" style="width:100px">
+                        </div>
+                        <div>
+                            <label style="font-size:0.85em;color:#888;">Timeout (s)</label>
+                            <input type="number" id="wf-timeout" class="config-input" value="15" min="5" max="30" style="width:80px">
+                        </div>
+                        <div>
+                            <label style="font-size:0.85em;color:#888;">Enabled</label>
+                            <select id="wf-enabled" class="config-select" style="min-width:100px">
+                                <option value="true">Oui</option>
+                                <option value="false">Non</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label style="font-size:0.85em;color:#888;">Via VPN</label>
+                            <select id="wf-via-vpn" class="config-select" style="min-width:100px">
+                                <option value="false">Non (egress direct)</option>
+                                <option value="true">Oui</option>
+                            </select>
+                        </div>
+                        <button class="btn btn-primary" id="wf-save-btn">Save</button>
+                        <span id="wf-save-status" class="save-status"></span>
                     </div>
                 </div>
 
@@ -909,7 +1003,7 @@
                         <label class="checkbox-label" style="font-size:0.85em; cursor:pointer;">
                             <input type="checkbox" id="traffic-auto-refresh" checked> <span data-i18n="traffic.auto_refresh">Auto-refresh</span>
                         </label>
-                        <input type="text" id="traffic-filter" placeholder="filter path…" style="flex:1;min-width:160px;max-width:280px">
+                        <input type="text" id="traffic-filter" placeholder="filtrer chemin…" style="flex:1;min-width:160px;max-width:280px">
                         <span id="traffic-status" class="save-status"></span>
                     </div>
                     <div class="config-actions" id="traffic-stats-bar" style="gap:12px;font-size:0.85em;flex-wrap:wrap;margin-bottom:10px"></div>
@@ -981,11 +1075,11 @@
         <div class="modal-overlay" id="request-detail-modal" style="display:none" role="dialog" aria-modal="true">
             <div class="modal" style="max-width:900px;width:95vw;max-height:90vh;overflow-y:auto">
                 <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:15px">
-                    <h3>Request Details</h3>
+                    <h3>Détails de la requête</h3>
                     <button class="btn btn-sm" id="req-detail-close">&times;</button>
                 </div>
                 <div id="req-detail-content">
-                    <p style="color:#888">Loading...</p>
+                    <p style="color:#888">Chargement...</p>
                 </div>
             </div>
         </div>

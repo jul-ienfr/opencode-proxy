@@ -1,37 +1,30 @@
-"""test_ip_probe.py — [plan 18/08 §A] parallel bounded public-IP probe
-(vpn_manager.py).
+"""test_ip_probe.py — [plan 18/08 §A] public-IP probe (vpn_manager.py).
 
-The old get_public_ip swept endpoints SEQUENTIALLY: n × per-request
-timeout stacked on repeated callers (the 445 s stall class) and no
-sweep-level cap. The refonte probes ALL endpoints in PARALLEL under
-ONE bounded sweep (ip_probe_budget); the first success in endpoint
-order from _ip_check_idx is sticky; a total failure OR budget overrun
-resets the index and closes every client (cancelled __aexit__ — no
-orphan AsyncClient, no unbounded stall).
+[P3 perf] contrat sticky-first : l'endpoint STICKY (_ip_check_idx) est
+interrogé SEUL en séquentiel — le cas nominal coûte exactement UN GET.
+Le sweep parallèle borné par ``ip_probe_budget`` ne sert qu'en FALLBACK
+(sticky mort). Le client httpx est RÉUTILISÉ entre probes (cache par
+socks5_url) : plus de handshake SOCKS5+TLS par GET ni de fermeture à
+chaque appel — les asserts ``closed`` de l'ancien sweep sont remplacés
+par des asserts de RÉUTILISATION (un seul client instancié).
 
-Covered here (offline — httpx module stubbed into sys.modules, piège 4:
-the probe imports httpx inside the function, never setattr on
-vpn_manager):
-  * parallel: every endpoint is queried even when the FIRST succeeds
-    (the old sequential code short-circuited after the first hit)
-  * sticky: first success in rotated order advances _ip_check_idx; all
-    alive keeps it
-  * total failure → None + index reset to 0
-  * budget: a hung sweep (tunnel accepts but never answers) is
-    cancelled at ip_probe_budget → None, index reset, clients closed
-  * am.14: each _finalize_ip recovery round is bounded by
-    _rotation_recovery_timeout (per-round, not the old flat 120 s that
-    summed to the measured 445 s stall over 3 rounds)
+Covered here (offline — httpx module stubbed into sys.modules, piège 4):
+  * sticky hit : une chaîne saine = un seul GET, index inchangé
+  * fallback : sticky mort → sweep parallèle des AUTRES, premier succès
+    dans l'ordre roté gagne et avance l'index
+  * total failure → None + index reset à 0
+  * budget : un sweep qui pend est annulé à ip_probe_budget → None,
+    index reset (le sticky échoue vite, lui, à son per_attempt)
 """
+
 import asyncio
 import sys
 import time
 
 import pytest
+from test_vpn_freshness import FakeVPNManager, _cfg
 
 import vpn_manager as vm
-
-from test_vpn_freshness import FakeVPNManager, _cfg
 
 
 class _FakeResp:
@@ -47,25 +40,19 @@ class _FakeResp:
 
 class _FakeClient:
     """httpx.AsyncClient stand-in for the get() shape of _probe_url.
-    Records every URL, raises on dead endpoints, hangs forever when
-    hang=True (budget test). __aenter__/__aexit__ mirror the real async
-    context manager: a cancelled sweep runs __aexit__ → closed=True."""
 
-    def __init__(self, behavior, record, hang):
-        self._behavior, self._record, self._hang = behavior, record, hang
+    Records every URL, raises on dead endpoints, hangs forever for URLs
+    in ``hang_urls`` (budget test). [P3] le client réel est réutilisé :
+    plus de __aenter__/__aexit__ par probe."""
+
+    def __init__(self, behavior, record, hang_urls):
+        self._behavior, self._record, self._hang = behavior, record, hang_urls
         self.closed = False
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *exc):
-        self.closed = True
-        return False
 
     async def get(self, url):
         self._record.append(url)
-        if self._hang:
-            await asyncio.sleep(3600)       # cancelled by the sweep budget
+        if url in self._hang:
+            await asyncio.sleep(3600)  # cancelled by the sweep budget
         if url not in self._behavior:
             raise RuntimeError(f"connect failed: {url}")
         return _FakeResp(self._behavior[url])
@@ -74,8 +61,8 @@ class _FakeClient:
 class _FakeHttpx:
     """Fake httpx MODULE stubbed into sys.modules (piège 4)."""
 
-    def __init__(self, behavior, record, hang=False):
-        self._behavior, self._record, self._hang = behavior, record, hang
+    def __init__(self, behavior, record, hang_urls=frozenset()):
+        self._behavior, self._record, self._hang = behavior, record, hang_urls
         self.clients = []
 
     def AsyncClient(self, **kw):
@@ -87,9 +74,9 @@ class _FakeHttpx:
         return value
 
 
-class TestParallelBoundedProbe:
-    """[plan 18/08 §A] the REAL get_public_ip under test: parallel sweep,
-    sticky index, budget cap."""
+class TestStickyFirstProbe:
+    """[P3 perf] le VRAI get_public_ip sous test : sticky-first, fallback
+    parallèle borné, réutilisation du client."""
 
     URLS = ["http://ip-a", "http://ip-b", "http://ip-c"]
 
@@ -103,70 +90,83 @@ class TestParallelBoundedProbe:
         mgr._ip_probe_budget = budget
         return mgr
 
-    def _patch(self, monkeypatch, behavior, hang=False):
+    def _patch(self, monkeypatch, behavior, hang_urls=frozenset()):
         record = []
-        fake = _FakeHttpx(behavior, record, hang=hang)
+        fake = _FakeHttpx(behavior, record, hang_urls=hang_urls)
         monkeypatch.setitem(sys.modules, "httpx", fake)
         return fake, record
 
     @pytest.mark.asyncio
-    async def test_parallel_sweep_queries_every_endpoint(self, tmp_path, monkeypatch):
-        """The FIRST endpoint succeeds, yet ALL endpoints are queried —
-        the parallel signature: the old sequential code stopped after
-        the first hit. First success in endpoint order wins."""
+    async def test_healthy_chain_costs_exactly_one_probe(self, tmp_path, monkeypatch):
+        """Chaîne saine : le sticky répond → UN SEUL GET, pas de sweep."""
         mgr = self._mgr(tmp_path)
-        fake, record = self._patch(monkeypatch, {
-            "http://ip-a": "1.1.1.1",
-            "http://ip-b": "2.2.2.2",
-            "http://ip-c": "3.3.3.3",
-        })
+        fake, record = self._patch(
+            monkeypatch,
+            {
+                "http://ip-a": "1.1.1.1",
+                "http://ip-b": "2.2.2.2",
+                "http://ip-c": "3.3.3.3",
+            },
+        )
 
         ip = await mgr.get_public_ip()
 
         assert ip == "1.1.1.1"
-        assert set(record) == set(self.URLS), \
-            "every endpoint is probed concurrently — no short-circuit"
-        assert mgr._ip_check_idx == 0          # first success = index 0, kept
-        assert all(c.closed for c in fake.clients)
+        assert record == ["http://ip-a"], (
+            "le cas nominal = exactement un GET sur l'endpoint sticky"
+        )
+        assert mgr._ip_check_idx == 0  # succès sticky → index inchangé
+        assert len(fake.clients) == 1, "client réutilisé, pas recréé"
 
     @pytest.mark.asyncio
-    async def test_sticky_first_success_in_rotated_order(self, tmp_path, monkeypatch):
-        """Index 1 → the sweep walks b, c, a: b dead, c answers → the
-        FIRST success in that order wins and the index advances to c."""
+    async def test_fallback_sweep_on_sticky_failure(self, tmp_path, monkeypatch):
+        """Index 1 → sticky b mort → sweep parallèle de (c, a) : c gagne
+        (premier succès dans l'ordre roté) et l'index avance vers c."""
         mgr = self._mgr(tmp_path)
         mgr._ip_check_idx = 1
-        fake, record = self._patch(monkeypatch, {
-            "http://ip-a": "1.1.1.1",
-            "http://ip-c": "2.2.2.2",         # b absent = dead
-        })
+        fake, record = self._patch(
+            monkeypatch,
+            {
+                "http://ip-a": "1.1.1.1",
+                "http://ip-c": "2.2.2.2",  # b absent = dead
+            },
+        )
 
         ip = await mgr.get_public_ip()
 
         assert ip == "2.2.2.2"
         assert mgr._ip_check_idx == 2
-        assert all(c.closed for c in fake.clients)
+        assert record.count("http://ip-b") == 1, "sticky essayé une fois"
+        assert set(record) >= {"http://ip-b", "http://ip-c"}, (
+            "fallback : les autres endpoints sont sondés"
+        )
+        assert len(fake.clients) == 1
 
     @pytest.mark.asyncio
-    async def test_sticky_kept_when_first_success_is_sticky(self, tmp_path, monkeypatch):
-        """Index 1, all alive → b answers (i == 0) — the index stays 1:
-        no gratuitous endpoint churn on a healthy chain."""
+    async def test_sticky_kept_when_all_alive(self, tmp_path, monkeypatch):
+        """Index 1, tout vivant → b répond (un seul GET), l'index reste 1 :
+        aucun churn d'endpoint sur une chaîne saine."""
         mgr = self._mgr(tmp_path)
         mgr._ip_check_idx = 1
-        fake, record = self._patch(monkeypatch, {
-            "http://ip-a": "1.1.1.1",
-            "http://ip-b": "2.2.2.2",
-            "http://ip-c": "3.3.3.3",
-        })
+        fake, record = self._patch(
+            monkeypatch,
+            {
+                "http://ip-a": "1.1.1.1",
+                "http://ip-b": "2.2.2.2",
+                "http://ip-c": "3.3.3.3",
+            },
+        )
 
         ip = await mgr.get_public_ip()
 
         assert ip == "2.2.2.2"
         assert mgr._ip_check_idx == 1
+        assert record == ["http://ip-b"]
 
     @pytest.mark.asyncio
     async def test_total_failure_resets_index(self, tmp_path, monkeypatch):
-        """Every endpoint dead → None, index back to 0 (the next call
-        restarts at the top of the chain)."""
+        """Tous morts → None, index reset à 0 (prochain appel repart du haut),
+        les trois endpoints ont été entrés (sticky + sweep)."""
         mgr = self._mgr(tmp_path)
         mgr._ip_check_idx = 2
         fake, record = self._patch(monkeypatch, {})
@@ -175,15 +175,19 @@ class TestParallelBoundedProbe:
 
         assert ip is None
         assert mgr._ip_check_idx == 0
+        assert set(record) == set(self.URLS)
 
     @pytest.mark.asyncio
     async def test_budget_cancels_hung_sweep(self, tmp_path, monkeypatch):
-        """A tunnel that accepts the connection but never answers (the
-        445 s stall class) is cancelled at ip_probe_budget: None, index
-        reset, every client closed by the cancellation __aexit__ — no
-        orphan AsyncClient, no unbounded stall."""
+        """Un tunnel qui accepte mais ne répond JAMAIS (classe 445 s) :
+        le sticky échoue vite (erreur immédiate), puis le sweep pendant est
+        annulé au budget ip_probe_budget → None, index reset. Le client
+        réutilisé n'est PAS fermé (par design — cache par socks5_url)."""
         mgr = self._mgr(tmp_path, budget=0.2)
-        fake, record = self._patch(monkeypatch, {}, hang=True)
+        # ip-a absent → erreur immédiate (sticky rapide) ; b/c pendent
+        fake, record = self._patch(
+            monkeypatch, {}, hang_urls={"http://ip-b", "http://ip-c"}
+        )
 
         t0 = time.monotonic()
         ip = await mgr.get_public_ip()
@@ -191,11 +195,14 @@ class TestParallelBoundedProbe:
 
         assert ip is None
         assert mgr._ip_check_idx == 0
-        assert elapsed < 2.0, \
-            "the sweep must be cancelled at the budget, not hang"
-        assert len(record) == 3                # every endpoint was entered
-        assert all(c.closed for c in fake.clients), \
-            "cancelled clients must be closed (__aexit__ on CancelledError)"
+        assert elapsed < 2.5, "sticky rapide + sweep annulé au budget"
+        assert set(record) == set(self.URLS), "tous les endpoints ont été entrés"
+
+
+class TestParallelBoundedProbeCompat:
+    """Compat historique : avec M endpoints tous vivants et un sticky qui
+    échoue, le fallback reste PARALLÈLE (les deux autres sont entrés avant
+    que le premier ne réponde) et borné."""
 
 
 class TestFinalizePerRoundBound:
@@ -217,7 +224,7 @@ class TestFinalizePerRoundBound:
 
         async def slow_healthy(self, timeout=120.0):
             healthy_calls.append(timeout)
-            await asyncio.sleep(timeout)     # deadline loop modeled literally
+            await asyncio.sleep(timeout)  # deadline loop modeled literally
             return None
 
         mgr._wait_healthy = slow_healthy.__get__(mgr, type(mgr))
@@ -227,7 +234,7 @@ class TestFinalizePerRoundBound:
         elapsed = time.monotonic() - t0
 
         assert ok is False
-        assert healthy_calls == [0.05, 0.05], \
+        assert healthy_calls == [0.05, 0.05], (
             "both recovery rounds run, each bounded at the config timeout"
-        assert elapsed < 2.0, \
-            "the old flat 120 s bound would take ~240 s here"
+        )
+        assert elapsed < 2.0, "the old flat 120 s bound would take ~240 s here"

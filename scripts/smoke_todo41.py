@@ -7,7 +7,11 @@ and yields httpx-style STR lines.
 
 Run: python scripts/smoke_todo41.py
 """
-import sys, json, asyncio
+
+import asyncio
+import json
+import sys
+
 sys.path.insert(0, ".")
 
 
@@ -44,12 +48,14 @@ async def main():
                 yield c
 
     # Chunk boundaries land mid-token and BETWEEN \r and \n.
-    mid = [i for i in range(3, len(payload) - 3)
-           if payload[i - 1 : i + 1] == b"\r\n"]  # cut between \r and \n
+    mid = [
+        i for i in range(3, len(payload) - 3) if payload[i - 1 : i + 1] == b"\r\n"
+    ]  # cut between \r and \n
     mid += [3, 15, 40, 52, 66, 79, 90, 105]
     chunks = _chunks(payload, sorted(set(mid)))
-    assert any(c.endswith(b"\r") and n.startswith(b"\n")
-               for c, n in zip(chunks, chunks[1:])), "test must split \\r from \\n across chunks"
+    assert any(c.endswith(b"\r") and n.startswith(b"\n") for c, n in zip(chunks, chunks[1:], strict=False)), (
+        "test must split \\r from \\n across chunks"
+    )
 
     wrapped = oc._CurlCffiStreamResponse(_FakeResp(chunks))
     lines = [l async for l in wrapped.aiter_lines()]
@@ -86,7 +92,7 @@ async def main():
         if d == "[DONE]":
             consumed += 1
             continue
-        chunk = json.loads(d)          # 4107-style parse
+        chunk = json.loads(d)  # 4107-style parse
         if chunk.get("choices"):
             consumed += 1
     assert consumed == 3, f"consumer parse failed: {consumed}/3"

@@ -28,14 +28,14 @@ own rotation workers, which are cancelled at the end of each test):
       * _free_stations_exhausted returns False while a rotation is in
         flight (a fresh (model, IP) key is imminent)
 """
+
 import asyncio
-import time
 
 import pytest
 
 import opencode as oc
-from free_ip_pool import FreeIPPool
 import vpn_manager as vm
+from free_ip_pool import FreeIPPool
 
 
 class _Station:
@@ -43,10 +43,11 @@ class _Station:
     the Axe 1.2 probe surface: ``_probe_tunnel_light`` returns
     ``probe_result`` and counts its calls."""
 
-    def __init__(self, sid, *, proxy_mode="vpn", status="connected",
-                 current_ip=None, quota=15, probe=True):
+    def __init__(
+        self, sid, *, proxy_mode="vpn", status="connected", current_ip=None, quota=15, probe=True
+    ):
         self._station = sid
-        self.enabled = True                  # FreeIPPool.get_status reads it
+        self.enabled = True  # FreeIPPool.get_status reads it
         self.proxy_mode = proxy_mode
         self.status = status
         self.current_ip = current_ip
@@ -73,8 +74,8 @@ def _pool(st1, st2=None, *, bad_ttl=60):
     these tests exercise the worker/queue path)."""
     pool = FreeIPPool(st1, st2)
     pool._bad_ttl = float(bad_ttl)
-    pool.switched = []                         # fake switch_ip's record log
-    pool.switch_ip = _fake_switch(pool)   # no docker — instance attr shadows
+    pool.switched = []  # fake switch_ip's record log
+    pool.switch_ip = _fake_switch(pool)  # no docker — instance attr shadows
     return pool
 
 
@@ -82,10 +83,12 @@ def _fake_switch(pool):
     """switch_ip that just records the station, increments the IP and sets
     status connected — the "rotation landed" contract _rotate_station
     expects."""
+
     async def switch(station):
         pool.switched.append(station._station)
         station.current_ip = f"10.{station._station}.0.{len(pool.switched)}"
         station.status = "connected"
+
     return switch
 
 
@@ -100,10 +103,12 @@ async def _shutdown(pool):
 
 # ── 1.1 Bounded rotation concurrency ──────────────────────────────
 
+
 def test_two_rotations_run_in_parallel():
     """The core 1.1 fix: with _ROTATION_CONCURRENCY = 2, two queued
     stations rotate CONCURRENTLY — the old single worker would serialize
     them (the second enters only after the first finishes)."""
+
     async def _go():
         s1, s2 = _Station(1), _Station(2)
         p = _pool(s1, s2)
@@ -113,8 +118,8 @@ def test_two_rotations_run_in_parallel():
         async def blocking_switch(station):
             p.switched.append(station._station)
             if len(p.switched) == 2:
-                both_inside.set()          # both workers inside a rotation
-            await release.wait()           # hold both until released
+                both_inside.set()  # both workers inside a rotation
+            await release.wait()  # hold both until released
 
         p.switch_ip = blocking_switch
         p._launch_rotation(s1)
@@ -142,6 +147,7 @@ def test_rotation_concurrency_one_serializes():
     station 1 blocks on a gate, and while it is blocked the second station
     must NOT enter (with 2 workers — the regression this guards — station 2
     would enter during the observation window and trip the assert)."""
+
     async def _go():
         s1, s2 = _Station(1), _Station(2)
         p = _pool(s1, s2)
@@ -155,18 +161,19 @@ def test_rotation_concurrency_one_serializes():
             order.append(station._station)
             if station._station == 1:
                 s1_entered.set()
-                await gate.wait()          # hold rotation 1 INSIDE switch_ip
+                await gate.wait()  # hold rotation 1 INSIDE switch_ip
             else:
                 s2_entered.set()
 
         p.switch_ip = serial_switch
         p._launch_rotation(s1)
         await asyncio.wait_for(s1_entered.wait(), 1.0)  # rotation 1 in flight
-        p._launch_rotation(s2)             # queued behind the single worker
-        await asyncio.sleep(0.1)           # observation window
-        assert not s2_entered.is_set(), \
+        p._launch_rotation(s2)  # queued behind the single worker
+        await asyncio.sleep(0.1)  # observation window
+        assert not s2_entered.is_set(), (
             "with 1 worker, station 2 must NOT enter while station 1 blocks"
-        gate.set()                         # release rotation 1
+        )
+        gate.set()  # release rotation 1
         await asyncio.wait_for(s2_entered.wait(), 1.0)  # then 2 runs second
         await asyncio.sleep(0.05)
         await _shutdown(p)
@@ -178,11 +185,12 @@ def test_rotation_concurrency_one_serializes():
 def test_launch_rotation_dedups_same_station():
     """Per-station single-flight kept under concurrency: two launch calls
     for the same station → ONE physical rotation."""
+
     async def _go():
         s1 = _Station(1)
         p = _pool(s1)
         p._launch_rotation(s1)
-        p._launch_rotation(s1)             # deduped (already queued)
+        p._launch_rotation(s1)  # deduped (already queued)
         await asyncio.sleep(0.05)
         await _shutdown(p)
         assert p.switched == [1], "one rotation per queued station, never two"
@@ -194,18 +202,20 @@ def test_update_config_sets_rotation_concurrency():
     p = _pool(_Station(1))
     p.update_config({"rotation_concurrency": 4})
     assert p._ROTATION_CONCURRENCY == 4
-    p.update_config({"rotation_concurrency": 0})   # clamped to the minimum
+    p.update_config({"rotation_concurrency": 0})  # clamped to the minimum
     assert p._ROTATION_CONCURRENCY == 1
     assert p.get_status()["rotation_concurrency"] == 1
 
 
 # ── 1.2 Post-commit probe ─────────────────────────────────────────
 
+
 def test_dead_post_commit_probe_requeues_and_bad_marks():
     """A rotation that lands a DEAD fresh tunnel must re-rotate immediately
     (not wait for the watchdog tick): bad-mark (other station usable), arm
     the watchdog, and re-queue — bounded by _POST_COMMIT_RETRY_MAX so a
     persistently flapping tunnel does not hot-loop the docker stack."""
+
     async def _go():
         s1, s2 = _Station(1, probe=False), _Station(2, probe=True)
         p = _pool(s1, s2)
@@ -220,22 +230,22 @@ def test_dead_post_commit_probe_requeues_and_bad_marks():
 
         p.switch_ip = gated_switch
         p._launch_rotation(s1)
-        await asyncio.sleep(0.05)          # rotation 1: commit + dead probe
+        await asyncio.sleep(0.05)  # rotation 1: commit + dead probe
         per = p._per_station(s1)
         assert p.switched == [1, 1], "re-queued: rotation 2 already in flight"
-        assert per["post_commit_retry_count"] == 1, \
+        assert per["post_commit_retry_count"] == 1, (
             "rotation 2 not yet committed — counter still at 1"
-        assert per["bad_until"] is not None, \
-            "dead fresh IP bad-marked (station 2 usable — no C1)"
+        )
+        assert per["bad_until"] is not None, "dead fresh IP bad-marked (station 2 usable — no C1)"
         assert s1.armed == [1], "watchdog armed on the dead probe"
 
         release.set()
-        await asyncio.sleep(0.05)          # rotation 2: hits the cap
+        await asyncio.sleep(0.05)  # rotation 2: hits the cap
         assert p.switched == [1, 1]
         assert per["post_commit_retry_count"] == 2
         assert s1.armed == [1, 1], "watchdog armed on EVERY dead probe"
 
-        await asyncio.sleep(0.05)          # nothing more happens
+        await asyncio.sleep(0.05)  # nothing more happens
         assert p.switched == [1, 1], "no third rotation after the cap"
         await _shutdown(p)
 
@@ -245,6 +255,7 @@ def test_dead_post_commit_probe_requeues_and_bad_marks():
 def test_alive_post_commit_probe_resets_counter():
     """A healthy fresh IP → probe alive → counter reset, no bad-mark, no
     re-queue (the rotation is complete)."""
+
     async def _go():
         s1, s2 = _Station(1, probe=True), _Station(2, probe=True)
         p = _pool(s1, s2)
@@ -267,6 +278,7 @@ def test_dead_post_commit_probe_c1_alone_no_badmark_but_requeues():
     """C1: the failed station is the ONLY usable one → no bad-mark (that
     would drive free traffic to paid), but the immediate re-rotation and
     the watchdog arm still happen."""
+
     async def _go():
         s1, s2 = _Station(1, probe=False), _Station(2, status="disconnected")
         p = _pool(s1, s2)
@@ -287,7 +299,7 @@ def test_dead_post_commit_probe_c1_alone_no_badmark_but_requeues():
         assert s1.armed == [1]
 
         release.set()
-        await asyncio.sleep(0.05)          # rotation 2: cap reached
+        await asyncio.sleep(0.05)  # rotation 2: cap reached
         assert per["post_commit_retry_count"] == 2
         assert per["bad_until"] is None, "still C1 — never bad-marked"
         assert s1.armed == [1, 1]
@@ -302,6 +314,7 @@ def test_dead_post_commit_probe_c1_alone_no_badmark_but_requeues():
 def test_no_post_commit_probe_outside_vpn_mode():
     """proxy_mode != vpn (e.g. the future static socks5 pool, or direct):
     no docker-backed probe, no re-queue, rotation just completes."""
+
     async def _go():
         s1 = _Station(1, proxy_mode="direct")
         p = _pool(s1)
@@ -317,6 +330,7 @@ def test_no_post_commit_probe_outside_vpn_mode():
 
 # ── 1.4 Exhaustion under rotation lock ────────────────────────────
 
+
 def test_any_rotation_in_flight():
     async def _go():
         s1 = _Station(1)
@@ -328,8 +342,9 @@ def test_any_rotation_in_flight():
         t.cancel()
         with pytest.raises(asyncio.CancelledError):
             await t
-        assert p.any_rotation_in_flight() is False, \
+        assert p.any_rotation_in_flight() is False, (
             "a finished rotation no longer counts as in flight"
+        )
         await _shutdown(p)
 
     asyncio.run(_go())
@@ -385,7 +400,7 @@ class _Socks5FakePool:
     exemption (no docker), the usable set is the enabled static proxies."""
 
     socks5_mode = True
-    _stations = []          # docker stations inert in socks5 mode
+    _stations = []  # docker stations inert in socks5 mode
 
     def __init__(self, eps):
         self._eps = eps
@@ -418,9 +433,11 @@ def test_socks5_exhausted_true_when_all_cooldowned(monkeypatch):
 
 def test_socks5_exhausted_true_when_no_usable_proxy(monkeypatch):
     """All proxies unusable (dead/disabled): no usable set → exhausted."""
-    monkeypatch.setattr(oc, "_free_ip_pool",
-                        _Socks5FakePool([_Ep(1, usable=False),
-                                         _Ep(2, enabled=False, usable=True)]))
+    monkeypatch.setattr(
+        oc,
+        "_free_ip_pool",
+        _Socks5FakePool([_Ep(1, usable=False), _Ep(2, enabled=False, usable=True)]),
+    )
     assert oc._free_stations_exhausted("some-model") is True
 
 
@@ -435,13 +452,15 @@ def test_free_stations_exhausted_getattr_duck_safe(monkeypatch):
 
 # ── 1.3 Adaptive probe timeout ────────────────────────────────────
 
+
 def test_classify_probe_exc_timeout():
-    assert vm._classify_probe_exc(asyncio.TimeoutError()) == "timeout"
+    assert vm._classify_probe_exc(TimeoutError()) == "timeout"
     assert vm._classify_probe_exc(TimeoutError()) == "timeout"
 
     class _Named(Exception):
         pass
-    _Named.__name__ = "ConnectTimeout"     # httpx's real type name
+
+    _Named.__name__ = "ConnectTimeout"  # httpx's real type name
     assert vm._classify_probe_exc(_Named("slow tunnel")) == "timeout"
 
     assert vm._classify_probe_exc(RuntimeError("timed out waiting")) == "timeout"
@@ -472,8 +491,7 @@ class _ProbeMgr:
         self._ip_check_url = "http://a"
         # None → single-endpoint path; the two-endpoint sweep is the real
         # multi-url config, so it is the test default here.
-        self._ip_check_urls = urls if urls is not None else ["http://a",
-                                                             "http://b"]
+        self._ip_check_urls = urls if urls is not None else ["http://a", "http://b"]
         self._ip_probe_budget = budget
         self._ip_check_idx = 0
         self.calls = []
@@ -492,7 +510,8 @@ def _light(mgr):
 def test_probe_timeout_then_ok_advances_sticky():
     mgr = _ProbeMgr(["timeout", "ok"])
     assert asyncio.run(_light(mgr)) is True
-    assert mgr.calls == [("http://a", 2.0), ("http://b", 2.0)]
+    # [v10 baseline] per-attempt cap raised 2.0 → 3.0 (vpn_manager min(3.0, budget))
+    assert mgr.calls == [("http://a", 3.0), ("http://b", 3.0)]
     assert mgr._ip_check_idx == 1, "sticky advance on a later endpoint"
 
 
@@ -502,16 +521,17 @@ def test_probe_timeout_only_gets_grace_attempt():
     answers here was never dead."""
     mgr = _ProbeMgr(["timeout", "timeout", "ok"])
     assert asyncio.run(_light(mgr)) is True
-    assert mgr.calls == [("http://a", 2.0), ("http://b", 2.0),
-                         ("http://a", 4.0)], "grace uses budget - sweep cost"
+    # sweep burns 2×3.0 of the 8.0 budget → grace gets the 2.0 remainder
+    assert mgr.calls == [("http://a", 3.0), ("http://b", 3.0), ("http://a", 2.0)], (
+        "grace uses budget - sweep cost"
+    )
     assert mgr._ip_check_idx == 0, "grace does not advance the sticky index"
 
 
 def test_probe_grace_fails_then_dead():
     mgr = _ProbeMgr(["timeout", "timeout", "timeout"])
     assert asyncio.run(_light(mgr)) is False
-    assert mgr.calls == [("http://a", 2.0), ("http://b", 2.0),
-                         ("http://a", 4.0)]
+    assert mgr.calls == [("http://a", 3.0), ("http://b", 3.0), ("http://a", 2.0)]
 
 
 def test_probe_refused_is_definitive_no_grace():
@@ -519,8 +539,9 @@ def test_probe_refused_is_definitive_no_grace():
     grace phase (only timeouts mean "might be slow")."""
     mgr = _ProbeMgr(["refused", "refused"])
     assert asyncio.run(_light(mgr)) is False
-    assert mgr.calls == [("http://a", 2.0), ("http://b", 2.0)], \
+    assert mgr.calls == [("http://a", 3.0), ("http://b", 3.0)], (
         "no third (grace) attempt after refused verdicts"
+    )
 
 
 def test_probe_error_is_definitive_no_grace():
@@ -528,25 +549,25 @@ def test_probe_error_is_definitive_no_grace():
     keeps the F2 offline tests' exact record assertions."""
     mgr = _ProbeMgr(["error", "error"])
     assert asyncio.run(_light(mgr)) is False
-    assert mgr.calls == [("http://a", 2.0), ("http://b", 2.0)]
+    assert mgr.calls == [("http://a", 3.0), ("http://b", 3.0)]
 
 
 def test_probe_refused_then_alive_falls_through():
     mgr = _ProbeMgr(["refused", "ok"])
     assert asyncio.run(_light(mgr)) is True
-    assert mgr.calls == [("http://a", 2.0), ("http://b", 2.0)]
+    assert mgr.calls == [("http://a", 3.0), ("http://b", 3.0)]
 
 
 def test_probe_grace_skipped_when_budget_exhausted():
-    """budget 3.0: the sweep (2 × 2.0) already burns more than the budget —
-    no leftover > 0.5 s → no grace attempt."""
+    """budget 3.0: per_attempt = min(3.0, budget) = 3.0 → the 2-endpoint sweep
+    consumes ≥ budget → no leftover > 0.5 s → no grace attempt."""
     mgr = _ProbeMgr(["timeout", "timeout"], budget=3.0)
     assert asyncio.run(_light(mgr)) is False
-    assert mgr.calls == [("http://a", 2.0), ("http://b", 2.0)]
+    assert mgr.calls == [("http://a", 3.0), ("http://b", 3.0)]
 
 
 def test_probe_single_endpoint_grace_uses_full_remaining():
-    """One-endpoint config: sweep cost 2.0, grace gets the rest (6.0)."""
+    """One-endpoint config: sweep cost 3.0, grace gets the rest (8−3 = 5.0)."""
     mgr = _ProbeMgr(["timeout", "ok"], urls=["http://a"])
     assert asyncio.run(_light(mgr)) is True
-    assert mgr.calls == [("http://a", 2.0), ("http://a", 6.0)]
+    assert mgr.calls == [("http://a", 3.0), ("http://a", 5.0)]

@@ -34,11 +34,22 @@ RUN groupadd -r opencode && useradd -r -g opencode -d /app -s /sbin/nologin open
     && mkdir -p /app/logs /app/vpn_configs && chown -R opencode:opencode /app
 
 # Explicit COPY only — never `COPY . .` (would bake config.yaml / vpn_configs secrets into the image)
+# [plan v10 §14.0.5] Liste alignée sur les imports réels au boot :
+#   opencode.py → traffic_capture, protocol_mapping, trust
+#   opencode.py lifespan → shared_rotation, scripts.make_credentials_env
+#   [P6 fix] imports tardifs/lifespan NON copiés avant → ModuleNotFoundError
+#   possible au boot conteneurisé : docker_events, station_supervisor,
+#   latency_rotation, ip_latency, free_discovery.
 COPY --chown=opencode:opencode requirements.txt ./
-COPY --chown=opencode:opencode opencode.py vpn_manager.py free_ip_pool.py shared_state.py ./
+COPY --chown=opencode:opencode opencode.py trust.py vpn_manager.py free_ip_pool.py shared_state.py shared_rotation.py traffic_capture.py protocol_mapping.py docker_events.py station_supervisor.py latency_rotation.py ip_latency.py free_discovery.py ./
 COPY --chown=opencode:opencode config/ ./config/
 COPY --chown=opencode:opencode dashboard/ ./dashboard/
 COPY --chown=opencode:opencode static/ ./static/
+COPY --chown=opencode:opencode scripts/make_credentials_env.py ./scripts/make_credentials_env.py
+
+# [P6] smoke-test d'import au build : un module manquant casse le build ici
+# (et non au boot conteneur, en prod).
+RUN python -c "import opencode" || (echo "SMOKE TEST FAILED: import opencode" && exit 1)
 
 USER opencode
 

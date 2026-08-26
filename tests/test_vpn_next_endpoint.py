@@ -13,6 +13,7 @@ into ``shared_state``):
 - station=0 with no active station yet → falls back to station 1.
 - an explicit station=1 targets station 1 regardless of the active one.
 """
+
 import sqlite3
 
 import pytest
@@ -25,6 +26,7 @@ from dashboard.api import register_dashboard
 
 class _FakeMgr:
     """Minimal station manager — the subset /api/vpn/next touches."""
+
     def __init__(self, station, ip):
         self._station = station
         self.current_ip = ip
@@ -33,12 +35,13 @@ class _FakeMgr:
 
     async def connect_next(self, **kw):
         self.rotations += 1
-        self.current_ip = f"10.0.0.{self._station + 2}"   # 1→.3, 2→.4
+        self.current_ip = f"10.0.0.{self._station + 2}"  # 1→.3, 2→.4
         return self.current_ip
 
 
 class _FakePool:
     """FreeIPPool slice: active_station + switch_ip(station=...)."""
+
     def __init__(self, s1, s2=None):
         self._vpn = s1
         self._vpn2 = s2
@@ -76,6 +79,7 @@ def _post(app, station):
 
 # ── station=0: report the ACTIVE station (the review-fixed branch) ──
 
+
 def test_station0_reports_active_station_2_and_fresh_ip(app):
     """Active station = 2 → station=0 rotates station 2 and reports it
     with its NEW IP. (Pre-fix: reported station 1's unchanged IP as
@@ -87,7 +91,7 @@ def test_station0_reports_active_station_2_and_fresh_ip(app):
     assert body["station"] == 2
     assert body["ip"] == "10.0.0.4"
     assert s2.current_ip == "10.0.0.4" and s2.rotations == 1
-    assert s1.current_ip == "10.0.0.1" and s1.rotations == 0   # untouched
+    assert s1.current_ip == "10.0.0.1" and s1.rotations == 0  # untouched
 
 
 def test_station0_without_active_falls_back_to_station1(app):
@@ -102,6 +106,7 @@ def test_station0_without_active_falls_back_to_station1(app):
 
 
 # ── explicit station targets stay explicit ──
+
 
 def test_explicit_station1_ignores_active_station(app):
     """station=1 must rotate station 1 even when the pool is active on 2."""

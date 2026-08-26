@@ -32,7 +32,7 @@ import re
 import shutil
 import sqlite3
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_DB = os.path.join(ROOT, "logs", "requests.db")
@@ -56,14 +56,19 @@ def _connect(db_path: str, read_only: bool = False) -> sqlite3.Connection:
 
 def _db_stats(conn: sqlite3.Connection, table: str) -> tuple[int, int, int, int]:
     total = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-    naive = conn.execute(f"SELECT COUNT(*) FROM {table} WHERE timestamp NOT LIKE '%Z'").fetchone()[0]
-    lo, hi = conn.execute(f"SELECT MIN(length(timestamp)), MAX(length(timestamp)) FROM {table}").fetchone()
+    naive = conn.execute(f"SELECT COUNT(*) FROM {table} WHERE timestamp NOT LIKE '%Z'").fetchone()[
+        0
+    ]
+    lo, hi = conn.execute(
+        f"SELECT MIN(length(timestamp)), MAX(length(timestamp)) FROM {table}"
+    ).fetchone()
     return total, naive, lo, hi
 
 
 def _file_sizes(db_path: str) -> tuple[int, int, int]:
     def size(p: str) -> int:
         return os.path.getsize(p) if os.path.exists(p) else 0
+
     return size(db_path), size(db_path + "-wal"), size(db_path + "-shm")
 
 
@@ -103,9 +108,13 @@ def _backup(db_path: str, backup_dir: str) -> str:
     dst.close()
     src.close()
     if dst_count < src_count or quick is None or quick[0] != "ok":
-        raise RuntimeError(f"backup verification failed (src={src_count} dst={dst_count} quick_check={quick})")
+        raise RuntimeError(
+            f"backup verification failed (src={src_count} dst={dst_count} quick_check={quick})"
+        )
     if dst_count > src_count:
-        print(f"  note: {dst_count - src_count} row(s) inserted during backup (live server) — snapshot is consistent")
+        print(
+            f"  note: {dst_count - src_count} row(s) inserted during backup (live server) — snapshot is consistent"
+        )
     print(f"  backup verified: {dst_count} rows, quick_check={quick[0]}")
     return dest_path
 
@@ -129,9 +138,12 @@ def _migrate(conn: sqlite3.Connection) -> tuple[dict, int]:
                     f"{table} row id={rid!r} has non-legacy timestamp {ts!r} — "
                     "cannot convert; aborting (DB intact)"
                 )
-            new_ts = (datetime.fromisoformat(ts)
-                      .astimezone().astimezone(timezone.utc)
-                      .strftime("%Y-%m-%dT%H:%M:%SZ"))
+            new_ts = (
+                datetime.fromisoformat(ts)
+                .astimezone()
+                .astimezone(UTC)
+                .strftime("%Y-%m-%dT%H:%M:%SZ")
+            )
             conn.execute(
                 f"UPDATE {table} SET timestamp = ? WHERE id = ? AND timestamp NOT LIKE '%Z'",
                 (new_ts, rid),
@@ -147,7 +159,9 @@ def _migrate(conn: sqlite3.Connection) -> tuple[dict, int]:
 def _verify(conn: sqlite3.Connection) -> bool:
     ok = True
     for table in TABLES:
-        naive = conn.execute(f"SELECT COUNT(*) FROM {table} WHERE timestamp NOT LIKE '%Z'").fetchone()[0]
+        naive = conn.execute(
+            f"SELECT COUNT(*) FROM {table} WHERE timestamp NOT LIKE '%Z'"
+        ).fetchone()[0]
         bad_len = conn.execute(
             f"SELECT COUNT(*) FROM {table} WHERE length(timestamp) NOT IN (19, 20)"
         ).fetchone()[0]
@@ -158,12 +172,24 @@ def _verify(conn: sqlite3.Connection) -> bool:
 
 
 def main() -> None:
-    print("migrate_timestamps_utc — run on the proxy host: rows were written in that machine's local time")
-    parser = argparse.ArgumentParser(description="Convert naive local timestamps to UTC+Z in requests.db")
-    parser.add_argument("--db", default=DEFAULT_DB, help=f"SQLite database path (default: {DEFAULT_DB})")
+    print(
+        "migrate_timestamps_utc — run on the proxy host: rows were written in that machine's local time"
+    )
+    parser = argparse.ArgumentParser(
+        description="Convert naive local timestamps to UTC+Z in requests.db"
+    )
+    parser.add_argument(
+        "--db", default=DEFAULT_DB, help=f"SQLite database path (default: {DEFAULT_DB})"
+    )
     parser.add_argument("--dry-run", action="store_true", help="report only, write nothing, exit 0")
-    parser.add_argument("--no-backup", action="store_true", help="skip the .bak file (idempotent migration; not recommended)")
-    parser.add_argument("--backup-dir", default=None, help="directory for the backup (default: next to the DB)")
+    parser.add_argument(
+        "--no-backup",
+        action="store_true",
+        help="skip the .bak file (idempotent migration; not recommended)",
+    )
+    parser.add_argument(
+        "--backup-dir", default=None, help="directory for the backup (default: next to the DB)"
+    )
     args = parser.parse_args()
 
     db_path = os.path.abspath(args.db)
@@ -171,9 +197,12 @@ def main() -> None:
         raise SystemExit(f"ERROR: database not found: {db_path}")
 
     conn = _connect(db_path, read_only=True)
-    existing = {r[0] for r in conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('requests','free_model_usage')"
-    ).fetchall()}
+    existing = {
+        r[0]
+        for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('requests','free_model_usage')"
+        ).fetchall()
+    }
     missing = [t for t in TABLES if t not in existing]
     if missing:
         conn.close()
@@ -185,19 +214,27 @@ def main() -> None:
         print(f"  {table}: {total} rows, {naive} naive (no Z), length range {lo}-{hi}")
 
     free, needed, enough = _check_disk(db_path)
-    print(f"  disk free: {free/1e9:.2f} GiB, needed: {needed/1e9:.2f} GiB (2.5x DB+WAL) -> {'OK' if enough else 'INSUFFICIENT'}")
-    backup_path = os.path.join(args.backup_dir or os.path.dirname(db_path),
-                               os.path.basename(db_path) + ".bak-<timestamp>")
+    print(
+        f"  disk free: {free / 1e9:.2f} GiB, needed: {needed / 1e9:.2f} GiB (2.5x DB+WAL) -> {'OK' if enough else 'INSUFFICIENT'}"
+    )
+    backup_path = os.path.join(
+        args.backup_dir or os.path.dirname(db_path), os.path.basename(db_path) + ".bak-<timestamp>"
+    )
     if args.dry_run:
         print(f"dry-run: no changes. Planned backup: {backup_path}")
         conn.close()
         raise SystemExit(0)
     if not enough:
         conn.close()
-        raise SystemExit("ERROR: insufficient free disk space for backup + WAL growth — aborting, DB untouched")
+        raise SystemExit(
+            "ERROR: insufficient free disk space for backup + WAL growth — aborting, DB untouched"
+        )
 
     if args.no_backup:
-        print("WARNING: --no-backup — no snapshot will be written (migration is deterministic/idempotent)", file=sys.stderr)
+        print(
+            "WARNING: --no-backup — no snapshot will be written (migration is deterministic/idempotent)",
+            file=sys.stderr,
+        )
         backup_path = None
     else:
         backup_path = _backup(db_path, args.backup_dir or os.path.dirname(db_path))
@@ -222,7 +259,9 @@ def main() -> None:
         except Exception:
             pass
         rw.close()
-        raise SystemExit(f"ERROR: migration failed ({type(e).__name__}: {e}) — ROLLED BACK, DB intact")
+        raise SystemExit(
+            f"ERROR: migration failed ({type(e).__name__}: {e}) — ROLLED BACK, DB intact"
+        ) from e
 
     for table in TABLES:
         print(f"  {table}: {per_table[table]} converted")

@@ -15,12 +15,11 @@ Covered here (offline — no docker, no shared state):
   * resolved_station_count: absent+dual_station → 2; absent without dual
     → 1; explicit station_count wins; clamped [1, 10]; non-int guard.
 """
+
 import os
 
-import pytest
-
-from config.settings import resolved_station_count
 import vpn_manager as vm
+from config.settings import resolved_station_count
 
 
 def _mgr(station, **over):
@@ -33,8 +32,8 @@ def _mgr(station, **over):
 class TestPortDerivation:
     def test_station3_derived_defaults(self):
         m = _mgr(3)
-        assert m._socks5_port == 1082       # 1079 + 3
-        assert m._proxy_port == 8890        # 8887 + 3
+        assert m._socks5_port == 1082  # 1079 + 3
+        assert m._proxy_port == 8890  # 8887 + 3
         assert m._docker_container == "opencode-vpn-3"
         assert m._compose_service == "vpn-gluetun-3"
         assert m._state_file.endswith(os.path.join("logs", "vpn_state3.json"))
@@ -56,9 +55,14 @@ class TestPortDerivation:
         assert m._state_file.endswith(os.path.join("logs", "vpn_state2.json"))
 
     def test_explicit_keys_override_derived(self):
-        m = _mgr(3, socks5_proxy_port_3=2099, vpn_proxy_port_3=9999,
-                 docker_container_3="custom-box", compose_service_3="my-gluetun-3",
-                 state_file_3="logs/custom3.json")
+        m = _mgr(
+            3,
+            socks5_proxy_port_3=2099,
+            vpn_proxy_port_3=9999,
+            docker_container_3="custom-box",
+            compose_service_3="my-gluetun-3",
+            state_file_3="logs/custom3.json",
+        )
         assert m._socks5_port == 2099
         assert m._proxy_port == 9999
         assert m._docker_container == "custom-box"
@@ -82,8 +86,7 @@ class TestResolvedStationCount:
         assert resolved_station_count({"dual_station": True}) == 2
 
     def test_explicit_wins_over_dual(self):
-        assert resolved_station_count(
-            {"dual_station": True, "station_count": 4}) == 4
+        assert resolved_station_count({"dual_station": True, "station_count": 4}) == 4
 
     def test_clamp_high(self):
         assert resolved_station_count({"station_count": 25}) == 10
@@ -97,5 +100,4 @@ class TestResolvedStationCount:
 
     def test_non_int_falls_back_to_dual(self):
         assert resolved_station_count({"station_count": "abc"}) == 1
-        assert resolved_station_count(
-            {"dual_station": True, "station_count": "abc"}) == 2
+        assert resolved_station_count({"dual_station": True, "station_count": "abc"}) == 2

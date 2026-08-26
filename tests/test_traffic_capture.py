@@ -12,17 +12,18 @@ paths need raw ASGI control, so those feed the middleware a fake scope
 directly.
 """
 
-import sys
 import os
+import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pytest
 from starlette.applications import Starlette
-from starlette.responses import JSONResponse, Response
+from starlette.responses import JSONResponse
 from starlette.routing import Route
 from starlette.testclient import TestClient
 
+import traffic_capture as tc_module
 from traffic_capture import (
     TrafficCapture,
     TrafficCaptureMiddleware,
@@ -30,25 +31,40 @@ from traffic_capture import (
 )
 
 
+def test_middleware_default_capture_singleton():
+    """[plan v10 §14.3.29] `capture or capture` auto-référence corrigé :
+    monter le middleware sans argument doit retomber sur le singleton
+    module-level, pas lever AttributeError au premier hit."""
+    mw = TrafficCaptureMiddleware(app=None)  # jamais vu en prod avant fix
+    assert mw._capture is tc_module.capture
+    assert mw._capture.enabled is tc_module.capture.enabled
+
 # ── helpers ───────────────────────────────────────────────────────
+
 
 async def _echo_route(request):
     """Echo back the request body + metadata so tests can verify bytes."""
     body = await request.body()
-    resp = JSONResponse({
-        "method": request.method,
-        "path": request.url.path,
-        "query": request.url.query,
-        "body_len": len(body),
-    })
+    resp = JSONResponse(
+        {
+            "method": request.method,
+            "path": request.url.path,
+            "query": request.url.query,
+            "body_len": len(body),
+        }
+    )
     resp.headers["X-Echo"] = "yes"
     return resp
 
 
 def _make_app(cap):
-    app = Starlette(routes=[Route("/v1/messages", _echo_route, methods=["POST"]),
-                            Route("/v1/messages", _echo_route, methods=["GET"]),
-                            Route("/health", _echo_route)])
+    app = Starlette(
+        routes=[
+            Route("/v1/messages", _echo_route, methods=["POST"]),
+            Route("/v1/messages", _echo_route, methods=["GET"]),
+            Route("/health", _echo_route),
+        ]
+    )
     return TrafficCaptureMiddleware(app, cap)
 
 
@@ -65,13 +81,16 @@ def _post(text: str, **kwargs):
         cap = _new_cap()
     app = _make_app(cap)
     with TestClient(app) as client:
-        r = client.post("/v1/messages", content=text.encode(),
-                        headers={"Content-Type": "application/json",
-                                 "X-Custom": "token123"})
+        r = client.post(
+            "/v1/messages",
+            content=text.encode(),
+            headers={"Content-Type": "application/json", "X-Custom": "token123"},
+        )
     return cap, r.text
 
 
 # ── happy path ────────────────────────────────────────────────────
+
 
 class TestCaptureHappyPath:
     def test_frame_captured_with_raw_meta(self):
@@ -79,9 +98,11 @@ class TestCaptureHappyPath:
         app = _make_app(cap)
         payload = b'{"model":"mimo-v2.5","messages":[{"role":"user","content":"hi"}]}'
         with TestClient(app) as client:
-            r = client.post("/v1/messages?foo=bar&baz=1", content=payload,
-                            headers={"Content-Type": "application/json",
-                                     "X-Custom": "token123"})
+            r = client.post(
+                "/v1/messages?foo=bar&baz=1",
+                content=payload,
+                headers={"Content-Type": "application/json", "X-Custom": "token123"},
+            )
         assert r.status_code == 200
         assert cap.status()["frames"] == 1
         f = cap.frames()[0]
@@ -108,8 +129,7 @@ class TestCaptureHappyPath:
         assert headers["x-custom"] == "token123"
         # Body hex: first row must contain the raw bytes of the payload.
         assert detail["body_hex"]
-        joined = "".join(r["hex"].replace(" ", "")
-                         for r in detail["body_hex"])
+        joined = "".join(r["hex"].replace(" ", "") for r in detail["body_hex"])
         assert payload.hex() in joined
         assert "".join(r["ascii"] for r in detail["body_hex"]).startswith('{"a":"b"}')
 
@@ -145,18 +165,18 @@ class TestCaptureHappyPath:
 
 # ── truncation ────────────────────────────────────────────────────
 
+
 class TestTruncation:
     def test_body_over_cap_is_truncated_but_counted(self):
         cap = _new_cap(body_cap=1024)
         payload = b"y" * 5000
         cap, _ = _post(payload.decode(), cap=cap)
         f = cap.frames()[0]
-        assert f["body_len"] == 5000          # full wire count preserved
+        assert f["body_len"] == 5000  # full wire count preserved
         assert f["truncated"] is True
         detail = cap.frame_detail(f["id"])
         # Stored dump is capped to body_cap bytes.
-        stored = b"".join(bytes.fromhex(r["hex"].replace(" ", ""))
-                          for r in detail["body_hex"])
+        stored = b"".join(bytes.fromhex(r["hex"].replace(" ", "")) for r in detail["body_hex"])
         assert len(stored) == 1024
         assert stored == b"y" * 1024
 
@@ -172,6 +192,7 @@ class TestTruncation:
 
 
 # ── ring eviction ─────────────────────────────────────────────────
+
 
 class TestEviction:
     def test_max_frames_ring(self):
@@ -194,7 +215,7 @@ class TestEviction:
         cap = _new_cap(body_cap=1024, max_bytes=4096)
         app = _make_app(cap)
         with TestClient(app) as client:
-            for i in range(6):
+            for _i in range(6):
                 client.post("/v1/messages", content=(b"x" * 1024))
         status = cap.status()
         # 6x1KB = 6144 over budget → oldest evicted until <= 4096 (4 frames).
@@ -220,6 +241,7 @@ class TestEviction:
 
 # ── toggle & skip ─────────────────────────────────────────────────
 
+
 class TestToggleAndSkip:
     def test_configure_enabled_false_passes_through(self):
         cap = _new_cap(enabled=False)
@@ -237,11 +259,15 @@ class TestToggleAndSkip:
 
     def test_health_and_traffic_paths_skipped(self):
         cap = _new_cap()
-        app = _make_app(cap)
-        starlette = Starlette(routes=[Route("/health", _echo_route),
-                                      Route("/api/traffic/status", _echo_route),
-                                      Route("/static/app.js", _echo_route),
-                                      Route("/v1/messages", _echo_route)])
+        _make_app(cap)
+        starlette = Starlette(
+            routes=[
+                Route("/health", _echo_route),
+                Route("/api/traffic/status", _echo_route),
+                Route("/static/app.js", _echo_route),
+                Route("/v1/messages", _echo_route),
+            ]
+        )
         wrapped = TrafficCaptureMiddleware(starlette, cap)
         with TestClient(wrapped) as client:
             client.get("/health")
@@ -254,6 +280,7 @@ class TestToggleAndSkip:
 
 
 # ── stats ─────────────────────────────────────────────────────────
+
 
 class TestStats:
     def test_aggregates_methods_paths_statuses(self):
@@ -283,6 +310,7 @@ class TestStats:
 
 # ── abort / RST classification (raw ASGI) ─────────────────────────
 
+
 def _scope(**kw):
     scope = {
         "type": "http",
@@ -293,8 +321,7 @@ def _scope(**kw):
         "path": "/v1/messages",
         "raw_path": b"/v1/messages",
         "query_string": b"x=1",
-        "headers": [(b"content-type", b"application/json"),
-                    (b"x-token", b"abc")],
+        "headers": [(b"content-type", b"application/json"), (b"x-token", b"abc")],
         "client": ("127.0.0.1", 54321),
         "server": ("127.0.0.1", 4000),
     }
@@ -419,6 +446,7 @@ class TestAbortClassification:
 
 
 # ── hex_dump ──────────────────────────────────────────────────────
+
 
 class TestHexDump:
     def test_empty(self):
