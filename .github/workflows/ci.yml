@@ -27,14 +27,13 @@ jobs:
       # [P6] mypy bloquant sur les modules SAINS (0 erreur vérifiée) ;
       # le reste tourne en progressif VISIBLE (continue-on-error) — plus de
       # `|| true` qui avalait les erreurs.
-      # [26/08] rachat effectué : config/, dashboard/, protocol_mapping.py
-      # ET opencode.py passent dans le gate bloquant (reste progressif :
-      # vpn_manager.py, gui, scripts).
+      # [26/08] rachat terminé pour tout le cœur : 11 modules gated
+      # (reste progressif : gui/, scripts/, tests).
       - name: Mypy (gate modules sains)
         run: >-
           mypy traffic_capture.py docker_events.py trust.py shared_rotation.py
           shared_state.py config/__init__.py config/settings.py dashboard/api.py
-          protocol_mapping.py opencode.py --ignore-missing-imports
+          protocol_mapping.py opencode.py vpn_manager.py --ignore-missing-imports
           --follow-imports=silent
       - name: Mypy (progressif, non bloquant)
         run: mypy . --ignore-missing-imports

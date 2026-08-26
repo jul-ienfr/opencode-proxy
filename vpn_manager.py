@@ -25,8 +25,12 @@ import subprocess
 import sys
 import threading
 import time
+from typing import TYPE_CHECKING, Any
 
 import shared_state
+
+if TYPE_CHECKING:  # annotation seule — pas d'import runtime (déjà injecté en paramètre)
+    from shared_rotation import SharedRotationState
 
 # [plan v10 §14.1.9] Sérialise le read-modify-write du .env entre managers
 # concurrents (hot-reload vs auto-flip hétérogène). La section critique est
@@ -204,7 +208,7 @@ _KNOWN_IMPERSONATIONS = frozenset(
     }
 )
 
-_DEFAULT_IDENTITY_PROFILE = {"impersonate": "chrome131", "user_agent": None, "extra_headers": {}}
+_DEFAULT_IDENTITY_PROFILE: dict = {"impersonate": "chrome131", "user_agent": None, "extra_headers": {}}
 
 
 def _normalize_identity_profiles(profiles) -> list[dict]:
@@ -230,7 +234,7 @@ def _normalize_identity_profiles(profiles) -> list[dict]:
                 {
                     "impersonate": imp,
                     "user_agent": ua if isinstance(ua, str) and ua.strip() else None,
-                    "extra_headers": dict(extra),
+                    "extra_headers": dict(extra) if isinstance(extra, dict) else {},
                 }
             )
     if not result:
@@ -625,7 +629,7 @@ def _classify_probe_exc(exc: BaseException) -> str:
         return "refused"
     # Walk the cause chain: httpx/wireproxy tend to wrap the real socket
     # error (ConnectionRefusedError) one or two layers down.
-    cur = exc
+    cur: BaseException | None = exc
     while cur is not None:
         if isinstance(cur, ConnectionRefusedError):
             return "refused"
@@ -713,7 +717,7 @@ class VPNManager:
         concern degrades to per-station local behavior — exact backward
         compatibility.
         """
-        self._shared: object | None = shared
+        self._shared: SharedRotationState | None = shared
         # [plan v10 §4 Lot 6] overrides PER-STATION : `ip_rotation.per_station`
         # = {«2»: {quota_per_ip: 500, country_offset: 3}} — fusionné PAR-DESSUS
         # la base pour CETTE instance uniquement (copie, jamais la référence
@@ -820,7 +824,7 @@ class VPNManager:
             os.path.dirname(self._compose_file_path()), "vpn_configs", "wireguard.env"
         )
         if self._stack == "wireguard":
-            self._stack_effective = "wireguard"
+            self._stack_effective: str | None = "wireguard"
         elif self._stack == "openvpn":
             self._stack_effective = "openvpn"
         else:  # auto
@@ -1888,7 +1892,7 @@ class VPNManager:
 
     async def health_check(self) -> dict:
         """Probe the tunnel through SOCKS5 and measure latency."""
-        result = {"ok": False, "ip_changed": False, "latency_ms": None, "error": None}
+        result: dict[str, Any] = {"ok": False, "ip_changed": False, "latency_ms": None, "error": None}
         if self._status != VPNState.CONNECTED:
             result["error"] = "Non connecté"
             return result
@@ -2769,9 +2773,12 @@ class VPNManager:
         a stale set cannot return us early while an op is still running.
         """
         while self._rotation_op_count > 0:
-            self._rotation_op_event.clear()
+            _op_ev = self._rotation_op_event
+            if _op_ev is None:
+                break  # boucle de rotation arrêtée : plus rien à attendre
+            _op_ev.clear()
             if self._rotation_op_count > 0:
-                await self._rotation_op_event.wait()
+                await _op_ev.wait()
 
     async def _docker_inspect(self) -> dict:
         """Inspect the gluetun container. Returns {} if absent or docker unavailable."""
@@ -4790,10 +4797,14 @@ class VPNManager:
                             "[vpn-watchdog] light restart failed: %s — escalating to compose", e
                         )
                         started_at = None
-                    healed = bool(started_at) and not (
-                        await self._check_auth_failed(started_at)
-                        or await self._check_server_issue(started_at)
-                    )
+                    # [mypy] _wait_healthy -> str | None ; le court-circuit
+                    # bool() protégeait déjà l'exécution, on l'explicite.
+                    healed = False
+                    if started_at:
+                        healed = not (
+                            await self._check_auth_failed(started_at)
+                            or await self._check_server_issue(started_at)
+                        )
                     if healed and await self._watchdog_recover_fresh_ip():
                         return
                     if not healed:
@@ -4806,10 +4817,12 @@ class VPNManager:
                         except Exception as e:
                             logger.warning("[vpn-watchdog] compose escalation failed: %s", e)
                             started_at = None
-                        healed = bool(started_at) and not (
-                            await self._check_auth_failed(started_at)
-                            or await self._check_server_issue(started_at)
-                        )
+                        healed = False
+                        if started_at:
+                            healed = not (
+                                await self._check_auth_failed(started_at)
+                                or await self._check_server_issue(started_at)
+                            )
                         if healed and await self._watchdog_recover_fresh_ip():
                             return
                     # Still failing: keep the error state and back off. This
