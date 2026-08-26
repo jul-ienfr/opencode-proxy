@@ -20,7 +20,7 @@ Production : flotte **4/4 connectée**, conteneurs healthy, uptime st1 = 7h+ (te
 
 1. **Nuit 24→25** : rôle control server perdu par overwrite de credentials.env → healthcheck 401 → churn infini. Fixes : rôle restauré (format officiel wiki), upsert anti-perte, DNS plain 1.1.1.1:53, MTU 1280.
 2. **Matin 25 (A)** : st3 rm cyclique — boot reconcile ré-exécuté à chaque redémarrage in-process du tray. Fix : garde `_RECONCILE_DONE_THIS_PROCESS` + période de grâce 120 s dans le reconcile.
-3. **Matin 25 (B)** : `POST /api/proxy/restart` laisse le serveur mort (shutdown OK, startup jamais relancé) — contournement : kill+relaunch process frais. **Ticket ouvert P1** : investiguer server_manager.restart() en mode --gui.
+3. **Matin 25 (B)** : `POST /api/proxy/restart` laisse le serveur mort (shutdown OK, startup jamais relancé) — contournement : kill+relaunch process frais. ~~**Ticket ouvert P1**~~ → **RÉSOLU (26/08, commit 50bd298)** : racine = restart appelé sur la boucle uvicorn (`/api/config` non corrigé par le fix proxy_restart) → stop() join(current_thread) → RuntimeError avant start(). Fixes : thread dédié "proxy-restart" + to_thread pour start/stop + garde anti self-join dans ServerManager.stop().
 
 ## Journal condensé (détails : entrées horodatées du plan miroir)
 
@@ -30,7 +30,7 @@ Production : flotte **4/4 connectée**, conteneurs healthy, uptime st1 = 7h+ (te
 
 - §12.2.9 géo-aware routing proactif : ☑ **déjà implémenté** ([Axe A/C] : _enforce_geo_gate pose _geo_forced_pool de façon proactive, lignes 3490-3496/3808-3809, couvert test_geo_routing.py) — texte plan périmé corrigé
 - §12.3 différenciation : reporté volontairement
-- Ticket P1 ouvert : server_manager.restart() in-process (mode --gui) ne relance pas le serveur — contournement opérationnel : kill+relaunch process
+- ~~Ticket P1 ouvert~~ **Résolu** (commit 50bd298) : server_manager.restart() in-process ne relance pas le serveur — plus de contournement nécessaire
 
 ## Observation §13.5 — critères de clôture J+3
 
