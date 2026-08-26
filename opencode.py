@@ -614,128 +614,36 @@ attach_module_logger("free_ip_pool")
 
 # Request body size limit (from YAML config, default 10 MB)
 MAX_BODY_SIZE = yaml_get("upstream", "max_body_size", 10 * 1024 * 1024)
-MAX_BODY_STORAGE = 100_000  # Max chars stored per request/response body in DB
+
+# ── [P5 tranche 1] Logique DB extraite vers app/db (pur, DI) ────────────
+# Les noms historiques restent exposés ici (seams de test oc._DbRowRaw /
+# oc._quick_body_size / monkeypatch.setattr(oc, "_conn"|"_db_queue")) :
+# chaque wrapper lit ses globales À L'APPEL — un patch d'oc._conn ou
+# oc._db_queue continue de couler dans la logique déléguée.
+from app import db as _app_db  # noqa: E402
+
+MAX_BODY_STORAGE = _app_db.MAX_BODY_STORAGE
 
 
-def _truncate_body_for_storage(body: dict, max_chars: int = MAX_BODY_STORAGE) -> str | None:
-    """Serialize body to JSON, truncating messages array if needed to stay under max_chars.
-
-    Keeps model, tools, and a summary of messages to preserve context while
-    avoiding the memory waste of serializing a 10MB body just to keep 100K.
-
-    Optimized: builds truncated version first, only falls back to full
-    serialization if the truncated version is small enough.
-    """
-    if not body:
-        return None
-    # Quick size estimate: sum of string lengths of non-messages fields
-    # This avoids full json.dumps for large bodies
-    estimate = sum(len(str(v)) for k, v in body.items() if k != "messages")
-    messages = body.get("messages", [])
-    if messages:
-        # Estimate first 2 messages + truncation marker
-        for msg in messages[:2]:
-            estimate += len(str(msg))
-        estimate += 80  # truncation marker overhead
-
-    if estimate <= max_chars:
-        # Likely fits — do full serialization (single pass)
-        full = json.dumps(body, ensure_ascii=False, separators=(",", ":"))
-        if len(full) <= max_chars:
-            return full
-        # Fell through: full was too big, build truncated version
-    # Build truncated version (skip full serialization of large body)
-    truncated = {k: v for k, v in body.items() if k != "messages"}
-    if messages:
-        truncated["messages"] = messages[:2] + [
-            {"_truncated": True, "original_count": len(messages)}
-        ]
-    result = json.dumps(truncated, ensure_ascii=False, separators=(",", ":"))
-    if len(result) > max_chars:
-        result = result[:max_chars]
-    return result
+def _truncate_body_for_storage(
+    body: dict | None, max_chars: int = MAX_BODY_STORAGE
+) -> str | None:
+    return _app_db.truncate_body_for_storage(body, max_chars)
 
 
-_DB_RAW_SIZE_CAP = 2_000_000  # [D1] au-delà : résumé compact mis en queue
+_DB_RAW_SIZE_CAP = _app_db.DB_RAW_SIZE_CAP
 
 
 def _quick_body_size(body) -> int:
-    """[D1 perf] Estimation O(texte) SANS sérialisation ni repr — somme des
-    longueurs des chaînes directement accessibles (champs top-level +
-    contenus de messages). Suffisante pour décider si un corps est trop
-    volumineux pour la queue ; le tronquage exact reste dans le writer."""
-    if not isinstance(body, dict):
-        return 0
-    total = 0
-    for v in body.values():
-        if type(v) is str:
-            total += len(v)
-    msgs = body.get("messages")
-    if isinstance(msgs, list):
-        for m in msgs:
-            if not isinstance(m, dict):
-                continue
-            c = m.get("content")
-            if type(c) is str:
-                total += len(c)
-            elif isinstance(c, list):
-                for p in c:
-                    if isinstance(p, dict):
-                        t = p.get("text") or p.get("thinking") or ""
-                        if type(t) is str:
-                            total += len(t)
-                        if p.get("input") is not None and not isinstance(
-                            p.get("input"), (str, int, float, bool)
-                        ):
-                            total += 256  # tool_use input : borne grossière
-    return total
+    return _app_db.quick_body_size(body)
 
 
 def _compact_body_stub(body) -> dict:
-    """[D1] Corps > _DB_RAW_SIZE_CAP → résumé compact (le writer appliquera
-    truncate+redact comme à tout autre corps). Évite d'épingler 10 Mo dans
-    la queue sous stall DB."""
-    stub: dict = {"_oversize": True}
-    if isinstance(body, dict):
-        for k in ("model", "stream", "max_tokens"):
-            if k in body:
-                stub[k] = body[k]
-        sysv = body.get("system")
-        if isinstance(sysv, str):
-            stub["system_head"] = sysv[:500]
-        elif isinstance(sysv, list) and sysv and isinstance(sysv[0], dict):
-            stub["system_head"] = str(sysv[0].get("text", ""))[:500]
-        msgs = body.get("messages")
-        if isinstance(msgs, list):
-            stub["_message_count"] = len(msgs)
-            first = msgs[0] if msgs else None
-            if isinstance(first, dict):
-                c = first.get("content")
-                stub["first_message_role"] = first.get("role")
-                stub["first_message_head"] = (
-                    c[:300] if isinstance(c, str) else str(c)[:300]
-                )
-    return stub
+    return _app_db.compact_body_stub(body)
 
 
-class _DbRowRaw:
-    """[D1 perf] Ligne DB brute : dumps tools + tronquage + redaction
-    s'exécutent dans le THREAD WRITER (_materialize_db_row), plus dans la
-    coroutine appelante — 0,5-3 ms/requête rendus à l'event loop.
-    L'ordre d'écriture est préservé (même queue unique)."""
-
-    __slots__ = ("head", "tail", "request_body", "response_body", "tools", "tools_used")
-
-    def __init__(self, head: tuple, tail: tuple, *, request_body, response_body, tools, tools_used):
-        # head = champs SQL avant tools_json (id..account_alias),
-        # tail = champs après response_body_json (client_user_agent..station).
-        self.head = head
-        self.tail = tail
-        self.request_body = request_body
-        self.response_body = response_body
-        self.tools = tools
-        self.tools_used = tools_used
-
+# Alias (PAS une sous-classe) : isinstance fonctionne dans les deux sens.
+_DbRowRaw = _app_db.DbRowRaw
 
 # [P2 perf] registre global des tool names déjà utilisés (alimenté par le
 # thread writer) — consommé par /api/history/filters via tools_provider.
@@ -744,145 +652,43 @@ _tools_used_seen: set = set()
 
 def _materialize_db_row(raw: "_DbRowRaw") -> tuple:
     """Thread writer : sérialise/tronque/redige une ligne brute (CPU hors loop)."""
-    tools_json = json.dumps(raw.tools) if raw.tools else "[]"
-    tools_used_json = json.dumps(list(dict.fromkeys(raw.tools_used))) if raw.tools_used else "[]"
-    # [P2 perf] registre des tools utilisés pour /api/history/filters —
-    # tenu à jour ici côté writer (thread unique) : le dashboard n'a plus à
-    # scanner TOUTE la table JSON à chaque requête de filtres.
-    if raw.tools_used:
-        _tools_used_seen.update(raw.tools_used)
-    request_body_json = (
-        _redact(_truncate_body_for_storage(raw.request_body)) if raw.request_body else None
-    )
-    response_body_json = (
-        _redact(_truncate_body_for_storage(raw.response_body)) if raw.response_body else None
-    )
-    return raw.head + (tools_json, tools_used_json, request_body_json, response_body_json) + raw.tail
+    return _app_db.materialize_db_row(raw, redact_fn=_redact, tools_seen=_tools_used_seen)
 
 
 # SQLite setup — synchronous connection, all DB ops run in thread pool
+# [P5 tranche 1] PRAGMAs/schéma/migrations/index délégués à app/db.
 _db_path = os.path.join(LOG_DIR, "requests.db")
 _conn = sqlite3.connect(_db_path, check_same_thread=False)
 _conn.row_factory = sqlite3.Row
-_conn.execute("PRAGMA journal_mode=WAL")
-_conn.execute(f"PRAGMA busy_timeout={yaml_get('database', 'busy_timeout', 5000)}")
-_conn.execute("PRAGMA synchronous=NORMAL")  # WAL+NORMAL: safe crash-resilient, 50-90% fewer fsyncs
-_conn.execute(f"PRAGMA cache_size=-{yaml_get('database', 'cache_size', 64000)}")  # page cache
-_conn.execute("PRAGMA temp_store=MEMORY")  # temp tables in RAM
-_conn.execute(
-    f"PRAGMA mmap_size={yaml_get('database', 'mmap_size', 268435456)}"
-)  # memory-mapped I/O
-_conn.execute("""
-    CREATE TABLE IF NOT EXISTS requests (
-        id TEXT PRIMARY KEY,
-        timestamp TEXT NOT NULL,
-        model TEXT NOT NULL,
-        original_model TEXT,
-        duration_ms INTEGER,
-        tokens_input INTEGER,
-        tokens_output INTEGER,
-        tokens_cache INTEGER,
-        success INTEGER,
-        error TEXT,
-        protocol TEXT,
-        is_stream INTEGER,
-        thinking TEXT,
-        effort TEXT
-    )
-""")
-_conn.execute("CREATE INDEX IF NOT EXISTS idx_timestamp ON requests(timestamp)")
-_conn.execute("CREATE INDEX IF NOT EXISTS idx_model ON requests(model)")
-_conn.execute("CREATE INDEX IF NOT EXISTS idx_success ON requests(success)")
-_conn.execute("CREATE INDEX IF NOT EXISTS idx_account ON requests(account_alias)")
-_conn.execute("CREATE INDEX IF NOT EXISTS idx_ts_model ON requests(timestamp, model)")
-_conn.execute("CREATE INDEX IF NOT EXISTS idx_free_ip ON requests(free_model_ip)")
-# [P2 perf] filtre historique par modèle original (dropdown dashboard)
-_conn.execute("CREATE INDEX IF NOT EXISTS idx_original_model ON requests(original_model)")
-for col, default in [
-    ("protocol", "NULL"),
-    ("is_stream", "0"),
-    ("thinking", "NULL"),
-    ("effort", "NULL"),
-    ("client_ip", "NULL"),
-    ("account_alias", "NULL"),
-    ("tools", "NULL"),
-    ("tools_used", "NULL"),
-    ("request_body", "NULL"),
-    ("response_body", "NULL"),
-    ("client_user_agent", "NULL"),
-    ("free_model_ip", "NULL"),
-    ("identity", "NULL"),
-    ("geo_country", "NULL"),
-    ("geo_blocked", "0"),
-    ("hedged", "0"),
-    ("winner_station", "NULL"),
-    ("geo_direct_country", "NULL"),
-    ("geo_direct_ip", "NULL"),
-    ("geo_via_vpn", "0"),
-    ("geo_allowed", "NULL"),
-]:
-    try:
-        _conn.execute(f"ALTER TABLE requests ADD COLUMN {col} TEXT DEFAULT {default}")
-    except Exception:
-        pass
-# [plan v10 §4 Lot 4] colonne station INTEGER (filtres ?station= dashboard) +
-# index composé station+timestamp (budget §7 : pas de scan à chaque filtre).
-try:
-    _conn.execute("ALTER TABLE requests ADD COLUMN station INTEGER DEFAULT NULL")
-except Exception:
-    pass
-_conn.execute(
-    "CREATE INDEX IF NOT EXISTS idx_requests_station_ts ON requests(station, timestamp)"
+_naive_ts_count = _app_db.init_requests_schema(
+    _conn,
+    busy_timeout=yaml_get("database", "busy_timeout", 5000),
+    cache_size=yaml_get("database", "cache_size", 64000),
+    mmap_size=yaml_get("database", "mmap_size", 268435456),
 )
-_conn.commit()
 _debug(f"  [db] SQLite connection established: {_db_path}")
 
 # [30] Canary: mixed naive/UTC timestamps break ORDER BY timestamp DESC (BINARY
 # collation) — warn the operator that scripts/migrate_timestamps_utc.py is pending.
-try:
-    _naive = _conn.execute(
-        "SELECT COUNT(*) FROM requests WHERE timestamp NOT LIKE '%Z'"
-    ).fetchone()[0]
-    if _naive:
-        _log(
-            f"  WARNING: {_naive} requests row(s) with naive timestamps (mixed local/UTC) — run scripts/migrate_timestamps_utc.py"
-        )
-except Exception:
-    pass
+if _naive_ts_count:
+    _log(
+        f"  WARNING: {_naive_ts_count} requests row(s) with naive timestamps (mixed local/UTC) — run scripts/migrate_timestamps_utc.py"
+    )
 
 
 # ── Free model usage tracking ──
-_conn.execute("""
-    CREATE TABLE IF NOT EXISTS free_model_usage (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        timestamp TEXT NOT NULL,
-        paid_model TEXT NOT NULL,
-        free_model TEXT NOT NULL,
-        api_key TEXT NOT NULL,
-        workspace_id TEXT NOT NULL,
-        status INTEGER NOT NULL,
-        tokens_input INTEGER DEFAULT 0,
-        tokens_output INTEGER DEFAULT 0,
-        duration_ms INTEGER DEFAULT 0,
-        ip TEXT DEFAULT ''
-    )
-""")
-_conn.execute("CREATE INDEX IF NOT EXISTS idx_free_ts ON free_model_usage(timestamp)")
-_conn.execute("CREATE INDEX IF NOT EXISTS idx_free_model ON free_model_usage(free_model)")
-_conn.execute("CREATE INDEX IF NOT EXISTS idx_free_key ON free_model_usage(api_key)")
-try:
-    _conn.execute("ALTER TABLE free_model_usage ADD COLUMN ip TEXT DEFAULT ''")
-except Exception:
-    pass  # Column already exists
-_conn.commit()
+_app_db.init_free_usage_schema(_conn)
 _debug("  [db] free_model_usage table ready")
 
 
-_db_pending_inserts = 0
-_db_last_commit = time.monotonic()
 _DB_COMMIT_INTERVAL = yaml_get("database", "commit_interval", 5)  # seconds between periodic commits
 _DB_COMMIT_BATCH = yaml_get("database", "commit_batch", 10)  # force commit after N inserts
 _db_commit_lock = threading.Lock()
+# [P5 tranche 1] état de batch mutable porté par app.db.BatchState — les
+# globales ci-dessus restent pour compat mais l'état VIVANT est _db_state.
+_db_state = _app_db.BatchState(
+    commit_interval=_DB_COMMIT_INTERVAL, commit_batch=_DB_COMMIT_BATCH
+)
 # Ultra-fast async DB queue — single writer, no per-request to_thread
 _db_queue: asyncio.Queue = asyncio.Queue(maxsize=10000)
 _db_writer_task: asyncio.Task | None = None
@@ -920,112 +726,41 @@ _web_nondet_injected: contextvars.ContextVar[bool] = contextvars.ContextVar(
 
 def _db_flush():
     """Force a pending commit. Called periodically and before shutdown."""
-    global _db_pending_inserts, _db_last_commit
-    with _db_commit_lock:
-        if _db_pending_inserts > 0:
-            try:
-                _conn.commit()
-                _debug(f"  [db] _db_flush: committed {_db_pending_inserts} pending inserts")
-            except Exception as e:
-                _debug(f"  [db] _db_flush commit FAILED: {type(e).__name__}: {e}")
-                # Try rollback to recover the connection for future operations
-                try:
-                    _conn.rollback()
-                except Exception:
-                    pass
-            # Always reset counter to avoid stuck state — even if commit failed,
-            # uncommitted rows will be lost but new inserts can proceed normally
-            _db_pending_inserts = 0
-            _db_last_commit = time.monotonic()
+    _app_db.flush(_conn, _db_commit_lock, _db_state, debug_fn=_debug)
 
 
 def _db_vacuum_if_needed(deleted_rows: int):
-    """Reclaim disk space after cleanup deletes (Vague 4/(g)).
-
-    SQLite keeps freed pages inside the file until VACUUM — without it the
-    DB only grows. Runs at most daily (cleanup cadence), only when rows
-    were actually deleted. VACUUM needs exclusive access, so it holds the
-    same lock as inserts/checkpoints; it commits any pending transaction
-    first and is itself transactional (safe on failure).
-    """
+    """Reclaim disk space after cleanup deletes (Vague 4/(g))."""
     if deleted_rows <= 0:
         return
-    with _db_commit_lock:
-        try:
+    try:
+        with _db_commit_lock:
             # A batched-insert transaction may still be open; VACUUM refuses
-            # to run inside one. Committing it early is harmless — the rows
-            # were destined to commit within the batch window anyway.
+            # to run inside one. Committing it early is harmless.
             if _conn.in_transaction:
                 _conn.commit()
             _conn.execute("VACUUM")
-        except Exception as e:
-            _debug(f"  [db] vacuum error: {type(e).__name__}: {e}")
-            return
+    except Exception as e:
+        _debug(f"  [db] vacuum error: {type(e).__name__}: {e}")
+        return
     _log(f"  DB VACUUM: reclaimed space after deleting {deleted_rows} rows")
 
 
 def _db_cleanup_old_bodies(retention_days: int = 7, delete_after_days: int = 30):
-    """Clean up old request data to prevent DB bloat.
-
-    Two-phase cleanup:
-    1. DELETE entire rows older than delete_after_days (30d default) — full removal
-    2. NULLIFY bodies for rows between retention_days and delete_after_days — keep metadata
-
-    Bodies account for ~95% of DB storage. This keeps recent bodies for debugging
-    while preventing unbounded growth. Called periodically by background task.
-    """
-    try:
-        # Phase 1: Delete old rows entirely
-        cutoff_delete = time.strftime(
-            "%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - delete_after_days * 86400)
-        )
-        cursor = _conn.execute("DELETE FROM requests WHERE timestamp < ?", (cutoff_delete,))
-        deleted = cursor.rowcount
-        cursor2 = _conn.execute(
-            "DELETE FROM free_model_usage WHERE timestamp < ?", (cutoff_delete,)
-        )
-        deleted2 = cursor2.rowcount
-
-        # Phase 2: Nullify bodies for 7-30 day old rows
-        cutoff_null = time.strftime(
-            "%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - retention_days * 86400)
-        )
-        cursor3 = _conn.execute(
-            "UPDATE requests SET request_body = NULL, response_body = NULL "
-            "WHERE timestamp < ? AND (request_body IS NOT NULL OR response_body IS NOT NULL)",
-            (cutoff_null,),
-        )
-        cleaned = cursor3.rowcount
-
-        total = deleted + deleted2 + cleaned
-        if total > 0:
-            _conn.commit()
-            _debug(
-                f"  [db] cleanup: deleted {deleted}+{deleted2} old rows, cleared bodies from {cleaned} requests"
-            )
-            _log(
-                f"  DB CLEANUP: deleted {deleted + deleted2} old rows, cleared {cleaned} bodies (>{retention_days}d)"
-            )
-            _db_vacuum_if_needed(deleted + deleted2)
-        return deleted + deleted2 + cleaned
-    except Exception as e:
-        _debug(f"  [db] cleanup error: {type(e).__name__}: {e}")
-        return 0
+    """Clean up old request data (two-phase : DELETE > 30 j, NULL bodies 7-30 j)."""
+    return _app_db.cleanup_old_bodies(
+        _conn,
+        _db_commit_lock,
+        retention_days,
+        delete_after_days,
+        log_fn=_log,
+        debug_fn=_debug,
+    )
 
 
 def _normalize_timestamp_utc(timestamp: str) -> str:
     """Naive local wall time → UTC+Z ; les valeurs déjà en Z passent inchangées."""
-    if timestamp.endswith("Z"):
-        return timestamp
-    try:
-        return (
-            datetime.datetime.fromisoformat(timestamp)
-            .astimezone()
-            .astimezone(datetime.UTC)
-            .strftime("%Y-%m-%dT%H:%M:%SZ")
-        )
-    except ValueError:
-        return timestamp  # unparseable — store as-is rather than dropping the row
+    return _app_db.normalize_timestamp_utc(timestamp)
 
 
 def _db_insert_sync(
@@ -1065,112 +800,60 @@ def _db_insert_sync(
     Batches commits: accumulates INSERTs and commits every _DB_COMMIT_BATCH
     inserts or every _DB_COMMIT_INTERVAL seconds, whichever comes first.
     Reduces fsync overhead under load (50 req/s → ~1 commit/s instead of 50).
+    [P5 tranche 1] logique déléguée à app/db.insert_sync.
     """
-    global _db_pending_inserts, _db_last_commit
     # [30] Normalize any timestamp that reaches the writer without a Z suffix:
     # naive strings are local wall time and silently mis-order ORDER BY timestamp DESC.
     timestamp = _normalize_timestamp_utc(timestamp)
-    t0 = time.monotonic()
-    # Lock the entire execute+commit block to prevent InterfaceError when
-    # _db_flush or _wal_checkpoint runs concurrently on another thread.
-    with _db_commit_lock:
-        _conn.execute(
-            """
-            INSERT OR REPLACE INTO requests (id, timestamp, model, original_model, duration_ms,
-                tokens_input, tokens_output, tokens_cache, success, error,
-                protocol, is_stream, thinking, effort, client_ip, account_alias, tools, tools_used,
-                request_body, response_body, client_user_agent, free_model_ip, identity, geo_country, geo_blocked,
-                geo_direct_country, geo_direct_ip, geo_via_vpn, geo_allowed, station)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-            (
-                req_id,
-                timestamp,
-                model,
-                original_model,
-                duration_ms,
-                tokens_input,
-                tokens_output,
-                tokens_cache,
-                1 if success else 0,
-                error,
-                protocol,
-                1 if is_stream else 0,
-                thinking,
-                effort,
-                client_ip,
-                account_alias,
-                tools_json,
-                tools_used_json,
-                request_body_json,
-                response_body_json,
-                client_user_agent,
-                free_model_ip,
-                identity,
-                geo_country,
-                geo_blocked,
-                geo_direct_country,
-                geo_direct_ip,
-                1 if geo_via_vpn else 0,
-                geo_allowed,
-                station,
-            ),
-        )
-        # Batch commit logic
-        _db_pending_inserts += 1
-        now = time.monotonic()
-        elapsed = now - _db_last_commit
-        if _db_pending_inserts >= _DB_COMMIT_BATCH or elapsed >= _DB_COMMIT_INTERVAL:
-            try:
-                _conn.commit()
-                _debug(
-                    f"  [db] _db_insert_sync: batch-committed {_db_pending_inserts} inserts ({elapsed:.1f}s) in {(time.monotonic() - t0) * 1000:.1f}ms"
-                )
-            except Exception as e:
-                _debug(f"  [db] _db_insert_sync commit FAILED: {type(e).__name__}: {e}")
-                try:
-                    _conn.rollback()
-                except Exception:
-                    pass
-            # Always reset counter to avoid stuck state
-            _db_pending_inserts = 0
-            _db_last_commit = now
-        else:
-            _debug(
-                f"  [db] _db_insert_sync: queued req_id={req_id} (pending={_db_pending_inserts}, {elapsed:.1f}s since last commit)"
-            )
+    row = (
+        req_id,
+        timestamp,
+        model,
+        original_model,
+        duration_ms,
+        tokens_input,
+        tokens_output,
+        tokens_cache,
+        1 if success else 0,
+        error,
+        protocol,
+        1 if is_stream else 0,
+        thinking,
+        effort,
+        client_ip,
+        account_alias,
+        tools_json,
+        tools_used_json,
+        request_body_json,
+        response_body_json,
+        client_user_agent,
+        free_model_ip,
+        identity,
+        geo_country,
+        geo_blocked,
+        geo_direct_country,
+        geo_direct_ip,
+        1 if geo_via_vpn else 0,
+        geo_allowed,
+        station,
+    )
+    _app_db.insert_sync(_conn, _db_commit_lock, _db_state, row, debug_fn=_debug)
 
 
 def _db_execute_batch_sync(batch: list):
-    """Execute a batch of DB inserts in a single transaction (called in thread pool)."""
-    if not batch:
-        return 0
-    with _db_commit_lock:
-        for item in batch:
-            # [D1 perf] les lignes brutes sont sérialisées/tronquées/redactées
-            # ICI (thread writer), plus dans l'event loop.
-            row = _materialize_db_row(item) if isinstance(item, _DbRowRaw) else item
-            _conn.execute(
-                """
-                INSERT OR REPLACE INTO requests (id, timestamp, model, original_model, duration_ms,
-                    tokens_input, tokens_output, tokens_cache, success, error,
-                    protocol, is_stream, thinking, effort, client_ip, account_alias, tools, tools_used,
-                    request_body, response_body, client_user_agent, free_model_ip, identity, geo_country, geo_blocked,
-                    geo_direct_country, geo_direct_ip, geo_via_vpn, geo_allowed, station)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-                row,
-            )
-        try:
-            _conn.commit()
-        except Exception as e:
-            _debug(f"  [db] batch commit FAILED: {type(e).__name__}: {e}")
-            try:
-                _conn.rollback()
-            except Exception:
-                pass
-            return 0
-        return len(batch)
+    """Execute a batch of DB inserts in a single transaction (called in thread pool).
+
+    [P5 tranche 1] logique déléguée à app/db.execute_batch_sync — la lecture
+    de ``_conn``/``_materialize_db_row`` se fait À L'APPEL : un
+    monkeypatch.setattr(oc, "_conn", ...) coule dans la logique déléguée.
+    """
+    return _app_db.execute_batch_sync(
+        _conn,
+        _db_commit_lock,
+        batch,
+        _materialize_db_row,
+        debug_fn=_debug,
+    )
 
 
 async def _db_writer_loop():
@@ -1473,7 +1156,7 @@ def _wal_checkpoint():
     """Run WAL checkpoint to prevent WAL file growth."""
     try:
         with _db_commit_lock:
-            _conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            _app_db.wal_checkpoint(_conn)
         _debug("  [db] WAL checkpoint completed successfully")
     except Exception as e:
         _debug(f"  [db] WAL checkpoint FAILED: {type(e).__name__}: {e}")
@@ -2565,10 +2248,8 @@ async def lifespan(app):
                 t0 = time.monotonic()
 
                 def _maint():
-                    with _db_commit_lock:
-                        _conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-                        _conn.execute("VACUUM")
-                    return round(os.path.getsize(_db_path) / 1024 / 1024, 1)
+                    # [P5 tranche 1] logique déléguée à app/db.weekly_maintain
+                    return _app_db.weekly_maintain(_conn, _db_commit_lock)
 
                 size_mo = await asyncio.to_thread(_maint)
                 _debug(
