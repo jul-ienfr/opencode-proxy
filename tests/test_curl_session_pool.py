@@ -169,6 +169,40 @@ async def test_pooled_sessions_inherit_bounded_timeout(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_cancelled_post_evicts_and_closes_session(monkeypatch):
+    """[P2.1] Un POST annulé (stop client) doit FERMER la session via
+    _evict_later — discard() seul la retirait du tracking sans close
+    (fuite socket à chaque stop Claude Code pendant un POST)."""
+    created: list = []
+
+    def _factory(**kw):
+        sess = _FakeCurlSession([], 0.5)  # POST long → annulé en cours
+        created.append(sess)
+        return sess
+
+    monkeypatch.setattr("curl_cffi.requests.AsyncSession", _factory)
+
+    pool, slot = await oc._get_pooled_curl_session("socks5://c:1080", "chrome131")
+
+    async def _cancelled_request():
+        try:
+            await slot.sess.post("http://x")
+        except asyncio.CancelledError:
+            oc._evict_later(pool, slot)
+            raise
+
+    task = asyncio.ensure_future(_cancelled_request())
+    await asyncio.sleep(0.05)  # laisse le POST entrer
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await asyncio.sleep(0.05)  # laisse tourner la tâche d'éviction différée
+
+    assert created[0].closed, "session fermée après annulation (pas de fuite socket)"
+    assert all(s is not slot for s in pool.slots), "slot évicté du pool"
+
+
+@pytest.mark.asyncio
 async def test_do_free_request_parallel_via_helper(monkeypatch):
     """Bout-en-bout _do_free_request_curl_cffi : 4 appels concurrents vers la
     même station se chevauchent (fin du head-of-line blocking) via le chemin

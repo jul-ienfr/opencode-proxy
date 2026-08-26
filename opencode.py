@@ -4053,9 +4053,11 @@ async def _do_free_request_curl_cffi(
             timeout=(10, 600),  # (connect, read) — read 600: long streams
         )
     except asyncio.CancelledError:
-        # État transport inconnu → on jette l'emprunt sans await (pas de
-        # close dans une tâche annulée) ; le shutdown fermera le reste.
-        pool.discard(slot)
+        # [P2.1 perf/fuite] _evict_later au lieu de discard() : le slot est
+        # RETIRÉ du tracking par discard sans close → socket TLS qui fuit à
+        # chaque stop Claude Code pendant un POST. L'éviction différée
+        # (fire-and-forget) ferme la session hors de la tâche annulée.
+        _evict_later(pool, slot)
         raise
     except _curl_err.RequestsError as e:
         # [plan 18/08 §1a] a REAL connection failure (dead SOCKS5 tunnel)
@@ -4627,7 +4629,9 @@ async def _open_free_stream(
                         stream=True,
                     )
                 except asyncio.CancelledError:
-                    pool2.discard(slot2)
+                    # [P2.1] éviction différée : close réel au lieu du
+                    # discard (socket qui fuyait à chaque stop client en stream).
+                    _evict_later(pool2, slot2)
                     raise
                 except BaseException:
                     _evict_later(pool2, slot2)
@@ -4834,7 +4838,8 @@ async def _open_via_pool(endpoint, body, headers, *, is_stream=False, forced_poo
                 stream=True,
             )
         except asyncio.CancelledError:
-            pool.discard(slot)
+            # [P2.1] éviction différée (close réel) au lieu de discard.
+            _evict_later(pool, slot)
             raise
         except BaseException:
             _evict_later(pool, slot)
