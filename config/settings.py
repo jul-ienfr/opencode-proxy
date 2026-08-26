@@ -9,6 +9,7 @@ import sys
 import threading
 import time
 from functools import lru_cache as _lru_cache
+from typing import Any
 
 # Windows: masquer la fenêtre console des subprocess (évite le flash noir 1s)
 _CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
@@ -56,7 +57,7 @@ CONFIG_KEYS = [
 # ── YAML Config Loader ───────────────────────────────────────────────
 # Hot-reload coalesces config.yaml + custom_routes.json under single _reload_lock
 
-_yaml_data = {}
+_yaml_data: dict[str, Any] = {}
 _config_yaml_mtime: float = 0.0  # set after initial load
 
 
@@ -956,7 +957,7 @@ if isinstance(_goi_raw, list):
 FREE_MODELS: set = {v for v in FREE_MODEL_MAP.values() if isinstance(v, str) and v}
 FREE_MODEL_POOL: list = sorted(FREE_MODELS)
 # Observability state (exposed via GET /api/free-models)
-_FREE_DISCOVERY_STATE = {
+_FREE_DISCOVERY_STATE: dict[str, Any] = {
     "last_refresh": None,
     "next_refresh": None,
     "source": "none",
@@ -1037,9 +1038,9 @@ def _fetch_free_models_sync(timeout: float = 10) -> tuple:
     Fail-soft: raises only if ALL urls failed; caller logs warning.
     """
     urls = _free_discovery_urls()
-    payloads = []
+    payloads: list[Any] = []
     source_parts = []
-    last_err = None
+    last_err: Exception | None = None
     for url in urls:
         success = False
         for attempt in range(3):
@@ -1066,7 +1067,7 @@ def _fetch_free_models_sync(timeout: float = 10) -> tuple:
                     last_err = None
                     break
                 # httpx path
-                _kwargs = {"timeout": timeout}
+                _kwargs: dict[str, Any] = {"timeout": timeout}
                 if PROXY:
                     _kwargs["proxy"] = PROXY
                 with _httpx.Client(**_kwargs) as _client:
@@ -1125,7 +1126,7 @@ def _fetch_free_models_sync(timeout: float = 10) -> tuple:
             try:
                 import httpx as _httpx2
 
-                _kwargs2 = {"timeout": timeout}
+                _kwargs2: dict[str, Any] = {"timeout": timeout}
                 if PROXY:
                     _kwargs2["proxy"] = PROXY
                 with _httpx2.Client(**_kwargs2) as _c2:

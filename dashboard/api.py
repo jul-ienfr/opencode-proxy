@@ -14,6 +14,7 @@ import sys
 import threading
 import time
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 from fastapi import Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -59,7 +60,7 @@ class _TTLCache:
 
     def __init__(self, ttl: float = 2.0):
         self._ttl = ttl
-        self._store: dict[str, tuple[float, any]] = {}
+        self._store: dict[str, tuple[float, Any]] = {}
         self._cleanup_counter = 0
 
     def get(self, key: str):
@@ -374,14 +375,14 @@ def _get_local_ips() -> list:
     now = time.monotonic()
     if _local_ips_cache and (now - _local_ips_cache[0]) < 60.0:
         return _local_ips_cache[1]
-    ips = []
+    ips: list[str] = []
     try:
         hostname = socket.gethostname()
         for info in socket.getaddrinfo(hostname, None):
             addr = info[4][0]
-            if addr and not addr.startswith("127.") and "." in addr:
+            if addr and not str(addr).startswith("127.") and "." in str(addr):
                 if addr not in ips:
-                    ips.append(addr)
+                    ips.append(str(addr))
     except Exception:
         pass
     # Fallback: try to determine primary IP via connection
@@ -483,13 +484,13 @@ def _compute_costs(rows, pricing: dict | None = None) -> dict:
     p = pricing or {}
     currency = str(p.get("currency", "USD"))
     defaults = p.get("defaults") if isinstance(p.get("defaults"), dict) else {}
-    rate_in = float(defaults.get("input_per_mtok", 3.0))
-    rate_out = float(defaults.get("output_per_mtok", 15.0))
+    rate_in = float(defaults.get("input_per_mtok", 3.0)) if isinstance(defaults, dict) else 3.0
+    rate_out = float(defaults.get("output_per_mtok", 15.0)) if isinstance(defaults, dict) else 15.0
     per_model_cfg = p.get("per_model") if isinstance(p.get("per_model"), dict) else {}
 
     paid_usd = 0.0
     saved_usd = 0.0
-    per_model_out = []
+    per_model_out: list[dict[str, Any]] = []
     seen = set()
     for row in rows:
         model = str(row.get("model") or "?")
@@ -499,9 +500,13 @@ def _compute_costs(rows, pricing: dict | None = None) -> dict:
         if key in seen:
             continue
         seen.add(key)
-        rates = per_model_cfg.get(model) or {}
-        ri = float(rates.get("input_per_mtok", rate_in))
-        ro_ = float(rates.get("output_per_mtok", rate_out))
+        rates = per_model_cfg.get(model) if isinstance(per_model_cfg, dict) else {}
+        ri = float(rates.get("input_per_mtok", rate_in)) if isinstance(rates, dict) else rate_in
+        ro_ = (
+            float(rates.get("output_per_mtok", rate_out))
+            if isinstance(rates, dict)
+            else rate_out
+        )
         cost = ti / 1e6 * ri + to_ / 1e6 * ro_
         is_free = model.endswith("-free")
         if is_free:
@@ -561,9 +566,9 @@ def _validate_vpn_config_payload(body) -> list:
             for k, (lo, hi) in _ranges.items():
                 if k in lr:
                     try:
-                        v = float(lr[k])
-                        if not lo <= v <= hi:
-                            errors.append(f"latency_rotation.{k}={v} hors bornes [{lo}, {hi}]")
+                        v_f = float(lr[k])
+                        if not lo <= v_f <= hi:
+                            errors.append(f"latency_rotation.{k}={v_f} hors bornes [{lo}, {hi}]")
                     except (TypeError, ValueError):
                         errors.append(f"latency_rotation.{k} doit être numérique")
             for k in ("consecutive_slow", "min_requests_before_eval", "max_soft_rotates_per_hour"):
@@ -1102,7 +1107,7 @@ def _socks5_raw_get(proxy_host: str, proxy_port: int, target: str, timeout: floa
     from urllib.parse import urlsplit
 
     u = urlsplit(target)
-    host, port = u.hostname, u.port or 443
+    host, port = u.hostname or "", u.port or 443
     started = time.monotonic()
     sock = socket.create_connection((proxy_host, int(proxy_port)), timeout=timeout)
     try:
@@ -1282,10 +1287,10 @@ async def _nordvpn_servers_by_country(code: str, limit: int = 20) -> list:
         return []
 
 
-def _docker_diag() -> dict:
+def _docker_diag() -> dict[str, Any]:
     """System docker info for the diagnostic bundle — isolated subprocess,
     monkeypatchable (never live in tests)."""
-    diag = {"available": False, "running": False, "version": None}
+    diag: dict[str, Any] = {"available": False, "running": False, "version": None}
     try:
         r = subprocess.run(
             ["docker", "version", "--format", "{{.Server.Version}}"],
@@ -1416,6 +1421,7 @@ def register_dashboard(
                 "model": info["model"],
             }
         # Fast path: local_ips and models are slow (socket, disk), return cached/instant
+        models_info: Any
         try:
             models_info = get_available_models()
         except Exception:
@@ -2554,7 +2560,7 @@ def register_dashboard(
                 if last.tzinfo is not None:
                     # [30] UTC timestamps carry a Z suffix → normalize to naive UTC
                     # so the comparison below stays naive-vs-naive.
-                    last = last.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+                    last = last.astimezone(UTC).replace(tzinfo=None)
                 reset_at = last + timedelta(hours=QUOTA_WINDOW_HOURS)
                 ip_data["reset_at"] = reset_at.strftime("%Y-%m-%dT%H:%M:%SZ")
                 ip_data["available"] = now >= reset_at
@@ -3251,6 +3257,8 @@ def register_dashboard(
                     # station-2 rotation would be reported ok:false with the
                     # wrong station_out — a false negative for the operator.
                     mgr = shared_state.free_ip_pool.active_station or shared_state.vpn_manager
+                if mgr is None:
+                    return {"error": "aucun manager VPN disponible"}
                 ip_before = mgr.current_ip
                 await shared_state.free_ip_pool.switch_ip(station=mgr)
                 ip_after = mgr.current_ip
@@ -3258,6 +3266,8 @@ def register_dashboard(
                 station_out = mgr._station
             else:
                 mgr = mgr or shared_state.vpn_manager
+                if mgr is None:
+                    return {"error": "aucun manager VPN disponible"}
                 ip_before = mgr.current_ip
                 await mgr.connect_next()
                 ip_after = mgr.current_ip
@@ -3575,7 +3585,9 @@ def register_dashboard(
         import shared_state
 
         body = await request.json()
-        resp, status = _apply_import_payload(
+        # [fix mypy 26/08] _apply_import_payload est async : sans await,
+        # l'unpacking du tuple levait TypeError à l'appel (endpoint mort).
+        resp, status = await _apply_import_payload(
             list(getattr(shared_state, "vpn_managers", None) or []),
             body,
             fallback_manager=shared_state.vpn_manager,
@@ -3869,7 +3881,12 @@ def register_dashboard(
         if not name.lower().endswith(".ovpn"):
             name += ".ovpn"
         upload = form.get("config")
-        content = upload.file.read() if upload is not None else None
+        # [mypy] UploadFile | str : seul l'UploadFile porte .file
+        content = (
+            await upload.read()
+            if upload is not None and not isinstance(upload, str)
+            else None
+        )
         if not content:
             return {"error": "fichier config manquant (champ FormData 'config')"}
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

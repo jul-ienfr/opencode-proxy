@@ -26,13 +26,14 @@ jobs:
         run: ruff format --check .
       # [P6] mypy bloquant sur les modules SAINS (0 erreur vérifiée) ;
       # le reste tourne en progressif VISIBLE (continue-on-error) — plus de
-      # `|| true` qui avalait les erreurs. Rachat incrémental : config/,
-      # dashboard/, protocol_mapping.py d'abord (~79 err au 2026-08-26).
+      # `|| true` qui avalait les erreurs.
+      # [26/08] rachat effectué : config/, dashboard/, protocol_mapping.py
+      # passent dans le gate bloquant (reste : opencode.py, vpn_manager.py…).
       - name: Mypy (gate modules sains)
         run: >-
           mypy traffic_capture.py docker_events.py trust.py shared_rotation.py
-          shared_state.py config/__init__.py --ignore-missing-imports
-          --follow-imports=silent
+          shared_state.py config/__init__.py config/settings.py dashboard/api.py
+          protocol_mapping.py --ignore-missing-imports --follow-imports=silent
       - name: Mypy (progressif, non bloquant)
         run: mypy . --ignore-missing-imports
         continue-on-error: true

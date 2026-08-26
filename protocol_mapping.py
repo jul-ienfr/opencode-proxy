@@ -9,13 +9,15 @@ import re
 import time
 import uuid
 from collections import OrderedDict
+from typing import Any
 
 from config import CACHE_MIN_PROMPT_SIZE, yaml_get
 from dashboard.display import debug as _debug
 from dashboard.display import log as _log
 
+_cfg_settings: Any
 try:
-    import config.settings as _cfg_settings
+    import config.settings as _cfg_settings  # type: ignore[assignment]
 except ImportError:  # pragma: no cover
 
     class _CfgFallback:
@@ -23,6 +25,7 @@ except ImportError:  # pragma: no cover
 
     _cfg_settings = _CfgFallback()
 
+_encoding: Any
 try:
     import tiktoken
 
@@ -309,7 +312,7 @@ def anthropic_to_openai(body: dict, model: str) -> dict:
     # GLM-5.x models don't support cache_control — skip it
     supports_cache_control = not model.startswith("glm-5")
 
-    messages = []
+    messages: list[dict[str, Any]] = []
 
     # System prompt — always add cache_control for prefix caching
     system_val = body.get("system", "")
@@ -317,7 +320,7 @@ def anthropic_to_openai(body: dict, model: str) -> dict:
         text = _extract_text(system_val)
         if text:
             text = _strip_billing_header(text)
-            msg = {"role": "system", "content": text}
+            msg: dict[str, Any] = {"role": "system", "content": text}
             if supports_cache_control:
                 msg["cache_control"] = {"type": "ephemeral"}
             messages.append(msg)
@@ -538,8 +541,8 @@ def anthropic_to_openai(body: dict, model: str) -> dict:
     # Claude Code sends: thinking: {type: "adaptive"} OR effort: "low"/"medium"/"high"/"xhigh"/"max"
     effort_level = body.get("effort")
     thinking_param = body.get("thinking") if isinstance(body.get("thinking"), dict) else {}
-    ttype = thinking_param.get("type", "")
-    budget = thinking_param.get("budget_tokens", 0)
+    ttype = thinking_param.get("type", "") if isinstance(thinking_param, dict) else ""
+    budget = thinking_param.get("budget_tokens", 0) if isinstance(thinking_param, dict) else 0
 
     if effort_level and effort_level != "none":
         wants_thinking = True
@@ -559,7 +562,7 @@ def anthropic_to_openai(body: dict, model: str) -> dict:
         wants_thinking = False
 
     if wants_thinking:
-        oai["reasoning_effort"] = _effort_to_reasoning(effort_level, model)
+        oai["reasoning_effort"] = _effort_to_reasoning(effort_level or "", model)
         _debug(
             f"  [thinking] {model}: reasoning_effort={oai['reasoning_effort']} (effort={effort_level})"
         )
@@ -608,7 +611,10 @@ def _anthropic_cache_key(model: str, body: dict, raw: bytes | None = None) -> st
     return h.hexdigest()
 
 
-def anthropic_to_openai(body: dict, model: str, raw: bytes | None = None) -> dict:
+def anthropic_to_openai(body: dict, model: str, raw: bytes | None = None) -> dict:  # type: ignore[no-redef]
+    # ^ [P4] wrapper de cache volontairement rebaptisé du même nom que
+    # l'implémentation d'origine (ligne ~308) — pattern décorateur manuel ;
+    # l'originale reste joignable via _orig_anthropic_to_openai.
     try:
         # B2c: invalidate cache if body contains role None (poison)
         for _m in body.get("messages", []) or []:
@@ -997,7 +1003,7 @@ def anthropic_to_openai_response(anthro: dict, model: str) -> dict:
     if cache_read:
         oai_usage["prompt_tokens_details"] = {"cached_tokens": cache_read}
 
-    message = {"role": "assistant"}
+    message: dict[str, Any] = {"role": "assistant"}
     if text_parts:
         message["content"] = "\n".join(text_parts)
     else:
@@ -1143,8 +1149,8 @@ def openai_responses_to_anthropic(body: dict) -> dict:
     # Claude Code sends: thinking: {type: "adaptive"} OR effort: "low"/"medium"/"high"/"xhigh"/"max"
     effort_level = body.get("effort")
     thinking = body.get("thinking") if isinstance(body.get("thinking"), dict) else {}
-    ttype = thinking.get("type", "")
-    budget = thinking.get("budget_tokens", 0)
+    ttype = thinking.get("type", "") if isinstance(thinking, dict) else ""
+    budget = thinking.get("budget_tokens", 0) if isinstance(thinking, dict) else 0
 
     # Determine desired effort from effort param or thinking param
     if effort_level and effort_level != "none":
@@ -1167,7 +1173,7 @@ def openai_responses_to_anthropic(body: dict) -> dict:
 
     if wants_thinking:
         _model = result.get("model", "")
-        result["reasoning_effort"] = _effort_to_reasoning(effort_level, _model)
+        result["reasoning_effort"] = _effort_to_reasoning(effort_level or "", _model)
         _debug(
             f"  [thinking] {_model}: reasoning_effort={result['reasoning_effort']} (effort={effort_level})"
         )
@@ -1178,7 +1184,7 @@ def openai_responses_to_anthropic(body: dict) -> dict:
 def anthropic_to_openai_responses(anthro: dict, model: str) -> dict:
     """Convert Anthropic Messages response → OpenAI Responses API format."""
     content_blocks = anthro.get("content", [])
-    output_items = []
+    output_items: list[dict[str, Any]] = []
     text_content = []
     function_calls = []
 
@@ -1251,7 +1257,7 @@ def openai_chat_to_responses(chat_resp: dict, model: str) -> dict:
     msg = choice.get("message", {})
     usage = chat_resp.get("usage", {})
 
-    output_items = []
+    output_items: list[dict[str, Any]] = []
 
     # Reasoning content -> reasoning item
     reasoning = msg.get("reasoning_content") or msg.get("reasoning")
@@ -1482,7 +1488,7 @@ def _responses_to_chat_response(resp: dict, model: str) -> dict:
                 }
             )
     # vrai seulement : pas de placeholder si pas de summary visible
-    msg = {"role": "assistant", "content": "\n".join(texts)}
+    msg: dict[str, Any] = {"role": "assistant", "content": "\n".join(texts)}
     if reasoning:
         msg["reasoning_content"] = reasoning
     if tool_calls:
@@ -1494,7 +1500,7 @@ def _responses_to_chat_response(resp: dict, model: str) -> dict:
         if isinstance(usage.get("input_tokens_details"), dict)
         else {}
     )
-    _cached = _inp_details.get("cached_tokens", 0)
+    _cached = _inp_details.get("cached_tokens", 0) if isinstance(_inp_details, dict) else 0
     chat_usage = {
         "prompt_tokens": usage.get("input_tokens", 0),
         "completion_tokens": usage.get("output_tokens", 0),
@@ -1562,7 +1568,7 @@ def _responses_to_anthropic_response(resp: dict, model: str) -> dict:
         if isinstance(usage.get("input_tokens_details"), dict)
         else {}
     )
-    _cache_read = _inp_details.get("cached_tokens", 0)
+    _cache_read = _inp_details.get("cached_tokens", 0) if isinstance(_inp_details, dict) else 0
     return {
         "id": f"msg_{uuid.uuid4().hex[:24]}",
         "type": "message",
