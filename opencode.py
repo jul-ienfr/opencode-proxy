@@ -1511,7 +1511,15 @@ async def _get_pooled_curl_session(proxy_url: str | None, impersonate: str):
         _curl_pool[key] = pool
     slot = await pool.checkout(
         lambda: _curl_requests_mod.AsyncSession(
-            impersonate=impersonate, proxy=_curl_proxy_url(proxy_url)
+            impersonate=impersonate,
+            proxy=_curl_proxy_url(proxy_url),
+            # [P1.1 perf] timeout=(connect 10, read 600) AU NIVEAU SESSION :
+            # toutes les sessions poolées l'héritent — POST non-stream,
+            # streams free et requêtes geo, y compris les appels qui ne
+            # passent pas de timeout explicite. Read 600 : longs streams ;
+            # le watchdog cancel_streams reste la 2ᵉ couche (détection
+            # egress-mort < timeout read).
+            timeout=(10, 600),
         )
     )
     return pool, slot
@@ -4595,11 +4603,13 @@ async def _open_free_stream(
                     _free_request_headers(headers), profile, use_curated_ua=False
                 )
                 req_headers["Content-Type"] = "application/json"
-                # [plan 18/08 §1a/am.21] connect timeout 30 → 10: in mono-station
-                # the request IS the arming signal (bad-mark is C1-forbidden) —
-                # the first failure reaches the manager in ≤10-15 s, not 30. Read
-                # 600 unchanged (long streams). SOCKS5+TLS handshake ≈ 1-2 s on a
-                # healthy tunnel — no legitimate request is impacted.
+                # [P1.1 perf] timeout=(10, 600) posé AU NIVEAU DE LA FACTORY
+                # de session poolée (_get_pooled_curl_session) : le POST
+                # ci-dessous n'a plus besoin d'un timeout par appel — toutes
+                # les sessions poolées l'héritent. Read 600 inchangé (longs
+                # streams). SOCKS5+TLS handshake ≈ 1-2 s sur un tunnel sain —
+                # aucune requête légitime n'est impactée ; un tunnel mort est
+                # détecté par le watchdog cancel_streams AVANT le read 600.
                 _debug(
                     f"  [free-stream] creating curl_cffi session proxy={_curl_proxy_url(proxy_url)} (pooled)"
                 )

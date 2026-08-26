@@ -146,6 +146,29 @@ async def test_eviction_removes_only_faulty_session(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_pooled_sessions_inherit_bounded_timeout(monkeypatch):
+    """[P1.1 perf] La factory de session poolée pose timeout=(10, 600) :
+    tout POST qui n'en passe pas (streams free, geo) hérite d'une borne
+    connect/read au lieu du défaut curl_cffi (illimité)."""
+    captured_kwargs: list[dict] = []
+
+    def _factory(**kw):
+        captured_kwargs.append(kw)
+        return _FakeCurlSession([], 0)
+
+    monkeypatch.setattr("curl_cffi.requests.AsyncSession", _factory)
+    monkeypatch.setattr(oc, "_curl_proxy_url", lambda p: p)
+
+    pool, slot = await oc._get_pooled_curl_session("socks5://t:1080", "chrome131")
+    await pool.checkin(slot)
+    assert captured_kwargs, "la factory doit être invoquée"
+    assert captured_kwargs[0].get("timeout") == (10, 600), (
+        "session poolée sans timeout borné — POST stream/geo peut pendre indéfiniment"
+    )
+    assert captured_kwargs[0].get("impersonate") == "chrome131"
+
+
+@pytest.mark.asyncio
 async def test_do_free_request_parallel_via_helper(monkeypatch):
     """Bout-en-bout _do_free_request_curl_cffi : 4 appels concurrents vers la
     même station se chevauchent (fin du head-of-line blocking) via le chemin
