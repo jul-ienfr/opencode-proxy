@@ -1857,10 +1857,15 @@ def _responses_sse_to_chat_deltas(raw_line: str, parsed=None, state: "ResponsesS
         item = chunk.get("item", {}) if isinstance(chunk.get("item"), dict) else {}
         if isinstance(item, dict) and item.get("type") == "reasoning":
             iid = item.get("id", "") or f"rs_{chunk.get('output_index', 0)}"
-            # dedupe: if any summary part for this item already emitted, skip (check prefix)
-            if iid and any(k == iid or k.startswith(f"{iid}:") for k in reasoning_seen):
-                return None
             summary = item.get("summary", [])
+            # dedupe per-index exact : ne droper que si tous les indices du summary
+            # ont déjà été émis. Évite perte queue (un delta partiel bloquait tout le fallback).
+            if iid and isinstance(summary, list) and summary:
+                if all(f"{iid}:{i}" in reasoning_seen for i in range(len(summary))):
+                    return None
+            elif iid and iid in reasoning_seen:
+                # summary vide/non-list : fallback bare iid (legacy, sécurité)
+                return None
             reasoning = ""
             if isinstance(summary, list):
                 for s in summary:
@@ -1876,10 +1881,11 @@ def _responses_sse_to_chat_deltas(raw_line: str, parsed=None, state: "ResponsesS
                 _debug(f"  [responses-sse] output_item.done no visible summary, skip (vrai seulement) iid={iid!r} encrypted={bool(item.get('encrypted_content'))}")
                 return None
             if reasoning:
-                if iid:
+                if iid and isinstance(summary, list) and summary:
+                    for i in range(len(summary)):
+                        reasoning_seen.add(f"{iid}:{i}")
+                elif iid:
                     reasoning_seen.add(iid)
-                    # also mark per-index to prevent double emit from summary_text.done
-                    reasoning_seen.add(f"{iid}:0")
                 _debug(f"  [responses-sse] output_item.done reasoning fallback len={len(reasoning)} iid={iid!r}")
                 return {"choices": [{"delta": {"reasoning_content": reasoning}, "finish_reason": None}]}
         return None
