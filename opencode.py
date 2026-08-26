@@ -26,6 +26,7 @@ import urllib.parse
 import uuid
 from collections import OrderedDict
 from contextlib import asynccontextmanager
+from typing import Any
 
 import httpx
 import yaml
@@ -59,11 +60,15 @@ try:
     from vpn_manager import _normalize_country as _vpn_normalize_country
 except ImportError:
 
-    def _vpn_normalize_country(n):  # fallback never invents beyond title()
+    def _vpn_normalize_country(n: str) -> str:  # type: ignore[misc]
+        # fallback never invents beyond title() ; signature alignée sur
+        # vpn_manager._normalize_country(name: str) -> str.
         return n.strip().replace("_", " ").strip().title()
 
 try:
-    from vpn_manager import get_socks5_proxy_url
+    # n'existe pas (encore) dans vpn_manager : le fallback local plus bas
+    # (PROXY_FALLBACK) est le chemin réellement actif.
+    from vpn_manager import get_socks5_proxy_url  # type: ignore[attr-defined]
 except ImportError:
     try:
         from config import PROXY as _PROXY_FALLBACK
@@ -178,7 +183,7 @@ def get_next_api_key() -> dict:
     with _key_cycle_lock:
         current_ids = [k.get("api_key") for k in available]
         if _key_cycle_keys != current_ids:
-            _key_cycle_keys = current_ids
+            _key_cycle_keys = [str(k) for k in current_ids]
             _key_cycle_index = 0
             _debug(
                 f"  [apikey] round-robin index reset: {len(available)} available keys (filtered from {len(enabled)} enabled)"
@@ -560,6 +565,7 @@ def _get_auth_headers(protocol: str, entry: dict | None = None) -> dict:
     return {"Authorization": f"Bearer {ak}", "Content-Type": "application/json"}
 
 
+_encoding: Any
 try:
     import tiktoken
 
@@ -695,7 +701,7 @@ _db_writer_task: asyncio.Task | None = None
 
 # Context variable to pass client user-agent from endpoint handlers to _save_request
 # without threading it through every intermediate function call.
-_current_user_agent: contextvars.ContextVar[str] = contextvars.ContextVar(
+_current_user_agent: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "_current_user_agent", default=None
 )
 
@@ -1344,6 +1350,8 @@ _client = httpx.AsyncClient(transport=_transport, timeout=_build_http_timeout())
 # re-import local à chaque POST/emprunt de session. NB : la CLASSE AsyncSession
 # est résolue par ATTRIBUT à l'appel (_curl_requests_mod.AsyncSession) — les
 # tests monkeypatchent l'attribut du module, un binding figé casserait ce seam.
+_curl_requests_mod: Any
+_curl_err: Any
 try:
     import curl_cffi.requests as _curl_requests_mod
     import curl_cffi.requests.errors as _curl_err
@@ -1545,7 +1553,7 @@ def _ensure_http_client() -> httpx.AsyncClient:
 
 
 # ── VPN / IP rotation (initialized in lifespan) ──────────────────
-_vpn_manager = None
+_vpn_manager: Any = None
 _free_ip_pool = None
 # ── Geo gate isolation (P2) ──────────────────────────────────
 _geo_breaker: dict = {}  # (country, station_id) -> consecutive failures
@@ -3072,7 +3080,7 @@ def _notify_geo_tray_throttled(msg: str, model: str | None = None):
             entry = {"time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "model": model or "", "message": msg}
             # keep last 20
             try:
-                old = []
+                old: list[Any] = []
                 if os.path.exists(p):
                     with open(p, encoding="utf-8") as _f:
                         old = _js.load(_f) or []
@@ -3191,7 +3199,7 @@ def _geo_block_response(
         "Retry-After": "0",
     }
     code = 451 if passthrough_451 else (400 if protocol == "anthropic" else 403)
-    payload_anthropic = {
+    payload_anthropic: dict[str, Any] = {
         "type": "error",
         "error": {
             "type": "geo_blocked",
@@ -3365,7 +3373,7 @@ async def _enforce_geo_gate(route: dict, request: Request, *, is_stream: bool, p
     # without VPN tunnel — skip the entire pin logic below.
     # Otherwise we force VPN but keep direct IP/country for the i18n warning
     # "Direct → VPN (geo fallback)" (IP + pays affichés, tray + badge).
-    _direct_country_val: str | None = None
+    _direct_country_val: Any = None
     _direct_ip_val: str | None = None
     _allowed_list = sorted(_geo_effective) if isinstance(_geo_effective, set) else []
     _allowed_str = ", ".join(_allowed_list) if _allowed_list else ""
@@ -3434,15 +3442,15 @@ async def _enforce_geo_gate(route: dict, request: Request, *, is_stream: bool, p
         else:
             # allow_direct disabled → always tunnel, but still capture direct for warning
             try:
-                _direct_country_val = await _direct_country()
+                _direct_country_val2: Any = await _direct_country()
             except Exception:
-                _direct_country_val = "unknown"
+                _direct_country_val2 = "unknown"
             try:
-                _direct_ip_val = _direct_ip_cache.get("ip") or _direct_country_cache.get("ip") or await _get_direct_ip()
+                _direct_ip_val2: Any = _direct_ip_cache.get("ip") or _direct_country_cache.get("ip") or await _get_direct_ip()
             except Exception:
-                _direct_ip_val = "unknown"
-            request.state._geo_direct_country = _direct_country_val  # type: ignore
-            request.state._geo_direct_ip = _direct_ip_val or "unknown"  # type: ignore
+                _direct_ip_val2 = "unknown"
+            request.state._geo_direct_country = _direct_country_val2  # type: ignore
+            request.state._geo_direct_ip = _direct_ip_val2 or "unknown"  # type: ignore
             request.state._geo_allowed = _allowed_list  # type: ignore
             request.state._geo_model = route.get("model", "") if isinstance(route, dict) else ""  # type: ignore
             request.state._geo_via_vpn_while_direct = True  # type: ignore
@@ -3602,9 +3610,10 @@ async def _enforce_geo_gate(route: dict, request: Request, *, is_stream: bool, p
                     try:
                         import shared_state as _ss_verify
 
+                        _v_pool = getattr(_ss_verify, "free_ip_pool", None)
                         _v_station = None
-                        if getattr(_ss_verify, "free_ip_pool", None):
-                            _v_station = _ss_verify.free_ip_pool._best_station(set(_geo_effective))
+                        if _v_pool is not None:
+                            _v_station = _v_pool._best_station(set(_geo_effective))
                         if _v_station is None:
                             for _vm in getattr(_ss_verify, "vpn_managers", None) or []:
                                 if _vm and getattr(_vm, "_current_country", None):
@@ -3665,7 +3674,8 @@ async def _enforce_geo_gate(route: dict, request: Request, *, is_stream: bool, p
                                 if "vpn_ip" not in _cur2:
                                     _vst = None
                                     try:
-                                        _vst = getattr(_ss_cur2, "free_ip_pool", None) and _ss_cur2.free_ip_pool._best_station(set(_geo_effective))
+                                        _vpool2 = getattr(_ss_cur2, "free_ip_pool", None)
+                                        _vst = _vpool2._best_station(set(_geo_effective)) if _vpool2 is not None else None
                                     except Exception:
                                         pass
                                     if _vst:
@@ -3890,7 +3900,7 @@ def _apply_identity(headers: dict, profile: dict, use_curated_ua: bool = True) -
     out = dict(headers)
     ua = profile.get("user_agent")
     if not ua and use_curated_ua:
-        ua = _UA_BY_IMPERSONATE.get(profile.get("impersonate"))
+        ua = _UA_BY_IMPERSONATE.get(profile.get("impersonate") or "")
     if ua:
         out["User-Agent"] = ua
     elif not use_curated_ua:
@@ -4104,7 +4114,7 @@ async def _hedged_fetch(cands, body: dict, headers: dict, endpoint: str, forced_
         _model_name = str(body.get("model") or body.get("original_model") or "")
         if isinstance(_pmap, dict) and _pmap:
             _base_ms = float(
-                _pmap.get(_model_name, _pmap.get("default", stagger * 1000.0))
+                _pmap.get(_model_name, _pmap.get("default", stagger * 1000.0)) or 0.0
             )
             stagger = max(0.0, min(2.0, _base_ms / 1000.0))
         stagger *= random.uniform(0.8, 1.2)  # jitter ±20 %
@@ -4842,7 +4852,7 @@ async def _open_via_pool(endpoint, body, headers, *, is_stream=False, forced_poo
 # the IP free requests actually present upstream), direct otherwise. The
 # entry is tagged with the probe context so a tunnel IP is never served as
 # the direct egress (or vice versa) across a VPN transition.
-_public_ip_cache = {"ip": "", "ts": 0.0, "via_tunnel": False}
+_public_ip_cache: dict[str, Any] = {"ip": "", "ts": 0.0, "via_tunnel": False}
 
 
 async def _get_cached_public_ip() -> str:
@@ -4876,7 +4886,7 @@ async def _get_cached_public_ip() -> str:
     return cached["ip"] if cached["via_tunnel"] == expect_tunnel else "unknown"
 
 
-_direct_country_cache = {"country": "", "ts": 0.0, "ip": ""}
+_direct_country_cache: dict[str, Any] = {"country": "", "ts": 0.0, "ip": ""}
 
 
 async def _get_direct_ip() -> str:
@@ -4897,7 +4907,7 @@ async def _get_direct_ip() -> str:
     return "unknown"
 
 
-_direct_ip_cache = {"ip": "", "ts": 0.0}
+_direct_ip_cache: dict[str, Any] = {"ip": "", "ts": 0.0}
 
 
 async def _direct_country() -> str:
@@ -4992,7 +5002,7 @@ def _free_cooldown_key(free_model: str, station=None) -> str:
     key must stay stable.
     """
     vpn = station or (_free_ip_pool.active_station if _free_ip_pool else None) or _vpn_manager
-    if getattr(vpn, "pid", None):
+    if vpn is not None and getattr(vpn, "pid", None):
         # [Axe 3.1] Static SOCKS5 proxy: no docker IP to key on — the
         # proxy's identity IS its host:port. Each proxy gets its own
         # bucket: a 429 on one must never cooldown the others, which
@@ -5171,7 +5181,7 @@ def _free_usage_ip(station=None) -> str:
     from the last non-stream probe.
     """
     vpn = station or (_free_ip_pool.active_station if _free_ip_pool else None) or _vpn_manager
-    if getattr(vpn, "pid", None):
+    if vpn is not None and getattr(vpn, "pid", None):
         # [Axe 3.1] Static SOCKS5 proxy: no docker IP to report — its
         # host:port identity is the correct usage label.
         return f"socks5:{vpn.pid}"
@@ -6607,7 +6617,7 @@ async def _execute_ddg_search(query: str, max_results: int = 5, timeout: int = 1
     if lock is None:
         lock = asyncio.Lock()
         _DDG_LOCKS[kstr] = lock
-    _hit_val = None
+        _hit_val: Any = None
     _hit = False
     try:
         async with lock:
@@ -6806,11 +6816,14 @@ def _is_web_tool_native(model_id: str) -> bool:
             return True
         # also check dashboard/quota capabilities if available
         try:
-            from dashboard.quota import get_model_capabilities_for_all  # type: ignore
+            from dashboard.quota import get_model_capabilities_for_all
 
-            all_caps = get_model_capabilities_for_all()
+            # [fix mypy 26/08 - vrai bug] l'appel sans argument levait
+            # TypeError (models requis), avalé par except-pass : les caps
+            # web-search du quota étaient silencieusement ignorées.
+            all_caps = get_model_capabilities_for_all({model_id: {}})
             if isinstance(all_caps, dict):
-                mc = all_caps.get(model_id, {})
+                mc: Any = all_caps.get(model_id, {})
                 if isinstance(mc, dict) and mc.get("web-search"):
                     return True
         except Exception:
@@ -7548,8 +7561,8 @@ async def messages(request: Request):
         if not is_stream:
             # Check cache
             cache_key = _response_cache.make_key(body, body_bytes=body_bytes)
-            cached = cache_key and _response_cache.get(cache_key)
-            if cached:
+            cached = _response_cache.get(cache_key) if cache_key else None
+            if cached and cache_key:
                 cached_body, cached_headers = cached
                 _debug(f"  cache HIT key={cache_key[:16]}… size={len(cached_body)} bytes")
                 _log(f"  ← {model_id} | cache HIT")
@@ -8396,10 +8409,10 @@ async def messages(request: Request):
                         ),
                         media_type="application/json",
                     )
-            except FreeQuotaExhausted as e:
-                return _free_quota_exhausted_response(e, "openai")
-            except Exception as e:
-                _debug(f"  [free] free model attempt failed: {e}")
+            except FreeQuotaExhausted as fq_err:
+                return _free_quota_exhausted_response(fq_err, "openai")
+            except Exception as fail_err:
+                _debug(f"  [free] free model attempt failed: {fail_err}")
         retry_after = int(e.retry_after) + 1
         return Response(
             content=_json_dumps_str(
@@ -8420,8 +8433,8 @@ async def messages(request: Request):
     if not is_stream:
         # Cache check for OpenAI-protocol via /v1/messages (mirrors anthropic branch)
         cache_key = _response_cache.make_key(body, body_bytes=body_bytes)
-        cached = cache_key and _response_cache.get(cache_key)
-        if cached:
+        cached = _response_cache.get(cache_key) if cache_key else None
+        if cached and cache_key:
             cached_body, cached_headers = cached
             _debug(
                 f"  cache HIT key={cache_key[:16]}… size={len(cached_body)} bytes (openai via messages)"
@@ -9831,10 +9844,10 @@ async def chat_completions(request: Request):
                                 content=_json_dumps_str(data, ensure_ascii=False),
                                 media_type="application/json",
                             )
-                    except FreeQuotaExhausted as e:
-                        return _free_quota_exhausted_response(e, "openai")
-                    except Exception as e:
-                        _debug(f"  [free] free model attempt failed: {e}")
+                    except FreeQuotaExhausted as fq_err:
+                        return _free_quota_exhausted_response(fq_err, "openai")
+                    except Exception as fail_err:
+                        _debug(f"  [free] free model attempt failed: {fail_err}")
             retry_after = int(e.retry_after) + 1
             return Response(
                 content=_json_dumps_str(
@@ -10678,10 +10691,10 @@ async def chat_completions(request: Request):
                             content=_json_dumps_str(oai_response, ensure_ascii=False),
                             media_type="application/json",
                         )
-                except FreeQuotaExhausted as e:
-                    return _free_quota_exhausted_response(e, "anthropic")
-                except Exception as e:
-                    _debug(f"  [free] free model attempt failed: {e}")
+                except FreeQuotaExhausted as fq_err:
+                    return _free_quota_exhausted_response(fq_err, "anthropic")
+                except Exception as fail_err:
+                    _debug(f"  [free] free model attempt failed: {fail_err}")
         retry_after = int(e.retry_after) + 1
         return Response(
             content=_json_dumps_str(
@@ -11560,10 +11573,10 @@ async def responses(request: Request):
                                 media_type="text/event-stream",
                                 headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
                             )
-                    except FreeQuotaExhausted as e:
-                        return _free_quota_exhausted_response(e, "anthropic")
-                    except Exception as e:
-                        _debug(f"  [free] free model attempt failed: {e}")
+                    except FreeQuotaExhausted as fq_err:
+                        return _free_quota_exhausted_response(fq_err, "anthropic")
+                    except Exception as fail_err:
+                        _debug(f"  [free] free model attempt failed: {fail_err}")
             retry_after = int(e.retry_after) + 1
             return Response(
                 content=_json_dumps_str(
@@ -11908,10 +11921,10 @@ async def responses(request: Request):
                         media_type="text/event-stream",
                         headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
                     )
-            except FreeQuotaExhausted as e:
-                return _free_quota_exhausted_response(e, "openai")
-            except Exception as e:
-                _debug(f"  [free] free model attempt failed: {e}")
+            except FreeQuotaExhausted as fq_err:
+                return _free_quota_exhausted_response(fq_err, "openai")
+            except Exception as fail_err:
+                _debug(f"  [free] free model attempt failed: {fail_err}")
         retry_after = int(e.retry_after) + 1
         return Response(
             content=_json_dumps_str(
@@ -12422,7 +12435,7 @@ class ServerManager:
 
 
 # ── Mono-instance lock [CRITIC(7)] ────────────────────────────────────
-_INSTANCE_LOCK_FDS = []  # keep fds referenced: GC closing them would release the lock
+_INSTANCE_LOCK_FDS: list[int] = []  # keep fds referenced: GC closing them would release the lock
 
 
 def _acquire_instance_lock(lock_path: str = os.path.join("logs", "opencode.lock")) -> None:
@@ -12449,9 +12462,9 @@ def _acquire_instance_lock(lock_path: str = os.path.join("logs", "opencode.lock"
 
             msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
         else:
-            import fcntl
+            import fcntl  # posix only — branche morte sous Windows, mypy ok
 
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # type: ignore[attr-defined]
     except OSError:
         # stderr print: the Rich log panel is never built when we exit here,
         # so this is the only place the user sees why the instance refused to start.

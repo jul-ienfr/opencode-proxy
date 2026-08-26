@@ -28,12 +28,14 @@ jobs:
       # le reste tourne en progressif VISIBLE (continue-on-error) — plus de
       # `|| true` qui avalait les erreurs.
       # [26/08] rachat effectué : config/, dashboard/, protocol_mapping.py
-      # passent dans le gate bloquant (reste : opencode.py, vpn_manager.py…).
+      # ET opencode.py passent dans le gate bloquant (reste progressif :
+      # vpn_manager.py, gui, scripts).
       - name: Mypy (gate modules sains)
         run: >-
           mypy traffic_capture.py docker_events.py trust.py shared_rotation.py
           shared_state.py config/__init__.py config/settings.py dashboard/api.py
-          protocol_mapping.py --ignore-missing-imports --follow-imports=silent
+          protocol_mapping.py opencode.py --ignore-missing-imports
+          --follow-imports=silent
       - name: Mypy (progressif, non bloquant)
         run: mypy . --ignore-missing-imports
         continue-on-error: true

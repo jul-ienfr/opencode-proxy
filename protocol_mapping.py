@@ -304,7 +304,9 @@ def _strip_billing_header(text: str) -> str:
     return rest
 
 
-def anthropic_to_openai(body: dict, model: str) -> dict:
+def anthropic_to_openai(body: dict, model: str, raw: bytes | None = None) -> dict:
+    # ``raw`` : bytes bruts du client, consommés uniquement par le wrapper de
+    # cache (plus bas) — l'implémentation d'origine n'en a pas besoin.
     thinking = isinstance(body.get("thinking"), dict) and body["thinking"].get("type") in (
         "enabled",
         "adaptive",
