@@ -1091,30 +1091,24 @@ def _log_free_model_usage(
     duration_ms: int = 0,
     ip: str = "",
 ):
-    """Log a free model request to the database for quota analysis."""
-    timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())  # [30] UTC
-    timestamp = _normalize_timestamp_utc(timestamp)
+    """Log a free model request to the database for quota analysis.
+
+    [P5 tranche 4] INSERT délégué à app/db.log_free_usage (lock + commit
+    gérés là-bas) ; le masquage de clé reste ici (seam visible)."""
     try:
-        with _db_commit_lock:
-            _conn.execute(
-                "INSERT INTO free_model_usage "
-                "(timestamp, paid_model, free_model, api_key, workspace_id, status, "
-                " tokens_input, tokens_output, duration_ms, ip) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    timestamp,
-                    paid_model,
-                    free_model,
-                    api_key[:16] + "...",
-                    workspace_id,
-                    status,
-                    tokens_in,
-                    tokens_out,
-                    duration_ms,
-                    ip,
-                ),
-            )
-            _conn.commit()
+        _app_db.log_free_usage(
+            _conn,
+            _db_commit_lock,
+            paid_model=paid_model,
+            free_model=free_model,
+            api_key_masked=api_key[:16] + "...",
+            workspace_id=workspace_id,
+            status=status,
+            tokens_in=tokens_in,
+            tokens_out=tokens_out,
+            duration_ms=duration_ms,
+            ip=ip,
+        )
         _debug(
             f"  [free-usage] logged: {free_model} key={api_key[:8]}... ws={workspace_id[:12]}... "
             f"status={status} ip={ip} in={tokens_in} out={tokens_out}"

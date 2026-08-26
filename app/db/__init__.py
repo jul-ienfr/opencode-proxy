@@ -532,6 +532,50 @@ def wal_checkpoint(conn: sqlite3.Connection) -> None:
     conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
 
 
+def log_free_usage(
+    conn: sqlite3.Connection,
+    lock,
+    *,
+    paid_model: str,
+    free_model: str,
+    api_key_masked: str,
+    workspace_id: str,
+    status: int,
+    tokens_in: int = 0,
+    tokens_out: int = 0,
+    duration_ms: int = 0,
+    ip: str = "",
+) -> None:
+    """[P5 tranche 4] INSERT free_model_usage sous le lock writer (commit
+    immédiat : la table alimente le dashboard quotas, pas besoin de batch).
+
+    ``api_key_masked`` est DÉJÀ masqué par l'appelant (jamais la clé pleine).
+    Lève sur erreur SQL — l'app hôte journalise et continue (fail-soft)."""
+    import datetime as _dt
+
+    timestamp = _dt.datetime.now(_dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    with lock:
+        conn.execute(
+            "INSERT INTO free_model_usage "
+            "(timestamp, paid_model, free_model, api_key, workspace_id, status, "
+            " tokens_input, tokens_output, duration_ms, ip) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                timestamp,
+                paid_model,
+                free_model,
+                api_key_masked,
+                workspace_id,
+                status,
+                tokens_in,
+                tokens_out,
+                duration_ms,
+                ip,
+            ),
+        )
+        conn.commit()
+
+
 def weekly_maintain(conn: sqlite3.Connection, lock) -> float:
     """Checkpoint TRUNCATE + VACUUM sous le lock writer (maintenance hebdo).
 
