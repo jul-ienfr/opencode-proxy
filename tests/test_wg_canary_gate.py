@@ -16,7 +16,6 @@ Contrats testés :
     à l'APPLICATION, pas à la décision).
 """
 
-import asyncio
 import os
 
 import pytest

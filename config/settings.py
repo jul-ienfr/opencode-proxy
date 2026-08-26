@@ -46,7 +46,6 @@ CONFIG_KEYS = [
     "OPENCODE_PROXY",
     "OPENCODE_HOST",
     "OPENCODE_PORT",
-    "OPENCODE_WEB_PORT",
     "OPUS_MAP_MODEL",
     "SONNET_MAP_MODEL",
     "HAIKU_MAP_MODEL",
@@ -439,6 +438,18 @@ GEO_POLICIES: dict = (
 SORTED_GEO_POLICIES: list = sorted(GEO_POLICIES.items()) if isinstance(GEO_POLICIES, dict) else []
 GEO_ALLOW_DIRECT_WHEN_COMPATIBLE: bool = bool(yaml_get("geo", "allow_direct_when_compatible", True))
 
+# [P1 perf] mémo resolve_geo — epoch bumpé à chaque hot-reload touchant les
+# entrées geo/routes ; clé complète dans resolve_geo (contenu + inputs).
+_geo_resolve_cache: dict = {}
+_GEO_RESOLVE_CACHE_MAX = 1024
+_geo_cache_epoch = 0
+
+
+def _bump_geo_cache() -> None:
+    global _geo_cache_epoch
+    _geo_cache_epoch += 1
+    _geo_resolve_cache.clear()
+
 
 def _server_countries_set() -> set:
     """Normalized set(server_countries) via single-source _vpn_normalize_country."""
@@ -536,13 +547,31 @@ def resolve_geo(route: dict) -> dict:
             "require_vpn": bool(raw_geo.get("require_vpn", False)),
             "geo_status": "disabled",
         }
+    # [P1 perf] mémo résolution : la clé couvre TOUTES les entrées qui
+    # influencent le résultat (contenu geo, flag global, server_countries,
+    # identité GEO_POLICIES + epoch bumpé au reload) — un monkeypatch/test ou
+    # un hot-reload produit donc forcément une clé différente.
+    server_set = _server_countries_set()
+    cache_key = (
+        _geo_cache_epoch,
+        repr(raw_geo),
+        tuple(sorted(server_set)),
+        id(GEO_POLICIES),
+    )
+    cached = _geo_resolve_cache.get(cache_key)
+    if cached is not None:
+        return {
+            "effective_allowed": set(cached[0]),
+            "mode": cached[1],
+            "require_vpn": cached[2],
+            "geo_status": cached[3],
+        }
     geo = _resolve_geo_extends(raw_geo)
     mode = str(geo.get("mode", "strict")).lower()
     if mode not in ("strict", "prefer", "warn"):
         logger.warning("[geo] invalid mode %r — fallback to strict", mode)
         mode = "strict"
     require_vpn = bool(geo.get("require_vpn", False))
-    server_set = _server_countries_set()
     allowed_raw = geo.get("allowed_countries", None)
     blocked_raw = geo.get("blocked_countries", None)
     # Normalize (invalid WARN+drop)
@@ -560,13 +589,20 @@ def resolve_geo(route: dict) -> dict:
         allowed_set = allowed_set - blocked_set
     has_allowed = allowed_raw is not None
     has_blocked = blocked_raw is not None
-    if not has_allowed and not has_blocked:
+
+    def _cached(effective: set, m: str, rv: bool, status: str) -> dict:
+        if len(_geo_resolve_cache) >= _GEO_RESOLVE_CACHE_MAX:
+            _geo_resolve_cache.clear()
+        _geo_resolve_cache[cache_key] = (frozenset(effective), m, rv, status)
         return {
-            "effective_allowed": set(server_set) if server_set else set(),
-            "mode": mode,
-            "require_vpn": require_vpn,
-            "geo_status": "ok",
+            "effective_allowed": set(effective),
+            "mode": m,
+            "require_vpn": rv,
+            "geo_status": status,
         }
+
+    if not has_allowed and not has_blocked:
+        return _cached(set(server_set) if server_set else set(), mode, require_vpn, "ok")
     if allowed_set and blocked_set:
         effective = (allowed_set - blocked_set) & server_set
     elif allowed_set:
@@ -580,20 +616,11 @@ def resolve_geo(route: dict) -> dict:
             effective = set()
         else:
             # only blocked declared but all invalid => nothing to block
-            effective = set(server_set) if server_set else set()
-            return {
-                "effective_allowed": effective,
-                "mode": mode,
-                "require_vpn": require_vpn,
-                "geo_status": "ok",
-            }
+            return _cached(
+                set(server_set) if server_set else set(), mode, require_vpn, "ok"
+            )
     geo_status = "misconfigured" if (not effective and mode == "strict") else "ok"
-    return {
-        "effective_allowed": effective,
-        "mode": mode,
-        "require_vpn": require_vpn,
-        "geo_status": geo_status,
-    }
+    return _cached(effective, mode, require_vpn, geo_status)
 
 
 def geo_strict_union() -> set:
@@ -750,7 +777,8 @@ def free_parallel_enabled() -> bool:
 # ── Server ──────────────────────────────────────────────────────────
 HOST = _env("OPENCODE_HOST", yaml_get("server", "host", "0.0.0.0"))
 PORT = _env_int("OPENCODE_PORT", yaml_get("server", "port", 4000))
-WEB_PORT = _env_int("OPENCODE_WEB_PORT", yaml_get("server", "web_port", 8082))
+# [P6] WEB_PORT supprimé : rien n'a jamais écouté sur :8082 — le dashboard
+# est servi par le port principal (PORT).
 
 # ── Model family prefix → protocol mapping ─────────────────────────
 # Used by _fetch_upstream_models() to assign the correct protocol
@@ -866,6 +894,14 @@ def _fetch_upstream_models(timeout: float = 3.0):
                 endpoint = API_BASE_OPENAI if proto == "openai" else API_BASE_ANTHROPIC
                 MODELS[model_id] = {"endpoint": endpoint, "protocol": proto}
                 added += 1
+        if added:
+            # [P4 correctesse] les modèles découverts doivent être visibles
+            # immédiatement : sans clear du LRU, get_model_config sert encore
+            # les défauts OpenAI stale pour un id absent au moment du 1er appel.
+            try:
+                get_model_config.cache_clear()
+            except Exception:
+                pass
         logger.info("[config] upstream models: fetched %d, added %d new", len(models), added)
         return added
     except Exception as e:
@@ -1022,7 +1058,7 @@ def _fetch_free_models_sync(timeout: float = 10) -> tuple:
                         creationflags=_CREATE_NO_WINDOW,
                     )
                     if r.returncode != 0:
-                        raise RuntimeError(f"curl failed: {r.stderr[:200]}")
+                        raise RuntimeError(f"curl failed: {r.stderr[:200]}") from None
                     data = _json.loads(r.stdout)
                     payloads.append(data)
                     source_parts.append(url)
@@ -1299,6 +1335,13 @@ def _ensure_free_models_async():
         pass
 
 
+# [P4 race boot] _reload_lock défini AVANT le spawn des threads discovery
+# (plus bas) : l'ancienne définition en ligne ~1541 laissait une fenêtre où
+# le thread free-discovery appelait save_yaml_config/_bump_route_version
+# avec globals().get("_reload_lock") = None → écritures hors verrou en
+# course avec le reload principal.
+_reload_lock = threading.Lock()
+
 try:
     if FREE_DISCOVERY_ENABLED:
         _ensure_free_models_async()
@@ -1502,7 +1545,8 @@ def _get_mtime(path):
 _custom_routes_mtime = _get_mtime(CUSTOM_ROUTES_PATH)
 _custom_routes_last_check = 0.0
 _CUSTOM_ROUTES_CHECK_INTERVAL = yaml_get("background", "custom_routes_check_interval", 5)
-_reload_lock = threading.Lock()
+# _reload_lock est défini PLUS HAUT (avant le spawn des threads discovery) —
+# voir [P4 race boot].
 
 
 def _sort_routes_by_match(routes: dict) -> list:
@@ -1639,6 +1683,7 @@ def maybe_reload_custom_routes():
                     if isinstance(new_policies, dict):
                         GEO_POLICIES.update(new_policies)
                     SORTED_GEO_POLICIES[:] = sorted(GEO_POLICIES.items())
+                    _bump_geo_cache()
                     GEO_ALLOW_DIRECT_WHEN_COMPATIBLE = bool(
                         geo_sec.get("allow_direct_when_compatible", True)
                     )
@@ -1669,15 +1714,35 @@ def maybe_reload_custom_routes():
                         _old_sc = IP_ROTATION.get("server_countries", "")
                         _new_sc = new_ip.get("server_countries", "")
                         if _old_sc != _new_sc and _new_sc:
+                            # [P4 perf] HORS loop : peut_reload tourne sur
+                            # l'event loop (via _route_for) — un subprocess
+                            # jusqu'à 10 s ici gelait TOUTES les streams.
+                            # Thread daemon fire-and-forget à la place.
                             import subprocess as _sp2
+                            import threading as _th2
 
-                            _sp2.run(
-                                [__import__("sys").executable, os.path.join(ROOT, "scripts", "make_credentials_env.py")],
-                                capture_output=True,
-                                timeout=10,
-                                creationflags=_CREATE_NO_WINDOW,
-                            )
-                            logging.info("[config] server_countries changed → .env regen")
+                            def _regen_env() -> None:
+                                try:
+                                    _sp2.run(
+                                        [
+                                            __import__("sys").executable,
+                                            os.path.join(
+                                                ROOT, "scripts", "make_credentials_env.py"
+                                            ),
+                                        ],
+                                        capture_output=True,
+                                        timeout=10,
+                                        creationflags=_CREATE_NO_WINDOW,
+                                    )
+                                    logging.info(
+                                        "[config] server_countries changed → .env regen"
+                                    )
+                                except Exception as _e2:
+                                    logging.warning("[config] .env regen failed: %s", _e2)
+
+                            _th2.Thread(
+                                target=_regen_env, daemon=True, name="env-regen"
+                            ).start()
                     except Exception:
                         pass
                     logging.info(
@@ -1715,6 +1780,7 @@ def maybe_reload_custom_routes():
                 # Invalidation centralisée : on tient déjà le verrou → variante
                 # unlocked (Lock non réentrant).
                 _bump_route_version_unlocked()
+                _bump_geo_cache()
                 logging.info(
                     "Reloaded routes (%d routes, cfg_changed=%s)", len(ROUTES), cfg_changed
                 )
@@ -1783,15 +1849,14 @@ def save_env(updates: dict):
     ROUTES = load_routes()
     SORTED_ROUTES = _sort_routes_by_match(ROUTES)
     _bump_route_version()  # pas de verrou tenu ici → variante lockée
+    _bump_geo_cache()
     logger.debug("[config] save_env: applied %d vars", len(updates))
 
 
-def apply_server_changes(port=None, web_port=None, host=None):
-    """Update HOST, PORT, WEB_PORT at runtime."""
-    global HOST, PORT, WEB_PORT
+def apply_server_changes(port=None, host=None):
+    """Update HOST, PORT at runtime."""
+    global HOST, PORT
     if host is not None:
         HOST = host
     if port is not None:
         PORT = int(port)
-    if web_port is not None:
-        WEB_PORT = int(web_port)

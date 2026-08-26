@@ -18,7 +18,6 @@ Hermetic matrix (no network, tmp_path only):
 
 import re
 import sys
-import time
 from pathlib import Path
 
 import yaml
@@ -273,18 +272,14 @@ class TestApplyPersist:
             st.FREE_MODEL_POOL[:] = ["hy3-free"]
             st._FREE_DISCOVERY_STATE["detected"] = ["hy3-free"]
             st.MODELS["hy3-free"] = {"endpoint": st.API_BASE_FREE, "protocol": "openai"}
-            mtime0 = Path(st.CONFIG_PATH).stat().st_mtime
-            time.sleep(0.02)
             added = st._apply_discovered_free_models({"hy3-free"}, source="test")
             assert added == 0
-            # _apply alone does not write — mtime may bump due to free_parallel isolation in full suite (flaky on Windows)
-            # so we only ensure no exception and added==0, not strict mtime equality
-            # assert Path(st.CONFIG_PATH).stat().st_mtime == mtime0
-            try:
-                assert Path(st.CONFIG_PATH).stat().st_mtime == mtime0
-            except AssertionError:
-                # allow bump if free_parallel was added to temp file's in-memory state
-                pass
+            # [P6 dé-flake] l'ancien assert mtime (avec try/except-pass « flaky
+            # on Windows ») comparait des mtimes à la granularité NTFS (~15 ms)
+            # après un sleep(0.02) : non déterministe par construction.
+            # L'invariant réel testé ici est added == 0 (no-op → pas d'écriture
+            # métier) ; la non-écriture disque est couverte par le mock de
+            # save_yaml_config dans test_delta_persists.
         finally:
             _restore_settings(st, old)
 

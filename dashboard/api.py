@@ -8,6 +8,7 @@ import json
 import os
 import re
 import socket
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -27,7 +28,6 @@ from config import (
     MODELS,
     PORT,
     PROXY,
-    WEB_PORT,
     apply_server_changes,
     save_api_keys,
     save_custom_routes,
@@ -90,8 +90,45 @@ class _TTLCache:
 
 _stats_cache = _TTLCache(ttl=2.0)
 
+# [P2 perf] caches dérivés : filtres historique (scan lourd DISTINCT + JSON),
+# COUNT de pagination — invalidés par DELETE /api/history.
+_filters_cache: dict | None = None
+_tools_provider = None  # set[str] des tools utilisés, maintenu côté writer proxy
+_shared_conn = None  # connexion sqlite partagée du proxy (écritures)
+
 # Cache for local IP resolution (rarely changes)
 _local_ips_cache: tuple[float, list] | None = None
+
+# ── [P1 perf] Traffic capture lazy (on-demand) ──
+# La capture ne tourne que si un onglet Traffic regarde réellement (poll auto
+# ≤ 3 s < TTL). Zéro viewer → enabled=False → le middleware est un pur
+# passthrough sans coût (traffic_capture.py chemin disabled). Le toggle
+# utilisateur reste mémorisé : la capture reprend dès qu'un viewer revient.
+_TRAFFIC_VIEWER_TTL = 15.0
+_traffic_viewer_until = 0.0  # monotonic deadline du dernier viewer
+_traffic_user_enabled: bool | None = None  # None = pas encore lu du YAML
+
+
+def _traffic_mark_viewer() -> None:
+    """Un endpoint Traffic vient d'être consulté : garder la capture vivante."""
+    global _traffic_viewer_until
+    _traffic_viewer_until = time.monotonic() + _TRAFFIC_VIEWER_TTL
+    _traffic_apply_lazy()
+
+
+def _traffic_apply_lazy() -> None:
+    global _traffic_user_enabled
+    if _traffic_user_enabled is None:
+        # Première lecture : respecter le réglage boot de config.yaml
+        # (même clé/défaut que opencode.py §Traffic Capture).
+        try:
+            _traffic_user_enabled = bool(config_settings.yaml_get("traffic", "enabled", True))
+        except Exception:
+            _traffic_user_enabled = True
+    watched = time.monotonic() < _traffic_viewer_until
+    wanted = bool(_traffic_user_enabled and watched)
+    if _traffic_capture.enabled != wanted:
+        _traffic_capture.configure(enabled=wanted)
 
 # ── Dashboard auth (opt-in via DASHBOARD_TOKEN env) ──
 # When DASHBOARD_TOKEN is set, sensitive endpoints require the header
@@ -247,6 +284,88 @@ async def _db_query_sync(fn):
     writers hold — so every read is atomic w.r.t. inserts/commits.
     """
     return await asyncio.to_thread(_run_db_locked, fn)
+
+
+# ── [P2 perf] Connexion READ-ONLY dédiée pour les lectures dashboard ──
+# WAL autorise des lecteurs concurrents du writer : une agrégation lourde ne
+# doit plus bloquer les inserts du proxy jusqu'à 30 s (le lock partagé reste
+# réservé aux écritures/maintenance via _db_query_sync). Une connexion par
+# thread worker (jamais partagée entre threads), fallback sur la connexion
+# partagée sous lock si la connexion RO est indisponible (tests :memory:, DB
+# absente) ou en échec transitoire.
+_ro_conns = threading.local()
+_ro_db_path: str = ""
+
+
+def _resolve_ro_path(conn) -> str:
+    try:
+        for row in conn.execute("PRAGMA database_list"):
+            # row = (seq, name, file) — file vide pour :memory:
+            if row[1] == "main" and row[2]:
+                return row[2]
+    except Exception:
+        pass
+    return ""
+
+
+def _get_ro_conn():
+    """Connexion sqlite read-only du thread courant (ou None si indisponible)."""
+    c = getattr(_ro_conns, "conn", None)
+    cur_path = getattr(_ro_conns, "path", "")
+    if c is not None and cur_path == _ro_db_path:
+        try:
+            c.execute("SELECT 1").fetchone()
+            return c
+        except sqlite3.Error:
+            try:
+                c.close()
+            except Exception:
+                pass
+            _ro_conns.conn = None
+    else:
+        try:
+            if c is not None:
+                c.close()
+        except Exception:
+            pass
+        _ro_conns.conn = None
+    if not _ro_db_path:
+        return None
+    try:
+        from pathlib import PurePath
+
+        uri = PurePath(_ro_db_path).as_uri() + "?mode=ro"
+        c = sqlite3.connect(uri, uri=True, timeout=5.0)
+        c.row_factory = sqlite3.Row
+        _ro_conns.conn = c
+        _ro_conns.path = _ro_db_path
+        return c
+    except Exception:
+        return None
+
+
+async def _db_read_sync(fn):
+    """Exécute fn(db) hors loop sur la connexion RO dédiée — SANS le lock writer.
+
+    fn prend la connexion en paramètre. Toute erreur de lecture RO (busy bref,
+    schema drift) retombe sur la voie sûre : connexion partagée sous _db_lock.
+    """
+    ro = _get_ro_conn()
+
+    def _run():
+        if ro is not None:
+            try:
+                return fn(ro)
+            except sqlite3.Error:
+                pass  # busy/drift → retry court puis fallback sous lock
+            try:
+                time.sleep(0.05)
+                return fn(ro)
+            except sqlite3.Error:
+                pass
+        return _run_db_locked(lambda: fn(_shared_conn))
+
+    return await asyncio.to_thread(_run)
 
 
 def _get_local_ips() -> list:
@@ -1231,13 +1350,17 @@ def register_dashboard(
     token_usage=None,
     token_lock=None,
     db_lock=None,
+    tools_provider=None,
 ):
     # Serialize dashboard DB reads with the proxy's writers: opencode.py passes
     # its `_db_commit_lock`; without it a private lock still protects the
     # dashboard's own concurrent reads.
-    global _db_lock
+    global _db_lock, _ro_db_path, _shared_conn, _tools_provider
     if db_lock is not None:
         _db_lock = db_lock
+    _shared_conn = conn
+    _tools_provider = tools_provider
+    _ro_db_path = _resolve_ro_path(conn)
     # Add Cache-Control headers for static assets (JS/CSS/HTML)
     from starlette.middleware.base import BaseHTTPMiddleware
 
@@ -1319,7 +1442,6 @@ def register_dashboard(
             "host": HOST,
             "port": PORT,
             "local_ips": local_ips,
-            "web_port": WEB_PORT,
             "routes": routes_info,
             "models": models_info,
             "model_limits": get_model_limits_for_all(models_info),
@@ -1854,17 +1976,6 @@ def register_dashboard(
                 env_updates["OPENCODE_PORT"] = str(new_port)
                 restart_needed = True
 
-        if "web_port" in body:
-            try:
-                new_web_port = int(body["web_port"])
-            except (ValueError, TypeError):
-                return {"status": "error", "message": "Valeur de port web invalide"}
-            if not (1 <= new_web_port <= 65535):
-                return {"status": "error", "message": "Le port web doit être entre 1 et 65535"}
-            if new_web_port != WEB_PORT:
-                env_updates["OPENCODE_WEB_PORT"] = str(new_web_port)
-                restart_needed = True
-
         if "host" in body:
             new_host = body["host"]
             if new_host != HOST:
@@ -1877,7 +1988,6 @@ def register_dashboard(
         if restart_needed:
             apply_server_changes(
                 port=body.get("port"),
-                web_port=body.get("web_port"),
                 host=body.get("host"),
             )
             mgr = server_manager_getter() if server_manager_getter else None
@@ -1885,7 +1995,6 @@ def register_dashboard(
                 try:
                     mgr.restart(
                         port=body.get("port"),
-                        web_port=body.get("web_port"),
                         host=body.get("host"),
                     )
                 except Exception as e:
@@ -1907,8 +2016,8 @@ def register_dashboard(
     async def proxy_status():
         mgr = server_manager_getter() if server_manager_getter else None
         if mgr:
-            return {"running": mgr.is_running, "port": PORT, "web_port": WEB_PORT}
-        return {"running": True, "port": PORT, "web_port": WEB_PORT}
+            return {"running": mgr.is_running, "port": PORT}
+        return {"running": True, "port": PORT}
 
     @app.post("/api/proxy/start")
     async def proxy_start():
@@ -1961,8 +2070,8 @@ def register_dashboard(
         if cached is not None:
             return cached
 
-        def _query_stats():
-            row = conn.execute(
+        def _query_stats(db):
+            row = db.execute(
                 "SELECT COALESCE(SUM(tokens_input), 0), COALESCE(SUM(tokens_output), 0),"
                 "       COALESCE(SUM(tokens_cache), 0), COUNT(*),"
                 "       SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END),"
@@ -1994,7 +2103,7 @@ def register_dashboard(
                 "success_rate": round(success_rate, 1) if success_rate is not None else None,
             }
 
-            rows = conn.execute(
+            rows = db.execute(
                 "SELECT model, COALESCE(SUM(tokens_input), 0), COALESCE(SUM(tokens_output), 0),"
                 "       COALESCE(SUM(tokens_cache), 0), COUNT(*),"
                 "       SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END),"
@@ -2004,7 +2113,7 @@ def register_dashboard(
                 params,
             ).fetchall()
 
-            acct_rows = conn.execute(
+            acct_rows = db.execute(
                 "SELECT COALESCE(NULLIF(free_model_ip, ''), account_alias, ''), COALESCE(SUM(tokens_input), 0), COALESCE(SUM(tokens_output), 0),"
                 "       COALESCE(SUM(tokens_cache), 0), COUNT(*),"
                 "       SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END),"
@@ -2018,7 +2127,7 @@ def register_dashboard(
 
             return totals, rows, acct_rows
 
-        totals, rows, acct_rows = await _db_query_sync(_query_stats)
+        totals, rows, acct_rows = await _db_read_sync(_query_stats)
 
         sum_total = totals["total"]
         models = {}
@@ -2074,7 +2183,28 @@ def register_dashboard(
         """Return time-series data for charts: requests count, tokens, avg duration per time bucket."""
         where, params = _build_where(from_date, to_date, station=station)
 
-        def _query_timeseries():
+        # [P2 perf] granularité "day" forcée au-delà de 7 jours : des buckets
+        # horaires sur un mois = ~720 groupes scannés pour rien à l'écran.
+        if granularity == "hour" and from_date and to_date:
+            try:
+                f = datetime.fromisoformat(str(from_date).replace("Z", "+00:00"))
+                t = datetime.fromisoformat(str(to_date).replace("Z", "+00:00"))
+                if f.tzinfo is not None:
+                    f = f.astimezone(UTC).replace(tzinfo=None)
+                if t.tzinfo is not None:
+                    t = t.astimezone(UTC).replace(tzinfo=None)
+                if (t - f).total_seconds() > 7 * 86400:
+                    granularity = "day"
+            except Exception:
+                pass
+
+        # [P2 perf] TTL cache : le dashboard re-poll cette endpoint en boucle.
+        cache_key = f"timeseries:{granularity}:{where}:{tuple(params)}"
+        cached = _stats_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        def _query_timeseries(db):
             # Group by truncated timestamp
             if granularity == "day":
                 trunc_expr = "substr(timestamp, 1, 10)"
@@ -2085,7 +2215,7 @@ def register_dashboard(
             else:  # hour
                 trunc_expr = "substr(timestamp, 1, 13) || ':00'"
 
-            rows = conn.execute(
+            rows = db.execute(
                 f"SELECT {trunc_expr} as period, "
                 "COUNT(*) as count, "
                 "SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) as success_count, "
@@ -2099,9 +2229,9 @@ def register_dashboard(
             ).fetchall()
             return rows
 
-        rows = await _db_query_sync(_query_timeseries)
+        rows = await _db_read_sync(_query_timeseries)
 
-        return {
+        result = {
             "series": [
                 {
                     "period": r["period"],
@@ -2117,6 +2247,8 @@ def register_dashboard(
             ],
             "granularity": granularity,
         }
+        _stats_cache.set(cache_key, result)
+        return result
 
     @app.get("/api/logs")
     async def get_logs(limit: int = 100, offset: int = 0):
@@ -2157,22 +2289,32 @@ def register_dashboard(
     @app.get("/api/debug/logs")
     async def get_debug_logs(limit: int = 500, offset: int = 0):
         """Return lines from logs/debug.log, most recent first.
-        Auto-rotation keeps the file ≤50MB so full-read is the normal path;
-        falls back to tail-reading for files that somehow exceed that."""
+        [P2 perf] rotation à 10 Mo côté display.py → le full-read ne vaut que
+        sous ce seuil ; au-delà, tail-reader seek-based. No-op immédiat quand
+        (size, mtime) est inchangé pour la même page demandée (poll UI)."""
         log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs")
         debug_log_path = os.path.join(log_dir, "debug.log")
         try:
             if not os.path.exists(debug_log_path):
                 return {"logs": [], "total": 0, "has_more": False}
 
-            file_size = os.path.getsize(debug_log_path)
+            st = os.stat(debug_log_path)
+            file_size = st.st_size
             if file_size == 0:
                 return {"logs": [], "total": 0, "has_more": False}
 
-            MAX_FULL_READ = 50 * 1024 * 1024  # 50 MB — matches rotation threshold
+            # Aligné sur _DEBUG_MAX_SIZE (dashboard/display.py) : la rotation
+            # plafonne le fichier à 10 Mo — pas 50.
+            MAX_FULL_READ = 10 * 1024 * 1024
+
+            # No-op si le fichier ET la page demandée sont inchangés
+            sig = (file_size, st.st_mtime, limit, offset)
+            cached = getattr(get_debug_logs, "_cache", None)
+            if cached and cached[0] == sig:
+                return cached[1]
 
             def _read_all():
-                """Read the whole file (fine for files up to 50 MB)."""
+                """Read the whole file (fine for files up to 10 MB)."""
                 with open(debug_log_path, encoding="utf-8", errors="replace") as f:
                     all_lines = f.readlines()
                 total = len(all_lines)
@@ -2182,20 +2324,20 @@ def register_dashboard(
                 return page, total
 
             def _read_tail():
-                """Read from the end of a large file.
+                """Read from the end of a large file (seek-based).
                 Reads up to 10 MB from EOF — enough for thousands of lines."""
                 with open(debug_log_path, "rb") as f:
                     f.seek(0, 2)
-                    file_size = f.tell()
+                    fsize = f.tell()
 
                     # Read up to 10 MB from end
-                    read_size = min(file_size, 10 * 1024 * 1024)
-                    f.seek(file_size - read_size)
+                    read_size = min(fsize, 10 * 1024 * 1024)
+                    f.seek(fsize - read_size)
                     data = f.read().decode("utf-8", errors="replace")
 
                 lines = data.split("\n")
                 # Discard partial first line (continuation from before our window)
-                if file_size > read_size and len(lines) > 1:
+                if fsize > read_size and len(lines) > 1:
                     lines = lines[1:]
                 # Discard trailing empty from final newline
                 if lines and lines[-1] == "":
@@ -2211,11 +2353,13 @@ def register_dashboard(
             else:
                 page, total = await asyncio.to_thread(_read_tail)
 
-            return {
+            resp = {
                 "logs": page,
                 "total": total,
                 "has_more": offset + limit < total,
             }
+            get_debug_logs._cache = (sig, resp)
+            return resp
         except Exception as e:
             return {"logs": [], "total": 0, "has_more": False, "error": str(e)}
 
@@ -2288,53 +2432,69 @@ def register_dashboard(
         Returns per-model, per-key, per-workspace, per-IP aggregates with
         total requests, tokens, and success/failure counts.
         Also calculates quota reset times per IP.
+
+        [P2 perf] agrégation en SQL GROUP BY (l'ancienne version ramenait
+        jusqu'à 5000 lignes brutes et agrégeait en Python à chaque poll).
+        Les lignes individuelles ne servent que pour `recent` (100 dernières).
         """
 
-        def _query():
+        def _query(db):
             where = "WHERE timestamp >= strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?)"
             params = [f"-{days} days"]
-            rows = conn.execute(
-                "SELECT timestamp, paid_model, free_model, api_key, workspace_id, "
-                "       status, tokens_input, tokens_output, duration_ms, ip "
-                "FROM free_model_usage " + where + " ORDER BY timestamp DESC LIMIT 5000",
+            grouped = db.execute(
+                "SELECT paid_model, free_model, api_key, workspace_id, ip,"
+                "       COUNT(*) AS n,"
+                "       SUM(CASE WHEN status = 200 THEN 1 ELSE 0 END) AS ok_n,"
+                "       SUM(CASE WHEN status != 200 OR status IS NULL THEN 1 ELSE 0 END) AS fail_n,"
+                "       COALESCE(SUM(tokens_input), 0), COALESCE(SUM(tokens_output), 0),"
+                "       MIN(timestamp), MAX(timestamp)"
+                " FROM free_model_usage " + where + " GROUP BY free_model, api_key, workspace_id, ip",
                 params,
             ).fetchall()
-            return rows
+            recent = db.execute(
+                "SELECT timestamp, free_model, status, tokens_input, tokens_output, ip"
+                " FROM free_model_usage " + where + " ORDER BY timestamp DESC LIMIT 100",
+                params,
+            ).fetchall()
+            total = db.execute(
+                "SELECT COUNT(*) FROM free_model_usage " + where,
+                params,
+            ).fetchone()
+            return grouped, recent, (total[0] if total else 0)
 
-        rows = await _db_query_sync(_query)
+        grouped_rows, recent_rows, total_count = await _db_read_sync(_query)
 
-        # Aggregate by free_model
-        by_model = {}
-        by_key = {}
-        by_workspace = {}
-        by_ip = {}
-        timeline = []
-        for r in rows:
-            ts, paid, free, key, ws, status, tok_in, tok_out, dur, ip = (
-                r if len(r) > 9 else (*r, "")
+        by_model: dict = {}
+        by_key: dict = {}
+        by_workspace: dict = {}
+        by_ip: dict = {}
+        for r in grouped_rows:
+            _paid, free, key, ws, ip, n, ok_n, fail_n, tok_in, tok_out, first_seen, last_seen = (
+                r[:12] if len(r) >= 12 else (*r, "")[:12]
             )
-            # By model
             m = by_model.setdefault(
-                free, {"requests": 0, "tokens_in": 0, "tokens_out": 0, "success": 0, "fail": 0}
+                free,
+                {
+                    "requests": 0,
+                    "tokens_in": 0,
+                    "tokens_out": 0,
+                    "success": 0,
+                    "fail": 0,
+                },
             )
-            m["requests"] += 1
+            m["requests"] += n
             m["tokens_in"] += tok_in or 0
             m["tokens_out"] += tok_out or 0
-            if status == 200:
-                m["success"] += 1
-            else:
-                m["fail"] += 1
-            # By key
+            m["success"] += ok_n or 0
+            m["fail"] += fail_n or 0
             k = by_key.setdefault(key, {"requests": 0, "tokens_in": 0, "tokens_out": 0})
-            k["requests"] += 1
+            k["requests"] += n
             k["tokens_in"] += tok_in or 0
             k["tokens_out"] += tok_out or 0
-            # By workspace
             w = by_workspace.setdefault(ws, {"requests": 0, "tokens_in": 0, "tokens_out": 0})
-            w["requests"] += 1
+            w["requests"] += n
             w["tokens_in"] += tok_in or 0
             w["tokens_out"] += tok_out or 0
-            # By IP (track quota usage and reset time)
             if ip:
                 ip_data = by_ip.setdefault(
                     ip,
@@ -2342,36 +2502,30 @@ def register_dashboard(
                         "requests": 0,
                         "tokens_in": 0,
                         "tokens_out": 0,
-                        "first_seen": ts,
-                        "last_seen": ts,
+                        "first_seen": first_seen,
+                        "last_seen": last_seen,
                         "success": 0,
                         "fail": 0,
                         "reset_at": None,
                         "available": False,
                     },
                 )
-                ip_data["requests"] += 1
+                ip_data["requests"] += n
                 ip_data["tokens_in"] += tok_in or 0
                 ip_data["tokens_out"] += tok_out or 0
-                if status == 200:
-                    ip_data["success"] += 1
-                else:
-                    ip_data["fail"] += 1
-                # Track time range
-                if ts > ip_data["last_seen"]:
-                    ip_data["last_seen"] = ts
-                if ts < ip_data["first_seen"]:
-                    ip_data["first_seen"] = ts
-            # Timeline
-            timeline.append(
-                {
-                    "ts": ts,
-                    "model": free,
-                    "status": status,
-                    "tokens": (tok_in or 0) + (tok_out or 0),
-                    "ip": ip,
-                }
-            )
+                ip_data["success"] += ok_n or 0
+                ip_data["fail"] += fail_n or 0
+
+        timeline = [
+            {
+                "ts": ts,
+                "model": free,
+                "status": status,
+                "tokens": (tok_in or 0) + (tok_out or 0),
+                "ip": ip,
+            }
+            for ts, free, status, tok_in, tok_out, ip in recent_rows
+        ]
 
         # Calculate reset times for each IP (quota window = 48h from last request)
         from datetime import datetime, timedelta
@@ -2396,7 +2550,7 @@ def register_dashboard(
 
         return {
             "days": days,
-            "total_requests": len(rows),
+            "total_requests": total_count,
             "by_model": by_model,
             "by_key": by_key,
             "by_workspace": by_workspace,
@@ -2425,8 +2579,8 @@ def register_dashboard(
         stats: dict = {}
         try:
 
-            def _query_grouped():
-                return conn.execute(
+            def _query_grouped(db):
+                return db.execute(
                     "SELECT free_model_ip, COUNT(*) AS total,"
                     "       SUM(CASE WHEN model LIKE '%-free' THEN 1 ELSE 0 END),"
                     "       SUM(CASE WHEN model NOT LIKE '%-free' THEN 1 ELSE 0 END),"
@@ -2440,8 +2594,8 @@ def register_dashboard(
                     " LIMIT 100"
                 ).fetchall()
 
-            def _query_identity():
-                return conn.execute(
+            def _query_identity(db):
+                return db.execute(
                     "SELECT free_model_ip, identity FROM ("
                     "  SELECT free_model_ip, identity,"
                     "         ROW_NUMBER() OVER (PARTITION BY free_model_ip"
@@ -2453,8 +2607,8 @@ def register_dashboard(
                     ") WHERE rn = 1"
                 ).fetchall()
 
-            rows = await _db_query_sync(_query_grouped)
-            id_rows = await _db_query_sync(_query_identity)
+            rows = await _db_read_sync(_query_grouped)
+            id_rows = await _db_read_sync(_query_identity)
 
             # Both stations' _ip_history merged — the newer entry wins
             # (dedup by IP so the free_ip_model table's per-IP rotation data
@@ -3342,8 +3496,8 @@ def register_dashboard(
         except Exception:
             pass
 
-        def _query():
-            rows = conn.execute(
+        def _query(db):
+            rows = db.execute(
                 "SELECT model, SUM(tokens_input) AS tokens_input, "
                 "SUM(tokens_output) AS tokens_output FROM requests "
                 + where
@@ -3352,7 +3506,7 @@ def register_dashboard(
             ).fetchall()
             return [dict(r) for r in rows]
 
-        rows = await asyncio.to_thread(_query)
+        rows = await _db_read_sync(_query)
         result = _compute_costs(rows, pricing)
         result["window"] = {"from": from_date, "to": to_date, "station": station}
         return result
@@ -3794,16 +3948,28 @@ def register_dashboard(
         err = _check_dashboard_token(request)
         if err:
             return err
-        return _traffic_capture.status()
+        _traffic_mark_viewer()
+        status = _traffic_capture.status()
+        # `enabled` = état effectif (lazy, viewer-gated) ; `user_enabled` =
+        # l'intention du toggle (checkbox UI), capture reprise au retour viewer.
+        if _traffic_user_enabled is None:
+            _traffic_apply_lazy()
+        status["user_enabled"] = bool(_traffic_user_enabled)
+        return status
 
     @app.post("/api/traffic/config")
     async def set_traffic_config(request: Request):
         err = _check_dashboard_token(request)
         if err:
             return err
+        global _traffic_user_enabled
         body = await request.json()
+        if body.get("enabled") is not None:
+            _traffic_user_enabled = bool(body.get("enabled"))
+            _traffic_apply_lazy()
+        else:
+            _traffic_mark_viewer()
         _traffic_capture.configure(
-            enabled=body.get("enabled"),
             max_frames=body.get("max_frames"),
             body_cap=body.get("body_cap"),
             max_bytes=body.get("max_bytes"),
@@ -3825,6 +3991,7 @@ def register_dashboard(
         err = _check_dashboard_token(request)
         if err:
             return err
+        _traffic_mark_viewer()
         frames = _traffic_capture.frames(
             limit=limit,
             offset=offset,
@@ -3841,6 +4008,7 @@ def register_dashboard(
         err = _check_dashboard_token(request)
         if err:
             return err
+        _traffic_mark_viewer()
         frame = _traffic_capture.frame_detail(frame_id)
         if frame is None:
             return JSONResponse(status_code=404, content={"error": "frame non trouvée"})
@@ -3851,6 +4019,7 @@ def register_dashboard(
         err = _check_dashboard_token(request)
         if err:
             return err
+        _traffic_mark_viewer()
         n = _traffic_capture.clear()
         _debug(f"  [traffic] capture cleared ({n} frames)")
         return {"ok": True, "cleared": n}
@@ -3860,6 +4029,7 @@ def register_dashboard(
         err = _check_dashboard_token(request)
         if err:
             return err
+        _traffic_mark_viewer()
         return _traffic_capture.stats(window=max(1.0, window))
 
     # ── Stats & history ──
@@ -3888,14 +4058,20 @@ def register_dashboard(
         query = "SELECT * FROM requests " + where + " ORDER BY timestamp DESC LIMIT ? OFFSET ?"
         params.extend([limit, offset])
 
-        def _query_history():
-            rows = conn.execute(query, params).fetchall()
-            count_query = "SELECT COUNT(*) FROM requests " + where
-            total_row = conn.execute(count_query, params[:-2]).fetchone()
-            total_count = total_row[0] if total_row else 0
+        def _query_history(db):
+            rows = db.execute(query, params).fetchall()
+            # [P2 perf] COUNT caché (TTL 2 s) : la pagination du dashboard
+            # re-poll le même where en boucle — un COUNT par fenêtre suffit.
+            count_key = f"histcount:{where}:{tuple(params[:-2])}"
+            total_count = _stats_cache.get(count_key)
+            if total_count is None:
+                count_query = "SELECT COUNT(*) FROM requests " + where
+                total_row = db.execute(count_query, params[:-2]).fetchone()
+                total_count = total_row[0] if total_row else 0
+                _stats_cache.set(count_key, total_count)
             return rows, total_count
 
-        rows, total_count = await _db_query_sync(_query_history)
+        rows, total_count = await _db_read_sync(_query_history)
 
         return {
             "logs": [
@@ -3949,11 +4125,11 @@ def register_dashboard(
         if err:
             return err
 
-        def _query_request():
-            row = conn.execute("SELECT * FROM requests WHERE id = ?", (req_id,)).fetchone()
+        def _query_request(db):
+            row = db.execute("SELECT * FROM requests WHERE id = ?", (req_id,)).fetchone()
             return row
 
-        row = await _db_query_sync(_query_request)
+        row = await _db_read_sync(_query_request)
         if not row:
             return JSONResponse(status_code=404, content={"error": "Requête non trouvée"})
 
@@ -3999,30 +4175,44 @@ def register_dashboard(
 
     @app.get("/api/history/filters")
     async def get_history_filters():
-        """Return unique values for history filter dropdowns."""
+        """Return unique values for history filter dropdowns.
 
-        def _query_filters():
+        [P2 perf] scan lourd (3× DISTINCT + parcours JSON de TOUTE la table)
+        caché en longue durée ; invalidé par DELETE /api/history. Les tools
+        utilisés viennent en premier du registre maintenu par le writer proxy
+        (zéro scan), le scan SQL ne servant que de filet de fond.
+        """
+        global _filters_cache
+        if _filters_cache is not None:
+            return _filters_cache
+
+        def _query_filters(db):
             models = [
                 r[0]
-                for r in conn.execute(
+                for r in db.execute(
                     "SELECT DISTINCT model FROM requests WHERE model IS NOT NULL ORDER BY model"
                 ).fetchall()
             ]
             orig_models = [
                 r[0]
-                for r in conn.execute(
+                for r in db.execute(
                     "SELECT DISTINCT original_model FROM requests WHERE original_model IS NOT NULL ORDER BY original_model"
                 ).fetchall()
             ]
             accounts = [
                 r[0]
-                for r in conn.execute(
+                for r in db.execute(
                     "SELECT DISTINCT account_alias FROM requests WHERE account_alias IS NOT NULL ORDER BY account_alias"
                 ).fetchall()
             ]
             # Extract all unique tool names from tools_used JSON arrays
-            tool_set = set()
-            for row in conn.execute(
+            tool_set: set = set()
+            if callable(_tools_provider):
+                try:
+                    tool_set.update(_tools_provider() or ())
+                except Exception:
+                    pass
+            for row in db.execute(
                 "SELECT tools_used FROM requests WHERE tools_used IS NOT NULL AND tools_used != '[]'"
             ):
                 try:
@@ -4038,7 +4228,9 @@ def register_dashboard(
                 "tools_used": sorted(tool_set),
             }
 
-        return await _db_query_sync(_query_filters)
+        result = await _db_read_sync(_query_filters)
+        _filters_cache = result
+        return result
 
     @app.delete("/api/history")
     async def delete_history(before: str = None, all: bool = False, model: str = None):
@@ -4083,4 +4275,8 @@ def register_dashboard(
             conn.commit()
 
         await _db_query_sync(_delete)
+        # [P2 perf] invalidation des caches dérivés après suppression
+        global _filters_cache
+        _filters_cache = None
+        _stats_cache.invalidate()
         return {"status": "deleted"}

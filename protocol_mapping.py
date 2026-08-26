@@ -8,6 +8,7 @@ import json
 import re
 import time
 import uuid
+from collections import OrderedDict
 
 from config import CACHE_MIN_PROMPT_SIZE, yaml_get
 from dashboard.display import debug as _debug
@@ -143,9 +144,6 @@ THINKING_MODELS = (
         "deepseek-v4-pro": 4096,
     }
 )
-
-_responses_tool_cache: dict = {}
-_responses_tool_index_map: dict = {}
 
 
 def _extract_text(content) -> str:
@@ -572,12 +570,25 @@ def anthropic_to_openai(body: dict, model: str) -> dict:
 
 
 _orig_anthropic_to_openai = anthropic_to_openai
-_anthropic_cache: dict = {}
+# [P4] LRU borné : OrderedDict move-to-end + drop-oldest (l'ancien dict
+# gelerait le contenu à 512 entrées — plus aucun nouveau body mis en cache).
+_anthropic_cache: OrderedDict = OrderedDict()
 _anthropic_cache_max = 512
 
 
+def _conversion_epoch() -> int:
+    """[P4 correctesse] version de routage mélangée à la clé de conversion :
+    tout hot-reload touchant les règles (ROUTE_VERSION++ via save_env /
+    save_custom_routes / reload mtime) rend les entrées précédentes
+    introuvables — fini la staleness permanente après rechargement."""
+    try:
+        return int(_cfg_settings.ROUTE_VERSION)
+    except Exception:
+        return 0
+
+
 def _anthropic_cache_key(model: str, body: dict, raw: bytes | None = None) -> str:
-    """[C1 perf/correctesse] clé de cache blake2b(body_bytes ‖ model).
+    """[C1 perf/correctesse] clé de cache blake2b(epoch ‖ body_bytes ‖ model).
 
     Remplace ``hash(json.dumps(body))`` : plus de dumps complet par requête
     quand les bytes bruts sont disponibles chez l'appelant, et surtout plus
@@ -587,6 +598,7 @@ def _anthropic_cache_key(model: str, body: dict, raw: bytes | None = None) -> st
     nul) pour éviter toute ambiguïté de concaténation.
     """
     h = hashlib.blake2b(digest_size=16)
+    h.update(f"{_conversion_epoch()}\x00".encode("ascii", "replace"))
     if raw is not None:
         h.update(raw)
     else:
@@ -606,16 +618,19 @@ def anthropic_to_openai(body: dict, model: str, raw: bytes | None = None) -> dic
         key = _anthropic_cache_key(model, body, raw)
         hit = _anthropic_cache.get(key)
         if hit is not None:
+            # [P4] LRU : le hit rafraîchit la position (move-to-end).
+            _anthropic_cache.move_to_end(key)
             # [C1] shallow copy TOP-LEVEL uniquement : audit plan §3 — les
             # mutations post-conversion des callers touchent des clés racine
             # (model / stream_options / min_tokens), jamais les structures
             # imbriquées partagées. Fini les deepcopy hit ET miss.
             return dict(hit)
         res = _orig_anthropic_to_openai(body, model)
-        if len(_anthropic_cache) < _anthropic_cache_max:
-            # Objet stocké JAMAIS exposé tel quel (le caller reçoit une
-            # copie racine) → le cache reste pristine sans deepcopy.
-            _anthropic_cache[key] = res
+        # Objet stocké JAMAIS exposé tel quel (le caller reçoit une copie
+        # racine) → le cache reste pristine sans deepcopy.
+        _anthropic_cache[key] = res
+        while len(_anthropic_cache) > _anthropic_cache_max:
+            _anthropic_cache.popitem(last=False)  # drop-oldest
         return dict(res)
     except Exception:
         return _orig_anthropic_to_openai(body, model)
@@ -1565,13 +1580,35 @@ def _responses_to_anthropic_response(resp: dict, model: str) -> dict:
 
 
 # ── Responses API tool mapping cache (item_id/output_index → tool info) ──
+# [P4 correctesse] état PAR STREAM : les trois structures ci-dessous étaient
+# des globals partagés entre streams concurrents — un stream B voyait les
+# item_ids/out_idx du stream A, et un stream avorté (pas de response.completed)
+# fuyait son état vers le suivant. ``ResponsesSseState`` est instancié par
+# stream et passé via ``state=`` ; les globals restent le fallback legacy
+# (appelants sans state : fixtures golden, compatibilité).
 _responses_tool_cache: dict = {}
 _responses_tool_index_map: dict = {}  # output_index -> sequential tool index (0,1,2...)
 # Track reasoning item_ids for which a delta was already emitted (dedupe delta vs done)
 _reasoning_seen_ids: set = set()
 
 
-def _responses_sse_to_chat_deltas(raw_line: str, parsed=None):
+class ResponsesSseState:
+    """État de conversion SSE Responses-API pour UN stream."""
+
+    __slots__ = ("tool_cache", "tool_index_map", "reasoning_seen")
+
+    def __init__(self) -> None:
+        self.tool_cache: dict = {}
+        self.tool_index_map: dict = {}
+        self.reasoning_seen: set = set()
+
+    def reset(self) -> None:
+        self.tool_cache.clear()
+        self.tool_index_map.clear()
+        self.reasoning_seen.clear()
+
+
+def _responses_sse_to_chat_deltas(raw_line: str, parsed=None, state: "ResponsesSseState | None" = None):
     """Convert one Responses API SSE data line to chat/completions delta chunks.
 
     Yields 0..N dicts in chat/completions streaming format:
@@ -1581,6 +1618,9 @@ def _responses_sse_to_chat_deltas(raw_line: str, parsed=None):
     [C2 perf] ``parsed``: dict déjà parsé par l'appelant (son propre
     _json_loads(data_str)) — évite un second parse identique par chunk SSE.
     Ignoré quand None (compatibilité appelants legacy / fixtures golden).
+
+    [P4] ``state``: ResponsesSseState du stream courant. None → fallback
+    legacy sur les globals module-level (comportement historique).
 
     Returns None if the line is [DONE] or not parseable.
     """
@@ -1595,6 +1635,23 @@ def _responses_sse_to_chat_deltas(raw_line: str, parsed=None):
             return None
         if not isinstance(chunk, dict):
             return None
+
+    if state is not None:
+        tool_cache = state.tool_cache
+        tool_index_map = state.tool_index_map
+        reasoning_seen = state.reasoning_seen
+    else:
+        tool_cache = _responses_tool_cache
+        tool_index_map = _responses_tool_index_map
+        reasoning_seen = _reasoning_seen_ids
+
+    def _clear_state() -> None:
+        if state is not None:
+            state.reset()
+        else:
+            _responses_tool_cache.clear()
+            _responses_tool_index_map.clear()
+            _reasoning_seen_ids.clear()
 
     etype = chunk.get("type", "")
     if _cfg_settings.DEBUG:
@@ -1636,7 +1693,7 @@ def _responses_sse_to_chat_deltas(raw_line: str, parsed=None):
         _sidx = chunk.get("summary_index", 0)
         _key = f"{_iid}:{_sidx}" if _iid else f"delta:{_sidx}:{text[:8]}"
         if _key:
-            _reasoning_seen_ids.add(_key)
+            reasoning_seen.add(_key)
         return {"choices": [{"delta": {"reasoning_content": text}, "finish_reason": None}]}
 
     # response.reasoning_summary_text.done — fallback when delta missing (short reasoning)
@@ -1644,14 +1701,14 @@ def _responses_sse_to_chat_deltas(raw_line: str, parsed=None):
         _iid = chunk.get("item_id", "")
         _sidx = chunk.get("summary_index", 0)
         _key = f"{_iid}:{_sidx}" if _iid else ""
-        if _key and _key in _reasoning_seen_ids:
+        if _key and _key in reasoning_seen:
             _debug(f"  [responses-sse] reasoning_summary_text.done deduped (delta already emitted) key={_key!r}")
             return None
         text = chunk.get("text", "") or chunk.get("delta", "")
         if not text:
             return None
         if _key:
-            _reasoning_seen_ids.add(_key)
+            reasoning_seen.add(_key)
         return {"choices": [{"delta": {"reasoning_content": text}, "finish_reason": None}]}
 
     # response.reasoning_summary_part.done — part-level summary (contains summary_text)
@@ -1665,10 +1722,10 @@ def _responses_sse_to_chat_deltas(raw_line: str, parsed=None):
         _iid = chunk.get("item_id", "")
         _sidx = chunk.get("summary_index", 0)
         _key = f"{_iid}:{_sidx}" if _iid else f"part:{text[:8]}"
-        if _key and _key in _reasoning_seen_ids:
+        if _key and _key in reasoning_seen:
             return None
         if _key:
-            _reasoning_seen_ids.add(_key)
+            reasoning_seen.add(_key)
         return {"choices": [{"delta": {"reasoning_content": text}, "finish_reason": None}]}
 
     # response.output_item.added — start of function_call (tool_use)
@@ -1677,20 +1734,20 @@ def _responses_sse_to_chat_deltas(raw_line: str, parsed=None):
         if item.get("type") == "function_call":
             out_idx = chunk.get("output_index", 0)
             # Map output_index to sequential tool index
-            if out_idx not in _responses_tool_index_map:
-                _responses_tool_index_map[out_idx] = len(_responses_tool_index_map)
-            tool_idx = _responses_tool_index_map[out_idx]
+            if out_idx not in tool_index_map:
+                tool_index_map[out_idx] = len(tool_index_map)
+            tool_idx = tool_index_map[out_idx]
             call_id = item.get("call_id") or item.get("id") or f"call_{uuid.uuid4().hex[:12]}"
             name = item.get("name", "")
             # Cache for later delta events (by item_id and output_index)
             iid = item.get("id") or call_id
-            _responses_tool_cache[iid] = {
+            tool_cache[iid] = {
                 "index": tool_idx,
                 "call_id": call_id,
                 "name": name,
                 "output_index": out_idx,
             }
-            _responses_tool_cache[f"idx_{out_idx}"] = {
+            tool_cache[f"idx_{out_idx}"] = {
                 "index": tool_idx,
                 "call_id": call_id,
                 "name": name,
@@ -1724,12 +1781,12 @@ def _responses_sse_to_chat_deltas(raw_line: str, parsed=None):
         out_idx = chunk.get("output_index", 0)
         iid = chunk.get("item_id", "")
         # Lookup tool index
-        info = _responses_tool_cache.get(iid) or _responses_tool_cache.get(f"idx_{out_idx}")
+        info = tool_cache.get(iid) or tool_cache.get(f"idx_{out_idx}")
         if info is None:
             # Fallback: create entry if we missed the 'added' event
-            if out_idx not in _responses_tool_index_map:
-                _responses_tool_index_map[out_idx] = len(_responses_tool_index_map)
-            tool_idx = _responses_tool_index_map[out_idx]
+            if out_idx not in tool_index_map:
+                tool_index_map[out_idx] = len(tool_index_map)
+            tool_idx = tool_index_map[out_idx]
             _debug(
                 f"  [responses-sse] function_call delta without prior added — fallback idx={tool_idx} out_idx={out_idx}"
             )
@@ -1753,8 +1810,8 @@ def _responses_sse_to_chat_deltas(raw_line: str, parsed=None):
         iid = chunk.get("item_id", "")
         chunk.get("arguments", "")
         name = chunk.get("name", "")
-        if iid and iid in _responses_tool_cache and name:
-            _responses_tool_cache[iid]["name"] = name
+        if iid and iid in tool_cache and name:
+            tool_cache[iid]["name"] = name
         return None
 
     # response.output_item.done — reasoning item final with summary array (fallback + 100% guarantee)
@@ -1763,7 +1820,7 @@ def _responses_sse_to_chat_deltas(raw_line: str, parsed=None):
         if isinstance(item, dict) and item.get("type") == "reasoning":
             iid = item.get("id", "") or f"rs_{chunk.get('output_index', 0)}"
             # dedupe: if any summary part for this item already emitted, skip (check prefix)
-            if iid and any(k == iid or k.startswith(f"{iid}:") for k in _reasoning_seen_ids):
+            if iid and any(k == iid or k.startswith(f"{iid}:") for k in reasoning_seen):
                 return None
             summary = item.get("summary", [])
             reasoning = ""
@@ -1782,9 +1839,9 @@ def _responses_sse_to_chat_deltas(raw_line: str, parsed=None):
                 return None
             if reasoning:
                 if iid:
-                    _reasoning_seen_ids.add(iid)
+                    reasoning_seen.add(iid)
                     # also mark per-index to prevent double emit from summary_text.done
-                    _reasoning_seen_ids.add(f"{iid}:0")
+                    reasoning_seen.add(f"{iid}:0")
                 _debug(f"  [responses-sse] output_item.done reasoning fallback len={len(reasoning)} iid={iid!r}")
                 return {"choices": [{"delta": {"reasoning_content": reasoning}, "finish_reason": None}]}
         return None
@@ -1792,9 +1849,7 @@ def _responses_sse_to_chat_deltas(raw_line: str, parsed=None):
     # response.completed — final event with usage
     if etype == "response.completed":
         # Clear tool cache + reasoning dedupe for next request
-        _responses_tool_cache.clear()
-        _responses_tool_index_map.clear()
-        _reasoning_seen_ids.clear()
+        _clear_state()
         resp = chunk.get("response", {})
         usage = resp.get("usage", {})
         # Cache tokens come from input_tokens_details, NOT output_tokens_details
@@ -1817,9 +1872,7 @@ def _responses_sse_to_chat_deltas(raw_line: str, parsed=None):
 
     # response.incomplete — model didn't generate output, treat as stream end
     if etype == "response.incomplete":
-        _responses_tool_cache.clear()
-        _responses_tool_index_map.clear()
-        _reasoning_seen_ids.clear()
+        _clear_state()
         _debug("  [responses-sse] response.incomplete received — model produced no output")
         resp = chunk.get("response", {})
         usage = resp.get("usage", {}) if isinstance(resp.get("usage"), dict) else {}

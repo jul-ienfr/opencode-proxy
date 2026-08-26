@@ -8,12 +8,13 @@ target-version = "py311"
 extend-exclude = [".kilo/", ".venv/", "logs/", "__pycache__/", ".git/"]
 
 [tool.ruff.lint]
+# [P6] ignore dédoublonné ; E722/B904 RETIRÉS des ignores et corrigés dans
+# le code (bare except → except Exception ; raise ... from e).
 select = ["E", "F", "I", "UP", "B", "C4"]
-ignore = ["E501", "E722", "B904", "B007", "B905", "B011", "C401", "E741", "B023", "UP031"]
-extend-ignore = ["E501", "E722", "B904", "B007", "B905", "B011", "C401", "E741", "B023", "UP031", "B904", "B905", "B007"]
+ignore = ["E501", "B007", "B905", "B011", "C401", "E741", "B023", "UP031"]
 
 [tool.ruff.lint.isort]
-known-first-party = ["app", "config", "dashboard", "free_discovery", "vpn", "vpn_manager", "free_ip_pool", "shared_rotation", "shared_state", "traffic_capture", "middleware", "server_scorer", "nordvpn_api", "docker_events", "protocol_mapping"]
+known-first-party = ["app", "config", "dashboard", "free_discovery", "vpn", "vpn_manager", "free_ip_pool", "shared_rotation", "shared_state", "traffic_capture", "docker_events", "protocol_mapping"]
 known-third-party = ["fastapi", "httpx", "uvicorn", "rich", "yaml", "pydantic"]
 
 [tool.ruff.format]

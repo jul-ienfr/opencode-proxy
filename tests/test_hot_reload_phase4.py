@@ -179,8 +179,19 @@ def test_schedule_hot_reload_no_restart(config_backup):
 
 
 @pytest.mark.asyncio
-async def test_web_port_hot_restart_not_full_restart(config_backup):
-    """web_port change → hot-restart (mgr.restart) not full_restart."""
+async def test_port_hot_restart_not_full_restart(config_backup, monkeypatch):
+    """[P6] Changement de port → hot-restart (mgr.restart), PAS full_restart.
+
+    Ancien test ``test_web_port_hot_restart_not_full_restart`` : WEB_PORT a été
+    SUPPRIMÉ (P6 hygiène — rien n'a jamais écouté sur :8082, le dashboard est
+    servi par le port principal). L'invariant survit sur ``port``.
+
+    [INCIDENT 26/08] ``save_env``/``apply_server_changes`` sont MOCKÉS : la
+    version initiale de ce test écrivait OPENCODE_PORT+1 dans le VRAI .env à
+    chaque run de la suite (4000 → 4010 au fil des exécutions). Aucun test
+    ne doit muter l'environnement disque réel.
+    """
+    import dashboard.api as _api
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
 
@@ -192,8 +203,15 @@ async def test_web_port_hot_restart_not_full_restart(config_backup):
     mock_mgr.restart = MagicMock()
     mock_mgr.full_restart = MagicMock()
 
-    # Need to test POST /api/config with web_port
-    # Create a minimal app with register_dashboard
+    # Interception AVANT tout POST : zéro écriture .env / zéro mutation globale
+    saved_updates: dict = {}
+
+    def _fake_save_env(updates):
+        saved_updates.update(updates)
+
+    monkeypatch.setattr(_api, "save_env", _fake_save_env)
+    monkeypatch.setattr(_api, "apply_server_changes", lambda **kw: None)
+
     app = FastAPI()
     # Use in-memory sqlite connection for dashboard
     import sqlite3
@@ -207,20 +225,15 @@ async def test_web_port_hot_restart_not_full_restart(config_backup):
 
     register_dashboard(app, static_dir, conn, server_manager_getter=lambda: mock_mgr)
 
-
     client = TestClient(app)
 
     # Get current config to know current ports
     resp = client.get("/api/config")
     assert resp.status_code == 200
     data = resp.json()
-    data["port"]
-    orig_web = data["web_port"]
-    new_web = orig_web + 1 if orig_web < 65535 else orig_web - 1
-    # Ensure we use a valid unused port (avoid conflict, just test logic — don't actually bind)
-    # We will POST with new_web; the handler will call mock_mgr.restart with web_port
-    payload = {"web_port": new_web}
-    # The handler's apply_server_changes will update cfg.WEB_PORT, and mgr.restart should be called
+    orig_port = int(data["port"])
+    new_port = orig_port + 1 if orig_port < 65535 else orig_port - 1
+    payload = {"port": new_port}
     resp2 = client.post("/api/config", json=payload)
     assert resp2.status_code == 200
     j = resp2.json()
@@ -229,25 +242,16 @@ async def test_web_port_hot_restart_not_full_restart(config_backup):
     # Verify hot-restart was called, not full_restart
     mock_mgr.restart.assert_called()
     mock_mgr.full_restart.assert_not_called()
-    # Verify args contain web_port
-    call_kwargs = mock_mgr.restart.call_args
-    # Check that web_port was passed (either as kwarg or arg)
-    found = False
-    if call_kwargs:
-        args, kwargs = call_kwargs
-        # Check kwargs
-        if "web_port" in kwargs and int(kwargs["web_port"]) == new_web:
-            found = True
-        # Check if port in kwargs (could be string)
-        for v in list(kwargs.values()) + list(args):
-            if str(v) == str(new_web):
-                found = True
-    assert found, f"mgr.restart should be called with web_port={new_web}, got {call_kwargs}"
+    call_args = mock_mgr.restart.call_args
+    args, kwargs = call_args
+    found = any(str(v) == str(new_port) for v in list(kwargs.values()) + list(args))
+    assert found, f"mgr.restart should be called with port={new_port}, got {call_args}"
 
-    # Verify that config.yaml persisted web_port
-    # Need to check via cfg (since dashboard writes via save_env + apply_server_changes + save_yaml? Actually web_port handled via save_env + apply_server_changes)
-    # The API writes to .env and also updates WEB_PORT; check that .env or yaml would be handled
-    # For this test we at least ensure no exception and needs_restart false
+    # [INCIDENT 26/08] l'update est bien INTERCEPTÉ, jamais écrit sur disque
+    assert saved_updates.get("OPENCODE_PORT") == str(new_port)
+
+    # [P6] plus aucun champ web_port exposé par l'API
+    assert "web_port" not in data
 
 
 def test_vpn_servers_persist_reboot_safe(config_backup):

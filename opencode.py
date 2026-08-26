@@ -48,7 +48,6 @@ from config import (
     PORT,
     PROXY,
     ROUTES,
-    WEB_PORT,
     get_model_config,
     maybe_reload_custom_routes,
     yaml_get,
@@ -203,6 +202,10 @@ def _find_alternative_key(failed_key: str) -> dict | None:
 
 
 _key_alias_cache: dict[str, str] = {}
+# [P1 perf] mémo {api_key → prefix} : SHA-256 par appel × plusieurs appels/req
+# (is_paused/best_available/remaining) — invalidé quand le jeu de clés change.
+_key_prefix_cache: dict[str, str] = {}
+_KEY_PREFIX_CACHE_MAX = 4096
 
 
 def _rebuild_key_cache():
@@ -211,6 +214,7 @@ def _rebuild_key_cache():
     _key_alias_cache = {
         k["api_key"]: k.get("alias", "") or "" for k in API_KEYS if k.get("api_key")
     }
+    _key_prefix_cache.clear()
 
 
 def _alias_for_key(api_key: str) -> str:
@@ -256,11 +260,17 @@ class _KeyPauser:
         unique par clé, toujours non réversible pour les logs. Les entrées
         persistées sous l'ancien schéma deviennent orphelines et expirent
         naturellement (jamais re-matchées)."""
+        cached = _key_prefix_cache.get(api_key)
+        if cached is not None:
+            return cached
         if not api_key:
             return ""
         import hashlib
 
-        return hashlib.sha256(api_key.encode("utf-8")).hexdigest()[:12]
+        prefix = hashlib.sha256(api_key.encode("utf-8")).hexdigest()[:12]
+        if len(_key_prefix_cache) < _KEY_PREFIX_CACHE_MAX:
+            _key_prefix_cache[api_key] = prefix
+        return prefix
 
     def _save(self):
         """Persist current pause state to YAML file (wall clock times).
@@ -727,10 +737,20 @@ class _DbRowRaw:
         self.tools_used = tools_used
 
 
+# [P2 perf] registre global des tool names déjà utilisés (alimenté par le
+# thread writer) — consommé par /api/history/filters via tools_provider.
+_tools_used_seen: set = set()
+
+
 def _materialize_db_row(raw: "_DbRowRaw") -> tuple:
     """Thread writer : sérialise/tronque/redige une ligne brute (CPU hors loop)."""
     tools_json = json.dumps(raw.tools) if raw.tools else "[]"
     tools_used_json = json.dumps(list(dict.fromkeys(raw.tools_used))) if raw.tools_used else "[]"
+    # [P2 perf] registre des tools utilisés pour /api/history/filters —
+    # tenu à jour ici côté writer (thread unique) : le dashboard n'a plus à
+    # scanner TOUTE la table JSON à chaque requête de filtres.
+    if raw.tools_used:
+        _tools_used_seen.update(raw.tools_used)
     request_body_json = (
         _redact(_truncate_body_for_storage(raw.request_body)) if raw.request_body else None
     )
@@ -776,6 +796,8 @@ _conn.execute("CREATE INDEX IF NOT EXISTS idx_success ON requests(success)")
 _conn.execute("CREATE INDEX IF NOT EXISTS idx_account ON requests(account_alias)")
 _conn.execute("CREATE INDEX IF NOT EXISTS idx_ts_model ON requests(timestamp, model)")
 _conn.execute("CREATE INDEX IF NOT EXISTS idx_free_ip ON requests(free_model_ip)")
+# [P2 perf] filtre historique par modèle original (dropdown dashboard)
+_conn.execute("CREATE INDEX IF NOT EXISTS idx_original_model ON requests(original_model)")
 for col, default in [
     ("protocol", "NULL"),
     ("is_stream", "0"),
@@ -884,6 +906,15 @@ _current_free_attempt: contextvars.ContextVar[dict | None] = contextvars.Context
 # Set by _enforce_geo_gate per request, read by _save_request / _geo_headers / tray.
 _current_geo: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
     "_current_geo", default=None
+)
+
+# [P4 correctesse] flag « contenu non-déterministe injecté APRÈS la capture
+# des bytes bruts » (résultats DuckDuckGo / web_fetch). La clé de cache de
+# conversion raw-bytes ne reflète alors plus le contenu réellement converti :
+# deux clients aux bytes identiques partageraient les résultats du premier.
+# → les sites de conversion re-clent sur le contenu courant (raw=None).
+_web_nondet_injected: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "_web_nondet_injected", default=False
 )
 
 
@@ -1494,6 +1525,40 @@ except ImportError:
     _JSON_LIB = "json"
 
 
+def _serialize_json_body(body) -> bytes:
+    """Pré-sérialise le corps JSON une seule fois (orjson) — les bytes sont
+    réutilisés tels quels entre retries/hedges au lieu de re-payer un dumps
+    stdlib sur la loop à chaque tentative (équivalent de json=body)."""
+    if isinstance(body, (bytes, bytearray, memoryview)):
+        return bytes(body)
+    return _json_dumps(body)
+
+
+def _with_json_content_type(headers):
+    """Retourne des headers garantissant Content-Type: application/json
+    (nécessaire depuis le passage de json= à content= pré-sérialisé)."""
+    try:
+        for k in headers:
+            if k.lower() == "content-type":
+                return headers
+    except TypeError:
+        pass
+    try:
+        merged = dict(headers)
+    except TypeError:
+        return headers
+    merged["Content-Type"] = "application/json"
+    return merged
+
+
+def _resp_json_or_empty(resp):
+    """Parse une réponse upstream via orjson (5-10x vs resp.json() = stdlib
+    json dans httpx) ; {} si le content-type n'est pas JSON."""
+    if str(resp.headers.get("content-type", "")).startswith("application/json"):
+        return _json_loads(resp.content)
+    return {}
+
+
 def _drop_orphan_tool_messages(messages: list[dict]) -> list[dict]:
     """Filter role:tool messages whose tool_call_id has no preceding tool_calls id."""
     _seen_ids: set[str] = set()
@@ -1592,13 +1657,30 @@ _client = httpx.AsyncClient(transport=_transport, timeout=_build_http_timeout())
 # (un seul emprunteur à la fois) ; les streams ne tiennent une session que
 # jusqu'aux headers, comme avant.
 
+# [P1 perf] imports curl_cffi au niveau module (une fois) au lieu d'un
+# re-import local à chaque POST/emprunt de session. NB : la CLASSE AsyncSession
+# est résolue par ATTRIBUT à l'appel (_curl_requests_mod.AsyncSession) — les
+# tests monkeypatchent l'attribut du module, un binding figé casserait ce seam.
+try:
+    import curl_cffi.requests as _curl_requests_mod
+    import curl_cffi.requests.errors as _curl_err
+
+    _CURL_CFFI_OK = True
+except ImportError:
+    _curl_requests_mod = None
+    _curl_err = None
+    _CURL_CFFI_OK = False
+
 
 class _CurlSessionSlot:
-    __slots__ = ("sess", "busy")
+    __slots__ = ("sess", "busy", "overflow")
 
-    def __init__(self, sess):
+    def __init__(self, sess, overflow: bool = False):
         self.sess = sess
         self.busy = False
+        # overflow=True : session créée AU-DELA de max_size quand le pool
+        # est saturé (checkout timeout) — retirée du pool dès restitution.
+        self.overflow = overflow
 
 
 class _CurlSessionPool:
@@ -1633,9 +1715,16 @@ class _CurlSessionPool:
                     slot.busy = True
                     self.slots.append(slot)
                     return slot
-                # M/M occupées → attendre une restitution (aucune session
-                # jamais partagée concurrentment).
-                await self._cond.wait()
+                # M/M occupées → attendre une restitution BORNÉE (5 s). Au-delà,
+                # créer une session overflow hors quota plutôt que bloquer la
+                # requête indéfiniment (head-of-line blocking réintroduit).
+                try:
+                    await asyncio.wait_for(self._cond.wait(), timeout=5.0)
+                except TimeoutError:
+                    slot = _CurlSessionSlot(factory(), overflow=True)
+                    slot.busy = True
+                    self.slots.append(slot)
+                    return slot
                 slot = self._try_checkout()
             return slot
 
@@ -1643,6 +1732,14 @@ class _CurlSessionPool:
         async with self._cond:
             if slot in self.slots:
                 slot.busy = False
+                if slot.overflow:
+                    # Auto-réduction : l'overflow quitte le pool dès sa
+                    # restitution (retour au quota M en régime stable).
+                    self.slots.remove(slot)
+                    try:
+                        await slot.sess.close()
+                    except Exception:
+                        pass
             self._cond.notify()
 
     async def evict(self, slot: _CurlSessionSlot) -> None:
@@ -1713,16 +1810,12 @@ async def _get_pooled_curl_session(proxy_url: str | None, impersonate: str):
     # pool lui-même est sous Condition (dans checkout/checkin/evict).
     pool = _curl_pool.get(key)
     if pool is None:
-        from curl_cffi.requests import AsyncSession
-
         pool = _CurlSessionPool(_curl_pool_size())
         _curl_pool[key] = pool
-        slot = await pool.checkout(lambda: AsyncSession(impersonate=impersonate, proxy=_curl_proxy_url(proxy_url)))
-        return pool, slot
-    from curl_cffi.requests import AsyncSession
-
     slot = await pool.checkout(
-        lambda: AsyncSession(impersonate=impersonate, proxy=_curl_proxy_url(proxy_url))
+        lambda: _curl_requests_mod.AsyncSession(
+            impersonate=impersonate, proxy=_curl_proxy_url(proxy_url)
+        )
     )
     return pool, slot
 
@@ -2039,9 +2132,12 @@ def _truncate(body, max_len=None) -> str:
         max_len = yaml_get("debug", "truncate_max", 2000)
     """Pretty-print a body for debug logging, truncated to max_len chars."""
     try:
-        text = _json_dumps_str(body, indent=2, ensure_ascii=False, default=str)
+        # Borné : sérialisation compacte orjson puis slice — ne jamais payer
+        # un json.dumps(indent=2) complet juste pour en garder max_len chars.
+        text = _json_dumps_str(body)
     except Exception:
         text = str(body)
+        return text[:max_len] + f"... [+{max(0, len(text) - max_len)} chars truncated]"
     if len(text) > max_len:
         return text[:max_len] + f"\n... [{len(text) - max_len} chars truncated]"
     return text
@@ -2670,6 +2766,24 @@ async def lifespan(app):
 app = FastAPI(lifespan=lifespan)
 
 
+# ── Traffic Capture (Wireshark-like raw request view) ──────────────
+# Enregistré EN PREMIER → middleware le PLUS INTERNE de la pile Starlette :
+# les rejets précoces (401 ClientAuth / 413 BodyLimit / 429 RateLimit,
+# ajoutés ensuite donc plus externes) ne paient plus la capture. Lazy :
+# boot en pur passthrough (enabled=False), activée seulement pendant qu'un
+# onglet Traffic regarde (dashboard/api.py §_traffic_apply_lazy, TTL 15 s).
+from traffic_capture import TrafficCaptureMiddleware  # noqa: E402  # after middleware setup (app object required)
+from traffic_capture import capture as _traffic_capture  # noqa: E402
+
+_traffic_capture.configure(
+    max_frames=int(yaml_get("traffic", "max_frames", 500)),
+    body_cap=int(yaml_get("traffic", "body_cap", 131072)),
+    max_bytes=int(yaml_get("traffic", "max_bytes", 33554432)),
+)
+_traffic_capture.configure(enabled=False)
+app.add_middleware(TrafficCaptureMiddleware, capture=_traffic_capture)
+
+
 @app.exception_handler(Exception)
 async def debug_exception(request: Request, exc: Exception):
     tb = traceback.format_exc()
@@ -2691,6 +2805,7 @@ register_dashboard(
     token_usage=_token_usage,
     token_lock=_token_lock,
     db_lock=_db_commit_lock,
+    tools_provider=lambda: set(_tools_used_seen),
 )
 
 
@@ -3059,24 +3174,6 @@ class GeoWarningMiddleware:
 
 
 app.add_middleware(GeoWarningMiddleware)
-
-
-# ── Traffic Capture (Wireshark-like raw request view) ──────────────
-# Outermost middleware: records every client request — raw body bytes,
-# headers, timing, tempo, abrupt disconnects (RST) — into a bounded
-# ring buffer served by /api/traffic/*. Excludes /static, /health and
-# itself. Configurable via the `traffic:` block in config.yaml.
-
-from traffic_capture import TrafficCaptureMiddleware  # noqa: E402  # after middleware setup (app object required)
-from traffic_capture import capture as _traffic_capture  # noqa: E402
-
-_traffic_capture.configure(
-    enabled=bool(yaml_get("traffic", "enabled", True)),
-    max_frames=int(yaml_get("traffic", "max_frames", 500)),
-    body_cap=int(yaml_get("traffic", "body_cap", 131072)),
-    max_bytes=int(yaml_get("traffic", "max_bytes", 33554432)),
-)
-app.add_middleware(TrafficCaptureMiddleware, capture=_traffic_capture)
 
 
 # ── Circuit Breaker (per-endpoint) ──────────────────────────────
@@ -4151,9 +4248,7 @@ def _is_connect_error(e: Exception) -> bool:
     on HTTP responses — 429/5xx are not exceptions on this path
     (raise_for_status is False).
     """
-    import curl_cffi.requests.errors as _err
-
-    if not isinstance(e, _err.RequestsError):
+    if not isinstance(e, _curl_err.RequestsError):
         return False
     try:
         code = int(getattr(e, "code", 0))
@@ -4213,9 +4308,7 @@ async def _do_free_request_curl_cffi(
     egresses this request must be the one whose fingerprint is stamped).
     Returns an httpx-like response object for compatibility.
     """
-    try:
-        from curl_cffi.requests import errors as _err
-    except ImportError:
+    if not _CURL_CFFI_OK:
         raise RuntimeError("curl_cffi non installé : pip install curl_cffi")
 
     # Strip paid-account artifacts, stamp the identity (bundle UA wins)
@@ -4250,7 +4343,7 @@ async def _do_free_request_curl_cffi(
     try:
         resp = await slot.sess.post(
             _ep,
-            json=body,
+            content=_serialize_json_body(body),
             headers=req_headers,
             timeout=(10, 600),  # (connect, read) — read 600: long streams
         )
@@ -4259,7 +4352,7 @@ async def _do_free_request_curl_cffi(
         # close dans une tâche annulée) ; le shutdown fermera le reste.
         pool.discard(slot)
         raise
-    except _err.RequestsError as e:
+    except _curl_err.RequestsError as e:
         # [plan 18/08 §1a] a REAL connection failure (dead SOCKS5 tunnel)
         # is invisible to the pool — the station stays "connected" and
         # every request re-strikes it. Signal the pool+manager
@@ -4821,7 +4914,10 @@ async def _open_free_stream(
                     _debug(f"  [free-stream] posting to {endpoint} (pooled)")
                     _t0_ttfb = time.monotonic()
                     resp = await slot2.sess.post(
-                        endpoint, json=body, headers=req_headers, stream=True
+                        endpoint,
+                        content=_serialize_json_body(body),
+                        headers=req_headers,
+                        stream=True,
                     )
                 except asyncio.CancelledError:
                     pool2.discard(slot2)
@@ -4849,9 +4945,28 @@ async def _open_free_stream(
                 # tests) must not break the request path: hasattr guard.
                 if _free_ip_pool is not None and hasattr(_free_ip_pool, "register_stream"):
                     _free_ip_pool.register_stream(station, asyncio.current_task())
+                # [P6] wire note_free_stream_start/end : le garde auto-update
+                # (_update_opportune) était inerte — le compteur n'était jamais
+                # alimenté, une apply_update pouvait couper un stream libre vif.
+                _stream_station = station if station is not None else None
+                try:
+                    if _stream_station is not None and hasattr(
+                        _stream_station, "note_free_stream_start"
+                    ):
+                        _stream_station.note_free_stream_start()
+                except Exception:
+                    _stream_station = None
                 try:
                     yield wrapped
                 finally:
+                    if (
+                        _stream_station is not None
+                        and hasattr(_stream_station, "note_free_stream_end")
+                    ):
+                        try:
+                            _stream_station.note_free_stream_end()
+                        except Exception:
+                            pass
                     if _free_ip_pool is not None and hasattr(_free_ip_pool, "unregister_stream"):
                         _free_ip_pool.unregister_stream(station, asyncio.current_task())
                     try:
@@ -4921,7 +5036,7 @@ async def _open_free_stream(
         free_headers = _apply_identity(_free_request_headers(headers), profile, use_curated_ua=True)
         free_headers["Content-Type"] = "application/json"
         async with _ensure_http_client().stream(
-            "POST", endpoint, json=body, headers=free_headers
+            "POST", endpoint, content=_serialize_json_body(body), headers=free_headers
         ) as resp:
             yield resp
         return
@@ -4935,7 +5050,9 @@ async def _open_free_stream(
         ) as resp:
             yield resp
         return
-    async with _ensure_http_client().stream("POST", endpoint, json=body, headers=headers) as resp:
+    async with _ensure_http_client().stream(
+        "POST", endpoint, content=_serialize_json_body(body), headers=_with_json_content_type(headers)
+    ) as resp:
         yield resp
 
 
@@ -5004,7 +5121,10 @@ async def _open_via_pool(endpoint, body, headers, *, is_stream=False, forced_poo
         )
         try:
             raw = await slot.sess.post(
-                endpoint, json=body, headers=req_headers, stream=True
+                endpoint,
+                content=_serialize_json_body(body),
+                headers=req_headers,
+                stream=True,
             )
         except asyncio.CancelledError:
             pool.discard(slot)
@@ -5918,7 +6038,7 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
     try:
         _dbg_body = _truncate(free_body) if "free_body" in locals() else ""
         _dbg_resp = _redact(getattr(resp, "text", "")[:2000]) if hasattr(resp, "text") else ""
-    except:
+    except Exception:
         _dbg_body, _dbg_resp = "", ""
     _debug(
         f"  [free] {free_model!r} returned {resp.status_code} body={_dbg_body[:2500]} resp={_dbg_resp[:2000]} → falling back to paid"
@@ -5945,15 +6065,12 @@ async def _do_request_with_retry(endpoint, body, headers, protocol, retry_on_429
             # [Correctif parité multi-tours] marqueur interne jamais envoyé à
             # l'upstream — consommé par le retry-once du caller.
             body.pop("_has_synthetic_reasoning_items", None)
-    # ── Orphan guard (defense in depth) ──
-    if isinstance(body, dict):
-        if "messages" in body:
-            body["messages"] = _drop_orphan_tool_messages(body["messages"])
-        elif "input" in body:
-            body["input"] = _drop_orphan_responses_input(body["input"])
     _RETRYABLE_STATUSES = {500, 502, 503, 504, 499}
     max_retries = yaml_get("streaming", "retry_attempts", 2)
     attempt = 0
+    # Corps pré-sérialisé UNE fois — les bytes sont réutilisés entre tentatives
+    _body_bytes = _serialize_json_body(body)
+    headers = _with_json_content_type(headers)
 
     while attempt < max_retries:
         if DEBUG:
@@ -5962,7 +6079,9 @@ async def _do_request_with_retry(endpoint, body, headers, protocol, retry_on_429
             )
         t0 = time.monotonic()
         try:
-            resp = await _ensure_http_client().post(endpoint, json=body, headers=headers)
+            resp = await _ensure_http_client().post(
+                endpoint, content=_body_bytes, headers=headers
+            )
         except httpx.ConnectError as e:
             _debug(f"  ✗ connect error after {(time.monotonic() - t0) * 1000:.0f}ms: {e}")
             _log(f"  UPSTREAM CONNECT ERROR: {type(e).__name__}: {e}")
@@ -6837,7 +6956,7 @@ async def _execute_ddg_search(query: str, max_results: int = 5, timeout: int = 1
                             with ddgs:
                                 return list(ddgs.text(qnorm, max_results=max_results))
                         except ImportError as e:
-                            raise ImportError(f"duckduckgo-search not installed: {e}")
+                            raise ImportError(f"duckduckgo-search not installed: {e}") from e
 
                     try:
                         results = await asyncio.wait_for(asyncio.to_thread(_sync_ddg), timeout + 2)
@@ -6926,6 +7045,10 @@ async def _execute_web_fetch(url: str, prompt: str = "", timeout: int = 15, max_
 
 def _inject_as_user_prefix(body: dict, content: str, protocol: str, tag: str):
     """Inject as user prefix split protocol R5: anthropic pos0, openai pos1 if system."""
+    # [P4 correctesse] contenu injecté NON-DÉTERMINISTE (résultats DDG,
+    # extraction web) : la clé de cache conversion raw-bytes ne reflète plus
+    # le corps réel → les sites de conversion re-clent sur le contenu courant.
+    _web_nondet_injected.set(True)
     block = f"<{tag}>\n{content}\n</{tag}>"
     msgs = body.get("messages", [])
     if not isinstance(msgs, list):
@@ -7257,6 +7380,7 @@ async def _handle_web_fetch(body: dict, model_id: str, protocol: str) -> bool:
 # preserve 'from opencode import ...' compatibility for tests.
 from protocol_mapping import (  # noqa: E402  # re-export after function defs for compat
     THINKING_MODELS,
+    ResponsesSseState,
     _anthropic_to_responses_request,
     _chat_to_responses_request,
     _drop_orphan_responses_input,
@@ -7415,9 +7539,10 @@ def ensure_min_tokens(body: dict, default: int = None) -> dict:
     reste des tokens pour la réponse après le reasoning."""
     model = body.get("model", "")
     min_tokens = default
-    _debug(
-        f"  [thinking] ensure_min_tokens: model={model!r} THINKING_MODELS={THINKING_MODELS} keys={list(body.keys())}"
-    )
+    if _cfg_settings.DEBUG:
+        _debug(
+            f"  [thinking] ensure_min_tokens: model={model!r} THINKING_MODELS={THINKING_MODELS} keys={list(body.keys())}"
+        )
     for prefix, tokens in THINKING_MODELS.items():
         if model.startswith(prefix) or model == prefix:
             min_tokens = max(min_tokens, tokens)
@@ -7672,11 +7797,7 @@ async def messages(request: Request):
                 )
                 if free_result is not None:
                     resp, _, _actual_model, _actual_ip = free_result
-                    data = (
-                        resp.json()
-                        if resp.headers.get("content-type", "").startswith("application/json")
-                        else {}
-                    )
+                    data = _resp_json_or_empty(resp)
                     usage = data.get("usage", {})
                     req_in = usage.get("input_tokens", 0) or usage.get("prompt_tokens", 0)
                     req_out = usage.get("output_tokens", 0) or usage.get("completion_tokens", 0)
@@ -7863,11 +7984,7 @@ async def messages(request: Request):
                     media_type="application/json",
                 )
             try:
-                data = (
-                    resp.json()
-                    if resp.headers.get("content-type", "").startswith("application/json")
-                    else {}
-                )
+                data = _resp_json_or_empty(resp)
             except Exception:
                 _debug(f"  ✗ non-JSON response from {endpoint}")
                 _log(f"  UPSTREAM DECODE ERROR: non-JSON response from {endpoint}")
@@ -7877,7 +7994,8 @@ async def messages(request: Request):
             req_out = usage.get("output_tokens", 0) or usage.get("completion_tokens", 0)
             req_cache = usage.get("cache_read_input_tokens", 0)
             _debug(f"  usage: in={req_in} out={req_out} cache={req_cache}")
-            _debug(f"  response=\n{_redact(_truncate(data))}")
+            if _cfg_settings.DEBUG:
+                _debug(f"  response=\n{_redact(_truncate(data))}")
             _update_token_usage(model_id, req_in, req_out, req_cache)
             used = [b["name"] for b in data.get("content", []) if b.get("type") == "tool_use"]
             await _save_and_log_request(
@@ -8527,11 +8645,18 @@ async def messages(request: Request):
     # ── OpenAI-protocol ─────────────────────────────────────────
     try:
         # [C1 perf] raw bytes disponibles → clé de cache sans re-dumps
-        oai_body = anthropic_to_openai(body, model_id, raw=body_bytes)
+        if _web_nondet_injected.get():
+            # [P4 correctesse] résultats DDG/fetch injectés après capture des
+            # bytes bruts → clé sur le contenu courant (sinon deux clients aux
+            # bytes identiques partageraient la conversion du premier).
+            oai_body = anthropic_to_openai(body, model_id)
+        else:
+            oai_body = anthropic_to_openai(body, model_id, raw=body_bytes)
         # Convert to Responses API format if endpoint requires it (muse-spark)
         if "/responses" in endpoint:
             oai_body = _chat_to_responses_request(oai_body)
-        _debug(f"[messages] converted to openai: {_redact(_truncate(oai_body, 2000))}")
+        if _cfg_settings.DEBUG:
+            _debug(f"[messages] converted to openai: {_redact(_truncate(oai_body, 2000))}")
         # ── Orphan guard (handler-level, plan api-error-400) ──
         if isinstance(oai_body, dict):
             if "messages" in oai_body:
@@ -8557,11 +8682,7 @@ async def messages(request: Request):
                 )
                 if free_result is not None:
                     resp, _, _actual_model, _actual_ip = free_result
-                    data = (
-                        resp.json()
-                        if resp.headers.get("content-type", "").startswith("application/json")
-                        else {}
-                    )
+                    data = _resp_json_or_empty(resp)
                     usage = data.get("usage", {})
                     req_in = usage.get("prompt_tokens", 0)
                     req_out = usage.get("completion_tokens", 0)
@@ -8663,7 +8784,6 @@ async def messages(request: Request):
             return JSONResponse(status_code=e.status_code, content={"error": str(e)})
         account_alias = _alias_for_key(_key_from_headers(headers, "openai"))
         _debug(f"  response status={resp.status_code} size={len(resp.content)} bytes")
-        _debug(f"  response status={resp.status_code} size={len(resp.content)} bytes")
         # [Correctif parité multi-tours] Retry-once défensif : si l'upstream
         # /responses rejette les items reasoning synthétiques (400/422),
         # retenter UNE fois sans eux plutôt que de casser le tour entier
@@ -8735,7 +8855,7 @@ async def messages(request: Request):
             if resp.status_code == 499:
                 return _anthropic_error(502, "Upstream disconnected (499). Retrying may help.")
             try:
-                err_data = resp.json()
+                err_data = _json_loads(resp.content)
                 err_msg = err_data.get("error", {})
                 if isinstance(err_msg, dict):
                     err_msg = err_msg.get("message", resp.text[:200])
@@ -9133,6 +9253,8 @@ async def messages(request: Request):
                                 continue
                         ak_h = _alias_for_key(_key_from_headers(hdrs, "openai"))
 
+                    # [P4] état SSE Responses-API PAR stream (retry → état neuf)
+                    _resp_state = ResponsesSseState()
                     async for line in resp.aiter_lines():
                         if not line.startswith("data:"):
                             continue
@@ -9194,7 +9316,9 @@ async def messages(request: Request):
                                 _debug(
                                     f"  [stream-oai] no choices, trying responses_sse convert: {data[:200]!r}"
                                 )
-                            converted = _responses_sse_to_chat_deltas(data, parsed=chunk)
+                            converted = _responses_sse_to_chat_deltas(
+                                data, parsed=chunk, state=_resp_state
+                            )
                             if converted is None:
                                 continue
                             chunk = converted
@@ -10453,6 +10577,8 @@ async def chat_completions(request: Request):
                             )
                             return
 
+                        # [P4] état SSE Responses-API PAR stream
+                        _resp_state = ResponsesSseState()
                         async for line in resp.aiter_lines():
                             if not line.startswith("data:"):
                                 continue
@@ -10473,7 +10599,9 @@ async def chat_completions(request: Request):
                                 actual_usage = chunk_usage
                             # Responses API stream (muse) : convertir avant de tester choices
                             if chunk.get("type", "").startswith("response."):
-                                converted = _responses_sse_to_chat_deltas(data_str, parsed=chunk)
+                                converted = _responses_sse_to_chat_deltas(
+                                    data_str, parsed=chunk, state=_resp_state
+                                )
                                 if converted is not None:
                                     chunk = converted
                                     # usage-only (completed/incomplete) → finaliser
@@ -10497,7 +10625,9 @@ async def chat_completions(request: Request):
                             choices = chunk.get("choices", [])
                             if not choices or not isinstance(choices, list):
                                 # 可能是 Responses API format — try converting (fallback legacy)
-                                converted = _responses_sse_to_chat_deltas(data_str, parsed=chunk)
+                                converted = _responses_sse_to_chat_deltas(
+                                    data_str, parsed=chunk, state=_resp_state
+                                )
                                 if converted is not None:
                                     chunk = converted
                                     choices = chunk.get("choices", [])
@@ -10831,11 +10961,7 @@ async def chat_completions(request: Request):
                     )
                     if free_result is not None:
                         resp, _, _actual_model, _actual_ip = free_result
-                        data = (
-                            resp.json()
-                            if resp.headers.get("content-type", "").startswith("application/json")
-                            else {}
-                        )
+                        data = _resp_json_or_empty(resp)
                         usage = data.get("usage", {})
                         req_in = usage.get("input_tokens", 0) or usage.get("prompt_tokens", 0)
                         req_out = usage.get("output_tokens", 0) or usage.get("completion_tokens", 0)
@@ -11889,11 +12015,7 @@ async def responses(request: Request):
                     media_type="application/json",
                 )
             try:
-                data = (
-                    resp.json()
-                    if resp.headers.get("content-type", "").startswith("application/json")
-                    else {}
-                )
+                data = _resp_json_or_empty(resp)
             except Exception:
                 _debug(f"  ✗ non-JSON response from {endpoint}")
                 _log(f"  UPSTREAM DECODE ERROR: non-JSON response from {endpoint}")
@@ -12038,9 +12160,14 @@ async def responses(request: Request):
     # ── OpenAI backend (double conversion) ──────────────────
     # Convert Anthropic → Chat Completions for the backend
     try:
-        # [C1 perf] raw bytes du body client (dérivation déterministe vers
-        # anthro_body) → clé de cache sans re-dumps
-        oai_body = anthropic_to_openai(anthro_body, model_id, raw=body_bytes)
+        if _web_nondet_injected.get():
+            # [P4 correctesse] résultats DDG/fetch injectés après capture des
+            # bytes bruts → clé sur le contenu courant (raw obsolète).
+            oai_body = anthropic_to_openai(anthro_body, model_id)
+        else:
+            # [C1 perf] raw bytes du body client (dérivation déterministe vers
+            # anthro_body) → clé de cache sans re-dumps
+            oai_body = anthropic_to_openai(anthro_body, model_id, raw=body_bytes)
         # Convert to Responses API format if endpoint requires it (muse-spark)
         if "/responses" in endpoint:
             oai_body = _chat_to_responses_request(oai_body)
@@ -12063,11 +12190,7 @@ async def responses(request: Request):
                 )
                 if free_result is not None:
                     resp, _, _actual_model, _actual_ip = free_result
-                    data = (
-                        resp.json()
-                        if resp.headers.get("content-type", "").startswith("application/json")
-                        else {}
-                    )
+                    data = _resp_json_or_empty(resp)
                     usage = data.get("usage", {})
                     req_in = usage.get("prompt_tokens", 0)
                     req_out = usage.get("completion_tokens", 0)
@@ -12321,6 +12444,8 @@ async def responses(request: Request):
                 collected_chunks = []
                 collected_reasoning_chunks = []
                 final_usage = None
+                # [P4] état SSE Responses-API PAR stream
+                _resp_state = ResponsesSseState()
                 async for line in resp.aiter_lines():
                     if not line.startswith("data:"):
                         continue
@@ -12339,7 +12464,9 @@ async def responses(request: Request):
                     choices = chunk.get("choices", [])
                     if not choices or not isinstance(choices, list):
                         # 可能是 Responses API format — try converting
-                        converted = _responses_sse_to_chat_deltas(data_str, parsed=chunk)
+                        converted = _responses_sse_to_chat_deltas(
+                            data_str, parsed=chunk, state=_resp_state
+                        )
                         if converted is None:
                             continue
                         chunk = converted
@@ -12419,6 +12546,8 @@ async def responses(request: Request):
     collected_chunks = []
     collected_reasoning_chunks = []
     final_usage = None
+    # [P4] état SSE Responses-API PAR stream
+    _resp_state = ResponsesSseState()
     async for line in resp.aiter_lines():
         if not line.startswith("data:"):
             continue
@@ -12439,7 +12568,9 @@ async def responses(request: Request):
         choices = chunk.get("choices", [])
         if not choices or not isinstance(choices, list):
             # 可能是 Responses API format — try converting
-            converted = _responses_sse_to_chat_deltas(data_str, parsed=chunk)
+            converted = _responses_sse_to_chat_deltas(
+                data_str, parsed=chunk, state=_resp_state
+            )
             if converted is None:
                 continue
             chunk = converted
@@ -12497,11 +12628,10 @@ async def responses(request: Request):
 class ServerManager:
     """Manages uvicorn server lifecycle for start/stop/restart."""
 
-    def __init__(self, app, host, port, web_port):
+    def __init__(self, app, host, port):
         self.app = app
         self.host = host
         self.port = port
-        self.web_port = web_port
         self._server = None
         self._thread = None
         self._lock = threading.Lock()
@@ -12558,7 +12688,7 @@ class ServerManager:
                 if self._server.started:
                     break
             self.is_running = True
-            _debug(f"  [server] started on {self.host}:{self.port} (web_port={self.web_port})")
+            _debug(f"  [server] started on {self.host}:{self.port}")
 
     def stop(self, timeout=10):
         """Graceful stop: signal uvicorn to stop, then wait for in-flight requests."""
@@ -12576,16 +12706,14 @@ class ServerManager:
         self._thread = None
         _debug("  [server] stopped")
 
-    def restart(self, port=None, web_port=None, host=None):
-        """Hot-restart: graceful stop + update host/ports + start."""
-        _debug(f"  [server] restart requested: host={host} port={port} web_port={web_port}")
+    def restart(self, port=None, host=None):
+        """Hot-restart: graceful stop + update host/port + start."""
+        _debug(f"  [server] restart requested: host={host} port={port}")
         self.stop()
         if host is not None:
             self.host = host
         if port is not None:
             self.port = int(port)
-        if web_port is not None:
-            self.web_port = int(web_port)
         self.start()
         _debug(f"  [server] restarted on {self.host}:{self.port}")
 
@@ -12686,7 +12814,7 @@ if __name__ == "__main__":
     # GUI by default (system tray + dashboard window); --no-gui forces terminal mode.
     use_gui = not _cli_args.no_gui
 
-    mgr = ServerManager(app, HOST, PORT, WEB_PORT)
+    mgr = ServerManager(app, HOST, PORT)
     _server_manager = mgr
 
     # Signal handler for clean shutdown on SIGINT/SIGTERM
@@ -12722,7 +12850,7 @@ if __name__ == "__main__":
             )
             use_gui = False
     if use_gui:
-        run_gui(mgr, HOST, PORT, WEB_PORT)
+        run_gui(mgr, HOST, PORT)
     else:
         try:
             run_terminal_loop(ROUTES, _token_usage, _token_lock)

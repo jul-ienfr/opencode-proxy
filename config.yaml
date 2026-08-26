@@ -180,7 +180,7 @@ ip_rotation:
   update_apply_window: 03:00-05:00
   update_apply_idle_minutes: 15
   update_apply_max_defer_hours: 24
-  watchdog_interval: 5
+  watchdog_interval: 20
   watchdog_backoff_base: 15
   watchdog_backoff_max: 60
   wait_healthy_poll: 0.5

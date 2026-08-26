@@ -116,6 +116,30 @@
         "ip_rotation.latency_rotation.enabled",
         "ip_rotation.country_offset_stride"
       ]
+    },
+    {
+      "type": "doc_must_mention",
+      "famille": "structure",
+      "doc": "README.md",
+      "must_contain": [
+        "docker_events.py",
+        "station_supervisor.py",
+        "latency_rotation.py",
+        "ip_latency.py",
+        "free_discovery.py",
+        "traffic_capture.py",
+        "shared_rotation.py"
+      ]
+    },
+    {
+      "type": "config_keys_exist_and_documented",
+      "famille": "security",
+      "doc": "README.md",
+      "config_file": "config.yaml",
+      "keys": [
+        "dashboard_trust.mode",
+        "client_auth.mode"
+      ]
     }
   ]
 }

@@ -261,7 +261,7 @@ def main() -> None:
         rw.close()
         raise SystemExit(
             f"ERROR: migration failed ({type(e).__name__}: {e}) — ROLLED BACK, DB intact"
-        )
+        ) from e
 
     for table in TABLES:
         print(f"  {table}: {per_table[table]} converted")

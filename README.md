@@ -272,9 +272,18 @@ When `DASHBOARD_TOKEN` is set, sensitive endpoints (`/api/config*`, `/api/vpn-co
 opencode.py              # Main FastAPI server + ServerManager (hot-restart)
 vpn_manager.py           # VPN lifecycle: connect/rotate/status, identity rotation
 free_ip_pool.py          # Free-model quota tracking + IP pool state
+docker_events.py         # docker events watcher → watchdog wake + SSE vpn_event
+station_supervisor.py    # Per-station supervisor registry (N stations)
+latency_rotation.py      # EWMA/p95 latency engine → soft/hard rotations
+ip_latency.py            # Per-IP latency probes shared across stations
+free_discovery.py        # Upstream free-model discovery + auto-persist
+shared_rotation.py       # Shared rotation state (anti-réutilisation d'IP)
+shared_state.py          # Registres globaux (managers, pool, watcher)
+traffic_capture.py       # Capture Wireshark-like (lazy, on-demand)
+trust.py                 # Client auth + dashboard trust middlewares
 config/
   __init__.py            # Package exports
-  settings.py            # Configuration, .env management, routes
+  settings.py            # Configuration, .env management, routes, geo
 dashboard/
   __init__.py            # Package exports
   api.py                 # Dashboard API endpoints
@@ -288,9 +297,11 @@ gui/
   window.py              # WebView window
   _webview_main.py       # WebView entry point
 static/
-  index.html             # Dashboard UI (4 tabs)
+  index.html             # Dashboard UI
   styles.css             # Theming (dark/light)
   app.js                 # Frontend logic
+scripts/                 # Outils : bench_perf, bench, migration DB, etc.
+tests/                   # Suite pytest (~740 tests)
 custom_routes.json       # Custom route mappings (persistent)
 docker-compose.yml       # Proxy + gluetun VPN tunnel stack
 credentials.env          # NordVPN credentials (gluetun env_file, gitignored)
@@ -298,6 +309,14 @@ requirements.txt         # Python dependencies
 .env.example             # Template environment configuration
 .env                     # Environment configuration (gitignored)
 ```
+
+### Dashboard trust
+
+Le dashboard est servi sur le port principal du proxy. Par défaut (`dashboard_trust.mode: lan`),
+les réseaux loopback + RFC1918 sont considérés de confiance sans token ; les mutations exigent le
+même-host (anti-CSRF) + rate-limit (`client_auth.mode`). Un token peut être requis via
+`DASHBOARD_TOKEN` / `DASHBOARD_REQUIRE_TOKEN=true`. Pour une exposition au-delà du LAN, passer
+`dashboard_trust.mode` en mode strict et exiger le token.
 
 ## License
 

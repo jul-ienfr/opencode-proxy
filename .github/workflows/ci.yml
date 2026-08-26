@@ -24,14 +24,23 @@ jobs:
         run: ruff check . --output-format=github
       - name: Ruff format
         run: ruff format --check .
-      - name: Mypy (progressive)
-        run: mypy . --ignore-missing-imports || true
-        continue-on-error: false
+      # [P6] mypy bloquant sur les modules SAINS (0 erreur vérifiée) ;
+      # le reste tourne en progressif VISIBLE (continue-on-error) — plus de
+      # `|| true` qui avalait les erreurs. Rachat incrémental : config/,
+      # dashboard/, protocol_mapping.py d'abord (~79 err au 2026-08-26).
+      - name: Mypy (gate modules sains)
+        run: >-
+          mypy traffic_capture.py docker_events.py trust.py shared_rotation.py
+          shared_state.py config/__init__.py --ignore-missing-imports
+          --follow-imports=silent
+      - name: Mypy (progressif, non bloquant)
+        run: mypy . --ignore-missing-imports
+        continue-on-error: true
       - name: Tests with coverage
         run: pytest -q --cov --cov-report=term-missing --cov-fail-under=35
         # Phase1 gate 35% (current 39%), Phase2 → 60, Phase3 → 75
       - name: pip-audit
-        run: pip-audit --desc --local || true
+        run: pip-audit --desc --local
       - name: gitleaks
         uses: gitleaks/gitleaks-action@v2
         env:

@@ -107,6 +107,8 @@ class DockerEventWatcher:
             logger.info("[docker-events] watcher started (docker events)")
             try:
                 while not self._stopped:
+                    if proc.stdout is None:  # pragma: no cover — PIPE toujours fourni
+                        break
                     line = await proc.stdout.readline()
                     if not line:
                         break  # stream ended (daemon restart, CLI killed)

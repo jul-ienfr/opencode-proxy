@@ -24,7 +24,7 @@ def notify_geo(message: str, title: str = "OpenCode — repli géo"):
 class TrayApp:
     """System tray icon with menu to control the proxy and open the dashboard."""
 
-    def __init__(self, server_manager, host, port, web_port):
+    def __init__(self, server_manager, host, port):
         self.server_manager = server_manager
         self.host = host
         self.port = port

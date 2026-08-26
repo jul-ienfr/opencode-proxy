@@ -176,7 +176,7 @@ const LOCALE = {
         'quotas.remaining': '% remaining',
         'config.server': 'Server Settings',
         'config.api_port': 'API Port',
-        'config.web_port': 'Web UI Port',
+        'config.host': 'Host',
         'config.bind_address': 'Bind Address',
         'config.bind_lan': 'Local network (0.0.0.0)',
         'config.bind_local': 'Local machine only (127.0.0.1)',
@@ -496,7 +496,6 @@ const LOCALE = {
         'quotas.remaining': '% restant',
         'config.server': 'Paramètres Serveur',
         'config.api_port': 'Port API',
-        'config.web_port': 'Port Interface Web',
         'config.bind_address': 'Adresse de liaison',
         'config.bind_lan': 'Réseau local (0.0.0.0)',
         'config.bind_local': 'Machine uniquement (127.0.0.1)',
@@ -1391,6 +1390,10 @@ let chartTsRequests = null, chartTsTokens = null, chartTsDuration = null, chartT
 
 async function renderTimeSeriesCharts(from, to) {
     try {
+        // [P2 perf] fetch seulement si l'onglet stats est visible — inutile
+        // de payer l'agrégation SQL pour des charts cachés.
+        const activeTab = document.querySelector('.tab.active');
+        if (!activeTab || activeTab.dataset.tab !== 'stats') return;
         const data = await apiFetch(`/api/stats/timeseries?from_date=${from || ''}&to_date=${to || ''}&granularity=hour`);
         if (!data || !data.series || !data.series.length) return;
 
@@ -2472,7 +2475,10 @@ function setupConfig() {
     // Sync toggle + stats bar with the live server state on load
     fetchTrafficStatus().then(status => {
         if (!status) return;
-        if (trafficCapCb) trafficCapCb.checked = !!status.enabled;
+        // user_enabled = intention du toggle (la capture effective est lazy :
+        // active seulement pendant qu'un onglet Traffic regarde).
+        const wantedEnabled = status.user_enabled !== undefined ? !!status.user_enabled : !!status.enabled;
+        if (trafficCapCb) trafficCapCb.checked = wantedEnabled;
         if (status.frames > 0 && document.querySelector('.tab.active')?.dataset.tab === 'traffic') {
             trafficRefresh();
         }
@@ -2516,7 +2522,13 @@ function setupConfig() {
 
 var _refreshing = false;
 var _refreshPending = false;
+var _lastRefreshDone = 0;
 async function refreshAll() {
+    // [P2 perf] intervalle minimal 1 s entre deux refreshAll complets,
+    // indépendant du garde anti-réentrance : les polls serrés (SSE + timers)
+    // ne martèlent plus /api/stats + /api/history + timeseries.
+    const now = Date.now();
+    if (now - _lastRefreshDone < 1000) return;
     if (_refreshing) { _refreshPending = true; return; }
     _refreshing = true;
     try {
@@ -2536,6 +2548,7 @@ async function refreshAll() {
         } while (_refreshPending);
     } finally {
         _refreshing = false;
+        _lastRefreshDone = Date.now();
     }
 }
 

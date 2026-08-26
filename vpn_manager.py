@@ -25,7 +25,6 @@ import subprocess
 import sys
 import threading
 import time
-from datetime import UTC
 
 import shared_state
 
@@ -1662,35 +1661,8 @@ class VPNManager:
                 )
             raise RotationFailed(self._error)
 
-    async def connect_wait(self, timeout: float = 120.0) -> bool:
-        """Wait for an externally managed tunnel to come up (no container action).
-
-        Returns True once the public IP through the SOCKS5 tunnel answers.
-        """
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            ip = await self.get_public_ip()
-            if ip:
-                self._current_ip = ip
-                self._connected_at = time.monotonic()
-                self._set_status(VPNState.CONNECTED)
-                self._current_server = {
-                    "name": self._docker_container,
-                    "country": self._current_country or self._server_countries,
-                }
-                # [plan v10 §14.3.5] l'IP était posée SANS _record_ip_change →
-                # hors registry croisé anti-réutilisation (une IP servie via
-                # connect_wait pouvait être re-tirée par l'autre station).
-                try:
-                    self._record_ip_change(ip)
-                except Exception:
-                    pass
-                return True
-            await asyncio.sleep(3)
-        self._set_status(VPNState.ERROR)
-        self._error = f"Délai dépassé en attente de connexion VPN ({int(timeout)}s)"
-        logger.error("[vpn] %s", self._error)
-        return False
+    # [P6] connect_wait supprimé : 0 appelant prod (audit 2026-08-26) —
+    # le chemin externe passe par _wait_healthy / _finalize_ip.
 
     async def disconnect(self) -> None:
         """Disconnect: update state + persist. Never stops the container —
@@ -1737,6 +1709,12 @@ class VPNManager:
         outcome instead of being corrupted by the event.
         """
         try:
+            # [P3 perf] compteur d'events depuis le dernier tick watchdog :
+            # 0 → le tick sain saute le refresh docker lourd (inspect+logs),
+            # la détection temps réel restant assurée par CE watcher.
+            self._docker_events_since_tick = getattr(
+                self, "_docker_events_since_tick", 0
+            ) + 1
             if self._watchdog_event is not None:
                 self._watchdog_event.set()  # not awaited -- simply wake the loop
             status = event.get("status")
@@ -1981,23 +1959,50 @@ class VPNManager:
             logger.error("[vpn] health check failed: %s", e)
         return result
 
+    def _get_probe_client(self):
+        """[P3 perf] httpx client RÉUTILISABLE par socks5_url pour les probes
+        IP — l'ancien code recréait un AsyncClient (handshake SOCKS5+TLS) par
+        GET. Caché par instance ; les vieux clients d'une URL remplacée sont
+        fermés en fire-and-forget."""
+        import httpx
+
+        cache = getattr(self, "_probe_clients", None)
+        if cache is None:
+            cache = {}
+            self._probe_clients = cache
+        key = self.socks5_url or ""
+        c = cache.get(key)
+        if c is not None and getattr(c, "is_closed", False):
+            c = None
+        if c is None:
+            c = httpx.AsyncClient(timeout=5, proxy=self.socks5_url or None)
+            cache[key] = c
+            # borne le cache (rotations multi-URL) — ferme les anciens
+            while len(cache) > 4:
+                old_url, old_c = next(iter(cache.items()))
+                if old_url == key:
+                    break
+                try:
+                    del cache[old_url]
+                    asyncio.get_running_loop().create_task(old_c.aclose())
+                except Exception:
+                    break
+        return c
+
     async def _probe_url(self, url: str, *, per_attempt: float = 2.0) -> str | None:
         """[plan 18/08 §A / prancy-unicorn §2] One bounded IP GET through the
-        SOCKS5 tunnel — the parallel unit of get_public_ip. Fresh coroutine
-        per endpoint: the sweep's wait_for cancels it on budget overrun,
-        __aexit__ closes the client on cancellation — no orphan task, no
-        leaked client. [unicorn] per-probe wait_for(min(2.0, budget)) so a
-        stuck SOCKS CONNECT (445 s stall) never leaks past httpx timeout=5.
+        SOCKS5 tunnel — the parallel unit of get_public_ip. [P3 perf] client
+        partagé réutilisable : plus de handshake SOCKS5+TLS par probe.
+        [unicorn] per-probe wait_for(min(2.0, budget)) so a stuck SOCKS
+        CONNECT (445 s stall) never leaks past httpx timeout=5.
         Returns the IP text (None on any failure)."""
         try:
-            import httpx
-
             # [unicorn] httpx timeout alone does NOT bound SOCKS CONNECT
             # — wrap the GET in wait_for(per_attempt) (min(3.0, budget))
             per_attempt = max(0.5, min(3.0, float(per_attempt or 3.0)))
-            async with httpx.AsyncClient(timeout=5, proxy=self.socks5_url) as client:
-                resp = await asyncio.wait_for(client.get(url), timeout=per_attempt)
-                ip = resp.text.strip()
+            client = self._get_probe_client()
+            resp = await asyncio.wait_for(client.get(url), timeout=per_attempt)
+            ip = resp.text.strip()
             if ip:
                 logger.debug("[vpn] probe ok %s via %s", url, self.socks5_url)
             return ip or None
@@ -2014,32 +2019,42 @@ class VPNManager:
         Tries the ordered ``ip_check_urls`` chain (``ip_check_url`` stays
         the legacy alias — entry 1 when no chain is configured), every
         endpoint through the SAME tunnel: resolving outside it would
-        falsify rotation validation. [plan 18/08 §A] ALL endpoints are
-        probed in PARALLEL under ONE bounded sweep (``ip_probe_budget``)
-        — the old sequential chain cost n × per-request timeout stacked on
-        repeated callers (the 445 s stall class), with no sweep-level cap.
-        The first success in endpoint order from ``_ip_check_idx`` is
-        returned and kept sticky; a fully failed OR budget-overrun sweep
-        resets the index. Returns None only when every endpoint failed —
-        never "unknown" as a success value.
+        falsify rotation validation.
+        [P3 perf] endpoint STICKY d'abord en séquentiel (1 seul GET dans le
+        cas nominal) ; le sweep parallèle borné par ``ip_probe_budget`` ne
+        sert qu'en fallback quand l'endpoint sticky échoue. Le sticky index
+        reste la source d'ordre ; un échec complet réinitialise l'index.
+        Returns None only when every endpoint failed — never "unknown" as
+        a success value.
         """
         urls = self._ip_check_urls or [self._ip_check_url]
-        base = self._ip_check_idx  # read BEFORE the sweep
+        base = self._ip_check_idx % len(urls)
+        # 1) Endpoint sticky seul — le cas nominal (tunnel sain, endpoint up)
+        # coûte exactement UN GET.
+        ip = await self._probe_url(urls[base])
+        if ip:
+            return ip
+        # 2) Fallback : sweep des AUTRES endpoints en parallèle, budget borné.
+        others = [(base + i) % len(urls) for i in range(1, len(urls))]
+        if not others:
+            self._ip_check_idx = 0
+            logger.error(
+                "[vpn] public IP probe failed on %d endpoint(s) via SOCKS5", len(urls)
+            )
+            return None
         try:
             results = await asyncio.wait_for(
-                asyncio.gather(*(self._probe_url(u) for u in urls)), self._ip_probe_budget
+                asyncio.gather(*(self._probe_url(urls[j]) for j in others)),
+                max(2.0, self._ip_probe_budget),
             )
         except TimeoutError:
             results = []  # sweep cancelled → total failure
-        for i in range(len(urls)):
-            idx = (base + i) % len(urls)  # scan in rotated order...
-            if i >= len(results):
+        for k, j in enumerate(others):
+            if k >= len(results):
                 break  # cancelled sweep → the total-failure tail
-            ip = results[idx]  # ...but results[] is URLS order
-            if ip:
-                # Sticky: remember the working endpoint (i==0 keeps it).
-                self._ip_check_idx = idx
-                return ip
+            if results[k]:
+                self._ip_check_idx = j
+                return results[k]
         self._ip_check_idx = 0  # full sweep failed — restart at the top next call
         logger.error("[vpn] public IP probe failed on all %d endpoints via SOCKS5", len(urls))
         return None
@@ -2671,8 +2686,8 @@ class VPNManager:
                 errors="replace",
                 env=env,
             )
-        except FileNotFoundError:
-            raise RuntimeError("CLI docker introuvable dans le PATH")
+        except FileNotFoundError as _fnf:
+            raise RuntimeError("CLI docker introuvable dans le PATH") from _fnf
         finally:
             if loop is not None and op_ev is not None:
                 # Stale-decrement guard: the rotation's teardown bumped the
@@ -2961,13 +2976,33 @@ class VPNManager:
         since_pin = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         deadline = time.monotonic() + timeout
         stopped_warned = False  # [incident 17/08] one WARN per pin — 59/line spam
+
+        async def _scan_auth_tls() -> bool:
+            """[P3 perf] UN SEUL ``docker logs`` par itération de pin : le
+            texte est partagé entre les scans AUTH_FAILED et TLS (l'ancien
+            code lançait un subprocess par check, à chaque poll de 0,5 s).
+            Stubs sans kwarg ``text`` → chemin historique (seam §14.1.10)."""
+            if not self._auth_check_supports_text():
+                if await self._check_auth_failed(since_pin):
+                    return True
+                return await self._check_server_issue(since_pin)
+            result = await asyncio.to_thread(
+                self._docker_run,
+                ["logs", "--since", since_pin, self._docker_container],
+                30,
+            )
+            if result.returncode != 0:
+                return False
+            text = result.stdout
+            if await self._check_auth_failed(since_pin, text=text):
+                return True
+            return await self._check_server_issue(since_pin, text=text)
+
         while time.monotonic() < deadline:
             # Scan BEFORE leaning on the status reply: gluetun can report
             # "running" while openvpn is caught in an AUTH_FAILED retry
             # loop, so the auth scan is the decisive signal.
-            if await self._check_auth_failed(since_pin) or await self._check_server_issue(
-                since_pin
-            ):
+            if await _scan_auth_tls():
                 logger.warning(
                     "[vpn] control pin %s: auth/TLS failure since pin start "
                     "— abandoning, the next country will be pinned "
@@ -2987,9 +3022,7 @@ class VPNManager:
                     # catch-up wall (running is the pin verdict).
                     catchup_deadline = time.monotonic() + catchup
                     while time.monotonic() < catchup_deadline:
-                        if await self._check_auth_failed(
-                            since_pin
-                        ) or await self._check_server_issue(since_pin):
+                        if await _scan_auth_tls():
                             # [audit 18/08] same WARN as the pre-status scan —
                             # a TLS failure mid-catch-up was silent before
                             # (the incident was diagnosed through logs).
@@ -3870,7 +3903,13 @@ class VPNManager:
         services = [self._compose_service]
         compose_path = self._compose_file_path()
         env_path = os.path.join(os.path.dirname(compose_path), ".env")
+        _env_lock_held = False
         try:
+            # [P4 race .env] même protection que _apply_stack : la réécriture
+            # du .env est atomique (tmp+replace) mais le read-modify-write
+            # concurrent avec un autre écrivain perdait des clés.
+            _ENV_RW_LOCK.acquire()
+            _env_lock_held = True
             data = ""
             try:
                 with open(env_path, encoding="utf-8") as f:
@@ -3924,6 +3963,10 @@ class VPNManager:
         except OSError as e:
             logger.error("[vpn] _apply_ovpn_protocol: cannot write %s: %s", env_path, e)
             return False
+        finally:
+            if _env_lock_held:
+                _env_lock_held = False
+                _ENV_RW_LOCK.release()
         try:
             prev = getattr(self, "_ovpn_protocol_effective", "udp")
             prev_port = getattr(self, "_ovpn_endpoint_port_effective", "1194" if prev == "udp" else "443")
@@ -4186,9 +4229,15 @@ class VPNManager:
         AUTH_FAILED scan to it, so a pre-restart AUTH_FAILED still in the
         logs cannot flip state (docker logs span container restarts, [15]).
         Returns None on failure/timeout.
+        [P3 perf] backoff exponentiel poll×1.5 plafonné à 2 s : un gluetun
+        met typiquement 5-30 s à devenir sain ; sonder docker+IP toutes les
+        500 ms pendant toute la fenêtre n'accélère rien et multiplie les
+        subprocess ×4 stations. L'IP-sweep ne tourne déjà qu'une fois le
+        conteneur ``running`` (court-circuit du and).
         """
         deadline = time.monotonic() + timeout
         empty_inspects = 0
+        delay = max(0.1, float(self._wait_healthy_poll))
         while time.monotonic() < deadline:
             info = await self._docker_inspect()
             if info.get("running") and await self.get_public_ip():
@@ -4212,7 +4261,8 @@ class VPNManager:
                 or await self._check_server_issue(info.get("started_at", ""))
             ):
                 return None
-            await asyncio.sleep(self._wait_healthy_poll)
+            await asyncio.sleep(delay)
+            delay = min(2.0, delay * 1.5)  # [P3 perf] backoff exponentiel
         return None
 
     # ── Auto-update (gluetun image) ────────────────────────────
@@ -4470,7 +4520,16 @@ class VPNManager:
     async def _updater_loop(self) -> None:
         """Background loop: detect available updates and apply them at the
         most opportune moment. First iteration runs immediately, then every
-        update_check_interval seconds."""
+        update_check_interval seconds.
+        [P3 perf] stagger par index de station : les N managers ne tirent
+        plus ``docker compose pull`` quasi simultanément toutes les 6 h
+        (N× bande passante + N× charge docker daemon pour LA MÊME image) —
+        le premier check est décalé de ``_station × 90 s``."""
+        try:
+            _idx = max(0, int(getattr(self, "_station", 1)) - 1)
+            await asyncio.sleep(_idx * 90)
+        except asyncio.CancelledError:
+            raise
         while True:
             try:
                 if await self.check_update() and self._update_opportune():
@@ -4595,7 +4654,21 @@ class VPNManager:
             # cadence). The light probe decides alone; the refresh returns
             # to transitions (recovery/compose, below) and idle ticks.
             if not self._egress_failures:
-                await self.refresh_status(force=True)
+                # [P3 perf] tick sain : le refresh docker lourd (inspect +
+                # logs, ~2-4 subprocess ×4 stations) ne tourne que si des
+                # events conteneur sont arrivés depuis le dernier tick OU si
+                # le cache status est expiré. Le watcher docker_events réveille
+                # déjà la boucle en ms sur die/stop/kill — le polling serré
+                # n'apporte rien en régime stable.
+                _events = getattr(self, "_docker_events_since_tick", 0)
+                _status_fresh = (
+                    self._last_status_refresh_at is not None
+                    and time.monotonic() - self._last_status_refresh_at
+                    < max(self._STATUS_CACHE_SECONDS, 30.0)
+                )
+                if _events > 0 or not _status_fresh:
+                    await self.refresh_status(force=True)
+                self._docker_events_since_tick = 0
             egress_dead = False
             # [plan 18/08 §E1] Light egress probe — SOCKS5 handshake +
             # CONNECT to the ip_check endpoint, bounded by the probe budget,
@@ -5076,8 +5149,8 @@ def _docker_cli(
             errors="replace",
             env=env,
         )
-    except FileNotFoundError:
-        raise RuntimeError("CLI docker introuvable dans le PATH")
+    except FileNotFoundError as _fnf:
+        raise RuntimeError("CLI docker introuvable dans le PATH") from _fnf
 
 
 def _env_value_from_inspect(info: dict, key: str) -> str | None:
@@ -5203,18 +5276,9 @@ async def reconcile_orphan_containers(managers: list, runner=None) -> list[str]:
         # [plan v10 incident 25/08 matin] PÉRIODE DE GRÂCE : un conteneur
         # démarré depuis <120 s n'est JAMAIS un orphelin — les courses
         # (watchdog qui recrée vs reconcile qui purge) supprimaient des
-        # stations fraîchement recréées, en boucle. Si l'âge est
-        # indéterminable, comportement historique (purge des orphelins).
-        started_at = str((info or {}).get("State") or {}).get("StartedAt") if isinstance((info or {}).get("State"), dict) else None
-        age_sec = None
-        if started_at:
-            try:
-                from datetime import datetime as _dt
-
-                born = _dt.fromisoformat(started_at[:19].replace("Z", "")).replace(tzinfo=UTC)
-                age_sec = max(0.0, time.time() - born.timestamp())
-            except Exception:
-                age_sec = None
+        # stations fraîchement recréées, en boucle. Garde effective :
+        # tout conteneur VIVANT absent du registre est conservé (plus bas).
+        # [P6] le calcul mort `age_sec` (jamais lu) est supprimé.
 
         m = by_name.get(name)
         if name not in expected:

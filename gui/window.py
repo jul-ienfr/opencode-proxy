@@ -8,8 +8,10 @@ import webbrowser
 class DashboardWindow:
     """Manages a pywebview window launched as a subprocess to avoid threading issues."""
 
-    def __init__(self, web_port, host="127.0.0.1"):
-        self.web_port = web_port
+    def __init__(self, port, host="127.0.0.1"):
+        # [P6] le dashboard est servi par le port PRINCIPAL du proxy —
+        # l'ancien paramètre web_port pointait vers :8082 où rien n'écoute.
+        self.port = port
         self.host = host
         self._process = None
         self._script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_webview_main.py")
@@ -30,7 +32,7 @@ class DashboardWindow:
         if self._process is not None and self._process.poll() is None:
             return
 
-        url = f"http://{self.host}:{self.web_port}"
+        url = f"http://{self.host}:{self.port}"
 
         try:
             kwargs = {}
