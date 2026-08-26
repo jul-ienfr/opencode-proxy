@@ -752,6 +752,8 @@ async def start_quota_fetcher(app):
 
     async def _poll():
         global _models_cache
+        # [P4.3 perf] sleep ancré sur échéance fixe — évite la dérive si un fetch est lent
+        next_deadline = time.monotonic() + QUOTA_FETCH_INTERVAL
         while True:
             # Periodically refresh upstream model list (every cycle = ~5 min)
             try:
@@ -774,50 +776,62 @@ async def start_quota_fetcher(app):
                         del _caches[wid]
 
             if not workspaces:
-                await asyncio.sleep(QUOTA_FETCH_INTERVAL)
+                delay = max(0, next_deadline - time.monotonic())
+                await asyncio.sleep(delay)
+                next_deadline += QUOTA_FETCH_INTERVAL
+                if next_deadline < time.monotonic():
+                    next_deadline = time.monotonic() + QUOTA_FETCH_INTERVAL
                 continue
 
-            for ws in workspaces:
-                wid = ws["go_workspace_id"]
-                cookie = ws["go_auth_cookie"]
-                try:
-                    quotas = await fetch_quotas(wid, cookie)
-                    # Check if workspace was previously in error (for recovery callback)
-                    was_error = False
-                    async with _cache_lock:
-                        prev = _caches.get(wid)
-                        was_error = prev and prev.get("status") == "error"
-                        _caches[wid] = {
-                            "status": "ok",
-                            "error": None,
-                            "fetched_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                            "quotas": quotas,
-                        }
-                    get_event_manager().publish(
-                        "quotas_updated", {"workspace_id": wid, "status": "ok"}
-                    )
-                    logger.debug("Quotas refreshed for workspace %s", wid[:8])
-                    # Notify recovery: unpause API key if it was paused due to 401
-                    if was_error and _on_workspace_recovered_callback:
-                        try:
-                            _on_workspace_recovered_callback(wid)
-                        except Exception as cb_err:
-                            logger.debug(
-                                "Recovery callback error for workspace %s: %s", wid[:8], cb_err
-                            )
-                except Exception as e:
-                    logger.warning("Quota fetch failed for workspace %s: %s", wid[:8], e)
-                    async with _cache_lock:
-                        if wid in _caches:
-                            _caches[wid]["status"] = "error"
-                            _caches[wid]["error"] = str(e)
-                        else:
-                            _caches[wid] = _new_cache("error", str(e))
-                    get_event_manager().publish(
-                        "quotas_updated", {"workspace_id": wid, "status": "error", "error": str(e)}
-                    )
+            # [P4.3 perf] workspaces en parallèle (sémaphore 3) — 5 workspaces × 1s = 1s au lieu de 5s
+            sem = asyncio.Semaphore(3)
 
-            await asyncio.sleep(QUOTA_FETCH_INTERVAL)
+            async def _fetch_one(ws):
+                async with sem:
+                    wid = ws["go_workspace_id"]
+                    cookie = ws["go_auth_cookie"]
+                    try:
+                        quotas = await fetch_quotas(wid, cookie)
+                        was_error = False
+                        async with _cache_lock:
+                            prev = _caches.get(wid)
+                            was_error = prev and prev.get("status") == "error"
+                            _caches[wid] = {
+                                "status": "ok",
+                                "error": None,
+                                "fetched_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                                "quotas": quotas,
+                            }
+                        get_event_manager().publish(
+                            "quotas_updated", {"workspace_id": wid, "status": "ok"}
+                        )
+                        logger.debug("Quotas refreshed for workspace %s", wid[:8])
+                        if was_error and _on_workspace_recovered_callback:
+                            try:
+                                _on_workspace_recovered_callback(wid)
+                            except Exception as cb_err:
+                                logger.debug(
+                                    "Recovery callback error for workspace %s: %s", wid[:8], cb_err
+                                )
+                    except Exception as e:
+                        logger.warning("Quota fetch failed for workspace %s: %s", wid[:8], e)
+                        async with _cache_lock:
+                            if wid in _caches:
+                                _caches[wid]["status"] = "error"
+                                _caches[wid]["error"] = str(e)
+                            else:
+                                _caches[wid] = _new_cache("error", str(e))
+                        get_event_manager().publish(
+                            "quotas_updated", {"workspace_id": wid, "status": "error", "error": str(e)}
+                        )
+
+            await asyncio.gather(*(_fetch_one(ws) for ws in workspaces))
+
+            delay = max(0, next_deadline - time.monotonic())
+            await asyncio.sleep(delay)
+            next_deadline += QUOTA_FETCH_INTERVAL
+            if next_deadline < time.monotonic():
+                next_deadline = time.monotonic() + QUOTA_FETCH_INTERVAL
 
     # Cancel existing task if called again (double-invocation guard)
     existing = getattr(app.state, "_quota_task", None)

@@ -81,6 +81,9 @@ except ImportError:
 
 def _drop_orphan_tool_messages(messages: list[dict]) -> list[dict]:
     """Filter role:tool messages whose tool_call_id has no preceding tool_calls id."""
+    # [P5.2 perf] early-exit sans rebuild quand aucun role=="tool" (99% des requêtes)
+    if not any(m.get("role") == "tool" for m in messages):
+        return messages
     _seen_ids: set[str] = set()
     filtered: list[dict] = []
     for m in messages:
@@ -105,6 +108,9 @@ def _drop_orphan_tool_messages(messages: list[dict]) -> list[dict]:
 
 def _drop_orphan_responses_input(inp: list[dict]) -> list[dict]:
     """Filter function_call_output items whose call_id has no preceding function_call."""
+    # [P5.2 perf] early-exit sans rebuild quand aucun function_call_output
+    if not any(it.get("type") == "function_call_output" for it in inp):
+        return inp
     _known: set[str] = set()
     _filt: list[dict] = []
     for it in inp:
@@ -663,21 +669,45 @@ def _local_signature(text: str) -> str:
     ).decode()
 
 
+# [P5.1 perf] LRU bornée pour _is_local_signature — les historiques multi-tours
+# ré-émettent les mêmes blocs → hit-rate élevé, zéro changement sémantique.
+_is_local_sig_cache: OrderedDict[bytes, bool] = OrderedDict()
+_IS_LOCAL_SIG_CACHE_MAX = 2048
+
+
 def _is_local_signature(text: str, signature: str) -> bool:
     """[PLAN-raisonnement Phase D] Détecte une signature FORGÉE par le proxy.
 
     Provenance stateless : on recalcule le HMAC local du texte et on compare.
     Une signature authentique (Anthropic) ne peut pas correspondre — elle
     n'est pas produite par notre clé. Un bloc thinking re-émis par le client
-    avec NOTRE signature est donc identifiable sans table d'état."""
+    avec NOTRE signature est donc identifiable sans table d'état.
+
+    [P5.1 perf] Mémoïsation LRU bornée (clé blake2b(text+signature), 2048 entrées)
+    pour éviter le recalcul HMAC par bloc/requête."""
     if not isinstance(signature, str) or not signature:
         return False
     if not isinstance(text, str) or not text:
         return False
     try:
+        # clé 128-bit blake2b : collision négligeable, calcul rapide
+        h = hashlib.blake2b(digest_size=16)
+        h.update(text.encode("utf-8"))
+        h.update(b"\x00")
+        h.update(signature.encode("utf-8"))
+        key = h.digest()
+        cached = _is_local_sig_cache.get(key)
+        if cached is not None:
+            _is_local_sig_cache.move_to_end(key)
+            return cached
         import hmac as _hmac
 
-        return _hmac.compare_digest(_local_signature(text), signature)
+        result = _hmac.compare_digest(_local_signature(text), signature)
+        _is_local_sig_cache[key] = result
+        _is_local_sig_cache.move_to_end(key)
+        if len(_is_local_sig_cache) > _IS_LOCAL_SIG_CACHE_MAX:
+            _is_local_sig_cache.popitem(last=False)
+        return result
     except Exception:
         return False
 

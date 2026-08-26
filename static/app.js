@@ -914,6 +914,7 @@ function debounce(fn, ms) {
 
 let trafficFilter = '';
 let trafficLastStats = null;
+let trafficLastFirstId = null; // [P4.6] diff-rendu
 
 async function fetchTrafficStatus() {
     try {
@@ -1025,6 +1026,13 @@ function renderTrafficFrames(data) {
     const capCb = document.getElementById('traffic-enabled');
     if (capCb && data.status) capCb.checked = !!data.status.enabled;
     renderTrafficStatsBar(data.status, trafficLastStats, data.frames);
+    // [P4.6 perf] diff-rendu : si le premier frame id n'a pas changé, skip le rebuild complet (200 <tr>)
+    const firstId = data.frames && data.frames[0] ? data.frames[0].id : null;
+    if (firstId !== null && firstId === trafficLastFirstId && tbody.querySelector(`tr[data-fid="${firstId}"]`)) {
+        // frames identiques au dernier rendu — pas de nouveau trafic, on garde le DOM
+        return;
+    }
+    trafficLastFirstId = firstId;
 
     if (!data.frames || data.frames.length === 0) {
         tbody.innerHTML = `<tr><td colspan="9" style="color:var(--text-dim)">${t('traffic.no_data')}</td></tr>`;
@@ -3019,6 +3027,8 @@ document.addEventListener('DOMContentLoaded', () => {
     });
 
     async function refreshVPNStatus() {
+        // [P4.6 perf] skip si tab cachée — évite 3 GET inutiles toutes les 10s
+        if (document.hidden) return;
         // Fetch vpn-status (slow, 5x refresh_status) and config (fast, station_count+free_parallel) in parallel
         // so GUI shows parameters instantly without waiting for 5 docker probes
         const vpnStatusP = fetchWithToken('/api/vpn-status').then(r=>r.json()).then(data=>{
@@ -3054,7 +3064,9 @@ document.addEventListener('DOMContentLoaded', () => {
             } catch(e) {}
             return data;
         }).catch(e=>{ console.error('VPN status error:', e); });
+        let _vpnConfigData = null;
         const vpnConfigP = fetchWithToken('/api/vpn-config').then(r=>r.json()).then(cfgJ=>{
+            _vpnConfigData = cfgJ;
             if (cfgJ.proxy_mode) try{ updateGeoWarning(cfgJ.proxy_mode); }catch(e){}
             // instant station_count + free_parallel from fast vpn-config (no docker probe)
             try {
@@ -3108,17 +3120,12 @@ document.addEventListener('DOMContentLoaded', () => {
             } catch(e){}
             return cfg;
         }).catch(e=>{});
-        // Wait for all three in parallel, but don't block UI updates (they already updated as they arrived)
-        await Promise.allSettled([vpnStatusP, vpnConfigP, configP]);
-        // Also check credential status
-        try {
-            const credResp = await fetchWithToken('/api/vpn/credentials');
-            const credData = await credResp.json();
+        // [P4.6 perf] credentials parallélisé (était séquentiel après les 3) + skip si tab cachée déjà fait
+        const credP = fetchWithToken('/api/vpn/credentials').then(r=>r.json()).then(credData=>{
             const credStatus = document.getElementById('vpn-cred-status');
             const usernameEl = document.getElementById('vpn-cred-username');
             const passwordEl = document.getElementById('vpn-cred-password');
             const fileEl = document.getElementById('vpn-cred-file');
-
             if (credData.exists) {
                 if (credStatus) credStatus.innerHTML = '<span style="color:var(--success)">&#10003;</span> ' + (t('vpn.credentials_saved') || 'Enregistré');
                 if (usernameEl) usernameEl.textContent = credData.username_preview || '****';
@@ -3130,13 +3137,14 @@ document.addEventListener('DOMContentLoaded', () => {
                 if (passwordEl) passwordEl.textContent = '—';
                 if (fileEl) fileEl.textContent = '—';
             }
-        } catch (e) {
-            console.error('Credential status error:', e);
-        }
-        // Also load server list from config
+            return credData;
+        }).catch(e=>{ console.error('Credential status error:', e); });
+        // Wait for all four in parallel, but don't block UI updates (they already updated as they arrived)
+        await Promise.allSettled([vpnStatusP, vpnConfigP, configP, credP]);
+
+        // Also load server list from config — [P4.6] réutilise le fetch déjà fait (évite 2e GET)
         try {
-            const cfgResp = await fetchWithToken('/api/vpn-config');
-            const cfgData = await cfgResp.json();
+            const cfgData = _vpnConfigData || await fetchWithToken('/api/vpn-config').then(r=>r.json()).catch(()=>({}));
             renderServerList(cfgData.servers || []);
             // Initialize config fields
             if (cfgData.mode) document.getElementById('vpn-mode').value = cfgData.mode;

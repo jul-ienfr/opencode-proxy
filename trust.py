@@ -68,10 +68,29 @@ def parse_cidrs(raw: Iterable[str]) -> list[ipaddress.IPv4Network | ipaddress.IP
     return out
 
 
+_lan_cidrs_cache: dict[tuple[str, ...], list[ipaddress.IPv4Network | ipaddress.IPv6Network]] = {}
+
+
 def lan_cidrs() -> list[ipaddress.IPv4Network | ipaddress.IPv6Network]:
+    """[P5.3 perf] mémoïsé par clé = tuple des items bruts — hot-reload change la clé naturellement."""
     raw = _yaml_get("dashboard_trust", "lan_cidrs", None)
     items = raw if isinstance(raw, (list, tuple)) and raw else DEFAULT_LAN_CIDRS
-    return parse_cidrs([str(c) for c in items])
+    key = tuple(str(c) for c in items)
+    cached = _lan_cidrs_cache.get(key)
+    if cached is not None:
+        return cached
+    parsed = parse_cidrs([str(c) for c in items])
+    _lan_cidrs_cache[key] = parsed
+    # borne simple : max 32 configs distinctes
+    if len(_lan_cidrs_cache) > 32:
+        # éviction FIFO de la plus ancienne
+        try:
+            oldest = next(iter(_lan_cidrs_cache))
+            if oldest != key:
+                del _lan_cidrs_cache[oldest]
+        except Exception:
+            pass
+    return parsed
 
 
 def is_loopback(ip: str) -> bool:

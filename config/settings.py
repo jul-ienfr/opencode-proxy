@@ -1649,6 +1649,9 @@ def maybe_reload_custom_routes():
                         if isinstance(new_yaml.get("ip_rotation"), dict)
                         else {}
                     )
+                    # Fix P2: snapshot old server_countries AVANT clear/update
+                    # sinon _old_sc lu en 1715 vaut déjà new_ip → regen .env jamais déclenché
+                    _old_sc_snapshot = IP_ROTATION.get("server_countries", "")
                     IP_ROTATION.clear()
                     if isinstance(new_ip, dict):
                         IP_ROTATION.update(new_ip)
@@ -1712,7 +1715,7 @@ def maybe_reload_custom_routes():
                         pass
                     # P2: server_countries change → regen .env via make_credentials_env
                     try:
-                        _old_sc = IP_ROTATION.get("server_countries", "")
+                        _old_sc = _old_sc_snapshot  # snapshot pris avant IP_ROTATION.clear()
                         _new_sc = new_ip.get("server_countries", "")
                         if _old_sc != _new_sc and _new_sc:
                             # [P4 perf] HORS loop : peut_reload tourne sur

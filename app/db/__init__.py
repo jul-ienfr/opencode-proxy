@@ -78,13 +78,18 @@ def quick_body_size(body) -> int:
     """[D1 perf] Estimation O(texte) SANS sérialisation ni repr — somme des
     longueurs des chaînes directement accessibles (champs top-level +
     contenus de messages). Suffisante pour décider si un corps est trop
-    volumineux pour la queue ; le tronquage exact reste dans le writer."""
+    volumineux pour la queue ; le tronquage exact reste dans le writer.
+
+    [P5.5 perf] early-exit dès DB_RAW_SIZE_CAP atteint — inutile de scanner
+    10 Mo de messages quand on sait déjà qu'on va stubber."""
     if not isinstance(body, dict):
         return 0
     total = 0
     for v in body.values():
         if type(v) is str:
             total += len(v)
+            if total > DB_RAW_SIZE_CAP:
+                return total
     msgs = body.get("messages")
     if isinstance(msgs, list):
         for m in msgs:
@@ -93,16 +98,22 @@ def quick_body_size(body) -> int:
             c = m.get("content")
             if type(c) is str:
                 total += len(c)
+                if total > DB_RAW_SIZE_CAP:
+                    return total
             elif isinstance(c, list):
                 for p in c:
                     if isinstance(p, dict):
                         t = p.get("text") or p.get("thinking") or ""
                         if type(t) is str:
                             total += len(t)
+                            if total > DB_RAW_SIZE_CAP:
+                                return total
                         if p.get("input") is not None and not isinstance(
                             p.get("input"), (str, int, float, bool)
                         ):
                             total += 256  # tool_use input : borne grossière
+                            if total > DB_RAW_SIZE_CAP:
+                                return total
     return total
 
 

@@ -26,6 +26,8 @@ class EventManager:
     # Flusher cadence — well under the coalesce window so pending events
     # land promptly after their window elapses.
     _FLUSH_INTERVAL = 0.1
+    # [P4.4 perf/sécurité] plafond subscribers — /api/events ouvert LAN sans token
+    MAX_SUBSCRIBERS = 100
 
     def __init__(self):
         self._subscribers = []
@@ -42,6 +44,8 @@ class EventManager:
     async def subscribe(self):
         queue = asyncio.Queue(maxsize=256)
         with self._lock:
+            if len(self._subscribers) >= self.MAX_SUBSCRIBERS:
+                raise RuntimeError(f"SSE subscriber limit reached ({self.MAX_SUBSCRIBERS})")
             self._subscribers.append(queue)
             logger.debug("[sse] subscriber added, count=%d", len(self._subscribers))
         return queue

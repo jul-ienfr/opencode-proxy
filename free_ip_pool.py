@@ -29,6 +29,12 @@ import weakref
 
 from vpn_manager import RotationFailed, VPNManager
 
+try:
+    from config.settings import yaml_get as _yaml_get
+except Exception:
+    def _yaml_get(section, key, default=None):  # fallback
+        return default
+
 logger = logging.getLogger(__name__)
 
 
@@ -159,6 +165,8 @@ class FreeIPPool:
         # [P3.1-A perf] défaut 20 s → 5 s : le repli paid garanti existe déjà
         # (l.869-870) ; au-delà de 5 s d'attente d'IP fraîche, TTFB pire cas.
         self._rotation_wait_timeout = 5.0
+        # [P3.1-B] hedge paid après rotation wait — 0 = désactivé, sinon ms
+        self._paid_hedge_after_ms = 0.0
         # [Axe 1.1] Bounded rotation coordinator: up to _ROTATION_CONCURRENCY
         # workers drain the queue in parallel, so a blocked rotation on one
         # station (budget wait + docker ops) no longer freezes the fleet.
@@ -761,7 +769,9 @@ class FreeIPPool:
                     if st.status != "connected":
                         continue
                     try:
-                        ok = await st.ensure_geo_egress(forced_pool, timeout=10.0)
+                        # [P3.2] bail court — 2s au lieu de 10s, au-delà on sert direct/paid et le pin finit en background si possible
+                        _geo_timeout = float(_yaml_get("geo", "pin_inline_timeout_s", 2) or 2)
+                        ok = await st.ensure_geo_egress(forced_pool, timeout=_geo_timeout)
                         if ok:
                             station = self._best_station(forced_pool)
                             if station is not None:
@@ -868,8 +878,19 @@ class FreeIPPool:
                         self._rotation_wait_timeout,
                     )
                     self._kick_connect(station)
-                    if not await self._await_rotation(station):
-                        return None, None
+                    # [P3.1-B] hedge opt-in — après paid_hedge_after_ms sans IP fraîche, rendre paid early
+                    if getattr(self, "_paid_hedge_after_ms", 0) and self._paid_hedge_after_ms > 0:
+                        try:
+                            ok = await asyncio.wait_for(
+                                self._await_rotation(station), timeout=self._paid_hedge_after_ms / 1000.0
+                            )
+                        except TimeoutError:
+                            return None, None
+                        if not ok:
+                            return None, None
+                    else:
+                        if not await self._await_rotation(station):
+                            return None, None
                     # Keep the station that just landed the fresh IP —
                     # switch_ip reset its counter, so this request counts
                     # as the first on the new (model, IP) cooldown key.
@@ -1545,6 +1566,9 @@ class FreeIPPool:
             self._rotation_stagger = max(0, int(cfg["rotation_stagger"] or 0))
         if "rotation_wait_timeout" in cfg:
             self._rotation_wait_timeout = max(1.0, float(cfg["rotation_wait_timeout"] or 0))
+        if "paid_hedge_after_ms" in cfg:
+            # [P3.1-B] opt-in hedge — 0 = désactivé, sinon ms
+            self._paid_hedge_after_ms = max(0.0, float(cfg["paid_hedge_after_ms"] or 0))
         # [Axe 1.1] Bounded rotation concurrency (config.yaml
         # `ip_rotation.rotation_concurrency`, hot-reloadable).
         if "rotation_concurrency" in cfg:
