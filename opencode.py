@@ -1389,12 +1389,22 @@ class _CurlSessionPool:
     place (l'éviction de la session fautive est conservée de l'ancien code).
     """
 
-    __slots__ = ("slots", "_cond", "max_size")
+    # [P2.2] last_used/closing : éviction TTL des pools orphelins + drainage
+    # swap-and-close à la rotation IP. busy_count est une propriété (classe).
+    __slots__ = ("slots", "_cond", "max_size", "last_used", "closing")
 
     def __init__(self, max_size: int = 3):
         self.slots: list[_CurlSessionSlot] = []
         self._cond = asyncio.Condition()
         self.max_size = max(1, int(max_size))
+        self.last_used = time.monotonic()
+        self.closing = False
+
+    @property
+    def busy_count(self) -> int:
+        """Slots empruntés (les slots restent listés dans self.slots même
+        busy — le garde busy est VITAL avant tout close_all())."""
+        return sum(1 for s in self.slots if s.busy)
 
     def _try_checkout(self) -> _CurlSessionSlot | None:
         for slot in self.slots:
@@ -1405,6 +1415,7 @@ class _CurlSessionPool:
 
     async def checkout(self, factory) -> _CurlSessionSlot:
         async with self._cond:
+            self.last_used = time.monotonic()
             slot = self._try_checkout()
             while slot is None:
                 if len(self.slots) < self.max_size:
@@ -1530,6 +1541,41 @@ async def _close_curl_pool():
     for pool in list(_curl_pool.values()):
         await pool.close_all()
     _curl_pool.clear()
+
+
+# [P2.2 perf] TTL d'idle au-delà de laquelle un pool sans slot emprunté est
+# évité : jusqu'à 256 profils d'identité ⇒ jusqu'à 256 clés (proxy|impersonate),
+# et les pools abandonnés gardent sinon leurs handles TLS ouverts pour toujours.
+_CURL_POOL_IDLE_TTL = 600.0
+
+
+async def _evict_idle_curl_pools(ttl: float = _CURL_POOL_IDLE_TTL) -> int:
+    """Éviction TTL/LRU des pools curl orphelins — appelée par le tick
+    background existant (30 s). Retourne le nombre de pools fermés.
+
+    Protocole : pop de la clé du dict AVANT close_all() — un checkout
+    concurrent reçoit None → crée un pool neuf. Garde busy_count == 0
+    VITAL : les slots empruntés restent listés dans self.slots et
+    close_all() les toucherait. La double vérification se fait SOUS la
+    Condition du pool pour fermer la course avec un checkout en vol.
+    """
+    now = time.monotonic()
+    freed = 0
+    for key, pool in list(_curl_pool.items()):
+        if pool.closing or (now - pool.last_used) < ttl:
+            continue
+        async with pool._cond:
+            # Re-vérification sous verrou : un checkout qui a gagné la course
+            # a posé last_used à jour ET rendu un slot busy.
+            if (
+                pool.busy_count != 0
+                or (time.monotonic() - pool.last_used) < ttl
+            ):
+                continue
+            _curl_pool.pop(key, None)
+            await pool.close_all()
+            freed += 1
+    return freed
 
 
 def _ensure_http_client() -> httpx.AsyncClient:
@@ -2221,6 +2267,11 @@ async def lifespan(app):
             await asyncio.sleep(yaml_get("background", "cooldown_sweep_interval", 30))
             try:
                 _sweep_free_cooldowns()
+                # [P2.2 perf/fuite] même tick : éviction des pools curl
+                # orphelins (identités abandonnées, handles TLS ouverts).
+                freed = await _evict_idle_curl_pools()
+                if freed:
+                    _debug(f"  [curl-pool] {freed} orphan pool(s) evicted (TTL)")
             except Exception as e:
                 _debug(f"  [cooldown] sweep error: {type(e).__name__}: {e}")
 
