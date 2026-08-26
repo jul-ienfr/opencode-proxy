@@ -1858,14 +1858,11 @@ def _responses_sse_to_chat_deltas(raw_line: str, parsed=None, state: "ResponsesS
         if isinstance(item, dict) and item.get("type") == "reasoning":
             iid = item.get("id", "") or f"rs_{chunk.get('output_index', 0)}"
             summary = item.get("summary", [])
-            # dedupe per-index exact : ne droper que si tous les indices du summary
-            # ont déjà été émis. Évite perte queue (un delta partiel bloquait tout le fallback).
-            if iid and isinstance(summary, list) and summary:
-                if all(f"{iid}:{i}" in reasoning_seen for i in range(len(summary))):
-                    return None
-            elif iid and iid in reasoning_seen:
-                # summary vide/non-list : fallback bare iid (legacy, sécurité)
-                return None
+            # [Correctif B2] Pass-through 200% : même si un index a déjà été
+            # streamé en delta (i vu → déjà visible côté client), le fallback
+            # intégral doit TOUJOURS remonter la queue perdue (les i NON vus).
+            # Pas de early-return ici — la dedup se fait au NIVEAU PART : chaque
+            # part non vue est émise ci-dessous, les parts déjà vues sont droppées.
             reasoning = ""
             if isinstance(summary, list):
                 for s in summary:
@@ -1881,13 +1878,38 @@ def _responses_sse_to_chat_deltas(raw_line: str, parsed=None, state: "ResponsesS
                 _debug(f"  [responses-sse] output_item.done no visible summary, skip (vrai seulement) iid={iid!r} encrypted={bool(item.get('encrypted_content'))}")
                 return None
             if reasoning:
+                # N'émètre QUE les parts non vues (per-index) — évite doublon
+                # (cas 1-part où delta déjà vu → on émet rien ; N-parts → on
+                # émet seulement les indices jamais vus).
+                _unseen = ""
+                _seen_any = False
                 if iid and isinstance(summary, list) and summary:
+                    for i, s in enumerate(summary):
+                        if f"{iid}:{i}" not in reasoning_seen:
+                            if isinstance(s, dict):
+                                _unseen += s.get("text", "") or ""
+                    _seen_any = any(f"{iid}:{i}" in reasoning_seen for i in range(len(summary)))
                     for i in range(len(summary)):
                         reasoning_seen.add(f"{iid}:{i}")
                 elif iid:
+                    if iid in reasoning_seen:
+                        return None
                     reasoning_seen.add(iid)
-                _debug(f"  [responses-sse] output_item.done reasoning fallback len={len(reasoning)} iid={iid!r}")
-                return {"choices": [{"delta": {"reasoning_content": reasoning}, "finish_reason": None}]}
+                    _unseen = reasoning
+                else:
+                    _unseen = reasoning
+                # si tout le summary avait déjà été delta-streamé → rien à émettre
+                if iid and isinstance(summary, list) and summary and not _unseen:
+                    _debug(f"  [responses-sse] output_item.done fully deduped iid={iid!r}")
+                    return None
+                # cas particulier single-part : le client a déjà le texte complet
+                # via delta — on ne renvoie PAS d'intégral redondant (même per-index
+                # présent → done fully dedupé ci-dessus l'a déjà absorbé).
+                _emit = _unseen if (iid and isinstance(summary, list) and summary and _seen_any) else reasoning
+                # mais si le seen_any était seulement partiel (N>1), _emit==_unseen
+                # (queue seule) ; si single-part seen → déjà return None ci-dessus.
+                _debug(f"  [responses-sse] output_item.done reasoning fallback len={len(_emit)} iid={iid!r} unseen={len(_unseen)} seen_any={_seen_any}")
+                return {"choices": [{"delta": {"reasoning_content": _emit}, "finish_reason": None}]}
         return None
 
     # response.completed — final event with usage

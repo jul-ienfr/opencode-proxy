@@ -7830,6 +7830,17 @@ async def messages(request: Request):
             stream_out = stream_cache = 0
             started = False
             open_blocks = []
+            # [PLAN-raisonnement Patch A] thinking synthétique : accumulation
+            # du contenu thinking passthrough pour pouvoir forger
+            # signature_delta côté synthétique (timeout/CancelledError/EOF).
+            # Passthrough nominal : sig upstream authentique déjà forwardée.
+            # Mais si passthrough tronqué brutalement, le client a encore un
+            # content_block_start thinking ouvert sans signature_delta — il
+            # l'abandonne au tour suivant. On capture donc ici l'index +
+            # accumulateur pour pouvoir injecter signature_delta via
+            # _terminate_after_started(thinking_idx, thinking_sig).
+            thinking_block_idx = None
+            thinking_acc = ""
             _yielded = False
             stop_reason = "end_turn"
             emitted_finish = False
@@ -7911,7 +7922,10 @@ async def messages(request: Request):
                                                 f"  stream_retry_suppressed_after_started attempt={_attempt + 1}"
                                             )
                                             async for ev in _terminate_after_started(
-                                                open_blocks, stream_out
+                                                open_blocks,
+                                                stream_out,
+                                                thinking_idx=thinking_block_idx,
+                                                thinking_sig=_local_signature(thinking_acc) if thinking_block_idx is not None and thinking_acc else "",
                                             ):
                                                 yield ev
                                             return
@@ -7977,7 +7991,10 @@ async def messages(request: Request):
                                         f"  stream_retry_suppressed_after_started attempt={_attempt + 1}"
                                     )
                                     async for ev in _terminate_after_started(
-                                        open_blocks, stream_out
+                                        open_blocks,
+                                        stream_out,
+                                        thinking_idx=thinking_block_idx,
+                                        thinking_sig=_local_signature(thinking_acc) if thinking_block_idx is not None and thinking_acc else "",
                                     ):
                                         yield ev
                                     return
@@ -7994,7 +8011,10 @@ async def messages(request: Request):
                                         f"  stream_retry_suppressed_after_started attempt={_attempt + 1}"
                                     )
                                     async for ev in _terminate_after_started(
-                                        open_blocks, stream_out
+                                        open_blocks,
+                                        stream_out,
+                                        thinking_idx=thinking_block_idx,
+                                        thinking_sig=_local_signature(thinking_acc) if thinking_block_idx is not None and thinking_acc else "",
                                     ):
                                         yield ev
                                     return
@@ -8027,8 +8047,11 @@ async def messages(request: Request):
                                             f"  stream_retry_suppressed_after_started attempt={_attempt + 1}"
                                         )
                                         async for ev in _terminate_after_started(
-                                            open_blocks, stream_out
-                                        ):
+                                        open_blocks,
+                                        stream_out,
+                                        thinking_idx=thinking_block_idx,
+                                        thinking_sig=_local_signature(thinking_acc) if thinking_block_idx is not None and thinking_acc else "",
+                                    ):
                                             yield ev
                                         return
                                     continue
@@ -8133,11 +8156,22 @@ async def messages(request: Request):
                                     if block.get("type") == "tool_use" and block.get("name"):
                                         used_tools.append(block["name"])
                                     open_blocks.append(event.get("index"))
+                                    if block.get("type") == "thinking":
+                                        thinking_block_idx = event.get("index")
+                                        thinking_acc = ""
+                                elif etype == "content_block_delta":
+                                    # Accumulate thinking deltas for synthetic termination signature
+                                    _delta = event.get("delta", {})
+                                    if _delta.get("type") == "thinking_delta" and thinking_block_idx is not None:
+                                        thinking_acc += _delta.get("thinking", "") or ""
                                 elif etype == "content_block_stop":
                                     idx = event.get("index")
                                     _debug(f"  [stream] content_block_stop: index={idx}")
                                     if idx in open_blocks:
                                         open_blocks.remove(idx)
+                                    if idx == thinking_block_idx:
+                                        thinking_block_idx = None
+                                        thinking_acc = ""
                                 elif etype == "message_delta":
                                     usage = event.get("usage", {})
                                     stream_out = usage.get("output_tokens", 0)
@@ -8201,7 +8235,7 @@ async def messages(request: Request):
                         if _stream_has_yielded(started, open_blocks, stream_out, _line_buf):
                             _cb_record_failure(endpoint)
                             _log(f"  stream_retry_suppressed_after_started attempt={_attempt + 1}")
-                            async for ev in _terminate_after_started(open_blocks, stream_out):
+                            async for ev in _terminate_after_started(open_blocks, stream_out, thinking_idx=thinking_block_idx, thinking_sig=_local_signature(thinking_acc) if thinking_block_idx is not None and thinking_acc else ""):
                                 yield ev
                             return
                         continue
@@ -8219,7 +8253,7 @@ async def messages(request: Request):
                     if _stream_has_yielded(started, open_blocks, stream_out, _line_buf):
                         _cb_record_failure(endpoint)
                         _log(f"  stream_retry_suppressed_after_started attempt={_attempt + 1}")
-                        async for ev in _terminate_after_started(open_blocks, stream_out):
+                        async for ev in _terminate_after_started(open_blocks, stream_out, thinking_idx=thinking_block_idx, thinking_sig=_local_signature(thinking_acc) if thinking_block_idx is not None and thinking_acc else ""):
                             yield ev
                         return
                     continue
@@ -8253,7 +8287,7 @@ async def messages(request: Request):
                                 _log(
                                     f"  stream_retry_suppressed_after_started attempt={_attempt + 1}"
                                 )
-                                async for ev in _terminate_after_started(open_blocks, stream_out):
+                                async for ev in _terminate_after_started(open_blocks, stream_out, thinking_idx=thinking_block_idx, thinking_sig=_local_signature(thinking_acc) if thinking_block_idx is not None and thinking_acc else ""):
                                     yield ev
                                 return
                             continue
@@ -8275,7 +8309,7 @@ async def messages(request: Request):
                         if _stream_has_yielded(started, open_blocks, stream_out, _line_buf):
                             _cb_record_failure(endpoint)
                             _log(f"  stream_retry_suppressed_after_started attempt={_attempt + 1}")
-                            async for ev in _terminate_after_started(open_blocks, stream_out):
+                            async for ev in _terminate_after_started(open_blocks, stream_out, thinking_idx=thinking_block_idx, thinking_sig=_local_signature(thinking_acc) if thinking_block_idx is not None and thinking_acc else ""):
                                 yield ev
                             return
                         continue
@@ -8312,7 +8346,17 @@ async def messages(request: Request):
                         request_body=request_body,
                     )
                     if started:
-                        for idx in open_blocks:
+                        # [Patch A] synthetic thinking termination: signature_delta before stop
+                        for idx in list(open_blocks):
+                            if thinking_block_idx is not None and idx == thinking_block_idx and thinking_acc:
+                                yield _sse(
+                                    "content_block_delta",
+                                    {
+                                        "type": "content_block_delta",
+                                        "index": idx,
+                                        "delta": {"type": "signature_delta", "signature": _local_signature(thinking_acc)},
+                                    },
+                                )
                             yield _sse(
                                 "content_block_stop", {"type": "content_block_stop", "index": idx}
                             )
@@ -8336,7 +8380,7 @@ async def messages(request: Request):
             if started and not emitted_finish:
                 _debug("  [stream] truncated without finish_reason → synthesizing stop")
                 _log("  stream truncated without finish_reason → synthesizing stop")
-                async for ev in _terminate_after_started(open_blocks, stream_out):
+                async for ev in _terminate_after_started(open_blocks, stream_out, thinking_idx=thinking_block_idx, thinking_sig=_local_signature(thinking_acc) if thinking_block_idx is not None and thinking_acc else ""):
                     yield ev
                 emitted_finish = True
             est_input = await _est_task
