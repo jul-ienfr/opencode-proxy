@@ -1745,19 +1745,33 @@ def _chat_to_responses_request(chat: dict) -> dict:
         model = chat.get("model", "")
         prof = _resolve_schema_profile(model)
         _is_strict = prof["strip_additional_props"]
+
+        def _needs_fallback(p: dict) -> bool:
+            if not isinstance(p, dict):
+                return False
+            if any(k in p for k in ("anyOf", "oneOf", "const", "title", "$schema", "$id")):
+                return True
+            for v in p.values():
+                if isinstance(v, dict) and _needs_fallback(v):
+                    return True
+                if isinstance(v, list) and any(isinstance(x, dict) and _needs_fallback(x) for x in v):
+                    return True
+            return False
+
         tools = []
         for t in chat["tools"]:
             if isinstance(t, dict) and "function" in t:
                 fn = t["function"]
-                params = _normalize_tool_schema(fn.get("parameters", {}) or {}, model)
+                raw_params = fn.get("parameters", {}) or {}
+                params = _normalize_tool_schema(raw_params, model)
                 tool_entry: dict = {
                     "type": "function",
                     "name": fn.get("name", ""),
                     "description": fn.get("description", ""),
                     "parameters": params,
                 }
-                # 100% : explicit non-strict bypass strict-attempt non déterministe
-                if _is_strict:
+                # V5.1 sémantique : strict:false seulement si fallback nécessaire
+                if _is_strict and _needs_fallback(raw_params):
                     tool_entry["strict"] = False
                 tools.append(tool_entry)
         if tools:

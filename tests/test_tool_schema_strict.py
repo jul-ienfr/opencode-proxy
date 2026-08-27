@@ -111,10 +111,17 @@ class TestArrayItems:
 # ── strict:false sur tool émis ────────────────────────────────────
 class TestStrictFalse:
     def test_chat_to_responses_sets_strict_false(self):
-        chat = {"model": "muse-spark-1.2-contributor", "messages": [{"role": "user", "content": "hi"}], "tools": [{"type": "function", "function": {"name": "bash", "description": "run", "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}}}]}
+        # V5.1 sémantique : strict:false seulement si fallback (anyOf/const/title)
+        chat = {"model": "muse-spark-1.2-contributor", "messages": [{"role": "user", "content": "hi"}], "tools": [{"type": "function", "function": {"name": "bash", "description": "run", "parameters": {"type": "object", "properties": {"command": {"type": "string", "anyOf": [{"type": "string"}, {"type": "number"}]}}, "required": ["command"]}}}]}
         r = pm._chat_to_responses_request(chat)
         assert r["tools"][0]["strict"] is False
         assert r["tools"][0]["parameters"]["additionalProperties"] is False
+
+    def test_chat_to_responses_simple_no_strict(self):
+        chat = {"model": "muse-spark-1.2-contributor", "messages": [{"role": "user", "content": "hi"}], "tools": [{"type": "function", "function": {"name": "bash", "description": "run", "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}}}]}
+        r = pm._chat_to_responses_request(chat)
+        # simple sans anyOf/const → pas de strict:false (laisse implicite)
+        assert "strict" not in r["tools"][0]
 
     def test_chat_to_responses_qwen_no_strict(self):
         chat = {"model": "qwen3.5-plus", "messages": [{"role": "user", "content": "hi"}], "tools": [{"type": "function", "function": {"name": "bash", "description": "run", "parameters": {"type": "object", "properties": {"command": {"type": "string"}}}}}]}

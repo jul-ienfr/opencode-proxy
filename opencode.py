@@ -5895,6 +5895,17 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
     return None
 
 
+def _unwrap_responses_envelope(data: dict) -> dict:
+    """V5.1 best-practice : déplie {"type":"response.created","response":{...}} → {...} (copy, idempotent)."""
+    if not isinstance(data, dict):
+        return data
+    if data.get("type", "").startswith("response.") and isinstance(data.get("response"), dict):
+        return dict(data["response"])
+    if isinstance(data.get("response"), dict) and "output" in data["response"] and "output" not in data:
+        return dict(data["response"])
+    return data
+
+
 def _is_retriable_datapolicy(resp) -> bool:
     """V4 100% : 403/400 DataPolicyError / illegal invocation → retriable, sans pause_key."""
     try:
@@ -10032,6 +10043,9 @@ async def chat_completions(request: Request):
                     paid_body = (
                         _chat_to_responses_request(body) if "/responses" in endpoint else body
                     )
+                    # V5.1 best-practice : stream flag explicite (évite response.created en non-stream)
+                    if "/responses" in endpoint:
+                        paid_body["stream"] = bool(is_stream)
                     if _geo_tunnel:
                         # Axe A: geo-restricted paid → must route through tunnel station
                         async with _open_via_pool(
@@ -10113,6 +10127,32 @@ async def chat_completions(request: Request):
                 _debug(f"  ✗ non-JSON response from {endpoint}")
                 _log(f"  UPSTREAM DECODE ERROR: non-JSON response from {endpoint}")
                 return _openai_error(502, "Upstream returned non-JSON response")
+            # V5.1 : déplie enveloppe response.created si /responses renvoie SSE en JSON (best-practice)
+            if "/responses" in endpoint:
+                data = _unwrap_responses_envelope(data)
+                if data.get("status") in ("queued", "in_progress"):
+                    _debug(f"  [unwrap] status={data.get('status')} → poll once")
+                    _log(f"  Responses status {data.get('status')} (non-stream) → 503 retryable")
+                    return _openai_error(503, f"Upstream {data.get('status')}, retry")
+                # Convertit Responses → Chat Completions pour le client
+                try:
+                    chat_resp = _responses_to_chat_response(data, original_model)
+                    body_bytes = _json_dumps(chat_resp)
+                    usage = chat_resp.get("usage", {})
+                    req_in = usage.get("prompt_tokens", 0)
+                    req_out = usage.get("completion_tokens", 0)
+                    cache = _extract_cache_tokens(usage)
+                    _debug(f"  usage: in={req_in} out={req_out} cache={cache} (converted)")
+                    _update_token_usage(model_id, req_in, req_out, cache)
+                    used = _extract_usage_tool_names(chat_resp)
+                    await _save_and_log_request(
+                        req_id, model_id, original_model, start_time, req_in, req_out, cache, protocol, is_stream, thinking_type, effort, client_ip, account_alias, tool_names, tools_used=used if used else None, request_body=request_body, response_body=chat_resp,
+                    )
+                    if cache_key:
+                        _response_cache.put(cache_key, body_bytes, {"Content-Type": "application/json"})
+                    return Response(content=body_bytes, headers={"X-Cache": "MISS"}, media_type="application/json")
+                except Exception as e:
+                    _debug(f"  [convert] Responses→Chat failed {e}, fallback brut")
             usage = data.get("usage", {})
             req_in = usage.get("prompt_tokens", 0)
             req_out = usage.get("completion_tokens", 0)
