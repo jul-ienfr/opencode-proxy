@@ -354,7 +354,7 @@ def anthropic_to_openai(body: dict, model: str, raw: bytes | None = None) -> dic
         if not isinstance(content, list):
             continue
 
-        text_parts, tool_calls, thinking_parts, tool_results = [], [], [], []
+        text_parts, tool_calls, thinking_parts, tool_results, image_parts = [], [], [], [], []
         last_cache_control = None
 
         for block in content:
@@ -382,6 +382,26 @@ def anthropic_to_openai(body: dict, model: str, raw: bytes | None = None) -> dic
                 # vers les autres upstreams (non déchiffrable, non interprétable)
                 _debug("  [convert] DROP redacted_thinking → upstream non-Anthropic")
                 continue
+            elif btype == "image":
+                src = block.get("source", {})
+                if not isinstance(src, dict):
+                    continue
+                stype = src.get("type", "")
+                if stype == "base64":
+                    media_type = src.get("media_type", "image/png")
+                    data = src.get("data", "")
+                    if not data:
+                        continue
+                    url = f"data:{media_type};base64,{data}"
+                elif stype == "url":
+                    url = src.get("url", "")
+                    if not url:
+                        continue
+                else:
+                    # type "file" ou inconnu → pas de fidélité OpenAI, on log et on skip
+                    _debug(f"  [convert] DROP image source type={stype!r} → no OpenAI fidelity")
+                    continue
+                image_parts.append({"type": "image_url", "image_url": {"url": url}})
             elif btype == "tool_use":
                 _tool_name = block.get("name", "")
                 if not isinstance(_tool_name, str) or not _tool_name.strip():
@@ -419,9 +439,44 @@ def anthropic_to_openai(body: dict, model: str, raw: bytes | None = None) -> dic
         # Emit tool_result messages first (must immediately follow assistant's tool_calls)
         messages.extend(tool_results)
 
-        # Then emit the main message (text + tool_calls + thinking)
+        # Then emit the main message (text + tool_calls + thinking + images)
         joined_thinking = "\n".join(thinking_parts) if thinking_parts else ""
-        if tool_calls:
+
+        # Si images présentes → content en liste mixte OpenAI (text + image_url)
+        if image_parts:
+            content_list: list[dict] = []
+            joined_text = "\n".join(text_parts) if text_parts else ""
+            if joined_text:
+                content_list.append({"type": "text", "text": joined_text})
+            content_list.extend(image_parts)
+            if tool_calls:
+                out = {
+                    "role": role,
+                    "content": content_list,
+                    "tool_calls": tool_calls,
+                }
+                if joined_thinking:
+                    out["reasoning_content"] = joined_thinking
+                elif thinking and is_asst:
+                    out["reasoning_content"] = " "
+                if last_cache_control and not is_asst:
+                    out["cache_control"] = last_cache_control
+                messages.append(out)
+            elif content_list or thinking_parts or (thinking and is_asst):
+                # Pas de tool_calls mais images (+ éventuellement texte)
+                if len(content_list) == 1 and content_list[0].get("type") == "text":
+                    # Seul du texte → garder le format string simple (compat)
+                    out = {"role": role, "content": content_list[0]["text"]}
+                else:
+                    out = {"role": role, "content": content_list}
+                if joined_thinking:
+                    out["reasoning_content"] = joined_thinking
+                elif thinking and is_asst:
+                    out["reasoning_content"] = " "
+                if last_cache_control and not is_asst and supports_cache_control:
+                    out["cache_control"] = last_cache_control
+                messages.append(out)
+        elif tool_calls:
             out = {
                 "role": role,
                 "content": "\n".join(text_parts) if text_parts else "",
@@ -866,6 +921,31 @@ def openai_to_anthropic_request(oai_body: dict) -> dict:
                 t = block.get("type", "")
                 if t == "text":
                     blocks.append({"type": "text", "text": block.get("text", "")})
+                elif t == "image_url":
+                    url_obj = block.get("image_url", {})
+                    url = url_obj.get("url", "") if isinstance(url_obj, dict) else ""
+                    if not url:
+                        continue
+                    if url.startswith("data:"):
+                        try:
+                            header, b64 = url.split(",", 1)
+                            media_type = header.split(";")[0].split(":")[1] if ";" in header else "image/png"
+                            if not media_type:
+                                media_type = "image/png"
+                        except ValueError:
+                            media_type = "image/png"
+                            b64 = ""
+                        if not b64:
+                            continue
+                        blocks.append({
+                            "type": "image",
+                            "source": {"type": "base64", "media_type": media_type, "data": b64},
+                        })
+                    else:
+                        blocks.append({
+                            "type": "image",
+                            "source": {"type": "url", "url": url},
+                        })
 
         # Convert tool_calls (assistant only)
         for tc in msg.get("tool_calls") or []:

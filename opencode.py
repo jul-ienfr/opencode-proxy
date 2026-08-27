@@ -10375,6 +10375,7 @@ async def chat_completions(request: Request):
 
                         # [P4] état SSE Responses-API PAR stream
                         _resp_state = ResponsesSseState()
+                        _chunk_already_yielded = False
                         async for line in resp.aiter_lines():
                             if not line.startswith("data:"):
                                 continue
@@ -10412,6 +10413,7 @@ async def chat_completions(request: Request):
                                         actual_usage = chunk.get("usage") or actual_usage
                                         break
                                     _oai_has_yielded = True
+                                    _chunk_already_yielded = True
                                     yield f"data: {_json_dumps_str(chunk, ensure_ascii=False)}\n\n".encode()
                                     # reasoning_content / content compté plus bas via choices
                                     choices = chunk.get("choices", [])
@@ -10469,8 +10471,10 @@ async def chat_completions(request: Request):
                                 )
                                 if _fr is not None:
                                     emitted_finish = True
-                            _oai_has_yielded = True
-                            yield line.encode() + b"\n\n"
+                            if not _chunk_already_yielded:
+                                _oai_has_yielded = True
+                                yield line.encode() + b"\n\n"
+                            _chunk_already_yielded = False
 
                         # Fix: synthesize finish_reason if truncated (EOF without finish_reason)
                         if not emitted_finish:
