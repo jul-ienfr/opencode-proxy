@@ -823,6 +823,7 @@ def _persist_vpn_config(updates: dict):
                 "ovpn_protocol": "ovpn_protocol",
                 "ovpn_endpoint_port": "ovpn_endpoint_port",
                 "auto_hetero_boot": "auto_hetero_boot",
+                "on_429_action": "on_429_action",
             }
 
         # [free_parallel] nested dict (B) Stations free — validate + merge (preserve existing keys)

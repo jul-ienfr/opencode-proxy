@@ -109,6 +109,7 @@ class FreeIPPool:
 
     _CONNECT_RETRY_INTERVAL = 300  # min seconds between docker reconnect attempts when down
     _BAD_TTL = 60  # seconds a 429 keeps a station out of rotation before it can be retried
+    _on_429_action = "both"  # class fallback for object.__new__ hermetic pools ("cooldown"|"rotate"|"both")
     # [Axe 1.1] Rotation concurrency: how many stations may rotate at the
     # same time. Bounded — a single blocked rotation (budget up to
     # rotation_wait_timeout, plus docker ops) must not freeze the fleet.
@@ -143,6 +144,7 @@ class FreeIPPool:
         # update_config() (config.yaml `ip_rotation`, hot-reloadable).
         self._connect_retry_interval = float(self._CONNECT_RETRY_INTERVAL)
         self._bad_ttl = float(self._BAD_TTL)
+        self._on_429_action = "both"
         # [plan v10 §3.6 Lot 3] Moteur de rotation latence-adaptive — partagé
         # (singleton), config canonique `ip_rotation.latency_rotation`.
         try:
@@ -1012,26 +1014,30 @@ class FreeIPPool:
 
         No-op when VPN is disabled or in direct mode.
         """
+        action = str(getattr(self, "_on_429_action", "both") or "both").strip().lower()
+        if action not in ("cooldown", "rotate", "both"):
+            action = "both"
         if not self._vpn.enabled:
             return
         if self._vpn.proxy_mode == "socks5":
             # [Axe 3.1] Static list, NO docker: bad-mark the current proxy
-            # (C1-guarded by _socks5_any_other) and let the next request
-            # skip to another one. No _launch_rotation — the rotation
-            # machinery is inert in socks5 mode.
+            # (C1-guarded) only for cooldown/both; rotate alone is no-op.
             ep = station if isinstance(station, Socks5Endpoint) else self._socks5_current
             if ep is None:
                 return
-            if self._socks5_any_other(ep):
-                self._per_station(ep)["bad_until"] = time.monotonic() + self._bad_ttl
+            if action in ("cooldown", "both"):
+                if self._socks5_any_other(ep):
+                    self._per_station(ep)["bad_until"] = time.monotonic() + self._bad_ttl
             return
         if self._vpn.proxy_mode != "vpn":
             return
         station = station or self._active_station or self._vpn
-        if self.dual_station:
-            if self._any_other_usable(station):
-                self._per_station(station)["bad_until"] = time.monotonic() + self._bad_ttl
-        self._launch_rotation(station, forced_pool=forced_pool)
+        if action in ("cooldown", "both"):
+            if self.dual_station:
+                if self._any_other_usable(station):
+                    self._per_station(station)["bad_until"] = time.monotonic() + self._bad_ttl
+        if action in ("rotate", "both"):
+            self._launch_rotation(station, forced_pool=forced_pool)
 
     async def on_disconnect_retry(
         self, failed: VPNManager | None = None, forced_pool=None
@@ -1567,6 +1573,10 @@ class FreeIPPool:
             return
         if "connect_retry_interval" in cfg:
             self._connect_retry_interval = max(5.0, float(cfg["connect_retry_interval"] or 0))
+        if "on_429_action" in cfg:
+            _val = str(cfg["on_429_action"] or "both").strip().lower()
+            if _val in ("cooldown", "rotate", "both"):
+                self._on_429_action = _val
         if "bad_ttl" in cfg:
             self._bad_ttl = max(0.0, float(cfg["bad_ttl"] or 0))
         if "rotation_stagger" in cfg:
@@ -1830,6 +1840,7 @@ class FreeIPPool:
             # Timings/hot-reload state (dashboard panel + tests)
             "connect_retry_interval": self._connect_retry_interval,
             "bad_ttl": self._bad_ttl,
+            "on_429_action": str(getattr(self, "_on_429_action", "both") or "both"),
             "rotation_stagger": self._rotation_stagger,
             "rotation_concurrency": self._ROTATION_CONCURRENCY,
             "rotate_pending": sorted(self._pending),

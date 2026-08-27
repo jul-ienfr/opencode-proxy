@@ -231,6 +231,7 @@ ip_rotation:
   station_count: 4
   status_cache_seconds: 2.0
   strict_free: true
+  on_429_action: both
   switch_delay: 1
   update_apply_idle_minutes: 15
   update_apply_max_defer_hours: 24

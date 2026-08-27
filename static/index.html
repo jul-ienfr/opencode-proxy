@@ -419,6 +419,14 @@
                                 </select>
                             </div>
                             <div style="display:flex;align-items:center;gap:8px;margin-top:10px">
+                                <span class="label" style="font-size:12px">Action sur 429</span>
+                                <select id="vpn-on-429-action" class="config-input" style="width:220px;font-size:12px" onchange="vpnSaveOn429Action()">
+                                    <option value="both">Cooldown + Rotation (défaut)</option>
+                                    <option value="cooldown">Cooldown seulement</option>
+                                    <option value="rotate">Rotation seulement</option>
+                                </select>
+                            </div>
+                            <div style="display:flex;align-items:center;gap:8px;margin-top:10px">
                                 <span class="label" style="font-size:12px">Essais gratuits / requête</span>
                                 <select id="vpn-free-attempts" class="config-input" style="width:70px;font-size:12px" onchange="vpnSaveMaxFreeAttempts()">
                                     <option value="1">1</option>

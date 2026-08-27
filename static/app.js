@@ -3210,6 +3210,8 @@ document.addEventListener('DOMContentLoaded', () => {
             }
             const exhaustMode = document.getElementById('vpn-exhaust-mode');
             if (exhaustMode) exhaustMode.value = cfgData.strict_free ? 'strict' : 'fallback';
+            const on429Action = document.getElementById('vpn-on-429-action');
+            if (on429Action) on429Action.value = cfgData.on_429_action || 'both';
 
             // [plan 19/08 §1/§2] free multi-attempt cap (1-3) + exception
             // ordering (station-first / direct) — read from config.
@@ -3920,6 +3922,14 @@ document.addEventListener('DOMContentLoaded', () => {
         await fetchWithToken('/api/vpn-config', {
             method: 'POST', headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({strict_free: strict})
+        });
+        refreshVPNStatus();
+    };
+    window.vpnSaveOn429Action = async function() {
+        const action = document.getElementById('vpn-on-429-action').value;
+        await fetchWithToken('/api/vpn-config', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({on_429_action: action})
         });
         refreshVPNStatus();
     };
