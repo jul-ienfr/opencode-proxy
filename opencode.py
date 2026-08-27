@@ -10146,13 +10146,13 @@ async def chat_completions(request: Request):
                 _debug(f"  ✗ non-JSON response from {endpoint}")
                 _log(f"  UPSTREAM DECODE ERROR: non-JSON response from {endpoint}")
                 return _openai_error(502, "Upstream returned non-JSON response")
-            # V5.1 : déplie enveloppe response.created si /responses renvoie SSE en JSON (best-practice)
-            if "/responses" in endpoint:
-                data = _unwrap_responses_envelope(data)
-                if data.get("status") in ("queued", "in_progress"):
-                    _debug(f"  [unwrap] status={data.get('status')} → poll once")
-                    _log(f"  Responses status {data.get('status')} (non-stream) → 503 retryable")
-                    return _openai_error(503, f"Upstream {data.get('status')}, retry")
+            # V5.1 : déplie enveloppe response.created même si endpoint pas /responses (best-practice, inconditionnel)
+            data = _unwrap_responses_envelope(data)
+            if data.get("status") in ("queued", "in_progress"):
+                _debug(f"  [unwrap] status={data.get('status')} (non-stream) → 503 retryable")
+                _log(f"  Responses status {data.get('status')} (non-stream) → 503 retryable")
+                return _openai_error(503, f"Upstream {data.get('status')}, retry")
+            if "output" in data and "choices" not in data:
                 # Convertit Responses → Chat Completions pour le client
                 try:
                     chat_resp = _responses_to_chat_response(data, original_model)
