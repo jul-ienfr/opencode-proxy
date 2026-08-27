@@ -824,6 +824,7 @@ def _persist_vpn_config(updates: dict):
                 "ovpn_endpoint_port": "ovpn_endpoint_port",
                 "auto_hetero_boot": "auto_hetero_boot",
                 "on_429_action": "on_429_action",
+                "bad_ttl": "bad_ttl",
             }
 
         # [free_parallel] nested dict (B) Stations free — validate + merge (preserve existing keys)
@@ -3138,6 +3139,30 @@ def register_dashboard(
             if str(body["free_exception_fallback"]) not in ("station-first", "direct"):
                 return {"error": "free_exception_fallback doit être 'station-first' ou 'direct'"}
             body["free_exception_fallback"] = str(body["free_exception_fallback"])
+        # Action sur 429 — validate, then let it flow to _persist + pool
+        if "on_429_action" in body:
+            _v = str(body["on_429_action"] or "").strip().lower()
+            if _v not in ("cooldown", "rotate", "both"):
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": "on_429_action doit être 'cooldown', 'rotate' ou 'both'"},
+                )
+            body["on_429_action"] = _v
+        # bad_ttl — conditional cooldown duration for both/cooldown, 1..3600s
+        if "bad_ttl" in body or "cooldown_sec" in body or "badTtl" in body:
+            _raw_bt = body.pop("bad_ttl", body.pop("cooldown_sec", body.pop("badTtl", None)))
+            try:
+                _bt = int(float(_raw_bt))
+            except (TypeError, ValueError):
+                return JSONResponse(
+                    status_code=400, content={"error": "bad_ttl doit être un entier entre 1 et 3600"}
+                )
+            if not (1 <= _bt <= 3600):
+                return JSONResponse(
+                    status_code=400, content={"error": "bad_ttl doit être un entier entre 1 et 3600"}
+                )
+            body["bad_ttl"] = _bt
+
         # [free_parallel] validate nested + flat keys
         if "free_parallel" in body:
             if not isinstance(body["free_parallel"], dict):

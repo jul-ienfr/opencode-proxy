@@ -2339,6 +2339,14 @@ class VPNManager:
             _free_parallel = _cfg_data.get("ip_rotation", {}).get("free_parallel", {})
             if not isinstance(_free_parallel, dict):
                 _free_parallel = {}
+            _on_429_action = str(_cfg_data.get("ip_rotation", {}).get("on_429_action", "both") or "both").strip().lower()
+            if _on_429_action not in ("cooldown", "rotate", "both"):
+                _on_429_action = "both"
+            try:
+                _bad_ttl = int(_cfg_data.get("ip_rotation", {}).get("bad_ttl", 60))
+            except Exception:
+                _bad_ttl = 60
+            _bad_ttl = max(1, min(3600, _bad_ttl))
         except Exception:
             _dual = _strict = False
             _vpn_stack = "auto"
@@ -2346,6 +2354,8 @@ class VPNManager:
             _free_attempts = 2
             _exc_fallback = "station-first"
             _free_parallel = {}
+            _on_429_action = "both"
+            _bad_ttl = 60
         return {
             "enabled": self._enabled,
             "proxy_mode": self._proxy_mode,
@@ -2416,6 +2426,8 @@ class VPNManager:
             "free_exception_fallback": _exc_fallback,
             # [free_parallel] Stations free parallel routing (persisted)
             "free_parallel": _free_parallel,
+            "on_429_action": _on_429_action,
+            "bad_ttl": _bad_ttl,
         }
 
     async def update_config(self, updates: dict) -> dict:

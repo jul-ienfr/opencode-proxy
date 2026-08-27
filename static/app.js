@@ -754,6 +754,10 @@ let availableModels = [];
 // [fix] Flags anti-écrasement (global, utilisés par renderConfig et refreshVPNStatus)
 let _vpnStationPending = null;
 let _vpnSaving = false;
+let _vpnOn429Pending = null;
+let _vpnOn429Saving = false;
+let _vpnCooldownSaving = false;
+let _vpnCooldownPending = null;
 let _crSaving = false;
 let _crDirty = false;
 
@@ -3211,7 +3215,44 @@ document.addEventListener('DOMContentLoaded', () => {
             const exhaustMode = document.getElementById('vpn-exhaust-mode');
             if (exhaustMode) exhaustMode.value = cfgData.strict_free ? 'strict' : 'fallback';
             const on429Action = document.getElementById('vpn-on-429-action');
-            if (on429Action) on429Action.value = cfgData.on_429_action || 'both';
+            if (on429Action) {
+                const persisted429 = String(cfgData.on_429_action || 'both');
+                const isFocused429 = document.activeElement === on429Action;
+                const isSaving429 = typeof _vpnOn429Saving !== 'undefined' && _vpnOn429Saving;
+                const hasPending429 = typeof _vpnOn429Pending !== 'undefined' && _vpnOn429Pending !== null;
+                if (!on429Action._vpn429ListenerAttached) {
+                    on429Action.addEventListener('change', () => {
+                        _vpnOn429Pending = on429Action.value;
+                        const row = document.getElementById('vpn-cooldown-row');
+                        if (row) row.style.display = (on429Action.value === 'both' ? 'flex' : 'none');
+                    });
+                    on429Action._vpn429ListenerAttached = true;
+                }
+                if (isFocused429 || isSaving429) {
+                    // interaction en cours — ne pas écraser
+                } else if (hasPending429 && _vpnOn429Pending !== persisted429) {
+                    on429Action.value = _vpnOn429Pending;
+                } else {
+                    on429Action.value = persisted429;
+                    if (hasPending429 && _vpnOn429Pending === persisted429) _vpnOn429Pending = null;
+                }
+                const cooldownRow = document.getElementById('vpn-cooldown-row');
+                if (cooldownRow && !isFocused429) cooldownRow.style.display = (on429Action.value === 'both' ? 'flex' : 'none');
+                const cooldownInput = document.getElementById('vpn-cooldown-sec');
+                if (cooldownInput && cfgData.bad_ttl !== undefined && cfgData.bad_ttl !== null) {
+                    const isFocusedCd = document.activeElement === cooldownInput;
+                    const isSavingCd = typeof _vpnCooldownSaving !== 'undefined' && _vpnCooldownSaving;
+                    const hasPendingCd = typeof _vpnCooldownPending !== 'undefined' && _vpnCooldownPending !== null;
+                    const persistedCd = String(cfgData.bad_ttl);
+                    if (isFocusedCd || isSavingCd) {
+                    } else if (hasPendingCd && String(_vpnCooldownPending) !== persistedCd) {
+                        cooldownInput.value = String(_vpnCooldownPending);
+                    } else {
+                        cooldownInput.value = persistedCd;
+                        if (hasPendingCd && String(_vpnCooldownPending) === persistedCd) _vpnCooldownPending = null;
+                    }
+                }
+            }
 
             // [plan 19/08 §1/§2] free multi-attempt cap (1-3) + exception
             // ordering (station-first / direct) — read from config.
@@ -3926,12 +3967,54 @@ document.addEventListener('DOMContentLoaded', () => {
         refreshVPNStatus();
     };
     window.vpnSaveOn429Action = async function() {
-        const action = document.getElementById('vpn-on-429-action').value;
-        await fetchWithToken('/api/vpn-config', {
-            method: 'POST', headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({on_429_action: action})
-        });
-        refreshVPNStatus();
+        const el = document.getElementById('vpn-on-429-action');
+        const action = el ? el.value : 'both';
+        const row = document.getElementById('vpn-cooldown-row');
+        if (row) row.style.display = (action === 'both' ? 'flex' : 'none');
+        if (typeof _vpnOn429Saving !== 'undefined' && _vpnOn429Saving) return;
+        _vpnOn429Saving = true;
+        _vpnOn429Pending = action;
+        try {
+            const resp = await fetchWithToken('/api/vpn-config', {
+                method: 'POST', headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({on_429_action: action})
+            });
+            const data = await resp.json().catch(()=>({}));
+            if (!resp.ok || data.error) throw new Error(data.error || `HTTP ${resp.status}`);
+            const persisted = data.config ? String(data.config.on_429_action || action) : action;
+            if (el) el.value = persisted;
+            if (persisted === action) _vpnOn429Pending = null;
+        } catch (e) {
+            alert('Erreur: ' + (e.message || e));
+        } finally {
+            _vpnOn429Saving = false;
+            try { await refreshVPNStatus(); } catch(e2) {}
+        }
+    };
+    window.vpnSaveCooldown = async function() {
+        const input = document.getElementById('vpn-cooldown-sec');
+        const n = input ? parseInt(input.value, 10) : NaN;
+        if (!n || n < 1 || n > 3600) { alert('Cooldown doit être entre 1 et 3600 secondes'); return; }
+        if (typeof _vpnCooldownSaving !== 'undefined' && _vpnCooldownSaving) return;
+        _vpnCooldownSaving = true;
+        _vpnCooldownPending = String(n);
+        try {
+            const resp = await fetchWithToken('/api/vpn-config', {
+                method: 'POST', headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({bad_ttl: n})
+            });
+            const data = await resp.json().catch(()=>({}));
+            if (!resp.ok || data.error) throw new Error(data.error || `HTTP ${resp.status}`);
+            const persisted = data.config ? String(data.config.bad_ttl || n) : String(n);
+            if (input) input.value = persisted;
+            if (persisted === String(n)) _vpnCooldownPending = null;
+        } catch (e) {
+            alert('Erreur: ' + (e.message || e));
+            _vpnCooldownPending = null;
+        } finally {
+            _vpnCooldownSaving = false;
+            try { await refreshVPNStatus(); } catch(e2) {}
+        }
     };
 
     // [plan 19/08 §1] free multi-attempt cap (1-3) — persisted + hot-reload

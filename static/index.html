@@ -426,6 +426,12 @@
                                     <option value="rotate">Rotation seulement</option>
                                 </select>
                             </div>
+                            <div id="vpn-cooldown-row" style="display:none;align-items:center;gap:8px;margin-top:10px">
+                                <span class="label" style="font-size:12px">Cooldown (s)</span>
+                                <input id="vpn-cooldown-sec" class="config-input" type="number" min="1" max="3600" step="1" style="width:90px;font-size:12px" placeholder="60" onchange="vpnSaveCooldown()" onkeydown="if(event.key==='Enter')vpnSaveCooldown()">
+                                <button class="btn" style="font-size:12px;padding:4px 10px" onclick="vpnSaveCooldown()">Appliquer</button>
+                                <span style="font-size:11px;color:var(--text-muted)">Visible seulement en Cooldown + Rotation</span>
+                            </div>
                             <div style="display:flex;align-items:center;gap:8px;margin-top:10px">
                                 <span class="label" style="font-size:12px">Essais gratuits / requête</span>
                                 <select id="vpn-free-attempts" class="config-input" style="width:70px;font-size:12px" onchange="vpnSaveMaxFreeAttempts()">

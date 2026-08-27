@@ -1578,7 +1578,12 @@ class FreeIPPool:
             if _val in ("cooldown", "rotate", "both"):
                 self._on_429_action = _val
         if "bad_ttl" in cfg:
-            self._bad_ttl = max(0.0, float(cfg["bad_ttl"] or 0))
+            try:
+                _bt = int(float(cfg["bad_ttl"] if cfg["bad_ttl"] is not None else 60))
+            except (TypeError, ValueError):
+                _bt = None  # invalid → ignore (keep current)
+            if _bt is not None:
+                self._bad_ttl = float(max(1, min(3600, _bt)))
         if "rotation_stagger" in cfg:
             self._rotation_stagger = max(0, int(cfg["rotation_stagger"] or 0))
         if "rotation_wait_timeout" in cfg:
