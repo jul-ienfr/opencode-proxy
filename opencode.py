@@ -5633,6 +5633,13 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
                     )
                     resp = None
                     continue
+                # V4 100% : 403/400 DataPolicyError → retry station fraîche sans pause_key (body déjà corrigé)
+                if _is_retriable_datapolicy(resp) and _free_used < free_max:
+                    _debug(f"  [datapolicy] {resp.status_code} DataPolicyError on station {attempt._station} → retry fraîche")
+                    _log(f"  FREE {free_model!r} DataPolicyError (403/400) on station {attempt._station} → retry station fraîche (essai {_free_used + 1}/{free_max})")
+                    _log_free_model_usage(model_id, free_model, free_api_key, free_workspace, resp.status_code, 0, 0, _free_elapsed, ip=free_ip)
+                    resp = None
+                    continue
                 break  # 200, final-429 or other status → shared handling below
             except Exception as e:
                 _debug(f"  [free] curl_cffi error (station {attempt._station}): {e}")
@@ -5888,6 +5895,18 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
     return None
 
 
+def _is_retriable_datapolicy(resp) -> bool:
+    """V4 100% : 403/400 DataPolicyError / illegal invocation → retriable, sans pause_key."""
+    try:
+        code = getattr(resp, "status_code", 0)
+        if code not in (403, 400):
+            return False
+        txt = (getattr(resp, "text", "") or "")[:2000].lower()
+        return "datapolicy" in txt or "illegal invocation" in txt
+    except Exception:
+        return False
+
+
 async def _do_request_with_retry(endpoint, body, headers, protocol, retry_on_429=True):
     """POST request with automatic 429/401 key failover and 5xx retry with backoff.
 
@@ -5981,19 +6000,36 @@ async def _do_request_with_retry(endpoint, body, headers, protocol, retry_on_429
         # 403 = region/model blocked for the key (e.g. RegionError). Pause the
         # key and try another account before surfacing anything to the client.
         if retry_on_429 and resp.status_code == 403 and len(API_KEYS) > 1:
-            failed_key = _key_from_headers(headers, protocol)
-            try:
-                _err_body = resp.text[:500] if hasattr(resp, "text") else str(resp.content[:500])
-            except Exception:
-                _err_body = "(unable to read response body)"
-            _debug(f"  [auth] 403 response body: {_redact(_err_body, 500)}")
-            _key_pauser.pause_key(failed_key, 1800, "403 Forbidden (region/model not allowed)")
-            alt = _find_alternative_key(failed_key)
-            if alt:
-                _debug(f"  ⟳ 403 failover: {failed_key[:8]}… → alias={alt.get('alias', '?')}")
-                _log("  403 on key, retrying with alternative key")
-                headers = _get_auth_headers(protocol, entry=alt)
-                continue  # retry immediately without incrementing attempt
+            # V4 : DataPolicyError ne doit pas pauser la clé — c'est un body policy hit
+            if _is_retriable_datapolicy(resp):
+                _debug(f"  [datapolicy] 403 DataPolicyError → retry same-key 1x (attempt {attempt + 1})")
+                _log("  403 DataPolicyError → retry same-key (body déjà corrigé par Patch A)")
+                await asyncio.sleep(1.0)
+                attempt += 1
+                if attempt < max_retries:
+                    continue
+            else:
+                failed_key = _key_from_headers(headers, protocol)
+                try:
+                    _err_body = resp.text[:500] if hasattr(resp, "text") else str(resp.content[:500])
+                except Exception:
+                    _err_body = "(unable to read response body)"
+                _debug(f"  [auth] 403 response body: {_redact(_err_body, 500)}")
+                _key_pauser.pause_key(failed_key, 1800, "403 Forbidden (region/model not allowed)")
+                alt = _find_alternative_key(failed_key)
+                if alt:
+                    _debug(f"  ⟳ 403 failover: {failed_key[:8]}… → alias={alt.get('alias', '?')}")
+                    _log("  403 on key, retrying with alternative key")
+                    headers = _get_auth_headers(protocol, entry=alt)
+                    continue  # retry immediately without incrementing attempt
+
+        # V4 : DataPolicyError même avec 1 seule clé (403/400) → 1 retry same-key sans pause
+        if _is_retriable_datapolicy(resp) and attempt < max_retries - 1:
+            _debug(f"  [datapolicy] {resp.status_code} DataPolicyError → retry same-key 1x (attempt {attempt + 1})")
+            _log(f"  {resp.status_code} DataPolicyError → retry same-key")
+            await asyncio.sleep(1.0)
+            attempt += 1
+            continue
 
         # Retry on 502/503/504 with backoff — DOES consume a retry attempt
         if resp.status_code in _RETRYABLE_STATUSES and attempt < max_retries - 1:
@@ -10232,6 +10268,16 @@ async def chat_completions(request: Request):
                                             )
                                             return
                                         continue
+                                # V4 100% : DataPolicyError → retry station fraîche sans pause_key
+                                if _is_retriable_datapolicy(resp) and _attempt + 1 < effective_free_max_attempts(_free_forced_pool):
+                                    if _oai_has_yielded or stream_out > 0:
+                                        _cb_record_failure(endpoint)
+                                        _log(f"  stream_retry_suppressed_after_started attempt={_attempt + 1}")
+                                        yield (b"data: " + _json_dumps_str({"error": {"message": "stream interrupted"}}, ensure_ascii=False).encode() + b"\n\ndata: [DONE]\n\n")
+                                        return
+                                    _log(f"  FREE {free_model!r} DataPolicyError ({resp.status_code}) → retry station fraîche (essai {_attempt + 2}/{effective_free_max_attempts(_free_forced_pool)})")
+                                    _log_free_model_usage(model_id, free_model, "free (no auth)", "free (no auth)", resp.status_code, ip=_free_usage_ip())
+                                    continue
                                 else:
                                     _set_free_cooldown(free_model, 60, _free_attempt_station())
                                     _refuse = False
@@ -11030,6 +11076,17 @@ async def chat_completions(request: Request):
                                         yield b"data: [DONE]\n\n"
                                         return
                                     continue
+                            # V4 100% : DataPolicyError → retry station fraîche sans pause_key
+                            if _is_retriable_datapolicy(resp) and _attempt + 1 < effective_free_max_attempts(_free_forced_pool):
+                                if _stream_has_yielded(started, open_blocks, stream_out, _line_buf):
+                                    _cb_record_failure(endpoint)
+                                    _log(f"  stream_retry_suppressed_after_started attempt={_attempt + 1}")
+                                    yield _chunk({}, "stop")
+                                    yield b"data: [DONE]\n\n"
+                                    return
+                                _log(f"  FREE {free_model!r} DataPolicyError ({resp.status_code}) → retry station fraîche (essai {_attempt + 2}/{effective_free_max_attempts(_free_forced_pool)})")
+                                _log_free_model_usage(model_id, free_model, "free (no auth)", "free (no auth)", resp.status_code, ip=_free_usage_ip())
+                                continue
                             else:
                                 _set_free_cooldown(free_model, 60, _free_attempt_station())
                                 _refuse = False

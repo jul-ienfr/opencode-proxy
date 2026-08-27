@@ -290,9 +290,11 @@ class TestAnthropicToOpenAI:
         tool = result["tools"][0]
         assert tool["type"] == "function"
         assert tool["function"]["name"] == "get_weather"
+        # V4 100% : additionalProperties:false forcé pour profil strict (default)
         assert tool["function"]["parameters"] == {
             "type": "object",
             "properties": {"city": {"type": "string"}},
+            "additionalProperties": False,
         }
         assert result["tool_choice"] == "required"
 

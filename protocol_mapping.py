@@ -429,6 +429,50 @@ def _normalize_tool_schema(schema: dict, model: str = "") -> dict:
             for k in ("if", "then", "else"):
                 if k in node and isinstance(node[k], dict):
                     node.pop(k)
+        # ── Traitements 10-17 : contrat strict muse/spark → 100% ──
+        _is_strict = prof["strip_additional_props"]
+        # 10. Force root type:"object" si absent
+        if _is_strict and "type" not in node and depth == 0:
+            node["type"] = "object"
+        # 11. Ensure each properties[k] a un type explicite (sinon string)
+        if _is_strict and node.get("type") == "object" and "properties" in node:
+            for pk, pv in list(node["properties"].items()):
+                if isinstance(pv, dict) and "type" not in pv and "anyOf" not in pv and "oneOf" not in pv and "$ref" not in pv:
+                    pv["type"] = "string"
+        # 12. Enforce required ⊆ properties
+        if "required" in node and isinstance(node["required"], list) and "properties" in node:
+            props = set(node["properties"].keys()) if isinstance(node["properties"], dict) else set()
+            node["required"] = [r for r in node["required"] if r in props]
+            if not node["required"]:
+                node.pop("required")
+        # 13. Strip marker invalide "@schema_version: invalid json schema"
+        if "@schema_version" in node:
+            node.pop("@schema_version")
+        # 14. Enforce additionalProperties:false sur tout object (root + nested)
+        if _is_strict and node.get("type") == "object":
+            node["additionalProperties"] = False
+        # 15. Strip anyOf/oneOf résiduels pour strict (seul anyOf null géré en 9)
+        if _is_strict:
+            for key in ("anyOf", "oneOf"):
+                if key in node and isinstance(node[key], list):
+                    lst = node[key]
+                    if lst and isinstance(lst[0], dict) and lst[0].get("type"):
+                        first = copy.deepcopy(lst[0])
+                        for sk, sv in list(node.items()):
+                            if sk not in (key, "type") and sk not in first:
+                                first[sk] = sv
+                        node.clear()
+                        node.update(_norm(first, depth, defs))
+                        return node
+                    node.pop(key, None)
+        # 16. Strip keywords non supportés en strict
+        if _is_strict:
+            for k in ("$schema", "$id", "title", "const", "examples", "example", "exclusiveMaximum", "exclusiveMinimum"):
+                node.pop(k, None)
+        # 17. Si array avec items sans type, forcer items.type
+        if _is_strict and node.get("type") == "array" and "items" in node and isinstance(node["items"], dict) and "type" not in node["items"]:
+            if not any(k in node["items"] for k in ("anyOf", "oneOf", "$ref")):
+                node["items"]["type"] = "string"
         defs_local: dict = {}
         if "$defs" in node and isinstance(node["$defs"], dict):
             defs_local.update(node["$defs"])
@@ -1699,19 +1743,23 @@ def _chat_to_responses_request(chat: dict) -> dict:
         req["reasoning"] = chat["reasoning"]
     if "tools" in chat:
         model = chat.get("model", "")
+        prof = _resolve_schema_profile(model)
+        _is_strict = prof["strip_additional_props"]
         tools = []
         for t in chat["tools"]:
             if isinstance(t, dict) and "function" in t:
                 fn = t["function"]
                 params = _normalize_tool_schema(fn.get("parameters", {}) or {}, model)
-                tools.append(
-                    {
-                        "type": "function",
-                        "name": fn.get("name", ""),
-                        "description": fn.get("description", ""),
-                        "parameters": params,
-                    }
-                )
+                tool_entry: dict = {
+                    "type": "function",
+                    "name": fn.get("name", ""),
+                    "description": fn.get("description", ""),
+                    "parameters": params,
+                }
+                # 100% : explicit non-strict bypass strict-attempt non déterministe
+                if _is_strict:
+                    tool_entry["strict"] = False
+                tools.append(tool_entry)
         if tools:
             req["tools"] = tools
         tc = chat.get("tool_choice")
