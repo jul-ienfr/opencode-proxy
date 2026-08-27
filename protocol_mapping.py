@@ -3,6 +3,7 @@ Protocol mapping: Anthropic <-> OpenAI <-> Responses
 Extracted from opencode.py (P3.10) - pure move, no behavior change.
 """
 
+import copy
 import hashlib
 import json
 import re
@@ -310,6 +311,154 @@ def _strip_billing_header(text: str) -> str:
     return rest
 
 
+# ── Tool schema normalization (proud-beaver V3) ──────────────────
+_SCHEMA_PROFILES: dict[str, dict] = {
+    "muse": {"strip_additional_props": True, "strip_format": True, "max_description_len": 1024, "max_nesting": 8},
+    "spark": {"strip_additional_props": True, "strip_format": True, "max_description_len": 1024, "max_nesting": 8},
+    "deepseek": {"strip_additional_props": True, "strip_format": True, "max_description_len": 1024, "max_nesting": 8},
+    "glm": {"strip_additional_props": True, "strip_format": True, "max_description_len": 1024, "max_nesting": 8},
+    "mimo": {"strip_additional_props": True, "strip_format": True, "max_description_len": 1024, "max_nesting": 8},
+    "hy": {"strip_additional_props": True, "strip_format": True, "max_description_len": 1024, "max_nesting": 8},
+    "minimax": {"strip_additional_props": False, "strip_format": False, "max_description_len": 2048, "max_nesting": 12},
+    "qwen": {"strip_additional_props": False, "strip_format": False, "max_description_len": 2048, "max_nesting": 12},
+    "_default": {"strip_additional_props": True, "strip_format": True, "max_description_len": 1024, "max_nesting": 8},
+}
+
+
+def _resolve_schema_profile(model: str) -> dict:
+    """Résout le profil — même logique que config/settings.py:807 _resolve_protocol."""
+    if not isinstance(model, str) or not model:
+        return _SCHEMA_PROFILES["_default"]
+    low = model.lower()
+    if "spark" in low:
+        return _SCHEMA_PROFILES["spark"]
+    if low.startswith("muse"):
+        return _SCHEMA_PROFILES["muse"]
+    prefix = low.split("-")[0].split(".")[0]
+    prefix = re.sub(r"\d+$", "", prefix)
+    return _SCHEMA_PROFILES.get(prefix, _SCHEMA_PROFILES["_default"])
+
+
+def _normalize_tool_schema(schema: dict, model: str = "") -> dict:
+    """Normalise un JSON Schema tool pour compatibilité multi-modèles.
+
+    Copy-on-write : l'input n'est jamais muté (deepcopy).
+    Idempotent : _normalize(_normalize(x)) == _normalize(x).
+    Récursif avec guard profondeur = profil max_nesting + 10 pour $ref circulaire.
+    """
+    if not isinstance(schema, dict):
+        return {}
+    if not schema:
+        return {}
+    prof = _resolve_schema_profile(model)
+    out = copy.deepcopy(schema)
+
+    def _norm(node, depth: int, defs: dict):
+        if depth > prof["max_nesting"]:
+            _debug(f"  [schema] flatten depth>{prof['max_nesting']} model={model!r}")
+            return {"type": "object"}
+        if depth > 20:
+            return {"type": "object"}
+        if not isinstance(node, dict):
+            return node
+        if "$ref" in node:
+            ref = node["$ref"]
+            if isinstance(ref, str) and ref.startswith("#/"):
+                parts = ref.lstrip("#/").split("/")
+                if len(parts) == 2 and parts[0] in ("$defs", "definitions"):
+                    target = defs.get(parts[1]) if isinstance(defs, dict) else None
+                    if isinstance(target, dict):
+                        resolved = copy.deepcopy(target)
+                        for k, v in node.items():
+                            if k not in ("$ref", "$defs", "definitions"):
+                                if k not in resolved:
+                                    resolved[k] = copy.deepcopy(v)
+                        return _norm(resolved, depth + 1, defs)
+            node = {k: v for k, v in node.items() if k != "$ref"}
+            if not node:
+                return {}
+        if node.get("nullable") is True:
+            node.pop("nullable")
+        if isinstance(node.get("type"), list):
+            t = [x for x in node["type"] if x != "null"]
+            if len(t) == 1:
+                node["type"] = t[0]
+            elif not t:
+                node.pop("type")
+            else:
+                node["type"] = t
+        for key in ("anyOf", "oneOf"):
+            if key in node and isinstance(node[key], list):
+                lst = node[key]
+                has_null = any(isinstance(x, dict) and x.get("type") == "null" and len(x) == 1 for x in lst)
+                if has_null:
+                    filtered = [x for x in lst if not (isinstance(x, dict) and x.get("type") == "null" and len(x) == 1)]
+                    if len(filtered) == 1 and isinstance(filtered[0], dict):
+                        siblings = {k: v for k, v in node.items() if k != key}
+                        merged = copy.deepcopy(filtered[0])
+                        for sk, sv in siblings.items():
+                            if sk not in merged:
+                                merged[sk] = sv
+                        return _norm(merged, depth, defs)
+                    elif not filtered:
+                        node.pop(key)
+                        continue
+                    else:
+                        node[key] = filtered
+                if key in node:
+                    node[key] = [_norm(x, depth + 1, defs) for x in node[key]]
+        if prof["strip_format"] and "format" in node:
+            if node["format"] not in ("date-time",):
+                node.pop("format")
+        if "enum" in node and isinstance(node["enum"], list) and len(node["enum"]) == 0:
+            node.pop("enum")
+        if "description" in node and isinstance(node["description"], str):
+            ml = prof["max_description_len"]
+            orig_len = len(node["description"])
+            if orig_len > ml:
+                node["description"] = node["description"][: ml - 3] + "..."
+                _debug(f"  [schema] truncate description {orig_len}>{ml} model={model!r}")
+        if prof["strip_additional_props"]:
+            ap = node.get("additionalProperties")
+            if ap is True or isinstance(ap, dict):
+                node.pop("additionalProperties")
+            if "unevaluatedProperties" in node:
+                node.pop("unevaluatedProperties")
+            if "patternProperties" in node:
+                node.pop("patternProperties")
+            for k in ("if", "then", "else"):
+                if k in node and isinstance(node[k], dict):
+                    node.pop(k)
+        defs_local: dict = {}
+        if "$defs" in node and isinstance(node["$defs"], dict):
+            defs_local.update(node["$defs"])
+        if "definitions" in node and isinstance(node["definitions"], dict):
+            defs_local.update(node["definitions"])
+        merged_defs: dict = {}
+        if isinstance(defs, dict):
+            for dk, dv in defs.items():
+                if dk not in ("$defs", "definitions") and isinstance(dv, dict):
+                    merged_defs[dk] = dv
+        for k, v in defs_local.items():
+            merged_defs[k] = v
+        if "properties" in node and isinstance(node["properties"], dict):
+            for k in list(node["properties"].keys()):
+                node["properties"][k] = _norm(node["properties"][k], depth + 1, merged_defs)
+        for k in ("items", "contains", "propertyNames", "additionalProperties"):
+            if k in node and isinstance(node[k], dict):
+                node[k] = _norm(node[k], depth + 1, merged_defs)
+        if "prefixItems" in node and isinstance(node["prefixItems"], list):
+            node["prefixItems"] = [_norm(x, depth + 1, merged_defs) for x in node["prefixItems"]]
+        return node
+
+    root_defs: dict = {}
+    if "$defs" in out and isinstance(out["$defs"], dict):
+        root_defs.update(out["$defs"])
+    if "definitions" in out and isinstance(out["definitions"], dict):
+        root_defs.update(out["definitions"])
+    return _norm(out, 0, root_defs)
+
+
 def anthropic_to_openai(body: dict, model: str, raw: bytes | None = None) -> dict:
     # ``raw`` : bytes bruts du client, consommés uniquement par le wrapper de
     # cache (plus bas) — l'implémentation d'origine n'en a pas besoin.
@@ -544,26 +693,28 @@ def anthropic_to_openai(body: dict, model: str, raw: bytes | None = None) -> dic
                 continue
             if "name" in t:
                 # Anthropic format: {"name": "...", "description": "...", "input_schema": {...}}
+                params = _normalize_tool_schema(t.get("input_schema", {}) or {}, model)
                 oai_tools.append(
                     {
                         "type": "function",
                         "function": {
                             "name": t["name"],
                             "description": t.get("description", ""),
-                            "parameters": t.get("input_schema", {}),
+                            "parameters": params,
                         },
                     }
                 )
             elif "function" in t:
                 # OpenAI format: {"type": "function", "function": {"name": "...", ...}}
                 fn = t["function"]
+                params = _normalize_tool_schema(fn.get("parameters", {}) or {}, model)
                 oai_tools.append(
                     {
                         "type": "function",
                         "function": {
                             "name": fn.get("name", ""),
                             "description": fn.get("description", ""),
-                            "parameters": fn.get("parameters", {}),
+                            "parameters": params,
                         },
                     }
                 )
@@ -572,13 +723,14 @@ def anthropic_to_openai(body: dict, model: str, raw: bytes | None = None) -> dic
                 if isinstance(t_type, str) and t_type.startswith("web_"):
                     oai_tools.append({"type": t_type, "name": t.get("name", "web_search")})
                 elif t.get("name"):
+                    params = _normalize_tool_schema(t.get("input_schema", t.get("parameters", {})) or {}, model)
                     oai_tools.append(
                         {
                             "type": "function",
                             "function": {
                                 "name": t.get("name", ""),
                                 "description": t.get("description", ""),
-                                "parameters": t.get("input_schema", t.get("parameters", {})),
+                                "parameters": params,
                             },
                         }
                     )
@@ -1007,6 +1159,7 @@ def openai_to_anthropic_request(oai_body: dict) -> dict:
 
     # Convert tools - v3.3: preserve server tools B4
     if "tools" in oai_body:
+        model = oai_body.get("model", "")
         anthro_tools = []
         for t in oai_body["tools"]:
             t_type = t.get("type", "")
@@ -1026,22 +1179,24 @@ def openai_to_anthropic_request(oai_body: dict) -> dict:
                 if not fn.get("name"):
                     _debug("  [convert] SKIP function tool without name")
                     continue
+                schema = _normalize_tool_schema(fn.get("parameters", {}) or {}, model)
                 anthro_tools.append(
                     {
                         "name": fn.get("name", ""),
                         "description": fn.get("description", ""),
-                        "input_schema": fn.get("parameters", {}),
+                        "input_schema": schema,
                     }
                 )
             elif "function" in t:
                 fn = t["function"]
                 if not fn.get("name"):
                     continue
+                schema = _normalize_tool_schema(fn.get("parameters", {}) or {}, model)
                 anthro_tools.append(
                     {
                         "name": fn["name"],
                         "description": fn.get("description", ""),
-                        "input_schema": fn.get("parameters", {}),
+                        "input_schema": schema,
                     }
                 )
         if anthro_tools:
@@ -1241,11 +1396,12 @@ def openai_responses_to_anthropic(body: dict) -> dict:
 
     # Convert tools (strip "type": "function" wrapper)
     if "tools" in body:
+        model = body.get("model", "")
         result["tools"] = []
         for t in body["tools"]:
             if isinstance(t, dict) and t.get("type") == "function":
                 tool = {"name": t["name"], "description": t.get("description", "")}
-                tool["input_schema"] = t.get("input_schema") or t.get("parameters") or {}
+                tool["input_schema"] = _normalize_tool_schema(t.get("input_schema") or t.get("parameters") or {}, model)
                 result["tools"].append(tool)
         tc = body.get("tool_choice", "auto")
         if isinstance(tc, dict):
@@ -1542,16 +1698,18 @@ def _chat_to_responses_request(chat: dict) -> dict:
     elif "reasoning" in chat:
         req["reasoning"] = chat["reasoning"]
     if "tools" in chat:
+        model = chat.get("model", "")
         tools = []
         for t in chat["tools"]:
             if isinstance(t, dict) and "function" in t:
                 fn = t["function"]
+                params = _normalize_tool_schema(fn.get("parameters", {}) or {}, model)
                 tools.append(
                     {
                         "type": "function",
                         "name": fn.get("name", ""),
                         "description": fn.get("description", ""),
-                        "parameters": fn.get("parameters", {}),
+                        "parameters": params,
                     }
                 )
         if tools:

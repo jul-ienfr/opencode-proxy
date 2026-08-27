@@ -333,6 +333,88 @@ def case_multiturn_thinking_strip():
     }
 
 
+def case_req_tools_complex():
+    """Schema complexe — exerce tous les normalizeurs (proud-beaver V3)."""
+    anthro = {
+        "model": "muse-spark-1.2-contributor",
+        "max_tokens": 1024,
+        "tools": [
+            {
+                "name": "agent_manager",
+                "description": "x" * 1100,
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"anyOf": [{"type": "string"}, {"type": "null"}], "description": "q"},
+                        "alt": {"type": ["string", "null"]},
+                        "config": {
+                            "type": "object",
+                            "properties": {"strict": {"type": "boolean"}},
+                            "additionalProperties": True,
+                            "format": "uri",
+                        },
+                        "deep": {
+                            "type": "object",
+                            "properties": {
+                                "l1": {
+                                    "type": "object",
+                                    "properties": {
+                                        "l2": {
+                                            "type": "object",
+                                            "properties": {
+                                                "l3": {
+                                                    "type": "object",
+                                                    "properties": {
+                                                        "l4": {
+                                                            "type": "object",
+                                                            "properties": {
+                                                                "l5": {
+                                                                    "type": "object",
+                                                                    "properties": {
+                                                                        "l6": {
+                                                                            "type": "object",
+                                                                            "properties": {
+                                                                                "l7": {
+                                                                                    "type": "object",
+                                                                                    "properties": {
+                                                                                        "l8": {
+                                                                                            "type": "object",
+                                                                                            "properties": {"l9": {"type": "string"}},
+                                                                                        }
+                                                                                    },
+                                                                                }
+                                                                            },
+                                                                        }
+                                                                    },
+                                                                }
+                                                            },
+                                                        }
+                                                    },
+                                                }
+                                            },
+                                        }
+                                    },
+                                }
+                            },
+                        },
+                        "opt": {"type": "string", "enum": []},
+                        "refd": {"$ref": "#/$defs/Foo"},
+                    },
+                    "required": ["query"],
+                    "$defs": {"Foo": {"type": "string", "description": "foo"}},
+                    "definitions": {"Bar": {"type": "number"}},
+                },
+            }
+        ],
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+    return {
+        "fn": "anthropic_to_openai",
+        "input": {"body": anthro, "model": "muse-spark-1.2-contributor"},
+        "note": "complex schema — anyOf null + type array null + additionalProperties + format + description truncate + nesting flatten + enum vide + $ref",
+    }
+
+
 CASES = [
     case_req_simple,
     case_req_tools,
@@ -344,6 +426,7 @@ CASES = [
     case_responses_api_entry,
     case_sse_deltas,
     case_multiturn_thinking_strip,
+    case_req_tools_complex,
 ]
 
 
