@@ -10504,27 +10504,31 @@ async def chat_completions(request: Request):
                                 converted = _responses_sse_to_chat_deltas(
                                     data_str, parsed=chunk, state=_resp_state
                                 )
-                                if converted is not None:
-                                    chunk = converted
-                                    # usage-only (completed/incomplete) → finaliser
-                                    if (
-                                        not chunk.get("choices")
-                                        and isinstance(chunk, dict)
-                                        and "usage" in chunk
-                                    ):
-                                        _debug(
-                                            "  [oai-stream] response stream-end signal, breaking to finalize"
-                                        )
-                                        actual_usage = chunk.get("usage") or actual_usage
-                                        break
-                                    _oai_has_yielded = True
-                                    _chunk_already_yielded = True
-                                    yield f"data: {_json_dumps_str(chunk, ensure_ascii=False)}\n\n".encode()
-                                    # reasoning_content / content compté plus bas via choices
-                                    choices = chunk.get("choices", [])
-                                    # ne pas re-tomber dans le test choices vide ci-dessous
-                                    if not choices:
-                                        continue
+                                if converted is None:
+                                    # Lifecycle/skip events (response.created,
+                                    # response.in_progress, etc.) — never yield raw
+                                    _debug(f"  [oai-stream] skip unconverted response event {chunk.get('type','')}")
+                                    continue
+                                chunk = converted
+                                # usage-only (completed/incomplete) → finaliser
+                                if (
+                                    not chunk.get("choices")
+                                    and isinstance(chunk, dict)
+                                    and "usage" in chunk
+                                ):
+                                    _debug(
+                                        "  [oai-stream] response stream-end signal, breaking to finalize"
+                                    )
+                                    actual_usage = chunk.get("usage") or actual_usage
+                                    break
+                                _oai_has_yielded = True
+                                _chunk_already_yielded = True
+                                yield f"data: {_json_dumps_str(chunk, ensure_ascii=False)}\n\n".encode()
+                                # reasoning_content / content compté plus bas via choices
+                                choices = chunk.get("choices", [])
+                                # ne pas re-tomber dans le test choices vide ci-dessous
+                                if not choices:
+                                    continue
                             choices = chunk.get("choices", [])
                             if not choices or not isinstance(choices, list):
                                 # 可能是 Responses API format — try converting (fallback legacy)
