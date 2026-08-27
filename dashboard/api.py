@@ -2816,10 +2816,11 @@ def register_dashboard(
         stale = False
         if managers:
             try:
-                _results = await asyncio.wait_for(
-                    asyncio.gather(*(mgr.refresh_status(force=False) for mgr in managers), return_exceptions=True),
-                    timeout=2.0,
-                )
+                # [v6 P1-1] asyncio.timeout (Python 3.11+) + return_exceptions + cancel propre
+                async with asyncio.timeout(2.0):
+                    _results = await asyncio.gather(
+                        *(mgr.refresh_status(force=False) for mgr in managers), return_exceptions=True
+                    )
                 for _r in _results:
                     if isinstance(_r, Exception):
                         refresh_error = f"{type(_r).__name__}: {_r}"
@@ -2830,9 +2831,15 @@ def register_dashboard(
                 refresh_error = "refresh timeout after 2.0s"
                 refreshed_at = datetime.now(UTC).isoformat()
                 try:
-                    asyncio.create_task(
-                        asyncio.gather(*(mgr.refresh_status() for mgr in managers), return_exceptions=True)
-                    )
+                    # [v6 P1-1] background force=True single-flight (évite stale 10s + herd 40 spawns)
+                    _inflight = getattr(shared_state, "_refresh_inflight", None)
+                    if not _inflight or getattr(_inflight, "done", lambda: True)():
+                        shared_state._refresh_inflight = asyncio.create_task(
+                            asyncio.gather(*(m.refresh_status(force=True) for m in managers), return_exceptions=True)
+                        )
+                        shared_state._refresh_inflight.add_done_callback(
+                            lambda t: setattr(shared_state, "_refresh_inflight", None)
+                        )
                 except Exception:
                     pass
             except Exception as _e:
@@ -2904,6 +2911,9 @@ def register_dashboard(
                 data["env_divergence"] = [
                     {"key": k, "file": f, "env": e} for k, f, e in config_settings.ENV_DIVERGENCE
                 ]
+            # [v6 P0-2] boot_error — 1/4 vs 4/4 visible (fail-open, pas raise)
+            if getattr(shared_state, "boot_error", None):
+                data["boot_error"] = shared_state.boot_error
             # [Axe 3.4] config.yaml modifié à la main sans POST dashboard →
             # dirty: le hot-reload est push-only par design, une bannière GUI
             # demande un restart ou une re-push (jamais d'auto-reload).
@@ -3309,6 +3319,29 @@ def register_dashboard(
             return {"error": "gestionnaire VPN non initialisé"}
         result = await shared_state.vpn_manager.health_check()
         return result
+
+    @app.post("/api/vpn/heal")
+    async def heal_vpn(request: Request):
+        """[v6 P1-0] Heal idempotent: converge missing stations (docker absent) via _apply_station_count."""
+        err = _check_dashboard_token(request)
+        if err:
+            return err
+        import shared_state
+
+        try:
+            from config.settings import IP_ROTATION, resolved_station_count
+
+            n = resolved_station_count(IP_ROTATION)
+            managers = getattr(shared_state, "vpn_managers", None) or []
+            if len(managers) < n:
+                # import at runtime to avoid circular import (opencode imports dashboard)
+                from opencode import _apply_station_count
+
+                await _apply_station_count(n)
+                return {"healed": True, "n": n, "managers": len(getattr(shared_state, "vpn_managers", []) or [])}
+            return {"healed": False, "n": n, "managers": len(managers)}
+        except Exception as e:
+            return {"error": str(e), "healed": False}
 
     @app.post("/api/vpn/next")
     async def next_vpn(request: Request):

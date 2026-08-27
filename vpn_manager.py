@@ -4758,7 +4758,23 @@ class VPNManager:
                 # the current stack when a plain recovery works.
                 info = await self._docker_inspect()
                 if not info or not info.get("running"):
-                    return  # absent/stopped/restarting — other paths own the lifecycle
+                    # [v6 P1-3] heal actif au lieu de return infini (Exited → 1/4 300s)
+                    try:
+                        self.arm_egress_watchdog()
+                        if getattr(self, "_watchdog_event", None) is not None:
+                            try:
+                                self._watchdog_event.set()
+                            except Exception:
+                                pass
+                        # container absent → schedule ensure outside lock (avoid deadlock)
+                        if not info:
+                            try:
+                                asyncio.create_task(self._ensure_container())
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                    return  # absent/stopped/restarting — other paths own the lifecycle (now with heal scheduled)
                 if egress_dead:
                     kind = "egress dead"
                 elif self._auth_failed:

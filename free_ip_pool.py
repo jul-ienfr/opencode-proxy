@@ -128,6 +128,8 @@ class FreeIPPool:
         # request handler holding a RETIRED manager must not re-queue it
         # after a downscale).
         self._station_ids = {m._station for m in self._stations}
+        # [v6 P1-4] pick+increment race — 2 on_request concurrentes sur même snapshot
+        self._pool_pick_lock = asyncio.Lock()
         self._active_station: VPNManager | None = None  # last station used by on_request
         self._total_free_requests = 0
         # Per-station state (request counters, IP stats, 429-bad TTL...)
@@ -749,7 +751,8 @@ class FreeIPPool:
                 )
                 per["request_count"] = 0
             per["last_quota_per_ip"] = ep._quota_per_ip
-            per["request_count"] += 1
+            async with self._pool_pick_lock:
+                per["request_count"] += 1
             ep.note_free_request()
             ip = ep.current_ip or ep.pid
             if ip not in per["ip_stats"]:
@@ -763,7 +766,9 @@ class FreeIPPool:
             return ep.socks5_url, ep
 
         if mode == "vpn":
-            station = self._best_station(forced_pool)
+            # [v6 P1-4] pick+increment race — lock <50µs, pas sur ensure_connected
+            async with self._pool_pick_lock:
+                station = self._best_station(forced_pool)
             if station is None and forced_pool is not None:
                 for st in self._stations:
                     if st.status != "connected":
@@ -901,7 +906,9 @@ class FreeIPPool:
             # Only count requests that actually went through the tunnel —
             # when the VPN is down, requests go direct on a residential IP
             # and must not advance the rotation counter ([5]).
-            per["request_count"] += 1
+            # [v6 P1-4] increment sous lock (évite sur-quota 429)
+            async with self._pool_pick_lock:
+                per["request_count"] += 1
             # Track activity for opportune update timing
             station.note_free_request()
             # Track stats for the current station IP
@@ -1754,6 +1761,21 @@ class FreeIPPool:
         # [prancy-unicorn Phase1] agrégat honnête N/M healthy — connected si une station l'est, error seulement si toutes error
         _healthy = sum(1 for _s in stations if _s.get("vpn_status") == "connected")
         _total = len(stations)
+        # [v6 P1-0b] healthy_routable — connected - cooldown 429 (60s) - hard latency 1800s
+        try:
+            _eng = getattr(self, "latency_engine", None)
+            _healthy_routable = 0
+            for _s in stations:
+                if _s.get("vpn_status") != "connected":
+                    continue
+                if _s.get("bad_remaining", 0) > 0:
+                    continue
+                _ip = _s.get("current_ip")
+                if _ip and _eng and _eng.ip_hard_cooled(int(_s["station"]), str(_ip)):
+                    continue
+                _healthy_routable += 1
+        except Exception:
+            _healthy_routable = _healthy
         if _healthy > 0:
             _agg_status = "connected"
         elif all(_s.get("vpn_status") == "error" for _s in stations):
@@ -1789,6 +1811,7 @@ class FreeIPPool:
             "active_station": active._station,
             "stations": stations,
             "healthy": _healthy,
+            "healthy_routable": _healthy_routable,
             "total": _total,
             "socks5_mode": self.socks5_mode,
             "socks5_current": (

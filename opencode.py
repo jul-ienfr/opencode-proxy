@@ -2273,7 +2273,26 @@ async def lifespan(app):
     # serialize the cold-start: station N waits for station 1's full
     # compose-up). Each start() is fail-soft internally (docker down/logs a
     # warning) so gather() never raises.
-    await asyncio.gather(*(m.start() for m in _managers if m.enabled))
+    # [v6 P0-2] fail-soft gather + boot_error (connected < n) — 100% certitude
+    _gather_results = await asyncio.gather(
+        *(m.start() for m in _managers if m.enabled), return_exceptions=True
+    )
+    for _r in _gather_results:
+        if isinstance(_r, Exception):
+            _debug(f"  [lifespan] WARN boot station start raised: {_r!r}")
+    # boot garde: 1/4 vs 4/4 visible même si 0 tunnel
+    try:
+        _n_expected = resolved_station_count(IP_ROTATION) if IP_ROTATION.get("enabled") else len(_managers)  # noqa: F821
+        _connected = sum(1 for _m in _managers if getattr(_m, "_status", None) == "connected" or getattr(_m, "status", None) == "connected")
+        if _connected < _n_expected and IP_ROTATION.get("enabled"):
+            _msg = f"boot { _connected}/{_n_expected}: expected {_n_expected}, connected {_connected} — reconcile/pool"
+            _debug(f"  CRITICAL: {_msg}")
+            shared_state.boot_error = _msg
+        else:
+            shared_state.boot_error = None
+    except Exception as _e:
+        _debug(f"  [lifespan] boot_error compute failed: {_e}")
+        shared_state.boot_error = None
     # [plan] C: docker event watcher — real-time container lifecycle → per-
     # station watchdog wake + SSE vpn_event. Fail-open: if docker is missing
     # or the stream dies, the watchdogs keep their interval pacing and the
@@ -12226,6 +12245,12 @@ async def responses(request: Request):
             _debug(f"  ✗ non-JSON response from {endpoint}")
             _log(f"  UPSTREAM DECODE ERROR: non-JSON response from {endpoint}")
             return _openai_error(502, "Upstream returned non-JSON response")
+        # V5.1 : unwrap enveloppe response.created si /responses renvoie SSE en JSON
+        if "/responses" in endpoint:
+            data = _unwrap_responses_envelope(data)
+            if data.get("status") in ("queued", "in_progress"):
+                _debug(f"  [unwrap] status={data.get('status')} (non-stream) → 503 retryable")
+                return _openai_error(503, f"Upstream {data.get('status')}, retry")
         # Detect Responses API format (has "output" key) vs Chat Completions (has "choices" key)
         is_responses_format = "output" in data and "choices" not in data
         usage = data.get("usage", {})

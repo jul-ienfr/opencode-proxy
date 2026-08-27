@@ -1727,7 +1727,7 @@ def maybe_reload_custom_routes():
 
                             def _regen_env() -> None:
                                 try:
-                                    _sp2.run(
+                                    _r = _sp2.run(
                                         [
                                             __import__("sys").executable,
                                             os.path.join(
@@ -1738,9 +1738,16 @@ def maybe_reload_custom_routes():
                                         timeout=10,
                                         creationflags=_CREATE_NO_WINDOW,
                                     )
-                                    logging.info(
-                                        "[config] server_countries changed → .env regen"
-                                    )
+                                    if _r.returncode != 0:
+                                        logging.warning(
+                                            "[config] .env regen rc=%s stderr=%s",
+                                            _r.returncode,
+                                            _r.stderr.decode(errors="ignore")[:500],
+                                        )
+                                    else:
+                                        logging.info(
+                                            "[config] server_countries changed → .env regen"
+                                        )
                                 except Exception as _e2:
                                     logging.warning("[config] .env regen failed: %s", _e2)
 

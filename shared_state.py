@@ -25,3 +25,5 @@ vpn_managers: list = []
 # portent l'état d'isolation (tracker latence, breaker local, warm-up).
 # Escape hatch : supervisor.enabled=false dans config.yaml → liste vide.
 station_supervisors: list = []
+# [v6 100%] boot_error — set by lifespan after gather(m.start()) if connected < n (P0-2)
+boot_error: str | None = None

@@ -3354,7 +3354,13 @@ document.addEventListener('DOMContentLoaded', () => {
         }
         let bannerLabel = s.label;
         if (_healthy != null && _total != null) bannerLabel += ` — ${_healthy}/${_total} healthy`;
+        // [v6 P1-0b] routable badge
+        const _routable = data.healthy_routable;
+        if (_routable != null && _routable !== _healthy) {
+            bannerLabel += ` (${_routable}/${_total} routable)`;
+        }
         if (data.stale) bannerLabel += ' ⟳';
+        if (data.boot_error) bannerLabel += ` ⚠ ${data.boot_error}`;
         statusEl.textContent = bannerLabel;
         statusEl.style.color = s.color;
         if (statusDot) {
@@ -3362,7 +3368,15 @@ document.addEventListener('DOMContentLoaded', () => {
             statusDot.style.opacity = data.stale ? '0.45' : '1';
             statusDot.title = data.stale ? `stale — ${data.refresh_error || ''}` : '';
         }
-        statusEl.title = data.refresh_error ? String(data.refresh_error) : (data.stale ? `stale — ${data.refreshed_at || ''}` : '');
+        if (_routable != null && _routable !== _healthy) {
+            statusEl.title = `routable = connected - cooldown 429 (60s) - hard latency (1800s). LRU fallback sert quand même si 0 routable.`;
+            if (statusDot) statusDot.title = statusEl.title;
+        } else if (data.boot_error) {
+            statusEl.title = data.boot_error;
+            if (statusDot) statusDot.title = data.boot_error;
+        } else {
+            statusEl.title = data.refresh_error ? String(data.refresh_error) : (data.stale ? `stale — ${data.refreshed_at || ''}` : '');
+        }
 
         ipEl.textContent = data.current_ip || '—';
         if (identityEl) {
