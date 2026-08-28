@@ -890,6 +890,15 @@ class VPNManager:
         # Le canari (compose vpn-wg-test, SOCKS5 loopback 1090) valide le
         # chemin WG RÉEL ; verdict TTL-caché pour ne pas marteler docker.
         self._wg_canary_state: dict = {"ok": None, "at": None}
+        # [Bug #3] Canary TTL asymétrique — PASS_TTL (600s) quand le verdict
+        # est OK (WG vivant, pas de marteau), FAIL_TTL (90s) quand FAIL
+        # (re-test rapide après échec transitoire). Zero-regression :
+        # config.yaml non migré → défauts identiques à l'ancien 600s uniforme.
+        self._WG_CANARY_FAIL_TTL_S = int(cfg.get("wg_canary_fail_ttl_s", 90))
+        self._WG_CANARY_PASS_TTL_S = int(cfg.get("wg_canary_pass_ttl_s", 600))
+        _cc = cfg.get("wg_canary_countries", "Switzerland")
+        self._WG_CANARY_COUNTRIES = [c.strip() for c in str(_cc).split(",") if c.strip()]
+        self._WG_CANARY_ENABLED = bool(cfg.get("wg_canary_enabled", True))
         # [plan 20/08] Gluetun healthcheck-restart churn: a marginal WG
         # tunnel makes gluetun's INTERNAL healthcheck restart the VPN every
         # ~12 s — invisible to the SOCKS5 probe (it samples the live
@@ -2653,6 +2662,10 @@ class VPNManager:
                     if self._wg_canary_state["at"] is None
                     else max(0, int(self._now_fn() - self._wg_canary_state["at"]))
                 ),
+                # [Bug #3] canary TTL config for dashboard observability
+                "wg_canary_fail_ttl": self._WG_CANARY_FAIL_TTL_S,
+                "wg_canary_pass_ttl": self._WG_CANARY_PASS_TTL_S,
+                "wg_canary_enabled": self._WG_CANARY_ENABLED,
                 # [Bug #4] flip observability — pending decision, blocked reason,
                 # cooldown, auth window detail, key presence, stack age
                 "pending_flip": self._pending_flip,
@@ -3575,14 +3588,14 @@ class VPNManager:
         # Path B : seuil franchi — flip immédiat (inchangé)
         if len(self._auth_failed_window) >= self._auto_ov_fail_threshold:
             return ("wireguard", f"{len(self._auth_failed_window)} AUTH_FAILED/30min")
-        # Path C' : OV sain ≥ return_min ET fenêtre < seuil/2 — retour WG
+        # Path C' : OV sain ≥ return_min ET fenêtre vide — retour WG
         # (1 blip isolé ne bloque plus 60 min ; ancien: window strictement vide)
         if (
             self._stack_since is not None
             and now - self._stack_since >= self._auto_ov_return_min * 60
-            and len(self._auth_failed_window) * 2 < self._auto_ov_fail_threshold
+            and not self._auth_failed_window
         ):
-            return ("wireguard", f"OV healthy {self._auto_ov_return_min}min — return to WG")
+            return ("wireguard", f"OV healthy {self._auto_ov_return_min} min — return to WG")
         # Path C'' : OV bloqué ≥ (return_min+30) min — escape hatch
         if (
             self._stack_since is not None
@@ -3671,7 +3684,9 @@ class VPNManager:
     # ── [canari WG 25/08] validation egress avant flip vers WireGuard ──
 
     _WG_CANARY_SERVICE = "vpn-wg-test"
-    _WG_CANARY_TTL_S = 600  # verdict réutilisé 10 min (anti-marteau docker)
+    # [Bug #3] TTL is now asymmetric via instance vars (_WG_CANARY_PASS_TTL_S /
+    # _WG_CANARY_FAIL_TTL_S). Class-level fallback kept for tests that bypass __init__.
+    _WG_CANARY_TTL_S = 600
     _WG_CANARY_BOOT_TIMEOUT_S = 90
     _WG_CANARY_PORT = 1090  # SOCKS5 du canari (compose, loopback uniquement)
     _WG_CANARY_POLL_INTERVAL_S = 4.0
@@ -3687,6 +3702,7 @@ class VPNManager:
 
             _has_socks = True
         except ImportError:
+            logger.warning("[vpn-canary] httpcore[socks] missing — canary bypass (no false positive)")
             return False
         if not _has_socks:
             return False
@@ -3715,16 +3731,18 @@ class VPNManager:
 
         Bring-up compose du service vpn-wg-test (VPN_TYPE=wireguard épinglé,
         profil wg-test), sondes répétées jusqu'au budget, teardown
-        systématique. Verdict mis en cache TTL (_WG_CANARY_TTL_S) : un
-        fournisseur WG cassé coûte au plus UNE validation par TTL et par
-        station — jamais de marteau docker, jamais de flip à l'aveugle.
+        systématique. Verdict mis en cache TTL asymétrique : PASS_TTL (600s)
+        quand WG vivant (pas de marteau), FAIL_TTL (90s) quand FAIL (re-test
+        rapide après échec transitoire). Jamais de flip à l'aveugle.
         """
         now = self._now_fn()
         st = self._wg_canary_state
+        # [Bug #3] TTL asymétrique : PASS → long cache, FAIL → re-test rapide
+        _ttl = self._WG_CANARY_PASS_TTL_S if st["ok"] else self._WG_CANARY_FAIL_TTL_S
         if (
             st["ok"] is not None
             and st["at"] is not None
-            and now - st["at"] < self._WG_CANARY_TTL_S
+            and now - st["at"] < _ttl
         ):
             return bool(st["ok"])
         logger.warning("[vpn-canary] validation egress WireGuard (%s)…", reason)
@@ -3922,6 +3940,10 @@ class VPNManager:
         self._stack_effective = mode
         self._stack_since = self._now_fn()
         self._last_flip_blocked_reason = None  # [Bug #4] clear on successful flip
+        # [Bug #3] Invalider le cache canari après flip OV→WG réussi — le verdict
+        # PASS/OBSOLETE était avant le flip, le nouveau stack doit être re-validé.
+        if mode == "wireguard" and previous == "openvpn":
+            self._wg_canary_state = {"ok": None, "at": None}
         if auto:
             self._last_auto_flip_at = self._now_fn()
             # [Bug #2] prune window after auto OV→WG flip — avoid stale AUTH_FAILED
@@ -4202,6 +4224,10 @@ class VPNManager:
                 if self._wg_canary_state["at"] is None
                 else max(0, int(now - self._wg_canary_state["at"]))
             ),
+            # [Bug #3] canary TTL config for dashboard observability
+            "wg_canary_fail_ttl": self._WG_CANARY_FAIL_TTL_S,
+            "wg_canary_pass_ttl": self._WG_CANARY_PASS_TTL_S,
+            "wg_canary_enabled": self._WG_CANARY_ENABLED,
         }
 
     async def _check_auth_failed(self, started_at: str = "", text: str | None = None) -> bool:

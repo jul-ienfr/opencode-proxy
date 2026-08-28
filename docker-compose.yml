@@ -492,9 +492,10 @@ services:
     environment:
       - VPN_SERVICE_PROVIDER=nordvpn
       - VPN_TYPE=wireguard
-      # Single country: validation checks the public IP lands in Switzerland
+      # [Bug #3] 2-3 countries for canary rotation — if one country's WG
+      # endpoint fails, the next country is tried before declaring FAIL.
       # (spaced name — gluetun enum, see comment on SERVER_COUNTRIES above).
-      - SERVER_COUNTRIES=Switzerland
+      - SERVER_COUNTRIES=Switzerland,Germany,Netherlands
       - UPDATER_PERIOD=480h
       - HTTPPROXY=on
       - HTTPPROXY_LISTENING_ADDRESS=:8898

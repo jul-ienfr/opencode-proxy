@@ -114,8 +114,10 @@ models:
     protocol: openai
   glm-5.3-flash:
     protocol: openai
+  qwen3.8-flash:
+    protocol: anthropic
 free_model_map:
-  mimo-v2.5: deepseek-v4-flash-free
+  mimo-v2.5: mimo-v2.5-free
   qwen3.7-max: mimo-v2.5-free
   glm-5.1: deepseek-v4-flash-free
   kimi-k2.6: mimo-v2.5-free
@@ -143,7 +145,11 @@ ip_rotation:
   auto_ov_return_min: 60
   auto_wg_egress_ticks: 2
   backoff_max_delay: 60
-  bad_ttl: 60
+  bad_ttl: 30
+  wg_canary_fail_ttl_s: 90
+  wg_canary_pass_ttl_s: 600
+  wg_canary_countries: "Switzerland,Germany,Netherlands"
+  wg_canary_enabled: true
   circuit_breaker_recovery: 300
   circuit_breaker_threshold: 3
   compose_service_2: vpn-gluetun-2
@@ -210,7 +216,7 @@ ip_rotation:
   ovpn_endpoint_port: '443'
   ovpn_protocol: tcp
   proxy_mode: vpn
-  quota_per_ip: 1000
+  quota_per_ip: 500
   recent_ip_max_age: 1800
   recent_ip_window: 20
   rotation_fail_cooldown: 60
@@ -267,7 +273,7 @@ custom_routes:
   mimov25:
     match:
     - mimo-v2.5
-    model: muse-spark-1.2-contributor
+    model: mimo-v2.5
     thinking: adaptive
   mimov25pro:
     match:
