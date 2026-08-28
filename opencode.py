@@ -4171,62 +4171,76 @@ async def _do_free_request_curl_cffi(
 
     # Pooled session — [A1 perf] checkout/checkin SANS verrou pendant le
     # transfert : le POST non-streaming ne sérialise plus la station.
-    pool, slot = await _get_pooled_curl_session(proxy_url, profile["impersonate"])
-    if endpoint:
-        _ep = endpoint
-    else:
-        _ep = _cfg_settings._free_endpoint_for(body.get("model", ""))
-        if (
-            not _ep
-            or _ep == _cfg_settings.API_BASE_FREE
-            or _ep == _cfg_settings.API_BASE_FREE.replace("/chat/completions", "/v1/responses")
-        ):
-            _ep = API_BASE_FREE
-        if not _ep:
-            _ep = API_BASE_FREE
-            _ep = API_BASE_FREE
-        elif "/responses" in _ep and API_BASE_FREE != _cfg_settings.API_BASE_FREE:
-            _ep = (
-                API_BASE_FREE.replace("/chat/completions", "/responses").replace(
-                    "/v1/chat/completions", "/v1/responses"
+    # SOCKS5 d'abord, puis fallback HTTP (le SOCKS5 refuse le loopback sur
+    # Windows Docker Desktop, le proxy HTTP marche). On ne bad-mark le
+    # station QUE si le fallback HTTP échoue aussi (tunnel vraiment mort).
+    proxies_to_try = [proxy_url]
+    http_fb = _http_fallback_proxy(proxy_url)
+    if http_fb:
+        proxies_to_try.append(http_fb)
+    last_exc = None
+    for attempt_i, attempt_proxy in enumerate(proxies_to_try):
+        is_last = attempt_i == len(proxies_to_try) - 1
+        pool, slot = await _get_pooled_curl_session(attempt_proxy, profile["impersonate"])
+        if endpoint:
+            _ep = endpoint
+        else:
+            _ep = _cfg_settings._free_endpoint_for(body.get("model", ""))
+            if (
+                not _ep
+                or _ep == _cfg_settings.API_BASE_FREE
+                or _ep == _cfg_settings.API_BASE_FREE.replace("/chat/completions", "/v1/responses")
+            ):
+                _ep = API_BASE_FREE
+            if not _ep:
+                _ep = API_BASE_FREE
+                _ep = API_BASE_FREE
+            elif "/responses" in _ep and API_BASE_FREE != _cfg_settings.API_BASE_FREE:
+                _ep = (
+                    API_BASE_FREE.replace("/chat/completions", "/responses").replace(
+                        "/v1/chat/completions", "/v1/responses"
+                    )
+                    if "/chat/completions" in API_BASE_FREE
+                    else _ep
                 )
-                if "/chat/completions" in API_BASE_FREE
-                else _ep
+        try:
+            resp = await slot.sess.post(
+                _ep,
+                content=_serialize_json_body(body),
+                headers=req_headers,
+                timeout=(10, 600),  # (connect, read) — read 600: long streams
             )
-    try:
-        resp = await slot.sess.post(
-            _ep,
-            content=_serialize_json_body(body),
-            headers=req_headers,
-            timeout=(10, 600),  # (connect, read) — read 600: long streams
-        )
-    except asyncio.CancelledError:
-        # [P2.1 perf/fuite] _evict_later au lieu de discard() : le slot est
-        # RETIRÉ du tracking par discard sans close → socket TLS qui fuit à
-        # chaque stop Claude Code pendant un POST. L'éviction différée
-        # (fire-and-forget) ferme la session hors de la tâche annulée.
-        _evict_later(pool, slot)
-        raise
-    except _curl_err.RequestsError as e:
-        # [plan 18/08 §1a] a REAL connection failure (dead SOCKS5 tunnel)
-        # is invisible to the pool — the station stays "connected" and
-        # every request re-strikes it. Signal the pool+manager
-        # fire-and-forget: bad-mark → instant failover (no request ever
-        # re-strikes a known-dead tunnel), arm+wake → live tick repair.
-        # Never on HTTP responses (429/5xx are not exceptions here —
-        # raise_for_status is False).
-        if station is not None and _is_connect_error(e):
-            _signal_connection_failure(station)
-        # On pooled session error, evict it so next request gets fresh TLS
-        # ([A1] éviction de la seule session fautive, le pool survit).
-        await pool.evict(slot)
-        raise
-    except Exception:
-        await pool.evict(slot)
-        raise
-    # Wrap in a compatible response object
-    await pool.checkin(slot)
-    return _CurlCffiResponse(resp)
+        except asyncio.CancelledError:
+            # [P2.1 perf/fuite] _evict_later au lieu de discard() : le slot est
+            # RETIRÉ du tracking par discard sans close → socket TLS qui fuit à
+            # chaque stop Claude Code pendant un POST. L'éviction différée
+            # (fire-and-forget) ferme la session hors de la tâche annulée.
+            _evict_later(pool, slot)
+            raise
+        except _curl_err.RequestsError as e:
+            # [plan 18/08 §1a] a REAL connection failure (dead SOCKS5 tunnel)
+            # is invisible to the pool — the station stays "connected" and
+            # every request re-strikes it. Signal the pool+manager
+            # fire-and-forget: bad-mark → instant failover (no request ever
+            # re-strikes a known-dead tunnel), arm+wake → live tick repair.
+            # Never on HTTP responses (429/5xx are not exceptions here —
+            # raise_for_status is False). Only on the LAST proxy (HTTP
+            # fallback already tried) so a flaky SOCKS5 alone doesn't churn.
+            if station is not None and _is_connect_error(e) and is_last:
+                _signal_connection_failure(station)
+            # On pooled session error, evict it so next request gets fresh TLS
+            # ([A1] éviction de la seule session fautive, le pool survit).
+            await pool.evict(slot)
+            last_exc = e
+            continue  # try next proxy (HTTP fallback)
+        except Exception as e:
+            await pool.evict(slot)
+            last_exc = e
+            continue
+        # Wrap in a compatible response object
+        await pool.checkin(slot)
+        return _CurlCffiResponse(resp)
+    raise last_exc
 
 
 def _free_parallel_should_hedge(body: dict, forced_pool=None) -> bool:
@@ -4433,6 +4447,24 @@ def _curl_proxy_url(proxy_url: str | None) -> str | None:
     if proxy_url and proxy_url.startswith("socks5://"):
         return "socks5h://" + proxy_url[len("socks5://") :]
     return proxy_url
+
+
+def _http_fallback_proxy(proxy_url: str | None) -> str | None:
+    """SOCKS5 → HTTP proxy fallback (same gluetun station, different port).
+
+    On Windows Docker Desktop the SOCKS5 listener refuses loopback connections
+    while the HTTP proxy (:8888 for station 1, +1 per station) works fine. Map
+    socks5://127.0.0.1:1080 → http://127.0.0.1:8888 (port + 7808). Returns None
+    when ``proxy_url`` isn't a SOCKS5 URL (no fallback needed)."""
+    if not proxy_url or not proxy_url.startswith("socks5://"):
+        return None
+    import re
+
+    m = re.match(r"socks5://([^:]+):(\d+)", proxy_url)
+    if not m:
+        return None
+    host, port = m.group(1), int(m.group(2))
+    return f"http://{host}:{port + 7808}"
 
 
 class _CurlCffiResponse:
