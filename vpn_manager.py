@@ -3572,14 +3572,29 @@ class VPNManager:
             logger.warning("[vpn] auto-flip blocked: %s", reason)
             self._last_flip_blocked_reason = reason
             return None  # cannot flip to wireguard without the key
+        # Path B : seuil franchi — flip immédiat (inchangé)
         if len(self._auth_failed_window) >= self._auto_ov_fail_threshold:
             return ("wireguard", f"{len(self._auth_failed_window)} AUTH_FAILED/30min")
+        # Path C' : OV sain ≥ return_min ET fenêtre < seuil/2 — retour WG
+        # (1 blip isolé ne bloque plus 60 min ; ancien: window strictement vide)
         if (
             self._stack_since is not None
             and now - self._stack_since >= self._auto_ov_return_min * 60
-            and not self._auth_failed_window
+            and len(self._auth_failed_window) * 2 < self._auto_ov_fail_threshold
         ):
-            return ("wireguard", f"OV healthy {self._auto_ov_return_min} min — return to WG")
+            return ("wireguard", f"OV healthy {self._auto_ov_return_min}min — return to WG")
+        # Path C'' : OV bloqué ≥ (return_min+30) min — escape hatch
+        if (
+            self._stack_since is not None
+            and now - self._stack_since >= (self._auto_ov_return_min + 30) * 60
+        ):
+            return ("wireguard", f"OV stuck {int((now - self._stack_since) / 60)}min — escape to WG")
+        # Path D' : slow-burn 1-2 AUTH_FAILED persistés ≥10 min sur OV
+        # (pas un bool, pas 5 min de flapping — old=oldest monotonic, déjà pruné 30 min)
+        if self._auth_failed_window and self._stack_since is not None:
+            oldest = self._auth_failed_window[0]
+            if now - oldest >= 10 * 60 and now - self._stack_since >= 10 * 60:
+                return ("wireguard", f"{len(self._auth_failed_window)} AUTH_FAILED/30min persisted 10min — slow-burn escape")
         return None
 
     def _emergency_flip_decision(self) -> tuple | None:
@@ -3896,6 +3911,10 @@ class VPNManager:
         self._last_flip_blocked_reason = None  # [Bug #4] clear on successful flip
         if auto:
             self._last_auto_flip_at = self._now_fn()
+            # [Bug #2] prune window after auto OV→WG flip — avoid stale AUTH_FAILED
+            # re-triggering D' on the next tick (window spans flips, not reset by stack change)
+            if mode == "wireguard":
+                self._auth_failed_window = []
         self._flips.append(
             {
                 "time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
