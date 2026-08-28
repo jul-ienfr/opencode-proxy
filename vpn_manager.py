@@ -3613,14 +3613,12 @@ class VPNManager:
             # Cascade timed out or exhausted — state already reset by _cascade_next_step,
             # fall through to normal OV→WG / UDP→TCP logic.
         # OV UDP dead -> TCP is cheaper than jumping back to WG (firewall blocks UDP)
+        # FIX auto always functional: TCP dead -> try UDP before WG (canary may block WG)
         if self._egress_failures >= self._auto_wg_egress_ticks:
             if getattr(self, "_ovpn_protocol_effective", "udp") == "udp":
                 return ("openvpn", f"egress dead {self._egress_failures} ticks UDP -> TCP")
-            # UDP already tried, TCP also dead -> fall through to WG flip via auth/window or direct
-            # If TCP dead persistently, the next egress tick will still be dead and the auth-free
-            # path below will eventually flip to WG (preferred). Keep egress->WG as fallback
-            # when protocol already tcp to avoid flip-flop loop.
-            return ("wireguard", f"egress dead {self._egress_failures} ticks TCP")
+            else:
+                return ("openvpn", f"egress dead {self._egress_failures} ticks TCP -> UDP")
         if not self._wg_key_present():
             # [Bug #4] log + blocked_reason pour observabilité dashboard
             reason = f"wireguard.env missing ({self._wg_key_file})"
@@ -5032,15 +5030,16 @@ class VPNManager:
                                 self._watchdog_event.set()
                             except Exception:
                                 pass
-                        # container absent → schedule ensure outside lock (avoid deadlock)
-                        if not info:
+                        # container absent/stopped → schedule ensure outside lock (avoid deadlock)
+                        # FIX always functional: stopped (control VPN arrêté) must also heal, not just absent
+                        if not info or not info.get("running"):
                             try:
                                 asyncio.create_task(self._ensure_container())
                             except Exception:
                                 pass
                     except Exception:
                         pass
-                    return  # absent/stopped/restarting — other paths own the lifecycle (now with heal scheduled)
+                    return  # absent/stopped/restarting — heal scheduled, next tick will re-check
                 if egress_dead:
                     kind = "egress dead"
                 elif self._auth_failed:
@@ -5151,11 +5150,16 @@ class VPNManager:
             mode, reason = self._pending_flip
             self._pending_flip = None
             is_emergency = reason.startswith("emergency")
-            # OV protocol flip (udp->tcp) is a lighter heal than full stack flip:
-            # same VPN_TYPE=openvpn, only OPENVPN_PROTOCOL changes (1194->443).
-            # Works for both auto and emergency (firewall blocks UDP but TCP 443 passes).
+            # OV protocol flip (udp->tcp / tcp->udp) is a lighter heal than full stack flip:
+            # same VPN_TYPE=openvpn, only OPENVPN_PROTOCOL changes (1194<->443).
+            # FIX auto always functional: TCP->UDP before WG (canary may block WG)
             if mode == "openvpn" and "UDP" in reason and "-> TCP" in reason:
                 ok = await self._apply_ovpn_protocol("tcp", reason=reason)
+                if ok:
+                    return
+                # Protocol flip failed -> fall through to stack flip as escalation
+            if mode == "openvpn" and "TCP" in reason and "-> UDP" in reason:
+                ok = await self._apply_ovpn_protocol("udp", reason=reason)
                 if ok:
                     return
                 # Protocol flip failed -> fall through to stack flip as escalation
@@ -5458,7 +5462,13 @@ class VPNManager:
             # OV) — the watchdog reconciles auto at the next tick.
             restored_stack = state.get("stack")
             if restored_stack in ("auto", "wireguard", "openvpn"):
-                self._stack = restored_stack
+                # FIX auto always functional: stale manual (wireguard/openvpn) in state must not
+                # override config's auto — otherwise a one-off manual flip locks the station forever
+                # and _auto_flip_decision (guard `if _stack != auto: return None`) never runs.
+                if self._stack == "auto" and restored_stack != "auto":
+                    logger.info("[vpn] state stack %s ignored — config is auto (effective %s)", restored_stack, self._stack_effective)
+                else:
+                    self._stack = restored_stack
             # OV protocol/port persistence (udp/tcp + 1194/443/8443)
             _rp = state.get("ovpn_protocol")
             if _rp in ("udp", "tcp"):

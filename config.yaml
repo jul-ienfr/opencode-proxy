@@ -256,7 +256,7 @@ ip_rotation:
   wait_healthy_poll: 0.5
   watchdog_backoff_base: 15
   watchdog_backoff_max: 60
-  watchdog_interval: 20
+  watchdog_interval: 5
 geo:
   enabled: true
   version: 1
