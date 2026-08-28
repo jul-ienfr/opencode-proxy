@@ -143,7 +143,7 @@ supervisor:
   enabled: true
 ip_rotation:
   auto_flip_cooldown_min: 0
-  cascade_enabled: false
+  cascade_enabled: true
   auto_hetero_boot: false
   auto_max_free_attempts: true
   auto_ov_fail_threshold: 3
@@ -219,7 +219,7 @@ ip_rotation:
     window: 20
   max_free_attempts: 4
   ovpn_endpoint_port: '443'
-  ovpn_protocol: tcp
+  ovpn_protocol: udp
   proxy_mode: vpn
   quota_per_ip: 500
   recent_ip_max_age: 1800
