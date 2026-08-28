@@ -3597,6 +3597,19 @@ class VPNManager:
                 return ("wireguard", f"{len(self._auth_failed_window)} AUTH_FAILED/30min persisted 10min — slow-burn escape")
         return None
 
+    # ── [Bug #1] Flip classification — auth/churn driven flips must not be
+    # cancelled by a temporary heal (the root cause persists). ──
+
+    @staticmethod
+    def _flip_is_auth_driven(pf: tuple | None) -> bool:
+        """True when the pending flip was triggered by AUTH_FAILED window breach."""
+        return bool(pf and pf[0] == "wireguard" and "AUTH_FAILED" in pf[1])
+
+    @staticmethod
+    def _flip_is_churn_driven(pf: tuple | None) -> bool:
+        """True when the pending flip was triggered by healthcheck restart loop."""
+        return bool(pf and "restart loop" in pf[1])
+
     def _emergency_flip_decision(self) -> tuple | None:
         """Emergency flip for manual stacks after persistent failure.
 
@@ -4824,6 +4837,10 @@ class VPNManager:
             # fresh counters, applied AFTER it (_apply_stack takes the lock;
             # asyncio.Lock is not reentrant, calling it here would deadlock).
             self._pending_flip = self._auto_flip_decision()
+            # [Bug #1] Snapshot — auth/churn-driven flips must not be cancelled
+            # by a temporary heal (the root cause persists).
+            auth_driven = self._flip_is_auth_driven(self._pending_flip)
+            churn_driven = self._flip_is_churn_driven(self._pending_flip)
             # Emergency flip for manual stacks: same thresholds but gated on
             # at least one failed heal attempt, so a transient blip is first
             # healed on the current stack before flipping.
@@ -4886,7 +4903,9 @@ class VPNManager:
                 # failure the compose path below (unchanged) is the
                 # escalation; same lock, so at most one recovery action per
                 # tick.
-                if await self._fast_recover_via_control(max_skips=3):
+                # [Bug #1] skip fast_recover for auth/churn-driven flips —
+                # the root cause persists, a temporary heal is misleading.
+                if not (auth_driven or churn_driven) and await self._fast_recover_via_control(max_skips=3):
                     return
                 try:
                     # [plan 18/08 §E3/am.20] LIGHT rung first — a plain
@@ -4918,7 +4937,9 @@ class VPNManager:
                             await self._check_auth_failed(started_at)
                             or await self._check_server_issue(started_at)
                         )
-                    if healed and await self._watchdog_recover_fresh_ip():
+                    # [Bug #1] gate: auth/churn-driven flips must not be cancelled
+                    # by a temporary heal — the root cause persists.
+                    if healed and not (auth_driven or churn_driven) and await self._watchdog_recover_fresh_ip():
                         return
                     if not healed:
                         logger.info(
@@ -4936,7 +4957,7 @@ class VPNManager:
                                 await self._check_auth_failed(started_at)
                                 or await self._check_server_issue(started_at)
                             )
-                        if healed and await self._watchdog_recover_fresh_ip():
+                        if healed and not (auth_driven or churn_driven) and await self._watchdog_recover_fresh_ip():
                             return
                     # Still failing: keep the error state and back off. This
                     # tail is inside the try — with no exception it runs ONCE
