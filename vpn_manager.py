@@ -963,6 +963,7 @@ class VPNManager:
         self._flips: list[dict] = []  # journal [{time, from, to, reason}], cap 20
         self._pending_flip: tuple | None = None  # set inside the tick lock,
         # applied AFTER it (_apply_stack takes the lock — not reentrant).
+        self._last_flip_blocked_reason: str | None = None  # [Bug #4] why flip was blocked
         # warm-avalanche: 401 control + SOCKS5 EOF observability
         self._control_last_401_at: float | None = None
         self._control_last_error: str | None = None
@@ -2652,6 +2653,33 @@ class VPNManager:
                     if self._wg_canary_state["at"] is None
                     else max(0, int(self._now_fn() - self._wg_canary_state["at"]))
                 ),
+                # [Bug #4] flip observability — pending decision, blocked reason,
+                # cooldown, auth window detail, key presence, stack age
+                "pending_flip": self._pending_flip,
+                "flip_blocked_reason": self._last_flip_blocked_reason,
+                "cooldown_remaining_s": (
+                    0
+                    if self._last_auto_flip_at is None
+                    else max(0, int(
+                        self._auto_flip_cooldown_min * 60
+                        - (self._now_fn() - self._last_auto_flip_at)
+                    ))
+                ),
+                "auth_failed_window_len": len(self._auth_failed_window),
+                "auth_failed_oldest_age_s": (
+                    None
+                    if not self._auth_failed_window
+                    else max(0, int(self._now_fn() - self._auth_failed_window[0]))
+                ),
+                "wg_key_present": self._wg_key_present(),
+                "wg_key_file": self._wg_key_file,
+                "stack_effective": self._stack_effective,
+                "stack_since_age_s": (
+                    None
+                    if self._stack_since is None
+                    else max(0, int(self._now_fn() - self._stack_since))
+                ),
+                "egress_failures": self._egress_failures,
             },
             "identity_index": self._identity_index,
             "profiles_count": len(self._identity_profiles),
@@ -3539,6 +3567,10 @@ class VPNManager:
             # when protocol already tcp to avoid flip-flop loop.
             return ("wireguard", f"egress dead {self._egress_failures} ticks TCP")
         if not self._wg_key_present():
+            # [Bug #4] log + blocked_reason pour observabilité dashboard
+            reason = f"wireguard.env missing ({self._wg_key_file})"
+            logger.warning("[vpn] auto-flip blocked: %s", reason)
+            self._last_flip_blocked_reason = reason
             return None  # cannot flip to wireguard without the key
         if len(self._auth_failed_window) >= self._auto_ov_fail_threshold:
             return ("wireguard", f"{len(self._auth_failed_window)} AUTH_FAILED/30min")
@@ -3861,6 +3893,7 @@ class VPNManager:
         previous = self._stack_effective
         self._stack_effective = mode
         self._stack_since = self._now_fn()
+        self._last_flip_blocked_reason = None  # [Bug #4] clear on successful flip
         if auto:
             self._last_auto_flip_at = self._now_fn()
         self._flips.append(
@@ -4086,6 +4119,7 @@ class VPNManager:
 
     def stack_info(self) -> dict:
         """Snapshot for GET /api/vpn-stack-info (dashboard rendering)."""
+        now = self._now_fn()
         return {
             "selected": self._stack,
             "effective": self._stack_effective,
@@ -4108,6 +4142,34 @@ class VPNManager:
             "control_last_401_at": getattr(self, "_control_last_401_at", None),
             "control_last_error": getattr(self, "_control_last_error", None),
             "socks5_eof_count": getattr(self, "_socks5_eof_count", 0),
+            # [Bug #4] flip observability — mirrors get_status for dashboard
+            "pending_flip": self._pending_flip,
+            "flip_blocked_reason": self._last_flip_blocked_reason,
+            "cooldown_remaining_s": (
+                0
+                if self._last_auto_flip_at is None
+                else max(0, int(
+                    self._auto_flip_cooldown_min * 60
+                    - (now - self._last_auto_flip_at)
+                ))
+            ),
+            "auth_failed_oldest_age_s": (
+                None
+                if not self._auth_failed_window
+                else max(0, int(now - self._auth_failed_window[0]))
+            ),
+            "wg_key_file": self._wg_key_file,
+            "stack_since_age_s": (
+                None
+                if self._stack_since is None
+                else max(0, int(now - self._stack_since))
+            ),
+            "wg_canary_ok": self._wg_canary_state["ok"],
+            "wg_canary_age_s": (
+                None
+                if self._wg_canary_state["at"] is None
+                else max(0, int(now - self._wg_canary_state["at"]))
+            ),
         }
 
     async def _check_auth_failed(self, started_at: str = "", text: str | None = None) -> bool:
