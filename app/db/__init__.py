@@ -298,11 +298,14 @@ def init_requests_schema(
     conn.execute("PRAGMA temp_store=MEMORY")  # temp tables in RAM
     conn.execute(f"PRAGMA mmap_size={mmap_size}")  # memory-mapped I/O
     conn.execute(_SCHEMA_REQUESTS)
-    for stmt in _REQUESTS_INDEXES:
-        conn.execute(stmt)
     for col, default in _REQUEST_COLUMN_MIGRATIONS:
         try:
             conn.execute(f"ALTER TABLE requests ADD COLUMN {col} TEXT DEFAULT {default}")
+        except Exception:
+            pass
+    for stmt in _REQUESTS_INDEXES:
+        try:
+            conn.execute(stmt)
         except Exception:
             pass
     # [plan v10 §4 Lot 4] colonne station INTEGER (filtres ?station=) +
