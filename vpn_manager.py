@@ -5060,7 +5060,10 @@ class VPNManager:
                 # tick.
                 # [Bug #1] skip fast_recover for auth/churn-driven flips —
                 # the root cause persists, a temporary heal is misleading.
-                if not (auth_driven or churn_driven) and await self._fast_recover_via_control(max_skips=3):
+                # FIX always functional: OV with cascade may still fast-pin (TCP->UDP) even when auth_driven,
+                # because OV->WG is blocked by canary and OV UDP may still work.
+                _allow_fast = not (auth_driven or churn_driven) or (self._stack_effective == "openvpn" and self._cascade_enabled)
+                if _allow_fast and await self._fast_recover_via_control(max_skips=3):
                     return
                 try:
                     # [plan 18/08 §E3/am.20] LIGHT rung first — a plain
