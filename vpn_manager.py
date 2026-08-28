@@ -2100,6 +2100,14 @@ class VPNManager:
                 return results[k]
         self._ip_check_idx = 0  # full sweep failed — restart at the top next call
         logger.error("[vpn] public IP probe failed on all %d endpoints via SOCKS5", len(urls))
+        # Fallback: gluetun self-reports its public IP via the control server
+        # (plain HTTP, no SOCKS5). The loopback SOCKS5 server can refuse
+        # connections even when the tunnel is healthy — trust gluetun's view
+        # instead of declaring the tunnel dead (false-error → recovery churn).
+        ctrl_ip = await self._control_public_ip()
+        if ctrl_ip:
+            logger.debug("[vpn] public IP from control fallback: %s", ctrl_ip)
+            return ctrl_ip
         return None
 
     async def _probe_tunnel_light(self) -> bool:
@@ -2154,6 +2162,11 @@ class VPNManager:
                     )
                     if verdict == "ok":
                         return True
+            # SOCKS5 probe failed but gluetun may still be healthy — the
+            # loopback SOCKS5 server can refuse connections while the tunnel
+            # is actually up. Trust gluetun's own control report.
+            if await self._control_status() and await self._control_public_ip():
+                return True
             return False
         except Exception:
             return False
