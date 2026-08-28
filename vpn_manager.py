@@ -917,9 +917,10 @@ class VPNManager:
         )
         self._ip_probe_budget = max(1.0, float(cfg.get("ip_probe_budget", 8.0)))
         # [PR2 cascade] Per-server technology cascade: WG → OV UDP → OV TCP
-        # (3 attempts <30s). OFF by default (parity with NordVPN official client
-        # which does fail-fast). ON = our innovation: applicative-layer cascade
-        # inside a single gluetun container (1 tech at a time).
+        # (3 attempts <120s — 2 recreates ~30s each + detection, P2.2). OFF by
+        # default (parity with NordVPN official client which does fail-fast).
+        # ON = our innovation: applicative-layer cascade inside a single
+        # gluetun container (1 tech at a time).
         self._cascade_enabled = bool(cfg.get("cascade_enabled", False))
         # Sequence of (stack, protocol) to try per-server when WG fails.
         # Each step recreates the container with the target tech/proto.
@@ -929,7 +930,8 @@ class VPNManager:
         ]
         self._cascade_step: int = 0  # 0-based index into _cascade_sequence
         self._cascade_started_at: float | None = None  # monotonic when cascade began
-        self._cascade_max_duration: float = 30.0  # hard cap per-server cascade
+        self._cascade_max_duration: float = 120.0  # hard cap per-server cascade (2 recreates ~30s each + detection)
+        self._cascade_pending_proto: str | None = None  # structured proto for watchdog intercept (no reason parsing)
         # [plan 18/08 §B] Control-pin budget: how long a rotation pin may
         # poll "running" (timeout) + how long it then waits for a REAL IP
         # through the tunnel (catch-up, a "running but unreachable" guard —
@@ -3573,10 +3575,6 @@ class VPNManager:
             return None  # cooldown — anti-flapping
         if self._stack_effective == "wireguard":
             if self._egress_failures >= self._auto_wg_egress_ticks:
-                # [PR2 cascade] When cascade is enabled, initiate cascade
-                # instead of a direct flip — try OV UDP then OV TCP per-server.
-                if self._cascade_enabled and not self._cascade_is_active():
-                    self._cascade_start()
                 return ("openvpn", f"egress dead {self._egress_failures} ticks")
             # [churn→OV 25/08] la boucle healthcheck gluetun PREUVE que le
             # tunnel ne passe pas : le compteur egress peut ne jamais
@@ -3588,8 +3586,6 @@ class VPNManager:
                 getattr(self, "_restart_churn", False)
                 and self._watchdog_backoff.consecutive_failures >= 1
             ):
-                if self._cascade_enabled and not self._cascade_is_active():
-                    self._cascade_start()
                 return (
                     "openvpn",
                     f"healthcheck restart loop x{self._restart_churn_threshold} + heal failed",
@@ -3600,6 +3596,8 @@ class VPNManager:
             return None
         # [PR2 cascade] When cascade is active and OV fails, try next step
         # (OV UDP→TCP) instead of immediately flipping back to WG.
+        # P2.3: proto is carried via _cascade_pending_proto (structured), not
+        # parsed from the reason string — fixes AUTH_FAILED → proto fragility.
         if self._cascade_enabled and self._cascade_is_active():
             if self._egress_failures >= self._auto_wg_egress_ticks:
                 next_step = self._cascade_next_step()
@@ -3612,9 +3610,8 @@ class VPNManager:
                 if next_step is not None:
                     stack, proto = next_step
                     return (stack, f"cascade step {self._cascade_step}: AUTH_FAILED → {proto}")
-            # Cascade timed out — fall through to normal OV→WG logic
-            if not self._cascade_is_active():
-                self._cascade_reset()
+            # Cascade timed out or exhausted — state already reset by _cascade_next_step,
+            # fall through to normal OV→WG / UDP→TCP logic.
         # OV UDP dead -> TCP is cheaper than jumping back to WG (firewall blocks UDP)
         if self._egress_failures >= self._auto_wg_egress_ticks:
             if getattr(self, "_ovpn_protocol_effective", "udp") == "udp":
@@ -3633,8 +3630,9 @@ class VPNManager:
         # Path B : seuil franchi — flip immédiat (inchangé)
         if len(self._auth_failed_window) >= self._auto_ov_fail_threshold:
             return ("wireguard", f"{len(self._auth_failed_window)} AUTH_FAILED/30min")
-        # Path C' : OV sain ≥ return_min ET fenêtre vide — retour WG
-        # (1 blip isolé ne bloque plus 60 min ; ancien: window strictement vide)
+        # Path C' : OV sain ≥ return_min ET fenêtre strictement vide — retour WG
+        # (strict vide + D' slow-burn 10min comme échappatoire blip isolé ; len*2<threshold
+        # a été volontairement abandonné pour moins de flapping — D' couvre 1-2 blips en 10min)
         if (
             self._stack_since is not None
             and now - self._stack_since >= self._auto_ov_return_min * 60
@@ -3854,6 +3852,9 @@ class VPNManager:
         pf = self._pending_flip
         if pf is None or pf[0] != "wireguard":
             return False
+        if not getattr(self, "_WG_CANARY_ENABLED", True):
+            logger.warning("[vpn-canary] disabled — gate bypassed (flip %s)", pf[1])
+            return False
         if await self._wg_canary_alive(pf[1]):
             return False
         self._pending_flip = None
@@ -3994,6 +3995,11 @@ class VPNManager:
         # flip to WG means the cascade succeeded or was superseded.
         if mode == "wireguard":
             self._cascade_reset()
+        # [PR2 P2.1] Start cascade timer at APPLICATION, not decision — otherwise
+        # the 30-90s compose recreate consumes the budget before step 0.
+        if mode == "openvpn" and previous == "wireguard" and self._cascade_enabled:
+            if not self._cascade_is_active():
+                self._cascade_start()
         if auto:
             self._last_auto_flip_at = self._now_fn()
             # [Bug #2] prune window after auto OV→WG flip — avoid stale AUTH_FAILED
@@ -4196,6 +4202,7 @@ class VPNManager:
         Resets the step counter and records the start time."""
         self._cascade_step = 0
         self._cascade_started_at = time.monotonic()
+        self._cascade_pending_proto = None
         logger.info("[vpn-cascade] starting per-server cascade (WG → OV UDP → OV TCP)")
 
     def _cascade_elapsed(self) -> float:
@@ -4216,6 +4223,8 @@ class VPNManager:
 
         Sequence: OV UDP (step 0) → OV TCP (step 1). After step 1, the
         cascade is done — the caller should escalate (next country / recovery).
+        Skips a step whose proto equals the current effective protocol (anti
+        ping-pong P2.4 — the initial WG→OV flip already set tcp/udp).
         """
         if not self._cascade_enabled:
             return None
@@ -4223,6 +4232,16 @@ class VPNManager:
             logger.info("[vpn-cascade] timed out after %.0fs — cascade exhausted", self._cascade_elapsed())
             self._cascade_reset()
             return None
+        # P2.4: skip proto == effective (avoid udp→tcp→udp ping-pong)
+        while self._cascade_step < len(self._cascade_sequence):
+            stack, proto = self._cascade_sequence[self._cascade_step]
+            eff = getattr(self, "_ovpn_protocol_effective", "udp")
+            if proto == eff:
+                logger.info("[vpn-cascade] skip step %d proto %s == effective — advancing",
+                            self._cascade_step, proto)
+                self._cascade_step += 1
+                continue
+            break
         if self._cascade_step >= len(self._cascade_sequence):
             logger.info("[vpn-cascade] all %d steps exhausted within %.0fs",
                         len(self._cascade_sequence), self._cascade_elapsed())
@@ -4230,6 +4249,7 @@ class VPNManager:
             return None
         stack, proto = self._cascade_sequence[self._cascade_step]
         self._cascade_step += 1
+        self._cascade_pending_proto = proto
         logger.info("[vpn-cascade] step %d/%d: %s %s (%.0fs elapsed)",
                      self._cascade_step, len(self._cascade_sequence),
                      stack, proto, self._cascade_elapsed())
@@ -4239,6 +4259,7 @@ class VPNManager:
         """Clear cascade state after completion or timeout."""
         self._cascade_step = 0
         self._cascade_started_at = None
+        self._cascade_pending_proto = None
 
     async def set_stack(self, mode: str, propagate: bool = True) -> dict:
         """API entry point (dashboard). mode ∈ {"auto", "wireguard", "openvpn"}.
@@ -5140,9 +5161,17 @@ class VPNManager:
                 # Protocol flip failed -> fall through to stack flip as escalation
             # [PR2 cascade] Cascade steps use _apply_ovpn_protocol (lighter than
             # full stack flip — same VPN_TYPE=openvpn, only protocol changes).
-            if self._cascade_enabled and "cascade step" in reason and mode == "openvpn":
-                # Extract protocol from reason: "cascade step N: proto"
-                proto = reason.split(":")[-1].strip() if ":" in reason else "udp"
+            # P2.3: structured _cascade_pending_proto — no reason parsing (fixes AUTH_FAILED → proto bug).
+            if self._cascade_enabled and mode == "openvpn" and self._cascade_pending_proto in ("udp", "tcp"):
+                proto = self._cascade_pending_proto
+                self._cascade_pending_proto = None
+                ok = await self._apply_ovpn_protocol(proto, reason=reason)
+                if ok:
+                    return
+                # Protocol flip failed -> fall through to stack flip as escalation
+            elif self._cascade_enabled and "cascade step" in reason and mode == "openvpn":
+                # Fallback: legacy reason parsing (only if pending was lost)
+                proto = reason.split(":")[-1].strip().split()[-1] if ":" in reason else "udp"
                 if proto in ("udp", "tcp"):
                     ok = await self._apply_ovpn_protocol(proto, reason=reason)
                     if ok:
