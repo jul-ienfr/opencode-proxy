@@ -139,6 +139,7 @@ supervisor:
   enabled: true
 ip_rotation:
   auto_flip_cooldown_min: 0
+  cascade_enabled: false
   auto_hetero_boot: false
   auto_max_free_attempts: true
   auto_ov_fail_threshold: 3
@@ -148,7 +149,7 @@ ip_rotation:
   bad_ttl: 30
   wg_canary_fail_ttl_s: 90
   wg_canary_pass_ttl_s: 600
-  wg_canary_countries: "Switzerland,Germany,Netherlands"
+  wg_canary_countries: Switzerland,Germany,Netherlands
   wg_canary_enabled: true
   circuit_breaker_recovery: 300
   circuit_breaker_threshold: 3
