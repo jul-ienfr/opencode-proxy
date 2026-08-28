@@ -3,7 +3,7 @@
 # share one stanza instead of duplicating it. Stations 1-2 keep their
 # historical literal blocks.
 x-gluetun-multi-base: &gluetun-multi-base
-  image: qmcgaw/gluetun:v3.40.0
+  image: qmcgaw/gluetun:v3.41.3
   cap_add:
     - NET_ADMIN
   devices:
@@ -124,7 +124,7 @@ services:
         condition: service_healthy
 
   vpn-gluetun:
-    image: qmcgaw/gluetun:v3.40.0
+    image: qmcgaw/gluetun:v3.41.3
     container_name: opencode-vpn
     cap_add:
       - NET_ADMIN
@@ -223,7 +223,7 @@ services:
   # vpn-gluetun-2` when dual_station is enabled — explicitly targeting a
   # profiled service runs it regardless of its profile.
   vpn-gluetun-2:
-    image: qmcgaw/gluetun:v3.40.0
+    image: qmcgaw/gluetun:v3.41.3
     profiles: ["dual-station", "multi-station"]
     container_name: opencode-vpn-2
     cap_add:
@@ -474,7 +474,7 @@ services:
   # mechanism as vpn-gluetun-2, see comment above) and the canary never
   # starts automatically.
   vpn-wg-test:
-    image: qmcgaw/gluetun:v3.40.0
+    image: qmcgaw/gluetun:v3.41.3
     profiles: ["wg-test"]
     container_name: opencode-wg-test
     cap_add:

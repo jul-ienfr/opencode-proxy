@@ -127,7 +127,12 @@ def _sync_control_api_key() -> bool:
     # (rôle encore sur l'ancienne clé). Les deux variables sont syncd.
     import json as _json
 
-    role = {"name": "normal", "auth": "apikey", "apikey": key}
+    # [fix 28/08] NO "name" field: that key is only valid in the TOML
+    # config file ([[roles]]); the HTTP_CONTROL_SERVER_AUTH_DEFAULT_ROLE
+    # env var is a single role object and gluetun ignores/rejects it when
+    # "name" is present (routes stay public + "unprotected" warning). The
+    # wiki format is exactly {"auth":"apikey","apikey":"..."}.
+    role = {"auth": "apikey", "apikey": key}
     _upsert_env_var(DST, "HTTP_CONTROL_SERVER_AUTH_DEFAULT_ROLE", _json.dumps(role))
     print(f"OK: {DST} VPN_CONTROL_API_KEY + HTTP_CONTROL_SERVER_AUTH_DEFAULT_ROLE synced from config.yaml")
     return True
