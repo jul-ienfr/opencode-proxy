@@ -5062,9 +5062,18 @@ class VPNManager:
                 # the root cause persists, a temporary heal is misleading.
                 # FIX always functional: OV with cascade may still fast-pin (TCP->UDP) even when auth_driven,
                 # because OV->WG is blocked by canary and OV UDP may still work.
+                # PROACTIVE: always try fast-pin for OV, even when auth_driven, if cascade ON
                 _allow_fast = not (auth_driven or churn_driven) or (self._stack_effective == "openvpn" and self._cascade_enabled)
-                if _allow_fast and await self._fast_recover_via_control(max_skips=3):
+                if _allow_fast and await self._fast_recover_via_control(max_skips=5):
                     return
+                # PROACTIVE 4/4: if 0/4 or 1/4 connected, force country rotation via control pin even when
+                # egress not yet dead — don't wait for 2 ticks, heal immediately
+                if self._egress_failures >= 1 and await self._pin_country_for_rotation(timeout=12, catchup=8):
+                    logger.warning("[vpn-watchdog] proactive country pin for s%s (egress %s/2)", self._station, self._egress_failures)
+                    if await self._finalize_ip(allow_stale=False):
+                        self._watchdog_backoff.record_success()
+                        self._set_status(VPNState.CONNECTED)
+                        return
                 try:
                     # [plan 18/08 §E3/am.20] LIGHT rung first — a plain
                     # `docker restart` (~1-2 s) before the heavy compose
