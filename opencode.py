@@ -5659,6 +5659,20 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
                     _log_free_model_usage(model_id, free_model, free_api_key, free_workspace, resp.status_code, 0, 0, _free_elapsed, ip=free_ip)
                     resp = None
                     continue
+                # [fix msg_6cfde942e100-106c] 37x 400 deepseek-v4-flash-free meme IP
+                # 19:48-19:50 -> fallback payant silencieux 401 Insufficient balance.
+                # Le 400 n'etait jamais classe retriable hors DataPolicyError, donc
+                # le multi-station ne re-tentait pas et consommait un seul strike.
+                # Instrumentation: body pour trier validation vs quota deguise.
+                if resp.status_code == 400 and _free_used < free_max:
+                    try:
+                        _b400 = (getattr(resp, "text", "") or "")[:512]
+                    except Exception:
+                        _b400 = ""
+                    _debug(f"  [free-400] {free_model!r} 400 station {attempt._station} ({_free_used}/{free_max}) body={_b400!r} -> retry fraiche")
+                    _log_free_model_usage(model_id, free_model, free_api_key, free_workspace, 400, 0, 0, _free_elapsed, ip=free_ip)
+                    resp = None
+                    continue
                 break  # 200, final-429 or other status → shared handling below
             except Exception as e:
                 _debug(f"  [free] curl_cffi error (station {attempt._station}): {e}")

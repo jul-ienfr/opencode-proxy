@@ -116,6 +116,10 @@ models:
     protocol: openai
   qwen3.8-flash:
     protocol: anthropic
+  hy4-preview:
+    protocol: openai
+  ling-3.0-flash-fin-free:
+    protocol: openai
 free_model_map:
   mimo-v2.5: mimo-v2.5-free
   qwen3.7-max: mimo-v2.5-free
@@ -146,7 +150,7 @@ ip_rotation:
   auto_ov_return_min: 60
   auto_wg_egress_ticks: 2
   backoff_max_delay: 60
-  bad_ttl: 30
+  bad_ttl: 20
   wg_canary_fail_ttl_s: 90
   wg_canary_pass_ttl_s: 600
   wg_canary_countries: Switzerland,Germany,Netherlands
