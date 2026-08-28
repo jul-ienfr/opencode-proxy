@@ -2164,10 +2164,32 @@ class VPNManager:
                         return True
             # SOCKS5 probe failed but gluetun may still be healthy — the
             # loopback SOCKS5 server can refuse connections while the tunnel
-            # is actually up. Trust gluetun's own control report.
+            # is actually up. Trust gluetun's own control report, then the
+            # HTTP proxy (works on Docker Desktop Windows where SOCKS5 loopback
+            # is refused) as a last egress liveness signal.
             if await self._control_status() and await self._control_public_ip():
                 return True
+            if await self._http_proxy_egress_ok():
+                return True
             return False
+        except Exception:
+            return False
+
+    async def _http_proxy_egress_ok(self) -> bool:
+        """[Axe 1.3 / Docker Desktop Win] Last-resort egress liveness when the
+        loopback SOCKS5 server refuses connections (known Docker Desktop
+        limitation — see gluetun wiki "Connect a LAN device to Gluetun": the
+        HTTP proxy on :8888 is the documented host/LAN egress path, SOCKS5 is
+        not). Probes one ip_check endpoint through the HTTP CONNECT proxy
+        (``self.proxy_url``); a 2xx/3xx response means the tunnel is genuinely
+        up and routing egress. Used only as a fallback after the SOCKS5 sweep
+        and the gluetun control report both fail.
+        """
+        try:
+            url = (self._ip_check_urls or [self._ip_check_url])[0]
+            async with httpx.AsyncClient(timeout=5, proxy=self.proxy_url) as client:
+                r = await client.get(url, follow_redirects=True)
+            return 200 <= r.status_code < 400
         except Exception:
             return False
 
@@ -2221,11 +2243,23 @@ class VPNManager:
                     self._socks5_eof_window = [t for t in self._socks5_eof_window if now - t < 300]
                     self._socks5_eof_count = len(self._socks5_eof_window)
                     if self._socks5_eof_count >= 4:
-                        logger.warning("[vpn] socks5 EOF burst x%d station %s — egress dead", self._socks5_eof_count, self._station)
-                        self.arm_egress_watchdog()
+                        # [stay-with-HTTP] SOCKS5 loopback refusal is EXPECTED on
+                        # Docker Desktop Windows — the HTTP proxy egress is the
+                        # real path. Only declare egress dead when the HTTP proxy
+                        # is ALSO down; otherwise tolerate (don't churn the host's
+                        # working tunnel).
+                        if not getattr(self, "_eof_tolerated_at", 0) or now - self._eof_tolerated_at > 300:
+                            logger.warning(
+                                "[vpn] socks5 EOF burst x%d station %s — tolerated, HTTP egress check",
+                                self._socks5_eof_count, self._station,
+                            )
+                            self._eof_tolerated_at = now
                         try:
-                            if self._watchdog_event is not None:
-                                self._watchdog_event.set()
+                            if not await self._http_proxy_egress_ok():
+                                logger.warning("[vpn] socks5 EOF + HTTP egress down station %s — egress dead", self._station)
+                                self.arm_egress_watchdog()
+                                if self._watchdog_event is not None:
+                                    self._watchdog_event.set()
                         except Exception:
                             pass
                 except Exception:

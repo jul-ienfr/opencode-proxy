@@ -4171,13 +4171,17 @@ async def _do_free_request_curl_cffi(
 
     # Pooled session — [A1 perf] checkout/checkin SANS verrou pendant le
     # transfert : le POST non-streaming ne sérialise plus la station.
-    # SOCKS5 d'abord, puis fallback HTTP (le SOCKS5 refuse le loopback sur
-    # Windows Docker Desktop, le proxy HTTP marche). On ne bad-mark le
-    # station QUE si le fallback HTTP échoue aussi (tunnel vraiment mort).
-    proxies_to_try = [proxy_url]
+    # HTTP d'abord (chemin documenté gluetun pour hôte/LAN sur Docker
+    # Desktop Windows — le SOCKS5 refuse le loopback), SOCKS5 en repli
+    # (utile dans le déploiement compose où vpn-gluetun:1080 marche).
+    # On ne bad-mark le station QUE si le SOCKS5 (dernier) échoue aussi
+    # (tunnel vraiment mort).
     http_fb = _http_fallback_proxy(proxy_url)
+    proxies_to_try = []
     if http_fb:
         proxies_to_try.append(http_fb)
+    if proxy_url:
+        proxies_to_try.append(proxy_url)
     last_exc = None
     for attempt_i, attempt_proxy in enumerate(proxies_to_try):
         is_last = attempt_i == len(proxies_to_try) - 1
