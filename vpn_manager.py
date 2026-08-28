@@ -5074,6 +5074,19 @@ class VPNManager:
                         self._watchdog_backoff.record_success()
                         self._set_status(VPNState.CONNECTED)
                         return
+                # PROACTIVE 0/4: all stations error → heal this station in parallel (don't wait for sequential ticks)
+                try:
+                    import shared_state as _ss
+                    _all = getattr(_ss, "vpn_managers", None) or []
+                    if _all and all(getattr(m, "_status", None) != VPNState.CONNECTED for m in _all if m):
+                        logger.warning("[vpn-watchdog] 0/4 detected — parallel heal s%s", self._station)
+                        if await self._pin_country_for_rotation(timeout=12, catchup=8):
+                            if await self._finalize_ip(allow_stale=False):
+                                self._watchdog_backoff.record_success()
+                                self._set_status(VPNState.CONNECTED)
+                                return
+                except Exception:
+                    pass
                 try:
                     # [plan 18/08 §E3/am.20] LIGHT rung first — a plain
                     # `docker restart` (~1-2 s) before the heavy compose
