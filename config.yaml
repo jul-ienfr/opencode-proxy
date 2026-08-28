@@ -1,30 +1,23 @@
 server:
   host: 0.0.0.0
   port: 4000
-  web_port: 8082
   debug: false
   log_dir: logs
 upstream:
   openai_base: https://opencode.ai/zen/go/v1/chat/completions
   anthropic_base: https://opencode.ai/zen/go/v1/messages
   free_base: https://opencode.ai/zen/v1/chat/completions
+  free_models_url: ''
   proxy: ''
   timeout:
-    connect: 30
+    connect: 5
     read: 600
-    write: 30
-    pool: 10
-  max_connections: 200
-  max_keepalive: 50
-  keepalive_expiry: 120
-  max_body_size:
-    default: 10485760    # 10 Mo — chat_completions et autres
-    messages: 26214400   # 25 Mo — couvre /compact (12-18 Mo p95)
-    responses: 15728640  # 15 Mo
-limits:
-  compact_json_thread_threshold: 1048576  # 1 Mo → json en thread
-  compact_tiktoken_char_limit: 100000    # 100k chars → fallback len//3.5
-  max_body_bytes_inflight: 104857600     # 100 Mo — garde volumétrique globale
+    write: 10
+    pool: 5
+  max_connections: 64
+  max_keepalive: 32
+  keepalive_expiry: 30
+  max_body_size: 10485760
 routing:
   opus_model: kimi-k2.6
   sonnet_model: glm-5.1
@@ -72,29 +65,215 @@ models:
     protocol: anthropic
   qwen3.5-plus:
     protocol: anthropic
+  kimi-k3:
+    protocol: openai
+  kimi-k2.7-code:
+    protocol: openai
+  glm-5.3:
+    protocol: openai
+  qwen3.8-max:
+    protocol: anthropic
+  hy3:
+    protocol: openai
+  hy3-preview:
+    protocol: openai
+  gpt-5.6-luna:
+    protocol: openai
+  grok-4.5:
+    protocol: openai
+  muse-spark-1.2-contributor:
+    protocol: openai
+    geo:
+      extends: meta-muse-spark
+  muse-spark-1.2-contributor-free:
+    protocol: openai
+    geo:
+      extends: meta-muse-spark
+  deepseek-v4-flash-free:
+    protocol: openai
+  hy3-free:
+    protocol: openai
+  laguna-s-2.1-free:
+    protocol: openai
+  mimo-v2.5-free:
+    protocol: openai
+  nemotron-3-ultra-free:
+    protocol: openai
+  nemotron-3.5-lightning-free:
+    protocol: openai
+  x-preview-f-free:
+    protocol: openai
+  ox-alpha-free:
+    protocol: openai
+    endpoint: go
+  deepseek-v4-flash-vision-exp:
+    protocol: openai
+  longcat-2.0:
+    protocol: openai
+  grok-4.6:
+    protocol: openai
+  glm-5.3-flash:
+    protocol: openai
+  qwen3.8-flash:
+    protocol: anthropic
+  hy4-preview:
+    protocol: openai
+  ling-3.0-flash-fin-free:
+    protocol: openai
 free_model_map:
-  deepseek-v4-flash: deepseek-v4-flash-free
   mimo-v2.5: mimo-v2.5-free
-ip_rotation:
+  qwen3.7-max: mimo-v2.5-free
+  glm-5.1: deepseek-v4-flash-free
+  kimi-k2.6: mimo-v2.5-free
+  minimax-m2.5: mimo-v2.5-free
+  deepseek-v4-flash: deepseek-v4-flash-free
+  hy3: hy3-free
+  muse-spark-1.2-contributor: muse-spark-1.2-contributor-free
+dashboard_trust:
+  mode: lan
+  lan_cidrs:
+  - 192.168.0.0/16
+  - 10.0.0.0/8
+  - 172.16.0.0/12
+  require_token: false
+client_auth:
+  mode: none
+  key: ''
+supervisor:
   enabled: true
+ip_rotation:
+  auto_flip_cooldown_min: 0
+  cascade_enabled: false
+  auto_hetero_boot: false
+  auto_max_free_attempts: true
+  auto_ov_fail_threshold: 3
+  auto_ov_return_min: 60
+  auto_wg_egress_ticks: 2
+  backoff_max_delay: 60
+  bad_ttl: 20
+  wg_canary_fail_ttl_s: 90
+  wg_canary_pass_ttl_s: 600
+  wg_canary_countries: Switzerland,Germany,Netherlands
+  wg_canary_enabled: true
+  circuit_breaker_recovery: 300
+  circuit_breaker_threshold: 3
+  compose_service_2: vpn-gluetun-2
+  connect_retry_interval: 20
+  control_api_key: VqdLMB1w_vBdO3rzfXYnlosN7PUEgOsnQgFtk3poXnE
+  control_enabled: true
+  control_pin_catchup: 25
+  control_pin_timeout: 20
+  country_offset: 14
+  country_offset_stride: 17
+  country_rotation: true
+  credentials_file: vpn_configs/credentials.txt
+  custom_ovpn_file: ''
+  docker_compose_file: docker-compose.yml
+  docker_container: opencode-vpn
+  docker_container_2: opencode-vpn-2
+  docker_events: true
+  dual_station: true
+  egress_failure_tick_interval: 2.0
+  enabled: true
+  free_exception_fallback: station-first
+  free_parallel:
+    enabled: true
+    routing: round-robin
+    mode: load-balance
+    hedge_delay_ms: 150
+    hedge_max_attempts: 2
+  identity_diversity: true
+  identity_max_profiles: 256
+  identity_profiles:
+  - extra_headers: {}
+    impersonate: chrome131
+    user_agent: null
+  identity_rotation: true
+  ip_check_url: https://api.ipify.org
+  ip_check_urls:
+  - https://api.ipify.org
+  - https://icanhazip.com
+  - https://ifconfig.me/ip
+  - https://checkip.amazonaws.com
+  ip_probe_budget: 10.0
+  latency_rotation:
+    consecutive_slow: 3
+    enabled: true
+    ewma_alpha: 0.3
+    ewma_threshold_ms: 6000
+    floor_ms: 3000
+    global_degraded_cooldown_sec: 300
+    global_degraded_threshold: 0.5
+    hard_cooldown_sec: 1800
+    max_soft_rotates_per_hour: 6
+    min_requests_before_eval: 5
+    p95_threshold_ms: 9000
+    slow_threshold_ms: 8000
+    slow_threshold_ms_per_model:
+      deepseek: 5000
+      default: 8000
+      glm: 4000
+      muse-spark: 6000
+    soft_cooldown_sec: 600
+    stream_metric: ttfb
+    window: 20
+  max_free_attempts: 4
+  ovpn_endpoint_port: '443'
+  ovpn_protocol: tcp
   proxy_mode: vpn
-  mode: docker
-  free_only: true
+  quota_per_ip: 500
+  recent_ip_max_age: 1800
+  recent_ip_window: 20
+  rotation_fail_cooldown: 60
+  rotation_max_duration: 240
+  rotation_stagger: 2
+  rotation_wait_timeout: 5
+  paid_hedge_after_ms: 0
+  server_countries: Germany,Netherlands,France,Spain,Poland,Sweden,Denmark,Finland,Norway,Belgium,Switzerland,Austria,Portugal,Italy,Ireland,United
+    Kingdom,Czech Republic,Estonia,Latvia,Lithuania,Romania,Hungary,Greece,Slovakia,Slovenia,Croatia,Bulgaria,Luxembourg,Iceland,Cyprus,Malta,United
+    States,Canada,Australia,Japan,Singapore
+  server_provider: nordvpn
+  shared_rotation_file: logs/shared_rotation.json
+  socks5_auto_rotate: true
+  socks5_proxies: []
+  socks5_proxy_port: 1080
+  socks5_proxy_port_2: 1081
+  state_file_2: logs/vpn_state2.json
+  station_count: 4
+  status_cache_seconds: 2.0
+  strict_free: true
+  on_429_action: both
+  switch_delay: 1
+  update_apply_idle_minutes: 15
+  update_apply_max_defer_hours: 24
+  update_apply_window: 03:00-05:00
+  update_check_interval: 21600
+  update_enabled: true
+  use_nordvpn_api: false
   vpn_proxy_port: 8888
-  openvpn:
-    configs_dir: vpn/configs
-    auth_file: vpn/credentials.txt
-    servers:
-    - name: de1227
-      config: vpn/configs/de1227.ovpn
-    - name: de1223
-      config: vpn/configs/de1223.ovpn
-  quota_per_ip: 300
-  switch_delay: 5
-  docker_image: openvpn-nordvpn
-  socks5_proxies:
-    rotate_socks5: true
-    list: []
+  vpn_proxy_port_2: 8889
+  vpn_stack: auto
+  wait_healthy_poll: 0.5
+  watchdog_backoff_base: 15
+  watchdog_backoff_max: 60
+  watchdog_interval: 20
+geo:
+  enabled: true
+  version: 1
+  allow_direct_when_compatible: true
+  pin_inline_timeout_s: 2
+  policies:
+    meta-muse-spark:
+      allowed_countries:
+      - United States
+      - Canada
+      - United Kingdom
+      - Australia
+      - Japan
+      - Singapore
+      last_checked_at: '2026-08-20T00:00:00Z'
+      mode: strict
+      require_vpn: true
 custom_routes:
   mimov25:
     match:
@@ -104,74 +283,69 @@ custom_routes:
   mimov25pro:
     match:
     - mimo-v2.5-pro
-    model: mimo-v2.5
+    model: muse-spark-1.2-contributor
   qwen35plus:
     match:
     - qwen3.5-plus
-    model: mimo-v2.5
+    model: muse-spark-1.2-contributor
     thinking: adaptive
   gpt54mini:
     match:
     - gpt-5.4-mini
-    model: mimo-v2.5
+    model: muse-spark-1.2-contributor
   kimik26:
     match:
     - kimi-k2.6
-    model: mimo-v2.5
-api_keys:
-- api_key: ***REMOVED-ROTATE-ME***
-  alias: joedouille648@gmail.com
-  go_workspace_id: wrk_01KQQG13W80W15YQPS4CZGY9FM
-  go_auth_cookie: Fe26.2**2a3b830b49b0314519c10981bfd5433a4ad6d5e9424896147bd779ba2cde6bdc*yNBPBAwUHSGSwlPQcfpBdw*5iwtiALr0YYvtOr4iSg0k06RxpKF5KwIVtuBOpkgUT6EmKbLYmBObhOI7dzLuAsij3PoahWkYWFQiFyQ5g2F18oqpPGcNgh20mjDhMGNb6__DQvrqd6A5p-lq0u9cdVmy-C2mpuQhdjwQH9gfcUq7p1xH0EBObjUFGxXl2NxrUQ5qdkfrA_ka5ppR7RFZQ547_a5UrWYSVvF7fGzD8LrxhbWFnThwCmEUDrsUg0AfVrptbKUfpvYbyiGeRRwkJbB4sfHSNJ25pOLR6xE8oOj176x0_IBZQtTokc_SBn_R9C_cUCqlwfJxaJhjBxAdglYPHkaTTDBn3IyI_7dL7PK3A*1812155771277*c8e19832a98d4cbf6ecb0bf3d0c0a8b830b2d5254c3c06743e0e0ff1c30deac3*Qae8LtSpAZJ_PYujMcoXLWCEth3GfDgg7qpAoqKCFTM
-  enabled: true
-- api_key: sk-m6bjriSKKpGpoTPmvYqua71deb7f6jsmjaQfeCF3ZeDoDYwUrf8gndorUzrUWQNT
-  alias: arthur0405@atomicmail.io
-  go_workspace_id: wrk_01KR5YD5316DP1KSB8WR4XRH9E
-  go_auth_cookie: Fe26.2**e4c2d52c5ad40f735d1f799d95c9406f1f94976c3045566fe598f6d36a4906b5*ELRWtmszKl38ppQ6IE3Vug*DP9YpL-3DCeBaPjZfuMH-A0I4hqd_0HsjABI1vcnv8B-aHrCEKyx3Mw9Z5mXFuOzOAdc-0WvprIBVelNthvkdOSLDS_kJUP83cVz-36DsTOawMG0RKlvU-M0SzkYj-MlKsoRAhFTnhsFqI8grVHuVaxvV-6Fprw1aViDybwRg2ylvOnWAV95X6X4Zm76eb0rDzymeLpZkRBsJ_yjHP7-25iR6D2yLUSPRuZZ5_imWADFQT3T67Io0hLCqi57OxcU93CC41_zaHuM4sJTDDZQufdr9rwaLwU82iuzWVwZaKQUzu9CF_hS0BXbQyQh6q_Kd4zPoM1_dMg83O32a1-uog*1809852122595*25a2b2cf8a8f252f74ee5b670e125fec6cd51eae7dd87216995ae94700b9e4ed*oMuZRSfbtn7HfIpgGXwp4rDZuLeGKwwDMO2I7c3Um5w
-  enabled: true
-- api_key: sk-0w7JFmSux2NXxB5PdOmq5uJQaYRznVi51Bnrmiff8bKYeFUhxTzfaGO7TZWP8hx8
-  alias: Patrice
-  go_workspace_id: wrk_01KSVYXW65VYQCKJ2WTXCXPGMQ
-  go_auth_cookie: Fe26.2**f83b4b2afd4ddc6bcd034cb2a7c6a3c04fe359ca6422e0a1649945ca4bf77651*PHt4lM8ffxGnYU7IhGnVNA*YjIr-V5OXwEm8aBWNncxZ2TBJ8xE4Mkp2HZjVd7iJZ8djZP3aDwzmM6kn9UIGf35A--SfbDQfHg0kX7qJOMCd0Fkm66iG6mWX-lhXTykOpJymfoqUkcy7XgO3B65rZOrJ-3CCxVPM2xmeOlWwky1ztgUH-QDqYuWQxCfN5JhxzO6Loe8CP8MdpROx_Q8awCP9kF3hhNzafAikYWPNwrHjC44lfvQSKMmZ94xJKyWHEAOR76CNtNcaN3C19invmsQ1C1HI502SqNh1DeviNzhxEdh7hlrx2mD77HE9jDu-YYfSiFp1rC10urx8TaF8b5NDwwmx_MY9aoGIL8FZt6Acw*1811664610719*8fcc623f3350d9bdd9dcf778a3dc85f6fb5a8b40cf0b8fbb448da016ef567d56*i3-pZOMhlQ9dvtyCHhAOS67yq8aVWMuv379prphYzvA
-  enabled: true
-- api_key: sk-aWY4yVKEAuMDNMvAl6sdUGDusboeZW589ckWTJskd517kyu4yqQKIJrexHozD6XJ
-  alias: laurent2804@atomicmail.io
-  go_workspace_id: wrk_01KSZ76PMN617KQDXKH8VWP2FD
-  go_auth_cookie: Fe26.2**629704ab113fb1b562df8a904d5a216c2dcf9748ef6920936654cb0d11824df6*G4Y3uvRZAX83f26VLLSQTA*a8snB6d1-6eTrW4Kml235NyL2ZbKrOYJVyy7RHz7IwQ-Ce9NBglWhI8YAaVaQn9H9rrJUpVaM6fSYpPPc5RJGfdUZGFGSqayhs8DunF9C4NMcp_GflFCtr9Dpzp_bMRb340Z7Z6UifXLuvFNiyvV5RUX8ZgdWrATjXx-vc7PoqcA2AB0F2w3WX9Cjhp5vB-QfDG60PxAwFSxSwXybpJKHBOJ7Arqer0bL4errYBggWDs_PlI-bJrPwL2atZoW6gd8zwX2XZpS_qJufzTfFEFhyQjNzh7xxDriyXl7ElkUdpo9wm4LQDYMweEqQu3rOIuFGg67G0R_JYSmX4rWDgFpg*1811773950919*ab25dd318eabbf66b9ca8d7fa86d043f990d017d7555ce0e7a14b855783f9097*dQ5-TbwgAZ2YfZRzsaaTh0lPGwgsjgtO_2ZMPTzsyWA
-  enabled: true
-- api_key: sk-mGh6PSl8t6rOCkAl8bJYCRAzuzCXdtDFWUZ3Jb2SjWF3pTmBmCzD2ZluB8eVlhni
-  alias: antoinne2804@atomicmail.io
-  go_workspace_id: wrk_01KT475NTJRWYVN0K4HT2QWY2R
-  go_auth_cookie: Fe26.2**1284f8bafcaa37856bee92827f2e65d79de82477acd9ac80e25116f07f20517a*h__5VroywwiTwm3CPzHHIQ*PVoDMWiOv5kWUwVBR3soNowRXIl533efR-LuJus21y-zrL432UDmHo_PILi3GwzqATYejEAWG_qyl-bJernqjbWsr_f2LXNP6ZJYczUfsgiA_I5G2YeL29htTqLBD1QRen8H2gJ_QZjfxhbv5z9-oZMuLXHHb6KhlLPcxQAIKOZh9-bbPQO63nkFJvceeq9fy1zAlKcsU53ScmoA1aynN4wSb8zgLhYQw5OFIKegzWYBAIKeU78hoUN-c5FT9Izc-2_RlhlHrDG4O7NxyJSanC3GL3R-I1Zuqf0pMiZ1NlqB5CIYXGXndrTVSBou4dTdeQGzL64VfkH3v0VO1Ef15A*1811941689510*96da07d6d6c8c1ddf68201e97a843b049f2969cd3d607329bde382898c601461*Hh1nIWV6OPqLDKd1hIeiNImYgE0tnAxuVnQLrtPWovA
-  enabled: true
-- api_key: sk-8yE0lTW4d3xsVw9O1DZ9pbMdRpeVNMGGkPHJKE7TJ9axWQzujO0UCmRwQwdqss5m
-  alias: salon2804@atomicmail.io
-  go_workspace_id: wrk_01KTA9P9PCQBYYXV9DV09SVTH1
-  go_auth_cookie: Fe26.2**0efc08f4cb18514907ec024a71f1d4920f42739bb53663cf859e47bb5e096cee*ow8JPWjSs0Qw-XVQ8X4NzQ*HirR_Wn816bBrM64_XeQ72MYVkknKafK7nib3gpQEyaa9QBAWXjVbjT48Y_W1VimEKi8ku-JCyXAMgIxKUMc1xLDD7f4CcoTyB9PCYe2LCwW2DgEkuWFHY2aQB8XZwjqXCUcZqtzr84YrEP6uaa2akcDHDCrWG3xONEAkznAo_cfIvvU9scxmKkMrpaPDFankrf4VBSDzLswl0S-M65CMY9BXfe8XhxzWVYxPGsX-I0JbWQhXxRtqj624QCOnbNBHqge5qO3hBRzeVZhw44ofx1QDbUzPeGjxely9Ba0ZvShlQ0dIsltYEf6UzKV1tIl3MHo8FNMX5khynxtP-KXYQ*1812145657727*c9fd2a8c78b617921d06353eb4a67f8b76569c446abe8c3ddc841cc2bfbb9beb*3vEjVQni-nW0AeWSzaNR8FhTu66uufzGEX2lKz6ku28
-  enabled: true
-tool_capabilities:
-  _default:
-    supported_tools: null
-    unsupported_tools: []
-    system_hint: null
-  mimo-v2-pro:
-    supported_tools: []
-    unsupported_tools:
-    - Read
-    - Write
-    - Edit
-    - Bash
-    - Grep
-    - Glob
-    - WebSearch
-    - WebFetch
-    - TodoWrite
-    system_hint: null
+    model: muse-spark-1.2-contributor
+  gpt56luna:
+    match:
+    - gpt-5.6-luna
+    model: muse-spark-1.2-contributor
+  deepseekv4flash:
+    match:
+    - deepseek-v4-flash
+    model: muse-spark-1.2-contributor
+  qwen37max:
+    match:
+    - qwen3.7-max
+    model: muse-spark-1.2-contributor
+  0xalphaoxalphaoxalpha:
+    match:
+    - 0xalpha
+    - ox-alpha
+    - oxalpha
+    model: muse-spark-1.2-contributor
+  glm51:
+    match:
+    - glm-5.1
+    model: muse-spark-1.2-contributor
+  musespark12contributor:
+    match:
+    - muse-spark-1.2-contributor
+    model: muse-spark-1.2-contributor
+api_keys: []
+pricing:
+  currency: USD
+  defaults:
+    input_per_mtok: 3.0
+    output_per_mtok: 15.0
+  per_model: {}
 web_search:
+  enabled: true
   mode: duckduckgo
   target_model: null
   max_results: 5
   timeout: 10
+  via_vpn: false
+  on_error: strip
+web_fetch:
+  enabled: true
+  mode: direct
+  target_model: null
+  timeout: 15
+  max_bytes: 12000
+  via_vpn: false
+  on_error: strip
 cache:
   max_size: 1000
   ttl: 300
@@ -180,8 +354,8 @@ circuit_breaker:
   failure_threshold: 5
   recovery_timeout: 60
 rate_limit:
-  rps: 50
-  burst: 100
+  rps: 200
+  burst: 400
   stale_ttl: 300
 key_pause:
   default_pause: 60
@@ -199,7 +373,6 @@ background:
   health_cache_ttl: 15
   health_timeout: 5
   custom_routes_check_interval: 5
-  tool_cap_check_interval: 5
 streaming:
   sse_keepalive_interval: 15
   line_buffer_max: 1000000
@@ -213,6 +386,8 @@ thinking:
   min_tokens:
     deepseek-v4-flash: 2048
     deepseek-v4-pro: 4096
+    muse-spark-1.2-contributor: 4096
+    muse-spark-1.2-contributor-free: 4096
   default_min_tokens: 256
 cache_rewrite_models:
 - mimo-v2.5
@@ -220,12 +395,16 @@ cache_rewrite_models:
 - mimo-v2-omni
 - mimo-v2.5-pro
 dashboard:
-  universal_tools:
-  - Read
-  - Write
-  - Edit
-  - Bash
-  - Grep
-  - Glob
-  - WebSearch
   display_lines: 35
+free_discovery:
+  enabled: true
+  interval: 3600
+  auto_persist: true
+  default_target: mimo-v2.5-free
+  go_only_ids:
+  - ox-alpha-free
+traffic:
+  enabled: true
+  max_frames: 500
+  body_cap: 131072
+  max_bytes: 33554432

@@ -1,0 +1,85 @@
+{
+  "fn": "openai_to_anthropic_request",
+  "input": {
+    "oai_body": {
+      "model": "claude-sonnet-4-5",
+      "max_tokens": 512,
+      "messages": [
+        {
+          "role": "system",
+          "content": "Be brief."
+        },
+        {
+          "role": "user",
+          "content": "Hi"
+        },
+        {
+          "role": "assistant",
+          "content": null,
+          "tool_calls": [
+            {
+              "id": "call_x1",
+              "function": {
+                "name": "ping",
+                "arguments": "{}"
+              }
+            }
+          ]
+        },
+        {
+          "role": "tool",
+          "tool_call_id": "call_x1",
+          "content": "pong"
+        },
+        {
+          "role": "user",
+          "content": "Continue"
+        }
+      ]
+    }
+  },
+  "expected": {
+    "model": "claude-sonnet-4-5",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Hi"
+          }
+        ]
+      },
+      {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "tool_use",
+            "id": "call_x1",
+            "name": "ping",
+            "input": {}
+          }
+        ]
+      },
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "tool_result",
+            "tool_use_id": "call_x1",
+            "content": "pong"
+          },
+          {
+            "type": "text",
+            "text": "Continue"
+          }
+        ]
+      }
+    ],
+    "max_tokens": 512,
+    "stream": false,
+    "system": "Be brief."
+  },
+  "_note": "role=tool bufferisé puis injecté dans le user suivant (contrat)",
+  "_generated_by": "scripts/gen_golden_fixtures.py (plan v10 §11.5)"
+}

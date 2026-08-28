@@ -1,0 +1,15 @@
+# Configuration gitleaks — [SEC-1 résolu 26/08]
+# L'historique a été purgé (git filter-repo, 3 branches force-poussées) :
+# plus aucun secret réel dans les blobs. Le gate est donc BLOQUANT dans ci.yml.
+#
+# Allowlist : config.yaml porte PAR DESIGN une clé locale (ip_rotation.control_api_key)
+# — c'est la source unique lue par scripts/make_credentials_env.py pour alimenter
+# credentials.env (gitignored). Ce n'est pas un credential externe ; la règle
+# generic-api-key la détecterait à chaque commit sinon. Tout AUTRE fichier reste
+# scanné normalement par les règles par défaut.
+[extend]
+useDefault = true
+
+[allowlist]
+  description = "cle locale du proxy (source unique config.yaml -> credentials.env)"
+  paths = ['''config\.yaml$''']

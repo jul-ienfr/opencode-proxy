@@ -1,24 +1,24 @@
 // HTTP status code explanations for common/proxy-relevant codes
 const HTTP_STATUS_EXPLANATIONS = {
-    400: 'Bad Request — the request was malformed',
-    401: 'Unauthorized — invalid or missing API key',
-    403: 'Forbidden — access denied',
-    404: 'Not Found — the requested resource is not available',
-    408: 'Request Timeout — the server timed out waiting for the request',
-    413: 'Payload Too Large — request exceeds the maximum allowed size',
-    429: 'Rate Limited — too many requests, please slow down',
-    500: 'Internal Server Error — the upstream server encountered an error',
-    502: 'Bad Gateway — the upstream server returned an invalid response',
-    503: 'Service Unavailable — the service is temporarily unavailable',
-    504: 'Gateway Timeout — the upstream server timed out',
-    520: 'Cloudflare 520 — origin server returned an empty or unknown response',
-    521: 'Cloudflare 521 — the origin server is down or refused the connection',
-    522: 'Cloudflare 522 — connection to the origin server timed out',
-    523: 'Cloudflare 523 — the origin server is unreachable',
-    524: 'Cloudflare 524 — a connection timeout occurred (origin too slow)',
-    525: 'Cloudflare 525 — SSL handshake failed between Cloudflare and the origin',
-    526: 'Cloudflare 526 — invalid SSL certificate on the origin server',
-    530: 'Cloudflare 530 — origin DNS error (domain does not resolve)',
+    400: 'Requête incorrecte — la requête est mal formée',
+    401: 'Non autorisé — clé API invalide ou manquante',
+    403: 'Interdit — accès refusé',
+    404: 'Non trouvé — ressource demandée indisponible',
+    408: 'Délai dépassé — le serveur a expiré en attendant la requête',
+    413: 'Charge trop volumineuse — requête dépasse la taille maximale autorisée',
+    429: 'Limite dépassée — trop de requêtes, veuillez ralentir',
+    500: 'Erreur interne — le serveur a rencontré une erreur',
+    502: 'Mauvaise passerelle — le serveur amont a renvoyé une réponse invalide',
+    503: 'Service indisponible — service temporairement indisponible',
+    504: 'Délai passerelle dépassé — le serveur amont a expiré',
+    520: 'Cloudflare 520 — le serveur d\'origine a renvoyé une réponse vide ou inconnue',
+    521: 'Cloudflare 521 — le serveur d\'origine est hors ligne ou a refusé la connexion',
+    522: 'Cloudflare 522 — délai de connexion au serveur d\'origine dépassé',
+    523: 'Cloudflare 523 — le serveur d\'origine est injoignable',
+    524: 'Cloudflare 524 — délai de connexion dépassé (origine trop lente)',
+    525: 'Cloudflare 525 — échec handshake SSL entre Cloudflare et l\'origine',
+    526: 'Cloudflare 526 — certificat SSL invalide sur le serveur d\'origine',
+    530: 'Cloudflare 530 — erreur DNS d\'origine (domaine non résolu)',
 };
 
 // ── i18n ──
@@ -56,6 +56,7 @@ const LOCALE = {
         'vpn.hint': 'Rotate IP addresses for free model quota via OpenVPN',
         'vpn.status': 'Status',
         'vpn.current_ip': 'Current IP',
+        'vpn.identity': 'Identity',
         'vpn.current_server': 'Server',
         'vpn.requests_this_ip': 'Requests this IP',
         'vpn.total_free': 'Total free requests',
@@ -68,6 +69,13 @@ const LOCALE = {
         'vpn.servers': 'VPN Servers',
         'vpn.add_server': 'Add Server',
         'vpn.ip_history': 'IP History',
+        'vpn.ip': 'IP',
+        'vpn.ip_total': 'Total',
+        'vpn.ip_free': 'Free',
+        'vpn.ip_paid': 'Paid',
+        'vpn.ip_identity': 'Identity',
+        'vpn.ip_last_seen': 'Last seen',
+        'vpn.ip_no_data': 'No IP usage yet',
         'vpn.credentials': 'NordVPN Credentials',
         'vpn.credentials_hint': 'Service credentials from NordVPN dashboard (Manual Setup)',
         'vpn.save_credentials': 'Save',
@@ -83,9 +91,41 @@ const LOCALE = {
         'vpn.rotation_off': 'Disabled',
         'vpn.ips_used': 'IPs used',
         'vpn.switches': 'Switches',
+        'vpn.stack.title': 'VPN technology',
+        'vpn.stack.hint': 'WireGuard/NordLynx preferred (no AUTH_FAILED); OpenVPN kept as fallback. Auto flips on reliability counters.',
+        'vpn.stations.title': 'Parallel VPN stations',
+        'vpn.stations.save': 'Apply',
+        'vpn.stations.hint': 'N simultaneous tunnels: when a station is exhausted (429) or near its quota, another takes over instantly while the first rotates in the background. Hot-applied, no proxy restart.',
+        'vpn.stack.auto': 'Auto (recommended)',
+        'vpn.stack.wireguard': 'WireGuard',
+        'vpn.stack.openvpn': 'OpenVPN',
+        'vpn.stack.save': 'Save',
+        'vpn.stack.station': 'Station',
+        'vpn.stack.effective': 'Effective',
+        'vpn.stack.keys': 'WG keys',
+        'vpn.stack.keys_present': 'present',
+        'vpn.stack.keys_missing': 'missing',
+        'vpn.stack.egress_fail': 'Egress failures',
+        'vpn.stack.egress_ticks': 'Egress dead ticks',
+        'vpn.stack.auth_failed': 'AUTH_FAILED / 30 min',
+        'vpn.stack.threshold': 'Flip threshold',
+        'vpn.stack.cooldown': 'Flip cooldown',
+        'vpn.stack.last_flip': 'Last flip',
+        'vpn.stack.history': 'Flip history (last 5)',
+        'vpn.stack.none': 'none',
         'vpn.servers_hint': 'NordVPN .ovpn configs',
         'vpn.confirm_remove': 'Remove this server?',
         'vpn.server_added': 'Server added',
+        'vpn.api_discovery': 'NordVPN API Discovery',
+        'vpn.api_hint': 'Auto-discover servers via NordVPN API',
+        'vpn.advanced': 'Advanced Settings',
+        'vpn.health_check': 'Health Check',
+        'vpn.config': 'VPN Configuration',
+        'vpn.mode': 'Mode',
+        'vpn.proxy_port': 'Proxy port',
+        'vpn.switch_delay': 'Switch delay (s)',
+        'vpn.docker_image': 'Docker image',
+        'vpn.config_summary': 'Config saved automatically',
         'last.update': 'Last update: ',
         'stats.overview': 'Overview',
         'stats.input': 'Input',
@@ -112,6 +152,7 @@ const LOCALE = {
         'filter.apply': 'Apply',
         'filter.to': 'to',
         'filter.now': 'now',
+        'filter.all': 'All',
         'logs.title': 'Request History',
         'logs.time': 'Time',
         'logs.original_model': 'Original Model',
@@ -135,13 +176,18 @@ const LOCALE = {
         'quotas.remaining': '% remaining',
         'config.server': 'Server Settings',
         'config.api_port': 'API Port',
-        'config.web_port': 'Web UI Port',
+        'config.host': 'Host',
         'config.bind_address': 'Bind Address',
         'config.bind_lan': 'Local network (0.0.0.0)',
         'config.bind_local': 'Local machine only (127.0.0.1)',
         'config.key_routing': 'Key Routing',
         'config.routing_rr': 'Round-Robin',
         'config.routing_failover': 'Failover',
+        'config.free_parallel': 'Parallelize free stations',
+        'config.free_parallel_hint': 'Round-Robin = least-loaded (spread on N), Failover = sticky 1 then switch on failure/quota. Hedge = N race, first wins (disabled for streaming).',
+        'config.free_routing': 'Free stations routing',
+        'config.free_routing_rr': 'Round-Robin (spread)',
+        'config.free_routing_failover': 'Failover (switch)',
         'config.save': 'Save Configuration',
         'config.saved': 'Configuration updated.',
         'proxy.running': 'Running',
@@ -201,6 +247,40 @@ const LOCALE = {
         'config.debug_off': 'Debug logging off',
         'config.debug_save': 'Toggle',
         'nav.debug_logs': 'Debug Logs',
+        'nav.traffic': 'Traffic',
+        'traffic.title': 'Traffic (Wireshark)',
+        'traffic.hint': 'Raw view of every client request on the wire — methods, paths, headers, body bytes, timing, tempo, and abrupt disconnects (RST).',
+        'traffic.capture': 'Capture',
+        'traffic.clear': 'Clear',
+        'traffic.auto_refresh': 'Auto-refresh',
+        'traffic.loading': 'Loading…',
+        'traffic.no_data': 'No frames captured yet.',
+        'traffic.time': 'Time',
+        'traffic.delta': 'Δms',
+        'traffic.method': 'Method',
+        'traffic.path': 'Path',
+        'traffic.status': 'Status',
+        'traffic.ttfb': 'TTFB',
+        'traffic.duration': 'Dur',
+        'traffic.size': 'Size',
+        'traffic.flags': 'Flags',
+        'traffic.frames': 'frames',
+        'traffic.rps': 'req/s',
+        'traffic.aborted': 'aborted',
+        'traffic.in_flight': 'in flight',
+        'traffic.slowest': 'slowest',
+        'traffic.avg_delta': 'avg Δ',
+        'traffic.p95_delta': 'p95 Δ',
+        'traffic.p95_ttfb': 'p95 TTFB',
+        'traffic.detail_title': 'Frame {id} — {method} {path}',
+        'traffic.headers': 'Headers',
+        'traffic.body_hex': 'Body (hex dump, {n} bytes)',
+        'traffic.body_trunc': ' (truncated)',
+        'traffic.aborted_by': 'Aborted: {r}',
+        'traffic.no_body': 'No body',
+        'traffic.unknown': '?',
+        'traffic.settings_changed': 'Capture settings saved.',
+        'traffic.cleared': 'Capture cleared.',
         'debug.title': 'Debug Log Viewer',
         'debug.clear': 'Clear Log',
         'debug.cleared': 'Log cleared.',
@@ -208,6 +288,7 @@ const LOCALE = {
         'debug.no_data': 'No debug logs. Enable debug mode in Configuration first.',
         'debug.loading': 'Loading...',
         'debug.lines': 'lines',
+        'dashboard_token_prompt': 'Enter dashboard token (DASHBOARD_TOKEN):',
         'config.api_keys': 'API Keys',
         'config.api_keys_desc': 'Configure API keys for upstream access. Each key can have its own Go workspace credentials.',
         'config.ak_alias': 'Alias',
@@ -254,6 +335,15 @@ const LOCALE = {
         'chart.token_dist': 'Token Distribution',
         'chart.token_pct': 'Token % by Model',
         'chart.req_pct': 'Requests % by Model',
+        'geo.direct_via_vpn': 'You are in Direct mode, but routed via VPN (station {station} {vpnCountry} {vpnIp}) because model {model} requires [{allowed}] and your direct egress {directIp} ({directCountry}) is outside that zone.',
+        'geo.direct_via_vpn_unknown': 'You are in Direct mode, but routed via VPN (station {station} {vpnCountry} {vpnIp}) because model {model} requires [{allowed}] and your direct IP is unknown.',
+        'geo.direct_via_vpn_short': 'Direct → VPN (geo fallback)',
+        'geo.badge_vpn': 'via VPN',
+        'geo.badge_direct': 'direct',
+        'geo.tooltip_allowed': 'Allowed: {allowed}',
+        'geo.toast_title': 'Geo fallback',
+        'geo.banner_direct_ok': 'Direct IP {directCountry} ({directIp}) compatible — no VPN needed',
+        'geo.banner_via_vpn': 'Direct {directCountry} ({directIp}) → VPN {vpnCountry} ({vpnIp}) for {model} — requires [{allowed}]',
     },
     fr: {
         'nav.stats': 'Statistiques',
@@ -287,6 +377,7 @@ const LOCALE = {
         'vpn.hint': 'Rotation des adresses IP pour le quota gratuit via OpenVPN',
         'vpn.status': 'Statut',
         'vpn.current_ip': 'IP actuelle',
+        'vpn.identity': 'Identité',
         'vpn.current_server': 'Serveur',
         'vpn.requests_this_ip': 'Requêtes cette IP',
         'vpn.total_free': 'Total requêtes gratuites',
@@ -299,6 +390,13 @@ const LOCALE = {
         'vpn.servers': 'Serveurs VPN',
         'vpn.add_server': 'Ajouter',
         'vpn.ip_history': 'Historique des IP',
+        'vpn.ip': 'IP',
+        'vpn.ip_total': 'Total',
+        'vpn.ip_free': 'Gratuites',
+        'vpn.ip_paid': 'Payantes',
+        'vpn.ip_identity': 'Identité',
+        'vpn.ip_last_seen': 'Dernière vue',
+        'vpn.ip_no_data': 'Aucune utilisation d\'IP',
         'vpn.credentials': 'Identifiants NordVPN',
         'vpn.credentials_hint': 'Identifiants de service depuis le dashboard NordVPN (Configuration manuelle)',
         'vpn.save_credentials': 'Enregistrer',
@@ -314,9 +412,41 @@ const LOCALE = {
         'vpn.rotation_off': 'Désactivé',
         'vpn.ips_used': 'IPs utilisées',
         'vpn.switches': 'Changements',
+        'vpn.stack.title': 'Technologie VPN',
+        'vpn.stack.hint': 'WireGuard/NordLynx préféré (aucun AUTH_FAILED) ; OpenVPN conservé en filet. Auto bascule sur compteurs de fiabilité.',
+        'vpn.stations.title': 'Stations VPN parallèles',
+        'vpn.stations.save': 'Appliquer',
+        'vpn.stations.hint': 'N tunnels simultanés : quand une station est épuisée (429) ou approche du quota, une autre prend le relais immédiatement pendant que la première rotate en arrière-plan. Appliqué à chaud, sans redémarrage du proxy.',
+        'vpn.stack.auto': 'Auto (recommandé)',
+        'vpn.stack.wireguard': 'WireGuard',
+        'vpn.stack.openvpn': 'OpenVPN',
+        'vpn.stack.save': 'Enregistrer',
+        'vpn.stack.station': 'Station',
+        'vpn.stack.effective': 'Effectif',
+        'vpn.stack.keys': 'Clés WG',
+        'vpn.stack.keys_present': 'présentes',
+        'vpn.stack.keys_missing': 'absentes',
+        'vpn.stack.egress_fail': 'Échecs egress',
+        'vpn.stack.egress_ticks': 'Ticks egress morts',
+        'vpn.stack.auth_failed': 'AUTH_FAILED / 30 min',
+        'vpn.stack.threshold': 'Seuil de bascule',
+        'vpn.stack.cooldown': 'Cooldown bascule',
+        'vpn.stack.last_flip': 'Dernière bascule',
+        'vpn.stack.history': 'Historique bascules (5 derniers)',
+        'vpn.stack.none': 'aucune',
         'vpn.servers_hint': 'Configs .ovpn NordVPN',
         'vpn.confirm_remove': 'Supprimer ce serveur ?',
         'vpn.server_added': 'Serveur ajouté',
+        'vpn.api_discovery': 'Découverte API NordVPN',
+        'vpn.api_hint': 'Découvre automatiquement les serveurs via l\'API NordVPN',
+        'vpn.advanced': 'Paramètres avancés',
+        'vpn.health_check': 'Health Check',
+        'vpn.config': 'Configuration VPN',
+        'vpn.mode': 'Mode',
+        'vpn.proxy_port': 'Port proxy',
+        'vpn.switch_delay': 'Délai switch (s)',
+        'vpn.docker_image': 'Image Docker',
+        'vpn.config_summary': 'Config sauvée automatiquement',
         'last.update': 'Dernière mise à jour : ',
         'stats.overview': 'Aperçu',
         'stats.input': 'Entrée',
@@ -343,6 +473,7 @@ const LOCALE = {
         'filter.apply': 'Appliquer',
         'filter.to': 'au',
         'filter.now': 'maintenant',
+        'filter.all': 'Tous',
         'logs.title': 'Historique des Requêtes',
         'logs.time': 'Heure',
         'logs.original_model': "Modèle d'origine",
@@ -365,13 +496,17 @@ const LOCALE = {
         'quotas.remaining': '% restant',
         'config.server': 'Paramètres Serveur',
         'config.api_port': 'Port API',
-        'config.web_port': 'Port Interface Web',
         'config.bind_address': 'Adresse de liaison',
         'config.bind_lan': 'Réseau local (0.0.0.0)',
         'config.bind_local': 'Machine uniquement (127.0.0.1)',
         'config.key_routing': 'Routage des clés',
         'config.routing_rr': 'Round-Robin',
         'config.routing_failover': 'Failover',
+        'config.free_parallel': 'Paralléliser les stations free',
+        'config.free_parallel_hint': 'Round-Robin = least-loaded (répartit sur N), Failover = sticky 1 puis bascule sur panne/quota. Hedge = course N stations, premier gagne (désactivé en streaming).',
+        'config.free_routing': 'Routage stations free',
+        'config.free_routing_rr': 'Round-Robin (répartir)',
+        'config.free_routing_failover': 'Failover (bascule)',
         'config.save': 'Sauvegarder',
         'config.saved': 'Configuration mise à jour.',
         'proxy.running': 'En cours',
@@ -431,6 +566,40 @@ const LOCALE = {
         'config.debug_off': 'Debug désactivé',
         'config.debug_save': 'Basculer',
         'nav.debug_logs': 'Logs Debug',
+        'nav.traffic': 'Trafic',
+        'traffic.title': 'Trafic (Wireshark)',
+        'traffic.hint': 'Vue brute de chaque requête client sur le fil — méthodes, chemins, en-têtes, octets du corps, timing, tempo, et déconnexions abruptes (RST).',
+        'traffic.capture': 'Capture',
+        'traffic.clear': 'Vider',
+        'traffic.auto_refresh': 'Actualisation auto',
+        'traffic.loading': 'Chargement…',
+        'traffic.no_data': 'Aucune frame capturée pour l\'instant.',
+        'traffic.time': 'Heure',
+        'traffic.delta': 'Δms',
+        'traffic.method': 'Méthode',
+        'traffic.path': 'Chemin',
+        'traffic.status': 'Statut',
+        'traffic.ttfb': 'TTFB',
+        'traffic.duration': 'Durée',
+        'traffic.size': 'Taille',
+        'traffic.flags': 'Drapeaux',
+        'traffic.frames': 'frames',
+        'traffic.rps': 'req/s',
+        'traffic.aborted': 'avortées',
+        'traffic.in_flight': 'en vol',
+        'traffic.slowest': 'plus lente',
+        'traffic.avg_delta': 'Δ moy',
+        'traffic.p95_delta': 'Δ p95',
+        'traffic.p95_ttfb': 'TTFB p95',
+        'traffic.detail_title': 'Frame {id} — {method} {path}',
+        'traffic.headers': 'En-têtes',
+        'traffic.body_hex': 'Corps (dump hex, {n} octets)',
+        'traffic.body_trunc': ' (tronqué)',
+        'traffic.aborted_by': 'Avorté : {r}',
+        'traffic.no_body': 'Pas de corps',
+        'traffic.unknown': '?',
+        'traffic.settings_changed': 'Paramètres de capture enregistrés.',
+        'traffic.cleared': 'Capture vidée.',
         'debug.title': 'Visionneuse de Logs Debug',
         'debug.clear': 'Vider le log',
         'debug.cleared': 'Log vidé.',
@@ -438,6 +607,7 @@ const LOCALE = {
         'debug.no_data': 'Aucun log debug. Activez le mode debug dans Configuration.',
         'debug.loading': 'Chargement...',
         'debug.lines': 'lignes',
+        'dashboard_token_prompt': 'Entrez le jeton du dashboard (DASHBOARD_TOKEN) :',
         'config.api_keys': 'Clés API',
         'config.api_keys_desc': 'Configurez les clés API. Chaque clé peut avoir ses propres identifiants Go workspace.',
         'config.ak_alias': 'Alias',
@@ -484,6 +654,15 @@ const LOCALE = {
         'chart.token_dist': 'Distribution des tokens',
         'chart.token_pct': 'Tokens % par modèle',
         'chart.req_pct': 'Requêtes % par modèle',
+        'geo.direct_via_vpn': 'Vous êtes en mode Direct, mais routé via VPN (station {station} {vpnCountry} {vpnIp}) car le modèle {model} exige [{allowed}] et votre IP directe {directIp} ({directCountry}) est hors zone.',
+        'geo.direct_via_vpn_unknown': 'Vous êtes en mode Direct, mais routé via VPN (station {station} {vpnCountry} {vpnIp}) car le modèle {model} exige [{allowed}] et votre IP directe est indéterminée.',
+        'geo.direct_via_vpn_short': 'Direct → VPN (repli géo)',
+        'geo.badge_vpn': 'via VPN',
+        'geo.badge_direct': 'direct',
+        'geo.tooltip_allowed': 'Autorisé : {allowed}',
+        'geo.toast_title': 'Repli géo',
+        'geo.banner_direct_ok': 'IP directe {directCountry} ({directIp}) compatible — pas de VPN nécessaire',
+        'geo.banner_via_vpn': 'Direct {directCountry} ({directIp}) → VPN {vpnCountry} ({vpnIp}) pour {model} — exige [{allowed}]',
     },
 };
 
@@ -572,18 +751,42 @@ let totalPages = 1;
 // Config state
 let configData = null;
 let availableModels = [];
+// [fix] Flags anti-écrasement (global, utilisés par renderConfig et refreshVPNStatus)
+let _vpnStationPending = null;
+let _vpnSaving = false;
+let _vpnOn429Pending = null;
+let _vpnOn429Saving = false;
+let _vpnCooldownSaving = false;
+let _vpnCooldownPending = null;
+let _crSaving = false;
+let _crDirty = false;
 
 function escHtml(s) {
     return (s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
 async function apiFetch(url, options = {}) {
-    const resp = await fetch(url, options);
+    let resp = await fetchWithToken(url, options);
+    if (resp.status === 401 && localStorage.getItem('dashboard_token')) {
+        // Token rejected or expired — ask again, then retry once
+        const token = prompt(t('dashboard_token_prompt'));
+        if (token) {
+            localStorage.setItem('dashboard_token', token.trim());
+            resp = await fetchWithToken(url, options);
+        }
+    }
     if (!resp.ok) {
         const text = await resp.text().catch(() => '');
         throw new Error(`HTTP ${resp.status}: ${text.slice(0, 200)}`);
     }
     return resp.json();
+}
+
+async function fetchWithToken(url, options = {}) {
+    const token = localStorage.getItem('dashboard_token');
+    const headers = { ...(options.headers || {}) };
+    if (token) headers['X-Dashboard-Token'] = token;
+    return fetch(url, { ...options, headers });
 }
 
 async function fetchStats(from, to) {
@@ -595,16 +798,6 @@ async function fetchStats(from, to) {
     } catch (e) {
         console.error('Failed to fetch stats:', e);
         return null;
-    }
-}
-
-async function fetchToolRoutes(days = 7, showAll = false) {
-    try {
-        const params = `days=${days}` + (showAll ? '&all=true' : '');
-        return await apiFetch(`/api/tools?${params}`);
-    } catch (e) {
-        console.error('Failed to fetch tool routes:', e);
-        return [];
     }
 }
 
@@ -713,6 +906,236 @@ function renderDebugLogLines(data) {
     nextBtn.disabled = debugLogPage >= debugLogTotalPages;
 }
 
+// ── Traffic / Wireshark-like raw capture ──
+
+function debounce(fn, ms) {
+    let timer = null;
+    return (...args) => {
+        if (timer) clearTimeout(timer);
+        timer = setTimeout(() => { timer = null; fn(...args); }, ms);
+    };
+}
+
+let trafficFilter = '';
+let trafficLastStats = null;
+let trafficLastFirstId = null; // [P4.6] diff-rendu
+
+async function fetchTrafficStatus() {
+    try {
+        return await apiFetch('/api/traffic/status');
+    } catch (e) {
+        console.error('Failed to fetch traffic status:', e);
+        return null;
+    }
+}
+
+async function toggleTrafficCapture(enabled) {
+    const statusEl = document.getElementById('traffic-status');
+    try {
+        await apiFetch('/api/traffic/config', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ enabled })
+        });
+        if (statusEl) {
+            statusEl.textContent = t('traffic.settings_changed');
+            statusEl.className = 'save-status success';
+            setTimeout(() => { statusEl.textContent = ''; }, 2500);
+        }
+    } catch (e) {
+        console.error('Failed to toggle capture:', e);
+        if (statusEl) {
+            statusEl.textContent = t('status.error');
+            statusEl.className = 'save-status error';
+        }
+    }
+}
+
+async function clearTrafficCapture() {
+    const statusEl = document.getElementById('traffic-status');
+    try {
+        await apiFetch('/api/traffic/clear', { method: 'POST' });
+        if (statusEl) {
+            statusEl.textContent = t('traffic.cleared');
+            statusEl.className = 'save-status success';
+            setTimeout(() => { statusEl.textContent = ''; }, 2500);
+        }
+        const tbody = document.getElementById('traffic-tbody');
+        if (tbody) {
+            tbody.innerHTML = `<tr><td colspan="9">${t('traffic.no_data')}</td></tr>`;
+        }
+        const detail = document.getElementById('traffic-detail');
+        if (detail) detail.style.display = 'none';
+        trafficRefresh();
+    } catch (e) {
+        console.error('Failed to clear capture:', e);
+        if (statusEl) {
+            statusEl.textContent = t('status.error');
+            statusEl.className = 'save-status error';
+        }
+    }
+}
+
+const METHOD_COLORS = {
+    GET: 'var(--success)',
+    POST: 'var(--accent)',
+    PUT: 'var(--warn)',
+    DELETE: 'var(--danger)',
+    PATCH: 'var(--warn)',
+    OPTIONS: 'var(--text-dim)',
+};
+
+function formatDur(ms) {
+    if (ms === null || ms === undefined || isNaN(ms)) return t('traffic.unknown');
+    if (ms < 1000) return Math.round(ms) + 'ms';
+    return (ms / 1000).toFixed(2) + 's';
+}
+
+function renderTrafficStatsBar(status, stats, frames) {
+    const bar = document.getElementById('traffic-stats-bar');
+    if (!bar) return;
+    let chips = [];
+    if (status) {
+        chips.push(`${status.frames} <b>${t('traffic.frames')}</b>`);
+        chips.push(`${status.bytes_stored ? (status.bytes_stored / 1024).toFixed(0) + 'KB' : '0B'} cap`);
+    }
+    if (stats) {
+        chips.push(`${stats.rps} <b>${t('traffic.rps')}</b>`);
+        if (stats.tempo_delta_ms) chips.push(`${t('traffic.avg_delta')} <b>${stats.tempo_delta_ms.p50}ms</b> / p95 <b>${stats.tempo_delta_ms.p95}ms</b>`);
+        if (stats.ttfb_ms) chips.push(`${t('traffic.p95_ttfb')} <b>${formatDur(stats.ttfb_ms.p95)}</b>`);
+        if (stats.duration_ms) chips.push(`${t('traffic.slowest')} <b>${formatDur(stats.duration_ms.max)}</b>`);
+        if (stats.aborted > 0) chips.push(`${t('traffic.aborted')} <b style="color:var(--danger)">${stats.aborted}</b>`);
+        if (stats.in_flight > 0) chips.push(`${t('traffic.in_flight')} <b style="color:var(--warn)">${stats.in_flight}</b>`);
+    }
+    let spark = '';
+    if (frames && frames.length > 1) {
+        // Tempo sparkline: inter-arrival delta per frame, oldest → newest
+        const deltas = frames.slice().reverse().map(f => f.delta_ms || 0);
+        const maxD = Math.max(...deltas, 1);
+        spark = '<span style="display:inline-flex;align-items:flex-end;gap:1px;height:22px;margin-left:6px;">'
+            + deltas.map(d => {
+                const h = Math.max(2, Math.round((d / maxD) * 20));
+                const hot = d > 0 && d < 5;
+                return `<span title="${d}ms" style="width:3px;height:${h}px;background:${hot ? 'var(--danger)' : 'var(--accent)'};opacity:.85"></span>`;
+            }).join('')
+            + '</span>';
+    }
+    bar.innerHTML = chips.map(c => `<span style="white-space:nowrap">${c}</span>`).join(' &nbsp;·&nbsp; ') + spark;
+}
+
+function renderTrafficFrames(data) {
+    const tbody = document.getElementById('traffic-tbody');
+    if (!tbody) return;
+    // Sync capture toggle with server state (baited by config page posts)
+    const capCb = document.getElementById('traffic-enabled');
+    if (capCb && data.status) capCb.checked = !!data.status.enabled;
+    renderTrafficStatsBar(data.status, trafficLastStats, data.frames);
+    // [P4.6 perf] diff-rendu : si le premier frame id n'a pas changé, skip le rebuild complet (200 <tr>)
+    const firstId = data.frames && data.frames[0] ? data.frames[0].id : null;
+    if (firstId !== null && firstId === trafficLastFirstId && tbody.querySelector(`tr[data-fid="${firstId}"]`)) {
+        // frames identiques au dernier rendu — pas de nouveau trafic, on garde le DOM
+        return;
+    }
+    trafficLastFirstId = firstId;
+
+    if (!data.frames || data.frames.length === 0) {
+        tbody.innerHTML = `<tr><td colspan="9" style="color:var(--text-dim)">${t('traffic.no_data')}</td></tr>`;
+        return;
+    }
+    tbody.innerHTML = data.frames.map(f => {
+        const flags = [];
+        if (f.aborted) flags.push(`<span class="flag-abort" title="${escHtml(f.abort_reason || '')}">ABORT</span>`);
+        if (f.truncated) flags.push(`<span class="flag-trunc">TRUNC</span>`);
+        if (f.status === null) flags.push(`<span class="flag-flight">…</span>`);
+        const methodColor = METHOD_COLORS[f.method] || 'var(--text)';
+        const statusCell = f.status !== null
+            ? `<span style="color:${f.status >= 500 ? 'var(--danger)' : f.status >= 400 ? 'var(--warn)' : 'var(--success)'}">${f.status}</span>`
+            : '<span style="color:var(--text-dim)">…</span>';
+        const reqTarget = f.query ? `${f.path}?${f.query}` : f.path;
+        return `<tr data-fid="${f.id}" ${f.aborted ? 'class="row-abort"' : ''} style="cursor:pointer" title="${escHtml(f.request_line)} — ${escHtml(f.client_ip || '')}:${f.client_port ?? ''}">
+            <td style="white-space:nowrap;font-family:monospace;font-size:0.9em">${f.time}<span style="color:var(--text-dim)">.${String(f.time_ms).padStart(3, '0')}</span></td>
+            <td style="white-space:nowrap;text-align:right;font-family:monospace">${f.delta_ms !== null && f.delta_ms !== undefined ? f.delta_ms.toFixed(1) : '-'}</td>
+            <td style="color:${methodColor};font-weight:600">${escHtml(f.method)}</td>
+            <td style="max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:monospace;font-size:0.9em">${escHtml(reqTarget)}</td>
+            <td>${statusCell}</td>
+            <td style="white-space:nowrap;text-align:right;font-family:monospace">${f.ttfb_ms !== null && f.ttfb_ms !== undefined ? f.ttfb_ms.toFixed(0) : '-'}</td>
+            <td style="white-space:nowrap;text-align:right;font-family:monospace">${f.duration_ms !== null && f.duration_ms !== undefined ? f.duration_ms.toFixed(0) : '-'}</td>
+            <td style="white-space:nowrap;text-align:right;font-family:monospace">${f.body_len > 0 ? (f.body_len / 1024).toFixed(1) + 'KB' : '–'}</td>
+            <td style="white-space:nowrap">${flags.join(' ')}</td>
+        </tr>`;
+    }).join('');
+}
+
+async function trafficRefresh() {
+    trafficFilter = (document.getElementById('traffic-filter')?.value || '').trim();
+    const params = new URLSearchParams({ limit: '200' });
+    if (trafficFilter) params.set('path', trafficFilter);
+    try {
+        const [framesData, statsData, statusData] = await Promise.all([
+            apiFetch(`/api/traffic/frames?${params}`),
+            apiFetch('/api/traffic/stats?window=60.0'),
+            apiFetch('/api/traffic/status'),
+        ]);
+        trafficLastStats = statsData;
+        renderTrafficFrames({ ...framesData, status: statusData });
+    } catch (e) {
+        console.error('Failed to refresh traffic:', e);
+        const tbody = document.getElementById('traffic-tbody');
+        if (tbody) tbody.innerHTML = `<tr><td colspan="9" style="color:var(--danger)">${t('status.error')}</td></tr>`;
+    }
+}
+
+async function fetchTrafficFrameDetail(fid) {
+    const detail = document.getElementById('traffic-detail');
+    if (!detail) return;
+    try {
+        detail.style.display = 'block';
+        detail.innerHTML = '<span style="color:var(--text-dim)">' + t('traffic.loading') + '</span>';
+        const f = await apiFetch(`/api/traffic/frames/${fid}`);
+        renderTrafficDetail(detail, f);
+    } catch (e) {
+        console.error('Failed to fetch frame detail:', e);
+        detail.innerHTML = `<span style="color:var(--danger)">${t('status.error')}</span>`;
+    }
+}
+
+function renderTrafficDetail(detail, f) {
+    const methodColor = METHOD_COLORS[f.method] || 'var(--text)';
+    const flags = [];
+    if (f.aborted) flags.push(`<span class="flag-abort">ABORT</span>`);
+    if (f.truncated) flags.push(`<span class="flag-trunc">TRUNC</span>`);
+    const metaLines = [
+        `<span style="color:${methodColor};font-weight:700">${escHtml(f.method)}</span> <span style="font-family:monospace">${escHtml(f.request_line)}</span> ${flags.join(' ')}`,
+        `${f.client_ip || '?'}:${f.client_port ?? '?'} &nbsp;·&nbsp; ${f.time}.${String(f.time_ms).padStart(3, '0')} &nbsp;·&nbsp; Δ ${f.delta_ms?.toFixed(1) ?? '-'}ms &nbsp;·&nbsp; TTFB ${f.ttfb_ms != null ? f.ttfb_ms.toFixed(1) + 'ms' : '-'} &nbsp;·&nbsp; dur ${f.duration_ms != null ? f.duration_ms.toFixed(1) + 'ms' : '-'}`,
+    ];
+    if (f.aborted && f.abort_reason) {
+        metaLines.push(`<span style="color:var(--danger)">⚠ ${escHtml(f.abort_reason)}</span>`);
+    }
+    let headersHtml = f.headers && f.headers.length
+        ? f.headers.map(h => `<div><span style="color:var(--text-dim)">${escHtml(h.name)}</span>: <span style="font-family:monospace">${escHtml(h.value)}</span></div>`).join('')
+        : `<span style="color:var(--text-dim)">—</span>`;
+    let hexHtml;
+    if (f.body_hex && f.body_hex.length) {
+        hexHtml = f.body_hex.map(row =>
+            `<div style="display:flex;gap:12px;white-space:pre;font-family:monospace;font-size:0.85em">
+                <span style="color:var(--text-dim);min-width:48px">${row.offset}</span>
+                <span style="min-width:150px">${row.hex}</span>
+                <span>${row.ascii}</span>
+            </div>`).join('');
+    } else {
+        hexHtml = `<span style="color:var(--text-dim)">${t('traffic.no_body')}</span>`;
+    }
+    detail.innerHTML = `
+        <div style="border-bottom:1px solid var(--border);padding-bottom:6px;margin-bottom:8px">
+            <div style="font-weight:600">${t('traffic.detail_title').replace('{id}', f.id).replace('{method}', f.method).replace('{path}', escHtml(f.path))}</div>
+            ${metaLines.join('<br>')}
+        </div>
+        <div style="margin-bottom:8px"><b>${t('traffic.headers')}</b> (${f.headers ? f.headers.length : 0})</div>
+        <div style="margin-bottom:8px;display:grid;grid-template-columns:1fr;gap:1px;max-height:220px;overflow-y:auto">${headersHtml}</div>
+        <div style="margin-bottom:4px"><b>${t('traffic.body_hex').replace('{n}', f.body_len ?? 0)}</b>${f.truncated ? t('traffic.body_trunc') : ''}</div>
+        <div style="background:var(--bg);border:1px solid var(--border);border-radius:4px;padding:8px;overflow-x:auto;max-height:360px;overflow-y:auto">${hexHtml}</div>`;
+}
+
 function formatResetTime(seconds) {
     if (seconds <= 0) return t('filter.now');
     const d = Math.floor(seconds / 86400);
@@ -729,7 +1152,13 @@ function renderQuotas(data) {
     const container = document.getElementById('quota-workspaces');
     const statusMsg = document.getElementById('quota-status-message');
 
-    if (!data || Object.keys(data).length === 0) {
+    if (data === null) {
+        // [35] Fetch failed — distinguish from "nothing configured"
+        statusMsg.textContent = t('quotas.error');
+        container.innerHTML = '';
+        return;
+    }
+    if (Object.keys(data).length === 0) {
         statusMsg.textContent = t('quotas.not_configured');
         container.innerHTML = '';
         return;
@@ -825,7 +1254,7 @@ function renderStats(data) {
     document.getElementById('total-fail').textContent = formatNumber(totals.fail_count);
     document.getElementById('avg-duration').textContent = totals.avg_duration_ms ? formatNumber(totals.avg_duration_ms) : '-';
     document.getElementById('cache-hit-rate').textContent = totals.cache_hit_rate != null ? totals.cache_hit_rate + '%' : '0%';
-    document.getElementById('success-rate').textContent = totals.success_rate != null ? totals.success_rate + '%' : '0%';
+    document.getElementById('success-rate').textContent = totals.success_rate != null ? totals.success_rate + '%' : '—';
     document.getElementById('total-requests').textContent = formatNumber(totals.count);
 
     const tbody = document.getElementById('model-tbody');
@@ -844,7 +1273,7 @@ function renderStats(data) {
                 <td>${formatNumber(s.total)}</td>
                 <td>${s.pct}</td>
                 <td>${s.cache_hit_rate != null ? s.cache_hit_rate + '%' : '0%'}</td>
-                <td>${s.success_rate != null ? s.success_rate + '%' : '0%'}</td>
+                <td>${s.success_rate != null ? s.success_rate + '%' : '—'}</td>
                 <td>${formatNumber(s.success_count)}</td>
                 <td>${formatNumber(s.fail_count)}</td>
                 <td>${s.avg_duration_ms ? formatNumber(s.avg_duration_ms) : '-'}</td>
@@ -869,7 +1298,7 @@ function renderStats(data) {
                 <td>${formatNumber(s.total)}</td>
                 <td>${s.pct}</td>
                 <td>${s.cache_hit_rate != null ? s.cache_hit_rate + '%' : '0%'}</td>
-                <td>${s.success_rate != null ? s.success_rate + '%' : '0%'}</td>
+                <td>${s.success_rate != null ? s.success_rate + '%' : '—'}</td>
                 <td>${formatNumber(s.success_count)}</td>
                 <td>${formatNumber(s.fail_count)}</td>
                 <td>${s.avg_duration_ms ? formatNumber(s.avg_duration_ms) : '-'}</td>
@@ -973,6 +1402,10 @@ let chartTsRequests = null, chartTsTokens = null, chartTsDuration = null, chartT
 
 async function renderTimeSeriesCharts(from, to) {
     try {
+        // [P2 perf] fetch seulement si l'onglet stats est visible — inutile
+        // de payer l'agrégation SQL pour des charts cachés.
+        const activeTab = document.querySelector('.tab.active');
+        if (!activeTab || activeTab.dataset.tab !== 'stats') return;
         const data = await apiFetch(`/api/stats/timeseries?from_date=${from || ''}&to_date=${to || ''}&granularity=hour`);
         if (!data || !data.series || !data.series.length) return;
 
@@ -1014,8 +1447,8 @@ async function renderTimeSeriesCharts(from, to) {
                     data: {
                         labels,
                         datasets: [
-                            { label: 'Success', data: reqData, backgroundColor: 'rgba(75,192,192,0.7)' },
-                            { label: 'Errors', data: failData, backgroundColor: 'rgba(255,99,132,0.7)' }
+                            { label: t('stats.success'), data: reqData, backgroundColor: 'rgba(75,192,192,0.7)' },
+                            { label: t('stats.failed'), data: failData, backgroundColor: 'rgba(255,99,132,0.7)' }
                         ]
                     },
                     options: { ...tsOpts, plugins: { legend: { display: true, labels: { color: textColor } } } }
@@ -1040,9 +1473,9 @@ async function renderTimeSeriesCharts(from, to) {
                     data: {
                         labels,
                         datasets: [
-                            { label: 'Input', data: inputData, borderColor: '#4fc3f7', fill: true, backgroundColor: 'rgba(79,195,247,0.1)' },
-                            { label: 'Output', data: outputData, borderColor: '#ff8a65', fill: true, backgroundColor: 'rgba(255,138,101,0.1)' },
-                            { label: 'Cache', data: cacheData, borderColor: '#81c784', fill: true, backgroundColor: 'rgba(129,199,132,0.1)' }
+                            { label: t('stats.input'), data: inputData, borderColor: '#4fc3f7', fill: true, backgroundColor: 'rgba(79,195,247,0.1)' },
+                            { label: t('stats.output'), data: outputData, borderColor: '#ff8a65', fill: true, backgroundColor: 'rgba(255,138,101,0.1)' },
+                            { label: t('stats.cache'), data: cacheData, borderColor: '#81c784', fill: true, backgroundColor: 'rgba(129,199,132,0.1)' }
                         ]
                     },
                     options: { ...tsOpts, plugins: { legend: { display: true, labels: { color: textColor } } } }
@@ -1083,8 +1516,8 @@ async function renderTimeSeriesCharts(from, to) {
                     data: {
                         labels,
                         datasets: [
-                            { label: 'Success', data: successData, backgroundColor: 'rgba(75,192,192,0.7)' },
-                            { label: 'Error', data: failData, backgroundColor: 'rgba(255,99,132,0.7)' }
+                            { label: t('stats.success'), data: successData, backgroundColor: 'rgba(75,192,192,0.7)' },
+                            { label: t('status.error'), data: failData, backgroundColor: 'rgba(255,99,132,0.7)' }
                         ]
                     },
                     options: { ...tsOpts, plugins: { legend: { display: true, labels: { color: textColor } } }, scales: { ...tsOpts.scales, x: { ...tsOpts.scales.x, stacked: true }, y: { ...tsOpts.scales.y, stacked: true } } }
@@ -1108,7 +1541,7 @@ function showRequestDetail(reqId) {
     const content = document.getElementById('req-detail-content');
 
     // Show loading state while fetching full details
-    content.innerHTML = '<p style="color:#888;text-align:center;padding:20px">Loading details...</p>';
+    content.innerHTML = `<p style="color:#888;text-align:center;padding:20px">${t('stats.loading')}</p>`;
     modal.style.display = 'flex';
 
     // Fetch full details from API
@@ -1116,8 +1549,8 @@ function showRequestDetail(reqId) {
         .then(r => r.json())
         .then(detail => {
             const statusHtml = detail.success
-                ? '<span class="status-ok">&#10004; Success</span>'
-                : `<span class="status-fail">&#10008; ${escHtml(detail.error || 'Error')}</span>`;
+                ? `<span class="status-ok">&#10004; ${t('stats.success')}</span>`
+                : `<span class="status-fail">&#10008; ${escHtml(detail.error || t('status.error'))}</span>`;
 
             const toolsUsedHtml = (detail.tools_used && detail.tools_used.length)
                 ? [...new Set(detail.tools_used)].map(t => `<span class="tool-badge used">${escHtml(t)}</span>`).join(' ')
@@ -1208,7 +1641,12 @@ function renderHistory(data) {
     }
 
     // Cache logs for detail modal
+    // [v10 §14.3.23] cache borné : session longue = croissance illimitée sinon
     for (const log of data.logs) {
+        const keys = Object.keys(_historyLogsCache);
+        if (keys.length >= 500) {
+            delete _historyLogsCache[keys[0]];
+        }
         _historyLogsCache[log.id] = log;
     }
 
@@ -1223,7 +1661,7 @@ function renderHistory(data) {
             const escError = escHtml(log.error);
             const escExplanation = errDetail.explanation ? escHtml(errDetail.explanation) : '';
             // Build a rich tooltip: error → explanation → context
-            const tooltipParts = ['Error: ' + escError];
+            const tooltipParts = [t('status.error') + ': ' + escError];
             if (escExplanation) tooltipParts.push(escExplanation);
             tooltipParts.push('Model: ' + escHtml(log.model || '-') + ' | Protocol: ' + escHtml(log.protocol || '-'));
             const tooltipText = tooltipParts.join('&#10;');
@@ -1242,11 +1680,25 @@ function renderHistory(data) {
         } else if (log.tools && log.tools.length) {
             toolsHtml = `<span title="${escHtml(log.tools.join(', '))}"><span class="tool-badge declared">${log.tools.length} declared</span></span>`;
         }
+        // Geo fallback badge (direct → VPN)
+        let geoHtml = '';
+        if (log.geo_via_vpn) {
+            const allowed = (log.geo_allowed || '').split(',').map(s=>s.trim()).filter(Boolean).join(', ');
+            const dc = log.geo_direct_country || '?';
+            const di = log.geo_direct_ip || '?';
+            const vc = log.geo_country || '?';
+            const vi = log.free_ip || log.geo_country || '';
+            const model = log.model || '';
+            const tip = t('geo.direct_via_vpn').replace('{station}', '?').replace('{vpnCountry}', vc).replace('{vpnIp}', vi).replace('{model}', model).replace('{allowed}', allowed).replace('{directIp}', di).replace('{directCountry}', dc);
+            geoHtml = `<br><span class="tool-badge" style="background:var(--warning,#e6a000);color:#fff" title="${escHtml(tip)}">${escHtml(t('geo.badge_vpn'))} ${escHtml(dc)}→${escHtml(vc)}</span> <span style="font-size:10px;color:var(--text-muted)">${escHtml(di)} → ${escHtml(vi)}</span>`;
+        } else if (log.geo_direct_country) {
+            geoHtml = `<br><span class="tool-badge" style="background:var(--bg);border:1px solid var(--border)" title="${escHtml(log.geo_direct_country + ' ' + (log.geo_direct_ip||''))}">${escHtml(t('geo.badge_direct'))} ${escHtml(log.geo_direct_country)}</span>`;
+        }
         html += `<tr class="detail-row" data-req-id="${escHtml(log.id)}">
             <td>${log.is_free_model ? '<span title="Modèle gratuit — pas de compte utilisé" style="color:var(--success);font-weight:bold">' + escHtml(log.free_ip || 'GRATUIT') + '</span>' : escHtml(log.account_alias) || '-'}</td>
             <td>${formatDateTime(log.timestamp)}</td>
             <td>${escHtml(log.original_model) || '-'}</td>
-            <td>${escHtml(log.model) || '-'}</td>
+            <td>${escHtml(log.model) || '-'}${geoHtml}</td>
             <td>${formatNumber(log.tokens_input)}</td>
             <td>${formatNumber(log.tokens_output)}</td>
             <td>${formatNumber(log.tokens_cache)}</td>
@@ -1400,12 +1852,6 @@ function renderConfig(data) {
     // Custom routes table
     renderCustomRoutes(data.custom_routes || {}, modelIds);
 
-    // Tool routes table — fetch and render
-    fetchToolRoutes().then(tools => renderToolRoutes(tools, modelIds));
-
-    // Tool compatibility matrix — fetch and render
-    fetchToolCapabilities().then(data => renderToolCompatMatrix(data, modelIds));
-
     // Apply server-side language if different
     if (data.lang && data.lang !== getLang()) {
         setLang(data.lang);
@@ -1434,7 +1880,7 @@ function renderCustomRoutes(routes, modelIds) {
         const thinkVal = info.thinking || 'auto';
         const effortVal = info.effort || 'auto';
         html += `<tr>
-            <td><input type="text" class="config-input cr-edit-match" value="${match}" style="width:100%"></td>
+            <td><input type="text" class="config-input cr-edit-match" value="${escHtml(match)}" style="width:100%"></td>
             <td><select class="config-select cr-edit-model" style="width:100%"><option value="">${t('config.cr_select_model')}</option>${opts.replace(`value="${model}"`, `value="${model}" selected`)}</select></td>
             <td style="text-align:center"><input type="checkbox" class="cr-edit-enabled" ${checked}></td>
             <td><select class="config-select cr-edit-thinking" style="width:100%">${thinkOpts.replace(`value="${thinkVal}"`, `value="${thinkVal}" selected`)}</select></td>
@@ -1445,195 +1891,22 @@ function renderCustomRoutes(routes, modelIds) {
     tbody.innerHTML = html;
 }
 
-function renderToolRoutes(tools, modelIds) {
-    const tbody = document.getElementById('tool-routes-tbody');
-    if (!tools || tools.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="4">' + t('config.tr_no_tools') + '</td></tr>';
-        return;
-    }
-    const opts = modelIds.map(id => `<option value="${id}">${id}</option>`).join('');
-    let html = '';
-    for (const tool of tools) {
-        const selectedRouted = tool.routed_to || '';
-        const isRouted = !!selectedRouted;
-        html += `<tr>
-            <td><code>${escHtml(tool.name)}</code></td>
-            <td>${tool.count}</td>
-            <td><select class="config-select tr-model-select" style="width:100%" data-tool="${escHtml(tool.name)}">
-                <option value="">—</option>
-                ${opts.replace(`value="${selectedRouted}"`, `value="${selectedRouted}" selected`)}
-            </select></td>
-            <td>${isRouted ? '<span class="status-ok">' + t('config.tr_routed') + '</span>' : '<span class="text-dim">' + t('config.tr_unrouted') + '</span>'}</td>
-        </tr>`;
-    }
-    tbody.innerHTML = html;
-}
-
-function gatherToolRoutes() {
-    const rows = document.querySelectorAll('#tool-routes-tbody tr');
-    const toolRoutes = {};
-    for (const row of rows) {
-        const select = row.querySelector('.tr-model-select');
-        if (!select) continue;
-        const toolName = select.dataset.tool;
-        const model = select.value;
-        if (toolName && model) {
-            const key = makeRouteKey(toolName);
-            toolRoutes[key] = { match: [toolName], model: model };
-        }
-    }
-    return toolRoutes;
-}
-
-// ── Tool Compatibility Matrix ──
-
-let _toolCompatData = null;
-
-async function fetchToolCapabilities() {
-    try {
-        return await apiFetch('/api/config/tool-capabilities');
-    } catch (e) {
-        console.error('Failed to fetch tool capabilities:', e);
-        return null;
-    }
-}
-
-function renderToolCompatMatrix(data, modelIds) {
-    const tbody = document.getElementById('tool-compat-tbody');
-    if (!data || !data.all_tools || data.all_tools.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="100">No tool data available yet. Make some requests first.</td></tr>';
-        return;
-    }
-    const caps = data.capabilities || {};
-    const tools = data.all_tools;
-    const models = data.all_models || modelIds;
-    const protocols = {};
-    // Build protocol map from MODELS config or default
-    for (const m of models) {
-        protocols[m] = 'openai'; // default
-    }
-
-    // Header row with tool names
-    let headerHtml = '<tr><th style="min-width:140px">Model</th><th>Protocol</th>';
-    for (const tool of tools) {
-        headerHtml += `<th style="writing-mode:vertical-lr;text-orientation:mixed;font-size:0.75em;min-width:36px">${escHtml(tool)}</th>`;
-    }
-    headerHtml += '<th>System Hint</th></tr>';
-
-    // Data rows
-    let bodyHtml = '';
-    for (const model of models) {
-        if (model === '_default' || model === '_doc') continue;
-        const cfg = caps[model] || {};
-        const defaults = caps['_default'] || {};
-        const supported = cfg.supported_tools || defaults.supported_tools;
-        const unsupported = cfg.unsupported_tools || defaults.unsupported_tools || [];
-        const hint = cfg.system_hint || defaults.system_hint || '';
-
-        bodyHtml += '<tr>';
-        bodyHtml += `<td><code style="font-size:0.85em">${escHtml(model)}</code></td>`;
-        bodyHtml += `<td class="text-dim" style="font-size:0.8em">${protocols[model] || 'openai'}</td>`;
-
-        for (const tool of tools) {
-            let supported_val;
-            if (supported !== null && supported !== undefined) {
-                supported_val = supported.includes(tool);
-            } else {
-                supported_val = !unsupported.includes(tool);
-            }
-            const cls = supported_val ? 'tc-supported' : 'tc-unsupported';
-            const icon = supported_val ? '✓' : '✗';
-            bodyHtml += `<td class="${cls}" style="text-align:center;cursor:pointer" data-model="${escHtml(model)}" data-tool="${escHtml(tool)}" onclick="toggleToolCompat(this)">${icon}</td>`;
-        }
-
-        const hintIcon = hint ? '💡' : '—';
-        bodyHtml += `<td style="text-align:center;font-size:0.9em" title="${escHtml(hint)}">${hintIcon}</td>`;
-        bodyHtml += '</tr>';
-    }
-
-    // Default row
-    if (caps['_default']) {
-        const def = caps['_default'];
-        bodyHtml += '<tr style="border-top:2px solid var(--border)">';
-        bodyHtml += '<td><code style="font-size:0.85em">_default</code></td>';
-        bodyHtml += '<td class="text-dim" style="font-size:0.8em">—</td>';
-        for (const tool of tools) {
-            const supported_val = def.unsupported_tools ? !def.unsupported_tools.includes(tool) : true;
-            const cls = supported_val ? 'tc-supported' : 'tc-unsupported';
-            const icon = supported_val ? '✓' : '✗';
-            bodyHtml += `<td class="${cls}" style="text-align:center;cursor:pointer" data-model="_default" data-tool="${escHtml(tool)}" onclick="toggleToolCompat(this)">${icon}</td>`;
-        }
-        bodyHtml += '<td style="text-align:center;font-size:0.9em">—</td>';
-        bodyHtml += '</tr>';
-    }
-
-    tbody.innerHTML = headerHtml + bodyHtml;
-    _toolCompatData = data;
-}
-
-function toggleToolCompat(td) {
-    const model = td.dataset.model;
-    const tool = td.dataset.tool;
-    const isCurrentlySupported = td.textContent.trim() === '✓';
-    td.textContent = isCurrentlySupported ? '✗' : '✓';
-    td.className = isCurrentlySupported ? 'tc-unsupported' : 'tc-supported';
-
-    // Update _toolCompatData
-    if (_toolCompatData && _toolCompatData.capabilities) {
-        const caps = _toolCompatData.capabilities;
-        const defaults = caps['_default'] || {};
-        const modelCfg = caps[model] || {};
-
-        // Switch between whitelist and blacklist modes
-        if (isCurrentlySupported) {
-            // Was supported, now unsupported — add to unsupported_tools
-            const unsupported = modelCfg.unsupported_tools || [];
-            if (!unsupported.includes(tool)) {
-                unsupported.push(tool);
-            }
-            caps[model] = { ...modelCfg, unsupported_tools: unsupported };
-        } else {
-            // Was unsupported, now supported — remove from unsupported_tools
-            let unsupported = modelCfg.unsupported_tools || [];
-            unsupported = unsupported.filter(t => t !== tool);
-            if (unsupported.length === 0 && !modelCfg.supported_tools) {
-                delete caps[model].unsupported_tools;
-            } else {
-                caps[model] = { ...modelCfg, unsupported_tools: unsupported };
-            }
-        }
-    }
-}
-
-async function saveToolCapabilities() {
-    if (!_toolCompatData || !_toolCompatData.capabilities) return;
-    const status = document.getElementById('tc-save-status');
-    try {
-        await apiFetch('/api/config/tool-capabilities', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(_toolCompatData.capabilities),
-        });
-        status.textContent = 'Saved!';
-        status.className = 'save-status success';
-        setTimeout(() => { status.textContent = ''; }, 3000);
-    } catch (e) {
-        status.textContent = 'Error saving';
-        status.className = 'save-status error';
-        console.error(e);
-    }
-}
-
-// ── Web Search config ──
+// ── Web Search / Web Fetch config (v3.3 symétrique) ──
 async function fetchWebSearchConfig() {
     try {
         const data = await apiFetch('/api/config/web-search');
         const modeSelect = document.getElementById('ws-mode-select');
         const modelSelect = document.getElementById('ws-model-select');
         const maxResults = document.getElementById('ws-max-results');
+        const timeoutEl = document.getElementById('ws-timeout');
+        const enabledEl = document.getElementById('ws-enabled');
+        const viaEl = document.getElementById('ws-via-vpn');
 
         modeSelect.value = data.mode || 'duckduckgo';
         maxResults.value = data.max_results || 5;
+        if (timeoutEl) timeoutEl.value = data.timeout || 10;
+        if (enabledEl) enabledEl.value = String(data.enabled !== false);
+        if (viaEl) viaEl.value = String(!!data.via_vpn);
 
         // Populate model dropdown
         modelSelect.innerHTML = '<option value="">-- select model --</option>';
@@ -1648,6 +1921,32 @@ async function fetchWebSearchConfig() {
         // Show/hide model selector based on mode
         const showModel = data.mode !== 'duckduckgo';
         document.getElementById('ws-model-group').style.display = showModel ? '' : 'none';
+
+        // WebFetch
+        const wf = data.web_fetch || {};
+        const wfMode = document.getElementById('wf-mode-select');
+        const wfModel = document.getElementById('wf-model-select');
+        const wfMax = document.getElementById('wf-max-bytes');
+        const wfTimeout = document.getElementById('wf-timeout');
+        const wfEnabled = document.getElementById('wf-enabled');
+        const wfVia = document.getElementById('wf-via-vpn');
+        if (wfMode) wfMode.value = wf.mode || 'direct';
+        if (wfMax) wfMax.value = wf.max_bytes || 12000;
+        if (wfTimeout) wfTimeout.value = wf.timeout || 15;
+        if (wfEnabled) wfEnabled.value = String(wf.enabled !== false);
+        if (wfVia) wfVia.value = String(!!wf.via_vpn);
+        if (wfModel) {
+            wfModel.innerHTML = '<option value="">-- select model --</option>';
+            (data.available_models || []).forEach(m => {
+                const opt = document.createElement('option');
+                opt.value = m;
+                opt.textContent = m;
+                if (m === wf.target_model) opt.selected = true;
+                wfModel.appendChild(opt);
+            });
+            const showWfModel = (wf.mode || 'direct') !== 'direct';
+            document.getElementById('wf-model-group').style.display = showWfModel ? '' : 'none';
+        }
     } catch (e) {
         console.error('Failed to fetch web search config:', e);
     }
@@ -1659,17 +1958,44 @@ async function saveWebSearchConfig() {
         const mode = document.getElementById('ws-mode-select').value;
         const target_model = document.getElementById('ws-model-select').value || null;
         const max_results = parseInt(document.getElementById('ws-max-results').value) || 5;
+        const timeout = parseInt(document.getElementById('ws-timeout').value) || 10;
+        const enabled = document.getElementById('ws-enabled').value === 'true';
+        const via_vpn = document.getElementById('ws-via-vpn').value === 'true';
 
         await apiFetch('/api/config/web-search', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ mode, target_model, max_results }),
+            body: JSON.stringify({ mode, target_model, max_results, timeout, enabled, via_vpn }),
         });
-        status.textContent = 'Saved!';
+        status.textContent = t('config.cr_saved');
         status.className = 'save-status success';
         setTimeout(() => { status.textContent = ''; }, 3000);
     } catch (e) {
-        status.textContent = 'Error saving';
+        status.textContent = t('status.error');
+        status.className = 'save-status error';
+        console.error(e);
+    }
+}
+
+async function saveWebFetchConfig() {
+    const status = document.getElementById('wf-save-status');
+    try {
+        const mode = document.getElementById('wf-mode-select').value;
+        const target_model = document.getElementById('wf-model-select').value || null;
+        const max_bytes = parseInt(document.getElementById('wf-max-bytes').value) || 12000;
+        const timeout = parseInt(document.getElementById('wf-timeout').value) || 15;
+        const enabled = document.getElementById('wf-enabled').value === 'true';
+        const via_vpn = document.getElementById('wf-via-vpn').value === 'true';
+        await apiFetch('/api/config/web-fetch', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ mode, target_model, max_bytes, timeout, enabled, via_vpn }),
+        });
+        status.textContent = t('config.cr_saved');
+        status.className = 'save-status success';
+        setTimeout(() => { status.textContent = ''; }, 3000);
+    } catch (e) {
+        status.textContent = t('status.error');
         status.className = 'save-status error';
         console.error(e);
     }
@@ -1687,10 +2013,10 @@ function renderApiKeysTable(apiKeys) {
         const wsPlaceholder = k.go_workspace_id_masked || ws.slice(0, 4) + '****' || '';
         const cookiePlaceholder = k.go_auth_cookie_masked || '****';
         return `<tr data-index="${i}">
-            <td><input type="text" class="config-input ak-alias" value="${k.alias || ''}" placeholder="${t('config.ak_alias')}" style="width:100%"></td>
-            <td><div class="api-key-row"><input type="password" class="config-input ak-key" value="${k.api_key || ''}" placeholder="${keyPlaceholder}" style="width:100%;font-family:monospace"><button class="btn btn-sm btn-toggle-secret" title="${t('show_hide')}">&#128065;</button></div></td>
-            <td><input type="text" class="config-input ak-workspace" value="${ws}" style="width:100%"></td>
-            <td><div class="api-key-row"><input type="password" class="config-input ak-cookie" value="${k.go_auth_cookie || ''}" placeholder="${cookiePlaceholder}" style="width:100%;font-family:monospace"><button class="btn btn-sm btn-toggle-secret" title="${t('show_hide')}">&#128065;</button></div></td>
+            <td><input type="text" class="config-input ak-alias" value="${escHtml(k.alias || '')}" placeholder="${t('config.ak_alias')}" style="width:100%"></td>
+            <td><div class="api-key-row"><input type="password" class="config-input ak-key" value="${escHtml(k.api_key || '')}" placeholder="${keyPlaceholder}" style="width:100%;font-family:monospace"><button class="btn btn-sm btn-toggle-secret" title="${t('show_hide')}">&#128065;</button></div></td>
+            <td><input type="text" class="config-input ak-workspace" value="${escHtml(ws)}" style="width:100%"></td>
+            <td><div class="api-key-row"><input type="password" class="config-input ak-cookie" value="${escHtml(k.go_auth_cookie || '')}" placeholder="${cookiePlaceholder}" style="width:100%;font-family:monospace"><button class="btn btn-sm btn-toggle-secret" title="${t('show_hide')}">&#128065;</button></div></td>
             <td style="text-align:center"><input type="checkbox" class="ak-enabled" ${k.enabled !== false ? 'checked' : ''}></td>
             <td><button class="btn btn-danger btn-sm ak-delete-btn">${t('config.ak_delete')}</button></td>
         </tr>`;
@@ -1727,6 +2053,8 @@ function setupTabs() {
             } else if (target === 'debug-logs') {
                 debugLogPage = 1;
                 fetchDebugLogs(1).then(renderDebugLogLines);
+            } else if (target === 'traffic') {
+                trafficRefresh();
             }
         });
     });
@@ -1786,7 +2114,7 @@ function populateFilterDropdown(id, values) {
     const select = document.getElementById(id);
     if (!select) return;
     const current = select.value;
-    select.innerHTML = '<option value="">All</option>';
+    select.innerHTML = `<option value="">${t('filter.all') || 'Tous'}</option>`;
     values.forEach(v => {
         if (!v) return;
         const opt = document.createElement('option');
@@ -1900,7 +2228,7 @@ function setupConfig() {
             // Refresh config display
             fetchConfig().then(renderConfig);
         } catch (e) {
-            saveStatus.textContent = 'Error saving';
+            saveStatus.textContent = t('status.error');
             saveStatus.className = 'save-status error';
             console.error('Failed to save config:', e);
         }
@@ -1955,7 +2283,7 @@ function setupConfig() {
             `<option value="${v}">${t('config.cr_effort_' + v)}</option>`).join('');
         const thinking = document.getElementById('cr-thinking').value;
         const effort = document.getElementById('cr-effort').value;
-        row.innerHTML = `<td><input type="text" class="config-input cr-edit-match" value="${match}" style="width:100%"></td>
+        row.innerHTML = `<td><input type="text" class="config-input cr-edit-match" value="${escHtml(match)}" style="width:100%"></td>
             <td><select class="config-select cr-edit-model" style="width:100%"><option value="">${t('config.cr_select_model')}</option>${opts}</select></td>
             <td style="text-align:center"><input type="checkbox" class="cr-edit-enabled" checked></td>
             <td><select class="config-select cr-edit-thinking" style="width:100%">${thinkOptsA.replace(`value="${thinking}"`, `value="${thinking}" selected`)}</select></td>
@@ -1964,6 +2292,7 @@ function setupConfig() {
         // Remove empty state
         if (tbody.querySelector('td[colspan]')) tbody.innerHTML = '';
         tbody.appendChild(row);
+        _crDirty = true;
         document.getElementById('cr-match').value = '';
         document.getElementById('cr-model').selectedIndex = 0;
     });
@@ -1974,14 +2303,20 @@ function setupConfig() {
         if (!btn) return;
         const row = btn.closest('tr');
         if (row) row.remove();
+        _crDirty = true;
         const tbody = document.getElementById('custom-routes-tbody');
         if (!tbody.querySelector('tr')) {
             tbody.innerHTML = '<tr><td colspan="6">' + t('config.cr_no_routes') + '</td></tr>';
         }
     });
+    // Marque dirty sur toute édition (input/select/checkbox) dans le tableau
+    document.getElementById('custom-routes-tbody').addEventListener('input', () => { _crDirty = true; });
+    document.getElementById('custom-routes-tbody').addEventListener('change', () => { _crDirty = true; });
 
-    // Custom routes: save
+    // Custom routes: save — [fix] 1 clic suffit (feedback + anti-écrasement)
     document.getElementById('cr-save-btn').addEventListener('click', async () => {
+        if (_crSaving) return;
+        const btn = document.getElementById('cr-save-btn');
         const tbody = document.getElementById('custom-routes-tbody');
         const rows = tbody.querySelectorAll('tr');
         const routes = {};
@@ -2003,6 +2338,9 @@ function setupConfig() {
             routes[key] = routeData;
         }
         const status = document.getElementById('cr-save-status');
+        _crSaving = true;
+        const _origText = btn ? btn.textContent : '';
+        if (btn) { btn.disabled = true; btn.textContent = 'En cours...'; btn.style.opacity = '0.6'; }
         try {
             await apiFetch('/api/config/custom-routes', {
                 method: 'POST',
@@ -2012,68 +2350,32 @@ function setupConfig() {
             status.textContent = t('config.cr_saved');
             status.className = 'save-status success';
             setTimeout(() => { status.textContent = ''; }, 3000);
-            fetchConfig().then(renderConfig);
+            // libère avant fetch pour que renderConfig puisse peindre le frais
+            _crSaving = false;
+            _crDirty = false;
+            const fresh = await fetchConfig();
+            if (fresh) renderConfig(fresh);
         } catch (e) {
-            status.textContent = 'Error saving';
+            status.textContent = t('status.error');
             status.className = 'save-status error';
             console.error(e);
+        } finally {
+            _crSaving = false;
+            if (btn) { btn.disabled = false; btn.textContent = _origText || t('config.cr_save'); btn.style.opacity = ''; }
         }
     });
 
-    // ── Tool Routes: toggle universal tools visibility ──
-    document.getElementById('tr-show-all').addEventListener('change', async (e) => {
-        const tools = await fetchToolRoutes(7, e.target.checked);
-        renderToolRoutes(tools, availableModels);
-    });
-
-    // ── Tool Routes: save ──
-    document.getElementById('tr-save-btn').addEventListener('click', async () => {
-        const toolRoutes = gatherToolRoutes();
-
-        // Fetch existing custom routes and merge
-        const configData = await apiFetch('/api/config');
-        const existingRoutes = configData.custom_routes || {};
-
-        // Remove old tool routes (those matching known tool names from the current data)
-        const currentTools = await fetchToolRoutes(7, true); // fetch all including universal
-        const currentToolNames = new Set(currentTools.map(t => t.name));
-        for (const key of Object.keys(existingRoutes)) {
-            const matches = existingRoutes[key].match || [];
-            if (matches.some(m => currentToolNames.has(m))) {
-                delete existingRoutes[key];
-            }
-        }
-
-        // Merge new tool routes
-        const mergedRoutes = { ...existingRoutes, ...toolRoutes };
-
-        const status = document.getElementById('tr-save-status');
-        try {
-            await apiFetch('/api/config/custom-routes', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(mergedRoutes),
-            });
-            status.textContent = t('config.tr_saved');
-            status.className = 'save-status success';
-            setTimeout(() => { status.textContent = ''; }, 3000);
-            fetchConfig().then(renderConfig);
-        } catch (e) {
-            status.textContent = 'Error saving';
-            status.className = 'save-status error';
-            console.error(e);
-        }
-    });
-
-    // ── Tool Capabilities save ──
-    document.getElementById('tc-save-btn').addEventListener('click', saveToolCapabilities);
-
-    // ── Web Search config ──
+    // ── Web Search / Web Fetch config ──
     fetchWebSearchConfig();
     document.getElementById('ws-save-btn').addEventListener('click', saveWebSearchConfig);
     document.getElementById('ws-mode-select').addEventListener('change', (e) => {
         const showModel = e.target.value !== 'duckduckgo';
         document.getElementById('ws-model-group').style.display = showModel ? '' : 'none';
+    });
+    document.getElementById('wf-save-btn').addEventListener('click', saveWebFetchConfig);
+    document.getElementById('wf-mode-select').addEventListener('change', (e) => {
+        const showModel = e.target.value !== 'direct';
+        document.getElementById('wf-model-group').style.display = showModel ? '' : 'none';
     });
 
     // ── API Keys management ──
@@ -2148,7 +2450,7 @@ function setupConfig() {
             setTimeout(() => { status.textContent = ''; }, 3000);
             fetchConfig().then(renderConfig);
         } catch (e) {
-            status.textContent = 'Error saving';
+            status.textContent = t('status.error');
             status.className = 'save-status error';
             console.error(e);
         }
@@ -2171,26 +2473,94 @@ function setupConfig() {
             if (debugLogsTabBtn) debugLogsTabBtn.style.display = enabled ? '' : 'none';
         });
     }
+
+    // ── Traffic tab ──
+    let trafficTimer = null;
+    const trafficCapCb = document.getElementById('traffic-enabled');
+    if (trafficCapCb) {
+        trafficCapCb.addEventListener('change', () => toggleTrafficCapture(trafficCapCb.checked));
+    }
+
+    const trafficClearBtn = document.getElementById('btn-traffic-clear');
+    if (trafficClearBtn) trafficClearBtn.addEventListener('click', clearTrafficCapture);
+
+    // Sync toggle + stats bar with the live server state on load
+    fetchTrafficStatus().then(status => {
+        if (!status) return;
+        // user_enabled = intention du toggle (la capture effective est lazy :
+        // active seulement pendant qu'un onglet Traffic regarde).
+        const wantedEnabled = status.user_enabled !== undefined ? !!status.user_enabled : !!status.enabled;
+        if (trafficCapCb) trafficCapCb.checked = wantedEnabled;
+        if (status.frames > 0 && document.querySelector('.tab.active')?.dataset.tab === 'traffic') {
+            trafficRefresh();
+        }
+    });
+
+    const trafficAutoCb = document.getElementById('traffic-auto-refresh');
+    if (trafficAutoCb) {
+        trafficAutoCb.addEventListener('change', (e) => {
+            if (e.target.checked) {
+                trafficRefresh();
+                trafficTimer = setInterval(() => {
+                    const activeTab = document.querySelector('.tab.active');
+                    if (activeTab && activeTab.dataset.tab === 'traffic') trafficRefresh();
+                }, 3000);
+            } else {
+                if (trafficTimer) { clearInterval(trafficTimer); trafficTimer = null; }
+            }
+        });
+    }
+
+    const trafficFilterInput = document.getElementById('traffic-filter');
+    if (trafficFilterInput) {
+        trafficFilterInput.addEventListener('input', debounce(() => {
+            const activeTab = document.querySelector('.tab.active');
+            if (activeTab && activeTab.dataset.tab === 'traffic') trafficRefresh();
+        }, 300));
+    }
+
+    // Clicking a frame row loads its detail (headers + hex dump)
+    const trafficTbody = document.getElementById('traffic-tbody');
+    if (trafficTbody) {
+        trafficTbody.addEventListener('click', (e) => {
+            const row = e.target.closest('tr[data-fid]');
+            if (!row) return;
+            trafficTbody.querySelectorAll('tr.selected').forEach(r => r.classList.remove('selected'));
+            row.classList.add('selected');
+            fetchTrafficFrameDetail(row.dataset.fid);
+        });
+    }
 }
 
 var _refreshing = false;
+var _refreshPending = false;
+var _lastRefreshDone = 0;
 async function refreshAll() {
-    if (_refreshing) return;
+    // [P2 perf] intervalle minimal 1 s entre deux refreshAll complets,
+    // indépendant du garde anti-réentrance : les polls serrés (SSE + timers)
+    // ne martèlent plus /api/stats + /api/history + timeseries.
+    const now = Date.now();
+    if (now - _lastRefreshDone < 1000) return;
+    if (_refreshing) { _refreshPending = true; return; }
     _refreshing = true;
     try {
-        const [stats, history, quotas] = await Promise.all([
-            fetchStats(filterFrom, filterTo),
-            fetchHistory(filterFrom, filterTo, currentPage),
-            fetchQuotas()
-        ]);
-        renderStats(stats);
-        renderCharts(stats);
-        renderHistory(history);
-        renderQuotas(quotas);
-        renderTimeSeriesCharts(filterFrom, filterTo);
-        document.getElementById('last-update').textContent = t('last.update') + formatTime();
+        do {
+            _refreshPending = false;
+            const [stats, history, quotas] = await Promise.all([
+                fetchStats(filterFrom, filterTo),
+                fetchHistory(filterFrom, filterTo, currentPage),
+                fetchQuotas()
+            ]);
+            renderStats(stats);
+            renderCharts(stats);
+            renderHistory(history);
+            renderQuotas(quotas);
+            renderTimeSeriesCharts(filterFrom, filterTo);
+            document.getElementById('last-update').textContent = t('last.update') + formatTime();
+        } while (_refreshPending);
     } finally {
         _refreshing = false;
+        _lastRefreshDone = Date.now();
     }
 }
 
@@ -2274,7 +2644,9 @@ document.addEventListener('DOMContentLoaded', () => {
     let eventSource = null;
     let pollTimer = null;
     let sseRetryDelay = 1000;
+    let lastEventTs = Date.now();
     const SSE_MAX_DELAY = 30000;
+    const SSE_SILENCE_MS = 45000; // server pings every 30s of idle → 45s = 1 missed ping
 
     function startPolling(intervalMs) {
         if (pollTimer) clearInterval(pollTimer);
@@ -2285,13 +2657,29 @@ document.addEventListener('DOMContentLoaded', () => {
         if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
     }
 
+    function sseScheduleReconnect() {
+        if (!pollTimer) startPolling(5000);
+        if (!window._sseRetry) {
+            window._sseRetry = setTimeout(() => {
+                window._sseRetry = null;
+                connectSSE();
+            }, sseRetryDelay);
+            sseRetryDelay = Math.min(sseRetryDelay * 2, SSE_MAX_DELAY);
+        }
+    }
+
     function connectSSE() {
         if (window._sseRetry) { clearTimeout(window._sseRetry); window._sseRetry = null; }
         if (eventSource) eventSource.close();
         const es = new EventSource('/api/events');
         eventSource = es;
+        lastEventTs = Date.now();
 
+        // [31] Any event proves the stream is alive; the server also emits a
+        // `ping` event every 30s of idle (keepalive comments are invisible to JS).
+        es.addEventListener('ping', () => { lastEventTs = Date.now(); });
         es.addEventListener('stats_updated', () => {
+            lastEventTs = Date.now();
             // Debounce: coalesce rapid events into a single refresh
             if (window._sseRefresh) clearTimeout(window._sseRefresh);
             window._sseRefresh = setTimeout(() => {
@@ -2299,34 +2687,82 @@ document.addEventListener('DOMContentLoaded', () => {
                 refreshAll();
             }, 200);
         });
-        es.addEventListener('connected', () => { stopPolling(); sseRetryDelay = 1000; });
+        es.addEventListener('connected', () => { lastEventTs = Date.now(); stopPolling(); sseRetryDelay = 1000; });
         es.addEventListener('quotas_updated', () => {
+            lastEventTs = Date.now();
             fetchQuotas().then(renderQuotas);
         });
         es.addEventListener('models_updated', () => {
+            lastEventTs = Date.now();
             fetchConfig().then(data => {
                 if (data) { configData = data; renderConfig(data); }
             });
+        });
+        // [plan] C: real-time vpn container events (die/start/restart/health)
+        // Instantané : chaque station pousse son vpn_event dès _set_status
+        // Server-side coalesce 500ms, client debounce 50ms -> quasi-direct.
+        es.addEventListener('vpn_event', (ev) => {
+            lastEventTs = Date.now();
+            // Si le payload est présent, maj instantanée sans HTTP (0ms)
+            try {
+                if (ev && ev.data) {
+                    const payload = JSON.parse(ev.data);
+                    // payload peut être un get_status complet (per-station) ou un wrapper
+                    // On tente update direct, sinon fallback fetch
+                    if (payload && (payload.station || payload.status || payload.vpn_status)) {
+                        // Petit debounce 50ms pour coalescer les bursts kill/restart
+                        if (window._sseVpnRefresh) clearTimeout(window._sseVpnRefresh);
+                        window._sseVpnRefresh = setTimeout(() => {
+                            window._sseVpnRefresh = null;
+                            // Si payload est un station single, on fetch l'agrégat pour garder la vue d'ensemble
+                            // mais on peut aussi patcher directement le cache
+                            refreshVPNStatus();
+                        }, 50);
+                        return;
+                    }
+                }
+            } catch(e) {}
+            if (window._sseVpnRefresh) clearTimeout(window._sseVpnRefresh);
+            window._sseVpnRefresh = setTimeout(() => {
+                window._sseVpnRefresh = null;
+                refreshVPNStatus();
+            }, 50);
+        });
+        es.addEventListener('geo_warning', (ev) => {
+            lastEventTs = Date.now();
+            try {
+                const data = JSON.parse(ev.data);
+                if (data && data.message) showGeoToast(data.message);
+            } catch(e) {}
+            pollGeoFallback();
         });
 
         es.onerror = () => {
             if (es !== eventSource) return; // stale
             if (eventSource) { eventSource.close(); eventSource = null; }
-            if (!pollTimer) startPolling(15000);
-            if (!window._sseRetry) {
-                window._sseRetry = setTimeout(() => {
-                    window._sseRetry = null;
-                    connectSSE();
-                }, sseRetryDelay);
-                sseRetryDelay = Math.min(sseRetryDelay * 2, SSE_MAX_DELAY);
-            }
+            sseScheduleReconnect();
         };
     }
 
-    connectSSE();
+    // [31] Reconnect on silence: without this, a stalled stream with an open
+    // socket (and no events) would look healthy forever — onerror never fires.
+    setInterval(() => {
+        if (!eventSource) return;
+        if (Date.now() - lastEventTs > SSE_SILENCE_MS) {
+            eventSource.close();
+            eventSource = null;
+            sseScheduleReconnect();
+        }
+    }, 15000);
 
-    // Backup poll in case SSE never connects
-    if (!pollTimer) startPolling(30000);
+    connectSSE();
+    // Geo fallback poll (direct → VPN) every 10s + immediate
+    pollGeoFallback();
+    setInterval(pollGeoFallback, 10000);
+
+    // Backup poll in case SSE never connects - 5s for direct live
+    // [v10 §14.3.22] uniquement tant que le flux SSE n'est PAS établi
+    if (!eventSource && !pollTimer) startPolling(5000);
 
     document.addEventListener('visibilitychange', () => {
         if (document.hidden) {
@@ -2335,7 +2771,8 @@ document.addEventListener('DOMContentLoaded', () => {
         } else {
             refreshAll();
             if (!eventSource) connectSSE();
-            if (!pollTimer) startPolling(30000);
+            // [v10 §14.3.22] pas de polling de secours si SSE est vivante
+            if (!eventSource && !pollTimer) startPolling(5000);
         }
     });
 
@@ -2345,7 +2782,19 @@ document.addEventListener('DOMContentLoaded', () => {
             const target = parseInt(el.dataset.resetTarget || '0', 10);
             if (!target) return;
             const remaining = target - Math.floor(Date.now() / 1000);
-            el.textContent = remaining <= 0 ? t('quotas.resetting') : t('quotas.resets_in') + formatResetTime(remaining);
+            if (remaining <= 0) {
+                // [35] Bounded « Resetting… »: once the countdown hits 0 the
+                // quota may already be available server-side; the next poll
+                // (≤5 min) refreshes the target. After a 10 s grace show « — »
+                // so the UI never claims "resetting" for minutes.
+                if (Date.now() - target * 1000 > 10000) {
+                    el.textContent = '—';
+                    return;
+                }
+                el.textContent = t('quotas.resetting');
+            } else {
+                el.textContent = t('quotas.resets_in') + formatResetTime(remaining);
+            }
         });
     }, 1000);
 
@@ -2430,7 +2879,7 @@ document.addEventListener('DOMContentLoaded', () => {
             debugLogPage = 1;
             fetchDebugLogs(1).then(renderDebugLogLines);
         } catch (e) {
-            status.textContent = 'Error';
+            status.textContent = t('status.error');
             status.className = 'save-status error';
         }
     });
@@ -2484,54 +2933,337 @@ document.addEventListener('DOMContentLoaded', () => {
     });
 
     // ── VPN tab refresh ──
-    async function refreshVPNStatus() {
-        try {
-            const resp = await fetch('/api/vpn-status');
-            const data = await resp.json();
-            updateVPNUI(data);
-        } catch (e) {
-            console.error('VPN status error:', e);
+    // [v10 §4 Lot 4] cartes per-station + sparkline EWMA/p95 (canvas 240×40)
+    window._latencyHistory = window._latencyHistory || {}; // sid -> [{ewma,p95}]
+    function renderStationCards(data) {
+        const wrap = document.getElementById('vpn-station-cards');
+        if (!wrap) return;
+        const stations = data.stations || [];
+        const lat = data.latency || {};
+        let html = '';
+        const perSid = {};
+        for (const key in lat) {
+            const sid = key.split('|')[0];
+            const snap = lat[key];
+            if (!snap || !snap.count) continue;
+            (perSid[sid] = perSid[sid] || []).push(snap);
         }
-        // Also check credential status
+        for (const st of stations) {
+            const sid = String(st.station);
+            const snaps = (perSid[sid] || []).filter(s => s.ewma_ms != null);
+            snaps.sort((a, b) => b.count - a.count);
+            const cur = snaps[0] || null;
+            const statusColor = st.vpn_status === 'connected'
+                ? ((cur && cur.consecutive_slow >= 2) ? 'var(--warning,#e6a000)' : 'var(--success,#7ec699)')
+                : (st.vpn_status === 'error' ? 'var(--danger,#e06c50)' : 'var(--text-muted,#8a8a8a)');
+            const ewma = cur ? Math.round(cur.ewma_ms) : null;
+            const p95 = cur && cur.p95_ms != null ? Math.round(cur.p95_ms) : null;
+            const slowBadge = (cur && cur.consecutive_slow >= 2) ? ' ⚠ ralentit' : '';
+            html += `<div style="flex:0 0 auto;min-width:150px;padding:8px 10px;background:var(--bg-secondary);border-radius:8px;border-left:3px solid ${statusColor};font-size:12px">`
+                + `<div><strong>Station ${escHtml(String(st.station))}</strong> <span style="color:${statusColor}">●</span>${slowBadge}</div>`
+                + `<div style="font-family:monospace;font-size:11px">${escHtml(st.current_ip || '—')}</div>`
+                + `<div>Req IP: ${st.requests_this_ip}/${st.quota_per_ip}</div>`
+                + `<div title="EWMA / p95 (ms)">lat: ${ewma != null ? ewma + 'ms' : '—'} · p95: ${p95 != null ? p95 + 'ms' : '—'}</div>`
+                + `<button class="btn btn-sm js-station-logs" data-sid="${parseInt(sid,10)||0}" style="margin-top:4px;font-size:11px;padding:2px 8px">Logs</button>`
+                + `</div>`;
+            // historique sparkline (60 derniers points par station)
+            if (ewma != null) {
+                const h = (window._latencyHistory[sid] = window._latencyHistory[sid] || []);
+                h.push({ ewma: ewma, p95: p95 });
+                if (h.length > 60) h.shift();
+            }
+        }
+        if (data.rotation_paused) {
+            html += `<div style="flex:0 0 auto;padding:8px 10px;background:rgba(230,160,0,0.12);border:1px solid var(--warning,#e6a000);border-radius:8px;font-size:12px;color:var(--warning,#e6a000)">⏸ rotations en pause${data.global_degraded_remaining > 0 ? ' (' + Math.round(data.global_degraded_remaining) + 's)' : ''}</div>`;
+        }
+        wrap.innerHTML = html;
+        drawLatencySparkline();
+    }
+
+    function drawLatencySparkline() {
+        const cv = document.getElementById('vpn-latency-sparkline');
+        if (!cv) return;
+        const series = Object.values(window._latencyHistory).filter(h => h.length > 1);
+        if (!series.length) { cv.style.display = 'none'; return; }
+        cv.style.display = 'block';
+        const ctx = cv.getContext('2d');
+        ctx.clearRect(0, 0, cv.width, cv.height);
+        const colors = ['#7ec699', '#61afef', '#e6a000', '#e06c50', '#c678dd', '#56b6c2', '#d19a66', '#98c379', '#be5046', '#528bff'];
+        let si = 0;
+        for (const hist of series) {
+            const color = colors[si % colors.length]; si++;
+            const vals = hist.map(p => p.ewma);
+            const max = Math.max(...vals, 1000);
+            ctx.strokeStyle = color;
+            ctx.lineWidth = 1.5;
+            ctx.beginPath();
+            vals.forEach((v, i) => {
+                const x = i / Math.max(1, vals.length - 1) * (cv.width - 4) + 2;
+                const y = cv.height - 4 - (v / max) * (cv.height - 8);
+                if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+            });
+            ctx.stroke();
+        }
+        ctx.fillStyle = 'rgba(128,128,128,0.9)';
+        ctx.font = '9px monospace';
+        ctx.fillText('EWMA/station (auto-échelle)', 4, 10);
+    }
+
+    // Logs per-station : délégation (pas d'onclick inline — cf. §14.1.16)
+    document.addEventListener('click', async function(ev) {
+        const btn = ev.target.closest('.js-station-logs');
+        if (!btn) return;
+        const sid = parseInt(btn.getAttribute('data-sid'), 10) || 0;
+        btn.textContent = '…';
         try {
-            const credResp = await fetch('/api/vpn/credentials');
-            const credData = await credResp.json();
+            const resp = await fetchWithToken(`/api/vpn/station/${sid}/logs?lines=80`);
+            const data = await resp.json();
+            const dlg = document.getElementById('vpn-event-log');
+            if (dlg) {
+                dlg.style.display = 'block';
+                dlg.textContent = (data.logs || data.error || '(vide)').split('\n').slice(-80).join('\n');
+                dlg.scrollTop = dlg.scrollHeight;
+            }
+            btn.textContent = 'Logs';
+        } catch (e) {
+            btn.textContent = 'Logs ✕';
+        }
+    });
+
+    async function refreshVPNStatus() {
+        // [P4.6 perf] skip si tab cachée — évite 3 GET inutiles toutes les 10s
+        if (document.hidden) return;
+        // Fetch vpn-status (slow, 5x refresh_status) and config (fast, station_count+free_parallel) in parallel
+        // so GUI shows parameters instantly without waiting for 5 docker probes
+        const vpnStatusP = fetchWithToken('/api/vpn-status').then(r=>r.json()).then(data=>{
+            updateVPNUI(data);
+            // [v10 §4 Lot 4] cartes per-station + sparkline EWMA/p95
+            try { renderStationCards(data); } catch(e) {}
+            // also update free_parallel from vpn-status if present (fast path for hedge_wins)
+            try {
+                const fp = data.free_parallel;
+                if (fp) {
+                    const fpEnabledEl = document.getElementById('cfg-free-parallel-enabled');
+                    const fpRoutingEl = document.getElementById('cfg-free-parallel-routing');
+                    const fpModeEl = document.getElementById('cfg-free-parallel-mode');
+                    const fpRow = document.getElementById('free-parallel-routing-row');
+                    const fpStatus = document.getElementById('free-parallel-status');
+                    if (fpEnabledEl && document.activeElement !== fpEnabledEl) fpEnabledEl.checked = !!fp.enabled;
+                    if (fpRoutingEl && document.activeElement !== fpRoutingEl) fpRoutingEl.value = fp.routing || 'round-robin';
+                    if (fpModeEl && document.activeElement !== fpModeEl) fpModeEl.value = fp.mode || 'load-balance';
+                    if (fpRow) fpRow.style.display = (fp.enabled ? 'flex' : 'none');
+                    if (fpStatus) fpStatus.textContent = fp.enabled ? `ON · ${fp.routing || 'round-robin'} · ${fp.mode || 'load-balance'}` : 'OFF';
+                }
+            } catch(e) {}
+            // also update station_count from vpn-status if present (stations.length)
+            try {
+                if (data.stations && data.stations.length) {
+                    const sel = document.getElementById('vpn-station-count');
+                    if (sel && document.activeElement !== sel && !sel.disabled) {
+                        // don't override pending user selection
+                        const hasPending = typeof _vpnStationPending !== 'undefined' && _vpnStationPending !== null;
+                        if (!hasPending) sel.value = String(data.stations.length);
+                    }
+                }
+            } catch(e) {}
+            return data;
+        }).catch(e=>{ console.error('VPN status error:', e); });
+        let _vpnConfigData = null;
+        const vpnConfigP = fetchWithToken('/api/vpn-config').then(r=>r.json()).then(cfgJ=>{
+            _vpnConfigData = cfgJ;
+            if (cfgJ.proxy_mode) try{ updateGeoWarning(cfgJ.proxy_mode); }catch(e){}
+            // instant station_count + free_parallel from fast vpn-config (no docker probe)
+            try {
+                const sel = document.getElementById('vpn-station-count');
+                if (sel && cfgJ.station_count && document.activeElement !== sel) {
+                    const hasPending = typeof _vpnStationPending !== 'undefined' && _vpnStationPending !== null;
+                    const isSaving = typeof _vpnSaving !== 'undefined' && _vpnSaving;
+                    if (!hasPending && !isSaving) sel.value = String(cfgJ.station_count);
+                }
+                if (cfgJ.free_parallel) {
+                    const fp = cfgJ.free_parallel;
+                    const fpEnabledEl = document.getElementById('cfg-free-parallel-enabled');
+                    const fpRoutingEl = document.getElementById('cfg-free-parallel-routing');
+                    const fpModeEl = document.getElementById('cfg-free-parallel-mode');
+                    const fpRow = document.getElementById('free-parallel-routing-row');
+                    const fpStatus = document.getElementById('free-parallel-status');
+                    if (fpEnabledEl && document.activeElement !== fpEnabledEl) fpEnabledEl.checked = !!fp.enabled;
+                    if (fpRoutingEl && document.activeElement !== fpRoutingEl) fpRoutingEl.value = fp.routing || 'round-robin';
+                    if (fpModeEl && document.activeElement !== fpModeEl) fpModeEl.value = fp.mode || 'load-balance';
+                    if (fpRow) fpRow.style.display = (fp.enabled ? 'flex' : 'none');
+                    if (fpStatus) fpStatus.textContent = fp.enabled ? `ON · ${fp.routing || 'round-robin'} · ${fp.mode || 'load-balance'}` : 'OFF';
+                }
+            } catch(e){}
+            return cfgJ;
+        }).catch(e=>{
+            // [v10 §14.3.33] échec visible : badge d'erreur sur le panneau VPN
+            console.error('VPN config error:', e);
+            const vp = document.getElementById('vpn-panel-error');
+            if (vp) { vp.textContent = '⚠ API /api/vpn-config injoignable'; vp.style.display = 'block'; }
+        });
+        const configP = fetchWithToken('/api/config').then(r=>r.json()).then(cfg=>{
+            // also update free_parallel from /api/config (fast, no docker)
+            try {
+                if (cfg.free_parallel) {
+                    const fp = cfg.free_parallel;
+                    const fpEnabledEl = document.getElementById('cfg-free-parallel-enabled');
+                    const fpRoutingEl = document.getElementById('cfg-free-parallel-routing');
+                    const fpModeEl = document.getElementById('cfg-free-parallel-mode');
+                    const fpRow = document.getElementById('free-parallel-routing-row');
+                    const fpStatus = document.getElementById('free-parallel-status');
+                    if (fpEnabledEl && document.activeElement !== fpEnabledEl) fpEnabledEl.checked = !!fp.enabled;
+                    if (fpRoutingEl && document.activeElement !== fpRoutingEl) fpRoutingEl.value = fp.routing || 'round-robin';
+                    if (fpModeEl && document.activeElement !== fpModeEl) fpModeEl.value = fp.mode || 'load-balance';
+                    if (fpRow) fpRow.style.display = (fp.enabled ? 'flex' : 'none');
+                    if (fpStatus) fpStatus.textContent = fp.enabled ? `ON · ${fp.routing || 'round-robin'} · ${fp.mode || 'load-balance'}` : 'OFF';
+                }
+                if (cfg.routing) {
+                    const sel = document.getElementById('cfg-routing');
+                    if (sel && document.activeElement !== sel) sel.value = cfg.routing;
+                }
+            } catch(e){}
+            return cfg;
+        }).catch(e=>{});
+        // [P4.6 perf] credentials parallélisé (était séquentiel après les 3) + skip si tab cachée déjà fait
+        const credP = fetchWithToken('/api/vpn/credentials').then(r=>r.json()).then(credData=>{
             const credStatus = document.getElementById('vpn-cred-status');
             const usernameEl = document.getElementById('vpn-cred-username');
             const passwordEl = document.getElementById('vpn-cred-password');
             const fileEl = document.getElementById('vpn-cred-file');
-
             if (credData.exists) {
                 if (credStatus) credStatus.innerHTML = '<span style="color:var(--success)">&#10003;</span> ' + (t('vpn.credentials_saved') || 'Enregistré');
                 if (usernameEl) usernameEl.textContent = credData.username_preview || '****';
                 if (passwordEl) passwordEl.textContent = '••••••••';
-                if (fileEl) fileEl.textContent = 'vpn_configs/credentials.txt';
+                if (fileEl) fileEl.textContent = 'credentials.env';
             } else {
                 if (credStatus) credStatus.innerHTML = '<span style="color:var(--warning)">!</span> ' + (t('vpn.credentials_missing') || 'Aucun identifiant');
                 if (usernameEl) usernameEl.textContent = '—';
                 if (passwordEl) passwordEl.textContent = '—';
                 if (fileEl) fileEl.textContent = '—';
             }
-        } catch (e) {
-            console.error('Credential status error:', e);
-        }
-        // Also load server list from config
+            return credData;
+        }).catch(e=>{ console.error('Credential status error:', e); });
+        // Wait for all four in parallel, but don't block UI updates (they already updated as they arrived)
+        await Promise.allSettled([vpnStatusP, vpnConfigP, configP, credP]);
+
+        // Also load server list from config — [P4.6] réutilise le fetch déjà fait (évite 2e GET)
         try {
-            const cfgResp = await fetch('/api/vpn-config');
-            const cfgData = await cfgResp.json();
+            const cfgData = _vpnConfigData || await fetchWithToken('/api/vpn-config').then(r=>r.json()).catch(()=>({}));
             renderServerList(cfgData.servers || []);
             // Initialize config fields
             if (cfgData.mode) document.getElementById('vpn-mode').value = cfgData.mode;
             if (cfgData.proxy_port) document.getElementById('vpn-proxy-port').value = cfgData.proxy_port;
             if (cfgData.switch_delay) document.getElementById('vpn-switch-delay').value = cfgData.switch_delay;
             if (cfgData.quota_per_ip) document.getElementById('vpn-quota-per-ip').value = cfgData.quota_per_ip;
-            if (cfgData.docker_image) document.getElementById('vpn-docker-image').value = cfgData.docker_image;
+            if (cfgData.docker_image) {
+                const dockerSelect = document.getElementById('vpn-docker-image');
+                // Check if it's a known option or custom
+                const knownImages = ['qmcgaw/gluetun', 'nordvpn-official'];
+                if (knownImages.includes(cfgData.docker_image)) {
+                    dockerSelect.value = cfgData.docker_image;
+                } else {
+                    dockerSelect.value = 'custom';
+                    const customInput = document.getElementById('vpn-docker-image-custom');
+                    if (customInput) {
+                        customInput.style.display = 'block';
+                        customInput.value = cfgData.docker_image;
+                    }
+                }
+                vpnDockerImageChanged();
+            }
             vpnInitConfig(cfgData.mode);
+
+            // Load advanced config fields
+            if (cfgData.circuit_breaker_threshold) document.getElementById('vpn-cb-threshold').value = cfgData.circuit_breaker_threshold;
+            if (cfgData.circuit_breaker_recovery) document.getElementById('vpn-cb-recovery').value = cfgData.circuit_breaker_recovery;
+            if (cfgData.backoff_max_delay) document.getElementById('vpn-backoff-max').value = cfgData.backoff_max_delay;
+            if (cfgData.watchdog_interval !== undefined) document.getElementById('vpn-watchdog').value = cfgData.watchdog_interval;
+            if (cfgData.api_cache_ttl) document.getElementById('vpn-api-cache').value = cfgData.api_cache_ttl;
 
             // Initialize proxy mode UI
             if (cfgData.proxy_mode) {
                 setProxyModeUI(cfgData.proxy_mode);
             }
+
+            // [plan 18/08 §4] N-station selector (1-10) + exhaust mode
+            const stationCountSelect = document.getElementById('vpn-station-count');
+            if (stationCountSelect) {
+                const persistedVal = String(cfgData.station_count || 1);
+                // [fix] Ne pas écraser la sélection utilisateur pendant interaction/sauvegarde.
+                const isFocused = document.activeElement === stationCountSelect;
+                const isSaving = typeof _vpnSaving !== 'undefined' && _vpnSaving;
+                const hasPending = typeof _vpnStationPending !== 'undefined' && _vpnStationPending !== null;
+                if (!stationCountSelect._vpnListenerAttached) {
+                    stationCountSelect.addEventListener('change', () => {
+                        _vpnStationPending = stationCountSelect.value;
+                        const btn = document.getElementById('vpn-station-apply-btn');
+                        if (btn) btn.style.outline = '2px solid var(--accent, #4fc3f7)';
+                    });
+                    stationCountSelect._vpnListenerAttached = true;
+                }
+                if (isFocused || isSaving) {
+                    // L'utilisateur interagit ou sauvegarde en cours — on ne touche pas.
+                } else if (hasPending && _vpnStationPending !== persistedVal) {
+                    stationCountSelect.value = _vpnStationPending;
+                } else {
+                    stationCountSelect.value = persistedVal;
+                    if (hasPending && _vpnStationPending === persistedVal) _vpnStationPending = null;
+                    const btn = document.getElementById('vpn-station-apply-btn');
+                    if (btn) btn.style.outline = '';
+                }
+            }
+            const exhaustMode = document.getElementById('vpn-exhaust-mode');
+            if (exhaustMode) exhaustMode.value = cfgData.strict_free ? 'strict' : 'fallback';
+            const on429Action = document.getElementById('vpn-on-429-action');
+            if (on429Action) {
+                const persisted429 = String(cfgData.on_429_action || 'both');
+                const isFocused429 = document.activeElement === on429Action;
+                const isSaving429 = typeof _vpnOn429Saving !== 'undefined' && _vpnOn429Saving;
+                const hasPending429 = typeof _vpnOn429Pending !== 'undefined' && _vpnOn429Pending !== null;
+                if (!on429Action._vpn429ListenerAttached) {
+                    on429Action.addEventListener('change', () => {
+                        _vpnOn429Pending = on429Action.value;
+                        const row = document.getElementById('vpn-cooldown-row');
+                        if (row) row.style.display = (on429Action.value === 'both' ? 'flex' : 'none');
+                    });
+                    on429Action._vpn429ListenerAttached = true;
+                }
+                if (isFocused429 || isSaving429) {
+                    // interaction en cours — ne pas écraser
+                } else if (hasPending429 && _vpnOn429Pending !== persisted429) {
+                    on429Action.value = _vpnOn429Pending;
+                } else {
+                    on429Action.value = persisted429;
+                    if (hasPending429 && _vpnOn429Pending === persisted429) _vpnOn429Pending = null;
+                }
+                const cooldownRow = document.getElementById('vpn-cooldown-row');
+                if (cooldownRow && !isFocused429) cooldownRow.style.display = (on429Action.value === 'both' ? 'flex' : 'none');
+                const cooldownInput = document.getElementById('vpn-cooldown-sec');
+                if (cooldownInput && cfgData.bad_ttl !== undefined && cfgData.bad_ttl !== null) {
+                    const isFocusedCd = document.activeElement === cooldownInput;
+                    const isSavingCd = typeof _vpnCooldownSaving !== 'undefined' && _vpnCooldownSaving;
+                    const hasPendingCd = typeof _vpnCooldownPending !== 'undefined' && _vpnCooldownPending !== null;
+                    const persistedCd = String(cfgData.bad_ttl);
+                    if (isFocusedCd || isSavingCd) {
+                    } else if (hasPendingCd && String(_vpnCooldownPending) !== persistedCd) {
+                        cooldownInput.value = String(_vpnCooldownPending);
+                    } else {
+                        cooldownInput.value = persistedCd;
+                        if (hasPendingCd && String(_vpnCooldownPending) === persistedCd) _vpnCooldownPending = null;
+                    }
+                }
+            }
+
+            // [plan 19/08 §1/§2] free multi-attempt cap (1-3) + exception
+            // ordering (station-first / direct) — read from config.
+            const freeAttempts = document.getElementById('vpn-free-attempts');
+            if (freeAttempts) freeAttempts.value = String(cfgData.max_free_attempts || 2);
+            const exceptionMode = document.getElementById('vpn-exception-mode');
+            if (exceptionMode) exceptionMode.value = cfgData.free_exception_fallback || 'station-first';
+
+            // [plan 18/08 §3d] VPN technology selector
+            const stackSelect = document.getElementById('vpn-stack-select');
+            if (stackSelect && cfgData.vpn_stack) stackSelect.value = cfgData.vpn_stack;
 
             // Initialize free models master toggle
             const fmToggle = document.getElementById('fm-toggle');
@@ -2546,13 +3278,75 @@ document.addEventListener('DOMContentLoaded', () => {
 
         // Load SOCKS5 proxies
         try {
-            const socks5Resp = await fetch('/api/vpn/socks5');
+            const socks5Resp = await fetchWithToken('/api/vpn/socks5');
             const socks5Data = await socks5Resp.json();
             renderSocks5List(socks5Data.proxies || []);
             const rotateToggle = document.getElementById('fm-socks5-rotate');
             if (rotateToggle) rotateToggle.checked = socks5Data.rotate !== false;
         } catch (e) {}
+
+        // [plan 18/08 §3d] VPN technology selector state
+        refreshStackInfo();
     }
+
+    // [plan 18/08 §3d] Render per-station stack info from GET /api/vpn-stack-info
+    async function refreshStackInfo() {
+        const container = document.getElementById('vpn-stack-stations');
+        if (!container) return;
+        try {
+            const resp = await fetchWithToken('/api/vpn-stack-info');
+            const data = await resp.json();
+            const stations = data.stations || {};
+            const keys = Object.keys(stations);
+            if (!keys.length) {
+                container.innerHTML = '<div style="color:var(--text-muted)">—</div>';
+                return;
+            }
+            container.innerHTML = keys.map(num => {
+                const s = stations[num];
+                const keysOk = s.keys_present
+                    ? '<span style="color:var(--success)">&#10003; ' + (t('vpn.stack.keys_present') || 'présentes') + '</span>'
+                    : '<span style="color:var(--warning)">! ' + (t('vpn.stack.keys_missing') || 'absentes') + '</span>';
+                const effLabel = s.effective === 'wireguard' ? (t('vpn.stack.wireguard') || 'WireGuard')
+                    : s.effective === 'openvpn' ? (t('vpn.stack.openvpn') || 'OpenVPN') : (s.effective || '—');
+                const lastFlip = (s.flips && s.flips.length)
+                    ? s.flips[s.flips.length - 1].time + ' ' + (s.flips[s.flips.length - 1].from || '?') + '→' + (s.flips[s.flips.length - 1].to || '?')
+                    : (t('vpn.stack.none') || 'aucune');
+                const hist = (s.flips && s.flips.length)
+                    ? '<div style="font-family:monospace;font-size:11px;margin-top:4px;color:var(--text-muted)">' +
+                        s.flips.slice(-5).map(f => escHtml(f.time + ' ' + (f.from || '?') + '→' + (f.to || '?') + ' (' + (f.reason || '') + ')')).join('<br>') +
+                      '</div>'
+                    : '';
+                return `
+                <div style="margin-top:8px;padding:8px;background:var(--bg-primary);border-radius:6px">
+                    <div style="display:flex;justify-content:space-between;align-items:center">
+                        <strong>${escHtml(t('vpn.stack.station') || 'Station')} ${num}</strong>
+                        <span>${effLabel} · ${keysOk}</span>
+                    </div>
+                    <div style="display:flex;gap:16px;margin-top:6px;font-size:11px;color:var(--text-muted);flex-wrap:wrap">
+                        <span>${escHtml(t('vpn.stack.egress_fail') || 'Échecs egress')}: ${s.egress_failures ?? 0}</span>
+                        <span>${escHtml(t('vpn.stack.egress_ticks') || 'Ticks egress morts')}: ${s.wg_egress_ticks ?? 0}</span>
+                        <span>${escHtml(t('vpn.stack.auth_failed') || 'AUTH_FAILED / 30 min')}: ${s.auth_failed_window ?? 0} / ${s.auth_failed_threshold ?? 3}</span>
+                        <span>${escHtml(t('vpn.stack.last_flip') || 'Dernière bascule')}: ${escHtml(lastFlip)}</span>
+                    </div>
+                    ${hist}
+                </div>`;
+            }).join('');
+        } catch (e) {
+            console.error('Stack info error:', e);
+            container.innerHTML = '<div style="color:var(--text-muted)">—</div>';
+        }
+    }
+
+    window.vpnSaveStack = async function() {
+        const select = document.getElementById('vpn-stack-select');
+        if (!select) return;
+        await fetchWithToken('/api/vpn-config', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({vpn_stack: select.value})
+        });
+        refreshVPNStatus();
+    };
 
     function renderServerList(servers) {
         const list = document.getElementById('vpn-servers-list');
@@ -2576,6 +3370,7 @@ document.addEventListener('DOMContentLoaded', () => {
         const statusEl = document.getElementById('vpn-status-text');
         const statusDot = document.getElementById('vpn-status-dot');
         const ipEl = document.getElementById('vpn-ip');
+        const identityEl = document.getElementById('vpn-identity');
         const serverEl = document.getElementById('vpn-server');
         const requestsEl = document.getElementById('vpn-requests');
         const totalEl = document.getElementById('vpn-total-free');
@@ -2593,11 +3388,44 @@ document.addEventListener('DOMContentLoaded', () => {
             error: { color: 'var(--danger)', label: t('vpn.error') || 'Erreur' }
         };
         const s = statusMap[data.status] || statusMap.disconnected;
-        statusEl.textContent = s.label;
+        // [prancy-unicorn Phase1] N/M healthy agrégat + stale spinner + error_detail tooltip
+        let _healthy = data.healthy;
+        let _total = data.total;
+        if ((_healthy == null || _total == null) && Array.isArray(data.stations)) {
+            _total = data.stations.length;
+            _healthy = data.stations.filter(x => x.vpn_status === 'connected').length;
+        }
+        let bannerLabel = s.label;
+        if (_healthy != null && _total != null) bannerLabel += ` — ${_healthy}/${_total} healthy`;
+        // [v6 P1-0b] routable badge
+        const _routable = data.healthy_routable;
+        if (_routable != null && _routable !== _healthy) {
+            bannerLabel += ` (${_routable}/${_total} routable)`;
+        }
+        if (data.stale) bannerLabel += ' ⟳';
+        if (data.boot_error) bannerLabel += ` ⚠ ${data.boot_error}`;
+        statusEl.textContent = bannerLabel;
         statusEl.style.color = s.color;
-        if (statusDot) statusDot.style.background = s.color;
+        if (statusDot) {
+            statusDot.style.background = s.color;
+            statusDot.style.opacity = data.stale ? '0.45' : '1';
+            statusDot.title = data.stale ? `stale — ${data.refresh_error || ''}` : '';
+        }
+        if (_routable != null && _routable !== _healthy) {
+            statusEl.title = `routable = connected - cooldown 429 (60s) - hard latency (1800s). LRU fallback sert quand même si 0 routable.`;
+            if (statusDot) statusDot.title = statusEl.title;
+        } else if (data.boot_error) {
+            statusEl.title = data.boot_error;
+            if (statusDot) statusDot.title = data.boot_error;
+        } else {
+            statusEl.title = data.refresh_error ? String(data.refresh_error) : (data.stale ? `stale — ${data.refreshed_at || ''}` : '');
+        }
 
         ipEl.textContent = data.current_ip || '—';
+        if (identityEl) {
+            const ident = data.vpn && data.vpn.current_identity;
+            identityEl.textContent = ident ? `${ident.impersonate} #${data.vpn.identity_index}` : '—';
+        }
         serverEl.textContent = data.current_server || '—';
         requestsEl.textContent = `${data.requests_this_ip || 0} / ${data.quota_per_ip || 300}`;
         totalEl.textContent = data.total_free_requests || 0;
@@ -2607,27 +3435,307 @@ document.addEventListener('DOMContentLoaded', () => {
         toggleEl.checked = data.enabled || false;
         toggleLabel.textContent = data.enabled ? (t('vpn.rotation_on') || 'Activé') : (t('vpn.rotation_off') || 'Désactivé');
 
-        // IP History
+        // [plan 18/08 §2.1] Env périmé (cause racine 19/08): le .env diffère
+        // de l'env du process — les enfants docker compose héritent de l'env,
+        // qui gagne sur le fichier. Le volet déterministe (_compose_env) force
+        // déjà VPN_TYPE_STATION{n} dans chaque enfant ; cette bannière signale
+        // la divergence restante (autres clés VPN_*) jusqu'au restart/re-push.
+        const envBanner = document.getElementById('vpn-env-divergence-banner');
+        if (envBanner) {
+            if (Array.isArray(data.env_divergence) && data.env_divergence.length) {
+                const keys = data.env_divergence.map(d => `<code>${escHtml(d.key)}</code>`).join(', ');
+                envBanner.innerHTML = '⚠ <strong>Env périmé</strong> — le .env diffère de l\'env du process pour : ' + keys +
+                    '. Redémarrez le proxy ou re-poussez la config pour re-synchroniser.';
+                envBanner.style.display = 'block';
+            } else {
+                envBanner.style.display = 'none';
+            }
+        }
+
+        // [plan 18/08 axe 3.4] config.yaml modifié à la main sans POST dashboard.
+        // Le hot-reload est push-only par design : on SIGNALE, on ne recharge
+        // jamais en auto (un état divergent serait invisible pour le pool).
+        const dirtyBanner = document.getElementById('vpn-config-dirty-banner');
+        if (dirtyBanner) {
+            if (data.config_yaml_dirty) {
+                dirtyBanner.innerHTML = '⚠ <strong>config.yaml modifié à la main</strong> — le détecteur M-time le signale mais le serveur ne recharge pas tout seul. Redémarrez le proxy ou re-poussez la config pour appliquer.';
+                dirtyBanner.style.display = 'block';
+            } else {
+                dirtyBanner.style.display = 'none';
+            }
+        }
+
+        // [prancy-unicorn Phase1 Q5] N>=2 && !free_parallel → tout sur station 1
+        const fpWarnEl = document.getElementById('vpn-free-parallel-warning');
+        if (fpWarnEl) {
+            if (data.free_parallel_warning) {
+                fpWarnEl.textContent = '⚠ ' + data.free_parallel_warning;
+                fpWarnEl.style.display = 'block';
+            } else fpWarnEl.style.display = 'none';
+        }
+
+        // [vivid-hinton P4] geo banner + badges + kill-switch (strict/best_effort/warn)
+        const geoBanner = document.getElementById('geo-banner');
+        const geoToggleBtn = document.getElementById('geo-toggle-btn');
+        const geoBadge = document.getElementById('geo-badge');
+        if (geoBanner) {
+            const geo = data.geo || {};
+            const cur = data.current_country || '';
+            const allowedFor = data.current_country_allowed_for || [];
+            if (geoToggleBtn) geoToggleBtn.textContent = geo.enabled ? '🌍 Géo: ON' : '🌍 Géo: OFF';
+            const geoDirectBtn = document.getElementById('geo-direct-btn');
+            if (geoDirectBtn) geoDirectBtn.textContent = geo.allow_direct_when_compatible ? 'Autoriser direct si IP compatible: ON' : 'Autoriser direct si IP compatible: OFF';
+            if (geoBadge) {
+                const badgeMap = { strict: '🔴 strict', prefer: '🟠 best_effort', warn: '⚪ warn' };
+                // derive dominant mode from vpn-status geo if available
+                geoBadge.textContent = geo.enabled ? (badgeMap[geo.mode] || '') : '';
+            }
+            if (!geo.enabled) {
+                geoBanner.innerHTML = '🌍 <strong>Géo</strong> désactivée (kill-switch) — aucune restriction active.';
+                geoBanner.style.display = 'block';
+                geoBanner.style.background = 'rgba(120,120,120,0.12)';
+                geoBanner.style.border = '1px solid var(--border,#555)';
+                geoBanner.style.color = 'var(--text-muted)';
+            } else if (cur) {
+                const n = allowedFor.length;
+                geoBanner.innerHTML = '🌍 Pays actuel <strong>' + escHtml(cur) + '</strong> — ' + n + ' route(s) autorisée(s)' + (n ? ': ' + allowedFor.map(escHtml).join(', ') : '');
+                geoBanner.style.display = 'block';
+                geoBanner.style.background = 'rgba(80,160,255,0.10)';
+                geoBanner.style.border = '1px solid rgba(80,160,255,0.35)';
+                geoBanner.style.color = 'var(--text)';
+            } else {
+                geoBanner.style.display = 'none';
+            }
+        }
+
+        // [plan 18/08 §4] N-station — one row per active tunnel, rendered
+        // from the pool's stations[] payload (was a fixed station-2 block).
+        // Countries overlay comes from data.countries (below); active_station
+        // marks the tunnel the pool currently routes through.
+        const countries = data.countries || {};
+        const stationRowsEl = document.getElementById('vpn-station-rows');
+        if (stationRowsEl) {
+            const stations = data.stations || [];
+            const sMap = { connected: t('vpn.connected') || 'Connecté', connecting: t('vpn.connecting') || 'Connexion...', disconnected: t('vpn.disconnected') || 'Déconnecté', error: t('vpn.error') || 'Erreur' };
+            stationRowsEl.innerHTML = stations.map(s => {
+                const cn = countries[s.station] || {};
+                let errText = '—';
+                if (s.last_rotation_error) errText = '⚠ ' + escHtml(s.last_rotation_error);
+                else if (s.bad_remaining > 0) errText = 'Cooldown (429) — ' + Math.ceil(s.bad_remaining) + 's';
+                else if (s.vpn && s.vpn.error) errText = escHtml(s.vpn.error);
+                // État réel : si le tunnel a une IP et n'est pas en cooldown, même un vpn_status error
+                // dû à une sonde transitoire (DNS) ne doit pas afficher "Erreur" alors qu'il sert.
+                let realStatus = s.vpn_status;
+                if (s.vpn_status === 'error' && s.current_ip && s.bad_remaining === 0 && !s.last_rotation_error) {
+                    const vpnErr = (s.vpn && s.vpn.error) || '';
+                    // "tunnel not answering" avec IP existante = sonde ratée mais tunnel a servi récemment
+                    if (vpnErr.includes('tunnel not answering') || vpnErr.includes('not answering')) {
+                        realStatus = 'connected';
+                        if (!errText || errText === '—') errText = 'Sonde échouée mais IP active';
+                    }
+                }
+                const statusText = (sMap[realStatus] || realStatus || '—') +
+                    (data.active_station === s.station ? ' · active' : '');
+                return '<div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border,#444)">' +
+                    '<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">' +
+                    '<strong style="font-size:12px">' + (t('vpn.stack.station') || 'Station') + ' ' + s.station + '</strong>' +
+                    '<span style="font-size:12px">' + statusText + '</span>' +
+                    '<button class="btn" onclick="vpnNext(' + s.station + ')" style="font-size:11px;padding:2px 8px">' +
+                    t('vpn.switch_ip') + '</button></div>' +
+                    '<div class="config-grid">' +
+                    '<div class="config-row"><span class="label">' + t('vpn.current_ip') + '</span>' +
+                    '<span class="value" style="font-family:monospace;font-weight:bold">' + escHtml(s.current_ip || '—') + '</span></div>' +
+                    '<div class="config-row"><span class="label">' + t('vpn.current_server') + '</span>' +
+                    '<span class="value">' + escHtml(s.current_server || '—') + '</span></div>' +
+                    '<div class="config-row"><span class="label">' + t('vpn.requests_this_ip') + '</span>' +
+                    '<span class="value">' + (s.requests_this_ip || 0) + ' / ' + (s.quota_per_ip || 300) + '</span></div>' +
+                    '<div class="config-row"><span class="label">Pays</span>' +
+                    '<span class="value">' + escHtml(cn.current_country || '—') + '</span></div>' +
+                    '<div class="config-row"><span class="label">Prochain pays</span>' +
+                    '<span class="value">' + escHtml(cn.next_country || '—') + '</span></div>' +
+                    '<div class="config-row"><span class="label">État</span>' +
+                    '<span class="value">' + errText + '</span></div>' +
+                    '</div></div>';
+            }).join('');
+        }
+
+        // [free_parallel] Stations free — toggle + routing + mode (vpn tab)
+        try {
+            const fp = data.free_parallel || data.freeParallel || {};
+            const fpEnabledEl = document.getElementById('cfg-free-parallel-enabled');
+            const fpRoutingEl = document.getElementById('cfg-free-parallel-routing');
+            const fpModeEl = document.getElementById('cfg-free-parallel-mode');
+            const fpRow = document.getElementById('free-parallel-routing-row');
+            const fpStatus = document.getElementById('free-parallel-status');
+            if (fpEnabledEl) {
+                // don't clobber user interaction while focused
+                if (document.activeElement !== fpEnabledEl) fpEnabledEl.checked = !!fp.enabled;
+            }
+            if (fpRoutingEl && document.activeElement !== fpRoutingEl) fpRoutingEl.value = fp.routing || 'round-robin';
+            if (fpModeEl && document.activeElement !== fpModeEl) fpModeEl.value = fp.mode || 'load-balance';
+            if (fpRow) fpRow.style.display = (fp.enabled ? 'flex' : 'none');
+            if (fpStatus) fpStatus.textContent = fp.enabled ? `ON · ${fp.routing || 'round-robin'} · ${fp.mode || 'load-balance'}` : 'OFF';
+            // also update hedge observability if present
+            if (data.hedge_wins) {
+                const hw = data.hedge_wins;
+                if (fpStatus && fp.enabled && hw.total) {
+                    fpStatus.textContent += ` · hedge ${hw.primary}/${hw.hedge}/${hw.total}`;
+                }
+            }
+        } catch(e) {}
+
+        // IP History — stats par IP (payload ip_stats injecté par /api/vpn-status)
         const historyEl = document.getElementById('vpn-ip-history');
-        if (historyEl && data.vpn && data.vpn.ip_history) {
-            historyEl.innerHTML = data.vpn.ip_history.slice().reverse().map(h =>
-                `<div style="padding:3px 0;border-bottom:1px solid var(--border)">
-                    <span style="font-family:monospace">${h.ip}</span>
-                    <span style="color:var(--text-muted)"> — ${h.server} — ${h.time}</span>
-                </div>`
-            ).join('') || '<div style="color:var(--text-muted);padding:4px">Aucun historique</div>';
+        if (historyEl) {
+            const rows = data.ip_stats ? Object.entries(data.ip_stats) : [];
+            if (!rows.length) {
+                historyEl.innerHTML = `<div style="color:var(--text-muted);padding:4px">${t('vpn.ip_no_data') || 'Aucune utilisation d\'IP'}</div>`;
+            } else {
+                historyEl.innerHTML =
+                    '<table style="width:100%"><thead><tr>' +
+                    `<th style="text-align:left">${t('vpn.ip') || 'IP'}</th>` +
+                    `<th>${t('vpn.ip_total') || 'Total'}</th>` +
+                    `<th>${t('vpn.ip_free') || 'Gratuites'}</th>` +
+                    `<th>${t('vpn.ip_paid') || 'Payantes'}</th>` +
+                    `<th>${t('vpn.ip_identity') || 'Identité'}</th>` +
+                    `<th>${t('vpn.ip_last_seen') || 'Dernière vue'}</th>` +
+                    '</tr></thead><tbody>' +
+                    rows.map(([ip, s]) =>
+                        `<tr><td style="font-family:monospace;font-size:12px">${escHtml(ip)}` +
+                        (s.server ? `<div style="font-size:10px;color:var(--text-muted)">${escHtml(s.server)}${s.last_rotation ? ' — ' + formatDateTime(s.last_rotation) : ''}</div>` : '') +
+                        `</td><td style="font-size:12px">${formatNumber(s.total)}</td>` +
+                        `<td style="font-size:12px">${formatNumber(s.free_count)}</td>` +
+                        `<td style="font-size:12px">${formatNumber(s.paid_count)}</td>` +
+                        `<td style="font-size:12px">${escHtml(s.identity) || '—'}</td>` +
+                        `<td style="font-size:12px">${formatDateTime(s.last_seen)}</td></tr>`
+                    ).join('') +
+                    '</tbody></table>';
+            }
+        }
+
+        // [plan] C: real-time panel — country per station, shared cursor,
+        // docker event watcher + invariant state (all fail-open to '—').
+        // Station 1 keeps the fixed vpn-country/vpn-next-country slots; the
+        // station ≥2 countries were rendered inside the N-station rows above.
+        const c1c = countries[1];
+        const countryEl = document.getElementById('vpn-country');
+        const nextEl = document.getElementById('vpn-next-country');
+        if (countryEl) countryEl.textContent = (c1c && c1c.current_country) || '—';
+        if (nextEl) nextEl.textContent = (c1c && c1c.next_country) || '—';
+
+        const rt = document.getElementById('vpn-realtime');
+        if (rt) {
+            const we = data.watch_events;
+            if (we) {
+                rt.style.display = '';
+                const watcherEl = document.getElementById('vpn-watcher');
+                if (watcherEl) {
+                    const alive = we.running ? 'live' : 'off';
+                    const color = we.running ? 'var(--success)' : 'var(--warning)';
+                    watcherEl.innerHTML = '<span style="color:' + color + '">● docker events ' + escHtml(alive) + '</span>' +
+                        ' <span style="color:var(--text-muted)">' + (we.events_seen || 0) + ' évts</span>';
+                }
+                const cursorEl = document.getElementById('vpn-country-cursor');
+                if (cursorEl) {
+                    const sr = data.shared_rotation || {};
+                    const cc = sr.country_cursor;
+                    const bySt = sr.last_country_by_station || {};
+                    const byStText = Object.keys(bySt).sort((a, b) => a - b)
+                        .map(k => 's' + k + ':' + (bySt[k] || '—')).join(' · ');
+                    cursorEl.textContent = (cc !== undefined && cc !== null ? cc : '—') +
+                        (byStText ? ' · ' + byStText : '');
+                }
+                const pendingEl = document.getElementById('vpn-rotate-pending');
+                if (pendingEl) {
+                    const pend = (data.rotate_pending || []).join(',') || 'aucune';
+                    pendingEl.textContent = (data.rotation_stagger || 0) + ' · ' + pend;
+                }
+                const eventLogEl = document.getElementById('vpn-event-log');
+                if (eventLogEl) {
+                    const rows = Object.entries(we.last_seen || {});
+                    eventLogEl.innerHTML = rows.length
+                        ? rows.map(([ctn, e]) =>
+                            '<div style="white-space:nowrap">' + escHtml(ctn) + ' → ' +
+                            escHtml(e.status) + ' <span style="opacity:.6">' +
+                            escHtml(e.time) + '</span></div>').join('')
+                        : '<div style="opacity:.7;font-style:italic">Aucun événement docker observé</div>';
+                }
+            } else {
+                rt.style.display = 'none';
+            }
+        }
+
+        // Circuit breaker status
+        const cbStatusEl = document.getElementById('vpn-cb-status');
+        if (cbStatusEl && data.vpn && data.vpn.circuit_breaker) {
+            const cb = data.vpn.circuit_breaker;
+            const entries = Object.entries(cb);
+            if (entries.length > 0) {
+                const openServers = entries.filter(([_, v]) => v.state === 'open');
+                const failedServers = entries.filter(([_, v]) => v.failures > 0);
+                let html = '';
+                if (openServers.length > 0) {
+                    html += `<span style="color:var(--danger)">🔴 ${openServers.length} serveur(s) bloqué(s)</span> `;
+                }
+                if (failedServers.length > 0) {
+                    html += `<span style="color:var(--warning)">⚠️ ${failedServers.length} serveur(s) avec échecs</span> `;
+                }
+                if (data.vpn.backoff_failures > 0) {
+                    html += `<span style="color:var(--text-muted)">Backoff: ${data.vpn.backoff_delay}s (${data.vpn.backoff_failures} échecs)</span>`;
+                }
+                cbStatusEl.innerHTML = html || '<span style="color:var(--success)">✓ Tous les serveurs OK</span>';
+            } else {
+                cbStatusEl.innerHTML = '<span style="color:var(--success)">✓ Aucun échec enregistré</span>';
+            }
+        }
+        // [36] G7 — last rotation error of the active station, appended last
+        // so the circuit-breaker block above can't overwrite it.
+        if (cbStatusEl) {
+            const s1 = (data.stations || [])[0];
+            const rotErr = (s1 && s1.last_rotation_error) || (data.vpn && data.vpn.last_rotation_error);
+            if (rotErr) {
+                cbStatusEl.innerHTML += `<div style="color:var(--danger);margin-top:6px">⚠ Rotation: ${escHtml(rotErr)}</div>`;
+            }
         }
     }
 
     window.toggleVPN = async function(enabled) {
-        await fetch('/api/vpn/toggle', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({enabled}) });
+        await fetchWithToken('/api/vpn/toggle', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({enabled}) });
         refreshVPNStatus();
     };
 
     window.vpnConnect = async function() {
-        const resp = await fetch('/api/vpn/connect', { method: 'POST' });
-        const data = await resp.json();
-        if (data.error) alert('Erreur: ' + data.error);
+        const resultEl = document.getElementById('vpn-health-result');
+        if (resultEl) resultEl.innerHTML = '<span style="color:var(--warning)">Connexion en cours...</span>';
+
+        try {
+            const resp = await fetchWithToken('/api/vpn/connect', { method: 'POST' });
+            const data = await resp.json();
+            if (data.error) {
+                // Parse error for specific messages
+                let msg = data.error;
+                let color = 'var(--danger)';
+                if (msg.includes('not found') || msg.includes('Not found')) {
+                    msg = '✗ NordVPN non installé ou introuvable';
+                } else if (msg.includes('AUTH_FAILED') || msg.includes('auth')) {
+                    msg = '✗ Échec authentification — vérifiez vos identifiants';
+                } else if (msg.includes('locked') || msg.includes('cooldown')) {
+                    msg = '✗ Trop de tentatives — attendez avant de réessayer';
+                } else if (msg.includes('token')) {
+                    msg = '✗ Token NordVPN invalide ou manquant';
+                } else if (msg.includes('Config not found')) {
+                    msg = '✗ Fichier .ovpn non trouvé';
+                } else {
+                    msg = '✗ ' + msg;
+                }
+                if (resultEl) resultEl.innerHTML = `<span style="color:${color}">${msg}</span>`;
+            } else {
+                const ip = data.ip || '?';
+                if (resultEl) resultEl.innerHTML = `<span style="color:var(--success)">✓ Connecté — IP: ${ip}</span>`;
+            }
+        } catch (e) {
+            if (resultEl) resultEl.innerHTML = `<span style="color:var(--danger)">✗ Erreur: ${e.message}</span>`;
+        }
         refreshVPNStatus();
     };
 
@@ -2635,11 +3743,23 @@ document.addEventListener('DOMContentLoaded', () => {
         const mode = document.getElementById('vpn-mode').value;
         const proxyPort = parseInt(document.getElementById('vpn-proxy-port').value) || 8888;
         const switchDelay = parseInt(document.getElementById('vpn-switch-delay').value) || 5;
-        const dockerImage = document.getElementById('vpn-docker-image')?.value || 'openvpn-nordvpn';
+        let dockerImage = document.getElementById('vpn-docker-image')?.value || 'qmcgaw/gluetun';
+        if (dockerImage === 'custom') {
+            dockerImage = document.getElementById('vpn-docker-image-custom')?.value || 'qmcgaw/gluetun';
+        }
+        const cbThreshold = parseInt(document.getElementById('vpn-cb-threshold')?.value) || 3;
+        const cbRecovery = parseInt(document.getElementById('vpn-cb-recovery')?.value) || 300;
+        const backoffMax = parseInt(document.getElementById('vpn-backoff-max')?.value) || 60;
+        const watchdog = parseInt(document.getElementById('vpn-watchdog')?.value) || 60;
+        const apiCache = parseInt(document.getElementById('vpn-api-cache')?.value) || 900;
 
-        await fetch('/api/vpn-config', {
+        await fetchWithToken('/api/vpn-config', {
             method: 'POST', headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({ mode, proxy_port: proxyPort, switch_delay: switchDelay, docker_image: dockerImage })
+            body: JSON.stringify({
+                mode, proxy_port: proxyPort, switch_delay: switchDelay, docker_image: dockerImage,
+                circuit_breaker_threshold: cbThreshold, circuit_breaker_recovery: cbRecovery,
+                backoff_max_delay: backoffMax, watchdog_interval: watchdog, api_cache_ttl: apiCache
+            })
         });
 
         // Show/hide Docker options
@@ -2649,7 +3769,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     window.saveQuotaPerIp = async function() {
         const quotaPerIp = parseInt(document.getElementById('vpn-quota-per-ip').value) || 300;
-        await fetch('/api/vpn-config', {
+        await fetchWithToken('/api/vpn-config', {
             method: 'POST', headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({ quota_per_ip: quotaPerIp })
         });
@@ -2659,24 +3779,304 @@ document.addEventListener('DOMContentLoaded', () => {
     function vpnInitConfig(mode) {
         document.getElementById('vpn-mode').value = mode || 'wsl2';
         document.getElementById('vpn-docker-row').style.display = (mode === 'docker') ? 'flex' : 'none';
-        document.getElementById('vpn-mode-hint').textContent = mode === 'docker' ? 'Docker (reproductible, isolé)' : 'WSL2 (léger, déjà installé)';
+        const nordvpnSection = document.getElementById('vpn-nordvpn-app-section');
+        if (nordvpnSection) nordvpnSection.style.display = (mode === 'nordvpn-app') ? 'block' : 'none';
+        const hints = {
+            auto: 'Auto-détecte le meilleur mode disponible',
+            docker: 'Docker (reproductible, isolé)',
+            native: 'Windows natif (OpenVPN installé)',
+            'nordvpn-app': 'NordVPN App (application desktop Windows)',
+            wsl2: 'WSL2 (léger, déjà installé)'
+        };
+        document.getElementById('vpn-mode-hint').textContent = hints[mode] || hints.wsl2;
     }
 
+    // ── VPN Diagnostic ──
+    window.vpnDiagnostic = async function() {
+        const resultEl = document.getElementById('vpn-diagnostic-result');
+        if (!resultEl) return;
+        resultEl.style.display = 'block';
+        resultEl.innerHTML = '<span style="color:var(--warning)">Diagnostic en cours...</span>';
+
+        try {
+            const resp = await fetchWithToken('/api/vpn/diagnostic');
+            const data = await resp.json();
+
+            let html = '<strong>🩺 Diagnostic VPN</strong><br>';
+
+            // Current mode
+            html += `<div style="margin-top:8px"><strong>Mode actuel:</strong> ${data.current_mode || '?'}</div>`;
+            html += `<div><strong>Status:</strong> ${data.status || '?'} | <strong>IP:</strong> ${data.ip || '?'}</div>`;
+
+            // NordVPN App
+            const nordvpn = data.nordvpn_app || {};
+            const nordvpnIcon = nordvpn.available ? '🟢' : '🔴';
+            html += `<div style="margin-top:6px">${nordvpnIcon} <strong>NordVPN App:</strong> ${nordvpn.available ? 'Installé (' + (nordvpn.exe || '?') + ')' : 'Non installé'}`;
+            if (nordvpn.status && nordvpn.status.connected) {
+                html += ` — Connecté: ${nordvpn.status.country || '?'} / ${nordvpn.status.city || '?'} / ${nordvpn.status.ip || '?'}`;
+            }
+            html += '</div>';
+
+            // Docker
+            const docker = data.docker || {};
+            const dockerIcon = docker.running ? '🟢' : docker.available ? '🟡' : '🔴';
+            html += `<div>${dockerIcon} <strong>Docker:</strong> ${docker.running ? 'En cours (v' + (docker.version || '?') + ')' : docker.available ? 'Installé mais arrêté' : 'Non installé'}</div>`;
+
+            // WSL2
+            const wsl2 = data.wsl2 || {};
+            const wsl2Icon = wsl2.available ? '🟢' : '🔴';
+            html += `<div>${wsl2Icon} <strong>WSL2:</strong> ${wsl2.available ? 'Disponible' : 'Non disponible'}</div>`;
+
+            // OpenVPN native
+            const openvpn = data.openvpn || {};
+            const openvpnIcon = openvpn.available ? '🟢' : '🔴';
+            html += `<div>${openvpnIcon} <strong>OpenVPN natif:</strong> ${openvpn.available ? openvpn.path : 'Non installé'}</div>`;
+
+            // Recommendation
+            html += `<div style="margin-top:8px;padding-top:6px;border-top:1px solid var(--border)"><strong>Recommandation:</strong> <span style="color:var(--success)">${data.recommendation || '?'}</span></div>`;
+
+            resultEl.innerHTML = html;
+        } catch (e) {
+            resultEl.innerHTML = `<span style="color:var(--danger)">✗ Erreur: ${e.message}</span>`;
+        }
+    };
+
+    // Test NordVPN App connection
+    window.vpnTestNordvpnApp = async function() {
+        const statusEl = document.getElementById('vpn-nordvpn-app-status');
+        const countriesEl = document.getElementById('vpn-nordvpn-app-countries');
+        if (statusEl) statusEl.innerHTML = '<span style="color:var(--warning)">Test en cours...</span>';
+
+        try {
+            // Check if available
+            const availResp = await fetchWithToken('/api/vpn/nordvpn-available');
+            const availData = await availResp.json();
+            if (!availData.available) {
+                if (statusEl) statusEl.innerHTML = '<span style="color:var(--danger)">✗ NordVPN non installé</span>';
+                return;
+            }
+
+            // Get status
+            const statusResp = await fetchWithToken('/api/vpn/nordvpn-status');
+            const statusData = await statusResp.json();
+            if (statusData.connected) {
+                if (statusEl) statusEl.innerHTML = `<span style="color:var(--success)">✓ Connecté</span> — ${statusData.country || '?'} / ${statusData.city || '?'} / IP: ${statusData.ip || '?'}`;
+            } else {
+                if (statusEl) statusEl.innerHTML = '<span style="color:var(--text-muted)">● Déconnecté (prêt)</span>';
+            }
+
+            // Get countries count
+            const countriesResp = await fetchWithToken('/api/vpn/nordvpn-countries');
+            const countriesData = await countriesResp.json();
+            if (countriesEl && countriesData.countries) {
+                countriesEl.textContent = `${countriesData.countries.length} pays disponibles`;
+            }
+        } catch (e) {
+            if (statusEl) statusEl.innerHTML = `<span style="color:var(--danger)">✗ ${e.message}</span>`;
+        }
+    };
+
+    // Docker image dropdown handler
+    window.vpnDockerImageChanged = function() {
+        const select = document.getElementById('vpn-docker-image');
+        const customInput = document.getElementById('vpn-docker-image-custom');
+        const hint = document.getElementById('vpn-docker-image-hint');
+        const value = select.value;
+
+        if (value === 'custom') {
+            customInput.style.display = 'block';
+        } else {
+            customInput.style.display = 'none';
+        }
+
+        const hints = {
+            'qmcgaw/gluetun': 'Gluetun: proxy intégré, WireGuard, 43 MB',
+            'nordvpn-official': 'NordVPN Officiel: client natif Linux, construit localement',
+            'custom': 'Entrez le nom de l\'image Docker'
+        };
+        if (hint) hint.textContent = hints[value] || '';
+        vpnSaveConfig();
+    };
+
     window.vpnDisconnect = async function() {
-        await fetch('/api/vpn/disconnect', { method: 'POST' });
+        await fetchWithToken('/api/vpn/disconnect', { method: 'POST' });
         refreshVPNStatus();
     };
 
-    window.vpnNext = async function() {
-        const resp = await fetch('/api/vpn/next', { method: 'POST' });
-        const data = await resp.json();
-        if (data.error) alert('Erreur: ' + data.error);
+    window.vpnNext = async function(station) {
+        try {
+            const resp = await fetchWithToken('/api/vpn/next', {
+                method: 'POST', headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({station: station || 0})
+            });
+            const data = await resp.json();
+            if (data.error) alert('Erreur: ' + data.error);
+        } catch (e) { alert('Erreur: ' + e); }
+        refreshVPNStatus();
+    };
+
+    // [fix] Stations VPN : 1 clic suffit — feedback + anti-race
+    // Le bug : refreshVPNStatus écrasait le <select> toutes les 10s et le bouton
+    // n'avait ni disabled ni spinner, donc l'utilisateur re-cliquait en boucle.
+    window.vpnSaveStationCount = async function() {
+        const select = document.getElementById('vpn-station-count');
+        const btn = document.getElementById('vpn-station-apply-btn') || document.querySelector('#vpn-dual-section button[onclick*="vpnSaveStationCount"]');
+        const n = select ? parseInt(select.value, 10) : 0;
+        if (!n || n < 1 || n > 10) return;
+        if (btn && btn.disabled) return;
+        if (typeof _vpnSaving !== 'undefined' && _vpnSaving) return;
+        _vpnSaving = true;
+        _vpnStationPending = String(n);
+        const origText = btn ? btn.textContent : '';
+        const origOutline = btn ? btn.style.outline : '';
+        if (btn) { btn.disabled = true; btn.textContent = 'En cours...'; btn.style.opacity = '0.6'; btn.style.cursor = 'wait'; }
+        if (select) select.disabled = true;
+        let data = null;
+        try {
+            const resp = await fetchWithToken('/api/vpn-config', {
+                method: 'POST', headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({station_count: n})
+            });
+            data = await resp.json();
+            if (!resp.ok || data.error) throw new Error(data.error || `HTTP ${resp.status}`);
+            if (data.config && data.config.station_count) {
+                const persisted = String(parseInt(data.config.station_count, 10));
+                if (select) select.value = persisted;
+                _vpnStationPending = null;
+                if (btn) btn.style.outline = '';
+            }
+        } catch (e) {
+            alert('Erreur: ' + (e.message || e));
+            _vpnStationPending = null;
+        } finally {
+            if (btn) { btn.disabled = false; btn.textContent = origText || (typeof t !== 'undefined' ? t('vpn.stations.save') : 'Appliquer'); btn.style.opacity = ''; btn.style.cursor = ''; if (!origOutline) btn.style.outline = ''; }
+            if (select) select.disabled = false;
+            _vpnSaving = false;
+            try { await refreshVPNStatus(); } catch(e2) {}
+            if (typeof refreshStackInfo === 'function') { try { await refreshStackInfo(); } catch(e3) {} }
+            try { fetchConfig(); } catch(e4) {}
+        }
+    };
+
+    window.vpnSaveExhaustMode = async function() {
+        const strict = document.getElementById('vpn-exhaust-mode').value === 'strict';
+        await fetchWithToken('/api/vpn-config', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({strict_free: strict})
+        });
+        refreshVPNStatus();
+    };
+    window.vpnSaveOn429Action = async function() {
+        const el = document.getElementById('vpn-on-429-action');
+        const action = el ? el.value : 'both';
+        const row = document.getElementById('vpn-cooldown-row');
+        if (row) row.style.display = (action === 'both' ? 'flex' : 'none');
+        if (typeof _vpnOn429Saving !== 'undefined' && _vpnOn429Saving) return;
+        _vpnOn429Saving = true;
+        _vpnOn429Pending = action;
+        try {
+            const resp = await fetchWithToken('/api/vpn-config', {
+                method: 'POST', headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({on_429_action: action})
+            });
+            const data = await resp.json().catch(()=>({}));
+            if (!resp.ok || data.error) throw new Error(data.error || `HTTP ${resp.status}`);
+            const persisted = data.config ? String(data.config.on_429_action || action) : action;
+            if (el) el.value = persisted;
+            if (persisted === action) _vpnOn429Pending = null;
+        } catch (e) {
+            alert('Erreur: ' + (e.message || e));
+        } finally {
+            _vpnOn429Saving = false;
+            try { await refreshVPNStatus(); } catch(e2) {}
+        }
+    };
+    window.vpnSaveCooldown = async function() {
+        const input = document.getElementById('vpn-cooldown-sec');
+        const n = input ? parseInt(input.value, 10) : NaN;
+        if (!n || n < 1 || n > 3600) { alert('Cooldown doit être entre 1 et 3600 secondes'); return; }
+        if (typeof _vpnCooldownSaving !== 'undefined' && _vpnCooldownSaving) return;
+        _vpnCooldownSaving = true;
+        _vpnCooldownPending = String(n);
+        try {
+            const resp = await fetchWithToken('/api/vpn-config', {
+                method: 'POST', headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({bad_ttl: n})
+            });
+            const data = await resp.json().catch(()=>({}));
+            if (!resp.ok || data.error) throw new Error(data.error || `HTTP ${resp.status}`);
+            const persisted = data.config ? String(data.config.bad_ttl || n) : String(n);
+            if (input) input.value = persisted;
+            if (persisted === String(n)) _vpnCooldownPending = null;
+        } catch (e) {
+            alert('Erreur: ' + (e.message || e));
+            _vpnCooldownPending = null;
+        } finally {
+            _vpnCooldownSaving = false;
+            try { await refreshVPNStatus(); } catch(e2) {}
+        }
+    };
+
+    // [plan 19/08 §1] free multi-attempt cap (1-3) — persisted + hot-reload
+    // (read per-request via IP_ROTATION.get, no restart).
+    window.vpnSaveMaxFreeAttempts = async function() {
+        const n = parseInt(document.getElementById('vpn-free-attempts').value, 10) || 2;
+        await fetchWithToken('/api/vpn-config', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({max_free_attempts: n})
+        });
+        refreshVPNStatus();
+    };
+
+    // [plan 19/08 §2] exception ordering: dead tunnel → next station first,
+    // or direct residential fallback immediately.
+    window.vpnSaveExceptionFallback = async function() {
+        const mode = document.getElementById('vpn-exception-mode').value;
+        await fetchWithToken('/api/vpn-config', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({free_exception_fallback: mode})
+        });
+        refreshVPNStatus();
+    };
+
+    // [free_parallel] Deux routings découplés — (B) Stations free
+    window.toggleFreeParallel = async function(enabled) {
+        const routing = document.getElementById('cfg-free-parallel-routing')?.value || 'round-robin';
+        const mode = document.getElementById('cfg-free-parallel-mode')?.value || 'load-balance';
+        const row = document.getElementById('free-parallel-routing-row');
+        if (row) row.style.display = enabled ? 'flex' : 'none';
+        const status = document.getElementById('free-parallel-status');
+        if (status) status.textContent = enabled ? `ON · ${routing} · ${mode}` : 'OFF';
+        await fetchWithToken('/api/vpn-config', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({free_parallel: {enabled: !!enabled, routing, mode}})
+        });
+        refreshVPNStatus();
+    };
+    window.saveFreeParallelRouting = async function() {
+        const enabled = document.getElementById('cfg-free-parallel-enabled')?.checked || false;
+        const routing = document.getElementById('cfg-free-parallel-routing')?.value || 'round-robin';
+        const mode = document.getElementById('cfg-free-parallel-mode')?.value || 'load-balance';
+        await fetchWithToken('/api/vpn-config', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({free_parallel: {enabled: !!enabled, routing, mode}})
+        });
+        refreshVPNStatus();
+    };
+    window.saveFreeParallelMode = async function() {
+        const enabled = document.getElementById('cfg-free-parallel-enabled')?.checked || false;
+        const routing = document.getElementById('cfg-free-parallel-routing')?.value || 'round-robin';
+        const mode = document.getElementById('cfg-free-parallel-mode')?.value || 'load-balance';
+        await fetchWithToken('/api/vpn-config', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({free_parallel: {enabled: !!enabled, routing, mode}})
+        });
         refreshVPNStatus();
     };
 
     window.vpnRemoveServer = async function(name) {
         if (!confirm(t('vpn.confirm_remove') || 'Supprimer ce serveur ?')) return;
-        await fetch('/api/vpn-config', {
+        await fetchWithToken('/api/vpn-config', {
             method: 'POST', headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({remove_server: name})
         });
@@ -2687,7 +4087,7 @@ document.addEventListener('DOMContentLoaded', () => {
         const username = document.getElementById('vpn-username').value.trim();
         const password = document.getElementById('vpn-password').value.trim();
         if (!username || !password) return alert('Username and password required');
-        const resp = await fetch('/api/vpn-config', {
+        const resp = await fetchWithToken('/api/vpn-config', {
             method: 'POST', headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({credentials: {username, password}})
         });
@@ -2723,7 +4123,7 @@ document.addEventListener('DOMContentLoaded', () => {
             formData.append('name', name);
             formData.append('config', _vpnSelectedFile);
 
-            const resp = await fetch('/api/vpn/upload-config', {
+            const resp = await fetchWithToken('/api/vpn/upload-config', {
                 method: 'POST',
                 body: formData
             });
@@ -2740,9 +4140,138 @@ document.addEventListener('DOMContentLoaded', () => {
         refreshVPNStatus();
     };
 
+    // ── VPN Health Check ──
+    window.vpnHealthCheck = async function() {
+        const resultEl = document.getElementById('vpn-health-result');
+        if (resultEl) resultEl.textContent = 'Test en cours...';
+        try {
+            const resp = await fetchWithToken('/api/vpn/health-check', { method: 'POST' });
+            const data = await resp.json();
+            if (data.ok) {
+                const latency = data.latency_ms ? ` (${data.latency_ms}ms)` : '';
+                const changed = data.ip_changed ? ' ⚠️ IP changée' : '';
+                if (resultEl) resultEl.innerHTML = `<span style="color:var(--success)">✓ OK${latency}</span>${changed}`;
+            } else {
+                if (resultEl) resultEl.innerHTML = `<span style="color:var(--danger)">✗ ${data.error || 'Échec'}</span>`;
+            }
+        } catch (e) {
+            if (resultEl) resultEl.innerHTML = `<span style="color:var(--danger)">✗ Erreur: ${e.message}</span>`;
+        }
+    };
+
+    // ── VPN Save State ──
+    window.vpnSaveState = async function() {
+        try {
+            await fetchWithToken('/api/vpn/save-state', { method: 'POST' });
+            const resultEl = document.getElementById('vpn-health-result');
+            if (resultEl) resultEl.innerHTML = '<span style="color:var(--success)">✓ État sauvegardé</span>';
+        } catch (e) {
+            console.error('Save state error:', e);
+        }
+    };
+
+    // ── NordVPN API Toggle ──
+    window.vpnToggleApi = async function(enabled) {
+        const section = document.getElementById('vpn-api-section');
+        if (section) section.style.display = enabled ? 'block' : 'none';
+        await fetchWithToken('/api/vpn-config', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ use_nordvpn_api: enabled })
+        });
+        if (enabled) {
+            vpnLoadCountries();
+        }
+    };
+
+    // ── Load Countries for API ──
+    async function vpnLoadCountries() {
+        try {
+            const resp = await fetchWithToken('/api/vpn/countries');
+            const data = await resp.json();
+            const select = document.getElementById('vpn-api-country');
+            if (select && data.countries) {
+                select.innerHTML = '<option value="">Tous</option>' +
+                    data.countries.map(c => `<option value="${escHtml(c.code)}">${escHtml(c.name)} (${escHtml(c.code)})</option>`).join('');
+            }
+        } catch (e) {
+            console.error('Load countries error:', e);
+        }
+    }
+
+    // ── Discover Servers via API ──
+    window.vpnDiscoverServers = async function() {
+        const country = document.getElementById('vpn-api-country')?.value || '';
+        const group = document.getElementById('vpn-api-group')?.value || '';
+        const limit = parseInt(document.getElementById('vpn-api-limit')?.value) || 5;
+        const resultsEl = document.getElementById('vpn-api-results');
+        if (resultsEl) resultsEl.textContent = 'Découverte en cours...';
+
+        try {
+            const resp = await fetchWithToken('/api/vpn/discover-and-add', {
+                method: 'POST', headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ country: country || null, group: group || null, limit })
+            });
+            const data = await resp.json();
+            if (data.error) {
+                if (resultsEl) resultsEl.innerHTML = `<span style="color:var(--danger)">✗ ${data.error}</span>`;
+            } else {
+                if (resultsEl) resultsEl.innerHTML = `<span style="color:var(--success)">✓ ${data.count} serveur(s) ajouté(s)</span>`;
+                refreshVPNStatus();
+            }
+        } catch (e) {
+            if (resultsEl) resultsEl.innerHTML = `<span style="color:var(--danger)">✗ Erreur: ${e.message}</span>`;
+        }
+    };
+
+    // ── Export VPN Config ──
+    window.vpnExportConfig = async function() {
+        try {
+            const resp = await fetchWithToken('/api/vpn/export');
+            const data = await resp.json();
+            const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `opencode-vpn-config-${new Date().toISOString().slice(0,10)}.json`;
+            a.click();
+            URL.revokeObjectURL(url);
+        } catch (e) {
+            alert('Export failed: ' + e.message);
+        }
+    };
+
+    // ── Import VPN Config ──
+    window.vpnImportConfig = async function() {
+        const input = document.createElement('input');
+        input.type = 'file';
+        input.accept = '.json';
+        input.onchange = async (e) => {
+            const file = e.target.files[0];
+            if (!file) return;
+            try {
+                const text = await file.text();
+                const data = JSON.parse(text);
+                const resp = await fetchWithToken('/api/vpn/import', {
+                    method: 'POST', headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(data)
+                });
+                const result = await resp.json();
+                if (result.ok) {
+                    alert('Configuration importée avec succès');
+                    refreshVPNStatus();
+                } else {
+                    alert('Import failed: ' + (result.error || 'Unknown error'));
+                }
+            } catch (e) {
+                alert('Import failed: ' + e.message);
+            }
+        };
+        input.click();
+    };
+
     // ── Free Models master toggle ──
     window.toggleFreeModels = async function(enabled) {
-        await fetch('/api/vpn/toggle', {
+        await fetchWithToken('/api/vpn/toggle', {
             method: 'POST', headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({enabled})
         });
@@ -2750,22 +4279,120 @@ document.addEventListener('DOMContentLoaded', () => {
     };
 
     // ── Proxy mode switching ──
+    let _geoCache = null;
+    let _geoCacheTs = 0;
+    async function updateGeoWarning(mode) {
+        const el = document.getElementById('fm-geo-warning');
+        if (!el) return;
+        if (mode === 'vpn') { el.style.display = 'none'; return; }
+        try {
+            const now = Date.now();
+            if (!_geoCache || now - _geoCacheTs > 60000) {
+                const r = await fetchWithToken('/api/routes?geo_status=ok&limit=100');
+                const j = await r.json();
+                _geoCache = j.routes || [];
+                _geoCacheTs = now;
+            }
+            const geoRoutes = _geoCache.filter(x => x.geo && (x.geo.require_vpn || x.mode === 'strict'));
+            if (!geoRoutes.length) { el.style.display = 'none'; return; }
+            const isDirect = mode === 'direct';
+            const head = isDirect
+                ? '⚠️ Mode direct : les modèles géo-restreints risquent de ne pas fonctionner (403). Passez en VPN.'
+                : '⚠️ SOCKS5 : vérifiez que vos proxies sont dans les pays autorisés, sinon 403.';
+            const byModel = {};
+            for (const r of geoRoutes) {
+                const m = r.model || r.key;
+                if (!byModel[m]) byModel[m] = { countries: r.effective_allowed || [], matches: [] };
+                for (const mt of (r.match || [])) if (!byModel[m].matches.includes(mt)) byModel[m].matches.push(mt);
+            }
+            const lines = Object.entries(byModel).map(([model, v]) => {
+                const via = v.matches.filter(x => x !== model).join(', ');
+                const c = (v.countries || []).join(', ') || '—';
+                return `<div style="margin-bottom:6px"><strong>${escHtml(model)}</strong>${via ? ' <span style="opacity:.7">(via ' + escHtml(via) + ')</span>' : ''}<br><span style="opacity:.8">Autorisé : ${escHtml(c)} (strict, VPN requis)</span></div>`;
+            }).join('');
+            el.innerHTML = `<div style="display:flex;gap:8px;align-items:flex-start"><span style="flex:1">${head}</span><span class="geo-info" tabindex="0" aria-label="Détails géo" style="cursor:help;flex-shrink:0;width:20px;height:20px;display:inline-flex;align-items:center;justify-content:center;border-radius:50%;background:var(--warning,#e6a000);color:#fff;font-weight:700;font-size:12px">ⓘ<span class="geo-tooltip" role="tooltip" style="display:none;position:absolute;right:0;top:28px;min-width:320px;max-width:420px;padding:12px;background:var(--bg-card,#222);border:1px solid var(--border);border-radius:8px;box-shadow:0 8px 24px rgba(0,0,0,.4);font-size:11px;line-height:1.5;z-index:10">${lines}</span></span></div>`;
+            el.style.display = 'block';
+            const info = el.querySelector('.geo-info');
+            const tip = el.querySelector('.geo-tooltip');
+            if (info && tip) {
+                const show = () => tip.style.display = 'block';
+                const hide = () => tip.style.display = 'none';
+                info.addEventListener('mouseenter', show);
+                info.addEventListener('mouseleave', hide);
+                info.addEventListener('focus', show);
+                info.addEventListener('blur', hide);
+                el.style.position = 'relative';
+            }
+        } catch (e) { el.style.display = 'none'; }
+    }
+
+    // ── Geo direct → VPN fallback banner + toast + tray (poll /api/geo/notifications)
+    let _lastGeoNotifTime = '';
+    async function pollGeoFallback() {
+        try {
+            const j = await apiFetch('/api/geo/notifications');
+            const notifs = j.notifications || [];
+            const banner = document.getElementById('geo-banner');
+            // Banner: only when direct incompatible → show warning, otherwise hide (spec: ne rien dire)
+            // Only show if last notification is recent (<10 min), else stale
+            if (notifs.length) {
+                const last = notifs[notifs.length - 1];
+                let recent = true;
+                try { recent = (Date.now() - new Date(last.time).getTime()) < 600000; } catch(e){}
+                if (recent) {
+                    const msg = escHtml(last.message || '');
+                    if (banner) {
+                        banner.innerHTML = '⚠️ <strong>' + escHtml(t('geo.toast_title')) + '</strong> — ' + msg;
+                        banner.style.display = 'block';
+                        banner.style.background = 'rgba(255,170,0,0.16)';
+                        banner.style.border = '1px solid var(--warning,#e6a000)';
+                        banner.style.color = 'var(--text)';
+                    }
+                    // toast once per new time
+                    if (last.time && last.time !== _lastGeoNotifTime) {
+                        _lastGeoNotifTime = last.time;
+                        showGeoToast(last.message);
+                    }
+                } else if (banner && banner.innerHTML.includes(escHtml(t('geo.toast_title')))) {
+                    banner.style.display = 'none';
+                }
+            } else {
+                // No fallback active — hide geo fallback banner (spec: ne rien dire quand direct OK)
+                // Do not clear the main geo status banner managed by refreshVPNStatus; only hide fallback warning
+                // We distinguish by checking if banner currently shows fallback (contains toast_title)
+                if (banner && banner.innerHTML.includes(escHtml(t('geo.toast_title')))) {
+                    banner.style.display = 'none';
+                }
+            }
+        } catch (e) {}
+    }
+    function showGeoToast(msg) {
+        let toast = document.getElementById('geo-toast');
+        if (!toast) {
+            toast = document.createElement('div');
+            toast.id = 'geo-toast';
+            toast.style.cssText = 'position:fixed;bottom:16px;right:16px;max-width:420px;padding:12px 16px;background:var(--bg-card,#222);border:1px solid var(--warning,#e6a000);border-radius:8px;box-shadow:0 8px 24px rgba(0,0,0,.4);font-size:12px;z-index:9999;display:none';
+            document.body.appendChild(toast);
+        }
+        toast.textContent = msg;
+        toast.style.display = 'block';
+        setTimeout(()=>{ toast.style.display='none'; }, 6000);
+    }
+
     function setProxyModeUI(mode) {
-        // Update radio buttons
         document.querySelectorAll('.proxy-mode-btn').forEach(btn => btn.classList.remove('active'));
         const activeBtn = document.getElementById('fm-mode-' + mode);
         if (activeBtn) activeBtn.classList.add('active');
-
-        // Show/hide sections
         const vpnSection = document.getElementById('fm-vpn-section');
         const socks5Section = document.getElementById('fm-socks5-section');
         if (vpnSection) vpnSection.style.display = mode === 'vpn' ? 'block' : 'none';
         if (socks5Section) socks5Section.style.display = mode === 'socks5' ? 'block' : 'none';
+        updateGeoWarning(mode);
     }
 
     window.switchProxyMode = async function(mode) {
         setProxyModeUI(mode);
-        await fetch('/api/vpn/proxy-mode', {
+        await fetchWithToken('/api/vpn/proxy-mode', {
             method: 'POST', headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({mode})
         });
@@ -2791,7 +4418,7 @@ document.addEventListener('DOMContentLoaded', () => {
                     ${p.has_password ? '<span style="font-size:11px;color:var(--text-muted)">🔒</span>' : ''}
                 </div>
                 <div style="display:flex;gap:4px">
-                    <button class="btn btn-sm" onclick="testSocks5Proxy('${escHtml(p.host)}', ${p.port})" style="font-size:11px;padding:2px 8px" data-i18n="free_models.socks5_test">Tester</button>
+                    <button class="btn btn-sm js-test-socks5" data-host="${escHtml(p.host)}" data-port="${parseInt(p.port,10)||0}" style="font-size:11px;padding:2px 8px" data-i18n="free_models.socks5_test">Tester</button>
                     <button class="btn btn-sm btn-danger" onclick="removeSocks5Proxy(${i})" style="font-size:11px;padding:2px 8px">✕</button>
                 </div>
             </div>
@@ -2806,7 +4433,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
         if (!host) return alert('Hôte requis');
 
-        const resp = await fetch('/api/vpn/socks5', {
+        const resp = await fetchWithToken('/api/vpn/socks5', {
             method: 'POST', headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({host, port, username, password})
         });
@@ -2825,7 +4452,7 @@ document.addEventListener('DOMContentLoaded', () => {
     window.removeSocks5Proxy = async function(index) {
         if (!confirm(t('free_models.socks5_remove') || 'Supprimer ce proxy ?')) return;
 
-        const resp = await fetch('/api/vpn/socks5/remove', {
+        const resp = await fetchWithToken('/api/vpn/socks5/remove', {
             method: 'POST', headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({index})
         });
@@ -2834,20 +4461,22 @@ document.addEventListener('DOMContentLoaded', () => {
     };
 
     window.toggleSocks5Proxy = async function(index, enabled) {
-        await fetch('/api/vpn/socks5/toggle', {
+        await fetchWithToken('/api/vpn/socks5/toggle', {
             method: 'POST', headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({index, enabled})
         });
     };
 
-    window.testSocks5Proxy = async function(host, port) {
-        const btn = event.target;
+    window.testSocks5Proxy = async function(host, port, btn) {
+        // [v10 §14.3.24] plus de global `event` (Firefox/Safari ReferenceError)
+        btn = btn || document.querySelector('.js-test-socks5[data-host="' + CSS.escape(String(host)) + '"]');
+        if (!btn) return;
         const origText = btn.textContent;
         btn.textContent = t('free_models.socks5_testing') || 'Test...';
         btn.disabled = true;
 
         try {
-            const resp = await fetch('/api/vpn/socks5/test', {
+            const resp = await fetchWithToken('/api/vpn/socks5/test', {
                 method: 'POST', headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({host, port})
             });
@@ -2878,11 +4507,39 @@ document.addEventListener('DOMContentLoaded', () => {
         }, 3000);
     };
 
+    // [v10 §14.1.16/14.3.24] délégation : plus de onclick inline avec
+    // interpolation dans un contexte JS-string (vecteur XSS + event global).
+    document.addEventListener('click', function(ev) {
+        const testBtn = ev.target.closest('.js-test-socks5');
+        if (testBtn) {
+            const host = testBtn.getAttribute('data-host') || '';
+            const port = parseInt(testBtn.getAttribute('data-port'), 10) || 0;
+            window.testSocks5Proxy(host, port, testBtn);
+        }
+    });
+
     window.toggleSocks5Rotation = async function(enabled) {
-        await fetch('/api/vpn/socks5/rotate', {
+        await fetchWithToken('/api/vpn/socks5/rotate', {
             method: 'POST', headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({rotate: enabled})
         });
+    };
+
+    window.toggleGeo = async function() {
+        const cur = await fetchWithToken('/api/geo-policies').then(r => r.json());
+        const enabled = !cur.enabled;
+        await fetchWithToken('/api/geo-policies', { method: 'PUT', headers: {'Content-Type': 'application/json', 'If-Match': String(Date.now())}, body: JSON.stringify({enabled, version: cur.version}) });
+        refreshVPNStatus();
+    };
+    window.toggleGeoDirect = async function() {
+        const cur = await fetchWithToken('/api/geo-policies').then(r => r.json());
+        const allow_direct_when_compatible = !cur.allow_direct_when_compatible;
+        await fetchWithToken('/api/geo-policies', { method: 'PUT', headers: {'Content-Type': 'application/json', 'If-Match': String(Date.now())}, body: JSON.stringify({allow_direct_when_compatible, version: cur.version, enabled: cur.enabled}) });
+        refreshVPNStatus();
+    };
+    window.rollbackGeo = async function() {
+        await fetchWithToken('/api/geo-policies/rollback', { method: 'POST' });
+        refreshVPNStatus();
     };
 
     // Refresh VPN status every 10 seconds when VPN tab is active

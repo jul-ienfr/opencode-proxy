@@ -8,7 +8,9 @@ Type=simple
 User=opencode
 Group=opencode
 WorkingDirectory=/opt/opencode-proxy
-ExecStart=/opt/opencode-proxy/.venv/bin/python opencode.py
+# Prod: gunicorn (workers=cpu_count, UvicornWorker, keepalive 15, timeout 600)
+# Dev: python opencode.py --no-gui (uvicorn direct, single worker)
+ExecStart=/opt/opencode-proxy/.venv/bin/gunicorn -c gunicorn.conf.py opencode:app
 Restart=always
 RestartSec=5
 

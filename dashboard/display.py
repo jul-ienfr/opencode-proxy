@@ -2,20 +2,20 @@
 Rich terminal display: token usage table, log panel, keyboard input.
 """
 
-import sys
-import time
-import os
 import collections
-import threading
 import logging
+import os
+import sys
+import threading
+import time
+
+from rich import box
+from rich.console import Group
+from rich.live import Live
+from rich.panel import Panel
+from rich.table import Table
 
 import config.settings as _cfg_settings
-
-from rich.live import Live
-from rich.table import Table
-from rich.panel import Panel
-from rich.console import Group
-from rich import box
 
 log_lines = collections.deque(maxlen=200)
 LOG_VISIBLE = 35
@@ -28,6 +28,7 @@ _debug_file_path = None
 _debug_write_counter = 0
 _DEBUG_FLUSH_INTERVAL = 10  # Flush to disk every N writes (reduces syscall overhead)
 _DEBUG_MAX_SIZE = 10 * 1024 * 1024  # Auto-rotate when file exceeds 10 MB
+_extra_handlers = []  # FileHandlers attached to module loggers (vpn_manager, free_ip_pool)
 
 
 def _rotate_debug_log():
@@ -40,6 +41,14 @@ def _rotate_debug_log():
         if size <= _DEBUG_MAX_SIZE:
             return
         _debug_file.close()
+        # [36] close the module-logger FileHandlers BEFORE the rename —
+        # on Windows an open handle makes os.rename fail with WinError 32.
+        # FileHandler re-opens baseFilename lazily on the next emit.
+        for _fh in _extra_handlers:
+            try:
+                _fh.close()
+            except Exception:
+                pass
         rotated = _debug_file_path + ".1"
         if os.path.exists(rotated):
             os.remove(rotated)
@@ -60,6 +69,52 @@ def set_debug_log_file(path: str):
         _rotate_debug_log()  # Rotate if needed at startup
     except Exception:
         _debug_file = None
+
+
+def attach_module_logger(name: str, level: int = logging.INFO):
+    """Attach the stdlib logger ``name`` to debug.log (rotation-aware).
+
+    Used for critical subsystems (vpn_manager, free_ip_pool) whose failures
+    must be visible in debug.log even when DEBUG is off — rotation failures
+    happen exactly when the tunnel is down, the moments you need the trace
+    most. The handler is registered in ``_extra_handlers`` so rotation
+    closes it before the rename (Windows file lock) and it re-opens the
+    new file lazily on the next emit.
+    """
+    global _debug_file_path
+    if not _debug_file_path:
+        return None
+    logger = logging.getLogger(name)
+    if logger.level == logging.NOTSET or logger.level > level:
+        logger.setLevel(level)
+    fh = logging.FileHandler(_debug_file_path, encoding="utf-8")
+    # Same bracketed-timestamp style as debug()/log() writes to debug.log,
+    # e.g. "[2026-08-17 18:54:50] [vpn_manager] [vpn-watchdog] ...". Keeping
+    # one consistent format lets header-anchored greps find both paths.
+    fh.setFormatter(
+        logging.Formatter("[%(asctime)s] [%(name)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    )
+    fh.setLevel(level)
+    logger.addHandler(fh)
+    _extra_handlers.append(fh)
+    return fh
+
+
+def attach_panel_logger(name: str, handler: logging.Handler):
+    """Route a module logger to a panel/UI handler WITHOUT dropping existing ones.
+
+    WebServerThread attaches RichLogHandler to vpn_manager/free_ip_pool so
+    their lines appear in the dashboard panel. Replacing ``logger.handlers``
+    here would clobber the debug.log FileHandler installed by
+    attach_module_logger() — exactly what made [vpn]/[vpn-watchdog] lines
+    invisible in logs/debug.log during AUTH_FAILED incidents. Append instead,
+    and stop propagation so records don't double-emit through the root logger.
+    """
+    logger = logging.getLogger(name)
+    if handler not in logger.handlers:
+        logger.addHandler(handler)
+    logger.propagate = False
+    return logger
 
 
 def log(msg: str):
@@ -119,7 +174,9 @@ class RichLogHandler(logging.Handler):
 
 
 def build_display(routes, token_usage, token_lock):
-    table = Table(box=box.SIMPLE, show_header=True, header_style="bold cyan", pad_edge=False, expand=False)
+    table = Table(
+        box=box.SIMPLE, show_header=True, header_style="bold cyan", pad_edge=False, expand=False
+    )
     table.add_column("Route", style="bold", width=8)
     table.add_column("Model", style="bold", min_width=14)
     table.add_column("Total", justify="right", min_width=10)
@@ -148,8 +205,12 @@ def build_display(routes, token_usage, token_lock):
         sum_cache += d["cache"]
         pct = f"{total / sum_total * 100:.1f}%" if sum_total else "0%"
         table.add_row(
-            route_name, model,
-            f"{total:,}", f"{d['input']:,}", f"{d['output']:,}", f"{d['cache']:,}",
+            route_name,
+            model,
+            f"{total:,}",
+            f"{d['input']:,}",
+            f"{d['output']:,}",
+            f"{d['cache']:,}",
             pct,
         )
 
@@ -164,23 +225,28 @@ def build_display(routes, token_usage, token_lock):
         sum_cache += d["cache"]
         pct = f"{total / sum_total * 100:.1f}%" if sum_total else "0%"
         table.add_row(
-            "-", model,
-            f"{total:,}", f"{d['input']:,}", f"{d['output']:,}", f"{d['cache']:,}",
+            "-",
+            model,
+            f"{total:,}",
+            f"{d['input']:,}",
+            f"{d['output']:,}",
+            f"{d['cache']:,}",
             pct,
         )
 
     sum_total = sum_in + sum_out + sum_cache
     table.add_row(
-        "[bold yellow]ALL[/]", "",
+        "[bold yellow]ALL[/]",
+        "",
         f"[bold yellow]{sum_total:,}[/]",
         f"[bold yellow]{sum_in:,}[/]",
         f"[bold yellow]{sum_out:,}[/]",
         f"[bold yellow]{sum_cache:,}[/]",
-        f"[bold yellow]100%[/]",
+        "[bold yellow]100%[/]",
     )
 
     start = max(0, min(_log_scroll, len(log_lines) - LOG_VISIBLE))
-    visible = list(log_lines)[start:start + LOG_VISIBLE]
+    visible = list(log_lines)[start : start + LOG_VISIBLE]
     log_text = "\n".join(visible) if visible else "[dim]waiting for requests...[/]"
     if len(log_lines) > LOG_VISIBLE:
         log_text += f"\n[dim]↑ {start + 1}/{len(log_lines)} logs (scroll with ↑↓ keys)[/]"
@@ -198,23 +264,28 @@ def start_input_thread():
     def _input_thread():
         if sys.platform == "win32":
             import msvcrt
+
             while not _stop_event.is_set():
                 if msvcrt.kbhit():
                     try:
                         ch = msvcrt.getch()
-                        if ch in (b'\xe0', b'\x00'):
+                        if ch in (b"\xe0", b"\x00"):
                             ch2 = msvcrt.getch()
-                            if ch2 == b'H':
+                            if ch2 == b"H":
                                 _log_scroll = max(0, _log_scroll - 1)
-                            elif ch2 == b'P':
-                                _log_scroll = min(max(0, len(log_lines) - LOG_VISIBLE), _log_scroll + 1)
-                            elif ch2 == b'I':
+                            elif ch2 == b"P":
+                                _log_scroll = min(
+                                    max(0, len(log_lines) - LOG_VISIBLE), _log_scroll + 1
+                                )
+                            elif ch2 == b"I":
                                 _log_scroll = max(0, _log_scroll - LOG_VISIBLE)
-                            elif ch2 == b'Q':
-                                _log_scroll = min(max(0, len(log_lines) - LOG_VISIBLE), _log_scroll + LOG_VISIBLE)
-                            elif ch2 == b'G':
+                            elif ch2 == b"Q":
+                                _log_scroll = min(
+                                    max(0, len(log_lines) - LOG_VISIBLE), _log_scroll + LOG_VISIBLE
+                                )
+                            elif ch2 == b"G":
                                 _log_scroll = 0
-                            elif ch2 == b'O':
+                            elif ch2 == b"O":
                                 _log_scroll = max(0, len(log_lines) - LOG_VISIBLE)
                             continue
                         ch = ch.decode("utf-8", errors="ignore")
@@ -233,7 +304,10 @@ def start_input_thread():
                 else:
                     time.sleep(0.05)
         else:
-            import tty, termios, select
+            import select
+            import termios
+            import tty
+
             fd = sys.stdin.fileno()
             old = termios.tcgetattr(fd)
             tty.setraw(fd)
@@ -244,17 +318,26 @@ def start_input_thread():
                         if ch == "\x03":
                             _stop_event.set()
                         elif ch == "\x1b":
-                            seq = sys.stdin.read(2) if select.select([sys.stdin], [], [], 0.01)[0] else ""
+                            seq = (
+                                sys.stdin.read(2)
+                                if select.select([sys.stdin], [], [], 0.01)[0]
+                                else ""
+                            )
                             if seq == "[A":
                                 _log_scroll = max(0, _log_scroll - 1)
                             elif seq == "[B":
-                                _log_scroll = min(max(0, len(log_lines) - LOG_VISIBLE), _log_scroll + 1)
+                                _log_scroll = min(
+                                    max(0, len(log_lines) - LOG_VISIBLE), _log_scroll + 1
+                                )
                             elif seq == "[5":
                                 if sys.stdin.read(1) == "~":
                                     _log_scroll = max(0, _log_scroll - LOG_VISIBLE)
                             elif seq == "[6":
                                 if sys.stdin.read(1) == "~":
-                                    _log_scroll = min(max(0, len(log_lines) - LOG_VISIBLE), _log_scroll + LOG_VISIBLE)
+                                    _log_scroll = min(
+                                        max(0, len(log_lines) - LOG_VISIBLE),
+                                        _log_scroll + LOG_VISIBLE,
+                                    )
                             elif seq == "[H":
                                 _log_scroll = 0
                             elif seq == "[F":
@@ -278,12 +361,14 @@ def run_terminal_loop(routes, token_usage, token_lock):
     global _display_dirty
     stop = start_input_thread()
     try:
-        with Live(build_display(routes, token_usage, token_lock), refresh_per_second=1, screen=True) as live:
+        with Live(
+            build_display(routes, token_usage, token_lock), refresh_per_second=1, screen=True
+        ) as live:
             while stop():
                 if _display_dirty:
                     _display_dirty = False
                     live.update(build_display(routes, token_usage, token_lock))
                 time.sleep(0.5)
     except Exception as e:
-        _debug(f"  [display] crashed: {type(e).__name__}: {e}")
+        log(f"  [display] crashed: {type(e).__name__}: {e}")
         raise  # re-throw so __main__ handler can log it too

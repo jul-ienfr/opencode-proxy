@@ -1,0 +1,129 @@
+{
+  "fn": "anthropic_to_openai",
+  "input": {
+    "body": {
+      "model": "claude-sonnet-4-5",
+      "max_tokens": 2048,
+      "system": [
+        {
+          "type": "text",
+          "text": "Use tools wisely."
+        }
+      ],
+      "tools": [
+        {
+          "name": "get_weather",
+          "description": "Get current weather",
+          "input_schema": {
+            "type": "object",
+            "properties": {
+              "city": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "city"
+            ]
+          }
+        }
+      ],
+      "tool_choice": {
+        "type": "auto"
+      },
+      "messages": [
+        {
+          "role": "user",
+          "content": "Quel temps à Paris ?"
+        },
+        {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "tool_use",
+              "id": "toolu_01ABC",
+              "name": "get_weather",
+              "input": {
+                "city": "Paris"
+              }
+            }
+          ]
+        },
+        {
+          "role": "user",
+          "content": [
+            {
+              "type": "tool_result",
+              "tool_use_id": "toolu_01ABC",
+              "content": "18C, nuageux"
+            }
+          ]
+        }
+      ]
+    },
+    "model": "deepseek-v4-flash"
+  },
+  "expected": {
+    "model": "deepseek-v4-flash",
+    "messages": [
+      {
+        "role": "system",
+        "content": "Use tools wisely.",
+        "cache_control": {
+          "type": "ephemeral"
+        }
+      },
+      {
+        "role": "user",
+        "content": "Quel temps à Paris ?",
+        "cache_control": {
+          "type": "ephemeral"
+        }
+      },
+      {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+          {
+            "id": "toolu_01ABC",
+            "type": "function",
+            "function": {
+              "name": "get_weather",
+              "arguments": "{\"city\":\"Paris\"}"
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "tool_call_id": "toolu_01ABC",
+        "content": "18C, nuageux"
+      }
+    ],
+    "max_tokens": 2048,
+    "stream": false,
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "get_weather",
+          "description": "Get current weather",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "city": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "city"
+            ],
+            "additionalProperties": false
+          }
+        }
+      }
+    ],
+    "tool_choice": "auto"
+  },
+  "_note": "tool_result user -> message role=tool ; tool_choice auto -> 'auto'",
+  "_generated_by": "scripts/gen_golden_fixtures.py (plan v10 §11.5)"
+}

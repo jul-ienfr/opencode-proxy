@@ -1,0 +1,40 @@
+{
+  "fn": "anthropic_to_openai",
+  "input": {
+    "body": {
+      "model": "claude-sonnet-4-5",
+      "max_tokens": 1024,
+      "system": "Tu es un assistant concis.",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Bonjour"
+        }
+      ]
+    },
+    "model": "deepseek-v4-flash"
+  },
+  "expected": {
+    "model": "deepseek-v4-flash",
+    "messages": [
+      {
+        "role": "system",
+        "content": "Tu es un assistant concis.",
+        "cache_control": {
+          "type": "ephemeral"
+        }
+      },
+      {
+        "role": "user",
+        "content": "Bonjour",
+        "cache_control": {
+          "type": "ephemeral"
+        }
+      }
+    ],
+    "max_tokens": 1024,
+    "stream": false
+  },
+  "_note": "system string -> premier message system ; max_tokens mappe",
+  "_generated_by": "scripts/gen_golden_fixtures.py (plan v10 §11.5)"
+}

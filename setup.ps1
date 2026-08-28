@@ -89,7 +89,7 @@ Write-Host "[OK] Configuration prete" -ForegroundColor Green
 Write-Host ""
 Write-Host "========================================" -ForegroundColor Cyan
 Write-Host "  Lancement du proxy..." -ForegroundColor Cyan
-Write-Host "  Dashboard: http://localhost:8082" -ForegroundColor Cyan
+Write-Host "  API + Dashboard: http://localhost:4000" -ForegroundColor Cyan
 Write-Host "========================================" -ForegroundColor Cyan
 Write-Host ""
 python opencode.py

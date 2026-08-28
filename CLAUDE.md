@@ -8,13 +8,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 # Install dependencies
 pip install -r requirements.txt
 
-# Run the proxy server
+# Run the proxy server (GUI by default: system tray + dashboard window)
+# GUI deps: pip install pystray Pillow pywebview  (falls back to terminal mode if missing)
 python opencode.py
+
+# Force terminal mode (headless — used by systemd/Docker)
+python opencode.py --no-gui
 ```
 
 Server starts on:
-- **API**: http://localhost:4000
-- **Web Dashboard**: http://localhost:8082
+- **API + Web Dashboard** (same app): http://localhost:4000
 
 ## Configuration
 
@@ -33,8 +36,7 @@ Key environment variables:
 
 Optional server overrides:
 - `OPENCODE_HOST` - Bind address (default: `0.0.0.0`)
-- `OPENCODE_PORT` - API port (default: `4000`)
-- `OPENCODE_WEB_PORT` - Web UI port (default: `8082`)
+- `OPENCODE_PORT` - API + dashboard port (default: `4000`)
 
 ## Deployment (Ubuntu Server)
 
@@ -73,7 +75,6 @@ docker build -t opencode-proxy .
 docker run -d \
   --name opencode-proxy \
   -p 4000:4000 \
-  -p 8082:8082 \
   -v $(pwd)/.env:/app/.env \
   -v opencode-logs:/app/logs \
   opencode-proxy
@@ -116,9 +117,19 @@ docker run -d \
 - Static files in `static/` directory
 - Token usage stats and request history via API endpoints
 
+## Claude Code — Hygiène contexte (anti-thrashing Autocompact)
+
+Pour éviter `Autocompact thrashing` (contexte qui se remplit en 2-3 tours) :
+- `Read` toujours avec `limit` (ex: `Read opencode.py limit 100 offset 1200`) sur les gros fichiers.
+- `Grep` toujours avec `glob`/`path` ciblé (`glob: "*.py"` ou `path: "app/"`) + `output_mode: "files_with_matches"` + `head_limit: 30` d'abord.
+- `Glob` jamais `**/*` nu → `app/**/*.py`, `dashboard/**/*.py`.
+- `git diff --stat` d'abord, puis `git diff -- <fichier>` ciblé si besoin ; `git log --oneline -20`.
+- Logs/DB : jamais `Read` sur `logs/requests.db` (3 Go) ou `logs/debug.log` → `Bash: tail -n 50 logs/debug.log` ou `sqlite3 logs/requests.db "SELECT ... LIMIT 20"`.
+- Fichiers ignorés par `.claudeignore` : `logs/`, `.kilo/`, `*.db`, `*.log` — ne pas les forcer.
+
 ## Remote Server Maintenance (192.168.31.101)
 
-Le serveur distant est une Ubuntu 24.04 qui héberge l'opencode-proxy ainsi que d'autres workloads (P-core, etc.).
+Le serveur distant est une Ubuntu 24.04 qui héberge d'autres workloads (P-core, etc.).
 
 ### Problème connu : VS Code Remote-SSH
 

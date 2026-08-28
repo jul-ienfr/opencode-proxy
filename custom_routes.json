@@ -3,32 +3,50 @@
     "match": [
       "mimo-v2.5"
     ],
-    "model": "mimo-v2.5",
+    "model": "muse-spark-1.2-contributor",
     "thinking": "adaptive"
   },
   "mimov25pro": {
     "match": [
       "mimo-v2.5-pro"
     ],
-    "model": "mimo-v2.5"
+    "model": "muse-spark-1.2-contributor"
   },
   "qwen35plus": {
     "match": [
       "qwen3.5-plus"
     ],
-    "model": "mimo-v2.5",
+    "model": "muse-spark-1.2-contributor",
     "thinking": "adaptive"
   },
   "gpt54mini": {
     "match": [
       "gpt-5.4-mini"
     ],
-    "model": "mimo-v2.5"
+    "model": "muse-spark-1.2-contributor"
   },
   "kimik26": {
     "match": [
       "kimi-k2.6"
     ],
-    "model": "mimo-v2.5"
+    "model": "muse-spark-1.2-contributor"
+  },
+  "gpt56luna": {
+    "match": [
+      "gpt-5.6-luna"
+    ],
+    "model": "muse-spark-1.2-contributor"
+  },
+  "deepseekv4flash": {
+    "match": [
+      "deepseek-v4-flash"
+    ],
+    "model": "muse-spark-1.2-contributor"
+  },
+  "qwen37max": {
+    "match": [
+      "qwen3.7-max"
+    ],
+    "model": "muse-spark-1.2-contributor"
   }
 }
