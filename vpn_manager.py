@@ -3453,6 +3453,9 @@ class VPNManager:
                         attempt + 1,
                         max_skips + 1,
                     )
+                    # Backoff: hammering NordVPN with 5 rapid auth attempts
+                    # triggers throttling/AUTH_FAILED storms. Space the pins.
+                    await asyncio.sleep(15)
                     continue  # dead host: the next country can work
                 return False  # infra failure: compose path is the escalation
             host = await self._current_hostname(since)
@@ -3463,6 +3466,7 @@ class VPNManager:
                     attempt + 1,
                     max_skips + 1,
                 )
+                await asyncio.sleep(5)
                 continue
             if await self._finalize_ip(allow_stale=False):
                 self._watchdog_backoff.record_success()
