@@ -5030,16 +5030,15 @@ class VPNManager:
                                 self._watchdog_event.set()
                             except Exception:
                                 pass
-                        # container absent/stopped → schedule ensure outside lock (avoid deadlock)
-                        # FIX always functional: stopped (control VPN arrêté) must also heal, not just absent
+                        # container absent/stopped → heal synchrone (FIX always functional: was create_task + return → s1 restait arrêté 30s)
                         if not info or not info.get("running"):
                             try:
-                                asyncio.create_task(self._ensure_container())
-                            except Exception:
-                                pass
+                                await self._ensure_container()
+                            except Exception as e:
+                                logger.warning("[vpn-watchdog] heal VPN arrêté %s failed: %s", self._docker_container, e)
                     except Exception:
                         pass
-                    return  # absent/stopped/restarting — heal scheduled, next tick will re-check
+                    return  # absent/stopped/restarting — healed, next tick will re-check
                 if egress_dead:
                     kind = "egress dead"
                 elif self._auth_failed:

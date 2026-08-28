@@ -195,7 +195,7 @@ ip_rotation:
   - https://icanhazip.com
   - https://ifconfig.me/ip
   - https://checkip.amazonaws.com
-  ip_probe_budget: 10.0
+  ip_probe_budget: 20.0
   latency_rotation:
     consecutive_slow: 3
     enabled: true
