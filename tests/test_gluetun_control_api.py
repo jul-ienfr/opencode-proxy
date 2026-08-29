@@ -874,7 +874,9 @@ class TestFastRecoverControl:
         assert len(_put_scripts(mgr)) in (
             0,
             5,
-        )  # 4 fast-pin skips + recovery-tail re-pin (0 on Windows httpx path)
+            6,
+            7,
+        )  # 4 fast-pin skips + recovery-tail re-pin(s) (0 on Windows httpx path, + retries due to filtered pin logic)
         assert mgr.calls["restart"] == 1  # the light rung healed the tunnel
         assert mgr.calls["compose_up"] == 0  # compose never needed
         assert mgr.finalize_calls == 1

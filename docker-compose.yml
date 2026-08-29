@@ -3,7 +3,7 @@
 # share one stanza instead of duplicating it. Stations 1-2 keep their
 # historical literal blocks.
 x-gluetun-multi-base: &gluetun-multi-base
-  image: qmcgaw/gluetun:v3.41.3
+  image: qmcgaw/gluetun:latest
   cap_add:
     - NET_ADMIN
   devices:
@@ -37,7 +37,7 @@ x-gluetun-multi-env: &gluetun-multi-env
   VPN_SERVICE_PROVIDER: nordvpn
   OPENVPN_VERBOSITY: '4'   # hostname in logs (see vpn-gluetun comment)
   SERVER_COUNTRIES: ${SERVER_COUNTRIES:?Set SERVER_COUNTRIES from config.yaml - run python scripts/make_credentials_env.py}
-  UPDATER_PERIOD: 480h
+  UPDATER_PERIOD: 24h
   HTTPPROXY: 'on'
   SOCKS5_ENABLED: 'on'
   # [incident v10] DoT par défaut de cette image flanche à travers certains
@@ -124,7 +124,7 @@ services:
         condition: service_healthy
 
   vpn-gluetun:
-    image: qmcgaw/gluetun:v3.41.3
+    image: qmcgaw/gluetun:latest
     container_name: opencode-vpn
     cap_add:
       - NET_ADMIN
@@ -169,7 +169,7 @@ services:
       # choices" and silently break the rotation.
       # Source unique: config.yaml ip_rotation.server_countries (no inline fallback, audit F-H5).
       - SERVER_COUNTRIES=${SERVER_COUNTRIES:?Set SERVER_COUNTRIES from config.yaml - see .env.example}
-      - UPDATER_PERIOD=480h   # gluetun refreshes its own servers list every 20 days (prevent stale list)
+      - UPDATER_PERIOD=24h   # gluetun refreshes its own servers list every 24h (prevent stale list)
       - HTTPPROXY=on
       - HTTPPROXY_LISTENING_ADDRESS=:8888
       - SOCKS5_ENABLED=on
@@ -223,7 +223,7 @@ services:
   # vpn-gluetun-2` when dual_station is enabled — explicitly targeting a
   # profiled service runs it regardless of its profile.
   vpn-gluetun-2:
-    image: qmcgaw/gluetun:v3.41.3
+    image: qmcgaw/gluetun:latest
     profiles: ["dual-station", "multi-station"]
     container_name: opencode-vpn-2
     cap_add:
@@ -264,7 +264,7 @@ services:
       # choices" and silently break the rotation.
       # Source unique: config.yaml ip_rotation.server_countries (no inline fallback, audit F-H5).
       - SERVER_COUNTRIES=${SERVER_COUNTRIES:?Set SERVER_COUNTRIES from config.yaml - see .env.example}
-      - UPDATER_PERIOD=480h   # gluetun refreshes its own servers list every 20 days (prevent stale list)
+      - UPDATER_PERIOD=24h   # gluetun refreshes its own servers list every 24h (prevent stale list)
       - HTTPPROXY=on
       - HTTPPROXY_LISTENING_ADDRESS=:8889
       - SOCKS5_ENABLED=on
@@ -474,7 +474,7 @@ services:
   # mechanism as vpn-gluetun-2, see comment above) and the canary never
   # starts automatically.
   vpn-wg-test:
-    image: qmcgaw/gluetun:v3.41.3
+    image: qmcgaw/gluetun:latest
     profiles: ["wg-test"]
     container_name: opencode-wg-test
     cap_add:

@@ -142,13 +142,13 @@ client_auth:
 supervisor:
   enabled: true
 ip_rotation:
-  auto_flip_cooldown_min: 0
+  auto_flip_cooldown_min: 15
   cascade_enabled: true
   auto_hetero_boot: false
   auto_max_free_attempts: true
   auto_ov_fail_threshold: 3
   auto_ov_return_min: 60
-  auto_wg_egress_ticks: 2
+  auto_wg_egress_ticks: 8
   backoff_max_delay: 60
   bad_ttl: 20
   wg_canary_fail_ttl_s: 90
@@ -159,7 +159,7 @@ ip_rotation:
   circuit_breaker_threshold: 3
   compose_service_2: vpn-gluetun-2
   connect_retry_interval: 20
-  control_api_key: VqdLMB1w_vBdO3rzfXYnlosN7PUEgOsnQgFtk3poXnE
+  control_api_key: vg3q59eBCjG9hWVXm2Wpc8n9smumwhtugihf7oDafv0
   control_enabled: true
   control_pin_catchup: 25
   control_pin_timeout: 20
@@ -173,7 +173,7 @@ ip_rotation:
   docker_container_2: opencode-vpn-2
   docker_events: true
   dual_station: true
-  egress_failure_tick_interval: 2.0
+  egress_failure_tick_interval: 5.0
   enabled: true
   free_exception_fallback: station-first
   free_parallel:
@@ -218,8 +218,8 @@ ip_rotation:
     stream_metric: ttfb
     window: 20
   max_free_attempts: 4
-  ovpn_endpoint_port: '443'
-  ovpn_protocol: udp
+  ovpn_endpoint_port: ''
+  ovpn_protocol: tcp
   proxy_mode: vpn
   quota_per_ip: 500
   recent_ip_max_age: 1800
@@ -251,6 +251,8 @@ ip_rotation:
   vpn_proxy_port: 8888
   vpn_proxy_port_2: 8889
   vpn_stack: auto
+  wg_churn_fallback: true
+  wg_return_enabled: true
   wait_healthy_poll: 0.5
   watchdog_backoff_base: 15
   watchdog_backoff_max: 60
@@ -276,7 +278,7 @@ custom_routes:
   mimov25:
     match:
     - mimo-v2.5
-    model: mimo-v2.5
+    model: muse-spark-1.2-contributor
     thinking: adaptive
   mimov25pro:
     match:
