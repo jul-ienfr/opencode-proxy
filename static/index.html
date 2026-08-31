@@ -316,6 +316,11 @@
                                     <span class="toggle-slider"></span>
                                 </label>
                                 <span id="vpn-toggle-label" style="margin-left:8px;font-size:13px" data-i18n="vpn.rotation">Rotation</span>
+                                <label class="toggle-switch" style="margin:0 0 0 14px" title="Cooldown soft/hard d'IP détectées lentes (rotation auto sur latence). Persistant (config.yaml) — OFF purge immédiatement les cooldowns actifs ; le tracking EWMA/p95 reste affiché sans effet.">
+                                    <input type="checkbox" id="vpn-latency-toggle" onchange="vpnSaveLatencyEnabled(this.checked)" checked>
+                                    <span class="toggle-slider"></span>
+                                </label>
+                                <span style="margin-left:6px;font-size:13px" data-i18n="vpn.latency_cooldown">Cooldown latence</span>
                             </div>
                         </div>
                         <!-- [plan 18/08 §2.1] Env périmé: le .env diffère de l'env du process — les enfants docker compose héritent de l'env (cause racine 19/08). Rempli par updateVPNUI quand /api/vpn-status expose env_divergence. -->

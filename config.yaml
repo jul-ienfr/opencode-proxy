@@ -141,6 +141,7 @@ client_auth:
   key: ''
 supervisor:
   enabled: true
+  warmup_excluded_requests: 1
 ip_rotation:
   auto_flip_cooldown_min: 15
   cascade_enabled: true
@@ -150,7 +151,7 @@ ip_rotation:
   auto_ov_return_min: 60
   auto_wg_egress_ticks: 8
   backoff_max_delay: 60
-  bad_ttl: 20
+  bad_ttl: 10
   wg_canary_fail_ttl_s: 90
   wg_canary_pass_ttl_s: 600
   wg_canary_countries: Switzerland,Germany,Netherlands
@@ -159,6 +160,16 @@ ip_rotation:
   circuit_breaker_threshold: 3
   compose_service_2: vpn-gluetun-2
   connect_retry_interval: 20
+  breaker_warmup_grace_s: 60
+  bad_ttl_factor: 2
+  bad_ttl_max: 1440
+  station_bad_ttl_s: 60
+  station_connect_retry_interval_s: 300
+  station_max_rotations_per_hour: 10
+  rotation_storm_cooldown_s: 600
+  cascade_max_duration_s: 120
+  stack_age_guard_s: 600
+  wg_canary_poll_interval_s: 4
   control_api_key: vg3q59eBCjG9hWVXm2Wpc8n9smumwhtugihf7oDafv0
   control_enabled: true
   control_pin_catchup: 25
@@ -197,23 +208,23 @@ ip_rotation:
   - https://checkip.amazonaws.com
   ip_probe_budget: 20.0
   latency_rotation:
-    consecutive_slow: 3
-    enabled: true
+    consecutive_slow: 5
+    enabled: false
     ewma_alpha: 0.3
-    ewma_threshold_ms: 6000
+    ewma_threshold_ms: 12000
     floor_ms: 3000
     global_degraded_cooldown_sec: 300
     global_degraded_threshold: 0.5
-    hard_cooldown_sec: 1800
+    hard_cooldown_sec: 900
     max_soft_rotates_per_hour: 6
     min_requests_before_eval: 5
-    p95_threshold_ms: 9000
-    slow_threshold_ms: 8000
+    p95_threshold_ms: 30000
+    slow_threshold_ms: 15000
     slow_threshold_ms_per_model:
-      deepseek: 5000
-      default: 8000
-      glm: 4000
-      muse-spark: 6000
+      deepseek: 12000
+      default: 15000
+      glm: 10000
+      muse-spark: 15000
     soft_cooldown_sec: 600
     stream_metric: ttfb
     window: 20
@@ -237,7 +248,7 @@ ip_rotation:
   socks5_proxy_port: 1080
   socks5_proxy_port_2: 1081
   state_file_2: logs/vpn_state2.json
-  station_count: 4
+  station_count: 5
   status_cache_seconds: 2.0
   strict_free: true
   on_429_action: both
@@ -366,6 +377,7 @@ database:
   mmap_size: 268435456
   commit_interval: 5
   commit_batch: 10
+  weekly_purge_days: 90
 background:
   wal_checkpoint_interval: 3600
   key_pause_cleanup_interval: 30

@@ -70,6 +70,76 @@ traffic:
 
 - Pure-ASGI ring buffer 500 frames, 64 KiB per body, 32 MiB total — budgets for VPS with 1 GB RAM.
 
+## Clés plan-30/08 (optimisation / fiabilisation perf)
+
+Nouvelles clés `ip_rotation` (toutes bornées, hot-reloadées par
+`VPNManager.update_config` ; `bad_ttl*` relues depuis `self._config`) :
+
+| Clé | Défaut | Bornes | Objet |
+|---|---|---|---|
+| `bad_ttl` | `10` (ex-`20`) | 1–4 320 min | TTL de base du ban fast-pin A2, en **minutes** |
+| `bad_ttl_factor` | `2` | 1–10 | Multiplicateur progressif à chaque re-échec |
+| `bad_ttl_max` | `1440` | 1–43 200 min | Plafond du ban progressif |
+| `breaker_warmup_grace_s` | `60` | 10–600 s | Fenêtre post-boot : failures de sondes non comptées breaker |
+| `station_max_rotations_per_hour` | `10` | 1–720 | Seuil anti-churn A4 |
+| `rotation_storm_cooldown_s` | `600` | 30–7 200 s | Cooldown forcé au-dessus du seuil |
+| `cascade_max_duration_s` | `120` | 30–600 s | Budget de la rotation en cascade |
+| `stack_age_guard_s` | `600` | 60–3 600 s | Âge max d'un stack avant relecture |
+| `wg_canary_poll_interval_s` | `4` | 0.5–60 s | Cadence des sondes canary WG |
+| `station_bad_ttl_s` | `60` | 1–3 600 s | TTL `bad` après 429 côté `FreeIPPool` |
+| `station_connect_retry_interval_s` | `300` | 5–3 600 s | Intervalle retry docker station down |
+
+Autres sections :
+
+- `supervisor.warmup_excluded_requests` (0–1000, défaut `1`) — requêtes
+  warm-up exclues des statistiques de latence (post-rotation).
+- `database.weekly_purge_days` (défaut `90`, `0` = off) — purge hebdo des
+  lignes > N jours dans `requests` + `free_model_usage` (dim. 03:00, avant
+  le VACUUM). Job manuel : `powershell scripts/rotate_db.ps1 [-DryRun] [.Vacuum]`.
+
+Sonde externe : `GET /health` renvoie un payload léger par défaut (B3).
+Pour les graphes agrégés de consommation, utiliser `/health?detail=full`
+(usage par modèle inclus) ou le dashboard Grafana (collecteur dédié
+`/api/dashboard/*`).
+
+## AUTH_FAILED NordVPN — diagnostic
+
+A5 constat incident du 30/08 : AUTH_FAILED n'est **pas** un bug du proxy
+mais la limite littérale des sessions simultanées NordVPN (6 sessions/
+compte, tunnel par session consommé — 4 stations + 2 autres machines/routeur
+atteignent très facilement la limite).
+
+Signatures :
+
+- Log NordVPN : `403 Forbidden` à la demande de session suivie par
+  `AUTH_FAILED` côté gluetun.
+- Station qui fly très vite avec probes ascendante OK (tunnel local up)
+  puis down dès la rotation effective (soumission de la session).
+
+Actions :
+
+1. Compter les sessions actives sur le compte NordVPN (IHM compte
+   nordvpn.com → "Devices") — libérer un slot avant toute recherche code.
+2. Le watchdog gère AUTH_FAILED via restart + re-élection du pays
+   (chemin existant, inchangé A5 = **veto** au gel des stacks ; pas de
+   masquage automatique, pas d'état figé) ; la station reste dans la
+   boucle dès qu'une session redevient disponible.
+3. Le flip automatique reste disponible via `auto_flip_cooldown_min` /
+   `auto_ov_return_min` — le compte de sessions n'entre en jeu que quand
+   une *session* ne peut être ouverte, pas en tant que cap d'IP.
+
+Points **non touchés volontairement** (veto confirmé 31/08) :
+
+- A5 : pas de gel de stacks (`auto_flip wg→ov`, suppression station
+  flip-to-wg) — l'utilisateur a confirmé que le proxy **doit pouvoir
+  utiliser tous les modes automatiquement**, le problème AUTH_FAILED se
+  corrige par la gestion de sessions compte (ou réduction des stations),
+  pas par une option qui fige le pool.
+- B4 : image gluetun épinglée à `v3.41.3` (digest stable, éviter la
+  casse SOCKS5 observée sur un digest précédent). Ne jamais dégrader :
+  rester sur `v3.41.3` ou monter ; si `latest` se recasse plus tard,
+  la hot-lane `/api/vpn/flip` reste le recours manuel.
+
 ## Refs
 
 - `config/settings.py:36-73` + `dashboard/api.py:457,1822` — see inline comments.

@@ -147,6 +147,25 @@ def debug(msg: str):
             pass
 
 
+def _logger_writes_debug_file(logger_name: str) -> bool:
+    """[plan 30/08 Lot B2] True si le logger émetteur possède DÉJÀ un
+    FileHandler pointé sur debug.log (posé par ``attach_module_logger`` pour
+    vpn_manager / free_ip_pool au démarrage) — le handler panel ne doit alors
+    écrire QUE dans le panneau, sinon chaque ligne part en double dans
+    debug.log (I/O ×2, rétention ÷2, hot-reload opencode.py:12733+)."""
+    if not _debug_file_path:
+        return False
+    try:
+        target = os.path.abspath(_debug_file_path)
+        for h in logging.getLogger(logger_name).handlers:
+            base = getattr(h, "baseFilename", None)
+            if base and os.path.abspath(base) == target:
+                return True
+    except Exception:
+        pass
+    return False
+
+
 class RichLogHandler(logging.Handler):
     def emit(self, record):
         msg = record.getMessage()
@@ -158,8 +177,14 @@ class RichLogHandler(logging.Handler):
         level = record.levelname
         ts = time.strftime("%H:%M:%S")
         log_lines.append(f"[{ts}] [{level}] {msg}")
-        # Also write DEBUG-level messages to the debug.log file (buffered flush)
-        if _cfg_settings.DEBUG and _debug_file is not None and record.levelno <= logging.DEBUG:
+        # Also write DEBUG-level messages to the debug.log file (buffered
+        # flush) — sauf si le logger a déjà son FileHandler dessus (Lot B2).
+        if (
+            _cfg_settings.DEBUG
+            and _debug_file is not None
+            and record.levelno <= logging.DEBUG
+            and not _logger_writes_debug_file(record.name)
+        ):
             try:
                 global _debug_write_counter
                 _rotate_debug_log()  # Auto-rotate if file is too large

@@ -123,6 +123,13 @@ def test_validate_payload_ok_and_errors():
     errs = v({"per_station": {"2": {"unknown_key": 1}}})
     assert errs and "non supportées" in errs[0]
     assert v({}) == []
+    # [GUI toggle « Cooldown latence »] booléen enabled accepté
+    assert v({"latency_rotation": {"enabled": False}}) == []
+    assert v({"latency_rotation": {"enabled": True, "soft_cooldown_sec": 600}}) == []
+    errs = v({"latency_rotation": {"enabled": "no"}})
+    assert errs and "enabled" in errs[0]
+    errs = v({"latency_rotation": {"enabled": 1}})
+    assert errs and "enabled" in errs[0]
 
 
 def test_validate_endpoint_dry_run_does_not_apply():

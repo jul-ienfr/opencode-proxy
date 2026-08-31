@@ -18,6 +18,7 @@ proxy_mode:
 import asyncio
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -455,16 +456,22 @@ class CircuitBreaker:
         (sinon les appelants suivants repassaient tous jusqu'au threshold)."""
         info = self._servers.get(server_name, {"failures": 0, "opened_at": 0, "state": "closed"})
         was_half_open = info.get("state") == "half-open"
+        was_open = info.get("state") == "open"
         info["failures"] += 1
         if was_half_open or info["failures"] >= self._failure_threshold:
             info["state"] = "open"
             info["opened_at"] = time.monotonic()
-            logger.warning(
-                "[circuit-breaker] server %s OPEN after %d failures%s",
-                server_name,
-                info["failures"],
-                " (sonde half-open échouée — re-open immédiat)" if was_half_open else "",
-            )
+            # [plan 30/08 Lot A6] UNE ligne de log par transition : tant que le
+            # breaker RESTE open, les échecs suivants incrémentent le compteur
+            # en silence (plus de rafale de warnings pendant la fenêtre de
+            # recovery — l'alerte est déjà émise à l'ouverture).
+            if not was_open:
+                logger.warning(
+                    "[circuit-breaker] server %s OPEN after %d failures%s",
+                    server_name,
+                    info["failures"],
+                    " (sonde half-open échouée — re-open immédiat)" if was_half_open else "",
+                )
         self._servers[server_name] = info
         self._half_open_probe.discard(server_name)
 
@@ -596,10 +603,50 @@ def _normalize_country(name: str) -> str:
 # visible from the default verbosity 1) — never "Connecting to [<host>]".
 _NORDVPN_HOST_RE = re.compile(r"[a-z]{2}[0-9]{2,4}\.nordvpn\.com")
 
-# Blacklist TTL: the OpenVPN sunset kills hosts within a daily window — one
-# wall-clock day covers it, and a host that starts working again simply
-# expires back into rotation.
-_FAILED_HOST_TTL = 24 * 3600
+# [plan 30/08 Lot A2] Blacklist TTL: l'ancien `_FAILED_HOST_TTL = 24h` codé en
+# dur bannissait ~200 serveurs NordVPN 24 h sur un refus transitoire (incident
+# station 3). Le TTL est maintenant progressif et configuré (voir
+# _host_ttl_seconds) : base `bad_ttl` minutes, ×`bad_ttl_factor` par re-échec,
+# plafond `bad_ttl_max`. Un host qui refonctionne expire et revient en
+# rotation tout seul.
+
+
+def _clamp_cfg_number(cfg: dict, key: str, default: float, lo: float, hi: float) -> float:
+    """[plan 30/08 R6] Lit une clé numérique de config avec bornes min/max.
+
+    Valeur invalide → repli sur le défaut avec warning ; hors bornes → clamp
+    avec warning. Jamais de crash, jamais de valeur absurde silencieuse."""
+    raw = cfg.get(key, default)
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        logger.warning("[vpn-config] %s=%r invalide — repli sur défaut %s", key, raw, default)
+        return float(default)
+    if math.isnan(val):
+        logger.warning("[vpn-config] %s=%r invalide (NaN) — repli sur défaut %s", key, raw, default)
+        return float(default)
+    if val < lo or val > hi:
+        clamped = max(lo, min(hi, val))
+        logger.warning(
+            "[vpn-config] %s=%s hors bornes [%s, %s] — clamp à %s", key, raw, lo, hi, clamped
+        )
+        return clamped
+    return val
+
+
+def _host_ttl_seconds(failures: int, cfg: dict) -> float | None:
+    """[plan 30/08 Lot A2] TTL progressif (secondes) de la blacklist fast-pin.
+
+    TTL de base = ``bad_ttl`` (MINUTES, bornes 1–4320, défaut 1440 min = 24 h
+    → comportement strictement identique à l'existant tant que la clé est
+    absente), multiplié par ``bad_ttl_factor`` (défaut 2) à chaque re-échec,
+    plafonné à ``bad_ttl_max`` minutes (défaut 1440)."""
+    base_min = _clamp_cfg_number(cfg, "bad_ttl", 1440.0, 1.0, 4320.0)
+    max_min = _clamp_cfg_number(cfg, "bad_ttl_max", 1440.0, 1.0, 43200.0)
+    factor = _clamp_cfg_number(cfg, "bad_ttl_factor", 2.0, 1.0, 10.0)
+    n = max(1, int(failures))
+    ttl_min = min(base_min * (factor ** (n - 1)), max_min)
+    return ttl_min * 60.0
 
 
 def _classify_probe_exc(exc: BaseException) -> str:
@@ -901,6 +948,12 @@ class VPNManager:
         _cc = cfg.get("wg_canary_countries", "Switzerland")
         self._WG_CANARY_COUNTRIES = [c.strip() for c in str(_cc).split(",") if c.strip()]
         self._WG_CANARY_ENABLED = bool(cfg.get("wg_canary_enabled", True))
+        # [plan 30/08 — constante → config] cadence des sondes de boot du
+        # canari : instance attr qui surclasse la constante de classe
+        # (fallback 4.0 s pour les tests qui court-circuitent __init__).
+        self._WG_CANARY_POLL_INTERVAL_S = _clamp_cfg_number(
+            cfg, "wg_canary_poll_interval_s", 4.0, 0.5, 60.0
+        )
         # [plan 20/08] Gluetun healthcheck-restart churn: a marginal WG
         # tunnel makes gluetun's INTERNAL healthcheck restart the VPN every
         # ~12 s — invisible to the SOCKS5 probe (it samples the live
@@ -938,7 +991,12 @@ class VPNManager:
         ]
         self._cascade_step: int = 0  # 0-based index into _cascade_sequence
         self._cascade_started_at: float | None = None  # monotonic when cascade began
-        self._cascade_max_duration: float = 120.0  # hard cap per-server cascade (2 recreates ~30s each + detection)
+        # [plan 30/08 — constante → config] hard cap per-server cascade
+        # (2 recreates ~30s each + detection). Clé cascade_max_duration_s,
+        # défaut 120 s (= comportement historique), bornes 30–600.
+        self._cascade_max_duration: float = _clamp_cfg_number(
+            cfg, "cascade_max_duration_s", 120.0, 30.0, 600.0
+        )
         self._cascade_pending_proto: str | None = None  # structured proto for watchdog intercept (no reason parsing)
         # [least-loaded] Pin to the LOWEST-LOAD NordVPN servers in the chosen
         # country instead of letting gluetun pick arbitrarily (which tends to
@@ -1136,6 +1194,39 @@ class VPNManager:
         _wmax = max(_wbase, float(cfg.get("watchdog_backoff_max", 300.0)))
         self._watchdog_backoff = BackoffTimer(base_delay=_wbase, max_delay=_wmax)
         self._watchdog_escalated_at: float | None = None  # escalation re-arm: 30 min
+
+        # [plan 30/08 Lot A1] Fenêtre de grâce warm-up post-(re)rotation :
+        # lancée au DÉBUT de chaque connect/rotation ; tant qu'elle est
+        # ouverte, les échecs de sonde ne chargent PAS le breaker (incident
+        # 30/08 : 3 probes ratés pendant le montage du tunnel = station gelée
+        # 300 s sur un tunnel sain). Consommée par _breaker_charge_failure,
+        # clôturée immédiatement au premier probe réussi (_breaker_charge_success).
+        self._breaker_warmup_grace_s = _clamp_cfg_number(
+            cfg, "breaker_warmup_grace_s", 60.0, 10.0, 600.0
+        )
+        self._warmup_until = 0.0  # deadline monotonic ; 0.0 = fenêtre fermée
+
+        # [plan 30/08 Lot A4] Anti-churn : compteur de rotations par station
+        # sur fenêtre glissante 1 h. Au-delà de station_max_rotations_per_hour
+        # (défaut 10), cooldown storm (rotation_storm_cooldown_s, défaut 600 s)
+        # + alerte dashboard au lieu de poursuivre la tempête qui armait le
+        # breaker (15 rotations en 18 min, incident 30/08).
+        self._max_rotations_per_hour = int(
+            _clamp_cfg_number(cfg, "station_max_rotations_per_hour", 10.0, 1.0, 720.0)
+        )
+        self._rotation_storm_cooldown_s = _clamp_cfg_number(
+            cfg, "rotation_storm_cooldown_s", 600.0, 30.0, 7200.0
+        )
+        self._rotation_history: list[float] = []  # timestamps monotonic, fenêtre 1 h
+        self._storm_cooldown_until = 0.0  # deadline monotonic ; 0.0 = pas de storm
+
+        # [plan 30/08 — constantes → config] cadences/guardrails qui étaient
+        # codés en dur (comportement à défaut strictement identique).
+        # _cascade_max_duration : assignée plus haut (ligne ~941) via
+        # _clamp_cfg_number — ne pas réassigner ici.
+        self._stack_age_guard_s = _clamp_cfg_number(
+            cfg, "stack_age_guard_s", 600.0, 60.0, 3600.0
+        )
 
         self.load_state()
         # [P5.4 perf] debounced save_state — évite copy2+dump sur la boucle event loop
@@ -1381,6 +1472,10 @@ class VPNManager:
                 raise RuntimeError(f"Transition impossible de {self._status} vers connecting")
             self._set_status(VPNState.CONNECTING)
             self._error = None
+            # [plan 30/08 Lot A1] ouvre la fenêtre warm-up : les sondes du boot
+            # (tunnel pas encore établi derrière le SOCKS5 répondeur) ne doivent
+            # pas charger le breaker.
+            self._warmup_until = time.monotonic() + self._breaker_warmup_grace_s
             try:
                 await self._compose_up()
                 started_at = await self._wait_healthy(timeout=120)
@@ -1415,7 +1510,7 @@ class VPNManager:
                     "name": self._docker_container,
                     "country": self._current_country or self._server_countries,
                 }
-                self._circuit_breaker.record_success(self._docker_container)
+                self._breaker_charge_success()  # ferme la fenêtre warm-up (A1)
                 self._backoff.record_success()
                 self._last_rotation_failed_at = None  # tunnel is up: clear cooldown
                 self._last_rotation_error = None
@@ -1430,10 +1525,50 @@ class VPNManager:
             except Exception as e:
                 self._set_status(VPNState.ERROR)
                 self._error = str(e)
-                self._circuit_breaker.record_failure(self._docker_container)
+                # [plan 30/08 Lot A1] pendant la fenêtre warm-up (boot en
+                # cours), l'échec ne charge pas le breaker — backoff conservé.
+                self._breaker_charge_failure("connect")
                 self._backoff.record_failure()
                 logger.error("[vpn] connect failed: %s", e)
                 raise
+
+    def _check_rotation_storm(self) -> None:
+        """[plan 30/08 Lot A4] Anti-churn : fenêtre glissante 1 h des
+        rotations DÉMARRÉES. Au-delà de station_max_rotations_per_hour →
+        cooldown storm (rotation_storm_cooldown_s) au lieu d'armer le breaker
+        (tempête de 15 rotations en 18 min, incident station 3 du 30/08).
+
+        Lève RotationFailed si un cooldown est actif ou si le seuil est
+        dépassé ; sinon journalise le démarrage courant et retourne."""
+        now_mono = time.monotonic()
+        if now_mono < self._storm_cooldown_until:
+            remaining = self._storm_cooldown_until - now_mono
+            logger.warning(
+                "[vpn] rotation refusée — storm cooldown station %s (%.0fs restantes)",
+                self._station,
+                remaining,
+                extra={"storm_cooldown_until": self._storm_cooldown_until},
+            )
+            raise RotationFailed(
+                f"rotation storm cooldown ({int(remaining)}s restant)"
+            )
+        self._rotation_history = [t for t in self._rotation_history if now_mono - t < 3600.0]
+        self._rotation_history.append(now_mono)
+        if len(self._rotation_history) > self._max_rotations_per_hour:
+            self._storm_cooldown_until = now_mono + self._rotation_storm_cooldown_s
+            logger.warning(
+                "[vpn] ROTATION STORM station %s : %d rotations/heure > %d —"
+                " cooldown forcé %.0fs (anti-churn, plan 30/08 A4)",
+                self._station,
+                len(self._rotation_history),
+                self._max_rotations_per_hour,
+                self._rotation_storm_cooldown_s,
+                extra={"storm_cooldown_until": self._storm_cooldown_until},
+            )
+            raise RotationFailed(
+                f"rotation storm ({len(self._rotation_history)}/h > "
+                f"{self._max_rotations_per_hour}) — cooldown {int(self._rotation_storm_cooldown_s)}s"
+            )
 
     async def connect_next(self) -> str:
         """Rotate to a fresh IP — single-flight.
@@ -1469,6 +1604,11 @@ class VPNManager:
         # Circuit breaker gate ([25]): no rotation while the breaker is open.
         if not self._circuit_breaker.is_available(self._docker_container):
             raise RotationFailed("circuit breaker ouvert — rotation ignorée")
+        # [plan 30/08 Lot A4] Anti-churn : fenêtre glissante 1 h des rotations
+        # DÉMARRÉES. Au-delà de station_max_rotations_per_hour → cooldown storm
+        # (rotation_storm_cooldown_s) au lieu d'armer le breaker (tempête de
+        # 15 rotations en 18 min, incident station 3 du 30/08).
+        self._check_rotation_storm()
         task = asyncio.create_task(self._connect_next_impl())
         self._rotation_task = task
         try:
@@ -1500,6 +1640,10 @@ class VPNManager:
         (CRITIC(5)).
         """
         async with self._lock:
+            # [plan 30/08 Lot A1] ouvre la fenêtre warm-up AVANT la 1re
+            # tentative : les probes du/nouveau tunnel naissant ne doivent pas
+            # charger le breaker (incident 30/08 : 3 misses → station gelée).
+            self._warmup_until = time.monotonic() + self._breaker_warmup_grace_s
             if not self._enabled:
                 raise RotationFailed("VPN désactivé — rotation impossible")
             if not VPNState.can_transition(self._status, VPNState.CONNECTING):
@@ -1604,7 +1748,9 @@ class VPNManager:
                     }
                 )
                 self._ip_history = self._ip_history[-100:]
-                self._circuit_breaker.record_success(self._docker_container)
+                # [plan 30/08 Lot A1] symétrie warm-up : 1er probe réussi →
+                # record_success immédiat + fermeture de la fenêtre de grâce.
+                self._breaker_charge_success()
                 self._backoff.record_success()
                 self._last_rotation_failed_at = None  # success: clear cooldown
                 self._last_rotation_error = None
@@ -1643,7 +1789,9 @@ class VPNManager:
                         # budget left → next attempt, else bail.
                         deadline_hit = True
                         last_error = RuntimeError("délai de rotation dépassé")
-                        self._circuit_breaker.record_failure(self._docker_container)
+                        # [plan 30/08 Lot A1] timeout pendant la fenêtre
+                        # warm-up (boot lent) → ignoré par le breaker.
+                        self._breaker_charge_failure(f"rotation attempt {attempt + 1} timeout")
                         self._backoff.record_failure()
                         logger.warning(
                             "[vpn] rotation attempt %d/3 hit the %.0f s wall — "
@@ -1661,7 +1809,9 @@ class VPNManager:
                             # on "IP unchanged"/"recently used": those prove
                             # the tunnel answers.
                             self._rotation_probe_dead = True
-                        self._circuit_breaker.record_failure(self._docker_container)
+                        # [plan 30/08 Lot A1] ignoré par le breaker pendant
+                        # la fenêtre warm-up (backoff toujours armé).
+                        self._breaker_charge_failure(f"rotation attempt {attempt + 1}")
                         self._backoff.record_failure()
                         logger.warning("[vpn] rotation attempt %d/3 failed: %s", attempt + 1, e)
                         if attempt < 2:
@@ -2488,10 +2638,13 @@ class VPNManager:
             if _on_429_action not in ("cooldown", "rotate", "both"):
                 _on_429_action = "both"
             try:
-                _bad_ttl = int(_cfg_data.get("ip_rotation", {}).get("bad_ttl", 60))
+                # [plan 30/08 Lot A2] unité clarifiée : bad_ttl est en MINUTES
+                # (TTL de base de la blacklist fast-pin), bornes 1–4320.
+                # Valeur invalide → défaut 1440 min (= 24 h historique).
+                _bad_ttl = int(_cfg_data.get("ip_rotation", {}).get("bad_ttl", 1440))
             except Exception:
-                _bad_ttl = 60
-            _bad_ttl = max(1, min(3600, _bad_ttl))
+                _bad_ttl = 1440
+            _bad_ttl = max(1, min(4320, _bad_ttl))
         except Exception:
             _dual = _strict = False
             _vpn_stack = "auto"
@@ -2533,6 +2686,15 @@ class VPNManager:
             "update_apply_max_defer_hours": self._update_max_defer_hours,
             "circuit_breaker_threshold": self._circuit_breaker._failure_threshold,
             "circuit_breaker_recovery": self._circuit_breaker._recovery_time,
+            # [plan 30/08 — nouvelles clés, défauts = comportement historique]
+            "breaker_warmup_grace_s": getattr(self, "_breaker_warmup_grace_s", 60.0),
+            "station_max_rotations_per_hour": getattr(self, "_max_rotations_per_hour", 10),
+            "rotation_storm_cooldown_s": getattr(self, "_rotation_storm_cooldown_s", 600.0),
+            "cascade_max_duration_s": getattr(self, "_cascade_max_duration", 120.0),
+            "stack_age_guard_s": getattr(self, "_stack_age_guard_s", 600.0),
+            "wg_canary_poll_interval_s": getattr(self, "_WG_CANARY_POLL_INTERVAL_S", 4.0),
+            "bad_ttl_factor": self._config.get("bad_ttl_factor", 2),
+            "bad_ttl_max": self._config.get("bad_ttl_max", 1440),
             "backoff_max_delay": self._backoff._max_delay,
             "watchdog_interval": self._watchdog_interval,
             "egress_failure_tick_interval": self._egress_failure_tick_interval,
@@ -2703,6 +2865,35 @@ class VPNManager:
                 float(updates.get("watchdog_backoff_max", self._watchdog_backoff._max_delay)),
             )
             self._watchdog_backoff = BackoffTimer(base_delay=_wbase, max_delay=_wmax)
+        # [plan 30/08 — règle transversale] hot-reload des nouvelles clés des
+        # lots A/B (mêmes bornes qu'à l'__init__, via _clamp_cfg_number).
+        # bad_ttl / bad_ttl_factor / bad_ttl_max n'ont PAS de handler ici :
+        # _host_ttl_seconds() lit self._config à chaque blacklist (déjà
+        # re-synchronisé par self._config.update(updates) en tête).
+        if "breaker_warmup_grace_s" in updates:
+            self._breaker_warmup_grace_s = _clamp_cfg_number(
+                updates, "breaker_warmup_grace_s", 60.0, 10.0, 600.0
+            )
+        if "station_max_rotations_per_hour" in updates:
+            self._max_rotations_per_hour = int(
+                _clamp_cfg_number(updates, "station_max_rotations_per_hour", 10.0, 1.0, 720.0)
+            )
+        if "rotation_storm_cooldown_s" in updates:
+            self._rotation_storm_cooldown_s = _clamp_cfg_number(
+                updates, "rotation_storm_cooldown_s", 600.0, 30.0, 7200.0
+            )
+        if "cascade_max_duration_s" in updates:
+            self._cascade_max_duration = _clamp_cfg_number(
+                updates, "cascade_max_duration_s", 120.0, 30.0, 600.0
+            )
+        if "stack_age_guard_s" in updates:
+            self._stack_age_guard_s = _clamp_cfg_number(
+                updates, "stack_age_guard_s", 600.0, 60.0, 3600.0
+            )
+        if "wg_canary_poll_interval_s" in updates:
+            self._WG_CANARY_POLL_INTERVAL_S = _clamp_cfg_number(
+                updates, "wg_canary_poll_interval_s", 4.0, 0.5, 60.0
+            )
         if "ovpn_protocol" in updates or "openvpn_protocol" in updates:
             _p = str(updates.get("ovpn_protocol", updates.get("openvpn_protocol", "udp"))).lower()
             if _p not in ("udp", "tcp"):
@@ -2788,6 +2979,22 @@ class VPNManager:
             "socks5_url": self.socks5_url,
             "container": self._docker_container,
             "circuit_breaker": self._circuit_breaker.get_status(),
+            # [plan 30/08 Lot A4] visibilité anti-churn (alerte dashboard).
+            # getattr : des tests construisent la coquille sans __init__.
+            "rotation_storm": {
+                "cooldown_active": time.monotonic()
+                < getattr(self, "_storm_cooldown_until", 0.0),
+                "cooldown_remaining_s": max(
+                    0,
+                    int(getattr(self, "_storm_cooldown_until", 0.0) - time.monotonic()),
+                ),
+                "rotations_last_hour": sum(
+                    1
+                    for t in getattr(self, "_rotation_history", [])
+                    if time.monotonic() - t < 3600.0
+                ),
+                "max_per_hour": getattr(self, "_max_rotations_per_hour", 10),
+            },
             "backoff_failures": self._backoff.consecutive_failures,
             "backoff_delay": self._backoff.delay,
             "watchdog": {
@@ -3234,8 +3441,10 @@ class VPNManager:
                         except Exception:
                             pass
                         # Blacklist rejected hostnames so next fetch skips them
+                        # [plan 30/08 Lot A2] TTL progressif configuré (plus de 24 h en dur)
                         try:
-                            self._failed_hosts[h] = {"failures": 1, "first_failed_at": __import__("time").time(), "bad_until": __import__("time").time() + _FAILED_HOST_TTL}
+                            _now_ts = time.time()
+                            self._failed_hosts[h] = {"failures": 1, "first_failed_at": _now_ts, "bad_until": _now_ts + _host_ttl_seconds(1, self._config)}
                         except Exception:
                             pass
                     logger.warning("[vpn] control pin %s rejected (choices/hostnames): %s — blacklisted %d hosts, retrying filtered", country, lines[0][:200], len(hostnames))
@@ -4113,7 +4322,10 @@ class VPNManager:
         # (pas un bool, pas 5 min de flapping — old=oldest monotonic, déjà pruné 30 min)
         if self._auth_failed_window and self._stack_since is not None:
             oldest = self._auth_failed_window[0]
-            if now - oldest >= 10 * 60 and now - self._stack_since >= 10 * 60:
+            if (
+                now - oldest >= self._stack_age_guard_s
+                and now - self._stack_since >= self._stack_age_guard_s
+            ):
                 return ("wireguard", f"{len(self._auth_failed_window)} AUTH_FAILED/30min persisted 10min — slow-burn escape")
         return None
 
@@ -4868,10 +5080,11 @@ class VPNManager:
 
         The caller has already established the rejection is live (no later
         "Initialization Sequence Completed"). The blacklist is consumed ONLY
-        by the fast-pin path (Phase 1c) — free_ip_pool never sees it. TTL
-        24 h covers the daily sunset window; a host that works again simply
-        expires back into rotation.
-        """
+        by the fast-pin path (Phase 1c) — free_ip_pool never sees it.
+        [plan 30/08 Lot A2] TTL progressif et configuré (`bad_ttl` minutes ×
+        `bad_ttl_factor` par re-échec, plafond `bad_ttl_max`) — plus de 24 h
+        codé en dur ; à défaut de clés, le défaut 1440 min = 24 h reproduit
+        exactement le comportement historique."""
         host = _extract_current_hostname(text)
         if not host:
             return  # no hostname in this text — nothing to blacklist
@@ -4881,16 +5094,19 @@ class VPNManager:
             entry = {"failures": 0, "first_failed_at": now, "bad_until": 0.0}
             self._failed_hosts[host] = entry
         entry["failures"] += 1
-        entry["bad_until"] = now + _FAILED_HOST_TTL
+        ttl_s = _host_ttl_seconds(entry["failures"], self._config)
+        entry["bad_until"] = now + ttl_s
         logger.warning(
-            "[vpn] AUTH_FAILED on %s (failure #%d, TTL 24h) — fast-pin will skip it",
+            "[vpn] AUTH_FAILED on %s (failure #%d, TTL %.0fmin) — fast-pin will skip it",
             host,
             entry["failures"],
+            ttl_s / 60.0,
         )
 
     def _host_blacklisted(self, host: str) -> bool:
-        """True while a host is inside its 24 h blacklist window. Prunes the
-        entry when it expires, so the dict never grows unbounded."""
+        """True while a host is inside its blacklist window (TTL progressif
+        A2 : `bad_ttl`/`bad_ttl_factor`/`bad_ttl_max`, défaut 24 h). Prunes
+        the entry when it expires, so the dict never grows unbounded."""
         entry = self._failed_hosts.get(host)
         if entry is None:
             return False
@@ -4898,6 +5114,36 @@ class VPNManager:
             del self._failed_hosts[host]
             return False
         return True
+
+    def _breaker_charge_failure(self, reason: str) -> bool:
+        """[plan 30/08 Lot A1] Compte un échec dans le circuit breaker — SAUF
+        pendant la fenêtre de grâce warm-up post-rotation.
+
+        Incident 30/08 station 3 : après un restart/rotation, le conteneur
+        gluetun met ~15 s à monter (SOCKS5 OK quelques secondes avant le
+        tunnel). Trois « public IP probe failed » pendant ce warm-up mettaient
+        3 points au breaker (seuil 3) → station gelée 300 s (recovery_time)
+        alors que le tunnel était sain. Le backoff exponentiel continue de
+        s'armer (pas cher), seule l'alimentation du breaker est filtrée.
+
+        Retourne True si le breaker a été informé."""
+        if self._warmup_until and time.monotonic() < self._warmup_until:
+            remaining = self._warmup_until - time.monotonic()
+            logger.info(
+                "[breaker] warm-up grace — échec ignoré (%s), fenêtre restante %.0fs",
+                reason,
+                remaining,
+            )
+            return False
+        self._circuit_breaker.record_failure(self._docker_container)
+        return True
+
+    def _breaker_charge_success(self) -> None:
+        """[plan 30/08 Lot A1] Symétrie du warm-up : le premier probe réussi
+        (garant de santé tunnel) apprend l'événement immédiatement au breaker
+        (reset direct) et ferme la fenêtre de grâce."""
+        self._warmup_until = 0.0
+        self._circuit_breaker.record_success(self._docker_container)
 
     async def _check_server_issue(self, started_at: str = "", text: str | None = None) -> bool:
         """Scan container logs for a TLS negotiation failure (stale server

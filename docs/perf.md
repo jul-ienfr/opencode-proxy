@@ -18,6 +18,26 @@
 - `mmap 268M` vs `cache_size 64000` — bench via `scripts/rotate_db.sh --vacuum` + `SELECT COUNT(*)`
 - WAL checkpoint 3600s — `PRAGMA wal_checkpoint(TRUNCATE)` évite WAL 4M → 100M
 
+## Optimisation plan-30/08 (2026-08-30, pile patchée A/B)
+
+Bench après les lots A (warmup grace, blacklistTTL progressif, anti-churn),
+B (rotation DB hebdo, logs unifiés debug.log, `/health?detail=full`,
+pin gluetun:v3.41.3) et C (scriptolis tranche 1, mypy gate) :
+
+- `scripts/bench_perf.py` : budgets inchangés, tous verts (lock_p95 0.0 ms,
+  atomic_write 1.7 ms, sqlite index 0.008 ms, conv 0.002/0.029 ms,
+  static_mw 0.001 ms, SSE 4.9 ms, free_usage 0.020 ms, curl_pool 0.001 ms).
+- `scripts/bench.py` sur `/health` (détail minimal par défaut, post-B3) :
+  **1000 req, conc 50 → 470 rps, p50 41 ms, p95 738 ms, p99 763 ms**
+  (pas de régression vs baseline Phase 3 ; la serialisation exhaustive des
+  40 modèles hors `/health` rend le hot-path stable sous check Uptime
+  Kuma 30 s sans bruit de CPU).
+- Pool `VPNManager` : `bad_ttl` passe à 10 min (progressif, cap 1440 min,
+  ×2 par re-échec) — la blacklist fast-pin NordVPN libère les hosts en
+  quelques minutes au lieu de 24 h, ce qui maintient un pool de serveurs
+  sains sous persistence AUTH_FAILED et réduit la proba d'aimanter les
+  stations 2/3 sur des NordVPN morts (incident 30/08).
+
 ## Résultats (2026-08-23, 4c/8G)
 
 - `CACHE_MIN_PROMPT_SIZE 2000` + `max_size 1000` → 300 entries, hit 42% sur 500 req

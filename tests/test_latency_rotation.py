@@ -152,6 +152,38 @@ def test_lru_guarantee_never_none(engine, clock):
     assert fresh == (3, "7.7.7.7"), "non-refroidi bat toujours un refroidi"
 
 
+def test_disable_purges_cooldowns_and_soft_history(engine):
+    """[GUI toggle « Cooldown latence »] update_config({"enabled": False}) =
+    purge immédiate : tous les cooldowns actifs sautent, _soft_history est
+    vidée (pas de ré-escalade fantôme à la réactivation), record_request
+    court-circuite en "disabled", et la réactivation ne restaure rien."""
+    sid, ip = 1, "8.8.8.8"
+    engine.mark(sid, ip, COOLDOWN_HARD)
+    engine.mark(2, "9.9.9.9", COOLDOWN_SOFT)
+    engine._soft_history.update({(sid, ip), (2, "9.9.9.9")})
+    assert engine.cooldown_kind(sid, ip) == COOLDOWN_HARD
+    assert engine.cooldown_kind(2, "9.9.9.9") == COOLDOWN_SOFT
+
+    engine.update_config({"enabled": False})
+    assert engine.cfg.enabled is False
+    assert not engine._cooldowns, "cooldowns purgés"
+    assert not engine._soft_history, "soft_history purgé (pas d'escalade fantôme)"
+    assert engine.cooldown_kind(sid, ip) is None
+    assert engine.cooldown_kind(2, "9.9.9.9") is None
+    dec = engine.record_request(sid, ip, 30000, "glm", 200)
+    assert dec == {"action": "none", "reason": "disabled"}
+
+    # réactivation : rien n'est hérité (cooldowns + historique vides)
+    engine.update_config({"enabled": True})
+    assert engine.cfg.enabled is True
+    assert engine.cooldown_kind(sid, ip) is None
+    assert not engine._soft_history
+
+    # séquence no-op : déjà désactivé → pas d'effet, pas de crash
+    engine.update_config({"enabled": False})
+    assert not engine._cooldowns
+
+
 def test_per_model_thresholds_hot_reload(engine):
     engine.update_config(
         {

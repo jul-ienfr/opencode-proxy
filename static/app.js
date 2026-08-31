@@ -89,6 +89,7 @@ const LOCALE = {
         'vpn.rotation': 'Rotation',
         'vpn.rotation_on': 'Enabled',
         'vpn.rotation_off': 'Disabled',
+        'vpn.latency_cooldown': 'Latency cooldown',
         'vpn.ips_used': 'IPs used',
         'vpn.switches': 'Switches',
         'vpn.stack.title': 'VPN technology',
@@ -410,6 +411,7 @@ const LOCALE = {
         'vpn.rotation': 'Rotation',
         'vpn.rotation_on': 'Activé',
         'vpn.rotation_off': 'Désactivé',
+        'vpn.latency_cooldown': 'Cooldown latence',
         'vpn.ips_used': 'IPs utilisées',
         'vpn.switches': 'Changements',
         'vpn.stack.title': 'Technologie VPN',
@@ -3338,6 +3340,15 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     }
 
+    // [GUI toggle « Cooldown latence »] POST persisté (config.yaml latency_rotation.enabled).
+    // OFF = purge immédiate des cooldowns actifs ; le tracking/sparkline reste affiché sans effet.
+    window.vpnSaveLatencyEnabled = async function(enabled) {
+        await fetchWithToken('/api/vpn-config', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ latency_rotation: { enabled: !!enabled } })
+        });
+    };
+
     window.vpnSaveStack = async function() {
         const select = document.getElementById('vpn-stack-select');
         if (!select) return;
@@ -3434,6 +3445,12 @@ document.addEventListener('DOMContentLoaded', () => {
 
         toggleEl.checked = data.enabled || false;
         toggleLabel.textContent = data.enabled ? (t('vpn.rotation_on') || 'Activé') : (t('vpn.rotation_off') || 'Désactivé');
+        // [GUI toggle « Cooldown latence »] synchro serveur → toggle, sans
+        // étouffer le clic utilisateur en cours (activeElement).
+        const latTgl = document.getElementById('vpn-latency-toggle');
+        if (latTgl && data.latency_enabled !== undefined && document.activeElement !== latTgl) {
+            latTgl.checked = !!data.latency_enabled;
+        }
 
         // [plan 18/08 §2.1] Env périmé (cause racine 19/08): le .env diffère
         // de l'env du process — les enfants docker compose héritent de l'env,

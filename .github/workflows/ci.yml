@@ -31,7 +31,8 @@ jobs:
         run: >-
           mypy traffic_capture.py docker_events.py trust.py shared_rotation.py
           shared_state.py config/__init__.py config/settings.py dashboard/api.py
-          protocol_mapping.py opencode.py vpn_manager.py
+          protocol_mapping.py opencode.py vpn_manager.py dashboard/display.py
+          free_ip_pool.py station_supervisor.py app/db/__init__.py
           gui/window.py gui/tray.py gui/__init__.py gui/icon.py gui/_webview_main.py
           scripts/make_credentials_env.py scripts/bench_perf.py scripts/bench.py
           --ignore-missing-imports --follow-imports=silent

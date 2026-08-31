@@ -122,6 +122,7 @@ class LatencyRotationEngine:
     # ── config ────────────────────────────────────────────────────────
 
     def update_config(self, cfg: dict[str, Any]) -> None:
+        old_enabled = self.cfg.enabled
         old = (
             self.cfg.window,
             self.cfg.ewma_alpha,
@@ -129,6 +130,17 @@ class LatencyRotationEngine:
             self.cfg.consecutive_slow,
         )
         self.cfg = EngineConfig.from_cfg(cfg)
+        # [GUI toggle « Cooldown latence »] transition True→False : purge
+        # immédiate de TOUS les cooldowns actifs (les stations exclues
+        # redeviennent routables tout de suite) ET du _soft_history (sinon
+        # une IP revenue après réactivation serait re-marquée hard d'office —
+        # escalade fantôme). Les trackers sont conservés (sparkline/EWMA
+        # restent affichés, sans effet). Ne purge PAS au boot ni en False→True.
+        if old_enabled and not self.cfg.enabled:
+            n = len(self._cooldowns)
+            self._cooldowns.clear()
+            self._soft_history.clear()
+            logger.info("[latency] engine désactivé — %d cooldowns purgés", n)
         new = (
             self.cfg.window,
             self.cfg.ewma_alpha,
@@ -145,10 +157,17 @@ class LatencyRotationEngine:
     def on_rotation_done(self, sid: int, new_ip: str) -> None:
         """Rotation réussie : warm-up v6 — reset consecutive_slow de tous les
         trackers de la station (la nouvelle IP démarre vierge, et les anciennes
-        aussi pour éviter un faux signal au retour par fallback LRU)."""
+        aussi pour éviter un faux signal au retour par fallback LRU).
+        Invalide aussi les entrées _soft_history de la station : sinon une IP
+        revenue après rotation re-slow est re-marquée d'office en hard
+        (escalade soft→hard systématique) et le pool tombe à 1/N routable."""
         for (s, _ip), tr in self._trackers.items():
             if s == int(sid):
                 tr.reset_consecutive_slow()
+        # purge anti hard-cascade : on ne peut escalader en hard que sur une
+        # IP observée re-lente APRÈS l'expiration de SON soft, pas sur une IP
+        # repassée par une rotation entre-temps.
+        self._soft_history = {k for k in self._soft_history if int(k[0]) != int(sid)}
         self.tracker_for(int(sid), str(new_ip))
 
     def threshold_for(self, model: str) -> tuple[float, float]:

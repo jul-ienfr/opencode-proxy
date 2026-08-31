@@ -2374,6 +2374,110 @@ async def lifespan(app):
 
     cooldown_sweep_task = asyncio.create_task(_periodic_cooldown_sweep())
 
+    # [hot-reload] Watcher config.yaml : polling mtime (5 s) puis rechargement
+    # + fan-out complet (managers VPN, pool d'IPs, moteur latence-adaptive,
+    # FREE_MODEL_MAP / ALIASES en place). Même sémantique que
+    # POST /api/vpn-config, déclenchée par une édition DIRECTE du fichier —
+    # sans ça le hot-reload n'existait que via l'API dashboard et une édition
+    # manuelle de config.yaml restait morte jusqu'au prochain restart.
+    _config_watch_state: dict = {"mtime": None}
+
+    async def _periodic_config_watch():
+        import yaml as _yaml
+
+        from config import settings as _cfg
+
+        while True:
+            try:
+                await asyncio.sleep(5.0)
+                _path = _cfg.CONFIG_PATH
+                try:
+                    _mtime = os.path.getmtime(_path)
+                except OSError:
+                    continue
+                if (
+                    _config_watch_state["mtime"] is not None
+                    and _mtime == _config_watch_state["mtime"]
+                ):
+                    continue
+                # debounce : réécritures en plusieurs passes (éditeurs,
+                # _persist_vpn_config pendant le boot) — un 2e tour stable
+                # avant de parser.
+                await asyncio.sleep(1.0)
+                try:
+                    if os.path.getmtime(_path) != _mtime:
+                        continue
+                except OSError:
+                    continue
+                _config_watch_state["mtime"] = _mtime
+                with open(_path, encoding="utf-8") as _f:
+                    _new = _yaml.safe_load(_f) or {}
+                if not isinstance(_new, dict):
+                    continue
+
+                # Sections protégées (mêmes listes que le merge boot de
+                # settings.py, locales à reload_custom_routes — dupliquées ici
+                # car non exportées) : jamais d'effacement si absentes du disque.
+                _PROTECTED_SECTIONS = ("dashboard_trust", "client_auth", "supervisor")
+                _PROTECTED_NESTED = {"ip_rotation": ("latency_rotation",)}
+                for _sec in _PROTECTED_SECTIONS:
+                    if _sec not in _new and isinstance(
+                        _cfg._yaml_data.get(_sec), dict
+                    ):
+                        _new[_sec] = _cfg._yaml_data[_sec]
+                for _parent, _subs in _PROTECTED_NESTED.items():
+                    _old_sub = _cfg._yaml_data.get(_parent)
+                    _new_sub = _new.get(_parent)
+                    if isinstance(_old_sub, dict) and isinstance(_new_sub, dict):
+                        for _sub in _subs:
+                            if _sub not in _new_sub and _sub in _old_sub:
+                                _new_sub[_sub] = _old_sub[_sub]
+
+                _ip_rot_new = _new.get("ip_rotation") or {}
+                _ip_rot_changed = _ip_rot_new != (
+                    _cfg._yaml_data.get("ip_rotation") or {}
+                )
+
+                # Source de vérité + dicts importés par référence (opencode,
+                # dashboard, free_discovery lisent ces objets partagés).
+                _cfg._yaml_data.clear()
+                _cfg._yaml_data.update(_new)
+                for _name in ("IP_ROTATION", "FREE_MODEL_MAP", "ALIASES"):
+                    _ref = getattr(_cfg, _name, None)
+                    _fresh = _new.get(
+                        {"IP_ROTATION": "ip_rotation",
+                         "FREE_MODEL_MAP": "free_model_map",
+                         "ALIASES": "routing"}.get(_name), {}
+                    )
+                    if _name == "ALIASES" and isinstance(_fresh, dict):
+                        _fresh = _fresh.get("aliases", {})
+                    if isinstance(_ref, dict) and isinstance(_fresh, dict):
+                        _ref.clear()
+                        _ref.update(_fresh)
+
+                # Fan-out ip_rotation → managers + pool (le pool forward
+                # latency_rotation au moteur) — identique à POST /vpn-config.
+                if _ip_rot_changed:
+                    _managers = getattr(shared_state, "vpn_managers", None) or []
+                    for _mgr in _managers:
+                        try:
+                            await _mgr.update_config(_ip_rot_new)
+                        except Exception as _e_mgr:
+                            _debug(
+                                f"  [config-watch] station {_mgr._station}: {_e_mgr}"
+                            )
+                    _pool = getattr(shared_state, "free_ip_pool", None)
+                    if _pool is not None:
+                        try:
+                            _pool.update_config(_ip_rot_new)
+                        except Exception as _e_pool:
+                            _debug(f"  [config-watch] pool: {_e_pool}")
+                    _debug("  [config-watch] config.yaml rechargé (ip_rotation fan-out)")
+            except Exception as e:
+                _debug(f"  [config-watch] error: {type(e).__name__}: {e}")
+
+    config_watch_task = asyncio.create_task(_periodic_config_watch())
+
     # Periodic DB body cleanup (daily) — removes old request/response bodies to save disk
     async def _periodic_db_cleanup():
         # Run cleanup once at startup, then every 24h
@@ -2419,7 +2523,10 @@ async def lifespan(app):
 
                 def _maint():
                     # [P5 tranche 1] logique déléguée à app/db.weekly_maintain
-                    return _app_db.weekly_maintain(_conn, _db_commit_lock)
+                    # [plan 30/08 Lot B1] purge auto des lignes > N jours
+                    # (database.weekly_purge_days, défaut 90 — 0 = off).
+                    _pd = yaml_get("database", "weekly_purge_days", 90)
+                    return _app_db.weekly_maintain(_conn, _db_commit_lock, purge_days=_pd)
 
                 size_mo = await asyncio.to_thread(_maint)
                 _debug(
@@ -2537,6 +2644,7 @@ async def lifespan(app):
     db_flush_task.cancel()
     key_pause_cleanup_task.cancel()
     cooldown_sweep_task.cancel()
+    config_watch_task.cancel()
     db_cleanup_task.cancel()
     try:
         await checkpoint_task
@@ -9591,7 +9699,12 @@ _health_lock = asyncio.Lock()  # sérialise le check upstream caché (§14.3.16 
 
 
 @app.get("/health")
-async def health():
+async def health(detail: str = "lite"):
+    # [plan 30/08 Lot B3] Payload léger par défaut : la sérialisation de
+    # l'usage ~40 modèles + clés coûtait du CPU à CHAQUE check Uptime Kuma
+    # (30 s). ``GET /health?detail=full`` restitue la vue complète (usage
+    # inclus) pour le debug ciblé.
+    _detail_full = str(detail or "").strip().lower() == "full"
     _debug("  [health] health check started")
 
     def _health_probe():
@@ -9603,10 +9716,14 @@ async def health():
     await asyncio.to_thread(_health_probe)
     _debug("  [health] DB connectivity OK")
 
-    usage = {
-        model: {"input": d["input"], "output": d["output"], "cache": d["cache"]}
-        for model, d in _token_usage.items()
-    }
+    usage = (
+        {
+            model: {"input": d["input"], "output": d["output"], "cache": d["cache"]}
+            for model, d in _token_usage.items()
+        }
+        if _detail_full
+        else {}
+    )
 
     # Check circuit breaker status
     cb_status = {}

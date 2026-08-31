@@ -678,6 +678,9 @@ def _validate_vpn_config_payload(body) -> list:
             pm = lr.get("slow_threshold_ms_per_model")
             if pm is not None and not isinstance(pm, dict):
                 errors.append("slow_threshold_ms_per_model doit être un objet {modèle: ms}")
+            en = lr.get("enabled")
+            if en is not None and not isinstance(en, bool):
+                errors.append("latency_rotation.enabled doit être booléen")
 
     per = body.get("per_station")
     if per is not None:
@@ -846,7 +849,18 @@ def _persist_vpn_config(updates: dict):
                 _fp_changed = True
             # remove so key_map loop doesn't see it
             updates = {k: v for k, v in updates.items() if k != "free_parallel"}
-        changed = _fp_changed
+        # [GUI toggle « Cooldown latence »] latency_rotation : merge imbriqué
+        # symétrique à free_parallel (preserve les clés seuils existantes dans
+        # config.yaml — un POST {"enabled": false} ne doit PAS les écraser).
+        _lr_changed = False
+        if isinstance(updates.get("latency_rotation"), dict):
+            existing_lr = ip_rot.get("latency_rotation") if isinstance(ip_rot.get("latency_rotation"), dict) else {}
+            merged_lr = {**existing_lr, **updates["latency_rotation"]}
+            if merged_lr != existing_lr:
+                ip_rot["latency_rotation"] = merged_lr
+                _lr_changed = True
+            updates = {k: v for k, v in updates.items() if k != "latency_rotation"}
+        changed = _fp_changed or _lr_changed
         for key, yaml_key in key_map.items():
             if key in updates:
                 old_val = ip_rot.get(yaml_key)
@@ -2933,6 +2947,9 @@ def register_dashboard(
                     _lat[f"{_lsid}|{_lip}"] = _tr.snapshot().__dict__
                 data["latency"] = _lat
                 data["rotation_paused"] = bool(getattr(_leng, "paused", False))
+                # [GUI toggle « Cooldown latence »] état persistant du moteur
+                # (config.yaml latency_rotation.enabled) pour le toggle.
+                data["latency_enabled"] = bool(getattr(_leng.cfg, "enabled", True))
                 data["global_degraded_remaining"] = round(
                     max(0.0, float(_leng._global_paused_until) - _leng._now()), 1
                 )
@@ -3064,6 +3081,79 @@ def register_dashboard(
                 pass
         return data
 
+    @app.get("/api/pool-status")
+    async def get_pool_status():
+        """[v10] État du pool d'IPs free (stations, quotas, healthy/routable).
+
+        Endpoint attendu par scripts/verify_100.py (check 3/15) et utile au
+        monitoring externe — /api/vpn-status retourne la mÊME vue enrichie,
+        celui-ci reste la ressource stable documentée."""
+        import shared_state
+
+        pool = getattr(shared_state, "free_ip_pool", None)
+        if pool is None:
+            return JSONResponse(
+                status_code=503,
+                content={"error": "free_ip_pool non initialisé", "proxy_mode": "none"},
+            )
+        return pool.get_status()
+
+    @app.get("/api/latency-status")
+    async def get_latency_status():
+        """[v10] État interne du moteur de rotation latence-adaptive.
+
+        Expose ce qui rend une station non-routable : seuils live (post
+        hot-reload), cooldowns soft/hard actifs avec TTL restant, historique
+        soft (source des escalades hard), compteurs anti-flapping. C'est le
+        point d'entrée pour répondre à « pourquoi healthy_routable < N ».
+        """
+        import shared_state
+
+        try:
+            from latency_rotation import get_engine
+            eng = getattr(shared_state, "latency_engine", None) or get_engine()
+        except Exception as e:
+            return {"enabled": False, "error": f"engine unavailable: {e}"}
+
+        now = time.time()
+        cfg = eng.cfg
+        cooldowns = []
+        for (sid, ip), (kind, until) in sorted(eng._cooldowns.items()):
+            remaining = max(0.0, until - now)
+            if remaining > 0:
+                cooldowns.append({
+                    "station": sid, "ip": ip, "kind": kind,
+                    "remaining_s": round(remaining, 1),
+                })
+        soft_history = sorted(f"{sid}|{ip}" for sid, ip in eng._soft_history)
+        trackers = []
+        for (sid, ip), tr in sorted(eng._trackers.items()):
+            snap = tr.snapshot()
+            trackers.append({
+                "station": sid, "ip": ip,
+                "count": snap.count,
+                "ewma_ms": None if snap.ewma_ms is None else round(snap.ewma_ms, 1),
+                "p95_ms": None if snap.p95_ms is None else round(snap.p95_ms, 1),
+                "consecutive_slow": snap.consecutive_slow,
+            })
+        return {
+            "enabled": bool(cfg.enabled),
+            "config": {
+                "slow_threshold_ms": cfg.slow_threshold_ms,
+                "ewma_threshold_ms": cfg.ewma_threshold_ms,
+                "p95_threshold_ms": cfg.p95_threshold_ms,
+                "floor_ms": cfg.floor_ms,
+                "consecutive_slow": cfg.consecutive_slow,
+                "soft_cooldown_sec": cfg.soft_cooldown_sec,
+                "hard_cooldown_sec": cfg.hard_cooldown_sec,
+                "slow_threshold_ms_per_model": dict(cfg.per_model),
+                "stream_metric": cfg.stream_metric,
+            },
+            "cooldowns": cooldowns,
+            "soft_history": soft_history,
+            "trackers": trackers,
+        }
+
     @app.get("/api/vpn-config")
     async def get_vpn_config():
         """Get current VPN configuration."""
@@ -3162,6 +3252,16 @@ def register_dashboard(
                     status_code=400, content={"error": "bad_ttl doit être un entier entre 1 et 3600"}
                 )
             body["bad_ttl"] = _bt
+
+        # [GUI toggle « Cooldown latence »] validation minimale du bloc imbriqué
+        # latency_rotation (scope: le booléen enabled — les autres clés restent
+        # couvertes par config.yaml / le validateur dry-run).
+        if "latency_rotation" in body:
+            _lr = body["latency_rotation"]
+            if not isinstance(_lr, dict):
+                return JSONResponse(status_code=400, content={"error": "latency_rotation doit être un objet"})
+            if "enabled" in _lr and not isinstance(_lr["enabled"], bool):
+                return JSONResponse(status_code=400, content={"error": "latency_rotation.enabled doit être booléen"})
 
         # [free_parallel] validate nested + flat keys
         if "free_parallel" in body:

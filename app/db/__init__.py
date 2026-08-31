@@ -616,11 +616,62 @@ def log_free_usage(
         conn.commit()
 
 
-def weekly_maintain(conn: sqlite3.Connection, lock) -> float:
-    """Checkpoint TRUNCATE + VACUUM sous le lock writer (maintenance hebdo).
+# [plan 30/08 Lot B1] purge des LIGNES > 90 jours au passage de la
+# maintenance hebdo (dimanche 03:00) — avant le VACUUM pour rendre les
+# pages libérées. La purge corps (> body_retention_days, défaut 7 j scinde
+# les corps hors taille) reste quotidienne dans cleanup_old_bodies ; cette
+# purge vise la croissance structurelle du fichier (incident 30/08 : ~1 Go).
+WEEKLY_PURGE_DAYS = 90
+
+_PURGE_OLD_ROWS_SQL = "DELETE FROM requests WHERE timestamp < ?"
+_PURGE_OLD_USAGE_SQL = "DELETE FROM free_model_usage WHERE timestamp < ?"
+
+
+def _purge_old_rows_locked(conn: sqlite3.Connection, days: int = WEEKLY_PURGE_DAYS) -> int:
+    """DELETE ≤ bornes des deux tables ; suppose le lock déjà détenu.
+
+    Les timestamps sont TEXT ISO8601 UTC — un cutoff texte suffit ('YYYY-MM-…'
+    trie proprement), pas de strftime SQLite (testable 100 % pur).
+
+    ``days <= 0`` = no-op défensif (le garde-fou officiel reste dans
+    weekly_maintain, mais l'helper ne doit jamais purger « sans borne »)."""
+    if days is None or days <= 0:
+        return 0
+    import datetime as _dt
+
+    cutoff = (
+        (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(days=days))
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    total = 0
+    for sql in (_PURGE_OLD_ROWS_SQL, _PURGE_OLD_USAGE_SQL):
+        try:
+            cur = conn.execute(sql, (cutoff,))
+            total += cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+        except sqlite3.Error:
+            # free_model_usage peut ne pas exister sur une DB legacy —
+            # la purge reste tolérante (le VACUUM tourne quand même).
+            continue
+    return total
+
+
+def weekly_maintain(conn: sqlite3.Connection, lock, purge_days: int = WEEKLY_PURGE_DAYS) -> float:
+    """Checkpoint TRUNCATE + purge > ``purge_days`` jours + VACUUM sous le
+    lock writer (maintenance hebdo).
+
+    ``purge_days`` peut être désactivé via 0 (ou None) — la maintenance
+    redevient alors le checkpoint+VACUUM historique.
 
     Retourne la taille DB en Mo (pour le log de l'app hôte)."""
     with lock:
+        if purge_days and purge_days > 0:
+            _purge_old_rows_locked(conn, int(purge_days))
+            # Commit explicite AVANT VACUUM : la purge ouvre une transaction
+            # implicite (sqlite3 isolation_level default), et VACUUM refuse
+            # de tourner dans une transaction.
+            conn.commit()
         conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         conn.execute("VACUUM")
     import os as _os

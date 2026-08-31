@@ -22,6 +22,7 @@ exhausted.
 
 import asyncio
 import logging
+import math
 import random
 import time
 import urllib.parse
@@ -36,6 +37,38 @@ except Exception:
         return default
 
 logger = logging.getLogger(__name__)
+
+
+def _clamp_seconds(cfg: dict, key: str, lo: float, hi: float) -> float | None:
+    """[plan 30/08 — règle transversale] Lit une clé de durée (secondes) avec
+    bornes : valeur invalide → warning + None (l'appelant garde sa valeur
+    courante) ; hors plage → clamp + warning.
+
+    Retourne None quand la clé est absente ou invalide — jamais d'écrasement
+    silencieux d'un réglage existant par un défaut."""
+    if key not in cfg:
+        return None
+    raw = cfg[key]
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "[pool-config] %s=%r invalide — valeur courante conservée", key, raw
+        )
+        return None
+    if math.isnan(val):
+        logger.warning(
+            "[pool-config] %s=%r invalide (NaN) — valeur courante conservée", key, raw
+        )
+        return None
+    if val < lo or val > hi:
+        clamped = max(lo, min(hi, val))
+        logger.warning(
+            "[pool-config] %s=%s hors bornes [%s, %s] — clamp à %s",
+            key, raw, lo, hi, clamped,
+        )
+        return clamped
+    return val
 
 
 class Socks5Endpoint:
@@ -140,10 +173,31 @@ class FreeIPPool:
         # station (and ``VPNManager.connect_next`` is itself single-flight
         # on top).
         self._rotation_tasks: dict[int, asyncio.Task] = {}
-        # Timing attrs — seeded from the class defaults, overridden by
-        # update_config() (config.yaml `ip_rotation`, hot-reloadable).
+        # Timing attrs — seeded from the class defaults (= comportement
+        # historique), overridden by update_config() (config.yaml
+        # `ip_rotation`, hot-reloadable).
+        # [plan 30/08 — constantes → config] clés dédiées (comportement
+        # exact inchangé à défaut) :
+        #   station_connect_retry_interval_s (défaut 300 s) remplace
+        #     _CONNECT_RETRY_INTERVAL codé en dur — la clé historique
+        #     ``connect_retry_interval`` reste lue tel quel plus bas.
+        #   station_bad_ttl_s (défaut 60 s) remplace _BAD_TTL codé en dur
+        #     (les 429 gardent une station hors rotation). On ne recycle PAS
+        #     la clé ``bad_ttl`` : elle porte la sémantique blacklist fast-pin
+        #     en MINUTES côté vpn_manager (lot A2) depuis le 30/08.
         self._connect_retry_interval = float(self._CONNECT_RETRY_INTERVAL)
         self._bad_ttl = float(self._BAD_TTL)
+        try:
+            _cfg_seed = getattr(vpn_manager, "_config", None) or {}
+            for _key, _attr in (
+                ("station_connect_retry_interval_s", "_connect_retry_interval"),
+                ("station_bad_ttl_s", "_bad_ttl"),
+            ):
+                _v = _clamp_seconds(_cfg_seed, _key, 1.0, 3600.0)
+                if _v is not None:
+                    setattr(self, _attr, _v)
+        except Exception:
+            pass
         self._on_429_action = "both"
         # [plan v10 §3.6 Lot 3] Moteur de rotation latence-adaptive — partagé
         # (singleton), config canonique `ip_rotation.latency_rotation`.
@@ -342,7 +396,10 @@ class FreeIPPool:
 
                 eng = getattr(self, "latency_engine", None) or get_engine()
                 cur_ip = str(getattr(station, "current_ip", "") or "")
-                if cur_ip and eng.ip_hard_cooled(int(station._station), cur_ip):
+                # Garde cfg.enabled : un moteur latence désactivé (toggle GUI,
+                # état importé…) ne filtre RIEN, même si des cooldowns ont
+                # survécu à la purge de update_config.
+                if cur_ip and eng.cfg.enabled and eng.ip_hard_cooled(int(station._station), cur_ip):
                     return False
             except Exception:
                 pass
@@ -1584,6 +1641,15 @@ class FreeIPPool:
                 _bt = None  # invalid → ignore (keep current)
             if _bt is not None:
                 self._bad_ttl = float(max(1, min(3600, _bt)))
+        # [plan 30/08] clés dédiées (secondes, sans collision avec bad_ttl
+        # minutes du fast-pin vpn_manager). Présentes → prioritaires ;
+        # absentes/invalides → inchangé (défauts = comportement actuel).
+        _v = _clamp_seconds(cfg, "station_connect_retry_interval_s", 5.0, 3600.0)
+        if _v is not None:
+            self._connect_retry_interval = _v
+        _v = _clamp_seconds(cfg, "station_bad_ttl_s", 1.0, 3600.0)
+        if _v is not None:
+            self._bad_ttl = _v
         if "rotation_stagger" in cfg:
             self._rotation_stagger = max(0, int(cfg["rotation_stagger"] or 0))
         if "rotation_wait_timeout" in cfg:

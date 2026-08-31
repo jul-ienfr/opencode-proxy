@@ -29,7 +29,34 @@ logger = logging.getLogger(__name__)
 
 # Warm-up post-rotation (v6 §3.6.5) : la 1ʳᵉ requête sur une IP neuve paie le
 # handshake TLS/SOCKS et ne doit pas compter comme "slow".
+# [plan 30/08 — constante → config] clé ``supervisor.warmup_excluded_requests``
+# (défaut 1 = comportement historique, bornes 0–1000 appliquées à la lecture).
+# La valeur se relit à chaque usage via config mirror → hot-reload OK.
 WARMUP_EXCLUDED_REQUESTS: int = 1
+
+
+def warmup_excluded_requests() -> int:
+    """[plan 30/08] Valeur effective du warm-up (clé supervisor.*, clampée)."""
+    default = WARMUP_EXCLUDED_REQUESTS
+    try:
+        from config.settings import _yaml_data
+
+        raw = (_yaml_data.get("supervisor") or {}).get(
+            "warmup_excluded_requests", default
+        )
+        val = int(raw)
+    except Exception:
+        return default
+    if val < 0 or val > 1000:
+        clamped = max(0, min(1000, val))
+        logger.warning(
+            "[supervisor-config] warmup_excluded_requests=%r hors bornes [0, 1000]"
+            " — clamp à %s",
+            raw,
+            clamped,
+        )
+        return clamped
+    return val
 
 
 @dataclass
