@@ -190,7 +190,7 @@ ip_rotation:
   free_parallel:
     enabled: true
     routing: round-robin
-    mode: load-balance
+    mode: strict
     hedge_delay_ms: 150
     hedge_max_attempts: 2
   identity_diversity: true
@@ -230,7 +230,7 @@ ip_rotation:
     window: 20
   max_free_attempts: 4
   ovpn_endpoint_port: ''
-  ovpn_protocol: tcp
+  ovpn_protocol: udp
   proxy_mode: vpn
   quota_per_ip: 500
   recent_ip_max_age: 1800
