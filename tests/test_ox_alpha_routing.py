@@ -58,6 +58,18 @@ class TestResolveModelEndpoint:
             == st._RESPONSES_ENDPOINT
         )
 
+    def test_muse_13_free_responses(self):
+        assert (
+            st._resolve_model_endpoint("muse-spark-1.3-contributor-free", {}, "openai")
+            == st._RESPONSES_FREE_ENDPOINT
+        )
+
+    def test_muse_13_paid_responses(self):
+        assert (
+            st._resolve_model_endpoint("muse-spark-1.3-contributor", {}, "openai")
+            == st._RESPONSES_ENDPOINT
+        )
+
     def test_paid_openai_default(self):
         assert st._resolve_model_endpoint("kimi-k2.6", {}, "openai") == st.API_BASE_OPENAI
 
@@ -78,6 +90,49 @@ def test_get_model_config_go_seam():
     cfg = st.get_model_config("ox-alpha-free")
     assert cfg["endpoint"] == st.API_BASE_OPENAI
     assert cfg["protocol"] == "openai"
+
+
+# ── Parité muse-spark 1.3 == 1.2 ──────────────────────────────────────
+
+
+def test_live_models_muse_spark_13_endpoints():
+    for mid, expected in (
+        ("muse-spark-1.3-contributor", st._RESPONSES_ENDPOINT),
+        ("muse-spark-1.3-contributor-free", st._RESPONSES_FREE_ENDPOINT),
+    ):
+        cfg = st.get_model_config(mid)
+        assert cfg["endpoint"] == expected
+        assert cfg["protocol"] == "openai"
+
+
+def test_live_models_muse_spark_13_free_map():
+    assert st.FREE_MODEL_MAP["muse-spark-1.3-contributor"] == "muse-spark-1.3-contributor-free"
+
+
+def test_live_models_muse_spark_13_geo():
+    for mid in ("muse-spark-1.3-contributor", "muse-spark-1.3-contributor-free"):
+        route = st.MODELS[mid]
+        res = st.resolve_geo({"model": mid, "geo": route.get("geo", {})})
+        ref = st.resolve_geo(
+            {
+                "model": mid.replace("1.3", "1.2"),
+                "geo": st.MODELS[mid.replace("1.3", "1.2")].get("geo", {}),
+            }
+        )
+        assert res["geo_status"] == ref["geo_status"]
+        assert res["mode"] == ref["mode"] == "strict"
+        assert res["require_vpn"] == ref["require_vpn"]
+        assert res["effective_allowed"] == ref["effective_allowed"]
+
+
+def test_web_search_native_parity_13():
+    for mid in (
+        "muse-spark-1.2-contributor",
+        "muse-spark-1.2-contributor-free",
+        "muse-spark-1.3-contributor",
+        "muse-spark-1.3-contributor-free",
+    ):
+        assert mid in st.WEB_SEARCH_NATIVE_MODELS
 
 
 # ── Exclusion découverte auto (go_only_ids) ─────────────────────────

@@ -777,6 +777,11 @@ class FreeIPPool:
         self._total_free_requests += 1
 
         mode = self._vpn.proxy_mode
+        if mode == "direct":
+            # [proxy_mode] all free traffic goes direct (residential IP) —
+            # uniform with muse-spark: no tunnel attempt. Debug-level to
+            # avoid per-request spam.
+            logger.debug("[free-ip] proxy_mode=direct → free served direct (no tunnel pick)")
         if mode == "socks5":
             # [Axe 3.1] Static SOCKS5 list — round-robin pick, NO docker.
             # The two-pass _socks5_next already prefers a fresh proxy; when

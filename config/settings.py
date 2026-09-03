@@ -439,6 +439,20 @@ GEO_POLICIES: dict = (
 SORTED_GEO_POLICIES: list = sorted(GEO_POLICIES.items()) if isinstance(GEO_POLICIES, dict) else []
 GEO_ALLOW_DIRECT_WHEN_COMPATIBLE: bool = bool(yaml_get("geo", "allow_direct_when_compatible", True))
 
+
+def is_free_vpn_required() -> bool:
+    """True when ALL free traffic must go through tunnels (vpn/socks5).
+
+    proxy_mode is the single source of truth for the free path: vpn/socks5
+    → never a residential-IP direct fallback; direct → residential for all
+    free models (muse-spark included). Used by opencode.py / dashboard /
+    tests as the canonical gate check.
+    """
+    return bool(
+        yaml_get("ip_rotation", "enabled", False)
+        and yaml_get("ip_rotation", "proxy_mode", "vpn") in ("vpn", "socks5")
+    )
+
 # [P1 perf] mémo resolve_geo — epoch bumpé à chaque hot-reload touchant les
 # entrées geo/routes ; clé complète dans resolve_geo (contenu + inputs).
 _geo_resolve_cache: dict = {}
@@ -929,9 +943,9 @@ except Exception as e:
     logger.debug("[config] impossible de lancer le thread upstream: %s", e)
 
 # ── Web search native allowlist (v3.3) ─────────────────────────
-WEB_SEARCH_NATIVE_MODELS: list = yaml_get("web_search_native", default=["muse-spark-1.2-contributor", "muse-spark-1.2-contributor-free"])
+WEB_SEARCH_NATIVE_MODELS: list = yaml_get("web_search_native", default=["muse-spark-1.2-contributor", "muse-spark-1.2-contributor-free", "muse-spark-1.3-contributor", "muse-spark-1.3-contributor-free"])
 if not isinstance(WEB_SEARCH_NATIVE_MODELS, list):
-    WEB_SEARCH_NATIVE_MODELS = ["muse-spark-1.2-contributor", "muse-spark-1.2-contributor-free"]
+    WEB_SEARCH_NATIVE_MODELS = ["muse-spark-1.2-contributor", "muse-spark-1.2-contributor-free", "muse-spark-1.3-contributor", "muse-spark-1.3-contributor-free"]
 
 # ── Free discovery (auto-detect -free models) ─────────────────────
 FREE_DISCOVERY = (
@@ -1693,7 +1707,7 @@ def maybe_reload_custom_routes():
                     )
                     # v3.3: WEB_SEARCH_NATIVE_MODELS hot-reload
                     try:
-                        new_wsn = new_yaml.get("web_search_native", ["muse-spark-1.2-contributor", "muse-spark-1.2-contributor-free"])
+                        new_wsn = new_yaml.get("web_search_native", ["muse-spark-1.2-contributor", "muse-spark-1.2-contributor-free", "muse-spark-1.3-contributor", "muse-spark-1.3-contributor-free"])
                         if isinstance(new_wsn, list) and new_wsn:
                             WEB_SEARCH_NATIVE_MODELS[:] = new_wsn
                     except Exception:

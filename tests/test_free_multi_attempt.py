@@ -422,9 +422,9 @@ async def test_socks5_mode_429_retries_next_proxy(free_vpn_env, free_cfg, monkey
 async def test_socks5_mode_single_proxy_429_budget_exhausted(free_vpn_env, free_cfg, monkeypatch):
     """[Axe 3.1] ONE static proxy, 429 with max_free_attempts=2: the second
     pass of _socks5_next admits NO other proxy (exclusion never re-strikes
-    the cooldowned one) → the loop breaks and — identically to a single vpn
-    station — the last-resort residential direct fallback runs; its 429
-    answer is swallowed and the caller pays (None). No infinite loop."""
+    the cooldowned one) → the loop breaks. [proxy_mode] socks5 (like vpn)
+    NEVER falls back to the residential-IP direct path: the caller pays
+    (None) directly. No infinite loop."""
     oc.IP_ROTATION["auto_max_free_attempts"] = False
     oc.IP_ROTATION["max_free_attempts"] = 2
     a = _Socks5Ep(1)
@@ -443,8 +443,7 @@ async def test_socks5_mode_single_proxy_429_budget_exhausted(free_vpn_env, free_
     result = await oc._try_free_model_first(_free_body(), dict(PAID_HEADERS), "openai", PAID_MODEL)
     assert result is None, "no second proxy → paid fallback (None)"
     assert [s for _p, s in fake.calls] == [a], "the sole proxy struck exactly once"
-    assert len(direct_calls) == 1, "last-resort residential fallback attempted"
-    assert direct_calls[0] == oc.API_BASE_FREE
+    assert direct_calls == [], "proxy_mode=socks5 → NO residential fallback (tunnels/paid only)"
 
 
 # ── (a') non-stream budget épuisé → None (payant), pas de direct 429 ───────
@@ -519,18 +518,57 @@ async def test_non_stream_tunnel_failure_retries_station(free_vpn_env, free_cfg,
     assert direct_calls == [], "direct residential fallback never reached"
 
 
-# ── (d) non-stream: exception tunnel, direct mode → legacy direct ──────────
+# ── (d) exception fallback scoped on proxy_mode==direct ────────────────────
+class _StubVpnDirect:
+    """_vpn_manager double: proxy_mode=direct forces the direct branch."""
+
+    proxy_mode = "direct"
+    current_ip = "10.0.0.1"
+
+
 @pytest.mark.asyncio
-async def test_non_stream_direct_mode_legacy_fallback(free_vpn_env, free_cfg, monkeypatch):
-    """direct mode (legacy): a dead tunnel on A falls back to the direct
-    residential path IMMEDIATELY — B is never struck."""
+async def test_non_stream_exception_fallback_ignored_in_vpn_mode(free_vpn_env, free_cfg, monkeypatch):
+    """[proxy_mode] vpn + free_exception_fallback=direct: the knob is
+    IGNORED in vpn mode — a dead tunnel retries fresh stations while the
+    budget lasts, then returns None (paid); the residential-IP direct
+    fallback is NEVER attempted."""
     oc.IP_ROTATION["max_free_attempts"] = 2
     oc.IP_ROTATION["free_exception_fallback"] = "direct"
     a = _Station(1, "1.1.1.1", "socks5://127.0.0.1:1080")
     b = _Station(2, "2.2.2.2", "socks5://127.0.0.1:1081")
     pool = _PoolMulti([a, b])
     monkeypatch.setattr(oc, "_free_ip_pool", pool)
-    fake = _FakeFreeCurl([RuntimeError("SOCKS5 tunnel dead")])
+    fake = _FakeFreeCurl([RuntimeError("SOCKS5 tunnel dead"), RuntimeError("SOCKS5 tunnel dead 2")])
+    monkeypatch.setattr(oc, "_do_free_request_curl_cffi", fake)
+    direct_calls = []
+
+    async def _fake_direct(url, body, headers, protocol, retry_on_429=False):
+        direct_calls.append(url)
+        return _FakeResp(200, {"content-type": "application/json"}), {}
+
+    monkeypatch.setattr(oc, "_do_request_with_retry", _fake_direct)
+
+    result = await oc._try_free_model_first(_free_body(), dict(PAID_HEADERS), "openai", PAID_MODEL)
+    assert result is None, "budget exhausted → paid fallback (None), never direct"
+    assert [s for _p, s in fake.calls] == [a, b], (
+        "both stations struck before giving up (knob ignored in vpn mode)"
+    )
+    assert direct_calls == [], "proxy_mode=vpn → NO residential direct fallback"
+
+
+@pytest.mark.asyncio
+async def test_free_direct_mode_uses_direct(free_vpn_env, free_cfg, monkeypatch):
+    """[proxy_mode] direct: free traffic goes straight to the residential
+    direct path (else branch) — curl_cffi / station picks never happen,
+    the free_exception_fallback knob is irrelevant."""
+    monkeypatch.setattr(oc, "_vpn_manager", _StubVpnDirect())
+    oc.IP_ROTATION["max_free_attempts"] = 2
+    oc.IP_ROTATION["free_exception_fallback"] = "direct"
+    a = _Station(1, "1.1.1.1", "socks5://127.0.0.1:1080")
+    b = _Station(2, "2.2.2.2", "socks5://127.0.0.1:1081")
+    pool = _PoolMulti([a, b])
+    monkeypatch.setattr(oc, "_free_ip_pool", pool)
+    fake = _FakeFreeCurl([RuntimeError("must never be called")])
     monkeypatch.setattr(oc, "_do_free_request_curl_cffi", fake)
     direct_calls = []
 
@@ -542,11 +580,8 @@ async def test_non_stream_direct_mode_legacy_fallback(free_vpn_env, free_cfg, mo
 
     result = await oc._try_free_model_first(_free_body(), dict(PAID_HEADERS), "openai", PAID_MODEL)
     assert result is not None and result[0].status_code == 200
-    assert [s for _p, s in fake.calls] == [a], (
-        "direct mode: exactly ONE tunnel strike, then direct fallback"
-    )
-    assert len(direct_calls) == 1, "legacy direct fallback ran"
-    assert direct_calls[0] == oc.API_BASE_FREE
+    assert fake.calls == [], "proxy_mode=direct → the VPN/curl path is never entered"
+    assert direct_calls == [oc.API_BASE_FREE], "free served via the residential direct branch"
 
 
 # ── (b) stream 429: cooldown (model, IP) + rotation + refuse flag ─────────

@@ -24,6 +24,7 @@ goldens §v1-response.md. Aliases actuels (`free_model_map`) :
 - `qwen3.7-max` → `mimo-v2.5-free`
 - `hy3` → `hy3-free`
 - `muse-spark-1.2-contributor` → `muse-spark-1.2-contributor-free`
+- `muse-spark-1.3-contributor` → `muse-spark-1.3-contributor-free`
 
 Modèles free directs : `x-preview-f-free`,
 `nemotron-3-ultra-free`, `nemotron-3.5-lightning-free`,

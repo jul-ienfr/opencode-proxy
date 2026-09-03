@@ -4795,9 +4795,27 @@ def _free_exception_fallback_mode() -> str:
     "station-first" → a dead tunnel retries another station before the
     direct residential fallback; "direct" → legacy immediate direct
     fallback. Hot-reloaded per request like max_free_attempts.
+
+    NOTE: only applies when the effective free proxy mode is "direct" —
+    in vpn/socks5 mode ALL free traffic stays on tunnels (no silent
+    VPN→direct fallback); the knob is ignored.
     """
     mode = IP_ROTATION.get("free_exception_fallback", "station-first") or "station-first"
     return mode if mode in ("station-first", "direct") else "station-first"
+
+
+def _free_proxy_mode() -> str:
+    """Effective proxy mode governing ALL free traffic: vpn / socks5 / direct.
+
+    proxy_mode is the single source of truth for the free path
+    (muse-spark, mimo, deepseek, … all aligned): vpn/socks5 → tunnels
+    only, never a residential-IP direct fallback; direct → residential
+    (free exception fallback knob applies). Hot-reloaded via _vpn_manager.
+    """
+    try:
+        return _vpn_manager.proxy_mode if _vpn_manager else "direct"
+    except Exception:
+        return "direct"
 
 
 def _free_attempts_active(forced_pool=None) -> bool:
@@ -4880,6 +4898,15 @@ async def _open_free_stream(
             _debug(
                 "  [free-stream] ⚠️ no VPN proxy — free endpoint is geo-restricted, direct connection will likely 400"
             )
+            if not direct_fallback and _free_proxy_mode() in ("vpn", "socks5"):
+                # [proxy_mode] vpn/socks5: never open a direct free stream —
+                # re-raise so the caller's retry loop strikes another station
+                # or, budget spent, falls back to PAID (never residential-IP direct).
+                _log(
+                    "  FREE STREAM: no usable station "
+                    f"(proxy_mode={_free_proxy_mode()}) → no direct stream, caller retries/paid"
+                )
+                raise _FreeTunnelFailure(station, RuntimeError("no usable VPN station"))
         if proxy_url:
             try:
 
@@ -5820,7 +5847,12 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
                 break  # 200, final-429 or other status → shared handling below
             except Exception as e:
                 _debug(f"  [free] curl_cffi error (station {attempt._station}): {e}")
-                if station_first and _free_used < free_max:
+                # [proxy_mode] in vpn/socks5 mode a dead tunnel NEVER falls
+                # back to the residential-IP direct path — retry another
+                # station while the budget lasts, then return None (paid) or
+                # FreeQuotaExhausted (strict_free) via the resp-is-None block
+                # below. free_exception_fallback only applies in direct mode.
+                if (station_first or proxy_mode in ("vpn", "socks5")) and _free_used < free_max:
                     # [plan 19/08 §2] station-first: a dead tunnel retries
                     # another station BEFORE the residential-IP direct
                     # fallback (whose bucket is long exhausted).
@@ -5830,12 +5862,28 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
                     )
                     continue
                 # station-first budget spent, or direct mode → legacy fallback
-                _log(
-                    f"  FREE via station {attempt._station} tunnel FAILED ({e}) → direct fallback (residential IP)"
-                )
+                # (reachable in direct proxy_mode only)
+                if proxy_mode in ("vpn", "socks5"):
+                    _log(
+                        f"  FREE via station {attempt._station} tunnel FAILED ({e}) — attempts exhausted, no direct fallback (proxy_mode={proxy_mode}) → paid"
+                    )
+                else:
+                    _log(
+                        f"  FREE via station {attempt._station} tunnel FAILED ({e}) → direct fallback (residential IP)"
+                    )
                 resp = None
                 break
         if resp is None:
+            # [proxy_mode] vpn/socks5 never falls back to direct here — this
+            # block is also reached after the 400/datapolicy retry budget is
+            # exhausted, not only on dead tunnels: paid (or strict_free 429).
+            if proxy_mode in ("vpn", "socks5"):
+                _log(
+                    f"  FREE attempts exhausted — no direct fallback (proxy_mode={proxy_mode}) → paid fallback"
+                )
+                if IP_ROTATION.get("strict_free", False) and _free_stations_exhausted(free_model):
+                    raise FreeQuotaExhausted(_free_429_cooldown_seconds(""))
+                return None
             _log("  FREE via VPN tunnels FAILED → direct fallback (residential IP)")
             try:
                 resp, resp_headers = await _do_request_with_retry(
@@ -7075,7 +7123,7 @@ def _is_web_tool_native(model_id: str) -> bool:
     try:
         from config.settings import WEB_SEARCH_NATIVE_MODELS as _ALLOW
     except ImportError:
-        _ALLOW = ["muse-spark-1.2-contributor", "muse-spark-1.2-contributor-free"]
+        _ALLOW = ["muse-spark-1.2-contributor", "muse-spark-1.2-contributor-free", "muse-spark-1.3-contributor", "muse-spark-1.3-contributor-free"]
     if model_id in _ALLOW:
         return True
     # capabilities live
@@ -8099,8 +8147,11 @@ async def messages(request: Request):
                             count_request=(_attempt == 0),
                             fresh_station=(_attempt > 0 and _using_free),
                             direct_fallback=(
-                                _free_exception_fallback_mode() != "station-first"
-                                or _attempt + 1 >= effective_free_max_attempts(_free_forced_pool)
+                                _free_proxy_mode() == "direct"
+                                and (
+                                    _free_exception_fallback_mode() != "station-first"
+                                    or _attempt + 1 >= effective_free_max_attempts(_free_forced_pool)
+                                )
                             ),
                             forced_pool=_free_forced_pool,
                         )
@@ -9092,8 +9143,11 @@ async def messages(request: Request):
                         count_request=(_attempt == 0),
                         fresh_station=(_attempt > 0 and _using_free),
                         direct_fallback=(
-                            _free_exception_fallback_mode() != "station-first"
-                            or _attempt + 1 >= effective_free_max_attempts(_free_forced_pool)
+                            _free_proxy_mode() == "direct"
+                            and (
+                                _free_exception_fallback_mode() != "station-first"
+                                or _attempt + 1 >= effective_free_max_attempts(_free_forced_pool)
+                            )
                         ),
                         forced_pool=_free_forced_pool,
                     )
@@ -10443,8 +10497,11 @@ async def chat_completions(request: Request):
                         count_request=(_attempt == 0),
                         fresh_station=(_attempt > 0 and _using_free),
                         direct_fallback=(
-                            _free_exception_fallback_mode() != "station-first"
-                            or _attempt + 1 >= effective_free_max_attempts(_free_forced_pool)
+                            _free_proxy_mode() == "direct"
+                            and (
+                                _free_exception_fallback_mode() != "station-first"
+                                or _attempt + 1 >= effective_free_max_attempts(_free_forced_pool)
+                            )
                         ),
                         forced_pool=_free_forced_pool,
                     ) as resp:
@@ -11257,8 +11314,11 @@ async def chat_completions(request: Request):
                         count_request=(_attempt == 0),
                         fresh_station=(_attempt > 0 and _using_free),
                         direct_fallback=(
-                            _free_exception_fallback_mode() != "station-first"
-                            or _attempt + 1 >= effective_free_max_attempts(_free_forced_pool)
+                            _free_proxy_mode() == "direct"
+                            and (
+                                _free_exception_fallback_mode() != "station-first"
+                                or _attempt + 1 >= effective_free_max_attempts(_free_forced_pool)
+                            )
                         ),
                         forced_pool=_free_forced_pool,
                     )
