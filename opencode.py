@@ -23,7 +23,7 @@ import threading
 import time
 import traceback
 import urllib.parse
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -226,12 +226,34 @@ def _alias_for_key(api_key: str) -> str:
     return _key_alias_cache.get(api_key, "")
 
 
+def _has_usable_paid_key() -> bool:
+    """True iff ≥1 enabled, non-paused paid key exists (API_KEYS or .env).
+
+    [Étape 2A — A1/A2] Garde no-valid-keys : toute jambe paid est condamnée
+    au 401/403 sans clé utilisable. Chemin de chargement (config/settings.py
+    load_api_keys) : api_keys.json → YAML → single-key .env → []. Le .env
+    vide (API_KEY == "") ne compte PAS comme clé utilisable — un Bearer vide
+    produit un 401 upstream systématique.
+    """
+    for k in API_KEYS:
+        if not k.get("enabled", True):
+            continue
+        ak = k.get("api_key", "")
+        if ak and not _key_pauser.is_paused(ak):
+            return True
+    env_key = API_KEY or ""
+    if env_key and not _key_pauser.is_paused(env_key):
+        return True
+    return False
+
+
 # ── Key pause tracker ─────────────────────────────────────────
 
 
 # [plan v10 §14.1.15] même condition HTTP = même durée, stream ou non :
 # 401 = clé temporairement indisponible (quota) — 1h des deux côtés.
-KEY_PAUSE_401_SEC = 3600.0
+# [PLAN-corrections-429 P9] rendu configurable via config.yaml:key_pause.key_pause_401_sec.
+KEY_PAUSE_401_SEC = float(yaml_get("key_pause", "key_pause_401_sec", 3600.0))
 
 
 class _KeyPauser:
@@ -488,6 +510,7 @@ async def _pause_key_for_quota_reset(api_key: str):
     Finds which rolling quota is at 100%, calculates the exact reset time,
     and pauses the key for that duration. The key auto-re-enables at reset.
     """
+    _record_global_429()
     try:
         from dashboard.quota import fetch_quotas
 
@@ -800,6 +823,10 @@ def _db_insert_sync(
     geo_via_vpn=None,
     geo_allowed=None,
     station=None,
+    # [Étape 2 — O2] jambes fallback corrélées par req_id (32 colonnes ;
+    # le fallback QueueFull passe *row matérialisé — arité 32 exigée).
+    free_status=None,
+    paid_status=None,
 ):
     """Synchronous DB insert — called via asyncio.to_thread().
 
@@ -842,6 +869,8 @@ def _db_insert_sync(
         1 if geo_via_vpn else 0,
         geo_allowed,
         station,
+        free_status,
+        paid_status,
     )
     _app_db.insert_sync(_conn, _db_commit_lock, _db_state, row, debug_fn=_debug)
 
@@ -928,6 +957,12 @@ async def _save_request(
     geo_via_vpn=None,
     geo_allowed=None,
     station=None,
+    # [Étape 2 — O2] jambes fallback corrélées par req_id : passés
+    # explicitement par les sites paid (statut upstream), lus sinon depuis
+    # le ctx C1 (statut free — peek sans pop, le pop reste à l'émission B1).
+    # None = pas de fallback (paid direct ou free direct).
+    free_status=None,
+    paid_status=None,
 ):
     # [D1 perf] plus de sérialisation inline : tools_json / truncate / redact
     # sont exécutés dans le thread writer (_materialize_db_row). Estimation
@@ -982,6 +1017,26 @@ async def _save_request(
                     geo_blocked = _g.get("blocked")
         except Exception:
             pass
+    # [Étape 2 — O2] persistance free_status/paid_status corrélés par req_id :
+    # le push C1 (jambe free, au swap) a déposé {free_model, free_status} dans
+    # _FALLBACK_CTX ; le site paid passe paid_status explicitement. Peek ici
+    # (SANS pop — le pop one-shot reste à l'émission B1 corrélée). Logging +
+    # DB seulement, jamais de body (C0). Aucun changement endpoint/géo (X1-X2).
+    if free_status is None:
+        try:
+            _fb = (_FALLBACK_CTX.get(str(req_id)) or _FALLBACK_CTX_LAST.get(str(req_id))) if req_id else None
+            if _fb is not None:
+                free_status = _fb.get("free_status")
+        except Exception:
+            pass
+    if free_status is not None or paid_status is not None:
+        try:
+            _debug(
+                f"  [fallback] req_id={req_id} persist free_status={free_status} "
+                f"paid_status={paid_status} model={model!r}"
+            )
+        except Exception:
+            pass
     # normalize geo_allowed list → string for DB
     if isinstance(geo_allowed, list):
         geo_allowed = ",".join(geo_allowed)
@@ -1014,6 +1069,8 @@ async def _save_request(
         1 if geo_via_vpn else 0,
         geo_allowed,
         station,
+        free_status,
+        paid_status,
     )
     item = _DbRowRaw(
         head,
@@ -1071,6 +1128,9 @@ async def _save_request(
                 "geo_direct_ip": geo_direct_ip,
                 "geo_via_vpn": bool(geo_via_vpn),
                 "geo_allowed": geo_allowed,
+                # [Étape 2 — O2] jambes fallback corrélées par req_id (SSE temps réel).
+                "free_status": free_status,
+                "paid_status": paid_status,
                 "tools": tools or [],
                 "tools_used": tools_used_deduped,
             },
@@ -1218,9 +1278,18 @@ except ImportError:
 def _serialize_json_body(body) -> bytes:
     """Pré-sérialise le corps JSON une seule fois (orjson) — les bytes sont
     réutilisés tels quels entre retries/hedges au lieu de re-payer un dumps
-    stdlib sur la loop à chaque tentative (équivalent de json=body)."""
+    stdlib sur la loop à chaque tentative (équivalent de json=body).
+    [tool-names ≤64] strip défensif de la clé privée _tool_name_map :
+    la map aller→retour ne doit JAMAIS être sérialisée à l'upstream
+    (les callers la poppent en local pour le restore-retour)."""
     if isinstance(body, (bytes, bytearray, memoryview)):
         return bytes(body)
+    if isinstance(body, dict) and _TOOL_NAME_MAP_KEY in body:
+        # Copie filtrante : ne JAMAIS muter le dict appelant — la map
+        # aller→retour doit survivre aux sends pour le restore-retour
+        # (pops aux restores non-stream, slot SSE en stream). Alloc
+        # seulement quand la map est présente (noms >64, cas rare).
+        body = {k: v for k, v in body.items() if k != _TOOL_NAME_MAP_KEY}
     return _json_dumps(body)
 
 
@@ -3004,6 +3073,32 @@ def _build_metrics_text() -> str:
     except Exception as e:
         _debug(f"  [metrics] build échoué (partiel): {e}")
 
+    # [Étape 2 — O3] compteurs fallback/failover par cause (familles counter).
+    # Fail-soft : snapshot sous lock, émission hors lock, jamais de raise.
+    # Toujours émises (même à zéro) pour la cause quota_429 — les dashboards
+    # peuvent alerter dessus sans gérer l'absence de série.
+    try:
+        with _FB_METRICS_LOCK:
+            _fb_snap = dict(_FB_FALLBACK_COUNTS)
+            _fo_snap = dict(_FB_FAILOVER_COUNTS)
+        lines.append("# HELP proxy_fallback_total fallback free→paid par cause")
+        lines.append("# TYPE proxy_fallback_total counter")
+        for _cause in _FB_FALLBACK_CAUSES:
+            _v = _fb_snap.get(("free_to_paid", _cause), 0)
+            lines.append(f'proxy_fallback_total{{leg="free_to_paid",cause="{_cause}"}} {_v}')
+        for (_leg, _cause), _v in sorted(_fb_snap.items()):
+            if _leg != "free_to_paid" or _cause in _FB_FALLBACK_CAUSES:
+                continue
+            lines.append(f'proxy_fallback_total{{leg="{_leg}",cause="{_cause}"}} {_v}')
+        lines.append("# HELP proxy_failover_total failover paid inter-clés / gardes par cause")
+        lines.append("# TYPE proxy_failover_total counter")
+        for (_leg, _cause, _outcome), _v in sorted(_fo_snap.items()):
+            lines.append(
+                f'proxy_failover_total{{leg="{_leg}",cause="{_cause}",outcome="{_outcome}"}} {_v}'
+            )
+    except Exception as e:
+        _debug(f"  [metrics] compteurs O3 échoués (partiel): {e}")
+
     return "\n".join(lines) + "\n"
 
 
@@ -3242,6 +3337,71 @@ def _cb_record_success(endpoint: str):
 def _cb_record_failure(endpoint: str):
     """Record a failed request to this endpoint."""
     _get_cb(endpoint).record_failure()
+
+
+# ── Circuit breaker GLOBAL 429 ([PLAN-corrections-429 E3/P14]) ──
+
+_G429_THRESHOLD = int(yaml_get("circuit_breaker", "global_429_threshold", 10))
+_G429_WINDOW = float(yaml_get("circuit_breaker", "global_429_window", 30))
+_G429_BACKOFF = float(yaml_get("circuit_breaker", "global_429_backoff", 15))
+_g429_hits: deque = deque()
+_g429_open_until = 0.0
+
+
+def _record_global_429() -> None:
+    global _g429_open_until
+    now = time.monotonic()
+    hits = _g429_hits
+    hits.append(now)
+    while hits and now - hits[0] > _G429_WINDOW:
+        hits.popleft()
+    if len(hits) >= _G429_THRESHOLD:
+        count = len(hits)
+        _g429_open_until = now + _G429_BACKOFF
+        hits.clear()
+        _debug(
+            f"  [g429] breaker OPEN: {count} upstream 429s in {_G429_WINDOW:.0f}s "
+            f"→ backoff {_G429_BACKOFF:.0f}s"
+        )
+
+
+def _global_429_remaining() -> float:
+    return max(0.0, _g429_open_until - time.monotonic())
+
+
+class Global429BackoffMiddleware:
+    """[PLAN-corrections-429 E3/P14] Coupe-circuit global anti-thundering-herd.
+
+    Quand trop de 429 upstream viennent d'être observés (fenêtre glissante),
+    les nouvelles requêtes sont rejetées en 503 + Retry-After au lieu
+    d'aller saturer l'upstream. Raw ASGI, zéro copie.
+    """
+
+    _SKIP_PREFIXES = ("/api/", "/static/", "/health")
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and not scope.get("path", "").startswith(self._SKIP_PREFIXES):
+            wait = _global_429_remaining()
+            if wait > 0:
+                resp = JSONResponse(
+                    {
+                        "error": {
+                            "message": "upstream 429 storm — global backoff active",
+                            "type": "rate_limit_error",
+                        }
+                    },
+                    status_code=503,
+                    headers={"Retry-After": str(int(wait) + 1)},
+                )
+                await resp(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
+
+
+app.add_middleware(Global429BackoffMiddleware)
 
 
 # ── HTTP helpers with circuit breaker ────────────────────────────
@@ -4285,11 +4445,16 @@ async def _do_free_request_curl_cffi(
     # On ne bad-mark le station QUE si le SOCKS5 (dernier) échoue aussi
     # (tunnel vraiment mort).
     http_fb = _http_fallback_proxy(proxy_url)
-    proxies_to_try = []
+    proxies_to_try: list = []
     if http_fb:
         proxies_to_try.append(http_fb)
     if proxy_url:
         proxies_to_try.append(proxy_url)
+    if not proxies_to_try:
+        # Mode direct (proxy_url=None) : on tente quand même une fois en
+        # direct — sinon la boucle ne tourne jamais et ``raise last_exc``
+        # lève None (TypeError: exceptions must derive from BaseException).
+        proxies_to_try.append(None)
     last_exc = None
     for attempt_i, attempt_proxy in enumerate(proxies_to_try):
         is_last = attempt_i == len(proxies_to_try) - 1
@@ -4379,8 +4544,11 @@ async def _hedged_fetch(cands, body: dict, headers: dict, endpoint: str, forced_
 
     cands: list of stations sorted by routing preference (pick_candidates).
     Limited to hedge_max+1 to avoid abuse. Stagger = hedge_delay_ms per station.
-    Returns (resp, winner_station). Losers are cancelled (CancelledError silent,
-    no bad-mark). Only winner increments quota via pool.note_hedge_winner().
+    Returns (resp, winner_station). Losers are cancelled (CancelledError silent).
+    [PLAN-corrections-429 G1/G5] Losers that COMPLETED with a 429 are
+    bad-marked individually (cooldown and/or rotation per on_429_action)
+    even when another station wins — only the winner increments quota via
+    pool.note_hedge_winner().
     """
     if not cands or len(cands) < 2:
         raise ValueError("hedge needs ≥2 candidates")
@@ -4393,7 +4561,10 @@ async def _hedged_fetch(cands, body: dict, headers: dict, endpoint: str, forced_
     max_cands = min(len(cands), hedge_max + 1)
     cands = cands[:max_cands]
     try:
-        stagger = float(getattr(_free_ip_pool, "_free_parallel_hedge_delay_ms", 300) or 300) / 1000.0
+        # NOTE: explicit 0 = launch all hedges immediately (no stagger).
+        # ``or 300`` would silently turn 0 into 300 ms — only None falls back.
+        _raw_delay = getattr(_free_ip_pool, "_free_parallel_hedge_delay_ms", 300)
+        stagger = float(300 if _raw_delay is None else _raw_delay) / 1000.0
     except Exception:
         stagger = 0.3
     stagger = max(0.0, min(2.0, stagger))
@@ -4435,6 +4606,9 @@ async def _hedged_fetch(cands, body: dict, headers: dict, endpoint: str, forced_
     err_resp = None
     err_station = None
     err_task = None
+    # [PLAN-corrections-429 G1/G5] stations ayant COMPLÉTÉ avec un 429 :
+    # bad-mark individuel même si une autre station gagne la course.
+    _hedge_stations_429: list = []  # [(station, retry_after_str)]
     # overall hedge timeout: generous (connect 10 + read 600, but hedge should not wait forever)
     # we wait until first success; if all fail, raise last error
     last_exc = None
@@ -4460,6 +4634,15 @@ async def _hedged_fetch(cands, body: dict, headers: dict, endpoint: str, forced_
                         winner_station = tasks.get(d)
                         winner_task = d
                         break
+                    # [PLAN-corrections-429 G5] collecte des 429 complétés —
+                    # bad-mark individuel des perdantes (§G losing-429), même
+                    # si une autre station gagne ensuite la course.
+                    if getattr(resp, "status_code", 500) == 429:
+                        try:
+                            _ra = (resp.headers.get("retry-after", "") if getattr(resp, "headers", None) else "") or ""
+                        except Exception:
+                            _ra = ""
+                        _hedge_stations_429.append((tasks.get(d), _ra))
                     if err_resp is None:
                         err_resp, err_station, err_task = resp, tasks.get(d), d
                 if winner_resp is not None:
@@ -4514,7 +4697,10 @@ async def _hedged_fetch(cands, body: dict, headers: dict, endpoint: str, forced_
                         pass
         # no winner <400 : filet = la première erreur HTTP reçue (comportement
         # historique préservé en dernier recours), sinon raise.
-        if err_resp is not None:
+        # [PLAN-corrections-429 G5] le filet ne s'applique que si AUCUN <400
+        # n'a gagné : sans ce garde, une 429 rapide écrasait un 200 lent
+        # arrivé ensuite (l'ancien bug §14.1.5 que le filet devait corriger).
+        if winner_resp is None and err_resp is not None:
             winner_resp, winner_station, winner_task = err_resp, err_station, err_task
         if winner_resp is not None:
             # [v10 §14.1.5] la compta hedge ne compte que les VRAIS wins :
@@ -4525,6 +4711,17 @@ async def _hedged_fetch(cands, body: dict, headers: dict, endpoint: str, forced_
                         _free_ip_pool.note_hedge_winner(winner_station, primary=primary)
                 except Exception:
                     pass
+                # [PLAN-corrections-429 G5] les perdantes ayant complété avec
+                # un 429 sont bad-markées individuellement (cooldown et/ou
+                # rotation selon on_429_action) — la gagnante continue de servir.
+                if _hedge_stations_429:
+                    try:
+                        _free_model_429 = str(body.get("model") or body.get("original_model") or "")
+                    except Exception:
+                        _free_model_429 = ""
+                    for _st429, _ra429 in _hedge_stations_429:
+                        if _st429 is not None and _st429 is not winner_station:
+                            _mark_free_stations_429(_free_model_429, _ra429, stations=[_st429], forced_pool=forced_pool)
             # need to ensure free_ip / identity context for downstream logging
             try:
                 ip = getattr(winner_station, "current_ip", None) or getattr(winner_station, "pid", "") or ""
@@ -5320,6 +5517,9 @@ async def _direct_country() -> str:
 # FRESH key (the 429 that triggered the rotation only blocks the
 # exhausted IP, never the model on the new IP).
 _free_model_cooldowns: dict[str, float] = {}  # "model|ip" -> monotonic expiry
+# [PLAN-corrections-429 P7] F-H3 convention (threading.Lock for sync+async mix):
+# sweep vs set could otherwise lose writes — the GIL only prevents corruption.
+_free_cooldown_lock = threading.Lock()
 _FREE_COOLDOWN_MAX = 86400  # hard ceiling: retry-after beyond 24 h → default below
 # [incident 17/08 PAYANT] zen's free API 429 (FreeUsageLimitError) carries NO
 # retry-after header. The old 3600 s default meant ONE 429 — even a transient
@@ -5390,33 +5590,43 @@ def _sweep_free_cooldowns() -> int:
     the len()>32 guard in _set_free_cooldown remains a soft-limit for
     transient bursts between ticks.
     """
-    now = time.monotonic()
+    with _free_cooldown_lock:
+        removed = _sweep_free_cooldowns_locked()
+    if removed:
+        _debug(f"  [cooldown] swept {removed} expired free-cooldown entries")
+    return removed
+
+
+def _sweep_free_cooldowns_locked(now: float | None = None) -> int:
+    """[PLAN-corrections-429 P7] Lock-held variant: caller owns _free_cooldown_lock."""
+    if now is None:
+        now = time.monotonic()
     expired = [k for k, t in _free_model_cooldowns.items() if t <= now]
     for k in expired:
         del _free_model_cooldowns[k]
-    if expired:
-        _debug(f"  [cooldown] swept {len(expired)} expired free-cooldown entries")
     return len(expired)
 
 
 def _set_free_cooldown(free_model: str, seconds: float, station=None) -> None:
     key = _free_cooldown_key(free_model, station)
     expiry = time.monotonic() + seconds
-    # soft-limit ([plan 18/08 §4.2]): the periodic _sweep_free_cooldowns is
-    # the real memory bound; this only avoids a burst between two ticks.
-    if len(_free_model_cooldowns) > 32:
-        _sweep_free_cooldowns()
-    _free_model_cooldowns[key] = expiry
+    with _free_cooldown_lock:
+        # soft-limit ([plan 18/08 §4.2]): the periodic _sweep_free_cooldowns is
+        # the real memory bound; this only avoids a burst between two ticks.
+        if len(_free_model_cooldowns) > 32:
+            _sweep_free_cooldowns_locked()
+        _free_model_cooldowns[key] = expiry
     _log(f"  FREE COOLDOWN: {key} for {seconds:.0f}s")
 
 
 def _free_cooldown_active(free_model: str, station=None) -> bool:
     key = _free_cooldown_key(free_model, station)
-    expiry = _free_model_cooldowns.get(key, 0.0)
-    if expiry > 0 and time.monotonic() < expiry:
-        return True
-    if expiry > 0:
-        del _free_model_cooldowns[key]
+    with _free_cooldown_lock:
+        expiry = _free_model_cooldowns.get(key, 0.0)
+        if expiry > 0 and time.monotonic() < expiry:
+            return True
+        if expiry > 0:
+            del _free_model_cooldowns[key]
     return False
 
 
@@ -5484,7 +5694,90 @@ def _free_stations_exhausted(free_model: str) -> bool:
     return True
 
 
-def _on_free_429_stream(free_model: str, retry_after: str = "", forced_pool=None) -> bool:
+def _mark_free_stations_429(free_model: str, retry_after: str = "", stations=None, forced_pool=None) -> None:
+    """[PLAN-corrections-429 G1/G3/G5] Action 429 immédiate par station.
+
+    Chaque station listée est traitée INDÉPENDAMMENT : cooldown si
+    ``on_429_action`` inclut cooldown, rotation si elle inclut rotate.
+    ``stations=None`` → la station de la tentative courante
+    (``_free_attempt_station``). Les autres stations continuent de servir.
+    """
+    _record_global_429()
+    if stations is None:
+        stations = [_free_attempt_station()]
+    seen = set()
+    for station in stations:
+        if station is None or id(station) in seen:
+            continue
+        seen.add(id(station))
+        _action_429 = _cfg_settings.get_429_action()
+        if _action_429 != "rotate":
+            _set_free_cooldown(free_model, _free_429_cooldown_seconds(retry_after), station)
+        if _action_429 != "cooldown" and _free_ip_pool:
+            try:
+                _free_ip_pool.on_quota_exhausted(station, forced_pool=forced_pool)
+            except TypeError:
+                _free_ip_pool.on_quota_exhausted(station)
+
+
+def _free_failover_exhausted(free_model: str, retry_after: str = "", stations=None) -> None:
+    """[PLAN-corrections-429 G4] Cooldown "sentinelle" épuisement-compte.
+
+    En routing=failover la sticky station reçoit tout le trafic : ≥3 429
+    consécutifs sur des IPs DIFFÉRENTES = quota épuisé au niveau COMPTE,
+    pas per-IP — une rotation de plus ne servirait à rien. On pose donc un
+    cooldown couvrant TOUTES les stations connues (chaque station reçoit
+    sa propre clé (modèle, IP)), d'une durée honnête
+    (``_free_429_cooldown_seconds``). Enregistrée comme callback pool via
+    ``set_failover_exhausted_cb`` (la pool appelle ``cb(station)`` — le
+    modèle est porté par closure) ; appelable aussi directement.
+    """
+    cands = list(stations) if stations else []
+    if _free_ip_pool and getattr(_free_ip_pool, "_stations", None):
+        for st in _free_ip_pool._stations:
+            if st is not None and all(st is not c for c in cands):
+                cands.append(st)
+    if not cands:
+        cands = [_free_attempt_station()]
+    secs = _free_429_cooldown_seconds(retry_after)
+    for station in cands:
+        if station is None:
+            continue
+        try:
+            _set_free_cooldown(free_model, secs, station)
+        except Exception:
+            pass
+    _log(f"  FREE {free_model!r} FAILOVER-CASCADE: épuisement compte présumé → cooldown {secs:.0f}s sur {len([s for s in cands if s is not None])} station(s)")
+
+
+def _register_failover_exhausted_cb(free_model_getter=None) -> None:
+    """[PLAN-corrections-429 G4] Branche le hook pool→opencode.
+
+    La pool appelle ``cb(station)`` sans connaître le modèle free ; la
+    closure résout le modèle courant (getter) ou reçoit ``cb(station,
+    free_model)`` — on accepte les deux signatures par robustesse.
+    Idempotent (ré-appelable à chaque requête sans effet de bord).
+    """
+    pool = _free_ip_pool
+    if pool is None or not hasattr(pool, "set_failover_exhausted_cb"):
+        return
+    def _cb(station, free_model=""):
+        try:
+            model = free_model
+            if not model and callable(free_model_getter):
+                model = free_model_getter() or ""
+            if not model:
+                return
+            _free_failover_exhausted(str(model), "", stations=[station])
+        except Exception:
+            pass
+    try:
+        pool.set_failover_exhausted_cb(_cb)
+    except Exception:
+        pass
+
+
+def _on_free_429_stream(free_model: str, retry_after: str = "", forced_pool=None, failed_stations=None) -> bool:
     """Free endpoint 429 during streaming: cooldown + paid fallback.
 
     Returns True when the request must be REFUSED (strict_free mode and
@@ -5501,16 +5794,21 @@ def _on_free_429_stream(free_model: str, retry_after: str = "", forced_pool=None
     Axe B: ``forced_pool`` is propagated to the background rotation so
     the rotated station stays within geo-allowed countries.
 
+    [PLAN-corrections-429 G3] ``failed_stations`` porte les stations
+    échouées (hedge N stations) — défaut : la station courante.
+
     No-op when VPN rotation is off.
     """
-    station = _free_attempt_station()
-    _set_free_cooldown(free_model, _free_429_cooldown_seconds(retry_after), station)
-    if _free_ip_pool:
-        try:
-            _free_ip_pool.on_quota_exhausted(station, forced_pool=forced_pool)
-        except TypeError:
-            _free_ip_pool.on_quota_exhausted(station)
-    return bool(IP_ROTATION.get("strict_free", False)) and _free_stations_exhausted(free_model)
+    _mark_free_stations_429(
+        free_model, retry_after,
+        stations=failed_stations if failed_stations else [_free_attempt_station()],
+        forced_pool=forced_pool,
+    )
+    if IP_ROTATION.get("strict_free", False):
+        if _free_exception_fallback_mode() == "direct":
+            return False
+        return _free_stations_exhausted(free_model)
+    return _free_stations_exhausted(free_model)
 
 
 def _free_usage_ip(station=None) -> str:
@@ -5560,7 +5858,7 @@ def _free_quota_exhausted_response(exc: FreeQuotaExhausted, protocol: str):
     return resp
 
 
-async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=None):
+async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=None, req_id=None):
     """Try the free model equivalent before falling back to paid.
 
     If the model has a free equivalent in FREE_MODEL_MAP, attempt the request
@@ -5619,7 +5917,13 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
     #     _debug(f"  [free] skipping free model {free_model!r} (no station with a fresh key)")
     #     return None
 
-    _debug(f"  [free] trying free model {free_model!r} instead of {model_id!r}")
+    _debug(f"  [free] req_id={req_id} trying free model {free_model!r} instead of {model_id!r}")
+    # [PLAN-corrections-429 G4] branche le hook pool→opencode avec le modèle
+    # courant en closure (la pool appelle cb(station) sans connaître le modèle).
+    try:
+        _register_failover_exhausted_cb(lambda: free_model)
+    except Exception:
+        pass
 
     try:
         station = _free_ip_pool._best_station(forced_pool) if _free_ip_pool else None
@@ -5671,6 +5975,15 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
         if "input" in body:
             free_body = dict(body)
             free_body["model"] = free_model
+            # Sanitize-aller branche verbatim (client déjà en format Responses) :
+            # mêmes helpers que _chat_to_responses_request, map transportée par
+            # requête (clé privée _tool_name_map), stripée avant envoi wire.
+            _vb_tools = free_body.get("tools")
+            if isinstance(_vb_tools, list) and _vb_tools:
+                _vb_tools, _vb_map = sanitize_tool_names(_vb_tools)
+                free_body["tools"] = _vb_tools
+                if _vb_map:
+                    free_body[_TOOL_NAME_MAP_KEY] = _vb_map
         elif protocol == "anthropic":
             free_body = _anthropic_to_responses_request({**body, "model": free_model})
         else:
@@ -5678,6 +5991,9 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
     else:
         free_body = dict(body)
         free_body["model"] = free_model
+    # [tool-names ≤64] strip de la clé privée AVANT tout envoi wire : la map
+    # est conservée pour le restore-retour, jamais sérialisée à l'upstream.
+    _tool_name_map = free_body.pop(_TOOL_NAME_MAP_KEY, None)
     free_body = ensure_min_tokens(free_body)
     _free_is_responses = _is_responses
 
@@ -5715,10 +6031,19 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
                 _hedge_cands = _free_ip_pool.pick_candidates(forced_pool)
                 # bound already in _hedged_fetch via hedge_max, but we check length
                 if len(_hedge_cands) >= 2:
-                    _debug(f"  [free] hedge start N={len(_hedge_cands)} stagger={_free_ip_pool._free_parallel_hedge_delay_ms}ms")
+                    _debug(f"  [free] hedge start N={len(_hedge_cands)} stagger={getattr(_free_ip_pool, '_free_parallel_hedge_delay_ms', '?')}ms")
                     try:
                         resp, winner = await _hedged_fetch(_hedge_cands, free_body, free_headers, free_endpoint, forced_pool)
                         # hedged_fetch already did note_hedge_winner + _current_free_attempt
+                        # [PLAN-corrections-429 G1] filet 429 = TOUTES les stations
+                        # hedged ont 429 → bad-mark chacune (le handling partagé
+                        # ci-dessous reste idempotent sur la gagnante-filet).
+                        if resp is not None and getattr(resp, "status_code", 500) == 429:
+                            try:
+                                _ra_all = (resp.headers.get("retry-after", "") if getattr(resp, "headers", None) else "") or ""
+                            except Exception:
+                                _ra_all = ""
+                            _mark_free_stations_429(free_model, _ra_all, stations=list(_hedge_cands), forced_pool=forced_pool)
                         station = winner
                         if winner and getattr(winner, "current_ip", None):
                             free_ip = winner.current_ip
@@ -5791,9 +6116,10 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
                 )
                 station = attempt  # cooldown key + on_quota_exhausted must target THIS IP
                 if resp.status_code == 429 and _free_used < free_max:
-                    # 429 = this station's bucket exhausted → cooldown
-                    # (model, IP) + background rotation, then continue on a
-                    # FRESH station while the budget lasts ([plan 19/08 §1]:
+                    # 429 = this station's bucket exhausted → action immédiate
+                    # sur CETTE station (helper G1/G3/G5 : cooldown et/ou
+                    # rotation selon on_429_action), puis continue sur une
+                    # station FRAÎCHE tant que le budget dure ([plan 19/08 §1]:
                     # each attempt a fresh IP; a same-IP retry would burn
                     # the budget on a guaranteed ✘).
                     _log_free_model_usage(
@@ -5807,16 +6133,12 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
                         _free_elapsed,
                         ip=free_ip,
                     )
-                    _set_free_cooldown(
+                    _mark_free_stations_429(
                         free_model,
-                        _free_429_cooldown_seconds(resp.headers.get("retry-after", "") or ""),
-                        attempt,
+                        resp.headers.get("retry-after", "") or "",
+                        stations=[attempt],
+                        forced_pool=forced_pool,
                     )
-                    if _free_ip_pool:
-                        try:
-                            _free_ip_pool.on_quota_exhausted(attempt, forced_pool=forced_pool)
-                        except TypeError:
-                            _free_ip_pool.on_quota_exhausted(attempt)
                     _log(
                         f"  FREE {free_model!r} RATE LIMITED (429) on station {attempt._station} → "
                         f"retry station fraîche (essai {_free_used + 1}/{free_max})"
@@ -5840,7 +6162,7 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
                         _b400 = (getattr(resp, "text", "") or "")[:512]
                     except Exception:
                         _b400 = ""
-                    _debug(f"  [free-400] {free_model!r} 400 station {attempt._station} ({_free_used}/{free_max}) body={_b400!r} -> retry fraiche")
+                    _debug(f"  [free-400] req_id={req_id} leg=free {free_model!r} 400 station {attempt._station} ({_free_used}/{free_max}) body={_b400!r} -> retry fraiche")
                     _log_free_model_usage(model_id, free_model, free_api_key, free_workspace, 400, 0, 0, _free_elapsed, ip=free_ip)
                     resp = None
                     continue
@@ -5881,8 +6203,10 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
                 _log(
                     f"  FREE attempts exhausted — no direct fallback (proxy_mode={proxy_mode}) → paid fallback"
                 )
-                if IP_ROTATION.get("strict_free", False) and _free_stations_exhausted(free_model):
-                    raise FreeQuotaExhausted(_free_429_cooldown_seconds(""))
+                # [GUI strict_free] tunnels épuisés + strict/refuser → refus
+                # local, ZÉRO jambe paid (même avec clés payantes valides).
+                if IP_ROTATION.get("strict_free", False):
+                    raise FreeQuotaExhausted(str(int(_free_429_cooldown_seconds(""))))
                 return None
             _log("  FREE via VPN tunnels FAILED → direct fallback (residential IP)")
             try:
@@ -5951,12 +6275,12 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
                     _log_free_model_usage(model_id, free_model, free_api_key, free_workspace, 502, ip=free_ip)
                     return None
             if protocol == "anthropic":
-                cdata = _responses_to_anthropic_response(rdata, free_model)
+                cdata = _responses_to_anthropic_response(rdata, free_model, _tool_name_map)
                 usage = cdata.get("usage", {})
                 tokens_in = usage.get("input_tokens", 0)
                 tokens_out = usage.get("output_tokens", 0)
             else:
-                cdata = _responses_to_chat_response(rdata, free_model)
+                cdata = _responses_to_chat_response(rdata, free_model, _tool_name_map)
                 usage = cdata.get("usage", {})
                 tokens_in = usage.get("prompt_tokens", 0)
                 tokens_out = usage.get("completion_tokens", 0)
@@ -6087,22 +6411,20 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
             f"  FREE {free_model!r} RATE LIMITED (429) retry-after={retry_after}s → falling back to paid {model_id!r}"
         )
 
-        # Per-(model, IP) cooldown honoring the upstream retry-after ([4])
-        # + background IP rotation ([0]/[42]): the key is (model, the
-        # station's current IP), so the rotation makes the next free
-        # attempt a fresh key. (Non-final VPN 429s already did this in the
-        # multi-attempt loop — idempotent here.)
-        _set_free_cooldown(free_model, _free_429_cooldown_seconds(retry_after), station)
-        if _free_ip_pool:
-            try:
-                _free_ip_pool.on_quota_exhausted(station, forced_pool=forced_pool)
-            except TypeError:
-                _free_ip_pool.on_quota_exhausted(station)
+        # [PLAN-corrections-429 G1/G3/G5] Action immédiate sur LA station
+        # concernée (helper unifié : cooldown et/ou rotation selon
+        # on_429_action). Idempotent avec la boucle multi-attempt.
+        # Sauf sortie de hedge : le câblage G1 a DÉJÀ bad-marké les N
+        # stations hedged — re-marquer ici re-rotaterait la gagnante-filet
+        # (le cooldown est idempotent, la rotation ne l'est pas).
+        if not _hedge_done:
+            _mark_free_stations_429(free_model, retry_after, stations=[station], forced_pool=forced_pool)
 
-        # strict_free (GUI): when EVERY station is exhausted, refuse
-        # instead of paying — the caller answers 429/503 with Retry-After.
-        if IP_ROTATION.get("strict_free", False) and _free_stations_exhausted(free_model):
-            raise FreeQuotaExhausted(retry_after)
+        if IP_ROTATION.get("strict_free", False):
+            if _free_exception_fallback_mode() == "direct":
+                return None
+            if _free_stations_exhausted(free_model):
+                raise FreeQuotaExhausted(retry_after)
 
         return None
 
@@ -6113,9 +6435,22 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
         _dbg_resp = _redact(getattr(resp, "text", "")[:2000]) if hasattr(resp, "text") else ""
     except Exception:
         _dbg_body, _dbg_resp = "", ""
+    # [GUI strict_free] Activer les modèles gratuits = ON + mode épuisement
+    # strict/refuser → TOUT échec free non-429 refuse, ZÉRO jambe paid, même
+    # avec des clés payantes valides. Seul le fallback-payant autorise paid.
+    if IP_ROTATION.get("strict_free", False):
+        # [Étape 2A — A2] + [GUI strict_free] : refus au lieu du fallback
+        # paid silencieux (bruit trompeur « model/region »).
+        _debug(
+            f"  [free] req_id={req_id} leg=free→refuse {free_model!r} free_status={resp.status_code} (strict_free, no paid leg)"
+        )
+        _set_free_cooldown(free_model, 60, station)
+        raise FreeQuotaExhausted(resp.headers.get("retry-after", "") or "60")
     _debug(
-        f"  [free] {free_model!r} returned {resp.status_code} body={_dbg_body[:2500]} resp={_dbg_resp[:2000]} → falling back to paid"
+        f"  [free] req_id={req_id} leg=free→paid {free_model!r} free_status={resp.status_code} body={_redact(_dbg_body, 500)} resp={_redact(_dbg_resp, 500)} → falling back to paid"
     )
+    _log_fallback(req_id, "free→paid", free_model, resp.status_code, model_id)  # [O1] unifié
+    _fallback_ctx_push(req_id, free_model, resp.status_code)  # [O1] push C1 au tail non-stream (uniforme stream/non-stream)
     _set_free_cooldown(free_model, 60, station)
     return None
 
@@ -6132,15 +6467,245 @@ def _unwrap_responses_envelope(data: dict) -> dict:
 
 
 def _is_retriable_datapolicy(resp) -> bool:
-    """V4 100% : 403/400 DataPolicyError / illegal invocation → retriable, sans pause_key."""
+    """[Étape 2B — B2/C3] UNIFIÉ : DataPolicyError = garde pré-forward, JAMAIS retriable.
+
+    Historique V4 : 403/400 DataPolicyError → retry same-key 1x (free : station
+    fraîche ; paid : même clé). Verdict Étape 2 : un opt-in workspace manquant
+    ne se répare JAMAIS par retry — la MÊME requête est vouée à l'échec
+    (prouvé : 97/97 bodies identiques, MODE B). Le retry aveugle double la
+    latence du 403 sans aucun bénéfice. Retourne donc toujours False ; la
+    détection du body vit dans _datapolicy_optin_info() (B1), consommée par la
+    garde pré-forward _check_datapolicy_guard() (B2) AVANT tout appel paid.
+    Conservé comme prédicat (et non supprimé) pour garder les call sites
+    compilables en mode garde désactivée — mais aucun chemin ne doit le
+    traiter comme "retryable" : tout retry DataPolicyError est supprimé.
+    """
+    return False
+
+
+def _datapolicy_optin_info(resp_or_text) -> str | None:
+    """[Étape 2B — B1] Extrait l'URL d'opt-in workspace d'un body DataPolicyError.
+
+    Retourne l'URL complète (https://opencode.ai/workspace/<id>/go) si le body
+    contient un DataPolicyError, sinon None. Accepte un objet response (avec
+    .text) ou une str. Cap 2000 chars — jamais de log du body entier.
+    """
     try:
-        code = getattr(resp, "status_code", 0)
-        if code not in (403, 400):
-            return False
-        txt = (getattr(resp, "text", "") or "")[:2000].lower()
-        return "datapolicy" in txt or "illegal invocation" in txt
+        if hasattr(resp_or_text, "text"):
+            txt = (getattr(resp_or_text, "text", "") or "")[:2000]
+        else:
+            txt = (resp_or_text or "")[:2000]
+        low = txt.lower()
+        if "datapolicy" not in low and "illegal invocation" not in low:
+            return None
+        import re
+
+        m = re.search(r"https://opencode\.ai/workspace/\S+?/go", txt)
+        if m:
+            return m.group(0).rstrip(".,)\"'}]")
+        return "opt-in requis (URL non extraite du body)"
     except Exception:
-        return False
+        return None
+
+
+def _datapolicy_client_message(optin_url: str | None, account_alias: str = "") -> str:
+    """[Étape 2B — B1] Message client explicite pour un 403 DataPolicyError.
+
+    Remplace le trompeur « model/region may be restricted » quand le body
+    upstream PROUVE un opt-in workspace manquant : cause exacte + URL
+    d'activation + alias de compte. Le fix réel reste côté compte opencode.ai.
+    """
+    alias = f" (compte {account_alias})" if account_alias else ""
+    url = optin_url or "opt-in requis (URL non extraite du body)"
+    return (
+        "Upstream DataPolicyError (403) — ce modèle exige l'opt-in data du "
+        f"workspace{alias} : {url}. Activez l'opt-in côté compte opencode.ai, "
+        "puis réessayez. Le retry ne peut pas réparer ce cas."
+    )
+
+
+def _check_datapolicy_guard(resp, account_alias: str = "") -> str | None:
+    """[Étape 2B — B2] Garde pré-forward DataPolicyError : body → message local.
+
+    À appeler sur TOUT 403 paid AVANT tout retry/failover : si le body prouve
+    un DataPolicyError, retourne le message client explicite (B1) — l'appelant
+    doit répondre immédiatement, SANS retry same-key ni bascule alt-key
+    (requête condamnée, C3 unifié). Retourne None si pas DataPolicyError
+    (vrai 403 région → texte région conservé + failover normal).
+    """
+    try:
+        if getattr(resp, "status_code", 0) != 403:
+            return None
+        url = _datapolicy_optin_info(resp)
+        if url is None:
+            return None
+        _debug(f"  [datapolicy-guard] 403 DataPolicyError → garde pré-forward (pas de retry) url={url}")
+        return _datapolicy_client_message(url, account_alias)
+    except Exception:
+        return None
+
+
+# ── Étape 2C — C1 : contexte fallback corrélé par req_id ─────────────
+# Threadé du site swap/fallback (jambe free) vers le site d'émission B1
+# (jambe paid 403) : le message client dit les deux jambes au lieu du seul
+# trompeur « model/region may be restricted ». Stockage clé = req_id
+# (même granularité que _save_request/_stream_error_response). Cap mémoire :
+# entrée pop() à la consommation + TTL implicite via _fallback_ctx_trim
+# (une requête fallback = une entrée, pas de croissance). Logging-only :
+# jamais de body brut, statuts + alias seulement.
+
+_FALLBACK_CTX: dict[str, dict] = {}
+_FALLBACK_CTX_MAX = 512
+# [Étape 2 — O2] dernière valeur consommée par le pop B1 (one-shot message) :
+# l'émission 403 (pop) précède TOUJOURS la persistance _save_request ; sans ce
+# registre, le peek O2 arriverait trop tard (entrée déjà poppée → free_status
+# None en DB). Même cap mémoire que _FALLBACK_CTX, logging-only (C0).
+_FALLBACK_CTX_LAST: dict[str, dict] = {}
+
+
+def _fallback_ctx_trim() -> None:
+    """Borne la taille des registres C1/O2 (plus vieilles entrées d'abord)."""
+    try:
+        while len(_FALLBACK_CTX) > _FALLBACK_CTX_MAX:
+            _FALLBACK_CTX.pop(next(iter(_FALLBACK_CTX)), None)
+        while len(_FALLBACK_CTX_LAST) > _FALLBACK_CTX_MAX:
+            _FALLBACK_CTX_LAST.pop(next(iter(_FALLBACK_CTX_LAST)), None)
+    except Exception:
+        pass
+
+
+def _fallback_ctx_push(req_id, free_model, free_status) -> None:
+    """Enregistre la jambe free au moment du swap free→paid (C1)."""
+    try:
+        if not req_id:
+            return
+        _FALLBACK_CTX[str(req_id)] = {
+            "free_model": str(free_model or "?"),
+            "free_status": int(free_status) if free_status is not None else "?",
+        }
+        _fallback_ctx_trim()
+    except Exception:
+        pass
+
+
+def _fallback_ctx_pop(req_id):
+    """Consomme le contexte C1 (émission B1 403) — one-shot par requête.
+
+    [O2] la valeur poppée est aussi copiée dans _FALLBACK_CTX_LAST pour la
+    persistance : l'émission 403 précède toujours _save_request, le peek O2
+    y retrouvera free_model/free_status (pop SANS copy = free_status None).
+    """
+    try:
+        if not req_id:
+            return None
+        _ctx = _FALLBACK_CTX.pop(str(req_id), None)
+        if _ctx is not None:
+            _FALLBACK_CTX_LAST[str(req_id)] = dict(_ctx)
+            _fallback_ctx_trim()
+        return _ctx
+    except Exception:
+        return None
+
+
+# [Étape 2 — O3] Compteurs fallback/failover par cause (Prometheus + /metrics).
+# Registres en mémoire, thread-safe (threading.Lock — mix sync/async, cf F-H3),
+# logging-only : aucun effet sur le routage. Familles exposées :
+#   proxy_fallback_total{leg="free_to_paid",cause="..."}
+#   proxy_failover_total{leg="paid",cause="...",outcome="alt_key|guard_skip"}
+# Causes free bornées (labels stables) : quota_429 / payload_400 /
+# upstream_5xx / tunnel_vide / other.
+_FB_METRICS_LOCK = threading.Lock()
+_FB_FALLBACK_COUNTS: dict[tuple[str, str], int] = {}
+_FB_FAILOVER_COUNTS: dict[tuple[str, str, str], int] = {}
+_FB_FALLBACK_CAUSES = ("quota_429", "payload_400", "upstream_5xx", "tunnel_vide", "other")
+
+
+def _fallback_cause(status) -> str:
+    """Bucketise un statut free en cause bornée (labels Prometheus stables)."""
+    try:
+        code = int(status)
+    except (TypeError, ValueError):
+        return "tunnel_vide"
+    if code == 429:
+        return "quota_429"
+    if code == 400:
+        return "payload_400"
+    if 500 <= code <= 599:
+        return "upstream_5xx"
+    if code <= 0:
+        return "tunnel_vide"
+    return "other"
+
+
+def _bump_fallback_counter(leg: str, cause: str) -> None:
+    """Incrémente un compteur fallback — fail-soft total (jamais de raise)."""
+    try:
+        with _FB_METRICS_LOCK:
+            _k = (str(leg), str(cause))
+            _FB_FALLBACK_COUNTS[_k] = _FB_FALLBACK_COUNTS.get(_k, 0) + 1
+    except Exception:
+        pass
+
+
+def _bump_failover_counter(leg: str, cause: str, outcome: str) -> None:
+    """Incrémente un compteur failover/garde paid — fail-soft total."""
+    try:
+        with _FB_METRICS_LOCK:
+            _k = (str(leg), str(cause), str(outcome))
+            _FB_FAILOVER_COUNTS[_k] = _FB_FAILOVER_COUNTS.get(_k, 0) + 1
+    except Exception:
+        pass
+
+
+def _reset_fallback_metrics() -> None:
+    """Remise à zéro des compteurs O3 (tests uniquement) — jamais en runtime."""
+    try:
+        with _FB_METRICS_LOCK:
+            _FB_FALLBACK_COUNTS.clear()
+            _FB_FAILOVER_COUNTS.clear()
+    except Exception:
+        pass
+
+
+def _log_fallback(req_id, leg, free_model, free_status, paid_model, account_alias=None) -> None:
+    """[O1] Log fallback unifié free→paid — même forme sur les 5 sites.
+
+    Logging-only : statuts + alias seulement, jamais de body brut (C0).
+    Le tag [fallback] commun rend le fallback requêtable en un grep.
+    [O3] + incrément du compteur proxy_fallback_total par cause.
+    """
+    try:
+        _alias = f" account={account_alias}" if account_alias else ""
+        _debug(
+            f"  [fallback] req_id={req_id} leg={leg} free {free_model!r} "
+            f"free_status={free_status} → paid {paid_model!r}{_alias}"
+        )
+        _bump_fallback_counter("free_to_paid", _fallback_cause(free_status))
+    except Exception:
+        pass
+
+
+def _correlated_403_message(msg, req_id):
+    """[Étape 2C — C1] Préfixe corrélé free→paid sur un message 403/503 payant.
+
+    msg = message B1 déjà calculé (DataPolicyError explicite OU texte région
+    conservé) ; préfixe « free <modèle> → <free_status>, paid fallback → »
+    seulement si un contexte C1 existe pour ce req_id (requête réellement
+    passée par le fallback). Sinon retourne msg inchangé (paid direct,
+    pas de corrélation à affirmer). Ne touche JAMAIS au statut HTTP — seul
+    le texte client est enrichi.
+    """
+    try:
+        ctx = _fallback_ctx_pop(req_id)
+        if not ctx:
+            return msg
+        prefix = (
+            f"free {ctx.get('free_model', '?')} → {ctx.get('free_status', '?')} "
+            "(échec jambe free), paid fallback → "
+        )
+        return prefix + (msg or "")
+    except Exception:
+        return msg
 
 
 async def _do_request_with_retry(endpoint, body, headers, protocol, retry_on_429=True):
@@ -6211,6 +6776,7 @@ async def _do_request_with_retry(endpoint, body, headers, protocol, retry_on_429
             if alt:
                 _debug(f"  ⟳ 429 failover: {failed_key[:8]}… → alias={alt.get('alias', '?')}")
                 _log("  429 on key, retrying with alternative key")
+                _bump_failover_counter("paid", "quota_429", "alt_key")  # [O3]
                 headers = _get_auth_headers(protocol, entry=alt)
                 continue  # retry immediately without incrementing attempt
 
@@ -6229,6 +6795,7 @@ async def _do_request_with_retry(endpoint, body, headers, protocol, retry_on_429
             if alt:
                 _debug(f"  ⟳ 401 failover: {failed_key[:8]}… → alias={alt.get('alias', '?')}")
                 _log("  401 on key (invalid/revoked), retrying with alternative key")
+                _bump_failover_counter("paid", "auth_401", "alt_key")  # [O3]
                 headers = _get_auth_headers(protocol, entry=alt)
                 continue  # retry immediately without incrementing attempt
 
@@ -6236,36 +6803,36 @@ async def _do_request_with_retry(endpoint, body, headers, protocol, retry_on_429
         # 403 = region/model blocked for the key (e.g. RegionError). Pause the
         # key and try another account before surfacing anything to the client.
         if retry_on_429 and resp.status_code == 403 and len(API_KEYS) > 1:
-            # V4 : DataPolicyError ne doit pas pauser la clé — c'est un body policy hit
-            if _is_retriable_datapolicy(resp):
-                _debug(f"  [datapolicy] 403 DataPolicyError → retry same-key 1x (attempt {attempt + 1})")
-                _log("  403 DataPolicyError → retry same-key (body déjà corrigé par Patch A)")
-                await asyncio.sleep(1.0)
-                attempt += 1
-                if attempt < max_retries:
-                    continue
-            else:
-                failed_key = _key_from_headers(headers, protocol)
-                try:
-                    _err_body = resp.text[:500] if hasattr(resp, "text") else str(resp.content[:500])
-                except Exception:
-                    _err_body = "(unable to read response body)"
-                _debug(f"  [auth] 403 response body: {_redact(_err_body, 500)}")
-                _key_pauser.pause_key(failed_key, 1800, "403 Forbidden (region/model not allowed)")
-                alt = _find_alternative_key(failed_key)
-                if alt:
-                    _debug(f"  ⟳ 403 failover: {failed_key[:8]}… → alias={alt.get('alias', '?')}")
-                    _log("  403 on key, retrying with alternative key")
-                    headers = _get_auth_headers(protocol, entry=alt)
-                    continue  # retry immediately without incrementing attempt
+            # [Étape 2B — B2/C3] UNIFIÉ : DataPolicyError = JAMAIS retryable.
+            # _is_retriable_datapolicy() retourne toujours False : le body policy
+            # hit se résout côté compte (opt-in workspace), pas en rejouant la
+            # même requête. La garde pré-forward _check_datapolicy_guard() aux
+            # sites d'émission (B1) produit le message client explicite avec URL.
+            # → pas de pause, pas de failover alt-key : remonter tel quel pour
+            # que le site B1 émette le message explicite immédiatement.
+            if _datapolicy_optin_info(resp) is not None:
+                _debug("  [datapolicy-guard] paid 403 DataPolicyError → pas de failover (requête condamnée)")
+                _bump_failover_counter("paid", "datapolicy_403", "guard_skip")  # [O3]
+                return resp, headers
+            failed_key = _key_from_headers(headers, protocol)
+            try:
+                _err_body = resp.text[:500] if hasattr(resp, "text") else str(resp.content[:500])
+            except Exception:
+                _err_body = "(unable to read response body)"
+            _debug(f"  [auth] 403 response body: {_redact(_err_body, 500)}")
+            _key_pauser.pause_key(failed_key, 1800, "403 Forbidden (region/model not allowed)")
+            alt = _find_alternative_key(failed_key)
+            if alt:
+                _debug(f"  ⟳ 403 failover: {failed_key[:8]}… → alias={alt.get('alias', '?')}")
+                _log("  403 on key, retrying with alternative key")
+                _bump_failover_counter("paid", "region_403", "alt_key")  # [O3]
+                headers = _get_auth_headers(protocol, entry=alt)
+                continue  # retry immediately without incrementing attempt
 
-        # V4 : DataPolicyError même avec 1 seule clé (403/400) → 1 retry same-key sans pause
-        if _is_retriable_datapolicy(resp) and attempt < max_retries - 1:
-            _debug(f"  [datapolicy] {resp.status_code} DataPolicyError → retry same-key 1x (attempt {attempt + 1})")
-            _log(f"  {resp.status_code} DataPolicyError → retry same-key")
-            await asyncio.sleep(1.0)
-            attempt += 1
-            continue
+        # [Étape 2B — B2/C3] UNIFIÉ : le retry same-key DataPolicyError (V4,
+        # multi-clé comme single-clé) est SUPPRIMÉ — _is_retriable_datapolicy()
+        # retourne toujours False. Rejouer la même requête ne résout jamais un
+        # policy hit : fix côté compte (opt-in workspace, voir message B1).
 
         # Retry on 502/503/504 with backoff — DOES consume a retry attempt
         if resp.status_code in _RETRYABLE_STATUSES and attempt < max_retries - 1:
@@ -6322,6 +6889,8 @@ async def _save_and_log_request(
     response_body=None,
     free_model_ip=None,
     identity=None,
+    free_status=None,
+    paid_status=None,
 ):
     """Log success and save to DB with success=True."""
     # Free-channel stamp first: the IP/identity of the free attempt beats the
@@ -6371,6 +6940,8 @@ async def _save_and_log_request(
             response_body=response_body,
             free_model_ip=free_model_ip,
             identity=identity,
+            free_status=free_status,
+            paid_status=paid_status,
         )
     except Exception as e:
         _debug(f"  ✗ save_request failed: {type(e).__name__}: {e}")
@@ -6394,6 +6965,8 @@ async def _log_and_save_error(
     tools_used=None,
     request_body=None,
     response_body=None,
+    free_status=None,
+    paid_status=None,
 ):
     """Log error and save to DB with success=False."""
     _log(f"  ERROR {status_code}: {_redact(resp_text, 300)}")
@@ -6418,6 +6991,8 @@ async def _log_and_save_error(
             tools_used=tools_used,
             request_body=request_body,
             response_body=response_body,
+            free_status=free_status,
+            paid_status=paid_status,
         )
     except Exception as e:
         _debug(f"  ✗ save_request (error path) failed: {type(e).__name__}: {e}")
@@ -6438,7 +7013,28 @@ def _make_stream_retry_loop(protocol):
         # B4 idempotence: 400 never retries here (param=name would pause_key uselessly).
         # Credit 400 retry is handled explicitly in the non-stream caller after checking
         # "Insufficient balance" / "Monthly usage limit" in resp.text (see messages() P2).
-        if attempt == 0 and len(API_KEYS) > 1 and status_code in (429, 401, 403):
+        # [Étape 2C — C3] DataPolicyError 403 = requête condamnée (opt-in workspace
+        # manquant) : JAMAIS de pause ni de failover alt-key — un retry ne répare
+        # rien (prouvé : 97/97 bodies identiques, MODE B) et pauserait à tort une
+        # clé saine 1800 s. Retour (headers, False) : l'appelant tombe sur le site
+        # d'émission B1 qui répond le message opt-in explicite. Garde unifiée avec
+        # le non-stream (_do_request_with_retry : même short-circuit, Étape 2B).
+        # NOTE : resp_text est normalisé bytes→str ici pour que les 4 sites
+        # d'appel puissent passer (await resp.aread()) brut sans décoder.
+        if status_code == 403 and resp_text:
+            _txt = (
+                resp_text.decode("utf-8", "replace")
+                if isinstance(resp_text, (bytes, bytearray))
+                else resp_text
+            )
+            if isinstance(_txt, str) and _datapolicy_optin_info(_txt) is not None:
+                _debug("  [datapolicy-guard] stream 403 DataPolicyError → pas de pause/failover (requête condamnée)")
+                _bump_failover_counter("paid", "datapolicy_403", "guard_skip")  # [O3]
+                return headers, False
+        # [Lot B2] failover étendu au-delà de attempt==0 : chaque clé en
+        # échec est pausée avant la recherche d'alternative, donc chaque
+        # failover progresse vers une clé fraîche (P6).
+        if len(API_KEYS) > 1 and status_code in (429, 401, 403):
             failed_key = _key_from_headers(headers, protocol)
             if status_code == 429:
                 # Fetch fresh quotas and pause key until exact reset time
@@ -6457,6 +7053,12 @@ def _make_stream_retry_loop(protocol):
             alt = _find_alternative_key(failed_key)
             if alt:
                 _log(f"  {status_code} on key, retrying with alternative key")
+                # [O3] cause bornée par statut (labels stables) : 429 quota,
+                # 401 auth, 403 région (le datapolicy short-circuite plus haut).
+                _cause = {429: "quota_429", 401: "auth_401", 403: "region_403"}.get(
+                    status_code, "other"
+                )
+                _bump_failover_counter("paid", _cause, "alt_key")
                 return _get_auth_headers(protocol, entry=alt), True
         return headers, False
 
@@ -6479,6 +7081,8 @@ async def _stream_error_response(
     error_payload,
     tools_used=None,
     request_body=None,
+    free_status=None,
+    paid_status=None,
 ):
     """Handle streaming error: log, save DB, yield error SSE event. Returns the error event bytes."""
     _log(f"  ERROR {status_code}: {_redact(resp_body, 300)}")
@@ -6501,8 +7105,101 @@ async def _stream_error_response(
         tools=tools,
         tools_used=tools_used,
         request_body=request_body,
+        free_status=free_status,
+        paid_status=paid_status,
     )
     return _sse("error", error_payload)
+
+
+async def _free_stream_refuse_bytes(
+    resp, req_id, free_model, original_model, start_time, protocol,
+    thinking_type, effort, client_ip, tool_names, request_body,
+):
+    _retry_after = resp.headers.get("retry-after", "") or "60"
+    return await _stream_error_response(
+        req_id,
+        free_model,
+        original_model,
+        start_time,
+        429,
+        await resp.aread(),
+        protocol,
+        thinking_type,
+        effort,
+        client_ip,
+        "free (no auth)",
+        tool_names,
+        {
+            "type": "error",
+            "error": {
+                "type": "rate_limit_error",
+                "message": f"Free quota exhausted on all VPN stations. Retry after {_retry_after}s.",
+            },
+        },
+        request_body=request_body,
+    )
+
+
+def _free_429_stream_decision(free_model, resp, _attempt, forced_pool, track_model):
+    refuse = _on_free_429_stream(
+        free_model,
+        resp.headers.get("retry-after", ""),
+        forced_pool=forced_pool,
+    )
+    if not refuse and _attempt + 1 < effective_free_max_attempts(forced_pool):
+        _log_free_model_usage(
+            track_model,
+            free_model,
+            "free (no auth)",
+            "free (no auth)",
+            resp.status_code,
+            ip=_free_usage_ip(),
+        )
+        _log(
+            f"  FREE {free_model!r} RATE LIMITED (429) → retry station fraîche (essai {_attempt + 2}/{effective_free_max_attempts(forced_pool)})"
+        )
+        return "retry_free", refuse
+    return "fallback_paid", refuse
+
+
+async def _free_non429_cooldown_strict(
+    resp, free_model, req_id, original_model, start_time, protocol,
+    thinking_type, effort, client_ip, tool_names, request_body, tag,
+):
+    _set_free_cooldown(free_model, 60, _free_attempt_station())
+    if IP_ROTATION.get("strict_free", False):
+        _debug(
+            f"  [{tag}] req_id={req_id} leg=free→refuse free_status={resp.status_code} free_model={free_model!r} (strict_free GUI)"
+        )
+        return True, await _free_stream_refuse_bytes(
+            resp, req_id, free_model, original_model, start_time, protocol,
+            thinking_type, effort, client_ip, tool_names, request_body,
+        )
+    return False, None
+
+
+def _free_fallback_bookkeep(
+    req_id, free_model, status_code, track_model, tag, with_host=False, paid_endpoint=None,
+):
+    _fallback_ctx_push(req_id, free_model, status_code)
+    _log_fallback(req_id, "free→paid", free_model, status_code, track_model)
+    if with_host:
+        _debug(
+            f"  [{tag}] req_id={req_id} leg=free→paid free_status={status_code} free_model={free_model!r} → paid {track_model!r} host={urllib.parse.urlparse(paid_endpoint).hostname}"
+        )
+    else:
+        _debug(
+            f"  [{tag}] req_id={req_id} leg=free→paid free_status={status_code} free_model={free_model!r} → paid {track_model!r}"
+        )
+    _log(f"  FREE model {status_code} → falling back to paid {track_model!r}")
+    _log_free_model_usage(
+        track_model,
+        free_model,
+        "free (no auth)",
+        "free (no auth)",
+        status_code,
+        ip=_free_usage_ip(),
+    )
 
 
 def _finalize_stream_tokens(
@@ -7393,6 +8090,7 @@ async def _handle_web_fetch(body: dict, model_id: str, protocol: str) -> bool:
 from protocol_mapping import (  # noqa: E402  # re-export after function defs for compat
     THINKING_MODELS,
     ResponsesSseState,
+    _TOOL_NAME_MAP_KEY,
     _anthropic_to_responses_request,
     _chat_to_responses_request,
     _drop_orphan_responses_input,
@@ -7413,6 +8111,8 @@ from protocol_mapping import (  # noqa: E402  # re-export after function defs fo
     openai_responses_to_anthropic,
     openai_to_anthropic,
     openai_to_anthropic_request,
+    restore_tool_name,
+    sanitize_tool_names,
     strip_synthetic_thinking,
 )
 
@@ -7809,6 +8509,7 @@ async def messages(request: Request):
                     "anthropic",
                     model_id,
                     forced_pool=getattr(request.state, "_geo_forced_pool", None),
+                    req_id=req_id,
                 )
                 if free_result is not None:
                     resp, _, _actual_model, _actual_ip = free_result
@@ -7903,6 +8604,7 @@ async def messages(request: Request):
                     "anthropic",
                     model_id,
                     forced_pool=getattr(request.state, "_geo_forced_pool", None),
+                    req_id=req_id,
                 )
                 if free_result is not None:
                     resp, a_headers, _actual_model, _actual_ip = free_result
@@ -7936,7 +8638,12 @@ async def messages(request: Request):
                 elif resp.status_code == 401:
                     msg = "All API keys exhausted (unauthorized). Check your API keys."
                 elif resp.status_code == 403:
-                    msg = _auth_window_message(403)
+                    # [Étape 2B — B1] DataPolicyError → message explicite avec
+                    # URL d'opt-in + alias (jamais le texte région générique) ;
+                    # vrai 403 région → texte région conservé.
+                    # [Étape 2C — C1] corrélé free→paid par req_id (logging-only,
+                    # jamais le statut HTTP) : préfixe free_status si fallback.
+                    msg = _correlated_403_message(_check_datapolicy_guard(resp, account_alias) or _auth_window_message(403), req_id)
                 elif resp.status_code == 499:
                     msg = "Upstream disconnected (499). Retrying may help."
                 else:
@@ -7958,6 +8665,9 @@ async def messages(request: Request):
                     tool_names,
                     request_body=request_body,
                     response_body={"error": resp.text[:2000]},
+                    # [Étape 2 — O2] jambe paid après (ou sans) free : statut upstream
+                    # explicite, free_status lu depuis le ctx C1 (peek sans pop).
+                    paid_status=resp.status_code,
                 )
                 # Pause key on credit/balance errors (400) and retry with alt key
                 if resp.status_code == 400 and any(
@@ -8120,6 +8830,7 @@ async def messages(request: Request):
             _geo_tunnel = getattr(request.state, "_geo_force_tunnel", False)
             _free_forced_pool = getattr(request.state, "_geo_forced_pool", None)
             _free_bound = yaml_get("streaming", "retry_attempts", 2)
+            _free_bound = max(_free_bound, len(API_KEYS))
             if _using_free and _free_attempts_active(_free_forced_pool):
                 # [plan 19/08 §1] free multi-attempt: extra free strikes on
                 # fresh stations; paid retry budget preserved
@@ -8206,57 +8917,28 @@ async def messages(request: Request):
                                             return
                                         continue
                                 else:
-                                    _set_free_cooldown(free_model, 60, _free_attempt_station())
-                                    _refuse = False
+                                    _refuse, _refuse_bytes = await _free_non429_cooldown_strict(
+                                        resp, free_model, req_id, original_model, start_time, protocol,
+                                        thinking_type, effort, client_ip, tool_names, request_body, "stream",
+                                    )
+                                    if _refuse:
+                                        yield _refuse_bytes
+                                        return
                                 body = paid_body
                                 endpoint = paid_endpoint
                                 _using_free = False
-                                _track_model = model_id  # Revert tracking to paid model
-                                _debug(
-                                    f"  [stream] free model {resp.status_code} → falling back to paid {_track_model!r}"
-                                )
-                                _log(
-                                    f"  FREE model {resp.status_code} → falling back to paid {_track_model!r}"
-                                )
-                                _log_free_model_usage(
-                                    model_id,
-                                    free_model,
-                                    "free (no auth)",
-                                    "free (no auth)",
-                                    resp.status_code,
-                                    ip=_free_usage_ip(),
-                                )
+                                _track_model = model_id
+                                _free_fallback_bookkeep(req_id, free_model, resp.status_code, _track_model, "stream")
                                 if _refuse:
-                                    # strict_free (GUI): every station exhausted
-                                    # (bad/down + (model, IP) cooldown active) —
-                                    # refuse instead of paying.
-                                    _retry_after = resp.headers.get("retry-after", "") or "60"
-                                    yield await _stream_error_response(
-                                        req_id,
-                                        free_model,
-                                        original_model,
-                                        start_time,
-                                        429,
-                                        await resp.aread(),
-                                        protocol,
-                                        thinking_type,
-                                        effort,
-                                        client_ip,
-                                        "free (no auth)",
-                                        tool_names,
-                                        {
-                                            "type": "error",
-                                            "error": {
-                                                "type": "rate_limit_error",
-                                                "message": f"Free quota exhausted on all VPN stations. Retry after {_retry_after}s.",
-                                            },
-                                        },
-                                        request_body=request_body,
+                                    yield await _free_stream_refuse_bytes(
+                                        resp, req_id, free_model, original_model, start_time, protocol,
+                                        thinking_type, effort, client_ip, tool_names, request_body,
                                     )
                                     return
                                 continue
                             headers, should_retry = await _handle_429(
-                                headers, resp.status_code, _attempt, resp.headers
+                                headers, resp.status_code, _attempt, resp.headers,
+                                (await resp.aread()) if resp.status_code == 403 else None,
                             )
                             if should_retry:
                                 _debug("  [stream] 429 retry, key swapped")
@@ -8331,6 +9013,9 @@ async def messages(request: Request):
                                         return
                                     continue
                             ak = _alias_for_key(headers.get("x-api-key", ""))
+                            # [Étape 2B — B1] 403 DataPolicyError → message
+                            # explicite (URL opt-in + alias) ; vrai 403 → région.
+                            _dp_guard = _check_datapolicy_guard(resp, ak)
                             _debug(f"  [stream] error {resp.status_code}: {_redact(err, 300)}")
                             # Log 401 body specifically for key diagnosis
                             if resp.status_code == 401:
@@ -8341,7 +9026,8 @@ async def messages(request: Request):
                             if resp.status_code == 429:
                                 err_msg = "All API keys exhausted (rate limited). Try again later."
                             elif resp.status_code in (401, 403):
-                                err_msg = _auth_window_message(resp.status_code)
+                                # [Étape 2C — C1] corrélé free→paid par req_id : préfixe free_status si fallback.
+                                err_msg = _correlated_403_message((_dp_guard if resp.status_code == 403 else None) or _auth_window_message(resp.status_code), req_id)
                             else:
                                 err_msg = f"HTTP {resp.status_code}: {err.decode('utf-8', errors='replace')[:200]}"
                             error_payload = {
@@ -8364,6 +9050,10 @@ async def messages(request: Request):
                                 tool_names,
                                 error_payload,
                                 request_body=request_body,
+                                # [Étape 2 — O2] jambe paid après (ou sans) free :
+                                # statut upstream explicite, free_status lu depuis
+                                # le ctx C1 (peek sans pop).
+                                paid_status=resp.status_code,
                             )
                             return
                         async for chunk in resp.aiter_bytes():
@@ -8750,6 +9440,7 @@ async def messages(request: Request):
                     "openai",
                     model_id,
                     forced_pool=getattr(request.state, "_geo_forced_pool", None),
+                    req_id=req_id,
                 )
                 if free_result is not None:
                     resp, _, _actual_model, _actual_ip = free_result
@@ -8832,6 +9523,7 @@ async def messages(request: Request):
                 "openai",
                 model_id,
                 forced_pool=getattr(request.state, "_geo_forced_pool", None),
+                req_id=req_id,
             )
             if free_result is not None:
                 resp, headers, _actual_model, _actual_ip = free_result
@@ -8894,6 +9586,9 @@ async def messages(request: Request):
                 tool_names,
                 request_body=request_body,
                 response_body={"error": resp.text[:2000]},
+                # [Étape 2 — O2] jambe paid après (ou sans) free : statut upstream
+                # explicite, free_status lu depuis le ctx C1 (peek sans pop).
+                paid_status=resp.status_code,
             )
             # Pause key on credit/balance errors (400)
             if resp.status_code == 400 and any(
@@ -8922,7 +9617,11 @@ async def messages(request: Request):
                         return _anthropic_error(e.status_code, str(e))
             # Convert 429/401/403 → 503 to avoid Claude Code auth window
             if resp.status_code in (429, 401, 403):
-                return _anthropic_error(503, _auth_window_message(resp.status_code))
+                # [Étape 2B — B1] 403 DataPolicyError → message explicite
+                # (URL opt-in + alias) ; vrai 403 → texte région conservé.
+                # [Étape 2C — C1] corrélé free→paid par req_id : préfixe free_status si fallback.
+                return _anthropic_error(503, _correlated_403_message((_check_datapolicy_guard(resp, account_alias)
+                    if resp.status_code == 403 else None) or _auth_window_message(resp.status_code), req_id))
             if resp.status_code == 499:
                 return _anthropic_error(502, "Upstream disconnected (499). Retrying may help.")
             try:
@@ -8993,7 +9692,7 @@ async def messages(request: Request):
                 _debug(
                     f"  [non-stream] WARNING: thinking requested (type={thinking_type}, effort={effort}) but upstream returned no reasoning in Responses API response"
                 )
-            anthro_resp = _responses_to_anthropic_response(data, original_model)
+            anthro_resp = _responses_to_anthropic_response(data, original_model, oai_body.pop(_TOOL_NAME_MAP_KEY, None))
         else:
             used = _extract_usage_tool_names(data)
             msg_data = ((data.get("choices") or [{}])[0] or {}).get("message") or {}
@@ -9068,6 +9767,11 @@ async def messages(request: Request):
             _using_free = True
         else:
             _using_free = False
+        # [tool-names ≤64] restore-retour stream : la map aller {short: original}
+        # est poppée ici (jambe free uniquement) vers un local — le wire ne la
+        # voit jamais (strip _serialize_json_body) et chaque état SSE neuf la
+        # rejoue via son slot (retry → état neuf). Jambe paid → None.
+        _free_tool_map = oai_body.pop(_TOOL_NAME_MAP_KEY, None) if _using_free else None
         # [B1 perf / v10 PLAN-commun 1.3] estimation tiktoken DIFFÉRÉE : elle
         # tourne en tâche concurrente avec la connexion upstream — le premier
         # yield n'attend plus le comptage (−20 à −150 ms de TTFB sur gros
@@ -9107,6 +9811,7 @@ async def messages(request: Request):
         _debug("  [stream-oai] _handle_429 ready, about to yaml_get")
 
         _free_bound = yaml_get("streaming", "retry_attempts", 2)
+        _free_bound = max(_free_bound, len(API_KEYS))
         _debug(f"  [stream-oai] _free_bound={_free_bound}")
         _geo_tunnel = getattr(request.state, "_geo_force_tunnel", False)
         _free_forced_pool = getattr(request.state, "_geo_forced_pool", None)
@@ -9204,58 +9909,29 @@ async def messages(request: Request):
                                         return
                                     continue
                             else:
-                                _set_free_cooldown(free_model, 60, _free_attempt_station())
-                                _refuse = False
-                            _debug(
-                                f"  [stream-oai] free model {resp.status_code} → falling back to paid {_paid_model_id!r}"
-                            )
-                            _log(
-                                f"  FREE model {resp.status_code} → falling back to paid {_paid_model_id!r}"
-                            )
-                            _log_free_model_usage(
-                                _paid_model_id,
-                                free_model,
-                                "free (no auth)",
-                                "free (no auth)",
-                                resp.status_code,
-                                ip=_free_usage_ip(),
-                            )
+                                _refuse, _refuse_bytes = await _free_non429_cooldown_strict(
+                                    resp, free_model, req_id, original_model, start_time, protocol,
+                                    thinking_type, effort, client_ip, tool_names, request_body, "stream-oai",
+                                )
+                                if _refuse:
+                                    yield _refuse_bytes
+                                    return
+                            _free_fallback_bookkeep(req_id, free_model, resp.status_code, _paid_model_id, "stream-oai", with_host=True, paid_endpoint=paid_endpoint)
                             oai_body = paid_oai_body
                             endpoint = paid_endpoint
                             model_id = _paid_model_id
-                            _req_model_id = _paid_model_id  # Also revert logging model (fixes is_free_model in history)
+                            _req_model_id = _paid_model_id
                             _using_free = False
                             if _refuse:
-                                # strict_free (GUI): every station exhausted
-                                # (bad/down + (model, IP) cooldown active) —
-                                # refuse instead of paying.
-                                _retry_after = resp.headers.get("retry-after", "") or "60"
-                                yield await _stream_error_response(
-                                    req_id,
-                                    free_model,
-                                    original_model,
-                                    start_time,
-                                    429,
-                                    await resp.aread(),
-                                    protocol,
-                                    thinking_type,
-                                    effort,
-                                    client_ip,
-                                    "free (no auth)",
-                                    tool_names,
-                                    {
-                                        "type": "error",
-                                        "error": {
-                                            "type": "rate_limit_error",
-                                            "message": f"Free quota exhausted on all VPN stations. Retry after {_retry_after}s.",
-                                        },
-                                    },
-                                    request_body=request_body,
+                                yield await _free_stream_refuse_bytes(
+                                    resp, req_id, free_model, original_model, start_time, protocol,
+                                    thinking_type, effort, client_ip, tool_names, request_body,
                                 )
                                 return
                             continue
                         hdrs, should_retry = await _handle_429(
-                            hdrs, resp.status_code, _attempt, resp.headers
+                            hdrs, resp.status_code, _attempt, resp.headers,
+                            (await resp.aread()) if resp.status_code == 403 else None,
                         )
                         if should_retry:
                             if _stream_has_yielded(started, open_blocks, stream_out_tokens, ""):
@@ -9326,9 +10002,14 @@ async def messages(request: Request):
                                     return
                                 continue
                         ak_h = _alias_for_key(_key_from_headers(hdrs, "openai"))
+                        if resp.status_code in (401, 403, 429) and not _using_free:
+                            _debug(f"  [paid-stream] req_id={req_id} leg=paid paid_status={resp.status_code} host={urllib.parse.urlparse(endpoint).hostname} body={_redact(err, 500)!r}")
 
                     # [P4] état SSE Responses-API PAR stream (retry → état neuf)
+                    # [tool-names ≤64] rejoue la map aller free sur chaque état
+                    # neuf (jambe free uniquement ; paid → None).
                     _resp_state = ResponsesSseState()
+                    _resp_state.tool_name_map = _free_tool_map if _using_free else None
                     async for line in resp.aiter_lines():
                         if not line.startswith("data:"):
                             continue
@@ -10179,11 +10860,31 @@ async def chat_completions(request: Request):
         try:
             headers = _get_auth_headers("openai")
         except AllKeysPausedError as e:
+            # [Étape 2A — A1/A3] Si aucune clé payante utilisable (état
+            # no-valid-keys : API_KEYS vide OU .env vide OU tout pausé),
+            # le free-first est la voie principale — jamais de jambe paid
+            # condamnée au 401/403. Succès free → réponse directe (200) ;
+            # FreeQuotaExhausted (quota/strict_free, A2) → refus corrélé
+            # 429+Retry-After, jamais le placeholder 503 trompeur.
+            # Si des clés valides existent mais sont momentanément pausées,
+            # comportement legacy conservé : free-first puis 503 générique.
+            _no_valid_keys = not _has_usable_paid_key()
             # If a free model exists, try it before giving up
             if FREE_MODEL_MAP.get(model_id):
                 if is_stream:
-                    # Streaming with no API key: use free model stream directly (openai_stream defined later, use fallback 503 for now)
-                    return _openai_error(503, "All API keys paused — free model will be tried by openai_stream on next attempt")
+                    if _no_valid_keys:
+                        # A3 : pas de clé payante → le placeholder 503 serait
+                        # un mensonge (aucune jambe paid ne peut suivre).
+                        # Le vrai fallback free-direct est servi par
+                        # openai_stream sur cette même requête (motif
+                        # messages-stream l.7852-7865 : free-first réel,
+                        # pas « au prochain attempt »).
+                        _debug(
+                            f"  [chat] req_id={req_id} leg=free-only stream, no usable paid key → free-direct via openai_stream"
+                        )
+                    else:
+                        # Streaming with no API key: use free model stream directly (openai_stream defined later, use fallback 503 for now)
+                        return _openai_error(503, "All API keys paused — free model will be tried by openai_stream on next attempt")
                 else:
                     # Non-streaming: try free model
                     try:
@@ -10193,6 +10894,7 @@ async def chat_completions(request: Request):
                             "openai",
                             model_id,
                             forced_pool=getattr(request.state, "_geo_forced_pool", None),
+                            req_id=req_id,
                         )
                         if free_result is not None:
                             resp, _, _actual_model, _actual_ip = free_result
@@ -10274,11 +10976,28 @@ async def chat_completions(request: Request):
                     "openai",
                     model_id,
                     forced_pool=getattr(request.state, "_geo_forced_pool", None),
+                    req_id=req_id,
                 )
                 if free_result is not None:
                     resp, headers, _actual_model, _actual_ip = free_result
                     model_id = _actual_model
                 else:
+                    # [Étape 2A — A1] no-valid-keys : le free a échoué sans
+                    # lever (non-strict ou échec non-429 hors strict). Ne
+                    # jamais appeler la jambe paid — sans clé utilisable c'est
+                    # un 401/403 condamné qui produirait le trompeur
+                    # « model/region may be restricted ». Erreur locale
+                    # explicite à la place.
+                    if not _has_usable_paid_key():
+                        _debug(
+                            f"  [chat] req_id={req_id} leg=paid-skipped no usable paid key (free failed) → erreur locale"
+                        )
+                        return _openai_error(
+                            503,
+                            "Free model request failed and no usable paid API key "
+                            "is configured — cannot fall back to paid. "
+                            "Configure a paid key or retry later.",
+                        )
                     # Convert to Responses API format if endpoint requires it (muse-spark)
                     paid_body = (
                         _chat_to_responses_request(body) if "/responses" in endpoint else body
@@ -10322,6 +11041,9 @@ async def chat_completions(request: Request):
                     tool_names,
                     request_body=request_body,
                     response_body={"error": resp.text[:2000]},
+                    # [Étape 2 — O2] jambe paid après (ou sans) free : statut upstream
+                    # explicite, free_status lu depuis le ctx C1 (peek sans pop).
+                    paid_status=resp.status_code,
                 )
                 # Pause key on credit/balance errors (400) and retry with alt key
                 if resp.status_code == 400 and any(
@@ -10353,7 +11075,14 @@ async def chat_completions(request: Request):
                             )
                 # Convert 429/401/403 → 503 to avoid Claude Code auth window
                 if resp.status_code in (429, 401, 403):
-                    return _openai_error(503, _auth_window_message(resp.status_code))
+                    # [C0] corrélation paid par req_id (logging-only) : statut + body upstream
+                    _debug(f"  [paid] req_id={req_id} leg=paid paid_status={resp.status_code} host={urllib.parse.urlparse(endpoint).hostname} body={_redact(resp.text, 500)}")
+                    # [Étape 2B — B1] 403 DataPolicyError → message explicite
+                    # (URL opt-in + alias) ; vrai 403 → texte région conservé.
+                    _alias = locals().get("account_alias", "") or _alias_for_key(_key_from_headers(headers, "openai"))
+                    # [Étape 2C — C1] corrélé free→paid par req_id : préfixe free_status si fallback.
+                    return _openai_error(503, _correlated_403_message((_check_datapolicy_guard(resp, _alias)
+                        if resp.status_code == 403 else None) or _auth_window_message(resp.status_code), req_id))
                 if resp.status_code == 499:
                     return _openai_error(502, "Upstream disconnected (499). Retrying may help.")
                 return Response(
@@ -10376,7 +11105,7 @@ async def chat_completions(request: Request):
             if "output" in data and "choices" not in data:
                 # Convertit Responses → Chat Completions pour le client
                 try:
-                    chat_resp = _responses_to_chat_response(data, original_model)
+                    chat_resp = _responses_to_chat_response(data, original_model, oai_body.pop(_TOOL_NAME_MAP_KEY, None))
                     body_bytes = _json_dumps(chat_resp)
                     usage = chat_resp.get("usage", {})
                     req_in = usage.get("prompt_tokens", 0)
@@ -10457,6 +11186,12 @@ async def chat_completions(request: Request):
                 _track_model = free_model
             else:
                 _using_free = False
+            # [tool-names ≤64] restore-retour stream : la map aller {short:
+            # original} est poppée ici (jambe free uniquement) vers un local —
+            # le wire ne la voit jamais (strip _serialize_json_body) et chaque
+            # état SSE neuf la rejoue via son slot (retry → état neuf).
+            # Jambe paid → None.
+            _free_tool_map = oai_body.pop(_TOOL_NAME_MAP_KEY, None) if _using_free else None
             # [B1 perf] estimation tiktoken DIFFÉRÉE (même motif que
             # anthropic_stream) : tâche concurrente avec la connexion upstream,
             # résolue paresseusement à la finalisation / rollback.
@@ -10480,6 +11215,7 @@ async def chat_completions(request: Request):
             _handle_429 = _make_stream_retry_loop("openai")
             _free_forced_pool = getattr(request.state, "_geo_forced_pool", None)
             _free_bound = yaml_get("streaming", "retry_attempts", 2)
+            _free_bound = max(_free_bound, len(API_KEYS))
             if _using_free and _free_attempts_active(_free_forced_pool):
                 # [plan 19/08 §1] free multi-attempt: extra free strikes on
                 # fresh stations; paid retry budget preserved
@@ -10562,57 +11298,47 @@ async def chat_completions(request: Request):
                                     _log_free_model_usage(model_id, free_model, "free (no auth)", "free (no auth)", resp.status_code, ip=_free_usage_ip())
                                     continue
                                 else:
-                                    _set_free_cooldown(free_model, 60, _free_attempt_station())
-                                    _refuse = False
+                                    _refuse, _refuse_bytes = await _free_non429_cooldown_strict(
+                                        resp, free_model, req_id, original_model, start_time, protocol,
+                                        thinking_type, effort, client_ip, tool_names, request_body, "chat-stream",
+                                    )
+                                    if _refuse:
+                                        yield _refuse_bytes
+                                        return
+                                if not _has_usable_paid_key():
+                                    _debug(
+                                        f"  [chat-stream] req_id={req_id} leg=free→refuse free_status={resp.status_code} free_model={free_model!r} (no usable paid key, strict_free={bool(IP_ROTATION.get('strict_free', False))})"
+                                    )
+                                    if IP_ROTATION.get("strict_free", False):
+                                        yield await _free_stream_refuse_bytes(
+                                            resp, req_id, free_model, original_model, start_time, protocol,
+                                            thinking_type, effort, client_ip, tool_names, request_body,
+                                        )
+                                        return
+                                    yield (
+                                        b"data: "
+                                        + _json_dumps_str(
+                                            {"error": {"message": "Free model request failed and no usable paid API key is configured — cannot fall back to paid. Configure a paid key or retry later."}},
+                                            ensure_ascii=False,
+                                        ).encode()
+                                        + b"\n\ndata: [DONE]\n\n"
+                                    )
+                                    return
                                 oai_body = paid_oai_body
                                 endpoint = paid_endpoint
                                 _using_free = False
-                                _track_model = model_id  # Revert tracking to paid model
-                                _debug(
-                                    f"  [chat-stream] free model {resp.status_code} → falling back to paid {_track_model!r}"
-                                )
-                                _log(
-                                    f"  FREE model {resp.status_code} → falling back to paid {_track_model!r}"
-                                )
-                                _log_free_model_usage(
-                                    model_id,
-                                    free_model,
-                                    "free (no auth)",
-                                    "free (no auth)",
-                                    resp.status_code,
-                                    ip=_free_usage_ip(),
-                                )
+                                _track_model = model_id
+                                _free_fallback_bookkeep(req_id, free_model, resp.status_code, _track_model, "chat-stream", with_host=True, paid_endpoint=paid_endpoint)
                                 if _refuse:
-                                    # strict_free (GUI): every station exhausted
-                                    # (bad/down + (model, IP) cooldown active) —
-                                    # refuse instead of paying.
-                                    _retry_after = resp.headers.get("retry-after", "") or "60"
-                                    yield await _stream_error_response(
-                                        req_id,
-                                        free_model,
-                                        original_model,
-                                        start_time,
-                                        429,
-                                        await resp.aread(),
-                                        protocol,
-                                        thinking_type,
-                                        effort,
-                                        client_ip,
-                                        "free (no auth)",
-                                        tool_names,
-                                        {
-                                            "type": "error",
-                                            "error": {
-                                                "type": "rate_limit_error",
-                                                "message": f"Free quota exhausted on all VPN stations. Retry after {_retry_after}s.",
-                                            },
-                                        },
-                                        request_body=request_body,
+                                    yield await _free_stream_refuse_bytes(
+                                        resp, req_id, free_model, original_model, start_time, protocol,
+                                        thinking_type, effort, client_ip, tool_names, request_body,
                                     )
                                     return
                                 continue
                             hdrs, should_retry = await _handle_429(
-                                hdrs, resp.status_code, _attempt, resp.headers
+                                hdrs, resp.status_code, _attempt, resp.headers,
+                                (await resp.aread()) if resp.status_code == 403 else None,
                             )
                             if should_retry:
                                 if _oai_has_yielded or stream_out > 0:
@@ -10683,14 +11409,21 @@ async def chat_completions(request: Request):
                                         return
                                     continue
                             ak_h = _alias_for_key(_key_from_headers(hdrs, "openai"))
+                            # [Étape 2B — B1] garde pré-forward : 403 DataPolicyError →
+                            # message explicite (URL opt-in + alias) ; None sinon.
+                            _dp_guard = _check_datapolicy_guard(resp, ak_h)
                             # Log 401 body specifically for key diagnosis
                             if resp.status_code == 401:
                                 _debug(f"  [auth] 401 response body: {_redact(err, 500)}")
+                            # [C0] corrélation paid-stream par req_id (logging-only)
+                            if resp.status_code in (401, 403, 429):
+                                _debug(f"  [paid-stream] req_id={req_id} leg=paid paid_status={resp.status_code} host={urllib.parse.urlparse(endpoint).hostname} body={_redact(err, 500)!r}")
                             # Convert 429/401/403 → 503 to avoid Claude Code auth window
                             if resp.status_code == 429:
                                 err_msg = "All API keys exhausted (rate limited). Try again later."
                             elif resp.status_code in (401, 403):
-                                err_msg = _auth_window_message(resp.status_code)
+                                # [Étape 2C — C1] corrélé free→paid par req_id : préfixe free_status si fallback.
+                                err_msg = _correlated_403_message((_dp_guard if resp.status_code == 403 else None) or _auth_window_message(resp.status_code), req_id)
                             else:
                                 err_msg = f"HTTP {resp.status_code}"
                             yield (
@@ -10703,7 +11436,10 @@ async def chat_completions(request: Request):
                             return
 
                         # [P4] état SSE Responses-API PAR stream
+                        # [tool-names ≤64] rejoue la map aller free sur chaque
+                        # état neuf (jambe free uniquement ; paid → None).
                         _resp_state = ResponsesSseState()
+                        _resp_state.tool_name_map = _free_tool_map if _using_free else None
                         _chunk_already_yielded = False
                         async for line in resp.aiter_lines():
                             if not line.startswith("data:"):
@@ -11091,6 +11827,7 @@ async def chat_completions(request: Request):
                         "anthropic",
                         model_id,
                         forced_pool=getattr(request.state, "_geo_forced_pool", None),
+                        req_id=req_id,
                     )
                     if free_result is not None:
                         resp, _, _actual_model, _actual_ip = free_result
@@ -11158,6 +11895,7 @@ async def chat_completions(request: Request):
                 "anthropic",
                 model_id,
                 forced_pool=getattr(request.state, "_geo_forced_pool", None),
+                req_id=req_id,
             )
             if free_result is not None:
                 resp, a_headers, _actual_model, _actual_ip = free_result
@@ -11188,10 +11926,13 @@ async def chat_completions(request: Request):
                 tool_names,
                 request_body=request_body,
                 response_body={"error": resp.text[:2000]},
+                # [Étape 2 — O2] jambe paid après (ou sans) free.
+                paid_status=resp.status_code,
             )
             # Convert 429/401/403 → 503 to avoid Claude Code auth window
             if resp.status_code in (429, 401, 403):
-                return _openai_error(503, _auth_window_message(resp.status_code))
+                # [Étape 2C — C1] corrélé free→paid par req_id : préfixe free_status si fallback.
+                return _openai_error(503, _correlated_403_message(((_check_datapolicy_guard(resp, account_alias) if resp.status_code == 403 else None) or _auth_window_message(resp.status_code)), req_id))  # [Étape 2B — B1] DataPolicyError → URL opt-in
             if resp.status_code == 499:
                 return _openai_error(502, "Upstream disconnected (499). Retrying may help.")
             try:
@@ -11292,6 +12033,7 @@ async def chat_completions(request: Request):
         _geo_tunnel = getattr(request.state, "_geo_force_tunnel", False)
         _free_forced_pool = getattr(request.state, "_geo_forced_pool", None)
         _free_bound = yaml_get("streaming", "retry_attempts", 2)
+        _free_bound = max(_free_bound, len(API_KEYS))
         if _using_free and _free_attempts_active(_free_forced_pool):
             # [plan 19/08 §1] free multi-attempt: extra free strikes on
             # fresh stations; paid retry budget preserved
@@ -11378,57 +12120,28 @@ async def chat_completions(request: Request):
                                 _log_free_model_usage(model_id, free_model, "free (no auth)", "free (no auth)", resp.status_code, ip=_free_usage_ip())
                                 continue
                             else:
-                                _set_free_cooldown(free_model, 60, _free_attempt_station())
-                                _refuse = False
+                                _refuse, _refuse_bytes = await _free_non429_cooldown_strict(
+                                    resp, free_model, req_id, original_model, start_time, protocol,
+                                    thinking_type, effort, client_ip, tool_names, request_body, "anthro-to-oai-stream",
+                                )
+                                if _refuse:
+                                    yield _refuse_bytes
+                                    return
                             anthro_body = paid_anthro_body
                             endpoint = paid_endpoint
                             _using_free = False
                             _track_model = model_id
-                            _debug(
-                                f"  [anthro-to-oai-stream] free model {resp.status_code} → falling back to paid {_track_model!r}"
-                            )
-                            _log(
-                                f"  FREE model {resp.status_code} → falling back to paid {_track_model!r}"
-                            )
-                            _log_free_model_usage(
-                                model_id,
-                                free_model,
-                                "free (no auth)",
-                                "free (no auth)",
-                                resp.status_code,
-                                ip=_free_usage_ip(),
-                            )
+                            _free_fallback_bookkeep(req_id, free_model, resp.status_code, _track_model, "anthro-to-oai-stream")
                             if _refuse:
-                                # strict_free (GUI): every station exhausted
-                                # (bad/down + (model, IP) cooldown active) —
-                                # refuse instead of paying.
-                                _retry_after = resp.headers.get("retry-after", "") or "60"
-                                yield await _stream_error_response(
-                                    req_id,
-                                    free_model,
-                                    original_model,
-                                    start_time,
-                                    429,
-                                    await resp.aread(),
-                                    protocol,
-                                    thinking_type,
-                                    effort,
-                                    client_ip,
-                                    "free (no auth)",
-                                    tool_names,
-                                    {
-                                        "type": "error",
-                                        "error": {
-                                            "type": "rate_limit_error",
-                                            "message": f"Free quota exhausted on all VPN stations. Retry after {_retry_after}s.",
-                                        },
-                                    },
-                                    request_body=request_body,
+                                yield await _free_stream_refuse_bytes(
+                                    resp, req_id, free_model, original_model, start_time, protocol,
+                                    thinking_type, effort, client_ip, tool_names, request_body,
                                 )
                                 return
                             continue
                         hdrs, should_retry = await _handle_429(
-                            hdrs, resp.status_code, _attempt, resp.headers
+                            hdrs, resp.status_code, _attempt, resp.headers,
+                            (await resp.aread()) if resp.status_code == 403 else None,
                         )
                         if should_retry:
                             if _stream_has_yielded(started, open_blocks, stream_out, _line_buf):
@@ -11506,7 +12219,8 @@ async def chat_completions(request: Request):
                         if resp.status_code == 429:
                             err_msg = "All API keys exhausted (rate limited). Try again later."
                         elif resp.status_code in (401, 403):
-                            err_msg = _auth_window_message(resp.status_code)
+                            # [Étape 2C — C1] corrélé free→paid par req_id : préfixe free_status si fallback.
+                            err_msg = _correlated_403_message(((_check_datapolicy_guard(resp, ak) if resp.status_code == 403 else None) or _auth_window_message(resp.status_code)), req_id)  # [Étape 2B — B1] DataPolicyError → URL opt-in
                         else:
                             err_msg = f"HTTP {resp.status_code}"
                         yield (
@@ -11973,6 +12687,7 @@ async def responses(request: Request):
                             "anthropic",
                             model_id,
                             forced_pool=getattr(request.state, "_geo_forced_pool", None),
+                            req_id=req_id,
                         )
                         if free_result is not None:
                             resp, _, _actual_model, _actual_ip = free_result
@@ -12065,6 +12780,7 @@ async def responses(request: Request):
                     "anthropic",
                     model_id,
                     forced_pool=getattr(request.state, "_geo_forced_pool", None),
+                    req_id=req_id,
                 )
                 if free_result is not None:
                     resp, a_headers, _actual_model, _actual_ip = free_result
@@ -12105,6 +12821,9 @@ async def responses(request: Request):
                     tool_names,
                     request_body=request_body,
                     response_body={"error": resp.text[:2000]},
+                    # [Étape 2 — O2] jambe paid après (ou sans) free : statut upstream
+                    # explicite, free_status lu depuis le ctx C1 (peek sans pop).
+                    paid_status=resp.status_code,
                 )
                 # Pause key on credit/balance errors (400) and retry with alt key
                 if resp.status_code == 400 and any(
@@ -12148,7 +12867,7 @@ async def responses(request: Request):
                             )
                 # Convert 429/401/403 → 503 to avoid Claude Code auth window
                 if resp.status_code in (429, 401, 403):
-                    return _openai_error(503, _auth_window_message(resp.status_code))
+                    return _openai_error(503, _correlated_403_message(((_check_datapolicy_guard(resp, account_alias) if resp.status_code == 403 else None) or _auth_window_message(resp.status_code)), req_id))  # [Étape 2B — B1] DataPolicyError → URL opt-in + [Étape 2C — C1] corrélation free→paid
                 if resp.status_code == 499:
                     return _openai_error(502, "Upstream disconnected (499). Retrying may help.")
                 try:
@@ -12208,6 +12927,7 @@ async def responses(request: Request):
                 "anthropic",
                 model_id,
                 forced_pool=getattr(request.state, "_geo_forced_pool", None),
+                req_id=req_id,
             )
             if free_result is not None:
                 resp, a_headers, _actual_model, _actual_ip = free_result
@@ -12248,6 +12968,8 @@ async def responses(request: Request):
                 tool_names,
                 request_body=request_body,
                 response_body={"error": resp.text[:2000]},
+                # [Étape 2 — O2] jambe paid après (ou sans) free.
+                paid_status=resp.status_code,
             )
 
             async def err_stream():
@@ -12334,6 +13056,7 @@ async def responses(request: Request):
                     "openai",
                     model_id,
                     forced_pool=getattr(request.state, "_geo_forced_pool", None),
+                    req_id=req_id,
                 )
                 if free_result is not None:
                     resp, _, _actual_model, _actual_ip = free_result
@@ -12416,6 +13139,7 @@ async def responses(request: Request):
                 "openai",
                 model_id,
                 forced_pool=getattr(request.state, "_geo_forced_pool", None),
+                req_id=req_id,
             )
             if free_result is not None:
                 resp, headers, _actual_model, _actual_ip = free_result
@@ -12454,10 +13178,12 @@ async def responses(request: Request):
                 tool_names,
                 request_body=request_body,
                 response_body={"error": resp.text[:2000]},
+                # [Étape 2 — O2] jambe paid après (ou sans) free.
+                paid_status=resp.status_code,
             )
             # Convert 429/401/403 → 503 to avoid Claude Code auth window
             if resp.status_code in (429, 401, 403):
-                return _openai_error(503, _auth_window_message(resp.status_code))
+                return _openai_error(503, _correlated_403_message(((_check_datapolicy_guard(resp, account_alias) if resp.status_code == 403 else None) or _auth_window_message(resp.status_code)), req_id))  # [Étape 2B — B1] DataPolicyError → URL opt-in + [Étape 2C — C1] corrélation free→paid
             if resp.status_code == 499:
                 return _openai_error(502, "Upstream disconnected (499). Retrying may help.")
             try:
@@ -12550,6 +13276,7 @@ async def responses(request: Request):
             "openai",
             model_id,
             forced_pool=getattr(request.state, "_geo_forced_pool", None),
+            req_id=req_id,
         )
         if free_result is not None:
             resp, headers, _actual_model, _actual_ip = free_result
@@ -12584,6 +13311,8 @@ async def responses(request: Request):
                         tool_names,
                         request_body=request_body,
                         response_body={"error": resp.text[:2000]},
+                        # [Étape 2 — O2] jambe paid après (ou sans) free.
+                        paid_status=resp.status_code,
                     )
 
                     async def err_stream():
@@ -12684,6 +13413,8 @@ async def responses(request: Request):
             tool_names,
             request_body=request_body,
             response_body={"error": resp.text[:2000]},
+            # [Étape 2 — O2] jambe paid après (ou sans) free.
+            paid_status=resp.status_code,
         )
 
         async def err_stream():

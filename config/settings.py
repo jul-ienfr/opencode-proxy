@@ -426,6 +426,29 @@ FREE_MODEL_MAP = yaml_get("free_model_map", default={})
 # ── IP rotation (OpenVPN for free model quota) ────────────────────
 IP_ROTATION = yaml_get("ip_rotation", default={})
 
+_VALID_429_ACTIONS = ("cooldown", "rotate", "both")
+
+
+def normalize_429_action(raw, default: str = "both") -> str:
+    """[PLAN-corrections-429 P12/D3] Shared normalizer for on_429_action values.
+
+    Returns one of "cooldown" | "rotate" | "both"; anything else falls back
+    to `default`. Used by opencode.py, free_ip_pool.py and vpn_manager.py so
+    the str()/strip()/lower() validation lives in exactly one place.
+    """
+    action = str(raw if raw else default).strip().lower()
+    return action if action in _VALID_429_ACTIONS else default
+
+
+def get_429_action(default: str = "both") -> str:
+    """[PLAN-corrections-429 P12] Normalized reader for ip_rotation.on_429_action.
+
+    Reads the LIVE yaml (hot-reload safe) rather than the import-time
+    IP_ROTATION snapshot, so dashboard edits apply without a restart.
+    """
+    raw = yaml_get("ip_rotation", "on_429_action", default)
+    return normalize_429_action(raw, default)
+
 # ── Geo (P1 — single source config.yaml:geo, kill-switch enabled:false) ─
 # Source: https://ai.developer.meta.com/legal/geographic-use-policy
 # Snapshot 2026-08-20 JS-rendered — WebFetch returned empty skeleton, manual

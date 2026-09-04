@@ -42,7 +42,9 @@ Never touches the live system: no real curl/httpx (both faked), no VPN,
 no DB write (free-usage logging no-op'd).
 """
 
+import asyncio
 import json
+import time
 from contextlib import asynccontextmanager
 
 import pytest
@@ -156,6 +158,7 @@ class _PoolMulti:
         self._stations = stations
         self.rotated = []  # on_quota_exhausted(station) calls
         self.requests = 0  # on_request() calls (quota counter)
+        self.hedge_winners = []  # note_hedge_winner(winner) calls (winner-only compta)
 
     async def on_request(self):
         self.requests += 1
@@ -180,8 +183,19 @@ class _PoolMulti:
     def _station_usable(self, st, *, exclude_approaching=False):
         return st.status == "connected"
 
+    def pick_candidates(self, forced_pool=None):
+        """[Lot G] hedge wiring calls pick_candidates — mirror the real
+        pool: all usable stations, routing preference = list order."""
+        return [
+            st for st in self._stations
+            if self._station_usable(st, exclude_approaching=False)
+        ]
+
     def on_quota_exhausted(self, station):
         self.rotated.append(station)
+
+    def note_hedge_winner(self, winner, primary=None):
+        self.hedge_winners.append(winner)
 
 
 @pytest.fixture
@@ -210,6 +224,7 @@ def free_cfg():
             "auto_max_free_attempts",
             "station_count",
             "free_parallel",
+            "on_429_action",
         )
     }
     # deep copy for dict values
@@ -223,6 +238,9 @@ def free_cfg():
     # into the "budget exhausted → paid fallback" tests. Tests wanting strict
     # mode set it explicitly.
     oc.IP_ROTATION["strict_free"] = False
+    # [PLAN-corrections-429 A4] neutraliser on_429_action (live config = "both"
+    # d'après le plan ; les tests A4 le règlent explicitement par valeur).
+    oc.IP_ROTATION["on_429_action"] = "both"
     oc.IP_ROTATION["free_parallel"] = {
         "enabled": False,
         "routing": "round-robin",
@@ -617,11 +635,134 @@ async def test_stream_429_cooldown_rotation_refuse(free_vpn_env, free_cfg, monke
     assert pool.rotated == [a], "background rotation fired for the 429'd station"
 
     # strict_free: every station exhausted → refuse instead of paying
+    # [PLAN-corrections-429 A2] refuse UNIQUEMENT si toutes les stations
+    # sont réellement épuisées — un seul 429 ne refuse plus tout.
     oc.IP_ROTATION["strict_free"] = True
     oc._set_free_cooldown(FREE_MODEL, 9999, a)
     oc._set_free_cooldown(FREE_MODEL, 9999, b)
     refuse = oc._on_free_429_stream(FREE_MODEL, "60")
     assert refuse is True, "strict_free + all stations exhausted → refuse"
+
+    # strict_free A2 : stations NON épuisées → pas de refus (paid fallback)
+    oc._free_model_cooldowns.clear()
+    refuse = oc._on_free_429_stream(FREE_MODEL, "60")
+    assert refuse is False, "strict_free + stations utilisables → False (retry/fallback)"
+
+
+# ── [PLAN-corrections-429 §5 Lot A] on_429_action / strict_free / retry_after ──
+@pytest.mark.asyncio
+async def test_free_429_cooldown_only(free_vpn_env, free_cfg, monkeypatch):
+    """A4 : on_429_action=cooldown → cooldown posé, PAS de rotation."""
+    oc.IP_ROTATION["on_429_action"] = "cooldown"
+    oc.IP_ROTATION["strict_free"] = False
+    a = _Station(1, "1.1.1.1", "socks5://127.0.0.1:1080")
+    b = _Station(2, "2.2.2.2", "socks5://127.0.0.1:1081")
+    pool = _PoolStream429([a, b])
+    monkeypatch.setattr(oc, "_free_ip_pool", pool)
+    oc._current_free_attempt.set({"station": a, "proxy_url": a.socks5_url})
+
+    refuse = oc._on_free_429_stream(FREE_MODEL, "30")
+    assert refuse is False
+    assert oc._free_cooldown_active(FREE_MODEL, a), "cooldown doit être posé"
+    assert pool.rotated == [], "aucune rotation en mode cooldown seul"
+
+
+@pytest.mark.asyncio
+async def test_free_429_rotate_only(free_vpn_env, free_cfg, monkeypatch):
+    """A4 : on_429_action=rotate → rotation, PAS de cooldown."""
+    oc.IP_ROTATION["on_429_action"] = "rotate"
+    oc.IP_ROTATION["strict_free"] = False
+    a = _Station(1, "1.1.1.1", "socks5://127.0.0.1:1080")
+    b = _Station(2, "2.2.2.2", "socks5://127.0.0.1:1081")
+    pool = _PoolStream429([a, b])
+    monkeypatch.setattr(oc, "_free_ip_pool", pool)
+    oc._current_free_attempt.set({"station": a, "proxy_url": a.socks5_url})
+
+    refuse = oc._on_free_429_stream(FREE_MODEL, "30")
+    assert refuse is False
+    assert not oc._free_cooldown_active(FREE_MODEL, a), "aucun cooldown en mode rotate seul"
+    assert pool.rotated == [a], "rotation déclenchée pour la station 429"
+
+
+@pytest.mark.asyncio
+async def test_free_429_both(free_vpn_env, free_cfg, monkeypatch):
+    """A4 : on_429_action=both → cooldown + rotation (comportement historique)."""
+    oc.IP_ROTATION["on_429_action"] = "both"
+    oc.IP_ROTATION["strict_free"] = False
+    a = _Station(1, "1.1.1.1", "socks5://127.0.0.1:1080")
+    b = _Station(2, "2.2.2.2", "socks5://127.0.0.1:1081")
+    pool = _PoolStream429([a, b])
+    monkeypatch.setattr(oc, "_free_ip_pool", pool)
+    oc._current_free_attempt.set({"station": a, "proxy_url": a.socks5_url})
+
+    refuse = oc._on_free_429_stream(FREE_MODEL, "30")
+    assert refuse is False
+    assert oc._free_cooldown_active(FREE_MODEL, a), "cooldown posé"
+    assert pool.rotated == [a], "rotation déclenchée"
+
+
+@pytest.mark.asyncio
+async def test_strict_free_station_first(free_vpn_env, free_cfg, monkeypatch):
+    """A3 : strict_free + station-first → stations fraîches d'abord, refus
+    seulement quand TOUTES épuisées."""
+    oc.IP_ROTATION["strict_free"] = True
+    oc.IP_ROTATION["free_exception_fallback"] = "station-first"
+    a = _Station(1, "1.1.1.1", "socks5://127.0.0.1:1080")
+    b = _Station(2, "2.2.2.2", "socks5://127.0.0.1:1081")
+    pool = _PoolStream429([a, b])
+    monkeypatch.setattr(oc, "_free_ip_pool", pool)
+    oc._current_free_attempt.set({"station": a, "proxy_url": a.socks5_url})
+
+    # une seule station cooldownée → l'autre sert encore → pas de refus
+    oc._set_free_cooldown(FREE_MODEL, 9999, a)
+    assert oc._on_free_429_stream(FREE_MODEL, "60") is False
+    # toutes épuisées → refus
+    oc._set_free_cooldown(FREE_MODEL, 9999, b)
+    assert oc._on_free_429_stream(FREE_MODEL, "60") is True
+
+
+@pytest.mark.asyncio
+async def test_strict_free_direct(free_vpn_env, free_cfg, monkeypatch):
+    """A3 : strict_free + direct → jamais de refus ici (le caller tente la
+    jambe résidentielle directe, jamais de jambe paid)."""
+    oc.IP_ROTATION["strict_free"] = True
+    oc.IP_ROTATION["free_exception_fallback"] = "direct"
+    a = _Station(1, "1.1.1.1", "socks5://127.0.0.1:1080")
+    b = _Station(2, "2.2.2.2", "socks5://127.0.0.1:1081")
+    pool = _PoolStream429([a, b])
+    monkeypatch.setattr(oc, "_free_ip_pool", pool)
+    oc._current_free_attempt.set({"station": a, "proxy_url": a.socks5_url})
+
+    oc._set_free_cooldown(FREE_MODEL, 9999, a)
+    oc._set_free_cooldown(FREE_MODEL, 9999, b)
+    assert oc._on_free_429_stream(FREE_MODEL, "60") is False, (
+        "mode direct → False même stations épuisées (jambe directe en aval)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_strict_free_refuse_all_exhausted(free_vpn_env, free_cfg, monkeypatch):
+    """A2 : refus seulement si TOUTES les stations sont réellement épuisées."""
+    oc.IP_ROTATION["strict_free"] = True
+    oc.IP_ROTATION["free_exception_fallback"] = "station-first"
+    a = _Station(1, "1.1.1.1", "socks5://127.0.0.1:1080")
+    b = _Station(2, "2.2.2.2", "socks5://127.0.0.1:1081")
+    pool = _PoolStream429([a, b])
+    monkeypatch.setattr(oc, "_free_ip_pool", pool)
+    oc._current_free_attempt.set({"station": a, "proxy_url": a.socks5_url})
+
+    assert oc._on_free_429_stream(FREE_MODEL, "60") is False, "stations fraîches → pas de refus"
+    oc._set_free_cooldown(FREE_MODEL, 9999, a)
+    oc._set_free_cooldown(FREE_MODEL, 9999, b)
+    assert oc._on_free_429_stream(FREE_MODEL, "60") is True, "tout épuisé → refus"
+
+
+def test_free_quota_exhausted_retry_after_type():
+    """A1 : FreeQuotaExhausted.retry_after est une string entière, jamais un float."""
+    exc = oc.FreeQuotaExhausted(str(int(oc._free_429_cooldown_seconds(""))))
+    assert isinstance(exc.retry_after, str), "retry_after doit être une str"
+    assert exc.retry_after == "120", "défaut 120s en string entière"
+    assert "." not in exc.retry_after, "pas de représentation float"
 
 
 # ── (c') stream CM: direct_fallback=False → _FreeTunnelFailure re-raisé ────
@@ -740,6 +881,9 @@ def _pool_with(stations):
     pool._per = {}
     pool._rotation_stagger = 10
     pool._active_station = None
+    pool._worker_tasks = []  # [Lot G] _launch_rotation → _ensure_workers (hermetic)
+    pool._pending = set()
+    pool._rotation_tasks = {}
     return pool
 
 
@@ -768,6 +912,196 @@ def test_excluding_many_skips_bad_station_even_when_excluded_empty():
     assert pool._best_station_excluding_many({a}) is None, (
         "no usable station left → None (caller goes direct/paid)"
     )
+
+
+# ── [PLAN-corrections-429 §5 Lot G] hedge / strict / failover-cascade ─────
+# G5 : 429 sur une seule station → cette station traitée immédiatement,
+# les autres continuent de servir (cooldown + rotation périmétrés).
+@pytest.mark.asyncio
+async def test_independent_station_rotation(free_vpn_env, free_cfg, monkeypatch):
+    """G5 : 429 sur la station B (attempt ContextVar = B) → cooldown posé
+    sur la clé (modèle, IP_B) UNIQUEMENT, rotation déclenchée pour B
+    UNIQUEMENT ; la station A garde une clé FRAÎCHE et n'est pas rotatée."""
+    oc.IP_ROTATION["on_429_action"] = "both"
+    oc.IP_ROTATION["strict_free"] = False
+    a = _Station(1, "1.1.1.1", "socks5://127.0.0.1:1080")
+    b = _Station(2, "2.2.2.2", "socks5://127.0.0.1:1081")
+    c = _Station(3, "3.3.3.3", "socks5://127.0.0.1:1082")
+    pool = _PoolStream429([a, b, c])
+    monkeypatch.setattr(oc, "_free_ip_pool", pool)
+    # la tentative courante a servi via B (comme après _hedged_fetch qui a
+    # positionné le ContextVar sur la station 429, gagnante exclue)
+    oc._current_free_attempt.set({"station": b, "proxy_url": b.socks5_url})
+
+    refuse = oc._on_free_429_stream(FREE_MODEL, "30")
+    assert refuse is False
+    assert oc._free_cooldown_active(FREE_MODEL, b), "station 429 → cooldown"
+    assert not oc._free_cooldown_active(FREE_MODEL, a), "station 1 continue de servir"
+    assert not oc._free_cooldown_active(FREE_MODEL, c), "station 3 continue de servir"
+    assert pool.rotated == [b], "rotation périmétrée à la station 429"
+
+
+@pytest.mark.asyncio
+async def test_hedge_loser_429_badmarked(free_vpn_env, free_cfg, monkeypatch):
+    """G5 losing-429 : hedge 2 stations, la perdante complète avec un 429
+    avant que la gagnante ne réponde 200 → la perdante est bad-markée
+    (cooldown + rotation) alors que la gagnante continue de servir."""
+    oc.IP_ROTATION["on_429_action"] = "both"
+    oc.IP_ROTATION["strict_free"] = False
+    a = _Station(1, "1.1.1.1", "socks5://127.0.0.1:1080")
+    b = _Station(2, "2.2.2.2", "socks5://127.0.0.1:1081")
+    pool = _PoolStream429([a, b])
+    monkeypatch.setattr(oc, "_free_ip_pool", pool)
+    # hedge_max=1 → primaire + 1 hedge ; stagger 0 → les deux partent
+    pool._free_parallel_enabled = True
+    pool._free_parallel_mode = "hedge"
+    pool._free_parallel_hedge_max = 1
+    pool._free_parallel_hedge_delay_ms = 0
+
+    # ["slow200", "fast429"] : le _one(primaire=a) lit slow200 en premier.
+    # Stagger=0 → le hedge (b) part aussitôt ; la 429 perdante COMPLÈTE
+    # pendant que la gagnante attend encore son sleep 50 ms → le §14.1.5
+    # la retient en filet pendant que la course continue vers le 200 (G5).
+    order = iter(["slow200", "fast429"])
+
+    async def _fake_curl(body, headers, proxy_url=None, station=None, endpoint=None, **kwargs):
+        if next(order) == "fast429":
+            # la perdante répond 429 AVANT la gagnante (pas de sleep) —
+            # le filet §14.1.5 la retient sans clore la course
+            return _FakeResp(429, {"retry-after": "30"}, text="{}")
+        await asyncio.sleep(0.05)  # la gagnante répond APRES la 429 perdante
+        return _FakeResp(
+            200, {"content-type": "application/json"},
+            usage={"prompt_tokens": 1, "completion_tokens": 1},
+        )
+
+    monkeypatch.setattr(oc, "_do_free_request_curl_cffi", _fake_curl)
+
+    resp, winner = await oc._hedged_fetch(
+        [a, b],
+        # production swaps paid→free model BEFORE the hedge (free_body) —
+        # _hedged_fetch derives the 429-cooldown model key from body["model"]
+        {**_free_body(), "model": FREE_MODEL},
+        dict(PAID_HEADERS), "openai",
+    )
+    assert resp.status_code == 200
+    loser = b if winner is a else a
+    assert oc._free_cooldown_active(FREE_MODEL, loser), "perdante 429 → cooldown (clé périmétrée)"
+    assert not oc._free_cooldown_active(FREE_MODEL, winner), "gagnante 200 → pas de cooldown"
+    assert pool.rotated == [loser], "rotation périmétrée à la perdante 429"
+    assert pool.hedge_winners == [winner], "compta winner-only préservée"
+
+
+@pytest.mark.asyncio
+async def test_hedge_all_429_marks_all_stations(free_vpn_env, free_cfg, monkeypatch):
+    """G1 : hedge N stations, TOUTES répondent 429 → le filet §14.1.5
+    retient la première 429, et le site de câblage bad-marke les N
+    stations (cooldown + rotation chacune)."""
+    oc.IP_ROTATION["on_429_action"] = "both"
+    oc.IP_ROTATION["strict_free"] = False
+    oc.IP_ROTATION["max_free_attempts"] = 2
+    a = _Station(1, "1.1.1.1", "socks5://127.0.0.1:1080")
+    b = _Station(2, "2.2.2.2", "socks5://127.0.0.1:1081")
+    pool = _PoolStream429([a, b])
+    monkeypatch.setattr(oc, "_free_ip_pool", pool)
+
+    cands = [a, b]
+
+    async def _fake_hedge(cands_arg, body, headers, endpoint, forced_pool=None):
+        assert cands_arg == cands
+        return _FakeResp(429, {"retry-after": "45"}, text="{}"), a
+
+    monkeypatch.setattr(oc, "_hedged_fetch", _fake_hedge)
+    monkeypatch.setattr(oc, "_free_parallel_should_hedge", lambda *a_, **k: True)
+    monkeypatch.setattr(oc, "_do_request_with_retry", None)  # garde : jamais de jambe directe ici
+
+    result = await oc._try_free_model_first(_free_body(), dict(PAID_HEADERS), "openai", PAID_MODEL)
+    assert result is None, "filet 429 → pas de succès → repli paid (None)"
+    assert oc._free_cooldown_active(FREE_MODEL, a), "station A bad-markée"
+    assert oc._free_cooldown_active(FREE_MODEL, b), "station B bad-markée"
+    assert sorted(pool.rotated, key=lambda s: s._station) == [a, b], (
+        "les N stations hedged sont rotatées, pas seulement la gagnante-filet"
+    )
+
+
+@pytest.mark.asyncio
+async def test_paid_hedge_blocked_in_strict_free(free_cfg):
+    """G2 : strict_free + paid_hedge_after_ms>0 → on_request refuse la jambe
+    paid early (None, None) au lieu d'attendre la rotation."""
+    real_pool = FreeIPPool.__new__(FreeIPPool)
+    real_pool._connect_retry_interval = 300.0
+    real_pool._bad_ttl = 60.0
+    real_pool.update_config({"strict_free": True, "paid_hedge_after_ms": 500})
+
+    class _Mgr:
+        enabled = True
+        proxy_mode = "vpn"
+
+    real_pool._vpn = _Mgr()
+    assert real_pool._strict_free is True
+    assert real_pool._paid_hedge_after_ms == 500.0
+
+    # on_request est async et docker-couplé : on n'appelle QUE le garde G2
+    # via une station au seuil sans alternative — ici on vérifie le miroir
+    # config + le court-circuit statique (lignes 965-966 : strict → None, None
+    # avant le wait paid_hedge_after_ms).
+    import inspect
+
+    src = inspect.getsource(FreeIPPool.on_request)
+    assert 'getattr(self, "_strict_free", False)' in src
+    assert "return None, None" in src
+
+
+def test_failover_cascade_detection(free_cfg):
+    """G4 : routing=failover, ≥3 429 consécutifs de la sticky station sur
+    des IPs DIFFÉRENTES → callback épuisement-compte → cooldown sentinelle
+    couvrant TOUTES les stations ; même IP répétée n'incrémente pas."""
+    real_pool = FreeIPPool.__new__(FreeIPPool)
+    real_pool._connect_retry_interval = 300.0
+    real_pool._bad_ttl = 60.0
+    real_pool._free_parallel_enabled = True
+    real_pool._free_parallel_routing = "failover"  # non-RR → bras G4
+    real_pool._free_parallel_mode = "load-balance"
+    real_pool._on_429_action = "both"
+    real_pool._vpn = type("V", (), {"enabled": True, "proxy_mode": "vpn"})()
+    fired = []
+    real_pool._failover_exhausted_cb = lambda station: fired.append(station)
+    real_pool._station_ids = {1}
+    real_pool._pending = set()
+    real_pool._rotation_tasks = {}
+    real_pool._worker_tasks = []  # [Lot G] _launch_rotation → _ensure_workers (hermetic)
+    real_pool._rotation_queue = asyncio.Queue()
+    # [Lot G] la rotation docker est hors sujet ici (compteur cascade) :
+    # stub pour rester hermétique (pas de loop/workers dans ce test sync)
+    real_pool._launch_rotation = lambda *a_, **k: None
+    real_pool._per = {}
+
+    class _FailoverStation:
+        _station = 1
+        status = "connected"
+        current_ip = "9.9.9.9"
+        socks5_url = "socks5://127.0.0.1:1080"
+        _quota_per_ip = 100
+        current_identity = {"impersonate": "chrome131", "user_agent": None, "extra_headers": {}}
+
+        def note_free_request(self):
+            pass
+
+    st = _FailoverStation()
+    real_pool._stations = [st]
+
+    real_pool.on_quota_exhausted(st)  # IP #1 → consec=1
+    real_pool.on_quota_exhausted(st)  # même IP → inchangé
+    assert fired == []
+    per = real_pool._per_station(st)
+    assert per["consec_429"] == 1, "même IP répétée = même bucket, pas d'incrément"
+    st.current_ip = "8.8.8.8"
+    real_pool.on_quota_exhausted(st)  # IP #2 → consec=2
+    assert fired == []
+    st.current_ip = "7.7.7.7"
+    real_pool.on_quota_exhausted(st)  # IP #3 distincte → cascade
+    assert fired == [st], "3 429 sur IPs distinctes → épuisement compte"
+    assert real_pool._per_station(st)["consec_429"] == 0, "compteur reset après cascade"
 
 
 # ── (f) hot-reload: mutation EN PLACE d'IP_ROTATION = POST /api/vpn-config ─

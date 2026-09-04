@@ -2618,7 +2618,7 @@ class VPNManager:
         # not per-station manager settings).
         try:
             from config.settings import _yaml_data as _cfg_data
-            from config.settings import resolved_station_count
+            from config.settings import get_429_action, resolved_station_count
 
             _dual = _cfg_data.get("ip_rotation", {}).get("dual_station", False)
             _strict = _cfg_data.get("ip_rotation", {}).get("strict_free", False)
@@ -2634,9 +2634,7 @@ class VPNManager:
             _free_parallel = _cfg_data.get("ip_rotation", {}).get("free_parallel", {})
             if not isinstance(_free_parallel, dict):
                 _free_parallel = {}
-            _on_429_action = str(_cfg_data.get("ip_rotation", {}).get("on_429_action", "both") or "both").strip().lower()
-            if _on_429_action not in ("cooldown", "rotate", "both"):
-                _on_429_action = "both"
+            _on_429_action = get_429_action()
             try:
                 # [plan 30/08 Lot A2] unité clarifiée : bad_ttl est en MINUTES
                 # (TTL de base de la blacklist fast-pin), bornes 1–4320.

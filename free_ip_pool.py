@@ -199,6 +199,13 @@ class FreeIPPool:
         except Exception:
             pass
         self._on_429_action = "both"
+        # [PLAN-corrections-429 G2] miroir de IP_ROTATION["strict_free"] —
+        # la pool ne peut pas importer opencode (cycle), elle reçoit la
+        # valeur via update_config() (config.yaml au boot + hot-reload).
+        self._strict_free = False
+        # [PLAN-corrections-429 G4] callback épuisement-compte failover,
+        # poussé par opencode.py (set_failover_exhausted_cb) — jamais importé.
+        self._failover_exhausted_cb = None
         # [plan v10 §3.6 Lot 3] Moteur de rotation latence-adaptive — partagé
         # (singleton), config canonique `ip_rotation.latency_rotation`.
         try:
@@ -332,6 +339,10 @@ class FreeIPPool:
                 # on any alive probe; capped at _POST_COMMIT_RETRY_MAX
                 # before the watchdog owns recovery (no docker hot-loop).
                 "post_commit_retry_count": 0,
+                # [PLAN-corrections-429 G4] failover cascade : 429 consécutifs
+                # sur IPs différentes → épuisement compte (cooldown global).
+                "consec_429": 0,
+                "consec_429_ips": [],
             }
         return per
 
@@ -948,6 +959,11 @@ class FreeIPPool:
                     )
                     self._kick_connect(station)
                     # [P3.1-B] hedge opt-in — après paid_hedge_after_ms sans IP fraîche, rendre paid early
+                    # [PLAN-corrections-429 G2] strict_free : ZÉRO jambe paid —
+                    # paid early refusé (le caller _try_free_model_first refuse
+                    # en local via FreeQuotaExhausted).
+                    if getattr(self, "_strict_free", False):
+                        return None, None
                     if getattr(self, "_paid_hedge_after_ms", 0) and self._paid_hedge_after_ms > 0:
                         try:
                             ok = await asyncio.wait_for(
@@ -1018,6 +1034,10 @@ class FreeIPPool:
             raise RotationFailed("connect_next n'a retourné aucune IP")
         per = self._per_station(station)
         per["request_count"] = 0
+        # [PLAN-corrections-429 G4] IP fraîche = nouveau bucket → reset
+        # du compteur cascade (les 429 précédents portaient sur l'ancien).
+        per["consec_429"] = 0
+        per["consec_429_ips"] = []
         per["session_start"] = time.monotonic()
         # [review F1b] the rotation anchor: notify_connection_failure diffs
         # station.current_ip against this to detect a MANAGER repair (re-pin
@@ -1076,9 +1096,8 @@ class FreeIPPool:
 
         No-op when VPN is disabled or in direct mode.
         """
-        action = str(getattr(self, "_on_429_action", "both") or "both").strip().lower()
-        if action not in ("cooldown", "rotate", "both"):
-            action = "both"
+        from config.settings import normalize_429_action as _norm_429
+        action = _norm_429(getattr(self, "_on_429_action", None))
         if not self._vpn.enabled:
             return
         if self._vpn.proxy_mode == "socks5":
@@ -1100,6 +1119,46 @@ class FreeIPPool:
                     self._per_station(station)["bad_until"] = time.monotonic() + self._bad_ttl
         if action in ("rotate", "both"):
             self._launch_rotation(station, forced_pool=forced_pool)
+        # [PLAN-corrections-429 G4] failover cascade : en routing=failover,
+        # la sticky station reçoit TOUT le trafic — ≥3 429 consécutifs sur
+        # des IPs DIFFÉRENTES = épuisement au niveau COMPTE (pas per-IP).
+        # → callback compte-épuisé (opencode.py l'enregistre via
+        # set_failover_exhausted_cb : cooldown "sentinelle" couvrant toutes
+        # les stations pour ce modèle). Pas d'import opencode ici (cycle) :
+        # le callback est poussé, jamais tiré. Succès/rotation fraîche =
+        # reset (voir note_hedge_winner + switch_ip) ; même IP répétée =
+        # compteur inchangé (même bucket).
+        try:
+            if (
+                not self._free_parallel_is_rr()
+                and self._free_parallel_enabled
+                and getattr(station, "_station", None) is not None
+            ):
+                per = self._per_station(station)
+                ip = str(getattr(station, "current_ip", "") or "") or "unknown"
+                ips = per.get("consec_429_ips") or []
+                if ip not in ips:
+                    ips.append(ip)
+                    per["consec_429_ips"] = ips[-4:]
+                    per["consec_429"] = int(per.get("consec_429") or 0) + 1
+                if int(per.get("consec_429") or 0) >= 3:
+                    per["consec_429"] = 0
+                    per["consec_429_ips"] = []
+                    cb = getattr(self, "_failover_exhausted_cb", None)
+                    if callable(cb):
+                        try:
+                            cb(station)
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+
+    def set_failover_exhausted_cb(self, cb) -> None:
+        """[PLAN-corrections-429 G4] Enregistre le callback "épuisement
+        compte" appelé par on_quota_exhausted en cascade failover (≥3 429
+        sur IPs distinctes). Poussé par opencode.py au boot (pas d'import
+        inverse — cycle opencode↔pool interdit). ``None`` = désarme."""
+        self._failover_exhausted_cb = cb if callable(cb) or cb is None else None
 
     async def on_disconnect_retry(
         self, failed: VPNManager | None = None, forced_pool=None
@@ -1636,9 +1695,8 @@ class FreeIPPool:
         if "connect_retry_interval" in cfg:
             self._connect_retry_interval = max(5.0, float(cfg["connect_retry_interval"] or 0))
         if "on_429_action" in cfg:
-            _val = str(cfg["on_429_action"] or "both").strip().lower()
-            if _val in ("cooldown", "rotate", "both"):
-                self._on_429_action = _val
+            from config.settings import normalize_429_action as _norm_429
+            self._on_429_action = _norm_429(cfg["on_429_action"])
         if "bad_ttl" in cfg:
             try:
                 _bt = int(float(cfg["bad_ttl"] if cfg["bad_ttl"] is not None else 60))
@@ -1662,6 +1720,11 @@ class FreeIPPool:
         if "paid_hedge_after_ms" in cfg:
             # [P3.1-B] opt-in hedge — 0 = désactivé, sinon ms
             self._paid_hedge_after_ms = max(0.0, float(cfg["paid_hedge_after_ms"] or 0))
+        # [PLAN-corrections-429 G2] strict_free hot-reloadable (config.yaml
+        # au boot + dashboard). Voir on_request : en strict, la jambe paid
+        # early est refusée (None, None) → le caller refuse en local.
+        if "strict_free" in cfg:
+            self._strict_free = bool(cfg["strict_free"])
         # [Axe 1.1] Bounded rotation concurrency (config.yaml
         # `ip_rotation.rotation_concurrency`, hot-reloadable).
         if "rotation_concurrency" in cfg:
@@ -1746,6 +1809,10 @@ class FreeIPPool:
             return
         try:
             per = self._per_station(winner)
+            # [PLAN-corrections-429 G4] un 200 = la station sert → reset du
+            # compteur cascade (l'épuisement compte supposé est infirmé).
+            per["consec_429"] = 0
+            per["consec_429_ips"] = []
             # hot-reload guard like on_request
             if per["last_quota_per_ip"] is not None and per["last_quota_per_ip"] != getattr(winner, "_quota_per_ip", 0):
                 per["request_count"] = 0

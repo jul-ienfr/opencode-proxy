@@ -4349,7 +4349,7 @@ def register_dashboard(
             "SELECT id, timestamp, model, original_model, duration_ms, tokens_input, tokens_output, "
             "tokens_cache, success, error, protocol, is_stream, thinking, effort, client_ip, "
             "account_alias, station, free_model_ip, geo_country, geo_blocked, geo_direct_country, "
-            "geo_direct_ip, geo_via_vpn, geo_allowed, tools, tools_used "
+            "geo_direct_ip, geo_via_vpn, geo_allowed, tools, tools_used, free_status, paid_status "
             "FROM requests " + where + " ORDER BY timestamp DESC LIMIT ? OFFSET ?"
         )
         params.extend([limit, offset])
@@ -4399,6 +4399,9 @@ def register_dashboard(
                     "geo_direct_ip": r["geo_direct_ip"] if "geo_direct_ip" in r.keys() else None,
                     "geo_via_vpn": bool(r["geo_via_vpn"]) if "geo_via_vpn" in r.keys() and r["geo_via_vpn"] else False,
                     "geo_allowed": r["geo_allowed"] if "geo_allowed" in r.keys() else None,
+                    # [Étape 2 — O2] jambes fallback corrélées par req_id (NULL = pas de fallback).
+                    "free_status": r["free_status"] if "free_status" in r.keys() else None,
+                    "paid_status": r["paid_status"] if "paid_status" in r.keys() else None,
                     "tools": json.loads(r["tools"])
                     if "tools" in r.keys() and r["tools"] and r["tools"] != "[]"
                     else [],
@@ -4467,6 +4470,9 @@ def register_dashboard(
             "response_body": _parse_json_field(row["response_body"])
             if "response_body" in row.keys()
             else None,
+            # [Étape 2 — O2] jambes fallback corrélées par req_id (NULL = pas de fallback).
+            "free_status": row["free_status"] if "free_status" in row.keys() else None,
+            "paid_status": row["paid_status"] if "paid_status" in row.keys() else None,
         }
 
     @app.get("/api/history/filters")
