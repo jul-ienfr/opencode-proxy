@@ -418,6 +418,48 @@ class FreeIPPool:
             return False
         return True
 
+    def _non_routable_reason(self, station) -> str | None:
+        """[fiabilisation 05/09 Lot 0] Pourquoi ``station`` n'est pas routable
+        (base : mêmes branches et même ordre que ``_station_usable`` avec
+        ``exclude_approaching=False``, sans ``forced_pool``). ``None`` =
+        routable. Lecture seule : aucun effet sur la sélection."""
+        try:
+            per = self._per_station(station)
+        except Exception:
+            return "no-per-state"
+        try:
+            if per.get("bad_until") and time.monotonic() < per["bad_until"]:
+                return f"bad_until {int(per['bad_until'] - time.monotonic())}s"
+        except Exception:
+            pass
+        try:
+            if station.status != "connected":
+                return f"status={station.status}"
+        except Exception:
+            return "status=unknown"
+        try:
+            from latency_rotation import get_engine
+
+            eng = getattr(self, "latency_engine", None) or get_engine()
+            cur_ip = str(getattr(station, "current_ip", "") or "")
+            if cur_ip and eng.cfg.enabled and eng.ip_hard_cooled(int(station._station), cur_ip):
+                return "latency-hard-cool"
+        except Exception:
+            pass
+        return None
+
+    def usability_report(self) -> dict:
+        """[fiabilisation 05/09 Lot 0] N/M routable + raison par station,
+        pour le dashboard et le diagnostic « 1 seule station routable »."""
+        report = {}
+        for st in list(self._stations):
+            try:
+                sid = int(getattr(st, "_station", -1))
+            except Exception:
+                sid = -1
+            report[sid] = self._non_routable_reason(st) or "routable"
+        return report
+
     def _free_parallel_is_rr(self) -> bool:
         """True when free_parallel enabled + routing round-robin (tout mode sauf failover)."""
         return bool(self._free_parallel_enabled) and self._free_parallel_routing == "round-robin"
@@ -436,7 +478,20 @@ class FreeIPPool:
             st for st in self._stations if self._station_usable(st, exclude_approaching=False, forced_pool=forced_pool)
         ]
         if not usable:
-            return None
+            # [fiabilisation 05/09] second pass ignorant le hard-cool latence
+            # (miroir de pick_candidates §3.6.5) : sans ça, le chemin
+            # on_request (qui passe par _best_station, pas pick_candidates)
+            # rendait (None, None) alors qu'une station servable existait —
+            # effondrement artificiel N→0/1 sur refroidissement seul.
+            usable = [
+                st for st in self._stations
+                if self._station_usable(
+                    st, exclude_approaching=False, forced_pool=forced_pool,
+                    ignore_latency_cool=True,
+                )
+            ]
+            if not usable:
+                return None
         if not self._free_parallel_is_rr():
             return usable[0]
         # round-robin : selon mode
@@ -889,6 +944,20 @@ class FreeIPPool:
                             break
                     except Exception:
                         continue
+                # [fiabilisation 05/09] refus geo explicite : quelles stations
+                # existent et pourquoi aucune ne passe (évite le « 1 routable »
+                # incompréhensible côté client — voir usability_report).
+                try:
+                    _states = ",".join(
+                        f"{getattr(s, '_station', '?')}:{getattr(s, 'status', '?')}"
+                        for s in self._stations
+                    )
+                    logger.warning(
+                        "[free-ip] geo-mismatch forced_pool=%s stations=[%s] — aucune station compatible",
+                        sorted(forced_pool) if forced_pool else None, _states,
+                    )
+                except Exception:
+                    pass
                 return None, None
             if station is None:
                 return None, None
@@ -1887,6 +1956,9 @@ class FreeIPPool:
                     "bad_remaining": max(0, per["bad_until"] - time.monotonic())
                     if per["bad_until"]
                     else 0,
+                    # [fiabilisation 05/09 Lot 0] raison lisible quand la
+                    # station n'est pas servable (None = routable).
+                    "non_routable_reason": self._non_routable_reason(st),
                     "last_rotation_error": getattr(st, "_last_rotation_error", None),
                     "vpn": st.get_status(),
                 }
@@ -1965,6 +2037,8 @@ class FreeIPPool:
             "stations": stations,
             "healthy": _healthy,
             "healthy_routable": _healthy_routable,
+            # [fiabilisation 05/09 Lot 0] alias top-level pour le dashboard N/M.
+            "routable": _healthy_routable,
             "total": _total,
             "socks5_mode": self.socks5_mode,
             "socks5_current": (

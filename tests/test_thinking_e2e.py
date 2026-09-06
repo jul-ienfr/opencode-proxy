@@ -376,11 +376,25 @@ def test_openai_history_to_anthropic_upstream_no_forged_signature():
         ],
     }
     anthro = pm.openai_to_anthropic_request(oai_body)
-    dumped = json.dumps(anthro)
-    assert '"thinking"' not in dumped, (
-        "aucun bloc thinking forgé vers un upstream Anthropic "
-        "(signature cryptographique exigée par Anthropic)"
+    asst_blocks = anthro["messages"][1]["content"]
+    thinking = [b for b in asst_blocks if b.get("type") == "thinking"]
+    assert len(thinking) == 1
+    assert thinking[0]["signature"] == pm._local_signature(
+        "réflexion d'un autre modèle"
     )
+    stripped = pm.strip_synthetic_thinking(anthro)
+    assert stripped == 1
+    remaining = [
+        b
+        for m in anthro["messages"]
+        for b in m["content"]
+        if isinstance(b, dict) and b.get("type") == "thinking"
+    ]
+    assert not remaining, (
+        "strip_synthetic_thinking retire les blocs forgés avant "
+        "l'envoi à un upstream Anthropic strict"
+    )
+    dumped = pm._json_dumps_str(anthro, ensure_ascii=False)
     assert "réflexion d'un autre modèle" not in dumped
 
 

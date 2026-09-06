@@ -39,6 +39,71 @@ if TYPE_CHECKING:  # annotation seule — pas d'import runtime (déjà injecté 
 # 100% synchrone (file I/O, aucun await) → threading.Lock suffit.
 _ENV_RW_LOCK = threading.Lock()
 
+# [plan 05/09 §1.1] Throttle AUTH inter-stations — NordVPN rate-limited
+# les rafales (6 AUTH en <2s depuis la même IP résidentielle → AUTH_FAILED
+# en cascade, 476 occurrences). Espace les tentatives de 30 s, limite à
+# 2 connexions simultanées, cooldown global 120 s après 3 AUTH_FAILED
+# consécutifs (le compte est temporairement bloqué côté NordVPN).
+_AUTH_THROTTLE_LOCK = threading.Lock()
+_AUTH_FAIL_TIMES: list[float] = []
+_AUTH_GLOBAL_COOLDOWN_UNTIL = 0.0
+_AUTH_LAST_CONNECT_AT = 0.0
+_AUTH_IN_FLIGHT = 0
+
+
+def _auth_record_failure() -> None:
+    global _AUTH_GLOBAL_COOLDOWN_UNTIL
+    now = time.monotonic()
+    armed = False
+    with _AUTH_THROTTLE_LOCK:
+        _AUTH_FAIL_TIMES.append(now)
+        _AUTH_FAIL_TIMES[:] = [t for t in _AUTH_FAIL_TIMES if now - t <= 300.0]
+        if len(_AUTH_FAIL_TIMES) >= 3:
+            _AUTH_GLOBAL_COOLDOWN_UNTIL = now + 120.0
+            _AUTH_FAIL_TIMES.clear()
+            armed = True
+    if armed:
+        logger.warning("[vpn] AUTH_FAILED x3 — cooldown global 120s (plan 05/09 §1.1)")
+
+
+def _auth_cooldown_remaining() -> float:
+    now = time.monotonic()
+    with _AUTH_THROTTLE_LOCK:
+        return max(0.0, _AUTH_GLOBAL_COOLDOWN_UNTIL - now)
+
+
+def _auth_connect_done() -> None:
+    global _AUTH_IN_FLIGHT
+    with _AUTH_THROTTLE_LOCK:
+        _AUTH_IN_FLIGHT = max(0, _AUTH_IN_FLIGHT - 1)
+
+
+async def _auth_gate(count_inflight: bool = True) -> None:
+    global _AUTH_LAST_CONNECT_AT, _AUTH_IN_FLIGHT
+    if os.getenv("PYTEST_CURRENT_TEST"):
+        return
+    while True:
+        wait = _auth_cooldown_remaining()
+        if wait > 0:
+            await asyncio.sleep(min(wait, 5.0))
+            continue
+        sleep_for = 0.0
+        with _AUTH_THROTTLE_LOCK:
+            if count_inflight and _AUTH_IN_FLIGHT >= 2:
+                sleep_for = 2.0
+            else:
+                now = time.monotonic()
+                delta = now - _AUTH_LAST_CONNECT_AT
+                if delta < 30.0:
+                    sleep_for = 30.0 - delta
+                else:
+                    _AUTH_LAST_CONNECT_AT = now
+                    if count_inflight:
+                        _AUTH_IN_FLIGHT += 1
+                    return
+        await asyncio.sleep(sleep_for)
+
+
 # ── Docker Desktop auto-launch (Windows) ───────────────────────────────
 # If Docker Desktop is not running, `docker ps` fails with "error during connect".
 # On Windows, the proxy must auto-launch it (user request) — otherwise 5 stations
@@ -998,6 +1063,23 @@ class VPNManager:
             cfg, "cascade_max_duration_s", 120.0, 30.0, 600.0
         )
         self._cascade_pending_proto: str | None = None  # structured proto for watchdog intercept (no reason parsing)
+        # [cascade intra-OV 05/09] AUTH_FAILED localisé OV → proto opposé avant WG.
+        # Contexte : la cascade WG→OV ne démarre que sur flip WG→OV ; une station
+        # déjà en OV ne cascadiait jamais UDP↔TCP sur AUTH_FAILED (tentative WG
+        # directe, souvent ANNULÉE au canary, ou maintien OV collant).
+        # Cooldown local anti ping-pong UDP→TCP→UDP (clé ov_auth_cascade_cooldown_min,
+        # défaut 30 min = même ordre que le cooldown flip ANNULÉ), bornes 5–120.
+        # [05/09 soir] KILL-SWITCH : ov_auth_cascade_enabled défaut FALSE.
+        # Retour d'expérience : pendant un blocage COMPTE (rate-limit NordVPN),
+        # chaque flip proto = 1 recreate compose = N tentatives AUTH fraîches
+        # HORS budgets rotation (storm/max-h) → alimente le ban au lieu de le
+        # laisser retomber. N'activer que hors panne compte avérée.
+        self._ov_auth_cascade_enabled: bool = bool(cfg.get("ov_auth_cascade_enabled", False))
+        self._ov_auth_cascade_cooldown_s: float = (
+            _clamp_cfg_number(cfg, "ov_auth_cascade_cooldown_min", 30.0, 5.0, 120.0) * 60.0
+        )
+        self._ov_auth_last_proto_flip_at: float | None = None  # monotonic, in-memory (pas persisté)
+        self._ov_auth_last_proto: str | None = None  # dernier proto cible proposé (observabilité)
         # [least-loaded] Pin to the LOWEST-LOAD NordVPN servers in the chosen
         # country instead of letting gluetun pick arbitrarily (which tends to
         # land on the same few overloaded servers). Fetches live server load
@@ -1063,6 +1145,7 @@ class VPNManager:
         self._auth_failed_window: list[float] = []  # monotonic ts, 30-min sliding
         self._last_auto_flip_at: float | None = None  # cooldown (monotonic)
         self._stack_since: float | None = None  # when the effective stack took over
+        self._flip_annule_cooldown_until: float = 0.0
         self._auto_ov_fail_threshold = max(1, int(cfg.get("auto_ov_fail_threshold", 3)))
         self._auto_ov_return_min = max(1, int(cfg.get("auto_ov_return_min", 60)))
         # Cooldown 0 = instantané (utilisateur: pas d'attente, toute station doit être dispo immédiatement)
@@ -1476,6 +1559,7 @@ class VPNManager:
             # (tunnel pas encore établi derrière le SOCKS5 répondeur) ne doivent
             # pas charger le breaker.
             self._warmup_until = time.monotonic() + self._breaker_warmup_grace_s
+            await _auth_gate()
             try:
                 await self._compose_up()
                 started_at = await self._wait_healthy(timeout=120)
@@ -1484,6 +1568,7 @@ class VPNManager:
                 if await self._check_auth_failed(started_at):
                     self._auth_failed = True
                     self._current_ip = None  # stale IP must not be served ([5])
+                    _auth_record_failure()
                     raise RuntimeError("AUTH_FAILED - identifiants NordVPN rejetés")
                 self._auth_failed = False
                 # Boot with country rotation: pin the next country via the
@@ -1531,6 +1616,8 @@ class VPNManager:
                 self._backoff.record_failure()
                 logger.error("[vpn] connect failed: %s", e)
                 raise
+            finally:
+                _auth_connect_done()
 
     def _check_rotation_storm(self) -> None:
         """[plan 30/08 Lot A4] Anti-churn : fenêtre glissante 1 h des
@@ -1690,6 +1777,7 @@ class VPNManager:
                 if self._rotation_cancel_requested:
                     raise RotationFailed("rotation annulée (downscale en cours)")
                 if pinned is None:
+                    await _auth_gate(False)
                     await self._ensure_container()
                     started_at = await self._wait_healthy(timeout=120)
                     if self._rotation_cancel_requested:
@@ -1699,6 +1787,7 @@ class VPNManager:
                     if await self._check_auth_failed(started_at):
                         self._auth_failed = True
                         self._current_ip = None  # stale IP must not be served ([5])
+                        _auth_record_failure()
                         raise RuntimeError("AUTH_FAILED après redémarrage")
                     self._auth_failed = False
                 else:
@@ -2689,6 +2778,8 @@ class VPNManager:
             "station_max_rotations_per_hour": getattr(self, "_max_rotations_per_hour", 10),
             "rotation_storm_cooldown_s": getattr(self, "_rotation_storm_cooldown_s", 600.0),
             "cascade_max_duration_s": getattr(self, "_cascade_max_duration", 120.0),
+            "ov_auth_cascade_enabled": bool(getattr(self, "_ov_auth_cascade_enabled", False)),
+            "ov_auth_cascade_cooldown_min": float(getattr(self, "_ov_auth_cascade_cooldown_s", 1800.0)) / 60.0,
             "stack_age_guard_s": getattr(self, "_stack_age_guard_s", 600.0),
             "wg_canary_poll_interval_s": getattr(self, "_WG_CANARY_POLL_INTERVAL_S", 4.0),
             "bad_ttl_factor": self._config.get("bad_ttl_factor", 2),
@@ -2884,6 +2975,12 @@ class VPNManager:
             self._cascade_max_duration = _clamp_cfg_number(
                 updates, "cascade_max_duration_s", 120.0, 30.0, 600.0
             )
+        if "ov_auth_cascade_cooldown_min" in updates:
+            self._ov_auth_cascade_cooldown_s = (
+                _clamp_cfg_number(updates, "ov_auth_cascade_cooldown_min", 30.0, 5.0, 120.0) * 60.0
+            )
+        if "ov_auth_cascade_enabled" in updates:
+            self._ov_auth_cascade_enabled = bool(updates["ov_auth_cascade_enabled"])
         if "stack_age_guard_s" in updates:
             self._stack_age_guard_s = _clamp_cfg_number(
                 updates, "stack_age_guard_s", 600.0, 60.0, 3600.0
@@ -3058,6 +3155,19 @@ class VPNManager:
                 "cascade_elapsed_s": round(self._cascade_elapsed(), 1),
                 "cascade_remaining_s": round(
                     max(0.0, self._cascade_max_duration - self._cascade_elapsed()), 1
+                ),
+                # [cascade intra-OV 05/09] observabilité flip proto sur AUTH_FAILED
+                "ov_auth_last_proto": getattr(self, "_ov_auth_last_proto", None),
+                "ov_auth_cooldown_remaining_s": max(
+                    0,
+                    int(
+                        float(getattr(self, "_ov_auth_cascade_cooldown_s", 1800.0))
+                        - (
+                            self._now_fn() - self._ov_auth_last_proto_flip_at
+                            if getattr(self, "_ov_auth_last_proto_flip_at", None) is not None
+                            else float(getattr(self, "_ov_auth_cascade_cooldown_s", 1800.0))
+                        )
+                    ),
                 ),
             },
             "identity_index": self._identity_index,
@@ -3968,6 +4078,18 @@ class VPNManager:
             cmd.insert(4, "--force-recreate")
         result = await asyncio.to_thread(self._docker_run, cmd, 120, env=self._compose_env())
         if result.returncode != 0:
+            # [plan 05/09 §1.4] conflit de nom (« already in use » / Conflict) :
+            # conteneur stale hors compose — rm -f puis UN retry.
+            err_txt = f"{result.stderr or ''} {result.stdout or ''}"
+            if "already in use" in err_txt or "Conflict" in err_txt:
+                rm = await asyncio.to_thread(
+                    self._docker_run, ["rm", "-f", self._docker_container], 60
+                )
+                if rm.returncode == 0 or "No such container" in (rm.stderr or ""):
+                    result = await asyncio.to_thread(
+                        self._docker_run, cmd, 120, env=self._compose_env()
+                    )
+        if result.returncode != 0:
             raise RuntimeError(
                 f"échec docker compose up : {result.stderr.strip() or result.stdout.strip()}"
             )
@@ -4233,6 +4355,8 @@ class VPNManager:
         if self._stack != "auto":
             return None
         now = self._now_fn()
+        if now < self._flip_annule_cooldown_until:
+            return None
         # Lazy prune of the sliding window.
         cutoff = now - 30 * 60
         self._auth_failed_window = [t for t in self._auth_failed_window if t >= cutoff]
@@ -4284,6 +4408,49 @@ class VPNManager:
                 return ("openvpn", f"egress dead {self._egress_failures} ticks UDP -> TCP")
             else:
                 return ("openvpn", f"egress dead {self._egress_failures} ticks TCP -> UDP")
+        # [cascade intra-OV 05/09, kill-switch 05/09 soir] AUTH_FAILED localisé
+        # OV → proto opposé AVANT WG — UNIQUEMENT si ov_auth_cascade_enabled.
+        # Pendant un blocage compte, chaque flip = recreate = AUTH fraîches hors
+        # budgets → on laisse retomber le ban au lieu d'y contribuer.
+        if len(self._auth_failed_window) >= self._auto_ov_fail_threshold:
+            if self._cascade_enabled and getattr(self, "_ov_auth_cascade_enabled", False):
+                try:
+                    _global_rem = _auth_cooldown_remaining()
+                except Exception:
+                    _global_rem = 0.0
+                if _global_rem > 0:
+                    logger.debug(
+                        "[vpn-cascade] ov-auth skip: global AUTH cooldown %.0fs remaining "
+                        "(panne généralisée, pas de flip proto)",
+                        _global_rem,
+                    )
+                else:
+                    cur = getattr(self, "_ovpn_protocol_effective", "udp")
+                    target = "tcp" if cur == "udp" else "udp"
+                    try:
+                        _cd = float(getattr(self, "_ov_auth_cascade_cooldown_s", 1800.0))
+                    except Exception:
+                        _cd = 1800.0
+                    _last = getattr(self, "_ov_auth_last_proto_flip_at", None)
+                    if _last is None or (now - _last) >= _cd:
+                        self._ov_auth_last_proto_flip_at = now
+                        self._ov_auth_last_proto = target
+                        self._cascade_pending_proto = target
+                        logger.warning(
+                            "[vpn-cascade] ov-auth %s → %s (%d AUTH_FAILED/30min) — proto opposé avant WG",
+                            cur, target, len(self._auth_failed_window),
+                        )
+                        return (
+                            "openvpn",
+                            f"ov-auth cascade {cur} -> {target} ({len(self._auth_failed_window)} AUTH_FAILED/30min)",
+                        )
+                    else:
+                        logger.debug(
+                            "[vpn-cascade] ov-auth skip: cooldown local %.0fs restant (anti ping-pong %s)",
+                            _cd - (now - _last), cur,
+                        )
+            # Cascade non applicable (désactivée / cooldown) → fall through
+            # vers la logique normale OV→WG ci-dessous.
         if not self._wg_key_present():
             # [Bug #4] log + blocked_reason pour observabilité dashboard
             reason = f"wireguard.env missing ({self._wg_key_file})"
@@ -4467,6 +4634,10 @@ class VPNManager:
         ok = False
         t0 = self._now_fn()
         try:
+            await asyncio.to_thread(self._docker_run,
+                ["compose", "-f", compose_path, "rm", "-sf", self._WG_CANARY_SERVICE],
+                60,
+            )
             result = await asyncio.to_thread(self._docker_run,
                 ["compose", "-f", compose_path, "up", "-d", self._WG_CANARY_SERVICE],
                 240,
@@ -4532,6 +4703,7 @@ class VPNManager:
         if await self._wg_canary_alive(pf[1]):
             return False
         self._pending_flip = None
+        self._flip_annule_cooldown_until = self._now_fn() + 30 * 60
         logger.error(
             "[vpn-watchdog] flip →wireguard ANNULÉ — canari WG sans egress "
             "(%s) ; maintien sur %s jusqu'à preuve du chemin WG",
@@ -5032,6 +5204,9 @@ class VPNManager:
             "cascade_remaining_s": round(
                 max(0.0, self._cascade_max_duration - self._cascade_elapsed()), 1
             ),
+            # [cascade intra-OV 05/09] observabilité flip proto sur AUTH_FAILED
+            "ov_auth_last_proto": getattr(self, "_ov_auth_last_proto", None),
+            "ov_auth_cascade_cooldown_s": float(getattr(self, "_ov_auth_cascade_cooldown_s", 1800.0)),
         }
 
     async def _check_auth_failed(self, started_at: str = "", text: str | None = None) -> bool:
@@ -5402,6 +5577,7 @@ class VPNManager:
                     raise RuntimeError("tunnel non sain après mise à jour")
                 if await self._check_auth_failed(started_at):
                     self._auth_failed = True
+                    _auth_record_failure()
                     raise RuntimeError("AUTH_FAILED après mise à jour")
                 self._auth_failed = False
                 # Fresh IP + NEW identity: the recreate re-picked a server, so
@@ -5983,9 +6159,20 @@ class VPNManager:
                 if ok:
                     return
                 # Protocol flip failed -> fall through to stack flip as escalation
-            elif self._cascade_enabled and "cascade step" in reason and mode == "openvpn":
+            elif self._cascade_enabled and ("cascade step" in reason or "ov-auth cascade" in reason) and mode == "openvpn":
                 # Fallback: legacy reason parsing (only if pending was lost)
-                proto = reason.split(":")[-1].strip().split()[-1] if ":" in reason else "udp"
+                # [cascade intra-OV 05/09] "ov-auth cascade udp -> tcp (...)" → dernier mot
+                # nettoyé ("(3", "tcp)"…) — on extrait udp/tcp par recherche, pas par split brut.
+                proto = "udp"
+                _rl = reason.lower()
+                if "-> tcp" in _rl:
+                    proto = "tcp"
+                elif "-> udp" in _rl:
+                    proto = "udp"
+                else:
+                    proto = reason.split(":")[-1].strip().split()[-1].strip(")").lower() if ":" in reason else "udp"
+                    if proto not in ("udp", "tcp"):
+                        proto = "tcp" if "tcp" in _rl else "udp"
                 if proto in ("udp", "tcp"):
                     ok = await self._apply_ovpn_protocol(proto, reason=reason)
                     if ok:

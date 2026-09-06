@@ -867,7 +867,9 @@ class TestAnthropicToOpenAIResponses:
         assert usage["input_tokens"] == 20
         assert usage["output_tokens"] == 10
         assert usage["total_tokens"] == 30
-        assert usage["output_tokens_details"]["cached_tokens"] == 5
+        # cache READ tokens → input_tokens_details ( spéc OpenAI Responses :
+        # cached_tokens VIT dans input_tokens_details, pas output_* )
+        assert usage["input_tokens_details"]["cached_tokens"] == 5
 
 
 # ── Protocol Resolution ──────────────────────────────────────────

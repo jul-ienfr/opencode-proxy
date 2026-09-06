@@ -145,6 +145,32 @@ def _extract_cache_tokens(usage: dict) -> int:
     return 0
 
 
+def _extract_cache_creation_tokens(usage: dict) -> int:
+    """[Lot H1] Tokens écrits en cache côté upstream OpenAI, si le champ existe.
+
+    OpenAI n'expose pas de champ standard unique : certains upstreams renvoient
+    `prompt_tokens_details.cache_creation_tokens`, d'autres un top-level
+    `cache_creation_input_tokens` (passthrough Anthropic-compat) ou
+    `prompt_cache_miss_tokens`. Fallback 0 quand absent.
+    """
+    details = usage.get("prompt_tokens_details") or {}
+    if "cache_creation_tokens" in details:
+        return details["cache_creation_tokens"]
+    if "cache_creation_input_tokens" in usage:
+        return usage["cache_creation_input_tokens"]
+    if "prompt_cache_miss_tokens" in usage:
+        return usage["prompt_cache_miss_tokens"]
+    return 0
+
+
+# [Lot H3] Cache borné des blocs redacted_thinking retirés des requêtes partant
+# vers des upstreams non-Anthropic. Clé = sha256 du champ `data` (blob chiffré
+# authentique, non déchiffrable par le proxy). Les blocs restent disponibles
+# pour réinjection si la conversation revient vers un upstream Anthropic.
+_redacted_thinking_cache: OrderedDict[str, dict] = OrderedDict()
+_REDACTED_THINKING_CACHE_MAX = 512
+
+
 _thinking_cfg = yaml_get("thinking", "min_tokens", {})
 THINKING_MODELS = (
     {k: int(v) for k, v in _thinking_cfg.items()}
@@ -570,10 +596,24 @@ def anthropic_to_openai(body: dict, model: str, raw: bytes | None = None) -> dic
                 # transitent jamais vers openai-compatible (seul le texte).
                 thinking_parts.append(block.get("thinking", ""))
             elif btype == "redacted_thinking":
-                # [PLAN-raisonnement Phase D.4] donnée chiffrée authentique :
-                # préservée telle quelle vers Anthropic (passthrough), strippée
-                # vers les autres upstreams (non déchiffrable, non interprétable)
-                _debug("  [convert] DROP redacted_thinking → upstream non-Anthropic")
+                # [Lot H3 — remplace Phase D.4] donnée chiffrée authentique :
+                # préservée telle quelle vers Anthropic (passthrough). Vers les
+                # autres upstreams le bloc ne peut pas transiter (non déchiffrable,
+                # non interprétable) mais il est CONSERVÉ dans
+                # _redacted_thinking_cache au lieu d'être perdu définitivement.
+                _rt_data = block.get("data", "")
+                if isinstance(_rt_data, str) and _rt_data:
+                    _rt_key = hashlib.sha256(
+                        _rt_data.encode("utf-8", "ignore")
+                    ).hexdigest()
+                    _redacted_thinking_cache[_rt_key] = block
+                    _redacted_thinking_cache.move_to_end(_rt_key)
+                    if len(_redacted_thinking_cache) > _REDACTED_THINKING_CACHE_MAX:
+                        _redacted_thinking_cache.popitem(last=False)
+                _debug(
+                    "  [convert] CACHE redacted_thinking → upstream non-Anthropic "
+                    "(conservé pour réinjection vers Anthropic)"
+                )
                 continue
             elif btype == "image":
                 src = block.get("source", {})
@@ -1066,7 +1106,7 @@ def openai_to_anthropic(resp: dict, model: str) -> dict:
         "usage": {
             "input_tokens": usage.get("prompt_tokens", 0),
             "output_tokens": usage.get("completion_tokens", 0),
-            "cache_creation_input_tokens": 0,
+            "cache_creation_input_tokens": _extract_cache_creation_tokens(usage),
             "cache_read_input_tokens": usage.get("prompt_tokens_details", {}).get(
                 "cached_tokens", 0
             ),
@@ -1159,17 +1199,26 @@ def openai_to_anthropic_request(oai_body: dict) -> dict:
                 }
             )
 
-        # [PLAN-raisonnement Phase D.3] PAS de conversion reasoning_content →
-        # thinking ici : ce corps part vers un UPSTREAM Anthropic, qui valide
-        # cryptographiquement les signatures. Forger une signature locale
-        # produirait un 400 au tour suivant ; le raisonnement est simplement
-        # omis de l'historique (jamais de fausse signature vers Anthropic).
-        if isinstance(msg.get("reasoning_content") or msg.get("reasoning"), str) and (
-            msg.get("reasoning_content") or msg.get("reasoning")
-        ).strip():
-            _debug(
-                "  [convert] DROP reasoning_content historique → upstream Anthropic "
-                "(pas de signature forgée)"
+        # [Lot H2 — remplace Phase D.3] reasoning_content historique → bloc
+        # thinking avec signature locale, symétrique du sens réponse
+        # (openai_to_anthropic). Sécurité : les blocs à signature LOCALE sont
+        # reconnus et retirés par strip_synthetic_thinking (appelé sur la voie
+        # Anthropic, opencode.py) avant l'envoi à un upstream strict qui valide
+        # cryptographiquement les signatures — jamais de 400 forgé ; vers un
+        # upstream compatible le raisonnement voyage au lieu d'être perdu.
+        _hist_reasoning = msg.get("reasoning_content") or msg.get("reasoning")
+        if (
+            role == "assistant"
+            and isinstance(_hist_reasoning, str)
+            and _hist_reasoning.strip()
+        ):
+            blocks.insert(
+                0,
+                {
+                    "type": "thinking",
+                    "thinking": _hist_reasoning,
+                    "signature": _local_signature(_hist_reasoning),
+                },
             )
 
         # Ensure at least one block
@@ -1261,6 +1310,14 @@ def openai_to_anthropic_request(oai_body: dict) -> dict:
                 result["tool_choice"] = tc_type
         else:
             result["tool_choice"] = tc
+
+    # [Lot H4] Sens inverse de _effort_to_reasoning : un client OpenAI qui
+    # envoie reasoning_effort doit obtenir une config thinking Anthropic quand
+    # la requête est routée vers un upstream Anthropic (P26).
+    _re = oai_body.get("reasoning_effort")
+    if isinstance(_re, str) and _re and _re not in ("none", "minimal"):
+        _budget = {"low": 4096, "medium": 10000, "high": 16000}.get(_re, 16000)
+        result["thinking"] = {"type": "enabled", "budget_tokens": _budget}
 
     return result
 
@@ -1544,9 +1601,11 @@ def anthropic_to_openai_responses(anthro: dict, model: str) -> dict:
         "input_tokens": in_t,
         "output_tokens": out_t,
         "total_tokens": in_t + out_t,
+        "input_tokens_details": {
+            "cached_tokens": usage.get("cache_read_input_tokens", 0),
+        },
         "output_tokens_details": {
             "reasoning_tokens": 0,
-            "cached_tokens": usage.get("cache_read_input_tokens", 0),
         },
     }
 
@@ -1621,9 +1680,11 @@ def openai_chat_to_responses(chat_resp: dict, model: str) -> dict:
         "input_tokens": prompt_tokens,
         "output_tokens": completion_tokens,
         "total_tokens": prompt_tokens + completion_tokens,
+        "input_tokens_details": {
+            "cached_tokens": cached,
+        },
         "output_tokens_details": {
             "reasoning_tokens": 0,
-            "cached_tokens": cached,
         },
     }
 
@@ -1637,9 +1698,237 @@ def openai_chat_to_responses(chat_resp: dict, model: str) -> dict:
     }
 
 
+# ── Tool-name sanitization (fix 400 `name must be at most 64 characters`) ──
+# L'upstream /responses refuse les noms d'outils >64 chars (ex. tools MCP
+# `mcp__plugin_...`, 65 chars) : le free tombait en 400 systématique, le retry
+# « station fraîche » rejouant le MÊME body 4-5×. Sanitize-aller + restore-retour,
+# par requête (clé privée `_tool_name_map`, jamais globale) — uniforme free+paid,
+# jamais de branche au nom de modèle. Server tools `web_*` exclus.
+TOOL_NAME_MAX_LEN = 64
+_TOOL_NAME_MAP_KEY = "_tool_name_map"
+_TOOL_NAME_RE = re.compile(r"[^A-Za-z0-9_-]")
+# Marqueur interne retry-once (items reasoning synthétiques) — posé dans le
+# dict converti, consommé par la logique retry du caller, JAMAIS envoyé sur
+# le wire (l'upstream /responses le rejette `unknown parameter` en 400).
+_HAS_SYNTHETIC_REASONING_KEY = "_has_synthetic_reasoning_items"
+
+
+def _short_tool_name(name: str) -> str:
+    """Raccourci déterministe : `name[:57] + "-" + sha1(name)[:6]` (=64)."""
+    digest = hashlib.sha1(name.encode("utf-8")).hexdigest()[:6]
+    return f"{name[:57]}-{digest}"
+
+
+def sanitize_tool_names(tools: list) -> tuple[list, dict]:
+    """Sanitize les noms d'outils d'une liste `tools` Responses (dicts avec `name`).
+
+    Retourne (tools_sanitized, name_map) où name_map = {short: original}.
+    Fast-path : noms ≤64 + charset OK → payload inchangé, map vide.
+    Collisions résiduelles résolues par ordre alphabétique trié
+    (`name[:54] + "-" + sha1[:6] + "-02"`). Server tools `web_*` jamais renommés.
+    """
+    if not isinstance(tools, list) or not tools:
+        return tools, {}
+    used_valid: set[str] = set()
+    todo: list[tuple[int, dict, str]] = []  # (index, entry, original)
+    for i, t in enumerate(tools):
+        if not isinstance(t, dict):
+            continue
+        name = t.get("name", "")
+        if not isinstance(name, str) or not name or name.startswith("web_"):
+            if isinstance(name, str) and name:
+                used_valid.add(name)
+            continue
+        if len(name) <= TOOL_NAME_MAX_LEN and not _TOOL_NAME_RE.search(name):
+            used_valid.add(name)
+            continue
+        todo.append((i, t, name))
+    if not todo:
+        return tools, {}
+    # Passe 1 : candidat déterministe par outil (re-charset défensif d'abord,
+    # digest sha1 sur l'original — cas courant long-mais-valide = plan-literal).
+    cand_of: dict[int, str] = {}
+    for i, _t, name in todo:
+        clean = _TOOL_NAME_RE.sub("_", name)
+        if len(clean) <= TOOL_NAME_MAX_LEN:
+            cand_of[i] = clean
+        else:
+            digest = hashlib.sha1(name.encode("utf-8")).hexdigest()[:6]
+            cand_of[i] = f"{clean[:57]}-{digest}"
+    # Passe 2 : collisions résiduelles, ordre alphabétique trié (indépendant
+    # de l'ordre d'arrivée des tools → déterministe inter-requêtes).
+    by_cand: dict[str, list[tuple[int, str]]] = {}
+    for i, _t, name in todo:
+        by_cand.setdefault(cand_of[i], []).append((i, name))
+    name_map: dict[str, str] = {}
+    final: dict[int, str] = {}
+    used = set(used_valid)
+    for cand, members in sorted(by_cand.items()):
+        originals = sorted({name for _, name in members})
+        first_keeps = len(originals) == 1 and cand not in used
+        n = 2
+        for orig in originals:
+            if first_keeps and orig == originals[0]:
+                short = cand
+            else:
+                digest = hashlib.sha1(orig.encode("utf-8")).hexdigest()[:6]
+                clean = _TOOL_NAME_RE.sub("_", orig)
+                short = f"{clean[:54]}-{digest}-{n:02d}"
+                while short in used:
+                    n += 1
+                    short = f"{clean[:54]}-{digest}-{n:02d}"
+                n += 1
+            used.add(short)
+            name_map[short] = orig
+            for i, name in members:
+                if name == orig:
+                    final[i] = short
+    out = [dict(t) if idx in final else t for idx, t in enumerate(tools)]
+    for idx, short in final.items():
+        out[idx]["name"] = short
+    return out, name_map
+
+
+def restore_tool_name(short: str, name_map: dict | None) -> str:
+    """Restore le nom original d'un outil sanitizé (retour aller→client)."""
+    if not name_map or not isinstance(short, str):
+        return short
+    return name_map.get(short, short)
+
+
+def _inverse_tool_name_lookup(name_map: dict | None, original: str) -> str | None:
+    """Recherche inversée original → short dans une map {short: original}."""
+    if not isinstance(name_map, dict) or not isinstance(original, str):
+        return None
+    for _short, _orig in name_map.items():
+        if _orig == original:
+            return _short
+    return None
+
+
+def _register_defensive_short(name: str, name_map: dict) -> str:
+    """Short déterministe ≤64 + charset valide pour un nom hors tools[]
+    (historique périmé, tool_choice orphelin), enregistré {short: original}
+    dans name_map pour le restore-retour. Collisions suffixées."""
+    clean = _TOOL_NAME_RE.sub("_", name)
+    digest = hashlib.sha1(name.encode("utf-8")).hexdigest()[:6]
+    short = f"{clean[:57]}-{digest}"
+    n = 2
+    while short in name_map and name_map.get(short) != name:
+        short = f"{clean[:54]}-{digest}-{n:02d}"
+        n += 1
+    name_map[short] = name
+    return short
+
+
+def _remap_responses_history_names(inp: list, name_map: dict) -> dict:
+    """P0-1 [msg_18d502b1e0b40-e] : l'historique multi-tours
+    (input[].function_call.name) suit le même rename que tools[] — sinon le
+    tour N+1 rejoue le nom original (>64) et l'upstream répond 400
+    `name must be at most 64 characters` sur chaque station.
+
+    Mute les items function_call de `inp` + complète `name_map` (noms hors
+    tools[] → short défensif enregistré pour le restore-retour). Idempotent :
+    un nom déjà short/valide est laissé inchangé.
+    """
+    if not isinstance(inp, list) or not inp or not isinstance(name_map, dict):
+        return name_map
+    inv: dict[str, str] = {
+        o: s for s, o in name_map.items() if isinstance(s, str) and isinstance(o, str)
+    }
+    for item in inp:
+        if not isinstance(item, dict) or item.get("type") != "function_call":
+            continue
+        name = item.get("name", "")
+        if not isinstance(name, str) or not name:
+            continue
+        short = inv.get(name)
+        if short is None and (len(name) > TOOL_NAME_MAX_LEN or _TOOL_NAME_RE.search(name)):
+            short = _register_defensive_short(name, name_map)
+            inv[name] = short
+        if short is not None:
+            item["name"] = short
+    return name_map
+
+
+def _remap_responses_tool_choice(tc, name_map: dict | None):
+    """P0-2 : toute forme nommée de tool_choice suit le rename aller —
+    OpenAI {"type": "function", "function": {"name"}}, Responses natif
+    {"type": "function", "name"}, string. Copie défensive (jamais de mutation
+    du caller) ; nom >64 hors map → short défensif enregistré."""
+    if isinstance(tc, str):
+        if not isinstance(name_map, dict) or not tc:
+            return tc
+        short = _inverse_tool_name_lookup(name_map, tc)
+        if short is not None:
+            return short
+        if len(tc) > TOOL_NAME_MAX_LEN or _TOOL_NAME_RE.search(tc):
+            return _register_defensive_short(tc, name_map)
+        return tc
+    if not isinstance(tc, dict):
+        return tc
+    fn = tc.get("function")
+    if isinstance(fn, dict) and isinstance(fn.get("name"), str):
+        # Forme OpenAI {"type": "function", "function": {"name"}} (produite par
+        # anthropic_to_openai) → normalisée Responses {"type": "function",
+        # "name"} comme historiquement (format wire attendu par l'upstream).
+        name = fn.get("name", "")
+        if not name or not isinstance(name_map, dict):
+            return {"type": "function", "name": name}
+        short = _inverse_tool_name_lookup(name_map, name)
+        if short is None and (len(name) > TOOL_NAME_MAX_LEN or _TOOL_NAME_RE.search(name)):
+            short = _register_defensive_short(name, name_map)
+        return {"type": "function", "name": short if short is not None else name}
+    if isinstance(tc.get("name"), str):
+        # Forme Responses native {"type": "function", "name"} (+ tool_choice
+        # verbatim) : copie défensive, remap en place.
+        tc = dict(tc)
+        name = tc.get("name", "")
+        if not name or not isinstance(name_map, dict):
+            return tc
+        short = _inverse_tool_name_lookup(name_map, name)
+        if short is None and (len(name) > TOOL_NAME_MAX_LEN or _TOOL_NAME_RE.search(name)):
+            short = _register_defensive_short(name, name_map)
+        if short is not None:
+            tc["name"] = short
+        return tc
+    return tc
+
+
+def _sanitize_native_responses_request(req: dict) -> dict:
+    """Sanitize-aller pour un body déjà au format Responses (verbatim) :
+    tools[] + historique input[].function_call + tool_choice, map réunie sous
+    _TOOL_NAME_MAP_KEY (jamais globale). Copie les conteneurs mutés pour ne
+    jamais muter le caller. Idempotent (double conversion)."""
+    if not isinstance(req, dict):
+        return req
+    req = dict(req)
+    name_map = req.get(_TOOL_NAME_MAP_KEY)
+    name_map = dict(name_map) if isinstance(name_map, dict) else {}
+    tools = req.get("tools")
+    if isinstance(tools, list) and tools:
+        tools, fresh = sanitize_tool_names(tools)
+        req["tools"] = tools
+        for _s, _o in fresh.items():
+            name_map.setdefault(_s, _o)
+    inp = req.get("input")
+    if isinstance(inp, list) and inp:
+        req["input"] = [dict(it) if isinstance(it, dict) else it for it in inp]
+        _remap_responses_history_names(req["input"], name_map)
+    if req.get("tool_choice") is not None:
+        req["tool_choice"] = _remap_responses_tool_choice(req["tool_choice"], name_map)
+    if name_map:
+        req[_TOOL_NAME_MAP_KEY] = name_map
+    else:
+        req.pop(_TOOL_NAME_MAP_KEY, None)
+    return req
+
+
 def _chat_to_responses_request(chat: dict) -> dict:
     if "input" in chat and "messages" not in chat:
-        return dict(chat)
+        # Verbatim natif Responses : sanitize quand même (tools + historique
+        # + tool_choice, P0-1/P0-2), sinon fuite sur la jambe payée.
+        return _sanitize_native_responses_request(dict(chat))
     inp = []
     _has_reasoning_items = False
     for m in chat.get("messages", []) or []:
@@ -1724,8 +2013,10 @@ def _chat_to_responses_request(chat: dict) -> dict:
     # [Correctif parité multi-tours] marqueur pour le retry-once : si l'upstream
     # rejette les items reasoning synthétiques (400/422), /responses retente
     # une fois sans eux (même payload sinon) au lieu de casser le tour entier.
+    # Interne uniquement : stripé au dernier kilomètre (_serialize_json_body),
+    # jamais sur le wire (inconnu de l'upstream → 400).
     if _has_reasoning_items:
-        req["_has_synthetic_reasoning_items"] = True
+        req[_HAS_SYNTHETIC_REASONING_KEY] = True
     if "max_tokens" in chat:
         req["max_output_tokens"] = chat["max_tokens"]
     if "max_output_tokens" in chat:
@@ -1774,25 +2065,42 @@ def _chat_to_responses_request(chat: dict) -> dict:
                 if _is_strict and _needs_fallback(raw_params):
                     tool_entry["strict"] = False
                 tools.append(tool_entry)
+        _name_map: dict = {}
         if tools:
+            # Sanitize-aller : l'upstream /responses refuse les noms >64 chars
+            # (400 systématique → retry station fraîche inutile). La map est
+            # transportée par requête (clé privée, jamais globale) pour le
+            # restore-retour ; stripée avant sérialisation wire.
+            tools, _name_map = sanitize_tool_names(tools)
             req["tools"] = tools
+        # P0-1 [msg_18d502b1e0b40-e] : l'historique (input[].function_call.name)
+        # suit le même rename — le tour N+1 rejoue sinon le nom original.
+        _remap_responses_history_names(inp, _name_map)
+        if _name_map:
+            req[_TOOL_NAME_MAP_KEY] = _name_map
         tc = chat.get("tool_choice")
         if tc is not None:
-            if isinstance(tc, dict) and tc.get("type") == "function":
-                req["tool_choice"] = {"type": "function", "name": tc["function"].get("name", "")}
-            else:
-                req["tool_choice"] = tc
+            # P0-2 : toutes les formes nommées suivent le rename.
+            req["tool_choice"] = _remap_responses_tool_choice(tc, _name_map)
+    else:
+        # P0-1 sans définitions : l'historique reste remappé en défensif
+        # (map locale, restore-retour préservé).
+        _alone: dict = {}
+        _remap_responses_history_names(inp, _alone)
+        if _alone:
+            req[_TOOL_NAME_MAP_KEY] = _alone
     return req
 
 
 def _anthropic_to_responses_request(anthro: dict) -> dict:
     if "input" in anthro and "messages" not in anthro:
-        return dict(anthro)
+        # Verbatim natif Responses : même sanitize que le chemin chat (P0-1/P0-2).
+        return _sanitize_native_responses_request(dict(anthro))
     chat = anthropic_to_openai(anthro, anthro.get("model", ""))
     return _chat_to_responses_request(chat)
 
 
-def _responses_to_chat_response(resp: dict, model: str) -> dict:
+def _responses_to_chat_response(resp: dict, model: str, name_map: dict | None = None) -> dict:
     out = resp.get("output", []) or []
     texts = []
     reasoning = ""
@@ -1814,7 +2122,7 @@ def _responses_to_chat_response(resp: dict, model: str) -> dict:
                     "id": item.get("call_id", item.get("id", "")),
                     "type": "function",
                     "function": {
-                        "name": item.get("name", ""),
+                        "name": restore_tool_name(item.get("name", ""), name_map),
                         "arguments": item.get("arguments", "{}"),
                     },
                 }
@@ -1854,7 +2162,9 @@ def _responses_to_chat_response(resp: dict, model: str) -> dict:
     }
 
 
-def _responses_to_anthropic_response(resp: dict, model: str) -> dict:
+def _responses_to_anthropic_response(
+    resp: dict, model: str, name_map: dict | None = None
+) -> dict:
     blocks = []
     for item in resp.get("output", []) or []:
         if not isinstance(item, dict):
@@ -1882,7 +2192,7 @@ def _responses_to_anthropic_response(resp: dict, model: str) -> dict:
                 {
                     "type": "tool_use",
                     "id": item.get("call_id", item.get("id", "")),
-                    "name": item.get("name", ""),
+                    "name": restore_tool_name(item.get("name", ""), name_map),
                     "input": inp,
                 }
             )
@@ -1933,17 +2243,21 @@ _reasoning_seen_ids: set = set()
 class ResponsesSseState:
     """État de conversion SSE Responses-API pour UN stream."""
 
-    __slots__ = ("tool_cache", "tool_index_map", "reasoning_seen")
+    __slots__ = ("tool_cache", "tool_index_map", "reasoning_seen", "tool_name_map")
 
     def __init__(self) -> None:
         self.tool_cache: dict = {}
         self.tool_index_map: dict = {}
         self.reasoning_seen: set = set()
+        # Restore-retour stream : {short: original}, posée par requête par le
+        # caller (même map que l'aller) ; None = pas de rename sur ce stream.
+        self.tool_name_map: dict | None = None
 
     def reset(self) -> None:
         self.tool_cache.clear()
         self.tool_index_map.clear()
         self.reasoning_seen.clear()
+        self.tool_name_map = None
 
 
 def _responses_sse_to_chat_deltas(raw_line: str, parsed=None, state: "ResponsesSseState | None" = None):
@@ -2076,7 +2390,10 @@ def _responses_sse_to_chat_deltas(raw_line: str, parsed=None, state: "ResponsesS
                 tool_index_map[out_idx] = len(tool_index_map)
             tool_idx = tool_index_map[out_idx]
             call_id = item.get("call_id") or item.get("id") or f"call_{uuid.uuid4().hex[:12]}"
-            name = item.get("name", "")
+            # Restore-retour : le client reçoit le nom original, jamais le
+            # raccourci sanitizé envoyé à l'upstream.
+            _sse_name_map = state.tool_name_map if state is not None else None
+            name = restore_tool_name(item.get("name", ""), _sse_name_map)
             # Cache for later delta events (by item_id and output_index)
             iid = item.get("id") or call_id
             tool_cache[iid] = {
@@ -2249,7 +2566,7 @@ def _responses_sse_to_chat_deltas(raw_line: str, parsed=None, state: "ResponsesS
                 "total_tokens", usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
             ),
         }
-        return {"choices": [], "usage": chat_usage}
+        return {"choices": [], "usage": chat_usage, "_incomplete": True}
 
     # All other event types (response.created, response.in_progress,
     # response.output_item.done, response.content_part.added/done, etc.) — skip

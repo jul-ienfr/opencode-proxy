@@ -15,7 +15,7 @@ qualité Phase 5, PR isolée n°1). Ce module est PUR : aucun import du projet
   * ``debug_fn`` / ``log_fn`` injectés pour la journalisation.
 
 Contrats couverts par tests/test_db_offload.py :
-  - _materialize_db_row produit EXACTEMENT le même tuple SQL 30 colonnes ;
+  - _materialize_db_row produit EXACTEMENT le même tuple SQL 32 colonnes ;
   - la queue transporte des lignes BRUTES (_DbRowRaw) ;
   - les corps > 2 Mo sont stubés côté caller (jamais épinglés en queue).
 """
@@ -262,6 +262,10 @@ _REQUEST_COLUMN_MIGRATIONS = [
     ("geo_direct_ip", "NULL"),
     ("geo_via_vpn", "0"),
     ("geo_allowed", "NULL"),
+    # [Étape 2 — O2] jambes fallback corrélées par req_id (remplies par
+    # _save_request via peek _FALLBACK_CTX + statut paid ; NULL = pas de fallback)
+    ("free_status", "NULL"),
+    ("paid_status", "NULL"),
 ]
 
 _INSERT_REQUESTS_SQL = """
@@ -269,8 +273,8 @@ _INSERT_REQUESTS_SQL = """
         tokens_input, tokens_output, tokens_cache, success, error,
         protocol, is_stream, thinking, effort, client_ip, account_alias, tools, tools_used,
         request_body, response_body, client_user_agent, free_model_ip, identity, geo_country, geo_blocked,
-        geo_direct_country, geo_direct_ip, geo_via_vpn, geo_allowed, station)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        geo_direct_country, geo_direct_ip, geo_via_vpn, geo_allowed, station, free_status, paid_status)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """
 
 # [P1.2] INSERT free_model_usage préparé par l'appelant (timestamp inclus) —
@@ -400,7 +404,7 @@ def insert_sync(
     *,
     debug_fn,
 ) -> None:
-    """Synchronous DB insert d'un tuple SQL complet (30 colonnes) — appelé
+    """Synchronous DB insert d'un tuple SQL complet (32 colonnes) — appelé
     via thread pool.
 
     Batches commits: accumulates INSERTs and commits every commit_batch
