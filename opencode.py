@@ -1281,15 +1281,25 @@ def _serialize_json_body(body) -> bytes:
     stdlib sur la loop à chaque tentative (équivalent de json=body).
     [tool-names ≤64] strip défensif de la clé privée _tool_name_map :
     la map aller→retour ne doit JAMAIS être sérialisée à l'upstream
-    (les callers la poppent en local pour le restore-retour)."""
+    (les callers la poppent en local pour le restore-retour).
+    [msg_18e84c912f240-1b] strip du marqueur interne
+    _has_synthetic_reasoning_items (retry-once local) : inconnu de
+    l'upstream /responses → 400 `unknown parameter` systématique sur les
+    tours avec historique reasoning. Consommé pré-sérialisation par le
+    retry-once — le strip wire ne change rien à la logique locale."""
     if isinstance(body, (bytes, bytearray, memoryview)):
         return bytes(body)
-    if isinstance(body, dict) and _TOOL_NAME_MAP_KEY in body:
+    if isinstance(body, dict) and (_TOOL_NAME_MAP_KEY in body or _HAS_SYNTHETIC_REASONING_KEY in body):
         # Copie filtrante : ne JAMAIS muter le dict appelant — la map
         # aller→retour doit survivre aux sends pour le restore-retour
-        # (pops aux restores non-stream, slot SSE en stream). Alloc
-        # seulement quand la map est présente (noms >64, cas rare).
-        body = {k: v for k, v in body.items() if k != _TOOL_NAME_MAP_KEY}
+        # (pops aux restores non-stream, slot SSE en stream), et le marqueur
+        # doit survivre pour le retry-once du caller. Alloc seulement quand
+        # une clé privée est présente (cas rares).
+        body = {
+            k: v
+            for k, v in body.items()
+            if k != _TOOL_NAME_MAP_KEY and k != _HAS_SYNTHETIC_REASONING_KEY
+        }
     return _json_dumps(body)
 
 
@@ -2342,9 +2352,22 @@ async def lifespan(app):
     # serialize the cold-start: station N waits for station 1's full
     # compose-up). Each start() is fail-soft internally (docker down/logs a
     # warning) so gather() never raises.
+    # [fiabilisation 05/09 Lot 1] stagger à 2 stations max en // + 5s entre
+    # vagues : 6 `compose up` simultanés = rafale AUTH côté NordVPN
+    # (rate-limit, cf. throttle global vpn_manager) + thundering herd docker.
     # [v6 P0-2] fail-soft gather + boot_error (connected < n) — 100% certitude
+    _boot_sem = asyncio.Semaphore(2)
+
+    async def _start_one(_m):
+        async with _boot_sem:
+            try:
+                await _m.start()
+            except Exception as _e:
+                _debug(f"  [lifespan] WARN boot station start raised: {_e!r}")
+            await asyncio.sleep(5)
+
     _gather_results = await asyncio.gather(
-        *(m.start() for m in _managers if m.enabled), return_exceptions=True
+        *(_start_one(m) for m in _managers if m.enabled), return_exceptions=True
     )
     for _r in _gather_results:
         if isinstance(_r, Exception):
@@ -5061,6 +5084,14 @@ async def _open_free_stream(
     another station (fresh IP = fresh quota). True = legacy behavior (the
     direct fallback is the existing semantics).
     """
+    # [PLAN_CORRECTION_FAUX_429 Lot B2] delai court plafonne avant re-tentative free (fresh_station)
+    if use_free and fresh_station and not count_request:
+        try:
+            _b2 = _free_retry_delay_seconds(1)
+            if _b2 > 0:
+                await asyncio.sleep(_b2)
+        except Exception:
+            pass
     _debug(
         f"  [free-stream] _open_free_stream called: use_free={use_free} pool={_free_ip_pool is not None} pool_enabled={_free_ip_pool.enabled if _free_ip_pool else False}"
     )
@@ -5804,11 +5835,10 @@ def _on_free_429_stream(free_model: str, retry_after: str = "", forced_pool=None
         stations=failed_stations if failed_stations else [_free_attempt_station()],
         forced_pool=forced_pool,
     )
-    if IP_ROTATION.get("strict_free", False):
-        if _free_exception_fallback_mode() == "direct":
-            return False
-        return _free_stations_exhausted(free_model)
-    return _free_stations_exhausted(free_model)
+    strict_free = IP_ROTATION.get("strict_free", False)
+    if strict_free and _free_exception_fallback_mode() == "direct":
+        return False
+    return bool(strict_free) and _free_stations_exhausted(free_model)
 
 
 def _free_usage_ip(station=None) -> str:
@@ -5828,34 +5858,123 @@ def _free_usage_ip(station=None) -> str:
     return _public_ip_cache.get("ip", "") or ""
 
 
-class FreeQuotaExhausted(Exception):
-    """Raised by _try_free_model_first in strict_free mode when a 429
-    leaves no usable station (all stations bad/down and their (model, IP)
-    cooldown keys still active). The caller converts this into a 429/503
-    to the client with Retry-After — never a paid fallback."""
+class FreeRefusal(Exception):
+    """[PLAN_CORRECTION_FAUX_429 Lot A] Refus free véridique (remplace le faux 429).
 
-    def __init__(self, retry_after: str = ""):
-        super().__init__(f"free quota exhausted on all VPN stations (retry-after={retry_after!r})")
+    Porte le VRAI statut upstream + le VRAI body tronqué + le VRAI
+    Retry-After (jamais inventé). ``status==429`` = vrai quota épuisé ;
+    tout autre statut = erreur upstream relayée telle quelle (503 → 503).
+    ``FreeQuotaExhausted`` reste comme sous-classe legacy (compat tests /
+    call sites) — les handlers doivent catcher ``FreeRefusal``.
+    """
+
+    def __init__(self, status: int = 429, body: str = "", retry_after: str = ""):
+        try:
+            status = int(status)
+        except (TypeError, ValueError):
+            status = 429
+        if not 100 <= status <= 599:
+            status = 502
+        try:
+            body = str(body or "")[:2000]
+        except Exception:
+            body = ""
+        try:
+            retry_after = str(retry_after or "")
+        except Exception:
+            retry_after = ""
+        super().__init__(
+            f"free refusal status={status} retry-after={retry_after!r} body={body[:120]!r}"
+        )
+        self.status = status
+        self.body = body
         self.retry_after = retry_after
 
 
-def _free_quota_exhausted_response(exc: FreeQuotaExhausted, protocol: str):
-    """HTTP refusal for strict_free exhaustion (non-stream requests)."""
-    retry_after = exc.retry_after or "60"
+class FreeQuotaExhausted(FreeRefusal):
+    """Legacy alias — vrai 429 quota uniquement (status=429).
+
+    Gardé pour compat (tests + anciens raise à 1 arg). Les nouveaux
+    refus non-quota lèvent directement ``FreeRefusal(status, body, ...)``.
+    """
+
+    def __init__(self, retry_after: str = "", status: int = 429, body: str = ""):
+        super().__init__(status=status, body=body, retry_after=retry_after)
+
+
+def _free_refusal_response(exc: FreeRefusal, protocol: str):
+    """[PLAN_CORRECTION_FAUX_429 Lot A1] Réponse HTTP véridique (non-stream).
+
+    - status == 429 → 429 quota, message historique, Retry-After = header
+      upstream RÉEL uniquement (omis si absent — jamais 60/120 inventé).
+    - sinon → statut upstream relayé (503 → 503), type ``api_error``,
+      message ``Free model request failed with status {s}: {body}``
+      (miroir exact de ``_free_stream_refuse_bytes``), Retry-After
+      propagé uniquement si présent.
+    """
+    try:
+        status = int(getattr(exc, "status", 429))
+    except (TypeError, ValueError):
+        status = 429
+    if not 100 <= status <= 599:
+        status = 502
+    retry_after = (getattr(exc, "retry_after", "") or "").strip()
+    # Valide : secondes ou date HTTP, sinon on omet (jamais inventé)
+    _ra_out = ""
+    if retry_after:
+        try:
+            float(retry_after)
+            _ra_out = retry_after
+        except (TypeError, ValueError):
+            try:
+                email.utils.parsedate_to_datetime(retry_after)
+                _ra_out = retry_after
+            except Exception:
+                _ra_out = ""
+    if status == 429:
+        if _ra_out:
+            _msg = f"Free quota exhausted on all VPN stations. Retry after {_ra_out}s."
+        else:
+            _msg = "Free quota exhausted on all VPN stations."
+        if protocol == "anthropic":
+            resp = _anthropic_error(429, _msg, error_type="rate_limit_error")
+        else:
+            resp = _openai_error(429, _msg, error_type="rate_limit_error")
+        if _ra_out:
+            resp.headers["Retry-After"] = _ra_out
+        return resp
+    _body_txt = _redact(getattr(exc, "body", "") or "", 300)
+    _msg = f"Free model request failed with status {status}: {_body_txt}"
     if protocol == "anthropic":
-        resp = _anthropic_error(
-            429,
-            f"Free quota exhausted on all VPN stations. Retry after {retry_after}s.",
-            error_type="rate_limit_error",
-        )
+        resp = _anthropic_error(status, _msg, error_type="api_error")
     else:
-        resp = _openai_error(
-            429,
-            f"Free quota exhausted on all VPN stations. Retry after {retry_after}s.",
-            error_type="rate_limit_error",
-        )
-    resp.headers["Retry-After"] = retry_after
+        resp = _openai_error(status, _msg, error_type="api_error")
+    if _ra_out:
+        resp.headers["Retry-After"] = _ra_out
     return resp
+
+
+def _free_quota_exhausted_response(exc: FreeQuotaExhausted, protocol: str):
+    """Wrapper legacy → _free_refusal_response (comportement véridique)."""
+    return _free_refusal_response(exc, protocol)
+
+
+def _free_retry_delay_seconds(attempt: int) -> float:
+    """[PLAN_CORRECTION_FAUX_429 Lot B2 + PLAN_STABILISATION_VPN §5.2] Délai
+    court plafonné entre tentatives free consécutives (≈2 s max).
+
+    0.5 s × attempt, plafonné à 2.0 s. 0 en tests (PYTEST_CURRENT_TEST)
+    pour garder la suite hermétique et rapide.
+    """
+    try:
+        if os.getenv("PYTEST_CURRENT_TEST"):
+            return 0.0
+    except Exception:
+        pass
+    try:
+        return max(0.0, min(2.0, 0.5 * max(1, int(attempt))))
+    except Exception:
+        return 0.5
 
 
 async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=None, req_id=None):
@@ -5976,14 +6095,10 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
             free_body = dict(body)
             free_body["model"] = free_model
             # Sanitize-aller branche verbatim (client déjà en format Responses) :
-            # mêmes helpers que _chat_to_responses_request, map transportée par
-            # requête (clé privée _tool_name_map), stripée avant envoi wire.
-            _vb_tools = free_body.get("tools")
-            if isinstance(_vb_tools, list) and _vb_tools:
-                _vb_tools, _vb_map = sanitize_tool_names(_vb_tools)
-                free_body["tools"] = _vb_tools
-                if _vb_map:
-                    free_body[_TOOL_NAME_MAP_KEY] = _vb_map
+            # helper commun tools[] + historique function_call + tool_choice
+            # (P0-1/P0-2), map transportée par requête (clé privée
+            # _tool_name_map), stripée avant envoi wire.
+            free_body = _sanitize_native_responses_request(free_body)
         elif protocol == "anthropic":
             free_body = _anthropic_to_responses_request({**body, "model": free_model})
         else:
@@ -6061,6 +6176,13 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
         # if hedge succeeded (resp is HTTP response, even 429), skip sequential loop and go to shared handling
         # if hedge failed or not enabled, run sequential multi-attempt loop
         tried: set = set()
+        # [PLAN_CORRECTION_FAUX_429 Lot A3] cause terminale mémorisée : le bloc
+        # resp-is-None ne doit JAMAIS inventer un 429 — il rejoue la dernière
+        # cause réelle (dernier HTTP vu ou dernière erreur tunnel).
+        _last_free_status: int | None = None
+        _last_retry_after: str = ""
+        _last_body: str = ""
+        _last_tunnel_exc: Exception | None = None
         if not _hedge_done:
             if station is not None:
                 tried.add(station)  # on_request pick = first strike (dual-clutch)
@@ -6143,7 +6265,24 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
                         f"  FREE {free_model!r} RATE LIMITED (429) on station {attempt._station} → "
                         f"retry station fraîche (essai {_free_used + 1}/{free_max})"
                     )
+                    # [PLAN_CORRECTION_FAUX_429 A3] mémorise la cause (vrai 429)
+                    _last_free_status = 429
+                    try:
+                        _last_retry_after = resp.headers.get("retry-after", "") or ""
+                    except Exception:
+                        _last_retry_after = ""
+                    try:
+                        _last_body = (getattr(resp, "text", "") or "")[:2000]
+                    except Exception:
+                        _last_body = ""
+                    _last_tunnel_exc = None
                     resp = None
+                    try:
+                        _dly = _free_retry_delay_seconds(_free_used)
+                        if _dly > 0:
+                            await asyncio.sleep(_dly)
+                    except Exception:
+                        pass
                     continue
                 # V4 100% : 403/400 DataPolicyError → retry station fraîche sans pause_key (body déjà corrigé)
                 if _is_retriable_datapolicy(resp) and _free_used < free_max:
@@ -6164,11 +6303,61 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
                         _b400 = ""
                     _debug(f"  [free-400] req_id={req_id} leg=free {free_model!r} 400 station {attempt._station} ({_free_used}/{free_max}) body={_b400!r} -> retry fraiche")
                     _log_free_model_usage(model_id, free_model, free_api_key, free_workspace, 400, 0, 0, _free_elapsed, ip=free_ip)
+                    # [PLAN_CORRECTION_FAUX_429 A3] mémorise la cause (400 réel)
+                    _last_free_status = 400
+                    try:
+                        _last_retry_after = resp.headers.get("retry-after", "") or ""
+                    except Exception:
+                        _last_retry_after = ""
+                    _last_body = _b400
+                    _last_tunnel_exc = None
                     resp = None
+                    try:
+                        _dly = _free_retry_delay_seconds(_free_used)
+                        if _dly > 0:
+                            await asyncio.sleep(_dly)
+                    except Exception:
+                        pass
+                    continue
+                # [PLAN_CORRECTION_FAUX_429 Lot B1] 5xx transitoire (502/503/504…)
+                # → retry station fraîche tant que le budget dure (miroir du
+                # comportement streaming 9920-9944). Un 503 de tunnel qui flap
+                # ne doit pas tuer la requête au premier essai.
+                try:
+                    _code5 = int(getattr(resp, "status_code", 0) or 0)
+                except Exception:
+                    _code5 = 0
+                if 500 <= _code5 <= 599 and _free_used < free_max:
+                    try:
+                        _b5 = (getattr(resp, "text", "") or "")[:512]
+                    except Exception:
+                        _b5 = ""
+                    _log_free_model_usage(model_id, free_model, free_api_key, free_workspace, _code5, 0, 0, _free_elapsed, ip=free_ip)
+                    _log(
+                        f"  FREE {free_model!r} upstream {_code5} on station {attempt._station} → "
+                        f"retry station fraîche (essai {_free_used + 1}/{free_max})"
+                    )
+                    _debug(f"  [free-5xx] req_id={req_id} leg=free {free_model!r} {_code5} station {attempt._station} ({_free_used}/{free_max}) body={_b5!r} -> retry fraiche")
+                    _last_free_status = _code5
+                    try:
+                        _last_retry_after = resp.headers.get("retry-after", "") or ""
+                    except Exception:
+                        _last_retry_after = ""
+                    _last_body = _b5
+                    _last_tunnel_exc = None
+                    resp = None
+                    try:
+                        _dly = _free_retry_delay_seconds(_free_used)
+                        if _dly > 0:
+                            await asyncio.sleep(_dly)
+                    except Exception:
+                        pass
                     continue
                 break  # 200, final-429 or other status → shared handling below
             except Exception as e:
                 _debug(f"  [free] curl_cffi error (station {attempt._station}): {e}")
+                # [PLAN_CORRECTION_FAUX_429 A3] mémorise l'erreur tunnel (cause terminale)
+                _last_tunnel_exc = e
                 # [proxy_mode] in vpn/socks5 mode a dead tunnel NEVER falls
                 # back to the residential-IP direct path — retry another
                 # station while the budget lasts, then return None (paid) or
@@ -6182,6 +6371,12 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
                         f"  FREE via station {attempt._station} tunnel FAILED ({e}) → "
                         f"retry station fraîche (essai {_free_used + 1}/{free_max})"
                     )
+                    try:
+                        _dly = _free_retry_delay_seconds(_free_used)
+                        if _dly > 0:
+                            await asyncio.sleep(_dly)
+                    except Exception:
+                        pass
                     continue
                 # station-first budget spent, or direct mode → legacy fallback
                 # (reachable in direct proxy_mode only)
@@ -6198,15 +6393,36 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
         if resp is None:
             # [proxy_mode] vpn/socks5 never falls back to direct here — this
             # block is also reached after the 400/datapolicy retry budget is
-            # exhausted, not only on dead tunnels: paid (or strict_free 429).
+            # exhausted, not only on dead tunnels: paid (or strict_free refus).
             if proxy_mode in ("vpn", "socks5"):
                 _log(
                     f"  FREE attempts exhausted — no direct fallback (proxy_mode={proxy_mode}) → paid fallback"
                 )
                 # [GUI strict_free] tunnels épuisés + strict/refuser → refus
                 # local, ZÉRO jambe paid (même avec clés payantes valides).
+                # [PLAN_CORRECTION_FAUX_429 Lot A3] refus VÉRIDIQUE : rejoue la
+                # dernière cause réelle — jamais de « quota » sans 429 vu.
                 if IP_ROTATION.get("strict_free", False):
-                    raise FreeQuotaExhausted(str(int(_free_429_cooldown_seconds(""))))
+                    if _last_free_status == 429:
+                        raise FreeQuotaExhausted(
+                            _last_retry_after, status=429, body=_last_body
+                        )
+                    if _last_free_status is not None:
+                        raise FreeRefusal(
+                            status=_last_free_status,
+                            body=_last_body,
+                            retry_after=_last_retry_after,
+                        )
+                    _tun_msg = (
+                        f"no usable VPN station/tunnel: {_last_tunnel_exc}"
+                        if _last_tunnel_exc is not None
+                        else "no usable VPN station/tunnel"
+                    )
+                    try:
+                        _fallback_ctx_push(req_id, free_model, 503)
+                    except Exception:
+                        pass
+                    raise FreeRefusal(status=503, body=_tun_msg, retry_after="")
                 return None
             _log("  FREE via VPN tunnels FAILED → direct fallback (residential IP)")
             try:
@@ -6424,7 +6640,12 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
             if _free_exception_fallback_mode() == "direct":
                 return None
             if _free_stations_exhausted(free_model):
-                raise FreeQuotaExhausted(retry_after)
+                # [PLAN_CORRECTION_FAUX_429 A2] vrai 429 → body + retry_after réels
+                try:
+                    _full429 = (getattr(resp, "text", "") or "")[:2000]
+                except Exception:
+                    _full429 = body_429
+                raise FreeQuotaExhausted(retry_after, status=429, body=_full429)
 
         return None
 
@@ -6435,17 +6656,45 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
         _dbg_resp = _redact(getattr(resp, "text", "")[:2000]) if hasattr(resp, "text") else ""
     except Exception:
         _dbg_body, _dbg_resp = "", ""
+    # [LOT0-400] wire complet du 400 non-stream (dump disque + structure log).
+    try:
+        if resp.status_code == 400 and "free_body" in locals():
+            _persist_free_400_wire(req_id, free_model, "free-nonstream", free_body, 400)
+    except Exception:
+        pass
     # [GUI strict_free] Activer les modèles gratuits = ON + mode épuisement
     # strict/refuser → TOUT échec free non-429 refuse, ZÉRO jambe paid, même
     # avec des clés payantes valides. Seul le fallback-payant autorise paid.
     if IP_ROTATION.get("strict_free", False):
         # [Étape 2A — A2] + [GUI strict_free] : refus au lieu du fallback
         # paid silencieux (bruit trompeur « model/region »).
+        # [PLAN_CORRECTION_FAUX_429 Lot A2/D1/D2] refus VÉRIDIQUE : statut +
+        # body upstream réels, Retry-After réel uniquement (jamais « or 60 »),
+        # log du body tronqué + push ctx pour persistance free_status en DB.
+        try:
+            _ref_body = (getattr(resp, "text", "") or "")[:2000]
+        except Exception:
+            _ref_body = ""
+        try:
+            _ref_ra = resp.headers.get("retry-after", "") or ""
+        except Exception:
+            _ref_ra = ""
         _debug(
+            f"  [free] req_id={req_id} leg=free→refuse {free_model!r} free_status={resp.status_code} body={_redact(_ref_body, 300)!r} (strict_free, no paid leg)"
+        )
+        _log(
             f"  [free] req_id={req_id} leg=free→refuse {free_model!r} free_status={resp.status_code} (strict_free, no paid leg)"
         )
+        try:
+            _fallback_ctx_push(req_id, free_model, resp.status_code)
+        except Exception:
+            pass
+        try:
+            _log_fallback(req_id, "free→refuse", free_model, resp.status_code, model_id)
+        except Exception:
+            pass
         _set_free_cooldown(free_model, 60, station)
-        raise FreeQuotaExhausted(resp.headers.get("retry-after", "") or "60")
+        raise FreeRefusal(status=resp.status_code, body=_ref_body, retry_after=_ref_ra)
     _debug(
         f"  [free] req_id={req_id} leg=free→paid {free_model!r} free_status={resp.status_code} body={_redact(_dbg_body, 500)} resp={_redact(_dbg_resp, 500)} → falling back to paid"
     )
@@ -7083,6 +7332,7 @@ async def _stream_error_response(
     request_body=None,
     free_status=None,
     paid_status=None,
+    error_label=None,
 ):
     """Handle streaming error: log, save DB, yield error SSE event. Returns the error event bytes."""
     _log(f"  ERROR {status_code}: {_redact(resp_body, 300)}")
@@ -7095,7 +7345,7 @@ async def _stream_error_response(
         0,
         0,
         success=False,
-        error=f"HTTP {status_code}",
+        error=error_label or f"HTTP {status_code}",
         protocol=protocol,
         is_stream=True,
         thinking=thinking_type,
@@ -7111,32 +7361,158 @@ async def _stream_error_response(
     return _sse("error", error_payload)
 
 
+async def _capture_free_stream_error_body(resp, req_id, free_model, tag, attempt):
+    """[capture-400-stream] persister le body d'erreur upstream sur la voie
+    streaming — sinon aveugle (mémoire panneau 200 lignes + DB sans body).
+    Lecture seule, appelée uniquement sur les tentatives RETENTÉES (budget
+    non épuisé) : le payload étant rejoué à l'identique, la tentative finale
+    (refuse/paid) garde un body vierge — aucun double-aread, aucun changement
+    de comportement."""
+    try:
+        _b = await resp.aread()
+        _t = _b.decode("utf-8", "replace") if isinstance(_b, (bytes, bytearray)) else str(_b)
+    except Exception:
+        _t = ""
+    _debug(f"  [free-400-stream] req_id={req_id} leg=free {free_model!r} status={resp.status_code} attempt={attempt} ({tag}) body={_t[:512]!r}")
+
+
+def _persist_free_400_wire(req_id, free_model, tag, wire_body, status=400) -> str:
+    """[LOT0-400] Persiste le body wire COMPLET d'un 400 free pour analyse.
+
+    Lecture seule : dump disque logs/free400_<req_id>.json (body upstream
+    exact, non tronqué) + ligne debug structurée (clés racine, types
+    input[], tailles, sha256). Jamais de Mutation de comportement —
+    tout est best-effort (try/except), retourne le sha ou "".
+    Le dump est supprimé après analyse (contient le contexte utilisateur).
+    """
+    try:
+        import hashlib as _hl
+
+        try:
+            _raw = _serialize_json_body(wire_body)
+        except Exception:
+            _raw = b""
+        _sha = _hl.sha256(_raw).hexdigest()[:16] if _raw else ""
+        _keys, _types, _sizes = [], {}, {}
+        try:
+            if isinstance(wire_body, dict):
+                _keys = sorted(wire_body.keys())
+                _inp = wire_body.get("input")
+                if isinstance(_inp, list):
+                    from collections import Counter as _Ct
+
+                    _types = dict(
+                        _Ct(
+                            it.get("type", "?") if isinstance(it, dict) else "?"
+                            for it in _inp
+                        )
+                    )
+                    _sizes["n_input"] = len(_inp)
+                    try:
+                        _sizes["reasoning_items"] = sum(
+                            1
+                            for it in _inp
+                            if isinstance(it, dict) and it.get("type") == "reasoning"
+                        )
+                        _sizes["fn_call"] = sum(
+                            1
+                            for it in _inp
+                            if isinstance(it, dict) and it.get("type") == "function_call"
+                        )
+                        _sizes["fn_output"] = sum(
+                            1
+                            for it in _inp
+                            if isinstance(it, dict)
+                            and it.get("type") == "function_call_output"
+                        )
+                    except Exception:
+                        pass
+                _tools = wire_body.get("tools")
+                if isinstance(_tools, list):
+                    _sizes["n_tools"] = len(_tools)
+                for _k in ("reasoning", "tool_choice", "max_output_tokens",
+                           "temperature", "top_p", "stream", "stream_options"):
+                    if _k in wire_body:
+                        try:
+                            _sizes[_k] = str(wire_body.get(_k))[:80]
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+        _debug(
+            f"  [free-400-wire] req_id={req_id} leg=free {free_model!r} "
+            f"status={status} ({tag}) sha={_sha} wire_bytes={len(_raw)} "
+            f"keys={_keys} input_types={_types} sizes={_sizes}"
+        )
+        if _raw:
+            try:
+                _fn = os.path.join(
+                    LOG_DIR, f"free400_{str(req_id).replace('/', '_')}.json"
+                )
+                with open(_fn, "wb") as _fh:
+                    _fh.write(_raw)
+            except Exception:
+                pass
+        return _sha
+    except Exception:
+        return ""
+
+
 async def _free_stream_refuse_bytes(
     resp, req_id, free_model, original_model, start_time, protocol,
     thinking_type, effort, client_ip, tool_names, request_body,
 ):
-    _retry_after = resp.headers.get("retry-after", "") or "60"
+    # C1c : le refus dit VRAI — vrai statut upstream + vrai message (tronqué).
+    # Le refus reste un refus (strict respecté), mais 400 → 400, jamais 429 fabriqué.
+    # [PLAN_CORRECTION_FAUX_429 Lot A1/E6] Retry-After réel uniquement (omis si absent).
+    _status = resp.status_code
+    _body = await resp.aread()
+    # [capture-400-stream] le body d'erreur upstream n'était persisté nulle
+    # part en streaming (_log = mémoire panneau 200 lignes, DB = "HTTP 400"
+    # sans body) : tout 400 stream restait aveugle. Parité avec le non-stream
+    # [free-400] (body tronqué + redacté, jamais de Mutation de comportement).
+    try:
+        _cap = _body.decode("utf-8", "replace") if isinstance(_body, (bytes, bytearray)) else str(_body)
+    except Exception:
+        _cap = ""
+    _debug(f"  [free-400-stream] req_id={req_id} leg=free {free_model!r} status={_status} body={_cap[:512]!r}")
+    _retry_after = (resp.headers.get("retry-after", "") or "").strip()
+    if _status == 429:
+        if _retry_after:
+            _msg429 = f"Free quota exhausted on all VPN stations. Retry after {_retry_after}s."
+        else:
+            _msg429 = "Free quota exhausted on all VPN stations."
+        _payload = {
+            "type": "error",
+            "error": {
+                "type": "rate_limit_error",
+                "message": _msg429,
+            },
+        }
+    else:
+        _payload = {
+            "type": "error",
+            "error": {
+                "type": "api_error",
+                "message": f"Free model request failed with status {_status}: {_redact(_body, 300)}",
+            },
+        }
     return await _stream_error_response(
         req_id,
         free_model,
         original_model,
         start_time,
-        429,
-        await resp.aread(),
+        _status,
+        _body,
         protocol,
         thinking_type,
         effort,
         client_ip,
         "free (no auth)",
         tool_names,
-        {
-            "type": "error",
-            "error": {
-                "type": "rate_limit_error",
-                "message": f"Free quota exhausted on all VPN stations. Retry after {_retry_after}s.",
-            },
-        },
+        _payload,
         request_body=request_body,
+        free_status=_status,
     )
 
 
@@ -7168,7 +7544,12 @@ async def _free_non429_cooldown_strict(
 ):
     _set_free_cooldown(free_model, 60, _free_attempt_station())
     if IP_ROTATION.get("strict_free", False):
-        _debug(
+        # C1d : le chemin refuse-avant-bookkeep ne passe jamais par
+        # _free_fallback_bookkeep → pousser le ctx ici pour que
+        # free_status soit persisté (sinon NULL en DB). Log en _log
+        # (diagnostic sans DEBUG).
+        _fallback_ctx_push(req_id, free_model, resp.status_code)
+        _log(
             f"  [{tag}] req_id={req_id} leg=free→refuse free_status={resp.status_code} free_model={free_model!r} (strict_free GUI)"
         )
         return True, await _free_stream_refuse_bytes(
@@ -8090,6 +8471,7 @@ async def _handle_web_fetch(body: dict, model_id: str, protocol: str) -> bool:
 from protocol_mapping import (  # noqa: E402  # re-export after function defs for compat
     THINKING_MODELS,
     ResponsesSseState,
+    _HAS_SYNTHETIC_REASONING_KEY,
     _TOOL_NAME_MAP_KEY,
     _anthropic_to_responses_request,
     _chat_to_responses_request,
@@ -8104,6 +8486,7 @@ from protocol_mapping import (  # noqa: E402  # re-export after function defs fo
     _responses_sse_to_chat_deltas,
     _responses_to_anthropic_response,
     _responses_to_chat_response,
+    _sanitize_native_responses_request,
     anthropic_to_openai,
     anthropic_to_openai_response,
     anthropic_to_openai_responses,
@@ -8543,8 +8926,8 @@ async def messages(request: Request):
                         free_model_ip=_actual_ip,
                     )
                     return Response(content=resp.content, media_type="application/json")
-            except FreeQuotaExhausted as e:
-                return _free_quota_exhausted_response(e, "anthropic")
+            except FreeRefusal as e:
+                return _free_refusal_response(e, "anthropic")
             except Exception as e:
                 _debug(f"  [free] free model attempt failed: {e}")
 
@@ -8623,8 +9006,8 @@ async def messages(request: Request):
                     resp, a_headers = await _do_request_with_retry(
                         endpoint, body, a_headers, "anthropic"
                     )
-            except FreeQuotaExhausted as e:
-                return _free_quota_exhausted_response(e, "anthropic")
+            except FreeRefusal as e:
+                return _free_refusal_response(e, "anthropic")
             except UpstreamError as e:
                 _debug(f"  ✗ upstream error: {e}")
                 return JSONResponse(status_code=e.status_code, content={"error": str(e)})
@@ -8876,30 +9259,14 @@ async def messages(request: Request):
                                 # keys: a status from the free endpoint says nothing
                                 # about the paid account (CRITIC(2)/CRITIC(3)).
                                 if resp.status_code == 429:
-                                    _refuse = _on_free_429_stream(
+                                    _decision, _refuse = _free_429_stream_decision(
                                         free_model,
-                                        resp.headers.get("retry-after", ""),
-                                        forced_pool=_free_forced_pool,
+                                        resp,
+                                        _attempt,
+                                        _free_forced_pool,
+                                        model_id,
                                     )
-                                    if not _refuse and _attempt + 1 < effective_free_max_attempts(
-                                        _free_forced_pool
-                                    ):
-                                        # [plan 19/08 §1] budget left → retry free on a
-                                        # FRESH station (fresh IP = fresh quota); keep
-                                        # _using_free so the next attempt re-enters free
-                                        # with fresh_station=True. Cooldown + rotation
-                                        # for the exhausted IP already done above.
-                                        _log_free_model_usage(
-                                            model_id,
-                                            free_model,
-                                            "free (no auth)",
-                                            "free (no auth)",
-                                            resp.status_code,
-                                            ip=_free_usage_ip(),
-                                        )
-                                        _log(
-                                            f"  FREE {free_model!r} RATE LIMITED (429) → retry station fraîche (essai {_attempt + 2}/{effective_free_max_attempts(_free_forced_pool)})"
-                                        )
+                                    if _decision == "retry_free":
                                         if _stream_has_yielded(
                                             started, open_blocks, stream_out, _line_buf
                                         ):
@@ -8917,6 +9284,27 @@ async def messages(request: Request):
                                             return
                                         continue
                                 else:
+                                    # C1a : 400/5xx free → retry station fraîche tant que
+                                    # le budget free n'est pas épuisé (miroir non-stream).
+                                    if _attempt + 1 < effective_free_max_attempts(_free_forced_pool):
+                                        if _stream_has_yielded(
+                                            started, open_blocks, stream_out, _line_buf
+                                        ):
+                                            _cb_record_failure(endpoint)
+                                            _log(
+                                                f"  stream_retry_suppressed_after_started attempt={_attempt + 1}"
+                                            )
+                                            async for ev in _terminate_after_started(
+                                                open_blocks,
+                                                stream_out,
+                                                thinking_idx=thinking_block_idx,
+                                                thinking_sig=_local_signature(thinking_acc) if thinking_block_idx is not None and thinking_acc else "",
+                                            ):
+                                                yield ev
+                                            return
+                                        _log(f"  FREE {free_model!r} non-429 ({resp.status_code}) → retry station fraîche (essai {_attempt + 2}/{effective_free_max_attempts(_free_forced_pool)})")
+                                        _log_free_model_usage(model_id, free_model, "free (no auth)", "free (no auth)", resp.status_code, ip=_free_usage_ip())
+                                        continue
                                     _refuse, _refuse_bytes = await _free_non429_cooldown_strict(
                                         resp, free_model, req_id, original_model, start_time, protocol,
                                         thinking_type, effort, client_ip, tool_names, request_body, "stream",
@@ -9477,8 +9865,8 @@ async def messages(request: Request):
                         ),
                         media_type="application/json",
                     )
-            except FreeQuotaExhausted as fq_err:
-                return _free_quota_exhausted_response(fq_err, "openai")
+            except FreeRefusal as fq_err:
+                return _free_refusal_response(fq_err, "openai")
             except Exception as fail_err:
                 _debug(f"  [free] free model attempt failed: {fail_err}")
         retry_after = int(e.retry_after) + 1
@@ -9540,8 +9928,8 @@ async def messages(request: Request):
                     headers = dict(resp.headers)
             else:
                 resp, headers = await _do_request_with_retry(endpoint, oai_body, headers, "openai")
-        except FreeQuotaExhausted as e:
-            return _free_quota_exhausted_response(e, "openai")
+        except FreeRefusal as e:
+            return _free_refusal_response(e, "openai")
         except UpstreamError as e:
             _debug(f"  ✗ upstream error: {e}")
             return JSONResponse(status_code=e.status_code, content={"error": str(e)})
@@ -9862,35 +10250,26 @@ async def messages(request: Request):
                     _debug(f"  [stream-oai] stream context entered, status={resp.status_code}")
                     if resp.status_code != 200:
                         if _using_free:
+                            # [capture-400-stream] persister le body upstream
+                            # (tentative retentée uniquement — voir helper).
+                            if _attempt + 1 < effective_free_max_attempts(_free_forced_pool):
+                                await _capture_free_stream_error_body(resp, req_id, free_model, "stream-oai", _attempt)
+                            # [LOT0-400] wire complet du 400 (dump disque + structure log).
+                            if resp.status_code == 400:
+                                _persist_free_400_wire(req_id, free_model, "stream-oai", oai_body, 400)
                             # Free endpoint non-200 (429 quota, 5xx...) → cooldown
                             # the free model, fall back to paid. Never pauses PAID
                             # keys: a status from the free endpoint says nothing
                             # about the paid account (CRITIC(2)/CRITIC(3)).
                             if resp.status_code == 429:
-                                _refuse = _on_free_429_stream(
+                                _decision, _refuse = _free_429_stream_decision(
                                     free_model,
-                                    resp.headers.get("retry-after", ""),
-                                    forced_pool=_free_forced_pool,
+                                    resp,
+                                    _attempt,
+                                    _free_forced_pool,
+                                    _paid_model_id,
                                 )
-                                if not _refuse and _attempt + 1 < effective_free_max_attempts(
-                                    _free_forced_pool
-                                ):
-                                    # [plan 19/08 §1] budget left → retry free on a
-                                    # FRESH station (fresh IP = fresh quota); keep
-                                    # _using_free so the next attempt re-enters free
-                                    # with fresh_station=True. Cooldown + rotation
-                                    # for the exhausted IP already done above.
-                                    _log_free_model_usage(
-                                        _paid_model_id,
-                                        free_model,
-                                        "free (no auth)",
-                                        "free (no auth)",
-                                        resp.status_code,
-                                        ip=_free_usage_ip(),
-                                    )
-                                    _log(
-                                        f"  FREE {free_model!r} RATE LIMITED (429) → retry station fraîche (essai {_attempt + 2}/{effective_free_max_attempts(_free_forced_pool)})"
-                                    )
+                                if _decision == "retry_free":
                                     if _stream_has_yielded(
                                         started, open_blocks, stream_out_tokens, ""
                                     ):
@@ -9909,6 +10288,30 @@ async def messages(request: Request):
                                         return
                                     continue
                             else:
+                                # C1a : 400/5xx free → retry station fraîche tant que le
+                                # budget free n'est pas épuisé (miroir non-stream
+                                # _try_free_model_first). Garde post-byte : si des
+                                # octets ont déjà été émis, on termine proprement.
+                                if _attempt + 1 < effective_free_max_attempts(_free_forced_pool):
+                                    if _stream_has_yielded(
+                                        started, open_blocks, stream_out_tokens, ""
+                                    ):
+                                        _cb_record_failure(endpoint)
+                                        _log(
+                                            f"  stream_retry_suppressed_after_started attempt={_attempt + 1}"
+                                        )
+                                        _ti2, _ts2 = _thinking_flush()
+                                        async for ev in _terminate_after_started(
+                                            open_blocks,
+                                            stream_out_tokens,
+                                            thinking_idx=_ti2,
+                                            thinking_sig=_ts2,
+                                        ):
+                                            yield ev
+                                        return
+                                    _log(f"  FREE {free_model!r} non-429 ({resp.status_code}) → retry station fraîche (essai {_attempt + 2}/{effective_free_max_attempts(_free_forced_pool)})")
+                                    _log_free_model_usage(_paid_model_id, free_model, "free (no auth)", "free (no auth)", resp.status_code, ip=_free_usage_ip())
+                                    continue
                                 _refuse, _refuse_bytes = await _free_non429_cooldown_strict(
                                     resp, free_model, req_id, original_model, start_time, protocol,
                                     thinking_type, effort, client_ip, tool_names, request_body, "stream-oai",
@@ -10010,6 +10413,7 @@ async def messages(request: Request):
                     # neuf (jambe free uniquement ; paid → None).
                     _resp_state = ResponsesSseState()
                     _resp_state.tool_name_map = _free_tool_map if _using_free else None
+                    _incomplete_empty = False
                     async for line in resp.aiter_lines():
                         if not line.startswith("data:"):
                             continue
@@ -10085,6 +10489,17 @@ async def messages(request: Request):
                                 # response.incomplete (model didn't produce output).
                                 # Both signal end-of-stream.
                                 if isinstance(chunk, dict) and "usage" in chunk:
+                                    if (
+                                        chunk.get("_incomplete")
+                                        and _using_free
+                                        and not started
+                                        and stream_out_tokens == 0
+                                    ):
+                                        _incomplete_empty = True
+                                        _debug(
+                                            "  [stream-oai] response.incomplete with no output — treating as free failure"
+                                        )
+                                        break
                                     got_response_completed = True
                                     _responses_stream_done = True
                                     actual_usage = chunk.get("usage") or actual_usage
@@ -10230,6 +10645,69 @@ async def messages(request: Request):
                                     },
                                 )
 
+                    if _incomplete_empty and _using_free:
+                        _refuse = _on_free_429_stream(
+                            free_model, "", forced_pool=_free_forced_pool
+                        )
+                        if not _refuse and _attempt + 1 < effective_free_max_attempts(_free_forced_pool):
+                            _log_free_model_usage(_paid_model_id, free_model, "free (no auth)", "free (no auth)", 200, ip=_free_usage_ip())
+                            _log(
+                                f"  FREE {free_model!r} EMPTY RESPONSE (response.incomplete) → retry station fraîche (essai {_attempt + 2}/{effective_free_max_attempts(_free_forced_pool)})"
+                            )
+                            continue
+                        if not _has_usable_paid_key():
+                            _debug(
+                                f"  [stream-oai] req_id={req_id} leg=free→refuse free_status=empty_incomplete free_model={free_model!r} (no usable paid key, strict_free={bool(IP_ROTATION.get('strict_free', False))})"
+                            )
+                            if _refuse:
+                                yield await _stream_error_response(
+                                    req_id, free_model, original_model, start_time, 429, b"",
+                                    protocol, thinking_type, effort, client_ip, "free (no auth)",
+                                    tool_names,
+                                    {
+                                        "type": "error",
+                                        "error": {
+                                            "type": "rate_limit_error",
+                                            "message": "upstream_free_empty_response: free model produced no output on all stations. Retry later.",
+                                        },
+                                    },
+                                    request_body=request_body, free_status=429,
+                                    error_label="upstream_free_empty_response",
+                                )
+                                return
+                            yield _sse(
+                                "error",
+                                {
+                                    "type": "error",
+                                    "error": {
+                                        "type": "api_error",
+                                        "message": "Free model request failed and no usable paid API key is configured — cannot fall back to paid. Configure a paid key or retry later.",
+                                    },
+                                },
+                            )
+                            return
+                        _free_fallback_bookkeep(req_id, free_model, 200, _paid_model_id, "stream-oai", with_host=True, paid_endpoint=paid_endpoint)
+                        oai_body = paid_oai_body
+                        endpoint = paid_endpoint
+                        model_id = _paid_model_id
+                        _using_free = False
+                        if _refuse:
+                            yield await _stream_error_response(
+                                req_id, free_model, original_model, start_time, 429, b"",
+                                protocol, thinking_type, effort, client_ip, "free (no auth)",
+                                tool_names,
+                                {
+                                    "type": "error",
+                                    "error": {
+                                        "type": "rate_limit_error",
+                                        "message": "upstream_free_empty_response: free model produced no output on all stations. Retry later.",
+                                    },
+                                },
+                                request_body=request_body, free_status=429,
+                                error_label="upstream_free_empty_response",
+                            )
+                            return
+                        continue
                     # Responses API: if response.completed/incomplete was
                     # received, the upstream may not close the connection.
                     # Break the outer retry loop to finalize the stream.
@@ -10935,8 +11413,8 @@ async def chat_completions(request: Request):
                                 content=_json_dumps_str(data, ensure_ascii=False),
                                 media_type="application/json",
                             )
-                    except FreeQuotaExhausted as fq_err:
-                        return _free_quota_exhausted_response(fq_err, "openai")
+                    except FreeRefusal as fq_err:
+                        return _free_refusal_response(fq_err, "openai")
                     except Exception as fail_err:
                         _debug(f"  [free] free model attempt failed: {fail_err}")
             retry_after = int(e.retry_after) + 1
@@ -11019,8 +11497,8 @@ async def chat_completions(request: Request):
                         resp, headers = await _do_request_with_retry(
                             endpoint, paid_body, headers, "openai"
                         )
-            except FreeQuotaExhausted as e:
-                return _free_quota_exhausted_response(e, "openai")
+            except FreeRefusal as e:
+                return _free_refusal_response(e, "openai")
             except UpstreamError as e:
                 return JSONResponse(status_code=e.status_code, content={"error": str(e)})
             account_alias = _alias_for_key(_key_from_headers(headers, "openai"))
@@ -11243,35 +11721,22 @@ async def chat_completions(request: Request):
                     ) as resp:
                         if resp.status_code != 200:
                             if _using_free:
+                                # [capture-400-stream] persister le body upstream
+                                # (tentative retentée uniquement — voir helper).
+                                if _attempt + 1 < effective_free_max_attempts(_free_forced_pool):
+                                    await _capture_free_stream_error_body(resp, req_id, free_model, "chat-stream", _attempt)
+                                # [LOT0-400] wire complet du 400 (dump disque + structure log).
+                                if resp.status_code == 400:
+                                    _persist_free_400_wire(req_id, free_model, "chat-stream", oai_body, 400)
                                 # Free endpoint non-200 (429 quota, 5xx...) → cooldown
                                 # the free model, fall back to paid. Never pauses PAID
                                 # keys: a status from the free endpoint says nothing
                                 # about the paid account (CRITIC(2)/CRITIC(3)).
                                 if resp.status_code == 429:
-                                    _refuse = _on_free_429_stream(
-                                        free_model,
-                                        resp.headers.get("retry-after", ""),
-                                        forced_pool=_free_forced_pool,
+                                    _decision, _refuse = _free_429_stream_decision(
+                                        free_model, resp, _attempt, _free_forced_pool, model_id
                                     )
-                                    if not _refuse and _attempt + 1 < effective_free_max_attempts(
-                                        _free_forced_pool
-                                    ):
-                                        # [plan 19/08 §1] budget left → retry free on a
-                                        # FRESH station (fresh IP = fresh quota); keep
-                                        # _using_free so the next attempt re-enters free
-                                        # with fresh_station=True. Cooldown + rotation
-                                        # for the exhausted IP already done above.
-                                        _log_free_model_usage(
-                                            model_id,
-                                            free_model,
-                                            "free (no auth)",
-                                            "free (no auth)",
-                                            resp.status_code,
-                                            ip=_free_usage_ip(),
-                                        )
-                                        _log(
-                                            f"  FREE {free_model!r} RATE LIMITED (429) → retry station fraîche (essai {_attempt + 2}/{effective_free_max_attempts(_free_forced_pool)})"
-                                        )
+                                    if _decision == "retry_free":
                                         if _oai_has_yielded or stream_out > 0:
                                             _cb_record_failure(endpoint)
                                             _log(
@@ -11287,7 +11752,7 @@ async def chat_completions(request: Request):
                                             )
                                             return
                                         continue
-                                # V4 100% : DataPolicyError → retry station fraîche sans pause_key
+                            # V4 100% : DataPolicyError → retry station fraîche sans pause_key
                                 if _is_retriable_datapolicy(resp) and _attempt + 1 < effective_free_max_attempts(_free_forced_pool):
                                     if _oai_has_yielded or stream_out > 0:
                                         _cb_record_failure(endpoint)
@@ -11298,6 +11763,17 @@ async def chat_completions(request: Request):
                                     _log_free_model_usage(model_id, free_model, "free (no auth)", "free (no auth)", resp.status_code, ip=_free_usage_ip())
                                     continue
                                 else:
+                                    # C1a : 400/5xx free → retry station fraîche tant que
+                                    # le budget free n'est pas épuisé (miroir non-stream).
+                                    if _attempt + 1 < effective_free_max_attempts(_free_forced_pool):
+                                        if _oai_has_yielded or stream_out > 0:
+                                            _cb_record_failure(endpoint)
+                                            _log(f"  stream_retry_suppressed_after_started attempt={_attempt + 1}")
+                                            yield (b"data: " + _json_dumps_str({"error": {"message": "stream interrupted"}}, ensure_ascii=False).encode() + b"\n\ndata: [DONE]\n\n")
+                                            return
+                                        _log(f"  FREE {free_model!r} non-429 ({resp.status_code}) → retry station fraîche (essai {_attempt + 2}/{effective_free_max_attempts(_free_forced_pool)})")
+                                        _log_free_model_usage(model_id, free_model, "free (no auth)", "free (no auth)", resp.status_code, ip=_free_usage_ip())
+                                        continue
                                     _refuse, _refuse_bytes = await _free_non429_cooldown_strict(
                                         resp, free_model, req_id, original_model, start_time, protocol,
                                         thinking_type, effort, client_ip, tool_names, request_body, "chat-stream",
@@ -11441,6 +11917,7 @@ async def chat_completions(request: Request):
                         _resp_state = ResponsesSseState()
                         _resp_state.tool_name_map = _free_tool_map if _using_free else None
                         _chunk_already_yielded = False
+                        _incomplete_empty = False
                         async for line in resp.aiter_lines():
                             if not line.startswith("data:"):
                                 continue
@@ -11480,6 +11957,12 @@ async def chat_completions(request: Request):
                                         "  [oai-stream] response stream-end signal, breaking to finalize"
                                     )
                                     actual_usage = chunk.get("usage") or actual_usage
+                                    if (
+                                        chunk.get("_incomplete")
+                                        and not _oai_has_yielded
+                                        and stream_out == 0
+                                    ):
+                                        _incomplete_empty = True
                                     break
                                 _oai_has_yielded = True
                                 _chunk_already_yielded = True
@@ -11506,6 +11989,12 @@ async def chat_completions(request: Request):
                                             "  [oai-stream] response stream-end signal, breaking to finalize"
                                         )
                                         actual_usage = chunk.get("usage") or actual_usage
+                                        if (
+                                            chunk.get("_incomplete")
+                                            and not _oai_has_yielded
+                                            and stream_out == 0
+                                        ):
+                                            _incomplete_empty = True
                                         break
                                     # Yield converted chunk as chat/completions SSE
                                     _oai_has_yielded = True
@@ -11544,6 +12033,68 @@ async def chat_completions(request: Request):
                                 _oai_has_yielded = True
                                 yield line.encode() + b"\n\n"
                             _chunk_already_yielded = False
+
+                        if _incomplete_empty and _using_free:
+                            _refuse = _on_free_429_stream(
+                                free_model, "", forced_pool=_free_forced_pool
+                            )
+                            if not _refuse and _attempt + 1 < effective_free_max_attempts(_free_forced_pool):
+                                _log_free_model_usage(model_id, free_model, "free (no auth)", "free (no auth)", 200, ip=_free_usage_ip())
+                                _log(
+                                    f"  FREE {free_model!r} EMPTY RESPONSE (response.incomplete) → retry station fraîche (essai {_attempt + 2}/{effective_free_max_attempts(_free_forced_pool)})"
+                                )
+                                continue
+                            if not _has_usable_paid_key():
+                                _debug(
+                                    f"  [chat-stream] req_id={req_id} leg=free→refuse free_status=empty_incomplete free_model={free_model!r} (no usable paid key, strict_free={bool(IP_ROTATION.get('strict_free', False))})"
+                                )
+                                if _refuse:
+                                    yield await _stream_error_response(
+                                        req_id, free_model, original_model, start_time, 429, b"",
+                                        protocol, thinking_type, effort, client_ip, "free (no auth)",
+                                        tool_names,
+                                        {
+                                            "type": "error",
+                                            "error": {
+                                                "type": "rate_limit_error",
+                                                "message": "upstream_free_empty_response: free model produced no output on all stations. Retry later.",
+                                            },
+                                        },
+                                        request_body=request_body, free_status=429,
+                                        error_label="upstream_free_empty_response",
+                                    )
+                                    return
+                                yield (
+                                    b"data: "
+                                    + _json_dumps_str(
+                                        {"error": {"message": "Free model request failed and no usable paid API key is configured — cannot fall back to paid. Configure a paid key or retry later."}},
+                                        ensure_ascii=False,
+                                    ).encode()
+                                    + b"\n\ndata: [DONE]\n\n"
+                                )
+                                return
+                            oai_body = paid_oai_body
+                            endpoint = paid_endpoint
+                            _using_free = False
+                            _track_model = model_id
+                            _free_fallback_bookkeep(req_id, free_model, 200, _track_model, "chat-stream", with_host=True, paid_endpoint=paid_endpoint)
+                            if _refuse:
+                                yield await _stream_error_response(
+                                    req_id, free_model, original_model, start_time, 429, b"",
+                                    protocol, thinking_type, effort, client_ip, "free (no auth)",
+                                    tool_names,
+                                    {
+                                        "type": "error",
+                                        "error": {
+                                            "type": "rate_limit_error",
+                                            "message": "upstream_free_empty_response: free model produced no output on all stations. Retry later.",
+                                        },
+                                    },
+                                    request_body=request_body, free_status=429,
+                                    error_label="upstream_free_empty_response",
+                                )
+                                return
+                            continue
 
                         # Fix: synthesize finish_reason if truncated (EOF without finish_reason)
                         if not emitted_finish:
@@ -11867,8 +12418,8 @@ async def chat_completions(request: Request):
                             content=_json_dumps_str(oai_response, ensure_ascii=False),
                             media_type="application/json",
                         )
-                except FreeQuotaExhausted as fq_err:
-                    return _free_quota_exhausted_response(fq_err, "anthropic")
+                except FreeRefusal as fq_err:
+                    return _free_refusal_response(fq_err, "anthropic")
                 except Exception as fail_err:
                     _debug(f"  [free] free model attempt failed: {fail_err}")
         retry_after = int(e.retry_after) + 1
@@ -11904,8 +12455,8 @@ async def chat_completions(request: Request):
                 resp, a_headers = await _do_request_with_retry(
                     endpoint, anthro_body, a_headers, "anthropic"
                 )
-        except FreeQuotaExhausted as e:
-            return _free_quota_exhausted_response(e, "anthropic")
+        except FreeRefusal as e:
+            return _free_refusal_response(e, "anthropic")
         except UpstreamError as e:
             return JSONResponse(status_code=e.status_code, content={"error": str(e)})
         account_alias = _alias_for_key(a_headers.get("x-api-key", ""))
@@ -12068,41 +12619,28 @@ async def chat_completions(request: Request):
                 async with _stream_ctx as resp:
                     if resp.status_code != 200:
                         if _using_free:
+                            # [capture-400-stream] persister le body upstream
+                            # (tentative retentée uniquement — voir helper).
+                            if _attempt + 1 < effective_free_max_attempts(_free_forced_pool):
+                                await _capture_free_stream_error_body(resp, req_id, free_model, "anthropic-stream", _attempt)
+                            # [LOT0-400] wire complet du 400 (dump disque + structure log).
+                            if resp.status_code == 400:
+                                _persist_free_400_wire(req_id, free_model, "anthropic-stream", anthro_body, 400)
                             # Free endpoint non-200 (429 quota, 5xx...) → cooldown
                             # the free model, fall back to paid. Never pauses PAID
                             # keys: a status from the free endpoint says nothing
                             # about the paid account (CRITIC(2)/CRITIC(3)).
                             if resp.status_code == 429:
-                                _refuse = _on_free_429_stream(
-                                    free_model,
-                                    resp.headers.get("retry-after", ""),
-                                    forced_pool=_free_forced_pool,
+                                _decision, _refuse = _free_429_stream_decision(
+                                    free_model, resp, _attempt, _free_forced_pool, model_id
                                 )
-                                if not _refuse and _attempt + 1 < effective_free_max_attempts(
-                                    _free_forced_pool
-                                ):
-                                    # [plan 19/08 §1] budget left → retry free on a
-                                    # FRESH station (fresh IP = fresh quota); keep
-                                    # _using_free so the next attempt re-enters free
-                                    # with fresh_station=True. Cooldown + rotation
-                                    # for the exhausted IP already done above.
-                                    _log_free_model_usage(
-                                        model_id,
-                                        free_model,
-                                        "free (no auth)",
-                                        "free (no auth)",
-                                        resp.status_code,
-                                        ip=_free_usage_ip(),
-                                    )
-                                    _log(
-                                        f"  FREE {free_model!r} RATE LIMITED (429) → retry station fraîche (essai {_attempt + 2}/{effective_free_max_attempts(_free_forced_pool)})"
-                                    )
+                                if _decision == "retry_free":
                                     if _stream_has_yielded(
                                         started, open_blocks, stream_out, _line_buf
                                     ):
                                         _cb_record_failure(endpoint)
                                         _log(
-                                            f"  stream_retry_suppressed_after_started attempt={_attempt + 1}"
+                                            f" stream_retry_suppressed_after_started attempt={_attempt + 1}"
                                         )
                                         yield _chunk({}, "stop")
                                         yield b"data: [DONE]\n\n"
@@ -12120,6 +12658,18 @@ async def chat_completions(request: Request):
                                 _log_free_model_usage(model_id, free_model, "free (no auth)", "free (no auth)", resp.status_code, ip=_free_usage_ip())
                                 continue
                             else:
+                                # C1a : 400/5xx free → retry station fraîche tant que
+                                # le budget free n'est pas épuisé (miroir non-stream).
+                                if _attempt + 1 < effective_free_max_attempts(_free_forced_pool):
+                                    if _stream_has_yielded(started, open_blocks, stream_out, _line_buf):
+                                        _cb_record_failure(endpoint)
+                                        _log(f"  stream_retry_suppressed_after_started attempt={_attempt + 1}")
+                                        yield _chunk({}, "stop")
+                                        yield b"data: [DONE]\n\n"
+                                        return
+                                    _log(f"  FREE {free_model!r} non-429 ({resp.status_code}) → retry station fraîche (essai {_attempt + 2}/{effective_free_max_attempts(_free_forced_pool)})")
+                                    _log_free_model_usage(model_id, free_model, "free (no auth)", "free (no auth)", resp.status_code, ip=_free_usage_ip())
+                                    continue
                                 _refuse, _refuse_bytes = await _free_non429_cooldown_strict(
                                     resp, free_model, req_id, original_model, start_time, protocol,
                                     thinking_type, effort, client_ip, tool_names, request_body, "anthro-to-oai-stream",
@@ -12741,8 +13291,8 @@ async def responses(request: Request):
                                 media_type="text/event-stream",
                                 headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
                             )
-                    except FreeQuotaExhausted as fq_err:
-                        return _free_quota_exhausted_response(fq_err, "anthropic")
+                    except FreeRefusal as fq_err:
+                        return _free_refusal_response(fq_err, "anthropic")
                     except Exception as fail_err:
                         _debug(f"  [free] free model attempt failed: {fail_err}")
             retry_after = int(e.retry_after) + 1
@@ -12799,8 +13349,8 @@ async def responses(request: Request):
                     resp, a_headers = await _do_request_with_retry(
                         endpoint, anthro_body, a_headers, "anthropic"
                     )
-            except FreeQuotaExhausted as e:
-                return _free_quota_exhausted_response(e, "anthropic")
+            except FreeRefusal as e:
+                return _free_refusal_response(e, "anthropic")
             except UpstreamError as e:
                 return JSONResponse(status_code=e.status_code, content={"error": str(e)})
             account_alias = _alias_for_key(a_headers.get("x-api-key", ""))
@@ -12917,6 +13467,13 @@ async def responses(request: Request):
                 _response_cache.put(cache_key, _response_body, {"Content-Type": "application/json"})
             return Response(content=_response_body, media_type="application/json")
         # Anthropic streaming → collect, then emit SSE
+        # [PLAN_CORRECTION_FAUX_429 Lot C1] decision documentee : le refus free
+        # reste en HTTP JSON veridique (via _free_refusal_response) et NON en
+        # SSE api_error — simple, et le client stream:true gere l'erreur HTTP
+        # avant le parse SSE (meme forme que le chemin non-stream). Le helper
+        # partage _free_refusal_response garantit UNE logique veridique pour
+        # les 3 chemins (non-stream, collect-stream, SSE natif via
+        # _free_stream_refuse_bytes qui en est le miroir SSE).
         anthro_body["stream"] = False
         # Try free model first if available
         _geo_tunnel = getattr(request.state, "_geo_force_tunnel", False)
@@ -12946,8 +13503,8 @@ async def responses(request: Request):
                 resp, a_headers = await _do_request_with_retry(
                     endpoint, anthro_body, a_headers, "anthropic"
                 )
-        except FreeQuotaExhausted as e:
-            return _free_quota_exhausted_response(e, "anthropic")
+        except FreeRefusal as e:
+            return _free_refusal_response(e, "anthropic")
         except UpstreamError as e:
             return JSONResponse(status_code=e.status_code, content={"error": str(e)})
         account_alias = _alias_for_key(a_headers.get("x-api-key", ""))
@@ -13097,8 +13654,8 @@ async def responses(request: Request):
                         media_type="text/event-stream",
                         headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
                     )
-            except FreeQuotaExhausted as fq_err:
-                return _free_quota_exhausted_response(fq_err, "openai")
+            except FreeRefusal as fq_err:
+                return _free_refusal_response(fq_err, "openai")
             except Exception as fail_err:
                 _debug(f"  [free] free model attempt failed: {fail_err}")
         retry_after = int(e.retry_after) + 1
@@ -13156,8 +13713,8 @@ async def responses(request: Request):
                     headers = dict(resp.headers)
             else:
                 resp, headers = await _do_request_with_retry(endpoint, oai_body, headers, "openai")
-        except FreeQuotaExhausted as e:
-            return _free_quota_exhausted_response(e, "openai")
+        except FreeRefusal as e:
+            return _free_refusal_response(e, "openai")
         except UpstreamError as e:
             return JSONResponse(status_code=e.status_code, content={"error": str(e)})
         account_alias = _alias_for_key(_key_from_headers(headers, "openai"))
@@ -13391,8 +13948,8 @@ async def responses(request: Request):
                 )
         else:
             resp, headers = await _do_request_with_retry(endpoint, oai_body, headers, "openai")
-    except FreeQuotaExhausted as e:
-        return _free_quota_exhausted_response(e, "openai")
+    except FreeRefusal as e:
+        return _free_refusal_response(e, "openai")
     except UpstreamError as e:
         return JSONResponse(status_code=e.status_code, content={"error": str(e)})
     account_alias = _alias_for_key(_key_from_headers(headers, "openai"))

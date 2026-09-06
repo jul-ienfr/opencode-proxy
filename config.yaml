@@ -179,6 +179,8 @@ ip_rotation:
   station_max_rotations_per_hour: 10
   rotation_storm_cooldown_s: 600
   cascade_max_duration_s: 120
+  ov_auth_cascade_enabled: false
+  ov_auth_cascade_cooldown_min: 30
   stack_age_guard_s: 600
   wg_canary_poll_interval_s: 4
   control_api_key: vg3q59eBCjG9hWVXm2Wpc8n9smumwhtugihf7oDafv0
@@ -195,7 +197,7 @@ ip_rotation:
   docker_container_2: opencode-vpn-2
   docker_events: true
   dual_station: true
-  egress_failure_tick_interval: 5.0
+  egress_failure_tick_interval: 15.0
   enabled: true
   free_parallel:
     enabled: true
@@ -444,5 +446,5 @@ free_discovery:
 traffic:
   enabled: true
   max_frames: 500
-  body_cap: 131072
-  max_bytes: 33554432
+  body_cap: 2097152
+  max_bytes: 134217728
