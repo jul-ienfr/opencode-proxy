@@ -12084,7 +12084,11 @@ async def chat_completions(request: Request):
             if "output" in data and "choices" not in data:
                 # Convertit Responses → Chat Completions pour le client
                 try:
-                    chat_resp = _responses_to_chat_response(data, original_model, oai_body.pop(_TOOL_NAME_MAP_KEY, None))
+                    # [plan Lot 3 / F821 pre-existant] le map outil vit sur la
+                    # requête convertie envoyée upstream (paid_body), pas sur
+                    # un oai_body inexistant dans ce handler (NameError au
+                    # runtime si cette branche était atteinte).
+                    chat_resp = _responses_to_chat_response(data, original_model, paid_body.pop(_TOOL_NAME_MAP_KEY, None))
                     body_bytes = _json_dumps(chat_resp)
                     usage = chat_resp.get("usage", {})
                     req_in = usage.get("prompt_tokens", 0)

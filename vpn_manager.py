@@ -236,9 +236,16 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 
 # ── Identity rotation (client fingerprint) ─────────────────────
 
-# Stable desktop impersonation targets of curl_cffi 0.14 (verified by
-# Session(impersonate=...) instantiation). Alpha (chrome133a), mobile,
-# android, iOS, tor and generic variants are excluded.
+# Stable desktop impersonation targets of curl_cffi (pinned: see
+# requirements.txt). WARNING: Session(impersonate=...) instantiation does
+# NOT validate the target — an unknown target only raises ImpersonateError
+# ("Impersonating X is not supported") at request time, so every entry here
+# must exist in curl_cffi's NATIVE_TARGET_NAMES or its FingerprintManager
+# (see tests/test_impersonate_support.py). Alpha (chrome133a), mobile,
+# android, iOS, tor and generic variants are excluded. NOTE: "safari18_4"
+# is deliberately absent — curl_cffi >= 0.15 only ships "safari184" (same
+# Safari 18.4 face, same UA/headers); the underscore alias raises
+# ImpersonateError on every request (503 "no usable VPN station/tunnel").
 _KNOWN_IMPERSONATIONS = frozenset(
     {
         "chrome99",
@@ -269,7 +276,6 @@ _KNOWN_IMPERSONATIONS = frozenset(
         "safari180",
         "safari184",
         "safari18_0",
-        "safari18_4",
         "safari260",
         "safari2601",
     }
