@@ -5,7 +5,6 @@ Convert Anthropic /v1/messages ↔ OpenAI chat/completions
 
 import asyncio
 import contextvars
-import copy
 import datetime
 import email.utils
 import hmac
@@ -17,7 +16,6 @@ import os
 import random
 import re
 import re as _re_norm
-import socket
 import sqlite3
 import threading
 import time
@@ -7317,104 +7315,9 @@ async def _terminate_after_started(open_blocks, stream_out, thinking_idx=None, t
 _SSE_KEEPALIVE_INTERVAL = yaml_get("streaming", "sse_keepalive_interval", 15)  # seconds
 
 
-async def _sse_pump(stream, *, ping_interval: float = _SSE_KEEPALIVE_INTERVAL, coalesce_max: int = 64 * 1024):
-    """[P4.5 perf] Pompe SSE fusionnée — remplace _sse_keepalive+_sse_coalesce séparés.
-
-    Un seul `read_task` + timer idle réarmé par `asyncio.Event` (B2) + drain
-    non-bloquant après le 1er chunk, ≤1 `sleep(0)`/groupe, plafond 64 KiB (B3).
-    Priorité read > ping (ordre contractuel), retour propre sur Exception
-    upstream, `finally` cancel pending/read. Ne touche PAS à
-    `_CurlCffiStreamResponse.aiter_lines` [41] — uniquement la pompe d'émission.
-
-    `ping_interval` falsy → pas de pings, `coalesce_max` falsy → pas de coalesce.
-    """
-    # normalise en aiter
-    try:
-        aiter = stream.__aiter__()
-    except AttributeError:
-        aiter = stream
-    read_task = None
-    timer_task = None
-    pending = None
-    activity = asyncio.Event()
-
-    async def _idle_timer():
-        while True:
-            activity.clear()
-            try:
-                await asyncio.wait_for(activity.wait(), timeout=ping_interval)
-            except TimeoutError:
-                return
-
-    try:
-        while True:
-            if pending is not None:
-                read_task = pending
-                pending = None
-            elif read_task is None or read_task.done():
-                read_task = asyncio.ensure_future(anext(aiter))
-            # timer seulement si ping activé
-            if ping_interval and ping_interval > 0:
-                if timer_task is None or timer_task.done():
-                    timer_task = asyncio.ensure_future(_idle_timer())
-                wait_tasks = {read_task, timer_task}
-            else:
-                wait_tasks = {read_task}
-                timer_task = None
-            done, _ = await asyncio.wait(wait_tasks, return_when=asyncio.FIRST_COMPLETED)
-            if read_task in done:
-                activity.set()
-                try:
-                    first = read_task.result()
-                except StopAsyncIteration:
-                    return
-                except Exception:
-                    return
-                read_task = None
-                # coalesce si activé et bytes
-                if coalesce_max and coalesce_max > 0 and isinstance(first, (bytes, bytearray)):
-                    groups = [first]
-                    size = len(first)
-                    exhausted = False
-                    while size < coalesce_max:
-                        nxt = asyncio.ensure_future(anext(aiter))
-                        await asyncio.sleep(0)
-                        if not nxt.done():
-                            pending = nxt
-                            break
-                        try:
-                            chunk = nxt.result()
-                        except StopAsyncIteration:
-                            exhausted = True
-                            break
-                        except Exception:
-                            exhausted = True
-                            break
-                        if not isinstance(chunk, (bytes, bytearray)):
-                            # flush bytes group puis yield non-bytes isolé
-                            if groups:
-                                yield b"".join(groups)
-                                groups = []
-                            yield chunk
-                            break
-                        groups.append(chunk)
-                        size += len(chunk)
-                    if groups:
-                        yield b"".join(groups)
-                    if exhausted:
-                        return
-                else:
-                    yield first
-            elif timer_task is not None and timer_task in done:
-                timer_task = None
-                yield b": ping\n\n"
-    finally:
-        if timer_task is not None and not timer_task.done():
-            timer_task.cancel()
-        if read_task is not None and not read_task.done():
-            read_task.cancel()
-        if pending is not None and not pending.done():
-            pending.cancel()
+# [Phase 7 refonte] Pompe extraite vers streaming/sse.py (pur asyncio).
+# Les wrappers fins restent ici (défauts lus depuis config.yaml + seams tests).
+from streaming.sse import sse_pump as _sse_pump  # noqa: E402
 
 
 async def _sse_keepalive(stream_gen, interval: float = _SSE_KEEPALIVE_INTERVAL):
@@ -7567,203 +7470,45 @@ def _extract_search_query(body: dict) -> str:
     return ""
 
 
-def _normalize_query(q: str) -> str:
-    return re.sub(r"\s+", " ", q.strip().lower())[:500]
-
-
-def _format_ddg(results: list, query: str) -> str:
-    if not results:
-        return f"No results found for: {query}"
-    lines = [f"Web search results for '{query}':\n"]
-    for i, r in enumerate(results, 1):
-        title = r.get("title", "")
-        body_text = r.get("body", "")
-        href = r.get("href", "")
-        lines.append(f"{i}. **{title}**\n   {body_text}\n   {href}\n")
-    return "\n".join(lines)
+# [Phase 7 refonte] Helpers purs extraits vers server/websearch.py.
+from server import websearch as _ws_mod  # noqa: E402
+from server.websearch import format_ddg as _format_ddg  # noqa: E402
+from server.websearch import normalize_query as _normalize_query  # noqa: E402
 
 
 async def _is_safe_fetch_url(url: str) -> bool:
-    """SSRF guard F1+R1+R4: async, fail-closed, budgeted via outer wait_for."""
-    try:
-        p = urllib.parse.urlparse(url)
-        if p.scheme not in ("http", "https"):
-            return False
-        host = (p.hostname or "").lower().rstrip(".")
-        if not host or host in ("localhost", "localhost."):
-            return False
-        # IP literal
-        try:
-            ip = ipaddress.ip_address(host)
-            if any([ip.is_private, ip.is_loopback, ip.is_link_local, ip.is_reserved, ip.is_multicast]) or any(ip in n for n in _BLOCKED_NETS):
-                return False
-            return True
-        except ValueError:
-            pass
-        # DNS rebinding - to_thread, outer wait_for budgets it
-        try:
-            infos = await asyncio.to_thread(socket.getaddrinfo, host, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
-            for _, _, _, _, sa in infos:
-                ip = ipaddress.ip_address(sa[0])
-                if any([ip.is_private, ip.is_loopback, ip.is_link_local, ip.is_reserved, ip.is_multicast]) or any(ip in n for n in _BLOCKED_NETS):
-                    return False
-        except Exception:
-            return False
-        return True
-    except Exception:
-        return False
+    """SSRF guard — wrapper (état _BLOCKED_NETS possédé ici ; patché par tests)."""
+    return await _ws_mod.is_safe_fetch_url(url, _BLOCKED_NETS)
 
 
 async def _execute_ddg_search(query: str, max_results: int = 5, timeout: int = 10, proxy=None) -> str:
     """Execute DDG with cache, semaphore, lock per key, wait_for budget unique."""
-    # clamps Q8A
-    try:
-        timeout = max(5, min(30, int(timeout)))
-    except Exception:
-        timeout = 10
-    try:
-        max_results = max(1, min(10, int(max_results)))
-    except Exception:
-        max_results = 5
-    qnorm = _normalize_query(query)
-    kstr = f"{qnorm}:{max_results}"
-    now = time.monotonic()
-    # LRU hit
-    if kstr in _DDG_CACHE:
-        exp, val = _DDG_CACHE[kstr]
-        if now < exp:
-            _DDG_CACHE.move_to_end(kstr)
-            return copy.deepcopy(val)
-        else:
-            try:
-                del _DDG_CACHE[kstr]
-            except KeyError:
-                pass
-    # lock per key (v3.3 R3: pop after lock released, finally)
-    lock = _DDG_LOCKS.get(kstr)
-    if lock is None:
-        lock = asyncio.Lock()
-        _DDG_LOCKS[kstr] = lock
-        _hit_val: Any = None
-    _hit = False
-    try:
-        async with lock:
-            # double-check
-            if kstr in _DDG_CACHE:
-                exp2, val2 = _DDG_CACHE[kstr]
-                if time.monotonic() < exp2:
-                    _DDG_CACHE.move_to_end(kstr)
-                    _hit_val = copy.deepcopy(val2)
-                    _hit = True
-                else:
-                    _hit = False
-            else:
-                _hit = False
-            if not _hit:
-                # semaphore + wait_for
-                async with _DDG_SEM:
-
-                    def _sync_ddg():
-                        try:
-                            from duckduckgo_search import DDGS
-
-                            try:
-                                ddgs = DDGS(timeout=timeout, proxy=proxy)
-                            except TypeError:
-                                ddgs = DDGS()
-                            with ddgs:
-                                return list(ddgs.text(qnorm, max_results=max_results))
-                        except ImportError as e:
-                            raise ImportError(f"duckduckgo-search not installed: {e}") from e
-
-                    try:
-                        results = await asyncio.wait_for(asyncio.to_thread(_sync_ddg), timeout + 2)
-                    except TimeoutError:
-                        _log(f"  WEB SEARCH: DDG timeout {timeout}s query='{qnorm[:60]}' queue={3 - _DDG_SEM._value}")
-                        raise
-                    except ImportError:
-                        raise
-                    except Exception as e:
-                        # on_error strip - raise to let handler strip
-                        raise RuntimeError(f"DDG error: {e}") from e
-                formatted = _format_ddg(results, qnorm)
-                _DDG_CACHE[kstr] = (now + 300, formatted)
-                if len(_DDG_CACHE) > 512:
-                    _DDG_CACHE.popitem(last=False)
-                _hit_val = copy.deepcopy(formatted)
-    finally:
-        # outside lock: evict lock conditionnel (R3 sans race) - always
-        try:
-            if not lock.locked() and not getattr(lock, "_waiters", None):
-                _DDG_LOCKS.pop(kstr, None)
-            if len(_DDG_LOCKS) > 512:
-                oldest = next(iter(_DDG_LOCKS))
-                _DDG_LOCKS.pop(oldest, None)
-        except Exception:
-            try:
-                _DDG_LOCKS.pop(kstr, None)
-            except Exception:
-                pass
-    return _hit_val
+    return await _ws_mod.execute_ddg_search(
+        query,
+        max_results,
+        timeout,
+        proxy,
+        cache=_DDG_CACHE,
+        locks=_DDG_LOCKS,
+        sem=_DDG_SEM,
+        normalize_fn=_normalize_query,
+        format_fn=_format_ddg,
+        log_fn=_log,
+    )
 
 
 async def _execute_web_fetch(url: str, prompt: str = "", timeout: int = 15, max_bytes: int = 12000, via_vpn: bool = False) -> str:
     """Fetch URL with SSRF guard, redirect re-validation, content guards, sem."""
-    # clamps Q8A
-    try:
-        timeout = max(5, min(30, int(timeout)))
-    except Exception:
-        timeout = 15
-    try:
-        max_bytes = max(2000, min(50000, int(max_bytes)))
-    except Exception:
-        max_bytes = 12000
-    # SSRF initial - budgeted via outer wait_for, no inner wait_for
-    if not await _is_safe_fetch_url(url):
-        raise ValueError(f"SSRF rejected: {url}")
-    # [plan-perf Lot 1] Client partagé par rôle : plus de handshake TLS /
-    # pool par fetch. follow_redirects + timeout restent PAR REQUÊTE
-    # (httpx 0.28), boucle de redirection + re-validation SSRF INCHANGÉES.
-    # Rôle tunnel = URL SOCKS du pool/station active (cf. _role_tunnel_url),
-    # comme les probes déjà migrées — jamais de client jetable ici.
-    _role = "tunnel" if via_vpn else "direct"
-    c = _role_client(_role)
-    async with FETCH_SEM:
-        r = await c.get(url, headers={"User-Agent": "opencode-proxy/1.0"}, follow_redirects=False, timeout=timeout)
-        for _ in range(3):
-            if r.status_code in (301, 302, 303, 307, 308):
-                loc = r.headers.get("location", "")
-                nxt = urllib.parse.urljoin(url, loc)
-                if not loc or not await _is_safe_fetch_url(nxt):
-                    raise ValueError(f"SSRF redirect rejected: {loc}")
-                url = nxt
-                r = await c.get(url, headers={"User-Agent": "opencode-proxy/1.0"}, follow_redirects=False, timeout=timeout)
-            else:
-                break
-        # R4 guards
-        ct = r.headers.get("content-type", "").split(";")[0].strip().lower()
-        if ct and not (ct.startswith("text/") or "json" in ct or "xml" in ct):
-            raise ValueError(f"Rejected Content-Type: {ct}")
-        if int(r.headers.get("content-length", "0") or 0) > 5_000_000 or len(r.content) > 5_000_000:
-            raise ValueError("Content too large")
-        r.raise_for_status()
-        html = r.text[: max_bytes * 3]
-    # extraction to_thread
-    try:
-        import trafilatura
-
-        extracted = await asyncio.to_thread(trafilatura.extract, html) or ""
-    except ImportError:
-        extracted = ""
-    if not extracted:
-        try:
-            from bs4 import BeautifulSoup
-
-            extracted = await asyncio.to_thread(lambda: BeautifulSoup(html, "html.parser").get_text(separator="\n", strip=True))
-        except ImportError:
-            extracted = re.sub(r"<[^>]+>", " ", html)
-    extracted = extracted[:max_bytes].strip()
-    return f"Content of {url} (extracted {len(extracted)} chars):\n{extracted}"
+    return await _ws_mod.execute_web_fetch(
+        url,
+        prompt,
+        timeout,
+        max_bytes,
+        via_vpn,
+        role_client_fn=_role_client,
+        safe_fn=_is_safe_fetch_url,
+        sem=FETCH_SEM,
+    )
 
 
 def _inject_as_user_prefix(body: dict, content: str, protocol: str, tag: str):
@@ -7790,41 +7535,7 @@ def _inject_as_user_prefix(body: dict, content: str, protocol: str, tag: str):
 
 def _strip_web_tool(body: dict, protocol: str, name: str):
     """Remove web_* tool and forced tool_choice."""
-    if "tools" in body and isinstance(body["tools"], list):
-        body["tools"] = [t for t in body["tools"] if _normalize_tool_name(t) != name]
-        if not body["tools"]:
-            try:
-                del body["tools"]
-            except KeyError:
-                pass
-    tc = body.get("tool_choice")
-    if isinstance(tc, dict):
-        # check if tc references the tool being stripped
-        tc_name = tc.get("name", "") or tc.get("function", {}).get("name", "")
-        # also check type containing web_*
-        tc_type = tc.get("type", "")
-        is_target = False
-        if _normalize_tool_name({"name": tc_name}) == name:
-            is_target = True
-        elif isinstance(tc_type, str) and name in tc_type:
-            is_target = True
-        # empty orphan -> auto
-        if not isinstance(tc_name, str) or not tc_name.strip():
-            if tc_type in ("tool", "function") and not tc_name.strip():
-                _debug("  [convert] _strip_web_tool: empty tool_choice name → auto")
-                body["tool_choice"] = "auto"
-                return
-        if is_target and tc.get("type") in ("tool", "function"):
-            try:
-                del body["tool_choice"]
-            except KeyError:
-                pass
-        # also strip type web_* without name
-        if isinstance(tc_type, str) and tc_type.startswith(name):
-            try:
-                del body["tool_choice"]
-            except KeyError:
-                pass
+    _ws_mod.strip_web_tool(body, protocol, name, normalize_fn=_normalize_tool_name, debug_fn=_debug)
 
 
 def _strip_web_search_tool(body: dict, protocol: str):
