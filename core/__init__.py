@@ -21,6 +21,6 @@ stdlib + ``yaml`` seuls) :
   les wrappers d'une ligne les lisent À L'APPEL.
 """
 
-from core import keys
+from core import errors, keys
 
-__all__ = ["keys"]
+__all__ = ["errors", "keys"]

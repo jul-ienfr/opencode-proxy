@@ -2762,48 +2762,12 @@ app.add_middleware(Global429BackoffMiddleware, remaining_fn=_global_429_remainin
 
 # ── HTTP helpers with circuit breaker ────────────────────────────
 
-
-# [Phase 3 refonte] CircuitOpenError extrait vers upstream/breaker.py.
+# Erreurs extraites (phases 3/5/9) : upstream/breaker.py, core/keys.py,
+# core/errors.py — imports regroupés (isort), détails par phase ci-dessus.
+from core.errors import UpstreamError  # noqa: E402
+from core.errors import anthropic_error as _anthropic_error  # noqa: E402
+from core.errors import openai_error as _openai_error  # noqa: E402
 from upstream.breaker import CircuitOpenError  # noqa: E402
-
-
-class UpstreamError(Exception):
-    """Raised when an upstream HTTP request fails (connection, timeout, etc.)."""
-
-    def __init__(self, message: str, status_code: int = 502, original: Exception = None):
-        super().__init__(message)
-        self.status_code = status_code
-        self.original = original
-
-
-# [Phase 5 refonte] AllKeysPausedError extrait vers core/keys.py
-# (importé en tête de module — cf. § API key routing).
-
-
-# ── Standardized error response helpers ──
-
-
-def _anthropic_error(status_code: int, message: str, error_type: str = "api_error") -> JSONResponse:
-    """Return an error in Anthropic Messages API format."""
-    return JSONResponse(
-        status_code=status_code,
-        content={
-            "type": "error",
-            "error": {"type": error_type, "message": message},
-        },
-    )
-
-
-def _openai_error(
-    status_code: int, message: str, error_type: str = "invalid_request_error"
-) -> JSONResponse:
-    """Return an error in OpenAI API format."""
-    return JSONResponse(
-        status_code=status_code,
-        content={
-            "error": {"message": message, "type": error_type, "code": str(status_code)},
-        },
-    )
 
 
 def _geo_i18n(key: str, lang: str | None = None) -> str:
@@ -5334,100 +5298,23 @@ def _free_usage_ip(station=None) -> str:
     return _public_ip_cache.get("ip", "") or ""
 
 
-class FreeRefusal(Exception):
-    """[PLAN_CORRECTION_FAUX_429 Lot A] Refus free véridique (remplace le faux 429).
-
-    Porte le VRAI statut upstream + le VRAI body tronqué + le VRAI
-    Retry-After (jamais inventé). ``status==429`` = vrai quota épuisé ;
-    tout autre statut = erreur upstream relayée telle quelle (503 → 503).
-    ``FreeQuotaExhausted`` reste comme sous-classe legacy (compat tests /
-    call sites) — les handlers doivent catcher ``FreeRefusal``.
-    """
-
-    def __init__(self, status: int = 429, body: str = "", retry_after: str = ""):
-        try:
-            status = int(status)
-        except (TypeError, ValueError):
-            status = 429
-        if not 100 <= status <= 599:
-            status = 502
-        try:
-            body = str(body or "")[:2000]
-        except Exception:
-            body = ""
-        try:
-            retry_after = str(retry_after or "")
-        except Exception:
-            retry_after = ""
-        super().__init__(
-            f"free refusal status={status} retry-after={retry_after!r} body={body[:120]!r}"
-        )
-        self.status = status
-        self.body = body
-        self.retry_after = retry_after
-
-
-class FreeQuotaExhausted(FreeRefusal):
-    """Legacy alias — vrai 429 quota uniquement (status=429).
-
-    Gardé pour compat (tests + anciens raise à 1 arg). Les nouveaux
-    refus non-quota lèvent directement ``FreeRefusal(status, body, ...)``.
-    """
-
-    def __init__(self, retry_after: str = "", status: int = 429, body: str = ""):
-        super().__init__(status=status, body=body, retry_after=retry_after)
+# [Phase 9 refonte] Refus free véridiques extraits vers core/errors.py (purs).
+from core.errors import (  # noqa: E402
+    FreeQuotaExhausted,
+    FreeRefusal,
+)
+from core.errors import free_refusal_response as _free_refusal_response_impl  # noqa: E402
 
 
 def _free_refusal_response(exc: FreeRefusal, protocol: str):
-    """[PLAN_CORRECTION_FAUX_429 Lot A1] Réponse HTTP véridique (non-stream).
-
-    - status == 429 → 429 quota, message historique, Retry-After = header
-      upstream RÉEL uniquement (omis si absent — jamais 60/120 inventé).
-    - sinon → statut upstream relayé (503 → 503), type ``api_error``,
-      message ``Free model request failed with status {s}: {body}``
-      (miroir exact de ``_free_stream_refuse_bytes``), Retry-After
-      propagé uniquement si présent.
-    """
-    try:
-        status = int(getattr(exc, "status", 429))
-    except (TypeError, ValueError):
-        status = 429
-    if not 100 <= status <= 599:
-        status = 502
-    retry_after = (getattr(exc, "retry_after", "") or "").strip()
-    # Valide : secondes ou date HTTP, sinon on omet (jamais inventé)
-    _ra_out = ""
-    if retry_after:
-        try:
-            float(retry_after)
-            _ra_out = retry_after
-        except (TypeError, ValueError):
-            try:
-                email.utils.parsedate_to_datetime(retry_after)
-                _ra_out = retry_after
-            except Exception:
-                _ra_out = ""
-    if status == 429:
-        if _ra_out:
-            _msg = f"Free quota exhausted on all VPN stations. Retry after {_ra_out}s."
-        else:
-            _msg = "Free quota exhausted on all VPN stations."
-        if protocol == "anthropic":
-            resp = _anthropic_error(429, _msg, error_type="rate_limit_error")
-        else:
-            resp = _openai_error(429, _msg, error_type="rate_limit_error")
-        if _ra_out:
-            resp.headers["Retry-After"] = _ra_out
-        return resp
-    _body_txt = _redact(getattr(exc, "body", "") or "", 300)
-    _msg = f"Free model request failed with status {status}: {_body_txt}"
-    if protocol == "anthropic":
-        resp = _anthropic_error(status, _msg, error_type="api_error")
-    else:
-        resp = _openai_error(status, _msg, error_type="api_error")
-    if _ra_out:
-        resp.headers["Retry-After"] = _ra_out
-    return resp
+    """[PLAN_CORRECTION_FAUX_429 Lot A1] Réponse HTTP véridique (non-stream)."""
+    return _free_refusal_response_impl(
+        exc,
+        protocol,
+        anthropic_error_fn=_anthropic_error,
+        openai_error_fn=_openai_error,
+        redact_fn=_redact,
+    )
 
 
 def _free_quota_exhausted_response(exc: FreeQuotaExhausted, protocol: str):
@@ -8000,72 +7887,21 @@ def ensure_min_tokens(body: dict, default: int = None) -> dict:
     return body
 
 
-def _estimate_tokens(text: str) -> int:
-    """Fast token estimation — char-length only (P1.5).
-
-    [P1.5 perf] Plus de branche tiktoken ≥200 chars : cette fonction n'est
-    appelée QUE par les compteurs incrémentaux de stream (deltas, boucle
-    d'émission) — un encode tiktoken par delta à fort débit coûte cher sur
-    la boucle. Dérive chars//3 vs tiktoken acceptable : affichage stats
-    dashboard uniquement (usage réel lu dans `usage` quand l'upstream le
-    fournit). tiktoken CONSERVÉ pour _estimate_input_tokens / count_tokens
-    (offloadés to_thread)."""
-    return max(1, len(text) // 3)
+# [Phase 9 refonte] Estimation tokens extraite vers protocol/tokens.py.
+from protocol.tokens import elapsed_ms as _elapsed_ms  # noqa: E402
+from protocol.tokens import estimate_input_tokens as _estimate_input_tokens_impl  # noqa: E402
+from protocol.tokens import estimate_tokens as _estimate_tokens  # noqa: E402
 
 
 def _estimate_input_tokens(body: dict) -> int:
     """Estimate input tokens from message content, tools, and tool_results."""
-    try:
-        chunks = []
-
-        # System prompt
-        system = body.get("system", "")
-        if isinstance(system, str):
-            chunks.append(system)
-        elif isinstance(system, list):
-            for s in system:
-                if isinstance(s, str):
-                    chunks.append(s)
-                elif isinstance(s, dict):
-                    chunks.append(s.get("text", ""))
-
-        # Tools definitions
-        for tool in body.get("tools", []):
-            chunks.append(tool.get("name", ""))
-            chunks.append(tool.get("description", ""))
-            chunks.append(str(tool.get("input_schema", {})))
-
-        # Messages
-        for msg in body.get("messages", []):
-            content = msg.get("content", "")
-            if isinstance(content, str):
-                chunks.append(content)
-            elif isinstance(content, list):
-                for block in content:
-                    if isinstance(block, str):
-                        chunks.append(block)
-                    elif isinstance(block, dict):
-                        btype = block.get("type", "")
-                        if btype == "tool_result":
-                            chunks.append(_extract_text(block.get("content", "")))
-                        elif btype == "thinking":
-                            chunks.append(block.get("thinking", ""))
-                        else:
-                            chunks.append(block.get("text", ""))
-                            chunks.append(str(block.get("input", "")))
-
-        combined = "\n".join(chunks)
-        if _encoding:
-            return len(_encoding.encode(combined))
-        return max(1, len(combined) // 3)
-    except Exception as e:
-        _debug(f"  ✗ token estimation failed: {type(e).__name__}: {e}")
-        _log(f"  WARN: token estimation failed: {type(e).__name__}: {e}")
-        return 0
-
-
-def _elapsed_ms(start_time: float) -> int:
-    return int((time.monotonic() - start_time) * 1000)
+    return _estimate_input_tokens_impl(
+        body,
+        encoding=_encoding,
+        extract_fn=_extract_text,
+        debug_fn=_debug,
+        log_fn=_log,
+    )
 
 
 def _extract_usage_tool_names(data: dict) -> list:
