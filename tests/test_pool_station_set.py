@@ -161,7 +161,7 @@ def test_queued_entry_for_downscaled_station_is_noop():
         s1, s2, s3 = _Station(1), _Station(2), _Station(3)
         p = _pool(s1)
         p.set_stations([s1, s2, s3])
-        p._rotation_queue.put_nowait(s3)  # queued, then downscaled
+        p._rotation_queue.put_nowait((0, next(p._rotation_seq), s3))  # queued, then downscaled
         p.set_stations([s1, s2])
         task = asyncio.create_task(p._rotation_worker())
         await asyncio.sleep(0.05)  # let the worker drain the queue

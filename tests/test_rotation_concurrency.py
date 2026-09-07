@@ -198,6 +198,53 @@ def test_launch_rotation_dedups_same_station():
     asyncio.run(_go())
 
 
+# ── Lot 2 plan-perf : file prioritaire ──────────────────────────────
+
+
+def test_urgent_rotation_jumps_normal_queue():
+    """Priorité file : une rotation urgente (disconnect-retry, -1) passe
+    devant une rotation de fond (0) déjà en attente ; à priorité égale
+    l'ordre reste FIFO (seq monotone — comportement historique inchangé).
+
+    Déterministe : 1 worker bloqué sur s1, s2 (fond) puis s3 (urgente)
+    enfilées, release → ordre d'entrée [1, 3, 2]. Timeout borne le drain
+    (jamais de hang de gate si la discipline casse)."""
+
+    async def _go():
+        s1, s2, s3 = _Station(1), _Station(2), _Station(3)
+        p = _pool(s1, s2)
+        p.set_stations([s1, s2, s3])
+        p._ROTATION_CONCURRENCY = 1
+        entered = []
+        gate = asyncio.Event()
+        s1_started = asyncio.Event()
+
+        async def gated_switch(station):
+            entered.append(station._station)
+            if station._station == 1:
+                s1_started.set()
+                await gate.wait()
+            station.current_ip = f"10.{station._station}.0.9"
+            station.status = "connected"
+
+        p.switch_ip = gated_switch
+        p._launch_rotation(s1)
+        await asyncio.wait_for(s1_started.wait(), 1.0)
+        p._launch_rotation(s2)  # fond, enfilée première
+        p._launch_rotation(s3, priority=-1)  # urgente, enfilée seconde
+        gate.set()  # libère le worker : s3 doit passer avant s2
+
+        async def _drained():
+            while len(entered) < 3:
+                await asyncio.sleep(0.01)
+
+        await asyncio.wait_for(_drained(), 5.0)
+        await _shutdown(p)
+        assert entered == [1, 3, 2], "urgent avant fond, FIFO sinon"
+
+    asyncio.run(_go())
+
+
 def test_update_config_sets_rotation_concurrency():
     p = _pool(_Station(1))
     p.update_config({"rotation_concurrency": 4})

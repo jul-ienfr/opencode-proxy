@@ -21,6 +21,7 @@ exhausted.
 """
 
 import asyncio
+import itertools
 import logging
 import math
 import random
@@ -240,7 +241,15 @@ class FreeIPPool:
         # station (budget wait + docker ops) no longer freezes the fleet.
         # `_pending` dedups stations already queued (single-flight per
         # station, alongside `_rotation_tasks` for in-flight ones).
-        self._rotation_queue: asyncio.Queue = asyncio.Queue()
+        # [plan-perf Lot 2] File PRIORITAIRE (plus de FIFO simple) : les
+        # rotations qui servent une requête en attente (disconnect-retry,
+        # priorité -1) passent devant les rotations de fond 429 (priorité
+        # 0). Items (priorité, seq, station) — seq monotone = FIFO strict
+        # à priorité égale, donc comportement IDENTIQUE à avant quand tout
+        # est en priorité 0 (défaut). Pas de préemption : la priorité
+        # n'ordonne que les items EN ATTENTE (2 workers inchangés).
+        self._rotation_queue: asyncio.PriorityQueue = asyncio.PriorityQueue()
+        self._rotation_seq = itertools.count()
         self._pending: set[int] = set()
         self._worker_tasks: list = []  # rotation workers, pruned lazily
 
@@ -1299,7 +1308,11 @@ class FreeIPPool:
             if self.dual_station:
                 if self._any_other_usable(failed):
                     self._per_station(failed)["bad_until"] = time.monotonic() + self._bad_ttl
-            self._launch_rotation(failed, forced_pool=forced_pool)
+            # [plan-perf Lot 2] URGENT (-1) : ce retry sert une requête qui
+            # attend déjà (budget rotation_wait_timeout) — il passe devant
+            # les rotations de fond 429 en attente (pas de préemption des
+            # rotations en vol, seulement l'ordre de la file).
+            self._launch_rotation(failed, forced_pool=forced_pool, priority=-1)
         st = (
             self._best_station_excluding(failed, forced_pool)
             if failed is not None
@@ -1511,7 +1524,9 @@ class FreeIPPool:
         for _ in range(self._ROTATION_CONCURRENCY - len(self._worker_tasks)):
             self._worker_tasks.append(asyncio.create_task(self._rotation_worker()))
 
-    def _launch_rotation(self, station: VPNManager, forced_pool: set | None = None) -> None:
+    def _launch_rotation(
+        self, station: VPNManager, forced_pool: set | None = None, priority: int = 0
+    ) -> None:
         """Queue a background rotation for one station (C4/C5).
 
         Bounded concurrency [Axe 1.1]: up to ``_ROTATION_CONCURRENCY``
@@ -1521,6 +1536,11 @@ class FreeIPPool:
         (``_pending``) or already in flight (``_rotation_tasks``) is never
         queued twice — concurrent 429s on the same station share one
         rotation.
+
+        ``priority`` (Lot 2 plan-perf) : 0 = fond (défaut, tous les
+        producteurs historiques), négatif = urgent (seul
+        ``on_disconnect_retry`` utilise -1 : une requête attend déjà).
+        À priorité égale, le seq monotone garantit le FIFO historique.
 
         Axe B: ``forced_pool`` is stored on the station as
         ``_geo_forced_pool`` so the background rotation stays within
@@ -1543,7 +1563,7 @@ class FreeIPPool:
             station._geo_forced_pool = forced_pool
         self._pending.add(sid)
         self._ensure_workers()
-        self._rotation_queue.put_nowait(station)
+        self._rotation_queue.put_nowait((priority, next(self._rotation_seq), station))
 
     async def _rotation_worker(self) -> None:
         """Drain the rotation queue — up to ``_ROTATION_CONCURRENCY`` of
@@ -1551,7 +1571,7 @@ class FreeIPPool:
         (bounded) instead of serially. Per-station single-flight is kept
         by ``_rotation_tasks`` registration before the first await."""
         while True:
-            station = await self._rotation_queue.get()
+            _, _, station = await self._rotation_queue.get()
             self._pending.discard(station._station)
             if station not in self._stations:
                 # [plan 18/08 §4] station downscaled while queued — no-op;

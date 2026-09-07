@@ -90,6 +90,8 @@ scripts/pywin32_testall.py
 logs/free400_*.json
 # Dump d'audit ponctuel à la racine
 _audit_dump*.txt
+# Transients d'écriture atomique interrompue (save_yaml_config .tmp)
+*.tmp
 # Transients de la gate locale (logs/gate_pytest*.log déjà couverts par *.log)
 logs/gate_pytest.pid
 # Données de couverture (générées par `pytest --cov`, jamais versionnées)
