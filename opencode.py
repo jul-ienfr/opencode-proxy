@@ -4557,6 +4557,11 @@ def _apply_identity(headers: dict, profile: dict, use_curated_ua: bool = True) -
         client UA is removed so the impersonation bundle injects its own
         coherent browser UA — curl_cffi only fills headers that are absent.
     extra_headers are applied last so they can override anything.
+    `x-opencode-session` (instance UUID stable, cf. _proxy_session_id) est
+    ajouté sauf si déjà présent : exigé par la gateway Zen (sinon 400
+    MissingSessionID côté provider). Inoffensif sur le paid (la gateway
+    le supprime pour les providers legacy, s'en sert pour le sticky
+    sinon) — un seul choke point pour tout le trafic Zen.
     """
     out = dict(headers)
     ua = profile.get("user_agent")
@@ -4567,9 +4572,62 @@ def _apply_identity(headers: dict, profile: dict, use_curated_ua: bool = True) -
     elif not use_curated_ua:
         out.pop("User-Agent", None)
         out.pop("user-agent", None)
+    # [correctif 2026-09-07 — incident MissingSessionID] la gateway Zen lit
+    # `x-opencode-session` et le substitue dans les headers provider
+    # (`$session`) ; ABSENT → provider « Console » = 400 MissingSessionID
+    # sur TOUS les modèles free (vérifié : anonymous, cookie workspace,
+    # clé paid → 400 ; uuid quelconque → 200). setdefault : un appelant
+    # avec sa propre session garde la main.
+    if not any(k.lower() == "x-opencode-session" for k in out):
+        try:
+            out["x-opencode-session"] = _proxy_session_id()
+        except Exception:
+            pass
     for k, v in (profile.get("extra_headers") or {}).items():
         out[k] = v
     return out
+
+
+_PROXY_SESSION_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "logs", "_proxy_session_id"
+)
+_proxy_session_id_cache: str | None = None
+
+
+def _proxy_session_id() -> str:
+    """UUID de session stable de CETTE instance de proxy (persisté sur disque).
+
+    Lu par la gateway Zen comme identifiant d'instance (sticky routing) ;
+    ce n'est PAS un secret d'account (uuid aléatoire local, aucune identité,
+    aucun quota lié côté proxy — le trial upstream reste par IP). Le fichier
+    vit à côté des autres états runtime (`logs/`, gitignoré via `logs/_*`).
+    Fail-soft : toute erreur I/O → uuid éphémère (requête quand même émise).
+    """
+    global _proxy_session_id_cache
+    if _proxy_session_id_cache:
+        return _proxy_session_id_cache
+    try:
+        with open(_PROXY_SESSION_FILE, encoding="utf-8") as f:
+            _sid = (f.read() or "").strip()
+        import re as _re
+
+        if _re.fullmatch(r"[0-9a-fA-F-]{8,64}", _sid or ""):
+            _proxy_session_id_cache = _sid
+            return _sid
+    except OSError:
+        pass
+    import uuid as _uuid
+
+    _sid = str(_uuid.uuid4())
+    try:
+        _tmp = _PROXY_SESSION_FILE + ".tmp"
+        with open(_tmp, "w", encoding="utf-8") as f:
+            f.write(_sid)
+        os.replace(_tmp, _PROXY_SESSION_FILE)
+    except OSError:
+        pass
+    _proxy_session_id_cache = _sid
+    return _sid
 
 
 def _free_request_headers(headers: dict) -> dict:
