@@ -13531,58 +13531,11 @@ class ServerManager:
 
 
 # ── Mono-instance lock [CRITIC(7)] ────────────────────────────────────
-_INSTANCE_LOCK_FDS: list[int] = []  # keep fds referenced: GC closing them would release the lock
-
-
-def _acquire_instance_lock(lock_path: str = os.path.join("logs", "opencode.lock")) -> None:
-    """Take a non-blocking exclusive file lock; exit if another instance holds it.
-
-    [CRITIC(7)] Two proxy instances would fight over port 4000, the rotation
-    machinery and the SQLite DB. The lock file is advisory — one lock per
-    host — so a second `python opencode.py` exits immediately with a clear
-    message instead of corrupting state.
-    """
-    import sys
-
-    try:
-        os.makedirs(os.path.dirname(lock_path) or ".", exist_ok=True)
-        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
-    except OSError as e:
-        _log(
-            f"WARNING: cannot create lock file {lock_path}: {e} — continuing without mono-instance guard"
-        )
-        return
-    try:
-        if os.name == "nt":
-            import msvcrt
-
-            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
-        else:
-            import fcntl  # posix only — branche morte sous Windows, mypy ok
-
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # type: ignore[attr-defined]
-    except OSError:
-        # stderr print: the Rich log panel is never built when we exit here,
-        # so this is the only place the user sees why the instance refused to start.
-        print(
-            f"FATAL: another opencode-proxy instance is already running (lock held: {lock_path})",
-            file=sys.stderr,
-            flush=True,
-        )
-        _log(f"FATAL: another opencode-proxy instance is already running (lock held: {lock_path})")
-        try:
-            os.close(fd)
-        except OSError:
-            pass
-        sys.exit(1)
-    try:
-        os.ftruncate(fd, 0)
-        os.write(fd, f"pid={os.getpid()}\n".encode("ascii"))
-    except OSError:
-        pass
-    _INSTANCE_LOCK_FDS.append(fd)
-    _debug(f"  [lock] instance lock acquired: {lock_path}")
-
+# [Phase 8 refonte] Implémentation extraite vers ops/lock.py (pur, DI :
+# log_fn/debug_fn injectés au site d'appel __main__ ci-dessous).
+# ALIAS nu (pas de wrapper) : `inspect.getsource(oc._acquire_instance_lock)`
+# doit contenir le message FATAL figé (contrat test_phase0_contracts.py).
+from ops.lock import acquire_instance_lock as _acquire_instance_lock  # noqa: E402
 
 if __name__ == "__main__":
     import argparse
@@ -13606,7 +13559,10 @@ if __name__ == "__main__":
         # différents créaient deux locks distincts et deux instances vives.
         os.path.join(
             os.path.dirname(os.path.abspath(__file__)), "logs", f"opencode-{PORT}.lock"
-        )
+        ),
+        # [Phase 8] DI explicite (ops/lock.py pur).
+        log_fn=_log,
+        debug_fn=_debug,
     )
 
     # GUI by default (system tray + dashboard window); --no-gui forces terminal mode.
