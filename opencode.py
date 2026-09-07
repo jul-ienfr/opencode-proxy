@@ -34,7 +34,6 @@ import httpx
 # net au boot si absent. Un fallback silencieux sur stdlib json rendrait le
 # proxy 5-10x plus lent sans aucun signal.
 import orjson as _orjson  # type: ignore
-import yaml
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
@@ -117,110 +116,41 @@ _key_failover_index = 0
 _key_cycle_lock = threading.Lock()  # protects _key_cycle_keys/_key_cycle_index
 
 
+# [Phase 5 refonte] Sélection + pauser extraits vers core/keys.py (pur, DI :
+# état passé en paramètres, retourné mis à jour). L'état reste possédé ICI
+# (API_KEYS, _key_pauser, _key_failover_index… rebind par tests) ; les
+# wrappers ci-dessous lisent les globaux À L'APPEL.
+from core import keys as _keys_mod  # noqa: E402
+from core.keys import AllKeysPausedError  # noqa: E402
+
+
 def _get_enabled_keys() -> list[dict]:
-    return [k for k in API_KEYS if k.get("enabled", True)]
+    return _keys_mod.enabled_keys(API_KEYS)
 
 
 def _env_key_or_raise() -> dict:
-    """Return the .env fallback key, or raise AllKeysPausedError if paused.
-
-    [CRITIC(9)] The .env fallback must not be hammered while paused: when
-    every routed key is paused AND the .env key itself is paused, raise so
-    the caller surfaces a clean retry-after instead of sending a request
-    with a known-dead key.
-    """
-    if _key_pauser.is_paused(API_KEY):
-        remaining = _key_pauser.remaining(API_KEY)
-        _debug(
-            f"  [apikey] .env fallback key paused ({remaining:.0f}s) — raising AllKeysPausedError"
-        )
-        raise AllKeysPausedError(remaining if remaining > 0 else 1)
-    return {"api_key": API_KEY}
+    return _keys_mod.env_key_or_raise(API_KEY, _key_pauser, _debug)
 
 
 def get_next_api_key() -> dict:
-    global _key_cycle_keys, _key_failover_index
-    if not API_KEYS:
-        _debug("  [apikey] no API_KEYS configured, falling back to .env key")
-        return _env_key_or_raise()
-    enabled = _get_enabled_keys()
-    if not enabled:
-        _debug("  [apikey] no enabled keys, falling back to .env key")
-        return _env_key_or_raise()
-
-    # Filter out paused keys
-    available = [k for k in enabled if not _key_pauser.is_paused(k.get("api_key", ""))]
-
-    if not available:
-        # All paused — raise with shortest wait time instead of reusing a paused key
-        min_rem = min((_key_pauser.remaining(k.get("api_key", "")) for k in enabled), default=0)
-        if min_rem > 0:
-            _debug(
-                f"  [apikey] ALL keys paused, min remaining={min_rem:.0f}s — raising AllKeysPausedError"
-            )
-            raise AllKeysPausedError(min_rem)
-        _debug("  [apikey] no keys available, falling back to .env key")
-        return _env_key_or_raise()
-
-    # [plan Lot 2/3] PAS de shortcut len(available)==1 : la boucle
-    # failover ci-dessous gère uniformément tous les cas ET applique la
-    # sémantique sticky (avance sur pause). Le shortcut court-circuitait
-    # l'avance d'index à 2 clés (cas courant) : la clé servie était la
-    # bonne, mais l'index ne persistait pas (retour implicite à la clé 0
-    # à la levée de pause). Servir est identique, seul l'index change.
-    if API_KEY_ROUTING == "failover":
-        for i in range(len(API_KEYS)):
-            idx = (_key_failover_index + i) % len(API_KEYS)
-            if API_KEYS[idx].get("enabled", True) and not _key_pauser.is_paused(
-                API_KEYS[idx].get("api_key", "")
-            ):
-                # [plan Lot 2] sticky + avance sur pause : quand la clé
-                # d'index courant est pausée/sautée (i > 0), persister la
-                # nouvelle position — pas de retour automatique à la clé 0
-                # après récupération. Le failover intra-requête reste géré
-                # par _do_request_with_retry (_find_alternative_key).
-                if i > 0:
-                    _key_failover_index = idx
-                    _debug(
-                        f"  [apikey] failover index avance → {idx} (clé précédente pausée)"
-                    )
-                _debug(
-                    f"  [apikey] failover selected alias={API_KEYS[idx].get('alias', '?')} (idx={idx})"
-                )
-                return API_KEYS[idx]
-        # Fallback to shortest-paused
-        min_rem = min((_key_pauser.remaining(k.get("api_key", "")) for k in enabled), default=0)
-        if min_rem > 0:
-            raise AllKeysPausedError(min_rem)
-        _debug("  [apikey] failover exhausted, falling back to .env key")
-        return _env_key_or_raise()
-
-    # Round-robin: atomic index modulo under threading.Lock (no itertools.cycle)
-    global _key_cycle_index, _key_cycle_keys
-    with _key_cycle_lock:
-        current_ids = [k.get("api_key") for k in available]
-        if _key_cycle_keys != current_ids:
-            _key_cycle_keys = [str(k) for k in current_ids]
-            _key_cycle_index = 0
-            _debug(
-                f"  [apikey] round-robin index reset: {len(available)} available keys (filtered from {len(enabled)} enabled)"
-            )
-        idx = _key_cycle_index % len(available) if available else 0
-        selected = available[idx]
-        _key_cycle_index = (idx + 1) % len(available) if available else 0
-        _debug(f"  [apikey] round-robin selected alias={selected.get('alias', '?')} idx={idx}")
-        return selected
+    global _key_cycle_keys, _key_failover_index, _key_cycle_index
+    key, _key_failover_index, _key_cycle_keys, _key_cycle_index = _keys_mod.select_next_key(
+        api_keys=API_KEYS,
+        env_key=API_KEY,
+        routing=API_KEY_ROUTING,
+        pauser=_key_pauser,
+        failover_index=_key_failover_index,
+        cycle_keys=_key_cycle_keys,
+        cycle_index=_key_cycle_index,
+        cycle_lock=_key_cycle_lock,
+        debug_fn=_debug,
+    )
+    return key
 
 
 def _find_alternative_key(failed_key: str) -> dict | None:
     """Return the first enabled, non-paused key different from failed_key, or None."""
-    for k in API_KEYS:
-        if k.get("api_key") != failed_key and k.get("enabled", True):
-            if not _key_pauser.is_paused(k.get("api_key", "")):
-                _debug(f"  [apikey] alternative key found alias={k.get('alias', '?')}")
-                return k
-    _debug(f"  [apikey] no alternative key for {failed_key[:8]}...")
-    return None
+    return _keys_mod.find_alternative_key(API_KEYS, _key_pauser, failed_key, _debug)
 
 
 _key_alias_cache: dict[str, str] = {}
@@ -233,9 +163,7 @@ _KEY_PREFIX_CACHE_MAX = 4096
 def _rebuild_key_cache():
     """Rebuild the API key → alias lookup dict."""
     global _key_alias_cache
-    _key_alias_cache = {
-        k["api_key"]: k.get("alias", "") or "" for k in API_KEYS if k.get("api_key")
-    }
+    _key_alias_cache = _keys_mod.build_alias_cache(API_KEYS)
     _key_prefix_cache.clear()
 
 
@@ -253,16 +181,7 @@ def _has_usable_paid_key() -> bool:
     vide (API_KEY == "") ne compte PAS comme clé utilisable — un Bearer vide
     produit un 401 upstream systématique.
     """
-    for k in API_KEYS:
-        if not k.get("enabled", True):
-            continue
-        ak = k.get("api_key", "")
-        if ak and not _key_pauser.is_paused(ak):
-            return True
-    env_key = API_KEY or ""
-    if env_key and not _key_pauser.is_paused(env_key):
-        return True
-    return False
+    return _keys_mod.has_usable_paid_key(API_KEYS, API_KEY, _key_pauser)
 
 
 # ── Key pause tracker ─────────────────────────────────────────
@@ -274,238 +193,32 @@ def _has_usable_paid_key() -> bool:
 KEY_PAUSE_401_SEC = float(yaml_get("key_pause", "key_pause_401_sec", 3600.0))
 
 
-class _KeyPauser:
-    """Per-key rate limit pause tracker. Pauses a key when upstream returns 429.
+# [Phase 5 refonte] Classe extraite vers core/keys.py (pur, DI).
+# Sous-classe SEAM : max_pause depuis config.yaml + dict mémo partagé ;
+# alias/debug/log via LAMBDAS résolues À L'APPEL — ces globaux hôtes sont
+# définis APRÈS cette classe dans le module (un binding direct lèverait
+# NameError à l'instanciation du singleton ci-dessous) et patchés par tests
+# (ex. monkeypatch _debug). Construction directe oc._KeyPauser(...) :
+# max_pause explicite ou défaut yaml, même comportement.
+from core.keys import KeyPauser as _KeyPauserBase  # noqa: E402
 
-    Persists pause state to logs/paused_keys.yaml so pauses survive reboots.
-    """
 
+class _KeyPauser(_KeyPauserBase):
     _PAUSED_FILE = os.path.join(
         os.path.dirname(os.path.abspath(__file__)), "logs", "paused_keys.yaml"
     )
 
-    def __init__(self, max_pause: float = None):
-        if max_pause is None:
-            max_pause = float(yaml_get("key_pause", "max_pause", 600))
-        self._paused: dict[str, float] = {}  # key_prefix -> monotonic expiry
-        self._reasons: dict[str, str] = {}  # key_prefix -> reason string
-        self._lock = threading.Lock()
-        self._max_pause = max_pause
-
-    @staticmethod
-    def _prefix(api_key: str) -> str:
-        """Slot stable par clé ENTIÈRE.
-
-        [plan v10 Lot 0 filet — bug réel] l'ancien `api_key[:12]` fusionnait
-        toutes les clés partageant le préfixe fournisseur (« sk-ant-api03 » =
-        exactement 12 caractères) : mettre en pause UNE clé mettait en pause
-        TOUTES les clés Anthropic, et la sémantique « seulement étendre »
-        collait la plus longue pause à tout le monde. Hash tronqué = slot
-        unique par clé, toujours non réversible pour les logs. Les entrées
-        persistées sous l'ancien schéma deviennent orphelines et expirent
-        naturellement (jamais re-matchées)."""
-        cached = _key_prefix_cache.get(api_key)
-        if cached is not None:
-            return cached
-        if not api_key:
-            return ""
-        import hashlib
-
-        prefix = hashlib.sha256(api_key.encode("utf-8")).hexdigest()[:12]
-        if len(_key_prefix_cache) < _KEY_PREFIX_CACHE_MAX:
-            _key_prefix_cache[api_key] = prefix
-        return prefix
-
-    def _save(self):
-        """Persist current pause state to YAML file (wall clock times).
-
-        File I/O is offloaded to a thread pool so it doesn't block the event loop.
-        Data serialization happens synchronously (fast, in-memory only).
-        """
-        try:
-            data = {}
-            for prefix, mono_expiry in self._paused.items():
-                remaining = mono_expiry - time.monotonic()
-                if remaining > 0:
-                    wall_expiry = time.time() + remaining
-                    data[prefix] = {
-                        "expiry": wall_expiry,
-                        "reason": self._reasons.get(prefix, ""),
-                    }
-            # Offload file I/O to thread pool (non-blocking)
-            payload = {"paused_keys": data}
-            file_path = self._PAUSED_FILE
-
-            def _write_yaml():
-                os.makedirs(os.path.dirname(file_path), exist_ok=True)
-                # [plan v10 §9.1.2] tmp+fsync+replace — l'écriture directe
-                # pouvait laisser un YAML tronqué sur crash/kill (les clés
-                # pausées disparaissaient alors au prochain load).
-                tmp = file_path + ".tmp"
-                with open(tmp, "w", encoding="utf-8") as f:
-                    yaml.dump(payload, f, default_flow_style=False)
-                    f.flush()
-                    try:
-                        os.fsync(f.fileno())
-                    except OSError:
-                        pass
-                os.replace(tmp, file_path)
-
-            try:
-                loop = asyncio.get_running_loop()
-                loop.run_in_executor(None, _write_yaml)
-            except RuntimeError:
-                _write_yaml()  # Fallback: sync if no event loop running
-        except Exception as e:
-            _debug(f"  [keypauser] save error: {e}")
-
-    def load(self, api_keys: list):
-        """Load persisted pause state from YAML (called once at startup).
-
-        Converts wall clock expiry → monotonic expiry so is_paused() works.
-        Expired entries are silently dropped.
-        """
-        try:
-            if not os.path.exists(self._PAUSED_FILE):
-                return
-            with open(self._PAUSED_FILE, encoding="utf-8") as f:
-                raw = yaml.safe_load(f) or {}
-            entries = raw.get("paused_keys", {})
-            if not entries:
-                return
-            now_wall = time.time()
-            now_mono = time.monotonic()
-            loaded = 0
-            for prefix, info in entries.items():
-                wall_expiry = info.get("expiry", 0)
-                if wall_expiry <= now_wall:
-                    continue  # already expired
-                remaining = wall_expiry - now_wall
-                mono_expiry = now_mono + remaining
-                with self._lock:
-                    self._paused[prefix] = mono_expiry
-                    self._reasons[prefix] = info.get("reason", "")
-                loaded += 1
-            if loaded:
-                _debug(f"  [keypauser] loaded {loaded} persisted pauses from disk")
-                _log(f"  KEY PAUSER: restored {loaded} pauses from disk")
-        except Exception as e:
-            _debug(f"  [keypauser] load error: {e}")
-
-    def pause_key(self, api_key: str, duration: float, reason: str = "", quota_based: bool = False):
-        """Pause a key for `duration` seconds from now.
-
-        Only quota_based pauses (auto-computed reset times) are capped at
-        max_pause — the quota estimate can be wrong (e.g. a free-endpoint
-        429 misattributed to a paid key), and a wrong 24 h pause is worse
-        than a short one. Explicit 401/403 durations (revoked/blocked keys)
-        are honored in full: a revoked key never recovers, so capping its
-        pause only creates churn.
-        """
-        prefix = self._prefix(api_key)
-        if quota_based:
-            duration = min(duration, self._max_pause)
-        expiry = time.monotonic() + duration
-        with self._lock:
-            existing = self._paused.get(prefix, 0)
-            if expiry > existing:  # only extend, never shorten
-                self._paused[prefix] = expiry
-                self._reasons[prefix] = reason
-                self._save()
-        alias = _alias_for_key(api_key)
-        _debug(
-            f"  [keypauser] PAUSED alias={alias} prefix={prefix} for {duration:.0f}s reason={reason}"
+    def __init__(self, max_pause: float | None = None):
+        super().__init__(
+            max_pause
+            if max_pause is not None
+            else float(yaml_get("key_pause", "max_pause", 600)),
+            prefix_cache=_key_prefix_cache,
+            prefix_cache_max=_KEY_PREFIX_CACHE_MAX,
+            alias_fn=lambda key: _alias_for_key(key),
+            debug_fn=lambda *a, **k: _debug(*a, **k),
+            log_fn=lambda *a, **k: _log(*a, **k),
         )
-        _log(f"  KEY PAUSED: alias={alias} for {duration:.0f}s ({reason})")
-
-    def is_paused(self, api_key: str) -> bool:
-        """Check if a key is currently paused (and not yet expired)."""
-        prefix = self._prefix(api_key)
-        with self._lock:
-            expiry = self._paused.get(prefix, 0)
-            if expiry > 0 and time.monotonic() < expiry:
-                return True
-            if expiry > 0:
-                del self._paused[prefix]
-                self._reasons.pop(prefix, None)
-        return False
-
-    def remaining(self, api_key: str) -> float:
-        """Return seconds remaining on pause, or 0 if not paused."""
-        prefix = self._prefix(api_key)
-        with self._lock:
-            expiry = self._paused.get(prefix, 0)
-            if expiry > 0:
-                rem = expiry - time.monotonic()
-                if rem > 0:
-                    return rem
-                del self._paused[prefix]
-                self._reasons.pop(prefix, None)
-        return 0.0
-
-    def best_available(self, keys: list) -> dict | None:
-        """Among keys, return the one with shortest remaining pause.
-
-        Returns None if any key is fully available (meaning normal selection
-        should proceed). Caller uses None to mean 'use normal selection'.
-        """
-        best = None
-        best_remaining = float("inf")
-        for k in keys:
-            if not self.is_paused(k.get("api_key", "")):
-                return None  # at least one key is available
-            rem = self.remaining(k.get("api_key", ""))
-            if rem < best_remaining:
-                best_remaining = rem
-                best = k
-        return best
-
-    def get_all_status(self) -> dict:
-        """Return status of all paused keys (for dashboard/health endpoint)."""
-        now = time.monotonic()
-        with self._lock:
-            status = {}
-            expired = []
-            for prefix, expiry in self._paused.items():
-                remaining = expiry - now
-                if remaining <= 0:
-                    expired.append(prefix)
-                    continue
-                status[prefix] = {
-                    "remaining_seconds": round(remaining, 1),
-                    "reason": self._reasons.get(prefix, ""),
-                }
-            for prefix in expired:
-                del self._paused[prefix]
-                self._reasons.pop(prefix, None)
-        return status
-
-    def cleanup_expired(self):
-        """Remove all expired entries. Called periodically."""
-        now = time.monotonic()
-        with self._lock:
-            expired = [k for k, v in self._paused.items() if v <= now]
-            for k in expired:
-                del self._paused[k]
-                self._reasons.pop(k, None)
-            if expired:
-                self._save()
-        if expired:
-            _debug(f"  [keypauser] cleanup: {len(expired)} expired pauses removed")
-
-    def unpause_if_paused(self, api_key: str) -> bool:
-        """Remove a pause for a key if it exists. Returns True if removed."""
-        prefix = self._prefix(api_key)
-        with self._lock:
-            if prefix in self._paused:
-                del self._paused[prefix]
-                self._reasons.pop(prefix, None)
-                self._save()
-                alias = _alias_for_key(api_key)
-                _debug(f"  [keypauser] UNPAUSED alias={alias} prefix={prefix} (recovered)")
-                _log(f"  KEY UNPAUSED: alias={alias} (recovered)")
-                return True
-        return False
 
 
 _key_pauser = _KeyPauser()
@@ -3054,12 +2767,8 @@ class UpstreamError(Exception):
         self.original = original
 
 
-class AllKeysPausedError(Exception):
-    """Raised when all API keys are paused and no request can be made."""
-
-    def __init__(self, retry_after: float):
-        super().__init__(f"All API keys paused, retry after {retry_after:.0f}s")
-        self.retry_after = retry_after
+# [Phase 5 refonte] AllKeysPausedError extrait vers core/keys.py
+# (importé en tête de module — cf. § API key routing).
 
 
 # ── Standardized error response helpers ──
