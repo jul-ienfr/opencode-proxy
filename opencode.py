@@ -8380,11 +8380,11 @@ async def _handle_web_fetch(body: dict, model_id: str, protocol: str) -> bool:
         return False
 
 
-# ── Protocol mapping (single source: protocol_mapping.py) ──
-# This block was deduplicated: all conversions live in protocol_mapping.py
-# (Phase 2 of plan api-error-400-http-enchanted-creek). Imported here to
-# preserve 'from opencode import ...' compatibility for tests.
-from protocol_mapping import (  # noqa: E402,I001  # re-export after function defs for compat
+# ── Protocol mapping (single source: app/protocol/mapping.py) ──
+# This block was deduplicated: all conversions live in app/protocol/mapping.py
+# ([Phase 4] déplacé depuis protocol_mapping.py — shim conservé). Imported
+# here to preserve 'from opencode import ...' compatibility for tests.
+from app.protocol.mapping import (  # noqa: E402,I001  # re-export after function defs for compat
     THINKING_MODELS,
     ResponsesSseState,
     _HAS_SYNTHETIC_REASONING_KEY,

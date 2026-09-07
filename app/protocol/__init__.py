@@ -1,38 +1,20 @@
 """
-app.protocol — converters Anthropic<->OpenAI (re-export de protocol_mapping.py)
+app.protocol — converters Anthropic<->OpenAI (re-export de .mapping)
 
-Extraction de opencode.py: toute la conversion vit déjà dans protocol_mapping.py
-(1182l, orjson, orphan filter, dedup CACHE_REWRITE_MODELS). Ce package est le
-facade pour la future DI.
+[Phase 4 refonte] Domicile canonique : app.protocol.mapping (déplacé depuis
+protocol_mapping.py, shim conservé). Cette façade expose le sous-ensemble
+historique ; la surface complète vit dans app.protocol.mapping.
 """
 
-from protocol_mapping import (
-    CACHE_REWRITE_MODELS as CACHE_REWRITE_MODELS,
-)
-from protocol_mapping import (
-    _drop_orphan_responses_input as _drop_orphan_responses_input,
-)
-from protocol_mapping import (
-    _drop_orphan_tool_messages as _drop_orphan_tool_messages,
-)
-from protocol_mapping import (
-    _effort_to_reasoning as _effort_to_reasoning,
-)
-from protocol_mapping import (
-    anthropic_to_openai as anthropic_to_openai,
-)
-from protocol_mapping import (
-    anthropic_to_openai_response as anthropic_to_openai_response,
-)
-from protocol_mapping import (
-    anthropic_to_openai_responses as anthropic_to_openai_responses,
-)
-from protocol_mapping import (
-    openai_to_anthropic as openai_to_anthropic,
-)
-from protocol_mapping import (
-    openai_to_anthropic_request as openai_to_anthropic_request,
-)
+from app.protocol.mapping import CACHE_REWRITE_MODELS as CACHE_REWRITE_MODELS
+from app.protocol.mapping import _drop_orphan_responses_input as _drop_orphan_responses_input
+from app.protocol.mapping import _drop_orphan_tool_messages as _drop_orphan_tool_messages
+from app.protocol.mapping import _effort_to_reasoning as _effort_to_reasoning
+from app.protocol.mapping import anthropic_to_openai as anthropic_to_openai
+from app.protocol.mapping import anthropic_to_openai_response as anthropic_to_openai_response
+from app.protocol.mapping import anthropic_to_openai_responses as anthropic_to_openai_responses
+from app.protocol.mapping import openai_to_anthropic as openai_to_anthropic
+from app.protocol.mapping import openai_to_anthropic_request as openai_to_anthropic_request
 
 __all__ = [
     "CACHE_REWRITE_MODELS",
