@@ -665,12 +665,13 @@ attach_module_logger("free_ip_pool")
 MAX_BODY_SIZE = yaml_get("upstream", "max_body_size", 10 * 1024 * 1024)
 
 # ── [P5 tranche 1] Logique DB extraite vers app/db (pur, DI) ────────────
+# [Phase 2 refonte] domicile canonique : observability.db (app.db = shim).
 # Les noms historiques restent exposés ici (seams de test oc._DbRowRaw /
 # oc._quick_body_size / monkeypatch.setattr(oc, "_conn"|"_db_queue")) :
 # chaque wrapper lit ses globales À L'APPEL — un patch d'oc._conn ou
 # oc._db_queue continue de couler dans la logique déléguée.
-from app import db as _app_db  # noqa: E402
 from app.router import route_for as _app_router_route_for  # noqa: E402  # [P5 tranche 3]
+from observability import db as _app_db  # noqa: E402
 
 MAX_BODY_STORAGE = _app_db.MAX_BODY_STORAGE
 
@@ -2202,98 +2203,12 @@ def _redact(text, max_len=None) -> str:
 
 
 # ── Response Cache (non-streaming only) ──────────────────────────
+# [Phase 2 refonte] Implémentation extraite vers server/cache.py (pur, DI :
+# debug_fn + dumps_str_fn injectés). Les noms historiques restent exposés ici
+# (seams de test oc._response_cache / oc._ResponseCache).
+from server.cache import ResponseCache as _ResponseCache  # noqa: E402
 
-
-class _ResponseCache:
-    """LRU cache for non-streaming API responses with TTL and size limit.
-
-    Cache key: blake2b hash of raw request body bytes (excluding streaming and tool_use).
-    Returns (body_bytes, headers_dict) or None on miss.
-    Uses OrderedDict for O(1) LRU operations instead of list-based O(n).
-    """
-
-    def __init__(self, max_size: int = 1000, ttl: float = 300.0):
-        self._max_size = max_size
-        self._ttl = ttl
-        self._store: dict[str, tuple[float, bytes, dict]] = {}  # key -> (ts, body, headers)
-        self._access_order: OrderedDict[str, None] = OrderedDict()  # O(1) LRU tracking
-
-    def _evict(self):
-        evicted = 0
-        while len(self._store) > self._max_size:
-            oldest, _ = self._access_order.popitem(last=False)  # O(1) pop oldest
-            self._store.pop(oldest, None)
-            evicted += 1
-        if evicted > 0:
-            _debug(
-                f"  [cache] _evict: evicted {evicted} entries, store_size={len(self._store)}/{self._max_size}"
-            )
-
-    def get(self, key: str) -> tuple[bytes, dict] | None:
-        entry = self._store.get(key)
-        if entry is None:
-            return None
-        ts, body, headers = entry
-        if time.monotonic() - ts > self._ttl:
-            _debug(
-                f"  [cache] get: TTL expired (age={time.monotonic() - ts:.1f}s > ttl={self._ttl}s), evicting key={key[:16]}..."
-            )
-            self._store.pop(key, None)
-            self._access_order.pop(key, None)
-            return None
-        # Move to end of access order (most recently used) — O(1)
-        self._access_order.move_to_end(key)
-        _debug(f"  [cache] get: HIT key={key[:16]}... size={len(body)} bytes")
-        return body, headers
-
-    def put(self, key: str, body: bytes, headers: dict):
-        if key in self._store:
-            self._access_order.pop(key, None)
-        self._store[key] = (time.monotonic(), body, dict(headers))
-        self._access_order[key] = None  # append to end — O(1)
-        self._evict()
-        _debug(f"  [cache] put: key={key[:16]}... store_size={len(self._store)}/{self._max_size}")
-
-    def make_key(self, body: dict, body_bytes: bytes | None = None) -> str | None:
-        """Create cache key from request body. Returns None if not cacheable.
-
-        If body_bytes is provided, hashes raw bytes directly (fast, no re-serialization).
-        Falls back to json.dumps + blake2b if body_bytes is not provided.
-        """
-        if body.get("stream"):
-            _debug("  [cache] make_key: stream=True, returning None")
-            return None
-        # Don't cache requests with tool use (non-deterministic)
-        messages = body.get("messages", [])
-        for msg in messages:
-            content = msg.get("content", "")
-            if isinstance(content, list):
-                for block in content:
-                    if isinstance(block, dict) and block.get("type") == "tool_result":
-                        _debug("  [cache] make_key: tool_result found, returning None")
-                        return None
-        try:
-            import hashlib
-
-            if body_bytes:
-                # Fast path: hash raw bytes directly (avoids json.dumps + sort_keys)
-                key = hashlib.blake2b(body_bytes, digest_size=16).hexdigest()
-            else:
-                # Fallback: deterministic JSON serialization + blake2b
-                key = hashlib.blake2b(
-                    _json_dumps_str(body, separators=(",", ":"), default=str).encode(),
-                    digest_size=16,
-                ).hexdigest()
-            _debug(f"  [cache] make_key: generated hash={key[:16]}...")
-            return key
-        except Exception:
-            return None
-
-    def stats(self) -> dict:
-        return {"size": len(self._store), "max_size": self._max_size, "ttl": self._ttl}
-
-
-_response_cache = _ResponseCache()
+_response_cache = _ResponseCache(debug_fn=_debug, dumps_str_fn=_json_dumps_str)
 
 
 @asynccontextmanager
@@ -2938,8 +2853,10 @@ app = FastAPI(lifespan=lifespan)
 # ajoutés ensuite donc plus externes) ne paient plus la capture. Lazy :
 # boot en pur passthrough (enabled=False), activée seulement pendant qu'un
 # onglet Traffic regarde (dashboard/api.py §_traffic_apply_lazy, TTL 15 s).
-from traffic_capture import TrafficCaptureMiddleware  # noqa: E402  # after middleware setup (app object required)
-from traffic_capture import capture as _traffic_capture  # noqa: E402
+# [Phase 2 refonte] domicile canonique : observability.capture
+# (traffic_capture.py = shim).
+from observability.capture import TrafficCaptureMiddleware  # noqa: E402  # after middleware setup (app object required)
+from observability.capture import capture as _traffic_capture  # noqa: E402
 
 _traffic_capture.configure(
     max_frames=int(yaml_get("traffic", "max_frames", 500)),
@@ -2976,6 +2893,10 @@ register_dashboard(
 
 
 # ── Rate Limiting (token bucket, per-IP) ────────────────────────
+# [Phase 2 refonte] _Bucket + RateLimitMiddleware extraits vers
+# server/throttle.py (pur, DI : rate/burst/stale_ttl + debug_fn/dumps_fn
+# injectés). Les lectures config/env restent ICI (side-effects d'import
+# interdits dans le nouveau code). Alias _Bucket conservé (test_proxy.py).
 
 RATE_LIMIT_RPS = float(os.environ.get("RATE_LIMIT_RPS", str(yaml_get("rate_limit", "rps", 50))))
 RATE_LIMIT_BURST = float(
@@ -2986,108 +2907,18 @@ _STALE_BUCKET_TTL = yaml_get(
 )  # seconds — remove buckets inactive for 5 min
 
 
-class _Bucket:
-    """Token bucket for a single client IP — lock-free (single-threaded event loop)."""
+from server.throttle import Bucket as _Bucket  # noqa: E402,F401  # seam test_proxy (re-export)
+from server.throttle import RateLimitMiddleware  # noqa: E402
+from server.throttle import RequestBodyLimitMiddleware as _RequestBodyLimitMiddleware  # noqa: E402
 
-    __slots__ = ("tokens", "last_refill", "max_tokens", "refill_rate", "last_access")
-
-    def __init__(self, rate: float, burst: float):
-        self.tokens = burst
-        self.last_refill = time.monotonic()
-        self.max_tokens = burst
-        self.refill_rate = rate
-        self.last_access = time.monotonic()
-
-    async def consume(self) -> tuple[bool, float]:
-        """Try to consume one token. Returns (allowed, retry_after). Lock-free (no per-bucket lock)."""
-        now = time.monotonic()
-        self.last_access = now
-        elapsed = now - self.last_refill
-        self.tokens = min(self.max_tokens, self.tokens + elapsed * self.refill_rate)
-        self.last_refill = now
-        if self.tokens >= 1.0:
-            self.tokens -= 1.0
-            return True, 0.0
-        wait = (1.0 - self.tokens) / self.refill_rate
-        _debug(f"  [ratelimit] DENIED (tokens={self.tokens:.2f}, retry_after={wait:.2f}s)")
-        return False, wait
-
-    # Sync alias for pure-ASGI hot path (avoids await overhead)
-    def consume_sync(self) -> tuple[bool, float]:
-        now = time.monotonic()
-        self.last_access = now
-        elapsed = now - self.last_refill
-        self.tokens = min(self.max_tokens, self.tokens + elapsed * self.refill_rate)
-        self.last_refill = now
-        if self.tokens >= 1.0:
-            self.tokens -= 1.0
-            return True, 0.0
-        wait = (1.0 - self.tokens) / self.refill_rate
-        return False, wait
-
-
-class RateLimitMiddleware:
-    """Pure-ASGI token bucket rate limiter — zero copy, streaming-safe.
-
-    Replaces the old BaseHTTPMiddleware version which buffered response bodies
-    and added ~8ms per request. This version is a raw ASGI middleware (like
-    TrafficCaptureMiddleware) — no body copy, no BaseHTTPMiddleware overhead.
-    """
-
-    _SKIP_PREFIXES = ("/api/", "/static/", "/health")
-
-    def __init__(self, app, rate: float = RATE_LIMIT_RPS, burst: float = RATE_LIMIT_BURST):
-        self.app = app
-        self._rate = rate
-        self._burst = burst
-        self._buckets: dict[str, _Bucket] = {}
-        self._cleanup_task: asyncio.Task | None = None
-
-    async def __call__(self, scope, receive, send):
-        if scope["type"] != "http":
-            await self.app(scope, receive, send)
-            return
-        path = scope.get("path", "")
-        if path == "/health" or any(path.startswith(p) for p in self._SKIP_PREFIXES):
-            await self.app(scope, receive, send)
-            return
-        if self._cleanup_task is None or self._cleanup_task.done():
-            self._cleanup_task = asyncio.create_task(self._cleanup_loop())
-        client = scope.get("client")
-        ip = client[0] if client else "unknown"
-        bucket = self._buckets.get(ip)
-        if bucket is None:
-            bucket = _Bucket(self._rate, self._burst)
-            self._buckets[ip] = bucket
-        allowed, retry_after = bucket.consume_sync()
-        if allowed:
-            await self.app(scope, receive, send)
-            return
-        retry_after_int = max(1, int(retry_after) + 1)
-        body = _json_dumps({"error": "Limite de débit dépassée. Veuillez réessayer sous peu."})
-        headers = [
-            (b"content-type", b"application/json"),
-            (b"retry-after", str(retry_after_int).encode()),
-        ]
-        await send({"type": "http.response.start", "status": 503, "headers": headers})
-        await send({"type": "http.response.body", "body": body})
-
-    async def _cleanup_loop(self):
-        while True:
-            await asyncio.sleep(60)
-            now = time.monotonic()
-            stale = [
-                ip for ip, b in self._buckets.items() if now - b.last_access > _STALE_BUCKET_TTL
-            ]
-            for ip in stale:
-                self._buckets.pop(ip, None)
-            if stale:
-                _debug(
-                    f"  [ratelimit] cleanup: {len(stale)} stale buckets removed, {len(self._buckets)} active"
-                )
-
-
-app.add_middleware(RateLimitMiddleware)
+app.add_middleware(
+    RateLimitMiddleware,
+    rate=RATE_LIMIT_RPS,
+    burst=RATE_LIMIT_BURST,
+    stale_ttl=_STALE_BUCKET_TTL,
+    debug_fn=_debug,
+    dumps_fn=_json_dumps,
+)
 
 # [plan v10 §9.1.5] Limite de taille APPLIQUÉE au niveau ASGI : l'ancien
 # contrôle post-lecture (3 handlers) bufferisait d'abord tout le body en
@@ -3095,45 +2926,10 @@ app.add_middleware(RateLimitMiddleware)
 # Les bodies chunked sans Content-Length restent gérés par le 413 post-lecture.
 from trust import ClientAuthMiddleware  # noqa: E402  # module local, import tardif conventionnel
 
-
-class _RequestBodyLimitMiddleware:
-    """Pure ASGI — rejette 413 avant bufferisation si Content-Length dépasse
-    la limite configurée (`upstream.max_body_size`, défaut 10 Mo)."""
-
-    def __init__(self, app, limit_getter):
-        self.app = app
-        self._limit_getter = limit_getter
-
-    async def __call__(self, scope, receive, send):
-        if scope.get("type") == "http" and str(scope.get("method", "")).upper() in (
-            "POST",
-            "PUT",
-            "PATCH",
-        ):
-            try:
-                limit = int(self._limit_getter() or 0)
-            except Exception:
-                limit = 0
-            if limit > 0:
-                for raw_key, raw_val in scope.get("headers") or ():
-                    if bytes(raw_key).lower() == b"content-length":
-                        try:
-                            if int(raw_val) > limit:
-                                from trust import send_json as _sj
-
-                                await _sj(
-                                    send,
-                                    413,
-                                    {
-                                        "error": "payload_too_large",
-                                        "message": f"Body > {limit} octets (upstream.max_body_size).",
-                                    },
-                                )
-                                return
-                        except ValueError:
-                            pass
-                        break
-        await self.app(scope, receive, send)
+# [Phase 2 refonte] _RequestBodyLimitMiddleware extrait vers
+# server/throttle.py — import regroupé avec RateLimitMiddleware ci-dessus
+# (pur, aucun import projet au top-level — trust.send_json reste lazy dans
+# le hot path 413, comme avant).
 
 
 app.add_middleware(_RequestBodyLimitMiddleware, limit_getter=lambda: MAX_BODY_SIZE)
@@ -3309,47 +3105,11 @@ app.add_middleware(ClientAuthMiddleware)
 
 
 # ── Access Log Middleware ─────────────────────────────────────────
+# [Phase 2 refonte] AccessLogMiddleware extrait vers server/accesslog.py
+# (pur, DI : log_fn injecté).
+from server.accesslog import AccessLogMiddleware  # noqa: E402
 
-
-class AccessLogMiddleware:
-    """Pure-ASGI access log — zero copy, streaming-safe, no BaseHTTPMiddleware buffering."""
-
-    _SKIP_PREFIXES = ("/api/", "/static/", "/health")
-
-    def __init__(self, app):
-        self.app = app
-
-    async def __call__(self, scope, receive, send):
-        if scope["type"] != "http":
-            await self.app(scope, receive, send)
-            return
-        path = scope.get("path", "")
-        if path == "/health" or any(path.startswith(p) for p in self._SKIP_PREFIXES):
-            await self.app(scope, receive, send)
-            return
-        client = scope.get("client")
-        client_ip = client[0] if client else "?"
-        method = scope.get("method", "?")
-        start = time.monotonic()
-        status_holder = {}
-
-        async def send_wrapper(message):
-            if message["type"] == "http.response.start":
-                status_holder["status"] = message.get("status", 0)
-            await send(message)
-
-        try:
-            await self.app(scope, receive, send_wrapper)
-        except Exception:
-            elapsed_ms = (time.monotonic() - start) * 1000
-            _log(f"{method} {path} 499 {elapsed_ms:.0f}ms {client_ip}")
-            raise
-        elapsed_ms = (time.monotonic() - start) * 1000
-        status = status_holder.get("status", 0)
-        _log(f"{method} {path} {status} {elapsed_ms:.0f}ms {client_ip}")
-
-
-app.add_middleware(AccessLogMiddleware)
+app.add_middleware(AccessLogMiddleware, log_fn=_log)
 
 
 class GeoWarningMiddleware:

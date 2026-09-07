@@ -35,7 +35,9 @@ from config import (
     save_custom_routes,
     save_env,
 )
-from traffic_capture import capture as _traffic_capture
+
+# [Phase 2 refonte] domicile canonique : observability.capture (traffic_capture.py = shim).
+from observability.capture import capture as _traffic_capture
 
 from .display import debug as _debug
 from .display import log_lines
