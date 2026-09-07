@@ -40,10 +40,17 @@ def _two_keys():
 
 
 @pytest.fixture
-def _iso_keys(monkeypatch):
-    """API_KEYS + pauser + index + compteurs TTFB isolés du global réel."""
+def _iso_keys(monkeypatch, tmp_path):
+    """API_KEYS + pauser + index + compteurs TTFB isolés du global réel.
+
+    Le pauser écrit AUSSI sur disque (`_PAUSED_FILE` partagé au niveau
+    classe) : on le déroute vers un tmp (sinon les pauses de test
+    polluent le vrai `logs/paused_keys.yaml` du proxy live — incident
+    2026-09-07 : entrées k0/k1-lot3 retrouvées dans le fichier réel)."""
     monkeypatch.setattr(oc, "API_KEYS", _two_keys())
-    monkeypatch.setattr(oc, "_key_pauser", oc._KeyPauser())
+    pauser = oc._KeyPauser()
+    pauser._PAUSED_FILE = str(tmp_path / "paused_keys.yaml")
+    monkeypatch.setattr(oc, "_key_pauser", pauser)
     monkeypatch.setattr(oc, "_key_failover_index", 0)
     monkeypatch.setattr(oc, "API_KEY_ROUTING", "failover")
     monkeypatch.setattr(oc, "_TTFB_FAILOVER_COUNTS", {})
