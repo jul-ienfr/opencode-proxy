@@ -1467,128 +1467,14 @@ except ImportError:
     _CURL_CFFI_OK = False
 
 
-class _CurlSessionSlot:
-    __slots__ = ("sess", "busy", "overflow")
-
-    def __init__(self, sess, overflow: bool = False):
-        self.sess = sess
-        self.busy = False
-        # overflow=True : session créée AU-DELA de max_size quand le pool
-        # est saturé (checkout timeout) — retirée du pool dès restitution.
-        self.overflow = overflow
-
-
-class _CurlSessionPool:
-    """Pool FIFO de M sessions curl pour une clé (proxy, impersonate).
-
-    checkout() réutilise une session libre, sinon crée dans la limite M,
-    sinon attend une restitution (Condition — rare : concurrence > M).
-    checkin() restitue ; evict() ferme une session fautive et libère sa
-    place (l'éviction de la session fautive est conservée de l'ancien code).
-    """
-
-    # [P2.2] last_used/closing : éviction TTL des pools orphelins + drainage
-    # swap-and-close à la rotation IP. busy_count est une propriété (classe).
-    __slots__ = ("slots", "_cond", "max_size", "last_used", "closing")
-
-    def __init__(self, max_size: int = 3):
-        self.slots: list[_CurlSessionSlot] = []
-        self._cond = asyncio.Condition()
-        self.max_size = max(1, int(max_size))
-        self.last_used = time.monotonic()
-        self.closing = False
-
-    @property
-    def busy_count(self) -> int:
-        """Slots empruntés (les slots restent listés dans self.slots même
-        busy — le garde busy est VITAL avant tout close_all())."""
-        return sum(1 for s in self.slots if s.busy)
-
-    def _try_checkout(self) -> _CurlSessionSlot | None:
-        for slot in self.slots:
-            if not slot.busy:
-                slot.busy = True
-                return slot
-        return None
-
-    async def checkout(self, factory) -> _CurlSessionSlot:
-        async with self._cond:
-            self.last_used = time.monotonic()
-            slot = self._try_checkout()
-            while slot is None:
-                if len(self.slots) < self.max_size:
-                    slot = _CurlSessionSlot(factory())
-                    slot.busy = True
-                    self.slots.append(slot)
-                    return slot
-                # M/M occupées → attendre une restitution BORNÉE (5 s). Au-delà,
-                # créer une session overflow hors quota plutôt que bloquer la
-                # requête indéfiniment (head-of-line blocking réintroduit).
-                try:
-                    await asyncio.wait_for(self._cond.wait(), timeout=5.0)
-                except TimeoutError:
-                    slot = _CurlSessionSlot(factory(), overflow=True)
-                    slot.busy = True
-                    self.slots.append(slot)
-                    return slot
-                slot = self._try_checkout()
-            return slot
-
-    async def checkin(self, slot: _CurlSessionSlot) -> None:
-        async with self._cond:
-            if self.closing:
-                # [P2.3] pool en drainage (swap post-rotation) : fermer la
-                # session au lieu de la restocker — le drain se termine
-                # naturellement au dernier checkin.
-                try:
-                    self.slots.remove(slot)
-                except ValueError:
-                    pass
-                try:
-                    await slot.sess.close()
-                except Exception:
-                    pass
-                self._cond.notify()
-                return
-            if slot in self.slots:
-                slot.busy = False
-                if slot.overflow:
-                    # Auto-réduction : l'overflow quitte le pool dès sa
-                    # restitution (retour au quota M en régime stable).
-                    self.slots.remove(slot)
-                    try:
-                        await slot.sess.close()
-                    except Exception:
-                        pass
-            self._cond.notify()
-
-    async def evict(self, slot: _CurlSessionSlot) -> None:
-        """Ferme une session fautive et la retire du pool."""
-        async with self._cond:
-            try:
-                self.slots.remove(slot)
-            except ValueError:
-                pass
-            try:
-                await slot.sess.close()
-            except Exception:
-                pass
-            self._cond.notify()
-
-    def discard(self, slot: _CurlSessionSlot) -> None:
-        """Retire sans fermer (chemin annulation : pas d'await possible)."""
-        try:
-            self.slots.remove(slot)
-        except ValueError:
-            pass
-
-    async def close_all(self) -> None:
-        for slot in list(self.slots):
-            try:
-                await slot.sess.close()
-            except Exception:
-                pass
-        self.slots.clear()
+# [Phase 3 refonte] Pool curl extrait vers upstream/clients.py (pur asyncio,
+# zéro global projet — le dict _curl_pool RESTE possédé ici, inspecté par
+# test_curl_session_pool.py). Aliases historiques (mêmes objets).
+from upstream.clients import CurlSessionPool as _CurlSessionPool  # noqa: E402
+from upstream.clients import CurlSessionSlot as _CurlSessionSlot  # noqa: E402,F401  # re-export (surface historique)
+from upstream.clients import close_all_pools as _close_all_pools  # noqa: E402
+from upstream.clients import evict_idle_pools as _evict_idle_pools_impl  # noqa: E402
+from upstream.clients import swap_pools_for_proxy as _swap_pools_impl  # noqa: E402
 
 
 def _curl_pool_size() -> int:
@@ -1602,19 +1488,9 @@ def _curl_pool_size() -> int:
 _curl_pool: dict[str, _CurlSessionPool] = {}  # key -> pool (E2: get direct mono-thread)
 
 
-def _evict_later(pool: "_CurlSessionPool", slot: "_CurlSessionSlot") -> None:
-    """Fire-and-forget eviction — utilisable depuis un except CancelledError."""
-
-    async def _do():
-        try:
-            await pool.evict(slot)
-        except Exception:
-            pass
-
-    try:
-        asyncio.get_running_loop().create_task(_do())
-    except RuntimeError:
-        pool.discard(slot)
+# [Phase 3 refonte] evict_later extrait vers upstream/clients.py
+# (pur asyncio — utilisable depuis un except CancelledError).
+from upstream.clients import evict_later as _evict_later  # noqa: E402
 
 
 async def _get_pooled_curl_session(proxy_url: str | None, impersonate: str):
@@ -1654,9 +1530,7 @@ async def _get_pooled_curl_session(proxy_url: str | None, impersonate: str):
 
 async def _close_curl_pool():
     """Close all pooled curl sessions (lifespan shutdown)."""
-    for pool in list(_curl_pool.values()):
-        await pool.close_all()
-    _curl_pool.clear()
+    await _close_all_pools(_curl_pool)
 
 
 def _flush_curl_pools_for_proxy(proxy_url: str | None) -> None:
@@ -1666,49 +1540,13 @@ def _flush_curl_pools_for_proxy(proxy_url: str | None) -> None:
 
     Économise 1 aller-retour échoué (+1-3 s) sur la première requête
     post-rotation : les sessions de l'ancien tunnel ne sont plus jamais
-    réempruntées. Protocole SANS casser les requêtes en vol :
-      - pop de la clé + pool NEUF immédiat dans le dict ;
-      - busy_count == 0 → close_all() fire-and-forget (task) ;
-      - sinon pool.closing = True : les checkins ferment leurs sessions au
-        lieu de restocker, et une task de drainage ferme le reste dès que
-        busy_count retombe à 0.
+    réempruntées. [Phase 3] Mécanique extraite vers
+    upstream/clients.swap_pools_for_proxy (protocole inchangé) ; wrapper
+    d'une ligne (état _curl_pool + taille + debug possédés ici).
     """
-    if not proxy_url:
-        return
-    prefix = f"{proxy_url}|"
-    flushed = 0
-    for key, old_pool in list(_curl_pool.items()):
-        if not key.startswith(prefix):
-            continue
-        new_pool = _CurlSessionPool(_curl_pool_size())
-        _curl_pool[key] = new_pool  # remplace AVANT tout close
-        old_pool.closing = True
-        if old_pool.busy_count == 0:
-
-            async def _close_now(p=old_pool):
-                await p.close_all()
-
-            try:
-                asyncio.get_running_loop().create_task(_close_now())
-            except RuntimeError:
-                pass
-        else:
-
-            async def _drain(p=old_pool):
-                while True:
-                    async with p._cond:
-                        if p.busy_count == 0:
-                            break
-                    await asyncio.sleep(0.5)
-                await p.close_all()
-
-            try:
-                asyncio.get_running_loop().create_task(_drain())
-            except RuntimeError:
-                pass
-        flushed += 1
-    if flushed:
-        _debug(f"  [curl-pool] {flushed} pool(s) swapped after IP rotation")
+    _swap_pools_impl(
+        _curl_pool, proxy_url, pool_size=_curl_pool_size(), debug_fn=_debug
+    )
 
 
 # [P2.2 perf] TTL d'idle au-delà de laquelle un pool sans slot emprunté est
@@ -1721,29 +1559,11 @@ async def _evict_idle_curl_pools(ttl: float = _CURL_POOL_IDLE_TTL) -> int:
     """Éviction TTL/LRU des pools curl orphelins — appelée par le tick
     background existant (30 s). Retourne le nombre de pools fermés.
 
-    Protocole : pop de la clé du dict AVANT close_all() — un checkout
-    concurrent reçoit None → crée un pool neuf. Garde busy_count == 0
-    VITAL : les slots empruntés restent listés dans self.slots et
-    close_all() les toucherait. La double vérification se fait SOUS la
-    Condition du pool pour fermer la course avec un checkout en vol.
+    [Phase 3] Mécanique extraite vers upstream/clients.evict_idle_pools
+    (protocole inchangé, garde busy_count VITAL conservée) ; wrapper d'une
+    ligne (état _curl_pool possédé ici, lu À L'APPEL).
     """
-    now = time.monotonic()
-    freed = 0
-    for key, pool in list(_curl_pool.items()):
-        if pool.closing or (now - pool.last_used) < ttl:
-            continue
-        async with pool._cond:
-            # Re-vérification sous verrou : un checkout qui a gagné la course
-            # a posé last_used à jour ET rendu un slot busy.
-            if (
-                pool.busy_count != 0
-                or (time.monotonic() - pool.last_used) < ttl
-            ):
-                continue
-            _curl_pool.pop(key, None)
-            await pool.close_all()
-            freed += 1
-    return freed
+    return await _evict_idle_pools_impl(_curl_pool, ttl)
 
 
 def _ensure_http_client() -> httpx.AsyncClient:
@@ -1797,10 +1617,20 @@ def _ensure_http_client() -> httpx.AsyncClient:
 # ou une sonde peut encore l'utiliser — fermer tuerait des requêtes en
 # vol). Fuite bornée : au plus un ancien client par rôle entre deux
 # rotations ; le keepalive-expiry du transport purge le résiduel sinon.
-_role_clients_lock = threading.Lock()
-_role_clients: dict[str, tuple[httpx.AsyncClient, str | None]] = {}
+# [Phase 3 refonte] Magasin extrait vers upstream/clients.RoleClientStore.
+# _role_clients EST le dict du store (MÊME objet — snapshot/muté par
+# test_role_clients.py) ; _role_tunnel_url/_role_bound_url restent ici
+# (couplage VPN/free — Phase 6) et sont lus À L'APPEL (patchés par tests).
 _ROLE_CLIENT_TIMEOUT = httpx.Timeout(connect=5.0, read=30.0, write=10.0, pool=5.0)
 _ROLE_CLIENT_CLOSE_GRACE_S = 60.0
+
+from upstream.clients import RoleClientStore as _RoleClientStore  # noqa: E402
+from upstream.clients import (  # noqa: E402
+    aclose_role_client_after as _aclose_role_client_after,  # noqa: F401  # re-export (test_role_clients.py)
+)
+
+_role_store = _RoleClientStore(timeout=_ROLE_CLIENT_TIMEOUT)
+_role_clients: dict[str, tuple[httpx.AsyncClient, str | None]] = _role_store.clients
 
 
 def _role_tunnel_url() -> str | None:
@@ -1847,42 +1677,16 @@ def _role_client(role: str = "direct") -> httpx.AsyncClient:
 
     Rebuild automatique si l'URL SOCKS liée change (rotation NordVPN) ou si
     le client a été fermé. Retourne toujours un client ouvert.
+
+    [Phase 3] Mécanique extraite vers RoleClientStore.acquire ; wrapper
+    d'une ligne (URL liée + grâce lues À L'APPEL depuis les globaux hôtes,
+    patchés par test_role_clients.py).
     """
-    with _role_clients_lock:
-        want = _role_bound_url(role)
-        entry = _role_clients.get(role)
-        if entry is not None and entry[1] == want and not entry[0].is_closed:
-            return entry[0]
-        old = entry[0] if entry is not None else None
-        if want:
-            transport = httpx.AsyncHTTPTransport(proxy=want, retries=0)
-        else:
-            transport = httpx.AsyncHTTPTransport(retries=0)
-        client = httpx.AsyncClient(transport=transport, timeout=_ROLE_CLIENT_TIMEOUT)
-        _role_clients[role] = (client, want)
-    if old is not None and not old.is_closed:
-        try:
-            loop = asyncio.get_running_loop()
-            loop.create_task(_aclose_role_client_after(old, _ROLE_CLIENT_CLOSE_GRACE_S))
-        except RuntimeError:
-            pass  # pas de boucle ici — keepalive-expiry purge le résiduel
-    return client
-
-
-async def _aclose_role_client_after(client: httpx.AsyncClient, delay: float) -> None:
-    """Solde un ancien client de rôle après la période de grâce (cf. ci-dessus).
-
-    Fail-soft intégral : un cancel ou une erreur de close ne doit jamais
-    remonter (tâche fire-and-forget).
-    """
-    try:
-        await asyncio.sleep(delay)
-    except asyncio.CancelledError:
-        pass
-    try:
-        await client.aclose()
-    except Exception:
-        pass
+    return _role_store.acquire(
+        role,
+        bound_url=_role_bound_url(role),
+        grace_s=_ROLE_CLIENT_CLOSE_GRACE_S,
+    )
 
 
 # ── VPN / IP rotation (initialized in lifespan) ──────────────────
@@ -2940,17 +2744,15 @@ def _build_metrics_text() -> str:
 
     Sources : moteur §3.6 (EWMA/p95/slow par station·ip), états stations,
     compteurs rotations, cooldowns actifs, mode maintenance.
-    Fail-soft : toute source indisponible est sautée."""
-    lines = []
+    Fail-soft : toute source indisponible est sautée.
 
-    def gauge(name: str, help_txt: str, rows):
-        if not rows:
-            return
-        lines.append(f"# HELP {name} {help_txt}")
-        lines.append(f"# TYPE {name} gauge")
-        for labels, value in rows:
-            lines.append(f"{name}{{{labels}}} {value}")
+    [Phase 3] Rendu extrait vers observability/metrics.py (byte-identique) ;
+    ce wrapper assemble le snapshot avec les garde-fous fail-soft
+    historiques (mêmes frontières de try/except, mêmes _debug)."""
 
+    lines: list[str] = []
+
+    # Section VPN : extraction live shared_state (fail-soft, inchangée).
     try:
         import shared_state as _ss
 
@@ -2961,7 +2763,6 @@ def _build_metrics_text() -> str:
         for m in mgrs:
             status = str(getattr(m, "status", "") or "")
             st_rows.append((f'station="{m._station}"', 1 if status == "connected" else 0))
-        gauge("vpn_station_connected", "1 si la station est connectée", st_rows)
 
         ewma_rows, p95_rows, slow_rows = [], [], []
         if eng is not None:
@@ -2973,39 +2774,30 @@ def _build_metrics_text() -> str:
                 if snap.p95_ms is not None:
                     p95_rows.append((lbl, snap.p95_ms))
                 slow_rows.append((lbl, snap.consecutive_slow))
-        gauge("vpn_latency_ewma_ms", "EWMA par station·ip (ms)", ewma_rows)
-        gauge("vpn_latency_p95_ms", "p95 glissant par station·ip (ms)", p95_rows)
-        gauge(
-            "vpn_latency_consecutive_slow",
-            "requêtes lentes consécutives par station·ip",
-            slow_rows,
-        )
 
         if eng is not None:
-            gauge(
-                "vpn_rotations_total",
-                "rotations déclenchées par type",
-                [
-                    ('kind="soft"', getattr(eng, "total_soft", 0)),
-                    ('kind="hard"', getattr(eng, "total_hard", 0)),
-                ],
-            )
             cds = getattr(eng, "_cooldowns", {})
             now = time.monotonic()
             soft_n = sum(1 for _k, (kind, until) in cds.items() if kind == "soft" and until > now)
             hard_n = sum(1 for _k, (kind, until) in cds.items() if kind == "hard" and until > now)
-            gauge(
-                "vpn_cooldown_active",
-                "cooldowns actifs par kind",
-                [('kind="soft"', soft_n), ('kind="hard"', hard_n)],
-            )
-            gauge(
-                "vpn_rotation_paused",
-                "mode maintenance actif",
-                [('paused="true"' if getattr(eng, "paused", False) else 'paused="false"', 1 if getattr(eng, "paused", False) else 0)],
-            )
+            vpn_snap: dict | None = {
+                "stations": st_rows,
+                "ewma": ewma_rows,
+                "p95": p95_rows,
+                "slow": slow_rows,
+                "has_engine": True,
+                "total_soft": getattr(eng, "total_soft", 0),
+                "total_hard": getattr(eng, "total_hard", 0),
+                "cooldown_soft": soft_n,
+                "cooldown_hard": hard_n,
+                "paused": getattr(eng, "paused", False),
+            }
+        else:
+            vpn_snap = {"stations": st_rows, "has_engine": False}
     except Exception as e:
         _debug(f"  [metrics] build échoué (partiel): {e}")
+        vpn_snap = None
+    lines.extend(_metrics_mod.render_vpn_section(vpn_snap))
 
     # [Étape 2 — O3] compteurs fallback/failover par cause (familles counter).
     # Fail-soft : snapshot sous lock, émission hors lock, jamais de raise.
@@ -3015,47 +2807,17 @@ def _build_metrics_text() -> str:
         with _FB_METRICS_LOCK:
             _fb_snap = dict(_FB_FALLBACK_COUNTS)
             _fo_snap = dict(_FB_FAILOVER_COUNTS)
-        lines.append("# HELP proxy_fallback_total fallback free→paid par cause")
-        lines.append("# TYPE proxy_fallback_total counter")
-        for _cause in _FB_FALLBACK_CAUSES:
-            _v = _fb_snap.get(("free_to_paid", _cause), 0)
-            lines.append(f'proxy_fallback_total{{leg="free_to_paid",cause="{_cause}"}} {_v}')
-        for (_leg, _cause), _v in sorted(_fb_snap.items()):
-            if _leg != "free_to_paid" or _cause in _FB_FALLBACK_CAUSES:
-                continue
-            lines.append(f'proxy_fallback_total{{leg="{_leg}",cause="{_cause}"}} {_v}')
-        lines.append("# HELP proxy_failover_total failover paid inter-clés / gardes par cause")
-        lines.append("# TYPE proxy_failover_total counter")
-        for (_leg, _cause, _outcome), _v in sorted(_fo_snap.items()):
-            lines.append(
-                f'proxy_failover_total{{leg="{_leg}",cause="{_cause}",outcome="{_outcome}"}} {_v}'
-            )
+        lines.extend(_metrics_mod.render_fallback_section(_fb_snap, _fo_snap))
     except Exception as e:
         _debug(f"  [metrics] compteurs O3 échoués (partiel): {e}")
 
     # [plan Lot 0] Métriques de diagnostic perf : percentiles de latence
     # (TTFB upstream, attente checkout curl) + compteurs divers. Fail-soft.
     try:
-        for _m_name, _help in (
-            ("proxy_ttfb_upstream_ms", "TTFB du chemin paid upstream (ms) — alimente le seuil du watchdog"),
-            ("proxy_curl_checkout_wait_ms", "Attente d'emprunt d'une session curl (ms)"),
-        ):
-            _snap = _latency_snapshot().get(_m_name)
-            if _snap is None:
-                continue
-            _n, _p50, _p95, _p99 = _snap
-            lines.append(f"# HELP {_m_name} {_help}")
-            lines.append(f"# TYPE {_m_name} gauge")
-            lines.append(f'{_m_name}{{quantile="0.5"}} {_p50:.1f}')
-            lines.append(f'{_m_name}{{quantile="0.95"}} {_p95:.1f}')
-            lines.append(f'{_m_name}{{quantile="0.99"}} {_p99:.1f}')
+        _lat_snap = _latency_snapshot()
         with _FB_METRICS_LOCK:
             _misc_snap = dict(_MISC_COUNTERS)
             _ttfb_snap = dict(_TTFB_FAILOVER_COUNTS)
-        lines.append("# HELP proxy_misc_total compteurs de diagnostic (Lot 0)")
-        lines.append("# TYPE proxy_misc_total counter")
-        for _mc, _mv in sorted(_misc_snap.items()):
-            lines.append(f'proxy_misc_total{{name="{_mc}"}} {_mv}')
         # Hit-rate du cache de conversion (compteurs maintenus dans
         # protocol_mapping, exposés ici pour un point de collecte unique).
         # Également lue par scripts/bench_perf.py --json.
@@ -3065,19 +2827,18 @@ def _build_metrics_text() -> str:
             _conv = getattr(_pm, "conversion_cache_stats", None)
             if callable(_conv):
                 _cs = _conv()
-                lines.append("# HELP proxy_conversion_cache_total conversions anthropic→openai")
-                lines.append("# TYPE proxy_conversion_cache_total counter")
-                lines.append(f'proxy_conversion_cache_total{{result="hit"}} {int(_cs.get("hit", 0))}')
-                lines.append(f'proxy_conversion_cache_total{{result="miss"}} {int(_cs.get("miss", 0))}')
+                _conv_snap: dict | None = (
+                    {"hit": int(_cs.get("hit", 0)), "miss": int(_cs.get("miss", 0))}
+                    if isinstance(_cs, dict)
+                    else None
+                )
+            else:
+                _conv_snap = None
         except Exception as _e2:
             _debug(f"  [metrics] conversion cache stats skipped: {_e2}")
+            _conv_snap = None
         # [plan-perf Lot 2] Failovers du watchdog TTFB paid.
-        lines.append("# HELP proxy_ttfb_failover_total retentatives du watchdog TTFB paid")
-        lines.append("# TYPE proxy_ttfb_failover_total counter")
-        for _ka, _st in sorted(_ttfb_snap.keys()):
-            lines.append(
-                f'proxy_ttfb_failover_total{{key_alias="{_ka}",retry_stage="{_st}"}} {_ttfb_snap[(_ka, _st)]}'
-            )
+        lines.extend(_metrics_mod.render_lot0_section(_lat_snap, _misc_snap, _ttfb_snap, _conv_snap))
     except Exception as e:
         _debug(f"  [metrics] métriques Lot 0 échouées (partiel): {e}")
 
@@ -3198,109 +2959,24 @@ def _cb_half_open_probe_enabled() -> bool:
         return True
 
 
-class _CircuitBreaker:
-    """Per-endpoint circuit breaker: CLOSED → OPEN → HALF_OPEN → CLOSED.
+# [Phase 3 refonte] Machine à états extraite vers upstream/breaker.py
+# (pur, DI : seuils/timeout/debug_fn injectés). Sous-classe SEAM : le flag
+# hot-reload half_open_single_probe est résolu via le global hôte
+# _cb_half_open_probe_enabled() À L'APPEL (construction directe +
+# monkeypatch par test_proxy.py / test_perf_lot3_regressions.py).
+from upstream.breaker import CircuitBreaker as _CircuitBreakerBase  # noqa: E402
 
-    [plan Lot 2] En half_open, une SEULE requête sonde passe tant que la
-    sonde n'a pas conclu — les requêtes concurrentes sont rejetées comme si
-    le breaker était encore OPEN (CircuitOpenError → 503 côté appelant).
-    ``half_open_in_flight`` = sonde en vol. Désactivable via
-    ``circuit_breaker.half_open_single_probe: false`` (rollback)."""
 
-    __slots__ = (
-        "failures",
-        "state",
-        "opened_at",
-        "total_requests",
-        "total_failures",
-        "last_failure_time",
-        "created_at",
-        "half_open_in_flight",
-        "half_open_since",
-    )
-
+class _CircuitBreaker(_CircuitBreakerBase):
     def __init__(self):
-        self.failures = 0
-        self.state = "closed"  # closed | open | half_open
-        self.opened_at = 0.0
-        self.total_requests = 0
-        self.total_failures = 0
-        self.last_failure_time = 0.0
-        self.created_at = time.monotonic()
-        self.half_open_in_flight = False
-        self.half_open_since = 0.0
+        super().__init__(
+            failure_threshold=_CB_FAILURE_THRESHOLD,
+            recovery_timeout=_CB_RECOVERY_TIMEOUT,
+            debug_fn=_debug,
+        )
 
-    def record_success(self):
-        old_state = self.state
-        self.failures = 0
-        self.total_requests += 1
-        self.state = "closed"
-        self.half_open_in_flight = False
-        if old_state != "closed":
-            _debug(f"  [cb] state {old_state} → closed (success #{self.total_requests})")
-
-    def record_failure(self):
-        old_state = self.state
-        self.failures += 1
-        self.total_failures += 1
-        self.total_requests += 1
-        self.last_failure_time = time.monotonic()
-        if self.state == "half_open":
-            # Failure during half-open test → immediately reopen
-            self.state = "open"
-            self.half_open_in_flight = False
-            self.opened_at = time.monotonic()
-            _debug("  [cb] half_open → open (test request failed)")
-        elif self.failures >= _CB_FAILURE_THRESHOLD:
-            self.state = "open"
-            self.opened_at = time.monotonic()
-            _debug(f"  [cb] {old_state} → open (failures={self.failures}/{_CB_FAILURE_THRESHOLD})")
-
-    def should_allow(self) -> bool:
-        if self.state == "closed":
-            return True
-        if self.state == "open":
-            if time.monotonic() - self.opened_at >= _CB_RECOVERY_TIMEOUT:
-                self.state = "half_open"
-                # [Lot 2] le premier appelant devient la sonde.
-                self.half_open_in_flight = _cb_half_open_probe_enabled()
-                self.half_open_since = time.monotonic()
-                _debug("  [cb] open → half_open (cooldown expired — sonde)")
-                return True  # allow one test request
-            remaining = _CB_RECOVERY_TIMEOUT - (time.monotonic() - self.opened_at)
-            _debug(f"  [cb] DENIED (state=open, cooldown={remaining:.0f}s remaining)")
-            return False
-        # half_open
-        if _cb_half_open_probe_enabled():
-            # Sonde unique : si une sonde est déjà en vol, rejeter (comme
-            # open — CircuitOpenError → 503, comportement client existant).
-            if self.half_open_in_flight:
-                # Sonde présumée morte (requête annulée sans record_*) :
-                # après 2×le cooldown, la sonde expire et peut être reprise.
-                if time.monotonic() - self.half_open_since >= 2 * _CB_RECOVERY_TIMEOUT:
-                    self.half_open_since = time.monotonic()
-                    _debug("  [cb] half_open probe expired — nouvelle sonde")
-                    return True
-                _debug("  [cb] DENIED (half_open probe in flight — reject as open)")
-                return False
-            # État half_open sans sonde marquée (transition héritée, hot
-            # reload du flag, test) : prendre la sonde.
-            self.half_open_in_flight = True
-            self.half_open_since = time.monotonic()
-            return True
-        # Rollback : comportement historique « tout le monde passe ».
-        return True
-
-    def get_status(self) -> dict:
-        uptime = time.monotonic() - self.created_at
-        return {
-            "state": self.state,
-            "failures": self.failures,
-            "total_requests": self.total_requests,
-            "total_failures": self.total_failures,
-            "last_failure_time": self.last_failure_time,
-            "uptime_seconds": round(uptime, 1),
-        }
+    def _probe_enabled(self) -> bool:
+        return _cb_half_open_probe_enabled()
 
 
 _circuit_breakers: dict[str, _CircuitBreaker] = {}
@@ -3335,73 +3011,38 @@ def _cb_record_failure(endpoint: str):
 _G429_THRESHOLD = int(yaml_get("circuit_breaker", "global_429_threshold", 10))
 _G429_WINDOW = float(yaml_get("circuit_breaker", "global_429_window", 30))
 _G429_BACKOFF = float(yaml_get("circuit_breaker", "global_429_backoff", 15))
-_g429_hits: deque = deque()
-_g429_open_until = 0.0
+# [Phase 3 refonte] État global 429 extrait vers upstream/breaker.py
+# (Global429State pur, seuils/backoff injectés). L'hôte possède l'instance
+# unique et expose les wrappers historiques d'une ligne.
+from upstream.breaker import Global429BackoffMiddleware  # noqa: E402
+from upstream.breaker import Global429State as _Global429State  # noqa: E402
+
+_g429 = _Global429State(
+    threshold=_G429_THRESHOLD,
+    window=_G429_WINDOW,
+    backoff=_G429_BACKOFF,
+    debug_fn=_debug,
+)
 
 
 def _record_global_429() -> None:
-    global _g429_open_until
-    now = time.monotonic()
-    hits = _g429_hits
-    hits.append(now)
-    while hits and now - hits[0] > _G429_WINDOW:
-        hits.popleft()
-    if len(hits) >= _G429_THRESHOLD:
-        count = len(hits)
-        _g429_open_until = now + _G429_BACKOFF
-        hits.clear()
-        _debug(
-            f"  [g429] breaker OPEN: {count} upstream 429s in {_G429_WINDOW:.0f}s "
-            f"→ backoff {_G429_BACKOFF:.0f}s"
-        )
+    _g429.record()
 
 
 def _global_429_remaining() -> float:
-    return max(0.0, _g429_open_until - time.monotonic())
+    return _g429.remaining()
 
 
-class Global429BackoffMiddleware:
-    """[PLAN-corrections-429 E3/P14] Coupe-circuit global anti-thundering-herd.
-
-    Quand trop de 429 upstream viennent d'être observés (fenêtre glissante),
-    les nouvelles requêtes sont rejetées en 503 + Retry-After au lieu
-    d'aller saturer l'upstream. Raw ASGI, zéro copie.
-    """
-
-    _SKIP_PREFIXES = ("/api/", "/static/", "/health")
-
-    def __init__(self, app):
-        self.app = app
-
-    async def __call__(self, scope, receive, send):
-        if scope["type"] == "http" and not scope.get("path", "").startswith(self._SKIP_PREFIXES):
-            wait = _global_429_remaining()
-            if wait > 0:
-                resp = JSONResponse(
-                    {
-                        "error": {
-                            "message": "upstream 429 storm — global backoff active",
-                            "type": "rate_limit_error",
-                        }
-                    },
-                    status_code=503,
-                    headers={"Retry-After": str(int(wait) + 1)},
-                )
-                await resp(scope, receive, send)
-                return
-        await self.app(scope, receive, send)
-
-
-app.add_middleware(Global429BackoffMiddleware)
+# Position d'enregistrement INCHANGÉE (middleware le plus externe) —
+# seule la classe déménage (upstream/breaker.py), l'état est injecté.
+app.add_middleware(Global429BackoffMiddleware, remaining_fn=_global_429_remaining)
 
 
 # ── HTTP helpers with circuit breaker ────────────────────────────
 
 
-class CircuitOpenError(Exception):
-    """Raised when the circuit breaker is open for an endpoint."""
-
-    pass
+# [Phase 3 refonte] CircuitOpenError extrait vers upstream/breaker.py.
+from upstream.breaker import CircuitOpenError  # noqa: E402
 
 
 class UpstreamError(Exception):
@@ -6986,51 +6627,29 @@ _FB_FAILOVER_COUNTS: dict[tuple[str, str, str], int] = {}
 _FB_FALLBACK_CAUSES = ("quota_429", "payload_400", "upstream_5xx", "tunnel_vide", "other")
 
 
-def _fallback_cause(status) -> str:
-    """Bucketise un statut free en cause bornée (labels Prometheus stables)."""
-    try:
-        code = int(status)
-    except (TypeError, ValueError):
-        return "tunnel_vide"
-    if code == 429:
-        return "quota_429"
-    if code == 400:
-        return "payload_400"
-    if 500 <= code <= 599:
-        return "upstream_5xx"
-    if code <= 0:
-        return "tunnel_vide"
-    return "other"
+# [Phase 3 refonte] Compteurs/bucketisation extraits vers
+# observability/metrics.py (pur, état passé en paramètre). Les REGISTRES
+# restent possédés ici (lus/mutés directement par test_o3_fallback_metrics.py,
+# dont injection None en fail-soft) ; les wrappers lisent les globaux À
+# L'APPEL.
+from observability import metrics as _metrics_mod  # noqa: E402
+from observability.metrics import fallback_cause as _fallback_cause  # noqa: E402
+from upstream import quotas as _quotas_mod  # noqa: E402
 
 
 def _bump_fallback_counter(leg: str, cause: str) -> None:
     """Incrémente un compteur fallback — fail-soft total (jamais de raise)."""
-    try:
-        with _FB_METRICS_LOCK:
-            _k = (str(leg), str(cause))
-            _FB_FALLBACK_COUNTS[_k] = _FB_FALLBACK_COUNTS.get(_k, 0) + 1
-    except Exception:
-        pass
+    _metrics_mod.bump_fallback_counter(_FB_FALLBACK_COUNTS, _FB_METRICS_LOCK, leg, cause)
 
 
 def _bump_failover_counter(leg: str, cause: str, outcome: str) -> None:
     """Incrémente un compteur failover/garde paid — fail-soft total."""
-    try:
-        with _FB_METRICS_LOCK:
-            _k = (str(leg), str(cause), str(outcome))
-            _FB_FAILOVER_COUNTS[_k] = _FB_FAILOVER_COUNTS.get(_k, 0) + 1
-    except Exception:
-        pass
+    _metrics_mod.bump_failover_counter(_FB_FAILOVER_COUNTS, _FB_METRICS_LOCK, leg, cause, outcome)
 
 
 def _reset_fallback_metrics() -> None:
     """Remise à zéro des compteurs O3 (tests uniquement) — jamais en runtime."""
-    try:
-        with _FB_METRICS_LOCK:
-            _FB_FALLBACK_COUNTS.clear()
-            _FB_FAILOVER_COUNTS.clear()
-    except Exception:
-        pass
+    _metrics_mod.reset_fallback_metrics(_FB_FALLBACK_COUNTS, _FB_FAILOVER_COUNTS, _FB_METRICS_LOCK)
 
 
 # ── [plan Lot 0] Métriques de diagnostic perf ──────────────────────────────
@@ -7045,24 +6664,12 @@ _MISC_COUNTERS: dict[str, int] = {}
 
 def _observe_latency_ms(name: str, ms: float) -> None:
     """Alimente le ring de latence ``name`` — fail-soft, jamais de raise."""
-    try:
-        with _FB_METRICS_LOCK:
-            ring = _lat_rings.get(name)
-            if ring is None:
-                ring = deque(maxlen=_LAT_RING_MAX)
-                _lat_rings[name] = ring
-            ring.append(float(ms))
-    except Exception:
-        pass
+    _metrics_mod.observe_latency_ms(_lat_rings, _FB_METRICS_LOCK, name, ms)
 
 
 def _bump_misc_counter(name: str) -> None:
     """Compteur simple (db_queuefull, fetch_quotas_429, …) — fail-soft."""
-    try:
-        with _FB_METRICS_LOCK:
-            _MISC_COUNTERS[name] = _MISC_COUNTERS.get(name, 0) + 1
-    except Exception:
-        pass
+    _metrics_mod.bump_misc_counter(_MISC_COUNTERS, _FB_METRICS_LOCK, name)
 
 
 # ── [plan-perf Lot 0/2] fetch_quotas sur 429 : compteur + cache court ───────
@@ -7083,24 +6690,16 @@ def _bump_fetch_quotas_429() -> None:
 async def _fetch_quotas_429_cached(wid: str, cookie: str) -> dict:
     """fetch_quotas avec cache court (30 s) par workspace — anti-burst 429.
 
-    Fail-soft côté cache uniquement : toute erreur du fetch remonte à
-    l'appelant (qui bascule sur la pause par défaut, comportement historique).
+    [Phase 3] Mécanique extraite vers upstream/quotas.fetch_quotas_cached ;
+    wrapper (cache possédé ici + import tardif dashboard.quota injecté en
+    fetch_fn, comme avant). Fail-soft côté cache uniquement : toute erreur
+    du fetch remonte à l'appelant (pause par défaut, historique).
     """
-    try:
-        _hit = _fetch_quotas_429_cache.get(wid)
-        if _hit is not None and (time.monotonic() - _hit[0]) < _FETCH_QUOTAS_429_TTL_S:
-            if isinstance(_hit[1], dict):
-                return _hit[1]
-    except Exception:
-        pass
     from dashboard.quota import fetch_quotas  # import tardif : évite le cycle
-    quotas = await fetch_quotas(wid, cookie)
-    try:
-        if isinstance(quotas, dict):
-            _fetch_quotas_429_cache[wid] = (time.monotonic(), quotas)
-    except Exception:
-        pass
-    return quotas
+
+    return await _quotas_mod.fetch_quotas_cached(
+        _fetch_quotas_429_cache, wid, cookie, fetch_quotas, ttl_s=_FETCH_QUOTAS_429_TTL_S
+    )
 
 
 # ── [plan-perf Lot 2] Watchdog TTFB paid ─────────────────────────────────────
@@ -7113,21 +6712,16 @@ async def _fetch_quotas_429_cached(wid: str, cookie: str) -> dict:
 # reasoning long / gros tool calls. Rollback : ttfb_watchdog.enabled=false.
 
 
-class _TTFBWatchdogTimeout(Exception):
-    """Aucun byte upstream reçu dans le délai du watchdog (premier byte)."""
-
+# [Phase 3 refonte] Signal TTFB extrait vers upstream/quotas.py.
+from upstream.clients import build_fresh_client as _build_fresh_client  # noqa: E402
+from upstream.quotas import TTFBWatchdogTimeout as _TTFBWatchdogTimeout  # noqa: E402
 
 _TTFB_FAILOVER_COUNTS: dict[tuple[str, str], int] = {}
 
 
 def _bump_ttfb_failover(key_alias: str, stage: str) -> None:
     """Métrique proxy_ttfb_failover_total{key_alias, retry_stage} — fail-soft."""
-    try:
-        with _FB_METRICS_LOCK:
-            k = (str(key_alias or "?"), str(stage))
-            _TTFB_FAILOVER_COUNTS[k] = _TTFB_FAILOVER_COUNTS.get(k, 0) + 1
-    except Exception:
-        pass
+    _quotas_mod.bump_ttfb_failover(_TTFB_FAILOVER_COUNTS, _FB_METRICS_LOCK, key_alias, stage)
 
 
 def _ttfb_watchdog_enabled() -> bool:
@@ -7149,52 +6743,27 @@ def _ttfb_watchdog_timeout_s() -> float:
 
 
 def _alias_for_api_key(api_key: str) -> str:
-    try:
-        for _e in API_KEYS:
-            if _e.get("api_key") == api_key:
-                return str(_e.get("alias", "?"))
-    except Exception:
-        pass
-    return "?"
+    """Alias lisible d'une clé (métriques TTFB) — "?" si inconnue."""
+    return _quotas_mod.alias_for_api_key(API_KEYS, api_key)
 
 
 def _fresh_http_client() -> httpx.AsyncClient:
     """Client jetable « connexion neuve » (retentative stage-1 du watchdog) —
     même config que le client partagé, garanti sans connexion demi-morte
-    réutilisée. Le caller doit l'aclose()."""
-    _t = (
-        httpx.AsyncHTTPTransport(
-            proxy=PROXY, limits=_build_http_limits(), http2=True, retries=0
-        )
-        if PROXY
-        else httpx.AsyncHTTPTransport(
-            limits=_build_http_limits(), http2=True, retries=0
-        )
+    réutilisée. Le caller doit l'aclose().
+
+    [Phase 3] Construction extraite vers upstream/clients.build_fresh_client ;
+    wrapper (PROXY + builders possédés ici ; patché par
+    test_perf_lot3_regressions.py).
+    """
+    return _build_fresh_client(
+        proxy=PROXY, limits=_build_http_limits(), timeout=_build_http_timeout()
     )
-    return httpx.AsyncClient(transport=_t, timeout=_build_http_timeout())
-
-
-def _percentile(sorted_vals: list[float], q: float) -> float:
-    """Percentile nearest-rank sur liste triée non vide."""
-    idx = max(0, min(len(sorted_vals) - 1, int(q * (len(sorted_vals) - 1) + 0.5)))
-    return sorted_vals[idx]
 
 
 def _latency_snapshot() -> dict[str, tuple[int, float, float, float]]:
     """name -> (n, p50, p95, p99) en ms. Snapshot sous lock, tri hors lock."""
-    with _FB_METRICS_LOCK:
-        rings = {k: list(v) for k, v in _lat_rings.items()}
-    out: dict[str, tuple[int, float, float, float]] = {}
-    for name, vals in rings.items():
-        vals.sort()
-        if vals:
-            out[name] = (
-                len(vals),
-                _percentile(vals, 0.50),
-                _percentile(vals, 0.95),
-                _percentile(vals, 0.99),
-            )
-    return out
+    return _metrics_mod.latency_snapshot(_lat_rings, _FB_METRICS_LOCK)
 
 
 def _log_fallback(req_id, leg, free_model, free_status, paid_model, account_alias=None) -> None:
