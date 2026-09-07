@@ -162,10 +162,12 @@ def get_next_api_key() -> dict:
         _debug("  [apikey] no keys available, falling back to .env key")
         return _env_key_or_raise()
 
-    if len(available) == 1:
-        _debug(f"  [apikey] single available key: alias={available[0].get('alias', '?')}")
-        return available[0]
-
+    # [plan Lot 2/3] PAS de shortcut len(available)==1 : la boucle
+    # failover ci-dessous gère uniformément tous les cas ET applique la
+    # sémantique sticky (avance sur pause). Le shortcut court-circuitait
+    # l'avance d'index à 2 clés (cas courant) : la clé servie était la
+    # bonne, mais l'index ne persistait pas (retour implicite à la clé 0
+    # à la levée de pause). Servir est identique, seul l'index change.
     if API_KEY_ROUTING == "failover":
         for i in range(len(API_KEYS)):
             idx = (_key_failover_index + i) % len(API_KEYS)
@@ -1790,11 +1792,14 @@ def _ensure_http_client() -> httpx.AsyncClient:
 # (threading.Lock + double check — jamais d'I/O sous le lock).
 # Garde-fou rotation : quand l'URL SOCKS change, le client tunnel est
 # recréé (comparaison string à chaque acquire, coût nul). L'ancien client
-# est aclose() en fire-and-forget si une boucle tourne — pas de fuite
-# unbounded, et le keepalive-expiry du transport purge le résiduel sinon.
+# est soldé APRÈS une grâce (pas de aclose() immédiat : un web_fetch long
+# ou une sonde peut encore l'utiliser — fermer tuerait des requêtes en
+# vol). Fuite bornée : au plus un ancien client par rôle entre deux
+# rotations ; le keepalive-expiry du transport purge le résiduel sinon.
 _role_clients_lock = threading.Lock()
 _role_clients: dict[str, tuple[httpx.AsyncClient, str | None]] = {}
 _ROLE_CLIENT_TIMEOUT = httpx.Timeout(connect=5.0, read=30.0, write=10.0, pool=5.0)
+_ROLE_CLIENT_CLOSE_GRACE_S = 60.0
 
 
 def _role_tunnel_url() -> str | None:
@@ -1857,10 +1862,26 @@ def _role_client(role: str = "direct") -> httpx.AsyncClient:
     if old is not None and not old.is_closed:
         try:
             loop = asyncio.get_running_loop()
-            loop.create_task(old.aclose())
+            loop.create_task(_aclose_role_client_after(old, _ROLE_CLIENT_CLOSE_GRACE_S))
         except RuntimeError:
             pass  # pas de boucle ici — keepalive-expiry purge le résiduel
     return client
+
+
+async def _aclose_role_client_after(client: httpx.AsyncClient, delay: float) -> None:
+    """Solde un ancien client de rôle après la période de grâce (cf. ci-dessus).
+
+    Fail-soft intégral : un cancel ou une erreur de close ne doit jamais
+    remonter (tâche fire-and-forget).
+    """
+    try:
+        await asyncio.sleep(delay)
+    except asyncio.CancelledError:
+        pass
+    try:
+        await client.aclose()
+    except Exception:
+        pass
 
 
 # ── VPN / IP rotation (initialized in lifespan) ──────────────────

@@ -245,6 +245,86 @@ def test_urgent_rotation_jumps_normal_queue():
     asyncio.run(_go())
 
 
+def test_priority_burst_single_flight_and_order():
+    """Chaos borné : rafale de launches concurrents (normaux + urgents) sur
+    4 stations, 1 worker bloqué → chaque station tourne EXACTEMENT une fois
+    (single-flight sous concurrence) et l'urgente passe devant : [1, 4, …].
+    L'ordre relatif des deux normales suit leur seq (non asserté : interleave
+    du gather). Drain borné 5 s (jamais de hang de gate)."""
+
+    async def _go():
+        s1, s2, s3, s4 = (_Station(i) for i in (1, 2, 3, 4))
+        p = _pool(s1, s2)
+        p.set_stations([s1, s2, s3, s4])
+        p._ROTATION_CONCURRENCY = 1
+        entered = []
+        gate = asyncio.Event()
+        s1_started = asyncio.Event()
+
+        async def gated_switch(station):
+            entered.append(station._station)
+            if station._station == 1:
+                s1_started.set()
+                await gate.wait()
+            station.current_ip = f"10.{station._station}.0.9"
+            station.status = "connected"
+
+        p.switch_ip = gated_switch
+        p._launch_rotation(s1)
+        await asyncio.wait_for(s1_started.wait(), 1.0)
+
+        async def _burst(station, priority):
+            for _ in range(5):
+                p._launch_rotation(station, priority=priority)
+                await asyncio.sleep(0)
+
+        await asyncio.gather(
+            _burst(s2, 0),
+            _burst(s3, 0),
+            _burst(s4, -1),
+        )
+        gate.set()
+
+        async def _drained():
+            while len(entered) < 4:
+                await asyncio.sleep(0.01)
+
+        await asyncio.wait_for(_drained(), 5.0)
+        await _shutdown(p)
+        assert entered[0] == 1
+        assert entered[1] == 4, "l'urgente passe devant les normales en attente"
+        assert sorted(entered) == [1, 2, 3, 4], "exactement une rotation par station"
+
+    asyncio.run(_go())
+
+
+def test_disconnect_retry_launches_urgent():
+    """`on_disconnect_retry` propage priority=-1 (une requête attend déjà
+    derrière ce retry — cf. rotation_wait_timeout)."""
+
+    async def _go():
+        s1, s2 = _Station(1), _Station(2)
+        p = _pool(s1, s2)
+        launched = []
+        orig = p._launch_rotation
+
+        def spy(station, forced_pool=None, priority=0):
+            launched.append((station._station, priority))
+            return orig(station, forced_pool=forced_pool, priority=priority)
+
+        p._launch_rotation = spy
+
+        async def _no_conn():
+            return None
+
+        p.ensure_connected = _no_conn
+        await p.on_disconnect_retry(failed=s1)
+        assert (1, -1) in launched
+        await _shutdown(p)
+
+    asyncio.run(_go())
+
+
 def test_update_config_sets_rotation_concurrency():
     p = _pool(_Station(1))
     p.update_config({"rotation_concurrency": 4})
