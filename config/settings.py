@@ -1,15 +1,21 @@
 import json
 import logging
 import os
-import random
 import re
 import secrets
-import subprocess
 import sys
 import threading
 import time
 from functools import lru_cache as _lru_cache
 from typing import Any
+
+# [Phase 1 refonte] Sous-modules purs (aucun import projet, zéro side-effect
+# d'import) : loader (résolveurs sans état), geo (moteur géo), discovery
+# (fetch/apply). Le STORE (_yaml_data, snapshots, caches) et toute
+# l'exécution d'import restent ICI, dans le même ordre — seule la logique
+# migre, l'état est injecté aux wrappers À L'APPEL.
+from config import discovery as _discovery_mod  # noqa: E402
+from config import geo as _geo_mod  # noqa: E402
 
 # Windows: masquer la fenêtre console des subprocess (évite le flash noir 1s)
 _CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
@@ -369,30 +375,10 @@ def load_env_file():
     logger.debug("[config] load_env_file: loaded %d new vars from .env", count)
 
 
-def _env(key: str, default=None):
-    """Read env var, falling back to default."""
-    val = os.getenv(key)
-    if val is not None:
-        return val
-    return default
-
-
-def _env_bool(key: str, default=False):
-    val = os.getenv(key)
-    if val is not None:
-        return val.lower() in ("1", "true", "yes")
-    return default
-
-
-def _env_int(key: str, default=0):
-    val = os.getenv(key)
-    if val is not None:
-        try:
-            return int(val)
-        except ValueError:
-            logging.warning("Invalid integer for %s=%r, using default %d", key, val, default)
-    return default
-
+# [Phase 1] Lecteurs env déplacés vers config/loader.py (purs, os seul).
+from config.loader import _env as _env  # noqa: E402
+from config.loader import _env_bool as _env_bool  # noqa: E402
+from config.loader import _env_int as _env_int  # noqa: E402
 
 # ── Initialize config ────────────────────────────────────────────────
 
@@ -426,18 +412,9 @@ FREE_MODEL_MAP = yaml_get("free_model_map", default={})
 # ── IP rotation (OpenVPN for free model quota) ────────────────────
 IP_ROTATION = yaml_get("ip_rotation", default={})
 
-_VALID_429_ACTIONS = ("cooldown", "rotate", "both")
-
-
-def normalize_429_action(raw, default: str = "both") -> str:
-    """[PLAN-corrections-429 P12/D3] Shared normalizer for on_429_action values.
-
-    Returns one of "cooldown" | "rotate" | "both"; anything else falls back
-    to `default`. Used by opencode.py, free_ip_pool.py and vpn_manager.py so
-    the str()/strip()/lower() validation lives in exactly one place.
-    """
-    action = str(raw if raw else default).strip().lower()
-    return action if action in _VALID_429_ACTIONS else default
+# [Phase 1] Normaliseur déplacé vers config/loader.py (pur).
+from config.loader import _VALID_429_ACTIONS as _VALID_429_ACTIONS  # noqa: E402
+from config.loader import normalize_429_action as normalize_429_action  # noqa: E402
 
 
 def get_429_action(default: str = "both") -> str:
@@ -476,81 +453,26 @@ def is_free_vpn_required() -> bool:
         and yaml_get("ip_rotation", "proxy_mode", "vpn") in ("vpn", "socks5")
     )
 
-# [P1 perf] mémo resolve_geo — epoch bumpé à chaque hot-reload touchant les
-# entrées geo/routes ; clé complète dans resolve_geo (contenu + inputs).
-_geo_resolve_cache: dict = {}
-_GEO_RESOLVE_CACHE_MAX = 1024
-_geo_cache_epoch = 0
-
-
+# [Phase 1] Mémo resolve_geo déplacé vers config/geo.py (propriétaire du
+# cache + epoch — aucun lecteur externe, vérifié par grep). L'hôte garde
+# les snapshots (GEO_*) et des wrappers d'une ligne (état lu À L'APPEL).
 def _bump_geo_cache() -> None:
-    global _geo_cache_epoch
-    _geo_cache_epoch += 1
-    _geo_resolve_cache.clear()
+    _geo_mod.bump_geo_cache()
 
 
 def _server_countries_set() -> set:
     """Normalized set(server_countries) via single-source _vpn_normalize_country."""
-    raw = IP_ROTATION.get("server_countries", "") if isinstance(IP_ROTATION, dict) else ""
-    if isinstance(raw, list):
-        parts = [str(p).strip() for p in raw if str(p).strip()]
-    elif isinstance(raw, str):
-        parts = [p.strip() for p in raw.split(",") if p.strip()]
-    else:
-        parts = []
-    return {_vpn_normalize_country(p) for p in parts if p}
+    return _geo_mod.server_countries_set(IP_ROTATION, _vpn_normalize_country)
 
 
 def _resolve_geo_extends(raw_geo: dict) -> dict:
     """Resolve geo.extends: shallow copy of GEO_POLICIES[name] merged with overrides (route wins)."""
-    if not isinstance(raw_geo, dict):
-        return {}
-    extends = raw_geo.get("extends")
-    if not extends:
-        return dict(raw_geo)
-    if not isinstance(extends, str):
-        logger.warning("[geo] extends must be str, got %r — dropping extends", extends)
-        d = dict(raw_geo)
-        d.pop("extends", None)
-        return d
-    base = GEO_POLICIES.get(extends)
-    if not isinstance(base, dict):
-        logger.warning("[geo] extends=%r not found in geo.policies — dropping extends", extends)
-        d = dict(raw_geo)
-        d.pop("extends", None)
-        return d
-    merged = dict(base)
-    for k, v in raw_geo.items():
-        if k == "extends":
-            continue
-        merged[k] = v
-    return merged
+    return _geo_mod.resolve_geo_extends(raw_geo, GEO_POLICIES, logger)
 
 
 def _normalize_geo_list(countries, server_set: set) -> tuple[set, list]:
     """Normalize list via _vpn_normalize_country, drop invalid (WARN), dedup. Returns (valid_set, dropped)."""
-    valid: set = set()
-    dropped: list = []
-    if not countries:
-        return valid, dropped
-    if not isinstance(countries, (list, tuple)):
-        logger.warning("[geo] countries must be list, got %r — dropping", type(countries).__name__)
-        return valid, dropped
-    for c in countries:
-        if not isinstance(c, str) or not c.strip():
-            dropped.append(c)
-            continue
-        norm = _vpn_normalize_country(c)
-        if norm not in server_set:
-            logger.warning(
-                "[geo] country %r → %r not in server_countries — dropping (intersection check)",
-                c,
-                norm,
-            )
-            dropped.append(c)
-            continue
-        valid.add(norm)
-    return valid, dropped
+    return _geo_mod.normalize_geo_list(countries, server_set, _vpn_normalize_country, logger)
 
 
 def resolve_geo(route: dict) -> dict:
@@ -558,107 +480,16 @@ def resolve_geo(route: dict) -> dict:
 
     Returns {effective_allowed: set, mode: str, require_vpn: bool, geo_status: str}
     where geo_status is ok|misconfigured|disabled.
-    Validation after normalization against set(server_countries normalized).
-    Precedence blocked > allowed: effective = (allowed - blocked) ∩ server_countries
-    else server_countries - blocked if only blocked. Empty effective + strict => misconfigured.
+    [Phase 1] Moteur déplacé vers config/geo.py ; wrapper (snapshots lus À L'APPEL).
     """
-    if not isinstance(route, dict):
-        return {
-            "effective_allowed": set(),
-            "mode": "strict",
-            "require_vpn": False,
-            "geo_status": "disabled" if not GEO_ENABLED else "ok",
-        }
-    raw_geo = route.get("geo")
-    if not raw_geo or not isinstance(raw_geo, dict):
-        return {
-            "effective_allowed": set(),
-            "mode": "strict",
-            "require_vpn": False,
-            "geo_status": "disabled" if not GEO_ENABLED else "ok",
-        }
-    if not GEO_ENABLED:
-        # Kill-switch: passthrough but still report disabled status (P1 no enforcement)
-        return {
-            "effective_allowed": set(),
-            "mode": str(raw_geo.get("mode", "strict")),
-            "require_vpn": bool(raw_geo.get("require_vpn", False)),
-            "geo_status": "disabled",
-        }
-    # [P1 perf] mémo résolution : la clé couvre TOUTES les entrées qui
-    # influencent le résultat (contenu geo, flag global, server_countries,
-    # identité GEO_POLICIES + epoch bumpé au reload) — un monkeypatch/test ou
-    # un hot-reload produit donc forcément une clé différente.
-    server_set = _server_countries_set()
-    cache_key = (
-        _geo_cache_epoch,
-        repr(raw_geo),
-        tuple(sorted(server_set)),
-        id(GEO_POLICIES),
+    return _geo_mod.resolve_geo(
+        route,
+        enabled=GEO_ENABLED,
+        policies=GEO_POLICIES,
+        ip_rotation=IP_ROTATION,
+        normalize_fn=_vpn_normalize_country,
+        log=logger,
     )
-    cached = _geo_resolve_cache.get(cache_key)
-    if cached is not None:
-        return {
-            "effective_allowed": set(cached[0]),
-            "mode": cached[1],
-            "require_vpn": cached[2],
-            "geo_status": cached[3],
-        }
-    geo = _resolve_geo_extends(raw_geo)
-    mode = str(geo.get("mode", "strict")).lower()
-    if mode not in ("strict", "prefer", "warn"):
-        logger.warning("[geo] invalid mode %r — fallback to strict", mode)
-        mode = "strict"
-    require_vpn = bool(geo.get("require_vpn", False))
-    allowed_raw = geo.get("allowed_countries", None)
-    blocked_raw = geo.get("blocked_countries", None)
-    # Normalize (invalid WARN+drop)
-    allowed_set: set = set()
-    blocked_set: set = set()
-    if allowed_raw is not None:
-        allowed_set, _ = _normalize_geo_list(allowed_raw, server_set)
-    if blocked_raw is not None:
-        blocked_set, _ = _normalize_geo_list(blocked_raw, server_set)
-    # DRY note: blocked > allowed (dedup)
-    if allowed_set and blocked_set:
-        overlap = allowed_set & blocked_set
-        if overlap:
-            logger.warning("[geo] blocked > allowed overlap %r — blocked wins", sorted(overlap))
-        allowed_set = allowed_set - blocked_set
-    has_allowed = allowed_raw is not None
-    has_blocked = blocked_raw is not None
-
-    def _cached(effective: set, m: str, rv: bool, status: str) -> dict:
-        if len(_geo_resolve_cache) >= _GEO_RESOLVE_CACHE_MAX:
-            _geo_resolve_cache.clear()
-        _geo_resolve_cache[cache_key] = (frozenset(effective), m, rv, status)
-        return {
-            "effective_allowed": set(effective),
-            "mode": m,
-            "require_vpn": rv,
-            "geo_status": status,
-        }
-
-    if not has_allowed and not has_blocked:
-        return _cached(set(server_set) if server_set else set(), mode, require_vpn, "ok")
-    if allowed_set and blocked_set:
-        effective = (allowed_set - blocked_set) & server_set
-    elif allowed_set:
-        effective = allowed_set & server_set
-    elif blocked_set:
-        effective = server_set - blocked_set
-    else:
-        # Both normalized empty after WARN drops
-        if has_allowed:
-            # allowed declared but nothing valid => empty effective => misconfigured in strict
-            effective = set()
-        else:
-            # only blocked declared but all invalid => nothing to block
-            return _cached(
-                set(server_set) if server_set else set(), mode, require_vpn, "ok"
-            )
-    geo_status = "misconfigured" if (not effective and mode == "strict") else "ok"
-    return _cached(effective, mode, require_vpn, geo_status)
 
 
 def geo_strict_union() -> set:
@@ -666,128 +497,34 @@ def geo_strict_union() -> set:
 
     Vide si GEO désactivé ou aucune policy strict. Consulté par vpn_manager
     pour filtrer les rotations géo-restricted.
+    [Phase 1] Moteur déplacé vers config/geo.py ; wrapper (snapshots lus À L'APPEL).
     """
-    if not GEO_ENABLED:
-        return set()
-    union: set = set()
-    for _name, _pol in GEO_POLICIES.items() if isinstance(GEO_POLICIES, dict) else []:
-        # La policy brute peut ne pas avoir blocked/allowed — on passe par
-        # un faux route {geo: {extends: name}} pour réutiliser resolve_geo
-        # (normalisation + intersection server_countries).
-        try:
-            _info = resolve_geo({"geo": {"extends": _name}})
-        except Exception:
-            continue
-        if (
-            _info.get("mode") == "strict"
-            and _info.get("require_vpn")
-            and _info.get("geo_status") != "misconfigured"
-        ):
-            eff = _info.get("effective_allowed")
-            if isinstance(eff, set):
-                union |= eff
-    return union
+    return _geo_mod.geo_strict_union(
+        enabled=GEO_ENABLED,
+        policies=GEO_POLICIES,
+        ip_rotation=IP_ROTATION,
+        normalize_fn=_vpn_normalize_country,
+        log=logger,
+    )
 
 
-def resolved_station_count(cfg: dict) -> int:
-    """Resolve the number of parallel VPN stations (1-10).
+# [Phase 1] Résolveur déplacé vers config/loader.py (pur, cfg en paramètre).
+# [Phase 1] Garde déplacée vers config/loader.py (cfg + yaml_data en paramètres).
+from config.loader import _ensure_auto_max_free_attempts_warn as _ensure_auto_max_free_attempts_warn  # noqa: E402
+from config.loader import resolved_station_count as resolved_station_count  # noqa: E402
 
-    Canonical key: ``station_count``. Retro-compat: absent →
-    ``dual_station: true`` ⇒ 2, else 1. Clamped to [1, 10] — the
-    NordVPN account limit is 10 simultaneous connections.
-    """
-    try:
-        n = int(cfg.get("station_count", 0) or 0)
-    except (TypeError, ValueError):
-        n = 0
-    if n:
-        return max(1, min(10, n))
-    return 2 if cfg.get("dual_station", False) else 1
-
-
-# [plan v2 auto-sync] auto_max_free_attempts defaults to True (derived
-# effective_max = clamp(N,1,3)). Legacy config.yaml missing the key: WARN
-# when the stored value diverges from the derived one so the operator knows
-# to set ``auto_max_free_attempts=false`` to keep a deliberate manual value.
-# Placed AFTER resolved_station_count so the helper is available. Idempotent
-# on reload — the same guard runs in maybe_reload_custom_routes.
-def _ensure_auto_max_free_attempts_warn(cfg: dict, source: str = "boot") -> None:
-    if not isinstance(cfg, dict) or "auto_max_free_attempts" in cfg:
-        return
-    try:
-        stored = int(cfg.get("max_free_attempts", 2) or 2)
-    except (TypeError, ValueError):
-        stored = 2
-    stored = max(1, min(stored, 5))
-    derived = max(1, min(int(resolved_station_count(cfg) or 1), 5))
-    if stored != derived:
-        logger.warning(
-            "[config] manual max_free_attempts=%s differs from derived=%s "
-            "(station_count=%s) — enabling auto_max_free_attempts=true; "
-            "set auto_max_free_attempts=false to keep manual",
-            stored,
-            derived,
-            resolved_station_count(cfg),
-        )
-    cfg["auto_max_free_attempts"] = True
-    # keep the in-yaml mirror consistent so a later save_yaml doesn't drop it
-    try:
-        sec = _yaml_data.get("ip_rotation")
-        if isinstance(sec, dict) and "auto_max_free_attempts" not in sec:
-            sec["auto_max_free_attempts"] = True
-    except Exception:
-        pass
-
-
-_ensure_auto_max_free_attempts_warn(IP_ROTATION, source="boot")
+# [Phase 1] yaml_data injecté (le store reste possédé ici).
+_ensure_auto_max_free_attempts_warn(IP_ROTATION, _yaml_data, source="boot")
 
 # ── Free parallel (stations free) — two routings découplés ─────────
 # (B) Stations free: enabled bool, routing round-robin|failover,
 #     mode load-balance|hedge, hedge_delay_ms 0-2000, hedge_max_attempts 1-3
 # Defaults conservateurs OFF (pas de parallélisation sans action GUI).
 # P1 melodic-pearl: hedge 300→150ms / 1→2 pour N=10 (cap burst 3)
-_FREE_PARALLEL_DEFAULTS = {
-    "enabled": False,
-    "routing": "round-robin",
-    "mode": "load-balance",
-    "hedge_delay_ms": 150,
-    "hedge_max_attempts": 2,
-}
-
-
-def _normalize_free_parallel(raw) -> dict:
-    if not isinstance(raw, dict):
-        raw = {}
-    try:
-        enabled = bool(raw.get("enabled", _FREE_PARALLEL_DEFAULTS["enabled"]))
-    except Exception:
-        enabled = False
-    routing = str(raw.get("routing", _FREE_PARALLEL_DEFAULTS["routing"]) or "round-robin").lower()
-    if routing not in ("round-robin", "failover"):
-        logger.warning("[config] free_parallel.routing invalid %r — fallback to round-robin", routing)
-        routing = "round-robin"
-    mode = str(raw.get("mode", _FREE_PARALLEL_DEFAULTS["mode"]) or "load-balance").lower()
-    if mode not in ("load-balance", "strict", "hedge"):
-        logger.warning("[config] free_parallel.mode invalid %r — fallback to load-balance", mode)
-        mode = "load-balance"
-    try:
-        delay = int(raw.get("hedge_delay_ms", _FREE_PARALLEL_DEFAULTS["hedge_delay_ms"]))
-    except Exception:
-        delay = 300
-    delay = max(0, min(2000, delay))
-    try:
-        max_att = int(raw.get("hedge_max_attempts", _FREE_PARALLEL_DEFAULTS["hedge_max_attempts"]))
-    except Exception:
-        max_att = 1
-    max_att = max(1, min(3, max_att))
-    return {
-        "enabled": enabled,
-        "routing": routing,
-        "mode": mode,
-        "hedge_delay_ms": delay,
-        "hedge_max_attempts": max_att,
-    }
-
+# [Phase 1] Défauts + normaliseur déplacés vers config/loader.py (purs).
+# Le dict FREE_PARALLEL RESTE possédé ici (muté en place par dashboard/tests).
+from config.loader import _FREE_PARALLEL_DEFAULTS as _FREE_PARALLEL_DEFAULTS  # noqa: E402
+from config.loader import _normalize_free_parallel as _normalize_free_parallel  # noqa: E402
 
 FREE_PARALLEL: dict = _normalize_free_parallel(IP_ROTATION.get("free_parallel", {}))
 # back-fill IP_ROTATION mirror so save_yaml keeps it
@@ -853,7 +590,6 @@ def _resolve_protocol(model_id: str) -> str:
         "qwen3.7-plus" -> "qwen"  -> "anthropic"
         "glm-5.2"      -> "glm"   -> "openai"
     """
-    import re
 
     prefix = model_id.split("-")[0].split(".")[0].lower()
     prefix = re.sub(r"\d+$", "", prefix)  # "qwen3" -> "qwen"
@@ -904,66 +640,20 @@ for _model_id, _model_data in _models_cfg.items():
         MODELS[_model_id] = {"endpoint": _endpoint, "protocol": _proto}
 
 
-def _fetch_upstream_models(timeout: float = 3.0):
-    """Fetch available models from upstream API and add them to MODELS.
-
-    Timeout réduit à 3s (vs 10s avant) pour ne pas bloquer le démarrage.
-    Appelé en arrière-plan, jamais bloquant pour le 1er chargement GUI.
-    """
-    try:
-        url = f"{API_BASE_OPENAI.rsplit('/chat/completions', 1)[0]}/models"
-        # --max-time 3s + connect 2s : échec rapide si upstream lent
-        result = subprocess.run(
-            ["curl", "-s", "--max-time", str(int(timeout)), "--connect-timeout", "2", url],
-            capture_output=True,
-            text=True,
-            timeout=timeout + 2,
-            creationflags=_CREATE_NO_WINDOW,
-        )
-        if result.returncode != 0:
-            raise Exception(f"curl failed: {result.stderr[:200]}")
-        data = json.loads(result.stdout)
-        models = data.get("data", [])
-        added = 0
-        for m in models:
-            model_id = m.get("id", "")
-            if model_id and model_id not in MODELS:
-                proto = _resolve_protocol(model_id)
-                endpoint = API_BASE_OPENAI if proto == "openai" else API_BASE_ANTHROPIC
-                MODELS[model_id] = {"endpoint": endpoint, "protocol": proto}
-                added += 1
-        if added:
-            # [P4 correctesse] les modèles découverts doivent être visibles
-            # immédiatement : sans clear du LRU, get_model_config sert encore
-            # les défauts OpenAI stale pour un id absent au moment du 1er appel.
-            try:
-                get_model_config.cache_clear()
-            except Exception:
-                pass
-        logger.info("[config] upstream models: fetched %d, added %d new", len(models), added)
-        return added
-    except Exception as e:
-        logger.debug("[config] upstream models fetch failed (non-bloquant): %s", e)
-        return 0
-
-
-# Lancement non-bloquant en arrière-plan (daemon thread) — ne retarde pas l'import
-def _fetch_upstream_models_background():
-    try:
-        time.sleep(0.5)
-        _fetch_upstream_models(timeout=3.0)
-    except Exception:
-        pass
-
-
-try:
-    _bg_thread = threading.Thread(
-        target=_fetch_upstream_models_background, daemon=True, name="upstream-models-fetch"
-    )
-    _bg_thread.start()
-    logger.debug("[config] upstream fetch lancé en arrière-plan (3s timeout)")
-except Exception as e:
-    logger.debug("[config] impossible de lancer le thread upstream: %s", e)
+# [Phase 1] Fetch + starter déplacés vers config/discovery.py (DI).
+# Appel au MÊME point d'import, mêmes arguments (MODELS muté en place,
+# bases lues ici, clear LRU via lambda tardive — get_model_config n'existe
+# qu'en fin de module). Point d'ancrage explicite pour le lifespan Phase 9.
+_discovery_mod.start_background_fetch(
+    MODELS,
+    API_BASE_OPENAI,
+    API_BASE_ANTHROPIC,
+    _resolve_protocol,
+    # get_model_config n'est défini qu'en fin de module : résolution tardive
+    # (appel ≥0.5 s plus tard, module chargé — même mécanique que l'historique
+    # qui lisait le global à l'exécution du thread).
+    lambda: get_model_config.cache_clear(),  # type: ignore[has-type]
+)
 
 # ── Web search native allowlist (v3.3) ─────────────────────────
 WEB_SEARCH_NATIVE_MODELS: list = yaml_get("web_search_native", default=["muse-spark-1.2-contributor", "muse-spark-1.2-contributor-free", "muse-spark-1.3-contributor", "muse-spark-1.3-contributor-free"])
@@ -1005,67 +695,15 @@ _FREE_DISCOVERY_STATE: dict[str, Any] = {
 _FREE_DISCOVERY_URLS_CACHE = None
 
 
+# [Phase 1] URLs déplacées vers config/discovery.py (bases en paramètres).
 def _free_discovery_urls() -> list:
     """Union of free discovery URLs (derived from bases, dedup)."""
-    global _FREE_DISCOVERY_URLS_CACHE
-    override = yaml_get("upstream", "free_models_url", "")
-    if isinstance(override, str) and override.strip():
-        return [override.strip().rstrip("/")]
-    urls = []
-    for base in (API_BASE_FREE, API_BASE_OPENAI):
-        if not base:
-            continue
-        b = base.strip()
-        if "/chat/completions" in b:
-            b = b.rsplit("/chat/completions", 1)[0]
-        u = b.rstrip("/") + "/models"
-        if u not in urls:
-            urls.append(u)
-    return urls
+    return _discovery_mod.free_discovery_urls(API_BASE_FREE, API_BASE_OPENAI, yaml_get)
 
 
-def _is_free_model(m: dict) -> bool:
-    """Cascade: pricing/is_free/free/capabilities.free → suffix -free."""
-    if not isinstance(m, dict):
-        return False
-    mid = m.get("id", "")
-    if not isinstance(mid, str) or not mid:
-        return False
-    pricing = m.get("pricing")
-    if isinstance(pricing, dict):
-        try:
-            inp = pricing.get("input", None)
-            out = pricing.get("output", None)
-            if inp is not None and out is not None and float(inp) == 0 and float(out) == 0:
-                return True
-        except Exception:
-            pass
-    for k in ("is_free", "free"):
-        if m.get(k) is True:
-            return True
-    caps = m.get("capabilities")
-    if isinstance(caps, dict) and caps.get("free") is True:
-        return True
-    if mid.endswith("-free"):
-        return True
-    return False
-
-
-def _detect_free_ids(payloads: list) -> set:
-    """Extract free ids from a list of /models payloads (cascade)."""
-    free = set()
-    for payload in payloads:
-        if not isinstance(payload, dict):
-            continue
-        data = payload.get("data")
-        if not isinstance(data, list):
-            continue
-        for m in data:
-            if _is_free_model(m):
-                mid = m.get("id", "")
-                if isinstance(mid, str) and mid:
-                    free.add(mid)
-    return free
+# [Phase 1] Cascade déplacée vers config/discovery.py (pure).
+from config.discovery import _detect_free_ids as _detect_free_ids  # noqa: E402
+from config.discovery import _is_free_model as _is_free_model  # noqa: E402
 
 
 def _fetch_free_models_sync(timeout: float = 10) -> tuple:
@@ -1073,115 +711,14 @@ def _fetch_free_models_sync(timeout: float = 10) -> tuple:
 
     Returns (free_ids: set[str], source: str, payloads: list[dict]).
     Fail-soft: raises only if ALL urls failed; caller logs warning.
+    [Phase 1] Mécanique déplacée vers config/discovery.py ; wrapper (PROXY lu ici).
     """
-    urls = _free_discovery_urls()
-    payloads: list[Any] = []
-    source_parts = []
-    last_err: Exception | None = None
-    for url in urls:
-        success = False
-        for attempt in range(3):
-            try:
-                try:
-                    import httpx as _httpx
-                except ImportError:
-                    # Fallback to curl subprocess (Windows may lack curl but try)
-                    import json as _json
-
-                    r = subprocess.run(
-                        ["curl", "-s", "--max-time", str(int(timeout)), url],
-                        capture_output=True,
-                        text=True,
-                        timeout=timeout + 5,
-                        creationflags=_CREATE_NO_WINDOW,
-                    )
-                    if r.returncode != 0:
-                        raise RuntimeError(f"curl failed: {r.stderr[:200]}") from None
-                    data = _json.loads(r.stdout)
-                    payloads.append(data)
-                    source_parts.append(url)
-                    success = True
-                    last_err = None
-                    break
-                # httpx path
-                _kwargs: dict[str, Any] = {"timeout": timeout}
-                if PROXY:
-                    _kwargs["proxy"] = PROXY
-                with _httpx.Client(**_kwargs) as _client:
-                    _resp = _client.get(url)
-                if _resp.status_code == 429:
-                    _ra = _resp.headers.get("Retry-After", "")
-                    try:
-                        _delay = int(str(_ra).strip())
-                    except Exception:
-                        _delay = 60
-                    logger.warning("[free-discovery] 429 from %s Retry-After=%s", url, _delay)
-                    # Do not retry blindly on 429 — respect Retry-After
-                    last_err = RuntimeError(f"429 Retry-After {_delay} from {url}")
-                    break
-                if 500 <= _resp.status_code < 600:
-                    raise RuntimeError(f"5xx {_resp.status_code} from {url}")
-                _resp.raise_for_status()
-                data = _resp.json()
-                payloads.append(data)
-                source_parts.append(url)
-                success = True
-                last_err = None
-                break
-            except Exception as e:
-                last_err = e
-                msg = str(e)
-                is_retryable = (
-                    "5xx" in msg
-                    or "timeout" in msg.lower()
-                    or "timed out" in msg.lower()
-                    or "connect" in msg.lower()
-                    or "ConnectTimeout" in msg
-                    or "ReadTimeout" in msg
-                )
-                if not is_retryable or attempt == 2:
-                    if not success:
-                        logger.debug(
-                            "[free-discovery] fetch failed %s attempt %d: %s", url, attempt + 1, e
-                        )
-                    break
-                delay = (1.5**attempt) + random.uniform(-0.1, 0.1)
-                # jitter ±10% already via random; clamp min 0
-                if delay < 0:
-                    delay = 0
-                time.sleep(delay)
-        # next url
-    if not payloads:
-        if last_err is not None:
-            raise last_err
-        return set(), "none", []
-    free_ids = _detect_free_ids(payloads)
-    # HTML filet only if cascade found nothing
-    if not free_ids:
-        try:
-            docs_url = "https://opencode.ai/docs/fr/zen/"
-            try:
-                import httpx as _httpx2
-
-                _kwargs2: dict[str, Any] = {"timeout": timeout}
-                if PROXY:
-                    _kwargs2["proxy"] = PROXY
-                with _httpx2.Client(**_kwargs2) as _c2:
-                    _r2 = _c2.get(docs_url)
-                    if _r2.status_code == 200:
-                        _html = _r2.text
-                        _ids = set(
-                            re.findall(r"(?i)<td[^>]*>\s*([a-z0-9.\-]+-free)\s*</td>", _html)
-                        )
-                        if _ids:
-                            free_ids = _ids
-                            source_parts.append("docs:html")
-            except ImportError:
-                pass
-        except Exception as e:
-            logger.debug("[free-discovery] html filet failed: %s", e)
-    source = "|".join(source_parts) if source_parts else "none"
-    return free_ids, source, payloads
+    return _discovery_mod.fetch_free_models_sync(
+        timeout,
+        proxy=PROXY,
+        urls_fn=_free_discovery_urls,
+        log=logger,
+    )
 
 
 def _free_endpoint_for(free_id: str) -> str:
@@ -1189,146 +726,50 @@ def _free_endpoint_for(free_id: str) -> str:
 
     muse-* and spark-* models use the /v1/responses endpoint (Responses API),
     while other models use the standard /v1/chat/completions endpoint.
+    [Phase 1] Mécanique déplacée vers config/discovery.py ; wrapper (base lue ici).
     """
-    lid = free_id.lower()
-    if "muse" in lid or "spark" in lid:
-        return "https://opencode.ai/zen/v1/responses"
-    return API_BASE_FREE
+    return _discovery_mod.free_endpoint_for(free_id, API_BASE_FREE)
 
 
 def _apply_discovered_free_models(free_ids: set, source: str = "none") -> int:
     """Apply discovered free_ids to MODELS/FREE_MODEL_MAP/FREE_MODEL_POOL.
 
     Delta-check: if set == FREE_MODELS → no-op (0, no mtime bump).
-    Otherwise mutates MODELS (add missing free_ids with endpoint/protocol),
-    FREE_MODELS/FREE_MODEL_POOL in-place, and FREE_MODEL_MAP add-only
-    (paid → paid-free homonyme). Returns number of new MODELS added.
-    Thread-safe via _reload_lock if available.
+    [Phase 1] Mécanique déplacée vers config/discovery.py ; wrapper (état
+    possédé ici, lu À L'APPEL — le rebind FREE_MODEL_POOL est préservé tel quel).
     """
     global FREE_MODEL_POOL
-    if not isinstance(free_ids, set):
-        free_ids = set(free_ids)
-    if GO_ONLY_IDS:
-        _go_only_hits = {f for f in free_ids if str(f).lower() in GO_ONLY_IDS}
-        if _go_only_hits:
-            logger.info(
-                "[free-discovery] go-only ids excluded from anonymous pool: %s",
-                ", ".join(sorted(_go_only_hits)),
-            )
-            free_ids -= _go_only_hits
-    if free_ids == FREE_MODELS:
-        for _fid in sorted(free_ids):
-            if "muse" in _fid.lower() or "spark" in _fid.lower():
-                _exp = _free_endpoint_for(_fid)
-                _cur = MODELS.get(_fid, {}).get("endpoint", "")
-                if _cur and _cur != _exp:
-                    MODELS[_fid]["endpoint"] = _exp
-                    logger.info("[free-discovery] corrected endpoint %s → %s", _fid, _exp)
-        logger.debug(
-            "[free-discovery] no delta (still %d free ids) source=%s", len(free_ids), source
-        )
-        _FREE_DISCOVERY_STATE["detected"] = sorted(free_ids)
-        _FREE_DISCOVERY_STATE["source"] = source
-        return 0
-    removed = sorted(FREE_MODELS - free_ids) if FREE_MODELS else []
-    if removed:
-        logger.info(
-            "[free-discovery] upstream removed %s — keeping local, manual cleanup needed",
-            ", ".join(removed),
-        )
-        _FREE_DISCOVERY_STATE["removed"] = removed
-    else:
-        _FREE_DISCOVERY_STATE["removed"] = []
-    lock = globals().get("_reload_lock")
-    added = 0
-    try:
-        if lock is not None:
-            lock.acquire()
-        for fid in sorted(free_ids):
-            expected = _free_endpoint_for(fid)
-            if fid not in MODELS:
-                proto = _resolve_protocol(fid)
-                MODELS[fid] = {"endpoint": expected, "protocol": proto}
-                added += 1
-                prefix = fid.split("-")[0].split(".")[0].lower()
-                prefix_clean = re.sub(r"\d+$", "", prefix)
-                if prefix_clean not in KNOWN_PROTOCOLS:
-                    logger.warning(
-                        "[free-discovery] unknown family %s for %s → openai", prefix_clean, fid
-                    )
-            else:
-                cur = MODELS[fid].get("endpoint", "")
-                if cur != expected and ("muse" in fid.lower() or "spark" in fid.lower()):
-                    MODELS[fid]["endpoint"] = expected
-                    logger.info("[free-discovery] corrected endpoint %s → %s", fid, expected)
-        # Update FREE_MODELS in-place (keep object identity for importers that hold ref)
-        FREE_MODELS.clear()
-        FREE_MODELS.update(free_ids)
-        FREE_MODEL_POOL = sorted(free_ids)
-        # Keep state
-        _FREE_DISCOVERY_STATE["detected"] = sorted(free_ids)
-        _FREE_DISCOVERY_STATE["source"] = source
-        # FREE_MODEL_MAP add-only: paid → paid-free homonyme if exists
-        # Iterate over a snapshot of MODELS keys (paid candidates = not free themselves)
-        for paid in list(MODELS.keys()):
-            if paid in free_ids:
-                continue
-            homonyme = f"{paid}-free"
-            if homonyme in free_ids and paid not in FREE_MODEL_MAP:
-                FREE_MODEL_MAP[paid] = homonyme
-                logger.info("[free-discovery] mapped %s → %s (homonyme)", paid, homonyme)
-        # default_target validation
-        dt = FREE_DISCOVERY_DEFAULT_TARGET
-        if dt and dt not in free_ids and free_ids:
-            fallback = FREE_MODEL_POOL[0] if FREE_MODEL_POOL else dt
-            logger.warning(
-                "[free-discovery] default_target %r not in FREE_MODELS — fallback %r", dt, fallback
-            )
-        logger.info(
-            "[free-discovery] fetched %d free ids, added %d new MODELS, source=%s",
-            len(free_ids),
-            added,
-            source,
-        )
-        try:
-            get_model_config.cache_clear()
-        except Exception:
-            pass
-    finally:
-        if lock is not None:
-            try:
-                lock.release()
-            except RuntimeError:
-                pass
+    added, _new_pool = _discovery_mod.apply_discovered_free_models(
+        free_ids,
+        source,
+        go_only_ids=GO_ONLY_IDS,
+        free_models=FREE_MODELS,
+        free_model_map=FREE_MODEL_MAP,
+        models=MODELS,
+        discovery_state=_FREE_DISCOVERY_STATE,
+        default_target=FREE_DISCOVERY_DEFAULT_TARGET,
+        api_base_free=API_BASE_FREE,
+        resolve_protocol_fn=_resolve_protocol,
+        known_protocols=KNOWN_PROTOCOLS,
+        cache_clear_fn=lambda: get_model_config.cache_clear(),
+        lock=_reload_lock,
+        log=logger,
+    )
+    if _new_pool is not None:
+        FREE_MODEL_POOL = _new_pool
     return added
 
 
 def _persist_free_mappings():
     """Merge add-only free mappings into config.yaml (atomic tmp+fsync+replace under lock)."""
-    if not FREE_DISCOVERY_AUTO_PERSIST:
-        return
-    try:
-        # Ensure sections exist
-        if "free_model_map" not in _yaml_data or not isinstance(
-            _yaml_data.get("free_model_map"), dict
-        ):
-            _yaml_data["free_model_map"] = {}
-        if "models" not in _yaml_data or not isinstance(_yaml_data.get("models"), dict):
-            _yaml_data["models"] = {}
-        # Merge FREE_MODEL_MAP add-only
-        for k, v in FREE_MODEL_MAP.items():
-            if k not in _yaml_data["free_model_map"]:
-                _yaml_data["free_model_map"][k] = v
-        # Merge MODELS add-only (only free ids or newly discovered)
-        for mid, cfg in MODELS.items():
-            if mid not in _yaml_data["models"]:
-                # Persist minimal protocol hint
-                proto = cfg.get("protocol", "openai")
-                _yaml_data["models"][mid] = {"protocol": proto}
-        save_yaml_config()
-        logger.debug("[free-discovery] persisted %d free mappings", len(FREE_MODEL_MAP))
-    except Exception as e:
-        logger.warning("[free-discovery] persist failed: %s", e)
+    _discovery_mod.persist_free_mappings(
+        auto_persist=FREE_DISCOVERY_AUTO_PERSIST,
+        free_model_map=FREE_MODEL_MAP,
+        models=MODELS,
+        yaml_data=_yaml_data,
+        save_yaml_fn=save_yaml_config,
+        log=logger,
+    )
 
 
 def _ensure_free_models_sync() -> int:
@@ -1336,7 +777,13 @@ def _ensure_free_models_sync() -> int:
     if not FREE_DISCOVERY_ENABLED:
         return 0
     try:
-        free_ids, source, _payloads = _fetch_free_models_sync(timeout=10)
+        # [Phase 1] fetch déplacé vers config/discovery.py (état injecté).
+        free_ids, source, _payloads = _discovery_mod.fetch_free_models_sync(
+            timeout=10,
+            proxy=PROXY,
+            urls_fn=_free_discovery_urls,
+            log=logger,
+        )
         if not free_ids:
             logger.warning("[free-discovery] no free ids detected source=%s", source)
             _FREE_DISCOVERY_STATE["source"] = source
