@@ -1,5 +1,6 @@
 """Tests V4 100% : traitements 10-17 + strict:false (calm-rossum)."""
 import json
+
 import protocol_mapping as pm
 
 _N = pm._normalize_tool_schema

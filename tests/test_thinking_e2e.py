@@ -587,10 +587,10 @@ async def test_T4_streaming_400_no_retry_after_started(monkeypatch):
     # Le garde est structurel (indent) : on le vérifie par inspection + smoke.
     # Smoke: si _stream_has_yielded==True, le handler streaming appelle
     # _terminate_after_started avec thinking_idx/sig, pas _do_request_with_retry.
-    import opencode
-
     # Vérifie que le bloc retry-once est bien sous `if not is_stream:`
     import inspect
+
+    import opencode
 
     src = inspect.getsource(opencode.messages)
     # Le retry-once pop("_has_synthetic") ne doit apparaître qu'une fois et

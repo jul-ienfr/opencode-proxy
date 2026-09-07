@@ -23,7 +23,11 @@ import sys
 import time
 
 if sys.platform == "win32":
-    sys.stdout.reconfigure(encoding="utf-8")
+    # getattr (pas d'accès direct) : sous capture pytest, sys.stdout n'a pas
+    # toujours reconfigure (mypy union-attr sinon, crash au runtime si absent).
+    _reconf = getattr(sys.stdout, "reconfigure", None)
+    if callable(_reconf):
+        _reconf(encoding="utf-8")
 
 from config.settings import CONFIG_PATH, CUSTOM_ROUTES_PATH, yaml_get
 

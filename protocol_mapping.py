@@ -12,6 +12,12 @@ import uuid
 from collections import OrderedDict
 from typing import Any
 
+# [Plan perf-fiabilité Lot 1, décision 2026-09-06] FAIL FAST : orjson est
+# épinglé en dur (requirements.txt:19 orjson==3.11.7) — import direct, crash
+# net au boot si absent. Un fallback silencieux sur stdlib json rendrait le
+# proxy 5-10x plus lent sans aucun signal.
+import orjson as _orjson  # type: ignore
+
 from config import CACHE_MIN_PROMPT_SIZE, yaml_get
 from dashboard.display import debug as _debug
 from dashboard.display import log as _log
@@ -35,49 +41,32 @@ except Exception:
     _encoding = None
 
 # ── orjson fast-path (5-10x vs stdlib json on large bodies) ──
-try:
-    import orjson as _orjson  # type: ignore
+# (import fail-fast en tête de fichier — cf. note Lot 1 ci-dessus)
 
-    def _json_loads(b: bytes | str, **kw):
-        if isinstance(b, str):
-            b = b.encode()
-        return _orjson.loads(b)
 
-    def _json_dumps(obj, **kw) -> bytes:
-        if kw.get("indent") is not None:
-            return json.dumps(
-                obj, ensure_ascii=False, indent=kw.get("indent"), default=str
-            ).encode()
-        return _orjson.dumps(obj)
+def _json_loads(b: bytes | str, **kw):
+    if isinstance(b, str):
+        b = b.encode()
+    return _orjson.loads(b)
 
-    def _json_dumps_str(obj, **kw) -> str:
-        if kw.get("indent") is not None:
-            return json.dumps(obj, ensure_ascii=False, indent=kw.get("indent"), default=str)
-        if kw:
-            return _orjson.dumps(obj).decode()
+
+def _json_dumps(obj, **kw) -> bytes:
+    if kw.get("indent") is not None:
+        return json.dumps(
+            obj, ensure_ascii=False, indent=kw.get("indent"), default=str
+        ).encode()
+    return _orjson.dumps(obj)
+
+
+def _json_dumps_str(obj, **kw) -> str:
+    if kw.get("indent") is not None:
+        return json.dumps(obj, ensure_ascii=False, indent=kw.get("indent"), default=str)
+    if kw:
         return _orjson.dumps(obj).decode()
+    return _orjson.dumps(obj).decode()
 
-    _JSON_LIB = "orjson"
-except ImportError:
 
-    def _json_loads(b: bytes | str, **kw):  # type: ignore[no-redef]
-        if isinstance(b, bytes):
-            b = b.decode()
-        return json.loads(b, **kw)
-
-    def _json_dumps(obj, **kw) -> bytes:  # type: ignore[no-redef]
-        if "indent" in kw:
-            return json.dumps(
-                obj, ensure_ascii=False, indent=kw.get("indent"), default=str
-            ).encode()
-        return json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode()
-
-    def _json_dumps_str(obj, **kw) -> str:  # type: ignore[no-redef]
-        if "indent" in kw:
-            return json.dumps(obj, ensure_ascii=False, indent=kw.get("indent"), default=str)
-        return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
-
-    _JSON_LIB = "json"
+_JSON_LIB = "orjson"
 
 
 def _drop_orphan_tool_messages(messages: list[dict]) -> list[dict]:
@@ -877,6 +866,19 @@ _orig_anthropic_to_openai = anthropic_to_openai
 _anthropic_cache: OrderedDict = OrderedDict()
 _anthropic_cache_max = 512
 
+# [plan Lot 0] compteurs hit-rate exposition /metrics (fail-soft, zéro lock :
+# incréments GIL-atomiques suffisent pour de l'observabilité).
+_conversion_hits = 0
+_conversion_misses = 0
+
+
+def conversion_cache_stats() -> dict:
+    """Snapshot des compteurs hit/miss du cache de conversion (Lot 0)."""
+    hit = _conversion_hits
+    miss = _conversion_misses
+    total = hit + miss
+    return {"hit": hit, "miss": miss, "hit_rate": (hit / total) if total else 0.0}
+
 
 def _conversion_epoch() -> int:
     """[P4 correctesse] version de routage mélangée à la clé de conversion :
@@ -914,6 +916,7 @@ def anthropic_to_openai(body: dict, model: str, raw: bytes | None = None) -> dic
     # ^ [P4] wrapper de cache volontairement rebaptisé du même nom que
     # l'implémentation d'origine (ligne ~308) — pattern décorateur manuel ;
     # l'originale reste joignable via _orig_anthropic_to_openai.
+    global _conversion_hits, _conversion_misses
     try:
         # B2c: invalidate cache if body contains role None (poison)
         for _m in body.get("messages", []) or []:
@@ -925,11 +928,13 @@ def anthropic_to_openai(body: dict, model: str, raw: bytes | None = None) -> dic
         if hit is not None:
             # [P4] LRU : le hit rafraîchit la position (move-to-end).
             _anthropic_cache.move_to_end(key)
+            _conversion_hits += 1
             # [C1] shallow copy TOP-LEVEL uniquement : audit plan §3 — les
             # mutations post-conversion des callers touchent des clés racine
             # (model / stream_options / min_tokens), jamais les structures
             # imbriquées partagées. Fini les deepcopy hit ET miss.
             return dict(hit)
+        _conversion_misses += 1
         res = _orig_anthropic_to_openai(body, model)
         # Objet stocké JAMAIS exposé tel quel (le caller reçoit une copie
         # racine) → le cache reste pristine sans deepcopy.

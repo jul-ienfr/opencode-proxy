@@ -235,8 +235,9 @@ class TestPoolStationKeys:
 
 class TestHealthDetail:
     def test_default_ne_serialise_pas_usage(self):
-        import opencode as oc
         from fastapi.testclient import TestClient
+
+        import opencode as oc
 
         oc._token_usage["test-health-model"] = {"input": 1, "output": 2, "cache": 0}
         client = TestClient(oc.app)
@@ -252,10 +253,10 @@ class TestHealthDetail:
             oc._token_usage.pop("test-health-model", None)
 
     def test_detail_case_insensitive(self):
-        from opencode import app
         from fastapi.testclient import TestClient
 
         import opencode as oc
+        from opencode import app
 
         oc._token_usage["test-health-case"] = {"input": 3, "output": 4, "cache": 5}
         client = TestClient(app)
@@ -326,7 +327,7 @@ class TestWeeklyPurge:
     def test_purge_90_jours_masque_ancien_conserve_recent(self, tmp_path):
         import datetime as _dt
 
-        n = _dt.datetime.now(_dt.timezone.utc)
+        n = _dt.datetime.now(_dt.UTC)
         recent = (n - _dt.timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
         old = (n - _dt.timedelta(days=200)).strftime("%Y-%m-%dT%H:%M:%SZ")
         conn = self._db(tmp_path, [(1, recent), (2, old), (3, recent)])
@@ -339,7 +340,7 @@ class TestWeeklyPurge:
     def test_purge_0_desactivee(self, tmp_path):
         import datetime as _dt
 
-        ts = (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(days=400)).strftime(
+        ts = (_dt.datetime.now(_dt.UTC) - _dt.timedelta(days=400)).strftime(
             "%Y-%m-%dT%H:%M:%SZ"
         )
         conn = self._db(tmp_path, [(1, ts)])
@@ -351,7 +352,7 @@ class TestWeeklyPurge:
         import datetime as _dt
         import sqlite3
 
-        old = (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(days=365)).strftime(
+        old = (_dt.datetime.now(_dt.UTC) - _dt.timedelta(days=365)).strftime(
             "%Y-%m-%dT%H:%M:%SZ"
         )
         db = tmp_path / "legacy.db"

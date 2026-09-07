@@ -14,7 +14,13 @@ Refs: opencode.py:1716/1737/2202/2276, vpn_manager.py:1061/1412/1417/1765/1790/3
       dashboard/api.py:2808/2819/2833/2903, docker-compose.yml:22, app/db/__init__.py:294
 """
 from __future__ import annotations
-import argparse, json, re, subprocess, sys, pathlib
+
+import argparse
+import json
+import pathlib
+import re
+import subprocess
+import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 FAILED: list[str] = []
@@ -142,7 +148,7 @@ def check_7_docker_ps():
         out_a = sh(["docker", "ps", "-a", "--filter", "name=opencode-vpn", "--format", "{{.Names}} {{.Status}}"], timeout=10)
         if out_a.strip():
             return fail(f"7/15 FAIL: docker ps vide mais ps -a={out_a.strip()[:300]} -- containers Exited (H2) docker-compose.yml:22 30s×3 start-period 60s")
-        return fail(f"7/15 FAIL: docker ps vide -- docker non dispo ou 0/4 (H2) -- opencode.py:2276 gather")
+        return fail("7/15 FAIL: docker ps vide -- docker non dispo ou 0/4 (H2) -- opencode.py:2276 gather")
     lines = [l for l in out.splitlines() if "opencode-vpn" in l]
     # need 4 Up
     if len(lines) != 4:
@@ -212,7 +218,8 @@ def check_12_heal():
     env = ROOT / ".env"
     if env.exists():
         m = re.search(r"DASHBOARD_TOKEN\s*=\s*(\S+)", env.read_text(encoding="utf-8", errors="ignore"))
-        if m: token = m.group(1)
+        if m:
+            token = m.group(1)
     tok_h = ["-H", f"X-Dashboard-Token: {token}"] if token else []
     out = sh(["curl","-s","-X","POST","http://localhost:4000/api/vpn/heal"] + tok_h)
     try:

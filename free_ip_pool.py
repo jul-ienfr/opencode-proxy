@@ -27,13 +27,14 @@ import random
 import time
 import urllib.parse
 import weakref
+from typing import Any, cast
 
 from vpn_manager import RotationFailed, VPNManager
 
 try:
     from config.settings import yaml_get as _yaml_get
 except Exception:
-    def _yaml_get(section, key, default=None):  # fallback
+    def _yaml_get(section: str, key: str = None, default=None) -> Any:  # noqa: UP045 — signature miroir de config.settings.yaml_get exigée par mypy (conditional def)
         return default
 
 logger = logging.getLogger(__name__)
@@ -164,7 +165,7 @@ class FreeIPPool:
         self._station_ids = {m._station for m in self._stations}
         # [v6 P1-4] pick+increment race — 2 on_request concurrentes sur même snapshot
         self._pool_pick_lock = asyncio.Lock()
-        self._active_station: VPNManager | None = None  # last station used by on_request
+        self._active_station: VPNManager | Socks5Endpoint | None = None  # last station used by on_request (vpn OU socks5)
         self._total_free_requests = 0
         # Per-station state (request counters, IP stats, 429-bad TTL...)
         self._per: dict[int, dict] = {}
@@ -208,6 +209,8 @@ class FreeIPPool:
         self._failover_exhausted_cb = None
         # [plan v10 §3.6 Lot 3] Moteur de rotation latence-adaptive — partagé
         # (singleton), config canonique `ip_rotation.latency_rotation`.
+        # Any : import local (module optionnel) + duck-typing à l'usage.
+        self.latency_engine: Any = None
         try:
             from latency_rotation import get_engine
 
@@ -246,7 +249,7 @@ class FreeIPPool:
         self._socks5_proxies: list = []  # validated config rows {host, port, ...}
         self._socks5_eps: list = []  # parsed Socks5Endpoint list (negative sids)
         self._socks5_rr = 0  # round-robin cursor (index into _socks5_eps)
-        self._socks5_current = None  # last endpoint used by on_request
+        self._socks5_current: Socks5Endpoint | None = None  # last endpoint used by on_request
         # [Axe 3.1] True (default) = round-robin on every request; False =
         # stick to the current proxy while usable (rotation only via
         # bad-mark or the manual rotate endpoint).
@@ -317,12 +320,17 @@ class FreeIPPool:
         pool is disabled/direct — callers fall back to station 1
         (``self._vpn``) as before.
         """
-        return self._active_station
+        # NOTE (dette typage, gate Lot 0) : en mode socks5, _active_station
+        # peut être un Socks5Endpoint (duck-typé) — les consommateurs
+        # (rotation dashboard, switch_ip) attendent un VPNManager. Ne pas
+        # élargir sans traiter dashboard/api.py:3514 + opencode.py:4516.
+        return self._active_station  # type: ignore[return-value]
 
     # ── Station selection (double embrayage) ───────────────────
 
-    def _per_station(self, station: VPNManager) -> dict:
-        """Per-station mutable state, created lazily."""
+    def _per_station(self, station: VPNManager | Socks5Endpoint) -> dict:
+        """Per-station mutable state, created lazily (clé = ``station._station``,
+        négatif pour les endpoints SOCKS5 statiques — jamais de collision)."""
         sid = station._station
         per = self._per.get(sid)
         if per is None:
@@ -821,7 +829,7 @@ class FreeIPPool:
         per["last_connect_attempt"] = now
         self._launch_rotation(station)
 
-    async def on_request(self, forced_pool=None) -> tuple[str | None, VPNManager | None]:
+    async def on_request(self, forced_pool=None) -> tuple[str | None, VPNManager | Socks5Endpoint | None]:
         """Called before each free model request.
 
         Returns ``(proxy_url, station)`` — the SOCKS5 URL of the best
@@ -1076,7 +1084,7 @@ class FreeIPPool:
 
         return None, None
 
-    async def switch_ip(self, station: VPNManager | None = None) -> str:
+    async def switch_ip(self, station: VPNManager | Socks5Endpoint | None = None) -> str:
         """Switch the given station (default: the active/last used one) to
         a fresh VPN IP — honest single attempt (CRITIC(5)).
 
@@ -1096,6 +1104,8 @@ class FreeIPPool:
             # [Axe 3.1] Static proxies have no docker rotation — nothing to
             # switch. A stray call is a programming error, fail loudly.
             raise RotationFailed(f"proxy socks5 {station.pid} n'a pas de rotation docker")
+        if station is None:  # pragma: no cover — self._vpn toujours posé
+            raise RotationFailed("switch_ip sans station")
         new_ip = await station.connect_next()
         if not new_ip:
             # Defensive: connect_next is typed to return str now, but a
@@ -1129,7 +1139,7 @@ class FreeIPPool:
         return new_ip
 
     def on_quota_exhausted(
-        self, station: VPNManager | None = None, forced_pool: set | None = None
+        self, station: VPNManager | Socks5Endpoint | None = None, forced_pool: set | None = None
     ):
         """Free quota exhausted (429): mark the station bad and rotate it
         in the background — the next request lands on the other station.
@@ -1182,6 +1192,12 @@ class FreeIPPool:
         if self._vpn.proxy_mode != "vpn":
             return
         station = station or self._active_station or self._vpn
+        # cast (PAS d'isinstance) : en mode vpn, station est un VPNManager —
+        # la branche socks5 est sortie plus haut. Les doubles de test sont
+        # duck-typés (ni VPNManager ni Socks5Endpoint) et DOIVENT passer ici
+        # (régression 2026-09-07 : un garde isinstance retournait tôt et
+        # tuait les rotations forcées des tests).
+        station = cast("VPNManager", station)
         if action in ("cooldown", "both"):
             if self.dual_station:
                 if self._any_other_usable(station):
@@ -1231,7 +1247,7 @@ class FreeIPPool:
 
     async def on_disconnect_retry(
         self, failed: VPNManager | None = None, forced_pool=None
-    ) -> tuple[str | None, VPNManager | None]:
+    ) -> tuple[str | None, VPNManager | Socks5Endpoint | None]:
         """Pick a DIFFERENT station for a retry after an upstream disconnect.
 
         The stream retry loop used to re-strike the SAME station/proxy that
@@ -1264,11 +1280,17 @@ class FreeIPPool:
             target = failed if isinstance(failed, Socks5Endpoint) else self._socks5_current
             if target is not None and self._socks5_any_other(target):
                 self._per_station(target)["bad_until"] = time.monotonic() + self._bad_ttl
-            st = self._socks5_best_excluding(target) if target is not None else self._socks5_next()
+            # `st` couvre les deux modes (endpoint SOCKS5 OU manager VPN).
+            st: VPNManager | Socks5Endpoint | None = (
+                self._socks5_best_excluding(target) if target is not None else self._socks5_next()
+            )
             if st is None:
                 return None, None
             self._active_station = st
-            self._socks5_current = st
+            # st est toujours un endpoint ici (les deux sources le sont) ;
+            # l'isinstance satisfait mypy (narrowing vers Socks5Endpoint).
+            if isinstance(st, Socks5Endpoint):
+                self._socks5_current = st
             return st.socks5_url, st
         if self._vpn.proxy_mode != "vpn":
             return None, None
@@ -1407,7 +1429,7 @@ class FreeIPPool:
         # IDs forward would only risk misclassifying a genuine client cancel.
         # [plan v10 §14.3.9] WeakSet d'OBJETS et plus {id(t)} : un id réutilisé
         # par une nouvelle tâche post-GC était classé à tort "watchdog-cancelled".
-        _cancelled_ws = weakref.WeakSet()
+        _cancelled_ws: weakref.WeakSet = weakref.WeakSet()
         _cancelled_ws.update(tasks)
         per["watchdog_cancelled"] = _cancelled_ws
         for t in list(tasks):
@@ -1565,7 +1587,12 @@ class FreeIPPool:
         # "rotation running" marker `_launch_rotation` checks — a re-launch
         # of the same station while this one runs is deduped, another
         # station's rotation queues behind it.
-        self._rotation_tasks[sid] = asyncio.current_task()
+        # current_task() est toujours posée ici (on est dans le worker) ;
+        # le garde-None satisfait mypy et équivaut à l'absence de marqueur
+        # (le check `task and not task.done()` de _launch_rotation).
+        _current = asyncio.current_task()
+        if _current is not None:
+            self._rotation_tasks[sid] = _current
         needs_retry = False  # [Axe 1.2] re-queue after finally-pop (dedup)
         try:
             await self.switch_ip(station=station)
@@ -1967,7 +1994,7 @@ class FreeIPPool:
         # [plan v10 §14.3.8] stations[0] sans garde → IndexError (500 sur
         # /api/pool-status) dès que la registry est vide (retrait total).
         if not stations:
-            s1 = {
+            s1: dict = {
                 "station": None,
                 "vpn_status": "error",
                 "current_ip": None,

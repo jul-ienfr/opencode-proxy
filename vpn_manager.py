@@ -699,7 +699,7 @@ def _clamp_cfg_number(cfg: dict, key: str, default: float, lo: float, hi: float)
     return val
 
 
-def _host_ttl_seconds(failures: int, cfg: dict) -> float | None:
+def _host_ttl_seconds(failures: int, cfg: dict) -> float:
     """[plan 30/08 Lot A2] TTL progressif (secondes) de la blacklist fast-pin.
 
     TTL de base = ``bad_ttl`` (MINUTES, bornes 1–4320, défaut 1440 min = 24 h
@@ -846,6 +846,10 @@ class VPNManager:
             )
         self._config = cfg
         self._station = station
+        # Slot tagué par FreeIPPool._launch_rotation (contrainte géo de la
+        # rotation de fond) et levé dans son finally — déclaré ici pour que
+        # mypy voie l'attribut (getattr-défensif conservé : None = pas de pin).
+        self._geo_forced_pool: set | None = None
         self._mode = "docker"  # sole mode: compose-managed gluetun (free_ip_pool compat)
 
         self._enabled = cfg.get("enabled", False)
@@ -1093,9 +1097,9 @@ class VPNManager:
         self._least_loaded_topk = int(str(os.getenv("VPN_LEAST_LOADED_TOPK", cfg.get("least_loaded_topk", 5))))
         self._least_loaded_cache_s = int(str(os.getenv("VPN_LEAST_LOADED_CACHE_S", cfg.get("least_loaded_cache_s", 300))))
         self._server_cooldown_s = int(str(os.getenv("VPN_SERVER_COOLDOWN_S", cfg.get("server_cooldown_s", 1800))))
-        self._nord_loads_cache: dict | None = None  # {(tech,country): [(hostname, load), ...]} keyed by tech
+        self._nord_loads_cache: tuple[float, dict] | None = None  # (fetched_at, {(tech,country): [(hostname, load), ...]})
         self._nord_loads_cache_tech: str | None = None  # tech of cached loads
-        self._nord_country_ids = None  # {country_name: numeric id}
+        self._nord_country_ids: dict[str, int] | None = None  # {country_name: numeric id}
         # [plan 18/08 §B] Control-pin budget: how long a rotation pin may
         # poll "running" (timeout) + how long it then waits for a REAL IP
         # through the tunnel (catch-up, a "running but unreachable" guard —
@@ -2487,6 +2491,11 @@ class VPNManager:
         False.
         """
         urls = list(self._ip_check_urls or []) or [self._ip_check_url]
+        # import LOCAL volontaire (jamais module-level) : les tests stubent
+        # httpx dans sys.modules (test_vpn_freshness._FakeHttpx, piège 4) et
+        # un rebind module-level les rendrait aveugles (vrai réseau).
+        import httpx
+
         for _attempt in range(max(1, retries)):
             for url in urls:
                 try:
@@ -2555,7 +2564,9 @@ class VPNManager:
                         # real path. Only declare egress dead when the HTTP proxy
                         # is ALSO down; otherwise tolerate (don't churn the host's
                         # working tunnel).
-                        if not getattr(self, "_eof_tolerated_at", 0) or now - self._eof_tolerated_at > 300:
+                        # getattr x2 (pas self._eof_tolerated_at direct) : l'attribut
+                        # n'est posé qu'en cas de burst (mypy has-type sinon).
+                        if not getattr(self, "_eof_tolerated_at", 0) or now - getattr(self, "_eof_tolerated_at", 0) > 300:
                             logger.warning(
                                 "[vpn] socks5 EOF burst x%d station %s — tolerated, HTTP egress check",
                                 self._socks5_eof_count, self._station,
@@ -3030,8 +3041,8 @@ class VPNManager:
                 import datetime as _dt
                 _last = self._ip_history[-1].get("time")
                 if _last:
-                    _dt_utc = _dt.datetime.strptime(_last, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=_dt.timezone.utc)
-                    elapsed = int((_dt.datetime.now(_dt.timezone.utc) - _dt_utc).total_seconds())
+                    _dt_utc = _dt.datetime.strptime(_last, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=_dt.UTC)
+                    elapsed = int((_dt.datetime.now(_dt.UTC) - _dt_utc).total_seconds())
                 else:
                     elapsed = None
             except Exception:
@@ -3163,7 +3174,9 @@ class VPNManager:
                     int(
                         float(getattr(self, "_ov_auth_cascade_cooldown_s", 1800.0))
                         - (
-                            self._now_fn() - self._ov_auth_last_proto_flip_at
+                            # `or 0.0` : sous la garde getattr-is-not-None
+                            # l'attribut est un float (mypy operator sinon).
+                            self._now_fn() - (self._ov_auth_last_proto_flip_at or 0.0)
                             if getattr(self, "_ov_auth_last_proto_flip_at", None) is not None
                             else float(getattr(self, "_ov_auth_cascade_cooldown_s", 1800.0))
                         )
@@ -4209,7 +4222,12 @@ class VPNManager:
     async def _nord_country_id(self, name: str) -> int | None:
         if self._nord_country_ids is None:
             await self._load_nord_country_ids()
-        return self._nord_country_ids.get(name)
+        # Relecture locale : un await a eu lieu, une autre coroutine a pu
+        # réinitialiser l'attribut entre-temps (mypy narrowing + réalité).
+        _ids = self._nord_country_ids
+        if _ids is None:
+            return None
+        return _ids.get(name)
 
     async def _load_nord_country_ids(self) -> None:
         self._nord_country_ids = dict(self._NORD_COUNTRY_IDS_FALLBACK)
@@ -5063,7 +5081,7 @@ class VPNManager:
             return False
         return self._cascade_elapsed() < self._cascade_max_duration
 
-    def _cascade_next_step(self) -> tuple[str, str] | None:
+    def _cascade_next_step(self) -> tuple[str, str | None] | None:
         """Advance to the next cascade step. Returns (stack, protocol) or None
         if the cascade is exhausted or timed out.
 
@@ -5899,9 +5917,11 @@ class VPNManager:
                     # [v6 P1-3] heal actif au lieu de return infini (Exited → 1/4 300s)
                     try:
                         self.arm_egress_watchdog()
-                        if getattr(self, "_watchdog_event", None) is not None:
+                        # Locale : pas de narrowing mypy sur getattr (cf. §2566).
+                        _wd_ev = getattr(self, "_watchdog_event", None)
+                        if _wd_ev is not None:
                             try:
-                                self._watchdog_event.set()
+                                _wd_ev.set()
                             except Exception:
                                 pass
                         # container absent/stopped → heal synchrone (FIX always functional: was create_task + return → s1 restait arrêté 30s)

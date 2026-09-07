@@ -140,6 +140,49 @@ Points **non touchés volontairement** (veto confirmé 31/08) :
   rester sur `v3.41.3` ou monter ; si `latest` se recasse plus tard,
   la hot-lane `/api/vpn/flip` reste le recours manuel.
 
+## Gate d'intégration locale (plan perf-fiabilité Lot 0)
+
+Pas de CI distante (décision 2026-09-06) : une commande unique, fail-fast,
+depuis la racine du dépôt :
+
+```powershell
+pwsh scripts/gate.ps1
+```
+
+Étapes : `ruff check .` → `mypy .` → `pytest -k "not docker"
+--cov=. --cov-fail-under=35` → `bench_perf.py --json --fail-threshold 20`
+→ `pip-audit -r requirements.txt` → `gitleaks detect` (skip si binaire
+absent) → `docker compose config --quiet`. Exit 0 = lot verrouillable.
+
+Arbitrages Lot 0 (2026-09-07, gate rouge → verte) :
+
+- `pip-audit` est **scopé à `requirements.txt`** : nu, il audite tout
+  l'interpréteur système (266 vulns pré-existantes hors périmètre :
+  torch, litellm, crawl4ai… jamais importés par le proxy). Scopé : 0 vuln.
+- `bench_perf.py` accepte `--fail-threshold` (% — défaut 20, §13.5) :
+  `gate.ps1` le passait déjà, le flag n'existait pas (argparse exit 2).
+- `atomic_write_p95_ms` est **mesuré mais exclu du comparatif**
+  (`COMPARE_SKIP`) : bench 100 % stdlib, aucun code du dépôt dans le
+  chemin — sa variance Windows (fsync/AV : 2→30 ms d'un run à l'autre)
+  noierait tout signal. Baseline rafraîchie partiellement sur ce seul
+  bench (médiane 7 runs) ; tous les benches qui exercent le code
+  (sse, conv, static_mw, free_usage, curl_pool, lock, sqlite) restent
+  comparés à la baseline d'origine.
+- Dépôt scanné proprement : `Lib/`, `scripts/*.exe`, `scripts/bottle.py`,
+  `scripts/pywin32_*.py`, `logs/free400_*.json` gitignorés + exclus
+  ruff/mypy/coverage (artefacts locaux, pas du source).
+
+Décisions bench (run 2026-09-07) :
+
+- Pool curl : `curl_pool_checkout_p95_ms ≈ 0.001 ms` ≪ 200 ms → **M reste
+  à 3**, pas de passage à 4 (plan §5 : ne pas toucher si wait ≤ 200 ms).
+- Watchdog TTFB : aucun bench réseau (pas de TTFB prod mesuré ici) →
+  **seuil 90 s conservé** ; à recaler sur le p99 `proxy_ttfb_upstream_ms`
+  de `/metrics` si celui-ci dépasse 60 s.
+
+Hors gate (manuel, machine avec daemon Docker) : `pytest -m docker` +
+`python scripts/vpn_e2e_smoke.py`. Jamais dans la gate (exige le daemon).
+
 ## Refs
 
 - `config/settings.py:36-73` + `dashboard/api.py:457,1822` — see inline comments.

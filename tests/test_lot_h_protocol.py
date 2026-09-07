@@ -2,8 +2,6 @@
 
 import hashlib
 
-import pytest
-
 import protocol_mapping as pm
 
 

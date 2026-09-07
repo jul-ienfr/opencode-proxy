@@ -644,7 +644,7 @@ def _purge_old_rows_locked(conn: sqlite3.Connection, days: int = WEEKLY_PURGE_DA
     import datetime as _dt
 
     cutoff = (
-        (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(days=days))
+        (_dt.datetime.now(_dt.UTC) - _dt.timedelta(days=days))
         .replace(microsecond=0)
         .isoformat()
         .replace("+00:00", "Z")

@@ -72,7 +72,7 @@ class _EchoHandler(http.server.BaseHTTPRequestHandler):
     — the server is session-scoped, the list is cleared per test.
     """
 
-    captured = []
+    captured: list = []
 
     def do_POST(self):
         n = int(self.headers.get("content-length") or 0)
@@ -411,7 +411,7 @@ class _StubPoolDisconnectRetry:
     enabled = True
     active_station = None  # read by _current_free_identity on the direct path
     calls_to_request = 0
-    calls_to_disconnect = []
+    calls_to_disconnect: list = []
     _return_disconnect = ("socks5://127.0.0.1:1999", 99)
 
     async def on_request(self):
@@ -430,7 +430,7 @@ class _FakeStreamResp:
     """Minimal response double: status + headers, aclose() no-op."""
 
     status_code = 200
-    headers = {}
+    headers: dict = {}
 
     async def aclose(self):
         pass
@@ -444,7 +444,7 @@ class _FakeCurlSession:
     test assert proxy=/impersonate= without any socket I/O.
     """
 
-    created = []
+    created: list = []
 
     def __init__(self, **kwargs):
         self.kwargs = kwargs

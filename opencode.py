@@ -28,6 +28,12 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 import httpx
+
+# [Plan perf-fiabilité Lot 1, décision 2026-09-06] FAIL FAST : orjson est
+# épinglé en dur (requirements.txt:19 orjson==3.11.7) — import direct, crash
+# net au boot si absent. Un fallback silencieux sur stdlib json rendrait le
+# proxy 5-10x plus lent sans aucun signal.
+import orjson as _orjson  # type: ignore
 import yaml
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -166,6 +172,16 @@ def get_next_api_key() -> dict:
             if API_KEYS[idx].get("enabled", True) and not _key_pauser.is_paused(
                 API_KEYS[idx].get("api_key", "")
             ):
+                # [plan Lot 2] sticky + avance sur pause : quand la clé
+                # d'index courant est pausée/sautée (i > 0), persister la
+                # nouvelle position — pas de retour automatique à la clé 0
+                # après récupération. Le failover intra-requête reste géré
+                # par _do_request_with_retry (_find_alternative_key).
+                if i > 0:
+                    _key_failover_index = idx
+                    _debug(
+                        f"  [apikey] failover index avance → {idx} (clé précédente pausée)"
+                    )
                 _debug(
                     f"  [apikey] failover selected alias={API_KEYS[idx].get('alias', '?')} (idx={idx})"
                 )
@@ -512,7 +528,9 @@ async def _pause_key_for_quota_reset(api_key: str):
     """
     _record_global_429()
     try:
-        from dashboard.quota import fetch_quotas
+        # [plan-perf Lot 0/2] fetch quotas via le helper dédié : compteur
+        # /metrics (proxy_misc_total{name="fetch_quotas_429"}) + cache court
+        # 30 s anti-burst par workspace.
 
         # Find workspace for this key
         ws_entry = None
@@ -525,7 +543,8 @@ async def _pause_key_for_quota_reset(api_key: str):
 
         wid = ws_entry["go_workspace_id"]
         cookie = ws_entry["go_auth_cookie"]
-        quotas = await fetch_quotas(wid, cookie)
+        _bump_fetch_quotas_429()
+        quotas = await _fetch_quotas_429_cached(wid, cookie)
 
         # Find which quota window is exhausted — prefer rolling (5h window)
         for window in ("rolling", "weekly", "monthly"):
@@ -1083,6 +1102,14 @@ async def _save_request(
     try:
         _db_queue.put_nowait(("requests", item))
     except asyncio.QueueFull:
+        # [Lot 0] compteur d'alerte QueueFull (fallback synchrone) — signalé
+        # au runtime par logging.warning (visible hors DEBUG) + métrique.
+        _bump_misc_counter("db_queuefull")
+        logging.warning(
+            "[db] queue full (%d) — fallback synchrone pour req_id=%s",
+            _db_queue.qsize(),
+            req_id,
+        )
         _debug(
             f"  [db] queue full ({_db_queue.qsize()}), dropping req_id={req_id} — fallback to direct"
         )
@@ -1230,49 +1257,32 @@ def _wal_checkpoint():
 
 
 # ── orjson fast-path (5-10x vs stdlib json on large bodies) ──
-try:
-    import orjson as _orjson  # type: ignore
+# (import fail-fast en tête de fichier — cf. note Lot 1 en tête de module)
 
-    def _json_loads(b: bytes | str, **kw):
-        if isinstance(b, str):
-            b = b.encode()
-        return _orjson.loads(b)
 
-    def _json_dumps(obj, **kw) -> bytes:
-        if kw.get("indent") is not None:
-            return json.dumps(
-                obj, ensure_ascii=False, indent=kw.get("indent"), default=str
-            ).encode()
-        return _orjson.dumps(obj)
+def _json_loads(b: bytes | str, **kw):
+    if isinstance(b, str):
+        b = b.encode()
+    return _orjson.loads(b)
 
-    def _json_dumps_str(obj, **kw) -> str:
-        if kw.get("indent") is not None:
-            return json.dumps(obj, ensure_ascii=False, indent=kw.get("indent"), default=str)
-        if kw:
-            return _orjson.dumps(obj).decode()
+
+def _json_dumps(obj, **kw) -> bytes:
+    if kw.get("indent") is not None:
+        return json.dumps(
+            obj, ensure_ascii=False, indent=kw.get("indent"), default=str
+        ).encode()
+    return _orjson.dumps(obj)
+
+
+def _json_dumps_str(obj, **kw) -> str:
+    if kw.get("indent") is not None:
+        return json.dumps(obj, ensure_ascii=False, indent=kw.get("indent"), default=str)
+    if kw:
         return _orjson.dumps(obj).decode()
+    return _orjson.dumps(obj).decode()
 
-    _JSON_LIB = "orjson"
-except ImportError:
 
-    def _json_loads(b: bytes | str, **kw):  # type: ignore[no-redef]
-        if isinstance(b, bytes):
-            b = b.decode()
-        return json.loads(b, **kw)
-
-    def _json_dumps(obj, **kw) -> bytes:  # type: ignore[no-redef]
-        if "indent" in kw:
-            return json.dumps(
-                obj, ensure_ascii=False, indent=kw.get("indent"), default=str
-            ).encode()
-        return json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode()
-
-    def _json_dumps_str(obj, **kw) -> str:  # type: ignore[no-redef]
-        if "indent" in kw:
-            return json.dumps(obj, ensure_ascii=False, indent=kw.get("indent"), default=str)
-        return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
-
-    _JSON_LIB = "json"
+_JSON_LIB = "orjson"
 
 
 def _serialize_json_body(body) -> bytes:
@@ -1619,6 +1629,7 @@ async def _get_pooled_curl_session(proxy_url: str | None, impersonate: str):
     if pool is None:
         pool = _CurlSessionPool(_curl_pool_size())
         _curl_pool[key] = pool
+    _co_t0 = time.monotonic()
     slot = await pool.checkout(
         lambda: _curl_requests_mod.AsyncSession(
             impersonate=impersonate,
@@ -1632,6 +1643,9 @@ async def _get_pooled_curl_session(proxy_url: str | None, impersonate: str):
             timeout=(10, 600),
         )
     )
+    # [Lot 0] attente d'emprunt de session curl — métrique wait p50/p95/p99.
+    # Conditionne la décision pool curl M=4 (§5) : pas de bump si p95 <= 200 ms.
+    _observe_latency_ms("proxy_curl_checkout_wait_ms", (time.monotonic() - _co_t0) * 1000.0)
     return pool, slot
 
 
@@ -1767,6 +1781,86 @@ def _ensure_http_client() -> httpx.AsyncClient:
             _client = httpx.AsyncClient(transport=_transport, timeout=_build_http_timeout())
             _debug("[http] shared upstream client re-created (was closed)")
     return _client
+
+
+# ── [plan-perf Lot 1] Clients HTTP partagés par rôle (probes/web_fetch) ─────
+# Décision 2026-09-06 : PAS de client unique. Deux clients distincts —
+# « direct » (jamais de proxy : sondes IP/geo, dashboard) et « tunnel »
+# (proxy SOCKS du VPN actif). Lazy self-heal type _ensure_http_client
+# (threading.Lock + double check — jamais d'I/O sous le lock).
+# Garde-fou rotation : quand l'URL SOCKS change, le client tunnel est
+# recréé (comparaison string à chaque acquire, coût nul). L'ancien client
+# est aclose() en fire-and-forget si une boucle tourne — pas de fuite
+# unbounded, et le keepalive-expiry du transport purge le résiduel sinon.
+_role_clients_lock = threading.Lock()
+_role_clients: dict[str, tuple[httpx.AsyncClient, str | None]] = {}
+_ROLE_CLIENT_TIMEOUT = httpx.Timeout(connect=5.0, read=30.0, write=10.0, pool=5.0)
+
+
+def _role_tunnel_url() -> str | None:
+    """URL SOCKS courante du pool (proxy SOCKS du VPN actif), ou None.
+
+    Cas d'usage : sondes/web_fetch qui veulent TUNNELLER explicitement. On
+    prend d'abord la station active du pool (rotation NordVPN — rebuilt à
+    chaque changement, comparaison string), puis la socks5_url du manager,
+    puis le PROXY config. Réflexion à chaque acquire (coût nul), sans quota.
+    """
+    pool = _free_ip_pool
+    if pool is not None:
+        try:
+            if getattr(pool, "enabled", True):
+                st = getattr(pool, "_active_station", None)
+                if st is not None:
+                    url = getattr(st, "proxy_url", None)
+                    if url:
+                        return url
+        except Exception:
+            pass
+    try:
+        if _vpn_manager is not None:
+            url = getattr(_vpn_manager, "socks5_url", None)
+            if url:
+                return url
+    except Exception:
+        pass
+    try:
+        return get_socks5_proxy_url() or None
+    except Exception:
+        return PROXY or None
+
+
+def _role_bound_url(role: str) -> str | None:
+    """Proxy à appliquer au client du rôle. « direct » = jamais de proxy."""
+    if role == "tunnel":
+        return _role_tunnel_url()
+    return None
+
+
+def _role_client(role: str = "direct") -> httpx.AsyncClient:
+    """Client HTTP partagé pour le rôle (« direct » / « tunnel »).
+
+    Rebuild automatique si l'URL SOCKS liée change (rotation NordVPN) ou si
+    le client a été fermé. Retourne toujours un client ouvert.
+    """
+    with _role_clients_lock:
+        want = _role_bound_url(role)
+        entry = _role_clients.get(role)
+        if entry is not None and entry[1] == want and not entry[0].is_closed:
+            return entry[0]
+        old = entry[0] if entry is not None else None
+        if want:
+            transport = httpx.AsyncHTTPTransport(proxy=want, retries=0)
+        else:
+            transport = httpx.AsyncHTTPTransport(retries=0)
+        client = httpx.AsyncClient(transport=transport, timeout=_ROLE_CLIENT_TIMEOUT)
+        _role_clients[role] = (client, want)
+    if old is not None and not old.is_closed:
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(old.aclose())
+        except RuntimeError:
+            pass  # pas de boucle ici — keepalive-expiry purge le résiduel
+    return client
 
 
 # ── VPN / IP rotation (initialized in lifespan) ──────────────────
@@ -3122,6 +3216,54 @@ def _build_metrics_text() -> str:
     except Exception as e:
         _debug(f"  [metrics] compteurs O3 échoués (partiel): {e}")
 
+    # [plan Lot 0] Métriques de diagnostic perf : percentiles de latence
+    # (TTFB upstream, attente checkout curl) + compteurs divers. Fail-soft.
+    try:
+        for _m_name, _help in (
+            ("proxy_ttfb_upstream_ms", "TTFB du chemin paid upstream (ms) — alimente le seuil du watchdog"),
+            ("proxy_curl_checkout_wait_ms", "Attente d'emprunt d'une session curl (ms)"),
+        ):
+            _snap = _latency_snapshot().get(_m_name)
+            if _snap is None:
+                continue
+            _n, _p50, _p95, _p99 = _snap
+            lines.append(f"# HELP {_m_name} {_help}")
+            lines.append(f"# TYPE {_m_name} gauge")
+            lines.append(f'{_m_name}{{quantile="0.5"}} {_p50:.1f}')
+            lines.append(f'{_m_name}{{quantile="0.95"}} {_p95:.1f}')
+            lines.append(f'{_m_name}{{quantile="0.99"}} {_p99:.1f}')
+        with _FB_METRICS_LOCK:
+            _misc_snap = dict(_MISC_COUNTERS)
+            _ttfb_snap = dict(_TTFB_FAILOVER_COUNTS)
+        lines.append("# HELP proxy_misc_total compteurs de diagnostic (Lot 0)")
+        lines.append("# TYPE proxy_misc_total counter")
+        for _mc, _mv in sorted(_misc_snap.items()):
+            lines.append(f'proxy_misc_total{{name="{_mc}"}} {_mv}')
+        # Hit-rate du cache de conversion (compteurs maintenus dans
+        # protocol_mapping, exposés ici pour un point de collecte unique).
+        # Également lue par scripts/bench_perf.py --json.
+        try:
+            import protocol_mapping as _pm
+
+            _conv = getattr(_pm, "conversion_cache_stats", None)
+            if callable(_conv):
+                _cs = _conv()
+                lines.append("# HELP proxy_conversion_cache_total conversions anthropic→openai")
+                lines.append("# TYPE proxy_conversion_cache_total counter")
+                lines.append(f'proxy_conversion_cache_total{{result="hit"}} {int(_cs.get("hit", 0))}')
+                lines.append(f'proxy_conversion_cache_total{{result="miss"}} {int(_cs.get("miss", 0))}')
+        except Exception as _e2:
+            _debug(f"  [metrics] conversion cache stats skipped: {_e2}")
+        # [plan-perf Lot 2] Failovers du watchdog TTFB paid.
+        lines.append("# HELP proxy_ttfb_failover_total retentatives du watchdog TTFB paid")
+        lines.append("# TYPE proxy_ttfb_failover_total counter")
+        for _ka, _st in sorted(_ttfb_snap.keys()):
+            lines.append(
+                f'proxy_ttfb_failover_total{{key_alias="{_ka}",retry_stage="{_st}"}} {_ttfb_snap[(_ka, _st)]}'
+            )
+    except Exception as e:
+        _debug(f"  [metrics] métriques Lot 0 échouées (partiel): {e}")
+
     return "\n".join(lines) + "\n"
 
 
@@ -3263,8 +3405,26 @@ _CB_RECOVERY_TIMEOUT = float(
 )  # seconds before half-open test
 
 
+def _cb_half_open_probe_enabled() -> bool:
+    """[plan Lot 2] Sonde half-open unique (anti-thundering-herd).
+
+    ``circuit_breaker.half_open_single_probe`` (défaut True) ; ``false`` =
+    rollback exact au comportement historique (« tout passe en half_open »).
+    Lu à chaque appel → hot-reload config.yaml."""
+    try:
+        return bool(yaml_get("circuit_breaker", "half_open_single_probe", True))
+    except Exception:
+        return True
+
+
 class _CircuitBreaker:
-    """Per-endpoint circuit breaker: CLOSED → OPEN → HALF_OPEN → CLOSED."""
+    """Per-endpoint circuit breaker: CLOSED → OPEN → HALF_OPEN → CLOSED.
+
+    [plan Lot 2] En half_open, une SEULE requête sonde passe tant que la
+    sonde n'a pas conclu — les requêtes concurrentes sont rejetées comme si
+    le breaker était encore OPEN (CircuitOpenError → 503 côté appelant).
+    ``half_open_in_flight`` = sonde en vol. Désactivable via
+    ``circuit_breaker.half_open_single_probe: false`` (rollback)."""
 
     __slots__ = (
         "failures",
@@ -3274,6 +3434,8 @@ class _CircuitBreaker:
         "total_failures",
         "last_failure_time",
         "created_at",
+        "half_open_in_flight",
+        "half_open_since",
     )
 
     def __init__(self):
@@ -3284,12 +3446,15 @@ class _CircuitBreaker:
         self.total_failures = 0
         self.last_failure_time = 0.0
         self.created_at = time.monotonic()
+        self.half_open_in_flight = False
+        self.half_open_since = 0.0
 
     def record_success(self):
         old_state = self.state
         self.failures = 0
         self.total_requests += 1
         self.state = "closed"
+        self.half_open_in_flight = False
         if old_state != "closed":
             _debug(f"  [cb] state {old_state} → closed (success #{self.total_requests})")
 
@@ -3302,6 +3467,7 @@ class _CircuitBreaker:
         if self.state == "half_open":
             # Failure during half-open test → immediately reopen
             self.state = "open"
+            self.half_open_in_flight = False
             self.opened_at = time.monotonic()
             _debug("  [cb] half_open → open (test request failed)")
         elif self.failures >= _CB_FAILURE_THRESHOLD:
@@ -3315,12 +3481,33 @@ class _CircuitBreaker:
         if self.state == "open":
             if time.monotonic() - self.opened_at >= _CB_RECOVERY_TIMEOUT:
                 self.state = "half_open"
-                _debug("  [cb] open → half_open (cooldown expired)")
+                # [Lot 2] le premier appelant devient la sonde.
+                self.half_open_in_flight = _cb_half_open_probe_enabled()
+                self.half_open_since = time.monotonic()
+                _debug("  [cb] open → half_open (cooldown expired — sonde)")
                 return True  # allow one test request
             remaining = _CB_RECOVERY_TIMEOUT - (time.monotonic() - self.opened_at)
             _debug(f"  [cb] DENIED (state=open, cooldown={remaining:.0f}s remaining)")
             return False
-        # half_open: allow one request through
+        # half_open
+        if _cb_half_open_probe_enabled():
+            # Sonde unique : si une sonde est déjà en vol, rejeter (comme
+            # open — CircuitOpenError → 503, comportement client existant).
+            if self.half_open_in_flight:
+                # Sonde présumée morte (requête annulée sans record_*) :
+                # après 2×le cooldown, la sonde expire et peut être reprise.
+                if time.monotonic() - self.half_open_since >= 2 * _CB_RECOVERY_TIMEOUT:
+                    self.half_open_since = time.monotonic()
+                    _debug("  [cb] half_open probe expired — nouvelle sonde")
+                    return True
+                _debug("  [cb] DENIED (half_open probe in flight — reject as open)")
+                return False
+            # État half_open sans sonde marquée (transition héritée, hot
+            # reload du flag, test) : prendre la sonde.
+            self.half_open_in_flight = True
+            self.half_open_since = time.monotonic()
+            return True
+        # Rollback : comportement historique « tout le monde passe ».
         return True
 
     def get_status(self) -> dict:
@@ -4478,7 +4665,7 @@ async def _do_free_request_curl_cffi(
         # direct — sinon la boucle ne tourne jamais et ``raise last_exc``
         # lève None (TypeError: exceptions must derive from BaseException).
         proxies_to_try.append(None)
-    last_exc = None
+    last_exc: Exception | None = None
     for attempt_i, attempt_proxy in enumerate(proxies_to_try):
         is_last = attempt_i == len(proxies_to_try) - 1
         pool, slot = await _get_pooled_curl_session(attempt_proxy, profile["impersonate"])
@@ -4540,6 +4727,11 @@ async def _do_free_request_curl_cffi(
         # Wrap in a compatible response object
         await pool.checkin(slot)
         return _CurlCffiResponse(resp)
+    # Ici last_exc est toujours posée (boucle ≥1 tour, cf. ci-dessus) ; le
+    # garde-None satisfait mypy (`raise Optional` interdit) et convertit le
+    # cas théorique vide en RuntimeError explicite plutôt qu'en TypeError.
+    if last_exc is None:  # pragma: no cover — défensif
+        raise RuntimeError("free curl: no proxy slots available")
     raise last_exc
 
 
@@ -5308,10 +5500,97 @@ async def _open_free_stream(
         ) as resp:
             yield resp
         return
-    async with _ensure_http_client().stream(
-        "POST", endpoint, content=_serialize_json_body(body), headers=_with_json_content_type(headers)
-    ) as resp:
-        yield resp
+    # [plan-perf Lot 2] Branche paid direct (httpx stream) — watchdog TTFB :
+    # borne l'attente SANS premier byte (entrée du context manager = headers
+    # reçus). Failover : stage 1 = même clé, connexion neuve garantie (client
+    # jetable) ; stage 2 = clé alternative ; borne dure 2 tentatives, ensuite
+    # UpstreamError 504 (comportement client existant). Jamais en cours de
+    # stream : dès le premier byte, la boucle SSE locale prend le relais
+    # (keepalive 15 s) et le watchdog est désarmé — un silence intra-stream
+    # (reasoning long, gros tool call) ne déclenche AUCUN failover.
+    _ttfb_stage = 0
+    _ttfb_on = _ttfb_watchdog_enabled()
+    _s_protocol = "anthropic" if (headers or {}).get("x-api-key") else "openai"
+    while True:
+        _ttfb_fc = None
+        _ttfb_t0 = time.monotonic()
+        try:
+            _s_client = (
+                _fresh_http_client() if (_ttfb_on and _ttfb_stage >= 1) else _ensure_http_client()
+            )
+            if _ttfb_on and _ttfb_stage >= 1:
+                _ttfb_fc = _s_client
+            _stream_ctx = _s_client.stream(
+                "POST",
+                endpoint,
+                content=_serialize_json_body(body),
+                headers=_with_json_content_type(headers),
+            )
+            try:
+                if _ttfb_on:
+                    try:
+                        resp = await asyncio.wait_for(
+                            _stream_ctx.__aenter__(),
+                            timeout=_ttfb_watchdog_timeout_s(),
+                        )
+                    except TimeoutError as _te:
+                        try:
+                            await _stream_ctx.__aexit__(TimeoutError, _te, None)
+                        except Exception:
+                            pass
+                        raise _TTFBWatchdogTimeout(
+                            f"TTFB watchdog : headers muets après "
+                            f"{_ttfb_watchdog_timeout_s():.3g}s"
+                        ) from _te
+                else:
+                    resp = await _stream_ctx.__aenter__()
+            except _TTFBWatchdogTimeout:
+                raise
+            # Premier byte reçu → observer puis désarmer : le yield ci-dessous
+            # peut rester muet 10 min sur un reasoning — Jamais de watchdog.
+            _observe_latency_ms(
+                "proxy_ttfb_upstream_ms", (time.monotonic() - _ttfb_t0) * 1000.0
+            ) if _ttfb_on else None
+            try:
+                yield resp
+            finally:
+                try:
+                    await _stream_ctx.__aexit__(None, None, None)
+                except Exception:
+                    pass
+            return
+        except _TTFBWatchdogTimeout as _we:
+            if _ttfb_stage >= 2:
+                _bump_ttfb_failover("exhausted", "abort_504")
+                raise UpstreamError(
+                    f"Upstream TTFB watchdog: {_we}", status_code=504, original=_we
+                ) from _we
+            _ttfb_stage += 1
+            _cur_key = _key_from_headers(headers, _s_protocol)
+            if _ttfb_stage == 1:
+                _bump_ttfb_failover(_alias_for_api_key(_cur_key), "same_key_new_conn")
+                _log(f"  TTFB watchdog (stream) → même clé, connexion neuve ({_we})")
+            else:
+                _alt = _find_alternative_key(_cur_key)
+                if not _alt:
+                    _bump_ttfb_failover(_alias_for_api_key(_cur_key), "no_alt_504")
+                    raise UpstreamError(
+                        f"Upstream TTFB watchdog (stream, aucune clé alternative): {_we}",
+                        status_code=504,
+                        original=_we,
+                    ) from _we
+                _bump_ttfb_failover(str(_alt.get("alias", "?")), "alt_key")
+                _log(
+                    f"  TTFB watchdog (stream) → clé alternative alias={_alt.get('alias', '?')}"
+                )
+                headers = _get_auth_headers(_s_protocol, entry=_alt)
+            continue
+        finally:
+            if _ttfb_fc is not None:
+                try:
+                    await _ttfb_fc.aclose()
+                except Exception:
+                    pass
 
 
 @asynccontextmanager
@@ -5439,12 +5718,14 @@ async def _get_cached_public_ip() -> str:
     if cached["ip"] and now - cached["ts"] < 60 and cached["via_tunnel"] == expect_tunnel:
         return cached["ip"]
     try:
-        import httpx
-
-        proxy = _vpn_manager.socks5_url if expect_tunnel else None
-        async with httpx.AsyncClient(timeout=10 if expect_tunnel else 5, proxy=proxy) as client:
-            resp = await client.get("https://api.ipify.org")
-            ip = resp.text.strip()
+        # [plan-perf Lot 1] Clients partagés par rôle — choix selon l'égress
+        # attendu : tunnel SOCKS quand le VPN est censé porter la sortie,
+        # direct sinon (la sonde doit mesurer l'égress réel).
+        client = _role_client("tunnel" if expect_tunnel else "direct")
+        resp = await client.get(
+            "https://api.ipify.org", timeout=10 if expect_tunnel else 5
+        )
+        ip = resp.text.strip()
     except Exception:
         # Serve the stale value only when it matches the current context.
         return cached["ip"] if cached["via_tunnel"] == expect_tunnel else "unknown"
@@ -5462,14 +5743,13 @@ async def _get_direct_ip() -> str:
     bypassing any active VPN tunnel — used by _direct_country() to
     resolve the residential egress IP regardless of VPN state.
     """
-    import httpx as _httpx_ip
-
     try:
-        async with _httpx_ip.AsyncClient(timeout=5) as _client:
-            resp = await _client.get("https://api.ipify.org")
-            ip = resp.text.strip()
-            if ip:
-                return ip
+        # [plan-perf Lot 1] Client partagé « direct » — cette sonde contourne
+        # volontairement tout tunnel actif.
+        resp = await _role_client("direct").get("https://api.ipify.org", timeout=5)
+        ip = resp.text.strip()
+        if ip:
+            return ip
     except Exception:
         pass
     return "unknown"
@@ -5512,27 +5792,25 @@ async def _direct_country() -> str:
         return cached["country"]
     country = "unknown"
     try:
-        import httpx as _httpx_geo
-
-        # Direct lookup — never via tunnel (we want the residential egress)
-        async with _httpx_geo.AsyncClient(timeout=5) as _client:
-            # ip-api.com line format: country is plain text field
-            resp = await _client.get(f"http://ip-api.com/line/{current_ip}?fields=country")
-            raw = resp.text.strip()
-            if raw and raw.lower() not in ("fail", "unknown"):
-                country = _vpn_normalize_country(raw)
-            else:
-                # Fallback: ipinfo
-                try:
-                    r2 = await _client.get(f"https://ipinfo.io/{current_ip}/country", timeout=5)
-                    raw2 = r2.text.strip()
-                    if raw2 and len(raw2) <= 4:
-                        # ipinfo returns 2-letter code — map via aliases if needed
-                        country = _vpn_normalize_country(raw2)
-                    elif raw2:
-                        country = _vpn_normalize_country(raw2)
-                except Exception:
-                    pass
+        # [plan-perf Lot 1] Client partagé « direct » — never via tunnel.
+        _client = _role_client("direct")
+        # ip-api.com line format: country is plain text field
+        resp = await _client.get(f"http://ip-api.com/line/{current_ip}?fields=country", timeout=5)
+        raw = resp.text.strip()
+        if raw and raw.lower() not in ("fail", "unknown"):
+            country = _vpn_normalize_country(raw)
+        else:
+            # Fallback: ipinfo
+            try:
+                r2 = await _client.get(f"https://ipinfo.io/{current_ip}/country", timeout=5)
+                raw2 = r2.text.strip()
+                if raw2 and len(raw2) <= 4:
+                    # ipinfo returns 2-letter code — map via aliases if needed
+                    country = _vpn_normalize_country(raw2)
+                elif raw2:
+                    country = _vpn_normalize_country(raw2)
+            except Exception:
+                pass
     except Exception:
         country = "unknown"
     if country and country.lower() != "unknown":
@@ -6916,6 +7194,170 @@ def _reset_fallback_metrics() -> None:
         pass
 
 
+# ── [plan Lot 0] Métriques de diagnostic perf ──────────────────────────────
+# Registres en mémoire (mêmes garanties que _FB_* : thread-safe via
+# _FB_METRICS_LOCK, fail-soft, observabilité seule — aucune incidence sur le
+# routage). Latences : ring buffer borné par métrique (deque maxlen), rendu
+# Prometheus en gauge p50/p95/p99 + count sous /metrics.
+_LAT_RING_MAX = 1024  # ~garantie mémoire O(1) par métrique ; p99 glissant
+_lat_rings: dict[str, "deque[float]"] = {}
+_MISC_COUNTERS: dict[str, int] = {}
+
+
+def _observe_latency_ms(name: str, ms: float) -> None:
+    """Alimente le ring de latence ``name`` — fail-soft, jamais de raise."""
+    try:
+        with _FB_METRICS_LOCK:
+            ring = _lat_rings.get(name)
+            if ring is None:
+                ring = deque(maxlen=_LAT_RING_MAX)
+                _lat_rings[name] = ring
+            ring.append(float(ms))
+    except Exception:
+        pass
+
+
+def _bump_misc_counter(name: str) -> None:
+    """Compteur simple (db_queuefull, fetch_quotas_429, …) — fail-soft."""
+    try:
+        with _FB_METRICS_LOCK:
+            _MISC_COUNTERS[name] = _MISC_COUNTERS.get(name, 0) + 1
+    except Exception:
+        pass
+
+
+# ── [plan-perf Lot 0/2] fetch_quotas sur 429 : compteur + cache court ───────
+# Sans cache, une rafale de 429 sur le même workspace spammait l'endpoint de
+# quotas (un fetch par 429). TTL 30 s (reco §5 du plan) : le reset_in_sec
+# retourné évolue lentement, l'erreur induite sur la pause est négligeable et
+# le 429 suivant re-valide après expiration. Pas de flag config : pure
+# observabilité (compteur /metrics) + réduction de charge, rollback = TTL 0.
+_FETCH_QUOTAS_429_TTL_S = 30.0
+_fetch_quotas_429_cache: dict[str, tuple[float, dict]] = {}
+
+
+def _bump_fetch_quotas_429() -> None:
+    """Compteur proxy_misc_total{name="fetch_quotas_429"} — fail-soft."""
+    _bump_misc_counter("fetch_quotas_429")
+
+
+async def _fetch_quotas_429_cached(wid: str, cookie: str) -> dict:
+    """fetch_quotas avec cache court (30 s) par workspace — anti-burst 429.
+
+    Fail-soft côté cache uniquement : toute erreur du fetch remonte à
+    l'appelant (qui bascule sur la pause par défaut, comportement historique).
+    """
+    try:
+        _hit = _fetch_quotas_429_cache.get(wid)
+        if _hit is not None and (time.monotonic() - _hit[0]) < _FETCH_QUOTAS_429_TTL_S:
+            if isinstance(_hit[1], dict):
+                return _hit[1]
+    except Exception:
+        pass
+    from dashboard.quota import fetch_quotas  # import tardif : évite le cycle
+    quotas = await fetch_quotas(wid, cookie)
+    try:
+        if isinstance(quotas, dict):
+            _fetch_quotas_429_cache[wid] = (time.monotonic(), quotas)
+    except Exception:
+        pass
+    return quotas
+
+
+# ── [plan-perf Lot 2] Watchdog TTFB paid ─────────────────────────────────────
+# Chemin paid sans station : une connexion TCP « demi-morte » peut retenir les
+# headers indéfiniment (read 600s). Le watchdog coupe à ``timeout_s`` SANS
+# premier byte, puis failover : 1) même clé, connexion neuve garantie (client
+# jetable) ; 2) clé alternative enabled non-pausée. Borne dure : 2 tentatives
+# max, ensuite UpstreamError 504 (comportement client existant). Jamais en
+# cours de stream (bytes reçus = watchdog désarmé) — sinon faux positifs sur
+# reasoning long / gros tool calls. Rollback : ttfb_watchdog.enabled=false.
+
+
+class _TTFBWatchdogTimeout(Exception):
+    """Aucun byte upstream reçu dans le délai du watchdog (premier byte)."""
+
+
+_TTFB_FAILOVER_COUNTS: dict[tuple[str, str], int] = {}
+
+
+def _bump_ttfb_failover(key_alias: str, stage: str) -> None:
+    """Métrique proxy_ttfb_failover_total{key_alias, retry_stage} — fail-soft."""
+    try:
+        with _FB_METRICS_LOCK:
+            k = (str(key_alias or "?"), str(stage))
+            _TTFB_FAILOVER_COUNTS[k] = _TTFB_FAILOVER_COUNTS.get(k, 0) + 1
+    except Exception:
+        pass
+
+
+def _ttfb_watchdog_enabled() -> bool:
+    try:
+        _tw = yaml_get("circuit_breaker", "ttfb_watchdog", {}) or {}
+        return bool(_tw.get("enabled", True)) if isinstance(_tw, dict) else True
+    except Exception:
+        return True
+
+
+def _ttfb_watchdog_timeout_s() -> float:
+    try:
+        _tw = yaml_get("circuit_breaker", "ttfb_watchdog", {}) or {}
+        _v = _tw.get("timeout_s", 90) if isinstance(_tw, dict) else 90
+        v = float(_v or 90)
+        return max(5.0, min(600.0, v))
+    except Exception:
+        return 90.0
+
+
+def _alias_for_api_key(api_key: str) -> str:
+    try:
+        for _e in API_KEYS:
+            if _e.get("api_key") == api_key:
+                return str(_e.get("alias", "?"))
+    except Exception:
+        pass
+    return "?"
+
+
+def _fresh_http_client() -> httpx.AsyncClient:
+    """Client jetable « connexion neuve » (retentative stage-1 du watchdog) —
+    même config que le client partagé, garanti sans connexion demi-morte
+    réutilisée. Le caller doit l'aclose()."""
+    _t = (
+        httpx.AsyncHTTPTransport(
+            proxy=PROXY, limits=_build_http_limits(), http2=True, retries=0
+        )
+        if PROXY
+        else httpx.AsyncHTTPTransport(
+            limits=_build_http_limits(), http2=True, retries=0
+        )
+    )
+    return httpx.AsyncClient(transport=_t, timeout=_build_http_timeout())
+
+
+def _percentile(sorted_vals: list[float], q: float) -> float:
+    """Percentile nearest-rank sur liste triée non vide."""
+    idx = max(0, min(len(sorted_vals) - 1, int(q * (len(sorted_vals) - 1) + 0.5)))
+    return sorted_vals[idx]
+
+
+def _latency_snapshot() -> dict[str, tuple[int, float, float, float]]:
+    """name -> (n, p50, p95, p99) en ms. Snapshot sous lock, tri hors lock."""
+    with _FB_METRICS_LOCK:
+        rings = {k: list(v) for k, v in _lat_rings.items()}
+    out: dict[str, tuple[int, float, float, float]] = {}
+    for name, vals in rings.items():
+        vals.sort()
+        if vals:
+            out[name] = (
+                len(vals),
+                _percentile(vals, 0.50),
+                _percentile(vals, 0.95),
+                _percentile(vals, 0.99),
+            )
+    return out
+
+
 def _log_fallback(req_id, leg, free_model, free_status, paid_model, account_alias=None) -> None:
     """[O1] Log fallback unifié free→paid — même forme sur les 5 sites.
 
@@ -6978,6 +7420,10 @@ async def _do_request_with_retry(endpoint, body, headers, protocol, retry_on_429
     _RETRYABLE_STATUSES = {500, 502, 503, 504, 499}
     max_retries = yaml_get("streaming", "retry_attempts", 2)
     attempt = 0
+    # [plan-perf Lot 2] étape du watchdog TTFB (0=jamais déclenché,
+    # 1=retentative même clé sur connexion neuve, 2=clé alternative).
+    _ttfb_stage = 0
+    _ttfb_on = _ttfb_watchdog_enabled()
     # Corps pré-sérialisé UNE fois — les bytes sont réutilisés entre tentatives
     _body_bytes = _serialize_json_body(body)
     headers = _with_json_content_type(headers)
@@ -6988,10 +7434,33 @@ async def _do_request_with_retry(endpoint, body, headers, protocol, retry_on_429
                 f"  → upstream POST {endpoint} attempt {attempt + 1}/{max_retries} headers={_sanitize_headers(headers)}"
             )
         t0 = time.monotonic()
+        _ttfb_fc = None
         try:
-            resp = await _ensure_http_client().post(
-                endpoint, content=_body_bytes, headers=headers
-            )
+            if _ttfb_on:
+                # [plan-perf Lot 2] Watchdog TTFB paid : borne le temps SANS
+                # premier byte (= réponse complète ici, non-stream). Silences
+                # intra-stream non concernés. stage 0 = client partagé ;
+                # stages 1-2 = client jetable « connexion neuve » garantie.
+                _pc = _ensure_http_client()
+                if _ttfb_stage >= 1:
+                    _pc = _fresh_http_client()
+                    _ttfb_fc = _pc
+                try:
+                    resp = await asyncio.wait_for(
+                        _pc.post(endpoint, content=_body_bytes, headers=headers),
+                        timeout=_ttfb_watchdog_timeout_s(),
+                    )
+                except TimeoutError as _te:
+                    raise _TTFBWatchdogTimeout(
+                        f"TTFB watchdog : aucune réponse upstream en "
+                        f"{_ttfb_watchdog_timeout_s():.3g}s"
+                    ) from _te
+            else:
+                resp = await _ensure_http_client().post(
+                    endpoint, content=_body_bytes, headers=headers
+                )
+            # [plan Lot 0] TTFB upstream paid → alimente le recalibrage du seuil
+            _observe_latency_ms("proxy_ttfb_upstream_ms", (time.monotonic() - t0) * 1000.0)
         except httpx.ConnectError as e:
             _debug(f"  ✗ connect error after {(time.monotonic() - t0) * 1000:.0f}ms: {e}")
             _log(f"  UPSTREAM CONNECT ERROR: {type(e).__name__}: {e}")
@@ -7010,6 +7479,38 @@ async def _do_request_with_retry(endpoint, body, headers, protocol, retry_on_429
             raise UpstreamError(
                 f"Upstream request failed: {type(e).__name__}: {e}", status_code=502, original=e
             ) from e
+        except _TTFBWatchdogTimeout as _we:
+            # [plan-perf Lot 2] Borne dure : 2 retentatives max (ne consomme ni
+            # 429-failover ni les retries 5xx), ensuite 504 client.
+            if _ttfb_stage >= 2:
+                _bump_ttfb_failover("exhausted", "abort_504")
+                raise UpstreamError(
+                    f"Upstream TTFB watchdog: {_we}", status_code=504, original=_we
+                ) from _we
+            _ttfb_stage += 1
+            _cur_key = _key_from_headers(headers, protocol)
+            if _ttfb_stage == 1:
+                _bump_ttfb_failover(_alias_for_api_key(_cur_key), "same_key_new_conn")
+                _log(f"  TTFB watchdog → retentative même clé, connexion neuve ({_we})")
+            else:
+                _alt = _find_alternative_key(_cur_key)
+                if not _alt:
+                    _bump_ttfb_failover(_alias_for_api_key(_cur_key), "no_alt_504")
+                    raise UpstreamError(
+                        f"Upstream TTFB watchdog (aucune clé alternative): {_we}",
+                        status_code=504,
+                        original=_we,
+                    ) from _we
+                _bump_ttfb_failover(str(_alt.get("alias", "?")), "alt_key")
+                _log(f"  TTFB watchdog → retentative clé alternative alias={_alt.get('alias', '?')}")
+                headers = _get_auth_headers(protocol, entry=_alt)
+            continue
+        finally:
+            if _ttfb_fc is not None:
+                try:
+                    await _ttfb_fc.aclose()
+                except Exception:
+                    pass
 
         elapsed_ms = (time.monotonic() - t0) * 1000
         _debug(
@@ -7393,7 +7894,9 @@ def _persist_free_400_wire(req_id, free_model, tag, wire_body, status=400) -> st
         except Exception:
             _raw = b""
         _sha = _hl.sha256(_raw).hexdigest()[:16] if _raw else ""
-        _keys, _types, _sizes = [], {}, {}
+        _keys: list = []
+        _types: dict = {}
+        _sizes: dict = {}  # int (compteurs) et str (extraits ≤80c) — debug only
         try:
             if isinstance(wire_body, dict):
                 _keys = sorted(wire_body.keys())
@@ -8468,7 +8971,7 @@ async def _handle_web_fetch(body: dict, model_id: str, protocol: str) -> bool:
 # This block was deduplicated: all conversions live in protocol_mapping.py
 # (Phase 2 of plan api-error-400-http-enchanted-creek). Imported here to
 # preserve 'from opencode import ...' compatibility for tests.
-from protocol_mapping import (  # noqa: E402  # re-export after function defs for compat
+from protocol_mapping import (  # noqa: E402,I001  # re-export after function defs for compat
     THINKING_MODELS,
     ResponsesSseState,
     _HAS_SYNTHETIC_REASONING_KEY,
@@ -8494,8 +8997,6 @@ from protocol_mapping import (  # noqa: E402  # re-export after function defs fo
     openai_responses_to_anthropic,
     openai_to_anthropic,
     openai_to_anthropic_request,
-    restore_tool_name,
-    sanitize_tool_names,
     strip_synthetic_thinking,
 )
 

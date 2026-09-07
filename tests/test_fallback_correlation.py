@@ -23,14 +23,14 @@ Never touches the live system : pas d'upstream, pas de VPN, pas de DB
 
 import inspect
 
-import opencode as oc
+import pytest
 from test_free_multi_attempt import (  # noqa: F401  (doubles partagés, pattern test_free_vpn_required.py)
     FREE_MODEL,
     free_cfg,  # noqa: F401  (fixture ré-exportée)
     free_vpn_env,  # noqa: F401
 )
 
-import pytest
+import opencode as oc
 
 
 @pytest.fixture

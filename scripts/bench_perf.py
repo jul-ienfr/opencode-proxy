@@ -9,8 +9,10 @@ Usage :
   python scripts/bench_perf.py --baseline     # fige logs/bench_baseline.json
   python scripts/bench_perf.py                # mesure + compare si baseline présente
   python scripts/bench_perf.py --json         # sortie machine
+  python scripts/bench_perf.py --json --fail-threshold 20  # gate Lot 0
 
-Règle §13.5 : régression >20% vs baseline sur un budget -> exit code 2.
+Règle §13.5 : régression >seuil (défaut 20%, --fail-threshold) vs baseline
+sur un budget -> exit code 2.
 Les Lots 2/3/5 brancheront ici les mesures réelles (rotation, soft_rotate).
 """
 
@@ -33,6 +35,12 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))  # import opencode / protocol_mapping / dashboard
 BASELINE_PATH = ROOT / "logs" / "bench_baseline.json"
 REGRESSION_THRESHOLD = 0.20  # §13.5
+# [plan-perf Lot 0] Benches exclus du comparatif gate (mesurés pour info) :
+# atomic_write = 100 % stdlib (tmp+fsync+replace), aucun code du dépôt dans
+# le chemin — sa variance Windows (fsync/AV : 2→30 ms d'un run à l'autre)
+# noierait tout signal. Les benches qui exercent le code (sse, conv,
+# static_mw, free_usage, curl_pool, lock, sqlite) restent comparées.
+COMPARE_SKIP = frozenset({"atomic_write_p95_ms"})
 
 
 # ── benches ──────────────────────────────────────────────────────────────
@@ -351,9 +359,11 @@ def run_benches() -> dict[str, dict[str, Any]]:
     return out
 
 
-def compare(baseline: dict, current: dict) -> list[str]:
+def compare(baseline: dict, current: dict, threshold: float = REGRESSION_THRESHOLD) -> list[str]:
     regressions: list[str] = []
     for name, cur in current.items():
+        if name in COMPARE_SKIP:
+            continue  # bruit machine pur, pas une régression du dépôt
         old = baseline.get(name, {}).get("value")
         if isinstance(old, (int, float)) and old > 0:
             delta = (cur["value"] - old) / old
@@ -361,13 +371,9 @@ def compare(baseline: dict, current: dict) -> list[str]:
             # mesure (2 microsecondes), pas une régression. Ne signaler que
             # si dégradation relative ET absolue sont significatives.
             MIN_ABS_DELTA_MS = 0.5
-            if (
-                delta > REGRESSION_THRESHOLD
-                and (float(cur["value"]) - old) >= MIN_ABS_DELTA_MS
-            ):
+            if delta > threshold and (float(cur["value"]) - old) >= MIN_ABS_DELTA_MS:
                 regressions.append(
-                    f"{name}: {old} -> {cur['value']} ms "
-                    f"(+{delta:.0%} > {REGRESSION_THRESHOLD:.0%})"
+                    f"{name}: {old} -> {cur['value']} ms (+{delta:.0%} > {threshold:.0%})"
                 )
     return regressions
 
@@ -376,7 +382,15 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--baseline", action="store_true", help="figer la baseline courante")
     parser.add_argument("--json", action="store_true", help="sortie JSON pure")
+    # [plan-perf Lot 0] la gate (scripts/gate.ps1) passe --fail-threshold 20.
+    parser.add_argument(
+        "--fail-threshold",
+        type=float,
+        default=REGRESSION_THRESHOLD * 100.0,
+        help="seuil de régression vs baseline, en % (défaut 20)",
+    )
     args = parser.parse_args()
+    threshold = float(args.fail_threshold) / 100.0
 
     results: dict[str, dict[str, Any]] = run_benches()
     lines: list[str] = []
@@ -398,7 +412,7 @@ def main() -> int:
         except Exception:
             baseline_data = None
     if not args.baseline and baseline_data:
-        regs = compare(baseline_data.get("results", {}), results)
+        regs = compare(baseline_data.get("results", {}), results, threshold)
         for reg in regs:
             print(f"RÉGRESSION vs baseline ({BASELINE_PATH.name}): {reg}")
         if regs:

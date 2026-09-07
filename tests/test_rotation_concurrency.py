@@ -400,7 +400,7 @@ class _Socks5FakePool:
     exemption (no docker), the usable set is the enabled static proxies."""
 
     socks5_mode = True
-    _stations = []  # docker stations inert in socks5 mode
+    _stations: list = []  # docker stations inert in socks5 mode
 
     def __init__(self, eps):
         self._eps = eps

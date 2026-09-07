@@ -34,20 +34,18 @@ Never touches the live system: upstream doublé, pas de VPN, pas de DB
 """
 
 import pytest
-
-import opencode as oc
 from test_free_multi_attempt import (
     PAID_MODEL,
-    FREE_MODEL,
     _FakeFreeCurl,
-    _PoolMulti,
-    _Station,
-    _StubVpn,
     _FakeResp,
     _free_body,
+    _PoolMulti,
+    _Station,
     free_cfg,  # noqa: F401  (fixture ré-exportée)
     free_vpn_env,  # noqa: F401
 )
+
+import opencode as oc
 
 
 class _PaidTouched(Exception):

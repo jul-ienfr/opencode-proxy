@@ -14,6 +14,7 @@ import asyncio
 import json
 import sys
 from datetime import UTC, datetime
+from typing import Any
 
 try:
     import httpx
@@ -308,7 +309,7 @@ class ToolCompatibilityTester:
     ) -> dict:
         """Run tests for all models and save results."""
         models = models or MODELS_TO_TEST
-        all_results = {
+        all_results: dict[str, Any] = {
             "timestamp": datetime.now(UTC).isoformat(),
             "proxy": self.proxy_base,
             "models": {},
@@ -350,14 +351,14 @@ class ToolCompatibilityTester:
         print(f"{'=' * 60}")
 
         # Collect all tool names
-        all_tools = set()
+        all_tools: set[str] = set()
         for model_data in results["models"].values():
             for r in model_data.get("results", []):
                 all_tools.add(r["tool"])
-        all_tools = sorted(all_tools)
+        all_tools_sorted = sorted(all_tools)
 
         # Header
-        header = f"{'Model':<25}" + "".join(f"{t[:8]:>9}" for t in all_tools)
+        header = f"{'Model':<25}" + "".join(f"{t[:8]:>9}" for t in all_tools_sorted)
         print(header)
         print("-" * len(header))
 
@@ -365,7 +366,7 @@ class ToolCompatibilityTester:
         for model_name, model_data in results["models"].items():
             row = f"{model_name:<25}"
             tool_results = {r["tool"]: r for r in model_data.get("results", [])}
-            for tool in all_tools:
+            for tool in all_tools_sorted:
                 r = tool_results.get(tool)
                 if r is None:
                     cell = "   -"

@@ -37,7 +37,7 @@ class _FakeStreamResp:
     """Minimal response double: status + headers, aclose() no-op."""
 
     status_code = 200
-    headers = {}
+    headers: dict = {}
 
     async def aclose(self):
         pass

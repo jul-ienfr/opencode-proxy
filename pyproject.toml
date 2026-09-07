@@ -5,13 +5,18 @@ build-backend = "setuptools.build_meta"
 [tool.ruff]
 line-length = 120
 target-version = "py311"
-extend-exclude = [".kilo/", ".venv/", "logs/", "__pycache__/", ".git/"]
+extend-exclude = [".kilo/", ".venv/", "logs/", "__pycache__/", ".git/", "Lib/", "scripts/bottle.py", "scripts/pywin32_postinstall.py", "scripts/pywin32_testall.py"]
 
 [tool.ruff.lint]
 # [P6] ignore dédoublonné ; E722/B904 RETIRÉS des ignores et corrigés dans
 # le code (bare except → except Exception ; raise ... from e).
 select = ["E", "F", "I", "UP", "B", "C4"]
 ignore = ["E501", "B007", "B905", "B011", "C401", "E741", "B023", "UP031"]
+
+[tool.ruff.lint.per-file-ignores]
+# Fixtures pytest ré-exportées d'un autre module de test puis utilisées comme
+# paramètres (pattern test_free_vpn_required.py) : le shadowing est volontaire.
+"tests/test_no_valid_keys_guard.py" = ["F811"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["app", "config", "dashboard", "free_discovery", "vpn", "vpn_manager", "free_ip_pool", "shared_rotation", "shared_state", "traffic_capture", "docker_events", "protocol_mapping"]
@@ -23,6 +28,9 @@ indent-style = "space"
 
 [tool.mypy]
 python_version = "3.11"
+# scripts/ et tests/ n'ont pas de __init__.py : sans ceci, `mypy .` échoue
+# sur "Source file found twice under different module names".
+explicit_package_bases = true
 warn_return_any = false
 warn_unused_configs = true
 ignore_missing_imports = true
@@ -30,7 +38,7 @@ disallow_untyped_defs = false
 check_untyped_defs = false
 no_implicit_optional = false
 strict = false
-exclude = ["\\.kilo/", "\\.venv/", "logs/"]
+exclude = ["\\.kilo/", "\\.venv/", "logs/", "Lib/", "scripts/bottle\\.py", "scripts/pywin32_.*\\.py"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
@@ -48,7 +56,7 @@ markers = [
 
 [tool.coverage.run]
 source = ["."]
-omit = ["tests/*", "scripts/*", "static/*", "__pycache__/*", ".venv/*", ".kilo/*", "logs/*"]
+omit = ["tests/*", "scripts/*", "static/*", "__pycache__/*", ".venv/*", "Lib/*", ".kilo/*", "logs/*"]
 
 [tool.coverage.report]
 show_missing = true

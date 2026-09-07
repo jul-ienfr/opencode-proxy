@@ -79,7 +79,7 @@ async def test_non_stream(base: str, model: str) -> None:
     if r.status_code != 200:
         check(f"non-stream {model} ->200", False, f"HTTP {r.status_code}: {body_text[:400]}")
         return
-    check(f"non-stream {model} ->200", True, f"HTTP 200")
+    check(f"non-stream {model} ->200", True, "HTTP 200")
     try:
         data = r.json()
     except Exception as e:

@@ -352,7 +352,7 @@ class TestRequestPathWiring:
 
     class _FakeResponse:
         status_code = 429
-        headers = {}
+        headers: dict = {}
         content = b"{}"
 
     def _patch(self, monkeypatch, session):

@@ -1,6 +1,7 @@
 """Tests V5.1 : response.created unwrap + poll + strict sémantique."""
-import protocol_mapping as pm
 import opencode as oc
+import protocol_mapping as pm
+
 
 def test_nonstream_response_created_unwrapped():
     data = {"type": "response.created", "sequence_number": 0, "response": {"id": "resp_123", "object": "response", "status": "completed", "output": [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "hi"}]}], "usage": {"input_tokens": 1, "output_tokens": 1}}}

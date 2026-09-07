@@ -53,7 +53,7 @@ import vpn_manager as vm
 
 # Explicit 3-profile pool (diversity off — the plan's strict retrocompat
 # path). Index order: 0 chrome131, 1 firefox144, 2 edge101.
-PROFILES = [
+PROFILES: list = [
     {"impersonate": "chrome131", "user_agent": None, "extra_headers": {}},
     {"impersonate": "firefox144", "user_agent": None, "extra_headers": {}},
     {"impersonate": "edge101", "user_agent": None, "extra_headers": {}},
@@ -203,6 +203,15 @@ class FakeVPNManager(vm.VPNManager):
 
     async def _probe_tunnel_light(self):
         return self.probe_alive
+
+    async def _http_proxy_egress_ok(self, retries=2):
+        # Hermétique : le tick consulte ce fallback egress directement
+        # (vpn_manager ~5952). Historiquement toujours False (NameError :
+        # `httpx` n'était importé nulle part au module — le fallback
+        # last-resort ne marchait jamais). Rendu explicite pour ne pas
+        # dépendre du réseau réel quand httpx est disponible ; la vivacité
+        # des tests tick reste pilotée par probe_alive, jamais par l'egress.
+        return False
 
     # ── escalation stub (record-only) ────────────────────────────
     async def _watchdog_escalate(self):

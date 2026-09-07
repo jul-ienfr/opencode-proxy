@@ -5,9 +5,22 @@ import json
 from fastapi.testclient import TestClient
 
 
-def test_sse_keepalive_headers():
+def test_sse_keepalive_headers(monkeypatch):
     """StreamingResponse doit envoyer Cache-Control no-cache et Connection keep-alive."""
+    import time
+
+    import opencode as oc
     from opencode import app
+
+    # Hermétique (flake constaté 2026-09-07 : `degraded` intermittent en
+    # suite longue uniquement) : /health reflète l'état global mutable
+    # (breakers ouverts / clés pausées laissés par les tests précédents)
+    # + un check réseau RÉEL (GET opencode.ai, timeout 5 s) qui flake sous
+    # charge — ni l'un ni l'autre ne sont l'objet du test (le montage de
+    # l'app, cf. commentaire d'origine). On fige les trois entrées.
+    monkeypatch.setattr(oc, "_health_cache", (time.monotonic(), True))
+    monkeypatch.setattr(oc, "_circuit_breakers", {})
+    monkeypatch.setattr(oc._key_pauser, "get_all_status", lambda: {})
 
     client = TestClient(app)
     # health is non-stream, but we test that app mounts correctly and SSE helpers exist

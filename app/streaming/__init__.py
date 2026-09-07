@@ -10,8 +10,15 @@ try:
     from opencode import _sse_keepalive as _sse_keepalive
 except ImportError:
 
-    def _sse_keepalive(gen):
-        yield from gen
+    async def _sse_keepalive(stream_gen, interval: float = 15.0):
+        """Repli sans opencode : pass-through (pas d'injection keepalive).
+
+        Même signature que l'original (mypy variants) ; le `yield from`
+        synchrone précédent était de toute façon cassé sur un générateur
+        asynchrone (TypeError au premier chunk).
+        """
+        async for chunk in stream_gen:
+            yield chunk
 
 
 __all__ = ["_sse_keepalive"]

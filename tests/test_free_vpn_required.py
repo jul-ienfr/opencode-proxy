@@ -17,12 +17,12 @@ back to paid) instead of silently opening a direct residential stream.
 """
 
 import pytest
-
-import opencode as oc
 from test_free_multi_attempt import (  # noqa: F401  (shared doubles)
     _Station,
     _StubVpn,
 )
+
+import opencode as oc
 
 
 class _PoolNoStations:

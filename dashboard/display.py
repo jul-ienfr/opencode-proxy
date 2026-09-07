@@ -17,7 +17,7 @@ from rich.table import Table
 
 import config.settings as _cfg_settings
 
-log_lines = collections.deque(maxlen=200)
+log_lines: collections.deque = collections.deque(maxlen=200)
 LOG_VISIBLE = 35
 _log_scroll = 0
 _display_dirty = True  # Flag: set True when token usage changes, False after rebuild
@@ -28,7 +28,7 @@ _debug_file_path = None
 _debug_write_counter = 0
 _DEBUG_FLUSH_INTERVAL = 10  # Flush to disk every N writes (reduces syscall overhead)
 _DEBUG_MAX_SIZE = 10 * 1024 * 1024  # Auto-rotate when file exceeds 10 MB
-_extra_handlers = []  # FileHandlers attached to module loggers (vpn_manager, free_ip_pool)
+_extra_handlers: list = []  # FileHandlers attached to module loggers (vpn_manager, free_ip_pool)
 
 
 def _rotate_debug_log():

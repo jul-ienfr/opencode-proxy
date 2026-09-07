@@ -76,3 +76,22 @@ logs/config-*.json
 
 # Kilo Code
 .kilo/
+
+# Hygiène locale : environnement Python égaré + launchers console
+# installés par erreur dans scripts/ + bottle.py vendored (dépendance de
+# pywebview, pas du proxy). Non versionnés ET exclus de la gate locale
+# (scripts/gate.ps1 : ruff/mypy scannent le dépôt).
+Lib/
+scripts/*.exe
+scripts/bottle.py
+scripts/pywin32_postinstall.py
+scripts/pywin32_testall.py
+# Captures de diagnostic free400 (transients, volumineuses)
+logs/free400_*.json
+# Dump d'audit ponctuel à la racine
+_audit_dump*.txt
+# Transients de la gate locale (logs/gate_pytest*.log déjà couverts par *.log)
+logs/gate_pytest.pid
+# Données de couverture (générées par `pytest --cov`, jamais versionnées)
+.coverage*
+coverage.xml

@@ -667,7 +667,11 @@ async def fetch_quotas(workspace_id: str, auth_cookie: str) -> dict:
                 await asyncio.sleep(1.5 * (2**attempt))
                 continue
             raise
-    raise last_err  # pragma: no cover — loop always returns or raises above
+    if last_err is not None:
+        raise last_err
+    # Inatteignable : la boucle retourne ou lève toujours (verdict mypy —
+    # `raise Optional` interdit). RuntimeError plutôt que TypeError si jamais.
+    raise RuntimeError("OpenCode Go request failed (no response).")  # pragma: no cover
 
 
 # ── API accessor ──

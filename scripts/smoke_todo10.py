@@ -22,7 +22,7 @@ class _StubVPN:
     status = "connected"
     current_server = None
     _quota_per_ip = 300
-    _ip_history = []
+    _ip_history: list = []
     socks5_url = "socks5://127.0.0.1:1080"
 
     def __init__(self, ip="1.2.3.4"):

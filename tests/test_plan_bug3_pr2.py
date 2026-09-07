@@ -1,14 +1,11 @@
 """Tests manquants du plan Bug #3 + PR2 — repro TTL asym, canary, cascade."""
 
-import asyncio
-import subprocess
 import time
 
 import pytest
-
-import vpn_manager as vm
 from test_vpn_freshness import FakeVPNManager, _cfg
 
+import vpn_manager as vm
 
 # ── helpers ──────────────────────────────────────────────────────────
 
@@ -108,7 +105,7 @@ async def test_canary_cache_invalidated_after_ov_to_wg_flip(tmp_path):
     clock = _Clock()
     m._now_fn = clock
     # need compose file for _apply_stack .env write
-    import tempfile, os
+    import os
     tmpdir = str(tmp_path)
     compose = os.path.join(tmpdir, "docker-compose.yml")
     open(compose, "w").write("services: {}")
@@ -141,7 +138,6 @@ async def test_wg_canary_disabled_bypasses_gate(tmp_path, caplog):
 @pytest.mark.asyncio
 async def test_httpcore_missing_logs_warning(tmp_path, caplog, monkeypatch):
     """httpcore[socks] absent -> warning + bypass (pas de faux positif)."""
-    m = _canary_mgr(tmp_path)
     # force ImportError for httpcore by patching __import__
     import builtins
     orig_import = builtins.__import__

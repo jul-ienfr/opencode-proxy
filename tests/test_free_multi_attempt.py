@@ -44,7 +44,6 @@ no DB write (free-usage logging no-op'd).
 
 import asyncio
 import json
-import time
 from contextlib import asynccontextmanager
 
 import pytest
@@ -769,7 +768,7 @@ def test_free_quota_exhausted_retry_after_type():
 class _FakeCurlSessionRaise:
     """curl_cffi AsyncSession double whose post() raises (dead tunnel)."""
 
-    created = []
+    created: list = []
 
     def __init__(self, **kwargs):
         self.kwargs = kwargs
@@ -784,7 +783,7 @@ class _FakeCurlSessionRaise:
 
 class _FakeStreamResp:
     status_code = 200
-    headers = {}
+    headers: dict = {}
 
     async def aclose(self):
         pass

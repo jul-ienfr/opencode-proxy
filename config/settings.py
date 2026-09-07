@@ -1638,6 +1638,7 @@ def maybe_reload_custom_routes():
     no extra dep (watchdog), negligible cost vs per-request stat; 5s coalesces bursts.
     """
     global _custom_routes_mtime, _custom_routes_last_check, _config_yaml_mtime
+    global _yaml_data
     global \
         SORTED_ROUTES, \
         SORTED_CUSTOM_ROUTES, \
@@ -1677,8 +1678,16 @@ def maybe_reload_custom_routes():
                     logging.warning("[config] reload config.yaml failed: %s", e)
                     new_yaml = None
                 if new_yaml is not None:
-                    _yaml_data.clear()
-                    _yaml_data.update(new_yaml)
+                    # [plan Lot 2] Torn-read fix : swap atomique de la
+                    # RÉFÉRENCE au lieu de clear()+update() in-place — les
+                    # lecteurs lock-free (yaml_get) voient soit l'ancien dict
+                    # complet soit le nouveau, jamais un état intermédiaire.
+                    # Les modules qui importent _yaml_data par nom le font au
+                    # niveau fonction (vpn_manager.get_config,
+                    # station_supervisor.warmup_excluded_requests) → rebinding
+                    # visible au prochain appel. Le reste du bloc reload
+                    # lit/écrit new_yaml déjà chargé — aucune relecture.
+                    _yaml_data = new_yaml
                     _config_yaml_mtime = cfg_mtime
                     # IP_ROTATION in-place (keep object identity)
                     new_ip = (

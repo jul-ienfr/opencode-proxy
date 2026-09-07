@@ -32,7 +32,7 @@ class _StubMgr:
     """Stand-in for the VPNManager instances the upscale/downscale branch
     creates (the real __init__/start would touch docker)."""
 
-    created = []
+    created: list = []
 
     def __init__(self, config, station, shared=None):
         self._station = station
