@@ -8593,28 +8593,33 @@ async def _execute_web_fetch(url: str, prompt: str = "", timeout: int = 15, max_
     # SSRF initial - budgeted via outer wait_for, no inner wait_for
     if not await _is_safe_fetch_url(url):
         raise ValueError(f"SSRF rejected: {url}")
-    proxy = get_socks5_proxy_url() if via_vpn else None
+    # [plan-perf Lot 1] Client partagé par rôle : plus de handshake TLS /
+    # pool par fetch. follow_redirects + timeout restent PAR REQUÊTE
+    # (httpx 0.28), boucle de redirection + re-validation SSRF INCHANGÉES.
+    # Rôle tunnel = URL SOCKS du pool/station active (cf. _role_tunnel_url),
+    # comme les probes déjà migrées — jamais de client jetable ici.
+    _role = "tunnel" if via_vpn else "direct"
+    c = _role_client(_role)
     async with FETCH_SEM:
-        async with httpx.AsyncClient(follow_redirects=False, timeout=timeout, proxy=proxy) as c:
-            r = await c.get(url, headers={"User-Agent": "opencode-proxy/1.0"})
-            for _ in range(3):
-                if r.status_code in (301, 302, 303, 307, 308):
-                    loc = r.headers.get("location", "")
-                    nxt = urllib.parse.urljoin(url, loc)
-                    if not loc or not await _is_safe_fetch_url(nxt):
-                        raise ValueError(f"SSRF redirect rejected: {loc}")
-                    url = nxt
-                    r = await c.get(url, headers={"User-Agent": "opencode-proxy/1.0"})
-                else:
-                    break
-            # R4 guards
-            ct = r.headers.get("content-type", "").split(";")[0].strip().lower()
-            if ct and not (ct.startswith("text/") or "json" in ct or "xml" in ct):
-                raise ValueError(f"Rejected Content-Type: {ct}")
-            if int(r.headers.get("content-length", "0") or 0) > 5_000_000 or len(r.content) > 5_000_000:
-                raise ValueError("Content too large")
-            r.raise_for_status()
-            html = r.text[: max_bytes * 3]
+        r = await c.get(url, headers={"User-Agent": "opencode-proxy/1.0"}, follow_redirects=False, timeout=timeout)
+        for _ in range(3):
+            if r.status_code in (301, 302, 303, 307, 308):
+                loc = r.headers.get("location", "")
+                nxt = urllib.parse.urljoin(url, loc)
+                if not loc or not await _is_safe_fetch_url(nxt):
+                    raise ValueError(f"SSRF redirect rejected: {loc}")
+                url = nxt
+                r = await c.get(url, headers={"User-Agent": "opencode-proxy/1.0"}, follow_redirects=False, timeout=timeout)
+            else:
+                break
+        # R4 guards
+        ct = r.headers.get("content-type", "").split(";")[0].strip().lower()
+        if ct and not (ct.startswith("text/") or "json" in ct or "xml" in ct):
+            raise ValueError(f"Rejected Content-Type: {ct}")
+        if int(r.headers.get("content-length", "0") or 0) > 5_000_000 or len(r.content) > 5_000_000:
+            raise ValueError("Content too large")
+        r.raise_for_status()
+        html = r.text[: max_bytes * 3]
     # extraction to_thread
     try:
         import trafilatura

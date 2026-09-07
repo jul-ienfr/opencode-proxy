@@ -1310,20 +1310,20 @@ class TestWebSearchWebFetch:
             def raise_for_status(self):
                 pass
 
-        class FakeClient:
-            def __init__(self, *a, **kw):
-                pass
+        class FakeSharedClient:
+            """Double du client partagé _role_client (pas de context manager,
+            get() direct — même forme que httpx.AsyncClient partagé)."""
 
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, *a):
-                pass
-
-            async def get(self, url, headers=None):
+            async def get(self, url, headers=None, follow_redirects=False, timeout=None):
+                assert follow_redirects is False, "SSRF: pas de redirection auto"
                 return FakeResp()
 
-        monkeypatch.setattr(m.httpx, "AsyncClient", FakeClient)
+        def fake_role(role="direct"):
+            # via_vpn=False -> rôle direct (jamais de proxy SOCKS)
+            assert role == "direct", f"rôle inattendu: {role}"
+            return FakeSharedClient()
+
+        monkeypatch.setattr(m, "_role_client", fake_role)
         try:
             await m._execute_web_fetch("https://example.com", "", timeout=5, max_bytes=12000, via_vpn=False)
             assert False, "should reject content-type"
