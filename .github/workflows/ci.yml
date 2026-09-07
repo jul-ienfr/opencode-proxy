@@ -40,8 +40,8 @@ jobs:
         run: mypy . --ignore-missing-imports
         continue-on-error: true
       - name: Tests with coverage
-        run: pytest -q --cov --cov-report=term-missing --cov-fail-under=35
-        # Phase1 gate 35% (current 39%), Phase2 → 60, Phase3 → 75
+        run: pytest -q --cov --cov-report=term-missing --cov-fail-under=45
+        # Palier Lot 3 plan-perf (mesuré ~50%) — synchronisé avec scripts/gate.ps1
       - name: pip-audit
         run: pip-audit --desc --local
       # [SEC-1 résolu 26/08] historique purgé (filter-repo + rotation) :

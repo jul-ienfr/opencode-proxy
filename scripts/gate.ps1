@@ -4,7 +4,8 @@
 # Exécute dans l'ordre, arrêt au premier échec :
 #   1. ruff check
 #   2. mypy
-#   3. pytest -k "not docker" --cov=. --cov-fail-under=35
+#   3. pytest -k "not docker" --cov=. --cov-fail-under=45   (palier Lot 3,
+#      mesuré 49.9 — voir plan-perf-fiabilite-6stations)
 #   4. python scripts/bench_perf.py --json --fail-threshold 20
 #   5. pip-audit -r requirements.txt   (scopé aux dépendances du PROJET :
 #      `pip-audit` nu audite tout l'interpréteur système — 266 vulns
@@ -40,7 +41,7 @@ Step "ruff"   { ruff check . }
 if ($script:failed) { exit 1 }
 Step "mypy"   { mypy . }
 if ($script:failed) { exit 1 }
-Step "pytest" { python -m pytest -k "not docker" --cov=. --cov-fail-under=35 }
+Step "pytest" { python -m pytest -k "not docker" --cov=. --cov-fail-under=45 }
 if ($script:failed) { exit 1 }
 Step "bench"  { python scripts/bench_perf.py --json --fail-threshold 20 }
 if ($script:failed) { exit 1 }
