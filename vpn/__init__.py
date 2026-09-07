@@ -1,34 +1,37 @@
 """
-vpn — boundaries unifiées (Phase3 P3.2)
+vpn — boundaries unifiées.
 
 Regroupe les modules dispersés:
-- vpn_manager.py (3903l) — VPNManager, station 1..10, docker compose, control server
-- free_ip_pool.py (1410l) — FreeIPPool, per-IP cooldown, 429 handling, station usable
-- shared_rotation.py (378l) — SharedRotationState (shared_rotation.json recent-IP cursors)
+- vpn/manager.py (domicile canonique Phase 6 — ex-vpn_manager.py) :
+  VPNManager, stations 1..10, docker compose, control server
+- free/pool.py (domicile canonique Phase 6 — ex-free_ip_pool.py) :
+  FreeIPPool, per-IP cooldown, 429 handling, station usable
+- free/rotation.py (domicile canonique Phase 6 — ex-shared+latency) :
+  SharedRotationState (shared_rotation.json recent-IP cursors)
 - shared_state.py — registre cross-module des managers (évite import cycle)
-- traffic_capture.py (493l) — ring 500/32MiB pure-ASGI
-- server_scorer.py — scoring NordVPN
-- nordvpn_api.py — API NordVPN
-- docker_events.py — docker events wake-up watchdog
 
-Extraction progressive: chaque module garde son fichier à la racine pour compat
-`import vpn_manager` / `import free_ip_pool` etc, mais `vpn` est le package
-canonique pour les nouveaux imports (`from vpn import VPNManager`).
-
-P3.2 final: déplacer les fichiers dans vpn/ et faire les racines re-exporter:
-  vpn/manager.py, vpn/pool.py, vpn/shared.py, vpn/capture.py, etc.
+[Phase 6 refonte — chantier 3] Façade PARESSEUSE (PEP 562) : AUCUN import
+au chargement du package. Les importations eager précédentes
+(``from vpn_manager import …`` au top-level) créaient un cycle fatal avec
+le shim ``vpn_manager.py`` (``config/settings.py`` → ``vpn_manager`` →
+``vpn`` → ``free`` → ``vpn_manager`` partiel → ImportError). L'accès
+``vpn.VPNManager`` résout vers le canonique À L'USAGE (mêmes objets).
 """
 
-from shared_rotation import SharedRotationState as SharedRotationState
-
-try:
-    from vpn_manager import VPNManager as VPNManager
-except ImportError:
-    VPNManager = None  # type: ignore
-
-try:
-    from free_ip_pool import FreeIPPool as FreeIPPool
-except ImportError:
-    FreeIPPool = None  # type: ignore
-
 __all__ = ["SharedRotationState", "VPNManager", "FreeIPPool"]
+
+
+def __getattr__(name: str):
+    if name == "VPNManager":
+        from vpn.manager import VPNManager as _VM
+
+        return _VM
+    if name == "FreeIPPool":
+        from free.pool import FreeIPPool as _FP
+
+        return _FP
+    if name == "SharedRotationState":
+        from free.rotation import SharedRotationState as _SR
+
+        return _SR
+    raise AttributeError(f"module 'vpn' has no attribute {name!r}")

@@ -61,7 +61,7 @@ from config import (
 # P2 geo: dynamic GEO_ENABLED via settings (hot-reload), base resolver alias
 
 try:
-    from vpn_manager import _normalize_country as _vpn_normalize_country
+    from vpn.manager import _normalize_country as _vpn_normalize_country
 except ImportError:
 
     def _vpn_normalize_country(n: str) -> str:  # type: ignore[misc]
@@ -72,7 +72,7 @@ except ImportError:
 try:
     # n'existe pas (encore) dans vpn_manager : le fallback local plus bas
     # (PROXY_FALLBACK) est le chemin réellement actif.
-    from vpn_manager import get_socks5_proxy_url  # type: ignore[attr-defined]
+    from vpn.manager import get_socks5_proxy_url  # type: ignore[attr-defined]
 except ImportError:
     try:
         from config import PROXY as _PROXY_FALLBACK
@@ -1515,6 +1515,11 @@ async def _apply_station_count(new_n: int) -> None:
                 except Exception as e:
                     _debug(f"  [vpn] idempotent start failed: {e}")
             return
+        # [Phase 6] chemin HISTORIQUE (shim) volontaire : les tests patchent
+        # vpn_manager.VPNManager (stub) — une résolution via le canonique
+        # rendrait le patch invisible. Règle : les imports PAR APPEL passent
+        # par les shims (visibilité patch identique pré-refonte) ; seuls les
+        # imports top-level (1×) utilisent les chemins canoniques.
         from vpn_manager import VPNManager
 
         if new_n > old_n:
@@ -1764,6 +1769,7 @@ async def lifespan(app):
     # User request: if Docker Desktop is not running after a reboot, the proxy
     # must launch it — otherwise 5 stations stay `disconnected`.
     try:
+        # [Phase 6] chemin historique (shim) : import par appel.
         from vpn_manager import ensure_docker_running
 
         ok = await asyncio.wait_for(ensure_docker_running(timeout=60), timeout=65)
@@ -1811,6 +1817,10 @@ async def lifespan(app):
 
     # ── VPN / IP rotation for free models ──
     import shared_state
+
+    # [Phase 6] chemins HISTORIQUES (shims) volontaires : le lifespan
+    # ré-exécute à chaque redémarrage in-process et les tests patchent ces
+    # namespaces (ex. vpn_manager.VPNManager stubbé) — voir règle § _apply_station_count.
     from free_ip_pool import FreeIPPool
     from shared_rotation import SharedRotationState
     from vpn_manager import VPNManager
@@ -1884,6 +1894,7 @@ async def lifespan(app):
     # (a broken docker daemon must not block boot — start() handles it).
     try:
         global _RECONCILE_DONE_THIS_PROCESS
+        # [Phase 6] chemin historique (shim) : import par appel.
         from vpn_manager import reconcile_orphan_containers
 
         if _RECONCILE_DONE_THIS_PROCESS:
@@ -3627,7 +3638,7 @@ async def _forward_post(endpoint, json, headers):
 # full supported-impersonation list so the httpx fallback paths stay
 # coherent with the curl_cffi bundles). Re-exported here: _apply_identity
 # reads it, and tests reference oc._UA_BY_IMPERSONATE.
-from vpn_manager import _UA_BY_IMPERSONATE  # noqa: E402  # after identity docstring (lazy import avoids circular)
+from vpn.manager import _UA_BY_IMPERSONATE  # noqa: E402  # after identity docstring (lazy import avoids circular)
 
 
 def _current_free_identity(station=None) -> dict:

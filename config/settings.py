@@ -21,7 +21,7 @@ from config import geo as _geo_mod  # noqa: E402
 _CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
 
 try:
-    from vpn_manager import (
+    from vpn.manager import (
         _normalize_country as _vpn_normalize_country,
     )  # single source (no duplication)
 except ImportError:

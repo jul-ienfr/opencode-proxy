@@ -19,7 +19,7 @@ ignore = ["E501", "B007", "B905", "B011", "C401", "E741", "B023", "UP031"]
 "tests/test_no_valid_keys_guard.py" = ["F811"]
 
 [tool.ruff.lint.isort]
-known-first-party = ["app", "config", "dashboard", "free_discovery", "vpn", "vpn_manager", "free_ip_pool", "shared_rotation", "shared_state", "traffic_capture", "docker_events", "protocol_mapping", "server", "observability", "upstream", "core"]
+known-first-party = ["app", "config", "dashboard", "free_discovery", "vpn", "vpn_manager", "free_ip_pool", "shared_rotation", "shared_state", "traffic_capture", "docker_events", "protocol_mapping", "server", "observability", "upstream", "core", "free"]
 known-third-party = ["fastapi", "httpx", "uvicorn", "rich", "yaml", "pydantic"]
 
 [tool.ruff.format]
