@@ -40,9 +40,19 @@ from pathlib import Path
 
 SKIP_SUBTREES = {"models", "custom_routes", "free_model_map"}
 SKIP_DIRS = {
-    "docs", "scripts", ".git", ".venv", "venv", "Lib",
-    "__pycache__", ".mypy_cache", ".ruff_cache", ".pytest_cache",
-    ".kilo", "logs", "node_modules",
+    "docs",
+    "scripts",
+    ".git",
+    ".venv",
+    "venv",
+    "Lib",
+    "__pycache__",
+    ".mypy_cache",
+    ".ruff_cache",
+    ".pytest_cache",
+    ".kilo",
+    "logs",
+    "node_modules",
 }  # NOTE : "tests" volontairement ABSENT (filtre tests_only ci-dessous).
 
 
@@ -78,8 +88,20 @@ def leaf_of(dotted: str) -> str:
 # Feuilles trop génériques pour une recherche par mot : on cherche le
 # PARENT (le knob, ex. "bad_ttl_by_cause") au lieu de la feuille ("auth").
 GENERIC_LEAVES = {
-    "auth", "tls", "mode", "enabled", "timeout", "window", "interval",
-    "retries", "key", "port", "host", "ttl", "delay", "limit",
+    "auth",
+    "tls",
+    "mode",
+    "enabled",
+    "timeout",
+    "window",
+    "interval",
+    "retries",
+    "key",
+    "port",
+    "host",
+    "ttl",
+    "delay",
+    "limit",
 }
 
 
@@ -157,10 +179,10 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--config", default="config.yaml")
     ap.add_argument("--root", default=".")
-    ap.add_argument("--strict", action="store_true",
-                    help="exit 1 si ≥ 1 clé MORTE")
-    ap.add_argument("--baseline", default=None,
-                    help="JSON {morte_connue|legacy: [...]} : exit 1 si MORTE hors baseline")
+    ap.add_argument("--strict", action="store_true", help="exit 1 si ≥ 1 clé MORTE")
+    ap.add_argument(
+        "--baseline", default=None, help="JSON {morte_connue|legacy: [...]} : exit 1 si MORTE hors baseline"
+    )
     args = ap.parse_args(argv)
     root = Path(args.root)
     rows, _ = analyze(Path(args.config), root)

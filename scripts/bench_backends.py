@@ -47,8 +47,7 @@ AUTH_SIG = re.compile(r"AUTH_FAILED|Session.?Limit|ConnectionLimitReached|too ma
 
 def sh(args, timeout=60):
     try:
-        r = subprocess.run(args, capture_output=True, text=True, timeout=timeout,
-                           errors="replace", cwd=REPO)
+        r = subprocess.run(args, capture_output=True, text=True, timeout=timeout, errors="replace", cwd=REPO)
         return r.returncode, (r.stdout or "") + (r.stderr or "")
     except subprocess.TimeoutExpired as e:
         out = (e.stdout or b"").decode("utf-8", "replace") if isinstance(e.stdout, bytes) else (e.stdout or "")
@@ -128,9 +127,18 @@ def docker_logs(name, tail=60):
 
 def exec_probe(name):
     """(ip_ok, dns_ok, ip) via wget dans le conteneur."""
-    _, out = sh(["docker", "exec", name, "sh", "-c",
-                 "wget -q -O - -T 8 http://api.ipify.org; echo; "
-                 "wget -q -O /dev/null -T 5 http://1.1.1.1 && echo IP_OK || echo IP_KO"], 40)
+    _, out = sh(
+        [
+            "docker",
+            "exec",
+            name,
+            "sh",
+            "-c",
+            "wget -q -O - -T 8 http://api.ipify.org; echo; "
+            "wget -q -O /dev/null -T 5 http://1.1.1.1 && echo IP_OK || echo IP_KO",
+        ],
+        40,
+    )
     ip = ""
     for line in out.splitlines():
         line = line.strip()
@@ -140,8 +148,9 @@ def exec_probe(name):
 
 
 def host_socks(port):
-    rc, out = sh(["curl.exe", "-s", "--max-time", "10", "--socks5-hostname",
-                  f"127.0.0.1:{port}", "http://api.ipify.org"], 30)
+    rc, out = sh(
+        ["curl.exe", "-s", "--max-time", "10", "--socks5-hostname", f"127.0.0.1:{port}", "http://api.ipify.org"], 30
+    )
     ip = out.strip().splitlines()[0] if out.strip() else ""
     ok = bool(re.fullmatch(r"[0-9a-fA-F.:]+", ip or "") and "." in (ip or ""))
     return ok, ip
@@ -220,17 +229,32 @@ def poll_egress(name, tries=9, interval=10):
 
 # ── Runners (un par backend) : dict résultat partiel ─────────────
 
+
 def run_nordlynx_key(sec, tag):
     """bubuntux/nordlynx — WG clé, 0 AUTH."""
     name = f"bench-{tag}"
-    env = write_envfile({
-        "PRIVATE_KEY": sec["WIREGUARD_PRIVATE_KEY"],
-        "QUERY": r"filters\[country_id\]=153",
-        "NET_LOCAL": "192.168.0.0/16,10.0.0.0/8,172.16.0.0/12",
-    })
+    env = write_envfile(
+        {
+            "PRIVATE_KEY": sec["WIREGUARD_PRIVATE_KEY"],
+            "QUERY": r"filters\[country_id\]=153",
+            "NET_LOCAL": "192.168.0.0/16,10.0.0.0/8,172.16.0.0/12",
+        }
+    )
     try:
-        rc, _ = sh(["docker", "run", "-d", "--name", name, "--cap-add=NET_ADMIN",
-                    "--env-file", env, "ghcr.io/bubuntux/nordlynx:latest"], 60)
+        rc, _ = sh(
+            [
+                "docker",
+                "run",
+                "-d",
+                "--name",
+                name,
+                "--cap-add=NET_ADMIN",
+                "--env-file",
+                env,
+                "ghcr.io/bubuntux/nordlynx:latest",
+            ],
+            60,
+        )
         if rc != 0:
             return _fail(name, "run-failed")
         ok, dur = wait_marker(name, "Connected!", 150)
@@ -239,12 +263,16 @@ def run_nordlynx_key(sec, tag):
         server = log_server(name)
         ip_ok, dns_ok, ip, t_egr = poll_egress(name)
         if ip_ok and dns_ok:
-            return {"ok": True, "t_connect": dur,
-                    "t_egress": t_egr, "server": server,
-                    "egress_ip": ip, "dns": dns_ok, "reason": ""}
-        return _fail(name, "no-egress-90s", t_connect=dur,
-                     t_egress=t_egr, server=server,
-                     egress_ip=ip, dns=dns_ok)
+            return {
+                "ok": True,
+                "t_connect": dur,
+                "t_egress": t_egr,
+                "server": server,
+                "egress_ip": ip,
+                "dns": dns_ok,
+                "reason": "",
+            }
+        return _fail(name, "no-egress-90s", t_connect=dur, t_egress=t_egr, server=server, egress_ip=ip, dns=dns_ok)
     finally:
         rm_container(name)
         shred(env)
@@ -253,16 +281,33 @@ def run_nordlynx_key(sec, tag):
 def run_nordlynx_proxy(sec, tag):
     """edgd1er/nordlynx-proxy — WG client officiel, login TOKEN."""
     name = f"bench-{tag}"
-    env = write_envfile({
-        "NORDVPN_TOKEN": sec["NORDVPN_TOKEN"],
-        "CONNECT": "Netherlands",
-        "GROUP": "P2P",
-    })
+    env = write_envfile(
+        {
+            "NORDVPN_TOKEN": sec["NORDVPN_TOKEN"],
+            "CONNECT": "Netherlands",
+            "GROUP": "P2P",
+        }
+    )
     try:
-        rc, _ = sh(["docker", "run", "-d", "--name", name, "--privileged",
-                    "--device=/dev/net/tun", "--env-file", env,
-                    "-p", "127.0.0.1:1191:1080", "-p", "127.0.0.1:8991:8888",
-                    "edgd1er/nordlynx-proxy:latest"], 60)
+        rc, _ = sh(
+            [
+                "docker",
+                "run",
+                "-d",
+                "--name",
+                name,
+                "--privileged",
+                "--device=/dev/net/tun",
+                "--env-file",
+                env,
+                "-p",
+                "127.0.0.1:1191:1080",
+                "-p",
+                "127.0.0.1:8991:8888",
+                "edgd1er/nordlynx-proxy:latest",
+            ],
+            60,
+        )
         if rc != 0:
             return _fail(name, "run-failed")
         ok_login, d_login = wait_marker(name, "logged in", 120)
@@ -270,8 +315,7 @@ def run_nordlynx_proxy(sec, tag):
             return _fail(name, "no-login-timeout", t_login=d_login)
         ok, dur = wait_marker(name, "You are connected to", 240)
         if not ok:
-            return _fail(name, "no-connected-timeout",
-                         t_login=d_login, t_connect=dur)
+            return _fail(name, "no-connected-timeout", t_login=d_login, t_connect=dur)
         t_end = None
         ok_end, d_end = wait_marker(name, "END:", 90)
         if ok_end:
@@ -281,13 +325,28 @@ def run_nordlynx_proxy(sec, tag):
         h_ok, h_ip = host_http(8991)
         good = ip_ok and dns_ok and s_ok and h_ok
         if good:
-            return {"ok": True, "t_login": d_login,
-                    "t_connect": round(d_login + dur, 1), "t_end": t_end,
-                    "egress_ip": ip,
-                    "dns": dns_ok, "socks": s_ok, "http": h_ok, "reason": ""}
-        return _fail(name, "proxy-or-egress-ko", t_login=d_login,
-                     t_connect=round(d_login + dur, 1), t_end=t_end,
-                     egress_ip=ip, dns=dns_ok, socks=s_ok, http=h_ok)
+            return {
+                "ok": True,
+                "t_login": d_login,
+                "t_connect": round(d_login + dur, 1),
+                "t_end": t_end,
+                "egress_ip": ip,
+                "dns": dns_ok,
+                "socks": s_ok,
+                "http": h_ok,
+                "reason": "",
+            }
+        return _fail(
+            name,
+            "proxy-or-egress-ko",
+            t_login=d_login,
+            t_connect=round(d_login + dur, 1),
+            t_end=t_end,
+            egress_ip=ip,
+            dns=dns_ok,
+            socks=s_ok,
+            http=h_ok,
+        )
     finally:
         sh(["docker", "exec", name, "nordvpn", "disconnect"], 25)
         rm_container(name)
@@ -303,16 +362,30 @@ def run_bubuntux_nordvpn(sec, tag):
     import re as _re
 
     name = f"bench-{tag}"
-    env = write_envfile({
-        "TOKEN": sec["NORDVPN_TOKEN"],
-        "CONNECT": "Netherlands",
-        "TECHNOLOGY": "NordLynx",
-    })
+    env = write_envfile(
+        {
+            "TOKEN": sec["NORDVPN_TOKEN"],
+            "CONNECT": "Netherlands",
+            "TECHNOLOGY": "NordLynx",
+        }
+    )
     try:
-        rc, _ = sh(["docker", "run", "-d", "--name", name,
-                    "--cap-add=NET_ADMIN", "--cap-add=NET_RAW",
-                    "--device=/dev/net/tun", "--env-file", env,
-                    "bubuntux/nordvpn:latest"], 60)
+        rc, _ = sh(
+            [
+                "docker",
+                "run",
+                "-d",
+                "--name",
+                name,
+                "--cap-add=NET_ADMIN",
+                "--cap-add=NET_RAW",
+                "--device=/dev/net/tun",
+                "--env-file",
+                env,
+                "bubuntux/nordvpn:latest",
+            ],
+            60,
+        )
         if rc != 0:
             return _fail(name, "run-failed")
         ok_login, d_login = wait_marker(name, "Welcome to NordVPN", 120)
@@ -321,8 +394,7 @@ def run_bubuntux_nordvpn(sec, tag):
             d_login = None
         ok, dur = wait_marker(name, "You are connected to", 240)
         if not ok:
-            return _fail(name, "no-connected-timeout",
-                         t_login=d_login, t_connect=dur)
+            return _fail(name, "no-connected-timeout", t_login=d_login, t_connect=dur)
         rc, out = sh(["docker", "exec", name, "nordvpn", "status"], 30)
         ip = country = ""
         m = _re.search(r"IP:\s*([0-9a-fA-F.:]+)", out)
@@ -333,30 +405,59 @@ def run_bubuntux_nordvpn(sec, tag):
             country = m.group(1).strip()
         good = bool(ip)
         if good:
-            return {"ok": True, "t_login": d_login,
-                    "t_connect": round((d_login or 0) + dur, 1),
-                    "egress_ip": ip, "country": country, "reason": ""}
-        return _fail(name, "no-ip-in-status", t_login=d_login,
-                     t_connect=round((d_login or 0) + dur, 1),
-                     egress_ip=ip, country=country)
+            return {
+                "ok": True,
+                "t_login": d_login,
+                "t_connect": round((d_login or 0) + dur, 1),
+                "egress_ip": ip,
+                "country": country,
+                "reason": "",
+            }
+        return _fail(
+            name,
+            "no-ip-in-status",
+            t_login=d_login,
+            t_connect=round((d_login or 0) + dur, 1),
+            egress_ip=ip,
+            country=country,
+        )
     finally:
         sh(["docker", "exec", name, "nordvpn", "logout"], 25)
         rm_container(name)
         shred(env)
+
+
 def run_nordvpn_proxy(sec, tag):
     """edgd1er/nordvpn-proxy — OV, service creds, 1 AUTH."""
     name = f"bench-{tag}"
-    env = write_envfile({
-        "NORDVPN_USER": sec["OPENVPN_USER"],
-        "NORDVPN_PASS": sec["OPENVPN_PASSWORD"],
-        "NORDVPN_COUNTRY": "Netherlands",
-        "NORDVPN_PROTOCOL": "tcp",
-    })
+    env = write_envfile(
+        {
+            "NORDVPN_USER": sec["OPENVPN_USER"],
+            "NORDVPN_PASS": sec["OPENVPN_PASSWORD"],
+            "NORDVPN_COUNTRY": "Netherlands",
+            "NORDVPN_PROTOCOL": "tcp",
+        }
+    )
     try:
-        rc, _ = sh(["docker", "run", "-d", "--name", name, "--cap-add=NET_ADMIN",
-                    "--device=/dev/net/tun", "--env-file", env,
-                    "-p", "127.0.0.1:1191:1080", "-p", "127.0.0.1:8991:8888",
-                    "edgd1er/nordvpn-proxy:latest"], 60)
+        rc, _ = sh(
+            [
+                "docker",
+                "run",
+                "-d",
+                "--name",
+                name,
+                "--cap-add=NET_ADMIN",
+                "--device=/dev/net/tun",
+                "--env-file",
+                env,
+                "-p",
+                "127.0.0.1:1191:1080",
+                "-p",
+                "127.0.0.1:8991:8888",
+                "edgd1er/nordvpn-proxy:latest",
+            ],
+            60,
+        )
         if rc != 0:
             return _fail(name, "run-failed")
         ok, dur = wait_marker(name, "END:", 240)
@@ -367,10 +468,16 @@ def run_nordvpn_proxy(sec, tag):
         h_ok, _ = host_http(8991)
         good = ip_ok and dns_ok and s_ok and h_ok
         if good:
-            return {"ok": True, "t_connect": dur, "egress_ip": ip,
-                    "dns": dns_ok, "socks": s_ok, "http": h_ok, "reason": ""}
-        return _fail(name, "proxy-or-egress-ko", t_connect=dur,
-                     egress_ip=ip, dns=dns_ok, socks=s_ok, http=h_ok)
+            return {
+                "ok": True,
+                "t_connect": dur,
+                "egress_ip": ip,
+                "dns": dns_ok,
+                "socks": s_ok,
+                "http": h_ok,
+                "reason": "",
+            }
+        return _fail(name, "proxy-or-egress-ko", t_connect=dur, egress_ip=ip, dns=dns_ok, socks=s_ok, http=h_ok)
     finally:
         rm_container(name)
         shred(env)
@@ -429,9 +536,13 @@ def main(argv=None):
             random.Random(args.seed + rnd).shuffle(order)
             for b in order:
                 image, is_ov, runner = BACKENDS[b]
-                rec = {"ts": dt.datetime.now(dt.UTC).isoformat(),
-                       "backend": b, "round": rnd, "image": image,
-                       "digest": digests.get(b, "")}
+                rec = {
+                    "ts": dt.datetime.now(dt.UTC).isoformat(),
+                    "backend": b,
+                    "round": rnd,
+                    "image": image,
+                    "digest": digests.get(b, ""),
+                }
                 if is_ov:
                     auth_n = fleet_auth_count()
                     rec["fleet_auth_10min"] = auth_n
@@ -459,8 +570,7 @@ def main(argv=None):
                     rec["verdict"] = classify(tag, res)
                 out.write(json.dumps(rec) + "\n")
                 out.flush()
-                print(f"[{b} r{rnd}] {rec['verdict']} {res.get('reason', '')} "
-                      f"({rec['duration_s']}s)", flush=True)
+                print(f"[{b} r{rnd}] {rec['verdict']} {res.get('reason', '')} ({rec['duration_s']}s)", flush=True)
                 n += 1
                 time.sleep(args.gap_ov if is_ov else args.gap)
     print(f"{n} runs, résultats dans {args.out}")

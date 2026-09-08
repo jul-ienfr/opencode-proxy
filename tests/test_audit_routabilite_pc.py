@@ -43,9 +43,7 @@ def _gcfg(tmp_path, **over):
         "switch_delay": 0,
         "identity_rotation": True,
         "identity_diversity": False,
-        "identity_profiles": [
-            {"impersonate": "chrome131", "user_agent": None, "extra_headers": {}}
-        ],
+        "identity_profiles": [{"impersonate": "chrome131", "user_agent": None, "extra_headers": {}}],
         "watchdog_backoff_base": 15.0,
         "watchdog_backoff_max": 60.0,
         "auto_wg_egress_ticks": 3,
@@ -172,9 +170,7 @@ async def test_pc2_public_restart_counts_budget(tmp_path):
 
 
 def test_pc3_decide_action_matrix(tmp_path):
-    mgr = FakeVPNManager(
-        _pc_cfg(tmp_path, watchdog_auth_grace_s=240), tmp_path=tmp_path
-    )
+    mgr = FakeVPNManager(_pc_cfg(tmp_path, watchdog_auth_grace_s=240), tmp_path=tmp_path)
     # Voie non-AUTH sans budget consommé → restart.
     mgr._auth_failed = False
     assert mgr._decide_watchdog_action("TLS negotiation timeout")[0] == "restart"
@@ -191,9 +187,7 @@ def test_pc3_decide_action_matrix(tmp_path):
     mgr._auth_cool_until = mgr._now_fn() + 50.0
     assert mgr._decide_watchdog_action("AUTH_FAILED")[0] == "auth-cooling"
     # Budget épuisé (voie non-AUTH) → budget-exhausted.
-    mgr2 = FakeVPNManager(
-        _pc_cfg(tmp_path, watchdog_max_restarts_per_hour=3), tmp_path=tmp_path
-    )
+    mgr2 = FakeVPNManager(_pc_cfg(tmp_path, watchdog_max_restarts_per_hour=3), tmp_path=tmp_path)
     now = mgr2._now_fn()
     mgr2._watchdog_restarts_1h = [now - 10.0, now - 20.0, now - 30.0]
     assert mgr2._decide_watchdog_action("egress dead")[0] == "budget-exhausted"
@@ -216,11 +210,7 @@ async def test_pc3_single_decision_cooling_no_restart(tmp_path, caplog):
     assert mgr.calls["restart"] == 0
     assert mgr.calls["compose_up"] == 0
     assert mgr._watchdog_last_action == "auth-cooling"
-    wd = [
-        r
-        for r in caplog.records
-        if r.name == "vpn_manager" and "[vpn-watchdog]" in r.getMessage()
-    ]
+    wd = [r for r in caplog.records if r.name == "vpn_manager" and "[vpn-watchdog]" in r.getMessage()]
     assert len(wd) == 1, [r.getMessage() for r in wd]
     assert "restarting" not in caplog.text
 
@@ -287,10 +277,7 @@ def test_pc5_spread_off_is_historic(monkeypatch):
             "muse-spark-1.3-contributor",
             "muse-spark-1.3-contributor-free",
         )
-        assert (
-            oc._resolve_free_model("muse-spark-1.3-contributor")
-            == "muse-spark-1.3-contributor-free"
-        )
+        assert oc._resolve_free_model("muse-spark-1.3-contributor") == "muse-spark-1.3-contributor-free"
         assert oc._resolve_free_model("no-such-model") is None
     finally:
         oc._free_model_rr.clear()
@@ -371,9 +358,7 @@ async def test_pc15_heartbeat_every_5min(tmp_path, caplog):
     mgr._now_fn = lambda: 1400.0  # type: ignore[method-assign]
     with caplog.at_level(logging.INFO, logger="vpn_manager"):
         await mgr._watchdog_tick()
-    assert (
-        len([r for r in caplog.records if "[watchdog] hb" in r.getMessage()]) == 1
-    )
+    assert len([r for r in caplog.records if "[watchdog] hb" in r.getMessage()]) == 1
 
 
 # ── PC-7 : canari indéterminé (F3/H7) ───────────────────────────
@@ -438,9 +423,7 @@ def test_pc11_assigned_country_deterministic(tmp_path):
 
 
 def test_pc11_perimeter_helper(tmp_path):
-    mgr = GraceFake(
-        _gcfg(tmp_path, server_countries="Germany,Netherlands"), tmp_path
-    )
+    mgr = GraceFake(_gcfg(tmp_path, server_countries="Germany,Netherlands"), tmp_path)
     assert mgr._country_in_perimeter("Germany") is True
     assert mgr._country_in_perimeter("Brazil") is False
     assert mgr._country_in_perimeter("") is False
@@ -504,9 +487,7 @@ def test_pc14_analyze_statuses(tmp_path, monkeypatch):
     (root / "tests").mkdir()
     (root / "pkg" / "code.py").write_text('X = cfg.get("live_key")\n', encoding="utf-8")
     (root / "pkg" / "code2.py").write_text('Y = cfg.get("partial_key")\n', encoding="utf-8")
-    (root / "tests" / "test_a.py").write_text(
-        'def test_x():\n    assert "live_key"\n', encoding="utf-8"
-    )
+    (root / "tests" / "test_a.py").write_text('def test_x():\n    assert "live_key"\n', encoding="utf-8")
     cfg = root / "config.yaml"
     cfg.write_text("live_key: 1\npartial_key: 2\ndead_key: 3\n", encoding="utf-8")
     rows, _ = cc.analyze(cfg, root)
@@ -573,11 +554,7 @@ def test_pc13_no_duplicate_log_lines(tmp_path):
         disp.attach_module_logger("vpn_manager")
         for i in range(3):
             logger.warning(f"[vpn-watchdog] pc13-nodup line {i}")
-        lines = [
-            l
-            for l in logfile.read_text(encoding="utf-8").splitlines()
-            if "pc13-nodup" in l
-        ]
+        lines = [l for l in logfile.read_text(encoding="utf-8").splitlines() if "pc13-nodup" in l]
         assert len(lines) == 3
         for l in lines:
             assert re.match(r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}Z\]", l), l
@@ -615,11 +592,7 @@ def test_pc13_attach_is_idempotent(tmp_path):
         fh2 = disp.attach_module_logger("vpn_manager")
         assert fh2 is fh1
         logger.warning("pc13-idem line")
-        lines = [
-            l
-            for l in logfile.read_text(encoding="utf-8").splitlines()
-            if "pc13-idem" in l
-        ]
+        lines = [l for l in logfile.read_text(encoding="utf-8").splitlines() if "pc13-idem" in l]
         assert len(lines) == 1
     finally:
         for h in list(logger.handlers):
@@ -641,14 +614,23 @@ def test_pc13_attach_is_idempotent(tmp_path):
 
 # ── PC-16 : free-usage désambiguïsé (F9) + enforce_vpn_only ───────
 
+
 def test_pc16_usage_line_has_both_ips(monkeypatch):
     import opencode as oc
 
     msgs = []
     monkeypatch.setattr(oc, "_debug", msgs.append)
     oc._log_free_model_usage(
-        "paid-m", "free-m", "k" * 16, "w" * 12, 200, 11, 22, 33,
-        ip="5.6.7.8", client_ip="192.168.1.2",
+        "paid-m",
+        "free-m",
+        "k" * 16,
+        "w" * 12,
+        200,
+        11,
+        22,
+        33,
+        ip="5.6.7.8",
+        client_ip="192.168.1.2",
     )
     line = next(m for m in msgs if "[free-usage]" in m)
     assert "client_ip=192.168.1.2" in line
@@ -769,9 +751,7 @@ def test_mixed_wg_slot_returns_when_proven(tmp_path):
 
 def test_mixed_off_restores_legacy_auto(tmp_path):
     """Rollback auto_mixed_stacks=false : slot OV reflippe comme avant."""
-    mgr = FakeVPNManager(
-        _pc_cfg(tmp_path, auto_mixed_stacks=False), tmp_path=tmp_path
-    )
+    mgr = FakeVPNManager(_pc_cfg(tmp_path, auto_mixed_stacks=False), tmp_path=tmp_path)
     assert mgr._mixed_active() is False
     mgr._station = 2
     Path(mgr._wg_key_file).touch()
@@ -795,18 +775,14 @@ def test_apply_mixed_slot_sets_state(tmp_path):
     assert m3.apply_mixed_slot() == "openvpn-udp"
     assert m3._ovpn_protocol_effective == "udp"
     assert m3._ovpn_endpoint_port_effective == "1194"
-    m4 = FakeVPNManager(
-        _pc_cfg(tmp_path, auto_mixed_stacks=False), tmp_path=tmp_path, station=2
-    )
+    m4 = FakeVPNManager(_pc_cfg(tmp_path, auto_mixed_stacks=False), tmp_path=tmp_path, station=2)
     before = m4._stack_effective
     assert m4.apply_mixed_slot() == "openvpn-tcp"
     assert m4._stack_effective == before  # rollback : état inchangé
 
 
 def test_mixed_inactive_on_uniform_modes(tmp_path):
-    mgr = FakeVPNManager(
-        _pc_cfg(tmp_path, vpn_stack="wireguard"), tmp_path=tmp_path
-    )
+    mgr = FakeVPNManager(_pc_cfg(tmp_path, vpn_stack="wireguard"), tmp_path=tmp_path)
     assert mgr._mixed_active() is False
 
 
@@ -907,9 +883,7 @@ def _pc_pool(*stations):
 def test_pc10_cause_ttl():
     sts = [_Station(i + 1) for i in range(3)]
     pool = _pc_pool(*sts)
-    pool.update_config(
-        {"station_bad_ttl_s": 60, "bad_ttl_by_cause": {"timeout": 30, "rate_limit": None}}
-    )
+    pool.update_config({"station_bad_ttl_s": 60, "bad_ttl_by_cause": {"timeout": 30, "rate_limit": None}})
     pool._apply_bad_mark(sts[0], "timeout")
     rem = pool._per_station(sts[0])["bad_until"] - time.monotonic()
     assert 25.0 < rem <= 30.0
