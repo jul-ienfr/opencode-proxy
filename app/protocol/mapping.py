@@ -58,9 +58,7 @@ def _json_loads(b: bytes | str, **kw):
 
 def _json_dumps(obj, **kw) -> bytes:
     if kw.get("indent") is not None:
-        return json.dumps(
-            obj, ensure_ascii=False, indent=kw.get("indent"), default=str
-        ).encode()
+        return json.dumps(obj, ensure_ascii=False, indent=kw.get("indent"), default=str).encode()
     return _orjson.dumps(obj)
 
 
@@ -121,9 +119,7 @@ def _drop_orphan_responses_input(inp: list[dict]) -> list[dict]:
             if cid in _known:
                 _filt.append(it)
             else:
-                _debug(
-                    f"  [orphan] DROP function_call_output call_id={cid!r} — no preceding function_call"
-                )
+                _debug(f"  [orphan] DROP function_call_output call_id={cid!r} — no preceding function_call")
         else:
             _filt.append(it)
     return _filt
@@ -194,6 +190,19 @@ def _extract_text(content) -> str:
                     parts.append(f"[image:{i.get('source', {}).get('type', 'unknown')}]")
                 elif i.get("type") == "document":
                     parts.append(f"[document:{i.get('source', {}).get('type', 'unknown')}]")
+                elif i.get("type") == "input_audio":
+                    _af = (
+                        (i.get("input_audio") or {}).get("format", "unknown")
+                        if isinstance(i.get("input_audio"), dict)
+                        else "unknown"
+                    )
+                    parts.append(f"[audio:{_af}]")
+                elif i.get("type") in ("video", "video_url"):
+                    parts.append("[video:unsupported]")
+                elif i.get("type") == "file":
+                    parts.append(
+                        f"[file:{(i.get('file') or {}).get('filename', 'unknown') if isinstance(i.get('file'), dict) else 'unknown'}]"
+                    )
                 else:
                     parts.append(i.get("text", str(i)))
         return "\n".join(parts)
@@ -281,9 +290,7 @@ def _restructure_for_cache(oai_body: dict, model_id: str) -> dict:
 
     split_point = _find_split_point(sys_content)
     if split_point <= 0:
-        _debug(
-            f"  [cache-restructure] skipped: no valid split point found in {len(sys_content)} chars"
-        )
+        _debug(f"  [cache-restructure] skipped: no valid split point found in {len(sys_content)} chars")
         return oai_body
 
     static_part = sys_content[:split_point].strip()
@@ -310,9 +317,7 @@ def _restructure_for_cache(oai_body: dict, model_id: str) -> dict:
     _debug(
         f"  [cache-restructure] split at point={split_point}: static={len(static_part)} dynamic={len(dynamic_part)} chars"
     )
-    _log(
-        f"  [cache] split system prompt: static={len(static_part)} dynamic={len(dynamic_part)} chars"
-    )
+    _log(f"  [cache] split system prompt: static={len(static_part)} dynamic={len(dynamic_part)} chars")
     return oai_body
 
 
@@ -460,7 +465,13 @@ def _normalize_tool_schema(schema: dict, model: str = "") -> dict:
         # 11. Ensure each properties[k] a un type explicite (sinon string)
         if _is_strict and node.get("type") == "object" and "properties" in node:
             for pk, pv in list(node["properties"].items()):
-                if isinstance(pv, dict) and "type" not in pv and "anyOf" not in pv and "oneOf" not in pv and "$ref" not in pv:
+                if (
+                    isinstance(pv, dict)
+                    and "type" not in pv
+                    and "anyOf" not in pv
+                    and "oneOf" not in pv
+                    and "$ref" not in pv
+                ):
                     pv["type"] = "string"
         # 12. Enforce required ⊆ properties
         if "required" in node and isinstance(node["required"], list) and "properties" in node:
@@ -490,10 +501,25 @@ def _normalize_tool_schema(schema: dict, model: str = "") -> dict:
                     node.pop(key, None)
         # 16. Strip keywords non supportés en strict
         if _is_strict:
-            for k in ("$schema", "$id", "title", "const", "examples", "example", "exclusiveMaximum", "exclusiveMinimum"):
+            for k in (
+                "$schema",
+                "$id",
+                "title",
+                "const",
+                "examples",
+                "example",
+                "exclusiveMaximum",
+                "exclusiveMinimum",
+            ):
                 node.pop(k, None)
         # 17. Si array avec items sans type, forcer items.type
-        if _is_strict and node.get("type") == "array" and "items" in node and isinstance(node["items"], dict) and "type" not in node["items"]:
+        if (
+            _is_strict
+            and node.get("type") == "array"
+            and "items" in node
+            and isinstance(node["items"], dict)
+            and "type" not in node["items"]
+        ):
             if not any(k in node["items"] for k in ("anyOf", "oneOf", "$ref")):
                 node["items"]["type"] = "string"
         defs_local: dict = {}
@@ -600,9 +626,7 @@ def anthropic_to_openai(body: dict, model: str, raw: bytes | None = None) -> dic
                 # _redacted_thinking_cache au lieu d'être perdu définitivement.
                 _rt_data = block.get("data", "")
                 if isinstance(_rt_data, str) and _rt_data:
-                    _rt_key = hashlib.sha256(
-                        _rt_data.encode("utf-8", "ignore")
-                    ).hexdigest()
+                    _rt_key = hashlib.sha256(_rt_data.encode("utf-8", "ignore")).hexdigest()
                     _redacted_thinking_cache[_rt_key] = block
                     _redacted_thinking_cache.move_to_end(_rt_key)
                     if len(_redacted_thinking_cache) > _REDACTED_THINKING_CACHE_MAX:
@@ -628,8 +652,10 @@ def anthropic_to_openai(body: dict, model: str, raw: bytes | None = None) -> dic
                     if not url:
                         continue
                 else:
-                    # type "file" ou inconnu → pas de fidélité OpenAI, on log et on skip
+                    # type "file" ou inconnu → pas de fidélité OpenAI :
+                    # placeholder honnête + debug, jamais de drop silencieux.
                     _debug(f"  [convert] DROP image source type={stype!r} → no OpenAI fidelity")
+                    text_parts.append(f"[image:{stype or 'unknown'}]")
                     continue
                 image_parts.append({"type": "image_url", "image_url": {"url": url}})
             elif btype == "document":
@@ -649,15 +675,11 @@ def anthropic_to_openai(body: dict, model: str, raw: bytes | None = None) -> dic
                         }
                     )
                 elif stype == "url" and src.get("url"):
-                    image_parts.append(
-                        {
-                            "type": "file",
-                            "file": {
-                                "file_data": src["url"],
-                                "filename": block.get("name") or "document.pdf",
-                            },
-                        }
-                    )
+                    # Chat Completions n'a pas de part file-par-URL : un
+                    # file_data=url serait un data URI mensonger → placeholder
+                    # honnête + debug, jamais de faux octets.
+                    _debug(f"  [convert] DROP document url {src['url']!r} → Chat exige file_data base64 ou file_id")
+                    text_parts.append(f"[document:url:{src['url']}]")
                 elif stype == "file" and src.get("file_id"):
                     image_parts.append(
                         {
@@ -665,8 +687,23 @@ def anthropic_to_openai(body: dict, model: str, raw: bytes | None = None) -> dic
                             "file": {"file_id": src["file_id"]},
                         }
                     )
+                elif stype == "text" and src.get("text"):
+                    import base64 as _b64mod
+
+                    _raw = src["text"].encode("utf-8", "ignore")
+                    _enc = _b64mod.b64encode(_raw).decode("ascii")
+                    image_parts.append(
+                        {
+                            "type": "file",
+                            "file": {
+                                "file_data": f"data:text/plain;base64,{_enc}",
+                                "filename": block.get("name") or "document.txt",
+                            },
+                        }
+                    )
                 else:
                     _debug(f"  [convert] DROP document source type={stype!r} → no fidelity")
+                    text_parts.append(f"[document:{stype or 'unknown'}]")
                     continue
             elif btype == "tool_use":
                 _tool_name = block.get("name", "")
@@ -688,9 +725,7 @@ def anthropic_to_openai(body: dict, model: str, raw: bytes | None = None) -> dic
                 if not tid:
                     # Defensive: skip tool_result with missing/empty tool_use_id
                     # (can happen after context compaction loses the id)
-                    _debug(
-                        "  [compact] SKIP tool_result with missing tool_use_id in anthropic_to_openai"
-                    )
+                    _debug("  [compact] SKIP tool_result with missing tool_use_id in anthropic_to_openai")
                     continue
                 # tool_result multimodal : texte + images préservés en
                 # content-list OpenAI (la Responses API accepte input_text
@@ -698,9 +733,7 @@ def anthropic_to_openai(body: dict, model: str, raw: bytes | None = None) -> dic
                 _tr_texts: list[str] = []
                 _tr_images: list[dict] = []
                 _tr_raw = block.get("content", "")
-                _tr_blocks = (
-                    _tr_raw if isinstance(_tr_raw, list) else [_tr_raw]
-                )
+                _tr_blocks = _tr_raw if isinstance(_tr_raw, list) else [_tr_raw]
                 for _tr_b in _tr_blocks:
                     if isinstance(_tr_b, str):
                         if _tr_b:
@@ -733,11 +766,36 @@ def anthropic_to_openai(body: dict, model: str, raw: bytes | None = None) -> dic
                                 }
                             )
                         else:
-                            _debug(
-                                f"  [convert] DROP tool_result image source type={_tr_st!r} → no fidelity"
+                            _debug(f"  [convert] DROP tool_result image source type={_tr_st!r} → no fidelity")
+                            _tr_texts.append(f"[image:{_tr_st or 'unknown'}]")
+                    elif _tr_t == "document":
+                        _tr_dsrc = _tr_b.get("source", {})
+                        if not isinstance(_tr_dsrc, dict):
+                            continue
+                        _tr_dst = _tr_dsrc.get("type", "")
+                        if _tr_dst == "base64" and _tr_dsrc.get("data"):
+                            _tr_images.append(
+                                {
+                                    "type": "file",
+                                    "file": {
+                                        "file_data": f"data:{_tr_dsrc.get('media_type', 'application/pdf')};base64,{_tr_dsrc['data']}",
+                                        "filename": _tr_b.get("name") or "document.pdf",
+                                    },
+                                }
                             )
+                        elif _tr_dst == "file" and _tr_dsrc.get("file_id"):
+                            _tr_images.append({"type": "file", "file": {"file_id": _tr_dsrc["file_id"]}})
+                        else:
+                            # url / text / inconnu : pas de part file-par-URL en
+                            # Chat → placeholder honnête, jamais de faux octets.
+                            _debug(f"  [convert] DROP tool_result document source type={_tr_dst!r} → no Chat fidelity")
+                            _tr_texts.append(f"[document:{_tr_dst or 'unknown'}]")
+                    elif _tr_t == "input_audio":
+                        _debug("  [convert] DROP tool_result audio → no Chat tool fidelity (placeholder)")
+                        _tr_texts.append("[audio:unsupported-in-chat-tool-result]")
                     else:
-                        _tr_texts.append(_tr_b.get("text", str(_tr_b)))
+                        _debug(f"  [convert] DROP tool_result block type={_tr_t!r} → placeholder")
+                        _tr_texts.append(f"[{_tr_t or 'unknown'}]")
                 _tr_content: str | list = "\n".join(_tr_texts)
                 if _tr_images:
                     _tr_list: list[dict] = []
@@ -856,7 +914,14 @@ def anthropic_to_openai(body: dict, model: str, raw: bytes | None = None) -> dic
                 # Keep server tool as-is (e.g., web_search_2025_03_05)
                 # If converting to OpenAI and target is anthropic-native, preserve; otherwise keep type
                 if "name" in t and t.get("name"):
-                    oai_tools.append({"type": t_type, "name": t.get("name"), "description": t.get("description", ""), "input_schema": t.get("input_schema", {})})
+                    oai_tools.append(
+                        {
+                            "type": t_type,
+                            "name": t.get("name"),
+                            "description": t.get("description", ""),
+                            "input_schema": t.get("input_schema", {}),
+                        }
+                    )
                 else:
                     # type without name, e.g., {"type":"web_search_2025_03_05"} -> keep
                     oai_tools.append({"type": t_type, "name": t.get("name", "web_search")})
@@ -948,9 +1013,7 @@ def anthropic_to_openai(body: dict, model: str, raw: bytes | None = None) -> dic
 
     if wants_thinking:
         oai["reasoning_effort"] = _effort_to_reasoning(effort_level or "", model)
-        _debug(
-            f"  [thinking] {model}: reasoning_effort={oai['reasoning_effort']} (effort={effort_level})"
-        )
+        _debug(f"  [thinking] {model}: reasoning_effort={oai['reasoning_effort']} (effort={effort_level})")
 
     # Restructure system prompt for models without semantic caching
     oai = _restructure_for_cache(oai, model)
@@ -1057,9 +1120,7 @@ def _local_signature(text: str) -> str:
     import hmac
 
     key = b"opencode-proxy-local-thinking-signature-v1"
-    return base64.b64encode(
-        hmac.new(key, text.encode("utf-8"), hashlib.sha256).digest()
-    ).decode()
+    return base64.b64encode(hmac.new(key, text.encode("utf-8"), hashlib.sha256).digest()).decode()
 
 
 # [P5.1 perf] LRU bornée pour _is_local_signature — les historiques multi-tours
@@ -1209,9 +1270,7 @@ def openai_to_anthropic(resp: dict, model: str) -> dict:
             "input_tokens": usage.get("prompt_tokens", 0),
             "output_tokens": usage.get("completion_tokens", 0),
             "cache_creation_input_tokens": _extract_cache_creation_tokens(usage),
-            "cache_read_input_tokens": usage.get("prompt_tokens_details", {}).get(
-                "cached_tokens", 0
-            ),
+            "cache_read_input_tokens": usage.get("prompt_tokens_details", {}).get("cached_tokens", 0),
         },
     }
 
@@ -1236,9 +1295,7 @@ def openai_to_anthropic_request(oai_body: dict) -> dict:
             _o_tr_blocks: list = []
             if isinstance(_o_tool_content, str):
                 if _o_tool_content:
-                    _o_tr_blocks = [
-                        {"type": "text", "text": _o_tool_content}
-                    ]
+                    _o_tr_blocks = [{"type": "text", "text": _o_tool_content}]
             elif isinstance(_o_tool_content, list):
                 for _o_b in _o_tool_content:
                     if isinstance(_o_b, str):
@@ -1247,9 +1304,7 @@ def openai_to_anthropic_request(oai_body: dict) -> dict:
                     elif isinstance(_o_b, dict):
                         _o_bt = _o_b.get("type", "")
                         if _o_bt == "text" and _o_b.get("text"):
-                            _o_tr_blocks.append(
-                                {"type": "text", "text": _o_b["text"]}
-                            )
+                            _o_tr_blocks.append({"type": "text", "text": _o_b["text"]})
                         elif _o_bt == "image_url":
                             _o_url = (_o_b.get("image_url") or {}).get("url", "")
                             if not _o_url:
@@ -1258,9 +1313,7 @@ def openai_to_anthropic_request(oai_body: dict) -> dict:
                                 try:
                                     _o_h, _o_b64 = _o_url.split(",", 1)
                                     _o_m = (
-                                        _o_h.split(";")[0].split(":")[1]
-                                        if ";" in _o_h
-                                        else "image/png"
+                                        _o_h.split(";")[0].split(":")[1] if ";" in _o_h else "image/png"
                                     ) or "image/png"
                                 except ValueError:
                                     _o_m, _o_b64 = "image/png", ""
@@ -1285,12 +1338,53 @@ def openai_to_anthropic_request(oai_body: dict) -> dict:
                                 )
                         elif _o_bt == "image":
                             _o_tr_blocks.append(_o_b)
+                        elif _o_bt == "file":
+                            _o_f = _o_b.get("file") or {}
+                            if not isinstance(_o_f, dict):
+                                continue
+                            _o_fdata = _o_f.get("file_data", "") or ""
+                            _o_ffid = _o_f.get("file_id", "") or ""
+                            _o_fname = _o_f.get("filename", "") or ""
+                            if isinstance(_o_fdata, str) and _o_fdata.startswith("data:"):
+                                try:
+                                    _o_fh, _, _o_fd = _o_fdata[5:].partition(",")
+                                    _o_fm = (_o_fh.split(";")[0] or "").strip() or "application/pdf"
+                                except Exception:
+                                    _o_fm, _o_fd = "application/pdf", ""
+                                if not _o_fd:
+                                    continue
+                                _o_doc: dict = {
+                                    "type": "document",
+                                    "source": {"type": "base64", "media_type": _o_fm, "data": _o_fd},
+                                }
+                                if _o_fname:
+                                    _o_doc["name"] = _o_fname
+                                _o_tr_blocks.append(_o_doc)
+                            elif _o_ffid:
+                                _o_tr_blocks.append(
+                                    {"type": "document", "source": {"type": "file", "file_id": _o_ffid}}
+                                )
+                            elif isinstance(_o_fdata, str) and (
+                                _o_fdata.startswith("http://") or _o_fdata.startswith("https://")
+                            ):
+                                # Anthropic ne garantit document-URL que pour les PDF.
+                                if _o_fname.lower().endswith(".pdf"):
+                                    _o_doc2: dict = {
+                                        "type": "document",
+                                        "source": {"type": "url", "url": _o_fdata},
+                                    }
+                                    _o_doc2["name"] = _o_fname
+                                    _o_tr_blocks.append(_o_doc2)
+                                else:
+                                    _debug(f"  [convert] DROP tool file URL non-PDF {_o_fdata!r} → placeholder")
+                                    _o_tr_blocks.append({"type": "text", "text": f"[document:url:{_o_fdata}]"})
+                            else:
+                                _debug("  [convert] DROP tool file sans file_data ni file_id → skip")
+                        elif _o_bt == "input_audio":
+                            _debug("  [convert] DROP tool input_audio → Anthropic sans audio (placeholder)")
+                            _o_tr_blocks.append({"type": "text", "text": "[audio:unsupported-by-anthropic]"})
             # Contrat historique : texte seul → string (pas de liste à 1 bloc).
-            if (
-                len(_o_tr_blocks) == 1
-                and _o_tr_blocks[0].get("type") == "text"
-                and isinstance(_o_tool_content, str)
-            ):
+            if len(_o_tr_blocks) == 1 and _o_tr_blocks[0].get("type") == "text" and isinstance(_o_tool_content, str):
                 _o_tr_content: str | list = _o_tr_blocks[0]["text"]
             else:
                 _o_tr_content = _o_tr_blocks or _extract_text(_o_tool_content)
@@ -1339,15 +1433,65 @@ def openai_to_anthropic_request(oai_body: dict) -> dict:
                             b64 = ""
                         if not b64:
                             continue
-                        blocks.append({
-                            "type": "image",
-                            "source": {"type": "base64", "media_type": media_type, "data": b64},
-                        })
+                        blocks.append(
+                            {
+                                "type": "image",
+                                "source": {"type": "base64", "media_type": media_type, "data": b64},
+                            }
+                        )
                     else:
-                        blocks.append({
-                            "type": "image",
-                            "source": {"type": "url", "url": url},
-                        })
+                        blocks.append(
+                            {
+                                "type": "image",
+                                "source": {"type": "url", "url": url},
+                            }
+                        )
+                elif t == "file":
+                    _cf = block.get("file") or {}
+                    if not isinstance(_cf, dict):
+                        continue
+                    _cdata = _cf.get("file_data", "") or ""
+                    _cfid = _cf.get("file_id", "") or ""
+                    _cname = _cf.get("filename", "") or ""
+                    if isinstance(_cdata, str) and _cdata.startswith("data:"):
+                        try:
+                            _ch, _, _cd = _cdata[5:].partition(",")
+                            _cm = (_ch.split(";")[0] or "").strip() or "application/pdf"
+                        except Exception:
+                            _cm, _cd = "application/pdf", ""
+                        if _cd:
+                            _cb: dict = {
+                                "type": "document",
+                                "source": {"type": "base64", "media_type": _cm, "data": _cd},
+                            }
+                            if _cname:
+                                _cb["name"] = _cname
+                            blocks.append(_cb)
+                    elif _cfid:
+                        blocks.append({"type": "document", "source": {"type": "file", "file_id": _cfid}})
+                    elif isinstance(_cdata, str) and (_cdata.startswith("http://") or _cdata.startswith("https://")):
+                        # Anthropic ne garantit document-URL que pour les PDF.
+                        if _cname.lower().endswith(".pdf"):
+                            _cb2: dict = {
+                                "type": "document",
+                                "source": {"type": "url", "url": _cdata},
+                            }
+                            _cb2["name"] = _cname
+                            blocks.append(_cb2)
+                        else:
+                            _debug(f"  [convert] DROP file URL non-PDF {_cdata!r} → placeholder")
+                            blocks.append({"type": "text", "text": f"[document:url:{_cdata}]"})
+                    else:
+                        _debug("  [convert] DROP file sans file_data ni file_id → skip")
+                elif t == "input_audio":
+                    _debug("  [convert] DROP input_audio → Anthropic sans audio (placeholder)")
+                    blocks.append({"type": "text", "text": "[audio:unsupported-by-anthropic]"})
+                elif t not in ("video", "video_url"):
+                    _debug(f"  [convert] DROP chat part type={t!r} → placeholder")
+                    blocks.append({"type": "text", "text": f"[{t or 'unknown'}]"})
+                else:
+                    _debug("  [convert] DROP video → aucune API (placeholder)")
+                    blocks.append({"type": "text", "text": "[video:unsupported]"})
 
         # Convert tool_calls (assistant only)
         for tc in msg.get("tool_calls") or []:
@@ -1373,11 +1517,7 @@ def openai_to_anthropic_request(oai_body: dict) -> dict:
         # cryptographiquement les signatures — jamais de 400 forgé ; vers un
         # upstream compatible le raisonnement voyage au lieu d'être perdu.
         _hist_reasoning = msg.get("reasoning_content") or msg.get("reasoning")
-        if (
-            role == "assistant"
-            and isinstance(_hist_reasoning, str)
-            and _hist_reasoning.strip()
-        ):
+        if role == "assistant" and isinstance(_hist_reasoning, str) and _hist_reasoning.strip():
             blocks.insert(
                 0,
                 {
@@ -1431,7 +1571,13 @@ def openai_to_anthropic_request(oai_body: dict) -> dict:
                     name = "web_search"
                 elif "web_fetch" in t_type:
                     name = "web_fetch"
-                anthro_tools.append({"name": name, "description": t.get("description", ""), "input_schema": t.get("input_schema", t.get("parameters", {}))})
+                anthro_tools.append(
+                    {
+                        "name": name,
+                        "description": t.get("description", ""),
+                        "input_schema": t.get("input_schema", t.get("parameters", {})),
+                    }
+                )
                 continue
             if t.get("type") == "function":
                 fn = t.get("function", {})
@@ -1563,6 +1709,102 @@ def anthropic_to_openai_response(anthro: dict, model: str) -> dict:
     }
 
 
+def _responses_part_to_anthropic(part: dict) -> dict | None:
+    """Convertit une part Responses input_image/input_file → bloc Anthropic
+    natif (image/document + name). Factorise la logique de
+    openai_responses_to_anthropic (boucle principale + function_call_output
+    liste). None si inconvertible. Défensif : jamais d'exception."""
+    if not isinstance(part, dict):
+        return None
+    btype = part.get("type", "")
+    if btype == "input_image":
+        _r_img_url = part.get("image_url", "")
+        _r_img_b64 = part.get("image_base64", "")
+        _r_img_fid = part.get("file_id", "")
+        if not isinstance(_r_img_url, str):
+            _r_img_url = ""
+        if not isinstance(_r_img_b64, str):
+            _r_img_b64 = ""
+        if not isinstance(_r_img_fid, str):
+            _r_img_fid = ""
+        if _r_img_url.startswith("data:"):
+            try:
+                _r_h, _, _r_d = _r_img_url[5:].partition(",")
+                _r_m = (_r_h.split(";")[0] or "").strip() or "image/png"
+            except Exception:
+                _r_m, _r_d = "image/png", ""
+            if _r_d:
+                return {
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": _r_m, "data": _r_d},
+                }
+            return None
+        elif _r_img_url:
+            return {"type": "image", "source": {"type": "url", "url": _r_img_url}}
+        elif _r_img_b64:
+            return {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": part.get("mime_type", "image/png"),
+                    "data": _r_img_b64,
+                },
+            }
+        elif _r_img_fid:
+            return {"type": "image", "source": {"type": "file", "file_id": _r_img_fid}}
+        return None
+    if btype == "input_file":
+        _r_fdata = part.get("file_data", "")
+        _r_ffid = part.get("file_id", "")
+        _r_furl = part.get("file_url", "")
+        _r_fname = part.get("filename", "") or ""
+        if not isinstance(_r_fdata, str):
+            _r_fdata = ""
+        if not isinstance(_r_ffid, str):
+            _r_ffid = ""
+        if not isinstance(_r_furl, str):
+            _r_furl = ""
+        if _r_fdata.startswith("data:"):
+            try:
+                _r_fh, _, _r_fd = _r_fdata[5:].partition(",")
+                _r_fm = (_r_fh.split(";")[0] or "").strip() or "application/pdf"
+            except Exception:
+                _r_fm, _r_fd = "application/pdf", ""
+            if _r_fd:
+                _r_doc: dict = {
+                    "type": "document",
+                    "source": {"type": "base64", "media_type": _r_fm, "data": _r_fd},
+                }
+                if _r_fname:
+                    _r_doc["name"] = _r_fname
+                return _r_doc
+            return None
+        elif _r_fdata:
+            _r_doc2: dict = {
+                "type": "document",
+                "source": {
+                    "type": "base64",
+                    "media_type": part.get("mime_type", "application/pdf"),
+                    "data": _r_fdata,
+                },
+            }
+            if _r_fname:
+                _r_doc2["name"] = _r_fname
+            return _r_doc2
+        elif _r_ffid:
+            return {"type": "document", "source": {"type": "file", "file_id": _r_ffid}}
+        elif _r_furl:
+            _r_doc3: dict = {
+                "type": "document",
+                "source": {"type": "url", "url": _r_furl},
+            }
+            if _r_fname:
+                _r_doc3["name"] = _r_fname
+            return _r_doc3
+        return None
+    return None
+
+
 def openai_responses_to_anthropic(body: dict) -> dict:
     """Convert OpenAI Responses API request → Anthropic Messages format."""
     system_text = ""
@@ -1581,11 +1823,39 @@ def openai_responses_to_anthropic(body: dict) -> dict:
             continue
 
         if item.get("type") == "function_call_output":
+            # output str → contrat golden (string seule reste string) ;
+            # output liste (extension tolérée par Zen/go, pas schéma officiel
+            # strict) → chaque part mappée vers le bloc Anthropic natif.
+            _fco_out = item.get("output", "")
+            if isinstance(_fco_out, list):
+                _fco_blocks: list = []
+                for _fp in _fco_out:
+                    if isinstance(_fp, str):
+                        if _fp:
+                            _fco_blocks.append({"type": "text", "text": _fp})
+                        continue
+                    if not isinstance(_fp, dict):
+                        continue
+                    _ft = _fp.get("type", "")
+                    if _ft in ("input_text", "output_text", "text"):
+                        _fco_blocks.append({"type": "text", "text": _fp.get("text", "")})
+                    elif _ft == "input_image":
+                        _fco_mapped = _responses_part_to_anthropic(_fp)
+                        _fco_blocks.append(_fco_mapped or {"type": "text", "text": "[image:unmapped]"})
+                    elif _ft == "input_file":
+                        _fco_mapped = _responses_part_to_anthropic(_fp)
+                        _fco_blocks.append(_fco_mapped or {"type": "text", "text": "[document:unmapped]"})
+                    elif _ft == "input_audio":
+                        _debug("  [convert] DROP fco input_audio → Anthropic sans audio (placeholder)")
+                        _fco_blocks.append({"type": "text", "text": "[audio:unsupported-by-anthropic]"})
+                    else:
+                        _fco_blocks.append({"type": "text", "text": _fp.get("text", str(_fp))})
+                _fco_out = _fco_blocks or ""
             pending_tool_results.append(
                 {
                     "type": "tool_result",
                     "tool_use_id": item.get("call_id", item.get("id", "")),
-                    "content": item.get("output", ""),
+                    "content": _fco_out,
                 }
             )
             continue
@@ -1602,9 +1872,7 @@ def openai_responses_to_anthropic(body: dict) -> dict:
                     "content": [
                         {
                             "type": "tool_use",
-                            "id": item.get("call_id")
-                            or item.get("id")
-                            or f"toolu_{uuid.uuid4().hex[:12]}",
+                            "id": item.get("call_id") or item.get("id") or f"toolu_{uuid.uuid4().hex[:12]}",
                             "name": item.get("name", ""),
                             "input": inp,
                         }
@@ -1627,116 +1895,27 @@ def openai_responses_to_anthropic(body: dict) -> dict:
             btype = block.get("type", "")
             if btype in ("input_text", "text"):
                 blocks.append({"type": "text", "text": block.get("text", "")})
-            elif btype == "input_image":
-                # Schéma Responses : image_url (data URI ou https) ou file_id.
-                # Formes historiques image_base64/mime_type encore acceptées
-                # en lecture (payloads pré-correctif, tests).
-                _r_img_url = block.get("image_url", "")
-                _r_img_b64 = block.get("image_base64", "")
-                _r_img_fid = block.get("file_id", "")
-                if _r_img_url.startswith("data:"):
-                    try:
-                        _r_h, _, _r_d = _r_img_url[5:].partition(",")
-                        _r_m = (_r_h.split(";")[0] or "").strip() or "image/png"
-                    except Exception:
-                        _r_m, _r_d = "image/png", ""
-                    if _r_d:
-                        blocks.append(
-                            {
-                                "type": "image",
-                                "source": {
-                                    "type": "base64",
-                                    "media_type": _r_m,
-                                    "data": _r_d,
-                                },
-                            }
-                        )
-                elif _r_img_url:
-                    blocks.append(
-                        {
-                            "type": "image",
-                            "source": {"type": "url", "url": _r_img_url},
-                        }
-                    )
-                elif _r_img_b64:
-                    blocks.append(
-                        {
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": block.get("mime_type", "image/png"),
-                                "data": _r_img_b64,
-                            },
-                        }
-                    )
-                elif _r_img_fid:
-                    blocks.append(
-                        {
-                            "type": "image",
-                            "source": {"type": "file", "file_id": _r_img_fid},
-                        }
-                    )
-            elif btype == "input_file":
-                # Schéma Responses : file_data (data URI) + filename, ou
-                # file_id. Formes historiques file_data brut / mime_type /
-                # file_url encore acceptées en lecture.
-                _r_fdata = block.get("file_data", "")
-                _r_ffid = block.get("file_id", "")
-                _r_furl = block.get("file_url", "")
-                if _r_fdata.startswith("data:"):
-                    try:
-                        _r_fh, _, _r_fd = _r_fdata[5:].partition(",")
-                        _r_fm = (_r_fh.split(";")[0] or "").strip() or "application/pdf"
-                    except Exception:
-                        _r_fm, _r_fd = "application/pdf", ""
-                    if _r_fd:
-                        blocks.append(
-                            {
-                                "type": "document",
-                                "source": {
-                                    "type": "base64",
-                                    "media_type": _r_fm,
-                                    "data": _r_fd,
-                                },
-                            }
-                        )
-                elif _r_fdata:
-                    blocks.append(
-                        {
-                            "type": "document",
-                            "source": {
-                                "type": "base64",
-                                "media_type": block.get("mime_type", "application/pdf"),
-                                "data": _r_fdata,
-                            },
-                        }
-                    )
-                elif _r_ffid:
-                    blocks.append(
-                        {
-                            "type": "document",
-                            "source": {"type": "file", "file_id": _r_ffid},
-                        }
-                    )
-                elif _r_furl:
-                    blocks.append(
-                        {
-                            "type": "document",
-                            "source": {"type": "url", "url": _r_furl},
-                        }
-                    )
+            elif btype in ("input_image", "input_file"):
+                # Schéma Responses : input_image = image_url (data URI ou
+                # https) ou file_id ; input_file = file_data (data URI) +
+                # filename, file_id ou file_url. Formes historiques encore
+                # acceptées en lecture (payloads pré-correctif, tests).
+                _mapped = _responses_part_to_anthropic(block)
+                if _mapped is not None:
+                    blocks.append(_mapped)
+            elif btype == "input_audio":
+                # Anthropic n'a pas d'audio : placeholder honnête + debug.
+                _debug("  [convert] DROP input_audio → Anthropic sans audio (placeholder)")
+                blocks.append({"type": "text", "text": "[audio:unsupported-by-anthropic]"})
             elif btype == "reasoning":
                 # [PLAN-raisonnement Phase D.3] pas de thinking forgé vers
                 # l'upstream Anthropic (signature cryptographique exigée) —
                 # le summary est omis de l'historique.
                 _summary = block.get("summary") or []
-                _has_text = any(
-                    isinstance(s, dict) and s.get("text") for s in _summary
-                )
+                _has_text = any(isinstance(s, dict) and s.get("text") for s in _summary)
                 if _has_text:
                     _debug(
-                        "  [convert] DROP reasoning summary historique → upstream Anthropic "
-                        "(pas de signature forgée)"
+                        "  [convert] DROP reasoning summary historique → upstream Anthropic (pas de signature forgée)"
                     )
 
         if not blocks:
@@ -1807,9 +1986,7 @@ def openai_responses_to_anthropic(body: dict) -> dict:
     if wants_thinking:
         _model = result.get("model", "")
         result["reasoning_effort"] = _effort_to_reasoning(effort_level or "", _model)
-        _debug(
-            f"  [thinking] {_model}: reasoning_effort={result['reasoning_effort']} (effort={effort_level})"
-        )
+        _debug(f"  [thinking] {_model}: reasoning_effort={result['reasoning_effort']} (effort={effort_level})")
 
     return result
 
@@ -2097,9 +2274,7 @@ def _remap_responses_history_names(inp: list, name_map: dict) -> dict:
     """
     if not isinstance(inp, list) or not inp or not isinstance(name_map, dict):
         return name_map
-    inv: dict[str, str] = {
-        o: s for s, o in name_map.items() if isinstance(s, str) and isinstance(o, str)
-    }
+    inv: dict[str, str] = {o: s for s, o in name_map.items() if isinstance(s, str) and isinstance(o, str)}
     for item in inp:
         if not isinstance(item, dict) or item.get("type") != "function_call":
             continue
@@ -2196,16 +2371,19 @@ def _normalize_responses_input_items(inp: list) -> list:
             elif btype == "input_file" and "file_id" not in b:
                 nb = dict(b)
                 if b.get("file_url") and not b.get("file_data"):
-                    # URL brute : ni file_data base64 ni file_id — DROP
-                    # plutôt qu'un data URI mensonger (cf. aller).
-                    _debug("  [convert] DROP input_file file_url → Responses exige file_data base64 ou file_id")
-                    changed = True
+                    # input_file.file_url EXISTE dans le schéma Responses
+                    # officiel → KEEP tel quel (fini le DROP).
+                    new_content.append(nb)
                     continue
                 if nb.get("file_data") and not str(nb["file_data"]).startswith("data:"):
                     _raw = str(nb["file_data"])
                     if _raw.startswith("http://") or _raw.startswith("https://"):
-                        _debug("  [convert] DROP input_file file_data URL → Responses exige file_data base64 ou file_id")
+                        # file_data par URL → replié en file_url officiel.
+                        nb = {"type": "input_file", "file_url": _raw}
+                        if b.get("filename"):
+                            nb["filename"] = b["filename"]
                         changed = True
+                        new_content.append(nb)
                         continue
                     _head, _, _rest = _raw.partition(",")
                     if ";" not in (_head or ""):
@@ -2219,6 +2397,20 @@ def _normalize_responses_input_items(inp: list) -> list:
                     nb.pop("mime_type", None)
                     changed = True
                 new_content.append(nb)
+            elif btype == "input_audio":
+                # Schéma Responses : input_audio {data, format} — set large
+                # mp3, wav, flac, ogg, m4a, mp4, webm (+ transcript optionnel).
+                # Format inconnu → placeholder input_text, jamais de drop
+                # silencieux.
+                _na = b.get("input_audio") if isinstance(b.get("input_audio"), dict) else {}
+                _nfmt = str((_na or {}).get("format", "") or "").lower()
+                if _nfmt not in ("mp3", "wav", "flac", "ogg", "m4a", "mp4", "webm"):
+                    _debug(f"  [convert] DROP input_audio format={_nfmt!r} → hors set Responses (placeholder)")
+                    nb = {"type": "input_text", "text": f"[audio:{_nfmt or 'unknown'}]"}
+                    changed = True
+                    new_content.append(nb)
+                else:
+                    new_content.append(b)
             else:
                 new_content.append(b)
         if changed:
@@ -2285,9 +2477,7 @@ def _chat_to_responses_request(chat: dict) -> dict:
                     if not isinstance(_tb, dict):
                         continue
                     if _tb.get("type") == "text" and _tb.get("text"):
-                        _tool_out_parts.append(
-                            {"type": "input_text", "text": _tb["text"]}
-                        )
+                        _tool_out_parts.append({"type": "input_text", "text": _tb["text"]})
                     elif _tb.get("type") == "image_url":
                         _turl = (_tb.get("image_url") or {}).get("url", "")
                         if not _turl:
@@ -2295,8 +2485,30 @@ def _chat_to_responses_request(chat: dict) -> dict:
                         # Schéma Responses : input_image = image_url (URL https
                         # ou data URI base64 tel quel) ou file_id — jamais
                         # image_base64/mime_type (400 upstream sinon).
+                        _tool_out_parts.append({"type": "input_image", "image_url": _turl})
+                    elif _tb.get("type") == "file":
+                        _tf = _tb.get("file") if isinstance(_tb.get("file"), dict) else {}
+                        if _tf.get("file_id"):
+                            _tool_out_parts.append({"type": "input_file", "file_id": _tf["file_id"]})
+                        elif isinstance(_tf.get("file_data"), str) and _tf["file_data"]:
+                            _tfd = _tf["file_data"]
+                            if _tfd.startswith("http://") or _tfd.startswith("https://"):
+                                _tfp: dict = {"type": "input_file", "file_url": _tfd}
+                                if _tf.get("filename"):
+                                    _tfp["filename"] = _tf["filename"]
+                                _tool_out_parts.append(_tfp)
+                            else:
+                                _tfp2: dict = {
+                                    "type": "input_file",
+                                    "file_data": _tfd,
+                                    "filename": _tf.get("filename") or "document.pdf",
+                                }
+                                _tool_out_parts.append(_tfp2)
+                    elif _tb.get("type") == "input_audio":
+                        # fco n'a pas de fidélité audio Chat : placeholder.
+                        _debug("  [convert] DROP tool input_audio → fco sans audio (placeholder)")
                         _tool_out_parts.append(
-                            {"type": "input_image", "image_url": _turl}
+                            {"type": "input_text", "text": "[audio:unsupported-in-chat-tool-result]"}
                         )
                 _tool_out = _tool_out_parts or ""
             else:
@@ -2339,9 +2551,7 @@ def _chat_to_responses_request(chat: dict) -> dict:
                 if b.get("type") == "text" and b.get("text"):
                     parts.append(
                         {
-                            "type": "output_text"
-                            if role == "assistant"
-                            else "input_text",
+                            "type": "output_text" if role == "assistant" else "input_text",
                             "text": b["text"],
                         }
                     )
@@ -2353,17 +2563,13 @@ def _chat_to_responses_request(chat: dict) -> dict:
                     # ou data URI base64 tel quel) — jamais image_base64 /
                     # mime_type (rejet 400 upstream : "requires either
                     # image_url or file_id").
-                    parts.append(
-                        {"type": "input_image", "image_url": _img_url}
-                    )
+                    parts.append({"type": "input_image", "image_url": _img_url})
                 elif b.get("type") == "file":
                     _fobj = b.get("file") or {}
                     if not isinstance(_fobj, dict):
                         continue
                     if _fobj.get("file_id"):
-                        parts.append(
-                            {"type": "input_file", "file_id": _fobj["file_id"]}
-                        )
+                        parts.append({"type": "input_file", "file_id": _fobj["file_id"]})
                     elif _fobj.get("file_data"):
                         _fdata = _fobj["file_data"]
                         if not _fdata:
@@ -2374,16 +2580,19 @@ def _chat_to_responses_request(chat: dict) -> dict:
                         if _fdata.startswith("data:"):
                             _fdata_norm = _fdata
                         elif _fdata.startswith("http://") or _fdata.startswith("https://"):
-                            # Pas d'upload Files API côté proxy : un document
-                            # par URL ne peut pas devenir file_data base64 —
-                            # DROP loggé plutôt qu'un data URI mensonger.
-                            _debug("  [convert] DROP file file_data URL → Responses input_file exige file_data base64 ou file_id")
+                            # input_file.file_url EXISTE dans le schéma
+                            # Responses officiel → mapping direct, pas de DROP.
+                            _fpart: dict = {"type": "input_file", "file_url": _fdata}
+                            if _fobj.get("filename"):
+                                _fpart["filename"] = _fobj["filename"]
+                            parts.append(_fpart)
                             continue
                         else:
                             _fhead, _, _fraw = _fdata.partition(",")
                             _fdata_norm = (
                                 f"data:application/pdf;base64,{_fraw or _fdata}"
-                                if ";" not in (_fhead or "") else _fdata
+                                if ";" not in (_fhead or "")
+                                else _fdata
                             )
                         parts.append(
                             {
@@ -2392,6 +2601,27 @@ def _chat_to_responses_request(chat: dict) -> dict:
                                 "filename": _fname,
                             }
                         )
+                elif b.get("type") == "input_audio":
+                    # Chat → Responses : input_audio {data: base64 brut,
+                    # format: wav|mp3 uniquement} → passthrough validé.
+                    _ca = b.get("input_audio") if isinstance(b.get("input_audio"), dict) else {}
+                    _cdata = (_ca or {}).get("data", "") or ""
+                    _cfmt = str((_ca or {}).get("format", "") or "").lower()
+                    if _cdata and _cfmt in ("wav", "mp3"):
+                        parts.append({"type": "input_audio", "input_audio": {"data": _cdata, "format": _cfmt}})
+                    else:
+                        _debug(
+                            f"  [convert] DROP input_audio format={_cfmt!r} → Chat n'accepte que wav|mp3 (placeholder)"
+                        )
+                        parts.append({"type": "input_text", "text": f"[audio:{_cfmt or 'unknown'}]"})
+                elif b.get("type") in ("video", "video_url"):
+                    # Aucune des trois API n'accepte la vidéo : placeholder
+                    # honnête (frames + transcript côté client, cf. plan).
+                    _debug("  [convert] DROP video → aucune API (placeholder)")
+                    parts.append({"type": "input_text", "text": "[video:unsupported]"})
+                elif b.get("type") not in ("text", "image_url", "file"):
+                    _debug(f"  [convert] DROP chat part type={b.get('type')!r} → placeholder")
+                    parts.append({"type": "input_text", "text": f"[{b.get('type') or 'unknown'}]"})
             if parts:
                 item = {"role": role, "content": parts}
                 if cache_ctrl:
@@ -2549,18 +2779,12 @@ def _responses_to_chat_response(resp: dict, model: str, name_map: dict | None = 
         msg["tool_calls"] = tool_calls
     usage = resp.get("usage", {}) if isinstance(resp.get("usage"), dict) else {}
     # Cache tokens come from input_tokens_details, NOT output_tokens_details
-    _inp_details = (
-        usage.get("input_tokens_details")
-        if isinstance(usage.get("input_tokens_details"), dict)
-        else {}
-    )
+    _inp_details = usage.get("input_tokens_details") if isinstance(usage.get("input_tokens_details"), dict) else {}
     _cached = _inp_details.get("cached_tokens", 0) if isinstance(_inp_details, dict) else 0
     chat_usage = {
         "prompt_tokens": usage.get("input_tokens", 0),
         "completion_tokens": usage.get("output_tokens", 0),
-        "total_tokens": usage.get(
-            "total_tokens", usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
-        ),
+        "total_tokens": usage.get("total_tokens", usage.get("input_tokens", 0) + usage.get("output_tokens", 0)),
     }
     if _cached:
         chat_usage["prompt_tokens_details"] = {"cached_tokens": _cached}
@@ -2576,9 +2800,7 @@ def _responses_to_chat_response(resp: dict, model: str, name_map: dict | None = 
     }
 
 
-def _responses_to_anthropic_response(
-    resp: dict, model: str, name_map: dict | None = None
-) -> dict:
+def _responses_to_anthropic_response(resp: dict, model: str, name_map: dict | None = None) -> dict:
     blocks = []
     for item in resp.get("output", []) or []:
         if not isinstance(item, dict):
@@ -2587,12 +2809,12 @@ def _responses_to_anthropic_response(
             for s in item.get("summary", []) or []:
                 if isinstance(s, dict) and s.get("text"):
                     blocks.append(
-            {
-                "type": "thinking",
-                "thinking": s.get("text", ""),
-                "signature": _local_signature(s.get("text", "")),
-            }
-        )
+                        {
+                            "type": "thinking",
+                            "thinking": s.get("text", ""),
+                            "signature": _local_signature(s.get("text", "")),
+                        }
+                    )
         elif item.get("type") == "message":
             for blk in item.get("content", []) or []:
                 if isinstance(blk, dict) and blk.get("type") == "output_text" and blk.get("text"):
@@ -2619,11 +2841,7 @@ def _responses_to_anthropic_response(
     if has_tools:
         stop = "tool_use"
     # Cache tokens come from input_tokens_details, NOT output_tokens_details
-    _inp_details = (
-        usage.get("input_tokens_details")
-        if isinstance(usage.get("input_tokens_details"), dict)
-        else {}
-    )
+    _inp_details = usage.get("input_tokens_details") if isinstance(usage.get("input_tokens_details"), dict) else {}
     _cache_read = _inp_details.get("cached_tokens", 0) if isinstance(_inp_details, dict) else 0
     return {
         "id": f"msg_{uuid.uuid4().hex[:24]}",
@@ -2864,9 +3082,7 @@ def _responses_sse_to_chat_deltas(raw_line: str, parsed=None, state: "ResponsesS
         return {
             "choices": [
                 {
-                    "delta": {
-                        "tool_calls": [{"index": tool_idx, "function": {"arguments": delta}}]
-                    },
+                    "delta": {"tool_calls": [{"index": tool_idx, "function": {"arguments": delta}}]},
                     "finish_reason": None,
                 }
             ]
@@ -2906,7 +3122,9 @@ def _responses_sse_to_chat_deltas(raw_line: str, parsed=None, state: "ResponsesS
             # 100% fallback: if no summary text but encrypted_content exists, synthesize placeholder so client always sees thinking
             if not reasoning:
                 # vrai seulement : pas de placeholder synthétique — si pas de summary visible, on ne remonte rien (le vrai)
-                _debug(f"  [responses-sse] output_item.done no visible summary, skip (vrai seulement) iid={iid!r} encrypted={bool(item.get('encrypted_content'))}")
+                _debug(
+                    f"  [responses-sse] output_item.done no visible summary, skip (vrai seulement) iid={iid!r} encrypted={bool(item.get('encrypted_content'))}"
+                )
                 return None
             if reasoning:
                 # N'émètre QUE les parts non vues (per-index) — évite doublon
@@ -2939,7 +3157,9 @@ def _responses_sse_to_chat_deltas(raw_line: str, parsed=None, state: "ResponsesS
                 _emit = _unseen if (iid and isinstance(summary, list) and summary and _seen_any) else reasoning
                 # mais si le seen_any était seulement partiel (N>1), _emit==_unseen
                 # (queue seule) ; si single-part seen → déjà return None ci-dessus.
-                _debug(f"  [responses-sse] output_item.done reasoning fallback len={len(_emit)} iid={iid!r} unseen={len(_unseen)} seen_any={_seen_any}")
+                _debug(
+                    f"  [responses-sse] output_item.done reasoning fallback len={len(_emit)} iid={iid!r} unseen={len(_unseen)} seen_any={_seen_any}"
+                )
                 return {"choices": [{"delta": {"reasoning_content": _emit}, "finish_reason": None}]}
         return None
 
@@ -2950,18 +3170,12 @@ def _responses_sse_to_chat_deltas(raw_line: str, parsed=None, state: "ResponsesS
         resp = chunk.get("response", {})
         usage = resp.get("usage", {})
         # Cache tokens come from input_tokens_details, NOT output_tokens_details
-        _inp_details = (
-            usage.get("input_tokens_details")
-            if isinstance(usage.get("input_tokens_details"), dict)
-            else {}
-        )
+        _inp_details = usage.get("input_tokens_details") if isinstance(usage.get("input_tokens_details"), dict) else {}
         _cached = _inp_details.get("cached_tokens", 0)
         chat_usage = {
             "prompt_tokens": usage.get("input_tokens", 0),
             "completion_tokens": usage.get("output_tokens", 0),
-            "total_tokens": usage.get(
-                "total_tokens", usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
-            ),
+            "total_tokens": usage.get("total_tokens", usage.get("input_tokens", 0) + usage.get("output_tokens", 0)),
         }
         if _cached:
             chat_usage["prompt_tokens_details"] = {"cached_tokens": _cached}
@@ -2976,9 +3190,7 @@ def _responses_sse_to_chat_deltas(raw_line: str, parsed=None, state: "ResponsesS
         chat_usage = {
             "prompt_tokens": usage.get("input_tokens", 0),
             "completion_tokens": usage.get("output_tokens", 0),
-            "total_tokens": usage.get(
-                "total_tokens", usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
-            ),
+            "total_tokens": usage.get("total_tokens", usage.get("input_tokens", 0) + usage.get("output_tokens", 0)),
         }
         return {"choices": [], "usage": chat_usage, "_incomplete": True}
 
