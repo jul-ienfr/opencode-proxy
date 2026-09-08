@@ -186,7 +186,9 @@ async def test_canary_failure_throttles_docker_calls(tmp_path):
         assert await m._cancel_wg_flip_if_canary_dead() is True
     ups = [c for c in m.compose_calls if "up" in c]
     rms = [c for c in m.compose_calls if "rm" in c]
-    assert len(ups) == 1 and len(rms) == 1
+    # Une validation = pré-nettoyage rm + up + teardown rm (finally).
+    assert len(ups) == 1 and len(rms) == 2
+    assert [("up" in c) for c in m.compose_calls] == [False, True, False]
 
 
 # ── La décision pure reste inchangée ────────────────────────────────
