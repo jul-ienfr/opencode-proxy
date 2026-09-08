@@ -192,6 +192,8 @@ def _extract_text(content) -> str:
                     parts.append(i.get("thinking", ""))
                 elif i.get("type") == "image":
                     parts.append(f"[image:{i.get('source', {}).get('type', 'unknown')}]")
+                elif i.get("type") == "document":
+                    parts.append(f"[document:{i.get('source', {}).get('type', 'unknown')}]")
                 else:
                     parts.append(i.get("text", str(i)))
         return "\n".join(parts)
@@ -630,6 +632,42 @@ def anthropic_to_openai(body: dict, model: str, raw: bytes | None = None) -> dic
                     _debug(f"  [convert] DROP image source type={stype!r} → no OpenAI fidelity")
                     continue
                 image_parts.append({"type": "image_url", "image_url": {"url": url}})
+            elif btype == "document":
+                src = block.get("source", {})
+                if not isinstance(src, dict):
+                    continue
+                stype = src.get("type", "")
+                if stype == "base64" and src.get("data"):
+                    media_type = src.get("media_type", "application/pdf")
+                    image_parts.append(
+                        {
+                            "type": "file",
+                            "file": {
+                                "file_data": f"data:{media_type};base64,{src['data']}",
+                                "filename": block.get("name") or "document.pdf",
+                            },
+                        }
+                    )
+                elif stype == "url" and src.get("url"):
+                    image_parts.append(
+                        {
+                            "type": "file",
+                            "file": {
+                                "file_data": src["url"],
+                                "filename": block.get("name") or "document.pdf",
+                            },
+                        }
+                    )
+                elif stype == "file" and src.get("file_id"):
+                    image_parts.append(
+                        {
+                            "type": "file",
+                            "file": {"file_id": src["file_id"]},
+                        }
+                    )
+                else:
+                    _debug(f"  [convert] DROP document source type={stype!r} → no fidelity")
+                    continue
             elif btype == "tool_use":
                 _tool_name = block.get("name", "")
                 if not isinstance(_tool_name, str) or not _tool_name.strip():
@@ -654,11 +692,64 @@ def anthropic_to_openai(body: dict, model: str, raw: bytes | None = None) -> dic
                         "  [compact] SKIP tool_result with missing tool_use_id in anthropic_to_openai"
                     )
                     continue
+                # tool_result multimodal : texte + images préservés en
+                # content-list OpenAI (la Responses API accepte input_text
+                # + input_image dans function_call_output.output).
+                _tr_texts: list[str] = []
+                _tr_images: list[dict] = []
+                _tr_raw = block.get("content", "")
+                _tr_blocks = (
+                    _tr_raw if isinstance(_tr_raw, list) else [_tr_raw]
+                )
+                for _tr_b in _tr_blocks:
+                    if isinstance(_tr_b, str):
+                        if _tr_b:
+                            _tr_texts.append(_tr_b)
+                        continue
+                    if not isinstance(_tr_b, dict):
+                        continue
+                    _tr_t = _tr_b.get("type", "")
+                    if _tr_t in ("text", "thinking"):
+                        _tr_texts.append(_tr_b.get("text" if _tr_t == "text" else "thinking", ""))
+                    elif _tr_t == "image":
+                        _tr_src = _tr_b.get("source", {})
+                        if not isinstance(_tr_src, dict):
+                            continue
+                        _tr_st = _tr_src.get("type", "")
+                        if _tr_st == "base64" and _tr_src.get("data"):
+                            _tr_images.append(
+                                {
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": f"data:{_tr_src.get('media_type', 'image/png')};base64,{_tr_src['data']}"
+                                    },
+                                }
+                            )
+                        elif _tr_st == "url" and _tr_src.get("url"):
+                            _tr_images.append(
+                                {
+                                    "type": "image_url",
+                                    "image_url": {"url": _tr_src["url"]},
+                                }
+                            )
+                        else:
+                            _debug(
+                                f"  [convert] DROP tool_result image source type={_tr_st!r} → no fidelity"
+                            )
+                    else:
+                        _tr_texts.append(_tr_b.get("text", str(_tr_b)))
+                _tr_content: str | list = "\n".join(_tr_texts)
+                if _tr_images:
+                    _tr_list: list[dict] = []
+                    if _tr_content:
+                        _tr_list.append({"type": "text", "text": _tr_content})
+                    _tr_list.extend(_tr_images)
+                    _tr_content = _tr_list
                 tool_results.append(
                     {
                         "role": "tool",
                         "tool_call_id": tid,
-                        "content": _extract_text(block.get("content", "")),
+                        "content": _tr_content,
                     }
                 )
                 if "cache_control" in block:
@@ -1139,11 +1230,75 @@ def openai_to_anthropic_request(oai_body: dict) -> dict:
             continue
 
         if role == "tool":
+            # tool_result multimodal : texte + images préservés (pas d'aplat
+            # _extract_text qui perdait les bytes image).
+            _o_tool_content = msg.get("content", "")
+            _o_tr_blocks: list = []
+            if isinstance(_o_tool_content, str):
+                if _o_tool_content:
+                    _o_tr_blocks = [
+                        {"type": "text", "text": _o_tool_content}
+                    ]
+            elif isinstance(_o_tool_content, list):
+                for _o_b in _o_tool_content:
+                    if isinstance(_o_b, str):
+                        if _o_b:
+                            _o_tr_blocks.append({"type": "text", "text": _o_b})
+                    elif isinstance(_o_b, dict):
+                        _o_bt = _o_b.get("type", "")
+                        if _o_bt == "text" and _o_b.get("text"):
+                            _o_tr_blocks.append(
+                                {"type": "text", "text": _o_b["text"]}
+                            )
+                        elif _o_bt == "image_url":
+                            _o_url = (_o_b.get("image_url") or {}).get("url", "")
+                            if not _o_url:
+                                continue
+                            if _o_url.startswith("data:"):
+                                try:
+                                    _o_h, _o_b64 = _o_url.split(",", 1)
+                                    _o_m = (
+                                        _o_h.split(";")[0].split(":")[1]
+                                        if ";" in _o_h
+                                        else "image/png"
+                                    ) or "image/png"
+                                except ValueError:
+                                    _o_m, _o_b64 = "image/png", ""
+                                if not _o_b64:
+                                    continue
+                                _o_tr_blocks.append(
+                                    {
+                                        "type": "image",
+                                        "source": {
+                                            "type": "base64",
+                                            "media_type": _o_m,
+                                            "data": _o_b64,
+                                        },
+                                    }
+                                )
+                            else:
+                                _o_tr_blocks.append(
+                                    {
+                                        "type": "image",
+                                        "source": {"type": "url", "url": _o_url},
+                                    }
+                                )
+                        elif _o_bt == "image":
+                            _o_tr_blocks.append(_o_b)
+            # Contrat historique : texte seul → string (pas de liste à 1 bloc).
+            if (
+                len(_o_tr_blocks) == 1
+                and _o_tr_blocks[0].get("type") == "text"
+                and isinstance(_o_tool_content, str)
+            ):
+                _o_tr_content: str | list = _o_tr_blocks[0]["text"]
+            else:
+                _o_tr_content = _o_tr_blocks or _extract_text(_o_tool_content)
             pending_tool_results.append(
                 {
                     "type": "tool_result",
                     "tool_use_id": msg.get("tool_call_id", ""),
-                    "content": _extract_text(msg.get("content", "")),
+                    "content": _o_tr_content,
                 }
             )
             continue
@@ -1472,6 +1627,104 @@ def openai_responses_to_anthropic(body: dict) -> dict:
             btype = block.get("type", "")
             if btype in ("input_text", "text"):
                 blocks.append({"type": "text", "text": block.get("text", "")})
+            elif btype == "input_image":
+                # Schéma Responses : image_url (data URI ou https) ou file_id.
+                # Formes historiques image_base64/mime_type encore acceptées
+                # en lecture (payloads pré-correctif, tests).
+                _r_img_url = block.get("image_url", "")
+                _r_img_b64 = block.get("image_base64", "")
+                _r_img_fid = block.get("file_id", "")
+                if _r_img_url.startswith("data:"):
+                    try:
+                        _r_h, _, _r_d = _r_img_url[5:].partition(",")
+                        _r_m = (_r_h.split(";")[0] or "").strip() or "image/png"
+                    except Exception:
+                        _r_m, _r_d = "image/png", ""
+                    if _r_d:
+                        blocks.append(
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": _r_m,
+                                    "data": _r_d,
+                                },
+                            }
+                        )
+                elif _r_img_url:
+                    blocks.append(
+                        {
+                            "type": "image",
+                            "source": {"type": "url", "url": _r_img_url},
+                        }
+                    )
+                elif _r_img_b64:
+                    blocks.append(
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": block.get("mime_type", "image/png"),
+                                "data": _r_img_b64,
+                            },
+                        }
+                    )
+                elif _r_img_fid:
+                    blocks.append(
+                        {
+                            "type": "image",
+                            "source": {"type": "file", "file_id": _r_img_fid},
+                        }
+                    )
+            elif btype == "input_file":
+                # Schéma Responses : file_data (data URI) + filename, ou
+                # file_id. Formes historiques file_data brut / mime_type /
+                # file_url encore acceptées en lecture.
+                _r_fdata = block.get("file_data", "")
+                _r_ffid = block.get("file_id", "")
+                _r_furl = block.get("file_url", "")
+                if _r_fdata.startswith("data:"):
+                    try:
+                        _r_fh, _, _r_fd = _r_fdata[5:].partition(",")
+                        _r_fm = (_r_fh.split(";")[0] or "").strip() or "application/pdf"
+                    except Exception:
+                        _r_fm, _r_fd = "application/pdf", ""
+                    if _r_fd:
+                        blocks.append(
+                            {
+                                "type": "document",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": _r_fm,
+                                    "data": _r_fd,
+                                },
+                            }
+                        )
+                elif _r_fdata:
+                    blocks.append(
+                        {
+                            "type": "document",
+                            "source": {
+                                "type": "base64",
+                                "media_type": block.get("mime_type", "application/pdf"),
+                                "data": _r_fdata,
+                            },
+                        }
+                    )
+                elif _r_ffid:
+                    blocks.append(
+                        {
+                            "type": "document",
+                            "source": {"type": "file", "file_id": _r_ffid},
+                        }
+                    )
+                elif _r_furl:
+                    blocks.append(
+                        {
+                            "type": "document",
+                            "source": {"type": "url", "url": _r_furl},
+                        }
+                    )
             elif btype == "reasoning":
                 # [PLAN-raisonnement Phase D.3] pas de thinking forgé vers
                 # l'upstream Anthropic (signature cryptographique exigée) —
@@ -1906,6 +2159,75 @@ def _remap_responses_tool_choice(tc, name_map: dict | None):
     return tc
 
 
+def _normalize_responses_input_items(inp: list) -> list:
+    """Normalise les parts input_image/input_file vers le schéma Responses
+    officiel (cf. docs/api-reference/responses) : un client (ou un payload
+    pré-correctif) peut envoyer image_base64/mime_type au lieu de image_url,
+    ou file_url/mime_type au lieu de file_data+filename — l'upstream rejette
+    en 400 ("input_image ... requires either image_url or file_id").
+    Copie défensive : jamais de mutation du caller. Idempotent."""
+    out = []
+    for item in inp:
+        if not isinstance(item, dict):
+            out.append(item)
+            continue
+        content = item.get("content")
+        if not isinstance(content, list):
+            out.append(item)
+            continue
+        changed = False
+        new_content = []
+        for b in content:
+            if not isinstance(b, dict):
+                new_content.append(b)
+                continue
+            btype = b.get("type", "")
+            if btype == "input_image" and "image_url" not in b and "file_id" not in b:
+                nb = dict(b)
+                if b.get("image_base64"):
+                    _nm = (b.get("mime_type", "") or "").strip() or "image/png"
+                    if not _nm.startswith("image/"):
+                        _nm = "image/png"
+                    nb["image_url"] = f"data:{_nm};base64,{b['image_base64']}"
+                    nb.pop("image_base64", None)
+                    nb.pop("mime_type", None)
+                    changed = True
+                new_content.append(nb)
+            elif btype == "input_file" and "file_id" not in b:
+                nb = dict(b)
+                if b.get("file_url") and not b.get("file_data"):
+                    # URL brute : ni file_data base64 ni file_id — DROP
+                    # plutôt qu'un data URI mensonger (cf. aller).
+                    _debug("  [convert] DROP input_file file_url → Responses exige file_data base64 ou file_id")
+                    changed = True
+                    continue
+                if nb.get("file_data") and not str(nb["file_data"]).startswith("data:"):
+                    _raw = str(nb["file_data"])
+                    if _raw.startswith("http://") or _raw.startswith("https://"):
+                        _debug("  [convert] DROP input_file file_data URL → Responses exige file_data base64 ou file_id")
+                        changed = True
+                        continue
+                    _head, _, _rest = _raw.partition(",")
+                    if ";" not in (_head or ""):
+                        nb["file_data"] = f"data:application/pdf;base64,{_rest or _raw}"
+                        changed = True
+                if nb.get("mime_type") and "filename" not in nb:
+                    nb["filename"] = "document.pdf"
+                    nb.pop("mime_type", None)
+                    changed = True
+                elif "mime_type" in nb and "filename" in nb:
+                    nb.pop("mime_type", None)
+                    changed = True
+                new_content.append(nb)
+            else:
+                new_content.append(b)
+        if changed:
+            item = dict(item)
+            item["content"] = new_content
+        out.append(item)
+    return out
+
+
 def _sanitize_native_responses_request(req: dict) -> dict:
     """Sanitize-aller pour un body déjà au format Responses (verbatim) :
     tools[] + historique input[].function_call + tool_choice, map réunie sous
@@ -1925,6 +2247,7 @@ def _sanitize_native_responses_request(req: dict) -> dict:
     inp = req.get("input")
     if isinstance(inp, list) and inp:
         req["input"] = [dict(it) if isinstance(it, dict) else it for it in inp]
+        req["input"] = _normalize_responses_input_items(req["input"])
         _remap_responses_history_names(req["input"], name_map)
     if req.get("tool_choice") is not None:
         req["tool_choice"] = _remap_responses_tool_choice(req["tool_choice"], name_map)
@@ -1947,16 +2270,42 @@ def _chat_to_responses_request(chat: dict) -> dict:
         content = m.get("content", "")
         # Preserve cache_control from the chat message for prefix caching
         cache_ctrl = m.get("cache_control")
-        # Tool results must be function_call_output only — never a "role": "tool" input_text (invalid for Responses)
+        # Tool results must be function_call_output only — never a "role": "tool" input_text (invalid for Responses).
+        # output accepte str ou liste de parts (input_text/input_image) :
+        # content-list multimodale préservée au lieu d'être str()-ifiée.
         if role == "tool":
             cid = m.get("tool_call_id", "")
             if not cid:
                 continue
+            if isinstance(content, str):
+                _tool_out: str | list = content
+            elif isinstance(content, list):
+                _tool_out_parts: list[dict] = []
+                for _tb in content:
+                    if not isinstance(_tb, dict):
+                        continue
+                    if _tb.get("type") == "text" and _tb.get("text"):
+                        _tool_out_parts.append(
+                            {"type": "input_text", "text": _tb["text"]}
+                        )
+                    elif _tb.get("type") == "image_url":
+                        _turl = (_tb.get("image_url") or {}).get("url", "")
+                        if not _turl:
+                            continue
+                        # Schéma Responses : input_image = image_url (URL https
+                        # ou data URI base64 tel quel) ou file_id — jamais
+                        # image_base64/mime_type (400 upstream sinon).
+                        _tool_out_parts.append(
+                            {"type": "input_image", "image_url": _turl}
+                        )
+                _tool_out = _tool_out_parts or ""
+            else:
+                _tool_out = str(content)
             inp.append(
                 {
                     "type": "function_call_output",
                     "call_id": cid,
-                    "output": content if isinstance(content, str) else str(content),
+                    "output": _tool_out,
                 }
             )
             continue
@@ -1983,14 +2332,68 @@ def _chat_to_responses_request(chat: dict) -> dict:
                     item["cache_control"] = cache_ctrl
                 inp.append(item)
         elif isinstance(content, list):
-            txt = "\n".join(
-                b.get("text", "")
-                for b in content
-                if isinstance(b, dict) and b.get("type") == "text"
-            )
-            if txt:
-                ctype = "output_text" if role == "assistant" else "input_text"
-                item = {"role": role, "content": [{"type": ctype, "text": txt}]}
+            parts: list[dict] = []
+            for b in content:
+                if not isinstance(b, dict):
+                    continue
+                if b.get("type") == "text" and b.get("text"):
+                    parts.append(
+                        {
+                            "type": "output_text"
+                            if role == "assistant"
+                            else "input_text",
+                            "text": b["text"],
+                        }
+                    )
+                elif b.get("type") == "image_url":
+                    _img_url = (b.get("image_url") or {}).get("url", "")
+                    if not _img_url:
+                        continue
+                    # Schéma Responses : input_image porte image_url (URL https
+                    # ou data URI base64 tel quel) — jamais image_base64 /
+                    # mime_type (rejet 400 upstream : "requires either
+                    # image_url or file_id").
+                    parts.append(
+                        {"type": "input_image", "image_url": _img_url}
+                    )
+                elif b.get("type") == "file":
+                    _fobj = b.get("file") or {}
+                    if not isinstance(_fobj, dict):
+                        continue
+                    if _fobj.get("file_id"):
+                        parts.append(
+                            {"type": "input_file", "file_id": _fobj["file_id"]}
+                        )
+                    elif _fobj.get("file_data"):
+                        _fdata = _fobj["file_data"]
+                        if not _fdata:
+                            continue
+                        # Schéma Responses : input_file = file_data (data URI
+                        # tel quel) + filename — jamais mime_type / file_url.
+                        _fname = _fobj.get("filename") or "document.pdf"
+                        if _fdata.startswith("data:"):
+                            _fdata_norm = _fdata
+                        elif _fdata.startswith("http://") or _fdata.startswith("https://"):
+                            # Pas d'upload Files API côté proxy : un document
+                            # par URL ne peut pas devenir file_data base64 —
+                            # DROP loggé plutôt qu'un data URI mensonger.
+                            _debug("  [convert] DROP file file_data URL → Responses input_file exige file_data base64 ou file_id")
+                            continue
+                        else:
+                            _fhead, _, _fraw = _fdata.partition(",")
+                            _fdata_norm = (
+                                f"data:application/pdf;base64,{_fraw or _fdata}"
+                                if ";" not in (_fhead or "") else _fdata
+                            )
+                        parts.append(
+                            {
+                                "type": "input_file",
+                                "file_data": _fdata_norm,
+                                "filename": _fname,
+                            }
+                        )
+            if parts:
+                item = {"role": role, "content": parts}
                 if cache_ctrl:
                     item["cache_control"] = cache_ctrl
                 inp.append(item)
