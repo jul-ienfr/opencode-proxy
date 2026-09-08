@@ -139,6 +139,9 @@ const LOCALE = {
         'stats.cache_hit_rate': 'Cache Hit Rate',
         'stats.success_rate': 'Success Rate',
         'stats.requests': 'Total Requests',
+        'stats.rpm_1m': 'Req/min (1m)',
+        'stats.rpm_1h': 'Req/min (1h)',
+        'stats.avg_period': 'Avg/min (period)',
         'stats.by_model': 'By Model',
         'stats.by_account': 'By Account',
         'stats.model': 'Model',
@@ -461,6 +464,9 @@ const LOCALE = {
         'stats.cache_hit_rate': 'Cache Hit Rate',
         'stats.success_rate': 'Taux de Succès',
         'stats.requests': 'Total Requêtes',
+        'stats.rpm_1m': 'Req/min (1 min)',
+        'stats.rpm_1h': 'Req/min (1 h)',
+        'stats.avg_period': 'Moy/min (période)',
         'stats.by_model': 'Par Modèle',
         'stats.by_account': 'Par Compte',
         'stats.model': 'Modèle',
@@ -1258,6 +1264,20 @@ function renderStats(data) {
     document.getElementById('cache-hit-rate').textContent = totals.cache_hit_rate != null ? totals.cache_hit_rate + '%' : '0%';
     document.getElementById('success-rate').textContent = totals.success_rate != null ? totals.success_rate + '%' : '—';
     document.getElementById('total-requests').textContent = formatNumber(totals.count);
+
+    const rates = data.rates || {};
+    const el1m = document.getElementById('rate-1m');
+    if (el1m) {
+        el1m.textContent = rates.rpm_1m != null ? rates.rpm_1m.toFixed(1) + '/min' : '—';
+        if (rates.c1m != null) el1m.title = rates.c1m + ' req';
+    }
+    const el1h = document.getElementById('rate-1h');
+    if (el1h) {
+        el1h.textContent = rates.rpm_1h != null ? rates.rpm_1h.toFixed(2) + '/min' : '—';
+        if (rates.c1h != null) el1h.title = rates.c1h + ' req';
+    }
+    const elP = document.getElementById('rate-period');
+    if (elP) elP.textContent = rates.avg_per_min != null ? rates.avg_per_min.toFixed(2) + '/min' : '—';
 
     const tbody = document.getElementById('model-tbody');
     const models = data.models;

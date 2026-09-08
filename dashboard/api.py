@@ -493,6 +493,33 @@ def daysAgo(n: int) -> str:
     return (datetime.now(UTC) - timedelta(days=n)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+_TS_FMT = "%Y-%m-%dT%H:%M:%SZ"
+
+
+def _period_minutes(from_date, to_date, now: datetime | None = None) -> float | None:
+    """Durée en minutes de la période sélectionnée, pour le débit moyen req/min.
+
+    `to_date=today` normalisé = 23:59:59 local (futur) → clampé à `now`, donc pour
+    « Aujourd'hui » la durée = temps écoulé depuis minuit, pas 24 h fixes.
+    Retourne None si indéterminée (bornes absentes/inversées/durée nulle)."""
+    if not from_date or not to_date:
+        return None
+    if now is None:
+        now = datetime.now(UTC)
+    try:
+        start = datetime.strptime(_normalize_date_bound(from_date, False), _TS_FMT).replace(
+            tzinfo=UTC
+        )
+        end = datetime.strptime(_normalize_date_bound(to_date, True), _TS_FMT).replace(tzinfo=UTC)
+    except (ValueError, TypeError):
+        return None
+    end_eff = min(end, now)
+    if end_eff <= start:
+        return None
+    minutes = (end_eff - start).total_seconds() / 60.0
+    return minutes if minutes > 0 else None
+
+
 def _compute_costs(rows, pricing: dict | None = None) -> dict:
     """[v10 §12.3.10] Coût payant + économies free à partir de lignes agrégées.
 
@@ -2128,6 +2155,24 @@ def register_dashboard(
         if cached is not None:
             return cached
 
+        # Sliding windows: absolute UTC bounds, independent of the period filter.
+        now = datetime.now(UTC)
+        now_s = now.strftime(_TS_FMT)
+        b1m = (now - timedelta(seconds=60)).strftime(_TS_FMT)
+        b1h = (now - timedelta(hours=1)).strftime(_TS_FMT)
+        # Rates cache (TTL 5 s, 5 s bucket): 10 s staleness would be 16 % of the
+        # 1-min window, while TTL 0 would scan twice on every SSE event burst.
+        rates_key = f"rates:{station}:{int(now.timestamp()) // 5 * 5}"
+        rates = _stats_cache.get(rates_key)
+
+        # Station clause shared with _build_where (cohérence filtre station).
+        station_cond, station_params = "", []
+        if station is not None and str(station).strip() != "":
+            try:
+                station_cond, station_params = " AND station = ?", [int(station)]
+            except (TypeError, ValueError):
+                pass
+
         def _query_stats(db):
             row = db.execute(
                 "SELECT COALESCE(SUM(tokens_input), 0), COALESCE(SUM(tokens_output), 0),"
@@ -2183,9 +2228,57 @@ def register_dashboard(
                 params,
             ).fetchall()
 
-            return totals, rows, acct_rows
+            c1m, c1h = None, None
+            if rates is None:
+                # Index-only range probes on idx_timestamp (or idx_requests_station_ts).
+                c1m = db.execute(
+                    "SELECT COUNT(*) FROM requests WHERE timestamp >= ? AND timestamp <= ?"
+                    + station_cond,
+                    [b1m, now_s] + station_params,
+                ).fetchone()[0]
+                c1h = db.execute(
+                    "SELECT COUNT(*) FROM requests WHERE timestamp >= ? AND timestamp <= ?"
+                    + station_cond,
+                    [b1h, now_s] + station_params,
+                ).fetchone()[0]
 
-        totals, rows, acct_rows = await _db_read_sync(_query_stats)
+            return totals, rows, acct_rows, c1m, c1h
+
+        totals, rows, acct_rows, c1m, c1h = await _db_read_sync(_query_stats)
+
+        if rates is None:
+            period_minutes = _period_minutes(from_date, to_date, now)
+            if period_minutes is not None and totals["count"] > 0:
+                avg_per_min = totals["count"] / period_minutes
+            elif totals["count"] == 0 and period_minutes is not None:
+                avg_per_min = 0.0
+            else:
+                avg_per_min = None
+            rates = {
+                "c1m": c1m,
+                "rpm_1m": round(c1m / 1.0, 1),
+                "c1h": c1h,
+                "rpm_1h": round(c1h / 60.0, 2),
+                "period_minutes": round(period_minutes, 1) if period_minutes is not None else None,
+                "avg_per_min": round(avg_per_min, 2) if avg_per_min is not None else None,
+            }
+            _stats_cache.set(rates_key, rates, ttl=5)
+        else:
+            # Cached sliding rates, but the period average follows the current filter.
+            period_minutes = _period_minutes(from_date, to_date, now)
+            if period_minutes is not None and totals["count"] > 0:
+                avg_per_min = totals["count"] / period_minutes
+            elif totals["count"] == 0 and period_minutes is not None:
+                avg_per_min = 0.0
+            else:
+                avg_per_min = None
+            rates = {
+                **rates,
+                "period_minutes": round(period_minutes, 1)
+                if period_minutes is not None
+                else None,
+                "avg_per_min": round(avg_per_min, 2) if avg_per_min is not None else None,
+            }
 
         sum_total = totals["total"]
         models = {}
@@ -2230,7 +2323,7 @@ def register_dashboard(
                 "success_rate": round(a_success_rate, 1) if a_success_rate is not None else None,
             }
 
-        result = {"models": models, "accounts": accounts, "totals": totals}
+        result = {"models": models, "accounts": accounts, "totals": totals, "rates": rates}
         _stats_cache.set(cache_key, result, ttl=10)
         return result
 
