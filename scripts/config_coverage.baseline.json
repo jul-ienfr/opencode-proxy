@@ -1,0 +1,16 @@
+{
+  "_comment": "Gate CI (PC-14/O1) : scripts/config_coverage.py --baseline ce_fichier échoue sur toute clé MORTE hors listes.",
+  "morte_connue": [
+    "geo.policies.meta-muse-spark.last_checked_at"
+  ],
+  "_morte_comment": "last_checked_at = métadonnée d'audit humaine (date de vérification de la politique géo), pas un knob — lue par l'opérateur, jamais par le code. Ne pas 'corriger' en la câblant.",
+  "legacy_a_retirer": [
+    "ip_rotation.dual_station",
+    "ip_rotation.vpn_proxy_port_2",
+    "ip_rotation.socks5_proxy_port_2",
+    "ip_rotation.state_file_2",
+    "ip_rotation.compose_service_2",
+    "ip_rotation.credentials_file"
+  ],
+  "_legacy_comment": "Informative (non utilisée par le gate) : secondes sources obsolètes lues pour rétro-compat (resolved_station_count, etc.). Plan de retrait avec ADR — voir audit 2026-09-08 §3.1-H8 / PC-14."
+}

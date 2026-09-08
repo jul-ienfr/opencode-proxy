@@ -756,6 +756,8 @@ def _persist_vpn_config(updates: dict):
                 "auto_hetero_boot": "auto_hetero_boot",
                 "on_429_action": "on_429_action",
                 "bad_ttl": "bad_ttl",
+                # [phase 1] qui choisit les serveurs VPN : proxy | gluetun.
+                "server_pick_mode": "server_pick_mode",
             }
 
         # [free_parallel] nested dict (B) Stations free — validate + merge (preserve existing keys)
@@ -2793,9 +2795,17 @@ def register_dashboard(
             else:
                 try:
                     _all = [m.get_status() for m in managers]
-                    _connected = sum(1 for _s in _all if _s.get("status") == "connected")
+                    # [graceful-aurora] up = connected + degraded.
+                    _connected = sum(1 for _s in _all if _s.get("status") in ("connected", "degraded"))
                     _total = len(_all)
-                    _agg = "connected" if _connected > 0 else ("error" if all(_s.get("status") == "error" for _s in _all) else _all[0].get("status", "not_configured"))
+                    if any(_s.get("status") == "connected" for _s in _all):
+                        _agg = "connected"
+                    elif any(_s.get("status") == "degraded" for _s in _all):
+                        _agg = "degraded"
+                    elif all(_s.get("status") == "error" for _s in _all):
+                        _agg = "error"
+                    else:
+                        _agg = _all[0].get("status", "not_configured")
                     data = _all[0].copy()
                     data["status"] = _agg
                     data["vpn_status"] = _agg
@@ -3166,6 +3176,15 @@ def register_dashboard(
                     content={"error": "on_429_action doit être 'cooldown', 'rotate' ou 'both'"},
                 )
             body["on_429_action"] = _v
+        # [phase 1] qui choisit les serveurs VPN : proxy (nous) | gluetun.
+        if "server_pick_mode" in body:
+            _v = str(body["server_pick_mode"] or "").strip().lower()
+            if _v not in ("proxy", "gluetun"):
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": "server_pick_mode doit être 'proxy' ou 'gluetun'"},
+                )
+            body["server_pick_mode"] = _v
         # bad_ttl — conditional cooldown duration for both/cooldown, 1..3600s
         if "bad_ttl" in body or "cooldown_sec" in body or "badTtl" in body:
             _raw_bt = body.pop("bad_ttl", body.pop("cooldown_sec", body.pop("badTtl", None)))
@@ -3331,7 +3350,7 @@ def register_dashboard(
             return {"error": "gestionnaire VPN non initialisé"}
 
         await shared_state.vpn_manager.refresh_status()
-        if shared_state.vpn_manager.status == "connected":
+        if shared_state.vpn_manager.status in ("connected", "degraded"):
             return {
                 "ok": True,
                 "ip": shared_state.vpn_manager.current_ip,
@@ -3952,7 +3971,7 @@ def register_dashboard(
                 # vpn_event SSE déjà émis par _set_status.
                 _starts = []
                 for mm in managers:
-                    if getattr(mm, "enabled", True) and getattr(mm, "status", "disconnected") != "connected":
+                    if getattr(mm, "enabled", True) and str(getattr(mm, "status", "disconnected") or "disconnected") not in ("connected", "degraded"):
                         _starts.append(
                             asyncio.create_task(
                                 mm.start(),
@@ -3995,7 +4014,7 @@ def register_dashboard(
                 continue
             if st["country"] is None:
                 st["country"] = mg.get("current_country") or None
-            if m.status == "connected" or mg.get("status") == "connected":
+            if m.status in ("connected", "degraded") or mg.get("status") in ("connected", "degraded"):
                 st["connected"] = True
             if st["ip"] is None:
                 st["ip"] = getattr(m, "current_ip", None) or mg.get("ip") or None
@@ -4094,16 +4113,16 @@ def register_dashboard(
         # État agrégé des stations actives.
         status, ip = "not_configured", None
         if managers:
-            connected = [m for m in managers if getattr(m, "status", None) == "connected"]
+            connected = [m for m in managers if getattr(m, "status", None) in ("connected", "degraded")]
             if connected:
-                status = "connected"
+                status = "connected" if any(getattr(m, "status", None) == "connected" for m in managers) else "degraded"
             elif any(getattr(m, "status", None) in ("connecting", "rotating") for m in managers):
                 status = "connecting"
             elif managers:
                 status = "not_connected"
             ip = next((m.current_ip for m in managers if m.current_ip), None)
         nordvpn = {"available": False, "exe": None, "status": None}
-        if status == "connected":
+        if status in ("connected", "degraded"):
             st = await nordvpn_status()
             nordvpn = {"available": True, "exe": None, "status": st}
         # [fix 20/08][Axe 3] Tout l'I/O subprocess/docker est offloadé sur
@@ -4136,6 +4155,8 @@ def register_dashboard(
         if mode == "vpn":
             if status == "connected":
                 rec = "Connexion VPN active — rotation IP opérationnelle"
+            elif status == "degraded":
+                rec = "Connexion VPN dégradée mais routable (reset récent / cooldown / SOCKS) — voir stations"
             elif docker_ok:
                 rec = "Docker OK — VPN non connecté (voir statut ci-dessus)"
             else:

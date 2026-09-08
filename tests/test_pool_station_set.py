@@ -7,9 +7,10 @@ survive the swap: queued entries for downscaled stations become no-ops.
 
 Covered here (offline — the same _Station/_pool helpers as
 test_pool_connection_failure.py, no docker, no loop tasks unless noted):
-  * best-station over 3 stations: preference A (station 1), non-bad wins,
-    walks down to the last standing; C1 never bad-marks the last standing
-    station when 2 others are already bad.
+   * best-station over 3 stations: preference A (station 1), non-bad wins,
+     walks down to the last standing; [PC-10] la garde N-2 succède au C1
+     strict : la dernière servable est marquée (traçable) mais servie en
+     dégradé — jamais 0 candidat tant qu'un tunnel est up.
   * set_stations: replaces the set sorted numerically (station 1 stays the
     preferred pass), prunes _per/_pending/_rotation_tasks of removed
     stations while PRESERVING the remaining stations' state, filters None.
@@ -81,27 +82,31 @@ def test_best_station_skips_bad_stations_down_to_the_last():
 
 
 def test_best_station_none_when_all_bad():
-    """C1 only protects the LAST STANDING station — a station that is
-    merely disconnected (e.g. compose up failed) is not usable either,
-    so with every station unusable the pool walks to None."""
+    """[PC-10] plus jamais 0 candidat : 2 marquées + 1 déconnectée ⇒ la
+    dégradée sert (dernier recours). None seulement si RIEN n'est servable
+    (tous les tunnels down — l'override ne contourne jamais le statut)."""
     s1, s2, s3 = _stations3(p := _pool(_Station(1)))
     p.notify_connection_failure(s1)
     p.notify_connection_failure(s2)
     s3.status = "disconnected"  # not bad-marked, but not connected
+    assert p._best_station() is s2, "dégradée mais servie (garde N-2)"
+    assert p._per_station(s2)["degraded_override"] is True
+    s1.status = "disconnected"
+    s2.status = "disconnected"
     assert p._best_station() is None
 
 
 def test_c1_last_standing_holds_with_3():
-    """Never bad-mark the last standing station — with 3 stations the guard
-    must see two bad ones AND refuse to mark the third."""
+    """[PC-10] la garde N-2 succède au C1 strict : la dernière servable est
+    marquée (traçable, bad_until posé) MAIS reste servie en dégradé —
+    l'esprit C1 (jamais 0 servable) est préservé et renforcé."""
     s1, s2, s3 = _stations3(p := _pool(_Station(1)))
     p.notify_connection_failure(s1)
     p.notify_connection_failure(s2)
     p.notify_connection_failure(s3)  # last one standing
-    assert p._per_station(s3)["bad_until"] is None, (
-        "C1: the last usable station is never bad-marked"
-    )
-    assert p._best_station() is s3
+    assert p._per_station(s3)["bad_until"] is not None, "marquée (traçable)"
+    assert p._per_station(s3)["degraded_override"] is True, "…mais servie"
+    assert p._best_station() in (s2, s3), "dégradées en dernier recours, jamais 0"
 
 
 # ── set_stations (hot-reload swap) ───────────────────────────────

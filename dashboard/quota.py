@@ -516,7 +516,18 @@ def parse_quota_html(html: str) -> dict:
 
 # ── HTTP fetch ──
 
-QUOTA_FETCH_INTERVAL = 300  # 5 minutes
+def _quota_fetch_interval() -> float:
+    """[PC-14/O1] ``background.quota_fetch_interval`` (clé morte avant
+    l'audit 2026-09-08) — borné [60, 3600], défaut 300 s (5 minutes)."""
+    try:
+        from config.settings import yaml_get as _yaml_get
+
+        return max(60.0, min(3600.0, float(_yaml_get("background", "quota_fetch_interval", 300) or 300)))
+    except Exception:
+        return 300.0
+
+
+QUOTA_FETCH_INTERVAL = _quota_fetch_interval()
 
 # ── Use Balance toggle ──
 # SolidJS server action hashes (reverse-engineered from OpenCode frontend)

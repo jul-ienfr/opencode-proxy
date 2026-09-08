@@ -83,6 +83,14 @@ def _cfg(tmp_path, **over):
         "egress_failure_tick_interval": 2.0,
         "ip_probe_budget": 8.0,
         "control_pin_catchup": 0.0,
+        # [graceful-aurora] comportement watchdog historique pour les suites
+        # existantes (rollback LOT D : grâce 0 = restart immédiat, seuil
+        # egress 3 = effectif 3). Les nouveaux LOTs testent la grâce avec
+        # leurs propres overrides.
+        "watchdog_auth_grace_s": 0,
+        "watchdog_egress_grace_ticks": 3,
+        "watchdog_max_restarts_per_hour": 10,
+        "ov_auth_station_threshold": 999,
     }
     cfg.update(over)
     return cfg

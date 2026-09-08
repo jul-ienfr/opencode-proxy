@@ -7,7 +7,7 @@ no [vpn] / [vpn-watchdog] trace in logs/debug.log and concluded the proxy
 ``lg.handlers = [h]`` + ``lg.propagate = False`` on vpn_manager /
 free_ip_pool, REPLACING the debug.log FileHandler installed at startup by
 attach_module_logger(). The watchdog's
-"[vpn-watchdog] AUTH_FAILED detected — restarting ..." (a WARNING) went only
+"[vpn-watchdog] s1 action=restart reason=AUTH_FAILED" (a WARNING) went only
 to the GUI panel, never to the log file.
 
 The fix — dashboard.display.attach_panel_logger — APPENDS the panel handler
@@ -31,7 +31,7 @@ import pytest
 
 from dashboard import display as _disp
 
-_AUTH_LINE = "[vpn-watchdog] AUTH_FAILED detected — restarting vpn"
+_AUTH_LINE = "[vpn-watchdog] s1 action=restart reason=AUTH_FAILED"
 _ROT_LINE = "[vpn] rotated → IP 187.40.35.141 (switch #183)"
 
 
@@ -89,8 +89,9 @@ def test_warning_auth_failed_reaches_debug_log(vpn_log):
     hits = _lines_containing(_file_lines(logfile), _AUTH_LINE)
     assert hits, "AUTH_FAILED watchdog line is missing from debug.log"
     # debug.log's bracketed-timestamp format, e.g.
-    # "[2026-08-17 18:54:50] [vpn_manager] [vpn-watchdog] AUTH_FAILED ..."
-    assert re.match(r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\] \[vpn_manager\] ", hits[0]), (
+    # "[2026-08-17 18:54:50Z] [vpn_manager] [vpn-watchdog] AUTH_FAILED ..."
+    # ([graceful-aurora LOT G] UTC, suffixe Z).
+    assert re.match(r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}Z\] \[vpn_manager\] ", hits[0]), (
         f"unexpected format: {hits[0]!r}"
     )
 
@@ -129,9 +130,13 @@ def test_panel_attach_is_idempotent(vpn_log):
 
 def test_formatter_matches_debug_log_style(vpn_log):
     """FileHandler format must equal debug.log's bracketed-timestamp style."""
+    import time as _time
+
     logfile, logger = vpn_log
     fh = _disp.attach_module_logger("vpn_manager")
     fmt = fh.formatter
     assert isinstance(fmt, logging.Formatter)
-    assert fmt._fmt == "[%(asctime)s] [%(name)s] %(message)s"
+    # [graceful-aurora LOT G] UTC : suffixe Z + converter gmtime (docker = UTC).
+    assert fmt._fmt == "[%(asctime)sZ] [%(name)s] %(message)s"
     assert fmt.datefmt == "%Y-%m-%d %H:%M:%S"
+    assert fmt.converter == _time.gmtime

@@ -31,6 +31,62 @@ _DEBUG_MAX_SIZE = 10 * 1024 * 1024  # Auto-rotate when file exceeds 10 MB
 _extra_handlers: list = []  # FileHandlers attached to module loggers (vpn_manager, free_ip_pool)
 
 
+def _cfg_int(section: str, key: str, default: int, lo: int, hi: int) -> int:
+    """[PC-14/O1] lit un knob config.yaml (borné ; défaut = historique)."""
+    try:
+        v = int(_cfg_settings.yaml_get(section, key, default))
+    except (TypeError, ValueError):
+        return default
+    return max(lo, min(hi, v))
+
+
+def refresh_display_config() -> dict:
+    """[PC-14/O1] (re)lit les knobs d'affichage depuis config.yaml.
+
+    Clés mortes avant l'audit 2026-09-08 : ``dashboard.display_lines``,
+    ``debug.log_lines_max``, ``debug.flush_interval`` (+ ``debug.max_size``
+    qui divergeait : 50 Mo config vs 10 Mo codés en dur — le fichier gagne).
+    Appelée à l'import ; ré-appelable sur hot-reload (le deque est
+    reconstruit en conservant les lignes si maxlen change).
+    """
+    global LOG_VISIBLE, _DEBUG_FLUSH_INTERVAL, _DEBUG_MAX_SIZE, log_lines
+    LOG_VISIBLE = _cfg_int("dashboard", "display_lines", 35, 5, 200)
+    _DEBUG_FLUSH_INTERVAL = _cfg_int("debug", "flush_interval", 10, 1, 1000)
+    _DEBUG_MAX_SIZE = _cfg_int(
+        "debug", "max_size", 10 * 1024 * 1024, 1024 * 1024, 1024 * 1024 * 1024
+    )
+    _max = _cfg_int("debug", "log_lines_max", 200, 10, 10000)
+    if log_lines.maxlen != _max:
+        log_lines = collections.deque(log_lines, maxlen=_max)
+    return {
+        "display_lines": LOG_VISIBLE,
+        "log_lines_max": log_lines.maxlen,
+        "flush_interval": _DEBUG_FLUSH_INTERVAL,
+        "max_size": _DEBUG_MAX_SIZE,
+    }
+
+
+refresh_display_config()  # applique config.yaml dès l'import
+
+
+def _utc_formatter(fmt: str, datefmt: str) -> logging.Formatter:
+    """[graceful-aurora LOT G] Formatter UTC : les conteneurs gluetun loguent
+    en UTC (``docker logs`` = UTC natif) — le proxy aussi, sinon toute
+    corrélation proxy↔docker exige une conversion manuelle (source d'erreurs,
+    cf. incident 07/09). ``converter = time.gmtime`` + suffixe ``Z``."""
+    f = logging.Formatter(fmt, datefmt=datefmt)
+    try:
+        f.converter = time.gmtime  # type: ignore[assignment]
+    except Exception:
+        pass
+    return f
+
+
+def _utc_file_timestamp() -> str:
+    """Timestamp fichier UTC avec suffixe Z (même convention que _utc_formatter)."""
+    return time.strftime("%Y-%m-%d %H:%M:%SZ", time.gmtime())
+
+
 def _rotate_debug_log():
     """Rotate debug.log → debug.log.1 when it exceeds _DEBUG_MAX_SIZE."""
     global _debug_file, _debug_file_path
@@ -87,12 +143,28 @@ def attach_module_logger(name: str, level: int = logging.INFO):
     logger = logging.getLogger(name)
     if logger.level == logging.NOTSET or logger.level > level:
         logger.setLevel(level)
+    # [PC-13/F8] idempotent : un second attach (re-exécution du lifespan,
+    # GUI + serveur) réutilise le handler existant au lieu d'empiler un
+    # doublon qui émettrait chaque ligne 2× dans debug.log.
+    try:
+        _target = os.path.abspath(_debug_file_path)
+    except Exception:
+        _target = None
+    for _h in list(logger.handlers):
+        try:
+            if _target is not None and os.path.abspath(
+                getattr(_h, "baseFilename", "") or ""
+            ) == _target:
+                return _h
+        except Exception:
+            pass
     fh = logging.FileHandler(_debug_file_path, encoding="utf-8")
     # Same bracketed-timestamp style as debug()/log() writes to debug.log,
-    # e.g. "[2026-08-17 18:54:50] [vpn_manager] [vpn-watchdog] ...". Keeping
+    # e.g. "[2026-08-17 18:54:50Z] [vpn_manager] [vpn-watchdog] ...". Keeping
     # one consistent format lets header-anchored greps find both paths.
+    # [graceful-aurora LOT G] UTC (converter gmtime + Z) — docker logs = UTC.
     fh.setFormatter(
-        logging.Formatter("[%(asctime)s] [%(name)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+        _utc_formatter("[%(asctime)sZ] [%(name)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
     )
     fh.setLevel(level)
     logger.addHandler(fh)
@@ -137,8 +209,8 @@ def debug(msg: str):
         try:
             global _debug_write_counter
             _rotate_debug_log()  # Auto-rotate if file is too large
-            ts = time.strftime("%Y-%m-%d %H:%M:%S")
-            _debug_file.write(f"[{ts}] {msg}\n")
+            # [graceful-aurora LOT G] UTC (docker logs = UTC).
+            _debug_file.write(f"[{_utc_file_timestamp()}] {msg}\n")
             _debug_write_counter += 1
             if _debug_write_counter >= _DEBUG_FLUSH_INTERVAL:
                 _debug_file.flush()
@@ -188,8 +260,8 @@ class RichLogHandler(logging.Handler):
             try:
                 global _debug_write_counter
                 _rotate_debug_log()  # Auto-rotate if file is too large
-                fts = time.strftime("%Y-%m-%d %H:%M:%S")
-                _debug_file.write(f"[{fts}] [{level}] {msg}\n")
+                # [graceful-aurora LOT G] UTC (docker logs = UTC).
+                _debug_file.write(f"[{_utc_file_timestamp()}] [{level}] {msg}\n")
                 _debug_write_counter += 1
                 if _debug_write_counter >= _DEBUG_FLUSH_INTERVAL:
                     _debug_file.flush()

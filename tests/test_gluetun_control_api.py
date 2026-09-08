@@ -252,12 +252,26 @@ class TestControlReading:
 # ── _control_pin_country: PUT + poll-until-running ───────────────
 
 
+
+def _pin_cfg(tmp_path, **over):
+    """Pin-mechanics tests: perimeter includes every country pinned below.
+
+    [PC-11] the out-of-perimeter guard would otherwise refuse (the pinned
+    country is incidental to these mechanics tests — PUT/poll/catch-up).
+    least-loaded off: hostname shortlists would pollute the asserted
+    country-only payloads (covered by TestServerPickMode instead).
+    """
+    over.setdefault("server_countries", "Germany,France,Czechia,Poland")
+    over.setdefault("least_loaded_enabled", False)
+    return _cfg(tmp_path, **over)
+
+
 class TestControlPinCountry:
     @pytest.mark.asyncio
     async def test_pin_success_polls_to_running(self, tmp_path):
         """204 (empty stdout) → poll status until 'running' → True."""
         mgr = ControlFakeVPNManager(
-            _cfg(tmp_path, control_api_key="k", wait_healthy_poll=0.01),  # fast poll for the test
+            _pin_cfg(tmp_path, control_api_key="k", wait_healthy_poll=0.01),  # fast poll for the test
             tmp_path=tmp_path,
         )
         # PUT returns [] (204 success); status returns running.
@@ -275,7 +289,7 @@ class TestControlPinCountry:
         """ "[incident 17/08] A NordVPN file-style country name is normalized
         to gluetun's canonical name BEFORE the PUT — 'Czechia' must be sent
         as 'Czech Republic' (never a 'not in choices' WARN)."""
-        mgr = ControlFakeVPNManager(_cfg(tmp_path, control_api_key="k"), tmp_path=tmp_path)
+        mgr = ControlFakeVPNManager(_pin_cfg(tmp_path, control_api_key="k"), tmp_path=tmp_path)
         mgr.stdout_by_fragment = {
             "/v1/vpn/settings": "",
             "/v1/vpn/status": '{"status":"running"}',
@@ -296,7 +310,7 @@ class TestControlPinCountry:
         self-correction: the 18:11:55Z AUTH_FAILED took ~2 min to clear
         before this fix."""
         mgr = ControlFakeVPNManager(
-            _cfg(tmp_path, control_api_key="k", wait_healthy_poll=0.01), tmp_path=tmp_path
+            _pin_cfg(tmp_path, control_api_key="k", wait_healthy_poll=0.01), tmp_path=tmp_path
         )
         mgr.stdout_by_fragment = {
             "/v1/vpn/settings": "",
@@ -316,7 +330,7 @@ class TestControlPinCountry:
         the fake; this pins the wider failure surface: BOTH dead-server
         signatures short-circuit a pin."""
         mgr = ControlFakeVPNManager(
-            _cfg(tmp_path, control_api_key="k", wait_healthy_poll=0.01), tmp_path=tmp_path
+            _pin_cfg(tmp_path, control_api_key="k", wait_healthy_poll=0.01), tmp_path=tmp_path
         )
         mgr.stdout_by_fragment = {
             "/v1/vpn/settings": "",
@@ -335,7 +349,7 @@ class TestControlPinCountry:
         (2.5 min rotations). The body "running" must be ACCEPTED and the
         status poll must then confirm the tunnel is up."""
         mgr = ControlFakeVPNManager(
-            _cfg(tmp_path, control_api_key="k", wait_healthy_poll=0.01), tmp_path=tmp_path
+            _pin_cfg(tmp_path, control_api_key="k", wait_healthy_poll=0.01), tmp_path=tmp_path
         )
         # PUT answers 200 + "running" (the real gluetun success signature);
         # the trailing status poll then confirms running.
@@ -354,7 +368,7 @@ class TestControlPinCountry:
         flicker 'stopped' mid-reconnect before 'running'. The poll must keep
         waiting through the transient stop (never report the pin failed)."""
         mgr = ControlFakeVPNManager(
-            _cfg(tmp_path, control_api_key="k", wait_healthy_poll=0.01), tmp_path=tmp_path
+            _pin_cfg(tmp_path, control_api_key="k", wait_healthy_poll=0.01), tmp_path=tmp_path
         )
         mgr.stdout_by_fragment = {
             "/v1/vpn/settings": "running",
@@ -374,7 +388,7 @@ class TestControlPinCountry:
     @pytest.mark.asyncio
     async def test_pin_rejected_nonempty_stdout(self, tmp_path):
         """A non-empty PUT response is an error body → False, no status poll."""
-        mgr = ControlFakeVPNManager(_cfg(tmp_path, control_api_key="k"), tmp_path=tmp_path)
+        mgr = ControlFakeVPNManager(_pin_cfg(tmp_path, control_api_key="k"), tmp_path=tmp_path)
         mgr.control_stdout = '{"message":"bad request"}'
         assert await mgr._control_pin_country("France", timeout=1) is False
         assert mgr.calls["docker_run"] == 1  # only the PUT, no status poll
@@ -388,7 +402,10 @@ class TestControlPinCountry:
         live log."""
         import logging
 
-        mgr = ControlFakeVPNManager(_cfg(tmp_path, control_api_key="k"), tmp_path=tmp_path)
+        mgr = ControlFakeVPNManager(
+            _pin_cfg(tmp_path, control_api_key="k", egress_allow_any_country=True),
+            tmp_path=tmp_path,
+        )
         mgr.control_stdout = (
             "ERROR: provider.server_selection.countries: "
             "values atlantis are not in choices Afghanistan, "
@@ -404,7 +421,7 @@ class TestControlPinCountry:
     async def test_pin_stopped_until_timeout(self, tmp_path):
         """Status stays 'stopped' → poll until the deadline → False."""
         mgr = ControlFakeVPNManager(
-            _cfg(tmp_path, control_api_key="k", wait_healthy_poll=0.01), tmp_path=tmp_path
+            _pin_cfg(tmp_path, control_api_key="k", wait_healthy_poll=0.01), tmp_path=tmp_path
         )
         mgr.stdout_by_fragment = {
             "/v1/vpn/settings": "",
@@ -416,7 +433,7 @@ class TestControlPinCountry:
     async def test_pin_control_down_falls_back(self, tmp_path):
         """Control server unreachable (rc != 0) → pin fails → the rotation
         path falls back to the legacy container-restart branch."""
-        mgr = ControlFakeVPNManager(_cfg(tmp_path, control_api_key="k"), tmp_path=tmp_path)
+        mgr = ControlFakeVPNManager(_pin_cfg(tmp_path, control_api_key="k"), tmp_path=tmp_path)
         mgr.control_rc = 1
         mgr.ips = ["1.2.3.4"]
         mgr._status = vm.VPNState.DISCONNECTED
@@ -435,7 +452,7 @@ class TestControlPinCountry:
         445 s stall class was a 'connected' tunnel that never answered.
         True the moment an IP answers, not at the catch-up wall."""
         mgr = ControlFakeVPNManager(
-            _cfg(tmp_path, control_api_key="k", wait_healthy_poll=0.01), tmp_path=tmp_path
+            _pin_cfg(tmp_path, control_api_key="k", wait_healthy_poll=0.01), tmp_path=tmp_path
         )
         mgr.stdout_by_fragment = {
             "/v1/vpn/settings": "",
@@ -463,7 +480,7 @@ class TestControlPinCountry:
         import logging
 
         mgr = ControlFakeVPNManager(
-            _cfg(tmp_path, control_api_key="k", wait_healthy_poll=0.01), tmp_path=tmp_path
+            _pin_cfg(tmp_path, control_api_key="k", wait_healthy_poll=0.01), tmp_path=tmp_path
         )
         mgr.stdout_by_fragment = {
             "/v1/vpn/settings": "",
@@ -496,7 +513,7 @@ class TestControlPinCountry:
         """catchup=0 (the rotation-pin default): 'running' IS the verdict —
         True immediately, ZERO IP probes. Exact legacy behavior."""
         mgr = ControlFakeVPNManager(
-            _cfg(tmp_path, control_api_key="k", wait_healthy_poll=0.01), tmp_path=tmp_path
+            _pin_cfg(tmp_path, control_api_key="k", wait_healthy_poll=0.01), tmp_path=tmp_path
         )
         mgr.stdout_by_fragment = {
             "/v1/vpn/settings": "",
@@ -521,7 +538,7 @@ class TestControlPinCountry:
         import logging
 
         mgr = ControlFakeVPNManager(
-            _cfg(tmp_path, control_api_key="k", wait_healthy_poll=0.01), tmp_path=tmp_path
+            _pin_cfg(tmp_path, control_api_key="k", wait_healthy_poll=0.01), tmp_path=tmp_path
         )
         mgr.stdout_by_fragment = {
             "/v1/vpn/settings": "",
@@ -1186,6 +1203,10 @@ class TestStackSelector:
         mgr.ips = ["1.2.3.4"]  # tunnel OV sain
 
         async def _canary_dead(reason):
+            # Verdict négatif MESURÉ (SANS EGRESS, cf. _wg_canary_alive) —
+            # pas un bring-up échoué (indéterminé : flip maintenu, PC-7).
+            mgr._wg_canary_state["ok"] = False
+            mgr._wg_canary_state["at"] = mgr._now_fn()
             return False  # provider WG black-hole silencieux
 
         monkeypatch.setattr(mgr, "_wg_canary_alive", _canary_dead)

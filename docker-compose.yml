@@ -3,6 +3,16 @@
 # share one stanza instead of duplicating it. Stations 1-2 keep their
 # historical literal blocks.
 x-gluetun-multi-base: &gluetun-multi-base
+  # [PC-12 audit 2026-09-08, révisé 2026-09-08] :latest VOULU (pas :latest par
+  # négligence) : la dernière release v3.41.3 (30/07) ne contient PAS les
+  # hotfixes master postérieurs — firewall netlink (connexions droppées au
+  # setup, 01/09), iptables vs Docker NAT chains (23/08), crash control
+  # server après PUT ports (31/08), servers data v0.2.0 (06/08). Tous
+  # impactent directement cette flotte (FIREWALL:on, pins PUT constants).
+  # Dès que v3.42.0 sort : re-pinner en version (pull idempotent).
+  # IMPORTANT : `docker compose pull` frais au déploiement (le tag bouge).
+  # Vérifié le 2026-09-08 : sha256:89e3cbe22e0d6f09a18d3e86269392fd9f7f08e8991040741e577f8f127cdfe4
+  # (revision 0fef7b2 = master post-hotfixes firewall/DNS 01/09, prouvé via API GitHub).
   image: qmcgaw/gluetun:latest
   cap_add:
     - NET_ADMIN
@@ -16,14 +26,15 @@ x-gluetun-multi-base: &gluetun-multi-base
     - path: vpn_configs/wireguard.env
       required: false
   restart: unless-stopped
-  # [plan] local healthcheck — control server instead of external egress
-  # (see vpn-gluetun comment: $$ escapes compose interpolation so the sh in
-  # the container expands the key from its own env).
+  # [PC-6 audit 2026-09-08] healthcheck = EGRESS RÉELLE : le probe traverse
+  # le tunnel (kill-switch gluetun : VPN down = wget bloqué = unhealthy).
+  # L'ancien test interrogeait /v1/vpn/status LOCAL (connecté ≠ egress) et
+  # fabriquait le faux « gluetun non sain » de la boucle watchdog (H3/F1).
   healthcheck:
-    test: ["CMD-SHELL", "wget -q -O - -T 5 --header=\"X-API-Key: $$VPN_CONTROL_API_KEY\" http://127.0.0.1:8000/v1/vpn/status"]
+    test: ["CMD-SHELL", "wget -q -O /dev/null -T 12 http://api.ipify.org || exit 1"]
     interval: 30s
-    timeout: 5s
-    retries: 3
+    timeout: 15s
+    retries: 2
     start_period: 60s
 
 x-gluetun-multi-env: &gluetun-multi-env
@@ -37,14 +48,20 @@ x-gluetun-multi-env: &gluetun-multi-env
   VPN_SERVICE_PROVIDER: nordvpn
   OPENVPN_VERBOSITY: '4'   # hostname in logs (see vpn-gluetun comment)
   SERVER_COUNTRIES: ${SERVER_COUNTRIES:?Set SERVER_COUNTRIES from config.yaml - run python scripts/make_credentials_env.py}
-  UPDATER_PERIOD: 24h
+  # [PC-8 audit 2026-09-08] source UNIQUE de fraîcheur = le refresh
+  # applicatif (incident + périodique server_list_refresh_interval_s).
+  # UPDATER_PERIOD volontairement absent (défaut gluetun sinon) : deux
+  # sources = cache écrasé en course avec le wipe.
   HTTPPROXY: 'on'
   SOCKS5_ENABLED: 'on'
-  # [incident v10] DoT par défaut de cette image flanche à travers certains
-  # tunnels WG -> résolutions intermittentes -> probes proxy en erreur.
-  # Plain UDP 53 vers 1.1.1.1 dans le tunnel : fiable.
-  # (DNS_ADDRESS marche mais est legacy — nom moderne ci-dessous.)
-  DNS_UPSTREAM_PLAIN_ADDRESSES: 1.1.1.1:53
+  # [plan B 2026-09-08] DNS chiffré (DoT) au lieu de plain UDP/53 :
+  # l'UDP/53 sortant des conteneurs est mort au niveau Docker Desktop
+  # (prouvé : timeout 1.1.1.1/8.8.8.8, TCP/443 OK) — le plain ne peut plus
+  # marcher. DoT = TCP/853. Historique v10 (DoT flanchait) périmé : pool
+  # DoT corrigé build 01/09. Repli possible : RESOLVER_TYPE=doh (443 prouvé)
+  # ou re-plain si le plan réseau change. Recommandation wiki : 2 providers.
+  DNS_UPSTREAM_RESOLVER_TYPE: dot
+  DNS_UPSTREAM_RESOLVERS: cloudflare,google
   # [incident v10] PMTUD échoue systématiquement sur ce réseau (ICMP+TCP) ->
   # MTU retombé à 1320 insuffisant : les gros paquets TLS des probes
   # black-holent -> stations en error intermittentes. Knob officiel FAQ
@@ -169,12 +186,14 @@ services:
       # choices" and silently break the rotation.
       # Source unique: config.yaml ip_rotation.server_countries (no inline fallback, audit F-H5).
       - SERVER_COUNTRIES=${SERVER_COUNTRIES:?Set SERVER_COUNTRIES from config.yaml - see .env.example}
-      - UPDATER_PERIOD=24h   # gluetun refreshes its own servers list every 24h (prevent stale list)
+      # [PC-8] pas de UPDATER_PERIOD : source unique = refresh applicatif.
       - HTTPPROXY=on
       - HTTPPROXY_LISTENING_ADDRESS=:8888
       - SOCKS5_ENABLED=on
       - SOCKS5_LISTENING_ADDRESS=:1080
-      - DNS_ADDRESS=1.1.1.1
+      # [plan B 2026-09-08] DoT (cf. ancre) — pas de plain UDP (mort).
+      - DNS_UPSTREAM_RESOLVER_TYPE=dot
+      - DNS_UPSTREAM_RESOLVERS=cloudflare,google
       # [incident v10] blocs littéraux st1/st2 : le MTU de l'ancre partagée
       # n'atteint pas ces services — TLS black-holait au-delà de ~1300 octets.
       - WIREGUARD_MTU=1280
@@ -199,16 +218,13 @@ services:
       # OPENVPN_CUSTOM_CONFIG env above points inside it.
       - ./vpn_configs/custom:/vpn-custom:ro
     restart: unless-stopped
-    # [plan] local healthcheck — hits the control server, NOT external
-    # egress (api.ipify.org at every 30s wasted bandwidth and depended on
-    # an external resolver). $$VPN_CONTROL_API_KEY: the escaped dollar keeps
-    # compose from interpolating it from the HOST env — the sh in the
-    # container expands it from its own env (credentials.env).
+    # [PC-6 audit 2026-09-08] healthcheck = egress réelle via le tunnel
+    # (cf. ancre x-gluetun-multi-base) — jamais le status local.
     healthcheck:
-      test: ["CMD-SHELL", "wget -q -O - -T 5 --header=\"X-API-Key: $$VPN_CONTROL_API_KEY\" http://127.0.0.1:8000/v1/vpn/status"]
+      test: ["CMD-SHELL", "wget -q -O /dev/null -T 12 http://api.ipify.org || exit 1"]
       interval: 30s
-      timeout: 5s
-      retries: 3
+      timeout: 15s
+      retries: 2
       start_period: 60s
 
   # Station 2 ("double embrayage"): a second independent tunnel on its own
@@ -264,12 +280,14 @@ services:
       # choices" and silently break the rotation.
       # Source unique: config.yaml ip_rotation.server_countries (no inline fallback, audit F-H5).
       - SERVER_COUNTRIES=${SERVER_COUNTRIES:?Set SERVER_COUNTRIES from config.yaml - see .env.example}
-      - UPDATER_PERIOD=24h   # gluetun refreshes its own servers list every 24h (prevent stale list)
+      # [PC-8] pas de UPDATER_PERIOD : source unique = refresh applicatif.
       - HTTPPROXY=on
       - HTTPPROXY_LISTENING_ADDRESS=:8889
       - SOCKS5_ENABLED=on
       - SOCKS5_LISTENING_ADDRESS=:1081
-      - DNS_ADDRESS=1.1.1.1
+      # [plan B 2026-09-08] DoT (cf. ancre) — pas de plain UDP (mort).
+      - DNS_UPSTREAM_RESOLVER_TYPE=dot
+      - DNS_UPSTREAM_RESOLVERS=cloudflare,google
       - WIREGUARD_MTU=1280
       - OPENVPN_MSSFIX=1280
       - FIREWALL=on
@@ -284,12 +302,13 @@ services:
       # OPENVPN_CUSTOM_CONFIG env above points inside it.
       - ./vpn_configs/custom:/vpn-custom:ro
     restart: unless-stopped
-    # [plan] local healthcheck — control server instead of external egress.
+    # [PC-6 audit 2026-09-08] healthcheck = egress réelle via le tunnel
+    # (cf. ancre x-gluetun-multi-base) — jamais le status local.
     healthcheck:
-      test: ["CMD-SHELL", "wget -q -O - -T 5 --header=\"X-API-Key: $$VPN_CONTROL_API_KEY\" http://127.0.0.1:8000/v1/vpn/status"]
+      test: ["CMD-SHELL", "wget -q -O /dev/null -T 12 http://api.ipify.org || exit 1"]
       interval: 30s
-      timeout: 5s
-      retries: 3
+      timeout: 15s
+      retries: 2
       start_period: 60s
 
   # Stations 3-10 ("multi-station", plan 18/08): N parallel tunnels on
@@ -501,7 +520,9 @@ services:
       - HTTPPROXY_LISTENING_ADDRESS=:8898
       - SOCKS5_ENABLED=on
       - SOCKS5_LISTENING_ADDRESS=:1090
-      - DNS_ADDRESS=1.1.1.1
+      # [plan B 2026-09-08] DoT (cf. ancre) — pas de plain UDP (mort).
+      - DNS_UPSTREAM_RESOLVER_TYPE=dot
+      - DNS_UPSTREAM_RESOLVERS=cloudflare,google
       - FIREWALL=on
       - PUID=1000
       - PGID=1000

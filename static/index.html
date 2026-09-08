@@ -395,6 +395,18 @@
                                 <div id="vpn-stack-loading" style="color:var(--text-muted)">…</div>
                             </div>
                         </div>
+                        <!-- [phase 1] Qui choisit les serveurs VPN : proxy (nous) ou gluetun -->
+                        <div id="vpn-pick-section" style="margin-top:14px;padding:12px;background:var(--bg-secondary);border-radius:8px">
+                            <div style="display:flex;justify-content:space-between;align-items:center">
+                                <strong style="font-size:13px">Choix des serveurs</strong>
+                                <select id="vpn-pick-select" class="config-input" style="width:220px;font-size:12px">
+                                    <option value="proxy">Proxy — nous (recommandé)</option>
+                                    <option value="gluetun">Gluetun — délégué</option>
+                                </select>
+                                <button onclick="vpnSavePickMode()" style="padding:4px 12px;font-size:12px">Enregistrer</button>
+                            </div>
+                            <div style="font-size:11px;color:var(--text-muted);margin-top:6px">Proxy : le proxy impose les serveurs les moins chargés (pays + hostnames). Gluetun : le proxy ne fixe que le pays, gluetun choisit le serveur seul.</div>
+                        </div>
                         <!-- Stations VPN parallèles ("double embrayage") -->
                         <div id="vpn-dual-section" style="margin-top:14px;padding:12px;background:var(--bg-secondary);border-radius:8px">
                             <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">

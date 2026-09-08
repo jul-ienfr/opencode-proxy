@@ -461,6 +461,13 @@ _current_user_agent: contextvars.ContextVar[str | None] = contextvars.ContextVar
     "_current_user_agent", default=None
 )
 
+# [PC-16 audit 2026-09-08] IP cliente de la requête courante (F9) — lue par
+# _log_free_model_usage pour lever l'ambiguïté ip= (client vs egress).
+# Même pattern que _current_user_agent (jamais de fuite inter-requêtes).
+_current_client_ip: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "_current_client_ip", default=None
+)
+
 # Context variable carrying the free-channel attempt (egress IP + identity profile)
 # from the two places a free request actually leaves (_try_free_model_first,
 # _open_free_stream) to the leaf _save_request — same pattern as _current_user_agent.
@@ -890,6 +897,7 @@ def _log_free_model_usage(
     tokens_out: int = 0,
     duration_ms: int = 0,
     ip: str = "",
+    client_ip: str = "",
 ):
     """Log a free model request to the database for quota analysis.
 
@@ -898,8 +906,20 @@ def _log_free_model_usage(
     l'INSERT+commit s'exécute dans le thread writer, commits groupés.
     Sémantique fail-soft inchangée : erreur SQL loguée côté writer, jamais
     propagée à la requête. Le masquage de clé reste ici (seam visible).
-    Fraîcheur dashboard : instant → ≤5 s (table display-only, aucun routage)."""
+    Fraîcheur dashboard : instant → ≤5 s (table display-only, aucun routage).
+
+    [PC-16 audit 2026-09-08] F9 : ``ip`` est l'IP d'EGRESS (jamais la
+    cliente — un 192.168.x ici = anomalie de sonde, pas un client). La
+    ligne de log distingue ``client_ip`` (requête, via ContextVar quand
+    l'appelant ne la passe pas) de ``egress_ip``. Colonne DB ``ip``
+    inchangée (egress, pas de migration).
+    """
     try:
+        if not client_ip:
+            try:
+                client_ip = _current_client_ip.get() or ""
+            except Exception:
+                client_ip = ""
         timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         row = (
             timestamp,
@@ -916,7 +936,7 @@ def _log_free_model_usage(
         _db_queue.put_nowait(("free_usage", row))
         _debug(
             f"  [free-usage] queued: {free_model} key={api_key[:8]}... ws={workspace_id[:12]}... "
-            f"status={status} ip={ip} in={tokens_in} out={tokens_out}"
+            f"status={status} client_ip={client_ip} egress_ip={ip} in={tokens_in} out={tokens_out}"
         )
     except asyncio.QueueFull:
         _debug(f"  [free-usage] queue full — dropped usage row for {free_model}")
@@ -1444,6 +1464,20 @@ def _sync_station_supervisors(shared_state) -> None:
         _debug(f"  [vpn] supervisor sync failed (fail-soft): {e}")
 
 
+def _boot_stagger_s() -> float:
+    """[PC-4 — audit routabilité 2026-09-08] quinconce anti-rafale AUTH (H1).
+
+    Une seule source (O1) : ``ip_rotation.boot_stagger_s`` — au plus 2
+    connexions NordVPN simultanées (sémaphores) + délai entre vagues, au
+    boot comme à l'upscale. Défaut 5 s (comportement historique) ;
+    30 s en prod (config.yaml) : 6 AUTH < 2 s = rate-limit NordVPN.
+    """
+    try:
+        return max(0.0, min(120.0, float((IP_ROTATION or {}).get("boot_stagger_s", 5.0))))
+    except (TypeError, ValueError):
+        return 5.0
+
+
 async def _apply_station_count(new_n: int) -> None:
     """[plan 18/08 §4] Hot-reload the number of parallel VPN stations.
 
@@ -1502,14 +1536,36 @@ async def _apply_station_count(new_n: int) -> None:
                 shared_state.vpn_manager = managers[0] if managers else None
                 shared_state.vpn_manager_2 = managers[1] if len(managers) >= 2 else None
             # ensure enabled stations are started (idempotent)
-            to_start = [m for m in managers if m.enabled and m.proxy_mode == "vpn" and m.status != "connected"]
+            # [graceful-aurora] degraded = up : pas de start/connect redondant.
+            to_start = [m for m in managers if m.enabled and m.proxy_mode == "vpn" and str(getattr(m, "status", "disconnected") or "disconnected") not in ("connected", "degraded")]
             if to_start:
                 try:
-                    await asyncio.gather(*(m.start() for m in to_start))
+                    # [phase 1] même quinconce qu'au boot (sémaphore 2 + 5 s) :
+                    # N start()/connect() simultanés = rafale AUTH NordVPN.
+                    _up_sem = asyncio.Semaphore(2)
+
+                    async def _start_one_up(_m):
+                        async with _up_sem:
+                            try:
+                                await _m.start()
+                            except Exception as _e:
+                                _debug(f"  [vpn] upscale start failed: {_e!r}")
+                            await asyncio.sleep(_boot_stagger_s())
+
+                    await asyncio.gather(*(_start_one_up(m) for m in to_start))
                     # also ensure real managers are actually connected (blocking)
-                    _real_connect = [m.connect() for m in to_start if hasattr(m, "_compose_up") and hasattr(m, "connect")]
-                    if _real_connect:
-                        await asyncio.gather(*_real_connect)
+                    _real = [m for m in to_start if hasattr(m, "_compose_up") and hasattr(m, "connect")]
+
+                    async def _connect_one_up(_m):
+                        async with _up_sem:
+                            try:
+                                await _m.connect()
+                            except Exception as _e:
+                                _debug(f"  [vpn] upscale connect failed: {_e!r}")
+                            await asyncio.sleep(_boot_stagger_s())
+
+                    if _real:
+                        await asyncio.gather(*(_connect_one_up(m) for m in _real))
                 except Exception as e:
                     _debug(f"  [vpn] idempotent start failed: {e}")
             return
@@ -1841,9 +1897,35 @@ async def lifespan(app):
         m.enabled = False if IP_ROTATION.get("_fail_closed") else IP_ROTATION.get("enabled", False)
     if IP_ROTATION.get("_fail_closed"):
         _debug("  [lifespan] fail-closed: VPN désactivé (clé divergente)")
+    # [O3-mixed — audit 2026-09-08] flotte hétérogène déterministe : en
+    # mode auto (défaut, rollback auto_mixed_stacks=false), chaque station
+    # rejoint son slot AVANT start() — (n-1) mod 3 : WG / OV-TCP / OV-UDP.
+    # Le compose up du boot applique donc la bonne stack sans churn
+    # supplémentaire ; les flips suivants respectent les slots.
+    # L'ancien hetero-boot 2-stations ne vaut qu'en auto NON mixte.
+    _mixed_now = False
+    try:
+        _mixed_now = (
+            not IP_ROTATION.get("_fail_closed")
+            and len(_managers) >= 1
+            and str(IP_ROTATION.get("vpn_stack", "auto") or "auto").strip().lower() == "auto"
+            and bool(IP_ROTATION.get("auto_mixed_stacks", True))
+        )
+    except Exception:
+        _mixed_now = False
+    if _mixed_now:
+        try:
+            for _m in _managers:
+                try:
+                    _m.apply_mixed_slot()
+                except Exception as _e_slot:
+                    _debug(f"  [lifespan] mixed slot failed s{getattr(_m, '_station', '?')}: {_e_slot}")
+            _debug("  [lifespan] mixed fleet: WG / OV-TCP / OV-UDP par slot (n-1)%3")
+        except Exception as _e_mixed:
+            _debug(f"  [lifespan] mixed fleet failed: {_e_mixed}")
     # warm-avalanche Q7: hetero-boot opt-in (false par défaut) — S1 WG / S2 OV UDP en // au boot
     try:
-        if not IP_ROTATION.get("_fail_closed") and IP_ROTATION.get("auto_hetero_boot", False) and len(_managers) >= 2 and IP_ROTATION.get("vpn_stack", "auto") == "auto":
+        if not _mixed_now and not IP_ROTATION.get("_fail_closed") and IP_ROTATION.get("auto_hetero_boot", False) and len(_managers) >= 2 and IP_ROTATION.get("vpn_stack", "auto") == "auto":
             _wg_present = os.path.exists(os.path.join(os.path.dirname(os.path.abspath(__file__)), "vpn_configs", "wireguard.env"))
             if _wg_present:
                 _managers[0]._stack = "auto"
@@ -1920,7 +2002,7 @@ async def lifespan(app):
                 await _m.start()
             except Exception as _e:
                 _debug(f"  [lifespan] WARN boot station start raised: {_e!r}")
-            await asyncio.sleep(5)
+            await asyncio.sleep(_boot_stagger_s())
 
     _gather_results = await asyncio.gather(
         *(_start_one(m) for m in _managers if m.enabled), return_exceptions=True
@@ -1931,7 +2013,8 @@ async def lifespan(app):
     # boot garde: 1/4 vs 4/4 visible même si 0 tunnel
     try:
         _n_expected = resolved_station_count(IP_ROTATION) if IP_ROTATION.get("enabled") else len(_managers)  # noqa: F821
-        _connected = sum(1 for _m in _managers if getattr(_m, "_status", None) == "connected" or getattr(_m, "status", None) == "connected")
+        # [graceful-aurora] up = connected + degraded.
+        _connected = sum(1 for _m in _managers if str(getattr(_m, "_status", None) or getattr(_m, "status", None) or "") in ("connected", "degraded"))
         if _connected < _n_expected and IP_ROTATION.get("enabled"):
             _msg = f"boot { _connected}/{_n_expected}: expected {_n_expected}, connected {_connected} — reconcile/pool"
             _debug(f"  CRITICAL: {_msg}")
@@ -2482,9 +2565,40 @@ def _build_metrics_text() -> str:
         mgrs = list(getattr(_ss, "vpn_managers", None) or [])
 
         st_rows = []
+        # [graceful-aurora LOT J] stations dégradées + cooldowns + restarts.
+        degraded_rows = []
+        cooldown_rows = []
+        restart_rows = []
         for m in mgrs:
             status = str(getattr(m, "status", "") or "")
             st_rows.append((f'station="{m._station}"', 1 if status == "connected" else 0))
+            try:
+                _reason = str(getattr(m, "_degraded_reason", "") or "degraded")
+                degraded_rows.append(
+                    (f'station="{m._station}",reason="{_reason}"', 1 if status == "degraded" else 0)
+                )
+            except Exception:
+                pass
+            try:
+                _cool_fn = getattr(m, "_auth_cooling", None)
+                _ac = 1 if callable(_cool_fn) and _cool_fn() else 0
+            except Exception:
+                _ac = 0
+            try:
+                _si = 1 if bool(getattr(m, "_server_issue_pending", False)) else 0
+            except Exception:
+                _si = 0
+            cooldown_rows.append((f'station="{m._station}",kind="auth_cooling"', _ac))
+            cooldown_rows.append((f'station="{m._station}",kind="server_issue_pending"', _si))
+            try:
+                _n = sum(
+                    1
+                    for t in getattr(m, "_watchdog_restarts_1h", [])
+                    if time.monotonic() - t < 3600.0
+                )
+            except Exception:
+                _n = 0
+            restart_rows.append((f'station="{m._station}"', _n))
 
         ewma_rows, p95_rows, slow_rows = [], [], []
         if eng is not None:
@@ -2504,6 +2618,9 @@ def _build_metrics_text() -> str:
             hard_n = sum(1 for _k, (kind, until) in cds.items() if kind == "hard" and until > now)
             vpn_snap: dict | None = {
                 "stations": st_rows,
+                "degraded": degraded_rows,
+                "cooldowns": cooldown_rows,
+                "restarts": restart_rows,
                 "ewma": ewma_rows,
                 "p95": p95_rows,
                 "slow": slow_rows,
@@ -2515,11 +2632,61 @@ def _build_metrics_text() -> str:
                 "paused": getattr(eng, "paused", False),
             }
         else:
-            vpn_snap = {"stations": st_rows, "has_engine": False}
+            vpn_snap = {
+                "stations": st_rows,
+                "degraded": degraded_rows,
+                "cooldowns": cooldown_rows,
+                "restarts": restart_rows,
+                "has_engine": False,
+            }
     except Exception as e:
         _debug(f"  [metrics] build échoué (partiel): {e}")
         vpn_snap = None
     lines.extend(_metrics_mod.render_vpn_section(vpn_snap))
+
+    # [audit 2026-09-08 §6/O4 + PC-5] éligibilité pool (SLO usable/floor)
+    # + 429 free par modèle. Fail-soft : sections sautées si indisponibles.
+    try:
+        import shared_state as _ss_pool
+
+        _pool = getattr(_ss_pool, "free_ip_pool", None)
+        _urows, _un = [], 0
+        _stations: list = []
+        if _pool is None:
+            _stations = []
+        else:
+            try:
+                _stations = list(getattr(_pool, "_stations", None) or [])
+            except Exception:
+                _stations = []
+            for _st in _stations:
+                try:
+                    _ok = bool(_pool._station_usable(_st, exclude_approaching=False))
+                except Exception:
+                    _ok = False
+                try:
+                    _sid = getattr(_st, "_station", "?")
+                except Exception:
+                    _sid = "?"
+                _urows.append((f'station="{_sid}"', 1 if _ok else 0))
+                _un += 1 if _ok else 0
+            if _stations:
+                try:
+                    _floor = int(_pool._pool_floor())
+                except Exception:
+                    _floor = 1
+                lines.extend(
+                    _metrics_mod.render_pool_section(
+                        {"usable": _urows, "usable_count": _un, "total": len(_stations), "floor": _floor}
+                    )
+                )
+        try:
+            _f429 = dict(_free_429_by_model)
+        except Exception:
+            _f429 = {}
+        lines.extend(_metrics_mod.render_free_429_section(_f429))
+    except Exception as e:
+        _debug(f"  [metrics] pool/free429 échoués (partiel): {e}")
 
     # [Étape 2 — O3] compteurs fallback/failover par cause (familles counter).
     # Fail-soft : snapshot sous lock, émission hors lock, jamais de raise.
@@ -4378,6 +4545,22 @@ def _free_exception_fallback_mode() -> str:
     return mode if mode in ("station-first", "direct") else "station-first"
 
 
+def _direct_fallback_allowed() -> bool:
+    """[PC-16/F9 — audit routabilité 2026-09-08] fail-closed optionnel.
+
+    ``ip_rotation.enforce_vpn_only: true`` interdit toute sortie free hors
+    tunnel (direct residential IP) — les replis directs deviennent paid
+    (ou refus strict). Défaut False = comportement historique. En mode
+    vpn/socks5 le repli direct n'existe déjà pas (fail-closed natif).
+    """
+    try:
+        if bool((IP_ROTATION or {}).get("enforce_vpn_only", False)):
+            return False
+    except Exception:
+        pass
+    return True
+
+
 def _free_proxy_mode() -> str:
     """Effective proxy mode governing ALL free traffic: vpn / socks5 / direct.
 
@@ -4437,7 +4620,12 @@ async def _open_free_stream(
     the direct residential fallback — the caller's retry loop then tries
     another station (fresh IP = fresh quota). True = legacy behavior (the
     direct fallback is the existing semantics).
+
+    [PC-16] enforce_vpn_only=true force direct_fallback=False à l'entrée
+    (fail-closed : jamais de sortie hors tunnel).
     """
+    if not _direct_fallback_allowed():
+        direct_fallback = False
     # [PLAN_CORRECTION_FAUX_429 Lot B2] delai court plafonne avant re-tentative free (fresh_station)
     if use_free and fresh_station and not count_request:
         try:
@@ -4480,10 +4668,13 @@ async def _open_free_stream(
             _debug(
                 "  [free-stream] ⚠️ no VPN proxy — free endpoint is geo-restricted, direct connection will likely 400"
             )
-            if not direct_fallback and _free_proxy_mode() in ("vpn", "socks5"):
+            if not direct_fallback and (
+                _free_proxy_mode() in ("vpn", "socks5") or not _direct_fallback_allowed()
+            ):
                 # [proxy_mode] vpn/socks5: never open a direct free stream —
                 # re-raise so the caller's retry loop strikes another station
                 # or, budget spent, falls back to PAID (never residential-IP direct).
+                # [PC-16] enforce_vpn_only étend ce fail-closed au mode direct.
                 _log(
                     "  FREE STREAM: no usable station "
                     f"(proxy_mode={_free_proxy_mode()}) → no direct stream, caller retries/paid"
@@ -5052,6 +5243,58 @@ def _free_429_cooldown_seconds(retry_after: str = "") -> float:
     return _FREE_429_DEFAULT
 
 
+# [PC-5 — audit routabilité 2026-09-08] Le 429 free suit le COMPTE/modèle,
+# pas l'IP (F5) : tant que tout le trafic vise un seul modèle upstream, la
+# diversité des 6 tunnels ne sert à rien. `free_model_spread: true` +
+# `free_model_candidates: {paid: [free...]}` répartit en round-robin.
+_free_model_rr: dict[str, int] = {}
+_free_429_by_model: dict[str, int] = {}
+
+
+def _free_candidates_for(paid_model: str) -> list:
+    """Liste des modèles free équivalents pour `paid_model` (config)."""
+    try:
+        cands = (IP_ROTATION or {}).get("free_model_candidates") or {}
+        lst = cands.get(paid_model)
+        if isinstance(lst, list) and lst:
+            return [str(m) for m in lst if m]
+    except Exception:
+        pass
+    return []
+
+
+def _resolve_free_model(paid_model: str):
+    """Résout le modèle free cible pour `paid_model` (O1 : effet prouvé).
+
+    Défaut (`free_model_spread` faux/absent) : `FREE_MODEL_MAP` historique.
+    Spread actif + ≥ 2 candidats : round-robin par requête — 2 requêtes
+    consécutives ne touchent pas le même modèle upstream.
+    """
+    base = FREE_MODEL_MAP.get(paid_model)
+    if not base:
+        return None
+    try:
+        spread = bool((IP_ROTATION or {}).get("free_model_spread", False))
+    except Exception:
+        spread = False
+    if not spread:
+        return base
+    cands = _free_candidates_for(paid_model)
+    if len(cands) < 2:
+        return base
+    idx = _free_model_rr.get(paid_model, 0) % len(cands)
+    _free_model_rr[paid_model] = idx + 1
+    return cands[idx]
+
+
+def _note_free_429(model: str) -> None:
+    """Compteur `free_429_by_model` (PC-5) : le 429 suit le modèle."""
+    try:
+        _free_429_by_model[model] = int(_free_429_by_model.get(model, 0)) + 1
+    except Exception:
+        pass
+
+
 def _sweep_free_cooldowns() -> int:
     """[plan 18/08 §4.2] Drop expired (model, IP) cooldown entries.
 
@@ -5172,8 +5415,13 @@ def _mark_free_stations_429(free_model: str, retry_after: str = "", stations=Non
     ``on_429_action`` inclut cooldown, rotation si elle inclut rotate.
     ``stations=None`` → la station de la tentative courante
     (``_free_attempt_station``). Les autres stations continuent de servir.
+
+    [PC-5] le 429 suit le modèle (compte), pas l'IP : compteur
+    ``_free_429_by_model`` incrémenté ici (point de passage unique
+    stream + non-stream).
     """
     _record_global_429()
+    _note_free_429(free_model)
     if stations is None:
         stations = [_free_attempt_station()]
     seen = set()
@@ -5366,7 +5614,7 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
     """
     global _free_ip_pool
 
-    free_model = FREE_MODEL_MAP.get(model_id)
+    free_model = _resolve_free_model(model_id)
     if not free_model:
         return None  # No free equivalent, proceed with paid
 
@@ -5786,6 +6034,10 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
                     except Exception:
                         pass
                     raise FreeRefusal(status=503, body=_tun_msg, retry_after="")
+                return None
+            # [PC-16] fail-closed optionnel : jamais de sortie hors tunnel.
+            if not _direct_fallback_allowed():
+                _log("  [POLICY] direct fallback refusé (enforce_vpn_only) → paid fallback")
                 return None
             _log("  FREE via VPN tunnels FAILED → direct fallback (residential IP)")
             try:
@@ -7944,6 +8196,7 @@ async def messages(request: Request):
     start_time = time.monotonic()
     client_ip = _get_client_ip(request)
     _current_user_agent.set(request.headers.get("user-agent"))
+    _current_client_ip.set(client_ip)  # [PC-16] traçabilité free-usage
 
     body_bytes = await request.body()
     _debug(
@@ -8332,7 +8585,7 @@ async def messages(request: Request):
             # UnboundLocalError in Python 3.12+ (nonlocal + assignment conflict).
             _track_model = model_id
             # Try free model for streaming: swap endpoint/model before starting stream
-            free_model = FREE_MODEL_MAP.get(model_id)
+            free_model = _resolve_free_model(model_id)
             if free_model:
                 _debug(f"  [stream] attempting free model {free_model!r} first")
                 paid_endpoint = endpoint
@@ -9315,7 +9568,7 @@ async def messages(request: Request):
         _req_model_id = model_id
         # Try free model for streaming
         _paid_model_id = _req_model_id  # Save original for fallback
-        free_model = FREE_MODEL_MAP.get(_req_model_id)
+        free_model = _resolve_free_model(_req_model_id)
         if free_model:
             _debug(f"  [stream-oai] attempting free model {free_model!r} first")
             paid_endpoint = endpoint
@@ -10377,6 +10630,7 @@ async def chat_completions(request: Request):
     start_time = time.monotonic()
     client_ip = _get_client_ip(request)
     _current_user_agent.set(request.headers.get("user-agent"))
+    _current_client_ip.set(client_ip)  # [PC-16] traçabilité free-usage
 
     body_bytes = await request.body()
     _debug(
@@ -10833,7 +11087,7 @@ async def chat_completions(request: Request):
             # UnboundLocalError in Python 3.12+ (nonlocal + assignment conflict).
             _track_model = model_id
             # Try free model for streaming: swap endpoint/model before starting stream
-            free_model = FREE_MODEL_MAP.get(model_id)
+            free_model = _resolve_free_model(model_id)
             if free_model:
                 _debug(f"  [chat-stream] attempting free model {free_model!r} first")
                 paid_endpoint = endpoint
@@ -11728,7 +11982,7 @@ async def chat_completions(request: Request):
     async def _anthro_to_oai_stream(hdrs):
         nonlocal endpoint, model_id
         # Try free model for streaming: swap endpoint/model before starting stream
-        free_model = FREE_MODEL_MAP.get(model_id)
+        free_model = _resolve_free_model(model_id)
         if free_model:
             _debug(f"  [anthro-to-oai-stream] attempting free model {free_model!r} first")
             paid_endpoint = endpoint
@@ -12306,6 +12560,7 @@ async def responses(request: Request):
     start_time = time.monotonic()
     client_ip = _get_client_ip(request)
     _current_user_agent.set(request.headers.get("user-agent"))
+    _current_client_ip.set(client_ip)  # [PC-16] traçabilité free-usage
 
     body_bytes = await request.body()
     _debug(

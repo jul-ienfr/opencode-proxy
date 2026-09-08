@@ -70,6 +70,7 @@ _tmp_*
 tmp_*.py
 # Perf baselines : timings machine-spécifiques (plan v10 §15.1/§13.5)
 logs/bench_baseline.json
+logs/bench_*.jsonl
 # Runtime state du boot proxy (jamais versionner)
 logs/*.err
 logs/config-*.json

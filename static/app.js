@@ -2955,14 +2955,18 @@ document.addEventListener('DOMContentLoaded', () => {
             const snaps = (perSid[sid] || []).filter(s => s.ewma_ms != null);
             snaps.sort((a, b) => b.count - a.count);
             const cur = snaps[0] || null;
+            // [graceful-aurora LOT J] degraded = ambre (ni vert ni rouge) + motif.
+            const _degReason = st.vpn && st.vpn.degraded_reason ? String(st.vpn.degraded_reason) : '';
             const statusColor = st.vpn_status === 'connected'
                 ? ((cur && cur.consecutive_slow >= 2) ? 'var(--warning,#e6a000)' : 'var(--success,#7ec699)')
-                : (st.vpn_status === 'error' ? 'var(--danger,#e06c50)' : 'var(--text-muted,#8a8a8a)');
+                : (st.vpn_status === 'degraded' ? 'var(--warning,#e6a000)'
+                : (st.vpn_status === 'error' ? 'var(--danger,#e06c50)' : 'var(--text-muted,#8a8a8a)'));
             const ewma = cur ? Math.round(cur.ewma_ms) : null;
             const p95 = cur && cur.p95_ms != null ? Math.round(cur.p95_ms) : null;
             const slowBadge = (cur && cur.consecutive_slow >= 2) ? ' ⚠ ralentit' : '';
+            const degBadge = st.vpn_status === 'degraded' ? (' ~ ' + (_degReason || 'dégradé')) : '';
             html += `<div style="flex:0 0 auto;min-width:150px;padding:8px 10px;background:var(--bg-secondary);border-radius:8px;border-left:3px solid ${statusColor};font-size:12px">`
-                + `<div><strong>Station ${escHtml(String(st.station))}</strong> <span style="color:${statusColor}">●</span>${slowBadge}</div>`
+                + `<div><strong>Station ${escHtml(String(st.station))}</strong> <span style="color:${statusColor}">●</span>${slowBadge}${escHtml(degBadge)}</div>`
                 + `<div style="font-family:monospace;font-size:11px">${escHtml(st.current_ip || '—')}</div>`
                 + `<div>Req IP: ${st.requests_this_ip}/${st.quota_per_ip}</div>`
                 + `<div title="EWMA / p95 (ms)">lat: ${ewma != null ? ewma + 'ms' : '—'} · p95: ${p95 != null ? p95 + 'ms' : '—'}</div>`
@@ -3267,6 +3271,10 @@ document.addEventListener('DOMContentLoaded', () => {
             const stackSelect = document.getElementById('vpn-stack-select');
             if (stackSelect && cfgData.vpn_stack) stackSelect.value = cfgData.vpn_stack;
 
+            // [phase 1] Qui choisit les serveurs VPN (défaut : nous).
+            const pickSelect = document.getElementById('vpn-pick-select');
+            if (pickSelect) pickSelect.value = cfgData.server_pick_mode || 'proxy';
+
             // Initialize free models master toggle
             const fmToggle = document.getElementById('fm-toggle');
             const fmLabel = document.getElementById('fm-toggle-label');
@@ -3359,6 +3367,17 @@ document.addEventListener('DOMContentLoaded', () => {
         refreshVPNStatus();
     };
 
+    // [phase 1] Qui choisit les serveurs VPN : proxy (nous) | gluetun (délégué).
+    window.vpnSavePickMode = async function() {
+        const select = document.getElementById('vpn-pick-select');
+        if (!select) return;
+        await fetchWithToken('/api/vpn-config', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({server_pick_mode: select.value})
+        });
+        refreshVPNStatus();
+    };
+
     function renderServerList(servers) {
         const list = document.getElementById('vpn-servers-list');
         if (!list) return;
@@ -3394,24 +3413,30 @@ document.addEventListener('DOMContentLoaded', () => {
 
         const statusMap = {
             connected: { color: 'var(--success)', label: t('vpn.connected') || 'Connecté' },
+            degraded: { color: 'var(--warning)', label: t('vpn.degraded') || 'Dégradé' },
             connecting: { color: 'var(--warning)', label: t('vpn.connecting') || 'Connexion...' },
             disconnected: { color: 'var(--text-muted)', label: t('vpn.disconnected') || 'Déconnecté' },
             error: { color: 'var(--danger)', label: t('vpn.error') || 'Erreur' }
         };
         const s = statusMap[data.status] || statusMap.disconnected;
         // [prancy-unicorn Phase1] N/M healthy agrégat + stale spinner + error_detail tooltip
+        // [graceful-aurora LOT J] up = connected + degraded.
         let _healthy = data.healthy;
         let _total = data.total;
         if ((_healthy == null || _total == null) && Array.isArray(data.stations)) {
             _total = data.stations.length;
-            _healthy = data.stations.filter(x => x.vpn_status === 'connected').length;
+            _healthy = data.stations.filter(x => x.vpn_status === 'connected' || x.vpn_status === 'degraded').length;
         }
         let bannerLabel = s.label;
         if (_healthy != null && _total != null) bannerLabel += ` — ${_healthy}/${_total} healthy`;
-        // [v6 P1-0b] routable badge
+        // [v6 P1-0b] routable badge (+ dégradées ambre LOT J)
         const _routable = data.healthy_routable;
         if (_routable != null && _routable !== _healthy) {
             bannerLabel += ` (${_routable}/${_total} routable)`;
+        }
+        const _degN = data.degraded_routable;
+        if (_degN != null && _degN > 0) {
+            bannerLabel += ` (~${_degN} dégradée${_degN > 1 ? 's' : ''})`;
         }
         if (data.stale) bannerLabel += ' ⟳';
         if (data.boot_error) bannerLabel += ` ⚠ ${data.boot_error}`;

@@ -161,6 +161,9 @@ class MetricsSnapshot:
     latency: dict = field(default_factory=dict)
     vpn: dict | None = None
     conv: dict | None = None
+    # [audit 2026-09-08 §6/O4 + PC-5] pool free + 429 par modèle.
+    pool: dict | None = None
+    free429: dict = field(default_factory=dict)
 
 
 def _gauge(lines: list, name: str, help_txt: str, rows) -> None:
@@ -182,6 +185,27 @@ def render_vpn_section(vpn: dict | None) -> list[str]:
     if not vpn:
         return lines
     _gauge(lines, "vpn_station_connected", "1 si la station est connectée", vpn.get("stations", []))
+    # [graceful-aurora LOT J] stations dégradées-routables + cooldowns + restarts.
+    _gauge(
+        lines,
+        "vpn_station_degraded",
+        "1 si la station est dégradée-routable (reset récent, auth-cooling, socks-down, pin-widened)",
+        vpn.get("degraded", []),
+    )
+    # (nom distinct de vpn_cooldown_active{kind} latence : des labels
+    # différents dans une même famille = exposition invalide.)
+    _gauge(
+        lines,
+        "vpn_station_cooldown_active",
+        "cooldowns LOT A/C par station et kind",
+        vpn.get("cooldowns", []),
+    )
+    _gauge(
+        lines,
+        "watchdog_restart_total",
+        "restarts watchdog par station (fenêtre 1 h)",
+        [(lbl, val) for lbl, val in vpn.get("restarts", []) if val],
+    )
     _gauge(lines, "vpn_latency_ewma_ms", "EWMA par station·ip (ms)", vpn.get("ewma", []))
     _gauge(lines, "vpn_latency_p95_ms", "p95 glissant par station·ip (ms)", vpn.get("p95", []))
     _gauge(
@@ -218,6 +242,57 @@ def render_vpn_section(vpn: dict | None) -> list[str]:
             )
         ],
     )
+    return lines
+
+
+def render_pool_section(pool: dict | None) -> list[str]:
+    """[audit 2026-09-08 §6/O4] Éligibilité pool free (SLO).
+
+    ``pool`` = {"usable": [(labels, 0/1)], "usable_count": int,
+    "total": int, "floor": int} — l'hôte compte via ``_station_usable``
+    (garde N-2 incluse). Alerte : usable < floor pendant > 2 min.
+    """
+    lines: list[str] = []
+    if not pool:
+        return lines
+    _gauge(
+        lines,
+        "pool_station_usable",
+        "1 si la station est éligible au sélecteur free (bad-mark, cooldowns, statut)",
+        pool.get("usable", []),
+    )
+    try:
+        _u = int(pool.get("usable_count", 0))
+        _t = int(pool.get("total", 0))
+        _f = int(pool.get("floor", 1))
+    except (TypeError, ValueError):
+        return lines
+    _gauge(lines, "pool_usable_stations", "stations éligibles (SLO)", [(f'total="{_t}"', _u)])
+    _gauge(
+        lines,
+        "pool_usable_floor",
+        "plancher éligibles max(2, N-2) (garde anti-1/N)",
+        [(f'total="{_t}"', _f)],
+    )
+    return lines
+
+
+def render_free_429_section(counts: dict | None) -> list[str]:
+    """[PC-5 audit 2026-09-08] 429 free par modèle upstream.
+
+    Le rate-limit suit le compte/modèle, pas l'IP : cette famille montre
+    où frappe le 429 quand la diversité des tunnels ne sert plus.
+    """
+    lines: list[str] = []
+    if not counts:
+        return lines
+    lines.append("# HELP free_429_by_model 429 free par modèle upstream")
+    lines.append("# TYPE free_429_by_model counter")
+    for _model, _n in sorted(counts.items()):
+        try:
+            lines.append(f'free_429_by_model{{model="{_model}"}} {int(_n)}')
+        except (TypeError, ValueError):
+            continue
     return lines
 
 
@@ -293,6 +368,8 @@ def build_metrics_text(snap: MetricsSnapshot) -> str:
     garde-fous fail-soft (sections None = sautées)."""
     lines: list[str] = []
     lines.extend(render_vpn_section(snap.vpn))
+    lines.extend(render_pool_section(snap.pool))
+    lines.extend(render_free_429_section(snap.free429))
     lines.extend(render_fallback_section(snap.fb, snap.fo))
     lines.extend(render_lot0_section(snap.latency, snap.misc, snap.ttfb, snap.conv))
     return "\n".join(lines) + "\n"
@@ -313,7 +390,9 @@ __all__ = [
     "observe_latency_ms",
     "percentile",
     "render_fallback_section",
+    "render_free_429_section",
     "render_lot0_section",
+    "render_pool_section",
     "render_vpn_section",
     "reset_fallback_metrics",
 ]

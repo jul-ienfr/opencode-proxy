@@ -24,6 +24,7 @@ la Phase 9 ; le nouveau code importe ``ops.supervisor``.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
@@ -79,6 +80,11 @@ class StationSupervisor:
     breaker_cooldown_sec: float = 60.0
     last_probe_mono: float = 0.0
     restart_in_progress: bool = False
+    # [graceful-aurora LOT H] lock restart PAR STATION (instance, jamais
+    # global) : deux restart() concurrents sur la MÊME station → 1 seul
+    # manager.restart() effectif ; deux stations restent parallèles.
+    # default_factory → compat build_supervisors/sync_supervisors inchangée.
+    restart_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     # ── cycle de vie (délégation pure) ────────────────────────────────
 
@@ -90,7 +96,9 @@ class StationSupervisor:
 
     async def restart(self, reason: str = "") -> None:
         """restart sérialisé : un second appel pendant un restart est no-op
-        (garde anti-thundering, exploité par le watchdog Lot 2)."""
+        (garde anti-thundering, exploité par le watchdog Lot 2).
+        [graceful-aurora LOT H] + lock d'instance en double-checked : le
+        check-then-set historique laissait passer 2 restart() concurrents."""
         if self.restart_in_progress:
             logger.info(
                 "[supervisor st%s] restart déjà en cours — no-op (%s)",
@@ -98,12 +106,20 @@ class StationSupervisor:
                 reason,
             )
             return
-        self.restart_in_progress = True
-        try:
-            await self.manager.restart()
-            logger.info("[supervisor st%s] restart ok (%s)", self.station, reason)
-        finally:
-            self.restart_in_progress = False
+        async with self.restart_lock:
+            if self.restart_in_progress:
+                logger.info(
+                    "[supervisor st%s] restart déjà en cours — no-op (%s)",
+                    self.station,
+                    reason,
+                )
+                return
+            self.restart_in_progress = True
+            try:
+                await self.manager.restart()
+                logger.info("[supervisor st%s] restart ok (%s)", self.station, reason)
+            finally:
+                self.restart_in_progress = False
 
     def record_success(self) -> None:
         self.consecutive_failures = 0

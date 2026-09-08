@@ -38,7 +38,28 @@ import urllib.parse
 import weakref
 from typing import Any, cast
 
-from vpn.manager import RotationFailed, VPNManager
+from vpn.manager import RotationFailed, VPNManager, VPNState
+
+
+def _station_is_up(station) -> bool:
+    """[graceful-aurora] Routable = connected + degraded (duck-typé : les
+    stubs de test et Socks5Endpoint exposent ``status`` en string)."""
+    try:
+        return VPNState.is_up(str(getattr(station, "status", "disconnected") or "disconnected"))
+    except Exception:
+        return False
+
+
+def _egress_rank(station) -> int:
+    """[graceful-aurora LOT F] Pénalité second choix : tunnel_up_full (0)
+    d'abord, tunnel_up_socks_down (1) ensuite. Inconnu/absent = 0 (zéro
+    changement pour les stubs et le nominal)."""
+    try:
+        if str(getattr(station, "_egress_state", "tunnel_up_full") or "tunnel_up_full") == "tunnel_up_socks_down":
+            return 1
+    except Exception:
+        pass
+    return 0
 
 try:
     from config.settings import yaml_get as _yaml_get
@@ -209,6 +230,13 @@ class FreeIPPool:
         except Exception:
             pass
         self._on_429_action = "both"
+        # [PC-10 audit 2026-09-08] table cause → TTL (seed + hot-reload via
+        # update_config) ; absente → 100 % legacy (_bad_ttl partout).
+        self._bad_ttl_by_cause: dict = {}
+        try:
+            self._load_bad_ttl_by_cause(getattr(vpn_manager, "_config", None) or {})
+        except Exception:
+            pass
         # [PLAN-corrections-429 G2] miroir de IP_ROTATION["strict_free"] —
         # la pool ne peut pas importer opencode (cycle), elle reçoit la
         # valeur via update_config() (config.yaml au boot + hot-reload).
@@ -216,6 +244,37 @@ class FreeIPPool:
         # [PLAN-corrections-429 G4] callback épuisement-compte failover,
         # poussé par opencode.py (set_failover_exhausted_cb) — jamais importé.
         self._failover_exhausted_cb = None
+        # [phase 1] Breaker « 429 corrélés » TOUS modes : 3+ 429 sur des
+        # (station, IP) distinctes / fenêtre = événement amont (l'amont
+        # rejette tout — rotationner brûlerait des IP neuves + des AUTH
+        # NordVPN pour rien). Pendant l'événement : cooldowns conservés
+        # (C1), rotations 429 GELÉES, refus honnête via le chemin strict_free
+        # existant. Rollback : upstream_event_threshold: 999 (= jamais).
+        from collections import deque as _deque
+
+        self._upstream_429_log: Any = _deque()
+        self._upstream_event_until = 0.0
+        self._upstream_event_threshold = 3
+        self._upstream_event_window_s = 60.0
+        self._upstream_event_cool_s = 180.0
+        try:
+            _cfg_seed = getattr(vpn_manager, "_config", None) or {}
+            _thr_raw = _cfg_seed.get("upstream_event_threshold", 3)
+            try:
+                _thr_f = float(_thr_raw)
+            except (TypeError, ValueError):
+                _thr_f = 3.0
+            self._upstream_event_threshold = (
+                10**9 if _thr_f >= 999 else max(2, int(_thr_f))
+            )
+            _w = _clamp_seconds(_cfg_seed, "upstream_event_window_s", 10.0, 900.0)
+            if _w is not None:
+                self._upstream_event_window_s = _w
+            _c = _clamp_seconds(_cfg_seed, "upstream_event_cool_s", 30.0, 3600.0)
+            if _c is not None:
+                self._upstream_event_cool_s = _c
+        except Exception:
+            pass
         # [plan v10 §3.6 Lot 3] Moteur de rotation latence-adaptive — partagé
         # (singleton), config canonique `ip_rotation.latency_rotation`.
         # Any : import local (module optionnel) + duck-typing à l'usage.
@@ -325,7 +384,7 @@ class FreeIPPool:
         if self._vpn.proxy_mode != "vpn":
             return None
         best = self._best_station()
-        if best is None or best.status != "connected":
+        if best is None or not _station_is_up(best):
             return None
         return best.socks5_url
 
@@ -359,6 +418,12 @@ class FreeIPPool:
                 "last_connect_attempt": None,
                 "last_quota_per_ip": None,  # hot-reload detection (CRITIC(11))
                 "bad_until": None,  # set by a 429 (double embrayage)
+                # [PC-10 audit 2026-09-08] bad-mark par cause + garde N-2.
+                "bad_cause": None,  # dernière cause ("rate_limit"|"timeout"|...)
+                "degraded_override": False,  # servie malgré le marqueur (garde N-2)
+                # [PC-9 audit 2026-09-08] rotation sans coupure : début de la
+                # rotation en vol (None = aucune) — la station en connecting
+                # reste servie sur son ancienne IP pendant la grâce.
                 # [Axe 1.2] Consecutive dead probes right after a rotation
                 # commit (fresh tunnel committed but not egressing). Reset
                 # on any alive probe; capped at _POST_COMMIT_RETRY_MAX
@@ -391,6 +456,112 @@ class FreeIPPool:
             1, station._quota_per_ip - 10 - self._rotation_stagger * max(0, station._station - 1)
         )
 
+    # ── [PC-10 audit 2026-09-08] bad-mark par cause + garde N-2 ──
+
+    def _load_bad_ttl_by_cause(self, cfg: dict) -> None:
+        """Charge ``bad_ttl_by_cause`` : cause → TTL secondes (None = legacy).
+
+        Invalide → warning + entrée ignorée (jamais d'écrasement silencieux).
+        """
+        table: dict = {}
+        try:
+            raw = (cfg or {}).get("bad_ttl_by_cause")
+            if isinstance(raw, dict):
+                for k, v in raw.items():
+                    if v is None:
+                        table[str(k)] = None
+                        continue
+                    try:
+                        table[str(k)] = max(0.0, min(3600.0, float(v)))
+                    except (TypeError, ValueError):
+                        logger.warning(
+                            "[pool-config] bad_ttl_by_cause[%r]=%r invalide — ignoré",
+                            k, v,
+                        )
+        except Exception:
+            pass
+        self._bad_ttl_by_cause = table
+
+    def _bad_ttl_for(self, cause) -> float:
+        """TTL du bad-mark selon la cause ; ``_bad_ttl`` legacy sinon."""
+        try:
+            table = getattr(self, "_bad_ttl_by_cause", None) or {}
+            if cause is not None and cause in table:
+                v = table[cause]
+                if v is None:
+                    return self._bad_ttl
+                return max(0.0, float(v))
+        except Exception:
+            pass
+        return self._bad_ttl
+
+    def _pool_floor(self) -> int:
+        """Éligibles minimums : max(2, N-2) borné à [1, N] (garde anti-1/6)."""
+        try:
+            n = len(self._stations)
+        except Exception:
+            n = 1
+        if n < 1:
+            return 1
+        return max(1, min(n, max(2, n - 2)))
+
+    def _degraded_rank(self, station) -> int:
+        """0 = saine, 1 = servable dégradée (dernier recours au tri)."""
+        try:
+            sid = getattr(station, "_station", None)
+            per = self._per.get(sid) if isinstance(sid, int) else None
+            if per and per.get("degraded_override"):
+                return 1
+        except Exception:
+            pass
+        return 0
+
+    def _apply_bad_mark(self, target, cause: str) -> None:
+        """Pose un bad-mark par cause + garde N-2 (jamais < floor éligibles).
+
+        La station marquée qui ferait passer le pool sous le plancher est
+        convertie en « servable dégradé » : le marqueur est posé (traçable
+        via bad_cause) mais la station reste servie — dernier recours au
+        tri (cf. _degraded_rank). Log ``[pool] invariant_n2``.
+        Voie SOCKS5 statique : pas de garde inter-familles (C1 dédié déjà
+        appliqué par les appelants), marqueur + cause seulement.
+        """
+        try:
+            per = self._per_station(target)
+        except Exception:
+            return
+        try:
+            ttl = self._bad_ttl_for(cause)
+        except Exception:
+            ttl = self._bad_ttl
+        per["bad_until"] = time.monotonic() + ttl
+        per["bad_cause"] = cause
+        if isinstance(target, Socks5Endpoint):
+            return
+        # Éligibilité APRÈS marque (sans l'override courant : il est recalculé).
+        per["degraded_override"] = False
+        try:
+            elig = sum(
+                1
+                for st in self._stations
+                if self._station_usable(st, exclude_approaching=False)
+            )
+        except Exception:
+            return
+        floor = self._pool_floor()
+        if elig < floor:
+            per["degraded_override"] = True
+            try:
+                sid = getattr(target, "_station", "?")
+            except Exception:
+                sid = "?"
+            logger.warning(
+                "[pool] invariant_n2 gardé sur s%s (cause=%s) — %d/%d éligibles (plancher %d)",
+                sid, cause, elig, len(self._stations), floor,
+            )
+        else:
+            per["degraded_override"] = False
+
     def _station_usable(
         self,
         station: VPNManager,
@@ -422,9 +593,39 @@ class FreeIPPool:
                     if cc not in forced_pool:
                         return False
         per = self._per_station(station)
-        if per["bad_until"] and time.monotonic() < per["bad_until"]:
-            return False
-        if station.status != "connected":
+        if per.get("bad_until") and time.monotonic() < per["bad_until"]:
+            # [PC-10] servable dégradé : le marqueur est posé mais la garde
+            # N-2 impose de continuer à servir (dernier recours au tri).
+            if not per.get("degraded_override"):
+                return False
+        # [PC-9] rotation sans coupure : station en connecting avec une
+        # dernière IP saine connue et une rotation récente (<
+        # rotation_wait_timeout) → servie sur son ancienne IP (cut-over
+        # sans trou). Le bad-mark ci-dessus reste prioritaire.
+        try:
+            _pc9_status = str(getattr(station, "status", "") or "")
+        except Exception:
+            _pc9_status = ""
+        if _pc9_status == "connecting":
+            try:
+                _rot_at = per.get("rotation_started_at")
+                _last_good = per.get("last_confirmed_ip") or getattr(
+                    station, "current_ip", None
+                )
+                _grace = max(
+                    1.0, float(getattr(self, "_rotation_wait_timeout", 5.0) or 5.0)
+                )
+            except Exception:
+                _rot_at, _last_good, _grace = None, None, 5.0
+            if (
+                _rot_at is not None
+                and _last_good
+                and (time.monotonic() - _rot_at) < _grace
+            ):
+                return True
+        # [graceful-aurora] degraded routable (LOT A/C/F) : up = connected +
+        # degraded. Le second-pass LRU reste inchangé (ignore_latency_cool).
+        if not _station_is_up(station):
             return False
         if not ignore_latency_cool:
             try:
@@ -453,13 +654,41 @@ class FreeIPPool:
         except Exception:
             return "no-per-state"
         try:
-            if per.get("bad_until") and time.monotonic() < per["bad_until"]:
-                return f"bad_until {int(per['bad_until'] - time.monotonic())}s"
+            _bu = per.get("bad_until")
+            # [PC-10] servable dégradé : marquée mais servie → pas de motif.
+            if _bu and time.monotonic() < _bu and not per.get("degraded_override"):
+                return f"bad_until {int(_bu - time.monotonic())}s"
+        except Exception:
+            pass
+        # [PC-9] même grâce que _station_usable : rotation en douceur = routable.
+        try:
+            if str(getattr(station, "status", "") or "") == "connecting":
+                _rot_at = per.get("rotation_started_at")
+                _last_good = per.get("last_confirmed_ip") or getattr(
+                    station, "current_ip", None
+                )
+                _grace = max(
+                    1.0, float(getattr(self, "_rotation_wait_timeout", 5.0) or 5.0)
+                )
+                if (
+                    _rot_at is not None
+                    and _last_good
+                    and (time.monotonic() - _rot_at) < _grace
+                ):
+                    return None
         except Exception:
             pass
         try:
-            if station.status != "connected":
-                return f"status={station.status}"
+            _st = str(getattr(station, "status", "unknown") or "unknown")
+            if not _station_is_up(station):
+                # [graceful-aurora LOT C] cooling sans tunnel → motif dédié.
+                try:
+                    _cool = station._auth_cooling() if hasattr(station, "_auth_cooling") else False
+                except Exception:
+                    _cool = False
+                if _cool:
+                    return "auth-cooling"
+                return f"status={_st}"
         except Exception:
             return "status=unknown"
         try:
@@ -475,14 +704,22 @@ class FreeIPPool:
 
     def usability_report(self) -> dict:
         """[fiabilisation 05/09 Lot 0] N/M routable + raison par station,
-        pour le dashboard et le diagnostic « 1 seule station routable »."""
+        pour le dashboard et le diagnostic « 1 seule station routable ».
+        [graceful-aurora LOT F/J] + ``egress_state`` par station."""
         report = {}
         for st in list(self._stations):
             try:
                 sid = int(getattr(st, "_station", -1))
             except Exception:
                 sid = -1
-            report[sid] = self._non_routable_reason(st) or "routable"
+            try:
+                _egr = str(getattr(st, "_egress_state", "unknown") or "unknown")
+            except Exception:
+                _egr = "unknown"
+            report[sid] = {
+                "reason": self._non_routable_reason(st) or "routable",
+                "egress_state": _egr,
+            }
         return report
 
     def _free_parallel_is_rr(self) -> bool:
@@ -515,13 +752,15 @@ class FreeIPPool:
                     ignore_latency_cool=True,
                 )
             ]
-            if not usable:
-                return None
+        if not usable:
+            return None
         if not self._free_parallel_is_rr():
+            # failover → sticky 1..N, full d'abord (LOT F second choix).
+            usable.sort(key=lambda s: (_egress_rank(s), self._degraded_rank(s), s._station))
             return usable[0]
         # round-robin : selon mode
         if self._free_parallel_mode == "strict":
-            usable.sort(key=lambda s: s._station)
+            usable.sort(key=lambda s: (_egress_rank(s), self._degraded_rank(s), s._station))
             try:
                 idx = self._rr_idx % len(usable)
                 self._rr_idx = (self._rr_idx + 1) % 1000000
@@ -530,17 +769,21 @@ class FreeIPPool:
                 return usable[0]
         if self._free_parallel_mode == "hedge":
             # hedge primaire = strict aussi (course)
-            usable.sort(key=lambda s: s._station)
+            usable.sort(key=lambda s: (_egress_rank(s), self._degraded_rank(s), s._station))
             try:
                 idx = self._rr_idx % len(usable)
                 self._rr_idx = (self._rr_idx + 1) % 1000000
                 return usable[idx]
             except Exception:
                 return usable[0]
-        # load-balance (défaut) → least-loaded
+        # load-balance (défaut) → least-loaded, full d'abord (LOT F),
+        # [PC-10] saines d'abord, servables dégradées en dernier recours.
         try:
-            min_cnt = min(self._per_station(st)["request_count"] for st in usable)
-            least = [st for st in usable if self._per_station(st)["request_count"] == min_cnt]
+            _full = [st for st in usable if _egress_rank(st) == 0 and self._degraded_rank(st) == 0]
+            if not _full:
+                _full = [st for st in usable if _egress_rank(st) == 0] or list(usable)
+            min_cnt = min(self._per_station(st)["request_count"] for st in _full)
+            least = [st for st in _full if self._per_station(st)["request_count"] == min_cnt]
             if len(least) == 1:
                 return least[0]
             return random.choice(least)
@@ -552,10 +795,13 @@ class FreeIPPool:
     ) -> VPNManager | None:
         """Best station other than ``station`` (for an immediate dual-clutch
         switch when the current one approaches quota)."""
+        # [graceful-aurora LOT F] full d'abord, socks_down ensuite.
+        _ordered = sorted(
+            (st for st in self._stations if st is not station),
+            key=lambda s: (_egress_rank(s), self._degraded_rank(s), s._station),
+        )
         for exclude_approaching in (True, False):
-            for st in self._stations:
-                if st is station:
-                    continue
+            for st in _ordered:
                 if self._station_usable(
                     st, exclude_approaching=exclude_approaching, forced_pool=forced_pool
                 ):
@@ -565,10 +811,12 @@ class FreeIPPool:
     def _best_station_excluding_many(self, excluded: set, forced_pool=None) -> VPNManager | None:
         """Best station NOT in ``excluded`` (cumulative retries: never
         re-strike an IP/bucket already used in this request's free attempts)."""
+        _ordered = sorted(
+            (st for st in self._stations if st not in excluded),
+            key=lambda s: (_egress_rank(s), self._degraded_rank(s), s._station),
+        )
         for exclude_approaching in (True, False):
-            for st in self._stations:
-                if st in excluded:
-                    continue
+            for st in _ordered:
                 if self._station_usable(
                     st, exclude_approaching=exclude_approaching, forced_pool=forced_pool
                 ):
@@ -623,6 +871,7 @@ class FreeIPPool:
                 eng = getattr(self, "latency_engine", None) or get_engine()
                 usable.sort(
                     key=lambda st: (
+                        _egress_rank(st),
                         eng.cooldown_kind(int(st._station), str(getattr(st, "current_ip", "") or ""))
                         == "hard",
                         st._station,
@@ -633,19 +882,24 @@ class FreeIPPool:
             return [usable[0]]
         # if free_parallel disabled, return only best (no hedge)
         if not self._free_parallel_enabled:
+            # LOT F : full d'abord même sans parallélisation.
+            try:
+                usable.sort(key=lambda st: (_egress_rank(st), self._degraded_rank(st), st._station))
+            except Exception:
+                pass
             return [usable[0]] if usable else []
         if len(usable) == 1:
             return usable
-        # sort according to routing
+        # sort according to routing (LOT F : rang egress en tête)
         if self._free_parallel_is_rr():
             # least-loaded first
             try:
-                usable.sort(key=lambda st: self._per_station(st)["request_count"])
+                usable.sort(key=lambda st: (_egress_rank(st), self._degraded_rank(st), self._per_station(st)["request_count"]))
             except Exception:
                 pass
         else:
             # failover: already in _station order, keep sticky
-            usable.sort(key=lambda st: st._station)
+            usable.sort(key=lambda st: (_egress_rank(st), self._degraded_rank(st), st._station))
         # cap to N (all) — caller may hedge on all, but limit burst to 3 for N=10
         # plan: staggers évite burst simultané; on retourne toutes, l'appelant borne
         return usable
@@ -826,7 +1080,7 @@ class FreeIPPool:
             # invariant).
             return
         for st in self._stations:
-            if st.proxy_mode == "vpn" and st.status != "connected":
+            if st.proxy_mode == "vpn" and not _station_is_up(st):
                 self._kick_connect(st)
 
     def _kick_connect(self, station: VPNManager) -> None:
@@ -926,7 +1180,7 @@ class FreeIPPool:
                 station = self._best_station(forced_pool)
             if station is None and forced_pool is not None:
                 for st in self._stations:
-                    if st.status != "connected":
+                    if not _station_is_up(st):
                         continue
                     try:
                         # [P3.2] bail court — 2s au lieu de 10s, au-delà on sert direct/paid et le pin finit en background si possible
@@ -1155,6 +1409,75 @@ class FreeIPPool:
             pass
         return new_ip
 
+    # ── [phase 1] Événement amont (429 corrélés) ────────────────
+
+    def _upstream_event_active(self) -> bool:
+        """True pendant un événement amont déclaré (gel des rotations 429)."""
+        try:
+            return time.monotonic() < float(getattr(self, "_upstream_event_until", 0.0))
+        except Exception:
+            return False
+
+    def _upstream_event_remaining_s(self) -> int:
+        try:
+            rem = float(getattr(self, "_upstream_event_until", 0.0)) - time.monotonic()
+            return max(0, int(rem))
+        except Exception:
+            return 0
+
+    def _note_upstream_429(self, station) -> bool:
+        """Enregistre un 429 (station, IP). Retourne True si l'enregistrement
+        DÉCLARE un événement amont (seuil de paires distinctes atteint).
+
+        Seules des paires (station, IP) DISTINCTES comptent : 3× 429 sur le
+        même bucket = quota per-IP réel (rotation légitime), pas un
+        événement. Fenêtre glissante, mémoire seule."""
+        try:
+            now = time.monotonic()
+            try:
+                sid = int(getattr(station, "_station", -1))
+            except Exception:
+                sid = -1
+            ip = str(getattr(station, "current_ip", "") or "") or "unknown"
+            log = getattr(self, "_upstream_429_log", None)
+            if log is None:
+                return False
+            try:
+                win = float(getattr(self, "_upstream_event_window_s", 60.0))
+            except Exception:
+                win = 60.0
+            try:
+                thr = int(getattr(self, "_upstream_event_threshold", 3))
+            except Exception:
+                thr = 3
+            log.append((now, sid, ip))
+            while log and now - log[0][0] > win:
+                log.popleft()
+            if len(log) > 64:
+                for _ in range(len(log) - 64):
+                    log.popleft()
+            if self._upstream_event_active():
+                return False  # déjà déclaré — pas de re-log
+            distinct = {(s, i) for (_, s, i) in log}
+            if len(distinct) >= max(2, thr):
+                try:
+                    cool = float(getattr(self, "_upstream_event_cool_s", 180.0))
+                except Exception:
+                    cool = 180.0
+                self._upstream_event_until = now + max(30.0, cool)
+                logger.warning(
+                    "[free-ip] ÉVÉNEMENT AMONT : %d 429 sur %d couples (station,IP) distincts / %.0fs — "
+                    "gel des rotations 429 pendant %.0fs (refus honnête, pas de churn)",
+                    len(log),
+                    len(distinct),
+                    win,
+                    cool,
+                )
+                return True
+            return False
+        except Exception:
+            return False
+
     def on_quota_exhausted(
         self, station: VPNManager | Socks5Endpoint | None = None, forced_pool: set | None = None
     ):
@@ -1204,7 +1527,7 @@ class FreeIPPool:
                 return
             if action in ("cooldown", "both"):
                 if self._socks5_any_other(ep):
-                    self._per_station(ep)["bad_until"] = time.monotonic() + self._bad_ttl
+                    self._apply_bad_mark(ep, "rate_limit")
             return
         if self._vpn.proxy_mode != "vpn":
             return
@@ -1215,12 +1538,33 @@ class FreeIPPool:
         # (régression 2026-09-07 : un garde isinstance retournait tôt et
         # tuait les rotations forcées des tests).
         station = cast("VPNManager", station)
+        # [phase 1] alimente le breaker corrélé (TOUS modes, pas seulement
+        # failover) AVANT d'agir — un événement déclaré par CET appel gèle
+        # la rotation ci-dessous (l'IP neuve 429erait aussi).
+        try:
+            self._note_upstream_429(station)
+        except Exception:
+            pass
         if action in ("cooldown", "both"):
             if self.dual_station:
                 if self._any_other_usable(station):
-                    self._per_station(station)["bad_until"] = time.monotonic() + self._bad_ttl
+                    self._apply_bad_mark(station, "rate_limit")
         if action in ("rotate", "both"):
-            self._launch_rotation(station, forced_pool=forced_pool)
+            if self._upstream_event_active():
+                # Événement amont : l'IP neuve serait rejetée aussi — on ne
+                # brûle ni IP ni AUTH NordVPN. Le cooldown ci-dessus suffit ;
+                # la prochaine rotation partira à la fin de l'événement.
+                # Vaut aussi pour la dernière-servable : aucune rotation
+                # forcée pendant l'événement (elle continue de servir ; un
+                # 429 isolé hors événement rotationne normalement).
+                logger.info(
+                    "[free-ip] station %s 429 pendant événement amont (%ds restants) — "
+                    "rotation gelée, cooldown seul",
+                    getattr(station, "_station", "?"),
+                    self._upstream_event_remaining_s(),
+                )
+            else:
+                self._launch_rotation(station, forced_pool=forced_pool)
         # [PLAN-corrections-429 G4] failover cascade : en routing=failover,
         # la sticky station reçoit TOUT le trafic — ≥3 429 consécutifs sur
         # des IPs DIFFÉRENTES = épuisement au niveau COMPTE (pas per-IP).
@@ -1296,7 +1640,7 @@ class FreeIPPool:
             # _launch_rotation, no dual_station check.
             target = failed if isinstance(failed, Socks5Endpoint) else self._socks5_current
             if target is not None and self._socks5_any_other(target):
-                self._per_station(target)["bad_until"] = time.monotonic() + self._bad_ttl
+                self._apply_bad_mark(target, "timeout")
             # `st` couvre les deux modes (endpoint SOCKS5 OU manager VPN).
             st: VPNManager | Socks5Endpoint | None = (
                 self._socks5_best_excluding(target) if target is not None else self._socks5_next()
@@ -1315,7 +1659,7 @@ class FreeIPPool:
         if failed is not None:
             if self.dual_station:
                 if self._any_other_usable(failed):
-                    self._per_station(failed)["bad_until"] = time.monotonic() + self._bad_ttl
+                    self._apply_bad_mark(failed, "timeout")
             # [plan-perf Lot 2] URGENT (-1) : ce retry sert une requête qui
             # attend déjà (budget rotation_wait_timeout) — il passe devant
             # les rotations de fond 429 en attente (pas de préemption des
@@ -1361,7 +1705,7 @@ class FreeIPPool:
             if target is None:
                 return
             if self._socks5_any_other(target):
-                self._per_station(target)["bad_until"] = time.monotonic() + self._bad_ttl
+                self._apply_bad_mark(target, "timeout")
             return
         per = self._per_station(station)
         cur_ip = getattr(station, "current_ip", None)
@@ -1392,7 +1736,7 @@ class FreeIPPool:
             per["session_start"] is None
             or time.monotonic() - per["session_start"] >= self._late_signal_grace
         ):
-            per["bad_until"] = time.monotonic() + self._bad_ttl
+            self._apply_bad_mark(station, "timeout")
         station.arm_egress_watchdog()
 
     # ── In-flight free stream registry (plan 18/08 §am.22) ──────
@@ -1515,7 +1859,7 @@ class FreeIPPool:
                 return (
                     station.current_ip is not None
                     and station.current_ip != burned_ip
-                    and station.status == "connected"
+                    and _station_is_up(station)
                     and self._station_usable(station, exclude_approaching=False)
                 )
             # Not in flight yet — either queued behind another station's
@@ -1621,6 +1965,13 @@ class FreeIPPool:
         _current = asyncio.current_task()
         if _current is not None:
             self._rotation_tasks[sid] = _current
+        # [PC-9] rotation sans coupure : horodate le début du vol — tant que
+        # la station est en connecting avec une IP saine connue, le sélecteur
+        # la sert sur son ancienne IP (cut-over sans trou).
+        try:
+            self._per_station(station)["rotation_started_at"] = time.monotonic()
+        except Exception:
+            pass
         needs_retry = False  # [Axe 1.2] re-queue after finally-pop (dedup)
         try:
             await self.switch_ip(station=station)
@@ -1629,6 +1980,9 @@ class FreeIPPool:
             # (model, IP) cooldown key) — make it eligible again now,
             # without waiting out the bad TTL.
             per["bad_until"] = None
+            # [PC-10] la garde N-2 n'a plus lieu d'être sur IP neuve.
+            per["bad_cause"] = None
+            per["degraded_override"] = False
             if station.proxy_mode == "vpn":
                 # [Axe 1.2] Fresh probe AFTER the commit (direct call = not
                 # the watchdog's tick, no status cache): a committed-but-dead
@@ -1662,7 +2016,7 @@ class FreeIPPool:
                     if per["post_commit_retry_count"] < self._POST_COMMIT_RETRY_MAX:
                         # C1: never bad-mark the ONLY usable station.
                         if self._any_other_usable(station):
-                            per["bad_until"] = time.monotonic() + self._bad_ttl
+                            self._apply_bad_mark(station, "timeout")
                         needs_retry = True
                     # At the cap: give up on immediate re-rotation — the
                     # watchdog owns recovery (escalation, not hot-loop).
@@ -1837,6 +2191,25 @@ class FreeIPPool:
         _v = _clamp_seconds(cfg, "station_bad_ttl_s", 1.0, 3600.0)
         if _v is not None:
             self._bad_ttl = _v
+        # [PC-10] bad-mark par cause (hot-reloadable).
+        if "bad_ttl_by_cause" in cfg:
+            self._load_bad_ttl_by_cause(cfg)
+        # [phase 1] breaker 429 corrélés (hot-reload, mêmes règles qu'à
+        # l'__init__ ; 999 = désactivé/rollback).
+        if "upstream_event_threshold" in cfg:
+            try:
+                _t = float(cfg.get("upstream_event_threshold", 3))
+                self._upstream_event_threshold = (
+                    10**9 if _t >= 999 else max(2, int(_t))
+                )
+            except (TypeError, ValueError):
+                pass
+        _v = _clamp_seconds(cfg, "upstream_event_window_s", 10.0, 900.0)
+        if _v is not None:
+            self._upstream_event_window_s = _v
+        _v = _clamp_seconds(cfg, "upstream_event_cool_s", 30.0, 3600.0)
+        if _v is not None:
+            self._upstream_event_cool_s = _v
         if "rotation_stagger" in cfg:
             self._rotation_stagger = max(0, int(cfg["rotation_stagger"] or 0))
         if "rotation_wait_timeout" in cfg:
@@ -1996,6 +2369,10 @@ class FreeIPPool:
         stations = []
         for st in self._stations:
             per = self._per_station(st)
+            try:
+                _egr = str(getattr(st, "_egress_state", "unknown") or "unknown")
+            except Exception:
+                _egr = "unknown"
             stations.append(
                 {
                     "station": st._station,
@@ -2011,9 +2388,18 @@ class FreeIPPool:
                     "bad_remaining": max(0, per["bad_until"] - time.monotonic())
                     if per["bad_until"]
                     else 0,
+                    # [PC-10] cause du marquage + servable dégradé (garde N-2).
+                    "bad_cause": per.get("bad_cause"),
+                    "degraded_override": bool(per.get("degraded_override")),
+                    # [PC-9] rotation en douceur (cut-over sans trou).
+                    "rotation_in_progress": per.get("rotation_started_at") is not None
+                    and str(getattr(st, "status", "") or "") == "connecting",
+                    "last_good_ip": per.get("last_confirmed_ip"),
                     # [fiabilisation 05/09 Lot 0] raison lisible quand la
                     # station n'est pas servable (None = routable).
                     "non_routable_reason": self._non_routable_reason(st),
+                    # [graceful-aurora LOT F/J] état egress distingué.
+                    "egress_state": _egr,
                     "last_rotation_error": getattr(st, "_last_rotation_error", None),
                     "vpn": st.get_status(),
                 }
@@ -2039,25 +2425,47 @@ class FreeIPPool:
         else:
             s1 = stations[0]
         # [prancy-unicorn Phase1] agrégat honnête N/M healthy — connected si une station l'est, error seulement si toutes error
-        _healthy = sum(1 for _s in stations if _s.get("vpn_status") == "connected")
+        # [graceful-aurora LOT J] up = connected + degraded (statut routable).
+        def _is_up_status(_v: object) -> bool:
+            try:
+                return VPNState.is_up(str(_v or ""))
+            except Exception:
+                return False
+
+        _healthy = sum(1 for _s in stations if _is_up_status(_s.get("vpn_status")))
         _total = len(stations)
-        # [v6 P1-0b] healthy_routable — connected - cooldown 429 (60s) - hard latency 1800s
+        # [v6 P1-0b] healthy_routable — up - cooldown 429 (60s) - hard latency 1800s
+        # (- auth_cooling sans tunnel, cf. _non_routable_reason).
         try:
             _eng = getattr(self, "latency_engine", None)
             _healthy_routable = 0
+            _degraded_routable = 0
             for _s in stations:
-                if _s.get("vpn_status") != "connected":
+                if not _is_up_status(_s.get("vpn_status")):
                     continue
-                if _s.get("bad_remaining", 0) > 0:
+                # [PC-10] une servable dégradée (garde N-2) reste routable.
+                if _s.get("bad_remaining", 0) > 0 and not _s.get("degraded_override"):
+                    continue
+                if _s.get("non_routable_reason") is not None:
                     continue
                 _ip = _s.get("current_ip")
                 if _ip and _eng and _eng.ip_hard_cooled(int(_s["station"]), str(_ip)):
                     continue
                 _healthy_routable += 1
+                if str(_s.get("vpn_status") or "") == "degraded":
+                    _degraded_routable += 1
         except Exception:
             _healthy_routable = _healthy
+            _degraded_routable = sum(
+                1 for _s in stations if str(_s.get("vpn_status") or "") == "degraded"
+            )
         if _healthy > 0:
-            _agg_status = "connected"
+            # degraded seul (sans connected) → agrégat degraded, pas connected.
+            _agg_status = (
+                "connected"
+                if any(_s.get("vpn_status") == "connected" for _s in stations)
+                else "degraded"
+            )
         elif all(_s.get("vpn_status") == "error" for _s in stations):
             _agg_status = "error"
         else:
@@ -2092,6 +2500,11 @@ class FreeIPPool:
             "stations": stations,
             "healthy": _healthy,
             "healthy_routable": _healthy_routable,
+            # [graceful-aurora LOT J] dégradées mais routables (ambre).
+            "degraded_routable": _degraded_routable,
+            # [phase 1] événement amont 429 corrélés (gel rotations).
+            "upstream_event_active": self._upstream_event_active(),
+            "upstream_event_remaining_s": self._upstream_event_remaining_s(),
             # [fiabilisation 05/09 Lot 0] alias top-level pour le dashboard N/M.
             "routable": _healthy_routable,
             "total": _total,
