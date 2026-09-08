@@ -85,7 +85,20 @@ pull `:latest` (+6 autres images de bench) · `rmi` tags v3.41.3/v3.40.0 (~90 Mo
 9. **Rotation TOKEN** : secret apparu en transcript (voir §7).
 
 ## 7. Incidents de session (à traiter)
-
 - ** fuite secret** : valeurs de `vpn_configs/credentials.txt` affichées par une commande d'inventaire dans le transcript. **Rotation des credentials de service recommandée** (dashboard NordVPN → manual setup). Le TOKEN transmis ensuite est stocké uniquement dans `credentials.env` (ignoré git, jamais ré-affiché).
 - Fichiers temporaires hors repo (`AppData\Local\Temp\opencode\*.py`, pool_summary) : pas de secrets dedans (vérifié : bench_nordlynx.env shreddé, store_token.py supprimé).
 - `bench_pilot.jsonl` → `logs/bench_runs.jsonl` + règle `.gitignore` ajoutée.
+
+## 8. Faux échec commit (résolu) : test ox-alpha dépendant du .env
+
+`test_dead_identity_falls_through_to_live_free` échouait sur checkout
+vierge mais passait ici. Cause prouvée (sondes croisées) : `DISABLE_MAPPING`
+vaut True uniquement avec le `.env` opérateur (gitignoré) — sans lui,
+`_route_for("ox-alpha-free")` prend une autre branche (MODELS/FREE/POOL
+identiques par ailleurs). Ni le commit ni l'audit en cause (logique de
+routage intacte). Fix : pin `DISABLE_MAPPING=True` dans le test (hermétique, docstring
+du code l'autorise) + `oc._route_cache.clear()` (un test antérieur peut
+y avoir figé une résolution sous un autre mapping — prouvé par
+empoisonnement volontaire : `ox-alpha-free` servi du cache, test vert
+quand même après le fix). Commit `4872447`, suite
+complète re-vérifiée verte sur worktree vierge.

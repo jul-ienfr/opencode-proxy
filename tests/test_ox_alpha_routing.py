@@ -208,10 +208,18 @@ def test_alias_case_insensitive():
     assert route["model"] == "x-preview-f-free"
 
 
-def test_dead_identity_falls_through_to_live_free():
+def test_dead_identity_falls_through_to_live_free(monkeypatch):
     """Ancien garde « identité non écrasée » : inverse aujourd'hui — le
     modèle ox-alpha-free étant mort upstream, la demande tombe sur le free
-    vivant plutôt que d'échouer (dégradation gracieuse §12.2.6)."""
+    vivant plutôt que d'échouer (dégradation gracieuse §12.2.6).
+    Hermétique au .env opérateur (DISABLE_MAPPING gitignoré) : le cas
+    testé exige le mapping actif. Vide aussi le cache de routes : un test
+    antérieur ayant pu y figer une résolution sous un autre mapping."""
+    monkeypatch.setattr(oc, "DISABLE_MAPPING", True)
+    try:
+        oc._route_cache.clear()
+    except Exception:
+        pass
     route = oc._route_for("ox-alpha-free")
     assert route is not None
     assert route["model"] == "x-preview-f-free"
