@@ -12,3 +12,12 @@ logs/_*
 logs/vpn_state*.json
 logs/shared_rotation.json
 tool_compat_results.json
+# P0 anti-thrashing : dumps transients racine (sweeps grep, snapshots VPN, captures HTTP)
+pool_snapshot.json
+tmp_*.json
+tmp_*.txt
+tmp_*.py
+_tmp_*
+_audit_dump*.txt
+PLAN_CORRECTION_*.md
+docs/PLAN_*.md

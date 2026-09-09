@@ -27,3 +27,10 @@ vpn_managers: list = []
 station_supervisors: list = []
 # [v6 100%] boot_error — set by lifespan after gather(m.start()) if connected < n (P0-2)
 boot_error: str | None = None
+# [vitesse max] boot non-bloquant — gate + handles des tâches de fond :
+# docker_ready: None (ensure en cours) / True (daemon UP) / False (fail-soft).
+# reconcile_task / boot_fanout_task : handles annulés/attendus (borné 5 s) au
+# shutdown pour éviter "task destroyed pending".
+docker_ready: bool | None = None
+reconcile_task = None
+boot_fanout_task = None

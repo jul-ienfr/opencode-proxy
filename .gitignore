@@ -68,6 +68,10 @@ tests/_*.txt
 _tmp_*
 # Scripts jetables a la racine (ex: tmp_decrypt.py, tmp_extract*.py)
 tmp_*.py
+# Dumps transients racine (sweeps grep, snapshots VPN, captures HTTP — P0 anti-thrashing)
+pool_snapshot.json
+tmp_*.json
+tmp_*.txt
 # Perf baselines : timings machine-spécifiques (plan v10 §15.1/§13.5)
 logs/bench_baseline.json
 logs/bench_*.jsonl

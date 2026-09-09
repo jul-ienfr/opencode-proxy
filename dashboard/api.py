@@ -2403,6 +2403,16 @@ def register_dashboard(
 
     @app.get("/api/logs")
     async def get_logs(limit: int = 100, offset: int = 0):
+        # P0 anti-thrashing : clamper limit/offset (deque bornée côté display.py,
+        # mais un limit énorme reste un slicing inutile).
+        try:
+            limit = max(1, min(int(limit or 100), 500))
+        except (TypeError, ValueError):
+            limit = 100
+        try:
+            offset = max(0, int(offset or 0))
+        except (TypeError, ValueError):
+            offset = 0
         lines = list(log_lines)
         return {
             "logs": lines[offset : offset + limit],
@@ -2440,12 +2450,22 @@ def register_dashboard(
     @app.get("/api/debug/logs")
     async def get_debug_logs(limit: int = 500, offset: int = 0):
         """Return lines from logs/debug.log, most recent first.
-        [P2 perf] rotation à 10 Mo côté display.py → le full-read ne vaut que
-        sous ce seuil ; au-delà, tail-reader seek-based. No-op immédiat quand
-        (size, mtime) est inchangé pour la même page demandée (poll UI)."""
+        [P2 perf] rotation a 10 Mo cote display.py : le full-read ne vaut que
+        sous ce seuil ; au-dela, tail-reader seek-based. No-op immediat quand
+        (size, mtime) est inchange pour la meme page demandee (poll UI).
+        [P0 anti-thrashing] limit clampe 1-500 (defaut UI 200), offset >= 0 :
+        un limit=100000 aspirerait tout le fichier (jusqu'a 10 Mo)."""
         log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs")
         debug_log_path = os.path.join(log_dir, "debug.log")
         try:
+            try:
+                limit = max(1, min(int(limit or 500), 500))
+            except (TypeError, ValueError):
+                limit = 500
+            try:
+                offset = max(0, int(offset or 0))
+            except (TypeError, ValueError):
+                offset = 0
             if not os.path.exists(debug_log_path):
                 return {"logs": [], "total": 0, "has_more": False}
 
@@ -4322,6 +4342,15 @@ def register_dashboard(
         if err:
             return err
         _traffic_mark_viewer()
+        # P0 anti-thrashing : clamper limit/offset (même pattern que /api/history).
+        try:
+            limit = max(1, min(int(limit or 200), 200))
+        except (TypeError, ValueError):
+            limit = 200
+        try:
+            offset = max(0, int(offset or 0))
+        except (TypeError, ValueError):
+            offset = 0
         frames = _traffic_capture.frames(
             limit=limit,
             offset=offset,
