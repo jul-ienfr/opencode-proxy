@@ -90,8 +90,6 @@ models:
       extends: meta-muse-spark
   deepseek-v4-flash-free:
     protocol: openai
-  hy3-free:
-    protocol: openai
   mimo-v2.5-free:
     protocol: openai
   nemotron-3-ultra-free:
