@@ -996,6 +996,8 @@ class TestChatToResponsesRequest:
             ("deepseek-v4-flash", "max", "max"),
             ("mimo-v2.5", "max", "max"),
             ("mimo-v2-pro", "max", "high"),
+            ("nemotron-3-ultra-free", "max", "high"),
+            ("nemotron-3.5-lightning-free", "max", "max"),
         ],
     )
     def test_reasoning_effort_clamped_to_model_cap(self, model, effort, expected):

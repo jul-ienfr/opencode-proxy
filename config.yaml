@@ -454,11 +454,14 @@ thinking:
     default: high
     glm-5: high
     deepseek-v4: max
+    deepseek-v4-flash-free: high
     mimo-v2.5: max
     muse-spark: xhigh
     muse_spark: xhigh
     spark: xhigh
     ling-3.0-flash-fin: max
+    nemotron-3-ultra: high
+    nemotron-3.5-lightning: max
   min_tokens:
     deepseek-v4-flash: 2048
     deepseek-v4-pro: 4096

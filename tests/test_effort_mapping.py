@@ -5,7 +5,7 @@ Clamp config-driven : ``_effort_to_reasoning`` délègue à
 ``config.effort_caps.clamp_effort`` (section ``thinking`` de ``config.yaml``,
 lue en live). Ces tests valident le comportement avec la config réelle du
 repo (spark → xhigh, glm-5 → high, deepseek-v4 → max, mimo-v2.5 → max,
-défaut → high) —
+nemotron-3-ultra → high, nemotron-3.5-lightning → max, défaut → high) —
 voir ``tests/test_effort_caps.py`` pour la logique unitaire (caps custom,
 longest-prefix, hot-reload logique)."""
 
@@ -43,6 +43,13 @@ import protocol_mapping as pm
         ("xhigh", "mimo-v2-pro", "high"),
         ("max", "mimo-v2-pro", "high"),
         ("high", "mimo-v2-pro", "high"),
+        # nemotron-3-ultra : 400 "Model is unavailable" meme a high
+        # 2026-09-09 -> defaut high conserve ; nemotron-3.5-lightning :
+        # cap max (upstream Zen 2x200 max confirme 2026-09-09)
+        ("max", "nemotron-3-ultra-free", "high"),
+        ("xhigh", "nemotron-3-ultra-free", "high"),
+        ("max", "nemotron-3.5-lightning-free", "max"),
+        ("xhigh", "nemotron-3.5-lightning-free", "xhigh"),
         # muse-spark : xhigh préservé (upstream Zen 200 confirmé 2026-09-09),
         # max → xhigh (upstream refuse max en 400), high/medium/low inchangés
         ("xhigh", "muse-spark-1.3-contributor", "xhigh"),
