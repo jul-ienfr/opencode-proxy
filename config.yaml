@@ -144,40 +144,29 @@ supervisor:
   warmup_excluded_requests: 1
 ip_rotation:
   auto_flip_cooldown_min: 15
-  cascade_enabled: true
   auto_hetero_boot: false
   auto_max_free_attempts: true
+  auto_mixed_stacks: true
   auto_ov_fail_threshold: 3
   auto_ov_return_min: 60
   auto_wg_egress_ticks: 20
   backoff_max_delay: 60
   bad_ttl: 10
-  wg_canary_fail_ttl_s: 90
-  wg_canary_pass_ttl_s: 600
-  wg_canary_countries: Switzerland,Germany,Netherlands
-  wg_canary_enabled: true
+  bad_ttl_by_cause:
+    auth: 0
+    rate_limit: null
+    timeout: 30
+    tls: 45
+  bad_ttl_factor: 2
+  bad_ttl_max: 1440
+  boot_stagger_s: 60
+  breaker_warmup_grace_s: 60
+  cascade_enabled: true
+  cascade_max_duration_s: 120
   circuit_breaker_recovery: 300
   circuit_breaker_threshold: 3
   compose_service_2: vpn-gluetun-2
   connect_retry_interval: 20
-  boot_stagger_s: 30
-  breaker_warmup_grace_s: 60
-  bad_ttl_factor: 2
-  bad_ttl_max: 1440
-  station_bad_ttl_s: 60
-  bad_ttl_by_cause:
-    rate_limit: null
-    timeout: 30
-    auth: 0
-    tls: 45
-  station_connect_retry_interval_s: 300
-  station_max_rotations_per_hour: 10
-  rotation_storm_cooldown_s: 600
-  cascade_max_duration_s: 120
-  ov_auth_cascade_enabled: false
-  ov_auth_cascade_cooldown_min: 30
-  stack_age_guard_s: 600
-  wg_canary_poll_interval_s: 4
   control_api_key: vg3q59eBCjG9hWVXm2Wpc8n9smumwhtugihf7oDafv0
   control_enabled: true
   control_pin_catchup: 25
@@ -191,9 +180,14 @@ ip_rotation:
   docker_container: opencode-vpn
   docker_container_2: opencode-vpn-2
   docker_events: true
-  dual_station: true
+  dual_station: false
+  egress_allow_any_country: false
   egress_failure_tick_interval: 15.0
   enabled: true
+  enforce_vpn_only: false
+  free_exception_fallback: station-first
+  free_model_candidates: {}
+  free_model_spread: true
   free_parallel:
     enabled: true
     routing: round-robin
@@ -235,76 +229,82 @@ ip_rotation:
     soft_cooldown_sec: 600
     stream_metric: ttfb
     window: 20
+  max_free_attempts: 5
+  on_429_action: both
+  ov_auth_backoff_max_s: 600
+  ov_auth_backoff_s: 90
+  ov_auth_cascade_cooldown_min: 30
+  ov_auth_cascade_enabled: false
+  ov_auth_cool_s: 300
+  ov_auth_host_blacklist_min: 60
+  ov_auth_station_threshold: 5
+  ov_auth_window_s: 1800
   ovpn_endpoint_port: ''
   ovpn_protocol: tcp
+  paid_hedge_after_ms: 0
+  pin_widen_auths: 8
+  pin_widen_minutes: 30
+  pin_widen_resets: 6
+  pin_widen_stagger_s: 60
   proxy_mode: vpn
   quota_per_ip: 500
   recent_ip_max_age: 1800
   recent_ip_window: 20
   rotation_fail_cooldown: 60
   rotation_max_duration: 240
-  rotation_stagger: 2
+  rotation_stagger: 10
+  rotation_storm_cooldown_s: 600
   rotation_wait_timeout: 5
-  paid_hedge_after_ms: 0
   server_countries: Germany,Netherlands,France,Sweden,Switzerland
-  egress_allow_any_country: false
+  server_issue_grace_s: 25
+  server_issue_recheck: true
+  server_list_refresh_interval_s: 21600
+  server_pick_mode: proxy
   server_provider: nordvpn
   shared_rotation_file: logs/shared_rotation.json
   socks5_auto_rotate: true
   socks5_proxies: []
   socks5_proxy_port: 1080
   socks5_proxy_port_2: 1081
+  socks_catchup_s: 90
+  socks_down_routable: true
+  stack_age_guard_s: 600
   state_file_2: logs/vpn_state2.json
+  station_bad_ttl_s: 60
+  station_connect_retry_interval_s: 300
   station_count: 6
+  station_max_rotations_per_hour: 10
   status_cache_seconds: 2.0
-  strict_free: true
-  free_model_spread: true
-  free_model_candidates: {}
-  on_429_action: both
+  strict_free: false
   switch_delay: 1
   update_apply_idle_minutes: 15
   update_apply_max_defer_hours: 24
   update_apply_window: 03:00-05:00
   update_check_interval: 21600
   update_enabled: true
+  upstream_event_cool_s: 180
+  upstream_event_threshold: 3
+  upstream_event_window_s: 60
   use_nordvpn_api: false
   vpn_proxy_port: 8888
   vpn_proxy_port_2: 8889
   vpn_stack: auto
-  auto_mixed_stacks: true
-  wg_churn_fallback: true
-  wg_return_enabled: true
+  wait_healthy_late_retry_s: 30
   wait_healthy_poll: 0.5
+  wait_healthy_require_socks: false
+  watchdog_auth_grace_s: 240
   watchdog_backoff_base: 15
   watchdog_backoff_max: 60
-  watchdog_interval: 20
-  server_issue_grace_s: 25
-  server_issue_recheck: true
-  wait_healthy_late_retry_s: 30
-  wait_healthy_require_socks: false
-  socks_catchup_s: 90
-  socks_down_routable: true
-  ov_auth_window_s: 1800
-  ov_auth_station_threshold: 5
-  ov_auth_cool_s: 300
-  ov_auth_backoff_s: 90
-  ov_auth_backoff_max_s: 600
-  ov_auth_host_blacklist_min: 60
-  watchdog_auth_grace_s: 240
   watchdog_egress_grace_ticks: 6
+  watchdog_interval: 20
   watchdog_max_restarts_per_hour: 3
-  server_list_refresh_interval_s: 21600
-  pin_widen_resets: 6
-  pin_widen_auths: 8
-  pin_widen_minutes: 30
-  pin_widen_stagger_s: 60
-  upstream_event_threshold: 3
-  upstream_event_window_s: 60
-  upstream_event_cool_s: 180
-  server_pick_mode: proxy
-  max_free_attempts: 5
-  free_exception_fallback: station-first
-  enforce_vpn_only: false
+  wg_canary_countries: Switzerland,Germany,Netherlands
+  wg_canary_enabled: true
+  wg_canary_fail_ttl_s: 90
+  wg_canary_pass_ttl_s: 600
+  wg_canary_poll_interval_s: 4
+  wg_churn_fallback: true
+  wg_return_enabled: true
 geo:
   enabled: true
   version: 1

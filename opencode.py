@@ -1603,7 +1603,18 @@ async def _apply_station_count(new_n: int) -> None:
                 if managers[old_n:]:
                     new_managers = managers[old_n:]
                     # start() for all to init watchdog/state, then connect() for new ones to block until healthy
-                    await asyncio.gather(*(m.start() for m in new_managers))
+                    # [fix 09/09] fail-soft comme connect() : une station lente
+                    # (compose/docker) ne doit pas faire rollback TOTAL de
+                    # l'upscale — le watchdog healera la station fautive.
+                    _start_results = await asyncio.gather(
+                        *(m.start() for m in new_managers), return_exceptions=True
+                    )
+                    for _m, _r in zip(new_managers, _start_results):
+                        if isinstance(_r, Exception):
+                            _debug(
+                                f"  [vpn] upscale start soft-failed "
+                                f"(station {getattr(_m, '_station', '?')}, watchdog will heal): {_r}"
+                            )
                     # Now actually bring up the new tunnels (blocking) — real VPNManager has _compose_up, stub (tests) does not
                     connect_tasks = []
                     for m in new_managers:

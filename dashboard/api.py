@@ -3351,6 +3351,11 @@ def register_dashboard(
         # windows must stay symmetric on every station (a single shared
         # registry and one absolute identity cursor globalise them).
         managers = getattr(shared_state, "vpn_managers", None) or []
+        if not managers and "station_count" in (body or {}):
+            return JSONResponse(
+                status_code=503,
+                content={"error": "gestionnaire VPN non initialisé (aucune station active)"},
+            )
         if managers and body:
             # [plan 18/08 §4] N-station hot-reload — change the number of
             # parallel tunnels at runtime (start/stop compose containers,
@@ -3380,8 +3385,34 @@ def register_dashboard(
 
                         await _apply_station_count(_new_n)
                     except Exception as e:
-                        _debug(f"  [vpn] station_count hot-reload failed: {e}")
-                        return {"error": f"échec hot-reload station_count : {e}"}
+                        import traceback as _tb
+
+                        _debug(f"  [vpn] station_count hot-reload failed: {e}\n{_tb.format_exc()}")
+                        return JSONResponse(
+                            status_code=500,
+                            content={"error": f"échec hot-reload station_count : {e}"},
+                        )
+                    managers = getattr(shared_state, "vpn_managers", None) or []
+                else:
+                    # [fix 09/09] new == len(managers) : le registre runtime a
+                    # déjà N stations mais le miroir persisté peut être périmé
+                    # (ex. runtime 6 vs config.yaml 2) — le GUI renverrait
+                    # sinon l'ancienne valeur et « reviendrait sur 2 ».
+                    # Converge via _apply_station_count (chemin idempotent :
+                    # recrée les stations manquantes, redémarre les
+                    # déconnectées) puis persiste si le miroir diffère.
+                    try:
+                        from opencode import _apply_station_count as _asc_sync
+
+                        await _asc_sync(_new_n)
+                    except Exception as e:
+                        import traceback as _tb2
+
+                        _debug(f"  [vpn] station_count resync failed: {e}\n{_tb2.format_exc()}")
+                        return JSONResponse(
+                            status_code=500,
+                            content={"error": f"échec resync station_count : {e}"},
+                        )
                     managers = getattr(shared_state, "vpn_managers", None) or []
             for mgr in managers:
                 await mgr.update_config(body)
@@ -3399,7 +3430,15 @@ def register_dashboard(
             # persistent state that would also kill auto-flips on reboot
             # (stack != auto wins). The other keys are unconditional.
             _persist_body = {k: v for k, v in body.items() if k != "vpn_stack"}
-            _persist_vpn_config(_persist_body)
+            # [fix 09/09] le retour de _persist n'est plus ignoré : un échec
+            # disque silencieux laissait config.yaml périmé (désync 2 vs 6).
+            _persist_err = _persist_vpn_config(_persist_body)
+            if _persist_err:
+                _debug(f"  [vpn] persist config failed: {_persist_err}")
+                return JSONResponse(
+                    status_code=500,
+                    content={"error": f"échec persistance config : {_persist_err}"},
+                )
 
             # [plan 18/08 §3d] stack selection — applied AFTER the config
             # fan-out (set_stack persists the mode itself into the manager;
