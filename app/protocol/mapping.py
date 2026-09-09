@@ -358,11 +358,19 @@ def _strip_billing_header(text: str) -> str:
     return rest
 
 
-# ── Tool schema normalization (proud-beaver V3) ──────────────────
-# `pattern` non compilable en ECMA sans flag `u` (ex. \p{...}) : le
-# validateur de la jambe Responses le rejette en 400 invalid_request_error.
-# Pleine fidélité : \p{Cc|Cf|Zl|Zp} intra-classe → plages BMP exactes
-# (toutes BMP → \uXXXX par code-unit, identique en ECMA sans `u`).
+# ── Tool schema normalization (strict-subset) ────────────────────
+# En profil strict (muse/spark/...) : AUCUN keyword hors sous-ensemble
+# strict n'est émis — `pattern` systématiquement strippé (le validateur
+# de la jambe Responses rejette les lookarounds en 400
+# invalid_request_error, quel que soit le fragment exact cité),
+# `propertyNames`/`prefixItems`/`allOf` également normalisés. `pattern`
+# et `propertyNames` ne sont que des hints de validation (le proxy ne
+# valide pas les valeurs d'args) → suppression cosmétique seule.
+# Profils permissifs (minimax/qwen) : `pattern` conservé si ECMA-safe,
+# sinon transpilé via _rewrite_unicode_properties, strippé si non
+# transpilable. Pleine fidélité : \p{Cc|Cf|Zl|Zp} intra-classe →
+# plages BMP exactes (toutes BMP → \uXXXX par code-unit, identique en
+# ECMA sans `u`).
 _UNSAFE_PATTERN_RE = re.compile(r"\\[pP]\{")
 
 # Cf BMP uniquement (43 pts, unicodedata 15.0) : le reste de Cf est
@@ -511,6 +519,8 @@ def _normalize_tool_schema(schema: dict, model: str = "") -> dict:
                 return {}
         if node.get("nullable") is True:
             node.pop("nullable")
+        if prof["strip_additional_props"] and node == {} and depth > 0:
+            return {"type": "string"}
         if isinstance(node.get("type"), list):
             t = [x for x in node["type"] if x != "null"]
             if len(t) == 1:
@@ -519,7 +529,7 @@ def _normalize_tool_schema(schema: dict, model: str = "") -> dict:
                 node.pop("type")
             else:
                 node["type"] = t
-        for key in ("anyOf", "oneOf"):
+        for key in ("anyOf", "oneOf", "allOf"):
             if key in node and isinstance(node[key], list):
                 lst = node[key]
                 has_null = any(isinstance(x, dict) and x.get("type") == "null" and len(x) == 1 for x in lst)
@@ -574,6 +584,7 @@ def _normalize_tool_schema(schema: dict, model: str = "") -> dict:
                     and "type" not in pv
                     and "anyOf" not in pv
                     and "oneOf" not in pv
+                    and "allOf" not in pv
                     and "$ref" not in pv
                 ):
                     pv["type"] = "string"
@@ -589,9 +600,9 @@ def _normalize_tool_schema(schema: dict, model: str = "") -> dict:
         # 14. Enforce additionalProperties:false sur tout object (root + nested)
         if _is_strict and node.get("type") == "object":
             node["additionalProperties"] = False
-        # 15. Strip anyOf/oneOf résiduels pour strict (seul anyOf null géré en 9)
+        # 15. Strip anyOf/oneOf/allOf résiduels pour strict (seul anyOf/allOf null géré en 9)
         if _is_strict:
-            for key in ("anyOf", "oneOf"):
+            for key in ("anyOf", "oneOf", "allOf"):
                 if key in node and isinstance(node[key], list):
                     lst = node[key]
                     if lst and isinstance(lst[0], dict) and lst[0].get("type"):
@@ -626,12 +637,15 @@ def _normalize_tool_schema(schema: dict, model: str = "") -> dict:
         ):
             if not any(k in node["items"] for k in ("anyOf", "oneOf", "$ref")):
                 node["items"]["type"] = "string"
-        # 18. Transpile `pattern` non compilable ECMA sans flag `u`
-        # (ex. \p{...}) en strict — 400 invalid_request_error garanti sur
-        # la jambe Responses sinon (route free, provider Console).
-        # Pleine fidélité : rewrite BMP-exact, strip seulement si non
-        # transpilable (ex. \P{...}, propriété inconnue, token hors classe).
+        # 18. Strip TOTAL de `pattern` en strict — 400
+        # invalid_request_error garanti sur la jambe Responses sinon
+        # (route free, provider Console). Hors strict (profils permissifs
+        # minimax/qwen), rewrite BMP-exact via _rewrite_unicode_properties,
+        # strip seulement si non transpilable.
         if _is_strict and isinstance(node.get("pattern"), str):
+            _debug(f"  [schema] strip pattern (strict) model={model!r} pattern={node['pattern'][:80]!r}")
+            node.pop("pattern", None)
+        elif not _is_strict and isinstance(node.get("pattern"), str):
             if _UNSAFE_PATTERN_RE.search(node["pattern"]):
                 rewritten = _rewrite_unicode_properties(node["pattern"])
                 if rewritten is None:
@@ -640,6 +654,21 @@ def _normalize_tool_schema(schema: dict, model: str = "") -> dict:
                 elif rewritten != node["pattern"]:
                     _debug(f"  [schema] rewrite unsafe pattern model={model!r} pattern={node['pattern'][:80]!r}")
                     node["pattern"] = rewritten
+        # 19. Strict-subset : drop propertyNames/prefixItems, sécurise {}.
+        # propertyNames non supporté en strict → pop. prefixItems non
+        # supporté → pop + items par défaut string si absent/non-dict
+        # (dict existant laissé tel quel, la récursion le normalise).
+        # Nœud vidé par les strips → {"type": "string"} (jambe Responses
+        # rejette les schémas vides). Root exclu : depth 0 a toujours
+        # "type" ici (étape 10), donc == {} impossible à depth 0.
+        if _is_strict:
+            node.pop("propertyNames", None)
+            if "prefixItems" in node:
+                node.pop("prefixItems")
+                if not isinstance(node.get("items"), dict):
+                    node["items"] = {"type": "string"}
+            if node == {}:
+                node["type"] = "string"
         defs_local: dict = {}
         if "$defs" in node and isinstance(node["$defs"], dict):
             defs_local.update(node["$defs"])

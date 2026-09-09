@@ -13,8 +13,8 @@ as test_vpn_stack_persist.py; ``opencode._apply_station_count`` and
 - GET echoes ``station_count`` (it now lives in the manager's config).
 - POST {station_count: 4} → _apply_station_count(4), station_count never
   reaches update_config/_persist (consumed).
-- POST with the CURRENT count → short-circuit: _apply_station_count never
-  called; the key is still consumed (never fanned out).
+- POST with the CURRENT count → idempotent resync via _apply_station_count(N);
+  the key is still consumed (never fanned out).
 - POST {station_count: "abc"} or 15 → HTTP 400 explicit (plan 18/08 axe 3.3
   — a silent clamp would mask GUI/programmatic errors; 1..10 only).
 - regression: POST {dual_station: false} (legacy toggle) is a plain config
@@ -120,14 +120,16 @@ def test_post_station_count_applies_hot_reload(ctx):
 
 
 def test_post_station_count_same_value_short_circuits(ctx):
-    """2 == 2 active stations → no _apply_station_count; the key is still
-    consumed (never persisted, never fanned out)."""
+    """2 == 2 active stations → resync idempotent via _apply_station_count(2)
+    ([fix 09/09] : le registre peut avoir N stations avec un miroir persisté
+    périmé — le short-circuit pur renvoyait l'ancienne valeur et le GUI
+    « revenait sur 2 »). La clé reste consommée (ni fan-out ni persist)."""
     fast, s1, s2, pool, applied, persisted = ctx
 
     resp = _post(fast, {"station_count": 2})
 
     assert resp["ok"] is True
-    assert applied == []
+    assert applied == [2]
     assert persisted == [{}]
 
 

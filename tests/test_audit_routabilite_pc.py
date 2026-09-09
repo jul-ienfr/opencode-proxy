@@ -790,8 +790,16 @@ def test_mixed_inactive_on_uniform_modes(tmp_path):
 
 
 async def test_socks_probe_second_pass_on_timeouts(tmp_path, monkeypatch):
-    """Timeouts 3 s partout puis OK à 8 s ⇒ True (tunnel lent, pas mort)."""
-    mgr = FakeVPNManager(_pc_cfg(tmp_path), tmp_path=tmp_path)
+    """Timeouts 3 s partout puis OK à 8 s ⇒ True (tunnel lent, pas mort).
+
+    Budget 20 s (valeur live config.yaml) : la repasse à 8 s tient dans
+    l'enveloppe globale ([fiab 09/09]). Avec le budget 8.0 des suites
+    historiques + 2 URLs, la repasse serait plafonnée au temps restant
+    (2 s) — pas un bug, juste l'enveloppe qui protège /api/vpn-status.
+    """
+    mgr = FakeVPNManager(
+        _pc_cfg(tmp_path, ip_probe_budget=20.0), tmp_path=tmp_path
+    )
     mgr._ip_check_urls = ["http://a.invalid", "http://b.invalid"]
     calls = {"n": 0, "budgets": []}
 

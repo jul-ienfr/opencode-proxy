@@ -1432,6 +1432,32 @@ class FreeIPPool:
         Seules des paires (station, IP) DISTINCTES comptent : 3× 429 sur le
         même bucket = quota per-IP réel (rotation légitime), pas un
         événement. Fenêtre glissante, mémoire seule."""
+        return self._note_upstream(station, "429")
+
+    def _note_upstream_timeout(self, station) -> bool:
+        """[fiab 09/09 phase 2] Enregistre un timeout/disconnect (station,
+        IP) dans le même log corrélé que les 429 : N timeouts sur des
+        couples distincts / fenêtre = cause commune (réseau/NordVPN),
+        pas N tunnels morts isolés → gel des rotations."""
+        return self._note_upstream(station, "timeout")
+
+    def _note_upstream_auth(self, station) -> bool:
+        """[fiab 09/09 phase 2] Enregistre un refus AUTH (station, IP) dans
+        le même log corrélé : N AUTH_FAILED sur des couples distincts /
+        fenêtre = throttle/limite sessions côté NordVPN (storm auto-infligé
+        ou limite de compte), rotationner brûlerait des IP neuves + des
+        handshakes AUTH pour rien → gel des rotations."""
+        return self._note_upstream(station, "auth")
+
+    def _note_upstream(self, station, kind: str = "429") -> bool:
+        """[fiab 09/09 phase 2] Cœur corrélé multi-causes : 429, timeouts et
+        AUTH alimentent le MÊME log — une vague amont mixte (429 + timeouts
+        + AUTH_FAILED) déclare comme une vague homogène. Seuls des couples
+        (station, IP) DISTINCTS comptent, toutes causes confondues : des
+        répétitions sur le même bucket = cause per-IP/station réelle
+        (rotation légitime), pas un événement. Fenêtre glissante, mémoire
+        seule. Entrées (now, sid, ip, kind) — les 3-tuples historiques
+        (now, sid, ip) restent lisibles (compat phase 1)."""
         try:
             now = time.monotonic()
             try:
@@ -1450,7 +1476,7 @@ class FreeIPPool:
                 thr = int(getattr(self, "_upstream_event_threshold", 3))
             except Exception:
                 thr = 3
-            log.append((now, sid, ip))
+            log.append((now, sid, ip, kind))
             while log and now - log[0][0] > win:
                 log.popleft()
             if len(log) > 64:
@@ -1458,17 +1484,40 @@ class FreeIPPool:
                     log.popleft()
             if self._upstream_event_active():
                 return False  # déjà déclaré — pas de re-log
-            distinct = {(s, i) for (_, s, i) in log}
-            if len(distinct) >= max(2, thr):
+            # [fiab 09/09 phase 2] déclare sur couples DISTINCTS toutes
+            # causes confondues, OU sur stations distinctes ≥ seuil quand
+            # les IPs sont inconnues (doubles/timeouts précoces : ip="unknown"
+            # identique partout — les sids distincts portent la corrélation).
+            # Les 3-tuples phase 1 (now, sid, ip) restent lisibles : kind="429".
+            try:
+                kinds = {(e[3] if len(e) > 3 else "429") for e in log}
+            except Exception:
+                kinds = {"429"}
+            distinct = set()
+            try:
+                for e in log:
+                    distinct.add((e[1], e[2]))
+            except Exception:
+                pass
+            try:
+                distinct_sids = {e[1] for e in log}
+            except Exception:
+                distinct_sids = set()
+            if len(distinct) >= max(2, thr) or len(distinct_sids) >= max(2, thr):
                 try:
                     cool = float(getattr(self, "_upstream_event_cool_s", 180.0))
                 except Exception:
                     cool = 180.0
                 self._upstream_event_until = now + max(30.0, cool)
+                try:
+                    _kinds_str = "+".join(sorted(kinds))
+                except Exception:
+                    _kinds_str = "mixte"
                 logger.warning(
-                    "[free-ip] ÉVÉNEMENT AMONT : %d 429 sur %d couples (station,IP) distincts / %.0fs — "
-                    "gel des rotations 429 pendant %.0fs (refus honnête, pas de churn)",
+                    "[free-ip] ÉVÉNEMENT AMONT : %d signaux (%s) sur %d couples (station,IP) distincts / %.0fs — "
+                    "gel des rotations pendant %.0fs (refus honnête, pas de churn)",
                     len(log),
+                    _kinds_str,
                     len(distinct),
                     win,
                     cool,
@@ -1660,11 +1709,31 @@ class FreeIPPool:
             if self.dual_station:
                 if self._any_other_usable(failed):
                     self._apply_bad_mark(failed, "timeout")
+            # [fiab 09/09 phase 2] alimente le breaker corrélé AVANT d'agir
+            # (même règle que on_quota_exhausted : un événement déclaré par
+            # CET appel gèle la rotation ci-dessous — l'IP neuve mourrait
+            # aussi si la cause est commune). Mode vpn uniquement (la
+            # branche socks5 est sortie plus haut).
+            try:
+                self._note_upstream_timeout(failed)
+            except Exception:
+                pass
             # [plan-perf Lot 2] URGENT (-1) : ce retry sert une requête qui
             # attend déjà (budget rotation_wait_timeout) — il passe devant
             # les rotations de fond 429 en attente (pas de préemption des
             # rotations en vol, seulement l'ordre de la file).
-            self._launch_rotation(failed, forced_pool=forced_pool, priority=-1)
+            if self._upstream_event_active():
+                # Événement amont : le bad-mark/ci-dessus suffit, la
+                # requête retry atterrit ci-dessous sur une autre station ;
+                # rotationner maintenant brûlerait une IP neuve + un AUTH.
+                logger.info(
+                    "[free-ip] station %s disconnect pendant événement amont (%ds restants) — "
+                    "rotation gelée, cooldown seul",
+                    getattr(failed, "_station", "?"),
+                    self._upstream_event_remaining_s(),
+                )
+            else:
+                self._launch_rotation(failed, forced_pool=forced_pool, priority=-1)
         st = (
             self._best_station_excluding(failed, forced_pool)
             if failed is not None
@@ -1737,6 +1806,15 @@ class FreeIPPool:
             or time.monotonic() - per["session_start"] >= self._late_signal_grace
         ):
             self._apply_bad_mark(station, "timeout")
+            # [fiab 09/09 phase 2] feed genuine-only : le bad-mark étage 0
+            # vient d'être appliqué (ni late-signal absorbé par la grâce
+            # 20 s, ni refresh d'ancre repair) → le tunnel est vraiment
+            # mort côté requête → signal timeout corrélé. Mode vpn
+            # uniquement (la branche socks5 est sortie plus haut).
+            try:
+                self._note_upstream_timeout(station)
+            except Exception:
+                pass
         station.arm_egress_watchdog()
 
     # ── In-flight free stream registry (plan 18/08 §am.22) ──────
@@ -1896,7 +1974,25 @@ class FreeIPPool:
 
         Axe B: ``forced_pool`` is stored on the station as
         ``_geo_forced_pool`` so the background rotation stays within
-        geo-allowed countries."""
+        geo-allowed countries.
+
+        [fiab 09/09 phase 2] Gel centralisé événement amont : TOUS les
+        producteurs (429 fond, disconnect retry URGENT -1, re-queue
+        post-commit) passent ici — pendant un événement corrélé
+        (429/timeouts/AUTH sur couples distincts), aucune rotation ne part :
+        l'IP neuve mourrait de la même cause commune. Refus honnête
+        (log), pas de churn. Le cooldown/bad-mark posé par l'appelant
+        suffit ; la prochaine rotation part à la fin de l'événement."""
+        try:
+            if self._upstream_event_active():
+                logger.info(
+                    "[free-ip] station %s rotation gelée — événement amont (%ds restants), cooldown seul",
+                    getattr(station, "_station", "?"),
+                    self._upstream_event_remaining_s(),
+                )
+                return
+        except Exception:
+            pass
         sid = station._station
         if sid not in self._station_ids:
             # [plan 18/08 §2.3] A request handler can hold a manager the
@@ -2028,6 +2124,36 @@ class FreeIPPool:
             logger.warning(
                 "[free-ip] station %d background rotation failed: %s", station._station, e
             )
+            # [fiab 09/09 phase 2] feed _rotate_station : un except ici =
+            # switch_ip a levé (AUTH/gate/timeout/docker) — pas un simple
+            # bad-mark. AuthCoolingDownError (sous-classe de RotationFailed,
+            # testée en premier — duck-typé par nom pour les doubles de
+            # test) → signal "auth" ; les autres RotationFailed/délais/
+            # timeouts → signal "timeout". Tout le reste (docker, bugs) ne
+            # nourrit PAS le breaker (local, pas amont). try/except pass,
+            # vpn-only (les endpoints SOCKS5 ne passent jamais ici).
+            try:
+                _ename = type(e).__name__
+                _emro = [c.__name__ for c in type(e).__mro__]
+                _emsg = str(e) or ""
+                if _ename == "AuthCoolingDownError" or (
+                    "AuthCoolingDownError" in _emro
+                    or "AuthCoolingDown" in _ename
+                    or "auth-cooling" in _emsg.lower()
+                    or "auth cooling" in _emsg.lower()
+                ):
+                    self._note_upstream_auth(station)
+                elif (
+                    _ename == "RotationFailed"
+                    or "RotationFailed" in _emro
+                    or "timed out" in _emsg.lower()
+                    or "timeout" in _emsg.lower()
+                    or "délai" in _emsg.lower()
+                    or "delai" in _emsg.lower()
+                ):
+                    self._note_upstream_timeout(station)
+            except Exception:
+                pass
         finally:
             self._rotation_tasks.pop(sid, None)
             # [plan v10 §14.1.8] le tag géo était posé par _launch_rotation et

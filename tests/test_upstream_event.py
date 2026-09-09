@@ -16,6 +16,8 @@ _launch_rotation spybée, jamais de docker.
 
 import time
 
+import pytest
+
 from free_ip_pool import FreeIPPool
 
 
@@ -43,7 +45,10 @@ def _pool3():
     pool = FreeIPPool(s[0], s[1])
     pool.set_stations(s)
     pool.rotated = []
-    pool._launch_rotation = lambda station, forced_pool=None: pool.rotated.append(station)
+    # NOTE : le gel centralisé vit dans _launch_rotation (réel) — le stub
+    # le court-circuite, donc les tests ci-dessous exercent le gel via les
+    # branches on_quota_exhausted/on_disconnect_retry, pas via ce stub.
+    pool._launch_rotation = lambda station, forced_pool=None, **kw: pool.rotated.append(station)
     return pool, s
 
 
@@ -158,3 +163,88 @@ class TestUpstreamEvent:
         pool.on_quota_exhausted(s1)  # dernière-servable, en événement
         assert len(pool.rotated) == n  # aucune rotation forcée
         assert pool._station_usable(s1, exclude_approaching=False) is True
+
+    # ── [fiab 09/09 phase 2] multi-causes : timeouts + AUTH ──────────
+
+    def test_mixed_429_timeout_auth_declares_event(self):
+        """Une vague MIXTE (429 + timeout + AUTH sur couples distincts)
+        déclare comme une vague homogène — c'est le cas réel d'un throttle
+        amont (storm auto-infligé : les retries timeoutent ET les AUTH
+        suivants sont refusés)."""
+        pool, (s1, s2, s3) = _pool3()
+        pool._note_upstream_429(s1)
+        assert pool._upstream_event_active() is False
+        pool._note_upstream_timeout(s2)
+        assert pool._upstream_event_active() is False
+        pool._note_upstream_auth(s3)  # 3ᵉ couple distinct, 3ᵉ cause → événement
+        assert pool._upstream_event_active() is True
+
+    @pytest.mark.asyncio
+    async def test_disconnect_retry_feeds_breaker_and_freezes_when_declared(self):
+        """on_disconnect_retry alimente le log timeout (vrai même hors
+        événement : le bad-mark + la rotation URGENTE partent normalement),
+        et gèle la rotation dès que CET appel déclare l'événement."""
+        pool, (s1, s2, s3) = _pool3()
+        # 1er couple distinct → pas d'événement, rotation URGENTE normale.
+        await pool.on_disconnect_retry(s1)
+        assert pool._upstream_event_active() is False
+        assert pool.rotated == [s1]
+        # 2ᵉ couple distinct → toujours pas d'événement (seuil 3).
+        await pool.on_disconnect_retry(s2)
+        assert pool._upstream_event_active() is False
+        n = len(pool.rotated)
+        # 3ᵉ couple distinct → CET appel déclare → gel de SA rotation.
+        await pool.on_disconnect_retry(s3)
+        assert pool._upstream_event_active() is True
+        assert len(pool.rotated) == n  # s3 gelée, pas de rotation neuve
+
+    def test_notify_genuine_failure_feeds_timeout(self):
+        """notify_connection_failure n'alimente que sur bad-mark genuine
+        (ni late-signal absorbé ni refresh d'ancre) — ici s1 échoue pour de
+        vrai (autre station utilisable, session hors grâce) → 1 signal."""
+        pool, (s1, s2, s3) = _pool3()
+        pool.notify_connection_failure(s1)
+        assert len(pool._upstream_429_log) == 1
+        assert pool._upstream_429_log[0][3] == "timeout"
+        assert pool._upstream_event_active() is False
+
+    def test_notify_late_signal_does_not_feed(self):
+        """Un late-signal (session_start < grâce 20 s, IP inchangée) est
+        absorbé sans bad-mark → AUCUN signal timeout (pas de faux corrélé)."""
+        pool, (s1, s2, s3) = _pool3()
+        per = pool._per_station(s1)
+        per["last_confirmed_ip"] = s1.current_ip
+        per["session_start"] = time.monotonic()  # frais → dans la grâce
+        pool.notify_connection_failure(s1)
+        assert len(pool._upstream_429_log) == 0
+
+    def test_launch_rotation_central_gel_blocks_all_producers(self):
+        """Le gel centralisé dans _launch_rotation (réel, pas stubé) bloque
+        TOUS les producteurs pendant l'événement — y compris un appel direct
+        (re-queue post-commit, futur producteur)."""
+        pool, (s1, s2, s3) = _pool3()
+        pool._note_upstream_429(s1)
+        pool._note_upstream_timeout(s2)
+        pool._note_upstream_auth(s3)
+        assert pool._upstream_event_active() is True
+        # Dé-stubbe : le vrai _launch_rotation doit refuser pendant l'event.
+        # _ensure_workers créerait des workers orphelins (coroutine jamais
+        # attendue) — on le neutralise : le gel est AVANT, c'est lui qu'on
+        # teste ici, pas la file.
+        del pool._launch_rotation
+        pool._ensure_workers = lambda: None
+        n_pending = len(pool._pending)
+        pool._launch_rotation(s1)
+        assert len(pool._pending) == n_pending  # rien n'a été filé
+        # Hors événement : le chemin réel re-file (pending +1, queue
+        # alimentée — _ensure_workers neutralisé, pas de worker créé).
+        pool._upstream_event_until = time.monotonic() - 1.0
+        pool._launch_rotation(s1)
+        assert len(pool._pending) == n_pending + 1
+        # Nettoie la file pour ne pas laisser d'entrée orpheline.
+        try:
+            while True:
+                pool._rotation_queue.get_nowait()
+        except Exception:
+            pass
+        pool._pending.discard(s1._station)

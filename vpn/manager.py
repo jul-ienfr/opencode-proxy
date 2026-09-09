@@ -85,7 +85,7 @@ def _auth_connect_done() -> None:
         _AUTH_IN_FLIGHT = max(0, _AUTH_IN_FLIGHT - 1)
 
 
-async def _auth_gate(count_inflight: bool = True) -> None:
+async def _auth_gate() -> None:
     global _AUTH_LAST_CONNECT_AT, _AUTH_IN_FLIGHT
     if os.getenv("PYTEST_CURRENT_TEST"):
         return
@@ -96,7 +96,7 @@ async def _auth_gate(count_inflight: bool = True) -> None:
             continue
         sleep_for = 0.0
         with _AUTH_THROTTLE_LOCK:
-            if count_inflight and _AUTH_IN_FLIGHT >= 2:
+            if _AUTH_IN_FLIGHT >= 2:
                 sleep_for = 2.0
             else:
                 now = time.monotonic()
@@ -105,8 +105,7 @@ async def _auth_gate(count_inflight: bool = True) -> None:
                     sleep_for = 30.0 - delta
                 else:
                     _AUTH_LAST_CONNECT_AT = now
-                    if count_inflight:
-                        _AUTH_IN_FLIGHT += 1
+                    _AUTH_IN_FLIGHT += 1
                     return
         await asyncio.sleep(sleep_for)
 
@@ -2098,8 +2097,18 @@ class VPNManager:
                 if self._rotation_cancel_requested:
                     raise RotationFailed("rotation annulée (downscale en cours)")
                 if pinned is None:
-                    await _auth_gate(False)
-                    await self._ensure_container()
+                    # [fiab 09/09] branche legacy COMPTÉE sous la gate : le
+                    # restart container fait un vrai AUTH NordVPN, il prend
+                    # un slot et le libère dès le restart lancé (le handshake
+                    # AUTH part au start ; le wait_healthy ne fait que poller
+                    # et ne doit pas bloquer un slot des minutes). Le pin
+                    # control est gaté dans _control_pin_country — jamais deux
+                    # slots tenus pour une seule rotation.
+                    await _auth_gate()
+                    try:
+                        await self._ensure_container()
+                    finally:
+                        _auth_connect_done()
                     started_at = await self._wait_healthy(timeout=120)
                     if self._rotation_cancel_requested:
                         raise RotationFailed("rotation annulée (downscale en cours)")
@@ -2707,29 +2716,66 @@ class VPNManager:
                             except Exception:
                                 pass
                         else:
-                            # tunnel UP + SOCKS5 KO (cas S6) : dégradé
-                            # routable — l'IP reste servie, jamais d'error.
-                            self._egress_state = "tunnel_up_socks_down"
+                            # tunnel UP + SOCKS5 KO (cas S6) : grace light
+                            # avant de declarer — un handshake froid isole
+                            # (timeouts) ne rougit pas la GUI : confirmation
+                            # legere bornee par le budget (pattern watchdog).
                             try:
-                                self._egress_socks_pending = True
-                                self._degraded_reason = "socks-down"
+                                _pending_at_entry = bool(
+                                    getattr(self, "_egress_socks_pending", False)
+                                )
                             except Exception:
-                                pass
-                            self._error = (
-                                "tunnel UP mais egress SOCKS5 KO — dégradé routable"
-                            )
+                                _pending_at_entry = False
                             try:
-                                if VPNState.can_transition(self._status, VPNState.DEGRADED):
-                                    self._set_status(VPNState.DEGRADED)
-                                else:
+                                _light_alive = await asyncio.wait_for(
+                                    self._probe_tunnel_light(),
+                                    self._ip_probe_budget,
+                                )
+                            except Exception:
+                                _light_alive = False
+                            if _light_alive and not _pending_at_entry:
+                                # Premier doute, tunnel vivant : rester
+                                # CONNECTED avec pending — le fond confirmera
+                                # au prochain tick, pas de degradation GUI.
+                                try:
+                                    self._egress_socks_pending = True
+                                except Exception:
+                                    pass
+                                try:
+                                    self._launch_socks_catchup()
+                                except Exception:
+                                    pass
+                                self._egress_state = "tunnel_up_full"
+                            else:
+                                # Doute confirme 2 ticks de suite, ou tunnel
+                                # vraiment KO : dégradé routable — l'IP reste
+                                # servie, jamais d'error. Le fond fait
+                                # retomber le pending sans bloquer les ticks.
+                                self._egress_state = "tunnel_up_socks_down"
+                                try:
+                                    self._egress_socks_pending = True
+                                    self._degraded_reason = "socks-down"
+                                except Exception:
+                                    pass
+                                try:
+                                    self._launch_socks_catchup()
+                                except Exception:
+                                    pass
+                                self._error = (
+                                    "tunnel UP mais egress SOCKS5 KO — dégradé routable"
+                                )
+                                try:
+                                    if VPNState.can_transition(self._status, VPNState.DEGRADED):
+                                        self._set_status(VPNState.DEGRADED)
+                                    else:
+                                        self._status = VPNState.DEGRADED
+                                except Exception:
                                     self._status = VPNState.DEGRADED
-                            except Exception:
-                                self._status = VPNState.DEGRADED
-                            self._current_server = {
-                                "name": self._docker_container,
-                                "country": self._current_country or self._server_countries,
-                            }
-                            return self.get_status()
+                                self._current_server = {
+                                    "name": self._docker_container,
+                                    "country": self._current_country or self._server_countries,
+                                }
+                                return self.get_status()
                     else:
                         self._egress_state = "tunnel_up_full"
                     # [graceful-aurora LOT C] auth_cooling + IP servie →
@@ -3028,18 +3074,30 @@ class VPNManager:
         timeouts — un handshake SOCKS froid via tunnel chargé prend
         1-2,2 s à vide (mesuré 6/6 en prod) et dépasse 3 s en charge,
         ce qui marquait « socks down » des tunnels sains (faux dégradé
-        collant, GUI rouge à tort)."""
+        collant, GUI rouge à tort).
+        [fiab 09/09] enveloppe GLOBALE : la double-passe historique
+        (n×3 s + n×8 s ≈ 44 s à 4 URLs) explosait ``ip_probe_budget``
+        (20 s live) et le timeout 2 s de /api/vpn-status — le tick
+        restait bloqué en sonde et le dashboard servait du stale. Pire
+        cas désormais ≤ budget : passe 1 en n×min(3, budget/n), repasse
+        UNIQUE sur le sticky avec le temps RESTANT (> 0,5 s), comme la
+        grâce de ``_probe_tunnel_light``."""
         try:
             urls = list(getattr(self, "_ip_check_urls", None) or [self._ip_check_url])
             if not urls:
                 return False
-            per_attempt = min(3.0, float(getattr(self, "_ip_probe_budget", 8.0) or 8.0))
+            try:
+                budget = max(1.0, float(getattr(self, "_ip_probe_budget", 8.0) or 8.0))
+            except (TypeError, ValueError):
+                budget = 8.0
+            n = len(urls)
             base = int(getattr(self, "_ip_check_idx", 0) or 0)
+            per_attempt = min(3.0, budget / n)
             all_timeout = True
-            for i in range(len(urls)):
+            for i in range(n):
                 try:
                     verdict = await self._probe_connect(
-                        urls[(base + i) % len(urls)], per_attempt=per_attempt
+                        urls[(base + i) % n], per_attempt=per_attempt
                     )
                 except Exception:
                     continue
@@ -3049,15 +3107,16 @@ class VPNManager:
                     all_timeout = False
             if not all_timeout:
                 return False
-            # Tous timeouts : possible lenteur, pas mort — une repasse longue.
-            per_slow = min(8.0, float(getattr(self, "_ip_probe_budget", 8.0) or 8.0))
-            for i in range(len(urls)):
+            # Tous timeouts : possible lenteur, pas mort — UNE repasse sur
+            # le sticky avec le temps RESTANT (jamais au-delà du budget).
+            remaining = budget - n * per_attempt
+            if remaining > 0.5:
                 try:
                     verdict = await self._probe_connect(
-                        urls[(base + i) % len(urls)], per_attempt=per_slow
+                        urls[base % n], per_attempt=min(8.0, remaining)
                     )
                 except Exception:
-                    continue
+                    verdict = "timeout"
                 if verdict == "ok":
                     return True
             return False
@@ -3511,7 +3570,14 @@ class VPNManager:
                 return self._commit_ip(new_ip)
             if attempt < 2:
                 try:
-                    await self._ensure_container()
+                    # [fiab 09/09] recovery = VRAI restart = VRAI AUTH :
+                    # compté sous la gate, slot libéré dès le restart lancé
+                    # (le wait qui suit ne fait que poller).
+                    await _auth_gate()
+                    try:
+                        await self._ensure_container()
+                    finally:
+                        _auth_connect_done()
                     # [plan 18/08 §A/am.14] per-round bound, not the old
                     # flat 120 s: 3 recovery rounds × _wait_healthy(120) +
                     # _ensure_container legs summed to the measured 445 s
@@ -4413,10 +4479,18 @@ class VPNManager:
                 getattr(self, "_station", "?"),
             )
             return
+        # [fiab 09/09] `docker restart` relance gluetun/openvpn dans le
+        # conteneur = nouveau handshake AUTH NordVPN = VRAI AUTH : passe la
+        # gate anti-rafale (slot libéré dès le restart lancé, le wait qui
+        # suivra chez l'appelant ne fait que poller).
         _rlock = getattr(self, "_restart_lock", None)
         if _rlock is None:
             self._note_watchdog_restart()
-            await self._docker_restart()
+            await _auth_gate()
+            try:
+                await self._docker_restart()
+            finally:
+                _auth_connect_done()
             return
         async with _rlock:
             if getattr(self, "_restart_in_progress", False):
@@ -4424,7 +4498,11 @@ class VPNManager:
             self._restart_in_progress = True
             try:
                 self._note_watchdog_restart()
-                await self._docker_restart()
+                await _auth_gate()
+                try:
+                    await self._docker_restart()
+                finally:
+                    _auth_connect_done()
             finally:
                 self._restart_in_progress = False
 
@@ -4583,6 +4661,24 @@ class VPNManager:
         country immediately — instead of sitting in ``timeout`` (outage
         was ~2 min before this fix).
         """
+        if not self._control_enabled or not country:
+            return False
+        # [fiab 09/09] VRAI reconnect = VRAI AUTH NordVPN : le pin prend un
+        # slot de la gate anti-rafale AVANT le PUT settings (le PUT stop+start
+        # déclenche le handshake AUTH ; le poll qui suit ne fait que lire le
+        # statut). Le slot est libéré dès le PUT parti — tenir un slot pendant
+        # tout le poll bloquerait les autres stations des minutes.
+        await _auth_gate()
+        try:
+            return await self._control_pin_country_gated(country, timeout, catchup)
+        finally:
+            _auth_connect_done()
+
+    async def _control_pin_country_gated(
+        self, country: str, timeout: float = 60.0, catchup: float = 0.0
+    ) -> bool:
+        """Corps du pin control, appelé SOUS slot de la gate _auth_gate
+        (voir _control_pin_country) — ne jamais appeler directement."""
         if not self._control_enabled or not country:
             return False
         country = _normalize_country(country)
@@ -5132,7 +5228,13 @@ class VPNManager:
                     # pause pilotée passe à ov_auth_backoff_s (×2 plafonné),
                     # TOUJOURS via _auth_gate (throttle global jamais contourné).
                     _bo = float(getattr(self, "_auth_backoff_delay", 0.0) or 0.0)
-                    await asyncio.sleep(_bo if _bo > 0 else 15)
+                    # [fiab 09/09] jitter ±20% (même motif que switch_delay :
+                    # 6 stations qui dorment 15 s pile repartent en rafale
+                    # synchronisée → le jitter désynchronise les handshakes).
+                    _raw = _bo if _bo > 0 else 15.0
+                    if not os.getenv("PYTEST_CURRENT_TEST"):
+                        _raw *= random.uniform(0.8, 1.2)
+                    await asyncio.sleep(_raw)
                     continue  # dead host: the next country can work
                 return False  # infra failure: compose path is the escalation
             host = await self._current_hostname(since)
@@ -5150,7 +5252,11 @@ class VPNManager:
                     attempt + 1,
                     max_skips + 1,
                 )
-                await asyncio.sleep(5)
+                # [fiab 09/09] jitter ±20% : désync les re-pins parallèles.
+                if not os.getenv("PYTEST_CURRENT_TEST"):
+                    await asyncio.sleep(5 * random.uniform(0.8, 1.2))
+                else:
+                    await asyncio.sleep(5)
                 continue
             if await self._finalize_ip(allow_stale=False):
                 self._watchdog_backoff.record_success()
@@ -6035,12 +6141,20 @@ class VPNManager:
         # call — profiled services run when explicitly targeted (same
         # mechanism a station brings itself up). 300 s: N recreations,
         # one command.
+        # [fiab 09/09] recréation = nouvelle connexion = VRAI AUTH : un
+        # seul slot global suffit (compose unique qui refait TOUS les
+        # services d'un coup — pas un slot par station). Slot libéré dès
+        # le compose lancé (le poll de santé ne fait que lire le statut).
         try:
+            await _auth_gate()
             cmd = ["compose", "-f", compose_path, "up", "-d", "--force-recreate"] + sorted(services)
             # Explicit env: the TARGET stack reaches the compose child even
             # when the parent env is stale (19/08 root cause — §2.1).
-            result = await asyncio.to_thread(self._docker_run, cmd, 300, env=self._compose_env(stations=stations, stack=mode)
-            )
+            try:
+                result = await asyncio.to_thread(self._docker_run, cmd, 300, env=self._compose_env(stations=stations, stack=mode)
+                )
+            finally:
+                _auth_connect_done()
             if result.returncode != 0:
                 raise RuntimeError(result.stderr.strip() or result.stdout.strip())
         except Exception as e:
@@ -6212,9 +6326,16 @@ class VPNManager:
                     self._ovpn_port_idx = self._ovpn_ports.index(f"{protocol}:{target_port_str}")
                 except ValueError:
                     pass
+            # [fiab 09/09] flip = recréation = nouvelle connexion = VRAI AUTH :
+            # gate avant le compose, slot libéré dès le compose lancé (le
+            # wait_healthy qui suit ne fait que poller).
+            await _auth_gate()
             cmd = ["compose", "-f", compose_path, "up", "-d", "--force-recreate"] + sorted(services)
             env = self._compose_env(stations=stations, stack="openvpn")
-            result = await asyncio.to_thread(self._docker_run, cmd, 300, env=env)
+            try:
+                result = await asyncio.to_thread(self._docker_run, cmd, 300, env=env)
+            finally:
+                _auth_connect_done()
             if result.returncode != 0:
                 self._ovpn_protocol_effective = prev
                 self._ovpn_protocol = prev
@@ -7222,20 +7343,26 @@ class VPNManager:
                 return {"ok": False, "error": "une autre instance applique déjà une mise à jour"}
             try:
                 compose_file = self._compose_file_path()
-                result = await asyncio.to_thread(self._docker_run,
-                    [
-                        "compose",
-                        "-f",
-                        compose_file,
-                        "up",
-                        "-d",
-                        "--pull",
-                        "never",
-                        self._compose_service,
-                    ],
-                    120,
-                    env=self._compose_env(),
-                )
+                # [fiab 09/09] recréation = VRAI AUTH : gate, slot libéré dès
+                # le compose lancé (le wait ne fait que poller).
+                await _auth_gate()
+                try:
+                    result = await asyncio.to_thread(self._docker_run,
+                        [
+                            "compose",
+                            "-f",
+                            compose_file,
+                            "up",
+                            "-d",
+                            "--pull",
+                            "never",
+                            self._compose_service,
+                        ],
+                        120,
+                        env=self._compose_env(),
+                    )
+                finally:
+                    _auth_connect_done()
                 if result.returncode != 0:
                     raise RuntimeError(result.stderr.strip() or result.stdout.strip())
                 started_at = await self._wait_healthy(timeout=120)
@@ -7667,7 +7794,13 @@ class VPNManager:
                         # container absent/stopped → heal synchrone (FIX always functional: was create_task + return → s1 restait arrêté 30s)
                         if not info or not info.get("running"):
                             try:
-                                await self._ensure_container()
+                                # [fiab 09/09] heal = restart = VRAI AUTH NordVPN :
+                                # passe la gate (slot libéré dès le restart lancé).
+                                await _auth_gate()
+                                try:
+                                    await self._ensure_container()
+                                finally:
+                                    _auth_connect_done()
                             except Exception as e:
                                 logger.warning("[vpn-watchdog] heal VPN arrêté %s failed: %s", self._docker_container, e)
                     except Exception:
@@ -7933,7 +8066,13 @@ class VPNManager:
                             kind,
                         )
                         self._note_watchdog_restart()
-                        await self._docker_restart()
+                        # [fiab 09/09] restart = VRAI AUTH : gate, slot libéré
+                        # dès le restart lancé (le wait ne fait que poller).
+                        await _auth_gate()
+                        try:
+                            await self._docker_restart()
+                        finally:
+                            _auth_connect_done()
                         started_at = await self._wait_healthy(timeout=60)
                     except Exception as e:
                         logger.warning(
@@ -7960,7 +8099,13 @@ class VPNManager:
                             if self._server_issue or self._auth_failed:
                                 # idem refresh liste fraîche sur AUTH_FAILED [stabilité 25/08]
                                 await self._refresh_server_list()
-                            await self._ensure_container()
+                            # [fiab 09/09] escalation = VRAI AUTH : gate, slot
+                            # libéré dès le restart lancé.
+                            await _auth_gate()
+                            try:
+                                await self._ensure_container()
+                            finally:
+                                _auth_connect_done()
                             started_at = await self._wait_healthy(timeout=120)
                         except Exception as e:
                             logger.warning("[vpn-watchdog] compose escalation failed: %s", e)
@@ -8123,7 +8268,13 @@ class VPNManager:
             # may have started while the update check was running.
             try:
                 if not self._lock.locked():
-                    await self._ensure_container()
+                    # [fiab 09/09] restart = VRAI AUTH : gate, slot libéré
+                    # dès le restart lancé.
+                    await _auth_gate()
+                    try:
+                        await self._ensure_container()
+                    finally:
+                        _auth_connect_done()
             except Exception as e:
                 logger.error("[vpn-watchdog] escalation restart failed: %s", e)
 

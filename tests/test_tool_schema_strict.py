@@ -1,4 +1,5 @@
 """Tests V4 100% : traitements 10-17 + strict:false (calm-rossum)."""
+import copy
 import json
 
 import protocol_mapping as pm
@@ -129,18 +130,103 @@ class TestStrictFalse:
         r = pm._chat_to_responses_request(chat)
         assert "strict" not in r["tools"][0]
 
-# ── 18 : unsafe pattern transpile e2e (jambe Responses) ─────────
+# ── 18 : strict-subset e2e (jambe Responses) ───────────────────
+# Certitude : AUCUN `pattern` ne sort sur le wire en strict, même
+# avec lookahead ou \p{...} en entrée.
 class TestUnsafePatternE2E:
-    def test_chat_to_responses_rewrites_unsafe_pattern(self):
+    def test_chat_to_responses_strips_all_patterns(self):
         offending = r"^(?!__.*__$)[^\p{Cc}\p{Cf}\p{Zl}\p{Zp}\"\\./[\]]{1,200}$"
         lookahead = r"^(?!\.\.?(?:\/|$))[A-Za-z0-9_\-.~:@+]{1,200}$"
-        chat = {"model": "muse-spark-1.3-contributor-free", "messages": [{"role": "user", "content": "hi"}], "tools": [{"type": "function", "function": {"name": "Artifact", "description": "artifact", "parameters": {"type": "object", "properties": {"field": {"type": "string", "pattern": offending}, "collection": {"type": "string", "pattern": lookahead}}, "required": ["field"]}}}]}
+        chat = {"model": "muse-spark-1.3-contributor-free", "messages": [{"role": "user", "content": "hi"}], "tools": [{"type": "function", "function": {"name": "Artifact", "description": "artifact", "parameters": {"type": "object", "properties": {"field": {"type": "string", "pattern": offending}, "collection": {"type": "string", "pattern": lookahead}, "simple": {"type": "string", "pattern": r"^[a-z]+$"}}, "required": ["field"]}}}]}
         r = pm._chat_to_responses_request(chat)
         params = r["tools"][0]["parameters"]
-        field_pat = params["properties"]["field"]["pattern"]
-        assert field_pat == pm._rewrite_unicode_properties(offending)
-        assert "\\p{" not in field_pat and "\\P{" not in field_pat
-        assert params["properties"]["collection"]["pattern"] == lookahead
+        assert "pattern" not in json.dumps(params)
+        assert params["properties"]["field"]["type"] == "string"
+
+# ── Garantie strict-subset sur les 7 outils réels des dumps 400 ──
+# C'est CE test qui porte la certitude : il charge les paramètres tels
+# qu'envoyés sur le wire (logs/free400_msg_*.json — dump5, 31 outils,
+# intersection fautive), les passe dans _N en profil strict, puis scanne
+# récursivement : aucun keyword hors sous-ensemble strict ne doit rester.
+class TestStrictSubsetGuarantee:
+    DUMP = "logs/free400_msg_323ba97cfd00-2b7.json"
+    NAMES = ("Artifact", "SendMessage", "Monitor", "Workflow", "CronList", "EnterPlanMode", "AskUserQuestion")
+    MODEL = "muse-spark-1.3-contributor-free"
+    FORBIDDEN_KEYS = (
+        "pattern", "propertyNames", "prefixItems",
+        "allOf", "anyOf", "oneOf",
+        "const", "title", "$schema", "$id",
+        "if", "then", "else",
+        "unevaluatedProperties", "patternProperties",
+        "examples", "example", "exclusiveMaximum", "exclusiveMinimum",
+    )
+
+    def _load_wire_params(self):
+        import pathlib
+        p = pathlib.Path(__file__).resolve().parent.parent / self.DUMP
+        if not p.exists():
+            return None
+        with open(p, encoding="utf-8") as fh:
+            dump = json.load(fh)
+        return {t["name"]: t.get("parameters", {}) for t in dump.get("tools", [])}
+
+    def _scan(self, node, path="root"):
+        # Note : les clés d'une map `properties` sont des NOMS de paramètres
+        # (ex. Artifact a un paramètre nommé "title") — pas des keywords, on
+        # ne les flagge pas, on scanne seulement leurs valeurs comme schémas.
+        problems = []
+        if isinstance(node, dict):
+            if node == {} and path != "root":
+                problems.append(f"{path}: empty schema {{}}")
+            for k in self.FORBIDDEN_KEYS:
+                if k in node:
+                    problems.append(f"{path}: forbidden key {k!r}")
+            for k, v in node.items():
+                if k == "properties" and isinstance(v, dict):
+                    for pk, pv in v.items():
+                        problems.extend(self._scan(pv, f"{path}/{k}/{pk}"))
+                else:
+                    problems.extend(self._scan(v, f"{path}/{k}"))
+        elif isinstance(node, list):
+            for i, v in enumerate(node):
+                problems.extend(self._scan(v, f"{path}[{i}]"))
+        return problems
+
+    def test_wire_schemas_strict_subset(self):
+        wire = self._load_wire_params()
+        assert wire is not None, f"dump {self.DUMP} introuvable"
+        for name in self.NAMES:
+            assert name in wire, f"outil {name} absent du dump"
+        for name in self.NAMES:
+            out = _N(copy.deepcopy(wire[name]), self.MODEL)
+            problems = self._scan(out)
+            assert problems == [], f"{name}: {problems}"
+
+    def test_wire_schemas_idempotent(self):
+        wire = self._load_wire_params()
+        assert wire is not None, f"dump {self.DUMP} introuvable"
+        for name in self.NAMES:
+            once = _N(copy.deepcopy(wire[name]), self.MODEL)
+            twice = _N(copy.deepcopy(once), self.MODEL)
+            assert once == twice, f"{name} non idempotent"
+
+    def test_condemned_fragments_covered(self):
+        # Fragments condamnés vus dans les 5 dumps, en représentatif
+        # auto-porteur (tourne même sans logs/).
+        schema = {
+            "type": "object",
+            "properties": {
+                "field": {"type": "string", "pattern": r"^(?!__.*__$)[^\p{Cc}\p{Zl}\"\\./]{1,200}$"},
+                "collection": {"type": "string", "pattern": r"^(?!\.\.?(?:\/|$))[A-Za-z0-9_\-.~:@+]{1,200}$"},
+                "to": {"type": "string", "allOf": [{"pattern": r"^[^\n\r]*$"}, {"pattern": r"^[\s\S]{0,300}$"}]},
+                "data": {"type": "object", "propertyNames": {"type": "string"}},
+                "where": {"type": "array", "prefixItems": [{"type": "string"}]},
+                "empty": {},
+            },
+        }
+        out = _N(copy.deepcopy(schema), self.MODEL)
+        assert self._scan(out) == []
+        assert out["properties"]["empty"] == {"type": "string", "additionalProperties": False} or out["properties"]["empty"].get("type") == "string"
 
 # ── 9 tools end-to-end ────────────────────────────────────────────
 class TestNineTools:

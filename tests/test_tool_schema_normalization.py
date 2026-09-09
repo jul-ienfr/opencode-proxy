@@ -299,20 +299,15 @@ class TestCopyOnWrite:
         assert schema["properties"]["x"]["type"] == "string"
 
 
-# ── 18 : \p{...} transpilé BMP-exact en strict ────────────────────
+# ── 18 : strict-subset — AUCUN `pattern` émis en strict ──────────
+# Règle de certitude : en profil strict, tout `pattern` est strippé
+# (le validateur de la jambe Responses rejette les lookarounds en 400
+# invalid_request_error). La transpile BMP-exacte via
+# _rewrite_unicode_properties ne sert plus qu'aux profils permissifs.
 
 class TestUnsafePatternStrip:
     OFFENDING = r"^(?!__.*__$)[^\p{Cc}\p{Cf}\p{Zl}\p{Zp}\"\\./[\]]{1,200}$"
     STRICT_MODEL = "muse-spark-1.3-contributor-free"
-
-    EXPECTED_REWRITTEN = (
-        r"^(?!__.*__$)[^"
-        + pm._P_CLASS_BMP["Cc"]
-        + pm._P_CLASS_BMP["Cf"]
-        + pm._P_CLASS_BMP["Zl"]
-        + pm._P_CLASS_BMP["Zp"]
-        + r"\"\\./[\]]{1,200}$"
-    )
 
     def _artifact_schema(self, pattern):
         return {
@@ -332,16 +327,15 @@ class TestUnsafePatternStrip:
             "required": ["field"],
         }
 
-    def test_offending_artifact_field_pattern_rewritten_strict(self):
+    def test_offending_artifact_field_pattern_stripped_strict(self):
         out = _N(self._artifact_schema(self.OFFENDING), self.STRICT_MODEL)
-        pat = out["properties"]["field"]["pattern"]
-        assert pat == self.EXPECTED_REWRITTEN
-        assert "\\p{" not in pat and "\\P{" not in pat
+        assert "pattern" not in json.dumps(out)
         assert out["properties"]["field"]["type"] == "string"
         assert out["properties"]["field"]["description"] == "write_db with db_op 'str_replace' only"
 
-    def test_rewritten_semantics_bmp_exact(self):
-        # Équivalence BMP-exacte : pour tout pt BMP, le réécrit accepte ssi
+    def test_rewrite_helper_semantics_bmp_exact(self):
+        # Équivalence BMP-exacte du HELPER pur (sert les profils
+        # permissifs) : pour tout pt BMP, le réécrit accepte ssi
         # l'original (sémantique \\p{...} via unicodedata) accepte.
         def orig_accepts(ch):
             if not re.fullmatch(r"(?!__.*__$).{1,200}", ch, flags=re.DOTALL):
@@ -358,17 +352,18 @@ class TestUnsafePatternStrip:
         assert re.fullmatch(rewritten, "abc")
         assert not re.fullmatch(rewritten, "__x__")
 
-    def test_lookahead_only_pattern_preserved(self):
+    def test_lookahead_only_pattern_stripped_strict(self):
         out = _N(self._artifact_schema(r"^(?!\.\.?(?:\/|$))[A-Za-z0-9_\-.~:@+]{1,200}$"), self.STRICT_MODEL)
-        assert out["properties"]["field"]["pattern"] == r"^(?!\.\.?(?:\/|$))[A-Za-z0-9_\-.~:@+]{1,200}$"
+        assert "pattern" not in out["properties"]["field"]
+        assert "pattern" not in out["properties"]["collection"]
 
-    def test_hex_pattern_preserved(self):
+    def test_hex_pattern_stripped_strict(self):
         out = _N(self._artifact_schema(r"^[0-9a-f]{32}$"), self.STRICT_MODEL)
-        assert out["properties"]["field"]["pattern"] == r"^[0-9a-f]{32}$"
+        assert "pattern" not in out["properties"]["field"]
 
-    def test_normal_pattern_preserved(self):
+    def test_normal_pattern_stripped_strict(self):
         out = _N(self._artifact_schema(r"^[a-z]+$"), self.STRICT_MODEL)
-        assert out["properties"]["field"]["pattern"] == r"^[a-z]+$"
+        assert "pattern" not in out["properties"]["field"]
 
     def test_untranspilable_still_stripped(self):
         # \P{...} (négation) et propriété inconnue → strip, pas de 400.
@@ -381,9 +376,23 @@ class TestUnsafePatternStrip:
         twice = _N(once, self.STRICT_MODEL)
         assert once == twice
 
-    def test_permissive_keeps_unsafe_pattern(self):
+    def test_permissive_rewrites_unsafe_pattern(self):
+        # Profil permissif : rewrite BMP-exact, pas de strip, pas de verbatim.
         out = _N(self._artifact_schema(self.OFFENDING), "minimax-m2.5")
-        assert out["properties"]["field"]["pattern"] == self.OFFENDING
+        pat = out["properties"]["field"]["pattern"]
+        assert pat == pm._rewrite_unicode_properties(self.OFFENDING)
+        assert "\\p{" not in pat and "\\P{" not in pat
+
+    def test_permissive_keeps_simple_pattern(self):
+        out = _N(self._artifact_schema(r"^[a-z]+$"), "minimax-m2.5")
+        assert out["properties"]["field"]["pattern"] == r"^[a-z]+$"
+        out_q = _N(self._artifact_schema(r"^[a-z]+$"), "qwen3.5-plus")
+        assert out_q["properties"]["field"]["pattern"] == r"^[a-z]+$"
+
+    def test_permissive_qwen_rewrites_unicode_class(self):
+        out = _N(self._artifact_schema(self.OFFENDING), "qwen3.5-plus")
+        pat = out["properties"]["field"]["pattern"]
+        assert pat == pm._rewrite_unicode_properties(self.OFFENDING)
 
     def test_nested_and_array_items_covered(self):
         schema = {
@@ -394,8 +403,8 @@ class TestUnsafePatternStrip:
             },
         }
         out = _N(schema, self.STRICT_MODEL)
-        assert out["properties"]["nested"]["properties"]["f"]["pattern"] == self.EXPECTED_REWRITTEN
-        assert out["properties"]["arr"]["items"]["pattern"] == self.EXPECTED_REWRITTEN
+        assert "pattern" not in out["properties"]["nested"]["properties"]["f"]
+        assert "pattern" not in out["properties"]["arr"]["items"]
 
     def test_non_string_pattern_ignored(self):
         schema = {"type": "object", "properties": {"x": {"type": "string", "pattern": 123}}}
