@@ -340,6 +340,91 @@ def _strip_billing_header(text: str) -> str:
 
 
 # ── Tool schema normalization (proud-beaver V3) ──────────────────
+# `pattern` non compilable en ECMA sans flag `u` (ex. \p{...}) : le
+# validateur de la jambe Responses le rejette en 400 invalid_request_error.
+# Pleine fidélité : \p{Cc|Cf|Zl|Zp} intra-classe → plages BMP exactes
+# (toutes BMP → \uXXXX par code-unit, identique en ECMA sans `u`).
+_UNSAFE_PATTERN_RE = re.compile(r"\\[pP]\{")
+
+# Cf BMP uniquement (43 pts, unicodedata 15.0) : le reste de Cf est
+# astral (U+110BD, U+110CD, U+13430-3F, U+1BCA0-A3, U+1D173-7A, U+E0001,
+# U+E0020-7F — 127 pts), non représentable dans une classe sans flag
+# `u` → admis (écart documenté ; jamais présent dans des args d'outils).
+_P_CLASS_BMP = {
+    "Cc": r"\u0000-\u001F\u007F-\u009F",
+    "Cf": (
+        r"\u00AD\u0600-\u0605\u061C\u06DD\u070F\u0890-\u0891\u08E2\u180E"
+        r"\u200B-\u200F\u202A-\u202E\u2060-\u2064\u2066-\u206F"
+        r"\uFEFF\uFFF9-\uFFFB"
+    ),
+    "Zl": r"\u2028",
+    "Zp": r"\u2029",
+}
+_P_TOKEN_RE = re.compile(r"\\[pP]\{([^}]*)\}")
+
+
+def _rewrite_unicode_properties(pattern: str) -> "str | None":
+    """Transpile les \\p{Cc|Cf|Zl|Zp} intra-classe en plages BMP ECMA-safe.
+
+    Retourne le pattern réécrit, ou None si non transpilable (l'appelant
+    strippe alors la clé — ex-comportement étape 18, toujours mieux qu'un
+    400). Non transpilable : \\P{...}, propriété inconnue, token hors
+    classe, classe non fermée, résultat structurellement invalide.
+    Token à backslash échappé ([\\\\p{Cc}] = antislash littéral, pas une
+    propriété) : copié verbatim, jamais réécrit.
+    """
+    toks = list(_P_TOKEN_RE.finditer(pattern))
+    if not toks:
+        return pattern
+    # Spans des classes [...] (échappements honorés).
+    spans: list = []
+    in_class = False
+    start = 0
+    i, n = 0, len(pattern)
+    while i < n:
+        c = pattern[i]
+        if c == "\\":
+            i += 2
+            continue
+        if c == "[" and not in_class:
+            in_class = True
+            start = i
+        elif c == "]" and in_class:
+            in_class = False
+            spans.append((start, i + 1))
+        i += 1
+    if in_class:  # classe non fermée → pas touche (strip)
+        return None
+    out: list = []
+    last = 0
+    for m in toks:
+        # Backslash du token lui-même échappé (ex. [\\p{Cc}] = antislash
+        # littéral + "p{Cc}", pas une propriété Unicode) → copié verbatim,
+        # jamais réécrit (pas de corruption, pas de strip inutile).
+        bs, run = m.start() - 1, 0
+        while bs >= 0 and pattern[bs] == "\\":
+            run += 1
+            bs -= 1
+        if run % 2 == 1:
+            out.append(pattern[last : m.end()])
+            last = m.end()
+            continue
+        inside = any(s <= m.start() and m.end() <= e for s, e in spans)
+        bmp = _P_CLASS_BMP.get(m.group(1)) if m.group(0).startswith("\\p") else None
+        if not inside or bmp is None:
+            return None
+        out.append(pattern[last : m.start()])
+        out.append(bmp)
+        last = m.end()
+    out.append(pattern[last:])
+    rewritten = "".join(out)
+    try:
+        re.compile(rewritten)  # garde-fou structurel (crochets/échappements)
+    except re.error:
+        return None
+    return rewritten
+
+
 _SCHEMA_PROFILES: dict[str, dict] = {
     "muse": {"strip_additional_props": True, "strip_format": True, "max_description_len": 1024, "max_nesting": 8},
     "spark": {"strip_additional_props": True, "strip_format": True, "max_description_len": 1024, "max_nesting": 8},
@@ -522,6 +607,20 @@ def _normalize_tool_schema(schema: dict, model: str = "") -> dict:
         ):
             if not any(k in node["items"] for k in ("anyOf", "oneOf", "$ref")):
                 node["items"]["type"] = "string"
+        # 18. Transpile `pattern` non compilable ECMA sans flag `u`
+        # (ex. \p{...}) en strict — 400 invalid_request_error garanti sur
+        # la jambe Responses sinon (route free, provider Console).
+        # Pleine fidélité : rewrite BMP-exact, strip seulement si non
+        # transpilable (ex. \P{...}, propriété inconnue, token hors classe).
+        if _is_strict and isinstance(node.get("pattern"), str):
+            if _UNSAFE_PATTERN_RE.search(node["pattern"]):
+                rewritten = _rewrite_unicode_properties(node["pattern"])
+                if rewritten is None:
+                    _debug(f"  [schema] strip unsafe pattern model={model!r} pattern={node['pattern'][:80]!r}")
+                    node.pop("pattern")
+                elif rewritten != node["pattern"]:
+                    _debug(f"  [schema] rewrite unsafe pattern model={model!r} pattern={node['pattern'][:80]!r}")
+                    node["pattern"] = rewritten
         defs_local: dict = {}
         if "$defs" in node and isinstance(node["$defs"], dict):
             defs_local.update(node["$defs"])

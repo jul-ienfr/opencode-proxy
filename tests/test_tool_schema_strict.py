@@ -129,6 +129,19 @@ class TestStrictFalse:
         r = pm._chat_to_responses_request(chat)
         assert "strict" not in r["tools"][0]
 
+# ── 18 : unsafe pattern transpile e2e (jambe Responses) ─────────
+class TestUnsafePatternE2E:
+    def test_chat_to_responses_rewrites_unsafe_pattern(self):
+        offending = r"^(?!__.*__$)[^\p{Cc}\p{Cf}\p{Zl}\p{Zp}\"\\./[\]]{1,200}$"
+        lookahead = r"^(?!\.\.?(?:\/|$))[A-Za-z0-9_\-.~:@+]{1,200}$"
+        chat = {"model": "muse-spark-1.3-contributor-free", "messages": [{"role": "user", "content": "hi"}], "tools": [{"type": "function", "function": {"name": "Artifact", "description": "artifact", "parameters": {"type": "object", "properties": {"field": {"type": "string", "pattern": offending}, "collection": {"type": "string", "pattern": lookahead}}, "required": ["field"]}}}]}
+        r = pm._chat_to_responses_request(chat)
+        params = r["tools"][0]["parameters"]
+        field_pat = params["properties"]["field"]["pattern"]
+        assert field_pat == pm._rewrite_unicode_properties(offending)
+        assert "\\p{" not in field_pat and "\\P{" not in field_pat
+        assert params["properties"]["collection"]["pattern"] == lookahead
+
 # ── 9 tools end-to-end ────────────────────────────────────────────
 class TestNineTools:
     def test_nine_tools_all_valid(self):

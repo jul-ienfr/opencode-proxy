@@ -31,6 +31,7 @@ import orjson as _orjson  # noqa: F401
 from app.protocol.mapping import _HAS_SYNTHETIC_REASONING_KEY as _HAS_SYNTHETIC_REASONING_KEY
 from app.protocol.mapping import _IS_LOCAL_SIG_CACHE_MAX as _IS_LOCAL_SIG_CACHE_MAX
 from app.protocol.mapping import _JSON_LIB as _JSON_LIB
+from app.protocol.mapping import _P_CLASS_BMP as _P_CLASS_BMP
 from app.protocol.mapping import _REDACTED_THINKING_CACHE_MAX as _REDACTED_THINKING_CACHE_MAX
 from app.protocol.mapping import _SCHEMA_PROFILES as _SCHEMA_PROFILES
 from app.protocol.mapping import _TOOL_NAME_MAP_KEY as _TOOL_NAME_MAP_KEY
@@ -72,6 +73,7 @@ from app.protocol.mapping import _register_defensive_short as _register_defensiv
 from app.protocol.mapping import _remap_responses_history_names as _remap_responses_history_names
 from app.protocol.mapping import _remap_responses_tool_choice as _remap_responses_tool_choice
 from app.protocol.mapping import _resolve_schema_profile as _resolve_schema_profile
+from app.protocol.mapping import _rewrite_unicode_properties as _rewrite_unicode_properties
 from app.protocol.mapping import _responses_sse_to_chat_deltas as _responses_sse_to_chat_deltas
 from app.protocol.mapping import _responses_to_anthropic_response as _responses_to_anthropic_response
 from app.protocol.mapping import _responses_to_chat_response as _responses_to_chat_response
@@ -137,12 +139,14 @@ __all__ = [
     "_looks_encrypted_reasoning",
     "_normalize_tool_schema",
     "_orig_anthropic_to_openai",
+    "_P_CLASS_BMP",
     "_reasoning_seen_ids",
     "_redacted_thinking_cache",
     "_register_defensive_short",
     "_remap_responses_history_names",
     "_remap_responses_tool_choice",
     "_resolve_schema_profile",
+    "_rewrite_unicode_properties",
     "_responses_sse_to_chat_deltas",
     "_responses_to_anthropic_response",
     "_responses_to_chat_response",

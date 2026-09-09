@@ -2,6 +2,8 @@
 
 import copy
 import json
+import re
+import unicodedata
 
 import protocol_mapping as pm
 
@@ -295,6 +297,116 @@ class TestCopyOnWrite:
         out = _N(schema, "muse-spark-1.2-contributor")
         out["properties"]["x"]["type"] = "number"
         assert schema["properties"]["x"]["type"] == "string"
+
+
+# ── 18 : \p{...} transpilé BMP-exact en strict ────────────────────
+
+class TestUnsafePatternStrip:
+    OFFENDING = r"^(?!__.*__$)[^\p{Cc}\p{Cf}\p{Zl}\p{Zp}\"\\./[\]]{1,200}$"
+    STRICT_MODEL = "muse-spark-1.3-contributor-free"
+
+    EXPECTED_REWRITTEN = (
+        r"^(?!__.*__$)[^"
+        + pm._P_CLASS_BMP["Cc"]
+        + pm._P_CLASS_BMP["Cf"]
+        + pm._P_CLASS_BMP["Zl"]
+        + pm._P_CLASS_BMP["Zp"]
+        + r"\"\\./[\]]{1,200}$"
+    )
+
+    def _artifact_schema(self, pattern):
+        return {
+            "type": "object",
+            "properties": {
+                "field": {
+                    "description": "write_db with db_op 'str_replace' only",
+                    "type": "string",
+                    "pattern": pattern,
+                },
+                "collection": {
+                    "type": "string",
+                    "pattern": r"^(?!\.\.?(?:\/|$))[A-Za-z0-9_\-.~:@+]{1,200}$",
+                },
+                "asset_id": {"type": "string", "pattern": r"^[0-9a-f]{32}$"},
+            },
+            "required": ["field"],
+        }
+
+    def test_offending_artifact_field_pattern_rewritten_strict(self):
+        out = _N(self._artifact_schema(self.OFFENDING), self.STRICT_MODEL)
+        pat = out["properties"]["field"]["pattern"]
+        assert pat == self.EXPECTED_REWRITTEN
+        assert "\\p{" not in pat and "\\P{" not in pat
+        assert out["properties"]["field"]["type"] == "string"
+        assert out["properties"]["field"]["description"] == "write_db with db_op 'str_replace' only"
+
+    def test_rewritten_semantics_bmp_exact(self):
+        # Équivalence BMP-exacte : pour tout pt BMP, le réécrit accepte ssi
+        # l'original (sémantique \\p{...} via unicodedata) accepte.
+        def orig_accepts(ch):
+            if not re.fullmatch(r"(?!__.*__$).{1,200}", ch, flags=re.DOTALL):
+                return False
+            if ch in ('"', "\\", "/", ".", "[", "]"):
+                return False
+            return unicodedata.category(ch) not in ("Cc", "Cf", "Zl", "Zp")
+
+        rewritten = pm._rewrite_unicode_properties(self.OFFENDING)
+        assert rewritten is not None
+        for cp in range(0x10000):
+            ch = chr(cp)
+            assert bool(re.fullmatch(rewritten, ch)) == orig_accepts(ch), hex(cp)
+        assert re.fullmatch(rewritten, "abc")
+        assert not re.fullmatch(rewritten, "__x__")
+
+    def test_lookahead_only_pattern_preserved(self):
+        out = _N(self._artifact_schema(r"^(?!\.\.?(?:\/|$))[A-Za-z0-9_\-.~:@+]{1,200}$"), self.STRICT_MODEL)
+        assert out["properties"]["field"]["pattern"] == r"^(?!\.\.?(?:\/|$))[A-Za-z0-9_\-.~:@+]{1,200}$"
+
+    def test_hex_pattern_preserved(self):
+        out = _N(self._artifact_schema(r"^[0-9a-f]{32}$"), self.STRICT_MODEL)
+        assert out["properties"]["field"]["pattern"] == r"^[0-9a-f]{32}$"
+
+    def test_normal_pattern_preserved(self):
+        out = _N(self._artifact_schema(r"^[a-z]+$"), self.STRICT_MODEL)
+        assert out["properties"]["field"]["pattern"] == r"^[a-z]+$"
+
+    def test_untranspilable_still_stripped(self):
+        # \P{...} (négation) et propriété inconnue → strip, pas de 400.
+        for pat in (r"^[^\P{Cc}]{1,10}$", r"^[\p{Foo}]+$"):
+            out = _N(self._artifact_schema(pat), self.STRICT_MODEL)
+            assert "pattern" not in out["properties"]["field"]
+
+    def test_idempotent(self):
+        once = _N(self._artifact_schema(self.OFFENDING), self.STRICT_MODEL)
+        twice = _N(once, self.STRICT_MODEL)
+        assert once == twice
+
+    def test_permissive_keeps_unsafe_pattern(self):
+        out = _N(self._artifact_schema(self.OFFENDING), "minimax-m2.5")
+        assert out["properties"]["field"]["pattern"] == self.OFFENDING
+
+    def test_nested_and_array_items_covered(self):
+        schema = {
+            "type": "object",
+            "properties": {
+                "nested": {"type": "object", "properties": {"f": {"type": "string", "pattern": self.OFFENDING}}},
+                "arr": {"type": "array", "items": {"type": "string", "pattern": self.OFFENDING}},
+            },
+        }
+        out = _N(schema, self.STRICT_MODEL)
+        assert out["properties"]["nested"]["properties"]["f"]["pattern"] == self.EXPECTED_REWRITTEN
+        assert out["properties"]["arr"]["items"]["pattern"] == self.EXPECTED_REWRITTEN
+
+    def test_non_string_pattern_ignored(self):
+        schema = {"type": "object", "properties": {"x": {"type": "string", "pattern": 123}}}
+        out = _N(schema, self.STRICT_MODEL)
+        assert out["properties"]["x"]["pattern"] == 123
+
+    def test_input_not_mutated(self):
+        schema = self._artifact_schema(self.OFFENDING)
+        snapshot = copy.deepcopy(schema)
+        _N(schema, self.STRICT_MODEL)
+        assert schema == snapshot
 
 
 # ── idempotence ─────────────────────────────────────────────────
