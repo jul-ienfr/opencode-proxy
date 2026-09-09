@@ -758,7 +758,7 @@ def _parse_server_issue_detail(text: str) -> tuple:
                     _ts = m.group(1)
                     try:
                         _d = _dt.datetime.strptime(_ts, "%Y-%m-%dT%H:%M:%S").replace(
-                            tzinfo=_dt.timezone.utc
+                            tzinfo=_dt.UTC
                         )
                         age_s = max(0.0, time.time() - _d.timestamp())
                     except Exception:
@@ -1769,7 +1769,18 @@ class VPNManager:
         if self._watchdog_event is None:
             self._watchdog_event = asyncio.Event()
         await self.refresh_status()
-        if self._enabled and self._proxy_mode == "vpn" and self._status != VPNState.CONNECTED:
+        # [audit 2026-09-09] Fast-path boot : refresh_status() a déjà adopté
+        # tout conteneur sain (CONNECTED/DEGRADED routable, 0 AUTH) quand il
+        # porte du trafic — y compris après un simple restart du proxy, où
+        # les conteneurs survivent (stop() ne fait que persister). Le chemin
+        # lourd _startup_connect() ne doit donc partir QUE si refresh n'a
+        # pas ramené une station déjà routable : avant, la garde
+        # ``!= CONNECTED`` forçait un reconnect complet (re-pin PUT = AUTH
+        # côté NordVPN + rotation forcée) même pour une station DEGRADED
+        # saine — d'où la rafale de 6 AUTH + throttle compte à chaque
+        # restart du proxy alors que les 6 tunnels étaient montés.
+        _up = VPNState.is_up(self._status) and bool(self._current_ip)
+        if self._enabled and self._proxy_mode == "vpn" and not _up:
             # Startup must NOT block the HTTP server: compose up +
             # wait_healthy (≤120s) + up to 3 _finalize_ip rotation rounds can
             # take minutes. Connect in a background task — the watchdog and
@@ -2528,12 +2539,82 @@ class VPNManager:
                     self._server_issue_pending = False
                 except Exception:
                     pass
+                # [audit 2026-09-09 P0-1/P0-3] voie TLS NON-auth : le scan
+                # docker logs peut voir des resets de la voie secondaire OV
+                # (cascade/pin) alors que le stack effectif porte du trafic
+                # (cas s4 : WG up + egress OK, 189 resets/h). Avant de coller
+                # error + purger l'IP, sonder l'egress réel :
+                #  - egress OK → DEGRADED routable "pin-loop", IP gardée, et
+                #    on laisse _maybe_pin_widen() casser la boucle (P0-2) ;
+                #  - egress KO → error historique inchangé (vrai tunnel down).
+                # AUTH_FAILED garde toujours le chemin error strict (P0-3 ne
+                # s'applique qu'au non-auth).
+                if not auth_failed:
+                    try:
+                        _egress_ok = await self._socks_egress_ok()
+                    except Exception:
+                        _egress_ok = False
+                    if _egress_ok:
+                        self._egress_state = "tunnel_up_full"
+                        try:
+                            self._degraded_reason = "pin-loop"
+                            self._egress_socks_pending = False
+                        except Exception:
+                            pass
+                        self._error = (
+                            "resets voie secondaire (pin instable) — "
+                            "tunnel effectif OK, dégradé routable"
+                        )
+                        try:
+                            if VPNState.can_transition(self._status, VPNState.DEGRADED):
+                                self._set_status(VPNState.DEGRADED)
+                            else:
+                                self._status = VPNState.DEGRADED
+                        except Exception:
+                            self._status = VPNState.DEGRADED
+                        self._current_server = {
+                            "name": self._docker_container,
+                            "country": self._current_country or self._server_countries,
+                        }
+                        logger.warning(
+                            "[vpn] s%s resets voie secondaire mais egress OK "
+                            "(stack %s) — degraded pin-loop, IP gardée",
+                            getattr(self, "_station", "?"),
+                            getattr(self, "_stack_effective", "?"),
+                        )
+                        # [P0-2] la voie error court-circuitait
+                        # _maybe_pin_widen() (appelée plus bas, chemin nominal
+                        # uniquement) : seuils atteints mais widen jamais
+                        # déclenché. On l'appelle ici pour casser la boucle.
+                        try:
+                            await self._maybe_pin_restore()
+                            await self._maybe_pin_widen()
+                        except Exception:
+                            pass
+                        return self.get_status()
+                    # [P0-3] egress KO : qualifier le message selon le stack
+                    # effectif — un reset OV sur une station WG n'est pas un
+                    # "serveur injoignable" du tunnel effectif.
+                    try:
+                        _stack_eff = str(getattr(self, "_stack_effective", "") or "")
+                    except Exception:
+                        _stack_eff = ""
+                    _qual = (
+                        " (resets voie secondaire OV, stack effectif %s — "
+                        "tunnel effectif down)" % _stack_eff
+                        if _stack_eff and _stack_eff != "openvpn"
+                        else ""
+                    )
+                    self._set_status(VPNState.ERROR)
+                    self._error = (
+                        "Serveur VPN injoignable - échec négociation TLS "
+                        "(liste serveurs obsolète ?)%s" % _qual
+                    )
+                    self._current_ip = None  # stale IP must not be served ([5])
+                    logger.error("[vpn] %s", self._error)
+                    return self.get_status()
                 self._set_status(VPNState.ERROR)
-                self._error = (
-                    "AUTH_FAILED - identifiants NordVPN rejetés"
-                    if auth_failed
-                    else "Serveur VPN injoignable - échec négociation TLS (liste serveurs obsolète ?)"
-                )
+                self._error = "AUTH_FAILED - identifiants NordVPN rejetés"
                 self._current_ip = None  # stale IP must not be served ([5])
                 logger.error("[vpn] %s", self._error)
                 return self.get_status()
@@ -2580,7 +2661,27 @@ class VPNManager:
             if ctl is True:
                 ctl_ip = await self._control_public_ip()
                 if ctl_ip:
-                    self._current_ip = ctl_ip
+                    # [audit 2026-09-09 — fast-path boot] une IP servie sans
+                    # trace (ni registre partagé anti-réutilisation, ni entrée
+                    # d'historique avec sa vraie identité) est une IP
+                    # fantôme : le pool peut la réattribuer ailleurs et la
+                    # durée connectée dérive d'un repli instable. La voie
+                    # connect() historique journalise via _finalize_ip →
+                    # _commit_ip ; on journalise ici de la même façon, SANS
+                    # avancer l'identité (pas de rotation au boot — on
+                    # constate le tunnel existant, on ne le fait pas tourner).
+                    if ctl_ip != self._current_ip:
+                        # [tâche 2 — fast-path boot] journaliser l'IP adoptée :
+                        # _adopt_boot_ip() = même contrat que _commit_ip()
+                        # (registre + historique + persist) SANS _advance_identity
+                        # (pas de rotation au boot — on constate, on ne tourne
+                        # pas). Le fallback try/except garde l'affectation
+                        # nue si une frontière (registre partagé, disque)
+                        # lève : refresh_status reste fail-soft.
+                        try:
+                            self._adopt_boot_ip(ctl_ip)
+                        except Exception:
+                            self._current_ip = ctl_ip
                     # [stabilité 25/08] NE PAS remettre le chrono à zéro ici :
                     # refresh_status tourne à chaque tick. Le chrono est piloté
                     # par _set_status (transition -> CONNECTED) uniquement.
@@ -3462,6 +3563,26 @@ class VPNManager:
         self._ip_history = self._ip_history[-100:]
         self.save_state()
         return True
+
+    def _adopt_boot_ip(self, ip: str) -> None:
+        """Journalise une IP déjà servie par le tunnel existant (fast-path
+        boot) : registre partagé anti-réutilisation + entrée d'historique
+        avec l'identité LIVE (sans avance — refresh_status constate le
+        tunnel, _commit_ip fait tourner) + persist. Le chrono connecté est
+        piloté par _set_status, jamais touché ici ([stabilité 25/08])."""
+        self._current_ip = ip
+        self._record_ip_change(ip)
+        self._ip_history.append(
+            {
+                "ip": ip,
+                "server": self._docker_container,
+                "time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "identity": self._live_identity.get("impersonate") or "",
+                "identity_index": self._identity_index,
+            }
+        )
+        self._ip_history = self._ip_history[-100:]
+        self.save_state()
 
     # ── Config ─────────────────────────────────────────────────
 
@@ -8077,6 +8198,14 @@ class VPNManager:
                 "failed_hosts": self._failed_hosts,
                 # [plan 18/08 §3b] stack selection + flip journal (cap 20)
                 "stack": self._stack,
+                # [audit 2026-09-09] stack_effective persistée : au boot, la
+                # mémoire (vpn_state{n}.json) doit primer sur le .env quand le
+                # conteneur RÉEL la confirme. Le .env est un cache d'intention
+                # (écrit par _apply_stack/_apply_ovpn_protocol) mais les flips
+                # per-station auto-hétéro / cascades proto ne le re-sync pas
+                # toujours — d'où des rm -f de tunnels SAINS au reboot
+                # (s1/s3/s5 recréés inutilement, cf. debug.log 09:17/09:49).
+                "stack_effective": getattr(self, "_stack_effective", None),
             "ovpn_protocol": getattr(self, "_ovpn_protocol", "udp"),
             "ovpn_protocol_effective": getattr(self, "_ovpn_protocol_effective", "udp"),
                 "ovpn_endpoint_port": getattr(self, "_ovpn_endpoint_port", "1194"),
@@ -8218,6 +8347,25 @@ class VPNManager:
                     logger.info("[vpn] state stack %s ignored — config is auto (effective %s)", restored_stack, self._stack_effective)
                 else:
                     self._stack = restored_stack
+            # [audit 2026-09-09] stack_effective restaurée (flotte mixte auto) :
+            # _stack reste "auto" (le mode choisi) mais l'EFFECTIVE — posée par
+            # apply_mixed_slot() au boot précédent ou par un flip auto — est
+            # rejouée telle quelle, SANS toucher au .env. Le reconcile boot
+            # (reconcile_orphan_containers) la CONFIRME contre le conteneur
+            # réel (voir règle keep) : mémoire + réalité concordantes ⇒ le
+            # .env stale ne peut plus faire rm -f un tunnel sain.
+            _restored_eff = state.get("stack_effective")
+            if (
+                self._stack == "auto"
+                and _restored_eff in ("wireguard", "openvpn")
+                and getattr(self, "_stack_effective", None) != _restored_eff
+            ):
+                logger.info(
+                    "[vpn] state stack_effective %s restored (init said %s)",
+                    _restored_eff,
+                    getattr(self, "_stack_effective", None),
+                )
+                self._stack_effective = _restored_eff
             # OV protocol/port persistence (udp/tcp + 1194/443/8443)
             _rp = state.get("ovpn_protocol")
             if _rp in ("udp", "tcp"):
@@ -8451,6 +8599,29 @@ async def reconcile_orphan_containers(managers: list, runner=None) -> list[str]:
             expected_stack = None
         if expected_stack is None:
             expected_stack = m._stack_effective or "openvpn"  # fallback historique
+        # [audit 2026-09-09] règle keep mémoire+réalité : la mémoire
+        # (m._stack_effective, restaurée depuis vpn_state{n}.json ET rejouée
+        # par apply_mixed_slot()) DEVANCE le .env quand le conteneur RÉEL la
+        # confirme. Le .env est un cache d'intention que les flips auto
+        # per-station / cascades ne re-sync pas toujours : sans cette règle,
+        # chaque reboot faisait rm -f de tunnels SAINS (s1 09:17, s3 09:49).
+        # Consensus à 2 voix sur 3 (mémoire + inspect vs fichier) : on garde
+        # le conteneur, et on re-sync le .env plus tard via _apply_stack.
+        _mem_eff = getattr(m, "_stack_effective", None)
+        if (
+            vpn_type is not None
+            and _mem_eff in ("wireguard", "openvpn")
+            and vpn_type == _mem_eff
+            and vpn_type != expected_stack
+        ):
+            logger.info(
+                "[vpn] boot reconcile: %s stack=%s == mémoire (≠ .env=%s) — "
+                "conservé (fichier stale, pas de rm)",
+                name,
+                vpn_type,
+                expected_stack,
+            )
+            continue
         if vpn_type is not None and vpn_type != expected_stack:
             logger.warning(
                 "[vpn] boot reconcile: %s stack=%s != attendu=%s (source .env) -> rm",

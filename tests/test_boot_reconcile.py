@@ -158,11 +158,18 @@ async def test_expected_on_right_stack_untouched(tmp_path):
 async def test_expected_on_wrong_stack_removed(tmp_path):
     """The 19/08 survivor: the container runs openvpn but the manager's
     effective stack is wireguard → it is removed so start() recreates it on
-    the right stack (no wait for the watchdog flip)."""
+    the right stack (no wait for the watchdog flip).
+
+    Le .env suit la mémoire ici (STATION2=openvpn… non — volontairement
+    COHÉRENT avec l'ancienne attente : les deux stations disent wireguard,
+    donc conteneur s2 = mémoire ∧ fichier contre lui → rm)."""
     stub = _DockerStub(
         {"opencode-vpn": "wireguard", "opencode-vpn-2": "openvpn"}
     )  # stale-boot station 2
     managers = _managers(tmp_path, 2, stack="wireguard")
+    (tmp_path / ".env").write_text(
+        "VPN_TYPE_STATION1=wireguard\nVPN_TYPE_STATION2=wireguard\n", encoding="utf-8"
+    )
 
     removed = await vm.reconcile_orphan_containers(managers, stub.run)
 
@@ -182,6 +189,50 @@ async def test_expected_unknown_stack_kept(tmp_path):
 
     assert removed == []
     assert stub.removed == []
+
+
+@pytest.mark.asyncio
+async def test_memory_reality_wins_over_stale_env_file(tmp_path):
+    """[audit 2026-09-09] keep mémoire+réalité : le conteneur RÉEL confirme la
+    mémoire (manager), le .env dit autre chose (stale) → CONSERVÉ, pas de rm.
+
+    Cas prod : s4 tourne wireguard, la mémoire dit wireguard, mais le .env
+    dit VPN_TYPE_STATION4=openvpn (flip auto jamais re-sync). Sans cette
+    règle, chaque reboot faisait rm -f d'un tunnel sain (s1 09:17, s3 09:49
+    dans debug.log : `stack=openvpn != attendu=wireguard (source .env)`)."""
+    stub = _DockerStub({"opencode-vpn-4": "wireguard"})
+    managers = _managers(tmp_path, 4, stack="openvpn")
+    managers[3]._stack_effective = "wireguard"  # s4 : mémoire = réalité
+    (tmp_path / ".env").write_text(
+        "VPN_TYPE_STATION1=openvpn\n"
+        "VPN_TYPE_STATION2=openvpn\n"
+        "VPN_TYPE_STATION3=openvpn\n"
+        "VPN_TYPE_STATION4=openvpn\n",  # stale — contredit mémoire+réalité
+        encoding="utf-8",
+    )
+
+    removed = await vm.reconcile_orphan_containers(managers, stub.run)
+
+    assert removed == []
+    assert stub.removed == []
+    rms = [c[0] for c in stub.calls if c[0][0] == "rm"]
+    assert rms == [], "aucun rm quand mémoire+réalité concordent"
+
+
+@pytest.mark.asyncio
+async def test_env_and_memory_agree_still_removes(tmp_path):
+    """Garde-fou inverse : mémoire ET .env disent wireguard mais le conteneur
+    tourne openvpn (vrai stale-stack, cas 19/08) → rm maintenu."""
+    stub = _DockerStub({"opencode-vpn-2": "openvpn"})
+    managers = _managers(tmp_path, 2, stack="wireguard")
+    (tmp_path / ".env").write_text(
+        "VPN_TYPE_STATION1=wireguard\nVPN_TYPE_STATION2=wireguard\n", encoding="utf-8"
+    )
+
+    removed = await vm.reconcile_orphan_containers(managers, stub.run)
+
+    assert removed == ["opencode-vpn-2"]
+    assert stub.removed == ["opencode-vpn-2"]
 
 
 @pytest.mark.asyncio
