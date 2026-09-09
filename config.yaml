@@ -38,8 +38,6 @@ models:
     protocol: openai
   kimi-k2.6:
     protocol: openai
-  kimi-k2.7:
-    protocol: openai
   deepseek-v4-pro:
     protocol: openai
   deepseek-v4-flash:
@@ -92,21 +90,12 @@ models:
       extends: meta-muse-spark
   deepseek-v4-flash-free:
     protocol: openai
-  hy3-free:
-    protocol: openai
-  laguna-s-2.1-free:
-    protocol: openai
   mimo-v2.5-free:
     protocol: openai
   nemotron-3-ultra-free:
     protocol: openai
   nemotron-3.5-lightning-free:
     protocol: openai
-  x-preview-f-free:
-    protocol: openai
-  ox-alpha-free:
-    protocol: openai
-    endpoint: go
   deepseek-v4-flash-vision-exp:
     protocol: openai
   longcat-2.0:
@@ -138,7 +127,6 @@ free_model_map:
   kimi-k2.6: mimo-v2.5-free
   minimax-m2.5: mimo-v2.5-free
   deepseek-v4-flash: deepseek-v4-flash-free
-  hy3: hy3-free
   muse-spark-1.2-contributor: muse-spark-1.2-contributor-free
   muse-spark-1.3-contributor: muse-spark-1.3-contributor-free
 dashboard_trust:
@@ -381,12 +369,6 @@ custom_routes:
     match:
     - muse-spark-1.3-contributor
     model: muse-spark-1.3-contributor
-  0xalphaoxalphaoxalpha:
-    match:
-    - 0xalpha
-    - ox-alpha
-    - oxalpha
-    model: x-preview-f-free
 api_keys: []
 pricing:
   currency: USD
@@ -481,8 +463,7 @@ free_discovery:
   interval: 3600
   auto_persist: true
   default_target: mimo-v2.5-free
-  go_only_ids:
-  - ox-alpha-free
+  go_only_ids: []
 traffic:
   enabled: true
   max_frames: 500

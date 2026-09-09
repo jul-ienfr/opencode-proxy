@@ -611,8 +611,8 @@ def _resolve_model_endpoint(model_id: str, model_data: dict, protocol: str) -> s
     An explicit per-model `endpoint` key wins over the -free / muse-spark
     heuristics: 'go' → Go chat completions (authenticated subscription),
     'free' → free chat completions, any other value is used verbatim as a
-    full URL. Example: ox-alpha-free lives on the Go endpoint despite its
-    -free suffix (its free-tier twin is x-preview-f-free).
+    full URL (a -free id with `endpoint: go` lives on the Go endpoint
+    despite its suffix).
     """
     explicit = model_data.get("endpoint")
     if explicit:
@@ -673,8 +673,9 @@ FREE_DISCOVERY_INTERVAL = int(
 FREE_DISCOVERY_ENABLED = bool(FREE_DISCOVERY.get("enabled", True))
 FREE_DISCOVERY_AUTO_PERSIST = bool(FREE_DISCOVERY.get("auto_persist", True))
 FREE_DISCOVERY_DEFAULT_TARGET = FREE_DISCOVERY.get("default_target", "mimo-v2.5-free")
-# -free ids served only via the authenticated Go endpoint (e.g. ox-alpha-free):
-# never added to the anonymous free pool / FREE_MODELS by auto-discovery.
+# -free ids served only via the authenticated Go endpoint (explicit
+# `endpoint: go` in config): never added to the anonymous free pool /
+# FREE_MODELS by auto-discovery.
 GO_ONLY_IDS: set = set()
 _goi_raw = FREE_DISCOVERY.get("go_only_ids", [])
 if isinstance(_goi_raw, list):

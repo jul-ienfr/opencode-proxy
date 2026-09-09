@@ -240,8 +240,8 @@ class TestDetectPure:
         import config.settings as st
 
         p1 = _payload("mimo-v2.5-free", "glm-5")
-        p2 = _payload("hy3-free")
-        assert st._detect_free_ids([p1, p2]) == {"mimo-v2.5-free", "hy3-free"}
+        p2 = _payload("acme-x-free")
+        assert st._detect_free_ids([p1, p2]) == {"mimo-v2.5-free", "acme-x-free"}
 
     def test_detect_skips_non_dict(self):
         import config.settings as st
@@ -261,18 +261,18 @@ class TestApplyPersist:
     def test_delta_no_op_does_not_bump_mtime(self, tmp_path, monkeypatch):
         yaml_data = {
             "server": {"host": "0.0.0.0", "port": 4000},
-            "models": {"mimo-v2.5": {"protocol": "openai"}, "hy3": {"protocol": "openai"}},
-            "free_model_map": {"hy3": "hy3-free"},
+            "models": {"mimo-v2.5": {"protocol": "openai"}, "acme-x": {"protocol": "openai"}},
+            "free_model_map": {"acme-x": "acme-x-free"},
         }
         st, *old = _isolated_settings(tmp_path, monkeypatch, yaml_data)
         try:
-            # seed FREE_MODELS to {hy3-free}
+            # seed FREE_MODELS to {acme-x-free}
             st.FREE_MODELS.clear()
-            st.FREE_MODELS.update({"hy3-free"})
-            st.FREE_MODEL_POOL[:] = ["hy3-free"]
-            st._FREE_DISCOVERY_STATE["detected"] = ["hy3-free"]
-            st.MODELS["hy3-free"] = {"endpoint": st.API_BASE_FREE, "protocol": "openai"}
-            added = st._apply_discovered_free_models({"hy3-free"}, source="test")
+            st.FREE_MODELS.update({"acme-x-free"})
+            st.FREE_MODEL_POOL[:] = ["acme-x-free"]
+            st._FREE_DISCOVERY_STATE["detected"] = ["acme-x-free"]
+            st.MODELS["acme-x-free"] = {"endpoint": st.API_BASE_FREE, "protocol": "openai"}
+            added = st._apply_discovered_free_models({"acme-x-free"}, source="test")
             assert added == 0
             # [P6 dé-flake] l'ancien assert mtime (avec try/except-pass « flaky
             # on Windows ») comparait des mtimes à la granularité NTFS (~15 ms)
@@ -286,34 +286,34 @@ class TestApplyPersist:
     def test_apply_adds_model_and_homonyme(self, tmp_path, monkeypatch):
         yaml_data = {
             "server": {"host": "0.0.0.0", "port": 4000},
-            "models": {"hy3": {"protocol": "openai"}},
+            "models": {"acme-x": {"protocol": "openai"}},
             "free_model_map": {},
         }
         st, *old = _isolated_settings(tmp_path, monkeypatch, yaml_data)
         try:
-            added = st._apply_discovered_free_models({"hy3-free"}, source="test")
-            assert "hy3-free" in st.MODELS
-            assert st.FREE_MODEL_MAP.get("hy3") == "hy3-free"
+            added = st._apply_discovered_free_models({"acme-x-free"}, source="test")
+            assert "acme-x-free" in st.MODELS
+            assert st.FREE_MODEL_MAP.get("acme-x") == "acme-x-free"
             assert added == 1
-            assert st.FREE_MODEL_POOL == ["hy3-free"]
+            assert st.FREE_MODEL_POOL == ["acme-x-free"]
         finally:
             _restore_settings(st, old)
 
     def test_persist_is_atomic_tmp_replace(self, tmp_path, monkeypatch):
         yaml_data = {
             "server": {"host": "0.0.0.0", "port": 4000},
-            "models": {"hy3": {"protocol": "openai"}},
+            "models": {"acme-x": {"protocol": "openai"}},
             "free_model_map": {},
         }
         st, *old = _isolated_settings(tmp_path, monkeypatch, yaml_data)
         try:
-            st._apply_discovered_free_models({"hy3-free"}, source="test")
+            st._apply_discovered_free_models({"acme-x-free"}, source="test")
             assert not Path(st.CONFIG_PATH + ".tmp").exists()
             st._persist_free_mappings()
             assert not Path(st.CONFIG_PATH + ".tmp").exists(), "tmp must have been replaced"
             on_disk = yaml.safe_load(Path(st.CONFIG_PATH).read_text(encoding="utf-8"))
-            assert "hy3-free" in on_disk.get("models", {})
-            assert on_disk.get("free_model_map", {}).get("hy3") == "hy3-free"
+            assert "acme-x-free" in on_disk.get("models", {})
+            assert on_disk.get("free_model_map", {}).get("acme-x") == "acme-x-free"
             # valid yaml
             yaml.safe_load(Path(st.CONFIG_PATH).read_text(encoding="utf-8"))
         finally:
@@ -340,13 +340,13 @@ class TestApplyPersist:
         yaml_data = {
             "server": {"host": "0.0.0.0", "port": 4000},
             "models": {},
-            "free_model_map": {"hy3": "hy3-free"},
+            "free_model_map": {"acme-x": "acme-x-free"},
         }
         st, *old = _isolated_settings(tmp_path, monkeypatch, yaml_data)
         try:
             st.FREE_MODELS.clear()
-            st.FREE_MODELS.update({"hy3-free", "mimo-v2.5-free"})
-            st._apply_discovered_free_models({"hy3-free"}, source="test")
+            st.FREE_MODELS.update({"acme-x-free", "mimo-v2.5-free"})
+            st._apply_discovered_free_models({"acme-x-free"}, source="test")
             assert st._FREE_DISCOVERY_STATE["removed"] == ["mimo-v2.5-free"]
         finally:
             _restore_settings(st, old)
@@ -361,31 +361,31 @@ class TestApplyPersist:
         try:
             urls = st._free_discovery_urls()
             # same payload on both urls → dedup to 2 ids
-            payload = _payload("mimo-v2.5-free", "hy3-free")
+            payload = _payload("mimo-v2.5-free", "acme-x-free")
             mapping = {u: _FakeResp(200, payload) for u in urls}
             _install_fake_httpx(monkeypatch, mapping)
             st._ensure_free_models_sync()
             # both frees discovered, both in MODELS
-            assert {"mimo-v2.5-free", "hy3-free"} <= st.FREE_MODELS
-            assert {"mimo-v2.5-free", "hy3-free"} <= set(st.MODELS.keys())
+            assert {"mimo-v2.5-free", "acme-x-free"} <= st.FREE_MODELS
+            assert {"mimo-v2.5-free", "acme-x-free"} <= set(st.MODELS.keys())
         finally:
             _restore_settings(st, old)
 
     def test_try_free_model_first_via_homonyme(self, tmp_path, monkeypatch):
-        """End-to-end: after discovery adds hy3→hy3-free, a pretending
+        """End-to-end: after discovery adds acme-x→acme-x-free, a pretending
         _try_free_model_first sees it (router live semantics)."""
         yaml_data = {
             "server": {"host": "0.0.0.0", "port": 4000},
-            "models": {"hy3": {"protocol": "openai"}},
+            "models": {"acme-x": {"protocol": "openai"}},
             "free_model_map": {},
         }
         st, *old = _isolated_settings(tmp_path, monkeypatch, yaml_data)
         try:
             # Simulate discovery homonyme
-            st._apply_discovered_free_models({"hy3-free"}, source="test")
+            st._apply_discovered_free_models({"acme-x-free"}, source="test")
             # Minimal router check: FREE_MODEL_MAP is the contract for _try_free_model_first
-            assert st.FREE_MODEL_MAP.get("hy3") == "hy3-free"
-            assert "hy3-free" in st.MODELS
+            assert st.FREE_MODEL_MAP.get("acme-x") == "acme-x-free"
+            assert "acme-x-free" in st.MODELS
         finally:
             _restore_settings(st, old)
 

@@ -22,30 +22,16 @@ goldens §v1-response.md. Aliases actuels (`free_model_map`) :
 - `glm-5.1`, `kimi-k2.6`, `minimax-m2.5` → `mimo-v2.5-free`
 - `mimo-v2.5` → `mimo-v2.5-free`
 - `qwen3.7-max` → `mimo-v2.5-free`
-- `hy3` → `hy3-free`
 - `muse-spark-1.2-contributor` → `muse-spark-1.2-contributor-free`
 - `muse-spark-1.3-contributor` → `muse-spark-1.3-contributor-free`
 
-Modèles free directs : `x-preview-f-free`,
-`nemotron-3-ultra-free`, `nemotron-3.5-lightning-free`,
-`deepseek-v4-flash-vision-exp`, `longcat-2.0`.
+Modèles free directs : `nemotron-3-ultra-free`,
+`nemotron-3.5-lightning-free`, `deepseek-v4-flash-vision-exp`, `longcat-2.0`.
 
-### Cas particulier : ox-alpha-free (endpoint Go authentifié)
-
-`ox-alpha-free` porte le suffixe `-free` mais vit sur l'endpoint **Go
-authentifié** (`upstream.openai_base` = `/zen/go/v1/chat/completions`) :
-override explicite `models.ox-alpha-free.endpoint: go` dans `config.yaml`
-(champ `endpoint` acceptant `go`, `free` ou une URL complète, qui prime sur
-l'heuristique suffixe/muse-spark de `_resolve_model_endpoint`). Ses requêtes
-sont traitées comme un modèle Go : clé API + rotation de clés, connexion
-directe (jamais via VPN/stations), quotas Go.
-
-Il est exclu du pool anonyme via `free_discovery.go_only_ids: [ox-alpha-free]`
-— la découverte auto ne l'ajoute jamais à `FREE_MODELS`/`FREE_MODEL_POOL`.
-
-Son jumeau free-tier est `x-preview-f-free` (endpoint libre
-`/zen/v1/chat/completions`, VPN/stations). Alias de saisie `0xalpha`,
-`ox-alpha`, `oxalpha` → `ox-alpha-free` (custom route `oxalpha`).
+> Note : les ids morts (`kimi-k2.7`, `hy3-free`, `laguna-s-2.1-free`,
+> `x-preview-f-free`, `ox-alpha-free`) ont été retirés du seed `config.yaml`
+> (2026-09-09 — pings live 503 upstream) ; si la découverte auto les
+> ré-annonce, elle les ré-ajoute (add-only) sans édition manuelle.
 
 ## Clés de config surveillées (drift)
 

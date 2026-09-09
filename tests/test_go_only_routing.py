@@ -1,21 +1,16 @@
-"""test_ox_alpha_routing.py — Ox Alpha : routage Go authentifié de
-ox-alpha-free + alias de saisie + exclusion du pool anonyme.
+"""test_go_only_routing.py — endpoint explicite + exclusion du pool anonyme.
 
-Couvre :
+Couvre la mécanique GÉNÉRIQUE (aucun id live — fixtures "acme-*") :
   * _resolve_model_endpoint — override explicite (`go` / `free` / URL)
     prime sur l'heuristique suffixe -free / muse-spark ;
-  * MODELS construits depuis config.yaml : ox-alpha-free → endpoint Go
-    authentifié, x-preview-f-free → endpoint free anonyme ;
   * get_model_config — le seam utilisé par les handlers /v1/messages ;
   * _apply_discovered_free_models — free_discovery.go_only_ids exclut
-    ox-alpha-free de FREE_MODELS / FREE_MODEL_POOL sans altérer son
-    entrée MODELS ; sans exclusion il serait ajouté comme tout -free ;
-  * _route_for — alias 0xalpha / ox-alpha / oxalpha → ox-alpha-free,
-    identité directe non shadowée par le pattern « ox-alpha ».
+    l'id du pool FREE_MODELS / FREE_MODEL_POOL sans altérer son
+    entrée MODELS ; sans exclusion il est ajouté comme tout -free.
 """
 
 import config.settings as st
-import opencode as oc
+
 
 # ── Résolution d'endpoint ──────────────────────────────────────────
 
@@ -23,13 +18,13 @@ import opencode as oc
 class TestResolveModelEndpoint:
     def test_explicit_go(self):
         assert (
-            st._resolve_model_endpoint("ox-alpha-free", {"endpoint": "go"}, "openai")
+            st._resolve_model_endpoint("acme-proto-free", {"endpoint": "go"}, "openai")
             == st.API_BASE_OPENAI
         )
 
     def test_explicit_go_case_insensitive(self):
         assert (
-            st._resolve_model_endpoint("ox-alpha-free", {"endpoint": " GO "}, "openai")
+            st._resolve_model_endpoint("acme-proto-free", {"endpoint": " GO "}, "openai")
             == st.API_BASE_OPENAI
         )
 
@@ -44,7 +39,7 @@ class TestResolveModelEndpoint:
         assert st._resolve_model_endpoint("custom-model", {"endpoint": url}, "openai") == url
 
     def test_free_suffix_default(self):
-        assert st._resolve_model_endpoint("x-preview-f-free", {}, "openai") == st.API_BASE_FREE
+        assert st._resolve_model_endpoint("acme-thing-free", {}, "openai") == st.API_BASE_FREE
 
     def test_muse_free_responses(self):
         assert (
@@ -77,22 +72,7 @@ class TestResolveModelEndpoint:
         assert st._resolve_model_endpoint("minimax-m2.5", {}, "anthropic") == st.API_BASE_ANTHROPIC
 
 
-# ── MODELS réels (config.yaml du dépôt) + seam des handlers ────────
-
-
-def test_live_models_ox_alpha_endpoints():
-    assert st.MODELS["ox-alpha-free"]["endpoint"] == st.API_BASE_OPENAI
-    assert st.MODELS["ox-alpha-free"]["protocol"] == "openai"
-    assert st.MODELS["x-preview-f-free"]["endpoint"] == st.API_BASE_FREE
-
-
-def test_get_model_config_go_seam():
-    cfg = st.get_model_config("ox-alpha-free")
-    assert cfg["endpoint"] == st.API_BASE_OPENAI
-    assert cfg["protocol"] == "openai"
-
-
-# ── Parité muse-spark 1.3 == 1.2 ──────────────────────────────────────
+# ── Parité muse-spark 1.3 == 1.2 (seam des handlers) ───────────────
 
 
 def test_live_models_muse_spark_13_endpoints():
@@ -135,7 +115,7 @@ def test_web_search_native_parity_13():
         assert mid in st.WEB_SEARCH_NATIVE_MODELS
 
 
-# ── Exclusion découverte auto (go_only_ids) ─────────────────────────
+# ── Exclusion découverte auto (go_only_ids, mécanique générique) ───
 
 
 def _snapshot_settings():
@@ -145,6 +125,7 @@ def _snapshot_settings():
         "pool_obj": st.FREE_MODEL_POOL,
         "map": dict(st.FREE_MODEL_MAP),
         "state": dict(st._FREE_DISCOVERY_STATE),
+        "go_only": set(st.GO_ONLY_IDS),
     }
 
 
@@ -158,72 +139,69 @@ def _restore_settings(snap):
     st.FREE_MODEL_MAP.update(snap["map"])
     st._FREE_DISCOVERY_STATE.clear()
     st._FREE_DISCOVERY_STATE.update(snap["state"])
+    st.GO_ONLY_IDS.clear()
+    st.GO_ONLY_IDS.update(snap["go_only"])
 
 
-def test_discovery_excludes_go_only_ids():
+def _install_go_only(monkeypatch, snap, go_only_id, endpoint):
+    """Isole le test du config.yaml réel : GO_ONLY_IDS + entrée MODELS
+    temporaires, restaurés après."""
+    monkeypatch.setattr(st, "GO_ONLY_IDS", {go_only_id})
+    st.MODELS[go_only_id] = {"endpoint": endpoint, "protocol": "openai"}
+    return go_only_id
+
+
+def test_discovery_excludes_go_only_ids(monkeypatch):
     snap = _snapshot_settings()
     try:
+        go_only = _install_go_only(
+            monkeypatch, snap, "acme-proto-free", st.API_BASE_OPENAI
+        )
         added = st._apply_discovered_free_models(
-            {"ox-alpha-free", "x-preview-f-free"}, source="test"
+            {go_only, "mimo-v2.5-free"}, source="test"
         )
         assert isinstance(added, int)
-        assert "ox-alpha-free" not in st.FREE_MODELS
-        assert "ox-alpha-free" not in st.FREE_MODEL_POOL
-        assert "x-preview-f-free" in st.FREE_MODELS
-        assert "x-preview-f-free" in st.FREE_MODEL_POOL
-        assert st.MODELS["ox-alpha-free"]["endpoint"] == st.API_BASE_OPENAI
-        assert st.MODELS["x-preview-f-free"]["endpoint"] == st.API_BASE_FREE
-        assert not any(v == "ox-alpha-free" for v in st.FREE_MODEL_MAP.values())
+        assert go_only not in st.FREE_MODELS
+        assert go_only not in st.FREE_MODEL_POOL
+        assert "mimo-v2.5-free" in st.FREE_MODELS
+        assert "mimo-v2.5-free" in st.FREE_MODEL_POOL
+        assert st.MODELS[go_only]["endpoint"] == st.API_BASE_OPENAI
+        assert st.MODELS["mimo-v2.5-free"]["endpoint"] == st.API_BASE_FREE
+        assert not any(v == go_only for v in st.FREE_MODEL_MAP.values())
     finally:
         _restore_settings(snap)
 
 
 def test_discovery_adds_go_only_id_when_filter_disabled(monkeypatch):
-    monkeypatch.setattr(st, "GO_ONLY_IDS", set())
     snap = _snapshot_settings()
     try:
-        st._apply_discovered_free_models({"ox-alpha-free"}, source="test")
-        assert "ox-alpha-free" in st.FREE_MODELS
-        assert "ox-alpha-free" in st.FREE_MODEL_POOL
+        monkeypatch.setattr(st, "GO_ONLY_IDS", set())
+        st._apply_discovered_free_models({"acme-proto-free"}, source="test")
+        assert "acme-proto-free" in st.FREE_MODELS
+        assert "acme-proto-free" in st.FREE_MODEL_POOL
     finally:
         _restore_settings(snap)
 
 
-# ── Alias de saisie (custom route oxalpha) ──────────────────────────
-# [v10 25/08 — commit 78e9285] ox-alpha-free a disparu de la découverte
-# upstream (plus dans /api/free-models detected) : les alias et l'identité
-# directe sont routés gracieusement vers le free vivant x-preview-f-free.
+# ── Garde-fou /v1/models : chaque id listé existe dans MODELS ───
 
 
-def test_alias_routes_to_live_free_target():
-    for name in ("0xalpha", "ox-alpha", "oxalpha"):
-        route = oc._route_for(name)
-        assert route is not None, f"no route for {name!r}"
-        assert route["model"] == "x-preview-f-free", name
+def test_list_models_ids_subset_of_models():
+    """GET /v1/models ne doit annoncer que des ids routables (MODELS).
 
+    Régression couverte : les 5 alias factices (gpt-5-codex, gpt-5, gpt-4o,
+    codex, deepseek-chat) injectés à la main dans list_models() — 404
+    upstream — retirés le 2026-09-09.Pattern : appel direct de la coroutine
+    (pas de TestClient — opencode.app monte tout le lifespan/VPN)."""
+    import asyncio
 
-def test_alias_case_insensitive():
-    route = oc._route_for("0XAlpha")
-    assert route is not None
-    assert route["model"] == "x-preview-f-free"
+    import opencode as oc
 
-
-def test_dead_identity_falls_through_to_live_free(monkeypatch):
-    """Ancien garde « identité non écrasée » : inverse aujourd'hui — le
-    modèle ox-alpha-free étant mort upstream, la demande tombe sur le free
-    vivant plutôt que d'échouer (dégradation gracieuse §12.2.6).
-    Hermétique au .env opérateur (DISABLE_MAPPING gitignoré) : le cas
-    testé exige le mapping actif. Vide aussi le cache de routes : un test
-    antérieur ayant pu y figer une résolution sous un autre mapping."""
-    monkeypatch.setattr(oc, "DISABLE_MAPPING", True)
-    try:
-        oc._route_cache.clear()
-    except Exception:
-        pass
-    route = oc._route_for("ox-alpha-free")
-    assert route is not None
-    assert route["model"] == "x-preview-f-free"
-    cfg = st.get_model_config(route["model"])
-    # free anonyme : endpoint zen standard, PAS l'endpoint Go authentifié
-    assert cfg["endpoint"].endswith("/chat/completions")
-    assert "/go/" not in cfg["endpoint"]
+    payload = asyncio.run(oc.list_models())
+    assert payload["object"] == "list"
+    ids = [m["id"] for m in payload["data"]]
+    assert len(ids) == len(set(ids)), "doublons dans /v1/models"
+    ghosts = [i for i in ids if i not in st.MODELS]
+    assert not ghosts, f"/v1/models annonce des ids non routables : {ghosts}"
+    for banned in ("gpt-5-codex", "gpt-5", "gpt-4o", "codex", "deepseek-chat"):
+        assert banned not in ids, f"alias factice {banned!r} de retour dans /v1/models"

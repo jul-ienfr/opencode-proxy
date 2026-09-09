@@ -10607,10 +10607,6 @@ async def list_models():
                 }
             )
             seen.add(model_id)
-    for alias in ["gpt-5-codex", "gpt-5", "gpt-4o", "codex", "deepseek-chat"]:
-        if alias not in seen:
-            data.append({"id": alias, "object": "model", "created": now, "owned_by": "opencode"})
-            seen.add(alias)
     return {"object": "list", "data": data, "cache": _response_cache.stats()}
 
 

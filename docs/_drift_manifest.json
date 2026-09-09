@@ -46,7 +46,6 @@
       "config_file": "config.yaml",
       "keys": [
         "free_model_map.deepseek-v4-flash",
-        "free_model_map.hy3",
         "dashboard_trust.mode",
         "client_auth.mode"
       ]
