@@ -90,6 +90,8 @@ models:
       extends: meta-muse-spark
   deepseek-v4-flash-free:
     protocol: openai
+  hy3-free:
+    protocol: openai
   mimo-v2.5-free:
     protocol: openai
   nemotron-3-ultra-free:
@@ -443,6 +445,22 @@ debug:
   max_size: 52428800
   log_lines_max: 200
 thinking:
+  effort_order:
+  - minimal
+  - low
+  - medium
+  - high
+  - xhigh
+  - max
+  effort_caps:
+    default: high
+    glm-5: high
+    deepseek-v4: max
+    mimo-v2.5: max
+    muse-spark: xhigh
+    muse_spark: xhigh
+    spark: xhigh
+    ling-3.0-flash-fin: max
   min_tokens:
     deepseek-v4-flash: 2048
     deepseek-v4-pro: 4096

@@ -986,6 +986,48 @@ class TestChatToResponsesRequest:
         result = _chat_to_responses_request(chat)
         assert "reasoning" not in result
 
+    @pytest.mark.parametrize(
+        "model,effort,expected",
+        [
+            ("glm-5-air", "max", "high"),
+            ("glm-5-air", "xhigh", "high"),
+            ("muse-spark-1.3-contributor", "max", "xhigh"),
+            ("muse-spark-1.3-contributor", "xhigh", "xhigh"),
+            ("deepseek-v4-flash", "max", "max"),
+            ("mimo-v2.5", "max", "max"),
+            ("mimo-v2-pro", "max", "high"),
+        ],
+    )
+    def test_reasoning_effort_clamped_to_model_cap(self, model, effort, expected):
+        """reasoning_effort au-delà du plafond config → relegué au cap."""
+        chat = {
+            "model": model,
+            "messages": [{"role": "user", "content": "test"}],
+            "reasoning_effort": effort,
+        }
+        result = _chat_to_responses_request(chat)
+        assert result["reasoning"] == {"summary": "auto", "effort": expected}
+
+    def test_reasoning_dict_effort_clamped_to_model_cap(self):
+        """reasoning dict natif (voie Responses) : effort clampé, clés gardées."""
+        chat = {
+            "model": "glm-5-air",
+            "messages": [{"role": "user", "content": "test"}],
+            "reasoning": {"summary": "auto", "effort": "max", "extra": 1},
+        }
+        result = _chat_to_responses_request(chat)
+        assert result["reasoning"] == {"summary": "auto", "effort": "high", "extra": 1}
+
+    def test_native_responses_reasoning_effort_clamped(self):
+        """Natif Responses verbatim (input sans messages) : effort clampé."""
+        req = {
+            "model": "glm-5-air",
+            "input": [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+            "reasoning": {"summary": "auto", "effort": "max"},
+        }
+        result = _chat_to_responses_request(req)
+        assert result["reasoning"]["effort"] == "high"
+
     def test_reasoning_effort_takes_precedence(self):
         """If both reasoning_effort and reasoning are present, reasoning_effort wins."""
         chat = {

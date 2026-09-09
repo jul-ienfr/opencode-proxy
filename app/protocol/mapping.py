@@ -102,6 +102,9 @@ def _drop_orphan_tool_messages(messages: list[dict]) -> list[dict]:
 
 def _drop_orphan_responses_input(inp: list[dict]) -> list[dict]:
     """Filter function_call_output items whose call_id has no preceding function_call."""
+    if not isinstance(inp, list):
+        return inp
+    inp = [it for it in inp if isinstance(it, dict)]
     # [P5.2 perf] early-exit sans rebuild quand aucun function_call_output
     if not any(it.get("type") == "function_call_output" for it in inp):
         return inp
@@ -237,19 +240,35 @@ def _find_split_point(text: str) -> int:
 
 
 def _effort_to_reasoning(effort_level: str, model: str) -> str:
-    """Map generic effort (xhigh/high/medium/low) to model-specific reasoning_effort.
+    """Map generic effort to model-specific reasoning_effort (config-driven).
 
-    Deduplicates logic at 477 and 932 (audit F-M7): single source for glm-5/deepseek/mimo.
+    Délègue à ``config.effort_caps.clamp_effort`` : plafond par modèle lu en
+    live depuis ``thinking.effort_order`` / ``thinking.effort_caps``
+    (``config.yaml``). Signature inchangée (coquille fine — réexportée,
+    utilisée par tests + opencode.py).
+
+    Robustesse : ``None``/``""``/``"none"`` → ``"low"`` (repli historique
+    de la branche défaut) ; niveau inconnu non vide → passthrough inchangé
+    (robustesse forward) ; import config protégé (jamais de 500 si la
+    config est absente — fallback hardcodé = comportement pré-patch).
     """
-    if model.startswith("glm-5"):
-        if effort_level in ("xhigh", "max", "high"):
-            return "high"
-        if effort_level == "medium":
-            return "medium"
+    try:
+        from config.effort_caps import clamp_effort
+    except ImportError:  # pragma: no cover
+        clamp_effort = None  # type: ignore[assignment]
+    if clamp_effort is not None:
+        try:
+            clamped = clamp_effort(effort_level, model)
+        except Exception:
+            clamped = None
+        if isinstance(clamped, str) and clamped:
+            return clamped
+        # None (désactivé) ou niveau inconnu-vide → repli historique.
+        _lvl = str(effort_level or "").strip().lower()
+        if _lvl in ("medium", "high", "xhigh", "max"):
+            return "high" if _lvl in ("high", "xhigh", "max") else "medium"
         return "low"
-    if model.startswith("deepseek-v4"):
-        return "max" if effort_level in ("xhigh", "max") else "high"
-    # mimo etc.
+    # Fallback hardcodé = comportement pré-patch (branche défaut historique).
     if effort_level in ("xhigh", "max", "high"):
         return "high"
     if effort_level == "medium":
@@ -1088,6 +1107,14 @@ def anthropic_to_openai(body: dict, model: str, raw: bytes | None = None) -> dic
 
     # Convert Anthropic thinking/effort → OpenAI reasoning parameters
     # Claude Code sends: thinking: {type: "adaptive"} OR effort: "low"/"medium"/"high"/"xhigh"/"max"
+    # Relais reasoning_effort natif (tour openai_responses_to_anthropic précédent
+    # sur jambe /v1/responses : l'effort y est déjà résolu/normalisé spark).
+    _relayed = body.get("reasoning_effort")
+    if isinstance(_relayed, str) and _relayed and _relayed != "none":
+        oai["reasoning_effort"] = _effort_to_reasoning(_relayed, model)
+        _debug(f"  [thinking] {model}: reasoning_effort={oai['reasoning_effort']} (relayed={_relayed})")
+        oai = _restructure_for_cache(oai, model)
+        return oai
     effort_level = body.get("effort")
     thinking_param = body.get("thinking") if isinstance(body.get("thinking"), dict) else {}
     ttype = thinking_param.get("type", "") if isinstance(thinking_param, dict) else ""
@@ -2058,6 +2085,15 @@ def openai_responses_to_anthropic(body: dict) -> dict:
 
     # Convert Anthropic thinking/effort -> model-specific reasoning parameter
     # Claude Code sends: thinking: {type: "adaptive"} OR effort: "low"/"medium"/"high"/"xhigh"/"max"
+    # Natif Responses (body.reasoning.effort, préservé par _sanitize + handler)
+    # prime sur le dérivé thinking/effort (BUG drop 2026-09-09 : /v1/responses
+    # natif perdait son effort ici même).
+    _native_reasoning = body.get("reasoning") if isinstance(body.get("reasoning"), dict) else {}
+    _native_effort = _native_reasoning.get("effort") if isinstance(_native_reasoning, dict) else None
+    if isinstance(_native_effort, str) and _native_effort and _native_effort != "none":
+        result["reasoning_effort"] = _effort_to_reasoning(_native_effort, result.get("model", ""))
+        _debug(f"  [thinking] {result.get('model', '')}: reasoning_effort={result['reasoning_effort']} (native reasoning.effort={_native_effort})")
+        return result
     effort_level = body.get("effort")
     thinking = body.get("thinking") if isinstance(body.get("thinking"), dict) else {}
     ttype = thinking.get("type", "") if isinstance(thinking, dict) else ""
@@ -2522,11 +2558,23 @@ def _normalize_responses_input_items(inp: list) -> list:
 def _sanitize_native_responses_request(req: dict) -> dict:
     """Sanitize-aller pour un body déjà au format Responses (verbatim) :
     tools[] + historique input[].function_call + tool_choice, map réunie sous
-    _TOOL_NAME_MAP_KEY (jamais globale). Copie les conteneurs mutés pour ne
-    jamais muter le caller. Idempotent (double conversion)."""
+    _TOOL_NAME_MAP_KEY (jamais globale). Clamp config de ``reasoning.effort``
+    (``thinking.effort_caps``) : un effort natif au-delà du plafond du modèle
+    (ex. max sur un modèle plafonné high) serait sinon refusé en 400 upstream.
+    Copie les conteneurs mutés pour ne jamais muter le caller. Idempotent
+    (double conversion)."""
     if not isinstance(req, dict):
         return req
     req = dict(req)
+    _native_reasoning = req.get("reasoning")
+    if isinstance(_native_reasoning, dict):
+        _native_effort = _native_reasoning.get("effort")
+        if isinstance(_native_effort, str) and _native_effort:
+            _req_model = req.get("model", "")
+            _clamped = _effort_to_reasoning(_native_effort, _req_model)
+            if _clamped != _native_effort:
+                req["reasoning"] = dict(_native_reasoning, effort=_clamped)
+                _debug(f"  [thinking] {_req_model}: reasoning.effort clampé {_native_effort} → {_clamped}")
     name_map = req.get(_TOOL_NAME_MAP_KEY)
     name_map = dict(name_map) if isinstance(name_map, dict) else {}
     tools = req.get("tools")
@@ -2767,14 +2815,28 @@ def _chat_to_responses_request(chat: dict) -> dict:
     for k in ("temperature", "top_p"):
         if k in chat:
             req[k] = chat[k]
-    # Forward reasoning parameters to Responses API format
+    # Forward reasoning parameters to Responses API format.
+    # Le clamp config (thinking.effort_caps) s'applique ici aussi : ce forward
+    # verbatim laissait passer un effort au-delà du plafond du modèle
+    # (ex. max sur glm-5 → 400 upstream) sur la jambe /v1/responses.
+    _chat_model = chat.get("model", "")
     if "reasoning_effort" in chat:
-        effort = chat["reasoning_effort"]
+        effort = _effort_to_reasoning(chat["reasoning_effort"], _chat_model)
         # summary:auto is required to get visible reasoning summary; without it
         # upstream returns only encrypted_content and proxy emits placeholder.
         req["reasoning"] = {"summary": "auto", "effort": effort}
     elif "reasoning" in chat:
-        req["reasoning"] = chat["reasoning"]
+        _raw_reasoning = chat["reasoning"]
+        if isinstance(_raw_reasoning, dict):
+            _raw_effort = _raw_reasoning.get("effort")
+            if isinstance(_raw_effort, str) and _raw_effort:
+                _clamped = dict(_raw_reasoning)
+                _clamped["effort"] = _effort_to_reasoning(_raw_effort, _chat_model)
+                req["reasoning"] = _clamped
+            else:
+                req["reasoning"] = _raw_reasoning
+        else:
+            req["reasoning"] = _raw_reasoning
     if "tools" in chat:
         model = chat.get("model", "")
         prof = _resolve_schema_profile(model)
