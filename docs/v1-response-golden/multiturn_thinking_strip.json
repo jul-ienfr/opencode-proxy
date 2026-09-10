@@ -87,7 +87,7 @@
     ],
     "max_tokens": 512,
     "stream": false,
-    "reasoning_effort": "max"
+    "reasoning_effort": "xhigh"
   },
   "_note": "multi-tours : thinking synthétique ET original préservés en reasoning_content (parité multi-tours), redacted_thinking strippé (correctif post-livraison PLAN-raisonnement)",
   "_generated_by": "scripts/gen_golden_fixtures.py (plan v10 §11.5)"
