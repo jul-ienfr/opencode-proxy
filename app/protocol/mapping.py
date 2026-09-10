@@ -38,13 +38,22 @@ except ImportError:  # pragma: no cover
 
     _cfg_settings = _CfgFallback()
 
-_encoding: Any
-try:
-    import tiktoken
+# tiktoken — LAZY (Phase 3 chantier boot) : ce module n'utilise plus
+# _encoding (doublon mort du singleton d'opencode.py) ; get_encoding()
+# coûtait 1-2 s à froid à CHAQUE import. Nom conservé pour compat.
+_encoding: Any = None
 
-    _encoding = tiktoken.get_encoding("cl100k_base")
-except Exception:
-    _encoding = None
+
+def _get_encoding() -> Any:
+    global _encoding
+    if _encoding is None:
+        try:
+            import tiktoken
+
+            _encoding = tiktoken.get_encoding("cl100k_base")
+        except Exception:
+            _encoding = None
+    return _encoding
 
 # ── orjson fast-path (5-10x vs stdlib json on large bodies) ──
 # (import fail-fast en tête de fichier — cf. note Lot 1 ci-dessus)

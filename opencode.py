@@ -319,13 +319,46 @@ def _get_auth_headers(protocol: str, entry: dict | None = None) -> dict:
     return {"Authorization": f"Bearer {ak}", "Content-Type": "application/json"}
 
 
-_encoding: Any
-try:
-    import tiktoken
+# ── Boot instrumentation (Phase 0 — chantier vitesse boot) ──
+# T0 pris le plus tôt possible après les imports stdlib : tous les jalons
+# boot sont mesurés en relatif ([boot+X.Xs]) dans debug.log.
+BOOT_T0 = time.monotonic()
 
-    _encoding = tiktoken.get_encoding("cl100k_base")
-except Exception:
-    _encoding = None
+
+def log_boot_phase(name: str) -> float:
+    """Log un jalon boot + retourne le temps écoulé depuis BOOT_T0."""
+    try:
+        from dashboard.display import debug as _dbg
+
+        elapsed = time.monotonic() - BOOT_T0
+        _dbg(f"  [boot+{elapsed:.1f}s] {name}")
+        return elapsed
+    except Exception:
+        return time.monotonic() - BOOT_T0
+
+
+# tiktoken — LAZY singleton (Phase 3) : get_encoding("cl100k_base") coûte
+# 1-2 s à froid (chargement BPE) et tournait 2x à l'import (ici +
+# app/protocol/mapping.py). Désormais résolu au 1er comptage ou en warmup
+# fond ; jamais sur le chemin import → listen.
+_encoding: Any = None
+_encoding_lock = threading.Lock()
+
+
+def _get_encoding() -> Any:
+    """Retourne l'encoding cl100k_base, chargé paresseusement (thread-safe)."""
+    global _encoding
+    if _encoding is None:
+        with _encoding_lock:
+            if _encoding is None:
+                try:
+                    import tiktoken
+
+                    _encoding = tiktoken.get_encoding("cl100k_base")
+                    log_boot_phase("tiktoken encoding ready (lazy)")
+                except Exception:
+                    _encoding = None
+    return _encoding
 
 # Fast monotonic ID generator — avoids /dev/urandom syscall of uuid4()
 # Used for request IDs (logging/DB keys only, not security-critical)
@@ -355,6 +388,7 @@ from dashboard.events import get_event_manager  # noqa: E402
 # Call after all imports are resolved (requires _debug for logging)
 _rebuild_key_cache()
 _debug(f"  [apikey] rebuilt alias cache: {len(_key_alias_cache)} keys")
+log_boot_phase("imports done (key cache rebuilt)")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
@@ -422,20 +456,49 @@ def _materialize_db_row(raw: "_DbRowRaw") -> tuple:
 _db_path = os.path.join(LOG_DIR, "requests.db")
 _conn = sqlite3.connect(_db_path, check_same_thread=False)
 _conn.row_factory = sqlite3.Row
-_naive_ts_count = _app_db.init_requests_schema(
+# Phase 2 chantier boot : ouverture rapide SANS scan — PRAGMAs +
+# CREATE TABLE uniquement. Les migrations ALTER + CREATE INDEX + canary
+# COUNT(*) partent en fond post-ready (_db_migrate_bg, lifespan) : sur une
+# DB ~6 Go le canary seul vaut 10-20 s sur le chemin import → listen.
+_app_db.init_requests_schema_fast(
     _conn,
     busy_timeout=yaml_get("database", "busy_timeout", 5000),
     cache_size=yaml_get("database", "cache_size", 64000),
     mmap_size=yaml_get("database", "mmap_size", 268435456),
 )
+_naive_ts_count: int | None = None  # résolu en fond par _db_migrate_bg
 _debug(f"  [db] SQLite connection established: {_db_path}")
+log_boot_phase("DB open (schema IF NOT EXISTS, no scan)")
 
-# [30] Canary: mixed naive/UTC timestamps break ORDER BY timestamp DESC (BINARY
-# collation) — warn the operator that scripts/migrate_timestamps_utc.py is pending.
-if _naive_ts_count:
-    _log(
-        f"  WARNING: {_naive_ts_count} requests row(s) with naive timestamps (mixed local/UTC) — run scripts/migrate_timestamps_utc.py"
-    )
+
+async def _db_migrate_bg() -> None:
+    """Fond post-ready : migrations ALTER + index + canary naïf (Phase 2).
+
+    Sérialisé avec le writer via _db_commit_lock (même connexion partagée).
+    Fail-soft : OperationalError → debug + warning différé au prochain boot.
+    """
+    global _naive_ts_count
+    try:
+
+        def _run() -> int:
+            with _db_commit_lock:
+                try:
+                    if _conn.in_transaction:
+                        _conn.commit()
+                except Exception:
+                    pass
+                return _app_db.migrate_and_canary(_conn)
+
+        _naive_ts_count = await asyncio.to_thread(_run)
+        # [30] Canary: mixed naive/UTC timestamps break ORDER BY timestamp
+        # DESC (BINARY collation) — warning différé, jamais sur le boot.
+        if _naive_ts_count:
+            _log(
+                f"  WARNING: {_naive_ts_count} requests row(s) with naive timestamps (mixed local/UTC) — run scripts/migrate_timestamps_utc.py"
+            )
+        log_boot_phase("db migrate+canary done (bg)")
+    except Exception as e:
+        _debug(f"  [db] migrate+canary bg FAILED: {type(e).__name__}: {e}")
 
 
 # ── Free model usage tracking ──
@@ -950,9 +1013,17 @@ _token_lock = threading.Lock()
 
 
 def _restore_token_counters():
-    """Restore in-memory token counters from SQLite on startup."""
+    """Restore in-memory token counters from SQLite on startup.
+
+    Phase 2 chantier boot : lecture sur une connexion dédiée courte (jamais
+    la connexion partagée du writer) — le writer peut insérer en parallèle
+    et le lock d'écriture n'est jamais tenu pendant le GROUP BY (~6 Go).
+    """
+    _ro = None
     try:
-        rows = _conn.execute(
+        _ro = sqlite3.connect(f"file:{_db_path}?mode=ro", uri=True, timeout=5.0)
+        _ro.row_factory = sqlite3.Row
+        rows = _ro.execute(
             "SELECT model, COALESCE(SUM(tokens_input), 0), COALESCE(SUM(tokens_output), 0),"
             "       COALESCE(SUM(tokens_cache), 0)"
             " FROM requests GROUP BY model"
@@ -975,9 +1046,39 @@ def _restore_token_counters():
     except Exception as e:
         _debug(f"  [db] restore token counters FAILED: {type(e).__name__}: {e}")
         _log(f"  Warning: Could not restore token counters: {e}")
+    finally:
+        if _ro is not None:
+            try:
+                _ro.close()
+            except Exception:
+                pass
+        global _token_counters_stale
+        _token_counters_stale = False
+        log_boot_phase("token counters restored")
 
 
-_restore_token_counters()
+# Compteurs à 0 au boot (stale) — le GROUP BY part en fond, jamais sur le
+# chemin import → listen (Phase 2 chantier boot). Défini AVANT le spawn
+# (un restore instantané sur DB vide finirait avant l'assignation sinon).
+_token_counters_stale = True
+
+
+def _restore_token_counters_async() -> None:
+    """Lance le restore compteurs en thread daemon (non-bloquant, Phase 2).
+
+    Fallback synchrone si le thread ne peut pas démarrer (sémantique exacte
+    conservée). Les compteurs valent 0 le temps du rattrapage — /usage peut
+    exposer stale:true via _token_counters_stale.
+    """
+    try:
+        threading.Thread(
+            target=_restore_token_counters, name="token-restore", daemon=True
+        ).start()
+    except Exception:
+        _restore_token_counters()
+
+
+_restore_token_counters_async()
 
 
 def _wal_checkpoint():
@@ -1153,23 +1254,35 @@ def _build_http_timeout() -> httpx.Timeout:
     )
 
 
-# Shared HTTP client (reused across requests) with connection pooling + HTTP/2 multiplex
-_transport = (
-    httpx.AsyncHTTPTransport(
-        proxy=PROXY,
-        limits=_build_http_limits(),
-        http2=True,
-        retries=0,
-    )
-    if PROXY
-    else httpx.AsyncHTTPTransport(
-        limits=_build_http_limits(),
-        http2=True,
-        retries=0,
-    )
-)
-_client = httpx.AsyncClient(transport=_transport, timeout=_build_http_timeout())
+# Shared HTTP client (reused across requests) with connection pooling + HTTP/2 multiplex.
+# [Phase 3 boot] construit LAZY (~256ms AsyncHTTPTransport http2+SSL à
+# l'import, mesuré cumulé 0.377s) : pas de construction sur le chemin
+# import → listen. _ensure_http_client() construit au 1er appel (warmup ou
+# 1re requête) et self-heal si fermé — MÊME pattern qu'avant, juste
+# différé. Les tests gardent le seam oc._client/oc._transport
+# (None jusqu'au 1er _ensure_http_client(), vivants ensuite).
+_transport: httpx.AsyncHTTPTransport | None = None
+_client: httpx.AsyncClient | None = None
 _client_lock = threading.Lock()  # [P2.4] self-heal sync + double-check (asyncio.Lock impossible depuis sync)
+
+
+def _build_shared_http_client() -> tuple[httpx.AsyncHTTPTransport, httpx.AsyncClient]:
+    """Construit le couple (transport, client) partagé upstream."""
+    _t = (
+        httpx.AsyncHTTPTransport(
+            proxy=PROXY,
+            limits=_build_http_limits(),
+            http2=True,
+            retries=0,
+        )
+        if PROXY
+        else httpx.AsyncHTTPTransport(
+            limits=_build_http_limits(),
+            http2=True,
+            retries=0,
+        )
+    )
+    return _t, httpx.AsyncClient(transport=_t, timeout=_build_http_timeout())
 
 # ── Curl TLS pool (M reusable AsyncSessions per proxy+impersonate) ──
 # [A1 perf / audit vitesse §2] L'ancien schéma « 1 session + lock global par
@@ -1181,21 +1294,49 @@ _client_lock = threading.Lock()  # [P2.4] self-heal sync + double-check (asyncio
 # (un seul emprunteur à la fois) ; les streams ne tiennent une session que
 # jusqu'aux headers, comme avant.
 
-# [P1 perf] imports curl_cffi au niveau module (une fois) au lieu d'un
-# re-import local à chaque POST/emprunt de session. NB : la CLASSE AsyncSession
-# est résolue par ATTRIBUT à l'appel (_curl_requests_mod.AsyncSession) — les
-# tests monkeypatchent l'attribut du module, un binding figé casserait ce seam.
-_curl_requests_mod: Any
-_curl_err: Any
-try:
-    import curl_cffi.requests as _curl_requests_mod
-    import curl_cffi.requests.errors as _curl_err
+# [P1 perf + Phase 3 boot] curl_cffi LAZY (~80ms : markdownify/bs4/lxml
+# transitifs via curl_cffi.requests.models→readability). L'attribut de module
+# ``_curl_requests_mod`` est conservé comme seam historique (résolu par
+# ATTRIBUT à l'appel : ``_curl_requests_mod.AsyncSession(...)``) mais rempli
+# au 1er usage réel, jamais sur le chemin import → listen. Monkeypatcher
+# ``curl_cffi.requests.AsyncSession`` (tests) continue de fonctionner :
+# _ensure_curl_cffi() préserve tout module déjà présent dans sys.modules.
+_curl_requests_mod: Any = None
+_curl_err: Any = None
+_CURL_CFFI_OK = False
+_curl_import_lock = threading.Lock()
 
-    _CURL_CFFI_OK = True
-except ImportError:
-    _curl_requests_mod = None
-    _curl_err = None
-    _CURL_CFFI_OK = False
+
+def _ensure_curl_cffi() -> bool:
+    """Importe curl_cffi au 1er besoin (pool/checkout ou garde isinstance).
+
+    Thread-safe GIL ; ne réimporte jamais un module déjà patché dans
+    ``sys.modules``. Retourne True si disponible.
+    """
+    global _curl_requests_mod, _curl_err, _CURL_CFFI_OK
+    if _CURL_CFFI_OK and _curl_requests_mod is not None:
+        return True
+    with _curl_import_lock:
+        if _CURL_CFFI_OK and _curl_requests_mod is not None:
+            return True
+        try:
+            import sys as _sys
+
+            if "curl_cffi.requests" in _sys.modules:
+                _curl_requests_mod = _sys.modules["curl_cffi.requests"]
+            else:
+                import curl_cffi.requests as _curl_requests_mod  # noqa: PLC0415
+            if "curl_cffi.requests.errors" in _sys.modules:
+                _curl_err = _sys.modules["curl_cffi.requests.errors"]
+            else:
+                import curl_cffi.requests.errors as _curl_err  # noqa: PLC0415
+            _CURL_CFFI_OK = True
+            return True
+        except ImportError:
+            _curl_requests_mod = None
+            _curl_err = None
+            _CURL_CFFI_OK = False
+            return False
 
 
 # [Phase 3 refonte] Pool curl extrait vers upstream/clients.py (pur asyncio,
@@ -1240,6 +1381,9 @@ async def _get_pooled_curl_session(proxy_url: str | None, impersonate: str):
         pool = _CurlSessionPool(_curl_pool_size())
         _curl_pool[key] = pool
     _co_t0 = time.monotonic()
+    # [Phase 3 boot] import paresseux au 1er checkout (jamais au boot).
+    if not _ensure_curl_cffi():
+        raise RuntimeError("curl_cffi non installé : pip install curl_cffi")
     slot = await pool.checkout(
         lambda: _curl_requests_mod.AsyncSession(
             impersonate=impersonate,
@@ -1311,6 +1455,10 @@ def _ensure_http_client() -> httpx.AsyncClient:
     [P2.4] threading.Lock + double vérification : fonction sync (asyncio.Lock
     impossible), deux coroutines peuvent recréer chacune un transport → le
     perdant fuirait (FD leak). Lock jamais tenu sur I/O (construction µs).
+
+    [Phase 3 boot] construction LAZY : le client n'existe pas à l'import
+    (None), il est construit ici au 1er appel — jamais sur le chemin
+    import → listen (~256ms économisées au boot).
     """
     global _client, _transport
     # fast-path sans lock
@@ -1318,22 +1466,8 @@ def _ensure_http_client() -> httpx.AsyncClient:
         return _client
     with _client_lock:
         if _client is None or getattr(_client, "is_closed", False):
-            _transport = (
-                httpx.AsyncHTTPTransport(
-                    proxy=PROXY,
-                    limits=_build_http_limits(),
-                    http2=True,
-                    retries=0,
-                )
-                if PROXY
-                else httpx.AsyncHTTPTransport(
-                    limits=_build_http_limits(),
-                    http2=True,
-                    retries=0,
-                )
-            )
-            _client = httpx.AsyncClient(transport=_transport, timeout=_build_http_timeout())
-            _debug("[http] shared upstream client re-created (was closed)")
+            _transport, _client = _build_shared_http_client()
+            _debug("[http] shared upstream client (re-)created")
     return _client
 
 
@@ -1801,28 +1935,36 @@ _response_cache = _ResponseCache(debug_fn=_debug, dumps_str_fn=_json_dumps_str)
 @asynccontextmanager
 async def lifespan(app):
     _debug("  [lifespan] app starting")
+    log_boot_phase("lifespan entered")
+    # Phase 0 : drapeau readiness (Phase 1 → Event + degraded dict réel).
+    app.state._boot_ready = False
+    app.state._boot_degraded = {"boot": "lifespan running"}
     # Restore persisted key pause state from disk
     _key_pauser.load(API_KEYS)
 
     # Start background quota fetcher (no-op if env vars not set)
     await start_quota_fetcher(app)
 
-    # Toggle "Use Balance" on for all workspaces (non-bloquant, 6s max)
-    try:
-        from dashboard import toggle_use_balance_all
-
+    # Toggle "Use Balance" — fond (Phase 1) : les 6 s séquentielles ne
+    # bloquent plus le yield ; le Gate des quotas reste fail-soft.
+    async def _balance_bg():
         try:
-            balance_results = await asyncio.wait_for(toggle_use_balance_all(), timeout=6.0)
-        except TimeoutError:
-            _debug("  [lifespan] use-balance toggle timeout (6s) — non-bloquant")
-            balance_results = {}
-        if balance_results:
-            ok = sum(1 for v in balance_results.values() if v)
-            _debug(
-                f"  [lifespan] use-balance toggle: {ok}/{len(balance_results)} workspaces enabled"
-            )
-    except Exception as e:
-        _debug(f"  [lifespan] use-balance toggle failed: {e}")
+            from dashboard import toggle_use_balance_all
+
+            try:
+                balance_results = await asyncio.wait_for(toggle_use_balance_all(), timeout=6.0)
+            except TimeoutError:
+                _debug("  [lifespan] use-balance toggle timeout (6s) — non-bloquant")
+                balance_results = {}
+            if balance_results:
+                ok = sum(1 for v in balance_results.values() if v)
+                _debug(
+                    f"  [lifespan] use-balance toggle: {ok}/{len(balance_results)} workspaces enabled"
+                )
+        except Exception as e:
+            _debug(f"  [lifespan] use-balance toggle failed: {e}")
+
+    app.state._balance_task = asyncio.create_task(_balance_bg())
 
     # Register recovery callback: unpause API keys when workspace returns to ok
     from dashboard.quota import set_on_workspace_recovered_callback
@@ -1831,16 +1973,25 @@ async def lifespan(app):
     _debug("  [lifespan] workspace recovery callback registered")
 
     # ── Docker Desktop auto-launch (Windows) ───────────────────────────
-    # User request: if Docker Desktop is not running after a reboot, the proxy
-    # must launch it — otherwise 5 stations stay `disconnected`.
-    try:
-        # [Phase 6] chemin historique (shim) : import par appel.
-        from vpn_manager import ensure_docker_running
+    # Phase 1 : sonde + lancement en fond — le yield n'attend plus les 65 s
+    # du cold-start Docker. Gate via shared_state.docker_ready (None = en
+    # cours, True/False = résolu), consommé par _boot_fanout.
+    async def _docker_ensure_bg():
+        import shared_state as _ss
 
-        ok = await asyncio.wait_for(ensure_docker_running(timeout=60), timeout=65)
-        _debug(f"  [lifespan] docker daemon ready={ok}")
-    except Exception as e:
-        _debug(f"  [lifespan] docker ensure failed (fail-soft): {e}")
+        _ss.docker_ready = None
+        try:
+            # [Phase 6] chemin historique (shim) : import par appel.
+            from vpn_manager import ensure_docker_running
+
+            ok = await asyncio.wait_for(ensure_docker_running(timeout=60), timeout=65)
+            _ss.docker_ready = bool(ok)
+            _debug(f"  [lifespan] docker daemon ready={ok} (bg)")
+        except Exception as e:
+            _ss.docker_ready = False
+            _debug(f"  [lifespan] docker ensure failed (fail-soft, bg): {e}")
+
+    app.state._docker_task = asyncio.create_task(_docker_ensure_bg())
 
     # warm-avalanche: sync déterministe control_api_key → credentials.env avant tout compose up (Q3 C fail-closed)
     try:
@@ -1983,20 +2134,28 @@ async def lifespan(app):
     # or containers booted on the stale stack (the 19/08 case). Remove them
     # NOW so start() recreates the fleet exactly as configured; fail-soft
     # (a broken docker daemon must not block boot — start() handles it).
-    try:
+    # [plan 18/08 §2.2] Boot reconcile — Phase 1 : fond. L'ordre historique
+    # reconcile → start est préservé DANS _boot_fanout (gate sur
+    # shared_state.reconcile_task), pas dans le lifespan.
+    async def _reconcile_bg():
         global _RECONCILE_DONE_THIS_PROCESS
-        # [Phase 6] chemin historique (shim) : import par appel.
-        from vpn_manager import reconcile_orphan_containers
+        try:
+            # [Phase 6] chemin historique (shim) : import par appel.
+            from vpn_manager import reconcile_orphan_containers
 
-        if _RECONCILE_DONE_THIS_PROCESS:
-            _debug("  [lifespan] boot reconcile skipped (in-process restart — containers are ours)")
-        else:
-            _removed = await reconcile_orphan_containers(_managers)
+            if _RECONCILE_DONE_THIS_PROCESS:
+                _debug("  [lifespan] boot reconcile skipped (in-process restart — containers are ours)")
+                return []
+            removed = await reconcile_orphan_containers(_managers)
             _RECONCILE_DONE_THIS_PROCESS = True
-            if _removed:
-                _debug(f"  [lifespan] boot reconcile removed: {_removed}")
-    except Exception as e:
-        _debug(f"  [lifespan] boot reconcile failed (fail-soft): {e}")
+            if removed:
+                _debug(f"  [lifespan] boot reconcile removed: {removed}")
+            return removed
+        except Exception as e:
+            _debug(f"  [lifespan] boot reconcile failed (fail-soft, bg): {e}")
+            return []
+
+    shared_state.reconcile_task = asyncio.create_task(_reconcile_bg())
     # Start every enabled station in PARALLEL (multi-station would otherwise
     # serialize the cold-start: station N waits for station 1's full
     # compose-up). Each start() is fail-soft internally (docker down/logs a
@@ -2015,44 +2174,72 @@ async def lifespan(app):
                 _debug(f"  [lifespan] WARN boot station start raised: {_e!r}")
             await asyncio.sleep(_boot_stagger_s())
 
-    _gather_results = await asyncio.gather(
-        *(_start_one(m) for m in _managers if m.enabled), return_exceptions=True
-    )
-    for _r in _gather_results:
-        if isinstance(_r, Exception):
-            _debug(f"  [lifespan] WARN boot station start raised: {_r!r}")
-    # boot garde: 1/4 vs 4/4 visible même si 0 tunnel
-    try:
-        _n_expected = resolved_station_count(IP_ROTATION) if IP_ROTATION.get("enabled") else len(_managers)  # noqa: F821
-        # [graceful-aurora] up = connected + degraded.
-        _connected = sum(1 for _m in _managers if str(getattr(_m, "_status", None) or getattr(_m, "status", None) or "") in ("connected", "degraded"))
-        if _connected < _n_expected and IP_ROTATION.get("enabled"):
-            _msg = f"boot { _connected}/{_n_expected}: expected {_n_expected}, connected {_connected} — reconcile/pool"
-            _debug(f"  CRITICAL: {_msg}")
-            shared_state.boot_error = _msg
-        else:
-            shared_state.boot_error = None
-    except Exception as _e:
-        _debug(f"  [lifespan] boot_error compute failed: {_e}")
-        shared_state.boot_error = None
-    # [plan] C: docker event watcher — real-time container lifecycle → per-
-    # station watchdog wake + SSE vpn_event. Fail-open: if docker is missing
-    # or the stream dies, the watchdogs keep their interval pacing and the
-    # dashboard its 10 s poll — never breaks a request.
+    # Phase 1 : fan-out stations en fond — le lifespan rend la main
+    # immédiatement après les create_task ; /healthz répond pendant que les
+    # stations démarrent. L'ordre historique reconcile → start est préservé
+    # ici (attente reconcile_task), ainsi que le gate docker_ready.
+    async def _boot_fanout():
+        try:
+            _reconcile_handle = getattr(shared_state, "reconcile_task", None)
+            if _reconcile_handle is not None:
+                try:
+                    await _reconcile_handle
+                except Exception as _e_rec:
+                    _debug(f"  [lifespan] reconcile gate failed (fail-soft, bg): {_e_rec}")
+            # Gate docker : rend la main dès que docker_ready est résolu
+            # (None = ensure encore en cours → on attend en fond, pas au yield).
+            for _ in range(600):
+                if getattr(shared_state, "docker_ready", None) is not None:
+                    break
+                await asyncio.sleep(1.0)
+            _gather_results = await asyncio.gather(
+                *(_start_one(m) for m in _managers if m.enabled), return_exceptions=True
+            )
+            for _r in _gather_results:
+                if isinstance(_r, Exception):
+                    _debug(f"  [lifespan] WARN boot station start raised: {_r!r}")
+            # boot garde: 1/4 vs 4/4 visible même si 0 tunnel
+            try:
+                _n_expected = resolved_station_count(IP_ROTATION) if IP_ROTATION.get("enabled") else len(_managers)  # noqa: F821
+                # [graceful-aurora] up = connected + degraded.
+                _connected = sum(1 for _m in _managers if str(getattr(_m, "_status", None) or getattr(_m, "status", None) or "") in ("connected", "degraded"))
+                if _connected < _n_expected and IP_ROTATION.get("enabled"):
+                    _msg = f"boot { _connected}/{_n_expected}: expected {_n_expected}, connected {_connected} — reconcile/pool"
+                    _debug(f"  CRITICAL: {_msg}")
+                    shared_state.boot_error = _msg
+                else:
+                    shared_state.boot_error = None
+            except Exception as _e:
+                _debug(f"  [lifespan] boot_error compute failed: {_e}")
+                shared_state.boot_error = None
+        except Exception as _e_fanout:
+            _debug(f"  [lifespan] _boot_fanout failed (fail-soft): {_e_fanout}")
+
+    shared_state.boot_fanout_task = asyncio.create_task(_boot_fanout())
+
+    # [plan] C: docker event watcher — Phase 1 : start en fond. Fail-open :
+    # if docker is missing or the stream dies, the watchdogs keep their
+    # interval pacing and the dashboard its 10 s poll — never breaks a request.
     shared_state.docker_event_watcher = None
-    if IP_ROTATION.get("docker_events", True) and _managers:
+
+    async def _watcher_start_bg():
+        if not (IP_ROTATION.get("docker_events", True) and _managers):
+            return
         from docker_events import DockerEventWatcher
 
         try:
             _watcher = DockerEventWatcher({m._docker_container: m for m in _managers})
-            await _watcher.start()
+            _watcher_started = _watcher.start()
+            await _watcher_started
             shared_state.docker_event_watcher = _watcher
             _debug(
-                f"  [lifespan] docker event watcher started ({len(_watcher._managers)} containers)"
+                f"  [lifespan] docker event watcher started ({len(_watcher._managers)} containers, bg)"
             )
         except Exception as e:
-            _debug(f"  [lifespan] docker event watcher failed to start: {e}")
+            _debug(f"  [lifespan] docker event watcher failed to start (bg): {e}")
             shared_state.docker_event_watcher = None
+
+    app.state._watcher_task = asyncio.create_task(_watcher_start_bg())
     # [plan v2 auto-sync] boot derive — mirrors _apply_station_count strict order
     # shared_state → pool.set_stations already done; watcher started; now derive
     try:
@@ -2366,7 +2553,16 @@ async def lifespan(app):
     _db_writer_task = asyncio.create_task(_db_writer_loop())
     _debug("  [lifespan] DB writer loop started (queue batch 32, 50ms)")
 
+    # Phase 2 chantier boot : migrations ALTER + index + canary COUNT(*) en
+    # fond post-ready — jamais sur le chemin import → listen (DB ~6 Go).
+    app.state._db_migrate_task = asyncio.create_task(_db_migrate_bg())
+    _debug("  [lifespan] DB migrate+canary task started (bg)")
+
+    log_boot_phase("lifespan pre-yield done — about to listen")
+    app.state._boot_ready = True
+    app.state._boot_degraded = {}
     yield
+    app.state._boot_ready = False
 
     _debug("  [lifespan] app shutting down")
     # Drain DB queue via writer before flush
@@ -2381,7 +2577,28 @@ async def lifespan(app):
     await asyncio.to_thread(_db_flush)
     _debug("  [lifespan] final DB flush done")
 
-    # Cancel background tasks
+    # Cancel background tasks (Phase 1 : warmup + loops — borné, pas de
+    # "task destroyed pending").
+    for _bg_attr in ("_balance_task", "_docker_task", "_watcher_task", "_db_migrate_task"):
+        _bg = getattr(app.state, _bg_attr, None)
+        if _bg is not None:
+            _bg.cancel()
+            try:
+                await asyncio.wait_for(asyncio.shield(_bg), timeout=5.0)
+            except (asyncio.CancelledError, TimeoutError):
+                pass
+            except Exception:
+                pass
+    for _ss_attr in ("reconcile_task", "boot_fanout_task"):
+        _bg = getattr(shared_state, _ss_attr, None)
+        if _bg is not None:
+            _bg.cancel()
+            try:
+                await asyncio.wait_for(asyncio.shield(_bg), timeout=5.0)
+            except (asyncio.CancelledError, TimeoutError):
+                pass
+            except Exception:
+                pass
     checkpoint_task.cancel()
     db_flush_task.cancel()
     key_pause_cleanup_task.cancel()
@@ -2442,7 +2659,12 @@ async def lifespan(app):
         except asyncio.CancelledError:
             pass
         _debug("  [lifespan] free-discovery task cancelled")
-    await _client.aclose()
+    _local_client = _client
+    if _local_client is not None:
+        try:
+            await _local_client.aclose()
+        except Exception:
+            pass
     _debug("  [lifespan] HTTP client closed")
     try:
         await _close_curl_pool()
@@ -2465,6 +2687,52 @@ async def lifespan(app):
 
 
 app = FastAPI(lifespan=lifespan)
+
+
+# ── Boot probes (Phase 1 — définitives) ──
+# /healthz = liveness pure (jamais I/O ni DB) ; /readyz = readiness warmup ;
+# /startupz = temps écoulé depuis BOOT_T0.
+@app.get("/healthz")
+async def healthz():
+    return {"status": "ok", "boot_s": round(time.monotonic() - BOOT_T0, 2)}
+
+
+@app.get("/readyz")
+async def readyz():
+    # Phase 1 définitive : ready quand le yield est passé ET que les gates
+    # de fond sont résolues ; degraded reflète l'état réel (jamais 503
+    # global — X-Degraded: warming pendant le warmup).
+    try:
+        import shared_state as _ss
+
+        docker = getattr(_ss, "docker_ready", None)
+        fanout = getattr(_ss, "boot_fanout_task", None)
+        fanout_done = fanout is None or bool(getattr(fanout, "done", lambda: True)())
+    except Exception:
+        docker, fanout_done = None, False
+    degraded = {}
+    if docker is None:
+        degraded["docker"] = "warming"
+    elif docker is False:
+        degraded["docker"] = "unavailable"
+    if not fanout_done:
+        degraded["vpn"] = "starting"
+    ready = bool(getattr(app.state, "_boot_ready", False)) and not degraded
+    headers = {}
+    if not ready and not degraded:
+        degraded = dict(getattr(app.state, "_boot_degraded", {}) or {"boot": "lifespan running"})
+    if not ready:
+        headers["X-Degraded"] = "warming"
+    return JSONResponse(
+        status_code=200,
+        content={"ready": ready, "degraded": degraded, "boot_s": round(time.monotonic() - BOOT_T0, 2)},
+        headers=headers,
+    )
+
+
+@app.get("/startupz")
+async def startupz():
+    return {"boot_s": round(time.monotonic() - BOOT_T0, 2), "ready": bool(getattr(app.state, "_boot_ready", False))}
 
 
 # ── Traffic Capture (Wireshark-like raw request view) ──────────────
@@ -3919,7 +4187,7 @@ def _is_connect_error(e: Exception) -> bool:
     on HTTP responses — 429/5xx are not exceptions on this path
     (raise_for_status is False).
     """
-    if not isinstance(e, _curl_err.RequestsError):
+    if _curl_err is None or not isinstance(e, _curl_err.RequestsError):
         return False
     try:
         code = int(getattr(e, "code", 0))
@@ -3979,7 +4247,7 @@ async def _do_free_request_curl_cffi(
     egresses this request must be the one whose fingerprint is stamped).
     Returns an httpx-like response object for compatibility.
     """
-    if not _CURL_CFFI_OK:
+    if not _ensure_curl_cffi():
         raise RuntimeError("curl_cffi non installé : pip install curl_cffi")
 
     # Strip paid-account artifacts, stamp the identity (bundle UA wins)
@@ -4044,7 +4312,11 @@ async def _do_free_request_curl_cffi(
             # (fire-and-forget) ferme la session hors de la tâche annulée.
             _evict_later(pool, slot)
             raise
-        except _curl_err.RequestsError as e:
+        except Exception as e:
+            # NB : pas de `except _curl_err.RequestsError` — _curl_err est lazy
+            # (None tant que _ensure_curl_cffi() n'a jamais réussi) et une
+            # classe d'exception dynamique est interdite en `except`. Le test
+            # RequestsError passe par _is_connect_error (garde None incluse).
             # [plan 18/08 §1a] a REAL connection failure (dead SOCKS5 tunnel)
             # is invisible to the pool — the station stays "connected" and
             # every request re-strikes it. Signal the pool+manager
@@ -4060,10 +4332,6 @@ async def _do_free_request_curl_cffi(
             await pool.evict(slot)
             last_exc = e
             continue  # try next proxy (HTTP fallback)
-        except Exception as e:
-            await pool.evict(slot)
-            last_exc = e
-            continue
         # Wrap in a compatible response object
         await pool.checkin(slot)
         return _CurlCffiResponse(resp)
@@ -8160,7 +8428,7 @@ def _estimate_input_tokens(body: dict) -> int:
     """Estimate input tokens from message content, tools, and tool_results."""
     return _estimate_input_tokens_impl(
         body,
-        encoding=_encoding,
+        encoding=_get_encoding(),
         extract_fn=_extract_text,
         debug_fn=_debug,
         log_fn=_log,
@@ -10614,6 +10882,9 @@ async def list_models():
                         "input": usage.get("input", 0),
                         "output": usage.get("output", 0),
                         "cache": usage.get("cache", 0),
+                        # Phase 2 chantier boot : compteurs à 0 le temps du
+                        # rattrapage GROUP BY en fond sur grosse DB.
+                        "stale": bool(_token_counters_stale),
                     },
                 }
             )
@@ -13577,6 +13848,7 @@ class ServerManager:
                     break
             self.is_running = True
             _debug(f"  [server] started on {self.host}:{self.port}")
+            log_boot_phase(f"server started (listening {self.host}:{self.port})")
 
     def stop(self, timeout=10):
         """Graceful stop: signal uvicorn to stop, then wait for in-flight requests."""
@@ -13686,6 +13958,7 @@ if __name__ == "__main__":
         pass  # SIGTERM not available on Windows
 
     mgr.start()
+    log_boot_phase("server listen confirmed (__main__)")
 
     _log(f"API: http://localhost:{PORT}")
 

@@ -292,13 +292,15 @@ _INSERT_FREE_USAGE_SQL = (
 )
 
 
-def init_requests_schema(
+def init_requests_schema_fast(
     conn: sqlite3.Connection, *, busy_timeout: int, cache_size: int, mmap_size: int
-) -> int:
-    """PRAGMAs WAL/NORMAL + schéma requests + migrations colonnes + index.
+) -> None:
+    """Boot rapide (Phase 2 chantier boot) : PRAGMAs WAL/NORMAL + CREATE TABLE.
 
-    Retourne le nombre de rows à timestamps naïfs ([30] canary — l'appelant
-    avertit l'opérateur que scripts/migrate_timestamps_utc.py est à lancer).
+    SANS migrations ALTER, SANS CREATE INDEX, SANS canary COUNT(*) — aucun
+    full scan sur le chemin import → listen (DB ~6 Go : le canary seul vaut
+    10-20 s). Les migrations + index + canary partent en fond post-ready via
+    :func:`migrate_and_canary`.
     """
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute(f"PRAGMA busy_timeout={busy_timeout}")
@@ -307,6 +309,16 @@ def init_requests_schema(
     conn.execute("PRAGMA temp_store=MEMORY")  # temp tables in RAM
     conn.execute(f"PRAGMA mmap_size={mmap_size}")  # memory-mapped I/O
     conn.execute(_SCHEMA_REQUESTS)
+    conn.commit()
+
+
+def migrate_and_canary(conn: sqlite3.Connection) -> int:
+    """Post-ready (fond) : migrations ALTER + CREATE INDEX + canary naïf.
+
+    Retourne le nombre de rows à timestamps naïfs ([30] canary — l'appelant
+    avertit l'opérateur que scripts/migrate_timestamps_utc.py est à lancer).
+    L'appelant détient le lock writer (concurrence avec le writer loop).
+    """
     for col, default in _REQUEST_COLUMN_MIGRATIONS:
         try:
             conn.execute(f"ALTER TABLE requests ADD COLUMN {col} TEXT DEFAULT {default}")
@@ -335,6 +347,22 @@ def init_requests_schema(
     except Exception:
         naive = 0
     return naive
+
+
+def init_requests_schema(
+    conn: sqlite3.Connection, *, busy_timeout: int, cache_size: int, mmap_size: int
+) -> int:
+    """PRAGMAs WAL/NORMAL + schéma requests + migrations colonnes + index.
+
+    Wrapper synchrone historique (contrat tests/test_phase0_contracts.py :
+    retourne int) = fast + migrate_and_canary en une fois. Le boot, lui,
+    appelle :func:`init_requests_schema_fast` puis :func:`migrate_and_canary`
+    en tâche de fond.
+    """
+    init_requests_schema_fast(
+        conn, busy_timeout=busy_timeout, cache_size=cache_size, mmap_size=mmap_size
+    )
+    return migrate_and_canary(conn)
 
 
 def init_free_usage_schema(conn: sqlite3.Connection) -> None:

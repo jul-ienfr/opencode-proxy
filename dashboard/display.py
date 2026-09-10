@@ -9,11 +9,31 @@ import sys
 import threading
 import time
 
-from rich import box
-from rich.console import Group
-from rich.live import Live
-from rich.panel import Panel
-from rich.table import Table
+# [Phase 3 boot] rich est LAZY (~18ms rich.console au boot) : le terminal
+# display ne sert qu'en mode GUI/terminal (jamais --no-gui). Les symboles
+# box/Group/Live/Panel/Table sont résolus à l'appel via _rich() — l'import
+# de ce module ne tire plus rich tout seul.
+_RICH_MODS: dict[str, object] = {}
+
+
+def _rich(name: str):
+    """Import paresseux d'un symbole rich (cache, thread-safe GIL)."""
+    mod = _RICH_MODS.get(name)
+    if mod is None:
+        if name == "box":
+            from rich import box as mod
+        elif name == "Group":
+            from rich.console import Group as mod
+        elif name == "Live":
+            from rich.live import Live as mod
+        elif name == "Panel":
+            from rich.panel import Panel as mod
+        elif name == "Table":
+            from rich.table import Table as mod
+        else:  # pragma: no cover - garde-fou
+            raise ImportError(f"rich symbol inconnu: {name}")
+        _RICH_MODS[name] = mod
+    return mod
 
 import config.settings as _cfg_settings
 
@@ -271,6 +291,10 @@ class RichLogHandler(logging.Handler):
 
 
 def build_display(routes, token_usage, token_lock):
+    Table = _rich("Table")
+    box = _rich("box")
+    Group = _rich("Group")
+    Panel = _rich("Panel")
     table = Table(
         box=box.SIMPLE, show_header=True, header_style="bold cyan", pad_edge=False, expand=False
     )
@@ -456,6 +480,7 @@ def start_input_thread():
 
 def run_terminal_loop(routes, token_usage, token_lock):
     global _display_dirty
+    Live = _rich("Live")
     stop = start_input_thread()
     try:
         with Live(

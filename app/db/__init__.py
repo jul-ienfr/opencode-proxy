@@ -41,6 +41,7 @@ from observability.db import (
     flush,
     init_free_usage_schema,
     init_requests_schema,
+    init_requests_schema_fast,
     insert_sync,
     materialize_db_row,
     normalize_timestamp_utc,
@@ -59,6 +60,9 @@ from observability.db import (
 from observability.db import (
     log_free_usage as log_free_usage,
 )
+from observability.db import (
+    migrate_and_canary as migrate_and_canary,
+)
 
 __all__ = [
     "DB_RAW_SIZE_CAP",
@@ -71,6 +75,8 @@ __all__ = [
     "flush",
     "init_free_usage_schema",
     "init_requests_schema",
+    "init_requests_schema_fast",
+    "migrate_and_canary",
     "insert_sync",
     "materialize_db_row",
     "normalize_timestamp_utc",

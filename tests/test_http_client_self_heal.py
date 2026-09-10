@@ -88,8 +88,11 @@ async def test_ensure_http_client_recreates_after_close(monkeypatch):
     """The incident scenario, direct, with a REAL httpx client: after the
     module client is aclose()d, the helper must swap in a fresh live one."""
     monkeypatch.setattr(oc, "_debug", lambda *a, **k: None)
-    original = oc._client  # real module-global AsyncClient (constructed at import)
+    # [Phase 3 boot] client construit LAZY : _ensure_http_client() le crée
+    # au 1er appel au lieu de l'import — le seam oc._client reste vivant.
+    original = oc._ensure_http_client()
     assert original is not None and not original.is_closed
+    assert oc._client is original
 
     await original.aclose()
     assert original.is_closed, "precondition: client must be closed"
