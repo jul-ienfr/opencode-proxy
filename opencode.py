@@ -6195,8 +6195,18 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
         else:
             free_body = _chat_to_responses_request({**body, "model": free_model})
     else:
-        free_body = dict(body)
-        free_body["model"] = free_model
+        if protocol == "anthropic":
+            # [Parité protocole — défaut mesuré, lot L1/P1] Le client parle
+            # Anthropic mais l'endpoint free parle Chat. Sans conversion, le
+            # corps partait verbatim : un endpoint Chat ne lit pas le `system`
+            # top-level (system prompt PERDU) ni `tools[].input_schema`
+            # (attendu : `tools[].function.parameters`) — et la réponse Chat
+            # `choices` était rendue telle quelle à un client Anthropic.
+            _conv_body = anthropic_to_openai({**body, "model": free_model}, free_model)
+            free_body = {k: v for k, v in _conv_body.items() if k != _HAS_SYNTHETIC_REASONING_KEY}
+        else:
+            free_body = dict(body)
+            free_body["model"] = free_model
     # [tool-names ≤64] strip de la clé privée AVANT tout envoi wire : la map
     # est conservée pour le restore-retour, jamais sérialisée à l'upstream.
     _tool_name_map = free_body.pop(_TOOL_NAME_MAP_KEY, None)
@@ -6647,6 +6657,29 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
             return wrapped, resp_headers, free_model, free_ip
         except Exception as e:
             _debug(f"  [free] /responses conversion failed: {e}")
+
+    if not _free_is_responses and protocol == "anthropic" and resp.status_code == 200:
+        # [Parité protocole — défaut mesuré, lot L1/P1] Symétrique de la
+        # conversion d'aller : l'endpoint free parle Chat, le client parle
+        # Anthropic. Sans ce bloc, la réponse Chat (`choices`) était rendue
+        # verbatim au client Anthropic sous un HTTP 200 — ni `content`, ni
+        # `stop_reason`, ni `usage.input_tokens`.
+        try:
+            rdata = resp.json()
+            cdata = openai_to_anthropic(rdata, free_model, _tool_name_map)
+            wrapped = _CurlCffiResponse.__new__(_CurlCffiResponse)
+            wrapped._resp = resp._resp if hasattr(resp, "_resp") else resp
+            wrapped.status_code = 200
+            wrapped.headers = dict(resp.headers)
+            wrapped._converted = cdata
+            wrapped.json = lambda: cdata
+            # [C3 perf] un seul dump : content (bytes) puis text = decode()
+            _c3_bytes = _json_dumps(cdata)
+            wrapped.content = _c3_bytes
+            wrapped.text = _c3_bytes.decode()
+            return wrapped, resp_headers, free_model, free_ip
+        except Exception as e:
+            _debug(f"  [free] chat→anthropic conversion failed: {e}")
 
     tokens_in = tokens_out = 0
     if resp.status_code == 200:
