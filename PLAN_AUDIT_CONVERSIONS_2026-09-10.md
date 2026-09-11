@@ -1,6 +1,8 @@
 # PLAN — Audit & complétion des conversions de protocole (effort · contexte · raisonnement · cache · tools · documents)
 
-Date : 2026-09-10. Statut : proposition, aucun code modifié.
+Date : 2026-09-10. Statut : **exécuté** — les 16 lots (L0→L16) sont traités ; l'état
+final, les écarts actés et les points encore ouverts sont en §11.9/§11.10. Le
+correctif **A8** a été livré après coup par le lot L4 (voir §11.9).
 Périmètre : `opencode.py` (13 225 l., 213 defs), `app/protocol/mapping.py` (3 398 l.), `protocol_mapping.py` (shim ADR-006), `config/effort_caps.py`, `protocol/tokens.py`, `streaming/sse.py`, `docs/conversion-matrix.md`, `docs/v1-response-golden/`, `scripts/gen_golden_fixtures.py`, `tests/`.
 
 Règle du plan : **aucun correctif avant la fin du Lot 1** (matrice de vérité). On prouve d'abord, on patche ensuite.
@@ -139,13 +141,16 @@ Préservation `cache_control` au niveau `tools[]` (P2) ; `test_cache_contract.py
 **L4 — Tools & documents : matrice complète** *(1,5 j)* — traite A9 — **PARTIELLEMENT TERMINÉ**
 `test_tools_matrix.py` + `test_documents_matrix.py` : pour les 6 chemins — `tools[]`/`tool_choice`/`strict`/nom long/`input_schema` invalide, puis `document` (base64 PDF, URL, `file_id`, texte), image, et `tool_result` portant document/image. Chaque perte silencieuse est soit corrigée, soit **déclarée** dans `docs/conversion-matrix.md` (la ligne « PERDU silencieusement » pour l'image est à mettre à jour).
 
-*Livré* : **`tests/test_tools_matrix.py`** (25 cas — axes `tools[]`,
-`tool_choice` nommé, `strict`, nom long, `input_schema` invalide × les 6 chemins).
+*Livré* : **`tests/test_tools_matrix.py`** (**30 cas** — axes `tools[]`,
+`tool_choice` nommé, `strict`, nom long, `input_schema` invalide × les 6 chemins,
+dont les 7 tests A8 (5 `test_a8_*`, l'axe P2 renommé, la réversibilité)).
 Le volet documents est couvert par **`tests/test_documents_contract.py`** (dont les
 2 verrous A25) plutôt que par un `test_documents_matrix.py` séparé — le
 regroupement est assumé, le contenu du plan est couvert.
-**Reste ouvert** : l'écart **A8 résiduel** (nom d'outil > 64 vers une cible Chat
-sur P2), déclaré et marqué `xfail(strict=True)` dans la matrice : cf. §11.9.
+**Plus rien d'ouvert sur cet axe** : l'écart **A8 résiduel** (nom d'outil > 64
+vers une cible Chat sur P2) a été **corrigé par le lot L4**. L'ancien
+`xfail(strict=True)` qui le portait a été levé — il est passé en XPASS au câblage
+de la sanitize, ce qui a forcé la correction du marqueur : cf. §11.9.
 
 **L5 — Streaming incrémental `/v1/responses`** *(2 j)* — traite A11, A12
 Émettre les vrais événements Responses (`response.created`, `output_item.added`, `output_text.delta`, `reasoning_summary_text.delta`, `function_call_arguments.delta`, `output_item.done`, `response.completed` avec `usage`) pour P5/P6, en dérivant des deltas chat/Anthropic déjà consommés. `test_responses_stream_contract.py` : ordre contractuel, un delta par fragment, usage final, `err_stream` gardant un terminal cohérent. À faire **après** L2/L3 (mêmes zones de `opencode.py`).
@@ -156,13 +161,13 @@ sur P2), déclaré et marqué `xfail(strict=True)` dans la matrice : cf. §11.9.
 **L7 — E2E & corpus** *(1,5 j)* — V3, V4 — **TERMINÉ**
 `test_e2e_protocol_matrix.py` : 6 chemins × stream/non-stream avec capture du corps amont + corpus round-trip. Inclut les sous-chemins free-model et failover sur P2 stream et P4 stream.
 
-*État final* : 26 fonctions → **34 cas collectés**, **tous verts** (les 3 cas
+*État final* : 27 fonctions → **35 cas collectés**, **tous verts** (les 3 cas
 P4-stream sont désormais de **simples tests de régression** : A24 est corrigée,
 les marqueurs `xfail(strict=True)` ont été **retirés**), plus les 5 verrous
-`test_l13_*` ajoutés par le lot L13. Suite complète hors
-`docker` : `1966 passed, 1 skipped, 23 deselected, 1 xfailed` — **`GATE OK`,
-exit 0** (chiffres du dernier passage de `scripts/gate.ps1` ; le `1 xfailed` est
-l'écart A8 résiduel déclaré, voir §11.9). Écart au texte du
+`test_l13_*` ajoutés par le lot L13 et le test de restauration A8 en streaming.
+Suite complète hors `docker` : **`GATE OK`, exit 0**, et **aucun `xfail`** — le
+dernier portait l'écart A8, désormais corrigé (voir §11.9) ; chiffres exacts du
+dernier passage en §8 du rapport. Écart au texte du
 plan, à acter : le corpus V4 est **embarqué dans le fichier de test**
 (`CORPUS_TEXT/TOOLS/IMAGES/DOCUMENTS/REASONING`), il n'existe pas de
 `tests/fixtures/protocol_corpus/`. Couverture : 5 cas de corpus × 2 chemins
@@ -359,7 +364,7 @@ Source : [litellm/llms/anthropic/chat/transformation.py](https://raw.githubuserc
 
 **Legacy conserve en shim, `adaptive` en tete** (l.1251-1286) : `type="adaptive"` est la voie moderne, `type="enabled"` + `budget_tokens` le repli de compatibilite — l'inverse exact de ce que fait notre proxy (A14).
 
-**Noms d'outils** : la référence API Anthropic donne `tool_use.name` en `maxLength: 200, minLength: 1` et **sans restriction de charset** (seul `tool_use.id` est contraint à `^[a-zA-Z0-9_-]+$`) ; LiteLLM cite pour sa part `^[a-zA-Z0-9_-]{1,128}$`. Dans tous les cas la limite Anthropic est **supérieure** aux 64 caractères d'OpenAI : le sanitize ne se justifie donc que **vers** OpenAI/Responses, jamais vers Anthropic. LiteLLM construit une **forward map par requête (original → sanitize)** parce qu'un sanitize naif est *lossy* : `foo/bar` et `foo_bar` se replieraient tous deux sur `foo_bar`, provoquant soit un 400 (doublon), soit une **mauvaise traduction retour** (restaurer `foo_bar` vers `foo/bar` alors que l'appelant avait reellement enregistre `foo_bar`). Notre sanitize par hachage doit etre verifie sur ce cas precis (A8).
+**Noms d'outils** : la référence API Anthropic donne `tool_use.name` en `maxLength: 200, minLength: 1` et **sans restriction de charset** (seul `tool_use.id` est contraint à `^[a-zA-Z0-9_-]+$`) ; LiteLLM cite pour sa part `^[a-zA-Z0-9_-]{1,128}$`. Dans tous les cas la limite Anthropic est **supérieure** aux 64 caractères d'OpenAI : le sanitize ne se justifie donc que **vers** OpenAI/Responses, jamais vers Anthropic. LiteLLM construit une **forward map par requête (original → sanitize)** parce qu'un sanitize naif est *lossy* : `foo/bar` et `foo_bar` se replieraient tous deux sur `foo_bar`, provoquant soit un 400 (doublon), soit une **mauvaise traduction retour** (restaurer `foo_bar` vers `foo/bar` alors que l'appelant avait reellement enregistre `foo_bar`). Notre sanitize par hachage devait etre verifie sur ce cas precis (A8) : **c'est fait** — `test_protocol_matrix.py::test_axis_tool_name_roundtrip_is_identity` (paramétré, notamment sur `name/with/slashes` et `outil.avec.points`) verrouille l'invariant « sanitize puis restore == nom d'origine », et `test_tool_name_sanitization.py::TestCollision` couvre le cas de collision. La map étant construite **par requête**, la mauvaise traduction retour est empêchée par construction.
 
 ### 9.7 Différé — corrigé en hotfix le 2026-09-10
 
@@ -434,9 +439,9 @@ paramétrés.
 | **L5** | A11, A21 | **Streaming Responses réellement incrémental** (voir §11.2) | `test_responses_stream_contract.py` (**49**) |
 | **L14** | A17, B2 | `max_completion_tokens` (voir §11.3) | `test_max_completion_tokens.py` (**34**) |
 | **L15** | B5, B6, B7, B8 | Relais `store`/`truncation` ; conformité shapes multimodales | `test_responses_conformance_l15.py` (**27**) |
-| **L7** | **A24**, **A25** | P4-stream ne renvoie plus 0 octet (A24) ; nom de fichier des documents plus perdu (A25) | `test_e2e_protocol_matrix.py` (**34**), `test_documents_contract.py` (**17**) |
+| **L7** | **A24**, **A25** | P4-stream ne renvoie plus 0 octet (A24) ; nom de fichier des documents plus perdu (A25) | `test_e2e_protocol_matrix.py` (**35**), `test_documents_contract.py` (**17**) |
 | **L13** | B1, B4 | Contrat `reasoning_content` mesuré + repli « retry-once » sur `/chat/completions` (voir §11.9) | `test_e2e_protocol_matrix.py::test_l13_*` (5) |
-| **L4** *(partiel)* | A9, **résidu A8** | Matrice outillage des 6 chemins ; écart A8 (nom > 64 vers Chat sur P2) **déclaré** et suivi par `xfail(strict=True)` | `test_tools_matrix.py` (8 fonctions → **25** cas) |
+| **L4** | A9, **résidu A8** | Matrice outillage des 6 chemins ; écart A8 (nom > 64 vers Chat sur P2) **corrigé** — sanitize à l'aller, remap historique/`tool_choice`, restauration non-stream **et** streaming | `test_tools_matrix.py` (13 fonctions → **30** cas, dont 7 pour A8) |
 
 ### 11.2 L5 — le « streaming » Responses n'en était pas un (A11/A21)
 
@@ -672,29 +677,30 @@ faisaient pas. Détail complet au rapport §3.6 et §3.7.
   L3528, `_responses_sse_to_chat_deltas` L3725) + le streaming via
   `state.tool_name_map`. Les tests `test_tool_name_sanitization.py` couvrent la
   restauration côté Chat et côté Anthropic.
-- **⚠️ Écart trouvé en vérifiant B4 (résidu A8, NON corrigé, déclaré)** : le
-  volet B4 portait sur la **restauration** au retour, pas sur la **sanitize**
-  à l'aller — et cette dernière est **asymétrique entre chemins**.
-  `sanitize_tool_names` n'est appelé que sur les chemins **Responses**
-  (`_sanitize_native_responses_request` L3061, `_chat_to_responses_request`
-  L3410). Sur les chemins **Chat**, un nom d'outil > 64 caractères part **tel
-  quel** vers l'amont : mesuré, un nom de 80 car. arrive à **80 car.** côté Chat
-  (`anthropic_to_openai` ne pose aucun `_tool_name_map`). Le sens P4 vers
-  Anthropic est correct (limite 200 : un nom de 80 passe légitimement).
-  **Risque** : un upstream Chat strict peut rejeter en 400. **Pourquoi non
-  corrigé ici** : la correction demande de plomber `name_map` dans
-  `anthropic_to_openai`/`openai_to_anthropic` et de le faire remonter au
-  handler — c'est le périmètre du **lot L4** (`test_tools_matrix.py`, qui
-  **existe** désormais), pas celui du volet B4. La perte est
-  **déclarée** (§7.2 du rapport) plutôt que silencieuse. *Aucun verrou* : c'est
-  précisément ce que L4 doit apporter.
+- **✅ Écart trouvé en vérifiant B4 (résidu A8) — CORRIGÉ depuis par le lot L4** :
+  le volet B4 portait sur la **restauration** au retour, pas sur la **sanitize**
+  à l'aller — et cette dernière était **asymétrique entre chemins**.
+  `sanitize_tool_names` n'était appelé que sur les chemins **Responses**
+  (`_sanitize_native_responses_request`, `_chat_to_responses_request`). Sur les
+  chemins **Chat**, un nom d'outil > 64 caractères partait **tel quel** vers
+  l'amont : mesuré, un nom de 80 car. arrivait à **80 car.** côté Chat
+  (`anthropic_to_openai` ne posait aucun `_tool_name_map`). Le sens P4 vers
+  Anthropic était déjà correct (limite 200 : un nom de 80 y passe légitimement).
+  **Risque identifié** : un upstream Chat strict pouvait rejeter en 400.
+  **Correctif (lot L4)** : `_sanitize_chat_tools` sanitize à l'aller en
+  **réutilisant** `sanitize_tool_names` (une seule source de vérité), l'historique
+  `tool_calls[].function.name` et le `tool_choice` nommé suivent le rename, la
+  `name_map` remonte au handler, et la restauration couvre le non-stream **et** le
+  streaming. Verrouillé par 6 tests `test_a8_*` + 1 test e2e de flux, et
+  **mutation-testé 6/6** (chaque élément neutralisé fait rougir son test).
 - **Vérification en conditions réelles — PARTIELLEMENT CONCLUANTE.** Le proxy en
   cours sur `127.0.0.1:4000` est joignable et a reçu de vraies requêtes. Sur
   `muse-spark-1.3-contributor` et `mimo-v2.5` (P2), des **`200`** ont été
   obtenus. Résultat exploitable, après vérification des dumps du proxy :
-  - ✅ **Sur P2 vers Chat, le nom de 80 caractères part NON sanitizé** vers un vrai
-    amont — observé dans `logs/free400_msg_aa3ac6d9fd40-31e.json`. La première
-    moitié de A8 est donc **prouvée sur le fil**, plus seulement hors ligne.
+  - ✅ **Sur P2 vers Chat, le nom de 80 caractères partait NON sanitizé** vers un
+    vrai amont — observé dans `logs/free400_msg_aa3ac6d9fd40-31e.json`. C'est ce
+    diagnostic, relevé **avant correction**, qui a établi le défaut sur le fil et
+    motivé le lot L4.
   - ✅ **Sur la jambe Responses, la sanitize à 64 fonctionne en production** : le
     nom émis est `a`×57 + `-86f336`, digest `sha1("a"×80)[:6]` recalculé
     **identique** à la sortie de `sanitize_tool_names`.
@@ -703,23 +709,27 @@ faisaient pas. Détail complet au rapport §3.6 et §3.7.
   - ❌ **Non établi** : qu'un amont **rejette** un nom > 64. Les échecs observés
     (`401 CreditsError` payant, `400 MissingSessionID` free, `403 DataPolicyError`
     d'opt-in workspace) ont d'autres causes, et la cible est **intermittente**
-    (mêmes modèles : `200` puis `503`). L'écart A8 reste donc **déclaré comme
-    risque** pour son volet « rejet ». Détail mesuré : §9 du rapport.
+    (mêmes modèles : `200` puis `503`). Le volet « rejet » de A8 reste donc
+    **déclaré comme risque** — mais cela ne conditionne plus le correctif, qui
+    applique la limite **par construction** (le proxy n'émet plus aucun nom > 64
+    vers Chat). Détail mesuré : §9 du rapport.
 
 ### 11.10 Reste à faire
 
-- **L4 (résidu)** — `tests/test_tools_matrix.py` est désormais **livré**
-  (25 cas, 6 chemins). Le volet documents reste couvert par
+- **L4 — livré intégralement.** `tests/test_tools_matrix.py` compte **30 cas**
+  (13 fonctions, 6 chemins). L'écart **A8 résiduel** décrit ci-dessus (nom
+  d'outil > 64 caractères vers une cible Chat sur **P2**) est **corrigé** :
+  sanitize à l'aller (`_sanitize_chat_tools`, réutilisant `sanitize_tool_names`),
+  remap de l'historique et du `tool_choice`, remontée de la `name_map` au handler,
+  et restauration non-stream **et** streaming. L'ancien `xfail(strict=True)` a été
+  levé (passé en XPASS au câblage) et le golden `p2_tools_long_name_strict_schema`
+  régénéré. Le volet documents reste couvert par
   `tests/test_documents_contract.py`, pas par un `test_documents_matrix.py`
-  séparé. Le seul point **non corrigé** est l'écart **A8 résiduel** décrit
-  ci-dessus (nom d'outil > 64 caractères vers une cible Chat sur **P2**) :
-  la matrice le porte en `xfail(strict=True)`, donc il est **suivi par la suite
-  de tests** et non enfoui. Corriger demande de sanitizer à l'aller, de faire
-  remonter la `name_map` au handler et de restaurer sur les voies de retour
-  non-stream **et** streaming.
-- **`docs/conversion-matrix.md`** — ✅ l'écart **A8 résiduel est désormais reporté**
-  dans ce tableau (bloc « Pertes déclarées sur l'axe des noms d'outils », avec la
-  preuve sur le fil et le digest vérifié). ⚠️ **Reste à faire** : la mise à jour de
+  séparé.
+- **`docs/conversion-matrix.md`** — ✅ l'écart **A8** y est désormais documenté
+  comme **corrigé** (bloc « Noms d'outils : 200 vs 64 — écart A8 CORRIGÉ », qui
+  conserve le diagnostic sur le fil et le digest vérifié, et signale que le golden
+  A8 est le seul des 46 à avoir changé). ⚠️ **Reste à faire** : la mise à jour de
   la ligne « PERDU silencieusement » pour l'**image**, demandée par L4 — cette
   ligne n'existe pas dans `docs/conversion-matrix.md` tel qu'il est aujourd'hui
   (grep : aucune occurrence de « PERDU »), donc soit elle vit dans un autre

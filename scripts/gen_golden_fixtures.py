@@ -617,7 +617,13 @@ def case_p4_max_completion_tokens_input():
 
 
 def case_p2_tools_long_name_strict_schema():
-    """P2 tools : nom > 64 caractères + schéma strict (additionalProperties=false)."""
+    """P2 tools : nom > 64 caractères + schéma strict (additionalProperties=false).
+
+    [Lot L4 — A8] Le nom long est désormais SANITIZÉ vers la limite Chat (64) et
+    une map de restauration `_tool_name_map` accompagne le corps. Avant le
+    correctif, ce cas figeait le défaut (« nom long conservé tel quel »), qui
+    faisait répondre 400 à une cible Chat stricte.
+    """
     return {
         "fn": "anthropic_to_openai",
         "input": {
@@ -640,7 +646,10 @@ def case_p2_tools_long_name_strict_schema():
             },
             "model": "deepseek-v4-flash",
         },
-        "note": "axe tools : nom long conservé tel quel côté Chat (pas de sanitize sur cette jambe)",
+        "note": (
+            "axe tools : nom long SANITIZÉ à 64 (lot L4/A8) + map _tool_name_map "
+            "de restauration ; le nom d'origine reste retrouvable côté client"
+        ),
     }
 
 

@@ -8504,6 +8504,7 @@ from app.protocol.mapping import (  # noqa: E402,I001  # re-export after functio
     openai_responses_to_anthropic,
     openai_to_anthropic,
     openai_to_anthropic_request,
+    restore_tool_name,
     strip_synthetic_thinking,
 )
 
@@ -9854,7 +9855,20 @@ async def messages(request: Request):
                         free_model_ip=_actual_ip,
                     )
                     return Response(
-                        content=_json_dumps_str(openai_to_anthropic(data, original_model), ensure_ascii=False),
+                        content=_json_dumps_str(
+                            openai_to_anthropic(
+                                data,
+                                original_model,
+                                # [Lot L4 — A8] Restore des noms d'outils raccourcis
+                                # à l'aller. ``get`` (et non ``pop``) : en cas
+                                # d'échec du repli free, le chemin payant qui suit
+                                # a encore besoin de la map.
+                                _oai_body_for_free.get(_TOOL_NAME_MAP_KEY)
+                                if isinstance(_oai_body_for_free, dict)
+                                else None,
+                            ),
+                            ensure_ascii=False,
+                        ),
                         media_type="application/json",
                     )
             except FreeRefusal as fq_err:
@@ -10082,7 +10096,10 @@ async def messages(request: Request):
             _debug(
                 f"  [non-stream] blocks: text={bool(msg_data.get('content'))} thinking={bool(msg_data.get('reasoning_content') or msg_data.get('reasoning'))} tools={used}"
             )
-            anthro_resp = openai_to_anthropic(data, original_model)
+            # [Lot L4 — A8] Restore des noms d'outils raccourcis à l'aller sur la
+            # limite Chat (64) : le client Anthropic doit retrouver le nom qu'il
+            # a envoyé (il a droit à 200), pas le nom raccourci.
+            anthro_resp = openai_to_anthropic(data, original_model, oai_body.pop(_TOOL_NAME_MAP_KEY, None))
         await _save_and_log_request(
             req_id,
             model_id,
@@ -10142,10 +10159,13 @@ async def messages(request: Request):
         else:
             _using_free = False
         # [tool-names ≤64] restore-retour stream : la map aller {short: original}
-        # est poppée ici (jambe free uniquement) vers un local — le wire ne la
-        # voit jamais (strip _serialize_json_body) et chaque état SSE neuf la
-        # rejoue via son slot (retry → état neuf). Jambe paid → None.
-        _free_tool_map = oai_body.pop(_TOOL_NAME_MAP_KEY, None) if _using_free else None
+        # est poppée ici vers un local — le wire ne la voit jamais (strip
+        # _serialize_json_body) et chaque état SSE neuf la rejoue via son slot
+        # (retry → état neuf). [Lot L4 — A8] Plus de restriction à la jambe free :
+        # la sanitize s'applique désormais aussi à l'aller payant Chat, dont la
+        # map doit donc être restaurée de la même façon (sinon le client recevrait
+        # des noms raccourcis qu'il ne reconnaît pas).
+        _out_tool_map = oai_body.pop(_TOOL_NAME_MAP_KEY, None) if isinstance(oai_body, dict) else None
         # [B1 perf / v10 PLAN-commun 1.3] estimation tiktoken DIFFÉRÉE : elle
         # tourne en tâche concurrente avec la connexion upstream — le premier
         # yield n'attend plus le comptage (−20 à −150 ms de TTFB sur gros
@@ -10414,7 +10434,7 @@ async def messages(request: Request):
                     # [tool-names ≤64] rejoue la map aller free sur chaque état
                     # neuf (jambe free uniquement ; paid → None).
                     _resp_state = ResponsesSseState()
-                    _resp_state.tool_name_map = _free_tool_map if _using_free else None
+                    _resp_state.tool_name_map = _out_tool_map
                     _incomplete_empty = False
                     async for line in resp.aiter_lines():
                         if not line.startswith("data:"):
@@ -10604,7 +10624,11 @@ async def messages(request: Request):
                                 next_block_idx += 1
                                 tool_block_idx[api_idx] = block_idx
                                 tc_id = tc.get("id", _fast_id("toolu"))
-                                tc_name = tc.get("function", {}).get("name", "")
+                                # [Lot L4 — A8] Restore : le nom raccourci pour
+                                # l'amont Chat (≤64) redevient celui que le client
+                                # a envoyé. ``used_tools`` enregistre donc le nom
+                                # d'origine, comme en non-stream.
+                                tc_name = restore_tool_name(tc.get("function", {}).get("name", ""), _out_tool_map)
                                 if tc_name:
                                     used_tools.append(tc_name)
                                 _debug(
@@ -11658,11 +11682,12 @@ async def chat_completions(request: Request):
             else:
                 _using_free = False
             # [tool-names ≤64] restore-retour stream : la map aller {short:
-            # original} est poppée ici (jambe free uniquement) vers un local —
-            # le wire ne la voit jamais (strip _serialize_json_body) et chaque
-            # état SSE neuf la rejoue via son slot (retry → état neuf).
-            # Jambe paid → None.
-            _free_tool_map = oai_body.pop(_TOOL_NAME_MAP_KEY, None) if _using_free else None
+            # original} est poppée ici vers un local — le wire ne la voit jamais
+            # (strip _serialize_json_body) et chaque état SSE neuf la rejoue via
+            # son slot (retry → état neuf). [Lot L4 — A8] Plus de restriction à
+            # la jambe free : un aller payant converti vers /responses produit lui
+            # aussi une map (nom Chat >64), qui doit être restaurée comme l'autre.
+            _out_tool_map = oai_body.pop(_TOOL_NAME_MAP_KEY, None) if isinstance(oai_body, dict) else None
             # [B1 perf] estimation tiktoken DIFFÉRÉE (même motif que
             # anthropic_stream) : tâche concurrente avec la connexion upstream,
             # résolue paresseusement à la finalisation / rollback.
@@ -11977,7 +12002,7 @@ async def chat_completions(request: Request):
                         # [tool-names ≤64] rejoue la map aller free sur chaque
                         # état neuf (jambe free uniquement ; paid → None).
                         _resp_state = ResponsesSseState()
-                        _resp_state.tool_name_map = _free_tool_map if _using_free else None
+                        _resp_state.tool_name_map = _out_tool_map
                         _chunk_already_yielded = False
                         _incomplete_empty = False
                         async for line in resp.aiter_lines():

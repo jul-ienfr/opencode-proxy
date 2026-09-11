@@ -21,17 +21,29 @@ Anthropic accepte **200** caractères, OpenAI n'en accepte que **64** (et la
 convention Responses également 64). Un nom valide côté client Anthropic peut donc
 être **invalide** une fois routé vers une cible Chat.
 
-**Écart déclaré (§7.2 du rapport).** Le nom long n'est sanitizé que sur les
-chemins **Responses** (`sanitize_tool_names` appelé en `_sanitize_native_responses_request`
-et `_chat_to_responses_request`). Sur **P2**, un nom de 80 caractères part **tel
-quel** vers la cible Chat. C'est le résidu de l'anomalie **A8**, déclaré et non
-couvert silencieusement. Le test correspondant porte un
-``xfail(strict=True)`` : il **échoue tant que le défaut est là** et forcera la
-levée du marqueur le jour où la sanitize sera câblée sur les chemins Chat.
-Contrairement au cas A24 (correctif d'un mot, différé à tort sur un périmètre
-inventé), ce défaut est une **fonctionnalité multi-sites** (sanitize à l'aller,
-map à faire remonter au handler, restore sur les voies de retour non-stream
-**et** streaming) explicitement rattachée par le plan au lot L4.
+**Écart A8 — CORRIGÉ (lot L4).** Le nom long n'était sanitizé que sur les chemins
+**Responses** (`sanitize_tool_names` appelé en `_sanitize_native_responses_request`
+et `_chat_to_responses_request`) ; sur **P2**, un nom de 80 caractères partait **tel
+quel** vers la cible Chat, qui n'en accepte que 64. La correction câble la même
+sanitize sur les chemins **Chat** :
+
+1. `_sanitize_chat_tools` projette les noms (`function.name`) vers la forme
+   attendue par `sanitize_tool_names`, réutilise la **même** logique (digest,
+   collisions, exclusions `web_*`) et réécrit les noms — une seule source de
+   vérité, aucune duplication de la règle de raccourcissement ;
+2. `_remap_chat_history_names` fait suivre l'historique
+   (`assistant.tool_calls[].function.name`), sinon le tour N+1 rejouerait le nom
+   long et l'amont répondrait 400 ;
+3. `_remap_chat_tool_choice` fait suivre le `tool_choice` nommé, en **conservant**
+   la forme Chat ;
+4. la map `{short: original}` repart au handler via `_TOOL_NAME_MAP_KEY` et le
+   retour restaure le nom d'origine — non-stream (`openai_to_anthropic`) **et**
+   streaming (branche `tool_calls` du flux P2).
+
+Le test de l'axe portait un ``xfail(strict=True)`` tant que le défaut était là ;
+il est passé en **XPASS** dès le câblage, ce qui a forcé la levée du marqueur —
+le garde-fou a fonctionné comme prévu. Les tests de ce fichier couvrent désormais
+aussi le **retour** (restauration), pas seulement l'aller.
 """
 
 from __future__ import annotations
@@ -45,6 +57,7 @@ from protocol_mapping import (
     _chat_to_responses_request,
     anthropic_to_openai,
     openai_responses_to_anthropic,
+    openai_to_anthropic,
     openai_to_anthropic_request,
     sanitize_tool_names,
 )
@@ -330,25 +343,17 @@ def test_axis_long_name_is_sanitized_towards_chat_via_responses(path):
     assert body.get(_TOOL_NAME_MAP_KEY), f"{path}: sanitize sans map de restauration"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "ÉCART DÉCLARÉ (résidu A8, §7.2 du rapport) : sur P2, un nom d'outil "
-        "Anthropic valide (>64 caractères) part TEL QUEL vers une cible Chat dont "
-        "la limite est de 64. `sanitize_tool_names` n'est câblé que sur les chemins "
-        "Responses. Corriger demande de sanitizer à l'aller, de faire remonter la "
-        "map au handler et de restaurer sur les voies de retour non-stream ET "
-        "streaming — périmètre du lot L4. Ce xfail est strict : il passera au rouge "
-        "le jour où la sanitize sera câblée, forçant la levée du marqueur."
-    ),
-)
-def test_axis_long_name_is_sanitized_towards_chat_on_p2_DECLARED_GAP():
-    """Axe « nom long » sur P2 — comportement ATTENDU, aujourd'hui non tenu.
+def test_axis_long_name_is_sanitized_towards_chat_on_p2():
+    """Axe « nom long » sur P2 — écart A8 **corrigé** (lot L4).
 
-    Ce test décrit la cible : un nom de 80 caractères doit être ramené à ≤64 vers
-    une cible Chat, avec une map de restauration. Il **échoue** aujourd'hui,
-    volontairement, pour que l'écart reste visible et suivi par la suite de tests
-    plutôt que d'être enfoui dans une documentation.
+    Un nom de 80 caractères est valide côté Anthropic (limite 200) mais dépasse
+    la limite Chat de 64 : il doit être ramené à ≤64 vers une cible Chat, **avec**
+    une map de restauration — sans quoi le client recevrait un nom raccourci
+    qu'il ne reconnaît pas (perte silencieuse).
+
+    Historique : ce test portait un ``xfail(strict=True)`` tant que la sanitize
+    n'était pas câblée sur les chemins Chat. Il est passé en XPASS au câblage,
+    ce qui a forcé la levée du marqueur — c'est le garde-fou qui a fonctionné.
     """
     tools, body = _p2([anthro_tool(name=LONG_NAME)])
 
@@ -357,6 +362,112 @@ def test_axis_long_name_is_sanitized_towards_chat_on_p2_DECLARED_GAP():
         f"nom de {len(emitted)} caractères envoyé à une cible Chat (limite {OPENAI_NAME_MAX})"
     )
     assert body.get(_TOOL_NAME_MAP_KEY), "sanitize sans map : le nom client serait irrécupérable"
+    # La map doit permettre de retrouver EXACTEMENT le nom envoyé par le client.
+    assert body[_TOOL_NAME_MAP_KEY][emitted] == LONG_NAME
+
+
+def test_a8_p2_tool_choice_follows_the_rename():
+    """A8 — un `tool_choice` nommé doit désigner le nom **réellement envoyé**.
+
+    Si les outils sont raccourcis mais que `tool_choice` garde le nom long,
+    l'amont cherche un outil inexistant (400/422). La forme Chat
+    ``{"function": {"name"}}`` doit être conservée, pas convertie en forme
+    Responses.
+    """
+    tools, body = _p2([anthro_tool(name=LONG_NAME)], tool_choice={"type": "tool", "name": LONG_NAME})
+
+    emitted = tool_name_of(tools[0], "p2")
+    choice = body.get("tool_choice")
+    assert isinstance(choice, dict) and isinstance(choice.get("function"), dict), (
+        f"tool_choice doit rester en forme Chat, reçu : {choice!r}"
+    )
+    assert choice["function"]["name"] == emitted, (
+        "tool_choice désigne un nom différent de celui envoyé — l'amont répondrait 400"
+    )
+
+
+def test_a8_p2_history_tool_calls_follow_the_rename():
+    """A8 — l'historique des tours précédents suit le même rename.
+
+    Un `tool_use` long dans l'historique devient un `tool_calls[].function.name`
+    côté Chat : sans rename, le tour N+1 rejoue le nom long et l'amont répond
+    400 `name must be at most 64 characters`.
+    """
+    body_in = _anthro_body([anthro_tool(name=LONG_NAME)])
+    body_in["messages"] = [
+        {"role": "user", "content": "Quel temps à Paris ?"},
+        {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": LONG_NAME, "input": {}}]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "ok"}]},
+    ]
+    out = anthropic_to_openai(body_in, "glm-5")
+
+    emitted = tool_name_of(out["tools"][0], "p2")
+    hist = [m for m in out["messages"] if m.get("tool_calls")]
+    assert hist, "aucun message assistant.tool_calls dans l'historique converti"
+    hist_name = hist[0]["tool_calls"][0]["function"]["name"]
+    assert hist_name == emitted, (
+        f"historique non remappé ({hist_name!r}) alors que tools[] envoie {emitted!r} — "
+        "l'amont répondrait 400 sur le tour suivant"
+    )
+
+
+def test_a8_restore_returns_the_original_name_on_the_way_back():
+    """A8 — le retour doit restaurer le nom d'origine, pas le nom raccourci.
+
+    C'est la moitié « restore » de l'écart : sanitizer sans restaurer
+    remplacerait une perte (400 amont) par une autre (le client ne reconnaît
+    plus son outil).
+    """
+    tools, body = _p2([anthro_tool(name=LONG_NAME)])
+    emitted = tool_name_of(tools[0], "p2")
+
+    upstream = {
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [{"id": "t1", "type": "function", "function": {"name": emitted, "arguments": "{}"}}],
+                },
+                "finish_reason": "tool_calls",
+            }
+        ],
+        "usage": {},
+    }
+    out = openai_to_anthropic(upstream, "glm-5", body[_TOOL_NAME_MAP_KEY])
+
+    names = [b.get("name") for b in out["content"] if b.get("type") == "tool_use"]
+    assert names == [LONG_NAME], f"nom non restauré côté client : {names!r}"
+
+
+def test_a8_no_map_when_nothing_was_renamed():
+    """A8 — fast-path : aucun renommage ⇒ aucune map posée.
+
+    Le marqueur interne ne doit pas apparaître sur les requêtes ordinaires : il
+    voyagerait sinon inutilement (et un consommateur pourrait croire à un
+    renommage qui n'a pas eu lieu).
+    """
+    tools, body = _p2([anthro_tool(name=VALID_NAME)])
+
+    assert tool_name_of(tools[0], "p2") == VALID_NAME, "un nom valide ne doit pas être renommé"
+    assert _TOOL_NAME_MAP_KEY not in body, "map posée alors qu'aucun renommage n'a eu lieu"
+
+
+def test_a8_map_never_reaches_the_wire():
+    """A8 — la map est un détail interne : elle ne doit jamais partir vers l'amont.
+
+    On vérifie sur le corps **sérialisé** (dernier kilomètre), pas sur le dict :
+    c'est la seule preuve qui vaille pour un champ interne.
+    """
+    import opencode as oc
+
+    _tools, body = _p2([anthro_tool(name=LONG_NAME)])
+    raw = oc._serialize_json_body(body).decode("utf-8")
+
+    assert _TOOL_NAME_MAP_KEY not in raw, "clé interne sérialisée sur le wire"
+    assert LONG_NAME not in raw, "nom long présent sur le wire malgré la sanitize"
+    # La requête reste par ailleurs intacte et exploitable.
+    assert json.loads(raw)["model"]
 
 
 def test_axis_long_name_sanitize_is_reversible():

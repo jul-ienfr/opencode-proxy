@@ -49,6 +49,7 @@ from fastapi.testclient import TestClient
 
 import config.settings as _cfg_settings
 import opencode as oc
+from protocol_mapping import sanitize_tool_names
 
 # ─────────────────────────── Endpoints amont attendus ───────────────────────────
 
@@ -1304,3 +1305,99 @@ def test_l13_no_marker_means_no_retry_for_plain_requests(client, recorder):
 
     assert len(recorder.calls) == 1, "aucun retry ne doit avoir lieu sans raisonnement"
     assert status == 400
+
+
+# ─────────────── [Lot L4 — A8] Restauration du nom d'outil en stream ───────────────
+
+
+def _chat_sse_with_tool_call(short_name: str) -> list[str]:
+    """SSE amont Chat : un tool_call dont le nom est le nom RACCOURCI (≤64).
+
+    Construit via ``json.dumps`` et non à la main : une accolade mal comptée
+    produit un chunk silencieusement ignoré par le handler, et le test finit par
+    vérifier autre chose que ce qu'il annonce (constaté en écrivant ce test).
+    """
+    base = {"id": "chatcmpl_tc", "object": "chat.completion.chunk", "created": 1700000000, "model": "upstream"}
+    first = {
+        **base,
+        "choices": [
+            {
+                "index": 0,
+                "delta": {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "index": 0,
+                            "id": "call_a8",
+                            "type": "function",
+                            "function": {"name": short_name, "arguments": ""},
+                        }
+                    ],
+                },
+                "finish_reason": None,
+            }
+        ],
+    }
+    second = {
+        **base,
+        "choices": [
+            {
+                "index": 0,
+                "delta": {"tool_calls": [{"index": 0, "function": {"arguments": "{}"}}]},
+                "finish_reason": "tool_calls",
+            }
+        ],
+        "usage": {"prompt_tokens": 11, "completion_tokens": 22, "total_tokens": 33},
+    }
+    return [f"data: {json.dumps(first)}", f"data: {json.dumps(second)}", "data: [DONE]"]
+
+
+def test_a8_stream_restore_returns_original_tool_name(client, recorder):
+    """A8 stream — le nom raccourci pour l'amont Chat est RESTAURÉ côté client.
+
+    C'est la moitié « streaming » du correctif : le non-stream est couvert par
+    ``openai_to_anthropic``, mais le flux emprunte un autre chemin (branche
+    ``tool_calls`` du handler P2) et restaurer à un seul endroit laisserait
+    l'autre fuir des noms raccourcis — c'est-à-dire des outils que le client n'a
+    jamais envoyés et ne saura pas router.
+    """
+    long_name = "mcp__plugin_very_long_tool_name_exceeding_sixty_four_chars_limit_aaaa"
+    short_tools, _map = sanitize_tool_names([{"name": long_name}])
+    short_name = short_tools[0]["name"]
+    assert len(short_name) <= 64 and short_name != long_name, "pré-requis : le nom doit être raccourci"
+
+    recorder.set_upstream(lambda e, b, p: FakeResponse(lines=_chat_sse_with_tool_call(short_name)))
+    body = {
+        "model": PAID_CHAT,
+        "max_tokens": 256,
+        "stream": True,
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [
+            {
+                "name": long_name,
+                "description": "d",
+                "input_schema": {"type": "object", "properties": {}},
+            }
+        ],
+    }
+
+    status, ctype, text = _post(client, "/v1/messages", body, stream=True)
+
+    assert status == 200
+    assert ctype.startswith("text/event-stream")
+    # Aller : l'amont reçoit bien le nom RACCOURCI (limite Chat 64).
+    sent = [t["function"]["name"] for t in recorder.last["body"]["tools"]]
+    assert sent == [short_name], f"nom long envoyé à l'amont Chat : {sent!r}"
+
+    # Retour : le client reçoit le nom d'ORIGINE, pas le raccourci.
+    tool_starts = [
+        payload["content_block"]["name"]
+        for name, payload in _sse_events(text)
+        if name == "content_block_start"
+        and isinstance(payload.get("content_block"), dict)
+        and payload["content_block"].get("type") == "tool_use"
+    ]
+    assert tool_starts == [long_name], (
+        f"nom non restauré en streaming : {tool_starts!r} (attendu {long_name!r}) — "
+        "le client recevrait un outil qu'il n'a jamais envoyé"
+    )

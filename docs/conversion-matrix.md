@@ -35,17 +35,17 @@
 | user block `tool_result {tool_use_id,content}` | message `role=tool {tool_call_id,content}` | bufferisé puis émis après l'assistant |
 | `tools[] {name,description,input_schema}` | `tools[] {type:"function",function:{name,description,parameters}}` | |
 | `tool_choice auto/any/tool{name}/none` | `"auto"/"required"/{"type":"function",...}/"none"` | |
-| nom d'outil **≤ 200 car.** (limite Anthropic) | nom **≤ 64 car.** (limite Chat/OpenAI) | ⚠️ **perte déclarée (résidu A8)** — voir ci-dessous |
+| nom d'outil **≤ 200 car.** (limite Anthropic) | nom **≤ 64 car.** (limite Chat/OpenAI) | ✅ **corrigé (lot L4)** — raccourci puis restauré, voir ci-dessous |
 | `max_tokens` | `max_tokens` | |
 | `stop_sequences` | `stop` | |
 | `temperature`, `top_p` | identiques | |
 | `thinking{type}` / `output_config.effort` | `reasoning_effort` | voir « Effort » ci-dessous |
 
-> **Pertes déclarées sur l'axe des noms d'outils (résidu A8).** Les deux contrats
-> n'ont pas la même limite de longueur : **Anthropic accepte 200 caractères**,
-> **OpenAI/Chat n'en accepte que 64**. `sanitize_tool_names` (raccourcissement
-> déterministe + map de restauration) n'est câblé que sur les chemins
-> **Responses** (`_sanitize_native_responses_request`, `_chat_to_responses_request`).
+> **Noms d'outils : 200 caractères (Anthropic) vs 64 (Chat/OpenAI) — écart A8
+> CORRIGÉ (lot L4).** `sanitize_tool_names` (raccourcissement déterministe + map
+> de restauration) est désormais câblé sur **tous** les chemins, et non plus
+> seulement sur les chemins Responses (`_sanitize_native_responses_request`,
+> `_chat_to_responses_request`).
 >
 > - Vers une cible **Anthropic** : aucun raccourcissement n'est nécessaire (200
 >   caractères sont légitimes) — comportement correct, couvert par
@@ -53,21 +53,29 @@
 > - Vers une cible **Chat via Responses** : le nom est raccourci à 64 avec map de
 >   restauration — correct, couvert par
 >   `test_axis_long_name_is_sanitized_towards_chat_via_responses`.
-> - Vers une cible **Chat sur P2** (`/v1/messages` → Chat) : le nom **n'est pas
->   raccourci**. Un nom valide côté client Anthropic (> 64) part donc tel quel et
->   peut être **rejeté en 400** par un upstream strict. C'est l'écart **non
->   corrigé**, porté par
->   `test_axis_long_name_is_sanitized_towards_chat_on_p2_DECLARED_GAP`
->   (`xfail(strict=True)`) : le défaut reste **visible dans la suite de tests** et
->   forcera la levée du marqueur quand il sera corrigé.
+> - Vers une cible **Chat sur P2** (`/v1/messages` → Chat) : **corrigé**.
+>   `_sanitize_chat_tools` projette les noms (qui vivent sous `function.name`
+>   côté Chat) vers la forme attendue par `sanitize_tool_names` et réutilise la
+>   **même** logique — une seule source de vérité, pas de deuxième règle de
+>   raccourcissement à maintenir. L'historique
+>   (`assistant.tool_calls[].function.name`) et le `tool_choice` nommé suivent le
+>   même rename, et le nom d'origine est **restauré au client**, non-stream
+>   (`openai_to_anthropic`) **et** streaming (branche `tool_calls` du flux P2).
+>   Couvert par `test_axis_long_name_is_sanitized_towards_chat_on_p2` et les
+>   tests `test_a8_*`.
 >
-> La perte n'est **pas** silencieuse au sens strict (un upstream qui refuse
-> répond 400) mais elle est **non couverte** par un repli : elle est donc déclarée
-> ici plutôt que passée sous silence.
+> **Ce que la correction a changé dans les tests de référence.** Le test de l'axe
+> portait un `xfail(strict=True)` tant que le défaut était là : il est passé en
+> **XPASS** dès le câblage, ce qui a **forcé** la levée du marqueur — le garde-fou
+> a joué son rôle. Le golden `p2_tools_long_name_strict_schema.json` figeait
+> explicitement le défaut (« nom long conservé tel quel côté Chat ») : il a été
+> **régénéré**, et il est le **seul** des 46 goldens à changer (vérifié par
+> empreinte avant/après).
 >
-> **Preuve sur le fil, en conditions réelles (proxy `:4000`).** La première
-> moitié de A8 n'est plus seulement déduite hors ligne : elle est **observée sur
-> le fil**. Requête P2 (`POST /v1/messages` → amont Chat, modèle
+> **Preuve sur le fil, en conditions réelles (proxy `:4000`) — diagnostic AVANT
+> correction.** Le défaut n'a pas été déduit hors ligne : il a été **observé sur
+> le fil**, et c'est cette observation qui a motivé le lot L4. Requête P2
+> (`POST /v1/messages` → amont Chat, modèle
 > `deepseek-v4-flash-free`) ; le dump de la requête réellement émise vers l'amont
 > (`logs/free400_msg_aa3ac6d9fd40-31e.json`) contient :
 >
@@ -78,23 +86,30 @@
 >  "tool_choice":"auto"}
 > ```
 >
-> Soit **80 caractères, non sanitizé**, vers un vrai amont : le proxy transmet
-> bien un nom au-delà de la limite Chat de 64. À noter que
-> `additionalProperties` a été ajouté au schéma par `_normalize_tool_schema` —
-> le proxy a donc **traité** les outils sans toucher au nom.
+> Soit **80 caractères, non sanitizé**, vers un vrai amont : c'était le défaut.
+> Depuis le lot L4, cette même requête émet un nom **≤ 64** (raccourci
+> déterministe) et transporte la map de restauration. À noter que
+> `additionalProperties` avait été ajouté au schéma par `_normalize_tool_schema` —
+> le proxy **traitait** donc les outils sans toucher au nom, ce qui rendait le
+> défaut discret.
 >
-> **Contre-preuve, même nom, autre jambe.** Via l'API **Responses** (jambe free),
-> le même nom de 80 caractères ressort **sanitizé à 64** :
+> **Contre-épreuve, même nom, autre jambe (avant correction).** Via l'API
+> **Responses** (jambe free), le même nom de 80 caractères ressortait
+> **sanitizé à 64** :
 > `"name":"aaaa…(57)-86f336"`, soit `a`×57 + `-` + `sha1("a"×80)[:6]`. Digest
 > recalculé : **`86f336`** — identique **au bit près** à la sortie de
 > `sanitize_tool_names`. La sanitize **fonctionne donc en production** sur cette
 > jambe, ce qui valide en réel le comportement verrouillé hors ligne par
 > `test_axis_long_name_is_sanitized_towards_chat_via_responses`.
 >
-> **Ce qui reste non prouvé** : qu'un amont **rejette** effectivement un nom
-> > 64. Les `400`/`503` observés ont d'autres causes (session free manquante,
-> `DataPolicyError` d'opt-in workspace, solde de crédits à zéro). Le volet
-> « rejet » reste donc **déclaré comme risque**, pas reproduit.
+> **Ce qui reste non prouvé** (et ne l'était pas davantage avant la correction) :
+> qu'un amont **rejette** effectivement un nom dépassant 64 caractères. Les
+> `400`/`503` observés ont d'autres causes (session free manquante,
+> `DataPolicyError` d'opt-in workspace, solde de crédits à zéro). Cette
+> incertitude porte sur la **nécessité** de la limite, pas sur le fait que le
+> proxy l'applique désormais : le correctif est verrouillé hors ligne et
+> mutation-testé (6 mutations, 6 tests qui mordent). Le volet « rejet réel par
+> l'amont » reste donc **déclaré comme risque**, pas reproduit.
 
 ## Effort et raisonnement — règle unique (décision produit)
 

@@ -1433,6 +1433,10 @@ def anthropic_to_openai(body: dict, model: str, raw: bytes | None = None) -> dic
         if key in body:
             oai[oai_key] = body[key]
 
+    # [Lot L4 — A8] Map de renommage des outils pour CETTE conversion.
+    # Initialisée AVANT le bloc conditionnel ``tools`` : la référencer plus bas
+    # (marqueur de retour) sur un chemin sans outils lèverait un UnboundLocalError.
+    _chat_name_map: dict = {}
     if "tools" in body:
         # Support both Anthropic format (name at top level) and OpenAI format (function.name)
         # v3.3: preserve server tools (web_search/web_fetch) natively, fix else branch B4
@@ -1542,7 +1546,10 @@ def anthropic_to_openai(body: dict, model: str, raw: bytes | None = None) -> dic
                     _debug(f"  [convert] SKIP tool without name type={t_type!r}")
                     continue
         if oai_tools:
-            oai["tools"] = oai_tools
+            # [Lot L4 — A8] Sanitize vers la limite Chat (64) : sans cela un nom
+            # Anthropic valide (>64, jusqu'à 200) partait tel quel et l'amont
+            # Chat répondait 400. La map repart au client via _TOOL_NAME_MAP_KEY.
+            oai["tools"] = _sanitize_chat_tools(oai_tools, _chat_name_map)
         tc = body.get("tool_choice", "auto")
         if isinstance(tc, dict):
             tc_type = tc.get("type", "auto")
@@ -1554,6 +1561,17 @@ def anthropic_to_openai(body: dict, model: str, raw: bytes | None = None) -> dic
                 oai["tool_choice"] = "auto"
         else:
             oai["tool_choice"] = tc
+        # [Lot L4 — A8] Le tool_choice nommé doit désigner le nom RÉELLEMENT
+        # envoyé, sinon l'amont cherche un outil inexistant (400/422).
+        if isinstance(oai.get("tool_choice"), dict):
+            oai["tool_choice"] = _remap_chat_tool_choice(oai["tool_choice"], _chat_name_map)
+
+    # [Lot L4 — A8] Historique : les tool_calls des tours précédents suivent le
+    # même rename que tools[] (hors ce bloc : l'historique peut porter des noms
+    # même quand cette requête n'envoie aucun outil — short défensif).
+    _chat_hist = oai.get("messages")
+    if isinstance(_chat_hist, list) and _chat_hist:
+        _remap_chat_history_names(_chat_hist, _chat_name_map)
 
     # Convert Anthropic thinking/effort → OpenAI reasoning parameters.
     # [Lot L2] SOURCE UNIQUE : ``config.effort_policy.resolve_effort`` lit toutes
@@ -1596,6 +1614,12 @@ def anthropic_to_openai(body: dict, model: str, raw: bytes | None = None) -> dic
         for _m in _final.get("messages", [])
     ):  # fmt: skip
         _final[_HAS_SYNTHETIC_REASONING_KEY] = True
+    # [Lot L4 — A8] Map de restauration aller→client, transportée par requête
+    # (clé privée, jamais globale) ; stripée au dernier kilomètre par
+    # ``_serialize_json_body`` — l'amont ne la voit jamais. Posée seulement si
+    # un renommage a eu lieu (sinon aucune restauration n'est nécessaire).
+    if isinstance(_final, dict) and _chat_name_map:
+        _final[_TOOL_NAME_MAP_KEY] = _chat_name_map
     return _final
 
 
@@ -1793,7 +1817,15 @@ def strip_synthetic_thinking(body: dict) -> int:
     return stripped
 
 
-def openai_to_anthropic(resp: dict, model: str) -> dict:
+def openai_to_anthropic(resp: dict, model: str, name_map: dict | None = None) -> dict:
+    """Convertit une réponse Chat en réponse Anthropic.
+
+    ``name_map`` ([Lot L4 — A8]) est la map ``{short: original}`` produite à
+    l'aller par ``_sanitize_chat_tools`` : sans elle, un client qui avait envoyé
+    un nom d'outil > 64 caractères recevrait le nom *raccourci* dans le bloc
+    ``tool_use``, c'est-à-dire un outil qu'il ne reconnaît pas. Restaure le nom
+    d'origine tel quel quand aucune map n'est fournie (jamais de renommage).
+    """
     choice = resp.get("choices", [{}])[0]
     msg = choice.get("message", {})
     usage = resp.get("usage", {})
@@ -1825,7 +1857,10 @@ def openai_to_anthropic(resp: dict, model: str) -> dict:
             {
                 "type": "tool_use",
                 "id": tc.get("id", f"toolu_{uuid.uuid4().hex[:8]}"),
-                "name": fn.get("name", ""),
+                # [Lot L4 — A8] Restore : le client doit retrouver le nom qu'il a
+                # envoyé (la limite 64 est une contrainte de l'amont Chat, pas
+                # du client Anthropic, qui autorise 200).
+                "name": restore_tool_name(fn.get("name", ""), name_map),
                 "input": inp,
             }
         )
@@ -2948,6 +2983,122 @@ def _remap_responses_tool_choice(tc, name_map: dict | None):
     return tc
 
 
+def _sanitize_chat_tools(oai_tools: list, name_map: dict) -> list:
+    """[Lot L4 — A8] Sanitize-aller des noms d'outils d'un corps **Chat**.
+
+    ``sanitize_tool_names`` attend des dicts au format Responses (``name`` à
+    plat) ; dans un corps Chat le nom vit sous ``function.name`` — il ne voyait
+    donc rien et laissait passer un nom > 64 caractères, que l'amont Chat refuse
+    en 400. On projette les noms vers la forme attendue, on réutilise la MÊME
+    logique de sanitize (une seule source de vérité : digest, collisions,
+    exclusions ``web_*``), puis on réécrit les noms dans les entrées Chat.
+
+    Copie des seules entrées modifiées : le caller n'est jamais muté.
+    Retourne la nouvelle liste ; complète ``name_map`` ``{short: original}``.
+    Fast-path intégral (aucun nom à raccourcir) : liste inchangée, map vide.
+    """
+    if not isinstance(oai_tools, list) or not oai_tools or not isinstance(name_map, dict):
+        return oai_tools
+    idx_of: list[int] = []
+    flat: list[dict] = []
+    for i, t in enumerate(oai_tools):
+        if not isinstance(t, dict):
+            continue
+        fn = t.get("function")
+        if not isinstance(fn, dict):
+            continue
+        name = fn.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        idx_of.append(i)
+        flat.append({"name": name})
+    if not flat:
+        return oai_tools
+    sanitized, fresh = sanitize_tool_names(flat)
+    if not fresh:
+        return oai_tools
+    name_map.update(fresh)
+    # ``sanitize_tool_names`` préserve ordre et longueur (cf. son ``out``), donc
+    # l'alignement positionnel flat[i] ↔ sanitized[i] est garanti.
+    out = list(oai_tools)
+    for pos, i in enumerate(idx_of):
+        new_name = sanitized[pos].get("name") if isinstance(sanitized[pos], dict) else None
+        if isinstance(new_name, str) and new_name and new_name != flat[pos]["name"]:
+            entry = dict(out[i])
+            entry["function"] = dict(entry["function"], name=new_name)
+            out[i] = entry
+    return out
+
+
+def _remap_chat_history_names(messages: list, name_map: dict) -> dict:
+    """[Lot L4 — A8] L'historique Chat (``assistant.tool_calls[].function.name``)
+    suit le même rename que ``tools[]`` — sinon le tour N+1 rejoue le nom
+    original (>64) et l'amont répond 400 ``name must be at most 64 characters``.
+
+    Mute les seuls conteneurs concernés (dicts neufs : jamais ceux du caller) et
+    complète ``name_map`` (nom hors ``tools[]`` → short défensif enregistré, donc
+    restore-retour préservé). Idempotent : un nom déjà short/valide est laissé
+    inchangé. Même discipline que ``_remap_responses_history_names``.
+    """
+    if not isinstance(messages, list) or not messages or not isinstance(name_map, dict):
+        return name_map
+    inv: dict[str, str] = {o: s for s, o in name_map.items() if isinstance(s, str) and isinstance(o, str)}
+    for i, m in enumerate(messages):
+        if not isinstance(m, dict):
+            continue
+        calls = m.get("tool_calls")
+        if not isinstance(calls, list) or not calls:
+            continue
+        new_calls = None
+        for j, tc in enumerate(calls):
+            if not isinstance(tc, dict):
+                continue
+            fn = tc.get("function")
+            if not isinstance(fn, dict):
+                continue
+            name = fn.get("name")
+            if not isinstance(name, str) or not name:
+                continue
+            short = inv.get(name)
+            if short is None and (len(name) > TOOL_NAME_MAX_LEN or _TOOL_NAME_RE.search(name)):
+                short = _register_defensive_short(name, name_map)
+                inv[name] = short
+            if short is not None and short != name:
+                if new_calls is None:
+                    new_calls = list(calls)
+                new_calls[j] = dict(tc, function=dict(fn, name=short))
+        if new_calls is not None:
+            messages[i] = dict(m, tool_calls=new_calls)
+    return name_map
+
+
+def _remap_chat_tool_choice(tc, name_map: dict | None):
+    """[Lot L4 — A8] Toute forme **nommée** de ``tool_choice`` suit le rename
+    aller, en CONSERVANT la forme Chat ``{"type": "function", "function":
+    {"name": …}}`` — c'est cette forme que l'amont Chat attend ; la variante
+    Responses est traitée par ``_remap_responses_tool_choice``, qui normalise
+    vers l'autre forme (ne pas confondre les deux).
+
+    Les formes chaîne (``auto`` / ``required`` / ``none``) ne portent aucun nom :
+    laissées telles quelles. Copie défensive ; nom hors map et non raccourci
+    possible → inchangé.
+    """
+    if not isinstance(tc, dict) or not isinstance(name_map, dict):
+        return tc
+    fn = tc.get("function")
+    if not isinstance(fn, dict):
+        return tc
+    name = fn.get("name")
+    if not isinstance(name, str) or not name:
+        return tc
+    short = _inverse_tool_name_lookup(name_map, name)
+    if short is None and (len(name) > TOOL_NAME_MAX_LEN or _TOOL_NAME_RE.search(name)):
+        short = _register_defensive_short(name, name_map)
+    if short is None or short == name:
+        return tc
+    return dict(tc, function=dict(fn, name=short))
+
+
 def _normalize_responses_input_items(inp: list) -> list:
     """Normalise les parts input_image/input_file vers le schéma Responses
     officiel (cf. docs/api-reference/responses) : un client (ou un payload
@@ -3401,14 +3552,22 @@ def _chat_to_responses_request(chat: dict) -> dict:
                 if _is_strict and _needs_fallback(raw_params):
                     tool_entry["strict"] = False
                 tools.append(tool_entry)
-        _name_map: dict = {}
+        # [Lot L4 — A8] FUSION, jamais écrasement : ``anthropic_to_openai`` a pu
+        # déjà poser une map (noms Chat raccourcis pour la limite 64). Elle est
+        # lue depuis ``chat`` — l'ENTRÉE — et non depuis ``req``, qui est un dict
+        # NEUF (cf. sa construction ``{"model":…, "input":…}``) : la chercher dans
+        # ``req`` la perdait, et le client recevait un nom raccourci non
+        # restaurable (défaut trouvé par test_anthropic_path_funnels_through_chat).
+        _prev_map = chat.get(_TOOL_NAME_MAP_KEY)
+        _name_map: dict = dict(_prev_map) if isinstance(_prev_map, dict) else {}
         if tools:
             # Sanitize-aller : l'upstream /responses refuse les noms >64 chars
             # (400 systématique → retry station fraîche inutile). La map est
             # transportée par requête (clé privée, jamais globale) pour le
             # restore-retour ; stripée avant sérialisation wire.
-            tools, _name_map = sanitize_tool_names(tools)
+            tools, _fresh_map = sanitize_tool_names(tools)
             req["tools"] = tools
+            _name_map.update(_fresh_map)
         # P0-1 [msg_18d502b1e0b40-e] : l'historique (input[].function_call.name)
         # suit le même rename — le tour N+1 rejoue sinon le nom original.
         _remap_responses_history_names(inp, _name_map)
@@ -3420,8 +3579,10 @@ def _chat_to_responses_request(chat: dict) -> dict:
             req["tool_choice"] = _remap_responses_tool_choice(tc, _name_map)
     else:
         # P0-1 sans définitions : l'historique reste remappé en défensif
-        # (map locale, restore-retour préservé).
-        _alone: dict = {}
+        # (map locale, restore-retour préservé). [Lot L4 — A8] Fusion avec la
+        # map éventuellement déjà posée à l'aller Chat (lue sur ``chat``, cf. supra).
+        _prev_alone = chat.get(_TOOL_NAME_MAP_KEY)
+        _alone: dict = dict(_prev_alone) if isinstance(_prev_alone, dict) else {}
         _remap_responses_history_names(inp, _alone)
         if _alone:
             req[_TOOL_NAME_MAP_KEY] = _alone
