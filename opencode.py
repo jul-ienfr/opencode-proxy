@@ -8541,6 +8541,15 @@ from app.protocol.mapping import (  # noqa: E402,I001  # re-export after functio
     strip_synthetic_thinking,
 )
 
+# [Parité protocole — défaut mesuré, lot L1/P1] Convertisseur de flux Chat →
+# Anthropic, utilisé par la jambe free de `anthropic_stream` quand l'équivalent
+# free s'adresse à un endpoint /chat/completions alors que le client parle
+# Anthropic (cf. le corps converti et la boucle de relais).
+from app.protocol.chat_sse_to_anthropic import (  # noqa: E402
+    ChatSseToAnthropicState,
+    chat_sse_to_anthropic_events,
+)
+
 # [Lot L2] Source unique de vérité pour l'effort — remplace le mapping local
 # par famille de modèle du handler /v1/chat/completions (A1).
 from config.effort_policy import resolve_effort as _resolve_effort  # noqa: E402
@@ -9149,6 +9158,11 @@ async def messages(request: Request):
             _track_model = model_id
             # Try free model for streaming: swap endpoint/model before starting stream
             free_model = _resolve_free_model(model_id)
+            # [Parité protocole — défaut mesuré, lot L1/P1] État de la conversion
+            # Chat→Anthropic de la jambe free (voir la bascule ci-dessous et la
+            # boucle de relais) : False = relais verbatim historique.
+            _free_chat_stream = False
+            _free_tool_map: dict = {}
             if free_model:
                 _debug(f"  [stream] attempting free model {free_model!r} first")
                 paid_endpoint = endpoint
@@ -9168,6 +9182,25 @@ async def messages(request: Request):
                         )
                     else:
                         endpoint = API_BASE_FREE
+                # [Parité protocole — défaut mesuré, lot L1/P1] Le modèle payant
+                # déclare `protocol: anthropic` alors que son équivalent free
+                # s'adresse à un endpoint /chat/completions : sans conversion, le
+                # corps Anthropic partait VERBATIM vers un endpoint Chat — qui ne
+                # lit pas le `system` top-level (system prompt PERDU) ni
+                # `tools[].input_schema` — et les chunks `chat.completion.chunk`
+                # étaient relayés bruts à un client Anthropic. Symétrique du
+                # correctif non-stream de `_try_free_model_first`.
+                if "/responses" not in endpoint:
+                    _conv_stream_body = anthropic_to_openai({**body, "model": free_model}, free_model)
+                    # Map des noms d'outils (>64 car., A8) : conservée pour le
+                    # restore-retour, jamais sérialisée vers l'amont.
+                    _free_tool_map = _conv_stream_body.pop(_TOOL_NAME_MAP_KEY, None) or {}
+                    _conv_stream_body.pop(_HAS_SYNTHETIC_REASONING_KEY, None)
+                    # L'usage en streaming Chat n'arrive que sur demande explicite
+                    # (même champ que les chemins P2/P3, opencode.py:10165).
+                    _conv_stream_body["stream_options"] = {"include_usage": True}
+                    body = _conv_stream_body
+                    _free_chat_stream = True
                 _using_free = True
                 _track_model = free_model
             else:
@@ -9462,9 +9495,39 @@ async def messages(request: Request):
                                 paid_status=resp.status_code,
                             )
                             return
+                        _conv_state = None
+                        _conv_buf = ""
                         async for chunk in resp.aiter_bytes():
-                            yield chunk
-                            _line_buf += chunk.decode("utf-8", errors="replace")
+                            if not _free_chat_stream:
+                                yield chunk
+                                _out_text = chunk.decode("utf-8", errors="replace")
+                            else:
+                                # [Parité protocole — défaut mesuré, lot L1/P1] Le
+                                # flux amont est du Chat : on le convertit en
+                                # événements Anthropic avant de le rendre, pour que
+                                # le client reçoive le contrat SSE de son protocole
+                                # (et non des `chat.completion.chunk`). Effet
+                                # secondaire voulu : le suivi de tokens ci-dessous,
+                                # qui ne lit que des types Anthropic, redevient
+                                # opérant sur cette jambe.
+                                if _conv_state is None:
+                                    # [B1] l'estimation a tourné en parallèle de la
+                                    # connexion amont — résolue ici sans coût TTFB
+                                    # (même schéma que le chemin P2).
+                                    _conv_state = ChatSseToAnthropicState(
+                                        model=original_model,
+                                        tool_name_map=_free_tool_map,
+                                        input_tokens_estimate=await _ensure_est_input() or 0,
+                                    )
+                                _conv_buf += chunk.decode("utf-8", errors="replace")
+                                _conv_out: list[str] = []
+                                while "\n" in _conv_buf:
+                                    _conv_line, _conv_buf = _conv_buf.split("\n", 1)
+                                    _conv_out.extend(chat_sse_to_anthropic_events(_conv_line, state=_conv_state))
+                                _out_text = "".join(_conv_out)
+                                if _out_text:
+                                    yield _out_text.encode("utf-8")
+                            _line_buf += _out_text
                             if len(_line_buf) > _line_buf_max:
                                 # Truncate on newline boundary to avoid splitting JSON (fix truncation mid-JSON)
                                 _keep = 1000
@@ -9545,6 +9608,27 @@ async def messages(request: Request):
                                 elif etype == "message_stop":
                                     emitted_finish = True
                                     _debug("  [stream] message_stop received → emitted_finish=True")
+                        # [Parité protocole — défaut mesuré, lot L1/P1] Vidage de
+                        # fin de flux pour la jambe free convertie : une dernière
+                        # ligne restée sans newline, puis la clôture Anthropic si
+                        # l'amont Chat s'est tu sans `[DONE]` — sans quoi le client
+                        # resterait sans `message_stop`.
+                        if _conv_state is not None:
+                            _conv_tail: list[str] = []
+                            if _conv_buf.strip():
+                                _conv_tail.extend(chat_sse_to_anthropic_events(_conv_buf, state=_conv_state))
+                            _conv_tail.extend(chat_sse_to_anthropic_events("data: [DONE]", state=_conv_state))
+                            if _conv_tail:
+                                _conv_tail_text = "".join(_conv_tail)
+                                # Le suivi de tokens ne lit que `_line_buf` : il doit
+                                # voir la clôture convertie (usage final compris).
+                                _line_buf += _conv_tail_text
+                                yield _conv_tail_text.encode("utf-8")
+                            if _conv_state.finished:
+                                # La clôture a bien été émise : le garde de
+                                # troncature ci-dessous ne doit pas en synthétiser
+                                # une seconde.
+                                emitted_finish = True
                         # After stream ends, handle truncated stream (EOF without message_stop)
                         # Check remaining buffer for a final event before synthesis
                         if _line_buf.strip() and not emitted_finish:

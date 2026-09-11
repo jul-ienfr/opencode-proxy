@@ -921,6 +921,69 @@ def test_free_model_subpath_p4_stream(client, recorder):
     assert "data: [DONE]" in text
 
 
+# Client dont la route mène à un modèle à protocole `anthropic` (haiku →
+# minimax-m2.5, config.yaml:25/57-58) : c'est la condition du défaut P1, pas le
+# protocole du modèle free (tous les modèles free sont `openai`, config.yaml:93-94).
+P1_CLIENT = "haiku"
+
+
+def test_free_model_subpath_p1_stream_converts_chat_to_anthropic(client, recorder):
+    """P1 stream — [lot L1/P1] le modèle payant déclare ``protocol: anthropic``
+    alors que son équivalent free est un endpoint ``/chat/completions``.
+
+    Avant le correctif, la boucle de relais rendait les chunks
+    ``chat.completion.chunk`` **bruts** au client Anthropic : aucun
+    ``message_start``, aucun ``content_block_delta`` — juste un flux étranger sur
+    un endpoint SSE Anthropic, sous un HTTP 200.
+
+    Repère : le **même** modèle free, atteint par une route de protocole
+    ``openai``, fonctionnait déjà (``test_free_model_subpath_p2_stream``). C'est
+    donc la déclaration de protocole du modèle payant qui déclenchait le défaut.
+    """
+    target = oc._route_for(P1_CLIENT)["model"]
+    # Le test ne porte que si les DEUX conditions du défaut sont réunies.
+    assert oc.get_model_config(target)["protocol"] == "anthropic", f"{target} doit déclarer le protocole anthropic"
+    free_model = oc._resolve_free_model(target)
+    assert free_model, f"{target} doit avoir un équivalent free pour ce test"
+    assert "/responses" not in _cfg_settings._free_endpoint_for(
+        free_model
+    ), "l'équivalent free doit être un endpoint Chat, sinon ce chemin n'est pas celui du défaut"
+
+    _chat_bytes = [(ln + "\n").encode() for ln in CHAT_CHUNK_LINES]
+    recorder.queue_free(FakeResponse(lines=CHAT_CHUNK_LINES, raw_lines=_chat_bytes))
+    body = {
+        "model": P1_CLIENT,
+        "max_tokens": 256,
+        "stream": True,
+        "system": "SYS-A-NE-PAS-PERDRE",
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+
+    status, ctype, text = _post(client, "/v1/messages", body, stream=True)
+
+    assert status == 200
+    assert ctype.startswith("text/event-stream")
+
+    # 1) Le client reçoit le contrat SSE de SON protocole (RETOUR converti).
+    _compact = text.replace(" ", "")
+    assert "event:message_start" in _compact
+    assert '"type":"content_block_delta"' in _compact
+    assert '"type":"text_delta"' in _compact
+    assert "event:message_stop" in _compact
+    assert "hello" in text
+
+    # 2) Le défaut d'origine, nommément : des chunks Chat sur un endpoint Anthropic.
+    assert "chat.completion.chunk" not in text
+
+    # 3) L'ALLER a été converti : le `system` top-level Anthropic — qu'un endpoint
+    #    Chat ne lit pas, d'où sa perte silencieuse — devient un message.
+    free_call = recorder.calls[0]
+    assert free_call["seam"] == "free"
+    assert free_call["body"]["model"] == free_model
+    assert "system" not in free_call["body"]
+    assert any("SYS-A-NE-PAS-PERDRE" in json.dumps(m) for m in free_call["body"]["messages"])
+
+
 # ═══════════════════════ Sous-chemin failover (stream) ═══════════════════════
 
 
