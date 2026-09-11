@@ -1,0 +1,36 @@
+{
+  "fn": "anthropic_to_openai",
+  "input": {
+    "body": {
+      "model": "claude-sonnet-4-5",
+      "max_tokens": 100,
+      "output_config": {
+        "effort": "xhigh"
+      },
+      "messages": [
+        {
+          "role": "user",
+          "content": "Q"
+        }
+      ]
+    },
+    "model": "deepseek-v4-flash"
+  },
+  "expected": {
+    "model": "deepseek-v4-flash",
+    "messages": [
+      {
+        "role": "user",
+        "content": "Q",
+        "cache_control": {
+          "type": "ephemeral"
+        }
+      }
+    ],
+    "stream": false,
+    "max_tokens": 100,
+    "reasoning_effort": "xhigh"
+  },
+  "_note": "axe effort : output_config.effort (forme Anthropic native) → reasoning_effort",
+  "_generated_by": "scripts/gen_golden_fixtures.py (plan v10 §11.5)"
+}

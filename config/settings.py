@@ -113,9 +113,7 @@ def load_yaml_config() -> dict:
                         with open(CONFIG_PATH, encoding="utf-8") as _rf:
                             _reloaded = yaml.safe_load(_rf) or {}
                         _re_ir = (
-                            _reloaded.get("ip_rotation", {})
-                            if isinstance(_reloaded.get("ip_rotation"), dict)
-                            else {}
+                            _reloaded.get("ip_rotation", {}) if isinstance(_reloaded.get("ip_rotation"), dict) else {}
                         )
                         if str(_re_ir.get("control_api_key") or "").strip():
                             _yaml_data = _reloaded
@@ -392,18 +390,12 @@ OPENCODE_GO_WORKSPACE_ID = _env("OPENCODE_GO_WORKSPACE_ID", "")
 OPENCODE_GO_AUTH_COOKIE = _env("OPENCODE_GO_AUTH_COOKIE", "")
 OPENCODE_GO_USE_BALANCE = _env_bool("OPENCODE_GO_USE_BALANCE", True)
 API_KEY_ROUTING = _env("API_KEY_ROUTING", yaml_get("routing", "key_routing", "round-robin"))
-CACHE_MIN_PROMPT_SIZE = _env_int(
-    "CACHE_MIN_PROMPT_SIZE", yaml_get("cache", "min_prompt_size", 2000)
-)
+CACHE_MIN_PROMPT_SIZE = _env_int("CACHE_MIN_PROMPT_SIZE", yaml_get("cache", "min_prompt_size", 2000))
 DEBUG = _env_bool("OPENCODE_DEBUG", yaml_get("server", "debug", False))
 
 # ── Upstream endpoints ──────────────────────────────────────────────
-API_BASE_OPENAI = yaml_get(
-    "upstream", "openai_base", "https://opencode.ai/zen/go/v1/chat/completions"
-)
-API_BASE_ANTHROPIC = yaml_get(
-    "upstream", "anthropic_base", "https://opencode.ai/zen/go/v1/messages"
-)
+API_BASE_OPENAI = yaml_get("upstream", "openai_base", "https://opencode.ai/zen/go/v1/chat/completions")
+API_BASE_ANTHROPIC = yaml_get("upstream", "anthropic_base", "https://opencode.ai/zen/go/v1/messages")
 API_BASE_FREE = yaml_get("upstream", "free_base", "https://opencode.ai/zen/v1/chat/completions")
 
 # ── Free model mapping (paid → free equivalent) ────────────────────
@@ -426,6 +418,7 @@ def get_429_action(default: str = "both") -> str:
     raw = yaml_get("ip_rotation", "on_429_action", default)
     return normalize_429_action(raw, default)
 
+
 # ── Geo (P1 — single source config.yaml:geo, kill-switch enabled:false) ─
 # Source: https://ai.developer.meta.com/legal/geographic-use-policy
 # Snapshot 2026-08-20 JS-rendered — WebFetch returned empty skeleton, manual
@@ -433,9 +426,7 @@ def get_429_action(default: str = "both") -> str:
 # live in config.yaml:geo.policies, routes reference via geo: {extends: name}.
 GEO_ENABLED: bool = bool(yaml_get("geo", "enabled", False))
 GEO_VERSION: int = int(yaml_get("geo", "version", 1) or 1)
-GEO_POLICIES: dict = (
-    yaml_get("geo", "policies", {}) if isinstance(yaml_get("geo", "policies", {}), dict) else {}
-)
+GEO_POLICIES: dict = yaml_get("geo", "policies", {}) if isinstance(yaml_get("geo", "policies", {}), dict) else {}
 SORTED_GEO_POLICIES: list = sorted(GEO_POLICIES.items()) if isinstance(GEO_POLICIES, dict) else []
 GEO_ALLOW_DIRECT_WHEN_COMPATIBLE: bool = bool(yaml_get("geo", "allow_direct_when_compatible", True))
 
@@ -449,9 +440,9 @@ def is_free_vpn_required() -> bool:
     tests as the canonical gate check.
     """
     return bool(
-        yaml_get("ip_rotation", "enabled", False)
-        and yaml_get("ip_rotation", "proxy_mode", "vpn") in ("vpn", "socks5")
+        yaml_get("ip_rotation", "enabled", False) and yaml_get("ip_rotation", "proxy_mode", "vpn") in ("vpn", "socks5")
     )
+
 
 # [Phase 1] Mémo resolve_geo déplacé vers config/geo.py (propriétaire du
 # cache + epoch — aucun lecteur externe, vérifié par grep). L'hôte garde
@@ -548,6 +539,7 @@ def get_free_parallel() -> dict:
 
 def free_parallel_enabled() -> bool:
     return bool(FREE_PARALLEL.get("enabled", False))
+
 
 # ── Server ──────────────────────────────────────────────────────────
 HOST = _env("OPENCODE_HOST", yaml_get("server", "host", "0.0.0.0"))
@@ -656,19 +648,29 @@ _discovery_mod.start_background_fetch(
 )
 
 # ── Web search native allowlist (v3.3) ─────────────────────────
-WEB_SEARCH_NATIVE_MODELS: list = yaml_get("web_search_native", default=["muse-spark-1.2-contributor", "muse-spark-1.2-contributor-free", "muse-spark-1.3-contributor", "muse-spark-1.3-contributor-free"])
+WEB_SEARCH_NATIVE_MODELS: list = yaml_get(
+    "web_search_native",
+    default=[
+        "muse-spark-1.2-contributor",
+        "muse-spark-1.2-contributor-free",
+        "muse-spark-1.3-contributor",
+        "muse-spark-1.3-contributor-free",
+    ],
+)
 if not isinstance(WEB_SEARCH_NATIVE_MODELS, list):
-    WEB_SEARCH_NATIVE_MODELS = ["muse-spark-1.2-contributor", "muse-spark-1.2-contributor-free", "muse-spark-1.3-contributor", "muse-spark-1.3-contributor-free"]
+    WEB_SEARCH_NATIVE_MODELS = [
+        "muse-spark-1.2-contributor",
+        "muse-spark-1.2-contributor-free",
+        "muse-spark-1.3-contributor",
+        "muse-spark-1.3-contributor-free",
+    ]
 
 # ── Free discovery (auto-detect -free models) ─────────────────────
 FREE_DISCOVERY = (
-    yaml_get("free_discovery", default={})
-    if isinstance(yaml_get("free_discovery", default={}), dict)
-    else {}
+    yaml_get("free_discovery", default={}) if isinstance(yaml_get("free_discovery", default={}), dict) else {}
 )
 FREE_DISCOVERY_INTERVAL = int(
-    FREE_DISCOVERY.get("interval", yaml_get("background", "free_models_refresh_interval", 3600))
-    or 3600
+    FREE_DISCOVERY.get("interval", yaml_get("background", "free_models_refresh_interval", 3600)) or 3600
 )
 FREE_DISCOVERY_ENABLED = bool(FREE_DISCOVERY.get("enabled", True))
 FREE_DISCOVERY_AUTO_PERSIST = bool(FREE_DISCOVERY.get("auto_persist", True))
@@ -801,9 +803,7 @@ def _ensure_free_models_sync() -> int:
         # next_refresh computed by caller (interval + jitter)
         return added
     except Exception as e:
-        _FREE_DISCOVERY_STATE["consecutive_failures"] = (
-            _FREE_DISCOVERY_STATE.get("consecutive_failures", 0) + 1
-        )
+        _FREE_DISCOVERY_STATE["consecutive_failures"] = _FREE_DISCOVERY_STATE.get("consecutive_failures", 0) + 1
         logger.warning(
             "[free-discovery] ensure failed (%d consecutive): %s",
             _FREE_DISCOVERY_STATE["consecutive_failures"],
@@ -828,11 +828,23 @@ def _ensure_free_models_async():
 # course avec le reload principal.
 _reload_lock = threading.Lock()
 
-try:
+# [Phase 3b-1 boot] Le spawn du thread free-discovery au niveau module est
+# SUPPRIMÉ. Il lançait, PENDANT la fenêtre import → listen :
+#   * un fetch HTTP réel (timeout 10 s) vers les endpoints de découverte, et
+#   * `import httpx` dans le thread (`config/discovery.py`),
+# en concurrence CPU/IO avec le thread principal qui doit atteindre `listen`.
+# Le 1er fetch est désormais déclenché par le lifespan du proxy (post-yield,
+# tâche de fond) via `ensure_free_models_on_boot()`. Effet de bord voulu :
+# un simple `import config` ne déclenche plus AUCUNE I/O réseau (tests,
+# scripts, outils d'audit inclus). La sémantique du proxy est préservée —
+# le fetch part juste après le ready au lieu de pendant l'import.
+
+
+def ensure_free_models_on_boot() -> None:
+    """1er fetch free-discovery en tâche de fond (appelé par le lifespan)."""
     if FREE_DISCOVERY_ENABLED:
         _ensure_free_models_async()
-except Exception:
-    pass
+
 
 # ── Routing ─────────────────────────────────────────────────────────
 DISABLE_MAPPING = _env_bool("DISABLE_MAPPING", yaml_get("routing", "disable_mapping", False))
@@ -936,8 +948,7 @@ def validate_custom_routes(routes) -> str | None:
             if not isinstance(k, str):
                 return f"{model}: clé de règle non-string {k!r}"
             if not (
-                isinstance(v, (str, int, float, bool))
-                or (isinstance(v, list) and all(isinstance(x, str) for x in v))
+                isinstance(v, (str, int, float, bool)) or (isinstance(v, list) and all(isinstance(x, str) for x in v))
             ):
                 return f"{model}.{k}: type non supporté ({type(v).__name__})"
     return None
@@ -1138,11 +1149,7 @@ def maybe_reload_custom_routes():
                     _yaml_data = new_yaml
                     _config_yaml_mtime = cfg_mtime
                     # IP_ROTATION in-place (keep object identity)
-                    new_ip = (
-                        new_yaml.get("ip_rotation", {})
-                        if isinstance(new_yaml.get("ip_rotation"), dict)
-                        else {}
-                    )
+                    new_ip = new_yaml.get("ip_rotation", {}) if isinstance(new_yaml.get("ip_rotation"), dict) else {}
                     # Fix P2: snapshot old server_countries AVANT clear/update
                     # sinon _old_sc lu en 1715 vaut déjà new_ip → regen .env jamais déclenché
                     _old_sc_snapshot = IP_ROTATION.get("server_countries", "")
@@ -1164,30 +1171,30 @@ def maybe_reload_custom_routes():
                     except Exception:
                         pass
                     # GEO in-place
-                    geo_sec = (
-                        new_yaml.get("geo", {}) if isinstance(new_yaml.get("geo"), dict) else {}
-                    )
+                    geo_sec = new_yaml.get("geo", {}) if isinstance(new_yaml.get("geo"), dict) else {}
                     GEO_ENABLED = bool(geo_sec.get("enabled", False))
                     try:
                         GEO_VERSION = int(geo_sec.get("version", 1) or 1)
                     except Exception:
                         GEO_VERSION = 1
-                    new_policies = (
-                        geo_sec.get("policies", {})
-                        if isinstance(geo_sec.get("policies"), dict)
-                        else {}
-                    )
+                    new_policies = geo_sec.get("policies", {}) if isinstance(geo_sec.get("policies"), dict) else {}
                     GEO_POLICIES.clear()
                     if isinstance(new_policies, dict):
                         GEO_POLICIES.update(new_policies)
                     SORTED_GEO_POLICIES[:] = sorted(GEO_POLICIES.items())
                     _bump_geo_cache()
-                    GEO_ALLOW_DIRECT_WHEN_COMPATIBLE = bool(
-                        geo_sec.get("allow_direct_when_compatible", True)
-                    )
+                    GEO_ALLOW_DIRECT_WHEN_COMPATIBLE = bool(geo_sec.get("allow_direct_when_compatible", True))
                     # v3.3: WEB_SEARCH_NATIVE_MODELS hot-reload
                     try:
-                        new_wsn = new_yaml.get("web_search_native", ["muse-spark-1.2-contributor", "muse-spark-1.2-contributor-free", "muse-spark-1.3-contributor", "muse-spark-1.3-contributor-free"])
+                        new_wsn = new_yaml.get(
+                            "web_search_native",
+                            [
+                                "muse-spark-1.2-contributor",
+                                "muse-spark-1.2-contributor-free",
+                                "muse-spark-1.3-contributor",
+                                "muse-spark-1.3-contributor-free",
+                            ],
+                        )
                         if isinstance(new_wsn, list) and new_wsn:
                             WEB_SEARCH_NATIVE_MODELS[:] = new_wsn
                     except Exception:
@@ -1202,9 +1209,7 @@ def maybe_reload_custom_routes():
                         _new_goi = _fd_sec.get("go_only_ids", [])
                         if isinstance(_new_goi, list):
                             GO_ONLY_IDS.clear()
-                            GO_ONLY_IDS.update(
-                                str(x).strip().lower() for x in _new_goi if str(x).strip()
-                            )
+                            GO_ONLY_IDS.update(str(x).strip().lower() for x in _new_goi if str(x).strip())
                     except Exception:
                         pass
                     # P2: server_countries change → regen .env via make_credentials_env
@@ -1224,9 +1229,7 @@ def maybe_reload_custom_routes():
                                     _r = _sp2.run(
                                         [
                                             __import__("sys").executable,
-                                            os.path.join(
-                                                ROOT, "scripts", "make_credentials_env.py"
-                                            ),
+                                            os.path.join(ROOT, "scripts", "make_credentials_env.py"),
                                         ],
                                         capture_output=True,
                                         timeout=10,
@@ -1239,15 +1242,11 @@ def maybe_reload_custom_routes():
                                             _r.stderr.decode(errors="ignore")[:500],
                                         )
                                     else:
-                                        logging.info(
-                                            "[config] server_countries changed → .env regen"
-                                        )
+                                        logging.info("[config] server_countries changed → .env regen")
                                 except Exception as _e2:
                                     logging.warning("[config] .env regen failed: %s", _e2)
 
-                            _th2.Thread(
-                                target=_regen_env, daemon=True, name="env-regen"
-                            ).start()
+                            _th2.Thread(target=_regen_env, daemon=True, name="env-regen").start()
                     except Exception:
                         pass
                     logging.info(
@@ -1286,9 +1285,7 @@ def maybe_reload_custom_routes():
                 # unlocked (Lock non réentrant).
                 _bump_route_version_unlocked()
                 _bump_geo_cache()
-                logging.info(
-                    "Reloaded routes (%d routes, cfg_changed=%s)", len(ROUTES), cfg_changed
-                )
+                logging.info("Reloaded routes (%d routes, cfg_changed=%s)", len(ROUTES), cfg_changed)
     except Exception as e:
         logging.warning("Failed to reload config: %s", e)
 

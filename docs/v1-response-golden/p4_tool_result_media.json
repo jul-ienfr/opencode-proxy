@@ -1,0 +1,126 @@
+{
+  "fn": "openai_to_anthropic_request",
+  "input": {
+    "oai_body": {
+      "model": "claude-sonnet-4-5",
+      "max_tokens": 100,
+      "messages": [
+        {
+          "role": "user",
+          "content": "q"
+        },
+        {
+          "role": "assistant",
+          "content": null,
+          "tool_calls": [
+            {
+              "id": "call_1",
+              "type": "function",
+              "function": {
+                "name": "t",
+                "arguments": "{}"
+              }
+            }
+          ]
+        },
+        {
+          "role": "tool",
+          "tool_call_id": "call_1",
+          "content": [
+            {
+              "type": "text",
+              "text": "res"
+            },
+            {
+              "type": "image_url",
+              "image_url": {
+                "url": "data:image/png;base64,iVBORw0KGgo="
+              }
+            },
+            {
+              "type": "file",
+              "file": {
+                "file_id": "file-1"
+              }
+            },
+            {
+              "type": "file",
+              "file": {
+                "file_data": "data:application/pdf;base64,JVBERi0=",
+                "filename": "a.pdf"
+              }
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "expected": {
+    "model": "claude-sonnet-4-5",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "q"
+          }
+        ]
+      },
+      {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "tool_use",
+            "id": "call_1",
+            "name": "t",
+            "input": {}
+          }
+        ]
+      },
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "tool_result",
+            "tool_use_id": "call_1",
+            "content": [
+              {
+                "type": "text",
+                "text": "res"
+              },
+              {
+                "type": "image",
+                "source": {
+                  "type": "base64",
+                  "media_type": "image/png",
+                  "data": "iVBORw0KGgo="
+                }
+              },
+              {
+                "type": "document",
+                "source": {
+                  "type": "file",
+                  "file_id": "file-1"
+                }
+              },
+              {
+                "type": "document",
+                "source": {
+                  "type": "base64",
+                  "media_type": "application/pdf",
+                  "data": "JVBERi0="
+                },
+                "name": "a.pdf"
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "stream": false,
+    "max_tokens": 100
+  },
+  "_note": "axe documents+images P4 : tool rôle multimodal → tool_result [text,image,document file_id,document base64]",
+  "_generated_by": "scripts/gen_golden_fixtures.py (plan v10 §11.5)"
+}

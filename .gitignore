@@ -20,6 +20,7 @@ logs/requests.db.bak*
 logs/debug.log*
 logs/opencode*.lock
 logs/paused_keys.yaml
+logs/paused_keys.yaml.*
 startup.err
 startup.log
 proxy_debug.log
@@ -95,6 +96,12 @@ scripts/pywin32_testall.py
 logs/free400_*.json
 # Dump d'audit ponctuel à la racine
 _audit_dump*.txt
+# [C24] Profils de boot (cProfile / py-spy / -X importtime) : artefacts de
+# diagnostic régénérables, jamais des sources. Absents du .gitignore d'origine
+# alors que le plan C24 les listait comme devant être couverts.
+boot.prof
+boot_prof.err
+boot_top.txt
 # Transients d'écriture atomique interrompue (save_yaml_config .tmp)
 *.tmp
 # Transients de la gate locale (logs/gate_pytest*.log déjà couverts par *.log)
@@ -102,3 +109,16 @@ logs/gate_*.pid
 # Données de couverture (générées par `pytest --cov`, jamais versionnées)
 .coverage*
 coverage.xml
+
+# [Phase 5 boot] Assets pré-compressés générés au BUILD par
+# scripts/precompress.py (artefacts, régénérés par le Dockerfile et le CI).
+# Sans eux, dashboard/routes/static.py recompresse à la volée au démarrage :
+# le proxy reste fonctionnel, juste un peu plus lent au boot.
+static/*.gz
+static/*.br
+
+# Worktrees git temporaires d'audit (créés dans le dépôt même par les
+# chantiers d'audit). Ce ne sont PAS des sources du projet : sans exclusion
+# ils polluent `ruff check .` (fichiers dupliqués, erreurs fantômes).
+.audit-wt/
+.audit-logs-wt/

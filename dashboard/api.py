@@ -42,10 +42,13 @@ from .display import debug as _debug
 from .display import log_lines
 from .events import get_event_manager
 from .quota import (
+    SWR_MAX_AGE_S,
+    SWR_STALE_S,
     get_available_models,
     get_model_capabilities_for_all,
     get_model_limits_for_all,
     get_quota_snapshot,
+    quota_cache_state,
 )
 
 # Windows: masquer la fenêtre console des subprocess (évite le flash noir 1s)
@@ -61,6 +64,9 @@ from dashboard.routes.static import (  # noqa: E402
     StaticCacheMiddleware as _StaticCacheMiddleware,
 )
 from dashboard.routes.static import (  # noqa: E402
+    load_precompressed as load_precompressed,
+)
+from dashboard.routes.static import (  # noqa: E402,F401  # re-export (test_static_cache_asgi.py)
     precompress_static_assets as _precompress_static_assets,
 )
 
@@ -152,6 +158,7 @@ def _traffic_apply_lazy() -> None:
     if _traffic_capture.enabled != wanted:
         _traffic_capture.configure(enabled=wanted)
 
+
 # ── Dashboard auth (opt-in via DASHBOARD_TOKEN env) ──
 # When DASHBOARD_TOKEN is set, sensitive endpoints require the header
 # `X-Dashboard-Token` (constant-time comparison). Unset → legacy open access
@@ -172,9 +179,7 @@ try:
 
         try:
             with open(
-                os.path.join(
-                    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.yaml"
-                ),
+                os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.yaml"),
                 encoding="utf-8",
             ) as _f:
                 _yw = _yaml_warn.safe_load(_f) or {}
@@ -200,9 +205,7 @@ except Exception:
 # ``config_yaml_dirty`` in /api/vpn-status so the GUI can banner.
 #  Never auto-reload: a user editing config.yaml by hand must restart or
 # re-push to get a consistent state.
-__CONFIG_YAML_PATH = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.yaml"
-)
+__CONFIG_YAML_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.yaml")
 _config_yaml_known_mtime: float = 0.0
 
 
@@ -475,9 +478,7 @@ _DATE_ONLY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 def _date_bound_to_utc(date_str: str, end_of_day: bool) -> str:
     """Jour calendaire local → borne UTC+Z, via le fuseau système (DST-correct)."""
     local_midnight = datetime.fromisoformat(date_str + "T00:00:00")  # naive = heure locale
-    local = (
-        local_midnight + timedelta(days=1) - timedelta(seconds=1) if end_of_day else local_midnight
-    )
+    local = local_midnight + timedelta(days=1) - timedelta(seconds=1) if end_of_day else local_midnight
     return local.astimezone().astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
@@ -507,9 +508,7 @@ def _period_minutes(from_date, to_date, now: datetime | None = None) -> float | 
     if now is None:
         now = datetime.now(UTC)
     try:
-        start = datetime.strptime(_normalize_date_bound(from_date, False), _TS_FMT).replace(
-            tzinfo=UTC
-        )
+        start = datetime.strptime(_normalize_date_bound(from_date, False), _TS_FMT).replace(tzinfo=UTC)
         end = datetime.strptime(_normalize_date_bound(to_date, True), _TS_FMT).replace(tzinfo=UTC)
     except (ValueError, TypeError):
         return None
@@ -550,11 +549,7 @@ def _compute_costs(rows, pricing: dict | None = None) -> dict:
         seen.add(key)
         rates = per_model_cfg.get(model) if isinstance(per_model_cfg, dict) else {}
         ri = float(rates.get("input_per_mtok", rate_in)) if isinstance(rates, dict) else rate_in
-        ro_ = (
-            float(rates.get("output_per_mtok", rate_out))
-            if isinstance(rates, dict)
-            else rate_out
-        )
+        ro_ = float(rates.get("output_per_mtok", rate_out)) if isinstance(rates, dict) else rate_out
         cost = ti / 1e6 * ri + to_ / 1e6 * ro_
         is_free = model.endswith("-free")
         if is_free:
@@ -640,10 +635,15 @@ def _validate_vpn_config_payload(body) -> list:
     per = body.get("per_station")
     if per is not None:
         if not isinstance(per, dict):
-            errors.append("per_station doit être un objet {\"N\": {...}}")
+            errors.append('per_station doit être un objet {"N": {...}}')
         else:
-            allowed_keys = {"quota_per_ip", "country_offset", "country_offset_stride",
-                            "watchdog_interval", "proxy_mode"}
+            allowed_keys = {
+                "quota_per_ip",
+                "country_offset",
+                "country_offset_stride",
+                "watchdog_interval",
+                "proxy_mode",
+            }
             for sid_key, ov in per.items():
                 if str(sid_key).strip() not in {str(i) for i in range(1, 11)}:
                     errors.append(f"per_station: station invalide {sid_key!r} (1..10)")
@@ -873,9 +873,7 @@ def _persist_vpn_config(updates: dict):
                 fd, tmp_path = tempfile.mkstemp(dir=dir_name, prefix=".config.yaml.tmp.")
                 try:
                     with os.fdopen(fd, "w", encoding="utf-8") as f:
-                        yaml.dump(
-                            config, f, default_flow_style=False, allow_unicode=True, sort_keys=False
-                        )
+                        yaml.dump(config, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
                         f.flush()
                         try:
                             os.fsync(f.fileno())
@@ -891,9 +889,7 @@ def _persist_vpn_config(updates: dict):
             except Exception:
                 # Fallback non-atomique
                 with open(config_path, "w", encoding="utf-8") as f:
-                    yaml.dump(
-                        config, f, default_flow_style=False, allow_unicode=True, sort_keys=False
-                    )
+                    yaml.dump(config, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
             # [32] keep the in-memory mirror in sync — otherwise the next
             # settings.yaml_set() re-dumps the stale _yaml_data and reverts
             # what we just wrote to disk.
@@ -939,10 +935,7 @@ def _persist_vpn_config(updates: dict):
                                 yaml_key = key_map[k]
                                 if yaml_key in ip_rot:
                                     m._config[yaml_key] = ip_rot[yaml_key]
-                        if (
-                            "circuit_breaker_threshold" in updates
-                            or "circuit_breaker_recovery" in updates
-                        ):
+                        if "circuit_breaker_threshold" in updates or "circuit_breaker_recovery" in updates:
                             try:
                                 from vpn_manager import CircuitBreaker
 
@@ -1205,10 +1198,7 @@ def _socks5_raw_get(proxy_host: str, proxy_port: int, target: str, timeout: floa
         path = u.path or "/"
         if u.query:
             path += "?" + u.query
-        req = (
-            f"GET {path} HTTP/1.1\r\nHost: {host}\r\n"
-            f"User-Agent: opencode-proxy/1.0\r\nConnection: close\r\n\r\n"
-        )
+        req = f"GET {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: opencode-proxy/1.0\r\nConnection: close\r\n\r\n"
         with ssl.create_default_context().wrap_socket(sock, server_hostname=host) as tls:
             tls.sendall(req.encode())
             data = b""
@@ -1432,14 +1422,17 @@ def register_dashboard(
     _shared_conn = conn
     _tools_provider = tools_provider
     _ro_db_path = _resolve_ro_path(conn)
-    # [P1.3 perf] Cache-Control + gzip pré-compressé via middleware PUR ASGI
-    # (module-level _StaticCacheMiddleware) : ~0.05 ms/requête au lieu de
+    # [P1.3 perf] Cache-Control + gzip/brotli pré-compressé via middleware PUR
+    # ASGI (module-level _StaticCacheMiddleware) : ~0.05 ms/requête au lieu de
     # ~1-8 ms avec BaseHTTPMiddleware sur TOUTES les requêtes y compris SSE.
     # PAS de GZipMiddleware global : il compresserait les flux SSE
-    # (tampon → casse le temps réel). Compression statique calculée UNE FOIS
-    # au démarrage ; zéro coût par requête.
-    _pre_static_gz = _precompress_static_assets(static_dir)
-    app.add_middleware(_StaticCacheMiddleware, precompressed=_pre_static_gz)
+    # (tampon → casse le temps réel).
+    # [Phase 5 boot] Les octets viennent des .br/.gz générés AU BUILD
+    # (scripts/precompress.py) quand ils existent — plus de compression zlib
+    # de 250 Ko de JS à chaque démarrage ; compression à la volée seulement en
+    # repli (checkout sans build). Négociation br > gzip par requête.
+    _pre_static = load_precompressed(static_dir)
+    app.add_middleware(_StaticCacheMiddleware, precompressed=_pre_static)
 
     # [plan v10 §14.0.3] Confiance réseau zéro-friction : loopback + LAN CIDRs
     # passent sans identifiant ; mutations → même-host anti-CSRF + rate-limit ;
@@ -1531,8 +1524,7 @@ def register_dashboard(
             else "",
             "go_auth_cookie_set": bool(config_settings.OPENCODE_GO_AUTH_COOKIE),
             "go_auth_cookie_masked": (config_settings.OPENCODE_GO_AUTH_COOKIE[:6] + "****")
-            if config_settings.OPENCODE_GO_AUTH_COOKIE
-            and len(config_settings.OPENCODE_GO_AUTH_COOKIE) > 6
+            if config_settings.OPENCODE_GO_AUTH_COOKIE and len(config_settings.OPENCODE_GO_AUTH_COOKIE) > 6
             else (""),
             "api_keys": [
                 {
@@ -1561,9 +1553,7 @@ def register_dashboard(
         }
 
     @app.get("/api/routes")
-    async def get_routes(
-        request: Request, q: str = None, geo_status: str = None, limit: int = 50, offset: int = 0
-    ):
+    async def get_routes(request: Request, q: str = None, geo_status: str = None, limit: int = 50, offset: int = 0):
         """Routes with geo enrichment + pagination (vivid-hinton P4)."""
         limit = max(1, min(200, int(limit or 50)))
         offset = max(0, int(offset or 0))
@@ -1581,11 +1571,7 @@ def register_dashboard(
             status = str(g.get("geo_status", "ok"))
             if geo_status and status != geo_status:
                 continue
-            if (
-                q
-                and q.lower() not in key.lower()
-                and q.lower() not in str(route.get("model", "")).lower()
-            ):
+            if q and q.lower() not in key.lower() and q.lower() not in str(route.get("model", "")).lower():
                 continue
             eff = g.get("effective_allowed", set())
             items.append(
@@ -1620,9 +1606,7 @@ def register_dashboard(
             "enabled": bool(getattr(config_settings, "GEO_ENABLED", False)),
             "version": int(getattr(config_settings, "GEO_VERSION", 1) or 1),
             "policies": dict(getattr(config_settings, "GEO_POLICIES", {}) or {}),
-            "allow_direct_when_compatible": bool(
-                getattr(config_settings, "GEO_ALLOW_DIRECT_WHEN_COMPATIBLE", True)
-            ),
+            "allow_direct_when_compatible": bool(getattr(config_settings, "GEO_ALLOW_DIRECT_WHEN_COMPATIBLE", True)),
         }
 
     @app.put("/api/geo-policies")
@@ -1710,7 +1694,9 @@ def register_dashboard(
         try:
             import json as _js
 
-            p = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs", "geo_notifications.json")
+            p = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs", "geo_notifications.json"
+            )
             if not os.path.exists(p):
                 return {"notifications": []}
             with open(p, encoding="utf-8") as _f:
@@ -2138,9 +2124,7 @@ def register_dashboard(
 
         target = mgr.full_restart if full else mgr.restart
         threading.Thread(target=target, name="proxy-restart", daemon=False).start()
-        msg = (
-            "Redémarrage complet déclenché" if full else "Redémarrage déclenché"
-        )
+        msg = "Redémarrage complet déclenché" if full else "Redémarrage déclenché"
         return {"status": "ok", "message": msg}
 
     # ── Stats & history ──
@@ -2222,9 +2206,7 @@ def register_dashboard(
                 "       SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END),"
                 "       SUM(CASE WHEN success = 0 OR success IS NULL THEN 1 ELSE 0 END),"
                 "       COALESCE(AVG(duration_ms), 0)"
-                " FROM requests "
-                + where
-                + " GROUP BY COALESCE(NULLIF(free_model_ip, ''), account_alias, '')",
+                " FROM requests " + where + " GROUP BY COALESCE(NULLIF(free_model_ip, ''), account_alias, '')",
                 params,
             ).fetchall()
 
@@ -2232,13 +2214,11 @@ def register_dashboard(
             if rates is None:
                 # Index-only range probes on idx_timestamp (or idx_requests_station_ts).
                 c1m = db.execute(
-                    "SELECT COUNT(*) FROM requests WHERE timestamp >= ? AND timestamp <= ?"
-                    + station_cond,
+                    "SELECT COUNT(*) FROM requests WHERE timestamp >= ? AND timestamp <= ?" + station_cond,
                     [b1m, now_s] + station_params,
                 ).fetchone()[0]
                 c1h = db.execute(
-                    "SELECT COUNT(*) FROM requests WHERE timestamp >= ? AND timestamp <= ?"
-                    + station_cond,
+                    "SELECT COUNT(*) FROM requests WHERE timestamp >= ? AND timestamp <= ?" + station_cond,
                     [b1h, now_s] + station_params,
                 ).fetchone()[0]
 
@@ -2274,9 +2254,7 @@ def register_dashboard(
                 avg_per_min = None
             rates = {
                 **rates,
-                "period_minutes": round(period_minutes, 1)
-                if period_minutes is not None
-                else None,
+                "period_minutes": round(period_minutes, 1) if period_minutes is not None else None,
                 "avg_per_min": round(avg_per_min, 2) if avg_per_min is not None else None,
             }
 
@@ -2437,9 +2415,7 @@ def register_dashboard(
         from dashboard.display import set_debug_log_file
 
         if enabled:
-            log_dir = os.path.join(
-                os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs"
-            )
+            log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs")
             debug_log_path = os.path.join(log_dir, "debug.log")
             set_debug_log_file(debug_log_path)
         from dashboard.display import debug as _debug_fn
@@ -2600,7 +2576,25 @@ def register_dashboard(
 
     @app.get("/api/quotas")
     async def get_quotas():
-        return await get_quota_snapshot()
+        """Quotas des workspaces — stale-while-revalidate (Phase 4 plan boot).
+
+        La donnée en cache est TOUJOURS servie immédiatement (jamais d'attente
+        upstream sur le chemin de la requête) ; son âge est publié dans
+        ``X-Cache`` / ``Cache-Control`` et un rafraîchissement part en fond si
+        elle dépasse max-age. Le client (dashboard) peut afficher un badge
+        « périmé » au lieu d'un spinner.
+        """
+        data = await get_quota_snapshot()
+        state, age = quota_cache_state()
+        age_hdr = "unknown" if age == float("inf") else f"{age:.1f}"
+        return JSONResponse(
+            content=data,
+            headers={
+                "Cache-Control": (f"private, max-age={int(SWR_MAX_AGE_S)}, stale-while-revalidate={int(SWR_STALE_S)}"),
+                "X-Cache": {"fresh": "HIT", "stale": "STALE", "miss": "MISS"}[state],
+                "X-Cache-Age": age_hdr,
+            },
+        )
 
     @app.get("/api/free-model-usage")
     async def get_free_model_usage(days: int = 7):
@@ -2845,9 +2839,7 @@ def register_dashboard(
             None,
         )
         if mgr is None:
-            return JSONResponse(
-                status_code=404, content={"error": f"station {station_id} introuvable"}
-            )
+            return JSONResponse(status_code=404, content={"error": f"station {station_id} introuvable"})
         n = max(10, min(int(lines or 50), 300))
         try:
             proc = await asyncio.to_thread(
@@ -2857,9 +2849,7 @@ def register_dashboard(
                 timeout=8,
                 creationflags=0x08000000 if sys.platform == "win32" else 0,
             )
-            text = ((proc.stdout or b"") + (proc.stderr or b"")).decode(
-                "utf-8", errors="replace"
-            )[-20000:]
+            text = ((proc.stdout or b"") + (proc.stderr or b"")).decode("utf-8", errors="replace")[-20000:]
             return {"station": station_id, "tail": n, "logs": text}
         except Exception as e:
             return JSONResponse(status_code=502, content={"error": str(e)})
@@ -2925,7 +2915,13 @@ def register_dashboard(
                     data["healthy"] = _connected
                     data["total"] = _total
                     data["stations"] = [
-                        {"station": _s.get("station"), "vpn_status": _s.get("status"), "current_ip": _s.get("ip"), "current_server": _s.get("server"), "vpn": _s}
+                        {
+                            "station": _s.get("station"),
+                            "vpn_status": _s.get("status"),
+                            "current_ip": _s.get("ip"),
+                            "current_server": _s.get("server"),
+                            "vpn": _s,
+                        }
                         for _s in _all
                     ]
                 except Exception:
@@ -2952,9 +2948,7 @@ def register_dashboard(
             try:
                 _running = getattr(_ip_stats_db, "_running_task", None)
                 if _running is None or _running.done():
-                    _ip_stats_db._running_task = asyncio.create_task(
-                        _ip_stats_db(shared_state.vpn_manager)
-                    )
+                    _ip_stats_db._running_task = asyncio.create_task(_ip_stats_db(shared_state.vpn_manager))
             except Exception:
                 pass
             # [plan] F: cross-station shared state (recent-IP registry +
@@ -2975,9 +2969,7 @@ def register_dashboard(
             # héritent de l'env du parent (cause racine 19/08). La bannière
             # dashboard s'affiche quand ce champ est présent.
             if config_settings.ENV_DIVERGENCE:
-                data["env_divergence"] = [
-                    {"key": k, "file": f, "env": e} for k, f, e in config_settings.ENV_DIVERGENCE
-                ]
+                data["env_divergence"] = [{"key": k, "file": f, "env": e} for k, f, e in config_settings.ENV_DIVERGENCE]
             # [v6 P0-2] boot_error — 1/4 vs 4/4 visible (fail-open, pas raise)
             if getattr(shared_state, "boot_error", None):
                 data["boot_error"] = shared_state.boot_error
@@ -3001,9 +2993,7 @@ def register_dashboard(
                 # [GUI toggle « Cooldown latence »] état persistant du moteur
                 # (config.yaml latency_rotation.enabled) pour le toggle.
                 data["latency_enabled"] = bool(getattr(_leng.cfg, "enabled", True))
-                data["global_degraded_remaining"] = round(
-                    max(0.0, float(_leng._global_paused_until) - _leng._now()), 1
-                )
+                data["global_degraded_remaining"] = round(max(0.0, float(_leng._global_paused_until) - _leng._now()), 1)
             except Exception:
                 pass
             data["socks5"] = {
@@ -3028,9 +3018,7 @@ def register_dashboard(
                 "allow_direct_when_compatible": bool(
                     getattr(config_settings, "GEO_ALLOW_DIRECT_WHEN_COMPATIBLE", True)
                 ),
-                "geo_allow_direct": bool(
-                    getattr(config_settings, "GEO_ALLOW_DIRECT_WHEN_COMPATIBLE", True)
-                ),
+                "geo_allow_direct": bool(getattr(config_settings, "GEO_ALLOW_DIRECT_WHEN_COMPATIBLE", True)),
             }
             # [Axe C] geo_strict_union: union of all effective_allowed countries
             # across all geo-enabled routes — lets the GUI show which countries
@@ -3162,6 +3150,7 @@ def register_dashboard(
 
         try:
             from latency_rotation import get_engine
+
             eng = getattr(shared_state, "latency_engine", None) or get_engine()
         except Exception as e:
             return {"enabled": False, "error": f"engine unavailable: {e}"}
@@ -3172,21 +3161,28 @@ def register_dashboard(
         for (sid, ip), (kind, until) in sorted(eng._cooldowns.items()):
             remaining = max(0.0, until - now)
             if remaining > 0:
-                cooldowns.append({
-                    "station": sid, "ip": ip, "kind": kind,
-                    "remaining_s": round(remaining, 1),
-                })
+                cooldowns.append(
+                    {
+                        "station": sid,
+                        "ip": ip,
+                        "kind": kind,
+                        "remaining_s": round(remaining, 1),
+                    }
+                )
         soft_history = sorted(f"{sid}|{ip}" for sid, ip in eng._soft_history)
         trackers = []
         for (sid, ip), tr in sorted(eng._trackers.items()):
             snap = tr.snapshot()
-            trackers.append({
-                "station": sid, "ip": ip,
-                "count": snap.count,
-                "ewma_ms": None if snap.ewma_ms is None else round(snap.ewma_ms, 1),
-                "p95_ms": None if snap.p95_ms is None else round(snap.p95_ms, 1),
-                "consecutive_slow": snap.consecutive_slow,
-            })
+            trackers.append(
+                {
+                    "station": sid,
+                    "ip": ip,
+                    "count": snap.count,
+                    "ewma_ms": None if snap.ewma_ms is None else round(snap.ewma_ms, 1),
+                    "p95_ms": None if snap.p95_ms is None else round(snap.p95_ms, 1),
+                    "consecutive_slow": snap.consecutive_slow,
+                }
+            )
         return {
             "enabled": bool(cfg.enabled),
             "config": {
@@ -3304,13 +3300,9 @@ def register_dashboard(
             try:
                 _bt = int(float(_raw_bt))
             except (TypeError, ValueError):
-                return JSONResponse(
-                    status_code=400, content={"error": "bad_ttl doit être un entier entre 1 et 3600"}
-                )
+                return JSONResponse(status_code=400, content={"error": "bad_ttl doit être un entier entre 1 et 3600"})
             if not (1 <= _bt <= 3600):
-                return JSONResponse(
-                    status_code=400, content={"error": "bad_ttl doit être un entier entre 1 et 3600"}
-                )
+                return JSONResponse(status_code=400, content={"error": "bad_ttl doit être un entier entre 1 et 3600"})
             body["bad_ttl"] = _bt
 
         # [GUI toggle « Cooldown latence »] validation minimale du bloc imbriqué
@@ -3333,7 +3325,12 @@ def register_dashboard(
                 body["free_parallel"] = _st_fp._normalize_free_parallel(body["free_parallel"])
             except Exception as e:
                 return {"error": f"free_parallel invalide : {e}"}
-        for _fk in ("free_parallel_enabled", "free_parallel_routing", "free_parallel_mode", "free_parallel_hedge_delay_ms"):
+        for _fk in (
+            "free_parallel_enabled",
+            "free_parallel_routing",
+            "free_parallel_mode",
+            "free_parallel_hedge_delay_ms",
+        ):
             if _fk in body:
                 # will be validated in _persist_vpn_config / pool.update_config; keep as is
                 pass
@@ -3374,9 +3371,7 @@ def register_dashboard(
                 if not (1 <= _new_n <= 10):
                     return JSONResponse(
                         status_code=400,
-                        content={
-                            "error": f"station_count doit être un entier entre 1 et 10, reçu {_raw_n!r}"
-                        },
+                        content={"error": f"station_count doit être un entier entre 1 et 10, reçu {_raw_n!r}"},
                     )
                 body.pop("station_count")  # consumed — never fanned out
                 if _new_n != len(managers):
@@ -3595,9 +3590,7 @@ def register_dashboard(
         if station:
             # [plan 18/08 §4] N-station: 1-indexed lookup in the registry.
             if not (1 <= station <= len(managers)):
-                return {
-                    "error": f"station {station} non configurée (station_count={len(managers)})"
-                }
+                return {"error": f"station {station} non configurée (station_count={len(managers)})"}
             mgr = managers[station - 1]
         else:
             # 0 → the station the pool currently routes through.
@@ -3759,11 +3752,7 @@ def register_dashboard(
         import shared_state
 
         mgr = next(
-            (
-                m
-                for m in (getattr(shared_state, "vpn_managers", None) or [])
-                if getattr(m, "_station", None) == sid
-            ),
+            (m for m in (getattr(shared_state, "vpn_managers", None) or []) if getattr(m, "_station", None) == sid),
             None,
         )
         if mgr is None:
@@ -3791,11 +3780,7 @@ def register_dashboard(
         import shared_state
 
         mgr = next(
-            (
-                m
-                for m in (getattr(shared_state, "vpn_managers", None) or [])
-                if getattr(m, "_station", None) == sid
-            ),
+            (m for m in (getattr(shared_state, "vpn_managers", None) or []) if getattr(m, "_station", None) == sid),
             None,
         )
         if mgr is None:
@@ -3816,11 +3801,7 @@ def register_dashboard(
         import shared_state
 
         mgr = next(
-            (
-                m
-                for m in (getattr(shared_state, "vpn_managers", None) or [])
-                if getattr(m, "_station", None) == sid
-            ),
+            (m for m in (getattr(shared_state, "vpn_managers", None) or []) if getattr(m, "_station", None) == sid),
             None,
         )
         if mgr is None:
@@ -3843,11 +3824,7 @@ def register_dashboard(
         import shared_state
 
         mgr = next(
-            (
-                m
-                for m in (getattr(shared_state, "vpn_managers", None) or [])
-                if getattr(m, "_station", None) == sid
-            ),
+            (m for m in (getattr(shared_state, "vpn_managers", None) or []) if getattr(m, "_station", None) == sid),
             None,
         )
         pool = getattr(shared_state, "free_ip_pool", None)
@@ -3879,9 +3856,7 @@ def register_dashboard(
         def _query(db):
             rows = db.execute(
                 "SELECT model, SUM(tokens_input) AS tokens_input, "
-                "SUM(tokens_output) AS tokens_output FROM requests "
-                + where
-                + " GROUP BY model",
+                "SUM(tokens_output) AS tokens_output FROM requests " + where + " GROUP BY model",
                 params,
             ).fetchall()
             return [dict(r) for r in rows]
@@ -4093,7 +4068,6 @@ def register_dashboard(
         # must not block the API).
         if mode in ("vpn", "socks5"):
             try:
-
                 # Ensure every configured station (station_count) is present.
                 # If the registry is short (e.g. boot direct with 1), rebuild
                 # it via _apply_station_count to restore the missing managers.
@@ -4123,7 +4097,9 @@ def register_dashboard(
                 # vpn_event SSE déjà émis par _set_status.
                 _starts = []
                 for mm in managers:
-                    if getattr(mm, "enabled", True) and str(getattr(mm, "status", "disconnected") or "disconnected") not in ("connected", "degraded"):
+                    if getattr(mm, "enabled", True) and str(
+                        getattr(mm, "status", "disconnected") or "disconnected"
+                    ) not in ("connected", "degraded"):
                         _starts.append(
                             asyncio.create_task(
                                 mm.start(),
@@ -4236,11 +4212,7 @@ def register_dashboard(
             name += ".ovpn"
         upload = form.get("config")
         # [mypy] UploadFile | str : seul l'UploadFile porte .file
-        content = (
-            await upload.read()
-            if upload is not None and not isinstance(upload, str)
-            else None
-        )
+        content = await upload.read() if upload is not None and not isinstance(upload, str) else None
         if not content:
             return {"error": "fichier config manquant (champ FormData 'config')"}
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -4500,9 +4472,7 @@ def register_dashboard(
                     "account_alias": r["account_alias"] if "account_alias" in r.keys() else None,
                     "is_free_model": "-free" in (r["model"] or ""),
                     "station": r["station"] if "station" in r.keys() else None,
-                    "free_ip": r["free_model_ip"]
-                    if "free_model_ip" in r.keys() and r["free_model_ip"]
-                    else "",
+                    "free_ip": r["free_model_ip"] if "free_model_ip" in r.keys() and r["free_model_ip"] else "",
                     "geo_country": r["geo_country"] if "geo_country" in r.keys() else None,
                     "geo_blocked": bool(r["geo_blocked"]) if "geo_blocked" in r.keys() and r["geo_blocked"] else False,
                     "geo_direct_country": r["geo_direct_country"] if "geo_direct_country" in r.keys() else None,
@@ -4566,20 +4536,12 @@ def register_dashboard(
             "thinking": row["thinking"] if "thinking" in row.keys() else None,
             "effort": row["effort"] if "effort" in row.keys() else None,
             "client_ip": row["client_ip"] if "client_ip" in row.keys() else None,
-            "client_user_agent": row["client_user_agent"]
-            if "client_user_agent" in row.keys()
-            else None,
+            "client_user_agent": row["client_user_agent"] if "client_user_agent" in row.keys() else None,
             "account_alias": row["account_alias"] if "account_alias" in row.keys() else None,
             "tools": _parse_json_field(row["tools"]) if "tools" in row.keys() else [],
-            "tools_used": _parse_json_field(row["tools_used"])
-            if "tools_used" in row.keys()
-            else [],
-            "request_body": _parse_json_field(row["request_body"])
-            if "request_body" in row.keys()
-            else None,
-            "response_body": _parse_json_field(row["response_body"])
-            if "response_body" in row.keys()
-            else None,
+            "tools_used": _parse_json_field(row["tools_used"]) if "tools_used" in row.keys() else [],
+            "request_body": _parse_json_field(row["request_body"]) if "request_body" in row.keys() else None,
+            "response_body": _parse_json_field(row["response_body"]) if "response_body" in row.keys() else None,
             # [Étape 2 — O2] jambes fallback corrélées par req_id (NULL = pas de fallback).
             "free_status": row["free_status"] if "free_status" in row.keys() else None,
             "paid_status": row["paid_status"] if "paid_status" in row.keys() else None,
@@ -4661,9 +4623,7 @@ def register_dashboard(
                 conn.execute("DELETE FROM requests WHERE model = ?", (model,))
                 if token_usage and model in token_usage:
                     with token_lock:
-                        token_usage[model]["input"] = token_usage[model]["output"] = token_usage[
-                            model
-                        ]["cache"] = 0
+                        token_usage[model]["input"] = token_usage[model]["output"] = token_usage[model]["cache"] = 0
             elif before:
                 conn.execute(
                     "DELETE FROM requests WHERE timestamp < ?",

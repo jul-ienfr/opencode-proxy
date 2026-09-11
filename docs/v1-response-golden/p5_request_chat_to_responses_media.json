@@ -1,0 +1,96 @@
+{
+  "fn": "_chat_to_responses_request",
+  "input": {
+    "chat": {
+      "model": "deepseek-v4-flash",
+      "max_tokens": 128,
+      "messages": [
+        {
+          "role": "user",
+          "content": [
+            {
+              "type": "text",
+              "text": "look"
+            },
+            {
+              "type": "image_url",
+              "image_url": {
+                "url": "data:image/png;base64,iVBORw0KGgo="
+              }
+            },
+            {
+              "type": "file",
+              "file": {
+                "file_id": "file-1"
+              }
+            },
+            {
+              "type": "file",
+              "file": {
+                "file_data": "data:application/pdf;base64,JVBERi0=",
+                "filename": "a.pdf"
+              }
+            },
+            {
+              "type": "video",
+              "video": {
+                "url": "https://ex.com/v.mp4"
+              }
+            },
+            {
+              "type": "input_audio",
+              "input_audio": {
+                "data": "AAA",
+                "format": "ogg"
+              }
+            }
+          ]
+        },
+        {
+          "role": "tool",
+          "tool_call_id": "call_missing",
+          "content": "orphan"
+        }
+      ]
+    }
+  },
+  "expected": {
+    "model": "deepseek-v4-flash",
+    "input": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "input_text",
+            "text": "look"
+          },
+          {
+            "type": "input_image",
+            "image_url": "data:image/png;base64,iVBORw0KGgo="
+          },
+          {
+            "type": "input_file",
+            "file_id": "file-1"
+          },
+          {
+            "type": "input_file",
+            "file_data": "data:application/pdf;base64,JVBERi0=",
+            "filename": "a.pdf"
+          },
+          {
+            "type": "input_text",
+            "text": "[video:unsupported]"
+          },
+          {
+            "type": "input_text",
+            "text": "[audio:ogg]"
+          }
+        ]
+      }
+    ],
+    "stream": false,
+    "max_output_tokens": 128
+  },
+  "_note": "axe documents+images P5 : image/file → input_* ; vidéo et audio → placeholders ; tool orphelin droppé",
+  "_generated_by": "scripts/gen_golden_fixtures.py (plan v10 §11.5)"
+}

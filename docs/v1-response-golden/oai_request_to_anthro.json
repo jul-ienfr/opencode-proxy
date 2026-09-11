@@ -76,8 +76,8 @@
         ]
       }
     ],
-    "max_tokens": 512,
     "stream": false,
+    "max_tokens": 512,
     "system": "Be brief."
   },
   "_note": "role=tool bufferisé puis injecté dans le user suivant (contrat)",

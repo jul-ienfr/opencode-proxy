@@ -1,0 +1,65 @@
+{
+  "fn": "openai_to_anthropic_request",
+  "input": {
+    "oai_body": {
+      "model": "deepseek-v4-flash",
+      "max_tokens": 512,
+      "messages": [
+        {
+          "role": "user",
+          "content": "q"
+        },
+        {
+          "role": "assistant",
+          "content": "a",
+          "reasoning_content": "raisonnement converti par le proxy"
+        },
+        {
+          "role": "user",
+          "content": "suite"
+        }
+      ]
+    }
+  },
+  "expected": {
+    "model": "deepseek-v4-flash",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "q"
+          }
+        ]
+      },
+      {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "thinking",
+            "thinking": "raisonnement converti par le proxy",
+            "signature": "DREIHM7viWWctliYmGYrFtpivUhoDCpr8kzywxqksXw="
+          },
+          {
+            "type": "text",
+            "text": "a"
+          }
+        ]
+      },
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "suite"
+          }
+        ]
+      }
+    ],
+    "stream": false,
+    "max_tokens": 512
+  },
+  "_note": "axe thinking multi-tours P4 : bloc thinking synthétique retiré de l'historique multi-tours (Phase D)",
+  "_generated_by": "scripts/gen_golden_fixtures.py (plan v10 §11.5)"
+}

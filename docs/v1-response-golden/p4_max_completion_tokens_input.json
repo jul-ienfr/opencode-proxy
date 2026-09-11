@@ -1,0 +1,33 @@
+{
+  "fn": "openai_to_anthropic_request",
+  "input": {
+    "oai_body": {
+      "model": "claude-sonnet-4-5",
+      "max_completion_tokens": 333,
+      "messages": [
+        {
+          "role": "user",
+          "content": "hi"
+        }
+      ]
+    }
+  },
+  "expected": {
+    "model": "claude-sonnet-4-5",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "hi"
+          }
+        ]
+      }
+    ],
+    "stream": false,
+    "max_tokens": 333
+  },
+  "_note": "axe max_tokens (A17) : max_completion_tokens client → max_tokens Anthropic 333",
+  "_generated_by": "scripts/gen_golden_fixtures.py (plan v10 §11.5)"
+}

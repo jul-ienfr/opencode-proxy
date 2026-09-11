@@ -1,0 +1,154 @@
+{
+  "fn": "anthropic_to_openai",
+  "input": {
+    "body": {
+      "model": "claude-sonnet-4-5",
+      "max_tokens": 10,
+      "cache_control": {
+        "type": "ephemeral",
+        "ttl": "1h"
+      },
+      "tools": [
+        {
+          "name": "t0",
+          "input_schema": {
+            "type": "object"
+          },
+          "cache_control": {
+            "type": "ephemeral"
+          }
+        },
+        {
+          "name": "t1",
+          "input_schema": {
+            "type": "object"
+          },
+          "cache_control": {
+            "type": "ephemeral"
+          }
+        },
+        {
+          "name": "t2",
+          "input_schema": {
+            "type": "object"
+          },
+          "cache_control": {
+            "type": "ephemeral"
+          }
+        }
+      ],
+      "messages": [
+        {
+          "role": "user",
+          "content": [
+            {
+              "type": "text",
+              "text": "a",
+              "cache_control": {
+                "type": "ephemeral"
+              }
+            }
+          ]
+        },
+        {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "text",
+              "text": "b",
+              "cache_control": {
+                "type": "ephemeral"
+              }
+            }
+          ]
+        },
+        {
+          "role": "user",
+          "content": [
+            {
+              "type": "text",
+              "text": "c",
+              "cache_control": {
+                "type": "ephemeral"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "model": "deepseek-v4-flash"
+  },
+  "expected": {
+    "model": "deepseek-v4-flash",
+    "messages": [
+      {
+        "role": "user",
+        "content": "a"
+      },
+      {
+        "role": "assistant",
+        "content": "b"
+      },
+      {
+        "role": "user",
+        "content": "c",
+        "cache_control": {
+          "type": "ephemeral"
+        }
+      }
+    ],
+    "stream": false,
+    "max_tokens": 10,
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "t0",
+          "description": "",
+          "parameters": {
+            "type": "object",
+            "additionalProperties": false
+          }
+        },
+        "cache_control": {
+          "type": "ephemeral"
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "t1",
+          "description": "",
+          "parameters": {
+            "type": "object",
+            "additionalProperties": false
+          }
+        },
+        "cache_control": {
+          "type": "ephemeral"
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "t2",
+          "description": "",
+          "parameters": {
+            "type": "object",
+            "additionalProperties": false
+          }
+        },
+        "cache_control": {
+          "type": "ephemeral"
+        }
+      }
+    ],
+    "tool_choice": "auto",
+    "cache_control": {
+      "type": "ephemeral",
+      "ttl": "1h"
+    }
+  },
+  "_note": "axe cache_control (A20) : 7 breakpoints → élagage des plus anciens, 4 conservés",
+  "_generated_by": "scripts/gen_golden_fixtures.py (plan v10 §11.5)"
+}

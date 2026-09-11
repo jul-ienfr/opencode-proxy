@@ -1,0 +1,118 @@
+{
+  "fn": "anthropic_to_openai",
+  "input": {
+    "body": {
+      "model": "claude-sonnet-4-5",
+      "max_tokens": 100,
+      "messages": [
+        {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "tool_use",
+              "id": "toolu_01ABC",
+              "name": "read",
+              "input": {
+                "p": "a.pdf"
+              }
+            }
+          ]
+        },
+        {
+          "role": "user",
+          "content": [
+            {
+              "type": "tool_result",
+              "tool_use_id": "toolu_01ABC",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "voici"
+                },
+                {
+                  "type": "image",
+                  "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": "iVBORw0KGgo="
+                  }
+                },
+                {
+                  "type": "document",
+                  "name": "r.pdf",
+                  "source": {
+                    "type": "base64",
+                    "media_type": "application/pdf",
+                    "data": "JVBERi0="
+                  }
+                },
+                {
+                  "type": "document",
+                  "name": "u.pdf",
+                  "source": {
+                    "type": "url",
+                    "url": "https://ex.com/u.pdf"
+                  }
+                },
+                {
+                  "type": "audio",
+                  "source": {
+                    "type": "base64",
+                    "data": "AAA"
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    "model": "deepseek-v4-flash"
+  },
+  "expected": {
+    "model": "deepseek-v4-flash",
+    "messages": [
+      {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+          {
+            "id": "toolu_01ABC",
+            "type": "function",
+            "function": {
+              "name": "read",
+              "arguments": "{\"p\":\"a.pdf\"}"
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "tool_call_id": "toolu_01ABC",
+        "content": [
+          {
+            "type": "text",
+            "text": "voici\n[document:url]\n[audio]"
+          },
+          {
+            "type": "image_url",
+            "image_url": {
+              "url": "data:image/png;base64,iVBORw0KGgo="
+            }
+          },
+          {
+            "type": "file",
+            "file": {
+              "file_data": "data:application/pdf;base64,JVBERi0=",
+              "filename": "r.pdf"
+            }
+          }
+        ]
+      }
+    ],
+    "stream": false,
+    "max_tokens": 100
+  },
+  "_note": "axe documents+images : tool_result multimodal → parts image_url/file + placeholders [document:url]/[audio]",
+  "_generated_by": "scripts/gen_golden_fixtures.py (plan v10 §11.5)"
+}

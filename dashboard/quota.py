@@ -10,8 +10,17 @@ import json
 import logging
 import re
 import time
+from typing import TYPE_CHECKING
 
-import httpx
+# [Phase 3b-1 boot] httpx DIFFÉRÉ : `import httpx` charge `httpx._main` (CLI)
+# → `rich` + `click` + `pygments` (~63 ms) inutiles ici. Le client n'est
+# construit qu'au premier fetch de quota (post-ready). Voir core/lazy.py.
+if TYPE_CHECKING:
+    import httpx
+else:
+    from core.lazy import LazyModule
+
+    httpx = LazyModule("httpx")
 
 from .events import get_event_manager
 
@@ -29,10 +38,12 @@ def set_on_workspace_recovered_callback(callback):
 
 
 # Shared HTTP client for quota fetcher (reused across calls, avoids fd leaks)
-_http_client: httpx.AsyncClient | None = None
+# [Phase 3b-1] annotation en littéral de chaîne : non évaluée au chargement,
+# donc aucun accès au proxy httpx ici.
+_http_client: "httpx.AsyncClient | None" = None
 
 
-async def _get_http_client() -> httpx.AsyncClient:
+async def _get_http_client() -> "httpx.AsyncClient":
     """Get or create a shared httpx client for the quota fetcher."""
     global _http_client
     if _http_client is None or _http_client.is_closed:
@@ -119,11 +130,7 @@ async def fetch_available_models() -> list[str]:
     try:
         import config.settings as _cs
 
-        lr = (
-            _cs._FREE_DISCOVERY_STATE.get("last_refresh")
-            if hasattr(_cs, "_FREE_DISCOVERY_STATE")
-            else None
-        )
+        lr = _cs._FREE_DISCOVERY_STATE.get("last_refresh") if hasattr(_cs, "_FREE_DISCOVERY_STATE") else None
         if lr and getattr(_cs, "FREE_MODELS", None):
             try:
                 import datetime as _dt2
@@ -151,9 +158,7 @@ async def fetch_available_models() -> list[str]:
         if resp.status_code != 200:
             raise RuntimeError(f"Models endpoint HTTP {resp.status_code}")
         data = resp.json()
-        ids = sorted(
-            {m["id"] for m in data.get("data", []) if isinstance(m, dict) and "id" in m}
-        )
+        ids = sorted({m["id"] for m in data.get("data", []) if isinstance(m, dict) and "id" in m})
         if not ids:
             raise RuntimeError("No models returned from upstream")
         return ids
@@ -194,6 +199,37 @@ def get_available_models() -> dict:
 
 _caches: dict[str, dict] = {}
 _cache_lock = asyncio.Lock()
+
+# ── [Phase 4 plan boot] Stale-while-revalidate ───────────────────────
+# Le poller rafraîchit toutes les QUOTA_FETCH_INTERVAL (300 s). Entre deux
+# cycles, un client qui interroge /api/quotas recevait la donnée du cycle
+# précédent sans aucun signal d'âge. On expose désormais l'âge et l'état
+# (fresh / stale / miss) et on déclenche un rafraîchissement EN FOND
+# (single-flight) dès que la donnée dépasse max-age — le client n'attend
+# jamais l'upstream, il reçoit la valeur périmée tout de suite.
+SWR_MAX_AGE_S = 60.0  # en deçà : « fresh »
+SWR_STALE_S = 300.0  # au-delà : la donnée n'est plus servie comme fraîche
+_last_refresh_ts: float = 0.0  # monotonic du dernier cycle de poll réussi
+_swr_inflight = False  # single-flight du refresh de fond
+
+
+def _mark_refreshed() -> None:
+    """Enregistre qu'un cycle de poll vient de mettre les caches à jour."""
+    global _last_refresh_ts
+    _last_refresh_ts = time.monotonic()
+
+
+def quota_cache_state() -> tuple[str, float]:
+    """Retourne ``(état, âge_s)`` du snapshot courant.
+
+    * ``miss``  : aucun cycle de poll n'a encore abouti (âge inconnu/infini) ;
+    * ``fresh`` : âge ≤ ``SWR_MAX_AGE_S`` ;
+    * ``stale`` : au-delà — la donnée reste servie (SWR), mais marquée.
+    """
+    if _last_refresh_ts <= 0.0:
+        return "miss", float("inf")
+    age = time.monotonic() - _last_refresh_ts
+    return ("fresh" if age <= SWR_MAX_AGE_S else "stale"), age
 
 
 def _new_cache(status="not_configured", error=None):
@@ -502,10 +538,7 @@ def parse_quota_html(html: str) -> dict:
             result[key] = w
 
     if not result:
-        raise ValueError(
-            "Could not parse quota data from the OpenCode Go page. "
-            "The page format may have changed."
-        )
+        raise ValueError("Could not parse quota data from the OpenCode Go page. The page format may have changed.")
 
     # Fill in any missing windows with zeroed data
     for key in ("rolling", "weekly", "monthly"):
@@ -515,6 +548,7 @@ def parse_quota_html(html: str) -> dict:
 
 
 # ── HTTP fetch ──
+
 
 def _quota_fetch_interval() -> float:
     """[PC-14/O1] ``background.quota_fetch_interval`` (clé morte avant
@@ -659,9 +693,7 @@ async def fetch_quotas(workspace_id: str, auth_cookie: str) -> dict:
             raise
 
         if resp.status_code in (401, 403):
-            logger.debug(
-                "[quota] auth failed for workspace %s (HTTP %d)", workspace_id[:8], resp.status_code
-            )
+            logger.debug("[quota] auth failed for workspace %s (HTTP %d)", workspace_id[:8], resp.status_code)
             raise RuntimeError("OpenCode Go authentication failed. Refresh your auth cookie.")
         if resp.status_code >= 500 and attempt < 2:
             last_err = RuntimeError(f"OpenCode Go request failed with HTTP {resp.status_code}.")
@@ -694,9 +726,88 @@ async def get_quota_snapshot() -> dict:
     [34] Copied under _cache_lock (the poller mutates _caches concurrently),
     one level deep so the in-place status updates can't race the JSON
     serialization of a returned snapshot.
+
+    [Phase 4 plan boot] Si la donnée est périmée, un rafraîchissement part en
+    tâche de fond (single-flight) et l'appelant reçoit IMMÉDIATEMENT la valeur
+    courante — jamais d'attente upstream sur le chemin de la requête.
     """
+    state, age = quota_cache_state()
+    if state != "fresh":
+        _trigger_background_refresh()
     async with _cache_lock:
         return {wid: dict(cache) for wid, cache in _caches.items()}
+
+
+def _trigger_background_refresh() -> None:
+    """Lance un cycle de poll hors du chemin de requête (single-flight).
+
+    No-op si aucun cycle n'est possible (pas de boucle asyncio, refresh déjà
+    en vol, ou aucun workspace configuré) : l'appelant ne doit jamais échouer
+    à cause de l'optimisation.
+    """
+    global _swr_inflight
+    if _swr_inflight:
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    if not get_configured_workspaces():
+        return
+    _swr_inflight = True
+
+    async def _refresh():
+        global _swr_inflight
+        try:
+            await _refresh_all_now()
+        except Exception as e:
+            logger.debug("[quota] SWR refresh failed: %s", e)
+        finally:
+            _swr_inflight = False
+
+    loop.create_task(_refresh())
+
+
+async def _refresh_all_now() -> None:
+    """Un cycle de fetch complet, immédiat (partagé poller + SWR)."""
+    workspaces = get_configured_workspaces()
+    if not workspaces:
+        return
+    sem = asyncio.Semaphore(3)
+
+    async def _fetch_one(ws):
+        async with sem:
+            wid = ws["go_workspace_id"]
+            cookie = ws["go_auth_cookie"]
+            try:
+                quotas = await fetch_quotas(wid, cookie)
+                async with _cache_lock:
+                    prev = _caches.get(wid)
+                    was_error = bool(prev and prev.get("status") == "error")
+                    _caches[wid] = {
+                        "status": "ok",
+                        "error": None,
+                        "fetched_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                        "quotas": quotas,
+                    }
+                get_event_manager().publish("quotas_updated", {"workspace_id": wid, "status": "ok"})
+                if was_error and _on_workspace_recovered_callback:
+                    try:
+                        _on_workspace_recovered_callback(wid)
+                    except Exception as cb_err:
+                        logger.debug("Recovery callback error for workspace %s: %s", wid[:8], cb_err)
+            except Exception as e:
+                logger.warning("Quota fetch failed for workspace %s: %s", wid[:8], e)
+                async with _cache_lock:
+                    if wid in _caches:
+                        _caches[wid]["status"] = "error"
+                        _caches[wid]["error"] = str(e)
+                    else:
+                        _caches[wid] = _new_cache("error", str(e))
+                get_event_manager().publish("quotas_updated", {"workspace_id": wid, "status": "error", "error": str(e)})
+
+    await asyncio.gather(*(_fetch_one(ws) for ws in workspaces))
+    _mark_refreshed()
 
 
 # ── Background poller ──
@@ -712,30 +823,36 @@ async def start_quota_fetcher(app):
     logger.debug("[quota] start_quota_fetcher called")
 
     # Fetch model limits + available models on startup (parallèle, non-bloquant)
+    # [Phase 4 plan boot] UN SEUL budget pour les deux fetches
+    # (asyncio.timeout(2.5) + gather(return_exceptions=True)) au lieu de deux
+    # wait_for indépendants : le budget est global, donc l'attente totale est
+    # bornée à 2,5 s quoi qu'il arrive, et un upstream lent ne peut pas faire
+    # traîner l'autre jambe. Le client HTTP est le client partagé
+    # (_get_http_client) — même pool, mêmes FDs.
     async def _startup_fetch():
         global _models_cache
 
-        async def _fetch_limits_safe():
-            try:
-                return await asyncio.wait_for(fetch_model_limits(), timeout=4.0)
-            except TimeoutError:
-                logger.debug("[quota] docs fetch timeout (4s) — fallback")
-                return None
-            except Exception as e:
-                logger.debug("[quota] docs fetch failed: %s", e)
-                return None
+        async def _limits() -> dict | None:
+            return await fetch_model_limits()
 
-        async def _fetch_models_safe():
-            try:
-                return await asyncio.wait_for(fetch_available_models(), timeout=4.0)
-            except TimeoutError:
-                logger.debug("[quota] models fetch timeout (4s)")
-                return None
-            except Exception as e:
-                logger.debug("[quota] models fetch failed: %s", e)
-                return None
+        async def _models() -> list[str] | None:
+            return await fetch_available_models()
 
-        limits, models = await asyncio.gather(_fetch_limits_safe(), _fetch_models_safe())
+        try:
+            async with asyncio.timeout(2.5):
+                limits, models = await asyncio.gather(_limits(), _models(), return_exceptions=True)
+        except TimeoutError:
+            logger.debug("[quota] startup fetch budget dépassé (2.5s) — fallback")
+            limits, models = None, None
+
+        # gather(return_exceptions=True) renvoie les exceptions telles quelles :
+        # on les traite comme un échec de la jambe concernée (jamais propagées).
+        if isinstance(limits, BaseException):
+            logger.debug("[quota] docs fetch failed: %s", limits)
+            limits = None
+        if isinstance(models, BaseException):
+            logger.debug("[quota] models fetch failed: %s", models)
+            models = None
 
         if limits is not None:
             try:
@@ -757,7 +874,7 @@ async def start_quota_fetcher(app):
     # Lance en arrière-plan sans bloquer le lifespan (ne retarde pas le 1er GET /api/config)
     try:
         asyncio.create_task(_startup_fetch())
-        logger.debug("[quota] startup fetch lancé en arrière-plan (parallèle 4s)")
+        logger.debug("[quota] startup fetch lancé en arrière-plan (budget global 2.5s)")
     except Exception as e:
         logger.debug("[quota] impossible de lancer startup fetch: %s", e)
         try:
@@ -798,49 +915,10 @@ async def start_quota_fetcher(app):
                     next_deadline = time.monotonic() + QUOTA_FETCH_INTERVAL
                 continue
 
-            # [P4.3 perf] workspaces en parallèle (sémaphore 3) — 5 workspaces × 1s = 1s au lieu de 5s
-            sem = asyncio.Semaphore(3)
-
-            async def _fetch_one(ws):
-                async with sem:
-                    wid = ws["go_workspace_id"]
-                    cookie = ws["go_auth_cookie"]
-                    try:
-                        quotas = await fetch_quotas(wid, cookie)
-                        was_error = False
-                        async with _cache_lock:
-                            prev = _caches.get(wid)
-                            was_error = prev and prev.get("status") == "error"
-                            _caches[wid] = {
-                                "status": "ok",
-                                "error": None,
-                                "fetched_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                                "quotas": quotas,
-                            }
-                        get_event_manager().publish(
-                            "quotas_updated", {"workspace_id": wid, "status": "ok"}
-                        )
-                        logger.debug("Quotas refreshed for workspace %s", wid[:8])
-                        if was_error and _on_workspace_recovered_callback:
-                            try:
-                                _on_workspace_recovered_callback(wid)
-                            except Exception as cb_err:
-                                logger.debug(
-                                    "Recovery callback error for workspace %s: %s", wid[:8], cb_err
-                                )
-                    except Exception as e:
-                        logger.warning("Quota fetch failed for workspace %s: %s", wid[:8], e)
-                        async with _cache_lock:
-                            if wid in _caches:
-                                _caches[wid]["status"] = "error"
-                                _caches[wid]["error"] = str(e)
-                            else:
-                                _caches[wid] = _new_cache("error", str(e))
-                        get_event_manager().publish(
-                            "quotas_updated", {"workspace_id": wid, "status": "error", "error": str(e)}
-                        )
-
-            await asyncio.gather(*(_fetch_one(ws) for ws in workspaces))
+            # [Phase 4 plan boot] cycle de fetch PARTAGÉ avec le refresh SWR
+            # déclenché par get_quota_snapshot() — une seule implémentation,
+            # donc pas de divergence entre le poller et le SWR.
+            await _refresh_all_now()
 
             delay = max(0, next_deadline - time.monotonic())
             await asyncio.sleep(delay)

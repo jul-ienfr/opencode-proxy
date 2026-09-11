@@ -1,0 +1,40 @@
+{
+  "fn": "sanitize_tool_names",
+  "input": {
+    "tools": [
+      {
+        "type": "function",
+        "name": "mcp__plugin_very_long_tool_name_exceeding_sixty_four_chars_limit_aaaa"
+      },
+      {
+        "type": "function",
+        "name": "web_search"
+      },
+      {
+        "type": "function",
+        "name": "ok-name"
+      }
+    ]
+  },
+  "expected": [
+    [
+      {
+        "type": "function",
+        "name": "mcp__plugin_very_long_tool_name_exceeding_sixty_four_char-c662e5"
+      },
+      {
+        "type": "function",
+        "name": "web_search"
+      },
+      {
+        "type": "function",
+        "name": "ok-name"
+      }
+    ],
+    {
+      "mcp__plugin_very_long_tool_name_exceeding_sixty_four_char-c662e5": "mcp__plugin_very_long_tool_name_exceeding_sixty_four_chars_limit_aaaa"
+    }
+  ],
+  "_note": "axe tools noms longs : >64 → name[:57]+sha1[:6] ; web_* jamais renommés ; map retour",
+  "_generated_by": "scripts/gen_golden_fixtures.py (plan v10 §11.5)"
+}

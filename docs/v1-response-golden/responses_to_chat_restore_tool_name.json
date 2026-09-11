@@ -1,0 +1,58 @@
+{
+  "fn": "_responses_to_chat_response",
+  "input": {
+    "resp": {
+      "id": "resp_1",
+      "status": "completed",
+      "output": [
+        {
+          "type": "function_call",
+          "call_id": "call_9",
+          "name": "tool_short",
+          "arguments": "{\"a\":1}"
+        }
+      ],
+      "usage": {
+        "input_tokens": 1,
+        "output_tokens": 2
+      }
+    },
+    "model": "deepseek-v4-flash",
+    "name_map": {
+      "tool_short": "VeryLongOriginalName"
+    }
+  },
+  "expected": {
+    "id": "resp_1",
+    "object": "chat.completion",
+    "created": "<epoch>",
+    "model": "deepseek-v4-flash",
+    "choices": [
+      {
+        "index": 0,
+        "message": {
+          "role": "assistant",
+          "content": "",
+          "tool_calls": [
+            {
+              "id": "call_9",
+              "type": "function",
+              "function": {
+                "name": "VeryLongOriginalName",
+                "arguments": "{\"a\":1}"
+              }
+            }
+          ]
+        },
+        "finish_reason": "stop"
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 1,
+      "completion_tokens": 2,
+      "total_tokens": 3
+    }
+  },
+  "_note": "axe tools noms longs (retour) : restore_tool_name via name_map court→original",
+  "_generated_by": "scripts/gen_golden_fixtures.py (plan v10 §11.5)"
+}

@@ -1,0 +1,90 @@
+{
+  "fn": "anthropic_to_openai",
+  "input": {
+    "body": {
+      "model": "claude-sonnet-4-5",
+      "max_tokens": 100,
+      "messages": [
+        {
+          "role": "user",
+          "content": [
+            {
+              "type": "document",
+              "name": "a.pdf",
+              "source": {
+                "type": "base64",
+                "media_type": "application/pdf",
+                "data": "JVBERi0xLjQK"
+              }
+            },
+            {
+              "type": "document",
+              "name": "b.pdf",
+              "source": {
+                "type": "url",
+                "url": "https://ex.com/b.pdf"
+              }
+            },
+            {
+              "type": "document",
+              "name": "c.pdf",
+              "source": {
+                "type": "file",
+                "file_id": "file-abc"
+              }
+            },
+            {
+              "type": "document",
+              "source": {
+                "type": "text",
+                "text": "contenu brut"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "model": "deepseek-v4-flash"
+  },
+  "expected": {
+    "model": "deepseek-v4-flash",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "[document:url:https://ex.com/b.pdf]"
+          },
+          {
+            "type": "file",
+            "file": {
+              "file_data": "data:application/pdf;base64,JVBERi0xLjQK",
+              "filename": "a.pdf"
+            }
+          },
+          {
+            "type": "file",
+            "file": {
+              "file_id": "file-abc"
+            }
+          },
+          {
+            "type": "file",
+            "file": {
+              "file_data": "data:text/plain;base64,Y29udGVudSBicnV0",
+              "filename": "document.txt"
+            }
+          }
+        ],
+        "cache_control": {
+          "type": "ephemeral"
+        }
+      }
+    ],
+    "stream": false,
+    "max_tokens": 100
+  },
+  "_note": "axe documents : PDF base64 → file_data ; URL sans repli fichier → placeholder texte ; file_id → file_data ; texte",
+  "_generated_by": "scripts/gen_golden_fixtures.py (plan v10 §11.5)"
+}

@@ -1,0 +1,72 @@
+{
+  "fn": "anthropic_to_openai",
+  "input": {
+    "body": {
+      "model": "claude-sonnet-4-5",
+      "max_tokens": 100,
+      "tools": [
+        {
+          "name": "mcp__plugin_very_long_tool_name_exceeding_sixty_four_chars_limit_aaaa",
+          "description": "d",
+          "input_schema": {
+            "type": "object",
+            "properties": {
+              "a": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "a"
+            ],
+            "additionalProperties": false
+          }
+        }
+      ],
+      "messages": [
+        {
+          "role": "user",
+          "content": "hi"
+        }
+      ]
+    },
+    "model": "deepseek-v4-flash"
+  },
+  "expected": {
+    "model": "deepseek-v4-flash",
+    "messages": [
+      {
+        "role": "user",
+        "content": "hi",
+        "cache_control": {
+          "type": "ephemeral"
+        }
+      }
+    ],
+    "stream": false,
+    "max_tokens": 100,
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "mcp__plugin_very_long_tool_name_exceeding_sixty_four_chars_limit_aaaa",
+          "description": "d",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "a": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "a"
+            ],
+            "additionalProperties": false
+          }
+        }
+      }
+    ],
+    "tool_choice": "auto"
+  },
+  "_note": "axe tools : nom long conservé tel quel côté Chat (pas de sanitize sur cette jambe)",
+  "_generated_by": "scripts/gen_golden_fixtures.py (plan v10 §11.5)"
+}

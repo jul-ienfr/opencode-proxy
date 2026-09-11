@@ -9,6 +9,12 @@ import sys
 import threading
 import time
 
+# [Phase 3b-1] import remonté dans le bloc d'imports : il se trouvait APRÈS la
+# définition de _rich() (introduit par le passage de rich en lazy), ce qui
+# déclenchait E402 dans le gate ruff du CI. config.settings n'importe
+# dashboard.api que paresseusement (dans une fonction) → aucun cycle.
+import config.settings as _cfg_settings
+
 # [Phase 3 boot] rich est LAZY (~18ms rich.console au boot) : le terminal
 # display ne sert qu'en mode GUI/terminal (jamais --no-gui). Les symboles
 # box/Group/Live/Panel/Table sont résolus à l'appel via _rich() — l'import
@@ -35,7 +41,6 @@ def _rich(name: str):
         _RICH_MODS[name] = mod
     return mod
 
-import config.settings as _cfg_settings
 
 log_lines: collections.deque = collections.deque(maxlen=200)
 LOG_VISIBLE = 35
@@ -72,9 +77,7 @@ def refresh_display_config() -> dict:
     global LOG_VISIBLE, _DEBUG_FLUSH_INTERVAL, _DEBUG_MAX_SIZE, log_lines
     LOG_VISIBLE = _cfg_int("dashboard", "display_lines", 35, 5, 200)
     _DEBUG_FLUSH_INTERVAL = _cfg_int("debug", "flush_interval", 10, 1, 1000)
-    _DEBUG_MAX_SIZE = _cfg_int(
-        "debug", "max_size", 10 * 1024 * 1024, 1024 * 1024, 1024 * 1024 * 1024
-    )
+    _DEBUG_MAX_SIZE = _cfg_int("debug", "max_size", 10 * 1024 * 1024, 1024 * 1024, 1024 * 1024 * 1024)
     _max = _cfg_int("debug", "log_lines_max", 200, 10, 10000)
     if log_lines.maxlen != _max:
         log_lines = collections.deque(log_lines, maxlen=_max)
@@ -172,9 +175,7 @@ def attach_module_logger(name: str, level: int = logging.INFO):
         _target = None
     for _h in list(logger.handlers):
         try:
-            if _target is not None and os.path.abspath(
-                getattr(_h, "baseFilename", "") or ""
-            ) == _target:
+            if _target is not None and os.path.abspath(getattr(_h, "baseFilename", "") or "") == _target:
                 return _h
         except Exception:
             pass
@@ -183,9 +184,7 @@ def attach_module_logger(name: str, level: int = logging.INFO):
     # e.g. "[2026-08-17 18:54:50Z] [vpn_manager] [vpn-watchdog] ...". Keeping
     # one consistent format lets header-anchored greps find both paths.
     # [graceful-aurora LOT G] UTC (converter gmtime + Z) — docker logs = UTC.
-    fh.setFormatter(
-        _utc_formatter("[%(asctime)sZ] [%(name)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
-    )
+    fh.setFormatter(_utc_formatter("[%(asctime)sZ] [%(name)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
     fh.setLevel(level)
     logger.addHandler(fh)
     _extra_handlers.append(fh)
@@ -295,9 +294,7 @@ def build_display(routes, token_usage, token_lock):
     box = _rich("box")
     Group = _rich("Group")
     Panel = _rich("Panel")
-    table = Table(
-        box=box.SIMPLE, show_header=True, header_style="bold cyan", pad_edge=False, expand=False
-    )
+    table = Table(box=box.SIMPLE, show_header=True, header_style="bold cyan", pad_edge=False, expand=False)
     table.add_column("Route", style="bold", width=8)
     table.add_column("Model", style="bold", min_width=14)
     table.add_column("Total", justify="right", min_width=10)
@@ -395,15 +392,11 @@ def start_input_thread():
                             if ch2 == b"H":
                                 _log_scroll = max(0, _log_scroll - 1)
                             elif ch2 == b"P":
-                                _log_scroll = min(
-                                    max(0, len(log_lines) - LOG_VISIBLE), _log_scroll + 1
-                                )
+                                _log_scroll = min(max(0, len(log_lines) - LOG_VISIBLE), _log_scroll + 1)
                             elif ch2 == b"I":
                                 _log_scroll = max(0, _log_scroll - LOG_VISIBLE)
                             elif ch2 == b"Q":
-                                _log_scroll = min(
-                                    max(0, len(log_lines) - LOG_VISIBLE), _log_scroll + LOG_VISIBLE
-                                )
+                                _log_scroll = min(max(0, len(log_lines) - LOG_VISIBLE), _log_scroll + LOG_VISIBLE)
                             elif ch2 == b"G":
                                 _log_scroll = 0
                             elif ch2 == b"O":
@@ -439,17 +432,11 @@ def start_input_thread():
                         if ch == "\x03":
                             _stop_event.set()
                         elif ch == "\x1b":
-                            seq = (
-                                sys.stdin.read(2)
-                                if select.select([sys.stdin], [], [], 0.01)[0]
-                                else ""
-                            )
+                            seq = sys.stdin.read(2) if select.select([sys.stdin], [], [], 0.01)[0] else ""
                             if seq == "[A":
                                 _log_scroll = max(0, _log_scroll - 1)
                             elif seq == "[B":
-                                _log_scroll = min(
-                                    max(0, len(log_lines) - LOG_VISIBLE), _log_scroll + 1
-                                )
+                                _log_scroll = min(max(0, len(log_lines) - LOG_VISIBLE), _log_scroll + 1)
                             elif seq == "[5":
                                 if sys.stdin.read(1) == "~":
                                     _log_scroll = max(0, _log_scroll - LOG_VISIBLE)
@@ -483,9 +470,7 @@ def run_terminal_loop(routes, token_usage, token_lock):
     Live = _rich("Live")
     stop = start_input_thread()
     try:
-        with Live(
-            build_display(routes, token_usage, token_lock), refresh_per_second=1, screen=True
-        ) as live:
+        with Live(build_display(routes, token_usage, token_lock), refresh_per_second=1, screen=True) as live:
             while stop():
                 if _display_dirty:
                     _display_dirty = False

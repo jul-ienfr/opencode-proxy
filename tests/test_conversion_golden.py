@@ -8,6 +8,7 @@ sortie = échec → il faut régénérer/réviser la fixture EXPLICITEMENT
 (scripts/gen_golden_fixtures.py) : c'est le rôle de verrou du contrat.
 """
 
+import copy
 import json
 import re
 from pathlib import Path
@@ -22,6 +23,8 @@ _NONDETERMINISTIC_IDS = [
     (re.compile(r"^msg_[0-9a-f]{24}$"), "<msg_id>"),
     (re.compile(r"^toolu_[0-9a-f]{8}$"), "<toolu_id>"),
     (re.compile(r"^chatcmpl-[0-9a-f]{24}$"), "<chatcmpl_id>"),
+    # [Lot L6] `resp_<hex24>` (uuid4) — miroir de scripts/gen_golden_fixtures.py
+    (re.compile(r"^resp_[0-9a-f]{24}$"), "<resp_id>"),
 ]
 
 
@@ -57,6 +60,26 @@ def _call(fn_name: str, args: dict):
         return pm.openai_responses_to_anthropic(args["body"])
     if fn_name == "_responses_sse_to_chat_deltas_lines":
         return [pm._responses_sse_to_chat_deltas(line) for line in args["lines"]]
+    # ── [Lot L6] fonctions supplémentaires (miroir de
+    # scripts/gen_golden_fixtures.py::call_fn — les deux DOIVENT rester identiques) ──
+    if fn_name == "anthropic_to_openai_responses":
+        return pm.anthropic_to_openai_responses(args["anthro"], args["model"])
+    if fn_name == "openai_chat_to_responses":
+        return pm.openai_chat_to_responses(args["chat_resp"], args["model"])
+    if fn_name == "sanitize_tool_names":
+        # tuple (tools, name_map) → liste, forme alignée sur le dispatcher
+        # miroir de scripts/gen_golden_fixtures.py::call_fn
+        tools, name_map = pm.sanitize_tool_names(args["tools"])
+        return [tools, name_map]
+    if fn_name == "_responses_to_chat_response":
+        return pm._responses_to_chat_response(args["resp"], args["model"], args.get("name_map"))
+    if fn_name == "_responses_to_anthropic_response":
+        return pm._responses_to_anthropic_response(args["resp"], args["model"], args.get("name_map"))
+    if fn_name == "_chat_to_responses_request":
+        return pm._chat_to_responses_request(args["chat"])
+    if fn_name == "strip_synthetic_thinking":
+        body = copy.deepcopy(args["body"])
+        return {"stripped": pm.strip_synthetic_thinking(body), "body": body}
     raise KeyError(f"fixture: fonction inconnue '{fn_name}' — mettre à jour le dispatcher")
 
 

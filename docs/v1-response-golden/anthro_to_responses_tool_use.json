@@ -1,0 +1,83 @@
+{
+  "fn": "anthropic_to_openai_responses",
+  "input": {
+    "anthro": {
+      "content": [
+        {
+          "type": "thinking",
+          "thinking": "tk",
+          "signature": "s"
+        },
+        {
+          "type": "text",
+          "text": "ans"
+        },
+        {
+          "type": "tool_use",
+          "id": "toolu_01ABC",
+          "name": "t",
+          "input": {
+            "a": 1
+          }
+        }
+      ],
+      "stop_reason": "tool_use",
+      "usage": {
+        "input_tokens": 11,
+        "output_tokens": 7,
+        "cache_read_input_tokens": 3,
+        "output_tokens_details": {
+          "thinking_tokens": 4
+        }
+      }
+    },
+    "model": "claude-sonnet-4-5"
+  },
+  "expected": {
+    "id": "<resp_id>",
+    "object": "response",
+    "status": "completed",
+    "model": "claude-sonnet-4-5",
+    "output": [
+      {
+        "type": "reasoning",
+        "summary": [
+          {
+            "type": "summary_text",
+            "text": "tk"
+          }
+        ]
+      },
+      {
+        "type": "message",
+        "role": "assistant",
+        "content": [
+          {
+            "type": "output_text",
+            "text": "ans"
+          }
+        ]
+      },
+      {
+        "type": "function_call",
+        "call_id": "toolu_01ABC",
+        "name": "t",
+        "arguments": "{\"a\":1}",
+        "status": "completed"
+      }
+    ],
+    "usage": {
+      "input_tokens": 11,
+      "output_tokens": 7,
+      "total_tokens": 18,
+      "input_tokens_details": {
+        "cached_tokens": 3
+      },
+      "output_tokens_details": {
+        "reasoning_tokens": 4
+      }
+    }
+  },
+  "_note": "axe usage cache read P6 : cache_read_input_tokens → input_tokens_details.cached_tokens",
+  "_generated_by": "scripts/gen_golden_fixtures.py (plan v10 §11.5)"
+}

@@ -22,3 +22,7 @@ httptools==0.7.1
 # [P6] lock fichier .env en mode gunicorn multi-worker (importé config/settings.py)
 portalocker==3.2.0
 gunicorn==22.0.0
+# [Phase 5 boot] brotli : pré-compression des assets statiques AU BUILD
+# (scripts/precompress.py, servi par dashboard/routes/static.py). Optionnel :
+# sans lui, gzip seul (repli runtime) — le proxy reste fonctionnel.
+brotli==1.2.0

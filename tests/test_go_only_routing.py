@@ -11,7 +11,6 @@ Couvre la mécanique GÉNÉRIQUE (aucun id live — fixtures "acme-*") :
 
 import config.settings as st
 
-
 # ── Résolution d'endpoint ──────────────────────────────────────────
 
 

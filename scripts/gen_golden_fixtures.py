@@ -14,6 +14,7 @@ connus vs spec officielle (ex: 14.1.6 images perdues).
 
 from __future__ import annotations
 
+import copy
 import json
 import re
 import sys
@@ -32,6 +33,10 @@ _NONDETERMINISTIC_IDS = [
     (re.compile(r"^msg_[0-9a-f]{24}$"), "<msg_id>"),
     (re.compile(r"^toolu_[0-9a-f]{8}$"), "<toolu_id>"),
     (re.compile(r"^chatcmpl-[0-9a-f]{24}$"), "<chatcmpl_id>"),
+    # [Lot L6] `resp_<hex24>` généré par uuid4 dans anthropic_to_openai_responses
+    # et openai_chat_to_responses — non déterministe, doit être normalisé comme
+    # les ids msg_/chatcmpl (miroir dans tests/test_conversion_golden.py).
+    (re.compile(r"^resp_[0-9a-f]{24}$"), "<resp_id>"),
 ]
 
 
@@ -415,6 +420,912 @@ def case_req_tools_complex():
     }
 
 
+# ── [Lot L6 — goldens étendus] 15 axes × 6 chemins ──
+#
+# Les 11 fixtures ci-dessus sont GELÉES (§7.2 : jamais régénérer « pour faire
+# passer »). Les cas suivants sont des AJOUTS couvrant la matrice de couverture
+# cible (PLAN §6) : effort/thinking, cache_control (messages/tools/top-level),
+# max_tokens vs max_completion_tokens, schéma d'outils/strict/noms longs/schéma
+# invalide, documents (PDF base64/URL/file_id/texte), images, strip thinking
+# multi-tours, usage cache read/creation.
+
+
+def case_p2_effort_thinking_budget():
+    """P2 effort/thinking : thinking enabled + budget_tokens → reasoning_effort."""
+    return {
+        "fn": "anthropic_to_openai",
+        "input": {
+            "body": {
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 4096,
+                "thinking": {"type": "enabled", "budget_tokens": 10000},
+                "system": "S",
+                "messages": [{"role": "user", "content": "Q"}],
+            },
+            "model": "deepseek-v4-flash",
+        },
+        "note": "axe effort : thinking budget_tokens → reasoning_effort=high (plafond modèle)",
+    }
+
+
+def case_p2_effort_output_config():
+    """P2 effort : forme Anthropic native output_config.effort (A13)."""
+    return {
+        "fn": "anthropic_to_openai",
+        "input": {
+            "body": {
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 100,
+                "output_config": {"effort": "xhigh"},
+                "messages": [{"role": "user", "content": "Q"}],
+            },
+            "model": "deepseek-v4-flash",
+        },
+        "note": "axe effort : output_config.effort (forme Anthropic native) → reasoning_effort",
+    }
+
+
+def case_p2_effort_thinking_disabled():
+    """P2 effort : thinking explicitement désactivé → aucun reasoning_effort."""
+    return {
+        "fn": "anthropic_to_openai",
+        "input": {
+            "body": {
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 100,
+                "thinking": {"type": "disabled"},
+                "messages": [{"role": "user", "content": "Q"}],
+            },
+            "model": "deepseek-v4-flash",
+        },
+        "note": "axe effort : thinking disabled explicite → pas de reasoning_effort émis",
+    }
+
+
+def case_p2_cache_control_messages():
+    """P2 cache_control : breakpoint sur un content block de message."""
+    return {
+        "fn": "anthropic_to_openai",
+        "input": {
+            "body": {
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 100,
+                "system": [{"type": "text", "text": "sys"}],
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "hi",
+                                "cache_control": {"type": "ephemeral", "ttl": "1h"},
+                            }
+                        ],
+                    }
+                ],
+            },
+            "model": "deepseek-v4-flash",
+        },
+        "note": "axe cache_control : ttl 1h propagé du content block au message Chat",
+    }
+
+
+def case_p2_cache_control_tools():
+    """P2 cache_control : breakpoint porté par un outil (A5)."""
+    return {
+        "fn": "anthropic_to_openai",
+        "input": {
+            "body": {
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 100,
+                "tools": [
+                    {
+                        "name": "t1",
+                        "input_schema": {"type": "object"},
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ],
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+            "model": "deepseek-v4-flash",
+        },
+        "note": "axe cache_control tools (A5) : le breakpoint outil est bien reporté sur l'entrée Chat",
+    }
+
+
+def case_p2_cache_control_top_level():
+    """P2 cache_control : breakpoint top-level de la requête Anthropic."""
+    return {
+        "fn": "anthropic_to_openai",
+        "input": {
+            "body": {
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 100,
+                "cache_control": {"type": "ephemeral", "ttl": "1h"},
+                "system": "s",
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+            "model": "deepseek-v4-flash",
+        },
+        "note": "axe cache_control top-level : transporté tel quel sur le corps Chat",
+    }
+
+
+def case_p2_cache_control_breakpoint_limit():
+    """P2 cache_control : plafond 4 breakpoints Anthropic (A20) — élagage."""
+    return {
+        "fn": "anthropic_to_openai",
+        "input": {
+            "body": {
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 10,
+                "cache_control": {"type": "ephemeral", "ttl": "1h"},
+                "tools": [
+                    {"name": f"t{i}", "input_schema": {"type": "object"}, "cache_control": {"type": "ephemeral"}}
+                    for i in range(3)
+                ],
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [{"type": "text", "text": "a", "cache_control": {"type": "ephemeral"}}],
+                    },
+                    {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "b", "cache_control": {"type": "ephemeral"}}],
+                    },
+                    {
+                        "role": "user",
+                        "content": [{"type": "text", "text": "c", "cache_control": {"type": "ephemeral"}}],
+                    },
+                ],
+            },
+            "model": "deepseek-v4-flash",
+        },
+        "note": "axe cache_control (A20) : 7 breakpoints → élagage des plus anciens, 4 conservés",
+    }
+
+
+def case_p2_max_completion_tokens_o3():
+    """P2 max_tokens : modèle o-series → max_completion_tokens (A17/B2)."""
+    return {
+        "fn": "anthropic_to_openai",
+        "input": {
+            "body": {
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 77,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+            "model": "o3-mini",
+        },
+        "note": "axe max_tokens : modèle o-series → forme max_completion_tokens (max_tokens rejeté en 400)",
+    }
+
+
+def case_p4_max_completion_tokens_input():
+    """P4 max_tokens : forme moderne max_completion_tokens lue, jamais remplacée par le défaut."""
+    return {
+        "fn": "openai_to_anthropic_request",
+        "input": {
+            "oai_body": {
+                "model": "claude-sonnet-4-5",
+                "max_completion_tokens": 333,
+                "messages": [{"role": "user", "content": "hi"}],
+            }
+        },
+        "note": "axe max_tokens (A17) : max_completion_tokens client → max_tokens Anthropic 333",
+    }
+
+
+def case_p2_tools_long_name_strict_schema():
+    """P2 tools : nom > 64 caractères + schéma strict (additionalProperties=false)."""
+    return {
+        "fn": "anthropic_to_openai",
+        "input": {
+            "body": {
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 100,
+                "tools": [
+                    {
+                        "name": "mcp__plugin_very_long_tool_name_exceeding_sixty_four_chars_limit_aaaa",
+                        "description": "d",
+                        "input_schema": {
+                            "type": "object",
+                            "properties": {"a": {"type": "string"}},
+                            "required": ["a"],
+                            "additionalProperties": False,
+                        },
+                    }
+                ],
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+            "model": "deepseek-v4-flash",
+        },
+        "note": "axe tools : nom long conservé tel quel côté Chat (pas de sanitize sur cette jambe)",
+    }
+
+
+def case_p2_tools_invalid_schema():
+    """P2 tools : input_schema non-dict → schéma vide au lieu d'une exception."""
+    return {
+        "fn": "anthropic_to_openai",
+        "input": {
+            "body": {
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 100,
+                "tools": [{"name": "bad", "description": "d", "input_schema": "not-a-dict"}],
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+            "model": "deepseek-v4-flash",
+        },
+        "note": "axe tools : schéma invalide (str) → parameters {} sans lever (jamais de 500)",
+    }
+
+
+def case_p4_tools_strict_schema():
+    """P4 tools : profil strict + additionalProperties=false conservés."""
+    return {
+        "fn": "openai_to_anthropic_request",
+        "input": {
+            "oai_body": {
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 100,
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "get_x",
+                            "description": "d",
+                            "strict": True,
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"a": {"type": "string"}},
+                                "required": ["a"],
+                                "additionalProperties": False,
+                            },
+                        },
+                    }
+                ],
+            }
+        },
+        "note": "axe tools schéma/strict : profil OpenAI strict → input_schema Anthropic normalisé",
+    }
+
+
+def case_p6_tools_long_name_strict():
+    """P6 tools : nom long + strict → input_schema Anthropic, nom inchangé."""
+    return {
+        "fn": "openai_responses_to_anthropic",
+        "input": {
+            "body": {
+                "model": "claude-sonnet-4-5",
+                "input": [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "mcp__plugin_very_long_tool_name_exceeding_sixty_four_chars_limit_aaaa",
+                        "description": "d",
+                        "strict": True,
+                        "input_schema": {"type": "object", "properties": {"a": {"type": "string"}}},
+                    },
+                    {"type": "function", "name": "short", "input_schema": {"type": "object"}},
+                ],
+            }
+        },
+        "note": "axe tools noms longs P6 : schéma normalisé, nom long transmis tel quel à l'amont",
+    }
+
+
+def case_sanitize_tool_names_long_and_server():
+    """sanitize_tool_names : raccourci déterministe + serveur tools intouchés."""
+    return {
+        "fn": "sanitize_tool_names",
+        "input": {
+            "tools": [
+                {"type": "function", "name": "mcp__plugin_very_long_tool_name_exceeding_sixty_four_chars_limit_aaaa"},
+                {"type": "function", "name": "web_search"},
+                {"type": "function", "name": "ok-name"},
+            ]
+        },
+        "note": "axe tools noms longs : >64 → name[:57]+sha1[:6] ; web_* jamais renommés ; map retour",
+    }
+
+
+def case_p2_documents_pdf_url_file_text():
+    """P2 documents : PDF base64, URL, file_id, texte brut (4 formes)."""
+    return {
+        "fn": "anthropic_to_openai",
+        "input": {
+            "body": {
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 100,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "document",
+                                "name": "a.pdf",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": "application/pdf",
+                                    "data": "JVBERi0xLjQK",
+                                },
+                            },
+                            {
+                                "type": "document",
+                                "name": "b.pdf",
+                                "source": {"type": "url", "url": "https://ex.com/b.pdf"},
+                            },
+                            {
+                                "type": "document",
+                                "name": "c.pdf",
+                                "source": {"type": "file", "file_id": "file-abc"},
+                            },
+                            {"type": "document", "source": {"type": "text", "text": "contenu brut"}},
+                        ],
+                    }
+                ],
+            },
+            "model": "deepseek-v4-flash",
+        },
+        "note": "axe documents : PDF base64 → file_data ; URL sans repli fichier → placeholder texte ; file_id → file_data ; texte",
+    }
+
+
+def case_p2_documents_tool_result_media():
+    """P2 documents+images : media dans un tool_result (texte/image/document/audio)."""
+    return {
+        "fn": "anthropic_to_openai",
+        "input": {
+            "body": {
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 100,
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "tool_use", "id": "toolu_01ABC", "name": "read", "input": {"p": "a.pdf"}}
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "toolu_01ABC",
+                                "content": [
+                                    {"type": "text", "text": "voici"},
+                                    {
+                                        "type": "image",
+                                        "source": {
+                                            "type": "base64",
+                                            "media_type": "image/png",
+                                            "data": "iVBORw0KGgo=",
+                                        },
+                                    },
+                                    {
+                                        "type": "document",
+                                        "name": "r.pdf",
+                                        "source": {
+                                            "type": "base64",
+                                            "media_type": "application/pdf",
+                                            "data": "JVBERi0=",
+                                        },
+                                    },
+                                    {
+                                        "type": "document",
+                                        "name": "u.pdf",
+                                        "source": {"type": "url", "url": "https://ex.com/u.pdf"},
+                                    },
+                                    {"type": "audio", "source": {"type": "base64", "data": "AAA"}},
+                                ],
+                            }
+                        ],
+                    },
+                ],
+            },
+            "model": "deepseek-v4-flash",
+        },
+        "note": "axe documents+images : tool_result multimodal → parts image_url/file + placeholders [document:url]/[audio]",
+    }
+
+
+def case_p2_image_base64_and_url():
+    """P2 images : base64 → data-URI, URL https → image_url natif."""
+    return {
+        "fn": "anthropic_to_openai",
+        "input": {
+            "body": {
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 100,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "look"},
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": "image/png",
+                                    "data": "iVBORw0KGgo=",
+                                },
+                            },
+                            {"type": "image", "source": {"type": "url", "url": "https://ex.com/i.png"}},
+                        ],
+                    }
+                ],
+            },
+            "model": "deepseek-v4-flash",
+        },
+        "note": "axe images : base64 → data URI, URL passée telle quelle (file_id image non couvert ici)",
+    }
+
+
+def case_p4_tool_result_media():
+    """P4 documents+images : role tool multimodal → tool_result Anthropic."""
+    return {
+        "fn": "openai_to_anthropic_request",
+        "input": {
+            "oai_body": {
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 100,
+                "messages": [
+                    {"role": "user", "content": "q"},
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {"id": "call_1", "type": "function", "function": {"name": "t", "arguments": "{}"}}
+                        ],
+                    },
+                    {
+                        "role": "tool",
+                        "tool_call_id": "call_1",
+                        "content": [
+                            {"type": "text", "text": "res"},
+                            {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgo="}},
+                            {"type": "file", "file": {"file_id": "file-1"}},
+                            {
+                                "type": "file",
+                                "file": {
+                                    "file_data": "data:application/pdf;base64,JVBERi0=",
+                                    "filename": "a.pdf",
+                                },
+                            },
+                        ],
+                    },
+                ],
+            }
+        },
+        "note": "axe documents+images P4 : tool rôle multimodal → tool_result [text,image,document file_id,document base64]",
+    }
+
+
+def case_p6_documents_file_forms():
+    """P6 documents : input_file file_data / file_id / file_url → document Anthropic."""
+    return {
+        "fn": "openai_responses_to_anthropic",
+        "input": {
+            "body": {
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 100,
+                "input": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_file",
+                                "filename": "r.pdf",
+                                "file_data": "data:application/pdf;base64,JVBERi0=",
+                            },
+                            {"type": "input_file", "file_id": "file-xyz"},
+                            {
+                                "type": "input_file",
+                                "file_url": "https://ex.com/a.pdf",
+                                "filename": "u.pdf",
+                            },
+                        ],
+                    }
+                ],
+            }
+        },
+        "note": "axe documents P6 : file_data → base64+name, file_id → source file, file_url → source url",
+    }
+
+
+def case_p6_images_forms():
+    """P6 images : input_image data-URI et URL https → blocs image Anthropic."""
+    return {
+        "fn": "openai_responses_to_anthropic",
+        "input": {
+            "body": {
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 100,
+                "input": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "input_image", "image_url": "data:image/png;base64,iVBORw0KGgo="},
+                            {"type": "input_image", "image_url": "https://ex.com/i.png"},
+                        ],
+                    }
+                ],
+            }
+        },
+        "note": "axe documents+images P6 : data-URI décodé en source base64, URL → source url",
+    }
+
+
+def case_p6_reasoning_history_dropped():
+    """P6 multi-tours : item reasoning de l'historique droppé (pas de signature forgée)."""
+    return {
+        "fn": "openai_responses_to_anthropic",
+        "input": {
+            "body": {
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 100,
+                "input": [
+                    {"role": "user", "content": [{"type": "input_text", "text": "q"}]},
+                    {"type": "reasoning", "summary": [{"type": "summary_text", "text": "résumé précédent"}]},
+                    {"role": "assistant", "content": [{"type": "output_text", "text": "a"}]},
+                ],
+            }
+        },
+        "note": "axe multi-tours reasoning (assumé) : le summary est droppé, l'assistant devient un bloc texte vide",
+    }
+
+
+def case_p4_thinking_strip_local_signature():
+    """P4 multi-tours : reasoning_content → thinking à signature LOCALE, puis strippé."""
+    return {
+        "fn": "openai_to_anthropic_request",
+        "input": {
+            "oai_body": {
+                "model": "deepseek-v4-flash",
+                "max_tokens": 512,
+                "messages": [
+                    {"role": "user", "content": "q"},
+                    {
+                        "role": "assistant",
+                        "content": "a",
+                        "reasoning_content": "raisonnement converti par le proxy",
+                    },
+                    {"role": "user", "content": "suite"},
+                ],
+            }
+        },
+        "note": "axe thinking multi-tours P4 : bloc thinking synthétique retiré de l'historique multi-tours (Phase D)",
+    }
+
+
+def case_strip_synthetic_thinking():
+    """P1 helper multi-tours : strip des thinking locaux, originaux/redacted préservés."""
+    return {
+        "fn": "strip_synthetic_thinking",
+        "input": {
+            "body": {
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "thinking",
+                                "thinking": "synthétique",
+                                "signature": pm._local_signature("synthétique"),
+                            },
+                            {"type": "thinking", "thinking": "vrai", "signature": "authentique-signature"},
+                            {"type": "redacted_thinking", "data": "blob"},
+                            {"type": "text", "text": "ok"},
+                        ],
+                    },
+                    {"role": "user", "content": "suite"},
+                ]
+            }
+        },
+        "note": "axe thinking multi-tours P1 : signature locale strippée, signature authentique et redacted conservés",
+    }
+
+
+def case_anthro_to_responses_tool_use():
+    """P6 réponse : thinking + texte + tool_use → items Responses, usage cache read."""
+    return {
+        "fn": "anthropic_to_openai_responses",
+        "input": {
+            "anthro": {
+                "content": [
+                    {"type": "thinking", "thinking": "tk", "signature": "s"},
+                    {"type": "text", "text": "ans"},
+                    {"type": "tool_use", "id": "toolu_01ABC", "name": "t", "input": {"a": 1}},
+                ],
+                "stop_reason": "tool_use",
+                "usage": {
+                    "input_tokens": 11,
+                    "output_tokens": 7,
+                    "cache_read_input_tokens": 3,
+                    "output_tokens_details": {"thinking_tokens": 4},
+                },
+            },
+            "model": "claude-sonnet-4-5",
+        },
+        "note": "axe usage cache read P6 : cache_read_input_tokens → input_tokens_details.cached_tokens",
+    }
+
+
+def case_anthro_to_responses_thinking_omitted():
+    """P6 réponse : thinking `display: omitted` (texte vide) → aucun item reasoning vide."""
+    return {
+        "fn": "anthropic_to_openai_responses",
+        "input": {
+            "anthro": {
+                "content": [
+                    {"type": "thinking", "thinking": "   ", "signature": "s"},
+                    {"type": "text", "text": "ans"},
+                ],
+                "stop_reason": "max_tokens",
+                "usage": {"input_tokens": 1, "output_tokens": 2},
+            },
+            "model": "claude-sonnet-4-5",
+        },
+        "note": "axe effort/thinking P6 (A19) : thinking vide → pas d'item reasoning fantôme",
+    }
+
+
+def case_chat_to_responses_reasoning_and_usage():
+    """P5 réponse : reasoning_content + tool_calls → items Responses + usage détaillé."""
+    return {
+        "fn": "openai_chat_to_responses",
+        "input": {
+            "chat_resp": {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "Hi",
+                            "reasoning_content": "r",
+                            "tool_calls": [
+                                {
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {"name": "t", "arguments": '{"a":1}'},
+                                }
+                            ],
+                        },
+                        "finish_reason": "tool_calls",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 5,
+                    "prompt_tokens_details": {"cached_tokens": 3},
+                    "completion_tokens_details": {"reasoning_tokens": 2},
+                },
+            },
+            "model": "deepseek-v4-flash",
+        },
+        "note": "axe usage cache read P5 : prompt_tokens_details.cached_tokens + reasoning_tokens extraits",
+    }
+
+
+def case_responses_to_chat_response_cache_usage():
+    """Responses → cible Chat : usage cache read/non-caché + reasoning_content."""
+    return {
+        "fn": "_responses_to_chat_response",
+        "input": {
+            "resp": {
+                "id": "resp_1",
+                "status": "completed",
+                "output": [
+                    {"type": "reasoning", "summary": [{"type": "summary_text", "text": "rs"}]},
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "hello"}],
+                    },
+                    {
+                        "type": "function_call",
+                        "call_id": "call_9",
+                        "name": "tool_short",
+                        "arguments": '{"a":1}',
+                    },
+                ],
+                "usage": {
+                    "input_tokens": 20,
+                    "output_tokens": 9,
+                    "total_tokens": 29,
+                    "input_tokens_details": {"cached_tokens": 5},
+                },
+            },
+            "model": "deepseek-v4-flash",
+        },
+        "note": "axe usage cache read : cached_tokens ← input_tokens_details (jamais output_tokens_details)",
+    }
+
+
+def case_responses_to_chat_restore_tool_name():
+    """Responses → cible Chat : name_map restaure le nom d'outil original."""
+    return {
+        "fn": "_responses_to_chat_response",
+        "input": {
+            "resp": {
+                "id": "resp_1",
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "function_call",
+                        "call_id": "call_9",
+                        "name": "tool_short",
+                        "arguments": '{"a":1}',
+                    }
+                ],
+                "usage": {"input_tokens": 1, "output_tokens": 2},
+            },
+            "model": "deepseek-v4-flash",
+            "name_map": {"tool_short": "VeryLongOriginalName"},
+        },
+        "note": "axe tools noms longs (retour) : restore_tool_name via name_map court→original",
+    }
+
+
+def case_responses_to_anthropic_response_tool_use():
+    """Responses → cible Anthropic : thinking + texte + tool_use, cache read."""
+    return {
+        "fn": "_responses_to_anthropic_response",
+        "input": {
+            "resp": {
+                "id": "resp_1",
+                "status": "completed",
+                "output": [
+                    {"type": "reasoning", "summary": [{"type": "summary_text", "text": "rs"}]},
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "hello"}],
+                    },
+                    {
+                        "type": "function_call",
+                        "call_id": "call_9",
+                        "name": "tool_short",
+                        "arguments": '{"a":1}',
+                    },
+                ],
+                "usage": {
+                    "input_tokens": 20,
+                    "output_tokens": 9,
+                    "total_tokens": 29,
+                    "input_tokens_details": {"cached_tokens": 5},
+                },
+            },
+            "model": "claude-sonnet-4-5",
+            "name_map": {"tool_short": "VeryLongOriginalName"},
+        },
+        "note": "axe usage cache read + noms d'outils : cached_tokens → cache_read_input_tokens, nom restauré",
+    }
+
+
+def case_p5_request_chat_to_responses_media():
+    """P5 requête : Chat → Responses, media (image/file/vidéo/audio) + orphelin droppé."""
+    return {
+        "fn": "_chat_to_responses_request",
+        "input": {
+            "chat": {
+                "model": "deepseek-v4-flash",
+                "max_tokens": 128,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "look"},
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": "data:image/png;base64,iVBORw0KGgo="},
+                            },
+                            {"type": "file", "file": {"file_id": "file-1"}},
+                            {
+                                "type": "file",
+                                "file": {
+                                    "file_data": "data:application/pdf;base64,JVBERi0=",
+                                    "filename": "a.pdf",
+                                },
+                            },
+                            {"type": "video", "video": {"url": "https://ex.com/v.mp4"}},
+                            {"type": "input_audio", "input_audio": {"data": "AAA", "format": "ogg"}},
+                        ],
+                    },
+                    {"role": "tool", "tool_call_id": "call_missing", "content": "orphan"},
+                ],
+            }
+        },
+        "note": "axe documents+images P5 : image/file → input_* ; vidéo et audio → placeholders ; tool orphelin droppé",
+    }
+
+
+def case_p5_request_native_responses_passthrough():
+    """P5 requête native : body déjà Responses → sanitize (effort clampé, store/truncation)."""
+    return {
+        "fn": "_chat_to_responses_request",
+        "input": {
+            "chat": {
+                "model": "deepseek-v4-flash-free",
+                "input": [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+                "reasoning": {"effort": "max"},
+                "store": True,
+                "truncation": "auto",
+            }
+        },
+        "note": "axe effort P5 natif : reasoning.effort=max clampé au plafond du modèle (high)",
+    }
+
+
+def case_p6_request_tool_choice_required():
+    """P6 requête : tool_choice dict → tool Anthropic + orphelin function_call_output."""
+    return {
+        "fn": "openai_responses_to_anthropic",
+        "input": {
+            "body": {
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 100,
+                "tools": [{"type": "function", "name": "t", "parameters": {"type": "object"}}],
+                "tool_choice": {"type": "function", "name": "t"},
+                "input": [{"type": "function_call_output", "call_id": "call_x", "output": "orphan"}],
+            }
+        },
+        "note": "axe tools tool_choice P6 : dict → {type:tool,name} ; function_call_output sans call précédent conservé",
+    }
+
+
+def case_p6_request_effort_relay():
+    """P6 requête : reasoning.effort → output_config.effort Anthropic (A3 corrigée)."""
+    return {
+        "fn": "openai_responses_to_anthropic",
+        "input": {
+            "body": {
+                "model": "claude-sonnet-4-5",
+                "reasoning": {"effort": "high"},
+                "input": [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+            }
+        },
+        "note": "axe effort P6 (A3) : reasoning.effort relais → output_config.effort + thinking adaptive",
+    }
+
+
+def case_p4_request_effort_relay():
+    """P4 requête : reasoning_effort / output_config.effort → output_config Anthropic."""
+    return {
+        "fn": "openai_to_anthropic_request",
+        "input": {
+            "oai_body": {
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 2048,
+                "reasoning_effort": "medium",
+                "messages": [{"role": "user", "content": "hi"}],
+            }
+        },
+        "note": "axe effort P4 : reasoning_effort → output_config.effort=medium + thinking adaptive",
+    }
+
+
+def case_openai_to_anthropic_usage_cache_creation():
+    """V1 usage : cache_creation_input_tokens + cache_read_input_tokens extraits."""
+    return {
+        "fn": "openai_to_anthropic",
+        "input": {
+            "resp": {
+                "choices": [{"message": {"role": "assistant", "content": "x"}, "finish_reason": "stop"}],
+                "usage": {
+                    "prompt_tokens": 100,
+                    "completion_tokens": 10,
+                    "prompt_tokens_details": {"cached_tokens": 40, "cache_creation_tokens": 60},
+                    "completion_tokens_details": {"reasoning_tokens": 7},
+                },
+            },
+            "model": "deepseek-v4-flash",
+        },
+        "note": "axe usage cache creation (A6) : prompt_tokens_details → cache_read 40 / cache_creation 60",
+    }
+
+
 CASES = [
     case_req_simple,
     case_req_tools,
@@ -427,6 +1338,42 @@ CASES = [
     case_sse_deltas,
     case_multiturn_thinking_strip,
     case_req_tools_complex,
+    # ── Lot L6 : ajouts (jamais de modification des 11 ci-dessus) ──
+    case_p2_effort_thinking_budget,
+    case_p2_effort_output_config,
+    case_p2_effort_thinking_disabled,
+    case_p2_cache_control_messages,
+    case_p2_cache_control_tools,
+    case_p2_cache_control_top_level,
+    case_p2_cache_control_breakpoint_limit,
+    case_p2_max_completion_tokens_o3,
+    case_p4_max_completion_tokens_input,
+    case_p2_tools_long_name_strict_schema,
+    case_p2_tools_invalid_schema,
+    case_p4_tools_strict_schema,
+    case_p6_tools_long_name_strict,
+    case_sanitize_tool_names_long_and_server,
+    case_p2_documents_pdf_url_file_text,
+    case_p2_documents_tool_result_media,
+    case_p2_image_base64_and_url,
+    case_p4_tool_result_media,
+    case_p6_documents_file_forms,
+    case_p6_images_forms,
+    case_p6_reasoning_history_dropped,
+    case_p4_thinking_strip_local_signature,
+    case_strip_synthetic_thinking,
+    case_anthro_to_responses_tool_use,
+    case_anthro_to_responses_thinking_omitted,
+    case_chat_to_responses_reasoning_and_usage,
+    case_responses_to_chat_response_cache_usage,
+    case_responses_to_chat_restore_tool_name,
+    case_responses_to_anthropic_response_tool_use,
+    case_p5_request_chat_to_responses_media,
+    case_p5_request_native_responses_passthrough,
+    case_p6_request_tool_choice_required,
+    case_p6_request_effort_relay,
+    case_p4_request_effort_relay,
+    case_openai_to_anthropic_usage_cache_creation,
 ]
 
 
@@ -444,6 +1391,26 @@ def call_fn(c: dict):
         return pm.openai_responses_to_anthropic(args["body"])
     if name == "_responses_sse_to_chat_deltas_lines":
         return [pm._responses_sse_to_chat_deltas(line) for line in args["lines"]]
+    # ── [Lot L6] fonctions supplémentaires (dispatcher miroir dans
+    # tests/test_conversion_golden.py::_call — les deux DOIVENT rester identiques) ──
+    if name == "anthropic_to_openai_responses":
+        return pm.anthropic_to_openai_responses(args["anthro"], args["model"])
+    if name == "openai_chat_to_responses":
+        return pm.openai_chat_to_responses(args["chat_resp"], args["model"])
+    if name == "sanitize_tool_names":
+        # tuple (tools, name_map) → JSON-sérialisable, forme alignée sur le
+        # dispatcher miroir de tests/test_conversion_golden.py
+        tools, name_map = pm.sanitize_tool_names(args["tools"])
+        return [tools, name_map]
+    if name == "_responses_to_chat_response":
+        return pm._responses_to_chat_response(args["resp"], args["model"], args.get("name_map"))
+    if name == "_responses_to_anthropic_response":
+        return pm._responses_to_anthropic_response(args["resp"], args["model"], args.get("name_map"))
+    if name == "_chat_to_responses_request":
+        return pm._chat_to_responses_request(args["chat"])
+    if name == "strip_synthetic_thinking":
+        body = copy.deepcopy(args["body"])
+        return {"stripped": pm.strip_synthetic_thinking(body), "body": body}
     raise KeyError(name)
 
 

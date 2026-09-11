@@ -1,0 +1,35 @@
+{
+  "fn": "anthropic_to_openai",
+  "input": {
+    "body": {
+      "model": "claude-sonnet-4-5",
+      "max_tokens": 100,
+      "thinking": {
+        "type": "disabled"
+      },
+      "messages": [
+        {
+          "role": "user",
+          "content": "Q"
+        }
+      ]
+    },
+    "model": "deepseek-v4-flash"
+  },
+  "expected": {
+    "model": "deepseek-v4-flash",
+    "messages": [
+      {
+        "role": "user",
+        "content": "Q",
+        "cache_control": {
+          "type": "ephemeral"
+        }
+      }
+    ],
+    "stream": false,
+    "max_tokens": 100
+  },
+  "_note": "axe effort : thinking disabled explicite → pas de reasoning_effort émis",
+  "_generated_by": "scripts/gen_golden_fixtures.py (plan v10 §11.5)"
+}

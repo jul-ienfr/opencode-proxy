@@ -99,8 +99,8 @@
         "content": "18C, nuageux"
       }
     ],
-    "max_tokens": 2048,
     "stream": false,
+    "max_tokens": 2048,
     "tools": [
       {
         "type": "function",

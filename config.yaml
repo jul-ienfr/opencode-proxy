@@ -120,6 +120,10 @@ models:
       extends: meta-muse-spark
   omen-alpha:
     protocol: openai
+  deepseek-flash:
+    protocol: openai
+  deepseek-v4.1-flash:
+    protocol: openai
 free_model_map:
   mimo-v2.5: mimo-v2.5-free
   qwen3.7-max: mimo-v2.5-free
@@ -159,7 +163,7 @@ ip_rotation:
     tls: 45
   bad_ttl_factor: 2
   bad_ttl_max: 1440
-  boot_stagger_s: 60
+  boot_stagger_s: 0
   breaker_warmup_grace_s: 60
   cascade_enabled: true
   cascade_max_duration_s: 120
@@ -470,6 +474,11 @@ thinking:
     muse-spark-1.3-contributor: 4096
     muse-spark-1.3-contributor-free: 4096
   default_min_tokens: 256
+  max_completion_models:
+  - o1
+  - o3
+  - o4
+  - gpt-5
 cache_rewrite_models:
 - mimo-v2.5
 - mimo-v2-pro

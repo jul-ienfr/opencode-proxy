@@ -30,8 +30,8 @@
         ]
       }
     ],
-    "max_tokens": 256,
-    "stream": false
+    "stream": false,
+    "max_tokens": 256
   },
   "_note": "/v1/responses input_text -> content text (contrat §11.5 clients-compat)",
   "_generated_by": "scripts/gen_golden_fixtures.py (plan v10 §11.5)"

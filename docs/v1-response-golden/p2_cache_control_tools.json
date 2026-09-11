@@ -1,0 +1,60 @@
+{
+  "fn": "anthropic_to_openai",
+  "input": {
+    "body": {
+      "model": "claude-sonnet-4-5",
+      "max_tokens": 100,
+      "tools": [
+        {
+          "name": "t1",
+          "input_schema": {
+            "type": "object"
+          },
+          "cache_control": {
+            "type": "ephemeral"
+          }
+        }
+      ],
+      "messages": [
+        {
+          "role": "user",
+          "content": "hi"
+        }
+      ]
+    },
+    "model": "deepseek-v4-flash"
+  },
+  "expected": {
+    "model": "deepseek-v4-flash",
+    "messages": [
+      {
+        "role": "user",
+        "content": "hi",
+        "cache_control": {
+          "type": "ephemeral"
+        }
+      }
+    ],
+    "stream": false,
+    "max_tokens": 100,
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "t1",
+          "description": "",
+          "parameters": {
+            "type": "object",
+            "additionalProperties": false
+          }
+        },
+        "cache_control": {
+          "type": "ephemeral"
+        }
+      }
+    ],
+    "tool_choice": "auto"
+  },
+  "_note": "axe cache_control tools (A5) : le breakpoint outil est bien reporté sur l'entrée Chat",
+  "_generated_by": "scripts/gen_golden_fixtures.py (plan v10 §11.5)"
+}

@@ -1,0 +1,67 @@
+{
+  "fn": "strip_synthetic_thinking",
+  "input": {
+    "body": {
+      "messages": [
+        {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "thinking",
+              "thinking": "synthétique",
+              "signature": "4KjMp1wd2R9XfpraN6xmd8mmmxIjT7NJojs6QeYKtRs="
+            },
+            {
+              "type": "thinking",
+              "thinking": "vrai",
+              "signature": "authentique-signature"
+            },
+            {
+              "type": "redacted_thinking",
+              "data": "blob"
+            },
+            {
+              "type": "text",
+              "text": "ok"
+            }
+          ]
+        },
+        {
+          "role": "user",
+          "content": "suite"
+        }
+      ]
+    }
+  },
+  "expected": {
+    "stripped": 1,
+    "body": {
+      "messages": [
+        {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "thinking",
+              "thinking": "vrai",
+              "signature": "authentique-signature"
+            },
+            {
+              "type": "redacted_thinking",
+              "data": "blob"
+            },
+            {
+              "type": "text",
+              "text": "ok"
+            }
+          ]
+        },
+        {
+          "role": "user",
+          "content": "suite"
+        }
+      ]
+    }
+  },
+  "_note": "axe thinking multi-tours P1 : signature locale strippée, signature authentique et redacted conservés",
+  "_generated_by": "scripts/gen_golden_fixtures.py (plan v10 §11.5)"
+}

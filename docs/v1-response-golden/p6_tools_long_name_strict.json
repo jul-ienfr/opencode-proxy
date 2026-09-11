@@ -1,0 +1,84 @@
+{
+  "fn": "openai_responses_to_anthropic",
+  "input": {
+    "body": {
+      "model": "claude-sonnet-4-5",
+      "input": [
+        {
+          "role": "user",
+          "content": [
+            {
+              "type": "input_text",
+              "text": "hi"
+            }
+          ]
+        }
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "name": "mcp__plugin_very_long_tool_name_exceeding_sixty_four_chars_limit_aaaa",
+          "description": "d",
+          "strict": true,
+          "input_schema": {
+            "type": "object",
+            "properties": {
+              "a": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        {
+          "type": "function",
+          "name": "short",
+          "input_schema": {
+            "type": "object"
+          }
+        }
+      ]
+    }
+  },
+  "expected": {
+    "model": "claude-sonnet-4-5",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "hi"
+          }
+        ]
+      }
+    ],
+    "stream": false,
+    "max_tokens": 16384,
+    "tools": [
+      {
+        "name": "mcp__plugin_very_long_tool_name_exceeding_sixty_four_chars_limit_aaaa",
+        "description": "d",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "a": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      {
+        "name": "short",
+        "description": "",
+        "input_schema": {
+          "type": "object",
+          "additionalProperties": false
+        }
+      }
+    ],
+    "tool_choice": "auto"
+  },
+  "_note": "axe tools noms longs P6 : schéma normalisé, nom long transmis tel quel à l'amont",
+  "_generated_by": "scripts/gen_golden_fixtures.py (plan v10 §11.5)"
+}

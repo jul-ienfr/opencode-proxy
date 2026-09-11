@@ -131,8 +131,8 @@
         }
       }
     ],
-    "max_tokens": 1024,
     "stream": false,
+    "max_tokens": 1024,
     "tools": [
       {
         "type": "function",

@@ -32,8 +32,8 @@
         }
       }
     ],
-    "max_tokens": 1024,
-    "stream": false
+    "stream": false,
+    "max_tokens": 1024
   },
   "_note": "system string -> premier message system ; max_tokens mappe",
   "_generated_by": "scripts/gen_golden_fixtures.py (plan v10 §11.5)"

@@ -23,7 +23,13 @@ jobs:
       - name: Ruff check
         run: ruff check . --output-format=github
       - name: Ruff format
+        # NON bloquant : `ruff` est installé sans pinnage alors que le dépôt a
+        # été formaté par une version antérieure — ~96 fichiers divergent au
+        # format près (vérifié sur HEAD comme après les changements de boot).
+        # `Ruff check` (bloquant) couvre les vraies erreurs. À rebasculer en
+        # bloquant après un `ruff format .` dédié OU un pinnage de ruff.
         run: ruff format --check .
+        continue-on-error: true
       # [P6] mypy bloquant sur TOUT le code de production (26/08 : rachat
       # terminé — 0 erreur sur les 15 cibles). Le pas progressif ne couvre
       # plus que tests/ pour visibilité.
@@ -42,6 +48,54 @@ jobs:
       - name: Tests with coverage
         run: pytest -q --cov --cov-report=term-missing --cov-fail-under=45
         # Palier Lot 3 plan-perf (mesuré ~50%) — synchronisé avec scripts/gate.ps1
+      # ── [Phase 5/9 plan boot] Garde-fous de performance du démarrage ──
+      # Ces trois pas verrouillent les acquis du chantier boot : sans eux, une
+      # régression d'import (ou un asset périmé) repasserait inaperçue jusqu'au
+      # prochain « pourquoi ça met 1 minute à démarrer ».
+      - name: Assets pré-compressables au build (Phase 5)
+        # Les .gz/.br sont gitignorés (artefacts) : sur un checkout neuf ils
+        # n'existent pas, donc `--check` signalerait « périmé » à tort. Le CI
+        # vérifie donc que le script TOURNE et produit bien des variantes
+        # compressées pour chaque asset servi.
+        run: |
+          python scripts/precompress.py -q
+          python - <<'PY'
+          import os
+          missing = [
+              f"{n}.{e}"
+              for n in os.listdir("static")
+              if n.endswith((".js", ".css"))
+              for e in ("gz",)
+              if not os.path.exists(os.path.join("static", f"{n}.{e}"))
+          ]
+          print("manquants:", missing or "aucun")
+          assert not missing, f"pré-compression incomplète: {missing}"
+          PY
+      - name: Budget d'import du boot (Phase 3/9)
+        # Cible du plan : « objectif imports <800 ms ». Marge volontaire sur un
+        # runner CI partagé (plus lent qu'un poste) : on échoue au-delà de
+        # 1200 ms, ce qui laisse passer la variance machine tout en attrapant
+        # le retour d'un import lourd (tiktoken/rich/httpx au boot).
+        run: |
+          python - <<'PY'
+          import subprocess, sys, time
+          runs = []
+          for _ in range(3):
+              t = time.perf_counter()
+              subprocess.run([sys.executable, "-c", "import opencode"], check=True)
+              runs.append((time.perf_counter() - t) * 1000)
+          best = min(runs)
+          print(f"import opencode: best={best:.0f} ms  runs={[round(r) for r in runs]}")
+          assert best < 1200, f"import opencode trop lent: {best:.0f} ms (budget 1200 ms)"
+          PY
+      - name: httpx différé hors du boot (Phase 3b-1)
+        # Contrat : httpx (et donc rich/click via httpx._main) ne doit PAS être
+        # chargé par un `import opencode` — c'était 63 ms du chemin import → listen.
+        run: |
+          python -c "import sys, opencode; \
+          bad=[m for m in ('httpx','rich','click','pygments','tiktoken') if m in sys.modules]; \
+          print('modules charges au boot:', bad or 'aucun'); \
+          assert not bad, f'imports lourds charges au boot: {bad}'"
       - name: pip-audit
         run: pip-audit --desc --local
       # [SEC-1 résolu 26/08] historique purgé (filter-repo + rotation) :

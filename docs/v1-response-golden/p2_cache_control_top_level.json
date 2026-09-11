@@ -1,0 +1,48 @@
+{
+  "fn": "anthropic_to_openai",
+  "input": {
+    "body": {
+      "model": "claude-sonnet-4-5",
+      "max_tokens": 100,
+      "cache_control": {
+        "type": "ephemeral",
+        "ttl": "1h"
+      },
+      "system": "s",
+      "messages": [
+        {
+          "role": "user",
+          "content": "hi"
+        }
+      ]
+    },
+    "model": "deepseek-v4-flash"
+  },
+  "expected": {
+    "model": "deepseek-v4-flash",
+    "messages": [
+      {
+        "role": "system",
+        "content": "s",
+        "cache_control": {
+          "type": "ephemeral"
+        }
+      },
+      {
+        "role": "user",
+        "content": "hi",
+        "cache_control": {
+          "type": "ephemeral"
+        }
+      }
+    ],
+    "stream": false,
+    "max_tokens": 100,
+    "cache_control": {
+      "type": "ephemeral",
+      "ttl": "1h"
+    }
+  },
+  "_note": "axe cache_control top-level : transporté tel quel sur le corps Chat",
+  "_generated_by": "scripts/gen_golden_fixtures.py (plan v10 §11.5)"
+}

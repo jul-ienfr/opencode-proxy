@@ -7,7 +7,7 @@
       "type": "golden_dir",
       "famille": "v1",
       "dir": "docs/v1-response-golden",
-      "min_count": 9,
+      "min_count": 46,
       "required_fields": ["fn", "input", "expected", "_note"]
     },
     {
@@ -36,7 +36,12 @@
         "openai_to_anthropic_request",
         "anthropic_to_openai_response",
         "openai_responses_to_anthropic",
-        "_responses_sse_to_chat_deltas"
+        "_responses_sse_to_chat_deltas",
+        "anthropic_to_openai_responses",
+        "openai_chat_to_responses",
+        "_responses_to_chat_response",
+        "_responses_to_anthropic_response",
+        "sanitize_tool_names"
       ]
     },
     {

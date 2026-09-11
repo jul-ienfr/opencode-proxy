@@ -162,7 +162,7 @@ def analyze(config_path: Path, root: Path):
         seen.setdefault(leaf_of(dotted), dotted)
     prod_files = list(iter_py_files(root, tests_only=False))
     test_files = list(iter_py_files(root, tests_only=True))
-    rows = []
+    rows: list[tuple[str, str, list, list]] = []
     for leaf in sorted(seen):
         needle = needle_for(seen[leaf])
         code_hits = search(needle, prod_files)

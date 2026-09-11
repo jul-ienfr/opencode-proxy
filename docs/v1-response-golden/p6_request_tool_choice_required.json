@@ -1,0 +1,62 @@
+{
+  "fn": "openai_responses_to_anthropic",
+  "input": {
+    "body": {
+      "model": "claude-sonnet-4-5",
+      "max_tokens": 100,
+      "tools": [
+        {
+          "type": "function",
+          "name": "t",
+          "parameters": {
+            "type": "object"
+          }
+        }
+      ],
+      "tool_choice": {
+        "type": "function",
+        "name": "t"
+      },
+      "input": [
+        {
+          "type": "function_call_output",
+          "call_id": "call_x",
+          "output": "orphan"
+        }
+      ]
+    }
+  },
+  "expected": {
+    "model": "claude-sonnet-4-5",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "tool_result",
+            "tool_use_id": "call_x",
+            "content": "orphan"
+          }
+        ]
+      }
+    ],
+    "stream": false,
+    "max_tokens": 100,
+    "tools": [
+      {
+        "name": "t",
+        "description": "",
+        "input_schema": {
+          "type": "object",
+          "additionalProperties": false
+        }
+      }
+    ],
+    "tool_choice": {
+      "type": "tool",
+      "name": "t"
+    }
+  },
+  "_note": "axe tools tool_choice P6 : dict → {type:tool,name} ; function_call_output sans call précédent conservé",
+  "_generated_by": "scripts/gen_golden_fixtures.py (plan v10 §11.5)"
+}

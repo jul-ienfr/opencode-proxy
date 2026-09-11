@@ -1,0 +1,40 @@
+{
+  "fn": "openai_to_anthropic_request",
+  "input": {
+    "oai_body": {
+      "model": "claude-sonnet-4-5",
+      "max_tokens": 2048,
+      "reasoning_effort": "medium",
+      "messages": [
+        {
+          "role": "user",
+          "content": "hi"
+        }
+      ]
+    }
+  },
+  "expected": {
+    "model": "claude-sonnet-4-5",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "hi"
+          }
+        ]
+      }
+    ],
+    "stream": false,
+    "max_tokens": 2048,
+    "output_config": {
+      "effort": "medium"
+    },
+    "thinking": {
+      "type": "adaptive"
+    }
+  },
+  "_note": "axe effort P4 : reasoning_effort → output_config.effort=medium + thinking adaptive",
+  "_generated_by": "scripts/gen_golden_fixtures.py (plan v10 §11.5)"
+}

@@ -73,13 +73,13 @@ from app.protocol.mapping import _register_defensive_short as _register_defensiv
 from app.protocol.mapping import _remap_responses_history_names as _remap_responses_history_names
 from app.protocol.mapping import _remap_responses_tool_choice as _remap_responses_tool_choice
 from app.protocol.mapping import _resolve_schema_profile as _resolve_schema_profile
-from app.protocol.mapping import _rewrite_unicode_properties as _rewrite_unicode_properties
 from app.protocol.mapping import _responses_sse_to_chat_deltas as _responses_sse_to_chat_deltas
 from app.protocol.mapping import _responses_to_anthropic_response as _responses_to_anthropic_response
 from app.protocol.mapping import _responses_to_chat_response as _responses_to_chat_response
 from app.protocol.mapping import _responses_tool_cache as _responses_tool_cache
 from app.protocol.mapping import _responses_tool_index_map as _responses_tool_index_map
 from app.protocol.mapping import _restructure_for_cache as _restructure_for_cache
+from app.protocol.mapping import _rewrite_unicode_properties as _rewrite_unicode_properties
 from app.protocol.mapping import _sanitize_native_responses_request as _sanitize_native_responses_request
 from app.protocol.mapping import _short_tool_name as _short_tool_name
 from app.protocol.mapping import _strip_billing_header as _strip_billing_header

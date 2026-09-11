@@ -1,0 +1,45 @@
+{
+  "fn": "_chat_to_responses_request",
+  "input": {
+    "chat": {
+      "model": "deepseek-v4-flash-free",
+      "input": [
+        {
+          "role": "user",
+          "content": [
+            {
+              "type": "input_text",
+              "text": "hi"
+            }
+          ]
+        }
+      ],
+      "reasoning": {
+        "effort": "max"
+      },
+      "store": true,
+      "truncation": "auto"
+    }
+  },
+  "expected": {
+    "model": "deepseek-v4-flash-free",
+    "input": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "input_text",
+            "text": "hi"
+          }
+        ]
+      }
+    ],
+    "reasoning": {
+      "effort": "high"
+    },
+    "store": true,
+    "truncation": "auto"
+  },
+  "_note": "axe effort P5 natif : reasoning.effort=max clampé au plafond du modèle (high)",
+  "_generated_by": "scripts/gen_golden_fixtures.py (plan v10 §11.5)"
+}

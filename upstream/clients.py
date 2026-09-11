@@ -31,15 +31,41 @@ import asyncio
 import threading
 import time
 from collections.abc import Callable
+from typing import TYPE_CHECKING, Any
 
-import httpx
+# [Phase 3b-1 boot] httpx est DIFFÉRÉ : `import httpx` tire `httpx._main` (CLI)
+# → `rich` + `click` + `pygments` (~63 ms) dont ce module n'a aucun usage.
+# Le proxy `LazyModule` conserve la syntaxe `httpx.X` partout (annotations
+# quotées ci-dessous, constructions dans les fonctions) et ne charge httpx
+# qu'au premier client réellement construit. Voir core/lazy.py.
+if TYPE_CHECKING:
+    import httpx
+else:
+    from core.lazy import LazyModule
+
+    httpx = LazyModule("httpx")
 
 DEFAULT_POOL_SIZE = 3  # = config.yaml upstream.curl_sessions_per_station
 DEFAULT_IDLE_TTL_S = 600.0
-DEFAULT_ROLE_TIMEOUT = httpx.Timeout(connect=5.0, read=30.0, write=10.0, pool=5.0)
 DEFAULT_CLOSE_GRACE_S = 60.0
 CHECKOUT_WAIT_S = 5.0  # attente bornée d'une restitution avant overflow
 POOL_SESSION_TIMEOUT = (10, 600)  # (connect, read) imposé aux sessions poolées
+
+
+def default_role_timeout() -> httpx.Timeout:
+    """Timeout par défaut d'un client de rôle (RÉSOLU À L'APPEL).
+
+    [Phase 3b-1] Remplace la constante module ``DEFAULT_ROLE_TIMEOUT`` :
+    construire un ``httpx.Timeout`` au niveau module forçait l'import httpx
+    sur le chemin import → listen. Mémoïsé, donc construit une seule fois.
+    """
+    global _DEFAULT_ROLE_TIMEOUT_CACHE
+    if _DEFAULT_ROLE_TIMEOUT_CACHE is None:
+        _DEFAULT_ROLE_TIMEOUT_CACHE = httpx.Timeout(connect=5.0, read=30.0, write=10.0, pool=5.0)
+    return _DEFAULT_ROLE_TIMEOUT_CACHE
+
+
+_DEFAULT_ROLE_TIMEOUT_CACHE: Any = None
 
 
 class CurlSessionSlot:
@@ -193,9 +219,7 @@ def evict_later(pool: CurlSessionPool, slot: CurlSessionSlot) -> None:
 _evict_later = evict_later
 
 
-async def evict_idle_pools(
-    pools: dict[str, CurlSessionPool], ttl: float = DEFAULT_IDLE_TTL_S
-) -> int:
+async def evict_idle_pools(pools: dict[str, CurlSessionPool], ttl: float = DEFAULT_IDLE_TTL_S) -> int:
     """Éviction TTL/LRU des pools curl orphelins — appelée par le tick
     background existant (30 s). Retourne le nombre de pools fermés.
 
@@ -309,7 +333,10 @@ class RoleClientStore:
     ):
         self.clients: dict[str, tuple[httpx.AsyncClient, str | None]] = {}
         self._lock = lock or threading.Lock()
-        self._timeout = timeout or DEFAULT_ROLE_TIMEOUT
+        # [Phase 3b-1] le défaut est résolu À L'APPEL (acquire) : construire le
+        # Timeout ici forcerait l'import httpx dès le module-level
+        # `_role_store = _RoleClientStore(...)` d'opencode.py.
+        self._timeout = timeout
 
     def acquire(
         self,
@@ -330,7 +357,7 @@ class RoleClientStore:
                 transport = httpx.AsyncHTTPTransport(proxy=want, retries=0)
             else:
                 transport = httpx.AsyncHTTPTransport(retries=0)
-            client = httpx.AsyncClient(transport=transport, timeout=self._timeout)
+            client = httpx.AsyncClient(transport=transport, timeout=self._timeout or default_role_timeout())
             self.clients[role] = (client, want)
         if old is not None and not old.is_closed:
             try:
@@ -382,7 +409,6 @@ __all__ = [
     "DEFAULT_CLOSE_GRACE_S",
     "DEFAULT_IDLE_TTL_S",
     "DEFAULT_POOL_SIZE",
-    "DEFAULT_ROLE_TIMEOUT",
     "POOL_SESSION_TIMEOUT",
     "CurlSessionPool",
     "CurlSessionSlot",
@@ -390,6 +416,7 @@ __all__ = [
     "aclose_role_client_after",
     "build_fresh_client",
     "close_all_pools",
+    "default_role_timeout",
     "evict_idle_pools",
     "evict_later",
     "swap_pools_for_proxy",
@@ -398,3 +425,16 @@ __all__ = [
     "_aclose_role_client_after",
     "_evict_later",
 ]
+
+
+def __getattr__(name: str) -> Any:
+    """Compat paresseuse de l'ancienne constante ``DEFAULT_ROLE_TIMEOUT``.
+
+    [Phase 3b-1] Elle n'est plus construite à l'import (elle forçait ``import
+    httpx`` au boot). Conservée pour tout consommateur externe qui lirait
+    encore le nom : il obtient le même ``httpx.Timeout``, construit à la
+    demande.
+    """
+    if name == "DEFAULT_ROLE_TIMEOUT":
+        return default_role_timeout()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

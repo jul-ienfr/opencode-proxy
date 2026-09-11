@@ -2,7 +2,9 @@
 
 * ``core.keys`` — ``KeyPauser`` (pause 429/401/403 + persistance disque),
   ``AllKeysPausedError``, sélection round-robin/failover (déplacés depuis
-  ``opencode.py``, déplacement pur).
+  ``opencode.py``, déplacement pur) ;
+* ``core.lazy`` — ``LazyModule`` (proxy d'import différé, stdlib seule) utilisé
+  pour sortir ``httpx`` du chemin import → listen (Phase 3b-1).
 
 AUCUN import du projet (``opencode`` / ``config`` / ``dashboard`` interdits ;
 stdlib + ``yaml`` seuls) :
@@ -21,6 +23,6 @@ stdlib + ``yaml`` seuls) :
   les wrappers d'une ligne les lisent À L'APPEL.
 """
 
-from core import errors, keys
+from core import errors, keys, lazy
 
-__all__ = ["errors", "keys"]
+__all__ = ["errors", "keys", "lazy"]

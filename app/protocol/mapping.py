@@ -25,6 +25,12 @@ from typing import Any
 import orjson as _orjson  # type: ignore
 
 from config import CACHE_MIN_PROMPT_SIZE, yaml_get
+
+# [Lot L2] Source unique de vérité pour l'effort (A1/A2/A13/A14/A15/A23).
+# ``config.effort_policy`` n'importe que ``config.effort_caps`` (lui-même
+# réduit à ``yaml_get``) + stdlib : aucun coût de boot (contrainte plan §7.4),
+# aucun risque de cycle ``config/*``.
+from config.effort_policy import resolve_effort as _resolve_effort
 from dashboard.display import debug as _debug
 from dashboard.display import log as _log
 
@@ -146,6 +152,148 @@ def _extract_cache_tokens(usage: dict) -> int:
     if "cache_read_input_tokens" in usage:
         return usage["cache_read_input_tokens"]
     return 0
+
+
+def _extract_reasoning_tokens(usage: dict, output_tokens: int | None = None) -> int:
+    """[Lot L12 — A18] Tokens de raisonnement d'un `usage` amont, toutes formes.
+
+    A18 : les conversions Responses écrivaient ``reasoning_tokens: 0`` **en dur**
+    (mapping.py:2459, 2538). Le dashboard affichait donc toujours zéro token de
+    raisonnement, alors que c'est précisément la part facturée la plus chère sur
+    un modèle de raisonnement — et l'information qui permet à un client de
+    détecter qu'un modèle « réfléchit » moins que prévu.
+
+    Formes lues :
+
+    * ``output_tokens_details.reasoning_tokens`` — Responses / Chat OpenAI ;
+    * ``completion_tokens_details.reasoning_tokens`` — Chat OpenAI historique ;
+    * ``reasoning_tokens`` — certains upstreams compatibles à plat ;
+    * ``output_tokens_details.thinking_tokens`` — passthrough Anthropic-compat.
+
+    ``output_tokens`` (optionnel) borne le résultat : la ventilation est un
+    SOUS-ENSEMBLE de la sortie. Un amont qui annonce plus de tokens de
+    raisonnement que de tokens produits est incohérent, et propager la valeur
+    telle quelle afficherait un pourcentage de raisonnement > 100 % dans le
+    dashboard. On plafonne plutôt que de relayer une incohérence.
+
+    Fallback 0 quand absent (un upstream sans raisonnement n'écrit pas ce champ).
+    """
+    value = 0
+    if isinstance(usage, dict):
+        for container, key in (
+            ("output_tokens_details", "reasoning_tokens"),
+            ("output_tokens_details", "thinking_tokens"),
+            ("completion_tokens_details", "reasoning_tokens"),
+            ("prompt_tokens_details", "reasoning_tokens"),
+        ):
+            holder = usage.get(container)
+            if isinstance(holder, dict):
+                candidate = holder.get(key)
+                if isinstance(candidate, int) and candidate > 0:
+                    value = candidate
+                    break
+        else:
+            candidate = usage.get("reasoning_tokens")
+            if isinstance(candidate, int) and candidate > 0:
+                value = candidate
+    if value and isinstance(output_tokens, int) and output_tokens >= 0:
+        return min(value, output_tokens)
+    return value
+
+
+#: Modèles dont l'upstream Chat **exige** ``max_completion_tokens`` : la famille
+#: o-series / gpt-5 d'OpenAI, où ``max_tokens`` est déprécié et rejeté (B2).
+#:
+#: Volontairement RESTREINT à cette famille. Les passerelles compatibles tierces
+#: que ce proxy utilise (DeepSeek, GLM, MiMo, …) documentent et acceptent
+#: ``max_tokens`` : leur envoyer ``max_completion_tokens`` risquerait un 400, ou
+#: pire un champ ignoré — donc **aucune limite de sortie appliquée**, un coût non
+#: borné (exactement le contraire du but). B2 ne mandate le basculement que pour
+#: les modèles o-series.
+#:
+#: Surchargeable via ``thinking.max_completion_models`` dans ``config.yaml`` :
+#: un opérateur qui constate qu'un upstream l'exige l'ajoute sans toucher au code.
+_MAX_COMPLETION_MODELS_DEFAULT = ("o1", "o3", "o4", "gpt-5")
+
+
+def _wants_max_completion_tokens(model: str) -> bool:
+    """[Lot L14 — B2/A17] L'upstream Chat de ``model`` exige-t-il ``max_completion_tokens`` ?
+
+    ``max_tokens`` est déprécié et **incompatible avec les modèles o-series**,
+    qui exigent ``max_completion_tokens`` : un upstream strict rejette
+    ``max_tokens`` par un 400, la requête échoue alors qu'elle est légitime.
+
+    Le basculement est délibérément limité aux préfixes reconnus (config-driven,
+    cf. ``_MAX_COMPLETION_MODELS_DEFAULT``) : basculer trop large risquerait
+    qu'une passerelle tierce ignore le champ inconnu et n'applique donc **aucune
+    limite de sortie** — un coût non borné, soit pire que le problème d'origine.
+    """
+    if not isinstance(model, str) or not model:
+        return False
+    cfg = yaml_get("thinking", "max_completion_models", None)
+    prefixes = cfg if isinstance(cfg, list) and cfg else _MAX_COMPLETION_MODELS_DEFAULT
+    name = model.lower()
+    return any(name.startswith(str(p).lower()) for p in prefixes if p)
+
+
+def _set_output_token_limit(
+    target: dict,
+    source: dict,
+    model: str,
+    default: int = 16384,
+    target_protocol: str = "openai",
+) -> int:
+    """[Lot L14 — B2/A17] Écrit la limite de sortie dans ``target``, forme adaptée.
+
+    Lit la limite du client en acceptant **toutes** ses conventions —
+    ``max_tokens`` (Anthropic/Chat historique) et ``max_completion_tokens``
+    (Chat moderne), ``max_output_tokens`` (Responses) — puis l'écrit sous la
+    forme attendue par la **destination** :
+
+    * ``target_protocol="openai"`` + modèle de raisonnement →
+      ``max_completion_tokens`` (B2 : ``max_tokens`` y est déprécié, et rejeté
+      par les modèles o-series) ;
+    * ``target_protocol="openai"`` sinon → ``max_tokens`` ;
+    * ``target_protocol="anthropic"`` → toujours ``max_tokens`` : c'est le seul
+      champ qu'Anthropic connaît, quelle que soit la forme reçue du client.
+
+    Avant ce lot, P4 lisait uniquement ``max_tokens`` : un client Chat envoyant
+    ``max_completion_tokens`` (la forme moderne recommandée) voyait sa limite
+    **silencieusement remplacée par le défaut 16384**. Une limite courte posée
+    pour maîtriser le coût devenait donc inopérante — perte invisible.
+
+    Retourne la limite retenue.
+
+    **Précédence de lecture** (décision documentée, ex-§11.8) : ``max_tokens`` →
+    ``max_completion_tokens`` → ``max_output_tokens``, **première forme valide
+    gagnante**. ``max_tokens`` est canonique côté Anthropic et historique côté
+    Chat ; les deux autres ne servent que de repli quand il est absent. Un
+    client qui enverrait deux formes divergentes suit donc ``max_tokens``.
+    """
+    limit = None
+    for key in ("max_tokens", "max_completion_tokens", "max_output_tokens"):
+        candidate = source.get(key)
+        if isinstance(candidate, int) and candidate > 0:
+            limit = candidate
+            break
+    if limit is None:
+        # Le client n'a rien demandé : ne pas inventer de champ, sauf défaut
+        # explicitement voulu par l'appelant (comportement historique 16384).
+        if default is None:
+            return 0
+        limit = default
+
+    if target_protocol == "anthropic":
+        target["max_tokens"] = limit
+    elif _wants_max_completion_tokens(model):
+        target["max_completion_tokens"] = limit
+        _debug(
+            f"  [convert] {model}: max_tokens→max_completion_tokens={limit} "
+            f"(modèle de raisonnement, B2)"
+        )
+    else:
+        target["max_tokens"] = limit
+    return limit
 
 
 def _extract_cache_creation_tokens(usage: dict) -> int:
@@ -283,6 +431,213 @@ def _effort_to_reasoning(effort_level: str, model: str) -> str:
     if effort_level == "medium":
         return "medium"
     return "low"
+
+
+# [Hotfix 2026-09-10] Niveaux acceptés par ``output_config.effort`` (référence
+# API Messages : ``"low" | "medium" | "high" | "xhigh" | "max"``). OpenAI
+# accepte en plus ``none`` (pas de raisonnement) et ``minimal``, qui se replie
+# sur ``low`` — correspondance de LiteLLM, de facto standard de l'écosystème
+# (``minimal→low``, ``xhigh→xhigh``, ``max→max``, jamais d'écrasement en high).
+_ANTHROPIC_EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
+_ANTHROPIC_EFFORT_ALIASES = {"minimal": "low", "none": "", "": ""}
+
+
+def _effort_to_anthropic(effort_level: str, model: str) -> str:
+    """Niveau d'effort (vocabulaire OpenAI) → ``output_config.effort`` Anthropic.
+
+    Applique le plafond du modèle (``_effort_to_reasoning`` → ``clamp_effort``)
+    puis replie sur le vocabulaire Anthropic : ``minimal → low``,
+    ``none``/vide → ``""`` (aucun raisonnement demandé). Un niveau hors
+    vocabulaire est ramené au défaut documenté ``high`` plutôt que relayé tel
+    quel — l'upstream Anthropic rejetterait un niveau inconnu en 400.
+    """
+    level = str(effort_level or "").strip().lower()
+    level = _ANTHROPIC_EFFORT_ALIASES.get(level, level)
+    if not level:
+        return ""
+    mapped = _effort_to_reasoning(level, model)
+    if not isinstance(mapped, str) or not mapped:
+        return ""
+    mapped = _ANTHROPIC_EFFORT_ALIASES.get(mapped.strip().lower(), mapped.strip().lower())
+    if not mapped:
+        return ""
+    if mapped in _ANTHROPIC_EFFORT_LEVELS:
+        return mapped
+    _debug(f"  [thinking] {model}: effort {mapped!r} hors vocabulaire Anthropic -> high")
+    return "high"
+
+
+def _apply_anthropic_effort(result: dict, effort_level: str, model: str, *, source: str = "") -> bool:
+    """Écrit ``output_config.effort`` + ``thinking.adaptive`` sur un body Anthropic.
+
+    Remplace deux formes retirées le 2026-09-10 parce qu'invalides :
+
+    * ``thinking: {type:"enabled", budget_tokens:N}`` — dépréciée sur Claude 4.6,
+      **rejetée en 400 à partir de Claude 4.7** ;
+    * ``reasoning_effort`` — nom de champ OpenAI, inexistant côté Anthropic.
+
+    ``adaptive`` ne porte pas de ``budget_tokens`` : l'invariant Anthropic
+    ``max_tokens > budget_tokens`` ne peut donc plus être violé, quelle que soit
+    la valeur de ``max_tokens`` demandée par le client (l'ancien ratio
+    16000/10000/4000 émettait 16000 quels que soient les ``max_tokens``).
+
+    Un ``thinking: {type:"disabled"}`` explicite du client est respecté.
+    Retourne ``True`` si un effort a effectivement été appliqué.
+    """
+    level = _effort_to_anthropic(effort_level, model)
+    if not level:
+        return False
+    cfg = result.get("output_config")
+    cfg = dict(cfg) if isinstance(cfg, dict) else {}
+    cfg["effort"] = level
+    result["output_config"] = cfg
+    thinking = result.get("thinking")
+    thinking = dict(thinking) if isinstance(thinking, dict) else {}
+    if thinking.get("type") != "disabled":
+        thinking["type"] = "adaptive"
+        result["thinking"] = thinking
+    _debug(f"  [thinking] {model}: output_config.effort={level} + thinking=adaptive ({source})")
+    return True
+
+
+# ── [Lot L11 — A20] Conformité cache Anthropic ──
+#
+# Anthropic n'accepte que **4 breakpoints** `cache_control` par requête : au-delà
+# l'amont répond 400. Nos convertisseurs en *ajoutent* (pratique recommandée :
+# préfixe système + dernier tour utilisateur) tout en reportant ceux du client :
+# rien ne bornait le total. Un client qui pose lui-même 4 breakpoints faisait
+# donc échouer sa requête à cause de NOTRE ajout — panne invisible côté client.
+ANTHROPIC_MAX_CACHE_BREAKPOINTS = 4
+
+
+def _cc_is_set(holder: Any) -> bool:
+    """Vrai si ce message/outil porte déjà un breakpoint."""
+    return isinstance(holder, dict) and bool(holder.get("cache_control"))
+
+
+def _count_cache_breakpoints(messages: list, tools: list | None = None) -> int:
+    """Compte les breakpoints `cache_control` d'un corps converti.
+
+    Compte les breakpoints message et outil (les deux consomment le quota
+    Anthropic de 4) ainsi que les breakpoints posés sur des **parts** de
+    contenu, qui sont une autre façon de les placer.
+    """
+    total = 0
+    for m in messages or []:
+        if not isinstance(m, dict):
+            continue
+        if _cc_is_set(m):
+            total += 1
+        content = m.get("content")
+        if isinstance(content, list):
+            total += sum(1 for p in content if _cc_is_set(p))
+    for t in tools or []:
+        if _cc_is_set(t):
+            total += 1
+    return total
+
+
+def _enforce_cache_breakpoint_limit(result: dict) -> dict:
+    """Garde-fou A20 : ne jamais partir avec plus de 4 breakpoints.
+
+    On retire les breakpoints **les plus anciens d'abord** (en parcourant le
+    prompt du début vers la fin) : le cache Anthropic fonctionne par préfixe,
+    donc ce sont les marqueurs profonds dans la conversation — les plus récents —
+    qui ont le meilleur rapport hit/miss.
+
+    Les breakpoints d'**outils** consomment le même quota que ceux des messages
+    (le préfixe caché inclut les définitions d'outils) : ils sont donc comptés
+    ET élagués ici. Les oublier laissait passer 5 breakpoints dans un corps
+    « 3 messages + 3 outils », soit exactement le 400 qu'on veut éviter.
+
+    Retourne le corps (muté en place, comme les autres helpers de ce module).
+    """
+    messages = result.get("messages")
+    tools = result.get("tools")
+    tools = tools if isinstance(tools, list) else None
+
+    total = _count_cache_breakpoints(messages or [], tools)
+    if total <= ANTHROPIC_MAX_CACHE_BREAKPOINTS:
+        return result
+
+    _debug(
+        f"  [cache] {total} breakpoints cache_control > {ANTHROPIC_MAX_CACHE_BREAKPOINTS} "
+        f"→ élagage des plus anciens (400 amont sinon)"
+    )
+
+    # Ordre de priorité de conservation : messages d'abord (du plus ancien au
+    # plus récent), puis outils. On élague donc en tête de cette liste, ce qui
+    # revient à sacrifier les breakpoints les moins profonds dans le préfixe.
+    slots: list[dict] = []
+    for m in messages or []:
+        if not isinstance(m, dict):
+            continue
+        if _cc_is_set(m):
+            slots.append(m)
+        content = m.get("content")
+        if isinstance(content, list):
+            for p in content:
+                if _cc_is_set(p):
+                    slots.append(p)
+    for t in tools or []:
+        if _cc_is_set(t):
+            slots.append(t)
+
+    excess = total - ANTHROPIC_MAX_CACHE_BREAKPOINTS
+    for holder in slots[:excess]:
+        holder.pop("cache_control", None)
+
+    remaining = _count_cache_breakpoints(messages or [], tools)
+    if remaining > ANTHROPIC_MAX_CACHE_BREAKPOINTS:  # pragma: no cover — sécurité
+        # Filet de sécurité : si un emplacement compté n'était pas élagable
+        # (structure inattendue), on retire depuis la fin.
+        for holder in reversed(slots):
+            if remaining <= ANTHROPIC_MAX_CACHE_BREAKPOINTS:
+                break
+            if holder.pop("cache_control", None):
+                remaining -= 1
+    return result
+
+
+def _apply_top_level_cache_control(result: dict, source_body: dict) -> dict:
+    """[Lot L11 — A20] Reporte le `cache_control` **top-level** (automatic caching).
+
+    Anthropic accepte un `cache_control` à la racine du corps : le service place
+    alors lui-même le breakpoint au dernier bloc cachable. Nos convertisseurs ne
+    le lisaient pas — un client qui utilisait cette forme perdait son cache
+    silencieusement (aucune erreur, juste plus de hit).
+
+    On le transporte tel quel : c'est la forme la plus simple et celle que
+    l'amont comprend nativement.
+    """
+    if not isinstance(source_body, dict):
+        return result
+    cc = source_body.get("cache_control")
+    if cc:
+        result["cache_control"] = cc
+    return result
+
+
+def _cache_control_to_openai_breakpoint(holder: dict) -> dict:
+    """[Lot L11 — B3] Réservé — NON ÉMIS (voir décision ci-dessous).
+
+    B3 établit que l'équivalent OpenAI de ``cache_control`` est
+    ``prompt_cache_breakpoint: {"mode":"explicit"}`` posé **sur les content
+    parts** (text, image_url, input_audio, file, tool messages), et non au
+    niveau du message.
+
+    Une première version de L11 l'émettait au niveau du message : c'était un
+    placement contraire à la spec citée par le plan. Émettre un champ
+    non-standard au mauvais niveau est un risque net (un amont strict peut
+    répondre 400, un amont permissif le place au mauvais endroit) pour un
+    bénéfice nul tant que le placement par part n'est pas fait.
+
+    Ce travail est explicitement rattaché à **L15** (« traduire `cache_control`
+    → `prompt_cache_breakpoint` sur les parts »). On laisse donc le corps
+    inchangé ici, et ``cache_control`` continue d'être transporté comme avant
+    (comportement préexistant, non modifié par ce lot).
+    """
+    return holder
 
 
 def _restructure_for_cache(oai_body: dict, model_id: str) -> dict:
@@ -826,7 +1181,16 @@ def anthropic_to_openai(body: dict, model: str, raw: bytes | None = None) -> dic
                             "type": "file",
                             "file": {
                                 "file_data": f"data:{media_type};base64,{src['data']}",
-                                "filename": block.get("name") or "document.pdf",
+                                # [A25] Le champ client est ``title`` côté
+                                # Anthropic (``DocumentBlockParam`` : source,
+                                # type, cache_control, citations, context,
+                                # title) — PAS ``name``. Lire ``name`` seul
+                                # faisait donc TOUJOURS retomber sur le défaut :
+                                # le nom de fichier du client était perdu en
+                                # silence (``rapport.pdf`` → ``document.pdf``).
+                                # ``name`` reste lu en second pour ne pas casser
+                                # les corps non conformes déjà acceptés.
+                                "filename": block.get("title") or block.get("name") or "document.pdf",
                             },
                         }
                     )
@@ -853,7 +1217,9 @@ def anthropic_to_openai(body: dict, model: str, raw: bytes | None = None) -> dic
                             "type": "file",
                             "file": {
                                 "file_data": f"data:text/plain;base64,{_enc}",
-                                "filename": block.get("name") or "document.txt",
+                                # [A25] même défaut que la branche base64 ci-dessus :
+                                # le champ client est ``title``, pas ``name``.
+                                "filename": block.get("title") or block.get("name") or "document.txt",
                             },
                         }
                     )
@@ -935,7 +1301,9 @@ def anthropic_to_openai(body: dict, model: str, raw: bytes | None = None) -> dic
                                     "type": "file",
                                     "file": {
                                         "file_data": f"data:{_tr_dsrc.get('media_type', 'application/pdf')};base64,{_tr_dsrc['data']}",
-                                        "filename": _tr_b.get("name") or "document.pdf",
+                                        # [A25] champ client ``title`` (cf. branche
+                                        # document homologue plus haut).
+                                        "filename": _tr_b.get("title") or _tr_b.get("name") or "document.pdf",
                                     },
                                 }
                             )
@@ -1040,16 +1408,22 @@ def anthropic_to_openai(body: dict, model: str, raw: bytes | None = None) -> dic
     if supports_cache_control:
         for i in range(len(messages) - 1, -1, -1):
             if messages[i].get("role") == "user":
-                messages[i]["cache_control"] = {"type": "ephemeral"}
+                # [Lot L11 — B3] On n'ÉCRASE pas un breakpoint client : le TTL
+                # explicite d'un client (`{"ttl":"1h"}`) doit survivre à notre
+                # ajout, et il ne doit pas consommer deux fois le quota de 4.
+                messages[i].setdefault("cache_control", {"type": "ephemeral"})
+                _cache_control_to_openai_breakpoint(messages[i])
                 break
 
     # Build request
     oai = {
         "model": model,
         "messages": messages,
-        "max_tokens": body.get("max_tokens", 16384),
         "stream": body.get("stream", False),
     }
+    # [Lot L14 — B2/A17] Forme du champ de limite adaptée à l'upstream : les
+    # modèles de raisonnement exigent `max_completion_tokens`.
+    _set_output_token_limit(oai, body, model)
 
     for key, oai_key in [
         ("temperature", "temperature"),
@@ -1063,6 +1437,28 @@ def anthropic_to_openai(body: dict, model: str, raw: bytes | None = None) -> dic
         # Support both Anthropic format (name at top level) and OpenAI format (function.name)
         # v3.3: preserve server tools (web_search/web_fetch) natively, fix else branch B4
         oai_tools = []
+
+        def _carry_cc(dst: dict, src: dict) -> dict:
+            """[Lot L3 — A5] Reporte le breakpoint de cache d'un outil.
+
+            La boucle reconstruisait chaque outil sans reporter ``cache_control`` :
+            un client posant un breakpoint sur un outil le perdait
+            silencieusement, alors que le même breakpoint posé sur un message est
+            bien reporté. On aligne les deux comportements — la perte silencieuse
+            est le seul vrai défaut ici (§9.3 : l'amont OpenAI ignore ce champ,
+            il n'est donc pas nuisible de le transporter).
+
+            [Lot L11 — B3] On émet AUSSI l'équivalent OpenAI réel
+            (``prompt_cache_breakpoint``), sans retirer ``cache_control`` : les
+            deux publics (upstream OpenAI strict / Anthropic-compatible) sont
+            servis par le même corps.
+            """
+            cc = src.get("cache_control") if isinstance(src, dict) else None
+            if cc:
+                dst["cache_control"] = cc
+                _cache_control_to_openai_breakpoint(dst)
+            return dst
+
         for t in body["tools"]:
             # Server tools: preserve natively if type is web_*
             t_type = t.get("type", "")
@@ -1071,59 +1467,75 @@ def anthropic_to_openai(body: dict, model: str, raw: bytes | None = None) -> dic
                 # If converting to OpenAI and target is anthropic-native, preserve; otherwise keep type
                 if "name" in t and t.get("name"):
                     oai_tools.append(
-                        {
-                            "type": t_type,
-                            "name": t.get("name"),
-                            "description": t.get("description", ""),
-                            "input_schema": t.get("input_schema", {}),
-                        }
+                        _carry_cc(
+                            {
+                                "type": t_type,
+                                "name": t.get("name"),
+                                "description": t.get("description", ""),
+                                "input_schema": t.get("input_schema", {}),
+                            },
+                            t,
+                        )
                     )
                 else:
                     # type without name, e.g., {"type":"web_search_2025_03_05"} -> keep
-                    oai_tools.append({"type": t_type, "name": t.get("name", "web_search")})
+                    oai_tools.append(
+                        _carry_cc({"type": t_type, "name": t.get("name", "web_search")}, t)
+                    )
                 continue
             if "name" in t:
                 # Anthropic format: {"name": "...", "description": "...", "input_schema": {...}}
                 params = _normalize_tool_schema(t.get("input_schema", {}) or {}, model)
                 oai_tools.append(
-                    {
-                        "type": "function",
-                        "function": {
-                            "name": t["name"],
-                            "description": t.get("description", ""),
-                            "parameters": params,
+                    _carry_cc(
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": t["name"],
+                                "description": t.get("description", ""),
+                                "parameters": params,
+                            },
                         },
-                    }
+                        t,
+                    )
                 )
             elif "function" in t:
                 # OpenAI format: {"type": "function", "function": {"name": "...", ...}}
                 fn = t["function"]
                 params = _normalize_tool_schema(fn.get("parameters", {}) or {}, model)
                 oai_tools.append(
-                    {
-                        "type": "function",
-                        "function": {
-                            "name": fn.get("name", ""),
-                            "description": fn.get("description", ""),
-                            "parameters": params,
+                    _carry_cc(
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": fn.get("name", ""),
+                                "description": fn.get("description", ""),
+                                "parameters": params,
+                            },
                         },
-                    }
+                        t,
+                    )
                 )
             else:
                 # Unknown format: B4 fix - don't produce {"name":""}; check if web_* type without name
                 if isinstance(t_type, str) and t_type.startswith("web_"):
-                    oai_tools.append({"type": t_type, "name": t.get("name", "web_search")})
+                    oai_tools.append(
+                        _carry_cc({"type": t_type, "name": t.get("name", "web_search")}, t)
+                    )
                 elif t.get("name"):
                     params = _normalize_tool_schema(t.get("input_schema", t.get("parameters", {})) or {}, model)
                     oai_tools.append(
-                        {
-                            "type": "function",
-                            "function": {
-                                "name": t.get("name", ""),
-                                "description": t.get("description", ""),
-                                "parameters": params,
+                        _carry_cc(
+                            {
+                                "type": "function",
+                                "function": {
+                                    "name": t.get("name", ""),
+                                    "description": t.get("description", ""),
+                                    "parameters": params,
+                                },
                             },
-                        }
+                            t,
+                        )
                     )
                 else:
                     # skip invalid tool without name
@@ -1143,45 +1555,48 @@ def anthropic_to_openai(body: dict, model: str, raw: bytes | None = None) -> dic
         else:
             oai["tool_choice"] = tc
 
-    # Convert Anthropic thinking/effort → OpenAI reasoning parameters
-    # Claude Code sends: thinking: {type: "adaptive"} OR effort: "low"/"medium"/"high"/"xhigh"/"max"
-    # Relais reasoning_effort natif (tour openai_responses_to_anthropic précédent
-    # sur jambe /v1/responses : l'effort y est déjà résolu/normalisé spark).
-    _relayed = body.get("reasoning_effort")
-    if isinstance(_relayed, str) and _relayed and _relayed != "none":
-        oai["reasoning_effort"] = _effort_to_reasoning(_relayed, model)
-        _debug(f"  [thinking] {model}: reasoning_effort={oai['reasoning_effort']} (relayed={_relayed})")
-        oai = _restructure_for_cache(oai, model)
-        return oai
-    effort_level = body.get("effort")
-    thinking_param = body.get("thinking") if isinstance(body.get("thinking"), dict) else {}
-    ttype = thinking_param.get("type", "") if isinstance(thinking_param, dict) else ""
-    budget = thinking_param.get("budget_tokens", 0) if isinstance(thinking_param, dict) else 0
+    # Convert Anthropic thinking/effort → OpenAI reasoning parameters.
+    # [Lot L2] SOURCE UNIQUE : ``config.effort_policy.resolve_effort`` lit toutes
+    # les formes clientes (``output_config.effort`` [A13], ``effort``,
+    # ``reasoning_effort`` relais P6, ``thinking.type``/``budget_tokens``) et
+    # applique le plafond modèle de la config. Plus de table locale : un
+    # ``effort: high`` produit le MÊME résultat sur les 6 chemins (A1).
+    _decision = _resolve_effort(body, model)
+    if _decision.wants and _decision.level:
+        oai["reasoning_effort"] = _decision.level
+        _debug(
+            f"  [thinking] {model}: reasoning_effort={_decision.level} "
+            f"(source={_decision.source}, explicit={_decision.explicit})"
+        )
 
-    if effort_level and effort_level != "none":
-        wants_thinking = True
-    elif ttype in ("enabled", "adaptive") or budget > 0:
-        wants_thinking = True
-        if budget >= 16000 or budget == 0:
-            effort_level = "xhigh"
-        elif budget >= 10000:
-            effort_level = "high"
-        elif budget >= 4000:
-            effort_level = "medium"
-        elif ttype == "adaptive":
-            effort_level = "medium"
-        else:
-            effort_level = "low"
-    else:
-        wants_thinking = False
+    # ── [Lot L11 — A20] Clôture cache : top-level + plafond 4 ──
+    # L'ancien retour anticipé sur la source ``reasoning_effort`` est supprimé :
+    # il court-circuitait cette clôture, donc un client relayant
+    # ``reasoning_effort`` échappait au plafond de breakpoints ET à la
+    # réécriture de cache. Le seul effet visé (« ne pas restructurer deux fois »)
+    # est conservé par le fait qu'on ne restructure plus qu'une fois ici.
+    def _close_cache(out: dict) -> dict:
+        _apply_top_level_cache_control(out, body)
+        _enforce_cache_breakpoint_limit(out)
+        return out
 
-    if wants_thinking:
-        oai["reasoning_effort"] = _effort_to_reasoning(effort_level or "", model)
-        _debug(f"  [thinking] {model}: reasoning_effort={oai['reasoning_effort']} (effort={effort_level})")
-
-    # Restructure system prompt for models without semantic caching
-    oai = _restructure_for_cache(oai, model)
-    return oai
+    # ── [Lot L13 — B1] Marqueur de repli « reasoning_content » ──
+    # ``reasoning_content`` n'est dans AUCUNE spec OpenAI : c'est une convention
+    # vendeur (DeepSeek/GLM/Kimi…). Un upstream STRICT peut donc le rejeter en
+    # 400/422. On pose ici un marqueur interne (jamais sérialisé sur le wire,
+    # cf. ``_serialize_body``) pour que le handler puisse rejouer UNE fois la
+    # requête sans le champ, au lieu de casser le tour entier (texte + tool
+    # calls) pour tous les clients routés sur cet endpoint. Même mécanisme que
+    # le retry-once des items ``reasoning`` de ``/responses``.
+    # Le raisonnement est un ENRICHISSEMENT, jamais un bloquant : on dégrade
+    # (perte de la mémoire du raisonnement) plutôt que d'échouer.
+    _final = _restructure_for_cache(_close_cache(oai), model)
+    if isinstance(_final, dict) and any(
+        isinstance(_m, dict) and _m.get("reasoning_content")
+        for _m in _final.get("messages", [])
+    ):  # fmt: skip
+        _final[_HAS_SYNTHETIC_REASONING_KEY] = True
+    return _final
 
 
 _orig_anthropic_to_openai = anthropic_to_openai
@@ -1704,9 +2119,14 @@ def openai_to_anthropic_request(oai_body: dict) -> dict:
     result = {
         "model": oai_body.get("model", ""),
         "messages": anthro_messages,
-        "max_tokens": oai_body.get("max_tokens", 16384),
         "stream": oai_body.get("stream", False),
     }
+    # [Lot L14 — A17] Lit `max_tokens` ET `max_completion_tokens` : la forme
+    # moderne était ignorée, la limite du client remplacée par le défaut 16384.
+    # Destination Anthropic → toujours `max_tokens`.
+    _set_output_token_limit(
+        result, oai_body, oai_body.get("model", ""), target_protocol="anthropic"
+    )
 
     if system_text:
         result["system"] = system_text
@@ -1787,13 +2207,27 @@ def openai_to_anthropic_request(oai_body: dict) -> dict:
         else:
             result["tool_choice"] = tc
 
-    # [Lot H4] Sens inverse de _effort_to_reasoning : un client OpenAI qui
-    # envoie reasoning_effort doit obtenir une config thinking Anthropic quand
-    # la requête est routée vers un upstream Anthropic (P26).
-    _re = oai_body.get("reasoning_effort")
-    if isinstance(_re, str) and _re and _re not in ("none", "minimal"):
-        _budget = {"low": 4096, "medium": 10000, "high": 16000}.get(_re, 16000)
-        result["thinking"] = {"type": "enabled", "budget_tokens": _budget}
+    # [Lot H4 / Lot L2] Sens inverse de _effort_to_reasoning : un client OpenAI
+    # qui envoie reasoning_effort doit obtenir une config thinking Anthropic
+    # quand la requête est routée vers un upstream Anthropic (P4/P26).
+    #
+    # [Lot L2] On passe par la SOURCE UNIQUE : ``resolve_effort`` lit
+    # ``reasoning_effort`` mais aussi ``output_config.effort``, ``effort``,
+    # ``reasoning.effort`` et ``thinking.*`` — un client peut donc envoyer
+    # n'importe laquelle de ces formes sur cette porte (A1). L'ancien dict codé
+    # en dur ``{low:4096, medium:10000, high:16000}`` repliait ``xhigh``/``max``
+    # sur 16000 (A2) : il est supprimé.
+    #
+    # [Hotfix A14/A23] La forme {type:"enabled", budget_tokens:N} est
+    # abandonnée : dépréciée sur Claude 4.6, rejetée en 400 à partir de 4.7,
+    # et son ratio 16000/10000/4096 pouvait dépasser les max_tokens du client
+    # (Anthropic exige max_tokens > budget_tokens). Cible : adaptive +
+    # output_config.effort, qui ne porte aucun budget.
+    _decision = _resolve_effort(oai_body, result.get("model", ""))
+    if _decision.wants and _decision.level:
+        _apply_anthropic_effort(
+            result, _decision.level, result.get("model", ""), source=_decision.source
+        )
 
     return result
 
@@ -2092,9 +2526,19 @@ def openai_responses_to_anthropic(body: dict) -> dict:
     result = {
         "model": body.get("model", ""),
         "messages": anthro_messages,
-        "max_tokens": body.get("max_output_tokens", 16384),
         "stream": body.get("stream", False),
     }
+    # [Lot L15 — B5] NB : `store`/`truncation` ne sont **pas** relayés ici. La
+    # sortie de P6 part soit vers un upstream Anthropic (qui rejetterait ces
+    # clés inconnues par un 400), soit vers la chaîne P2→P5 du handler
+    # `/v1/responses`. C'est donc au handler — seul endroit qui connaît la
+    # destination — de les replacer quand la cible est bien un endpoint
+    # Responses (cf. `_relay_responses_storage_fields` appelé là-bas).
+    # [Lot L14 — A17] Même lecture unifiée des formes de limite ; destination
+    # Anthropic → toujours `max_tokens`.
+    _set_output_token_limit(
+        result, body, body.get("model", ""), target_protocol="anthropic"
+    )
     if system_text:
         result["system"] = system_text
     if "temperature" in body:
@@ -2121,45 +2565,25 @@ def openai_responses_to_anthropic(body: dict) -> dict:
         else:
             result["tool_choice"] = tc
 
-    # Convert Anthropic thinking/effort -> model-specific reasoning parameter
-    # Claude Code sends: thinking: {type: "adaptive"} OR effort: "low"/"medium"/"high"/"xhigh"/"max"
-    # Natif Responses (body.reasoning.effort, préservé par _sanitize + handler)
-    # prime sur le dérivé thinking/effort (BUG drop 2026-09-09 : /v1/responses
-    # natif perdait son effort ici même).
-    _native_reasoning = body.get("reasoning") if isinstance(body.get("reasoning"), dict) else {}
-    _native_effort = _native_reasoning.get("effort") if isinstance(_native_reasoning, dict) else None
-    if isinstance(_native_effort, str) and _native_effort and _native_effort != "none":
-        result["reasoning_effort"] = _effort_to_reasoning(_native_effort, result.get("model", ""))
-        _debug(f"  [thinking] {result.get('model', '')}: reasoning_effort={result['reasoning_effort']} (native reasoning.effort={_native_effort})")
-        return result
-    effort_level = body.get("effort")
-    thinking = body.get("thinking") if isinstance(body.get("thinking"), dict) else {}
-    ttype = thinking.get("type", "") if isinstance(thinking, dict) else ""
-    budget = thinking.get("budget_tokens", 0) if isinstance(thinking, dict) else 0
-
-    # Determine desired effort from effort param or thinking param
-    if effort_level and effort_level != "none":
-        wants_thinking = True
-    elif ttype in ("enabled", "adaptive") or budget > 0:
-        wants_thinking = True
-        # Map deprecated budget_tokens -> effort level
-        if budget >= 16000 or budget == 0:
-            effort_level = "xhigh"
-        elif budget >= 10000:
-            effort_level = "high"
-        elif budget >= 4000:
-            effort_level = "medium"
-        elif ttype == "adaptive":
-            effort_level = "medium"
-        else:
-            effort_level = "low"
-    else:
-        wants_thinking = False
-
-    if wants_thinking:
-        _model = result.get("model", "")
-        result["reasoning_effort"] = _effort_to_reasoning(effort_level or "", _model)
-        _debug(f"  [thinking] {_model}: reasoning_effort={result['reasoning_effort']} (effort={effort_level})")
+    # Convert Anthropic thinking/effort -> model-specific reasoning parameter.
+    # [Lot L2] SOURCE UNIQUE, comme P2 et P4. ``resolve_effort`` couvre
+    # ``reasoning.effort`` (natif Responses, préservé par _sanitize + handler),
+    # ``output_config.effort``, ``effort``, ``reasoning_effort`` et
+    # ``thinking.*`` — et applique le plafond modèle de la config. La 3ᵉ table
+    # budget→niveau locale est supprimée (A1) ainsi que l'écrasement de
+    # ``xhigh``/``max`` (A2).
+    #
+    # BUG drop 2026-09-09 préservé : sur /v1/responses natif, l'effort était
+    # perdu ici même — le test de non-régression correspondant reste vert.
+    #
+    # [Hotfix A15] Le champ de sortie est ``output_config.effort`` : jamais
+    # ``reasoning_effort``, nom de champ OPENAI qu'un upstream Anthropic
+    # ignorerait au mieux, rejetterait au pire.
+    _decision = _resolve_effort(body, result.get("model", ""))
+    if _decision.wants and _decision.level:
+        _apply_anthropic_effort(
+            result, _decision.level, result.get("model", ""), source=_decision.source
+        )
 
     return result
 
@@ -2178,13 +2602,25 @@ def anthropic_to_openai_responses(anthro: dict, model: str) -> dict:
         if btype == "text":
             text_content.append({"type": "output_text", "text": block.get("text", "")})
         elif btype == "thinking":
-            output_items.insert(
-                0,
-                {
-                    "type": "reasoning",
-                    "summary": [{"type": "summary_text", "text": block.get("thinking", "")}],
-                },
-            )
+            # [Lot L12 — A19] `display: "omitted"` : le bloc existe et porte une
+            # signature, mais son texte est vide. Émettre un item `reasoning`
+            # avec un `summary_text` vide ferait afficher à chaque tour un bloc
+            # « réflexion » vide côté client. On n'émet l'item que s'il y a
+            # réellement quelque chose à résumer.
+            _thinking_text = block.get("thinking") or ""
+            if _thinking_text.strip():
+                output_items.insert(
+                    0,
+                    {
+                        "type": "reasoning",
+                        "summary": [{"type": "summary_text", "text": _thinking_text}],
+                    },
+                )
+            else:
+                _debug(
+                    "  [convert] thinking display=omitted (texte vide) → "
+                    "pas d'item reasoning vide émis"
+                )
         elif btype == "tool_use":
             function_calls.append(
                 {
@@ -2219,7 +2655,10 @@ def anthropic_to_openai_responses(anthro: dict, model: str) -> dict:
             "cached_tokens": usage.get("cache_read_input_tokens", 0),
         },
         "output_tokens_details": {
-            "reasoning_tokens": 0,
+            # [Lot L12 — A18] Était codé en dur à 0 : la part facturée la plus
+            # chère d'un modèle de raisonnement était toujours affichée nulle.
+            # Borné par `out_t` : la ventilation est un sous-ensemble de la sortie.
+            "reasoning_tokens": _extract_reasoning_tokens(usage, out_t),
         },
     }
 
@@ -2298,7 +2737,9 @@ def openai_chat_to_responses(chat_resp: dict, model: str) -> dict:
             "cached_tokens": cached,
         },
         "output_tokens_details": {
-            "reasoning_tokens": 0,
+            # [Lot L12 — A18] Idem : remonte la ventilation réelle du raisonnement,
+            # bornée par le total de sortie.
+            "reasoning_tokens": _extract_reasoning_tokens(usage, completion_tokens),
         },
     }
 
@@ -2635,6 +3076,39 @@ def _sanitize_native_responses_request(req: dict) -> dict:
     return req
 
 
+def _relay_responses_storage_fields(req: dict, source: dict) -> None:
+    """[Lot L15 — B5] Relaie ``store`` et ``truncation`` vers Responses.
+
+    Les deux ont un défaut upstream qui surprend, et que le client doit pouvoir
+    piloter :
+
+    * ``store`` vaut ``true`` par défaut côté OpenAI — la réponse est **conservée
+      ≥30 jours**, sans que le client l'ait demandé. Notre proxy ne relayait pas
+      le champ : un client qui envoyait ``store: false`` (exigence de
+      confidentialité) voyait sa consigne **ignorée**, et rien ne le signalait.
+    * ``truncation`` vaut ``"disabled"`` : un dépassement de contexte produit un
+      **400 explicite** au lieu d'une troncature silencieuse. Ne pas le relayer
+      empêche le client de choisir ``"auto"``.
+
+    On ne pose **pas** de valeur par défaut : n'émettre le champ que si le client
+    l'a envoyé préserve la sémantique upstream, et évite de transformer un
+    ``store`` absent en décision que le proxy n'a pas à prendre. Les valeurs sont
+    validées — un ``store`` non booléen est rejeté par l'upstream, mieux vaut ne
+    pas le propager pour un 400 évitable.
+    """
+    store = source.get("store")
+    if isinstance(store, bool):
+        req["store"] = store
+    elif store is not None:
+        _debug(f"  [convert] DROP store non booléen invalide: {store!r}")
+
+    truncation = source.get("truncation")
+    if isinstance(truncation, str) and truncation in ("auto", "disabled"):
+        req["truncation"] = truncation
+    elif truncation is not None:
+        _debug(f"  [convert] DROP truncation invalide: {truncation!r}")
+
+
 def _chat_to_responses_request(chat: dict) -> dict:
     if "input" in chat and "messages" not in chat:
         # Verbatim natif Responses : sanitize quand même (tools + historique
@@ -2672,7 +3146,11 @@ def _chat_to_responses_request(chat: dict) -> dict:
                         # image_base64/mime_type (400 upstream sinon).
                         _tool_out_parts.append({"type": "input_image", "image_url": _turl})
                     elif _tb.get("type") == "file":
-                        _tf = _tb.get("file") if isinstance(_tb.get("file"), dict) else {}
+                        # mypy : `_tb.get("file")` répété ne se narrow pas ; on
+                        # passe par un temporaire annoté `dict` pour que les
+                        # accès ci-dessous soient typés (union-attr/index).
+                        _raw_tf = _tb.get("file")
+                        _tf: dict = _raw_tf if isinstance(_raw_tf, dict) else {}
                         if _tf.get("file_id"):
                             _tool_out_parts.append({"type": "input_file", "file_id": _tf["file_id"]})
                         elif isinstance(_tf.get("file_data"), str) and _tf["file_data"]:
@@ -2846,10 +3324,25 @@ def _chat_to_responses_request(chat: dict) -> dict:
     # jamais sur le wire (inconnu de l'upstream → 400).
     if _has_reasoning_items:
         req[_HAS_SYNTHETIC_REASONING_KEY] = True
-    if "max_tokens" in chat:
-        req["max_output_tokens"] = chat["max_tokens"]
-    if "max_output_tokens" in chat:
-        req["max_output_tokens"] = chat["max_output_tokens"]
+    # [Lot L14 — A17] Lecture unifiée des trois formes de limite. Avant, seule
+    # `max_tokens` était relue : un modèle de raisonnement à qui P2 venait
+    # d'écrire `max_completion_tokens` (B2) voyait sa limite **disparaître** à
+    # cette étape — le client demandait 512 tokens, l'upstream n'en recevait
+    # aucune borne, soit exactement le coût non borné que B2 cherche à éviter.
+    #
+    # Priorité inchangée pour les deux formes historiques : `max_output_tokens`
+    # (forme Responses native) l'emporte sur `max_tokens` (héritée). La forme
+    # moderne est ajoutée en dernier recours, donc aucun cas existant ne change.
+    for _key in ("max_output_tokens", "max_tokens", "max_completion_tokens"):
+        _val = chat.get(_key)
+        if isinstance(_val, int) and _val > 0:
+            req["max_output_tokens"] = _val
+            break
+    # [Lot L15 — B5] Relaie `store` et `truncation` : les défauts Responses sont
+    # `store=true` (rétention ≥30 j côté upstream) et `truncation="disabled"`
+    # (400 en dépassement de contexte, pas de troncature silencieuse). Sans
+    # relais, le client ne contrôle ni sa confidentialité ni son mode d'échec.
+    _relay_responses_storage_fields(req, chat)
     for k in ("temperature", "top_p"):
         if k in chat:
             req[k] = chat[k]
@@ -2940,7 +3433,12 @@ def _anthropic_to_responses_request(anthro: dict) -> dict:
         # Verbatim natif Responses : même sanitize que le chemin chat (P0-1/P0-2).
         return _sanitize_native_responses_request(dict(anthro))
     chat = anthropic_to_openai(anthro, anthro.get("model", ""))
-    return _chat_to_responses_request(chat)
+    req = _chat_to_responses_request(chat)
+    # [Lot L15 — B5] `anthropic_to_openai` ne transporte pas `store`/`truncation` :
+    # on les relaie depuis le corps d'origine, sinon un client Anthropic ne peut
+    # pas refuser la rétention ≥30 j ni choisir son mode de dépassement.
+    _relay_responses_storage_fields(req, anthro)
+    return req
 
 
 def _responses_to_chat_response(resp: dict, model: str, name_map: dict | None = None) -> dict:
@@ -3396,3 +3894,413 @@ def _responses_sse_to_chat_deltas(raw_line: str, parsed=None, state: "ResponsesS
     # All other event types (response.created, response.in_progress,
     # response.output_item.done, response.content_part.added/done, etc.) — skip
     return None
+
+
+# ── [Lot L5 — A11/A21] Émission incrémentale des événements Responses ──
+#
+# A21 (confirmé par la spec) : l'ensemble minimal consommé par un client est
+# ``response.created`` → ``response.output_text.delta``* → ``response.completed``.
+# Nous n'émettions QUE ``response.completed`` — sans même le ``response.created``
+# initial. Un client qui attend ``response.created`` avant d'afficher quoi que ce
+# soit reste donc bloqué jusqu'à la fin de la génération : la réponse n'apparaît
+# pas progressivement, elle apparaît d'un coup à la fin.
+#
+# Ce module fournit les briques d'émission ; l'appelant (opencode.py) décide du
+# moment. Chaque événement porte son ``sequence_number`` (B7), strictement
+# croissant dans le stream — un client qui détecte un trou ou un doublon
+# réinitialise son état.
+
+# Champs exacts par type d'événement (B7) — rappel de la spec, appliqué par les
+# méthodes ci-dessous :
+#   - `output_text.delta` : {content_index, delta, item_id, logprobs[], output_index, sequence_number}
+#   - `function_call_arguments.delta` : NI `content_index` NI `name`
+#   - `reasoning_summary_text.delta` : `summary_index` (pas `content_index`)
+
+
+class ResponsesStreamEmitter:
+    """Construit la séquence d'événements SSE Responses d'une réponse.
+
+    État PAR STREAM (comme ``ResponsesSseState``) : ``sequence_number`` et
+    identifiants sont propres à un stream. Deux streams concurrents ne doivent
+    jamais partager ces compteurs — c'était le défaut déjà corrigé pour le cache
+    d'outils.
+
+    ``output_index`` est **explicite** sur chaque méthode qui le concerne : le
+    déduire d'un compteur interne produisait un index faux sur
+    ``output_item.done`` (le compteur avait déjà été incrémenté par ``.added``),
+    et un client qui corrèle les deux événements par index aurait perdu l'item.
+    """
+
+    __slots__ = ("response_id", "model", "sequence", "created_sent")
+
+    def __init__(self, model: str, response_id: str | None = None) -> None:
+        self.model = model
+        self.response_id = response_id or f"resp_{uuid.uuid4().hex[:24]}"
+        self.sequence = 0
+        self.created_sent = False
+
+    def _next_seq(self) -> int:
+        seq = self.sequence
+        self.sequence += 1
+        return seq
+
+    def _wrap(self, event_type: str, payload: dict) -> dict:
+        return {"type": event_type, **payload, "sequence_number": self._next_seq()}
+
+    # ── Cycle de vie ──
+
+    def created(self, created_at: int | None = None, status: str = "in_progress") -> dict:
+        """`response.created` — premier événement, OBLIGATOIRE (A21).
+
+        Un client qui attend cet événement avant d'afficher resterait sinon
+        bloqué jusqu'à la fin de la génération : le texte n'apparaît pas
+        progressivement, il apparaît d'un bloc à la fin.
+        """
+        self.created_sent = True
+        now = created_at if created_at is not None else int(time.time())
+        return self._wrap(
+            "response.created",
+            {
+                "response": {
+                    "id": self.response_id,
+                    "object": "response",
+                    "created_at": now,
+                    "status": status,
+                    "model": self.model,
+                    "output": [],
+                }
+            },
+        )
+
+    def in_progress(self) -> dict:
+        """`response.in_progress` — transition, juste après ``created``."""
+        return self._wrap(
+            "response.in_progress",
+            {
+                "response": {
+                    "id": self.response_id,
+                    "object": "response",
+                    "status": "in_progress",
+                    "model": self.model,
+                    "output": [],
+                }
+            },
+        )
+
+    def output_item_added(self, item: dict, output_index: int) -> dict:
+        """`response.output_item.added` — ouvre un item de sortie, **vide**.
+
+        Le contenu ne doit **pas** figurer ici : il arrive par les deltas, puis
+        se referme complet sur ``.done``. Un client conforme qui initialise son
+        accumulateur avec ``item`` et y ajoute ensuite les deltas obtiendrait le
+        contenu **en double** si ``.added`` portait déjà tout le texte — cas
+        d'autant plus pernicieux qu'un test qui ne relit que les deltas (la vue
+        la plus naturelle) ne le voit jamais.
+
+        C'est aussi la convention déjà supposée par notre propre parseur SSE :
+        ``_responses_chunk_to_chat`` émet ``"arguments": ""`` sur l'événement
+        ``.added`` d'un ``function_call`` puis accumule les deltas.
+        """
+        return self._wrap(
+            "response.output_item.added",
+            {"output_index": output_index, "item": _empty_item_for_added(item, output_index)},
+        )
+
+    def output_item_done(self, item: dict, output_index: int) -> dict:
+        """`response.output_item.done` — ferme un item.
+
+        C'est à ce moment que l'``encrypted_content`` d'un reasoning item est
+        complet (B7) : le lire depuis ``.added`` donne une valeur partielle.
+        """
+        return self._wrap(
+            "response.output_item.done",
+            {"output_index": output_index, "item": {**item, "index": output_index}},
+        )
+
+    def content_part_added(self, item_id: str, output_index: int, content_index: int = 0) -> dict:
+        """`response.content_part.added` — ouvre une part de contenu texte."""
+        return self._wrap(
+            "response.content_part.added",
+            {
+                "item_id": item_id,
+                "output_index": output_index,
+                "content_index": content_index,
+                "part": {"type": "output_text", "text": "", "annotations": []},
+            },
+        )
+
+    def content_part_done(
+        self, item_id: str, text: str, output_index: int, content_index: int = 0
+    ) -> dict:
+        """`response.content_part.done` — ferme une part de contenu texte."""
+        return self._wrap(
+            "response.content_part.done",
+            {
+                "item_id": item_id,
+                "output_index": output_index,
+                "content_index": content_index,
+                "part": {"type": "output_text", "text": text, "annotations": []},
+            },
+        )
+
+    # ── Texte ──
+
+    def text_delta(
+        self, delta: str, item_id: str, output_index: int = 0, content_index: int = 0
+    ) -> dict:
+        """`response.output_text.delta` — un fragment de texte.
+
+        ``logprobs`` est présent (liste vide) : le champ est documenté dans le
+        payload, et un client strict qui le lit ne doit pas recevoir ``None``.
+        """
+        return self._wrap(
+            "response.output_text.delta",
+            {
+                "item_id": item_id,
+                "output_index": output_index,
+                "content_index": content_index,
+                "delta": delta,
+                "logprobs": [],
+            },
+        )
+
+    def text_done(
+        self, text: str, item_id: str, output_index: int = 0, content_index: int = 0
+    ) -> dict:
+        """`response.output_text.done` — texte complet de la part."""
+        return self._wrap(
+            "response.output_text.done",
+            {
+                "item_id": item_id,
+                "output_index": output_index,
+                "content_index": content_index,
+                "text": text,
+            },
+        )
+
+    # ── Raisonnement ──
+
+    def reasoning_summary_delta(
+        self, delta: str, item_id: str, output_index: int = 0, summary_index: int = 0
+    ) -> dict:
+        """`response.reasoning_summary_text.delta`.
+
+        B7 : ce type utilise ``summary_index`` — PAS ``content_index``. Émettre
+        ``content_index`` ici ferait ignorer le fragment par un client conforme.
+        """
+        return self._wrap(
+            "response.reasoning_summary_text.delta",
+            {
+                "item_id": item_id,
+                "output_index": output_index,
+                "summary_index": summary_index,
+                "delta": delta,
+            },
+        )
+
+    # ── Appels d'outils ──
+
+    def function_call_arguments_delta(self, delta: str, item_id: str, output_index: int = 0) -> dict:
+        """`response.function_call_arguments.delta`.
+
+        B7 : NI ``content_index`` NI ``name`` dans ce payload — les ajouter
+        contredit la spec.
+        """
+        return self._wrap(
+            "response.function_call_arguments.delta",
+            {"item_id": item_id, "output_index": output_index, "delta": delta},
+        )
+
+    def function_call_arguments_done(
+        self, arguments: str, item_id: str, output_index: int = 0
+    ) -> dict:
+        """`response.function_call_arguments.done` — arguments complets."""
+        return self._wrap(
+            "response.function_call_arguments.done",
+            {
+                "item_id": item_id,
+                "output_index": output_index,
+                "arguments": arguments,
+            },
+        )
+
+    # ── Terminaison ──
+
+    def completed(self, response: dict) -> dict:
+        """`response.completed` — terminal, porte l'``usage`` final."""
+        return self._wrap("response.completed", {"response": response})
+
+    def failed(self, response: dict | None = None, message: str = "") -> dict:
+        """`response.failed` — terminal cohérent pour un stream avorté.
+
+        L5 exige qu'un stream en erreur garde un **terminal cohérent** : un
+        client qui ne reçoit jamais d'événement terminal laisse sa connexion (et
+        son UI) bloquée jusqu'au timeout.
+        """
+        payload = response or {
+            "id": self.response_id,
+            "object": "response",
+            "status": "failed",
+            "model": self.model,
+            "output": [],
+            "error": {"code": "stream_error", "message": message or "upstream stream failed"},
+        }
+        return self._wrap("response.failed", {"response": payload})
+
+
+# Taille des fragments émis quand on rejoue une réponse complète sous forme
+# d'événements. Assez petit pour que le client voie une progression réelle
+# (l'objectif d'A11 : ne pas tout livrer d'un bloc), assez grand pour ne pas
+# multiplier les trames SSE sur une longue réponse.
+_RESPONSES_REPLAY_CHUNK = 64
+
+
+def _empty_item_for_added(item: dict, output_index: int) -> dict:
+    """Version **vide** d'un item, pour ``response.output_item.added``.
+
+    Conserve l'identité de l'item (``type``, ``id``/``call_id``, ``name``,
+    ``role``, ``status``) — ce qu'un client utilise pour décider *comment*
+    accumuler — mais vide le **contenu** (``content``, ``arguments``,
+    ``summary``, ``encrypted_content``), livré par les deltas puis complet sur
+    ``.done``.
+
+    Vider ``content`` plutôt que de l'omettre : un client strict qui itère
+    ``item["content"]`` sans garde ne doit pas recevoir de ``KeyError``, et la
+    liste vide est la valeur que la spec documente pour un item qui démarre.
+    """
+    if not isinstance(item, dict):
+        return {"index": output_index}
+
+    empty = {k: v for k, v in item.items() if k not in ("content", "arguments", "summary", "encrypted_content")}
+    empty["index"] = output_index
+
+    itype = item.get("type")
+    if itype == "message":
+        # Une part vide par part d'origine : le nombre de parts (et donc les
+        # `content_index` à venir) reste annoncé dès `.added`.
+        parts = item.get("content") or []
+        empty["content"] = [
+            {"type": "output_text", "text": "", "annotations": []}
+            if isinstance(p, dict) and p.get("type") in ("output_text", "text")
+            else (dict(p) if isinstance(p, dict) else p)
+            for p in parts
+        ]
+    elif itype == "function_call":
+        # Convention OpenAI (et de notre propre parseur) : arguments vides.
+        empty["arguments"] = ""
+    elif itype == "reasoning":
+        summary = item.get("summary") or []
+        empty["summary"] = [
+            {"type": "summary_text", "text": ""} if isinstance(s, dict) else s for s in summary
+        ]
+
+    return empty
+
+
+def responses_stream_events(
+    response: dict,
+    model: str,
+    emitter: ResponsesStreamEmitter | None = None,
+) -> list[dict]:
+    """[Lot L5 — A11/A21] Séquence d'événements Responses conforme pour `response`.
+
+    Transforme une réponse Responses **complète** (déjà convertie) en la
+    séquence d'événements qu'un client conforme attend :
+
+        response.created → response.in_progress
+        → (par item) output_item.added → … deltas … → output_item.done
+        → response.completed (avec `usage`)
+
+    L'ensemble minimal documenté (A21) est
+    ``response.created`` → ``response.output_text.delta``* → ``response.completed``.
+    Nous n'émettions que ``response.completed`` : un client qui attend
+    ``response.created`` avant d'afficher restait bloqué, et rien ne s'affichait
+    progressivement.
+
+    Les fragments de texte sont découpés en tranches de
+    ``_RESPONSES_REPLAY_CHUNK`` caractères : l'objectif est la **progression
+    perçue**, pas de simuler un vrai tokenizer. Le contenu final est identique à
+    celui de ``response["output"]``, seul le découpage diffère.
+
+    ``usage`` est reporté tel quel sur ``response.completed`` — c'est là que le
+    client lit la consommation finale.
+    """
+    emitter = emitter or ResponsesStreamEmitter(model, response.get("id"))
+    events: list[dict] = [emitter.created(), emitter.in_progress()]
+
+    for output_index, item in enumerate(response.get("output") or []):
+        if not isinstance(item, dict):
+            continue
+        itype = item.get("type")
+
+        if itype == "reasoning":
+            # B7 : le raisonnement ne coule que si `reasoning.summary` est opt-in
+            # côté client ; on émet les fragments de résumé disponibles.
+            events.append(emitter.output_item_added(item, output_index))
+            summary_dir = item.get("summary") or []
+            text = "".join(
+                s.get("text", "") for s in summary_dir if isinstance(s, dict) and s.get("text")
+            )
+            item_id = item.get("id") or f"rs_{uuid.uuid4().hex[:16]}"
+            for start in range(0, len(text), _RESPONSES_REPLAY_CHUNK):
+                chunk = text[start : start + _RESPONSES_REPLAY_CHUNK]
+                if chunk:
+                    events.append(emitter.reasoning_summary_delta(chunk, item_id, output_index))
+            # `encrypted_content` n'est complet qu'ici (B7), donc `.done` après
+            # tous les fragments.
+            events.append(emitter.output_item_done(item, output_index))
+
+        elif itype == "function_call":
+            events.append(emitter.output_item_added(item, output_index))
+            item_id = item.get("id") or item.get("call_id") or f"fc_{uuid.uuid4().hex[:16]}"
+            args = item.get("arguments") or ""
+            for start in range(0, len(args), _RESPONSES_REPLAY_CHUNK):
+                chunk = args[start : start + _RESPONSES_REPLAY_CHUNK]
+                if chunk:
+                    events.append(emitter.function_call_arguments_delta(chunk, item_id, output_index))
+            events.append(emitter.function_call_arguments_done(args, item_id, output_index))
+            events.append(emitter.output_item_done(item, output_index))
+
+        elif itype == "message":
+            events.append(emitter.output_item_added(item, output_index))
+            item_id = item.get("id") or f"msg_{uuid.uuid4().hex[:16]}"
+            content_index = 0
+            for part in item.get("content") or []:
+                if not isinstance(part, dict):
+                    continue
+                if part.get("type") not in ("output_text", "text"):
+                    content_index += 1
+                    continue
+                text = part.get("text", "") or ""
+                events.append(emitter.content_part_added(item_id, output_index, content_index))
+                for start in range(0, len(text), _RESPONSES_REPLAY_CHUNK):
+                    chunk = text[start : start + _RESPONSES_REPLAY_CHUNK]
+                    if chunk:
+                        events.append(
+                            emitter.text_delta(chunk, item_id, output_index, content_index)
+                        )
+                events.append(emitter.text_done(text, item_id, output_index, content_index))
+                events.append(emitter.content_part_done(item_id, text, output_index, content_index))
+                content_index += 1
+            events.append(emitter.output_item_done(item, output_index))
+
+        else:
+            # Type inconnu : on le transporte sans le perdre (un item qu'on ne
+            # sait pas découper reste livré en un seul bloc).
+            events.append(emitter.output_item_added(item, output_index))
+            events.append(emitter.output_item_done(item, output_index))
+
+    events.append(emitter.completed(response))
+    return events
+
+
+def responses_stream_sse(events: list[dict]) -> bytes:
+    """Sérialise des événements Responses en corps SSE (``data: …`` + ``[DONE]``).
+
+    ``[DONE]`` est conservé en fin de flux : nos clients existants s'en servent
+    comme sentinelle de fin, et la spec Responses ne l'interdit pas.
+    """
+    parts = [f"data: {_json_dumps_str(ev, ensure_ascii=False)}\n\n" for ev in events]
+    parts.append("data: [DONE]\n\n")
+    return "".join(parts).encode()
+

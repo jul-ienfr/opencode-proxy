@@ -38,9 +38,7 @@ DB_RAW_SIZE_CAP = 2_000_000  # [D1] au-delà : résumé compact mis en queue
 # ── Corps : tronquage / estimation / stub ───────────────────────────
 
 
-def truncate_body_for_storage(
-    body: dict | None, max_chars: int = MAX_BODY_STORAGE
-) -> str | None:
+def truncate_body_for_storage(body: dict | None, max_chars: int = MAX_BODY_STORAGE) -> str | None:
     """Serialize body to JSON, truncating messages array if needed to stay under max_chars.
 
     Keeps model, tools, and a summary of messages to preserve context while
@@ -70,9 +68,7 @@ def truncate_body_for_storage(
     # Build truncated version (skip full serialization of large body)
     truncated = {k: v for k, v in body.items() if k != "messages"}
     if messages:
-        truncated["messages"] = messages[:2] + [
-            {"_truncated": True, "original_count": len(messages)}
-        ]
+        truncated["messages"] = messages[:2] + [{"_truncated": True, "original_count": len(messages)}]
     result = json.dumps(truncated, ensure_ascii=False, separators=(",", ":"))
     if len(result) > max_chars:
         result = result[:max_chars]
@@ -113,9 +109,7 @@ def quick_body_size(body) -> int:
                             total += len(t)
                             if total > DB_RAW_SIZE_CAP:
                                 return total
-                        if p.get("input") is not None and not isinstance(
-                            p.get("input"), (str, int, float, bool)
-                        ):
+                        if p.get("input") is not None and not isinstance(p.get("input"), (str, int, float, bool)):
                             total += 256  # tool_use input : borne grossière
                             if total > DB_RAW_SIZE_CAP:
                                 return total
@@ -143,9 +137,7 @@ def compact_body_stub(body) -> dict:
             if isinstance(first, dict):
                 c = first.get("content")
                 stub["first_message_role"] = first.get("role")
-                stub["first_message_head"] = (
-                    c[:300] if isinstance(c, str) else str(c)[:300]
-                )
+                stub["first_message_head"] = c[:300] if isinstance(c, str) else str(c)[:300]
     return stub
 
 
@@ -184,12 +176,8 @@ def materialize_db_row(raw: DbRowRaw, *, redact_fn, tools_seen: set | None = Non
     # scanner TOUTE la table JSON à chaque requête de filtres.
     if raw.tools_used and tools_seen is not None:
         tools_seen.update(raw.tools_used)
-    request_body_json = (
-        redact_fn(truncate_body_for_storage(raw.request_body)) if raw.request_body else None
-    )
-    response_body_json = (
-        redact_fn(truncate_body_for_storage(raw.response_body)) if raw.response_body else None
-    )
+    request_body_json = redact_fn(truncate_body_for_storage(raw.request_body)) if raw.request_body else None
+    response_body_json = redact_fn(truncate_body_for_storage(raw.response_body)) if raw.response_body else None
     return raw.head + (tools_json, tools_used_json, request_body_json, response_body_json) + raw.tail
 
 
@@ -203,12 +191,7 @@ def normalize_timestamp_utc(timestamp: str) -> str:
     if timestamp.endswith("Z"):
         return timestamp
     try:
-        return (
-            _dt.datetime.fromisoformat(timestamp)
-            .astimezone()
-            .astimezone(_dt.UTC)
-            .strftime("%Y-%m-%dT%H:%M:%SZ")
-        )
+        return _dt.datetime.fromisoformat(timestamp).astimezone().astimezone(_dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     except ValueError:
         return timestamp  # unparseable — store as-is rather than dropping the row
 
@@ -282,6 +265,11 @@ _INSERT_REQUESTS_SQL = """
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """
 
+# Tables cibles acceptées sous forme de tuple taggé ``(table, payload)`` dans
+# un batch — utilisé pour lever l'ambiguïté avec un tuple SQL brut (voir
+# execute_batch_sync).
+_TAGGED_TABLES = frozenset({"requests", "free_usage"})
+
 # [P1.2] INSERT free_model_usage préparé par l'appelant (timestamp inclus) —
 # consommé par le writer batché ; le masquage de clé reste côté caller.
 _INSERT_FREE_USAGE_SQL = (
@@ -291,10 +279,192 @@ _INSERT_FREE_USAGE_SQL = (
     "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
 )
 
+# ── [Phase 8 plan boot] Compteurs de tokens incrémentaux ─────────────
+# Le restore des compteurs au boot faisait `SELECT model, SUM(tokens_*) FROM
+# requests GROUP BY model` sur ~6 Go : plusieurs secondes, à chaque démarrage.
+# Cette table agrège la MÊME information par (model, date) et est alimentée
+# par le writer au fil de l'eau : le restore devient un `SELECT ... WHERE
+# date >= ?` sur quelques centaines de lignes (<10 ms).
+#
+# Le curseur (`meta`) permet un premier remplissage progressif : au boot, si
+# la table est vide/incomplète, on agrège l'historique en tâche de fond par
+# tranches de dates, sans jamais re-scanner ce qui est déjà compté.
+_SCHEMA_TOKEN_COUNTERS_DAILY = """
+    CREATE TABLE IF NOT EXISTS token_counters_daily (
+        model TEXT NOT NULL,
+        date TEXT NOT NULL,
+        tokens_input INTEGER NOT NULL DEFAULT 0,
+        tokens_output INTEGER NOT NULL DEFAULT 0,
+        tokens_cache INTEGER NOT NULL DEFAULT 0,
+        requests INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (model, date)
+    )
+"""
 
-def init_requests_schema_fast(
-    conn: sqlite3.Connection, *, busy_timeout: int, cache_size: int, mmap_size: int
+_TOKEN_COUNTERS_INDEXES = [
+    "CREATE INDEX IF NOT EXISTS idx_tcd_date ON token_counters_daily(date)",
+]
+
+# Upsert : le writer incrémente les compteurs du jour pour le modèle.
+_UPSERT_TOKEN_COUNTERS_SQL = """
+    INSERT INTO token_counters_daily
+        (model, date, tokens_input, tokens_output, tokens_cache, requests)
+    VALUES (?, ?, ?, ?, ?, 1)
+    ON CONFLICT(model, date) DO UPDATE SET
+        tokens_input = tokens_input + excluded.tokens_input,
+        tokens_output = tokens_output + excluded.tokens_output,
+        tokens_cache = tokens_cache + excluded.tokens_cache,
+        requests = requests + 1
+"""
+
+# Meta générique (curseurs d'agrégation, version de schéma backfill).
+_SCHEMA_META = """
+    CREATE TABLE IF NOT EXISTS meta (
+        key TEXT PRIMARY KEY,
+        value TEXT
+    )
+"""
+
+DAY_BUCKET_VERSION = "1"
+
+
+def init_token_counters_schema(conn: sqlite3.Connection) -> None:
+    """Crée token_counters_daily + meta (idempotent, aucun scan).
+
+    Appelé au boot sur le chemin import → listen : uniquement des
+    ``CREATE TABLE IF NOT EXISTS``, donc O(1) même sur une DB de 6 Go.
+    """
+    conn.execute(_SCHEMA_TOKEN_COUNTERS_DAILY)
+    conn.execute(_SCHEMA_META)
+    for stmt in _TOKEN_COUNTERS_INDEXES:
+        try:
+            conn.execute(stmt)
+        except Exception:
+            pass
+    conn.commit()
+
+
+def bump_token_counters(
+    conn: sqlite3.Connection,
+    lock,
+    *,
+    model: str,
+    date: str,
+    tokens_input: int,
+    tokens_output: int,
+    tokens_cache: int,
+    fail_soft: bool = True,
 ) -> None:
+    """Incrémente les compteurs du jour (appelé par le writer, sous lock).
+
+    Fail-soft par défaut : la comptabilité analytique ne doit JAMAIS faire
+    échouer l'insertion de la requête elle-même.
+    """
+    try:
+        with lock:
+            conn.execute(
+                _UPSERT_TOKEN_COUNTERS_SQL,
+                (model, date, int(tokens_input or 0), int(tokens_output or 0), int(tokens_cache or 0)),
+            )
+    except Exception:
+        if not fail_soft:
+            raise
+
+
+def restore_token_counters(conn: sqlite3.Connection) -> dict[str, dict[str, int]]:
+    """Compteurs cumulés par modèle, lus depuis token_counters_daily.
+
+    Remplace le ``GROUP BY`` sur ``requests`` : quelques centaines de lignes
+    au lieu de millions → <10 ms sur la DB de référence (5,9 Go).
+    """
+    out: dict[str, dict[str, int]] = {}
+    try:
+        rows = conn.execute(
+            "SELECT model,"
+            "       COALESCE(SUM(tokens_input), 0),"
+            "       COALESCE(SUM(tokens_output), 0),"
+            "       COALESCE(SUM(tokens_cache), 0)"
+            " FROM token_counters_daily GROUP BY model"
+        ).fetchall()
+    except Exception:
+        return out
+    for row in rows:
+        out[row[0]] = {"input": row[1], "output": row[2], "cache": row[3]}
+    return out
+
+
+def get_meta(conn: sqlite3.Connection, key: str) -> str | None:
+    try:
+        row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+        return row[0] if row else None
+    except Exception:
+        return None
+
+
+def set_meta(conn: sqlite3.Connection, lock, key: str, value: str) -> None:
+    try:
+        with lock:
+            conn.execute(
+                "INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (key, value),
+            )
+            conn.commit()
+    except Exception:
+        pass
+
+
+def backfill_token_counters(conn: sqlite3.Connection, lock, *, chunk_days: int = 30) -> int:
+    """Agrège l'historique `requests` dans token_counters_daily, par tranches.
+
+    Un seul passage : le curseur ``token_backfill_done`` est posé à la fin.
+    Conçu pour tourner en tâche de fond APRÈS le ready (jamais sur le chemin
+    import → listen) — c'est le seul endroit qui refait le gros ``GROUP BY``,
+    et une seule fois dans la vie de la base.
+
+    Retourne le nombre de lignes agrégées (0 si déjà fait).
+    """
+    if get_meta(conn, "token_backfill_done") == DAY_BUCKET_VERSION:
+        return 0
+    total = 0
+    try:
+        with lock:
+            # `substr(timestamp, 1, 10)` = YYYY-MM-DD sur les timestamps ISO
+            # (les naïfs sont traités par le canary, cf. migrate_and_canary).
+            rows = conn.execute(
+                "SELECT model, substr(timestamp, 1, 10) AS d,"
+                "       COALESCE(SUM(tokens_input), 0),"
+                "       COALESCE(SUM(tokens_output), 0),"
+                "       COALESCE(SUM(tokens_cache), 0),"
+                "       COUNT(*)"
+                " FROM requests"
+                " WHERE timestamp IS NOT NULL AND length(timestamp) >= 10"
+                " GROUP BY model, d"
+            ).fetchall()
+            for model, d, ti, to, tc, n in rows:
+                conn.execute(
+                    "INSERT INTO token_counters_daily"
+                    " (model, date, tokens_input, tokens_output, tokens_cache, requests)"
+                    " VALUES (?, ?, ?, ?, ?, ?)"
+                    " ON CONFLICT(model, date) DO UPDATE SET"
+                    "   tokens_input = excluded.tokens_input,"
+                    "   tokens_output = excluded.tokens_output,"
+                    "   tokens_cache = excluded.tokens_cache,"
+                    "   requests = excluded.requests",
+                    (model, d, ti, to, tc, n),
+                )
+                total += 1
+            conn.execute(
+                "INSERT INTO meta (key, value) VALUES ('token_backfill_done', ?)"
+                " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (DAY_BUCKET_VERSION,),
+            )
+            conn.commit()
+    except Exception:
+        return 0
+    return total
+
+
+def init_requests_schema_fast(conn: sqlite3.Connection, *, busy_timeout: int, cache_size: int, mmap_size: int) -> None:
     """Boot rapide (Phase 2 chantier boot) : PRAGMAs WAL/NORMAL + CREATE TABLE.
 
     SANS migrations ALTER, SANS CREATE INDEX, SANS canary COUNT(*) — aucun
@@ -335,23 +505,17 @@ def migrate_and_canary(conn: sqlite3.Connection) -> int:
         conn.execute("ALTER TABLE requests ADD COLUMN station INTEGER DEFAULT NULL")
     except Exception:
         pass
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_requests_station_ts ON requests(station, timestamp)"
-    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_requests_station_ts ON requests(station, timestamp)")
     conn.commit()
     # [30] Canary: mixed naive/UTC timestamps break ORDER BY timestamp DESC
     try:
-        naive = conn.execute(
-            "SELECT COUNT(*) FROM requests WHERE timestamp NOT LIKE '%Z'"
-        ).fetchone()[0]
+        naive = conn.execute("SELECT COUNT(*) FROM requests WHERE timestamp NOT LIKE '%Z'").fetchone()[0]
     except Exception:
         naive = 0
     return naive
 
 
-def init_requests_schema(
-    conn: sqlite3.Connection, *, busy_timeout: int, cache_size: int, mmap_size: int
-) -> int:
+def init_requests_schema(conn: sqlite3.Connection, *, busy_timeout: int, cache_size: int, mmap_size: int) -> int:
     """PRAGMAs WAL/NORMAL + schéma requests + migrations colonnes + index.
 
     Wrapper synchrone historique (contrat tests/test_phase0_contracts.py :
@@ -359,9 +523,7 @@ def init_requests_schema(
     appelle :func:`init_requests_schema_fast` puis :func:`migrate_and_canary`
     en tâche de fond.
     """
-    init_requests_schema_fast(
-        conn, busy_timeout=busy_timeout, cache_size=cache_size, mmap_size=mmap_size
-    )
+    init_requests_schema_fast(conn, busy_timeout=busy_timeout, cache_size=cache_size, mmap_size=mmap_size)
     return migrate_and_canary(conn)
 
 
@@ -481,6 +643,7 @@ def execute_batch_sync(
     materialize_fn,
     *,
     debug_fn,
+    counter_fn=None,
 ) -> int:
     """Execute a batch of DB inserts in a single transaction (called in thread pool).
 
@@ -493,6 +656,12 @@ def execute_batch_sync(
     commits groupés inchangés. Sémantique fail-soft : une erreur SQL sur
     un item est loguée et l'item sauté — jamais propagée à la requête.
     Les items nus (_DbRowRaw / tuple SQL) restent acceptés (= requests).
+
+    [Phase 8 plan boot] ``counter_fn(model, timestamp, tokens_input,
+    tokens_output, tokens_cache)`` est appelé pour chaque ligne `requests`
+    insérée : l'hôte y branche l'incrément de ``token_counters_daily``. DI
+    volontaire (ce module reste pur) et fail-soft (une erreur de compteur ne
+    doit jamais faire échouer l'insertion de la requête).
     """
     if not batch:
         return 0
@@ -500,7 +669,13 @@ def execute_batch_sync(
     with lock:
         for item in batch:
             try:
-                if isinstance(item, tuple) and item and isinstance(item[0], str):
+                # [fix Phase 8] La détection du tuple taggé ne doit PAS se fier
+                # au seul « item[0] est une str » : un tuple SQL brut commence
+                # par l'id de requête, qui EST une chaîne → il était pris pour
+                # un (table, payload) et l'INSERT échouait silencieusement
+                # (item « sauté », batch perdu). On n'accepte donc comme tag
+                # que les noms de tables réellement gérés.
+                if isinstance(item, tuple) and len(item) == 2 and item[0] in _TAGGED_TABLES:
                     table, payload = item[0], item[1]
                 else:
                     table, payload = "requests", item
@@ -511,6 +686,13 @@ def execute_batch_sync(
                 row = materialize_fn(payload) if isinstance(payload, DbRowRaw) else payload
                 conn.execute(_INSERT_REQUESTS_SQL, row)
                 inserted += 1
+                if counter_fn is not None:
+                    try:
+                        # Layout _INSERT_REQUESTS_SQL : (1) timestamp, (2) model,
+                        # (5) tokens_input, (6) tokens_output, (7) tokens_cache.
+                        counter_fn(row[2], row[1], row[5], row[6], row[7])
+                    except Exception:
+                        pass
             except Exception as e:
                 debug_fn(f"  [db] batch item skipped ({type(e).__name__}: {e})")
         try:
@@ -571,20 +753,14 @@ def cleanup_old_bodies(
     """
     try:
         # Phase 1: Delete old rows entirely
-        cutoff_delete = time.strftime(
-            "%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - delete_after_days * 86400)
-        )
+        cutoff_delete = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - delete_after_days * 86400))
         cursor = conn.execute("DELETE FROM requests WHERE timestamp < ?", (cutoff_delete,))
         deleted = cursor.rowcount
-        cursor2 = conn.execute(
-            "DELETE FROM free_model_usage WHERE timestamp < ?", (cutoff_delete,)
-        )
+        cursor2 = conn.execute("DELETE FROM free_model_usage WHERE timestamp < ?", (cutoff_delete,))
         deleted2 = cursor2.rowcount
 
         # Phase 2: Nullify bodies for 7-30 day old rows
-        cutoff_null = time.strftime(
-            "%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - retention_days * 86400)
-        )
+        cutoff_null = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - retention_days * 86400))
         cursor3 = conn.execute(
             "UPDATE requests SET request_body = NULL, response_body = NULL "
             "WHERE timestamp < ? AND (request_body IS NOT NULL OR response_body IS NOT NULL)",
@@ -595,9 +771,7 @@ def cleanup_old_bodies(
         total = deleted + deleted2 + cleaned
         if total > 0:
             conn.commit()
-            debug_fn(
-                f"  [db] cleanup: deleted {deleted}+{deleted2} old rows, cleared bodies from {cleaned} requests"
-            )
+            debug_fn(f"  [db] cleanup: deleted {deleted}+{deleted2} old rows, cleared bodies from {cleaned} requests")
             log_fn(
                 f"  DB CLEANUP: deleted {deleted + deleted2} old rows, cleared {cleaned} bodies (>{retention_days}d)"
             )
@@ -677,10 +851,7 @@ def _purge_old_rows_locked(conn: sqlite3.Connection, days: int = WEEKLY_PURGE_DA
     import datetime as _dt
 
     cutoff = (
-        (_dt.datetime.now(_dt.UTC) - _dt.timedelta(days=days))
-        .replace(microsecond=0)
-        .isoformat()
-        .replace("+00:00", "Z")
+        (_dt.datetime.now(_dt.UTC) - _dt.timedelta(days=days)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
     )
     total = 0
     for sql in (_PURGE_OLD_ROWS_SQL, _PURGE_OLD_USAGE_SQL):
@@ -725,20 +896,27 @@ def weekly_maintain(conn: sqlite3.Connection, lock, purge_days: int = WEEKLY_PUR
 
 
 __all__ = [
+    "DAY_BUCKET_VERSION",
     "DB_RAW_SIZE_CAP",
     "MAX_BODY_STORAGE",
     "BatchState",
     "DbRowRaw",
+    "backfill_token_counters",
+    "bump_token_counters",
     "cleanup_old_bodies",
     "compact_body_stub",
     "execute_batch_sync",
     "flush",
+    "get_meta",
     "init_free_usage_schema",
     "init_requests_schema",
+    "init_token_counters_schema",
     "insert_sync",
     "materialize_db_row",
     "normalize_timestamp_utc",
     "quick_body_size",
+    "restore_token_counters",
+    "set_meta",
     "truncate_body_for_storage",
     "vacuum_if_needed",
     "wal_checkpoint",

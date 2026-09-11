@@ -1,0 +1,32 @@
+{
+  "fn": "anthropic_to_openai",
+  "input": {
+    "body": {
+      "model": "claude-sonnet-4-5",
+      "max_tokens": 77,
+      "messages": [
+        {
+          "role": "user",
+          "content": "hi"
+        }
+      ]
+    },
+    "model": "o3-mini"
+  },
+  "expected": {
+    "model": "o3-mini",
+    "messages": [
+      {
+        "role": "user",
+        "content": "hi",
+        "cache_control": {
+          "type": "ephemeral"
+        }
+      }
+    ],
+    "stream": false,
+    "max_completion_tokens": 77
+  },
+  "_note": "axe max_tokens : modèle o-series → forme max_completion_tokens (max_tokens rejeté en 400)",
+  "_generated_by": "scripts/gen_golden_fixtures.py (plan v10 §11.5)"
+}

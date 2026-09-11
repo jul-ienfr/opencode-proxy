@@ -1,0 +1,55 @@
+{
+  "fn": "anthropic_to_openai_responses",
+  "input": {
+    "anthro": {
+      "content": [
+        {
+          "type": "thinking",
+          "thinking": "   ",
+          "signature": "s"
+        },
+        {
+          "type": "text",
+          "text": "ans"
+        }
+      ],
+      "stop_reason": "max_tokens",
+      "usage": {
+        "input_tokens": 1,
+        "output_tokens": 2
+      }
+    },
+    "model": "claude-sonnet-4-5"
+  },
+  "expected": {
+    "id": "<resp_id>",
+    "object": "response",
+    "status": "incomplete",
+    "model": "claude-sonnet-4-5",
+    "output": [
+      {
+        "type": "message",
+        "role": "assistant",
+        "content": [
+          {
+            "type": "output_text",
+            "text": "ans"
+          }
+        ]
+      }
+    ],
+    "usage": {
+      "input_tokens": 1,
+      "output_tokens": 2,
+      "total_tokens": 3,
+      "input_tokens_details": {
+        "cached_tokens": 0
+      },
+      "output_tokens_details": {
+        "reasoning_tokens": 0
+      }
+    }
+  },
+  "_note": "axe effort/thinking P6 (A19) : thinking vide → pas d'item reasoning fantôme",
+  "_generated_by": "scripts/gen_golden_fixtures.py (plan v10 §11.5)"
+}

@@ -1,0 +1,45 @@
+{
+  "fn": "anthropic_to_openai",
+  "input": {
+    "body": {
+      "model": "claude-sonnet-4-5",
+      "max_tokens": 4096,
+      "thinking": {
+        "type": "enabled",
+        "budget_tokens": 10000
+      },
+      "system": "S",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Q"
+        }
+      ]
+    },
+    "model": "deepseek-v4-flash"
+  },
+  "expected": {
+    "model": "deepseek-v4-flash",
+    "messages": [
+      {
+        "role": "system",
+        "content": "S",
+        "cache_control": {
+          "type": "ephemeral"
+        }
+      },
+      {
+        "role": "user",
+        "content": "Q",
+        "cache_control": {
+          "type": "ephemeral"
+        }
+      }
+    ],
+    "stream": false,
+    "max_tokens": 4096,
+    "reasoning_effort": "high"
+  },
+  "_note": "axe effort : thinking budget_tokens → reasoning_effort=high (plafond modèle)",
+  "_generated_by": "scripts/gen_golden_fixtures.py (plan v10 §11.5)"
+}

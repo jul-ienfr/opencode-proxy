@@ -32,6 +32,7 @@ class TrayApp:
         self._icon = None
         self._geo_last_time = ""
         self._geo_poll_thread = None
+        self._state_poll_thread = None
 
     def _api_url(self):
         return f"http://{self.host}:{self.port}"
@@ -56,9 +57,7 @@ class TrayApp:
             return
         self._icon.icon = running_icon() if self.server_manager.is_running else stopped_icon()
         self._icon.title = (
-            f"OpenCode Proxy — {self._api_url()}"
-            if self.server_manager.is_running
-            else "OpenCode Proxy — Arrete"
+            f"OpenCode Proxy — {self._api_url()}" if self.server_manager.is_running else "OpenCode Proxy — Arrete"
         )
         self._icon.menu = self._build_menu()
 
@@ -91,6 +90,14 @@ class TrayApp:
             self._update_icon()
 
     def _on_open_dashboard(self, icon, item):
+        # [Phase 7] La fenêtre (pywebview, WebView2) coûte 1-3 s à froid et vit
+        # dans un PROCESSUS séparé (gui/_webview_main.py) : le parent n'importe
+        # jamais webview, rien à pré-chauffer ici. On avertit simplement si le
+        # socket n'écoute pas encore, au lieu d'ouvrir une page d'erreur.
+        if not self.server_manager.is_running:
+            self.notify("Le proxy demarre encore — reessayez dans quelques secondes.")
+            return
+        self._log_boot("webview launch requested")
         self.dashboard.open()
 
     def _on_copy_api_url(self, icon, item):
@@ -156,6 +163,16 @@ class TrayApp:
     # ── Entry point ──
 
     def run(self):
+        # [Phase 7 plan boot] Le tray est désormais le PREMIER élément visible :
+        # __main__ lance le serveur dans un thread de fond et appelle run() tout
+        # de suite. L'icône apparaît donc en ~50 ms (pystray + PIL) au lieu
+        # d'attendre la fin de ServerManager.start() (jusqu'à 5 s de socket)
+        # puis de toute la GUI.
+        #
+        # Le thread d'état (ci-dessous) fait passer l'icône de rouge à vert
+        # toute seule dès que le socket écoute — l'utilisateur voit un tray
+        # honnête pendant le démarrage.
+        self._start_state_poll()
         # start geo poll thread (daemon)
         try:
             import threading as _th
@@ -170,7 +187,74 @@ class TrayApp:
             running_icon() if self.server_manager.is_running else stopped_icon(),
             f"OpenCode Proxy — {self._api_url()}"
             if self.server_manager.is_running
-            else "OpenCode Proxy — Arrete",
+            else "OpenCode Proxy — demarrage...",
             menu=self._build_menu(),
         )
+        self._log_boot("tray shown")
         self._icon.run()
+
+    @staticmethod
+    def _log_boot(name: str) -> None:
+        """Jalon boot (même format que opencode.log_boot_phase) — import
+        paresseux pour ne pas imposer dashboard à gui."""
+        try:
+            import opencode as _oc
+
+            _oc.log_boot_phase(name)
+        except Exception:
+            pass
+
+    def _start_state_poll(self) -> None:
+        """Sonde l'état serveur/docker et rafraîchit l'icône (Phase 7).
+
+        Remplace le rafraîchissement uniquement « au retour de start/stop » :
+        avec le démarrage en thread de fond, personne ne rappellerait
+        _update_icon() quand le socket devient réellement prêt.
+        """
+        import threading as _th
+
+        if getattr(self, "_state_poll_thread", None) is not None and (self._state_poll_thread.is_alive()):
+            return
+        self._state_poll_thread = _th.Thread(target=self._state_poll_loop, daemon=True)
+        self._state_poll_thread.start()
+
+    def _state_poll_loop(self) -> None:
+        import time as _time
+
+        last_running = None
+        docker_notified = False
+        for _ in range(1800):  # ~30 min, puis on s'arrête (le tray reste juste)
+            try:
+                running = bool(self.server_manager.is_running)
+                if running != last_running:
+                    last_running = running
+                    self._update_icon()
+                    if running:
+                        self._log_boot("server ready (tray)")
+                # [Phase 6] docker indisponible → une seule notification tray
+                if not docker_notified:
+                    try:
+                        import shared_state as _ss
+
+                        if getattr(_ss, "docker_ready", None) is False:
+                            docker_notified = True
+                            self.notify(
+                                "Docker indisponible — les stations VPN ne peuvent pas demarrer.",
+                                "OpenCode Proxy",
+                            )
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            _time.sleep(1.0)
+
+    def notify(self, message: str, title: str = "OpenCode Proxy") -> None:
+        """Notification tray générique (balloon Windows via pystray)."""
+        try:
+            if self._icon is not None and hasattr(self._icon, "notify"):
+                try:
+                    self._icon.notify(message, title)
+                except TypeError:
+                    self._icon.notify(message)
+        except Exception:
+            pass

@@ -1,0 +1,82 @@
+{
+  "fn": "_responses_to_chat_response",
+  "input": {
+    "resp": {
+      "id": "resp_1",
+      "status": "completed",
+      "output": [
+        {
+          "type": "reasoning",
+          "summary": [
+            {
+              "type": "summary_text",
+              "text": "rs"
+            }
+          ]
+        },
+        {
+          "type": "message",
+          "role": "assistant",
+          "content": [
+            {
+              "type": "output_text",
+              "text": "hello"
+            }
+          ]
+        },
+        {
+          "type": "function_call",
+          "call_id": "call_9",
+          "name": "tool_short",
+          "arguments": "{\"a\":1}"
+        }
+      ],
+      "usage": {
+        "input_tokens": 20,
+        "output_tokens": 9,
+        "total_tokens": 29,
+        "input_tokens_details": {
+          "cached_tokens": 5
+        }
+      }
+    },
+    "model": "deepseek-v4-flash"
+  },
+  "expected": {
+    "id": "resp_1",
+    "object": "chat.completion",
+    "created": "<epoch>",
+    "model": "deepseek-v4-flash",
+    "choices": [
+      {
+        "index": 0,
+        "message": {
+          "role": "assistant",
+          "content": "hello",
+          "reasoning_content": "rs",
+          "tool_calls": [
+            {
+              "id": "call_9",
+              "type": "function",
+              "function": {
+                "name": "tool_short",
+                "arguments": "{\"a\":1}"
+              }
+            }
+          ]
+        },
+        "finish_reason": "stop"
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 20,
+      "completion_tokens": 9,
+      "total_tokens": 29,
+      "prompt_tokens_details": {
+        "cached_tokens": 5
+      }
+    }
+  },
+  "_note": "axe usage cache read : cached_tokens ← input_tokens_details (jamais output_tokens_details)",
+  "_generated_by": "scripts/gen_golden_fixtures.py (plan v10 §11.5)"
+}

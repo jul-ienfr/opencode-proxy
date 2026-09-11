@@ -40,16 +40,43 @@ RUN groupadd -r opencode && useradd -r -g opencode -d /app -s /sbin/nologin open
 #   [P6 fix] imports tardifs/lifespan NON copiés avant → ModuleNotFoundError
 #   possible au boot conteneurisé : docker_events, station_supervisor,
 #   latency_rotation, ip_latency, free_discovery.
+# [Phase 9 plan boot — corrigé 10/09] Les packages issus des refontes
+# (phases 1-9) n'étaient PAS copiés : `core`, `app`, `upstream`, `server`,
+# `observability`, `ops`, `protocol`, `streaming`, `vpn`, `free`,
+# `dashboard.routes`. Le smoke-test d'import en fin de build échouait donc
+# systématiquement (ModuleNotFoundError: No module named 'core' — vérifié en
+# rejouant les COPY dans un dossier isolé). On copie désormais les packages
+# en entier, en gardant l'exclusion stricte des secrets.
 COPY --chown=opencode:opencode requirements.txt ./
 COPY --chown=opencode:opencode opencode.py trust.py vpn_manager.py free_ip_pool.py shared_state.py shared_rotation.py traffic_capture.py protocol_mapping.py docker_events.py station_supervisor.py latency_rotation.py ip_latency.py free_discovery.py ./
+COPY --chown=opencode:opencode app/ ./app/
 COPY --chown=opencode:opencode config/ ./config/
+COPY --chown=opencode:opencode core/ ./core/
 COPY --chown=opencode:opencode dashboard/ ./dashboard/
+COPY --chown=opencode:opencode free/ ./free/
+COPY --chown=opencode:opencode gui/ ./gui/
+COPY --chown=opencode:opencode observability/ ./observability/
+COPY --chown=opencode:opencode ops/ ./ops/
+COPY --chown=opencode:opencode protocol/ ./protocol/
+COPY --chown=opencode:opencode server/ ./server/
 COPY --chown=opencode:opencode static/ ./static/
+COPY --chown=opencode:opencode streaming/ ./streaming/
+COPY --chown=opencode:opencode upstream/ ./upstream/
+COPY --chown=opencode:opencode vpn/ ./vpn/
 COPY --chown=opencode:opencode scripts/make_credentials_env.py ./scripts/make_credentials_env.py
+COPY --chown=opencode:opencode scripts/precompress.py ./scripts/precompress.py
+# [Phase 5 plan boot] Assets pré-compressés AU BUILD (jamais au runtime) : le
+# démarrage ne compresse plus 250 Ko de JS en zlib et le service sert du
+# brotli (−82 % mesuré sur app.js). Non fatal : sans brotli, gzip seul ; sans
+# aucun pré-compressé, dashboard/routes/static.py recompresse à la volée.
+RUN python scripts/precompress.py -q || echo "precompress skipped (fallback runtime)"
 
 # [P6] smoke-test d'import au build : un module manquant casse le build ici
 # (et non au boot conteneur, en prod).
 RUN python -c "import opencode" || (echo "SMOKE TEST FAILED: import opencode" && exit 1)
+# [Phase 3b-1] Vérifie que httpx (donc rich/click) N'EST PAS chargé au boot :
+# c'est le contrat de perf du boot. Régression = build rouge.
+RUN python -c "import sys, opencode; assert 'httpx' not in sys.modules, 'httpx charge au boot (Phase 3b-1 regressee)'; print('boot import: httpx deferred OK')"
 
 USER opencode
 
