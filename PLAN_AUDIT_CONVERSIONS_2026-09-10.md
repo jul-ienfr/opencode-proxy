@@ -139,7 +139,7 @@ Deux tests sont écrits comme **détecteurs de correction** (A4, A11) : ils pass
 Préservation `cache_control` au niveau `tools[]` (P2) ; `test_cache_contract.py` couvrant les 7 sites d'usage cache et les breakpoints par chemin ; contrats explicites `CACHE_REWRITE_MODELS` et exception `glm-5` ; guards d'orphelins homogènes par chemin ; estimation tokens médias par comptage réel (images : ratio dimensions ; documents : tokens du texte extrait ou marqueur documenté) dans `protocol/tokens.py` + test `count_tokens` vision/PDF.
 
 **L4 — Tools & documents : matrice complète** *(1,5 j)* — traite A9 — **PARTIELLEMENT TERMINÉ**
-`test_tools_matrix.py` + `test_documents_matrix.py` : pour les 6 chemins — `tools[]`/`tool_choice`/`strict`/nom long/`input_schema` invalide, puis `document` (base64 PDF, URL, `file_id`, texte), image, et `tool_result` portant document/image. Chaque perte silencieuse est soit corrigée, soit **déclarée** dans `docs/conversion-matrix.md` (la ligne « PERDU silencieusement » pour l'image est à mettre à jour).
+`test_tools_matrix.py` + `test_documents_matrix.py` : pour les 6 chemins — `tools[]`/`tool_choice`/`strict`/nom long/`input_schema` invalide, puis `document` (base64 PDF, URL, `file_id`, texte), image, et `tool_result` portant document/image. Chaque perte silencieuse est soit corrigée, soit **déclarée** dans `docs/conversion-matrix.md` (la ligne « PERDU silencieusement » pour l'image a été **rétablie et corrigée** en §11.10 : elle était trop large — `base64` et `url` traversent intacts, seul un `source.type` `file`/inconnu devient `[image:…]`).
 
 *Livré* : **`tests/test_tools_matrix.py`** (**30 cas** — axes `tools[]`,
 `tool_choice` nommé, `strict`, nom long, `input_schema` invalide × les 6 chemins,
@@ -686,12 +686,18 @@ faisaient pas. Détail complet au rapport §3.6 et §3.7.
   l'amont : mesuré, un nom de 80 car. arrivait à **80 car.** côté Chat
   (`anthropic_to_openai` ne posait aucun `_tool_name_map`). Le sens P4 vers
   Anthropic était déjà correct (limite 200 : un nom de 80 y passe légitimement).
-  **Risque identifié** : un upstream Chat strict pouvait rejeter en 400.
+  **Risque identifié, puis mesuré et écarté** : un upstream Chat strict *pouvait*
+  rejeter un nom > 64 en 400. La mesure sur le fil ne le confirme **pas** : cet
+  amont ne rejette ni ne tronque (nom de 72 car. rendu identique, 3/3, sur un
+  chemin sans sanitize ni restauration). Le correctif se lit donc comme une
+  **mise en conformité** au contrat OpenAI/Chat, et non comme la réparation d'une
+  panne reproduite — détail mesuré en §9 du rapport.
   **Correctif (lot L4)** : `_sanitize_chat_tools` sanitize à l'aller en
   **réutilisant** `sanitize_tool_names` (une seule source de vérité), l'historique
   `tool_calls[].function.name` et le `tool_choice` nommé suivent le rename, la
   `name_map` remonte au handler, et la restauration couvre le non-stream **et** le
-  streaming. Verrouillé par 6 tests `test_a8_*` + 1 test e2e de flux, et
+  streaming. Verrouillé par 7 tests dédiés (5 `test_a8_*`, l'axe P2 renommé et la
+  réversibilité) + 1 test e2e de flux, et
   **mutation-testé 6/6** (chaque élément neutralisé fait rougir son test).
 - **Vérification en conditions réelles — PARTIELLEMENT CONCLUANTE.** Le proxy en
   cours sur `127.0.0.1:4000` est joignable et a reçu de vraies requêtes. Sur
@@ -706,13 +712,21 @@ faisaient pas. Détail complet au rapport §3.6 et §3.7.
     **identique** à la sortie de `sanitize_tool_names`.
   - ⚠️ **Piège de lecture, corrigé** : les `200` ne prouvent **pas** qu'un amont
     accepte 80 caractères — sur cette jambe le nom était **sanitizé à 64**.
-  - ❌ **Non établi** : qu'un amont **rejette** un nom > 64. Les échecs observés
-    (`401 CreditsError` payant, `400 MissingSessionID` free, `403 DataPolicyError`
-    d'opt-in workspace) ont d'autres causes, et la cible est **intermittente**
-    (mêmes modèles : `200` puis `503`). Le volet « rejet » de A8 reste donc
-    **déclaré comme risque** — mais cela ne conditionne plus le correctif, qui
-    applique la limite **par construction** (le proxy n'émet plus aucun nom > 64
-    vers Chat). Détail mesuré : §9 du rapport.
+  - ✅ **Tranché depuis, dans le sens du NON-rejet** : cet amont ne rejette **pas**
+    un nom > 64, et ne le tronque pas non plus. Mesuré sur le seul chemin sans
+    ambiguïté — un modèle free à endpoint non-`/responses` (`mimo-v2.5-free`), où
+    `opencode.py:6197-6199` recopie le corps sans conversion, sans sanitize et
+    sans restauration : nom de **72 caractères** envoyé, `200`, nom rendu
+    **identique, 3/3 rondes**, témoin court vert à chaque ronde. Les échecs
+    observés gardent leurs autres causes (`401 CreditsError` payant,
+    `400 MissingSessionID` free, `403 DataPolicyError` d'opt-in).
+  - ⚠️ **Deux découvertes annexes de cette mesure.** (a) L'amont n'accepte que
+    `tool_choice: "auto"` : `required` et les formes nommées sont refusés en 400 —
+    limitation de l'amont, **pas** un défaut de conversion, et A8 en est disculpé
+    par construction (la branche passthrough n'appelle jamais `anthropic_to_openai`).
+    (b) **Lacune résiduelle déclarée** : sur la jambe free à endpoint
+    non-`/responses`, les noms > 64 partent **non sanitizés** — même classe d'écart
+    que A8, sans effet observable ici puisque l'amont tolère.
 
 ### 11.10 Reste à faire
 
@@ -729,12 +743,18 @@ faisaient pas. Détail complet au rapport §3.6 et §3.7.
 - **`docs/conversion-matrix.md`** — ✅ l'écart **A8** y est désormais documenté
   comme **corrigé** (bloc « Noms d'outils : 200 vs 64 — écart A8 CORRIGÉ », qui
   conserve le diagnostic sur le fil et le digest vérifié, et signale que le golden
-  A8 est le seul des 46 à avoir changé). ⚠️ **Reste à faire** : la mise à jour de
-  la ligne « PERDU silencieusement » pour l'**image**, demandée par L4 — cette
-  ligne n'existe pas dans `docs/conversion-matrix.md` tel qu'il est aujourd'hui
-  (grep : aucune occurrence de « PERDU »), donc soit elle vit dans un autre
-  document, soit elle n'a jamais été écrite. À clarifier avant de considérer L4
-  comme clos.
+  A8 est le seul des 46 à avoir changé). ✅ **Tranché — la ligne « PERDU
+  silencieusement » pour l'image, demandée par L4.** Elle **existait bien**, mais
+  dans une version antérieure de ce document : c'est la refonte de
+  `docs/conversion-matrix.md` au commit `b6c6543` qui l'a **supprimée** sans la
+  remplacer, d'où un grep vide sur le main. Elle est désormais **rétablie,
+  corrigée** : « PERDU silencieusement » était **faux pour `base64` et `url`** (les
+  octets traversent intacts — ni fetch, ni ré-encodage) et **vrai pour un cas
+  étroit** — un `source.type` `file` (`file_id`) devient le texte `[image:file]`
+  (`mapping.py:1165-1169`) sans que le client en soit informé. La même correction a
+  été portée dans `docs/clients-compat.md`, qui affirmait la version générale
+  fausse. Détail (trou latent en direction réponse, chemins sans test P1/P3) :
+  `docs/conversion-matrix.md`, section « Mapping champs ».
 - **L16** — le volet A4 (`ensure_min_tokens`) est **fait** (voir §11.6) : le
   relèvement se fait par champ et n'abaisse plus jamais une limite. Le volet
   Anthropic reste sans objet (A23 structurellement inviolable, plus aucun

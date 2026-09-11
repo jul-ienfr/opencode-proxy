@@ -550,19 +550,24 @@ modifications en cours.
 
 Par honnêteté, les limites de la couverture :
 
-1. **Le comportement de l'upstream réel n'est pas testé en live.** Tous les
-   tests sont hermétiques (upstream simulé). **Une tentative de test réel a
-   été faite** (voir ci-dessous) et elle est **bloquée au niveau du compte**,
-   pas de la connectivité : le proxy en cours sur `127.0.0.1:4000` est
-   joignable et répond, mais aucun amont n'accepte la requête. Donc **aucune
-   cible réelle n'a pu être validée**. **C'est en particulier le cas de la
-   limite de 64 caractères des cibles Chat** : on ne peut pas établir depuis ce
-   dépôt qu'un amont **rejette** effectivement un nom d'outil > 64 caractères. Le
-   correctif A8 applique donc la limite **par construction** — le proxy n'émet
-   plus aucun nom > 64 vers une cible Chat, et restitue le nom d'origine au
-   client — sans avoir reproduit le rejet en réel. Ce volet reste **déclaré comme
-   risque**, pas comme panne observée, et la tentative ci-dessous montre qu'il ne
-   peut pas être tranché sans accès amont.
+1. **Le comportement de l'upstream réel n'était pas testé en live — il l'est
+   désormais en partie, et une conclusion ferme en est sortie.** Tous les tests
+   restent hermétiques (upstream simulé) : cela reste vrai. Mais la tentative de
+   test réel, d'abord **bloquée au niveau du compte** (`CreditsError`,
+   `MissingSessionID`, `DataPolicyError`), a fini par aboutir : **plusieurs modèles
+   ont servi de vraies réponses** (`mimo-v2.5-free`, `glm-5.1`, `kimi-k2.6`,
+   `muse-spark-1.2-contributor`), la cible étant **intermittente** — mêmes modèles :
+   `200`, puis `503` quelques minutes plus tard. Ce qui est validé en réel est
+   détaillé ci-dessous, avec ses témoins. En particulier, **la limite de 64
+   caractères des cibles Chat a été tranchée par la mesure : cet amont ne rejette
+   pas un nom > 64** (nom de 72 car. rendu identique, 3/3, sur un chemin sans
+   conversion, sans sanitize et sans restauration). Le correctif A8 reste justifié
+   comme **mise en conformité** — 64 est la limite du contrat OpenAI/Chat — mais sa
+   prémisse « l'amont rejette » est **démentie** ici : ce volet n'est plus « déclaré
+   comme risque », il est **tranché, dans le sens du non-rejet**. Ce qui n'est
+   toujours **pas** prouvé en réel est plus étroit : la conformité des autres
+   chemins d'écriture (effort, cache, documents) et le comportement des amonts
+   Anthropic, qu'aucune cible joignable ne permet d'atteindre.
 2. **La bascule `max_completion_tokens` (D2) est latente**, pas active : aucune
    route configurée ne cible aujourd'hui un modèle o-series (`gpt-5.6-luna` est
    remappé vers `muse-spark-1.3-contributor`). Le mécanisme est correct et
@@ -572,8 +577,25 @@ Par honnêteté, les limites de la couverture :
    en conditions réelles ; la précédence est décidée et verrouillée, mais le
    comportement d'un upstream face à la coexistence des deux champs n'est pas
    confirmé.
-4. **Les documents et images** sont couverts au niveau de la conversion, mais
-   pas d'un bout à l'autre avec un upstream réel renvoyant un contenu analysé.
+4. **Les images : une dégradation réelle mais étroite, et deux chemins non
+   verrouillés.** Le cas courant est **fidèle** — `source.type` `base64` ou `url` :
+   octets transmis intacts, ni fetch d'URL, ni ré-encodage, ni redimensionnement
+   (`mapping.py:1155-1171`). Le cas étroit est une **dégradation** : tout autre
+   `source.type` (typiquement `file` avec `file_id`) devient le **texte**
+   `[image:file]` (`mapping.py:1165-1169`), y compris dans un `tool_result`
+   (`:1290-1292`), **sans que le client en soit informé** — le serveur le trace
+   (`_debug`, `:1168`), le client non, ce qui est précisément la définition d'une
+   perte silencieuse côté client. S'y ajoute un **trou latent** en direction
+   réponse : les convertisseurs de réponse ne traitent ni les blocs `image`
+   (`mapping.py:2281-2295`, `:2633-2668`) ni les deltas non textuels du flux
+   (`opencode.py:12954-12968`) — non observé, faute de production d'image en sortie
+   dans ce dépôt. Enfin **P1 et P3 n'ont aucun test d'image** : la transmission y
+   est verbatim, donc une perte est très improbable, mais elle n'est **pas
+   verrouillée** (décompte : P2 = 5, P4 = 1, P5 = 1, P6 = 2 tests portant réellement
+   une image). La ligne « PERDU silencieusement » de `docs/conversion-matrix.md`,
+   **supprimée par mégarde lors de la refonte de ce document** (commit `b6c6543`) et
+   introuvable depuis, a été **rétablie sous une forme exacte** — et la même
+   affirmation fausse, encore présente dans `docs/clients-compat.md`, a été corrigée.
 
 ### Tentative de test réel (résultat mesuré)
 
@@ -592,7 +614,7 @@ cause** : ce n'était pas la connectivité qui manquait.
 | **Via le proxy `:4000`**, P2, `deepseek-v4-flash-free` | témoin court | `503` (free → 400, payant → 503) |
 | **Via le proxy `:4000`**, P2, `muse-spark-1.3-contributor` / `mimo-v2.5` | **témoin court** | **`200`** ✅ — « Bonjour » |
 | idem, sur ces deux modèles | nom de 80 car. | **`200`** ✅ |
-| idem, avec `tool_choice` forcé | nom de 80 car. | `503` — `DataPolicyError (403)` : opt-in data du workspace requis |
+| idem, avec `tool_choice` forcé | nom de 80 car. | `503` — cause réelle **`tool_choice`**, pas le nom : l'amont n'accepte que `"auto"` (mesuré ci-dessous), puis le repli payant se heurte au `403 DataPolicyError` d'opt-in workspace |
 
 **Correction d'une erreur de lecture, à signaler.** J'ai d'abord interprété les
 deux `200` comme « l'amont accepte un nom de 80 caractères ». **C'était faux.**
@@ -623,18 +645,78 @@ ne faisait pas 80 caractères :
 2. ✅ **Établi** : sur la jambe Responses, la sanitize à 64 **fonctionne en
    production** (digest vérifié). Cela valide en réel le comportement verrouillé
    hors ligne par `test_axis_long_name_is_sanitized_towards_chat_via_responses`.
-3. ❌ **Non établi** : qu'un amont **rejette** effectivement un nom > 64. Tous les
-   échecs observés ont une autre cause (session free manquante, `DataPolicyError`
-   d'opt-in workspace, solde à zéro). La cible est en outre **intermittente**
-   (mêmes modèles : `200` puis `503`), donc un échec isolé ne serait de toute
-   façon pas imputable au nom. Cette question porte sur la **nécessité** de la
-   limite, pas sur le correctif A8 : celui-ci applique la limite **par
-   construction**, indépendamment de ce que ferait l'amont.
+3. ✅ **Établi depuis — et la réponse est NON** : cet amont **ne rejette pas** un nom
+   > 64. Mesuré sur le seul chemin sans ambiguïté — un modèle free à endpoint
+   non-`/responses` (`mimo-v2.5-free`), où il n'y a **ni conversion, ni sanitize, ni
+   restauration** : un nom d'outil de **72 caractères** est envoyé, l'amont répond
+   **`200`** et rend le nom **IDENTIQUE (72 car.), 3/3 rondes**, chacune avec son
+   témoin à nom court vert. La prémisse de A8 (« l'amont rejette ») est donc
+   **démentie sur cette cible**. Le correctif reste justifié comme **mise en
+   conformité** au contrat OpenAI/Chat (64 caractères), **pas** comme réparation
+   d'une panne reproduite. Détail en « Mesures A8 sur le fil » ci-dessous — y
+   compris les mesures que la **première rédaction surévaluait**, et la lacune
+   résiduelle découverte à cette occasion.
 
 **Le témoin reste la règle.** Sur `deepseek-v4-flash-free`, le témoin à nom court
 échouait déjà en `503` : dans ce cas la sonde **refuse de conclure** au lieu de
 produire un « A8 non confirmé » trompeur. Même discipline que pour les mutations :
 sans témoin vert, rien n'est imputable à la variable testée.
+
+### Mesures A8 sur le fil (résultat mesuré)
+
+**La question tranchée** : un amont rejette-t-il un nom d'outil > 64 caractères ?
+**Réponse : non, pas celui-ci** — et c'est mesuré, non plus supposé.
+
+**Le chemin qui permet de conclure.** La sanitize de la jambe free dépend de
+l'**URL** de la jambe : `_is_responses = "/responses" in free_endpoint`
+(`opencode.py:6183`). Les modèles **muse/spark** prennent un endpoint
+`/responses`, où les trois branches convertissent et sanitizent
+(`_sanitize_native_responses_request`, `_anthropic_to_responses_request`,
+`_chat_to_responses_request` — ce dernier appelle `sanitize_tool_names`,
+`mapping.py:3568`). Les **autres** modèles free prennent `free_base` =
+`.../chat/completions` : la branche `else` (`opencode.py:6197-6199`) recopie le
+corps, **passthrough nu** (cf. `tests/test_free_discovery.py:13`). Sur ce second
+chemin il n'y a **ni conversion, ni sanitize, ni map de restauration** : le nom du
+client part **verbatim** et celui de l'amont revient **verbatim**. C'est le seul
+chemin où la tolérance de l'amont est observable sans ambiguïté.
+
+| Mesure | Chemin | Nom d'outil | Résultat |
+|---|---|---|---|
+| **Tolérance amont** | `mimo-v2.5-free` (endpoint `chat/completions`, passthrough nu) | **72 car.** | **`200`, nom rendu IDENTIQUE (72 car.), 3/3 rondes** — témoin 11 car. vert dans chaque ronde |
+| Corroboration | `deepseek-v4-flash-free`, idem | **80 car.** | `400`, mais le corps d'erreur est *« Model is unavailable »* : le refus **ne portait pas** sur le nom |
+| Exclus (jambe morte) | `deepseek-v4-flash-free` → `503` ; `nemotron-3-ultra-free` → `MissingSessionID` | — | **non concluants**, écartés : sans témoin vert, rien n'est imputable |
+
+**Une erreur de méthode, corrigée dans cette rédaction.** Un premier jet a présenté
+« 9/9 en `200` sur le passthrough P3 » et « 24/24 noms identiques » comme la preuve
+de la tolérance amont. C'était **trop large** : la plupart de ces essais passaient
+par une jambe free muse/spark en `/responses`, donc **sanitizée à l'aller et
+restaurée au retour** — le même piège que celui signalé plus haut (lire un `200`
+comme l'acceptation d'un nom long). Ces mesures gardent leur valeur comme preuve que
+**le proxy se comporte correctement** (la restauration rend bien le nom d'origine) ;
+elles ne disent rien de la tolérance de l'amont. Seule la ligne `mimo-v2.5-free` en
+parle, et elle est sans échappatoire.
+
+**Découverte annexe — l'amont n'accepte que `tool_choice: "auto"`.** Toute autre
+valeur est refusée par un `400` au message explicite : *« only `"auto"` is supported
+for `tool_choice`. `"none"`, `"required"`, and named function choices are not
+currently supported »*. Reproduction : **3/3 rondes, sur les deux protocoles**
+(`/v1/messages` et `/v1/chat/completions`) — `auto` → `200`, `required` et la forme
+nommée → échec, **avec un nom d'outil court comme avec un nom long** : la longueur
+du nom n'est donc pas la variable. Le refus est retenté sur 5 stations, puis le
+repli payant se heurte au `403 DataPolicyError` du compte, d'où un `503` composite
+(`free=400` + `paid=403`) — confirmé par les colonnes `free_status`/`paid_status` de
+`logs/requests.db`. **Ce n'est pas un défaut de conversion** (la traduction du proxy
+est conforme), et le correctif A8 en est **disculpé par construction** : la branche
+passthrough P3 n'appelle jamais `anthropic_to_openai`, seul site d'appel de
+`_remap_chat_tool_choice` (`mapping.py:1567`), et `git diff b6c6543 HEAD -- app/protocol/mapping.py`
+ne touche `tool_choice` que là.
+
+**Lacune résiduelle déclarée.** Sur la jambe free à endpoint non-`/responses`, les
+noms d'outil ne sont **pas** sanitizés (`opencode.py:6197-6199`) : un nom > 64 y part
+tel quel. Même classe d'écart que A8, sur une autre branche, **sans effet observable
+ici** puisque l'amont tolère. Déclaré comme écart de conformité, **pas** comme panne ;
+toute correction éventuelle devrait réutiliser `sanitize_tool_names` plutôt que créer
+une seconde règle.
 
 ---
 

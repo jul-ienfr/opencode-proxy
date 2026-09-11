@@ -32,5 +32,9 @@
 
 ## Limites connues (audit §14, ne pas « documenter comme normal »)
 
-- images Anthropic perdues vers upstream OpenAI (§14.1.6)
+- images Anthropic **`source.type: file`** (`file_id`) perdues vers un upstream
+  OpenAI/Chat — remplacées par le texte `[image:file]`, sans que le client soit
+  prévenu (corrigé le 11/09 : la formulation précédente, « images Anthropic perdues
+  vers upstream OpenAI (§14.1.6) », était **fausse pour `base64` et `url`**, qui
+  traversent intacts — voir `docs/conversion-matrix.md`, section « Mapping champs »)
 - erreurs de stream /v1/responses non distinguables d'un succès (§14.1.14)
