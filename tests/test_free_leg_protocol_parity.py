@@ -207,8 +207,12 @@ class _Seam:
 
 
 async def _run_free(monkeypatch, protocol, model_id, free_model, body, payload):
-    oc.FREE_MODEL_MAP.clear()
-    oc.FREE_MODEL_MAP[model_id] = free_model
+    # Remplacer la TABLE, jamais la muter en place : `oc.FREE_MODEL_MAP` EST l'objet
+    # de `config.settings` (même référence). Un `.clear()` détruirait donc la table
+    # live pour TOUTE la session de tests — ce qui fait échouer
+    # `test_go_only_routing.py::test_live_models_muse_spark_13_free_map`, qui lit la
+    # configuration réelle. `monkeypatch.setattr` restaure la liaison en sortie.
+    monkeypatch.setattr(oc, "FREE_MODEL_MAP", {model_id: free_model})
     seam = _Seam(payload)
     monkeypatch.setattr(oc, "_do_free_request_curl_cffi", seam)
     out = await oc._try_free_model_first(dict(body), {}, protocol, model_id)
@@ -270,8 +274,9 @@ async def test_p1_long_tool_name_sanitized_on_wire_and_restored_to_client(free_e
     )
     # La réponse Chat référence le nom réellement envoyé : on le lit sur le fil,
     # ce qui prouve au passage que c'est bien ce nom qui circule.
-    oc.FREE_MODEL_MAP.clear()
-    oc.FREE_MODEL_MAP[PAID_ANTHROPIC] = FREE_CHAT
+    # Idem `_run_free` : remplacement de la table, jamais mutation en place —
+    # `oc.FREE_MODEL_MAP` est l'objet de `config.settings`.
+    monkeypatch.setattr(oc, "FREE_MODEL_MAP", {PAID_ANTHROPIC: FREE_CHAT})
     seen = {}
 
     class _SeamTool:

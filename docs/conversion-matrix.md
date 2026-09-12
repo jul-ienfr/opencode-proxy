@@ -248,3 +248,59 @@ Un niveau **explicite** n'est jamais relevé au maximum ; seul le cas
 | sinon | `stop_reason: end_turn` | |
 | `usage.prompt_tokens/completion_tokens` | `input_tokens/output_tokens` | |
 | `prompt_tokens_details.cached_tokens` | `cache_read_input_tokens` | `cache_creation=0` |
+
+## Jambe free — parité de protocole (défaut mesuré, corrigé le 11/09/2026)
+
+Le proxy route vers la « jambe free » quand le modèle payant routé a un équivalent
+dans `free_model_map` (`_try_free_model_first`, `opencode.py:6075`). L'endpoint free
+dépend du **modèle free** : `/responses` pour `muse-*`/`spark-*`, `/chat/completions`
+pour tous les autres (`config/discovery.py:324-333`).
+
+**Défaut (mesuré le 11/09 sur le proxy `:4000`)** : quand le modèle payant déclare
+`protocol: anthropic` **et** que son équivalent free est un endpoint
+`/chat/completions`, le corps Anthropic partait **verbatim** vers un endpoint Chat, et
+la réponse Chat était rendue **verbatim** au client Anthropic — sous un **HTTP 200**.
+
+Cas vivant : route `haiku` → `minimax-m2.5` (`protocol: anthropic`) →
+`mimo-v2.5-free` (endpoint Chat). Conséquences mesurées :
+
+- **system prompt perdu** — un endpoint Chat ne lit pas le champ `system` top-level
+  Anthropic ;
+- `tools[].input_schema` non traduit (un endpoint Chat attend
+  `tools[].function.parameters`) ;
+- réponse `{"choices":[…]}` (non-stream) ou chunks `chat.completion.chunk` (stream)
+  servis à un client Anthropic : ni `content`, ni `stop_reason`, ni
+  `usage.input_tokens`.
+
+**Repère de contrôle** : la route `opus` (→ `kimi-k2.6`, `protocol: openai`) utilise
+**le même** modèle free et le même endpoint, et fonctionnait — c'est donc la
+déclaration de protocole du modèle **payant**, et non le modèle free, qui déclenchait
+le défaut.
+
+**Correctif** — l'aller et le retour sont convertis, non-stream **et** stream :
+
+| Jambe | Aller (Anthropic → Chat) | Retour (Chat → Anthropic) |
+|---|---|---|
+| non-stream | `anthropic_to_openai` (`opencode.py:6205`) | `openai_to_anthropic` + restauration des noms d'outils (`opencode.py:6669`) |
+| stream | `anthropic_to_openai` (`opencode.py:9190`) | `chat_sse_to_anthropic_events` (`app/protocol/chat_sse_to_anthropic.py`) |
+
+Le convertisseur de flux est un module autonome, à état **par stream** (aucun global
+mutable — cf. le bug documenté en `app/protocol/mapping.py:3720-3726`). Il reprend les
+événements du chemin P2 déjà mesuré en réel : `message_start`, blocs `text`/`thinking`,
+`tool_use` + `input_json_delta`, `message_delta`, `message_stop`.
+
+**Périmètre** : les 7 sites appelant la jambe free avec `protocol="anthropic"`
+(chemins P1, P4, P6) consomment tous la réponse comme de l'Anthropic ; le correctif les
+aligne tous. Le chemin client Chat (P3) est inchangé — un témoin de non-régression le
+verrouille.
+
+**Écart déclaré, non corrigé** : le même schéma subsiste sur **P4 stream**
+(`_anthro_to_oai_stream`, `opencode.py:12783`), où le consommateur attend de
+l'Anthropic alors que l'endpoint free est Chat. Le test
+`test_free_model_subpath_p4_stream` ne le détecte pas : son stub renvoie une forme
+Anthropic (`ANTHRO_SSE_LINES`) que l'endpoint free réel ne produit pas.
+
+**Verrous** : `tests/test_free_leg_protocol_parity.py` (5 cas, non-stream),
+`tests/test_chat_sse_to_anthropic.py` (48 cas, convertisseur),
+`tests/test_e2e_protocol_matrix.py::test_free_model_subpath_p1_stream_converts_chat_to_anthropic`
+(bout en bout stream). Mutations : 4/4 mordent (2 non-stream, 2 stream).

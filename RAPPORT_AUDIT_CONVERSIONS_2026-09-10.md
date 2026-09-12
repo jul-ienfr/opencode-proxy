@@ -279,6 +279,147 @@ dont le mandat était de traverser le handler jusqu'au fil. Les 23 anomalies
 inventoriées au départ sont donc complétées par 2 trouvailles que seule la
 traversée de bout en bout pouvait produire.
 
+**…et ce n'était pas fini.** La reprise ligne par ligne de la matrice de vérité
+(§3.9) a produit une **troisième** trouvaille hors inventaire, **A26** : cette fois la
+matrice elle-même était fausse, et c'est en la relisant — contre le code, puis contre le
+proxy réel — que le défaut est apparu.
+
+### 3.8 A26 — la jambe free ne respectait pas le protocole du client
+
+**Anomalie hors inventaire, découverte en reprenant la matrice L1 ligne par ligne.**
+
+Le proxy bascule une requête vers la « jambe free » quand le modèle payant routé a un
+équivalent dans `free_model_map` (`_try_free_model_first`, `opencode.py:6075`). Quand le
+modèle payant déclare `protocol: anthropic` **et** que son équivalent free s'adresse à un
+endpoint `/chat/completions`, le corps Anthropic partait **verbatim** vers un endpoint
+Chat, et la réponse Chat était rendue **verbatim** au client Anthropic — **sous un HTTP
+200**.
+
+Conséquences, telles que mesurées :
+
+- **le system prompt était perdu** : un endpoint Chat ne lit pas le champ `system`
+  top-level d'Anthropic ;
+- `tools[].input_schema` partait non traduit (un endpoint Chat attend
+  `tools[].function.parameters`) ;
+- le client recevait `{"choices":[…]}` en non-stream et des `chat.completion.chunk` en
+  stream, là où il attend `content`, `stop_reason` et `usage.input_tokens`.
+
+**Preuve, avec son contrôle.** Le cas vivant est la route `haiku` → `minimax-m2.5`
+(`protocol: anthropic`) → `mimo-v2.5-free`. Le contrôle décisif est la route `opus` →
+`kimi-k2.6` (`protocol: openai`) : elle atteint **le même** modèle free par **le même**
+endpoint, et fonctionnait. Un témoin de prompt système envoyé sur les deux routes est
+honoré sur `opus` et **ignoré** sur `haiku`. C'est donc la déclaration de protocole du
+modèle **payant**, et non le modèle free, qui déclenchait le défaut — et un test vert sur
+un chemin voisin ne couvrait pas la cellule.
+
+**Pourquoi la matrice ne l'avait pas vu.** Le corpus n'exerçait la jambe free que sur des
+chemins à protocole `openai`, où la recopie verbatim est correcte ; et la cellule P1
+décrivait le chemin « natif » sans jamais franchir la bascule free.
+
+**Correctif** (conversion dans les deux sens, non-stream **et** stream) et **verrous** :
+
+| Jambe | Aller | Retour | Verrou |
+|---|---|---|---|
+| non-stream | `anthropic_to_openai` (`opencode.py:6205`) | `openai_to_anthropic` (`opencode.py:6669`) | `tests/test_free_leg_protocol_parity.py` (5 cas) |
+| stream | `anthropic_to_openai` (`opencode.py:9190`) | `chat_sse_to_anthropic_events` (`app/protocol/chat_sse_to_anthropic.py`) | `tests/test_chat_sse_to_anthropic.py` (48 cas) |
+
+Témoin bout en bout :
+`tests/test_e2e_protocol_matrix.py::test_free_model_subpath_p1_stream_converts_chat_to_anthropic`.
+**Mutation** : 4/4 mordent (aller et retour, non-stream et stream), fichier restauré à
+l'identique (sha256 vérifié) — sans quoi le vert ne serait imputable à rien.
+
+**Reste ouvert, déclaré** : le même schéma subsiste sur **P4 stream**
+(`_anthro_to_oai_stream`, `opencode.py:12783`), où le consommateur attend de l'Anthropic
+alors que l'endpoint free rend du Chat ; le test existant
+`test_free_model_subpath_p4_stream` ne le voit pas, son stub renvoyant `ANTHRO_SSE_LINES`,
+une forme que l'endpoint free réel ne produit pas.
+
+### 3.9 Reprise de la matrice de vérité (lot L1) — corrections et trous ouverts
+
+Le lot L1 avait produit une matrice de vérité ; sa reprise ligne par ligne, axe par axe et
+chemin par chemin, montre qu'elle était **incomplète et, par endroits, fausse**.
+
+| Chemin | Verdict de la reprise |
+|---|---|
+| **P1** | **toute la colonne fausse** (« natif ») → A26, corrigée |
+| **P2** | 3 cellules fausses (A5 et A6 étaient en fait **corrigées** ; `openai_stream` n'existe pas — c'est `stream_gen`), 6 imprécises |
+| **P3** | 3 cellules fausses (A1 et A4 étaient déjà corrigées par le lot L2 : les cellules décrivaient le code d'avant L2), 1 trompeuse |
+| **P5** | 11 cellules fausses ou imprécises (confusion P5-Chat / P5-Responses) |
+| **P4** | **5 cellules fausses** (effort « dict en dur », budget « 4096/10000/16000 », `redacted_thinking` « cache borné », noms longs « sanitize/restore », documents « PDF-URL seul »), 5 imprécises ; **défaut mesuré : jambe free Chat → 0 octet au client** |
+| **P6** | **2 cellules fausses** (A3 en fait **corrigée et testée ×3** ; « remap » inexistant), 8 imprécises ; garde orphelins **contournée** |
+
+**Trous ouverts trouvés par la reprise** (déclarés, non corrigés) :
+
+1. **A8 ouvert sur P3** — `sanitize_tool_names` n'est appelé **nulle part** dans
+   `opencode.py` : un nom d'outil > 64 caractères part verbatim vers un amont Chat.
+2. **A8 : retour P5 non restauré** — `openai_chat_to_responses` (`mapping.py:2710`)
+   n'accepte pas de `name_map` ; le client reçoit le nom raccourci.
+3. **P4 stream** — le schéma d'A26 (voir §3.8).
+4. **P2 → `/responses`** — chemin entier absent de la matrice
+   (`opencode.py:9826-9827`).
+5. **Axe « jambe free »** — la décision prise côté payant (plafond d'effort, profil de
+   schéma, `max_completion_tokens`) n'est pas recalculée après la bascule.
+6. **Garde `supports_cache_control` absente** (`mapping.py:1363`, `1390`) : fuite possible
+   d'un `cache_control` client vers un amont `glm-5*`.
+7. **A11 partiel** — séquence SSE conforme et verrouillée, mais **émission bufferisée** :
+   le TTFB vaut la durée totale de génération.
+8. **`cache_control` → `prompt_cache_breakpoint` est un no-op** ; `cache_write_tokens`
+   n'existe que dans le plan.
+9. **`thinking` top-level jamais recopié par P5.**
+10. **Zéro golden P3.**
+11. **P4 stream : la jambe free rend 0 octet au client** — **MESURÉ** (sonde TestClient
+    hors dépôt). Le swap free (`opencode.py:12736-12744`) ne convertit ni l'aller ni le
+    retour vers un endpoint free Chat, là où P1 le fait (`opencode.py:9193-9203`). Et
+    `test_free_model_subpath_p4_stream` **ne le détecte pas** : il stubbe
+    `ANTHRO_SSE_LINES` (`tests/test_e2e_protocol_matrix.py:909`), forme que l'endpoint
+    free réel ne produit pas, et n'asserte aucun contenu (`:914-921`) — contrairement à
+    `test_p4_chat_to_anthropic_stream:817`.
+12. **P4 : signature HMAC locale forgée émise vers l'amont Anthropic** — le
+    `reasoning_content` d'un historique multi-tours devient un bloc `thinking` signé
+    localement, et `strip_synthetic_thinking` n'est appelé que par `/v1/messages`
+    (`opencode.py:8888` contre `:11433-11437`). Le golden
+    `p4_thinking_strip_local_signature.json:38-43` verrouille même sa présence, malgré
+    son nom. Non mesuré (400 amont attendu, non constaté).
+13. **P6 : garde orphelins contournée** — `_drop_orphan_responses_input` filtre
+    `body["input"]` (`opencode.py:13399-13407`) mais `anthro_body` n'est jamais
+    reconstruit (branche `pass`) : le `tool_result` orphelin atteint l'amont. DÉDUIT.
+
+**Limite de cette reprise** : elle est **documentaire et statique**. Elle établit ce que
+le code fait, pas ce que l'amont réel accepte. Une seule trouvaille de P4 est
+**mesurée** et non déduite : la jambe free de P4 en streaming rend **0 octet** au client.
+Trois réserves : la jambe free de **P6 n'a aucun test** (les E2E stubent
+`_try_free_model_first → None`), le garde « axe 14 » de `tests/test_protocol_matrix.py`
+ne vérifie qu'une sous-chaîne de source et **ne passe donc pas l'axe** de
+l'incrémentalité, et le cap d'effort par défaut est **DÉDUIT**, non exécuté.
+
+### 3.10 Un défaut dans le test que j'ai écrit — trouvé par le gate complet
+
+Il serait malhonnête de présenter les verrous d'A26 sans dire ceci. Le commit `62381fe` a
+introduit `tests/test_free_leg_protocol_parity.py`, dont l'aide `_run_free` exécutait
+`oc.FREE_MODEL_MAP.clear()` — une mutation **en place**. Or `oc.FREE_MODEL_MAP` **est**
+l'objet de `config.settings` (`oc.FREE_MODEL_MAP is st.FREE_MODEL_MAP` → `True`) : la table
+live était donc vidée pour **toute** la session de tests, ce qui fait échouer
+`tests/test_go_only_routing.py::test_live_models_muse_spark_13_free_map`
+(`KeyError: 'muse-spark-1.3-contributor'`).
+
+Deux leçons, toutes deux de méthode :
+
+1. **Un sous-ensemble vert ne prouve rien.** J'avais lancé 141 tests choisis à la main,
+   tous verts ; le gate complet a rougi sur le seul test que ce sous-ensemble n'incluait
+   pas. Le « vert » revendiqué pour `62381fe` était donc **faux**, et la couverture
+   annoncée n'était pas mesurée.
+2. **Muter l'état global est un piège à retardement.** Le symptôme apparaissait dans un
+   fichier sans aucun rapport avec le correctif, à cause du seul ordre de collecte
+   (`test_free_leg…` < `test_go_only…` alphabétiquement).
+
+**Correctif** : `monkeypatch.setattr(oc, "FREE_MODEL_MAP", {…})` — remplacement de la
+liaison, restaurée automatiquement, au lieu d'une mutation en place.
+
+**Preuve de causalité par mutation inverse** : en réintroduisant le `.clear()`, le
+`KeyError` revient **exactement au même endroit** (`test_go_only_routing.py:88`) ; le
+fichier est ensuite restauré à l'identique (sha256 vérifié). Sans cette étape, rien
+n'établirait que la correction est bien la cause du vert.
+
 ---
 
 ## 4. Anomalies invalidées, avec preuve

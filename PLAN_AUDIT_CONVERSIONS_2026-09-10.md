@@ -215,26 +215,48 @@ Charge : **~11 jours-homme pour L0-L8, ~15 avec L9-L12, ~18 avec L9-L15, ~19 ave
 
 ---
 
-## 6. Matrice de couverture cible (15 axes × 6 chemins)
+## 6. Matrice de couverture cible (16 axes × 6 chemins)
+
+> Le titre annonçait « 15 axes » : il y en a **16** (recompté à l'audit L1).
+> La colonne **P1** a été **falsifiée** par A26 (§11.11) et les colonnes P2, P3 et P5
+> ont été reprises ligne par ligne à l'audit L1 : les corrections sont portées dans le
+> tableau, et les cellules restées fausses ou imprécises sont listées en §11.12.
 
 | Axe | P1 | P2 | P3 | P4 | P5 | P6 |
 |---|---|---|---|---|---|---|
-| effort entrée | natif | `_effort_to_reasoning` + caps | **4ᵉ mapping, sans caps** | dict en dur (A1/A2) | natif `reasoning.effort` | **perdu (A3)** |
-| budget thinking↔niveau | natif | ratio 16000/10000/4000 | par famille | 4096/10000/16000 | idem | absent |
-| plancher max_tokens | oui | oui | **non (A4)** | oui | oui | oui |
-| thinking multi-tours | strip synthétique | `reasoning_content` | passthrough | `_local_signature` | résumé `reasoning` droppé | droppé assumé |
-| `redacted_thinking` | natif | cache borné 512 | passthrough | cache borné | — | — |
-| ordre blocs réponse | natif | golden | passthrough | à tester | à tester | à tester |
-| `cache_control` messages | natif | partiel | passthrough | n/a | partiel | n/a |
-| `cache_control` tools | natif | **perdu (A5)** | passthrough | n/a | — | — |
-| usage cache (read/creation) | natif | 7 sites, **0 test (A6)** | passthrough | à tester | partiel | partiel |
-| tools schéma/strict | natif | `_normalize_tool_schema` | passthrough | profils | `_sanitize` | profils |
-| tool_choice | natif | golden | passthrough | dict↔str | dict↔str | dict↔str |
-| noms d'outils longs | natif | sanitize/restore | passthrough | sanitize/restore | remap historique | remap |
-| orphelins tool_result | — | `_drop_orphan_tool_messages` | idem | idem | `_drop_orphan_responses_input` | idem |
-| documents (PDF/URL/file_id) | natif | `{type:file}` + replis | passthrough | PDF-URL seul | `input_file` | `input_file` |
-| images (+ tool_result) | natif | data-URI + drops | passthrough | data-URI | `input_image` | `input_image` |
-| streaming incrémental | natif | `openai_stream` | natif | `_anthro_to_oai_stream` | **non (A11)** | **non (A11)** |
+| effort entrée | natif ⚠️ | `resolve_effort` + caps modèle | `resolve_effort` + caps (L2) | `resolve_effort`→`output_config.effort` + `thinking.adaptive` | `output_config.effort`→`reasoning_effort` ; natif si free `/responses` | `output_config.effort` + `thinking.adaptive`, **A3 corrigée** |
+| budget thinking↔niveau | natif ⚠️ | table unique 4 paliers, aucun budget émis | idem (L2) | **aucun budget émis** (le niveau reste un niveau) | **budget non lu** : clé `thinking` non recopiée | **aucun budget émis** — choix, pas trou |
+| plancher max_tokens | oui ⚠️ | oui | **oui (corrigé L2)** | oui (relevé **par champ**) | oui | oui ; précédence `max_tokens`→`max_completion_tokens`→`max_output_tokens` |
+| thinking multi-tours | strip synthétique ⚠️ | `reasoning_content` | passthrough, **sans repli retry-once** | **signature HMAC locale forgée émise vers l'amont** (trou) | résumé `reasoning` droppé | droppé assumé (golden) |
+| `redacted_thinking` | natif ⚠️ | cache 512 en **écriture seule** (aucune réinjection) | passthrough | **perdu en silence** (le cache ne vit que sur P2) | — | **perdu en silence** |
+| ordre blocs réponse | natif ⚠️ | golden (non-stream) ; **SSE non verrouillé** | passthrough | **normalisé** `reasoning`→texte→`tool_calls` (entrelacement perdu) | **déterministe** : `reasoning`→texte→`function_call` | **déterministe** (golden) |
+| `cache_control` messages | natif ⚠️ | partiel — garde `supports_cache_control` absente (fuite `glm-5*` possible, non testée) | passthrough | n/a (aucune occurrence) | **client perdu** ; breakpoints auto-injectés | **perte muette** |
+| `cache_control` tools | natif ⚠️ | **corrigé (L3)** ; `prompt_cache_breakpoint` reste un no-op | passthrough | abandonné (boucle reconstruite) | transporté mais **non traduit** (L15 non fait) | **perte muette** |
+| usage cache (read/creation) | natif ⚠️ | read ok ; trous = sites handler, compta DB, `cache_creation` en stream | passthrough (usage amont) | read remonté ; **`cache_creation` jamais remonté**, pas d'E2E | read ok, **création perdue** | read ok ; **création jetée** (`cache_write_tokens` absent du dépôt) |
+| tools schéma/strict | natif ⚠️ | `_normalize_tool_schema` (aucun `strict` émis) | passthrough | profils ; **`strict` abandonné (non déclaré)** | `_normalize_tool_schema` + profil modèle | profils ; `strict` jamais reporté |
+| tool_choice | natif ⚠️ | golden | passthrough (exception `web_search`/`web_fetch`) | dict→dict ; **chaîne passée verbatim** | dict→dict (`any`→`required`) | dict→dict ; **pas de sens retour** |
+| noms d'outils longs | **converti (A26)** ⚠️ | sanitize/restore | **verbatim non sanitizé — trou A8 ouvert** | **aucun remap** (nom verbatim ; 200 car. légitimes) | aller sanitizé, **retour non restauré** | **pas de remap** ; côté free Chat, non câblé |
+| orphelins tool_result | — | `_drop_orphan_tool_messages` | idem (câblage non testé) | **garde câblée** avant conversion | `_drop_orphan_responses_input` | **garde contournée** : le corps Anthropic converti n'est pas refiltré |
+| documents (PDF/URL/file_id) | natif ⚠️ | `{type:file}` + replis | passthrough | **les 3 formes traitées** (base64, `file_id`, URL ; URL non-PDF → texte) | base64/`file_id` ok, **URL→texte** | `input_file` → 3 formes (TESTÉ) |
+| images (+ tool_result) | natif ⚠️ | data-URI + **placeholders** (pas de drop silencieux) | passthrough | data-URI / URL ; **images dans `tool_result` préservées** | `input_image` | `input_image` ; **part inconvertible = drop muet** |
+| streaming incrémental | **converti (A26)** ⚠️ | `stream_gen` (`opencode.py:10167`) | relais verbatim ligne à ligne | payant **réellement incrémental** ; **jambe free Chat = 0 octet (MESURÉ)** | **séquence conforme, émission bufferisée (A11 partiel)** | **idem — TTFB = durée totale** |
+
+> **Provenance.** `natif` = aucune conversion, le corps et la réponse traversent tels
+> quels. Ce tableau est **la cible** ; l'état constaté et sa provenance
+> (`TESTÉ` / `MESURÉ` / `DÉDUIT` / `NON TESTÉ`) sont en §11.12.
+>
+> ⚠️ **P1** — colonne **falsifiée** par A26 (§11.11) : « natif » ne vaut que pour la
+> **jambe payante**. Dès que le modèle payant a un équivalent free à endpoint
+> `/chat/completions`, corps et réponse sont **convertis** dans les deux sens. La
+> mention « natif » seule était fausse : elle décrivait le chemin nominal sans
+> franchir la bascule free, et la jambe free n'était exercée que sur les chemins à
+> protocole `openai`.
+>
+> ⚠️ **P3 — trou A8 ouvert** : `sanitize_tool_names` n'est appelé **nulle part** dans
+> `opencode.py`. Un nom d'outil > 64 caractères part donc **verbatim** vers un amont
+> Chat sur P3, et le lot L4 ne l'a pas couvert (il ne traite que P2 et les
+> convertisseurs). La cellule « passthrough » était exacte au sens littéral mais
+> **trompeuse** : elle masquait ce trou.
 
 ---
 
@@ -767,3 +789,165 @@ faisaient pas. Détail complet au rapport §3.6 et §3.7.
   `max_tokens` → `max_completion_tokens` → `max_output_tokens`, première forme
   valide gagnante (`max_tokens` est canonique côté Anthropic et historique côté
   Chat). Un client envoyant deux formes divergentes suit `max_tokens`.
+
+### 11.11 A26 — parité de protocole de la jambe free (mesurée, corrigée)
+
+**Anomalie hors inventaire**, trouvée en reprenant la matrice L1 ligne par ligne :
+la colonne P1 du §6 annonçait « natif » et elle est **fausse**.
+
+**Défaut mesuré** (11/09/2026, proxy `:4000`) — sur `/v1/messages`, quand le modèle
+**payant** routé déclare `protocol: anthropic` **et** que son équivalent free
+utilise `/chat/completions` :
+
+- le corps Anthropic partait **verbatim** vers un endpoint Chat — un endpoint Chat
+  ne lit pas le champ `system` top-level (**system prompt perdu**) et n'attend pas
+  `tools[].input_schema` ;
+- la réponse Chat était rendue **verbatim** au client Anthropic, sous **HTTP 200**
+  (`choices` en non-stream, `chat.completion.chunk` en stream) : ni `content`, ni
+  `stop_reason`, ni `usage.input_tokens`.
+
+Cas vivant : route `haiku` → `minimax-m2.5` (`protocol: anthropic`) →
+`mimo-v2.5-free` (endpoint Chat). **Contrôle décisif** : la route `opus` →
+`kimi-k2.6` (`protocol: openai`) atteint **le même** modèle free par le **même**
+endpoint et fonctionnait ; le témoin de prompt système est honoré sur `opus` et
+ignoré sur `haiku`. C'est donc la déclaration de protocole du modèle **payant**, et
+non le modèle free, qui déclenchait le défaut.
+
+**Pourquoi la matrice L1 ne l'avait pas vu** : la jambe free n'était exercée que
+sur des chemins à protocole `openai`, où la recopie verbatim est correcte, et la
+cellule P1 décrivait le chemin « natif » sans franchir la bascule free. Un test vert
+sur un chemin voisin ne couvre pas la cellule — cf. la règle de provenance du §4.
+
+**Correctif** : conversion dans les deux sens, non-stream **et** stream.
+`_try_free_model_first` : `anthropic_to_openai` à l'aller (`opencode.py:6205`),
+`openai_to_anthropic` au retour (`opencode.py:6669`). `anthropic_stream` :
+conversion du corps avant envoi (`opencode.py:9190`) puis nouveau convertisseur de
+flux `app/protocol/chat_sse_to_anthropic.py` pour le relais, avec vidage de fin de
+flux (clôture Anthropic émise même si l'amont Chat se tait sans `[DONE]`).
+
+**Verrous** : `tests/test_free_leg_protocol_parity.py` (5 cas),
+`tests/test_chat_sse_to_anthropic.py` (48 cas),
+`test_e2e_protocol_matrix.py::test_free_model_subpath_p1_stream_converts_chat_to_anthropic`.
+**Mutations** : 4/4 mordent (aller et retour, non-stream et stream), fichier
+restauré à l'identique (sha256 vérifié).
+
+**Défaut dans le verrou lui-même, corrigé** — `_run_free` vidait `oc.FREE_MODEL_MAP`
+**en place** ; or c'est l'objet de `config.settings`, donc la table live était détruite
+pour toute la session de tests et le gate complet rougissait sur
+`test_go_only_routing.py::test_live_models_muse_spark_13_free_map`
+(`KeyError`). Remplacé par `monkeypatch.setattr` (liaison restaurée en sortie).
+Causalité prouvée par mutation inverse. Détail et leçons : rapport §3.10.
+
+**Reste ouvert, déclaré** : le même schéma subsiste sur **P4 stream**
+(`_anthro_to_oai_stream`, `opencode.py:12783`) — le consommateur attend de
+l'Anthropic, l'endpoint free rend du Chat. Le test existant
+`test_free_model_subpath_p4_stream` ne le voit pas : son stub renvoie
+`ANTHRO_SSE_LINES`, une forme que l'endpoint free réel ne produit pas.
+
+### 11.12 L1 — reprise de la matrice de vérité, ligne par ligne
+
+**Méthode.** Chacune des 6 colonnes du §6 a été reprise axe par axe, en confrontant la
+cellule du plan à ce que le code fait réellement, avec un `file:line`. Vocabulaire de
+provenance strict appliqué à chaque affirmation : **TESTÉ** (un test nommé verrouille),
+**MESURÉ** (mesure traçable : golden, log, requête réelle), **DÉDUIT** (lecture de code
+seule), **NON TESTÉ** (rien ne l'établit). Une cellule n'est « couverte » que si un test
+**passe l'axe** : un test qui appelle un convertisseur sans l'axe ne compte pas.
+
+**Résultat.** Le lot L1 tel que livré était **incomplet et, par endroits, faux**. Les
+corrections sont portées au §6 ; leur nature :
+
+| Chemin | Cellules fausses | Cellules imprécises | Nature du constat |
+|---|---|---|---|
+| **P1** | **toute la colonne** (« natif ») | — | Falsifiée par A26 (§11.11) : défaut **mesuré en réel**. Corrigé. |
+| **P2** | axe 8 (`cache_control` tools « perdu (A5) ») ; axe 9 (« 7 sites, 0 test (A6) ») ; axe 16 (`openai_stream`) | axes 1, 2, 5, 7, 10, 15 | A5 et A6 étaient **corrigées** (L3 livré, tests présents) ; le nom du générateur de flux était faux. |
+| **P3** | axe 1 (« 4ᵉ mapping, sans caps ») ; axe 2 (« par famille ») ; axe 3 (« non (A4) ») | axe 12 (trompeuse) | A1 et A4 étaient **déjà corrigées en HEAD** par le lot L2 : les cellules décrivaient le code d'avant L2. |
+| **P5** | 11 cellules (confusion P5-Chat / P5-Responses, `tool_choice` « dict↔str », ordre des blocs « à tester », images, documents-URL…) | — | Colonne établie par analogie avec P2/P6 : les deux sous-chemins P5 ne se comportent pas pareil. |
+| **P4** | **5 cellules fausses** (effort « dict en dur (A1/A2) », budget « 4096/10000/16000 », `redacted_thinking` « cache borné », noms longs « sanitize/restore », documents « PDF-URL seul ») | 5 imprécises (dont **signature locale forgée émise vers l'amont**, `cache_creation` jamais remonté) | Reprise complète. **Défaut mesuré** : jambe free Chat → **0 octet** au client. |
+| **P6** | **2 cellules fausses** (« perdu (A3) » — en fait corrigée et testée ×3 ; « remap » — inexistant) | 8 imprécises (dont ordre des blocs déjà verrouillé par golden, `cache_control` en **perte muette**, garde orphelins **contournée**) | Reprise complète. A11 à moitié corrigée : séquence conforme, émission bufferisée. |
+
+#### 11.12.1 Trous ouverts trouvés par la reprise (déclarés, non corrigés)
+
+1. **A8 ouvert sur P3** — `sanitize_tool_names` n'est appelé **nulle part** dans
+   `opencode.py` : un nom d'outil > 64 caractères part verbatim vers un amont Chat sur
+   P3. Le lot L4 (`58f788e`) ne couvre que P2 et les convertisseurs.
+2. **A8 — retour P5 non restauré** — `openai_chat_to_responses`
+   (`app/protocol/mapping.py:2710`) n'accepte pas de `name_map` et recopie
+   `fn.get("name")` tel quel (`mapping.py:2750`) ; ses 4 sites d'appel
+   (`opencode.py:13763`, `13946`, `14063`, `14176`) ne passent aucune table → le client
+   reçoit le nom **raccourci**.
+3. **P4 stream — même schéma que A26** — `_anthro_to_oai_stream` (`opencode.py:12783`)
+   attend de l'Anthropic d'une jambe free qui rend du Chat ; le test
+   `test_free_model_subpath_p4_stream` ne le détecte pas (son stub est de forme
+   anthropic).
+4. **P2 → `/responses`, chemin entier absent de la matrice** — via `custom_routes`,
+   10 des 11 cibles de `muse-spark-1.3-contributor` partent vers `/responses`
+   (`opencode.py:9826-9827`, retour `10121`).
+5. **Axe « jambe free » absent** — la décision prise côté payant (plafond d'effort,
+   profil de schéma, `max_completion_tokens`) n'est **pas recalculée** après la bascule
+   (`opencode.py:6208-6209`, `10173-10191`).
+6. **Garde `supports_cache_control` absente** — `mapping.py:1363` et `1390` ne la
+   portent pas : un `cache_control` client sur un bloc image/`tool_result` peut fuiter
+   vers un amont `glm-5*`. Non testé.
+7. **A11 partiel** — la séquence SSE de P5/P6 est conforme et verrouillée (49 cas,
+   `tests/test_responses_stream_contract.py`), mais l'émission est **entièrement
+   bufferisée** (`opencode.py:14009-14070` consomme tout l'amont puis renvoie
+   `Response(content=sse_body)`) : le TTFB vaut la durée totale de génération.
+8. **`cache_control` → `prompt_cache_breakpoint` est un no-op** —
+   `_cache_control_to_openai_breakpoint` (`mapping.py:621-640`, docstring « Réservé —
+   NON ÉMIS ») ; `cache_write_tokens` n'existe que dans le plan (§209, §329) : le lot
+   L15 ne l'a pas fait.
+9. **`thinking` top-level jamais recopié par P5** — `openai_responses_to_anthropic`
+   (`mapping.py:2441-2576`) ignore `thinking.budget_tokens`.
+10. **Zéro golden P3** — les 46 goldens sont `p2_/p4_/p5_/p6_`.
+
+#### 11.12.2 Trouvailles propres à P4 et P6
+
+**P4 — le défaut d'A26 en streaming, mesuré.** La colonne P4 du §6 annonçait
+`_anthro_to_oai_stream` sans dire que la **jambe free** rend **0 octet** au client : le
+swap free (`opencode.py:12736-12744`) ne convertit ni l'aller ni le retour quand
+l'endpoint free est un endpoint Chat, alors que P1 le fait désormais
+(`opencode.py:9193-9203`). Le non-stream, lui, est correctement corrigé (le paramètre
+`protocol="anthropic"` est partagé par P1 et P4 via `opencode.py:12566-12573`).
+`test_free_model_subpath_p4_stream` **ne détecte pas** ce défaut : il stubbe
+`ANTHRO_SSE_LINES` (`tests/test_e2e_protocol_matrix.py:909`) — une forme que l'endpoint
+free réel ne produit pas — et n'asserte **aucun contenu** (`:914-921`), contrairement à
+`test_p4_chat_to_anthropic_stream:817`.
+
+**P4 — signature locale forgée émise vers l'amont.** Le `reasoning_content` d'un
+historique multi-tours devient un bloc `thinking` portant une **signature HMAC locale
+forgée**, et `strip_synthetic_thinking` n'est appelé que par `/v1/messages`
+(`opencode.py:8888`, contre `:11433-11437` pour P4) : le bloc forgé part donc vers
+l'amont Anthropic. Le golden `p4_thinking_strip_local_signature.json:38-43` verrouille
+même son **présence**, malgré son nom. Non mesuré (un 400 amont est attendu, non
+constaté).
+
+**P6 — garde orphelins contournée.** `_drop_orphan_responses_input` filtre bien
+`body["input"]` (`opencode.py:13399-13407`), mais `anthro_body` n'est **jamais
+reconstruit** après (la branche est un `pass`) : le `tool_result` orphelin atteint quand
+même l'amont Anthropic. DÉDUIT.
+
+**P6 — A3 est corrigée.** `openai_responses_to_anthropic` délègue à `resolve_effort` et
+écrit `output_config.effort` + `thinking.adaptive` (`mapping.py:2604-2621`,
+`_apply_anthropic_effort` `:470-500`), verrouillé par trois tests
+(`test_effort_mapping.py:298`, `test_effort_policy.py:241`,
+`test_protocol_matrix.py:139`).
+
+**Trou non déclaré, P4 comme P6** : `cache_creation_input_tokens` est jeté côté réponse
+(`mapping.py:2315-2317` pour P4, `:2682-2698` pour P6) et `cache_write_tokens` n'existe
+**nulle part** dans le dépôt — seulement dans le plan.
+
+#### 11.12.3 Limites de cette reprise
+
+Elle est **documentaire et statique** : elle prouve ce que le code fait (lecture +
+tests nommés), pas ce que l'amont réel accepte. Les mesures bout en bout disponibles
+sont : A26 (§11.11), le lot A8, et le **0 octet** de la jambe free de P4 en streaming.
+
+Trois réserves explicites :
+1. **Aucun test n'exerce la jambe free de P6** : les E2E P6 stubent
+   `_try_free_model_first → None` (`tests/test_e2e_protocol_matrix.py:448`) ; le
+   correctif y est partagé mais **non mesuré sur P6**.
+2. Le garde axe 14 de `tests/test_protocol_matrix.py:614` ne vérifie qu'une
+   **sous-chaîne de source** (`assert "responses_stream_events(" in src`) : il **ne passe
+   pas l'axe** de l'incrémentalité.
+3. Le cap d'effort par défaut (`effort_caps.default: high`) n'a pas été exécuté : sa
+   valeur exacte est **DÉDUITE**, non mesurée.
