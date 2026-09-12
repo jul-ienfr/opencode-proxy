@@ -1,0 +1,60 @@
+{
+  "fn": "openai_to_anthropic",
+  "input": {
+    "resp": {
+      "choices": [
+        {
+          "message": {
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [
+              {
+                "id": "call_free_1",
+                "type": "function",
+                "function": {
+                  "name": "mcp__tres_long_segment_tres_long_segment_tres_long_segmen-f76dda",
+                  "arguments": "{\"city\": \"Paris\"}"
+                }
+              }
+            ]
+          },
+          "finish_reason": "tool_calls"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 20,
+        "completion_tokens": 15
+      }
+    },
+    "model": "mimo-v2.5-free",
+    "name_map": {
+      "mcp__tres_long_segment_tres_long_segment_tres_long_segmen-f76dda": "mcp__tres_long_segment_tres_long_segment_tres_long_segment_tres_long_segment_tres_long_segment_tres_long_segment_outil_final"
+    }
+  },
+  "expected": {
+    "id": "<msg_id>",
+    "type": "message",
+    "role": "assistant",
+    "content": [
+      {
+        "type": "tool_use",
+        "id": "call_free_1",
+        "name": "mcp__tres_long_segment_tres_long_segment_tres_long_segment_tres_long_segment_tres_long_segment_tres_long_segment_outil_final",
+        "input": {
+          "city": "Paris"
+        }
+      }
+    ],
+    "model": "mimo-v2.5-free",
+    "stop_reason": "tool_use",
+    "stop_sequence": null,
+    "usage": {
+      "input_tokens": 20,
+      "output_tokens": 15,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0
+    }
+  },
+  "_note": "[A26] jambe free P1 : le retour Chat -> Anthropic restaure le nom d'outil raccourci (64 car.) vers sa forme longue (124 car.)",
+  "_generated_by": "scripts/gen_golden_fixtures.py (plan v10 §11.5)"
+}

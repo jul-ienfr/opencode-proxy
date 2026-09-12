@@ -827,7 +827,9 @@ flux (clôture Anthropic émise même si l'amont Chat se tait sans `[DONE]`).
 
 **Verrous** : `tests/test_free_leg_protocol_parity.py` (5 cas),
 `tests/test_chat_sse_to_anthropic.py` (48 cas),
-`test_e2e_protocol_matrix.py::test_free_model_subpath_p1_stream_converts_chat_to_anthropic`.
+`test_e2e_protocol_matrix.py::test_free_model_subpath_p1_stream_converts_chat_to_anthropic`,
+et le golden `docs/v1-response-golden/p1_free_leg_tool_name_restored.json` (le retour
+restaure le nom raccourci — 64 car. — vers sa forme longue — 124 car.).
 **Mutations** : 4/4 mordent (aller et retour, non-stream et stream), fichier
 restauré à l'identique (sha256 vérifié).
 
@@ -898,7 +900,9 @@ corrections sont portées au §6 ; leur nature :
    L15 ne l'a pas fait.
 9. **`thinking` top-level jamais recopié par P5** — `openai_responses_to_anthropic`
    (`mapping.py:2441-2576`) ignore `thinking.budget_tokens`.
-10. **Zéro golden P3** — les 46 goldens sont `p2_/p4_/p5_/p6_`.
+10. **Zéro golden P3** — les 47 goldens sont `p1_/p2_/p4_/p5_/p6_` ; le seul `p1_`
+    (`p1_free_leg_tool_name_restored.json`) a été ajouté pour A26, et il n'existe
+    **toujours aucun golden P3**.
 
 #### 11.12.2 Trouvailles propres à P4 et P6
 

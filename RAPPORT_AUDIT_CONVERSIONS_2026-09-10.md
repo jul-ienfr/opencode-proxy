@@ -325,6 +325,14 @@ décrivait le chemin « natif » sans jamais franchir la bascule free.
 
 Témoin bout en bout :
 `tests/test_e2e_protocol_matrix.py::test_free_model_subpath_p1_stream_converts_chat_to_anthropic`.
+
+**Golden** : `docs/v1-response-golden/p1_free_leg_tool_name_restored.json` verrouille la
+**restauration du nom d'outil** au retour — la réponse Chat porte la forme raccourcie
+(64 car.), la sortie Anthropic porte la forme longue d'origine (124 car.). Les deux
+dispatchers (`scripts/gen_golden_fixtures.py` et `tests/test_conversion_golden.py`)
+acceptent désormais `name_map` ; la régénération complète n'a modifié **aucun** des 46
+goldens préexistants, ce qui est en soi une vérification de non-régression.
+
 **Mutation** : 4/4 mordent (aller et retour, non-stream et stream), fichier restauré à
 l'identique (sha256 vérifié) — sans quoi le vert ne serait imputable à rien.
 
@@ -512,7 +520,7 @@ de `openai_to_anthropic_request` et `openai_responses_to_anthropic`.
 
 ## 6. Golden fixtures — le verrou du contrat V1
 
-- **11 → 46 fixtures** (`docs/v1-response-golden/`), couvrant les 15 axes ×
+- **11 → 47 fixtures** (`docs/v1-response-golden/`), couvrant les 15 axes ×
   6 chemins.
 - Règle §11.5 : une modification de conversion qui change une sortie **doit**
   faire échouer le gate ; la fixture n'est régénérée qu'après revue du diff.
@@ -615,12 +623,12 @@ Comptage reproductible (`Select-String -Pattern '^\s*def test_'`) :
 | `test_token_estimation.py` | 12 | estimation de tokens (A10) |
 | `test_effort_caps.py` | 10 | plafonds par modèle (A22) |
 | `test_docs_drift.py` | 3 | gate code ↔ doc bidirectionnel |
-| `test_conversion_golden.py` | 2 | verrou du contrat V1 (paramétré sur 46 fixtures) |
+| `test_conversion_golden.py` | 2 | verrou du contrat V1 (paramétré sur 47 fixtures) |
 | `test_e2e_protocol_matrix.py` | 27 | **bout en bout** : handler → corps amont, 6 chemins + sous-chemins free/failover (trouve **A24** et **A25**) + 5 verrous L13 « reasoning_content » + la restauration A8 en streaming — 27 fonctions → **35 cas collectés** |
 | `test_tools_matrix.py` | 13 | matrice outillage 6 chemins : `tools[]`/`tool_choice`/`strict`/nom long/`input_schema` invalide (**L4** ; 7 tests couvrent A8) — 13 fonctions → **30 cas** |
 | **Total** | **302** | 17 fichiers (comptage **mesuré** : `^def test_` / `^async def test_` par fichier) |
 
-> `test_conversion_golden.py` ne compte que 2 fonctions mais **46 cas** via
+> `test_conversion_golden.py` ne compte que 2 fonctions mais **47 cas** via
 > paramétrage : c'est le nombre de cas, non de fonctions, qui fait la force du
 > verrou. Idem `test_e2e_protocol_matrix.py` et `test_tools_matrix.py`, dont les
 > fonctions sont massivement paramétrées (`test_tools_matrix.py` : 13 fonctions →
@@ -869,7 +877,7 @@ une seconde règle.
 | `config/effort_caps.py` | plafonds par modèle (config-driven) |
 | `app/protocol/mapping.py` | conversions, `_set_output_token_limit`, `ResponsesStreamEmitter` |
 | `opencode.py` | handlers, `ensure_min_tokens`, relais `store`/`truncation` |
-| `scripts/gen_golden_fixtures.py` | générateur des 46 goldens |
+| `scripts/gen_golden_fixtures.py` | générateur des 47 goldens |
 | `tests/test_protocol_matrix.py` | matrice 6 chemins × 15 axes |
 | `tests/test_effort_policy.py` | contrat d'effort, décision §7.1 |
 | `tests/test_conversion_golden.py` | verrou du contrat V1 |

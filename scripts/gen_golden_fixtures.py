@@ -176,6 +176,48 @@ def case_resp_tool_calls():
     }
 
 
+def case_p1_free_leg_tool_name_restored():
+    """[A26] Jambe free P1 — le nom d'outil raccourci vers un amont Chat est RESTAURE.
+
+    Le nom porté par la réponse Chat est la forme RACCOURCIE produite à l'aller par
+    ``sanitize_tool_names`` ; ``name_map`` étant fourni au retour, le bloc ``tool_use``
+    doit porter le nom LONG d'origine — celui que le client avait défini. Sans cette
+    restauration, un client Anthropic reçoit un nom d'outil qu'il n'a jamais déclaré.
+    """
+    long_name = "mcp__" + "tres_long_segment_" * 6 + "outil_final"
+    short_tools, name_map = pm.sanitize_tool_names(
+        [{"name": long_name, "description": "d", "input_schema": {"type": "object", "properties": {}}}]
+    )
+    short_name = short_tools[0]["name"]
+    oai = {
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_free_1",
+                            "type": "function",
+                            "function": {"name": short_name, "arguments": '{"city": "Paris"}'},
+                        }
+                    ],
+                },
+                "finish_reason": "tool_calls",
+            }
+        ],
+        "usage": {"prompt_tokens": 20, "completion_tokens": 15},
+    }
+    return {
+        "fn": "openai_to_anthropic",
+        "input": {"resp": oai, "model": "mimo-v2.5-free", "name_map": name_map},
+        "note": (
+            "[A26] jambe free P1 : le retour Chat -> Anthropic restaure le nom d'outil "
+            f"raccourci ({len(short_name)} car.) vers sa forme longue ({len(long_name)} car.)"
+        ),
+    }
+
+
 def case_resp_reasoning():
     """reasoning_content (modèles thinking free/payés) -> bloc thinking."""
     oai = {
@@ -1383,6 +1425,7 @@ CASES = [
     case_p6_request_effort_relay,
     case_p4_request_effort_relay,
     case_openai_to_anthropic_usage_cache_creation,
+    case_p1_free_leg_tool_name_restored,
 ]
 
 
@@ -1391,7 +1434,7 @@ def call_fn(c: dict):
     if name == "anthropic_to_openai":
         return pm.anthropic_to_openai(args["body"], args["model"])
     if name == "openai_to_anthropic":
-        return pm.openai_to_anthropic(args["resp"], args["model"])
+        return pm.openai_to_anthropic(args["resp"], args["model"], args.get("name_map"))
     if name == "openai_to_anthropic_request":
         return pm.openai_to_anthropic_request(args["oai_body"])
     if name == "anthropic_to_openai_response":

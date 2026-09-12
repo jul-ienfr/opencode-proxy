@@ -51,7 +51,7 @@ def _call(fn_name: str, args: dict):
     if fn_name == "anthropic_to_openai":
         return pm.anthropic_to_openai(args["body"], args["model"])
     if fn_name == "openai_to_anthropic":
-        return pm.openai_to_anthropic(args["resp"], args["model"])
+        return pm.openai_to_anthropic(args["resp"], args["model"], args.get("name_map"))
     if fn_name == "openai_to_anthropic_request":
         return pm.openai_to_anthropic_request(args["oai_body"])
     if fn_name == "anthropic_to_openai_response":
