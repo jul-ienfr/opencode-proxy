@@ -901,12 +901,28 @@ def test_free_model_subpath_p2_stream(client, recorder):
 
 
 def test_free_model_subpath_p4_stream(client, recorder):
-    """P4 stream — même swap free attendu ; bloqué par le bug ``anthro_body``
-    (échec sur la jambe free à opencode.py:12576, sans même un log)."""
+    """P4 stream — le client parle Chat, le modèle payant routé déclare
+    ``protocol: anthropic`` (l'amont payant est donc Anthropic) et son équivalent
+    free s'adresse à un endpoint **Chat**.
+
+    Avant le correctif A26/P4, l'aller partait en forme Anthropic vers un endpoint
+    Chat et le flux Chat revenait à un parseur qui attend de l'Anthropic : le
+    client recevait **0 octet**, sous un HTTP 200.
+
+    Ce test stubait auparavant ``ANTHRO_SSE_LINES`` — une forme que l'endpoint free
+    réel ne produit **jamais** — et n'asserait aucun contenu : il verrouillait donc
+    le défaut au lieu de le détecter (même classe qu'A25).
+    """
     target = oc._route_for(FREE_CLIENT_P4)["model"]
+    assert oc.get_model_config(target)["protocol"] == "anthropic", f"{target} doit déclarer le protocole anthropic"
     free_model = oc._resolve_free_model(target)
     assert free_model, f"{target} doit avoir un équivalent free pour ce test"
-    recorder.queue_free(FakeResponse(lines=ANTHRO_SSE_LINES, raw_lines=ANTHRO_SSE_BYTES))
+    assert "/responses" not in _cfg_settings._free_endpoint_for(
+        free_model
+    ), "l'équivalent free doit être un endpoint Chat, sinon ce chemin n'est pas celui du défaut"
+
+    _chat_bytes = [(ln + "\n").encode() for ln in CHAT_CHUNK_LINES]
+    recorder.queue_free(FakeResponse(lines=CHAT_CHUNK_LINES, raw_lines=_chat_bytes))
     body = {"model": FREE_CLIENT_P4, "max_tokens": 256, "stream": True, "messages": [{"role": "user", "content": "hi"}]}
 
     status, ctype, text = _post(client, "/v1/chat/completions", body, stream=True)
@@ -918,7 +934,50 @@ def test_free_model_subpath_p4_stream(client, recorder):
     assert free_call["seam"] == "free"
     assert free_call["use_free"] is True
     assert free_call["body"]["model"] == free_model
+
+    # 1) L'ALLER est de forme CHAT, pas Anthropic : un endpoint Chat ne lit ni
+    #    `system` top-level ni `input_schema` (ici `content` doit rester une chaîne).
+    assert isinstance(free_call["body"]["messages"][0]["content"], str), (
+        "corps envoyé en forme Anthropic (blocs) vers un endpoint Chat"
+    )
+
+    # 2) Le CONTENU arrive — c'est l'assertion qui manquait.
+    assert "hello" in text, f"contenu perdu, flux reçu : {text!r}"
+
+    # 3) Le défaut d'origine, nommément : 0 octet sous un HTTP 200.
+    assert text.strip(), "le client a reçu 0 octet"
+    assert "chat.completion.chunk" in text
     assert "data: [DONE]" in text
+
+
+def test_p4_nonstream_sans_cle_anthropic_est_503_pas_500(client, recorder, monkeypatch):
+    """[A27] Mesuré en réel le 14/09/2026 sur le proxy :4000 — trace ``opencode.py:12647``.
+
+    Toutes les clés Anthropic en pause ⇒ ``_get_auth_headers`` rend ``None`` **sans**
+    lever ``AllKeysPausedError`` ; la jambe free échoue ; le repli payant propage ce
+    ``None`` ; puis ``a_headers.get("x-api-key", "")`` levait
+    ``AttributeError: 'NoneType' object has no attribute 'get'`` ⇒ **HTTP 500**
+    « Erreur interne du serveur », au lieu du 503 propre que rend déjà la branche
+    streaming (opencode.py:12560).
+
+    Aucun test ne couvrait ce cas : le harnais rendait toujours des en-têtes d'auth.
+    """
+    vus = []
+
+    async def _sans_cle(endpoint, body, headers, protocol, retry_on_429=True):
+        vus.append(headers)
+        recorder._record("http", endpoint, body, protocol)
+        return FakeResponse(status_code=503, payload={"error": "no key"}), None
+
+    monkeypatch.setattr(oc, "_get_auth_headers", lambda protocol, entry=None: None, raising=False)
+    monkeypatch.setattr(oc, "_do_request_with_retry", _sans_cle, raising=False)
+
+    body = {"model": FREE_CLIENT_P4, "max_tokens": 256, "messages": [{"role": "user", "content": "hi"}]}
+    status, _ctype, text = _post(client, "/v1/chat/completions", body, stream=False)
+
+    assert vus == [None], f"ce test n'a de sens que si le repli payant reçoit None (reçu {vus!r})"
+    assert status == 503, f"A27 : {status} au lieu de 503 (corps reçu : {text[:200]!r})"
+    assert "All API keys exhausted" in text
 
 
 # Client dont la route mène à un modèle à protocole `anthropic` (haiku →

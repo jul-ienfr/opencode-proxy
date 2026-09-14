@@ -955,3 +955,86 @@ Trois réserves explicites :
    pas l'axe** de l'incrémentalité.
 3. Le cap d'effort par défaut (`effort_caps.default: high`) n'a pas été exécuté : sa
    valeur exacte est **DÉDUITE**, non mesurée.
+
+---
+
+### 11.13 P4 en streaming, A27, et validation en réel (14/09/2026)
+
+Cette section clôt les deux points restés ouverts : le **0 octet** de P4 en streaming,
+et l'absence de mesure sur un proxy vivant.
+
+#### 11.13.1 P4 streaming — 0 octet (mesuré, corrigé)
+
+Deux défauts distincts, tous deux sur `/v1/chat/completions` avec un modèle payant routé
+à `protocol: anthropic` dont l'équivalent free est un endpoint **Chat** (cas vivant :
+route `haiku` → `minimax-m2.5` → `mimo-v2.5-free`) :
+
+1. **Aller** (`opencode.py:12742`) : le corps converti en Anthropic partait vers un
+   endpoint Chat — `system` top-level et `input_schema` jamais lus. Corrigé en renvoyant
+   le **corps client** (déjà de forme Chat, cf. `anthro_body = openai_to_anthropic_request(body)`
+   en `opencode.py:12533`), augmenté de `stream_options.include_usage`.
+2. **Retour** (`opencode.py:13026`) : le flux Chat revenait à un parseur qui n'exploite
+   que des événements Anthropic (`if not line.startswith("data:"): continue`, puis
+   `ev["type"]`). Aucune ligne exploitable ⇒ **0 octet** sous HTTP 200. Corrigé par une
+   conversion `Chat SSE → Anthropic SSE` (`app/protocol/chat_sse_to_anthropic.py`) insérée
+   avant le parseur, avec un état **frais par tentative**.
+
+Le fanion `_free_chat_stream` est déclaré **avant** la bascule free (même classe de piège
+qu'A24, §11.6) et remis à `False` au repli payant.
+
+**Un piège rencontré pendant le correctif** : `chat_sse_to_anthropic_events` rend des
+`str`, pas des `bytes` ; mon `.decode()` levait `AttributeError`, **avalé par le
+`except Exception` du handler** — le symptôme redevenait « 0 octet sous HTTP 200 »,
+indistinguable du défaut d'origine. C'est la démonstration que le `except Exception`
+large est le véritable amplificateur de ces bugs : il transforme une erreur de
+programmation en défaut métier silencieux.
+
+#### 11.13.2 A27 — 500 au lieu de 503 quand toutes les clés Anthropic sont en pause
+
+Mesuré en réel : toutes les clés Anthropic en pause ⇒ `_get_auth_headers("anthropic")`
+rend `None` **sans** lever `AllKeysPausedError` ; la jambe free échoue (429) ; le repli
+payant propage ce `None` ; `opencode.py:12647` faisait alors
+`a_headers.get("x-api-key", "")` ⇒ `AttributeError: 'NoneType' object has no attribute 'get'`
+⇒ **HTTP 500 « Erreur interne du serveur »**, là où la branche streaming rend un 503
+propre (`opencode.py:12560`).
+
+Corrigé par un garde 503 (et un `account_alias` tolérant). **Le même motif existe à
+l'identique dans un second handler** (`grep 'account_alias = _alias_for_key(a_headers.get'`
+⇒ 2 occurrences, une seule corrigée) : ce jumeau reste **non corrigé et non mesuré**.
+
+#### 11.13.3 Validation en réel (proxy `:4000`, avant/après redémarrage)
+
+Le proxy tournait depuis le 11/09 19:48 sur le code **d'avant** les correctifs (commits
+du 12/09 00:59→02:16). Sonde : `/v1/messages` et `/v1/chat/completions`, `model: haiku`,
+plus le témoin `opus`.
+
+| Chemin | Avant redémarrage | Après |
+|---|---|---|
+| P1 non-stream `/v1/messages` | **500** « Erreur interne du serveur » | 200, corps **ANTHROPIC** `content='Bonjour'` |
+| P1 stream `/v1/messages` | 200, **16 007 o de Chat non converti** (`chat.completion.chunk`, 0 `message_start`) | 200, **ANTHROPIC** (`message_start` + `content_block_delta`, aucun `chat.chunk`) |
+| P4 non-stream `/v1/chat/completions` | **500** (A27) | 200, `choices[0].message.content='bonjour'` |
+| P4 stream `/v1/chat/completions` | 200, **0 octet** | 200, **7 559 o de Chat**, texte reçu |
+| Témoin `opus` (protocole `openai`) | 200 ANTHROPIC `'Bonjour'` | 200 ANTHROPIC `'Bonjour'` |
+
+Le témoin `opus` atteint **le même** modèle free et **le même** endpoint et n'a jamais été
+cassé : c'est la déclaration de protocole du modèle **payant** qui déclenchait les trois
+défauts, pas la jambe free elle-même.
+
+Sur P4, la sortie `chat.completion.chunk` est **le format correct** (le client a appelé
+`/v1/chat/completions`) ; sur P1, le même format était le symptôme du défaut (le client
+avait appelé `/v1/messages`).
+
+**Réserves** : cette validation est ponctuelle (une requête par chemin, un seul
+fournisseur free, stations en 429 intermittents). Elle ne remplace pas les tests
+hermétiques, elle les confirme.
+
+#### 11.13.4 Preuves de non-régression
+
+* `tests/test_e2e_protocol_matrix.py::test_free_model_subpath_p4_stream` : le test
+  existant stubait `ANTHRO_SSE_LINES` — une forme que l'endpoint free **ne produit
+  jamais** — et n'assertait aucun contenu : il **verrouillait** le défaut (classe A25,
+  §11.7). Réécrit avec `CHAT_CHUNK_LINES`, assertions de contenu et assertion d'aller Chat.
+* Mutations : 2/2 mordent sur P4 (aller, retour), 1/1 sur A27 (retour au code d'origine) ;
+  fichiers restaurés à l'identique (sha256).
+* 294 tests des chemins voisins verts ; régénération golden : aucun des 47 goldens
+  préexistants modifié.

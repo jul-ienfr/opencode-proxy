@@ -12644,7 +12644,30 @@ async def chat_completions(request: Request):
             return _free_refusal_response(e, "anthropic")
         except UpstreamError as e:
             return JSONResponse(status_code=e.status_code, content={"error": str(e)})
-        account_alias = _alias_for_key(a_headers.get("x-api-key", ""))
+        # [A27] `a_headers` peut valoir None : `_get_auth_headers` rend None quand
+        # TOUTES les cles Anthropic sont en pause (sans lever AllKeysPausedError),
+        # et `_do_request_with_retry` propage ce None. La lecture ci-dessous faisait
+        # alors un 500 (`AttributeError: 'NoneType' object has no attribute 'get'`,
+        # mesure en reel le 14/09 sur /v1/chat/completions non-stream), la ou la
+        # branche streaming rend un 503 propre (L12560) et ou la branche
+        # AllKeysPausedError en rend un aussi (L12613). On s'aligne : un 503
+        # exploitable, jamais un 500.
+        if a_headers is None and resp.status_code != 200:
+            _debug("  [free] aucune cle Anthropic disponible (toutes en pause) et jambe free epuisee -> 503")
+            return Response(
+                content=_json_dumps_str(
+                    {
+                        "error": {
+                            "message": "All API keys exhausted (paused) and no free model available.",
+                            "type": "api_error",
+                        }
+                    }
+                ),
+                status_code=503,
+                media_type="application/json",
+                headers={"Retry-After": "30"},
+            )
+        account_alias = _alias_for_key(a_headers.get("x-api-key", "")) if a_headers else "?"
         if resp.status_code != 200:
             await _log_and_save_error(
                 req_id,
@@ -12732,6 +12755,10 @@ async def chat_completions(request: Request):
         # le ``except Exception`` du handler → le client recevait un
         # ``text/event-stream`` de 0 octet, sans erreur ni log exploitable.
         nonlocal endpoint, model_id, anthro_body
+        # [A26/P4] Déclaré AVANT la bascule free : sinon Python en ferait une
+        # variable locale non initialisée quand le modèle n'a pas d'équivalent
+        # free — exactement la classe du bug A24 documenté juste au-dessus.
+        _free_chat_stream = False
         # Try free model for streaming: swap endpoint/model before starting stream
         free_model = _resolve_free_model(model_id)
         if free_model:
@@ -12739,9 +12766,22 @@ async def chat_completions(request: Request):
             paid_endpoint = endpoint
             paid_anthro_body = dict(anthro_body)
             paid_anthro_body["model"] = model_id
-            anthro_body = dict(anthro_body)
-            anthro_body["model"] = free_model
-            endpoint = _cfg_settings._free_endpoint_for(free_model)
+            _free_ep = _cfg_settings._free_endpoint_for(free_model)
+            if "/responses" not in _free_ep:
+                # [A26/P4] L'endpoint free parle CHAT alors que cet handler a
+                # converti le corps client en Anthropic : envoyer `anthro_body`
+                # verbatim perdait le system prompt et le `input_schema`, et le
+                # flux Chat revenait ensuite à un parseur qui attend de
+                # l'Anthropic — le client recevait 0 octet. On renvoie donc le
+                # corps CLIENT (qui est déjà de forme Chat, cf. L12533).
+                anthro_body = dict(body)
+                anthro_body["model"] = free_model
+                anthro_body["stream_options"] = {"include_usage": True}
+                _free_chat_stream = True
+            else:
+                anthro_body = dict(anthro_body)
+                anthro_body["model"] = free_model
+            endpoint = _free_ep
             _using_free = True
             _track_model = free_model
         else:
@@ -12782,6 +12822,10 @@ async def chat_completions(request: Request):
             _free_bound += max(0, effective_free_max_attempts(_free_forced_pool) - 1)
         for _attempt in range(_free_bound):
             _line_buf = ""  # fresh per attempt — avoids stale truncated data: re-parse
+            # [A26/P4] Etat de conversion Chat -> Anthropic, frais par tentative
+            # (un etat partage entre tentatives rouvrirait des blocs deja clos).
+            _conv_state = None
+            _conv_buf = ""
             try:
                 # Axe A: geo-restricted paid streaming → route through tunnel station
                 _stream_ctx = (
@@ -12897,6 +12941,9 @@ async def chat_completions(request: Request):
                             endpoint = paid_endpoint
                             _using_free = False
                             _track_model = model_id
+                            # [A26/P4] Le repli payant reprend un corps Anthropic :
+                            # ne plus convertir le flux entrant.
+                            _free_chat_stream = False
                             _free_fallback_bookkeep(
                                 req_id, free_model, resp.status_code, _track_model, "anthro-to-oai-stream"
                             )
@@ -13008,7 +13055,23 @@ async def chat_completions(request: Request):
                         return
 
                     async for raw in resp.aiter_bytes():
-                        _line_buf += raw.decode("utf-8", errors="replace")
+                        if _free_chat_stream:
+                            # [A26/P4] L'amont free rend du CHAT : convertir en
+                            # Anthropic AVANT le parseur ci-dessous, qui n'exploite
+                            # que des evenements Anthropic (cf. `data:` a L13040).
+                            # Sans cette etape, aucune ligne exploitable : le client
+                            # recevait un text/event-stream de 0 octet.
+                            if _conv_state is None:
+                                _conv_state = ChatSseToAnthropicState(model=original_model, tool_name_map={})
+                            _conv_buf += raw.decode("utf-8", errors="replace")
+                            while "\n" in _conv_buf:
+                                _conv_line, _conv_buf = _conv_buf.split("\n", 1)
+                                # `chat_sse_to_anthropic_events` rend des STR (SSE
+                                # deja formate), pas des octets.
+                                for _ev_str in chat_sse_to_anthropic_events(_conv_line, state=_conv_state):
+                                    _line_buf += _ev_str
+                        else:
+                            _line_buf += raw.decode("utf-8", errors="replace")
                         if len(_line_buf) > 1_000_000:
                             # Truncate on newline boundary to avoid splitting JSON
                             _keep = 1000

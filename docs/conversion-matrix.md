@@ -294,13 +294,43 @@ mutable — cf. le bug documenté en `app/protocol/mapping.py:3720-3726`). Il re
 aligne tous. Le chemin client Chat (P3) est inchangé — un témoin de non-régression le
 verrouille.
 
-**Écart déclaré, non corrigé** : le même schéma subsiste sur **P4 stream**
-(`_anthro_to_oai_stream`, `opencode.py:12783`), où le consommateur attend de
-l'Anthropic alors que l'endpoint free est Chat. Le test
-`test_free_model_subpath_p4_stream` ne le détecte pas : son stub renvoie une forme
-Anthropic (`ANTHRO_SSE_LINES`) que l'endpoint free réel ne produit pas.
+**P4 stream — corrigé le 14/09/2026.** Le défaut était double, et le second volet
+n'était pas visible dans le code seul : l'aller envoyait le corps Anthropic à un endpoint
+Chat (`opencode.py:12742`), et le flux Chat revenait à un parseur qui n'exploite que des
+événements Anthropic (`opencode.py:13026` — `if not line.startswith("data:"): continue`,
+puis `ev["type"]`) : le client recevait **0 octet sous HTTP 200**. Corrigé en renvoyant le
+**corps client** (déjà de forme Chat, `opencode.py:12533`) et en insérant la conversion
+`Chat SSE → Anthropic SSE` avant le parseur, avec un état **frais par tentative**.
+
+**Le test complice (classe A25)** : `test_free_model_subpath_p4_stream` stubait
+`ANTHRO_SSE_LINES` — une forme que l'endpoint free **ne produit jamais** — et n'assertait
+aucun contenu : il ne pouvait que passer. Réécrit avec `CHAT_CHUNK_LINES` et des assertions
+de contenu, il a échoué immédiatement (`''`), en reproduisant exactement le défaut qu'il
+aurait dû détecter.
+
+**A27 — 500 au lieu de 503 (mesuré le 14/09/2026)** : toutes les clés Anthropic en pause ⇒
+`_get_auth_headers("anthropic")` rend `None` **sans** lever `AllKeysPausedError` ; la jambe
+free échoue (429) ; le repli payant propage ce `None` ; `opencode.py:12647` faisait
+`None.get(...)` ⇒ **HTTP 500** sur P4 non-stream, là où la branche streaming rend un 503
+propre (`opencode.py:12560`). Corrigé par un garde 503. Le motif jumeau dans le second
+handler **reste non corrigé**.
+
+**Validation en réel (proxy `:4000`, 14/09/2026)** — même sonde avant/après redémarrage :
+
+| Chemin (`model: haiku`) | Avant | Après |
+|---|---|---|
+| P1 non-stream `/v1/messages` | 500 | 200 Anthropic, `content='Bonjour'` |
+| P1 stream `/v1/messages` | 200, 16 007 o de Chat non converti | 200 Anthropic (`message_start` + `content_block_delta`) |
+| P4 non-stream `/v1/chat/completions` | 500 (A27) | 200, `choices[0].message.content='bonjour'` |
+| P4 stream `/v1/chat/completions` | 200, **0 octet** | 200, 7 559 o de Chat, texte reçu |
+| Témoin `opus` (`protocol: openai`) | 200 Anthropic | 200 Anthropic |
+
+Sur P4, la sortie `chat.completion.chunk` est le format **correct** (le client a appelé
+`/v1/chat/completions`) ; sur P1, ce même format était le symptôme du défaut.
 
 **Verrous** : `tests/test_free_leg_protocol_parity.py` (5 cas, non-stream),
 `tests/test_chat_sse_to_anthropic.py` (48 cas, convertisseur),
 `tests/test_e2e_protocol_matrix.py::test_free_model_subpath_p1_stream_converts_chat_to_anthropic`
-(bout en bout stream). Mutations : 4/4 mordent (2 non-stream, 2 stream).
+et `::test_free_model_subpath_p4_stream` (bout en bout stream, P1 et P4),
+`::test_p4_nonstream_sans_cle_anthropic_est_503_pas_500` (A27). Mutations : **7/7 mordent**
+(2 non-stream, 2 stream P1, 2 P4, 1 A27), fichiers restaurés à l'identique (sha256).

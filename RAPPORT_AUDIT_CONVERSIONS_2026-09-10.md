@@ -884,3 +884,74 @@ une seconde règle.
 | `tests/test_docs_drift.py` | gate code ↔ doc bidirectionnel |
 | `docs/conversion-matrix.md` | matrice documentaire (règle d'effort incluse) |
 | `docs/_drift_manifest.json` | source machine-lisible du gate doc |
+
+---
+
+### 3.11 P4 en streaming, A27 et validation en réel (14/09/2026)
+
+Suite directe de §3.8 et §3.9 : les deux points restés ouverts — le **0 octet** de la
+jambe free de P4 en streaming, et l'absence de mesure sur un proxy vivant — sont traités.
+Détail technique complet au plan §11.13 ; ici, les résultats et ce qu'ils enseignent.
+
+#### Ce qui a été corrigé
+
+1. **P4 streaming, 0 octet** — deux défauts, sur `/v1/chat/completions` avec un modèle
+   payant à `protocol: anthropic` dont l'équivalent free parle Chat :
+   * l'**aller** envoyait le corps Anthropic à un endpoint Chat (`system` et
+     `input_schema` perdus) ;
+   * le **retour** livrait du Chat à un parseur qui n'exploite que de l'Anthropic
+     (`opencode.py:13026`) ⇒ aucune ligne exploitable, **200 + 0 octet**.
+   Corrigé : corps client à l'aller, conversion `Chat SSE → Anthropic SSE` au retour,
+   état frais par tentative.
+2. **A27, nouveau défaut mesuré** — toutes les clés Anthropic en pause ⇒
+   `_get_auth_headers` rend `None` **sans** lever ; la jambe free échoue ; le repli
+   payant propage ce `None` ; `opencode.py:12647` faisait `None.get(...)` ⇒ **500**, là
+   où le streaming rend un 503 propre. Corrigé par un garde 503. **Le motif jumeau dans
+   le second handler n'est pas corrigé** (déclaré, plan §11.13.2).
+
+#### Le test qui verrouillait le défaut
+
+`test_free_model_subpath_p4_stream` stubait `ANTHRO_SSE_LINES` : une forme que l'endpoint
+free **ne produit jamais**, et il n'assertait aucun contenu — il ne pouvait donc que
+passer. Réécrit avec la forme réelle (`CHAT_CHUNK_LINES`) et des assertions de contenu, il
+a immédiatement échoué en rendant `''`. C'est **la deuxième occurrence** de la classe A25
+(§3.7) dans ce lot : mes propres tests ont verrouillé deux fois le bug qu'ils étaient
+censés détecter. Le schéma est net — un stub qui reproduit fidèlement les hypothèses du
+code buggé est un test complice, et seule une assertion de **contenu** le démasque.
+
+#### Une erreur de ma part, du même genre que le défaut
+
+En écrivant le correctif, j'ai appelé `.decode()` sur la sortie du convertisseur, qui rend
+des `str`. L'`AttributeError` a été **avalée par le `except Exception` du handler** : le
+symptôme redevenait exactement « 200 + 0 octet », indistinguable du défaut d'origine. Je
+l'ai trouvé en isolant le convertisseur hors du serveur, pas en lisant le code. Leçon :
+dans ce proxy, un défaut silencieux n'est pas seulement possible, c'est le comportement
+par défaut de toute erreur de programmation dans un handler.
+
+#### Validation en réel (proxy `:4000`)
+
+Le proxy a été redémarré (il tournait depuis le 11/09 19:48 sur le code d'avant les
+correctifs), et la même sonde rejouée avant/après :
+
+| Chemin (`model: haiku`) | Avant | Après |
+|---|---|---|
+| P1 non-stream `/v1/messages` | **500** | 200 **ANTHROPIC** `content='Bonjour'` |
+| P1 stream `/v1/messages` | 200, **16 007 o de Chat** non converti | 200 **ANTHROPIC** (`message_start` + `content_block_delta`) |
+| P4 non-stream `/v1/chat/completions` | **500** (A27) | 200 `choices[0].message.content='bonjour'` |
+| P4 stream `/v1/chat/completions` | 200, **0 octet** | 200, **7 559 o** de Chat, texte reçu |
+| Témoin `opus` (`protocol: openai`) | 200 ANTHROPIC | 200 ANTHROPIC |
+
+Le témoin est le point décisif : `opus` atteint **le même** modèle free et **le même**
+endpoint, et n'a jamais été cassé. Les trois défauts venaient donc de la **déclaration de
+protocole du modèle payant**, pas de la jambe free.
+
+#### Ce qui n'est pas prouvé
+
+* Une requête par chemin, un seul fournisseur free, des stations en 429 intermittents :
+  c'est une confirmation, pas une couverture.
+* Le jumeau d'A27 (second handler) : non corrigé, non mesuré.
+* Les 13 trous ouverts du §3.9 restent ouverts : A8 sur P3 et P5, la signature HMAC
+  forgée de P4, le garde orphelin de P6, P2 → `/responses`, l'axe « jambe free » absent
+  de la matrice, `supports_cache_control`, A11 partiel (P5/P6 entièrement bufferisés),
+  `cache_control` → `prompt_cache_breakpoint` no-op, `thinking` top-level jamais copié par
+  P5, zéro golden P3, aucun test de la jambe free de P6.
