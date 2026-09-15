@@ -17,6 +17,10 @@ ignore = ["E501", "B007", "B905", "B011", "C401", "E741", "B023", "UP031"]
 # Fixtures pytest ré-exportées d'un autre module de test puis utilisées comme
 # paramètres (pattern test_free_vpn_required.py) : le shadowing est volontaire.
 "tests/test_no_valid_keys_guard.py" = ["F811"]
+# Idem : `tests/test_p3_tool_names.py` ré-exporte `client`/`recorder` du harnais
+# `tests/test_e2e_protocol_matrix.py` (import, jamais copie) pour les utiliser
+# comme paramètres de test.
+"tests/test_p3_tool_names.py" = ["F811", "F401"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["app", "config", "dashboard", "free_discovery", "vpn", "vpn_manager", "free_ip_pool", "shared_rotation", "shared_state", "traffic_capture", "docker_events", "protocol_mapping", "server", "observability", "upstream", "core", "free", "streaming", "ops"]

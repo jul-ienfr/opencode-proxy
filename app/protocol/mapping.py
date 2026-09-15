@@ -1360,7 +1360,7 @@ def anthropic_to_openai(body: dict, model: str, raw: bytes | None = None) -> dic
                     out["reasoning_content"] = joined_thinking
                 elif thinking and is_asst:
                     out["reasoning_content"] = " "
-                if last_cache_control and not is_asst:
+                if last_cache_control and not is_asst and supports_cache_control:
                     out["cache_control"] = last_cache_control
                 messages.append(out)
             elif content_list or thinking_parts or (thinking and is_asst):
@@ -1387,7 +1387,7 @@ def anthropic_to_openai(body: dict, model: str, raw: bytes | None = None) -> dic
                 out["reasoning_content"] = joined_thinking
             elif thinking and is_asst:
                 out["reasoning_content"] = " "
-            if last_cache_control and not is_asst:
+            if last_cache_control and not is_asst and supports_cache_control:
                 out["cache_control"] = last_cache_control
             messages.append(out)
         elif text_parts or thinking_parts or (thinking and is_asst):
@@ -1452,10 +1452,14 @@ def anthropic_to_openai(body: dict, model: str, raw: bytes | None = None) -> dic
             est le seul vrai défaut ici (§9.3 : l'amont OpenAI ignore ce champ,
             il n'est donc pas nuisible de le transporter).
 
-            [Lot L11 — B3] On émet AUSSI l'équivalent OpenAI réel
-            (``prompt_cache_breakpoint``), sans retirer ``cache_control`` : les
-            deux publics (upstream OpenAI strict / Anthropic-compatible) sont
-            servis par le même corps.
+            [Lot L11 — B3] Il n'y a PAS d'équivalent OpenAI émis ici, et c'est une
+            décision, pas un oubli : ``_cache_control_to_openai_breakpoint`` est un
+            no-op assumé (voir sa docstring). B3 place ``prompt_cache_breakpoint``
+            sur les **content parts**, jamais sur une définition d'outil — or c'est
+            une définition d'outil qu'on traite ici. Inventer le champ à ce niveau
+            risquerait un 400 chez un amont strict pour un gain nul. Seul
+            ``cache_control`` est donc transporté, ce qui suffit aux amonts
+            Anthropic-compatibles ; la traduction par part est rattachée à L15.
             """
             cc = src.get("cache_control") if isinstance(src, dict) else None
             if cc:
@@ -2623,7 +2627,7 @@ def openai_responses_to_anthropic(body: dict) -> dict:
     return result
 
 
-def anthropic_to_openai_responses(anthro: dict, model: str) -> dict:
+def anthropic_to_openai_responses(anthro: dict, model: str, name_map: dict | None = None) -> dict:
     """Convert Anthropic Messages response → OpenAI Responses API format."""
     content_blocks = anthro.get("content", [])
     output_items: list[dict[str, Any]] = []
@@ -2661,7 +2665,13 @@ def anthropic_to_openai_responses(anthro: dict, model: str) -> dict:
                 {
                     "type": "function_call",
                     "call_id": block.get("id", f"call_{uuid.uuid4().hex[:12]}"),
-                    "name": block.get("name", ""),
+                    # [TROU 3 — A8] Symétrie avec ``_responses_to_anthropic_response``
+                    # / ``_responses_to_chat_response`` : le nom RÉELLEMENT émis au
+                    # client est le nom d'origine (la map est construite à l'aller
+                    # par ``sanitize_tool_names``). Sans ce restore, un nom
+                    # raccourci pour l'amont ressortirait raccourci et le client ne
+                    # pourrait plus faire correspondre ses propres outils.
+                    "name": restore_tool_name(block.get("name", ""), name_map),
                     "arguments": _json_dumps_str(block.get("input", {}), ensure_ascii=False),
                     "status": "completed",
                 }
@@ -2707,10 +2717,17 @@ def anthropic_to_openai_responses(anthro: dict, model: str) -> dict:
     }
 
 
-def openai_chat_to_responses(chat_resp: dict, model: str) -> dict:
+def openai_chat_to_responses(chat_resp: dict, model: str, name_map: dict | None = None) -> dict:
     """Convert OpenAI Chat Completions response directly to OpenAI Responses API format.
 
     Bypasses the intermediate Anthropic format to avoid data loss and unnecessary conversion.
+
+    [TROU 3 — A8] ``name_map`` (``{short: original}`` construit à l'aller par
+    ``sanitize_tool_names``, transporté sous ``_TOOL_NAME_MAP_KEY``) restaure le
+    nom d'origine des outils RÉELLEMENT émis : sans lui, un nom raccourci pour la
+    borne 64 de l'amont ressortait raccourci au client, qui ne pouvait plus faire
+    correspondre ses propres outils (asymétrie avec ``_responses_to_chat_response``
+    / ``_responses_to_anthropic_response``, qui avaient déjà le paramètre).
     """
     choice = chat_resp.get("choices", [{}])[0]
     msg = choice.get("message", {})
@@ -2747,7 +2764,9 @@ def openai_chat_to_responses(chat_resp: dict, model: str) -> dict:
             {
                 "type": "function_call",
                 "call_id": tc.get("id", f"call_{uuid.uuid4().hex[:12]}"),
-                "name": fn.get("name", ""),
+                # [TROU 3 — A8] Restore-retour : le client reçoit le nom qu'il a
+                # envoyé, jamais le raccourci interne de la borne 64.
+                "name": restore_tool_name(fn.get("name", ""), name_map),
                 "arguments": fn.get("arguments", "{}"),
                 "status": "completed",
             }
@@ -3097,6 +3116,79 @@ def _remap_chat_tool_choice(tc, name_map: dict | None):
     if short is None or short == name:
         return tc
     return dict(tc, function=dict(fn, name=short))
+
+
+def sanitize_chat_tool_names(body: dict) -> dict:
+    """[TROU 2 — A8] Point d'entrée unique « sanitize-aller » d'un corps **Chat**.
+
+    Une seule source de vérité pour les trois sites qui portent un nom d'outil
+    dans un corps Chat : ``tools[].function.name`` (≤64), l'historique
+    (``messages[].tool_calls[].function.name``) et ``tool_choice.function.name``.
+    Sans les deux derniers, l'amont Chat répond 400 ``unknown tool`` dès le
+    tour N+1 : un tool_choice ou un historique qui nomme l'outil original (>64)
+    ne correspond plus à ``tools[]`` raccourci.
+
+    Mute `body` (comme ``_remap_chat_history_names``) et y dépose la map
+    ``{short: original}`` sous ``_TOOL_NAME_MAP_KEY`` pour le restore-retour.
+    Le wire ne la voit jamais : ``_serialize_json_body`` la strippe, et les
+    callers la poppent en local. Idempotent ; fast-path sans copie quand rien
+    n'est à raccourcir.
+    """
+    if not isinstance(body, dict):
+        return body
+    name_map: dict = {}
+    tools = body.get("tools")
+    if isinstance(tools, list):
+        body["tools"] = _sanitize_chat_tools(tools, name_map)
+    messages = body.get("messages")
+    if isinstance(messages, list):
+        _remap_chat_history_names(messages, name_map)
+    if "tool_choice" in body:
+        body["tool_choice"] = _remap_chat_tool_choice(body.get("tool_choice"), name_map)
+    if name_map:
+        body[_TOOL_NAME_MAP_KEY] = name_map
+    return body
+
+
+def restore_chat_response_tool_names(data: dict, name_map: dict | None) -> dict:
+    """[TROU 2 — A8] Restore-retour Chat : ``choices[].message.tool_calls`` (et
+    la forme ``delta`` du stream) reprennent le nom **original** du client.
+
+    Copie des seuls nœuds modifiés — jamais de mutation du caller. No-op si
+    ``name_map`` est vide. Utilisé par le passthrough P3 (client Chat → amont
+    Chat) en non-stream et en stream.
+    """
+    if not name_map or not isinstance(data, dict):
+        return data
+    choices = data.get("choices")
+    if not isinstance(choices, list):
+        return data
+    for ch in choices:
+        if not isinstance(ch, dict):
+            continue
+        for slot in ("message", "delta"):
+            holder = ch.get(slot)
+            if not isinstance(holder, dict):
+                continue
+            calls = holder.get("tool_calls")
+            if not isinstance(calls, list) or not calls:
+                continue
+            new_calls = None
+            for j, tc in enumerate(calls):
+                if not isinstance(tc, dict):
+                    continue
+                fn = tc.get("function")
+                if not isinstance(fn, dict):
+                    continue
+                short = fn.get("name")
+                if not isinstance(short, str) or short not in name_map:
+                    continue
+                if new_calls is None:
+                    new_calls = list(calls)
+                new_calls[j] = dict(tc, function=dict(fn, name=name_map[short]))
+            if new_calls is not None:
+                ch[slot] = dict(holder, tool_calls=new_calls)
+    return data
 
 
 def _normalize_responses_input_items(inp: list) -> list:

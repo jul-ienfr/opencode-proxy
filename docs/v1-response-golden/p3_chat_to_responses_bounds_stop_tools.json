@@ -1,0 +1,170 @@
+{
+  "fn": "_chat_to_responses_request",
+  "input": {
+    "chat": {
+      "model": "muse-spark-1.3-contributor-free",
+      "stream": true,
+      "stream_options": {
+        "include_usage": true
+      },
+      "max_tokens": 512,
+      "max_completion_tokens": 300,
+      "stop": [
+        "END",
+        "STOP"
+      ],
+      "temperature": 0.3,
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "get_weather",
+            "description": "d",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "city"
+              ]
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "mcp__tres_long_segment_tres_long_segment_tres_long_segment_tres_long_segment_tres_long_segment_tres_long_segment_outil_final",
+            "description": "d",
+            "parameters": {
+              "type": "object",
+              "properties": {}
+            }
+          }
+        }
+      ],
+      "tool_choice": "auto",
+      "messages": [
+        {
+          "role": "system",
+          "content": "Be brief."
+        },
+        {
+          "role": "user",
+          "content": "Meteo a Paris ?"
+        },
+        {
+          "role": "assistant",
+          "content": null,
+          "tool_calls": [
+            {
+              "id": "call_p3_1",
+              "type": "function",
+              "function": {
+                "name": "mcp__tres_long_segment_tres_long_segment_tres_long_segment_tres_long_segment_tres_long_segment_tres_long_segment_outil_final",
+                "arguments": "{\"city\":\"Paris\"}"
+              }
+            }
+          ]
+        },
+        {
+          "role": "tool",
+          "tool_call_id": "call_p3_1",
+          "content": "{\"temp\":21}"
+        },
+        {
+          "role": "tool",
+          "tool_call_id": "call_orphan_9",
+          "content": "orphelin"
+        },
+        {
+          "role": "user",
+          "content": "Et demain ?"
+        }
+      ]
+    }
+  },
+  "expected": {
+    "model": "muse-spark-1.3-contributor-free",
+    "input": [
+      {
+        "role": "system",
+        "content": [
+          {
+            "type": "input_text",
+            "text": "Be brief."
+          }
+        ]
+      },
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "input_text",
+            "text": "Meteo a Paris ?"
+          }
+        ]
+      },
+      {
+        "type": "function_call",
+        "call_id": "call_p3_1",
+        "name": "mcp__tres_long_segment_tres_long_segment_tres_long_segmen-f76dda",
+        "arguments": "{\"city\":\"Paris\"}"
+      },
+      {
+        "type": "function_call_output",
+        "call_id": "call_p3_1",
+        "output": "{\"temp\":21}"
+      },
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "input_text",
+            "text": "Et demain ?"
+          }
+        ]
+      }
+    ],
+    "stream": true,
+    "max_output_tokens": 512,
+    "temperature": 0.3,
+    "tools": [
+      {
+        "type": "function",
+        "name": "get_weather",
+        "description": "d",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "city": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "city"
+          ],
+          "additionalProperties": false
+        }
+      },
+      {
+        "type": "function",
+        "name": "mcp__tres_long_segment_tres_long_segment_tres_long_segmen-f76dda",
+        "description": "d",
+        "parameters": {
+          "type": "object",
+          "properties": {},
+          "additionalProperties": false
+        }
+      }
+    ],
+    "_tool_name_map": {
+      "mcp__tres_long_segment_tres_long_segment_tres_long_segmen-f76dda": "mcp__tres_long_segment_tres_long_segment_tres_long_segment_tres_long_segment_tres_long_segment_tres_long_segment_outil_final"
+    },
+    "tool_choice": "auto"
+  },
+  "_note": "[TROU 12] conversion du corps P3 quand l'amont est /responses : max_tokens 512 → max_output_tokens 512 (borne PRÉSERVÉE, prioritaire sur max_completion_tokens 300 — lot L14/A17) ; stop/stop_sequences et stream_options ABSENTS du corps amont (perdus — aucune forme Responses) ; tools[].function.parameters → parameters (+additionalProperties:false) ; nom d'outil 124 car. → 64 car. + _tool_name_map (restauration) ; function_call.name de l'historique renommé court ; tool orphelin droppé",
+  "_generated_by": "scripts/gen_golden_fixtures.py (plan v10 §11.5)"
+}

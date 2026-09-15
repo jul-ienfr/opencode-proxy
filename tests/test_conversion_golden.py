@@ -104,3 +104,73 @@ def test_golden_contract(path: Path):
         "est VOLONTAIRE (fix 14.x), régénérer via scripts/gen_golden_fixtures.py "
         "et relire le diff avant commit."
     )
+
+
+# ── [TROU 12] P3 : corps Chat client → amont /responses ──────────────────────
+# Le relais Chat → Chat (passthrough) n'appelle aucune conversion de
+# `app.protocol.mapping` ; la SEULE conversion réelle du corps P3 est
+# `_chat_to_responses_request`, appliquée quand l'endpoint amont est /responses
+# (jambe payée `paid_body = ...` et jambe free muse-spark dans `opencode.py`).
+_P3_FIXTURE = GOLDEN_DIR / "p3_chat_to_responses_bounds_stop_tools.json"
+
+
+def test_p3_golden_present():
+    """TROU 12 : le chemin P3 (client Chat) doit rester verrouillé par un golden."""
+    p3 = [p for p in FIXTURES if p.stem.startswith("p3_")]
+    assert p3, (
+        "TROU 12 : aucun golden P3 — le corps d'un client /v1/chat/completions "
+        "(max_tokens, stop, tools, multi-tours, stream_options) n'est pas figé."
+    )
+
+
+def test_p3_tool_names_and_token_bounds():
+    """TROU 12 : axes « noms d'outils » (A8) et « bornes de tokens » (A17) sur P3.
+
+    Rejoue la conversion RÉELLE (même dispatch que `test_golden_contract`, donc
+    identique à `call_fn` du générateur) et vérifie les deux axes où des défauts
+    réels ont été trouvés dans l'audit :
+      - nom d'outil ≤ 64 car. vers l'amont ET restaurable à l'identique au retour ;
+      - borne de tokens du client PRÉSERVÉE vers l'amont (jamais perdue, pas de
+        coût non borné).
+    """
+    case = json.loads(_P3_FIXTURE.read_text(encoding="utf-8"))
+    out = _call(case["fn"], case["input"])
+    chat = case["input"]["chat"]
+
+    # axe bornes de tokens : max_tokens du client → max_output_tokens amont, et
+    # la forme moderne présente dans le corps (max_completion_tokens) ne l'écrase
+    # pas (priorité documentée lot L14/A17) — aucune borne perdue = pas de coût
+    # non borné.
+    assert out["max_output_tokens"] == chat["max_tokens"] == 512, out.get("max_output_tokens")
+    assert out["max_output_tokens"] != chat["max_completion_tokens"]
+
+    # axe noms d'outils : le cas porte bien un nom au-delà de la limite Chat
+    longs = [t["function"]["name"] for t in chat["tools"] if len(t["function"]["name"]) > pm.TOOL_NAME_MAX_LEN]
+    assert longs, "le cas P3 doit porter au moins un nom d'outil > 64 caractères"
+
+    names = [t["name"] for t in out["tools"]]
+    over = [n for n in names if len(n) > pm.TOOL_NAME_MAX_LEN]
+    assert not over, f"nom(s) d'outil > {pm.TOOL_NAME_MAX_LEN} car. envoyés à l'amont : {over}"
+
+    # ... et restaurables à l'identique (la map doit avoir été transportée)
+    name_map = out[pm._TOOL_NAME_MAP_KEY]
+    restored = {pm.restore_tool_name(n, name_map) for n in names}
+    for orig in longs:
+        assert orig in restored, f"nom d'origine non restaurable : {orig!r}"
+
+    # l'historique multi-tours suit le rename (tour N+1 cohérent avec les tools)
+    fc = [i for i in out["input"] if i.get("type") == "function_call"]
+    assert fc, "aucun function_call dans l'input converti"
+    for item in fc:
+        assert len(item["name"]) <= pm.TOOL_NAME_MAX_LEN, item
+        assert item["name"] in name_map, item
+    # ... et le tool orphelin (call_id sans tool_call précédent) est droppé
+    outs = [i for i in out["input"] if i.get("type") == "function_call_output"]
+    assert [o["call_id"] for o in outs] == ["call_p3_1"], outs
+
+    # constat MESURÉ et figé (pas de correctif dans ce trou) : la forme Responses
+    # ne porte ni `stop`/`stop_sequences` ni `stream_options` → ces champs du
+    # client P3 sont perdus. Un correctif qui les relaierait doit mettre à jour
+    # EXPLICITEMENT la fixture (le présent test est le garde-fou du silence).
+    assert out["stream"] is True
+    assert "stop" not in out and "stop_sequences" not in out and "stream_options" not in out

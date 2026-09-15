@@ -17,11 +17,11 @@
 | `openai_responses_to_anthropic(body)` | requête `/v1/responses` → upstream Anthropic | `responses_api_entry`, `p6_tools_long_name_strict`, `p6_documents_file_forms`, `p6_images_forms`, `p6_reasoning_history_dropped`, `p6_request_tool_choice_required`, `p6_request_effort_relay` |
 | `anthropic_to_openai_responses(anthro, model)` | réponse Anthropic → format Responses | `anthro_to_responses_tool_use`, `anthro_to_responses_thinking_omitted` |
 | `openai_chat_to_responses(chat_resp, model)` | réponse Chat → format Responses | `chat_to_responses_reasoning_and_usage` |
-| `_chat_to_responses_request(chat)` | requête client Chat → body Responses (P5 aller, sanitize natif) | `p5_request_chat_to_responses_media`, `p5_request_native_responses_passthrough` |
+| `_chat_to_responses_request(chat)` | requête client Chat → body Responses (P5 aller, sanitize natif ; **et P3** quand l'endpoint amont est `/responses`) | `p5_request_chat_to_responses_media`, `p5_request_native_responses_passthrough`, `p3_chat_to_responses_bounds_stop_tools` |
 | `_responses_to_chat_response(resp, model, name_map)` | réponse Responses interne → cible Chat | `responses_to_chat_response_cache_usage`, `responses_to_chat_restore_tool_name` |
 | `_responses_to_anthropic_response(resp, model, name_map)` | réponse Responses interne → cible Anthropic | `responses_to_anthropic_response_tool_use` |
 | `sanitize_tool_names` | noms d'outils > 64 car. → `name[:57]+sha1[:6]` + map de restauration | `sanitize_tool_names_long_and_server` |
-| `strip_synthetic_thinking(body)` | historique Anthropic : retire les blocs `thinking` à signature locale | `strip_synthetic_thinking`, `multiturn_thinking_strip` |
+| `strip_synthetic_thinking(body)` | historique Anthropic : retire les blocs `thinking` à signature locale — appelé par les handlers **P1**, **P4** et (depuis le 15/09/2026) **P6** | `strip_synthetic_thinking`, `multiturn_thinking_strip` |
 | `_responses_sse_to_chat_deltas(raw_line)` | 1 ligne SSE Responses (sans `data:`) → delta chat, `[DONE]`→None | `sse_deltas` |
 
 ## Mapping champs — requête Anthropic → Chat Completions
@@ -331,6 +331,32 @@ Sur P4, la sortie `chat.completion.chunk` est le format **correct** (le client a
 **Verrous** : `tests/test_free_leg_protocol_parity.py` (5 cas, non-stream),
 `tests/test_chat_sse_to_anthropic.py` (48 cas, convertisseur),
 `tests/test_e2e_protocol_matrix.py::test_free_model_subpath_p1_stream_converts_chat_to_anthropic`
-et `::test_free_model_subpath_p4_stream` (bout en bout stream, P1 et P4),
-`::test_p4_nonstream_sans_cle_anthropic_est_503_pas_500` (A27). Mutations : **7/7 mordent**
-(2 non-stream, 2 stream P1, 2 P4, 1 A27), fichiers restaurés à l'identique (sha256).
+et `::test_free_model_subpath_p4_stream` (bout en bout stream, P1 et P4). Mutations : **6/6
+mordent** (2 non-stream, 2 stream P1, 2 P4), fichiers restaurés à l'identique (sha256).
+
+> ⚠️ **Correction (15/09/2026)** — cette liste annonçait « 7/7 mordent … 1 A27 » et citait un
+> test `::test_p4_nonstream_sans_cle_anthropic_est_503_pas_500` qui **n'existe plus**
+> (remplacé par deux témoins). La mutation d'A27 **ne mord pas** : dépouillement seul, garde
+> seul, ou retour **complet** au code d'origine laissent les témoins verts, alors qu'une
+> sonde prouve que le site fautif est atteint. Voir plan §12.1.
+
+## Corrections du 15/09/2026 — vérité par axe
+
+| Axe | État avant | État après | Preuve |
+|---|---|---|---|
+| **A27** — en-têtes `None` de la jambe free écrasant des en-têtes valides | HTTP **500** nu (mesuré en production) | 14 sites de dépouillement homogènes + garde 503 en défense en profondeur | mesure live ; **témoins non mordants**, déclaré (plan §12.1) |
+| **P4** — bloc `thinking` à signature **locale forgée** vers l'amont | bloc signé par le proxy parti en amont (non-stream **et** stream) | `strip_synthetic_thinking` appelé au passage unique des deux jambes | `tests/test_p4_synthetic_thinking.py` ; mutations **2/2 mordent**, témoin P1 vert |
+| **P6** — signature forgée **et** garde orphelin contourné | `anthro_body` construit **avant** la garde ; bloc `pass` déguisé en garde | garde appliquée à l'objet réellement envoyé (resynchronisation depuis le corps **filtré**) + strip sur P6 | `tests/test_p6_orphan_and_thinking.py` ; mutation **mord** ; le strip est une défense en profondeur, **non prouvé nécessaire** (déclaré) |
+| **`supports_cache_control`** | 2 sites sur 4 sans garde (`mapping.py:1363`, `1390`) | garde sur les quatre sites | témoin **par site** ; mutations **2/2 mordent** avec discrimination |
+| **`cache_control` → `prompt_cache_breakpoint`** | no-op, mais une docstring affirmait l'émission | décision tranchée, docstring corrigée, comportement verrouillé | `tests/test_cache_control_support.py` |
+| **`thinking` racine → `reasoning`** | déclaré « jamais copié » | **déclaration réfutée** : converti, et le budget pilote l'effort (256→low, 8000→medium, 32000→high) | 8 cas, `tests/test_thinking_effort_mapping.py` |
+| **A8 sur P3** — noms d'outils > 64 car. non raccourcis à l'aller, non restaurés au retour | nom de 102 car. parti **verbatim** vers un amont plafonné à 64 ; le retour rendait le nom raccourci (le non-stream rendait même les **octets amont verbatim**, le stream réémettait la **ligne brute**) | `sanitize_chat_tool_names` / `restore_chat_response_tool_names` câblés aux deux retours | `tests/test_p3_tool_names.py` (8 cas) ; 5 échecs sans le correctif, **5 mutations mordent** ; 3 aides étaient du **code mort** |
+| **A8 sur P5/P6** — `name_map` absent des convertisseurs Responses | retour P5 : le client recevait le nom **raccourci** | `anthropic_to_openai_responses` / `openai_chat_to_responses` prennent `name_map` (symétrie des jumelles), carte extraite et propagée aux **7 sites** | `tests/test_trou3_a8_responses_restore.py` ; mutations A et C **mordent**, **B ne mord pas** (point inerte, déclaré) ; mesure : l'aller P5 raccourcit bien, l'aller **P6 envoie verbatim** (trou distinct, ouvert) |
+| **Jambe free — effort** | l'`reasoning_effort` décidé pour le modèle **payant** partait tel quel vers le modèle **free** | recalculé avec le modèle free via la source unique `config.effort_policy` (ne peut que rabaisser) | `tests/test_free_leg_effort_recompute.py` ; mutation **mord** (`'max'` → `'high'`) ; prouvé sur le chemin Chat seul, **inerte** sur `/responses` (clamp aval), déclaré |
+| **Jambe free `/responses` en flux SSE** | un **200** du modèle free était lu comme « vide » (le corps SSE n'est pas du JSON) → repli payant → **503** client alors que le free avait répondu | corps collecté (`.text`, à défaut lignes asynchrones) et objet reconstruit depuis `response.completed` | mesuré en E2E ; **reste ouvert** : le repli rend encore du **JSON à un client streaming** (`is_stream` non consulté, `opencode.py:10051-10067`) — `xfail` déclaré |
+| **A11 — P5/P6 bufferisés** | TTFB = durée totale de génération | **non corrigé** | mesuré **en live** : TTFB/total = **1,00** sur P6 (26,11 s) contre 0,86 sur P1 — réserve : les deux passent par la jambe free, le chemin payant est inmesurable ici. Exige un convertisseur SSE→SSE Responses inexistant |
+| **P2 → `/responses`** (trou 6) | chemin absent de la matrice : **aucune couverture** | 2 témoins (1 vert, 1 `xfail`), et **2 défauts neufs** dont 1 corrigé : un **200 du modèle free lu comme « vide »** (le corps SSE n'est pas du JSON) partait en repli payant, soit un **503 client** alors que le free avait répondu | mesuré en E2E ; le **cadrage SSE** du repli reste ouvert (le handler rend du JSON sans consulter `is_stream`) — déclaré |
+| **Jambe free de P6** (trou 13) | aucun test | 3 témoins, et un défaut révélé au passage : **503 annonçant une jambe free qui n'avait pas lieu** (corrigé) | 4 mutations en worktree jetable, **une déclarée non mordante** |
+| **A27 — garde 503 non atteinte** (trou 1, suite) | garde en « défense en profondeur » réputée vérifiée | **non atteinte** : `a_headers` y est **toujours un `dict`** (sonde), et ses deux conditions sont **mutuellement exclusives** ; restaurer le défaut aux 14 sites ne casse aucun test | mesuré ; le témoin existant est **complice** — trou **ouvert**, remédiation identifiée côté correctif (plan §12.17) |
+| **A11 — P5/P6 bufferisés** (trou 9, suite) | correctif borné (ping initial) envisagé | **impossible en l'état** : mesuré TTFB/total = **1,00** ; `StreamingResponse` construit à t = 625 ms, **après** la libération de l'amont à 610 ms — le handler n'atteint jamais son `return` | refus justifié (un ping tardif **masquerait** le watchdog TTFB) ; défaut neuf : `resp.json()` **sans `await`** (plan §12.17) |
+| **P3 → `/responses`** | aucun golden | 48ᵉ golden ; perte de `stop`/`stop_sequences`/`stream_options` **mesurée** et figée | 47/47 goldens préexistants inchangés ; mutations **3/3 mordent** |

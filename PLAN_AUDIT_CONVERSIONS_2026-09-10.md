@@ -112,17 +112,23 @@ Ce document. Inventaire par `grep` de **tous** les sites appelant une conversion
 
 | Anomalie | Statut | Preuve (test) |
 |---|---|---|
+> **Note de lecture (15/09/2026).** Les temoins cites dans ce tableau portent leur nom
+> **actuel** : plusieurs ont ete renommes quand le defaut qu'ils decrivaient a ete corrige
+> (`..._is_a_known_gap` -> `..._is_wired`, `..._is_lost` -> `..._is_preserved`,
+> `..._is_not_incremental_known_gap` -> `..._is_incremental`). Un ancien nom aurait inverse
+> le sens de la lecture : il aurait fait passer un trou ferme pour un trou ouvert.
+
 | A1 (4 mappings divergents) | **confirmée** | `test_axis_effort_p2_*`, `test_axis_effort_p4_*` |
 | A2 (`xhigh`/`max` écrasés, `minimal` filtré) | **corrigée au hotfix** | `test_axis_effort_p4_no_level_is_lost`, `_minimal_is_recognized` |
 | A3 (P6 perd l'effort) | **corrigée au hotfix** | `test_axis_effort_p6_reaches_anthropic` |
-| A4 (plancher absent sur P3) | **confirmée — gap connu** | `test_axis_min_tokens_floor_p3_is_a_known_gap` |
-| A5 (`cache_control` tools perdu) | **confirmée** | `test_axis_cache_control_on_tools_p2_is_lost` |
+| A4 (plancher absent sur P3) | **confirmée — gap connu** | `test_axis_min_tokens_floor_p3_is_wired` |
+| A5 (`cache_control` tools perdu) | **confirmée** | `test_axis_cache_control_on_tools_p2_is_preserved` |
 | A6 (usage cache non testé) | **traitée ici** | `test_axis_cache_read_tokens_extracted` (×3), `_creation_tokens_extracted` |
 | A7 (réécriture cache conditionnelle) | à couvrir L3 | — |
 | A8 (tools : 3 mécanismes) | **contrat prouvé** | `test_axis_tool_name_roundtrip_is_identity` (×8), orphelins |
 | A9 (documents asymétriques) | **confirmée couverture** | `test_axis_document_url_p2_becomes_file`, `_p6` |
 | A10 (tokens aveugles aux médias) | **confirmée** | `test_axis_token_estimate_ignores_media_size` |
-| A11 (faux streaming) | **confirmée — gap connu** | `test_axis_responses_stream_is_not_incremental_known_gap` |
+| A11 (faux streaming) | **confirmée — gap connu** | `test_axis_responses_stream_is_incremental` |
 | A12 (`_responses_sse_to_chat_deltas` peu testé) | **traitée ici** | `test_axis_chat_stream_conversion_produces_deltas`, `_reasoning_delta` |
 | A13-A16, A23 | **corrigées au hotfix** | `test_effort_mapping.py` (§10) |
 
@@ -230,16 +236,16 @@ Charge : **~11 jours-homme pour L0-L8, ~15 avec L9-L12, ~18 avec L9-L15, ~19 ave
 | thinking multi-tours | strip synthétique ⚠️ | `reasoning_content` | passthrough, **sans repli retry-once** | **signature HMAC locale forgée émise vers l'amont** (trou) | résumé `reasoning` droppé | droppé assumé (golden) |
 | `redacted_thinking` | natif ⚠️ | cache 512 en **écriture seule** (aucune réinjection) | passthrough | **perdu en silence** (le cache ne vit que sur P2) | — | **perdu en silence** |
 | ordre blocs réponse | natif ⚠️ | golden (non-stream) ; **SSE non verrouillé** | passthrough | **normalisé** `reasoning`→texte→`tool_calls` (entrelacement perdu) | **déterministe** : `reasoning`→texte→`function_call` | **déterministe** (golden) |
-| `cache_control` messages | natif ⚠️ | partiel — garde `supports_cache_control` absente (fuite `glm-5*` possible, non testée) | passthrough | n/a (aucune occurrence) | **client perdu** ; breakpoints auto-injectés | **perte muette** |
+| `cache_control` messages | natif ⚠️ | **corrigé 15/09** : garde `supports_cache_control` posée aux 2 sites manquants, témoin **par site** (§12.2) | passthrough | n/a (aucune occurrence) | **client perdu** ; breakpoints auto-injectés | **perte muette** |
 | `cache_control` tools | natif ⚠️ | **corrigé (L3)** ; `prompt_cache_breakpoint` reste un no-op | passthrough | abandonné (boucle reconstruite) | transporté mais **non traduit** (L15 non fait) | **perte muette** |
 | usage cache (read/creation) | natif ⚠️ | read ok ; trous = sites handler, compta DB, `cache_creation` en stream | passthrough (usage amont) | read remonté ; **`cache_creation` jamais remonté**, pas d'E2E | read ok, **création perdue** | read ok ; **création jetée** (`cache_write_tokens` absent du dépôt) |
 | tools schéma/strict | natif ⚠️ | `_normalize_tool_schema` (aucun `strict` émis) | passthrough | profils ; **`strict` abandonné (non déclaré)** | `_normalize_tool_schema` + profil modèle | profils ; `strict` jamais reporté |
 | tool_choice | natif ⚠️ | golden | passthrough (exception `web_search`/`web_fetch`) | dict→dict ; **chaîne passée verbatim** | dict→dict (`any`→`required`) | dict→dict ; **pas de sens retour** |
 | noms d'outils longs | **converti (A26)** ⚠️ | sanitize/restore | **verbatim non sanitizé — trou A8 ouvert** | **aucun remap** (nom verbatim ; 200 car. légitimes) | aller sanitizé, **retour non restauré** | **pas de remap** ; côté free Chat, non câblé |
-| orphelins tool_result | — | `_drop_orphan_tool_messages` | idem (câblage non testé) | **garde câblée** avant conversion | `_drop_orphan_responses_input` | **garde contournée** : le corps Anthropic converti n'est pas refiltré |
+| orphelins tool_result | — | `_drop_orphan_tool_messages` | idem (câblage non testé) | **garde câblée** avant conversion | `_drop_orphan_responses_input` | **corrigé 15/09** : le corps réellement envoyé est refiltré (resynchronisation depuis le corps Chat filtré) + `strip_synthetic_thinking` ; témoin qui mord (§12.6) |
 | documents (PDF/URL/file_id) | natif ⚠️ | `{type:file}` + replis | passthrough | **les 3 formes traitées** (base64, `file_id`, URL ; URL non-PDF → texte) | base64/`file_id` ok, **URL→texte** | `input_file` → 3 formes (TESTÉ) |
 | images (+ tool_result) | natif ⚠️ | data-URI + **placeholders** (pas de drop silencieux) | passthrough | data-URI / URL ; **images dans `tool_result` préservées** | `input_image` | `input_image` ; **part inconvertible = drop muet** |
-| streaming incrémental | **converti (A26)** ⚠️ | `stream_gen` (`opencode.py:10167`) | relais verbatim ligne à ligne | payant **réellement incrémental** ; **jambe free Chat = 0 octet (MESURÉ)** | **séquence conforme, émission bufferisée (A11 partiel)** | **idem — TTFB = durée totale** |
+| streaming incrémental | **converti (A26)** ⚠️ | `stream_gen` (`opencode.py:10167`) | relais verbatim ligne à ligne | payant **réellement incrémental** ; jambe free Chat **corrigée 15/09** (0 octet → corps converti, MESURÉ) | **séquence conforme, émission bufferisée (A11 partiel)** | **idem — TTFB = durée totale** (A11 partiel, §12.11) ; **mais** le 503 mensonger de P6-stream est corrigé (jambe free désormais réellement tentée, §12.9) |
 
 > **Provenance.** `natif` = aucune conversion, le corps et la réponse traversent tels
 > quels. Ce tableau est **la cible** ; l'état constaté et sa provenance
@@ -251,6 +257,8 @@ Charge : **~11 jours-homme pour L0-L8, ~15 avec L9-L12, ~18 avec L9-L15, ~19 ave
 > mention « natif » seule était fausse : elle décrivait le chemin nominal sans
 > franchir la bascule free, et la jambe free n'était exercée que sur les chemins à
 > protocole `openai`.
+>
+> ⚠️ **État des trous au 15/09/2026.** Cette matrice décrit **la cible** ; l'état vérifié de chacun des 13 trous déclarés (ce qui est corrigé, réfuté, mesuré, ou encore ouvert) est tenu **par trou** au **§12**, avec la preuve associée. Une cellule ci-dessus peut donc être en avance ou en retard sur l'état réel : en cas de doute, c'est le §12 qui fait foi.
 >
 > ⚠️ **P3 — trou A8 ouvert** : `sanitize_tool_names` n'est appelé **nulle part** dans
 > `opencode.py`. Un nom d'outil > 64 caractères part donc **verbatim** vers un amont
@@ -1034,7 +1042,5237 @@ hermétiques, elle les confirme.
   existant stubait `ANTHRO_SSE_LINES` — une forme que l'endpoint free **ne produit
   jamais** — et n'assertait aucun contenu : il **verrouillait** le défaut (classe A25,
   §11.7). Réécrit avec `CHAT_CHUNK_LINES`, assertions de contenu et assertion d'aller Chat.
-* Mutations : 2/2 mordent sur P4 (aller, retour), 1/1 sur A27 (retour au code d'origine) ;
-  fichiers restaurés à l'identique (sha256).
+* Mutations : 2/2 mordent sur P4 (aller, retour) ; fichiers restaurés à l'identique (sha256).
 * 294 tests des chemins voisins verts ; régénération golden : aucun des 47 goldens
   préexistants modifié.
+
+> ⚠️ **Correction (15/09/2026)** — la phrase « 1/1 sur A27 (retour au code d'origine) »
+> était **fausse** et est retirée : aucune des trois mutations d'A27 (dépouillement seul,
+> garde seul, retour COMPLET au code d'origine) ne fait échouer les témoins. Voir §12.1.
+
+## 12. Trous déclarés de l'audit — corrections du 15/09/2026
+
+Cette section est le registre de vérité des 13 trous déclarés dans la synthèse de l'audit
+(§9 « ce qui reste ouvert » du rapport). Chaque entrée dit : le défaut tel qu'il a été
+**mesuré** (et non tel qu'il avait été supposé), le correctif, le témoin, la **mutation**
+(correctif neutralisé → le test doit rougir), et ce qui reste ouvert.
+
+Vocabulaire inchangé : `TESTÉ`, `MESURÉ`, `DÉDUIT`, `NON TESTÉ`.
+
+### 12.1 A27 (jumeau `/v1/messages`) — la jambe free rend des en-têtes `None`
+
+**Défaut mesuré.** Trace de production : `AttributeError: 'NoneType' object has no
+attribute 'get'` dans `chat_completions`, remontée en **HTTP 500 nu**.
+
+**Mécanisme réel** (la première rédaction de ce plan accusait `_get_auth_headers`, c'était
+faux) : `_try_free_model_first` rend **`None`** dans le créneau des en-têtes sur son chemin
+nominal de hedge — le code le dit lui-même (`resp = resp_headers = None`, puis le
+commentaire « resp_headers stays None for hedge »). **Huit sites** de dépouillement
+écrivaient `resp, headers, _actual_model, _actual_ip = free_result`, écrasant des en-têtes
+payants **valides** par ce `None`. `_get_auth_headers` ne rend jamais `None`
+(`entry.get("api_key", API_KEY)`), il n'était pas en cause.
+
+**Correctif.** Les 14 sites de dépouillement utilisent désormais `_` pour ce créneau
+(homogénéité) ; le contrat est écrit dans la docstring de `_try_free_model_first` ; le
+garde `503` (message « plus de clé et pas de free model ») est conservé en **défense en
+profondeur**, avec un commentaire corrigé.
+
+**Limite de preuve, dite franchement.** Les deux témoins
+(`test_p4_nonstream_jambe_free_sans_entetes_ne_fait_pas_500`,
+`test_p1_nonstream_jambe_free_sans_entetes_ne_fait_pas_500`) passent et assertent le
+comportement observable — **mais ils ne mordent pas** : ni la mutation du dépouillement
+seul, ni celle du garde seul, ni le retour **complet** au code d'origine ne les rendent
+rouges. Sonde à l'appui : le site `opencode.py:12650` **est** atteint, le stub **est**
+appelé, et le `503` observé vient du chemin d'erreur normal
+(`« All API keys exhausted (rate limited) »`), pas de la lecture fautive. Conclusion
+assumée : la correction d'A27 repose sur la **mesure live** et la lecture du code, pas sur
+un test qui mord. Classe A25 inversée : ici le harnais est *trop permissif* pour
+reproduire, pas complice.
+
+### 12.2 `supports_cache_control` — deux sites sur quatre sans garde (TROU 8)
+
+**Défaut MESURÉ.** Dans `anthropic_to_openai` (`app/protocol/mapping.py`), quatre sites de
+report du `cache_control` sur le message converti. Deux portent le garde (`L1377`, `L1399`),
+deux non (`L1363`, `L1390`) — alors que la variable est définie dans la même fonction
+(`supports_cache_control = not model.startswith("glm-5")`). Un modèle sans support recevait
+donc un `cache_control` par ces deux branches. Asymétrie entre sites jumeaux, pas décision.
+
+**Atteindre ces sites est le point dur** — et c'est ce qui a fait échouer ma première
+version du témoin : elle passait par les sites **déjà gardés**, la mutation ne mordait pas.
+Les deux lignes vivent dans des branches qui exigent `tool_calls` **et** `not is_asst` : il
+faut un message **utilisateur** contenant un bloc `tool_use` (un `tool_use` remplit
+`tool_calls` quel que soit le rôle, L1230-1244) ; `L1363` exige en plus `image_parts`.
+
+**Correctif + témoin.** Garde ajouté aux deux sites ; témoins distincts par site dans
+`tests/test_cache_control_support.py`. **Mutation** : neutraliser `L1363` fait rougir le
+témoin « avec image », neutraliser `L1390` fait rougir le témoin « sans image » —
+discrimination par site ; fichier restauré (sha256 identique).
+
+### 12.3 `cache_control` → `prompt_cache_breakpoint` : décision tranchée (TROU 10)
+
+**Défaut réel, mais documentaire.** `_cache_control_to_openai_breakpoint`
+(`mapping.py:621`) est un no-op **assumé** (« Réservé — NON ÉMIS »), et argumenté : B3 place
+`prompt_cache_breakpoint` sur les **content parts**, pas sur un message ni sur une
+définition d'outil ; émettre au mauvais niveau risque un 400 pour un gain nul. Or la
+docstring de `_carry_cc` (`mapping.py:1455`) affirmait le contraire : « **on émet AUSSI**
+l'équivalent OpenAI réel ». Deux docstrings du même fichier se contredisaient.
+
+**Correctif.** La docstring fausse est corrigée (elle dit maintenant la décision et sa
+raison). Le comportement est verrouillé par
+`test_cache_control_sur_outil_est_transporte_sans_inventer_le_champ_openai` : le breakpoint
+de l'outil est transporté, `prompt_cache_breakpoint` n'est pas inventé.
+
+**Reste ouvert, assumé** : la traduction par part (lot **L15**) n'est pas faite, et
+`cache_write_tokens` n'est toujours remonté nulle part. Ce n'est pas un oubli : c'est un
+travail rattaché à L15, refusé ici parce qu'un placement non conforme est pire que
+l'absence.
+
+### 12.4 « `thinking` top-level jamais copié » — RÉFUTÉ par la mesure (TROU 11)
+
+**L'affirmation de l'audit est fausse.** Mesure sur `_anthropic_to_responses_request`
+(constructeur de corps pour l'endpoint `/responses`) :
+
+| entrée | sortie |
+|---|---|
+| sans `thinking` | pas de champ `reasoning` |
+| `thinking: {type: disabled}` | pas de champ `reasoning` |
+| `thinking: {type: enabled, budget_tokens: 256}` | `reasoning: {summary: auto, effort: low}` |
+| `… budget_tokens: 8000` | `… effort: medium` |
+| `… budget_tokens: 32000` | `… effort: high` |
+
+Le `thinking` racine **est** converti, et le budget **pilote** l'effort. L'axe était donc
+déjà couvert, sans témoin pour le verrouiller.
+
+**Action.** `tests/test_thinking_effort_mapping.py` (8 cas) verrouille le comportement
+mesuré, y compris l'échelle d'effort. La déclaration d'audit est retirée. Portée : ce
+constructeur de requête uniquement — les autres chemins bâtissant un corps Responses ne
+sont pas couverts par ce fichier.
+
+### 12.5 P4 émettait une signature **forgée** vers l'amont (TROU 4)
+
+**Défaut MESURÉ.** Le proxy fabrique un bloc `thinking` « synthétique » et le signe
+localement (`_local_signature`). Sur P4, `strip_synthetic_thinking` n'était pas appelé :
+le bloc partait **signé d'une signature locale** vers un amont Anthropic, en non-stream
+(amont payant) **et** en stream (jambe free Anthropic). P1 le faisait (`L8898`), P4 non.
+
+**Correctif.** Appel ajouté au **passage unique** des deux jambes P4
+(`opencode.py:12543-12561`, juste après `anthro_body = openai_to_anthropic_request(body)`).
+
+**Témoin + mutation.** `tests/test_p4_synthetic_thinking.py` (3 cas) ; correctif neutralisé
+→ **2 rouges** avec le message exact du bloc forgé, tandis que le témoin P1 **reste vert**
+(la morsure vise P4, pas le strip en général) ; sha256 restauré.
+
+**Limite.** La mesure porte sur des seams amont doublés, pas sur un vrai 400 Anthropic.
+
+### 12.6 P6 : garde orphelin contourné **et** signature forgée non retirée (TROU 5)
+
+**Défaut MESURÉ (lecture du code, corroborée par le sous-agent du TROU 4).** Dans le
+handler `/v1/responses`, `anthro_body` est construit (`L13474`, resynchronisé `L13487`)
+**avant** la garde orphelin, qui filtre `body` (`L13492`/`L13494`). Le bloc qui suivait
+(`L13495-13497`) ne faisait **rien** tout en ayant l'air de garder : `pass` et commentaire
+« keep for completeness ». Un message `tool` orphelin partait donc vers l'amont Anthropic
+dès que le client parlait Responses, alors que le même orphelin est écarté sur les autres
+chemins (`L7219`, `L9934`, `L11445`).
+
+**Correctif — et un premier correctif FAUX, ce qui est instructif.** J'ai d'abord appliqué
+`_drop_orphan_tool_messages` au corps Anthropic. Le témoin écrit à ce moment-là a **échoué**,
+et il avait raison : cette fonction travaille au format **Chat** (`role: tool` /
+`tool_call_id`) et ne trouve donc rien dans un corps Anthropic — le correctif ne corrigeait
+rien. Le vrai correctif **resynchronise** : `anthro_body` est reconstruit depuis le `body`
+**déjà filtré**, exactement le motif utilisé deux lignes plus haut pour `web_search`.
+`strip_synthetic_thinking` est en outre appelé sur le corps P6.
+
+**Témoins (fermé).** `tests/test_p6_orphan_and_thinking.py`, fichier **autonome** (harnais
+ASGI + doubles amont copié du témoin P4, pour ne pas dépendre du fichier E2E que le
+sous-agent 13 tenait). Trois cas : orphelin non transmis, contre-témoin de contenu intact
+(« question » doit survivre à la garde), et absence de signature locale. **Mutation** : le
+bloc `pass` d'origine rétabli → le témoin rougit avec le message exact du `tool_result`
+orphelin ; fichier restauré à l'octet (sha256 identique).
+
+**Mesure honnête sur le `strip` P6.** Retirer l'appel au `strip` **ne fait pas rougir** les
+témoins P6 (les témoins P4, eux, restent verts eux aussi) : cet appel est donc de la
+**défense en profondeur, pas un correctif prouvé nécessaire**. Il est conservé parce qu'un
+client peut renvoyer un historique qui a transité par P1/P4 et porterait alors une signature
+locale, mais c'est une hypothèse, pas une mesure — dit tel quel.
+
+### 12.7 Aucun golden P3 — fermé, et un défaut neuf mesuré au passage (TROU 12)
+
+**Ce que la mesure a d'abord appris** (et qui corrige une hypothèse de l'audit) : sur P3, le
+relais Chat→Chat **n'appelle aucune fonction de `app/protocol/mapping.py`** — les mutations
+de corps sont dans `opencode.py` (`ensure_min_tokens` l.11437, garde orphelin l.11445,
+`reasoning_effort` l.11420) et ne sont pas atteignables par le harnais golden. La **seule**
+conversion `mapping.py` de P3 est `_chat_to_responses_request`, appliquée quand l'endpoint
+amont est `/responses` (jambe payante `opencode.py:11606`, jambe free `muse-spark`
+`opencode.py:6206`). Le golden porte donc sur **ce** chemin — un Chat→Chat pur n'aurait
+rien verrouillé de plus que P2.
+
+**Golden ajouté** : `docs/v1-response-golden/p3_chat_to_responses_bounds_stop_tools.json`
+(48ᵉ fixture) + `test_p3_golden_present` et `test_p3_tool_names_and_token_bounds`.
+Il fige : `max_tokens 512 → max_output_tokens 512` **prioritaire** sur
+`max_completion_tokens 300` (axe A17/L14) ; `tools[].function.parameters → tools[].parameters`
+(+ `additionalProperties: false` du profil muse-spark) ; nom d'outil de 124 → 64 caractères
+avec `_tool_name_map` restaurable (axe A8) ; renommage de l'historique ; `tool` orphelin
+écarté ; `stream` conservé.
+
+**Preuves** : 51 tests golden verts ; **les 47 goldens préexistants sont inchangés**
+(sha256 identiques 47/47, et `git status` ne montre que la nouvelle fixture) ; générateur
+idempotent (47/47 payloads re-rendus identiques, en dry-run **sans écriture**) ; `_call` ≡
+`call_fn` vérifié sur 48/48. **Mutations** : trois mutations de source **en mémoire** (plugin
+pytest hors dépôt, aucun fichier du dépôt touché) — lecture sans `max_tokens`, sans
+`sanitize_tool_names`, sans `_remap_responses_history_names` → **les trois mordent**
+(2 échecs chacune).
+
+**Défaut neuf, MESURÉ, non corrigé ici** : `_chat_to_responses_request` **perd
+silencieusement** `stop` / `stop_sequences` et `stream_options` d'un client P3 quand l'amont
+est `/responses` (champs absents du corps amont). Conséquence possible : la réponse ne
+s'arrête pas sur la séquence demandée. Le golden **fige le constat** et le test le rend
+explicite — un correctif devra donc régénérer la fixture. Je ne l'ai pas corrigé parce que
+la cible (API Responses) **n'a peut-être pas** d'équivalent `stop` : inventer un champ au
+risque d'un 400 est exactement l'erreur évitée au §12.3. **À trancher contre la spec**, puis
+soit corrigé, soit inscrit comme perte résiduelle assumée et **tracée** (pas silencieuse).
+
+### 12.8 Jambe free de P6 : aucun test — fermé, et un défaut révélé (TROU 13)
+
+Trois témoins ajoutés dans `tests/test_e2e_protocol_matrix.py` (section dédiée) :
+`test_p6_jambe_free_nonstream_endpoint_chat` et `test_p6_jambe_free_nonstream_endpoint_responses`
+(couvent **déjà verts** — la jambe free fonctionnait sur les deux formes d'endpoint : le trou
+était bien un trou de **couverture**, pas un défaut), plus un troisième cas qui a révélé le
+défaut du §12.10.
+
+**Preuve de morsure** — 4 mutations, en **worktree git jetable** (l'arbre de travail n'a
+jamais été touché ; `opencode.py` restauré byte-identique, sha256 `ef05e577…`) :
+`_try_free_model_first` → `None` : **2 échecs** ; retour Chat non converti : échec du volet
+Chat ; aller non converti : échec ; `stream=False` non forcé : **ne mord pas** — le chemin
+était alors inatteignable (c'est le défaut lui-même), et l'agent l'a déclaré au lieu de le
+maquiller.
+
+### 12.9 P6-stream : le 503 annonçait une jambe free qui n'avait pas lieu (TROU 15)
+
+**Défaut MESURÉ** (même corps client, clé payante en pause) :
+
+| requête | avant | après |
+|---|---|---|
+| `stream: false` | 200 + texte free, **1 appel** amont | inchangé |
+| `stream: true` | **503** « free model will be tried on next attempt », **0 appel** amont | 200 + texte free |
+
+Le message annonçait un essai qui n'avait pas lieu, alors que le code de streaming situé
+plus bas (après le `return` du non-stream) force `stream = False` en amont **et tente déjà
+la jambe free**.
+
+**Correctif — en deux temps, le premier insuffisant.** La branche `is_stream` laisse
+désormais filer vers ce code de streaming ; mais un **`return` 503 inconditionnel** situé
+juste après le bloc free interceptait encore le flux : une sonde a montré que la branche
+était bien atteinte et que **zéro** appel amont partait quand même. Ce `return` est donc
+conditionné, et un drapeau `_paused_sans_cle` interdit d'appeler le payant sans clé — si la
+jambe free ne donne rien, le 503 renvoyé est **véridique** (« no free model available »).
+
+**Témoin + mutation.** `test_p6_jambe_free_stream_bufferise_et_sans_fuite_de_format` : il
+était marqué `xfail` (défaut mesuré, non corrigé) ; le marqueur est **retiré** car il passe.
+Mutation : court-circuit rétabli → **il rougit** (« jambe free attendue une fois, appels :
+[] »), fichier restauré à l'octet.
+
+### 12.10 Jambe free : ce qui est recalculé, ce qui ne l'est pas (TROU 7, partiel) — **supplanté par §12.13**
+
+**Mesuré par lecture du code** (`_try_free_model_first`, `opencode.py:6075+`) : la
+déclaration de l'audit (« la décision prise côté payant n'est pas recalculée après la
+bascule ») est **trop large**. Ce qui EST recalculé : la conversion est refaite **avec le nom
+du modèle free** (`{**body, "model": free_model}`), donc tout ce qui est indexé par modèle
+l'est aussi — profil de schéma (`muse-spark` → `additionalProperties: false`, verrouillé par
+le golden P3 du §12.7), garde `supports_cache_control` (§12.2), champ de borne (`max_tokens`
+→ `max_output_tokens` selon l'endpoint) : L6204 (anthropic→`/responses`), L6206
+(chat→`/responses`), L6215 (anthropic→Chat).
+
+Ce qui **n'est PAS** recalculé : **l'effort**. Le corps Chat part **tel quel** vers l'endpoint
+free Chat (`free_body = dict(body)`, L6218) : le `reasoning_effort` décidé pour le modèle
+**payant** (`_resolve_effort(body, model_id)`, L11423, qui applique `thinking.effort_caps`)
+est donc réutilisé pour le modèle free — aucun site d'effort n'existe dans
+`_try_free_model_first` (vérifié : zéro occurrence). Si le plafond du modèle free est plus bas
+que celui du payant, le free reçoit un niveau qu'il ne devrait pas.
+
+**Statut : mesuré, non corrigé à cette date** — le correctif (recalculer la décision d'effort
+avec le modèle free) doit venir **avec un témoin qui mord**, donc pas seulement une lecture
+de code. C'est le seul volet du TROU 7 qui survit à la mesure.
+
+### 12.11 A8 sur P3 : l'aide existait, personne ne l'appelait (TROU 2)
+
+**Défaut mesuré.** Sur P3 (client Chat → modèle dont l'amont est Chat), un nom d'outil de
+**102 caractères** partait **verbatim** vers l'amont, qui plafonne à 64 (rejet attendu), et le
+retour rendait en outre le nom raccourci. L'audit annonçait « `sanitize_tool_names` jamais
+appelé dans `opencode.py` » : c'est exact, **mais la formulation induisait la mauvaise
+correction** — dans un corps Chat le nom vit sous `function.name`, pas à plat, donc l'aide
+« forme Responses » n'aurait rien vu. Le vrai constat est meilleur et plus gênant :
+**`_sanitize_chat_tools`, `_remap_chat_history_names` et `_remap_chat_tool_choice` existaient
+et étaient du code mort**, appelés nulle part. Ils n'étaient pas bogués ; ils n'étaient pas
+câblés — et l'audit les croyait câblés par le lot L4.
+
+**Correctif.** Nouvelle aide publique `sanitize_chat_tool_names(body)` appelée en tête de la
+branche `protocol == "openai"` du handler `chat_completions` (`opencode.py:11476`), et
+`restore_chat_response_tool_names(data, name_map)` au retour (`mapping.py:3106` et `3134`,
+construites sur les trois aides mortes). Deux **pièges mesurés** expliquent pourquoi
+« restaurer la réponse » ne suffisait pas : le non-stream rendait `resp.content`, les **octets
+amont verbatim** (le nom restauré n'y était donc pas), et le stream **réémettait la ligne
+brute** (`line.encode()`). Les deux sont corrigés (re-sérialisation du seul cas renommé ;
+`yield` du chunk parsé restauré).
+
+**Témoin + mutations.** `tests/test_p3_tool_names.py` (8 cas) ; le harnais est **importé** du
+fichier E2E, jamais recopié, et le double amont rejoue **le nom qu'il a reçu** : le test ne
+présuppose donc pas le comportement corrigé (défaut de classe A25 évité). Sans correctif :
+**5 rouges**. Cinq mutations (aller neutralisé, `yield` brut, restauration inerte, map
+retirée) mordent, `ruff` OK, CRLF intact, sha256 restaurés à l'octet.
+
+**Limites déclarées.** Cache de réponses et jambe free réelle de P3 non couverts (stubs) ;
+une entrée `per-file-ignores` a été ajoutée à `pyproject.toml` pour ce fichier de test, sur le
+motif déjà présent dans le dépôt (Ré-export de fixtures).
+
+### 12.12 P2 vers `/responses` : la couverture manquait, et deux défauts en sont sortis
+
+**Couverture (le trou lui-même).** Deux témoins ajoutés dans `tests/test_e2e_protocol_matrix.py`
+(section dédiée) : `test_p2_jambe_free_endpoint_responses_nonstream` (**vert** — le chemin
+fonctionnait : c'était bien un trou de couverture) et
+`test_p2_jambe_free_endpoint_responses_stream_sans_cle_payante` (**xfail**, voir ci-dessous).
+Mutations en **worktree jetable** (l'arbre n'a jamais été touché) : neutraliser
+`_chat_to_responses_request` → **mord** (« corps non converti en forme Responses ») ; laisser
+`free_body = dict(body)` → **mord** (« modèle free non swappé »). Deux autres mutations
+(`stream` forcé à `False`, retour non converti) **ne mordent pas** : l'une est indistinguable
+en non-stream, l'autre est masquée par le défaut D2. Déclaré, pas maquillé.
+
+**Défaut D2 — un 200 du modèle free jeté comme un échec (corrigé, partiellement).**
+`_try_free_model_first` ne lisait la réponse `/responses` que si le `content-type` était JSON
+(`opencode.py:6595`). Or quand on demande `stream: true` à `/responses`, la réponse est un
+**flux SSE** : `rdata` restait vide, la réponse **200** était classée « empty JSON response »,
+le repli payant prenait le relais — et clés en pause, le client recevait **503** alors que le
+modèle free avait répondu. Même classe que le 503 mensonger de P6-stream (§12.9).
+
+Correctif appliqué : le corps est collecté (`.text`, à défaut les lignes asynchrones — cas
+d'un flux réellement diffusé) et l'objet Responses complet est reconstruit depuis
+`response.completed`, à défaut le dernier `response.*` portant `output`
+(`_collect_responses_sse_object`, `_free_responses_body_object`).
+
+**Ce qui reste ouvert, dit franchement** : le repli du handler P2 (`opencode.py:10051-10067`)
+rend sa réponse en **JSON sans regarder `is_stream`**. Après correctif, un client *streaming*
+reçoit donc **200 avec le texte** (au lieu du 503) mais en `application/json` — la perte de
+données est réparée, le **cadrage SSE** ne l'est pas. Le témoin reste donc `xfail` sur cette
+seule assertion, et la mutation associée n'est pas revendiquée.
+
+**Défaut D1 — comptabilité à zéro (mesuré, non corrigé).** Le même repli lit
+`usage.prompt_tokens` / `usage.completion_tokens` (`opencode.py:10026-10027`) alors qu'une
+réponse `/responses` porte `input_tokens` / `output_tokens` : la consommation de la jambe free
+sur ce chemin compte **0**. Le contenu rendu au client, lui, est correct. Non corrigé faute de
+témoin : une correction sans test qui mord serait exactement ce que cet audit reproche.
+
+**Limites déclarées.** Le chemin `stream_gen` de la jambe free `/responses` (clés payantes
+*disponibles*) n'est pas exécutable dans ce proxy et n'est donc couvert par **aucun** test ;
+outils, `tool_choice` et images sur ce chemin ne le sont pas non plus.
+
+### 12.13 TROU 7 : l'effort de la jambe free est désormais recalculé
+
+**Correctif.** Dans `_try_free_model_first` (bloc inséré vers `opencode.py:6220-6253`) : si le
+corps destiné au free porte un `reasoning_effort` **décidé pour le modèle payant**, il est
+recalculé avec `free_model` via la **source unique** (`_resolve_effort`, `config.effort_policy`)
+— aucune table locale, et rien n'est inventé quand le client n'a rien demandé. Le recalcul ne
+peut que **rabaisser** le niveau.
+
+**Témoin + mutation.** `tests/test_free_leg_effort_recompute.py` (5 cas) ; le témoin passe par
+le **handler réel** `chat_completions` et asserte le corps **réellement remis à la couche
+réseau** (couple mesuré : payant `deepseek-v4-flash`, plafond `max` ; free
+`deepseek-v4-flash-free`, plafond `high`). Mutation (`if False and _paid_effort is not None`) :
+**mord** — `assert 'max' == 'high'`, avec le message qui nomme les deux plafonds. sha256
+restauré ; `ruff` OK.
+
+**Limites déclarées par la mesure.** (1) Seul le chemin « endpoint free = Chat » est prouvé —
+c'est le seul où un écart de plafond réel existe. (2) Sur `/responses`, le bloc est **inerte** :
+`_chat_to_responses_request` clampe déjà l'effort en aval (mesuré, A/B identique) — c'est
+pourquoi la déclaration initiale de l'audit (« la décision payante n'est pas recalculée »)
+était **trop large**. (3) Aucun couple à plafonds divergents n'existe pour `muse-spark-*`
+(`xhigh`/`xhigh`) : non prouvé par un témoin rouge, dit tel quel.
+
+**Faille trouvée APRÈS coup, en vérifiant la garantie « ne peut que rabaisser » — et corrigée.**
+La garantie ne tenait pas par construction, seulement par chance de configuration. Mesure sur la
+config réelle : `_resolve_effort` donne la **priorité** à `effort` et `output_config.effort` sur
+`reasoning_effort`.
+
+| Sonde passée à `_resolve_effort` (plafond du modèle = `xhigh`) | Niveau rendu |
+|---|---|
+| `{"reasoning_effort": "high"}` | `high` |
+| `{…, "reasoning": {"effort": "max"}}` | `high` |
+| `{…, "thinking": {"type": "adaptive"}}` | `high` |
+| `{…, "effort": "max"}` | **`max`** ← dépasse la décision payante |
+| `{…, "output_config": {"effort": "max"}}` | **`max`** ← idem |
+
+Or le bloc recopiait **tout** le corps (`dict(body)`) avant d'y réinjecter la décision payante :
+les formes plus prioritaires restaient présentes et pouvaient donc **relever** le niveau au-dessus
+de la décision payante. Le correctif rend la garantie structurelle : la sonde ne porte plus QUE
+`{"reasoning_effort": _paid_effort}`.
+
+**Portée exacte de cette faille, dite sans dramatiser.** Avec la configuration actuelle, aucun
+couple payant/free n'a de plafond free **supérieur** au payant : la faille était donc **latente**
+(inatteignable en l'état) et non active en production. Elle devenait active dès qu'un couple
+futur aurait un plafond free plus haut — c'est pourquoi elle est corrigée maintenant plutôt que
+laissée au hasard d'une future configuration.
+
+
+### 12.14 TROU 9 (A11) : bufferisation **mesurée en live**, non corrigée à cette date
+
+**Ce qui est mesuré** (proxy relancé sur le code corrigé, requêtes réelles, `max_tokens` 400) :
+
+| Requête | TTFB | total | ratio |
+|---|---|---|---|
+| P1 stream (`/v1/messages`, client Anthropic) | 21,06 s | 24,36 s | **0,86** |
+| P6 stream (`/v1/responses`, client Responses) | 26,11 s | 26,11 s | **1,00** |
+
+Le premier octet arrive **avec le dernier** : la revendication de l'audit (TTFB = durée totale
+de génération) est **confirmée** sur P6.
+
+**Réserve honnête sur la mesure.** Le « contraste » P1 n'en est pas un : sur cette route les
+deux requêtes empruntent la **jambe free**, qui bufferise elle aussi. Le chemin payant n'a pas
+pu être mesuré — la clé payante répond « unauthorized » sur ce poste. La mesure dit donc ce
+qu'un client subit **ici**, pas la différence payant/free.
+
+**Contrainte structurelle, établie par lecture du code (et non supposée).** Le battement de
+cœur **existe déjà** : `_SSE_KEEPALIVE_INTERVAL = 15 s` (`opencode.py:8102`), commentaire
+documenté comme « harmless to clients », émis par `_sse_pump` (`opencode.py:8110-8121`). Mais il
+ne peut émettre qu'**entre deux `yield` du générateur** : si le générateur bloque toute la
+génération **avant sa première émission** — ce que fait précisément le chemin P5/P6 —, le pump
+ne peut rien faire. Conséquence pour tout correctif futur : il doit émettre **avant d'attendre
+l'amont**, et non se contenter d'envelopper le générateur existant avec `_sse_keepalive`. Un
+correctif qui se contenterait de l'enveloppe ne changerait **rien** et son témoin ne pourrait
+pas mordre — c'est le critère de jugement retenu.
+
+**Portée réelle de la mesure.** Seul **P6** a pu être chronométré. **P5** n'est pas mesurable
+sur ce poste : il exige soit une clé payante valide (celle du poste répond « unauthorized »),
+soit des clés **en pause** (seul état qui déclenche le repli free) — deux conditions absentes.
+Quant à la ligne **P1** du tableau (ratio 0,86), elle ne documente pas le chemin **payant** : elle
+reflète elle aussi la jambe free. Aucune ligne de ce tableau ne mesure donc le payant, et P5 n'a
+pas été mesuré du tout.
+
+**Pourquoi ce n'est pas corrigé dans cette passe.** Un vrai incrémental demande un
+convertisseur **SSE → SSE Responses** qui n'existe pas dans le dépôt : l'inventaire ne trouve
+que le sens inverse (`_responses_sse_to_chat_deltas`, `mapping.py:3826`) et un
+`responses_stream_sse` qui prend une **liste d'événements déjà calculée**. C'est un chantier,
+pas un correctif de trou. Le correctif borné envisagé (en-têtes et battement de cœur immédiats,
+contenu toujours bufferisé) n'a **pas** été écrit : le déclarer fermé sans l'avoir fait serait
+exactement le travers que cet audit corrige.
+
+### 12.15 A8 sur P5/P6 : restauration absente au retour (TROU 3), et deux écarts mesurés
+
+**Mesure dans les deux sens — c'est elle qui a tranché la formulation.** Sur P5
+(`/v1/responses` → `muse-spark` → amont `/responses`), l'**aller raccourcit bien** le nom de
+78 caractères à ≤64 et la `_tool_name_map` accompagne le corps : le trou est donc
+« **restauration absente au retour** », comme l'annonçait l'audit. Sur P6
+(`/v1/responses` → `minimax-m3` → amont Anthropic), en revanche, l'amont reçoit le nom client
+**tel quel** et aucune map n'est construite : le restore-retour y est un **no-op mesuré**.
+Deux situations différentes que la formulation unique de l'audit confondait.
+
+**Correctif.** `anthropic_to_openai_responses(anthro, model, name_map=None)` et
+`openai_chat_to_responses(chat_resp, model, name_map=None)` (`mapping.py:2626` et `2716`)
+restituent `function_call.name` via `restore_tool_name` — **symétrie exacte** avec les jumelles
+`_responses_to_chat_response` / `_responses_to_anthropic_response`, aucune table nouvelle.
+`opencode.py:13886` extrait la carte de la clé privée existante (`_TOOL_NAME_MAP_KEY`) et la
+propage aux **7 sites** d'appel.
+
+**Témoin + mutations.** `tests/test_trou3_a8_responses_restore.py` (5 cas, harnais E2E ASGI,
+zéro réseau) ; le témoin P5 asserte que le client reçoit **son** nom d'origine, pas celui de
+l'amont. Trois mutations, chacune annulée et vérifiée au sha256 :
+**MUT-A** (restauration neutralisée dans `openai_chat_to_responses`) → **mord** : c'est ce
+point-là qui porte la preuve. **MUT-C** (extraction de la carte neutralisée) → **mord**.
+**MUT-B** (même neutralisation dans `anthropic_to_openai_responses`) → **ne mord pas**, et
+c'est déclaré : la symétrie est posée, mais comme P6 ne construit aucune map, ce point est
+**aujourd'hui inerte** — le témoin P6 ne pourra mordre qu'après correction de l'aller P6.
+
+**Écarts mesurés, non corrigés, et pourquoi.**
+
+1. **P6, aller** : le nom part **verbatim** (78 car.) vers un amont Anthropic. L'amont tolère
+   200 caractères, donc rien ne casse — mais A8 est **absent de cette jambe**. Trou distinct,
+   hors périmètre de ce correctif, et laissé ouvert plutôt que masqué.
+2. **Amont P5 en Responses natif** : le handler passe `data` verbatim, le convertisseur est
+   court-circuité — les noms ne sont pas restaurés non plus. Testé en caractérisation.
+3. **P5 en streaming** : le collecteur ne garde que `content`/`reasoning_content` du flux Chat
+   amont, donc un `tool_calls` d'amont **n'atteint jamais** la réponse convertie (mesuré :
+   `output: []`). Aucun témoin streaming n'est donc possible **avant** ce correctif-là — et
+   c'est un défaut à part entière, pas une simple limite de test.
+
+**Limite de méthode.** Tout est hermétique : aucun de ces tests ne parle à un vrai amont.
+
+### 12.16 Trous encore ouverts à cette date
+
+| Trou | État | Où |
+|---|---|---|
+| 2 — A8 noms d'outils sur P3 | **fermé** (§12.11) — l'aide existait mais était du **code mort** | `opencode.py:11476`, `mapping.py:3106/3134` |
+| 3 — A8 restauration des noms sur P5 (`name_map`) | **fermé** (§12.15) — l'aller P5 raccourcissait bien, c'est le retour qui ne restaurait pas ; **P6 aller reste verbatim** (trou distinct, mesuré) | `mapping.py:2626/2716`, 7 sites `opencode.py` |
+| 5 — témoins P6 (orphelin + signature) | **fermé** (§12.6) | `tests/test_p6_orphan_and_thinking.py` |
+| 6 — P2 → `/responses` | **fermé** (§12.12) : 1 témoin vert + 1 `xfail` (cadrage SSE du repli), 2 défauts neufs dont 1 corrigé | `tests/test_e2e_protocol_matrix.py` |
+| 7 — axe « jambe free » | **fermé** (§12.13) — seul l'effort manquait ; corrigé avec témoin qui mord | `opencode.py:6220-6253` |
+| 9 — A11 : P5/P6 bufferisés | **ouvert, mesuré en live** (ratio TTFB/total = 1,00, §12.14) — exige un convertisseur SSE→SSE Responses neuf | `opencode.py` |
+| 12 — aucun golden P3 | **fermé** (§12.7) | — |
+| 13 — jambe free de P6 sans test | **fermé** (§12.8) | `tests/test_e2e_protocol_matrix.py` |
+| 14 — `stop`/`stream_options` perdus vers `/responses` | **mesuré**, à trancher contre spec (§12.7) | `mapping.py:3267` |
+| 15 — P6-stream : 503 au lieu de la jambe free | **fermé** (§12.9) | `opencode.py` (handler `responses`) |
+
+Écarts **neufs**, trouvés par ces travaux, **mesurés et laissés ouverts** — ils ne figuraient pas
+dans les 13 trous de départ, et aucun n'est maquillé en correction :
+
+| Écart | État | Où |
+|---|---|---|
+| A8 sur **P6, aller** : le nom d'outil part **verbatim** (78 car.) vers un amont Anthropic, aucune map n'est construite | **mesuré, ouvert** ; l'amont tolère 200 car., donc rien ne casse | `opencode.py` (aller P6) |
+| P5 quand l'amont est en **Responses natif** : le handler passe `data` verbatim, le convertisseur est court-circuité | **mesuré, ouvert** (caractérisé par un test) | `opencode.py` (handler `responses`) |
+| P5 en **streaming** : le collecteur ne garde que `content`/`reasoning_content`, un `tool_calls` d'amont n'atteint jamais la réponse (mesuré : `output: []`) | **mesuré, ouvert** — empêche aussi tout témoin streaming du trou 3 | `opencode.py` (collecteur P5) |
+| Repli **P2 streaming** : rendu en `application/json` sans consulter `is_stream` (le 503 mensonger est corrigé, le cadrage SSE non) | **mesuré, ouvert** — `xfail` déclaré | `opencode.py:10051-10067` |
+| **Comptabilité de tokens** de la jambe free `/responses` : lit `prompt_tokens` sur une charge qui porte `input_tokens` → compte **0** (contenu correct) | **mesuré, ouvert** — non corrigé faute de témoin | `opencode.py:10026-10027` |
+
+Ce tableau est tenu à jour : un trou n'est déclaré fermé que lorsque le témoin **mord**.
+
+---
+
+### 12.17 Verdicts finaux des trous 1 et 9 — deux refus argumentés
+
+Ces deux trous ont été repris par des agents dédiés, avec l'exigence explicite : un livrable
+prouvé, ou un refus argumenté — jamais un faux correctif. Les deux ont conclu au refus, mesures
+à l'appui.
+
+**TROU 9 (A11, P5/P6 bufferisés) — le correctif borné est IMPOSSIBLE, et l'aurait été
+nuisible.** Le correctif a d'abord été écrit (helper de flux + ping initial, les 4 sites SSE
+reliés), puis **mesuré en HTTP réel** (uvicorn en thread, socket brute, amont bloqué sur un
+`threading.Event`) : **TTFB/total reste 1,00 sur P5 comme sur P6**. La cause racine a été tracée
+par instrumentation du constructeur `StreamingResponse` dans l'application réelle : il n'est créé
+qu'à **t = 625 ms**, soit *après* la libération de l'amont à 610 ms. Le handler n'atteint jamais
+son `return` avant la fin de la génération (P5 bloqué dans la boucle `aiter_lines`, P6 dans
+`resp.json()`), donc **l'objet réponse n'existe pas encore** au moment où il faudrait émettre :
+remplacer `Response` par `StreamingResponse` ne peut rien y changer.
+
+Le refus ne tient pas seulement à l'inefficacité. Le ping, émis en fin de génération, aurait
+**remis à zéro le watchdog TTFB et les timeouts idle de la jambe amont** : il aurait donc
+**masqué** les blocages que ces garde-fous existent pour détecter. Un correctif qui dégrade
+l'observabilité en prétendant l'améliorer justifie le refus.
+
+**Défaut neuf, mesuré au passage :** `resp.json()` est appelé **sans `await`** (`opencode.py`),
+exécution donc **synchrone sur la boucle d'événements** — le harnais ASGI de l'agent a été
+**gelé** par cet appel. C'est un défaut distinct du trou 9, et il bloquerait de toute façon
+l'émission d'un ping côté P6.
+
+**Ce qu'exigerait un vrai correctif (déduit, chiffré).** Rendre le handler *paresseux* :
+construire la réponse et ses en-têtes **avant** l'appel amont, puis déplacer toute la
+collecte/conversion/journalisation dans un générateur consommé par la réponse. Cela entre en
+contradiction avec les `return` de mi-parcours et les branches d'erreur (`AllKeysPausedError`,
+`FreeRefusal`, `UpstreamError`) qui renvoient aujourd'hui des 4xx/5xx propres — en-têtes déjà
+partis, ces réponses ne sont plus possibles. **2 des 4 sites** sont concernés directement ; P6
+exige en plus la correction de l'appel bloquant. C'est le chantier qui avait été mis hors
+périmètre, et il le reste : il est maintenant décrit, borné, et non fait — dit tel quel.
+
+Le témoin construit (harnais ASGI piloté directement, assertion d'**ordre causal** et jamais de
+durée, car `TestClient` bufferise la réponse entière et ne peut pas exprimer un ordre causal)
+**échoue avec le correctif appliqué** : `2 failed, 2 passed`, « aucun octet n'est parti avant la
+libération de l'amont ». Autrement dit le témoin **réfute** le correctif. Aucun témoin vert n'a
+été fabriqué, et aucune section mutation n'a été inventée pour un correctif inexistant.
+
+**TROU 1 (A27) — aucun témoin ne peut mordre sur ce commit, et le témoin existant est
+complice.** Deux mesures décisives. (1) Restaurer le défaut d'origine (l'écrasement des en-têtes
+par `None`) aux **14 sites** ne fait échouer **aucun** test : 78 passed / 1 xfailed, identique au
+run pristine. (2) Une sonde instrumentée juste avant la garde montre que `a_headers` y est
+**toujours un `dict`**, jamais `None` — alors qu'une sentinelle `if True:` au même endroit casse
+6 tests, ce qui prouve que le **site** est bien atteint.
+
+La raison est structurelle : `_get_auth_headers` rend toujours un `dict` ; la seule affectation
+qui mettrait `None` dans le créneau d'en-têtes du handler `messages` vit **dans** le
+`except AllKeysPausedError`, branche qui **retourne sur tous ses chemins**. Atteindre la garde
+suppose donc que l'authentification a réussi, c'est-à-dire que `a_headers` est un `dict` : **les
+deux conditions de la garde sont mutuellement exclusives**, le corps de la garde est du code
+**non atteint** sur ce commit.
+
+Le témoin A27 existant ne verrouille rien : il fait rendre un tuple non-`None` à la jambe free,
+le handler répond **200 sans jamais consulter la garde**, et le test **passe sous toutes les
+mutations**, y compris celle qui rétablit le défaut d'origine. C'est un test complice, mesuré.
+
+**Remédiation, côté correctif et non côté test** (proposée par la mesure) : soit normaliser le
+cas « aucune clé » dans le `except AllKeysPausedError` du handler `messages` en posant
+`a_headers = None` avant le retour, pour que la garde teste une valeur **réellement produite** au
+lieu d'une variable non liée ; soit coupler la garde à `_get_auth_headers` sur les 13 autres
+sites.
+
+**Conséquence, dite sans détour : l'exigence « une correction = un test qui échoue sans elle »
+reste INSATISFAITE pour A27.** Le correctif antérieur a bien supprimé la cause racine, mais la
+garde ajoutée en « défense en profondeur » est indéfendable en l'état, et le trou 1 reste
+**ouvert** — non par manque d'essai, mais parce que l'arbre committé ne permet plus de le
+déclencher.
+
+**Confirmation indépendante du constat A27, faite sur l'état committé et non sur la foi du
+rapport d'agent.** La question décisive est : `a_headers` peut-il seulement valoir `None` à
+l'endroit de la garde ? Réponse au niveau du code, par énumération exhaustive :
+
+- `_get_auth_headers` (L318) a exactement **deux** `return`, tous deux des **`dict`** (L323,
+  L328) — jamais `None` ;
+- les **14 affectations** à `a_headers` du fichier viennent de `_get_auth_headers`,
+  de `dict(resp.headers)`, d'un dépouillement de tuple ou d'un littéral `dict` : **aucune**
+  n'assigne `None`. La ligne d'écrasement d'origine, celle qui produisait le 500, **n'existe
+  plus**.
+
+Conséquence : à la garde `if a_headers is None and resp.status_code != 200:`, la première
+condition est **toujours fausse**. Le corps de la garde est **inatteignable** — ce n'est pas une
+garde difficile à déclencher, c'est du code mort.
+
+**Ce que cela change, et une correction de notre propre analyse.** La remédiation proposée plus
+haut (« poser `a_headers = None` avant le retour de la branche `except AllKeysPausedError` ») est
+**inexacte** : cette branche retourne sur tous ses chemins, la garde n'est donc pas atteinte depuis
+elle ; l'assignation déplacerait du code mort sans le rendre vivant. Elle est corrigée ici plutôt
+que laissée dans le plan comme une piste valable.
+
+**Verdict A27, définitif sur cet arbre** : le défaut est **corrigé à la racine** (plus aucun
+écrasement par `None`), la garde de défense en profondeur est **structurellement morte**, et donc
+**aucun témoin ne peut mordre** : il faudrait réintroduire artificiellement l'état interdit pour
+que la garde devienne testable. Deux issues honnêtes, au choix du propriétaire du dépôt : soit
+**retirer** la garde morte, soit la remplacer par une assertion d'invariant sur `_get_auth_headers`.
+Tant que ce choix n'est pas fait, le trou 1 reste **ouvert** — non par insuffisance d'essais, mais
+parce que l'exigence « un test qui échoue sans la correction » n'a plus d'objet mesurable ici.
+
+**Suite (tours 31-32) — TROU 1 FERMÉ, et une démonstration que j'ai dû corriger.** Le constat
+« la garde est inatteignable » était juste, mais la preuve que j'avais produite ne l'était pas :
+elle reposait sur un grephe du motif `a_headers\s*=`, qui **ne matche pas** un dépouillement de
+tuple. La démonstration valable vient de la lecture du site réel : ligne 12755, le résultat de la
+jambe free est dépouillé en `resp, _, _actual_model, _actual_ip` — le créneau d'en-têtes part dans
+`_`, il ne peut donc **jamais** parvenir à `a_headers`. Confirmé par ailleurs : `_get_auth_headers`
+(L318) n'a que deux `return`, tous deux des `dict`, et aucune affectation n'écrit `None`.
+
+**Ce qui a été corrigé, et pourquoi c'est une correction et pas un contournement :** le commentaire
+qui affirmait « `a_headers` peut valoir None » disait **faux** — c'est le type d'affirmation périmée
+que cet audit traque partout ailleurs, et elle vivait dans le code de production. Il est remplacé
+par ce que le correctif a réellement fermé : le dépouillement en `_` (L12755) et le ternaire
+`if a_headers else "?"`, qui est la protection **réellement atteignable**. La branche `if a_headers
+is None` a été **retirée** : elle était inatteignable, et la laisser faisait croire à une défense
+qui ne peut pas se déclencher. Le commentaire explique désormais pourquoi elle a été retirée, et
+que si un `None` revenait un jour dans ce créneau, c'est le ternaire qu'il faudrait tester.
+
+La suppression est **prouvée sans effet de bord** : la condition étant toujours fausse, retirer la
+branche ne peut rien changer — et les 9 tests de la zone passent, plus 1 xfailed, AST et ruff
+propres. Les trois docstrings de test qui décrivaient l'ancien mécanisme comme s'il était courant
+ont été rectifiées : elles disent maintenant que le `None` ne parvient jamais à `a_headers`, que le
+503 observé vient de la traduction « clés en pause » en 503 retryable, et que ces tests **ne
+prouvent pas** la garde.
+
+**Ce que cela ne prétend pas.** L'exigence « un test qui échoue sans la correction » reste sans
+objet pour A27 : le défaut d'origine n'est plus atteignable, donc aucun test ne peut le distinguer
+d'un état sain. C'est écrit plutôt que coché. Le trou est fermé au sens où le code ne porte plus
+d'affirmation fausse ni de défense fantôme ; il ne l'est pas au sens d'un témoin mordant, qui
+resterait impossible.
+
+
+*
+*
+S
+u
+i
+t
+e
+ 
+(
+t
+o
+u
+r
+s
+ 
+3
+3
+-
+4
+0
+)
+ 
+—
+ 
+A
+1
+1
+,
+ 
+d
+é
+f
+a
+u
+t
+ 
+b
+o
+r
+n
+é
+ 
+:
+ 
+C
+O
+R
+R
+I
+G
+É
+ 
+e
+t
+ 
+p
+r
+o
+u
+v
+é
+,
+ 
+a
+p
+r
+è
+s
+ 
+u
+n
+ 
+é
+c
+h
+e
+c
+ 
+i
+n
+s
+t
+r
+u
+c
+t
+i
+f
+.
+*
+*
+
+
+
+
+L
+e
+ 
+d
+é
+f
+a
+u
+t
+ 
+:
+ 
+d
+a
+n
+s
+ 
+l
+e
+ 
+h
+a
+n
+d
+l
+e
+r
+ 
+`
+/
+v
+1
+/
+r
+e
+s
+p
+o
+n
+s
+e
+s
+`
+ 
+(
+`
+a
+s
+y
+n
+c
+ 
+d
+e
+f
+ 
+r
+e
+s
+p
+o
+n
+s
+e
+s
+`
+,
+ 
+d
+o
+n
+t
+ 
+l
+e
+ 
+d
+é
+c
+o
+r
+a
+t
+e
+u
+r
+ 
+e
+s
+t
+
+
+`
+@
+a
+p
+p
+.
+p
+o
+s
+t
+(
+"
+/
+v
+1
+/
+r
+e
+s
+p
+o
+n
+s
+e
+s
+"
+)
+`
+)
+,
+ 
+l
+e
+ 
+c
+o
+r
+p
+s
+ 
+a
+m
+o
+n
+t
+ 
+é
+t
+a
+i
+t
+ 
+p
+a
+r
+s
+é
+ 
+p
+a
+r
+ 
+`
+r
+e
+s
+p
+.
+j
+s
+o
+n
+(
+)
+`
+ 
+*
+*
+d
+e
+ 
+f
+a
+ç
+o
+n
+ 
+s
+y
+n
+c
+h
+r
+o
+n
+e
+*
+*
+,
+
+
+d
+o
+n
+c
+ 
+s
+u
+r
+ 
+l
+a
+ 
+b
+o
+u
+c
+l
+e
+ 
+d
+'
+é
+v
+é
+n
+e
+m
+e
+n
+t
+s
+.
+ 
+C
+e
+ 
+c
+o
+r
+p
+s
+ 
+p
+e
+u
+t
+ 
+ê
+t
+r
+e
+ 
+*
+*
+t
+o
+u
+t
+ 
+u
+n
+ 
+f
+l
+u
+x
+ 
+S
+S
+E
+ 
+a
+c
+c
+u
+m
+u
+l
+é
+*
+*
+ 
+:
+ 
+l
+e
+ 
+g
+e
+l
+ 
+c
+r
+o
+î
+t
+ 
+a
+v
+e
+c
+
+
+s
+a
+ 
+t
+a
+i
+l
+l
+e
+,
+ 
+e
+t
+ 
+u
+n
+ 
+h
+a
+r
+n
+a
+i
+s
+ 
+A
+S
+G
+I
+ 
+a
+v
+a
+i
+t
+ 
+é
+t
+é
+ 
+f
+i
+g
+é
+ 
+p
+a
+r
+ 
+c
+e
+t
+ 
+a
+p
+p
+e
+l
+.
+
+
+
+
+L
+e
+ 
+c
+o
+r
+r
+e
+c
+t
+i
+f
+ 
+:
+ 
+u
+n
+e
+ 
+a
+i
+d
+e
+ 
+`
+_
+r
+e
+s
+p
+_
+j
+s
+o
+n
+_
+h
+o
+r
+s
+_
+b
+o
+u
+c
+l
+e
+(
+r
+e
+s
+p
+)
+`
+ 
+q
+u
+i
+ 
+d
+é
+p
+l
+a
+c
+e
+ 
+l
+e
+ 
+p
+a
+r
+s
+e
+ 
+d
+a
+n
+s
+ 
+u
+n
+ 
+t
+h
+r
+e
+a
+d
+ 
+v
+i
+a
+
+
+`
+a
+s
+y
+n
+c
+i
+o
+.
+t
+o
+_
+t
+h
+r
+e
+a
+d
+`
+ 
+(
+p
+r
+é
+c
+é
+d
+e
+n
+t
+ 
+d
+é
+j
+à
+ 
+é
+t
+a
+b
+l
+i
+ 
+d
+a
+n
+s
+ 
+l
+e
+ 
+m
+o
+d
+u
+l
+e
+)
+.
+ 
+C
+o
+m
+p
+o
+r
+t
+e
+m
+e
+n
+t
+ 
+s
+t
+r
+i
+c
+t
+e
+m
+e
+n
+t
+ 
+i
+d
+e
+n
+t
+i
+q
+u
+e
+ 
+:
+ 
+m
+ê
+m
+e
+
+
+J
+S
+O
+N
+,
+ 
+m
+ê
+m
+e
+s
+ 
+e
+x
+c
+e
+p
+t
+i
+o
+n
+s
+,
+ 
+m
+ê
+m
+e
+ 
+5
+0
+2
+,
+ 
+e
+t
+ 
+l
+e
+ 
+c
+a
+s
+ 
+«
+ 
+c
+o
+n
+t
+e
+n
+t
+-
+t
+y
+p
+e
+ 
+n
+o
+n
+ 
+J
+S
+O
+N
+ 
+-
+>
+ 
+`
+{
+}
+`
+ 
+»
+ 
+p
+r
+é
+s
+e
+r
+v
+é
+,
+ 
+v
+e
+r
+r
+o
+u
+i
+l
+l
+é
+ 
+p
+a
+r
+
+
+u
+n
+ 
+t
+e
+s
+t
+ 
+d
+o
+n
+t
+ 
+l
+e
+ 
+p
+a
+r
+s
+e
+u
+r
+ 
+l
+è
+v
+e
+ 
+s
+'
+i
+l
+ 
+e
+s
+t
+ 
+a
+p
+p
+e
+l
+é
+.
+
+
+
+
+*
+*
+L
+e
+ 
+t
+é
+m
+o
+i
+n
+ 
+e
+s
+t
+ 
+c
+a
+u
+s
+a
+l
+,
+ 
+p
+a
+s
+ 
+t
+e
+m
+p
+o
+r
+e
+l
+*
+*
+ 
+:
+ 
+l
+e
+ 
+d
+o
+u
+b
+l
+e
+ 
+s
+i
+g
+n
+a
+l
+e
+ 
+s
+o
+n
+ 
+e
+n
+t
+r
+é
+e
+ 
+d
+a
+n
+s
+ 
+l
+e
+ 
+p
+a
+r
+s
+e
+ 
+p
+u
+i
+s
+ 
+a
+t
+t
+e
+n
+d
+ 
+u
+n
+
+
+`
+t
+h
+r
+e
+a
+d
+i
+n
+g
+.
+E
+v
+e
+n
+t
+`
+ 
+;
+ 
+u
+n
+e
+ 
+v
+e
+i
+l
+l
+e
+ 
+n
+'
+i
+n
+c
+r
+é
+m
+e
+n
+t
+e
+ 
+q
+u
+'
+*
+*
+a
+p
+r
+è
+s
+*
+*
+ 
+c
+e
+t
+t
+e
+ 
+e
+n
+t
+r
+é
+e
+.
+ 
+A
+v
+e
+c
+ 
+l
+e
+ 
+c
+o
+r
+r
+e
+c
+t
+i
+f
+ 
+l
+a
+ 
+b
+o
+u
+c
+l
+e
+ 
+r
+e
+s
+t
+e
+
+
+l
+i
+b
+r
+e
+ 
+e
+t
+ 
+l
+a
+ 
+v
+e
+i
+l
+l
+e
+ 
+p
+r
+o
+g
+r
+e
+s
+s
+e
+ 
+;
+ 
+a
+v
+e
+c
+ 
+l
+e
+ 
+p
+a
+r
+s
+e
+ 
+s
+y
+n
+c
+h
+r
+o
+n
+e
+ 
+l
+'
+e
+n
+t
+r
+é
+e
+ 
+a
+ 
+l
+i
+e
+u
+ 
+s
+u
+r
+ 
+l
+a
+ 
+b
+o
+u
+c
+l
+e
+,
+ 
+g
+e
+l
+é
+e
+,
+ 
+e
+t
+ 
+l
+a
+
+
+v
+e
+i
+l
+l
+e
+ 
+n
+e
+ 
+p
+e
+u
+t
+ 
+p
+l
+u
+s
+ 
+s
+'
+e
+x
+é
+c
+u
+t
+e
+r
+.
+ 
+A
+u
+c
+u
+n
+ 
+s
+e
+u
+i
+l
+ 
+d
+e
+ 
+d
+u
+r
+é
+e
+,
+ 
+a
+u
+c
+u
+n
+ 
+`
+s
+l
+e
+e
+p
+`
+ 
+d
+e
+ 
+s
+y
+n
+c
+h
+r
+o
+n
+i
+s
+a
+t
+i
+o
+n
+,
+ 
+c
+h
+i
+e
+n
+ 
+d
+e
+ 
+g
+a
+r
+d
+e
+
+
+`
+w
+a
+i
+t
+_
+f
+o
+r
+`
+.
+ 
+S
+o
+r
+t
+i
+e
+ 
+b
+r
+u
+t
+e
+ 
+:
+ 
+V
+E
+R
+T
+,
+ 
+p
+u
+i
+s
+ 
+R
+O
+U
+G
+E
+ 
+s
+o
+u
+s
+ 
+m
+u
+t
+a
+t
+i
+o
+n
+ 
+a
+v
+e
+c
+ 
+`
+a
+s
+s
+e
+r
+t
+ 
+0
+ 
+>
+ 
+0
+`
+ 
+e
+t
+ 
+l
+e
+ 
+m
+e
+s
+s
+a
+g
+e
+ 
+d
+e
+ 
+g
+e
+l
+,
+
+
+p
+u
+i
+s
+ 
+r
+e
+s
+t
+a
+u
+r
+a
+t
+i
+o
+n
+ 
+b
+y
+t
+e
+-
+e
+x
+a
+c
+t
+e
+,
+ 
+p
+u
+i
+s
+ 
+V
+E
+R
+T
+.
+ 
+V
+e
+r
+d
+i
+c
+t
+ 
+o
+u
+t
+i
+l
+l
+é
+ 
+:
+ 
+`
+B
+I
+T
+E
+ 
+:
+ 
+T
+r
+u
+e
+`
+.
+
+
+
+
+*
+*
+L
+'
+é
+c
+h
+e
+c
+ 
+i
+n
+s
+t
+r
+u
+c
+t
+i
+f
+,
+ 
+e
+t
+ 
+l
+'
+e
+r
+r
+e
+u
+r
+ 
+d
+e
+ 
+d
+i
+a
+g
+n
+o
+s
+t
+i
+c
+ 
+q
+u
+e
+ 
+j
+'
+a
+i
+ 
+f
+a
+i
+l
+l
+i
+ 
+c
+o
+m
+m
+e
+t
+t
+r
+e
+.
+*
+*
+ 
+L
+a
+ 
+p
+r
+e
+m
+i
+è
+r
+e
+ 
+t
+e
+n
+t
+a
+t
+i
+v
+e
+ 
+a
+
+
+c
+a
+s
+s
+é
+ 
+*
+*
+2
+6
+ 
+t
+e
+s
+t
+s
+*
+*
+.
+ 
+M
+o
+n
+ 
+h
+y
+p
+o
+t
+h
+è
+s
+e
+ 
+i
+m
+m
+é
+d
+i
+a
+t
+e
+ 
+—
+ 
+«
+ 
+l
+e
+ 
+d
+o
+u
+b
+l
+e
+ 
+d
+e
+ 
+r
+é
+p
+o
+n
+s
+e
+ 
+a
+m
+o
+n
+t
+ 
+d
+e
+ 
+l
+a
+ 
+s
+u
+i
+t
+e
+ 
+n
+e
+ 
+s
+u
+r
+v
+i
+t
+ 
+p
+a
+s
+ 
+a
+u
+
+
+p
+a
+r
+s
+e
+ 
+d
+é
+p
+l
+a
+c
+é
+ 
+d
+a
+n
+s
+ 
+u
+n
+ 
+t
+h
+r
+e
+a
+d
+ 
+»
+ 
+—
+ 
+é
+t
+a
+i
+t
+ 
+*
+*
+f
+a
+u
+s
+s
+e
+*
+*
+.
+ 
+L
+e
+ 
+m
+e
+s
+s
+a
+g
+e
+ 
+d
+'
+é
+c
+h
+e
+c
+ 
+d
+i
+s
+a
+i
+t
+ 
+`
+a
+s
+s
+e
+r
+t
+ 
+4
+2
+2
+ 
+=
+=
+ 
+2
+0
+0
+`
+ 
+:
+ 
+u
+n
+e
+
+
+e
+r
+r
+e
+u
+r
+ 
+d
+e
+ 
+v
+a
+l
+i
+d
+a
+t
+i
+o
+n
+ 
+F
+a
+s
+t
+A
+P
+I
+,
+ 
+d
+o
+n
+c
+ 
+u
+n
+e
+ 
+*
+*
+r
+o
+u
+t
+e
+ 
+p
+e
+r
+d
+u
+e
+*
+*
+.
+ 
+L
+a
+ 
+c
+a
+u
+s
+e
+ 
+r
+é
+e
+l
+l
+e
+ 
+:
+ 
+m
+o
+n
+ 
+s
+c
+r
+i
+p
+t
+ 
+a
+v
+a
+i
+t
+ 
+i
+n
+s
+é
+r
+é
+
+
+l
+'
+a
+i
+d
+e
+ 
+*
+*
+e
+n
+t
+r
+e
+ 
+l
+e
+ 
+d
+é
+c
+o
+r
+a
+t
+e
+u
+r
+ 
+`
+@
+a
+p
+p
+.
+p
+o
+s
+t
+(
+"
+/
+v
+1
+/
+r
+e
+s
+p
+o
+n
+s
+e
+s
+"
+)
+`
+ 
+e
+t
+ 
+s
+a
+ 
+f
+o
+n
+c
+t
+i
+o
+n
+*
+*
+,
+ 
+s
+i
+ 
+b
+i
+e
+n
+ 
+q
+u
+e
+ 
+l
+e
+ 
+d
+é
+c
+o
+r
+a
+t
+e
+u
+r
+
+
+s
+'
+a
+p
+p
+l
+i
+q
+u
+a
+i
+t
+ 
+à
+ 
+l
+'
+a
+i
+d
+e
+ 
+e
+t
+ 
+q
+u
+e
+ 
+l
+e
+ 
+h
+a
+n
+d
+l
+e
+r
+ 
+n
+'
+é
+t
+a
+i
+t
+ 
+p
+l
+u
+s
+ 
+r
+o
+u
+t
+é
+.
+ 
+L
+e
+ 
+c
+o
+r
+r
+e
+c
+t
+i
+f
+ 
+é
+t
+a
+i
+t
+ 
+s
+a
+i
+n
+ 
+;
+ 
+m
+o
+n
+ 
+p
+o
+i
+n
+t
+
+
+d
+'
+i
+n
+s
+e
+r
+t
+i
+o
+n
+ 
+n
+e
+ 
+l
+'
+é
+t
+a
+i
+t
+ 
+p
+a
+s
+.
+ 
+L
+'
+a
+i
+d
+e
+ 
+e
+s
+t
+ 
+d
+é
+s
+o
+r
+m
+a
+i
+s
+ 
+p
+l
+a
+c
+é
+e
+ 
+*
+*
+e
+n
+ 
+f
+i
+n
+ 
+d
+e
+ 
+m
+o
+d
+u
+l
+e
+*
+*
+,
+ 
+a
+v
+e
+c
+ 
+u
+n
+ 
+c
+o
+m
+m
+e
+n
+t
+a
+i
+r
+e
+
+
+e
+x
+p
+l
+i
+q
+u
+a
+n
+t
+ 
+p
+o
+u
+r
+q
+u
+o
+i
+ 
+c
+e
+t
+ 
+e
+m
+p
+l
+a
+c
+e
+m
+e
+n
+t
+ 
+e
+s
+t
+ 
+r
+e
+q
+u
+i
+s
+,
+ 
+p
+o
+u
+r
+ 
+q
+u
+e
+ 
+p
+e
+r
+s
+o
+n
+n
+e
+ 
+n
+e
+ 
+l
+a
+ 
+«
+ 
+r
+a
+n
+g
+e
+ 
+»
+ 
+a
+u
+ 
+m
+a
+u
+v
+a
+i
+s
+ 
+e
+n
+d
+r
+o
+i
+t
+.
+
+
+L
+e
+ç
+o
+n
+ 
+r
+e
+t
+e
+n
+u
+e
+ 
+:
+ 
+u
+n
+e
+ 
+h
+y
+p
+o
+t
+h
+è
+s
+e
+ 
+p
+l
+a
+u
+s
+i
+b
+l
+e
+ 
+n
+e
+ 
+r
+e
+m
+p
+l
+a
+c
+e
+ 
+p
+a
+s
+ 
+l
+a
+ 
+l
+e
+c
+t
+u
+r
+e
+ 
+d
+u
+ 
+m
+e
+s
+s
+a
+g
+e
+ 
+d
+'
+é
+c
+h
+e
+c
+.
+
+
+
+
+*
+*
+C
+e
+ 
+q
+u
+i
+ 
+r
+e
+s
+t
+e
+ 
+o
+u
+v
+e
+r
+t
+,
+ 
+e
+t
+ 
+d
+é
+c
+l
+a
+r
+é
+ 
+t
+e
+l
+ 
+q
+u
+e
+l
+ 
+:
+*
+*
+ 
+l
+e
+ 
+c
+h
+a
+n
+t
+i
+e
+r
+ 
+d
+e
+ 
+f
+o
+n
+d
+ 
+—
+ 
+P
+5
+/
+P
+6
+ 
+é
+m
+e
+t
+t
+e
+n
+t
+ 
+l
+e
+u
+r
+ 
+S
+S
+E
+ 
+e
+n
+t
+i
+è
+r
+e
+m
+e
+n
+t
+
+
+b
+u
+f
+f
+e
+r
+i
+s
+é
+,
+ 
+d
+o
+n
+c
+ 
+T
+T
+F
+B
+ 
+=
+ 
+g
+é
+n
+é
+r
+a
+t
+i
+o
+n
+ 
+t
+o
+t
+a
+l
+e
+ 
+—
+ 
+r
+e
+s
+t
+e
+ 
+h
+o
+r
+s
+ 
+p
+é
+r
+i
+m
+è
+t
+r
+e
+ 
+(
+h
+a
+n
+d
+l
+e
+r
+ 
+p
+a
+r
+e
+s
+s
+e
+u
+x
+ 
+e
+t
+ 
+r
+e
+f
+o
+n
+t
+e
+ 
+d
+e
+s
+
+
+b
+r
+a
+n
+c
+h
+e
+s
+ 
+d
+'
+e
+r
+r
+e
+u
+r
+)
+.
+ 
+`
+r
+e
+s
+p
+.
+j
+s
+o
+n
+(
+)
+`
+ 
+a
+p
+p
+e
+l
+é
+ 
+s
+a
+n
+s
+ 
+`
+a
+w
+a
+i
+t
+`
+ 
+a
+i
+l
+l
+e
+u
+r
+s
+ 
+d
+a
+n
+s
+ 
+l
+e
+ 
+m
+ê
+m
+e
+ 
+h
+a
+n
+d
+l
+e
+r
+ 
+:
+ 
+s
+i
+g
+n
+a
+l
+é
+,
+ 
+n
+o
+n
+
+
+c
+o
+r
+r
+i
+g
+é
+.
+ 
+E
+t
+ 
+l
+e
+ 
+m
+o
+t
+i
+f
+ 
+d
+e
+ 
+p
+a
+r
+s
+e
+ 
+s
+y
+n
+c
+h
+r
+o
+n
+e
+ 
+e
+x
+i
+s
+t
+e
+ 
+à
+ 
+*
+*
+q
+u
+a
+t
+r
+e
+*
+*
+ 
+s
+i
+t
+e
+s
+ 
+(
+L
+6
+8
+0
+0
+,
+ 
+L
+1
+0
+2
+8
+4
+,
+ 
+L
+1
+2
+8
+8
+3
+ 
+e
+t
+ 
+l
+e
+ 
+s
+i
+t
+e
+ 
+A
+1
+1
+
+
+L
+1
+4
+0
+1
+4
+)
+ 
+:
+ 
+s
+e
+u
+l
+ 
+L
+1
+4
+0
+1
+4
+ 
+e
+s
+t
+ 
+c
+o
+r
+r
+i
+g
+é
+,
+ 
+l
+e
+s
+ 
+t
+r
+o
+i
+s
+ 
+j
+u
+m
+e
+a
+u
+x
+ 
+s
+o
+n
+t
+ 
+d
+e
+s
+ 
+r
+é
+p
+o
+n
+s
+e
+s
+ 
+n
+o
+n
+-
+s
+t
+r
+e
+a
+m
+é
+e
+s
+ 
+d
+o
+n
+t
+ 
+j
+e
+ 
+n
+'
+a
+i
+ 
+p
+a
+s
+
+
+m
+e
+s
+u
+r
+é
+ 
+l
+a
+ 
+t
+a
+i
+l
+l
+e
+ 
+d
+e
+ 
+c
+o
+r
+p
+s
+.
+
+
+#
+#
+#
+ 
+V
+e
+r
+d
+i
+c
+t
+ 
+d
+e
+ 
+g
+a
+t
+e
+ 
+s
+u
+r
+ 
+l
+'
+e
+t
+a
+t
+ 
+c
+o
+m
+m
+i
+t
+t
+e
+ 
+(
+t
+o
+u
+r
+ 
+4
+1
+)
+
+
+
+
+L
+a
+ 
+g
+a
+t
+e
+ 
+a
+ 
+e
+t
+e
+ 
+m
+e
+s
+u
+r
+e
+e
+ 
+s
+u
+r
+ 
+l
+e
+ 
+c
+o
+m
+m
+i
+t
+ 
+`
+0
+6
+d
+c
+f
+b
+e
+`
+ 
+d
+a
+n
+s
+ 
+u
+n
+ 
+*
+*
+w
+o
+r
+k
+t
+r
+e
+e
+ 
+d
+e
+t
+a
+c
+h
+e
+ 
+p
+r
+o
+p
+r
+e
+,
+ 
+h
+o
+r
+s
+ 
+d
+u
+ 
+d
+e
+p
+o
+t
+*
+*
+
+
+(
+`
+C
+:
+\
+U
+s
+e
+r
+s
+\
+j
+u
+l
+i
+e
+\
+D
+o
+w
+n
+l
+o
+a
+d
+s
+\
+o
+p
+e
+n
+c
+o
+d
+e
+-
+a
+1
+1
+-
+g
+a
+t
+e
+`
+)
+,
+ 
+p
+a
+r
+c
+e
+ 
+q
+u
+'
+u
+n
+e
+ 
+*
+*
+a
+u
+t
+r
+e
+ 
+s
+e
+s
+s
+i
+o
+n
+ 
+t
+r
+a
+v
+a
+i
+l
+l
+a
+i
+t
+ 
+e
+n
+ 
+p
+a
+r
+a
+l
+l
+e
+l
+e
+
+
+d
+a
+n
+s
+ 
+l
+'
+a
+r
+b
+r
+e
+ 
+p
+r
+i
+n
+c
+i
+p
+a
+l
+*
+*
+ 
+:
+ 
+y
+ 
+m
+e
+s
+u
+r
+e
+r
+ 
+a
+u
+r
+a
+i
+t
+ 
+m
+e
+l
+a
+n
+g
+e
+ 
+d
+e
+u
+x
+ 
+c
+o
+d
+e
+b
+a
+s
+e
+s
+ 
+e
+t
+ 
+l
+e
+ 
+v
+e
+r
+d
+i
+c
+t
+ 
+n
+'
+a
+u
+r
+a
+i
+t
+ 
+r
+i
+e
+n
+ 
+p
+r
+o
+u
+v
+e
+.
+
+
+
+
+R
+e
+s
+u
+l
+t
+a
+t
+,
+ 
+e
+t
+a
+p
+e
+ 
+p
+a
+r
+ 
+e
+t
+a
+p
+e
+ 
+:
+ 
+r
+u
+f
+f
+ 
+O
+K
+ 
+;
+ 
+m
+y
+p
+y
+ 
+O
+K
+ 
+;
+ 
+p
+y
+t
+e
+s
+t
+ 
+*
+*
+p
+a
+s
+s
+e
+*
+*
+ 
+(
+2
+0
+7
+8
+ 
+t
+e
+s
+t
+s
+,
+ 
+2
+3
+ 
+d
+e
+s
+e
+l
+e
+c
+t
+i
+o
+n
+n
+e
+s
+,
+ 
+1
+ 
+s
+k
+i
+p
+,
+
+
+1
+ 
+x
+f
+a
+i
+l
+,
+ 
+c
+o
+u
+v
+e
+r
+t
+u
+r
+e
+ 
+6
+1
+,
+4
+9
+ 
+%
+ 
+p
+o
+u
+r
+ 
+u
+n
+ 
+s
+e
+u
+i
+l
+ 
+d
+e
+ 
+4
+5
+ 
+%
+)
+ 
+;
+ 
+b
+e
+n
+c
+h
+ 
+*
+*
+O
+K
+*
+*
+ 
+(
+t
+o
+u
+t
+e
+s
+ 
+m
+e
+t
+r
+i
+q
+u
+e
+s
+ 
+d
+a
+n
+s
+ 
+l
+e
+s
+ 
+b
+u
+d
+g
+e
+t
+s
+)
+ 
+;
+
+
+p
+i
+p
+-
+a
+u
+d
+i
+t
+ 
+*
+*
+O
+K
+*
+*
+ 
+(
+a
+u
+c
+u
+n
+e
+ 
+v
+u
+l
+n
+e
+r
+a
+b
+i
+l
+i
+t
+e
+ 
+c
+o
+n
+n
+u
+e
+)
+ 
+;
+ 
+g
+i
+t
+l
+e
+a
+k
+s
+ 
+i
+g
+n
+o
+r
+e
+ 
+(
+b
+i
+n
+a
+i
+r
+e
+ 
+a
+b
+s
+e
+n
+t
+)
+ 
+;
+ 
+`
+d
+o
+c
+k
+e
+r
+ 
+c
+o
+m
+p
+o
+s
+e
+ 
+c
+o
+n
+f
+i
+g
+
+
+-
+-
+q
+u
+i
+e
+t
+`
+ 
+*
+*
+O
+K
+*
+*
+.
+
+
+
+
+D
+e
+u
+x
+ 
+e
+c
+h
+e
+c
+s
+ 
+s
+o
+n
+t
+ 
+a
+p
+p
+a
+r
+u
+s
+ 
+a
+u
+ 
+p
+r
+e
+m
+i
+e
+r
+ 
+p
+a
+s
+s
+a
+g
+e
+,
+ 
+t
+o
+u
+s
+ 
+d
+e
+u
+x
+ 
+*
+*
+a
+r
+t
+e
+f
+a
+c
+t
+s
+ 
+d
+e
+ 
+l
+'
+i
+s
+o
+l
+e
+m
+e
+n
+t
+,
+ 
+p
+a
+s
+ 
+d
+e
+f
+a
+u
+t
+s
+ 
+d
+u
+ 
+c
+o
+d
+e
+*
+*
+,
+
+
+e
+t
+ 
+c
+h
+a
+c
+u
+n
+ 
+d
+e
+m
+o
+n
+t
+r
+e
+ 
+p
+a
+r
+ 
+s
+o
+n
+ 
+p
+r
+o
+p
+r
+e
+ 
+m
+e
+s
+s
+a
+g
+e
+ 
+d
+'
+e
+r
+r
+e
+u
+r
+ 
+:
+
+
+
+
+-
+ 
+`
+t
+e
+s
+t
+s
+/
+t
+e
+s
+t
+_
+t
+o
+o
+l
+_
+s
+c
+h
+e
+m
+a
+_
+s
+t
+r
+i
+c
+t
+.
+p
+y
+`
+ 
+(
+2
+ 
+t
+e
+s
+t
+s
+)
+ 
+:
+ 
+`
+d
+u
+m
+p
+ 
+l
+o
+g
+s
+/
+f
+r
+e
+e
+4
+0
+0
+_
+m
+s
+g
+_
+.
+.
+.
+j
+s
+o
+n
+ 
+i
+n
+t
+r
+o
+u
+v
+a
+b
+l
+e
+`
+ 
+-
+-
+ 
+c
+e
+s
+ 
+t
+e
+s
+t
+s
+
+
+ 
+ 
+l
+i
+s
+e
+n
+t
+ 
+u
+n
+ 
+f
+i
+c
+h
+i
+e
+r
+ 
+d
+e
+ 
+d
+o
+n
+n
+e
+e
+s
+ 
+q
+u
+e
+ 
+l
+e
+ 
+d
+e
+p
+o
+t
+ 
+c
+o
+n
+t
+i
+e
+n
+t
+ 
+e
+t
+ 
+q
+u
+e
+ 
+l
+e
+ 
+w
+o
+r
+k
+t
+r
+e
+e
+ 
+n
+e
+u
+f
+ 
+n
+'
+a
+v
+a
+i
+t
+ 
+p
+a
+s
+.
+ 
+R
+e
+p
+r
+o
+d
+u
+i
+t
+s
+ 
+a
+
+
+ 
+ 
+l
+'
+i
+d
+e
+n
+t
+i
+q
+u
+e
+ 
+s
+e
+u
+l
+s
+,
+ 
+a
+v
+e
+c
+ 
+m
+o
+n
+ 
+f
+i
+c
+h
+i
+e
+r
+ 
+d
+e
+ 
+t
+e
+s
+t
+ 
+c
+o
+l
+l
+e
+c
+t
+e
+ 
+a
+v
+a
+n
+t
+,
+ 
+p
+u
+i
+s
+ 
+a
+p
+r
+e
+s
+ 
+:
+ 
+n
+i
+ 
+A
+1
+1
+,
+ 
+n
+i
+ 
+u
+n
+ 
+e
+f
+f
+e
+t
+ 
+d
+'
+o
+r
+d
+r
+e
+.
+
+
+ 
+ 
+R
+e
+s
+o
+l
+u
+s
+ 
+e
+n
+ 
+r
+e
+l
+i
+a
+n
+t
+ 
+`
+l
+o
+g
+s
+/
+`
+ 
+p
+a
+r
+ 
+*
+*
+j
+o
+n
+c
+t
+i
+o
+n
+*
+*
+ 
+(
+a
+u
+c
+u
+n
+e
+ 
+c
+o
+p
+i
+e
+ 
+d
+e
+s
+ 
+3
+ 
+G
+o
+)
+ 
+:
+ 
+p
+y
+t
+e
+s
+t
+ 
+p
+a
+s
+s
+e
+ 
+a
+l
+o
+r
+s
+ 
+e
+n
+t
+i
+e
+r
+e
+m
+e
+n
+t
+.
+
+
+-
+ 
+`
+c
+o
+m
+p
+o
+s
+e
+`
+ 
+:
+ 
+`
+e
+n
+v
+ 
+f
+i
+l
+e
+ 
+.
+.
+.
+c
+r
+e
+d
+e
+n
+t
+i
+a
+l
+s
+.
+e
+n
+v
+ 
+n
+o
+t
+ 
+f
+o
+u
+n
+d
+`
+ 
+-
+-
+ 
+f
+i
+c
+h
+i
+e
+r
+ 
+n
+o
+n
+ 
+s
+u
+i
+v
+i
+ 
+p
+a
+r
+ 
+g
+i
+t
+,
+ 
+d
+o
+n
+c
+ 
+a
+b
+s
+e
+n
+t
+ 
+d
+u
+
+
+ 
+ 
+w
+o
+r
+k
+t
+r
+e
+e
+.
+ 
+C
+o
+p
+i
+e
+,
+ 
+p
+u
+i
+s
+ 
+`
+d
+o
+c
+k
+e
+r
+ 
+c
+o
+m
+p
+o
+s
+e
+ 
+c
+o
+n
+f
+i
+g
+ 
+-
+-
+q
+u
+i
+e
+t
+`
+ 
+s
+o
+r
+t
+ 
+e
+n
+ 
+*
+*
+e
+x
+i
+t
+ 
+0
+*
+*
+.
+
+
+
+
+*
+*
+C
+e
+ 
+q
+u
+e
+ 
+c
+e
+ 
+v
+e
+r
+d
+i
+c
+t
+ 
+e
+t
+a
+b
+l
+i
+t
+ 
+:
+*
+*
+ 
+l
+e
+ 
+c
+o
+m
+m
+i
+t
+ 
+`
+0
+6
+d
+c
+f
+b
+e
+`
+ 
+p
+a
+s
+s
+e
+ 
+l
+a
+ 
+g
+a
+t
+e
+ 
+c
+o
+m
+p
+l
+e
+t
+e
+,
+ 
+i
+n
+d
+e
+p
+e
+n
+d
+a
+m
+m
+e
+n
+t
+ 
+d
+e
+ 
+c
+e
+ 
+q
+u
+e
+ 
+f
+a
+i
+t
+
+
+l
+a
+ 
+s
+e
+s
+s
+i
+o
+n
+ 
+p
+a
+r
+a
+l
+l
+e
+l
+e
+.
+ 
+*
+*
+C
+e
+ 
+q
+u
+'
+i
+l
+ 
+n
+'
+e
+t
+a
+b
+l
+i
+t
+ 
+p
+a
+s
+ 
+:
+*
+*
+ 
+q
+u
+e
+ 
+l
+'
+a
+r
+b
+r
+e
+ 
+d
+e
+ 
+t
+r
+a
+v
+a
+i
+l
+ 
+p
+r
+i
+n
+c
+i
+p
+a
+l
+ 
+e
+s
+t
+ 
+s
+a
+i
+n
+ 
+-
+-
+ 
+i
+l
+ 
+c
+o
+n
+t
+i
+e
+n
+t
+
+
+l
+e
+s
+ 
+m
+o
+d
+i
+f
+i
+c
+a
+t
+i
+o
+n
+s
+ 
+e
+n
+ 
+c
+o
+u
+r
+s
+ 
+d
+e
+ 
+c
+e
+t
+t
+e
+ 
+a
+u
+t
+r
+e
+ 
+s
+e
+s
+s
+i
+o
+n
+,
+ 
+q
+u
+i
+ 
+n
+'
+o
+n
+t
+ 
+e
+t
+e
+ 
+n
+i
+ 
+t
+o
+u
+c
+h
+e
+e
+s
+,
+ 
+n
+i
+ 
+c
+o
+m
+m
+i
+t
+e
+e
+s
+,
+ 
+n
+i
+ 
+a
+n
+n
+u
+l
+e
+e
+s
+.
+

@@ -1377,6 +1377,101 @@ def case_openai_to_anthropic_usage_cache_creation():
     }
 
 
+def case_p3_chat_to_responses_bounds_stop_tools():
+    """[TROU 12] P3 → amont ``/responses`` : ce qu'un corps **Chat client** devient.
+
+    Chemin réel (handler ``chat_completions``, ``opencode.py``) : la conversion
+    ``_chat_to_responses_request`` est appliquée au corps P3 quand l'endpoint
+    amont est ``/responses`` — jambe payée (``paid_body =
+    _chat_to_responses_request(body) if "/responses" in endpoint``) et jambe
+    free ``muse-spark`` (``free_body = _chat_to_responses_request({**body,
+    "model": free_model})``). Le relais Chat → Chat (passthrough) n'appelle
+    aucune fonction de ``mapping`` : ce cas fige donc la SEULE conversion réelle
+    du corps P3.
+
+    Mesures figées ici :
+      - ``max_tokens`` → ``max_output_tokens`` : la borne du client est
+        **préservée** (pas de coût non borné) — et la forme moderne
+        ``max_completion_tokens`` (également dans le corps) ne l'écrase pas
+        (priorité documentée : ``max_output_tokens`` > ``max_tokens`` >
+        ``max_completion_tokens``, lot L14/A17) ;
+      - ``stop`` / ``stop_sequences`` et ``stream_options`` : aucune forme
+        Responses → **perdus silencieusement** (constat, cf. ``_note``) ;
+      - ``tools[].function.parameters`` → ``tools[].parameters`` (profil strict
+        du modèle → ``additionalProperties: false``) ;
+      - nom d'outil de 124 car. → 64 car. + ``_tool_name_map`` (restauration au
+        retour) — l'historique ``function_call.name`` suit la même forme courte ;
+      - multi-tours : le ``tool`` orphelin (``call_id`` sans ``tool_call``
+        précédent) est droppé.
+    """
+    long_name = "mcp__" + "tres_long_segment_" * 6 + "outil_final"
+    return {
+        "fn": "_chat_to_responses_request",
+        "input": {
+            "chat": {
+                "model": "muse-spark-1.3-contributor-free",
+                "stream": True,
+                "stream_options": {"include_usage": True},
+                "max_tokens": 512,
+                "max_completion_tokens": 300,
+                "stop": ["END", "STOP"],
+                "temperature": 0.3,
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "get_weather",
+                            "description": "d",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"city": {"type": "string"}},
+                                "required": ["city"],
+                            },
+                        },
+                    },
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": long_name,
+                            "description": "d",
+                            "parameters": {"type": "object", "properties": {}},
+                        },
+                    },
+                ],
+                "tool_choice": "auto",
+                "messages": [
+                    {"role": "system", "content": "Be brief."},
+                    {"role": "user", "content": "Meteo a Paris ?"},
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": "call_p3_1",
+                                "type": "function",
+                                "function": {"name": long_name, "arguments": '{"city":"Paris"}'},
+                            }
+                        ],
+                    },
+                    {"role": "tool", "tool_call_id": "call_p3_1", "content": '{"temp":21}'},
+                    {"role": "tool", "tool_call_id": "call_orphan_9", "content": "orphelin"},
+                    {"role": "user", "content": "Et demain ?"},
+                ],
+            }
+        },
+        "note": (
+            "[TROU 12] conversion du corps P3 quand l'amont est /responses : "
+            "max_tokens 512 → max_output_tokens 512 (borne PRÉSERVÉE, prioritaire sur "
+            "max_completion_tokens 300 — lot L14/A17) ; "
+            "stop/stop_sequences et stream_options ABSENTS du corps amont "
+            "(perdus — aucune forme Responses) ; "
+            "tools[].function.parameters → parameters (+additionalProperties:false) ; "
+            f"nom d'outil {len(long_name)} car. → 64 car. + _tool_name_map (restauration) ; "
+            "function_call.name de l'historique renommé court ; tool orphelin droppé"
+        ),
+    }
+
+
 CASES = [
     case_req_simple,
     case_req_tools,
@@ -1426,6 +1521,8 @@ CASES = [
     case_p4_request_effort_relay,
     case_openai_to_anthropic_usage_cache_creation,
     case_p1_free_leg_tool_name_restored,
+    # ── [TROU 12] premier golden P3 (corps Chat client → amont /responses) ──
+    case_p3_chat_to_responses_bounds_stop_tools,
 ]
 
 

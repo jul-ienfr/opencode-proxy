@@ -122,3 +122,5 @@ static/*.br
 # ils polluent `ruff check .` (fichiers dupliqués, erreurs fantômes).
 .audit-wt/
 .audit-logs-wt/
+# worktrees d'agents d'audit (jetables, mais lintes par ruff s'ils sont visibles)
+.trou*-wt/

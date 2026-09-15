@@ -6072,6 +6072,62 @@ def _free_retry_delay_seconds(attempt: int) -> float:
         return 0.5
 
 
+def _collect_responses_sse_object(raw: str) -> dict:
+    """Reconstruit l'objet Responses complet porte par un flux SSE."""
+    complet: dict = {}
+    dernier: dict = {}
+    for ligne in (raw or "").splitlines():
+        if not ligne.startswith("data:"):
+            continue
+        charge = ligne[5:].strip()
+        if not charge or charge == "[DONE]":
+            continue
+        try:
+            evt = json.loads(charge)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(evt, dict):
+            continue
+        objet = evt.get("response")
+        if isinstance(objet, dict):
+            if evt.get("type") == "response.completed":
+                complet = objet
+            elif "output" in objet:
+                dernier = objet
+    return complet or dernier
+
+
+async def _free_responses_body_object(resp) -> dict:
+    """Objet Responses d'une reponse free, JSON **ou** flux SSE.
+
+    [TROU 6 - defaut D2] Quand on demande `stream: true` a `/responses`, la
+    reponse est un flux SSE (`text/event-stream`) : `resp.json()` n'y trouve
+    rien, et une reponse 200 etait classee « vide » avant un repli payant.
+    On collecte donc le corps (.text ; a defaut les lignes asynchrones, cas
+    d'un flux reellement diffuse) puis on reconstruit l'objet complet.
+    """
+    corps = ""
+    texte = getattr(resp, "text", "")
+    if isinstance(texte, str) and texte:
+        corps = texte
+    else:
+        contenu = getattr(resp, "content", b"")
+        if isinstance(contenu, bytes) and contenu:
+            corps = contenu.decode("utf-8", "replace")
+    if not corps:
+        lignes: list[str] = []
+        aiter = getattr(resp, "aiter_lines", None)
+        if callable(aiter):
+            try:
+                async for ligne in aiter():
+                    lignes.append(ligne)
+            except Exception as err:  # noqa: BLE001
+                _debug(f"  [free] collecte du flux SSE impossible: {err}")
+        if lignes:
+            corps = "\n".join(lignes)
+    return _collect_responses_sse_object(corps)
+
+
 async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=None, req_id=None):
     """Try the free model equivalent before falling back to paid.
 
@@ -6217,6 +6273,44 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
         else:
             free_body = dict(body)
             free_body["model"] = free_model
+    # [TROU 7 volet « effort »] Le champ d'effort ci-dessus a été posé pour le
+    # modèle **payant** (ex. ``chat_completions`` → ``_resolve_effort(body,
+    # model_id)``). La jambe free ne le recalculait jamais : dès que le plafond
+    # du modèle free est plus bas que celui du payant (cas vivant
+    # ``deepseek-v4-flash`` → ``deepseek-v4-flash-free``, ``max`` → ``high``),
+    # l'amont free recevait un ``reasoning_effort`` hors plafond. Recalcul avec
+    # le modèle free, **même source unique** ``config.effort_policy`` — aucune
+    # table locale. Le corps de référence est celui reçu par la fonction (celui
+    # sur lequel la décision payante a été prise) : on y réinjecte la valeur
+    # payante déjà appliquée, de sorte que la décision free ne puisse que
+    # **rabaisser** (jamais relever) le niveau réellement demandé. Aucun effort
+    # n'est inventé : sans ``reasoning_effort`` d'entrée, on ne touche à rien.
+    _paid_effort = body.get("reasoning_effort") if isinstance(body, dict) else None
+    if _paid_effort is None:
+        # Forme « effort » top-level, ou ``reasoning_effort`` posé seulement sur
+        # la copie de travail : on lit le corps réellement construit.
+        _paid_decision = _resolve_effort(body if isinstance(body, dict) else {}, model_id)
+        if not _paid_decision.wants:
+            _paid_effort = free_body.get("reasoning_effort") if isinstance(free_body, dict) else None
+    if _paid_effort is not None:
+        # La sonde ne porte QUE la decision payante : `_resolve_effort` donne la
+        # priorite a `effort` / `output_config.effort` sur `reasoning_effort`, donc
+        # recopier le corps laissait une forme plus prioritaire l'emporter et
+        # pouvait RELEVER le niveau au-dessus de la decision payante.
+        _free_effort_body = {"reasoning_effort": _paid_effort}
+        _free_decision = _resolve_effort(_free_effort_body, free_model)
+        if _free_decision.wants and _free_decision.level:
+            free_body["reasoning_effort"] = _free_decision.level
+            if _free_decision.level != _paid_effort:
+                _debug(
+                    f"  [free] effort: {model_id} → {free_model} : "
+                    f"reasoning_effort={_paid_effort} rabaissé à {_free_decision.level} "
+                    f"(plafond du modèle free)"
+                )
+        # Plafond free à « désactivé » : le champ ne doit pas partir du tout.
+        elif not _free_decision.wants and "reasoning_effort" in free_body:
+            free_body.pop("reasoning_effort", None)
+
     # [tool-names ≤64] strip de la clé privée AVANT tout envoi wire : la map
     # est conservée pour le restore-retour, jamais sérialisée à l'upstream.
     _tool_name_map = free_body.pop(_TOOL_NAME_MAP_KEY, None)
@@ -6592,7 +6686,16 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
 
     if _free_is_responses and resp.status_code == 200:
         try:
-            rdata = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+            _ctype = resp.headers.get("content-type", "")
+            if _ctype.startswith("application/json"):
+                rdata = resp.json()
+            elif "text/event-stream" in _ctype or not _ctype:
+                # [TROU 6 - D2] Flux SSE : le corps n'est pas du JSON. Sans ce
+                # chemin, une reponse 200 du free etait classee « vide » et
+                # remplacee par un repli payant (503 si les cles sont en pause).
+                rdata = await _free_responses_body_object(resp)
+            else:
+                rdata = {}
             _debug(f"  [free] raw response keys: {list(rdata.keys()) if isinstance(rdata, dict) else 'not dict'}")
             # Guard empty response (131x observed -> 0 tokens success should be treated as failure)
             if not isinstance(rdata, dict) or not rdata:
@@ -8540,6 +8643,8 @@ from app.protocol.mapping import (  # noqa: E402,I001  # re-export after functio
     _sanitize_native_responses_request,
     responses_stream_events,
     responses_stream_sse,
+    restore_chat_response_tool_names,
+    sanitize_chat_tool_names,
     anthropic_to_openai,
     anthropic_to_openai_response,
     anthropic_to_openai_responses,
@@ -11461,6 +11566,17 @@ async def chat_completions(request: Request):
 
     # ── OpenAI passthrough ─────────────────────────────────────
     if protocol == "openai":
+        # [TROU 2 — A8] Sanitize-aller des noms d'outils : un client Chat
+        # (Anthropic autorise 200 caractères) peut envoyer un nom > 64, que
+        # l'amont Chat refuse en 400 (`name must be at most 64 characters`) ou
+        # tronque. P3 était un passthrough intégral : le nom partait tel quel et
+        # rien ne le restaurait au retour. Le corps réellement envoyé (jambe paid
+        # ET jambe free) reçoit ici des noms ≤64 ; la map {short: original} est
+        # déposée dans le corps (clé privée, strippée par `_serialize_json_body`)
+        # puis poppée localement pour le restore-retour (non-stream et stream).
+        # Portée volontairement limitée à cette branche : P4 (amont Anthropic)
+        # accepte 200 caractères et n'a pas de rename à faire.
+        body = sanitize_chat_tool_names(body)
         try:
             headers = _get_auth_headers("openai")
         except AllKeysPausedError as e:
@@ -11700,6 +11816,18 @@ async def chat_completions(request: Request):
                 return _openai_error(502, "Upstream returned non-JSON response")
             # V5.1 : déplie enveloppe response.created même si endpoint pas /responses (best-practice, inconditionnel)
             data = _unwrap_responses_envelope(data)
+            # [TROU 2 — A8] Restore-retour non-stream : les tool_calls amont
+            # portent le nom raccourci ≤64 de l'aller ; le client Chat doit
+            # retrouver le nom (jusqu'à 200 car.) qu'il a envoyé — y compris
+            # dans le log/`used_tools` dérivé plus bas et dans le corps rendu.
+            _name_map = body.pop(_TOOL_NAME_MAP_KEY, None)
+            data = restore_chat_response_tool_names(data, _name_map)
+            # Le corps rendu était `resp.content` (bytes amont VERBATIM) : sans
+            # re-sérialisation, le restore n'affectait que le dict parsé et le
+            # client recevait quand même le nom raccourci. On re-sérialise donc
+            # le SEUL cas où un rename a eu lieu (aucun changement d'octets pour
+            # le passthrough ordinaire).
+            _restored_body_bytes = _json_dumps(data) if _name_map else None
             if data.get("status") in ("queued", "in_progress"):
                 _debug(f"  [unwrap] status={data.get('status')} (non-stream) → 503 retryable")
                 _log(f"  Responses status {data.get('status')} (non-stream) → 503 retryable")
@@ -11772,6 +11900,14 @@ async def chat_completions(request: Request):
                 request_body=request_body,
                 response_body=data,
             )
+            # [TROU 2 — A8] Si un rename a eu lieu à l'aller, on rend le corps
+            # restauré (sinon le passthrough reste bytes-amont VERBATIM).
+            if _restored_body_bytes is not None:
+                if cache_key:
+                    _response_cache.put(cache_key, _restored_body_bytes, {"Content-Type": "application/json"})
+                return Response(
+                    content=_restored_body_bytes, headers={"X-Cache": "MISS"}, media_type="application/json"
+                )
             # [v10 §14.3.26] garde manquante sur cette branche : cache_key None
             # polluait le store LRU d'une entrée clé None.
             if cache_key:
@@ -12166,6 +12302,8 @@ async def chat_completions(request: Request):
                                     if chunk.get("_incomplete") and not _oai_has_yielded and stream_out == 0:
                                         _incomplete_empty = True
                                     break
+                                # [TROU 2 — A8] nom d'outil restauré avant yield.
+                                chunk = restore_chat_response_tool_names(chunk, _out_tool_map)
                                 _oai_has_yielded = True
                                 _chunk_already_yielded = True
                                 yield f"data: {_json_dumps_str(chunk, ensure_ascii=False)}\n\n".encode()
@@ -12191,6 +12329,8 @@ async def chat_completions(request: Request):
                                             _incomplete_empty = True
                                         break
                                     # Yield converted chunk as chat/completions SSE
+                                    # [TROU 2 — A8] nom d'outil restauré avant yield.
+                                    chunk = restore_chat_response_tool_names(chunk, _out_tool_map)
                                     _oai_has_yielded = True
                                     yield f"data: {_json_dumps_str(chunk, ensure_ascii=False)}\n\n".encode()
                                     continue
@@ -12203,6 +12343,12 @@ async def chat_completions(request: Request):
                                     rc = delta.get("reasoning_content") or delta.get("reasoning")
                                     if isinstance(rc, str):
                                         stream_out += _estimate_tokens(rc)
+                                    # [TROU 2 — A8] Restore-retour stream : le nom
+                                    # raccourci ≤64 émis par l'amont Chat redevient
+                                    # celui du client AVANT d'être relâché dans le
+                                    # flux SSE (mutation in-place sur `chunk`, dont
+                                    # le yield ré-émet la version restaurée).
+                                    chunk = restore_chat_response_tool_names(chunk, _out_tool_map)
                                     for tc in delta.get("tool_calls") or []:
                                         if isinstance(tc, dict) and "name" in tc.get("function", {}):
                                             tc_idx = tc.get("index", len(seen_tool_indices))
@@ -12215,7 +12361,14 @@ async def chat_completions(request: Request):
                                     emitted_finish = True
                             if not _chunk_already_yielded:
                                 _oai_has_yielded = True
-                                yield line.encode() + b"\n\n"
+                                # [TROU 2 — A8] On ré-émet le chunk PARSÉ (et non la
+                                # ligne amont brute) : le restore-retour a réécrit
+                                # le nom d'outil dans `chunk`, et relâcher la ligne
+                                # d'origine renvoyait au client le nom raccourci.
+                                # Sérialisation identique aux autres yields (orjson,
+                                # même `ensure_ascii=False`) ; `data_str` == le JSON
+                                # du chunk, donc aucune perte de champ.
+                                yield f"data: {_json_dumps_str(chunk, ensure_ascii=False)}\n\n".encode()
                             _chunk_already_yielded = False
 
                         if _incomplete_empty and _using_free:
@@ -12542,6 +12695,23 @@ async def chat_completions(request: Request):
     # ── Anthropic protocol (double conversion) ──────────────────
     anthro_body = openai_to_anthropic_request(body)
 
+    # [TROU 4 / parité P1] ``openai_to_anthropic_request`` réinjecte le
+    # ``reasoning_content`` de l'historique en bloc ``thinking`` signé LOCALEMENT
+    # (mapping.py L2126-2142). Un upstream Anthropic valide la signature
+    # cryptographiquement : ces blocs ne doivent jamais partir. P1 le fait
+    # (cf. ``strip_synthetic_thinking`` en tête de branche anthropic) ; P4
+    # l'oubliait et émettait la signature locale forgée vers l'amont. On nettoie
+    # donc le corps RÉELLEMENT envoyé (non-stream et stream : ``anthro_body`` est
+    # le point de passage unique des deux jambes).
+    try:
+        _stripped_thinking = strip_synthetic_thinking(anthro_body)
+        if _stripped_thinking:
+            _log(
+                f"  [thinking] {_stripped_thinking} bloc(s) thinking à signature locale strippé(s) de l'historique (upstream anthropic)"
+            )
+    except Exception as e:
+        _debug(f"  [thinking] strip_synthetic_thinking failed: {type(e).__name__}: {e}")
+
     # Apply thinking/effort overrides from route
     thinking_override = route.get("thinking")
     if thinking_override and thinking_override != "auto":
@@ -12654,29 +12824,17 @@ async def chat_completions(request: Request):
             return _free_refusal_response(e, "anthropic")
         except UpstreamError as e:
             return JSONResponse(status_code=e.status_code, content={"error": str(e)})
-        # [A27] `a_headers` peut valoir None : `_try_free_model_first` rend **None**
-        # dans le creneau des en-tetes sur son chemin nominal (hedge). Avant le
-        # correctif, ce None ecrasait les en-tetes payants valides et la lecture
-        # ci-dessous levait `AttributeError: 'NoneType' object has no attribute
-        # 'get'` => HTTP 500 mesure en reel le 14/09 sur /v1/chat/completions
-        # non-stream, la ou la branche streaming rend un 503 propre (L12560). Les 8
-        # sites de depouillement n'ecrasent plus les en-tetes ; ce garde reste en
-        # defense en profondeur : un 503 exploitable, jamais un 500.
-        if a_headers is None and resp.status_code != 200:
-            _debug("  [free] aucune cle Anthropic disponible (toutes en pause) et jambe free epuisee -> 503")
-            return Response(
-                content=_json_dumps_str(
-                    {
-                        "error": {
-                            "message": "All API keys exhausted (paused) and no free model available.",
-                            "type": "api_error",
-                        }
-                    }
-                ),
-                status_code=503,
-                media_type="application/json",
-                headers={"Retry-After": "30"},
-            )
+        # [A27] Ce que le correctif a reellement ferme, dit sans se flatter :
+        # (1) le resultat de la jambe free est depouille en `resp, _, _actual_model,
+        #     _actual_ip` (L12755) : le creneau d'en-tetes part dans `_`, il ne peut
+        #     donc plus ecraser les en-tetes payants valides ;
+        # (2) la lecture ci-dessous est protegee par le ternaire `if a_headers else
+        #     "?"`, qui est la protection reellement atteignable.
+        # Une garde `if a_headers is None` a existe ici. Elle a ete RETIREE parce
+        # qu'elle etait inatteignable : `_get_auth_headers` (L318) ne rend que des
+        # `dict` et aucune affectation n'ecrit `None`. La laisser aurait fait croire
+        # a une defense qui ne peut pas se declencher. Si un jour un `None` revient
+        # dans ce creneau, c'est le ternaire qui protegera, et il faudra le tester.
         account_alias = _alias_for_key(a_headers.get("x-api-key", "")) if a_headers else "?"
         if resp.status_code != 200:
             await _log_and_save_error(
@@ -13476,8 +13634,27 @@ async def responses(request: Request):
         elif "input" in body:
             body["input"] = _drop_orphan_responses_input(body["input"])
     if isinstance(anthro_body, dict) and "messages" in anthro_body:
-        # Anthropic body itself not filtered here (upstream is Anthropic), but keep for completeness
-        pass
+        # [TROU 5] La garde ci-dessus filtre `body` — or `anthro_body` a été construit
+        # AVANT elle, et le bloc qui suivait ici ne faisait RIEN tout en ayant l'air de
+        # garder (`pass` + commentaire « keep for completeness »). On ne peut pas non
+        # plus réutiliser `_drop_orphan_tool_messages` sur le corps Anthropic : elle
+        # travaille au format Chat (`role: tool` / `tool_call_id`) et n'y trouve donc
+        # rien — MESURÉ par test, l'orphelin passait quand même. Le convertisseur, lui,
+        # sait écarter un `function_call_output` sans appel correspondant : on lui
+        # resoumet le `body` DÉJÀ filtré, comme la resynchronisation web_search ci-dessus.
+        anthro_body = openai_responses_to_anthropic(body)
+        anthro_body["model"] = model_id
+
+    # [TROU 4 — jumeau P6] Même classe de défaut que P4 : un bloc thinking forgé
+    # localement (signature du proxy, pas de l'amont) ne doit jamais partir signé.
+    # P1 (L8898) et P4 (L12554) le retirent ; P6 ne le faisait pas.
+    if isinstance(anthro_body, dict):
+        try:
+            _stripped_thinking_p6 = strip_synthetic_thinking(anthro_body)
+            if _stripped_thinking_p6:
+                _debug(f"  [thinking] P6 : {_stripped_thinking_p6} bloc(s) thinking forge(s) retire(s)")
+        except Exception as e:
+            _debug(f"  [thinking] strip_synthetic_thinking failed (P6): {type(e).__name__}: {e}")
 
     # Apply route overrides
     thinking_override = route.get("thinking")
@@ -13502,14 +13679,23 @@ async def responses(request: Request):
 
     # ── Anthropic backend (passthrough) ─────────────────────
     if protocol == "anthropic":
+        # [TROU 15] Vrai si les cles payantes sont en pause : sert a ne JAMAIS tenter
+        # le payant sans cle depuis la branche streaming (cf. garde plus bas).
+        _paused_sans_cle = False
         try:
             a_headers = _get_auth_headers("anthropic")
         except AllKeysPausedError as e:
             # If a free model exists, try it before giving up
             if FREE_MODEL_MAP.get(model_id):
                 if is_stream:
-                    # Streaming with no API key: free model will be tried on next normal attempt
-                    return _anthropic_error(503, "All API keys paused — free model will be tried on next attempt")
+                    # [TROU 15] Couper ici etait un MENSONGE : le 503 annoncait un essai
+                    # de la jambe free qui n'avait JAMAIS lieu (mesure : 503 et ZERO
+                    # appel amont), alors que le code de streaming situe plus bas (apres
+                    # le `return` du non-stream) force `stream = False` en amont et tente
+                    # LUI-MEME la jambe free. On le laisse donc filer, avec un drapeau
+                    # qui interdit d'appeler le payant sans cle.
+                    a_headers = {}
+                    _paused_sans_cle = True
                 else:
                     # Non-streaming: try free model
                     try:
@@ -13554,7 +13740,9 @@ async def responses(request: Request):
                                 response_body=data,
                                 free_model_ip=_actual_ip,
                             )
-                            oai_resp = anthropic_to_openai_responses(data, original_model)
+                            oai_resp = anthropic_to_openai_responses(
+                                data, original_model, anthro_body.get(_TOOL_NAME_MAP_KEY)
+                            )
                             # [Lot L5 — D4] Ce site est dans la branche
                             # non-streaming (`else:` de `if is_stream`) : renvoyer
                             # du SSE à un client qui a demandé du JSON lui donne un
@@ -13568,20 +13756,27 @@ async def responses(request: Request):
                         return _free_refusal_response(fq_err, "anthropic")
                     except Exception as fail_err:
                         _debug(f"  [free] free model attempt failed: {fail_err}")
-            retry_after = int(e.retry_after) + 1
-            return Response(
-                content=_json_dumps_str(
-                    {
-                        "error": {
-                            "message": f"All API keys exhausted. Retry after {retry_after}s.",
-                            "type": "api_error",
+            if _paused_sans_cle:
+                # [TROU 15] Cles en pause ET client en streaming : la jambe free est
+                # tentee par le code de streaming situe plus bas (il force
+                # `stream = False` en amont puis essaie le free). Retourner ici
+                # rouvrirait le mensonge : un 503 sans aucun appel amont.
+                pass
+            else:
+                retry_after = int(e.retry_after) + 1
+                return Response(
+                    content=_json_dumps_str(
+                        {
+                            "error": {
+                                "message": f"All API keys exhausted. Retry after {retry_after}s.",
+                                "type": "api_error",
+                            }
                         }
-                    }
-                ),
-                status_code=503,
-                media_type="application/json",
-                headers={"Retry-After": str(retry_after)},
-            )
+                    ),
+                    status_code=503,
+                    media_type="application/json",
+                    headers={"Retry-After": str(retry_after)},
+                )
         if not is_stream:
             # Response cache (mirrors the anthropic/chat handlers)
             cache_key = _response_cache.make_key(body, body_bytes=body_bytes)
@@ -13735,7 +13930,7 @@ async def responses(request: Request):
                 request_body=request_body,
                 response_body=data,
             )
-            oai_resp = anthropic_to_openai_responses(data, original_model)
+            oai_resp = anthropic_to_openai_responses(data, original_model, anthro_body.get(_TOOL_NAME_MAP_KEY))
             _response_body = _json_dumps_str(oai_resp, ensure_ascii=False).encode()
             if cache_key:
                 _response_cache.put(cache_key, _response_body, {"Content-Type": "application/json"})
@@ -13763,6 +13958,12 @@ async def responses(request: Request):
             if free_result is not None:
                 resp, _, _actual_model, _actual_ip = free_result
                 model_id = _actual_model
+            elif _geo_tunnel:
+                model_id = _actual_model
+            elif _paused_sans_cle:
+                # La jambe free n'a rien donne ET aucune cle payante n'est disponible :
+                # 503 VERIDIQUE (jamais « un essai free aura lieu »).
+                return _anthropic_error(503, "All API keys paused and no free model available.")
             elif _geo_tunnel:
                 # Axe A: geo-restricted paid → must route through tunnel station
                 async with _open_via_pool(
@@ -13810,7 +14011,7 @@ async def responses(request: Request):
                 headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
             )
         try:
-            data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+            data = await _resp_json_hors_boucle(resp)
         except Exception:
             _debug(f"  ✗ non-JSON response from {endpoint}")
             _log(f"  UPSTREAM DECODE ERROR: non-JSON response from {endpoint}")
@@ -13840,7 +14041,7 @@ async def responses(request: Request):
             request_body=request_body,
             response_body=data,
         )
-        oai_resp = anthropic_to_openai_responses(data, original_model)
+        oai_resp = anthropic_to_openai_responses(data, original_model, anthro_body.get(_TOOL_NAME_MAP_KEY))
         # [Lot L5 — A11/A21] Séquence conforme au lieu du seul terminal.
         sse_body = responses_stream_sse(responses_stream_events(oai_resp, original_model))
         return Response(
@@ -13851,6 +14052,10 @@ async def responses(request: Request):
 
     # ── OpenAI backend (double conversion) ──────────────────
     # Convert Anthropic → Chat Completions for the backend
+    # [TROU 3 — A8] Map de restauration des noms d'outils, posée AVANT le `try` :
+    # les branches d'erreur (`AllKeysPausedError` → jambe free) la lisent, et une
+    # affectation seulement dans le `try` les ferait planter en UnboundLocalError.
+    _out_tool_map = None
     try:
         if _web_nondet_injected.get():
             # [P4 correctesse] résultats DDG/fetch injectés après capture des
@@ -13870,6 +14075,14 @@ async def responses(request: Request):
             # destination est bien un endpoint Responses ; les envoyer à un
             # upstream Anthropic serait un 400 « unknown parameter ».
             _relay_responses_storage_fields(oai_body, body)
+        # [TROU 3 — A8] Map de restauration des noms d'outils construite à l'aller
+        # par ``_chat_to_responses_request`` (noms >64 raccourcis, clé privée
+        # ``_tool_name_map``). Elle est EXTRAITE ici, avant les deux jambes
+        # (free et payante), pour que le retour — ``openai_chat_to_responses`` —
+        # rende au client le nom qu'il a réellement envoyé. La jambe Anthropic de
+        # P6 ne construit pas de map (l'amont accepte 200 caractères) : le
+        # ``.get()`` y renvoie ``None`` (no-op).
+        _out_tool_map = oai_body.pop(_TOOL_NAME_MAP_KEY, None)
     except Exception as e:
         _debug(f"[responses] ✗ conversion failed: {e}")
         _log(f"  CONVERSION ERROR: anthropic_to_openai failed: {type(e).__name__}: {e}")
@@ -13917,7 +14130,7 @@ async def responses(request: Request):
                         response_body=data,
                         free_model_ip=_actual_ip,
                     )
-                    oai_resp = openai_chat_to_responses(data, original_model)
+                    oai_resp = openai_chat_to_responses(data, original_model, _out_tool_map)
                     # [Lot L5 — D4] Ce site s'exécute **avant** le calcul de
                     # `is_stream` (fait plus bas) : sans garde, un client
                     # `stream:false` recevait du SSE — corps non parsable en JSON.
@@ -14100,7 +14313,7 @@ async def responses(request: Request):
                 oai_resp["id"] = _fast_id("resp")
         else:
             # Chat Completions format — convert to Responses API
-            oai_resp = openai_chat_to_responses(data, original_model)
+            oai_resp = openai_chat_to_responses(data, original_model, _out_tool_map)
         _response_body = _json_dumps_str(oai_resp, ensure_ascii=False).encode()
         if cache_key:
             _response_cache.put(cache_key, _response_body, {"Content-Type": "application/json"})
@@ -14217,7 +14430,7 @@ async def responses(request: Request):
                     ],
                     "usage": final_usage or {"prompt_tokens": 0, "completion_tokens": 0},
                 }
-                oai_resp = openai_chat_to_responses(chat_resp, original_model)
+                oai_resp = openai_chat_to_responses(chat_resp, original_model, _out_tool_map)
                 # [Lot L5 — A11/A21] Séquence conforme au lieu du seul terminal.
                 sse_body = responses_stream_sse(responses_stream_events(oai_resp, original_model))
                 return Response(
@@ -14330,7 +14543,7 @@ async def responses(request: Request):
     }
 
     # Convert to Responses API format
-    oai_resp = openai_chat_to_responses(chat_resp, original_model)
+    oai_resp = openai_chat_to_responses(chat_resp, original_model, _out_tool_map)
     # [Lot L5 — A11/A21] Séquence conforme (`response.created` → deltas →
     # `response.completed`) au lieu d'un unique bloc terminal : le client
     # n'affichait rien avant la fin de la génération.
@@ -14595,3 +14808,22 @@ if __name__ == "__main__":
             except Exception:
                 pass
             _db_flush()
+
+
+# [A11] Aide placee en fin de module : l'inserer juste avant `async def responses` la placerait
+# ENTRE le decorateur @app.post("/v1/responses") et sa fonction, qui perdrait alors sa route
+# (mesure : FastAPI renvoyait 422 au lieu de 200). La resolution se faisant a l'appel, l'ordre
+# du module est sans effet.
+async def _resp_json_hors_boucle(resp):
+    """[A11] Parse le corps amont **hors de la boucle d'evenements**.
+
+    Le corps concerne peut etre tout un flux SSE accumule : le parse synchrone gelait la
+    boucle proportionnellement a sa taille (un harnais ASGI a ete fige par cet appel).
+    `asyncio.to_thread` deplace le parse dans un thread de travail ; le resultat et les
+    exceptions sont identiques, seul le gel disparait.
+
+    Le comportement content-type non JSON -> {} est preserve a l'identique.
+    """
+    if not resp.headers.get("content-type", "").startswith("application/json"):
+        return {}
+    return await asyncio.to_thread(resp.json)
