@@ -950,34 +950,56 @@ def test_free_model_subpath_p4_stream(client, recorder):
     assert "data: [DONE]" in text
 
 
-def test_p4_nonstream_sans_cle_anthropic_est_503_pas_500(client, recorder, monkeypatch):
-    """[A27] Mesuré en réel le 14/09/2026 sur le proxy :4000 — trace ``opencode.py:12647``.
+def _free_leg_sans_entetes(monkeypatch, status_code=429):
+    """[A27] Reproduit le mécanisme **réel** du 500, pas une hypothèse.
 
-    Toutes les clés Anthropic en pause ⇒ ``_get_auth_headers`` rend ``None`` **sans**
-    lever ``AllKeysPausedError`` ; la jambe free échoue ; le repli payant propage ce
-    ``None`` ; puis ``a_headers.get("x-api-key", "")`` levait
-    ``AttributeError: 'NoneType' object has no attribute 'get'`` ⇒ **HTTP 500**
-    « Erreur interne du serveur », au lieu du 503 propre que rend déjà la branche
-    streaming (opencode.py:12560).
-
-    Aucun test ne couvrait ce cas : le harnais rendait toujours des en-têtes d'auth.
+    ``_try_free_model_first`` rend ``resp_headers`` **None** sur son chemin nominal
+    (« resp_headers stays None for hedge », ``opencode.py:6280``). Huit sites de
+    dépouillement écrasaient alors leurs en-têtes payants — valides — par ce ``None``, et
+    la lecture suivante levait ``AttributeError``, avalée par le ``except Exception`` du
+    handler : un **HTTP 500** nu, sans autre trace qu'un ``Traceback (500)`` dans le log.
     """
-    vus = []
 
-    async def _sans_cle(endpoint, body, headers, protocol, retry_on_429=True):
-        vus.append(headers)
-        recorder._record("http", endpoint, body, protocol)
-        return FakeResponse(status_code=503, payload={"error": "no key"}), None
+    appels = []
 
-    monkeypatch.setattr(oc, "_get_auth_headers", lambda protocol, entry=None: None, raising=False)
-    monkeypatch.setattr(oc, "_do_request_with_retry", _sans_cle, raising=False)
+    async def _free(*args, **kwargs):
+        appels.append(args)
+        resp = FakeResponse(status_code=status_code, payload={"error": {"message": "free limited"}})
+        return resp, None, "mimo-v2.5-free", "203.0.113.9"
 
+    monkeypatch.setattr(oc, "_try_free_model_first", _free, raising=False)
+    return appels
+
+
+def test_p4_nonstream_jambe_free_sans_entetes_ne_fait_pas_500(client, recorder, monkeypatch):
+    """[A27] ``/v1/chat/completions`` non-stream — trace réelle ``opencode.py:12647``."""
+    appels = _free_leg_sans_entetes(monkeypatch)
     body = {"model": FREE_CLIENT_P4, "max_tokens": 256, "messages": [{"role": "user", "content": "hi"}]}
+
     status, _ctype, text = _post(client, "/v1/chat/completions", body, stream=False)
 
-    assert vus == [None], f"ce test n'a de sens que si le repli payant reçoit None (reçu {vus!r})"
-    assert status == 503, f"A27 : {status} au lieu de 503 (corps reçu : {text[:200]!r})"
-    assert "All API keys exhausted" in text
+    assert appels, "la jambe free doit être tentée, sinon ce test ne couvre rien"
+    assert status != 500, f"A27 : 500 au lieu d'une erreur exploitable (corps : {text[:200]!r})"
+    # L'amont 429 est traduit en 503 « retry later » — message exploitable, pas un 500 nu.
+    assert status == 503, f"A27 : code {status} inattendu (corps : {text[:200]!r})"
+    assert "Erreur interne" not in text
+    assert "exhausted" in text.lower()
+
+
+def test_p1_nonstream_jambe_free_sans_entetes_ne_fait_pas_500(client, recorder, monkeypatch):
+    """[A27] Le **jumeau** : ``/v1/messages`` non-stream (``opencode.py:9022``).
+
+    Même motif dans un autre handler : la jambe free rend ses en-têtes ``None``, le site
+    de dépouillement écrasait les en-têtes payants, puis la lecture en ``.get()`` levait.
+    Non mesuré en réel (seul P4 l'a été), mais identique par construction.
+    """
+    _free_leg_sans_entetes(monkeypatch)
+    body = {"model": P1_CLIENT, "max_tokens": 256, "messages": [{"role": "user", "content": "hi"}]}
+
+    status, _ctype, text = _post(client, "/v1/messages", body, stream=False)
+
+    assert status != 500, f"A27 jumeau : 500 au lieu d'une erreur exploitable (corps : {text[:200]!r})"
+    assert "Erreur interne" not in text
 
 
 # Client dont la route mène à un modèle à protocole `anthropic` (haiku →

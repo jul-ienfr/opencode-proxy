@@ -6095,6 +6095,16 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
 
     Returns (response, headers, actual_model_name, free_ip) if free model succeeded,
     or None if fallback needed.
+
+    ⚠️ Le créneau ``headers`` vaut **None** sur le chemin nominal (hedge) : la jambe free
+    ne s'authentifie pas (cf. ``resp_headers`` initialisé à None et le commentaire
+    « resp_headers stays None for hedge »). Il n'est renseigné que lorsque l'aide a
+    elle-même basculé sur le payant. **Ne jamais écrire** ``resp, headers, ... =
+    free_result`` : cela écraserait des en-têtes payants valides par ``None``, et toute
+    lecture ultérieure en ``.get()`` levait ``AttributeError`` avalée par le
+    ``except Exception`` du handler — soit un **HTTP 500** sur ``/v1/chat/completions``
+    non-stream mesuré en réel le 14/09/2026 (A27). Les 14 sites de dépouillement
+    utilisent donc ``_`` pour ce créneau.
     """
     global _free_ip_pool
 
@@ -9000,7 +9010,7 @@ async def messages(request: Request):
                     req_id=req_id,
                 )
                 if free_result is not None:
-                    resp, a_headers, _actual_model, _actual_ip = free_result
+                    resp, _, _actual_model, _actual_ip = free_result
                     model_id = _actual_model  # Log as free model
                 elif _geo_tunnel:
                     # Axe A: geo-restricted paid → must route through tunnel station
@@ -10035,7 +10045,7 @@ async def messages(request: Request):
                 req_id=req_id,
             )
             if free_result is not None:
-                resp, headers, _actual_model, _actual_ip = free_result
+                resp, _, _actual_model, _actual_ip = free_result
                 model_id = _actual_model
             elif _geo_tunnel:
                 # Axe A: geo-restricted paid → must route through tunnel station
@@ -11573,7 +11583,7 @@ async def chat_completions(request: Request):
                     req_id=req_id,
                 )
                 if free_result is not None:
-                    resp, headers, _actual_model, _actual_ip = free_result
+                    resp, _, _actual_model, _actual_ip = free_result
                     model_id = _actual_model
                 else:
                     # [Étape 2A — A1] no-valid-keys : le free a échoué sans
@@ -12636,7 +12646,7 @@ async def chat_completions(request: Request):
                 req_id=req_id,
             )
             if free_result is not None:
-                resp, a_headers, _actual_model, _actual_ip = free_result
+                resp, _, _actual_model, _actual_ip = free_result
                 model_id = _actual_model
             else:
                 resp, a_headers = await _do_request_with_retry(endpoint, anthro_body, a_headers, "anthropic")
@@ -12644,14 +12654,14 @@ async def chat_completions(request: Request):
             return _free_refusal_response(e, "anthropic")
         except UpstreamError as e:
             return JSONResponse(status_code=e.status_code, content={"error": str(e)})
-        # [A27] `a_headers` peut valoir None : `_get_auth_headers` rend None quand
-        # TOUTES les cles Anthropic sont en pause (sans lever AllKeysPausedError),
-        # et `_do_request_with_retry` propage ce None. La lecture ci-dessous faisait
-        # alors un 500 (`AttributeError: 'NoneType' object has no attribute 'get'`,
-        # mesure en reel le 14/09 sur /v1/chat/completions non-stream), la ou la
-        # branche streaming rend un 503 propre (L12560) et ou la branche
-        # AllKeysPausedError en rend un aussi (L12613). On s'aligne : un 503
-        # exploitable, jamais un 500.
+        # [A27] `a_headers` peut valoir None : `_try_free_model_first` rend **None**
+        # dans le creneau des en-tetes sur son chemin nominal (hedge). Avant le
+        # correctif, ce None ecrasait les en-tetes payants valides et la lecture
+        # ci-dessous levait `AttributeError: 'NoneType' object has no attribute
+        # 'get'` => HTTP 500 mesure en reel le 14/09 sur /v1/chat/completions
+        # non-stream, la ou la branche streaming rend un 503 propre (L12560). Les 8
+        # sites de depouillement n'ecrasent plus les en-tetes ; ce garde reste en
+        # defense en profondeur : un 503 exploitable, jamais un 500.
         if a_headers is None and resp.status_code != 200:
             _debug("  [free] aucune cle Anthropic disponible (toutes en pause) et jambe free epuisee -> 503")
             return Response(
@@ -13596,7 +13606,7 @@ async def responses(request: Request):
                     req_id=req_id,
                 )
                 if free_result is not None:
-                    resp, a_headers, _actual_model, _actual_ip = free_result
+                    resp, _, _actual_model, _actual_ip = free_result
                     model_id = _actual_model
                 elif _geo_tunnel:
                     # Axe A: geo-restricted paid → must route through tunnel station
@@ -13751,7 +13761,7 @@ async def responses(request: Request):
                 req_id=req_id,
             )
             if free_result is not None:
-                resp, a_headers, _actual_model, _actual_ip = free_result
+                resp, _, _actual_model, _actual_ip = free_result
                 model_id = _actual_model
             elif _geo_tunnel:
                 # Axe A: geo-restricted paid → must route through tunnel station
@@ -13969,7 +13979,7 @@ async def responses(request: Request):
                 req_id=req_id,
             )
             if free_result is not None:
-                resp, headers, _actual_model, _actual_ip = free_result
+                resp, _, _actual_model, _actual_ip = free_result
                 model_id = _actual_model
             elif _geo_tunnel:
                 # Axe A: geo-restricted paid → must route through tunnel station
@@ -14109,7 +14119,7 @@ async def responses(request: Request):
             req_id=req_id,
         )
         if free_result is not None:
-            resp, headers, _actual_model, _actual_ip = free_result
+            resp, _, _actual_model, _actual_ip = free_result
             model_id = _actual_model
         elif _geo_tunnel:
             # Axe A: geo-restricted paid → must route through tunnel station.
