@@ -84,7 +84,8 @@
               "arguments": "{\"p\":\"a.pdf\"}"
             }
           }
-        ]
+        ],
+        "reasoning_content": " "
       },
       {
         "role": "tool",
@@ -111,7 +112,8 @@
       }
     ],
     "stream": false,
-    "max_tokens": 100
+    "max_tokens": 100,
+    "_has_synthetic_reasoning_items": true
   },
   "_note": "axe documents+images : tool_result multimodal → parts image_url/file + placeholders [document:url]/[audio]",
   "_generated_by": "scripts/gen_golden_fixtures.py (plan v10 §11.5)"

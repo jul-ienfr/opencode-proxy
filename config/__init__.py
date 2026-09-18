@@ -36,7 +36,12 @@ from .settings import _normalize_geo_list as _normalize_geo_list
 from .settings import _resolve_geo_extends as _resolve_geo_extends
 from .settings import _server_countries_set as _server_countries_set
 from .settings import apply_server_changes as apply_server_changes
+from .settings import FAMILY_CAPABILITIES as FAMILY_CAPABILITIES
+from .settings import MODEL_API_FAMILIES as MODEL_API_FAMILIES
+from .settings import UNKNOWN_MODEL_CAPABILITIES as UNKNOWN_MODEL_CAPABILITIES
 from .settings import geo_strict_union as geo_strict_union
+from .settings import get_model_api as get_model_api
+from .settings import get_model_capabilities as get_model_capabilities
 from .settings import get_model_config as get_model_config
 from .settings import load_custom_routes as load_custom_routes
 from .settings import maybe_reload_custom_routes as maybe_reload_custom_routes
@@ -68,6 +73,7 @@ __all__ = [
     "FREE_MODEL_MAP",
     "FREE_MODEL_POOL",
     "FREE_MODELS",
+    "FAMILY_CAPABILITIES",
     "GEO_ALLOW_DIRECT_WHEN_COMPATIBLE",
     "GEO_ENABLED",
     "GEO_POLICIES",
@@ -75,6 +81,7 @@ __all__ = [
     "HOST",
     "IP_ROTATION",
     "MODELS",
+    "MODEL_API_FAMILIES",
     "PORT",
     "PROXY",
     "ROUTES",
@@ -87,7 +94,10 @@ __all__ = [
     "_resolve_geo_extends",
     "_server_countries_set",
     "apply_server_changes",
+    "UNKNOWN_MODEL_CAPABILITIES",
     "geo_strict_union",
+    "get_model_api",
+    "get_model_capabilities",
     "get_model_config",
     "load_custom_routes",
     "maybe_reload_custom_routes",

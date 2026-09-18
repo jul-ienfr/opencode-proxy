@@ -88,8 +88,27 @@ def _json_dumps_str(obj, **kw) -> str:
 _JSON_LIB = "orjson"
 
 
-def _drop_orphan_tool_messages(messages: list[dict]) -> list[dict]:
-    """Filter role:tool messages whose tool_call_id has no preceding tool_calls id."""
+def _has_server_side_history(body) -> bool:
+    """True si l'historique vit côté serveur (chaînage Responses).
+
+    Avec `previous_response_id`/`conversation`, un output sans call VISIBLE
+    dans le payload est légitime (le call est dans la réponse chaînée) : le
+    filtre orphelin local ne doit pas amputer. L'officiel ne strippe jamais.
+    """
+    if not isinstance(body, dict):
+        return False
+    return bool(body.get("previous_response_id") or body.get("conversation"))
+
+
+def _drop_orphan_tool_messages(messages: list[dict], body: dict | None = None) -> list[dict]:
+    """Filter role:tool messages whose tool_call_id has no preceding tool_calls id.
+
+    Garde : si `body` porte un chaînage serveur (`previous_response_id` /
+    `conversation`), aucun filtrage — l'appariement vit côté upstream.
+    """
+    if _has_server_side_history(body):
+        _debug("  [orphan] chaînage serveur → filtre orphelin désactivé (pas d'amputation)")
+        return messages
     # [P5.2 perf] early-exit sans rebuild quand aucun role=="tool" (99% des requêtes)
     if not any(m.get("role") == "tool" for m in messages):
         return messages
@@ -115,8 +134,15 @@ def _drop_orphan_tool_messages(messages: list[dict]) -> list[dict]:
     return filtered
 
 
-def _drop_orphan_responses_input(inp: list[dict]) -> list[dict]:
-    """Filter function_call_output items whose call_id has no preceding function_call."""
+def _drop_orphan_responses_input(inp: list[dict], body: dict | None = None) -> list[dict]:
+    """Filter function_call_output items whose call_id has no preceding function_call.
+
+    Garde : si `body` porte un chaînage serveur (`previous_response_id` /
+    `conversation`), aucun filtrage — l'appariement vit côté upstream.
+    """
+    if _has_server_side_history(body):
+        _debug("  [orphan] chaînage serveur → filtre orphelin désactivé (pas d'amputation)")
+        return [it for it in inp if isinstance(it, dict)] if isinstance(inp, list) else inp
     if not isinstance(inp, list):
         return inp
     inp = [it for it in inp if isinstance(it, dict)]
@@ -236,8 +262,30 @@ def _wants_max_completion_tokens(model: str) -> bool:
     return any(name.startswith(str(p).lower()) for p in prefixes if p)
 
 
-def _set_output_token_limit(
-    target: dict,
+#: Plafonds de sortie connus par famille (au-delà → 400 upstream).
+#: Famille absente = plafond inconnu → passthrough (pas de borne inventée).
+_MAX_OUTPUT_TOKENS_CAPS = (("muse", 131072), ("spark", 131072))
+
+
+def _clamp_max_output_tokens(value: int, model_id: str) -> int:
+    """Borne haute de sortie (parité capacité modèle — ex. 128k muse-spark).
+
+    Une demande au-delà de la capacité part telle quelle officiellement… et
+    revient en 400. Le proxy clamp explicitement (log) au lieu de laisser
+    l'upstream rejeter tout le tour.
+    """
+    try:
+        lid = str(model_id or "").lower()
+    except Exception:
+        return value
+    for prefix, cap in _MAX_OUTPUT_TOKENS_CAPS:
+        if prefix in lid and value > cap:
+            _debug(f"  [convert] max_output_tokens {value} > cap {cap} ({prefix}) → clampé")
+            return cap
+    return value
+
+
+def _set_output_token_limit(    target: dict,
     source: dict,
     model: str,
     default: int = 16384,
@@ -396,7 +444,7 @@ def _find_split_point(text: str) -> int:
     return 0
 
 
-def _effort_to_reasoning(effort_level: str, model: str) -> str:
+def _effort_to_reasoning(effort_level: str, model: str) -> str | None:
     """Map generic effort to model-specific reasoning_effort (config-driven).
 
     Délègue à ``config.effort_caps.clamp_effort`` : plafond par modèle lu en
@@ -404,8 +452,9 @@ def _effort_to_reasoning(effort_level: str, model: str) -> str:
     (``config.yaml``). Signature inchangée (coquille fine — réexportée,
     utilisée par tests + opencode.py).
 
-    Robustesse : ``None``/``""``/``"none"`` → ``"low"`` (repli historique
-    de la branche défaut) ; niveau inconnu non vide → passthrough inchangé
+    Robustesse : ``None``/``""``/``"none"``/``"off"`` → ``None`` (raisonnement
+    désactivé, parité thinkingLevel `off` — les appelants ne posent alors AUCUN
+    bloc `reasoning`) ; niveau inconnu non vide → passthrough inchangé
     (robustesse forward) ; import config protégé (jamais de 500 si la
     config est absente — fallback hardcodé = comportement pré-patch).
     """
@@ -417,15 +466,23 @@ def _effort_to_reasoning(effort_level: str, model: str) -> str:
         try:
             clamped = clamp_effort(effort_level, model)
         except Exception:
-            clamped = None
-        if isinstance(clamped, str) and clamped:
+            clamped = "__error__"
+        if isinstance(clamped, str) and clamped and clamped != "__error__":
             return clamped
-        # None (désactivé) ou niveau inconnu-vide → repli historique.
+        if clamped is None:
+            # Désactivé (None/""/"none"/"off") : pas de raisonnement.
+            return None
+        # Erreur de clamp → repli historique ci-dessous.
         _lvl = str(effort_level or "").strip().lower()
+        if _lvl in ("", "none", "off"):
+            return None
         if _lvl in ("medium", "high", "xhigh", "max"):
             return "high" if _lvl in ("high", "xhigh", "max") else "medium"
         return "low"
     # Fallback hardcodé = comportement pré-patch (branche défaut historique).
+    _lvl0 = str(effort_level or "").strip().lower()
+    if _lvl0 in ("", "none", "off"):
+        return None
     if effort_level in ("xhigh", "max", "high"):
         return "high"
     if effort_level == "medium":
@@ -439,7 +496,7 @@ def _effort_to_reasoning(effort_level: str, model: str) -> str:
 # sur ``low`` — correspondance de LiteLLM, de facto standard de l'écosystème
 # (``minimal→low``, ``xhigh→xhigh``, ``max→max``, jamais d'écrasement en high).
 _ANTHROPIC_EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
-_ANTHROPIC_EFFORT_ALIASES = {"minimal": "low", "none": "", "": ""}
+_ANTHROPIC_EFFORT_ALIASES = {"minimal": "low", "none": "", "off": "", "": ""}
 
 
 def _effort_to_anthropic(effort_level: str, model: str) -> str:
@@ -496,6 +553,23 @@ def _apply_anthropic_effort(result: dict, effort_level: str, model: str, *, sour
     if thinking.get("type") != "disabled":
         thinking["type"] = "adaptive"
         result["thinking"] = thinking
+        if not _PARITY_DISABLED:
+            # Parité OpenCodeClient : `display: summarized` sur adaptive moderne
+            # (défaut `omitted` = blocs vides), `blockBinding: drop_block` sur
+            # 5.1+ (préfixe re-rendu entre tours, sinon 400). Opt-out : un
+            # `thinking.blockBinding: false` explicite du client est respecté.
+            try:
+                _explicit = thinking.get("blockBinding")
+                if _explicit is False:
+                    # Opt-out OpenCode-only : clé consommée, pas de blockBinding.
+                    del thinking["blockBinding"]
+                    if thinking.get("type") == "adaptive" and anthropic_modern_adaptive_thinking(model):
+                        thinking.setdefault("display", "summarized")
+                elif _explicit is None:
+                    apply_anthropic_thinking_display(thinking, model)
+                # Sinon : blockBinding explicite du client conservé tel quel.
+            except Exception:
+                pass
     _debug(f"  [thinking] {model}: output_config.effort={level} + thinking=adaptive ({source})")
     return True
 
@@ -584,7 +658,21 @@ def _enforce_cache_breakpoint_limit(result: dict) -> dict:
             slots.append(t)
 
     excess = total - ANTHROPIC_MAX_CACHE_BREAKPOINTS
-    for holder in slots[:excess]:
+    # C2 : un breakpoint client `ttl: 1h` (cache long, coûteux à réchauffer)
+    # survit à un breakpoint auto 5 min — on sacrifie d'abord les breakpoints
+    # sans TTL explicite, à ancienneté égale.
+    def _has_long_ttl(holder: dict) -> bool:
+        cc = holder.get("cache_control")
+        return isinstance(cc, dict) and str(cc.get("ttl", "")).strip().lower() == "1h"
+
+    victims = [h for h in slots[:excess] if not _has_long_ttl(h)]
+    victims += [h for h in slots[:excess] if _has_long_ttl(h)]
+    if len(slots) > excess:
+        # Les suivants (profonds) ne sont élagués qu'en dernier recours, même
+        # ordre de préférence TTL.
+        victims += [h for h in slots[excess:] if not _has_long_ttl(h)]
+        victims += [h for h in slots[excess:] if _has_long_ttl(h)]
+    for holder in victims[:excess]:
         holder.pop("cache_control", None)
 
     remaining = _count_cache_breakpoints(messages or [], tools)
@@ -1063,9 +1151,28 @@ def _normalize_tool_schema(schema: dict, model: str = "") -> dict:
     return _norm(out, 0, root_defs)
 
 
+def _system_cache_control(system_val: list) -> dict:
+    """Breakpoint de cache du système : préserve celui du client (dont `ttl`).
+
+    Sans cela, un `cache_control: {ttl: 1h}` posé par le client sur le système
+    était aplati par `_extract_text` puis remplacé par un breakpoint nu =
+    rétrogradé silencieusement à 5 min. Dernier breakpoint client gagnant ;
+    défaut nu seulement si le client n'en a posé aucun.
+    """
+    cc: dict = {"type": "ephemeral"}
+    for block in system_val or []:
+        if isinstance(block, dict) and isinstance(block.get("cache_control"), dict):
+            cc = dict(block["cache_control"])
+            cc.setdefault("type", "ephemeral")
+    return cc
+
+
 def anthropic_to_openai(body: dict, model: str, raw: bytes | None = None) -> dict:
     # ``raw`` : bytes bruts du client, consommés uniquement par le wrapper de
     # cache (plus bas) — l'implémentation d'origine n'en a pas besoin.
+    # Parité OpenCodeClient : filtre des contenus vides côté requête Anthropic
+    # (l'amont rejette les contenus vides en 400). Copie défensive, jamais vide.
+    body = filter_anthropic_request_body(body)
     thinking = isinstance(body.get("thinking"), dict) and body["thinking"].get("type") in (
         "enabled",
         "adaptive",
@@ -1083,7 +1190,7 @@ def anthropic_to_openai(body: dict, model: str, raw: bytes | None = None) -> dic
             text = _strip_billing_header(text)
             msg: dict[str, Any] = {"role": "system", "content": text}
             if supports_cache_control:
-                msg["cache_control"] = {"type": "ephemeral"}
+                msg["cache_control"] = _system_cache_control(system_val)
             messages.append(msg)
     elif system_val:
         msg = {"role": "system", "content": _strip_billing_header(system_val)}
@@ -1401,10 +1508,15 @@ def anthropic_to_openai(body: dict, model: str, raw: bytes | None = None) -> dic
             messages.append(out)
 
     # ── Orphan filter: drop role:tool without preceding tool_calls id ──
-    messages = _drop_orphan_tool_messages(messages)
+    # (désactivé si chaînage serveur : l'appariement vit côté upstream)
+    messages = _drop_orphan_tool_messages(messages, body)
 
     # Add cache_control to the last user message for optimal prefix caching
-    # (Anthropic best practice: cache system + last user turn)
+    # (Anthropic best practice: cache system + last user turn).
+    # DIVERGENCE ASSUMÉE vs OpenCodeClient (applyCaching : système + 2 derniers
+    # tours) : le contrat est verrouillé par
+    # test_breakpoint_injection_is_bounded_and_under_the_anthropic_limit (≤2
+    # breakpoints injectés, budget 4 préservé pour les breakpoints clients).
     if supports_cache_control:
         for i in range(len(messages) - 1, -1, -1):
             if messages[i].get("role") == "user":
@@ -1561,14 +1673,38 @@ def anthropic_to_openai(body: dict, model: str, raw: bytes | None = None) -> dic
                 oai["tool_choice"] = {"type": "function", "function": {"name": tc.get("name", "")}}
             elif tc_type == "any":
                 oai["tool_choice"] = "required"
-            else:
+            elif tc_type == "none":
+                # `none` ≠ `auto` : interdiction d'outil, jamais choix libre.
+                oai["tool_choice"] = "none"
+            elif tc_type == "function" and isinstance(tc.get("function"), dict):
+                # Forme Chat déjà : passthrough (le rename suit plus bas).
+                oai["tool_choice"] = {
+                    "type": "function",
+                    "function": {"name": tc["function"].get("name", "")},
+                }
+            elif tc_type == "auto":
                 oai["tool_choice"] = "auto"
+            else:
+                _debug(f"  [convert] tool_choice Anthropic inconnu {tc_type!r} → auto")
+                oai["tool_choice"] = "auto"
+        elif isinstance(tc, str):
+            # `any` n'existe pas côté Chat → `required` (équivalent officiel).
+            # `required` (forme Chat) passe tel quel — sinon il tombait en `auto`.
+            oai["tool_choice"] = {"auto": "auto", "any": "required", "none": "none", "required": "required"}.get(
+                tc, "auto"
+            )
+            if oai["tool_choice"] == "auto" and tc != "auto":
+                _debug(f"  [convert] tool_choice string inconnu {tc!r} → auto")
         else:
-            oai["tool_choice"] = tc
+            oai["tool_choice"] = "auto"
         # [Lot L4 — A8] Le tool_choice nommé doit désigner le nom RÉELLEMENT
         # envoyé, sinon l'amont cherche un outil inexistant (400/422).
         if isinstance(oai.get("tool_choice"), dict):
             oai["tool_choice"] = _remap_chat_tool_choice(oai["tool_choice"], _chat_name_map)
+
+    # Parité SDK : metadata/user/service_tier valides côté Chat — hors du
+    # bloc tools (ils existent aussi sans outils).
+    _relay_chat_optional_fields(oai, body)
 
     # [Lot L4 — A8] Historique : les tool_calls des tours précédents suivent le
     # même rename que tools[] (hors ce bloc : l'historique peut porter des noms
@@ -1590,6 +1726,16 @@ def anthropic_to_openai(body: dict, model: str, raw: bytes | None = None) -> dic
             f"  [thinking] {model}: reasoning_effort={_decision.level} "
             f"(source={_decision.source}, explicit={_decision.explicit})"
         )
+
+    # ── Parité OpenCodeClient (normalizeMessages / sampling) ──
+    # Post-traitement du corps converti, AVANT la clôture cache pour que le
+    # plafond 4 couvre aussi les breakpoints ajoutés. No-op sur les entrées
+    # déjà propres (sanitize/scrub ne touchent que l'invalide).
+    try:
+        if not _PARITY_DISABLED:
+            _apply_opencode_client_parity(oai, body, model)
+    except Exception:
+        pass
 
     # ── [Lot L11 — A20] Clôture cache : top-level + plafond 4 ──
     # L'ancien retour anticipé sur la source ``reasoning_effort`` est supprimé :
@@ -1906,6 +2052,15 @@ def openai_to_anthropic_request(oai_body: dict) -> dict:
             system_text = _extract_text(msg.get("content", ""))
             continue
 
+        if role == "developer":
+            # Parité SDK : developer = system sous un autre nom. Sans cela le
+            # message tombait dans le filtre `not in ("user","assistant")`
+            # plus bas → consigne système silencieusement perdue.
+            _dev_text = _extract_text(msg.get("content", ""))
+            if _dev_text:
+                system_text = f"{system_text}\n\n{_dev_text}" if system_text else _dev_text
+            continue
+
         if role == "tool":
             # tool_result multimodal : texte + images préservés (pas d'aplat
             # _extract_text qui perdait les bytes image).
@@ -2155,6 +2310,17 @@ def openai_to_anthropic_request(oai_body: dict) -> dict:
     if pending_tool_results:
         anthro_messages.append({"role": "user", "content": pending_tool_results})
 
+    # Parité OpenCodeClient : filtre des contenus vides côté requête Anthropic
+    # (remplace le pis-aller `text:""` qui partait en 400). Garde : si tout est
+    # vide, on conserve l'original (un `messages: []` serait pire).
+    if not _PARITY_DISABLED:
+        try:
+            _filtered = filter_empty_anthropic_messages(anthro_messages)
+            if _filtered:
+                anthro_messages = _filtered
+        except Exception:
+            pass
+
     result = {
         "model": oai_body.get("model", ""),
         "messages": anthro_messages,
@@ -2178,6 +2344,9 @@ def openai_to_anthropic_request(oai_body: dict) -> dict:
     ]:
         if key in oai_body:
             result[anthro_key] = oai_body[key]
+
+    # Parité SDK : metadata/service_tier valides côté Anthropic, user → user_id.
+    _relay_anthropic_optional_fields(result, oai_body)
 
     # Convert tools - v3.3: preserve server tools B4
     if "tools" in oai_body:
@@ -2230,7 +2399,9 @@ def openai_to_anthropic_request(oai_body: dict) -> dict:
         if anthro_tools:
             result["tools"] = anthro_tools
 
-        # Convert tool_choice
+        # Convert tool_choice (formes Chat valides : none/auto/required + dict
+        # function — la forme objet Anthropic {type} est émise, jamais de string
+        # nue que l'amont rejetterait en 400).
         tc = oai_body.get("tool_choice", "auto")
         if isinstance(tc, dict):
             tc_type = tc.get("type", "auto")
@@ -2239,12 +2410,21 @@ def openai_to_anthropic_request(oai_body: dict) -> dict:
                     "type": "tool",
                     "name": tc.get("function", {}).get("name", ""),
                 }
-            elif tc_type == "any":
-                result["tool_choice"] = {"type": "any"}
+            elif tc_type in ("any", "auto", "none"):
+                result["tool_choice"] = {"type": tc_type}
             else:
-                result["tool_choice"] = tc_type
+                _debug(f"  [convert] tool_choice Chat dict inconnu {tc_type!r} → auto")
+                result["tool_choice"] = {"type": "auto"}
+        elif isinstance(tc, str):
+            if tc == "required":
+                result["tool_choice"] = {"type": "any"}
+            elif tc in ("auto", "any", "none"):
+                result["tool_choice"] = {"type": tc}
+            else:
+                _debug(f"  [convert] tool_choice string inconnu {tc!r} → auto")
+                result["tool_choice"] = {"type": "auto"}
         else:
-            result["tool_choice"] = tc
+            result["tool_choice"] = {"type": "auto"}
 
     # [Lot H4 / Lot L2] Sens inverse de _effort_to_reasoning : un client OpenAI
     # qui envoie reasoning_effort doit obtenir une config thinking Anthropic
@@ -2598,11 +2778,26 @@ def openai_responses_to_anthropic(body: dict) -> dict:
         if isinstance(tc, dict):
             tc_type = tc.get("type", "auto")
             if tc_type == "function":
-                result["tool_choice"] = {"type": "tool", "name": tc.get("name", "")}
+                # Forme Responses {"type":"function","name"} + forme Chat
+                # {"type":"function","function":{"name"}} : les deux arrivent ici.
+                _nm = tc.get("name", "") or (tc.get("function", {}) or {}).get("name", "")
+                result["tool_choice"] = {"type": "tool", "name": _nm}
+            elif tc_type in ("any", "auto", "none"):
+                result["tool_choice"] = {"type": tc_type}
             else:
-                result["tool_choice"] = tc_type
+                _debug(f"  [convert] tool_choice Responses dict inconnu {tc_type!r} → auto")
+                result["tool_choice"] = {"type": "auto"}
+        elif isinstance(tc, str):
+            # Formes Chat valides vers objet Anthropic (jamais de string nue).
+            if tc == "required":
+                result["tool_choice"] = {"type": "any"}
+            elif tc in ("auto", "any", "none"):
+                result["tool_choice"] = {"type": tc}
+            else:
+                _debug(f"  [convert] tool_choice string inconnu {tc!r} → auto")
+                result["tool_choice"] = {"type": "auto"}
         else:
-            result["tool_choice"] = tc
+            result["tool_choice"] = {"type": "auto"}
 
     # Convert Anthropic thinking/effort -> model-specific reasoning parameter.
     # [Lot L2] SOURCE UNIQUE, comme P2 et P4. ``resolve_effort`` couvre
@@ -2623,6 +2818,8 @@ def openai_responses_to_anthropic(body: dict) -> dict:
         _apply_anthropic_effort(
             result, _decision.level, result.get("model", ""), source=_decision.source
         )
+    # Parité SDK : metadata/service_tier valides côté Anthropic, user → user_id.
+    _relay_anthropic_optional_fields(result, body)
 
     return result
 
@@ -2660,6 +2857,14 @@ def anthropic_to_openai_responses(anthro: dict, model: str, name_map: dict | Non
                     "  [convert] thinking display=omitted (texte vide) → "
                     "pas d'item reasoning vide émis"
                 )
+        elif btype == "redacted_thinking":
+            # Raisonnement chiffré authentique : préservé rejouable
+            # (encrypted_content) au lieu d'être droppé en silence.
+            _data = block.get("data", "")
+            if isinstance(_data, str) and _data:
+                output_items.insert(0, {"type": "reasoning", "encrypted_content": _data, "summary": []})
+            else:
+                _debug("  [convert] redacted_thinking sans data → droppé")
         elif btype == "tool_use":
             function_calls.append(
                 {
@@ -2928,6 +3133,427 @@ def _register_defensive_short(name: str, name_map: dict) -> str:
         n += 1
     name_map[short] = name
     return short
+
+
+# ── Parité OpenCodeClient (sst/opencode provider/transform.ts) ──
+# Ports fidèles des normalisations du client officiel, appliquées au corps
+# OpenAI-chat CONVERTI (équivalent de normalizeMessages / temperature / topP /
+# topK / applyCaching pour notre pont Anthropic → OpenAI-chat) :
+#   * sanitize_surrogates — le client nettoie les surrogats solitaires sur TOUS
+#     les rôles avant envoi (l'amont rejette sinon) ;
+#   * scrub des tool_call_id — claude : ``[^a-zA-Z0-9_-]→"_"`` ; mistral (& co) :
+#     alphanumérique, 9 chars, pad "0", + insertion d'un tour assistant "Done."
+#     entre tool→user (Mistral refuse tool suivi de user) ;
+#   * deepseek — tout message assistant porte ``reasoning_content`` (même " ") :
+#     le champ, même vide, DOIT être renvoyé aux tours suivants ;
+#   * sampling_defaults_for_model — temperature/top_p/top_k par défaut quand le
+#     client n'en envoie pas (claude→inchangé, gemini/glm/minimax/kimi→valeurs
+#     officielles) ;
+#   * cache — le 2ᵉ breakpoint (avant-dernier message non-système) est posé dans
+#     la boucle « last user » plus bas (applyCaching officiel : 2 derniers).
+_SURROGATE_RE = re.compile(r"[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]")
+_CLAUDE_TOOL_ID_RE = re.compile(r"[^a-zA-Z0-9_-]")
+_MISTRAL_TOOL_ID_RE = re.compile(r"[^a-zA-Z0-9]")
+_MISTRAL_FAMILIES = ("mistral", "devstral", "codestral", "pixtral", "mixtral")
+# Coupe-circuit de diagnostic (tests) : True = normalisations de parité désactivées.
+_PARITY_DISABLED = False
+
+
+def _anthropic_block_meaningful(block: dict) -> bool:
+    """Un bloc Anthropic compte comme contenu non-vide (garde le message)."""
+    if not isinstance(block, dict):
+        return True
+    btype = block.get("type")
+    if btype == "text":
+        return bool(isinstance(block.get("text"), str) and block["text"] != "")
+    if btype == "thinking":
+        text = block.get("thinking", "")
+        if isinstance(text, str) and text.strip():
+            return True
+        # Port transform.ts : un reasoning signé/donnée redactée survit vide.
+        return bool(block.get("signature") or block.get("redacted_data") or block.get("data"))
+    if btype == "redacted_thinking":
+        return bool(block.get("data"))
+    # tool_use / tool_result / image / document / autres : jamais filtrés ici.
+    return True
+
+
+def filter_empty_anthropic_messages(messages: list) -> list:
+    """Port du filtre vide Anthropic/Bedrock (normalizeMessages).
+
+    Retire les parts ``text:""`` et les ``thinking`` vides non signés ; un
+    message sans plus aucun contenu significatif est retiré (l'amont Anthropic
+    rejette les contenus vides en 400). Retourne une NOUVELLE liste.
+    """
+    if not isinstance(messages, list):
+        return messages
+    out = []
+    for m in messages:
+        if not isinstance(m, dict):
+            out.append(m)
+            continue
+        content = m.get("content")
+        if isinstance(content, str):
+            if content == "":
+                continue
+            out.append(m)
+            continue
+        if not isinstance(content, list):
+            out.append(m)
+            continue
+        kept = [b for b in content if not isinstance(b, dict) or _anthropic_block_meaningful(b)]
+        if not kept:
+            continue
+        if len(kept) != len(content):
+            m = dict(m)
+            m["content"] = kept
+        out.append(m)
+    return out
+
+
+# ── Modalités d'entrée par modèle (port de unsupportedParts / capabilities) ──
+# Table explicite pour les modèles du proxy ; défaut = texte seul (un modèle
+# inconnu ne se voit jamais attribuer une modalité qu'il n'a pas).
+_MODEL_INPUT_MODALITIES: dict[str, set[str]] = {}
+
+
+def _register_model_modalities() -> dict[str, set[str]]:
+    table: dict[str, set[str]] = {}
+    full = {"text", "image", "pdf"}
+    for fam in (
+        "claude",
+        "gpt-",
+        "kimi",
+        "glm",
+        "minimax",
+        "muse-spark",
+        "qwen",
+        "deepseek",
+        "mistral",
+        "gemini",
+        "grok",
+    ):
+        table[fam] = set(full)
+    table["audio_in"] = {"text", "image", "pdf", "audio"}
+    return table
+
+
+_MODEL_INPUT_MODALITIES = _register_model_modalities()
+
+
+def model_supports_modality(model: str, modality: str) -> bool:
+    """True si le modèle accepte la modalité d'entrée.
+
+    Source unique : ``config.settings.get_model_capabilities`` (catalogue
+    explicite + défauts par famille) ; la table locale ne sert que de repli
+    si settings est indisponible. Modèle inconnu → texte seul.
+    """
+    try:
+        _caps_fn = getattr(_cfg_settings, "get_model_capabilities", None)
+        if callable(_caps_fn):
+            caps = _caps_fn(model)
+            if isinstance(caps, dict):
+                inputs = caps.get("input", [])
+                if isinstance(inputs, (list, tuple, set, frozenset)):
+                    return modality in set(inputs)
+    except Exception:
+        pass
+    mid = str(model or "").lower()
+    for fam, mods in _MODEL_INPUT_MODALITIES.items():
+        if fam in mid:
+            return modality in mods
+    return modality == "text"
+
+
+def unsupported_modality_error_text(modality: str, filename: str | None = None) -> str:
+    """Port de unsupportedParts : texte d'erreur explicite à la place d'un
+    contenu qu'un modèle ne sait pas lire (le modèle en informe l'utilisateur)."""
+    name = f'"{filename}"' if filename else modality
+    return f"ERROR: Cannot read {name} (this model does not support {modality} input). Inform the user."
+
+
+# ── Thinking moderne Anthropic (ports de transform.ts) ──
+_ANTHROPIC_VERSION_RE = re.compile(r"claude-(?:([a-z]+)-)?(\d+)(?:[.-](\d{1,2}))?(?:-([a-z]+))?(?:[.@-]|$)", re.IGNORECASE)
+
+
+def anthropic_modern_adaptive_thinking(model: str) -> bool:
+    """Claude 4.7+ (pensée adaptive moderne, `display` défaut `omitted`)."""
+    m = _ANTHROPIC_VERSION_RE.search(str(model or ""))
+    if not m:
+        return "claude" in str(model or "").lower()
+    major, minor = int(m.group(2)), int(m.group(3) or 0)
+    return major > 4 or (major == 4 and minor >= 7)
+
+
+def anthropic_binds_thinking(model: str) -> bool:
+    """Claude 5.1+ lie la signature au préfixe (sauf Mythos 5.1)."""
+    m = _ANTHROPIC_VERSION_RE.search(str(model or ""))
+    if not m:
+        return False
+    major, minor = int(m.group(2)), int(m.group(3) or 0)
+    fam = (m.group(1) or m.group(4) or "").lower()
+    if major == 5 and minor == 1 and fam == "mythos":
+        return False
+    return major > 5 or (major == 5 and minor >= 1)
+
+
+ANTHROPIC_BLOCK_BINDING = {"prefixMismatchBehavior": "drop_block"}
+
+
+def apply_anthropic_thinking_display(thinking: dict, model: str) -> dict:
+    """Force `display: summarized` sur adaptive moderne (défaut `omitted`
+    rendrait des blocs thinking vides), et `blockBinding: drop_block` sur
+    5.1+ (le préfixe re-rendu entre tours serait sinon rejeté en 400)."""
+    if not isinstance(thinking, dict):
+        return thinking
+    ttype = thinking.get("type")
+    if ttype not in ("adaptive", "enabled"):
+        return thinking
+    if ttype == "adaptive" and anthropic_modern_adaptive_thinking(model):
+        thinking.setdefault("display", "summarized")
+    if anthropic_binds_thinking(model) and "blockBinding" not in thinking:
+        thinking["blockBinding"] = dict(ANTHROPIC_BLOCK_BINDING)
+    return thinking
+
+
+def sanitize_surrogates(text: str) -> str:
+    """Port de ``sanitizeSurrogates`` (transform.ts) : surrogats solitaires → U+FFFD."""
+    if not isinstance(text, str) or not text:
+        return text
+    return _SURROGATE_RE.sub("\ufffd", text)
+
+
+def scrub_claude_tool_id(tid: str) -> str:
+    """Port du scrub claude (transform.ts) : ``[^a-zA-Z0-9_-]`` → ``"_"``."""
+    if not isinstance(tid, str) or not tid:
+        return tid
+    return _CLAUDE_TOOL_ID_RE.sub("_", tid)
+
+
+def scrub_mistral_tool_id(tid: str) -> str:
+    """Port du scrub mistral (transform.ts) : alphanum, 9 chars, pad "0"."""
+    if not isinstance(tid, str) or not tid:
+        return tid
+    return _MISTRAL_TOOL_ID_RE.sub("", tid)[:9].ljust(9, "0")
+
+
+def _is_mistral_model(model: str) -> bool:
+    mid = str(model or "").lower()
+    return "mistral" in str(model or "").lower() or any(f in mid for f in _MISTRAL_FAMILIES)
+
+
+def _is_deepseek_model(model: str) -> bool:
+    return "deepseek" in str(model or "").lower()
+
+
+def _is_claude_model(model: str) -> bool:
+    return "claude" in str(model or "").lower()
+
+
+def scrub_openai_tool_ids(messages: list, model: str) -> int:
+    """Scrub les tool_call_id d'un corps OpenAI-chat selon la famille du modèle.
+
+    No-op sur les IDs déjà valides (ex. ``toolu_…`` claude-compatibles).
+    Retourne le nombre d'IDs modifiés.
+    """
+    if not isinstance(messages, list) or not messages:
+        return 0
+    mistral = _is_mistral_model(model)
+    claude = _is_claude_model(model)
+    if not mistral and not claude:
+        return 0
+    scrub = scrub_mistral_tool_id if mistral else scrub_claude_tool_id
+    changed = 0
+    for m in messages:
+        if not isinstance(m, dict):
+            continue
+        for tc in m.get("tool_calls") or []:
+            if isinstance(tc, dict) and isinstance(tc.get("id"), str):
+                new = scrub(tc["id"])
+                if new != tc["id"]:
+                    tc["id"] = new
+                    changed += 1
+        if m.get("role") == "tool" and isinstance(m.get("tool_call_id"), str):
+            new = scrub(m["tool_call_id"])
+            if new != m["tool_call_id"]:
+                m["tool_call_id"] = new
+                changed += 1
+    if changed:
+        _debug(f"  [parity] scrub tool_ids model={model!r} changed={changed}")
+    return changed
+
+
+def fix_mistral_tool_user_sequence(messages: list, model: str) -> int:
+    """Port du fix de séquence mistral : un message tool suivi d'un user reçoit
+    un tour assistant ``"Done."`` intercalé. Retourne le nombre d'insertions."""
+    if not _is_mistral_model(model) or not isinstance(messages, list):
+        return 0
+    inserted = 0
+    out: list = []
+    for i, m in enumerate(messages):
+        out.append(m)
+        nxt = messages[i + 1] if i + 1 < len(messages) else None
+        if (
+            isinstance(m, dict)
+            and m.get("role") == "tool"
+            and isinstance(nxt, dict)
+            and nxt.get("role") == "user"
+        ):
+            out.append({"role": "assistant", "content": "Done."})
+            inserted += 1
+    if inserted:
+        messages[:] = out
+        _debug(f"  [parity] mistral tool→user fix model={model!r} inserted={inserted}")
+    return inserted
+
+
+def ensure_deepseek_reasoning(messages: list, model: str) -> int:
+    """Port deepseek (transform.ts) : chaque message assistant porte
+    ``reasoning_content`` (même vide) pour rejouabilité multi-tours."""
+    if not _is_deepseek_model(model) or not isinstance(messages, list):
+        return 0
+    fixed = 0
+    for m in messages:
+        if isinstance(m, dict) and m.get("role") == "assistant" and "reasoning_content" not in m:
+            m["reasoning_content"] = " "
+            fixed += 1
+    if fixed:
+        _debug(f"  [parity] deepseek reasoning_content default model={model!r} fixed={fixed}")
+    return fixed
+
+
+def sanitize_openai_texts(messages: list) -> int:
+    """Applique ``sanitize_surrogates`` aux contenus texte d'un corps OpenAI-chat."""
+    if not isinstance(messages, list):
+        return 0
+    fixed = 0
+    for m in messages:
+        if not isinstance(m, dict):
+            continue
+        content = m.get("content")
+        if isinstance(content, str):
+            new = sanitize_surrogates(content)
+            if new != content:
+                m["content"] = new
+                fixed += 1
+        elif isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and isinstance(part.get("text"), str):
+                    new = sanitize_surrogates(part["text"])
+                    if new != part["text"]:
+                        part["text"] = new
+                        fixed += 1
+    return fixed
+
+
+def sampling_defaults_for_model(model: str) -> dict:
+    """Port de temperature/topP/topK (transform.ts) : défauts d'échantillonnage
+    par modèle, {} quand le client ne doit pas être touché (claude→undefined)."""
+    mid = str(model or "").lower()
+    out: dict = {}
+    if "north-mini-code" in mid:
+        return {"temperature": 1.0}
+    if "claude" in mid:
+        return {}
+    if "gemini" in mid:
+        import re as _re
+
+        if any(
+            _re.search(p, mid)
+            for p in (
+                r"gemini-2[.-]5(?:[.-]|$)",
+                r"gemini-3-(?:flash|pro)(?:[.-]|$)",
+                r"gemini-3[.-]1(?:[.-]|$)",
+            )
+        ):
+            return {"temperature": 1.0, "top_p": 0.95, "top_k": 64}
+        return {}
+    if "glm-4.6" in mid or "glm-4.7" in mid:
+        return {"temperature": 1.0}
+    if "minimax-m2" in mid:
+        out = {"temperature": 1.0, "top_p": 0.95}
+        out["top_k"] = 40 if any(s in mid for s in ("m2.", "m25", "m21")) else 20
+        return out
+    if "kimi-k2" in mid:
+        if any(s in mid for s in ("thinking", "k2.", "k2p", "k2-5", "k2.5")):
+            return {"temperature": 1.0, "top_p": 0.95}
+        return {"temperature": 0.6}
+    if "kimi" in mid or "k2p" in mid:
+        return {}
+    return {}
+
+
+def apply_opencode_sampling_defaults(oai: dict, model: str) -> bool:
+    """Pose les défauts d'échantillonnage UNIQUEMENT si le client n'a rien envoyé.
+
+    Ne touche jamais une valeur cliente explicite (le proxy reste un pont).
+    Retourne True si au moins un défaut a été posé."""
+    if not isinstance(oai, dict):
+        return False
+    defaults = sampling_defaults_for_model(model)
+    if not defaults:
+        return False
+    applied = False
+    for key, val in defaults.items():
+        if key not in oai:
+            oai[key] = val
+            applied = True
+    if applied:
+        _debug(f"  [parity] sampling defaults model={model!r} {defaults}")
+    return applied
+
+
+def _apply_opencode_client_parity(oai: dict, body: dict, model: str) -> dict:
+    """Orchestre les normalisations OpenCodeClient sur un corps converti (muté).
+
+    Appelé en fin de ``_orig_anthropic_to_openai``, AVANT la clôture cache pour
+    que le plafond 4 couvre tous les breakpoints. No-op sur entrées propres."""
+    if not isinstance(oai, dict):
+        return oai
+    messages = oai.get("messages")
+    if isinstance(messages, list):
+        sanitize_openai_texts(messages)
+        scrub_openai_tool_ids(messages, model)
+        fix_mistral_tool_user_sequence(messages, model)
+        ensure_deepseek_reasoning(messages, model)
+    apply_opencode_sampling_defaults(oai, model)
+    return oai
+
+
+def filter_anthropic_request_body(body: dict) -> dict:
+    """Filtre vide sur un corps requête Anthropic (port normalizeMessages).
+
+    Retire les parts ``text:""`` / ``thinking`` vides non signés et les
+    messages vidés ; ``system`` liste traité pareil (chaîne vide = absent).
+    Ne mute JAMAIS l'entrée (copie défensive) et ne renvoie jamais un corps
+    sans messages (repli entrée intacte). No-op si ``_PARITY_DISABLED``.
+    """
+    if _PARITY_DISABLED or not isinstance(body, dict):
+        return body
+    try:
+        msgs = body.get("messages")
+        system = body.get("system")
+        new_msgs = filter_empty_anthropic_messages(msgs) if isinstance(msgs, list) else msgs
+        new_system: object = system
+        if isinstance(system, list):
+            _kept = filter_empty_anthropic_messages([{"role": "system", "content": system}])
+            new_system = _kept[0]["content"] if _kept else None
+        elif isinstance(system, str) and system == "":
+            new_system = None
+        if new_msgs is msgs and (new_system is system or new_system == system):
+            return body
+        if isinstance(msgs, list) and not new_msgs:
+            return body
+        out = dict(body)
+        if isinstance(msgs, list):
+            out["messages"] = new_msgs
+        if new_system is None:
+            out.pop("system", None)
+        elif new_system is not system:
+            out["system"] = new_system
+        return out
+    except Exception:
+        return body
 
 
 def _remap_responses_history_names(inp: list, name_map: dict) -> dict:
@@ -3294,7 +3920,12 @@ def _sanitize_native_responses_request(req: dict) -> dict:
         if isinstance(_native_effort, str) and _native_effort:
             _req_model = req.get("model", "")
             _clamped = _effort_to_reasoning(_native_effort, _req_model)
-            if _clamped != _native_effort:
+            if _clamped is None:
+                # Désactivé (none/off) : la clé reasoning entière sort
+                # (le SDK n'émet aucun reasoning dans ce cas).
+                req.pop("reasoning", None)
+                _debug(f"  [thinking] {_req_model}: reasoning désactivé (effort={_native_effort!r}) → clé retirée")
+            elif _clamped != _native_effort:
                 req["reasoning"] = dict(_native_reasoning, effort=_clamped)
                 _debug(f"  [thinking] {_req_model}: reasoning.effort clampé {_native_effort} → {_clamped}")
     name_map = req.get(_TOOL_NAME_MAP_KEY)
@@ -3309,9 +3940,13 @@ def _sanitize_native_responses_request(req: dict) -> dict:
     if isinstance(inp, list) and inp:
         req["input"] = [dict(it) if isinstance(it, dict) else it for it in inp]
         req["input"] = _normalize_responses_input_items(req["input"])
+        # Parité client officiel : strip des `id` d'items (comme Codex).
+        req["input"] = _strip_responses_item_ids(req["input"])
         _remap_responses_history_names(req["input"], name_map)
     if req.get("tool_choice") is not None:
         req["tool_choice"] = _remap_responses_tool_choice(req["tool_choice"], name_map)
+    # Parité SDK : store:false + reasoning → include encrypted_content (rejeu).
+    _ensure_encrypted_content_include(req)
     if name_map:
         req[_TOOL_NAME_MAP_KEY] = name_map
     else:
@@ -3352,6 +3987,190 @@ def _relay_responses_storage_fields(req: dict, source: dict) -> None:
         _debug(f"  [convert] DROP truncation invalide: {truncation!r}")
 
 
+def _is_responses_reasoning_model(model_id: str) -> bool:
+    """True si le modèle passe par /v1/responses en mode raisonnement (muse/spark).
+
+    Miroir de la règle d'endpoint de ``config/settings.py`` (muse/spark →
+    Responses). Le SDK ``@ai-sdk/openai`` applique à ces modèles :
+    system→developer, suppression temperature/top_p, summary 'detailed' par défaut.
+    """
+    try:
+        lid = str(model_id or "").lower()
+    except Exception:
+        return False
+    return ("muse" in lid) or ("spark" in lid)
+
+
+def _strip_responses_item_ids(inp: list) -> list:
+    """Strip les ``id`` des items d'historique Responses (parité client officiel).
+
+    Le client officiel (``packages/opencode/src/provider/provider.ts``, wrapper
+    fetch « Strip openai itemId metadata following what codex does ») supprime
+    ``id`` de chaque item de ``input`` avant envoi à Zen. ``call_id``
+    (appariement function_call/output) et ``encrypted_content`` (rejeu reasoning
+    sans store) sont TOUJOURS conservés. Exception : ``item_reference`` n'est
+    QUE son ``id`` — le stripper = supprimer l'item, on le garde tel quel.
+    Idempotent, copie défensive (jamais de mutation du caller).
+    """
+    if not isinstance(inp, list):
+        return inp
+    out = []
+    for item in inp:
+        if not isinstance(item, dict) or "id" not in item:
+            out.append(item)
+            continue
+        if item.get("type") == "item_reference":
+            out.append(item)
+            continue
+        cp = dict(item)
+        cp.pop("id", None)
+        out.append(cp)
+    return out
+
+
+_RESPONSES_OPTIONAL_STR_FIELDS = (
+    "instructions",
+    "conversation",
+    "previous_response_id",
+    "prompt_cache_key",
+    "prompt_cache_retention",
+    "user",
+    "safety_identifier",
+    "service_tier",
+)
+
+
+def _relay_responses_optional_fields(req: dict, source: dict) -> None:
+    """Relaie les champs Responses optionnels présents chez le client (parité SDK).
+
+    Le SDK ``@ai-sdk/openai`` les émet (conversation, previous_response_id,
+    prompt_cache_key, service_tier, metadata, parallel_tool_calls, max_tool_calls,
+    user, instructions, include, text, top_logprobs...) ; le proxy les droppait
+    silencieusement sur les jambes converties (le passthrough natif les garde
+    déjà par copie intégrale). Ne pose AUCUN défaut : absent → absent
+    (sémantique upstream préservée). ``conversation`` + ``previous_response_id``
+    ensemble → le SDK refuse (warning) : on garde previous_response_id, on
+    droppe conversation (log). N'écrase jamais une valeur déjà posée par le
+    convertisseur (double conversion P6 sûre).
+    """
+    if not isinstance(req, dict) or not isinstance(source, dict):
+        return
+    for k in _RESPONSES_OPTIONAL_STR_FIELDS:
+        v = source.get(k)
+        if isinstance(v, str) and v and k not in req:
+            req[k] = v
+    if isinstance(source.get("metadata"), dict) and source["metadata"] and "metadata" not in req:
+        req["metadata"] = source["metadata"]
+    if isinstance(source.get("parallel_tool_calls"), bool) and "parallel_tool_calls" not in req:
+        req["parallel_tool_calls"] = source["parallel_tool_calls"]
+    if isinstance(source.get("max_tool_calls"), int) and "max_tool_calls" not in req:
+        req["max_tool_calls"] = source["max_tool_calls"]
+    if isinstance(source.get("top_logprobs"), int) and "top_logprobs" not in req:
+        req["top_logprobs"] = source["top_logprobs"]
+    if isinstance(source.get("text"), dict) and source["text"] and "text" not in req:
+        req["text"] = source["text"]
+    inc = source.get("include")
+    if isinstance(inc, list) and inc and "include" not in req:
+        _clean = [x for x in inc if isinstance(x, str) and x]
+        if _clean:
+            req["include"] = _clean
+    if req.get("previous_response_id") and req.get("conversation"):
+        _debug("  [convert] conversation + previous_response_id → conversation droppé (SDK: mutuellement exclusifs)")
+        del req["conversation"]
+
+
+def _relay_chat_optional_fields(req: dict, source: dict) -> None:
+    """Relaie `metadata`/`user`/`service_tier` vers une cible Chat (parité SDK).
+
+    Champs valides de l'API Chat Completions, droppés par nos conversions.
+    Relayés, jamais inventés.
+    """
+    if not isinstance(req, dict) or not isinstance(source, dict):
+        return
+    if isinstance(source.get("metadata"), dict) and source["metadata"] and "metadata" not in req:
+        req["metadata"] = source["metadata"]
+    for k in ("user", "service_tier"):
+        v = source.get(k)
+        if isinstance(v, str) and v and k not in req:
+            req[k] = v
+
+
+def _relay_anthropic_optional_fields(req: dict, source: dict) -> None:
+    """Relaie `metadata`/`service_tier` vers une cible Anthropic + `user`(Chat)
+    → `metadata.user_id` (forme Anthropic). Relayés, jamais inventés.
+    """
+    if not isinstance(req, dict) or not isinstance(source, dict):
+        return
+    meta = dict(req["metadata"]) if isinstance(req.get("metadata"), dict) else {}
+    if isinstance(source.get("metadata"), dict):
+        for k, v in source["metadata"].items():
+            meta.setdefault(k, v)
+    user = source.get("user")
+    if isinstance(user, str) and user:
+        meta.setdefault("user_id", user)
+    if meta and "metadata" not in req:
+        req["metadata"] = meta
+    st = source.get("service_tier")
+    if isinstance(st, str) and st and "service_tier" not in req:
+        req["service_tier"] = st
+
+
+def _relay_response_format(req: dict, source: dict) -> None:
+    """Relaie `response_format` (Chat) → `text.format` (Responses), parité SDK.
+
+    Le SDK émet `text: {format: {type: json_object|json_schema, ...}}` ; le
+    proxy droppait la consigne → réponse non contrainte, échec silencieux du
+    structured output. Formes Chat reconnues :
+      {"type": "json_object"} → {"type": "json_object"} ;
+      {"type": "json_schema", "json_schema": {"name","schema","strict",...}} →
+        {"type": "json_schema", "name", "schema", "strict"?} (+description?).
+    N'écrase jamais un `text` déjà posé ; absent → absent.
+    """
+    if not isinstance(req, dict) or not isinstance(source, dict):
+        return
+    if "text" in req:
+        return
+    rf = source.get("response_format")
+    if not isinstance(rf, dict):
+        return
+    rtype = rf.get("type")
+    if rtype == "json_object":
+        req["text"] = {"format": {"type": "json_object"}}
+    elif rtype == "json_schema" and isinstance(rf.get("json_schema"), dict):
+        js = rf["json_schema"]
+        fmt: dict = {"type": "json_schema"}
+        for k in ("name", "description", "schema", "strict"):
+            if js.get(k) is not None:
+                fmt[k] = js[k]
+        if isinstance(fmt.get("schema"), dict):
+            req["text"] = {"format": fmt}
+        else:
+            _debug("  [convert] DROP response_format json_schema sans schema → non relayé")
+    elif rtype == "text" or rtype is None:
+        return
+    else:
+        _debug(f"  [convert] DROP response_format type={rtype!r} → inconnu côté Responses")
+
+
+def _ensure_encrypted_content_include(req: dict) -> None:
+    """Ajoute ``reasoning.encrypted_content`` à ``include`` quand store===False (parité SDK).
+
+    Le SDK : ``if (store === false && isReasoningModel) addInclude(...)``. Sans
+    lui, un client store:false ne reçoit que le summary et ne peut pas rejouer
+    le reasoning au tour suivant. N'émet rien si store absent/vrai (défaut
+    upstream) ou sans bloc reasoning (pas de raisonnement à rejouer).
+    """
+    if not isinstance(req, dict) or req.get("store") is not False:
+        return
+    if not isinstance(req.get("reasoning"), dict):
+        return
+    inc = req.get("include")
+    if inc is None:
+        req["include"] = ["reasoning.encrypted_content"]
+    elif isinstance(inc, list) and "reasoning.encrypted_content" not in inc:
+        req["include"] = [*inc, "reasoning.encrypted_content"]
+
+
 def _chat_to_responses_request(chat: dict) -> dict:
     if "input" in chat and "messages" not in chat:
         # Verbatim natif Responses : sanitize quand même (tools + historique
@@ -3359,8 +4178,13 @@ def _chat_to_responses_request(chat: dict) -> dict:
         return _sanitize_native_responses_request(dict(chat))
     inp = []
     _has_reasoning_items = False
+    # Parité SDK (systemMessageMode='developer' pour les modèles de raisonnement) :
+    # le system Chat devient un item developer côté Responses, jamais system.
+    _is_reas = _is_responses_reasoning_model(chat.get("model", ""))
     for m in chat.get("messages", []) or []:
         role = m.get("role", "user")
+        if role == "system" and _is_reas:
+            role = "developer"
         content = m.get("content", "")
         # Preserve cache_control from the chat message for prefix caching
         cache_ctrl = m.get("cache_control")
@@ -3447,7 +4271,11 @@ def _chat_to_responses_request(chat: dict) -> dict:
                 ctype = "output_text" if role == "assistant" else "input_text"
                 item = {"role": role, "content": [{"type": ctype, "text": content}]}
                 if cache_ctrl:
-                    item["cache_control"] = cache_ctrl
+                    # `cache_control` n'existe pas au schéma Responses officiel :
+                    # ne jamais l'émettre (400 sur upstream strict). Le cache
+                    # Responses passe par `prompt_cache_key` (jambe free) — log
+                    # seul, pas de traduction inventée (cf. TROU 10 / L15).
+                    _debug("  [convert] DROP cache_control → item Responses (champ inconnu du schéma)")
                 inp.append(item)
         elif isinstance(content, list):
             parts: list[dict] = []
@@ -3531,7 +4359,8 @@ def _chat_to_responses_request(chat: dict) -> dict:
             if parts:
                 item = {"role": role, "content": parts}
                 if cache_ctrl:
-                    item["cache_control"] = cache_ctrl
+                    # Idem branche str : champ inconnu du schéma Responses.
+                    _debug("  [convert] DROP cache_control → item Responses (champ inconnu du schéma)")
                 inp.append(item)
         for tc in m.get("tool_calls", []) or []:
             fn = tc.get("function", {}) if isinstance(tc.get("function"), dict) else {}
@@ -3551,7 +4380,11 @@ def _chat_to_responses_request(chat: dict) -> dict:
                 }
             )
     # Orphan filter for Responses input
-    inp = _drop_orphan_responses_input(inp)
+    # (désactivé si chaînage serveur : l'appariement vit côté upstream)
+    inp = _drop_orphan_responses_input(inp, chat)
+    # Parité client officiel : strip des `id` d'items (provider.ts, comme Codex).
+    # `call_id`/`encrypted_content`/`item_reference` préservés (cf. helper).
+    inp = _strip_responses_item_ids(inp)
 
     # Guard: Responses input must be non-empty; log original chat for audit if empty
     if not inp:
@@ -3576,18 +4409,35 @@ def _chat_to_responses_request(chat: dict) -> dict:
     # Priorité inchangée pour les deux formes historiques : `max_output_tokens`
     # (forme Responses native) l'emporte sur `max_tokens` (héritée). La forme
     # moderne est ajoutée en dernier recours, donc aucun cas existant ne change.
+    # (Divergence assumée vs l'ordre canonique §11.8 de `_set_output_token_limit`
+    # — contrat figé par test_p5_preserves_historical_precedence ; ne s'active
+    # que si le client envoie deux formes divergentes.)
     for _key in ("max_output_tokens", "max_tokens", "max_completion_tokens"):
         _val = chat.get(_key)
         if isinstance(_val, int) and _val > 0:
-            req["max_output_tokens"] = _val
+            req["max_output_tokens"] = _clamp_max_output_tokens(_val, chat.get("model", ""))
             break
     # [Lot L15 — B5] Relaie `store` et `truncation` : les défauts Responses sont
     # `store=true` (rétention ≥30 j côté upstream) et `truncation="disabled"`
     # (400 en dépassement de contexte, pas de troncature silencieuse). Sans
     # relais, le client ne contrôle ni sa confidentialité ni son mode d'échec.
     _relay_responses_storage_fields(req, chat)
+    # Parité SDK : les champs optionnels (previous_response_id, prompt_cache_key,
+    # service_tier, instructions...) suivent quand le client les envoie.
+    _relay_responses_optional_fields(req, chat)
+    # Structured output : response_format (Chat) → text.format (Responses).
+    _relay_response_format(req, chat)
+    # NB : `_ensure_encrypted_content_include` est appelé en fin de fonction,
+    # APRÈS la pose de `req["reasoning"]` (il en dépend).
+    # Parité SDK : temperature/top_p NON supportés par les modèles de
+    # raisonnement (le SDK les supprime avec warning). Les émettre vers
+    # muse/spark = 400 évitable ou consigne silencieusement ignorée.
+    _drop_sampling = _is_responses_reasoning_model(chat.get("model", ""))
     for k in ("temperature", "top_p"):
         if k in chat:
+            if _drop_sampling:
+                _debug(f"  [convert] DROP {k} → modèle de raisonnement (SDK: non supporté)")
+                continue
             req[k] = chat[k]
     # Forward reasoning parameters to Responses API format.
     # Le clamp config (thinking.effort_caps) s'applique ici aussi : ce forward
@@ -3596,17 +4446,27 @@ def _chat_to_responses_request(chat: dict) -> dict:
     _chat_model = chat.get("model", "")
     if "reasoning_effort" in chat:
         effort = _effort_to_reasoning(chat["reasoning_effort"], _chat_model)
-        # summary:auto is required to get visible reasoning summary; without it
-        # upstream returns only encrypted_content and proxy emits placeholder.
-        req["reasoning"] = {"summary": "auto", "effort": effort}
+        if effort is None:
+            # Désactivé (none/off) : AUCUN bloc reasoning (parité thinkingLevel off).
+            _debug(f"  [thinking] {_chat_model}: effort désactivé → pas de reasoning")
+        else:
+            # Parité SDK : le défaut quand un effort est posé est 'detailed'
+            # (summary riche), pas 'auto' (condensé). undefined = pas de summary.
+            req["reasoning"] = {"summary": "detailed", "effort": effort}
     elif "reasoning" in chat:
         _raw_reasoning = chat["reasoning"]
         if isinstance(_raw_reasoning, dict):
             _raw_effort = _raw_reasoning.get("effort")
             if isinstance(_raw_effort, str) and _raw_effort:
-                _clamped = dict(_raw_reasoning)
-                _clamped["effort"] = _effort_to_reasoning(_raw_effort, _chat_model)
-                req["reasoning"] = _clamped
+                _clamped_effort = _effort_to_reasoning(_raw_effort, _chat_model)
+                if _clamped_effort is None:
+                    _debug(f"  [thinking] {_chat_model}: reasoning désactivé (effort={_raw_effort!r}) → clé retirée")
+                else:
+                    _clamped = dict(_raw_reasoning)
+                    _clamped["effort"] = _clamped_effort
+                    if "summary" not in _clamped:
+                        _clamped["summary"] = "detailed"
+                    req["reasoning"] = _clamped
             else:
                 req["reasoning"] = _raw_reasoning
         else:
@@ -3678,6 +4538,9 @@ def _chat_to_responses_request(chat: dict) -> dict:
         _remap_responses_history_names(inp, _alone)
         if _alone:
             req[_TOOL_NAME_MAP_KEY] = _alone
+    # Parité SDK : store:false + reasoning → include reasoning.encrypted_content.
+    # ICI (fin) car `req["reasoning"]` n'est posé qu'au milieu de la fonction.
+    _ensure_encrypted_content_include(req)
     return req
 
 
@@ -3690,7 +4553,10 @@ def _anthropic_to_responses_request(anthro: dict) -> dict:
     # [Lot L15 — B5] `anthropic_to_openai` ne transporte pas `store`/`truncation` :
     # on les relaie depuis le corps d'origine, sinon un client Anthropic ne peut
     # pas refuser la rétention ≥30 j ni choisir son mode de dépassement.
+    # Même relais pour les autres champs Responses optionnels (parité SDK).
     _relay_responses_storage_fields(req, anthro)
+    _relay_responses_optional_fields(req, anthro)
+    _ensure_encrypted_content_include(req)
     return req
 
 
@@ -3756,8 +4622,10 @@ def _responses_to_anthropic_response(resp: dict, model: str, name_map: dict | No
         if not isinstance(item, dict):
             continue
         if item.get("type") == "reasoning":
+            _seen_text = False
             for s in item.get("summary", []) or []:
                 if isinstance(s, dict) and s.get("text"):
+                    _seen_text = True
                     blocks.append(
                         {
                             "type": "thinking",
@@ -3765,6 +4633,10 @@ def _responses_to_anthropic_response(resp: dict, model: str, name_map: dict | No
                             "signature": _local_signature(s.get("text", "")),
                         }
                     )
+            if not _seen_text and isinstance(item.get("encrypted_content"), str) and item["encrypted_content"]:
+                # Pas de summary visible mais contenu chiffré authentique :
+                # bloc opaque rejouable (parité SDK) au lieu d'une perte sèche.
+                blocks.append({"type": "redacted_thinking", "data": item["encrypted_content"]})
         elif item.get("type") == "message":
             for blk in item.get("content", []) or []:
                 if isinstance(blk, dict) and blk.get("type") == "output_text" and blk.get("text"):
@@ -3804,6 +4676,9 @@ def _responses_to_anthropic_response(resp: dict, model: str, name_map: dict | No
         "usage": {
             "input_tokens": usage.get("input_tokens", 0),
             "output_tokens": usage.get("output_tokens", 0),
+            # F3 : la création cache (part la plus chère) était extraite mais
+            # jamais propagée — parité openai_to_anthropic (champ standard).
+            "cache_creation_input_tokens": _extract_cache_creation_tokens(usage),
             "cache_read_input_tokens": _cache_read,
         },
     }

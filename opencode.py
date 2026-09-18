@@ -324,8 +324,80 @@ def _get_auth_headers(protocol: str, entry: dict | None = None) -> dict:
             "x-api-key": ak,
             "Content-Type": "application/json",
             "anthropic-version": "2023-06-01",
+            # Parité client officiel (provider.ts, loader anthropic) : thinking
+            # intercalé + tool-streaming grain fin. Sans lui, l'amont dégrade.
+            "anthropic-beta": _ANTHROPIC_BETA,
         }
     return {"Authorization": f"Bearer {ak}", "Content-Type": "application/json"}
+
+
+# Parité client officiel (packages/opencode/src/provider/provider.ts, custom
+# loader `anthropic`) — exigé pour le thinking intercalé et le tool-streaming
+# grain fin sur la jambe Anthropic.
+_ANTHROPIC_BETA = "interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14"
+# Parité OpenCodeClient (anthropicBlockBinding) : le SDK patché ajoute ce beta
+# dès que `thinking.blockBinding` est posé — sans lui l'amont rejette le champ.
+_ANTHROPIC_BINDING_BETA = "thinking-binding-controls"
+
+
+def _body_has_thinking_block_binding(body) -> bool:
+    """True si un corps Anthropic porte `thinking.blockBinding` (5.1+)."""
+    try:
+        if not isinstance(body, dict):
+            return False
+        _th = body.get("thinking")
+        return isinstance(_th, dict) and isinstance(_th.get("blockBinding"), dict)
+    except Exception:
+        return False
+
+
+def _ensure_anthropic_beta(headers: dict, body=None) -> dict:
+    """Setdefault `anthropic-beta` sur des headers de jambe Anthropic.
+
+    Couvre les reconstructions manuelles de failover (qui ne passent pas par
+    `_get_auth_headers`) et le tunnel geo. Idempotent, ne touche jamais la clé.
+
+    Union avec les bêtas demandées par le CLIENT (capturées par
+    `_capture_client_anthropic_betas` à l'entrée des handlers) : le défaut
+    proxy (= client officiel : interleaved-thinking + fine-grained-tool-
+    streaming) est toujours présent, les bêtas du harness s'y ajoutent
+    (dédupliquées). `anthropic-version` : valeur client prioritaire si fournie.
+
+    `body` (optionnel, corps Anthropic) : si `thinking.blockBinding` est posé
+    (parité 5.1+), le beta `thinking-binding-controls` est ajouté — sans lui
+    l'amont rejette le champ en 400.
+    """
+    try:
+        if not isinstance(headers, dict):
+            return headers
+        try:
+            _client_betas = _current_client_anthropic_betas.get() or {}
+        except Exception:
+            _client_betas = {}
+        _beta_key = next((k for k in headers if str(k).lower() == "anthropic-beta"), "anthropic-beta")
+        _merged: list = []
+        _extra_betas = (_ANTHROPIC_BINDING_BETA,) if _body_has_thinking_block_binding(body) else ()
+        for _src in (
+            str(headers.get(_beta_key, "")),
+            _ANTHROPIC_BETA,
+            "".join(_extra_betas),
+            str((_client_betas or {}).get("anthropic-beta", "")),
+        ):
+            for _b in [x.strip() for x in _src.split(",") if x.strip()]:
+                if _b not in _merged:
+                    _merged.append(_b)
+        headers = dict(headers)
+        headers[_beta_key] = ",".join(_merged)
+        try:
+            _cv = str((_client_betas or {}).get("anthropic-version", "") or "").strip()
+        except Exception:
+            _cv = ""
+        if _cv:
+            _ver_key = next((k for k in headers if str(k).lower() == "anthropic-version"), "anthropic-version")
+            headers[_ver_key] = _cv
+        return headers
+    except Exception:
+        return headers
 
 
 # ── Boot instrumentation (Phase 0 — chantier vitesse boot) ──
@@ -554,6 +626,79 @@ _db_writer_task: asyncio.Task | None = None
 # Context variable to pass client user-agent from endpoint handlers to _save_request
 # without threading it through every intermediate function call.
 _current_user_agent: contextvars.ContextVar[str | None] = contextvars.ContextVar("_current_user_agent", default=None)
+
+# Passthrough des headers Anthropic du client vers l'amont (scope requête).
+# Le client officiel envoie `anthropic-beta` (interleaved-thinking,
+# fine-grained-tool-streaming) ; le proxy les abandonnait, privant l'amont
+# des features demandées par le harness. Allowlist stricte : seuls ces deux
+# headers sont re-forwardés (jamais d'auth/cookies/headers arbitraires).
+_CLIENT_ANTHROPIC_BETA_ALLOWLIST = ("anthropic-beta", "anthropic-version")
+_current_client_anthropic_betas: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "_current_client_anthropic_betas", default=None
+)
+
+
+def _capture_client_anthropic_betas(request_headers) -> None:
+    """Mémorise les headers bêta du client (scope requête, jamais de fuite)."""
+    try:
+        betas = {}
+        for _name in _CLIENT_ANTHROPIC_BETA_ALLOWLIST:
+            try:
+                _v = request_headers.get(_name, "")
+            except Exception:
+                _v = ""
+            if _v:
+                betas[_name] = _v
+        _current_client_anthropic_betas.set(betas)
+    except Exception:
+        try:
+            _current_client_anthropic_betas.set({})
+        except Exception:
+            pass
+
+
+def _with_client_anthropic_betas(headers: dict) -> dict:
+    """Fusionne les bêtas client (prioritaires) dans des headers amont. Pur."""
+    try:
+        _betas = _current_client_anthropic_betas.get() or {}
+    except Exception:
+        _betas = {}
+    if _betas and isinstance(headers, dict):
+        for _k, _v in _betas.items():
+            headers[_k] = _v
+    return headers
+
+
+def _warn_huge_context(request, where: str = "") -> None:
+    """Garde warn-only pré-forward : signale les bodies énormes (~150k+ tokens).
+
+    O(1) via Content-Length (aucune re-sérialisation, aucune latence).
+    AUCUN refus : le tour peut réussir ; le WARN sert à corréler avec un
+    éventuel suspect_tiny_output (cause n°1 des tâches coupées).
+    Seuil : `context_guard.warn_body_bytes` (défaut 600000 ≈ 150k tokens).
+    """
+    try:
+        _hdrs = getattr(request, "headers", None)
+        _raw = (_hdrs.get("content-length") or "").strip() if _hdrs is not None else ""
+        _size = int(_raw) if _raw.isdigit() else 0
+    except Exception:
+        return
+    if _size <= 0:
+        return
+    try:
+        _threshold = int(yaml_get("context_guard", "warn_body_bytes", 600000))
+    except Exception:
+        _threshold = 600000
+    if _size >= _threshold:
+        try:
+            _ua = (_hdrs.get("user-agent") or "")[:60]
+            _path = str(getattr(getattr(request, "url", None), "path", "") or "") or where
+        except Exception:
+            _ua, _path = "", where
+        _log(
+            f"  WARN huge-context: {_path} body={_size}b (~{_size // 4} tok) "
+            f"ua={_ua} — session à compacter ?"
+        )
 
 # [PC-16 audit 2026-09-08] IP cliente de la requête courante (F9) — lue par
 # _log_free_model_usage pour lever l'ambiguïté ip= (client vs egress).
@@ -1992,6 +2137,12 @@ _REDACT_PATTERNS = [
     ),
     # JSON fields / query params: api_key=..., apikey: ...
     (re.compile(r'(?i)\b(api[_-]?key\s*[:=]\s*"?)[^"\s,}]{4,}'), r"\1***"),
+    # IDs de session/requête opencode (ses_/msg_ temporels, sticky routing) :
+    # pas des clés paid, mais identifiants persistés en clair sinon (format
+    # _mint_oc_id : préfixe + 12 hex + 14 base62). Couvre aussi les valeurs
+    # prompt_cache_key / x-opencode-session dans les dumps.
+    (re.compile(r"\b(ses_[0-9a-f]{12})[A-Za-z0-9]{14}\b"), r"\1***"),
+    (re.compile(r"\b(msg_[0-9a-f]{12})[A-Za-z0-9]{14}\b"), r"\1***"),
 ]
 
 
@@ -3447,6 +3598,22 @@ def _cb_record_failure(endpoint: str):
     _get_cb(endpoint).record_failure()
 
 
+def _cb_record_stream_success(endpoint, inp, out, tools_used):
+    """CB success sauf tour agent vide (neutre : ni succès ni échec compté).
+
+    Best-effort : inp peut être None (estimation non résolue à ce stade) →
+    succès normal. La vérité DB est assurée par _save_and_log_request.
+    """
+    try:
+        if _is_suspect_tiny_output(inp, out, tools_used):
+            _log(f"  WARN suspect_tiny_output: CB success ignoré pour {endpoint} (in={inp} out={out})")
+            return False
+    except Exception:
+        pass
+    _cb_record_success(endpoint)
+    return True
+
+
 # ── Circuit breaker GLOBAL 429 ([PLAN-corrections-429 E3/P14]) ──
 
 _G429_THRESHOLD = int(yaml_get("circuit_breaker", "global_429_threshold", 10))
@@ -4653,7 +4820,13 @@ def _free_wire_body(body, force_stream: bool = False):
         wire["tools"] = base
     if need_key:
         try:
-            wire["prompt_cache_key"] = _free_session_id()
+            # Parité options() : promptCacheKey = sessionID de la conversation
+            # (meilleur hit-rate que la session globale quand le corps porte
+            # un chaînage `conversation` ; repli global sinon).
+            _conv = body.get("conversation") if isinstance(body, dict) else None
+            wire["prompt_cache_key"] = (
+                _conversation_session_id(_conv) if isinstance(_conv, str) and _conv else _free_session_id()
+            )
         except Exception:
             pass
     forced = False
@@ -4844,7 +5017,52 @@ def _free_request_msg_id() -> str:
     return mid
 
 
-def _official_free_headers(endpoint: str = "") -> dict:
+_CONVERSATION_SESSIONS: OrderedDict = OrderedDict()
+_CONVERSATION_SESSIONS_MAX = 512
+
+
+def _conversation_session_id(key: str | None) -> str:
+    """``ses_`` stable PAR CONVERSATION (parité request.ts : sessionID stable par
+    conversation, sticky routing + réutilisation du prefix-cache côté Zen).
+
+    ``key`` = l'identifiant de chaînage Responses (``conversation``) quand le
+    client en porte un. Sans clé (cas Claude Code / chat : aucun ID de
+    conversation dans le protocole), repli sur la session globale tournante
+    ``_free_session_id()`` — comportement inchangé. LRU bornée 512, fail-soft.
+    """
+    if not key or not isinstance(key, str):
+        return _free_session_id()
+    try:
+        sid = _CONVERSATION_SESSIONS.get(key)
+        if sid:
+            _CONVERSATION_SESSIONS.move_to_end(key)
+            return sid
+        sid = _mint_oc_id("ses", "descending")
+        _CONVERSATION_SESSIONS[key] = sid
+        while len(_CONVERSATION_SESSIONS) > _CONVERSATION_SESSIONS_MAX:
+            _CONVERSATION_SESSIONS.popitem(last=False)
+        return sid
+    except Exception:
+        return _free_session_id()
+
+
+def _body_conversation_key(body) -> str | None:
+    """Extrait la clé de conversation d'un corps de requête (chaînage Responses).
+
+    Seul signal stable-par-conversation disponible côté proxy : le client
+    Claude Code / chat n'en porte pas (repli global dans ce cas).
+    """
+    try:
+        if isinstance(body, dict):
+            conv = body.get("conversation")
+            if isinstance(conv, str) and conv:
+                return conv
+    except Exception:
+        pass
+    return None
+
+
+def _official_free_headers(endpoint: str = "", conversation_key: str | None = None) -> dict:
     """Jeu de headers officiel complet pour UN envoi jambe free.
 
     Copie du wire Bun MESURÉ sur le vrai client 1.18.31 (capture en clair
@@ -4879,6 +5097,10 @@ def _official_free_headers(endpoint: str = "") -> dict:
     sur /chat/completions mais 4.0.40 sur /responses (deux bundles ai-sdk).
     """
     ua = _OPENCODE_OFFICIAL_UA_RESPONSES if "/responses" in (endpoint or "") else _OPENCODE_OFFICIAL_UA
+    try:
+        _conv_session = _conversation_session_id(conversation_key)
+    except Exception:
+        _conv_session = _free_session_id()
     return {
         "Authorization": "Bearer public",
         "Content-Type": "application/json",
@@ -4886,8 +5108,95 @@ def _official_free_headers(endpoint: str = "") -> dict:
         "x-opencode-client": _OPENCODE_CLIENT_NAME,
         "x-opencode-project": _OPENCODE_PROJECT,
         "x-opencode-request": _free_request_msg_id(),
-        "x-opencode-session": _free_session_id(),
+        "x-opencode-session": _conv_session,
     }
+
+
+_PAID_SESSION_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "_paid_session_id")
+_PAID_SESSION_CACHE: str | None = None
+_PAID_SESSION_TS = 0.0
+
+
+def _paid_session_id() -> str:
+    """Session paid ``ses_`` stable, tournée toutes les 30 min (parité client).
+
+    Même format temporel que la session free (``_mint_oc_id("ses", ...)``) mais
+    fichier distinct : les deux jambes ne partagent pas leur affinité sticky.
+    Le client officiel envoie un ses_ par conversation sur TOUTES les jambes ;
+    la jambe paid n'en envoyait aucun (que Authorization + Content-Type).
+    """
+    global _PAID_SESSION_CACHE, _PAID_SESSION_TS
+    now = time.time()
+    if _PAID_SESSION_CACHE and (now - _PAID_SESSION_TS) < _FREE_SESSION_ROTATE_S:
+        return _PAID_SESSION_CACHE
+    try:
+        with open(_PAID_SESSION_FILE, encoding="utf-8") as f:
+            raw = (f.read() or "").strip()
+        sid, _, ts = raw.partition("|")
+        if (
+            sid.startswith("ses_")
+            and len(sid) == 30
+            and ts.replace(".", "", 1).isdigit()
+            and (now - float(ts)) < _FREE_SESSION_ROTATE_S
+        ):
+            _PAID_SESSION_CACHE, _PAID_SESSION_TS = sid, float(ts)
+            return sid
+    except OSError:
+        pass
+    sid = _mint_oc_id("ses", "descending")
+    _PAID_SESSION_CACHE, _PAID_SESSION_TS = sid, now
+    try:
+        _tmp = _PAID_SESSION_FILE + ".tmp"
+        with open(_tmp, "w", encoding="utf-8") as f:
+            f.write(f"{sid}|{now}")
+        os.replace(_tmp, _PAID_SESSION_FILE)
+    except OSError:
+        pass
+    return sid
+
+
+def _enrich_paid_wire_headers(headers: dict, endpoint: str = "", conversation_key: str | None = None) -> dict:
+    """Aligne les headers paid sur l'identité du client officiel (parité wire).
+
+    Le client officiel envoie sur TOUTES les jambes, payante incluse : UA
+    ``opencode/<ver> ai-sdk/provider-utils/<v> runtime/bun/<v>`` (4.0.40 sur
+    /responses, 4.0.23 sur /chat — deux bundles ai-sdk) + x-opencode-*
+    (ses_/msg_ temporels). La jambe paid n'envoyait que Authorization +
+    Content-Type (+ UA python-httpx par défaut). Sémantique setdefault :
+    Authorization (clé + failover) et toute valeur déjà posée sont intouchables.
+    Borné aux endpoints OpenAI-protocol — chemin Anthropic et jambe free exclus.
+    """
+    try:
+        ep = endpoint or ""
+        if ("/responses" not in ep) and ("/chat/completions" not in ep):
+            return headers
+        out = dict(headers) if isinstance(headers, dict) else {}
+        lowered = {k.lower() for k in out}
+        if "user-agent" not in lowered:
+            out["User-Agent"] = (
+                _OPENCODE_OFFICIAL_UA_RESPONSES if "/responses" in ep else _OPENCODE_OFFICIAL_UA
+            )
+        if "x-opencode-client" not in lowered:
+            out["x-opencode-client"] = _OPENCODE_CLIENT_NAME
+        if "x-opencode-project" not in lowered:
+            out["x-opencode-project"] = _OPENCODE_PROJECT
+        if "x-opencode-session" not in lowered:
+            try:
+                # Parité request.ts : même sessionID par conversation sur TOUTES
+                # les jambes ; sans clé de conversation, session paid dédiée.
+                out["x-opencode-session"] = (
+                    _conversation_session_id(conversation_key) if conversation_key else _paid_session_id()
+                )
+            except Exception:
+                pass
+        if "x-opencode-request" not in lowered:
+            try:
+                out["x-opencode-request"] = _free_request_msg_id()
+            except Exception:
+                pass
+        return out
+    except Exception:
+        return headers
 
 
 def _is_connect_error(e: Exception) -> bool:
@@ -4969,7 +5278,8 @@ async def _do_free_request_curl_cffi(
     # le gate. Face réseau = replay Bun (ja3 custom + H1), jamais un preset
     # navigateur (cf. _free_fp_override). UA choisie par endpoint (le client
     # envoie provider-utils/4.0.40 sur /responses, 4.0.23 sur /chat).
-    req_headers = _official_free_headers(endpoint or "")
+    # Session par conversation quand le corps porte un chaînage (parité request.ts).
+    req_headers = _official_free_headers(endpoint or "", _body_conversation_key(body))
     _free_impersonate, _free_fp = _get_free_fp_kwargs()
     # [gate body 2026-09-18] grille tools (bash+read) + stream forcé : un corps
     # non-stream ou sans tools serait 403. Si stream forcé ici, le SSE est
@@ -5748,7 +6058,8 @@ async def _open_free_stream(
                 # [gate 2026-09-17 + copie exacte 2026-09-18] Identité
                 # officielle (msg_ stable par message via _free_request_msg_id,
                 # face Bun rejouée, UA par endpoint) — même sur les ré-essais.
-                req_headers = _official_free_headers(endpoint or "")
+                # Session par conversation quand le corps porte un chaînage.
+                req_headers = _official_free_headers(endpoint or "", _body_conversation_key(body))
                 _free_impersonate, _free_fp = _get_free_fp_kwargs()
                 # [gate body 2026-09-18] grille tools sur le corps stream.
                 wire_body, _ = _free_wire_body(body, force_stream=True)
@@ -5883,7 +6194,8 @@ async def _open_free_stream(
         # [gate 2026-09-17 + copie exacte 2026-09-18] Identité officielle
         # (direct fallback httpx aussi — même face, sans TLS custom).
         # [gate body 2026-09-18] grille tools sur le corps stream.
-        free_headers = _official_free_headers(endpoint or "")
+        # Session par conversation quand le corps porte un chaînage.
+        free_headers = _official_free_headers(endpoint or "", _body_conversation_key(body))
         wire_body, _ = _free_wire_body(body, force_stream=True)
         async with _ensure_http_client().stream(
             "POST", endpoint, content=_serialize_json_body(wire_body), headers=free_headers
@@ -5910,6 +6222,14 @@ async def _open_free_stream(
     _ttfb_on = _ttfb_watchdog_enabled()
     _s_protocol = "anthropic" if (headers or {}).get("x-api-key") else "openai"
     while True:
+        # [Parité client] stream paid direct : même identité que le non-stream
+        # (UA officielle + x-opencode-*, beta si Anthropic). Ici (tête de boucle)
+        # car le failover TTFB remplace headers en fin de boucle.
+        if _s_protocol == "anthropic":
+            # body passé pour le beta thinking-binding-controls (parité 5.1+).
+            headers = _ensure_anthropic_beta(headers, body)
+        else:
+            headers = _enrich_paid_wire_headers(headers, endpoint, _body_conversation_key(body))
         _ttfb_fc = None
         _ttfb_t0 = time.monotonic()
         try:
@@ -6032,6 +6352,14 @@ async def _open_via_pool(endpoint, body, headers, *, is_stream=False, forced_poo
     profile = _current_free_identity(station)
     req_headers = _apply_identity(dict(headers), profile, use_curated_ua=False)
     req_headers["Content-Type"] = "application/json"
+    # Parité client : beta thinking intercalé sur jambe Anthropic (x-api-key
+    # présent). Sur jambe OpenAI-protocol, complète les x-opencode-* manquants
+    # (l'UA reste celle du profil d'identité tunnel — setdefault — le tunnel
+    # garde sa face navigateur qui fonctionne aujourd'hui).
+    if any(k.lower() == "x-api-key" for k in req_headers):
+        req_headers = _ensure_anthropic_beta(req_headers, body)
+    else:
+        req_headers = _enrich_paid_wire_headers(req_headers, endpoint)
 
     # 3) curl_cffi through SOCKS5 tunnel — POOL partagé avec le chemin free.
     # [v10 PLAN-commun 1.1] fini la AsyncSession jetable (handshake SOCKS5+TLS
@@ -6813,7 +7141,8 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
     # (observabilité) : la face réseau est figée, pas en rotation.
     free_profile = _current_free_identity(station)
     _current_free_attempt.set({"ip": free_ip, "identity": free_profile.get("impersonate") or "", "station": station})
-    free_headers = _official_free_headers(free_endpoint or "")
+    # Session par conversation quand le corps porte un chaînage (parité request.ts).
+    free_headers = _official_free_headers(free_endpoint or "", _body_conversation_key(body))
     free_api_key = "free (no auth)"
     free_workspace = "free (no auth)"
 
@@ -7812,13 +8141,15 @@ def _ttfb_watchdog_enabled() -> bool:
 
 
 def _ttfb_watchdog_timeout_s() -> float:
+    # Défaut 300 s = headerTimeout du client officiel (provider.ts) : le proxy
+    # ne doit pas tuer (504) une requête que le client officiel attendrait.
     try:
         _tw = yaml_get("circuit_breaker", "ttfb_watchdog", {}) or {}
-        _v = _tw.get("timeout_s", 90) if isinstance(_tw, dict) else 90
-        v = float(_v or 90)
+        _v = _tw.get("timeout_s", 300) if isinstance(_tw, dict) else 300
+        v = float(_v or 300)
         return max(5.0, min(600.0, v))
     except Exception:
-        return 90.0
+        return 300.0
 
 
 def _alias_for_api_key(api_key: str) -> str:
@@ -7919,11 +8250,14 @@ async def _do_request_with_retry(endpoint, body, headers, protocol, retry_on_429
     Raises UpstreamError on connection/timeout/protocol failures.
     """
     # ── Orphan guard (defense in depth) ──
+    # Garde chaînage : vers /responses avec previous_response_id/conversation,
+    # l'appariement vit côté serveur — aucun filtrage (pas d'amputation).
+    _chain_guard = body if (isinstance(body, dict) and "/responses" in (endpoint or "")) else None
     if isinstance(body, dict):
         if "messages" in body:
-            body["messages"] = _drop_orphan_tool_messages(body["messages"])
+            body["messages"] = _drop_orphan_tool_messages(body["messages"], _chain_guard)
         elif "input" in body:
-            body["input"] = _drop_orphan_responses_input(body["input"])
+            body["input"] = _drop_orphan_responses_input(body["input"], _chain_guard)
             # [Correctif parité multi-tours] marqueur interne jamais envoyé à
             # l'upstream — consommé par le retry-once du caller.
             body.pop("_has_synthetic_reasoning_items", None)
@@ -7939,6 +8273,13 @@ async def _do_request_with_retry(endpoint, body, headers, protocol, retry_on_429
     headers = _with_json_content_type(headers)
 
     while attempt < max_retries:
+        # [Parité client] la jambe paid parle comme le client officiel (UA +
+        # x-opencode-*) sur les endpoints OpenAI-protocol. Setdefault : le
+        # failover (qui remplace headers) reste intact, ré-enrichi ici.
+        # Session par conversation quand le corps porte un chaînage.
+        headers = _enrich_paid_wire_headers(headers, endpoint, _body_conversation_key(body))
+        if protocol == "anthropic":
+            headers = _ensure_anthropic_beta(headers, body)
         if DEBUG:
             _debug(
                 f"  → upstream POST {endpoint} attempt {attempt + 1}/{max_retries} headers={_sanitize_headers(headers)}"
@@ -8098,17 +8439,24 @@ async def _do_request_with_retry(endpoint, body, headers, protocol, retry_on_429
     return resp, headers
 
 
-def _update_token_usage(model_id, inp, out, cache):
-    """Thread-safe update of in-memory token counters."""
+def _update_token_usage(model_id, inp, out, cache, cache_creation=0):
+    """Thread-safe update of in-memory token counters.
+
+    `cache_creation` (tokens d'écriture cache — la part la plus chère) :
+    avant, extrait mais jamais compté (F3). Clé `cache_write` (setdefault :
+    les snapshots existants sans la clé restent valides).
+    """
     try:
         with _token_lock:
             if model_id not in _token_usage:
-                _token_usage[model_id] = {"input": 0, "output": 0, "cache": 0}
+                _token_usage[model_id] = {"input": 0, "output": 0, "cache": 0, "cache_write": 0}
+            _token_usage[model_id].setdefault("cache_write", 0)
             _token_usage[model_id]["input"] += inp
             _token_usage[model_id]["output"] += out
             _token_usage[model_id]["cache"] += cache
+            _token_usage[model_id]["cache_write"] += cache_creation
         _debug(
-            f"  [tokens] _update_token_usage: model={model_id} +{inp} in +{out} out +{cache} cache | totals: {_token_usage[model_id]}"
+            f"  [tokens] _update_token_usage: model={model_id} +{inp} in +{out} out +{cache} cache +{cache_creation} cache_write | totals: {_token_usage[model_id]}"
         )
     except Exception as e:
         _debug(f"  ✗ _update_token_usage failed: {type(e).__name__}: {e}")
@@ -8138,8 +8486,27 @@ async def _save_and_log_request(
     identity=None,
     free_status=None,
     paid_status=None,
+    success=True,
+    error=None,
+    response_preview=None,
 ):
-    """Log success and save to DB with success=True."""
+    """Log success and save to DB (success=False si tour agent vide suspect)."""
+    # [suspect_tiny_output P0] Un tour « énorme input + micro output + aucun
+    # tool call » est inutilisable pour le harness mais arrivait en
+    # success=True. Bascule en échec typé (stats honnêtes, filtrable).
+    if success and _is_suspect_tiny_output(inp, out, tools_used):
+        success = False
+        error = error or _SUSPECT_TINY_ERROR
+        log_tag = f"{log_tag} suspect_tiny_output".strip()
+        _log(
+            f"  WARN suspect_tiny_output: {model_id} in={inp} out={out} "
+            f"(tour agent vide → marqué échec, CB non récompensé)"
+        )
+        # [preview P0-obs] post-mortem du tour vide : le response_body des
+        # streams est volontairement NULL (volumétrie) — on n'y stocke que ce
+        # preview borné, uniquement sur suspect (surcoût stockage ~nul).
+        if not response_body and response_preview:
+            response_body = "[stream-preview] " + str(response_preview)[:500]
     # Free-channel stamp first: the IP/identity of the free attempt beats the
     # current IP (mid-stream 429 + background rotation must keep the pre-rotation
     # IP). Falls back to auto-detect for -free models when no stamp exists.
@@ -8174,7 +8541,8 @@ async def _save_and_log_request(
             inp,
             out,
             cache,
-            success=True,
+            success=success,
+            error=error,
             protocol=protocol,
             is_stream=is_stream,
             thinking=thinking_type,
@@ -8438,8 +8806,14 @@ def _persist_free_400_wire(req_id, free_model, tag, wire_body, status=400) -> st
         if _raw:
             try:
                 _fn = os.path.join(LOG_DIR, f"free400_{str(req_id).replace('/', '_')}.json")
+                # C1 : le dump disque ne persiste pas les ses_/msg_ en clair
+                # (le sha reste calculé sur le wire brut pour corrélation).
+                try:
+                    _scrubbed = _redact(_raw.decode("utf-8", "replace")).encode("utf-8")
+                except Exception:
+                    _scrubbed = _raw
                 with open(_fn, "wb") as _fh:
-                    _fh.write(_raw)
+                    _fh.write(_scrubbed)
             except Exception:
                 pass
         return _sha
@@ -8641,6 +9015,7 @@ def _finalize_stream_tokens(
                     final_out = total - prompt
             final_out = final_out or stream_out
             final_cache = _extract_cache_tokens(actual_usage)
+            final_cache_write = _extract_cache_creation_tokens(actual_usage)
             log_tag = ""
             with _token_lock:
                 _token_usage[model_id]["input"] -= est_input
@@ -8648,6 +9023,9 @@ def _finalize_stream_tokens(
                 _token_usage[model_id]["output"] += final_out
                 if final_cache:
                     _token_usage[model_id]["cache"] += final_cache
+                if final_cache_write:
+                    _token_usage[model_id].setdefault("cache_write", 0)
+                    _token_usage[model_id]["cache_write"] += final_cache_write
         else:
             log_tag = " (est)"
             with _token_lock:
@@ -8660,6 +9038,50 @@ def _finalize_stream_tokens(
         _log(f"  WARN: _finalize_stream_tokens failed for {model_id!r}: {type(e).__name__}: {e}")
 
     return final_in, final_out, final_cache, log_tag
+
+
+# ── Détection « tour agent vide » (suspect_tiny_output, P0) ──────────
+# Signature : input énorme + output minuscule + aucun tool call. Pour un
+# harness agentique, un tel tour est une impasse (la tâche s'arrête sans
+# finir) alors que le proxy répondait success=1 + stop/[DONE] nominal.
+# Seuils surchargeables sans restart via config.yaml :
+#   suspect_tiny_output: {input_min: 40000, output_max: 100}
+# (custom_routes / mapping perso NON touché — détection seule, jamais de
+# re-routage ici. Le client a déjà reçu ses octets à ce stade : pas de
+# retry ici, seulement vérité DB + CB non récompensé + log WARN.)
+_SUSPECT_TINY_ERROR = "upstream_tiny_output"
+
+
+def _is_suspect_tiny_output(inp, out, tools_used) -> bool:
+    """True si le tour ressemble à un tour agent vide (pur, jamais de raise)."""
+    try:
+        in_min = int(yaml_get("suspect_tiny_output", "input_min", 40000))
+        out_max = int(yaml_get("suspect_tiny_output", "output_max", 100))
+    except Exception:
+        in_min, out_max = 40000, 100
+    try:
+        if tools_used:
+            return False
+        return (inp or 0) >= in_min and (out or 0) < out_max
+    except Exception:
+        return False
+
+
+def _should_retry_empty_stream(has_yielded: bool, stream_out) -> bool:
+    """True si RIEN n'est parti au client : un retry est sûr (pas de concat).
+
+    Pur, jamais de raise. Couvre deux cas amont :
+    - EOF sans terminal ni usage (flux nu) ;
+    - complétion NOMINALE (usage présent) mais zéro delta visible — ex. tour
+      reasoning-only chiffré/skippé : le client n'a reçu que du vide.
+    Dans les deux cas le client n'a rien d'exploitable ; la maquinaria
+    `_incomplete_empty` existante rejoue sur station fraîche (puis failover
+    payant, puis erreur typée — jamais de faux `stop`).
+    """
+    try:
+        return not has_yielded and (stream_out or 0) == 0
+    except Exception:
+        return False
 
 
 def _sse(event: str, payload: dict) -> bytes:
@@ -8717,10 +9139,11 @@ _SSE_KEEPALIVE_INTERVAL = yaml_get("streaming", "sse_keepalive_interval", 15)  #
 # connexion puis se tait (tunnel mort, fournisseur figé) est attendu jusqu'au timeout
 # de lecture TCP — `upstream.timeout.read` = 600 s dans config.yaml — pendant que la pompe
 # envoie des `: ping` toutes les 15 s : le client voit un flux VIVANT mais VIDE, sans
-# erreur ni log. C'est le « ça s'arrête d'un coup » sans diagnostic. 120 s laisse passer
-# un raisonnement long mais coupe un gel avéré 5× plus tôt. Réglable :
-# `streaming.sse_idle_timeout` (0 ou absent = désactivé).
-_SSE_IDLE_TIMEOUT = float(yaml_get("streaming", "sse_idle_timeout", 120) or 0)
+# erreur ni log. 300 s = aligné sur le chunkTimeout du client officiel (provider.ts) :
+# un raisonnement long ne doit pas être coupé par le proxy avant que le client
+# officiel lui-même n'abandonne. Réglable : `streaming.sse_idle_timeout`
+# (0 ou absent = désactivé).
+_SSE_IDLE_TIMEOUT = float(yaml_get("streaming", "sse_idle_timeout", 300) or 0)
 
 
 # [Phase 7 refonte] Pompe extraite vers streaming/sse.py (pur asyncio).
@@ -9307,12 +9730,15 @@ from app.protocol.mapping import (  # noqa: E402,I001  # re-export after functio
     _chat_to_responses_request,
     _drop_orphan_responses_input,
     _drop_orphan_tool_messages,
+    _ensure_encrypted_content_include,
+    _extract_cache_creation_tokens,
     _extract_cache_tokens,
     _extract_text,
     _json_dumps,
     _json_dumps_str,
     _json_loads,
     _local_signature,
+    _relay_responses_optional_fields,
     _relay_responses_storage_fields,
     _responses_sse_to_chat_deltas,
     _responses_to_anthropic_response,
@@ -9572,6 +9998,8 @@ async def messages(request: Request):
     start_time = time.monotonic()
     client_ip = _get_client_ip(request)
     _current_user_agent.set(request.headers.get("user-agent"))
+    _capture_client_anthropic_betas(request.headers)
+    _warn_huge_context(request)
     _current_client_ip.set(client_ip)  # [PC-16] traçabilité free-usage
 
     body_bytes = await request.body()
@@ -9705,7 +10133,7 @@ async def messages(request: Request):
                     req_in = usage.get("input_tokens", 0) or usage.get("prompt_tokens", 0)
                     req_out = usage.get("output_tokens", 0) or usage.get("completion_tokens", 0)
                     req_cache = usage.get("cache_read_input_tokens", 0)
-                    _update_token_usage(_actual_model, req_in, req_out, req_cache)
+                    _update_token_usage(_actual_model, req_in, req_out, req_cache, _extract_cache_creation_tokens(usage))
                     used = [b["name"] for b in data.get("content", []) if b.get("type") == "tool_use"]
                     await _save_and_log_request(
                         req_id,
@@ -9908,7 +10336,7 @@ async def messages(request: Request):
             _debug(f"  usage: in={req_in} out={req_out} cache={req_cache}")
             if _cfg_settings.DEBUG:
                 _debug(f"  response=\n{_redact(_truncate(data))}")
-            _update_token_usage(model_id, req_in, req_out, req_cache)
+            _update_token_usage(model_id, req_in, req_out, req_cache, _extract_cache_creation_tokens(usage))
             used = [b["name"] for b in data.get("content", []) if b.get("type") == "tool_use"]
             await _save_and_log_request(
                 req_id,
@@ -10459,7 +10887,7 @@ async def messages(request: Request):
                                     _token_usage[_track_model]["output"] += stream_out
                             except Exception:
                                 pass
-                        _cb_record_success(endpoint)  # Stream completed successfully
+                        _cb_record_stream_success(endpoint, est_input, stream_out, used_tools)
                 except asyncio.CancelledError:
                     # [plan 18/08 §am.22/piège 19] a free stream cancelled by the
                     # watchdog (egress_dead CONFIRMED on its station) IS a network
@@ -10794,11 +11222,13 @@ async def messages(request: Request):
         if _cfg_settings.DEBUG:
             _debug(f"[messages] converted to openai: {_redact(_truncate(oai_body, 2000))}")
         # ── Orphan guard (handler-level, plan api-error-400) ──
+        # Garde chaînage : vers /responses avec previous_response_id, pas de filtre.
+        _chain_guard = body if "/responses" in (endpoint or "") else None
         if isinstance(oai_body, dict):
             if "messages" in oai_body:
-                oai_body["messages"] = _drop_orphan_tool_messages(oai_body["messages"])
+                oai_body["messages"] = _drop_orphan_tool_messages(oai_body["messages"], _chain_guard)
             elif "input" in oai_body:
-                oai_body["input"] = _drop_orphan_responses_input(oai_body["input"])
+                oai_body["input"] = _drop_orphan_responses_input(oai_body["input"], _chain_guard)
     except Exception as e:
         _debug(f"[messages] ✗ conversion failed: {e}")
         _log(f"  CONVERSION ERROR: anthropic_to_openai failed: {type(e).__name__}: {e}")
@@ -10824,7 +11254,7 @@ async def messages(request: Request):
                     req_in = usage.get("prompt_tokens", 0)
                     req_out = usage.get("completion_tokens", 0)
                     cache = _extract_cache_tokens(usage)
-                    _update_token_usage(_actual_model, req_in, req_out, cache)
+                    _update_token_usage(_actual_model, req_in, req_out, cache, _extract_cache_creation_tokens(usage))
                     used = _extract_usage_tool_names(data)
                     await _save_and_log_request(
                         req_id,
@@ -10946,13 +11376,27 @@ async def messages(request: Request):
             and oai_body.pop("_has_synthetic_reasoning_items", False)
         ):
             if oai_body.get("input") is not None:
-                # Chemin /responses : retirer les items `reasoning` synthétiques.
+                # Chemin /responses : retirer les items `reasoning` SYNTHÉTIQUES
+                # seuls (ni `id` ni `encrypted_content`) — les items authentiques
+                # (rejeu client avec id/encrypted_content, parité SDK) sont
+                # préservés : les amputer casserait le tour suivant.
                 _pre = len(oai_body["input"])
-                oai_body["input"] = [
-                    i for i in oai_body["input"] if not (isinstance(i, dict) and i.get("type") == "reasoning")
-                ]
+                _kept_auth = 0
+                _new_inp = []
+                for i in oai_body["input"]:
+                    if (
+                        isinstance(i, dict)
+                        and i.get("type") == "reasoning"
+                        and not i.get("id")
+                        and not i.get("encrypted_content")
+                    ):
+                        continue
+                    if isinstance(i, dict) and i.get("type") == "reasoning":
+                        _kept_auth += 1
+                    _new_inp.append(i)
+                oai_body["input"] = _new_inp
                 _log(
-                    f"  [thinking] upstream {resp.status_code} avec items reasoning → retry sans ({_pre}→{len(oai_body['input'])} items)"
+                    f"  [thinking] upstream {resp.status_code} avec items reasoning → retry sans synthétiques ({_pre}→{len(oai_body['input'])} items, {_kept_auth} authentique(s) gardé(s))"
                 )
             elif isinstance(oai_body.get("messages"), list):
                 # Chemin /chat/completions : retirer `reasoning_content`.
@@ -11061,7 +11505,7 @@ async def messages(request: Request):
         _debug(
             f"  usage: in={req_in} out={req_out} cache={cache} format={'responses' if is_responses_format else 'chat'}"
         )
-        _update_token_usage(model_id, req_in, req_out, cache)
+        _update_token_usage(model_id, req_in, req_out, cache, _extract_cache_creation_tokens(usage))
         if is_responses_format:
             _debug(
                 f"  [non-stream] Responses API output items: {[(item.get('type'), list(item.keys())[:6]) for item in data.get('output', []) if isinstance(item, dict)]}"
@@ -12329,6 +12773,8 @@ async def chat_completions(request: Request):
     start_time = time.monotonic()
     client_ip = _get_client_ip(request)
     _current_user_agent.set(request.headers.get("user-agent"))
+    _capture_client_anthropic_betas(request.headers)
+    _warn_huge_context(request)
     _current_client_ip.set(client_ip)  # [PC-16] traçabilité free-usage
 
     body_bytes = await request.body()
@@ -12412,11 +12858,13 @@ async def chat_completions(request: Request):
     await _handle_web_search(body, model_id, protocol)
     await _handle_web_fetch(body, model_id, protocol)
     # ── Orphan guard (handler-level) ──
+    # Garde chaînage : vers /responses avec previous_response_id, pas de filtre.
+    _chain_guard = body if "/responses" in (endpoint or "") else None
     if isinstance(body, dict):
         if "messages" in body:
-            body["messages"] = _drop_orphan_tool_messages(body["messages"])
+            body["messages"] = _drop_orphan_tool_messages(body["messages"], _chain_guard)
         elif "input" in body:
-            body["input"] = _drop_orphan_responses_input(body["input"])
+            body["input"] = _drop_orphan_responses_input(body["input"], _chain_guard)
 
     _log(
         f"→ {original_model!r} → {model_id} | {protocol} | chat/completions | stream={is_stream} | thinking={thinking_type} | effort={effort} | ip={client_ip}"
@@ -12496,7 +12944,7 @@ async def chat_completions(request: Request):
                             req_in = usage.get("prompt_tokens", 0)
                             req_out = usage.get("completion_tokens", 0)
                             cache = _extract_cache_tokens(usage)
-                            _update_token_usage(_actual_model, req_in, req_out, cache)
+                            _update_token_usage(_actual_model, req_in, req_out, cache, _extract_cache_creation_tokens(usage))
                             used = _extract_usage_tool_names(data)
                             await _save_and_log_request(
                                 req_id,
@@ -12715,7 +13163,7 @@ async def chat_completions(request: Request):
                     req_out = usage.get("completion_tokens", 0)
                     cache = _extract_cache_tokens(usage)
                     _debug(f"  usage: in={req_in} out={req_out} cache={cache} (converted)")
-                    _update_token_usage(model_id, req_in, req_out, cache)
+                    _update_token_usage(model_id, req_in, req_out, cache, _extract_cache_creation_tokens(usage))
                     used = _extract_usage_tool_names(chat_resp)
                     await _save_and_log_request(
                         req_id,
@@ -12746,7 +13194,7 @@ async def chat_completions(request: Request):
             req_out = usage.get("completion_tokens", 0)
             cache = _extract_cache_tokens(usage)
             _debug(f"  usage: in={req_in} out={req_out} cache={cache}")
-            _update_token_usage(model_id, req_in, req_out, cache)
+            _update_token_usage(model_id, req_in, req_out, cache, _extract_cache_creation_tokens(usage))
             used = _extract_usage_tool_names(data)
             await _save_and_log_request(
                 req_id,
@@ -13141,6 +13589,11 @@ async def chat_completions(request: Request):
                         # convertisseur Responses (``tool_calls`` / ``stop``) : évite de
                         # rapporter un faux « stop » sur un tour d'outil.
                         _synth_finish = "stop"
+                        # [preview P0-obs] accumulateur texte du tour (diagnostic
+                        # tours vides) : réinitialisé par tentative, stocké en DB
+                        # UNIQUEMENT si le tour est marqué suspect (500 chars).
+                        _preview_parts: list = []
+                        _preview_len = 0
                         async for line in resp.aiter_lines():
                             if not line.startswith("data:"):
                                 continue
@@ -13214,9 +13667,15 @@ async def chat_completions(request: Request):
                                     c = delta.get("content")
                                     if isinstance(c, str):
                                         stream_out += _estimate_tokens(c)
+                                        if _preview_len < 500 and c:
+                                            _preview_parts.append(c[: 500 - _preview_len])
+                                            _preview_len += len(c)
                                     rc = delta.get("reasoning_content") or delta.get("reasoning")
                                     if isinstance(rc, str):
                                         stream_out += _estimate_tokens(rc)
+                                        if _preview_len < 500 and rc:
+                                            _preview_parts.append(rc[: 500 - _preview_len])
+                                            _preview_len += len(rc)
                                     # [TROU 2 — A8] Restore-retour stream : le nom
                                     # raccourci ≤64 émis par l'amont Chat redevient
                                     # celui du client AVANT d'être relâché dans le
@@ -13256,15 +13715,33 @@ async def chat_completions(request: Request):
                         # donc le bloc de reprise ci-dessous (station fraîche → clé payante)
                         # et on rend au client « stream truncated without content »
                         # (cf. 12501) alors que RIEN n'a été émis : un retry était sûr.
-                        if not _oai_has_yielded and stream_out == 0 and actual_usage is None:
-                            _debug(
-                                "  [oai-stream] upstream EOF without terminal event "
-                                "(no content, no usage) → treating as empty stream for retry"
-                            )
-                            _log(
-                                "  stream truncated without content (upstream EOF, no terminal event)"
-                                " → retry station fraîche / failover payant"
-                            )
+                        #
+                        # [P4 client-parité] Même traitement pour une complétion NOMINALE
+                        # (usage présent) avec ZÉRO delta visible : tour reasoning-only
+                        # chiffré/skippé typique — le client n'a reçu que du vide
+                        # (aucun texte, aucun tool call) et fige la tâche agentique.
+                        # `_should_retry_empty_stream` couvre les deux cas ; la
+                        # maquinaria `_incomplete_empty` derrière est inchangée
+                        # (retry borné → erreur typée, jamais de faux `stop`).
+                        if _should_retry_empty_stream(_oai_has_yielded, stream_out):
+                            if actual_usage is None:
+                                _debug(
+                                    "  [oai-stream] upstream EOF without terminal event "
+                                    "(no content, no usage) → treating as empty stream for retry"
+                                )
+                                _log(
+                                    "  stream truncated without content (upstream EOF, no terminal event)"
+                                    " → retry station fraîche / failover payant"
+                                )
+                            else:
+                                _debug(
+                                    "  [oai-stream] upstream completed with usage but zero "
+                                    "visible deltas (reasoning-only/skipped?) → retry as empty"
+                                )
+                                _log(
+                                    "  upstream completed but nothing yielded "
+                                    "(completed-with-usage, 0 deltas) → retry station fraîche / failover payant"
+                                )
                             _incomplete_empty = True
                             _empty_eof = True
 
@@ -13505,8 +13982,9 @@ async def chat_completions(request: Request):
                             log_tag,
                             tools_used=used_tools if used_tools else None,
                             request_body=request_body,
+                            response_preview="".join(_preview_parts) if _preview_parts else None,
                         )
-                        _cb_record_success(endpoint)  # Stream completed successfully
+                        _cb_record_stream_success(endpoint, final_in, final_out, used_tools)
                 except asyncio.CancelledError:
                     # [plan 18/08 §am.22/piège 19] — same watchdog-cancel
                     # handling as the anthropic stream handler (see there).
@@ -13736,7 +14214,7 @@ async def chat_completions(request: Request):
                         req_in = usage.get("input_tokens", 0) or usage.get("prompt_tokens", 0)
                         req_out = usage.get("output_tokens", 0) or usage.get("completion_tokens", 0)
                         req_cache = usage.get("cache_read_input_tokens", 0)
-                        _update_token_usage(_actual_model, req_in, req_out, req_cache)
+                        _update_token_usage(_actual_model, req_in, req_out, req_cache, _extract_cache_creation_tokens(usage))
                         used = [b["name"] for b in data.get("content", []) if b.get("type") == "tool_use"]
                         await _save_and_log_request(
                             req_id,
@@ -13867,7 +14345,7 @@ async def chat_completions(request: Request):
         req_in = usage.get("input_tokens", 0) or usage.get("prompt_tokens", 0)
         req_out = usage.get("output_tokens", 0) or usage.get("completion_tokens", 0)
         req_cache = usage.get("cache_read_input_tokens", 0)
-        _update_token_usage(model_id, req_in, req_out, req_cache)
+        _update_token_usage(model_id, req_in, req_out, req_cache, _extract_cache_creation_tokens(usage))
         used = [b["name"] for b in data.get("content", []) if b.get("type") == "tool_use"]
         await _save_and_log_request(
             req_id,
@@ -13944,6 +14422,7 @@ async def chat_completions(request: Request):
         stream_out = 0
         total_input = 0
         cache_read = 0
+        cache_write = 0
         emitted_finish = False
         _handle_429 = _make_stream_retry_loop("anthropic")
 
@@ -14245,6 +14724,8 @@ async def chat_completions(request: Request):
                                 usage = msg.get("usage", {})
                                 total_input = usage.get("input_tokens", 0)
                                 cache_read = usage.get("cache_read_input_tokens", 0)
+                                # F3 : l'écriture cache voyage avec le start.
+                                cache_write = _extract_cache_creation_tokens(usage)
                                 started = True
                                 yield _chunk({"role": "assistant", "content": ""}, None)
 
@@ -14335,7 +14816,7 @@ async def chat_completions(request: Request):
                                 emitted_finish = True
 
                             elif etype == "message_stop":
-                                _update_token_usage(_track_model, total_input, stream_out, cache_read)
+                                _update_token_usage(_track_model, total_input, stream_out, cache_read, cache_write)
                                 ak = _alias_for_key(hdrs.get("x-api-key", ""))
                                 if _using_free:
                                     _log_free_model_usage(
@@ -14386,7 +14867,7 @@ async def chat_completions(request: Request):
                                     usage_chunk["usage"]["prompt_tokens_details"] = {"cached_tokens": cache_read}
                                 yield (b"data: " + _json_dumps_str(usage_chunk, ensure_ascii=False).encode() + b"\n\n")
                                 yield b"data: [DONE]\n\n"
-                                _cb_record_success(endpoint)  # Stream completed successfully
+                                _cb_record_stream_success(endpoint, total_input, stream_out, used_tools)
                                 return
             except asyncio.CancelledError:
                 # [plan 18/08 §am.22/piège 19] — same watchdog-cancel
@@ -14569,6 +15050,8 @@ async def responses(request: Request):
     start_time = time.monotonic()
     client_ip = _get_client_ip(request)
     _current_user_agent.set(request.headers.get("user-agent"))
+    _capture_client_anthropic_betas(request.headers)
+    _warn_huge_context(request)
     _current_client_ip.set(client_ip)  # [PC-16] traçabilité free-usage
 
     body_bytes = await request.body()
@@ -14632,11 +15115,13 @@ async def responses(request: Request):
         anthro_body = openai_responses_to_anthropic(body)
         anthro_body["model"] = model_id
     # ── Orphan guard (handler-level) ──
+    # Garde chaînage : vers /responses avec previous_response_id, pas de filtre.
+    _chain_guard = body if "/responses" in (endpoint or "") else None
     if isinstance(body, dict):
         if "messages" in body:
-            body["messages"] = _drop_orphan_tool_messages(body["messages"])
+            body["messages"] = _drop_orphan_tool_messages(body["messages"], _chain_guard)
         elif "input" in body:
-            body["input"] = _drop_orphan_responses_input(body["input"])
+            body["input"] = _drop_orphan_responses_input(body["input"], _chain_guard)
     if isinstance(anthro_body, dict) and "messages" in anthro_body:
         # [TROU 5] La garde ci-dessus filtre `body` — or `anthro_body` a été construit
         # AVANT elle, et le bloc qui suivait ici ne faisait RIEN tout en ayant l'air de
@@ -14722,7 +15207,7 @@ async def responses(request: Request):
                             req_in = usage.get("input_tokens", 0) or usage.get("prompt_tokens", 0)
                             req_out = usage.get("output_tokens", 0) or usage.get("completion_tokens", 0)
                             req_cache = usage.get("cache_read_input_tokens", 0)
-                            _update_token_usage(_actual_model, req_in, req_out, req_cache)
+                            _update_token_usage(_actual_model, req_in, req_out, req_cache, _extract_cache_creation_tokens(usage))
                             used = [b["name"] for b in data.get("content", []) if b.get("type") == "tool_use"]
                             await _save_and_log_request(
                                 req_id,
@@ -14913,7 +15398,7 @@ async def responses(request: Request):
             req_in = usage.get("input_tokens", 0) or usage.get("prompt_tokens", 0)
             req_out = usage.get("output_tokens", 0) or usage.get("completion_tokens", 0)
             req_cache = usage.get("cache_read_input_tokens", 0)
-            _update_token_usage(model_id, req_in, req_out, req_cache)
+            _update_token_usage(model_id, req_in, req_out, req_cache, _extract_cache_creation_tokens(usage))
             used = [b["name"] for b in data.get("content", []) if b.get("type") == "tool_use"]
             await _save_and_log_request(
                 req_id,
@@ -15024,7 +15509,7 @@ async def responses(request: Request):
         req_in = usage.get("input_tokens", 0) or usage.get("prompt_tokens", 0)
         req_out = usage.get("output_tokens", 0) or usage.get("completion_tokens", 0)
         req_cache = usage.get("cache_read_input_tokens", 0)
-        _update_token_usage(model_id, req_in, req_out, req_cache)
+        _update_token_usage(model_id, req_in, req_out, req_cache, _extract_cache_creation_tokens(usage))
         used = [b["name"] for b in data.get("content", []) if b.get("type") == "tool_use"]
         await _save_and_log_request(
             req_id,
@@ -15079,6 +15564,12 @@ async def responses(request: Request):
             # destination est bien un endpoint Responses ; les envoyer à un
             # upstream Anthropic serait un 400 « unknown parameter ».
             _relay_responses_storage_fields(oai_body, body)
+            # [Parité SDK] Même relais pour les autres champs Responses optionnels
+            # (previous_response_id, prompt_cache_key, service_tier, instructions...)
+            # + include encrypted_content si store:false. Relay-only : le proxy
+            # ne fabrique jamais de chaînage (pas d'état conversation).
+            _relay_responses_optional_fields(oai_body, body)
+            _ensure_encrypted_content_include(oai_body)
         # [TROU 3 — A8] Map de restauration des noms d'outils construite à l'aller
         # par ``_chat_to_responses_request`` (noms >64 raccourcis, clé privée
         # ``_tool_name_map``). Elle est EXTRAITE ici, avant les deux jambes
@@ -15112,7 +15603,7 @@ async def responses(request: Request):
                     req_in = usage.get("prompt_tokens", 0)
                     req_out = usage.get("completion_tokens", 0)
                     cache = _extract_cache_tokens(usage)
-                    _update_token_usage(_actual_model, req_in, req_out, cache)
+                    _update_token_usage(_actual_model, req_in, req_out, cache, _extract_cache_creation_tokens(usage))
                     used = _extract_usage_tool_names(data)
                     await _save_and_log_request(
                         req_id,
@@ -15283,7 +15774,7 @@ async def responses(request: Request):
             req_in = usage.get("prompt_tokens", 0)
             req_out = usage.get("completion_tokens", 0)
             cache = _extract_cache_tokens(usage)
-        _update_token_usage(model_id, req_in, req_out, cache)
+        _update_token_usage(model_id, req_in, req_out, cache, _extract_cache_creation_tokens(usage))
         if is_responses_format:
             used = [
                 b["name"] for b in data.get("output", []) if isinstance(b, dict) and b.get("type") == "function_call"

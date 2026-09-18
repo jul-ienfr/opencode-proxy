@@ -87,7 +87,8 @@
       },
       {
         "role": "assistant",
-        "content": "b"
+        "content": "b",
+        "reasoning_content": " "
       },
       {
         "role": "user",
@@ -147,7 +148,8 @@
     "cache_control": {
       "type": "ephemeral",
       "ttl": "1h"
-    }
+    },
+    "_has_synthetic_reasoning_items": true
   },
   "_note": "axe cache_control (A20) : 7 breakpoints → élagage des plus anciens, 4 conservés",
   "_generated_by": "scripts/gen_golden_fixtures.py (plan v10 §11.5)"

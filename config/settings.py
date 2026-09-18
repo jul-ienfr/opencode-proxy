@@ -588,6 +588,116 @@ def _resolve_protocol(model_id: str) -> str:
     return KNOWN_PROTOCOLS.get(prefix, "openai")
 
 
+# ── Catalogue explicite API + capabilities (parité models.dev) ──
+# `api:` explicite par modèle (config.yaml) > familles ci-dessous > "chat".
+# Les heuristiques `-free` / muse-spark de _resolve_model_endpoint restent le
+# repli, jamais la source de vérité.
+MODEL_API_FAMILIES = {
+    "muse": "responses",
+    "spark": "responses",
+}
+
+
+def get_model_api(model_id: str, model_data: dict | None = None) -> str:
+    """Style d'API amont : "chat" (/chat/completions) ou "responses" (/responses).
+
+    Explicite `api:` du modèle > familles > "chat". Insensible à la casse ;
+    toute valeur hors {chat, responses} est ignorée (repli famille).
+    """
+    if model_data is None:
+        try:
+            model_data = MODELS.get(model_id, {})
+        except Exception:
+            model_data = {}
+    if isinstance(model_data, dict):
+        explicit = str(model_data.get("api", "") or "").strip().lower()
+        if explicit in ("chat", "responses"):
+            return explicit
+    lid = str(model_id or "").lower()
+    for fam in sorted(MODEL_API_FAMILIES, key=len, reverse=True):
+        if fam in lid:
+            return MODEL_API_FAMILIES[fam]
+    return "chat"
+
+
+_CAP_TEXT_IMAGE_PDF = ["text", "image", "pdf"]
+
+
+def _capabilities_full(interleaved: str | None = None) -> dict:
+    return {
+        "input": list(_CAP_TEXT_IMAGE_PDF),
+        "output": ["text"],
+        "reasoning": True,
+        "toolcall": True,
+        "interleaved": interleaved,
+    }
+
+
+# Capabilities par famille (port de models.dev, version proxy : seules les
+# modalités d'entrée sont consommées aujourd'hui, via get_model_capabilities).
+FAMILY_CAPABILITIES = {
+    "claude": _capabilities_full(),
+    "gpt": _capabilities_full(),
+    "kimi": _capabilities_full(),
+    "glm": _capabilities_full(),
+    "minimax": _capabilities_full(),
+    "muse-spark": _capabilities_full(),
+    "muse": _capabilities_full(),
+    "spark": _capabilities_full(),
+    "qwen": _capabilities_full(),
+    "deepseek": _capabilities_full(interleaved="reasoning_content"),
+    "mistral": _capabilities_full(),
+    "gemini": _capabilities_full(),
+    "grok": _capabilities_full(),
+    "mimo": _capabilities_full(),
+    "hy": _capabilities_full(),
+    "nemotron": _capabilities_full(),
+    "laguna": _capabilities_full(),
+    "north": _capabilities_full(),
+    "big": _capabilities_full(),
+    "longcat": _capabilities_full(),
+    "ling": _capabilities_full(),
+    "omen": _capabilities_full(),
+    "union": _capabilities_full(),
+}
+UNKNOWN_MODEL_CAPABILITIES = {
+    "input": ["text"],
+    "output": ["text"],
+    "reasoning": False,
+    "toolcall": True,
+    "interleaved": None,
+}
+
+
+def get_model_capabilities(model_id: str, model_data: dict | None = None) -> dict:
+    """Capabilities du modèle (parité models.dev, version proxy).
+
+    `capabilities:` explicite du modèle (config.yaml, fusionné par-dessus le
+    défaut de famille) > famille > modèle inconnu (texte seul). Retourne
+    toujours un dict neuf (jamais de référence partagée mutable).
+    """
+    if model_data is None:
+        try:
+            model_data = MODELS.get(model_id, {})
+        except Exception:
+            model_data = {}
+    base: dict | None = None
+    lid = str(model_id or "").lower()
+    for fam in sorted(FAMILY_CAPABILITIES, key=len, reverse=True):
+        if fam in lid:
+            base = FAMILY_CAPABILITIES[fam]
+            break
+    if base is None:
+        base = UNKNOWN_MODEL_CAPABILITIES
+    merged = {**base, "input": list(base.get("input", ["text"]))}
+    if isinstance(model_data, dict):
+        explicit = model_data.get("capabilities")
+        if isinstance(explicit, dict):
+            for key, value in explicit.items():
+                merged[key] = list(value) if isinstance(value, (list, tuple)) else value
+    return merged
+
+
 # ── Models ──────────────────────────────────────────────────────────
 _models_cfg = yaml_get("models", default={})
 MODELS = {}
@@ -600,11 +710,14 @@ _RESPONSES_FREE_ENDPOINT = "https://opencode.ai/zen/v1/responses"
 def _resolve_model_endpoint(model_id: str, model_data: dict, protocol: str) -> str:
     """Resolve the upstream endpoint for a configured model.
 
-    An explicit per-model `endpoint` key wins over the -free / muse-spark
-    heuristics: 'go' → Go chat completions (authenticated subscription),
-    'free' → free chat completions, any other value is used verbatim as a
-    full URL (a -free id with `endpoint: go` lives on the Go endpoint
-    despite its suffix).
+    An explicit per-model `endpoint` key wins over everything: 'go' → Go chat
+    completions (authenticated subscription), 'free' → free chat completions,
+    any other value is used verbatim as a full URL (a -free id with
+    `endpoint: go` lives on the Go endpoint despite its suffix).
+
+    Sinon l'`api:` explicite (`chat` | `responses`, cf. get_model_api)
+    choisit la famille d'endpoint, déclinée en variante `-free` le cas
+    échéant ; à défaut d'`api:`, les heuristiques historiques s'appliquent.
     """
     explicit = model_data.get("endpoint")
     if explicit:
@@ -616,12 +729,11 @@ def _resolve_model_endpoint(model_id: str, model_data: dict, protocol: str) -> s
             return API_BASE_FREE
         return value
     lid = model_id.lower()
-    if lid.endswith("-free"):
-        if "muse" in lid or "spark" in lid:
-            return _RESPONSES_FREE_ENDPOINT
+    is_free = lid.endswith("-free")
+    if get_model_api(model_id, model_data) == "responses":
+        return _RESPONSES_FREE_ENDPOINT if is_free else _RESPONSES_ENDPOINT
+    if is_free:
         return API_BASE_FREE
-    if "muse" in lid or "spark" in lid:
-        return _RESPONSES_ENDPOINT
     return API_BASE_OPENAI if protocol == "openai" else API_BASE_ANTHROPIC
 
 
@@ -629,7 +741,12 @@ for _model_id, _model_data in _models_cfg.items():
     if isinstance(_model_data, dict):
         _proto = _model_data.get("protocol", "openai")
         _endpoint = _resolve_model_endpoint(_model_id, _model_data, _proto)
-        MODELS[_model_id] = {"endpoint": _endpoint, "protocol": _proto}
+        MODELS[_model_id] = {
+            "endpoint": _endpoint,
+            "protocol": _proto,
+            "api": get_model_api(_model_id, _model_data),
+            "capabilities": get_model_capabilities(_model_id, _model_data),
+        }
 
 
 # [Phase 1] Fetch + starter déplacés vers config/discovery.py (DI).
