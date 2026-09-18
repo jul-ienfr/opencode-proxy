@@ -279,7 +279,7 @@ ip_rotation:
   station_count: 6
   station_max_rotations_per_hour: 10
   status_cache_seconds: 2.0
-  strict_free: false
+  strict_free: true
   switch_delay: 1
   update_apply_idle_minutes: 15
   update_apply_max_defer_hours: 24
