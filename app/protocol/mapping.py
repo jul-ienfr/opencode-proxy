@@ -4129,7 +4129,26 @@ def _responses_sse_to_chat_deltas(raw_line: str, parsed=None, state: "ResponsesS
         }
         if _cached:
             chat_usage["prompt_tokens_details"] = {"cached_tokens": _cached}
-        return {"choices": [], "usage": chat_usage}
+        # [FIX finish_reason] ``response.completed`` est l'événement TERMINAL du
+        # protocole Responses : il doit permettre de conclure un tour. Sans raison
+        # terminale, l'hôte « synthétisait » un faux ``finish_reason: "stop"``
+        # (532 occurrences mesurées) — y compris pour des tours d'OUTIL, qui doivent
+        # rapporter ``tool_calls``. On expose la raison réelle sous une clé PRIVÉE
+        # ``_finish_reason`` : le contrat public (``choices: []``) est préservé, donc
+        # aucun consommateur n'est cassé (l'``usage`` et ``got_response_completed``
+        # des handlers restent capturés à l'identique).
+        _finish_reason = "stop"
+        _output = resp.get("output")
+        if isinstance(_output, list):
+            for _item in _output:
+                if isinstance(_item, dict) and _item.get("type") in (
+                    "function_call",
+                    "custom_tool_call",
+                    "local_shell_call",
+                ):
+                    _finish_reason = "tool_calls"
+                    break
+        return {"choices": [], "usage": chat_usage, "_finish_reason": _finish_reason}
 
     # response.incomplete — model didn't generate output, treat as stream end
     if etype == "response.incomplete":

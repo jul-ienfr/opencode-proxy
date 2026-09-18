@@ -124,6 +124,8 @@ models:
     protocol: openai
   deepseek-v4.1-flash:
     protocol: openai
+  union-alpha:
+    protocol: openai
 free_model_map:
   mimo-v2.5: mimo-v2.5-free
   qwen3.7-max: mimo-v2.5-free

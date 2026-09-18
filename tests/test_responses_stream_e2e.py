@@ -74,6 +74,13 @@ def streamed(monkeypatch):
 
     monkeypatch.setattr(opencode, "_do_request_with_retry", _fake)
 
+    async def _fake_free(endpoint, body, headers):
+        # [gate body 2026-09-18] la jambe free directe ne passe plus par
+        # _do_request_with_retry : même simulacre, même contrat.
+        return _FakeStreamResp(), {}
+
+    monkeypatch.setattr(opencode, "_do_free_direct_request", _fake_free)
+
     # Pas de `with TestClient(app)` : le contexte déclenche le lifespan de
     # démarrage (pollers/superviseur en tâches de fond) qui ne se termine pas
     # sous pytest. Le client nu suffit — on ne teste que le handler.
@@ -212,6 +219,12 @@ def non_streamed(monkeypatch):
         return _FakeJsonResp(_CHAT_JSON), {}
 
     monkeypatch.setattr(opencode, "_do_request_with_retry", _fake)
+
+    async def _fake_free(endpoint, body, headers):
+        # [gate body 2026-09-18] cf. fixture streamed ci-dessus.
+        return _FakeJsonResp(_CHAT_JSON), {}
+
+    monkeypatch.setattr(opencode, "_do_free_direct_request", _fake_free)
     client = TestClient(opencode.app)
     r = client.post(
         "/v1/responses",

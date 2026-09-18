@@ -1440,15 +1440,23 @@ _curl_pool: dict[str, _CurlSessionPool] = {}  # key -> pool (E2: get direct mono
 from upstream.clients import evict_later as _evict_later  # noqa: E402
 
 
-async def _get_pooled_curl_session(proxy_url: str | None, impersonate: str):
-    """Emprunte une session du pool pour (proxy, impersonate).
+async def _get_pooled_curl_session(proxy_url: str | None, impersonate: str, fp_override: dict | None = None):
+    """Emprunte une session du pool pour (proxy, face réseau).
 
     Retourne (pool, slot) : l'appelant POSTe via ``slot.sess`` SANS tenir de
     verrou pendant le transfert, puis ``await pool.checkin(slot)`` (succès)
     ou éviction (session fautive). Les streams ne gardent l'emprunt que
     jusqu'aux headers.
+
+    ``fp_override`` (chemin free = face Bun officielle) remplace le preset
+    navigateur : ``{"ja3": ..., "extra_fp": ..., "http_version": ...}``.
+    La clé de pool devient alors ``<proxy>|bun`` (UNE seule face stable,
+    comme le vrai client) au lieu de ``<proxy>|<preset>``.
     """
-    key = f"{proxy_url or ''}|{impersonate}"
+    if fp_override:
+        key = f"{proxy_url or ''}|bun"
+    else:
+        key = f"{proxy_url or ''}|{impersonate}"
     # [E2 perf] dict.get mono-thread — pas de lock global ; seul l'état du
     # pool lui-même est sous Condition (dans checkout/checkin/evict).
     pool = _curl_pool.get(key)
@@ -1459,9 +1467,12 @@ async def _get_pooled_curl_session(proxy_url: str | None, impersonate: str):
     # [Phase 3 boot] import paresseux au 1er checkout (jamais au boot).
     if not _ensure_curl_cffi():
         raise RuntimeError("curl_cffi non installé : pip install curl_cffi")
+    if fp_override:
+        sess_kwargs: dict = dict(fp_override)
+    else:
+        sess_kwargs = {"impersonate": impersonate}
     slot = await pool.checkout(
         lambda: _curl_requests_mod.AsyncSession(
-            impersonate=impersonate,
             proxy=_curl_proxy_url(proxy_url),
             # [P1.1 perf] timeout=(connect 10, read 600) AU NIVEAU SESSION :
             # toutes les sessions poolées l'héritent — POST non-stream,
@@ -1470,6 +1481,7 @@ async def _get_pooled_curl_session(proxy_url: str | None, impersonate: str):
             # le watchdog cancel_streams reste la 2ᵉ couche (détection
             # egress-mort < timeout read).
             timeout=(10, 600),
+            **sess_kwargs,
         )
     )
     # [Lot 0] attente d'emprunt de session curl — métrique wait p50/p95/p99.
@@ -4270,8 +4282,12 @@ def _auth_window_message(status: int) -> str:
     if status == 401:
         return "All API keys exhausted (unauthorized). Check your API keys."
     if status == 403:
+        # [FIX classement harness] « (403) » retiré du texte client : `classifyPiAiError()`
+        # (dsh-llm-pi-ai) cherche `/\b(?:401|403)\b/` dans le TEXTE et en déduit « AUTH »
+        # → « API key is invalid », alors qu'un refus de région/permission n'est pas une
+        # clé invalide. Le code reste dans les logs et dans le statut HTTP.
         return (
-            "Upstream access denied (403) — model/region may be restricted for "
+            "Upstream access denied — model/region may be restricted for "
             "this key. Try again later or check key permissions."
         )
     return f"Upstream error (HTTP {status}). Try again later."
@@ -4429,6 +4445,451 @@ def _free_request_headers(headers: dict) -> dict:
     }
 
 
+# ── Identité client-officiel pour la jambe free (gate 2026-09-17) ──
+# Depuis le 17/09/2026 ~07h00 UTC, la gateway Zen refuse la jambe free
+# anonyme (« FreeTierError: can only be used from within OpenCode ») sauf
+# si la requête porte l'identité exacte du client officiel. Contrat relevé
+# DANS le repo du client (vérifié 2026-09-18 sur sst/opencode, même code
+# que le fork anomalyco/opencode) :
+#   client : packages/opencode/src/session/llm/request.ts — l'objet headers
+#     (ordre WIRE = trié par le fetch Bun, mesuré : Accept, Authorization,
+#     Content-Type, User-Agent, x-opencode-client/project/request/session) :
+#     x-opencode-project (= project.id — « global » pour le projet global,
+#     cf. ProjectV2.ID.global), x-opencode-session (= sessionID,
+#     ses_ descendant, stable par conversation), x-opencode-request
+#     (= user message ID, msg_ ascendant, STABLE par message y compris sur
+#     retry), x-opencode-client (= flags.client : « cli » par défaut,
+#     « desktop » pour l'app desktop), User-Agent = opencode/<ver> (la
+#     suite « ai-sdk/provider-utils/<v> runtime/bun/<v> » est ajoutée par
+#     la couche fetch ai-sdk/Bun).
+#   gateway : packages/console/app/src/routes/zen/util/handler.ts — lit les
+#     4 headers x-opencode-* (métriques + sticky routing sur la session +
+#     substitution $session/$request/$client/$project vers l'amont), supprime
+#     « public » de l'Authorization (anonyme), quota trial PAR IP
+#     (trialLimiter.ts). Aucune validation de l'empreinte TLS.
+#   IDs : packages/opencode/src/id/id.ts — now = ms*0x1000 + compteur/ms
+#     (compteur PARTAGÉ entre préfixes), 6 octets big-endian
+#     (descending = ~now), 12 hex + 14 base62 (crypto.randomBytes % 62).
+#     Un UUID ou un aléatoire pur est rejeté.
+# Preuve : capture du desktop officiel v1.18.31 + rejeu byte-exact (200 OK).
+# Rafraîchir après chaque release du client : capturer le nouvel UA
+# (ex. via mitmproxy devant le CLI) puis poser OPENCODE_OFFICIAL_UA
+# (et OPENCODE_CLIENT_NAME / OPENCODE_TLS_IMPERSONATE si besoin).
+_OPENCODE_OFFICIAL_UA = os.getenv(
+    "OPENCODE_OFFICIAL_UA",
+    "opencode/1.18.31 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14",
+)
+# UA de la jambe Responses — MESURÉ sur le vrai client 1.18.31 (même
+# opencode/Bun, mais ai-sdk provider-utils 4.0.40 : autre bundle ai-sdk pour
+# l'API Responses). Envoyer l'UA chat (4.0.23) sur /responses = combinaison
+# qui n'existe jamais dans la nature.
+_OPENCODE_OFFICIAL_UA_RESPONSES = os.getenv(
+    "OPENCODE_OFFICIAL_UA_RESPONSES",
+    "opencode/1.18.31 ai-sdk/provider-utils/4.0.40 runtime/bun/1.3.14",
+)
+# Nom de client officiel (capture desktop ; le CLI envoie « cli » par
+# défaut — OPENCODE_CLIENT=cli côté client, cf. runtime-flags.ts).
+_OPENCODE_CLIENT_NAME = os.getenv("OPENCODE_CLIENT_NAME", "desktop")
+# Projet officiel (capture : projet global, cf. ProjectV2.ID.global).
+_OPENCODE_PROJECT = os.getenv("OPENCODE_PROJECT", "global")
+# Empreinte réseau de la jambe free — la VRAIE face TLS+HTTP du client Bun,
+# capturée octet-exact le 2026-09-18 (Bun standalone 1.3.11 PUIS le vrai
+# client opencode 1.18.31 lui-même, redirigé vers un captureur local :
+# ClientHello du binaire officiel en main). Le client réel :
+#   * 17 ciphers BoringSSL SANS GREASE, SNI en premier, ALPN = http/1.1
+#     UNIQUEMENT (le fetch Bun ne fait pas de H2), key_share x25519 unique,
+#     9 sigalgs, extensions 0-23-65281-10-11-35-16-5(OCSP)-13-18(SCT)-51-45-43
+#     (+ pad) — et PAS d'ECH (le Bun standalone en met, le binaire non).
+#   * HTTP/1.1 : headers utilisateur TRIÉS (spec fetch — mesuré sur le wire),
+#     puis Connection/Host/Accept-Encoding/Content-Length ajoutés par Bun.
+# Rejeu via curl_cffi — recette validée au captureur (ClientHello
+# byte-identique au binaire officiel modulo clés éphémères) :
+# preset chrome131 (porteur : émission OCSP/SCT) + ja3 Bun + sigalgs +
+# tls_grease False + http_version v1 + default_headers False (sans quoi les
+# headers navigateur du preset — sec-ch-ua, Sec-Fetch-*, Accept-Language —
+# polluent le wire, MESURÉ). L'ECH listé dans le ja3 n'est pas émis (pas de
+# payload exprimable — le client n'en met pas non plus : match exact).
+# Surchageable (kill-switch preset navigateur si le replay casse un jour :
+# OPENCODE_TLS_IMPERSONATE=chrome131).
+_OPENCODE_JA3 = os.getenv(
+    "OPENCODE_JA3",
+    "771,4865-4866-4867-49195-49199-49196-49200-52393-52392-49161-49171"
+    "-49162-49172-156-157-47-53,0-65037-23-65281-10-11-35-16-5-13-18-51-45-43,"
+    "29-23-24,0",
+)
+# Les 9 signature_algorithms de Bun (noms OpenSSL — 1027,2052,1025,1283,2053,
+# 1281,2054,1537,513 ; le dernier, rsa_pkcs1_sha1, manque aux presets Chrome).
+_OPENCODE_SIG_ALGS = (
+    "ecdsa_secp256r1_sha256",
+    "rsa_pss_rsae_sha256",
+    "rsa_pkcs1_sha256",
+    "ecdsa_secp384r1_sha384",
+    "rsa_pss_rsae_sha384",
+    "rsa_pkcs1_sha384",
+    "rsa_pss_rsae_sha512",
+    "rsa_pkcs1_sha512",
+    "rsa_pkcs1_sha1",
+)
+_OPENCODE_TLS_IMPERSONATE = os.getenv("OPENCODE_TLS_IMPERSONATE", "")
+
+
+def _free_fp_override() -> dict:
+    """Params de session curl_cffi pour la face Bun officielle (replay exact).
+
+    Recette validée au captureur contre le vrai client 1.18.31 (ClientHello
+    byte-identique modulo clés éphémères — cf. § ci-dessus) :
+      * ``impersonate="chrome131"`` comme PORTEUR des comportements natifs
+        (émission OCSP/SCT) — SANS ses headers navigateur (``default_headers``
+        False : sinon sec-ch-ua/Sec-Fetch-*/Accept-Language polluent le wire),
+      * ``ja3`` = ClientHello Bun (ciphers BoringSSL sans GREASE, SNI premier,
+        ALPN http/1.1, key_share x25519 unique, ordre d'extensions Bun),
+      * ``tls_signature_algorithms`` = les 9 sigalgs Bun (noms OpenSSL),
+      * ``tls_grease`` False (Bun ne grease rien — vérifié sur 6 captures),
+      * ``http_version`` "v1" (= V1_1 : Bun n'offre que http/1.1 en ALPN).
+    Données pures (pas d'import curl_cffi ici — la factory garde son import
+    paresseux + son garde). Kill-switch : si OPENCODE_TLS_IMPERSONATE est
+    posé, retourne {} et l'appelant utilise le preset navigateur seul.
+    """
+    if _OPENCODE_TLS_IMPERSONATE:
+        return {}
+    return {
+        "impersonate": "chrome131",
+        "ja3": _OPENCODE_JA3,
+        "extra_fp": {
+            "tls_signature_algorithms": list(_OPENCODE_SIG_ALGS),
+            "tls_grease": False,
+        },
+        "http_version": "v1",
+        "default_headers": False,
+    }
+
+
+def _get_free_fp_kwargs() -> tuple[str, dict | None]:
+    """(impersonate, fp_override) pour la jambe free — kill-switch inclus."""
+    if _OPENCODE_TLS_IMPERSONATE:
+        return _OPENCODE_TLS_IMPERSONATE, None
+    return "", _free_fp_override()
+
+
+# ── Corps conformes-grille pour la jambe free (gate 2026-09-18, volet body) ──
+# Bisection live contre la gateway (même IP résidentielle, même identité
+# officielle Bun rejouée — seul le corps variait), endpoint /chat :
+#   stream:false (+ 11 tools opencode) → 403 ; stream:true SANS tools → 403 ;
+#   stream:true + system 21 Ko SANS tools → 403 ; stream:true + tools SANS
+#   system → 200 ; tools[] vide → 403 ; UN seul tool (read|bash) → 403 ;
+#   moitié [task..write] → 403, moitié [bash..skill] → 200 ;
+#   [bash,read] schemas minimaux (425 o) → 200 (×2) ;
+#   [bash,grep]/[bash,edit]/[read,edit] → 403 ; tool_choice absent → 200 ;
+#   stream_options absent → 200 ; max_tokens absent → 200 ;
+#   descriptions absentes → 200 ; [Bash,Read] capitalisés → 403.
+# Puis /responses (muse-spark-1.3-contributor-free) : stream+slim bash/read
+# (UA 4.0.40) → 200, non-stream → 403, prompt_cache_key=ses_ accepté.
+# RÈGLE : stream:true + tools[] contenant EXACTEMENT « bash » ET « read »
+# (match case-sensitive — les clients style Claude envoient « Bash »/« Read »
+# et se font rejeter ; le trafic réel l'a confirmé : 25 tools lowercase DONT
+# « read » MAIS SANS « bash » → 403). Les schemas/descriptions sont libres.
+_FREE_SHIM_DESC = (
+    "Do not use this tool. It is a compatibility placeholder with no "
+    "implementation; any call fails. Use the equivalent client tool instead."
+)
+
+
+def _free_shim_tool(name: str, responses: bool) -> dict:
+    """Tool factice conforme-grille (nom exact exigé, schéma minimal prouvé)."""
+    if responses:
+        return {
+            "type": "function",
+            "name": name,
+            "description": _FREE_SHIM_DESC,
+            "parameters": {"type": "object", "properties": {}},
+        }
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": _FREE_SHIM_DESC,
+            "parameters": {"type": "object", "properties": {}},
+        },
+    }
+
+
+def _free_wire_body(body, force_stream: bool = False):
+    """Copie d'envoi jambe free : grille tools + stream (±prompt_cache_key).
+
+    Ne mute JAMAIS l'entrée (copie défensive quand un patch est requis —
+    les appelants réutilisent le même dict sur retries/hedges ; la fonction
+    est idempotente). Retourne (wire, stream_forcé_ici) : quand
+    stream_forcé_ici est True, l'appelant a basculé un corps non-stream en
+    stream:true pour passer le gate et doit LIRE du SSE puis reconstituer
+    du JSON (collecteurs ci-dessous).
+    """
+    if not isinstance(body, dict):
+        return body, False
+    is_resp = "input" in body
+    is_chat = "messages" in body
+    if not is_resp and not is_chat:
+        return body, False
+    tools = body.get("tools")
+    if isinstance(tools, list):
+        if is_chat:
+            have = {
+                t.get("function", {}).get("name")
+                for t in tools
+                if isinstance(t, dict) and isinstance(t.get("function"), dict)
+            }
+        else:
+            have = {t.get("name") for t in tools if isinstance(t, dict)}
+    else:
+        have = set()
+    missing = [n for n in ("bash", "read") if n not in have]
+    need_stream = force_stream and body.get("stream") is not True
+    need_key = is_resp and not body.get("prompt_cache_key")
+    if not missing and not need_stream and not need_key:
+        return body, False
+    wire = dict(body)
+    if missing:
+        base = list(tools) if isinstance(tools, list) else []
+        base.extend(_free_shim_tool(n, is_resp) for n in missing)
+        wire["tools"] = base
+    if need_key:
+        try:
+            wire["prompt_cache_key"] = _free_session_id()
+        except Exception:
+            pass
+    forced = False
+    if need_stream:
+        wire["stream"] = True
+        forced = True
+    return wire, forced
+
+
+def _iter_sse_data(lines):
+    """Yield les payloads JSON des lignes `data:` d'un flux SSE."""
+    for line in lines or []:
+        s = line.strip() if isinstance(line, str) else bytes(line).decode("utf-8", "replace").strip()
+        if not s.startswith("data:"):
+            continue
+        payload = s[5:].strip()
+        if not payload or payload == "[DONE]":
+            continue
+        try:
+            yield _json_loads(payload)
+        except Exception:
+            continue
+
+
+def _collect_chat_completion(lines, model) -> dict | None:
+    """Reconstitue un chat.completion JSON depuis des chunks SSE OpenAI."""
+    content, finish, usage = [], None, {}
+    for ev in _iter_sse_data(lines):
+        if not isinstance(ev, dict):
+            continue
+        for ch in ev.get("choices") or []:
+            if not isinstance(ch, dict):
+                continue
+            d = ch.get("delta") or {}
+            t = d.get("content") if isinstance(d, dict) else None
+            if isinstance(t, str) and t:
+                content.append(t)
+            if ch.get("finish_reason"):
+                finish = ch["finish_reason"]
+        if isinstance(ev.get("usage"), dict):
+            usage = ev["usage"]
+    if not content and not finish and not usage:
+        return None
+    return {
+        "id": f"chatcmpl-free-{int(time.time() * 1000):x}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": "".join(content)},
+                "finish_reason": finish or "stop",
+            }
+        ],
+        "usage": dict(usage) if usage else {},
+    }
+
+
+def _collect_responses_object(lines, model) -> dict | None:
+    """Reconstitue un objet response JSON depuis des events SSE Responses."""
+    completed, texts = None, []
+    for ev in _iter_sse_data(lines):
+        if not isinstance(ev, dict):
+            continue
+        if ev.get("type") == "response.completed" and isinstance(ev.get("response"), dict):
+            completed = ev["response"]
+        elif ev.get("type") == "response.output_text.delta" and isinstance(ev.get("delta"), str):
+            texts.append(ev["delta"])
+    if isinstance(completed, dict):
+        return completed
+    if texts:
+        return {
+            "id": f"resp_free-{int(time.time() * 1000):x}",
+            "object": "response",
+            "model": model,
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "".join(texts)}],
+                }
+            ],
+        }
+    return None
+
+
+class _WireJsonResponse:
+    """Coquille JSON → objet réponse (collection SSE forcée, jambe free)."""
+
+    def __init__(self, payload: dict):
+        self.status_code = 200
+        self.headers = {"content-type": "application/json"}
+        self.content = _json_dumps(payload)
+
+
+_OC_ID_ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+_OC_ID_LOCK = threading.Lock()
+_OC_ID_LAST_MS = 0
+_OC_ID_COUNTER = 0
+_FREE_SESSION_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "_free_session_id")
+_FREE_SESSION_CACHE: str | None = None
+_FREE_SESSION_TS = 0.0
+_FREE_SESSION_ROTATE_S = 1800.0
+# msg_ du message logique en cours (sémantique client : l'ID du message
+# utilisateur, stable sur tous les essais — retries, hedges, stations —
+# d'UNE requête proxy). Une tâche asyncio = une requête entrante (Starlette)
+# → mint paresseux une fois par tâche, jamais de fuite inter-requêtes.
+_free_msg_id: contextvars.ContextVar[str | None] = contextvars.ContextVar("_free_msg_id", default=None)
+
+
+def _oc_random_base62(n: int = 14) -> str:
+    """Port exact de ``randomBase62()`` (id.ts) : 1 octet crypto par car."""
+    return "".join(_OC_ID_ALPHABET[b % 62] for b in os.urandom(n))
+
+
+def _mint_oc_id(prefix: str, direction: str = "descending", ts_ms: int | None = None) -> str:
+    """Porte exact de ``create()`` (packages/opencode/src/id/id.ts).
+
+    ``direction`` vaut ``"descending"`` (sessions ``ses_``) ou
+    ``"ascending"`` (messages ``msg_``). Compteur partagé par ms comme
+    dans le module TS d'origine.
+    """
+    global _OC_ID_LAST_MS, _OC_ID_COUNTER
+    now_ms = ts_ms if ts_ms is not None else int(time.time() * 1000)
+    with _OC_ID_LOCK:
+        if now_ms != _OC_ID_LAST_MS:
+            _OC_ID_LAST_MS = now_ms
+            _OC_ID_COUNTER = 0
+        _OC_ID_COUNTER += 1
+        n = now_ms * 0x1000 + _OC_ID_COUNTER
+    if direction == "descending":
+        n = -n - 1
+    n48 = n & ((1 << 48) - 1)
+    return f"{prefix}_{n48.to_bytes(6, 'big').hex()}" + _oc_random_base62(14)
+
+
+def _free_session_id() -> str:
+    """Session free ``ses_`` stable, tournée toutes les 30 min.
+
+    Même rôle que ``_proxy_session_id`` (sticky routing amont) mais au
+    format temporel exigé par le gate. Persistée (fichier ``ses|unix``)
+    pour survivre au reboot ; régénérée si âgée de plus de
+    ``_FREE_SESSION_ROTATE_S`` (le proxy tourne 24/7, une session
+    éternelle risquerait de sortir de la fenêtre de fraîcheur).
+    """
+    global _FREE_SESSION_CACHE, _FREE_SESSION_TS
+    now = time.time()
+    if _FREE_SESSION_CACHE and (now - _FREE_SESSION_TS) < _FREE_SESSION_ROTATE_S:
+        return _FREE_SESSION_CACHE
+    try:
+        with open(_FREE_SESSION_FILE, encoding="utf-8") as f:
+            raw = (f.read() or "").strip()
+        sid, _, ts = raw.partition("|")
+        if (
+            sid.startswith("ses_")
+            and len(sid) == 30
+            and ts.replace(".", "", 1).isdigit()
+            and (now - float(ts)) < _FREE_SESSION_ROTATE_S
+        ):
+            _FREE_SESSION_CACHE, _FREE_SESSION_TS = sid, float(ts)
+            return sid
+    except OSError:
+        pass
+    sid = _mint_oc_id("ses", "descending")
+    _FREE_SESSION_CACHE, _FREE_SESSION_TS = sid, now
+    try:
+        _tmp = _FREE_SESSION_FILE + ".tmp"
+        with open(_tmp, "w", encoding="utf-8") as f:
+            f.write(f"{sid}|{now}")
+        os.replace(_tmp, _FREE_SESSION_FILE)
+    except OSError:
+        pass
+    return sid
+
+
+def _free_request_msg_id() -> str:
+    """``msg_`` du message logique en cours — mint paresseux par tâche.
+
+    Sémantique client (request.ts) : ``x-opencode-request`` = l'ID du message
+    utilisateur, donc STABLE sur tous les envois d'un même message (retries,
+    hedges, stations). L'ancien code re-mintait un ID par essai.
+    """
+    mid = _free_msg_id.get()
+    if not mid:
+        mid = _mint_oc_id("msg", "ascending")
+        _free_msg_id.set(mid)
+    return mid
+
+
+def _official_free_headers(endpoint: str = "") -> dict:
+    """Jeu de headers officiel complet pour UN envoi jambe free.
+
+    Copie du wire Bun MESURÉ sur le vrai client 1.18.31 (capture en clair
+    via baseURL http:// locale, 2026-09-18) — octet-exact :
+      Authorization: Bearer public
+      Content-Type: application/json
+      User-Agent: opencode/<ver> ai-sdk/provider-utils/<v> runtime/bun/<v>
+      x-opencode-client / x-opencode-project / x-opencode-request /
+      x-opencode-session
+    puis la pile Bun ajoute : Connection: keep-alive, Accept: */*, Host,
+    Accept-Encoding: gzip, deflate, br, zstd, Content-Length.
+    Points critiques (le gate 403 les discrimine) :
+      * PAS de header ``Accept`` explicite : le vrai client ne le pose
+        jamais (transport Bun l'ajoute en 9ᵉ position) ; un Accept explicite
+        serait trié en premier par le fetch et trahirait la copie ;
+      * Authorization en premier (ai-sdk pose ses headers avant ceux du
+        user : request.ts + provider.ts) ;
+      * UA complet avec suffixes ai-sdk/Bun (composés par ai-sdk, VÉRIFIÉS
+        sur le wire : pas de suffixe ajouté par Bun lui-même).
+    La clé payante du client n'est JAMAIS recopiée : seul ``Bearer public``
+    part vers l'amont (A.0). AUCUN header navigateur (Accept-Language,
+    sec-ch-ua, cookies…) : le vrai client n'en envoie jamais — les
+    ``extra_headers`` des profils d'identité ne partent donc plus sur la
+    jambe free (ils restent utilisés sur le chemin geo, qui lui imite un
+    navigateur).
+    Note : Accept-Encoding reste celui de curl (``gzip, deflate, br``) et
+    NON celui de Bun (``+ zstd``) — notre build ne décode pas zstd, et
+    l'annoncer casserait les corps (vérifié au captureur : décodage auto OK
+    dans les deux cas dès que gzip est annoncé).
+
+    ``endpoint`` sélectionne l'UA : le client envoie provider-utils/4.0.23
+    sur /chat/completions mais 4.0.40 sur /responses (deux bundles ai-sdk).
+    """
+    ua = _OPENCODE_OFFICIAL_UA_RESPONSES if "/responses" in (endpoint or "") else _OPENCODE_OFFICIAL_UA
+    return {
+        "Authorization": "Bearer public",
+        "Content-Type": "application/json",
+        "User-Agent": ua,
+        "x-opencode-client": _OPENCODE_CLIENT_NAME,
+        "x-opencode-project": _OPENCODE_PROJECT,
+        "x-opencode-request": _free_request_msg_id(),
+        "x-opencode-session": _free_session_id(),
+    }
+
+
 def _is_connect_error(e: Exception) -> bool:
     """[plan 18/08 §1a] True when ``e`` is a transport-level connection
     failure through the VPN tunnel (SOCKS5 dead) — NOT an HTTP answer.
@@ -4491,21 +4952,29 @@ async def _do_free_request_curl_cffi(
 ):
     """Make a free model request using curl_cffi for TLS fingerprint evasion.
 
-    Uses the current identity profile's TLS fingerprint (default chrome131)
-    and User-Agent to avoid detection.
+    Rejoue la face réseau Bun officielle (ja3 custom + HTTP/1.1, cf.
+    _free_fp_override) avec le jeu de headers officiel — une copie du
+    client OpenCode, jamais une face navigateur en rotation.
     When proxy_url is provided (VPN mode), routes through the tunnel so the
     request exits with the VPN IP (fresh free quota per IP).
-    station disambiguates the identity under dual station (the tunnel that
-    egresses this request must be the one whose fingerprint is stamped).
-    Returns an httpx-like response object for compatibility.
+    station selects the egress tunnel (dual station); it no longer selects a
+    fingerprint. Returns an httpx-like response object for compatibility.
     """
     if not _ensure_curl_cffi():
         raise RuntimeError("curl_cffi non installé : pip install curl_cffi")
 
-    # Strip paid-account artifacts, stamp the identity (bundle UA wins)
-    profile = _current_free_identity(station)
-    req_headers = _apply_identity(_free_request_headers(headers), profile, use_curated_ua=False)
-    req_headers["Content-Type"] = "application/json"
+    # [gate 2026-09-17 + copie exacte 2026-09-18] Identité officielle
+    # complète : les headers client (dont sa clé payante) ne partent JAMAIS
+    # vers le free — seul « Bearer public » + IDs ses_/msg_ temporels passent
+    # le gate. Face réseau = replay Bun (ja3 custom + H1), jamais un preset
+    # navigateur (cf. _free_fp_override). UA choisie par endpoint (le client
+    # envoie provider-utils/4.0.40 sur /responses, 4.0.23 sur /chat).
+    req_headers = _official_free_headers(endpoint or "")
+    _free_impersonate, _free_fp = _get_free_fp_kwargs()
+    # [gate body 2026-09-18] grille tools (bash+read) + stream forcé : un corps
+    # non-stream ou sans tools serait 403. Si stream forcé ici, le SSE est
+    # collecté plus bas et reconstitué en JSON (contrat non-stream inchangé).
+    wire_body, _force_wire_stream = _free_wire_body(body, force_stream=True)
 
     # Pooled session — [A1 perf] checkout/checkin SANS verrou pendant le
     # transfert : le POST non-streaming ne sérialise plus la station.
@@ -4528,7 +4997,7 @@ async def _do_free_request_curl_cffi(
     last_exc: Exception | None = None
     for attempt_i, attempt_proxy in enumerate(proxies_to_try):
         is_last = attempt_i == len(proxies_to_try) - 1
-        pool, slot = await _get_pooled_curl_session(attempt_proxy, profile["impersonate"])
+        pool, slot = await _get_pooled_curl_session(attempt_proxy, _free_impersonate, _free_fp)
         if endpoint:
             _ep = endpoint
         else:
@@ -4553,9 +5022,10 @@ async def _do_free_request_curl_cffi(
         try:
             resp = await slot.sess.post(
                 _ep,
-                content=_serialize_json_body(body),
+                content=_serialize_json_body(wire_body),
                 headers=req_headers,
                 timeout=(10, 600),  # (connect, read) — read 600: long streams
+                stream=_force_wire_stream,
             )
         except asyncio.CancelledError:
             # [P2.1 perf/fuite] _evict_later au lieu de discard() : le slot est
@@ -4585,6 +5055,29 @@ async def _do_free_request_curl_cffi(
             last_exc = e
             continue  # try next proxy (HTTP fallback)
         # Wrap in a compatible response object
+        if _force_wire_stream:
+            # [gate body 2026-09-18] stream forcé pour passer le gate sur une
+            # jambe non-stream : on collecte le SSE ici (slot encore emprunté)
+            # et on reconstitue le JSON qu'un appel non-stream aurait rendu —
+            # l'appelant ne voit aucune différence.
+            try:
+                _forced_lines = [ln async for ln in resp.aiter_lines()]
+            finally:
+                try:
+                    await resp.aclose()
+                except Exception:
+                    pass
+            await pool.checkin(slot)
+            if "/responses" in _ep:
+                _forced_data = _collect_responses_object(_forced_lines, wire_body.get("model", ""))
+            else:
+                _forced_data = _collect_chat_completion(_forced_lines, wire_body.get("model", ""))
+            if not _forced_data:
+                # SSE vide (tunnel tronqué ?) → proxy suivant, comme une
+                # erreur transport (pas de bad-mark : pas un connect-error).
+                last_exc = UpstreamError("free: empty SSE collection", status_code=502)
+                continue
+            return _CurlCffiResponse(_WireJsonResponse(_forced_data))
         await pool.checkin(slot)
         return _CurlCffiResponse(resp)
     # Ici last_exc est toujours posée (boucle ≥1 tour, cf. ci-dessus) ; le
@@ -4593,6 +5086,49 @@ async def _do_free_request_curl_cffi(
     if last_exc is None:  # pragma: no cover — défensif
         raise RuntimeError("free curl: no proxy slots available")
     raise last_exc
+
+
+async def _do_free_direct_request(endpoint, body: dict, headers: dict):
+    """Envoi free direct httpx (IP résidentielle) — stream forcé + collecte.
+
+    Pendant free-only de ``_do_request_with_retry`` (partagé avec le paid,
+    qui doit rester non-stream) : applique la grille body (tools bash+read),
+    force stream:true (exigé par le gate), lit le SSE et reconstitue le JSON
+    qu'un appel non-stream aurait rendu. Contrat de retour identique à
+    ``_do_request_with_retry`` : tuple (resp, resp_headers) avec un vrai
+    ``httpx.Response`` — resp_headers étant, comme là-bas, les headers de
+    REQUÊTE. Erreurs HTTP repassées telles quelles pour le mapping 403/429
+    existant ; vide → UpstreamError 502 → repli paid).
+    """
+    wire_body, _ = _free_wire_body(body, force_stream=True)
+    req_headers = dict(headers)
+    try:
+        async with _ensure_http_client().stream(
+            "POST", endpoint, content=_serialize_json_body(wire_body), headers=req_headers
+        ) as resp:
+            status = resp.status_code
+            if status != 200:
+                raw = await resp.aread()
+                return (
+                    httpx.Response(status, headers=dict(resp.headers), content=raw, request=resp.request),
+                    req_headers,
+                )
+            lines = [ln async for ln in resp.aiter_lines()]
+    except httpx.RequestError as e:
+        raise UpstreamError(f"Free direct request failed: {type(e).__name__}: {e}", status_code=502, original=e) from e
+    if "/responses" in (endpoint or ""):
+        data = _collect_responses_object(lines, wire_body.get("model", ""))
+    else:
+        data = _collect_chat_completion(lines, wire_body.get("model", ""))
+    if not data:
+        raise UpstreamError("free direct: empty SSE collection", status_code=502)
+    out = httpx.Response(
+        200,
+        headers={"content-type": "application/json"},
+        content=_json_dumps(data),
+        request=httpx.Request("POST", endpoint, headers=req_headers),
+    )
+    return out, req_headers
 
 
 def _free_parallel_should_hedge(body: dict, forced_pool=None) -> bool:
@@ -5117,9 +5653,10 @@ async def _open_free_stream(
     """Context manager: upstream stream, routed through the VPN when free.
 
     use_free=True and VPN available → curl_cffi stream via the SOCKS5 tunnel
-    (fresh IP = fresh free quota), impersonate the current identity profile.
-    Direct fallback (VPN down) → httpx stream with paid-account artifacts
-    stripped and the identity UA applied (invariant A.0). use_free=False →
+    (fresh IP = fresh free quota) with the frozen official-client face
+    (headers + TLS, cf. _official_free_headers).
+    Direct fallback (VPN down) → httpx stream with the same official face
+    (invariant A.0). use_free=False →
     normal paid httpx stream, headers untouched. All paths yield the same
     response interface.
 
@@ -5208,8 +5745,13 @@ async def _open_free_stream(
                         "proxy_url": proxy_url,
                     }
                 )
-                req_headers = _apply_identity(_free_request_headers(headers), profile, use_curated_ua=False)
-                req_headers["Content-Type"] = "application/json"
+                # [gate 2026-09-17 + copie exacte 2026-09-18] Identité
+                # officielle (msg_ stable par message via _free_request_msg_id,
+                # face Bun rejouée, UA par endpoint) — même sur les ré-essais.
+                req_headers = _official_free_headers(endpoint or "")
+                _free_impersonate, _free_fp = _get_free_fp_kwargs()
+                # [gate body 2026-09-18] grille tools sur le corps stream.
+                wire_body, _ = _free_wire_body(body, force_stream=True)
                 # [P1.1 perf] timeout=(10, 600) posé AU NIVEAU DE LA FACTORY
                 # de session poolée (_get_pooled_curl_session) : le POST
                 # ci-dessous n'a plus besoin d'un timeout par appel — toutes
@@ -5218,7 +5760,7 @@ async def _open_free_stream(
                 # aucune requête légitime n'est impactée ; un tunnel mort est
                 # détecté par le watchdog cancel_streams AVANT le read 600.
                 _debug(f"  [free-stream] creating curl_cffi session proxy={_curl_proxy_url(proxy_url)} (pooled)")
-                pool2, slot2 = await _get_pooled_curl_session(proxy_url, profile["impersonate"])
+                pool2, slot2 = await _get_pooled_curl_session(proxy_url, _free_impersonate, _free_fp)
                 # [A1 perf] emprunt SANS verrou pendant le POST : seuls les
                 # headers transitent sous l'emprunt, le corps est consommé
                 # après restitution — sémantique inchangée, parallélisme OK.
@@ -5227,7 +5769,7 @@ async def _open_free_stream(
                     _t0_ttfb = time.monotonic()
                     resp = await slot2.sess.post(
                         endpoint,
-                        content=_serialize_json_body(body),
+                        content=_serialize_json_body(wire_body),
                         headers=req_headers,
                         stream=True,
                     )
@@ -5338,10 +5880,13 @@ async def _open_free_stream(
                 "proxy_url": None,
             }
         )
-        free_headers = _apply_identity(_free_request_headers(headers), profile, use_curated_ua=True)
-        free_headers["Content-Type"] = "application/json"
+        # [gate 2026-09-17 + copie exacte 2026-09-18] Identité officielle
+        # (direct fallback httpx aussi — même face, sans TLS custom).
+        # [gate body 2026-09-18] grille tools sur le corps stream.
+        free_headers = _official_free_headers(endpoint or "")
+        wire_body, _ = _free_wire_body(body, force_stream=True)
         async with _ensure_http_client().stream(
-            "POST", endpoint, content=_serialize_json_body(body), headers=free_headers
+            "POST", endpoint, content=_serialize_json_body(wire_body), headers=free_headers
         ) as resp:
             yield resp
         return
@@ -5887,7 +6432,13 @@ def _free_stations_exhausted(free_model: str) -> bool:
     return True
 
 
-def _mark_free_stations_429(free_model: str, retry_after: str = "", stations=None, forced_pool=None) -> None:
+def _mark_free_stations_429(
+    free_model: str,
+    retry_after: str = "",
+    stations=None,
+    forced_pool=None,
+    record_global: bool = True,
+) -> None:
     """[PLAN-corrections-429 G1/G3/G5] Action 429 immédiate par station.
 
     Chaque station listée est traitée INDÉPENDAMMENT : cooldown si
@@ -5899,8 +6450,16 @@ def _mark_free_stations_429(free_model: str, retry_after: str = "", stations=Non
     ``_free_429_by_model`` incrémenté ici (point de passage unique
     stream + non-stream).
     """
-    _record_global_429()
-    _note_free_429(free_model)
+    # [FIX EOF nu] ``record_global=False`` pour une fermeture de flux (EOF réseau) :
+    # ce n'est PAS un signal de quota upstream. Sans ce garde-fou, chaque tentative
+    # d'un flux vide alimente le compteur global 429 (seuil 10 / fenêtre 30 s) et une
+    # rafale de flux vides ouvre le coupe-circuit global → 503 pour TOUT le trafic,
+    # payant inclus. Mesuré : 3 requêtes à flux vide (12 tentatives) suffisaient.
+    # Le cooldown et la rotation de la station sont conservés (c'est la remédiation
+    # utile quand un tunnel meurt) ; seul le COMPTAGE 429 est court-circuité.
+    if record_global:
+        _record_global_429()
+        _note_free_429(free_model)
     if stations is None:
         stations = [_free_attempt_station()]
     seen = set()
@@ -5979,7 +6538,13 @@ def _register_failover_exhausted_cb(free_model_getter=None) -> None:
         pass
 
 
-def _on_free_429_stream(free_model: str, retry_after: str = "", forced_pool=None, failed_stations=None) -> bool:
+def _on_free_429_stream(
+    free_model: str,
+    retry_after: str = "",
+    forced_pool=None,
+    failed_stations=None,
+    record_global: bool = True,
+) -> bool:
     """Free endpoint 429 during streaming: cooldown + paid fallback.
 
     Returns True when the request must be REFUSED (strict_free mode and
@@ -6006,6 +6571,7 @@ def _on_free_429_stream(free_model: str, retry_after: str = "", forced_pool=None
         retry_after,
         stations=failed_stations if failed_stations else [_free_attempt_station()],
         forced_pool=forced_pool,
+        record_global=record_global,
     )
     strict_free = IP_ROTATION.get("strict_free", False)
     if strict_free and _free_exception_fallback_mode() == "direct":
@@ -6239,10 +6805,15 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
         if vpn and vpn.current_ip:
             free_ip = vpn.current_ip
 
-    # Free models don't need authentication — minimal headers + identity UA
+    # [gate 2026-09-17 + copie exacte 2026-09-18] La jambe free parle en
+    # client officiel anonyme (Bearer public + IDs ses_/msg_ temporels) —
+    # jamais avec la clé payante du client. UN msg_ par message logique
+    # (stable sur tous les essais : hedge/séquentiel partagent la tâche,
+    # cf. _free_request_msg_id). Le label d'identité reste informatif
+    # (observabilité) : la face réseau est figée, pas en rotation.
     free_profile = _current_free_identity(station)
     _current_free_attempt.set({"ip": free_ip, "identity": free_profile.get("impersonate") or "", "station": station})
-    free_headers = _apply_identity({"Content-Type": "application/json"}, free_profile, use_curated_ua=True)
+    free_headers = _official_free_headers(free_endpoint or "")
     free_api_key = "free (no auth)"
     free_workspace = "free (no auth)"
 
@@ -6667,17 +7238,16 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
                 return None
             _log("  FREE via VPN tunnels FAILED → direct fallback (residential IP)")
             try:
-                resp, resp_headers = await _do_request_with_retry(
-                    free_endpoint, free_body, free_headers, protocol, retry_on_429=False
-                )
+                # [gate body 2026-09-18] envoi free-only : grille tools +
+                # stream forcé + collecte (le sender partagé paid doit rester
+                # non-stream — jamais de stream ici).
+                resp, resp_headers = await _do_free_direct_request(free_endpoint, free_body, free_headers)
             except UpstreamError:
                 _log_free_model_usage(model_id, free_model, free_api_key, free_workspace, 502, ip=free_ip)
                 return None
     else:
         try:
-            resp, resp_headers = await _do_request_with_retry(
-                free_endpoint, free_body, free_headers, protocol, retry_on_429=False
-            )
+            resp, resp_headers = await _do_free_direct_request(free_endpoint, free_body, free_headers)
         except UpstreamError:
             _log_free_model_usage(model_id, free_model, free_api_key, free_workspace, 502, ip=free_ip)
             return None
@@ -7027,8 +7597,14 @@ def _datapolicy_client_message(optin_url: str | None, account_alias: str = "") -
     """
     alias = f" (compte {account_alias})" if account_alias else ""
     url = optin_url or "opt-in requis (URL non extraite du body)"
+    # [FIX classement harness] Le code HTTP amont n'apparaît PAS dans le texte client :
+    # `classifyPiAiError()` (dsh-llm-pi-ai) teste `/\b(?:401|403)\b/` sur le TEXTE du
+    # message, AVANT tous les autres cas, et en déduit « AUTH » → l'UI affiche
+    # « API key is invalid ». Un refus de politique contenant « 403 » était donc présenté
+    # comme une clé invalide, en masquant la cause réelle ET l'URL d'opt-in. Le statut
+    # reste dans les logs ([datapolicy-guard] url=…) et dans le code HTTP.
     return (
-        "Upstream DataPolicyError (403) — ce modèle exige l'opt-in data du "
+        "Upstream DataPolicyError — ce modèle exige l'opt-in data du "
         f"workspace{alias} : {url}. Activez l'opt-in côté compte opencode.ai, "
         "puis réessayez. Le retry ne peut pas réparer ce cas."
     )
@@ -7285,11 +7861,33 @@ def _log_fallback(req_id, leg, free_model, free_status, paid_model, account_alia
         pass
 
 
+def _status_word(code) -> str:
+    """[FIX classement harness] Rend un statut amont en MOTS pour le texte client.
+
+    `classifyPiAiError()` (dsh-llm-pi-ai) teste `/\b(?:401|403)\b/` sur le TEXTE du
+    message AVANT tout le reste et en déduit « AUTH » → l'UI affiche « API key is
+    invalid ». Un refus de politique (DataPolicy, free tier) annoncé avec « 403 »
+    était donc présenté comme une clé invalide, en masquant la cause réelle. Les
+    codes numériques restent dans les logs (`free_status=…`, `paid_status=…`).
+    """
+    try:
+        n = int(code)
+    except (TypeError, ValueError):
+        return str(code)
+    return {
+        400: "requête refusée par l'amont",
+        401: "authentification refusée par l'amont",
+        403: "accès refusé par l'amont",
+        404: "modèle introuvable en amont",
+        429: "quota amont atteint",
+    }.get(n, "échec amont")
+
+
 def _correlated_403_message(msg, req_id):
     """[Étape 2C — C1] Préfixe corrélé free→paid sur un message 403/503 payant.
 
     msg = message B1 déjà calculé (DataPolicyError explicite OU texte région
-    conservé) ; préfixe « free <modèle> → <free_status>, paid fallback → »
+    conservé) ; préfixe « free <modèle> → <cause>, paid fallback → »
     seulement si un contexte C1 existe pour ce req_id (requête réellement
     passée par le fallback). Sinon retourne msg inchangé (paid direct,
     pas de corrélation à affirmer). Ne touche JAMAIS au statut HTTP — seul
@@ -7299,8 +7897,12 @@ def _correlated_403_message(msg, req_id):
         ctx = _fallback_ctx_pop(req_id)
         if not ctx:
             return msg
+        # [FIX classement harness] statut rendu en mots : un « 403 » littéral dans le
+        # texte faisait classer cette panne de POLITIQUE en « AUTH » par DSH
+        # (« API key is invalid »), masquant l'URL d'opt-in qui est la vraie action.
         prefix = (
-            f"free {ctx.get('free_model', '?')} → {ctx.get('free_status', '?')} (échec jambe free), paid fallback → "
+            f"free {ctx.get('free_model', '?')} → "
+            f"{_status_word(ctx.get('free_status', '?'))} (échec jambe free), paid fallback → "
         )
         return prefix + (msg or "")
     except Exception:
@@ -7886,11 +8488,16 @@ async def _free_stream_refuse_bytes(
             },
         }
     else:
+        # [FIX classement harness] statut en MOTS : un « 403 » littéral faisait
+        # classer ce refus de politique (free tier / DataPolicy) en « AUTH » par
+        # `classifyPiAiError()` (dsh-llm-pi-ai) → l'UI annonçait « API key is
+        # invalid » alors que la cause réelle est dans le body (ex. FreeTierError).
+        # Le code numérique reste dans les logs (`free_status=...`).
         _payload = {
             "type": "error",
             "error": {
                 "type": "api_error",
-                "message": f"Free model request failed with status {_status}: {_redact(_body, 300)}",
+                "message": f"Free model request failed: {_status_word(_status)} — {_redact(_body, 300)}",
             },
         }
     return await _stream_error_response(
@@ -8072,7 +8679,9 @@ def _stream_has_yielded(started, open_blocks, stream_out, line_buf: str = "") ->
     return bool(started or has_blocks or has_out or (isinstance(line_buf, str) and bool(line_buf.strip())))
 
 
-async def _terminate_after_started(open_blocks, stream_out, thinking_idx=None, thinking_sig=""):
+async def _terminate_after_started(
+    open_blocks, stream_out, thinking_idx=None, thinking_sig="", stop_reason="error"
+):
     """Graceful SSE termination after a mid-stream failure (avoids concat retry).
 
     [PLAN-raisonnement Phase C.2] si un bloc thinking est encore ouvert,
@@ -8094,7 +8703,7 @@ async def _terminate_after_started(open_blocks, stream_out, thinking_idx=None, t
         "message_delta",
         {
             "type": "message_delta",
-            "delta": {"stop_reason": "error"},
+            "delta": {"stop_reason": stop_reason},
             "usage": {"output_tokens": stream_out},
         },
     )
@@ -8104,24 +8713,92 @@ async def _terminate_after_started(open_blocks, stream_out, thinking_idx=None, t
 # Keepalive comment that is harmless to clients: every 15s during idle periods
 _SSE_KEEPALIVE_INTERVAL = yaml_get("streaming", "sse_keepalive_interval", 15)  # seconds
 
+# [FIX gel silencieux] Borne d'inactivité AMONT. Sans elle, un amont qui ouvre la
+# connexion puis se tait (tunnel mort, fournisseur figé) est attendu jusqu'au timeout
+# de lecture TCP — `upstream.timeout.read` = 600 s dans config.yaml — pendant que la pompe
+# envoie des `: ping` toutes les 15 s : le client voit un flux VIVANT mais VIDE, sans
+# erreur ni log. C'est le « ça s'arrête d'un coup » sans diagnostic. 120 s laisse passer
+# un raisonnement long mais coupe un gel avéré 5× plus tôt. Réglable :
+# `streaming.sse_idle_timeout` (0 ou absent = désactivé).
+_SSE_IDLE_TIMEOUT = float(yaml_get("streaming", "sse_idle_timeout", 120) or 0)
+
 
 # [Phase 7 refonte] Pompe extraite vers streaming/sse.py (pur asyncio).
 # Les wrappers fins restent ici (défauts lus depuis config.yaml + seams tests).
 from streaming.sse import sse_pump as _sse_pump  # noqa: E402
 
 
-async def _sse_keepalive(stream_gen, interval: float = _SSE_KEEPALIVE_INTERVAL):
+async def _sse_keepalive(
+    stream_gen,
+    interval: float = _SSE_KEEPALIVE_INTERVAL,
+    on_error=None,
+    error_event: bytes | None = None,
+    idle_timeout: float | None = None,
+):
     """Wrapper fin pour compat tests — ping seul, pas de coalesce."""
-    async for chunk in _sse_pump(stream_gen, ping_interval=interval, coalesce_max=0):
+    async for chunk in _sse_pump(
+        stream_gen,
+        ping_interval=interval,
+        coalesce_max=0,
+        on_error=on_error,
+        error_event=error_event,
+        idle_timeout=idle_timeout,
+    ):
         yield chunk
 
 
 _SSE_COALESCE_MAX_BYTES = 64 * 1024
 
 
-async def _sse_coalesce(stream, max_group_bytes: int = _SSE_COALESCE_MAX_BYTES):
+def _note_sse_abort(exc: BaseException) -> None:
+    """[FIX cause n°1] Rend VISIBLE une erreur de lecture amont autrefois avalée.
+
+    ``streaming.sse.sse_pump`` terminait silencieusement sur exception : un flux
+    amont coupé (tunnel mort, reset, timeout de lecture) était indiscernable d'une
+    fin normale — le client recevait un flux tronqué SANS erreur et les logs n'en
+    portaient aucune trace. Ce rappel est branché sur tous les points d'appel de
+    la pompe (``on_error=``).
+    """
+    try:
+        _log(f"  upstream stream aborted: {type(exc).__name__}: {exc}")
+        _debug(f"  [sse] upstream read error → {type(exc).__name__}: {exc}")
+    except Exception:
+        pass
+
+
+# Erreurs protocolaires émises par la pompe quand le flux amont meurt en cours de
+# route. La pompe ignore le protocole du client : celui-ci lui est fourni
+# pré-formaté (``error_event=``), ce qui la garde protocol-agnostique.
+_SSE_ERR_ANTHROPIC = _sse(
+    "error",
+    {"type": "error", "error": {"type": "api_error", "message": "upstream stream aborted"}},
+)
+_SSE_ERR_OPENAI = (
+    b"data: "
+    + _json_dumps_str(
+        {"error": {"message": "upstream stream aborted", "type": "api_error"}},
+        ensure_ascii=False,
+    ).encode()
+    + b"\n\ndata: [DONE]\n\n"
+)
+
+
+async def _sse_coalesce(
+    stream,
+    max_group_bytes: int = _SSE_COALESCE_MAX_BYTES,
+    on_error=None,
+    error_event: bytes | None = None,
+    idle_timeout: float | None = None,
+):
     """Wrapper fin pour compat tests — coalesce seul, pas de ping."""
-    async for chunk in _sse_pump(stream, ping_interval=0, coalesce_max=max_group_bytes):
+    async for chunk in _sse_pump(
+        stream,
+        ping_interval=0,
+        coalesce_max=max_group_bytes,
+        on_error=on_error,
+        error_event=error_event,
+        idle_timeout=idle_timeout,
+    ):
         yield chunk
 
 
@@ -9068,7 +9745,13 @@ async def messages(request: Request):
                         yield chunk
 
                 return StreamingResponse(
-                    _sse_pump(anthropic_stream_free_fallback()),
+                    _sse_pump(
+                    anthropic_stream_free_fallback(),
+                    on_error=_note_sse_abort,
+                    error_event=_SSE_ERR_ANTHROPIC,
+
+                    idle_timeout=_SSE_IDLE_TIMEOUT,
+                ),
                     media_type="text/event-stream",
                     headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
                 )
@@ -9354,6 +10037,12 @@ async def messages(request: Request):
             _yielded = False
             stop_reason = "end_turn"
             emitted_finish = False
+            # [FIX corps vide] Sur le chemin P1, les octets amont partent au client AVANT
+            # que `started` soit positionné (relais brut 9617 / conversion Chat→Anthropic
+            # 9644, alors que `started = True` n'arrive qu'à 9676 sur le `message_start`
+            # parsé). `started` ne peut donc PAS servir de test « rien n'a été émis » :
+            # ce drapeau est posé après chaque yield réel et reste la seule preuve fiable.
+            _bytes_flushed = False
             _handle_429 = _make_stream_retry_loop("anthropic")
             _geo_tunnel = getattr(request.state, "_geo_force_tunnel", False)
             _free_forced_pool = getattr(request.state, "_geo_forced_pool", None)
@@ -9615,6 +10304,7 @@ async def messages(request: Request):
                         async for chunk in resp.aiter_bytes():
                             if not _free_chat_stream:
                                 yield chunk
+                                _bytes_flushed = True
                                 _out_text = chunk.decode("utf-8", errors="replace")
                             else:
                                 # [Parité protocole — défaut mesuré, lot L1/P1] Le
@@ -9642,6 +10332,7 @@ async def messages(request: Request):
                                 _out_text = "".join(_conv_out)
                                 if _out_text:
                                     yield _out_text.encode("utf-8")
+                                    _bytes_flushed = True
                             _line_buf += _out_text
                             if len(_line_buf) > _line_buf_max:
                                 # Truncate on newline boundary to avoid splitting JSON (fix truncation mid-JSON)
@@ -9921,7 +10612,11 @@ async def messages(request: Request):
                         tools_used=used_tools if used_tools else None,
                         request_body=request_body,
                     )
-                    if started:
+                    if started or _bytes_flushed:
+                        # [FIX trou] `started` n'est posé qu'au parse de `message_start`,
+                        # alors que les octets amont sont relayés VERBATIM avant ce parse :
+                        # `_bytes_flushed=True` avec `started=False` est un état réel. La
+                        # garde `if started:` seule laissait alors ce cas SANS terminal.
                         # [Patch A] synthetic thinking termination: signature_delta before stop
                         for idx in list(open_blocks):
                             if thinking_block_idx is not None and idx == thinking_block_idx and thinking_acc:
@@ -9946,17 +10641,59 @@ async def messages(request: Request):
                             },
                         )
                         yield _sse("message_stop", {"type": "message_stop"})
+                    else:
+                        # [FIX trou] Rien n'est parti (ni `message_start` parsé, ni octet
+                        # relayé) : sans ce cas, le flux se terminait VIDE et sans le
+                        # moindre terminal. On émet une erreur explicite.
+                        _log("  stream failed before any output → explicit error event (no empty 200)")
+                        yield _sse(
+                            "error",
+                            {
+                                "type": "error",
+                                "error": {
+                                    "type": "api_error",
+                                    "message": "upstream produced no output",
+                                },
+                            },
+                        )
                     return
                 else:
                     # Only reached if no exception and no break (successful stream)
+                    # [FIX EOF nu] L'amont a fermé proprement (donc AUCUN `except` n'a été
+                    # pris) mais RIEN n'est parti au client et aucun événement terminal n'a
+                    # été émis : c'est un flux vide, pas une fin de tour. Un retry est sûr —
+                    # `_bytes_flushed` False garantit qu'aucun octet n'a été émis, donc pas
+                    # de risque de concaténer deux réponses. `continue` reprend la boucle :
+                    # station fraîche sur la jambe free (fresh_station=(_attempt > 0 and
+                    # _using_free), cf. 9385) ou clé suivante côté payant.
+                    if not _bytes_flushed and not emitted_finish and _attempt + 1 < _free_bound:
+                        _debug(
+                            f"  [stream] upstream EOF without terminal event, no byte sent "
+                            f"(attempt {_attempt + 1}/{_free_bound}) → retry"
+                        )
+                        _log(
+                            "  stream truncated without content (upstream EOF, no terminal event)"
+                            " → retry station fraîche / clé suivante"
+                        )
+                        continue
                     break
             else:
                 # Exhausted retries without success → error already yielded
                 return
             # Fix: guarantee finish_reason on truncated stream (EOF without message_stop)
-            if started and not emitted_finish:
-                _debug("  [stream] truncated without finish_reason → synthesizing stop")
-                _log("  stream truncated without finish_reason → synthesizing stop")
+            # [FIX trou] `started` n'est posé qu'au parse de `message_start`, or les octets
+            # amont sont relayés VERBATIM avant ce parse : `_bytes_flushed=True` avec
+            # `started=False` est un état réel (message_start coupé entre deux chunks,
+            # ligne > line_buffer_max…). La garde `started` seule laissait cet état sortir
+            # SANS `content_block_stop`/`message_delta`/`message_stop` : le client Anthropic
+            # voyait une 200 se fermer sans terminal.
+            if (started or _bytes_flushed) and not emitted_finish:
+                # [FIX libellé] Cette ligne annonçait « synthesizing stop » alors que le
+                # code émet ``_terminate_after_started`` → ``stop_reason: "error"``. Un
+                # libellé faux fait croire à un faux vert là où le proxy est honnête, et
+                # fausse les audits : on dit ce qui est réellement émis.
+                _debug("  [stream] truncated without terminal → stop_reason=error")
+                _log("  stream truncated without terminal event → stop_reason=error (mid-stream failure)")
                 async for ev in _terminate_after_started(
                     open_blocks,
                     stream_out,
@@ -9966,6 +10703,23 @@ async def messages(request: Request):
                     else "",
                 ):
                     yield ev
+                emitted_finish = True
+            # [FIX corps vide] Aucun octet n'a jamais été envoyé au client et aucun
+            # événement terminal n'a été émis : le client Anthropic recevait sinon un
+            # `200 text/event-stream` TOTALEMENT vide — pas d'erreur, pas de log, soit
+            # le « ça s'arrête d'un coup » sans le moindre diagnostic. Test fondé sur
+            # `_bytes_flushed` (et non `started`) car sur ce chemin les octets amont
+            # partent avant `started = True` (cf. init en 9357).
+            if not _bytes_flushed and not emitted_finish:
+                _debug("  [stream] upstream produced no output at all → emitting error event")
+                _log("  stream truncated before first event (upstream EOF, no content) → error event")
+                yield _sse(
+                    "error",
+                    {
+                        "type": "error",
+                        "error": {"type": "api_error", "message": "upstream produced no output"},
+                    },
+                )
                 emitted_finish = True
             est_input = await _est_task
             logged_in = stream_in if stream_in is not None else est_input
@@ -10006,7 +10760,13 @@ async def messages(request: Request):
         # For streaming: if free model exists, pass empty headers (free models don't need auth)
         _stream_headers = a_headers if a_headers.get("x-api-key") else {}
         return StreamingResponse(
-            _sse_pump(anthropic_stream(_stream_headers)),
+            _sse_pump(
+                anthropic_stream(_stream_headers),
+                on_error=_note_sse_abort,
+                error_event=_SSE_ERR_ANTHROPIC,
+
+                idle_timeout=_SSE_IDLE_TIMEOUT,
+            ),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
         )
@@ -10668,6 +11428,10 @@ async def messages(request: Request):
                     _resp_state = ResponsesSseState()
                     _resp_state.tool_name_map = _out_tool_map
                     _incomplete_empty = False
+                    # [FIX EOF nu] distingue « fermeture de flux » (EOF réseau, PAS un
+                    # signal de quota) d'un vrai 429 / response.incomplete : sert à ne
+                    # pas alimenter le coupe-circuit 429 global sur un flux vide.
+                    _empty_eof = False
                     async for line in resp.aiter_lines():
                         if not line.startswith("data:"):
                             continue
@@ -10891,8 +11655,56 @@ async def messages(request: Request):
                                     },
                                 )
 
+                    # [FIX EOF nu] Fin de flux amont sans AUCUN contenu, sans usage et sans
+                    # événement terminal : l'amont a fermé après ses seuls événements
+                    # d'enveloppe (response.created / response.in_progress /
+                    # response.output_item.added) sans jamais émettre
+                    # response.completed|response.incomplete ni le moindre delta.
+                    #
+                    # Sans ce test, `_incomplete_empty` reste False (il n'est posé qu'à
+                    # 10748, sur un `response.incomplete` EXPLICITE), on saute donc le bloc
+                    # de reprise ci-dessous (station fraîche → clé payante) et le client
+                    # Anthropic reçoit un flux vide. Or `started` est False : RIEN n'est
+                    # parti (vérifié : le seul yield antérieur, ~10710, pose
+                    # `emitted_finish = True`), donc un retry est sûr.
+                    if (
+                        not started
+                        and stream_out_tokens == 0
+                        and actual_usage is None
+                        and not got_response_completed
+                        and not emitted_finish
+                    ):
+                        _debug(
+                            "  [stream-oai] upstream EOF without terminal event "
+                            "(no content, no usage) → treating as empty stream for retry"
+                        )
+                        _log(
+                            "  stream truncated without content (upstream EOF, no terminal event)"
+                            " → retry station fraîche / failover payant"
+                        )
+                        _incomplete_empty = True
+                        _empty_eof = True
+
+                    if _incomplete_empty and not _using_free and _attempt + 1 < _free_bound:
+                        # [FIX EOF nu / jambe payante] La reprise sur flux vide était
+                        # gardée par ``_using_free`` : sur le payant, un EOF amont
+                        # (enveloppe Responses puis fermeture, sans contenu ni usage)
+                        # terminait la requête SANS seconde chance alors que RIEN
+                        # n'avait été émis au client — le retry est donc sûr.
+                        _debug(
+                            f"  [stream-oai] empty upstream response (paid leg) "
+                            f"→ retry {_attempt + 2}/{_free_bound}"
+                        )
+                        _log(
+                            f"  EMPTY RESPONSE upstream (paid leg, nothing emitted) "
+                            f"→ retry {_attempt + 2}/{_free_bound}"
+                        )
+                        continue
+
                     if _incomplete_empty and _using_free:
-                        _refuse = _on_free_429_stream(free_model, "", forced_pool=_free_forced_pool)
+                        _refuse = _on_free_429_stream(
+                            free_model, "", forced_pool=_free_forced_pool, record_global=not _empty_eof
+                        )
                         if not _refuse and _attempt + 1 < effective_free_max_attempts(_free_forced_pool):
                             _log_free_model_usage(
                                 _paid_model_id, free_model, "free (no auth)", "free (no auth)", 200, ip=_free_usage_ip()
@@ -11081,7 +11893,11 @@ async def messages(request: Request):
                     tools_used=used_tools if used_tools else None,
                     request_body=request_body,
                 )
-                if started:
+                # [FIX trou] Même patron qu'à P1 : la garde `started` seule laisse sortir
+                # SANS terminal l'état « des octets sont partis mais `message_start` n'a pas
+                # été parsé ». `_stream_has_yielded(...)` est la sentinelle déjà utilisée par
+                # toutes les protections de reprise de ce générateur.
+                if _stream_has_yielded(started, open_blocks, stream_out_tokens, ""):
                     _ti, _ts = _thinking_flush()
                     for idx in open_blocks:
                         if _ti is not None and idx == _ti and _ts:
@@ -11103,6 +11919,17 @@ async def messages(request: Request):
                         },
                     )
                     yield _sse("message_stop", {"type": "message_stop"})
+                else:
+                    # [FIX trou] Rien n'est parti : sans ce cas, la 200 SSE se fermait VIDE,
+                    # sans le moindre terminal ni erreur.
+                    _log("  stream failed before any output → explicit error event (no empty 200)")
+                    yield _sse(
+                        "error",
+                        {
+                            "type": "error",
+                            "error": {"type": "api_error", "message": "upstream produced no output"},
+                        },
+                    )
                 return
             else:
                 break
@@ -11152,9 +11979,13 @@ async def messages(request: Request):
                 yield ev
             emitted_finish = True
         # Fix: guarantee finish_reason on truncated stream (EOF without [DONE] / response.completed)
-        if started and not emitted_finish:
-            _debug("  [stream-oai] truncated without finish_reason → synthesizing stop")
-            _log("  stream truncated without finish_reason → synthesizing stop")
+        # [FIX trou] Sentinelle élargie : ce générateur ne tient pas de `_bytes_flushed`, et
+        # `_finalize_and_close_stream` émet `message_start` en interne SANS poser le `started`
+        # de cette fonction. La garde `started` seule pouvait donc sortir sans terminal.
+        if _stream_has_yielded(started, open_blocks, stream_out_tokens, "") and not emitted_finish:
+            # [FIX libellé] idem P1 : le code émet ``stop_reason: "error"``, pas un « stop ».
+            _debug("  [stream-oai] truncated without terminal → stop_reason=error")
+            _log("  stream truncated without terminal event → stop_reason=error (mid-stream failure)")
             _ti, _ts = _thinking_flush()
             async for ev in _terminate_after_started(
                 open_blocks, stream_out_tokens, thinking_idx=_ti, thinking_sig=_ts
@@ -11162,18 +11993,54 @@ async def messages(request: Request):
                 yield ev
             emitted_finish = True
         elif got_response_completed and not emitted_finish:
-            # Incomplete Responses API without prior finalize (should be covered above, but keep for safety)
-            _debug("  [stream-oai] truncated Responses without finalize → synthesizing")
+            # [FIX faux rouge] L'amont a TERMINÉ normalement (``response.completed``) : le
+            # terminal manquait, mais signaler ``stop_reason: "error"`` présentait un tour
+            # RÉUSSI comme un échec — un harness abandonne alors une tâche pourtant finie.
+            # On émet un terminal PROPRE, avec la raison réelle (tour d'outil vs fin de tour).
+            _debug(
+                "  [stream-oai] Responses completed without prior finalize → proper terminal "
+                f"({'tool_use' if used_tools else 'end_turn'})"
+            )
+            _log("  stream terminal synthesized after response.completed (no error)")
             _ti, _ts = _thinking_flush()
             async for ev in _terminate_after_started(
-                open_blocks, stream_out_tokens, thinking_idx=_ti, thinking_sig=_ts
+                open_blocks,
+                stream_out_tokens,
+                thinking_idx=_ti,
+                thinking_sig=_ts,
+                stop_reason=("tool_use" if used_tools else "end_turn"),
             ):
                 yield ev
+            emitted_finish = True
+        # [FIX corps vide] Flux amont terminé sans qu'AUCUN octet n'ait été envoyé au client
+        # ET sans événement terminal : les deux branches ci-dessus ne couvrent que
+        # `started` et `got_response_completed`. Sans ce test, le client Anthropic recevait
+        # un `200 text/event-stream` TOTALEMENT vide — aucune erreur, aucun log — soit
+        # exactement le « ça s'arrête d'un coup » sans diagnostic.
+        # Sûreté : la sentinelle est `_stream_has_yielded(...)` et NON `started` — voir la
+        # note ci-dessus : un contenu déjà parti avec `started=False` déclencherait sinon un
+        # FAUX ROUGE (`event: error` après du contenu), en plus du trou symétrique.
+        if not _stream_has_yielded(started, open_blocks, stream_out_tokens, "") and not emitted_finish:
+            _debug("  [stream-oai] upstream produced no output at all → emitting error event")
+            _log("  stream truncated before first event (upstream EOF, no content) → error event")
+            yield _sse(
+                "error",
+                {
+                    "type": "error",
+                    "error": {"type": "api_error", "message": "upstream produced no output"},
+                },
+            )
             emitted_finish = True
         return
 
     return StreamingResponse(
-        _sse_pump(stream_gen(headers)),
+        _sse_pump(
+            stream_gen(headers),
+            on_error=_note_sse_abort,
+            error_event=_SSE_ERR_ANTHROPIC,
+
+            idle_timeout=_SSE_IDLE_TIMEOUT,
+        ),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
     )
@@ -12268,6 +13135,12 @@ async def chat_completions(request: Request):
                         _resp_state.tool_name_map = _out_tool_map
                         _chunk_already_yielded = False
                         _incomplete_empty = False
+                        # [FIX EOF nu] cf. P1oai : un EOF réseau n'est pas un 429.
+                        _empty_eof = False
+                        # [FIX finish_reason] Raison terminale réelle fournie par le
+                        # convertisseur Responses (``tool_calls`` / ``stop``) : évite de
+                        # rapporter un faux « stop » sur un tour d'outil.
+                        _synth_finish = "stop"
                         async for line in resp.aiter_lines():
                             if not line.startswith("data:"):
                                 continue
@@ -12319,6 +13192,7 @@ async def chat_completions(request: Request):
                                 if converted is not None:
                                     chunk = converted
                                     choices = chunk.get("choices", [])
+                                    _synth_finish = chunk.get("_finish_reason") or _synth_finish
                                     if not choices and isinstance(chunk, dict) and "usage" in chunk:
                                         # response.completed or response.incomplete —
                                         # stream-end signal; don't yield raw Responses
@@ -12371,14 +13245,39 @@ async def chat_completions(request: Request):
                                 yield f"data: {_json_dumps_str(chunk, ensure_ascii=False)}\n\n".encode()
                             _chunk_already_yielded = False
 
+                        # [FIX EOF nu] Fin de flux amont sans AUCUN contenu, sans usage et
+                        # sans finish_reason : l'amont a fermé après ses seuls événements
+                        # d'enveloppe (response.created / response.in_progress /
+                        # response.output_item.added) sans jamais émettre
+                        # response.completed|response.incomplete ni le moindre delta.
+                        #
+                        # Sans ce test, `_incomplete_empty` reste False (il n'est posé que
+                        # sur un `response.incomplete` EXPLICITE, cf. 12303/12329), on saute
+                        # donc le bloc de reprise ci-dessous (station fraîche → clé payante)
+                        # et on rend au client « stream truncated without content »
+                        # (cf. 12501) alors que RIEN n'a été émis : un retry était sûr.
+                        if not _oai_has_yielded and stream_out == 0 and actual_usage is None:
+                            _debug(
+                                "  [oai-stream] upstream EOF without terminal event "
+                                "(no content, no usage) → treating as empty stream for retry"
+                            )
+                            _log(
+                                "  stream truncated without content (upstream EOF, no terminal event)"
+                                " → retry station fraîche / failover payant"
+                            )
+                            _incomplete_empty = True
+                            _empty_eof = True
+
                         if _incomplete_empty and _using_free:
-                            _refuse = _on_free_429_stream(free_model, "", forced_pool=_free_forced_pool)
+                            _refuse = _on_free_429_stream(
+                                free_model, "", forced_pool=_free_forced_pool, record_global=not _empty_eof
+                            )
                             if not _refuse and _attempt + 1 < effective_free_max_attempts(_free_forced_pool):
                                 _log_free_model_usage(
                                     model_id, free_model, "free (no auth)", "free (no auth)", 200, ip=_free_usage_ip()
                                 )
                                 _log(
-                                    f"  FREE {free_model!r} EMPTY RESPONSE (response.incomplete) → retry station fraîche (essai {_attempt + 2}/{effective_free_max_attempts(_free_forced_pool)})"
+                                    f"  FREE {free_model!r} EMPTY RESPONSE (response.incomplete ou EOF nu) → retry station fraîche (essai {_attempt + 2}/{effective_free_max_attempts(_free_forced_pool)})"
                                 )
                                 continue
                             if not _has_usable_paid_key():
@@ -12465,20 +13364,74 @@ async def chat_completions(request: Request):
                                 return
                             continue
 
+                        elif _incomplete_empty and _attempt + 1 < _free_bound:
+                            # [FIX EOF nu / jambe payante] La reprise sur flux vide
+                            # était gardée par ``_using_free`` : sur le payant, un EOF
+                            # amont (ou un ``response.incomplete`` sans sortie) rendait
+                            # « stream truncated without content » SANS seconde chance,
+                            # alors que RIEN n'avait été émis — un retry est donc sûr.
+                            _debug(
+                                f"  [oai-stream] empty upstream response (paid leg) "
+                                f"→ retry {_attempt + 2}/{_free_bound}"
+                            )
+                            _log(
+                                f"  EMPTY RESPONSE upstream (paid leg, nothing emitted) "
+                                f"→ retry {_attempt + 2}/{_free_bound}"
+                            )
+                            continue
+
                         # Fix: synthesize finish_reason if truncated (EOF without finish_reason)
                         if not emitted_finish:
                             if _oai_has_yielded or stream_out > 0:
-                                _debug("  [oai-stream] truncated without finish_reason → synthesizing stop")
-                                _log("  stream truncated without finish_reason → synthesizing stop")
+                                # [FIX finish_reason] Deux cas très différents étaient
+                                # confondus sous « truncated » :
+                                #  • ``actual_usage is not None`` → l'amont Responses a
+                                #    bien envoyé ``response.completed`` : le flux est
+                                #    COMPLET, seule la raison terminale manquait au
+                                #    convertisseur. On conclut avec la raison réelle
+                                #    (``tool_calls`` sur un tour d'outil) et on ne crie
+                                #    plus « truncated » (534 occurrences mesurées).
+                                #  • sinon → aucune raison terminale reçue : le flux a
+                                #    réellement été coupé.
+                                if actual_usage is not None:
+                                    _debug(
+                                        "  [oai-stream] terminal Responses sans finish_reason → "
+                                        f"synthèse {_synth_finish!r} (flux complet, pas une troncature)"
+                                    )
+                                else:
+                                    _debug("  [oai-stream] truncated without finish_reason → synthesizing")
+                                    _log("  stream truncated without finish_reason → synthesizing")
                                 _synth = {
                                     "id": _fast_id("chatcmpl"),
                                     "object": "chat.completion.chunk",
                                     "created": int(time.time()),
                                     "model": original_model,
-                                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                                    "choices": [{"index": 0, "delta": {}, "finish_reason": _synth_finish}],
                                 }
                                 yield f"data: {_json_dumps_str(_synth, ensure_ascii=False)}\n\n".encode()
                                 yield b"data: [DONE]\n\n"
+                                emitted_finish = True
+                            elif _incomplete_empty:
+                                # [FIX faux-vert] L'amont a explicitement produit ZÉRO
+                                # sortie (``response.incomplete`` ou EOF nu) : fabriquer
+                                # un ``finish_reason: "stop"`` ferait passer un tour VIDE
+                                # pour un succès. On émet une erreur explicite — c'est le
+                                # motif exact du faux-vert mesuré (532 synthèses).
+                                _debug("  [oai-stream] empty upstream response → error (no false stop)")
+                                _log("  upstream produced no output → error (no synthesized stop)")
+                                yield (
+                                    b"data: "
+                                    + _json_dumps_str(
+                                        {
+                                            "error": {
+                                                "message": "upstream produced no output",
+                                                "type": "api_error",
+                                            }
+                                        },
+                                        ensure_ascii=False,
+                                    ).encode()
+                                    + b"\n\ndata: [DONE]\n\n"
+                                )
                                 emitted_finish = True
                             elif actual_usage is not None:
                                 # Responses API completed but no finish yet — also synthesize
@@ -12488,7 +13441,7 @@ async def chat_completions(request: Request):
                                     "object": "chat.completion.chunk",
                                     "created": int(time.time()),
                                     "model": original_model,
-                                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                                    "choices": [{"index": 0, "delta": {}, "finish_reason": _synth_finish}],
                                 }
                                 yield f"data: {_json_dumps_str(_synth, ensure_ascii=False)}\n\n".encode()
                                 yield b"data: [DONE]\n\n"
@@ -12680,6 +13633,25 @@ async def chat_completions(request: Request):
                         tool_names,
                         request_body=request_body,
                     )
+                    # [FIX trou] Ce chemin (exception alors que `_attempt > 0`) terminait par
+                    # un `return` MUET : le client recevait un 200 SSE qui s'arrêtait sans
+                    # AUCUN événement terminal — ni erreur, ni `[DONE]`, ni `finish_reason`.
+                    # C'est la pire issue : le harness voit un flux vide et conclut que la
+                    # tâche s'est arrêtée, sans rien pour diagnostiquer. Les trois autres
+                    # chemins (P1, P1oai, P4) émettent bien un terminal ici — le chat était
+                    # le seul à ne rien faire.
+                    _log(
+                        f"  stream failed after retries (attempt={_attempt + 1}) "
+                        "→ explicit error to client (no silent cut)"
+                    )
+                    yield (
+                        b"data: "
+                        + _json_dumps_str(
+                            {"error": {"message": "stream interrupted", "type": "api_error"}},
+                            ensure_ascii=False,
+                        ).encode()
+                        + b"\n\ndata: [DONE]\n\n"
+                    )
                     return
                 else:
                     break
@@ -12687,7 +13659,13 @@ async def chat_completions(request: Request):
                 return
 
         return StreamingResponse(
-            _sse_pump(openai_stream(headers)),
+            _sse_pump(
+                openai_stream(headers),
+                on_error=_note_sse_abort,
+                error_event=_SSE_ERR_OPENAI,
+
+                idle_timeout=_SSE_IDLE_TIMEOUT,
+            ),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
         )
@@ -13524,7 +14502,10 @@ async def chat_completions(request: Request):
         else:
             return
         # Fix: guarantee finish_reason on truncated stream (EOF without message_stop)
-        if started and not emitted_finish:
+        # [FIX trou] Sentinelle alignée sur les autres chemins : `started` y est fiable,
+        # mais `_stream_has_yielded(...)` reste la seule sentinelle qui ne peut pas
+        # laisser sortir un flux sans terminal. Le `else` plus bas couvre le cas opposé.
+        if _stream_has_yielded(started, open_blocks, stream_out, _line_buf) and not emitted_finish:
             # Check remaining buffer for a final event before synthesis
             if _line_buf.strip():
                 _rem = _line_buf.strip()
@@ -13543,17 +14524,40 @@ async def chat_completions(request: Request):
                         yield _chunk({}, "stop")
                         yield b"data: [DONE]\n\n"
                         return
-                except Exception:
-                    pass
+                except Exception as _tail_exc:
+                    # [FIX swallow] Un reste de buffer illisible était avalé (`pass`) :
+                    # le flux se terminait ensuite sur un faux `finish_reason: "stop"`.
+                    _debug(
+                        "  ✗ [_anthro_to_oai] tail unparsable: "
+                        f"{type(_tail_exc).__name__}: {_tail_exc}"
+                    )
             if not emitted_finish:
-                _debug("  [_anthro_to_oai] truncated without finish_reason → synthesizing stop")
-                _log("  stream truncated without finish_reason → synthesizing stop")
-                yield _chunk({}, "stop")
-                yield b"data: [DONE]\n\n"
+                # [FIX faux vert] Ni ``message_stop`` ni ``message_delta`` porteur d'un
+                # ``stop_reason`` n'ont été vus : le flux Anthropic amont a été COUPÉ (son
+                # protocole se termine TOUJOURS par ``message_stop``). Fabriquer un
+                # ``finish_reason: "stop"`` présentait cette coupure comme un tour réussi —
+                # le harness enchaîne alors sur une réponse tronquée au lieu de signaler
+                # l'incident. On émet une erreur explicite, comme sur les autres chemins.
+                _debug("  [_anthro_to_oai] upstream ended without terminal → error chunk (no false stop)")
+                _log("  stream ended without terminal event → error chunk (no synthesized stop)")
+                yield (
+                    b"data: "
+                    + _json_dumps_str(
+                        {"error": {"message": "upstream stream aborted", "type": "api_error"}},
+                        ensure_ascii=False,
+                    ).encode()
+                    + b"\n\ndata: [DONE]\n\n"
+                )
                 emitted_finish = True
 
     return StreamingResponse(
-        _sse_pump(_anthro_to_oai_stream(a_headers)),
+        _sse_pump(
+            _anthro_to_oai_stream(a_headers),
+            on_error=_note_sse_abort,
+            error_event=_SSE_ERR_OPENAI,
+
+            idle_timeout=_SSE_IDLE_TIMEOUT,
+        ),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
     )

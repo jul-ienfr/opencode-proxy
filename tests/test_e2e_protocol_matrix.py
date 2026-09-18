@@ -462,6 +462,17 @@ def _install_seams(monkeypatch, recorder: UpstreamRecorder):
         recorder._record("http", endpoint, body, protocol)
         return recorder._upstream(endpoint, body, protocol), headers
 
+    async def _do_free_direct_request(endpoint, body, headers):
+        # [gate body 2026-09-18] la jambe free directe ne passe plus par
+        # _do_request_with_retry : même enregistrement (seam "http" comme
+        # avant) et même routage, pour des tests identiques à HEAD.
+        recorder._record("http", endpoint, body, "free")
+        return recorder._upstream(endpoint, body, "free"), headers
+
+    async def _do_free_request_curl_cffi(body, headers, proxy_url=None, station=None, endpoint=None, **kwargs):
+        recorder._record("http", endpoint, body, "free")
+        return recorder._upstream(endpoint, body, "free")
+
     @asynccontextmanager
     async def _open_free_stream(endpoint, body, headers, use_free, count_request=True, **kwargs):
         recorder._record("free", endpoint, body, extra={"use_free": bool(use_free)})
@@ -482,6 +493,8 @@ def _install_seams(monkeypatch, recorder: UpstreamRecorder):
         yield resp
 
     monkeypatch.setattr(oc, "_do_request_with_retry", _do_request_with_retry, raising=False)
+    monkeypatch.setattr(oc, "_do_free_direct_request", _do_free_direct_request, raising=False)
+    monkeypatch.setattr(oc, "_do_free_request_curl_cffi", _do_free_request_curl_cffi, raising=False)
     monkeypatch.setattr(oc, "_open_free_stream", _open_free_stream, raising=False)
     monkeypatch.setattr(oc, "_open_via_pool", _open_via_pool, raising=False)
 

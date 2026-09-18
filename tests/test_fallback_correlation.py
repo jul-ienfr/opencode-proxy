@@ -22,6 +22,7 @@ Never touches the live system : pas d'upstream, pas de VPN, pas de DB
 """
 
 import inspect
+import re
 
 import pytest
 from test_free_multi_attempt import (  # noqa: F401  (doubles partagés, pattern test_free_vpn_required.py)
@@ -53,7 +54,17 @@ def test_c1_push_400_pop_prefixes_once_then_gone(_clean_ctx):
     oc._fallback_ctx_push("req-c-corr", FREE_MODEL, 400)
     assert "req-c-corr" in oc._FALLBACK_CTX
     out = oc._correlated_403_message("UPSTREAM-MSG", "req-c-corr")
-    assert out == f"free {FREE_MODEL} → 400 (échec jambe free), paid fallback → UPSTREAM-MSG"
+    # [FIX classement harness] Le statut est rendu en MOTS, pas en chiffres : un « 403 »
+    # littéral dans le texte client fait classer la panne en « AUTH » par
+    # `classifyPiAiError()` (dsh-llm-pi-ai, test `/\b(?:401|403)\b/` sur le message,
+    # AVANT tout autre cas) → l'UI affiche « API key is invalid » et masque la vraie cause.
+    assert out == (
+        f"free {FREE_MODEL} → requête refusée par l'amont (échec jambe free), "
+        "paid fallback → UPSTREAM-MSG"
+    )
+    assert not re.search(r"\b(?:401|403)\b", out), (
+        f"texte client classable AUTH par DSH : {out!r}"
+    )
     # Pop destructif : le registre live est vide pour ce req_id…
     assert "req-c-corr" not in oc._FALLBACK_CTX
     # …donc le 2e appel ne préfixe plus (one-shot, pas de re-préfixe).

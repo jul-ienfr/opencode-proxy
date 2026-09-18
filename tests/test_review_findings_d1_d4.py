@@ -477,6 +477,25 @@ def test_store_is_not_sent_to_an_anthropic_upstream(monkeypatch):
 
     monkeypatch.setattr(opencode, "_do_request_with_retry", _fake)
 
+    async def _fake_free(endpoint, body, headers):
+        # [gate body 2026-09-18] la jambe free directe ne passe plus par
+        # _do_request_with_retry : même simulacre, même contrat.
+        captured["endpoint"] = endpoint
+        captured["body"] = body if isinstance(body, dict) else json.loads(body)
+        return _FakeJsonResp(
+            {
+                "id": "msg_1",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-x",
+                "content": [{"type": "text", "text": "ok"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            }
+        ), {}
+
+    monkeypatch.setattr(opencode, "_do_free_direct_request", _fake_free)
+
     client = TestClient(opencode.app)
     for path in ("/v1/messages", "/v1/chat/completions"):
         captured.clear()
@@ -566,7 +585,12 @@ def test_responses_endpoint_honours_the_client_stream_flag(monkeypatch, stream):
     async def _fake(endpoint, body, headers, protocol, *a, **k):
         return _FakeJsonResp(_CHAT_JSON), {}
 
+    async def _fake_free(endpoint, body, headers):
+        # [gate body 2026-09-18] cf. ci-dessus : même simulacre free.
+        return _FakeJsonResp(_CHAT_JSON), {}
+
     monkeypatch.setattr(opencode, "_do_request_with_retry", _fake)
+    monkeypatch.setattr(opencode, "_do_free_direct_request", _fake_free)
     r = TestClient(opencode.app).post(
         "/v1/responses",
         json={

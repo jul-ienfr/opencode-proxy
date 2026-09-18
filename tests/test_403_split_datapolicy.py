@@ -97,7 +97,11 @@ def test_b2_datapolicy_never_retriable(code, text):
 def test_c1_correlated_prefix_only_with_fallback_ctx():
     oc._fallback_ctx_push("req-b-corr", "muse-spark-1.3-contributor-free", 400)
     out = oc._correlated_403_message("UPSTREAM-MSG", "req-b-corr")
-    assert out.startswith("free muse-spark-1.3-contributor-free → 400")
+    # [FIX classement harness] le statut est rendu en mots (voir
+    # test_messages_client_sans_code_401_403) : plus de « 400 » chiffré dans le texte.
+    assert out.startswith(
+        "free muse-spark-1.3-contributor-free → requête refusée par l'amont"
+    )
     assert "paid fallback → " in out
     assert out.endswith("UPSTREAM-MSG")
 
@@ -114,3 +118,27 @@ def test_b1_end_to_end_split_datapolicy_vs_region():
     assert OPTIN_URL in dp and "model/region may be restricted" not in dp
     region = oc._check_datapolicy_guard(_resp(403, "forbidden region XYZ"), "acct-1") or oc._auth_window_message(403)
     assert "model/region" in region and OPTIN_URL not in region
+
+
+def test_messages_client_sans_code_401_403():
+    """[FIX classement harness] Aucun texte client ne doit contenir « 401 »/« 403 ».
+
+    `classifyPiAiError()` (dsh-llm-pi-ai/lib/index.js) teste `/\b(?:401|403)\b/` sur le
+    TEXTE du message, AVANT les cas quota/rate-limit/5xx, et en déduit « AUTH » → l'UI
+    DSH affiche « API key is invalid ». Un refus de politique (opt-in data, free tier)
+    annoncé avec « 403 » était donc présenté comme une clé invalide, en masquant la cause
+    réelle et l'URL d'opt-in — exactement le symptôme « This turn failed / API key is
+    invalid » observé alors que le statut HTTP était 503. Les codes restent dans les logs.
+    """
+    import re
+
+    textes = {
+        "datapolicy": oc._datapolicy_client_message(OPTIN_URL, "acct-1"),
+        "region_403": oc._auth_window_message(403),
+        "auth_401": oc._auth_window_message(401),
+        "rate_429": oc._auth_window_message(429),
+    }
+    for nom, txt in textes.items():
+        assert not re.search(r"\b(?:401|403)\b", txt), f"{nom} classable AUTH par DSH : {txt!r}"
+    # Le message de politique doit rester ACTIONNABLE : URL d'opt-in présente.
+    assert OPTIN_URL in textes["datapolicy"]

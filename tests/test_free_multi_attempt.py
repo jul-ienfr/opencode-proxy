@@ -68,9 +68,21 @@ PAID_MODEL = "paid-test-model"
 
 
 def assert_no_paid_artifacts(label, headers, body=""):
-    """Invariant A.0 (voir test_invariant_a0.py) — aucun artefact payant."""
-    for name in ("authorization", "x-api-key", "cookie", "x-request-id"):
+    """Invariant A.0 (voir test_invariant_a0.py) — aucun artefact payant.
+
+    [gate 2026-09-17] ``authorization`` doit valoir EXACTEMENT
+    ``Bearer public`` (identité officielle exigée par l'amont).
+    """
+    import re
+
+    # Les fakes capturent les headers tels que construits (casse mixte) :
+    # normaliser avant d'assertir.
+    headers = {k.lower(): v for k, v in headers.items()}
+    for name in ("x-api-key", "cookie", "x-request-id"):
         assert name not in headers, f"{label}: forbidden header {name!r} reached API_BASE_FREE"
+    assert headers.get("authorization") == "Bearer public", (
+        f"{label}: Authorization must be exactly 'Bearer public', got {headers.get('authorization')!r}"
+    )
     for name, value in headers.items():
         assert not name.startswith("x-stainless-"), (
             f"{label}: SDK identifier {name!r} reached API_BASE_FREE"
@@ -81,6 +93,17 @@ def assert_no_paid_artifacts(label, headers, body=""):
     ua = headers.get("user-agent", "")
     assert "claude-cli" not in ua and "python-httpx" not in ua, (
         f"{label}: client UA leaked to the free endpoint: {ua!r}"
+    )
+    assert ua == oc._OPENCODE_OFFICIAL_UA, (
+        f"{label}: official UA expected, got {ua!r}"
+    )
+    assert headers.get("x-opencode-client") == "desktop", f"{label}: bad x-opencode-client"
+    assert headers.get("x-opencode-project") == "global", f"{label}: bad x-opencode-project"
+    assert re.fullmatch(r"msg_[0-9a-f]{12}[0-9A-Za-z]{14}", headers.get("x-opencode-request", "") or ""), (
+        f"{label}: bad x-opencode-request ID: {headers.get('x-opencode-request')!r}"
+    )
+    assert re.fullmatch(r"ses_[0-9a-f]{12}[0-9A-Za-z]{14}", headers.get("x-opencode-session", "") or ""), (
+        f"{label}: bad x-opencode-session ID: {headers.get('x-opencode-session')!r}"
     )
     if body:
         assert PAID_KEY_MARKER not in body, f"{label}: paid key leaked in request body"
@@ -198,7 +221,7 @@ class _PoolMulti:
 
 
 @pytest.fixture
-def free_vpn_env(monkeypatch):
+def free_vpn_env(monkeypatch, tmp_path):
     """Point the free machinery at the fakes; neutralise live side effects."""
     monkeypatch.setattr(oc, "_vpn_manager", _StubVpn())
     monkeypatch.setattr(oc, "_get_cached_public_ip", lambda: "127.0.0.1")
@@ -206,6 +229,12 @@ def free_vpn_env(monkeypatch):
     monkeypatch.setattr(oc, "_debug", lambda *a, **k: None)
     monkeypatch.setattr(oc, "_log", lambda *a, **k: None)
     monkeypatch.setattr(oc, "FREE_MODEL_MAP", {PAID_MODEL: FREE_MODEL})
+    # [gate 2026-09-17] la session free ne doit jamais toucher logs/ en test
+    monkeypatch.setattr(oc, "_FREE_SESSION_FILE", str(tmp_path / "_free_session_id"))
+    oc._FREE_SESSION_CACHE = None
+    oc._FREE_SESSION_TS = 0.0
+    # [copie exacte 2026-09-18] msg_ par tâche : reset entre tests
+    oc._free_msg_id.set(None)
     oc._free_model_cooldowns.clear()
     return oc
 
@@ -451,11 +480,11 @@ async def test_socks5_mode_single_proxy_429_budget_exhausted(free_vpn_env, free_
     monkeypatch.setattr(oc, "_do_free_request_curl_cffi", fake)
     direct_calls = []
 
-    async def _fake_direct(url, body, headers, protocol, retry_on_429=False):
+    async def _fake_direct(url, body, headers):
         direct_calls.append(url)
         return _FakeResp(429, {"retry-after": "90"}, text="{}"), {}
 
-    monkeypatch.setattr(oc, "_do_request_with_retry", _fake_direct)
+    monkeypatch.setattr(oc, "_do_free_direct_request", _fake_direct)
 
     result = await oc._try_free_model_first(_free_body(), dict(PAID_HEADERS), "openai", PAID_MODEL)
     assert result is None, "no second proxy → paid fallback (None)"
@@ -483,11 +512,11 @@ async def test_non_stream_budget_exhausted_returns_none(free_vpn_env, free_cfg, 
     monkeypatch.setattr(oc, "_do_free_request_curl_cffi", fake)
     direct_calls = []
 
-    async def _fake_direct(url, body, headers, protocol, retry_on_429=False):
+    async def _fake_direct(url, body, headers):
         direct_calls.append(url)
         return _FakeResp(429, {"retry-after": "90"}, text="{}"), {}
 
-    monkeypatch.setattr(oc, "_do_request_with_retry", _fake_direct)
+    monkeypatch.setattr(oc, "_do_free_direct_request", _fake_direct)
 
     result = await oc._try_free_model_first(_free_body(), dict(PAID_HEADERS), "openai", PAID_MODEL)
     assert result is None, "budget exhausted → paid fallback (None)"
@@ -520,11 +549,11 @@ async def test_non_stream_tunnel_failure_retries_station(free_vpn_env, free_cfg,
     monkeypatch.setattr(oc, "_do_free_request_curl_cffi", fake)
     direct_calls = []
 
-    async def _fake_direct(url, body, headers, protocol, retry_on_429=False):
+    async def _fake_direct(url, body, headers):
         direct_calls.append(url)
         return _FakeResp(200, {"content-type": "application/json"}), {}
 
-    monkeypatch.setattr(oc, "_do_request_with_retry", _fake_direct)
+    monkeypatch.setattr(oc, "_do_free_direct_request", _fake_direct)
 
     result = await oc._try_free_model_first(_free_body(), dict(PAID_HEADERS), "openai", PAID_MODEL)
     assert result is not None
@@ -559,11 +588,11 @@ async def test_non_stream_exception_fallback_ignored_in_vpn_mode(free_vpn_env, f
     monkeypatch.setattr(oc, "_do_free_request_curl_cffi", fake)
     direct_calls = []
 
-    async def _fake_direct(url, body, headers, protocol, retry_on_429=False):
+    async def _fake_direct(url, body, headers):
         direct_calls.append(url)
         return _FakeResp(200, {"content-type": "application/json"}), {}
 
-    monkeypatch.setattr(oc, "_do_request_with_retry", _fake_direct)
+    monkeypatch.setattr(oc, "_do_free_direct_request", _fake_direct)
 
     result = await oc._try_free_model_first(_free_body(), dict(PAID_HEADERS), "openai", PAID_MODEL)
     assert result is None, "budget exhausted → paid fallback (None), never direct"
@@ -589,11 +618,11 @@ async def test_free_direct_mode_uses_direct(free_vpn_env, free_cfg, monkeypatch)
     monkeypatch.setattr(oc, "_do_free_request_curl_cffi", fake)
     direct_calls = []
 
-    async def _fake_direct(url, body, headers, protocol, retry_on_429=False):
+    async def _fake_direct(url, body, headers):
         direct_calls.append(url)
         return _FakeResp(200, {"content-type": "application/json"}), {}
 
-    monkeypatch.setattr(oc, "_do_request_with_retry", _fake_direct)
+    monkeypatch.setattr(oc, "_do_free_direct_request", _fake_direct)
 
     result = await oc._try_free_model_first(_free_body(), dict(PAID_HEADERS), "openai", PAID_MODEL)
     assert result is not None and result[0].status_code == 200
