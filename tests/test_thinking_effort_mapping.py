@@ -6,7 +6,7 @@ La mesure contredit cette déclaration pour le constructeur de requête vers l'e
 
     sans `thinking`          -> pas de champ `reasoning`
     `thinking: {type: disabled}` -> pas de champ `reasoning`
-    `thinking: {type: enabled, budget_tokens: N}` -> `reasoning: {summary: auto, effort: ...}`
+    `thinking: {type: enabled, budget_tokens: N}` -> `reasoning: {summary: detailed, effort: ...}`
 
 et l'effort n'est pas figé : il dérive du budget (256 -> low, 8000 -> medium,
 32000 -> high). L'axe était donc **déjà couvert**, sans témoin pour le verrouiller.
@@ -43,7 +43,8 @@ def test_thinking_desactive_aucun_reasoning():
 def test_thinking_actif_produit_reasoning_avec_resume():
     reasoning = _build({"type": "enabled", "budget_tokens": 8000}).get("reasoning")
     assert reasoning, "`thinking` racine perdu : aucun `reasoning` emis"
-    assert reasoning.get("summary") == "auto", f"resume non demande : {reasoning!r}"
+    # Parité SDK : le défaut est 'detailed' (riche), pas 'auto' (condensé).
+    assert reasoning.get("summary") == "detailed", f"resume non demande : {reasoning!r}"
 
 
 @pytest.mark.parametrize(

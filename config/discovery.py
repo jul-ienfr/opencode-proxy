@@ -325,11 +325,15 @@ def free_endpoint_for(free_id: str, api_base_free: str) -> str:
     """Return the correct free endpoint for a model.
 
     muse-* and spark-* models use the /v1/responses endpoint (Responses API),
-    while other models use the standard /v1/chat/completions endpoint.
+    jev-* models use the /v1/systemone endpoint (TypeSafe SystemOne API —
+    state + typed questions, NOT chat), other models use the standard
+    /v1/chat/completions endpoint.
     """
     lid = free_id.lower()
     if "muse" in lid or "spark" in lid:
         return "https://opencode.ai/zen/v1/responses"
+    if "jev" in lid:
+        return "https://opencode.ai/zen/v1/systemone"
     return api_base_free
 
 

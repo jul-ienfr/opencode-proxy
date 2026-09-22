@@ -31,6 +31,7 @@ PROXY_ROUTES = {
     ("POST", "/v1/messages/count_tokens"),
     ("POST", "/v1/chat/completions"),
     ("POST", "/v1/responses"),
+    ("POST", "/v1/systemone"),
     ("GET", "/v1/models"),
     ("GET", "/health"),
     ("GET", "/metrics"),

@@ -505,3 +505,95 @@ def test_axis_strict_is_never_fabricated(path):
     assert inner.get("strict") is not True, (
         f"{path}: `strict: true` fabriqué alors que le client ne l'a pas demandé"
     )
+
+
+# ── Parité tool_choice (toutes formes, tous chemins) ──────────────────────
+
+
+def test_tool_choice_none_survives_anthropic_to_chat():
+    """`none` ≠ `auto` : l'interdiction d'outil ne doit pas devenir un choix libre."""
+    _tools, body = _p2([anthro_tool()], tool_choice={"type": "none"})
+    assert body.get("tool_choice") == "none"
+
+
+def test_tool_choice_chat_form_passthrough_anthropic_to_chat():
+    """Forme Chat déjà : passthrough (le rename suit séparément)."""
+    tc = {"type": "function", "function": {"name": "get_weather"}}
+    _tools, body = _p2([anthro_tool()], tool_choice=tc)
+    assert body.get("tool_choice") == tc
+
+
+@pytest.mark.parametrize(
+    ("incoming", "expected"),
+    [("auto", "auto"), ("any", "required"), ("none", "none"), ("required", "required")],
+)
+def test_tool_choice_strings_mapped_anthropic_to_chat(incoming, expected):
+    """Strings : `any` n'existe pas côté Chat → `required`."""
+    _tools, body = _p2([anthro_tool()], tool_choice=incoming)
+    assert body.get("tool_choice") == expected
+
+
+@pytest.mark.parametrize(
+    ("incoming", "expected"),
+    [
+        ({"type": "function", "function": {"name": "w"}}, {"type": "tool", "name": "w"}),
+        ({"type": "any"}, {"type": "any"}),
+        ({"type": "auto"}, {"type": "auto"}),
+        ({"type": "none"}, {"type": "none"}),
+        ("required", {"type": "any"}),
+        ("auto", {"type": "auto"}),
+        ("none", {"type": "none"}),
+    ],
+)
+def test_tool_choice_mapped_chat_to_anthropic(incoming, expected):
+    """Vers Anthropic : objets {type}, jamais de string nue (400 amont sinon)."""
+    _tools, body = _p4([chat_tool()], tool_choice=incoming)
+    assert body.get("tool_choice") == expected
+
+
+def test_tool_choice_nested_name_fallback_responses_to_anthropic():
+    """Forme Chat imbriquée arrivant sur la voie Responses→Anthropic : nom retrouvé."""
+    from app.protocol.mapping import openai_responses_to_anthropic
+
+    out = openai_responses_to_anthropic(
+        _responses_body(
+            tools=[responses_tool("w")],
+            tool_choice={"type": "function", "function": {"name": "w"}},
+        )
+    )
+    assert out.get("tool_choice") == {"type": "tool", "name": "w"}
+
+
+def test_developer_message_merged_into_system_chat_to_anthropic():
+    """`developer` = `system` sous un autre nom : contenu préservé, pas droppé."""
+    body = _chat_body()
+    body["messages"] = [
+        {"role": "developer", "content": "consigne dev"},
+        {"role": "user", "content": "hi"},
+    ]
+    from app.protocol.mapping import openai_to_anthropic_request
+
+    out = openai_to_anthropic_request(body)
+    assert "consigne dev" in out.get("system", "")
+    assert all(m.get("role") in ("user", "assistant") for m in out.get("messages", []))
+
+
+# ── Parité tool_choice : formes objet vers Anthropic ──────────────────────
+
+
+@pytest.mark.parametrize(
+    ("incoming", "expected"),
+    [
+        ({"type": "auto"}, {"type": "auto"}),
+        ({"type": "none"}, {"type": "none"}),
+        ({"type": "any"}, {"type": "any"}),
+    ],
+)
+def test_tool_choice_dict_forms_mapped_p6(incoming, expected):
+    """P6 : dict auto/any/none → objet {type}, jamais de string nue."""
+    from app.protocol.mapping import openai_responses_to_anthropic
+
+    out = openai_responses_to_anthropic(
+        _responses_body(tools=[responses_tool()], tool_choice=incoming)
+    )
+    assert out.get("tool_choice") == expected

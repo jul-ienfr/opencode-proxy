@@ -30,7 +30,7 @@ import uuid
 from collections.abc import Mapping
 from types import MappingProxyType
 
-from app.protocol.mapping import _json_dumps_str, restore_tool_name
+from app.protocol.mapping import _json_dumps_str, _local_signature, restore_tool_name
 
 __all__ = [
     "ChatSseToAnthropicState",
@@ -106,6 +106,26 @@ def _delta_text(content: object) -> str:
     return ""
 
 
+def _usage_cache_read(chunk: dict) -> int | None:
+    """Tokens cache-read lus du ``usage`` d'un chunk, sinon None.
+
+    Formes amont : Chat (``prompt_tokens_details.cached_tokens``) et
+    Responses (``input_tokens_details.cached_tokens``). Sans lui, le client
+    SSE voyait toujours ``cache_read_input_tokens: 0`` alors que la DB
+    (chemin inline) lisait le vrai cache — DB juste, client faux.
+    """
+    usage = chunk.get("usage")
+    if not isinstance(usage, dict):
+        return None
+    for key in ("prompt_tokens_details", "input_tokens_details"):
+        details = usage.get(key)
+        if isinstance(details, dict):
+            cached = details.get("cached_tokens")
+            if isinstance(cached, int):
+                return cached
+    return None
+
+
 def _usage_tokens(chunk: dict) -> tuple[int | None, int | None]:
     """(input_tokens, output_tokens) lus du ``usage`` du chunk, sinon (None, None).
 
@@ -145,10 +165,12 @@ class ChatSseToAnthropicState:
         "next_block_idx",
         "text_block_idx",
         "thinking_block_idx",
+        "thinking_text",
         "tool_block_idx",
         "open_blocks",
         "input_tokens",
         "input_tokens_estimate",
+        "cache_read_input_tokens",
         "output_tokens",
         "finish_reason",
     )
@@ -172,6 +194,10 @@ class ChatSseToAnthropicState:
         self.next_block_idx: int = 0
         self.text_block_idx: int | None = None
         self.thinking_block_idx: int | None = None
+        # Texte thinking accumulé : sert à forger la signature_delta de clôture
+        # (parité chemin natif opencode.py) — sinon un client strict abandonne
+        # le bloc en multi-tours.
+        self.thinking_text: str = ""
         # index Chat du tool_call → index de bloc Anthropic.
         self.tool_block_idx: dict[int, int] = {}
         # Blocs ouverts, dans l'ordre d'ouverture (ordre de clôture).
@@ -185,6 +211,7 @@ class ChatSseToAnthropicState:
         # on accepte donc l'estimation de l'appelant. Un usage amont réel
         # arrivé dans le même chunk que le premier delta reste prioritaire.
         self.input_tokens_estimate: int = max(0, int(input_tokens_estimate or 0))
+        self.cache_read_input_tokens: int = 0
         self.output_tokens: int = 0
         self.finish_reason: str | None = None
 
@@ -195,9 +222,11 @@ class ChatSseToAnthropicState:
         self.next_block_idx = 0
         self.text_block_idx = None
         self.thinking_block_idx = None
+        self.thinking_text = ""
         self.tool_block_idx.clear()
         self.open_blocks.clear()
         self.input_tokens = 0
+        self.cache_read_input_tokens = 0
         self.output_tokens = 0
         self.finish_reason = None
 
@@ -240,7 +269,7 @@ class ChatSseToAnthropicState:
                         "usage": {
                             "input_tokens": self.input_tokens or self.input_tokens_estimate,
                             "output_tokens": 0,
-                            "cache_read_input_tokens": 0,
+                            "cache_read_input_tokens": self.cache_read_input_tokens,
                         },
                     },
                 },
@@ -267,10 +296,22 @@ class ChatSseToAnthropicState:
             events.extend(self.message_start_events())
 
         # opencode.py:8618-8632 — clôture des blocs ouverts, dans l'ordre.
-        # (La ``signature_delta`` de ``_finalize_stream`` est locale au proxy
-        # et hors périmètre : ici le thinking vient d'un amont Chat, sans
-        # signature à rejouer — cf. section « divergences » du rapport.)
+        # Parité chemin natif : le bloc thinking reçoit sa `signature_delta`
+        # (forgée locale — reconnue et strippée avant upstream strict par
+        # strip_synthetic_thinking) au lieu d'être clos nu et abandonné par
+        # un client strict au tour suivant.
         for idx in self.open_blocks:
+            if idx == self.thinking_block_idx and self.thinking_text:
+                events.append(
+                    _sse(
+                        "content_block_delta",
+                        {
+                            "type": "content_block_delta",
+                            "index": idx,
+                            "delta": {"type": "signature_delta", "signature": _local_signature(self.thinking_text)},
+                        },
+                    )
+                )
             events.append(_sse("content_block_stop", {"type": "content_block_stop", "index": idx}))
 
         # opencode.py:8633-8640 — message_delta : stop_reason puis usage.
@@ -281,7 +322,10 @@ class ChatSseToAnthropicState:
                 {
                     "type": "message_delta",
                     "delta": {"stop_reason": stop_reason, "stop_sequence": None},
-                    "usage": {"output_tokens": self.output_tokens},
+                    "usage": {
+                        "output_tokens": self.output_tokens,
+                        "cache_read_input_tokens": self.cache_read_input_tokens,
+                    },
                 },
             )
         )
@@ -306,6 +350,9 @@ class ChatSseToAnthropicState:
             self.input_tokens = usage_in
         if usage_out is not None:
             self.output_tokens = usage_out
+        _cached = _usage_cache_read(chunk)
+        if _cached is not None:
+            self.cache_read_input_tokens = _cached
 
         choices = chunk.get("choices")
         first_choice = choices[0] if isinstance(choices, list) and choices else {}
@@ -344,6 +391,7 @@ class ChatSseToAnthropicState:
             if self.thinking_block_idx is None:
                 self.thinking_block_idx, opened = self._open_block({"type": "thinking", "thinking": ""})
                 events.extend(opened)
+            self.thinking_text += reasoning
             events.append(
                 _sse(
                     "content_block_delta",

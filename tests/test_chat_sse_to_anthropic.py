@@ -112,7 +112,30 @@ def test_texte_multi_chunks_un_seul_bloc():
 
     md = _data(events, "message_delta")[0]
     assert md["delta"] == {"stop_reason": "end_turn", "stop_sequence": None}
-    assert md["usage"] == {"output_tokens": 3}
+    assert md["usage"] == {"output_tokens": 3, "cache_read_input_tokens": 0}
+
+
+def test_message_delta_reports_cache_read():
+    """F4 : le cache amont remonte au client SSE (avant : toujours 0)."""
+    st = ChatSseToAnthropicState(model="m", message_id="msg_cache")
+    events = _events(
+        [
+            _chunk({"content": "x"}),
+            _chunk(
+                {},
+                finish_reason="stop",
+                usage={
+                    "prompt_tokens": 100,
+                    "completion_tokens": 5,
+                    "prompt_tokens_details": {"cached_tokens": 60},
+                },
+            ),
+            "data: [DONE]",
+        ],
+        st,
+    )
+    md = _data(events, "message_delta")[0]
+    assert md["usage"] == {"output_tokens": 5, "cache_read_input_tokens": 60}
 
     # Le format des chaînes est exactement celui de _sse (opencode.py:7945-7946).
     assert events[0].startswith("event: message_start\ndata: {")
@@ -265,15 +288,24 @@ def test_bloc_thinking_depuis_reasoning_content():
 
 def test_bloc_thinking_depuis_reasoning():
     """La clé `reasoning` (variante) ouvre le même bloc thinking."""
+    from app.protocol.mapping import _local_signature
+
     st = ChatSseToAnthropicState(model="m", message_id="msg_reason")
     events = _events([_chunk({"reasoning": "hmm"}), "data: [DONE]"], st)
     deltas = _data(events, "content_block_delta")
+    # thinking_delta puis, à la clôture, signature_delta forgée locale (parité
+    # chemin natif) — sans elle un client strict abandonne le bloc au tour suivant.
     assert deltas == [
         {
             "type": "content_block_delta",
             "index": 0,
             "delta": {"type": "thinking_delta", "thinking": "hmm"},
-        }
+        },
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "signature_delta", "signature": _local_signature("hmm")},
+        },
     ]
 
 

@@ -938,7 +938,7 @@ class TestChatToResponsesRequest:
     """Test _chat_to_responses_request() forwards reasoning parameters."""
 
     def test_reasoning_effort_forwarded(self):
-        """reasoning_effort must become reasoning: {summary: auto, effort: ...} in Responses API format."""
+        """reasoning_effort must become reasoning: {summary: detailed, effort: ...} in Responses API format."""
         chat = {
             "model": "muse-spark-1.2-contributor",
             "messages": [{"role": "user", "content": "Think about 2+2"}],
@@ -946,7 +946,7 @@ class TestChatToResponsesRequest:
         }
         result = _chat_to_responses_request(chat)
         assert "reasoning" in result
-        assert result["reasoning"] == {"summary": "auto", "effort": "high"}
+        assert result["reasoning"] == {"summary": "detailed", "effort": "high"}
 
     def test_reasoning_effort_medium(self):
         chat = {
@@ -955,7 +955,7 @@ class TestChatToResponsesRequest:
             "reasoning_effort": "medium",
         }
         result = _chat_to_responses_request(chat)
-        assert result["reasoning"] == {"summary": "auto", "effort": "medium"}
+        assert result["reasoning"] == {"summary": "detailed", "effort": "medium"}
 
     def test_reasoning_effort_low(self):
         chat = {
@@ -964,7 +964,7 @@ class TestChatToResponsesRequest:
             "reasoning_effort": "low",
         }
         result = _chat_to_responses_request(chat)
-        assert result["reasoning"] == {"summary": "auto", "effort": "low"}
+        assert result["reasoning"] == {"summary": "detailed", "effort": "low"}
 
     def test_reasoning_object_forwarded(self):
         """If reasoning is already a dict (Responses API format), pass it through."""
@@ -991,7 +991,7 @@ class TestChatToResponsesRequest:
         [
             ("glm-5-air", "max", "high"),
             ("glm-5-air", "xhigh", "high"),
-            ("muse-spark-1.3-contributor", "max", "xhigh"),
+            ("muse-spark-1.3-contributor", "max", "max"),
             ("muse-spark-1.3-contributor", "xhigh", "xhigh"),
             ("deepseek-v4-flash", "max", "max"),
             ("mimo-v2.5", "max", "max"),
@@ -1008,10 +1008,13 @@ class TestChatToResponsesRequest:
             "reasoning_effort": effort,
         }
         result = _chat_to_responses_request(chat)
-        assert result["reasoning"] == {"summary": "auto", "effort": expected}
+        assert result["reasoning"] == {"summary": "detailed", "effort": expected}
 
     def test_reasoning_dict_effort_clamped_to_model_cap(self):
-        """reasoning dict natif (voie Responses) : effort clampé, clés gardées."""
+        """reasoning dict natif (voie Responses) : effort clampé, clés gardées.
+
+        Verbatim : un summary explicite ('auto' ici) est CONSERVÉ tel quel —
+        seul le défaut (summary absent) devient 'detailed' (parité SDK)."""
         chat = {
             "model": "glm-5-air",
             "messages": [{"role": "user", "content": "test"}],
@@ -1039,10 +1042,11 @@ class TestChatToResponsesRequest:
             "reasoning": {"summary": "auto", "effort": "high"},
         }
         result = _chat_to_responses_request(chat)
-        assert result["reasoning"] == {"summary": "auto", "effort": "low"}
+        assert result["reasoning"] == {"summary": "detailed", "effort": "low"}
 
-    def test_temperature_and_top_p_preserved(self):
-        """temperature and top_p must still be forwarded."""
+    def test_temperature_and_top_p_dropped_for_reasoning_models(self):
+        """Parité SDK : temperature/top_p NON supportés par les modèles de
+        raisonnement (le SDK les supprime avec warning) — muse/spark."""
         chat = {
             "model": "muse-spark-1.2-contributor",
             "messages": [{"role": "user", "content": "test"}],
@@ -1051,9 +1055,21 @@ class TestChatToResponsesRequest:
             "reasoning_effort": "high",
         }
         result = _chat_to_responses_request(chat)
+        assert "temperature" not in result
+        assert "top_p" not in result
+        assert result["reasoning"] == {"summary": "detailed", "effort": "high"}
+
+    def test_temperature_and_top_p_preserved_for_other_models(self):
+        """Hors modèles de raisonnement, temperature/top_p suivent toujours."""
+        chat = {
+            "model": "glm-5-air",
+            "messages": [{"role": "user", "content": "test"}],
+            "temperature": 0.7,
+            "top_p": 0.9,
+        }
+        result = _chat_to_responses_request(chat)
         assert result["temperature"] == 0.7
         assert result["top_p"] == 0.9
-        assert result["reasoning"] == {"summary": "auto", "effort": "high"}
 
 
 # ── Web Search / Web Fetch (v3.3) ─────────────────────────────────

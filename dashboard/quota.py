@@ -75,6 +75,10 @@ MODEL_CAPABILITIES: dict[str, list[str]] = {
     "mimo-v2.5-free": ["chat", "vision"],
     "north-mini-code-free": ["chat", "code"],
     "nemotron-3-ultra-free": ["chat"],
+    # SystemOne decision models (TypeSafe Jev — structured decisions, NOT chat:
+    # state + typed questions via POST /v1/systemone, no text generation)
+    "jev-1.13": ["structured"],
+    "jev-1.13-free": ["structured"],
 }
 
 # ── Per-model estimated request limits ──

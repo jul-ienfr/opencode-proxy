@@ -12,6 +12,13 @@ le chunk d'usage final : présent sur les deux voies aller, verrouillé ici.
 **B8 (confirmé).** Les shapes multimodales ne sont pas interchangeables : Chat
 ``file`` n'a **pas** de ``file_url``, Responses ``input_file`` en a un, et
 ``detail`` n'accepte ``"original"`` que côté Responses.
+
+**Parité client officiel (2026-09-18, SDK @ai-sdk/openai).** Le client OpenCode
+dialogue en Responses via ``prepareRequest`` : system→developer pour les modèles
+de raisonnement, strip des ``id`` d'items (comme Codex), suppression
+temperature/top_p sur raisonnement, summary 'detailed' par défaut, relais des
+champs optionnels (previous_response_id, prompt_cache_key, service_tier...),
+include reasoning.encrypted_content quand store:false. Verrouillé ci-dessous.
 """
 
 import pytest
@@ -19,8 +26,12 @@ import pytest
 from app.protocol.mapping import (
     _anthropic_to_responses_request,
     _chat_to_responses_request,
+    _ensure_encrypted_content_include,
+    _is_responses_reasoning_model,
+    _relay_responses_optional_fields,
     _relay_responses_storage_fields,
     _sanitize_native_responses_request,
+    _strip_responses_item_ids,
 )
 
 # ─────────────────────── B5 : store ───────────────────────
@@ -236,3 +247,396 @@ def test_responses_image_detail_original_is_not_forced_to_chat():
     )
     dumped = str(req)
     assert "original" not in dumped, "detail=original émis vers un champ Chat"
+
+
+# ─────────────────────── Parité client officiel ───────────────────────
+
+
+def _chat(msgs, **kw):
+    body = {"model": "muse-spark-1.3-contributor", "messages": msgs}
+    body.update(kw)
+    return body
+
+
+def test_system_becomes_developer_for_reasoning_models():
+    """SDK (systemMessageMode='developer') : le system Chat part en developer."""
+    req = _chat_to_responses_request(
+        _chat([{"role": "system", "content": "tu es un agent"}, {"role": "user", "content": "hi"}])
+    )
+    roles = [it.get("role") for it in req["input"] if isinstance(it, dict)]
+    assert "system" not in roles
+    assert "developer" in roles
+
+
+def test_system_kept_for_other_models():
+    """Hors muse/spark, le rôle system est inchangé (non-régression)."""
+    req = _chat_to_responses_request(
+        {
+            "model": "glm-5-air",
+            "messages": [{"role": "system", "content": "s"}, {"role": "user", "content": "hi"}],
+        }
+    )
+    roles = [it.get("role") for it in req["input"] if isinstance(it, dict)]
+    assert "system" in roles
+
+
+@pytest.mark.parametrize("model", ["muse-spark-1.3-contributor", "MUSE-SPARK-1.2-contributor-free", "m"])
+def test_is_responses_reasoning_model(model):
+    assert _is_responses_reasoning_model(model) == ("muse" in model.lower() or "spark" in model.lower())
+
+
+def test_strip_item_ids_keeps_pairing_fields():
+    """Le client strippe les `id` (comme Codex) mais garde call_id,
+    encrypted_content et les item_reference entiers."""
+    out = _strip_responses_item_ids(
+        [
+            {"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "read", "arguments": "{}"},
+            {
+                "type": "reasoning",
+                "id": "rs_1",
+                "encrypted_content": "opaque",
+                "summary": [{"type": "summary_text", "text": "t"}],
+            },
+            {"type": "item_reference", "id": "ref_1"},
+            {"role": "user", "id": "msg_1", "content": [{"type": "input_text", "text": "hi"}]},
+        ]
+    )
+    assert "id" not in out[0] and out[0]["call_id"] == "call_1"
+    assert "id" not in out[1] and out[1]["encrypted_content"] == "opaque"
+    assert out[2] == {"type": "item_reference", "id": "ref_1"}
+    assert "id" not in out[3]
+
+
+def test_native_passthrough_strips_item_ids():
+    """Voie native : même strip avant envoi (parité wire officielle)."""
+    req = _sanitize_native_responses_request(
+        {
+            "model": "muse-spark-1.3-contributor",
+            "input": [
+                {"type": "function_call", "id": "fc_9", "call_id": "call_9", "name": "bash", "arguments": "{}"},
+                {"role": "user", "id": "u_1", "content": "hi"},
+            ],
+        }
+    )
+    assert "id" not in req["input"][0]
+    assert req["input"][0]["call_id"] == "call_9"
+    assert "id" not in req["input"][1]
+
+
+def test_converted_history_carries_no_item_ids():
+    """Voie convertie : aucun `id` fabriqué ne fuit vers l'upstream."""
+    req = _chat_to_responses_request(
+        _chat([{"role": "user", "content": "hi"}], stream=False)
+    )
+    assert '"id"' not in str(req["input"])
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("previous_response_id", "resp_abc"),
+        ("prompt_cache_key", "ses_abc"),
+        ("service_tier", "flex"),
+        ("instructions", "réponds en français"),
+        ("user", "u-1"),
+        ("safety_identifier", "s-1"),
+        ("prompt_cache_retention", "30d"),
+        ("parallel_tool_calls", False),
+        ("max_tool_calls", 4),
+        ("top_logprobs", 3),
+        ("metadata", {"k": "v"}),
+        ("text", {"format": {"type": "text"}}),
+        ("include", ["code_interpreter_call.outputs"]),
+        ("conversation", "conv_1"),
+    ],
+)
+def test_optional_fields_relayed_when_present(field, value):
+    """Champs SDK présents chez le client → relayés (jamais inventés)."""
+    req = _chat_to_responses_request(_chat([{"role": "user", "content": "hi"}], **{field: value}))
+    assert req.get(field) == value
+
+
+def test_optional_fields_absent_not_invented():
+    """Aucun défaut posé : absent → absent (sémantique upstream préservée)."""
+    req = _chat_to_responses_request(_chat([{"role": "user", "content": "hi"}]))
+    for field in (
+        "previous_response_id",
+        "prompt_cache_key",
+        "service_tier",
+        "instructions",
+        "user",
+        "metadata",
+        "parallel_tool_calls",
+        "max_tool_calls",
+        "top_logprobs",
+        "include",
+        "text",
+        "conversation",
+    ):
+        assert field not in req, f"{field} inventé"
+
+
+def test_conversation_dropped_when_previous_response_id_present():
+    """SDK : conversation + previous_response_id mutuellement exclusifs."""
+    req = _chat_to_responses_request(
+        _chat(
+            [{"role": "user", "content": "hi"}],
+            conversation="conv_1",
+            previous_response_id="resp_1",
+        )
+    )
+    assert req.get("previous_response_id") == "resp_1"
+    assert "conversation" not in req
+
+
+def test_relay_helper_does_not_overwrite_converter_values():
+    """Double conversion P6 sûre : le convertisseur gagne sur le relais."""
+    req = {"model": "m", "service_tier": "default"}
+    _relay_responses_optional_fields(req, {"service_tier": "flex"})
+    assert req["service_tier"] == "default"
+
+
+def test_encrypted_content_include_added_when_store_false():
+    """SDK : store:false + reasoning → include reasoning.encrypted_content."""
+    req = _chat_to_responses_request(
+        _chat(
+            [{"role": "user", "content": "hi"}],
+            store=False,
+            reasoning_effort="high",
+        )
+    )
+    assert req.get("store") is False
+    assert "reasoning.encrypted_content" in req.get("include", [])
+
+
+def test_encrypted_content_include_not_added_by_default():
+    """store absent/vrai → rien (pas de surcoût upstream)."""
+    req = _chat_to_responses_request(_chat([{"role": "user", "content": "hi"}], reasoning_effort="high"))
+    assert "include" not in req
+    req2 = _chat_to_responses_request(
+        _chat([{"role": "user", "content": "hi"}], store=True, reasoning_effort="high")
+    )
+    assert "include" not in req2
+
+
+def test_encrypted_content_include_merged_with_existing():
+    """Include client préservé, entrée ajoutée sans doublon (idempotent)."""
+    req = {"model": "m", "store": False, "reasoning": {"effort": "high"}, "include": ["a"]}
+    _ensure_encrypted_content_include(req)
+    _ensure_encrypted_content_include(req)
+    assert req["include"].count("reasoning.encrypted_content") == 1
+    assert "a" in req["include"]
+
+
+def test_reasoning_dict_without_summary_gets_detailed():
+    """SDK : summary défaut 'detailed' quand un effort est posé sans summary."""
+    req = _chat_to_responses_request(
+        _chat([{"role": "user", "content": "hi"}], reasoning={"effort": "high"})
+    )
+    assert req["reasoning"] == {"effort": "high", "summary": "detailed"}
+
+
+def test_anthropic_path_relays_optional_fields():
+    """Chemin Anthropic : previous_response_id et cie suivent aussi."""
+    req = _anthropic_to_responses_request(
+        {
+            "model": "muse-spark-1.3-contributor",
+            "max_tokens": 100,
+            "previous_response_id": "resp_1",
+            "service_tier": "auto",
+            "messages": [{"role": "user", "content": "hi"}],
+        }
+    )
+    assert req.get("previous_response_id") == "resp_1"
+    assert req.get("service_tier") == "auto"
+
+
+# ─────────────────────── Chaînage : garde orphelin ───────────────────────
+
+
+def test_orphan_filter_disabled_with_previous_response_id():
+    """Avec chaînage serveur, un output sans call visible est légitime (le call
+    est dans la réponse chaînée) : le filtre ne doit pas amputer."""
+    from app.protocol.mapping import _drop_orphan_responses_input, _drop_orphan_tool_messages
+
+    inp = [{"type": "function_call_output", "call_id": "call_x", "output": "42"}]
+    chained = {"previous_response_id": "resp_1"}
+    assert _drop_orphan_responses_input(inp, chained) == inp
+    assert _drop_orphan_responses_input(inp) == []
+
+    msgs = [{"role": "tool", "tool_call_id": "call_x", "content": "42"}]
+    assert _drop_orphan_tool_messages(msgs, chained) == msgs
+    assert _drop_orphan_tool_messages(msgs) == []
+
+    conv = {"conversation": "conv_1"}
+    assert _drop_orphan_responses_input(inp, conv) == inp
+
+
+def test_chained_request_keeps_orphans_end_to_end():
+    """Bout en bout converti : le chaînage traverse jusqu'au corps wire."""
+    req = _chat_to_responses_request(
+        _chat(
+            [{"role": "user", "content": "suite"}],
+            previous_response_id="resp_1",
+        )
+    )
+    assert req.get("previous_response_id") == "resp_1"
+
+
+# ─────────────────────── Structured output ───────────────────────
+
+
+def test_response_format_json_object_relayed():
+    """response_format json_object (Chat) → text.format (Responses)."""
+    req = _chat_to_responses_request(
+        _chat([{"role": "user", "content": "hi"}], response_format={"type": "json_object"})
+    )
+    assert req.get("text") == {"format": {"type": "json_object"}}
+
+
+def test_response_format_json_schema_relayed():
+    """json_schema : name/schema/strict reportés, jamais inventés."""
+    req = _chat_to_responses_request(
+        _chat(
+            [{"role": "user", "content": "hi"}],
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "r",
+                    "schema": {"type": "object", "properties": {}},
+                    "strict": True,
+                },
+            },
+        )
+    )
+    fmt = req.get("text", {}).get("format", {})
+    assert fmt.get("type") == "json_schema"
+    assert fmt.get("name") == "r"
+    assert fmt.get("strict") is True
+    assert isinstance(fmt.get("schema"), dict)
+
+
+def test_response_format_absent_not_invented():
+    """Absent → aucun `text` posé (défaut upstream préservé)."""
+    req = _chat_to_responses_request(_chat([{"role": "user", "content": "hi"}]))
+    assert "text" not in req
+
+
+# ─────────────────────── redacted_thinking ───────────────────────
+
+
+def test_responses_reasoning_encrypted_only_becomes_redacted():
+    """Reasoning sans summary visible mais avec encrypted_content → bloc opaque
+    rejouable, pas une perte sèche."""
+    from app.protocol.mapping import _responses_to_anthropic_response
+
+    out = _responses_to_anthropic_response(
+        {
+            "output": [
+                {"type": "reasoning", "encrypted_content": "opaque", "summary": []},
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "voilà"}],
+                },
+            ]
+        },
+        "m",
+    )
+    redacted = [b for b in out["content"] if b.get("type") == "redacted_thinking"]
+    assert redacted and redacted[0]["data"] == "opaque"
+
+
+def test_anthropic_redacted_thinking_becomes_encrypted_content():
+    """Sens inverse : redacted_thinking Anthropic → reasoning encrypted_content."""
+    from app.protocol.mapping import anthropic_to_openai_responses
+
+    out = anthropic_to_openai_responses(
+        {
+            "content": [
+                {"type": "redacted_thinking", "data": "opaque"},
+                {"type": "text", "text": "voilà"},
+            ]
+        },
+        "m",
+    )
+    reasoning = [i for i in out["output"] if i.get("type") == "reasoning"]
+    assert reasoning and reasoning[0].get("encrypted_content") == "opaque"
+
+
+def test_reasoning_extra_keys_preserved():
+    """`reasoning.mode`/`context` (SDK récent) survivent à la conversion."""
+    req = _chat_to_responses_request(
+        _chat(
+            [{"role": "user", "content": "hi"}],
+            reasoning={"effort": "high", "mode": "pro", "context": "ctx"},
+        )
+    )
+    assert req["reasoning"].get("mode") == "pro"
+    assert req["reasoning"].get("context") == "ctx"
+
+
+# ─────────────────────── metadata/user/service_tier ───────────────────────
+
+
+def test_chat_leg_relays_metadata_user_service_tier():
+    """Jambes Chat : metadata/user/service_tier valides, relayés sans outils."""
+    from app.protocol.mapping import anthropic_to_openai
+
+    out = anthropic_to_openai(
+        {
+            "model": "m",
+            "max_tokens": 10,
+            "metadata": {"k": "v"},
+            "user": "u-1",
+            "service_tier": "flex",
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+        "m",
+    )
+    assert out.get("metadata") == {"k": "v"}
+    assert out.get("user") == "u-1"
+    assert out.get("service_tier") == "flex"
+
+
+def test_anthropic_leg_relays_metadata_and_user_id():
+    """Jambes Anthropic : metadata copié, user → metadata.user_id."""
+    from app.protocol.mapping import openai_to_anthropic_request
+
+    out = openai_to_anthropic_request(
+        {
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "metadata": {"k": "v"},
+            "user": "u-1",
+            "service_tier": "auto",
+        }
+    )
+    assert out.get("metadata", {}).get("k") == "v"
+    assert out.get("metadata", {}).get("user_id") == "u-1"
+    assert out.get("service_tier") == "auto"
+
+
+def test_optional_chat_fields_absent_not_invented():
+    """Absent → absent sur les jambes Chat/Anthropic aussi."""
+    from app.protocol.mapping import anthropic_to_openai, openai_to_anthropic_request
+
+    out = anthropic_to_openai({"model": "m", "max_tokens": 10, "messages": []}, "m")
+    assert "metadata" not in out and "user" not in out and "service_tier" not in out
+    out2 = openai_to_anthropic_request({"model": "m", "messages": []})
+    assert "metadata" not in out2 and "service_tier" not in out2
+
+
+# ─────────────────────── Clé de cache : hors chaînage ───────────────────────
+
+
+def test_cache_key_ignores_chaining_fields():
+    """F6 : previous_response_id / prompt_cache_key uniques ne doivent pas
+    annuler le cache réponse (requêtes identiques → même clé)."""
+    from server.cache import ResponseCache
+
+    c = ResponseCache()
+    base = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
+    k1 = c.make_key(dict(base))
+    k2 = c.make_key({**base, "previous_response_id": "resp_1", "prompt_cache_key": "ses_abc"})
+    assert k1 is not None and k1 == k2

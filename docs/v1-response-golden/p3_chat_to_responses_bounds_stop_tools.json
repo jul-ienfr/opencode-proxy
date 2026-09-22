@@ -90,7 +90,7 @@
     "model": "muse-spark-1.3-contributor-free",
     "input": [
       {
-        "role": "system",
+        "role": "developer",
         "content": [
           {
             "type": "input_text",
@@ -130,7 +130,6 @@
     ],
     "stream": true,
     "max_output_tokens": 512,
-    "temperature": 0.3,
     "tools": [
       {
         "type": "function",

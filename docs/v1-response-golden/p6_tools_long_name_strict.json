@@ -77,7 +77,9 @@
         }
       }
     ],
-    "tool_choice": "auto"
+    "tool_choice": {
+      "type": "auto"
+    }
   },
   "_note": "axe tools noms longs P6 : schéma normalisé, nom long transmis tel quel à l'amont",
   "_generated_by": "scripts/gen_golden_fixtures.py (plan v10 §11.5)"

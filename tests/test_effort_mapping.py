@@ -4,7 +4,7 @@ plus le sens inverse (reasoning_effort OpenAI → thinking Anthropic).
 Clamp config-driven : ``_effort_to_reasoning`` délègue à
 ``config.effort_caps.clamp_effort`` (section ``thinking`` de ``config.yaml``,
 lue en live). Ces tests valident le comportement avec la config réelle du
-repo (spark → xhigh, glm-5 → high, deepseek-v4 → max, mimo-v2.5 → max,
+repo (spark → max, glm-5 → high, deepseek-v4 → max, mimo-v2.5 → max,
 nemotron-3-ultra → high, nemotron-3.5-lightning → max, défaut → high) —
 voir ``tests/test_effort_caps.py`` pour la logique unitaire (caps custom,
 longest-prefix, hot-reload logique)."""
@@ -23,15 +23,15 @@ import protocol_mapping as pm
         ("high", "glm-5-flash", "high"),
         ("medium", "glm-5-air", "medium"),
         ("low", "glm-5-air", "low"),
-        ("", "glm-5-air", "low"),
+        ("", "glm-5-air", None),
         # deepseek-v4 : cap max → tout est préservé (min(demandé, max) = demandé),
-        # "" → low (repli historique du désactivé dans _effort_to_reasoning)
+        # "" → None (désactivé : aucun raisonnement)
         ("xhigh", "deepseek-v4-flash", "xhigh"),
         ("max", "deepseek-v4-pro", "max"),
         ("high", "deepseek-v4-flash", "high"),
         ("medium", "deepseek-v4-flash", "medium"),
         ("low", "deepseek-v4-flash", "low"),
-        ("", "deepseek-v4-pro", "low"),
+        ("", "deepseek-v4-pro", None),
         # mimo-v2.5 : cap max (upstream Zen 2×200 max confirmé 2026-09-09),
         # tout est préservé ; mimo-v2-pro garde le défaut high
         ("xhigh", "mimo-v2.5", "xhigh"),
@@ -39,7 +39,7 @@ import protocol_mapping as pm
         ("high", "mimo-v2.5", "high"),
         ("medium", "mimo-v2.5", "medium"),
         ("low", "mimo-v2.5", "low"),
-        ("", "mimo-v2.5", "low"),
+        ("", "mimo-v2.5", None),
         ("xhigh", "mimo-v2-pro", "high"),
         ("max", "mimo-v2-pro", "high"),
         ("high", "mimo-v2-pro", "high"),
@@ -50,24 +50,26 @@ import protocol_mapping as pm
         ("xhigh", "nemotron-3-ultra-free", "high"),
         ("max", "nemotron-3.5-lightning-free", "max"),
         ("xhigh", "nemotron-3.5-lightning-free", "xhigh"),
-        # muse-spark : xhigh préservé (upstream Zen 200 confirmé 2026-09-09),
-        # max → xhigh (upstream refuse max en 400), high/medium/low inchangés
+        # muse-spark : cap max (thinkingLevelMap officiel : off/minimal/low/
+        # medium/high/xhigh/max) ; high/medium/low inchangés
         ("xhigh", "muse-spark-1.3-contributor", "xhigh"),
-        ("max", "muse-spark-1.3-contributor", "xhigh"),
+        ("max", "muse-spark-1.3-contributor", "max"),
         ("xhigh", "muse-spark-1.3-contributor-free", "xhigh"),
-        ("max", "muse-spark-1.2-contributor", "xhigh"),
+        ("max", "muse-spark-1.2-contributor", "max"),
         ("high", "muse-spark-1.3-contributor", "high"),
         ("medium", "muse-spark-1.3-contributor", "medium"),
         ("low", "muse-spark-1.3-contributor", "low"),
-        ("", "muse-spark-1.3-contributor", "low"),
+        ("", "muse-spark-1.3-contributor", None),
         # config-driven : normalisation casse/espaces, minimal, désactivé
-        # (repli historique "low"), niveau inconnu → passthrough inchangé
+        # (None : aucun bloc reasoning — parité thinkingLevel off),
+        # niveau inconnu → passthrough inchangé
         ("MAX", "glm-5-air", "high"),
         (" XHigh ", "muse-spark-1.3-contributor", "xhigh"),
         ("minimal", "muse-spark-1.3-contributor", "minimal"),
         ("minimal", "glm-5-air", "minimal"),
-        ("none", "muse-spark-1.3-contributor", "low"),
-        (None, "muse-spark-1.3-contributor", "low"),
+        ("none", "muse-spark-1.3-contributor", None),
+        (None, "muse-spark-1.3-contributor", None),
+        ("off", "muse-spark-1.3-contributor", None),
         ("ultra", "muse-spark-1.3-contributor", "ultra"),
     ],
 )
@@ -87,7 +89,7 @@ def test_effort_to_reasoning_all_levels(effort, model, expected):
         (16000, "xhigh", "muse-spark-1.3-contributor", "xhigh"),
         # budget 0 : valeur invalide (min spec = 1024) → aucun budget
         # exploitable, donc traité comme « pas de niveau demandé » → max du modèle.
-        (0, "max", "muse-spark-1.3-contributor", "xhigh"),
+        (0, "max", "muse-spark-1.3-contributor", "max"),
         # budget dérivé au-delà du cap → relegué au plafond du modèle
         # (ex. 20000 sur glm-5 → dérivé xhigh → clampé high)
         (20000, "xhigh→high", "glm-5-air", "high"),
@@ -280,7 +282,7 @@ def test_adaptive_without_budget_takes_the_model_maximum():
     mieux que le modèle cible sache faire, borné par son plafond configuré.
     """
     for model, expected in [
-        ("muse-spark-1.3-contributor", "xhigh"),
+        ("muse-spark-1.3-contributor", "max"),
         ("deepseek-v4-flash", "max"),
         ("glm-5-air", "high"),
     ]:

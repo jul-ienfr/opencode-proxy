@@ -71,7 +71,10 @@ async def test_vpn_e2e_free_fallback_when_all_stations_exhausted(monkeypatch):
         raise opencode.UpstreamError("direct failed")
 
     monkeypatch.setattr(opencode, "_do_free_request_curl_cffi", _fail_curl)
-    monkeypatch.setattr(opencode, "_do_request_with_retry", _fail_direct)
+    # Le fallback direct free est `_do_free_direct_request` (pas
+    # `_do_request_with_retry`, jambe paid, jamais appelée ici) : sans ce mock
+    # le test partait en vrai réseau (400 upstream réel, non hermétique).
+    monkeypatch.setattr(opencode, "_do_free_direct_request", _fail_direct)
     result = await opencode._try_free_model_first({}, {}, "anthropic", "kimi-k2.6")
     assert result is None
 

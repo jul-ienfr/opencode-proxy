@@ -203,6 +203,9 @@ upstream:
 | POST | `/v1/messages` | Proxy Anthropic format → backend |
 | POST | `/anthropic/v1/messages` | Proxy Anthropic format |
 | POST | `/v1/messages/count_tokens` | Estimate token count |
+| POST | `/v1/chat/completions` | Proxy OpenAI chat format → backend |
+| POST | `/v1/responses` | Proxy OpenAI Responses format → backend |
+| POST | `/v1/systemone` | Passthrough TypeSafe SystemOne (Jev) — `{model, state, questions}` → `zen/v1/systemone`. `jev-1.13` = clé Zen du pool, `jev-1.13-free` = anonyme gratuit. PAS un endpoint de chat (pas de `messages`, pas de tools) |
 | GET | `/health` | Health check |
 | GET | `/v1/models` | List available models |
 | GET | `/api/stats` | Token stats (supports `from_date`, `to_date`) |

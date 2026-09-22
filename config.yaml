@@ -132,6 +132,18 @@ models:
     protocol: openai
   jev-1.13-free:
     protocol: openai
+    endpoint: https://opencode.ai/zen/v1/systemone
+  jev-1.13:
+    protocol: openai
+    endpoint: https://opencode.ai/zen/v1/systemone
+  mimo-v2.6-flash-free:
+    protocol: openai
+  mimo-v2.6-pro:
+    protocol: openai
+  mimo-v2.6-flash:
+    protocol: openai
+  grok-4.7:
+    protocol: openai
 free_model_map:
   mimo-v2.5: mimo-v2.5-free
   qwen3.7-max: mimo-v2.5-free
@@ -141,6 +153,9 @@ free_model_map:
   deepseek-v4-flash: deepseek-v4-flash-free
   muse-spark-1.2-contributor: muse-spark-1.2-contributor-free
   muse-spark-1.3-contributor: muse-spark-1.3-contributor-free
+  jev-1.13-free: jev-1.13-free
+  jev-1.13: jev-1.13-free
+  mimo-v2.6-flash: mimo-v2.6-flash-free
 dashboard_trust:
   mode: lan
   lan_cidrs:
@@ -475,6 +490,7 @@ thinking:
     ling-3.0-flash-fin: max
     nemotron-3-ultra: high
     nemotron-3.5-lightning: max
+    jev: low
   min_tokens:
     deepseek-v4-flash: 2048
     deepseek-v4-pro: 4096

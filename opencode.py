@@ -4659,6 +4659,16 @@ _OPENCODE_OFFICIAL_UA_RESPONSES = os.getenv(
 _OPENCODE_CLIENT_NAME = os.getenv("OPENCODE_CLIENT_NAME", "desktop")
 # Projet officiel (capture : projet global, cf. ProjectV2.ID.global).
 _OPENCODE_PROJECT = os.getenv("OPENCODE_PROJECT", "global")
+# Endpoint amont TypeSafe SystemOne (Jev) — documenté :
+# https://opencode.ai/docs/fr/zen/#jev — ni /chat/completions ni /messages
+# ni /responses : le corps est {model, state, questions}. Vérifié live
+# (2026-09-22) : jev-1.13 + clé Zen → 402 (solde vide, auth OK) ;
+# jev-1.13-free + Bearer public → 200. Pas de variante /go (400
+# MissingSessionID — endpoint non public).
+_SYSTEMONE_ENDPOINT = os.getenv(
+    "OPENCODE_SYSTEMONE_ENDPOINT",
+    "https://opencode.ai/zen/v1/systemone",
+)
 # Empreinte réseau de la jambe free — la VRAIE face TLS+HTTP du client Bun,
 # capturée octet-exact le 2026-09-18 (Bun standalone 1.3.11 PUIS le vrai
 # client opencode 1.18.31 lui-même, redirigé vers un captureur local :
@@ -15042,6 +15052,166 @@ async def chat_completions(request: Request):
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
     )
+
+
+@app.post("/v1/systemone")
+async def systemone(request: Request):
+    """Passthrough TypeSafe SystemOne (Jev) — PAS un endpoint de chat.
+
+    Jev n'est ni un LLM de chat ni un modèle à tool calls : il évalue un
+    `state` contre des questions typées (`noul`/`choice`/`score`) et renvoie
+    des réponses structurées. Ce handler relaie le corps tel quel vers
+    l'endpoint amont dédié (docs : https://opencode.ai/docs/fr/zen/#jev) :
+      POST https://opencode.ai/zen/v1/systemone
+      { "model": "jev-1.13[-free]", "state": "...",
+        "questions": { "<id>": { "type": "noul|choice|score", ... } } }
+
+    Routage d'auth (vérifié par probes live 2026-09-22) :
+      * `jev-1.13` (payant) → clé Zen du pool (round-robin + failover
+        401/429/403, même mécanique que la jambe paid) ;
+      * `jev-1.13-free` → `Bearer public` anonyme direct (vérifié 200,
+        `cost: "0"`, sans rate-limit IP observé sur 15 appels rapprochés).
+
+    La réponse amont `{model, answers, usage}` est relayée telle quelle ;
+    `usage` (input/output_tokens) alimente les compteurs + la DB comme
+    les autres endpoints.
+    """
+    req_id = _fast_id("sysone")
+    start_time = time.monotonic()
+    client_ip = _get_client_ip(request)
+    _current_user_agent.set(request.headers.get("user-agent"))
+    _current_client_ip.set(client_ip)
+
+    body_bytes = await request.body()
+    _debug(f"  [body] read {len(body_bytes)} bytes in {(time.monotonic() - start_time) * 1000:.0f}ms")
+    if len(body_bytes) > MAX_BODY_SIZE:
+        _debug(f"  413: body too large ({len(body_bytes)} bytes)")
+        return _openai_error(413, f"Request body too large ({len(body_bytes)} bytes, max {MAX_BODY_SIZE})")
+
+    try:
+        body = _json_loads(body_bytes)
+    except Exception:
+        _debug("  400: invalid JSON body")
+        return _openai_error(400, "invalid json")
+    if not isinstance(body, dict):
+        return _openai_error(400, "body must be a JSON object")
+
+    original_model = body.get("model", "")
+    request_body = body
+    _debug(f"[systemone] req_id={req_id} model={original_model!r} ip={client_ip}")
+    route = _route_for(original_model)
+    if route is None:
+        _debug(f"[systemone] ✗ no route found for {original_model!r}")
+        available = sorted(m for m in MODELS if "jev" in m.lower())
+        return JSONResponse(
+            status_code=404,
+            content={
+                "error": f"Model not found: {original_model!r}",
+                "available_models": available,
+            },
+        )
+    model_id = route["model"]
+    cfg = get_model_config(model_id)
+    endpoint = cfg.get("endpoint") or _SYSTEMONE_ENDPOINT
+    if "systemone" not in (endpoint or ""):
+        # Garde : un modèle non-Jev routé ici par erreur ne doit jamais
+        # recevoir un payload {state, questions} sur un endpoint de chat.
+        _debug(f"[systemone] ✗ model {model_id!r} has non-systemone endpoint {endpoint!r}")
+        return _openai_error(400, f"model {model_id!r} is not a SystemOne model")
+    _debug(f"[systemone] route: {original_model!r} → {model_id} | endpoint={endpoint}")
+
+    # ── Validation du format SystemOne (doc TypeSafe) ──
+    if not isinstance(body.get("state"), str) or not body["state"].strip():
+        return _openai_error(400, "missing required field: 'state' (string)")
+    questions = body.get("questions")
+    if not isinstance(questions, dict) or not questions:
+        return _openai_error(400, "missing required field: 'questions' (non-empty object)")
+    for qid, q in questions.items():
+        if not isinstance(q, dict) or q.get("type") not in ("noul", "choice", "score"):
+            return _openai_error(
+                400,
+                f"questions[{qid!r}].type must be one of 'noul', 'choice', 'score'",
+            )
+
+    body = dict(body)
+    body["model"] = model_id
+
+    is_free = model_id.endswith("-free")
+    if is_free:
+        headers = {"Authorization": "Bearer public", "Content-Type": "application/json"}
+        account_alias = ""
+    else:
+        try:
+            entry = get_next_api_key()
+        except AllKeysPausedError as e:
+            return _openai_error(503, "All API keys exhausted. Check your billing.")
+        except Exception as e:
+            _debug(f"[systemone] ✗ no usable key: {type(e).__name__}: {e}")
+            return _openai_error(503, "All API keys exhausted. Check your billing.")
+        headers = {"Authorization": f"Bearer {entry.get('api_key', API_KEY)}", "Content-Type": "application/json"}
+        account_alias = _alias_for_key(entry.get("api_key", ""))
+
+    _log(f"→ {original_model!r} → {model_id} | systemone | free={is_free} | ip={client_ip}")
+
+    try:
+        if is_free:
+            resp = await _ensure_http_client().post(
+                endpoint, content=_serialize_json_body(body), headers=headers
+            )
+        else:
+            resp, headers = await _do_request_with_retry(endpoint, body, headers, "openai")
+    except UpstreamError as e:
+        await _log_and_save_error(
+            req_id, model_id, original_model, start_time, e.status_code, str(e),
+            "openai", False, "none", "none", client_ip, account_alias, [],
+            request_body=request_body, response_body={"error": str(e)[:2000]},
+            paid_status=None if is_free else e.status_code,
+        )
+        return JSONResponse(status_code=e.status_code, content={"error": str(e)})
+    if not is_free:
+        account_alias = _alias_for_key(_key_from_headers(headers, "openai"))
+
+    if resp.status_code != 200:
+        try:
+            err_text = resp.text
+        except Exception:
+            err_text = f"upstream status {resp.status_code}"
+        await _log_and_save_error(
+            req_id, model_id, original_model, start_time, resp.status_code, err_text,
+            "openai", False, "none", "none", client_ip, account_alias, [],
+            request_body=request_body, response_body={"error": err_text[:2000]},
+            paid_status=None if is_free else resp.status_code,
+        )
+        # Relayer le statut amont (402 solde vide, 401/429 quota…) tel quel,
+        # avec le corps amont quand il est lisible.
+        try:
+            err_content = _json_loads(resp.content)
+        except Exception:
+            err_content = {"error": err_text[:500]}
+        return JSONResponse(status_code=resp.status_code, content=err_content)
+
+    try:
+        data = _json_loads(resp.content)
+    except Exception:
+        await _log_and_save_error(
+            req_id, model_id, original_model, start_time, 502, "Upstream returned non-JSON response",
+            "openai", False, "none", "none", client_ip, account_alias, [],
+            request_body=request_body, response_body={"error": "non-JSON upstream"},
+            paid_status=None if is_free else 502,
+        )
+        return _openai_error(502, "Upstream returned non-JSON response")
+
+    usage = data.get("usage", {}) if isinstance(data, dict) else {}
+    req_in = int(usage.get("input_tokens", 0) or 0)
+    req_out = int(usage.get("output_tokens", 0) or 0)
+    await _save_and_log_request(
+        req_id, model_id, original_model, start_time, req_in, req_out, 0,
+        "openai", False, "none", "none", client_ip, account_alias, [],
+        request_body=request_body, response_body=data,
+        paid_status=None if is_free else 200,
+    )
+    _update_token_usage(model_id, req_in, req_out, 0)
+    return JSONResponse(status_code=200, content=data)
 
 
 @app.post("/v1/responses")

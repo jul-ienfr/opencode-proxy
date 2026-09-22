@@ -217,6 +217,28 @@ def test_client_ttl_is_not_overwritten_by_our_addition():
     assert "1h" in dumped, "le TTL explicite du client a été perdu"
 
 
+def test_system_block_ttl_is_preserved_not_flattened():
+    """F2 : un `ttl: 1h` posé sur un bloc système (forme liste) survit à
+    l'aplatissement `_extract_text` — avant : rétrogradé à 5 min en silence."""
+    out = pm.anthropic_to_openai(
+        _anthropic_body(
+            [{"role": "user", "content": "Bonjour"}],
+            system=[
+                {"type": "text", "text": "Tu es un assistant."},
+                {
+                    "type": "text",
+                    "text": "Contexte long.",
+                    "cache_control": {"type": "ephemeral", "ttl": "1h"},
+                },
+            ],
+        ),
+        "deepseek-v4-flash",
+    )
+    sys_msgs = [m for m in out["messages"] if m.get("role") == "system"]
+    assert sys_msgs, "message système perdu"
+    assert sys_msgs[0].get("cache_control", {}).get("ttl") == "1h"
+
+
 # ───────────────────── cache_control top-level ─────────────────────
 
 

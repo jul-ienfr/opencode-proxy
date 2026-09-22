@@ -67,7 +67,9 @@
         }
       }
     ],
-    "tool_choice": "auto"
+    "tool_choice": {
+      "type": "auto"
+    }
   },
   "_note": "axe tools schéma/strict : profil OpenAI strict → input_schema Anthropic normalisé",
   "_generated_by": "scripts/gen_golden_fixtures.py (plan v10 §11.5)"

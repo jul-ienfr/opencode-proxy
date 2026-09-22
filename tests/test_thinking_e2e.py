@@ -117,7 +117,9 @@ async def test_finalize_emits_signature_delta_before_stop(monkeypatch):
         "msg_test",
         "claude-test",
         {"glm-5.1-free": {"input": 0, "output": 0, "cache": 0}},
-        __import__("asyncio").Lock(),
+        # threading.Lock comme en prod : asyncio.Lock() levait TypeError dans
+        # _finalize_stream_tokens (catché) et polluait logs/debug.log partagé.
+        __import__("threading").Lock(),
         False,
         "paid-model",
         "",

@@ -23,6 +23,12 @@ def _default_dumps_str(obj, **kw) -> str:
     return json.dumps(obj, ensure_ascii=False, separators=(",", ":"), default=str)
 
 
+#: Champs de chaînage/session exclus de la clé de cache réponse (F6) :
+#: previous_response_id unique par tour + prompt_cache_key (ses_ tournant
+#: 30 min) donneraient sinon un hit-rate ~nul sur des requêtes identiques.
+_CHAINING_KEY_FIELDS = ("previous_response_id", "conversation", "prompt_cache_key")
+
+
 class ResponseCache:
     """LRU cache for non-streaming API responses with TTL and size limit.
 
@@ -101,13 +107,18 @@ class ResponseCache:
                         self._debug_fn("  [cache] make_key: tool_result found, returning None")
                         return None
         try:
-            if body_bytes:
+            if body_bytes and not any(k in body for k in _CHAINING_KEY_FIELDS):
                 # Fast path: hash raw bytes directly (avoids json.dumps + sort_keys)
                 key = hashlib.blake2b(body_bytes, digest_size=16).hexdigest()
             else:
+                # Champs de chaînage/session exclus : previous_response_id unique
+                # + rotation ses_ (30 min) donneraient sinon un hit-rate ~nul
+                # (requêtes identiques, clés différentes). La réponse cachée ne
+                # porte aucune donnée de session : le partage est sain.
+                scrubbed = {k: v for k, v in body.items() if k not in _CHAINING_KEY_FIELDS}
                 # Fallback: deterministic JSON serialization + blake2b
                 key = hashlib.blake2b(
-                    self._dumps_str_fn(body, separators=(",", ":"), default=str).encode(),
+                    self._dumps_str_fn(scrubbed, separators=(",", ":"), default=str).encode(),
                     digest_size=16,
                 ).hexdigest()
             self._debug_fn(f"  [cache] make_key: generated hash={key[:16]}...")

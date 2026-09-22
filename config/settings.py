@@ -564,6 +564,7 @@ KNOWN_PROTOCOLS = {
     "big": "openai",
     "laguna": "openai",
     "north": "openai",
+    "jev": "openai",
     # Anthropic protocol models
     "minimax": "anthropic",
     "qwen": "anthropic",
@@ -623,6 +624,24 @@ def get_model_api(model_id: str, model_data: dict | None = None) -> str:
 _CAP_TEXT_IMAGE_PDF = ["text", "image", "pdf"]
 
 
+def _capabilities_decision_only() -> dict:
+    """Capabilities Jev/SystemOne : décisions structurées, PAS de génération.
+
+    Contrairement aux LLM de chat, Jev ne génère pas de texte, ne fait pas
+    de tool calls et ne raisonne pas en sortie texte : il évalue un `state`
+    contre des questions typées (noul/choice/score) et renvoie des valeurs
+    structurées + probabilités + confidence. Marquer toolcall/reasoning à
+    True ferait router vers lui des requêtes agent qu'il ne peut pas servir.
+    """
+    return {
+        "input": ["text"],
+        "output": ["structured"],
+        "reasoning": False,
+        "toolcall": False,
+        "interleaved": None,
+    }
+
+
 def _capabilities_full(interleaved: str | None = None) -> dict:
     return {
         "input": list(_CAP_TEXT_IMAGE_PDF),
@@ -659,6 +678,7 @@ FAMILY_CAPABILITIES = {
     "ling": _capabilities_full(),
     "omen": _capabilities_full(),
     "union": _capabilities_full(),
+    "jev": _capabilities_decision_only(),
 }
 UNKNOWN_MODEL_CAPABILITIES = {
     "input": ["text"],

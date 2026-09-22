@@ -75,18 +75,28 @@ def test_cli_flags_exist():
 
 
 def test_boot_opts_defaults_are_historical():
-    """Sans argument, les options gardent le comportement historique complet."""
-    import importlib
+    """Sans argument, les options gardent le comportement historique complet.
 
-    saved = dict(oc.BOOT_OPTS)
-    try:
-        mod = importlib.reload(oc)
-        assert mod.BOOT_OPTS["no_docker"] is False
-        assert mod.BOOT_OPTS["no_vpn"] is False
-        assert mod.BOOT_OPTS["ready_timeout"] == 0.0
-    finally:
-        oc.BOOT_OPTS.clear()
-        oc.BOOT_OPTS.update(saved)
+    Exécuté en sous-processus frais (pas de ``importlib.reload`` en pleine
+    suite : recharger 16k lignes dans le namespace partagé casse l'herméticité
+    — objets fonction remplacés mid-run pour les tests d'inspection).
+    """
+    out = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import opencode as oc, json; print(json.dumps(oc.BOOT_OPTS))",
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=180,
+    ).stdout
+    opts = json.loads(out.strip().splitlines()[-1])
+    assert opts["no_docker"] is False
+    assert opts["no_vpn"] is False
+    assert opts["ready_timeout"] == 0.0
 
 
 # ── 2/3. /readyz ─────────────────────────────────────────────────────

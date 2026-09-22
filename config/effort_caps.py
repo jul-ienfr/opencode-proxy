@@ -28,7 +28,8 @@ EFFORT_ORDER_DEFAULT = ["minimal", "low", "medium", "high", "xhigh", "max"]
 DEFAULT_CAP_FALLBACK = "high"
 
 #: Niveaux qui désactivent le raisonnement — jamais clampés, passthrough None.
-_DISABLED = ("", "none")
+#: "off" = vocabulaire thinkingLevel (muse-spark) pour la désactivation.
+_DISABLED = ("", "none", "off")
 
 
 def _yaml_get(*keys, default=None):
