@@ -43,6 +43,10 @@ import protocol_mapping as pm
         ("xhigh", "mimo-v2-pro", "high"),
         ("max", "mimo-v2-pro", "high"),
         ("high", "mimo-v2-pro", "high"),
+        # mimo-v2.6 : cap max (même famille, pas de cache sémantique)
+        ("max", "mimo-v2.6-flash", "max"),
+        ("xhigh", "mimo-v2.6-flash-free", "xhigh"),
+        ("max", "mimo-v2.6-pro", "max"),
         # nemotron-3-ultra : 400 "Model is unavailable" meme a high
         # 2026-09-09 -> defaut high conserve ; nemotron-3.5-lightning :
         # cap max (upstream Zen 2x200 max confirme 2026-09-09)

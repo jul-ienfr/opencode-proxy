@@ -21,6 +21,7 @@ goldens §v1-response.md. Aliases actuels (`free_model_map`) :
 - `deepseek-v4-flash` → `deepseek-v4-flash-free`
 - `glm-5.1`, `kimi-k2.6`, `minimax-m2.5` → `mimo-v2.5-free`
 - `mimo-v2.5` → `mimo-v2.5-free`
+- `mimo-v2.6-flash` → `mimo-v2.6-flash-free`
 - `qwen3.7-max` → `mimo-v2.5-free`
 - `muse-spark-1.2-contributor` → `muse-spark-1.2-contributor-free`
 - `muse-spark-1.3-contributor` → `muse-spark-1.3-contributor-free`

@@ -484,6 +484,7 @@ thinking:
     deepseek-v4: max
     deepseek-v4-flash-free: high
     mimo-v2.5: max
+    mimo-v2.6: max
     muse-spark: max
     muse_spark: max
     spark: max
@@ -506,6 +507,8 @@ thinking:
   - gpt-5
 cache_rewrite_models:
 - mimo-v2.5
+- mimo-v2.6-flash
+- mimo-v2.6-pro
 - mimo-v2-pro
 - mimo-v2-omni
 - mimo-v2.5-pro
