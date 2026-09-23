@@ -15054,6 +15054,359 @@ async def chat_completions(request: Request):
     )
 
 
+async def _systemone_free_via_pool(endpoint: str, body: dict, headers: dict, forced_pool=None, req_id=None):
+    """[Lot 1 parité 429] Jambe free SystemOne (Jev) via le pool de tunnels.
+
+    Même mécanique 429 que les autres modèles free, protocole SystemOne
+    inchangé (passthrough ``{model, state, questions}`` tel quel — ni
+    conversion chat/responses, ni grille tools, ni effort, ni hedge :
+    ``_free_wire_body`` retourne un corps sans ``input``/``messages``
+    inchangé, et ``_do_free_request_curl_cffi`` le POSTe en non-stream).
+
+    * ``Bearer public`` (jamais la clé payante — A.0) VIA tunnel poolé
+      (curl_cffi, face Bun officielle reconstruite en interne) : boucle
+      multi-station (``effective_free_max_attempts``) ; chaque 429 → usage
+      loggé + ``_mark_free_stations_429`` (cooldown (modèle, IP) + rotation
+      + compteur selon ``on_429_action``) puis retry station fraîche ;
+      5xx → retry station fraîche ; tunnel mort → station suivante.
+    * Le 429 FINAL (budget épuisé) est relayé tel quel — un vrai 429 amont,
+      jamais un 429 fabriqué.
+    * Pool indispo → repli direct (option B) UNIQUEMENT en ``proxy_mode``
+      direct (et direct autorisé) ; en vpn/socks5 : fail-closed
+      (``UpstreamError`` 503, jamais de direct résidentiel). Sur le direct,
+      un 429 pose le cooldown clé ``direct`` + compteur, avec UN retry après
+      ``Retry-After`` (≤ 60 s) quand l'amont en prononce un.
+
+    Retourne un objet réponse httpx-like (``status_code``/``headers``/
+    ``text``/``content``) comme l'appel direct qu'il remplace ; lève
+    ``UpstreamError`` (cause réelle : tunnels tous morts → 502).
+    """
+    # ``headers`` (Bearer public + Content-Type posés par le handler) est
+    # volontairement ignoré : le tunnel reconstruit la face Bun officielle
+    # exacte via _official_free_headers, et le repli direct aussi — un jeu
+    # minimal sans UA Bun risquerait le gate 403.
+    free_model = (body.get("model") if isinstance(body, dict) else "") or "jev-1.13-free"
+    paid_model = free_model[:-5] if free_model.endswith("-free") else free_model
+    proxy_mode = _free_proxy_mode()
+    pool = _free_ip_pool
+    t0 = time.monotonic()
+    # forced_pool=None aujourd'hui (pas de _enforce_geo_gate sur systemone —
+    # aucun routage géo) ; threadé pour parité future avec la jambe générique.
+    free_max = effective_free_max_attempts(forced_pool)
+    station = None
+    free_ip = ""
+    tried: set = set()
+    # [Lot 1 FIX f] Sentinelle egress direct : pid=None + current_ip="" pour
+    # que _free_cooldown_key rende "{model}|direct" de façon déterministe
+    # (jamais de station tunnel stale sur le chemin direct pool-indispo).
+    class _DirectEgress:
+        pid = None
+        current_ip = ""
+    _direct_station = _DirectEgress()
+    _last_tunnel_exc: Exception | None = None
+    resp = None
+
+    pool_ok = bool(pool is not None and pool.enabled and proxy_mode in ("vpn", "socks5"))
+    if pool_ok:
+        _register_failover_exhausted_cb(lambda: free_model)
+        try:
+            # Un seul appel (l'ancien double try/except TypeError identique
+            # était du code mort) — forced_pool threadé ; un vieux double
+            # sans le paramètre lève TypeError → couvert par le except
+            # ci-dessous (repli direct/fail-closed, jamais de crash).
+            _, station = await pool.on_request(forced_pool)
+        except Exception as e:
+            _debug(f"  [systemone-free] on_request failed ({e}) → repli direct/fail-closed")
+            station = None
+            pool_ok = False
+        else:
+            vpn = station or _vpn_manager
+            if vpn is not None and getattr(vpn, "current_ip", None):
+                free_ip = vpn.current_ip
+
+    if pool_ok:
+        # Boucle multi-station miroir de _try_free_model_first (sans les
+        # conversions chat/responses/effort/min_tokens/hedge, sans objet
+        # pour SystemOne).
+        if station is not None:
+            tried.add(station)  # on_request pick = first strike
+        _free_used = 0
+        while resp is None and _free_used < free_max:
+            if _free_used == 0 and station is not None:
+                attempt = station
+            elif pool is not None:
+                if getattr(pool, "socks5_mode", False):
+                    # _socks5_next n'a pas de forced_pool (proxies statiques
+                    # sans sémantique pays) — l'exclusion cumulative suffit.
+                    attempt = pool._socks5_next(excluded=tried)
+                else:
+                    # forced_pool threadé (géo future) ; repli no-arg pour les
+                    # vieux doubles de test sans le paramètre.
+                    try:
+                        attempt = (
+                            pool._best_station_excluding_many(tried, forced_pool)
+                            if tried
+                            else pool._best_station(forced_pool)
+                        )
+                    except TypeError:
+                        attempt = (
+                            pool._best_station_excluding_many(tried)
+                            if tried
+                            else pool._best_station()
+                        )
+                if attempt is not None:
+                    tried.add(attempt)
+            else:
+                attempt = None
+            if attempt is None:
+                break  # plus de station → fail-closed ci-dessous
+            _free_used += 1
+            _free_elapsed = int((time.monotonic() - t0) * 1000)
+            try:
+                resp = await _do_free_request_curl_cffi(
+                    body,
+                    headers,
+                    attempt.socks5_url,
+                    station=attempt,
+                    endpoint=endpoint,
+                )
+            except Exception as e:
+                _debug(f"  [systemone-free] tunnel error (station {getattr(attempt, '_station', '?')}): {e}")
+                _last_tunnel_exc = e
+                try:
+                    _dly = _free_retry_delay_seconds(_free_used)
+                    if _dly > 0:
+                        await asyncio.sleep(_dly)
+                except Exception:
+                    pass
+                continue
+            if attempt.current_ip:
+                free_ip = attempt.current_ip
+            elif getattr(attempt, "pid", None):
+                free_ip = attempt.pid
+            _current_free_attempt.set(
+                {
+                    "ip": free_ip,
+                    "identity": _current_free_identity(attempt).get("impersonate") or "",
+                    "station": attempt,
+                }
+            )
+            station = attempt  # cooldown + on_quota_exhausted ciblent CETTE IP
+            try:
+                _code = int(getattr(resp, "status_code", 0) or 0)
+            except Exception:
+                _code = 0
+            try:
+                _ra = (resp.headers.get("retry-after", "") or "") if getattr(resp, "headers", None) else ""
+            except Exception:
+                _ra = ""
+            if _code == 200:
+                # [Lot 1 FIX c] Succès : logger l'usage (compteurs + DB) comme
+                # la jambe générique (L7716) — tokens best-effort depuis le
+                # JSON SystemOne {model, answers, usage{input_tokens,
+                # output_tokens}}, 0/0 si illisible.
+                try:
+                    _ok_data = _json_loads(resp.content)
+                    _ok_usage = _ok_data.get("usage", {}) if isinstance(_ok_data, dict) else {}
+                    _ok_in = int(_ok_usage.get("input_tokens", 0) or 0)
+                    _ok_out = int(_ok_usage.get("output_tokens", 0) or 0)
+                except Exception:
+                    _ok_in, _ok_out = 0, 0
+                _log_free_model_usage(
+                    paid_model, free_model, "free (no auth)", "free (no auth)",
+                    200, _ok_in, _ok_out, _free_elapsed, ip=free_ip,
+                )
+                break
+            if _code == 429:
+                # Quota de CETTE station épuisé → cooldown+rotation via le
+                # helper partagé, puis station FRAÎCHE tant que le budget dure.
+                _log_free_model_usage(
+                    paid_model, free_model, "free (no auth)", "free (no auth)",
+                    429, 0, 0, _free_elapsed, ip=free_ip,
+                )
+                _mark_free_stations_429(free_model, _ra, stations=[attempt], forced_pool=forced_pool)
+                _log(
+                    f"  FREE {free_model!r} RATE LIMITED (429) on station {getattr(attempt, '_station', '?')} → "
+                    f"retry station fraîche (essai {_free_used + 1}/{free_max})"
+                )
+                if _free_used < free_max:
+                    resp = None
+                    try:
+                        _dly = _free_retry_delay_seconds(_free_used)
+                        if _dly > 0:
+                            await asyncio.sleep(_dly)
+                    except Exception:
+                        pass
+                    continue
+                break  # 429 final → relayé tel quel (vrai 429 amont)
+            if 500 <= _code <= 599 and _free_used < free_max:
+                # 5xx transitoire (flap tunnel) → retry station fraîche.
+                try:
+                    _b5 = (getattr(resp, "text", "") or "")[:512]
+                except Exception:
+                    _b5 = ""
+                _log_free_model_usage(
+                    paid_model, free_model, "free (no auth)", "free (no auth)",
+                    _code, 0, 0, _free_elapsed, ip=free_ip,
+                )
+                _log(
+                    f"  FREE {free_model!r} upstream {_code} on station {getattr(attempt, '_station', '?')} → "
+                    f"retry station fraîche (essai {_free_used + 1}/{free_max})"
+                )
+                resp = None
+                try:
+                    _dly = _free_retry_delay_seconds(_free_used)
+                    if _dly > 0:
+                        await asyncio.sleep(_dly)
+                except Exception:
+                    pass
+                continue
+            break  # 200, 429 final ou autre statut → relayé tel quel
+        if resp is not None:
+            try:
+                _final_code = int(getattr(resp, "status_code", 0) or 0)
+            except Exception:
+                _final_code = 0
+            if _final_code == 429:
+                # [Lot 1 FIX e] 429 FINAL (budget épuisé) : bookkeeping
+                # best-effort pour que free_status=429 persiste (ctx O2 + log
+                # fallback) — le VRAI 429 amont est relayé tel quel par le
+                # handler (jamais de 429 fabriqué).
+                try:
+                    _fallback_ctx_push(req_id, free_model, 429)
+                except Exception:
+                    pass
+                try:
+                    _log_fallback(req_id, "free→refuse", free_model, 429, paid_model)
+                except Exception:
+                    pass
+            return resp
+        # Que des tunnels morts (les 429, eux, sont relayés ci-dessus) :
+        # fail-closed en vpn/socks5, jamais de direct résidentiel.
+        # [Lot 1 FIX e] Bookkeeping best-effort AVANT de lever (strict_free
+        # refuse déjà en config ; ici PAS de FreeRefusal — le handler ne
+        # catch que UpstreamError). Ordre : ctx C1 (persistance
+        # free_status=502 via _FALLBACK_CTX_LAST) → log fallback → cooldown
+        # 60 s → moteur latence (pattern L7731-7766, échec silencieux).
+        _dead_ms = int((time.monotonic() - t0) * 1000)
+        try:
+            _fallback_ctx_push(req_id, free_model, 502)
+        except Exception:
+            pass
+        try:
+            _log_fallback(req_id, "free→refuse", free_model, 502, paid_model)
+        except Exception:
+            pass
+        try:
+            _set_free_cooldown(free_model, 60, station)
+        except Exception:
+            pass
+        try:
+            import shared_state as _ss_lat_dead
+
+            _eng = getattr(_ss_lat_dead, "latency_engine", None)
+            if _eng is None:
+                from latency_rotation import get_engine as _get_eng
+
+                _eng = _get_eng()
+                _ss_lat_dead.latency_engine = _eng
+            if isinstance(station, object) and getattr(station, "_station", None) is not None:
+                _eng.record_request(int(station._station), str(free_ip or "direct"), float(_dead_ms), free_model, 502)
+        except Exception as _e_lat:
+            _debug(f"  [systemone-free] latency engine skip: {_e_lat}")
+        raise UpstreamError(
+            f"free {free_model}: all tunnels failed ({_last_tunnel_exc})",
+            status_code=502,
+        )
+
+    # ── Pool indispo : option B (direct) ou fail-closed ──
+    if proxy_mode in ("vpn", "socks5") or not _direct_fallback_allowed():
+        raise UpstreamError(
+            f"free {free_model}: pool indisponible (proxy_mode={proxy_mode}) — pas de direct résidentiel",
+            status_code=503,
+        )
+    wire_headers = _official_free_headers(endpoint or "", _body_conversation_key(body))
+    # [Lot 1] SystemOne répond du JSON brut `{model, answers, usage}` (jamais
+    # de SSE) : PAS de `_do_free_direct_request` ici — son stream forcé +
+    # collecte `_collect_chat_completion` transformerait le JSON en
+    # UpstreamError 502 « empty SSE collection ». POST httpx non-stream nu.
+    for _dt in range(2):  # essai + UN retry borné après Retry-After
+        try:
+            resp = await _ensure_http_client().post(
+                endpoint, content=_serialize_json_body(body), headers=wire_headers
+            )
+        except httpx.RequestError as e:
+            raise UpstreamError(f"free {free_model} direct failed: {type(e).__name__}: {e}", status_code=502) from e
+        except Exception as e:
+            raise UpstreamError(f"free {free_model} direct failed: {e}", status_code=502) from e
+        if resp.status_code != 429:
+            if resp.status_code == 200:
+                # [Lot 1 FIX c] Succès direct : même log d'usage que la jambe
+                # générique — tokens best-effort depuis le JSON SystemOne.
+                try:
+                    _d_data = _json_loads(resp.content)
+                    _d_usage = _d_data.get("usage", {}) if isinstance(_d_data, dict) else {}
+                    _d_in = int(_d_usage.get("input_tokens", 0) or 0)
+                    _d_out = int(_d_usage.get("output_tokens", 0) or 0)
+                except Exception:
+                    _d_in, _d_out = 0, 0
+                _log_free_model_usage(
+                    paid_model, free_model, "free (no auth)", "free (no auth)",
+                    200, _d_in, _d_out, int((time.monotonic() - t0) * 1000), ip="direct",
+                )
+            return resp
+        try:
+            _ra = (resp.headers.get("retry-after", "") or "") if getattr(resp, "headers", None) else ""
+        except Exception:
+            _ra = ""
+        _log_free_model_usage(
+            paid_model, free_model, "free (no auth)", "free (no auth)",
+            429, 0, 0, int((time.monotonic() - t0) * 1000), ip="direct",
+        )
+        # [Lot 1 FIX f] Clé direct déterministe : jamais la station tunnel
+        # stale ni la ContextVar du chemin pool. stations=[] = compteur seul
+        # (pas d'action par station), puis cooldown explicite sur la
+        # sentinelle _direct_station → "{model}|direct".
+        # [Lot 1 FIX d] Divergence documentée vs direct générique
+        # (single-shot) : SystemOne n'a pas de jambe paid de repli (le
+        # handler relaie directement), donc UN retry borné après un VRAI
+        # Retry-After est l'équivalent parité — mais jamais de seconde vague
+        # si le cooldown direct est déjà actif (check AVANT de poser le
+        # cooldown de ce 429, sinon le check serait trivialement vrai).
+        try:
+            if _free_cooldown_active(free_model, station=_direct_station):
+                _log(f"  FREE {free_model!r} RATE LIMITED (429) direct → cooldown actif, relai sans retry")
+                break
+        except Exception:
+            pass
+        _current_free_attempt.set({"ip": "direct", "identity": "", "station": None})
+        try:
+            _mark_free_stations_429(free_model, _ra, stations=[])
+        except Exception:
+            pass
+        try:
+            _set_free_cooldown(free_model, _free_429_cooldown_seconds(_ra), station=_direct_station)
+        except Exception:
+            pass
+        _log(f"  FREE {free_model!r} RATE LIMITED (429) direct → {'retry après Retry-After' if _dt == 0 else 'relai'}")
+        if _dt > 0:
+            break
+        try:
+            _wait = float(_ra)
+        except (TypeError, ValueError):
+            _wait = 0.0
+        if not 0 < _wait <= 60:
+            break  # pas de Retry-After exploitable → on relaie le vrai 429
+        try:
+            if os.getenv("PYTEST_CURRENT_TEST"):
+                _wait = 0.0
+        except Exception:
+            pass
+        if _wait > 0:
+            await asyncio.sleep(_wait)
+    return resp
+
+
 @app.post("/v1/systemone")
 async def systemone(request: Request):
     """Passthrough TypeSafe SystemOne (Jev) — PAS un endpoint de chat.
@@ -15066,11 +15419,15 @@ async def systemone(request: Request):
       { "model": "jev-1.13[-free]", "state": "...",
         "questions": { "<id>": { "type": "noul|choice|score", ... } } }
 
-    Routage d'auth (vérifié par probes live 2026-09-22) :
+    Routage d'auth :
       * `jev-1.13` (payant) → clé Zen du pool (round-robin + failover
         401/429/403, même mécanique que la jambe paid) ;
-      * `jev-1.13-free` → `Bearer public` anonyme direct (vérifié 200,
-        `cost: "0"`, sans rate-limit IP observé sur 15 appels rapprochés).
+      * `jev-1.13-free` → `Bearer public` (jamais la clé payante) VIA le
+        pool de tunnels comme les autres modèles free
+        (`_systemone_free_via_pool` : cooldown (modèle, IP) + rotation +
+        retry station fraîche sur 429 — Lot 1 parité 429). Repli direct
+        non-stream nu UNIQUEMENT si le pool est indispo en proxy_mode
+        direct ; fail-closed (503) en vpn/socks5.
 
     La réponse amont `{model, answers, usage}` est relayée telle quelle ;
     `usage` (input/output_tokens) alimente les compteurs + la DB comme
@@ -15155,9 +15512,13 @@ async def systemone(request: Request):
 
     try:
         if is_free:
-            resp = await _ensure_http_client().post(
-                endpoint, content=_serialize_json_body(body), headers=headers
-            )
+            # [Lot 1 parité 429 — Option A] Bearer public VIA tunnel pool
+            # (curl_cffi, Bun face) : rotation d'IP + cooldown (modèle, IP)
+            # gratuits, au lieu du direct sec. Fallback direct (option B)
+            # uniquement si le pool est indispo (proxy_mode fail-closed :
+            # jamais de direct quand vpn/socks5 est configuré). forced_pool=None
+            # (pas de géo sur systemone) + req_id (ctx fallback persistance).
+            resp = await _systemone_free_via_pool(endpoint, body, headers, forced_pool=None, req_id=req_id)
         else:
             resp, headers = await _do_request_with_retry(endpoint, body, headers, "openai")
     except UpstreamError as e:
@@ -15165,6 +15526,7 @@ async def systemone(request: Request):
             req_id, model_id, original_model, start_time, e.status_code, str(e),
             "openai", False, "none", "none", client_ip, account_alias, [],
             request_body=request_body, response_body={"error": str(e)[:2000]},
+            free_status=e.status_code if is_free else None,
             paid_status=None if is_free else e.status_code,
         )
         return JSONResponse(status_code=e.status_code, content={"error": str(e)})
@@ -15180,6 +15542,7 @@ async def systemone(request: Request):
             req_id, model_id, original_model, start_time, resp.status_code, err_text,
             "openai", False, "none", "none", client_ip, account_alias, [],
             request_body=request_body, response_body={"error": err_text[:2000]},
+            free_status=resp.status_code if is_free else None,
             paid_status=None if is_free else resp.status_code,
         )
         # Relayer le statut amont (402 solde vide, 401/429 quota…) tel quel,
@@ -15188,7 +15551,29 @@ async def systemone(request: Request):
             err_content = _json_loads(resp.content)
         except Exception:
             err_content = {"error": err_text[:500]}
-        return JSONResponse(status_code=resp.status_code, content=err_content)
+        # [Lot 1 FIX g] Forward du VRAI Retry-After amont (véridicité : jamais
+        # de valeur inventée — omis si absent/invalide). Valide = secondes
+        # 0<v<=86400 ou date HTTP future (email.utils déjà importé).
+        _ra_headers: dict = {}
+        try:
+            _ra_raw = ((resp.headers.get("retry-after", "") or "").strip()) if getattr(resp, "headers", None) else ""
+        except Exception:
+            _ra_raw = ""
+        if _ra_raw:
+            _ra_ok = False
+            try:
+                if 0 < float(_ra_raw) <= 86400:
+                    _ra_ok = True
+            except (TypeError, ValueError):
+                try:
+                    _ra_dt = email.utils.parsedate_to_datetime(_ra_raw)
+                    if _ra_dt is not None and _ra_dt.timestamp() > time.time():
+                        _ra_ok = True
+                except Exception:
+                    _ra_ok = False
+            if _ra_ok:
+                _ra_headers = {"Retry-After": _ra_raw}
+        return JSONResponse(status_code=resp.status_code, content=err_content, headers=_ra_headers or None)
 
     try:
         data = _json_loads(resp.content)
@@ -15197,6 +15582,7 @@ async def systemone(request: Request):
             req_id, model_id, original_model, start_time, 502, "Upstream returned non-JSON response",
             "openai", False, "none", "none", client_ip, account_alias, [],
             request_body=request_body, response_body={"error": "non-JSON upstream"},
+            free_status=502 if is_free else None,
             paid_status=None if is_free else 502,
         )
         return _openai_error(502, "Upstream returned non-JSON response")
@@ -15208,6 +15594,7 @@ async def systemone(request: Request):
         req_id, model_id, original_model, start_time, req_in, req_out, 0,
         "openai", False, "none", "none", client_ip, account_alias, [],
         request_body=request_body, response_body=data,
+        free_status=200 if is_free else None,
         paid_status=None if is_free else 200,
     )
     _update_token_usage(model_id, req_in, req_out, 0)
