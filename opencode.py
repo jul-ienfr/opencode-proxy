@@ -518,6 +518,7 @@ MAX_BODY_SIZE = yaml_get("upstream", "max_body_size", 10 * 1024 * 1024)
 # chaque wrapper lit ses globales À L'APPEL — un patch d'oc._conn ou
 # oc._db_queue continue de couler dans la logique déléguée.
 from app.router import route_for as _app_router_route_for  # noqa: E402  # [P5 tranche 3]
+from app.compaction import is_compaction_shape as _is_compaction_shape  # noqa: E402  # [Phase 1 compaction]
 from observability import db as _app_db  # noqa: E402
 
 MAX_BODY_STORAGE = _app_db.MAX_BODY_STORAGE
@@ -10029,13 +10030,17 @@ async def messages(request: Request):
     request_body = body  # Capture original request before mutation
     _debug(f"[messages] req_id={req_id} model={original_model!r} tools={tool_names} ip={client_ip}")
 
-    # [fix 20/08] Compact request detection + diagnostics
-    _thinking = body.get("thinking")
-    _is_compact = isinstance(_thinking, dict) and _thinking.get("type") == "compact"
-    _msg_count = len(body.get("messages", []))
-    if _is_compact or _msg_count > 50 or len(body_bytes) > 500000:
+    # [Phase 1 compaction] Détection shape stricte sur le body ORIGINAL
+    # (avant remap model / ensure_min_tokens / overrides) — sert à l'exclusion
+    # du response cache, au bypass 503 et au log [compaction].
+    try:
+        _is_compaction = bool(_is_compaction_shape(body))
+    except Exception:
+        _is_compaction = False
+    _msg_count = len(body.get("messages", [])) if isinstance(body.get("messages"), list) else 0
+    if _is_compaction:
         _log(
-            f"  [compact?] req_id={req_id} model={original_model!r} thinking={_thinking} msgs={_msg_count} body={len(body_bytes)}B"
+            f"  [compaction] req_id={req_id} model={original_model!r} msgs={_msg_count} body={len(body_bytes)}B"
         )
     if DEBUG:
         _debug(f"[messages] headers={_sanitize_headers(dict(request.headers))}")
@@ -10211,7 +10216,9 @@ async def messages(request: Request):
 
         if not is_stream:
             # Check cache
-            cache_key = _response_cache.make_key(body, body_bytes=body_bytes)
+            # [Phase 1 compaction] shape-compaction jamais cachée : un résumé
+            # servi rejoué (X-Cache: HIT) boucle côté client.
+            cache_key = None if _is_compaction else _response_cache.make_key(body, body_bytes=body_bytes)
             cached = _response_cache.get(cache_key) if cache_key else None
             if cached and cache_key:
                 cached_body, cached_headers = cached
@@ -10325,6 +10332,18 @@ async def messages(request: Request):
                         except UpstreamError as e:
                             return _anthropic_error(e.status_code, str(e))
                 if resp.status_code in (429, 401, 403):
+                    # [Phase 1 compaction] shape-compaction : relayer intact
+                    # (statut + Retry-After réel) au lieu de 503 — le client
+                    # sait backoffer sur 429 et doit voir les soucis d'auth.
+                    if _is_compaction:
+                        _pass = resp.headers.get("retry-after") or resp.headers.get("Retry-After")
+                        _pass_headers = {"Retry-After": _pass} if _pass else None
+                        return Response(
+                            content=resp.content,
+                            status_code=resp.status_code,
+                            media_type="application/json",
+                            headers=_pass_headers,
+                        )
                     return _anthropic_error(503, msg)
                 if resp.status_code == 499:
                     return _anthropic_error(502, msg)
@@ -10367,7 +10386,8 @@ async def messages(request: Request):
                 request_body=request_body,
                 response_body=data,
             )
-            if cache_key:
+            # [Phase 1 compaction] jamais de put sur shape-compaction.
+            if cache_key and not _is_compaction:
                 _response_cache.put(cache_key, resp.content, {"Content-Type": "application/json"})
             # success headers (minimized X-Geo-*)
             _succ_geo = {}
@@ -10700,7 +10720,13 @@ async def messages(request: Request):
                             # Convert 429/401/403 → 503 to avoid Claude Code auth window
                             # (statut normalisé inutile ici : HTTP déjà 200 en streaming,
                             # seul err_msg atteint le client)
-                            if resp.status_code == 429:
+                            # [Phase 1 compaction] shape-compaction : relayer statut
+                            # + body upstream intacts (overflow reconnaissable).
+                            if _is_compaction:
+                                err_msg = (
+                                    f"HTTP {resp.status_code}: {err.decode('utf-8', errors='replace')[:500]}"
+                                )
+                            elif resp.status_code == 429:
                                 err_msg = "All API keys exhausted (rate limited). Try again later."
                             elif resp.status_code in (401, 403):
                                 # [Étape 2C — C1] corrélé free→paid par req_id : préfixe free_status si fallback.
@@ -11326,7 +11352,8 @@ async def messages(request: Request):
 
     if not is_stream:
         # Cache check for OpenAI-protocol via /v1/messages (mirrors anthropic branch)
-        cache_key = _response_cache.make_key(body, body_bytes=body_bytes)
+        # [Phase 1 compaction] shape-compaction jamais cachée (idem branche anthropic).
+        cache_key = None if _is_compaction else _response_cache.make_key(body, body_bytes=body_bytes)
         cached = _response_cache.get(cache_key) if cache_key else None
         if cached and cache_key:
             cached_body, cached_headers = cached
@@ -11463,6 +11490,32 @@ async def messages(request: Request):
                         return _anthropic_error(e.status_code, str(e))
             # Convert 429/401/403 → 503 to avoid Claude Code auth window
             if resp.status_code in (429, 401, 403):
+                # [Phase 1 compaction] shape-compaction : relayer intact
+                # (statut + body upstream) au lieu de 503 — miroir branche anthropic.
+                if _is_compaction:
+                    try:
+                        err_data = _json_loads(resp.content)
+                        err_msg = err_data.get("error", {})
+                        if isinstance(err_msg, dict):
+                            err_msg = err_msg.get("message", resp.text[:200])
+                    except Exception:
+                        err_msg = resp.text[:200]
+                    anthro_err = _json_dumps_str(
+                        {
+                            "type": "error",
+                            "error": {
+                                "type": "api_error",
+                                "message": f"HTTP {resp.status_code}: {err_msg}",
+                            },
+                        },
+                        ensure_ascii=False,
+                    )
+                    _pass = resp.headers.get("retry-after") or resp.headers.get("Retry-After")
+                    _pass_headers = {"Retry-After": _pass} if _pass else None
+                    return Response(
+                        content=anthro_err, status_code=resp.status_code, media_type="application/json",
+                        headers=_pass_headers,
+                    )
                 # [Étape 2B — B1] 403 DataPolicyError → message explicite
                 # (URL opt-in + alias) ; vrai 403 → texte région conservé.
                 # [Étape 2C — C1] corrélé free→paid par req_id : préfixe free_status si fallback.
@@ -11566,7 +11619,8 @@ async def messages(request: Request):
             response_body=data,
         )
         anthro_bytes = _json_dumps_str(anthro_resp, ensure_ascii=False).encode()
-        if cache_key:
+        # [Phase 1 compaction] jamais de put sur shape-compaction.
+        if cache_key and not _is_compaction:
             _response_cache.put(cache_key, anthro_bytes, {"Content-Type": "application/json"})
         return Response(content=anthro_bytes, headers={"X-Cache": "MISS"}, media_type="application/json")
 
@@ -12803,6 +12857,18 @@ async def chat_completions(request: Request):
     tool_names = _extract_tool_names(body)
     request_body = body  # Capture original request before mutation
     _debug(f"[chat] req_id={req_id} model={original_model!r} tools={tool_names} ip={client_ip}")
+    # [Phase 1 compaction] Détection shape stricte sur le body ORIGINAL
+    # (avant remap model / ensure_min_tokens) — miroir du handler messages.
+    try:
+        _is_compaction = bool(_is_compaction_shape(body))
+    except Exception:
+        _is_compaction = False
+    if _is_compaction:
+        _msgs = body.get("messages", [])
+        _n = len(_msgs) if isinstance(_msgs, list) else 0
+        _log(
+            f"  [compaction] req_id={req_id} model={original_model!r} msgs={_n} body={len(body_bytes)}B"
+        )
     if DEBUG:
         _debug(f"[chat] headers={_sanitize_headers(dict(request.headers))}")
         _debug(f"[chat] body=\n{_redact(_truncate(body))}")
@@ -13002,7 +13068,8 @@ async def chat_completions(request: Request):
 
         if not is_stream:
             # Response cache (mirrors the anthropic non-stream handler) [8]
-            cache_key = _response_cache.make_key(body, body_bytes=body_bytes)
+            # [Phase 1 compaction] shape-compaction jamais cachée (idem messages).
+            cache_key = None if _is_compaction else _response_cache.make_key(body, body_bytes=body_bytes)
             cached = cache_key and _response_cache.get(cache_key)
             if cached:
                 cached_body, cached_headers = cached
@@ -13110,6 +13177,17 @@ async def chat_completions(request: Request):
                             return JSONResponse(status_code=e.status_code, content={"error": str(e)})
                 # Convert 429/401/403 → 503 to avoid Claude Code auth window
                 if resp.status_code in (429, 401, 403):
+                    # [Phase 1 compaction] shape-compaction : relayer intact
+                    # (statut + Retry-After réel) au lieu de 503 — miroir messages.
+                    if _is_compaction:
+                        _pass = resp.headers.get("retry-after") or resp.headers.get("Retry-After")
+                        _pass_headers = {"Retry-After": _pass} if _pass else None
+                        return Response(
+                            content=resp.content,
+                            status_code=resp.status_code,
+                            media_type="application/json",
+                            headers=_pass_headers,
+                        )
                     # [C0] corrélation paid par req_id (logging-only) : statut + body upstream
                     _debug(
                         f"  [paid] req_id={req_id} leg=paid paid_status={resp.status_code} host={urllib.parse.urlparse(endpoint).hostname} body={_redact(resp.text, 500)}"
@@ -13194,7 +13272,7 @@ async def chat_completions(request: Request):
                         request_body=request_body,
                         response_body=chat_resp,
                     )
-                    if cache_key:
+                    if cache_key and not _is_compaction:
                         _response_cache.put(cache_key, body_bytes, {"Content-Type": "application/json"})
                     return Response(content=body_bytes, headers={"X-Cache": "MISS"}, media_type="application/json")
                 except Exception as e:
@@ -13228,14 +13306,16 @@ async def chat_completions(request: Request):
             # [TROU 2 — A8] Si un rename a eu lieu à l'aller, on rend le corps
             # restauré (sinon le passthrough reste bytes-amont VERBATIM).
             if _restored_body_bytes is not None:
-                if cache_key:
+                # [Phase 1 compaction] jamais de put sur shape-compaction.
+                if cache_key and not _is_compaction:
                     _response_cache.put(cache_key, _restored_body_bytes, {"Content-Type": "application/json"})
                 return Response(
                     content=_restored_body_bytes, headers={"X-Cache": "MISS"}, media_type="application/json"
                 )
             # [v10 §14.3.26] garde manquante sur cette branche : cache_key None
             # polluait le store LRU d'une entrée clé None.
-            if cache_key:
+            # [Phase 1 compaction] jamais de put sur shape-compaction.
+            if cache_key and not _is_compaction:
                 _response_cache.put(cache_key, resp.content, {"Content-Type": "application/json"})
             return Response(content=resp.content, headers={"X-Cache": "MISS"}, media_type="application/json")
 
@@ -13568,7 +13648,13 @@ async def chat_completions(request: Request):
                                     f"  [paid-stream] req_id={req_id} leg=paid paid_status={resp.status_code} host={urllib.parse.urlparse(endpoint).hostname} body={_redact(err, 500)!r}"
                                 )
                             # Convert 429/401/403 → 503 to avoid Claude Code auth window
-                            if resp.status_code == 429:
+                            # [Phase 1 compaction] shape-compaction : relayer statut
+                            # + body upstream intacts (overflow reconnaissable).
+                            if _is_compaction:
+                                err_msg = (
+                                    f"HTTP {resp.status_code}: {err.decode('utf-8', errors='replace')[:500]}"
+                                )
+                            elif resp.status_code == 429:
                                 err_msg = "All API keys exhausted (rate limited). Try again later."
                             elif resp.status_code in (401, 403):
                                 # [Étape 2C — C1] corrélé free→paid par req_id : préfixe free_status si fallback.
@@ -14324,6 +14410,17 @@ async def chat_completions(request: Request):
             )
             # Convert 429/401/403 → 503 to avoid Claude Code auth window
             if resp.status_code in (429, 401, 403):
+                # [Phase 1 compaction] shape-compaction : relayer intact
+                # (statut + body upstream) au lieu de 503 — miroir messages/chat.
+                if _is_compaction:
+                    _pass = resp.headers.get("retry-after") or resp.headers.get("Retry-After")
+                    _pass_headers = {"Retry-After": _pass} if _pass else None
+                    return Response(
+                        content=resp.content,
+                        status_code=resp.status_code,
+                        media_type="application/json",
+                        headers=_pass_headers,
+                    )
                 # [Étape 2C — C1] corrélé free→paid par req_id : préfixe free_status si fallback.
                 return _openai_error(
                     503,
@@ -14669,7 +14766,11 @@ async def chat_completions(request: Request):
                             request_body=request_body,
                         )
                         # Convert 429/401/403 → 503 to avoid Claude Code auth window
-                        if resp.status_code == 429:
+                        # [Phase 1 compaction] shape-compaction : relayer statut
+                        # + body upstream intacts (overflow reconnaissable).
+                        if _is_compaction:
+                            err_msg = f"HTTP {resp.status_code}: {err.decode('utf-8', errors='replace')[:500]}"
+                        elif resp.status_code == 429:
                             err_msg = "All API keys exhausted (rate limited). Try again later."
                         elif resp.status_code in (401, 403):
                             # [Étape 2C — C1] corrélé free→paid par req_id : préfixe free_status si fallback.
@@ -15478,8 +15579,18 @@ async def systemone(request: Request):
     _debug(f"[systemone] route: {original_model!r} → {model_id} | endpoint={endpoint}")
 
     # ── Validation du format SystemOne (doc TypeSafe) ──
-    if not isinstance(body.get("state"), str) or not body["state"].strip():
-        return _openai_error(400, "missing required field: 'state' (string)")
+    # `state` : string non-vide OU objet non-vide, relayé tel quel vers
+    # l'amont (passthrough — le proxy ne valide pas plus strict que
+    # opencode.ai ; stringifier un dict ici casserait l'évaluation amont).
+    _state = body.get("state")
+    if isinstance(_state, str):
+        _state_ok = bool(_state.strip())
+    elif isinstance(_state, dict):
+        _state_ok = bool(_state)
+    else:
+        _state_ok = False
+    if not _state_ok:
+        return _openai_error(400, "missing required field: 'state' (string or object)")
     questions = body.get("questions")
     if not isinstance(questions, dict) or not questions:
         return _openai_error(400, "missing required field: 'questions' (non-empty object)")
@@ -15628,6 +15739,14 @@ async def responses(request: Request):
     original_model = body.get("model", "")
     tool_names = _extract_tool_names(body)
     request_body = body  # Capture original request before mutation
+    # [Phase 1 compaction] Détection shape stricte sur le body ORIGINAL
+    # (avant remap model / conversions) — miroir des handlers messages/chat.
+    try:
+        _is_compaction = bool(_is_compaction_shape(body))
+    except Exception:
+        _is_compaction = False
+    if _is_compaction:
+        _log(f"  [compaction] req_id={req_id} model={original_model!r} body={len(body_bytes)}B (responses)")
     route = _route_for(original_model)
     if route is None:
         available = sorted(MODELS.keys())
@@ -15825,7 +15944,8 @@ async def responses(request: Request):
                 )
         if not is_stream:
             # Response cache (mirrors the anthropic/chat handlers)
-            cache_key = _response_cache.make_key(body, body_bytes=body_bytes)
+            # [Phase 1 compaction] shape-compaction jamais cachée (idem messages/chat).
+            cache_key = None if _is_compaction else _response_cache.make_key(body, body_bytes=body_bytes)
             cached = cache_key and _response_cache.get(cache_key)
             if cached:
                 cached_body, cached_headers = cached
@@ -15923,6 +16043,17 @@ async def responses(request: Request):
                             return JSONResponse(status_code=e.status_code, content={"error": str(e)})
                 # Convert 429/401/403 → 503 to avoid Claude Code auth window
                 if resp.status_code in (429, 401, 403):
+                    # [Phase 1 compaction] shape-compaction : relayer intact
+                    # (statut réel) au lieu de 503 — miroir messages/chat.
+                    if _is_compaction:
+                        _pass = a_headers.get("retry-after") or a_headers.get("Retry-After")
+                        _pass_headers = {"Retry-After": _pass} if _pass else None
+                        return Response(
+                            content=resp.content,
+                            status_code=resp.status_code,
+                            media_type="application/json",
+                            headers=_pass_headers,
+                        )
                     return _openai_error(
                         503,
                         _correlated_403_message(
@@ -15978,7 +16109,8 @@ async def responses(request: Request):
             )
             oai_resp = anthropic_to_openai_responses(data, original_model, anthro_body.get(_TOOL_NAME_MAP_KEY))
             _response_body = _json_dumps_str(oai_resp, ensure_ascii=False).encode()
-            if cache_key:
+            # [Phase 1 compaction] shape-compaction : jamais mise en cache.
+            if cache_key and not _is_compaction:
                 _response_cache.put(cache_key, _response_body, {"Content-Type": "application/json"})
             return Response(content=_response_body, media_type="application/json")
         # Anthropic streaming → collect, then emit SSE
@@ -16027,7 +16159,15 @@ async def responses(request: Request):
         except UpstreamError as e:
             return JSONResponse(status_code=e.status_code, content={"error": str(e)})
         account_alias = _alias_for_key(a_headers.get("x-api-key", ""))
+        # [Phase 1 compaction] Sur shape-compaction, mémoriser l'erreur stream
+        # pour l'event SSE reconnaissable (resp fermée après _log_and_save_error).
+        _comp_err: tuple[int, str] | None = None
         if resp.status_code != 200:
+            if _is_compaction:
+                try:
+                    _comp_err = (resp.status_code, resp.text[:500])
+                except Exception:
+                    _comp_err = (resp.status_code, "")
             await _log_and_save_error(
                 req_id,
                 model_id,
@@ -16049,6 +16189,19 @@ async def responses(request: Request):
             )
 
             async def err_stream():
+                # [Phase 1 compaction] shape-compaction : erreur SSE reconnaissable
+                # (statut + body upstream) au lieu du seul [DONE] aveugle.
+                if _comp_err is not None:
+                    _st, _bd = _comp_err
+                    yield (
+                        b"data: "
+                        + _json_dumps_str(
+                            {"error": {"message": f"HTTP {_st}: {_bd}", "type": "api_error"}},
+                            ensure_ascii=False,
+                        ).encode()
+                        + b"\n\ndata: [DONE]\n\n"
+                    )
+                    return
                 yield b"data: [DONE]\n\n"
 
             return StreamingResponse(
@@ -16222,7 +16375,8 @@ async def responses(request: Request):
 
     if not is_stream:
         # Response cache (mirrors the anthropic/chat handlers)
-        cache_key = _response_cache.make_key(body, body_bytes=body_bytes)
+        # [Phase 1 compaction] shape-compaction : jamais mise en cache.
+        cache_key = None if _is_compaction else _response_cache.make_key(body, body_bytes=body_bytes)
         cached = cache_key and _response_cache.get(cache_key)
         if cached:
             cached_body, cached_headers = cached
@@ -16285,6 +16439,26 @@ async def responses(request: Request):
             )
             # Convert 429/401/403 → 503 to avoid Claude Code auth window
             if resp.status_code in (429, 401, 403):
+                # [Phase 1 compaction] shape-compaction : relayer intact
+                # (statut + body upstream) au lieu de 503 — miroir anthropic/chat.
+                if _is_compaction:
+                    try:
+                        err_data = _json_loads(resp.content)
+                        err_msg = err_data.get("error", {})
+                        if isinstance(err_msg, dict):
+                            err_msg = err_msg.get("message", resp.text[:200])
+                    except Exception:
+                        err_msg = resp.text[:200]
+                    oai_err = _json_dumps_str(
+                        {"error": {"message": f"HTTP {resp.status_code}: {err_msg}", "type": "api_error"}},
+                        ensure_ascii=False,
+                    )
+                    _pass = resp.headers.get("retry-after") or resp.headers.get("Retry-After")
+                    _pass_headers = {"Retry-After": _pass} if _pass else None
+                    return Response(
+                        content=oai_err, status_code=resp.status_code, media_type="application/json",
+                        headers=_pass_headers,
+                    )
                 return _openai_error(
                     503,
                     _correlated_403_message(
@@ -16367,7 +16541,8 @@ async def responses(request: Request):
             # Chat Completions format — convert to Responses API
             oai_resp = openai_chat_to_responses(data, original_model, _out_tool_map)
         _response_body = _json_dumps_str(oai_resp, ensure_ascii=False).encode()
-        if cache_key:
+        # [Phase 1 compaction] shape-compaction : jamais mise en cache.
+        if cache_key and not _is_compaction:
             _response_cache.put(cache_key, _response_body, {"Content-Type": "application/json"})
         return Response(content=_response_body, media_type="application/json")
 
@@ -16399,7 +16574,15 @@ async def responses(request: Request):
             ) as resp:
                 headers = dict(resp.headers)
                 account_alias = _alias_for_key(_key_from_headers(headers, "openai"))
+                # [Phase 1 compaction] Sur shape-compaction, mémoriser l'erreur
+                # stream pour l'event SSE reconnaissable (resp fermée après log).
+                _geo_comp_err: tuple[int, str] | None = None
                 if resp.status_code != 200:
+                    if _is_compaction:
+                        try:
+                            _geo_comp_err = (resp.status_code, resp.text[:500])
+                        except Exception:
+                            _geo_comp_err = (resp.status_code, "")
                     await _log_and_save_error(
                         req_id,
                         model_id,
@@ -16421,6 +16604,19 @@ async def responses(request: Request):
                     )
 
                     async def err_stream():
+                        # [Phase 1 compaction] shape-compaction : erreur SSE
+                        # reconnaissable au lieu du seul [DONE] aveugle.
+                        if _geo_comp_err is not None:
+                            _st, _bd = _geo_comp_err
+                            yield (
+                                b"data: "
+                                + _json_dumps_str(
+                                    {"error": {"message": f"HTTP {_st}: {_bd}", "type": "api_error"}},
+                                    ensure_ascii=False,
+                                ).encode()
+                                + b"\n\ndata: [DONE]\n\n"
+                            )
+                            return
                         yield b"data: [DONE]\n\n"
 
                     return StreamingResponse(
@@ -16497,7 +16693,15 @@ async def responses(request: Request):
     except UpstreamError as e:
         return JSONResponse(status_code=e.status_code, content={"error": str(e)})
     account_alias = _alias_for_key(_key_from_headers(headers, "openai"))
+    # [Phase 1 compaction] Sur shape-compaction, mémoriser l'erreur stream
+    # pour l'event SSE reconnaissable (resp fermée après _log_and_save_error).
+    _oai_comp_err: tuple[int, str] | None = None
     if resp.status_code != 200:
+        if _is_compaction:
+            try:
+                _oai_comp_err = (resp.status_code, resp.text[:500])
+            except Exception:
+                _oai_comp_err = (resp.status_code, "")
         await _log_and_save_error(
             req_id,
             model_id,
@@ -16519,6 +16723,19 @@ async def responses(request: Request):
         )
 
         async def err_stream():
+            # [Phase 1 compaction] shape-compaction : erreur SSE reconnaissable
+            # (statut + body upstream) au lieu du seul [DONE] aveugle.
+            if _oai_comp_err is not None:
+                _st, _bd = _oai_comp_err
+                yield (
+                    b"data: "
+                    + _json_dumps_str(
+                        {"error": {"message": f"HTTP {_st}: {_bd}", "type": "api_error"}},
+                        ensure_ascii=False,
+                    ).encode()
+                    + b"\n\ndata: [DONE]\n\n"
+                )
+                return
             yield b"data: [DONE]\n\n"
 
         return StreamingResponse(
