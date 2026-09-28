@@ -10,6 +10,7 @@ from .settings import CONFIG_PATH as CONFIG_PATH
 from .settings import CUSTOM_ROUTES as CUSTOM_ROUTES
 from .settings import DEBUG as DEBUG
 from .settings import DISABLE_MAPPING as DISABLE_MAPPING
+from .settings import FAMILY_CAPABILITIES as FAMILY_CAPABILITIES
 from .settings import FREE_DISCOVERY_AUTO_PERSIST as FREE_DISCOVERY_AUTO_PERSIST
 from .settings import FREE_DISCOVERY_DEFAULT_TARGET as FREE_DISCOVERY_DEFAULT_TARGET
 from .settings import FREE_DISCOVERY_ENABLED as FREE_DISCOVERY_ENABLED
@@ -23,6 +24,7 @@ from .settings import GEO_POLICIES as GEO_POLICIES
 from .settings import GEO_VERSION as GEO_VERSION
 from .settings import HOST as HOST
 from .settings import IP_ROTATION as IP_ROTATION
+from .settings import MODEL_API_FAMILIES as MODEL_API_FAMILIES
 from .settings import MODELS as MODELS
 from .settings import PORT as PORT
 from .settings import PROXY as PROXY
@@ -30,19 +32,18 @@ from .settings import ROUTES as ROUTES
 from .settings import SORTED_CUSTOM_ROUTES as SORTED_CUSTOM_ROUTES
 from .settings import SORTED_GEO_POLICIES as SORTED_GEO_POLICIES
 from .settings import SORTED_ROUTES as SORTED_ROUTES
+from .settings import UNKNOWN_MODEL_CAPABILITIES as UNKNOWN_MODEL_CAPABILITIES
 from .settings import WEB_SEARCH_NATIVE_MODELS as WEB_SEARCH_NATIVE_MODELS
 from .settings import _free_endpoint_for as _free_endpoint_for
 from .settings import _normalize_geo_list as _normalize_geo_list
 from .settings import _resolve_geo_extends as _resolve_geo_extends
 from .settings import _server_countries_set as _server_countries_set
 from .settings import apply_server_changes as apply_server_changes
-from .settings import FAMILY_CAPABILITIES as FAMILY_CAPABILITIES
-from .settings import MODEL_API_FAMILIES as MODEL_API_FAMILIES
-from .settings import UNKNOWN_MODEL_CAPABILITIES as UNKNOWN_MODEL_CAPABILITIES
 from .settings import geo_strict_union as geo_strict_union
 from .settings import get_model_api as get_model_api
 from .settings import get_model_capabilities as get_model_capabilities
 from .settings import get_model_config as get_model_config
+from .settings import get_server_compaction as get_server_compaction
 from .settings import load_custom_routes as load_custom_routes
 from .settings import maybe_reload_custom_routes as maybe_reload_custom_routes
 from .settings import resolve_geo as resolve_geo
@@ -99,6 +100,7 @@ __all__ = [
     "get_model_api",
     "get_model_capabilities",
     "get_model_config",
+    "get_server_compaction",
     "load_custom_routes",
     "maybe_reload_custom_routes",
     "resolve_geo",

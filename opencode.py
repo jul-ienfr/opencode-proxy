@@ -64,6 +64,7 @@ from config import (
     PROXY,
     ROUTES,
     get_model_config,
+    get_server_compaction,
     maybe_reload_custom_routes,
     yaml_get,
 )
@@ -517,8 +518,16 @@ MAX_BODY_SIZE = yaml_get("upstream", "max_body_size", 10 * 1024 * 1024)
 # oc._quick_body_size / monkeypatch.setattr(oc, "_conn"|"_db_queue")) :
 # chaque wrapper lit ses globales À L'APPEL — un patch d'oc._conn ou
 # oc._db_queue continue de couler dans la logique déléguée.
+from app.compaction import is_compaction_shape as _is_compaction_shape  # noqa: E402  # [Phase 1+2 compaction]
+from app.compaction import is_native_compaction as _is_native_compaction  # noqa: E402  # [Compaction natifs]
+from app.compaction import maybe_condense as _maybe_condense  # noqa: E402  # [Phase 2 compaction]
+from app.compaction.classify import has_free_leg as _classify_has_free_leg  # noqa: E402  # [Compaction voie unifiée]
+from app.compaction.classify import is_free_class as _classify_is_free_class  # noqa: E402
+from app.compaction.plan import summarizer_plan as _plan_summarizer_plan  # noqa: E402
+from app.compaction.transport import normalize_free_responses as _transport_normalize  # noqa: E402
+from app.compaction.transport import summarizer_headers as _transport_headers  # noqa: E402
+from app.compaction.transport import summarizer_request as _transport_request  # noqa: E402
 from app.router import route_for as _app_router_route_for  # noqa: E402  # [P5 tranche 3]
-from app.compaction import is_compaction_shape as _is_compaction_shape  # noqa: E402  # [Phase 1 compaction]
 from observability import db as _app_db  # noqa: E402
 
 MAX_BODY_STORAGE = _app_db.MAX_BODY_STORAGE
@@ -4655,11 +4664,66 @@ _OPENCODE_OFFICIAL_UA_RESPONSES = os.getenv(
     "OPENCODE_OFFICIAL_UA_RESPONSES",
     "opencode/1.18.31 ai-sdk/provider-utils/4.0.40 runtime/bun/1.3.14",
 )
-# Nom de client officiel (capture desktop ; le CLI envoie « cli » par
-# défaut — OPENCODE_CLIENT=cli côté client, cf. runtime-flags.ts).
-_OPENCODE_CLIENT_NAME = os.getenv("OPENCODE_CLIENT_NAME", "desktop")
-# Projet officiel (capture : projet global, cf. ProjectV2.ID.global).
-_OPENCODE_PROJECT = os.getenv("OPENCODE_PROJECT", "global")
+# Nom de client officiel. Enum RÉELLE extraite du binaire 1.18.31 :
+#   ["app","cli","desktop"].includes(t.client)
+# Le CLI `opencode run` envoie « cli » — MESURÉ 243 fois sur le captureur
+# (provider `opencodeproxy`) et 20 fois dans logs/debug.log. La valeur
+# « desktop » n'apparaît dans AUCUNE de nos captures du vrai client.
+_OPENCODE_CLIENT_NAME = os.getenv("OPENCODE_CLIENT_NAME", "cli")
+
+
+def _official_project_id() -> str:
+    """``x-opencode-project`` officiel = ID de projet, PAS une constante.
+
+    Dérivation extraite du binaire 1.18.31 (``Project.resolve``) :
+        let F = repo.discover(dir)
+        if(!F) return {id: ID.global}                      # hors dépôt git
+        let I = readFileString(join(commonDirectory,"opencode"))  # fichier .git/opencode
+        let L = (git remote get-url origin → hash) ?? I ?? rootCommit
+        return {id: L ?? ID.global}
+
+    Donc : hors dépôt → « global » ; sinon le contenu de
+    ``<git-common-dir>/opencode`` s'il existe (c'est le cas ici : il contient
+    ``a24ad984335289d5bb037e290b55f7fb5e04ce6b``, EXACTEMENT la valeur
+    observée chez le vrai client), à défaut le hash du remote, à défaut le
+    commit racine.
+
+    Le gate 403 ne discrimine PAS cette valeur (4 variantes testées → 200) :
+    c'est de la fidélité de copie, pas une condition d'accès. On reste
+    néanmoins fidèle puisque c'est l'instruction.
+    """
+    import subprocess as _sp
+
+    def _git(*args: str) -> str:
+        try:
+            r = _sp.run(
+                ["git", *args], capture_output=True, text=True, timeout=5, check=False
+            )
+            return r.stdout.strip() if r.returncode == 0 else ""
+        except Exception:
+            return ""
+
+    try:
+        common = _git("rev-parse", "--git-common-dir")
+        if common:
+            p = common if os.path.isabs(common) else os.path.join(os.getcwd(), common)
+            f = os.path.join(p, "opencode")
+            if os.path.isfile(f):
+                with open(f, encoding="utf-8", errors="replace") as fh:
+                    v = fh.read().strip()
+                if v:
+                    return v
+        root = _git("rev-list", "--max-parents=0", "HEAD").splitlines()
+        if root and root[0].strip():
+            return root[0].strip()
+    except Exception:
+        pass
+    return "global"
+
+
+# Résolu une fois au chargement (le client le fait aussi par session) puis
+# mémoïsé : pas de `git` sur le chemin chaud d'une requête.
+_OPENCODE_PROJECT = os.getenv("OPENCODE_PROJECT") or _official_project_id()
 # Endpoint amont TypeSafe SystemOne (Jev) — documenté :
 # https://opencode.ai/docs/fr/zen/#jev — ni /chat/completions ni /messages
 # ni /responses : le corps est {model, state, questions}. Vérifié live
@@ -4680,19 +4744,26 @@ _SYSTEMONE_ENDPOINT = os.getenv(
 #     (+ pad) — et PAS d'ECH (le Bun standalone en met, le binaire non).
 #   * HTTP/1.1 : headers utilisateur TRIÉS (spec fetch — mesuré sur le wire),
 #     puis Connection/Host/Accept-Encoding/Content-Length ajoutés par Bun.
-# Rejeu via curl_cffi — recette validée au captureur (ClientHello
-# byte-identique au binaire officiel modulo clés éphémères) :
+# Rejeu via curl_cffi — recette validée au captureur (ClientHello conforme au
+# binaire officiel, MESURÉ) :
 # preset chrome131 (porteur : émission OCSP/SCT) + ja3 Bun + sigalgs +
 # tls_grease False + http_version v1 + default_headers False (sans quoi les
 # headers navigateur du preset — sec-ch-ua, Sec-Fetch-*, Accept-Language —
-# polluent le wire, MESURÉ). L'ECH listé dans le ja3 n'est pas émis (pas de
-# payload exprimable — le client n'en met pas non plus : match exact).
-# Surchageable (kill-switch preset navigateur si le replay casse un jour :
+# polluent le wire, MESURÉ).
+# [65037 — CORRIGÉ] La version précédente portait 65037 (ALPS/ECH) dans la
+# liste d'extensions en croyant qu'elle ne serait pas émise. MESURE DIRECTE
+# du vrai binaire (opencode.exe lancé contre un captureur TLS local) : le
+# client émet 13 extensions — 0, 23, 65281, 10, 11, 35, 16, 5, 13, 18, 51,
+# 45, 43 — et AUCUN 65037. Avec 65037 le proxy émettait une extension en
+# trop dont la longueur VARIE aléatoirement (186/218/250/282 octets -> 4
+# profils distincts, empreinte instable). Retiré : le profil devient
+# exactement celui du binaire (vérifié, sonde AQ).
+# Surchargeable (kill-switch preset navigateur si le replay casse un jour :
 # OPENCODE_TLS_IMPERSONATE=chrome131).
 _OPENCODE_JA3 = os.getenv(
     "OPENCODE_JA3",
     "771,4865-4866-4867-49195-49199-49196-49200-52393-52392-49161-49171"
-    "-49162-49172-156-157-47-53,0-65037-23-65281-10-11-35-16-5-13-18-51-45-43,"
+    "-49162-49172-156-157-47-53,0-23-65281-10-11-35-16-5-13-18-51-45-43,"
     "29-23-24,0",
 )
 # Les 9 signature_algorithms de Bun (noms OpenSSL — 1027,2052,1025,1283,2053,
@@ -4709,6 +4780,45 @@ _OPENCODE_SIG_ALGS = (
     "rsa_pkcs1_sha1",
 )
 _OPENCODE_TLS_IMPERSONATE = os.getenv("OPENCODE_TLS_IMPERSONATE", "")
+# [wire complet] Pose-t-on les 4 en-têtes de transport dans l'ordre du client ?
+# MESURÉ : le vrai client envoie 12 en-têtes, notre jambe free n'en envoyait
+# que 10 — il manquait Connection + Accept, Host était en 1re position au lieu
+# de la 10e, et Accept-Encoding valait « gzip, deflate, br » au lieu de
+# « gzip, deflate, br, zstd ». Kill-switch si un jour le gate les refuse.
+_FREE_WIRE_FULL_HEADERS = os.getenv("OPENCODE_FREE_WIRE_FULL_HEADERS", "1") not in (
+    "0",
+    "false",
+    "False",
+    "",
+)
+# Accept-Encoding du client Bun — MESURÉ sur 243 requêtes. On l'annonce
+# maintenant qu'on sait que curl_cffi décode zstd (libcurl/8.21.0 zstd/1.5.7 ;
+# 6/6 cas gzip/br/zstd décodés avec AE explicite, probe E2).
+_OPENCODE_ACCEPT_ENCODING = os.getenv(
+    "OPENCODE_ACCEPT_ENCODING", "gzip, deflate, br, zstd"
+)
+# [ordre exact] Ordre des en-têtes sur le fil — MESURÉ 243× sur le client.
+# curl_cffi expose l'option libcurl-impersonate CURLOPT_HTTPHEADER_ORDER
+# (11030) via ExtraFingerprints.header_order. Sans elle, libcurl émet NOTRE
+# Connection en DERNIÈRE position (il ne la génère pas lui-même : sans elle
+# fournie, aucune Connection ne part — prouvé, probe AD) et décale de 4 rangs
+# les en-têtes suivants.
+# Forme attendue : une CHAÎNE séparée par des virgules (une liste fait
+# échouer le binding cffi : « initializer for ctype 'void *' must be a cdata
+# pointer, not list »).
+# Kill-switch : OPENCODE_FREE_HEADER_ORDER=0.
+_OPENCODE_HEADER_ORDER = os.getenv(
+    "OPENCODE_FREE_HEADER_ORDER",
+    "Authorization,Content-Type,User-Agent,x-opencode-client,x-opencode-project,"
+    "x-opencode-request,x-opencode-session,Connection,Accept,Host,Accept-Encoding,"
+    "Content-Length",
+)
+_FREE_HEADER_ORDER_ON = os.getenv("OPENCODE_FREE_HEADER_ORDER_ON", "1") not in (
+    "0",
+    "false",
+    "False",
+    "",
+)
 
 
 def _free_fp_override() -> dict:
@@ -4723,20 +4833,26 @@ def _free_fp_override() -> dict:
         ALPN http/1.1, key_share x25519 unique, ordre d'extensions Bun),
       * ``tls_signature_algorithms`` = les 9 sigalgs Bun (noms OpenSSL),
       * ``tls_grease`` False (Bun ne grease rien — vérifié sur 6 captures),
-      * ``http_version`` "v1" (= V1_1 : Bun n'offre que http/1.1 en ALPN).
+      * ``http_version`` "v1" (= V1_1 : Bun n'offre que http/1.1 en ALPN),
+      * ``header_order`` = l'ordre EXACT des 12 en-têtes du client (voir
+        _OPENCODE_HEADER_ORDER). C'est ce qui place ``Connection`` en 8e
+        position comme le client, au lieu de la dernière (limite libcurl).
     Données pures (pas d'import curl_cffi ici — la factory garde son import
     paresseux + son garde). Kill-switch : si OPENCODE_TLS_IMPERSONATE est
     posé, retourne {} et l'appelant utilise le preset navigateur seul.
     """
     if _OPENCODE_TLS_IMPERSONATE:
         return {}
+    fp = {
+        "tls_signature_algorithms": list(_OPENCODE_SIG_ALGS),
+        "tls_grease": False,
+    }
+    if _FREE_HEADER_ORDER_ON and _OPENCODE_HEADER_ORDER:
+        fp["header_order"] = _OPENCODE_HEADER_ORDER
     return {
         "impersonate": "chrome131",
         "ja3": _OPENCODE_JA3,
-        "extra_fp": {
-            "tls_signature_algorithms": list(_OPENCODE_SIG_ALGS),
-            "tls_grease": False,
-        },
+        "extra_fp": fp,
         "http_version": "v1",
         "default_headers": False,
     }
@@ -4800,6 +4916,18 @@ def _free_wire_body(body, force_stream: bool = False):
     stream_forcé_ici est True, l'appelant a basculé un corps non-stream en
     stream:true pour passer le gate et doit LIRE du SSE puis reconstituer
     du JSON (collecteurs ci-dessous).
+
+    [copie exacte, 3e passe] Deux signatures du corps officiel sont
+    désormais reproduites (MESURÉES sur 243 requêtes du vrai client) :
+      * ORDRE DES CLÉS : « model, max_tokens, messages, tools, tool_choice,
+        stream, stream_options » — 242/243 requêtes, l'ordre est donc une
+        signature stable, pas un hasard (json.dumps respecte l'ordre du
+        dict : nos octets partaient dans un ordre différent) ;
+      * ``tool_choice: "auto"`` présent dès qu'il y a des tools (242/242) —
+        le client le pose toujours, nous l'omettions.
+    L'ordre n'a aucun effet sémantique (JSON), mais l'octet compte pour une
+    copie fidèle. Corps Responses (``input``) : ordre non mesuré chez le
+    client → inchangé (on n'invente rien).
     """
     if not isinstance(body, dict):
         return body, False
@@ -4822,13 +4950,25 @@ def _free_wire_body(body, force_stream: bool = False):
     missing = [n for n in ("bash", "read") if n not in have]
     need_stream = force_stream and body.get("stream") is not True
     need_key = is_resp and not body.get("prompt_cache_key")
-    if not missing and not need_stream and not need_key:
+    # Le client pose « auto » dès qu'il y a des tools (242/242 mesures) — y
+    # compris quand les tools viennent de notre grille shim.
+    need_tc = is_chat and (bool(tools) or bool(missing)) and "tool_choice" not in body
+    # L'ordre client n'est réordonné que si le corps est en forme chat ET
+    # finira par porter des tools (ceux d'origine OU ceux du shim) : hors de
+    # là, on ne touche à rien. NB : on teste l'état FINAL, pas l'état initial
+    # — sinon un corps sans tools (grille ajoutée ensuite) garderait l'ordre
+    # d'origine alors qu'il porte désormais des tools.
+    need_order = is_chat and (bool(tools) or bool(missing))
+    if not missing and not need_stream and not need_key and not need_tc and not need_order:
         return body, False
     wire = dict(body)
     if missing:
         base = list(tools) if isinstance(tools, list) else []
         base.extend(_free_shim_tool(n, is_resp) for n in missing)
         wire["tools"] = base
+    if need_tc:
+        # Le client pose « auto » dès qu'il y a des tools (242/242 mesures).
+        wire["tool_choice"] = "auto"
     if need_key:
         try:
             # Parité options() : promptCacheKey = sessionID de la conversation
@@ -4844,7 +4984,37 @@ def _free_wire_body(body, force_stream: bool = False):
     if need_stream:
         wire["stream"] = True
         forced = True
+    if need_order:
+        wire = _reorder_client_body(wire)
     return wire, forced
+
+
+# Ordre des clés du corps chat officiel — MESURÉ 242/243 requêtes.
+_CLIENT_CHAT_KEY_ORDER = (
+    "model",
+    "max_tokens",
+    "messages",
+    "tools",
+    "tool_choice",
+    "stream",
+    "stream_options",
+)
+
+
+def _reorder_client_body(wire: dict) -> dict:
+    """Réordonne les clés du corps selon la séquence officielle mesurée.
+
+    Les clés inconnues (non mesurées chez le client) sont conservées À LA
+    FIN, dans leur ordre d'origine — on ne supprime ni n'invente rien.
+    """
+    try:
+        out = {k: wire[k] for k in _CLIENT_CHAT_KEY_ORDER if k in wire}
+        for k, v in wire.items():
+            if k not in out:
+                out[k] = v
+        return out
+    except Exception:
+        return wire
 
 
 def _iter_sse_data(lines):
@@ -5099,20 +5269,32 @@ def _official_free_headers(endpoint: str = "", conversation_key: str | None = No
     ``extra_headers`` des profils d'identité ne partent donc plus sur la
     jambe free (ils restent utilisés sur le chemin geo, qui lui imite un
     navigateur).
-    Note : Accept-Encoding reste celui de curl (``gzip, deflate, br``) et
-    NON celui de Bun (``+ zstd``) — notre build ne décode pas zstd, et
-    l'annoncer casserait les corps (vérifié au captureur : décodage auto OK
-    dans les deux cas dès que gzip est annoncé).
-
     ``endpoint`` sélectionne l'UA : le client envoie provider-utils/4.0.23
     sur /chat/completions mais 4.0.40 sur /responses (deux bundles ai-sdk).
+
+    [wire complet, 2e passe] Les 4 en-têtes de transport sont désormais posés
+    EXPLICITEMENT, dans l'ordre exact du client, au lieu d'être laissés à
+    libcurl qui les plaçait autrement (mesuré au captureur) :
+      * ``Accept: */*``      — absente avant (libcurl ne l'ajoute pas) ;
+      * ``Connection``       — absente avant ;
+      * ``Host``             — libcurl la mettait en TÊTE (position 1) au lieu
+                               de la 10e ;
+      * ``Accept-Encoding``  — la nôtre valait ``gzip, deflate, br`` (celle de
+                               libcurl) au lieu de ``gzip, deflate, br, zstd``.
+    Risque de compression vérifié AVANT livraison (probe E2) : libcurl décode
+    toujours gzip/br/zstd même quand Accept-Encoding est posé explicitement
+    (6/6 cas décodés) — annoncer zstd est donc sûr, le build le décode
+    (libcurl/8.21.0 zstd/1.5.7).
+    Limite structurelle : libcurl émet TOUJOURS ``Connection`` en dernier ;
+    l'ordre du client (Connection en 8e) est inatteignable via curl_cffi.
+    Vérifié : hors Connection, l'ordre obtenu est IDENTIQUE à celui du client.
     """
     ua = _OPENCODE_OFFICIAL_UA_RESPONSES if "/responses" in (endpoint or "") else _OPENCODE_OFFICIAL_UA
     try:
         _conv_session = _conversation_session_id(conversation_key)
     except Exception:
         _conv_session = _free_session_id()
-    return {
+    out = {
         "Authorization": "Bearer public",
         "Content-Type": "application/json",
         "User-Agent": ua,
@@ -5121,6 +5303,21 @@ def _official_free_headers(endpoint: str = "", conversation_key: str | None = No
         "x-opencode-request": _free_request_msg_id(),
         "x-opencode-session": _conv_session,
     }
+    if _FREE_WIRE_FULL_HEADERS:
+        # Ordre du client : Connection 8e, Accept 9e, Host 10e, AE 11e.
+        # (libcurl replacera Connection en dernier — cf. docstring.)
+        try:
+            from urllib.parse import urlparse as _urlparse
+
+            _host = _urlparse(endpoint or "").netloc
+        except Exception:
+            _host = ""
+        if _host:
+            out["Connection"] = "keep-alive"
+            out["Accept"] = "*/*"
+            out["Host"] = _host
+            out["Accept-Encoding"] = _OPENCODE_ACCEPT_ENCODING
+    return out
 
 
 _PAID_SESSION_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "_paid_session_id")
@@ -5452,6 +5649,199 @@ async def _do_free_direct_request(endpoint, body: dict, headers: dict):
     return out, req_headers
 
 
+class _CompactionTunnelDone(Exception):
+    """Signal interne : retry condensé via tunnel pool déjà exécuté (voie unifiée)."""
+
+    def __init__(self, resp, headers):
+        super().__init__("compaction tunnel done")
+        self.resp = resp
+        self.headers = headers
+
+
+def _has_free_leg(model_id: str) -> bool:
+    """Ce modèle a-t-il une jambe free (id déjà free, ou équivalent mappé) ?
+    Délégué fin vers ``app.compaction.classify.has_free_leg`` (logique pure,
+    DI) : lit SES globales À L'APPEL pour que les seams de test
+    (``FREE_MODEL_MAP`` patché, ``FREE_MODELS``) continuent de couler.
+    """
+    try:
+        return bool(
+            _classify_has_free_leg(
+                model_id,
+                is_free_route_fn=_is_free_model_route,
+                free_model_map=FREE_MODEL_MAP,
+                free_models=getattr(_cfg_settings, "FREE_MODELS", None),
+            )
+        )
+    except Exception:
+        return False
+
+
+def _compaction_is_free_class(model_id: str) -> bool:
+    """La conversation est-elle servie par la jambe free (classe du résumeur) ?
+
+    Délégué fin vers ``app.compaction.classify.is_free_class`` : même classe
+    free → résumeur free ; sinon résumeur payant.
+    """
+    try:
+        return bool(
+            _classify_is_free_class(
+                model_id,
+                is_free_route_fn=_is_free_model_route,
+                free_model_map=FREE_MODEL_MAP,
+                free_models=getattr(_cfg_settings, "FREE_MODELS", None),
+            )
+        )
+    except Exception:
+        return False
+
+
+def _compaction_class_policy() -> str:
+    """Politique de classe du résumeur (config live, défaut auto)."""
+    try:
+        _p = get_server_compaction("class_policy", "auto")
+        if isinstance(_p, str) and _p.strip().lower() in ("auto", "free_only", "paid_only"):
+            return _p.strip().lower()
+    except Exception:
+        pass
+    return "auto"
+
+
+def _compaction_summarizer_plan_full(model_id, override=None, *, endpoint=None, protocol=None, api=None):
+    """Plan complet (model, endpoint, protocol, api, is_free, seed).
+
+    Délégué fin vers ``app.compaction.plan.summarizer_plan`` + application de
+    ``server_compaction.class_policy`` (``free_only``/``paid_only`` forcent la
+    classe après le plan auto ; ``auto`` = même voie que la conversation).
+    """
+    try:
+        _def_target = ""
+        try:
+            _def_target = str(getattr(_cfg_settings, "FREE_DISCOVERY_DEFAULT_TARGET", "") or "")
+        except Exception:
+            _def_target = ""
+        _m, _ep, _pr, _ap, _free, _seed = _plan_summarizer_plan(
+            model_id,
+            override,
+            endpoint=endpoint,
+            protocol=protocol,
+            api=api,
+            route_fn=_route_for,
+            model_config_fn=get_model_config,
+            resolve_free_fn=_resolve_free_model,
+            free_endpoint_fn=_cfg_settings._free_endpoint_for,
+            default_target=_def_target,
+            is_free_fn=_compaction_is_free_class,
+        )
+    except Exception:
+        return model_id, endpoint, protocol, api, False, None
+    try:
+        _pol = _compaction_class_policy()
+        if _pol == "free_only" and not _free:
+            # Force free si la conversation a une jambe free ; sinon inchangé
+            # (jamais de free inventé pour un modèle sans équivalent).
+            if _compaction_is_free_class(_m):
+                _retry = _plan_summarizer_plan(
+                    _m,
+                    None,
+                    endpoint=_ep,
+                    protocol=_pr,
+                    api=_ap,
+                    route_fn=_route_for,
+                    model_config_fn=get_model_config,
+                    resolve_free_fn=_resolve_free_model,
+                    free_endpoint_fn=_cfg_settings._free_endpoint_for,
+                    default_target=_def_target,
+                    is_free_fn=lambda _x: True,
+                )
+                return _retry
+        elif _pol == "paid_only" and _free:
+            return _m, _ep, _pr, _ap, False, _seed
+    except Exception:
+        pass
+    return _m, _ep, _pr, _ap, _free, _seed
+
+
+def _compaction_summarizer_plan(model_id, override=None, *, endpoint=None, protocol=None):
+    """Plan du résumeur de compaction : (model, endpoint, protocol, is_free, seed).
+
+    Wrapper de compat (tests ``test_compaction_free_class``) : même contrat
+    historique 5-tuple, délégué au plan complet 6-tuple (``api`` écartée).
+    Le résumeur appartient à la MÊME classe que la conversation active.
+    ``summarizer_model_override`` reste souverain.
+    """
+    try:
+        _m, _ep, _pr, _ap, _free, _seed = _compaction_summarizer_plan_full(
+            model_id, override, endpoint=endpoint, protocol=protocol, api=None
+        )
+        return _m, _ep, _pr, _free, _seed
+    except Exception:
+        return model_id, endpoint, protocol, False, None
+
+
+def _compaction_summarizer_headers(is_free: bool, protocol: str, endpoint: str = ""):
+    """auth_headers_fn du résumeur : Bearer public (free) ou clé payante.
+
+    Délégué fin vers ``app.compaction.transport.summarizer_headers``.
+    La jambe free ne s'authentifie JAMAIS avec la clé payante du client.
+    """
+    try:
+        return _transport_headers(
+            is_free,
+            protocol,
+            endpoint,
+            official_headers_fn=_official_free_headers,
+            paid_headers_fn=_get_auth_headers,
+        )
+    except Exception:
+        return {}
+
+
+async def _compaction_summarizer_request(is_free: bool, endpoint, body, headers, protocol):
+    """do_request_fn du résumeur : jambe free-only ou payante (voie unifiée).
+
+    Délégué fin vers ``app.compaction.transport.summarizer_request`` :
+    ``is_free`` → ``_do_free_direct_request`` (grille wire + Bearer public,
+    conversion chat→Responses sur endpoint ``/responses``) ; sinon
+    ``_do_request_with_retry`` (payant). Même voie que la conversation,
+    jamais de bascule silencieuse.
+    """
+    try:
+        return await _transport_request(
+            is_free,
+            endpoint,
+            body,
+            headers,
+            protocol,
+            do_free_fn=_do_free_direct_request,
+            do_paid_fn=_do_request_with_retry,
+            chat_to_responses_fn=_chat_to_responses_request,
+            normalize_response_fn=_compaction_normalize_response,
+        )
+    except Exception as exc:
+        raise exc
+
+
+async def _compaction_normalize_response(resp, endpoint, body):
+    """Normalise une réponse free en forme lisible par ``_extract_text``.
+
+    Délégué fin vers ``app.compaction.transport.normalize_free_responses`` :
+    ``/responses`` (``output[]``) → ``choices[0].message.content`` ; sinon
+    passthrough. Jamais d'exception (fail-open).
+    """
+    try:
+        return await _transport_normalize(
+            resp,
+            endpoint,
+            body,
+            json_loads_fn=_json_loads,
+            responses_to_chat_fn=_responses_to_chat_response,
+            response_cls=httpx.Response,
+        )
+    except Exception:
+        return resp
+
+
 def _free_parallel_should_hedge(body: dict, forced_pool=None) -> bool:
     """True when hedge is enabled, not streaming, and ≥2 candidates."""
     try:
@@ -5739,6 +6129,68 @@ class _CurlCffiResponse:
     def json(self):
         # [E3 perf] parse direct des bytes — évite le détour str(bytes)
         return _json_loads(self.content)
+
+    # [fix HTTP 500 /v1/responses] Interface SSE en REJEU.
+    #
+    # Cette classe n'enveloppe QUE des corps déjà tamponnés en mémoire :
+    #   - ``_WireJsonResponse`` (SSE forcé déjà collecté, ligne 5402) ;
+    #   - la réponse curl_cffi postée avec ``stream=False`` (ligne 5350) quand
+    #     le client avait DÉJÀ demandé ``stream:true`` → l'upstream a renvoyé
+    #     du SSE, entièrement tamponné dans ``.content``.
+    #
+    # Or les consommateurs streaming (route ``/v1/responses`` ligne 17176,
+    # chat SSE 12362/14114) font ``async for line in resp.aiter_lines()``.
+    # L'attribut manquant remontait en ``AttributeError`` → HTTP 500
+    # « Erreur interne du serveur » (bug préexistant, présent dès HEAD).
+    #
+    # [fix tour vide] Deux formes de corps arrivent ici :
+    #   1. du SSE réel → rejoué verbatim (découpe identique à
+    #      ``_CurlCffiStreamResponse.aiter_lines``) ;
+    #   2. un OBJET JSON recollé par la jambe free → les consommateurs, qui
+    #      ignorent toute ligne sans préfixe ``data:``, n'en tiraient AUCUN
+    #      delta : HTTP 200 au texte vide. On synthétise alors les frames SSE
+    #      Chat (cf. ``_sse_lines_from_buffered_json``).
+    # Le rejeu est idempotent — chaque appel relit le corps tamponné.
+    async def aiter_lines(self):
+        data = self.content
+        if isinstance(data, bytes):
+            lines = data.split(b"\n")
+        else:  # pragma: no cover — corps non-bytes (str) via override
+            lines = str(data).encode("utf-8", errors="replace").split(b"\n")
+        if lines and lines[-1] == b"":
+            lines.pop()  # corps terminé par un saut de ligne : pas de ligne vide finale
+
+        def _verbatim():
+            # Décodage PARESSEUX : sur le chemin JSON (cas nominal de la jambe
+            # free, corps de plusieurs dizaines de Ko) décoder tout le corps
+            # puis le jeter serait du travail pur perdu.
+            for line in lines:
+                yield line.rstrip(b"\r").decode("utf-8", errors="replace")
+
+        # Détection sur les lignes DÉJÀ découpées (pas de second split).
+        if _lines_are_sse(lines):
+            for line in _verbatim():
+                yield line
+            return
+        # Corps JSON : reconstituer un flux Chat exploitable par les 4 boucles.
+        _synth = _sse_lines_from_buffered_json(data)
+        if _synth is None:
+            for line in _verbatim():  # forme inconnue → verbatim (origine)
+                yield line
+            return
+        for line in _synth:
+            yield line
+
+    async def aiter_bytes(self):
+        # Parité d'interface (les boucles streaming lisent aussi aiter_bytes).
+        yield self.content
+
+    async def aread(self):
+        return self.content
+
+    async def aclose(self):
+        # Corps déjà tamponné : rien à fermer côté transport.
+        return None
 
 
 class _CurlCffiStreamResponse:
@@ -6637,6 +7089,13 @@ def _resolve_free_model(paid_model: str):
     """
     base = FREE_MODEL_MAP.get(paid_model)
     if not base:
+        # [Fix compaction free/paid] Un id DÉJÀ free (``-free`` / pool découvert)
+        # est sa propre cible : sans ce repli, ``resolve`` renvoyait None et la
+        # jambe free était sautée pour ces modèles — ils partaient sur la
+        # machinerie payante alors qu'ils n'exigent aucune clé (d'où des
+        # ``FreeTierError`` « free tier can only be used from within OpenCode »).
+        if _is_free_model_route(paid_model):
+            return paid_model
         return None
     try:
         spread = bool((IP_ROTATION or {}).get("free_model_spread", False))
@@ -9784,6 +10243,145 @@ from app.protocol.chat_sse_to_anthropic import (  # noqa: E402
 from config.effort_policy import resolve_effort as _resolve_effort  # noqa: E402
 
 
+# ── [fix tour vide /v1/responses] Rejeu SSE d'un corps JSON tamponné ──────
+#
+# La jambe free recolle TOUJOURS son flux amont en OBJET JSON avant de le
+# rendre au wrapper : ``_WireJsonResponse`` (ligne 5402, SSE forcé déjà
+# collecté) et les deux conversions de ``_try_free_model_first`` (lignes 7894
+# et 7918, Chat / Anthropic). ``_CurlCffiResponse.content`` porte donc un
+# objet JSON, jamais des lignes ``data:``.
+#
+# Or les QUATRE consommateurs streaming commencent tous par
+# ``if not line.startswith("data:"): continue`` :
+#   - ``/v1/responses``        lignes 17091 et 17212
+#   - ``/v1/chat/completions`` ligne 14150
+#   - ``/v1/messages``         ligne 12398
+# Un corps JSON rejoué tel quel traversait donc ces boucles sans produire un
+# seul delta → HTTP 200 au texte VIDE (le « tour vide » observé sur
+# ``muse-spark-1.3-contributor-free``). Le rejeu doit donc SYNTHÉTISER les
+# frames qu'un vrai flux Chat aurait émises : c'est la monnaie commune que
+# les quatre consommateurs savent déjà convertir (deltas Chat / Responses).
+#
+# Les consommateurs NON streaming (``.json()``, ``.text``, ``.content``) ne
+# passent jamais par ``aiter_lines`` et gardent leur contrat inchangé.
+
+
+def _lines_are_sse(raw_lines) -> bool:
+    """Ces lignes (déjà découpées) portent-elles du SSE ``data:`` ?
+
+    Distingue les deux provenances du wrapper : un upstream réellement SSE
+    (posté en ``stream=False`` alors que le client demandait ``stream:true``)
+    se rejoue verbatim ; un objet JSON recollé par la jambe free se synthétise.
+
+    Prend les lignes DÉJÀ découpées par ``aiter_lines`` (évite un second
+    ``split`` sur des corps de plusieurs dizaines de Ko).
+    """
+    if not raw_lines:
+        return False
+    _f = raw_lines[0]
+    if isinstance(_f, bytes):
+        return any(line.startswith(b"data:") for line in raw_lines)
+    if isinstance(_f, str):
+        return any(line.startswith("data:") for line in raw_lines)
+    return False
+
+
+def _chat_completion_from_any_json(obj: dict, model: str = "") -> dict | None:
+    """Normalise un objet JSON free (Chat / Responses / Anthropic) en Chat.
+
+    Réutilise les convertisseurs déjà testés du module de mapping : aucune
+    ré-implémentation de la sémantique texte / raisonnement / tool_calls.
+    """
+    if isinstance(obj.get("choices"), list) and obj["choices"]:
+        return obj  # déjà au format Chat Completions
+    if isinstance(obj.get("output"), list):
+        return _responses_to_chat_response(obj, model)
+    if isinstance(obj.get("content"), list):
+        return anthropic_to_openai_response(obj, model)
+    return None
+
+
+def _sse_lines_from_buffered_json(raw, model: str = "") -> list[str] | None:
+    """Frames SSE Chat reconstituées depuis un corps JSON tamponné.
+
+    Retourne ``None`` quand le corps n'est pas exploitable (objet vide, JSON
+    illisible, forme inconnue) : l'appelant rejoue alors le corps tel quel,
+    exactement comme avant ce correctif.
+    """
+    try:
+        obj = _json_loads(raw)
+    except Exception:
+        return None
+    if not isinstance(obj, dict) or not obj:
+        return None
+    if not model and isinstance(obj.get("model"), str):
+        model = obj["model"]
+    try:
+        chat = _chat_completion_from_any_json(obj, model)
+    except Exception as err:  # noqa: BLE001 — jamais de 500 sur un rejeu
+        _debug(f"  [free-replay] normalisation JSON→Chat impossible: {err}")
+        return None
+    if not isinstance(chat, dict):
+        return None
+    _choices = chat.get("choices") if isinstance(chat.get("choices"), list) else []
+    _ch0 = _choices[0] if _choices and isinstance(_choices[0], dict) else {}
+    _msg = _ch0.get("message") if isinstance(_ch0.get("message"), dict) else {}
+    _finish = _ch0.get("finish_reason") or "stop"
+    _usage = chat.get("usage") if isinstance(chat.get("usage"), dict) else {}
+    _mid = chat.get("id") if isinstance(chat.get("id"), str) else f"chatcmpl-free-{int(time.time() * 1000):x}"
+
+    frames: list[str] = []
+
+    def _emit(delta: dict, finish_reason=None, with_usage=None):
+        payload: dict = {
+            "id": _mid,
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": model,
+            "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+        }
+        if with_usage is not None:
+            payload["usage"] = with_usage
+        frames.append("data: " + _json_dumps_str(payload))
+
+    _reasoning = _msg.get("reasoning_content") or _msg.get("reasoning")
+    if isinstance(_reasoning, str) and _reasoning:
+        _emit({"reasoning_content": _reasoning})
+    _content = _msg.get("content")
+    if isinstance(_content, str) and _content:
+        _emit({"content": _content})
+    _emitted_tool_call = False
+    for _i, _tc in enumerate(_msg.get("tool_calls") or []):
+        if not isinstance(_tc, dict):
+            continue
+        _fn = _tc.get("function") if isinstance(_tc.get("function"), dict) else {}
+        # Un tool_call SANS nom serait rejete par le client : on l'ecarte
+        # (meme regle que la collecte de la route /v1/responses).
+        if not _fn.get("name"):
+            _debug(f"  [free-replay] tool_call {_i} sans nom — ecarte")
+            continue
+        _emitted_tool_call = True
+        _emit(
+            {
+                "tool_calls": [
+                    {
+                        "index": _i,
+                        "id": _tc.get("id") or f"call_free_{_i}",
+                        "type": "function",
+                        "function": {"name": _fn["name"], "arguments": _fn.get("arguments") or "{}"},
+                    }
+                ]
+            }
+        )
+    # Un tour d'outil doit s'annoncer comme tel : un « stop » ferait croire au
+    # client que le tour est termine alors qu'un outil doit etre execute.
+    if _emitted_tool_call and _finish in (None, "", "stop"):
+        _finish = "tool_calls"
+    _emit({}, finish_reason=_finish, with_usage=_usage or None)
+    frames.append("data: [DONE]")
+    return frames
+
+
 async def _finalize_and_close_stream(
     started,
     open_blocks,
@@ -10033,14 +10631,20 @@ async def messages(request: Request):
     # [Phase 1 compaction] Détection shape stricte sur le body ORIGINAL
     # (avant remap model / ensure_min_tokens / overrides) — sert à l'exclusion
     # du response cache, au bypass 503 et au log [compaction].
+    # Borne lue LIVE (hot-reload safe) via get_server_compaction, défaut 1000.
     try:
-        _is_compaction = bool(_is_compaction_shape(body))
+        _min_chars = get_server_compaction("min_chars_implicit", 1000)
+        _is_compaction = bool(_is_compaction_shape(body, min_chars_implicit=_min_chars))
     except Exception:
         _is_compaction = False
     _msg_count = len(body.get("messages", [])) if isinstance(body.get("messages"), list) else 0
     if _is_compaction:
+        try:
+            _native = bool(_is_native_compaction(body))
+        except Exception:
+            _native = False
         _log(
-            f"  [compaction] req_id={req_id} model={original_model!r} msgs={_msg_count} body={len(body_bytes)}B"
+            f"  [compaction] req_id={req_id} model={original_model!r} msgs={_msg_count} body={len(body_bytes)}B native={int(_native)}"
         )
     if DEBUG:
         _debug(f"[messages] headers={_sanitize_headers(dict(request.headers))}")
@@ -10131,7 +10735,7 @@ async def messages(request: Request):
         is_stream = body.get("stream", False)
 
         # ── Free model: try BEFORE auth (free models don't need API keys) ──
-        if not is_stream and FREE_MODEL_MAP.get(model_id):
+        if not is_stream and _has_free_leg(model_id):
             try:
                 free_result = await _try_free_model_first(
                     body,
@@ -10180,7 +10784,7 @@ async def messages(request: Request):
             a_headers = _get_auth_headers("anthropic")
         except AllKeysPausedError as e:
             # If a free model exists, try streaming with empty headers before giving up
-            if is_stream and FREE_MODEL_MAP.get(model_id):
+            if is_stream and _has_free_leg(model_id):
 
                 async def anthropic_stream_free_fallback():
                     # Re-use the existing generator — it already handles free model swap
@@ -10331,6 +10935,147 @@ async def messages(request: Request):
                                 return _anthropic_error(503, "All API keys exhausted. Check your billing.")
                         except UpstreamError as e:
                             return _anthropic_error(e.status_code, str(e))
+                # [Phase 2 compaction] condense-and-retry réactif : APRÈS le
+                # credit-retry (qui reste FIRST) et AVANT le relais d'erreur
+                # intacte. Fail-open total : tout échec → relais intact.
+                # Non-stream uniquement, 1 retry max, jamais systemone/streaming.
+                if resp.status_code == 400 and not is_stream:
+                    try:
+                        _cmp_cfg = get_server_compaction()
+                        _cmp_on = bool(_cmp_cfg.get("enabled", False)) if isinstance(_cmp_cfg, dict) else False
+                    except Exception:
+                        _cmp_cfg, _cmp_on = {}, False
+                    if _cmp_on:
+                        try:
+                            _cmp_hist = body.get("messages") if isinstance(body, dict) else None
+                            _cmp_condensed = None
+                            if isinstance(_cmp_hist, list) and _cmp_hist:
+                                try:
+                                    _ov = get_server_compaction("summarizer_model_override", None)
+                                except Exception:
+                                    _ov = None
+                                _s_model, _s_ep, _s_proto, _s_api, _s_free, _ = _compaction_summarizer_plan_full(
+                                    model_id, _ov, endpoint=endpoint, protocol=protocol, api=None
+                                )
+                                try:
+                                    _s_api = _s_api or ("responses" if "/responses" in str(_s_ep or "") else (_s_proto if _s_proto in ("anthropic", "openai") else "chat"))
+                                except Exception:
+                                    _s_api = "chat"
+                                try:
+                                    _mk = int(_cmp_cfg.get("summary_max_tokens", 2048))
+                                except Exception:
+                                    _mk = 2048
+                                _mk = min(max(_mk, 1), 4096)
+                                try:
+                                    _kr = int(_cmp_cfg.get("keep_recent_pairs", 4))
+                                except Exception:
+                                    _kr = 4
+                                try:
+                                    _to = int(_cmp_cfg.get("timeout_s", 60))
+                                except Exception:
+                                    _to = 60
+                                try:
+                                    _mrk = get_server_compaction("overflow_markers", None)
+                                except Exception:
+                                    _mrk = None
+                                try:
+                                    _cmp_condensed = await _maybe_condense(
+                                        _cmp_hist,
+                                        status_code=resp.status_code,
+                                        body_text=resp.text,
+                                        model_id=_s_model,
+                                        endpoint=_s_ep,
+                                        protocol=_s_proto,
+                                        auth_headers_fn=lambda proto, _f=_s_free, _e=_s_ep: _compaction_summarizer_headers(_f, proto, _e),
+                                        do_request_fn=lambda ep, b, h, pr, _f=_s_free: _compaction_summarizer_request(_f, ep, b, h, pr),
+                                        enabled=True,
+                                        summary_max_tokens=_mk,
+                                        keep_recent_pairs=_kr,
+                                        timeout_s=_to,
+                                        markers=_mrk,
+                                        api=_s_api,
+                                    )
+                                except Exception:
+                                    _cmp_condensed = None
+                            if _cmp_condensed:
+                                try:
+                                    _paid_body = dict(body)
+                                    _paid_body["messages"] = _cmp_condensed
+                                    _paid_body["model"] = model_id
+                                    # [Compaction voie unifiée] Même tunnel geo que la conversation :
+                                    # paid geo-restricted → retry via pool, sinon direct.
+                                    try:
+                                        _cmp_tunnel = bool(getattr(request.state, "_geo_force_tunnel", False))
+                                    except Exception:
+                                        _cmp_tunnel = False
+                                    if _cmp_tunnel:
+                                        async with _open_via_pool(
+                                            endpoint,
+                                            _paid_body,
+                                            a_headers,
+                                            is_stream=False,
+                                            forced_pool=getattr(request.state, "_geo_forced_pool", None),
+                                        ) as _r2:
+                                            _h2 = dict(_r2.headers) if getattr(_r2, "headers", None) else a_headers
+                                            # _open_via_pool rend un contexte : on sort avec _r2 utilisable
+                                            # (même contrat que la jambe paid normale).
+                                            _r2, _h2 = _r2, _h2
+                                            raise _CompactionTunnelDone(_r2, _h2)
+                                    else:
+                                        _r2, _h2 = await _do_request_with_retry(
+                                            endpoint, _paid_body, a_headers, "anthropic"
+                                        )
+                                except _CompactionTunnelDone as _td:
+                                    _r2, _h2 = _td.resp, _td.headers
+                                except UpstreamError:
+                                    _cmp_condensed = None
+                                except Exception:
+                                    _cmp_condensed = None
+                                else:
+                                    if _r2.status_code == 200:
+                                        try:
+                                            data = _resp_json_or_empty(_r2)
+                                        except Exception:
+                                            _cmp_condensed = None
+                                        else:
+                                            usage = data.get("usage", {}) if isinstance(data, dict) else {}
+                                            req_in = usage.get("input_tokens", 0) or usage.get("prompt_tokens", 0)
+                                            req_out = usage.get("output_tokens", 0) or usage.get("completion_tokens", 0)
+                                            req_cache = usage.get("cache_read_input_tokens", 0)
+                                            try:
+                                                _update_token_usage(model_id, req_in, req_out, req_cache, _extract_cache_creation_tokens(usage))
+                                            except Exception:
+                                                pass
+                                            used = [b["name"] for b in data.get("content", []) if isinstance(b, dict) and b.get("type") == "tool_use"] if isinstance(data, dict) else []
+                                            try:
+                                                await _save_and_log_request(
+                                                    req_id, model_id, original_model, start_time,
+                                                    req_in, req_out, req_cache, protocol, is_stream,
+                                                    thinking_type, effort, client_ip, account_alias,
+                                                    tool_names, tools_used=used,
+                                                    request_body=request_body, response_body=data,
+                                                )
+                                            except Exception:
+                                                pass
+                                            # Jamais de put cache sur réponse condensée.
+                                            return Response(
+                                                content=_r2.content,
+                                                headers={"X-Cache": "MISS"},
+                                                media_type="application/json",
+                                            )
+                                    # Re-overflow ou non-200 du retry : relais intact (fail-open, 1 tentative).
+                                    if _r2.status_code != 200:
+                                        try:
+                                            _log(f"  [compaction] condense-retry non-200={_r2.status_code} → relais intact")
+                                        except Exception:
+                                            pass
+                                        return Response(
+                                            content=_r2.content,
+                                            status_code=_r2.status_code,
+                                            media_type="application/json",
+                                        )
+                        except Exception:
+                            pass
                 if resp.status_code in (429, 401, 403):
                     # [Phase 1 compaction] shape-compaction : relayer intact
                     # (statut + Retry-After réel) au lieu de 503 — le client
@@ -11273,7 +12018,7 @@ async def messages(request: Request):
         headers = _get_auth_headers("openai")
     except AllKeysPausedError as e:
         # If a free model exists, try it before giving up
-        if FREE_MODEL_MAP.get(model_id):
+        if _has_free_leg(model_id):
             try:
                 free_result = await _try_free_model_first(
                     _oai_body_for_free,
@@ -11450,6 +12195,7 @@ async def messages(request: Request):
             except UpstreamError as e:
                 return JSONResponse(status_code=e.status_code, content={"error": str(e)})
             _debug(f"  [retry-no-reasoning] response status={resp.status_code}")
+        _condensed_ok = False  # [Phase 2 compaction] retry condensé réussi → skip put cache (jamais de cache des résumés)
         if resp.status_code != 200:
             await _log_and_save_error(
                 req_id,
@@ -11488,6 +12234,144 @@ async def messages(request: Request):
                             return _anthropic_error(503, "All API keys exhausted. Check your billing.")
                     except UpstreamError as e:
                         return _anthropic_error(e.status_code, str(e))
+            # [Phase 2 compaction — condense-and-retry, openai-via-messages, non-stream uniquement]
+            # Déclencheur réactif : 400-overflow upstream constaté (resp.status_code/body).
+            # APRÈS le credit-retry (qui reste FIRST : alt key, early-return 503 si échec)
+            # et AVANT le relais d'erreur intacte. Fail-open strict : enabled=false
+            # → passthrough inchangé ; condensé None → fall through intact relay ;
+            # retry condensé re-overflow/échec → intact-error relay ; jamais de
+            # 2ᵉ tentative, jamais de raise, jamais systemone/streaming/cache-put.
+            if resp.status_code != 200:
+                try:
+                    _sc_cfg = get_server_compaction()
+                except Exception:
+                    _sc_cfg = {}
+                try:
+                    _sc_on = bool(_sc_cfg.get("enabled", False)) if isinstance(_sc_cfg, dict) else False
+                except Exception:
+                    _sc_on = False
+                if _sc_on and not is_stream:
+                    try:
+                        _sc_hist = oai_body.get("messages") if isinstance(oai_body, dict) else None
+                        if "/responses" in (endpoint or "") and isinstance(oai_body, dict):
+                            _sc_hist = oai_body.get("input", _sc_hist)
+                        _sc_ovr = (
+                            str(_sc_cfg.get("summarizer_model_override") or "").strip()
+                            if isinstance(_sc_cfg, dict) else ""
+                        )
+                        _sc_model, _sc_ep, _sc_proto, _sc_api, _sc_free, _ = _compaction_summarizer_plan_full(
+                            model_id, _sc_ovr, endpoint=endpoint, protocol="openai", api=None
+                        )
+                        try:
+                            _sc_api = _sc_api or ("responses" if "/responses" in str(_sc_ep or "") else "chat")
+                        except Exception:
+                            _sc_api = "chat"
+                        _sc_markers = None
+                        try:
+                            _sc_markers = get_server_compaction("overflow_markers", None)
+                        except Exception:
+                            _sc_markers = None
+                        _sc_max = 2048
+                        try:
+                            _v = get_server_compaction("summary_max_tokens", 2048)
+                            if isinstance(_v, int) and _v > 0:
+                                _sc_max = min(_v, 4096)
+                        except Exception:
+                            pass
+                        _sc_keep = 4
+                        try:
+                            _v = get_server_compaction("keep_recent_pairs", 4)
+                            if isinstance(_v, int) and _v > 0:
+                                _sc_keep = _v
+                        except Exception:
+                            pass
+                        _sc_to = 60
+                        try:
+                            _v = get_server_compaction("timeout_s", 60)
+                            if isinstance(_v, int) and _v > 0:
+                                _sc_to = _v
+                        except Exception:
+                            pass
+                        _condensed = await _maybe_condense(
+                            _sc_hist,
+                            status_code=resp.status_code,
+                            body_text=resp.text,
+                            model_id=_sc_model,
+                            endpoint=_sc_ep,
+                            protocol=_sc_proto,
+                            auth_headers_fn=lambda proto, _f=_sc_free, _e=_sc_ep: _compaction_summarizer_headers(_f, proto, _e),
+                            do_request_fn=lambda ep, b, h, pr, _f=_sc_free: _compaction_summarizer_request(_f, ep, b, h, pr),
+                            enabled=True,
+                            summary_max_tokens=_sc_max,
+                            keep_recent_pairs=_sc_keep,
+                            timeout_s=_sc_to,
+                            markers=_sc_markers,
+                            api=_sc_api,
+                        )
+                    except Exception:
+                        _condensed = None
+                    if _condensed:
+                        try:
+                            _retry_body = dict(oai_body) if isinstance(oai_body, dict) else {}
+                            if "/responses" in (endpoint or "") and isinstance(_retry_body.get("input"), list):
+                                _retry_body["input"] = list(_condensed)
+                            elif isinstance(_retry_body.get("messages"), list):
+                                _retry_body["messages"] = list(_condensed)
+                            else:
+                                _retry_body = None
+                            # Préserver stream/temperature/top_p de la requête originale.
+                            if isinstance(_retry_body, dict):
+                                for _k in ("stream", "temperature", "top_p"):
+                                    try:
+                                        if _k in oai_body and _k not in _retry_body:
+                                            _retry_body[_k] = oai_body[_k]
+                                    except Exception:
+                                        pass
+                                _retry_body["stream"] = False
+                                # Garder la map de restore des noms d'outils pour
+                                # openai_to_anthropic plus bas (succès condensé).
+                                try:
+                                    _sc_map = oai_body.get(_TOOL_NAME_MAP_KEY)
+                                    if _sc_map is not None:
+                                        _retry_body[_TOOL_NAME_MAP_KEY] = _sc_map
+                                except Exception:
+                                    pass
+                        except Exception:
+                            _retry_body = None
+                        if isinstance(_retry_body, dict):
+                            _log(f"  [compaction] req_id={req_id} 400-overflow → condense-and-retry once (model={_sc_model!r})")
+                            try:
+                                try:
+                                    _sc_tunnel = bool(getattr(request.state, "_geo_force_tunnel", False))
+                                except Exception:
+                                    _sc_tunnel = False
+                                if _sc_tunnel:
+                                    async with _open_via_pool(
+                                        endpoint,
+                                        _retry_body,
+                                        headers,
+                                        is_stream=False,
+                                        forced_pool=getattr(request.state, "_geo_forced_pool", None),
+                                    ) as _rpool:
+                                        resp = _rpool
+                                        try:
+                                            headers = dict(_rpool.headers) if getattr(_rpool, "headers", None) else headers
+                                        except Exception:
+                                            pass
+                                        raise _CompactionTunnelDone(resp, headers)
+                                else:
+                                    resp, headers = await _do_request_with_retry(endpoint, _retry_body, headers, "openai")
+                            except _CompactionTunnelDone as _td2:
+                                resp, headers = _td2.resp, _td2.headers
+                            except UpstreamError as e:
+                                return _anthropic_error(e.status_code, str(e))
+                            except Exception:
+                                _retry_body = None
+                            if isinstance(_retry_body, dict) and resp.status_code == 200:
+                                oai_body = _retry_body
+                                account_alias = _alias_for_key(_key_from_headers(headers, "openai"))
+                                _condensed_ok = True
+                            # Re-overflow ou échec → fall through vers le relais intact (pas de 2ᵉ tentative).
             # Convert 429/401/403 → 503 to avoid Claude Code auth window
             if resp.status_code in (429, 401, 403):
                 # [Phase 1 compaction] shape-compaction : relayer intact
@@ -11620,7 +12504,8 @@ async def messages(request: Request):
         )
         anthro_bytes = _json_dumps_str(anthro_resp, ensure_ascii=False).encode()
         # [Phase 1 compaction] jamais de put sur shape-compaction.
-        if cache_key and not _is_compaction:
+        # [Phase 2] jamais de put après retry condensé (pas de cache des résumés).
+        if cache_key and not _is_compaction and not _condensed_ok:
             _response_cache.put(cache_key, anthro_bytes, {"Content-Type": "application/json"})
         return Response(content=anthro_bytes, headers={"X-Cache": "MISS"}, media_type="application/json")
 
@@ -12127,7 +13012,18 @@ async def messages(request: Request):
                                 block_idx = next_block_idx
                                 next_block_idx += 1
                                 tool_block_idx[api_idx] = block_idx
-                                tc_id = tc.get("id", _fast_id("toolu"))
+                                # [FIX id vide] ``dict.get(k, default)`` ne rend
+                                # PAS le défaut quand la clé existe avec une
+                                # valeur None/"" (fréquent : certains amonts
+                                # émettent "id": null sur le 1er delta). Un id
+                                # vide partait alors tel quel dans
+                                # content_block_start : le client ne pouvait
+                                # plus apparier son tool_result → déséquilibre
+                                # structurel permanent (structural_backoff).
+                                # Test de véracité obligatoire, jamais .get().
+                                tc_id = tc.get("id") or _fast_id("toolu")
+                                if not isinstance(tc_id, str) or not tc_id.strip():
+                                    tc_id = _fast_id("toolu")
                                 # [Lot L4 — A8] Restore : le nom raccourci pour
                                 # l'amont Chat (≤64) redevient celui que le client
                                 # a envoyé. ``used_tools`` enregistre donc le nom
@@ -12859,15 +13755,21 @@ async def chat_completions(request: Request):
     _debug(f"[chat] req_id={req_id} model={original_model!r} tools={tool_names} ip={client_ip}")
     # [Phase 1 compaction] Détection shape stricte sur le body ORIGINAL
     # (avant remap model / ensure_min_tokens) — miroir du handler messages.
+    # Borne lue LIVE (hot-reload safe) via get_server_compaction, défaut 1000.
     try:
-        _is_compaction = bool(_is_compaction_shape(body))
+        _min_chars = get_server_compaction("min_chars_implicit", 1000)
+        _is_compaction = bool(_is_compaction_shape(body, min_chars_implicit=_min_chars))
     except Exception:
         _is_compaction = False
     if _is_compaction:
         _msgs = body.get("messages", [])
         _n = len(_msgs) if isinstance(_msgs, list) else 0
+        try:
+            _native = bool(_is_native_compaction(body))
+        except Exception:
+            _native = False
         _log(
-            f"  [compaction] req_id={req_id} model={original_model!r} msgs={_n} body={len(body_bytes)}B"
+            f"  [compaction] req_id={req_id} model={original_model!r} msgs={_n} body={len(body_bytes)}B native={int(_native)}"
         )
     if DEBUG:
         _debug(f"[chat] headers={_sanitize_headers(dict(request.headers))}")
@@ -12981,7 +13883,7 @@ async def chat_completions(request: Request):
             # comportement legacy conservé : free-first puis 503 générique.
             _no_valid_keys = not _has_usable_paid_key()
             # If a free model exists, try it before giving up
-            if FREE_MODEL_MAP.get(model_id):
+            if _has_free_leg(model_id):
                 if is_stream:
                     if _no_valid_keys:
                         # A3 : pas de clé payante → le placeholder 503 serait
@@ -13690,12 +14592,76 @@ async def chat_completions(request: Request):
                         # UNIQUEMENT si le tour est marqué suspect (500 chars).
                         _preview_parts: list = []
                         _preview_len = 0
+
+                        # ── [PARITE client officiel] Métadonnées + usage ──────
+                        # Deux écarts mesurés sur le proxy vivant face au parseur
+                        # du client officiel (bundle 1.18.31, extrait du binaire) :
+                        #
+                        # 1. Métadonnées. Le parseur fait, sur le PREMIER chunk :
+                        #      if(J) J=!1, W.enqueue({type:"response-metadata",...LG(c)})
+                        #    avec ``LG({id,model,created})`` → sans ``id``/``model``/
+                        #    ``created`` le client n'émet AUCUNE métadonnée de réponse.
+                        #    Le convertisseur Responses→Chat ne les produit pas
+                        #    (mapping.py : ``{"choices":[{"delta":...,"finish_reason":None}]}``).
+                        #
+                        # 2. Usage. Le client envoie
+                        #    ``stream_options={"include_usage":true}`` (capture octet-
+                        #    exact) et son parseur lit ``c.usage`` sur n'importe
+                        #    quelle frame (``if(c.usage!=null)$=c.usage``) pour
+                        #    alimenter ``createUsage(prompt_tokens,
+                        #    completion_tokens, prompt_tokens_details.cached_tokens)``.
+                        #    Le chemin chat n'émettait AUCUNE frame usage : comptage
+                        #    de tokens et de cache perdus côté client.
+                        _usage_emitted = False
+                        _out_id_meta = _fast_id("chatcmpl")
+                        _out_created_meta = int(time.time())
+                        # [PARITE] L'amont peut fournir ``finish_reason`` PUIS
+                        # fermer sans ``[DONE]`` : le client officiel attend un
+                        # ``[DONE]`` pour clore son flux (``GG()`` =
+                        # ``T.trim()==="[DONE]"``). Sans lui, la boucle de
+                        # consommation reste en attente jusqu'au timeout.
+                        _done_emitted = False
+
+                        def _enrich_chunk(_c):
+                            """Ajoute id/object/created/model absents d'un delta."""
+                            if isinstance(_c, dict) and _c.get("choices"):
+                                _c.setdefault("id", _out_id_meta)
+                                _c.setdefault("object", "chat.completion.chunk")
+                                _c.setdefault("created", _out_created_meta)
+                                _c.setdefault("model", original_model)
+                            return _c
+
+                        def _usage_frame() -> bytes:
+                            """Frame usage terminale (format OpenAI include_usage).
+
+                            Émise UNIQUEMENT si l'amont a fourni un usage réel :
+                            inventer des compteurs serait pire que l'absence.
+                            """
+                            nonlocal _usage_emitted
+                            if _usage_emitted or not isinstance(actual_usage, dict):
+                                return b""
+                            _usage_emitted = True
+                            _u = dict(actual_usage)
+                            if "total_tokens" not in _u:
+                                _u["total_tokens"] = (_u.get("prompt_tokens") or 0) + (_u.get("completion_tokens") or 0)
+                            _frame = {
+                                "id": _out_id_meta,
+                                "object": "chat.completion.chunk",
+                                "created": _out_created_meta,
+                                "model": original_model,
+                                "choices": [],
+                                "usage": _u,
+                            }
+                            return b"data: " + _json_dumps_str(_frame, ensure_ascii=False).encode() + b"\n\n"
+
                         async for line in resp.aiter_lines():
                             if not line.startswith("data:"):
                                 continue
                             data_str = line[5:].strip()
                             if data_str == "[DONE]":
+                                yield _usage_frame()
                                 yield line.encode() + b"\n\n"
+                                _done_emitted = True
                                 continue
                             try:
                                 chunk = _json_loads(data_str)
@@ -13724,8 +14690,10 @@ async def chat_completions(request: Request):
                                     if chunk.get("_incomplete") and not _oai_has_yielded and stream_out == 0:
                                         _incomplete_empty = True
                                     break
-                                # [TROU 2 — A8] nom d'outil restauré avant yield.
-                                chunk = restore_chat_response_tool_names(chunk, _out_tool_map)
+                                # [PARITE] métadonnées id/object/created/model :
+                                # le parseur officiel émet ses ``response-metadata``
+                                # depuis le PREMIER chunk reçu.
+                                chunk = _enrich_chunk(restore_chat_response_tool_names(chunk, _out_tool_map))
                                 _oai_has_yielded = True
                                 _chunk_already_yielded = True
                                 yield f"data: {_json_dumps_str(chunk, ensure_ascii=False)}\n\n".encode()
@@ -13753,7 +14721,8 @@ async def chat_completions(request: Request):
                                         break
                                     # Yield converted chunk as chat/completions SSE
                                     # [TROU 2 — A8] nom d'outil restauré avant yield.
-                                    chunk = restore_chat_response_tool_names(chunk, _out_tool_map)
+                                    # [PARITE] + métadonnées id/object/created/model.
+                                    chunk = _enrich_chunk(restore_chat_response_tool_names(chunk, _out_tool_map))
                                     _oai_has_yielded = True
                                     yield f"data: {_json_dumps_str(chunk, ensure_ascii=False)}\n\n".encode()
                                     continue
@@ -13784,6 +14753,17 @@ async def chat_completions(request: Request):
                                             if tc_idx not in seen_tool_indices:
                                                 seen_tool_indices.add(tc_idx)
                                                 used_tools.append(tc["function"]["name"])
+                                    # [PARITE client officiel] L'amont free peut
+                                    # emettre des tool_calls SANS finish_reason
+                                    # terminal (mesure : 3 frames de delta puis
+                                    # EOF). Le proxy synthetisait alors « stop »,
+                                    # soit un tour d'outil annonce comme termine.
+                                    # Le parseur officiel mappe tool_calls ->
+                                    # "tool-calls" et stop -> "stop" : un « stop »
+                                    # avec outil fait croire au client que le tour
+                                    # est fini et l'outil n'est jamais execute.
+                                    if seen_tool_indices and _synth_finish in (None, "", "stop"):
+                                        _synth_finish = "tool_calls"
                                 # Track finish_reason for truncated-stream detection
                                 _fr = choices[0].get("finish_reason") if isinstance(choices[0], dict) else None
                                 if _fr is not None:
@@ -13797,7 +14777,8 @@ async def chat_completions(request: Request):
                                 # Sérialisation identique aux autres yields (orjson,
                                 # même `ensure_ascii=False`) ; `data_str` == le JSON
                                 # du chunk, donc aucune perte de champ.
-                                yield f"data: {_json_dumps_str(chunk, ensure_ascii=False)}\n\n".encode()
+                                # [PARITE] + métadonnées id/object/created/model.
+                                yield f"data: {_json_dumps_str(_enrich_chunk(chunk), ensure_ascii=False)}\n\n".encode()
                             _chunk_already_yielded = False
 
                         # [FIX EOF nu] Fin de flux amont sans AUCUN contenu, sans usage et
@@ -13982,8 +14963,10 @@ async def chat_completions(request: Request):
                                     "choices": [{"index": 0, "delta": {}, "finish_reason": _synth_finish}],
                                 }
                                 yield f"data: {_json_dumps_str(_synth, ensure_ascii=False)}\n\n".encode()
+                                yield _usage_frame()
                                 yield b"data: [DONE]\n\n"
                                 emitted_finish = True
+                                _done_emitted = True
                             elif _incomplete_empty:
                                 # [FIX faux-vert] L'amont a explicitement produit ZÉRO
                                 # sortie (``response.incomplete`` ou EOF nu) : fabriquer
@@ -14006,6 +14989,7 @@ async def chat_completions(request: Request):
                                     + b"\n\ndata: [DONE]\n\n"
                                 )
                                 emitted_finish = True
+                                _done_emitted = True
                             elif actual_usage is not None:
                                 # Responses API completed but no finish yet — also synthesize
                                 _debug("  [oai-stream] synthesizing finish for Responses/empty stream")
@@ -14017,8 +15001,10 @@ async def chat_completions(request: Request):
                                     "choices": [{"index": 0, "delta": {}, "finish_reason": _synth_finish}],
                                 }
                                 yield f"data: {_json_dumps_str(_synth, ensure_ascii=False)}\n\n".encode()
+                                yield _usage_frame()
                                 yield b"data: [DONE]\n\n"
                                 emitted_finish = True
+                                _done_emitted = True
                             else:
                                 # Nothing yielded — emit error to avoid silent failure
                                 _debug("  [oai-stream] no content yielded, emitting error termination")
@@ -14034,6 +15020,22 @@ async def chat_completions(request: Request):
                                     + b"\n\ndata: [DONE]\n\n"
                                 )
                                 emitted_finish = True
+                                _done_emitted = True
+                        # [PARITE client officiel] Terminaison garantie.
+                        # Le client officiel attend ``data: [DONE]`` pour clore
+                        # son flux (``T.trim()==="[DONE]"``) et lit ``usage`` sur
+                        # n'importe quelle frame. Deux cas laissaient le flux
+                        # SANS terminal :
+                        #  • l'amont a fourni son ``finish_reason`` puis a fermé
+                        #    sans ``[DONE]`` (mesure : EOF après la 3e frame) ;
+                        #  • l'amont s'est tu sans finish_reason ni ``[DONE]``.
+                        # On n'émet rien de plus qu'avant sur le contenu : on
+                        # ajoute uniquement la clôture manquante, et la frame
+                        # usage si l'amont en a fourni un (jamais inventée).
+                        if not _done_emitted and emitted_finish:
+                            yield _usage_frame()
+                            yield b"data: [DONE]\n\n"
+                            _done_emitted = True
                         # Stream ended — finalize tracking
                         # [B1] résout l'estimation différée avant réconciliation
                         est_input = await _ensure_est_input()
@@ -14288,7 +15290,7 @@ async def chat_completions(request: Request):
         a_headers = _get_auth_headers("anthropic")
     except AllKeysPausedError as e:
         # If a free model exists, try it before giving up
-        if FREE_MODEL_MAP.get(model_id):
+        if _has_free_leg(model_id):
             if is_stream:
                 # Streaming with no API key: free model will be tried by _anthro_to_oai_stream on next normal attempt
                 return _anthropic_error(503, "All API keys paused — free model will be tried on next attempt")
@@ -15611,7 +16613,7 @@ async def systemone(request: Request):
     else:
         try:
             entry = get_next_api_key()
-        except AllKeysPausedError as e:
+        except AllKeysPausedError:
             return _openai_error(503, "All API keys exhausted. Check your billing.")
         except Exception as e:
             _debug(f"[systemone] ✗ no usable key: {type(e).__name__}: {e}")
@@ -15741,12 +16743,18 @@ async def responses(request: Request):
     request_body = body  # Capture original request before mutation
     # [Phase 1 compaction] Détection shape stricte sur le body ORIGINAL
     # (avant remap model / conversions) — miroir des handlers messages/chat.
+    # Borne lue LIVE (hot-reload safe) via get_server_compaction, défaut 1000.
     try:
-        _is_compaction = bool(_is_compaction_shape(body))
+        _min_chars = get_server_compaction("min_chars_implicit", 1000)
+        _is_compaction = bool(_is_compaction_shape(body, min_chars_implicit=_min_chars))
     except Exception:
         _is_compaction = False
     if _is_compaction:
-        _log(f"  [compaction] req_id={req_id} model={original_model!r} body={len(body_bytes)}B (responses)")
+        try:
+            _native = bool(_is_native_compaction(body))
+        except Exception:
+            _native = False
+        _log(f"  [compaction] req_id={req_id} model={original_model!r} body={len(body_bytes)}B (responses) native={int(_native)}")
     route = _route_for(original_model)
     if route is None:
         available = sorted(MODELS.keys())
@@ -15851,7 +16859,7 @@ async def responses(request: Request):
             a_headers = _get_auth_headers("anthropic")
         except AllKeysPausedError as e:
             # If a free model exists, try it before giving up
-            if FREE_MODEL_MAP.get(model_id):
+            if _has_free_leg(model_id):
                 if is_stream:
                     # [TROU 15] Couper ici etait un MENSONGE : le 503 annoncait un essai
                     # de la jambe free qui n'avait JAMAIS lieu (mesure : 503 et ZERO
@@ -16296,7 +17304,7 @@ async def responses(request: Request):
         headers = _get_auth_headers("openai")
     except AllKeysPausedError as e:
         # If a free model exists, try it before giving up
-        if FREE_MODEL_MAP.get(model_id):
+        if _has_free_leg(model_id):
             try:
                 free_result = await _try_free_model_first(
                     oai_body,
@@ -16626,6 +17634,15 @@ async def responses(request: Request):
                     )
                 collected_chunks = []
                 collected_reasoning_chunks = []
+                # [fix tool_calls] Meme defaut latent que sur le chemin free : les
+                # deltas de tool_calls et le vrai finish_reason etaient IGNORES
+                # (seuls ``content``/``reasoning_content`` etaient collectes, et
+                # le finish_reason de sortie etait code en dur a "stop"). Un tour
+                # d'outil arrivait donc SANS outil et annonce « termine ».
+                # Reconstitution par index (forme OpenAI : id/name au 1er delta,
+                # arguments fragmentes sur les deltas suivants).
+                collected_tool_calls: dict[int, dict] = {}
+                _finish_reason = None
                 final_usage = None
                 # [P4] état SSE Responses-API PAR stream
                 _resp_state = ResponsesSseState()
@@ -16655,7 +17672,10 @@ async def responses(request: Request):
                         if not choices:
                             continue
                     if choices and isinstance(choices, list) and len(choices) > 0:
-                        delta = choices[0].get("delta", {}) if isinstance(choices[0], dict) else {}
+                        _ch = choices[0] if isinstance(choices[0], dict) else {}
+                        if _ch.get("finish_reason"):
+                            _finish_reason = _ch["finish_reason"]
+                        delta = _ch.get("delta", {})
                         if isinstance(delta, dict):
                             c = delta.get("content")
                             if isinstance(c, str) and c:
@@ -16663,17 +17683,49 @@ async def responses(request: Request):
                             rc = delta.get("reasoning_content") or delta.get("reasoning")
                             if isinstance(rc, str) and rc:
                                 collected_reasoning_chunks.append(rc)
+                            for _tc in delta.get("tool_calls") or []:
+                                if not isinstance(_tc, dict):
+                                    continue
+                                _ix = _tc.get("index")
+                                _ix = _ix if isinstance(_ix, int) else len(collected_tool_calls)
+                                _acc = collected_tool_calls.setdefault(
+                                    _ix,
+                                    {"id": "", "type": "function", "function": {"name": "", "arguments": ""}},
+                                )
+                                if _tc.get("id"):
+                                    _acc["id"] = _tc["id"]
+                                _fn = _tc.get("function") if isinstance(_tc.get("function"), dict) else {}
+                                if _fn.get("name"):
+                                    _acc["function"]["name"] += _fn["name"]
+                                if _fn.get("arguments"):
+                                    _acc["function"]["arguments"] += _fn["arguments"]
                 full_content = "".join(collected_chunks) or ""
                 full_reasoning = "".join(collected_reasoning_chunks) or ""
+                _msg_out: dict = {
+                    "content": full_content,
+                    "role": "assistant",
+                    "reasoning_content": full_reasoning,
+                }
+                if collected_tool_calls:
+                    _tcs = [collected_tool_calls[k] for k in sorted(collected_tool_calls)]
+                    for _n, _t in enumerate(_tcs):
+                        if not _t.get("id"):
+                            _t["id"] = _fast_id("call")
+                        # un nom vide ferait rejeter l'outil cote client
+                        if not _t["function"].get("name"):
+                            _tcs[_n] = None
+                    _tcs = [t for t in _tcs if t]
+                    if _tcs:
+                        _msg_out["tool_calls"] = _tcs
                 chat_resp = {
                     "choices": [
                         {
-                            "message": {
-                                "content": full_content,
-                                "role": "assistant",
-                                "reasoning_content": full_reasoning,
-                            },
-                            "finish_reason": "stop",
+                            "message": _msg_out,
+                            # [fix tool_calls free] vrai finish_reason de l'amont,
+                            # "tool_calls" compris — un "stop" code en dur faisait
+                            # croire au client que le tour etait termine.
+                            "finish_reason": _finish_reason
+                            or ("tool_calls" if _msg_out.get("tool_calls") else "stop"),
                         }
                     ],
                     "usage": final_usage or {"prompt_tokens": 0, "completion_tokens": 0},
@@ -16747,6 +17799,16 @@ async def responses(request: Request):
     # Collect streaming response and convert to Responses API format
     collected_chunks = []
     collected_reasoning_chunks = []
+    # [fix tool_calls free] Les deltas de tool_calls et le vrai finish_reason
+    # etaient IGNORES ici : seuls ``content``/``reasoning_content`` etaient
+    # collectes, et le finish_reason de sortie etait code en dur a "stop".
+    # Un tour d'OUTIL servi par la jambe free — le cas nominal de
+    # muse-spark via /v1/responses — arrivait donc au client SANS son outil et
+    # annonce « termine » : le client n'executait rien et le tour etait perdu.
+    # Reconstitution par index (forme OpenAI : id/name au 1er delta, arguments
+    # fragmentes sur les deltas suivants).
+    collected_tool_calls: dict[int, dict] = {}
+    _finish_reason = None
     final_usage = None
     # [P4] état SSE Responses-API PAR stream
     _resp_state = ResponsesSseState()
@@ -16778,7 +17840,10 @@ async def responses(request: Request):
             if not choices:
                 continue
         if choices and isinstance(choices, list) and len(choices) > 0:
-            delta = choices[0].get("delta", {}) if isinstance(choices[0], dict) else {}
+            _ch0 = choices[0] if isinstance(choices[0], dict) else {}
+            if _ch0.get("finish_reason"):
+                _finish_reason = _ch0["finish_reason"]
+            delta = _ch0.get("delta", {})
             if isinstance(delta, dict):
                 c = delta.get("content")
                 if isinstance(c, str) and c:
@@ -16787,6 +17852,22 @@ async def responses(request: Request):
                 rc = delta.get("reasoning_content") or delta.get("reasoning")
                 if isinstance(rc, str) and rc:
                     collected_reasoning_chunks.append(rc)
+                for _tc in delta.get("tool_calls") or []:
+                    if not isinstance(_tc, dict):
+                        continue
+                    _ix = _tc.get("index")
+                    _ix = _ix if isinstance(_ix, int) else len(collected_tool_calls)
+                    _acc = collected_tool_calls.setdefault(
+                        _ix,
+                        {"id": "", "type": "function", "function": {"name": "", "arguments": ""}},
+                    )
+                    if _tc.get("id"):
+                        _acc["id"] = _tc["id"]
+                    _fn = _tc.get("function") if isinstance(_tc.get("function"), dict) else {}
+                    if _fn.get("name"):
+                        _acc["function"]["name"] += _fn["name"]
+                    if _fn.get("arguments"):
+                        _acc["function"]["arguments"] += _fn["arguments"]
 
     # Build final response
     full_content = "".join(collected_chunks)
@@ -16796,16 +17877,33 @@ async def responses(request: Request):
     if not full_reasoning:
         full_reasoning = ""  # Ensure non-None
 
+    _msg_out: dict = {
+        "content": full_content,
+        "role": "assistant",
+        "reasoning_content": full_reasoning,
+    }
+    if collected_tool_calls:
+        _tcs = []
+        for _k in sorted(collected_tool_calls):
+            _t = collected_tool_calls[_k]
+            # un tool_call sans nom serait rejete par le client : on l'ecarte
+            if not _t["function"].get("name"):
+                continue
+            if not _t.get("id"):
+                _t["id"] = _fast_id("call")
+            _tcs.append(_t)
+        if _tcs:
+            _msg_out["tool_calls"] = _tcs
+            # un tour d'outil doit etre annonce comme tel, pas « stop »
+            if _finish_reason in (None, "", "stop"):
+                _finish_reason = "tool_calls"
+
     # Create Chat Completions format response for conversion
     chat_resp = {
         "choices": [
             {
-                "message": {
-                    "content": full_content,
-                    "role": "assistant",
-                    "reasoning_content": full_reasoning,
-                },
-                "finish_reason": "stop",
+                "message": _msg_out,
+                "finish_reason": _finish_reason or "stop",
             }
         ],
         "usage": final_usage or {"prompt_tokens": 0, "completion_tokens": 0},
@@ -16964,6 +18062,15 @@ if __name__ == "__main__":
     import signal
     import sys
     import traceback as _traceback
+
+    # [Console Windows] La console hérite souvent de cp1252 : tout print d'un
+    # contenu modèle (emoji, ✓, →, CJK) levait UnicodeEncodeError 'charmap'.
+    # Convention repo (scripts/*) : stdout/stderr en UTF-8 avec replace.
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
     parser = argparse.ArgumentParser(description="OpenCode Proxy")
     parser.add_argument("--no-gui", action="store_true", help="Force terminal mode (no system tray)")

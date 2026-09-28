@@ -519,6 +519,33 @@ def _period_minutes(from_date, to_date, now: datetime | None = None) -> float | 
     return minutes if minutes > 0 else None
 
 
+def _period_rates(count: int, period_minutes: float | None) -> tuple[float | None, float | None]:
+    """(period_minutes, avg_per_min) PUBLIÉS — cohérents entre eux.
+
+    ``avg_per_min`` est calculé à partir de la période **arrondie**, celle qui
+    est effectivement publiée et affichée, et non de la valeur brute. Sans
+    cela les deux nombres du dashboard ne se réconcilient pas : une période
+    réelle de 7,0499 min s'affiche « 7,0 min », mais 8 requêtes / 7,0499
+    donnait 1,13/min alors que 8 / 7,0 = 1,14/min. L'utilisateur voyait donc
+    « 8 requêtes · 7,0 min · 1,13 req/min », un calcul faux à l'écran.
+
+    Cas limites :
+      * période indéterminée          -> (None, None)  (la tuile affiche « — »)
+      * période connue, 0 requête     -> (p, 0.0)      (pas None, pas d'exception)
+      * période arrondie tombant à 0  -> on publie la valeur brute (une
+        période de moins de 3 s n'est pas représentable à 1 décimale ; on
+        garde ainsi la cohérence et on évite une division par zéro).
+    """
+    if period_minutes is None:
+        return None, None
+    période = round(period_minutes, 1)
+    if période <= 0:
+        période = period_minutes
+    if count > 0:
+        return période, round(count / période, 2)
+    return période, 0.0
+
+
 def _compute_costs(rows, pricing: dict | None = None) -> dict:
     """[v10 §12.3.10] Coût payant + économies free à partir de lignes agrégées.
 
@@ -2228,34 +2255,24 @@ def register_dashboard(
 
         if rates is None:
             period_minutes = _period_minutes(from_date, to_date, now)
-            if period_minutes is not None and totals["count"] > 0:
-                avg_per_min = totals["count"] / period_minutes
-            elif totals["count"] == 0 and period_minutes is not None:
-                avg_per_min = 0.0
-            else:
-                avg_per_min = None
+            p_min, avg_per_min = _period_rates(totals["count"], period_minutes)
             rates = {
                 "c1m": c1m,
                 "rpm_1m": round(c1m / 1.0, 1),
                 "c1h": c1h,
                 "rpm_1h": round(c1h / 60.0, 2),
-                "period_minutes": round(period_minutes, 1) if period_minutes is not None else None,
-                "avg_per_min": round(avg_per_min, 2) if avg_per_min is not None else None,
+                "period_minutes": p_min,
+                "avg_per_min": avg_per_min,
             }
             _stats_cache.set(rates_key, rates, ttl=5)
         else:
             # Cached sliding rates, but the period average follows the current filter.
             period_minutes = _period_minutes(from_date, to_date, now)
-            if period_minutes is not None and totals["count"] > 0:
-                avg_per_min = totals["count"] / period_minutes
-            elif totals["count"] == 0 and period_minutes is not None:
-                avg_per_min = 0.0
-            else:
-                avg_per_min = None
+            p_min, avg_per_min = _period_rates(totals["count"], period_minutes)
             rates = {
                 **rates,
-                "period_minutes": round(period_minutes, 1) if period_minutes is not None else None,
-                "avg_per_min": round(avg_per_min, 2) if avg_per_min is not None else None,
+                "period_minutes": p_min,
+                "avg_per_min": avg_per_min,
             }
 
         sum_total = totals["total"]

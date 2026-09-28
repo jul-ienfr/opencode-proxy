@@ -25,16 +25,32 @@ Règles verrouillées ici :
   2. Ordre wire réel : Authorization, Content-Type, User-Agent,
      x-opencode-client/project/request/session (UA par endpoint : 4.0.23 en
      chat, 4.0.40 en responses — deux bundles ai-sdk mesurés).
-  3. x-opencode-request STABLE par tâche (= par message logique) : deux
+  3. BRANCHE dépendante du nom du provider (binaire 1.18.31, verbatim) :
+       headers:{...e.model.providerID.startsWith("opencode")
+         ? {...(k?{"x-opencode-project":k}:{}), "x-opencode-session":...,
+            "x-opencode-request":..., "x-opencode-client":..., "User-Agent":_i}
+         : {"x-session-affinity":..., "X-Session-Id":..., "User-Agent":_i}, ...}
+     Le provider réel s'appelle `opencodeproxy` → commence par « opencode » →
+     branche x-opencode-* (VÉRIFIÉ : capture à 243 requêtes avec ce nom).
+     Un provider nommé autrement (`capture`) reçoit x-session-affinity.
+     La jambe free copie la branche x-opencode-*, la seule fidèle au client
+     dont le provider commence par « opencode ».
+  4. Valeurs : x-opencode-client = "cli" (enum binaire
+     ["app","cli","desktop"] ; le CLI envoie « cli », mesuré 243x, alors que
+     « desktop » n'apparaît dans AUCUNE capture du vrai client) ;
+     x-opencode-project = ID de projet DÉRIVÉ, pas une constante — voir
+     Project.resolve dans test_project_id_derivation_matches_official
+     (fichier .git/opencode > commit racine, « global » hors dépôt git).
+  5. x-opencode-request STABLE par tâche (= par message logique) : deux
      envois d'une même tâche partagent le msg_, deux tâches ont des msg_
      différents (sémantique request.ts : l'ID du message utilisateur).
-  4. Face réseau = replay Bun (preset porteur OCSP/SCT + ja3 + sigalgs x9 +
+  6. Face réseau = replay Bun (preset porteur OCSP/SCT + ja3 + sigalgs x9 +
      tls_grease False + H1 + default_headers False, cf. _free_fp_override),
      PAS une face navigateur en rotation ; clé de pool `<proxy>|bun`.
-  5. Grille body : stream forcé + tools bash/read ajoutés (shims, idempotent,
+  7. Grille body : stream forcé + tools bash/read ajoutés (shims, idempotent,
      entrée jamais mutée) ; prompt_cache_key=ses_ sur responses ; collectes
      SSE→JSON pour les jambes non-stream.
-  6. IDs byte-exacts id.ts : 30 car., 12 hex + 14 base62, ascending monotone
+  8. IDs byte-exacts id.ts : 30 car., 12 hex + 14 base62, ascending monotone
      à timestamp extractible, descending inversé.
 
 Hermétique : aucun réseau, logs/ redirigé vers tmp_path, curl_cffi faké.
@@ -59,6 +75,29 @@ EXPECTED_ORDER = [
     "x-opencode-project",
     "x-opencode-request",
     "x-opencode-session",
+    # [wire complet] 4 en-têtes de transport posés EXPLICITEMENT, dans l'ordre
+    # du client (mesuré 243x). Avant, libcurl les plaçait autrement : Host en
+    # position 1, Accept absente, Accept-Encoding sans zstd.
+    "Connection",
+    "Accept",
+    "Host",
+    "Accept-Encoding",
+]
+
+# Ordre EXACT sur le fil chez le client officiel (12 en-têtes, mesuré 243x).
+CLIENT_WIRE_ORDER = [
+    "Authorization",
+    "Content-Type",
+    "User-Agent",
+    "x-opencode-client",
+    "x-opencode-project",
+    "x-opencode-request",
+    "x-opencode-session",
+    "Connection",
+    "Accept",
+    "Host",
+    "Accept-Encoding",
+    "Content-Length",
 ]
 
 
@@ -74,14 +113,20 @@ def official_env(monkeypatch, tmp_path):
 
 
 def test_header_set_exact(official_env):
-    """7 headers officiels, ni plus ni moins (aucun header navigateur,
-    et PAS d'Accept explicite — le transport Bun l'ajoute en 9ᵉ position,
-    un Accept explicite serait trié premier et trahirait la copie)."""
-    h = oc._official_free_headers()
+    """Wire complet : les en-tetes du client, dans l'ordre du client.
+
+    [2e passe] Le client officiel envoie 12 en-tetes (mesure 243x) : les 7 de
+    la couche ai-sdk PUIS Connection, Accept, Host, Accept-Encoding,
+    Content-Length. Les 11 premiers sont poses ici ; Content-Length est genere
+    par le transport. AVANT ce correctif, la jambe free n'en envoyait que 10 :
+    Accept et Connection manquaient, Host partait en position 1 et
+    Accept-Encoding valait gzip, deflate, br au lieu de gzip, deflate, br, zstd.
+    Aucun en-tete navigateur, et jamais x-api-key (invariant A.0).
+    """
+    h = oc._official_free_headers("https://opencode.ai/zen/v1/chat/completions")
     assert list(h.keys()) == EXPECTED_ORDER
     lower = {k.lower() for k in h}
     for banned in (
-        "accept",
         "accept-language",
         "sec-ch-ua",
         "sec-ch-ua-mobile",
@@ -97,17 +142,75 @@ def test_header_set_exact(official_env):
 
 
 def test_header_values_official(official_env):
-    """Valeurs exactes du client officiel (captures desktop v1.18.31)."""
+    """Valeurs exactes du client officiel (captures v1.18.31, provider réel).
+
+    Mesuré sur le captureur avec le provider NOMMÉ `opencodeproxy` (243
+    requêtes) ET dans logs/debug.log (20 occurrences) :
+      x-opencode-client  = "cli"   (enum binaire : ["app","cli","desktop"])
+      x-opencode-project = ID de projet dérivé (ici le contenu de
+                           .git/opencode), PAS la constante "global"
+
+    Le binaire 1.18.31 (Project.resolve) :
+      let F = repo.discover(dir)
+      if(!F) return {id: ID.global}                    # hors dépôt git
+      let I = readFileString(join(commonDirectory,"opencode"))
+      let L = (git remote → hash) ?? I ?? rootCommit
+      return {id: L ?? ID.global}
+    Hors dépôt git, le client envoie littéralement "global" (vérifié par
+    capture : dossier temp hors repo → x-opencode-project: global).
+    """
     h = oc._official_free_headers()
     assert h["User-Agent"] == oc._OPENCODE_OFFICIAL_UA
     assert h["User-Agent"] == "opencode/1.18.31 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14"
     assert h["Authorization"] == "Bearer public"
-    assert h["x-opencode-client"] == "desktop"
-    assert h["x-opencode-project"] == "global"
+    assert h["x-opencode-client"] == "cli", (
+        "le CLI officiel envoie 'cli' (mesuré 243x) ; 'desktop' n'apparaît "
+        "dans aucune capture du vrai client"
+    )
     assert h["Content-Type"] == "application/json"
+    # project = ID dérivé de git, ou "global" hors dépôt git. Jamais vide.
+    proj = h["x-opencode-project"]
+    assert proj, "x-opencode-project ne doit jamais être vide"
+    assert re.fullmatch(r"(global|[0-9a-f]{40})", proj), proj
+    if oc._OPENCODE_PROJECT == "global":
+        assert proj == "global"
+    else:
+        assert proj == oc._OPENCODE_PROJECT
     assert "Accept" not in h, "Accept must stay transport-added (9th), never explicit"
     assert MSG_RE.fullmatch(h["x-opencode-request"]), h["x-opencode-request"]
     assert SES_RE.fullmatch(h["x-opencode-session"]), h["x-opencode-session"]
+
+
+def test_client_name_enum_matches_binary(official_env):
+    """L'enum du binaire est ["app","cli","desktop"] : on envoie un membre."""
+    assert oc._OPENCODE_CLIENT_NAME in ("app", "cli", "desktop")
+
+
+def test_project_id_derivation_matches_official(official_env, monkeypatch, tmp_path):
+    """Project.resolve : .git/opencode > commit racine > "global".
+
+    Vérifie la dérivation elle-même, pas la valeur du dépôt courant.
+    """
+    import subprocess as sp
+
+    # 1. Dépôt git avec .git/opencode → la valeur du fichier gagne.
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    sp.run(["git", "init", "-q"], cwd=repo, check=False, capture_output=True)
+    (repo / ".git" / "opencode").write_text("deadbeef" * 5, encoding="utf-8")
+    monkeypatch.chdir(repo)
+    assert oc._official_project_id() == "deadbeef" * 5
+
+    # 2. Dépôt git SANS .git/opencode → repli commit racine s'il existe.
+    (repo / ".git" / "opencode").unlink()
+    val = oc._official_project_id()
+    assert re.fullmatch(r"(global|[0-9a-f]{40})", val), val
+
+    # 3. Hors dépôt git → "global" exactement (mesuré sur le vrai client).
+    hors = tmp_path / "hors"
+    hors.mkdir()
+    monkeypatch.chdir(hors)
+    assert oc._official_project_id() == "global"
 
 
 def test_ua_per_endpoint(official_env):
@@ -160,11 +263,14 @@ def test_hostile_profile_extras_never_reach_free(official_env):
             "Cookie": "session=abc",
         },
     }
-    h = oc._official_free_headers()
+    h = oc._official_free_headers("https://opencode.ai/zen/v1/chat/completions")
     lower = {k.lower(): v for k, v in h.items()}
     for k in hostile["extra_headers"]:
         assert k.lower() not in lower, f"profile extra {k!r} leaked to free"
     assert set(h.keys()) == set(EXPECTED_ORDER)
+    # Le jeu ferme comprend EXACTEMENT les en-tetes du client : hors extras
+    # hostiles, il ne doit rien contenir d'autre.
+    assert set(h) == set(CLIENT_WIRE_ORDER) - {"Content-Length"}
 
 
 class _FakeCurlResp:
@@ -248,6 +354,9 @@ async def test_bun_replay_non_stream(official_env, monkeypatch):
     assert fp["extra_fp"] == {
         "tls_signature_algorithms": list(oc._OPENCODE_SIG_ALGS),
         "tls_grease": False,
+        # [ordre exact] header_order place Connection en 8e position comme
+        # le client (libcurl la mettrait en dernier). Cf. sonde AK.
+        "header_order": oc._OPENCODE_HEADER_ORDER,
     }
     assert len(oc._OPENCODE_SIG_ALGS) == 9
     assert fp["http_version"] == "v1"  # Bun = HTTP/1.1 uniquement
@@ -390,14 +499,26 @@ def test_free_wire_body_responses_prompt_cache_key(official_env):
 
 
 def test_free_wire_body_passthrough():
-    """Non-dict, ni-chat-ni-responses, ou déjà conforme → inchangé."""
+    """Non-dict, ni-chat-ni-responses → inchangé (identité, zéro copie).
+
+    NB : un corps chat AVEC tools n'est plus un passthrough, même s'il porte
+    déjà la grille bash/read — il lui manque ``tool_choice: "auto"``, que le
+    client officiel pose 242/242 fois (mesuré). Voir
+    test_free_body_conformite.py::test_tool_choice_auto_added_when_tools_present.
+    """
     assert oc._free_wire_body(b"raw") == (b"raw", False)
     assert oc._free_wire_body({"model": "m"}) == ({"model": "m"}, False)
     full = {"model": "m", "messages": [],
             "tools": [{"type": "function", "function": {"name": n}} for n in ("bash", "read")],
+            "tool_choice": "auto",
             "stream": True}
     wire, forced = oc._free_wire_body(full, force_stream=True)
-    assert forced is False and wire is full
+    # Deja conforme : grille complete + tool_choice pose + stream vrai.
+    assert forced is False
+    assert wire["tool_choice"] == "auto"
+    assert wire == full or list(wire) == [
+        "model", "messages", "tools", "tool_choice", "stream",
+    ]
 
 
 def test_collect_chat_completion():

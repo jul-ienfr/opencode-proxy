@@ -20,7 +20,7 @@ from httpx import ASGITransport, AsyncClient
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import dashboard.api as api
-from dashboard.api import _period_minutes, register_dashboard
+from dashboard.api import _period_minutes, _period_rates, register_dashboard
 
 _TS_FMT = "%Y-%m-%dT%H:%M:%SZ"
 
@@ -182,6 +182,56 @@ async def test_no_bounds_avg_is_none(rates_app):
     data = await _get_stats(rates_app)
     assert data["rates"]["avg_per_min"] is None
     assert data["rates"]["period_minutes"] is None
+
+
+class TestPeriodRatesCohérence:
+    """_period_rates : avg_per_min doit se réconcilier avec la période PUBLIÉE.
+
+    Régression (détectée par test_sliding_independent_of_period) : l'API
+    calculait avg_per_min depuis la période BRUTE mais publiait la période
+    ARRONDIE à 1 décimale. Les deux nombres affichés côte à côte étaient donc
+    incohérents : 8 requêtes sur une période réelle de 7,0499 min s'affichaient
+    « 7,0 min » mais donnaient 1,13 req/min, alors que 8 / 7,0 = 1,14.
+    """
+
+    def test_reconcilie_periode_arrondie(self):
+        """count / period_minutes PUBLIÉS == avg_per_min publié."""
+        p_min, avg = _period_rates(8, 7.0499)
+        assert p_min == 7.0  # arrondi à 1 décimale, ce qui est affiché
+        assert avg == round(8 / 7.0, 2) == 1.14
+        # Le contrôle que faisait l'utilisateur à l'écran doit tomber juste.
+        assert avg == pytest.approx(8 / p_min, abs=0.005)
+
+    def test_cas_historique_1_13(self):
+        """Le cas exact qui échouait : 1,13 (brut) vs 1,14 (arrondi)."""
+        _, avg = _period_rates(8, 7.0499)
+        assert avg == 1.14, "régression : retour au calcul sur la période brute"
+        assert avg != 1.13
+
+    def test_periode_indeterminee(self):
+        """Période None → les deux None (la tuile affiche « — »)."""
+        assert _period_rates(5, None) == (None, None)
+
+    def test_zero_requete(self):
+        """Période connue mais 0 requête → avg 0.0, jamais None."""
+        p_min, avg = _period_rates(0, 120.0)
+        assert p_min == 120.0
+        assert avg == 0.0
+
+    def test_periode_arrondie_a_zero_ne_divise_pas(self):
+        """Période < 0,05 min : on garde la valeur brute (pas de div. par 0)."""
+        p_min, avg = _period_rates(3, 0.01)
+        assert p_min == 0.01  # pas 0.0 -> sinon ZeroDivisionError
+        assert avg == round(3 / 0.01, 2)
+
+    @pytest.mark.parametrize(
+        ("count", "minutes"),
+        [(1, 1.0), (7, 60.0), (100, 1440.0), (3, 0.5), (9, 7.0499), (2, 33.333)],
+    )
+    def test_coherence_generale(self, count, minutes):
+        """Pour tout couple, avg == count / période publiée (arrondi 2 déc.)."""
+        p_min, avg = _period_rates(count, minutes)
+        assert avg == round(count / p_min, 2), (count, minutes, p_min, avg)
 
 
 def test_sliding_uses_timestamp_index(rates_db):

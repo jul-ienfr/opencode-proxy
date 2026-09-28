@@ -128,8 +128,6 @@ models:
     protocol: openai
   deepseek-v4.1-flash:
     protocol: openai
-  union-alpha:
-    protocol: openai
   jev-1.13-free:
     protocol: openai
     endpoint: https://opencode.ai/zen/v1/systemone
@@ -143,6 +141,12 @@ models:
   mimo-v2.6-flash:
     protocol: openai
   grok-4.7:
+    protocol: openai
+  space-bunny-free:
+    protocol: openai
+  gpt-6-luna:
+    protocol: openai
+  longcat-2.5-preview-free:
     protocol: openai
 free_model_map:
   mimo-v2.5: mimo-v2.5-free
@@ -428,6 +432,19 @@ cache:
   max_size: 1000
   ttl: 300
   min_prompt_size: 2000
+server_compaction:
+  enabled: false
+  summary_max_tokens: 2048
+  keep_recent_pairs: 4
+  summarizer_model_override: null
+  timeout_s: 60
+  max_attempts: 1
+  min_chars_implicit: 1000
+  overflow_markers: null
+  class_policy: auto
+  native_passthrough: true
+  keep_tail: true
+  summary_paid_bypass: false
 circuit_breaker:
   failure_threshold: 5
   recovery_timeout: 60

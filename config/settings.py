@@ -419,6 +419,83 @@ def get_429_action(default: str = "both") -> str:
     return normalize_429_action(raw, default)
 
 
+# ── Server-side compaction (voie free/payante unifiée + natifs, opt-in OFF) ──
+# Section config.yaml:
+#   server_compaction:
+#     enabled: false
+#     summary_max_tokens: 2048
+#     keep_recent_pairs: 4
+#     summarizer_model_override: null
+#     timeout_s: 60
+#     max_attempts: 1
+#     min_chars_implicit: 1000
+#     overflow_markers: null
+#     class_policy: auto            # auto|free_only|paid_only — force la classe du résumeur
+#     native_passthrough: true      # relaie verbatim les compactages natifs provider
+#     keep_tail: true               # condense-and-retry garde la queue récente verbatim
+#     summary_paid_bypass: false    # résumé client détecté : laisse passer en paid
+#                                   # même si strict_free (correctif Hermes, défaut OFF)
+#
+# Lectures LIVE (yaml_get, hot-reload safe) — pas de snapshot import-time.
+_SERVER_COMPACTION_DEFAULTS = {
+    "enabled": False,
+    "summary_max_tokens": 2048,
+    "keep_recent_pairs": 4,
+    "summarizer_model_override": None,
+    "timeout_s": 60,
+    "max_attempts": 1,
+    "min_chars_implicit": 1000,
+    "overflow_markers": None,  # None = défauts (app.compaction.overflow) ; liste custom sinon
+    "class_policy": "auto",
+    "native_passthrough": True,
+    "keep_tail": True,
+    "summary_paid_bypass": False,
+}
+
+
+def get_server_compaction(key: str | None = None, default=None):
+    """Lecteur live de la section server_compaction (config.yaml).
+
+    Sans clé → dict complet mergé sur les défauts. Avec clé → valeur typée
+    (bool/int/str/None selon la clé), défaut sûr si absente ou mal typée.
+    enabled=False par défaut : passthrough actuel inchangé (fail-open).
+    """
+    raw = yaml_get("server_compaction", default={})
+    cfg = dict(_SERVER_COMPACTION_DEFAULTS)
+    if isinstance(raw, dict):
+        for k, v in raw.items():
+            if k in cfg:
+                cfg[k] = v
+    if key is None:
+        return cfg
+    if key not in cfg:
+        return default
+    if key == "enabled":
+        return bool(cfg["enabled"]) if isinstance(cfg["enabled"], bool) else default
+    if key in ("native_passthrough", "keep_tail", "summary_paid_bypass"):
+        v = cfg[key]
+        return bool(v) if isinstance(v, bool) else default
+    if key == "class_policy":
+        v = cfg[key]
+        if isinstance(v, str) and v.strip().lower() in ("auto", "free_only", "paid_only"):
+            return v.strip().lower()
+        return default
+    if key in ("summary_max_tokens", "keep_recent_pairs", "timeout_s", "max_attempts", "min_chars_implicit"):
+        v = cfg[key]
+        return v if isinstance(v, int) and not isinstance(v, bool) and v > 0 else default
+    if key == "summarizer_model_override":
+        v = cfg[key]
+        return v if (v is None or (isinstance(v, str) and v.strip())) else default
+    if key == "overflow_markers":
+        v = cfg[key]
+        if v is None:
+            return default
+        if isinstance(v, (list, tuple)) and all(isinstance(x, str) for x in v):
+            return list(v)
+        return default
+    return cfg[key]
+
+
 # ── Geo (P1 — single source config.yaml:geo, kill-switch enabled:false) ─
 # Source: https://ai.developer.meta.com/legal/geographic-use-policy
 # Snapshot 2026-08-20 JS-rendered — WebFetch returned empty skeleton, manual

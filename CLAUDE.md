@@ -127,46 +127,9 @@ Pour éviter `Autocompact thrashing` (contexte qui se remplit en 2-3 tours) :
 - Logs/DB : jamais `Read` sur `logs/requests.db` (3 Go) ou `logs/debug.log` → `Bash: tail -n 50 logs/debug.log` ou `sqlite3 logs/requests.db "SELECT ... LIMIT 20"`.
 - Fichiers ignorés par `.claudeignore` : `logs/`, `.kilo/`, `*.db`, `*.log` — ne pas les forcer.
 
-## Remote Server Maintenance (192.168.31.101)
+## Runtime local (cette machine Windows)
 
-Le serveur distant est une Ubuntu 24.04 qui héberge d'autres workloads (P-core, etc.).
-
-### Problème connu : VS Code Remote-SSH
-
-La connexion VS Code Remote-SSH peut échouer avec l'erreur `AsyncPipeFailed(NotFound)` quand :
-- Le disque racine est > 90% (actuellement ~78% après nettoyage)
-- Les jobs P-core saturent le CPU (load > 150)
-- Le swap est saturé
-
-### Nettoyage rapide
-
-Sur la machine distante :
-```bash
-fix-vscode              # Tue les processus + nettoie l'état VS Code
-~/scripts/clean-vscode-server.sh --rotate  # Rotation des logs seulement
-~/scripts/clean-vscode-server.sh --check   # Vérification de l'état
-```
-
-Un cron de rotation des logs tourne chaque dimanche à 3h00.
-
-### Swap
-
-18.1 Go de swap total :
-- `/swap.img` : 6.1 Go (fichier original)
-- `/mnt/storage500/swap.img` : 12 Go (swap secondaire, ajouté le 29/05/2026)
-
-### P-core : Contrôle des jobs
-
-Les jobs P-core sont gérés par :
-- `pcore-scheduler.service` (daemon CronManager)
-- 17 timers systemd user
-
-Modifications effectuées le 29/05/2026 :
-- `prediction-core-live-observer.timer` : passage de 5 min → 15 min
-- `pcore-calibration.timer` : décalé de 03:00 → 04:00 (conflit avec backup)
-
-### Taille de la partition
-
-P-core a été déplacé vers `/mnt/storage500/P-core/` avec un symlink :
-```
-/home/jul/P-core -> /mnt/storage500/P-core/
+Le proxy tourne EN LOCAL sur cette machine : `pythonw opencode.py --gui`
+(system tray + dashboard, http://localhost:4000). Pas de serveur distant,
+pas de SSH, pas de systemd/Docker : restart = tuer le process pythonw et
+relancer. Ne jamais supposer ni proposer un déploiement distant.

@@ -14,7 +14,10 @@ can only be used from within OpenCode ») sauf identité client-officiel.
 Le nouveau contrat free (cf. _official_free_headers) EXIGE donc :
   * Authorization: Bearer public EXACTEMENT (la clé payante ne part jamais)
   * User-Agent officiel opencode/<ver> (plus de face navigateur chrome)
-  * x-opencode-client: desktop / x-opencode-project: global
+  * x-opencode-client: cli (enum binaire ["app","cli","desktop"] ; le CLI
+    envoie « cli », mesuré 243x — « desktop » n'apparaît dans aucune capture)
+  * x-opencode-project: ID de projet dérivé (fichier .git/opencode > commit
+    racine), « global » hors dépôt git (Project.resolve, binaire 1.18.31)
   * x-opencode-request: msg_<ID ascendant> STABLE par message logique
     (1 ID par requête proxy, partagé par tous les essais — sémantique
     client, cf. request.ts ; voir test_official_client_parity.py)
@@ -225,11 +228,13 @@ def assert_official_free_identity(label, headers):
     assert headers.get("user-agent") == oc._OPENCODE_OFFICIAL_UA, (
         f"{label}: official UA expected, got {headers.get('user-agent')!r}"
     )
-    assert headers.get("x-opencode-client") == "desktop", (
-        f"{label}: x-opencode-client must be 'desktop', got {headers.get('x-opencode-client')!r}"
+    assert headers.get("x-opencode-client") == oc._OPENCODE_CLIENT_NAME, (
+        f"{label}: x-opencode-client must be the official client name "
+        f"{oc._OPENCODE_CLIENT_NAME!r}, got {headers.get('x-opencode-client')!r}"
     )
-    assert headers.get("x-opencode-project") == "global", (
-        f"{label}: x-opencode-project must be 'global', got {headers.get('x-opencode-project')!r}"
+    assert headers.get("x-opencode-project") == oc._OPENCODE_PROJECT, (
+        f"{label}: x-opencode-project must be the official derived project id "
+        f"{oc._OPENCODE_PROJECT!r}, got {headers.get('x-opencode-project')!r}"
     )
     assert re.fullmatch(r"msg_[0-9a-f]{12}[0-9A-Za-z]{14}", headers.get("x-opencode-request", "") or ""), (
         f"{label}: bad x-opencode-request ID: {headers.get('x-opencode-request')!r}"
@@ -568,6 +573,9 @@ async def test_open_free_stream_count_false_reuses_stored_station(free_env, monk
     assert sess.get("extra_fp") == {
         "tls_signature_algorithms": list(oc._OPENCODE_SIG_ALGS),
         "tls_grease": False,
+        # [ordre exact] header_order place Connection en 8e position comme
+        # le client (libcurl la mettrait en dernier). Cf. sonde AK.
+        "header_order": oc._OPENCODE_HEADER_ORDER,
     }
     assert sess.get("http_version") == "v1"
     assert sess.get("default_headers") is False

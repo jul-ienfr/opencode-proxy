@@ -9,7 +9,18 @@ outils/system), Responses API équivalente, marqueurs Hermes
 
 import pytest
 
-from app.compaction import is_compaction_shape
+from app.compaction import (
+    build_checkpoint_summary,
+    build_condensed_history,
+    build_summarizer_body,
+    build_summary_user_text,
+    extract_previous_summary,
+    is_compaction_shape,
+    is_overflow,
+    maybe_condense,
+    run_summarizer,
+    split_keep_recent,
+)
 
 
 def _official(n=1, max_tokens=4096):
@@ -39,6 +50,20 @@ def test_short_user_text_is_not_compaction():
     assert is_compaction_shape(body) is False
     body["messages"] = [{"role": "user", "content": "x" * 1000}]
     assert is_compaction_shape(body) is True
+
+
+def test_min_chars_implicit_is_configurable():
+    # La borne est un paramètre (config.yaml:server_compaction.min_chars_implicit),
+    # pas une constante en dur : un texte de 500 chars passe avec borne=100.
+    body = {
+        "model": "haiku",
+        "messages": [{"role": "user", "content": "x" * 500}],
+    }
+    assert is_compaction_shape(body) is False
+    assert is_compaction_shape(body, min_chars_implicit=100) is True
+    # Marqueur explicite : pas de borne, même courte (on croit le client).
+    marked = {"messages": [{"role": "user", "content": "<conversation-checkpoint><summary>s</summary></conversation-checkpoint>"}]}
+    assert is_compaction_shape(marked, min_chars_implicit=10**9) is True
 
 
 def test_official_multi_user_text_shape():
@@ -191,3 +216,299 @@ def test_garbage_is_not_compaction(bad):
 def test_never_raises():
     assert is_compaction_shape({"messages": [{"role": "user", "content": [{"type": 42}]}]}) is False
     assert is_compaction_shape({"messages": [[[{"weird": object()}]]]}) is False
+
+
+# ── is_overflow : matcher 400-overflow upstream (Phase 2, déclencheur réactif) ──
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "prompt too long: max 200k tokens",
+        "Anthropic: prompt is too long",
+        "input is too long for requested model",
+        '{"error": {"code": "context_length_exceeded", "message": "too many tokens"}}',
+        "This model's maximum context length is 200000 tokens",
+        "Requested 250000 tokens, context window is 200000",
+        "input too long for model, reduce max_tokens",
+    ],
+)
+def test_overflow_true_on_400_with_marker(body):
+    assert is_overflow(400, body) is True
+
+
+@pytest.mark.parametrize(
+    "status, body",
+    [
+        (429, "prompt too long"),  # 429 + marqueur ≠ overflow (backoff, pas compaction)
+        (413, "Request body too large"),  # 413 proxy ≠ overflow modèle
+        (500, "prompt too long"),
+        (503, "overloaded"),
+        (400, "rate limit exceeded, retry later"),
+        (400, "request took too long to process"),  # timeout ≠ overflow
+        (400, ""),
+        (400, None),
+        (400, b"input too long for model"),  # bytes OK → True, cas séparé ci-dessous
+    ],
+)
+def test_overflow_false_cases(status, body):
+    expected = True if isinstance(body, bytes) else False
+    assert is_overflow(status, body) is expected
+
+
+def test_overflow_bad_status_never_raises():
+    assert is_overflow(None, "prompt too long") is False
+    assert is_overflow("bad", "prompt too long") is False
+    assert is_overflow(400, {"weird": object()}) is False
+    assert is_overflow("400", "too many tokens") is True
+
+
+def test_overflow_custom_markers():
+    assert is_overflow(400, "quota regionale depassee", markers=["regionale"]) is True
+    assert is_overflow(400, "autre chose", markers=["regionale"]) is False
+    # Liste vide / type invalide → repli sur les défauts.
+    assert is_overflow(400, "prompt too long", markers=[]) is True
+    assert is_overflow(400, "prompt too long", markers="nope") is True
+
+
+# ── truncate : forward condensé par paires complètes (Phase 2) ──
+
+
+def _u(t):
+    return {"role": "user", "content": t}
+
+
+def _a(t):
+    return {"role": "assistant", "content": t}
+
+
+def _tc(i):
+    return {"role": "assistant", "content": [{"type": "text", "text": "go"}, {"type": "tool_use", "id": i, "name": "bash", "input": {}}]}
+
+
+def _tr(i):
+    return {"role": "user", "content": [{"type": "tool_result", "tool_use_id": i, "content": "out"}]}
+
+
+def test_split_keep_recent_simple_pairs():
+    msgs = [_u("a"), _a("b"), _u("c"), _a("d"), _u("e"), _a("f")]
+    old, recent = split_keep_recent(msgs, 1)
+    assert [m["content"] for m in old] == ["a", "b", "c", "d"]
+    assert [m["content"] for m in recent] == ["e", "f"]
+
+
+def test_split_never_cuts_tool_pair():
+    # keep=1 : le récent commence sur un user — le tool_call/result reste entier
+    # d'un seul côté de la coupe (ici côté ancien, jamais orphelin côté récent).
+    msgs = [_u("x"), _a("y"), _u("do"), _tc("t1"), _tr("t1"), _u("next"), _a("ok")]
+    old, recent = split_keep_recent(msgs, 1)
+    assert [m["content"] if isinstance(m["content"], str) else "TOOLS" for m in recent] == ["next", "ok"]
+    # keep=2 : la paire outil entière bascule côté récent, jamais coupée.
+    old2, recent2 = split_keep_recent(msgs, 2)
+    assert recent2[0]["content"] == "do"
+    assert any("TOOLS" in str(m["content"]) or "tool" in str(m) for m in recent2)
+
+
+def test_split_keep_zero_and_garbage():
+    msgs = [_u("a"), _a("b")]
+    old, recent = split_keep_recent(msgs, 0)
+    assert old == msgs and recent == []
+    assert split_keep_recent(None, 2) == ([], [])
+    assert split_keep_recent("x", 2) == ([], [])
+
+
+def test_build_condensed_history_shape():
+    msgs = [_u("x"), _a("y"), _u("next"), _a("ok")]
+    condensed, kept = build_condensed_history(msgs, "  RESUME  ", 1)
+    assert condensed[0]["role"] == "user"
+    assert "<conversation-checkpoint><summary>RESUME</summary>" in condensed[0]["content"]
+    assert condensed[1:] == kept == [_u("next"), _a("ok")]
+    # Le résumé REMPLACE l'ancien : "x"/"y" ne sont plus dans le forward.
+    assert all("RESUME" not in str(m) or m is condensed[0] for m in condensed)
+
+
+def test_build_condensed_fallback_never_raises():
+    msgs = [_u("a")]
+    assert build_condensed_history(msgs, "   ", 1)[0] is None  # résumé vide
+    assert build_condensed_history([], "r", 1)[0] is None  # historique vide
+    assert build_condensed_history(None, "r", 1) == (None, None)
+
+
+def test_checkpoint_marker_is_detected_as_compaction():
+    # Le forward condensé lui-même porte le marqueur → détecté shape-compaction
+    # (exclu du cache, bypass 503) même avec un texte court.
+    cp = build_checkpoint_summary("s", 2)
+    assert is_compaction_shape({"messages": [cp]}, min_chars_implicit=10**9) is True
+
+
+# ── summarizer : réplique exacte de la requête officielle (Phase 2) ──
+
+
+def test_summarizer_body_is_official_replica():
+    b = build_summarizer_body("x" * 10, 2048)
+    # 1 seul msg user, stream:false, PAS de tools/system/thinking.
+    assert b == {"messages": [{"role": "user", "content": "x" * 10}], "max_tokens": 2048, "stream": False}
+
+
+def test_summarizer_body_caps_at_4096():
+    assert build_summarizer_body("x", 128000)["max_tokens"] == 4096  # cap officiel
+    assert build_summarizer_body("x", 512)["max_tokens"] == 512
+    assert build_summarizer_body("x", -5)["max_tokens"] == 2048  # repli sûr
+
+
+def test_previous_summary_chaining():
+    msgs = [
+        {"role": "user", "content": "<conversation-checkpoint><summary>ANCIEN</summary><recent-context>r</recent-context></conversation-checkpoint>"},
+        {"role": "user", "content": "suite"},
+    ]
+    assert extract_previous_summary(msgs) == "ANCIEN"
+    t = build_summary_user_text("HIST", "ANCIEN")
+    assert "<previous-summary>" in t and "ANCIEN" in t and "HIST" in t
+    t2 = build_summary_user_text("HIST", None)
+    assert "<previous-summary>" not in t2 and "HIST" in t2
+    assert extract_previous_summary([{"role": "user", "content": "rien"}]) is None
+    assert extract_previous_summary(None) is None
+
+
+class _FakeResp:
+    def __init__(self, status, content):
+        self.status_code = status
+        self.content = content
+
+
+@pytest.mark.asyncio
+async def test_run_summarizer_anthropic_success():
+    async def do(ep, body, h, p):
+        assert body["model"] == "m" and body["stream"] is False
+        assert "tools" not in body and "system" not in body
+        return _FakeResp(200, b'{"content": [{"type": "text", "text": "RESUME"}]}'), h
+
+    r = await run_summarizer(
+        [{"role": "user", "content": "hello world"}],
+        model_id="m", endpoint="e", protocol="anthropic",
+        auth_headers_fn=lambda p: {}, do_request_fn=do,
+    )
+    assert r == "RESUME"
+
+
+@pytest.mark.asyncio
+async def test_run_summarizer_openai_success():
+    async def do(ep, body, h, p):
+        return _FakeResp(200, b'{"choices": [{"message": {"content": "RES2"}}]}'), h
+
+    r = await run_summarizer(
+        [{"role": "user", "content": "hi there"}],
+        model_id="m", endpoint="e", protocol="openai",
+        auth_headers_fn=lambda p: {}, do_request_fn=do,
+    )
+    assert r == "RES2"
+
+
+@pytest.mark.asyncio
+async def test_run_summarizer_fail_open_returns_none():
+    async def do_400(ep, body, h, p):
+        return _FakeResp(400, b"prompt too long"), h
+
+    async def do_boom(ep, body, h, p):
+        raise TimeoutError()
+
+    kw = {"model_id": "m", "endpoint": "e", "protocol": "openai", "auth_headers_fn": lambda p: {}}
+    hist = [{"role": "user", "content": "hi there"}]
+    assert await run_summarizer(hist, do_request_fn=do_400, **kw) is None  # overflow du résumé
+    assert await run_summarizer(hist, do_request_fn=do_boom, timeout_s=5, **kw) is None  # timeout
+    assert await run_summarizer([], do_request_fn=do_400, **kw) is None  # historique vide
+    assert await run_summarizer("x", do_request_fn=do_400, **kw) is None  # garbage
+
+
+# ── react : maybe_condense (Phase 2, orchestration, jamais de raise) ──
+
+
+def _hist(n_pairs=2):
+    msgs = []
+    for i in range(n_pairs):
+        msgs.append({"role": "user", "content": f"q{i}"})
+        msgs.append({"role": "assistant", "content": f"a{i}"})
+    return msgs
+
+
+class _OkResp:
+    status_code = 200
+    content = b'{"choices": [{"message": {"content": "RESUME-CONDENSE"}}]}'
+
+
+async def _ok_do(endpoint, body, headers, protocol):
+    return _OkResp(), headers
+
+
+@pytest.mark.asyncio
+async def test_maybe_condense_disabled_returns_none():
+    # enabled:false (défaut) → None, jamais d'appel résumeur (fail-open).
+    async def _boom(*a, **k):
+        raise AssertionError("do_request_fn ne doit pas être appelé")
+
+    r = await maybe_condense(
+        _hist(), status_code=400, body_text="prompt too long",
+        model_id="m", endpoint="e", protocol="openai",
+        auth_headers_fn=lambda p: {}, do_request_fn=_boom, enabled=False,
+    )
+    assert r is None
+
+
+@pytest.mark.asyncio
+async def test_maybe_condense_non_overflow_returns_none():
+    # 429/500/400-non-marqueur → None (pas de compaction sur backoff/erreur).
+    kw = {"model_id": "m", "endpoint": "e", "protocol": "openai",
+          "auth_headers_fn": lambda p: {}, "do_request_fn": _ok_do, "enabled": True}
+    hist = _hist()
+    assert await maybe_condense(hist, status_code=429, body_text="prompt too long", **kw) is None
+    assert await maybe_condense(hist, status_code=500, body_text="prompt too long", **kw) is None
+    assert await maybe_condense(hist, status_code=400, body_text="rate limit exceeded", **kw) is None
+
+
+@pytest.mark.asyncio
+async def test_maybe_condense_overflow_condenses():
+    # 400-overflow + enabled → [checkpoint, *recent] prêt à forwarder.
+    r = await maybe_condense(
+        _hist(3), status_code=400, body_text="input is too long for model",
+        model_id="m", endpoint="e", protocol="openai",
+        auth_headers_fn=lambda p: {}, do_request_fn=_ok_do,
+        enabled=True, keep_recent_pairs=1,
+    )
+    assert isinstance(r, list) and len(r) == 3  # checkpoint + 1 paire récente
+    assert "<conversation-checkpoint><summary>RESUME-CONDENSE</summary>" in r[0]["content"]
+    assert r[1:] == _hist(3)[-2:]
+
+
+@pytest.mark.asyncio
+async def test_maybe_condense_summarizer_failure_returns_none():
+    # Résumeur en échec (400/timeout) → None, l'appelant relaie l'overflow intact.
+    async def _do_400(ep, body, h, p):
+        class _R:
+            status_code = 400
+            content = b"prompt too long"
+        return _R(), h
+
+    async def _do_boom(ep, body, h, p):
+        raise TimeoutError()
+
+    kw = {"status_code": 400, "body_text": "prompt too long", "model_id": "m",
+          "endpoint": "e", "protocol": "openai", "auth_headers_fn": lambda p: {},
+          "enabled": True, "timeout_s": 5}
+    hist = _hist()
+    assert await maybe_condense(hist, do_request_fn=_do_400, **kw) is None
+    assert await maybe_condense(hist, do_request_fn=_do_boom, **kw) is None
+
+
+@pytest.mark.asyncio
+async def test_maybe_condense_never_raises():
+    # Garbage partout → None, jamais d'exception (fail-open total).
+    r = await maybe_condense(
+        "pas-une-liste", status_code="???", body_text=object(),
+        model_id="m", endpoint="e", protocol="openai",
+        auth_headers_fn=lambda p: 1 / 0, do_request_fn=None, enabled=True,
+    )
+    assert r is None
+    assert await maybe_condense(None, status_code=400, body_text="prompt too long",
+                                model_id="m", endpoint="e", protocol="openai",
+                                auth_headers_fn=lambda p: {}, do_request_fn=_ok_do,
+                                enabled=True) is None

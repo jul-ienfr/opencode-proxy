@@ -65,6 +65,16 @@ tmp/
 tests/_*.txt
 *_diff_tmp.txt
 
+# Sondes/captures jetables de conformite (prefixe `_`, meme convention que
+# `logs/_*` et `tests/_*.txt`). Regenerables a la demande, jamais des sources :
+# sans exclusion elles polluent `ruff check .` et `git status`.
+scripts/_*.py
+# Meme convention pour les sondes jetables ecrites a la RACINE (repros de
+# diagnostic en lecture seule). Sans exclusion elles apparaissent dans
+# `git status` et `ruff check .` alors qu'elles ne sont pas des sources.
+_repro_*.py
+_repro*.txt
+
 # AI transcripts / temp extracts at repo root (plan v10 §14.4.6)
 _tmp_*
 # Scripts jetables a la racine (ex: tmp_decrypt.py, tmp_extract*.py)

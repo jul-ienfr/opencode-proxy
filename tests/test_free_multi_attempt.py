@@ -97,8 +97,8 @@ def assert_no_paid_artifacts(label, headers, body=""):
     assert ua == oc._OPENCODE_OFFICIAL_UA, (
         f"{label}: official UA expected, got {ua!r}"
     )
-    assert headers.get("x-opencode-client") == "desktop", f"{label}: bad x-opencode-client"
-    assert headers.get("x-opencode-project") == "global", f"{label}: bad x-opencode-project"
+    assert headers.get("x-opencode-client") == oc._OPENCODE_CLIENT_NAME, f"{label}: bad x-opencode-client"
+    assert headers.get("x-opencode-project") == oc._OPENCODE_PROJECT, f"{label}: bad x-opencode-project"
     assert re.fullmatch(r"msg_[0-9a-f]{12}[0-9A-Za-z]{14}", headers.get("x-opencode-request", "") or ""), (
         f"{label}: bad x-opencode-request ID: {headers.get('x-opencode-request')!r}"
     )

@@ -105,6 +105,29 @@ def test_systemone_free_passthrough_anonymous(client):
     assert wire["questions"]["is_urgent"]["type"] == "noul"
 
 
+def test_systemone_accepts_dict_state_passthrough(client):
+    """state dict → accepté et relayé TEL QUEL (pas de 400 proxy, pas de
+    stringification : l'amont tranche du format)."""
+    payload = _body("jev-1.13-free")
+    payload["state"] = {"task": "triage", "context": "payments failing"}
+    r = client.post("/v1/systemone", json=payload)
+    assert r.status_code == 200, r.text
+
+    fake = client._systemone_fake
+    assert len(fake.calls) == 1
+    wire = json.loads(fake.calls[0]["content"])
+    assert wire["state"] == {"task": "triage", "context": "payments failing"}
+
+
+def test_systemone_rejects_empty_dict_state(client):
+    """state dict vide → 400 (jamais relayé à l'amont)."""
+    bad = _body()
+    bad["state"] = {}
+    r = client.post("/v1/systemone", json=bad)
+    assert r.status_code == 400
+    assert client._systemone_fake.calls == []
+
+
 def test_systemone_rejects_chat_payload(client):
     """Pas de state/questions → 400 (jamais relayé à l'amont)."""
     r = client.post("/v1/systemone", json={"model": "jev-1.13-free", "messages": [{"role": "user", "content": "hi"}]})

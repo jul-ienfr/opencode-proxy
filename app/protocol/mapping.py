@@ -88,6 +88,37 @@ def _json_dumps_str(obj, **kw) -> str:
 _JSON_LIB = "orjson"
 
 
+def _stable_tool_id(prefix: str, *parts: Any) -> str:
+    """Id d'outil de repli : DÉTERMINISTE, jamais vide.
+
+    Deux exigences client (invariant structurel Anthropic) :
+    1. l'id ne doit jamais être vide/None — sinon le client ne peut pas
+       apparier son tool_result au tool_use et la conversation reste
+       définitivement déséquilibrée ;
+    2. l'id doit être STABLE pour un même call : si une conversation est
+       reconvertie (retry, relecture de cache, second passage), un id
+       aléatoire change à chaque fois et casse l'appariement avec le
+       tool_result déjà émis par le client.
+
+    D'où un hachage du contexte du call plutôt qu'un uuid4 : même entrée →
+    même id. ``prefix`` garde la forme attendue par l'amont (``call_``/``toolu_``).
+    """
+    seed = "\x1f".join(str(p) for p in parts)
+    digest = hashlib.sha1(seed.encode("utf-8", errors="replace")).hexdigest()
+    return f"{prefix}{digest[:24]}"
+
+
+def _tool_id_or_stable(raw: Any, prefix: str, *parts: Any) -> str:
+    """Id d'outil existant s'il est exploitable, sinon id stable dérivé.
+
+    ``dict.get(k, default)`` ne suffit PAS : il rend la valeur présente
+    (None, "", 0) au lieu du défaut. Test de véracité obligatoire.
+    """
+    if isinstance(raw, str) and raw.strip():
+        return raw
+    return _stable_tool_id(prefix, *parts)
+
+
 def _has_server_side_history(body) -> bool:
     """True si l'historique vit côté serveur (chaînage Responses).
 
@@ -1341,7 +1372,15 @@ def anthropic_to_openai(body: dict, model: str, raw: bytes | None = None) -> dic
                     continue
                 tool_calls.append(
                     {
-                        "id": block.get("id", f"call_{uuid.uuid4().hex[:8]}"),
+                        "id": _tool_id_or_stable(
+                            block.get("id"),
+                            "call_",
+                            _tool_name.strip(),
+                            # Position du tool_use DANS ce message : déterministe
+                            # (même body → même id) et unique (deux appels
+                            # identiques du même outil reçoivent 0 puis 1).
+                            len(tool_calls),
+                        ),
                         "type": "function",
                         "function": {
                             "name": _tool_name.strip(),
@@ -2006,7 +2045,7 @@ def openai_to_anthropic(resp: dict, model: str, name_map: dict | None = None) ->
         blocks.append(
             {
                 "type": "tool_use",
-                "id": tc.get("id", f"toolu_{uuid.uuid4().hex[:8]}"),
+                "id": _tool_id_or_stable(tc.get("id"), "toolu_", len(blocks)),
                 # [Lot L4 — A8] Restore : le client doit retrouver le nom qu'il a
                 # envoyé (la limite 64 est une contrainte de l'amont Chat, pas
                 # du client Anthropic, qui autorise 200).
@@ -2276,7 +2315,7 @@ def openai_to_anthropic_request(oai_body: dict) -> dict:
             blocks.append(
                 {
                     "type": "tool_use",
-                    "id": tc.get("id", f"toolu_{uuid.uuid4().hex[:8]}"),
+                    "id": _tool_id_or_stable(tc.get("id"), "toolu_", len(blocks)),
                     "name": fn.get("name", ""),
                     "input": inp,
                 }
@@ -2469,7 +2508,9 @@ def anthropic_to_openai_response(anthro: dict, model: str) -> dict:
         elif t == "tool_use":
             tool_calls.append(
                 {
-                    "id": block.get("id", f"call_{uuid.uuid4().hex[:12]}"),
+                    "id": _tool_id_or_stable(
+                        block.get("id"), "call_", block.get("name", ""), len(tool_calls)
+                    ),
                     "type": "function",
                     "function": {
                         "name": block.get("name", ""),
@@ -2689,7 +2730,12 @@ def openai_responses_to_anthropic(body: dict) -> dict:
                     "content": [
                         {
                             "type": "tool_use",
-                            "id": item.get("call_id") or item.get("id") or f"toolu_{uuid.uuid4().hex[:12]}",
+                            "id": _tool_id_or_stable(
+                                item.get("call_id") or item.get("id"),
+                                "toolu_",
+                                item.get("name", ""),
+                                len(anthro_messages),
+                            ),
                             "name": item.get("name", ""),
                             "input": inp,
                         }
@@ -2869,7 +2915,9 @@ def anthropic_to_openai_responses(anthro: dict, model: str, name_map: dict | Non
             function_calls.append(
                 {
                     "type": "function_call",
-                    "call_id": block.get("id", f"call_{uuid.uuid4().hex[:12]}"),
+                    "call_id": _tool_id_or_stable(
+                        block.get("id"), "call_", block.get("name", ""), len(function_calls)
+                    ),
                     # [TROU 3 — A8] Symétrie avec ``_responses_to_anthropic_response``
                     # / ``_responses_to_chat_response`` : le nom RÉELLEMENT émis au
                     # client est le nom d'origine (la map est construite à l'aller
@@ -2968,7 +3016,9 @@ def openai_chat_to_responses(chat_resp: dict, model: str, name_map: dict | None 
         output_items.append(
             {
                 "type": "function_call",
-                "call_id": tc.get("id", f"call_{uuid.uuid4().hex[:12]}"),
+                "call_id": _tool_id_or_stable(
+                    tc.get("id"), "call_", fn.get("name", ""), len(output_items)
+                ),
                 # [TROU 3 — A8] Restore-retour : le client reçoit le nom qu'il a
                 # envoyé, jamais le raccourci interne de la borne 64.
                 "name": restore_tool_name(fn.get("name", ""), name_map),
@@ -3944,7 +3994,10 @@ def _sanitize_native_responses_request(req: dict) -> dict:
         req["input"] = _strip_responses_item_ids(req["input"])
         _remap_responses_history_names(req["input"], name_map)
     if req.get("tool_choice") is not None:
-        req["tool_choice"] = _remap_responses_tool_choice(req["tool_choice"], name_map)
+        # [FIX tour vide] {"type":"auto"} → "auto" (cf. _normalize_responses_tool_choice).
+        req["tool_choice"] = _remap_responses_tool_choice(
+            _normalize_responses_tool_choice(req["tool_choice"]), name_map
+        )
     # Parité SDK : store:false + reasoning → include encrypted_content (rejeu).
     _ensure_encrypted_content_include(req)
     if name_map:
@@ -4152,6 +4205,42 @@ def _relay_response_format(req: dict, source: dict) -> None:
         _debug(f"  [convert] DROP response_format type={rtype!r} → inconnu côté Responses")
 
 
+def _normalize_responses_tool_choice(tc):
+    """[FIX tour vide] Formes ``{"type": ...}`` → ``"auto"``, seule valeur admise.
+
+    L'upstream ``/v1/responses`` refuse en 400 tout ``tool_choice`` non nommé :
+    « tool_choice did not match any supported type ». Un client Anthropic/Chat
+    envoie ``{"type": "auto"}`` ; recopié verbatim par la conversion, il faisait
+    échouer la requête. Sur la jambe free l'échec était avalé en **tour vide**
+    (input ~50 000, output ~40 tokens) : le compactage client recevait un résumé
+    vide et la tâche se figeait.
+
+    Preuve live (``muse-spark-1.3-contributor-free``, via ``/v1/responses``) :
+
+    ==============================  ===========================
+    ``tool_choice`` envoyé          résultat
+    ==============================  ===========================
+    absent / ``"auto"``             200, contenu normal
+    ``"none"``, ``"required"``      refus amont
+    ``"any"``                       refus amont
+    ``{"type": <auto|none|…>}``     refus amont
+    ==============================  ===========================
+
+    ``"auto"`` est donc la **seule** valeur qui passe. On y ramène toutes les
+    formes non nommées ; la perte de sémantique de ``none``/``required`` est
+    signalée en debug. Les formes NOMMÉES (``function``/``tool``/``name``) ne
+    sont pas touchées ici : elles relèvent de ``_remap_responses_tool_choice``.
+    """
+    if not isinstance(tc, dict):
+        return tc
+    _t = tc.get("type")
+    if _t in ("auto", "none", "required", "any"):
+        if _t != "auto":
+            _debug(f"  [convert] tool_choice {{'type': {_t!r}}} → 'auto' (/responses ne l'accepte pas)")
+        return "auto"
+    return tc
+
+
 def _ensure_encrypted_content_include(req: dict) -> None:
     """Ajoute ``reasoning.encrypted_content`` à ``include`` quand store===False (parité SDK).
 
@@ -4279,6 +4368,11 @@ def _chat_to_responses_request(chat: dict) -> dict:
                 inp.append(item)
         elif isinstance(content, list):
             parts: list[dict] = []
+            # [FIX tour vide] Un placeholder de texte doit suivre le rôle : sur un
+            # message `assistant` l'upstream /responses refuse `input_text`
+            # (« content type `input_text` is not valid on `assistant` messages »)
+            # et la requête part en 400, avalé en tour vide sur la jambe free.
+            _ph_type = "output_text" if role == "assistant" else "input_text"
             for b in content:
                 if not isinstance(b, dict):
                     continue
@@ -4297,10 +4391,23 @@ def _chat_to_responses_request(chat: dict) -> dict:
                     # ou data URI base64 tel quel) — jamais image_base64 /
                     # mime_type (rejet 400 upstream : "requires either
                     # image_url or file_id").
-                    parts.append({"type": "input_image", "image_url": _img_url})
+                    # [FIX tour vide] `input_image` n'est valide que sur un
+                    # message non-assistant ; sur un assistant on replie en
+                    # placeholder typé (même règle que les autres placeholders).
+                    if role == "assistant":
+                        _debug("  [convert] DROP image_url sur assistant → placeholder (input_image invalide)")
+                        parts.append({"type": _ph_type, "text": "[image]"})
+                    else:
+                        parts.append({"type": "input_image", "image_url": _img_url})
                 elif b.get("type") == "file":
                     _fobj = b.get("file") or {}
                     if not isinstance(_fobj, dict):
+                        continue
+                    if role == "assistant":
+                        # [FIX tour vide] `input_file` invalide sur un assistant :
+                        # repli en placeholder typé plutôt qu'un 400 avalé.
+                        _debug("  [convert] DROP file sur assistant → placeholder (input_file invalide)")
+                        parts.append({"type": _ph_type, "text": "[file]"})
                         continue
                     if _fobj.get("file_id"):
                         parts.append({"type": "input_file", "file_id": _fobj["file_id"]})
@@ -4341,21 +4448,25 @@ def _chat_to_responses_request(chat: dict) -> dict:
                     _ca = b.get("input_audio") if isinstance(b.get("input_audio"), dict) else {}
                     _cdata = (_ca or {}).get("data", "") or ""
                     _cfmt = str((_ca or {}).get("format", "") or "").lower()
-                    if _cdata and _cfmt in ("wav", "mp3"):
+                    if _cdata and _cfmt in ("wav", "mp3") and role != "assistant":
                         parts.append({"type": "input_audio", "input_audio": {"data": _cdata, "format": _cfmt}})
+                    elif _cdata and _cfmt in ("wav", "mp3"):
+                        # [FIX tour vide] `input_audio` invalide sur un assistant.
+                        _debug("  [convert] DROP input_audio sur assistant → placeholder")
+                        parts.append({"type": _ph_type, "text": f"[audio:{_cfmt}]"})
                     else:
                         _debug(
                             f"  [convert] DROP input_audio format={_cfmt!r} → Chat n'accepte que wav|mp3 (placeholder)"
                         )
-                        parts.append({"type": "input_text", "text": f"[audio:{_cfmt or 'unknown'}]"})
+                        parts.append({"type": _ph_type, "text": f"[audio:{_cfmt or 'unknown'}]"})
                 elif b.get("type") in ("video", "video_url"):
                     # Aucune des trois API n'accepte la vidéo : placeholder
                     # honnête (frames + transcript côté client, cf. plan).
                     _debug("  [convert] DROP video → aucune API (placeholder)")
-                    parts.append({"type": "input_text", "text": "[video:unsupported]"})
+                    parts.append({"type": _ph_type, "text": "[video:unsupported]"})
                 elif b.get("type") not in ("text", "image_url", "file"):
                     _debug(f"  [convert] DROP chat part type={b.get('type')!r} → placeholder")
-                    parts.append({"type": "input_text", "text": f"[{b.get('type') or 'unknown'}]"})
+                    parts.append({"type": _ph_type, "text": f"[{b.get('type') or 'unknown'}]"})
             if parts:
                 item = {"role": role, "content": parts}
                 if cache_ctrl:
@@ -4370,7 +4481,9 @@ def _chat_to_responses_request(chat: dict) -> dict:
                     f"  [convert] SKIP function_call with empty name call_id={tc.get('call_id') or tc.get('id', '?')}"
                 )
                 continue
-            _cid = tc.get("call_id") or tc.get("id") or f"call_{uuid.uuid4().hex[:12]}"
+            _cid = _tool_id_or_stable(
+                tc.get("call_id") or tc.get("id"), "call_", _fn_name.strip(), len(inp)
+            )
             inp.append(
                 {
                     "type": "function_call",
@@ -4527,6 +4640,10 @@ def _chat_to_responses_request(chat: dict) -> dict:
             req[_TOOL_NAME_MAP_KEY] = _name_map
         tc = chat.get("tool_choice")
         if tc is not None:
+            # [FIX tour vide] {"type":"auto"} → "auto" AVANT le remap nommé :
+            # /responses refuse les objets à type non nommé (400 avalé en tour
+            # vide sur la jambe free).
+            tc = _normalize_responses_tool_choice(tc)
             # P0-2 : toutes les formes nommées suivent le rename.
             req["tool_choice"] = _remap_responses_tool_choice(tc, _name_map)
     else:
@@ -4846,7 +4963,12 @@ def _responses_sse_to_chat_deltas(raw_line: str, parsed=None, state: "ResponsesS
             if out_idx not in tool_index_map:
                 tool_index_map[out_idx] = len(tool_index_map)
             tool_idx = tool_index_map[out_idx]
-            call_id = item.get("call_id") or item.get("id") or f"call_{uuid.uuid4().hex[:12]}"
+            call_id = _tool_id_or_stable(
+                item.get("call_id") or item.get("id"),
+                "call_",
+                item.get("name", ""),
+                len(tool_index_map),
+            )
             # Restore-retour : le client reçoit le nom original, jamais le
             # raccourci sanitizé envoyé à l'upstream.
             _sse_name_map = state.tool_name_map if state is not None else None

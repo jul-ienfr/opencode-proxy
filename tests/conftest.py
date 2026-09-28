@@ -1,8 +1,91 @@
 import os
+import tempfile
 
 import pytest
 
 pytest_plugins = ["pytest_asyncio"]
+
+_MKDIR_0700_BROKEN = None  # cache de sonde (None = pas encore sondé)
+
+
+def _fix_mkdir_0700_enumeration() -> bool:
+    """[FIX env] ``os.mkdir(path, mode=0o700)`` → dossier NON énumérable.
+
+    ``_pytest/tmpdir.py`` crée ses dossiers via ``mkdir(mode=0o700)`` (lignes
+    133/152/162/166) puis ``cleanup_dead_symlinks()`` fait ``root.iterdir()``.
+    Sur certaines couches de fichiers (bac à sable Windows), le mode 0o700 est
+    traduit en refus d'accès : le dossier existe, ``st_mode`` vaut bien 0o40777
+    et ses attributs Windows sont identiques à ceux d'un ``mkdir(p)`` normal,
+    mais toute énumération lève ``PermissionError`` — et ``chmod`` échoue aussi.
+
+    Résultat : 13 ``ERROR at setup`` sur le premier test réclamant ``tmp_path``
+    (``tests/test_official_client_parity.py``), sans rapport avec le code testé.
+
+    Correctif : neutraliser le mode sur les SEULS appels ``os.mkdir`` dont le
+    mode vaut exactement 0o700, et uniquement si la sonde prouve que
+    l'environnement est touché. Read-only ailleurs, no-op sur une machine saine.
+
+    Sonde unique (résultat mis en cache module-level). Elle crée un dossier
+    0o700 puis tente de l'énumérer. Si le bug est présent, ce dossier est
+    indestructible (``rmdir``/``chmod`` refusés) : il reste alors un dossier vide
+    dans le temp du bac à sable. C'est le prix de la détection — préférable à un
+    patch inconditionnel qui modifierait le comportement d'une machine saine.
+    """
+    global _MKDIR_0700_BROKEN
+    if _MKDIR_0700_BROKEN is not None:
+        return _MKDIR_0700_BROKEN
+    try:
+        _probe = os.path.join(tempfile.gettempdir(), f"_p_{os.getpid()}")
+        os.mkdir(_probe, 0o700)
+    except OSError:
+        _MKDIR_0700_BROKEN = False
+        return False
+    try:
+        os.listdir(_probe)
+        _MKDIR_0700_BROKEN = False  # environnement sain : ne rien patcher
+    except PermissionError:
+        _MKDIR_0700_BROKEN = True  # confirmé : le mode 0o700 casse l'énumération
+    except OSError:
+        _MKDIR_0700_BROKEN = False
+    finally:
+        try:
+            os.rmdir(_probe)
+        except OSError:
+            pass
+    return _MKDIR_0700_BROKEN
+
+
+if _fix_mkdir_0700_enumeration():
+    _real_mkdir = os.mkdir
+
+    def _mkdir_enum_safe(path, mode=0o777, *args, **kwargs):
+        """``os.mkdir`` sans le mode 0o700 (cf. ``_fix_mkdir_0700_enumeration``)."""
+        if mode == 0o700:
+            mode = 0o777
+        return _real_mkdir(path, mode, *args, **kwargs)
+
+    os.mkdir = _mkdir_enum_safe
+
+    # Un dossier ``pytest-of-<user>`` empoisonné par un run PRÉCÉDENT (créé en
+    # 0o700 avant ce correctif) reste indestructible : ``rmdir`` et ``chmod`` y
+    # sont refusés. Il faut donc aussi changer de racine, sinon pytest échoue
+    # toujours sur son `iterdir()`. Surchargeable via PYTEST_DEBUG_TEMPROOT.
+    if not os.environ.get("PYTEST_DEBUG_TEMPROOT"):
+        try:
+            _user = __import__("getpass").getuser()
+        except Exception:
+            _user = ""
+        _stale = os.path.join(tempfile.gettempdir(), f"pytest-of-{_user or 'unknown'}")
+        if os.path.isdir(_stale):
+            try:
+                os.listdir(_stale)  # accessible : rien à faire
+            except OSError:
+                _fresh = os.path.join(tempfile.gettempdir(), "pytest-dshroot")
+                try:
+                    os.makedirs(_fresh, exist_ok=True)
+                    os.environ["PYTEST_DEBUG_TEMPROOT"] = _fresh
+                except OSError:
+                    pass
 
 
 @pytest.fixture(autouse=True)
