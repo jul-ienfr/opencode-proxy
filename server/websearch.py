@@ -34,6 +34,16 @@ DDG_CACHE_MAX = 512
 DDG_CACHE_TTL_S = 300
 DDG_LOCKS_MAX = 512
 FETCH_MAX_BYTES = 5_000_000
+# [P2-12] cache + singleflight du fetch (même pattern que DDG) : le résumeur
+# et les handlers fetchent souvent la même URL en rafale.
+FETCH_CACHE_MAX = 256
+FETCH_CACHE_TTL_S = 120
+FETCH_LOCKS_MAX = 256
+
+# [P2-12] regex précompilées du chemin chaud (normalize à chaque recherche,
+# fallback tags à chaque fetch sans trafilatura/bs4).
+_WS_RE = re.compile(r"\s+")
+_TAG_RE = re.compile(r"<[^>]+>")
 
 
 def _noop_log(*args, **kwargs) -> None:
@@ -45,7 +55,7 @@ def _noop_debug(*args, **kwargs) -> None:
 
 
 def normalize_query(q: str) -> str:
-    return re.sub(r"\s+", " ", q.strip().lower())[:500]
+    return _WS_RE.sub(" ", q.strip().lower())[:500]
 
 
 # Alias historique (opencode._normalize_query).
@@ -226,8 +236,18 @@ async def execute_web_fetch(
     role_client_fn,
     safe_fn,
     sem,
+    cache=None,
+    locks=None,
+    fetch_ttl_s: int = FETCH_CACHE_TTL_S,
 ) -> str:
-    """Fetch URL with SSRF guard, redirect re-validation, content guards, sem."""
+    """Fetch URL with SSRF guard, redirect re-validation, content guards, sem.
+
+    [P2-12] ``cache``/``locks`` fournis → singleflight + TTL (même pattern
+    que ``execute_ddg_search``) : N fetch concurrents de la même URL ne
+    font qu'UN HTTP. ``None`` = sans cache (comportement historique).
+    Seuls les succès sont cachés ; la clé inclut via_vpn+max_bytes (le
+    ``prompt`` n'influence pas la sortie).
+    """
     # clamps Q8A
     try:
         timeout = max(5, min(30, int(timeout)))
@@ -237,52 +257,110 @@ async def execute_web_fetch(
         max_bytes = max(2000, min(50000, int(max_bytes)))
     except Exception:
         max_bytes = 12000
-    # SSRF initial - budgeted via outer wait_for, no inner wait_for
-    if not await safe_fn(url):
-        raise ValueError(f"SSRF rejected: {url}")
-    # [plan-perf Lot 1] Client partagé par rôle : plus de handshake TLS /
-    # pool par fetch. follow_redirects + timeout restent PAR REQUÊTE
-    # (httpx 0.28), boucle de redirection + re-validation SSRF INCHANGÉES.
-    # Rôle tunnel = URL SOCKS du pool/station active (cf. _role_tunnel_url),
-    # comme les probes déjà migrées — jamais de client jetable ici.
-    _role = "tunnel" if via_vpn else "direct"
-    c = role_client_fn(_role)
-    async with sem:
-        r = await c.get(url, headers={"User-Agent": "opencode-proxy/1.0"}, follow_redirects=False, timeout=timeout)
-        for _ in range(3):
-            if r.status_code in (301, 302, 303, 307, 308):
-                loc = r.headers.get("location", "")
-                nxt = urllib.parse.urljoin(url, loc)
-                if not loc or not await safe_fn(nxt):
-                    raise ValueError(f"SSRF redirect rejected: {loc}")
-                url = nxt
-                r = await c.get(url, headers={"User-Agent": "opencode-proxy/1.0"}, follow_redirects=False, timeout=timeout)
-            else:
-                break
-        # R4 guards
-        ct = r.headers.get("content-type", "").split(";")[0].strip().lower()
-        if ct and not (ct.startswith("text/") or "json" in ct or "xml" in ct):
-            raise ValueError(f"Rejected Content-Type: {ct}")
-        if int(r.headers.get("content-length", "0") or 0) > FETCH_MAX_BYTES or len(r.content) > FETCH_MAX_BYTES:
-            raise ValueError("Content too large")
-        r.raise_for_status()
-        html = r.text[: max_bytes * 3]
-    # extraction to_thread
-    try:
-        import trafilatura
 
-        extracted = await asyncio.to_thread(trafilatura.extract, html) or ""
-    except ImportError:
-        extracted = ""
-    if not extracted:
+    async def _do_fetch(_url: str) -> str:
+        # SSRF initial - budgeted via outer wait_for, no inner wait_for
+        if not await safe_fn(_url):
+            raise ValueError(f"SSRF rejected: {_url}")
+        # [plan-perf Lot 1] Client partagé par rôle : plus de handshake TLS /
+        # pool par fetch. follow_redirects + timeout restent PAR REQUÊTE
+        # (httpx 0.28), boucle de redirection + re-validation SSRF INCHANGÉES.
+        # Rôle tunnel = URL SOCKS du pool/station active (cf. _role_tunnel_url),
+        # comme les probes déjà migrées — jamais de client jetable ici.
+        _role = "tunnel" if via_vpn else "direct"
+        c = role_client_fn(_role)
+        async with sem:
+            r = await c.get(_url, headers={"User-Agent": "opencode-proxy/1.0"}, follow_redirects=False, timeout=timeout)
+            for _ in range(3):
+                if r.status_code in (301, 302, 303, 307, 308):
+                    loc = r.headers.get("location", "")
+                    nxt = urllib.parse.urljoin(_url, loc)
+                    if not loc or not await safe_fn(nxt):
+                        raise ValueError(f"SSRF redirect rejected: {loc}")
+                    _url = nxt
+                    r = await c.get(_url, headers={"User-Agent": "opencode-proxy/1.0"}, follow_redirects=False, timeout=timeout)
+                else:
+                    break
+            # R4 guards
+            ct = r.headers.get("content-type", "").split(";")[0].strip().lower()
+            if ct and not (ct.startswith("text/") or "json" in ct or "xml" in ct):
+                raise ValueError(f"Rejected Content-Type: {ct}")
+            if int(r.headers.get("content-length", "0") or 0) > FETCH_MAX_BYTES or len(r.content) > FETCH_MAX_BYTES:
+                raise ValueError("Content too large")
+            r.raise_for_status()
+            html = r.text[: max_bytes * 3]
+        # extraction to_thread
         try:
-            from bs4 import BeautifulSoup
+            import trafilatura
 
-            extracted = await asyncio.to_thread(lambda: BeautifulSoup(html, "html.parser").get_text(separator="\n", strip=True))
+            extracted = await asyncio.to_thread(trafilatura.extract, html) or ""
         except ImportError:
-            extracted = re.sub(r"<[^>]+>", " ", html)
-    extracted = extracted[:max_bytes].strip()
-    return f"Content of {url} (extracted {len(extracted)} chars):\n{extracted}"
+            extracted = ""
+        if not extracted:
+            try:
+                from bs4 import BeautifulSoup
+
+                extracted = await asyncio.to_thread(lambda: BeautifulSoup(html, "html.parser").get_text(separator="\n", strip=True))
+            except ImportError:
+                extracted = _TAG_RE.sub(" ", html)
+        extracted = extracted[:max_bytes].strip()
+        return f"Content of {_url} (extracted {len(extracted)} chars):\n{extracted}"
+
+    if cache is None or locks is None:
+        return await _do_fetch(url)
+    # [P2-12] singleflight + TTL (même pattern que execute_ddg_search).
+    kstr = f"{url}|{max_bytes}|{1 if via_vpn else 0}"
+    now = time.monotonic()
+    if kstr in cache:
+        exp, val = cache[kstr]
+        if now < exp:
+            try:
+                cache.move_to_end(kstr)
+            except Exception:
+                pass
+            return copy.deepcopy(val) if isinstance(val, str) else val
+        else:
+            try:
+                del cache[kstr]
+            except KeyError:
+                pass
+    lock = locks.get(kstr)
+    if lock is None:
+        lock = asyncio.Lock()
+        locks[kstr] = lock
+    try:
+        async with lock:
+            if kstr in cache:
+                exp2, val2 = cache[kstr]
+                if time.monotonic() < exp2:
+                    try:
+                        cache.move_to_end(kstr)
+                    except Exception:
+                        pass
+                    return copy.deepcopy(val2) if isinstance(val2, str) else val2
+            result = await _do_fetch(url)
+            try:
+                ttl = max(1, int(fetch_ttl_s))
+            except Exception:
+                ttl = FETCH_CACHE_TTL_S
+            cache[kstr] = (time.monotonic() + ttl, result)
+            if len(cache) > FETCH_CACHE_MAX:
+                try:
+                    cache.popitem(last=False)
+                except Exception:
+                    pass
+            return result
+    finally:
+        try:
+            if not lock.locked() and not getattr(lock, "_waiters", None):
+                locks.pop(kstr, None)
+            if len(locks) > FETCH_LOCKS_MAX:
+                locks.pop(next(iter(locks)), None)
+        except Exception:
+            try:
+                locks.pop(kstr, None)
+            except Exception:
+                pass
 
 
 # Alias historique (opencode._execute_web_fetch — wrapper hôte conservé,
@@ -337,6 +415,9 @@ __all__ = [
     "DDG_CACHE_MAX",
     "DDG_CACHE_TTL_S",
     "DDG_LOCKS_MAX",
+    "FETCH_CACHE_MAX",
+    "FETCH_CACHE_TTL_S",
+    "FETCH_LOCKS_MAX",
     "FETCH_MAX_BYTES",
     "execute_ddg_search",
     "execute_web_fetch",

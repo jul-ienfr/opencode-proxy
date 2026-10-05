@@ -134,8 +134,56 @@ def build_condensed_history(messages, summary_text: str, keep_recent_pairs: int)
         return None, messages
 
 
+def build_checkpoint_input(summary_text: str, recent_count: int) -> dict:
+    """Construit l'item Responses portant le résumé (forme ``input``, jamais ``messages``).
+
+    Miroir Responses de ``build_checkpoint_summary`` : item
+    ``{"type": "message", "role": "user", "content": [{"type": "input_text",
+    "text": "<conversation-checkpoint>…"}]}`` — pas de ``tool_choice``,
+    pas d'item ``compaction`` opaque fabriqué (le proxy ne forge jamais
+    d'item chiffré provider, relay-only).
+    """
+    text = summary_text if isinstance(summary_text, str) else ""
+    return {
+        "type": "message",
+        "role": "user",
+        "content": [
+            {
+                "type": "input_text",
+                "text": (
+                    "<conversation-checkpoint>"
+                    f"<summary>{text}</summary>"
+                    f"<recent-context>omitted, {recent_count} recent messages preserved verbatim</recent-context>"
+                    "</conversation-checkpoint>"
+                ),
+            }
+        ],
+    }
+
+
+def build_condensed_input(history_input, summary_text: str, keep_recent_pairs: int):
+    """[checkpoint_input, *recent] : fenêtre Responses condensée prête à forwarder.
+
+    Miroir Responses de ``build_condensed_history`` : la coupe réutilise
+    ``split_keep_recent`` (frontières de paires user, jamais d'orphelin
+    tool_call/function_call_output). Repli sûr identique (None + originaux).
+    """
+    try:
+        if not isinstance(history_input, list) or not history_input:
+            return None, history_input
+        if not isinstance(summary_text, str) or not summary_text.strip():
+            return None, history_input
+        _old, recent = split_keep_recent(history_input, keep_recent_pairs)
+        checkpoint = build_checkpoint_input(summary_text.strip(), len(recent))
+        return [checkpoint] + recent, recent
+    except Exception:
+        return None, history_input
+
+
 __all__ = [
     "split_keep_recent",
     "build_checkpoint_summary",
     "build_condensed_history",
+    "build_checkpoint_input",
+    "build_condensed_input",
 ]

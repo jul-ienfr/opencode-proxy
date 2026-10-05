@@ -7,11 +7,15 @@ outils/system), Responses API équivalente, marqueurs Hermes
 (<conversation-checkpoint>).
 """
 
+import json
+
 import pytest
 
 from app.compaction import (
+    build_checkpoint_input,
     build_checkpoint_summary,
     build_condensed_history,
+    build_condensed_input,
     build_summarizer_body,
     build_summary_user_text,
     extract_previous_summary,
@@ -157,7 +161,10 @@ def test_checkpoint_marker_shape():
     assert is_compaction_shape(body) is True
 
 
-def test_marker_with_tools_is_not_compaction():
+def test_marker_with_tools_is_compaction():
+    # Les compactions Claude Code rejouent l'historique AVEC outils (prouvé
+    # sur traces : 40-76k tokens, sorties tiny) : le marqueur explicite fait
+    # foi même avec tools (aucun tour normal ne contient ces marqueurs).
     body = {
         "model": "muse-spark-1.3-contributor",
         "messages": [
@@ -165,7 +172,7 @@ def test_marker_with_tools_is_not_compaction():
         ],
         "tools": [{"type": "function", "function": {"name": "bash"}}],
     }
-    assert is_compaction_shape(body) is False
+    assert is_compaction_shape(body) is True
 
 
 def test_normal_agent_turn_is_not_compaction():
@@ -512,3 +519,148 @@ async def test_maybe_condense_never_raises():
                                 model_id="m", endpoint="e", protocol="openai",
                                 auth_headers_fn=lambda p: {}, do_request_fn=_ok_do,
                                 enabled=True) is None
+
+
+def _rin(text):
+    return {"type": "message", "role": "user", "content": [{"type": "input_text", "text": text}]}
+
+
+def test_build_condensed_input_shape():
+    # Miroir Responses de build_condensed_history : [checkpoint_input, *recent],
+    # forme input (jamais messages), coupe aux frontières de paires.
+    hist = [_rin("a"), {"role": "assistant", "content": "b"}, _rin("c"), {"role": "assistant", "content": "d"}]
+    condensed, kept = build_condensed_input(hist, "  RESUME  ", 1)
+    assert condensed[0]["type"] == "message" and condensed[0]["role"] == "user"
+    assert "<conversation-checkpoint><summary>RESUME</summary>" in condensed[0]["content"][0]["text"]
+    assert "messages" not in condensed[0]
+    assert condensed[1:] == kept == hist[-2:]
+    assert build_condensed_input(hist, "   ", 1)[0] is None  # résumé vide
+    assert build_condensed_input([], "r", 1)[0] is None  # historique vide
+    assert build_condensed_input(None, "r", 1) == (None, None)
+
+
+def test_checkpoint_input_never_forges_compaction_item():
+    # Le proxy ne forge jamais d'item compaction opaque (chiffré provider) :
+    # le checkpoint est un message user ordinaire portant le marqueur texte.
+    cp = build_checkpoint_input("s", 2)
+    assert cp.get("type") == "message"
+    # ... qui reste détecté comme compactage (exclu du cache, bypass 503),
+    # comme son jumeau chat (test_checkpoint_marker_is_detected_as_compaction).
+    assert is_compaction_shape({"input": [cp]}, min_chars_implicit=10**9) is True
+
+
+@pytest.mark.asyncio
+async def test_maybe_condense_responses_api_builds_input():
+    # api=responses → fenêtre input (pas de messages), prête pour /responses.
+    async def _ok_resp(ep, body, h, p):
+        assert body.get("input") and "messages" not in body
+        return _FakeResp(200, b'{"output": [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "R"}]}]}'), h
+
+    hist = [_rin("vieux 1"), _rin("vieux 2"), _rin("recent"), {"role": "assistant", "content": "ok"}]
+    r = await maybe_condense(
+        hist, status_code=400, body_text="context window exceeded",
+        model_id="m", endpoint="https://x/v1/responses", protocol="openai",
+        auth_headers_fn=lambda p: {}, do_request_fn=_ok_resp,
+        enabled=True, keep_recent_pairs=1, api="responses",
+    )
+    assert isinstance(r, list) and r[0].get("type") == "message"
+    assert r[0]["content"][0]["text"].startswith("<conversation-checkpoint>")
+    assert r[1:] == hist[-2:]
+
+
+# ── lean : amaigrissement des sorties d'outils (résumés seuls) ──
+
+
+def test_lean_truncates_tool_outputs_only():
+    from app.compaction import lean_summary_body
+
+    big = "R" * 5000
+    body = {
+        "model": "m",
+        "system": "SYS" + "S" * 5000,
+        "messages": [
+            {"role": "user", "content": "question " + "Q" * 5000},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "c1", "name": "Bash", "input": {}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "c1", "content": big}]},            {"role": "user", "content": [{"type": "text", "text": "note " + "N" * 5000}]},
+        ],
+        "tools": [{"name": "Bash"}],
+    }
+    snap = json.dumps(body)
+    out, cut = lean_summary_body(body, max_chars=2000)
+    assert cut == 3000
+    # Sortie d'outil tronquée + marqueur ; tout le reste intact.
+    tr = out["messages"][2]["content"][0]
+    assert len(tr["content"]) < len(big) and "omitted by proxy summary-lean" in tr["content"]
+    assert out["messages"][0]["content"].endswith("Q" * 5000)
+    assert out["messages"][3]["content"][0]["text"].endswith("N" * 5000)
+    assert out["system"].endswith("S" * 5000)
+    assert out["tools"] == [{"name": "Bash"}]
+    assert json.dumps(body) == snap, "l'entrée ne doit jamais être mutée"
+
+
+def test_lean_chat_and_responses_shapes():
+    from app.compaction import lean_summary_body
+
+    chat = {"messages": [{"role": "tool", "content": "T" * 3000}]}
+    out, cut = lean_summary_body(chat, max_chars=2000)
+    assert cut == 1000 and len(out["messages"][0]["content"]) < 3000
+
+    resp = {"input": [{"type": "function_call_output", "output": "O" * 3000}]}
+    out, cut = lean_summary_body(resp, max_chars=2000)
+    assert cut == 1000
+
+    short = {"messages": [{"role": "tool", "content": "ok"}]}
+    out, cut = lean_summary_body(short, max_chars=2000)
+    assert cut == 0 and out == short
+
+    assert lean_summary_body(None, max_chars=2000) == (None, 0)
+    assert lean_summary_body({}, max_chars=2000) == ({}, 0)
+    assert lean_summary_body({"messages": []}, max_chars=-5)[1] == 0
+
+
+def test_lean_never_raises():
+    from app.compaction import lean_summary_body
+
+    assert lean_summary_body(object(), max_chars=2000)[1] == 0
+    assert lean_summary_body({"messages": [{"role": "tool"}]}, max_chars=2000)[1] == 0
+    assert lean_summary_body({"messages": [None, 42]}, max_chars=2000)[1] == 0
+
+
+# ── cap officiel 4096 : should_clamp_summary / cap_summary_max_tokens ──
+
+
+def test_should_clamp_prefilter():
+    from app.compaction import should_clamp_summary
+
+    assert should_clamp_summary({"max_tokens": 128000}, 4096) is True
+    assert should_clamp_summary({"max_tokens": 4096}, 4096) is False
+    assert should_clamp_summary({"max_tokens": 32}, 4096) is False
+    assert should_clamp_summary({"max_output_tokens": 128000}, 4096) is True
+    assert should_clamp_summary({}, 4096) is False
+    assert should_clamp_summary(None, 4096) is False
+    assert should_clamp_summary({"max_tokens": True}, 4096) is False
+    assert should_clamp_summary({"max_tokens": "x"}, 4096) is False
+    assert should_clamp_summary(object(), 4096) is False
+
+
+def test_cap_summary_max_tokens_official():
+    from app.compaction import cap_summary_max_tokens
+
+    body = {"model": "m", "messages": [{"role": "user", "content": "x"}], "max_tokens": 128000}
+    snap = json.dumps(body)
+    out, changed = cap_summary_max_tokens(body, 4096)
+    assert changed is True
+    assert out["max_tokens"] == 4096
+    assert json.dumps(body) == snap, "original intact pour logs/DB"
+
+    out, changed = cap_summary_max_tokens({"max_tokens": 4096}, 4096)
+    assert (changed, out["max_tokens"]) == (False, 4096)
+    out, changed = cap_summary_max_tokens({"max_tokens": 32}, 4096)
+    assert (changed, out["max_tokens"]) == (False, 32)
+    out, changed = cap_summary_max_tokens({"input": [], "max_output_tokens": 128000}, 4096)
+    assert (changed, out["max_output_tokens"]) == (True, 4096)
+    # Jamais de remontée, jamais d'ajout de clé.
+    out, changed = cap_summary_max_tokens({"messages": []}, 4096)
+    assert changed is False and "max_tokens" not in out
+    assert cap_summary_max_tokens(None, 4096) == (None, False)
+    assert cap_summary_max_tokens({}, 0) == ({}, False)

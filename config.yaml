@@ -148,13 +148,17 @@ models:
     protocol: openai
   longcat-2.5-preview-free:
     protocol: openai
+  fledge-alpha-free:
+    protocol: openai
+  ling-3.1-flash-free:
+    protocol: openai
 free_model_map:
   mimo-v2.5: mimo-v2.5-free
   qwen3.7-max: mimo-v2.5-free
-  glm-5.1: deepseek-v4-flash-free
+  glm-5.1: mimo-v2.5-free
   kimi-k2.6: mimo-v2.5-free
   minimax-m2.5: mimo-v2.5-free
-  deepseek-v4-flash: deepseek-v4-flash-free
+  deepseek-v4-flash: mimo-v2.5-free
   muse-spark-1.2-contributor: muse-spark-1.2-contributor-free
   muse-spark-1.3-contributor: muse-spark-1.3-contributor-free
   jev-1.13-free: jev-1.13-free
@@ -271,7 +275,7 @@ ip_rotation:
   ov_auth_station_threshold: 5
   ov_auth_window_s: 1800
   ovpn_endpoint_port: ''
-  ovpn_protocol: tcp
+  ovpn_protocol: udp
   paid_hedge_after_ms: 0
   pin_widen_auths: 8
   pin_widen_minutes: 30
@@ -445,6 +449,10 @@ server_compaction:
   native_passthrough: true
   keep_tail: true
   summary_paid_bypass: false
+  tiny_retry: true
+  summary_lean: true
+  summary_lean_max_chars: 2000
+  summary_clamp_max_tokens: 4096
 circuit_breaker:
   failure_threshold: 5
   recovery_timeout: 60
@@ -467,9 +475,10 @@ database:
   busy_timeout: 5000
   cache_size: 64000
   mmap_size: 268435456
-  commit_interval: 5
+  commit_interval: 2
   commit_batch: 10
   weekly_purge_days: 90
+  archive_after_days: 60
 background:
   wal_checkpoint_interval: 3600
   key_pause_cleanup_interval: 30

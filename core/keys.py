@@ -43,6 +43,15 @@ class KeyPauser:
 
     ``prefix_cache`` : mémo partagé {clé → slot} (possédé par l'hôte) ;
     ``alias_fn`` : alias lisible pour les logs (hôte : ``_alias_for_key``).
+
+    Concurrence (hiérarchie des locks — P1-8) :
+    ``self._lock`` (threading) ne protège que des ops dict O(1), JAMAIS
+    d'await ni d'I/O : tenu quelques microsecondes, il ne bloque pas la
+    loop même en contention. Règle : ``threading.Lock`` (données) →
+    jamais d'``asyncio.Lock`` en dessous (pas d'inversion) ; les I/O
+    fichier partent en executor ou après relâche, jamais sous le lock.
+    ``select_next_key`` prend ``cycle_lock`` (hôte) sans jamais tenir
+    ``_lock`` en même temps (séquentiel, pas imbriqué).
     """
 
     _PAUSED_FILE = ""  # surchargé par la sous-classe hôte (chemin ancré projet)
@@ -91,19 +100,23 @@ class KeyPauser:
     def _save(self):
         """Persist current pause state to YAML file (wall clock times).
 
-        File I/O is offloaded to a thread pool so it doesn't block the event loop.
-        Data serialization happens synchronously (fast, in-memory only).
+        Snapshot sous lock, I/O APRÈS relâche (P1-8) : ni itération d'un
+        dict mutable depuis l'executor, ni écriture synchrone sous lock.
+        File I/O offloaded to a thread pool so it doesn't block the loop.
         """
         try:
+            with self._lock:
+                snapshot = [
+                    (prefix, mono_expiry, self._reasons.get(prefix, ""))
+                    for prefix, mono_expiry in self._paused.items()
+                ]
+            now_mono = time.monotonic()
+            now_wall = time.time()
             data = {}
-            for prefix, mono_expiry in self._paused.items():
-                remaining = mono_expiry - time.monotonic()
+            for prefix, mono_expiry, reason in snapshot:
+                remaining = mono_expiry - now_mono
                 if remaining > 0:
-                    wall_expiry = time.time() + remaining
-                    data[prefix] = {
-                        "expiry": wall_expiry,
-                        "reason": self._reasons.get(prefix, ""),
-                    }
+                    data[prefix] = {"expiry": now_wall + remaining, "reason": reason}
             # Offload file I/O to thread pool (non-blocking)
             payload = {"paused_keys": data}
             file_path = self._PAUSED_FILE
@@ -178,12 +191,15 @@ class KeyPauser:
         if quota_based:
             duration = min(duration, self._max_pause)
         expiry = time.monotonic() + duration
+        changed = False
         with self._lock:
             existing = self._paused.get(prefix, 0)
             if expiry > existing:  # only extend, never shorten
                 self._paused[prefix] = expiry
                 self._reasons[prefix] = reason
-                self._save()
+                changed = True
+        if changed:
+            self._save()  # [P1-8] hors lock (I/O jamais sous le verrou)
         alias = self._alias_fn(api_key)
         self._debug_fn(
             f"  [keypauser] PAUSED alias={alias} prefix={prefix} for {duration:.0f}s reason={reason}"
@@ -260,23 +276,25 @@ class KeyPauser:
             for k in expired:
                 del self._paused[k]
                 self._reasons.pop(k, None)
-            if expired:
-                self._save()
         if expired:
+            self._save()  # [P1-8] hors lock
             self._debug_fn(f"  [keypauser] cleanup: {len(expired)} expired pauses removed")
 
     def unpause_if_paused(self, api_key: str) -> bool:
         """Remove a pause for a key if it exists. Returns True if removed."""
         prefix = self._prefix(api_key)
+        removed = False
         with self._lock:
             if prefix in self._paused:
                 del self._paused[prefix]
                 self._reasons.pop(prefix, None)
-                self._save()
-                alias = self._alias_fn(api_key)
-                self._debug_fn(f"  [keypauser] UNPAUSED alias={alias} prefix={prefix} (recovered)")
-                self._log_fn(f"  KEY UNPAUSED: alias={alias} (recovered)")
-                return True
+                removed = True
+        if removed:
+            self._save()  # [P1-8] hors lock
+            alias = self._alias_fn(api_key)
+            self._debug_fn(f"  [keypauser] UNPAUSED alias={alias} prefix={prefix} (recovered)")
+            self._log_fn(f"  KEY UNPAUSED: alias={alias} (recovered)")
+            return True
         return False
 
 

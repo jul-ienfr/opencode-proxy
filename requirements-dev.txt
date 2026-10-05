@@ -1,7 +1,11 @@
 # Dev/test dependencies — plan v10 §15.1.2 (item 14.4.8)
 # Runtime deps live in requirements.txt; these are the gates of §3.7.
-pytest>=8.0
-pytest-asyncio>=0.23
-ruff>=0.6
-mypy>=1.11
-respx>=0.21
+# [P1-9] Pinné (vérifié 2026-10-04, python 3.12, httpx 0.28.1 compatible
+# respx 0.23) : le flottant faisait dériver la gate CI sans changement code.
+# Régénérer : `pip install pip-tools && pip-compile --generate-hashes requirements-dev.in`
+pytest==9.0.2
+pytest-asyncio==1.4.0
+pytest-cov==7.1.0
+ruff==0.15.19
+mypy==2.3.1
+respx==0.23.1

@@ -5,7 +5,8 @@ build-backend = "setuptools.build_meta"
 [tool.ruff]
 line-length = 120
 target-version = "py311"
-extend-exclude = [".kilo/", ".venv/", "logs/", "__pycache__/", ".git/", "Lib/", "scripts/bottle.py", "scripts/pywin32_postinstall.py", "scripts/pywin32_testall.py"]
+# [P1-10] worktrees d'audit + repros jetables exclus du lint (jamais des sources).
+extend-exclude = [".kilo/", ".venv/", "logs/", "__pycache__/", ".git/", "Lib/", "scripts/bottle.py", "scripts/pywin32_postinstall.py", "scripts/pywin32_testall.py", ".audit-wt/", ".audit-logs-wt/", ".trou*-wt/", "_repro_*.py"]
 
 [tool.ruff.lint]
 # [P6] ignore dédoublonné ; E722/B904 RETIRÉS des ignores et corrigés dans
@@ -42,7 +43,7 @@ disallow_untyped_defs = false
 check_untyped_defs = false
 no_implicit_optional = false
 strict = false
-exclude = ["\\.kilo/", "\\.venv/", "logs/", "Lib/", "scripts/bottle\\.py", "scripts/pywin32_.*\\.py"]
+exclude = ["\\.kilo/", "\\.venv/", "logs/", "Lib/", "scripts/bottle\\.py", "scripts/pywin32_.*\\.py", "\\.audit-wt/", "\\.audit-logs-wt/", "\\.trou.*-wt/"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

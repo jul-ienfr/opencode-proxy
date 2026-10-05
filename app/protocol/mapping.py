@@ -958,7 +958,7 @@ def _resolve_schema_profile(model: str) -> dict:
     if low.startswith("muse"):
         return _SCHEMA_PROFILES["muse"]
     prefix = low.split("-")[0].split(".")[0]
-    prefix = re.sub(r"\d+$", "", prefix)
+    prefix = _TRAILING_DIGITS_RE.sub("", prefix)
     return _SCHEMA_PROFILES.get(prefix, _SCHEMA_PROFILES["_default"])
 
 
@@ -1245,7 +1245,11 @@ def anthropic_to_openai(body: dict, model: str, raw: bytes | None = None) -> dic
         if not isinstance(content, list):
             continue
 
-        text_parts, tool_calls, thinking_parts, tool_results, image_parts = [], [], [], [], []
+        text_parts: list = []
+        tool_calls: list = []
+        thinking_parts: list = []
+        tool_results: list = []
+        image_parts: list = []
         last_cache_control = None
 
         for block in content:
@@ -2493,9 +2497,9 @@ def openai_to_anthropic_request(oai_body: dict) -> dict:
 def anthropic_to_openai_response(anthro: dict, model: str) -> dict:
     """Convert Anthropic Messages response → OpenAI Chat Completions format."""
     content_blocks = anthro.get("content", [])
-    text_parts = []
+    text_parts: list = []
     reasoning_text = ""
-    tool_calls = []
+    tool_calls: list = []
 
     for block in content_blocks:
         if not isinstance(block, dict):
@@ -2666,8 +2670,8 @@ def _responses_part_to_anthropic(part: dict) -> dict | None:
 def openai_responses_to_anthropic(body: dict) -> dict:
     """Convert OpenAI Responses API request → Anthropic Messages format."""
     system_text = ""
-    pending_tool_results = []
-    anthro_messages = []
+    pending_tool_results: list = []
+    anthro_messages: list = []
 
     for item in body.get("input", []):
         if not isinstance(item, dict):
@@ -2874,8 +2878,8 @@ def anthropic_to_openai_responses(anthro: dict, model: str, name_map: dict | Non
     """Convert Anthropic Messages response → OpenAI Responses API format."""
     content_blocks = anthro.get("content", [])
     output_items: list[dict[str, Any]] = []
-    text_content = []
-    function_calls = []
+    text_content: list = []
+    function_calls: list = []
 
     for block in content_blocks:
         if not isinstance(block, dict):
@@ -3071,6 +3075,8 @@ def openai_chat_to_responses(chat_resp: dict, model: str, name_map: dict | None 
 TOOL_NAME_MAX_LEN = 64
 _TOOL_NAME_MAP_KEY = "_tool_name_map"
 _TOOL_NAME_RE = re.compile(r"[^A-Za-z0-9_-]")
+# [P2-12] précompilée (chemin chaud _resolve_schema_profile, par requête).
+_TRAILING_DIGITS_RE = re.compile(r"\d+$")
 # Marqueur interne retry-once (items reasoning synthétiques) — posé dans le
 # dict converti, consommé par la logique retry du caller, JAMAIS envoyé sur
 # le wire (l'upstream /responses le rejette `unknown parameter` en 400).

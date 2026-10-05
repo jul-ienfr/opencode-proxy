@@ -26,8 +26,22 @@ Contrats couverts par tests/test_db_offload.py :
 """
 
 import json
+import logging
 import sqlite3
 import time
+
+logger = logging.getLogger(__name__)
+
+# Compteur d'anomalies DB silencieuses autrefois (migrations/index/VACUUM
+# avalés par `except: pass`). Exposé pour /metrics et les tests.
+db_maintenance_errors: int = 0
+
+
+def _record_maintenance_error(where: str, exc: BaseException) -> None:
+    """Journalise une anomalie de maintenance (jamais silencieuse)."""
+    global db_maintenance_errors
+    db_maintenance_errors += 1
+    logger.warning("[db] maintenance %s FAILED: %s: %s", where, type(exc).__name__, exc)
 
 # ── Constantes ──────────────────────────────────────────────────────
 
@@ -482,36 +496,91 @@ def init_requests_schema_fast(conn: sqlite3.Connection, *, busy_timeout: int, ca
     conn.commit()
 
 
-def migrate_and_canary(conn: sqlite3.Connection) -> int:
-    """Post-ready (fond) : migrations ALTER + CREATE INDEX + canary naïf.
+def migrate_and_canary(conn: sqlite3.Connection, *, report: dict | None = None) -> int:
+    """Post-ready (fond) : migrations ALTER + CREATE INDEX + canary borné.
 
-    Retourne le nombre de rows à timestamps naïfs ([30] canary — l'appelant
-    avertit l'opérateur que scripts/migrate_timestamps_utc.py est à lancer).
+    Ordre optimisé anti full-scan : les index sur colonnes natives
+    (timestamp/model/success) sont créés AVANT les migrations ALTER, pour
+    fermer au plus tôt la fenêtre « requêtes dashboard sans index ». Les
+    index sur colonnes migrées suivent, puis le canary.
+
+    Canary BORNÉ (P0-4) : `SELECT 1 ... LIMIT 1001` au lieu de `COUNT(*)`
+    — jamais de full scan sur DB multi-Go ; retourne le compte exact sous
+    1001, 1001 si saturé (l'appelant affiche « ≥ »).
+
+    Retourne le nombre de rows à timestamps naïfs (contrat historique :
+    int). ``report`` (optionnel) reçoit le détail {added_columns,
+    existing_columns, failed_ops, canary_capped}.
     L'appelant détient le lock writer (concurrence avec le writer loop).
     """
+    added: list[str] = []
+    existing: list[str] = []
+    failed: list[str] = []
+    # [P0-4] index natifs d'abord : requêtes dashboard couvertes au plus tôt.
+    for stmt in _REQUESTS_INDEXES[:3]:
+        try:
+            conn.execute(stmt)
+        except Exception as e:
+            failed.append(stmt)
+            _record_maintenance_error(f"index {stmt}", e)
     for col, default in _REQUEST_COLUMN_MIGRATIONS:
         try:
             conn.execute(f"ALTER TABLE requests ADD COLUMN {col} TEXT DEFAULT {default}")
-        except Exception:
-            pass
-    for stmt in _REQUESTS_INDEXES:
+            added.append(col)
+        except Exception as e:
+            # Colonne déjà présente = cas nominal (IF NOT EXISTS indisponible
+            # pour ADD COLUMN) ; toute autre erreur est journalisée + comptée.
+            if "duplicate column name" not in str(e).lower():
+                failed.append(f"addcol:{col}")
+                _record_maintenance_error(f"addcol {col}", e)
+            else:
+                existing.append(col)
+    for stmt in _REQUESTS_INDEXES[3:]:
         try:
             conn.execute(stmt)
-        except Exception:
-            pass
+        except Exception as e:
+            failed.append(stmt)
+            _record_maintenance_error(f"index {stmt}", e)
     # [plan v10 §4 Lot 4] colonne station INTEGER (filtres ?station=) +
     # index composé station+timestamp (budget §7).
     try:
         conn.execute("ALTER TABLE requests ADD COLUMN station INTEGER DEFAULT NULL")
-    except Exception:
-        pass
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_requests_station_ts ON requests(station, timestamp)")
-    conn.commit()
-    # [30] Canary: mixed naive/UTC timestamps break ORDER BY timestamp DESC
+        added.append("station")
+    except Exception as e:
+        if "duplicate column name" not in str(e).lower():
+            failed.append("addcol:station")
+            _record_maintenance_error("addcol station", e)
+        else:
+            existing.append("station")
     try:
-        naive = conn.execute("SELECT COUNT(*) FROM requests WHERE timestamp NOT LIKE '%Z'").fetchone()[0]
-    except Exception:
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_requests_station_ts ON requests(station, timestamp)")
+    except Exception as e:
+        failed.append("idx_requests_station_ts")
+        _record_maintenance_error("index idx_requests_station_ts", e)
+    conn.commit()
+    # [30] Canary: mixed naive/UTC timestamps break ORDER BY timestamp DESC.
+    # BORNÉ : échantillon LIMIT au lieu de COUNT(*) full-scan (P0-4).
+    try:
+        rows = conn.execute(
+            "SELECT 1 FROM requests WHERE timestamp NOT LIKE '%Z' LIMIT 1001"
+        ).fetchall()
+        naive = len(rows)
+        capped = naive == 1001
+        if capped:
+            logger.warning("[db] canary timestamps naïfs saturé (≥1001) — lancer scripts/migrate_timestamps_utc.py")
+    except Exception as e:
+        _record_maintenance_error("canary", e)
         naive = 0
+        capped = False
+    if report is not None:
+        report.update(
+            {
+                "added_columns": added,
+                "existing_columns": existing,
+                "failed_ops": failed,
+                "canary_capped": capped,
+            }
+        )
     return naive
 
 
@@ -548,8 +617,9 @@ def init_free_usage_schema(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_free_key ON free_model_usage(api_key)")
     try:
         conn.execute("ALTER TABLE free_model_usage ADD COLUMN ip TEXT DEFAULT ''")
-    except Exception:
-        pass  # Column already exists
+    except Exception as e:
+        if "duplicate column name" not in str(e).lower():
+            _record_maintenance_error("free_model_usage addcol ip", e)
     conn.commit()
 
 
@@ -729,8 +799,8 @@ def vacuum_if_needed(conn: sqlite3.Connection, lock, deleted_rows: int) -> None:
             if conn.in_transaction:
                 conn.commit()
             conn.execute("VACUUM")
-        except Exception:
-            pass  # l'app hôte journalise via son wrapper
+        except Exception as e:
+            _record_maintenance_error("VACUUM", e)
 
 
 def cleanup_old_bodies(
@@ -834,6 +904,12 @@ def log_free_usage(
 # purge vise la croissance structurelle du fichier (incident 30/08 : ~1 Go).
 WEEKLY_PURGE_DAYS = 90
 
+# [P2-11] Archivage mensuel auto (défaut 60 j < purge 90 j) : les lignes
+# 60-90 j sont DÉPLACÉES vers logs/archive/requests-YYYY-MM.db AVANT que la
+# purge ne les supprime — conservation sans croissance du live. 0/None = off.
+ARCHIVE_AFTER_DAYS = 60
+ARCHIVE_DIRNAME = "archive"
+
 _PURGE_OLD_ROWS_SQL = "DELETE FROM requests WHERE timestamp < ?"
 _PURGE_OLD_USAGE_SQL = "DELETE FROM free_model_usage WHERE timestamp < ?"
 
@@ -865,15 +941,133 @@ def _purge_old_rows_locked(conn: sqlite3.Connection, days: int = WEEKLY_PURGE_DA
     return total
 
 
-def weekly_maintain(conn: sqlite3.Connection, lock, purge_days: int = WEEKLY_PURGE_DAYS) -> float:
-    """Checkpoint TRUNCATE + purge > ``purge_days`` jours + VACUUM sous le
-    lock writer (maintenance hebdo).
+def archive_old_rows(
+    conn: sqlite3.Connection, db_path: str, days: int = ARCHIVE_AFTER_DAYS
+) -> tuple[int, list[str]]:
+    """Déplace les lignes > ``days`` jours vers logs/archive/requests-YYYY-MM.db.
 
-    ``purge_days`` peut être désactivé via 0 (ou None) — la maintenance
-    redevient alors le checkpoint+VACUUM historique.
+    [P2-11] Pendant automatisé de scripts/archive_db.py (même format de
+    fichiers, mêmes requêtes par mois) pour la maintenance hebdo : sans
+    copie de sécurité (la purge hebdo supprime déjà sans backup — archiver
+    avant purger est strictement plus sûr), mais avec vérification par mois
+    (INSERT puis COUNT avant DELETE du mois ; mois en échec ignoré, jamais
+    supprimé du live). Idempotent (INSERT OR REPLACE + re-run sans effet).
+
+    Suppose le lock writer détenu. ``days <= 0``/None = no-op.
+    Retourne (lignes déplacées, mois ["YYYY-MM", ...]).
+    """
+    import datetime as _dt
+    import os as _os
+
+    if not days or days <= 0 or not db_path:
+        return 0, []
+    archive_dir = _os.path.join(_os.path.dirname(db_path), ARCHIVE_DIRNAME)
+    try:
+        _os.makedirs(archive_dir, exist_ok=True)
+    except OSError as e:
+        _record_maintenance_error("archive mkdir", e)
+        return 0, []
+    cutoff = (
+        (_dt.datetime.now(_dt.UTC) - _dt.timedelta(days=days)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    )
+    try:
+        months = [
+            r[0]
+            for r in conn.execute(
+                "SELECT DISTINCT substr(timestamp, 1, 7) FROM requests WHERE timestamp < ? ORDER BY 1",
+                (cutoff,),
+            ).fetchall()
+            if r[0]
+        ]
+    except Exception as e:
+        _record_maintenance_error("archive plan", e)
+        return 0, []
+    try:
+        schema_row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='requests'"
+        ).fetchone()
+        col_names = [r[1] for r in conn.execute("PRAGMA table_info(requests)").fetchall()]
+    except Exception as e:
+        _record_maintenance_error("archive schema", e)
+        return 0, []
+    if not schema_row or not schema_row[0] or not col_names:
+        return 0, []
+    table_ddl = schema_row[0].replace("CREATE TABLE requests", "CREATE TABLE IF NOT EXISTS arch.requests", 1)
+    if "arch.requests" not in table_ddl:
+        _record_maintenance_error("archive ddl", ValueError(f"DDL inattendue: {schema_row[0][:80]}"))
+        return 0, []
+    col_list = ", ".join(col_names)
+    moved_months: list[str] = []
+    moved = 0
+    for month in months:
+        target = _os.path.join(archive_dir, f"requests-{month}.db")
+        try:
+            year, mon = int(month[:4]), int(month[5:7])
+            first = _dt.date(year, mon, 1)
+            upper = (first + _dt.timedelta(days=32)).replace(day=1).strftime("%Y-%m-01")
+            first_day = first.strftime("%Y-%m-01")
+        except ValueError as e:
+            _record_maintenance_error(f"archive month {month}", e)
+            continue
+        try:
+            conn.execute("ATTACH DATABASE ? AS arch", (target,))
+            try:
+                conn.execute(table_ddl)
+                conn.commit()
+                conn.execute(
+                    f"INSERT OR REPLACE INTO arch.requests ({col_list})"
+                    f" SELECT {col_list} FROM main.requests"
+                    " WHERE timestamp >= ? AND timestamp < ? AND timestamp < ?",
+                    (first_day, upper, cutoff),
+                )
+                conn.commit()
+                n = conn.execute(
+                    "SELECT COUNT(*) FROM arch.requests WHERE timestamp >= ? AND timestamp < ?",
+                    (first_day, upper),
+                ).fetchone()[0]
+                conn.execute("CREATE INDEX IF NOT EXISTS arch.idx_archive_timestamp ON requests(timestamp)")
+                conn.commit()
+                conn.execute("DELETE FROM main.requests WHERE timestamp >= ? AND timestamp < ?", (first_day, upper))
+                conn.commit()
+                moved += int(n or 0)
+                moved_months.append(month)
+            finally:
+                try:
+                    conn.execute("DETACH DATABASE arch")
+                except sqlite3.Error:
+                    pass
+        except Exception as e:
+            _record_maintenance_error(f"archive {month}", e)
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            continue
+    if moved:
+        logger.info("[db] archive: %d lignes → %s (%s)", moved, archive_dir, ",".join(moved_months))
+    return moved, moved_months
+
+
+def weekly_maintain(
+    conn: sqlite3.Connection, lock, purge_days: int = WEEKLY_PURGE_DAYS, *, archive_days: int = 0, db_path: str = ""
+) -> float:
+    """Checkpoint TRUNCATE + archivage + purge > ``purge_days`` jours + VACUUM.
+
+    [P2-11] ``archive_days`` (> 0 + ``db_path``) déplace d'abord les lignes
+    anciennes vers logs/archive/ (conservation) avant que la purge ne
+    supprime le reste. ``purge_days`` à 0/None désactive la purge (la
+    maintenance redevient checkpoint+VACUUM+archivage).
 
     Retourne la taille DB en Mo (pour le log de l'app hôte)."""
     with lock:
+        # [P2-11] archiver AVANT purger : les lignes 60-90 j sont conservées
+        # (fichiers mensuels) au lieu d'être supprimées par la purge 90 j.
+        if archive_days and archive_days > 0 and db_path:
+            try:
+                archive_old_rows(conn, db_path, int(archive_days))
+                conn.commit()
+            except Exception as e:
+                _record_maintenance_error("archive", e)
         if purge_days and purge_days > 0:
             _purge_old_rows_locked(conn, int(purge_days))
             # Commit explicite AVANT VACUUM : la purge ouvre une transaction
@@ -896,6 +1090,8 @@ def weekly_maintain(conn: sqlite3.Connection, lock, purge_days: int = WEEKLY_PUR
 
 
 __all__ = [
+    "ARCHIVE_AFTER_DAYS",
+    "ARCHIVE_DIRNAME",
     "DAY_BUCKET_VERSION",
     "DB_RAW_SIZE_CAP",
     "MAX_BODY_STORAGE",
@@ -905,6 +1101,8 @@ __all__ = [
     "bump_token_counters",
     "cleanup_old_bodies",
     "compact_body_stub",
+    "archive_old_rows",
+    "db_maintenance_errors",
     "execute_batch_sync",
     "flush",
     "get_meta",

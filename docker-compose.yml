@@ -127,7 +127,20 @@ services:
       - ./logs:/app/logs
       - ./config.yaml:/app/config.yaml:ro
       - ./api_keys.json:/app/api_keys.json:ro
-      # [13] docker CLI inside this container talks to the HOST daemon.
+      # [P2-14 — trust boundary] docker CLI inside this container talks to
+      # the HOST daemon. docker.sock = root-equivalent : quiconque exécute
+      # du code dans opencode-proxy (RCE) contrôle le daemon hôte
+      # (montage host, --privileged, lecture /etc, etc.). Atténuations en
+      # place : USER opencode (Dockerfile), pas de NET_ADMIN ici (gluetun
+      # seuls), DOCKER_GID explicite. Durcissement opt-in : profil
+      # `socket-proxy` (service docker-socket-proxy ci-dessous) — le proxy
+      # ne voit alors qu'une API filtrée via DOCKER_HOST=tcp://...:2375.
+      # `docker compose --profile socket-proxy up -d`, puis
+      # DOCKER_HOST=tcp://docker-socket-proxy:2375 dans .env et retrait du
+      # montage sock + group_add ci-dessous. Non activé par défaut :
+      # `docker compose` (up/pull/exec/logs/restart) exige les perms
+      # CONTAINERS/IMAGES/EXEC/POST du sidecar — validé `compose config`
+      # uniquement, jamais exercé live (pas de daemon au gate).
       - /var/run/docker.sock:/var/run/docker.sock
       # [13] host project dir read-only, mounted at the SAME absolute path as
       # on the host, so `docker compose -f ...` resolves its relative paths
@@ -537,6 +550,47 @@ services:
       timeout: 5s
       retries: 3
       start_period: 60s
+
+  # ── [P2-14] socket-proxy opt-in (profil `socket-proxy`, OFF par défaut) ──
+  # Proxy filtrant devant /var/run/docker.sock : opencode-proxy parle à
+  # DOCKER_HOST=tcp://docker-socket-proxy:2375 au lieu du socket brut.
+  # Permissions = le besoin exact de vpn_manager.py : compose up/pull
+  # (CONTAINERS+IMAGES+VOLUMES — les volumes nommés gluetun* sont créés au
+  # premier up), ps/inspect/logs (INFO+GET), exec wget/health + control
+  # API (EXEC), restart/rm (POST). Tout le reste (BUILD, PRIVILEGED…)=0.
+  # VOLUMES=1 : create/list seulement (pas de bind host — aucun host escape). Tag :latest VOULU ici comme gluetun (suivi
+  # amont, jamais de drift silencieux accepté ailleurs) — pinner après
+  # premier exercice live (`docker compose --profile socket-proxy up -d`
+  # + rotation complète OK).
+  docker-socket-proxy:
+    image: tecnativa/docker-socket-proxy:latest
+    profiles: ["socket-proxy"]
+    container_name: opencode-docker-proxy
+    ports:
+      - "127.0.0.1:2375:2375"    # loopback only — jamais exposé au LAN
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    environment:
+      - CONTAINERS=1
+      - EXEC=1
+      - IMAGES=1
+      - INFO=1
+      - NETWORKS=1
+      - POST=1
+      - BUILD=0
+      - COMMIT=0
+      - CONFIGS=0
+      - DISTRIBUTION=0
+      - NODES=0
+      - PLUGINS=0
+      - SECRETS=0
+      - SERVICES=0
+      - SESSION=0
+      - SWARM=0
+      - SYSTEM=0
+      - TASKS=0
+      - VOLUMES=1
+    restart: unless-stopped
 
 volumes:
   gluetun:

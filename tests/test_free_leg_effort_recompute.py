@@ -10,7 +10,8 @@ fonction ne contenait **aucun** site d'effort (0 occurrence sur ~790 lignes).
 Conséquence : dès que le plafond d'effort du modèle free est plus bas que celui du
 payant, l'amont free reçoit un niveau hors plafond.
 
-Couple réel à plafonds divergents (``config.yaml:thinking.effort_caps``) :
+Couple à plafonds divergents (``config.yaml:thinking.effort_caps``), forcé
+dans la map par la fixture (le -free homonyme est mort côté amont) :
 
 * payant ``deepseek-v4-flash`` → plafond ``max``
 * free ``deepseek-v4-flash-free`` → plafond ``high``   (entrée explicite)
@@ -171,7 +172,16 @@ def free_env(monkeypatch):
         }
     )
     oc._free_model_cooldowns.clear()
+    # Le -free homonyme est mort côté amont (remappé sain en config) : le
+    # témoin force le couple divergent dans la map, le temps des tests.
+    _map_had = PAID_CHAT in oc.FREE_MODEL_MAP
+    _map_saved = oc.FREE_MODEL_MAP.get(PAID_CHAT)
+    oc.FREE_MODEL_MAP[PAID_CHAT] = FREE_CHAT
     yield oc
+    if _map_had:
+        oc.FREE_MODEL_MAP[PAID_CHAT] = _map_saved
+    else:
+        oc.FREE_MODEL_MAP.pop(PAID_CHAT, None)
     for k, v in saved.items():
         if v is None:
             oc.IP_ROTATION.pop(k, None)
@@ -180,8 +190,11 @@ def free_env(monkeypatch):
 
 
 # ── 0. Le couple payant/free a bien des plafonds DIFFÉRENTS ────────
-def test_witness_pair_has_really_divergent_effort_caps():
+def test_witness_pair_has_really_divergent_effort_caps(monkeypatch):
     """Sans écart de plafond, tout témoin sur l'effort ne prouverait rien."""
+    # Couple forcé ici même (le -free homonyme est mort côté amont) ;
+    # monkeypatch restaure la map saine en fin de test.
+    monkeypatch.setitem(oc.FREE_MODEL_MAP, PAID_CHAT, FREE_CHAT)
     if oc.FREE_MODEL_MAP.get(PAID_CHAT) != FREE_CHAT:
         pytest.skip(f"{PAID_CHAT} n'est plus routé vers {FREE_CHAT} dans cet environnement")
 

@@ -8,7 +8,9 @@ Type=simple
 User=opencode
 Group=opencode
 WorkingDirectory=/opt/opencode-proxy
-# Prod: gunicorn (workers=cpu_count, UvicornWorker, keepalive 15, timeout 600)
+# Prod: gunicorn single-worker OBLIGATOIRE (gunicorn.conf.py: workers=1 —
+# étatful : piles VPN, ring buffers, EventManager SSE, SQLite partagée).
+# Multi-workers = ops dashboard partielles, SSE perdus, courses .env/json.
 # Dev: python opencode.py --no-gui (uvicorn direct, single worker)
 ExecStart=/opt/opencode-proxy/.venv/bin/gunicorn -c gunicorn.conf.py opencode:app
 Restart=always
@@ -19,7 +21,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
 ProtectHome=true
-ReadWritePaths=/opt/opencode-proxy/logs /opt/opencode-proxy/.env
+ReadWritePaths=/opt/opencode-proxy/logs /opt/opencode-proxy/.env /opt/opencode-proxy/config.yaml /opt/opencode-proxy/credentials.env /opt/opencode-proxy/api_keys.json /opt/opencode-proxy/logs/shared_rotation.json
 
 [Install]
 WantedBy=multi-user.target

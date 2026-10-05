@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from app.compaction.overflow import is_overflow
 from app.compaction.summarizer import run_summarizer
-from app.compaction.truncate import build_condensed_history
+from app.compaction.truncate import build_condensed_history, build_condensed_input
 
 
 async def maybe_condense(
@@ -60,7 +60,14 @@ async def maybe_condense(
         )
         if not isinstance(summary, str) or not summary.strip():
             return None
-        condensed, _kept = build_condensed_history(history_messages, summary, keep_recent_pairs)
+        try:
+            _api = str(api or "chat").lower()
+        except Exception:
+            _api = "chat"
+        if _api == "responses":
+            condensed, _kept = build_condensed_input(history_messages, summary, keep_recent_pairs)
+        else:
+            condensed, _kept = build_condensed_history(history_messages, summary, keep_recent_pairs)
         if not condensed:
             return None
         return condensed

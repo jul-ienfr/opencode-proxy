@@ -326,3 +326,141 @@ def test_shape_429_relayed_intact_not_503(client, recorder):
     assert r.status_code == 429, f"attendu 429 intact, vu {r.status_code}: {r.text[:300]!r}"
     assert "rate limited" in r.text
     assert "All API keys exhausted" not in r.text
+
+
+# ── (6) stream compactage : tiny → refetch station fraîche → SSE complet ──
+
+def _tiny_chat_completion():
+    return {
+        "id": "chatcmpl-tiny",
+        "object": "chat.completion",
+        "created": 1,
+        "model": "glm-5",
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": "x"}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 50000, "completion_tokens": 17, "total_tokens": 50017},
+    }
+
+
+def _full_chat_completion(text="RESUME-WIRE-COMPLET"):
+    payload = _chat_completion(text=text)
+    payload["usage"] = {"prompt_tokens": 50000, "completion_tokens": 500, "total_tokens": 50500}
+    return payload
+
+
+def test_compaction_stream_tiny_retries_then_succeeds(client, monkeypatch):
+    """Chemin Hermes réel : stream shape-compaction, free tiny puis complet.
+
+    Le client reçoit le SSE synthétisé du 2e essai (jamais l'octet tiny) :
+    le live streaming n'émet rien avant la décision — retry sûr à 100 %.
+    """
+    rec = UpstreamRecorder()
+    _install_seams(monkeypatch, rec)
+    calls = []
+
+    async def _tiny_then_full(body, headers, protocol, model_id, forced_pool=None, req_id=None):
+        calls.append(1)
+        if len(calls) == 1:
+            return FakeResponse(payload=_tiny_chat_completion()), {}, "glm-5-free", "9.9.9.9"
+        return FakeResponse(payload=_full_chat_completion()), {}, "glm-5-free", "9.9.9.10"
+
+    monkeypatch.setattr(oc, "_try_free_model_first", _tiny_then_full, raising=False)
+    body = _shape_chat_body(model="sonnet")
+    body["stream"] = True
+
+    text = _stream_text(client, "/v1/chat/completions", body)
+
+    assert len(calls) == 2, f"refetch station fraîche attendu, vu {len(calls)}"
+    assert "RESUME-WIRE-COMPLET" in text, f"résumé du 2e essai absent: {text[:400]!r}"
+    assert text.rstrip().endswith("[DONE]")
+    assert '"finish_reason": "stop"' in text or '"finish_reason":"stop"' in text
+
+
+def test_compaction_stream_untiny_passthrough_single_fetch(client, monkeypatch):
+    """Stream compactage non-tiny : 1 seul fetch, SSE synthétisé direct."""
+    rec = UpstreamRecorder()
+    _install_seams(monkeypatch, rec)
+    calls = []
+
+    async def _full_only(body, headers, protocol, model_id, forced_pool=None, req_id=None):
+        calls.append(1)
+        return FakeResponse(payload=_full_chat_completion()), {}, "glm-5-free", "9.9.9.10"
+
+    monkeypatch.setattr(oc, "_try_free_model_first", _full_only, raising=False)
+    body = _shape_chat_body(model="sonnet")
+    body["stream"] = True
+
+    text = _stream_text(client, "/v1/chat/completions", body)
+
+    assert len(calls) == 1
+    assert "RESUME-WIRE-COMPLET" in text
+    assert text.rstrip().endswith("[DONE]")
+
+
+def _tiny_anthropic_payload():
+    return {
+        "content": [{"type": "text", "text": "x"}],
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 50000, "output_tokens": 17},
+    }
+
+
+def _full_anthropic_payload(text="RESUME-VIA-COMPLET"):
+    return {
+        "content": [{"type": "text", "text": text}],
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 50000, "output_tokens": 500},
+    }
+
+
+def _shape_messages_body(model="minimax-m2.5", n_chars=1500):
+    return {
+        "model": model,
+        "max_tokens": 64,
+        "messages": [{"role": "user", "content": "resume plz " + "x" * n_chars}],
+    }
+
+
+def test_messages_stream_compaction_tiny_retries_openai_via(client, monkeypatch):
+    """Messages streaming, backend openai-via : tiny chat → refetch → SSE Anthropic."""
+    rec = UpstreamRecorder()
+    _install_seams(monkeypatch, rec)
+    calls = []
+
+    async def _tiny_then_full(body, headers, protocol, model_id, forced_pool=None, req_id=None):
+        calls.append(1)
+        if len(calls) == 1:
+            return FakeResponse(payload=_tiny_chat_completion()), {}, "glm-5-free", "9.9.9.9"
+        return FakeResponse(payload=_full_chat_completion("RESUME-VIA-COMPLET")), {}, "glm-5-free", "9.9.9.10"
+
+    monkeypatch.setattr(oc, "_try_free_model_first", _tiny_then_full, raising=False)
+    body = _shape_messages_body(model="sonnet")
+    body["stream"] = True
+
+    text = _stream_text(client, "/v1/messages", body)
+
+    assert len(calls) == 2, f"refetch attendu, vu {len(calls)}"
+    assert "RESUME-VIA-COMPLET" in text, f"résumé absent: {text[:400]!r}"
+    assert "message_stop" in text
+
+
+def test_messages_stream_compaction_tiny_retries_anthropic_native(client, monkeypatch):
+    """Messages streaming, backend anthropic natif : tiny → refetch → SSE Anthropic."""
+    rec = UpstreamRecorder()
+    _install_seams(monkeypatch, rec)
+    calls = []
+
+    async def _tiny_then_full(body, headers, protocol, model_id, forced_pool=None, req_id=None):
+        calls.append(1)
+        if len(calls) == 1:
+            return FakeResponse(payload=_tiny_anthropic_payload()), {}, "mimo-v2.5-free", "9.9.9.9"
+        return FakeResponse(payload=_full_anthropic_payload()), {}, "mimo-v2.5-free", "9.9.9.10"
+
+    monkeypatch.setattr(oc, "_try_free_model_first", _tiny_then_full, raising=False)
+    body = _shape_messages_body(model="minimax-m2.5")
+    body["stream"] = True
+
+    text = _stream_text(client, "/v1/messages", body)
+
+    assert len(calls) == 2, f"refetch attendu, vu {len(calls)}"
+    assert "RESUME-VIA-COMPLET" in text, f"résumé absent: {text[:400]!r}"
+    assert "message_stop" in text

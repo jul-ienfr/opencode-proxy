@@ -112,28 +112,63 @@ def test_plan_is_pure_and_never_raises():
 
 
 def test_free_request_helper_never_calls_paid_helper(monkeypatch):
-    """is_free=True → _do_free_direct_request, JAMAIS _do_request_with_retry."""
-    calls = {"free": 0, "paid": 0}
+    """is_free=True → pool free (_try_free_model_first), JAMAIS _do_request_with_retry.
 
-    async def _fake_free(ep, body, headers):
-        calls["free"] += 1
-        return ("FREERESP", headers)
+    [Voie unifiée] Le résumeur d'une conversation free emprunte la même
+    machinerie pool (stations/VPN/hedge) que la conversation : ni le helper
+    payant, ni le direct résidentiel ne doivent être appelés.
+    """
+    calls = {"pool": 0, "paid": 0, "direct": 0}
+
+    async def _fake_pool(body, headers, protocol, model_id, forced_pool=None, req_id=None):
+        calls["pool"] += 1
+        assert model_id == "mimo-v2.5", "le pool doit résoudre via le seed (même route que la conversation)"
+        return ("FREERESP", headers, model_id, "9.9.9.9")
 
     async def _fake_paid(*a, **k):
         calls["paid"] += 1
         return ("PAIDRESP", {})
 
-    monkeypatch.setattr(oc, "_do_free_direct_request", _fake_free)
+    async def _fake_direct(*a, **k):
+        calls["direct"] += 1
+        return ("DIRECTRESP", {})
+
+    monkeypatch.setattr(oc, "_try_free_model_first", _fake_pool)
     monkeypatch.setattr(oc, "_do_request_with_retry", _fake_paid)
+    monkeypatch.setattr(oc, "_do_free_direct_request", _fake_direct)
 
     import asyncio
 
     out = asyncio.get_event_loop_policy().new_event_loop().run_until_complete(
-        oc._compaction_summarizer_request(True, "https://opencode.ai/zen/v1/chat/completions", {"messages": []}, {}, "openai")
+        oc._compaction_summarizer_request(True, "https://opencode.ai/zen/v1/chat/completions", {"model": "mimo-v2.5-free", "messages": []}, {}, "openai", seed="mimo-v2.5")
     )
     assert out[0] == "FREERESP"
-    assert calls["free"] == 1
+    assert calls["pool"] == 1
     assert calls["paid"] == 0, "la jambe free ne doit jamais emprunter le helper payant"
+    assert calls["direct"] == 0, "la jambe free passe par le pool (VPN/stations), pas le direct résidentiel"
+
+
+def test_free_pool_exhaustion_is_fail_open_never_paid(monkeypatch):
+    """Pool épuisé (None) → UpstreamError (fail-open), toujours pas de payant."""
+    import asyncio
+
+    async def _fake_pool_none(*a, **k):
+        return None
+
+    async def _fake_paid(*a, **k):
+        raise AssertionError("le repli payant silencieux est interdit")
+
+    monkeypatch.setattr(oc, "_try_free_model_first", _fake_pool_none)
+    monkeypatch.setattr(oc, "_do_request_with_retry", _fake_paid)
+
+    try:
+        asyncio.get_event_loop_policy().new_event_loop().run_until_complete(
+            oc._compaction_summarizer_request(True, "https://opencode.ai/zen/v1/chat/completions", {"model": "m", "messages": []}, {}, "openai", seed="mimo-v2.5")
+        )
+    except oc.UpstreamError:
+        pass
+    else:
+        raise AssertionError("pool épuisé → UpstreamError attendu (run_summarizer le convertit en None)")
 
 
 def test_summarizer_never_targets_systemone():
@@ -254,4 +289,6 @@ def test_paid_ids_still_resolve_to_none(model_id):
 def test_mapped_paid_names_keep_their_destination():
     """Les noms payants mappés gardent leur destination déclarée (non régressé)."""
     assert oc._resolve_free_model("mimo-v2.5") == "mimo-v2.5-free"
-    assert oc._resolve_free_model("glm-5.1") == "deepseek-v4-flash-free"
+    # deepseek-v4-flash-free mort côté amont (0 succès) : remappé sain.
+    assert oc._resolve_free_model("glm-5.1") == "mimo-v2.5-free"
+    assert oc._resolve_free_model("deepseek-v4-flash") == "mimo-v2.5-free"

@@ -41,6 +41,69 @@ def build_summary_user_text(history_text: str, previous_summary: str | None = No
     )
 
 
+def _norm_cap(cap) -> int:
+    """Cap assaini (défaut officiel _SUMMARY_CAP). Ne lève jamais."""
+    try:
+        c = int(cap)
+        return c if c > 0 else _SUMMARY_CAP
+    except Exception:
+        return _SUMMARY_CAP
+
+
+def _int_field(body, key):
+    """Entier positif d'un champ (hors bool), ou 0. Ne lève jamais."""
+    try:
+        v = body.get(key) if isinstance(body, dict) else None
+        if isinstance(v, bool):
+            return 0
+        return int(v) if isinstance(v, int) and v > 0 else 0
+    except Exception:
+        return 0
+
+
+def should_clamp_summary(body, cap=None) -> bool:
+    """True si body porte un max_tokens/max_output_tokens au-delà du cap.
+
+    Pré-filtre bon marché (comparaison d'entiers, sans scan) avant la
+    détection de shape : les requêtes ordinaires (cap respecté) ne paient
+    jamais le coût de ``is_compaction_shape``. Ne lève jamais.
+    """
+    try:
+        c = _norm_cap(cap)
+        return _int_field(body, "max_tokens") > c or _int_field(body, "max_output_tokens") > c
+    except Exception:
+        return False
+
+
+def cap_summary_max_tokens(body, cap=None) -> tuple:
+    """Plafonne max_tokens/max_output_tokens au cap officiel (4096).
+
+    Réplique officielle : l'officiel n'envoie jamais plus de
+    ``min(outputLimit, 4096)`` pour un résumé — borne les générations
+    runaway (13k tokens → 2 min) qui font thrasher les clients en attente.
+    Jamais de remontée, jamais d'ajout de clé, copie (l'original reste
+    intact pour logs/DB). Retourne (body, capped: bool). Ne lève jamais.
+    """
+    try:
+        c = _norm_cap(cap)
+        if not isinstance(body, dict):
+            return body, False
+        changed = False
+        out = body
+        for k in ("max_tokens", "max_output_tokens"):
+            if _int_field(out, k) > c:
+                if out is body:
+                    out = dict(body)
+                out[k] = c
+                changed = True
+        return out, changed
+    except Exception:
+        try:
+            return body, False
+        except Exception:
+            return {}, False
+
+
 def build_summarizer_body(summary_text_input: str, max_tokens: int) -> dict:
     """Body de la requête résumeur (jamais envoyé tel quel : model remappé par l'appelant)."""
     cap = max_tokens if isinstance(max_tokens, int) and max_tokens > 0 else 2048
@@ -292,6 +355,8 @@ __all__ = [
     "build_summarizer_anthropic_body",
     "build_summarizer_responses_body",
     "build_summarizer_for_api",
+    "should_clamp_summary",
+    "cap_summary_max_tokens",
     "extract_previous_summary",
     "run_summarizer",
 ]

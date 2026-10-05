@@ -67,7 +67,7 @@ PAID_RESPONSES = "muse-spark-1.3-contributor"  # â†’ openai /v1/responses
 
 # Sous-chemin free-model (stream) : on doit partir d'un modÃ¨le CLIENT dont la
 # cible a un Ã©quivalent free â€” c'est le seul point d'entrÃ©e qui dÃ©clenche le swap.
-#   P2 : Â« sonnet Â» â†’ glm-5.1 (openai chat)  â†’ free deepseek-v4-flash-free
+#   P2 : Â« sonnet Â» â†’ glm-5.1 (openai chat)  â†’ free mimo-v2.5-free
 #   P4 : Â« haiku Â»  â†’ minimax-m2.5 (anthropic) â†’ free mimo-v2.5-free
 FREE_CLIENT_P2 = "sonnet"
 FREE_CLIENT_P4 = "haiku"
@@ -1922,7 +1922,7 @@ def _p2_messages(text: str = "hi", max_tokens: int = 4096, stream: bool = False)
 def _p2_free_responses(monkeypatch) -> str:
     """Force l'endpoint free de la route P2 vers ``/responses``. Rend le modèle free.
 
-    Le modèle free de ``sonnet`` est ``deepseek-v4-flash-free`` (endpoint Chat
+    Le modèle free de ``sonnet`` est ``mimo-v2.5-free`` (endpoint Chat
     aujourd'hui) : on ne substitue le sélecteur **que** pour ce modèle, en
     déléguant au vrai ``_free_endpoint_for`` pour tout le reste.
     """

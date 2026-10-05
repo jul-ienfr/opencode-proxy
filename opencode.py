@@ -100,6 +100,9 @@ _DDG_CACHE: OrderedDict = OrderedDict()  # kstr -> (expiry, formatted)
 _DDG_LOCKS: dict[str, asyncio.Lock] = {}
 _DDG_SEM = asyncio.Semaphore(3)
 FETCH_SEM = asyncio.Semaphore(5)
+# [P2-12] cache + singleflight du fetch (même pattern que DDG).
+_FETCH_CACHE: OrderedDict = OrderedDict()  # kstr -> (expiry, extracted)
+_FETCH_LOCKS: dict[str, asyncio.Lock] = {}
 _BLOCKED_NETS = [
     ipaddress.ip_network(c)
     for c in (
@@ -524,7 +527,14 @@ from app.compaction import maybe_condense as _maybe_condense  # noqa: E402  # [P
 from app.compaction.classify import has_free_leg as _classify_has_free_leg  # noqa: E402  # [Compaction voie unifiée]
 from app.compaction.classify import is_free_class as _classify_is_free_class  # noqa: E402
 from app.compaction.plan import summarizer_plan as _plan_summarizer_plan  # noqa: E402
-from app.compaction.transport import normalize_free_responses as _transport_normalize  # noqa: E402
+from app.compaction.streaming import anthropic_sse_from_completion as _compact_anthropic_sse  # noqa: E402
+from app.compaction.streaming import chat_sse_from_completion as _compact_chat_sse  # noqa: E402
+from app.compaction.streaming import completion_text as _compact_text  # noqa: E402
+from app.compaction.streaming import final_has_nontext_blocks as _compact_final_has_nontext  # noqa: E402
+from app.compaction.streaming import should_buffer_compaction as _should_buffer_compaction  # noqa: E402
+from app.compaction.transport import (  # noqa: E402
+    normalize_free_responses as _transport_normalize,  # noqa: E402  # [Compaction voie unifiée]
+)
 from app.compaction.transport import summarizer_headers as _transport_headers  # noqa: E402
 from app.compaction.transport import summarizer_request as _transport_request  # noqa: E402
 from app.router import route_for as _app_router_route_for  # noqa: E402  # [P5 tranche 3]
@@ -619,7 +629,7 @@ _app_db.init_token_counters_schema(_conn)
 _debug("  [db] free_model_usage + token_counters_daily tables ready")
 
 
-_DB_COMMIT_INTERVAL = yaml_get("database", "commit_interval", 5)  # seconds between periodic commits
+_DB_COMMIT_INTERVAL = yaml_get("database", "commit_interval", 2)  # seconds between periodic commits
 _DB_COMMIT_BATCH = yaml_get("database", "commit_batch", 10)  # force commit after N inserts
 _db_commit_lock = threading.Lock()
 # [Phase 8] Lock no-op : _bump_token_counters_sync tourne DÉJÀ sous
@@ -701,7 +711,7 @@ def _warn_huge_context(request, where: str = "") -> None:
         _threshold = 600000
     if _size >= _threshold:
         try:
-            _ua = (_hdrs.get("user-agent") or "")[:60]
+            _ua = ((_hdrs.get("user-agent") if _hdrs is not None else "") or "")[:60]
             _path = str(getattr(getattr(request, "url", None), "path", "") or "") or where
         except Exception:
             _ua, _path = "", where
@@ -933,6 +943,10 @@ async def _db_writer_loop():
                     pass
             break
         except Exception as e:
+            # [P1-7] Le batch est déjà vidangé (finally) : aucune perte, aucun
+            # doublon — mais l'erreur mérite un compteur + warning.
+            _bump_misc_counter("db_writer_error")
+            logging.warning("[db] writer error: %s: %s", type(e).__name__, e)
             _debug(f"  [db] writer error: {type(e).__name__}: {e}")
             await asyncio.sleep(0.1)
 
@@ -1092,20 +1106,24 @@ async def _save_request(
     try:
         _db_queue.put_nowait(("requests", item))
     except asyncio.QueueFull:
-        # [Lot 0] compteur d'alerte QueueFull (fallback synchrone) — signalé
-        # au runtime par logging.warning (visible hors DEBUG) + métrique.
+        # [Lot 0] compteur d'alerte QueueFull (fallback synchrone — la ligne
+        # n'est PAS perdue, elle est insérée hors loop) — signalé au runtime
+        # par logging.warning (visible hors DEBUG) + métrique.
         _bump_misc_counter("db_queuefull")
         logging.warning(
             "[db] queue full (%d) — fallback synchrone pour req_id=%s",
             _db_queue.qsize(),
             req_id,
         )
-        _debug(f"  [db] queue full ({_db_queue.qsize()}), dropping req_id={req_id} — fallback to direct")
+        _debug(f"  [db] queue full ({_db_queue.qsize()}), fallback synchrone req_id={req_id}")
         try:
             # [D1] matérialisation dans le thread (fallback = même CPU hors loop)
             row = await asyncio.to_thread(_materialize_db_row, item)
             await asyncio.to_thread(_db_insert_sync, *row)
         except Exception as e:
+            # [P1-7] Échec du fallback = vraie perte : compteur dédié.
+            _bump_misc_counter("db_fallback_failed")
+            logging.warning("[db] fallback insert FAILED req_id=%s: %s: %s", req_id, type(e).__name__, e)
             _debug(f"  [db] fallback insert failed: {e}")
     else:
         _debug(
@@ -1206,6 +1224,9 @@ def _log_free_model_usage(
             f"status={status} client_ip={client_ip} egress_ip={ip} in={tokens_in} out={tokens_out}"
         )
     except asyncio.QueueFull:
+        # [P1-7] Perte réelle ici (pas de fallback) : compteur + warning.
+        _bump_misc_counter("db_free_usage_dropped")
+        logging.warning("[db] free_usage queue full — dropped usage row for %s", free_model)
         _debug(f"  [free-usage] queue full — dropped usage row for {free_model}")
     except Exception as e:
         _debug(f"  [free-usage] log failed: {e}")
@@ -1405,56 +1426,10 @@ def _resp_json_or_empty(resp):
     return {}
 
 
-def _drop_orphan_tool_messages(messages: list[dict]) -> list[dict]:
-    """Filter role:tool messages whose tool_call_id has no preceding tool_calls id."""
-    # [P5.2 perf] early-exit sans rebuild quand aucun role=="tool" (99% des requêtes)
-    if not any(m.get("role") == "tool" for m in messages):
-        return messages
-    _seen_ids: set[str] = set()
-    filtered: list[dict] = []
-    for m in messages:
-        if m.get("tool_calls"):
-            for tc in m["tool_calls"]:
-                tid = tc.get("id")
-                if tid:
-                    _seen_ids.add(tid)
-            filtered.append(m)
-        elif m.get("role") == "tool":
-            cid = m.get("tool_call_id", "")
-            if cid in _seen_ids:
-                filtered.append(m)
-            else:
-                _debug(
-                    f"  [orphan] DROP tool output call_id={cid!r} — no preceding tool_call (compaction or empty-name skip)"
-                )
-        else:
-            filtered.append(m)
-    return filtered
-
-
-def _drop_orphan_responses_input(inp: list[dict]) -> list[dict]:
-    """Filter function_call_output items whose call_id has no preceding function_call."""
-    # [P5.2 perf] early-exit sans rebuild quand aucun function_call_output
-    if not any(it.get("type") == "function_call_output" for it in inp):
-        return inp
-    _known: set[str] = set()
-    _filt: list[dict] = []
-    for it in inp:
-        t = it.get("type")
-        if t == "function_call":
-            cid = it.get("call_id") or it.get("id") or ""
-            if cid:
-                _known.add(cid)
-            _filt.append(it)
-        elif t == "function_call_output":
-            cid = it.get("call_id") or ""
-            if cid in _known:
-                _filt.append(it)
-            else:
-                _debug(f"  [orphan] DROP function_call_output call_id={cid!r} — no preceding function_call")
-        else:
-            _filt.append(it)
-    return _filt
+# ── [P1-6] _drop_orphan_tool_messages / _drop_orphan_responses_input : source
+# unique = app.protocol.mapping (importées § « Protocol mapping » ci-dessous
+# pour compat `from opencode import ...`). Les définitions locales historiques
+# ont été supprimées (code mort : masquées par l'import au runtime).
 
 
 def _build_http_limits() -> "httpx.Limits":
@@ -2727,8 +2702,15 @@ async def lifespan(app):
                     # [P5 tranche 1] logique déléguée à app/db.weekly_maintain
                     # [plan 30/08 Lot B1] purge auto des lignes > N jours
                     # (database.weekly_purge_days, défaut 90 — 0 = off).
+                    # [P2-11] archivage mensuel AVANT purge
+                    # (database.archive_after_days, défaut 60 — 0 = off) :
+                    # les lignes 60-90 j partent en logs/archive/ au lieu
+                    # d'être supprimées.
                     _pd = yaml_get("database", "weekly_purge_days", 90)
-                    return _app_db.weekly_maintain(_conn, _db_commit_lock, purge_days=_pd)
+                    _ad = yaml_get("database", "archive_after_days", 60)
+                    return _app_db.weekly_maintain(
+                        _conn, _db_commit_lock, purge_days=_pd, archive_days=_ad, db_path=_db_path
+                    )
 
                 size_mo = await asyncio.to_thread(_maint)
                 _debug(
@@ -5797,29 +5779,59 @@ def _compaction_summarizer_headers(is_free: bool, protocol: str, endpoint: str =
         return {}
 
 
-async def _compaction_summarizer_request(is_free: bool, endpoint, body, headers, protocol):
-    """do_request_fn du résumeur : jambe free-only ou payante (voie unifiée).
+async def _compaction_free_pool_request(body, headers, protocol, seed, forced_pool=None, req_id=None):
+    """Résumeur free via la machinerie pool (stations/VPN/hedge/cooldown), fail-open.
 
-    Délégué fin vers ``app.compaction.transport.summarizer_request`` :
-    ``is_free`` → ``_do_free_direct_request`` (grille wire + Bearer public,
-    conversion chat→Responses sur endpoint ``/responses``) ; sinon
-    ``_do_request_with_retry`` (payant). Même voie que la conversation,
-    jamais de bascule silencieuse.
+    [P1-6] Wrapper fin vers ``app.compaction.pool.free_pool_request`` (DI
+    pure) — même jambe que la conversation, jamais de repli payant
+    silencieux. Ne lève que ``UpstreamError``.
     """
-    try:
-        return await _transport_request(
-            is_free,
-            endpoint,
-            body,
-            headers,
-            protocol,
-            do_free_fn=_do_free_direct_request,
-            do_paid_fn=_do_request_with_retry,
-            chat_to_responses_fn=_chat_to_responses_request,
-            normalize_response_fn=_compaction_normalize_response,
+    from app.compaction.pool import free_pool_request as _pool_free
+
+    return await _pool_free(
+        body,
+        headers,
+        protocol,
+        seed,
+        forced_pool=forced_pool,
+        req_id=req_id,
+        try_free_fn=_try_free_model_first,
+        refusal_types=(FreeRefusal, UpstreamError),
+        upstream_error_cls=UpstreamError,
+    )
+
+
+async def _compaction_summarizer_request(
+    is_free: bool, endpoint, body, headers, protocol, *, seed=None, forced_pool=None, req_id=None
+):
+    """do_request_fn du résumeur : jambe free (pool stations/VPN) ou payante.
+
+    [P1-6] Wrapper fin vers ``app.compaction.pool.summarizer_dispatch``
+    (même voie que la conversation, jamais de bascule silencieuse).
+    """
+    from app.compaction.pool import summarizer_dispatch as _pool_dispatch
+
+    async def _bound_free_pool(wire_body, wire_headers, _protocol, _seed, *, forced_pool=None, req_id=None):
+        return await _compaction_free_pool_request(
+            wire_body, wire_headers, _protocol, _seed, forced_pool=forced_pool, req_id=req_id
         )
-    except Exception as exc:
-        raise exc
+
+    return await _pool_dispatch(
+        is_free,
+        endpoint,
+        body,
+        headers,
+        protocol,
+        seed=seed,
+        forced_pool=forced_pool,
+        req_id=req_id,
+        free_pool_fn=_bound_free_pool,
+        do_paid_fn=_do_request_with_retry,
+        do_free_direct_fn=_do_free_direct_request,
+        transport_request_fn=_transport_request,
+        chat_to_responses_fn=_chat_to_responses_request,
+        normalize_response_fn=_compaction_normalize_response,
+    )
 
 
 async def _compaction_normalize_response(resp, endpoint, body):
@@ -5840,6 +5852,319 @@ async def _compaction_normalize_response(resp, endpoint, body):
         )
     except Exception:
         return resp
+
+
+async def _try_free_with_tiny_retry(send_body, headers, protocol, model_id, *, forced_pool=None, req_id=None):
+    """Free-first + 1 refetch station fraîche sur sortie tiny (free-only, pré-réponse).
+
+    [Compaction tiny-retry] L'amont free répond parfois 200 avec une sortie
+    microscopique sur énorme contexte (signature ``suspect_tiny_output`` :
+    in>=40k, out<100, aucun outil) — un résumé de 17 tokens n'en est pas un.
+    Comme RIEN n'a encore été envoyé au client, un 2e essai est sûr : la
+    station fautive est mise en cooldown 60 s (même machinerie que les 429)
+    puis UNE seule tentative fraîche. Au-delà (2e tiny, None, erreur) : retour
+    tel quel / propagation — l'appelant applique sa politique (paid, relais
+    intact, live streaming). Contrat identique à ``_try_free_model_first``
+    (4-tuple ou None ; FreeRefusal/UpstreamError propagés). Réservé au
+    compactage sans outils (l'appelant gate via ``should_buffer_compaction``).
+    """
+    try:
+        result = await _try_free_model_first(
+            send_body, headers, protocol, model_id, forced_pool=forced_pool, req_id=req_id
+        )
+    except (FreeRefusal, UpstreamError):
+        raise
+    except Exception:
+        return None
+    if result is None:
+        return None
+    try:
+        resp, _hdrs, _actual, _ip = result
+        if getattr(resp, "status_code", 0) != 200:
+            return result
+        data = _resp_json_or_empty(resp)
+        if not isinstance(data, dict) or not data:
+            return result
+        usage = data.get("usage", {}) if isinstance(data.get("usage"), dict) else {}
+        try:
+            _tools_used = []
+            _content = data.get("content")
+            if isinstance(_content, list):
+                _tools_used = [
+                    b.get("name") for b in _content
+                    if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("name")
+                ]
+            _choices = data.get("choices")
+            if not _tools_used and isinstance(_choices, list) and _choices and isinstance(_choices[0], dict):
+                _tc = ((_choices[0].get("message") or {}).get("tool_calls")) or []
+                _tools_used = [
+                    (t.get("function") or {}).get("name", "?") for t in _tc if isinstance(t, dict)
+                ]
+            _output = data.get("output")
+            if not _tools_used and isinstance(_output, list):
+                _tools_used = [
+                    i.get("name", "?") for i in _output
+                    if isinstance(i, dict) and i.get("type") == "function_call"
+                ]
+        except Exception:
+            _tools_used = []
+        if protocol == "anthropic":
+            _in = usage.get("input_tokens", 0) or usage.get("prompt_tokens", 0)
+            _out = usage.get("output_tokens", 0) or usage.get("completion_tokens", 0)
+        else:
+            _in = usage.get("prompt_tokens", 0) or usage.get("input_tokens", 0)
+            _out = usage.get("completion_tokens", 0) or usage.get("output_tokens", 0)
+        if not _is_suspect_tiny_output(_in, _out, _tools_used):
+            return result
+    except Exception:
+        return result
+    try:
+        _log(f"  [compaction] tiny_output in={_in} out={_out} ({_actual!r}) → 1 refetch station fraîche")
+    except Exception:
+        pass
+    try:
+        _st = _free_attempt_station()
+        _set_free_cooldown(_actual, 60, _st)
+    except Exception:
+        pass
+    try:
+        result2 = await _try_free_model_first(
+            send_body, headers, protocol, model_id, forced_pool=forced_pool, req_id=req_id
+        )
+    except (FreeRefusal, UpstreamError):
+        raise
+    except Exception:
+        return result
+    # 2e tiny ou None : fail-open, l'appelant tranche (jamais de boucle).
+    return result2 if result2 is not None else result
+
+
+async def _buffered_compaction_stream(
+    *,
+    porte,
+    request,
+    req_id,
+    original_model,
+    model_id,
+    endpoint,
+    protocol,
+    headers,
+    send_body,
+    paid_body,
+    client_ip,
+    start_time,
+    is_stream,
+    thinking_type,
+    effort,
+    tool_names,
+    request_body,
+    is_compaction,
+):
+    """Stream de compactage bufferisé : fetch non-stream + retry tiny + SSE synthétisé.
+
+    [Compaction tiny-retry] Les boucles live émettent chaque chunk dès
+    réception : sur sortie tiny, le client a déjà reçu l'octet défectueux et
+    aucun retry same-stream n'est possible (``stream_retry_suppressed_...``).
+    Pour le compactage détecté (y compris WITH-tools : les compactions Claude
+    Code rejouent l'historique avec outils — tâche de fond, pas d'interactivité), on fetche en bufferisé (stream OFF), on
+    rejoue UNE fois sur station fraîche si tiny (rien n'est parti : sûr à
+    100 %), puis on émet le flux SSE reconstruit — contrat client inchangé.
+
+    - ``porte`` : ``messages`` (synthèse SSE Anthropic) ou ``chat`` (SSE Chat).
+    - ``send_body`` : corps d'envoi free (forme amont) ; ``paid_body`` : corps
+      d'envoi paid (converti si endpoint ``/responses``) — copies faites ici.
+    - Retourne une ``StreamingResponse`` complète, ou ``None`` pour laisser
+      le live streaming (comportement actuel inchangé) : gate fermée,
+      refus/erreur free, paid non-200, JSON illisible, вывод vide, ou
+      exception quelconque (fail-open TOTAL).
+    """
+    try:
+        try:
+            _ten = get_server_compaction("tiny_retry", True)
+        except Exception:
+            _ten = True
+        if not _should_buffer_compaction(
+            is_stream=is_stream,
+            is_compaction=is_compaction,
+            tiny_retry_enabled=_ten,
+            has_free_leg=_has_free_leg(model_id),
+        ):
+            return None
+        try:
+            _forced_pool = getattr(request.state, "_geo_forced_pool", None)
+        except Exception:
+            _forced_pool = None
+        _fetch = dict(send_body) if isinstance(send_body, dict) else {}
+        _fetch["stream"] = False
+        _paid_fetch = dict(paid_body) if isinstance(paid_body, dict) else dict(_fetch)
+        _paid_fetch["stream"] = False
+        try:
+            free_result = await _try_free_with_tiny_retry(
+                _fetch, {}, protocol, model_id, forced_pool=_forced_pool, req_id=req_id
+            )
+        except (FreeRefusal, UpstreamError):
+            return None
+        except Exception:
+            return None
+        _account_alias = "free (no auth)"
+        _free_ip = ""
+        _log_model = model_id
+        if free_result is not None:
+            resp, _hdrs, _actual_model, _actual_ip = free_result
+            _log_model = _actual_model
+            _free_ip = _actual_ip or ""
+            data = _resp_json_or_empty(resp)
+        else:
+            try:
+                _tunnel = bool(getattr(request.state, "_geo_force_tunnel", False))
+            except Exception:
+                _tunnel = False
+            try:
+                if _tunnel:
+                    async with _open_via_pool(
+                        endpoint,
+                        _paid_fetch,
+                        headers,
+                        is_stream=False,
+                        forced_pool=_forced_pool,
+                    ) as resp:
+                        headers = dict(resp.headers) if getattr(resp, "headers", None) else headers
+                        _tunnel_resp = resp
+                    resp = _tunnel_resp
+                else:
+                    resp, headers = await _do_request_with_retry(endpoint, _paid_fetch, headers, protocol)
+            except (FreeRefusal, UpstreamError):
+                return None
+            except Exception:
+                return None
+            if getattr(resp, "status_code", 0) != 200:
+                return None
+            try:
+                _account_alias = _alias_for_key(_key_from_headers(headers, protocol))
+            except Exception:
+                _account_alias = ""
+            try:
+                data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+            except Exception:
+                return None
+        if not isinstance(data, dict) or not data:
+            return None
+        # Façonnage client final (miroirs non-stream, copies — jamais de mutation de l'appelant).
+        try:
+            _map = None
+            if porte == "messages":
+                if "output" in data and "choices" not in data:
+                    _map = dict(_fetch).pop(_TOOL_NAME_MAP_KEY, None)
+                    final = _responses_to_anthropic_response(data, original_model, _map)
+                    usage = final.get("usage", {}) if isinstance(final.get("usage"), dict) else {}
+                    req_in = usage.get("input_tokens", 0)
+                    req_out = usage.get("output_tokens", 0)
+                    _inp_det = usage.get("input_tokens_details") if isinstance(usage.get("input_tokens_details"), dict) else {}
+                    cache = _inp_det.get("cached_tokens", 0)
+                elif "choices" in data:
+                    _map = dict(_fetch).pop(_TOOL_NAME_MAP_KEY, None)
+                    final = openai_to_anthropic(data, original_model, _map)
+                    usage = final.get("usage", {}) if isinstance(final.get("usage"), dict) else {}
+                    req_in = usage.get("input_tokens", 0)
+                    req_out = usage.get("output_tokens", 0)
+                    cache = usage.get("cache_read_input_tokens", 0)
+                else:
+                    final = data
+                    usage = data.get("usage", {}) if isinstance(data.get("usage"), dict) else {}
+                    req_in = usage.get("input_tokens", 0) or usage.get("prompt_tokens", 0)
+                    req_out = usage.get("output_tokens", 0) or usage.get("completion_tokens", 0)
+                    cache = usage.get("cache_read_input_tokens", 0)
+            else:  # porte chat
+                if "output" in data and "choices" not in data:
+                    _map = dict(_paid_fetch).pop(_TOOL_NAME_MAP_KEY, None)
+                    final = _responses_to_chat_response(data, original_model, _map)
+                    usage = final.get("usage", {}) if isinstance(final.get("usage"), dict) else {}
+                    req_in = usage.get("prompt_tokens", 0)
+                    req_out = usage.get("completion_tokens", 0)
+                    cache = _extract_cache_tokens(usage)
+                else:
+                    final = data
+                    usage = data.get("usage", {}) if isinstance(data.get("usage"), dict) else {}
+                    req_in = usage.get("prompt_tokens", 0)
+                    req_out = usage.get("completion_tokens", 0)
+                    cache = _extract_cache_tokens(usage)
+        except Exception:
+            return None
+        text = _compact_text(final)
+        if _compact_final_has_nontext(final):
+            # Fidélité : le final porte outils/thinking/bloc natif que la
+            # synthèse texte ne sait pas rendre → live streaming (aucune
+            # amputation, le retry tiny a déjà eu lieu en bufferisé).
+            return None
+        if not text:
+            # Vide : laisser le live (machinerie empty existante) trancher.
+            return None
+        try:
+            _update_token_usage(_log_model, req_in, req_out, cache, _extract_cache_creation_tokens(usage))
+        except Exception:
+            pass
+        try:
+            await _save_and_log_request(
+                req_id,
+                _log_model,
+                original_model,
+                start_time,
+                req_in,
+                req_out,
+                cache,
+                protocol,
+                True,
+                thinking_type,
+                effort,
+                client_ip,
+                _account_alias,
+                tool_names,
+                tools_used=None,
+                request_body=request_body,
+                response_body=final,
+                free_model_ip=_free_ip or None,
+            )
+        except Exception:
+            pass
+        try:
+            _log(f"  [compaction] buffered stream {porte} model={_log_model!r} in={req_in} out={req_out}")
+        except Exception:
+            pass
+        if porte == "messages":
+            events = _compact_anthropic_sse(
+                text, model=original_model, msg_id=_fast_id("msg"),
+                input_tokens=req_in, output_tokens=req_out, cache_read=cache,
+            )
+            err_ev = _SSE_ERR_ANTHROPIC
+        else:
+            try:
+                import time as _time_mod
+
+                _created = int(_time_mod.time())
+            except Exception:
+                _created = 0
+            events = _compact_chat_sse(
+                text, model=original_model, msg_id=_fast_id("chatcmpl"),
+                created=_created, prompt_tokens=req_in, completion_tokens=req_out,
+            )
+            err_ev = _SSE_ERR_OPENAI
+
+        async def _replay():
+            for _ev in events or []:
+                yield _ev
+
+        return StreamingResponse(
+            _sse_pump(
+                _replay(),
+                on_error=_note_sse_abort,
+                error_event=err_ev,
+                idle_timeout=_SSE_IDLE_TIMEOUT,
+            ),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+        )
+    except Exception:
+        return None
 
 
 def _free_parallel_should_hedge(body: dict, forced_pool=None) -> bool:
@@ -7492,7 +7817,8 @@ async def _free_responses_body_object(resp) -> dict:
     return _collect_responses_sse_object(corps)
 
 
-async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=None, req_id=None):
+async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=None, req_id=None,
+                            is_compaction="auto"):
     """Try the free model equivalent before falling back to paid.
 
     If the model has a free equivalent in FREE_MODEL_MAP, attempt the request
@@ -7527,6 +7853,51 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
     utilisent donc ``_`` pour ce créneau.
     """
     global _free_ip_pool
+
+    # [Compaction summary-lean] Sur trafic compactage détecté uniquement :
+    # sorties d'outils tronquées (l'amont free digère mal les résumés de
+    # plusieurs Mo). Jamais sur tours normaux (risque sémantique).
+    # is_compaction=True forcé par l'appelant, "auto" = détection locale.
+    try:
+        _lean_on = get_server_compaction("summary_lean", True)
+    except Exception:
+        _lean_on = True
+    if _lean_on:
+        try:
+            _is_comp = bool(is_compaction) if isinstance(is_compaction, bool) else bool(
+                _is_compaction_shape(body))
+        except Exception:
+            _is_comp = False
+        if _is_comp:
+            try:
+                _mc = get_server_compaction("summary_lean_max_chars", 2000)
+            except Exception:
+                _mc = 2000
+            try:
+                from app.compaction.lean import lean_summary_body as _lean_fn
+
+                body, _cut = _lean_fn(body, max_chars=_mc)
+                if _cut:
+                    _debug(f"  [compaction] summary-lean: {_cut} chars d'outputs d'outils tronqués")
+            except Exception:
+                pass
+            # [Compaction official-cap] même gate : sortie plafonnée comme
+            # l'officiel (min(outputLimit,4096)) — borne les générations
+            # runaway qui font thrasher les clients en attente.
+            try:
+                from app.compaction.summarizer import cap_summary_max_tokens as _cap_fn
+                from app.compaction.summarizer import should_clamp_summary as _should_cap_fn
+
+                try:
+                    _cc = get_server_compaction("summary_clamp_max_tokens", 4096)
+                except Exception:
+                    _cc = 4096
+                if _should_cap_fn(body, _cc):
+                    body, _capped = _cap_fn(body, _cc)
+                    if _capped:
+                        _debug("  [compaction] summary max_tokens clampé (cap officiel)")
+            except Exception:
+                pass
 
     free_model = _resolve_free_model(model_id)
     if not free_model:
@@ -9860,7 +10231,10 @@ async def _execute_ddg_search(query: str, max_results: int = 5, timeout: int = 1
 async def _execute_web_fetch(
     url: str, prompt: str = "", timeout: int = 15, max_bytes: int = 12000, via_vpn: bool = False
 ) -> str:
-    """Fetch URL with SSRF guard, redirect re-validation, content guards, sem."""
+    """Fetch URL with SSRF guard, redirect re-validation, content guards, sem.
+
+    [P2-12] singleflight + TTL 120 s via _FETCH_CACHE/_FETCH_LOCKS.
+    """
     return await _ws_mod.execute_web_fetch(
         url,
         prompt,
@@ -9870,6 +10244,8 @@ async def _execute_web_fetch(
         role_client_fn=_role_client,
         safe_fn=_is_safe_fetch_url,
         sem=FETCH_SEM,
+        cache=_FETCH_CACHE,
+        locks=_FETCH_LOCKS,
     )
 
 
@@ -10325,7 +10701,8 @@ def _sse_lines_from_buffered_json(raw, model: str = "") -> list[str] | None:
         return None
     _choices = chat.get("choices") if isinstance(chat.get("choices"), list) else []
     _ch0 = _choices[0] if _choices and isinstance(_choices[0], dict) else {}
-    _msg = _ch0.get("message") if isinstance(_ch0.get("message"), dict) else {}
+    _ch_msg = _ch0.get("message")
+    _msg: dict = _ch_msg if isinstance(_ch_msg, dict) else {}
     _finish = _ch0.get("finish_reason") or "stop"
     _usage = chat.get("usage") if isinstance(chat.get("usage"), dict) else {}
     _mid = chat.get("id") if isinstance(chat.get("id"), str) else f"chatcmpl-free-{int(time.time() * 1000):x}"
@@ -10354,7 +10731,8 @@ def _sse_lines_from_buffered_json(raw, model: str = "") -> list[str] | None:
     for _i, _tc in enumerate(_msg.get("tool_calls") or []):
         if not isinstance(_tc, dict):
             continue
-        _fn = _tc.get("function") if isinstance(_tc.get("function"), dict) else {}
+        _fn_raw = _tc.get("function")
+        _fn: dict = _fn_raw if isinstance(_fn_raw, dict) else {}
         # Un tool_call SANS nom serait rejete par le client : on l'ecarte
         # (meme regle que la collecte de la route /v1/responses).
         if not _fn.get("name"):
@@ -10954,7 +11332,7 @@ async def messages(request: Request):
                                     _ov = get_server_compaction("summarizer_model_override", None)
                                 except Exception:
                                     _ov = None
-                                _s_model, _s_ep, _s_proto, _s_api, _s_free, _ = _compaction_summarizer_plan_full(
+                                _s_model, _s_ep, _s_proto, _s_api, _s_free, _s_seed = _compaction_summarizer_plan_full(
                                     model_id, _ov, endpoint=endpoint, protocol=protocol, api=None
                                 )
                                 try:
@@ -10987,7 +11365,7 @@ async def messages(request: Request):
                                         endpoint=_s_ep,
                                         protocol=_s_proto,
                                         auth_headers_fn=lambda proto, _f=_s_free, _e=_s_ep: _compaction_summarizer_headers(_f, proto, _e),
-                                        do_request_fn=lambda ep, b, h, pr, _f=_s_free: _compaction_summarizer_request(_f, ep, b, h, pr),
+                                        do_request_fn=lambda ep, b, h, pr, _f=_s_free, _s=_s_seed: _compaction_summarizer_request(_f, ep, b, h, pr, seed=_s, forced_pool=getattr(request.state, "_geo_forced_pool", None), req_id=req_id),
                                         enabled=True,
                                         summary_max_tokens=_mk,
                                         keep_recent_pairs=_kr,
@@ -11968,6 +12346,18 @@ async def messages(request: Request):
 
         # For streaming: if free model exists, pass empty headers (free models don't need auth)
         _stream_headers = a_headers if a_headers.get("x-api-key") else {}
+        # [Compaction tiny-retry] stream de compactage sans outils : fetch
+        # bufferisé + 1 refetch station fraîche sur tiny, puis SSE synthétisé
+        # (échec quelconque → None → live streaming inchangé).
+        _buf = await _buffered_compaction_stream(
+            porte="messages", request=request, req_id=req_id, original_model=original_model,
+            model_id=model_id, endpoint=endpoint, protocol=protocol, headers=a_headers,
+            send_body=body, paid_body=body, client_ip=client_ip, start_time=start_time,
+            is_stream=is_stream, thinking_type=thinking_type, effort=effort,
+            tool_names=tool_names, request_body=request_body, is_compaction=_is_compaction,
+        )
+        if _buf is not None:
+            return _buf
         return StreamingResponse(
             _sse_pump(
                 anthropic_stream(_stream_headers),
@@ -12259,7 +12649,7 @@ async def messages(request: Request):
                             str(_sc_cfg.get("summarizer_model_override") or "").strip()
                             if isinstance(_sc_cfg, dict) else ""
                         )
-                        _sc_model, _sc_ep, _sc_proto, _sc_api, _sc_free, _ = _compaction_summarizer_plan_full(
+                        _sc_model, _sc_ep, _sc_proto, _sc_api, _sc_free, _sc_seed = _compaction_summarizer_plan_full(
                             model_id, _sc_ovr, endpoint=endpoint, protocol="openai", api=None
                         )
                         try:
@@ -12300,7 +12690,7 @@ async def messages(request: Request):
                             endpoint=_sc_ep,
                             protocol=_sc_proto,
                             auth_headers_fn=lambda proto, _f=_sc_free, _e=_sc_ep: _compaction_summarizer_headers(_f, proto, _e),
-                            do_request_fn=lambda ep, b, h, pr, _f=_sc_free: _compaction_summarizer_request(_f, ep, b, h, pr),
+                            do_request_fn=lambda ep, b, h, pr, _f=_sc_free, _s=_sc_seed: _compaction_summarizer_request(_f, ep, b, h, pr, seed=_s, forced_pool=getattr(request.state, "_geo_forced_pool", None), req_id=req_id),
                             enabled=True,
                             summary_max_tokens=_sc_max,
                             keep_recent_pairs=_sc_keep,
@@ -12312,7 +12702,8 @@ async def messages(request: Request):
                         _condensed = None
                     if _condensed:
                         try:
-                            _retry_body = dict(oai_body) if isinstance(oai_body, dict) else {}
+                            _retry_body: dict | None = dict(oai_body) if isinstance(oai_body, dict) else {}
+                            assert isinstance(_retry_body, dict)
                             if "/responses" in (endpoint or "") and isinstance(_retry_body.get("input"), list):
                                 _retry_body["input"] = list(_condensed)
                             elif isinstance(_retry_body.get("messages"), list):
@@ -13437,6 +13828,18 @@ async def messages(request: Request):
             emitted_finish = True
         return
 
+    # [Compaction tiny-retry] stream de compactage sans outils (openai-via) :
+    # fetch bufferisé + 1 refetch station fraîche sur tiny, puis SSE
+    # Anthropic synthétisé (échec → None → live streaming inchangé).
+    _buf_oa = await _buffered_compaction_stream(
+        porte="messages", request=request, req_id=req_id, original_model=original_model,
+        model_id=model_id, endpoint=endpoint, protocol="openai", headers=headers,
+        send_body=oai_body, paid_body=oai_body, client_ip=client_ip, start_time=start_time,
+        is_stream=is_stream, thinking_type=thinking_type, effort=effort,
+        tool_names=tool_names, request_body=request_body, is_compaction=_is_compaction,
+    )
+    if _buf_oa is not None:
+        return _buf_oa
     return StreamingResponse(
         _sse_pump(
             stream_gen(headers),
@@ -13983,6 +14386,7 @@ async def chat_completions(request: Request):
                 )
             # Try free model first if available
             _geo_tunnel = getattr(request.state, "_geo_force_tunnel", False)
+            _condensed_ok = False  # [Compaction] retry condensé réussi → skip put cache (jamais de cache des résumés)
             try:
                 free_result = await _try_free_model_first(
                     body,
@@ -14077,6 +14481,135 @@ async def chat_completions(request: Request):
                                 return _openai_error(503, "All API keys exhausted. Check your billing.")
                         except UpstreamError as e:
                             return JSONResponse(status_code=e.status_code, content={"error": str(e)})
+                # [Compaction voie unifiée] condense-and-retry réactif (chat) :
+                # 400-overflow constaté, non-stream uniquement, APRÈS le
+                # credit-retry et AVANT le relais d'erreur. Fail-open total :
+                # enabled=false → passthrough ; condensé None → fall through ;
+                # retry re-overflow/échec → relais intact ; 1 tentative max.
+                if resp.status_code == 400 and not is_stream:
+                    try:
+                        _ch_cfg = get_server_compaction()
+                    except Exception:
+                        _ch_cfg = {}
+                    try:
+                        _ch_on = bool(_ch_cfg.get("enabled", False)) if isinstance(_ch_cfg, dict) else False
+                    except Exception:
+                        _ch_on = False
+                    if _ch_on:
+                        try:
+                            _ch_hist = body.get("messages") if isinstance(body, dict) else None
+                            _ch_condensed = None
+                            if isinstance(_ch_hist, list) and _ch_hist:
+                                try:
+                                    _ch_ovr = get_server_compaction("summarizer_model_override", None)
+                                except Exception:
+                                    _ch_ovr = None
+                                (_ch_model, _ch_ep, _ch_proto, _ch_api, _ch_free, _ch_seed) = _compaction_summarizer_plan_full(
+                                    model_id, _ch_ovr, endpoint=endpoint, protocol="openai", api=None
+                                )
+                                try:
+                                    _ch_api = _ch_api or ("responses" if "/responses" in str(_ch_ep or "") else "chat")
+                                except Exception:
+                                    _ch_api = "chat"
+                                try:
+                                    _ch_mk = get_server_compaction("summary_max_tokens", 2048)
+                                except Exception:
+                                    _ch_mk = 2048
+                                try:
+                                    _ch_mk = min(max(int(_ch_mk), 1), 4096)
+                                except Exception:
+                                    _ch_mk = 2048
+                                try:
+                                    _ch_keep = get_server_compaction("keep_recent_pairs", 4)
+                                except Exception:
+                                    _ch_keep = 4
+                                try:
+                                    _ch_keep = int(_ch_keep) if isinstance(_ch_keep, int) else 4
+                                except Exception:
+                                    _ch_keep = 4
+                                try:
+                                    _ch_to = get_server_compaction("timeout_s", 60)
+                                except Exception:
+                                    _ch_to = 60
+                                try:
+                                    _ch_to = int(_ch_to) if isinstance(_ch_to, int) else 60
+                                except Exception:
+                                    _ch_to = 60
+                                try:
+                                    _ch_markers = get_server_compaction("overflow_markers", None)
+                                except Exception:
+                                    _ch_markers = None
+                                try:
+                                    _ch_condensed = await _maybe_condense(
+                                        _ch_hist,
+                                        status_code=resp.status_code,
+                                        body_text=resp.text,
+                                        model_id=_ch_model,
+                                        endpoint=_ch_ep,
+                                        protocol=_ch_proto,
+                                        auth_headers_fn=lambda proto, _f=_ch_free, _e=_ch_ep: _compaction_summarizer_headers(_f, proto, _e),
+                                        do_request_fn=lambda ep, b, h, pr, _f=_ch_free, _s=_ch_seed: _compaction_summarizer_request(_f, ep, b, h, pr, seed=_s, forced_pool=getattr(request.state, "_geo_forced_pool", None), req_id=req_id),
+                                        enabled=True,
+                                        summary_max_tokens=_ch_mk,
+                                        keep_recent_pairs=_ch_keep,
+                                        timeout_s=_ch_to,
+                                        markers=_ch_markers,
+                                        api=_ch_api,
+                                    )
+                                except Exception:
+                                    _ch_condensed = None
+                        except Exception:
+                            _ch_condensed = None
+                        if _ch_condensed:
+                            try:
+                                _ch_retry: dict | None = dict(body) if isinstance(body, dict) else {}
+                                assert isinstance(_ch_retry, dict)
+                                if isinstance(_ch_retry.get("messages"), list):
+                                    _ch_retry["messages"] = list(_ch_condensed)
+                                else:
+                                    _ch_retry = None
+                                if isinstance(_ch_retry, dict):
+                                    _ch_retry["model"] = model_id
+                                    _ch_retry["stream"] = False
+                                    try:
+                                        _ch_map = body.get(_TOOL_NAME_MAP_KEY)
+                                        if _ch_map is not None:
+                                            _ch_retry[_TOOL_NAME_MAP_KEY] = _ch_map
+                                    except Exception:
+                                        pass
+                                    try:
+                                        _ch_tunnel = bool(getattr(request.state, "_geo_force_tunnel", False))
+                                    except Exception:
+                                        _ch_tunnel = False
+                                    if _ch_tunnel:
+                                        async with _open_via_pool(
+                                            endpoint,
+                                            _ch_retry,
+                                            headers,
+                                            is_stream=False,
+                                            forced_pool=getattr(request.state, "_geo_forced_pool", None),
+                                        ) as _ch_r2:
+                                            _ch_h2 = dict(_ch_r2.headers) if getattr(_ch_r2, "headers", None) else headers
+                                            raise _CompactionTunnelDone(_ch_r2, _ch_h2)
+                                    else:
+                                        _ch_r2, _ch_h2 = await _do_request_with_retry(endpoint, _ch_retry, headers, "openai")
+                            except _CompactionTunnelDone as _ch_td:
+                                _ch_r2, _ch_h2 = _ch_td.resp, _ch_td.headers
+                            except Exception:
+                                _ch_condensed = None
+                            else:
+                                if _ch_r2.status_code == 200:
+                                    assert isinstance(_ch_retry, dict)
+                                    body = _ch_retry
+                                    paid_body = _chat_to_responses_request(_ch_retry) if "/responses" in endpoint else _ch_retry
+                                    if "/responses" in endpoint:
+                                        paid_body["stream"] = False
+                                    headers = _ch_h2
+                                    resp = _ch_r2
+                                    account_alias = _alias_for_key(_key_from_headers(headers, "openai"))
+                                    _condensed_ok = True
+                                    _log(f"  [compaction] req_id={req_id} 400-overflow → condense-and-retry once (model={_ch_model!r})")
+                                # Re-overflow ou non-200 : fall through vers le relais intact (pas de 2e tentative).
                 # Convert 429/401/403 → 503 to avoid Claude Code auth window
                 if resp.status_code in (429, 401, 403):
                     # [Phase 1 compaction] shape-compaction : relayer intact
@@ -14174,7 +14707,7 @@ async def chat_completions(request: Request):
                         request_body=request_body,
                         response_body=chat_resp,
                     )
-                    if cache_key and not _is_compaction:
+                    if cache_key and not _is_compaction and not _condensed_ok:
                         _response_cache.put(cache_key, body_bytes, {"Content-Type": "application/json"})
                     return Response(content=body_bytes, headers={"X-Cache": "MISS"}, media_type="application/json")
                 except Exception as e:
@@ -14209,7 +14742,7 @@ async def chat_completions(request: Request):
             # restauré (sinon le passthrough reste bytes-amont VERBATIM).
             if _restored_body_bytes is not None:
                 # [Phase 1 compaction] jamais de put sur shape-compaction.
-                if cache_key and not _is_compaction:
+                if cache_key and not _is_compaction and not _condensed_ok:
                     _response_cache.put(cache_key, _restored_body_bytes, {"Content-Type": "application/json"})
                 return Response(
                     content=_restored_body_bytes, headers={"X-Cache": "MISS"}, media_type="application/json"
@@ -14217,7 +14750,7 @@ async def chat_completions(request: Request):
             # [v10 §14.3.26] garde manquante sur cette branche : cache_key None
             # polluait le store LRU d'une entrée clé None.
             # [Phase 1 compaction] jamais de put sur shape-compaction.
-            if cache_key and not _is_compaction:
+            if cache_key and not _is_compaction and not _condensed_ok:
                 _response_cache.put(cache_key, resp.content, {"Content-Type": "application/json"})
             return Response(content=resp.content, headers={"X-Cache": "MISS"}, media_type="application/json")
 
@@ -15234,6 +15767,22 @@ async def chat_completions(request: Request):
             else:
                 return
 
+        # [Compaction tiny-retry] stream de compactage sans outils (chat) :
+        # fetch bufferisé + 1 refetch station fraîche sur tiny, puis SSE Chat
+        # synthétisé (échec → None → live streaming inchangé).
+        try:
+            _paid_for_buf = _chat_to_responses_request(dict(body)) if "/responses" in endpoint else body
+        except Exception:
+            _paid_for_buf = body
+        _buf_oai = await _buffered_compaction_stream(
+            porte="chat", request=request, req_id=req_id, original_model=original_model,
+            model_id=model_id, endpoint=endpoint, protocol="openai", headers=headers,
+            send_body=body, paid_body=_paid_for_buf, client_ip=client_ip, start_time=start_time,
+            is_stream=is_stream, thinking_type=thinking_type, effort=effort,
+            tool_names=tool_names, request_body=request_body, is_compaction=_is_compaction,
+        )
+        if _buf_oai is not None:
+            return _buf_oai
         return StreamingResponse(
             _sse_pump(
                 openai_stream(headers),
@@ -16162,8 +16711,9 @@ async def _systemone_free_via_pool(endpoint: str, body: dict, headers: dict, for
 
     Même mécanique 429 que les autres modèles free, protocole SystemOne
     inchangé (passthrough ``{model, state, questions}`` tel quel — ni
-    conversion chat/responses, ni grille tools, ni effort, ni hedge :
-    ``_free_wire_body`` retourne un corps sans ``input``/``messages``
+    conversion chat/responses, ni grille tools, ni effort : le hedge
+    free_parallel et la boucle multi-station sont partagés avec la jambe
+    générique, ``_free_wire_body`` retourne un corps sans ``input``/``messages``
     inchangé, et ``_do_free_request_curl_cffi`` le POSTe en non-stream).
 
     * ``Bearer public`` (jamais la clé payante — A.0) VIA tunnel poolé
@@ -16213,10 +16763,10 @@ async def _systemone_free_via_pool(endpoint: str, body: dict, headers: dict, for
     if pool_ok:
         _register_failover_exhausted_cb(lambda: free_model)
         try:
-            # Un seul appel (l'ancien double try/except TypeError identique
-            # était du code mort) — forced_pool threadé ; un vieux double
-            # sans le paramètre lève TypeError → couvert par le except
+            # pool_ok ⇒ pool non-None (assert de typage, sans effet runtime) ;
+            # un vieux double sans le paramètre lève TypeError → couvert par le except
             # ci-dessous (repli direct/fail-closed, jamais de crash).
+            assert pool is not None
             _, station = await pool.on_request(forced_pool)
         except Exception as e:
             _debug(f"  [systemone-free] on_request failed ({e}) → repli direct/fail-closed")
@@ -16229,12 +16779,65 @@ async def _systemone_free_via_pool(endpoint: str, body: dict, headers: dict, for
 
     if pool_ok:
         # Boucle multi-station miroir de _try_free_model_first (sans les
-        # conversions chat/responses/effort/min_tokens/hedge, sans objet
-        # pour SystemOne).
-        if station is not None:
-            tried.add(station)  # on_request pick = first strike
-        _free_used = 0
-        while resp is None and _free_used < free_max:
+        # conversions chat/responses/effort/min_tokens, sans objet
+        # pour SystemOne) — hedge free_parallel INCLUS (parité chat).
+        _hedge_done = False
+        _hedge_cands = []
+        try:
+            if (
+                pool is not None
+                and not getattr(pool, "socks5_mode", False)
+                and _free_parallel_should_hedge(body, forced_pool)
+            ):
+                _hedge_cands = pool.pick_candidates(forced_pool)
+                if len(_hedge_cands) >= 2:
+                    _debug(
+                        f"  [systemone-free] hedge start N={len(_hedge_cands)} "
+                        f"stagger={getattr(pool, '_free_parallel_hedge_delay_ms', '?')}ms"
+                    )
+                    try:
+                        resp, winner = await _hedged_fetch(
+                            _hedge_cands, body, headers, endpoint, forced_pool
+                        )
+                        # [G1] filet 429 = TOUTES les stations hedged ont 429 →
+                        # bad-mark chacune (le handling partagé ci-dessous reste
+                        # idempotent sur la gagnante-filet).
+                        if resp is not None and getattr(resp, "status_code", 500) == 429:
+                            try:
+                                _ra_all = (
+                                    resp.headers.get("retry-after", "") if getattr(resp, "headers", None) else ""
+                                ) or ""
+                            except Exception:
+                                _ra_all = ""
+                            _mark_free_stations_429(
+                                free_model, _ra_all, stations=list(_hedge_cands), forced_pool=forced_pool
+                            )
+                        station = winner
+                        if winner is not None and getattr(winner, "current_ip", None):
+                            free_ip = winner.current_ip
+                        elif winner is not None and getattr(winner, "pid", None):
+                            free_ip = winner.pid
+                        _hedge_done = True
+                        _debug(
+                            f"  [systemone-free] hedge winner station {getattr(winner, '_station', '?')} "
+                            f"status={resp.status_code if resp else '?'}"
+                        )
+                    except Exception as he:
+                        _debug(f"  [systemone-free] hedge failed, fallback sequential: {he}")
+                        resp = None
+                        _hedge_done = False
+        except Exception as he:
+            _debug(f"  [systemone-free] hedge check failed: {he}")
+        if _hedge_done:
+            # Le hedge a consommé 1 essai logique ; le handling partagé
+            # ci-dessous traite resp (200, 429 filet ou autre statut).
+            _free_used = 1
+            tried = set(_hedge_cands)  # jamais re-frapper un candidat hedgé
+        else:
+            if station is not None:
+                tried.add(station)  # on_request pick = first strike
+            _free_used = 0
+        while not _hedge_done and resp is None and _free_used < free_max:
             if _free_used == 0 and station is not None:
                 attempt = station
             elif pool is not None:
@@ -16383,6 +16986,21 @@ async def _systemone_free_via_pool(endpoint: str, body: dict, headers: dict, for
                     _log_fallback(req_id, "free→refuse", free_model, 429, paid_model)
                 except Exception:
                     pass
+            if _final_code == 200 and _hedge_done:
+                # Succès hedge (boucle séquentielle sautée, son log d'usage
+                # in-loop ne tourne pas) : même log d'usage que le 200
+                # in-loop — compteurs + DB, une seule fois.
+                try:
+                    _ok_data = _json_loads(resp.content)
+                    _ok_usage = _ok_data.get("usage", {}) if isinstance(_ok_data, dict) else {}
+                    _ok_in = int(_ok_usage.get("input_tokens", 0) or 0)
+                    _ok_out = int(_ok_usage.get("output_tokens", 0) or 0)
+                except Exception:
+                    _ok_in, _ok_out = 0, 0
+                _log_free_model_usage(
+                    paid_model, free_model, "free (no auth)", "free (no auth)",
+                    200, _ok_in, _ok_out, int((time.monotonic() - t0) * 1000), ip=free_ip,
+                )
             return resp
         # Que des tunnels morts (les 429, eux, sont relayés ci-dessus) :
         # fail-closed en vpn/socks5, jamais de direct résidentiel.
@@ -16412,9 +17030,9 @@ async def _systemone_free_via_pool(endpoint: str, body: dict, headers: dict, for
                 from latency_rotation import get_engine as _get_eng
 
                 _eng = _get_eng()
-                _ss_lat_dead.latency_engine = _eng
+                setattr(_ss_lat_dead, "latency_engine", _eng)  # noqa: B010 — attribut dynamique, mypy l'interdit en accès direct
             if isinstance(station, object) and getattr(station, "_station", None) is not None:
-                _eng.record_request(int(station._station), str(free_ip or "direct"), float(_dead_ms), free_model, 502)
+                _eng.record_request(int(getattr(station, "_station")), str(free_ip or "direct"), float(_dead_ms), free_model, 502)  # noqa: B009
         except Exception as _e_lat:
             _debug(f"  [systemone-free] latency engine skip: {_e_lat}")
         raise UpstreamError(
@@ -16523,8 +17141,13 @@ async def systemone(request: Request):
         "questions": { "<id>": { "type": "noul|choice|score", ... } } }
 
     Routage d'auth :
-      * `jev-1.13` (payant) → clé Zen du pool (round-robin + failover
-        401/429/403, même mécanique que la jambe paid) ;
+      * `jev-1.13` (payant) → free-first comme les jambes chat quand un
+        équivalent free existe (`_has_free_leg` : `jev-1.13-free` via
+        `_systemone_free_via_pool`) ; repli vers la clé Zen du pool
+        (round-robin + failover 401/429/403, même mécanique que la jambe
+        paid) UNIQUEMENT si le fallback-payant est autorisé
+        (`strict_free` OFF) ; `strict_free` ON → l'erreur free est relayée
+        telle quelle, ZÉRO jambe paid (refus) ;
       * `jev-1.13-free` → `Bearer public` (jamais la clé payante) VIA le
         pool de tunnels comme les autres modèles free
         (`_systemone_free_via_pool` : cooldown (modèle, IP) + rotation +
@@ -16607,8 +17230,26 @@ async def systemone(request: Request):
     body["model"] = model_id
 
     is_free = model_id.endswith("-free")
+    # Paid Jev avec équivalent free → free-first comme les jambes chat
+    # (`_has_free_leg` + `_resolve_free_model`, ex. jev-1.13 → jev-1.13-free).
+    # Repli paid UNIQUEMENT si fallback-payant autorisé (strict_free OFF) ;
+    # strict_free ON → erreur free relayée, zéro jambe paid (refus).
+    free_first_model = None
+    if not is_free:
+        try:
+            if _has_free_leg(model_id):
+                free_first_model = _resolve_free_model(model_id)
+        except Exception:
+            free_first_model = None
+        if not free_first_model or free_first_model == model_id:
+            free_first_model = None
+    free_headers = {"Authorization": "Bearer public", "Content-Type": "application/json"}
     if is_free:
-        headers = {"Authorization": "Bearer public", "Content-Type": "application/json"}
+        headers = dict(free_headers)
+        account_alias = ""
+    elif free_first_model:
+        # Clé payante acquise au repli uniquement (pas de conso au succès free).
+        headers = None
         account_alias = ""
     else:
         try:
@@ -16621,7 +17262,123 @@ async def systemone(request: Request):
         headers = {"Authorization": f"Bearer {entry.get('api_key', API_KEY)}", "Content-Type": "application/json"}
         account_alias = _alias_for_key(entry.get("api_key", ""))
 
-    _log(f"→ {original_model!r} → {model_id} | systemone | free={is_free} | ip={client_ip}")
+    _log(f"→ {original_model!r} → {model_id} | systemone | free={is_free} | free_first={free_first_model!r} | ip={client_ip}")
+
+    free_status_before_paid = None
+    if free_first_model:
+        # ── Jambe free d'abord (paid jev) ──────────────────────────
+        free_body = dict(body)
+        free_body["model"] = free_first_model
+        try:
+            free_resp = await _systemone_free_via_pool(
+                endpoint, free_body, dict(free_headers), forced_pool=None, req_id=req_id
+            )
+            free_err = None
+        except UpstreamError as e:
+            free_resp, free_err = None, e
+        try:
+            free_status_before_paid = int(
+                getattr(free_resp, "status_code", 0) or (free_err.status_code if free_err else 0)
+            ) or 0
+        except Exception:
+            free_status_before_paid = 0
+        if free_resp is not None and free_status_before_paid == 200:
+            try:
+                data = _json_loads(free_resp.content)
+            except Exception:
+                await _log_and_save_error(
+                    req_id, free_first_model, original_model, start_time, 502,
+                    "Upstream returned non-JSON response",
+                    "openai", False, "none", "none", client_ip, "", [],
+                    request_body=request_body, response_body={"error": "non-JSON upstream"},
+                    free_status=200, paid_status=None,
+                )
+                return _openai_error(502, "Upstream returned non-JSON response")
+            usage = data.get("usage", {}) if isinstance(data, dict) else {}
+            req_in = int(usage.get("input_tokens", 0) or 0)
+            req_out = int(usage.get("output_tokens", 0) or 0)
+            await _save_and_log_request(
+                req_id, free_first_model, original_model, start_time, req_in, req_out, 0,
+                "openai", False, "none", "none", client_ip, "", [],
+                request_body=request_body, response_body=data,
+                free_status=200, paid_status=None,
+            )
+            _update_token_usage(free_first_model, req_in, req_out, 0)
+            return JSONResponse(status_code=200, content=data)
+        # Échec free : refus (strict_free, zéro paid) ou repli paid.
+        try:
+            _fallback_ctx_push(req_id, free_first_model, free_status_before_paid or 502)
+        except Exception:
+            pass
+        if IP_ROTATION.get("strict_free", False):
+            try:
+                _log_fallback(req_id, "free→refuse", free_first_model, free_status_before_paid or 502, model_id)
+            except Exception:
+                pass
+            if free_resp is not None:
+                try:
+                    err_content = _json_loads(free_resp.content)
+                except Exception:
+                    try:
+                        err_content = {"error": (free_resp.text or "")[:500]}
+                    except Exception:
+                        err_content = {"error": f"upstream status {free_status_before_paid}"}
+                _ra_headers = {}
+                try:
+                    _ra_raw = ((free_resp.headers.get("retry-after", "") or "").strip()) if getattr(free_resp, "headers", None) else ""
+                except Exception:
+                    _ra_raw = ""
+                if _ra_raw:
+                    _ra_ok = False
+                    try:
+                        if 0 < float(_ra_raw) <= 86400:
+                            _ra_ok = True
+                    except (TypeError, ValueError):
+                        try:
+                            _ra_dt = email.utils.parsedate_to_datetime(_ra_raw)
+                            if _ra_dt is not None and _ra_dt.timestamp() > time.time():
+                                _ra_ok = True
+                        except Exception:
+                            _ra_ok = False
+                    if _ra_ok:
+                        _ra_headers = {"Retry-After": _ra_raw}
+                await _log_and_save_error(
+                    req_id, free_first_model, original_model, start_time,
+                    free_status_before_paid or 502,
+                    (getattr(free_resp, "text", "") or "")[:2000],
+                    "openai", False, "none", "none", client_ip, "", [],
+                    request_body=request_body,
+                    response_body=err_content if isinstance(err_content, dict) else {"error": str(err_content)[:2000]},
+                    free_status=free_status_before_paid or 502, paid_status=None,
+                )
+                return JSONResponse(
+                    status_code=free_status_before_paid or 502, content=err_content,
+                    headers=_ra_headers or None,
+                )
+            await _log_and_save_error(
+                req_id, free_first_model, original_model, start_time,
+                (free_err.status_code if free_err else 502), str(free_err or "free leg failed"),
+                "openai", False, "none", "none", client_ip, "", [],
+                request_body=request_body, response_body={"error": str(free_err or "free leg failed")[:2000]},
+                free_status=(free_err.status_code if free_err else 502), paid_status=None,
+            )
+            return JSONResponse(
+                status_code=(free_err.status_code if free_err else 502),
+                content={"error": str(free_err or "free leg failed")},
+            )
+        try:
+            _log_fallback(req_id, "free→paid", free_first_model, free_status_before_paid or 502, model_id)
+        except Exception:
+            pass
+        try:
+            entry = get_next_api_key()
+        except AllKeysPausedError:
+            return _openai_error(503, "All API keys exhausted. Check your billing.")
+        except Exception as e:
+            _debug(f"[systemone] ✗ no usable key: {type(e).__name__}: {e}")
+            return _openai_error(503, "All API keys exhausted. Check your billing.")
+        headers = {"Authorization": f"Bearer {entry.get('api_key', API_KEY)}", "Content-Type": "application/json"}
+        account_alias = _alias_for_key(entry.get("api_key", ""))
 
     try:
         if is_free:
@@ -16631,7 +17388,10 @@ async def systemone(request: Request):
             # uniquement si le pool est indispo (proxy_mode fail-closed :
             # jamais de direct quand vpn/socks5 est configuré). forced_pool=None
             # (pas de géo sur systemone) + req_id (ctx fallback persistance).
-            resp = await _systemone_free_via_pool(endpoint, body, headers, forced_pool=None, req_id=req_id)
+            resp = await _systemone_free_via_pool(
+                endpoint, body, headers if isinstance(headers, dict) else dict(free_headers),
+                forced_pool=None, req_id=req_id,
+            )
         else:
             resp, headers = await _do_request_with_retry(endpoint, body, headers, "openai")
     except UpstreamError as e:
@@ -16639,7 +17399,7 @@ async def systemone(request: Request):
             req_id, model_id, original_model, start_time, e.status_code, str(e),
             "openai", False, "none", "none", client_ip, account_alias, [],
             request_body=request_body, response_body={"error": str(e)[:2000]},
-            free_status=e.status_code if is_free else None,
+            free_status=e.status_code if is_free else free_status_before_paid,
             paid_status=None if is_free else e.status_code,
         )
         return JSONResponse(status_code=e.status_code, content={"error": str(e)})
@@ -16655,7 +17415,7 @@ async def systemone(request: Request):
             req_id, model_id, original_model, start_time, resp.status_code, err_text,
             "openai", False, "none", "none", client_ip, account_alias, [],
             request_body=request_body, response_body={"error": err_text[:2000]},
-            free_status=resp.status_code if is_free else None,
+            free_status=resp.status_code if is_free else free_status_before_paid,
             paid_status=None if is_free else resp.status_code,
         )
         # Relayer le statut amont (402 solde vide, 401/429 quota…) tel quel,
@@ -16667,7 +17427,7 @@ async def systemone(request: Request):
         # [Lot 1 FIX g] Forward du VRAI Retry-After amont (véridicité : jamais
         # de valeur inventée — omis si absent/invalide). Valide = secondes
         # 0<v<=86400 ou date HTTP future (email.utils déjà importé).
-        _ra_headers: dict = {}
+        _ra_headers = {}
         try:
             _ra_raw = ((resp.headers.get("retry-after", "") or "").strip()) if getattr(resp, "headers", None) else ""
         except Exception:
@@ -16695,7 +17455,7 @@ async def systemone(request: Request):
             req_id, model_id, original_model, start_time, 502, "Upstream returned non-JSON response",
             "openai", False, "none", "none", client_ip, account_alias, [],
             request_body=request_body, response_body={"error": "non-JSON upstream"},
-            free_status=502 if is_free else None,
+            free_status=502 if is_free else free_status_before_paid,
             paid_status=None if is_free else 502,
         )
         return _openai_error(502, "Upstream returned non-JSON response")
@@ -16707,7 +17467,7 @@ async def systemone(request: Request):
         req_id, model_id, original_model, start_time, req_in, req_out, 0,
         "openai", False, "none", "none", client_ip, account_alias, [],
         request_body=request_body, response_body=data,
-        free_status=200 if is_free else None,
+        free_status=200 if is_free else free_status_before_paid,
         paid_status=None if is_free else 200,
     )
     _update_token_usage(model_id, req_in, req_out, 0)
@@ -17396,6 +18156,7 @@ async def responses(request: Request):
             )
         # Try free model first if available
         _geo_tunnel = getattr(request.state, "_geo_force_tunnel", False)
+        _r6_condensed_ok = False  # [Compaction] retry condensé réussi → skip put cache (jamais de cache des résumés)
         try:
             free_result = await _try_free_model_first(
                 oai_body,
@@ -17424,6 +18185,131 @@ async def responses(request: Request):
             return _free_refusal_response(e, "openai")
         except UpstreamError as e:
             return JSONResponse(status_code=e.status_code, content={"error": str(e)})
+        # [Compaction voie unifiée] condense-and-retry réactif (responses) :
+        # 400-overflow constaté, non-stream uniquement, APRÈS free/paid et
+        # AVANT le relais d'erreur. Fail-open total : enabled=false →
+        # passthrough ; condensé None → fall through ; retry re-overflow →
+        # relais intact ; 1 tentative max. Forme selon l'endpoint : ``input``
+        # (``/responses``) ou ``messages`` (chat), retry tunnel-aware.
+        if resp.status_code == 400 and not is_stream:
+            try:
+                _r6_cfg = get_server_compaction()
+            except Exception:
+                _r6_cfg = {}
+            try:
+                _r6_on = bool(_r6_cfg.get("enabled", False)) if isinstance(_r6_cfg, dict) else False
+            except Exception:
+                _r6_on = False
+            if _r6_on:
+                try:
+                    _r6_use_input = "/responses" in (endpoint or "") and isinstance(oai_body, dict) and isinstance(oai_body.get("input"), list)
+                    if _r6_use_input:
+                        _r6_hist = oai_body.get("input")
+                        _r6_api = "responses"
+                    else:
+                        _r6_hist = oai_body.get("messages") if isinstance(oai_body, dict) else None
+                        _r6_api = "chat"
+                    _r6_condensed = None
+                    if isinstance(_r6_hist, list) and _r6_hist:
+                        try:
+                            _r6_ovr = get_server_compaction("summarizer_model_override", None)
+                        except Exception:
+                            _r6_ovr = None
+                        (_r6_model, _r6_ep, _r6_proto, _r6_papi, _r6_free, _r6_seed) = _compaction_summarizer_plan_full(
+                            model_id, _r6_ovr, endpoint=endpoint, protocol="openai", api=None
+                        )
+                        try:
+                            _r6_mk = get_server_compaction("summary_max_tokens", 2048)
+                        except Exception:
+                            _r6_mk = 2048
+                        try:
+                            _r6_mk = min(max(int(_r6_mk), 1), 4096)
+                        except Exception:
+                            _r6_mk = 2048
+                        try:
+                            _r6_keep = get_server_compaction("keep_recent_pairs", 4)
+                        except Exception:
+                            _r6_keep = 4
+                        try:
+                            _r6_keep = int(_r6_keep) if isinstance(_r6_keep, int) else 4
+                        except Exception:
+                            _r6_keep = 4
+                        try:
+                            _r6_to = get_server_compaction("timeout_s", 60)
+                        except Exception:
+                            _r6_to = 60
+                        try:
+                            _r6_to = int(_r6_to) if isinstance(_r6_to, int) else 60
+                        except Exception:
+                            _r6_to = 60
+                        try:
+                            _r6_markers = get_server_compaction("overflow_markers", None)
+                        except Exception:
+                            _r6_markers = None
+                        try:
+                            _r6_condensed = await _maybe_condense(
+                                _r6_hist,
+                                status_code=resp.status_code,
+                                body_text=resp.text,
+                                model_id=_r6_model,
+                                endpoint=_r6_ep,
+                                protocol=_r6_proto,
+                                auth_headers_fn=lambda proto, _f=_r6_free, _e=_r6_ep: _compaction_summarizer_headers(_f, proto, _e),
+                                do_request_fn=lambda ep, b, h, pr, _f=_r6_free, _s=_r6_seed: _compaction_summarizer_request(_f, ep, b, h, pr, seed=_s, forced_pool=getattr(request.state, "_geo_forced_pool", None), req_id=req_id),
+                                enabled=True,
+                                summary_max_tokens=_r6_mk,
+                                keep_recent_pairs=_r6_keep,
+                                timeout_s=_r6_to,
+                                markers=_r6_markers,
+                                api=_r6_api,
+                            )
+                        except Exception:
+                            _r6_condensed = None
+                except Exception:
+                    _r6_condensed = None
+                if _r6_condensed:
+                    try:
+                        _r6_retry: dict | None = dict(oai_body) if isinstance(oai_body, dict) else {}
+                        assert isinstance(_r6_retry, dict)
+                        if _r6_use_input and isinstance(_r6_retry.get("input"), list):
+                            _r6_retry["input"] = list(_r6_condensed)
+                        elif not _r6_use_input and isinstance(_r6_retry.get("messages"), list):
+                            _r6_retry["messages"] = list(_r6_condensed)
+                        else:
+                            _r6_retry = None
+                        if isinstance(_r6_retry, dict):
+                            _r6_retry["model"] = model_id
+                            _r6_retry["stream"] = False
+                            try:
+                                _r6_tunnel = bool(getattr(request.state, "_geo_force_tunnel", False))
+                            except Exception:
+                                _r6_tunnel = False
+                            if _r6_tunnel:
+                                async with _open_via_pool(
+                                    endpoint,
+                                    _r6_retry,
+                                    headers,
+                                    is_stream=False,
+                                    forced_pool=getattr(request.state, "_geo_forced_pool", None),
+                                ) as _r6_r2:
+                                    _r6_h2 = dict(_r6_r2.headers) if getattr(_r6_r2, "headers", None) else headers
+                                    raise _CompactionTunnelDone(_r6_r2, _r6_h2)
+                            else:
+                                _r6_r2, _r6_h2 = await _do_request_with_retry(endpoint, _r6_retry, headers, "openai")
+                    except _CompactionTunnelDone as _r6_td:
+                        _r6_r2, _r6_h2 = _r6_td.resp, _r6_td.headers
+                    except Exception:
+                        _r6_condensed = None
+                    else:
+                        if _r6_r2.status_code == 200:
+                            assert isinstance(_r6_retry, dict)
+                            oai_body = _r6_retry
+                            headers = _r6_h2
+                            resp = _r6_r2
+                            account_alias = _alias_for_key(_key_from_headers(headers, "openai"))
+                            _r6_condensed_ok = True
+                            _log(f"  [compaction] req_id={req_id} 400-overflow → condense-and-retry once (model={_r6_model!r})")
+                        # Re-overflow ou non-200 : fall through vers le relais intact (pas de 2e tentative).
         account_alias = _alias_for_key(_key_from_headers(headers, "openai"))
         if resp.status_code != 200:
             await _log_and_save_error(
@@ -17550,7 +18436,8 @@ async def responses(request: Request):
             oai_resp = openai_chat_to_responses(data, original_model, _out_tool_map)
         _response_body = _json_dumps_str(oai_resp, ensure_ascii=False).encode()
         # [Phase 1 compaction] shape-compaction : jamais mise en cache.
-        if cache_key and not _is_compaction:
+        # [Compaction] retry condensé réussi : jamais de put non plus.
+        if cache_key and not _is_compaction and not _r6_condensed_ok:
             _response_cache.put(cache_key, _response_body, {"Content-Type": "application/json"})
         return Response(content=_response_body, media_type="application/json")
 
@@ -17694,7 +18581,8 @@ async def responses(request: Request):
                                 )
                                 if _tc.get("id"):
                                     _acc["id"] = _tc["id"]
-                                _fn = _tc.get("function") if isinstance(_tc.get("function"), dict) else {}
+                                _fn_raw = _tc.get("function")
+                                _fn: dict = _fn_raw if isinstance(_fn_raw, dict) else {}
                                 if _fn.get("name"):
                                     _acc["function"]["name"] += _fn["name"]
                                 if _fn.get("arguments"):
@@ -17707,7 +18595,7 @@ async def responses(request: Request):
                     "reasoning_content": full_reasoning,
                 }
                 if collected_tool_calls:
-                    _tcs = [collected_tool_calls[k] for k in sorted(collected_tool_calls)]
+                    _tcs: list = [collected_tool_calls[k] for k in sorted(collected_tool_calls)]
                     for _n, _t in enumerate(_tcs):
                         if not _t.get("id"):
                             _t["id"] = _fast_id("call")
@@ -17807,7 +18695,7 @@ async def responses(request: Request):
     # annonce « termine » : le client n'executait rien et le tour etait perdu.
     # Reconstitution par index (forme OpenAI : id/name au 1er delta, arguments
     # fragmentes sur les deltas suivants).
-    collected_tool_calls: dict[int, dict] = {}
+    collected_tool_calls_ns: dict[int, dict] = {}
     _finish_reason = None
     final_usage = None
     # [P4] état SSE Responses-API PAR stream
@@ -17856,18 +18744,19 @@ async def responses(request: Request):
                     if not isinstance(_tc, dict):
                         continue
                     _ix = _tc.get("index")
-                    _ix = _ix if isinstance(_ix, int) else len(collected_tool_calls)
-                    _acc = collected_tool_calls.setdefault(
+                    _ix = _ix if isinstance(_ix, int) else len(collected_tool_calls_ns)
+                    _acc = collected_tool_calls_ns.setdefault(
                         _ix,
                         {"id": "", "type": "function", "function": {"name": "", "arguments": ""}},
                     )
                     if _tc.get("id"):
                         _acc["id"] = _tc["id"]
-                    _fn = _tc.get("function") if isinstance(_tc.get("function"), dict) else {}
-                    if _fn.get("name"):
-                        _acc["function"]["name"] += _fn["name"]
-                    if _fn.get("arguments"):
-                        _acc["function"]["arguments"] += _fn["arguments"]
+                    _fn_ns_raw = _tc.get("function")
+                    _fn_ns: dict = _fn_ns_raw if isinstance(_fn_ns_raw, dict) else {}
+                    if _fn_ns.get("name"):
+                        _acc["function"]["name"] += _fn_ns["name"]
+                    if _fn_ns.get("arguments"):
+                        _acc["function"]["arguments"] += _fn_ns["arguments"]
 
     # Build final response
     full_content = "".join(collected_chunks)
@@ -17877,15 +18766,15 @@ async def responses(request: Request):
     if not full_reasoning:
         full_reasoning = ""  # Ensure non-None
 
-    _msg_out: dict = {
+    _msg_out_ns: dict = {
         "content": full_content,
         "role": "assistant",
         "reasoning_content": full_reasoning,
     }
-    if collected_tool_calls:
+    if collected_tool_calls_ns:
         _tcs = []
-        for _k in sorted(collected_tool_calls):
-            _t = collected_tool_calls[_k]
+        for _k in sorted(collected_tool_calls_ns):
+            _t = collected_tool_calls_ns[_k]
             # un tool_call sans nom serait rejete par le client : on l'ecarte
             if not _t["function"].get("name"):
                 continue
@@ -17893,7 +18782,7 @@ async def responses(request: Request):
                 _t["id"] = _fast_id("call")
             _tcs.append(_t)
         if _tcs:
-            _msg_out["tool_calls"] = _tcs
+            _msg_out_ns["tool_calls"] = _tcs
             # un tour d'outil doit etre annonce comme tel, pas « stop »
             if _finish_reason in (None, "", "stop"):
                 _finish_reason = "tool_calls"
@@ -17902,7 +18791,7 @@ async def responses(request: Request):
     chat_resp = {
         "choices": [
             {
-                "message": _msg_out,
+                "message": _msg_out_ns,
                 "finish_reason": _finish_reason or "stop",
             }
         ],
@@ -17996,9 +18885,18 @@ class ServerManager:
                 time.sleep(0.1)
                 if self._server.started:
                     break
-            self.is_running = True
-            _debug(f"  [server] started on {self.host}:{self.port}")
-            log_boot_phase(f"server started (listening {self.host}:{self.port})")
+            if self._server.started:
+                self.is_running = True
+                _debug(f"  [server] started on {self.host}:{self.port}")
+                log_boot_phase(f"server started (listening {self.host}:{self.port})")
+            else:
+                # Ne JAMAIS mentir : sans socket, le tray reste rouge et
+                # l'échec est visible dans debug.log (sinon l'utilisateur
+                # croit le proxy vert alors que rien ne sert — incident
+                # 29/09 : processus vivant, port 4000 muet).
+                self.is_running = False
+                _debug(f"  [server] FAILED to listen on {self.host}:{self.port} after 5s")
+                log_boot_phase(f"server FAILED to listen on {self.host}:{self.port}")
 
     def stop(self, timeout=10):
         """Graceful stop: signal uvicorn to stop, then wait for in-flight requests."""
@@ -18067,8 +18965,12 @@ if __name__ == "__main__":
     # contenu modèle (emoji, ✓, →, CJK) levait UnicodeEncodeError 'charmap'.
     # Convention repo (scripts/*) : stdout/stderr en UTF-8 avec replace.
     try:
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+        _reconf_out = getattr(sys.stdout, "reconfigure", None)
+        if callable(_reconf_out):
+            _reconf_out(encoding="utf-8", errors="replace")
+        _reconf_err = getattr(sys.stderr, "reconfigure", None)
+        if callable(_reconf_err):
+            _reconf_err(encoding="utf-8", errors="replace")
     except Exception:
         pass
 

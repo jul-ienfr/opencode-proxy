@@ -51,8 +51,9 @@ import pytest
 
 import opencode as oc
 
-#: Couple vivant : ``FREE_MODEL_MAP["deepseek-v4-flash"] == "deepseek-v4-flash-free"``
-#: et les deux modèles parlent Chat (endpoint ``/v1/chat/completions``).
+#: Couple FORCÉ en fixture (``_CapAsymmetry`` mappe aussi) : le -free homonyme
+#: est mort côté amont — la config saine route vers ``mimo-v2.5-free``.
+#: Les deux modèles parlent Chat (endpoint ``/v1/chat/completions``).
 PAID_CHAT = "deepseek-v4-flash"
 FREE_CHAT = "deepseek-v4-flash-free"
 
@@ -208,10 +209,19 @@ class _CapAsymmetry:
         patched[self.paid] = self.paid_cap
         patched[self.free] = self.free_cap
         self._block["effort_caps"] = patched
+        # Le -free homonyme est mort côté amont (remappé sain en config) :
+        # on force le couple AUSSI dans la map, le temps du témoin.
+        self._map_had = self.paid in oc.FREE_MODEL_MAP
+        self._map_saved = oc.FREE_MODEL_MAP.get(self.paid)
+        oc.FREE_MODEL_MAP[self.paid] = self.free
         return self
 
     def __exit__(self, *exc):
         self._block["effort_caps"] = self._saved
+        if self._map_had:
+            oc.FREE_MODEL_MAP[self.paid] = self._map_saved
+        else:
+            oc.FREE_MODEL_MAP.pop(self.paid, None)
         return False
 
 

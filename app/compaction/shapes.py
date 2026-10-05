@@ -159,10 +159,17 @@ def _marker_shape(body: dict) -> bool:
     Un marqueur de compaction n'est jamais émis par un tour agent ordinaire :
     le tester quel que soit le rôle ne crée pas de faux positif.
 
-    Exige quand même l'absence d'outils déclarés (tools null/vide) pour ne pas
-    confondre avec un tour agent normal.
+    PAS de veto sur les outils déclarés : les compactions Claude Code
+    rejouent l'historique complet AVEC leurs 15+ outils (prouvé sur traces
+    réelles : requêtes 40-76k tokens avec tools, sorties tiny 17-80).
+    Exiger l'absence d'outils les rendait invisibles (ni exclusion cache,
+    ni relais intact, ni tiny-retry, ni lean) — boucle de thrash garantie.
+    Un tour normal ne contient jamais ces marqueurs : les croire même avec
+    outils ne crée pas de faux positif (pire cas : un tour qui discute de
+    « context compaction » avec outils → bypass cache + fetch bufferisé à
+    contenu identique, inoffensif).
     """
-    if not _no_tools(body):
+    if not isinstance(body, dict):
         return False
     texts: list[str] = []
     msgs = body.get("messages")
@@ -242,9 +249,10 @@ def is_compaction_shape(body: dict, min_chars_implicit: int | None = None) -> bo
        un vrai compactage embarque l'historique complet — jamais 2 caractères
        comme "hi") ;
     2. Responses API équivalente (input 100 % user texte pur, même borne) ;
-    3. à marqueur : texte user contenant 'conversation-checkpoint' ou
-       'context compaction' (Hermes, Claude-Code), outils absents, SANS borne
-       de taille (si le client dit "compaction", on le croit) ;
+    3. à marqueur : texte quelconque contenant 'conversation-checkpoint' ou
+       'context compaction' (Hermes, Claude-Code), SANS borne de taille et
+       SANS veto outils (les compactions rejouent l'historique avec outils ;
+       si le client dit "compaction", on le croit) ;
     4. native provider (``is_native_compaction``) : ``context_management`` /
        bloc ou item ``compaction`` opaque — passthrough verbatim, toujours
        détecté même avec outils/system (le provider gère le pairing).

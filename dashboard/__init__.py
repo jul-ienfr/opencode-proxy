@@ -2,6 +2,7 @@ from .api import register_dashboard as register_dashboard
 from .display import RichLogHandler as RichLogHandler
 from .display import build_display as build_display
 from .display import debug as debug
+from .display import debug_kv as debug_kv
 from .display import log as log
 from .display import set_debug_log_file as set_debug_log_file
 from .display import start_input_thread as start_input_thread
@@ -13,6 +14,7 @@ __all__ = [
     "RichLogHandler",
     "build_display",
     "debug",
+    "debug_kv",
     "get_quota_snapshot",
     "log",
     "register_dashboard",

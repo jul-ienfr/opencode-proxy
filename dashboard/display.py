@@ -53,6 +53,11 @@ _debug_file_path = None
 _debug_write_counter = 0
 _DEBUG_FLUSH_INTERVAL = 10  # Flush to disk every N writes (reduces syscall overhead)
 _DEBUG_MAX_SIZE = 10 * 1024 * 1024  # Auto-rotate when file exceeds 10 MB
+_DEBUG_ROTATE_KEEP = 3  # [P2-13] générations conservées (debug.log.1..N)
+# [P2-13] les écritures fichier viennent de threads variés (loop, executor,
+# handlers logging) : un verrou unique sérialise write/rotate/flush pour
+# éviter les lignes entrelacées et la course close/rename de la rotation.
+_debug_lock = threading.Lock()
 _extra_handlers: list = []  # FileHandlers attached to module loggers (vpn_manager, free_ip_pool)
 
 
@@ -74,10 +79,11 @@ def refresh_display_config() -> dict:
     Appelée à l'import ; ré-appelable sur hot-reload (le deque est
     reconstruit en conservant les lignes si maxlen change).
     """
-    global LOG_VISIBLE, _DEBUG_FLUSH_INTERVAL, _DEBUG_MAX_SIZE, log_lines
+    global LOG_VISIBLE, _DEBUG_FLUSH_INTERVAL, _DEBUG_MAX_SIZE, _DEBUG_ROTATE_KEEP, log_lines
     LOG_VISIBLE = _cfg_int("dashboard", "display_lines", 35, 5, 200)
     _DEBUG_FLUSH_INTERVAL = _cfg_int("debug", "flush_interval", 10, 1, 1000)
     _DEBUG_MAX_SIZE = _cfg_int("debug", "max_size", 10 * 1024 * 1024, 1024 * 1024, 1024 * 1024 * 1024)
+    _DEBUG_ROTATE_KEEP = _cfg_int("debug", "rotate_keep", 3, 1, 10)
     _max = _cfg_int("debug", "log_lines_max", 200, 10, 10000)
     if log_lines.maxlen != _max:
         log_lines = collections.deque(log_lines, maxlen=_max)
@@ -86,6 +92,7 @@ def refresh_display_config() -> dict:
         "log_lines_max": log_lines.maxlen,
         "flush_interval": _DEBUG_FLUSH_INTERVAL,
         "max_size": _DEBUG_MAX_SIZE,
+        "rotate_keep": _DEBUG_ROTATE_KEEP,
     }
 
 
@@ -111,7 +118,11 @@ def _utc_file_timestamp() -> str:
 
 
 def _rotate_debug_log():
-    """Rotate debug.log → debug.log.1 when it exceeds _DEBUG_MAX_SIZE."""
+    """Rotate debug.log → debug.log.1 (.2, .3 … selon ``_DEBUG_ROTATE_KEEP``).
+
+    [P2-13] cascade : une seule génération (.1) perdait l'historique dès le
+    2e dépassement sur proxy verbeux. Suppose ``_debug_lock`` détenu.
+    """
     global _debug_file, _debug_file_path
     if _debug_file is None or _debug_file_path is None:
         return
@@ -128,11 +139,19 @@ def _rotate_debug_log():
                 _fh.close()
             except Exception:
                 pass
-        rotated = _debug_file_path + ".1"
-        if os.path.exists(rotated):
-            os.remove(rotated)
-        os.rename(_debug_file_path, rotated)
+        keep = max(1, int(_DEBUG_ROTATE_KEEP))
+        oldest = f"{_debug_file_path}.{keep}"
+        if os.path.exists(oldest):
+            os.remove(oldest)
+        # Décale .N-1 → .N … .1 → .2, puis base → .1 (jamais d'écrasement :
+        # sous Windows os.rename échoue si la cible existe).
+        for i in range(keep - 1, 0, -1):
+            src = f"{_debug_file_path}.{i}"
+            if os.path.exists(src):
+                os.rename(src, f"{_debug_file_path}.{i + 1}")
+        os.rename(_debug_file_path, _debug_file_path + ".1")
         _debug_file = open(_debug_file_path, "a", encoding="utf-8")
+        global _debug_write_counter
         _debug_write_counter = 0
     except Exception:
         pass
@@ -227,15 +246,37 @@ def debug(msg: str):
     if _debug_file is not None:
         try:
             global _debug_write_counter
-            _rotate_debug_log()  # Auto-rotate if file is too large
-            # [graceful-aurora LOT G] UTC (docker logs = UTC).
-            _debug_file.write(f"[{_utc_file_timestamp()}] {msg}\n")
-            _debug_write_counter += 1
-            if _debug_write_counter >= _DEBUG_FLUSH_INTERVAL:
-                _debug_file.flush()
-                _debug_write_counter = 0
+            with _debug_lock:
+                _rotate_debug_log()  # Auto-rotate if file is too large
+                # [graceful-aurora LOT G] UTC (docker logs = UTC).
+                _debug_file.write(f"[{_utc_file_timestamp()}] {msg}\n")
+                _debug_write_counter += 1
+                if _debug_write_counter >= _DEBUG_FLUSH_INTERVAL:
+                    _debug_file.flush()
+                    _debug_write_counter = 0
         except Exception:
             pass
+
+
+def debug_kv(msg: str, req_id: str | None = None, **kv):
+    """[P2-13] Log structuré léger : ``msg req_id=… k=v …`` (grep-friendly).
+
+    Convention sans churn : les 1000+ appels existants gardent leurs
+    f-strings ; le nouveau code corrélé passe ``req_id=`` en premier pour
+    ``grep req_id=… debug.log*``.
+    """
+    try:
+        parts = [str(msg)]
+        if req_id:
+            parts.append(f"req_id={req_id}")
+        for k, v in kv.items():
+            try:
+                parts.append(f"{k}={v}")
+            except Exception:
+                parts.append(f"{k}=?")
+        debug(" ".join(parts))
+    except Exception:
+        pass
 
 
 def _logger_writes_debug_file(logger_name: str) -> bool:
@@ -278,13 +319,14 @@ class RichLogHandler(logging.Handler):
         ):
             try:
                 global _debug_write_counter
-                _rotate_debug_log()  # Auto-rotate if file is too large
-                # [graceful-aurora LOT G] UTC (docker logs = UTC).
-                _debug_file.write(f"[{_utc_file_timestamp()}] [{level}] {msg}\n")
-                _debug_write_counter += 1
-                if _debug_write_counter >= _DEBUG_FLUSH_INTERVAL:
-                    _debug_file.flush()
-                    _debug_write_counter = 0
+                with _debug_lock:
+                    _rotate_debug_log()  # Auto-rotate if file is too large
+                    # [graceful-aurora LOT G] UTC (docker logs = UTC).
+                    _debug_file.write(f"[{_utc_file_timestamp()}] [{level}] {msg}\n")
+                    _debug_write_counter += 1
+                    if _debug_write_counter >= _DEBUG_FLUSH_INTERVAL:
+                        _debug_file.flush()
+                        _debug_write_counter = 0
             except Exception:
                 pass
 

@@ -65,7 +65,7 @@ def test_resolve_endpoint_heuristic_fallback_unchanged():
 
 def test_capabilities_family_and_unknown():
     kimi = st.get_model_capabilities("kimi-k2.6")
-    assert set(["text", "image", "pdf"]) <= set(kimi["input"])
+    assert {"text", "image", "pdf"} <= set(kimi["input"])
     assert kimi["toolcall"] is True
     ds = st.get_model_capabilities("deepseek-v4-flash")
     assert ds["interleaved"] == "reasoning_content"
@@ -88,7 +88,7 @@ def test_models_entries_and_config():
         free = st.get_model_config("muse-spark-1.3-contributor-free")
         assert free["api"] == "responses"
         assert free["endpoint"] == st._RESPONSES_FREE_ENDPOINT
-        assert set(["text", "image", "pdf"]) <= set(free["capabilities"]["input"])
+        assert {"text", "image", "pdf"} <= set(free["capabilities"]["input"])
         chat = st.get_model_config("kimi-k2.6")
         assert chat["api"] == "chat"
         assert chat["endpoint"] == st.API_BASE_OPENAI

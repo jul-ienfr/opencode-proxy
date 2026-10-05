@@ -18,7 +18,7 @@ Upstream = endpoint OpenAI-compatible (`protocol: openai`). Le client parle
 toujours Anthropic (`/v1/messages`) ; la conversion est verrouillée par les
 goldens §v1-response.md. Aliases actuels (`free_model_map`) :
 
-- `deepseek-v4-flash` → `deepseek-v4-flash-free`
+- `deepseek-v4-flash` → `mimo-v2.5-free` (le `-free` homonyme est mort côté amont : 0 succès, que des 400 — voir config)
 - `glm-5.1`, `kimi-k2.6`, `minimax-m2.5` → `mimo-v2.5-free`
 - `mimo-v2.5` → `mimo-v2.5-free`
 - `mimo-v2.6-flash` → `mimo-v2.6-flash-free`

@@ -151,3 +151,27 @@ def _reset_global_429():
     _neuf()
     yield
     _neuf()
+
+
+@pytest.fixture(autouse=True)
+def _reset_web_caches():
+    """[P2-12] Caches web hermétiques entre tests.
+
+    ``_FETCH_CACHE`` (singleflight fetch) et ``_DDG_CACHE`` sont des états
+    module-level persistants : sans reset, un succès caché par un test
+    masque le comportement du test suivant sur la même URL (ex. succès
+    text/html en cache → ``test_fetch_rejected_content_type`` ne voit plus
+    son octet-stream). Même pattern que ``_reset_curl_pool``.
+    """
+    import opencode as oc
+
+    def _neuf() -> None:
+        for name in ("_FETCH_CACHE", "_FETCH_LOCKS", "_DDG_CACHE", "_DDG_LOCKS"):
+            try:
+                getattr(oc, name, {}).clear()
+            except Exception:
+                pass
+
+    _neuf()
+    yield
+    _neuf()

@@ -46,8 +46,8 @@ jobs:
         run: mypy . --ignore-missing-imports
         continue-on-error: true
       - name: Tests with coverage
-        run: pytest -q --cov --cov-report=term-missing --cov-fail-under=45
-        # Palier Lot 3 plan-perf (mesuré ~50%) — synchronisé avec scripts/gate.ps1
+        run: pytest -q --cov --cov-report=term-missing --cov-fail-under=60
+        # Palier audit 2026-10-04 (mesuré 62%) — synchronisé avec scripts/gate.ps1
       # ── [Phase 5/9 plan boot] Garde-fous de performance du démarrage ──
       # Ces trois pas verrouillent les acquis du chantier boot : sans eux, une
       # régression d'import (ou un asset périmé) repasserait inaperçue jusqu'au

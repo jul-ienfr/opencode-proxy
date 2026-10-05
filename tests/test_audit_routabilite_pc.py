@@ -502,14 +502,14 @@ def test_pc14_analyze_statuses(tmp_path, monkeypatch):
 def test_pc14_display_knobs_take_effect(monkeypatch):
     from dashboard import display as disp
 
-    saved = (disp.LOG_VISIBLE, disp._DEBUG_FLUSH_INTERVAL, disp._DEBUG_MAX_SIZE, disp.log_lines)
+    saved = (disp.LOG_VISIBLE, disp._DEBUG_FLUSH_INTERVAL, disp._DEBUG_MAX_SIZE, disp._DEBUG_ROTATE_KEEP, disp.log_lines)
     try:
         monkeypatch.setattr(
             disp._cfg_settings,
             "yaml_get",
             lambda s, k=None, d=None: {
                 "dashboard": {"display_lines": 50},
-                "debug": {"log_lines_max": 300, "flush_interval": 7, "max_size": 12345678},
+                "debug": {"log_lines_max": 300, "flush_interval": 7, "max_size": 12345678, "rotate_keep": 2},
             }.get(s, {}).get(k, d),
         )
         out = disp.refresh_display_config()
@@ -518,10 +518,12 @@ def test_pc14_display_knobs_take_effect(monkeypatch):
             "log_lines_max": 300,
             "flush_interval": 7,
             "max_size": 12345678,
+            "rotate_keep": 2,
         }
         assert disp.LOG_VISIBLE == 50 and disp.log_lines.maxlen == 300
+        assert disp._DEBUG_ROTATE_KEEP == 2
     finally:
-        disp.LOG_VISIBLE, disp._DEBUG_FLUSH_INTERVAL, disp._DEBUG_MAX_SIZE, disp.log_lines = saved
+        disp.LOG_VISIBLE, disp._DEBUG_FLUSH_INTERVAL, disp._DEBUG_MAX_SIZE, disp._DEBUG_ROTATE_KEEP, disp.log_lines = saved
 
 
 def test_pc14_quota_interval_knob(monkeypatch):

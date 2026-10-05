@@ -60,8 +60,8 @@ class EventManager:
             self._vpn_pending.pop(queue, None)
             logger.debug("[sse] subscriber removed, count=%d", len(self._subscribers))
 
-    def _deliver(self, queue, payload: str, event: str):
-        """Queue one frame for a subscriber (caller holds ``_lock``).
+    def _deliver_direct(self, queue, payload: str, event: str):
+        """Queue one frame for a subscriber (runs in the loop thread).
 
         Never blocks and never drops the subscriber: a full queue ejects
         its oldest buffered event ([31]) — these are ephemeral snapshots,
@@ -76,6 +76,28 @@ class EventManager:
                 logger.debug("[sse] slow subscriber: oldest event evicted (event=%s)", event)
             except Exception:
                 pass  # closed/destroyed queue
+
+    def _deliver(self, queue, payload: str, event: str):
+        """Thread-aware dispatch (caller holds ``_lock``).
+
+        [P1-8] ``asyncio.Queue.put_nowait`` réveille les getters via
+        ``loop.call_soon`` — non thread-safe depuis un thread sync (watchdog
+        VPN, docker-events). Hors thread de la boucle liée : on repasse par
+        ``call_soon_threadsafe`` (non bloquant, sous lock OK). Sans boucle
+        liée (tests) ou boucle fermée : direct, best effort.
+        """
+        bound = self._bound_loop
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if bound is not None and bound.is_running() and running is not bound:
+            try:
+                bound.call_soon_threadsafe(self._deliver_direct, queue, payload, event)
+                return
+            except RuntimeError:
+                pass  # boucle fermée au shutdown → best effort direct
+        self._deliver_direct(queue, payload, event)
 
     def publish(self, event: str, data: dict):
         """Thread-safe. Call from sync or async context.

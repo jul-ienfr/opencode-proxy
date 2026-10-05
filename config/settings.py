@@ -435,6 +435,8 @@ def get_429_action(default: str = "both") -> str:
 #     keep_tail: true               # condense-and-retry garde la queue récente verbatim
 #     summary_paid_bypass: false    # résumé client détecté : laisse passer en paid
 #                                   # même si strict_free (correctif Hermes, défaut OFF)
+#     tiny_retry: true              # stream de compactage : fetch bufferisé + 1 refetch
+#                                   # station fraîche sur sortie tiny (free-only, pré-réponse)
 #
 # Lectures LIVE (yaml_get, hot-reload safe) — pas de snapshot import-time.
 _SERVER_COMPACTION_DEFAULTS = {
@@ -450,6 +452,10 @@ _SERVER_COMPACTION_DEFAULTS = {
     "native_passthrough": True,
     "keep_tail": True,
     "summary_paid_bypass": False,
+    "tiny_retry": True,
+    "summary_lean": True,
+    "summary_lean_max_chars": 2000,
+    "summary_clamp_max_tokens": 4096,
 }
 
 
@@ -472,7 +478,7 @@ def get_server_compaction(key: str | None = None, default=None):
         return default
     if key == "enabled":
         return bool(cfg["enabled"]) if isinstance(cfg["enabled"], bool) else default
-    if key in ("native_passthrough", "keep_tail", "summary_paid_bypass"):
+    if key in ("native_passthrough", "keep_tail", "summary_paid_bypass", "tiny_retry", "summary_lean"):
         v = cfg[key]
         return bool(v) if isinstance(v, bool) else default
     if key == "class_policy":
@@ -480,7 +486,8 @@ def get_server_compaction(key: str | None = None, default=None):
         if isinstance(v, str) and v.strip().lower() in ("auto", "free_only", "paid_only"):
             return v.strip().lower()
         return default
-    if key in ("summary_max_tokens", "keep_recent_pairs", "timeout_s", "max_attempts", "min_chars_implicit"):
+    if key in ("summary_max_tokens", "keep_recent_pairs", "timeout_s", "max_attempts", "min_chars_implicit",
+                 "summary_lean_max_chars", "summary_clamp_max_tokens"):
         v = cfg[key]
         return v if isinstance(v, int) and not isinstance(v, bool) and v > 0 else default
     if key == "summarizer_model_override":
@@ -778,15 +785,16 @@ def get_model_capabilities(model_id: str, model_data: dict | None = None) -> dic
             model_data = MODELS.get(model_id, {})
         except Exception:
             model_data = {}
-    base: dict | None = None
+    base: dict[str, Any] | None = None
     lid = str(model_id or "").lower()
     for fam in sorted(FAMILY_CAPABILITIES, key=len, reverse=True):
         if fam in lid:
             base = FAMILY_CAPABILITIES[fam]
             break
     if base is None:
-        base = UNKNOWN_MODEL_CAPABILITIES
-    merged = {**base, "input": list(base.get("input", ["text"]))}
+        base = dict(UNKNOWN_MODEL_CAPABILITIES)
+    base_input = base.get("input", ["text"])
+    merged = {**base, "input": list(base_input) if isinstance(base_input, (list, tuple)) else [base_input]}
     if isinstance(model_data, dict):
         explicit = model_data.get("capabilities")
         if isinstance(explicit, dict):

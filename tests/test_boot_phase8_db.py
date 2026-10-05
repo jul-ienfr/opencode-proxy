@@ -313,16 +313,30 @@ def test_restore_token_counters_uses_aggregate_not_group_by():
 
 @pytest.fixture
 def archive_env(tmp_path):
-    """Base live + arborescence logs, comme en production."""
+    """Base live + arborescence logs, comme en production.
+
+    [P2-11] Mois ANCRÉS (pas de jours relatifs) : 4 lignes anciennes sur 4
+    mois distincts garantis (15 des mois now-4..-7, toujours > 90 j) + 4
+    lignes récentes (< 90 j). L'ancienne version en jours relatifs
+    (200/150/120/100 j) regroupait 2 lignes dans le même mois selon la
+    date d'exécution (ex. 2026-10-04 : 120 j et 100 j → juin).
+    """
     logs = tmp_path / "logs"
     logs.mkdir()
     db_path = logs / "requests.db"
     conn = sqlite3.connect(db_path)
     _requests_table(conn)
     now = dt.datetime.now(dt.UTC)
-    for days_ago in (200, 150, 120, 100, 61, 40, 10, 1):
+    for k in range(4, 8):
+        y, m = now.year, now.month - k
+        while m <= 0:
+            m += 12
+            y -= 1
+        ts = dt.datetime(y, m, 15, 12, tzinfo=dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        _insert_request(conn, f"rold{k}", ts)
+    for days_ago, rid in ((61, "r61"), (40, "r40"), (10, "r10"), (1, "r1")):
         ts = (now - dt.timedelta(days=days_ago)).strftime("%Y-%m-%dT%H:%M:%SZ")
-        _insert_request(conn, f"r{days_ago}", ts)
+        _insert_request(conn, rid, ts)
     conn.commit()
     conn.close()
     return db_path

@@ -40,11 +40,18 @@ dessus → repli `FREE_DISCOVERY_DEFAULT_TARGET` chat-compatible.
 
 `classify.has_free_leg` = id `-free`/pool découvert OU clé `FREE_MODEL_MAP` OU
 valeur `FREE_MODELS`. `plan.summarizer_plan` + `class_policy` (`auto` défaut,
-`free_only`/`paid_only` forcent après plan auto). `transport` : free =
-`_official_free_headers` + `_do_free_direct_request` (grille wire,
-conversion `/responses`, normalisation `output[]→choices`) ; paid =
-`_get_auth_headers` + `_do_request_with_retry`. Retry condensé paid : même
-tunnel geo que la conversation (`_open_via_pool` si `_geo_force_tunnel`).
+`free_only`/`paid_only` forcent après plan auto). `transport` :
+- free = `_official_free_headers` + `_compaction_free_pool_request`
+  (même `_try_free_model_first` que la conversation : stations, hedge,
+  cooldowns, repli direct, `forced_pool` geo ; `seed` = nom d'origine pour la
+  même résolution) — jamais de direct résidentiel hors pool, jamais de payant
+  silencieux (pool épuisé → `UpstreamError` 502 → `None` → relais intact) ;
+- paid = `_get_auth_headers` + `_do_request_with_retry`.
+Condense-and-retry sur les 3 portes (`/v1/messages` branches anthropic +
+openai-via, `/v1/chat/completions`, `/v1/responses` backend OpenAI) :
+non-stream uniquement, 1 tentative, retry tunnel-aware (`_open_via_pool` si
+`_geo_force_tunnel`), skip put cache (`_condensed_ok` / `_r6_condensed_ok`),
+forme du retry selon l'endpoint (`messages` vs `input` + checkpoint adapté).
 `native_passthrough:true` (défaut) = natifs relayés verbatim, jamais résumés
 côté client. `summary_paid_bypass:false` (défaut OFF) = résumé client détecté
 ne contourne pas `strict_free` (correctif Hermes opt-in).
@@ -65,7 +72,27 @@ server_compaction:
   native_passthrough: true
   keep_tail: true
   summary_paid_bypass: false
+  tiny_retry: true          # stream compactage sans outils : fetch bufferisé +
+                            # 1 refetch station fraîche sur sortie tiny (free-only)
+  summary_lean: true        # jambe free : sorties d'outils tronquées sur trafic
+                            # compactage détecté (l'amont digère mal les Mo)
+  summary_lean_max_chars: 2000
 ```
+
+### Streams de compactage (tiny-retry)
+
+Les boucles live émettent chaque chunk dès réception : sur micro-sortie
+amont, le client a déjà reçu l'octet défectueux et aucun retry same-stream
+n'est possible. Pour un stream de compactage (y compris WITH-tools : les
+compactions Claude Code rejouent l'historique avec outils), le proxy fetche
+en bufferisé (stream OFF : même `_try_free_model_first` — stations, hedge,
+cooldowns), rejoue UNE fois sur station fraîche (cooldown 60 s) si la
+sortie est tiny (`in>=40k, out<100`, sans tool_use effectif), puis émet le
+SSE reconstruit (`streaming.py`, mêmes champs que le live). Fidélité :
+tout final non-texte (outil, thinking, bloc natif) retombe en live —
+jamais de résumé amputé. Échec quelconque → `None` → live streaming
+inchangé (fail-open total, jamais de payant silencieux). TTFB = durée
+totale (tâche de fond, pas d'interactivité).
 
 ## 6. Modules
 
@@ -73,6 +100,7 @@ server_compaction:
 - `plan.py` : `summarizer_plan` → `(model,endpoint,protocol,api,is_free,seed)` (pur, DI).
 - `router.py` : `detect_compaction` → `(is_compaction,is_native,kind)`, `plan_for_conversation` (pur, DI).
 - `transport.py` : `summarizer_headers/request`, `normalize_free_responses`, `should_use_tunnel` (DI).
+- `streaming.py` : `should_buffer_compaction`, `is_tiny_result`, `completion_text`, `chat/anthropic_sse_from_completion` (pur).
 - `shapes.py` : `is_compaction_shape` (officielle+marqueur+natif), `is_native_compaction`.
 - `summarizer.py` : `build_summarizer_body/_anthropic_body/_responses_body/_for_api`, `run_summarizer(...,api)`, `_extract_text` (chat+anthropic+responses, item compaction ignoré).
-- `react.py` : `maybe_condense(...,api)` ; `truncate.py` : coupe aux frontières de paires.
+- `react.py` : `maybe_condense(...,api)` ; `truncate.py` : coupe aux frontières de paires + `build_checkpoint_input` / `build_condensed_input` (fenêtre Responses).

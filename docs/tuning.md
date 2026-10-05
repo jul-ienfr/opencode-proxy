@@ -9,8 +9,11 @@ database:
   busy_timeout: 5000      # ms — wait on SQLITE_BUSY before error; 5000 balances contention vs latency
   cache_size: 64000       # pages → -64000 = ~256 MB (negative = KB). Large cache reduces I/O for token stats
   mmap_size: 268435456    # 268 MB mmap — memory-mapped I/O for fast scans, capped to avoid OOM on small hosts
-  commit_interval: 5      # s — batch queue flush interval
+  commit_interval: 2      # s — batch queue flush interval (fenêtre de perte sur crash)
   commit_batch: 10        # rows per commit batch (queue 10000, batch 32, timeout 50 ms in app/db)
+  weekly_purge_days: 90   # j — DELETE des lignes anciennes (maintenance hebdo dimanche 03:00)
+  archive_after_days: 60  # j — AVANT la purge : déplace les lignes > 60 j vers logs/archive/requests-YYYY-MM.db
+                          # (0 = off). Garder < weekly_purge_days : 60-90 j archivés, > 90 j purgés.
 ```
 
 - `journal_mode=WAL` + `synchronous=NORMAL` — WAL allows concurrent readers, NORMAL is safe with WAL (fsync at checkpoint only).
