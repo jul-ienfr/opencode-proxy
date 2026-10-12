@@ -144,7 +144,7 @@ def test_quota_false_skips_rotation_but_keeps_correlated_counter(monkeypatch):
 
     pool = pool_mod.FreeIPPool.__new__(pool_mod.FreeIPPool)
     pool._vpn = _FakeVPN()
-    pool._stations = [st_dummy := object()]  # dual_station=False (1 station)
+    pool._stations = [object()]  # dual_station=False (1 station)
     pool._on_429_action = "both"
     pool._note_upstream_429 = lambda station: noted.append(station)
     pool._launch_rotation = lambda station, forced_pool=None: launched.append(station)
@@ -182,3 +182,130 @@ def test_quota_default_still_rotates(monkeypatch):
     pool.on_quota_exhausted(st)  # quota=True par défaut → comportement historique
 
     assert launched == [st]
+
+
+# ── 4. Isolation single-station : un quota sur N ne bouge que N ──────
+#
+# Exigence : « si une station a une IP dépassée, les autres ne doivent pas
+# changer ; la station qui a l'IP hors quota doit changer d'IP mais les
+# autres IP des autres stations doivent rester intactes ».
+#
+# Ces tests prouvent (hermétique, 0 quota brûlé, aucun docker) que :
+#   a) on_quota_exhausted(stN) ne lance une rotation QUE pour stN
+#      (ni _launch_rotation sur une autre station, ni bad-mark ailleurs) ;
+#   b) _launch_rotation est single-flight PAR station : N 429 concurrents
+#      sur la même station = 1 seule rotation enfilée (pas de storm) ;
+#      et deux stations en 429 enfilent 2 rotations DISTINCTES, une par
+#      station (pas de fusion, pas de contamination) ;
+#   c) _launch_rotation ignore une station inconnue (retirée par
+#      downscale) : aucune entrée enfilée, aucun docker touché.
+
+
+class _IsoVPN:
+    enabled = True
+    proxy_mode = "vpn"
+
+
+class _IsoStation:
+    """Station fake : up, IP stable, utilisable par _station_usable."""
+
+    def __init__(self, sid, ip):
+        self._station = sid
+        self.status = "connected"
+        self.current_ip = ip
+        self._config = {}
+        self._current_country = "Switzerland"
+
+
+def _iso_pool(nstations=3):
+    import free.pool as pool_mod
+
+    stations = [_IsoStation(i + 1, f"10.0.0.{i + 1}") for i in range(nstations)]
+    pool = pool_mod.FreeIPPool.__new__(pool_mod.FreeIPPool)
+    pool._vpn = _IsoVPN()
+    pool._stations = list(stations)
+    pool._station_ids = {s._station for s in stations}
+    pool._on_429_action = "both"
+    pool._per = {}
+    pool._connect_retry_interval = 300.0
+    pool._bad_ttl = 60.0
+    pool._bad_ttl_by_cause = {}
+    pool._free_parallel_enabled = False
+    pool._free_parallel_routing = "round-robin"
+    pool._rotation_wait_timeout = 5.0
+    pool.latency_engine = None
+    pool._failover_exhausted_cb = None
+    pool._upstream_429_log = __import__("collections").deque()
+    pool._upstream_event_until = 0.0
+    pool._upstream_event_threshold = 10**9  # storm-guard désactivé ici
+    pool._upstream_event_window_s = 60.0
+    pool._upstream_event_cool_s = 180.0
+    pool._rotation_tasks = {}
+    pool._pending = set()
+    from asyncio import PriorityQueue as _PQ
+    import itertools as _it
+
+    pool._rotation_queue = _PQ()
+    pool._rotation_seq = _it.count()
+    pool._worker_tasks = []
+    pool._ensure_workers = lambda: None  # pas de loop nécessaire : la file suffit
+    return pool, stations
+
+
+def test_quota_station_N_rotates_only_N():
+    """429 quota (vrai motif) sur st2 → rotation enfilée pour st2 SEULE,
+    bad-mark posé sur st2 SEULE, st1/st3 intacts (pas de bad_until)."""
+    pool, stations = _iso_pool(3)
+    st1, st2, st3 = stations
+
+    launched = []
+    pool._launch_rotation = lambda station, forced_pool=None: launched.append(station)
+
+    pool.on_quota_exhausted(st2, quota=True)
+
+    assert launched == [st2]
+    assert pool._per_station(st2).get("bad_until") is not None
+    assert pool._per_station(st2).get("bad_cause") == "rate_limit"
+    assert pool._per_station(st1).get("bad_until") is None
+    assert pool._per_station(st3).get("bad_until") is None
+    assert st1.current_ip == "10.0.0.1"
+    assert st3.current_ip == "10.0.0.3"
+
+
+def test_quota_single_flight_per_station():
+    """N 429 concurrents sur la MÊME station = 1 seule rotation enfilée."""
+    pool, stations = _iso_pool(2)
+    pool.on_quota_exhausted(stations[0], quota=True)
+    pool.on_quota_exhausted(stations[0], quota=True)
+    pool.on_quota_exhausted(stations[0], quota=True)
+
+    assert pool._pending == {1}
+    queued = []
+    while not pool._rotation_queue.empty():
+        queued.append(pool._rotation_queue.get_nowait()[2])
+    assert queued == [stations[0]]
+
+
+def test_quota_two_stations_two_distinct_rotations():
+    """429 sur st1 PUIS st2 → 2 entrées DISTINCTES (une par station),
+    jamais une rotation « globale » qui toucherait les deux."""
+    pool, stations = _iso_pool(3)
+    pool.on_quota_exhausted(stations[0], quota=True)
+    pool.on_quota_exhausted(stations[1], quota=True)
+
+    assert pool._pending == {1, 2}
+    queued = []
+    while not pool._rotation_queue.empty():
+        queued.append(pool._rotation_queue.get_nowait()[2])
+    assert [s._station for s in queued] == [1, 2]
+    assert pool._per_station(stations[2]).get("bad_until") is None
+
+
+def test_launch_rotation_ignores_unknown_station():
+    """Station retirée (downscale) : _launch_rotation = no-op,
+    rien enfilé, rien touché."""
+    pool, stations = _iso_pool(2)
+    ghost = _IsoStation(9, "10.9.9.9")
+    pool._launch_rotation(ghost)
+    assert pool._pending == set()
+    assert pool._rotation_queue.empty()
