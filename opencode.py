@@ -3644,7 +3644,11 @@ app.add_middleware(Global429BackoffMiddleware, remaining_fn=_global_429_remainin
 # core/errors.py — imports regroupés (isort), détails par phase ci-dessus.
 from core.errors import UpstreamError  # noqa: E402
 from core.errors import anthropic_error as _anthropic_error  # noqa: E402
+from core.errors import classify_upstream_error as _classify_upstream_error  # noqa: E402
+from core.errors import is_credit_exhaustion as _is_credit_exhaustion  # noqa: E402
+from core.errors import is_free_quota_failure as _is_free_quota_failure  # noqa: E402
 from core.errors import openai_error as _openai_error  # noqa: E402
+from core.errors import upstream_retry_signal as _upstream_retry_signal  # noqa: E402
 from upstream.breaker import CircuitOpenError  # noqa: E402
 
 
@@ -4432,6 +4436,31 @@ def _safe_client_status(upstream_status: int) -> int:
     if upstream_status == 499:
         return 502
     return upstream_status
+
+
+# [PLAN_AUDIT_CLIENT_OFFICIEL G1] Statuts « ambigus » : hors de la liste
+# `_RETRYABLE_STATUSES` mais dont le CORPS amont peut déclarer une surcharge
+# transitoire (certains gateways rendent un 400/422 sur une charge). Jamais
+# 401/403 (fenêtre auth → failover de clé), jamais 429 (failover quota),
+# jamais 499 (déconnexion) : ces statuts ont déjà leur propre traitement.
+_MOTIF_RETRY_STATUSES = {400, 404, 408, 409, 422, 425}
+
+
+def _motif_retryable(status_code, body) -> bool:
+    """[G1] Vrai si un statut NON retryable devient retryable par son corps.
+
+    Pur, jamais de raise. Appelé sur chaque réponse amont non retryable : un
+    ``server_is_overloaded`` / ``server_error`` dans le corps est transitoire
+    et se rejoue (parité officielle), alors qu'un ``insufficient_quota`` ou un
+    ``context_length_exceeded`` ne se rejoue JAMAIS — c'est tout l'objet de la
+    lecture du corps plutôt que du seul statut.
+    """
+    try:
+        if int(status_code) not in _MOTIF_RETRY_STATUSES:
+            return False
+        return bool(_upstream_retry_signal(status_code, body)[0])
+    except Exception:
+        return False
 
 
 def _auth_window_message(status: int) -> str:
@@ -6251,7 +6280,7 @@ async def _hedged_fetch(cands, body: dict, headers: dict, endpoint: str, forced_
     err_task = None
     # [PLAN-corrections-429 G1/G5] stations ayant COMPLÉTÉ avec un 429 :
     # bad-mark individuel même si une autre station gagne la course.
-    _hedge_stations_429: list = []  # [(station, retry_after_str)]
+    _hedge_stations_429: list = []  # [(station, retry_after_str, body_429_str)]
     # overall hedge timeout: generous (connect 10 + read 600, but hedge should not wait forever)
     # we wait until first success; if all fail, raise last error
     last_exc = None
@@ -6285,7 +6314,13 @@ async def _hedged_fetch(cands, body: dict, headers: dict, endpoint: str, forced_
                             _ra = (resp.headers.get("retry-after", "") if getattr(resp, "headers", None) else "") or ""
                         except Exception:
                             _ra = ""
-                        _hedge_stations_429.append((tasks.get(d), _ra))
+                        # [fix rotation-storm] corps du 429 threadé au bad-mark
+                        # pour ne rotater que sur un vrai quota.
+                        try:
+                            _b429 = (getattr(resp, "text", "") or "")[:2000]
+                        except Exception:
+                            _b429 = ""
+                        _hedge_stations_429.append((tasks.get(d), _ra, _b429))
                     if err_resp is None:
                         err_resp, err_station, err_task = resp, tasks.get(d), d
                 if winner_resp is not None:
@@ -6362,9 +6397,11 @@ async def _hedged_fetch(cands, body: dict, headers: dict, endpoint: str, forced_
                         _free_model_429 = str(body.get("model") or body.get("original_model") or "")
                     except Exception:
                         _free_model_429 = ""
-                    for _st429, _ra429 in _hedge_stations_429:
+                    for _st429, _ra429, _b429 in _hedge_stations_429:
                         if _st429 is not None and _st429 is not winner_station:
-                            _mark_free_stations_429(_free_model_429, _ra429, stations=[_st429], forced_pool=forced_pool)
+                            _mark_free_stations_429(
+                                _free_model_429, _ra429, stations=[_st429], forced_pool=forced_pool, body=_b429
+                            )
             # need to ensure free_ip / identity context for downstream logging
             try:
                 ip = getattr(winner_station, "current_ip", None) or getattr(winner_station, "pid", "") or ""
@@ -7561,6 +7598,7 @@ def _mark_free_stations_429(
     stations=None,
     forced_pool=None,
     record_global: bool = True,
+    body=None,
 ) -> None:
     """[PLAN-corrections-429 G1/G3/G5] Action 429 immédiate par station.
 
@@ -7572,6 +7610,15 @@ def _mark_free_stations_429(
     [PC-5] le 429 suit le modèle (compte), pas l'IP : compteur
     ``_free_429_by_model`` incrémenté ici (point de passage unique
     stream + non-stream).
+
+    [fix rotation-storm] ``body`` = corps du 429 amont, quand l'appelant a
+    pu le lire. Il décide si le 429 est un VRAI quota per-IP (rotation
+    d'IP utile) ou une surcharge serveur transitoire
+    (``is_free_quota_failure``). ``body=None`` (EOF/flux vide, appelants
+    historiques) → on garde le comportement d'avant : quota présumé,
+    rotation autorisée. ``body`` fourni et SANS motif quota → pas de
+    rotation (l'IP neuve serait rejetée pareil) et cooldown court : on ne
+    punit pas une station pour une panne amont passagère.
     """
     # [FIX EOF nu] ``record_global=False`` pour une fermeture de flux (EOF réseau) :
     # ce n'est PAS un signal de quota upstream. Sans ce garde-fou, chaque tentative
@@ -7583,6 +7630,13 @@ def _mark_free_stations_429(
     if record_global:
         _record_global_429()
         _note_free_429(free_model)
+    # [fix rotation-storm] Un 429 « Endpoint is unavailable » (surcharge amont
+    # transitoire) n'a RIEN à voir avec le quota per-IP : rotater consomme des IP
+    # neuves + des handshakes AUTH NordVPN pour rien → rafale → throttling compte
+    # NordVPN → stations en erreur → boucle auto-destructrice. ``quota_flag`` est
+    # False pour un 429 transitoire → on saute la rotation (cf. FreeIPPool).
+    # ``body=None`` (EOF, appelants sans corps) → True (comportement historique).
+    quota_flag = True if body is None else _is_free_quota_failure(429, body)
     if stations is None:
         stations = [_free_attempt_station()]
     seen = set()
@@ -7591,13 +7645,26 @@ def _mark_free_stations_429(
             continue
         seen.add(id(station))
         _action_429 = _cfg_settings.get_429_action()
+        # Surcharge transitoire : cooldown court (30 s) au lieu du quota long —
+        # inutile de tenir la station écartée sur un quota qui reviendrait vite.
+        _cd_secs = (
+            _free_429_cooldown_seconds(retry_after)
+            if quota_flag
+            else min(_free_429_cooldown_seconds(retry_after), 30.0)
+        )
         if _action_429 != "rotate":
-            _set_free_cooldown(free_model, _free_429_cooldown_seconds(retry_after), station)
-        if _action_429 != "cooldown" and _free_ip_pool:
+            _set_free_cooldown(free_model, _cd_secs, station)
+        # [fix rotation-storm] rotation SEULEMENT pour un vrai quota (ou body absent).
+        if _action_429 != "cooldown" and quota_flag and _free_ip_pool:
             try:
-                _free_ip_pool.on_quota_exhausted(station, forced_pool=forced_pool)
+                _free_ip_pool.on_quota_exhausted(station, forced_pool=forced_pool, quota=quota_flag)
             except TypeError:
-                _free_ip_pool.on_quota_exhausted(station)
+                try:
+                    _free_ip_pool.on_quota_exhausted(station, quota=quota_flag)
+                except TypeError:
+                    # Doubles à l'ancienne signature (station seule) : on ne
+                    # perd jamais la rotation sur une incompatibilité de kwargs.
+                    _free_ip_pool.on_quota_exhausted(station)
 
 
 def _free_failover_exhausted(free_model: str, retry_after: str = "", stations=None) -> None:
@@ -7667,6 +7734,7 @@ def _on_free_429_stream(
     forced_pool=None,
     failed_stations=None,
     record_global: bool = True,
+    body=None,
 ) -> bool:
     """Free endpoint 429 during streaming: cooldown + paid fallback.
 
@@ -7687,6 +7755,11 @@ def _on_free_429_stream(
     [PLAN-corrections-429 G3] ``failed_stations`` porte les stations
     échouées (hedge N stations) — défaut : la station courante.
 
+    [fix rotation-storm] ``body`` = corps du 429 amont (lu quand possible),
+    transmis à ``_mark_free_stations_429`` pour distinguer un vrai quota
+    (rotation utile) d'une surcharge transitoire (rotation inutile).
+    ``body=None`` → comportement historique (quota présumé).
+
     No-op when VPN rotation is off.
     """
     _mark_free_stations_429(
@@ -7695,6 +7768,7 @@ def _on_free_429_stream(
         stations=failed_stations if failed_stations else [_free_attempt_station()],
         forced_pool=forced_pool,
         record_global=record_global,
+        body=body,
     )
     strict_free = IP_ROTATION.get("strict_free", False)
     if strict_free and _free_exception_fallback_mode() == "direct":
@@ -8114,8 +8188,15 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
                                 ) or ""
                             except Exception:
                                 _ra_all = ""
+                            # [fix rotation-storm générique] corps threadé : pas de
+                            # rotation sur une surcharge transitoire amont
+                            # partagée par toutes les stations.
+                            try:
+                                _b_all = (getattr(resp, "text", "") or "")[:2000]
+                            except Exception:
+                                _b_all = ""
                             _mark_free_stations_429(
-                                free_model, _ra_all, stations=list(_hedge_cands), forced_pool=forced_pool
+                                free_model, _ra_all, stations=list(_hedge_cands), forced_pool=forced_pool, body=_b_all
                             )
                         station = winner
                         if winner and getattr(winner, "current_ip", None):
@@ -8198,12 +8279,9 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
                 )
                 station = attempt  # cooldown key + on_quota_exhausted must target THIS IP
                 if resp.status_code == 429 and _free_used < free_max:
-                    # 429 = this station's bucket exhausted → action immédiate
-                    # sur CETTE station (helper G1/G3/G5 : cooldown et/ou
-                    # rotation selon on_429_action), puis continue sur une
-                    # station FRAÎCHE tant que le budget dure ([plan 19/08 §1]:
-                    # each attempt a fresh IP; a same-IP retry would burn
-                    # the budget on a guaranteed ✘).
+                    # 429 = quota OU surcharge transitoire — le corps lu
+                    # ci-dessous distingue (cf. is_free_quota_failure) : on ne
+                    # rotate que pour un vrai quota.
                     _log_free_model_usage(
                         model_id,
                         free_model,
@@ -8215,11 +8293,16 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
                         _free_elapsed,
                         ip=free_ip,
                     )
+                    try:
+                        _body_429_seq = (getattr(resp, "text", "") or "")[:2000]
+                    except Exception:
+                        _body_429_seq = ""
                     _mark_free_stations_429(
                         free_model,
                         resp.headers.get("retry-after", "") or "",
                         stations=[attempt],
                         forced_pool=forced_pool,
+                        body=_body_429_seq,
                     )
                     _log(
                         f"  FREE {free_model!r} RATE LIMITED (429) on station {attempt._station} → "
@@ -8601,7 +8684,8 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
         _log(f"  FREE {free_model!r} OK ({tokens_in}+{tokens_out} tokens, saved paid quota)")
         return resp, resp_headers, free_model, free_ip
 
-    # 429 = free quota exhausted → fall back to paid silently
+    # 429 = vrai quota OU surcharge transitoire amont (cf. is_free_quota_failure) →
+    # cooldown (+ rotation seulement si quota) puis repli silencieux sur le payant.
     if resp.status_code == 429:
         # Read and log the 429 response body for quota analysis
         try:
@@ -8633,7 +8717,11 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
         # stations hedged — re-marquer ici re-rotaterait la gagnante-filet
         # (le cooldown est idempotent, la rotation ne l'est pas).
         if not _hedge_done:
-            _mark_free_stations_429(free_model, retry_after, stations=[station], forced_pool=forced_pool)
+            # [fix rotation-storm] ``body_429`` distingue un vrai quota
+            # (rotation utile) d'une surcharge transitoire (pas de rotation).
+            _mark_free_stations_429(
+                free_model, retry_after, stations=[station], forced_pool=forced_pool, body=body_429
+            )
 
         if IP_ROTATION.get("strict_free", False):
             if _free_exception_fallback_mode() == "direct":
@@ -9734,11 +9822,30 @@ async def _free_stream_refuse_bytes(
     )
 
 
-def _free_429_stream_decision(free_model, resp, _attempt, forced_pool, track_model):
+async def _free_429_stream_decision(free_model, resp, _attempt, forced_pool, track_model):
+    # [fix rotation-storm] On lit le corps du 429 (best-effort) pour
+    # distinguer un VRAI quota per-IP (rotation d'IP utile) d'une surcharge
+    # serveur transitoire (« Endpoint is unavailable » → rotation INUTILE :
+    # l'IP neuve serait rejetée pareil, on consumerait IP + handshake AUTH
+    # NordVPN pour rien). ``resp.aread()`` est idempotent : le ``await
+    # resp.aread()`` du relais d'erreur plus bas renverra le cache.
+    # Corps illisible ou vide → "" → ``is_free_quota_failure=False`` → PAS de
+    # rotation (défaut storm-safe : mieux vaut manquer une rotation que
+    # re-déclencher la rafale auto-destructrice).
+    try:
+        _raw = await resp.aread()
+        _body = (
+            _raw.decode("utf-8", "ignore")
+            if isinstance(_raw, (bytes, bytearray))
+            else str(_raw or "")
+        )
+    except Exception:
+        _body = ""
     refuse = _on_free_429_stream(
         free_model,
         resp.headers.get("retry-after", ""),
         forced_pool=forced_pool,
+        body=_body,
     )
     if not refuse and _attempt + 1 < effective_free_max_attempts(forced_pool):
         _log_free_model_usage(
@@ -11243,10 +11350,15 @@ async def messages(request: Request):
                 return _free_refusal_response(e, "anthropic")
             except UpstreamError as e:
                 _debug(f"  ✗ upstream error: {e}")
-                return JSONResponse(status_code=e.status_code, content={"error": str(e)})
+                # Parité officielle : enveloppe Anthropic, pas {"error": ...},
+                # sinon le SDK ne reconnaît pas le type et ne retrye pas.
+                # [G1] le type est déduit du corps (overflow → invalid_request_error,
+                # pour que le client compacte) et non du fourre-tout api_error.
+                _e_st, _e_type = _classify_upstream_error(e.status_code, str(e))
+                return _anthropic_error(_e_st, str(e), error_type=_e_type)
             account_alias = _alias_for_key(a_headers.get("x-api-key", ""))
             if resp.status_code != 200:
-                # Normalize 429/401/403 → 503 to avoid Claude Code auth window
+                # Parité officielle : 429/529 préservés, 401/403 → 503 anti-fenêtre auth.
                 # Convert 499 → 502 (upstream disconnected, non-standard code)
                 status = _safe_client_status(resp.status_code)
                 if resp.status_code == 429:
@@ -11288,9 +11400,7 @@ async def messages(request: Request):
                     paid_status=resp.status_code,
                 )
                 # Pause key on credit/balance errors (400) and retry with alt key
-                if resp.status_code == 400 and any(
-                    x in resp.text for x in ("Insufficient balance", "Monthly usage limit")
-                ):
+                if resp.status_code == 400 and _is_credit_exhaustion(resp.text):
                     failed_key = a_headers.get("x-api-key", "")
                     _key_pauser.pause_key(
                         failed_key,
@@ -11312,7 +11422,9 @@ async def messages(request: Request):
                             else:
                                 return _anthropic_error(503, "All API keys exhausted. Check your billing.")
                         except UpstreamError as e:
-                            return _anthropic_error(e.status_code, str(e))
+                            # [G1] type déduit du corps (overflow → invalid_request_error).
+                            _e_st, _e_type = _classify_upstream_error(e.status_code, str(e))
+                            return _anthropic_error(_e_st, str(e), error_type=_e_type)
                 # [Phase 2 compaction] condense-and-retry réactif : APRÈS le
                 # credit-retry (qui reste FIRST) et AVANT le relais d'erreur
                 # intacte. Fail-open total : tout échec → relais intact.
@@ -11672,7 +11784,7 @@ async def messages(request: Request):
                                 # keys: a status from the free endpoint says nothing
                                 # about the paid account (CRITIC(2)/CRITIC(3)).
                                 if resp.status_code == 429:
-                                    _decision, _refuse = _free_429_stream_decision(
+                                    _decision, _refuse = await _free_429_stream_decision(
                                         free_model,
                                         resp,
                                         _attempt,
@@ -11804,10 +11916,7 @@ async def messages(request: Request):
                                 continue
                             err = await resp.aread()
                             # Pause key on credit/balance errors (400)
-                            if resp.status_code == 400 and any(
-                                x in err.decode(errors="ignore")
-                                for x in ("Insufficient balance", "Monthly usage limit")
-                            ):
+                            if resp.status_code == 400 and _is_credit_exhaustion(err.decode(errors="ignore")):
                                 failed_key = headers.get("x-api-key", "")
                                 _key_pauser.pause_key(failed_key, _key_pauser._max_pause, "400 credit error")
                                 alt = _find_alternative_key(failed_key)
@@ -12608,7 +12717,7 @@ async def messages(request: Request):
                 paid_status=resp.status_code,
             )
             # Pause key on credit/balance errors (400)
-            if resp.status_code == 400 and any(x in resp.text for x in ("Insufficient balance", "Monthly usage limit")):
+            if resp.status_code == 400 and _is_credit_exhaustion(resp.text):
                 failed_key = _key_from_headers(headers, "openai")
                 _key_pauser.pause_key(failed_key, _key_pauser._max_pause, f"400 credit error: {resp.text[:80]}")
                 alt = _find_alternative_key(failed_key)
@@ -12623,7 +12732,9 @@ async def messages(request: Request):
                         else:
                             return _anthropic_error(503, "All API keys exhausted. Check your billing.")
                     except UpstreamError as e:
-                        return _anthropic_error(e.status_code, str(e))
+                        # [G1] type déduit du corps (overflow → invalid_request_error).
+                        _e_st, _e_type = _classify_upstream_error(e.status_code, str(e))
+                        return _anthropic_error(_e_st, str(e), error_type=_e_type)
             # [Phase 2 compaction — condense-and-retry, openai-via-messages, non-stream uniquement]
             # Déclencheur réactif : 400-overflow upstream constaté (resp.status_code/body).
             # APRÈS le credit-retry (qui reste FIRST : alt key, early-return 503 si échec)
@@ -12755,7 +12866,9 @@ async def messages(request: Request):
                             except _CompactionTunnelDone as _td2:
                                 resp, headers = _td2.resp, _td2.headers
                             except UpstreamError as e:
-                                return _anthropic_error(e.status_code, str(e))
+                                # [G1] type déduit du corps (overflow → invalid_request_error).
+                                _e_st, _e_type = _classify_upstream_error(e.status_code, str(e))
+                                return _anthropic_error(_e_st, str(e), error_type=_e_type)
                             except Exception:
                                 _retry_body = None
                             if isinstance(_retry_body, dict) and resp.status_code == 200:
@@ -12811,17 +12924,23 @@ async def messages(request: Request):
                     err_msg = err_msg.get("message", resp.text[:200])
             except Exception:
                 err_msg = resp.text[:200]
+            # [G1] le type est lu dans le CORPS amont (et non figé en
+            # `api_error`, fourre-tout que le client ne sait pas interpréter) :
+            # un `context_length_exceeded` remonte en `invalid_request_error` et
+            # déclenche la compaction du client ; une surcharge en
+            # `overloaded_error`. Le statut, lui, reste celui de l'amont.
+            _e_st, _e_type = _classify_upstream_error(resp.status_code, resp.text[:4000])
             anthro_err = _json_dumps_str(
                 {
                     "type": "error",
                     "error": {
-                        "type": "api_error",
+                        "type": _e_type,
                         "message": f"HTTP {resp.status_code}: {err_msg}",
                     },
                 },
                 ensure_ascii=False,
             )
-            return Response(content=anthro_err, status_code=resp.status_code, media_type="application/json")
+            return Response(content=anthro_err, status_code=_e_st, media_type="application/json")
         try:
             data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
         except Exception:
@@ -13040,7 +13159,7 @@ async def messages(request: Request):
                             # keys: a status from the free endpoint says nothing
                             # about the paid account (CRITIC(2)/CRITIC(3)).
                             if resp.status_code == 429:
-                                _decision, _refuse = _free_429_stream_decision(
+                                _decision, _refuse = await _free_429_stream_decision(
                                     free_model,
                                     resp,
                                     _attempt,
@@ -13178,9 +13297,7 @@ async def messages(request: Request):
                             continue
                         err = await resp.aread()
                         # Pause key on credit/balance errors (400)
-                        if resp.status_code == 400 and any(
-                            x in err.decode(errors="ignore") for x in ("Insufficient balance", "Monthly usage limit")
-                        ):
+                        if resp.status_code == 400 and _is_credit_exhaustion(err.decode(errors="ignore")):
                             failed_key = _key_from_headers(hdrs, "openai")
                             _key_pauser.pause_key(failed_key, _key_pauser._max_pause, "400 credit error")
                             alt = _find_alternative_key(failed_key)
@@ -14460,9 +14577,7 @@ async def chat_completions(request: Request):
                     paid_status=resp.status_code,
                 )
                 # Pause key on credit/balance errors (400) and retry with alt key
-                if resp.status_code == 400 and any(
-                    x in resp.text for x in ("Insufficient balance", "Monthly usage limit")
-                ):
+                if resp.status_code == 400 and _is_credit_exhaustion(resp.text):
                     failed_key = _key_from_headers(headers, "openai")
                     _key_pauser.pause_key(
                         failed_key,
@@ -14856,7 +14971,7 @@ async def chat_completions(request: Request):
                                 # keys: a status from the free endpoint says nothing
                                 # about the paid account (CRITIC(2)/CRITIC(3)).
                                 if resp.status_code == 429:
-                                    _decision, _refuse = _free_429_stream_decision(
+                                    _decision, _refuse = await _free_429_stream_decision(
                                         free_model, resp, _attempt, _free_forced_pool, model_id
                                     )
                                     if _decision == "retry_free":
@@ -15047,10 +15162,7 @@ async def chat_completions(request: Request):
                                 continue
                             err = await resp.aread()
                             # Pause key on credit/balance errors (400)
-                            if resp.status_code == 400 and any(
-                                x in err.decode(errors="ignore")
-                                for x in ("Insufficient balance", "Monthly usage limit")
-                            ):
+                            if resp.status_code == 400 and _is_credit_exhaustion(err.decode(errors="ignore")):
                                 failed_key = _key_from_headers(hdrs, "openai")
                                 _key_pauser.pause_key(failed_key, _key_pauser._max_pause, "400 credit error")
                                 alt = _find_alternative_key(failed_key)
@@ -16148,7 +16260,7 @@ async def chat_completions(request: Request):
                             # keys: a status from the free endpoint says nothing
                             # about the paid account (CRITIC(2)/CRITIC(3)).
                             if resp.status_code == 429:
-                                _decision, _refuse = _free_429_stream_decision(
+                                _decision, _refuse = await _free_429_stream_decision(
                                     free_model, resp, _attempt, _free_forced_pool, model_id
                                 )
                                 if _decision == "retry_free":
@@ -16276,9 +16388,7 @@ async def chat_completions(request: Request):
                             continue
                         err = await resp.aread()
                         # Pause key on credit/balance errors (400)
-                        if resp.status_code == 400 and any(
-                            x in err.decode(errors="ignore") for x in ("Insufficient balance", "Monthly usage limit")
-                        ):
+                        if resp.status_code == 400 and _is_credit_exhaustion(err.decode(errors="ignore")):
                             failed_key = hdrs.get("x-api-key", "")
                             _key_pauser.pause_key(failed_key, _key_pauser._max_pause, "400 credit error")
                             alt = _find_alternative_key(failed_key)
@@ -16809,8 +16919,15 @@ async def _systemone_free_via_pool(endpoint: str, body: dict, headers: dict, for
                                 ) or ""
                             except Exception:
                                 _ra_all = ""
+                            # [fix rotation-storm systemone] corps threadé : pas de rotation sur
+                            # une surcharge transitoire amont partagée par toutes
+                            # les stations.
+                            try:
+                                _b_all = (getattr(resp, "text", "") or "")[:2000]
+                            except Exception:
+                                _b_all = ""
                             _mark_free_stations_429(
-                                free_model, _ra_all, stations=list(_hedge_cands), forced_pool=forced_pool
+                                free_model, _ra_all, stations=list(_hedge_cands), forced_pool=forced_pool, body=_b_all
                             )
                         station = winner
                         if winner is not None and getattr(winner, "current_ip", None):
@@ -16924,13 +17041,20 @@ async def _systemone_free_via_pool(endpoint: str, body: dict, headers: dict, for
                 )
                 break
             if _code == 429:
-                # Quota de CETTE station épuisé → cooldown+rotation via le
-                # helper partagé, puis station FRAÎCHE tant que le budget dure.
+                # 429 = quota OU surcharge transitoire (cf. is_free_quota_failure) :
+                # cooldown+rotation via le helper partagé (rotation seulement si
+                # vrai quota), puis station FRAÎCHE tant que le budget dure.
                 _log_free_model_usage(
                     paid_model, free_model, "free (no auth)", "free (no auth)",
                     429, 0, 0, _free_elapsed, ip=free_ip,
                 )
-                _mark_free_stations_429(free_model, _ra, stations=[attempt], forced_pool=forced_pool)
+                try:
+                    _b429 = (getattr(resp, "text", "") or "")[:2000]
+                except Exception:
+                    _b429 = ""
+                _mark_free_stations_429(
+                    free_model, _ra, stations=[attempt], forced_pool=forced_pool, body=_b429
+                )
                 _log(
                     f"  FREE {free_model!r} RATE LIMITED (429) on station {getattr(attempt, '_station', '?')} → "
                     f"retry station fraîche (essai {_free_used + 1}/{free_max})"
@@ -17101,8 +17225,15 @@ async def _systemone_free_via_pool(endpoint: str, body: dict, headers: dict, for
         except Exception:
             pass
         _current_free_attempt.set({"ip": "direct", "identity": "", "station": None})
+        # [fix rotation-storm] stations=[] = compteur seul (jamais de rotation
+        # sur ce site) ; le corps sert à poser un cooldown honnête — transitoire
+        # amont = cooldown court (cf. _mark_free_stations_429).
         try:
-            _mark_free_stations_429(free_model, _ra, stations=[])
+            _b429_direct = (getattr(resp, "text", "") or "")[:2000]
+        except Exception:
+            _b429_direct = ""
+        try:
+            _mark_free_stations_429(free_model, _ra, stations=[], body=_b429_direct)
         except Exception:
             pass
         try:
@@ -17776,9 +17907,7 @@ async def responses(request: Request):
                     paid_status=resp.status_code,
                 )
                 # Pause key on credit/balance errors (400) and retry with alt key
-                if resp.status_code == 400 and any(
-                    x in resp.text for x in ("Insufficient balance", "Monthly usage limit")
-                ):
+                if resp.status_code == 400 and _is_credit_exhaustion(resp.text):
                     failed_key = a_headers.get("x-api-key", "")
                     _key_pauser.pause_key(
                         failed_key,
