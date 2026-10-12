@@ -388,27 +388,59 @@ async def test_run_summarizer_anthropic_success():
     async def do(ep, body, h, p):
         assert body["model"] == "m" and body["stream"] is False
         assert "tools" not in body and "system" not in body
-        return _FakeResp(200, b'{"content": [{"type": "text", "text": "RESUME"}]}'), h
+        return _FakeResp(200, b'{"content": [{"type": "text", "text": "## Objective\\nRESUME"}]}'), h
 
     r = await run_summarizer(
         [{"role": "user", "content": "hello world"}],
         model_id="m", endpoint="e", protocol="anthropic",
         auth_headers_fn=lambda p: {}, do_request_fn=do,
     )
-    assert r == "RESUME"
+    assert r == "## Objective\nRESUME"
 
 
 @pytest.mark.asyncio
 async def test_run_summarizer_openai_success():
     async def do(ep, body, h, p):
-        return _FakeResp(200, b'{"choices": [{"message": {"content": "RES2"}}]}'), h
+        return _FakeResp(200, b'{"choices": [{"message": {"content": "## Decisions\\nRES2"}}]}'), h
 
     r = await run_summarizer(
         [{"role": "user", "content": "hi there"}],
         model_id="m", endpoint="e", protocol="openai",
         auth_headers_fn=lambda p: {}, do_request_fn=do,
     )
-    assert r == "RES2"
+    assert r == "## Decisions\nRES2"
+
+
+@pytest.mark.asyncio
+async def test_run_summarizer_rewrite_once_then_fail_open():
+    # Sans rubriques → 1 corrective ; si toujours invalide → None (fail-open).
+    calls = []
+
+    async def do_bad(ep, body, h, p):
+        calls.append(body)
+        return _FakeResp(200, b'{"choices": [{"message": {"content": "bavardage sans structure"}}]}'), h
+
+    r = await run_summarizer(
+        [{"role": "user", "content": "hello world"}],
+        model_id="m", endpoint="e", protocol="openai",
+        auth_headers_fn=lambda p: {}, do_request_fn=do_bad,
+    )
+    assert r is None
+    assert len(calls) == 2, "exactement 1 corrective, jamais de boucle"
+    assert "Previous attempt" in json.dumps(calls[1])
+
+    # Corrective fructueuse → résumé validé rendu.
+    async def do_fixed(ep, body, h, p):
+        if len([c for c in [body] if "Previous attempt" in json.dumps(c)]) == 0:
+            return _FakeResp(200, b'{"choices": [{"message": {"content": "bavardage"}}]}'), h
+        return _FakeResp(200, b'{"choices": [{"message": {"content": "## Objective\\nok"}}]}'), h
+
+    r = await run_summarizer(
+        [{"role": "user", "content": "hello world"}],
+        model_id="m", endpoint="e", protocol="openai",
+        auth_headers_fn=lambda p: {}, do_request_fn=do_fixed,
+    )
+    assert r == "## Objective\nok"
 
 
 @pytest.mark.asyncio
@@ -440,7 +472,7 @@ def _hist(n_pairs=2):
 
 class _OkResp:
     status_code = 200
-    content = b'{"choices": [{"message": {"content": "RESUME-CONDENSE"}}]}'
+    content = b'{"choices": [{"message": {"content": "## Objective\\nRESUME-CONDENSE"}}]}'
 
 
 async def _ok_do(endpoint, body, headers, protocol):
@@ -482,7 +514,8 @@ async def test_maybe_condense_overflow_condenses():
         enabled=True, keep_recent_pairs=1,
     )
     assert isinstance(r, list) and len(r) == 3  # checkpoint + 1 paire récente
-    assert "<conversation-checkpoint><summary>RESUME-CONDENSE</summary>" in r[0]["content"]
+    assert "<conversation-checkpoint><summary>## Objective" in r[0]["content"]
+    assert "RESUME-CONDENSE</summary>" in r[0]["content"]
     assert r[1:] == _hist(3)[-2:]
 
 
@@ -554,7 +587,7 @@ async def test_maybe_condense_responses_api_builds_input():
     # api=responses → fenêtre input (pas de messages), prête pour /responses.
     async def _ok_resp(ep, body, h, p):
         assert body.get("input") and "messages" not in body
-        return _FakeResp(200, b'{"output": [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "R"}]}]}'), h
+        return _FakeResp(200, b'{"output": [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "## Decisions\\nR"}]}]}'), h
 
     hist = [_rin("vieux 1"), _rin("vieux 2"), _rin("recent"), {"role": "assistant", "content": "ok"}]
     r = await maybe_condense(
@@ -624,6 +657,106 @@ def test_lean_never_raises():
     assert lean_summary_body(object(), max_chars=2000)[1] == 0
     assert lean_summary_body({"messages": [{"role": "tool"}]}, max_chars=2000)[1] == 0
     assert lean_summary_body({"messages": [None, 42]}, max_chars=2000)[1] == 0
+
+
+# ── template structuré officiel : rubriques + validation ──
+
+
+def test_summary_template_has_required_outline():
+    from app.compaction import build_summary_user_text, has_required_outline
+
+    t = build_summary_user_text("HIST", "ANCIEN")
+    assert has_required_outline(t) is True
+    assert "## Objective" in t and "<previous-summary>" in t
+    t2 = build_summary_user_text("HIST", None)
+    assert has_required_outline(t2) is True
+    assert has_required_outline("bavardage sans structure") is False
+    assert has_required_outline("") is False
+    assert has_required_outline(None) is False
+    assert has_required_outline("## decisions\nok") is True  # casse indifférente
+
+
+def test_serialize_strips_media_to_descriptors():
+    import app.compaction.summarizer as _summ
+
+    hist = [
+        {"role": "user", "content": [
+            {"type": "text", "text": "regarde"},
+            {"type": "image", "source": {"type": "base64", "data": "AAA"}},
+            {"type": "file", "filename": "doc.pdf"},
+        ]},
+    ]
+    txt = _summ._serialize_history_for_summary(hist)
+    assert "[Attached image:" in txt and "[Attached file: doc.pdf]" in txt
+    assert "AAA" not in txt, "octets embarqués ne partent jamais"
+    assert _summ._serialize_history_for_summary(None) == ""
+    assert _summ._serialize_history_for_summary(object()) == ""
+
+
+# ── keep_tokens budgété + garde huge_context (aligné officiel, opt-in) ──
+
+
+def _mk_msgs(n_pairs=4, size=100):
+    msgs = []
+    for i in range(n_pairs):
+        msgs.append({"role": "user", "content": "q" * size})
+        msgs.append({"role": "assistant", "content": "a" * size})
+    return msgs
+
+
+def test_split_budget_keeps_newest_within_tokens():
+    from app.compaction import split_keep_recent
+
+    def est(t):
+        return len(t) // 4  # ~50 tokens/paire de 200 chars
+
+    old, recent = split_keep_recent(_mk_msgs(4), 99, keep_tokens=120, estimate_fn=est)
+    assert len(recent) == 4  # 2 paires ≈ 100 tokens ≤ 120
+    assert len(old) == 4
+    old, recent = split_keep_recent(_mk_msgs(4), 99, keep_tokens=10, estimate_fn=est)
+    assert len(recent) == 2, "toujours au moins la paire la plus récente"
+    # Legacy inchangé sans budget.
+    old, recent = split_keep_recent(_mk_msgs(4), 1)
+    assert len(recent) == 2 and len(old) == 6
+    # Estimateur fautif → repli legacy, jamais d'exception.
+    old, recent = split_keep_recent(_mk_msgs(4), 1, keep_tokens=120, estimate_fn=lambda t: 1 / 0)
+    assert len(recent) == 2
+    assert split_keep_recent(None, 1, keep_tokens=10, estimate_fn=est) == ([], [])
+
+
+def test_split_budget_never_cuts_tool_pair():
+    from app.compaction import split_keep_recent
+
+    msgs = [
+        {"role": "user", "content": "u1"},
+        {"role": "assistant", "content": [{"type": "tool_use", "id": "c1", "name": "Bash", "input": {}}]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "c1", "content": "out"}]},
+        {"role": "user", "content": "u2"},
+        {"role": "assistant", "content": "a2"},
+    ]
+    old, recent = split_keep_recent(msgs, 99, keep_tokens=10, estimate_fn=lambda t: len(t))
+    # La coupe tombe sur un vrai user, jamais au milieu d'une paire outil.
+    assert recent and recent[0].get("role") == "user"
+    assert not any(
+        isinstance(m, dict) and m.get("role") == "user"
+        and any(isinstance(b, dict) and b.get("type") == "tool_result" for b in (m.get("content") or []))
+        for m in ([recent[0]] if recent else [])
+    )
+
+
+def test_huge_context_check_matrix():
+    from app.compaction import huge_context_check
+
+    assert huge_context_check(100, 1000) == (None, "")
+    assert huge_context_check(10**7, 10**6)[0] is None  # seuils à 0 = off
+    level, msg = huge_context_check(10**6, 250000, warn_tokens=200000)
+    assert level == "warn" and "250000" in msg
+    level, msg = huge_context_check(10**6, 500000, warn_tokens=200000, deny_tokens=450000)
+    assert level == "deny" and "450000" in msg and "/compact" in msg
+    level, _ = huge_context_check(10**7, 1000, deny_tokens=450000)
+    assert level == "deny", "le volume brut suffit (pas d'estimation)"
+    assert huge_context_check(None, None, warn_tokens=1) == (None, "")
+    assert huge_context_check(object(), object(), warn_tokens=1, deny_tokens=2) == (None, "")
 
 
 # ── cap officiel 4096 : should_clamp_summary / cap_summary_max_tokens ──

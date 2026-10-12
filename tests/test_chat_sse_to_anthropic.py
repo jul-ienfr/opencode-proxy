@@ -108,7 +108,12 @@ def test_texte_multi_chunks_un_seul_bloc():
     assert ms["model"] == "claude-haiku-4-5"
     assert ms["stop_reason"] is None
     assert ms["stop_sequence"] is None
-    assert ms["usage"] == {"input_tokens": 12, "output_tokens": 0, "cache_read_input_tokens": 0}
+    assert ms["usage"] == {
+        "input_tokens": 12,
+        "output_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+    }
 
     md = _data(events, "message_delta")[0]
     assert md["delta"] == {"stop_reason": "end_turn", "stop_sequence": None}
@@ -259,7 +264,7 @@ def test_bloc_thinking_depuis_reasoning_content():
 
     starts = _data(events, "content_block_start")
     assert [s["content_block"]["type"] for s in starts] == ["thinking", "text"]
-    assert starts[0]["content_block"] == {"type": "thinking", "thinking": ""}
+    assert starts[0]["content_block"] == {"type": "thinking", "thinking": "", "signature": ""}
     assert [s["index"] for s in starts] == [0, 1]
 
     thinking_deltas = [
@@ -325,13 +330,19 @@ def test_pas_de_bloc_thinking_quand_absent():
         ("function_call", "tool_use"),
         ("content_filter", "end_turn"),
         ("autre_inconnu", "end_turn"),
-        (None, "end_turn"),
+        # Parité officielle : sans finish_reason amont (coupure), on signale
+        # `error` au lieu de déguiser en `end_turn` qui forçait un `continue`.
+        (None, "error"),
     ],
 )
 def test_correspondance_stop_reason(finish_reason, expected):
     """Table de correspondance des finish_reason Chat → stop_reason Anthropic."""
     st = ChatSseToAnthropicState(model="m", message_id="msg_stop")
-    events = _events([_chunk({"content": "x"}), _chunk({}, finish_reason=finish_reason), "data: [DONE]"], st)
+    if finish_reason is None:
+        chunks = [_chunk({"content": "x"}), "data: [DONE]"]
+    else:
+        chunks = [_chunk({"content": "x"}), _chunk({}, finish_reason=finish_reason), "data: [DONE]"]
+    events = _events(chunks, st)
     assert _data(events, "message_delta")[0]["delta"]["stop_reason"] == expected
 
 
@@ -379,7 +390,8 @@ def test_flux_vide_recoit_message_start_puis_cloture():
     st = ChatSseToAnthropicState(model="m", message_id="msg_empty")
     events = chat_sse_to_anthropic_events("data: [DONE]", state=st)
     assert _names(events) == ["message_start", "message_delta", "message_stop"]
-    assert _data(events, "message_delta")[0]["delta"]["stop_reason"] == "end_turn"
+    # Parité officielle : vide sans terminal = troncation → `error`, pas `end_turn`.
+    assert _data(events, "message_delta")[0]["delta"]["stop_reason"] == "error"
 
 
 @pytest.mark.parametrize(
@@ -525,6 +537,7 @@ def test_etancheite_deux_streams_entrelaces():
         _chunk({"content": "A1"}),
         _chunk({"tool_calls": [{"index": 0, "id": "ta", "function": {"name": "court_a", "arguments": '{"a"'}}]}),
         _chunk({"tool_calls": [{"index": 0, "function": {"arguments": ":1}"}}]}),
+        _chunk({}, finish_reason="tool_calls"),
         "data: [DONE]",
     ]
     seq_b = [
@@ -609,3 +622,322 @@ def test_reset_remet_letat_a_zero():
     assert st.tool_block_idx == {}
     assert (st.input_tokens, st.output_tokens, st.finish_reason) == (0, 0, None)
     assert st.message_id == "msg_reset"
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# F1 — panne amont portée par une ligne ``data: {"error": …}``
+#
+# Défaut d'origine : ``chat.completion.chunk`` n'a pas de clé ``error``, donc
+# une passerelle qui signale une panne milieu de flux (HTTP déjà 200) faisait
+# tomber la ligne dans le cas « pas de choices » — ``delta`` valant ``{}``,
+# ``feed_chunk`` rendait ``[]``. Le message ET le type amont étaient perdus,
+# et le client ne voyait qu'un ``stop_reason: error`` nu, sans ``event:
+# error`` : impossible de classer la panne, donc impossible de retry.
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestF1ErreurAmontDansLeFlux:
+    def _err(self, payload) -> str:
+        return _data_line({"error": payload})
+
+    def test_erreur_seule_emet_event_error_type_et_message(self):
+        """Le cas nu : la ligne d'erreur seule produit un `event: error`."""
+        st = ChatSseToAnthropicState(model="m", message_id="msg_f1a")
+        ev = _events([self._err({"message": "upstream exploded", "type": "server_error"})], st)
+
+        assert "error" in _names(ev)
+        payload = _data(ev, "error")[0]
+        assert payload["type"] == "error"
+        assert payload["error"]["message"] == "upstream exploded"
+        # `server_error` n'appartient pas au vocabulaire Anthropic : il doit
+        # être rapproché d'un type que le client sait classer.
+        assert payload["error"]["type"] == "overloaded_error"
+
+    def test_event_error_precede_la_cloture(self):
+        """Ordre : `error` AVANT `message_stop`. Un client strict lève sur
+        l'erreur ; un client souple hérite quand même d'une clôture propre."""
+        st = ChatSseToAnthropicState(model="m", message_id="msg_f1b")
+        ev = _events([self._err({"message": "boom", "type": "api_error"})], st)
+        names = _names(ev)
+
+        assert names[0] == "error"
+        assert names.index("error") < names.index("message_stop")
+        assert names[-1] == "message_stop"
+        assert names.count("message_stop") == 1
+
+    def test_erreur_apres_texte_ne_laisse_pas_de_bloc_ouvert(self):
+        """Texte déjà coulé + panne : le bloc doit être fermé, sinon un client
+        strict jette tout le tour — la panne coûterait plus cher qu'elle-même."""
+        st = ChatSseToAnthropicState(model="m", message_id="msg_f1c")
+        ev = _events(
+            [
+                _chunk({"content": "réponse partielle"}),
+                self._err({"message": "connection reset", "type": "internal_error"}),
+            ],
+            st,
+        )
+        names = _names(ev)
+
+        assert "error" in names
+        # Bloc 0 ouvert par le texte, puis refermé : jamais de `message_stop`
+        # sur un bloc encore ouvert.
+        assert [s["index"] for s in _data(ev, "content_block_stop")] == [0]
+        assert names.index("content_block_stop") < names.index("message_stop")
+        # La clôture reste honnête sur la cause.
+        assert _data(ev, "message_delta")[0]["delta"]["stop_reason"] == "error"
+
+    def test_done_apres_erreur_ne_reemet_rien(self):
+        """Une passerelle émettant `data: [DONE]` APRÈS l'erreur ne doit pas
+        produire une seconde clôture (bug de double `message_stop`)."""
+        st = ChatSseToAnthropicState(model="m", message_id="msg_f1d")
+        ev = _events(
+            [
+                self._err({"message": "rate limited", "type": "rate_limit_exceeded", "code": 429}),
+                "data: [DONE]",
+            ],
+            st,
+        )
+
+        assert _names(ev).count("message_stop") == 1
+        assert _names(ev).count("error") == 1
+        assert st.finished is True
+
+    def test_chunk_apres_erreur_ignore(self):
+        """Même garantie pour un chunk de texte tardif (amont bavard)."""
+        st = ChatSseToAnthropicState(model="m", message_id="msg_f1e")
+        ev = _events(
+            [
+                self._err({"message": "boom"}),
+                _chunk({"content": "trop tard"}),
+            ],
+            st,
+        )
+        assert "content_block_delta" not in _names(ev)
+        assert _names(ev).count("message_stop") == 1
+
+    def test_usage_de_lerreur_est_conserve(self):
+        """La branche est placée APRÈS la reprise d'usage : une passerelle qui
+        rend son usage final à côté de l'erreur ne le perd pas."""
+        st = ChatSseToAnthropicState(model="m", message_id="msg_f1f")
+        ev = _events(
+            [
+                _data_line(
+                    {
+                        "error": {"message": "quota épuisé", "type": "insufficient_quota"},
+                        "usage": {"prompt_tokens": 40, "completion_tokens": 12},
+                    }
+                )
+            ],
+            st,
+        )
+        assert (st.input_tokens, st.output_tokens) == (40, 12)
+        assert _data(ev, "message_delta")[0]["usage"]["output_tokens"] == 12
+
+    def test_erreur_avant_tout_message_start_quand_meme_emise(self):
+        """Flux d'erreur pur : `error` d'abord, puis la clôture complète —
+        y compris `message_start`, qu'un flux vide reçoit lui aussi."""
+        st = ChatSseToAnthropicState(model="m", message_id="msg_f1g")
+        ev = _events([self._err({"message": "refusé"})], st)
+        names = _names(ev)
+
+        assert names[0] == "error"
+        assert "message_start" in names
+        assert names[-1] == "message_stop"
+        assert st.started is True
+
+    def test_erreur_chaine_libre_est_relayee(self):
+        """Forme `{"error": "texte"}` (pas de dict) : le texte survit quand même."""
+        st = ChatSseToAnthropicState(model="m", message_id="msg_f1h")
+        ev = _events([self._err("Too Many Requests, slow down")], st)
+        payload = _data(ev, "error")[0]
+        assert payload["error"]["message"] == "Too Many Requests, slow down"
+        assert payload["error"]["type"] == "rate_limit_error"
+
+    def test_erreur_sans_message_rend_la_charge_utile(self):
+        """Ni `message`, ni `detail`, ni texte : on rend la charge utile
+        entière. Un diagnostic illisible vaut mieux qu'un message vide."""
+        st = ChatSseToAnthropicState(model="m", message_id="msg_f1i")
+        ev = _events([self._err({"code": "mystery_failure", "upstream_trace": "abc-123"})], st)
+        message = _data(ev, "error")[0]["error"]["message"]
+        assert "mystery_failure" in message and "abc-123" in message
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            '{"error": null}',
+            '{"error": ""}',
+            '{"error": []}',
+            '{"error": {}}',
+            '{"error": 0}',
+            '{"error": false}',
+        ],
+    )
+    def test_error_vide_ou_nul_ne_declenche_pas_derreur(self, raw):
+        """Un `error` vide/nul n'est PAS une panne : le flux continue normalement.
+
+        Sans ce garde, une passerelle posant `error: null` sur chaque chunk
+        transformerait chaque token en `event: error`.
+        """
+        st = ChatSseToAnthropicState(model="m", message_id="msg_f1j")
+        ev = _events([f"data: {raw}", _chunk({"content": "ok"}, finish_reason="stop"), "data: [DONE]"], st)
+        assert "error" not in _names(ev)
+        assert _data(ev, "message_delta")[0]["delta"]["stop_reason"] == "end_turn"
+        assert st.finished is True
+
+    def test_error_non_dict_non_vide_est_quand_meme_relaye(self):
+        """`error: 503` (un statut nu) porte une information : on la relaie."""
+        st = ChatSseToAnthropicState(model="m", message_id="msg_f1k")
+        ev = _events([self._err(503)], st)
+        payload = _data(ev, "error")[0]
+        assert payload["error"]["type"] == "overloaded_error"
+        assert payload["error"]["message"] == "503"
+
+
+class TestF1ClassificationDuType:
+    """Le type rendu doit appartenir au vocabulaire Anthropic — c'est ce qui
+    permet à Claude Code de décider retry/backoff au lieu d'abandonner."""
+
+    @pytest.mark.parametrize(
+        "payload,attendu",
+        [
+            ({"message": "slow down", "type": "rate_limit_exceeded"}, "rate_limit_error"),
+            ({"message": "quota épuisé", "type": "insufficient_quota"}, "rate_limit_error"),
+            ({"message": "x", "type": "rate_limit"}, "rate_limit_error"),
+            ({"message": "overloaded", "type": "server_error"}, "overloaded_error"),
+            ({"message": "x", "type": "internal_error"}, "overloaded_error"),
+            ({"message": "temporarily unavailable", "type": "whatever"}, "overloaded_error"),
+            ({"message": "prompt too long", "type": "context_length_exceeded"}, "invalid_request_error"),
+            ({"message": "bad tool schema", "type": "invalid_request_error"}, "invalid_request_error"),
+            ({"message": "no such model", "type": "model_not_found"}, "not_found_error"),
+            ({"message": "key invalid", "type": "authentication_error"}, "authentication_error"),
+            ({"message": "nope", "type": "permission_error"}, "permission_error"),
+            ({"message": "inconnu au bataillon", "type": "some_new_gateway_type"}, "api_error"),
+        ],
+    )
+    def test_type_amont_rapproche_du_vocabulaire_anthropic(self, payload, attendu):
+        st = ChatSseToAnthropicState(model="m", message_id="msg_f1t")
+        ev = _events([_data_line({"error": payload})], st)
+        assert _data(ev, "error")[0]["error"]["type"] == attendu
+
+    @pytest.mark.parametrize(
+        "status,attendu",
+        [
+            (429, "rate_limit_error"),
+            (529, "overloaded_error"),
+            (503, "overloaded_error"),
+            (500, "overloaded_error"),
+            (400, "invalid_request_error"),
+            (401, "authentication_error"),
+            (403, "permission_error"),
+            (404, "not_found_error"),
+            (413, "request_too_large"),
+            ("429", "rate_limit_error"),
+            (418, "api_error"),
+            (None, "api_error"),
+            (True, "api_error"),
+            (0, "api_error"),
+        ],
+    )
+    def test_statut_http_amont_classe(self, status, attendu):
+        """Même table que ``opencode.py:12127-12136`` (429 → rate_limit,
+        529 → overloaded), étendue aux autres statuts courants."""
+        st = ChatSseToAnthropicState(model="m", message_id="msg_f1s")
+        payload = {"message": "panne", "status": status}
+        if status is None:
+            del payload["status"]
+        ev = _events([_data_line({"error": payload})], st)
+        assert _data(ev, "error")[0]["error"]["type"] == attendu
+
+    def test_type_amont_bat_le_statut(self):
+        """`type` est un champ dédié, `status` peut être un codage de
+        passerelle : en cas de désaccord, le champ dédié gagne."""
+        st = ChatSseToAnthropicState(model="m", message_id="msg_f1u")
+        ev = _events([_data_line({"error": {"message": "m", "type": "rate_limit_exceeded", "status": 500}})], st)
+        assert _data(ev, "error")[0]["error"]["type"] == "rate_limit_error"
+
+    def test_statut_bat_le_libre_du_message(self):
+        """À type absent, le statut est lu avant le message : « 500 tokens
+        written » ne doit PAS devenir une surcharge."""
+        st = ChatSseToAnthropicState(model="m", message_id="msg_f1v")
+        ev = _events(
+            [_data_line({"error": {"message": "failed after 500 tokens written", "status_code": "429"}})],
+            st,
+        )
+        assert _data(ev, "error")[0]["error"]["type"] == "rate_limit_error"
+
+    def test_message_sans_indice_replie_sur_api_error(self):
+        st = ChatSseToAnthropicState(model="m", message_id="msg_f1w")
+        ev = _events([_data_line({"error": {"message": "yolo"}})], st)
+        assert _data(ev, "error")[0]["error"]["type"] == "api_error"
+
+
+class TestF1FormeDuWire:
+    """La forme doit être EXACTEMENT celle d'Anthropic / de
+    ``core/errors.py:74`` — un client qui ne reconnaît pas l'enveloppe
+    ignore l'erreur et rend la main sur un tour tronqué."""
+
+    def test_enveloppe_exacte(self):
+        st = ChatSseToAnthropicState(model="m", message_id="msg_f1x")
+        ev = _events([_data_line({"error": {"message": "boom", "type": "server_error"}})], st)
+        raw = ev[0]
+        assert raw.startswith("event: error\n")
+        assert raw.endswith("\n\n")
+        body = json.loads(raw.split("\n")[1].removeprefix("data: "))
+        assert set(body) == {"type", "error"}
+        assert body["type"] == "error"
+        assert set(body["error"]) == {"type", "message"}
+
+    def test_json_non_ascii_preserve(self):
+        """Accents et emoji ne doivent pas être échappés en ``\\uXXXX``."""
+        st = ChatSseToAnthropicState(model="m", message_id="msg_f1y")
+        ev = _events([_data_line({"error": {"message": "clé invalide 🔑", "type": "auth"}})], st)
+        assert "clé invalide 🔑" in ev[0]
+
+    def test_pas_doublon_avec_le_relais_event_error_nu(self):
+        """Contrat avec ``opencode.py:12181`` : un ``event: error`` nu de
+        l'amont est déjà relayé tel quel (et coupe la conversion). Le
+        convertisseur, lui, ne voit QUE des lignes ``data:`` — donc jamais
+        de doublon. Vérifié ici : une ligne ``event: error`` n'est pas une
+        ligne de donnée et ne produit rien.
+        """
+        st = ChatSseToAnthropicState(model="m", message_id="msg_f1z")
+        ev = _events(["event: error"], st) + st.finalize_events()
+        assert "error" not in _names(ev)
+        assert st.finished is True
+
+    def test_ligne_sans_cle_error_ne_declenche_rien(self):
+        """Le miroir de F1 : un chunk Chat normal, sans ``error`` de premier
+        niveau, ne doit JAMAIS produire d'``event: error``. C'est lui qui
+        garantit l'absence de doublon sur le relais de ``opencode.py:12181``.
+        """
+        st = ChatSseToAnthropicState(model="m", message_id="msg_f1z2")
+        ev = _events([_chunk({"content": "bonjour"})], st) + st.finalize_events()
+        assert "error" not in _names(ev)
+        assert st.finished is True
+
+    def test_enveloppe_anthropic_est_relayee_telle_quelle(self):
+        """Une passerelle qui formate déjà en Anthropic
+        (``data: {"type":"error","error":{…}}``) sans ``event: error`` atteint
+        quand même F1 (clé ``error`` de premier niveau). On relaie l'enveloppe
+        telle quelle — reclasser perdrait ``param``/``request_id`` et
+        afficherait au client une erreur qui n'est pas la sienne.
+        """
+        inner = {"type": "invalid_request_error", "message": "max_tokens trop grand", "param": "max_tokens"}
+        st = ChatSseToAnthropicState(model="m", message_id="msg_f1z3")
+        ev = _events([_data_line({"type": "error", "error": inner})], st)
+        assert _names(ev).count("error") == 1
+        payload = _data(ev, "error")
+        assert len(payload) == 1
+        assert payload[0]["error"] == inner
+
+    def test_erreur_tardive_apres_finalize_ne_reecrit_pas(self):
+        """F1 émet sa propre queue de finalize ; un chunk d'erreur qui
+        arrive après ``message_stop`` ne doit rien ajouter (fin de flux
+        déjà actée côté client).
+        """
+        st = ChatSseToAnthropicState(model="m", message_id="msg_f1z4")
+        first = _events([_data_line({"error": {"message": "boom", "type": "api_error"}})], st)
+        assert "message_stop" in _names(first)
+        assert _events([_data_line({"error": {"message": "boom2", "type": "api_error"}})], st) == []
+        assert st.finished is True
+

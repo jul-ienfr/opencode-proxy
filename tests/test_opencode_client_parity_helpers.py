@@ -275,18 +275,48 @@ def test_apply_effort_adds_display_and_binding():
     assert res3["thinking"]["display"] == "summarized"
 
 
+def _beta_tokens(h: dict) -> set:
+    """Tokens exacts de ``anthropic-beta`` (pas de substring).
+
+    [C2] Le test ne peut PAS se contenter de ``in h["anthropic-beta"]`` :
+    ``"thinking-binding-controls" in "thinking-binding-controls-2026-08-01"``
+    est vrai, donc une assertion substring ne distinguerait plus la forme nue
+    (celle qu'on avait) de la forme datée (celle du client officiel).
+    """
+    return {t.strip() for t in str(h.get("anthropic-beta", "")).split(",") if t.strip()}
+
+
 def test_beta_binding_controls_only_with_block_binding():
     oc._current_client_anthropic_betas.set({})
     try:
         h = oc._ensure_anthropic_beta({"x-api-key": "k"})
-        assert "thinking-binding-controls" not in h["anthropic-beta"]
+        assert "thinking-binding-controls" not in _beta_tokens(h)
+        assert "thinking-binding-controls-2026-08-01" not in _beta_tokens(h)
         h2 = oc._ensure_anthropic_beta(
             {"x-api-key": "k"}, {"thinking": {"type": "adaptive", "blockBinding": {"prefixMismatchBehavior": "drop_block"}}}
         )
-        assert "thinking-binding-controls" in h2["anthropic-beta"]
-        assert "interleaved-thinking-2025-05-14" in h2["anthropic-beta"]
+        # [C2] la forme émise est la forme DATÉE du client officiel, pas la nue.
+        assert "thinking-binding-controls-2026-08-01" in _beta_tokens(h2)
+        assert "thinking-binding-controls" not in _beta_tokens(h2)
+        assert "interleaved-thinking-2025-05-14" in _beta_tokens(h2)
         # idempotent : pas de doublon
         h3 = oc._ensure_anthropic_beta(h2, {"thinking": {"type": "adaptive", "blockBinding": {}}})
         assert h3["anthropic-beta"].count("thinking-binding-controls") == 1
+        assert _beta_tokens(h3) == _beta_tokens(h2)
+    finally:
+        oc._current_client_anthropic_betas.set({})
+
+
+def test_beta_binding_controls_union_keeps_a_client_supplied_bare_form():
+    """Un harness qui réclame la forme nue la conserve en plus de la datée :
+    l'union de `_ensure_anthropic_beta` est le filet, pas la constante."""
+    oc._current_client_anthropic_betas.set({"anthropic-beta": "thinking-binding-controls"})
+    try:
+        h = oc._ensure_anthropic_beta(
+            {"x-api-key": "k"}, {"thinking": {"type": "adaptive", "blockBinding": {}}}
+        )
+        toks = _beta_tokens(h)
+        assert "thinking-binding-controls" in toks  # réclamée par le client
+        assert "thinking-binding-controls-2026-08-01" in toks  # requise par le champ
     finally:
         oc._current_client_anthropic_betas.set({})

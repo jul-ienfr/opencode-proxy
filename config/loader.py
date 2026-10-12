@@ -87,13 +87,17 @@ def resolved_station_count(cfg: dict) -> int:
 # (B) Stations free: enabled bool, routing round-robin|failover,
 #     mode load-balance|hedge, hedge_delay_ms 0-2000, hedge_max_attempts 1-3
 # Defaults conservateurs OFF (pas de parallélisation sans action GUI).
-# P1 melodic-pearl: hedge 300→150ms / 1→2 pour N=10 (cap burst 3)
+# [P0-3] hedge stagger 400 ms / max 1 (primaire + 1 seul hedge) : un stagger
+# court x6 stations multiplie les 429 amont et peut auto-déclencher l'event
+# amont (3×429/60s → gel 180s). load-balance (least-loaded) par défaut :
+# le compteur strict change de station à chaque requête et réveille tout
+# le pool pour rien.
 _FREE_PARALLEL_DEFAULTS = {
     "enabled": False,
     "routing": "round-robin",
     "mode": "load-balance",
-    "hedge_delay_ms": 150,
-    "hedge_max_attempts": 2,
+    "hedge_delay_ms": 400,
+    "hedge_max_attempts": 1,
 }
 
 
@@ -115,7 +119,7 @@ def _normalize_free_parallel(raw) -> dict:
     try:
         delay = int(raw.get("hedge_delay_ms", _FREE_PARALLEL_DEFAULTS["hedge_delay_ms"]))
     except Exception:
-        delay = 300
+        delay = _FREE_PARALLEL_DEFAULTS["hedge_delay_ms"]
     delay = max(0, min(2000, delay))
     try:
         max_att = int(raw.get("hedge_max_attempts", _FREE_PARALLEL_DEFAULTS["hedge_max_attempts"]))

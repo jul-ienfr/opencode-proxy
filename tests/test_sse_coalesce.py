@@ -93,4 +93,4 @@ class TestCoalesce:
         out = await _consume(oc._sse_keepalive(oc._sse_coalesce(gen()), interval=0.04))
         assert out[0] == b"ab", f"burst groupé attendu, got {out!r}"
         assert out[-1] == b"c"
-        assert b": ping\n\n" in out
+        assert any(c.startswith(b"event: ping") for c in out)

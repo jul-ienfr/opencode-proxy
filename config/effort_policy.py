@@ -28,9 +28,10 @@ Politique de sortie : le niveau est **reconnu nommément** (``minimal``
 compris — A2) puis **plafonné par modèle** via ``config.effort_caps``. Aucun
 repli « famille de modèle » codé en dur : le plafond est de la config.
 
-Contrainte de boot (plan §7.4) : **aucun import lourd**. Ce module n'importe
-que ``config.effort_caps`` (lui-même réduit à ``yaml_get``) et la stdlib —
-jamais httpx/rich/tiktoken/click.
+Contrainte de boot (plan §7.4) : **aucun import lourd**. Ce module n'accède
+à ``config.effort_caps`` et ``config.reasoning_options`` (tous deux réduits à
+``yaml_get``) que par import paresseux, et au reste de la stdlib — jamais
+httpx/rich/tiktoken/click.
 """
 
 from __future__ import annotations
@@ -222,6 +223,30 @@ def clamp_level(level: str | None, model: str) -> str | None:
         return level
 
 
+def _allow_list_clamp(level: str | None, model: str) -> str | None:
+    """Ramène ``level`` dans l'allow-list officielle du modèle — si armée.
+
+    [C1] Dernière étape, **après** ``clamp_level`` : l'allow-list est la
+    déclaration de ce que l'amont accepte, elle gagne quand les deux
+    parlent (un modèle cataloguant ``max`` seul ne doit pas repartir avec
+    notre plafond local ``high``, qui serait hors liste).
+
+    Import paresseux + flag : à ``allow_list_enabled: false`` (défaut), la
+    fonction rend son argument **inchangé** — comportement d'origine bit
+    pour bit, y compris si la table est déjà peuplée.
+    """
+    if level is None:
+        return None
+    try:
+        from config.reasoning_options import clamp_effort_to_allow_list
+    except ImportError:  # pragma: no cover
+        return level
+    try:
+        return clamp_effort_to_allow_list(level, model)
+    except Exception:  # pragma: no cover — config cassée : jamais de 500
+        return level
+
+
 def resolve_effort(
     fields: dict,
     model: str,
@@ -245,6 +270,9 @@ def resolve_effort(
         # « Le maximum du modèle » : décision différée au modèle cible. Le
         # plafond est le bon niveau par construction — inutile de clamper.
         cap = max_level_for_model(model) or DEFAULT_LEVEL
+        # [C1] ...sauf si l'allow-list du modèle est plus étroite que ce
+        # plafond : « le maximum qu'il sait faire » doit rester dedans.
+        cap = _allow_list_clamp(cap, model) or cap
         return EffortDecision(wants=True, level=cap, source=source, explicit=explicit)
 
     if level is None and not explicit and default_when_unspecified:
@@ -257,5 +285,9 @@ def resolve_effort(
     clamped = clamp_level(level, model)
     if clamped is None:
         # Le plafond du modèle désactive le raisonnement.
+        return EffortDecision(wants=False, level=None, source=source, explicit=explicit)
+    # [C1] Dernier mot à l'allow-list officielle, si elle est armée.
+    clamped = _allow_list_clamp(clamped, model)
+    if clamped is None:
         return EffortDecision(wants=False, level=None, source=source, explicit=explicit)
     return EffortDecision(wants=True, level=clamped, source=source, explicit=explicit)

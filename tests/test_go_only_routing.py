@@ -105,13 +105,17 @@ def test_live_models_muse_spark_13_geo():
 
 
 def test_web_search_native_parity_13():
+    # PLAN N2 recâblé le 2026-10-12 : `muse-spark-1.2-contributor-free`
+    # (deprecated côté anonyme) est retiré de `web_search_native` —
+    # `muse-spark-1.3-contributor-free` la remplace. La variante payante
+    # `muse-spark-1.2-contributor` reste (routée côté payé, pas concernée).
     for mid in (
         "muse-spark-1.2-contributor",
-        "muse-spark-1.2-contributor-free",
         "muse-spark-1.3-contributor",
         "muse-spark-1.3-contributor-free",
     ):
         assert mid in st.WEB_SEARCH_NATIVE_MODELS
+    assert "muse-spark-1.2-contributor-free" not in st.WEB_SEARCH_NATIVE_MODELS
 
 
 # ── Exclusion découverte auto (go_only_ids, mécanique générique) ───

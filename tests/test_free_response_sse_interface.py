@@ -997,4 +997,14 @@ def test_route_responses_still_500s_without_sse_interface(monkeypatch):
 
     status, _ctype, raw = _post_responses(monkeypatch, _NoSseInterface())
     assert status == 500
-    assert "Erreur interne du serveur" in raw
+    # L'invariant n'est pas le libellé du message (debug_exception façonne
+    # l'enveloppe selon le protocole de la route — anglais + type/code côté
+    # OpenAI, cf. core/errors.openai_error) mais la FORME de l'erreur : un
+    # 500 annoncé, structuré, et surtout sans traceback qui fuit dans la
+    # réponse. Le message français historique n'est plus une garantie.
+    body = json.loads(raw)
+    err = body["error"]
+    assert err["type"] == "invalid_request_error"
+    assert err["code"] == "500"
+    assert isinstance(err["message"], str) and err["message"]
+    assert "Traceback" not in raw and "File \"" not in raw, "traceback exposé au client"

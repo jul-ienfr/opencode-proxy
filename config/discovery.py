@@ -44,6 +44,23 @@ def _noop_log(*args, **kwargs) -> None:
     return None
 
 
+def _normalize_ids(raw) -> set:
+    """Normalise une liste d'ids de config (minuscules, strip, sans doublon).
+
+    `isinstance(x, str)` et non `str(x)` : une entrée YAML `null` ou `42`
+    deviendrait sinon le tombiveau "none"/"42", et un id réel collant à ces
+    chaînes disparaîtrait du catalogue. Une clé absente/mal typée donne `set()`.
+
+    Une chaîne nue n'est PAS une liste d'ids : l'itérer produirait un caractère
+    par « id » (chacun devenant un tombiveau d'une lettre, susceptible de
+    couvrir un id réel). Un scalaire non plus (`42` → TypeError). Les deux
+    retombent donc sur `set()`, comme une clé absente.
+    """
+    if not raw or not isinstance(raw, (list, tuple, set, frozenset)):
+        return set()
+    return {x.strip().lower() for x in raw if isinstance(x, str) and x.strip()}
+
+
 def fetch_upstream_models(
     models: dict,
     api_base_openai: str,
@@ -52,13 +69,33 @@ def fetch_upstream_models(
     cache_clear_fn: Callable[[], None],
     timeout: float = 3.0,
     log=logger,
+    purged_ids_fn: Callable[[], set] | None = None,
 ) -> int:
     """Fetch available models from upstream API and add them to MODELS.
 
     Timeout réduit à 3s (vs 10s avant) pour ne pas bloquer le démarrage.
     Appelé en arrière-plan, jamais bloquant pour le 1er chargement GUI.
+
+    `purged_ids_fn` : résolution TARDIVE des tombeaux de purge, comme
+    `cache_clear_fn` — `PURGED_IDS` n'existe pas encore quand l'hôte lance le
+    thread (il est défini plus bas dans `config/settings.py`). C'est la 3e voie
+    d'ajout automatique du catalogue (après `apply_discovered_free_models` et
+    `persist_free_mappings`) : sans ce filtre, un id mort annoncé par l'upstream
+    rentre dans `MODELS` 0,5 s après l'import et redevient routable — la purge
+    manuelle de `models:` ne tenait alors que jusqu'au prochain démarrage.
     """
     try:
+        purged = _normalize_ids(purged_ids_fn() if purged_ids_fn else ())
+        if purged:
+            # Process démarré avant la purge (ou id ré-annoncé) : sortie de
+            # `MODELS`, sinon `get_model_config` résout encore l'id mort.
+            for _mid in sorted(purged & set(models)):
+                models.pop(_mid, None)
+                log.info(
+                    "[config] purged id %s dropped from MODELS (retiré à la main, "
+                    "la découverte auto ne doit pas le ressusciter)",
+                    _mid,
+                )
         url = f"{api_base_openai.rsplit('/chat/completions', 1)[0]}/models"
         # --max-time 3s + connect 2s : échec rapide si upstream lent
         result = subprocess.run(
@@ -76,6 +113,12 @@ def fetch_upstream_models(
         for m in data_models:
             model_id = m.get("id", "")
             if model_id and model_id not in models:
+                if model_id in purged:
+                    log.info(
+                        "[config] purged id %s kept out of MODELS (retiré à la main)",
+                        model_id,
+                    )
+                    continue
                 proto = resolve_protocol_fn(model_id)
                 endpoint = api_base_openai if proto == "openai" else api_base_anthropic
                 models[model_id] = {"endpoint": endpoint, "protocol": proto}
@@ -102,8 +145,13 @@ def start_background_fetch(
     resolve_protocol_fn: Callable[[str], str],
     cache_clear_fn: Callable[[], None],
     log=logger,
+    purged_ids_fn: Callable[[], set] | None = None,
 ) -> None:
     """Lancement non-bloquant en arrière-plan (daemon thread) — ne retarde pas l'import.
+
+    `purged_ids_fn` est transmis tel quel à `fetch_upstream_models` (tombeaux de
+    purge, résolution tardive — voir sa docstring) : sans lui, la 3e voie d'ajout
+    automatique ré-annonce les ids morts à chaque démarrage.
 
     [Phase 1] Point d'ancrage EXPLICITE pour le lifespan Phase 9
     (``app/composition.py``) : l'hôte l'appelle aujourd'hui au même point
@@ -116,7 +164,14 @@ def start_background_fetch(
         try:
             time.sleep(0.5)
             fetch_upstream_models(
-                models, api_base_openai, api_base_anthropic, resolve_protocol_fn, cache_clear_fn, timeout=3.0, log=log
+                models,
+                api_base_openai,
+                api_base_anthropic,
+                resolve_protocol_fn,
+                cache_clear_fn,
+                timeout=3.0,
+                log=log,
+                purged_ids_fn=purged_ids_fn,
             )
         except Exception:
             pass
@@ -353,6 +408,7 @@ def apply_discovered_free_models(
     cache_clear_fn: Callable[[], None],
     lock=None,
     log=logger,
+    purged_ids: set | frozenset = frozenset(),
 ) -> tuple[int, list | None]:
     """Apply discovered free_ids to MODELS/FREE_MODEL_MAP/FREE_MODEL_POOL.
 
@@ -368,6 +424,15 @@ def apply_discovered_free_models(
     """
     if not isinstance(free_ids, set):
         free_ids = set(free_ids)
+    purged = _normalize_ids(purged_ids)
+    if purged:
+        _purged_hits = free_ids & purged
+        if _purged_hits:
+            log.info(
+                "[free-discovery] purged ids kept out of the anonymous pool: %s",
+                ", ".join(sorted(_purged_hits)),
+            )
+        free_ids -= purged
     if go_only_ids:
         _go_only_hits = {f for f in free_ids if str(f).lower() in go_only_ids}
         if _go_only_hits:
@@ -376,6 +441,17 @@ def apply_discovered_free_models(
                 ", ".join(sorted(_go_only_hits)),
             )
             free_ids -= _go_only_hits
+    if purged:
+        # Un process démarré avant la purge a déjà ré-ajouté l'id en mémoire :
+        # sans ce retrait, le persist add-only le réécrirait sur le disque.
+        for _mid in sorted(purged & set(models)):
+            models.pop(_mid, None)
+            log.info(
+                "[free-discovery] purged id %s dropped from models: (retiré à la main, "
+                "la découverte auto ne doit pas le ressusciter)",
+                _mid,
+            )
+        free_models -= purged
     if free_ids == free_models:
         for _fid in sorted(free_ids):
             if "muse" in _fid.lower() or "spark" in _fid.lower():
@@ -470,10 +546,12 @@ def persist_free_mappings(
     yaml_data: dict,
     save_yaml_fn: Callable[[], None],
     log=logger,
+    purged_ids: set | frozenset = frozenset(),
 ) -> None:
     """Merge add-only free mappings into config.yaml (atomic tmp+fsync+replace under lock)."""
     if not auto_persist:
         return
+    purged = _normalize_ids(purged_ids)
     try:
         # Ensure sections exist
         if "free_model_map" not in yaml_data or not isinstance(
@@ -486,8 +564,19 @@ def persist_free_mappings(
         for k, v in free_model_map.items():
             if k not in yaml_data["free_model_map"]:
                 yaml_data["free_model_map"][k] = v
+        # Purge tombstonée : un id retiré à la main de `models:` ne doit jamais
+        # revenir par le persist add-only (le process vivant peut encore le
+        # porter en mémoire — voir apply_discovered_free_models).
+        for _mid in sorted(purged & set(yaml_data["models"])):
+            yaml_data["models"].pop(_mid, None)
+            log.info(
+                "[free-discovery] purged id %s dropped from config models: (retiré à la main)",
+                _mid,
+            )
         # Merge MODELS add-only (only free ids or newly discovered)
         for mid, cfg in models.items():
+            if mid in purged:
+                continue
             if mid not in yaml_data["models"]:
                 # Persist minimal protocol hint
                 proto = cfg.get("protocol", "openai")

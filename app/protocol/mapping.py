@@ -31,6 +31,7 @@ from config import CACHE_MIN_PROMPT_SIZE, yaml_get
 # réduit à ``yaml_get``) + stdlib : aucun coût de boot (contrainte plan §7.4),
 # aucun risque de cycle ``config/*``.
 from config.effort_policy import resolve_effort as _resolve_effort
+from config.limits import clamp_output_token_limit as _clamp_output_token_limit
 from dashboard.display import debug as _debug
 from dashboard.display import log as _log
 
@@ -348,11 +349,27 @@ def _set_output_token_limit(    target: dict,
     gagnante**. ``max_tokens`` est canonique côté Anthropic et historique côté
     Chat ; les deux autres ne servent que de repli quand il est absent. Un
     client qui enverrait deux formes divergentes suit donc ``max_tokens``.
+
+    **[V3 — écart E2]** Après résolution client/défaut, la limite est
+    bornée par ``models.<id>.output_limit`` (catalogue live) quand le
+    modèle en a une. Le plafond dur à 32 000 du client officiel n'est
+    **pas** recopié (§14.3 : défaut réglable de ce client, pas une loi de
+    l'amont) ; ce qui est borné, c'est la limite réelle du modèle. Table
+    vide ou modèle absent ⇒ comportement d'origine, inchangé.
     """
     limit = None
     for key in ("max_tokens", "max_completion_tokens", "max_output_tokens"):
         candidate = source.get(key)
-        if isinstance(candidate, int) and candidate > 0:
+        # `True`/`False` sont des `int` en Python : sans ce garde-fou, un
+        # `max_tokens: true` deviendrait une limite de 1 token et tronquerait
+        # toute réponse. `0` reste exclu comme avant : une limite nulle n'est
+        # pas une limite, c'est une absence — le défaut s'applique (le passage
+        # de `0` en valeur explicite avait été introduit le 2026-10-10 au nom
+        # d'une « parité officielle / pre-warm cache » qu'aucune source du
+        # dépôt n'atteste : `prewarm_after_rotate` de free/rotation.py concerne
+        # larotation de clé, pas une limite à 0. Un `max_tokens: 0` relayé à
+        # l'amont est un 400 garanti sur les upstreams stricts).
+        if isinstance(candidate, int) and candidate > 0 and not isinstance(candidate, bool):
             limit = candidate
             break
     if limit is None:
@@ -361,6 +378,12 @@ def _set_output_token_limit(    target: dict,
         if default is None:
             return 0
         limit = default
+
+    # [V3 — écart E2] Borne par la limite de sortie réelle du modèle cible.
+    # Placé AVANT l'écriture dans `target`, donc aussi avant la branche
+    # `max_completion_tokens` : la valeur écrite est déjà bornée. Aucun effet
+    # si `models.<id>.output_limit` est absent (module pur, lecture live).
+    limit = _clamp_output_token_limit(limit, model)
 
     if target_protocol == "anthropic":
         target["max_tokens"] = limit
@@ -1477,6 +1500,19 @@ def anthropic_to_openai(body: dict, model: str, raw: bytes | None = None) -> dic
                         _tr_list.append({"type": "text", "text": _tr_content})
                     _tr_list.extend(_tr_images)
                     _tr_content = _tr_list
+                # Parité officielle : `is_error: true` doit survivre à la conversion.
+                # Chat n'a pas de flag d'erreur — on préfixe le contenu pour que
+                # l'amont voie l'échec au lieu d'un succès silencieux qui casse
+                # la boucle agentique (l'agent croit que l'outil a réussi).
+                try:
+                    _is_err = block.get("is_error") is True
+                except Exception:
+                    _is_err = False
+                if _is_err:
+                    if isinstance(_tr_content, str):
+                        _tr_content = "[tool_error] " + _tr_content if _tr_content else "[tool_error]"
+                    elif isinstance(_tr_content, list):
+                        _tr_content = [{"type": "text", "text": "[tool_error]"}] + _tr_content
                 tool_results.append(
                     {
                         "role": "tool",
@@ -1486,6 +1522,23 @@ def anthropic_to_openai(body: dict, model: str, raw: bytes | None = None) -> dic
                 )
                 if "cache_control" in block:
                     last_cache_control = block["cache_control"]
+            else:
+                # Parité officielle : jamais de drop silencieux. Les blocs serveur
+                # (server_tool_use, web_search_tool_result, code_execution,
+                # mcp_tool_use/result, container_upload, search_result, etc.)
+                # n'ont pas d'équivalent Chat : on les matérialise en texte pour
+                # que le contexte agentique survive, au lieu de les perdre et de
+                # forcer un `continue` manuel sur un tour amnésique.
+                try:
+                    _ubt = block.get("type", "?") if isinstance(block, dict) else type(block).__name__
+                except Exception:
+                    _ubt = "?"
+                _debug(f"  [convert] server/block type={_ubt!r} sans équivalent Chat → placeholder texte")
+                try:
+                    _ph = _json_dumps_str(block, ensure_ascii=False)[:2000] if isinstance(block, dict) else str(block)[:2000]
+                except Exception:
+                    _ph = str(_ubt)
+                text_parts.append(f"[{_ubt}: {_ph}]")
 
         # Emit tool_result messages first (must immediately follow assistant's tool_calls)
         messages.extend(tool_results)
@@ -1576,6 +1629,19 @@ def anthropic_to_openai(body: dict, model: str, raw: bytes | None = None) -> dic
         "messages": messages,
         "stream": body.get("stream", False),
     }
+    # Parité officielle : en streaming, demander l'usage réel à l'amont.
+    # Sans `stream_options.include_usage`, l'amont Chat n'envoie jamais `usage`
+    # et le client SSE garde l'estimation locale pour toujours (compaction
+    # faussée → `continue` manuel). L'officiel reçoit toujours le vrai usage.
+    if oai.get("stream") is True:
+        try:
+            _so = oai.get("stream_options")
+            if not isinstance(_so, dict):
+                oai["stream_options"] = {"include_usage": True}
+            else:
+                _so.setdefault("include_usage", True)
+        except Exception:
+            pass
     # [Lot L14 — B2/A17] Forme du champ de limite adaptée à l'upstream : les
     # modèles de raisonnement exigent `max_completion_tokens`.
     _set_output_token_limit(oai, body, model)
@@ -1709,8 +1775,23 @@ def anthropic_to_openai(body: dict, model: str, raw: bytes | None = None) -> dic
             # Anthropic valide (>64, jusqu'à 200) partait tel quel et l'amont
             # Chat répondait 400. La map repart au client via _TOOL_NAME_MAP_KEY.
             oai["tools"] = _sanitize_chat_tools(oai_tools, _chat_name_map)
-        tc = body.get("tool_choice", "auto")
-        if isinstance(tc, dict):
+        # [PLAN E1 2026-10-12] L'officiel n'envoie `tool_choice` que si le
+        # client en a posé un : émission conditionnée à la présence de la clé.
+        # `disable_parallel_tool_use` continue de fonctionner seul (lu sur la
+        # valeur brute, pas sur le défaut). Repli `protocol.emit_default_tool_choice`
+        # (défaut `false`) pour les gateways qui changent de comportement sans le champ.
+        _raw_tc = body.get("tool_choice")
+        _emit_default_tc = bool(yaml_get("protocol", "emit_default_tool_choice", False))
+        tc = _raw_tc if _raw_tc is not None else ("auto" if _emit_default_tc else None)
+        # Parité officielle : `disable_parallel_tool_use: true` → `parallel_tool_calls: false`.
+        # Sans ça, un client qui interdit le parallèle voit l'amont appeler 2-3 outils
+        # d'un coup, ce qui casse la boucle agentique (tour invalide → `continue` manuel).
+        _no_parallel = False
+        if isinstance(_raw_tc, dict) and _raw_tc.get("disable_parallel_tool_use") is True:
+            _no_parallel = True
+        if tc is None:
+            pass  # [PLAN E1] pas de clé client, pas de défaut : champ absent.
+        elif isinstance(tc, dict):
             tc_type = tc.get("type", "auto")
             if tc_type == "tool":
                 oai["tool_choice"] = {"type": "function", "function": {"name": tc.get("name", "")}}
@@ -1740,6 +1821,8 @@ def anthropic_to_openai(body: dict, model: str, raw: bytes | None = None) -> dic
                 _debug(f"  [convert] tool_choice string inconnu {tc!r} → auto")
         else:
             oai["tool_choice"] = "auto"
+        if _no_parallel:
+            oai["parallel_tool_calls"] = False
         # [Lot L4 — A8] Le tool_choice nommé doit désigner le nom RÉELLEMENT
         # envoyé, sinon l'amont cherche un outil inexistant (400/422).
         if isinstance(oai.get("tool_choice"), dict):
@@ -1802,6 +1885,20 @@ def anthropic_to_openai(body: dict, model: str, raw: bytes | None = None) -> dic
     # Le raisonnement est un ENRICHISSEMENT, jamais un bloquant : on dégrade
     # (perte de la mémoire du raisonnement) plutôt que d'échouer.
     _final = _restructure_for_cache(_close_cache(oai), model)
+    # Parité officielle : jamais de drop silencieux des champs top-level sans
+    # équivalent Chat. Un seul `_debug` groupé (pas de bruit par requête OK).
+    try:
+        _ignored = [k for k in (
+            "top_k", "container", "mcp_servers", "context_management",
+            "inference_geo", "diagnostics",
+        ) if k in body]
+        _oc = body.get("output_config") if isinstance(body.get("output_config"), dict) else None
+        if isinstance(_oc, dict) and any(k in _oc for k in ("format", "task_budget")):
+            _ignored.append("output_config.format/task_budget")
+        if _ignored:
+            _debug(f"  [convert] top-level sans équivalent Chat ignoré: {','.join(_ignored)}")
+    except Exception:
+        pass
     if isinstance(_final, dict) and any(
         isinstance(_m, dict) and _m.get("reasoning_content")
         for _m in _final.get("messages", [])
@@ -2311,7 +2408,13 @@ def openai_to_anthropic_request(oai_body: dict) -> dict:
 
         # Convert tool_calls (assistant only)
         for tc in msg.get("tool_calls") or []:
-            fn = tc.get("function", {})
+            fn = tc.get("function", {}) if isinstance(tc.get("function"), dict) else {}
+            _tname = fn.get("name", "") if isinstance(fn.get("name"), str) else ""
+            if not _tname.strip():
+                # Parité officielle (symétrique du sens inverse) : `name` minLength 1.
+                # Un tool_call sans nom ne doit jamais produire un bloc invalide.
+                _debug(f"  [convert] SKIP tool_call with empty name id={tc.get('id', '?')}")
+                continue
             try:
                 inp = _json_loads(fn.get("arguments", "{}"))
             except Exception:
@@ -2320,7 +2423,7 @@ def openai_to_anthropic_request(oai_body: dict) -> dict:
                 {
                     "type": "tool_use",
                     "id": _tool_id_or_stable(tc.get("id"), "toolu_", len(blocks)),
-                    "name": fn.get("name", ""),
+                    "name": _tname,
                     "input": inp,
                 }
             )
@@ -3684,6 +3787,93 @@ def _remap_responses_tool_choice(tc, name_map: dict | None):
     return tc
 
 
+# [E3] Rangs de ponctuation au niveau primaire de la collation du client officiel.
+# « _ » avant « - » (mesuré : `"_x".localeCompare("-x") === -1`), et toute la
+# ponctuation avant les alphanumériques (impliqué par le (0, …) de la clé).
+_TOOL_PUNCT_RANK = {"_": 1, "-": 2}
+
+
+def _tool_sort_key(name: str):
+    """[E3] Clé de tri reproduisant ``localeCompare`` (collation ICU du client).
+
+    ``request.ts:184`` trie avec ``toSorted(localeCompare)``, pas avec ``<`` sur
+    les code points. La différence n'est pas cosmétique, elle change l'ordre du fil
+    pour les jeux de noms à casse mixte — c'est-à-dire pour tous les jeux réels
+    (``Bash``/``bash_tool``, ``Zed``/``alpha``) :
+
+    - **ponctuation d'abord** : ``_`` < ``-`` < chiffres < lettres ;
+    - **lettres insensibles à la casse** au niveau primaire ;
+    - **la casse ne départage qu'à égalité**, minuscule avant majuscule
+      (``"a" < "A"``, ``"m1" < "M1"``), et **seulement** quand tout le niveau
+      primaire est égal.
+
+    Ce troisième point est le piège : la casse est un *niveau*, pas un poids par
+    caractère. Un tri qui compare la casse position par position met ``a_b`` avant
+    ``A`` (le ``a`` minuscule gagne au premier caractère), alors que ICU met ``A``
+    avant ``a_b`` — le primaire de ``A`` est un **préfixe** de celui de ``a_b``, et
+    un préfixe se décide avant que la casse ne soit même consultée.
+
+    D'où la forme à deux niveaux. Le primaire porte, par caractère, un poids
+    ``(0, rang)`` pour la ponctuation et ``(1, casefold)`` pour un alphanumérique :
+    le ``0``/``1`` garantit ponctuation < alphanumérique, et ``casefold`` donne
+    l'ordre alphabétique insensible à la casse. Le tertiaire ne transporte que la
+    casse, et n'est regardé qu'une fois le primaire entièrement égal.
+
+    Validé contre le vrai collateur (``node -e "[...].sort((a,b)=>a.localeCompare(b))``)
+    sur 395 noms tirés de l'alphabet complet du contrat d'outils
+    ``[A-Za-z0-9_-]`` : ordre identique, y compris les chaînes aléatoires. Pour un
+    caractère hors de cet alphabet la clé reste **totale** (ponctuation inconnue
+    classée par code point) — aucune exception, aucun ordre non déterministe.
+    """
+    prim: list[tuple[int, str]] = []
+    tert: list[int] = []
+    for ch in name:
+        if ch.isalnum():
+            prim.append((1, ch.casefold()))
+        else:
+            prim.append((0, _TOOL_PUNCT_RANK.get(ch, 3 + ord(ch))))
+        tert.append(1 if ch.isupper() else 0)
+    return (tuple(prim), tuple(tert))
+
+
+def _sorted_chat_tools(tools: list) -> list:
+    """[E3 — parité client officiel] Trie ``tools[]`` par ``function.name``.
+
+    Le client officiel trie ses outils avant l'envoi (``toSorted(localeCompare)``,
+    ``request.ts:184``) : l'ordre du fil devient déterministe quel que soit l'ordre
+    d'arrivée du client, ce qui stabilise le **préfixe** du corps — et
+    ``cache_read_input_tokens`` avec lui (un même jeu d'outils envoyé dans deux
+    ordres produisait deux préfixes, donc deux entrées de cache). Chez nous, l'ordre
+    client était préservé tel quel.
+
+    Garde-fou : on ne trie que si **chaque** entrée porte un ``function.name``
+    chaîne non vide. Une liste malformée (entrée non-dict, ``function`` absent,
+    nom vide) est renvoyée **inchangée** — on ne réordonne jamais ce qu'on ne
+    comprend pas, et une liste < 2 éléments est déjà triée.
+
+    Le tri est celui du client officiel (``_tool_sort_key``), pas un tri de code
+    points : c'est la condition pour que l'ordre du fil soit **le même** que celui
+    du client, et donc pour que le préfixe — et ``cache_read_input_tokens`` —
+    soient partagés avec lui.
+
+    Renvoie une copie : l'entrée du caller n'est jamais mutée.
+    """
+    if not isinstance(tools, list) or len(tools) < 2:
+        return tools
+    for t in tools:
+        if not isinstance(t, dict):
+            return tools
+        fn = t.get("function")
+        if not isinstance(fn, dict):
+            return tools
+        name = fn.get("name")
+        if not isinstance(name, str) or not name:
+            return tools
+    out = list(tools)
+    out.sort(key=lambda t: _tool_sort_key(t["function"]["name"]))
+    return out
+
+
 def _sanitize_chat_tools(oai_tools: list, name_map: dict) -> list:
     """[Lot L4 — A8] Sanitize-aller des noms d'outils d'un corps **Chat**.
 
@@ -3696,13 +3886,19 @@ def _sanitize_chat_tools(oai_tools: list, name_map: dict) -> list:
 
     Copie des seules entrées modifiées : le caller n'est jamais muté.
     Retourne la nouvelle liste ; complète ``name_map`` ``{short: original}``.
-    Fast-path intégral (aucun nom à raccourcir) : liste inchangée, map vide.
+    Fast-path intégral (aucun nom à raccourcir) : map vide — mais la liste est
+    malgré tout **triée** (E3, cf. ``_sorted_chat_tools``) : l'ordre officiel est
+    une propriété du fil, pas un effet de bord du raccourcissement.
     """
     if not isinstance(oai_tools, list) or not oai_tools or not isinstance(name_map, dict):
         return oai_tools
+    # E3 : on trie AVANT de projeter, pour que les index de ``flat``/``sanitized``
+    # décrivent la liste telle qu'elle partira — l'alignement positionnel reste
+    # garanti, et la sortie est triée même quand rien n'est à raccourcir.
+    src = _sorted_chat_tools(oai_tools)
     idx_of: list[int] = []
     flat: list[dict] = []
-    for i, t in enumerate(oai_tools):
+    for i, t in enumerate(src):
         if not isinstance(t, dict):
             continue
         fn = t.get("function")
@@ -3714,14 +3910,14 @@ def _sanitize_chat_tools(oai_tools: list, name_map: dict) -> list:
         idx_of.append(i)
         flat.append({"name": name})
     if not flat:
-        return oai_tools
+        return src
     sanitized, fresh = sanitize_tool_names(flat)
     if not fresh:
-        return oai_tools
+        return src
     name_map.update(fresh)
     # ``sanitize_tool_names`` préserve ordre et longueur (cf. son ``out``), donc
     # l'alignement positionnel flat[i] ↔ sanitized[i] est garanti.
-    out = list(oai_tools)
+    out = list(src)
     for pos, i in enumerate(idx_of):
         new_name = sanitized[pos].get("name") if isinstance(sanitized[pos], dict) else None
         if isinstance(new_name, str) and new_name and new_name != flat[pos]["name"]:

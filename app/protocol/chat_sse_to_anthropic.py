@@ -59,13 +59,15 @@ def anthropic_stop_reason(finish_reason: object, has_tool_use: bool = False) -> 
 
     ``has_tool_use`` sert de repli quand l'amont n'a rien signalé : c'est la
     règle de ``opencode.py:8610/8637`` (``stop_reason = "tool_use" if
-    tool_block_idx else "end_turn"``).
+    tool_block_idx else "end_turn"``). S'applique aussi aux finish inconnus
+    non-vides (ex. `refusal`) : un tour d'outil ne doit jamais rendre
+    `end_turn` et faire rater l'exécution.
     """
     if isinstance(finish_reason, str) and finish_reason:
         mapped = _STOP_REASON_MAP.get(finish_reason)
         if mapped is not None:
             return mapped
-        return "end_turn"
+        return "tool_use" if has_tool_use else "end_turn"
     return "tool_use" if has_tool_use else "end_turn"
 
 
@@ -77,6 +79,160 @@ def _sse(event: str, payload: dict) -> str:
     ``ensure_ascii=False``, double saut de ligne terminal).
     """
     return f"event: {event}\ndata: {_json_dumps_str(payload, ensure_ascii=False)}\n\n"
+
+
+# ── F1 : panne amont portée par une ligne ``data:`` ─────────────────────
+# Une passerelle Chat n'a pas toujours l'exception : le HTTP est déjà en
+# 200 et la panne arrive MILIEU de flux, sous forme de ligne
+# ``data: {"error": {"message": …, "type": …}}``, suivie ou non d'un
+# ``data: [DONE]``. ``chat.completion.chunk`` ne définit AUCUNE clé
+# ``error`` : sa présence est donc sans ambiguïté un échec amont.
+#
+# Avant ce correctif, cette ligne tombait dans le cas « pas de ``choices`` » :
+# ``first_choice`` et ``delta`` valaient ``{}`` et ``feed_chunk`` rendait
+# ``[]``. Message ET type amont étaient perdus en route. Le client ne
+# recevait, à la clôture, qu'un ``stop_reason: "error"`` nu — sans
+# ``event: error``, donc sans moyen de classer la panne (rate_limit /
+# overloaded / api_error) ni de décider d'un retry. Et dès qu'un peu de
+# texte avait déjà coulé, le tour ressemblait à une troncature banale.
+
+# Statut HTTP amont → type Anthropic. Table courte et FERMÉE : un statut
+# inconnu ne devine rien (repli ``api_error``). ``MappingProxyType`` — cette
+# table est module-level, donc en lecture seule (cf.
+# ``test_pas_detat_mutable_au_niveau_module``).
+_STATUS_ERROR_TYPES = MappingProxyType(
+    {
+        400: "invalid_request_error",
+        401: "authentication_error",
+        403: "permission_error",
+        404: "not_found_error",
+        408: "api_error",
+        413: "request_too_large",
+        422: "invalid_request_error",
+        429: "rate_limit_error",
+        500: "overloaded_error",
+        502: "overloaded_error",
+        503: "overloaded_error",
+        504: "api_error",
+        529: "overloaded_error",
+    }
+)
+
+# Libellé amont → type Anthropic. Volontairement SANS chiffre nu : « 500
+# tokens written » ne doit pas devenir une surcharge. Ordre = priorité.
+_TEXT_ERROR_TYPES = (
+    (
+        ("rate_limit", "rate limit", "ratelimit", "too many requests", "too_many_requests", "quota", "concurrency limit"),
+        "rate_limit_error",
+    ),
+    (
+        ("overload", "capacity", "unavailable", "server_error", "internal_error", "internal server", "temporarily", "try again later"),
+        "overloaded_error",
+    ),
+    (
+        ("context_length", "context length", "context window", "maximum context", "too long"),
+        "invalid_request_error",
+    ),
+    (
+        ("not_found", "does not exist", "unknown model", "model not found"),
+        "not_found_error",
+    ),
+    (
+        ("permission", "forbidden", "not allowed", "access denied"),
+        "permission_error",
+    ),
+    (
+        ("authentication", "unauthorized", "api_key", "api key", "invalid key"),
+        "authentication_error",
+    ),
+    (
+        ("invalid_request", "bad_request", "malformed", "unprocessable", "validation error"),
+        "invalid_request_error",
+    ),
+)
+
+
+def _status_error_type(status: object) -> str | None:
+    """Statut amont → type Anthropic, ou ``None`` si non concluant.
+
+    Même esprit que la table ``opencode.py:12127-12136`` (429 → rate_limit,
+    529 → overloaded) : le statut est la signature la plus fiable, on la lit
+    avant les libellés. ``bool`` est un ``int`` en Python — exclu
+    explicitement pour qu'un ``True`` ne devienne pas le statut 1.
+    """
+    if isinstance(status, bool):
+        return None
+    if isinstance(status, str):
+        digits = status.strip()
+        if not (digits.isdigit() and len(digits) == 3):
+            return None
+        status = int(digits)
+    elif isinstance(status, float):
+        if not status.is_integer():
+            return None
+    elif not isinstance(status, int):
+        return None
+    return _STATUS_ERROR_TYPES.get(int(status))
+
+
+def _text_error_type(text: object) -> str | None:
+    """Libellé amont → type Anthropic, ou ``None`` si rien ne correspond."""
+    if not isinstance(text, str) or not text.strip():
+        return None
+    low = text.lower()
+    for needles, error_type in _TEXT_ERROR_TYPES:
+        if any(n in low for n in needles):
+            return error_type
+    return None
+
+
+def _upstream_error_shape(payload: object) -> tuple[str, str]:
+    """Normalise une charge utile d'erreur amont en ``(type, message)``.
+
+    Formes vues sur les passerelles Chat :
+    ``{"error": {"message": …, "type": …, "code": …}}``,
+    ``{"error": {"message": …, "status": 429}}``, ``{"error": "texte libre"}``,
+    et parfois ``{"error": {"detail": …}}``. Tout ce qui n'est aucune de ces
+    formes est rendu tel quel dans le message : mieux vaut un diagnostic
+    illisible qu'un message vide.
+
+    Priorité de classification : ``type`` puis ``code`` (champs dédiés), puis
+    le statut HTTP, puis le message en dernier recours. Repli final :
+    ``api_error``, le défaut de ``core/errors.py:74`` — jamais un type inventé.
+    """
+    if isinstance(payload, str):
+        body = payload.strip()
+        return _text_error_type(body) or "api_error", body or "upstream stream error"
+    if not isinstance(payload, Mapping):
+        # Valeur scalaire nue — typiquement un statut (`{"error": 503}`) ou un
+        # code. Elle porte une information : on la classe et on la rend telle
+        # quelle plutôt que de la réduire à « upstream stream error ».
+        if isinstance(payload, bool) or payload is None:
+            return "api_error", "upstream stream error"
+        return _status_error_type(payload) or "api_error", str(payload)
+
+    message = payload.get("message")
+    if not isinstance(message, str) or not message.strip():
+        message = payload.get("detail")
+    if not isinstance(message, str) or not message.strip():
+        message = payload.get("error")
+    if not isinstance(message, str) or not message.strip():
+        # Rien d'exploitable : on rend la charge utile entière plutôt que de
+        # taire la panne.
+        try:
+            message = _json_dumps_str(dict(payload), ensure_ascii=False)
+        except Exception:
+            message = "upstream stream error"
+
+    error_type = (
+        _text_error_type(payload.get("type"))
+        or _text_error_type(payload.get("code"))
+        or _status_error_type(payload.get("status"))
+        or _status_error_type(payload.get("status_code"))
+        or _text_error_type(message)
+        or "api_error"
+    )
+    return error_type, message.strip()
 
 
 def _new_id() -> str:
@@ -167,6 +323,8 @@ class ChatSseToAnthropicState:
         "thinking_block_idx",
         "thinking_text",
         "tool_block_idx",
+        "pending_tool_args",
+        "pending_tool_ids",
         "open_blocks",
         "input_tokens",
         "input_tokens_estimate",
@@ -200,6 +358,10 @@ class ChatSseToAnthropicState:
         self.thinking_text: str = ""
         # index Chat du tool_call → index de bloc Anthropic.
         self.tool_block_idx: dict[int, int] = {}
+        # Fragments d'args arrivés avant le vrai nom (gateway non-strict) :
+        # bufferisés sans jamais émettre de bloc fantôme `tool_pending_*`.
+        self.pending_tool_args: dict[int, str] = {}
+        self.pending_tool_ids: dict[int, str] = {}
         # Blocs ouverts, dans l'ordre d'ouverture (ordre de clôture).
         self.open_blocks: list[int] = []
         self.input_tokens: int = 0
@@ -224,6 +386,8 @@ class ChatSseToAnthropicState:
         self.thinking_block_idx = None
         self.thinking_text = ""
         self.tool_block_idx.clear()
+        self.pending_tool_args.clear()
+        self.pending_tool_ids.clear()
         self.open_blocks.clear()
         self.input_tokens = 0
         self.cache_read_input_tokens = 0
@@ -251,6 +415,8 @@ class ChatSseToAnthropicState:
 
         Émis paresseusement au premier chunk exploitable, ou en tête de la
         séquence de clôture si rien n'est jamais arrivé (``opencode.py:8588``).
+        Parité officielle : inclut ``cache_creation_input_tokens`` (0 par défaut)
+        pour que le SDK ne considère jamais le champ comme absent.
         """
         self.started = True
         return [
@@ -270,6 +436,7 @@ class ChatSseToAnthropicState:
                             "input_tokens": self.input_tokens or self.input_tokens_estimate,
                             "output_tokens": 0,
                             "cache_read_input_tokens": self.cache_read_input_tokens,
+                            "cache_creation_input_tokens": 0,
                         },
                     },
                 },
@@ -283,6 +450,13 @@ class ChatSseToAnthropicState:
         d'ouverture), puis ``message_delta`` (stop_reason + output_tokens),
         puis ``message_stop``. Idempotent : un second appel ne ré-émet rien
         (``finished``), pour que ``data: [DONE]`` ne soit traité qu'une fois.
+
+        Parité officielle : si aucun ``finish_reason`` amont n'a été vu
+        (coupure TCP/timeout/EOF nu), on NE déguise PAS en ``end_turn``.
+        On clôt les blocs puis on émet ``stop_reason: error`` + ``message_stop``
+        (même convention que ``_terminate_after_started`` côté opencode.py),
+        pour que Claude Code retrye au lieu de rendre la main avec un tour
+        tronqué qui force un `continue` manuel.
         """
         if self.finished:
             return []
@@ -314,8 +488,11 @@ class ChatSseToAnthropicState:
                 )
             events.append(_sse("content_block_stop", {"type": "content_block_stop", "index": idx}))
 
-        # opencode.py:8633-8640 — message_delta : stop_reason puis usage.
-        stop_reason = anthropic_stop_reason(self.finish_reason, has_tool_use=bool(self.tool_block_idx))
+        # Troncation sans terminal amont → `error`, jamais `end_turn` déguisé.
+        if self.finish_reason is None:
+            stop_reason = "error"
+        else:
+            stop_reason = anthropic_stop_reason(self.finish_reason, has_tool_use=bool(self.tool_block_idx))
         events.append(
             _sse(
                 "message_delta",
@@ -332,6 +509,40 @@ class ChatSseToAnthropicState:
 
         # opencode.py:8641 — message_stop.
         events.append(_sse("message_stop", {"type": "message_stop"}))
+        return events
+
+    def _upstream_error_events(
+        self, payload: object, *, already_anthropic: bool = False
+    ) -> list[str]:
+        """F1 — séquence émise quand l'amont porte l'erreur DANS le flux.
+
+        ``event: error`` d'abord (type + message classés), puis la queue de
+        finalize habituelle. Cet ordre est le point à ne pas inverser :
+
+        - le client lit ``event: error`` et classe la panne (retry/backoff) ;
+        - un client qui l'ignore hérite quand même d'une clôture propre —
+          ``content_block_stop`` par bloc ouvert, ``message_delta`` avec
+          ``stop_reason: error``, ``message_stop`` — au lieu d'un bloc jamais
+          fermé qui lui ferait jeter tout le texte déjà reçu.
+
+        Idempotent via ``finished`` : le ``[DONE]`` qui suit parfois l'erreur
+        amont, et tout chunk tardif, ne réémettent rien.
+
+        ``already_anthropic`` — certaines passerelles envoient l'erreur déjà
+        formatée Anthropic (``data: {"type":"error","error":{…}}``) sans
+        ``event: error``. La clé ``error`` de premier niveau fait alors
+        déclencher ce même chemin. On relaie l'enveloppe TELLE QUELLE au lieu
+        de la reclasser : reclasser perdrait les clés propres à l'amont (code,
+        param, request_id…) sans rien gagner, et le client verrait une erreur
+        qui n'est pas celle qu'il a reçue.
+        """
+        if already_anthropic and isinstance(payload, Mapping):
+            frame = {"type": "error", "error": dict(payload)}
+        else:
+            error_type, message = _upstream_error_shape(payload)
+            frame = {"type": "error", "error": {"type": error_type, "message": message}}
+        events = [_sse("error", frame)]
+        events.extend(self.finalize_events())
         return events
 
     def feed_chunk(self, chunk: dict) -> list[str]:
@@ -353,6 +564,19 @@ class ChatSseToAnthropicState:
         _cached = _usage_cache_read(chunk)
         if _cached is not None:
             self.cache_read_input_tokens = _cached
+
+        # ── F1 : la panne amont passe AVANT tout le reste ──────────────
+        # Une passerelle Chat signale un échec milieu de flux par une clé
+        # ``error`` de premier niveau (le HTTP est déjà 200). Voir le bloc F1
+        # en tête de module : sans cette branche la ligne était avalée et le
+        # client n'apprenait la panne que par un ``stop_reason: error`` nu.
+        # Placé APRÈS la reprise d'usage : une passerelle qui rend son usage
+        # final à côté de l'erreur ne le perd pas.
+        _upstream_error = chunk.get("error")
+        if _upstream_error:
+            return self._upstream_error_events(
+                _upstream_error, already_anthropic=chunk.get("type") == "error"
+            )
 
         choices = chunk.get("choices")
         first_choice = choices[0] if isinstance(choices, list) and choices else {}
@@ -386,10 +610,13 @@ class ChatSseToAnthropicState:
         # opencode.py:10625-10650 — raisonnement → bloc ``thinking`` ouvert
         # paresseusement, delta ``thinking_delta`` (type relevé sur place,
         # ligne 10648 — jamais ``reasoning_delta``).
+        # Parité officielle : `content_block_start` thinking inclut toujours `signature: ""`.
         reasoning = delta.get("reasoning_content") or delta.get("reasoning")
         if isinstance(reasoning, str) and reasoning:
             if self.thinking_block_idx is None:
-                self.thinking_block_idx, opened = self._open_block({"type": "thinking", "thinking": ""})
+                self.thinking_block_idx, opened = self._open_block(
+                    {"type": "thinking", "thinking": "", "signature": ""}
+                )
                 events.extend(opened)
             self.thinking_text += reasoning
             events.append(
@@ -404,6 +631,9 @@ class ChatSseToAnthropicState:
             )
 
         # opencode.py:10652-10693 — tool_calls → blocs ``tool_use``.
+        # Parité officielle : `name` minLength 1, `input_json_delta` toujours str.
+        # Un premier fragment sans nom (gateway non-strict) ne doit jamais créer
+        # un bloc `name: ""` invalide qui casse la boucle agentique.
         for tc in delta.get("tool_calls") or []:
             if not isinstance(tc, dict):
                 continue
@@ -414,10 +644,25 @@ class ChatSseToAnthropicState:
             if not isinstance(function, dict):
                 function = {}
             if api_idx not in self.tool_block_idx:
-                tc_id = tc.get("id", _new_tool_id())
+                tc_id = tc.get("id") or self.pending_tool_ids.get(api_idx) or _new_tool_id()
                 # opencode.py:10660-10666 — [Lot L4 — A8] le nom raccourci pour
                 # l'amont Chat (≤64) redevient celui que le client a envoyé.
                 tc_name = restore_tool_name(function.get("name", ""), self.tool_name_map)
+                if not tc_name:
+                    # Parité officielle : jamais de bloc fantôme `tool_pending_*`.
+                    # On bufferise id + args sans émettre ; le vrai nom arrivera
+                    # au chunk suivant et le bloc sera créé avec le cumul.
+                    if tc.get("id"):
+                        self.pending_tool_ids[api_idx] = tc.get("id")
+                    _pending_args = function.get("arguments", "")
+                    if isinstance(_pending_args, dict):
+                        try:
+                            _pending_args = json.dumps(_pending_args, ensure_ascii=False)
+                        except Exception:
+                            _pending_args = ""
+                    if isinstance(_pending_args, str) and _pending_args:
+                        self.pending_tool_args[api_idx] = self.pending_tool_args.get(api_idx, "") + _pending_args
+                    continue
                 block_idx, opened = self._open_block(
                     {
                         "type": "tool_use",
@@ -428,8 +673,27 @@ class ChatSseToAnthropicState:
                 )
                 self.tool_block_idx[api_idx] = block_idx
                 events.extend(opened)
+                # Flush des args bufferisés avant le nom.
+                _flushed = self.pending_tool_args.pop(api_idx, "")
+                self.pending_tool_ids.pop(api_idx, None)
+                if _flushed:
+                    events.append(
+                        _sse(
+                            "content_block_delta",
+                            {
+                                "type": "content_block_delta",
+                                "index": block_idx,
+                                "delta": {"type": "input_json_delta", "partial_json": _flushed},
+                            },
+                        )
+                    )
             # opencode.py:10684-10693 — fragments d'arguments concaténables.
             args = function.get("arguments", "")
+            if isinstance(args, dict):
+                try:
+                    args = json.dumps(args, ensure_ascii=False)
+                except Exception:
+                    args = ""
             if isinstance(args, str) and args:
                 events.append(
                     _sse(

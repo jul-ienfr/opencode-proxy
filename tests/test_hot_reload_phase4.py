@@ -15,40 +15,129 @@ CONFIG_PATH = os.path.join(ROOT, "config.yaml")
 
 
 def _backup_config():
-    with open(CONFIG_PATH, encoding="utf-8") as f:
-        data = yaml.safe_load(f)
-    # deep copy
-    return copy.deepcopy(data)
-
-
-def _restore_config(backup):
-    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-        yaml.dump(backup, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
-    # reload in-memory
+    """Snapshot EN MÉMOIRE du document vivant (aucun accès disque)."""
     import config.settings as cfg
 
-    cfg.load_yaml_config()
-    # Re-sync globals that depend on YAML
+    return copy.deepcopy(dict(cfg._yaml_data)) if getattr(cfg, "_yaml_data", None) else {}
+
+
+# Globals en mémoire que les tests de CE fichier mutent (clear + update) et
+# qu'un simple snapshot de `_yaml_data` ne ramènerait pas : sans restauration,
+# `test_free_model_map_hot_reload_no_restart` laisse `FREE_MODEL_MAP` à ses deux
+# entrées de test pour tout le process pytest, et un test ultérieur qui lit une
+# entrée réelle (`test_go_only_routing::test_live_models_muse_spark_13_free_map`)
+# échoue en KeyError — rouge fabriqué par le fichier d'avant, pas par le dépôt.
+_MUTATED_GLOBALS = ("FREE_MODEL_MAP", "FREE_MODELS", "FREE_MODEL_POOL", "IP_ROTATION")
+
+
+def _snapshot_globals():
+    """Copie des contenus (les objets gardent leur identité)."""
+    import config.settings as cfg
+
+    snap = {name: copy.deepcopy(getattr(cfg, name, None)) for name in _MUTATED_GLOBALS}
+    # `opencode` peut détenir sa PROPRE référence (le test la mute si elle
+    # diffère de celle de config.settings) : on la snapshotte aussi.
     try:
-        cfg.FREE_MODEL_MAP.clear()
-        cfg.FREE_MODEL_MAP.update(cfg.yaml_get("free_model_map", default={}) or {})
+        import opencode as oc
+
+        snap["oc.FREE_MODEL_MAP"] = copy.deepcopy(getattr(oc, "FREE_MODEL_MAP", None))
+    except Exception:
+        snap["oc.FREE_MODEL_MAP"] = None
+    return snap
+
+
+def _restore_globals(snap):
+    """Restauration EN PLACE (contenu, pas identité) des globals mutés."""
+    import config.settings as cfg
+
+    for name in _MUTATED_GLOBALS:
+        target = getattr(cfg, name, None)
+        saved = snap.get(name)
+        if isinstance(target, dict) and isinstance(saved, dict):
+            target.clear()
+            target.update(saved)
+        elif isinstance(target, list) and isinstance(saved, list):
+            del target[:]
+            target.extend(saved)
+        elif isinstance(target, set) and isinstance(saved, set):
+            target.clear()
+            target.update(saved)
+    try:
+        import opencode as oc
+
+        oc_map = getattr(oc, "FREE_MODEL_MAP", None)
+        saved_oc = snap.get("oc.FREE_MODEL_MAP")
+        if isinstance(oc_map, dict) and isinstance(saved_oc, dict):
+            oc_map.clear()
+            oc_map.update(saved_oc)
     except Exception:
         pass
-    try:
-        cfg.IP_ROTATION.clear()
-        cfg.IP_ROTATION.update(cfg.yaml_get("ip_rotation", default={}) or {})
-    except Exception:
-        pass
+
+
+def _restore_in_memory(snapshot, globals_snap=None):
+    """Restauration EN PLACE : `_yaml_data` garde son identité (d'autres modules
+    détiennent une référence), seules ses clés reviennent à l'état d'avant test.
+    Rien n'est réécrit sur le disque : rien n'a jamais été écrit ailleurs que
+    dans la copie tmp_path."""
+    import config.settings as cfg
+
+    cfg._yaml_data.clear()
+    cfg._yaml_data.update(snapshot)
+    if globals_snap:
+        _restore_globals(globals_snap)
 
 
 @pytest.fixture
-def config_backup():
-    backup = _backup_config()
-    yield backup
-    _restore_config(backup)
+def config_path(tmp_path, monkeypatch):
+    """config.yaml isolé dans tmp_path — AUCUN test n'écrit le fichier du dépôt.
+
+    Historique à ne pas revenir en arrière : cette fixture ouvrait le VRAI
+    ``ROOT/config.yaml`` en lecture ET en écriture, et son teardown ré-écrivait
+    un ``yaml.dump`` du snapshot. Deux dégâts à chaque exécution de la suite :
+
+    1. **tous les commentaires du fichier étaient perdus** — ``yaml.dump`` ne
+       porte aucun commentaire (config.yaml est passé à 0 ligne ``#``) ;
+    2. un snapshot pris AVANT une purge manuelle de ``models:`` était recollé
+       intégralement sur le disque → les ids morts revenus, et
+       ``tests/test_models_catalog.py::test_ids_purges_absents_de_models``
+       échouait en fin de suite, « résurrection » fabriquée par le test
+       lui-même (le vert du fichier ciblé ne se voyait pas dans la suite).
+
+    Ici : une copie du document vivant (`_yaml_data`, déjà chargé) atterrit dans
+    tmp_path, et les TROIS chemins qui désignent config.yaml sont redirigés —
+    ``config.settings.CONFIG_PATH`` (load/save/reload) et les deux constantes de
+    `dashboard.api` (persist vpn + persist free_model_map). L'état en mémoire
+    muté par les tests est restauré en place dans le finally.
+    """
+    import config.settings as cfg
+    import dashboard.api as api_module
+
+    base = _backup_config()
+    if not base:  # secours (process sans _yaml_data) : lecture seule du fichier réel
+        with open(CONFIG_PATH, encoding="utf-8") as f:
+            base = yaml.safe_load(f) or {}
+    yaml_file = tmp_path / "config.yaml"
+    yaml_file.write_text(
+        yaml.safe_dump(base, default_flow_style=False, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cfg, "CONFIG_PATH", str(yaml_file))
+    monkeypatch.setattr(cfg, "_config_yaml_mtime", 0.0)
+    monkeypatch.setattr(api_module, "__CONFIG_YAML_PATH", str(yaml_file))
+    # badge « config.yaml édité à la main » du dashboard : viser la copie
+    monkeypatch.setattr(api_module, "_config_yaml_known_mtime", os.path.getmtime(yaml_file))
+    # rechargement à chaud : désarmer le check mtime + le rate-limit
+    monkeypatch.setattr(cfg, "_custom_routes_mtime", 0.0)
+    monkeypatch.setattr(cfg, "_custom_routes_last_check", 0.0)
+    saved = _backup_config()
+    saved_globals = _snapshot_globals()
+    try:
+        yield str(yaml_file)
+    finally:
+        _restore_in_memory(saved, saved_globals)
 
 
-def test_free_model_map_hot_reload_no_restart(config_backup):
+def test_free_model_map_hot_reload_no_restart(config_path):
     """free_model_map édité → persist YAML + hot-reload globals, sans full_restart."""
     import config.settings as cfg
     import dashboard.api as api_module
@@ -81,7 +170,7 @@ def test_free_model_map_hot_reload_no_restart(config_backup):
                 oc.FREE_MODEL_MAP.update(new_map)
 
         # Verify YAML persisted
-        with open(CONFIG_PATH, encoding="utf-8") as f:
+        with open(config_path, encoding="utf-8") as f:
             on_disk = yaml.safe_load(f)
         assert on_disk.get("free_model_map") == new_map, "YAML not persisted"
 
@@ -96,7 +185,7 @@ def test_free_model_map_hot_reload_no_restart(config_backup):
         mock_mgr.full_restart.assert_not_called()
 
 
-def test_vpn_config_watchdog_hot_reload_no_restart(config_backup):
+def test_vpn_config_watchdog_hot_reload_no_restart(config_path):
     """vpn watchdog interval → persist + hot-reload, sans full_restart (N-station compat)."""
     import dashboard.api as api_module
 
@@ -106,14 +195,14 @@ def test_vpn_config_watchdog_hot_reload_no_restart(config_backup):
         mock_em.publish = MagicMock()
         mock_get_em.return_value = mock_em
         api_module._persist_vpn_config({"watchdog_interval": new_interval})
-        with open(CONFIG_PATH, encoding="utf-8") as f:
+        with open(config_path, encoding="utf-8") as f:
             on_disk = yaml.safe_load(f)
         assert on_disk["ip_rotation"]["watchdog_interval"] == new_interval
         # IP_ROTATION may be updated via _persist (best-effort) — check persisted value
         assert on_disk["ip_rotation"]["watchdog_interval"] == new_interval
 
 
-def test_vpn_circuit_breaker_hot_reload_no_restart(config_backup):
+def test_vpn_circuit_breaker_hot_reload_no_restart(config_path):
     """circuit breaker threshold/recovery → persist YAML (N-station via update_config)."""
     import dashboard.api as api_module
 
@@ -126,13 +215,13 @@ def test_vpn_circuit_breaker_hot_reload_no_restart(config_backup):
         api_module._persist_vpn_config(
             {"circuit_breaker_threshold": new_threshold, "circuit_breaker_recovery": new_recovery}
         )
-        with open(CONFIG_PATH, encoding="utf-8") as f:
+        with open(config_path, encoding="utf-8") as f:
             on_disk = yaml.safe_load(f)
         assert on_disk["ip_rotation"]["circuit_breaker_threshold"] == new_threshold
         assert on_disk["ip_rotation"]["circuit_breaker_recovery"] == new_recovery
 
 
-def test_rotation_rules_hot_reload_no_restart(config_backup):
+def test_rotation_rules_hot_reload_no_restart(config_path):
     """rotation_rules → persist YAML (N-station compat)."""
     import config.settings as cfg
     import dashboard.api as api_module
@@ -145,13 +234,13 @@ def test_rotation_rules_hot_reload_no_restart(config_backup):
         cfg._yaml_data.setdefault("ip_rotation", {})["rotation_rules"] = new_rules
         cfg.save_yaml_config()
         cfg.IP_ROTATION["rotation_rules"] = new_rules
-        with open(CONFIG_PATH, encoding="utf-8") as f:
+        with open(config_path, encoding="utf-8") as f:
             on_disk = yaml.safe_load(f)
         assert on_disk["ip_rotation"]["rotation_rules"] == new_rules
         assert cfg.IP_ROTATION.get("rotation_rules") == new_rules
 
 
-def test_schedule_hot_reload_no_restart(config_backup):
+def test_schedule_hot_reload_no_restart(config_path):
     """schedule → persist YAML + manager hot-reload."""
     import config.settings as cfg
     import shared_state
@@ -170,7 +259,7 @@ def test_schedule_hot_reload_no_restart(config_backup):
         cfg.IP_ROTATION["schedule"] = new_schedule
         mgr.update_config({"schedule": new_schedule})
 
-        with open(CONFIG_PATH, encoding="utf-8") as f:
+        with open(config_path, encoding="utf-8") as f:
             on_disk = yaml.safe_load(f)
         assert on_disk["ip_rotation"]["schedule"] == new_schedule
         assert mgr._config.get("schedule") == new_schedule
@@ -179,7 +268,7 @@ def test_schedule_hot_reload_no_restart(config_backup):
 
 
 @pytest.mark.asyncio
-async def test_port_hot_restart_not_full_restart(config_backup, monkeypatch):
+async def test_port_hot_restart_not_full_restart(config_path, monkeypatch):
     """[P6] Changement de port → hot-restart (mgr.restart), PAS full_restart.
 
     Ancien test ``test_web_port_hot_restart_not_full_restart`` : WEB_PORT a été
@@ -335,8 +424,12 @@ def test_server_stop_from_other_thread_joins_normally():
     assert mgr.is_running is False
 
 
-def test_vpn_servers_persist_reboot_safe(config_backup):
-    """servers persist → reboot-safe YAML persistence (N-station compat)."""
+def test_vpn_servers_persist_reboot_safe(config_path):
+    """servers persist → reboot-safe YAML persistence (N-station compat).
+
+    `config_path` (fixture hermétique) : `save_yaml_config()` écrit sur la copie
+    tmp_path, jamais sur le config.yaml du dépôt (aucun commentaire perdu).
+    """
     import config.settings as cfg
 
     new_servers = [
@@ -347,7 +440,7 @@ def test_vpn_servers_persist_reboot_safe(config_backup):
     cfg._yaml_data.setdefault("ip_rotation", {}).setdefault("openvpn", {})["servers"] = new_servers
     cfg.save_yaml_config()
     cfg.IP_ROTATION.setdefault("openvpn", {})["servers"] = new_servers
-    with open(CONFIG_PATH, encoding="utf-8") as f:
+    with open(config_path, encoding="utf-8") as f:
         on_disk = yaml.safe_load(f)
     assert on_disk["ip_rotation"]["openvpn"]["servers"] == new_servers
 

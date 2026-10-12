@@ -456,6 +456,9 @@ _SERVER_COMPACTION_DEFAULTS = {
     "summary_lean": True,
     "summary_lean_max_chars": 2000,
     "summary_clamp_max_tokens": 4096,
+    "keep_tokens": None,
+    "huge_warn_tokens": 0,
+    "huge_deny_tokens": 0,
 }
 
 
@@ -486,8 +489,12 @@ def get_server_compaction(key: str | None = None, default=None):
         if isinstance(v, str) and v.strip().lower() in ("auto", "free_only", "paid_only"):
             return v.strip().lower()
         return default
+    if key == "keep_tokens":
+        v = cfg[key]
+        return v if isinstance(v, int) and not isinstance(v, bool) and v > 0 else default
     if key in ("summary_max_tokens", "keep_recent_pairs", "timeout_s", "max_attempts", "min_chars_implicit",
-                 "summary_lean_max_chars", "summary_clamp_max_tokens"):
+                 "summary_lean_max_chars", "summary_clamp_max_tokens",
+                 "huge_warn_tokens", "huge_deny_tokens"):
         v = cfg[key]
         return v if isinstance(v, int) and not isinstance(v, bool) and v > 0 else default
     if key == "summarizer_model_override":
@@ -867,6 +874,11 @@ _discovery_mod.start_background_fetch(
     # (appel ≥0.5 s plus tard, module chargé — même mécanique que l'historique
     # qui lisait le global à l'exécution du thread).
     lambda: get_model_config.cache_clear(),  # type: ignore[has-type]
+    # `purged_ids_fn` par mot-clé : `log` le précède dans la signature.
+    # Idem pour PURGED_IDS (défini plus bas, :919) : sans ce filtre la 3e voie
+    # d'ajout — le fetch du catalogue upstream — ré-annonce les ids morts 0,5 s
+    # après l'import et annule la purge manuelle de `models:` à chaque démarrage.
+    purged_ids_fn=lambda: PURGED_IDS,  # type: ignore[has-type]
 )
 
 # ── Web search native allowlist (v3.3) ─────────────────────────
@@ -874,7 +886,6 @@ WEB_SEARCH_NATIVE_MODELS: list = yaml_get(
     "web_search_native",
     default=[
         "muse-spark-1.2-contributor",
-        "muse-spark-1.2-contributor-free",
         "muse-spark-1.3-contributor",
         "muse-spark-1.3-contributor-free",
     ],
@@ -882,7 +893,6 @@ WEB_SEARCH_NATIVE_MODELS: list = yaml_get(
 if not isinstance(WEB_SEARCH_NATIVE_MODELS, list):
     WEB_SEARCH_NATIVE_MODELS = [
         "muse-spark-1.2-contributor",
-        "muse-spark-1.2-contributor-free",
         "muse-spark-1.3-contributor",
         "muse-spark-1.3-contributor-free",
     ]
@@ -904,6 +914,18 @@ GO_ONLY_IDS: set = set()
 _goi_raw = FREE_DISCOVERY.get("go_only_ids", [])
 if isinstance(_goi_raw, list):
     GO_ONLY_IDS.update(str(x).strip().lower() for x in _goi_raw if str(x).strip())
+
+# Ids retirés À LA MAIN de `models:` (inventaire catalogue mort : aucun modèle
+# correspondant des deux jambes du catalogue live). La découverte auto est
+# add-only : sans cette liste, un refresh suivant les ré-ajoute — la purge
+# d'un id mort ne tiendrait alors que jusqu'au prochain cycle.
+PURGED_IDS: set = set()
+_purged_raw = FREE_DISCOVERY.get("purged_ids", [])
+if isinstance(_purged_raw, list):
+    # `isinstance(x, str)` et non `str(x).strip()` : une entrée YAML `null` ou
+    # `42` deviendrait sinon le tombiveau "none"/"42" — un id réel pourrait
+    # un jour coller à ces chaînes et disparaître du catalogue.
+    PURGED_IDS.update(x.strip().lower() for x in _purged_raw if isinstance(x, str) and x.strip())
 
 # Seed FREE_MODELS from existing free_model_map values (known frees at boot)
 FREE_MODELS: set = {v for v in FREE_MODEL_MAP.values() if isinstance(v, str) and v}
@@ -979,6 +1001,7 @@ def _apply_discovered_free_models(free_ids: set, source: str = "none") -> int:
         cache_clear_fn=lambda: get_model_config.cache_clear(),
         lock=_reload_lock,
         log=logger,
+        purged_ids=PURGED_IDS,
     )
     if _new_pool is not None:
         FREE_MODEL_POOL = _new_pool
@@ -994,6 +1017,7 @@ def _persist_free_mappings():
         yaml_data=_yaml_data,
         save_yaml_fn=save_yaml_config,
         log=logger,
+        purged_ids=PURGED_IDS,
     )
 
 
@@ -1412,7 +1436,6 @@ def maybe_reload_custom_routes():
                             "web_search_native",
                             [
                                 "muse-spark-1.2-contributor",
-                                "muse-spark-1.2-contributor-free",
                                 "muse-spark-1.3-contributor",
                                 "muse-spark-1.3-contributor-free",
                             ],
@@ -1432,6 +1455,22 @@ def maybe_reload_custom_routes():
                         if isinstance(_new_goi, list):
                             GO_ONLY_IDS.clear()
                             GO_ONLY_IDS.update(str(x).strip().lower() for x in _new_goi if str(x).strip())
+                    except Exception:
+                        pass
+                    # purged_ids hot-reload (in-place set — tombeaux de purge vivants)
+                    try:
+                        _new_pur = (
+                            new_yaml.get("free_discovery", {})
+                            if isinstance(new_yaml.get("free_discovery"), dict)
+                            else {}
+                        ).get("purged_ids", [])
+                        if isinstance(_new_pur, list):
+                            PURGED_IDS.clear()
+                            PURGED_IDS.update(
+                                x.strip().lower()
+                                for x in _new_pur
+                                if isinstance(x, str) and x.strip()
+                            )
                     except Exception:
                         pass
                     # P2: server_countries change → regen .env via make_credentials_env
@@ -1514,9 +1553,28 @@ def maybe_reload_custom_routes():
 
 @_lru_cache(maxsize=512)
 def get_model_config(model_id: str) -> dict:
-    """Return merged config for model_id with sensible defaults (LRU cached)."""
+    """Return merged config for model_id with sensible defaults (LRU cached).
+
+    [PLAN N4] le repli ne choisit plus la jambe à la main : il repasse par
+    `_resolve_model_endpoint`, la SOURCE UNIQUE qui a déjà bâti `MODELS` à
+    l'import. Un id absent de `models:` retombait auparavant sur
+    `API_BASE_OPENAI` — la jambe **payée** — y compris quand son suffixe
+    `-free` désignait la jambe anonyme : un id libre non déclaré partait donc
+    en 404 côté payant au lieu d'être tenté côté anonyme.
+
+    Les deux bornes du plan (« pas d'`endpoint:`, pas d'id interne ») sont
+    tenues par construction. Un `endpoint:` explicite gagne toujours
+    (`_resolve_model_endpoint` le lit en premier), donc les ids internes
+    `jev-1.13*` sur `/zen/v1/systemone` ressortent inchangés ; et l'heuristique
+    ne sait rendre que l'une des bases opencode déjà déclarées — elle
+    n'invente aucune URL.
+    """
     cfg = MODELS.get(model_id, {})
-    defaults = {"endpoint": API_BASE_OPENAI, "protocol": "openai"}
+    protocol = cfg.get("protocol") or "openai"
+    defaults = {
+        "endpoint": _resolve_model_endpoint(model_id, cfg, protocol),
+        "protocol": protocol,
+    }
     return {**defaults, **cfg}
 
 

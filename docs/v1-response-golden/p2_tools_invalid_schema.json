@@ -42,8 +42,7 @@
           "parameters": {}
         }
       }
-    ],
-    "tool_choice": "auto"
+    ]
   },
   "_note": "axe tools : schéma invalide (str) → parameters {} sans lever (jamais de 500)",
   "_generated_by": "scripts/gen_golden_fixtures.py (plan v10 §11.5)"

@@ -101,7 +101,7 @@ def test_blank_override_ignored():
         "mimo-v2.5", "   ", endpoint="https://opencode.ai/zen/go/v1/chat/completions", protocol="openai"
     )[:4]
     assert is_free is True
-    assert m == "mimo-v2.5-free"
+    assert m == "mimo-v2.6-flash-free"
 
 
 def test_plan_is_pure_and_never_raises():
@@ -288,7 +288,7 @@ def test_paid_ids_still_resolve_to_none(model_id):
 
 def test_mapped_paid_names_keep_their_destination():
     """Les noms payants mappés gardent leur destination déclarée (non régressé)."""
-    assert oc._resolve_free_model("mimo-v2.5") == "mimo-v2.5-free"
+    assert oc._resolve_free_model("mimo-v2.5") == "mimo-v2.6-flash-free"
     # deepseek-v4-flash-free mort côté amont (0 succès) : remappé sain.
-    assert oc._resolve_free_model("glm-5.1") == "mimo-v2.5-free"
-    assert oc._resolve_free_model("deepseek-v4-flash") == "mimo-v2.5-free"
+    assert oc._resolve_free_model("glm-5.1") == "mimo-v2.6-flash-free"
+    assert oc._resolve_free_model("deepseek-v4-flash") == "mimo-v2.6-flash-free"

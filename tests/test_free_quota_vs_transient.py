@@ -242,8 +242,8 @@ def _iso_pool(nstations=3):
     pool._upstream_event_cool_s = 180.0
     pool._rotation_tasks = {}
     pool._pending = set()
-    from asyncio import PriorityQueue as _PQ
     import itertools as _it
+    from asyncio import PriorityQueue as _PQ
 
     pool._rotation_queue = _PQ()
     pool._rotation_seq = _it.count()
@@ -309,3 +309,85 @@ def test_launch_rotation_ignores_unknown_station():
     pool._launch_rotation(ghost)
     assert pool._pending == set()
     assert pool._rotation_queue.empty()
+
+
+# ── 5. _free_stream_refuse_bytes : parité véridique avec le non-stream ──
+#
+# Le chemin stream affirmait « Free quota exhausted on all VPN stations. »
+# pour TOUT 429, y compris « Endpoint is unavailable » (surcharge serveur
+# transitoire). Miroir de free_refusal_response :
+#   - 429 + motif quota → message historique + rate_limit_error ;
+#   - 429 transitoire → message véridique + type classé (overloaded_error),
+#     PAS « quota épuisé », PAS rate_limit_error.
+
+
+class _StreamFakeResp:
+    """Réponse free minimale pour _free_stream_refuse_bytes."""
+
+    def __init__(self, status_code, body: bytes, retry_after: str = ""):
+        self.status_code = status_code
+        self._body = body
+        self.headers = {"retry-after": retry_after} if retry_after else {}
+
+    async def aread(self):
+        return self._body
+
+
+def _run_refuse(monkeypatch, status_code, body: bytes, protocol="openai"):
+    """Appelle _free_stream_refuse_bytes avec DB neutralisée, rend (octets, payload)."""
+    import asyncio
+    import json as _json
+
+    import opencode as _oc
+
+    async def _noop_save(*a, **k):
+        return None
+
+    monkeypatch.setattr(_oc, "_save_request", _noop_save)
+    monkeypatch.setattr(_oc, "_log", lambda *a, **k: None)
+    monkeypatch.setattr(_oc, "_debug", lambda *a, **k: None)
+    monkeypatch.setattr(_oc, "_log_free_model_usage", lambda *a, **k: None)
+
+    # [incident st1 12/10] boucle robuste à l'ordre d'exécution : un test
+    # async précédent (pytest-asyncio strict) peut avoir fermé la boucle.
+    try:
+        _loop = asyncio.get_event_loop()
+    except RuntimeError:
+        _loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(_loop)
+    out = _loop.run_until_complete(
+        _oc._free_stream_refuse_bytes(
+            _StreamFakeResp(status_code, body),
+            "req-test",
+            "mimo-v2.6-flash-free",
+            "mimo",
+            0.0,
+            protocol,
+            None,
+            None,
+            "127.0.0.1",
+            [],
+            {},
+        )
+    )
+    assert out.endswith(b"data: [DONE]\n\n")
+    first = out.split(b"\n")[0]
+    assert first.startswith(b"data: ")
+    return out, _json.loads(first[len(b"data: "):].decode())
+
+
+def test_stream_transient_429_does_not_claim_quota_exhausted(monkeypatch):
+    """429 « Endpoint is unavailable » en stream → message véridique,
+    type overloaded_error, jamais « quota épuisé » / rate_limit_error."""
+    _, payload = _run_refuse(monkeypatch, 429, UNAVAILABLE.encode())
+    msg = payload["error"]["message"]
+    assert "Free quota exhausted" not in msg
+    assert "Endpoint is unavailable" in msg
+    assert payload["error"]["type"] == "overloaded_error"
+
+
+def test_stream_real_quota_429_keeps_historic_message(monkeypatch):
+    """429 quota réel en stream → message historique + rate_limit_error."""
+    _, payload = _run_refuse(monkeypatch, 429, QUOTA_RATE_LIMIT.encode())
+    assert payload["error"]["message"] == "Free quota exhausted on all VPN stations."
+    assert payload["error"]["type"] == "rate_limit_error"

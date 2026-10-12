@@ -2,7 +2,7 @@
 
 from app.compaction.classify import has_free_leg, is_free_class
 from app.compaction.lean import lean_summary_body
-from app.compaction.overflow import is_overflow
+from app.compaction.overflow import huge_context_check, is_overflow
 from app.compaction.plan import summarizer_plan
 from app.compaction.pool import free_pool_request, summarizer_dispatch
 from app.compaction.react import maybe_condense
@@ -17,6 +17,7 @@ from app.compaction.streaming import (
     should_buffer_compaction,
 )
 from app.compaction.summarizer import (
+    build_rewrite_prompt,
     build_summarizer_anthropic_body,
     build_summarizer_body,
     build_summarizer_for_api,
@@ -24,6 +25,7 @@ from app.compaction.summarizer import (
     build_summary_user_text,
     cap_summary_max_tokens,
     extract_previous_summary,
+    has_required_outline,
     run_summarizer,
     should_clamp_summary,
 )
@@ -63,6 +65,7 @@ __all__ = [
     "normalize_free_responses",
     "should_use_tunnel",
     "is_overflow",
+    "huge_context_check",
     "maybe_condense",
     "split_keep_recent",
     "build_checkpoint_summary",
@@ -74,6 +77,8 @@ __all__ = [
     "build_summarizer_anthropic_body",
     "build_summarizer_responses_body",
     "build_summarizer_for_api",
+    "build_rewrite_prompt",
+    "has_required_outline",
     "should_clamp_summary",
     "cap_summary_max_tokens",
     "extract_previous_summary",

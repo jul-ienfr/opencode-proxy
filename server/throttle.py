@@ -139,12 +139,35 @@ class RateLimitMiddleware:
             await self.app(scope, receive, send)
             return
         retry_after_int = max(1, int(retry_after) + 1)
-        body = self._dumps_fn({"error": "Limite de débit dépassée. Veuillez réessayer sous peu."})
+        # Parité officielle : enveloppe Anthropic sur /messages, sinon le SDK
+        # ne backoffe pas et l'utilisateur doit dire `continue` à la main.
+        if "/messages" in path or path.startswith("/anthropic"):
+            body = self._dumps_fn(
+                {
+                    "type": "error",
+                    "error": {
+                        "type": "rate_limit_error",
+                        "message": "Rate limit exceeded. Please retry shortly.",
+                    },
+                }
+            )
+        else:
+            # Parité officielle : enveloppe OpenAI objet + EN (le FR seul cassait
+            # `error.message` côté parseur OpenAI).
+            body = self._dumps_fn(
+                {
+                    "error": {
+                        "message": "Rate limit exceeded. Please retry shortly.",
+                        "type": "rate_limit_error",
+                        "code": "rate_limit_exceeded",
+                    }
+                }
+            )
         headers = [
             (b"content-type", b"application/json"),
             (b"retry-after", str(retry_after_int).encode()),
         ]
-        await send({"type": "http.response.start", "status": 503, "headers": headers})
+        await send({"type": "http.response.start", "status": 429, "headers": headers})
         await send({"type": "http.response.body", "body": body})
 
     async def _cleanup_loop(self):

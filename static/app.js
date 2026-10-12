@@ -3460,6 +3460,8 @@ document.addEventListener('DOMContentLoaded', () => {
         }
         if (data.stale) bannerLabel += ' ⟳';
         if (data.boot_error) bannerLabel += ` ⚠ ${data.boot_error}`;
+        // [docker-autostart 2026-10-07] daemon down connu → badge explicite.
+        if (data.docker_daemon && data.docker_daemon.reachable === false) bannerLabel += ' ⚠ Docker daemon down — relance auto en cours';
         statusEl.textContent = bannerLabel;
         statusEl.style.color = s.color;
         if (statusDot) {

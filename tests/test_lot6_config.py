@@ -58,6 +58,13 @@ def test_save_custom_routes_no_parallel_json(tmp_path, monkeypatch):
     """[§14.4.11] plus d'écriture custom_routes.json parallèle."""
     import config.settings as st
 
+    # `save_custom_routes` mute les globaux CUSTOM_ROUTES/ROUTES EN PLACE, et
+    # la route de test porte SANS clé `model`. Sans restore, tout consommateur
+    # ultérieur qui fait `route["model"]` explose (KeyError — constaté en
+    # exécution ciblée de ce fichier + test_free_model_map_http). Le disque est
+    # déjà hermétique via CONFIG_PATH ; on isole maintenant l'état mémoire.
+    saved_custom = dict(st.CUSTOM_ROUTES)
+    saved_routes = dict(st.ROUTES)
     monkeypatch.setattr(st, "CUSTOM_ROUTES_PATH", str(tmp_path / "custom_routes.json"))
     monkeypatch.setattr(
         st,
@@ -65,16 +72,28 @@ def test_save_custom_routes_no_parallel_json(tmp_path, monkeypatch):
         {k: v for k, v in st._yaml_data.items() if k != "custom_routes"},
     )
     monkeypatch.setattr(st, "CONFIG_PATH", str(tmp_path / "config.yaml"))
-    st.save_custom_routes({"glm-5.1": {"match": "GLM"}})
-    assert not (tmp_path / "custom_routes.json").exists(), "source unique YAML"
+    try:
+        st.save_custom_routes({"glm-5.1": {"match": "GLM"}})
+        assert not (tmp_path / "custom_routes.json").exists(), "source unique YAML"
+    finally:
+        st.CUSTOM_ROUTES.clear()
+        st.CUSTOM_ROUTES.update(saved_custom)
+        st.ROUTES.clear()
+        st.ROUTES.update(saved_routes)
 
 
 def test_save_custom_routes_invalid_raises(monkeypatch, tmp_path):
     import config.settings as st
 
     monkeypatch.setattr(st, "CUSTOM_ROUTES_PATH", str(tmp_path / "x.json"))
+    # `save_custom_routes` valide AVANT d'écrire, donc ce test n'atteint aucun
+    # disque aujourd'hui. On détourne quand même CONFIG_PATH : l'ordre
+    # interne ne doit pas être la seule chose qui protège le dépôt, et on
+    # verrouille l'invariant « rejet = aucune écriture ».
+    monkeypatch.setattr(st, "CONFIG_PATH", str(tmp_path / "config.yaml"))
     with pytest.raises(ValueError):
         st.save_custom_routes({"bad": "payload"})
+    assert not (tmp_path / "config.yaml").exists(), "rejet avant toute écriture disque"
 
 
 # ── 14.3.31 import : validation + fan-out ────────────────────────────────
@@ -115,38 +134,29 @@ async def test_import_payload_validates():
 
 def test_persist_vpn_config_returns_error_string(monkeypatch, tmp_path):
     """[§14.3.30] succès → None ; échec → STRING (le contrat `if not err`
-    des callers devient enfin réel)."""
-    import os
+    des callers devient enfin réel).
 
+    Le chemin visé est `api.__CONFIG_YAML_PATH` (constante de module, source
+    unique depuis que les deux persist ont abandonné le recalcul local
+    `os.path.join(dirname(dirname(__file__)), "config.yaml")`). L'ancienne
+    version de ce test détournait `api.os.path.join`, devenu INOPÉRANT : le
+    persist visait alors le VRAI config.yaml du dépôt (écriture réelle, et
+    assertion d'échec rouge car le fichier existe bel et bien)."""
     import dashboard.api as api
 
-    # échec déterministe : chemin config.yaml inexistant
-    real_join = os.path.join
-
-    def fake_join(*a):
-        if a and isinstance(a[-1], str) and a[-1] == "config.yaml":
-            return real_join(str(tmp_path / "does-not-exist"), "config.yaml")
-        return real_join(*a)
-
-    monkeypatch.setattr(api.os.path, "join", fake_join)
-    lock = threading.Lock()
-    monkeypatch.setattr(api, "_persist_lock", lock)
+    missing_dir = tmp_path / "does-not-exist"
+    missing_path = missing_dir / "config.yaml"
+    monkeypatch.setattr(api, "__CONFIG_YAML_PATH", str(missing_path))
+    monkeypatch.setattr(api, "_config_yaml_known_mtime", 0.0, raising=False)
+    monkeypatch.setattr(api, "_persist_lock", threading.Lock())
     err = api._persist_vpn_config({"enabled": True})
     assert isinstance(err, str) and err, "échec explicite au lieu du silence historique"
+    assert not missing_path.exists(), "échec = aucun fichier créé"
 
-    # succès sur un vrai fichier minimal (join restauré d'abord)
-    monkeypatch.undo()
+    # succès sur un vrai fichier minimal, toujours dans tmp_path
     cfg_file = tmp_path / "config.yaml"
     cfg_file.parent.mkdir(parents=True, exist_ok=True)
     cfg_file.write_text("ip_rotation:\n  enabled: true\n", encoding="utf-8")
-
-    def ok_join(*a):
-        if a and isinstance(a[-1], str) and a[-1] == "config.yaml":
-            return str(cfg_file)
-        return real_join(*a)
-
-    monkeypatch.setattr(api.os.path, "join", ok_join)
-    monkeypatch.setattr(api, "_persist_lock", threading.Lock())
-    monkeypatch.setattr(api, "_config_yaml_known_mtime", 0.0, raising=False)
+    monkeypatch.setattr(api, "__CONFIG_YAML_PATH", str(cfg_file))
     err2 = api._persist_vpn_config({"enabled": True})
     assert err2 is None or isinstance(err2, str)

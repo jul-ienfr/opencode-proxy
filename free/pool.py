@@ -1382,6 +1382,17 @@ class FreeIPPool:
             # Defensive: connect_next is typed to return str now, but a
             # None would silently reset counters below — fail loudly instead.
             raise RotationFailed("connect_next n'a retourné aucune IP")
+        # [audit-rotation] Ligne d'arrivée (jointure avec la ligne QUOTA de
+        # on_quota_exhausted par n° de station) : old → new.
+        try:
+            logger.info(
+                "[free-ip] ROTATED station %s %s → %s",
+                getattr(station, "_station", "?"),
+                getattr(station, "current_ip", "?"),
+                new_ip,
+            )
+        except Exception:
+            pass
         per = self._per_station(station)
         per["request_count"] = 0
         # [PLAN-corrections-429 G4] IP fraîche = nouveau bucket → reset
@@ -1620,6 +1631,19 @@ class FreeIPPool:
                     self._upstream_event_remaining_s(),
                 )
             else:
+                # [audit-rotation] Une ligne par rotation quota : station, IP
+                # AVANT rotation, cause. L'IP APRÈS est loggée par switch_ip à
+                # l'arrivée (join des deux lignes par n° de station).
+                try:
+                    logger.info(
+                        "[free-ip] QUOTA station %s ip=%s cause=quota-429 action=%s — "
+                        "rotation enfilée (autres stations intactes)",
+                        getattr(station, "_station", "?"),
+                        getattr(station, "current_ip", "?"),
+                        action,
+                    )
+                except Exception:
+                    pass
                 self._launch_rotation(station, forced_pool=forced_pool)
         # [PLAN-corrections-429 G4] failover cascade : en routing=failover,
         # la sticky station reçoit TOUT le trafic — ≥3 429 consécutifs sur

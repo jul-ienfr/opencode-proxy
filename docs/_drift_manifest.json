@@ -52,7 +52,8 @@
       "keys": [
         "free_model_map.deepseek-v4-flash",
         "dashboard_trust.mode",
-        "client_auth.mode"
+        "client_auth.mode",
+        "protocol.emit_default_tool_choice"
       ]
     },
     {

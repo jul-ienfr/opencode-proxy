@@ -54,14 +54,35 @@ def should_buffer_compaction(
         return False
 
 
-def is_tiny_result(inp, out, tools_used, *, input_min=40000, output_max=100) -> bool:
-    """True si (énorme input + micro output + aucun outil) — miroir du garde
-    ``suspect_tiny_output`` (mêmes défauts) : un résumé de 40k qui tient en
-    17 tokens n'en est pas un, c'est une troncation amont à rejouer."""
+def is_tiny_result(inp, out, tools_used, *, input_min=40000, output_max=100, ratio_min=150) -> bool:
+    """True si sortie suspecte : absolu (règle ``suspect_tiny_output``) OU ratio.
+
+    Le seuil absolu (out<100) laisse passer des pseudo-résumés 100-300 tokens
+    pour 40-90k d'input — qui ne compressent rien sémantiquement : l'agent
+    relit tout, le contexte se remplit en 3 tours, boucle de thrash garantie
+    (constaté en prod : 52k→88, 76k→65). La règle ratio (out*ratio_min < in,
+    défaut 150 : ex. 88*150=13200 < 52000) les rattrape ; un vrai résumé
+    (72k→1330 : 1330*150 >> 72000) passe. Sans outils uniquement dans les
+    deux cas. Ne lève jamais.
+    """
     try:
         if tools_used:
             return False
-        return (inp or 0) >= (input_min or 40000) and (out or 0) < (output_max or 100)
+        try:
+            inp_n = int(inp or 0)
+        except Exception:
+            inp_n = 0
+        try:
+            out_n = int(out or 0)
+        except Exception:
+            out_n = 0
+        if inp_n >= (input_min or 40000) and out_n < (output_max or 100):
+            return True
+        try:
+            rm = int(ratio_min or 150)
+        except Exception:
+            rm = 150
+        return bool(inp_n >= (input_min or 40000) and rm > 0 and out_n * rm < inp_n)
     except Exception:
         return False
 

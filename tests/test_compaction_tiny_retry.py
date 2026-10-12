@@ -62,12 +62,27 @@ def test_tiny_mirrors_server_guard():
         (50000, 17, [], True),
         (40000, 99, [], True),
         (39999, 17, [], False),
-        (50000, 100, [], False),
+        (50000, 400, [], False),
         (100000, 20, ["bash"], False),
     ]
     for inp, out, tools, expected in cases:
         assert is_tiny_result(inp, out, tools) is expected
         assert oc._is_suspect_tiny_output(inp, out, tools) is expected
+
+
+def test_tiny_ratio_catches_pseudo_summaries():
+    # 52k→88, 76k→65, 42k→17 passent le seuil absolu (<100 pour 88/65... non :
+    # 88 et 65 sont SOUS 100 donc déjà caught) — le ratio attrape 100-300 :
+    # 76k→250, 52k→310, 40k→200 : inutiles comme résumés, invisibles avant.
+    for inp, out in ((76000, 250), (52000, 310), (40000, 200), (100000, 600)):
+        assert is_tiny_result(inp, out, []) is True
+    # Vrais résumés : intacts.
+    for inp, out in ((72000, 1330), (84000, 6728), (99000, 3402), (50000, 500)):
+        assert is_tiny_result(inp, out, []) is False
+    # Garde-fous : outils utilisés, micro-inputs, garbage.
+    assert is_tiny_result(50000, 200, ["bash"]) is False
+    assert is_tiny_result(5000, 10, []) is False
+    assert is_tiny_result(None, None, None) is False
 
 
 def test_chat_sse_roundtrip():

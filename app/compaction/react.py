@@ -29,6 +29,8 @@ async def maybe_condense(
     enabled=False,
     summary_max_tokens=2048,
     keep_recent_pairs=4,
+    keep_tokens=None,
+    estimate_tokens_fn=None,
     timeout_s=60,
     markers=None,
     api="chat",
@@ -65,9 +67,11 @@ async def maybe_condense(
         except Exception:
             _api = "chat"
         if _api == "responses":
-            condensed, _kept = build_condensed_input(history_messages, summary, keep_recent_pairs)
+            condensed, _kept = build_condensed_input(
+                history_messages, summary, keep_recent_pairs, keep_tokens, estimate_tokens_fn)
         else:
-            condensed, _kept = build_condensed_history(history_messages, summary, keep_recent_pairs)
+            condensed, _kept = build_condensed_history(
+                history_messages, summary, keep_recent_pairs, keep_tokens, estimate_tokens_fn)
         if not condensed:
             return None
         return condensed

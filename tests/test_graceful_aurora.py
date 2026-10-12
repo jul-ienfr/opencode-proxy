@@ -915,3 +915,95 @@ class TestServerPickMode:
         assert mgr.get_status()["server_pick_mode"] == "gluetun"
         # get_config lit le miroir persisté (config.yaml édité : proxy).
         assert mgr.get_config()["server_pick_mode"] == "proxy"
+
+
+# ── Incident st1 12/10 : serveur NordVPN qui refuse (Connection refused) ──
+# Logs réels prod (vpn/station/1/logs) : boucle openvpn
+# "TCP: connect to [AF_INET]217.138.207.139:443 failed: Connection refused"
+# + "SIGUSR1[connection failed(soft),connection-failed] ... Restart pause".
+# Avant le fix, _parse_server_issue_detail ne couvrait que TLS/reset → live
+# False → pas de degraded, pas de re-pin, pas de blacklist : la station
+# restait collée en error sans jamais se récupérer seule.
+
+_ST1_REFUSED_CHUNK = (
+    "2026-10-12T05:04:36Z TCP: connect to [AF_INET]217.138.207.139:443 "
+    "failed: Connection refused\n"
+    "2026-10-12T05:04:36Z SIGUSR1[connection failed(soft),connection-failed] "
+    "received, process restarting\n"
+    "2026-10-12T05:04:36Z Restart pause, 40 second(s)\n"
+)
+
+
+class TestServerRefusedAutoRecovery:
+    def test_refused_loop_is_live_server_issue(self):
+        """Le chunk st1 réel → live True (détection, pas silence)."""
+        live, _age, healed, _init = cvm._parse_server_issue_detail(_ST1_REFUSED_CHUNK)
+        assert live is True
+        assert healed is False
+
+    def test_refused_then_init_is_healed(self):
+        """INIT après le refused → guérison prouvée (pas de re-pin inutile)."""
+        live, _age, healed, _init = cvm._parse_server_issue_detail(
+            _ST1_REFUSED_CHUNK
+            + "2026-10-12T05:05:36Z Initialization Sequence Completed\n"
+        )
+        assert live is False
+        assert healed is True
+
+    def test_extract_current_ip_reads_af_inet(self):
+        """L'IP distante est lisible même sans hostname dans le chunk."""
+        assert cvm._extract_current_ip(_ST1_REFUSED_CHUNK) == "217.138.207.139"
+
+    def test_extract_current_ip_none_without_af_inet(self):
+        assert cvm._extract_current_ip("openvpn: Connection reset, restarting\n") is None
+
+    async def test_check_server_issue_flags_refused_chunk(self, tmp_path):
+        """_check_server_issue(text=chunk st1) → True + IP blacklistée."""
+        mgr = GraceFake(_gcfg(tmp_path), tmp_path)
+        assert await mgr._check_server_issue(text=_ST1_REFUSED_CHUNK) is True
+        assert mgr._host_blacklisted("217.138.207.139") is True
+
+    async def test_record_failure_without_hostname_still_blacklists_ip(self, tmp_path):
+        """Chunk sans hostname (boucle SIGUSR1 précoce) → l'IP est blacklistée
+        quand même (avant : silence total)."""
+        mgr = GraceFake(_gcfg(tmp_path), tmp_path)
+        mgr._record_auth_failure(_ST1_REFUSED_CHUNK)
+        assert mgr._host_blacklisted("217.138.207.139") is True
+
+    async def test_record_failure_with_hostname_blacklists_both(self, tmp_path):
+        """Chunk complet → hostname ET IP blacklistés (non-régression + ajout)."""
+        mgr = GraceFake(_gcfg(tmp_path), tmp_path)
+        mgr._record_auth_failure(
+            "2026-10-12T05:04:00Z [de1372.nordvpn.com] Peer Connection "
+            "Initiated with [AF_INET]217.138.207.139:1194\n" + _ST1_REFUSED_CHUNK
+        )
+        assert mgr._host_blacklisted("de1372.nordvpn.com") is True
+        assert mgr._host_blacklisted("217.138.207.139") is True
+
+    async def test_refused_chunk_is_degraded_not_error(self, tmp_path):
+        """Chunk st1 frais (sans timestamp → âge 0) + egress OK → degraded
+        routable voie grace, pending posé, recheck programmé."""
+        mgr = GraceFake(_gcfg(tmp_path), tmp_path)
+        mgr._current_ip = "9.9.9.9"
+        mgr.log_text = (
+            "TCP: connect to [AF_INET]217.138.207.139:443 failed: "
+            "Connection refused\n"
+            "SIGUSR1[connection failed(soft),connection-failed] received, "
+            "process restarting\n"
+        )
+        st = await mgr.refresh_status(force=True)
+        assert st["status"] == VPNState.DEGRADED
+        assert st["server_issue_pending"] is True
+        assert st["ip"] == "9.9.9.9"  # jamais purgée sur la voie degraded
+        _cancel(mgr._server_issue_recheck_task)
+
+    async def test_old_refused_chunk_is_pin_loop_degraded(self, tmp_path):
+        """Chunk st1 réel horodaté (vieux de > grace) + egress OK → degraded
+        voie pin-loop (pas de pending, pas de recheck) : la station reste
+        routable au lieu de coller en error."""
+        mgr = GraceFake(_gcfg(tmp_path), tmp_path)
+        mgr._current_ip = "9.9.9.9"
+        mgr.log_text = _ST1_REFUSED_CHUNK
+        st = await mgr.refresh_status(force=True)
+        assert st["status"] == VPNState.DEGRADED
+        assert st["ip"] == "9.9.9.9"  # jamais purgée sur la voie degraded

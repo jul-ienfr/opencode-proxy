@@ -52,8 +52,7 @@
           "type": "ephemeral"
         }
       }
-    ],
-    "tool_choice": "auto"
+    ]
   },
   "_note": "axe cache_control tools (A5) : le breakpoint outil est bien reporté sur l'entrée Chat",
   "_generated_by": "scripts/gen_golden_fixtures.py (plan v10 §11.5)"

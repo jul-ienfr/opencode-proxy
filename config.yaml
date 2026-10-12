@@ -19,6 +19,7 @@ upstream:
   keepalive_expiry: 30
   max_body_size: 10485760
   curl_sessions_per_station: 3
+  max_retries: 2
 routing:
   opus_model: kimi-k2.6
   sonnet_model: glm-5.1
@@ -30,104 +31,135 @@ routing:
 models:
   glm-5.2:
     protocol: openai
+    output_limit: 131072
   glm-5.1:
     protocol: openai
+    output_limit: 131072
   glm-5:
     protocol: openai
+    output_limit: 131072
   kimi-k2.5:
     protocol: openai
+    output_limit: 65536
   kimi-k2.6:
     protocol: openai
+    output_limit: 65536
   deepseek-v4-pro:
     protocol: openai
+    output_limit: 384000
   deepseek-v4-flash:
     protocol: openai
-  mimo-v2-pro:
-    protocol: openai
-  mimo-v2-omni:
-    protocol: openai
+    output_limit: 384000
   mimo-v2.5-pro:
     protocol: openai
+    output_limit: 128000
   mimo-v2.5:
     protocol: openai
+    output_limit: 128000
   minimax-m2.7:
     protocol: anthropic
+    output_limit: 131072
   minimax-m3:
     protocol: anthropic
+    output_limit: 131072
   minimax-m2.5:
     protocol: anthropic
   qwen3.7-max:
-    protocol: anthropic
+    protocol: openai
+    output_limit: 65536
   qwen3.7-plus:
     protocol: anthropic
+    output_limit: 65536
   qwen3.6-plus:
-    protocol: anthropic
+    protocol: openai
+    output_limit: 65536
   qwen3.5-plus:
     protocol: anthropic
+    output_limit: 65536
   kimi-k3:
     protocol: openai
+    output_limit: 131072
   kimi-k2.7-code:
     protocol: openai
+    output_limit: 262144
   glm-5.3:
     protocol: openai
+    output_limit: 131072
   qwen3.8-max:
     protocol: anthropic
+    output_limit: 131072
   hy3:
     protocol: openai
-  hy3-preview:
-    protocol: openai
+    output_limit: 128000
   gpt-5.6-luna:
     protocol: openai
+    api: responses
+    output_limit: 128000
   grok-4.5:
     protocol: openai
+    api: responses
+    output_limit: 500000
   muse-spark-1.2-contributor:
     protocol: openai
     api: responses
+    output_limit: 131072
     geo:
       extends: meta-muse-spark
   muse-spark-1.2-contributor-free:
     protocol: openai
     api: responses
+    output_limit: 131072
     geo:
       extends: meta-muse-spark
   deepseek-v4-flash-free:
     protocol: openai
+    output_limit: 128000
   mimo-v2.5-free:
     protocol: openai
+    output_limit: 32000
   nemotron-3-ultra-free:
     protocol: openai
+    output_limit: 128000
   nemotron-3.5-lightning-free:
     protocol: openai
+    output_limit: 262144
   deepseek-v4-flash-vision-exp:
     protocol: openai
+    output_limit: 384000
   longcat-2.0:
     protocol: openai
+    output_limit: 131072
   grok-4.6:
     protocol: openai
+    api: responses
+    output_limit: 500000
   glm-5.3-flash:
     protocol: openai
+    output_limit: 131072
   qwen3.8-flash:
     protocol: anthropic
+    output_limit: 131072
   hy4-preview:
     protocol: openai
+    output_limit: 64000
   ling-3.0-flash-fin-free:
     protocol: openai
+    output_limit: 32768
   muse-spark-1.3-contributor-free:
     protocol: openai
     api: responses
+    output_limit: 131072
     geo:
       extends: meta-muse-spark
   muse-spark-1.3-contributor:
     protocol: openai
     api: responses
+    output_limit: 131072
     geo:
       extends: meta-muse-spark
-  omen-alpha:
-    protocol: openai
-  deepseek-flash:
-    protocol: openai
   deepseek-v4.1-flash:
     protocol: openai
+    output_limit: 384000
   jev-1.13-free:
     protocol: openai
     endpoint: https://opencode.ai/zen/v1/systemone
@@ -136,34 +168,58 @@ models:
     endpoint: https://opencode.ai/zen/v1/systemone
   mimo-v2.6-flash-free:
     protocol: openai
+    output_limit: 32000
   mimo-v2.6-pro:
     protocol: openai
+    output_limit: 131072
   mimo-v2.6-flash:
     protocol: openai
+    output_limit: 131072
   grok-4.7:
     protocol: openai
+    api: responses
+    output_limit: 500000
   space-bunny-free:
     protocol: openai
+    output_limit: 524288
   gpt-6-luna:
     protocol: openai
+    api: responses
+    output_limit: 128000
   longcat-2.5-preview-free:
     protocol: openai
+    output_limit: 131072
   fledge-alpha-free:
     protocol: openai
+    output_limit: 131072
   ling-3.1-flash-free:
     protocol: openai
+    output_limit: 32768
+  space-bunny:
+    protocol: openai
+    output_limit: 524288
+  exo-free:
+    protocol: openai
+    output_limit: 131072
+  step-5-preview-free:
+    protocol: openai
+    output_limit: 65536
+  claude-haiku-5-5:
+    protocol: anthropic
+    output_limit: 128000
 free_model_map:
-  mimo-v2.5: mimo-v2.5-free
-  qwen3.7-max: mimo-v2.5-free
-  glm-5.1: mimo-v2.5-free
-  kimi-k2.6: mimo-v2.5-free
-  minimax-m2.5: mimo-v2.5-free
-  deepseek-v4-flash: mimo-v2.5-free
-  muse-spark-1.2-contributor: muse-spark-1.2-contributor-free
+  mimo-v2.5: mimo-v2.6-flash-free
+  qwen3.7-max: mimo-v2.6-flash-free
+  glm-5.1: mimo-v2.6-flash-free
+  kimi-k2.6: mimo-v2.6-flash-free
+  minimax-m2.5: mimo-v2.6-flash-free
+  deepseek-v4-flash: mimo-v2.6-flash-free
+  muse-spark-1.2-contributor: muse-spark-1.3-contributor-free
   muse-spark-1.3-contributor: muse-spark-1.3-contributor-free
   jev-1.13-free: jev-1.13-free
   jev-1.13: jev-1.13-free
   mimo-v2.6-flash: mimo-v2.6-flash-free
+  space-bunny: space-bunny-free
 dashboard_trust:
   mode: lan
   lan_cidrs:
@@ -211,6 +267,8 @@ ip_rotation:
   country_rotation: true
   credentials_file: vpn_configs/credentials.txt
   custom_ovpn_file: ''
+  docker_autostart: true
+  docker_autostart_cooldown_s: 600
   docker_compose_file: docker-compose.yml
   docker_container: opencode-vpn
   docker_container_2: opencode-vpn-2
@@ -226,9 +284,9 @@ ip_rotation:
   free_parallel:
     enabled: true
     routing: round-robin
-    mode: strict
-    hedge_delay_ms: 150
-    hedge_max_attempts: 2
+    mode: load-balance
+    hedge_delay_ms: 400
+    hedge_max_attempts: 1
   identity_diversity: true
   identity_max_profiles: 256
   identity_profiles:
@@ -275,7 +333,7 @@ ip_rotation:
   ov_auth_station_threshold: 5
   ov_auth_window_s: 1800
   ovpn_endpoint_port: ''
-  ovpn_protocol: udp
+  ovpn_protocol: tcp
   paid_hedge_after_ms: 0
   pin_widen_auths: 8
   pin_widen_minutes: 30
@@ -421,7 +479,6 @@ web_search:
   on_error: strip
 web_search_native:
 - muse-spark-1.2-contributor
-- muse-spark-1.2-contributor-free
 - muse-spark-1.3-contributor
 - muse-spark-1.3-contributor-free
 web_fetch:
@@ -453,6 +510,9 @@ server_compaction:
   summary_lean: true
   summary_lean_max_chars: 2000
   summary_clamp_max_tokens: 4096
+  keep_tokens: null
+  huge_warn_tokens: 0
+  huge_deny_tokens: 0
 circuit_breaker:
   failure_threshold: 5
   recovery_timeout: 60
@@ -518,6 +578,47 @@ thinking:
     nemotron-3-ultra: high
     nemotron-3.5-lightning: max
     jev: low
+  allow_list_enabled: false
+  reasoning_options:
+    deepseek-v4-pro:
+      variants:
+      - high
+      - max
+    glm-5.3:
+      variants:
+      - low
+      - high
+      - max
+    kimi-k2.6:
+      variants: []
+    kimi-k3:
+      variants:
+      - max
+    muse-spark:
+      variants:
+      - minimal
+      - low
+      - medium
+      - high
+      - xhigh
+    space-bunny:
+      variants:
+      - low
+      - medium
+      - high
+      - xhigh
+      - max
+    hy4-preview:
+      variants:
+      - none
+      - high
+    hy3:
+      variants:
+      - none
+      - low
+      - high
+    minimax-m2.7:
+      variants: []
   min_tokens:
     deepseek-v4-flash: 2048
     deepseek-v4-pro: 4096
@@ -544,10 +645,21 @@ free_discovery:
   enabled: true
   interval: 3600
   auto_persist: true
-  default_target: mimo-v2.5-free
+  default_target: mimo-v2.6-flash-free
   go_only_ids: []
+  purged_ids:
+  - deepseek-flash
+  - hy3-preview
+  - mimo-v2-omni
+  - mimo-v2-pro
+  - omen-alpha
+models_catalog:
+  enabled: false
+  output_dir: logs
 traffic:
   enabled: true
   max_frames: 500
   body_cap: 2097152
   max_bytes: 134217728
+protocol:
+  emit_default_tool_choice: false

@@ -237,16 +237,32 @@ class Global429BackoffMiddleware:
         if scope["type"] == "http" and not scope.get("path", "").startswith(self._SKIP_PREFIXES):
             wait = self._remaining_fn()
             if wait > 0:
-                resp = JSONResponse(
-                    {
-                        "error": {
-                            "message": "upstream 429 storm — global backoff active",
-                            "type": "rate_limit_error",
-                        }
-                    },
-                    status_code=503,
-                    headers={"Retry-After": str(int(wait) + 1)},
-                )
+                _path = str(scope.get("path", ""))
+                # Parité officielle : enveloppe Anthropic sur les routes Messages,
+                # sinon le SDK ne reconnaît pas le retry et rend la main.
+                if "/messages" in _path or _path.startswith("/anthropic"):
+                    resp = JSONResponse(
+                        {
+                            "type": "error",
+                            "error": {
+                                "type": "rate_limit_error",
+                                "message": "upstream 429 storm — global backoff active",
+                            },
+                        },
+                        status_code=429,
+                        headers={"Retry-After": str(int(wait) + 1)},
+                    )
+                else:
+                    resp = JSONResponse(
+                        {
+                            "error": {
+                                "message": "upstream 429 storm — global backoff active",
+                                "type": "rate_limit_error",
+                            }
+                        },
+                        status_code=429,
+                        headers={"Retry-After": str(int(wait) + 1)},
+                    )
                 await resp(scope, receive, send)
                 return
         await self.app(scope, receive, send)

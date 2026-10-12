@@ -13,6 +13,13 @@ import asyncio
 
 DEFAULT_PING_INTERVAL = 15.0  # s, même défaut que config.yaml
 DEFAULT_COALESCE_MAX = 64 * 1024  # plafond micro-batch (B3)
+# [P0-1] Borne d'inactivité amont par défaut (s). Un amont qui ouvre la
+# connexion puis se tait (tunnel mort, fournisseur figé) ne doit jamais
+# donner un flux vivant-mais-vide jusqu'au timeout TCP : la pompe émet une
+# erreur explicite après ce délai sans le moindre octet. L'hôte
+# (opencode.py) surcharge avec ``streaming.sse_idle_timeout`` (paid, parité
+# chunkTimeout officiel 300 s) ou 120 s (jambe free, tunnels moins stables).
+DEFAULT_IDLE_TIMEOUT = 120.0
 
 
 def _notifier(on_error, exc) -> None:
@@ -35,7 +42,7 @@ async def sse_pump(
     coalesce_max: int = DEFAULT_COALESCE_MAX,
     on_error=None,
     error_event: bytes | None = None,
-    idle_timeout: float | None = None,
+    idle_timeout: float | None = DEFAULT_IDLE_TIMEOUT,
 ):
     """[P4.5 perf] Pompe SSE fusionnée — remplace _sse_keepalive+_sse_coalesce séparés.
 
@@ -59,8 +66,9 @@ async def sse_pump(
     que la pompe continue d'envoyer des ``: ping`` toutes les 15 s. Le client voit
     donc un flux vivant mais VIDE, sans erreur ni log : « ça s'arrête d'un coup ».
     Au-delà de ``idle_timeout`` sans le moindre octet amont, on notifie l'hôte et on
-    émet ``error_event``. ``None`` (défaut) désactive la borne : le comportement des
-    appelants existants est inchangé.
+    émet ``error_event``. ``None`` (désactivation explicite) restaure l'ancien
+    comportement sans borne — réservé aux appelants qui portent déjà leur
+    propre watchdog (l'hôte passe toujours ``streaming.sse_idle_timeout``).
 
     `ping_interval` falsy → pas de pings, `coalesce_max` falsy → pas de coalesce.
     """
@@ -178,7 +186,9 @@ async def sse_pump(
                 return
             elif timer_task is not None and timer_task in done:
                 timer_task = None
-                yield b": ping\n\n"
+                # Parité officielle Anthropic Messages SSE : `event: ping` + `data: {"type":"ping"}`
+                # (l'ancien `: ping` n'est qu'un commentaire SSE, ignoré par le SDK qui attend l'event).
+                yield b"event: ping\ndata: {\"type\": \"ping\"}\n\n"
     finally:
         if timer_task is not None and not timer_task.done():
             timer_task.cancel()
@@ -193,4 +203,4 @@ async def sse_pump(
 # Alias historique (opencode._sse_pump).
 _sse_pump = sse_pump
 
-__all__ = ["DEFAULT_COALESCE_MAX", "DEFAULT_PING_INTERVAL", "sse_pump", "_sse_pump"]
+__all__ = ["DEFAULT_COALESCE_MAX", "DEFAULT_IDLE_TIMEOUT", "DEFAULT_PING_INTERVAL", "sse_pump", "_sse_pump"]

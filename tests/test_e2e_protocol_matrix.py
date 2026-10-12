@@ -59,8 +59,15 @@ EP_RESPONSES = "https://opencode.ai/zen/go/v1/responses"
 EP_FREE_CHAT = "https://opencode.ai/zen/v1/chat/completions"
 EP_FREE_RESPONSES = "https://opencode.ai/zen/v1/responses"
 
-# ModÃ¨les clients : cible payante unique par chemin (aucun Ã©quivalent free dans
-# FREE_MODEL_MAP) â†’ la jambe payante est exercÃ©e sans dÃ©pendre du swap free.
+# Modeles clients : cible payante unique par chemin.
+# Z1 (plan 19.5, lot Z) : `_install_seams` vide SORTED_CUSTOM_ROUTES, donc
+# `custom_routes` ne reecrit AUCUN de ces ids avant la resolution d'endpoint --
+# la matrice mesure le seul couple (protocol, api) declare dans `models:`.
+# Le shadow lui-meme est verrouille par tests/test_custom_routes_shadow.py.
+# `muse-spark-1.3-contributor` est la SEULE a avoir un equivalent free
+# (`free_model_map`, config.yaml:176) : les tests P5 comptent sur le stub de
+# `_try_free_model_first` pour rester sur la jambe payante malgre tout -- d'ou
+# l'assertion `is not None` de test_corpus_is_wired_to_real_models.
 PAID_ANTHRO = "minimax-m3"  # /v1/messages + /v1/chat/completions + /v1/responses â†’ anthropic
 PAID_CHAT = "glm-5"  # â†’ openai chat/completions
 PAID_RESPONSES = "muse-spark-1.3-contributor"  # â†’ openai /v1/responses
@@ -448,6 +455,17 @@ def _install_seams(monkeypatch, recorder: UpstreamRecorder):
     monkeypatch.setattr(oc, "_alias_for_key", lambda key: "test-alias", raising=False)
     monkeypatch.setattr(oc, "_try_free_model_first", _no_free, raising=False)
     monkeypatch.setattr(oc, "_response_cache", _NullCache(), raising=False)
+
+    # [Lot Z, plan §19.5 option A] La matrice veut l'endpoint induit par
+    # ``protocol``/``api`` du modèle DEMANDÉ. Or ``custom_routes`` réécrit l'id
+    # AVANT la résolution d'endpoint (app/router/__init__.py:108-119, passage
+    # unique non transitif) : ``muse-spark-1.3-contributor`` partait vers
+    # ``step-5-preview-free`` (jambe anonyme) et cassait P5 responses. On sort
+    # donc ``SORTED_CUSTOM_ROUTES`` du champ du fichier — sans toucher la config.
+    # ``_route_for`` vide ``_route_cache`` quand ``ROUTE_VERSION`` change, d'où
+    # le bump : sinon l'entrée mise en cache par un test précédent survivrait.
+    monkeypatch.setattr(_cfg_settings, "SORTED_CUSTOM_ROUTES", [])
+    monkeypatch.setattr(_cfg_settings, "ROUTE_VERSION", _cfg_settings.ROUTE_VERSION + 1)
 
     def _auth_headers(protocol, entry=None):
         """En-tÃªtes d'auth factices â€” jamais de vraie clÃ©."""

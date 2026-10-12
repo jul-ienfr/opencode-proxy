@@ -133,3 +133,10 @@ Le proxy tourne EN LOCAL sur cette machine : `pythonw opencode.py --gui`
 (system tray + dashboard, http://localhost:4000). Pas de serveur distant,
 pas de SSH, pas de systemd/Docker : restart = tuer le process pythonw et
 relancer. Ne jamais supposer ni proposer un déploiement distant.
+
+Auto-relance Docker ([docker-autostart 2026-10-07]) : si Docker
+Desktop quitte (veille, quit manuel), le watchdog relance Desktop tout seul
+(`vpn/manager.py:request_docker_autostart`, max 1 fois / 10 min —
+`ip_rotation.docker_autostart` / `docker_autostart_cooldown_s`). État visible
+dans `/api/vpn-status` (champ `docker_daemon`) + badge dashboard. Un
+AUTH_FAILED NordVPN ne déclenche jamais de relance (rate-limit compte).

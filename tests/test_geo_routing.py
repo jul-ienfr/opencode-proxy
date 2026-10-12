@@ -154,7 +154,8 @@ class TestGeoGateIntegration:
 
         route = {"model": "x", "geo": {"allowed_countries": ["United States"], "mode": "strict"}}
         resp = opencode._geo_block_response(route, "Germany", "anthropic")
-        assert resp.status_code == 400
+        # Parité officielle : 403 permission (un 400 fait croire à une bad request).
+        assert resp.status_code == 403
 
     def test_coalescing_same_allowed(self):
         import asyncio

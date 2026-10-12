@@ -23,6 +23,56 @@ import json as _json
 _SUMMARY_CAP = 4096  # cap client officiel : min(outputLimit, 4096)
 
 
+# Rubriques exigées du résumé (aligné officiel : template structuré imposé,
+# réponse invalide → 1 corrective, cf. has_required_outline/REWRITE_PROMPT).
+_REQUIRED_HEADINGS = (
+    "objective",
+    "decisions",
+    "completed work",
+    "active work",
+    "next steps",
+    "relevant files",
+)
+
+_STRUCTURE_INSTRUCTIONS = (
+    "Write a structured summary to allow continuing the work in a fresh context "
+    "window where the raw history above will be replaced with this summary. "
+    "Use exactly these sections (omit none, keep each concise):\n"
+    "## Objective\n## Decisions\n## Completed work\n"
+    "## Active work and next steps\n## Relevant files and context"
+)
+
+
+def has_required_outline(summary_text) -> bool:
+    """True si le résumé contient ≥1 rubrique exigée (`#` optionnel, casse libre).
+
+    Validation réplique officielle : un résumé sans aucune rubrique est
+    rejeté (1 corrective, puis échec franc). Ne lève jamais.
+    """
+    try:
+        if not isinstance(summary_text, str) or not summary_text.strip():
+            return False
+        low = summary_text.lower()
+        return any(h in low for h in _REQUIRED_HEADINGS)
+    except Exception:
+        return False
+
+
+def build_rewrite_prompt(bad_summary: str) -> str:
+    """Prompt correctif unique quand le résumé ne respecte pas les rubriques."""
+    try:
+        attempt = bad_summary if isinstance(bad_summary, str) else ""
+    except Exception:
+        attempt = ""
+    return (
+        "The previous response did not use the required sections. Rewrite it "
+        "using exactly these sections (omit none, keep each concise):\n"
+        "## Objective\n## Decisions\n## Completed work\n"
+        "## Active work and next steps\n## Relevant files and context\n\n"
+        "Previous attempt:\n<attempt>\n" + attempt[:8000] + "\n</attempt>"
+    )
+
+
 def build_summary_user_text(history_text: str, previous_summary: str | None = None) -> str:
     """Corps du message user résumeur (template compaction : chaînage previousSummary)."""
     prev = (previous_summary or "").strip()
@@ -31,13 +81,14 @@ def build_summary_user_text(history_text: str, previous_summary: str | None = No
         return (
             "Previous summary:\n<previous-summary>\n" + prev + "\n</previous-summary>\n\n"
             "Conversation to summarize:\n<conversation>\n" + hist + "\n</conversation>\n\n"
-            "Write a concise summary of the conversation above, continuing from the "
-            "previous summary. Cover goals, key decisions, current state, and open items."
+            + _STRUCTURE_INSTRUCTIONS
+            + " Continue from the previous summary: preserve still-true details, "
+              "remove stale ones, merge in the new facts."
         )
     return (
-        "Summarize the following conversation concisely. "
-        "Cover goals, key decisions, current state, and open items.\n\n"
-        "<conversation>\n" + hist + "\n</conversation>"
+        "Summarize the following conversation concisely.\n\n"
+        "<conversation>\n" + hist + "\n</conversation>\n\n"
+        + _STRUCTURE_INSTRUCTIONS
     )
 
 
@@ -183,11 +234,57 @@ def build_summarizer_for_api(summary_text_input: str, max_tokens: int, model_id:
         return build_summarizer_body(summary_text_input, max_tokens)
 
 
+_MEDIA_PLACEHOLDER = "[Attached {kind}: {name}]"
+
+
+def _media_descriptor(block) -> str | None:
+    """Descripteur texte d'un bloc média (image/fichier), ou None si non-média.
+
+    Aligné officiel (stripMedia) : les octets embarqués ne partent jamais
+    vers le résumeur — un descripteur suffit à situer la pièce.
+    Ne lève jamais.
+    """
+    try:
+        if not isinstance(block, dict):
+            return None
+        t = str(block.get("type", "")).lower()
+        if t in ("image", "image_url"):
+            src = block.get("source", {}) if isinstance(block.get("source"), dict) else {}
+            st = str(src.get("type", "")).lower()
+            if st == "url" or block.get("image_url"):
+                url = src.get("url", "") or block.get("image_url", "")
+                return _MEDIA_PLACEHOLDER.format(kind="image", name=str(url)[:120] or "url")
+            if st == "base64":
+                return _MEDIA_PLACEHOLDER.format(kind="image", name="embedded data omitted")
+            return _MEDIA_PLACEHOLDER.format(kind="image", name="omitted")
+        if t in ("file", "document", "input_file"):
+            name = block.get("filename", "") or block.get("name", "") or "file"
+            return _MEDIA_PLACEHOLDER.format(kind="file", name=str(name)[:120])
+        return None
+    except Exception:
+        return None
+
+
 def _serialize_history_for_summary(messages) -> str:
     """Sérialise messages → texte (role: contenu), jamais d'exception."""
     try:
         if not isinstance(messages, list):
             return ""
+        # Allègement façon officielle AVANT sérialisation : sorties d'outils
+        # rognées (même règle que summary-lean, 2000 chars) — jamais l'original.
+        # L'historique est une liste : on l'enveloppe pour lean (messages/input).
+        try:
+            from app.compaction.lean import lean_summary_body as _lean_hist
+
+            _looks_responses = any(
+                isinstance(_m, dict) and "type" in _m for _m in (messages or [])
+            )
+            _wrap_key = "input" if _looks_responses else "messages"
+            _wrapped, _ = _lean_hist({_wrap_key: messages}, max_chars=2000)
+            if isinstance(_wrapped, dict) and isinstance(_wrapped.get(_wrap_key), list):
+                messages = _wrapped[_wrap_key]
+        except Exception:
+            pass
         parts = []
         for m in messages:
             if not isinstance(m, dict):
@@ -195,11 +292,17 @@ def _serialize_history_for_summary(messages) -> str:
             role = m.get("role", "?")
             content = m.get("content")
             if isinstance(content, list):
-                txt = " ".join(
-                    str(b.get("text", b.get("content", "")))
-                    if isinstance(b, dict) else str(b)
-                    for b in content
-                )
+                chunks = []
+                for b in content:
+                    if not isinstance(b, dict):
+                        chunks.append(str(b))
+                        continue
+                    desc = _media_descriptor(b)
+                    if desc is not None:
+                        chunks.append(desc)
+                        continue
+                    chunks.append(str(b.get("text", b.get("content", ""))))
+                txt = " ".join(chunks)
             else:
                 txt = "" if content is None else str(content)
             parts.append(f"{role}: {txt[:4000]}")
@@ -295,7 +398,44 @@ async def run_summarizer(
             data = _json.loads(raw) if isinstance(raw, str) else {}
         except Exception:
             return None
-        return _extract_text(data)
+        summary = _extract_text(data)
+        if summary and has_required_outline(summary):
+            return summary
+        # Aligné officiel : 1 SEULE corrective quand les rubriques manquent
+        # (résumé vide/hors-format), puis échec franc (None → relais intact).
+        if not summary:
+            return None
+        try:
+            rewrite_body = build_summarizer_for_api(
+                build_rewrite_prompt(summary), summary_max_tokens, model_id, _api or "chat"
+            )
+            try:
+                rewrite_body["model"] = model_id
+            except Exception:
+                pass
+
+            async def _once_more():
+                return await do_request_fn(endpoint, rewrite_body, headers, protocol)
+
+            try:
+                resp2, _ = await asyncio.wait_for(_once_more(), timeout=timeout_s)
+            except Exception:
+                return None
+            try:
+                if getattr(resp2, "status_code", 0) != 200:
+                    return None
+                raw2 = resp2.content
+                if isinstance(raw2, (bytes, bytearray)):
+                    raw2 = bytes(raw2).decode("utf-8", errors="replace")
+                data2 = _json.loads(raw2) if isinstance(raw2, str) else {}
+            except Exception:
+                return None
+            summary2 = _extract_text(data2)
+            if summary2 and has_required_outline(summary2):
+                return summary2
+            return None
+        except Exception:
+            return None
     except Exception:
         return None
 

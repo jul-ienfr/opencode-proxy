@@ -4,7 +4,10 @@
   429 (déplacés depuis ``opencode.py``, déplacement pur) ;
 * ``upstream.clients`` — pool de sessions curl + clients HTTP partagés par
   rôle (idem) ;
-* ``upstream.quotas`` — cache court fetch_quotas/429 + watchdog TTFB (idem).
+* ``upstream.quotas`` — cache court fetch_quotas/429 + watchdog TTFB (idem) ;
+* ``upstream.retry`` — helper retry centralisé : parse ``Retry-After``
+  (secondes/date HTTP) + backoff exponentiel + jitter (P0-5) +
+  normalisation du budget de reprises lu en config (G2).
 
 Modules purs : AUCUN import du projet (``opencode`` / ``config`` /
 ``dashboard`` / ``vpn_manager`` interdits). Tout ce qui varie est injecté
@@ -12,6 +15,6 @@ Modules purs : AUCUN import du projet (``opencode`` / ``config`` /
 possédé par l'hôte et passé en paramètre) — cf. docs/PLAN_REFONTE.md §7.
 """
 
-from upstream import breaker, clients, quotas
+from upstream import breaker, clients, quotas, retry
 
-__all__ = ["breaker", "clients", "quotas"]
+__all__ = ["breaker", "clients", "quotas", "retry"]

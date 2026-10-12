@@ -31,10 +31,19 @@ upstream:
   max_keepalive: 32
   keepalive_expiry: 30
   pool: 5
+  # [PLAN ALIGNEMENT CLIENT OFFICIEL G2] budget de reprises sur échec 5xx
+  # (relais non-stream + bornes des 4 boucles de flux). Défaut 2 = historique.
+  max_retries: 2
 ```
 
 - `max_connections 64` backpressure: above 64 concurrent upstream, httpx queues (timeout `pool 5` s) → 503 if saturated, protects Opencode. [P2.5 perf] défaut 500→64 : un proxy mono-utilisateur n'a jamais besoin de 500 conns ; FDs/mémoire libérés, pool toujours chaud. Hot-reloadable.
 - `max_keepalive 32` reuse: 32 idle keep-alive slots, expiry 30 s — avoids TIME_WAIT storm.
+- `max_retries 2` : nombre de tentatives sur échec amont **rejouable** (5xx, plus les statuts ambigus dont le corps déclare une surcharge — lot G1). Seul point de lecture : `opencode._upstream_max_retries()`, qui résout `upstream.max_retries` → l'historique `streaming.retry_attempts` → `2`. Tant que la nouvelle clé reste absente/vide, c'est donc l'ancienne qui fait foi (aucun changement de comportement pour qui n'a réglé que celle-là).
+  - **Ce budget n'est PAS consommé par le failover de clé** (429/401/403 → rotation vers une autre clé du pool) : ce mécanisme a son propre compteur et ouvre sa propre fenêtre d'auth.
+  - **Jambe libre** (lot I3) : sa borne est `max(budget, len(API_KEYS))` + coups libres — le réglage ne peut jamais l'abaisser sous le nombre de clés du pool, et ses délais (0,5 s plafonné à 2 s, idle 120 s) sont indépendants de ce budget. `tests/test_upstream_retry_budget.py` verrouille ce plancher.
+  - Délais : `Retry-After` amont honoré s'il est exploitable (borné 600 s), sinon backoff `1 × 2**tentative` + jitter ±25 % (`upstream.retry.compute_retry_delay`). Le client officiel vise 5 tentatives base 2 s cap 30 s : l'écart est **assumé** (§14.2 du plan) — le proxy compense par le failover de clé, le hedging et le watchdog TTFB, qui n'existent pas côté client.
+  - Plafond dur `RETRY_BUDGET_MAX = 10` et refus des valeurs illisibles (`0`, booléens YAML `yes`/`on`, texte) : la borne libre dérive de ce budget, une faute de frappe multiplierait les connexions amont par requête client.
+  - Bench: `python -m pytest tests/test_upstream_retry_budget.py tests/test_retry_helper.py -q`.
 - Bench: `scripts/bench.py --url http://localhost:4000 --stream`.
 
 ## Health caches

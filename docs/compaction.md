@@ -77,7 +77,21 @@ server_compaction:
   summary_lean: true        # jambe free : sorties d'outils tronquées sur trafic
                             # compactage détecté (l'amont digère mal les Mo)
   summary_lean_max_chars: 2000
+  summary_clamp_max_tokens: 4096  # sortie résumés plafonnée (officiel)
+  keep_tokens: null         # budget tokens queue (officiel keep.tokens) ; null = paires
+  keep_recent_pairs: 4      # ... utilisées quand keep_tokens est null
+  huge_warn_tokens: 0       # 0 = off ; warn log au-delà (opt-in)
+  huge_deny_tokens: 0       # 0 = off ; 413 actionnable au-delà (opt-in)
 ```
+
+### Template, allègement et garde (aligné officiel)
+
+- Résumeur : template à rubriques (`## Objective…`), 1 corrective si
+  rubriques absentes puis échec franc, médias strippés en descripteurs,
+  sorties d'outils rognées — comme l'officiel, sans jamais bloquer.
+- Queue gardée au budget tokens quand `keep_tokens` est posé (sinon paires).
+- Garde pré-forward opt-in (`huge_*`, 0 = inactive) : warn log / 413
+  actionnable avant l'amont, seuils absolus (pas de table par modèle).
 
 ### Streams de compactage (tiny-retry)
 

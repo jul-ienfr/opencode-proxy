@@ -2,6 +2,8 @@
 import copy
 import json
 
+import pytest
+
 import protocol_mapping as pm
 
 _N = pm._normalize_tool_schema
@@ -194,7 +196,8 @@ class TestStrictSubsetGuarantee:
 
     def test_wire_schemas_strict_subset(self):
         wire = self._load_wire_params()
-        assert wire is not None, f"dump {self.DUMP} introuvable"
+        if wire is None:
+            pytest.skip(f"dump {self.DUMP} absent (logs/ est gitignoré)")
         for name in self.NAMES:
             assert name in wire, f"outil {name} absent du dump"
         for name in self.NAMES:
@@ -204,7 +207,8 @@ class TestStrictSubsetGuarantee:
 
     def test_wire_schemas_idempotent(self):
         wire = self._load_wire_params()
-        assert wire is not None, f"dump {self.DUMP} introuvable"
+        if wire is None:
+            pytest.skip(f"dump {self.DUMP} absent (logs/ est gitignoré)")
         for name in self.NAMES:
             once = _N(copy.deepcopy(wire[name]), self.MODEL)
             twice = _N(copy.deepcopy(once), self.MODEL)

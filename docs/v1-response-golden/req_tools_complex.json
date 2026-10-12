@@ -235,8 +235,7 @@
           }
         }
       }
-    ],
-    "tool_choice": "auto"
+    ]
   },
   "_note": "complex schema — anyOf null + type array null + additionalProperties + format + description truncate + nesting flatten + enum vide + $ref",
   "_generated_by": "scripts/gen_golden_fixtures.py (plan v10 §11.5)"

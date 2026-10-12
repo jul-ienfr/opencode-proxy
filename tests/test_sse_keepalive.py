@@ -64,8 +64,8 @@ class TestKeepalive:
 
         out = await _consume(oc._sse_keepalive(gen(), interval=0.05))
         assert out[0] == b"a" and out[-1] == b"b"
-        assert b": ping\n\n" in out
-        assert all(c == b": ping\n\n" for c in out[1:-1])
+        assert b"event: ping\n" in out[1]
+        assert all(c.startswith(b"event: ping") for c in out[1:-1])
 
     @pytest.mark.asyncio
     async def test_stall_is_bridged_not_killed(self):
@@ -77,7 +77,8 @@ class TestKeepalive:
         the chunk arrives once the upstream wakes up.
         """
         out = await _consume(oc._sse_keepalive(_gen_that_stalls(0.10, b"late"), interval=0.05))
-        assert out == [b"first", b": ping\n\n", b"late"]
+        assert out[0] == b"first" and out[-1] == b"late"
+        assert out[1].startswith(b"event: ping")
 
     @pytest.mark.asyncio
     async def test_multiple_pings_then_data(self):
@@ -89,7 +90,7 @@ class TestKeepalive:
         leaves the ping count far from the assertion boundary.
         """
         out = await _consume(oc._sse_keepalive(_gen_that_stalls(0.20, b"late"), interval=0.02))
-        pings = [c for c in out if c == b": ping\n\n"]
+        pings = [c for c in out if c.startswith(b"event: ping")]
         assert len(pings) >= 3
         assert out[-1] == b"late"
 
@@ -110,7 +111,8 @@ class TestKeepalive:
             yield b"c"
 
         out = await _consume(oc._sse_keepalive(gen(), interval=0.05))
-        assert out == [b"a", b": ping\n\n", b"b", b"c"]
+        assert out[0] == b"a" and out[2] == b"b" and out[-1] == b"c"
+        assert out[1].startswith(b"event: ping")
 
     @pytest.mark.asyncio
     async def test_stop_async_iteration_ends_stream(self):

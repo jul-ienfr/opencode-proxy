@@ -341,7 +341,13 @@ def _get_auth_headers(protocol: str, entry: dict | None = None) -> dict:
 _ANTHROPIC_BETA = "interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14"
 # Parité OpenCodeClient (anthropicBlockBinding) : le SDK patché ajoute ce beta
 # dès que `thinking.blockBinding` est posé — sans lui l'amont rejette le champ.
-_ANTHROPIC_BINDING_BETA = "thinking-binding-controls"
+# [C2 — alignement client officiel] La forme est DATÉE, exactement comme le client
+# l'émet (`@ai-sdk%2Fanthropic@3.0.111.patch:133`) : la forme nue
+# `thinking-binding-controls` n'est pas un nom de beta reconnu, et un amont
+# strict y répond 400. Si un modèle ancien exigeait la forme nue, elle s'ajoute
+# via l'union de `_ensure_anthropic_beta` (client betas / header entrant) — pas
+# par cette constante.
+_ANTHROPIC_BINDING_BETA = "thinking-binding-controls-2026-08-01"
 
 
 def _body_has_thinking_block_binding(body) -> bool:
@@ -368,8 +374,9 @@ def _ensure_anthropic_beta(headers: dict, body=None) -> dict:
     (dédupliquées). `anthropic-version` : valeur client prioritaire si fournie.
 
     `body` (optionnel, corps Anthropic) : si `thinking.blockBinding` est posé
-    (parité 5.1+), le beta `thinking-binding-controls` est ajouté — sans lui
-    l'amont rejette le champ en 400.
+    (parité 5.1+), le beta `thinking-binding-controls-2026-08-01` est ajouté —
+    sans lui l'amont rejette le champ en 400. La forme est DATÉE (C2), comme chez
+    le client officiel.
     """
     try:
         if not isinstance(headers, dict):
@@ -526,11 +533,13 @@ from app.compaction import is_native_compaction as _is_native_compaction  # noqa
 from app.compaction import maybe_condense as _maybe_condense  # noqa: E402  # [Phase 2 compaction]
 from app.compaction.classify import has_free_leg as _classify_has_free_leg  # noqa: E402  # [Compaction voie unifiée]
 from app.compaction.classify import is_free_class as _classify_is_free_class  # noqa: E402
+from app.compaction.overflow import huge_context_check as _huge_context_check  # noqa: E402
 from app.compaction.plan import summarizer_plan as _plan_summarizer_plan  # noqa: E402
 from app.compaction.streaming import anthropic_sse_from_completion as _compact_anthropic_sse  # noqa: E402
 from app.compaction.streaming import chat_sse_from_completion as _compact_chat_sse  # noqa: E402
 from app.compaction.streaming import completion_text as _compact_text  # noqa: E402
 from app.compaction.streaming import final_has_nontext_blocks as _compact_final_has_nontext  # noqa: E402
+from app.compaction.streaming import is_tiny_result as _compact_is_tiny  # noqa: E402
 from app.compaction.streaming import should_buffer_compaction as _should_buffer_compaction  # noqa: E402
 from app.compaction.transport import (  # noqa: E402
     normalize_free_responses as _transport_normalize,  # noqa: E402  # [Compaction voie unifiée]
@@ -1570,6 +1579,22 @@ _curl_pool: dict[str, _CurlSessionPool] = {}  # key -> pool (E2: get direct mono
 from upstream.clients import evict_later as _evict_later  # noqa: E402
 
 
+def _curl_timeout() -> tuple:
+    """Timeout (connect, read) des sessions curl poolées — lu depuis la config.
+
+    [P0-1] Connect fixe 10 s (handshake SOCKS5+TLS ≈ 1-2 s sur tunnel sain),
+    read = ``upstream.timeout.read`` (défaut 600 = filet ultime, TOUJOURS
+    au-delà de l'idle SSE paid 300 / free 120 qui émet l'erreur propre
+    avant). Rendre le read configurable sans toucher au code.
+    """
+    try:
+        t2 = yaml_get("upstream", "timeout", {})
+        read = float(t2.get("read", 600) if isinstance(t2, dict) else 600)
+    except Exception:
+        read = 600.0
+    return (10, read)
+
+
 async def _get_pooled_curl_session(proxy_url: str | None, impersonate: str, fp_override: dict | None = None):
     """Emprunte une session du pool pour (proxy, face réseau).
 
@@ -1604,13 +1629,13 @@ async def _get_pooled_curl_session(proxy_url: str | None, impersonate: str, fp_o
     slot = await pool.checkout(
         lambda: _curl_requests_mod.AsyncSession(
             proxy=_curl_proxy_url(proxy_url),
-            # [P1.1 perf] timeout=(connect 10, read 600) AU NIVEAU SESSION :
+            # [P1.1 perf] timeout AU NIVEAU SESSION via _curl_timeout() :
             # toutes les sessions poolées l'héritent — POST non-stream,
             # streams free et requêtes geo, y compris les appels qui ne
-            # passent pas de timeout explicite. Read 600 : longs streams ;
-            # le watchdog cancel_streams reste la 2ᵉ couche (détection
-            # egress-mort < timeout read).
-            timeout=(10, 600),
+            # passent pas de timeout explicite. Read = upstream.timeout.read
+            # (filet ultime > idle SSE) ; le watchdog cancel_streams reste
+            # la 2ᵉ couche (détection egress-mort < timeout read).
+            timeout=_curl_timeout(),
             **sess_kwargs,
         )
     )
@@ -1711,6 +1736,9 @@ from upstream.clients import RoleClientStore as _RoleClientStore  # noqa: E402
 from upstream.clients import (  # noqa: E402
     aclose_role_client_after as _aclose_role_client_after,  # noqa: F401  # re-export (test_role_clients.py)
 )
+from upstream.retry import compute_retry_delay as _compute_retry_delay  # noqa: E402
+from upstream.retry import parse_retry_after as _parse_retry_after  # noqa: E402
+from upstream.retry import resolve_max_retries as _resolve_max_retries  # noqa: E402
 
 _role_store = _RoleClientStore()
 _role_clients: "dict[str, tuple[httpx.AsyncClient, str | None]]" = _role_store.clients
@@ -2717,6 +2745,18 @@ async def lifespan(app):
                     f"  [db] maintenance hebdo OK en {time.monotonic() - t0:.1f}s "
                     f"(checkpoint+VACUUM, {_db_path} = {size_mo} Mo)"
                 )
+                # [P0-4] Alerte taille : la base live doit rester < 1 Go
+                # (fenêtre récente seule, l'historique part en archive/).
+                # Au-delà → `python scripts/archive_db.py --apply` puis
+                # `python scripts/purge_logs.py --apply`.
+                try:
+                    if size_mo and float(size_mo) > 1024:
+                        _log(
+                            f"  WARN [db] {_db_path} = {float(size_mo):.0f} Mo > 1 Go — "
+                            "lancer scripts/archive_db.py --apply"
+                        )
+                except Exception:
+                    pass
             except Exception as e:
                 _debug(f"  [db] maintenance hebdo échouée (fail-soft): {type(e).__name__}: {e}")
             await asyncio.sleep(3600)  # re-programme l'année suivante au prochain calcul
@@ -3192,8 +3232,15 @@ async def debug_exception(request: Request, exc: Exception):
     client_ip = _get_client_ip(request)
     _log(f"ERROR {request.method} {request.url.path} from {client_ip}: {type(exc).__name__}: {exc}")
     _debug(f"Traceback (500):\n{tb}")
-    # Don't expose tracebacks to clients — log them server-side only
-    return JSONResponse(status_code=500, content={"error": "Erreur interne du serveur"})
+    # Don't expose tracebacks to clients — log them server-side only.
+    # Parité officielle : enveloppe selon la route (Anthropic vs OpenAI).
+    try:
+        _p = str(request.url.path or "")
+    except Exception:
+        _p = ""
+    if "/messages" in _p or _p.startswith("/anthropic"):
+        return _anthropic_error(500, "Internal server error")
+    return _openai_error(500, "Internal server error")
 
 
 # Server manager set later in __main__ for GUI mode; None means always-running
@@ -3815,6 +3862,8 @@ def _geo_block_response(
     mode = str(resolved.get("mode", "strict")) if isinstance(resolved, dict) else "strict"
     ui_mode = "best_effort" if mode == "prefer" else mode
     status = str(resolved.get("geo_status", "ok")) if isinstance(resolved, dict) else "ok"
+    # Parité officielle : refus permanent -> pas de Retry-After (un `0` invite à
+    # une boucle serrée ; seul un délai réel et actionnable doit être envoyé).
     headers = {
         "X-Geo-Blocked": "1",
         "X-Geo-Allowed": body_allowed,
@@ -3822,9 +3871,10 @@ def _geo_block_response(
         "X-Geo-Mode": ui_mode,
         "X-Geo-Status": status,
         "X-Geo-Pinned": "false",
-        "Retry-After": "0",
     }
-    code = 451 if passthrough_451 else (400 if protocol == "anthropic" else 403)
+    # Statut officiel par protocole : 403 permission (jamais 400 côté Anthropic,
+    # un 400 fait croire à une bad request retryable à l'infini).
+    code = 451 if passthrough_451 else 403
     payload_anthropic: dict[str, Any] = {
         "type": "error",
         "error": {
@@ -4429,9 +4479,12 @@ _AUTH_WINDOW_CODES = {401, 403}
 def _safe_client_status(upstream_status: int) -> int:
     """Statut à renvoyer au client pour éviter la fenêtre d'auth de Claude Code.
 
-    401/403/429 → 503, 499 → 502, sinon inchangé.
+    Parité officielle : 429 (rate_limit) et 529 (overloaded) sont préservés
+    tels quels pour que le SDK backoffe correctement. Seuls 401/403 → 503
+    (clé/région proxy bloquée, rien que l'utilisateur puisse corriger en se
+    reconnectant) et 499 → 502 (code non-standard).
     """
-    if upstream_status in _AUTH_WINDOW_CODES or upstream_status == 429:
+    if upstream_status in _AUTH_WINDOW_CODES:
         return 503
     if upstream_status == 499:
         return 502
@@ -4977,6 +5030,13 @@ def _free_wire_body(body, force_stream: bool = False):
         base = list(tools) if isinstance(tools, list) else []
         base.extend(_free_shim_tool(n, is_resp) for n in missing)
         wire["tools"] = base
+    if is_chat and need_order:
+        # [E3 — parité client officiel] Les shims « bash »/« read » doivent être
+        # triés AVEC le reste, pas simplement ajoutés en fin de liste : le client
+        # officiel trie l'ensemble des outils par nom (request.ts:184). Le tri
+        # porte donc sur l'état FINAL (outils d'origine + shims), et sur les
+        # outils d'origine seuls quand aucun shim ne manque.
+        wire["tools"] = _sorted_chat_tools(wire.get("tools"))
     if need_tc:
         # Le client pose « auto » dès qu'il y a des tools (242/242 mesures).
         wire["tool_choice"] = "auto"
@@ -5379,11 +5439,18 @@ def _enrich_paid_wire_headers(headers: dict, endpoint: str = "", conversation_ke
 
     Le client officiel envoie sur TOUTES les jambes, payante incluse : UA
     ``opencode/<ver> ai-sdk/provider-utils/<v> runtime/bun/<v>`` (4.0.40 sur
-    /responses, 4.0.23 sur /chat — deux bundles ai-sdk) + x-opencode-*
-    (ses_/msg_ temporels). La jambe paid n'envoyait que Authorization +
+    /responses, 4.0.23 sur /chat — deux bundles ai-sdk) + ``x-opencode-session-id``
+    (toutes requêtes) +, pour les providers ``opencode*`` seulement, x-opencode-client
+    / -project / -session / -request. La jambe paid n'envoyait que Authorization +
     Content-Type (+ UA python-httpx par défaut). Sémantique setdefault :
     Authorization (clé + failover) et toute valeur déjà posée sont intouchables.
     Borné aux endpoints OpenAI-protocol — chemin Anthropic et jambe free exclus.
+
+    ``x-opencode-session-id`` vaut la même valeur que ``x-opencode-session``
+    (``request.ts:188-189`` VS ``:190-197`` : deux noms, un sessionID). **Jambe
+    free volontairement écartée** : son wire est verrouillé octet-exact par une
+    capture 243 requêtes (``tests/test_official_client_parity.py``), y changer
+    demande une re-mesure (§6 D2).
     """
     try:
         ep = endpoint or ""
@@ -5408,6 +5475,18 @@ def _enrich_paid_wire_headers(headers: dict, endpoint: str = "", conversation_ke
                 )
             except Exception:
                 pass
+        # §6 D2 — le client officiel émet `x-opencode-session-id` sur TOUTES les
+        # requêtes (request.ts:188-189), AVANT les en-têtes `opencode*` ; ceux-ci
+        # ne concernent que les providers `opencode*` (request.ts:190-197), dont
+        # le nôtre : `x-opencode-session` est donc en réalité le **même**
+        # sessionID relu sous un autre nom. Même valeur, deux rôles côté amont.
+        # Sémantique setdefault comme les voisins ; si le `ses_` n'a pas pu être
+        # minté (exception avalée ci-dessus), on n'invente pas une valeur
+        # orpheline — mieux vaut l'en-tête absent qu'incohérent.
+        if "x-opencode-session-id" not in lowered:
+            _sid = out.get("x-opencode-session")
+            if isinstance(_sid, str) and _sid:
+                out["x-opencode-session-id"] = _sid
         if "x-opencode-request" not in lowered:
             try:
                 out["x-opencode-request"] = _free_request_msg_id()
@@ -5553,7 +5632,7 @@ async def _do_free_request_curl_cffi(
                 _ep,
                 content=_serialize_json_body(wire_body),
                 headers=req_headers,
-                timeout=(10, 600),  # (connect, read) — read 600: long streams
+                timeout=_curl_timeout(),  # (connect, read) — cf. _curl_timeout()
                 stream=_force_wire_stream,
             )
         except asyncio.CancelledError:
@@ -5883,6 +5962,44 @@ async def _compaction_normalize_response(resp, endpoint, body):
         return resp
 
 
+def _huge_context_verdict(body, body_bytes):
+    """(level, message) de la garde pré-forward opt-in — None si inactive.
+
+    Lit ``huge_warn_tokens``/``huge_deny_tokens`` (0 = off, défaut) puis
+    n'estime (``_estimate_input_tokens``) que si le préfiltre octet
+    (seuil*3, rapide) passe : coût nul quand l'opt-in est off. Ne lève
+    jamais.
+    """
+    try:
+        try:
+            _warn = get_server_compaction("huge_warn_tokens", 0)
+        except Exception:
+            _warn = 0
+        try:
+            _deny = get_server_compaction("huge_deny_tokens", 0)
+        except Exception:
+            _deny = 0
+        try:
+            _pre = max(int(_warn or 0), int(_deny or 0))
+        except Exception:
+            return None, ""
+        if _pre <= 0:
+            return None, ""
+        try:
+            _nbytes = len(body_bytes or b"")
+        except Exception:
+            return None, ""
+        if _nbytes < _pre * 3:
+            return None, ""
+        try:
+            _est = int(_estimate_input_tokens(body) or 0)
+        except Exception:
+            return None, ""
+        return _huge_context_check(_nbytes, _est, warn_tokens=_warn, deny_tokens=_deny)
+    except Exception:
+        return None, ""
+
+
 async def _try_free_with_tiny_retry(send_body, headers, protocol, model_id, *, forced_pool=None, req_id=None):
     """Free-first + 1 refetch station fraîche sur sortie tiny (free-only, pré-réponse).
 
@@ -5943,7 +6060,9 @@ async def _try_free_with_tiny_retry(send_body, headers, protocol, model_id, *, f
         else:
             _in = usage.get("prompt_tokens", 0) or usage.get("input_tokens", 0)
             _out = usage.get("completion_tokens", 0) or usage.get("output_tokens", 0)
-        if not _is_suspect_tiny_output(_in, _out, _tools_used):
+        if not _is_suspect_tiny_output(_in, _out, _tools_used) and not _compact_is_tiny(
+            _in, _out, _tools_used
+        ):
             return result
     except Exception:
         return result
@@ -6652,10 +6771,10 @@ def effective_free_max_attempts(forced_pool=None) -> int:
     Auto mode (``auto_max_free_attempts`` true, default): derived from the
     number of *usable* egresses — ``len(_socks5_enabled_eps())`` in socks5
     mode, else ``resolved_station_count`` filtered by ``forced_pool`` when
-    present (geo). Clamped to [1, 3]; direct is never counted.
+    present (geo). Clamped to [1, 5]; direct is never counted.
 
     Manual mode (auto false): respects ``max_free_attempts`` clamped to
-    [1, 3] + WARN if it exceeds the usable count (operator asked for more
+    [1, 5] + WARN if it exceeds the usable count (operator asked for more
     attempts than stations exist).
     """
     # Manual override — respect the stored value, but warn when incoherent
@@ -6888,13 +7007,14 @@ async def _open_free_stream(
                 _free_impersonate, _free_fp = _get_free_fp_kwargs()
                 # [gate body 2026-09-18] grille tools sur le corps stream.
                 wire_body, _ = _free_wire_body(body, force_stream=True)
-                # [P1.1 perf] timeout=(10, 600) posé AU NIVEAU DE LA FACTORY
-                # de session poolée (_get_pooled_curl_session) : le POST
-                # ci-dessous n'a plus besoin d'un timeout par appel — toutes
-                # les sessions poolées l'héritent. Read 600 inchangé (longs
-                # streams). SOCKS5+TLS handshake ≈ 1-2 s sur un tunnel sain —
-                # aucune requête légitime n'est impactée ; un tunnel mort est
-                # détecté par le watchdog cancel_streams AVANT le read 600.
+                # [P1.1 perf] timeout posé AU NIVEAU DE LA FACTORY
+                # de session poolée (_curl_timeout : connect 10 + read config
+                # upstream.timeout.read) : le POST ci-dessous n'a plus besoin
+                # d'un timeout par appel — toutes les sessions poolées
+                # l'héritent. SOCKS5+TLS handshake ≈ 1-2 s sur un tunnel
+                # sain — aucune requête légitime n'est impactée ; un tunnel
+                # mort est détecté par le watchdog cancel_streams AVANT le
+                # read (filet ultime > idle SSE).
                 _debug(f"  [free-stream] creating curl_cffi session proxy={_curl_proxy_url(proxy_url)} (pooled)")
                 pool2, slot2 = await _get_pooled_curl_session(proxy_url, _free_impersonate, _free_fp)
                 # [A1 perf] emprunt SANS verrou pendant le POST : seuls les
@@ -7051,7 +7171,7 @@ async def _open_free_stream(
         # (UA officielle + x-opencode-*, beta si Anthropic). Ici (tête de boucle)
         # car le failover TTFB remplace headers en fin de boucle.
         if _s_protocol == "anthropic":
-            # body passé pour le beta thinking-binding-controls (parité 5.1+).
+            # body passé pour le beta thinking-binding-controls-2026-08-01 (C2, parité 5.1+).
             headers = _ensure_anthropic_beta(headers, body)
         else:
             headers = _enrich_paid_wire_headers(headers, endpoint, _body_conversation_key(body))
@@ -8479,6 +8599,18 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
                         if _last_tunnel_exc is not None
                         else "no usable VPN station/tunnel"
                     )
+                    # [docker-autostart 2026-10-07] daemon down connu →
+                    # message actionnable au lieu du curl brut.
+                    try:
+                        from vpn.manager import docker_daemon_status as _dd_status
+
+                        if _dd_status().get("reachable") is False:
+                            _tun_msg = (
+                                "Docker daemon unreachable (Docker Desktop arrêté ?) — "
+                                "relance automatique en cours, réessayez dans ~1 min"
+                            )
+                    except Exception:
+                        pass
                     try:
                         _fallback_ctx_push(req_id, free_model, 503)
                     except Exception:
@@ -9061,6 +9193,38 @@ def _bump_ttfb_failover(key_alias: str, stage: str) -> None:
     _quotas_mod.bump_ttfb_failover(_TTFB_FAILOVER_COUNTS, _FB_METRICS_LOCK, key_alias, stage)
 
 
+def _upstream_max_retries() -> int:
+    """[PLAN_ALIGNEMENT_CLIENT_OFFICIEL G2] Budget de reprises amont.
+
+    SEUL point de lecture de ce réglage dans tout le fichier : les cinq sites
+    (relais payant non-stream + les quatre bornes de flux) l'appellent au lieu
+    de lire chacun leur ``yaml_get``, pour qu'augmenter le budget à 3-4
+    tentatives sur les 502 reste une décision de configuration et pas une
+    chasse à cinq endroits.
+
+    Ordre de résolution — la rétro-compatibilité d'abord :
+    ``upstream.max_retries`` (nouveau, absent aujourd'hui), puis l'historique
+    ``streaming.retry_attempts`` (``2`` dans ``config.yaml``), puis ``2``.
+    Tant que la nouvelle clé n'est pas écrite, la valeur effective est donc
+    EXACTEMENT celle d'avant. Une clé nouvelle présente mais VIDE
+    (``max_retries:`` → ``None``, ou ``max_retries: ''``) compte comme non
+    écrite : sinon un YAML à moitié rempli ferait tomber sur ``2`` en dur au
+    lieu de laisser l'historique s'exprimer.
+
+    Le bornage et le refus des valeurs illisibles vivent dans
+    ``upstream.retry.resolve_max_retries`` (module pur, testé seul).
+    """
+    try:
+        _raw = yaml_get("upstream", "max_retries", None)
+        if isinstance(_raw, str) and not _raw.strip():
+            _raw = None
+        if _raw is None:
+            _raw = yaml_get("streaming", "retry_attempts", None)
+        return _resolve_max_retries(_raw, default=2)
+    except Exception:
+        return 2
+
+
 def _ttfb_watchdog_enabled() -> bool:
     try:
         _tw = yaml_get("circuit_breaker", "ttfb_watchdog", {}) or {}
@@ -9190,8 +9354,9 @@ async def _do_request_with_retry(endpoint, body, headers, protocol, retry_on_429
             # [Correctif parité multi-tours] marqueur interne jamais envoyé à
             # l'upstream — consommé par le retry-once du caller.
             body.pop("_has_synthetic_reasoning_items", None)
-    _RETRYABLE_STATUSES = {500, 502, 503, 504, 499}
-    max_retries = yaml_get("streaming", "retry_attempts", 2)
+    _RETRYABLE_STATUSES = {500, 502, 503, 504, 499, 408, 409, 425, 529}
+    # [G2] budget centralisé (upstream.max_retries, défaut inchangé)
+    max_retries = _upstream_max_retries()
     attempt = 0
     # [plan-perf Lot 2] étape du watchdog TTFB (0=jamais déclenché,
     # 1=retentative même clé sur connexion neuve, 2=clé alternative).
@@ -9299,6 +9464,27 @@ async def _do_request_with_retry(endpoint, body, headers, protocol, retry_on_429
                 headers = _get_auth_headers(protocol, entry=alt)
                 continue  # retry immediately without incrementing attempt
 
+        # Key failover on 529 overloaded — parité officielle : l'officiel file
+        # d'attente sur 529, nous on bascule de clé immédiatement (mieux que
+        # l'officiel, sans changer le contrat client qui voit 529+overloaded
+        # si toutes les clés sont surchargées).
+        if retry_on_429 and resp.status_code == 529 and len(API_KEYS) > 1:
+            failed_key = _key_from_headers(headers, protocol)
+            try:
+                _key_pauser.pause_key(failed_key, 60, "529 Overloaded (temporary)")
+            except Exception:
+                pass
+            alt = _find_alternative_key(failed_key)
+            if alt:
+                _debug(f"  ⟳ 529 failover: {failed_key[:8]}… → alias={alt.get('alias', '?')}")
+                _log("  529 overloaded on key, retrying with alternative key")
+                try:
+                    _bump_failover_counter("paid", "overloaded_529", "alt_key")
+                except Exception:
+                    pass
+                headers = _get_auth_headers(protocol, entry=alt)
+                continue
+
         # Key failover on 401 — does NOT consume a retry attempt
         if resp.status_code == 401 and len(API_KEYS) > 1:
             failed_key = _key_from_headers(headers, protocol)
@@ -9339,7 +9525,13 @@ async def _do_request_with_retry(endpoint, body, headers, protocol, retry_on_429
             except Exception:
                 _err_body = "(unable to read response body)"
             _debug(f"  [auth] 403 response body: {_redact(_err_body, 500)}")
-            _key_pauser.pause_key(failed_key, 1800, "403 Forbidden (region/model not allowed)")
+            # Parité config : pause 403 configurable comme 401 (défaut 1800s),
+            # lue live pour hot-reload.
+            try:
+                _pause_403 = float(yaml_get("key_pause", "key_pause_403_sec", 1800) or 1800)
+            except Exception:
+                _pause_403 = 1800
+            _key_pauser.pause_key(failed_key, _pause_403, "403 Forbidden (region/model not allowed)")
             alt = _find_alternative_key(failed_key)
             if alt:
                 _debug(f"  ⟳ 403 failover: {failed_key[:8]}… → alias={alt.get('alias', '?')}")
@@ -9353,9 +9545,28 @@ async def _do_request_with_retry(endpoint, body, headers, protocol, retry_on_429
         # retourne toujours False. Rejouer la même requête ne résout jamais un
         # policy hit : fix côté compte (opt-in workspace, voir message B1).
 
-        # Retry on 502/503/504 with backoff — DOES consume a retry attempt
-        if resp.status_code in _RETRYABLE_STATUSES and attempt < max_retries - 1:
-            wait = 1.0 * (2**attempt)  # 1s, 2s
+        # Retry on 502/503/504 (+408/409/425/529 parité SDK) with backoff — DOES consume a retry attempt
+        # Parité officielle : honore Retry-After upstream + jitter (évite thundering herd).
+        # [P0-5] Politique centralisée upstream.retry (même comportement : exp
+        # 1s/2s, Retry-After jusqu'à max_pause 600s, jitter ±25%).
+        # [G1] Lecture du CORPS, pas seulement du statut : un statut ambigu
+        # (400/404/408/409/422/425) dont le corps déclare une surcharge
+        # transitoire (`server_is_overloaded` / `server_error`) se rejoue.
+        # Borné par `max_retries` comme les autres, et jamais sur
+        # 401/403/429/499 (failover de clé / fenêtre auth, géré plus haut).
+        _motif_retry = False
+        if resp.status_code not in _RETRYABLE_STATUSES:
+            try:
+                _motif_retry = _motif_retryable(resp.status_code, resp.text[:4000])
+            except Exception:
+                _motif_retry = False
+        if (resp.status_code in _RETRYABLE_STATUSES or _motif_retry) and attempt < max_retries - 1:
+            _ra = (resp.headers.get("retry-after") or resp.headers.get("Retry-After") or "").strip() if hasattr(resp, "headers") else ""
+            # Parité officielle : honorer la consigne amont jusqu'à max_pause
+            # (600s défaut), pas 120s tronqués. Au-delà → backoff local pour
+            # ne pas bloquer un worker.
+            _ra_f = _parse_retry_after(_ra, max_s=600.0)
+            wait = _compute_retry_delay(attempt, retry_after=_ra_f, base=1.0, cap=600.0)
             _debug(f"  ⟳ retry {resp.status_code} in {wait:.1f}s")
             _log(f"  RETRY {resp.status_code} after {wait:.1f}s (attempt {attempt + 1}/{max_retries})")
             await asyncio.sleep(wait)
@@ -9647,6 +9858,24 @@ async def _stream_error_response(
         free_status=free_status,
         paid_status=paid_status,
     )
+    # Parité protocole : sur route OpenAI le client attend `data: {"error":...}`
+    # + `[DONE]`, jamais `event: error` Anthropic (erreur invisible sinon).
+    try:
+        _proto = str(protocol or "").lower()
+    except Exception:
+        _proto = ""
+    if _proto in ("openai", "chat", "responses"):
+        try:
+            _em = error_payload.get("error", {}) if isinstance(error_payload, dict) else {}
+            _emsg = _em.get("message", "upstream error") if isinstance(_em, dict) else str(error_payload)[:500]
+            _etype = _em.get("type", "api_error") if isinstance(_em, dict) else "api_error"
+        except Exception:
+            _emsg, _etype = "upstream error", "api_error"
+        return (
+            b"data: "
+            + _json_dumps_str({"error": {"message": _emsg, "type": _etype}}, ensure_ascii=False).encode()
+            + b"\n\ndata: [DONE]\n\n"
+        )
     return _sse("error", error_payload)
 
 
@@ -9778,7 +10007,11 @@ async def _free_stream_refuse_bytes(
         _cap = ""
     _debug(f"  [free-400-stream] req_id={req_id} leg=free {free_model!r} status={_status} body={_cap[:512]!r}")
     _retry_after = (resp.headers.get("retry-after", "") or "").strip()
-    if _status == 429:
+    # [fix faux-429 stream] Miroir de free_refusal_response (non-stream) : on ne
+    # brandit « quota épuisé » que pour un VRAI quota (motif dans le corps).
+    # Un 429 « Endpoint is unavailable » = surcharge serveur transitoire :
+    # message véridique + type overloaded_error (jamais rate_limit_error).
+    if _status == 429 and _is_free_quota_failure(_status, _cap):
         if _retry_after:
             _msg429 = f"Free quota exhausted on all VPN stations. Retry after {_retry_after}s."
         else:
@@ -9791,15 +10024,16 @@ async def _free_stream_refuse_bytes(
             },
         }
     else:
-        # [FIX classement harness] statut en MOTS : un « 403 » littéral faisait
-        # classer ce refus de politique (free tier / DataPolicy) en « AUTH » par
-        # `classifyPiAiError()` (dsh-llm-pi-ai) → l'UI annonçait « API key is
-        # invalid » alors que la cause réelle est dans le body (ex. FreeTierError).
-        # Le code numérique reste dans les logs (`free_status=...`).
+        # [fix faux-429 stream] Branch transitoire : 429 SANS motif quota
+        # (« Endpoint is unavailable ») ou autre statut. Parité non-stream
+        # (classify_upstream_error) : type déduit du corps — overloaded_error
+        # pour la surcharge, api_error sinon — et message véridique portant
+        # le vrai corps (tronqué + redacté), jamais « quota épuisé ».
+        _, _etype = _classify_upstream_error(_status, _cap)  # statut déjà porté par _status
         _payload = {
             "type": "error",
             "error": {
-                "type": "api_error",
+                "type": _etype,
                 "message": f"Free model request failed: {_status_word(_status)} — {_redact(_body, 300)}",
             },
         }
@@ -9911,18 +10145,26 @@ def _free_fallback_bookkeep(
     tag,
     with_host=False,
     paid_endpoint=None,
+    refused=False,
 ):
+    # [fix log-mensonger] Quand le refuse strict est déjà décidé (_refuse=True),
+    # aucune jambe payée ne part : le log doit dire free→refuse, pas free→paid.
+    _leg = "free→refuse" if refused else "free→paid"
+    _arrow = "refused (strict_free, no paid leg)" if refused else f"→ paid {track_model!r}"
     _fallback_ctx_push(req_id, free_model, status_code)
-    _log_fallback(req_id, "free→paid", free_model, status_code, track_model)
+    _log_fallback(req_id, _leg, free_model, status_code, track_model)
     if with_host:
         _debug(
-            f"  [{tag}] req_id={req_id} leg=free→paid free_status={status_code} free_model={free_model!r} → paid {track_model!r} host={urllib.parse.urlparse(paid_endpoint).hostname}"
+            f"  [{tag}] req_id={req_id} leg={_leg} free_status={status_code} free_model={free_model!r} {_arrow} host={urllib.parse.urlparse(paid_endpoint).hostname}"
         )
     else:
         _debug(
-            f"  [{tag}] req_id={req_id} leg=free→paid free_status={status_code} free_model={free_model!r} → paid {track_model!r}"
+            f"  [{tag}] req_id={req_id} leg={_leg} free_status={status_code} free_model={free_model!r} {_arrow}"
         )
-    _log(f"  FREE model {status_code} → falling back to paid {track_model!r}")
+    if refused:
+        _log(f"  FREE model {status_code} → refused (strict_free, no paid leg)")
+    else:
+        _log(f"  FREE model {status_code} → falling back to paid {track_model!r}")
     _log_free_model_usage(
         track_model,
         free_model,
@@ -10032,6 +10274,32 @@ def _should_retry_empty_stream(has_yielded: bool, stream_out) -> bool:
         return False
 
 
+def _stream_cache_delta(usage, current) -> tuple:
+    """[F2] Cache réel porté par un `message_delta` → `(nouveau, delta)`.
+
+    Pur, jamais de raise. `None` quand le chunk n'apporte rien
+    d'utilisable : clé absente, valeur non entière (str, float, bool, None)
+    ou identique au courant — dans ce cas l'appelant ne touche à rien.
+
+    Pourquoi le delta et pas la valeur nue : le `usage` de plusieurs
+    gateways est CUMULATIF d'un bout à l'autre du flux. Le `message_start`
+    en porte déjà une première fois, le delta final le répète en entier.
+    Le crédit doit suivre la DIFFÉRENCE (`nouveau - courant`) : ce qui a
+    déjà été porté au crédit au start est déduit, donc un `usage` cumulatif
+    n'est compté qu'une fois. Additionner la valeur double-compterait.
+    """
+    try:
+        value = usage.get("cache_read_input_tokens")
+        if not isinstance(value, int) or isinstance(value, bool):
+            return None
+        current = current or 0
+        if value == current:
+            return None
+        return value, value - current
+    except Exception:
+        return None
+
+
 def _sse(event: str, payload: dict) -> bytes:
     return f"event: {event}\ndata: {_json_dumps_str(payload, ensure_ascii=False)}\n\n".encode()
 
@@ -10106,7 +10374,15 @@ async def _sse_keepalive(
     error_event: bytes | None = None,
     idle_timeout: float | None = None,
 ):
-    """Wrapper fin pour compat tests — ping seul, pas de coalesce."""
+    """Wrapper fin pour compat tests — ping seul, pas de coalesce.
+
+    [P0-1] ``idle_timeout=None`` (défaut historique) retombe sur
+    ``_SSE_IDLE_TIMEOUT`` (``streaming.sse_idle_timeout``, parité 300 s) au
+    lieu de désactiver la borne : aucun flux sans watchdog. Passer
+    explicitement ``0`` ou une valeur pour surcharger/désactiver.
+    """
+    if idle_timeout is None:
+        idle_timeout = _SSE_IDLE_TIMEOUT or None
     async for chunk in _sse_pump(
         stream_gen,
         ping_interval=interval,
@@ -10161,7 +10437,13 @@ async def _sse_coalesce(
     error_event: bytes | None = None,
     idle_timeout: float | None = None,
 ):
-    """Wrapper fin pour compat tests — coalesce seul, pas de ping."""
+    """Wrapper fin pour compat tests — coalesce seul, pas de ping.
+
+    [P0-1] Même retombée que ``_sse_keepalive`` : ``None`` → borne
+    ``_SSE_IDLE_TIMEOUT`` (jamais de flux sans watchdog).
+    """
+    if idle_timeout is None:
+        idle_timeout = _SSE_IDLE_TIMEOUT or None
     async for chunk in _sse_pump(
         stream,
         ping_interval=0,
@@ -10395,7 +10677,6 @@ def _is_web_tool_native(model_id: str) -> bool:
     except ImportError:
         _ALLOW = [
             "muse-spark-1.2-contributor",
-            "muse-spark-1.2-contributor-free",
             "muse-spark-1.3-contributor",
             "muse-spark-1.3-contributor-free",
         ]
@@ -10697,6 +10978,7 @@ from app.protocol.mapping import (  # noqa: E402,I001  # re-export after functio
     _responses_to_anthropic_response,
     _responses_to_chat_response,
     _sanitize_native_responses_request,
+    _sorted_chat_tools,
     responses_stream_events,
     responses_stream_sse,
     restore_chat_response_tool_names,
@@ -11100,13 +11382,13 @@ async def messages(request: Request):
     _debug(f"  [body] read {len(body_bytes)} bytes in {(time.monotonic() - start_time) * 1000:.0f}ms")
     if len(body_bytes) > MAX_BODY_SIZE:
         _debug(f"  413: body too large ({len(body_bytes)} bytes)")
-        return _anthropic_error(413, f"Request body too large ({len(body_bytes)} bytes, max {MAX_BODY_SIZE})")
+        return _anthropic_error(413, f"Request body too large ({len(body_bytes)} bytes, max {MAX_BODY_SIZE})", error_type="invalid_request_error")
 
     try:
         body = _json_loads(body_bytes)
     except Exception:
         _debug("  400: invalid JSON body")
-        return _anthropic_error(400, "invalid json")
+        return _anthropic_error(400, "invalid json", error_type="invalid_request_error")
 
     original_model = body.get("model", "")
     tool_names = _extract_tool_names(body)
@@ -11137,17 +11419,22 @@ async def messages(request: Request):
     route = _route_for(original_model)
     if route is None:
         _debug(f"[messages] ✗ no route found for {original_model!r}")
-        available = sorted(MODELS.keys())
-        return Response(
-            content=_json_dumps_str({"error": f"Model not found: {original_model!r}", "available_models": available}),
-            status_code=404,
-            media_type="application/json",
-        )
+        # Parité officielle : enveloppe Anthropic sur route Anthropic
+        # (le SDK lève NotFoundError typée au lieu d'un 404 brut).
+        return _anthropic_error(404, f"Model not found: {original_model!r}", error_type="not_found_error")
     model_id = route["model"]
     cfg = get_model_config(model_id)
     endpoint = cfg["endpoint"]
     protocol = cfg["protocol"]
     _debug(f"[messages] route: {original_model!r} → {model_id} | {protocol} | endpoint={endpoint}")
+
+    # [Compaction garde opt-in] contexte énorme : warn (log) ou deny (413
+    # actionnable) AVANT l'amont. Inactif par défaut (seuils à 0).
+    _huge_level, _huge_msg = _huge_context_verdict(body, body_bytes)
+    if _huge_level == "deny":
+        return _anthropic_error(413, _huge_msg)
+    if _huge_level == "warn":
+        _log(f"  [compaction] {_huge_msg} model={original_model!r}")
 
     body = dict(body)
     body["model"] = model_id
@@ -11197,7 +11484,19 @@ async def messages(request: Request):
     # Circuit breaker check
     if not _cb_should_allow(endpoint):
         _log(f"  CIRCUIT BREAKER OPEN — fast-failing request to {endpoint}")
-        return _anthropic_error(503, "Service temporarily unavailable (circuit breaker open)")
+        _cb_resp = _anthropic_error(503, "Service temporarily unavailable (circuit breaker open)")
+        # Parité officielle : Retry-After réel = recovery_timeout config,
+        # jamais `60` fixe qui fait attendre 4x trop si l'opérateur règle 15s.
+        try:
+            _cb_ra = int(float(yaml_get("circuit_breaker", "recovery_timeout", 60) or 60))
+            _cb_ra = min(max(_cb_ra, 1), 600)
+        except Exception:
+            _cb_ra = 60
+        try:
+            _cb_resp.headers["Retry-After"] = str(_cb_ra)
+        except Exception:
+            pass
+        return _cb_resp
 
     # ── Anthropic pass-through ──────────────────────────────────
     if protocol == "anthropic":
@@ -11313,6 +11612,32 @@ async def messages(request: Request):
                 cached_body, cached_headers = cached
                 _debug(f"  cache HIT key={cache_key[:16]}… size={len(cached_body)} bytes")
                 _log(f"  ← {model_id} | cache HIT")
+                # Parité officielle : un HIT reste compté (l'officiel ne cache
+                # jamais : 2 appels identiques = 2 usages). On rejoue le body
+                # (gain latence) mais on recompte l'usage gelé pour ne pas
+                # fausser dashboard/compaction. Jamais de coût nul silencieux.
+                try:
+                    _hit_data = _orjson.loads(cached_body) if isinstance(cached_body, (bytes, bytearray)) else {}
+                    _hit_usage = _hit_data.get("usage", {}) if isinstance(_hit_data, dict) else {}
+                    _hit_in = _hit_usage.get("input_tokens", 0) or _hit_usage.get("prompt_tokens", 0) or 0
+                    _hit_out = _hit_usage.get("output_tokens", 0) or _hit_usage.get("completion_tokens", 0) or 0
+                    # Parité stream : lire les 2 formes de cache (Anthropic +
+                    # OpenAI-converti), sinon HIT sous-compte le cache_read.
+                    try:
+                        from app.protocol.mapping import _extract_cache_tokens as _hit_cache_fn
+                    except Exception:
+                        _hit_cache_fn = None
+                    if _hit_cache_fn is not None:
+                        try:
+                            _hit_cache = _hit_cache_fn(_hit_usage) or 0
+                        except Exception:
+                            _hit_cache = _hit_usage.get("cache_read_input_tokens", 0) or 0
+                    else:
+                        _hit_cache = _hit_usage.get("cache_read_input_tokens", 0) or 0
+                    if _hit_in or _hit_out:
+                        _update_token_usage(model_id, _hit_in, _hit_out, _hit_cache, _extract_cache_creation_tokens(_hit_usage))
+                except Exception:
+                    pass
                 return Response(
                     content=cached_body,
                     headers={**cached_headers, "X-Cache": "HIT"},
@@ -11481,6 +11806,8 @@ async def messages(request: Request):
                                         enabled=True,
                                         summary_max_tokens=_mk,
                                         keep_recent_pairs=_kr,
+                                        keep_tokens=get_server_compaction("keep_tokens", None),
+                                        estimate_tokens_fn=_estimate_input_tokens,
                                         timeout_s=_to,
                                         markers=_mrk,
                                         api=_s_api,
@@ -11566,19 +11893,34 @@ async def messages(request: Request):
                                         )
                         except Exception:
                             pass
-                if resp.status_code in (429, 401, 403):
-                    # [Phase 1 compaction] shape-compaction : relayer intact
-                    # (statut + Retry-After réel) au lieu de 503 — le client
-                    # sait backoffer sur 429 et doit voir les soucis d'auth.
+                if resp.status_code in (429, 401, 403, 529):
+                    # Parité officielle : 429 → 429 rate_limit_error + Retry-After réel,
+                    # 529 → 529 overloaded_error, pour que le SDK backoffe au lieu de
+                    # rendre la main. 401/403 → 503 (fenêtre auth proxy, pas client).
+                    # Shape-compaction : relais intact dans tous les cas.
+                    _ra_p = None
+                    try:
+                        _ra_p = resp.headers.get("retry-after") or resp.headers.get("Retry-After")
+                    except Exception:
+                        _ra_p = None
                     if _is_compaction:
-                        _pass = resp.headers.get("retry-after") or resp.headers.get("Retry-After")
-                        _pass_headers = {"Retry-After": _pass} if _pass else None
+                        _pass_headers = {"Retry-After": _ra_p} if _ra_p else None
                         return Response(
                             content=resp.content,
                             status_code=resp.status_code,
                             media_type="application/json",
                             headers=_pass_headers,
                         )
+                    if resp.status_code == 429:
+                        _r429 = _anthropic_error(429, msg, error_type="rate_limit_error")
+                        if _ra_p:
+                            _r429.headers["Retry-After"] = str(_ra_p)
+                        return _r429
+                    if resp.status_code == 529:
+                        _r529 = _anthropic_error(529, msg or "Overloaded. Try again later.", error_type="overloaded_error")
+                        if _ra_p:
+                            _r529.headers["Retry-After"] = str(_ra_p)
+                        return _r529
                     return _anthropic_error(503, msg)
                 if resp.status_code == 499:
                     return _anthropic_error(502, msg)
@@ -11739,7 +12081,9 @@ async def messages(request: Request):
             _handle_429 = _make_stream_retry_loop("anthropic")
             _geo_tunnel = getattr(request.state, "_geo_force_tunnel", False)
             _free_forced_pool = getattr(request.state, "_geo_forced_pool", None)
-            _free_bound = yaml_get("streaming", "retry_attempts", 2)
+            # [G2] budget centralisé ; le plancher len(API_KEYS) ci-dessous
+            # protège la jambe free (lot I3) quel que soit le réglage.
+            _free_bound = _upstream_max_retries()
             _free_bound = max(_free_bound, len(API_KEYS))
             if _using_free and _free_attempts_active(_free_forced_pool):
                 # [plan 19/08 §1] free multi-attempt: extra free strikes on
@@ -11856,7 +12200,7 @@ async def messages(request: Request):
                                 endpoint = paid_endpoint
                                 _using_free = False
                                 _track_model = model_id
-                                _free_fallback_bookkeep(req_id, free_model, resp.status_code, _track_model, "stream")
+                                _free_fallback_bookkeep(req_id, free_model, resp.status_code, _track_model, "stream", refused=_refuse)
                                 if _refuse:
                                     yield await _free_stream_refuse_bytes(
                                         resp,
@@ -11969,9 +12313,22 @@ async def messages(request: Request):
                                 )
                             else:
                                 err_msg = f"HTTP {resp.status_code}: {err.decode('utf-8', errors='replace')[:200]}"
+                            # Parité officielle : typer l'event stream comme le non-stream
+                            # (rate_limit/overloaded au lieu de api_error générique),
+                            # sinon le SDK ne backoffe jamais sur les flux longs.
+                            try:
+                                _et = (
+                                    "rate_limit_error"
+                                    if resp.status_code == 429
+                                    else "overloaded_error"
+                                    if resp.status_code == 529
+                                    else "api_error"
+                                )
+                            except Exception:
+                                _et = "api_error"
                             error_payload = {
                                 "type": "error",
-                                "error": {"type": "api_error", "message": err_msg},
+                                "error": {"type": _et, "message": err_msg},
                             }
                             # DB/console gardent le vrai statut upstream (resp.status_code)
                             yield await _stream_error_response(
@@ -11997,7 +12354,27 @@ async def messages(request: Request):
                             return
                         _conv_state = None
                         _conv_buf = ""
-                        async for chunk in resp.aiter_bytes():
+                        # Parité officielle : keepalive ping + borne idle sur le chemin
+                        # natif (avant : aucun ping ni idle_timeout ici, flux long sans
+                        # keepalive applicatif). La pompe n'injecte que des events
+                        # valides Anthropic (`ping`/`error`) relayés tels quels.
+                        _pump = _sse_pump(
+                            resp.aiter_bytes(),
+                            ping_interval=_SSE_KEEPALIVE_INTERVAL,
+                            coalesce_max=0,
+                            on_error=_note_sse_abort,
+                            error_event=_SSE_ERR_ANTHROPIC,
+                            idle_timeout=_SSE_IDLE_TIMEOUT or None,
+                        )
+                        async for chunk in _pump:
+                            if chunk.startswith(b"event: ping"):
+                                yield chunk
+                                continue
+                            if chunk.startswith(b"event: error"):
+                                yield chunk
+                                _bytes_flushed = True
+                                _out_text = chunk.decode("utf-8", errors="replace")
+                                break
                             if not _free_chat_stream:
                                 yield chunk
                                 _bytes_flushed = True
@@ -12104,6 +12481,31 @@ async def messages(request: Request):
                                     usage = event.get("usage", {})
                                     stream_out = usage.get("output_tokens", 0)
                                     stop_reason = event.get("delta", {}).get("stop_reason", stop_reason)
+                                    # [F2] Le vrai chiffre de cache arrive SOUVENT
+                                    # ici et pas au `message_start` : l'API
+                                    # Anthropic rend 0 au start et le chiffre réel
+                                    # au delta final. Même chose sur la jambe free
+                                    # convertie — notre convertisseur porte le cache
+                                    # dans le `message_delta` qu'il émet. Sans cette
+                                    # lecture, la DB affichait 0 là où le client
+                                    # affichait le bon nombre.
+                                    # ÉCRASEMENT, jamais addition : plusieurs
+                                    # gateways répètent un `usage` cumulatif au
+                                    # delta, l'addition le compterait deux fois.
+                                    _md_cache = _stream_cache_delta(usage, stream_cache)
+                                    if _md_cache is not None:
+                                        _md_new, _md_delta = _md_cache
+                                        # Le total cumulé suit l'écrasement par la
+                                        # DIFFÉRENCE : ce qui a déjà été porté au
+                                        # crédit au `message_start` est déduit, donc
+                                        # un `usage` cumulatif n'est compté qu'une fois.
+                                        try:
+                                            with _token_lock:
+                                                _token_usage[_track_model]["cache"] += _md_delta
+                                        except Exception as e:
+                                            _debug(f"  ✗ token cache rollback failed: {type(e).__name__}: {e}")
+                                        _debug(f"  [stream] message_delta: cache {stream_cache} -> {_md_new}")
+                                        stream_cache = _md_new
                                     _debug(
                                         f"  [stream] message_delta: stop_reason={stop_reason} output_tokens={stream_out}"
                                     )
@@ -12512,7 +12914,7 @@ async def messages(request: Request):
     except Exception as e:
         _debug(f"[messages] ✗ conversion failed: {e}")
         _log(f"  CONVERSION ERROR: anthropic_to_openai failed: {type(e).__name__}: {e}")
-        return _anthropic_error(400, f"Request conversion failed: {e}")
+        return _anthropic_error(400, f"Request conversion failed: {e}", error_type="invalid_request_error")
     try:
         headers = _get_auth_headers("openai")
     except AllKeysPausedError as e:
@@ -12805,6 +13207,8 @@ async def messages(request: Request):
                             enabled=True,
                             summary_max_tokens=_sc_max,
                             keep_recent_pairs=_sc_keep,
+                            keep_tokens=get_server_compaction("keep_tokens", None),
+                            estimate_tokens_fn=_estimate_input_tokens,
                             timeout_s=_sc_to,
                             markers=_sc_markers,
                             api=_sc_api,
@@ -13099,7 +13503,9 @@ async def messages(request: Request):
         _handle_429 = _make_stream_retry_loop("openai")
         _debug("  [stream-oai] _handle_429 ready, about to yaml_get")
 
-        _free_bound = yaml_get("streaming", "retry_attempts", 2)
+        # [G2] budget centralisé ; le plancher len(API_KEYS) ci-dessous protège
+        # la jambe free (lot I3) quel que soit le réglage.
+        _free_bound = _upstream_max_retries()
         _free_bound = max(_free_bound, len(API_KEYS))
         _debug(f"  [stream-oai] _free_bound={_free_bound}")
         _geo_tunnel = getattr(request.state, "_geo_force_tunnel", False)
@@ -13235,6 +13641,7 @@ async def messages(request: Request):
                                 "stream-oai",
                                 with_host=True,
                                 paid_endpoint=paid_endpoint,
+                                refused=_refuse,
                             )
                             oai_body = paid_oai_body
                             endpoint = paid_endpoint
@@ -13333,7 +13740,68 @@ async def messages(request: Request):
                     # signal de quota) d'un vrai 429 / response.incomplete : sert à ne
                     # pas alimenter le coupe-circuit 429 global sur un flux vide.
                     _empty_eof = False
-                    async for line in resp.aiter_lines():
+                    # Parité officielle + anti-gel VPN : borne d'inactivité mid-stream.
+                    # Sans elle, un tunnel mort après `output_item.done` (cas réel :
+                    # plus aucun octet, jamais de `response.completed`) pend jusqu'au
+                    # timeout TCP 600s et le client coupe à la main. Free = 120s
+                    # (détection vite, tunnels moins stables), payant = idle SSE.
+                    try:
+                        _oai_idle = 120.0 if _using_free else (float(_SSE_IDLE_TIMEOUT or 0) or 0)
+                    except Exception:
+                        _oai_idle = 120.0
+                    if not (_oai_idle > 0):
+                        _oai_idle = 300.0
+                    _oai_aiter = resp.aiter_lines()
+                    _last_resp_type = ""
+                    while True:
+                        try:
+                            if _oai_idle > 0:
+                                line = await asyncio.wait_for(anext(_oai_aiter), timeout=_oai_idle)
+                            else:
+                                line = await anext(_oai_aiter)
+                        except StopAsyncIteration:
+                            break
+                        except TimeoutError:
+                            _log(f"  [stream-oai] idle {_oai_idle:.0f}s sans octet amont (tunnel mort ?) → terminaison explicite")
+                            _debug(f"  [stream-oai] idle-timeout mid-stream après {stream_out_tokens} out_tokens last={_last_resp_type!r}")
+                            if _stream_has_yielded(started, open_blocks, stream_out_tokens, ""):
+                                _cb_record_failure(endpoint)
+                                # Le tour est COMPLET mais l'enveloppe finale manque
+                                # (frontière d'item vue : output_item/content_part.done)
+                                # → terminal de SUCCÈS au format OpenAI (même contrat
+                                # que l'officiel), pas d'erreur sur un tour fini.
+                                if _last_resp_type in ("response.output_item.done", "response.content_part.done"):
+                                    _idle_finish = "tool_calls" if used_tools else "stop"
+                                    _log(f"  [stream-oai] tour complet sans enveloppe → finish {_idle_finish!r} synthétisé")
+                                    _synth = {
+                                        "id": _fast_id("chatcmpl"),
+                                        "object": "chat.completion.chunk",
+                                        "created": int(time.time()),
+                                        "model": original_model,
+                                        "choices": [{"index": 0, "delta": {}, "finish_reason": _idle_finish}],
+                                    }
+                                    yield f"data: {_json_dumps_str(_synth, ensure_ascii=False)}\n\n".encode()
+                                    yield b"data: [DONE]\n\n"
+                                    emitted_finish = True
+                                    return
+                                yield (
+                                    b"data: "
+                                    + _json_dumps_str(
+                                        {
+                                            "error": {
+                                                "message": "upstream stream stalled without terminal",
+                                                "type": "api_error",
+                                            }
+                                        },
+                                        ensure_ascii=False,
+                                    ).encode()
+                                    + b"\n\ndata: [DONE]\n\n"
+                                )
+                                emitted_finish = True
+                                return
+                            # Rien émis : retry station fraîche si budget restant.
+                            _empty_eof = True
+                            break
                         if not line.startswith("data:"):
                             continue
                         data = line[5:].strip()
@@ -13382,6 +13850,15 @@ async def messages(request: Request):
                             continue
                         if chunk is None:
                             continue
+                        # Mémorise le dernier event Responses pour le gardien idle :
+                        # à la frontière d'item, un tour sans enveloppe finale est
+                        # quand même un tour complet.
+                        try:
+                            _ct = chunk.get("type")
+                            if isinstance(_ct, str) and _ct:
+                                _last_resp_type = _ct
+                        except Exception:
+                            pass
 
                         chunk_usage = chunk.get("usage")
                         if chunk_usage and isinstance(chunk_usage, dict):
@@ -13674,6 +14151,7 @@ async def messages(request: Request):
                             "stream-oai",
                             with_host=True,
                             paid_endpoint=paid_endpoint,
+                            refused=_refuse,
                         )
                         oai_body = paid_oai_body
                         endpoint = paid_endpoint
@@ -14311,6 +14789,13 @@ async def chat_completions(request: Request):
     protocol = cfg["protocol"]
     _debug(f"[chat] route: {original_model!r} → {model_id} | {protocol} | endpoint={endpoint}")
 
+    # [Compaction garde opt-in] voir handler messages (warn log / deny 413).
+    _huge_level, _huge_msg = _huge_context_verdict(body, body_bytes)
+    if _huge_level == "deny":
+        return _openai_error(413, _huge_msg)
+    if _huge_level == "warn":
+        _log(f"  [compaction] {_huge_msg} model={original_model!r}")
+
     body = dict(body)
     body["model"] = model_id
     is_stream = body.get("stream", False)
@@ -14667,6 +15152,8 @@ async def chat_completions(request: Request):
                                         enabled=True,
                                         summary_max_tokens=_ch_mk,
                                         keep_recent_pairs=_ch_keep,
+                            keep_tokens=get_server_compaction("keep_tokens", None),
+                            estimate_tokens_fn=_estimate_input_tokens,
                                         timeout_s=_ch_to,
                                         markers=_ch_markers,
                                         api=_ch_api,
@@ -14928,7 +15415,9 @@ async def chat_completions(request: Request):
             emitted_finish = False
             _handle_429 = _make_stream_retry_loop("openai")
             _free_forced_pool = getattr(request.state, "_geo_forced_pool", None)
-            _free_bound = yaml_get("streaming", "retry_attempts", 2)
+            # [G2] budget centralisé ; le plancher len(API_KEYS) ci-dessous
+            # protège la jambe free (lot I3) quel que soit le réglage.
+            _free_bound = _upstream_max_retries()
             _free_bound = max(_free_bound, len(API_KEYS))
             if _using_free and _free_attempts_active(_free_forced_pool):
                 # [plan 19/08 §1] free multi-attempt: extra free strikes on
@@ -15103,6 +15592,7 @@ async def chat_completions(request: Request):
                                     "chat-stream",
                                     with_host=True,
                                     paid_endpoint=paid_endpoint,
+                                    refused=_refuse,
                                 )
                                 if _refuse:
                                     yield await _free_stream_refuse_bytes(
@@ -15534,6 +16024,7 @@ async def chat_completions(request: Request):
                                 "chat-stream",
                                 with_host=True,
                                 paid_endpoint=paid_endpoint,
+                                refused=_refuse,
                             )
                             if _refuse:
                                 yield await _stream_error_response(
@@ -15598,8 +16089,27 @@ async def chat_completions(request: Request):
                                         f"synthèse {_synth_finish!r} (flux complet, pas une troncature)"
                                     )
                                 else:
-                                    _debug("  [oai-stream] truncated without finish_reason → synthesizing")
-                                    _log("  stream truncated without finish_reason → synthesizing")
+                                    # Parité Anthropic : contenu sans terminal ni usage =
+                                    # troncature réelle, pas un succès. On émet une erreur
+                                    # explicite au lieu d'un faux `stop` + [DONE].
+                                    _debug("  [oai-stream] truncated without finish_reason/usage → error (no false stop)")
+                                    _log("  stream truncated without finish_reason/usage → error (no false stop)")
+                                    yield (
+                                        b"data: "
+                                        + _json_dumps_str(
+                                            {
+                                                "error": {
+                                                    "message": "upstream stream truncated without terminal",
+                                                    "type": "api_error",
+                                                }
+                                            },
+                                            ensure_ascii=False,
+                                        ).encode()
+                                        + b"\n\ndata: [DONE]\n\n"
+                                    )
+                                    emitted_finish = True
+                                    _done_emitted = True
+                                    continue
                                 _synth = {
                                     "id": _fast_id("chatcmpl"),
                                     "object": "chat.completion.chunk",
@@ -16208,7 +16718,9 @@ async def chat_completions(request: Request):
 
         _geo_tunnel = getattr(request.state, "_geo_force_tunnel", False)
         _free_forced_pool = getattr(request.state, "_geo_forced_pool", None)
-        _free_bound = yaml_get("streaming", "retry_attempts", 2)
+        # [G2] budget centralisé ; le plancher len(API_KEYS) ci-dessous protège
+        # la jambe free (lot I3) quel que soit le réglage.
+        _free_bound = _upstream_max_retries()
         _free_bound = max(_free_bound, len(API_KEYS))
         if _using_free and _free_attempts_active(_free_forced_pool):
             # [plan 19/08 §1] free multi-attempt: extra free strikes on
@@ -16340,7 +16852,7 @@ async def chat_completions(request: Request):
                             # ne plus convertir le flux entrant.
                             _free_chat_stream = False
                             _free_fallback_bookkeep(
-                                req_id, free_model, resp.status_code, _track_model, "anthro-to-oai-stream"
+                                req_id, free_model, resp.status_code, _track_model, "anthro-to-oai-stream", refused=_refuse
                             )
                             if _refuse:
                                 yield await _free_stream_refuse_bytes(
@@ -16575,6 +17087,14 @@ async def chat_completions(request: Request):
                                 u = ev.get("usage", {})
                                 if u.get("output_tokens"):
                                     stream_out = u["output_tokens"]
+                                # [F2] idem site A : le cache réel arrive au delta
+                                # final, pas au `message_start`. Écrasement, pas
+                                # addition — et comme `cache_read` n'est crédité
+                                # qu'au `message_stop` ci-dessous, l'écrasement
+                                # suffit ici (aucun cumul à corriger).
+                                _md_cache = _stream_cache_delta(u, cache_read)
+                                if _md_cache is not None:
+                                    cache_read = _md_cache[0]
                                 sr = d.get("stop_reason", "")
                                 if sr == "end_turn":
                                     finish = "stop"
@@ -17243,12 +17763,12 @@ async def _systemone_free_via_pool(endpoint: str, body: dict, headers: dict, for
         _log(f"  FREE {free_model!r} RATE LIMITED (429) direct → {'retry après Retry-After' if _dt == 0 else 'relai'}")
         if _dt > 0:
             break
-        try:
-            _wait = float(_ra)
-        except (TypeError, ValueError):
-            _wait = 0.0
-        if not 0 < _wait <= 60:
+        # [P0-5] Parse centralisé : secondes ou date HTTP, borné à 60 s
+        # (parité du chemin existant — jamais de seconde vague au-delà).
+        _parsed_wait = _parse_retry_after(_ra, max_s=60.0)
+        if _parsed_wait is None:
             break  # pas de Retry-After exploitable → on relaie le vrai 429
+        _wait = _parsed_wait
         try:
             if os.getenv("PYTEST_CURRENT_TEST"):
                 _wait = 0.0
@@ -17663,6 +18183,13 @@ async def responses(request: Request):
     is_stream = body.get("stream", False)
 
     _log(f"→ {original_model!r} → {model_id} | {protocol} | responses | stream={is_stream} | ip={client_ip}")
+
+    # [Compaction garde opt-in] voir handler messages (warn log / deny 413).
+    _huge_level, _huge_msg = _huge_context_verdict(body, body_bytes)
+    if _huge_level == "deny":
+        return _openai_error(413, _huge_msg)
+    if _huge_level == "warn":
+        _log(f"  [compaction] {_huge_msg} model={original_model!r}")
 
     _geo_gate = await _enforce_geo_gate(route, request, is_stream=bool(is_stream), protocol=protocol)
     if _geo_gate is not None:
@@ -18388,6 +18915,8 @@ async def responses(request: Request):
                                 enabled=True,
                                 summary_max_tokens=_r6_mk,
                                 keep_recent_pairs=_r6_keep,
+                            keep_tokens=get_server_compaction("keep_tokens", None),
+                            estimate_tokens_fn=_estimate_input_tokens,
                                 timeout_s=_r6_to,
                                 markers=_r6_markers,
                                 api=_r6_api,

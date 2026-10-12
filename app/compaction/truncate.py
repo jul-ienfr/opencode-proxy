@@ -67,17 +67,86 @@ def _is_tool_result(msg) -> bool:
         return False
 
 
-def split_keep_recent(messages, keep_recent_pairs: int):
-    """Scinde (ancien, récent) : récent = keep_recent_pairs paires complètes max.
+def _pair_text(pair) -> str:
+    """Texte d'une paire (role: contenu) pour estimation tokens. Ne lève jamais."""
+    try:
+        parts = []
+        for m in pair or []:
+            if not isinstance(m, dict):
+                continue
+            role = m.get("role", "?")
+            content = m.get("content")
+            if isinstance(content, list):
+                txt = " ".join(
+                    str(b.get("text", b.get("content", "")))
+                    if isinstance(b, dict) else str(b)
+                    for b in content
+                )
+            else:
+                txt = "" if content is None else str(content)
+            parts.append(f"{role}: {txt}")
+        return "\n".join(parts)
+    except Exception:
+        return ""
 
-    Une « paire » = 1 message user + les messages suivants jusqu'au prochain
-    user (réponses assistant + tool_result inclus). La coupe se fait toujours
-    sur un message user : jamais de tool_result orphelin côté récent, jamais
-    de tool_call séparé de ses résultats.
+
+def split_keep_recent(messages, keep_recent_pairs: int, keep_tokens=None, estimate_fn=None):
+    """Scinde (ancien, récent) : paires complètes, par nombre OU par budget tokens.
+
+    Mode legacy (défaut) : ``keep_recent_pairs`` paires max.
+    Mode budget (aligné officiel ``keep.tokens``) : ``keep_tokens`` (int>0) +
+    ``estimate_fn(texte_paire) -> int`` — on garde les paires les plus
+    récentes jusqu'au budget, TOUJOURS au moins la paire la plus récente, et
+    la coupe reste sur frontière user (jamais d'orphelin). Sans estimate_fn
+    ou budget invalide : repli legacy. Ne lève jamais.
     """
     try:
         if not isinstance(messages, list) or not messages:
             return [], []
+        try:
+            budget = int(keep_tokens) if keep_tokens is not None else 0
+        except Exception:
+            budget = 0
+        if budget <= 0 or not callable(estimate_fn):
+            return _split_by_pairs(messages, keep_recent_pairs)
+        user_idx = [
+            i for i, m in enumerate(messages)
+            if _role_of(m) == "user" and not _is_tool_result(m)
+        ]
+        if not user_idx:
+            return list(messages), []
+        # Paires (début, fin) de la plus récente à la plus ancienne.
+        bounds = []
+        for k, start in enumerate(user_idx):
+            end = user_idx[k + 1] if k + 1 < len(user_idx) else len(messages)
+            bounds.append((start, end))
+        total = 0
+        cut = len(messages)
+        for start, end in reversed(bounds):
+            try:
+                size = int(estimate_fn(_pair_text(messages[start:end]))) or 0
+            except Exception:
+                # Estimation fautive : repli legacy immédiat (sûr).
+                return _split_by_pairs(messages, keep_recent_pairs)
+            if size < 0:
+                size = 0
+            if total + size > budget and total > 0:
+                break
+            total += size
+            cut = start
+            if total >= budget:
+                break
+        return list(messages[:cut]), list(messages[cut:])
+    except Exception:
+        try:
+            return list(messages), []
+        except Exception:
+            return [], []
+
+
+def _split_by_pairs(messages, keep_recent_pairs: int):
+    """Cœur legacy : coupe aux N dernières paires (extrait de split_keep_recent)."""
+    try:
         n = keep_recent_pairs if isinstance(keep_recent_pairs, int) and keep_recent_pairs > 0 else 0
         if n <= 0:
             return list(messages), []
@@ -116,18 +185,20 @@ def build_checkpoint_summary(summary_text: str, recent_count: int) -> dict:
     }
 
 
-def build_condensed_history(messages, summary_text: str, keep_recent_pairs: int):
+def build_condensed_history(messages, summary_text: str, keep_recent_pairs: int,
+                            keep_tokens=None, estimate_fn=None):
     """[checkpoint, *recent] : historique condensé prêt à forwarder.
 
-    Repli sûr : si messages invalide/vide ou résumé vide → (None, messages
-    originaux inchangés) — l'appelant relaie alors l'erreur intacte.
+    ``keep_tokens`` + ``estimate_fn`` : mode budget (aligné officiel) ;
+    sinon paires fixes. Repli sûr : si messages invalide/vide ou résumé
+    vide → (None, messages originaux inchangés).
     """
     try:
         if not isinstance(messages, list) or not messages:
             return None, messages
         if not isinstance(summary_text, str) or not summary_text.strip():
             return None, messages
-        _old, recent = split_keep_recent(messages, keep_recent_pairs)
+        _old, recent = split_keep_recent(messages, keep_recent_pairs, keep_tokens, estimate_fn)
         checkpoint = build_checkpoint_summary(summary_text.strip(), len(recent))
         return [checkpoint] + recent, recent
     except Exception:
@@ -161,19 +232,18 @@ def build_checkpoint_input(summary_text: str, recent_count: int) -> dict:
     }
 
 
-def build_condensed_input(history_input, summary_text: str, keep_recent_pairs: int):
+def build_condensed_input(history_input, summary_text: str, keep_recent_pairs: int,
+                          keep_tokens=None, estimate_fn=None):
     """[checkpoint_input, *recent] : fenêtre Responses condensée prête à forwarder.
 
-    Miroir Responses de ``build_condensed_history`` : la coupe réutilise
-    ``split_keep_recent`` (frontières de paires user, jamais d'orphelin
-    tool_call/function_call_output). Repli sûr identique (None + originaux).
+    Miroir Responses de ``build_condensed_history`` (budget ou paires).
     """
     try:
         if not isinstance(history_input, list) or not history_input:
             return None, history_input
         if not isinstance(summary_text, str) or not summary_text.strip():
             return None, history_input
-        _old, recent = split_keep_recent(history_input, keep_recent_pairs)
+        _old, recent = split_keep_recent(history_input, keep_recent_pairs, keep_tokens, estimate_fn)
         checkpoint = build_checkpoint_input(summary_text.strip(), len(recent))
         return [checkpoint] + recent, recent
     except Exception:

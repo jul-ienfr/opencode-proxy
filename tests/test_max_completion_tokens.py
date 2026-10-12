@@ -170,8 +170,14 @@ def test_helper_prefers_max_tokens_when_several_present():
 
 
 def test_helper_ignores_non_positive_and_non_int_limits():
-    """Une limite absurde (0, négative, chaîne) ne doit pas être transportée."""
-    for bad in (0, -5, "4096", None, 3.5):
+    """Une limite absurde (0, négative, chaîne, booléen) ne doit pas être transportée.
+
+    `0` en particulier : une limite nulle est une absence, pas une limite. La
+    transporter exposerait à un 400 de l'amont, là où le défaut 16384 fait
+    passer la requête. `True`/`False` sont des `int` en Python — sans le
+    garde-fou, `max_tokens: true` deviendrait une limite de 1 token.
+    """
+    for bad in (0, -5, "4096", None, 3.5, True, False):
         target = {}
         _set_output_token_limit(target, {"max_tokens": bad}, "x")
         assert target.get("max_tokens") == 16384, f"{bad!r} accepté comme limite"

@@ -115,7 +115,124 @@ async def _auth_gate() -> None:
 # On Windows, the proxy must auto-launch it (user request) — otherwise 5 stations
 # stay `disconnected` after a reboot. Fail-soft: if launch fails, the caller logs
 # and continues (watchdog will retry).
-_DOCKER_DESKTOP_LAUNCHED = False
+#
+# [docker-autostart 2026-10-07] le latch one-shot historique
+# (_DOCKER_DESKTOP_LAUNCHED) ne relançait qu'au boot : si Docker quittait
+# APRÈS (veille, quit manuel), plus aucune relance jusqu'au restart du
+# proxy. Remplacé par un cooldown temporel : une relance reste possible à
+# tout moment, au plus 1 fois par _DOCKER_AUTOSTART_COOLDOWN_S.
+_DOCKER_LAST_LAUNCH_AT = 0.0  # monotonic ; 0.0 = jamais tenté
+_DOCKER_LAUNCH_IN_PROGRESS = False
+# Dernière sonde daemon connue (pour /api/vpn-status + message 503 explicite).
+_DOCKER_DAEMON_REACHABLE: bool | None = None
+_DOCKER_DAEMON_CHECKED_AT = 0.0  # monotonic
+# Configurables via configure_docker_autostart() (lus depuis ip_rotation).
+_DOCKER_AUTOSTART_ENABLED = sys.platform == "win32"
+_DOCKER_AUTOSTART_COOLDOWN_S = 600.0
+
+# Sous-chaînes (lowercase) caractéristiques d'un daemon injoignable.
+# Surtout PAS d'AUTH_FAILED/gluetun ici : un refus NordVPN (rate-limit
+# côté compte) ne doit jamais déclencher une relance Docker.
+_DAEMON_DOWN_MARKERS = (
+    "failed to connect to the docker api",
+    "cannot connect to the docker daemon",
+    "error during connect",
+    "is the docker daemon running",
+    "dockerdesktoplinuxengine",
+    "npipe",
+    "//./pipe/docker",
+    "le fichier spécifié est introuvable",
+    "the system cannot find the file specified",
+)
+
+
+def configure_docker_autostart(enabled: bool | None = None, cooldown_s: float | None = None) -> None:
+    """Règle l'auto-relance Docker (appelée par VPNManager.__init__ depuis ip_rotation)."""
+    global _DOCKER_AUTOSTART_ENABLED, _DOCKER_AUTOSTART_COOLDOWN_S
+    if enabled is not None:
+        _DOCKER_AUTOSTART_ENABLED = bool(enabled)
+    if cooldown_s is not None:
+        try:
+            _DOCKER_AUTOSTART_COOLDOWN_S = min(3600.0, max(60.0, float(cooldown_s)))
+        except (TypeError, ValueError):
+            pass
+
+
+def is_daemon_unreachable_error(exc: BaseException | None) -> bool:
+    """True si l'exception vient d'un daemon docker injoignable (pas d'un VPN)."""
+    try:
+        txt = str(exc or "").lower()
+    except Exception:
+        return False
+    if not txt:
+        return False
+    return any(m in txt for m in _DAEMON_DOWN_MARKERS)
+
+
+def docker_daemon_status() -> dict:
+    """État daemon connu (sans sonde — lecture seule, safe pour l'API)."""
+    try:
+        now = time.monotonic()
+    except Exception:
+        now = 0.0
+    return {
+        "reachable": _DOCKER_DAEMON_REACHABLE,
+        "checked_at_age_s": round(now - _DOCKER_DAEMON_CHECKED_AT, 1) if _DOCKER_DAEMON_CHECKED_AT else None,
+        "autostart_enabled": bool(_DOCKER_AUTOSTART_ENABLED),
+        "autostart_in_progress": bool(_DOCKER_LAUNCH_IN_PROGRESS),
+        "last_launch_age_s": round(now - _DOCKER_LAST_LAUNCH_AT, 1) if _DOCKER_LAST_LAUNCH_AT else None,
+        "cooldown_s": _DOCKER_AUTOSTART_COOLDOWN_S,
+    }
+
+
+def _note_daemon_reachable(ok: bool) -> None:
+    global _DOCKER_DAEMON_REACHABLE, _DOCKER_DAEMON_CHECKED_AT
+    _DOCKER_DAEMON_REACHABLE = bool(ok)
+    try:
+        _DOCKER_DAEMON_CHECKED_AT = time.monotonic()
+    except Exception:
+        pass
+
+
+async def _docker_autostart_worker(reason: str, timeout: int) -> None:
+    """Corps de la relance background (flag in_progress garantie par l'appelant)."""
+    global _DOCKER_LAUNCH_IN_PROGRESS
+    try:
+        ok = await ensure_docker_running(timeout=timeout)
+        logger.info("[docker] autostart %s (%s)", "OK" if ok else "FAILED", reason)
+    except Exception as e:
+        logger.warning("[docker] autostart crashed (%s): %s", reason, e)
+    finally:
+        _DOCKER_LAUNCH_IN_PROGRESS = False
+
+
+def request_docker_autostart(reason: str = "", timeout: int = 120) -> str:
+    """Demande NON BLOQUANTE une relance Docker Desktop (depuis le watchdog).
+
+    Retourne "started" | "in_progress" | "cooldown" | "disabled" |
+    "non_windows" | "no_loop". Seul "started" mérite un log warning —
+    les autres cas sont le fonctionnement normal anti-boucle.
+    """
+    global _DOCKER_LAUNCH_IN_PROGRESS
+    if sys.platform != "win32":
+        return "non_windows"
+    if not _DOCKER_AUTOSTART_ENABLED:
+        return "disabled"
+    if _DOCKER_LAUNCH_IN_PROGRESS:
+        return "in_progress"
+    try:
+        now = time.monotonic()
+    except Exception:
+        now = 0.0
+    if _DOCKER_LAST_LAUNCH_AT and (now - _DOCKER_LAST_LAUNCH_AT) < _DOCKER_AUTOSTART_COOLDOWN_S:
+        return "cooldown"
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return "no_loop"
+    _DOCKER_LAUNCH_IN_PROGRESS = True
+    loop.create_task(_docker_autostart_worker(reason or "watchdog", timeout))
+    return "started"
 
 
 async def ensure_docker_running(timeout: int = 60) -> bool:
@@ -124,8 +241,13 @@ async def ensure_docker_running(timeout: int = 60) -> bool:
     Returns True if `docker ps` succeeds within `timeout` seconds, False otherwise.
     Launch is best-effort: if Docker Desktop is not installed or fails to start,
     the caller should log and continue (watchdog will retry).
+
+    [docker-autostart 2026-10-07] relance limitée à 1 fois par
+    _DOCKER_AUTOSTART_COOLDOWN_S (cooldown temporel, pas de latch
+    one-shot) : un appel dans le cooldown attend seulement que le
+    daemon devienne joignable (relance déjà en cours).
     """
-    global _DOCKER_DESKTOP_LAUNCHED
+    global _DOCKER_LAST_LAUNCH_AT
     # Quick probe: is daemon already reachable?
     try:
         r = await asyncio.to_thread(
@@ -137,13 +259,20 @@ async def ensure_docker_running(timeout: int = 60) -> bool:
             creationflags=CREATE_NO_WINDOW if sys.platform == "win32" else 0,
         )
         if r.returncode == 0:
+            _note_daemon_reachable(True)
             return True
     except Exception:
         pass
     if sys.platform != "win32":
+        _note_daemon_reachable(False)
         return False
-    # Windows: try to launch Docker Desktop if not already attempted this boot
-    if _DOCKER_DESKTOP_LAUNCHED:
+    # Windows: relance récente (< cooldown) → ne pas spammer Desktop,
+    # attendre seulement qu'il devienne joignable.
+    try:
+        _now = time.monotonic()
+    except Exception:
+        _now = 0.0
+    if _DOCKER_LAST_LAUNCH_AT and (_now - _DOCKER_LAST_LAUNCH_AT) < _DOCKER_AUTOSTART_COOLDOWN_S:
         # Already tried once this process — don't loop forever, just wait a bit
         for _ in range(timeout // 2):
             await asyncio.sleep(2)
@@ -157,9 +286,11 @@ async def ensure_docker_running(timeout: int = 60) -> bool:
                     creationflags=CREATE_NO_WINDOW,
                 )
                 if r.returncode == 0:
+                    _note_daemon_reachable(True)
                     return True
             except Exception:
                 pass
+        _note_daemon_reachable(False)
         return False
     # [v10 §14.3.13] latch posé uniquement après un Popen RÉUSSI (voir plus bas)
     # Common install paths
@@ -189,6 +320,12 @@ async def ensure_docker_running(timeout: int = 60) -> bool:
             )
         except Exception:
             pass
+        # `start` shell : tentative effectuée aussi → horodatage pour le
+        # cooldown (évite de spammer une machine sans Docker installé).
+        try:
+            _DOCKER_LAST_LAUNCH_AT = time.monotonic()
+        except Exception:
+            pass
     else:
         try:
             # Use Popen to not block; Desktop will daemonize
@@ -199,12 +336,17 @@ async def ensure_docker_running(timeout: int = 60) -> bool:
                 stderr=subprocess.DEVNULL,
             )
         except Exception as e:
-            # [plan v10 §14.3.13] le latch ne se pose qu'après un lancement
-            # EFFECTIF : sinon un Popen raté verrouillait _LAUNCHED=True pour
-            # tout le process → plus aucune relance jusqu'au restart.
+            # [plan v10 §14.3.13] l'horodatage ne se pose qu'après un lancement
+            # EFFECTIF : sinon un Popen raté verrouillait toute relance
+            # jusqu'au restart ([docker-autostart 2026-10-07] : cooldown
+            # temporel au lieu du latch one-shot).
             logging.getLogger("vpn_manager").warning("[docker] failed to launch Desktop %s: %s", exe, e)
+            _note_daemon_reachable(False)
             return False
-        _DOCKER_DESKTOP_LAUNCHED = True
+        try:
+            _DOCKER_LAST_LAUNCH_AT = time.monotonic()
+        except Exception:
+            pass
     # Wait for daemon to become reachable
     for _ in range(timeout // 2):
         await asyncio.sleep(2)
@@ -219,10 +361,12 @@ async def ensure_docker_running(timeout: int = 60) -> bool:
             )
             if r.returncode == 0:
                 logging.getLogger("vpn_manager").info("[docker] daemon reachable after Desktop launch")
+                _note_daemon_reachable(True)
                 return True
         except Exception:
             pass
     logging.getLogger("vpn_manager").warning("[docker] daemon still not reachable after %ds", timeout)
+    _note_daemon_reachable(False)
     return False
 
 # Cross-module registry of active VPN managers ([plan 18/08 §1]): set by
@@ -724,21 +868,65 @@ _NORDVPN_HOST_RE = re.compile(r"[a-z]{2}[0-9]{2,4}\.nordvpn\.com")
 _ISSUE_TS_RE = re.compile(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})")
 
 
+# [incident st1 12/10] NordVPN AF_INET IP: the openvpn "[<host>] Peer
+# Connection Initiated with [AF_INET]<ip>:..." line carries the CURRENT remote
+# IP. When the log chunk has no hostname (early SIGUSR1 loop on a refusing
+# server), the IP is still blacklistable — the fast-pin path then only needs
+# a different server, not a different hostname.
+_NORDVPN_AF_INET_RE = re.compile(r"\[AF_INET\](\d{1,3}(?:\.\d{1,3}){3})")
+
+
+def _extract_current_ip(text: str) -> str | None:
+    """Last remote AF_INET IP present in gluetun/openvpn log text.
+
+    The SIGUSR1 retry loop re-logs the SAME remote every ~11-40 s, so the
+    last "[AF_INET]<ip>:port" occurrence is the endpoint currently in play.
+    None when no AF_INET address is logged.
+    """
+    matches = _NORDVPN_AF_INET_RE.findall(text or "")
+    return matches[-1] if matches else None
+
+
 def _parse_server_issue_detail(text: str) -> tuple:
     """Parse un chunk de logs (case-insensitive) → (live, age_s, healed, init_ok_at).
 
-    - live : reset/TLS après le dernier INIT (ou sans INIT du tout).
-    - healed : INIT après le dernier reset (guérison prouvée).
+    - live : reset/TLS/refus après le dernier INIT (ou sans INIT du tout).
+    - healed : INIT après le dernier motif (guérison prouvée).
     - age_s : âge du dernier reset en secondes (timestamp ISO de la ligne,
       0.0 si non horodatable = frais par défaut → chemin degraded).
     - init_ok_at : timestamp ISO du dernier INIT si horodaté, sinon None.
-    Pur (aucun état, aucun log) — testable sans docker."""
+    Pur (aucun état, aucun log) — testable sans docker.
+
+    [incident st1 12/10] couvre aussi les motifs openvpn d'un serveur qui
+    REFUSE la connexion : "TCP: connect to [AF_INET]<ip>:443 failed:
+    Connection refused" + "SIGUSR1[connection failed(soft),connection-failed]".
+    Avant ce fix seuls "tls key negotiation failed" et "connection reset"
+    déclenchaient la voie degraded (re-pin + refresh + blacklist) — la
+    station restait collée en error sur "Connection refused" sans jamais
+    re-pinner toute seule."""
     low = (text or "").lower()
     tls_fail = "tls key negotiation failed" in low
     conn_reset = "connection reset, restarting" in low or "connection reset" in low
-    if not (tls_fail or conn_reset):
+    # [incident st1 12/10] un serveur NordVPN saturé/hors-ligne ne dit ni TLS
+    # ni reset : openvpn boucle sur "TCP: connect to [AF_INET]<ip>:443 failed:
+    # Connection refused" + "SIGUSR1[connection failed(soft),connection-failed]".
+    _refused_markers = (
+        "connection refused",
+        "connection failed(soft)",
+        "connection-failed",
+        "tcp: connect to",
+    )
+    _refused_hit = next((m for m in _refused_markers if m in low), None)
+    if not (tls_fail or conn_reset or _refused_hit):
         return (False, None, True, None)
-    key = "tls key negotiation failed" if tls_fail else "connection reset"
+    _markers = []
+    if tls_fail:
+        _markers.append("tls key negotiation failed")
+    if conn_reset:
+        _markers.append("connection reset")
+    if _refused_hit:
+        _markers.append(_refused_hit)
+    key = max(_markers, key=lambda m: low.rfind(m))
     i_init = low.rfind("initialization sequence completed")
     i_fail = low.rfind(key)
     live = i_init < i_fail
@@ -1576,6 +1764,19 @@ class VPNManager:
         self._egress_state = "unknown"
         self._degraded_reason: str | None = None
         self._socks_down_routable = bool(cfg.get("socks_down_routable", True))
+        # [docker-autostart 2026-10-07] relance Desktop depuis le watchdog
+        # (défaut actif sur Windows local ; cooldown anti-boucle).
+        try:
+            _da_cd = float(cfg.get("docker_autostart_cooldown_s", 600.0))
+        except (TypeError, ValueError):
+            _da_cd = 600.0
+        try:
+            configure_docker_autostart(
+                enabled=bool(cfg.get("docker_autostart", sys.platform == "win32")),
+                cooldown_s=_da_cd,
+            )
+        except Exception:
+            pass
         # LOT E — pin pays réversible (999 = rollback : jamais élargie).
         try:
             _pw_r_raw = float(cfg.get("pin_widen_resets", 6.0))
@@ -5183,6 +5384,19 @@ class VPNManager:
             return None
         return _extract_current_hostname(result.stdout)
 
+    async def _current_remote_ip(self, since: str) -> str | None:
+        """Remote IP gluetun is currently trying — the LAST "[AF_INET]<ip>"
+        occurrence in container logs written since ``since``.
+
+        [incident st1 12/10] quand le chunk ne contient aucun hostname
+        (boucle SIGUSR1 précoce sur un serveur qui refuse), l'IP reste
+        lisible et permet au fast-pin de sauter un serveur blacklisté."""
+        result = await asyncio.to_thread(self._docker_run, ["logs", "--since", since, self._docker_container], 30
+        )
+        if result.returncode != 0:
+            return None
+        return _extract_current_ip(result.stdout)
+
     async def _fast_recover_via_control(
         self, max_skips: int = 3, timeout: float = 15.0, catchup: float = 15.0
     ) -> bool:
@@ -5241,14 +5455,20 @@ class VPNManager:
             # [phase 1] en mode "gluetun" la blacklist n'est pas appliquée
             # aux pins (gluetun choisit) — seul le re-pin pays sur AUTH
             # persiste, sans boucle d'évitement de host.
-            if (
-                host
-                and self._host_blacklisted(host)
-                and getattr(self, "_server_pick_mode", "proxy") == "proxy"
-            ):
+            # [incident st1 12/10] le serveur fautif peut n'être connu que par
+            # son IP (chunk sans hostname) : le skip couvre host ET IP.
+            _bad_server: str | None = None
+            if getattr(self, "_server_pick_mode", "proxy") == "proxy":
+                if host and self._host_blacklisted(host):
+                    _bad_server = host
+                else:
+                    _rip = await self._current_remote_ip(since)
+                    if _rip and self._host_blacklisted(_rip):
+                        _bad_server = _rip
+            if _bad_server:
                 logger.warning(
                     "[vpn] fast-pin: %s blacklisted — skipping it (attempt %d/%d)",
-                    host,
+                    _bad_server,
                     attempt + 1,
                     max_skips + 1,
                 )
@@ -6824,32 +7044,52 @@ class VPNManager:
         return ("restart", kind)
 
     def _record_auth_failure(self, text: str) -> None:
-        """Blacklist the current NordVPN hostname after a LIVE AUTH_FAILED.
+        """Blacklist le serveur fautif après un rejet LIVE (AUTH_FAILED ou
+        server_issue).
 
-        The caller has already established the rejection is live (no later
-        "Initialization Sequence Completed"). The blacklist is consumed ONLY
-        by the fast-pin path (Phase 1c) — free_ip_pool never sees it.
+        L'appelant a déjà établi que le rejet est vivant (pas de
+        "Initialization Sequence Completed" postérieur). La blacklist est
+        consommée UNIQUEMENT par le fast-pin (Phase 1c) — free_ip_pool ne la
+        voit jamais.
         [plan 30/08 Lot A2] TTL progressif et configuré (`bad_ttl` minutes ×
         `bad_ttl_factor` par re-échec, plafond `bad_ttl_max`) — plus de 24 h
         codé en dur ; à défaut de clés, le défaut 1440 min = 24 h reproduit
-        exactement le comportement historique."""
-        host = _extract_current_hostname(text)
-        if not host:
-            return  # no hostname in this text — nothing to blacklist
+        exactement le comportement historique.
+        [incident st1 12/10] blackliste AUSSI l'IP distante [AF_INET] : le
+        chunk d'un serveur qui refuse peut ne contenir AUCUN hostname (boucle
+        SIGUSR1 précoce) — avant ce fix la blacklist restait silencieuse et
+        le fast-pin pouvait retomber sur le même serveur mort."""
         now = time.time()
-        entry = self._failed_hosts.get(host)
-        if entry is None:
-            entry = {"failures": 0, "first_failed_at": now, "bad_until": 0.0}
-            self._failed_hosts[host] = entry
-        entry["failures"] += 1
-        ttl_s = _host_ttl_seconds(entry["failures"], self._config)
-        entry["bad_until"] = now + ttl_s
-        logger.warning(
-            "[vpn] AUTH_FAILED on %s (failure #%d, TTL %.0fmin) — fast-pin will skip it",
-            host,
-            entry["failures"],
-            ttl_s / 60.0,
-        )
+        host = _extract_current_hostname(text)
+        if host:
+            entry = self._failed_hosts.get(host)
+            if entry is None:
+                entry = {"failures": 0, "first_failed_at": now, "bad_until": 0.0}
+                self._failed_hosts[host] = entry
+            entry["failures"] += 1
+            ttl_s = _host_ttl_seconds(entry["failures"], self._config)
+            entry["bad_until"] = now + ttl_s
+            logger.warning(
+                "[vpn] AUTH_FAILED on %s (failure #%d, TTL %.0fmin) — fast-pin will skip it",
+                host,
+                entry["failures"],
+                ttl_s / 60.0,
+            )
+        ip = _extract_current_ip(text)
+        if ip:
+            entry = self._failed_hosts.get(ip)
+            if entry is None:
+                entry = {"failures": 0, "first_failed_at": now, "bad_until": 0.0}
+                self._failed_hosts[ip] = entry
+            entry["failures"] += 1
+            ttl_s = _host_ttl_seconds(entry["failures"], self._config)
+            entry["bad_until"] = now + ttl_s
+            logger.warning(
+                "[vpn] server-refused on %s (failure #%d, TTL %.0fmin) — fast-pin will avoid it",
+                ip,
+                entry["failures"],
+                ttl_s / 60.0,
+            )
 
     def _host_blacklisted(self, host: str) -> bool:
         """True while a host is inside its blacklist window (TTL progressif
@@ -6896,7 +7136,9 @@ class VPNManager:
     async def _check_server_issue(self, started_at: str = "", text: str | None = None) -> bool:
         """Scan container logs for a TLS negotiation failure (stale server
         IP or crashed server — gluetun's 🔌 'server no longer valid'
-        guidance) OR a hard "Connection reset" from a dead/rejecting server.
+        guidance), a hard "Connection reset" from a dead/rejecting server,
+        OR an openvpn "Connection refused" loop (saturated/offline server,
+        [incident st1 12/10]).
         [stabilité 25/08] "Connection reset, restarting" = serveur qui coupe
         la connexion (down/maintenance/firewall) — même traitement que
         TLS-negotiation : re-pin + refresh liste, et blacklist du host pour
@@ -7803,6 +8045,22 @@ class VPNManager:
                                     _auth_connect_done()
                             except Exception as e:
                                 logger.warning("[vpn-watchdog] heal VPN arrêté %s failed: %s", self._docker_container, e)
+                                # [docker-autostart 2026-10-07] daemon down ?
+                                # → relance Desktop en tâche de fond (cooldown
+                                # anti-boucle, 1 fois / 10 min max). Le classifieur
+                                # ne matche QUE les erreurs CLI docker, jamais
+                                # un AUTH_FAILED NordVPN (rate-limit compte) :
+                                # aucun restart intempestif côté VPN.
+                                try:
+                                    if is_daemon_unreachable_error(e):
+                                        _da_req = request_docker_autostart(f"s{self._station} heal")
+                                        if _da_req == "started":
+                                            logger.warning(
+                                                "[vpn-watchdog] docker daemon down — relance Desktop demandée (s%s)",
+                                                self._station,
+                                            )
+                                except Exception:
+                                    pass
                     except Exception:
                         pass
                     return  # absent/stopped/restarting — healed, next tick will re-check

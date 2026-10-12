@@ -71,4 +71,42 @@ def is_overflow(status_code, body_text, markers=None) -> bool:
         return False
 
 
-__all__ = ["is_overflow", "_DEFAULT_OVERFLOW_MARKERS"]
+def huge_context_check(body_bytes_len, est_tokens, *, warn_tokens=0, deny_tokens=0):
+    """Garde pré-forward optionnelle (opt-in, tout à 0 = inactive).
+
+    Retourne (level, message) : level None (passe), "warn" (log + continue)
+    ou "deny" (refuser par 413 actionnable AVANT l'amont). deny prioritaire.
+    Seuils absolus en tokens (pas de table par modèle — doctrine réactive
+    préservée par défaut). Ne lève jamais.
+    """
+    try:
+        try:
+            n_bytes = int(body_bytes_len or 0)
+        except Exception:
+            n_bytes = 0
+        try:
+            est = int(est_tokens or 0)
+        except Exception:
+            est = 0
+        try:
+            warn = int(warn_tokens or 0)
+        except Exception:
+            warn = 0
+        try:
+            deny = int(deny_tokens or 0)
+        except Exception:
+            deny = 0
+        if deny > 0 and (est >= deny or n_bytes >= deny * 4):
+            return ("deny",
+                    f"Context too large (est ~{est} tokens > {deny}): compact the session "
+                    "(/compact), start fresh (/clear), or shrink tool outputs, then retry.")
+        if warn > 0 and (est >= warn or n_bytes >= warn * 4):
+            return ("warn",
+                    f"huge context (est ~{est} tokens >= {warn}): upstream may 400/overflow — "
+                    "consider /compact")
+        return (None, "")
+    except Exception:
+        return (None, "")
+
+
+__all__ = ["is_overflow", "_DEFAULT_OVERFLOW_MARKERS", "huge_context_check"]

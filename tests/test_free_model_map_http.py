@@ -25,9 +25,20 @@ real writer against a tmp config.yaml):
     ``_persist_vpn_config`` never see free_model_map as a key.
   * mirror sync: ``_yaml_data["free_model_map"]`` equals the posted map.
   * the real ``_persist_free_model_map`` writes the TOP-LEVEL key and
-    leaves the ip_rotation block untouched (config.yaml reachable via a
-    monkeypatched ``api.__file__`` — the repo config.yaml is never
-    written).
+    leaves the ip_rotation block untouched (config.yaml reachable via
+    ``_redirect_yaml_path`` — the repo config.yaml is NEVER written).
+
+Le piège refermé ici : ces tests faisaient
+``monkeypatch.setattr(api, "__file__", tmp_path / "dashboard" / "api.py")``,
+ce qui arrangeait l'époque où `_persist_free_model_map` recalculait son
+chemin depuis ``os.path.dirname(os.path.dirname(__file__))``. Depuis que le
+module porte une constante unique `api.__CONFIG_YAML_PATH` (un seul chemin,
+redirigeable), ce monkeypatch est **inopérant** : le rédacteur visait le
+VRAI config.yaml du dépôt. La suite complète a écrasé
+``free_model_map`` (12 entrées → 1) le 2026-10-10 — vert du fichier ciblé
+intact (les assertions portaient sur la copie tmp_path), dépôt dégradé.
+`_redirect_yaml_path` cible donc la constante, plus `_config_yaml_mtime` et
+son anneau de synchronisation.
 """
 
 import sqlite3
@@ -42,6 +53,22 @@ import config.settings as st
 import dashboard.api as api
 import shared_state
 from dashboard.api import register_dashboard
+
+
+def _redirect_yaml_path(tmp_path, monkeypatch, *, missing: bool = False) -> str:
+    """Pointe le SEUL chemin config.yaml de `dashboard.api` vers tmp_path.
+
+    Retourne le chemin visé (jamais créé si `missing=True`).
+    """
+    import os
+
+    target = tmp_path / "config.yaml"
+    monkeypatch.setattr(api, "__CONFIG_YAML_PATH", str(target))
+    # le détecteur « édité à la main » + le mtime synchronisé côté settings
+    monkeypatch.setattr(api, "_config_yaml_known_mtime", 0.0)
+    if not missing:
+        monkeypatch.setattr(api, "_config_yaml_mtime", lambda: float(os.path.exists(target)))
+    return str(target)
 
 
 class _FakeMgr:
@@ -168,10 +195,10 @@ def test_free_model_map_mirror_synced(ctx):
 
 def test_persist_free_model_map_writes_top_level_key(tmp_path, monkeypatch):
     """The writer puts free_model_map at the TOP LEVEL — ip_rotation and
-    the other sections must survive untouched. ``api.__file__`` is
-    monkeypatched so the resolver finds the tmp config.yaml (the repo
-    file is never written by tests)."""
-    monkeypatch.setattr(api, "__file__", str(tmp_path / "dashboard" / "api.py"))
+    the other sections must survive untouched. Le chemin config.yaml est
+    redirigé vers la copie tmp_path : le fichier du dépôt n'est jamais
+    écrit (voir `_redirect_yaml_path` en tête de fichier)."""
+    cfg_path = _redirect_yaml_path(tmp_path, monkeypatch)
     repo_yaml = {
         "server": {"host": "0.0.0.0", "port": 4000},
         "ip_rotation": {"enabled": True, "station_count": 3, "vpn_stack": "wireguard"},
@@ -183,6 +210,7 @@ def test_persist_free_model_map_writes_top_level_key(tmp_path, monkeypatch):
 
     api._persist_free_model_map({"glm-5.1": "deepseek-v4-flash-free"})
 
+    assert cfg_path == str(tmp_path / "config.yaml")
     got = yaml.safe_load((tmp_path / "config.yaml").read_text(encoding="utf-8"))
     assert got["free_model_map"] == {"glm-5.1": "deepseek-v4-flash-free"}
     assert got["ip_rotation"] == repo_yaml["ip_rotation"], "ip_rotation block untouched"
@@ -192,7 +220,7 @@ def test_persist_free_model_map_writes_top_level_key(tmp_path, monkeypatch):
 
 def test_persist_free_model_map_missing_file_is_noop(tmp_path, monkeypatch):
     """config.yaml absent → best-effort no-op, no exception."""
-    monkeypatch.setattr(api, "__file__", str(tmp_path / "dashboard" / "api.py"))
+    _redirect_yaml_path(tmp_path, monkeypatch, missing=True)
     api._persist_free_model_map({"glm-5.1": "deepseek-v4-flash-free"})
     assert not (tmp_path / "config.yaml").exists()
 

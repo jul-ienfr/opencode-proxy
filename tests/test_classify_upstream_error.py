@@ -40,7 +40,6 @@ from core.errors import (
     upstream_retry_signal,
 )
 
-
 # ─────────── La table : chaque motif amont → son type d'erreur ───────────
 
 

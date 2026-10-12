@@ -61,9 +61,13 @@ from vpn.manager import _safari_version as _safari_version
 from vpn.manager import _sh_quote as _sh_quote
 from vpn.manager import _stack_from_env_file as _stack_from_env_file
 from vpn.manager import _ua_for_target as _ua_for_target
+from vpn.manager import configure_docker_autostart as configure_docker_autostart
+from vpn.manager import docker_daemon_status as docker_daemon_status
 from vpn.manager import ensure_docker_running as ensure_docker_running
+from vpn.manager import is_daemon_unreachable_error as is_daemon_unreachable_error
 from vpn.manager import logger as logger
 from vpn.manager import reconcile_orphan_containers as reconcile_orphan_containers
+from vpn.manager import request_docker_autostart as request_docker_autostart
 
 __all__ = [
     "BackoffTimer",
@@ -91,6 +95,8 @@ __all__ = [
     "_classify_error_kind",
     "_classify_probe_exc",
     "_docker_cli",
+    "configure_docker_autostart",
+    "docker_daemon_status",
     "_env_value_from_inspect",
     "_extract_current_hostname",
     "_headers_key",
@@ -103,6 +109,8 @@ __all__ = [
     "_stack_from_env_file",
     "_ua_for_target",
     "ensure_docker_running",
+    "is_daemon_unreachable_error",
     "logger",
     "reconcile_orphan_containers",
+    "request_docker_autostart",
 ]

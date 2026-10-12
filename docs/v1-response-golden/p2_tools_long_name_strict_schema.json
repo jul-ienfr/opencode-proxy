@@ -65,7 +65,6 @@
         }
       }
     ],
-    "tool_choice": "auto",
     "_tool_name_map": {
       "mcp__plugin_very_long_tool_name_exceeding_sixty_four_char-c662e5": "mcp__plugin_very_long_tool_name_exceeding_sixty_four_chars_limit_aaaa"
     }

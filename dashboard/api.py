@@ -736,7 +736,11 @@ def _persist_vpn_config(updates: dict):
     try:
         import yaml
 
-        config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "config.yaml")
+        # Source unique du chemin (constante de module `__CONFIG_YAML_PATH`)
+        # plutôt qu'un recalcul local depuis `__file__` : les deux désignent le
+        # même fichier, mais seule la constante peut être redirigée par un test
+        # — sans ça aucun test ne peut exercer ce persist sur une copie.
+        config_path = __CONFIG_YAML_PATH
         if not os.path.exists(config_path):
             return f"config.yaml introuvable: {config_path}"
         with _persist_lock:
@@ -1000,7 +1004,9 @@ def _persist_free_model_map(mapping: dict):
     try:
         import yaml
 
-        config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "config.yaml")
+        # Même constante de module que `_persist_vpn_config` : un seul chemin,
+        # redirigeable par les tests (aucun test ne doit écrire le vrai fichier).
+        config_path = __CONFIG_YAML_PATH
         if not os.path.exists(config_path):
             return
         with open(config_path, encoding="utf-8") as f:
@@ -2990,6 +2996,14 @@ def register_dashboard(
             # [v6 P0-2] boot_error — 1/4 vs 4/4 visible (fail-open, pas raise)
             if getattr(shared_state, "boot_error", None):
                 data["boot_error"] = shared_state.boot_error
+            # [docker-autostart 2026-10-07] état daemon pour le badge
+            # dashboard (lecture seule, jamais bloquant).
+            try:
+                from vpn.manager import docker_daemon_status as _dd_status
+
+                data["docker_daemon"] = _dd_status()
+            except Exception:
+                pass
             # [Axe 3.4] config.yaml modifié à la main sans POST dashboard →
             # dirty: le hot-reload est push-only par design, une bannière GUI
             # demande un restart ou une re-push (jamais d'auto-reload).
