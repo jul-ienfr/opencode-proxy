@@ -413,6 +413,16 @@ Tests : `tests/test_free_multi_attempt.py` (G1, G2, G4, G5 + A1-A5) — 69 passe
 
 Tests : `tests/test_lot_h_protocol.py` (H1, H2, H3, H5, H6, H7) + `tests/test_effort_mapping.py` (H4).
 
+### Lot I — Faux-429 + rotation-storm (incident 2026-10-11) — TERMINÉ ✅
+
+| # | Action | Fichier | Statut | Résultat |
+|---|---|---|---|---|
+| I1 | Ne plus classer tout 429 free comme quota : `is_free_quota_failure` | `core/errors.py` | ✅ Fait | Vrai quota UNIQUEMENT si le corps porte un motif quota/crédit (`_pause` de la table) ou une limite de débit explicite (`rate limit`/`too many requests`). « Endpoint is unavailable » (surcharge amont transitoire) → transitoire : ni message « quota épuisé », ni rotation. Non-429 / corps vide / statut illisible → toujours False. |
+| I2 | Gater rotation + message sur le flag quota | `opencode.py` (`_mark_free_stations_429`, `_on_free_429_stream`, `_free_429_stream_decision`, 6 sites non-stream) + `free/pool.py` (`on_quota_exhausted(quota=...)`) | ✅ Fait | Corps threadé depuis chaque 429 (stream : `aread()` ; hedge/seq/main/systemone : `resp.text`). Transitoire → cooldown court 30 s, pas de rotation, message véridique `overloaded_error`. `body=None` (EOF) → comportement historique préservé. Fallback double `TypeError` pour les doubles à l'ancienne signature. |
+| I3 | Mettre les tests existants au nouveau contrat | `tests/test_free_multi_attempt.py`, `tests/test_classify_upstream_error.py`, `tests/test_faux_429_veridique.py` | ✅ Fait | Faux corps 429 `"{}"` → vrais corps quota (`Rate limit exceeded for free tier`) ; `server_error`/`unavailable` génériques retirés de la table (seul « Endpoint is unavailable » exact est classé) ; E6 épinglé sur le message véridique. |
+
+Tests : `tests/test_free_quota_vs_transient.py` (13 tests, nouveau) — suite complète 3163 passed, 0 failed (hors tests réseau live).
+
 ---
 
 ## 4. Ordre de priorité

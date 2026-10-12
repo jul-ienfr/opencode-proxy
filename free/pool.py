@@ -1528,7 +1528,7 @@ class FreeIPPool:
             return False
 
     def on_quota_exhausted(
-        self, station: VPNManager | Socks5Endpoint | None = None, forced_pool: set | None = None
+        self, station: VPNManager | Socks5Endpoint | None = None, forced_pool: set | None = None, quota: bool = True
     ):
         """Free quota exhausted (429): mark the station bad and rotate it
         in the background — the next request lands on the other station.
@@ -1561,6 +1561,13 @@ class FreeIPPool:
 
         Axe B: ``forced_pool`` is propagated to the background rotation so
         the rotated station stays within geo-allowed countries.
+
+        [fix faux-429] ``quota=False`` : l'appelant a classé le 429 comme une
+        erreur serveur TRANSITOIRE (ex. « Endpoint is unavailable » →
+        overloaded_error), pas un quota per-IP. On saute la rotation (et le
+        bad-mark) : l'IP neuve serait rejetée pareil, la rotation ne ferait
+        que brûler des IP + des handshakes AUTH NordVPN (tempête de rotation).
+        Le compteur corrélé ``_note_upstream_429`` reste alimenté plus haut.
 
         No-op when VPN is disabled or in direct mode.
         """
@@ -1598,7 +1605,7 @@ class FreeIPPool:
             if self.dual_station:
                 if self._any_other_usable(station):
                     self._apply_bad_mark(station, "rate_limit")
-        if action in ("rotate", "both"):
+        if action in ("rotate", "both") and quota:
             if self._upstream_event_active():
                 # Événement amont : l'IP neuve serait rejetée aussi — on ne
                 # brûle ni IP ni AUTH NordVPN. Le cooldown ci-dessus suffit ;

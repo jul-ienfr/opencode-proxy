@@ -294,7 +294,18 @@ def test_E6_no_fabricated_retry_after():
     r = oc._free_refusal_response(e429_nora, "openai")
     assert r.status_code == 429
     assert "Retry-After" not in r.headers, "429 sans RA upstream → pas de header inventé"
-    assert "quota" in str(_resp_json(r)).lower()
+    # [fix faux-429] "rl" n'est pas un corps quota (pas de motif quota/crédit
+    # ni de limite de débit explicite) → message VÉRIDIQUE, pas "quota".
+    assert "quota" not in str(_resp_json(r)).lower()
+    assert "Free model request failed with status 429" in str(_resp_json(r))
+    # Un VRAI corps quota garde le message historique.
+    e429_quota = oc.FreeRefusal(
+        status=429, body='{"error": {"message": "Rate limit exceeded"}}', retry_after=""
+    )
+    r_q = oc._free_refusal_response(e429_quota, "openai")
+    assert r_q.status_code == 429
+    assert "Retry-After" not in r_q.headers, "429 sans RA upstream → pas de header inventé"
+    assert "quota" in str(_resp_json(r_q)).lower()
     # legacy wrapper délégué (compat)
     r2 = oc._free_quota_exhausted_response(e429_nora, "openai")
     assert r2.status_code == 429 and "Retry-After" not in r2.headers

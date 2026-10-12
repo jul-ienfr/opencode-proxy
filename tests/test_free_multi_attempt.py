@@ -442,7 +442,7 @@ async def test_socks5_mode_429_retries_next_proxy(free_vpn_env, free_cfg, monkey
     monkeypatch.setattr(oc, "_free_ip_pool", pool)
     fake = _FakeFreeCurl(
         [
-            _FakeResp(429, {"retry-after": "30"}, text="{}"),
+            _FakeResp(429, {"retry-after": "30"}, text='{"error": {"message": "Rate limit exceeded for free tier"}}'),
             _FakeResp(
                 200,
                 {"content-type": "application/json"},
@@ -505,8 +505,8 @@ async def test_non_stream_budget_exhausted_returns_none(free_vpn_env, free_cfg, 
     monkeypatch.setattr(oc, "_free_ip_pool", pool)
     fake = _FakeFreeCurl(
         [
-            _FakeResp(429, {"retry-after": "30"}, text="{}"),
-            _FakeResp(429, {"retry-after": "60"}, text="{}"),
+            _FakeResp(429, {"retry-after": "30"}, text='{"error": {"message": "Rate limit exceeded for free tier"}}'),
+            _FakeResp(429, {"retry-after": "60"}, text='{"error": {"message": "Rate limit exceeded for free tier"}}'),
         ]
     )
     monkeypatch.setattr(oc, "_do_free_request_curl_cffi", fake)
@@ -996,7 +996,7 @@ async def test_hedge_loser_429_badmarked(free_vpn_env, free_cfg, monkeypatch):
         if next(order) == "fast429":
             # la perdante répond 429 AVANT la gagnante (pas de sleep) —
             # le filet §14.1.5 la retient sans clore la course
-            return _FakeResp(429, {"retry-after": "30"}, text="{}")
+            return _FakeResp(429, {"retry-after": "30"}, text='{"error": {"message": "Rate limit exceeded for free tier"}}')
         await asyncio.sleep(0.05)  # la gagnante répond APRES la 429 perdante
         return _FakeResp(
             200, {"content-type": "application/json"},
@@ -1037,7 +1037,7 @@ async def test_hedge_all_429_marks_all_stations(free_vpn_env, free_cfg, monkeypa
 
     async def _fake_hedge(cands_arg, body, headers, endpoint, forced_pool=None):
         assert cands_arg == cands
-        return _FakeResp(429, {"retry-after": "45"}, text="{}"), a
+        return _FakeResp(429, {"retry-after": "45"}, text='{"error": {"message": "Rate limit exceeded for free tier"}}'), a
 
     monkeypatch.setattr(oc, "_hedged_fetch", _fake_hedge)
     monkeypatch.setattr(oc, "_free_parallel_should_hedge", lambda *a_, **k: True)
