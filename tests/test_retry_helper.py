@@ -25,7 +25,8 @@ def test_parse_rejects_garbage_and_out_of_range():
     assert parse_retry_after("nonsense") is None
     assert parse_retry_after("0") is None
     assert parse_retry_after("-3") is None
-    assert parse_retry_after("601") is None  # > max_s défaut 600
+    assert parse_retry_after("901") is None  # > max_s défaut 900 (parité v2 : 15 min)
+    assert parse_retry_after("900") == 900.0
     assert parse_retry_after("61", max_s=60.0) is None  # borne free-direct
     assert parse_retry_after("60", max_s=60.0) == 60.0
 

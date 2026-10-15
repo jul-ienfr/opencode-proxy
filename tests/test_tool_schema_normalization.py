@@ -24,14 +24,14 @@ class TestStripAnyOfNull:
         schema = {"anyOf": [{"type": "null"}]}
         out = _N(schema, "deepseek-v4-flash")
         assert "anyOf" not in out
-        # V4 100% : root type forcé + additionalProperties:false pour strict
-        assert out == {"type": "object", "additionalProperties": False}
+        # Parité 1.19.0 : root type forcé, jamais additionalProperties:false.
+        assert out == {"type": "object"}
 
     def test_anyof_string_object_null_filter(self):
         schema = {"anyOf": [{"type": "string"}, {"type": "object"}, {"type": "null"}]}
         out = _N(schema, "glm-5.1")
-        # V4 100% : anyOf résiduel strippé + flatten vers 1er élément pour strict
-        assert out == {"type": "string", "additionalProperties": False}
+        # Parité 1.19.0 : anyOf résiduel strippé + flatten vers 1er élément.
+        assert out == {"type": "string"}
 
     def test_oneof_idem(self):
         schema = {"oneOf": [{"type": "string"}, {"type": "null"}], "description": "bar"}
@@ -41,8 +41,8 @@ class TestStripAnyOfNull:
     def test_anyof_without_null_unchanged(self):
         schema = {"anyOf": [{"type": "string"}, {"type": "number"}]}
         out = _N(schema, "deepseek-v4-flash")
-        # V4 100% : anyOf résiduel strippé pour strict → flatten
-        assert out == {"type": "string", "additionalProperties": False}
+        # Parité 1.19.0 : anyOf résiduel strippé pour strict → flatten.
+        assert out == {"type": "string"}
         # permissive garde anyOf
         out2 = _N(schema, "minimax-m2.5")
         assert out2 == {"anyOf": [{"type": "string"}, {"type": "number"}]}
@@ -59,8 +59,8 @@ class TestTypeArrayNull:
 
     def test_type_array_null_only_drop(self):
         out = _N({"type": ["null"]}, "glm-5.1")
-        # V4 100% : type manquant → root forcé object
-        assert out == {"type": "object", "additionalProperties": False}
+        # type manquant → root forcé object (parité 1.19.0 : sans additionalProperties).
+        assert out == {"type": "object"}
 
 
 # ── nullable ────────────────────────────────────────────────────
@@ -118,13 +118,13 @@ class TestStripAdditionalProperties:
     def test_additional_true_stripped(self):
         schema = {"type": "object", "properties": {"x": {"type": "string"}}, "additionalProperties": True}
         out = _N(schema, "muse-spark-1.2-contributor")
-        # V4 100% : forcé false pour strict
-        assert out["additionalProperties"] is False
+        # Parité 1.19.0 : True strippé, jamais forcé false.
+        assert "additionalProperties" not in out
 
     def test_additional_schema_stripped(self):
         schema = {"type": "object", "additionalProperties": {"type": "string"}}
         out = _N(schema, "deepseek-v4-flash")
-        assert out["additionalProperties"] is False
+        assert "additionalProperties" not in out
 
     def test_additional_false_preserved(self):
         schema = {"type": "object", "additionalProperties": False}
@@ -149,7 +149,7 @@ class TestStripAdditionalProperties:
     def test_nested_additional_true_stripped(self):
         schema = {"type": "object", "properties": {"cfg": {"type": "object", "properties": {}, "additionalProperties": True}}}
         out = _N(schema, "muse-spark-1.2-contributor")
-        assert out["properties"]["cfg"]["additionalProperties"] is False
+        assert "additionalProperties" not in out["properties"]["cfg"]
 
     def test_permissive_keeps_additional(self):
         schema = {"type": "object", "additionalProperties": True}
@@ -208,13 +208,8 @@ class TestNestingDepth:
     def test_depth_5_unchanged(self):
         schema = self._deep(5)
         out = _N(schema, "muse-spark-1.2-contributor")
-        # V4 100% : additionalProperties:false forcé à chaque niveau même sans flatten
-        assert out != schema
-        # vérifie que chaque niveau a bien additionalProperties:false
-        cur = out
-        for _ in range(5):
-            assert cur.get("additionalProperties") is False
-            cur = cur.get("properties", {}).get("x", {})
+        # Parité 1.19.0 : rien n'est inventé — schéma inchangé.
+        assert out == schema
 
     def test_depth_13_permissive(self):
         schema = self._deep(13)
@@ -537,5 +532,5 @@ class TestEndToEndConversion:
             "tools": [{"name": "t", "input_schema": {"type": "object", "properties": {"x": {"type": "string"}}, "additionalProperties": True}}],
         }
         r = pm.anthropic_to_openai(body, "muse-spark-1.2-contributor")
-        # V4 100% : forcé false pour strict
-        assert r["tools"][0]["function"]["parameters"]["additionalProperties"] is False
+        # Parité 1.19.0 : True strippé, jamais forcé false.
+        assert "additionalProperties" not in r["tools"][0]["function"]["parameters"]
