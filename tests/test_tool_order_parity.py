@@ -109,39 +109,40 @@ def test_tool_sort_key_is_total_and_never_raises():
 
 
 def test_sanitize_chat_tools_sorts_on_the_fast_path_too():
-    """Parité v2 : ordre préservé même sans raccourcissement (plus de tri)."""
+    """Aucun nom à raccourcir… mais la sortie est quand même triée (E3, mesuré 1.19.0)."""
     name_map: dict = {}
     out = _sanitize_chat_tools([_tool("zeta"), _tool("alpha")], name_map)
-    assert _names(out) == ["zeta", "alpha"]
+    assert _names(out) == ["alpha", "zeta"]
     assert name_map == {}  # rien à raccourcir, donc aucune entrée de map
 
 
 def test_sanitize_chat_tools_sorts_the_renamed_tools_with_the_rest():
-    """Le nom raccourci reste sur place (ordre préservé v2, pas de tri)."""
+    """Le nom raccourci (digest) prend sa place dans le tri, il n'est pas
+    simplement remplacé sur place — sinon l'ordre cesserait d'être trié."""
     long_name = "a" * 80
     name_map: dict = {}
     out = _sanitize_chat_tools([_tool("zeta"), _tool(long_name), _tool("alpha")], name_map)
-    assert _names(out)[0] == "zeta"
-    assert _names(out)[2] == "alpha"
+    assert _names(out) == sorted(_names(out))
     assert len(name_map) == 1  # le seul nom raccourci est enregistré
-    assert len(_names(out)[1]) <= 64
+    assert len(_names(out)[1]) <= 64  # « alpha » puis le nom raccourci puis « zeta »
 
 
 def test_free_wire_shims_are_sorted_with_the_rest():
-    """Jambe free v2 : shims `bash`/`read` appendus, ordre client préservé."""
+    """Jambe free : ``bash``/``read`` s'intercalent dans l'ordre trié (mesuré
+    1.19.0), ils ne sont pas simplement ajoutés en fin de liste."""
     body = {
         "model": "m",
         "messages": [{"role": "user", "content": "hi"}],
         "tools": [_tool("zzz"), _tool("aaa")],
     }
     wire, _forced = oc._free_wire_body(body)
-    assert _names(wire["tools"]) == ["zzz", "aaa", "bash", "read"]
+    assert _names(wire["tools"]) == ["aaa", "bash", "read", "zzz"]
     # Le corps d'origine n'est jamais muté (idempotence des retries/hedges).
     assert _names(body["tools"]) == ["zzz", "aaa"]
 
 
 def test_free_wire_is_idempotent_once_sorted():
-    """Réappliquer le wire ne change plus rien : append idempotent (v2)."""
+    """Réappliquer le wire ne change plus rien : le tri est un point fixe."""
     body = {
         "model": "m",
         "messages": [{"role": "user", "content": "hi"}],
@@ -149,7 +150,7 @@ def test_free_wire_is_idempotent_once_sorted():
     }
     first, _ = oc._free_wire_body(body)
     second, _ = oc._free_wire_body(first)
-    assert _names(second["tools"]) == _names(first["tools"]) == ["zzz", "aaa", "bash", "read"]
+    assert _names(second["tools"]) == _names(first["tools"]) == ["aaa", "bash", "read", "zzz"]
 
 
 def test_free_wire_responses_leg_is_left_alone():
@@ -165,7 +166,7 @@ def test_free_wire_responses_leg_is_left_alone():
 
 
 def test_end_to_end_chat_request_is_sorted():
-    """Par le point d'entrée public : le corps Chat préserve l'ordre (v2)."""
+    """Par le point d'entrée public : le corps Chat qui part est trié (mesuré 1.19.0)."""
     req = {
         "model": "muse-spark",
         "max_tokens": 16,
@@ -176,4 +177,4 @@ def test_end_to_end_chat_request_is_sorted():
         ],
     }
     out = pm.anthropic_to_openai(req, req["model"])
-    assert _names(out["tools"]) == ["zzz", "aaa"]
+    assert _names(out["tools"]) == ["aaa", "zzz"]

@@ -1,12 +1,13 @@
-"""Verrouille le WIRE COMPLET de la jambe free : 12 en-tetes comme le client.
+"""Verrouille le WIRE COMPLET de la jambe free : 13 en-tetes comme le client 1.19.0.
 
-Test de conformite mesure : le client officiel 1.18.31 envoie 12 en-tetes
-(capture logs/_capture_real_provider.jsonl, 243 requetes, une seule signature
-d'en-tetes sur toute la serie). On verifie que la jambe free les emet tous,
-avec les bonnes valeurs, et que l'ordre hors Connection est identique.
+Test de conformite mesure : le client officiel 1.19.0 envoie 13 en-tetes
+(re-mesure 2026-10-15, `opencode run`, provider `opencodeproxy`, baseURL
+http:// locale : 8 en-têtes applicatifs + 5 de transport). On verifie que la
+jambe free les emet tous, avec les bonnes valeurs, et que l'ordre hors
+Connection est identique.
 
 Limite structurelle assumee : libcurl emet TOUJOURS Connection en dernier,
-l'ordre exact du client (Connection en 8e) est inatteignable via curl_cffi.
+l'ordre exact du client (Connection en 9e) est inatteignable via curl_cffi.
 Ce test verrouille donc « identical hors Connection », pas l'ordre brut.
 """
 
@@ -19,7 +20,7 @@ import pytest
 sys.path.insert(0, ".")
 import opencode as oc  # noqa: E402
 
-# Ordre EXACT mesure sur le fil chez le client officiel (243 requetes).
+# Ordre EXACT mesure sur le fil chez le client officiel 1.19.0.
 CLIENT_WIRE_ORDER = [
     "Authorization",
     "Content-Type",
@@ -28,6 +29,7 @@ CLIENT_WIRE_ORDER = [
     "x-opencode-project",
     "x-opencode-request",
     "x-opencode-session",
+    "x-opencode-session-id",
     "Connection",
     "Accept",
     "Host",
@@ -38,7 +40,7 @@ CLIENT_WIRE_ORDER = [
 CLIENT_WIRE_VALUES = {
     "Authorization": "Bearer public",
     "Content-Type": "application/json",
-    "User-Agent": "opencode/1.18.31 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14",
+    "User-Agent": "opencode/1.19.0 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14",
     "x-opencode-client": "cli",
     "Connection": "keep-alive",
     "Accept": "*/*",
@@ -101,7 +103,7 @@ def _capture_headers(extra_fp=None):
     not oc._ensure_curl_cffi(), reason="curl_cffi requis pour le wire reel"
 )
 def test_free_wire_has_all_client_headers():
-    """Les 12 en-tetes du client sont emis (avant : 10 seulement)."""
+    """Les 13 en-tetes du client 1.19.0 sont emis (avant : 12 sans session-id)."""
     got = _capture_headers()
     assert got, "aucune requete capturee"
     names = [k for k, _ in got]
@@ -129,6 +131,8 @@ def test_free_wire_values_match_client():
     assert re.fullmatch(r"(global|[0-9a-f]{40})", got["x-opencode-project"])
     assert re.fullmatch(r"msg_[0-9a-f]{12}[0-9A-Za-z]{14}", got["x-opencode-request"])
     assert re.fullmatch(r"ses_[0-9a-f]{12}[0-9A-Za-z]{14}", got["x-opencode-session"])
+    assert re.fullmatch(r"ses_[0-9a-f]{12}[0-9A-Za-z]{14}", got["x-opencode-session-id"])
+    assert got["x-opencode-session-id"] == got["x-opencode-session"]
 
 
 @pytest.mark.skipif(
@@ -161,7 +165,7 @@ def test_full_headers_kill_switch(monkeypatch):
     h = oc._official_free_headers("https://opencode.ai/zen/v1/chat/completions")
     for hdr in ("Connection", "Accept", "Host", "Accept-Encoding"):
         assert hdr not in h, f"{hdr} devrait etre absent avec le kill-switch"
-    assert len(h) == 7
+    assert len(h) == 8
 
 
 def test_host_recomputed_per_endpoint():

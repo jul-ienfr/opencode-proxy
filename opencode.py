@@ -4718,15 +4718,15 @@ def _free_request_headers(headers: dict) -> dict:
 # (et OPENCODE_CLIENT_NAME / OPENCODE_TLS_IMPERSONATE si besoin).
 _OPENCODE_OFFICIAL_UA = os.getenv(
     "OPENCODE_OFFICIAL_UA",
-    "opencode/1.18.31 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14",
+    "opencode/1.19.0 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14",
 )
-# UA de la jambe Responses — MESURÉ sur le vrai client 1.18.31 (même
+# UA de la jambe Responses — MESURÉ sur le vrai client 1.19.0 (même
 # opencode/Bun, mais ai-sdk provider-utils 4.0.40 : autre bundle ai-sdk pour
 # l'API Responses). Envoyer l'UA chat (4.0.23) sur /responses = combinaison
 # qui n'existe jamais dans la nature.
 _OPENCODE_OFFICIAL_UA_RESPONSES = os.getenv(
     "OPENCODE_OFFICIAL_UA_RESPONSES",
-    "opencode/1.18.31 ai-sdk/provider-utils/4.0.40 runtime/bun/1.3.14",
+    "opencode/1.19.0 ai-sdk/provider-utils/4.0.40 runtime/bun/1.3.14",
 )
 # Parité officielle v2 (`packages/core/src/app.ts:useragent`) :
 # `opencode/<channel>/<version>/<name>` — plus de `ai-sdk/provider-utils`,
@@ -4828,6 +4828,12 @@ _SYSTEMONE_ENDPOINT = os.getenv(
 # trop dont la longueur VARIE aléatoirement (186/218/250/282 octets -> 4
 # profils distincts, empreinte instable). Retiré : le profil devient
 # exactement celui du binaire (vérifié, sonde AQ).
+# Re-mesuré le 2026-10-15 sur le binaire 1.19.0 (`localhost:48443`, 517
+# octets) : ciphers/curves/sigalgs(9)/ALPN http/1.1/GREASE-absent IDENTIQUES
+# au replay, SNI premier, + extension padding 21 en fin — ajoutée
+# automatiquement par la stack (BoringSSL/curl_cffi l'émet aussi : notre
+# replay fait également 517 octets avec `-21` final). La chaîne JA3
+# ci-dessous ne liste donc pas le 21 : il vient de la stack des deux côtés.
 # Surchargeable (kill-switch preset navigateur si le replay casse un jour :
 # OPENCODE_TLS_IMPERSONATE=chrome131).
 _OPENCODE_JA3 = os.getenv(
@@ -4867,7 +4873,10 @@ _FREE_WIRE_FULL_HEADERS = os.getenv("OPENCODE_FREE_WIRE_FULL_HEADERS", "1") not 
 _OPENCODE_ACCEPT_ENCODING = os.getenv(
     "OPENCODE_ACCEPT_ENCODING", "gzip, deflate, br, zstd"
 )
-# [ordre exact] Ordre des en-têtes sur le fil — MESURÉ 243× sur le client.
+# [ordre exact] Ordre des en-têtes sur le fil — MESURÉ 243× sur le client
+# 1.18.31 (12 en-têtes) puis re-mesuré 4 requêtes sur le client 1.19.0
+# (2026-10-15, `opencode run`, provider `opencodeproxy`) : 13 en-têtes,
+# `x-opencode-session-id` (= même ses_) en 8e après `x-opencode-session`.
 # curl_cffi expose l'option libcurl-impersonate CURLOPT_HTTPHEADER_ORDER
 # (11030) via ExtraFingerprints.header_order. Sans elle, libcurl émet NOTRE
 # Connection en DERNIÈRE position (il ne la génère pas lui-même : sans elle
@@ -4880,7 +4889,7 @@ _OPENCODE_ACCEPT_ENCODING = os.getenv(
 _OPENCODE_HEADER_ORDER = os.getenv(
     "OPENCODE_FREE_HEADER_ORDER",
     "Authorization,Content-Type,User-Agent,x-opencode-client,x-opencode-project,"
-    "x-opencode-request,x-opencode-session,Connection,Accept,Host,Accept-Encoding,"
+    "x-opencode-request,x-opencode-session,x-opencode-session-id,Connection,Accept,Host,Accept-Encoding,"
     "Content-Length",
 )
 _FREE_HEADER_ORDER_ON = os.getenv("OPENCODE_FREE_HEADER_ORDER_ON", "1") not in (
@@ -4904,8 +4913,8 @@ def _free_fp_override() -> dict:
       * ``tls_signature_algorithms`` = les 9 sigalgs Bun (noms OpenSSL),
       * ``tls_grease`` False (Bun ne grease rien — vérifié sur 6 captures),
       * ``http_version`` "v1" (= V1_1 : Bun n'offre que http/1.1 en ALPN),
-      * ``header_order`` = l'ordre EXACT des 12 en-têtes du client (voir
-        _OPENCODE_HEADER_ORDER). C'est ce qui place ``Connection`` en 8e
+      * ``header_order`` = l'ordre EXACT des 13 en-têtes du client 1.19.0 (voir
+        _OPENCODE_HEADER_ORDER). C'est ce qui place ``Connection`` en 9e
         position comme le client, au lieu de la dernière (limite libcurl).
     Données pures (pas d'import curl_cffi ici — la factory garde son import
     paresseux + son garde). Kill-switch : si OPENCODE_TLS_IMPERSONATE est
@@ -5037,19 +5046,11 @@ def _free_wire_body(body, force_stream: bool = False):
         base.extend(_free_shim_tool(n, is_resp) for n in missing)
         wire["tools"] = base
     if is_chat and need_order:
-        # Parité officielle v2 (`flattenTools` préserve l'ordre, aucun tri) :
-        # on préserve l'ordre client + shims manquants appendus (contrainte
-        # gateway I3 : `bash`+`read` requis, sinon 403). L'ancien tri ICU v1
-        # (`request.ts:184`) reste disponible via `OPENCODE_SORT_TOOLS=1`
-        # comme optimisation maison du préfixe cache, plus comme parité.
-        try:
-            import os as _os
-
-            _sort_opt = _os.getenv("OPENCODE_SORT_TOOLS", "0") not in ("", "0", "false", "False", "no", "No")
-        except Exception:
-            _sort_opt = False
-        if _sort_opt:
-            wire["tools"] = _sorted_chat_tools(wire.get("tools"))
+        # Parité client officiel v1 (tri ICU `toSorted(localeCompare)`,
+        # re-mesuré sur 1.19.0 le 2026-10-15 : outils triés sur le fil).
+        # Les shims `bash`/`read` sont triés AVEC le reste, pas appendus :
+        # le tri porte sur l'état FINAL (outils d'origine + shims).
+        wire["tools"] = _sorted_chat_tools(wire.get("tools"))
     if need_tc:
         # Le client pose « auto » dès qu'il y a des tools (242/242 mesures).
         wire["tool_choice"] = "auto"
@@ -5330,13 +5331,14 @@ def _body_conversation_key(body) -> str | None:
 def _official_free_headers(endpoint: str = "", conversation_key: str | None = None) -> dict:
     """Jeu de headers officiel complet pour UN envoi jambe free.
 
-    Copie du wire Bun MESURÉ sur le vrai client 1.18.31 (capture en clair
-    via baseURL http:// locale, 2026-09-18) — octet-exact :
+    Copie du wire Bun MESURÉ sur le vrai client 1.19.0 (capture en clair
+    via baseURL http:// locale, 2026-10-15, provider `opencodeproxy`,
+    `opencode run`, 2 requêtes : titres + principale, même ses_/msg_) :
       Authorization: Bearer public
       Content-Type: application/json
       User-Agent: opencode/<ver> ai-sdk/provider-utils/<v> runtime/bun/<v>
       x-opencode-client / x-opencode-project / x-opencode-request /
-      x-opencode-session
+      x-opencode-session / x-opencode-session-id (= même ses_)
     puis la pile Bun ajoute : Connection: keep-alive, Accept: */*, Host,
     Accept-Encoding: gzip, deflate, br, zstd, Content-Length.
     Points critiques (le gate 403 les discrimine) :
@@ -5386,9 +5388,16 @@ def _official_free_headers(endpoint: str = "", conversation_key: str | None = No
         "x-opencode-project": _OPENCODE_PROJECT,
         "x-opencode-request": _free_request_msg_id(),
         "x-opencode-session": _conv_session,
+        # Parité 1.19.0 mesurée : `x-opencode-session-id` = même ses_ que
+        # `x-opencode-session` (absent en 1.18.31). Note `x-opencode-client` :
+        # `opencode run` envoie `desktop` en 1.18.31 comme en 1.19.0 (mesuré
+        # 4 requêtes, même méthodologie) ; on garde `cli`, valeur qui obtient
+        # des 200 en production depuis des mois — changer sans preuve live
+        # serait risquer la jambe qui marche.
+        "x-opencode-session-id": _conv_session,
     }
     if _FREE_WIRE_FULL_HEADERS:
-        # Ordre du client : Connection 8e, Accept 9e, Host 10e, AE 11e.
+        # Ordre du client 1.19.0 : Connection 9e, Accept 10e, Host 11e, AE 12e.
         # (libcurl replacera Connection en dernier — cf. docstring.)
         try:
             from urllib.parse import urlparse as _urlparse

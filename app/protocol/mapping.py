@@ -283,37 +283,21 @@ _MAX_COMPLETION_MODELS_DEFAULT = ("o1", "o3", "o4", "gpt-5")
 
 
 def _wants_max_completion_tokens(model: str) -> bool:
-    """[Lot L14 — B2/A17 + parité v2 `detectMaxTokensField`] L'upstream Chat exige-t-il ``max_completion_tokens`` ?
+    """[Lot L14 — B2/A17] L'upstream Chat de ``model`` exige-t-il ``max_completion_tokens`` ?
 
-    Officiel (`openai-chat.ts`) : `max_completion_tokens` par défaut, sauf
-    providers legacy qui exigent `max_tokens` (deepseek/moonshot/together/zai/
-    nvidia/cerebras/chutes/cloudflare). On approxime le provider par le nom
-    de modèle (le proxy ne connaît que l'id catalogue, pas le provider npm).
-    Config `thinking.max_completion_models` reste en surcharge explicite.
+    Mesuré sur le client déployé 1.19.0 (2026-10-15) : Chat émet TOUJOURS
+    ``max_tokens`` (défaut 32000), y compris glm/mimo/muse-spark — la
+    détection `detectMaxTokensField` n'existe que sur la lignée v2-dev,
+    pas dans le client qui parle aujourd'hui aux providers.
+    Le basculement reste donc limité aux préfixes o-series/gpt-5
+    (config-driven), qui rejettent ``max_tokens`` en 400.
     """
     if not isinstance(model, str) or not model:
-        return True
+        return False
     cfg = yaml_get("thinking", "max_completion_models", None)
     prefixes = cfg if isinstance(cfg, list) and cfg else _MAX_COMPLETION_MODELS_DEFAULT
     name = model.lower()
-    if any(name.startswith(str(p).lower()) for p in prefixes if p):
-        return True
-    # Providers legacy qui exigent `max_tokens` (aligné `detectMaxTokensField`).
-    legacy = (
-        "deepseek",
-        "moonshot",
-        "together",
-        "zai",
-        "zhipu",
-        "bigmodel",
-        "nvidia",
-        "cerebras",
-        "chutes",
-        "cloudflare",
-    )
-    if any(tok in name for tok in legacy):
-        return False
-    return True
+    return any(name.startswith(str(p).lower()) for p in prefixes if p)
 
 
 #: Plafonds de sortie connus par famille (au-delà → 400 upstream).
@@ -345,7 +329,10 @@ def _set_output_token_limit(    target: dict,
     default: int | None = 32000,
     target_protocol: str = "openai",
 ) -> int:
-    """[Lot L14 — B2/A17 + parité v2] Écrit la limite de sortie dans ``target``.
+    """[Lot L14 — B2/A17] Écrit la limite de sortie dans ``target``, forme adaptée.
+
+    Défaut 32000 = défaut officiel mesuré (Chat 1.19.0 : `max_tokens: 32000` ;
+    Anthropic : `DEFAULT_MAX_TOKENS = 32_000`).
 
     Lit la limite du client en acceptant **toutes** ses conventions —
     ``max_tokens`` (Anthropic/Chat historique) et ``max_completion_tokens``
@@ -1666,10 +1653,10 @@ def anthropic_to_openai(body: dict, model: str, raw: bytes | None = None) -> dic
                 _so.setdefault("include_usage", True)
         except Exception:
             pass
-    # [Lot L14 — B2/A17 + parité v2] Chat : ne rien inventer si le client
-    # n'envoie rien (l'officiel laisse `undefined`) ; forme détectée
-    # `max_tokens` vs `max_completion_tokens` par provider.
-    _set_output_token_limit(oai, body, model, default=None, target_protocol="openai")
+    # [Lot L14 — B2/A17] Forme du champ de limite adaptée à l'upstream :
+    # `max_tokens` par défaut (mesuré 1.19.0 : le client émet `max_tokens`
+    # = 32000) ; `max_completion_tokens` vers o-series/gpt-5 uniquement.
+    _set_output_token_limit(oai, body, model)
 
     for key, oai_key in [
         ("temperature", "temperature"),
@@ -3872,11 +3859,12 @@ def _tool_sort_key(name: str):
 
 
 def _sorted_chat_tools(tools: list) -> list:
-    """[E3 legacy v1 — optimisation maison, plus parité v2] Trie ``tools[]``.
+    """[E3 — parité client officiel v1] Trie ``tools[]`` par ``function.name``.
 
-    v1 triait (`toSorted(localeCompare)`, `request.ts:184`) ; v2 préserve
-    l'ordre (`flattenTools`, aucun tri). Gardé derrière `OPENCODE_SORT_TOOLS=1`
-    comme optimisation du préfixe cache, plus comme imitation.
+    Re-mesuré sur le client 1.19.0 le 2026-10-15 (`opencode run`, provider
+    `opencodeproxy`, 4 requêtes) : outils triés sur le fil
+    (`toSorted(localeCompare)`, collation ICU). La lignée v2-dev
+    (`flattenTools`, aucun tri) n'est PAS ce que le client déployé envoie.
     Renvoie une copie : l'entrée du caller n'est jamais mutée.
     """
     if not isinstance(tools, list) or len(tools) < 2:
@@ -3907,14 +3895,17 @@ def _sanitize_chat_tools(oai_tools: list, name_map: dict) -> list:
 
     Copie des seules entrées modifiées : le caller n'est jamais muté.
     Retourne la nouvelle liste ; complète ``name_map`` ``{short: original}``.
-    Parité v2 : l'ordre client est préservé (plus de tri) ; le sanitize ne
-    réordonne jamais.
+    Fast-path intégral (aucun nom à raccourcir) : map vide — mais la liste est
+    malgré tout **triée** (E3, cf. ``_sorted_chat_tools``) : l'ordre officiel
+    (mesuré 1.19.0) est une propriété du fil, pas un effet de bord du
+    raccourcissement.
     """
     if not isinstance(oai_tools, list) or not oai_tools or not isinstance(name_map, dict):
         return oai_tools
-    # v2 : pas de tri — on projette dans l'ordre d'arrivée pour garder
-    # l'alignement positionnel flat[i] ↔ sanitized[i].
-    src = list(oai_tools)
+    # E3 : on trie AVANT de projeter, pour que les index de ``flat``/``sanitized``
+    # décrivent la liste telle qu'elle partira — l'alignement positionnel reste
+    # garanti, et la sortie est triée même quand rien n'est à raccourcir.
+    src = _sorted_chat_tools(oai_tools)
     idx_of: list[int] = []
     flat: list[dict] = []
     for i, t in enumerate(src):

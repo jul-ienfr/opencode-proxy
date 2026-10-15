@@ -143,20 +143,20 @@ def test_clamp_leaves_a_bool_even_when_a_limit_exists(isolated_models):
 
 
 def test_helper_clips_the_client_value(isolated_models):
-    """Le cœur du correctif : 200 000 demandé, 65 536 écrit (v2 : `max_completion_tokens`)."""
+    """Le cœur du correctif : 200 000 demandé, 65 536 écrit."""
     isolated_models({"kimi-k2.6": {"output_limit": 65536}})
     target = {}
     limit = _set_output_token_limit(target, {"max_tokens": 200000}, "kimi-k2.6")
     assert limit == 65536
-    assert target["max_completion_tokens"] == 65536
+    assert target["max_tokens"] == 65536
 
 
 def test_helper_leaves_the_default_alone_without_entry(isolated_models):
-    """Non-régression majeure : sans entrée, le défaut officiel 32000 reste 32000 (v2)."""
+    """Non-régression : sans entrée, le défaut officiel 32000 reste 32000."""
     isolated_models({})
     target = {}
     assert _set_output_token_limit(target, {}, "kimi-k2.6") == 32000
-    assert target["max_completion_tokens"] == 32000
+    assert target["max_tokens"] == 32000
 
 
 def test_helper_respects_a_client_asking_less(isolated_models):
@@ -164,7 +164,7 @@ def test_helper_respects_a_client_asking_less(isolated_models):
     isolated_models({"kimi-k2.6": {"output_limit": 65536}})
     target = {}
     assert _set_output_token_limit(target, {"max_tokens": 4096}, "kimi-k2.6") == 4096
-    assert target["max_completion_tokens"] == 4096
+    assert target["max_tokens"] == 4096
 
 
 def test_clamp_applies_before_the_max_completion_branch(isolated_models):
@@ -195,24 +195,23 @@ def test_clamp_applies_on_the_anthropic_target_too(isolated_models):
 
 def test_end_to_end_clips_the_upstream_body(isolated_models):
     """200 000 tokens de sortie demandés à un modèle qui plafonne à 131 072 :
-    le corps envoyé à l'upstream porte 131 072 (v2 : `max_completion_tokens`)."""
+    le corps envoyé à l'upstream porte 131 072."""
     isolated_models({"glm-5.1": {"output_limit": 131072}})
     out = anthropic_to_openai(
         {"model": "x", "max_tokens": 200000, "messages": [{"role": "user", "content": "hi"}]},
         "glm-5.1",
     )
-    assert out.get("max_completion_tokens") == 131072
+    assert out.get("max_tokens") == 131072
 
 
 def test_end_to_end_keeps_the_default_for_unlisted_models(isolated_models):
-    """Un modèle hors table : Chat n'invente rien (parité v2, `undefined`)."""
+    """Un modèle hors table : défaut officiel 32000 en `max_tokens` (mesuré 1.19.0)."""
     isolated_models({"glm-5.1": {"output_limit": 131072}})
     out = anthropic_to_openai(
         {"model": "x", "messages": [{"role": "user", "content": "hi"}]},
         "minimax-m2.5",
     )
-    assert "max_tokens" not in out
-    assert "max_completion_tokens" not in out
+    assert out.get("max_tokens") == 32000
 
 
 def test_end_to_end_a_short_request_is_not_inflated(isolated_models):
@@ -222,7 +221,7 @@ def test_end_to_end_a_short_request_is_not_inflated(isolated_models):
         {"model": "x", "max_tokens": 512, "messages": [{"role": "user", "content": "hi"}]},
         "grok-4.7",
     )
-    assert out.get("max_completion_tokens") == 512
+    assert out.get("max_tokens") == 512
 
 
 # ─────────────── garde structurelle sur la config réelle ───────────────

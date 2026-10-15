@@ -133,10 +133,9 @@ def test_session_id_is_case_insensitive_on_the_incoming_key():
 
 
 def test_free_leg_still_has_no_session_id():
-    """Jambe free verrouillée octet-exact par la capture 243 requêtes : aucun
-    `session-id` n'y est ajouté (demanderait une re-mesure)."""
+    """Jambe free : `x-opencode-session-id` = même ses_ (re-mesuré 1.19.0)."""
     h = oc._official_free_headers("")
-    assert "x-opencode-session-id" not in {k.lower() for k in h}
+    assert h["x-opencode-session-id"] == h["x-opencode-session"]
     assert "x-opencode-session" in h
 
 

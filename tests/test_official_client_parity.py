@@ -1,13 +1,15 @@
 """test_official_client_parity.py — la jambe free recopie le client OpenCode officiel.
 
-Référence (vérifiée 2026-09-18, sst/opencode == fork anomalyco/opencode) :
+Référence (re-vérifiée 2026-10-15 sur le binaire 1.19.0, même méthodologie :
+`opencode run`, provider `opencodeproxy`, baseURL http:// locale) :
   * client  : packages/opencode/src/session/llm/request.ts (jeu des headers)
-  * wire    : captures octet-exact du VRAI client 1.18.31 redirigé vers un
-              captureur local (baseURL http://) : 7 headers dans l'ordre
+  * wire    : captures octet-exact du VRAI client 1.19.0 redirigé vers un
+              captureur local (baseURL http://) : 8 headers dans l'ordre
               Authorization, Content-Type, User-Agent, x-opencode-client/
-              project/request/session, puis transport Bun (Connection,
-              Accept, Host, AE, Content-Length) ; ClientHello Bun rejoué
-              (ciphers/order/sigalgs/ALPN http/1.1, cf. _free_fp_override)
+              project/request/session/session-id (= même ses_), puis
+              transport Bun (Connection, Accept, Host, AE, Content-Length) ;
+              ClientHello Bun rejoué (ciphers/order/sigalgs/ALPN http/1.1,
+              + padding ext 21 — cf. _free_fp_override)
   * gate    : bisection live 2026-09-18 — la jambe anonyme exige stream:true
               + tools[] contenant « bash » ET « read » (case-sensitive,
               schemas libres), sinon 403 FreeTierError
@@ -17,14 +19,15 @@ Référence (vérifiée 2026-09-18, sst/opencode == fork anomalyco/opencode) :
               « public » → anonyme, quota trial PAR IP)
 
 Règles verrouillées ici :
-  1. Jeu exact : 7 headers, ni plus ni moins — AUCUN header navigateur
+  1. Jeu exact : 8 headers, ni plus ni moins — AUCUN header navigateur
      (Accept-Language, sec-ch-ua, Cookie…) même si le profil d'identité en
      porte (la diversité navigateur ne sert que le chemin geo), et PAS
-     d'Accept explicite (transport Bun l'ajoute en 9ᵉ ; explicite = trié
+     d'Accept explicite (transport Bun l'ajoute en 10ᵉ ; explicite = trié
      premier = copie trahie).
   2. Ordre wire réel : Authorization, Content-Type, User-Agent,
-     x-opencode-client/project/request/session (UA par endpoint : 4.0.23 en
-     chat, 4.0.40 en responses — deux bundles ai-sdk mesurés).
+     x-opencode-client/project/request/session/session-id (UA par endpoint :
+     4.0.23 en chat, 4.0.40 en responses — deux bundles ai-sdk mesurés
+     en 1.19.0).
   3. BRANCHE dépendante du nom du provider (binaire 1.18.31, verbatim) :
        headers:{...e.model.providerID.startsWith("opencode")
          ? {...(k?{"x-opencode-project":k}:{}), "x-opencode-session":...,
@@ -36,8 +39,11 @@ Règles verrouillées ici :
      La jambe free copie la branche x-opencode-*, la seule fidèle au client
      dont le provider commence par « opencode ».
   4. Valeurs : x-opencode-client = "cli" (enum binaire
-     ["app","cli","desktop"] ; le CLI envoie « cli », mesuré 243x, alors que
-     « desktop » n'apparaît dans AUCUNE capture du vrai client) ;
+     ["app","cli","desktop"] ; `opencode run` envoie « desktop » en 1.18.31
+     comme en 1.19.0 — mesuré 4 requêtes à méthodologie identique — alors
+     que la capture 243x (TUI) portait « cli ». On garde « cli », valeur
+     qui obtient des 200 en production depuis des mois : changer sans
+     preuve live serait risquer la jambe qui marche) ;
      x-opencode-project = ID de projet DÉRIVÉ, pas une constante — voir
      Project.resolve dans test_project_id_derivation_matches_official
      (fichier .git/opencode > commit racine, « global » hors dépôt git).
@@ -75,16 +81,18 @@ EXPECTED_ORDER = [
     "x-opencode-project",
     "x-opencode-request",
     "x-opencode-session",
+    "x-opencode-session-id",
     # [wire complet] 4 en-têtes de transport posés EXPLICITEMENT, dans l'ordre
-    # du client (mesuré 243x). Avant, libcurl les plaçait autrement : Host en
-    # position 1, Accept absente, Accept-Encoding sans zstd.
+    # du client (mesuré 243x en 1.18.31, re-mesuré 4 requêtes en 1.19.0).
+    # Avant, libcurl les plaçait autrement : Host en position 1, Accept
+    # absente, Accept-Encoding sans zstd.
     "Connection",
     "Accept",
     "Host",
     "Accept-Encoding",
 ]
 
-# Ordre EXACT sur le fil chez le client officiel (12 en-têtes, mesuré 243x).
+# Ordre EXACT sur le fil chez le client officiel (13 en-têtes, 1.19.0).
 CLIENT_WIRE_ORDER = [
     "Authorization",
     "Content-Type",
@@ -93,6 +101,7 @@ CLIENT_WIRE_ORDER = [
     "x-opencode-project",
     "x-opencode-request",
     "x-opencode-session",
+    "x-opencode-session-id",
     "Connection",
     "Accept",
     "Host",
@@ -142,31 +151,28 @@ def test_header_set_exact(official_env):
 
 
 def test_header_values_official(official_env):
-    """Valeurs exactes du client officiel (captures v1.18.31, provider réel).
+    """Valeurs exactes du client officiel (re-mesuré 1.19.0, 2026-10-15).
 
-    Mesuré sur le captureur avec le provider NOMMÉ `opencodeproxy` (243
-    requêtes) ET dans logs/debug.log (20 occurrences) :
-      x-opencode-client  = "cli"   (enum binaire : ["app","cli","desktop"])
+    Mesuré sur le captureur avec le provider NOMMÉ `opencodeproxy`
+    (`opencode run`, baseURL http:// locale) :
+      x-opencode-client  = "cli"   (choix proxy assumé : `run` envoie
+                            « desktop » en 1.18.31 comme en 1.19.0, mais
+                            « cli » obtient des 200 en production)
       x-opencode-project = ID de projet dérivé (ici le contenu de
                            .git/opencode), PAS la constante "global"
-
-    Le binaire 1.18.31 (Project.resolve) :
-      let F = repo.discover(dir)
-      if(!F) return {id: ID.global}                    # hors dépôt git
-      let I = readFileString(join(commonDirectory,"opencode"))
-      let L = (git remote → hash) ?? I ?? rootCommit
-      return {id: L ?? ID.global}
+      x-opencode-session-id = même ses_ que x-opencode-session (nouveau
+                              en 1.19.0, absent en 1.18.31)
     Hors dépôt git, le client envoie littéralement "global" (vérifié par
     capture : dossier temp hors repo → x-opencode-project: global).
     """
     h = oc._official_free_headers()
     assert h["User-Agent"] == oc._OPENCODE_OFFICIAL_UA
-    assert h["User-Agent"] == "opencode/1.18.31 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14"
+    assert h["User-Agent"] == "opencode/1.19.0 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14"
     assert h["Authorization"] == "Bearer public"
-    assert h["x-opencode-client"] == "cli", (
-        "le CLI officiel envoie 'cli' (mesuré 243x) ; 'desktop' n'apparaît "
-        "dans aucune capture du vrai client"
-    )
+    assert h["x-opencode-client"] == "cli"
+    # session-id = même ses_ que session (mesuré 1.19.0, 2 requêtes).
+    assert SES_RE.fullmatch(h["x-opencode-session-id"]), h["x-opencode-session-id"]
+    assert h["x-opencode-session-id"] == h["x-opencode-session"]
     assert h["Content-Type"] == "application/json"
     # project = ID dérivé de git, ou "global" hors dépôt git. Jamais vide.
     proj = h["x-opencode-project"]
@@ -176,7 +182,7 @@ def test_header_values_official(official_env):
         assert proj == "global"
     else:
         assert proj == oc._OPENCODE_PROJECT
-    assert "Accept" not in h, "Accept must stay transport-added (9th), never explicit"
+    assert "Accept" not in h, "Accept must stay transport-added (10th), never explicit"
     assert MSG_RE.fullmatch(h["x-opencode-request"]), h["x-opencode-request"]
     assert SES_RE.fullmatch(h["x-opencode-session"]), h["x-opencode-session"]
 
@@ -479,9 +485,11 @@ def test_free_wire_body_chat_keeps_client_tools(official_env):
     """Tools client conservés + shim manquant ajouté (ex. Bash capitalisé
     côté Claude ne compte PAS : le gate est case-sensitive).
 
-    Parité v2 (`flattenTools` préserve l'ordre, aucun tri) : on préserve
-    l'ordre client + shims appendus (`Bash` d'origine, puis `bash`, `read`
-    manquants). L'ancien tri ICU v1 reste via `OPENCODE_SORT_TOOLS=1`.
+    Parité v1 (tri ICU `toSorted(localeCompare)`, re-mesuré 1.19.0) : les
+    shims sont triés AVEC les outils du client. D'où l'ordre attendu ici :
+    « bash » avant « Bash » (primaire égal, le niveau tertiaire de la
+    collation met la minuscule avant la majuscule), puis « Bash » avant
+    « read ».
     """
     mine = {"type": "function", "function": {"name": "Bash", "description": "x",
             "parameters": {"type": "object", "properties": {}}}}
@@ -490,8 +498,8 @@ def test_free_wire_body_chat_keeps_client_tools(official_env):
     assert forced is False  # déjà stream:true
     names = _chat_names(wire["tools"])
     assert {"Bash", "bash", "read"} <= names
-    assert wire["tools"][0] is mine  # v2 : ordre préservé, pas de tri
-    assert [t["function"]["name"] for t in wire["tools"]] == ["Bash", "bash", "read"]
+    assert wire["tools"][0] is not mine  # [E3] le shim « bash » passe devant
+    assert [t["function"]["name"] for t in wire["tools"]] == ["bash", "Bash", "read"]
 
 
 def test_free_wire_body_responses_prompt_cache_key(official_env):

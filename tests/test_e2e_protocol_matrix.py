@@ -1714,8 +1714,7 @@ def test_p6_jambe_free_nonstream_endpoint_chat(client, recorder, monkeypatch):
     assert isinstance(free_call["body"]["messages"][0]["content"], str), (
         f"contenu envoyÃ© en blocs Anthropic vers un endpoint Chat : {free_call['body']['messages'][0]['content']!r}"
     )
-    _lim = free_call["body"].get("max_completion_tokens", free_call["body"].get("max_tokens"))
-    assert _lim is None or isinstance(_lim, int), "max_tokens (Anthropic) attendu en forme Chat"
+    assert isinstance(free_call["body"]["max_tokens"], int), "max_tokens (Anthropic) attendu en forme Chat"
 
     # 3) Contenu reÃ§u par le client : le texte du modÃ¨le free, pas un corps vide.
     assert status == 200
