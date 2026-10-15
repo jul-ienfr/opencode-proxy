@@ -56,12 +56,11 @@ def test_p4_chain_still_reads_classic_max_tokens():
 
 
 def test_p4_chain_defaults_when_client_sends_nothing():
-    """Aucune limite demandée → défaut historique préservé (pas de champ inventé
-    à partir de rien, mais le contrat V1 attend 16384)."""
+    """Aucune limite demandée → défaut officiel Anthropic 32000 (parité v2)."""
     out = openai_to_anthropic_request(
         {"model": "x", "messages": [{"role": "user", "content": "hi"}]}
     )
-    assert out.get("max_tokens") == 16384
+    assert out.get("max_tokens") == 32000
 
 
 def test_p6_chain_reads_max_output_tokens():
@@ -77,12 +76,12 @@ def test_p6_chain_reads_max_output_tokens():
 
 
 def test_p2_chain_transports_the_limit():
-    """Anthropic → Chat : la limite ``max_tokens`` du client est transportée."""
+    """Anthropic → Chat : la limite ``max_tokens`` du client est transportée (v2 : `max_completion_tokens`)."""
     out = anthropic_to_openai(
         {"model": "x", "max_tokens": 4096, "messages": [{"role": "user", "content": "hi"}]},
         "un-modele-inconnu-xyz",
     )
-    assert out.get("max_tokens") == 4096
+    assert out.get("max_completion_tokens") == 4096
 
 
 # ─────────────────────── B2 : la forme émise ───────────────────────
@@ -118,11 +117,24 @@ def test_all_o_series_prefixes_are_recognized(model):
 
 @pytest.mark.parametrize(
     "model",
-    ["deepseek-v4-flash", "glm-5.1", "mimo-v2.5", "muse-spark", "ling-3.0-flash-fin", "", None, 42],
+    ["deepseek-v4-flash", "deepseek-v4-pro", "moonshot-test", "together-test", "zai-test"],
+)
+def test_legacy_providers_keep_max_tokens(model):
+    """Providers legacy (`detectMaxTokensField`) exigent `max_tokens`."""
+    assert _wants_max_completion_tokens(model) is False, model
+
+
+@pytest.mark.parametrize(
+    "model",
+    ["glm-5.1", "mimo-v2.5", "muse-spark", "ling-3.0-flash-fin", "o1", "gpt-5-turbo", "x", "", None, 42],
 )
 def test_non_o_series_models_are_never_switched(model):
-    """Aucun de nos upstreams réels ne bascule : ils acceptent ``max_tokens``."""
-    assert _wants_max_completion_tokens(model) is False, model
+    """Parité v2 : `max_completion_tokens` par défaut (sauf legacy ci-dessus)."""
+    # legacy déjà couverts ; ici on attend True (moderne) pour tous les autres,
+    # y compris les noms vides/invalides (défaut sûr : champ moderne).
+    if model in ("deepseek-v4-flash",):
+        return
+    assert _wants_max_completion_tokens(model) is True, model
 
 
 def test_default_prefix_list_is_restricted_to_o_series():
@@ -136,30 +148,30 @@ def test_default_prefix_list_is_restricted_to_o_series():
 
 
 def test_unknown_model_keeps_backward_compatible_field():
-    """Un modèle inconnu garde le comportement historique."""
+    """Un modèle inconnu suit la parité v2 (`max_completion_tokens`)."""
     out = anthropic_to_openai(
         {"model": "x", "max_tokens": 777, "messages": [{"role": "user", "content": "hi"}]},
         "modele-inexistant-zzz",
     )
-    assert out.get("max_tokens") == 777
+    assert out.get("max_completion_tokens") == 777
 
 
 # ─────────────────────── helper unitaire ───────────────────────
 
 
 def test_helper_reads_all_three_field_forms():
-    """Les trois conventions client sont acceptées, par ordre de priorité."""
+    """Les trois conventions client sont acceptées, par ordre de priorité (v2 : émet `max_completion_tokens`)."""
     target = {}
     assert _set_output_token_limit(target, {"max_tokens": 11}, "x") == 11
-    assert target["max_tokens"] == 11
+    assert target["max_completion_tokens"] == 11
 
     target = {}
     assert _set_output_token_limit(target, {"max_completion_tokens": 22}, "x") == 22
-    assert target["max_tokens"] == 22
+    assert target["max_completion_tokens"] == 22
 
     target = {}
     assert _set_output_token_limit(target, {"max_output_tokens": 33}, "x") == 33
-    assert target["max_tokens"] == 33
+    assert target["max_completion_tokens"] == 33
 
 
 def test_helper_prefers_max_tokens_when_several_present():
@@ -180,7 +192,7 @@ def test_helper_ignores_non_positive_and_non_int_limits():
     for bad in (0, -5, "4096", None, 3.5, True, False):
         target = {}
         _set_output_token_limit(target, {"max_tokens": bad}, "x")
-        assert target.get("max_tokens") == 16384, f"{bad!r} accepté comme limite"
+        assert target.get("max_completion_tokens") == 32000, f"{bad!r} accepté comme limite"
 
 
 def test_helper_anthropic_target_never_gets_completion_tokens():
@@ -226,21 +238,25 @@ def test_limit_survives_a_chain_without_default_substitution():
 
 
 def test_only_the_routed_model_name_decides_the_field():
-    """Le nom qui décide est le modèle **routé**, pas l'alias du client.
+    """Le nom qui décide est le modèle **routé**, pas l'alias du client (v2 : moderne par défaut).
 
-    Piège réel de ce dépôt : ``gpt-5.6-luna`` n'est qu'un alias client qui route
-    vers ``muse-spark-1.3-contributor`` (passerelle tierce, qui accepte
-    ``max_tokens``). Les handlers passent ``model_id`` — le nom routé — donc
-    l'alias ne déclenche pas le basculement. Si un jour un handler passait
-    l'alias, ``gpt-5`` préfixerait et on enverrait ``max_completion_tokens`` à une
-    passerelle qui l'ignore → **aucune limite de sortie appliquée**.
+    `muse-spark-1.3-contributor` émet désormais `max_completion_tokens`
+    (parité `detectMaxTokensField`) ; seuls les legacy (`deepseek`, …)
+    gardent `max_tokens`.
     """
     out = anthropic_to_openai(
         {"model": "x", "max_tokens": 500, "messages": [{"role": "user", "content": "hi"}]},
         "muse-spark-1.3-contributor",
     )
-    assert out.get("max_tokens") == 500
-    assert "max_completion_tokens" not in out
+    assert out.get("max_completion_tokens") == 500
+    assert "max_tokens" not in out
+
+    # Legacy : `deepseek` garde `max_tokens`.
+    legacy = anthropic_to_openai(
+        {"model": "x", "max_tokens": 500, "messages": [{"role": "user", "content": "hi"}]},
+        "deepseek-v4-flash",
+    )
+    assert legacy.get("max_tokens") == 500
 
     # Et l'inverse, documenté explicitement comme NON utilisé par les handlers :
     # le nom d'alias, lui, bascule — d'où l'importance de passer `model_id`.

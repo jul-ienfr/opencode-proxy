@@ -4728,6 +4728,12 @@ _OPENCODE_OFFICIAL_UA_RESPONSES = os.getenv(
     "OPENCODE_OFFICIAL_UA_RESPONSES",
     "opencode/1.18.31 ai-sdk/provider-utils/4.0.40 runtime/bun/1.3.14",
 )
+# Parité officielle v2 (`packages/core/src/app.ts:useragent`) :
+# `opencode/<channel>/<version>/<name>` — plus de `ai-sdk/provider-utils`,
+# plus de `runtime/bun`. Ex. `opencode/prod/2.0.28/cli`.
+# Jambe free verrouillée sur v1 (capture 243 req, couplage UA↔TLS I3) ;
+# jambe paid basculée v2 (headers seuls, sans replay TLS).
+_OPENCODE_OFFICIAL_UA_V2 = os.getenv("OPENCODE_OFFICIAL_UA_V2", "opencode/prod/2.0.28/cli")
 # Nom de client officiel. Enum RÉELLE extraite du binaire 1.18.31 :
 #   ["app","cli","desktop"].includes(t.client)
 # Le CLI `opencode run` envoie « cli » — MESURÉ 243 fois sur le captureur
@@ -5031,12 +5037,19 @@ def _free_wire_body(body, force_stream: bool = False):
         base.extend(_free_shim_tool(n, is_resp) for n in missing)
         wire["tools"] = base
     if is_chat and need_order:
-        # [E3 — parité client officiel] Les shims « bash »/« read » doivent être
-        # triés AVEC le reste, pas simplement ajoutés en fin de liste : le client
-        # officiel trie l'ensemble des outils par nom (request.ts:184). Le tri
-        # porte donc sur l'état FINAL (outils d'origine + shims), et sur les
-        # outils d'origine seuls quand aucun shim ne manque.
-        wire["tools"] = _sorted_chat_tools(wire.get("tools"))
+        # Parité officielle v2 (`flattenTools` préserve l'ordre, aucun tri) :
+        # on préserve l'ordre client + shims manquants appendus (contrainte
+        # gateway I3 : `bash`+`read` requis, sinon 403). L'ancien tri ICU v1
+        # (`request.ts:184`) reste disponible via `OPENCODE_SORT_TOOLS=1`
+        # comme optimisation maison du préfixe cache, plus comme parité.
+        try:
+            import os as _os
+
+            _sort_opt = _os.getenv("OPENCODE_SORT_TOOLS", "0") not in ("", "0", "false", "False", "no", "No")
+        except Exception:
+            _sort_opt = False
+        if _sort_opt:
+            wire["tools"] = _sorted_chat_tools(wire.get("tools"))
     if need_tc:
         # Le client pose « auto » dès qu'il y a des tools (242/242 mesures).
         wire["tool_choice"] = "auto"
@@ -5435,22 +5448,16 @@ def _paid_session_id() -> str:
 
 
 def _enrich_paid_wire_headers(headers: dict, endpoint: str = "", conversation_key: str | None = None) -> dict:
-    """Aligne les headers paid sur l'identité du client officiel (parité wire).
+    """Aligne les headers paid sur l'identité du client officiel v2 (parité wire).
 
-    Le client officiel envoie sur TOUTES les jambes, payante incluse : UA
-    ``opencode/<ver> ai-sdk/provider-utils/<v> runtime/bun/<v>`` (4.0.40 sur
-    /responses, 4.0.23 sur /chat — deux bundles ai-sdk) + ``x-opencode-session-id``
-    (toutes requêtes) +, pour les providers ``opencode*`` seulement, x-opencode-client
-    / -project / -session / -request. La jambe paid n'envoyait que Authorization +
-    Content-Type (+ UA python-httpx par défaut). Sémantique setdefault :
-    Authorization (clé + failover) et toute valeur déjà posée sont intouchables.
-    Borné aux endpoints OpenAI-protocol — chemin Anthropic et jambe free exclus.
-
-    ``x-opencode-session-id`` vaut la même valeur que ``x-opencode-session``
-    (``request.ts:188-189`` VS ``:190-197`` : deux noms, un sessionID). **Jambe
-    free volontairement écartée** : son wire est verrouillé octet-exact par une
-    capture 243 requêtes (``tests/test_official_client_parity.py``), y changer
-    demande une re-mesure (§6 D2).
+    Officiel v2 (`model-request.ts:282-295`, `app.ts:useragent`) :
+    `User-Agent: opencode/<channel>/<version>/<name>` (ex. `opencode/prod/2.0.28/cli`),
+    `x-opencode-session-id` (= session.id), `x-session-affinity` + `X-Session-Id`
+    (= affinité), `x-opencode-session` (= affinité), `x-opencode-project`,
+    `x-opencode-client`, `x-opencode-request`, `promptCacheKey` (body).
+    Sémantique setdefault : Authorization et valeurs déjà posées intouchables.
+    Borné aux endpoints OpenAI-protocol — chemin Anthropic et jambe free exclus
+    (free verrouillée v1 octet-exact, couplage UA↔TLS I3).
     """
     try:
         ep = endpoint or ""
@@ -5459,30 +5466,28 @@ def _enrich_paid_wire_headers(headers: dict, endpoint: str = "", conversation_ke
         out = dict(headers) if isinstance(headers, dict) else {}
         lowered = {k.lower() for k in out}
         if "user-agent" not in lowered:
-            out["User-Agent"] = (
-                _OPENCODE_OFFICIAL_UA_RESPONSES if "/responses" in ep else _OPENCODE_OFFICIAL_UA
-            )
+            out["User-Agent"] = _OPENCODE_OFFICIAL_UA_V2
         if "x-opencode-client" not in lowered:
             out["x-opencode-client"] = _OPENCODE_CLIENT_NAME
         if "x-opencode-project" not in lowered:
             out["x-opencode-project"] = _OPENCODE_PROJECT
         if "x-opencode-session" not in lowered:
             try:
-                # Parité request.ts : même sessionID par conversation sur TOUTES
-                # les jambes ; sans clé de conversation, session paid dédiée.
                 out["x-opencode-session"] = (
                     _conversation_session_id(conversation_key) if conversation_key else _paid_session_id()
                 )
             except Exception:
                 pass
-        # §6 D2 — le client officiel émet `x-opencode-session-id` sur TOUTES les
-        # requêtes (request.ts:188-189), AVANT les en-têtes `opencode*` ; ceux-ci
-        # ne concernent que les providers `opencode*` (request.ts:190-197), dont
-        # le nôtre : `x-opencode-session` est donc en réalité le **même**
-        # sessionID relu sous un autre nom. Même valeur, deux rôles côté amont.
-        # Sémantique setdefault comme les voisins ; si le `ses_` n'a pas pu être
-        # minté (exception avalée ci-dessus), on n'invente pas une valeur
-        # orpheline — mieux vaut l'en-tête absent qu'incohérent.
+        _aff = out.get("x-opencode-session") if isinstance(out.get("x-opencode-session"), str) else ""
+        # Affinité v2 : `x-session-affinity` + `X-Session-Id` = même affinité.
+        if _aff:
+            if "x-session-affinity" not in lowered:
+                out["x-session-affinity"] = _aff
+            if "x-session-id" not in lowered:
+                out["X-Session-Id"] = _aff
+        # `x-opencode-session-id` : id session distinct de l'affinité côté
+        # officiel ; le proxy n'a qu'un `ses_` par conversation → on envoie
+        # l'affinité persistée (approximation documentée, mieux que absent).
         if "x-opencode-session-id" not in lowered:
             _sid = out.get("x-opencode-session")
             if isinstance(_sid, str) and _sid:

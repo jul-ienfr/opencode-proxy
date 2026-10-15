@@ -1,14 +1,9 @@
-"""Parité wire paid : la jambe payante parle comme le client officiel.
+"""Parité wire paid v2 : la jambe payante parle comme le client officiel v2.
 
-Le client officiel envoie sur TOUTES les jambes (y compris payante) : UA
-``opencode/<ver> ai-sdk/provider-utils/<v> runtime/bun/<v>`` (4.0.40 sur
-/responses, 4.0.23 sur /chat — deux bundles ai-sdk) + ``x-opencode-session-id``
-(toutes requêtes, même valeur que ``x-opencode-session``) +, pour les providers
-``opencode*`` seulement, x-opencode-client / -project / -session / -request
-(ses_/msg_ temporels). La jambe paid n'envoyait que Authorization +
-Content-Type (+ UA python-httpx par défaut). La jambe free est exclue : son
-wire est verrouillé octet-exact par la capture 243 requêtes de
-``tests/test_official_client_parity.py``.
+Officiel v2 (`model-request.ts`, `app.ts:useragent`) : UA
+`opencode/<channel>/<version>/<name>` (ex. `opencode/prod/2.0.28/cli`),
+`x-opencode-session-id` + `x-session-affinity`/`X-Session-Id` + `x-opencode-session`
++ client/project/request. Jambe free exclue (verrou v1 octet-exact).
 """
 
 import opencode as oc
@@ -20,14 +15,14 @@ MSG_EP = "https://opencode.ai/zen/go/v1/messages"
 
 def test_responses_leg_gets_responses_ua():
     h = oc._enrich_paid_wire_headers({"Authorization": "Bearer k"}, RESP_EP)
-    assert h["User-Agent"] == oc._OPENCODE_OFFICIAL_UA_RESPONSES
-    assert "4.0.40" in h["User-Agent"]
+    assert h["User-Agent"] == oc._OPENCODE_OFFICIAL_UA_V2
+    assert h["User-Agent"] == "opencode/prod/2.0.28/cli"
 
 
 def test_chat_leg_gets_chat_ua():
     h = oc._enrich_paid_wire_headers({"Authorization": "Bearer k"}, CHAT_EP)
-    assert h["User-Agent"] == oc._OPENCODE_OFFICIAL_UA
-    assert "4.0.23" in h["User-Agent"]
+    assert h["User-Agent"] == oc._OPENCODE_OFFICIAL_UA_V2
+    assert h["User-Agent"].startswith("opencode/prod/")
 
 
 def test_anthropic_leg_untouched():

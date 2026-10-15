@@ -14,7 +14,8 @@ class TestRootType:
         schema = {"properties": {"command": {"type": "string"}}, "required": ["command"]}
         out = _N(schema, "muse-spark-1.2-contributor")
         assert out["type"] == "object"
-        assert out["additionalProperties"] is False
+        # Parité v2 : jamais `additionalProperties:false` (passthrough officiel).
+        assert "additionalProperties" not in out
 
     def test_root_already_typed_unchanged(self):
         schema = {"type": "object", "properties": {"x": {"type": "string"}}}
@@ -63,17 +64,17 @@ class TestSchemaVersionStrip:
         out = _N(schema, "muse-spark-1.2-contributor")
         assert "@schema_version" not in out["properties"]["x"]
 
-# ── 14 : additionalProperties:false forcé ─────────────────────────
+# ── 14 : additionalProperties jamais forcé (parité v2) ──────────
 class TestAdditionalPropertiesFalse:
     def test_root_missing_forced_false(self):
         schema = {"type": "object", "properties": {"x": {"type": "string"}}}
         out = _N(schema, "muse-spark-1.2-contributor")
-        assert out["additionalProperties"] is False
+        assert "additionalProperties" not in out
 
     def test_nested_missing_forced_false(self):
         schema = {"type": "object", "properties": {"cfg": {"type": "object", "properties": {"y": {"type": "string"}}}}}
         out = _N(schema, "muse-spark-1.2-contributor")
-        assert out["properties"]["cfg"]["additionalProperties"] is False
+        assert "additionalProperties" not in out["properties"]["cfg"]
 
     def test_permissive_not_forced(self):
         schema = {"type": "object", "properties": {"x": {"type": "string"}}}
@@ -119,7 +120,8 @@ class TestStrictFalse:
         chat = {"model": "muse-spark-1.2-contributor", "messages": [{"role": "user", "content": "hi"}], "tools": [{"type": "function", "function": {"name": "bash", "description": "run", "parameters": {"type": "object", "properties": {"command": {"type": "string", "anyOf": [{"type": "string"}, {"type": "number"}]}}, "required": ["command"]}}}]}
         r = pm._chat_to_responses_request(chat)
         assert r["tools"][0]["strict"] is False
-        assert r["tools"][0]["parameters"]["additionalProperties"] is False
+        # Parité v2 : pas de `additionalProperties:false` forcé.
+        assert "additionalProperties" not in r["tools"][0]["parameters"]
 
     def test_chat_to_responses_simple_no_strict(self):
         chat = {"model": "muse-spark-1.2-contributor", "messages": [{"role": "user", "content": "hi"}], "tools": [{"type": "function", "function": {"name": "bash", "description": "run", "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}}}]}
@@ -251,7 +253,8 @@ class TestNineTools:
         for t in r["tools"]:
             p = t["function"]["parameters"]
             assert p.get("type") == "object"
-            assert p.get("additionalProperties") is False
+            # Parité v2 : jamais forcé.
+            assert "additionalProperties" not in p
             assert "@schema_version" not in json.dumps(p)
             assert "const" not in json.dumps(p)
             assert "title" not in json.dumps(p)

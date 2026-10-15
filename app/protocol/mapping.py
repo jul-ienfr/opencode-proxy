@@ -114,8 +114,16 @@ def _tool_id_or_stable(raw: Any, prefix: str, *parts: Any) -> str:
 
     ``dict.get(k, default)`` ne suffit PAS : il rend la valeur présente
     (None, "", 0) au lieu du défaut. Test de véracité obligatoire.
+    Parité officielle v2 (`scrubToolCallID`) : tout id relayé vers
+    Anthropic (`toolu_`) est scrubbé `[^a-zA-Z0-9_-]→_` ; les ids stables
+    générés (`prefix+sha1`) sont déjà valides.
     """
     if isinstance(raw, str) and raw.strip():
+        if prefix.startswith("toolu_"):
+            try:
+                return scrub_claude_tool_id(raw)
+            except Exception:
+                return raw
         return raw
     return _stable_tool_id(prefix, *parts)
 
@@ -275,23 +283,37 @@ _MAX_COMPLETION_MODELS_DEFAULT = ("o1", "o3", "o4", "gpt-5")
 
 
 def _wants_max_completion_tokens(model: str) -> bool:
-    """[Lot L14 — B2/A17] L'upstream Chat de ``model`` exige-t-il ``max_completion_tokens`` ?
+    """[Lot L14 — B2/A17 + parité v2 `detectMaxTokensField`] L'upstream Chat exige-t-il ``max_completion_tokens`` ?
 
-    ``max_tokens`` est déprécié et **incompatible avec les modèles o-series**,
-    qui exigent ``max_completion_tokens`` : un upstream strict rejette
-    ``max_tokens`` par un 400, la requête échoue alors qu'elle est légitime.
-
-    Le basculement est délibérément limité aux préfixes reconnus (config-driven,
-    cf. ``_MAX_COMPLETION_MODELS_DEFAULT``) : basculer trop large risquerait
-    qu'une passerelle tierce ignore le champ inconnu et n'applique donc **aucune
-    limite de sortie** — un coût non borné, soit pire que le problème d'origine.
+    Officiel (`openai-chat.ts`) : `max_completion_tokens` par défaut, sauf
+    providers legacy qui exigent `max_tokens` (deepseek/moonshot/together/zai/
+    nvidia/cerebras/chutes/cloudflare). On approxime le provider par le nom
+    de modèle (le proxy ne connaît que l'id catalogue, pas le provider npm).
+    Config `thinking.max_completion_models` reste en surcharge explicite.
     """
     if not isinstance(model, str) or not model:
-        return False
+        return True
     cfg = yaml_get("thinking", "max_completion_models", None)
     prefixes = cfg if isinstance(cfg, list) and cfg else _MAX_COMPLETION_MODELS_DEFAULT
     name = model.lower()
-    return any(name.startswith(str(p).lower()) for p in prefixes if p)
+    if any(name.startswith(str(p).lower()) for p in prefixes if p):
+        return True
+    # Providers legacy qui exigent `max_tokens` (aligné `detectMaxTokensField`).
+    legacy = (
+        "deepseek",
+        "moonshot",
+        "together",
+        "zai",
+        "zhipu",
+        "bigmodel",
+        "nvidia",
+        "cerebras",
+        "chutes",
+        "cloudflare",
+    )
+    if any(tok in name for tok in legacy):
+        return False
+    return True
 
 
 #: Plafonds de sortie connus par famille (au-delà → 400 upstream).
@@ -320,10 +342,10 @@ def _clamp_max_output_tokens(value: int, model_id: str) -> int:
 def _set_output_token_limit(    target: dict,
     source: dict,
     model: str,
-    default: int = 16384,
+    default: int | None = 32000,
     target_protocol: str = "openai",
 ) -> int:
-    """[Lot L14 — B2/A17] Écrit la limite de sortie dans ``target``, forme adaptée.
+    """[Lot L14 — B2/A17 + parité v2] Écrit la limite de sortie dans ``target``.
 
     Lit la limite du client en acceptant **toutes** ses conventions —
     ``max_tokens`` (Anthropic/Chat historique) et ``max_completion_tokens``
@@ -1103,9 +1125,11 @@ def _normalize_tool_schema(schema: dict, model: str = "") -> dict:
         # 13. Strip marker invalide "@schema_version: invalid json schema"
         if "@schema_version" in node:
             node.pop("@schema_version")
-        # 14. Enforce additionalProperties:false sur tout object (root + nested)
-        if _is_strict and node.get("type") == "object":
-            node["additionalProperties"] = False
+        # 14. Parité officielle v2 (objectRoot, jamais additionalProperties:false) :
+        # l'officiel est en passthrough sur openai/responses et ne force jamais
+        # `false` (commentaire : providers stricts 400 sur champs inconnus).
+        # On ne force donc rien ; le strip True/dict ci-dessus suffit.
+        # (ancien forçage `node["additionalProperties"] = False` retiré 2026-10-15)
         # 15. Strip anyOf/oneOf/allOf résiduels pour strict (seul anyOf/allOf null géré en 9)
         if _is_strict:
             for key in ("anyOf", "oneOf", "allOf"):
@@ -1642,9 +1666,10 @@ def anthropic_to_openai(body: dict, model: str, raw: bytes | None = None) -> dic
                 _so.setdefault("include_usage", True)
         except Exception:
             pass
-    # [Lot L14 — B2/A17] Forme du champ de limite adaptée à l'upstream : les
-    # modèles de raisonnement exigent `max_completion_tokens`.
-    _set_output_token_limit(oai, body, model)
+    # [Lot L14 — B2/A17 + parité v2] Chat : ne rien inventer si le client
+    # n'envoie rien (l'officiel laisse `undefined`) ; forme détectée
+    # `max_tokens` vs `max_completion_tokens` par provider.
+    _set_output_token_limit(oai, body, model, default=None, target_protocol="openai")
 
     for key, oai_key in [
         ("temperature", "temperature"),
@@ -3512,16 +3537,26 @@ def _is_claude_model(model: str) -> bool:
 def scrub_openai_tool_ids(messages: list, model: str) -> int:
     """Scrub les tool_call_id d'un corps OpenAI-chat selon la famille du modèle.
 
-    No-op sur les IDs déjà valides (ex. ``toolu_…`` claude-compatibles).
-    Retourne le nombre d'IDs modifiés.
+    Parité officielle v2 (`openai-chat.ts` lowering `toolCallID`) :
+    - mistral/devstral/codestral/pixtral/mixtral → alnum 9 chars pad `0` ;
+    - id contenant `claude` → `[^a-zA-Z0-9_-]→_` ;
+    - provider openai/azure ou id `openai/` → slice 40 ;
+    - sinon → inchangé (pas de scrub inventé).
+    No-op sur les IDs déjà valides. Retourne le nombre d'IDs modifiés.
     """
     if not isinstance(messages, list) or not messages:
         return 0
     mistral = _is_mistral_model(model)
     claude = _is_claude_model(model)
-    if not mistral and not claude:
+    mid = str(model or "").lower()
+    openai_slice = ("openai" in mid) or ("azure" in mid) or mid.startswith("openai/")
+    if not mistral and not claude and not openai_slice:
         return 0
-    scrub = scrub_mistral_tool_id if mistral else scrub_claude_tool_id
+
+    def _scrub_openai_slice(tid: str) -> str:
+        return tid[:40] if isinstance(tid, str) else tid
+
+    scrub = scrub_mistral_tool_id if mistral else (scrub_claude_tool_id if claude else _scrub_openai_slice)
     changed = 0
     for m in messages:
         if not isinstance(m, dict):
@@ -3837,25 +3872,11 @@ def _tool_sort_key(name: str):
 
 
 def _sorted_chat_tools(tools: list) -> list:
-    """[E3 — parité client officiel] Trie ``tools[]`` par ``function.name``.
+    """[E3 legacy v1 — optimisation maison, plus parité v2] Trie ``tools[]``.
 
-    Le client officiel trie ses outils avant l'envoi (``toSorted(localeCompare)``,
-    ``request.ts:184``) : l'ordre du fil devient déterministe quel que soit l'ordre
-    d'arrivée du client, ce qui stabilise le **préfixe** du corps — et
-    ``cache_read_input_tokens`` avec lui (un même jeu d'outils envoyé dans deux
-    ordres produisait deux préfixes, donc deux entrées de cache). Chez nous, l'ordre
-    client était préservé tel quel.
-
-    Garde-fou : on ne trie que si **chaque** entrée porte un ``function.name``
-    chaîne non vide. Une liste malformée (entrée non-dict, ``function`` absent,
-    nom vide) est renvoyée **inchangée** — on ne réordonne jamais ce qu'on ne
-    comprend pas, et une liste < 2 éléments est déjà triée.
-
-    Le tri est celui du client officiel (``_tool_sort_key``), pas un tri de code
-    points : c'est la condition pour que l'ordre du fil soit **le même** que celui
-    du client, et donc pour que le préfixe — et ``cache_read_input_tokens`` —
-    soient partagés avec lui.
-
+    v1 triait (`toSorted(localeCompare)`, `request.ts:184`) ; v2 préserve
+    l'ordre (`flattenTools`, aucun tri). Gardé derrière `OPENCODE_SORT_TOOLS=1`
+    comme optimisation du préfixe cache, plus comme imitation.
     Renvoie une copie : l'entrée du caller n'est jamais mutée.
     """
     if not isinstance(tools, list) or len(tools) < 2:
@@ -3886,16 +3907,14 @@ def _sanitize_chat_tools(oai_tools: list, name_map: dict) -> list:
 
     Copie des seules entrées modifiées : le caller n'est jamais muté.
     Retourne la nouvelle liste ; complète ``name_map`` ``{short: original}``.
-    Fast-path intégral (aucun nom à raccourcir) : map vide — mais la liste est
-    malgré tout **triée** (E3, cf. ``_sorted_chat_tools``) : l'ordre officiel est
-    une propriété du fil, pas un effet de bord du raccourcissement.
+    Parité v2 : l'ordre client est préservé (plus de tri) ; le sanitize ne
+    réordonne jamais.
     """
     if not isinstance(oai_tools, list) or not oai_tools or not isinstance(name_map, dict):
         return oai_tools
-    # E3 : on trie AVANT de projeter, pour que les index de ``flat``/``sanitized``
-    # décrivent la liste telle qu'elle partira — l'alignement positionnel reste
-    # garanti, et la sortie est triée même quand rien n'est à raccourcir.
-    src = _sorted_chat_tools(oai_tools)
+    # v2 : pas de tri — on projette dans l'ordre d'arrivée pour garder
+    # l'alignement positionnel flat[i] ↔ sanitized[i].
+    src = list(oai_tools)
     idx_of: list[int] = []
     flat: list[dict] = []
     for i, t in enumerate(src):

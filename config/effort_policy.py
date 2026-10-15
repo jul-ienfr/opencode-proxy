@@ -42,9 +42,11 @@ __all__ = [
     "EffortDecision",
     "BUDGET_TO_LEVEL_TABLE",
     "DEFAULT_LEVEL",
+    "MIN_THINKING_BUDGET",
     "MODEL_MAX",
     "budget_to_level",
     "extract_requested_level",
+    "fit_thinking_budget",
     "get_effort_order",
     "clamp_level",
     "max_level_for_model",
@@ -125,7 +127,12 @@ def get_effort_order() -> list:
 
 
 def budget_to_level(budget) -> str | None:
-    """Table budget → niveau (UNIQUE). ``None`` si budget absent/nul/invalide."""
+    """Table budget → niveau (UNIQUE). ``None`` si budget absent/nul/invalide.
+
+    Parité v2 : plancher `MIN_THINKING_BUDGET=1024` — un budget explicite
+    < 1024 reste mappé (pas de refus silencieux) mais l'émission le
+    remonte via `fit_thinking_budget` (cf. ci-dessous).
+    """
     try:
         value = int(budget)
     except (TypeError, ValueError):
@@ -136,6 +143,36 @@ def budget_to_level(budget) -> str | None:
         if value >= threshold:
             return level
     return "low"
+
+
+#: Plancher officiel du budget de pensée (`anthropic-messages.ts`).
+MIN_THINKING_BUDGET = 1024
+
+
+def fit_thinking_budget(budget, max_tokens, minimum: int = MIN_THINKING_BUDGET):
+    """Capte un budget de pensée à la moitié de la sortie (parité `fitThinkingBudget`).
+
+    Pur : `max_tokens` indéfini / budget ≤ moitié → inchangé ; sinon
+    `max(minimum, floor(max_tokens/2))`. Les valeurs spéciales ≤ 0 passent
+    inchangées (désactivation explicite).
+    """
+    try:
+        b = int(budget)
+    except (TypeError, ValueError):
+        return budget
+    if b <= 0:
+        return budget
+    try:
+        m = int(max_tokens) if max_tokens is not None else None
+    except (TypeError, ValueError):
+        return budget
+    if m is None or b <= m / 2:
+        return b
+    try:
+        floor = int(minimum)
+    except (TypeError, ValueError):
+        floor = MIN_THINKING_BUDGET
+    return max(floor, m // 2)
 
 
 def _read_field(fields: dict, dotted: str):

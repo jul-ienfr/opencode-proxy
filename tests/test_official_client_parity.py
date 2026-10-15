@@ -479,23 +479,9 @@ def test_free_wire_body_chat_keeps_client_tools(official_env):
     """Tools client conservés + shim manquant ajouté (ex. Bash capitalisé
     côté Claude ne compte PAS : le gate est case-sensitive).
 
-    [E3] Le shim ne part PAS en fin de liste. Mesuré sur la source du client
-    officiel (``packages/opencode/src/session/llm/request.ts``, HEAD 3884062 /
-    v1.18.35) : il y a UN seul point de tri, ligne 184 —
-
-        tools: Object.fromEntries(Object.entries(tools)
-                .toSorted(([a], [b]) => a.localeCompare(b))),
-
-    et il est appliqué APRÈS que tous les outils sont réunis, shims de
-    compatibilité inclus : la ligne 165 injecte elle-même un
-    ``tools["_noop"]`` pour les providers qui exigent un champ tools, et ce
-    ``_noop`` traverse le tri comme les autres (il arrive d'ailleurs en tête,
-    la ponctuation passant avant les alphanumériques en collation ICU).
-    Donc ``bash``/``read`` sont triés AVEC les outils du client.
-
-    D'où l'ordre attendu ici : « bash » avant « Bash » (primaire égal, le
-    niveau tertiaire de la collation met la minuscule avant la majuscule),
-    puis « Bash » avant « read ».
+    Parité v2 (`flattenTools` préserve l'ordre, aucun tri) : on préserve
+    l'ordre client + shims appendus (`Bash` d'origine, puis `bash`, `read`
+    manquants). L'ancien tri ICU v1 reste via `OPENCODE_SORT_TOOLS=1`.
     """
     mine = {"type": "function", "function": {"name": "Bash", "description": "x",
             "parameters": {"type": "object", "properties": {}}}}
@@ -504,8 +490,8 @@ def test_free_wire_body_chat_keeps_client_tools(official_env):
     assert forced is False  # déjà stream:true
     names = _chat_names(wire["tools"])
     assert {"Bash", "bash", "read"} <= names
-    assert wire["tools"][0] is not mine  # [E3] le shim « bash » passe devant
-    assert [t["function"]["name"] for t in wire["tools"]] == ["bash", "Bash", "read"]
+    assert wire["tools"][0] is mine  # v2 : ordre préservé, pas de tri
+    assert [t["function"]["name"] for t in wire["tools"]] == ["Bash", "bash", "read"]
 
 
 def test_free_wire_body_responses_prompt_cache_key(official_env):

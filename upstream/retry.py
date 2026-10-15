@@ -21,14 +21,14 @@ import email.utils as _eu
 import random
 
 
-def parse_retry_after(value: object, max_s: float = 600.0) -> float | None:
+def parse_retry_after(value: object, max_s: float = 900.0) -> float | None:
     """Parse un header ``Retry-After`` → secondes d'attente, ou ``None``.
 
     Accepte les secondes (``"120"``, ``120``) et les dates HTTP
     (``email.utils.parsedate_to_datetime``). Retourne ``None`` si absent,
     illisible, ``<= 0`` ou ``> max_s`` (consigne inexploitable → backoff
-    local). ``max_s`` borne le blocage worker (paid : 600 = ``key_pause``
-    ``max_pause`` ; free-direct : 60, parité du chemin existant).
+    local). ``max_s`` borne le blocage worker (parité officielle v2 :
+    `retryAfterMs` borné 15 min = 900 s ; paid historique 600 relevé).
     """
     if value is None:
         return None

@@ -33,7 +33,7 @@
       }
     ],
     "stream": false,
-    "max_tokens": 16384,
+    "max_tokens": 32000,
     "output_config": {
       "effort": "high"
     },

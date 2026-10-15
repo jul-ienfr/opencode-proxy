@@ -37,6 +37,12 @@ logger = logging.getLogger("config.settings")
 #: Nom de la clé sous ``models.<id>`` (lisible en live, datée à la main).
 LIMIT_KEY = "output_limit"
 
+#: Parité officielle v2 (`model-request.ts:49-57`) : fallback quand le
+#: catalogue ne donne rien, cap absolu, plancher du calcul de place.
+OUTPUT_TOKEN_FALLBACK = 32000
+OUTPUT_TOKEN_MAX = 256000
+OUTPUT_TOKEN_MIN = 1024
+
 
 def _yaml_get(*keys, default=None):
     # Import tardif : évite tout cycle si config.settings venait un jour
@@ -98,7 +104,7 @@ def output_limit(model) -> int | None:
 
 
 def clamp_output_token_limit(limit, model):
-    """Borne ``limit`` par la limite de sortie réelle du modèle.
+    """Borne ``limit`` par la limite de sortie réelle du modèle (parité v2).
 
     - Pas d'entrée pour ce modèle ⇒ ``limit`` rendu **inchangé** (y
       compris ``None`` et les formes non-entières : ce n'est pas à cette
@@ -106,17 +112,32 @@ def clamp_output_token_limit(limit, model):
     - ``limit`` au-dessous de la limite modèle ⇒ inchangé (le client est
       volontairement plus court, on respecte son choix).
     - Au-dessus ⇒ ramené à la limite du modèle.
+    - Cap absolu officiel `256 000` dans tous les cas (un 500k catalogue
+      ou client ne part jamais tel quel).
     """
+    try:
+        from config.limits import OUTPUT_TOKEN_MAX as _CAP
+    except Exception:
+        _CAP = 256000
     cap = output_limit(model)
-    if cap is None:
-        return limit
     try:
         value = int(limit)
     except (TypeError, ValueError):
         return limit
     if isinstance(limit, bool) or value != limit:
         return limit
-    return value if value <= cap else cap
+    if cap is not None and value > cap:
+        value = cap
+    if value > int(_CAP):
+        value = int(_CAP)
+    return value
 
 
-__all__ = ["LIMIT_KEY", "clamp_output_token_limit", "output_limit"]
+def output_limit_with_fallback(model) -> int:
+    """Limite modèle v2 : `min(catalogue.output ou 32k fallback, 256k cap)`."""
+    cap = output_limit(model)
+    base = cap if cap is not None else OUTPUT_TOKEN_FALLBACK
+    return base if base <= OUTPUT_TOKEN_MAX else OUTPUT_TOKEN_MAX
+
+
+__all__ = ["LIMIT_KEY", "OUTPUT_TOKEN_FALLBACK", "OUTPUT_TOKEN_MAX", "OUTPUT_TOKEN_MIN", "clamp_output_token_limit", "output_limit", "output_limit_with_fallback"]

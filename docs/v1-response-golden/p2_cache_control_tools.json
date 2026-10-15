@@ -44,8 +44,7 @@
           "name": "t1",
           "description": "",
           "parameters": {
-            "type": "object",
-            "additionalProperties": false
+            "type": "object"
           }
         },
         "cache_control": {

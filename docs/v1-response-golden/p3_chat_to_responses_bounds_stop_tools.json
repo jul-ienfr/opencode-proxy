@@ -144,8 +144,7 @@
           },
           "required": [
             "city"
-          ],
-          "additionalProperties": false
+          ]
         }
       },
       {
@@ -154,8 +153,7 @@
         "description": "d",
         "parameters": {
           "type": "object",
-          "properties": {},
-          "additionalProperties": false
+          "properties": {}
         }
       }
     ],

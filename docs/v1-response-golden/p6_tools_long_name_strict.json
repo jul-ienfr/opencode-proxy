@@ -53,7 +53,7 @@
       }
     ],
     "stream": false,
-    "max_tokens": 16384,
+    "max_tokens": 32000,
     "tools": [
       {
         "name": "mcp__plugin_very_long_tool_name_exceeding_sixty_four_chars_limit_aaaa",
@@ -64,16 +64,14 @@
             "a": {
               "type": "string"
             }
-          },
-          "additionalProperties": false
+          }
         }
       },
       {
         "name": "short",
         "description": "",
         "input_schema": {
-          "type": "object",
-          "additionalProperties": false
+          "type": "object"
         }
       }
     ],

@@ -117,8 +117,7 @@
             },
             "required": [
               "city"
-            ],
-            "additionalProperties": false
+            ]
           }
         }
       }

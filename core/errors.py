@@ -206,36 +206,76 @@ _UPSTREAM_MOTIFS: tuple = (
     # overflow de contexte → le client compacte. Non rejouable chez nous (la
     # compaction réactive a déjà eu sa chance) et SANS pause de clé : la clé
     # n'a rien fait, c'est la conversation qui est trop longue.
+    # Batterie élargie v2 (`provider-error.ts`) : le gateway Zen masque
+    # parfois le code sous `[code]` (extrait avant match, cf. _strip_gateway_label).
     (r"context_length_exceeded", "invalid_request_error", False, False),
+    (r"maximum context", "invalid_request_error", False, False),
+    (r"context window", "invalid_request_error", False, False),
+    (r"too many tokens", "invalid_request_error", False, False),
+    (r"payload.too.large|payload too large|request too large", "invalid_request_error", False, False),
+    (r"model maximum context|context.*exceeded|exceed.*context", "invalid_request_error", False, False),
     # quota / crédit épuisé → problème de COMPTE, pas de réseau : ça ne revient
-    # pas tout seul, donc pas de rejeu, mais une pause longue côté hôte
-    # (parité du site historique « 400 credit error »). Les deux motifs
-    # officiels + les deux textes déjà reconnus par le proxy, une seule table.
+    # pas tout seul, donc pas de rejeu, mais une pause longue côté hôte.
+    # Parité v2 : 6 codes officiels + textes historiques du proxy.
     (r"insufficient_quota", "permission_error", False, True),
     (r"usage_not_included", "permission_error", False, True),
+    (r"billing_error|billing.*error|out of credits|no credits", "permission_error", False, True),
+    (r"gousagelimiterror|go.*usage.*limit", "permission_error", False, True),
+    (r"freeusagelimiterror|free.*usage.*limit", "permission_error", False, True),
+    (r"creditlimitexceeded|credit.*limit.*exceed", "permission_error", False, True),
     (r"insufficient balance", "permission_error", False, True),
     (r"monthly usage limit", "permission_error", False, True),
+    # auth : clé invalide / permission refusée → pas de retry, pause longue
+    # (clé condamnée au 401/403). 400+`incorrect api key` inclus (officiel).
+    (r"incorrect api key|invalid api key|api_key_invalid|invalid_api_key", "authentication_error", False, True),
+    (r"permission_denied|permission denied|forbidden.*key", "permission_error", False, True),
     # prompt refusé par la politique amont → requête à corriger. Non-retry
     # comme les deux précédents, mais PAS de pause de clé : punir toutes les
     # clés parce qu'un prompt est invalide provoquerait une panne auto-infligée.
+    # Parité v2 `ContentPolicy` → mappé `invalid_request_error` (non-retry).
     (r"invalid_prompt", "invalid_request_error", False, False),
+    (r"content_policy|usage.?policy|policy violation|blocked.*policy|harmful content", "invalid_request_error", False, False),
     # surcharge amont → transitoire, ça se rejoue. Inclut les textes OpenCode
     # « Endpoint is unavailable » : 429 transitoire côté SERVEUR, sans lien avec
     # le quota per-IP — rotater l'IP ne change rien (cf. is_free_quota_failure).
+    # Parité v2 : `try again`, `at capacity`, 408/409 traités à part dans
+    # `classify_upstream_error` (statut), pas ici. `server_error` générique
+    # volontairement exclu (contrat : 503 ordinaire reste `api_error`).
     (r"server_is_overloaded", "overloaded_error", True, False),
     (r"endpoint is unavailable", "overloaded_error", True, False),
-    # « unavailable » / « server_error » génériques VOLONTAIREMENT absents :
-    # un 503 « Service Unavailable » ordinaire doit rester api_error (contrat
-    # épinglé test_corps_sans_motif). Seul le texte OpenCode précis est classé.
+    (r"try again|at capacity|temporarily unavailable", "overloaded_error", True, False),
+    # « unavailable » / « server_error » génériques VOLONTAIREMENT restreints :
+    # un 503 « Service Unavailable » ordinaire sans motif précis reste api_error
+    # (contrat épinglé test_corps_sans_motif). Seuls les textes ci-dessus classent.
 )
 
-# Compilation unique à l'import. `\b` des deux côtés : « server_error » ne doit
-# pas matcher « server_errors_total » ni « not_server_error », et les motifs
-# officiels sont en snake_case, donc délimités par de la ponctuation JSON.
+# Compilation unique à l'import. `\b(?:…)\b` : chaque alternative est bornée
+# (sans groupe, `\bmotif1|motif2\b` ne bornait que les extrémités). « server_error »
+# ne doit pas matcher « server_errors_total » ni « not_server_error ».
 _MOTIF_RES: tuple = tuple(
-    (re.compile(r"\b" + motif + r"\b", re.IGNORECASE), etype, retryable, pause)
+    (re.compile(r"\b(?:" + motif + r")\b", re.IGNORECASE), etype, retryable, pause)
     for motif, etype, retryable, pause in _UPSTREAM_MOTIFS
 )
+
+
+def _strip_gateway_label(body: object) -> str:
+    """Extrait le label gateway `[code]` que Zen préfixe (`GATEWAY_CODE_LABEL`).
+
+    Zen réécrit les codes mais garde `[code]` en tête de message ; sans
+    extraction, tout est masqué en `server_error`. Rend `"<label> <body>"`
+    pour que les motifs voient le code d'origine. Pur, jamais de raise.
+    """
+    if not isinstance(body, str) or not body:
+        return ""
+    try:
+        import re as _re
+
+        m = _re.match(r"\s*\[([A-Za-z0-9_.-]+)\]\s*(.*)", body, re.DOTALL)
+        if m:
+            return f"{m.group(1)} {m.group(2)}"
+    except Exception:
+        pass
+    return body if isinstance(body, str) else ""
 
 
 def _match_upstream_motif(body: object):
@@ -244,12 +284,14 @@ def _match_upstream_motif(body: object):
     Pur, jamais de raise : appelé sur du texte réseau (corps d'erreur amont,
     message d'exception). Rend ``None`` si aucun motif ne correspond — dans ce
     cas l'appelant garde son comportement par défaut (``api_error``).
+    Le label gateway `[code]` est déplié avant match (parité Zen).
     """
     if not isinstance(body, str) or not body:
         return None
     try:
+        hay = _strip_gateway_label(body)
         for rx, etype, retryable, pause in _MOTIF_RES:
-            if rx.search(body):
+            if rx.search(hay):
                 return etype, retryable, pause
     except Exception:
         return None
@@ -257,18 +299,22 @@ def _match_upstream_motif(body: object):
 
 
 def classify_upstream_error(status: object, body: object) -> tuple:
-    """[G1] ``(status, error_type)`` — statut inchangé, type déduit du CORPS.
+    """[G1 + parité v2] ``(status, error_type)`` — statut inchangé, type déduit du CORPS.
 
     Le statut n'est jamais réécrit ici : les règles de fenêtre d'auth
     (401/403 → 503) et de parité (429 → 429, 529 → 529) restent la propriété
     de l'hôte (``opencode._safe_client_status``). Seul le TYPE change, et
     uniquement quand l'amont est explicite — un corps sans motif continue de
     sortir en ``api_error`` exactement comme avant.
+    Parité v2 : 402 → quota (`permission_error`, non-retryable) même sans
+    motif (facturation) ; le label `[code]` est déplié avant match.
     """
     try:
         status_i = int(status)
     except (TypeError, ValueError):
         status_i = 502
+    if status_i == 402:
+        return status_i, "permission_error"
     _m = _match_upstream_motif(body)
     if _m is None:
         return status_i, "api_error"
