@@ -4718,15 +4718,19 @@ def _free_request_headers(headers: dict) -> dict:
 # (et OPENCODE_CLIENT_NAME / OPENCODE_TLS_IMPERSONATE si besoin).
 _OPENCODE_OFFICIAL_UA = os.getenv(
     "OPENCODE_OFFICIAL_UA",
-    "opencode/1.19.0 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14",
+    "opencode/1.18.31 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14",
 )
-# UA de la jambe Responses — MESURÉ sur le vrai client 1.19.0 (même
+# UA de la jambe Responses — MESURÉ sur le vrai client 1.18.31 (même
 # opencode/Bun, mais ai-sdk provider-utils 4.0.40 : autre bundle ai-sdk pour
-# l'API Responses). Envoyer l'UA chat (4.0.23) sur /responses = combinaison
-# qui n'existe jamais dans la nature.
+# l'API Responses, vérifié sur le fil le 2026-10-15 : chat=4.0.23,
+# responses=4.0.40). Envoyer l'UA chat (4.0.23) sur /responses = combinaison
+# qui n'existe jamais dans la nature. NOTE 2026-10-15 : l'UA « 1.19.0 »
+# précédemment câblé ici est REJETÉ par la gateway (403 FreeTierError
+# vérifié live : même octets, 1.18.31 → 200, 1.19.0 → 403) — ne re-bumper
+# la version qu'après re-capture mitmproxy du nouveau binaire.
 _OPENCODE_OFFICIAL_UA_RESPONSES = os.getenv(
     "OPENCODE_OFFICIAL_UA_RESPONSES",
-    "opencode/1.19.0 ai-sdk/provider-utils/4.0.40 runtime/bun/1.3.14",
+    "opencode/1.18.31 ai-sdk/provider-utils/4.0.40 runtime/bun/1.3.14",
 )
 # Parité officielle v2 (`packages/core/src/app.ts:useragent`) :
 # `opencode/<channel>/<version>/<name>` — plus de `ai-sdk/provider-utils`,
@@ -4736,9 +4740,10 @@ _OPENCODE_OFFICIAL_UA_RESPONSES = os.getenv(
 _OPENCODE_OFFICIAL_UA_V2 = os.getenv("OPENCODE_OFFICIAL_UA_V2", "opencode/prod/2.0.28/cli")
 # Nom de client officiel. Enum RÉELLE extraite du binaire 1.18.31 :
 #   ["app","cli","desktop"].includes(t.client)
-# Le CLI `opencode run` envoie « cli » — MESURÉ 243 fois sur le captureur
-# (provider `opencodeproxy`) et 20 fois dans logs/debug.log. La valeur
-# « desktop » n'apparaît dans AUCUNE de nos captures du vrai client.
+# Le natif `opencode run` (provider `opencode`, mesuré mitmproxy 2026-10-15)
+# envoie « desktop » ; l'ancien chemin custom-provider mesurait « cli ».
+# Les deux obtiennent des 200 sur inference/v1 (vérifié live) — on garde
+# « cli » par défaut (surchargable via OPENCODE_CLIENT_NAME=desktop).
 _OPENCODE_CLIENT_NAME = os.getenv("OPENCODE_CLIENT_NAME", "cli")
 
 
@@ -4802,7 +4807,7 @@ _OPENCODE_PROJECT = os.getenv("OPENCODE_PROJECT") or _official_project_id()
 # MissingSessionID — endpoint non public).
 _SYSTEMONE_ENDPOINT = os.getenv(
     "OPENCODE_SYSTEMONE_ENDPOINT",
-    "https://opencode.ai/zen/v1/systemone",
+    "https://opencode.ai/inference/v1/systemone",
 )
 # Empreinte réseau de la jambe free — la VRAIE face TLS+HTTP du client Bun,
 # capturée octet-exact le 2026-09-18 (Bun standalone 1.3.11 PUIS le vrai
@@ -4828,7 +4833,7 @@ _SYSTEMONE_ENDPOINT = os.getenv(
 # trop dont la longueur VARIE aléatoirement (186/218/250/282 octets -> 4
 # profils distincts, empreinte instable). Retiré : le profil devient
 # exactement celui du binaire (vérifié, sonde AQ).
-# Re-mesuré le 2026-10-15 sur le binaire 1.19.0 (`localhost:48443`, 517
+# Re-mesuré le 2026-10-15 sur le binaire 1.18.31 natif (`localhost:48443`, 517
 # octets) : ciphers/curves/sigalgs(9)/ALPN http/1.1/GREASE-absent IDENTIQUES
 # au replay, SNI premier, + extension padding 21 en fin — ajoutée
 # automatiquement par la stack (BoringSSL/curl_cffi l'émet aussi : notre
@@ -4873,11 +4878,12 @@ _FREE_WIRE_FULL_HEADERS = os.getenv("OPENCODE_FREE_WIRE_FULL_HEADERS", "1") not 
 _OPENCODE_ACCEPT_ENCODING = os.getenv(
     "OPENCODE_ACCEPT_ENCODING", "gzip, deflate, br, zstd"
 )
-# [ordre exact] Ordre des en-têtes sur le fil — MESURÉ 243× sur le client
-# 1.18.31 (12 en-têtes) puis re-mesuré 4 requêtes sur le client 1.19.0
-# (2026-10-15, `opencode run`, provider `opencodeproxy`) : 13 en-têtes,
-# `x-opencode-session-id` (= même ses_) en 8e après `x-opencode-session`.
-# curl_cffi expose l'option libcurl-impersonate CURLOPT_HTTPHEADER_ORDER
+# [ordre exact] Ordre des en-têtes sur le fil — MESURÉ au mitmproxy sur le
+# vrai client 1.18.31 natif le 2026-10-15 (`opencode run`, provider `opencode`,
+# POST https://opencode.ai/inference/v1/responses + /chat/completions) :
+# 12 en-têtes, SANS `x-opencode-session-id` (le natif ne l'envoie JAMAIS —
+# l'ancienne valeur à 13 en-têtes venait du chemin custom-provider, pas du
+# natif). curl_cffi expose l'option libcurl-impersonate CURLOPT_HTTPHEADER_ORDER
 # (11030) via ExtraFingerprints.header_order. Sans elle, libcurl émet NOTRE
 # Connection en DERNIÈRE position (il ne la génère pas lui-même : sans elle
 # fournie, aucune Connection ne part — prouvé, probe AD) et décale de 4 rangs
@@ -4889,7 +4895,7 @@ _OPENCODE_ACCEPT_ENCODING = os.getenv(
 _OPENCODE_HEADER_ORDER = os.getenv(
     "OPENCODE_FREE_HEADER_ORDER",
     "Authorization,Content-Type,User-Agent,x-opencode-client,x-opencode-project,"
-    "x-opencode-request,x-opencode-session,x-opencode-session-id,Connection,Accept,Host,Accept-Encoding,"
+    "x-opencode-request,x-opencode-session,Connection,Accept,Host,Accept-Encoding,"
     "Content-Length",
 )
 _FREE_HEADER_ORDER_ON = os.getenv("OPENCODE_FREE_HEADER_ORDER_ON", "1") not in (
@@ -4913,8 +4919,8 @@ def _free_fp_override() -> dict:
       * ``tls_signature_algorithms`` = les 9 sigalgs Bun (noms OpenSSL),
       * ``tls_grease`` False (Bun ne grease rien — vérifié sur 6 captures),
       * ``http_version`` "v1" (= V1_1 : Bun n'offre que http/1.1 en ALPN),
-      * ``header_order`` = l'ordre EXACT des 13 en-têtes du client 1.19.0 (voir
-        _OPENCODE_HEADER_ORDER). C'est ce qui place ``Connection`` en 9e
+      * ``header_order`` = l'ordre EXACT des 12 en-têtes du client 1.18.31 natif (voir
+        _OPENCODE_HEADER_ORDER). C'est ce qui place ``Connection`` en 8e
         position comme le client, au lieu de la dernière (limite libcurl).
     Données pures (pas d'import curl_cffi ici — la factory garde son import
     paresseux + son garde). Kill-switch : si OPENCODE_TLS_IMPERSONATE est
@@ -4957,31 +4963,83 @@ def _get_free_fp_kwargs() -> tuple[str, dict | None]:
 #   descriptions absentes → 200 ; [Bash,Read] capitalisés → 403.
 # Puis /responses (muse-spark-1.3-contributor-free) : stream+slim bash/read
 # (UA 4.0.40) → 200, non-stream → 403, prompt_cache_key=ses_ accepté.
-# RÈGLE : stream:true + tools[] contenant EXACTEMENT « bash » ET « read »
-# (match case-sensitive — les clients style Claude envoient « Bash »/« Read »
-# et se font rejeter ; le trafic réel l'a confirmé : 25 tools lowercase DONT
-# « read » MAIS SANS « bash » → 403). Les schemas/descriptions sont libres.
-_FREE_SHIM_DESC = (
-    "Do not use this tool. It is a compatibility placeholder with no "
-    "implementation; any call fails. Use the equivalent client tool instead."
-)
+# [gate inference 2026-10-15] Bisection live sur inference/v1 (UA 1.18.31,
+# octets variables un par un, corps replayes via le TLS du proxy) :
+#   * endpoint zen/v1/* → 403 systématique (migration inference) ;
+#   * UA 1.19.0 ou v2/prod/* → 403 (seul 1.18.31 + bon bundle passe) ;
+#   * tools ABSENTS sur input primary-like → 403 ; tools sur input
+#     title-like → 403 (cohérence requise, comme le natif) ;
+#   * description placeholder ("Do not use this tool...") → 403 MÊME
+#     avec le bon nom (signature blacklistée) ; schéma `properties: {}`
+#     vide → 403 MÊME avec description réaliste ;
+#   * noms d'outils inconnus + descriptions réalistes → 200 (tolérés
+#     en extras) ; paraphrase de description → 200 (pas de match exact).
+# RÈGLE : stream:true + tools[] contenant un « read » à définition
+# réaliste (nom + description + schéma avec propriétés — le « read »
+# officiel seul suffit, « bash » seul ne suffit PAS, « edit » seul non plus).
+# Les shims ci-dessous portent donc des définitions plausibles calquées sur
+# les outils natifs (paraphrasées, pas de chemins machine) : un appel amont
+# vers un shim est re-mappé vers l'outil client comme avant (name_map).
+_FREE_SHIM_DEFS = {
+    "bash": {
+        "description": (
+            "Executes a shell command in the current working directory and "
+            "returns its output. Use the workdir parameter to run in another "
+            "directory, and timeout to bound long-running commands."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "command": {"type": "string", "description": "The command to execute"},
+                "workdir": {
+                    "type": "string",
+                    "description": "Working directory (defaults to the current directory)",
+                },
+                "timeout": {"type": "integer", "description": "Timeout in milliseconds"},
+            },
+            "required": ["command"],
+        },
+    },
+    "read": {
+        "description": (
+            "Reads a file from the filesystem and returns its contents. "
+            "Use offset and limit to page through large files."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "filePath": {"type": "string", "description": "Absolute path of the file to read"},
+                "offset": {"type": "integer", "description": "First line to read (1-indexed)"},
+                "limit": {"type": "integer", "description": "Maximum lines to return"},
+            },
+            "required": ["filePath"],
+        },
+    },
+}
 
 
 def _free_shim_tool(name: str, responses: bool) -> dict:
-    """Tool factice conforme-grille (nom exact exigé, schéma minimal prouvé)."""
+    """Shim conforme-grille : nom exact + définition réaliste (gate inference)."""
+    definition = _FREE_SHIM_DEFS.get(name) or {
+        "description": "Performs the %s operation and returns its result." % name,
+        "parameters": {
+            "type": "object",
+            "properties": {"input": {"type": "string", "description": "Operation input"}},
+        },
+    }
     if responses:
         return {
             "type": "function",
             "name": name,
-            "description": _FREE_SHIM_DESC,
-            "parameters": {"type": "object", "properties": {}},
+            "description": definition["description"],
+            "parameters": definition["parameters"],
         }
     return {
         "type": "function",
         "function": {
             "name": name,
-            "description": _FREE_SHIM_DESC,
-            "parameters": {"type": "object", "properties": {}},
+            "description": definition["description"],
+            "parameters": definition["parameters"],
         },
     }
 
@@ -5047,7 +5105,7 @@ def _free_wire_body(body, force_stream: bool = False):
         wire["tools"] = base
     if is_chat and need_order:
         # Parité client officiel v1 (tri ICU `toSorted(localeCompare)`,
-        # re-mesuré sur 1.19.0 le 2026-10-15 : outils triés sur le fil).
+        # (tri constaté sur le natif : outils triés sur le fil).
         # Les shims `bash`/`read` sont triés AVEC le reste, pas appendus :
         # le tri porte sur l'état FINAL (outils d'origine + shims).
         wire["tools"] = _sorted_chat_tools(wire.get("tools"))
@@ -5331,14 +5389,15 @@ def _body_conversation_key(body) -> str | None:
 def _official_free_headers(endpoint: str = "", conversation_key: str | None = None) -> dict:
     """Jeu de headers officiel complet pour UN envoi jambe free.
 
-    Copie du wire Bun MESURÉ sur le vrai client 1.19.0 (capture en clair
-    via baseURL http:// locale, 2026-10-15, provider `opencodeproxy`,
-    `opencode run`, 2 requêtes : titres + principale, même ses_/msg_) :
+    Copie du wire Bun MESURÉ au mitmproxy sur le vrai client natif 1.18.31
+    (2026-10-15, `opencode run`, provider `opencode`,
+    POST https://opencode.ai/inference/v1/responses + /chat/completions) :
       Authorization: Bearer public
       Content-Type: application/json
-      User-Agent: opencode/<ver> ai-sdk/provider-utils/<v> runtime/bun/<v>
+      User-Agent: opencode/1.18.31 ai-sdk/provider-utils/<4.0.23|4.0.40> runtime/bun/1.3.14
       x-opencode-client / x-opencode-project / x-opencode-request /
-      x-opencode-session / x-opencode-session-id (= même ses_)
+      x-opencode-session (12 en-têtes, SANS x-opencode-session-id : le natif
+      ne l'envoie jamais)
     puis la pile Bun ajoute : Connection: keep-alive, Accept: */*, Host,
     Accept-Encoding: gzip, deflate, br, zstd, Content-Length.
     Points critiques (le gate 403 les discrimine) :
@@ -5388,16 +5447,13 @@ def _official_free_headers(endpoint: str = "", conversation_key: str | None = No
         "x-opencode-project": _OPENCODE_PROJECT,
         "x-opencode-request": _free_request_msg_id(),
         "x-opencode-session": _conv_session,
-        # Parité 1.19.0 mesurée : `x-opencode-session-id` = même ses_ que
-        # `x-opencode-session` (absent en 1.18.31). Note `x-opencode-client` :
-        # `opencode run` envoie `desktop` en 1.18.31 comme en 1.19.0 (mesuré
-        # 4 requêtes, même méthodologie) ; on garde `cli`, valeur qui obtient
-        # des 200 en production depuis des mois — changer sans preuve live
-        # serait risquer la jambe qui marche.
-        "x-opencode-session-id": _conv_session,
+        # PAS de `x-opencode-session-id` : le natif 1.18.31 ne l'envoie jamais
+        # (vérifié mitmproxy 2026-10-15). Note `x-opencode-client` : le natif
+        # `opencode run` envoie `desktop`, mais `cli` obtient aussi des 200
+        # sur inference/v1 (vérifié live) — on garde `cli` par défaut.
     }
     if _FREE_WIRE_FULL_HEADERS:
-        # Ordre du client 1.19.0 : Connection 9e, Accept 10e, Host 11e, AE 12e.
+        # Ordre du client 1.18.31 natif : Connection 8e, Accept 9e, Host 10e, AE 11e.
         # (libcurl replacera Connection en dernier — cf. docstring.)
         try:
             from urllib.parse import urlparse as _urlparse
@@ -17801,7 +17857,7 @@ async def systemone(request: Request):
     `state` contre des questions typées (`noul`/`choice`/`score`) et renvoie
     des réponses structurées. Ce handler relaie le corps tel quel vers
     l'endpoint amont dédié (docs : https://opencode.ai/docs/fr/zen/#jev) :
-      POST https://opencode.ai/zen/v1/systemone
+      POST https://opencode.ai/inference/v1/systemone
       { "model": "jev-1.13[-free]", "state": "...",
         "questions": { "<id>": { "type": "noul|choice|score", ... } } }
 

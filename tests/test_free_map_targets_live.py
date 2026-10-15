@@ -62,7 +62,7 @@ CIBLES_DEPRECIEES = ("mimo-v2.5-free", "muse-spark-1.2-contributor-free")
 # Endpoint interne de l'exception `jev-1.13*` (`/zen/v1/systemone`) — hors des
 # deux jambes, donc hors du statut public. Verrouillé par
 # `tests/test_model_catalog.py::test_exception_jev_echappe_au_durcissement`.
-_INTERNAL_ENDPOINT = "https://opencode.ai/zen/v1/systemone"
+_INTERNAL_ENDPOINT = "https://opencode.ai/inference/v1/systemone"
 
 
 # ─────────── Règle (pure, testable sans config.yaml) ────────────────────

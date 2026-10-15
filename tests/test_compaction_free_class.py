@@ -50,7 +50,7 @@ def test_free_conversation_gets_free_summarizer(model_id):
     )[:4]
     assert is_free is True, f"{model_id!r} devrait produire un résumeur FREE"
     assert "/zen/go/" not in (ep or ""), f"résumeur free sur endpoint payant: {ep!r}"
-    assert "/zen/v1/" in (ep or ""), f"endpoint free attendu, obtenu {ep!r}"
+    assert "/inference/v1/" in (ep or ""), f"endpoint free attendu, obtenu {ep!r}"
 
 
 @pytest.mark.parametrize("model_id", FREE_CONVERSATIONS)
@@ -140,7 +140,7 @@ def test_free_request_helper_never_calls_paid_helper(monkeypatch):
     import asyncio
 
     out = asyncio.get_event_loop_policy().new_event_loop().run_until_complete(
-        oc._compaction_summarizer_request(True, "https://opencode.ai/zen/v1/chat/completions", {"model": "mimo-v2.5-free", "messages": []}, {}, "openai", seed="mimo-v2.5")
+        oc._compaction_summarizer_request(True, "https://opencode.ai/inference/v1/chat/completions", {"model": "mimo-v2.5-free", "messages": []}, {}, "openai", seed="mimo-v2.5")
     )
     assert out[0] == "FREERESP"
     assert calls["pool"] == 1
@@ -163,7 +163,7 @@ def test_free_pool_exhaustion_is_fail_open_never_paid(monkeypatch):
 
     try:
         asyncio.get_event_loop_policy().new_event_loop().run_until_complete(
-            oc._compaction_summarizer_request(True, "https://opencode.ai/zen/v1/chat/completions", {"model": "m", "messages": []}, {}, "openai", seed="mimo-v2.5")
+            oc._compaction_summarizer_request(True, "https://opencode.ai/inference/v1/chat/completions", {"model": "m", "messages": []}, {}, "openai", seed="mimo-v2.5")
         )
     except oc.UpstreamError:
         pass
@@ -206,7 +206,7 @@ def test_responses_payload_normalized_to_chat():
         ).encode(),
     )
     out = asyncio.get_event_loop_policy().new_event_loop().run_until_complete(
-        oc._compaction_normalize_response(resp, "https://opencode.ai/zen/v1/responses", {"model": "mimo-v2.5-free"})
+        oc._compaction_normalize_response(resp, "https://opencode.ai/inference/v1/responses", {"model": "mimo-v2.5-free"})
     )
     data = json.loads(out.content)
     assert data["choices"][0]["message"]["content"] == "RESUME-OK"
@@ -218,7 +218,7 @@ def test_chat_payload_left_untouched():
 
     resp = oc.httpx.Response(200, headers={"content-type": "application/json"}, content=b'{"choices":[]}')
     out = asyncio.get_event_loop_policy().new_event_loop().run_until_complete(
-        oc._compaction_normalize_response(resp, "https://opencode.ai/zen/v1/chat/completions", {})
+        oc._compaction_normalize_response(resp, "https://opencode.ai/inference/v1/chat/completions", {})
     )
     assert out is resp
 
@@ -229,7 +229,7 @@ def test_normalize_never_raises_on_garbage():
 
     resp = oc.httpx.Response(200, headers={"content-type": "application/json"}, content=b"not-json")
     out = asyncio.get_event_loop_policy().new_event_loop().run_until_complete(
-        oc._compaction_normalize_response(resp, "https://opencode.ai/zen/v1/responses", {})
+        oc._compaction_normalize_response(resp, "https://opencode.ai/inference/v1/responses", {})
     )
     assert out is resp
 

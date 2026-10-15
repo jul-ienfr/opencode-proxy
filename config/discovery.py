@@ -386,9 +386,9 @@ def free_endpoint_for(free_id: str, api_base_free: str) -> str:
     """
     lid = free_id.lower()
     if "muse" in lid or "spark" in lid:
-        return "https://opencode.ai/zen/v1/responses"
+        return "https://opencode.ai/inference/v1/responses"
     if "jev" in lid:
-        return "https://opencode.ai/zen/v1/systemone"
+        return "https://opencode.ai/inference/v1/systemone"
     return api_base_free
 
 

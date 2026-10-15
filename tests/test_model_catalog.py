@@ -258,7 +258,7 @@ def test_exception_jev_echappe_au_durcissement():
             assert model_id in st.MODELS, f"{model_id} a quitté models:"
             cfg = st.get_model_config(model_id)
             assert cfg["endpoint"] == st.MODELS[model_id]["endpoint"]
-            assert cfg["endpoint"] == "https://opencode.ai/zen/v1/systemone"
+            assert cfg["endpoint"] == "https://opencode.ai/inference/v1/systemone"
             # endpoint interne : ni la jambe payée, ni l'anonyme
             assert mc.endpoint_leg(cfg["endpoint"]) is None
     finally:

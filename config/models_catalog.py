@@ -32,10 +32,10 @@ CATALOG_TIMEOUT = 30.0
 
 # Nos deux providers, dans le catalogue live.
 PAID_PROVIDER = "opencode-go"    # https://opencode.ai/zen/go/v1  (jambe payée)
-FREE_PROVIDER = "opencode"       # https://opencode.ai/zen/v1     (jambe anonyme)
+FREE_PROVIDER = "opencode"       # https://opencode.ai/inference/v1 (jambe anonyme)
 OUR_PROVIDERS = (PAID_PROVIDER, FREE_PROVIDER)
 
-# Exception de périmètre : servis sur l'infra opencode (`/zen/v1/systemone`)
+# Exception de périmètre : servis sur l'infra opencode (`/inference/v1/systemone`)
 # mais absents du catalogue public — ne jamais les déclarer morts ni les
 # retirer. Tout le reste du catalogue (google, mistral, azure, bedrock…) est
 # chez un provider TIERS : le proxy ne le fournit pas.

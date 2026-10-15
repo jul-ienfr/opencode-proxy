@@ -133,11 +133,10 @@ class TestOrdreDesEnTetes:
         )
 
     def test_header_order_valeur(self):
-        """L'ordre imposé est exactement celui mesuré sur le client 1.19.0 (13)."""
+        """L'ordre imposé est exactement celui mesuré sur le natif 1.18.31 (12)."""
         attendu = (
             "Authorization,Content-Type,User-Agent,x-opencode-client,"
             "x-opencode-project,x-opencode-request,x-opencode-session,"
-            "x-opencode-session-id,"
             "Connection,Accept,Host,Accept-Encoding,Content-Length"
         )
         _, fp = oc._get_free_fp_kwargs()
@@ -149,11 +148,11 @@ class TestOrdreDesEnTetes:
         assert isinstance(fp["extra_fp"]["header_order"], str)
 
     def test_connection_en_8e_position(self):
-        """Connection est en 9e dans l'ordre imposé (= ordre du client 1.19.0)."""
+        """Connection est en 8e dans l'ordre imposé (= ordre du natif 1.18.31)."""
         _, fp = oc._get_free_fp_kwargs()
         champs = fp["extra_fp"]["header_order"].split(",")
-        assert champs.index("Connection") == 8, champs  # index 0 -> 9e
-        assert len(champs) == 13
+        assert champs.index("Connection") == 7, champs  # index 0 -> 8e
+        assert len(champs) == 12
 
     def test_kill_switch_header_order(self, monkeypatch):
         """OPENCODE_FREE_HEADER_ORDER_ON=0 retire l'option (repli sûr)."""

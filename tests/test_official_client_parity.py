@@ -1,12 +1,12 @@
 """test_official_client_parity.py — la jambe free recopie le client OpenCode officiel.
 
-Référence (re-vérifiée 2026-10-15 sur le binaire 1.19.0, même méthodologie :
-`opencode run`, provider `opencodeproxy`, baseURL http:// locale) :
+Référence (re-vérifiée 2026-10-15 sur le binaire natif 1.18.31 (mitmproxy :
+`opencode run`, provider `opencode`,
   * client  : packages/opencode/src/session/llm/request.ts (jeu des headers)
-  * wire    : captures octet-exact du VRAI client 1.19.0 redirigé vers un
-              captureur local (baseURL http://) : 8 headers dans l'ordre
+  * wire    : captures octet-exact du VRAI client natif (POST
+              https://opencode.ai/inference/v1/responses + /chat/completions) : 7 headers
               Authorization, Content-Type, User-Agent, x-opencode-client/
-              project/request/session/session-id (= même ses_), puis
+              project/request/session (SANS session-id : le natif ne l'envoie jamais), puis
               transport Bun (Connection, Accept, Host, AE, Content-Length) ;
               ClientHello Bun rejoué (ciphers/order/sigalgs/ALPN http/1.1,
               + padding ext 21 — cf. _free_fp_override)
@@ -27,7 +27,7 @@ Règles verrouillées ici :
   2. Ordre wire réel : Authorization, Content-Type, User-Agent,
      x-opencode-client/project/request/session/session-id (UA par endpoint :
      4.0.23 en chat, 4.0.40 en responses — deux bundles ai-sdk mesurés
-     en 1.19.0).
+     sur le natif 1.18.31 (UA 1.19.0/v2 = 403).
   3. BRANCHE dépendante du nom du provider (binaire 1.18.31, verbatim) :
        headers:{...e.model.providerID.startsWith("opencode")
          ? {...(k?{"x-opencode-project":k}:{}), "x-opencode-session":...,
@@ -40,10 +40,9 @@ Règles verrouillées ici :
      dont le provider commence par « opencode ».
   4. Valeurs : x-opencode-client = "cli" (enum binaire
      ["app","cli","desktop"] ; `opencode run` envoie « desktop » en 1.18.31
-     comme en 1.19.0 — mesuré 4 requêtes à méthodologie identique — alors
-     que la capture 243x (TUI) portait « cli ». On garde « cli », valeur
-     qui obtient des 200 en production depuis des mois : changer sans
-     preuve live serait risquer la jambe qui marche) ;
+     le natif `opencode run` envoie « desktop » (mesuré mitmproxy), mais
+     « cli » obtient aussi des 200 sur inference/v1 (vérifié live) —
+     on garde « cli » par défaut) ;
      x-opencode-project = ID de projet DÉRIVÉ, pas une constante — voir
      Project.resolve dans test_project_id_derivation_matches_official
      (fichier .git/opencode > commit racine, « global » hors dépôt git).
@@ -81,9 +80,8 @@ EXPECTED_ORDER = [
     "x-opencode-project",
     "x-opencode-request",
     "x-opencode-session",
-    "x-opencode-session-id",
     # [wire complet] 4 en-têtes de transport posés EXPLICITEMENT, dans l'ordre
-    # du client (mesuré 243x en 1.18.31, re-mesuré 4 requêtes en 1.19.0).
+    # du client natif (mesuré mitmproxy en 1.18.31, 2026-10-15).
     # Avant, libcurl les plaçait autrement : Host en position 1, Accept
     # absente, Accept-Encoding sans zstd.
     "Connection",
@@ -92,7 +90,7 @@ EXPECTED_ORDER = [
     "Accept-Encoding",
 ]
 
-# Ordre EXACT sur le fil chez le client officiel (13 en-têtes, 1.19.0).
+# Ordre EXACT sur le fil chez le client officiel natif (12 en-têtes, 1.18.31).
 CLIENT_WIRE_ORDER = [
     "Authorization",
     "Content-Type",
@@ -101,7 +99,6 @@ CLIENT_WIRE_ORDER = [
     "x-opencode-project",
     "x-opencode-request",
     "x-opencode-session",
-    "x-opencode-session-id",
     "Connection",
     "Accept",
     "Host",
@@ -132,7 +129,7 @@ def test_header_set_exact(official_env):
     Accept-Encoding valait gzip, deflate, br au lieu de gzip, deflate, br, zstd.
     Aucun en-tete navigateur, et jamais x-api-key (invariant A.0).
     """
-    h = oc._official_free_headers("https://opencode.ai/zen/v1/chat/completions")
+    h = oc._official_free_headers("https://opencode.ai/inference/v1/chat/completions")
     assert list(h.keys()) == EXPECTED_ORDER
     lower = {k.lower() for k in h}
     for banned in (
@@ -151,28 +148,25 @@ def test_header_set_exact(official_env):
 
 
 def test_header_values_official(official_env):
-    """Valeurs exactes du client officiel (re-mesuré 1.19.0, 2026-10-15).
+    """Valeurs exactes du client officiel natif (mesuré mitmproxy 1.18.31).
 
-    Mesuré sur le captureur avec le provider NOMMÉ `opencodeproxy`
-    (`opencode run`, baseURL http:// locale) :
+    Mesuré au mitmproxy sur le natif (`opencode run`, provider `opencode`) :
       x-opencode-client  = "cli"   (choix proxy assumé : `run` envoie
-                            « desktop » en 1.18.31 comme en 1.19.0, mais
+                            « desktop » (natif), mais
                             « cli » obtient des 200 en production)
       x-opencode-project = ID de projet dérivé (ici le contenu de
                            .git/opencode), PAS la constante "global"
-      x-opencode-session-id = même ses_ que x-opencode-session (nouveau
-                              en 1.19.0, absent en 1.18.31)
+      PAS de x-opencode-session-id (le natif ne l'envoie jamais)
     Hors dépôt git, le client envoie littéralement "global" (vérifié par
     capture : dossier temp hors repo → x-opencode-project: global).
     """
     h = oc._official_free_headers()
     assert h["User-Agent"] == oc._OPENCODE_OFFICIAL_UA
-    assert h["User-Agent"] == "opencode/1.19.0 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14"
+    assert h["User-Agent"] == "opencode/1.18.31 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14"
     assert h["Authorization"] == "Bearer public"
     assert h["x-opencode-client"] == "cli"
-    # session-id = même ses_ que session (mesuré 1.19.0, 2 requêtes).
-    assert SES_RE.fullmatch(h["x-opencode-session-id"]), h["x-opencode-session-id"]
-    assert h["x-opencode-session-id"] == h["x-opencode-session"]
+    # PAS de session-id : le natif ne l'envoie jamais (mesuré mitmproxy).
+    assert "x-opencode-session-id" not in h
     assert h["Content-Type"] == "application/json"
     # project = ID dérivé de git, ou "global" hors dépôt git. Jamais vide.
     proj = h["x-opencode-project"]
@@ -221,8 +215,8 @@ def test_project_id_derivation_matches_official(official_env, monkeypatch, tmp_p
 
 def test_ua_per_endpoint(official_env):
     """Le client envoie provider-utils/4.0.40 sur /responses (mesuré)."""
-    chat = oc._official_free_headers("https://opencode.ai/zen/v1/chat/completions")
-    resp = oc._official_free_headers("https://opencode.ai/zen/v1/responses")
+    chat = oc._official_free_headers("https://opencode.ai/inference/v1/chat/completions")
+    resp = oc._official_free_headers("https://opencode.ai/inference/v1/responses")
     assert chat["User-Agent"] == oc._OPENCODE_OFFICIAL_UA
     assert "4.0.23" in chat["User-Agent"]
     assert resp["User-Agent"] == oc._OPENCODE_OFFICIAL_UA_RESPONSES
@@ -269,7 +263,7 @@ def test_hostile_profile_extras_never_reach_free(official_env):
             "Cookie": "session=abc",
         },
     }
-    h = oc._official_free_headers("https://opencode.ai/zen/v1/chat/completions")
+    h = oc._official_free_headers("https://opencode.ai/inference/v1/chat/completions")
     lower = {k.lower(): v for k, v in h.items()}
     for k in hostile["extra_headers"]:
         assert k.lower() not in lower, f"profile extra {k!r} leaked to free"
@@ -485,7 +479,7 @@ def test_free_wire_body_chat_keeps_client_tools(official_env):
     """Tools client conservés + shim manquant ajouté (ex. Bash capitalisé
     côté Claude ne compte PAS : le gate est case-sensitive).
 
-    Parité v1 (tri ICU `toSorted(localeCompare)`, re-mesuré 1.19.0) : les
+    Parité v1 (tri ICU `toSorted(localeCompare)`, binaire 1.18.31) : les
     shims sont triés AVEC les outils du client. D'où l'ordre attendu ici :
     « bash » avant « Bash » (primaire égal, le niveau tertiaire de la
     collation met la minuscule avant la majuscule), puis « Bash » avant
@@ -626,7 +620,7 @@ async def test_do_free_direct_request_collects(official_env, monkeypatch):
     monkeypatch.setattr(oc, "_ensure_http_client", lambda: fake)
     body = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
     req_h = {"Authorization": "Bearer public"}
-    resp, resp_headers = await oc._do_free_direct_request("https://h/zen/v1/chat/completions", body, req_h)
+    resp, resp_headers = await oc._do_free_direct_request("https://h/inference/v1/chat/completions", body, req_h)
     assert resp.status_code == 200
     assert resp.json()["choices"][0]["message"]["content"] == "pong"
     assert resp_headers == req_h
@@ -644,7 +638,7 @@ async def test_do_free_direct_request_passthrough_error(official_env, monkeypatc
     fake = _FakeHttpxStreamClient(_FakeHttpxStreamResp(403, ['{"error": "x"}']))
     monkeypatch.setattr(oc, "_ensure_http_client", lambda: fake)
     resp, _rh = await oc._do_free_direct_request(
-        "https://h/zen/v1/chat/completions", {"model": "m", "messages": []}, {}
+        "https://h/inference/v1/chat/completions", {"model": "m", "messages": []}, {}
     )
     assert resp.status_code == 403
 
@@ -655,5 +649,5 @@ async def test_do_free_direct_request_empty_raises(official_env, monkeypatch):
     monkeypatch.setattr(oc, "_ensure_http_client", lambda: fake)
     with pytest.raises(oc.UpstreamError):
         await oc._do_free_direct_request(
-            "https://h/zen/v1/chat/completions", {"model": "m", "messages": []}, {}
+            "https://h/inference/v1/chat/completions", {"model": "m", "messages": []}, {}
         )

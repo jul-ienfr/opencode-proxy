@@ -63,7 +63,7 @@ def test_free_leg_comes_from_free_model_map():
 def test_free_target_lands_on_the_anonymous_responses_leg():
     """La cible free est api: responses, geo meta-muse-spark, endpoint anonyme."""
     cfg = _cfg_settings.get_model_config("muse-spark-1.3-contributor-free")
-    assert cfg["endpoint"] == "https://opencode.ai/zen/v1/responses"
+    assert cfg["endpoint"] == "https://opencode.ai/inference/v1/responses"
     assert cfg.get("api") == "responses"
 
 

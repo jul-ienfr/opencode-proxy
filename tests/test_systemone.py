@@ -2,7 +2,7 @@
 
 Contrats (docs : https://opencode.ai/docs/fr/zen/#jev + probes live) :
   * le corps {model, state, questions} est relayé TEL QUEL vers
-    https://opencode.ai/zen/v1/systemone (jamais vers /chat/completions) ;
+    https://opencode.ai/inference/v1/systemone (jamais vers /chat/completions) ;
   * `jev-1.13` (payant) → clé Zen du pool (Bearer <clé>) ;
   * `jev-1.13-free` → `Bearer public` anonyme direct ;
   * validation : model connu + state non vide + questions typées ;
@@ -97,7 +97,7 @@ def test_systemone_free_passthrough_anonymous(client):
     fake = client._systemone_fake
     assert len(fake.calls) == 1
     call = fake.calls[0]
-    assert call["endpoint"] == "https://opencode.ai/zen/v1/systemone"
+    assert call["endpoint"] == "https://opencode.ai/inference/v1/systemone"
     assert call["headers"]["Authorization"] == "Bearer public"
     wire = json.loads(call["content"])
     assert wire["model"] == "jev-1.13-free"
@@ -357,7 +357,7 @@ async def test_systemone_free_hedge_winner_200_no_sequential(monkeypatch):
     )
     calls = _hedge_mocks(monkeypatch, hedge_resp=(ok, winner))
     resp = await oc._systemone_free_via_pool(
-        "https://opencode.ai/zen/v1/systemone",
+        "https://opencode.ai/inference/v1/systemone",
         _body("jev-1.13-free"),
         {"Authorization": "Bearer public", "Content-Type": "application/json"},
     )
@@ -375,7 +375,7 @@ async def test_systemone_free_hedge_429_filet_relayed(monkeypatch):
     rate = _FakeResp(status=429, payload={"error": {"type": "rate_limit", "message": "quota exceeded"}})
     calls = _hedge_mocks(monkeypatch, hedge_resp=(rate, winner))
     resp = await oc._systemone_free_via_pool(
-        "https://opencode.ai/zen/v1/systemone",
+        "https://opencode.ai/inference/v1/systemone",
         _body("jev-1.13-free"),
         {"Authorization": "Bearer public", "Content-Type": "application/json"},
     )

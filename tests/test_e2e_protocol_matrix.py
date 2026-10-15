@@ -56,8 +56,8 @@ from protocol_mapping import sanitize_tool_names
 EP_ANTHRO = "https://opencode.ai/zen/go/v1/messages"
 EP_CHAT = "https://opencode.ai/zen/go/v1/chat/completions"
 EP_RESPONSES = "https://opencode.ai/zen/go/v1/responses"
-EP_FREE_CHAT = "https://opencode.ai/zen/v1/chat/completions"
-EP_FREE_RESPONSES = "https://opencode.ai/zen/v1/responses"
+EP_FREE_CHAT = "https://opencode.ai/inference/v1/chat/completions"
+EP_FREE_RESPONSES = "https://opencode.ai/inference/v1/responses"
 
 # Modeles clients : cible payante unique par chemin.
 # Z1 (plan 19.5, lot Z) : `_install_seams` vide SORTED_CUSTOM_ROUTES, donc

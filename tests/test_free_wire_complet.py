@@ -1,8 +1,9 @@
-"""Verrouille le WIRE COMPLET de la jambe free : 13 en-tetes comme le client 1.19.0.
+"""Verrouille le WIRE COMPLET de la jambe free : 12 en-tetes comme le natif 1.18.31.
 
-Test de conformite mesure : le client officiel 1.19.0 envoie 13 en-tetes
-(re-mesure 2026-10-15, `opencode run`, provider `opencodeproxy`, baseURL
-http:// locale : 8 en-têtes applicatifs + 5 de transport). On verifie que la
+Test de conformite mesure au mitmproxy : le natif 1.18.31 envoie 12 en-tetes
+(2026-10-15, `opencode run`, provider `opencode`,
+POST https://opencode.ai/inference/v1/* : 7 applicatifs + 5 de transport,
+SANS x-opencode-session-id). On verifie que la
 jambe free les emet tous, avec les bonnes valeurs, et que l'ordre hors
 Connection est identique.
 
@@ -20,7 +21,7 @@ import pytest
 sys.path.insert(0, ".")
 import opencode as oc  # noqa: E402
 
-# Ordre EXACT mesure sur le fil chez le client officiel 1.19.0.
+# Ordre EXACT mesure sur le fil chez le client officiel natif 1.18.31.
 CLIENT_WIRE_ORDER = [
     "Authorization",
     "Content-Type",
@@ -29,7 +30,6 @@ CLIENT_WIRE_ORDER = [
     "x-opencode-project",
     "x-opencode-request",
     "x-opencode-session",
-    "x-opencode-session-id",
     "Connection",
     "Accept",
     "Host",
@@ -40,7 +40,7 @@ CLIENT_WIRE_ORDER = [
 CLIENT_WIRE_VALUES = {
     "Authorization": "Bearer public",
     "Content-Type": "application/json",
-    "User-Agent": "opencode/1.19.0 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14",
+    "User-Agent": "opencode/1.18.31 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14",
     "x-opencode-client": "cli",
     "Connection": "keep-alive",
     "Accept": "*/*",
@@ -103,7 +103,7 @@ def _capture_headers(extra_fp=None):
     not oc._ensure_curl_cffi(), reason="curl_cffi requis pour le wire reel"
 )
 def test_free_wire_has_all_client_headers():
-    """Les 13 en-tetes du client 1.19.0 sont emis (avant : 12 sans session-id)."""
+    """Les 12 en-tetes du client natif 1.18.31 sont emis (sans session-id)."""
     got = _capture_headers()
     assert got, "aucune requete capturee"
     names = [k for k, _ in got]
@@ -131,8 +131,7 @@ def test_free_wire_values_match_client():
     assert re.fullmatch(r"(global|[0-9a-f]{40})", got["x-opencode-project"])
     assert re.fullmatch(r"msg_[0-9a-f]{12}[0-9A-Za-z]{14}", got["x-opencode-request"])
     assert re.fullmatch(r"ses_[0-9a-f]{12}[0-9A-Za-z]{14}", got["x-opencode-session"])
-    assert re.fullmatch(r"ses_[0-9a-f]{12}[0-9A-Za-z]{14}", got["x-opencode-session-id"])
-    assert got["x-opencode-session-id"] == got["x-opencode-session"]
+    assert "x-opencode-session-id" not in got
 
 
 @pytest.mark.skipif(
@@ -154,7 +153,7 @@ def test_free_wire_order_matches_client_except_connection():
 
 def test_accept_encoding_announces_zstd_like_bun():
     """Le client annonce zstd ; on l'annonce aussi (decodage verifie)."""
-    h = oc._official_free_headers("https://opencode.ai/zen/v1/chat/completions")
+    h = oc._official_free_headers("https://opencode.ai/inference/v1/chat/completions")
     assert h["Accept-Encoding"] == "gzip, deflate, br, zstd"
     assert oc._OPENCODE_ACCEPT_ENCODING == "gzip, deflate, br, zstd"
 
@@ -162,15 +161,15 @@ def test_accept_encoding_announces_zstd_like_bun():
 def test_full_headers_kill_switch(monkeypatch):
     """OPENCODE_FREE_WIRE_FULL_HEADERS=0 retire les 4 en-tetes de transport."""
     monkeypatch.setattr(oc, "_FREE_WIRE_FULL_HEADERS", False)
-    h = oc._official_free_headers("https://opencode.ai/zen/v1/chat/completions")
+    h = oc._official_free_headers("https://opencode.ai/inference/v1/chat/completions")
     for hdr in ("Connection", "Accept", "Host", "Accept-Encoding"):
         assert hdr not in h, f"{hdr} devrait etre absent avec le kill-switch"
-    assert len(h) == 8
+    assert len(h) == 7
 
 
 def test_host_recomputed_per_endpoint():
     """Host suit l'endpoint (le client l'emet pour opencode.ai)."""
-    a = oc._official_free_headers("https://opencode.ai/zen/v1/chat/completions")
+    a = oc._official_free_headers("https://opencode.ai/inference/v1/chat/completions")
     b = oc._official_free_headers("https://exemple.test/v1/chat/completions")
     assert a["Host"] == "opencode.ai"
     assert b["Host"] == "exemple.test"

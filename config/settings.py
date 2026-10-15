@@ -396,7 +396,7 @@ DEBUG = _env_bool("OPENCODE_DEBUG", yaml_get("server", "debug", False))
 # ── Upstream endpoints ──────────────────────────────────────────────
 API_BASE_OPENAI = yaml_get("upstream", "openai_base", "https://opencode.ai/zen/go/v1/chat/completions")
 API_BASE_ANTHROPIC = yaml_get("upstream", "anthropic_base", "https://opencode.ai/zen/go/v1/messages")
-API_BASE_FREE = yaml_get("upstream", "free_base", "https://opencode.ai/zen/v1/chat/completions")
+API_BASE_FREE = yaml_get("upstream", "free_base", "https://opencode.ai/inference/v1/chat/completions")
 
 # ── Free model mapping (paid → free equivalent) ────────────────────
 FREE_MODEL_MAP = yaml_get("free_model_map", default={})
@@ -814,9 +814,11 @@ def get_model_capabilities(model_id: str, model_data: dict | None = None) -> dic
 _models_cfg = yaml_get("models", default={})
 MODELS = {}
 # muse-* and spark-* models use /v1/responses (Responses API), not /chat/completions
-# Paid: https://opencode.ai/zen/go/v1/responses, Free: https://opencode.ai/zen/v1/responses
+# Paid: https://opencode.ai/zen/go/v1/responses, Free: https://opencode.ai/inference/v1/responses
+# (2026-10-15 : la jambe free /zen/v1/* répond 403 FreeTierError depuis la
+# migration inference — le natif 1.18.31 appelle inference/v1 directement)
 _RESPONSES_ENDPOINT = "https://opencode.ai/zen/go/v1/responses"
-_RESPONSES_FREE_ENDPOINT = "https://opencode.ai/zen/v1/responses"
+_RESPONSES_FREE_ENDPOINT = "https://opencode.ai/inference/v1/responses"
 
 
 def _resolve_model_endpoint(model_id: str, model_data: dict, protocol: str) -> str:
@@ -1565,7 +1567,7 @@ def get_model_config(model_id: str) -> dict:
     Les deux bornes du plan (« pas d'`endpoint:`, pas d'id interne ») sont
     tenues par construction. Un `endpoint:` explicite gagne toujours
     (`_resolve_model_endpoint` le lit en premier), donc les ids internes
-    `jev-1.13*` sur `/zen/v1/systemone` ressortent inchangés ; et l'heuristique
+    `jev-1.13*` sur `/inference/v1/systemone` ressortent inchangés ; et l'heuristique
     ne sait rendre que l'une des bases opencode déjà déclarées — elle
     n'invente aucune URL.
     """

@@ -52,13 +52,13 @@ def test_plan_free_conversation_stays_free_with_chat_api():
         route_fn=lambda x: None,
         model_config_fn=lambda x: {},
         resolve_free_fn=lambda x: "mimo-v2.5-free",
-        free_endpoint_fn=lambda x: "https://opencode.ai/zen/v1/chat/completions",
+        free_endpoint_fn=lambda x: "https://opencode.ai/inference/v1/chat/completions",
         default_target="mimo-v2.5-free",
         is_free_fn=lambda x: True,
     )
     assert is_free is True
     assert m == "mimo-v2.5-free"
-    assert "/zen/v1/" in ep
+    assert "/inference/v1/" in ep
     assert api == "chat"
 
 
@@ -83,13 +83,13 @@ def test_plan_paid_conversation_stays_paid():
 def test_plan_systemone_never_gets_chat_body():
     def _ep_for(mid):
         if mid == "mimo-v2.5-free":
-            return "https://opencode.ai/zen/v1/chat/completions"
-        return "https://opencode.ai/zen/v1/systemone"
+            return "https://opencode.ai/inference/v1/chat/completions"
+        return "https://opencode.ai/inference/v1/systemone"
 
     m, ep, proto, api, is_free, seed = summarizer_plan(
         "jev-1.13-free",
         None,
-        endpoint="https://opencode.ai/zen/v1/systemone",
+        endpoint="https://opencode.ai/inference/v1/systemone",
         protocol="openai",
         api="chat",
         route_fn=lambda x: None,

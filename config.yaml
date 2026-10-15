@@ -6,7 +6,7 @@ server:
 upstream:
   openai_base: https://opencode.ai/zen/go/v1/chat/completions
   anthropic_base: https://opencode.ai/zen/go/v1/messages
-  free_base: https://opencode.ai/zen/v1/chat/completions
+  free_base: https://opencode.ai/inference/v1/chat/completions
   free_models_url: ''
   proxy: ''
   timeout:
@@ -162,10 +162,10 @@ models:
     output_limit: 384000
   jev-1.13-free:
     protocol: openai
-    endpoint: https://opencode.ai/zen/v1/systemone
+    endpoint: https://opencode.ai/inference/v1/systemone
   jev-1.13:
     protocol: openai
-    endpoint: https://opencode.ai/zen/v1/systemone
+    endpoint: https://opencode.ai/inference/v1/systemone
   mimo-v2.6-flash-free:
     protocol: openai
     output_limit: 32000
@@ -340,7 +340,7 @@ ip_rotation:
   ov_auth_station_threshold: 5
   ov_auth_window_s: 1800
   ovpn_endpoint_port: ''
-  ovpn_protocol: udp
+  ovpn_protocol: tcp
   paid_hedge_after_ms: 0
   pin_widen_auths: 8
   pin_widen_minutes: 30

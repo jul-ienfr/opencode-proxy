@@ -330,7 +330,7 @@ class TestApplyPersist:
             # muse-spark models use /v1/responses (Responses API), not /chat/completions
             assert (
                 st._free_endpoint_for("muse-spark-1.2-contributor-free")
-                == "https://opencode.ai/zen/v1/responses"
+                == "https://opencode.ai/inference/v1/responses"
             )
             assert st._free_endpoint_for("mimo-v2.5-free") == st.API_BASE_FREE
         finally:
