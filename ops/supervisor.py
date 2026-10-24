@@ -163,13 +163,20 @@ class StationSupervisor:
 
     def tracker_for(self, ip: str) -> IpLatencyTracker:
         """Tracker (station, ip) — objet PARTAGÉ avec le moteur (une seule
-        source de vérité : la vitrine locale et les décisions lisent la même
-        instance)."""
-        tr: IpLatencyTracker
+        source de vérité). [audit-2026-10-24 Phase1] plus de split-brain :
+        le fallback local n'est utilisé qu'en dernier recours ET est
+        réconcilié (log warning) au lieu de diverger silencieusement."""
         try:
-            tr = self._engine().tracker_for(self.station, ip)
+            from latency_rotation import get_engine as _ge
+            tr = _ge().tracker_for(self.station, ip)
+            # Réconcilie la vitrine locale sur l'instance moteur.
+            try:
+                self.ip_latency[ip] = tr
+            except Exception:
+                pass
             return tr
-        except Exception:
+        except Exception as _e:
+            logger.warning("[supervisor st%s] engine HS, fallback local (%s)", self.station, _e)
             cached = self.ip_latency.get(ip)
             if cached is not None:
                 return cached
@@ -256,11 +263,30 @@ class StationSupervisor:
             mgr_status = get_status() if callable(get_status) else {}
         except Exception as exc:  # fail-soft : le dashboard ne doit jamais 500
             mgr_status = {"error": str(exc)}
-        latency = {
-            ip: snap.__dict__
-            for ip, tr in list(self.ip_latency.items())[:10]
-            for snap in [tr.snapshot()]
-        }
+        # [audit-2026-10-24 Phase1] lit le moteur (source décisions), pas la
+        # copie locale (dashboard/EWMA divergeaient en mode dégradé).
+        latency: dict[str, Any] = {}
+        try:
+            eng = self._engine()
+            for (s, ip) in list(getattr(eng, "_trackers", {}).keys())[:10]:
+                if int(s) != int(self.station):
+                    continue
+                try:
+                    latency[str(ip)] = eng.tracker_for(int(s), str(ip)).snapshot().__dict__
+                except Exception:
+                    continue
+            if not latency:
+                latency = {
+                    ip: snap.__dict__
+                    for ip, tr in list(self.ip_latency.items())[:10]
+                    for snap in [tr.snapshot()]
+                }
+        except Exception:
+            latency = {
+                ip: snap.__dict__
+                for ip, tr in list(self.ip_latency.items())[:10]
+                for snap in [tr.snapshot()]
+            }
         return {
             "station": self.station,
             "manager": mgr_status,
@@ -276,8 +302,19 @@ class StationSupervisor:
 
 def build_supervisors(managers: list[Any]) -> list[StationSupervisor]:
     """Construit les superviseurs alignés 1:1 avec la registry de managers."""
+    # [audit-2026-10-24] seuils unifiés : lit circuit_breaker_threshold (défaut 3)
+    # + recovery (défaut 300→cooldown 60s historique conservé si absent) depuis
+    # ip_rotation — fini les 3 breakers aux seuils divergents non documentés.
+    # Priorité : Engine latence > pool bad_ttl > manager breaker > superviseur local.
+    _thr, _cool = 3, 60.0
+    try:
+        from config.settings import IP_ROTATION as _IR
+        _thr = max(1, int((_IR or {}).get("circuit_breaker_threshold", 3)))
+        _cool = float((_IR or {}).get("station_bad_ttl_s", 60.0))
+    except Exception:
+        pass
     supervisors = [
-        StationSupervisor(station=m._station, manager=m)
+        StationSupervisor(station=m._station, manager=m, breaker_threshold=_thr, breaker_cooldown_sec=_cool)
         for m in sorted(managers, key=lambda m: m._station)
     ]
     return supervisors

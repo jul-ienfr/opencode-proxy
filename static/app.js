@@ -3482,7 +3482,14 @@ document.addEventListener('DOMContentLoaded', () => {
         ipEl.textContent = data.current_ip || '—';
         if (identityEl) {
             const ident = data.vpn && data.vpn.current_identity;
-            identityEl.textContent = ident ? `${ident.impersonate} #${data.vpn.identity_index}` : '—';
+            // [audit-2026-10-24] affiche wire Bun (vault) + navigateur geo.
+            const wire = data.wire_identity || (data.stations && data.stations[0] && data.stations[0].wire_identity);
+            if (wire && wire.version) {
+                identityEl.textContent = `${wire.version}/${wire.client} + ${ident ? ident.impersonate : '—'} #${data.vpn.identity_index}`;
+                identityEl.title = `wire Bun ${wire.version}/${wire.client} (IP) + navigateur geo ${ident ? ident.impersonate : '—'}`;
+            } else {
+                identityEl.textContent = ident ? `${ident.impersonate} #${data.vpn.identity_index}` : '—';
+            }
         }
         serverEl.textContent = data.current_server || '—';
         requestsEl.textContent = `${data.requests_this_ip || 0} / ${data.quota_per_ip || 300}`;

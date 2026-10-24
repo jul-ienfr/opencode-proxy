@@ -743,6 +743,20 @@ _current_free_attempt: contextvars.ContextVar[dict | None] = contextvars.Context
     "_current_free_attempt", default=None
 )
 
+# [V8.1] Refus amont d'un modèle free, porté jusqu'au logging d'usage.
+#
+# Le problème mesuré le 2026-10-22 : quand l'amont refuse un modèle
+# (`api_usage_error / Invalid request`), le proxy répond **200** au client avec
+# une trame `event: error`. Le logging d'usage enregistrait donc `status=200`
+# et `/api/free-health` comptait `jev-1.13-free` comme « servi » alors qu'il
+# échouait à chaque appel. Une trame d'erreur dans un flux 200 n'est pas un
+# succès ; ce ContextVar permet au statut réel d'atteindre la métrique sans
+# changer la sémantique HTTP visible par le client.
+# Valeur : (modèle free refusé, statut amont).
+_current_free_refusal: contextvars.ContextVar[tuple | None] = contextvars.ContextVar(
+    "_current_free_refusal", default=None
+)
+
 # Geo direct → VPN fallback context (IP+pays direct, allowed, via flag)
 # Set by _enforce_geo_gate per request, read by _save_request / _geo_headers / tray.
 _current_geo: contextvars.ContextVar[dict | None] = contextvars.ContextVar("_current_geo", default=None)
@@ -1215,6 +1229,38 @@ def _log_free_model_usage(
             except Exception:
                 client_ip = ""
         timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        # [V8.3] Latence et statut par jambe et par modele. Branché ici parce que
+        # c'est le SEUL point de passage qui reçoit à la fois le modèle, le statut
+        # et la durée de l'appel free — instrumenter chaque appelant aurait
+        # dupliqué la logique quatre fois et laissé des trous. Fail-soft : une
+        # métrique ne doit jamais faire échouer une requête.
+        try:
+            _metrics_mod.observe_leg_call(
+                _lat_rings,
+                _FB_METRICS_LOCK,
+                "free",
+                free_model,
+                float(duration_ms or 0),
+                status,
+                counters=_MISC_COUNTERS,
+            )
+            # [V8.1] « Observé » n'est pas « observé avec succès » : un modèle qui
+            # échoue à chaque appel est très observable, et pourtant mort. Sans ce
+            # statut, le détecteur de dérive prenait `jev-1.13-free` (refusé en
+            # amont à chaque appel) pour un modèle servi, donc pour un simple
+            # retard du snapshot.
+            _statut_reel = status
+            try:
+                _refus = _current_free_refusal.get()
+                if _refus and len(_refus) == 2 and _refus[0] == free_model:
+                    _statut_reel = _refus[1]
+            except Exception:
+                pass
+            _metrics_mod.mark_leg_status(
+                _metrics_mod.leg_latency_key("free", free_model), _statut_reel
+            )
+        except Exception:
+            pass
         row = (
             timestamp,
             paid_model,
@@ -1595,8 +1641,9 @@ def _curl_timeout() -> tuple:
     return (10, read)
 
 
-async def _get_pooled_curl_session(proxy_url: str | None, impersonate: str, fp_override: dict | None = None):
-    """Emprunte une session du pool pour (proxy, face réseau).
+async def _get_pooled_curl_session(proxy_url: str | None, impersonate: str, fp_override: dict | None = None,
+                                   egress_ip: str | None = None):
+    """Emprunte une session du pool pour (proxy, face réseau, IP).
 
     Retourne (pool, slot) : l'appelant POSTe via ``slot.sess`` SANS tenir de
     verrou pendant le transfert, puis ``await pool.checkin(slot)`` (succès)
@@ -1605,11 +1652,16 @@ async def _get_pooled_curl_session(proxy_url: str | None, impersonate: str, fp_o
 
     ``fp_override`` (chemin free = face Bun officielle) remplace le preset
     navigateur : ``{"ja3": ..., "extra_fp": ..., "http_version": ...}``.
-    La clé de pool devient alors ``<proxy>|bun`` (UNE seule face stable,
-    comme le vrai client) au lieu de ``<proxy>|<preset>``.
+    La clé de pool devient alors ``<proxy>|<ip>|bun`` (UNE face stable PAR
+    IP, comme une installation distincte — jamais de session TLS partagée
+    entre deux IPs) au lieu de ``<proxy>|<preset>``. ``egress_ip=None``
+    (sondes, tests) retombe sur l'ancienne clé ``<proxy>|bun``.
     """
     if fp_override:
-        key = f"{proxy_url or ''}|bun"
+        if egress_ip:
+            key = f"{proxy_url or ''}|{egress_ip}|bun"
+        else:
+            key = f"{proxy_url or ''}|bun"
     else:
         key = f"{proxy_url or ''}|{impersonate}"
     # [E2 perf] dict.get mono-thread — pas de lock global ; seul l'état du
@@ -1739,6 +1791,20 @@ from upstream.clients import (  # noqa: E402
 from upstream.retry import compute_retry_delay as _compute_retry_delay  # noqa: E402
 from upstream.retry import parse_retry_after as _parse_retry_after  # noqa: E402
 from upstream.retry import resolve_max_retries as _resolve_max_retries  # noqa: E402
+from upstream.retry import RETRYABLE_STATUSES  # noqa: E402
+# [V6.3.1] Classification des échecs free (gate / quota / transit / auth / model).
+from upstream.free_failures import classify_free_failure as _classify_free_failure  # noqa: E402
+from upstream.free_failures import free_failure_stats  # noqa: E402
+from upstream.free_failures import note_free_failure as _note_free_failure  # noqa: E402
+# [V6.1.2] Quel facteur de la porte a refusé (egress / identity / body).
+from config.free_gate import diagnose as _free_gate_diagnose  # noqa: E402
+from upstream.free_failures import gate_factor_stats  # noqa: E402
+from upstream.free_failures import note_gate_factors as _note_gate_factors  # noqa: E402
+# [V6.3.2] Imputer une panne à une station — et seulement quand c'est elle.
+from upstream.station_faults import attributable_fault as _station_attributable_fault  # noqa: E402
+from upstream.station_faults import cooldown_seconds as _station_cooldown_seconds  # noqa: E402
+from upstream.station_faults import note_station_fault as _note_station_fault  # noqa: E402
+from upstream.station_faults import station_fault_stats  # noqa: E402
 
 _role_store = _RoleClientStore()
 _role_clients: "dict[str, tuple[httpx.AsyncClient, str | None]]" = _role_store.clients
@@ -2402,10 +2468,20 @@ async def lifespan(app):
     shared_state.vpn_manager_2 = _managers[1] if n >= 2 else None
     shared_state.free_ip_pool = FreeIPPool(_managers[0], _managers[1] if n >= 2 else None)
     shared_state.free_ip_pool.set_stations(_managers)
+    # [audit-2026-10-24 Phase0] branche le swap-and-close curl post-rotation
+    # (FreeIPPool._post_rotation_flush_cb, fail-soft — sans import cycle).
+    try:
+        shared_state.free_ip_pool._post_rotation_flush_cb = _flush_curl_pools_for_proxy  # type: ignore[attr-defined]
+    except Exception:
+        pass
     # [plan] E: boot-time fan-out of the ip_rotation timings (connect retry,
     # bad TTL, rotation stagger) — the pool's built-in defaults are the
     # conservative legacy values.
     shared_state.free_ip_pool.update_config(IP_ROTATION)
+    try:
+        shared_state.free_ip_pool.load_pool_state()
+    except Exception:
+        pass
     global _vpn_manager, _free_ip_pool
     _vpn_manager = _managers[0]
     _free_ip_pool = shared_state.free_ip_pool
@@ -2482,7 +2558,11 @@ async def lifespan(app):
                     _debug(f"  [lifespan] WARN boot station start raised: {_r!r}")
             # boot garde: 1/4 vs 4/4 visible même si 0 tunnel
             try:
-                _n_expected = resolved_station_count(IP_ROTATION) if IP_ROTATION.get("enabled") else len(_managers)  # noqa: F821
+                _n_expected = (
+                    _cfg_settings.resolved_station_count(IP_ROTATION)
+                    if IP_ROTATION.get("enabled")
+                    else len(_managers)
+                )
                 # [graceful-aurora] up = connected + degraded.
                 _connected = sum(
                     1
@@ -2847,8 +2927,21 @@ async def lifespan(app):
         app.state._free_discovery_task = asyncio.create_task(_free_discovery_loop())
         _debug("  [lifespan] free-discovery loop started")
 
+    # [V8.2] Canary : vérifie périodiquement que la jambe répond vraiment.
+    # Désactivable par `canary.enabled: false` (aucune sonde, aucun quota).
+    if yaml_get("canary", "enabled", True):
+        app.state._canary_loop_task = asyncio.create_task(_free_canary_loop())
+        _debug("  [lifespan] canary loop started")
+
     # Ultra-fast DB writer (single writer, batch 32)
-    global _db_writer_task
+    # [fix hot-restart] ``asyncio.Queue`` se lie à la boucle courante au
+    # premier get/put. Un hot-restart (ServerManager.restart) réutilise les
+    # globales du module avec une NOUVELLE boucle : l'ancienne queue restait
+    # liée à la boucle morte → « Queue is bound to a different event loop »
+    # en boucle (6 878 occurrences le 22/10) et écritures DB perdues. On
+    # recrée la queue à chaque lifespan, avant de relancer le writer.
+    global _db_queue, _db_writer_task
+    _db_queue = asyncio.Queue(maxsize=10000)
     _db_writer_task = asyncio.create_task(_db_writer_loop())
     _debug("  [lifespan] DB writer loop started (queue batch 32, 50ms)")
 
@@ -3226,6 +3319,62 @@ _traffic_capture.configure(enabled=False)
 app.add_middleware(TrafficCaptureMiddleware, capture=_traffic_capture)
 
 
+# ── [V5.1] Flux amont vide : ne jamais rendre un 200 ─────────────────────────
+#
+# Défaut mesuré en production : un amont qui répond 200 puis ne produit AUCUN
+# octet était rendu au client en **HTTP 200** avec un événement SSE `error`.
+# Le client croyait avoir une réponse.
+#
+# Le proxy fait déjà un peek, mais il attend les **en-têtes** : `__aenter__`
+# sous `_TTFBWatchdogTimeout`. Un 200 suivi d'un corps vide le franchit sans
+# difficulté.
+#
+# Ici, on n'essaie pas de lire plus loin (cela changerait le contrat des quatre
+# chemins de streaming). On exploite un fait déjà établi par les gardes :
+#  * tant qu'aucun octet n'a été produit par le générateur, Starlette n'a pas
+#    envoyé les en-têtes ;
+#  * donc le statut est ENCORE modifiable.
+# Lever cette exception dans ce cas produit un 502 propre au lieu d'un faux 200.
+# Si des octets étaient déjà partis, les gardes ne s'appliquent pas et le
+# comportement historique (événement `error`) est conservé : on ne coupe jamais
+# un flux qui a commencé à livrer.
+class EmptyUpstreamStream(RuntimeError):
+    """Flux amont terminé sans un seul octet exploitable (V5.1)."""
+
+    status_code = 502
+    client_message = "Upstream returned an empty stream (no content produced)"
+
+
+class UnsupportedModelFamily(RuntimeError):
+    """Famille de protocole nommée par le catalogue mais non convertie (V2.5).
+
+    Aujourd'hui `gemini` (10 modèles). Sans ce refus explicite, l'id retombait
+    sur l'endpoint chat en protocole `openai` : le client recevait une erreur
+    d'amont incompréhensible au lieu de la vraie cause. Un `501` qui nomme le
+    modèle et la famille est toujours plus utile qu'un échec ailleurs.
+    """
+
+    status_code = 501
+
+    def __init__(self, model: str, family: str):
+        self.model = model
+        self.family = family
+        self.client_message = (
+            f"Model {model!r} uses the {family!r} protocol, which this proxy does not convert. "
+            f"Use an OpenAI-family or Anthropic-family model instead."
+        )
+        super().__init__(self.client_message)
+
+
+def _can_fail_with_http_status(bytes_sent: bool) -> bool:
+    """Peut-on encore changer le statut HTTP ? (pur, testable)
+
+    Vrai seulement si **rien** n'a été envoyé au client : les en-têtes partent
+    avec le premier octet, donc avant cela le statut reste libre.
+    """
+    return not bytes_sent
+
+
 @app.exception_handler(Exception)
 async def debug_exception(request: Request, exc: Exception):
     tb = traceback.format_exc()
@@ -3238,9 +3387,14 @@ async def debug_exception(request: Request, exc: Exception):
         _p = str(request.url.path or "")
     except Exception:
         _p = ""
+    # [V5.1] Une exception porteuse d'un statut explicite (flux amont vide →
+    # 502) est respectée : un 200 obtenu en mentant vaut moins qu'un 502
+    # honnête. Le message est contrôlé par la classe, jamais par l'amont.
+    _status = int(getattr(exc, "status_code", 500) or 500)
+    _client_msg = str(getattr(exc, "client_message", "") or "Internal server error")
     if "/messages" in _p or _p.startswith("/anthropic"):
-        return _anthropic_error(500, "Internal server error")
-    return _openai_error(500, "Internal server error")
+        return _anthropic_error(_status, _client_msg)
+    return _openai_error(_status, _client_msg)
 
 
 # Server manager set later in __main__ for GUI mode; None means always-running
@@ -3578,6 +3732,22 @@ _CB_FAILURE_THRESHOLD = yaml_get("circuit_breaker", "failure_threshold", 5)  # t
 _CB_RECOVERY_TIMEOUT = float(yaml_get("circuit_breaker", "recovery_timeout", 60))  # seconds before half-open test
 
 
+def _cb_enabled() -> bool:
+    """Kill-switch opérateur : ``circuit_breaker.enabled: false`` = les
+    requêtes passent TOUJOURS (jamais de 503 breaker/global-429).
+
+    Demandé explicitement : pas de coupe-circuit, le proxy essaie à chaque
+    fois. Conséquence assumée : quand les tunnels sont morts, l'échec prend
+    le temps des timeouts au lieu d'un 503 immédiat — le breaker
+    n'annonçait que la panne, il ne la créait pas. Défaut True
+    (comportement historique) ; lu à chaque appel → hot-reload.
+    """
+    try:
+        return bool(yaml_get("circuit_breaker", "enabled", True))
+    except Exception:
+        return True
+
+
 def _cb_half_open_probe_enabled() -> bool:
     """[plan Lot 2] Sonde half-open unique (anti-thundering-herd).
 
@@ -3624,6 +3794,8 @@ def _get_cb(endpoint: str) -> _CircuitBreaker:
 
 def _cb_should_allow(endpoint: str) -> bool:
     """Check if the circuit breaker allows a request to this endpoint."""
+    if not _cb_enabled():
+        return True
     return _get_cb(endpoint).should_allow()
 
 
@@ -3677,12 +3849,38 @@ def _record_global_429() -> None:
 
 
 def _global_429_remaining() -> float:
+    if not _cb_enabled():
+        return 0.0
     return _g429.remaining()
 
 
 # Position d'enregistrement INCHANGÉE (middleware le plus externe) —
 # seule la classe déménage (upstream/breaker.py), l'état est injecté.
 app.add_middleware(Global429BackoffMiddleware, remaining_fn=_global_429_remaining)
+
+# [V5.1] Point d'étranglement unique : une réponse 200 dont le PREMIER contenu
+# est une trame d'erreur (ou rien du tout) devient un 5xx honnête. Enregistré en
+# DERNIER, donc le plus externe : il voit les octets de toutes les autres
+# couches. C'est ce qui remplace la chasse site par site — cinq émetteurs
+# d'erreur distincts existaient sur le seul chemin `/v1/messages`.
+from streaming.empty_guard import EmptyStreamGuardMiddleware  # noqa: E402
+
+app.add_middleware(
+    EmptyStreamGuardMiddleware,
+    on_empty=lambda reason: _note_empty_stream("?", f"choke:{reason}"),
+)
+
+# [V6.5.3] Plafond de durée TOTALE d'une requête — enregistré en dernier, donc
+# le plus externe : il borne tout ce qui précède, y compris le garde de flux.
+# `request_budget_s: 0` désactive explicitement ; 900 s ne coupe jamais du trafic
+# normal (mesuré : max 13,4 s sur la jambe free) et libère un client quand un
+# amont accepte la connexion puis se tait indéfiniment.
+from streaming.deadline import RequestDeadlineMiddleware  # noqa: E402
+
+app.add_middleware(
+    RequestDeadlineMiddleware,
+    budget_getter=lambda: yaml_get("timeouts", "request_budget_s", 900),
+)
 
 
 # ── HTTP helpers with circuit breaker ────────────────────────────
@@ -3692,6 +3890,7 @@ app.add_middleware(Global429BackoffMiddleware, remaining_fn=_global_429_remainin
 from core.errors import UpstreamError  # noqa: E402
 from core.errors import anthropic_error as _anthropic_error  # noqa: E402
 from core.errors import classify_upstream_error as _classify_upstream_error  # noqa: E402
+from core.errors import extract_upstream_error_type as _extract_upstream_error_type  # noqa: E402
 from core.errors import is_credit_exhaustion as _is_credit_exhaustion  # noqa: E402
 from core.errors import is_free_quota_failure as _is_free_quota_failure  # noqa: E402
 from core.errors import openai_error as _openai_error  # noqa: E402
@@ -4718,19 +4917,37 @@ def _free_request_headers(headers: dict) -> dict:
 # (et OPENCODE_CLIENT_NAME / OPENCODE_TLS_IMPERSONATE si besoin).
 _OPENCODE_OFFICIAL_UA = os.getenv(
     "OPENCODE_OFFICIAL_UA",
-    "opencode/1.18.31 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14",
+    "opencode/1.19.3 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14",
 )
 # UA de la jambe Responses — MESURÉ sur le vrai client 1.18.31 (même
 # opencode/Bun, mais ai-sdk provider-utils 4.0.40 : autre bundle ai-sdk pour
 # l'API Responses, vérifié sur le fil le 2026-10-15 : chat=4.0.23,
 # responses=4.0.40). Envoyer l'UA chat (4.0.23) sur /responses = combinaison
-# qui n'existe jamais dans la nature. NOTE 2026-10-15 : l'UA « 1.19.0 »
-# précédemment câblé ici est REJETÉ par la gateway (403 FreeTierError
-# vérifié live : même octets, 1.18.31 → 200, 1.19.0 → 403) — ne re-bumper
-# la version qu'après re-capture mitmproxy du nouveau binaire.
+# qui n'existe jamais dans la nature.
+# [ALIGNEMENT 2026-10-20] Ce couple 1.18.31/4.0.40 est CONSERVÉ : /responses
+# n'a pas été re-capturé sur le binaire 1.19.3. Ce n'est pas une dette de
+# parité : la mesure a établi que le NUMÉRO DE VERSION de l'UA n'est pas un
+# facteur de la porte (1.18.31 comme 1.19.3 → 200, mêmes en-têtes, même
+# corps). On ne « re-bumpe » donc un UA qu'après une capture, jamais à
+# l'aveugle. (La note 2026-10-15 « UA 1.19.0 REJETÉ par la gateway » n'a pas
+# été reproduite le 2026-10-20 : à conditions identiques, 1.19.3 passe. La
+# contrainte de version est donc considérée comme inexistante jusqu'à preuve
+# du contraire, et aucun test ne doit en dépendre.)
+# [CORRECTIF 2026-10-24 — mesure duo 1.18.31] La décision ci-dessus reposait
+# sur l'idée d'un wire unique : elle est dépassée. Le binaire 1.18.31 local,
+# capturé contre un serveur local (`_research/oc-1.19.3/capture-1.18.31.jsonl`),
+# n'émet JAMAIS `x-opencode-session-id` (duo affinity+id), alors que le proxy
+# émet le trio sur les deux endpoints. Avec l'UA 1.18.31 ci-dessous, la jambe
+# /responses globale exhibait donc un combo qui n'existe sur AUCUNE version
+# (1.18.31 = duo, 1.19.3 = trio — request.ts ne varie les headers que par
+# providerID, jamais par endpoint). Le défaut passe à 1.19.3/4.0.40 : la face
+# globale devient UNE installation 1.19.3 cohérente sur les deux endpoints
+# (même double-bundle 4.0.23/4.0.40 embarqué dans les deux binaires, vérifié
+# par scan statique). Kill-switch inchangé : OPENCODE_OFFICIAL_UA_RESPONSES
+# restaure n'importe quelle valeur sans redéploiement.
 _OPENCODE_OFFICIAL_UA_RESPONSES = os.getenv(
     "OPENCODE_OFFICIAL_UA_RESPONSES",
-    "opencode/1.18.31 ai-sdk/provider-utils/4.0.40 runtime/bun/1.3.14",
+    "opencode/1.19.3 ai-sdk/provider-utils/4.0.40 runtime/bun/1.3.14",
 )
 # Parité officielle v2 (`packages/core/src/app.ts:useragent`) :
 # `opencode/<channel>/<version>/<name>` — plus de `ai-sdk/provider-utils`,
@@ -4878,6 +5095,19 @@ _FREE_WIRE_FULL_HEADERS = os.getenv("OPENCODE_FREE_WIRE_FULL_HEADERS", "1") not 
 _OPENCODE_ACCEPT_ENCODING = os.getenv(
     "OPENCODE_ACCEPT_ENCODING", "gzip, deflate, br, zstd"
 )
+# ── [ALIGNEMENT 2026-10-20] Style du jeu d'en-têtes de la jambe free ─────────
+# Mesuré le 2026-10-20 en faisant parler le binaire officiel 1.19.3 à un
+# serveur de capture local (`_research/oc-1.19.3/capture.jsonl`) : le client
+# émet `x-opencode-session-id` + `x-session-affinity` + `x-session-id` et
+# N'ÉMET PAS le quartet `x-opencode-client/project/request/session`.
+# Vérifié dans la foulée sur la passerelle : ce jeu exact passe la porte
+# (200), tout comme l'ancien — donc le quartet n'est pas load-bearing et
+# l'alignement est sans risque. `legacy` restaure l'ancien wire à chaud,
+# sans redéploiement, si la passerelle change d'avis.
+_FREE_WIRE_STYLE = (
+    os.getenv("OPENCODE_FREE_WIRE_STYLE", "official").strip().lower() or "official"
+)
+
 # [ordre exact] Ordre des en-têtes sur le fil — MESURÉ au mitmproxy sur le
 # vrai client 1.18.31 natif le 2026-10-15 (`opencode run`, provider `opencode`,
 # POST https://opencode.ai/inference/v1/responses + /chat/completions) :
@@ -4980,42 +5210,16 @@ def _get_free_fp_kwargs() -> tuple[str, dict | None]:
 # Les shims ci-dessous portent donc des définitions plausibles calquées sur
 # les outils natifs (paraphrasées, pas de chemins machine) : un appel amont
 # vers un shim est re-mappé vers l'outil client comme avant (name_map).
-_FREE_SHIM_DEFS = {
-    "bash": {
-        "description": (
-            "Executes a shell command in the current working directory and "
-            "returns its output. Use the workdir parameter to run in another "
-            "directory, and timeout to bound long-running commands."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "command": {"type": "string", "description": "The command to execute"},
-                "workdir": {
-                    "type": "string",
-                    "description": "Working directory (defaults to the current directory)",
-                },
-                "timeout": {"type": "integer", "description": "Timeout in milliseconds"},
-            },
-            "required": ["command"],
-        },
-    },
-    "read": {
-        "description": (
-            "Reads a file from the filesystem and returns its contents. "
-            "Use offset and limit to page through large files."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "filePath": {"type": "string", "description": "Absolute path of the file to read"},
-                "offset": {"type": "integer", "description": "First line to read (1-indexed)"},
-                "limit": {"type": "integer", "description": "Maximum lines to return"},
-            },
-            "required": ["filePath"],
-        },
-    },
-}
+# [V6.2.1] Registre déclaratif : les définitions vivent dans
+# `config.yaml > free.shims`, avec un champ `necessity` explicite. La mesure a
+# établi qu'il ne s'agit pas d'« outils utiles » mais du minimum qui satisfait
+# la grille : `read` est nécessaire, `bash` seul ne suffit pas. Le repli reste
+# dans le code (`config/free_shims.py: DEFAULT_SHIMS`), donc un config.yaml
+# amputé ne casse jamais la porte.
+from config.free_shims import shims as _free_shims_registry  # noqa: E402
+
+_FREE_SHIM_DEFS = _free_shims_registry()
+
 
 
 def _free_shim_tool(name: str, responses: bool) -> dict:
@@ -5044,7 +5248,7 @@ def _free_shim_tool(name: str, responses: bool) -> dict:
     }
 
 
-def _free_wire_body(body, force_stream: bool = False):
+def _free_wire_body(body, force_stream: bool = False, egress_ip: str | None = None):
     """Copie d'envoi jambe free : grille tools + stream (±prompt_cache_key).
 
     Ne mute JAMAIS l'entrée (copie défensive quand un patch est requis —
@@ -5084,7 +5288,14 @@ def _free_wire_body(body, force_stream: bool = False):
             have = {t.get("name") for t in tools if isinstance(t, dict)}
     else:
         have = set()
-    missing = [n for n in ("bash", "read") if n not in have]
+    # [V6.2.2] Mesuré le 2026-10-21 contre la passerelle (4 corps, même modèle,
+    # même tunnel) : sans outil -> 403 ; `read` seul -> 200 ; `bash` seul -> 403 ;
+    # `read` + `bash` -> 200. `bash` n'ajoute donc RIEN de nécessaire : il ne
+    # remplace pas `read` et ne change pas le verdict en sa présence. On ne
+    # l'injecte plus — moins d'octets, même passage, un shim de moins à
+    # maintenir. Le registre peut le réintroduire par configuration si une
+    # mesure future le réhabilite.
+    missing = [n for n in ("read",) if n not in have]
     need_stream = force_stream and body.get("stream") is not True
     need_key = is_resp and not body.get("prompt_cache_key")
     # Le client pose « auto » dès qu'il y a des tools (242/242 mesures) — y
@@ -5119,7 +5330,7 @@ def _free_wire_body(body, force_stream: bool = False):
             # un chaînage `conversation` ; repli global sinon).
             _conv = body.get("conversation") if isinstance(body, dict) else None
             wire["prompt_cache_key"] = (
-                _conversation_session_id(_conv) if isinstance(_conv, str) and _conv else _free_session_id()
+                _conversation_session_id(_conv, egress_ip) if isinstance(_conv, str) and _conv else _free_session_id(egress_ip)
             )
         except Exception:
             pass
@@ -5129,6 +5340,23 @@ def _free_wire_body(body, force_stream: bool = False):
         forced = True
     if need_order:
         wire = _reorder_client_body(wire)
+    # ── [ALIGNEMENT 2026-10-20] DeepSeek « thinking mode » ──────────────────
+    # L'amont exige que CHAQUE message assistant porte `reasoning_content`,
+    # même vide : sans lui, 400 « The `reasoning_content` in the thinking mode
+    # must be passed back to the API » (reproduit en production le 2026-10-20,
+    # corps de 359 Ko, 24 outils). Le proxy sait faire ce remplissage
+    # (`mapping.ensure_deepseek_reasoning`, port de `transform.ts`) mais ne
+    # l'appliquait PAS au corps de la jambe free : la règle existait d'un côté
+    # de la conversion et pas de l'autre.
+    # Invariant préservé : si le client a fourni un `reasoning_content` non
+    # vide, il voyage TEL QUEL (vérifié : `_free_wire_body` ne touche pas aux
+    # messages au-delà de cette règle).
+    try:
+        from app.protocol.mapping import ensure_deepseek_reasoning as _ensure_ds_reasoning
+
+        _ensure_ds_reasoning(wire.get("messages"), str(wire.get("model") or ""))
+    except Exception:
+        pass  # jamais bloquant : un corps sans défaut vaut mieux qu'un 500 local
     return wire, forced
 
 
@@ -5288,7 +5516,51 @@ def _mint_oc_id(prefix: str, direction: str = "descending", ts_ms: int | None = 
     return f"{prefix}_{n48.to_bytes(6, 'big').hex()}" + _oc_random_base62(14)
 
 
-def _free_session_id() -> str:
+def _per_ip_identity_enabled() -> bool:
+    """Kill-switch : `PER_IP_IDENTITY=0` ou `ip_rotation.per_ip_identity:false`
+    restaure les singletons globaux (comportement pré-vault)."""
+    try:
+        if os.getenv("PER_IP_IDENTITY", "1").strip() in ("0", "false", "False", ""):
+            return False
+    except Exception:
+        pass
+    try:
+        v = yaml_get("ip_rotation", "per_ip_identity", True)
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, str) and v.strip().lower() in ("0", "false", "no"):
+            return False
+    except Exception:
+        pass
+    return True
+
+
+def _ip_vault():
+    """Singleton du vault d'identités par IP (import paresseux : free.identities
+    ne dépend pas d'opencode, aucun cycle). Configuré À L'APPEL depuis les
+    réglages live (projet de base, forçages env)."""
+    try:
+        from free.identities import get_vault as _get_vault
+    except ImportError:
+        return None
+    try:
+        base = ""
+        try:
+            base = str(_OPENCODE_PROJECT or "")
+        except Exception:
+            base = ""
+        forced_client = str(os.getenv("OPENCODE_CLIENT_NAME", "") or "").strip()
+        forced_ver = str(os.getenv("OPENCODE_CLIENT_VERSION", "") or "").strip()
+        return _get_vault(base_project=base, forced_client=forced_client, forced_version=forced_ver)
+    except Exception:
+        try:
+            from free.identities import get_vault as _get_vault2
+            return _get_vault2()
+        except Exception:
+            return None
+
+
+def _free_session_id(egress_ip: str | None = None) -> str:
     """Session free ``ses_`` stable, tournée toutes les 30 min.
 
     Même rôle que ``_proxy_session_id`` (sticky routing amont) mais au
@@ -5296,7 +5568,18 @@ def _free_session_id() -> str:
     pour survivre au reboot ; régénérée si âgée de plus de
     ``_FREE_SESSION_ROTATE_S`` (le proxy tourne 24/7, une session
     éternelle risquerait de sortir de la fenêtre de fraîcheur).
+
+    ``egress_ip`` renseigné → identité de CETTE IP (vault : 1 IP = 1
+    installation, rotation propre à l'IP). Sinon singleton global
+    historique (sondes discovery, tests, repli).
     """
+    if egress_ip and _per_ip_identity_enabled():
+        try:
+            _v = _ip_vault()
+            if _v is not None:
+                return _v.session_for(egress_ip, None)
+        except Exception:
+            pass
     global _FREE_SESSION_CACHE, _FREE_SESSION_TS
     now = time.time()
     if _FREE_SESSION_CACHE and (now - _FREE_SESSION_TS) < _FREE_SESSION_ROTATE_S:
@@ -5327,13 +5610,25 @@ def _free_session_id() -> str:
     return sid
 
 
-def _free_request_msg_id() -> str:
+def _free_request_msg_id(egress_ip: str | None = None) -> str:
     """``msg_`` du message logique en cours — mint paresseux par tâche.
 
     Sémantique client (request.ts) : ``x-opencode-request`` = l'ID du message
     utilisateur, donc STABLE sur tous les envois d'un même message (retries,
     hedges, stations). L'ancien code re-mintait un ID par essai.
+
+    ``egress_ip`` renseigné (jambe free via vault) → `msg_` FRAIS par ENVOI
+    egress : deux IPs n'émettent jamais le même `msg_` (anti-corrélation).
+    Le gate ne vérifie que le format, jamais la stabilité — le format reste
+    `id.ts`-exact. Sans IP : comportement historique stable-par-tâche.
     """
+    if egress_ip and _per_ip_identity_enabled():
+        try:
+            _v = _ip_vault()
+            if _v is not None:
+                return _v.new_msg(egress_ip)
+        except Exception:
+            pass
     mid = _free_msg_id.get()
     if not mid:
         mid = _mint_oc_id("msg", "ascending")
@@ -5345,7 +5640,7 @@ _CONVERSATION_SESSIONS: OrderedDict = OrderedDict()
 _CONVERSATION_SESSIONS_MAX = 512
 
 
-def _conversation_session_id(key: str | None) -> str:
+def _conversation_session_id(key: str | None, egress_ip: str | None = None) -> str:
     """``ses_`` stable PAR CONVERSATION (parité request.ts : sessionID stable par
     conversation, sticky routing + réutilisation du prefix-cache côté Zen).
 
@@ -5353,9 +5648,19 @@ def _conversation_session_id(key: str | None) -> str:
     client en porte un. Sans clé (cas Claude Code / chat : aucun ID de
     conversation dans le protocole), repli sur la session globale tournante
     ``_free_session_id()`` — comportement inchangé. LRU bornée 512, fail-soft.
+
+    ``egress_ip`` renseigné → session scopée à CETTE IP (vault : deux IPs ne
+    partagent jamais un `ses_`, même sur la même conversation proxy).
     """
+    if egress_ip and _per_ip_identity_enabled():
+        try:
+            _v = _ip_vault()
+            if _v is not None:
+                return _v.session_for(egress_ip, key)
+        except Exception:
+            pass
     if not key or not isinstance(key, str):
-        return _free_session_id()
+        return _free_session_id(egress_ip if egress_ip and _per_ip_identity_enabled() else None)
     try:
         sid = _CONVERSATION_SESSIONS.get(key)
         if sid:
@@ -5386,8 +5691,15 @@ def _body_conversation_key(body) -> str | None:
     return None
 
 
-def _official_free_headers(endpoint: str = "", conversation_key: str | None = None) -> dict:
+def _official_free_headers(endpoint: str = "", conversation_key: str | None = None,
+                             egress_ip: str | None = None) -> dict:
     """Jeu de headers officiel complet pour UN envoi jambe free.
+
+    `egress_ip` renseigné (chemin nominal via vault) → identité COMPLÈTE de
+    CETTE IP : UA versionnée par IP (pool 1.18.31/1.19.3 mesuré), client
+    cli/desktop par IP, project dérivé par IP, `ses_` par (IP, conversation),
+    `msg_` frais par envoi. Deux IPs n'émettent jamais le même identifiant.
+    Sans IP (sondes discovery, tests) → singletons historiques.
 
     Copie du wire Bun MESURÉ au mitmproxy sur le vrai client natif 1.18.31
     (2026-10-15, `opencode run`, provider `opencode`,
@@ -5433,25 +5745,106 @@ def _official_free_headers(endpoint: str = "", conversation_key: str | None = No
     Limite structurelle : libcurl émet TOUJOURS ``Connection`` en dernier ;
     l'ordre du client (Connection en 8e) est inatteignable via curl_cffi.
     Vérifié : hors Connection, l'ordre obtenu est IDENTIQUE à celui du client.
+
+    [per-IP vault] Quand `egress_ip` est fourni et le vault actif, les 4
+    identifiants (UA version, client, project, ses_/msg_) viennent de
+    l'identité de CETTE IP — jamais des singletons globaux.
     """
-    ua = _OPENCODE_OFFICIAL_UA_RESPONSES if "/responses" in (endpoint or "") else _OPENCODE_OFFICIAL_UA
+    _per_ip = bool(egress_ip) and _per_ip_identity_enabled()
+    _vault_ident = None
+    if _per_ip:
+        try:
+            _vlt = _ip_vault()
+            if _vlt is not None:
+                _vault_ident = _vlt.get(egress_ip or "direct")
+                ua = _vault_ident.ua(endpoint or "")
+            else:
+                ua = _OPENCODE_OFFICIAL_UA_RESPONSES if "/responses" in (endpoint or "") else _OPENCODE_OFFICIAL_UA
+        except Exception:
+            _vault_ident = None
+            ua = _OPENCODE_OFFICIAL_UA_RESPONSES if "/responses" in (endpoint or "") else _OPENCODE_OFFICIAL_UA
+    else:
+        ua = _OPENCODE_OFFICIAL_UA_RESPONSES if "/responses" in (endpoint or "") else _OPENCODE_OFFICIAL_UA
+    # [per-IP coherent wire] Le style suit la VERSION de l'installation de
+    # cette IP : 1.18.31 n'émet QUE le quartet (client/project/request/
+    # session) et jamais `x-opencode-session-id` ; 1.19.3 n'émet QUE le trio.
+    # Un combo 1.18.31+trio (ou 1.19.3+quartet) n'existe sur AUCUNE version
+    # réelle — c'était le défaut : toutes les IP partageaient le wire
+    # « official » amputé du quartet, donc le provider ne voyait aucune
+    # installation distincte. Hors chemin per-IP (sondes/tests) le réglage
+    # global `_FREE_WIRE_STYLE` reste souverain.
+    _wire_style = _FREE_WIRE_STYLE
+    if _per_ip and _vault_ident is not None:
+        try:
+            _wire_style = "legacy" if str(_vault_ident.version) == "1.18.31" else "official"
+        except Exception:
+            _wire_style = _FREE_WIRE_STYLE
     try:
-        _conv_session = _conversation_session_id(conversation_key)
+        if _per_ip and _vault_ident is not None:
+            _conv_session = _vault_ident.session_for(conversation_key)
+        else:
+            _conv_session = _conversation_session_id(conversation_key)
     except Exception:
-        _conv_session = _free_session_id()
-    out = {
-        "Authorization": "Bearer public",
-        "Content-Type": "application/json",
-        "User-Agent": ua,
-        "x-opencode-client": _OPENCODE_CLIENT_NAME,
-        "x-opencode-project": _OPENCODE_PROJECT,
-        "x-opencode-request": _free_request_msg_id(),
-        "x-opencode-session": _conv_session,
-        # PAS de `x-opencode-session-id` : le natif 1.18.31 ne l'envoie jamais
-        # (vérifié mitmproxy 2026-10-15). Note `x-opencode-client` : le natif
-        # `opencode run` envoie `desktop`, mais `cli` obtient aussi des 200
-        # sur inference/v1 (vérifié live) — on garde `cli` par défaut.
-    }
+        _conv_session = _free_session_id(egress_ip if _per_ip else None)
+    if _wire_style == "legacy":
+        # Wire 1.18.x — conservé pour rollback à chaud.
+        if _per_ip and _vault_ident is not None:
+            try:
+                _msg = _vault_ident.new_msg()
+            except Exception:
+                _msg = _free_request_msg_id()
+            out = {
+                "Authorization": "Bearer public",
+                "Content-Type": "application/json",
+                "User-Agent": ua,
+                "x-opencode-client": _vault_ident.client,
+                "x-opencode-project": _vault_ident.project,
+                "x-opencode-request": _msg,
+                "x-opencode-session": _conv_session,
+            }
+        else:
+            out = {
+                "Authorization": "Bearer public",
+                "Content-Type": "application/json",
+                "User-Agent": ua,
+                "x-opencode-client": _OPENCODE_CLIENT_NAME,
+                "x-opencode-project": _OPENCODE_PROJECT,
+                "x-opencode-request": _free_request_msg_id(),
+                "x-opencode-session": _conv_session,
+            }
+    else:
+        # Wire officiel versionné par instance (vault) :
+        # * identité 1.19.3 → trio MESURÉ (`_research/oc-1.19.3/capture.jsonl`),
+        # * identité 1.18.31 → duo MESURÉ (capture locale 2026-10-24 : le 1.18.31
+        #   n'émet JAMAIS `x-opencode-session-id`).
+        # UA et jeu de headers viennent TOUJOURS de la même version : un combo
+        # 1.18.31+trio (ou 1.19.3+duo) n'existe jamais dans la nature.
+        # Sans IP (sondes, tests) : trio global historique inchangé.
+        out = {
+            "Authorization": "Bearer public",
+            "Content-Type": "application/json",
+            "User-Agent": ua,
+        }
+        if _per_ip and _vault_ident is not None:
+            try:
+                for _k, _v in _vault_ident.session_header_items(_conv_session):
+                    out[_k] = _v
+            except Exception:
+                out.update(
+                    {
+                        "x-opencode-session-id": _conv_session,
+                        "x-session-affinity": _conv_session,
+                        "x-session-id": _conv_session,
+                    }
+                )
+        else:
+            out.update(
+                {
+                    "x-opencode-session-id": _conv_session,
+                    "x-session-affinity": _conv_session,
+                    "x-session-id": _conv_session,
+                }
+            )
     if _FREE_WIRE_FULL_HEADERS:
         # Ordre du client 1.18.31 natif : Connection 8e, Accept 9e, Host 10e, AE 11e.
         # (libcurl replacera Connection en dernier — cf. docstring.)
@@ -5467,6 +5860,243 @@ def _official_free_headers(endpoint: str = "", conversation_key: str | None = No
             out["Host"] = _host
             out["Accept-Encoding"] = _OPENCODE_ACCEPT_ENCODING
     return out
+
+
+# ── [PLAN_STRATEGIE_FREE_MODELS Lot A] Sonde active de servabilité — GATE ────
+#
+# Mécanique pure : config/discovery.py (probe_cfg / shaping / verdict /
+# probe_free_models). Cette gate runtime est DI-ifiée dans
+# ``_cfg_settings._FREE_PROBE_GATE`` (G4 : poussée par l'hôte, jamais importée
+# de l'autre sens) et appelée au boot + chaque cycle par
+# ``_ensure_free_models_sync`` (rendu via asyncio.to_thread → jamais dans le
+# chemin requête client).
+
+def _probe_ms_iso() -> str:
+    import datetime as _dt
+
+    return _dt.datetime.now(_dt.UTC).isoformat()
+
+
+def _free_probe_dispatch(url: str, headers: dict, payload: bytes) -> tuple:
+    """POST ping — même egress que le fetch /models (``PROXY``) : la sonde
+    reste sur l'identité IP stable de la découverte (jamais le pool d'IP
+    rotatives — la sonde ne doit pas brûler les quotas (modèle, IP) du pool).
+
+    httpx primaire, repli curl subprocess (miroir du pattern fetch).
+    ``(None, "")`` = transport error → verdict ``unknown`` par le classifieur.
+    """
+    try:
+        timeout = float(
+            (yaml_get("free_discovery", "probe", {}) or {}).get("timeout", 8.0) or 8.0
+        )
+    except Exception:
+        timeout = 8.0
+    if timeout < 2.0:
+        timeout = 2.0
+    try:
+        import httpx as _httpx
+
+        with _httpx.Client(timeout=timeout, proxy=(_cfg_settings.PROXY or None)) as _c:
+            _r = _c.post(url, content=payload, headers=headers)
+            return _r.status_code, (_r.text or "")[:400]
+    except ImportError:
+        pass
+    except Exception:
+        return None, ""
+    # Repli curl (POST) — aucun httpx disponible.
+    import subprocess as _subprocess
+
+    try:
+        import config.discovery as _disc_curl
+
+        _flags = getattr(_disc_curl, "_CREATE_NO_WINDOW", 0)
+    except Exception:
+        _flags = 0
+    try:
+        _cmd = [
+            "curl",
+            "-s",
+            "--max-time",
+            str(int(timeout) + 2),
+            "-X",
+            "POST",
+            url,
+            "-w",
+            "\n\nFreeProbeStatus:%{http_code}",
+        ]
+        for _k, _v in (headers or {}).items():
+            _cmd += ["-H", f"{_k}: {_v}"]
+        _cmd += ["--data-binary", payload.decode("utf-8", "replace")]
+        _r = _subprocess.run(
+            _cmd, capture_output=True, text=True, timeout=timeout + 5, creationflags=_flags
+        )
+        out = _r.stdout or ""
+        body, _, code = out.rpartition("FreeProbeStatus:")
+        try:
+            return int(code.strip() or 0) or None, (body or out)[:400]
+        except ValueError:
+            return None, (out or _r.stderr or "")[:400]
+    except Exception:
+        return None, ""
+
+
+def _free_probe_recently_ok(model_ids: list, seconds: float) -> set:
+    """Succès ``status=200`` récent par id (usage DB, globales lues À L'APPEL
+    — pattern wrapper oc._conn). Fail-soft : erreur SQL → set() vide."""
+    if seconds <= 0 or not model_ids:
+        return set()
+    try:
+        import datetime as _dt
+
+        _since = (
+            _dt.datetime.now(_dt.UTC) - _dt.timedelta(seconds=float(seconds))
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        _conn_probe = globals().get("_conn")
+        _lock_probe = globals().get("_db_commit_lock")
+        if _conn_probe is None:
+            return set()
+        out: set = set()
+        ids = [str(m) for m in model_ids if m]
+        with _lock_probe or threading.Lock():
+            for i in range(0, len(ids), 50):
+                _chunk = ids[i : i + 50]
+                _q = ",".join("?" * len(_chunk))
+                _rows = _conn_probe.execute(
+                    "SELECT DISTINCT free_model FROM free_model_usage "
+                    f"WHERE status = 200 AND timestamp >= ? AND free_model IN ({_q})",
+                    [_since, *_chunk],
+                ).fetchall()
+                out.update(str(r[0]) for r in _rows)
+        return out
+    except Exception:
+        return set()
+
+
+_PROBE_RESULTS_LIMIT = 300  # bornage mémoire de l'état results (observability)
+
+
+def _free_probe_gate(announced: set, known: set, api_base_free: str) -> tuple:
+    """Verdict live AVANT promotion (voir doc config/settings._FREE_PROBE_GATE).
+
+    Entrée : ``announced`` = ids free détectés par la cascade ce cycle,
+    ``known`` = FREE_MODELS avant apply. Sortie : ``(accepted, probe_state)``.
+    Deux rôles :
+      1. PROMOTION bornée — un id NOUVEAU n'entre dans le pool que si la
+         sonde dit ``alive`` / ``limited`` (quota) / ``not_probeable`` (jev)
+         ou qu'il a un usage DB 200 récent ;
+      2. MÉMOIRE verdict — ``dead``/``not_free``/``unknown`` tracés,
+         ``dead`` gelé ``dead_ttl_s`` (re-sonde ultérieure, jamais définitif),
+         ``unknown`` re-sondé après ``recheck_interval_s``.
+    Toute erreur → ``(None, None)`` : comportement historique announce-only.
+    """
+    try:
+        import config.discovery as _disc
+
+        cfg = _disc.probe_cfg(yaml_get("free_discovery", "probe", {}) or {})
+        if not cfg["enabled"]:
+            return None, None
+        _go_only = set(getattr(_cfg_settings, "GO_ONLY_IDS", None) or ())
+        _purged = set(getattr(_cfg_settings, "PURGED_IDS", None) or ())
+        announced = {
+            m for m in (announced or ()) if isinstance(m, str) and m
+        }
+        known = {m for m in (known or ()) if isinstance(m, str) and m}
+        fresh = sorted((announced - known) - _go_only - _purged)
+        _st_pstate = dict(_cfg_settings._FREE_DISCOVERY_STATE.get("probe") or {})
+        results = dict(_st_pstate.get("results") or {})
+        now = time.time()
+        # Re-sonde des ``unknown`` périmés (borné au budget global)
+        rechecks = [
+            m
+            for m in _disc.probe_recheck_plan(results, cfg, now)
+            if m in announced and m not in _go_only and m not in _purged
+        ]
+        # Mémoire dead : ré-annoncé avant dead_ttl_s → suspendu sans sonde
+        dead_frozen = {
+            m
+            for m, r in results.items()
+            if isinstance(r, dict)
+            and r.get("verdict") == "dead"
+            and (now - float(r.get("checked_epoch") or 0.0)) < cfg["dead_ttl_s"]
+        }
+        budget = [m for m in fresh if m not in dead_frozen]
+        _rem = cfg["max_ids"] - len(budget)
+        if _rem > 0:
+            # Dédupe ordre-stable : fresh d'abord, rechecks PAS déjà budgetés
+            _in_budget = set(budget)
+            budget += [
+                m for m in rechecks if m not in dead_frozen and m not in _in_budget
+            ][:_rem]
+        budget = budget[: cfg["max_ids"]]
+        # Skips par usage DB récent (le trafic réel est un meilleur signal)
+        try:
+            _recently_ok = _free_probe_recently_ok(budget, cfg["skip_recent_ok_s"])
+        except Exception:
+            _recently_ok = set()
+        to_probe = [m for m in budget if m not in _recently_ok]
+        probe_results = _disc.probe_free_models(
+            to_probe,
+            api_base_free=api_base_free,
+            headers_fn=_official_free_headers,
+            dispatch_fn=_free_probe_dispatch,
+            cfg=cfg,
+            log=None,
+        )
+        for m in _recently_ok:
+            probe_results[m] = {
+                "verdict": "alive",
+                "status": None,
+                "reason": f"usage DB status=200 récent (≤{int(cfg['skip_recent_ok_s'])}s)",
+                "checked_at": _probe_ms_iso(),
+                "checked_epoch": now,
+                "source": "traffic",
+            }
+        accepted = set(announced & known) | {
+            m
+            for m, r in probe_results.items()
+            if r.get("verdict") in ("alive", "limited", "not_probeable")
+        }
+        results.update(probe_results)
+        if len(results) > _PROBE_RESULTS_LIMIT:
+            keep = sorted(
+                results.items(),
+                key=lambda kv: float((kv[1] or {}).get("checked_epoch") or 0.0),
+                reverse=True,
+            )[:_PROBE_RESULTS_LIMIT]
+            results = dict(keep)
+        summary: dict = {}
+        for r in results.values():
+            v = (r or {}).get("verdict", "?")
+            summary[v] = summary.get(v, 0) + 1
+        state = {
+            "enabled": True,
+            "timeout": cfg["timeout"],
+            "concurrency": cfg["concurrency"],
+            "max_ids": cfg["max_ids"],
+            "dead_ttl_s": cfg["dead_ttl_s"],
+            "recheck_interval_s": cfg["recheck_interval_s"],
+            "run_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
+            "candidates_new": fresh,
+            "probed": to_probe,
+            "skipped_recent_ok": sorted(_recently_ok),
+            "dead_frozen": sorted(dead_frozen & announced),
+            "summary": summary,
+            "results": results,
+        }
+        return accepted, state
+    except Exception as e:
+        try:
+            _debug(f"  [free-probe] gate FAILED: {type(e).__name__}: {e}")
+        except Exception:
+            pass
+        return None, None
+
+
+# DI G4 : l'hôte settings lit ``._FREE_PROBE_GATE`` à l'appel (jamais l'inverse).
+try:
+    _cfg_settings._FREE_PROBE_GATE = _free_probe_gate
+except Exception:
+    pass
 
 
 _PAID_SESSION_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "_paid_session_id")
@@ -5579,6 +6209,16 @@ def _is_connect_error(e: Exception) -> bool:
     on HTTP responses — 429/5xx are not exceptions on this path
     (raise_for_status is False).
     """
+    if _curl_err is None:
+        # Le module curl_cffi est lazy (jamais importé sur le chemin
+        # import → listen) : déclencher l'import ici au lieu de répondre
+        # False par défaut — sinon la classification dépend de l'historique
+        # d'appels (vrai en prod où _ensure a toujours tourné avant, faux
+        # en appel direct). Fail-soft : absent → False comme avant.
+        try:
+            _ensure_curl_cffi()
+        except Exception:
+            pass
     if _curl_err is None or not isinstance(e, _curl_err.RequestsError):
         return False
     try:
@@ -5647,12 +6287,25 @@ async def _do_free_request_curl_cffi(
     # navigateur (cf. _free_fp_override). UA choisie par endpoint (le client
     # envoie provider-utils/4.0.40 sur /responses, 4.0.23 sur /chat).
     # Session par conversation quand le corps porte un chaînage (parité request.ts).
-    req_headers = _official_free_headers(endpoint or "", _body_conversation_key(body))
+    # [per-IP vault] L'egress de CETTE tentative (station.current_ip) pilote
+    # TOUTE l'identité : headers + wire + pool TLS. Deux stations = deux
+    # installations distinctes, jamais le même ses_/msg_/UA.
+    try:
+        _egress_ip = (getattr(station, "current_ip", "") or "") if station is not None else ""
+    except Exception:
+        _egress_ip = ""
+    if not _egress_ip:
+        try:
+            _egress_ip = str((vpn.current_ip if (vpn := (station or _vpn_manager)) and getattr(vpn, "current_ip", "") else "") or "")
+        except Exception:
+            _egress_ip = ""
+    _egress_ip = (_egress_ip or "").strip() or None
+    req_headers = _official_free_headers(endpoint or "", _body_conversation_key(body), _egress_ip)
     _free_impersonate, _free_fp = _get_free_fp_kwargs()
     # [gate body 2026-09-18] grille tools (bash+read) + stream forcé : un corps
     # non-stream ou sans tools serait 403. Si stream forcé ici, le SSE est
     # collecté plus bas et reconstitué en JSON (contrat non-stream inchangé).
-    wire_body, _force_wire_stream = _free_wire_body(body, force_stream=True)
+    wire_body, _force_wire_stream = _free_wire_body(body, force_stream=True, egress_ip=_egress_ip)
 
     # Pooled session — [A1 perf] checkout/checkin SANS verrou pendant le
     # transfert : le POST non-streaming ne sérialise plus la station.
@@ -5675,7 +6328,8 @@ async def _do_free_request_curl_cffi(
     last_exc: Exception | None = None
     for attempt_i, attempt_proxy in enumerate(proxies_to_try):
         is_last = attempt_i == len(proxies_to_try) - 1
-        pool, slot = await _get_pooled_curl_session(attempt_proxy, _free_impersonate, _free_fp)
+        pool, slot = await _get_pooled_curl_session(attempt_proxy, _free_impersonate, _free_fp,
+                                                     egress_ip=_egress_ip)
         if endpoint:
             _ep = endpoint
         else:
@@ -5746,6 +6400,35 @@ async def _do_free_request_curl_cffi(
                 except Exception:
                     pass
             await pool.checkin(slot)
+            # [fix 2026-10-24] Refus upstream en JSON brut (429/400/5xx) :
+            # le collecteur SSE ne comprend que les trames `data:` — sans ce
+            # court-circuit, une 429 devenait "empty SSE collection" (502) et
+            # le vrai statut (quota → cooldown + rotation) était enterré.
+            # Miroir de _do_free_direct_request (même fichier ci-dessous).
+            try:
+                _fcode = int(getattr(resp, "status_code", 0) or 0)
+            except Exception:
+                _fcode = 0
+            if _fcode != 200:
+                try:
+                    _etext = "\n".join(
+                        ln.decode("utf-8", "replace")
+                        if isinstance(ln, (bytes, bytearray))
+                        else str(ln)
+                        for ln in (_forced_lines or [])
+                    )
+                except Exception:
+                    _etext = ""
+                _err_wrapped = _CurlCffiResponse.__new__(_CurlCffiResponse)
+                _err_wrapped._resp = resp
+                _err_wrapped.status_code = _fcode
+                try:
+                    _err_wrapped.headers = dict(resp.headers)
+                except Exception:
+                    _err_wrapped.headers = {}
+                _err_wrapped.text = _etext
+                _err_wrapped.content = _etext.encode("utf-8", "replace")
+                return _err_wrapped
             if "/responses" in _ep:
                 _forced_data = _collect_responses_object(_forced_lines, wire_body.get("model", ""))
             else:
@@ -6595,8 +7278,13 @@ async def _hedged_fetch(cands, body: dict, headers: dict, endpoint: str, forced_
             try:
                 ip = getattr(winner_station, "current_ip", None) or getattr(winner_station, "pid", "") or ""
                 prof = _current_free_identity(winner_station)
+                try:
+                    _w_inst = _ip_vault().snapshot(ip) if (_per_ip_identity_enabled() and ip) else {}
+                except Exception:
+                    _w_inst = {}
                 _current_free_attempt.set(
-                    {"ip": ip, "identity": prof.get("impersonate") or "", "station": winner_station}
+                    {"ip": ip, "identity": prof.get("impersonate") or "", "station": winner_station,
+                     "instance": _w_inst}
                 )
             except Exception:
                 pass
@@ -6841,7 +7529,8 @@ def effective_free_max_attempts(forced_pool=None) -> int:
     Auto mode (``auto_max_free_attempts`` true, default): derived from the
     number of *usable* egresses — ``len(_socks5_enabled_eps())`` in socks5
     mode, else ``resolved_station_count`` filtered by ``forced_pool`` when
-    present (geo). Clamped to [1, 5]; direct is never counted.
+    present (geo). Clamped to [1, 10] (architectural max, NordVPN account
+    limit); direct is never counted.
 
     Manual mode (auto false): respects ``max_free_attempts`` clamped to
     [1, 5] + WARN if it exceeds the usable count (operator asked for more
@@ -6853,6 +7542,13 @@ def effective_free_max_attempts(forced_pool=None) -> int:
             v = int(IP_ROTATION.get("max_free_attempts", 2) or 2)
         except (TypeError, ValueError):
             v = 2
+        # [2026-10-24] plafond auto 10 = max architectural
+        # (resolved_station_count 1-10, limite compte NordVPN) : à 6 stations,
+        # un budget auto de 5 laissait systématiquement une station inessayée
+        # par requête alors que les échecs sont dominés par les quotas PAR IP
+        # — une station fraîche a une forte proba de sauvetage.
+        # Le plafond MANUEL reste à 5 (garde-fou mirror GUI, test blessed
+        # test_hot_reload_in_place_mutation) : seul l'auto suit l'infra.
         manual = max(1, min(v, 5))
         # WARN when manual exceeds usable (only when we can compute usable)
         try:
@@ -6900,10 +7596,10 @@ def effective_free_max_attempts(forced_pool=None) -> int:
                 # if pool has no stations yet (boot), keep resolved count
                 if cnt == 0 and n == 0:
                     n = _cfg_settings.resolved_station_count(IP_ROTATION)
-        return max(1, min(int(n or 1), 5))
+        return max(1, min(int(n or 1), 10))
     except Exception:
         try:
-            return max(1, min(int(_cfg_settings.resolved_station_count(IP_ROTATION) or 1), 5))
+            return max(1, min(int(_cfg_settings.resolved_station_count(IP_ROTATION) or 1), 10))
         except Exception:
             return 2
 
@@ -7026,11 +7722,28 @@ async def _open_free_stream(
             except TypeError:
                 proxy_url, station = await _free_ip_pool.on_request()
         elif fresh_station:
-            _prev = _current_free_attempt.get() or {}
+            _prev = dict(_current_free_attempt.get() or {})
+            # [fix quota-vs-breaker] A previous 429 quota is marked in the
+            # ContextVar by _free_429_stream_decision. Tell the pool so this
+            # retry does NOT feed the correlated timeout breaker (a per-IP
+            # daily quota is not a tunnel/upstream failure) while still
+            # rotating the exhausted station and picking another one.
+            # The marker is consumed once: if this retry fails for another
+            # reason, the next attempt must not inherit the quota label.
+            _rate_limited = bool(_prev.pop("rate_limited", False))
+            if _rate_limited:
+                _current_free_attempt.set(_prev)
             try:
-                proxy_url, station = await _free_ip_pool.on_disconnect_retry(_prev.get("station"), forced_pool)
+                proxy_url, station = await _free_ip_pool.on_disconnect_retry(
+                    _prev.get("station"), forced_pool, rate_limited=_rate_limited
+                )
             except TypeError:
-                proxy_url, station = await _free_ip_pool.on_disconnect_retry(_prev.get("station"))
+                try:
+                    proxy_url, station = await _free_ip_pool.on_disconnect_retry(
+                        _prev.get("station"), forced_pool
+                    )
+                except TypeError:
+                    proxy_url, station = await _free_ip_pool.on_disconnect_retry(_prev.get("station"))
         else:
             # Retry after a network error: re-use the SAME station/proxy as
             # the original attempt. Reading the fresh ``proxy_url`` property
@@ -7061,22 +7774,38 @@ async def _open_free_stream(
             try:
                 station = station or (_free_ip_pool.active_station if proxy_url else None)
                 profile = _current_free_identity(station)
+                _egress_ip_s = ""
+                try:
+                    _egress_ip_s = str(_free_usage_ip(station) or "")
+                except Exception:
+                    _egress_ip_s = ""
+                _inst_snap = {}
+                try:
+                    _vv = _ip_vault()
+                    if _vv is not None and _per_ip_identity_enabled() and _egress_ip_s:
+                        _inst_snap = _vv.snapshot(_egress_ip_s)
+                except Exception:
+                    _inst_snap = {}
                 _current_free_attempt.set(
                     {
                         "ip": _free_usage_ip(station),
                         "identity": profile.get("impersonate") or "",
+                        "identity_browser": profile.get("impersonate") or "",
+                        "wire_version": (_inst_snap or {}).get("version"),
+                        "wire_client": (_inst_snap or {}).get("client"),
                         "station": station,
                         "proxy_url": proxy_url,
+                        "instance": _inst_snap,
                     }
                 )
                 # [gate 2026-09-17 + copie exacte 2026-09-18] Identité
-                # officielle (msg_ stable par message via _free_request_msg_id,
-                # face Bun rejouée, UA par endpoint) — même sur les ré-essais.
+                # officielle par IP (vault : UA versionnée + ses_/msg_ isolés),
+                # face Bun rejouée, UA par endpoint — même sur les ré-essais.
                 # Session par conversation quand le corps porte un chaînage.
-                req_headers = _official_free_headers(endpoint or "", _body_conversation_key(body))
+                req_headers = _official_free_headers(endpoint or "", _body_conversation_key(body), _egress_ip_s or None)
                 _free_impersonate, _free_fp = _get_free_fp_kwargs()
                 # [gate body 2026-09-18] grille tools sur le corps stream.
-                wire_body, _ = _free_wire_body(body, force_stream=True)
+                wire_body, _ = _free_wire_body(body, force_stream=True, egress_ip=_egress_ip_s or None)
                 # [P1.1 perf] timeout posé AU NIVEAU DE LA FACTORY
                 # de session poolée (_curl_timeout : connect 10 + read config
                 # upstream.timeout.read) : le POST ci-dessous n'a plus besoin
@@ -7086,7 +7815,8 @@ async def _open_free_stream(
                 # mort est détecté par le watchdog cancel_streams AVANT le
                 # read (filet ultime > idle SSE).
                 _debug(f"  [free-stream] creating curl_cffi session proxy={_curl_proxy_url(proxy_url)} (pooled)")
-                pool2, slot2 = await _get_pooled_curl_session(proxy_url, _free_impersonate, _free_fp)
+                pool2, slot2 = await _get_pooled_curl_session(proxy_url, _free_impersonate, _free_fp,
+                                                               egress_ip=_egress_ip_s or None)
                 # [A1 perf] emprunt SANS verrou pendant le POST : seuls les
                 # headers transitent sous l'emprunt, le corps est consommé
                 # après restitution — sémantique inchangée, parallélisme OK.
@@ -7198,20 +7928,33 @@ async def _open_free_stream(
         # it in the ContextVar before the accident): a disconnect retry must
         # switch AWAY from it on_disconnect_retry, not re-strike the same IP.
         _prev_attempt = _current_free_attempt.get() or {}
+        try:
+            _direct_ip = str(_free_usage_ip() or "")
+        except Exception:
+            _direct_ip = ""
+        _direct_inst = {}
+        try:
+            _vv2 = _ip_vault()
+            if _vv2 is not None and _per_ip_identity_enabled() and _direct_ip:
+                _direct_inst = _vv2.snapshot(_direct_ip)
+        except Exception:
+            _direct_inst = {}
         _current_free_attempt.set(
             {
                 "ip": _free_usage_ip(),
                 "identity": profile.get("impersonate") or "",
                 "station": _prev_attempt.get("station"),
                 "proxy_url": None,
+                "instance": _direct_inst,
             }
         )
         # [gate 2026-09-17 + copie exacte 2026-09-18] Identité officielle
         # (direct fallback httpx aussi — même face, sans TLS custom).
         # [gate body 2026-09-18] grille tools sur le corps stream.
         # Session par conversation quand le corps porte un chaînage.
-        free_headers = _official_free_headers(endpoint or "", _body_conversation_key(body))
-        wire_body, _ = _free_wire_body(body, force_stream=True)
+        # [per-IP vault] identité de l'IP résidentielle, pas le singleton.
+        free_headers = _official_free_headers(endpoint or "", _body_conversation_key(body), _direct_ip or None)
+        wire_body, _ = _free_wire_body(body, force_stream=True, egress_ip=_direct_ip or None)
         async with _ensure_http_client().stream(
             "POST", endpoint, content=_serialize_json_body(wire_body), headers=free_headers
         ) as resp:
@@ -7583,32 +8326,38 @@ def _free_cooldown_key(free_model: str, station=None) -> str:
     return f"{free_model}|{ip}"
 
 
-def _free_429_cooldown_seconds(retry_after: str = "") -> float:
+def _free_429_cooldown_seconds(retry_after: str = "", body=None) -> float:
     """Duration (seconds) to cooldown a free model after a 429.
 
-    Accepts a seconds count ("120") or an RFC 9110 HTTP-date
-    ("Wed, 21 Oct 2015 07:28:00 GMT") ([7]). Anything unparseable or out
-    of (0, 86400] → _FREE_429_DEFAULT (120 s). An absent retry-after means
-    we don't know the reset time — [incident 17/08] the OLD 3600 s default
-    made one 429 block ALL free attempts for an hour (an hour of paid); the
-    short default is safe because the key is (model, IP): the background
-    rotation gives a fresh IP/key well within 120 s.
+    Precedence : en-tête Retry-After (secondes ou HTTP-date) → durées
+    humaines du CORPS (« retry in 3hr 12min », « resets in 2 days » —
+    repli quand l'en-tête est absent, cas réel du 429 trial sans header)
+    → défaut 120 s. Tout ce qui est inparseable ou hors (0, 86400] →
+    défaut (l'ancien contrat est inchangé quand `body` est absent).
     """
-    if not retry_after:
-        return _FREE_429_DEFAULT
-    v = 0.0
-    try:
-        v = float(retry_after)
-    except (TypeError, ValueError):
+    if retry_after:
+        v = 0.0
         try:
-            parsed = email.utils.parsedate_to_datetime(retry_after)
-            if parsed.tzinfo is None:
-                parsed = parsed.replace(tzinfo=datetime.UTC)  # HTTP-date is GMT
-            v = (parsed - datetime.datetime.now(datetime.UTC)).total_seconds()
-        except (TypeError, ValueError, OverflowError):
-            return _FREE_429_DEFAULT
-    if 0 < v <= _FREE_COOLDOWN_MAX:
-        return v
+            v = float(retry_after)
+        except (TypeError, ValueError):
+            try:
+                parsed = email.utils.parsedate_to_datetime(retry_after)
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=datetime.UTC)  # HTTP-date is GMT
+                v = (parsed - datetime.datetime.now(datetime.UTC)).total_seconds()
+            except (TypeError, ValueError, OverflowError):
+                v = 0.0
+        if 0 < v <= _FREE_COOLDOWN_MAX:
+            return v
+    if body:
+        try:
+            from core.errors import parse_body_retry_seconds as _parse_body_retry
+
+            _bv = _parse_body_retry(body)
+            if _bv is not None:
+                return _bv
+        except Exception:
+            pass
     return _FREE_429_DEFAULT
 
 
@@ -7632,12 +8381,205 @@ def _free_candidates_for(paid_model: str) -> list:
     return []
 
 
+def _free_candidate_chain(paid_model: str, base: str) -> list:
+    """Chaîne ordonnée de frees à essayer pour `paid_model` (strict_free).
+
+    `[base/spread-pick, ...autres candidats, ...repli global même endpoint]`
+    dédupliquée. Le repli global évite le refus quand le bucket primaire est
+    trial-mort mais un autre bucket free est vivant (cas mesuré : big-pickle
+    429 pendant que jev-1.13-free répond 200 — buckets indépendants par modèle).
+    Endpoint-aware : chat/responses/systemone ne se mélangent jamais
+    (systemone = autre protocole, jamais substituable au chat).
+    Pur sauf lecture config (fail-soft : `[base]`).
+    """
+    try:
+        cands = _free_candidates_for(paid_model) or []
+        if not cands:
+            cands = _free_candidates_for(base) or []
+        chain: list = []
+        for m in ([base] + list(cands)):
+            try:
+                ms = str(m or "").strip()
+            except Exception:
+                continue
+            if ms and ms not in chain:
+                chain.append(ms)
+        # Repli global même endpoint (ne jamais mélanger chat/systemone).
+        try:
+            _ep = ""
+            try:
+                _ep = str(_cfg_settings._free_endpoint_for(base) or "")
+            except Exception:
+                _ep = ""
+            _is_sys = "systemone" in (_ep or "")
+            _is_resp = ("/responses" in (_ep or "")) or ("muse" in str(base).lower()) or ("spark" in str(base).lower())
+            if _is_sys:
+                _fb = ["jev-1.13-free"]
+            elif _is_resp:
+                _fb = ["muse-spark-1.3-contributor-free", "muse-spark-1.2-contributor-free"]
+            else:
+                # [2026-10-24] modèles VIVANTS uniquement (vérifié amont) :
+                # - mimo-v2.5-free = 410 ModelDeprecated (remplacement officiel
+                #   mimo-v2.6-flash-free) — mappé dans free_model_map, jamais ici ;
+                # - deepseek-v4-flash-free = 0 succès mesuré (mort) ;
+                # - space-bunny-free = 400 Model is unavailable (inexistant).
+                _fb = [
+                    "deepseek-v4.1-flash-free",
+                    "mimo-v2.6-flash-free",
+                    "glm-5.3-flash-free",
+                ]
+            for m in _fb:
+                if m not in chain:
+                    # N'ajouter que des frees connus (évite un id fantôme).
+                    try:
+                        if m in (FREE_MODEL_MAP or {}).values() or _is_free_model_route(m):
+                            chain.append(m)
+                    except Exception:
+                        chain.append(m)
+        except Exception:
+            pass
+        return chain or [base]
+    except Exception:
+        try:
+            return [base]
+        except Exception:
+            return []
+
+
+def _free_min_retry_after(models) -> str:
+    """Plus petit `Retry-After` restant parmi les cooldowns de `models`.
+
+    Sert le refus fast-fail strict_free : au lieu de marteler un bucket
+    trial-mort (chaque 429 re-arme 6 h et repousse la récupération à l'infini),
+    on refuse sans appel amont avec le vrai délai restant. Fail-soft : "".
+    """
+    try:
+        import time as _t
+
+        now = _t.monotonic()
+        best = None
+        with _free_cooldown_lock:
+            for m in (models or []):
+                try:
+                    pool = _free_ip_pool
+                    stations = list(getattr(pool, "_stations", None) or []) if pool else []
+                except Exception:
+                    stations = []
+                keys = []
+                try:
+                    for st in stations:
+                        try:
+                            keys.append(_free_cooldown_key(m, st))
+                        except Exception:
+                            continue
+                    if not keys:
+                        keys.append(_free_cooldown_key(m, None))
+                except Exception:
+                    continue
+                for k in keys:
+                    try:
+                        exp = float(_free_model_cooldowns.get(k, 0.0) or 0.0)
+                    except Exception:
+                        continue
+                    if exp > now:
+                        rem = exp - now
+                        if best is None or rem < best:
+                            best = rem
+        if best is None:
+            return ""
+        try:
+            return str(max(1, int(best)))
+        except Exception:
+            return ""
+    except Exception:
+        return ""
+
+
+async def _wait_for_fresh_free(models, timeout_s: float = 45.0, poll_s: float = 3.0, sleep_fn=None) -> bool:
+    """[strict_free no-block] Attendre une IP fraîche au lieu de refuser.
+
+    Quand tous les buckets (modèle, IP) sont trial-morts : demander des
+    rotations (no-op si gel AUTH/événement amont — pilotage interne) puis
+    attendre (borné) qu'une clé fraîche apparaisse — rotation aboutie
+    (IP neuve = bucket neuf) ou expiry d'un cooldown court. Rend True dès
+    qu'un modèle de la chaîne redevient servable ; False si rien ne bouge
+    (le refus honnête reste alors la seule option — strict_free sans
+    jambe paid, l'amont dit non partout).
+    """
+    _sleep = sleep_fn or asyncio.sleep
+    try:
+        pool = _free_ip_pool
+        stations = list(getattr(pool, "_stations", None) or []) if pool else []
+    except Exception:
+        pool, stations = None, []
+    # Nudge ciblé : seules les stations mortes pour cette chaîne (les
+    # saines gardent leur bonne IP — une rotation leur ferait perdre un
+    # bucket vivant + coûterait un AUTH NordVPN pour rien).
+    if pool is not None and stations:
+        for st in stations:
+            _dead_here = False
+            try:
+                for m in (models or []):
+                    try:
+                        if _free_trial_dead_active(m, st):
+                            _dead_here = True
+                            break
+                    except Exception:
+                        continue
+                if not _dead_here:
+                    try:
+                        if not pool._station_usable(st, exclude_approaching=False):
+                            _dead_here = True
+                    except Exception:
+                        pass
+            except Exception:
+                _dead_here = False
+            if _dead_here:
+                try:
+                    pool._launch_rotation(st)
+                except Exception:
+                    pass
+    try:
+        import time as _t
+
+        deadline = _t.monotonic() + max(1.0, float(timeout_s or 45.0))
+    except Exception:
+        return False
+    while True:
+        try:
+            for m in (models or []):
+                try:
+                    if not _free_stations_exhausted(m):
+                        return True
+                except Exception:
+                    return True
+        except Exception:
+            pass
+        try:
+            remaining = deadline - _t.monotonic()
+        except Exception:
+            return False
+        if remaining <= 0:
+            break
+        try:
+            await _sleep(min(float(poll_s or 3.0), remaining))
+        except Exception:
+            break
+    return False
+
+
 def _resolve_free_model(paid_model: str):
     """Résout le modèle free cible pour `paid_model` (O1 : effet prouvé).
 
     Défaut (`free_model_spread` faux/absent) : `FREE_MODEL_MAP` historique.
     Spread actif + ≥ 2 candidats : round-robin par requête — 2 requêtes
     consécutives ne touchent pas le même modèle upstream.
+
+    [strict_free 2026-10-24] Trial-dead aware : si le pick (base ou spread)
+    est épuisé sur toutes les stations (`_free_stations_exhausted`) mais un
+    autre candidat de la chaîne (`_free_candidate_chain`) est vivant, on
+    bascule dessus au resolve — toutes les jambes (non-stream + 4 streams)
+    en profitent sans changer leur boucle. Fail-soft : repli historique.
     """
     base = FREE_MODEL_MAP.get(paid_model)
     if not base:
@@ -7647,20 +8589,49 @@ def _resolve_free_model(paid_model: str):
         # machinerie payante alors qu'ils n'exigent aucune clé (d'où des
         # ``FreeTierError`` « free tier can only be used from within OpenCode »).
         if _is_free_model_route(paid_model):
-            return paid_model
-        return None
+            base = paid_model
+        else:
+            return None
     try:
         spread = bool((IP_ROTATION or {}).get("free_model_spread", False))
     except Exception:
         spread = False
     if not spread:
-        return base
-    cands = _free_candidates_for(paid_model)
-    if len(cands) < 2:
-        return base
-    idx = _free_model_rr.get(paid_model, 0) % len(cands)
-    _free_model_rr[paid_model] = idx + 1
-    return cands[idx]
+        pick = base
+    else:
+        cands = _free_candidates_for(paid_model)
+        if len(cands) < 2:
+            # Repli : candidats indexés par le free lui-même (cas big-pickle).
+            cands = _free_candidates_for(base)
+        if len(cands) < 2:
+            pick = base
+        else:
+            idx = _free_model_rr.get(paid_model, 0) % len(cands)
+            _free_model_rr[paid_model] = idx + 1
+            pick = cands[idx]
+    # Bascule trial-mort : ne pas envoyer sur un bucket cliniquement mort
+    # quand un frère est vivant. Guard boot (pool sans stations) : on garde
+    # le pick historique pour ne pas casser les tests/boot.
+    try:
+        pool = _free_ip_pool
+        has_stations = bool(pool is not None and list(getattr(pool, "_stations", None) or []))
+    except Exception:
+        has_stations = False
+    if has_stations:
+        try:
+            if _free_stations_exhausted(pick):
+                for alt in _free_candidate_chain(paid_model, pick):
+                    if alt == pick:
+                        continue
+                    try:
+                        if not _free_stations_exhausted(alt):
+                            _debug(f"  [free] failover resolve {pick!r} (trial-mort) → {alt!r} pour {paid_model!r}")
+                            return alt
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+    return pick
 
 
 def _note_free_429(model: str) -> None:
@@ -7669,6 +8640,45 @@ def _note_free_429(model: str) -> None:
         _free_429_by_model[model] = int(_free_429_by_model.get(model, 0)) + 1
     except Exception:
         pass
+
+
+# ── [ALIGNEMENT 2026-10-20] Incidents « flux amont vide » ────────────────────
+#
+# Un amont qui répond 200 puis ne produit AUCUN octet est renvoyé aujourd'hui
+# au client en HTTP 200 accompagné d'un événement SSE `error` (V5.1, ouvert).
+# Le corriger demande de déplacer la décision du 200 après un peek de contenu,
+# ce qui touche les quatre chemins de streaming : trop risqué sans amont
+# factice. En attendant, l'incident doit au moins être **mesurable** — sans
+# compteur, on ne sait ni sa fréquence, ni les modèles touchés, ni s'il se
+# concentre sur une station. C'est la donnée qui décidera de la priorité.
+_EMPTY_STREAM_INCIDENTS: dict = {}
+_EMPTY_STREAM_MAX_KEYS = 200
+
+
+def _note_empty_stream(model: str, leg: str = "paid") -> None:
+    """Incrémente le compteur d'incidents « aucun octet amont », fail-soft.
+
+    Clé = ``leg|model``. Deux dimensions seulement, et c'est délibéré : ce sont
+    les deux qui sont **toujours connues** au point d'émission. Y ajouter la
+    station supposerait de la lire à cet endroit précis (contexte de tâche,
+    pool, égress) et risquerait d'inventer une valeur — un compteur faux est
+    pire qu'un compteur grossier.
+    """
+    try:
+        key = f"{str(leg or '?')}|{str(model or '?')}"
+        if key not in _EMPTY_STREAM_INCIDENTS and len(_EMPTY_STREAM_INCIDENTS) >= _EMPTY_STREAM_MAX_KEYS:
+            return  # borne dure : on préfère perdre une clé rare à une fuite
+        _EMPTY_STREAM_INCIDENTS[key] = int(_EMPTY_STREAM_INCIDENTS.get(key, 0)) + 1
+    except Exception:
+        pass
+
+
+def empty_stream_stats() -> dict:
+    """Vue triée des incidents « flux amont vide » (pour /health)."""
+    try:
+        return dict(sorted(_EMPTY_STREAM_INCIDENTS.items(), key=lambda kv: -kv[1]))
+    except Exception:
+        return {}
 
 
 def _sweep_free_cooldowns() -> int:
@@ -7694,10 +8704,11 @@ def _sweep_free_cooldowns_locked(now: float | None = None) -> int:
     expired = [k for k, t in _free_model_cooldowns.items() if t <= now]
     for k in expired:
         del _free_model_cooldowns[k]
+        _free_cooldown_scope.pop(k, None)
     return len(expired)
 
 
-def _set_free_cooldown(free_model: str, seconds: float, station=None) -> None:
+def _set_free_cooldown(free_model: str, seconds: float, station=None, scope: str = "") -> None:
     key = _free_cooldown_key(free_model, station)
     expiry = time.monotonic() + seconds
     with _free_cooldown_lock:
@@ -7706,7 +8717,14 @@ def _set_free_cooldown(free_model: str, seconds: float, station=None) -> None:
         if len(_free_model_cooldowns) > 32:
             _sweep_free_cooldowns_locked()
         _free_model_cooldowns[key] = expiry
-    _log(f"  FREE COOLDOWN: {key} for {seconds:.0f}s")
+        if scope:
+            _free_cooldown_scope[key] = scope
+        else:
+            # Une décision fraîche sans scope remplace l'ancien : un scope
+            # trial-mort ne doit jamais survivre au cooldown qui l'a posé
+            # (clé réutilisée après rotation tardive, cascade sentinelle…).
+            _free_cooldown_scope.pop(key, None)
+    _log(f"  FREE COOLDOWN: {key} for {seconds:.0f}s" + (f" scope={scope}" if scope else ""))
 
 
 def _free_cooldown_active(free_model: str, station=None) -> bool:
@@ -7717,7 +8735,86 @@ def _free_cooldown_active(free_model: str, station=None) -> bool:
             return True
         if expiry > 0:
             del _free_model_cooldowns[key]
+            _free_cooldown_scope.pop(key, None)
     return False
+
+
+# Scope du 429 ayant posé chaque cooldown : "trial-exhausted" (bucket trial
+# per-IP cliniquement mort — aucun reset annoncé, cf. FreeUsageLimitError
+# mesuré en prod), "rate-limited", "transient" ou "" (inconnu/historique).
+# Même verrou que les cooldowns, purgé avec eux (sweep + lazy-delete).
+_free_cooldown_scope: dict[str, str] = {}
+
+
+def _trial_dead_cooldown_seconds() -> float:
+    """Durée du cooldown trial-mort (bucket per-IP épuisé, sans reset).
+
+    `ip_rotation.trial_dead_cooldown_s`, défaut 21600 s (6 h), clamp
+    [0, 86400]. 0 = désactivé (repli : cooldowns courts historiques).
+    Hot-reloadé à chaque lecture (pas de redémarrage).
+    """
+    try:
+        v = float(yaml_get("ip_rotation", "trial_dead_cooldown_s", 21600.0))
+    except (TypeError, ValueError):
+        return 21600.0
+    if v <= 0:
+        return 0.0
+    return max(60.0, min(v, 86400.0))
+
+
+def _free_trial_dead_active(free_model: str, station=None) -> bool:
+    """Vrai si la clé (modèle, IP) est en cooldown trial-mort.
+
+    Fail-soft : toute erreur → False (comportement historique : la clé
+    est (re)frappée, jamais de fail-closed inventé ici).
+    """
+    try:
+        key = _free_cooldown_key(free_model, station)
+    except Exception:
+        return False
+    try:
+        with _free_cooldown_lock:
+            if _free_cooldown_scope.get(key) != "trial-exhausted":
+                return False
+            expiry = _free_model_cooldowns.get(key, 0.0)
+            if expiry > 0 and time.monotonic() < expiry:
+                return True
+            if expiry > 0:
+                del _free_model_cooldowns[key]
+            _free_cooldown_scope.pop(key, None)
+    except Exception:
+        return False
+    return False
+
+
+def _trial_dead_stations(free_model: str) -> set:
+    """Stations/endpoints dont la clé (modèle, IP courante) est trial-morte.
+
+    Sert à SAUTER ces egress en premier (pas à les bannir : en repli,
+    quand rien d'autre ne sert, on les retente — early-recovery amont
+    toujours possible). Ensemble vide = comportement historique exact.
+    Couvre les stations docker ET les endpoints SOCKS5 statiques (objets
+    vivants de la pool, jamais de copies — l'identité objet compte pour
+    les `excluded` des picks).
+    """
+    try:
+        pool = _free_ip_pool
+        stations = list(getattr(pool, "_stations", None) or [])
+        if getattr(pool, "socks5_mode", False):
+            try:
+                stations += list(pool._socks5_enabled_eps() or [])
+            except Exception:
+                pass
+    except Exception:
+        return set()
+    dead = set()
+    for st in stations:
+        try:
+            if st is not None and _free_trial_dead_active(free_model, st):
+                dead.add(st)
+        except Exception:
+            continue
+    return dead
 
 
 def _free_attempt_station():
@@ -7827,6 +8924,21 @@ def _mark_free_stations_429(
     # False pour un 429 transitoire → on saute la rotation (cf. FreeIPPool).
     # ``body=None`` (EOF, appelants sans corps) → True (comportement historique).
     quota_flag = True if body is None else _is_free_quota_failure(429, body)
+    # [trial-dead 2026-10-24] Scope du 429 (core.errors.free_quota_scope) :
+    # un `FreeUsageLimitError` (trial per-IP épuisé, MESURÉ en prod, sans
+    # reset annoncé) ne reviendra pas dans 120 s — marteler la clé toutes
+    # les 2 min coûte une RTT amont complète par requête pour rien et
+    # ressemble à du hammering. Cooldown LONG (trial_dead_cooldown_s,
+    # défaut 6 h), rotation inchangée (IP fraîche = bucket frais).
+    # Un Retry-After explicite gagne toujours (consigne amont directe).
+    _scope = ""
+    try:
+        if body:
+            from core.errors import free_quota_scope as _fq_scope
+
+            _scope = _fq_scope(429, body) or ""
+    except Exception:
+        _scope = ""
     if stations is None:
         stations = [_free_attempt_station()]
     seen = set()
@@ -7837,15 +8949,48 @@ def _mark_free_stations_429(
         _action_429 = _cfg_settings.get_429_action()
         # Surcharge transitoire : cooldown court (30 s) au lieu du quota long —
         # inutile de tenir la station écartée sur un quota qui reviendrait vite.
-        _cd_secs = (
-            _free_429_cooldown_seconds(retry_after)
-            if quota_flag
-            else min(_free_429_cooldown_seconds(retry_after), 30.0)
-        )
+        if quota_flag:
+            _cd_secs = _free_429_cooldown_seconds(
+                retry_after, body if isinstance(body, str) else None
+            )
+            if _scope == "trial-exhausted" and not (retry_after or "").strip():
+                _td = _trial_dead_cooldown_seconds()
+                if _td > 0:
+                    _cd_secs = max(_cd_secs, _td)
+        else:
+            _cd_secs = min(_free_429_cooldown_seconds(retry_after), 30.0)
         if _action_429 != "rotate":
-            _set_free_cooldown(free_model, _cd_secs, station)
+            _set_free_cooldown(free_model, _cd_secs, station, scope=_scope if quota_flag else "transient")
+        # [no-ip-change 2026-10-24] Quota épuisé → changer d'impersonnalisation
+        # SUR PLACE (version/UA/ses_/project neufs, même IP, même tunnel) :
+        # zéro AUTH NordVPN, contrairement à une rotation d'IP. Si le bucket
+        # amont inclut la face client, la prochaine tentative passe sans
+        # changer d'IP. La rotation d'IP ci-dessous reste armée en parallèle
+        # (bucket vraiment per-IP). Jamais de raise : best-effort pur.
+        if quota_flag:
+            try:
+                _rip = ""
+                try:
+                    _rip = str(getattr(station, "current_ip", "") or "").strip()
+                except Exception:
+                    _rip = ""
+                if _rip and _per_ip_identity_enabled():
+                    _vv = _ip_vault()
+                    if _vv is not None and hasattr(_vv, "rotate_installation"):
+                        _new_face = _vv.rotate_installation(_rip) or {}
+                        try:
+                            _sid = getattr(station, "_station", "?")
+                            _log(f"  [free-identity] {free_model!r} quota ip={_rip} (st{_sid}) → nouvelle installation {(_new_face or {}).get('version')}/{(_new_face or {}).get('client')} gen={(_new_face or {}).get('generation')}")
+                        except Exception:
+                            pass
+            except Exception:
+                pass
         # [fix rotation-storm] rotation SEULEMENT pour un vrai quota (ou body absent).
-        if _action_429 != "cooldown" and quota_flag and _free_ip_pool:
+        # [fix quota-vs-breaker] On appelle AUSSI le pool pour un 429 transitoire
+        # (quota=False) : il n'y rotationne pas, mais il alimente le log corrélé
+        # (vraie surcharge amont). Sans cet appel, le seul producteur 429 du
+        # breaker était le quota per-IP — exactement le mauvais signal.
+        if _action_429 != "cooldown" and _free_ip_pool:
             try:
                 _free_ip_pool.on_quota_exhausted(station, forced_pool=forced_pool, quota=quota_flag)
             except TypeError:
@@ -8013,6 +9158,11 @@ def _free_retry_delay_seconds(attempt: int) -> float:
 
     0.5 s × attempt, plafonné à 2.0 s. 0 en tests (PYTEST_CURRENT_TEST)
     pour garder la suite hermétique et rapide.
+
+    [anti-corrélation 2026-10-24] gigue ±30 % : sans elle, les cadences de
+    retry sont bit-identiques sur toutes les IPs — des rafales synchronisées
+    même-corps/même-délai sont corrélables entre egress. Bornes inchangées
+    ([0, 2.0] : aucun surcoût de latence structurel).
     """
     try:
         if os.getenv("PYTEST_CURRENT_TEST"):
@@ -8020,7 +9170,8 @@ def _free_retry_delay_seconds(attempt: int) -> float:
     except Exception:
         pass
     try:
-        return max(0.0, min(2.0, 0.5 * max(1, int(attempt))))
+        base = max(0.0, min(2.0, 0.5 * max(1, int(attempt))))
+        return max(0.0, min(2.0, base * random.uniform(0.7, 1.3)))
     except Exception:
         return 0.5
 
@@ -8153,7 +9304,7 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
                 from app.compaction.summarizer import should_clamp_summary as _should_cap_fn
 
                 try:
-                    _cc = get_server_compaction("summary_clamp_max_tokens", 4096)
+                    _cc = get_server_compaction("summary_clamp_max_tokens", 32000)
                 except Exception:
                     _cc = 4096
                 if _should_cap_fn(body, _cc):
@@ -8166,6 +9317,53 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
     free_model = _resolve_free_model(model_id)
     if not free_model:
         return None  # No free equivalent, proceed with paid
+
+    # [strict_free 2026-10-24 no-block] Si TOUTE la chaîne (primaire +
+    # candidats même endpoint) est trial-morte sur toutes les stations :
+    # changer d'IP (rotations) et re-tenter au lieu de bloquer — une IP
+    # neuve = un bucket neuf. Refus honnête avec le vrai Retry-After
+    # seulement si rien n'a bougé (jambe paid interdite en strict_free,
+    # l'amont dit non partout — attendre n'y changerait rien).
+    try:
+        _chain = _free_candidate_chain(model_id, free_model)
+        _pool_ok = bool(
+            _free_ip_pool is not None
+            and getattr(_free_ip_pool, "enabled", False)
+            and list(getattr(_free_ip_pool, "_stations", None) or [])
+        )
+        if _pool_ok and IP_ROTATION.get("strict_free", False) and _free_proxy_mode() in ("vpn", "socks5"):
+            _all_dead = True
+            for _cm in _chain:
+                try:
+                    if not _free_stations_exhausted(_cm):
+                        _all_dead = False
+                        break
+                except Exception:
+                    _all_dead = False
+                    break
+            if _all_dead:
+                _log(
+                    f"  [free] req_id={req_id} chaîne épuisée {free_model!r} "
+                    f"(+{max(0, len(_chain) - 1)} candidats) — rotation + nouvelle tentative (pas de blocage)"
+                )
+                if await _wait_for_fresh_free(_chain):
+                    _debug(f"  [free] req_id={req_id} clé fraîche apparue — on retente l'amont")
+                    free_model = _resolve_free_model(model_id) or free_model
+                else:
+                    _ra = _free_min_retry_after(_chain)
+                    _log(
+                        f"  [free] req_id={req_id} toujours épuisé après attente — "
+                        f"refus honnête, Retry-After={_ra or '?'}s"
+                    )
+                    try:
+                        _fallback_ctx_push(req_id, free_model, 429)
+                    except Exception:
+                        pass
+                    raise FreeQuotaExhausted(_ra, status=429, body="FreeUsageLimitError: all free candidates trial-dead")
+    except FreeQuotaExhausted:
+        raise
+    except Exception:
+        pass
 
     free_endpoint = _cfg_settings._free_endpoint_for(free_model)
     if API_BASE_FREE != _cfg_settings.API_BASE_FREE:
@@ -8239,15 +9437,32 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
             free_ip = vpn.current_ip
 
     # [gate 2026-09-17 + copie exacte 2026-09-18] La jambe free parle en
-    # client officiel anonyme (Bearer public + IDs ses_/msg_ temporels) —
-    # jamais avec la clé payante du client. UN msg_ par message logique
-    # (stable sur tous les essais : hedge/séquentiel partagent la tâche,
-    # cf. _free_request_msg_id). Le label d'identité reste informatif
-    # (observabilité) : la face réseau est figée, pas en rotation.
+    # client officiel anonyme (Bearer public + IDs ses_/msg_ par IP) —
+    # jamais avec la clé payante du client. UNE installation par IP
+    # (vault : UA versionnée + ses_/msg_/project isolés — cf. free.identities).
+    # Le label d'identité navigateur reste informatif (observabilité geo).
     free_profile = _current_free_identity(station)
-    _current_free_attempt.set({"ip": free_ip, "identity": free_profile.get("impersonate") or "", "station": station})
-    # Session par conversation quand le corps porte un chaînage (parité request.ts).
-    free_headers = _official_free_headers(free_endpoint or "", _body_conversation_key(body))
+    try:
+        _fi_snap = {}
+        _vv0 = _ip_vault()
+        if _vv0 is not None and _per_ip_identity_enabled() and free_ip:
+            _fi_snap = _vv0.snapshot(free_ip)
+    except Exception:
+        _fi_snap = {}
+    _current_free_attempt.set({"ip": free_ip, "identity": free_profile.get("impersonate") or "",
+                               "identity_browser": free_profile.get("impersonate") or "",
+                               "wire_version": (_fi_snap or {}).get("version"),
+                               "wire_client": (_fi_snap or {}).get("client"),
+                               "station": station, "instance": _fi_snap})
+    try:
+        if _fi_snap:
+            _debug(f"  [free-identity] ip={free_ip} wire={_fi_snap.get('version')}/{_fi_snap.get('client')} "
+                   f"browser={free_profile.get('impersonate')} proj={str(_fi_snap.get('project'))[:12]}... ses={str(_fi_snap.get('ses'))[:12]}...")
+    except Exception:
+        pass
+    # Session par conversation quand le corps porte un chaînage (parité request.ts),
+    # scopée à l'IP d'egress (vault).
+    free_headers = _official_free_headers(free_endpoint or "", _body_conversation_key(body), free_ip or None)
     free_api_key = "free (no auth)"
     free_workspace = "free (no auth)"
 
@@ -8329,6 +9544,10 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
     if _vpn_manager:
         proxy_mode = _vpn_manager.proxy_mode
 
+    # [fix 2026-10-24] défini hors branche : le handling partagé (429/5xx)
+    # lit `_hedge_done` dans TOUS les modes — en direct sans hedge il
+    # n'était jamais assigné → UnboundLocalError au lieu du repli payant.
+    _hedge_done = False
     if proxy_mode in ("vpn", "socks5") and _free_ip_pool and _free_ip_pool.enabled:
         # VPN/socks5 mode: use curl_cffi for TLS fingerprint evasion,
         # routed through the chosen station's tunnel or static SOCKS5
@@ -8347,7 +9566,6 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
         free_max = effective_free_max_attempts(forced_pool)
         station_first = _free_exception_fallback_mode() == "station-first"
         # [free_parallel hedge] N-wide race, first wins, winner-only compta, streaming OFF
-        _hedge_done = False
         resp = resp_headers = None
         _hedge_cands = []
         try:
@@ -8423,7 +9641,11 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
             _free_used = 1
             tried = set(_hedge_cands)  # mark all hedged candidates as tried to avoid re-strike in fallback
         while not _hedge_done and resp is None and _free_used < free_max:
-            if _free_used == 0 and station is not None:
+            if _free_used == 0 and station is not None and not _free_trial_dead_active(free_model, station):
+                # [trial-dead] la clé (modèle, IP) de la station pré-choisie
+                # est cliniquement morte : ne pas y brûler le 1er essai quand
+                # d'autres egress vivent (repli ci-dessous sinon — jamais de
+                # fail-closed inventé : au pire on retente comme avant).
                 attempt = station
             elif _free_ip_pool:
                 if getattr(_free_ip_pool, "socks5_mode", False):
@@ -8431,13 +9653,35 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
                     # ``tried`` (never re-strike the same proxy twice). The
                     # two-pass walk admits an at-quota proxy on the second
                     # pass so a request still gets its free shot.
-                    attempt = _free_ip_pool._socks5_next(excluded=tried)
+                    # [trial-dead] les proxies morts d'abord, repli legacy
+                    # si rien d'autre (pas de stranding).
+                    try:
+                        _dead = _trial_dead_stations(free_model)
+                    except Exception:
+                        _dead = set()
+                    _excl = (set(tried) if tried else set()) | _dead
+                    attempt = _free_ip_pool._socks5_next(excluded=_excl)
+                    if attempt is None and _dead:
+                        attempt = _free_ip_pool._socks5_next(excluded=tried)
                 else:
-                    attempt = (
-                        _free_ip_pool._best_station_excluding_many(tried, forced_pool)
-                        if tried
-                        else _free_ip_pool._best_station(forced_pool)
-                    )
+                    # [trial-dead] même discipline côté docker : les clés
+                    # (modèle, IP) mortes sont sautées en premier, retentées
+                    # en repli (early-recovery toujours possible).
+                    try:
+                        _dead = _trial_dead_stations(free_model)
+                    except Exception:
+                        _dead = set()
+                    _excl = (set(tried) if tried else set()) | _dead
+                    if _excl:
+                        attempt = _free_ip_pool._best_station_excluding_many(_excl, forced_pool)
+                        if attempt is None and _dead:
+                            attempt = (
+                                _free_ip_pool._best_station_excluding_many(tried, forced_pool)
+                                if tried
+                                else _free_ip_pool._best_station(forced_pool)
+                            )
+                    else:
+                        attempt = _free_ip_pool._best_station(forced_pool)
                 if attempt is not None:
                     tried.add(attempt)
             else:
@@ -8460,11 +9704,16 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
                     # [Axe 3.1] Static proxy: no docker IP — log its id so
                     # usage rows distinguish the proxies.
                     free_ip = attempt.pid
+                try:
+                    _seq_inst = _ip_vault().snapshot(free_ip) if _per_ip_identity_enabled() else {}
+                except Exception:
+                    _seq_inst = {}
                 _current_free_attempt.set(
                     {
                         "ip": free_ip,
                         "identity": _current_free_identity(attempt).get("impersonate") or "",
                         "station": attempt,
+                        "instance": _seq_inst,
                     }
                 )
                 station = attempt  # cooldown key + on_quota_exhausted must target THIS IP
@@ -9424,7 +10673,12 @@ async def _do_request_with_retry(endpoint, body, headers, protocol, retry_on_429
             # [Correctif parité multi-tours] marqueur interne jamais envoyé à
             # l'upstream — consommé par le retry-once du caller.
             body.pop("_has_synthetic_reasoning_items", None)
-    _RETRYABLE_STATUSES = {500, 502, 503, 504, 499, 408, 409, 425, 529}
+    # [ALIGNEMENT 2026-10-20] Statuts rejouables = ceux du client officiel
+    # (`packages/llm/src/route/executor.ts` : 429/503/504/529 + tout 5xx).
+    # Avant : {500,502,503,504,499,408,409,425,529} — 409 et les statuts de
+    # transport étaient rejoués, 429 et les 5xx hors liste ne l'étaient pas.
+    # Source unique : `upstream.retry.RETRYABLE_STATUSES`.
+    _RETRYABLE_STATUSES = set(RETRYABLE_STATUSES)
     # [G2] budget centralisé (upstream.max_retries, défaut inchangé)
     max_retries = _upstream_max_retries()
     attempt = 0
@@ -9903,6 +11157,7 @@ async def _stream_error_response(
     free_status=None,
     paid_status=None,
     error_label=None,
+    client_protocol=None,
 ):
     """Handle streaming error: log, save DB, yield error SSE event. Returns the error event bytes."""
     _log(f"  ERROR {status_code}: {_redact(resp_body, 300)}")
@@ -9930,8 +11185,14 @@ async def _stream_error_response(
     )
     # Parité protocole : sur route OpenAI le client attend `data: {"error":...}`
     # + `[DONE]`, jamais `event: error` Anthropic (erreur invisible sinon).
+    #
+    # [V5.2] La forme suit le protocole du CLIENT, pas celui de l'amont. Bug
+    # mesuré : un client Anthropic (`/v1/messages`) servant un modèle free
+    # (amont chat) recevait `data: {"error":…}` + `data: [DONE]` — du JSON
+    # OpenAI dans un flux Anthropic. Le SDK Anthropic n'y voit pas une erreur :
+    # il ignore les lignes sans `event:` et le client conclut à un flux vide.
     try:
-        _proto = str(protocol or "").lower()
+        _proto = str(client_protocol or protocol or "").lower()
     except Exception:
         _proto = ""
     if _proto in ("openai", "chat", "responses"):
@@ -9949,6 +11210,39 @@ async def _stream_error_response(
     return _sse("error", error_payload)
 
 
+async def _safe_aread(resp, timeout: float = 4.0) -> bytes:
+    """Lecture du body d'une réponse en erreur, bornée dans le temps.
+
+    curl_cffi n'est PAS fiable sur un second ``aread()`` : une fois le body
+    consommé (capture-400-stream), le second appel peut attendre
+    indéfiniment. Observé le 22/10 18:27Z : un 429 sur ``glm-5.3-flash-free``
+    a bloqué la requête 96 s, sans aucune ligne de log, avant le retry.
+    Toute lecture best-effort sur le chemin d'erreur doit donc être bornée.
+    """
+    # [fix 22/10 19:04Z] Ne JAMAIS relire un body déjà lu : curl_cffi peut
+    # suspendre le second ``aread()`` indéfiniment (observé 119 s, zéro log,
+    # boucle asyncio vivante). ``asyncio.wait_for`` ne suffit pas si la
+    # coroutine ignore l'annulation. On mémorise donc le premier résultat sur
+    # la réponse : capture-400 → décision 429 → refus réutilisent le même
+    # body, une seule lecture réseau.
+    _cached = getattr(resp, "_oc_read_body", None)
+    if _cached is not None:
+        return _cached
+    try:
+        _b = await asyncio.wait_for(resp.aread(), timeout=timeout)
+    except Exception:
+        _b = b""
+    if isinstance(_b, (bytes, bytearray)):
+        _data = bytes(_b)
+    else:
+        _data = str(_b or "").encode("utf-8", "replace")
+    try:
+        resp._oc_read_body = _data
+    except Exception:
+        pass
+    return _data
+
+
 async def _capture_free_stream_error_body(resp, req_id, free_model, tag, attempt):
     """[capture-400-stream] persister le body d'erreur upstream sur la voie
     streaming — sinon aveugle (mémoire panneau 200 lignes + DB sans body).
@@ -9956,11 +11250,8 @@ async def _capture_free_stream_error_body(resp, req_id, free_model, tag, attempt
     non épuisé) : le payload étant rejoué à l'identique, la tentative finale
     (refuse/paid) garde un body vierge — aucun double-aread, aucun changement
     de comportement."""
-    try:
-        _b = await resp.aread()
-        _t = _b.decode("utf-8", "replace") if isinstance(_b, (bytes, bytearray)) else str(_b)
-    except Exception:
-        _t = ""
+    _b = await _safe_aread(resp)
+    _t = _b.decode("utf-8", "replace")
     _debug(
         f"  [free-400-stream] req_id={req_id} leg=free {free_model!r} status={resp.status_code} attempt={attempt} ({tag}) body={_t[:512]!r}"
     )
@@ -10061,12 +11352,13 @@ async def _free_stream_refuse_bytes(
     client_ip,
     tool_names,
     request_body,
+    client_protocol=None,
 ):
     # C1c : le refus dit VRAI — vrai statut upstream + vrai message (tronqué).
     # Le refus reste un refus (strict respecté), mais 400 → 400, jamais 429 fabriqué.
     # [PLAN_CORRECTION_FAUX_429 Lot A1/E6] Retry-After réel uniquement (omis si absent).
     _status = resp.status_code
-    _body = await resp.aread()
+    _body = await _safe_aread(resp)
     # [capture-400-stream] le body d'erreur upstream n'était persisté nulle
     # part en streaming (_log = mémoire panneau 200 lignes, DB = "HTTP 400"
     # sans body) : tout 400 stream restait aveugle. Parité avec le non-stream
@@ -10100,6 +11392,18 @@ async def _free_stream_refuse_bytes(
         # pour la surcharge, api_error sinon — et message véridique portant
         # le vrai corps (tronqué + redacté), jamais « quota épuisé ».
         _, _etype = _classify_upstream_error(_status, _cap)  # statut déjà porté par _status
+        # [V5.2] Si l'amont nomme lui-même son type d'erreur (et qu'il est au
+        # vocabulaire Anthropic), on le relaie : « tel quel » veut dire tel quel.
+        # Un `api_error` fourre-tout alors que l'amont disait `server_error` est
+        # une information perdue. Les motifs de surcharge/quota gardent la
+        # priorité (ils viennent d'être calculés ci-dessus).
+        if _etype == "api_error":
+            _vocab = "openai" if str(client_protocol or protocol or "").lower() in (
+                "openai",
+                "chat",
+                "responses",
+            ) else "anthropic"
+            _etype = _extract_upstream_error_type(_cap, _vocab) or _etype
         _payload = {
             "type": "error",
             "error": {
@@ -10107,6 +11411,13 @@ async def _free_stream_refuse_bytes(
                 "message": f"Free model request failed: {_status_word(_status)} — {_redact(_body, 300)}",
             },
         }
+    # [V8.1] Le client verra 200 (le flux SSE est déjà ouvert) ; la métrique doit
+    # voir le vrai statut amont. Sans ça, `/api/free-health` déclarait
+    # `jev-1.13-free` servi alors que l'amont le refusait à chaque appel.
+    try:
+        _current_free_refusal.set((free_model, int(_status)))
+    except Exception:
+        pass
     return await _stream_error_response(
         req_id,
         free_model,
@@ -10123,6 +11434,7 @@ async def _free_stream_refuse_bytes(
         _payload,
         request_body=request_body,
         free_status=_status,
+        client_protocol=client_protocol,
     )
 
 
@@ -10137,12 +11449,8 @@ async def _free_429_stream_decision(free_model, resp, _attempt, forced_pool, tra
     # rotation (défaut storm-safe : mieux vaut manquer une rotation que
     # re-déclencher la rafale auto-destructrice).
     try:
-        _raw = await resp.aread()
-        _body = (
-            _raw.decode("utf-8", "ignore")
-            if isinstance(_raw, (bytes, bytearray))
-            else str(_raw or "")
-        )
+        _raw = await _safe_aread(resp)
+        _body = _raw.decode("utf-8", "ignore")
     except Exception:
         _body = ""
     refuse = _on_free_429_stream(
@@ -10152,6 +11460,15 @@ async def _free_429_stream_decision(free_model, resp, _attempt, forced_pool, tra
         body=_body,
     )
     if not refuse and _attempt + 1 < effective_free_max_attempts(forced_pool):
+        # [fix quota-vs-breaker] Marque la tentative comme quota 429 : le
+        # prochain _open_free_stream(fresh_station=True) transmettra
+        # rate_limited=True au pool (pas de faux signal timeout corrélé).
+        try:
+            _att = dict(_current_free_attempt.get() or {})
+            _att["rate_limited"] = True
+            _current_free_attempt.set(_att)
+        except Exception:
+            pass
         _log_free_model_usage(
             track_model,
             free_model,
@@ -10164,6 +11481,18 @@ async def _free_429_stream_decision(free_model, resp, _attempt, forced_pool, tra
             f"  FREE {free_model!r} RATE LIMITED (429) → retry station fraîche (essai {_attempt + 2}/{effective_free_max_attempts(forced_pool)})"
         )
         return "retry_free", refuse
+    # [fix strict_free 429] Budget d'essais free épuisé : en mode tunnel
+    # (vpn/socks5) + strict_free, refuser honnêtement au lieu de lancer une
+    # jambe payante. Le chemin historique ne refusait que si
+    # ``_free_stations_exhausted()`` était vrai — or il renvoie False dès
+    # qu'une rotation est en vol, ce qui faisait tomber un 429 quota sur la
+    # clé payante (expirée) au lieu du refus strict attendu.
+    if not refuse and IP_ROTATION.get("strict_free", False) and _free_proxy_mode() in ("vpn", "socks5"):
+        _log(
+            f"  FREE {free_model!r} 429 quota — budget d'essais épuisé "
+            f"({_attempt + 1}/{effective_free_max_attempts(forced_pool)}) → refus strict (aucune jambe payante)"
+        )
+        refuse = True
     return "fallback_paid", refuse
 
 
@@ -10180,6 +11509,7 @@ async def _free_non429_cooldown_strict(
     tool_names,
     request_body,
     tag,
+    client_protocol=None,
 ):
     _set_free_cooldown(free_model, 60, _free_attempt_station())
     if IP_ROTATION.get("strict_free", False):
@@ -10203,6 +11533,10 @@ async def _free_non429_cooldown_strict(
             client_ip,
             tool_names,
             request_body,
+            # [V5.2] sans ce relais, le refus émis ici repartait en forme
+            # OpenAI (`data: {"error"}` + [DONE]) même pour un client
+            # Anthropic : c'est exactement le défaut mesuré en direct.
+            client_protocol=client_protocol,
         )
     return False, None
 
@@ -10539,6 +11873,15 @@ def _route_for(model_name: str) -> dict | None:
     (_route_cache, _seen_route_version) et les globales restent ici, lus À
     L'APPEL : monkeypatch.setattr(oc, "DISABLE_MAPPING"|...) coule toujours."""
     global _seen_route_version
+    # [V2.5] Une famille que le catalogue nomme mais que le proxy ne convertit
+    # pas (gemini) doit être refusée ICI, en la nommant — jamais routée vers un
+    # endpoint dont le dialecte ne correspond pas. Le refus vaut 501.
+    try:
+        _unsupported_family = _cfg_settings.CATALOG_UNSUPPORTED.get(model_name)
+    except Exception:
+        _unsupported_family = None
+    if _unsupported_family:
+        raise UnsupportedModelFamily(model_name, _unsupported_family)
     res, _seen_route_version = _app_router_route_for(
         model_name,
         models=MODELS,
@@ -11498,6 +12841,20 @@ async def messages(request: Request):
     protocol = cfg["protocol"]
     _debug(f"[messages] route: {original_model!r} → {model_id} | {protocol} | endpoint={endpoint}")
 
+    # [V8.5] Mauvais protocole : `jev-*` et consorts ne sont pas des modèles de
+    # chat, ils vivent sur `/inference/v1/systemone` (questions + state). Les
+    # router vers chat/completions produisait `api_usage_error / Invalid request`
+    # — indéchiffrable, et pris à tort pour une panne d'amont pendant des heures.
+    # Ici on le dit, avec l'endpoint à utiliser.
+    if "systemone" in (endpoint or ""):
+        _log(f"  [messages] ✗ {original_model!r} est un modèle SystemOne, pas un chat")
+        return _anthropic_error(
+            400,
+            f"Model {original_model!r} uses the SystemOne protocol "
+            f"(questions/state), not chat. POST it to /v1/systemone instead.",
+            error_type="invalid_request_error",
+        )
+
     # [Compaction garde opt-in] contexte énorme : warn (log) ou deny (413
     # actionnable) AVANT l'amont. Inactif par défaut (seuils à 0).
     _huge_level, _huge_msg = _huge_context_verdict(body, body_bytes)
@@ -11850,7 +13207,7 @@ async def messages(request: Request):
                                     _mk = int(_cmp_cfg.get("summary_max_tokens", 2048))
                                 except Exception:
                                     _mk = 2048
-                                _mk = min(max(_mk, 1), 4096)
+                                _mk = min(max(_mk, 1), 32000)
                                 try:
                                     _kr = int(_cmp_cfg.get("keep_recent_pairs", 4))
                                 except Exception:
@@ -12197,6 +13554,70 @@ async def messages(request: Request):
                                 # the free model, fall back to paid. Never pauses PAID
                                 # keys: a status from the free endpoint says nothing
                                 # about the paid account (CRITIC(2)/CRITIC(3)).
+                                #
+                                # [V6.3.1] Classer AVANT d'agir : un 403 « forme de
+                                # requête » ne se répare pas en tournant la station,
+                                # alors qu'un 429 oui. Sans cette mesure, les deux
+                                # déclenchaient la même rotation.
+                                try:
+                                    _ff_body = ""
+                                    try:
+                                        _ff_body = (resp.text or "")[:2000]
+                                    except Exception:
+                                        _ff_body = ""
+                                    _ff_kind = _classify_free_failure(resp.status_code, _ff_body)
+                                    _note_free_failure(_ff_kind)
+                                    _debug(f"  [free-failure] kind={_ff_kind} status={resp.status_code}")
+                                    if _ff_kind == "gate":
+                                        # [V6.1.2] Un 403 dit qu'un facteur a
+                                        # refusé, jamais lequel. On interroge la
+                                        # théorie (testée facteur par facteur)
+                                        # sur les en-têtes et le corps RÉELLEMENT
+                                        # partis : c'est la seule mesure qui
+                                        # distingue « l'IP est mauvaise » de
+                                        # « le corps n'a pas la forme ».
+                                        try:
+                                            _gate_verdict = _free_gate_diagnose(
+                                                headers, body, egress="rejected"
+                                            )
+                                            _note_gate_factors(_gate_verdict.failed_factors)
+                                            _debug(f"  [gate] facteurs={_gate_verdict.as_log()}")
+                                            # [V6.3.2] Mettre la station de côté
+                                            # SEULEMENT si la sortie est en cause.
+                                            # Un refus de forme (body/identity)
+                                            # échouerait sur les cinq stations :
+                                            # on ne consomme pas de rotation pour ça.
+                                            _station_fault = _station_attributable_fault(
+                                                _gate_verdict.failed_factors
+                                            )
+                                            if _station_fault:
+                                                _fault_station = _free_attempt_station()
+                                                if _fault_station is None:
+                                                    # Hors contexte de tentative : on compte
+                                                    # la panne, on n'écarte aucune station.
+                                                    _note_station_fault("?", _station_fault)
+                                                else:
+                                                    _note_station_fault(
+                                                        getattr(
+                                                            _fault_station,
+                                                            "station",
+                                                            getattr(_fault_station, "index", _fault_station),
+                                                        ),
+                                                        _station_fault,
+                                                    )
+                                                    _bench = _station_cooldown_seconds(_station_fault)
+                                                    try:
+                                                        _set_free_cooldown(free_model, _bench, _fault_station)
+                                                    except Exception:
+                                                        pass
+                                                    _log(
+                                                        f"  FREE {free_model!r} station écartée {_bench:.0f}s "
+                                                        f"({_station_fault}) — les autres continuent"
+                                                    )
+                                        except Exception:
+                                            pass
+                                except Exception:
+                                    pass
                                 if resp.status_code == 429:
                                     _decision, _refuse = await _free_429_stream_decision(
                                         free_model,
@@ -12262,6 +13683,7 @@ async def messages(request: Request):
                                         tool_names,
                                         request_body,
                                         "stream",
+                                    client_protocol="anthropic",
                                     )
                                     if _refuse:
                                         yield _refuse_bytes
@@ -12284,6 +13706,7 @@ async def messages(request: Request):
                                         client_ip,
                                         tool_names,
                                         request_body,
+                                    client_protocol="anthropic",
                                     )
                                     return
                                 continue
@@ -12420,6 +13843,7 @@ async def messages(request: Request):
                                 # statut upstream explicite, free_status lu depuis
                                 # le ctx C1 (peek sans pop).
                                 paid_status=resp.status_code,
+                            client_protocol="anthropic",
                             )
                             return
                         _conv_state = None
@@ -12813,7 +14237,23 @@ async def messages(request: Request):
                         # [FIX trou] Rien n'est parti (ni `message_start` parsé, ni octet
                         # relayé) : sans ce cas, le flux se terminait VIDE et sans le
                         # moindre terminal. On émet une erreur explicite.
-                        _log("  stream failed before any output → explicit error event (no empty 200)")
+                        #
+                        # [V5.1] Rien n'étant parti, les en-têtes ne sont pas envoyés :
+                        # le statut est encore libre, donc on LÈVE (502) au lieu
+                        # d'écrire l'erreur dans un 200. C'est ce chemin que le test
+                        # comportemental a révélé : les deux gardes « flux vide »
+                        # ne couvraient pas cette branche, et le client recevait
+                        # `200` + `event: error`.
+                        _log("  stream failed before any output → 502 (no empty 200)")
+                        _note_empty_stream(
+                            free_model if _using_free else model_id,
+                            "free" if _using_free else "paid",
+                        )
+                        if _can_fail_with_http_status(False):
+                            raise EmptyUpstreamStream(
+                                f"flux amont vide avant tout octet "
+                                f"(modèle={free_model if _using_free else model_id})"
+                            )
                         yield _sse(
                             "error",
                             {
@@ -12879,8 +14319,26 @@ async def messages(request: Request):
             # `_bytes_flushed` (et non `started`) car sur ce chemin les octets amont
             # partent avant `started = True` (cf. init en 9357).
             if not _bytes_flushed and not emitted_finish:
-                _debug("  [stream] upstream produced no output at all → emitting error event")
-                _log("  stream truncated before first event (upstream EOF, no content) → error event")
+                _debug("  [stream] upstream produced no output at all → 502 instead of a lying 200")
+                _log("  stream truncated before first event (upstream EOF, no content) → 502")
+                # [V5.1 — mesurable] Rendre l'incident comptable : sans ça, on ne
+                # sait pas s'il frappe une jambe, un modèle ou une station, donc
+                # on ne peut pas le prioriser.
+                _note_empty_stream(
+                    free_model if _using_free else model_id,
+                    "free" if _using_free else "paid",
+                )
+                # [V5.1 — correctif] Rien n'a été envoyé : les en-têtes ne sont pas
+                # partis, le statut est encore libre. Lever produit un 502 honnête
+                # au lieu d'un 200 avec un événement d'erreur que les clients lisent
+                # comme un succès. Si un octet était parti, la garde ci-dessus
+                # serait fausse et l'on garderait l'événement `error` : on ne coupe
+                # jamais un flux déjà commencé.
+                if _can_fail_with_http_status(_bytes_flushed):
+                    raise EmptyUpstreamStream(
+                        f"flux amont vide (modèle={free_model if _using_free else model_id}, "
+                        f"jambe={'free' if _using_free else 'paid'})"
+                    )
                 yield _sse(
                     "error",
                     {
@@ -13248,7 +14706,7 @@ async def messages(request: Request):
                         try:
                             _v = get_server_compaction("summary_max_tokens", 2048)
                             if isinstance(_v, int) and _v > 0:
-                                _sc_max = min(_v, 4096)
+                                _sc_max = min(_v, 32000)
                         except Exception:
                             pass
                         _sc_keep = 4
@@ -13699,6 +15157,7 @@ async def messages(request: Request):
                                     tool_names,
                                     request_body,
                                     "stream-oai",
+                                client_protocol="anthropic",
                                 )
                                 if _refuse:
                                     yield _refuse_bytes
@@ -13731,6 +15190,7 @@ async def messages(request: Request):
                                     client_ip,
                                     tool_names,
                                     request_body,
+                                client_protocol="anthropic",
                                 )
                                 return
                             continue
@@ -14200,6 +15660,7 @@ async def messages(request: Request):
                                     request_body=request_body,
                                     free_status=429,
                                     error_label="upstream_free_empty_response",
+                                client_protocol="anthropic",
                                 )
                                 return
                             yield _sse(
@@ -14251,6 +15712,7 @@ async def messages(request: Request):
                                 request_body=request_body,
                                 free_status=429,
                                 error_label="upstream_free_empty_response",
+                            client_protocol="anthropic",
                             )
                             return
                         continue
@@ -14298,6 +15760,12 @@ async def messages(request: Request):
                         yield ev
                     return
                 continue
+            except EmptyUpstreamStream:
+                # [V5.1] Ne JAMAIS avaler cette levée : c'est elle qui permet de
+                # rendre un 502 au lieu d'un 200 mensonger. Ce `except Exception`
+                # la convertissait en trame `upstream stream aborted` — nouveau
+                # message, même défaut : le client recevait toujours 200.
+                raise
             except Exception as e:
                 _log(f"  ERROR stream (attempt {_attempt + 1}): {type(e).__name__}: {e}")
                 _debug(f"  ✗ stream exception: {type(e).__name__}: {e}\n{traceback.format_exc()}")
@@ -14382,7 +15850,22 @@ async def messages(request: Request):
                 else:
                     # [FIX trou] Rien n'est parti : sans ce cas, la 200 SSE se fermait VIDE,
                     # sans le moindre terminal ni erreur.
-                    _log("  stream failed before any output → explicit error event (no empty 200)")
+                    #
+                    # [V5.1] Rien n'étant parti, le statut est encore libre : on LÈVE
+                    # (502) au lieu d'écrire l'erreur dans un 200. C'est le jumeau du
+                    # bloc corrigé dans le générateur natif Anthropic — le test
+                    # comportemental a montré que c'est CELUI-CI que sert un modèle à
+                    # protocole `openai` appelé sur `/v1/messages` (cas de `big-pickle`).
+                    _log("  stream failed before any output → 502 (no empty 200)")
+                    _note_empty_stream(
+                        free_model if _using_free else model_id,
+                        "free" if _using_free else "paid",
+                    )
+                    if _can_fail_with_http_status(False):
+                        raise EmptyUpstreamStream(
+                            f"flux amont vide avant tout octet "
+                            f"(modèle={free_model if _using_free else model_id})"
+                        )
                     yield _sse(
                         "error",
                         {
@@ -14481,8 +15964,20 @@ async def messages(request: Request):
         # note ci-dessus : un contenu déjà parti avec `started=False` déclencherait sinon un
         # FAUX ROUGE (`event: error` après du contenu), en plus du trou symétrique.
         if not _stream_has_yielded(started, open_blocks, stream_out_tokens, "") and not emitted_finish:
-            _debug("  [stream-oai] upstream produced no output at all → emitting error event")
+            _debug("  [stream-oai] upstream produced no output at all → error event (voir note V5.1)")
             _log("  stream truncated before first event (upstream EOF, no content) → error event")
+            # [V5.1 — pourquoi ce chemin n'est PAS passé au 502] Le correctif
+            # consiste à lever quand rien n'a été envoyé (en-têtes pas partis,
+            # statut encore libre). Ce générateur ne tient pas de `_bytes_flushed`
+            # (cf. note en 14829) : sa sentinelle est `_stream_has_yielded`, qui
+            # peut être fausse alors que des octets sont déjà partis verbatim.
+            # Lever dans ce cas couperait un flux qui livrait du contenu — pire
+            # que le défaut d'origine. On garde donc l'événement `error` ici, et
+            # le reste du travail est d'ajouter la sentinelle manquante.
+            _note_empty_stream(
+                free_model if _using_free else model_id,
+                "free" if _using_free else "paid",
+            )
             yield _sse(
                 "error",
                 {
@@ -14520,6 +16015,188 @@ async def messages(request: Request):
 
 _health_cache: tuple[float, bool] | None = None  # (timestamp, upstream_ok)
 _health_lock = asyncio.Lock()  # sérialise le check upstream caché (§14.3.16 garde le writer lock séparé)
+
+
+# [V8.2] Canary : deux sondes courtes (une par protocole client) qui vérifient
+# que la jambe répond VRAIMENT. La leçon du 2026-10-22 : `jev-1.13-free`
+# répondait 200 en 4 s sans rien produire. Un canary qui ne lit que le statut
+# aurait dit « tout va bien » pendant toute la panne.
+_CANARY_SYSTEM = "canary"
+
+
+def _canary_verdict(raw: str) -> tuple[bool, str]:
+    """(succès, raison) — un flux n'est un succès que s'il porte du **contenu**."""
+    text = raw or ""
+    if "Free model request failed" in text or '"type":"error"' in text or "event: error" in text:
+        return False, "trame d'erreur dans le flux"
+    if (
+        '"text_delta"' in text
+        or '"thinking_delta"' in text
+        or '"content_block_delta"' in text
+        or '"delta"' in text
+    ):
+        return True, ""
+    return False, "flux sans contenu"
+
+
+async def _canary_probe_once(probe: str, path: str, model: str, timeout_s: float) -> dict:
+    """Une sonde : requête courte sur NOTRE proxy (chemin client complet)."""
+    started = time.monotonic()
+    payload = {
+        "model": model,
+        "stream": True,
+        "max_tokens": 16,
+        "messages": [{"role": "user", "content": "Réponds: OK"}],
+    }
+    ok, detail, status_code = False, "", None
+    chunks: list[str] = []
+    try:
+        async with httpx.AsyncClient(timeout=timeout_s) as client:
+            async with client.stream(
+                "POST", f"http://127.0.0.1:{PORT}{path}", json=payload
+            ) as resp:
+                status_code = resp.status_code
+                async for chunk in resp.aiter_text():
+                    chunks.append(chunk)
+                    joined = "".join(chunks)
+                    # Arrêt dès qu'on sait : inutile de lire tout le flux.
+                    if "text_delta" in joined or "thinking_delta" in joined or "event: error" in joined:
+                        break
+                    if "Free model request failed" in joined:
+                        break
+        if status_code is not None and status_code >= 400:
+            ok, detail = False, f"HTTP {status_code}"
+        else:
+            ok, detail = _canary_verdict("".join(chunks))
+    except Exception as exc:  # noqa: BLE001 — une sonde ne casse jamais le proxy
+        ok, detail = False, f"{type(exc).__name__}: {str(exc)[:120]}"
+    latency_ms = (time.monotonic() - started) * 1000.0
+    try:
+        from observability import canary as _canary_mod
+
+        _canary_mod.record(probe, ok, latency_ms=latency_ms, detail=detail)
+    except Exception:
+        pass
+    return {"ok": ok, "ms": round(latency_ms, 1), "detail": detail, "status": status_code}
+
+
+async def _canary_cycle(model_override: str = "") -> dict:
+    """Les deux protocoles clients, un modèle de référence, un verdict chacun."""
+    model = str(
+        model_override or yaml_get("canary", "model", "big-pickle") or "big-pickle"
+    )
+    timeout_s = float(yaml_get("canary", "timeout_s", 90) or 90)
+    # [storm-guard 2026-10-24] Si toute la chaîne free du modèle canary est
+    # trial-morte sur toutes les stations, les 2 sondes streaming brûleraient
+    # ~2×N appels amont + rotations pour un verdict connu d'avance — en pleine
+    # tempête AUTH ça aggrave le throttling NordVPN. Verdict degraded SANS
+    # trafic (la récupération reste détectée : dès qu'un cooldown expire, la
+    # prochaine sonde repasse par le réseau).
+    try:
+        _cf = _resolve_free_model(model) or model
+        _chain = _free_candidate_chain(model, _cf)
+        _pool_ok = bool(
+            _free_ip_pool is not None
+            and getattr(_free_ip_pool, "enabled", False)
+            and list(getattr(_free_ip_pool, "_stations", None) or [])
+        )
+        if _pool_ok and _chain and all(
+            _free_stations_exhausted(_m) for _m in _chain
+        ):
+            from observability import canary as _canary_mod
+
+            out = {}
+            for probe, _path in (
+                ("free.messages", "/v1/messages"),
+                ("free.chat", "/v1/chat/completions"),
+            ):
+                _canary_mod.record(
+                    probe, False, latency_ms=0.0, detail="skip trial-dead (no upstream call)"
+                )
+                out[probe] = {
+                    "ok": False,
+                    "ms": 0.0,
+                    "detail": "skip trial-dead (no upstream call)",
+                    "status": None,
+                }
+            _debug(f"  [canary] cycle skipped (trial-dead) {model!r}")
+            return {"model": model, "probes": out}
+    except Exception:
+        pass
+    out = {}
+    for probe, path in (
+        ("free.messages", "/v1/messages"),
+        ("free.chat", "/v1/chat/completions"),
+    ):
+        out[probe] = await _canary_probe_once(probe, path, model, timeout_s)
+    _debug(f"  [canary] cycle {out}")
+    return {"model": model, "probes": out}
+
+
+async def _free_canary_loop() -> None:
+    """Sonde périodique. Silencieuse : elle mesure, elle ne répare rien."""
+    interval = float(yaml_get("canary", "interval_s", 1800) or 1800)
+    if interval <= 0:
+        _debug("  [canary] interval<=0 : sonde desactivee")
+        return
+    # Laisse le proxy finir de démarrer (tunnels, découverte) avant de sonder.
+    await asyncio.sleep(min(60.0, interval))
+    while True:
+        try:
+            await _canary_cycle()
+        except Exception as exc:  # noqa: BLE001
+            _debug(f"  [canary] cycle error: {type(exc).__name__}: {exc}")
+        await asyncio.sleep(interval)
+
+
+@app.post("/api/canary/run")
+async def api_canary_run(model: str = ""):
+    """Déclenche un cycle immédiatement (vérification manuelle, tests).
+
+    ``?model=`` permet de sonder un modèle précis — utile pour constater qu'un
+    modèle refusé en amont fait bien basculer le canary en `failing`.
+    """
+    result = await _canary_cycle(model)
+    try:
+        from observability import canary as _canary_mod
+
+        return {"run": result, "state": _canary_mod.snapshot()}
+    except Exception:
+        return {"run": result, "state": {}}
+
+
+def _health_status_reasons(
+    *,
+    upstream_ok: bool,
+    open_breakers: list[str] | tuple[str, ...] = (),
+    pauses: dict | None = None,
+    canary_status: str | None = None,
+) -> tuple[str, list[str]]:
+    """[V8.7] Pourquoi `/health` dit `degraded` — la raison, pas seulement l'état.
+
+    Constaté en vrai : `/health` répondait `degraded` avec `upstream: ok`, aucun
+    circuit ouvert, et un chat free en 1,5 s. La cause était un **pause de clé
+    oublié** (`reason: "test"`, 275 s restantes) hérité d'une vérification. Un
+    statut sans raison oblige à deviner — et on devine mal.
+
+    Fonction pure : le statut et ses raisons se testent sans réseau.
+    """
+    raisons: list[str] = []
+    if not upstream_ok:
+        raisons.append("upstream unreachable")
+    for endpoint in open_breakers or ():
+        raisons.append(f"circuit open: {endpoint}")
+    for cle, info in (pauses or {}).items():
+        info = info if isinstance(info, dict) else {}
+        motif = info.get("reason") or "?"
+        restant = info.get("remaining_seconds")
+        if isinstance(restant, (int, float)):
+            raisons.append(f"key paused: {cle} ({motif}, {int(restant)}s left)")
+        else:
+            raisons.append(f"key paused: {cle} ({motif})")
+    if canary_status == "failing":
+        raisons.append("canary failing")
+    return ("degraded" if raisons else "ok"), raisons
 
 
 @app.get("/health")
@@ -14582,19 +16259,84 @@ async def health(detail: str = "lite"):
 
     # Check key pause status
     key_pause_status = _key_pauser.get_all_status()
-    any_paused = bool(key_pause_status)
-    if any_paused:
-        status = "degraded"
+    # [V8.7] Le statut est calculé une seule fois, avec ses raisons : le payload
+    # dit `degraded` ET pourquoi. Un pause de clé oublié (`reason: "test"`) a
+    # déjà fait croire à une panne du proxy.
+    _open_endpoints = [ep for ep, cb in _circuit_breakers.items() if cb.state == "open"]
+    status, status_reasons = _health_status_reasons(
+        upstream_ok=upstream_ok,
+        open_breakers=_open_endpoints,
+        pauses=key_pause_status,
+    )
     _debug(f"  [health] key pauses: {len(key_pause_status)} active, status={status}")
 
     _debug(f"  [health] overall status={status}")
-    return {
+    payload = {
         "status": status,
+        "status_reasons": status_reasons,
         "usage": usage,
         "upstream": "ok" if upstream_ok else "unreachable",
         "circuit_breakers": cb_status,
         "key_pauses": key_pause_status,
     }
+    # [V5.1] Incidents « flux amont vide » — seulement en vue complète : le
+    # payload léger est appelé toutes les 30 s par la supervision et ne doit
+    # pas grossir (cf. note ci-dessus sur le coût de sérialisation).
+    if _detail_full:
+        payload["empty_stream_incidents"] = empty_stream_stats()
+        # [V6.3.1] Répartition des échecs free par cause : c'est la mesure qui
+        # dira si la politique de reprise dépense ses rotations sur des refus
+        # de forme (403), où tourner ne sert à rien.
+        payload["free_failure_kinds"] = free_failure_stats()
+        # [V6.1.2] `gate` dit qu'un facteur a refusé ; ce compteur dit lequel.
+        payload["gate_factors"] = gate_factor_stats()
+        # [V6.3.2] Pannes imputées à une station : « 3:egress » se lit
+        # « la station 3 a été refusée 3 fois sur sa sortie ».
+        payload["station_faults"] = station_fault_stats()
+        # [V8.3] Latence par jambe ET par modèle. Le snapshot de latence existait
+        # déjà mais n'était rendu qu'en Prometheus sur une liste fermée de séries :
+        # les clés `leg_ms:*` n'y apparaissaient pas. Ici on les expose telles
+        # quelles, avec n / p50 / p95, pour répondre à « quel modèle est lent ».
+        try:
+            _leg_series = {
+                _k: {"n": int(_v[0]), "p50_ms": round(float(_v[1]), 1), "p95_ms": round(float(_v[2]), 1)}
+                for _k, _v in (_latency_snapshot() or {}).items()
+                if str(_k).startswith("leg_ms:")
+            }
+            if _leg_series:
+                payload["latency_by_leg"] = _leg_series
+                # [V6.3.4] Verdict SLO : plus besoin qu'un humain lise les
+                # percentiles pour savoir si « c'est lent ». La cible du plan est
+                # p50 < 4 s et p95 < 12 s ; une série jeune reste `unknown`
+                # (moins de 5 mesures ne fait pas une médiane).
+                try:
+                    from observability.slo import evaluate as _slo_evaluate
+
+                    payload["slo"] = _slo_evaluate(_leg_series)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        # [V8.2] Canary : « la jambe répond-elle vraiment ? ». Verdict par sonde,
+        # avec `failing` après trois échecs consécutifs. Un canary qui ne lit que
+        # le statut aurait déclaré `jev-1.13-free` sain pendant toute la panne.
+        try:
+            from observability import canary as _canary_mod
+
+            _canary_state = _canary_mod.snapshot()
+            payload["canary"] = _canary_state
+            if _canary_state.get("status") == "failing" and status == "ok":
+                status, raisons = _health_status_reasons(
+                    upstream_ok=upstream_ok,
+                    open_breakers=_open_endpoints,
+                    pauses=key_pause_status,
+                    canary_status="failing",
+                )
+                payload["status"] = status
+                payload["status_reasons"] = raisons
+        except Exception:
+            pass
+    return payload
 
 
 @app.get("/api/circuit-breakers")
@@ -14640,14 +16382,173 @@ async def key_pauses():
 
 @app.post("/api/key-pauses/reset")
 async def key_pauses_reset():
-    """Unpause all paused keys immediately."""
-    _key_pauser.cleanup_expired()
-    with _key_pauser._lock:
-        count = len(_key_pauser._paused)
-        _key_pauser._paused.clear()
-        _key_pauser._reasons.clear()
-    _log(f"  KEY PAUSES RESET: {count} pauses cleared")
+    """Annule tous les pauses de clé **et persiste** l'annulation.
+
+    [V8.8] Avant : vidait les dicts en mémoire sans `_save()`, donc le fichier
+    de pauses gardait les entrées et le redémarrage les rechargeait — un
+    `reason: "test"` oublié revenait à chaque boot et maintenait `/health` en
+    `degraded`.
+    """
+    try:
+        count = _key_pauser.unpause_all()
+    except AttributeError:
+        # compat si une sous-classe locale ne fournit pas encore unpause_all
+        _key_pauser.cleanup_expired()
+        with _key_pauser._lock:
+            count = len(_key_pauser._paused)
+            _key_pauser._paused.clear()
+            _key_pauser._reasons.clear()
+        _key_pauser._save()
+    _log(f"  KEY PAUSES RESET: {count} pauses cleared (persisted)")
     return {"reset": "all", "count": count}
+
+
+@app.get("/api/drift")
+async def api_drift():
+    """[V8.1] Écart entre le catalogue de l'éditeur et ce que le proxy route.
+
+    Deux listes, et une seule est actionnable sans mesure :
+
+    * ``orphans`` — routé mais absent du catalogue : l'éditeur ne le propose
+      plus, la requête partira pour un modèle mort. **Actionnable.**
+    * ``candidates`` — dans le catalogue mais non routé : ce n'est pas un
+      manque. Sur 81 ids free non exposés, la mesure n'en a trouvé qu'un de
+      servable (`big-pickle`). Une liste de candidats est une invitation à
+      mesurer, pas un défaut.
+    """
+    try:
+        from observability.drift import compute as _drift_compute
+        from observability.drift import summarise as _drift_summarise
+
+        sections = []
+        routes = dict(getattr(_cfg_settings, "MODELS", {}) or {})
+        free_routed_raw = {name for name in routes if _is_free_model_route(name)}
+        # [V8.1] Les noms routés ne sont pas les noms *envoyés* : un alias comme
+        # `jev-1.13` part en `jev-1.13-free`. Comparer les alias au catalogue
+        # fabriquait huit faux orphelins — le genre de bruit qui rend un tableau
+        # de bord inutilisable. On compare donc ce qui part réellement.
+        fmap = dict(getattr(_cfg_settings, "FREE_MODEL_MAP", None) or {})
+        free_routed = {fmap.get(name, name) for name in free_routed_raw}
+        paid_routed = set(routes) - free_routed_raw
+        snapshot = getattr(_cfg_settings, "CATALOG_ROUTES", None) or {}
+        try:
+            last = _cfg_settings.CATALOG_ROUTES_FILE.stat().st_mtime
+            generated_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(last))
+        except Exception:
+            generated_at = None
+        for leg, catalog, routed in (
+            ("free", snapshot.get("opencode") or {}, free_routed),
+            ("paid", snapshot.get("opencode-go") or {}, paid_routed),
+        ):
+            sections.append(_drift_compute(catalog, routed, leg))
+        # [V8.1] Un id absent du snapshot mais **dont le dernier appel a réussi**
+        # ne prouve pas qu'il est mort : il prouve que le snapshot a vieilli.
+        # On n'annote qu'avec des succès — `jev-1.13-free` a été « observé »
+        # pendant des heures en échouant à chaque fois, ce qui n'est pas une
+        # preuve de service.
+        try:
+            from observability.drift import annotate as _drift_annotate
+            from observability.metrics import leg_ok_models as _leg_ok_models
+
+            _observed = _leg_ok_models()
+            sections = [_drift_annotate(section, _observed) for section in sections]
+        except Exception:
+            pass
+        payload = _drift_summarise(sections)
+        payload["snapshot_at"] = generated_at
+        return payload
+    except Exception as exc:
+        return {"status": "unknown", "error": str(exc), "legs": []}
+
+
+@app.get("/api/free-health")
+async def api_free_health():
+    """[V8.1] Quels modèles free ont réellement servi depuis le démarrage.
+
+    Un `200` du proxy ne prouve rien : quand l'amont refuse un modèle, le proxy
+    renvoie `200` avec une trame d'erreur. Ne compte donc ici que les séries
+    dont le **dernier** appel a réussi.
+
+    [V8.5] Les modèles **SystemOne** (`jev-*`) sont comptés à part : ils ne
+    parlent pas le protocole de chat, donc un échec en chat ne dit rien de leur
+    santé. Les mélanger faisait passer un mauvais protocole pour une panne
+    d'amont — l'erreur d'analyse qui a coûté une soirée.
+    """
+    try:
+        from observability.metrics import leg_ok_models as _leg_ok_models
+
+        ok = _leg_ok_models()
+    except Exception:
+        ok = set()
+    routes = dict(getattr(_cfg_settings, "MODELS", {}) or {})
+
+    def _is_systemone(name: str) -> bool:
+        try:
+            endpoint = (routes.get(name) or {}).get("endpoint") or ""
+        except Exception:
+            endpoint = ""
+        return "systemone" in endpoint
+
+    free_routed = sorted({name for name in routes if _is_free_model_route(name)})
+    chat_routed = [name for name in free_routed if not _is_systemone(name)]
+    systemone = [name for name in free_routed if _is_systemone(name)]
+    served = sorted(name for name in chat_routed if name in ok)
+    unproven = sorted(name for name in chat_routed if name not in ok)
+    return {
+        "routed": len(free_routed),
+        "served": served,
+        "unproven": unproven,
+        "systemone": systemone,
+        "quotas": _free_quota_states(),
+        "note": (
+            "`unproven` = aucun succès observé depuis le démarrage : soit le "
+            "modèle n'a pas été appelé, soit il est refusé en amont. Un 200 du "
+            "proxy ne suffit pas à conclure. `systemone` = autre protocole "
+            "(/v1/systemone), jamais jugé sur le chat. `quotas` = clés "
+            "(modèle, IP) en cooldown avec scope et retour estimé."
+        ),
+    }
+
+
+def _free_quota_states(limit: int = 200) -> list:
+    """État des cooldowns (modèle, IP) : scope + retour estimé.
+
+    Alimenté par les 429 amont (scope = trial-exhausted / rate-limited /
+    transient). `retry_in_s` = secondes restantes, `retry_at` = heure
+    locale estimée du prochain essai. Borné, trié par retour croissant,
+    fail-soft (jamais de 500 pour de l'observabilité).
+    """
+    try:
+        import datetime as _dt
+
+        now_m = time.monotonic()
+        with _free_cooldown_lock:
+            items = [
+                (k, t, _free_cooldown_scope.get(k, ""))
+                for k, t in _free_model_cooldowns.items()
+                if t > now_m
+            ]
+        out = []
+        for key, expiry, scope in items:
+            try:
+                model, _, ip = key.partition("|")
+                remain = max(0.0, expiry - now_m)
+                _eta = _dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(seconds=remain)
+                out.append(
+                    {
+                        "model": model,
+                        "ip": ip,
+                        "scope": scope or "unknown",
+                        "retry_in_s": round(remain, 1),
+                        "retry_at": _eta.isoformat(timespec="seconds") + "Z",
+                    }
+                )
+            except Exception:
+                continue
+        out.sort(key=lambda e: e["retry_in_s"])
+        return out[: max(1, int(limit))]
+    except Exception:
+        return []
 
 
 @app.get("/api/free-models")
@@ -14663,6 +16564,8 @@ async def free_models():
         "next_refresh": st.get("next_refresh"),
         "source": st.get("source", "none"),
         "consecutive_failures": int(st.get("consecutive_failures", 0) or 0),
+        # [Lot A] sonde active de servabilité — verdicts par id
+        "probe": dict(st.get("probe", {}) or {}),
     }
 
 
@@ -14858,6 +16761,17 @@ async def chat_completions(request: Request):
     endpoint = cfg["endpoint"]
     protocol = cfg["protocol"]
     _debug(f"[chat] route: {original_model!r} → {model_id} | {protocol} | endpoint={endpoint}")
+
+    # [V8.5] Mauvais protocole (voir handler messages) : un modèle SystemOne
+    # n'accepte pas un corps de chat. Le dire vaut mieux que laisser l'amont
+    # répondre « Invalid request » et faire croire à une panne.
+    if "systemone" in (endpoint or ""):
+        _log(f"  [chat] ✗ {original_model!r} est un modèle SystemOne, pas un chat")
+        return _openai_error(
+            400,
+            f"Model {original_model!r} uses the SystemOne protocol "
+            f"(questions/state), not chat. POST it to /v1/systemone instead.",
+        )
 
     # [Compaction garde opt-in] voir handler messages (warn log / deny 413).
     _huge_level, _huge_msg = _huge_context_verdict(body, body_bytes)
@@ -15186,7 +17100,7 @@ async def chat_completions(request: Request):
                                 except Exception:
                                     _ch_mk = 2048
                                 try:
-                                    _ch_mk = min(max(int(_ch_mk), 1), 4096)
+                                    _ch_mk = min(max(int(_ch_mk), 1), 32000)
                                 except Exception:
                                     _ch_mk = 2048
                                 try:
@@ -15614,6 +17528,7 @@ async def chat_completions(request: Request):
                                         tool_names,
                                         request_body,
                                         "chat-stream",
+                                    client_protocol="openai",
                                     )
                                     if _refuse:
                                         yield _refuse_bytes
@@ -15635,6 +17550,7 @@ async def chat_completions(request: Request):
                                             client_ip,
                                             tool_names,
                                             request_body,
+                                        client_protocol="openai",
                                         )
                                         return
                                     yield (
@@ -15677,6 +17593,7 @@ async def chat_completions(request: Request):
                                         client_ip,
                                         tool_names,
                                         request_body,
+                                    client_protocol="openai",
                                     )
                                     return
                                 continue
@@ -16067,6 +17984,7 @@ async def chat_completions(request: Request):
                                         request_body=request_body,
                                         free_status=429,
                                         error_label="upstream_free_empty_response",
+                                    client_protocol="openai",
                                     )
                                     return
                                 yield (
@@ -16120,6 +18038,7 @@ async def chat_completions(request: Request):
                                     request_body=request_body,
                                     free_status=429,
                                     error_label="upstream_free_empty_response",
+                                client_protocol="openai",
                                 )
                                 return
                             continue
@@ -16200,6 +18119,7 @@ async def chat_completions(request: Request):
                                 # motif exact du faux-vert mesuré (532 synthèses).
                                 _debug("  [oai-stream] empty upstream response → error (no false stop)")
                                 _log("  upstream produced no output → error (no synthesized stop)")
+                                _note_empty_stream(model_id, "paid")
                                 yield (
                                     b"data: "
                                     + _json_dumps_str(
@@ -16910,6 +18830,7 @@ async def chat_completions(request: Request):
                                     tool_names,
                                     request_body,
                                     "anthro-to-oai-stream",
+                                client_protocol="openai",
                                 )
                                 if _refuse:
                                     yield _refuse_bytes
@@ -16937,6 +18858,7 @@ async def chat_completions(request: Request):
                                     client_ip,
                                     tool_names,
                                     request_body,
+                                client_protocol="openai",
                                 )
                                 return
                             continue
@@ -17545,28 +19467,64 @@ async def _systemone_free_via_pool(endpoint: str, body: dict, headers: dict, for
                 tried.add(station)  # on_request pick = first strike
             _free_used = 0
         while not _hedge_done and resp is None and _free_used < free_max:
-            if _free_used == 0 and station is not None:
+            if _free_used == 0 and station is not None and not _free_trial_dead_active(free_model, station):
+                # [trial-dead] voir boucle générique : ne pas brûler le 1er
+                # essai sur une clé (modèle, IP) cliniquement morte.
                 attempt = station
             elif pool is not None:
                 if getattr(pool, "socks5_mode", False):
                     # _socks5_next n'a pas de forced_pool (proxies statiques
                     # sans sémantique pays) — l'exclusion cumulative suffit.
-                    attempt = pool._socks5_next(excluded=tried)
+                    # [trial-dead] proxies morts d'abord, repli legacy sinon.
+                    try:
+                        _s1_dead = _trial_dead_stations(free_model)
+                    except Exception:
+                        _s1_dead = set()
+                    _s1_excl = (set(tried) if tried else set()) | _s1_dead
+                    attempt = pool._socks5_next(excluded=_s1_excl)
+                    if attempt is None and _s1_dead:
+                        attempt = pool._socks5_next(excluded=tried)
                 else:
                     # forced_pool threadé (géo future) ; repli no-arg pour les
                     # vieux doubles de test sans le paramètre.
+                    # [trial-dead] clés mortes sautées d'abord, retentées en
+                    # repli (early-recovery toujours possible).
                     try:
-                        attempt = (
-                            pool._best_station_excluding_many(tried, forced_pool)
-                            if tried
-                            else pool._best_station(forced_pool)
-                        )
-                    except TypeError:
-                        attempt = (
-                            pool._best_station_excluding_many(tried)
-                            if tried
-                            else pool._best_station()
-                        )
+                        _s1_dead = _trial_dead_stations(free_model)
+                    except Exception:
+                        _s1_dead = set()
+                    _s1_excl = (set(tried) if tried else set()) | _s1_dead
+                    if _s1_excl:
+                        try:
+                            attempt = pool._best_station_excluding_many(_s1_excl, forced_pool)
+                        except TypeError:
+                            attempt = pool._best_station_excluding_many(_s1_excl)
+                        if attempt is None and _s1_dead:
+                            try:
+                                attempt = (
+                                    pool._best_station_excluding_many(tried, forced_pool)
+                                    if tried
+                                    else pool._best_station(forced_pool)
+                                )
+                            except TypeError:
+                                attempt = (
+                                    pool._best_station_excluding_many(tried)
+                                    if tried
+                                    else pool._best_station()
+                                )
+                    else:
+                        try:
+                            attempt = (
+                                pool._best_station_excluding_many(tried, forced_pool)
+                                if tried
+                                else pool._best_station(forced_pool)
+                            )
+                        except TypeError:
+                            attempt = (
+                                pool._best_station_excluding_many(tried)
+                                if tried
+                                else pool._best_station()
+                            )
                 if attempt is not None:
                     tried.add(attempt)
             else:
@@ -17597,11 +19555,16 @@ async def _systemone_free_via_pool(endpoint: str, body: dict, headers: dict, for
                 free_ip = attempt.current_ip
             elif getattr(attempt, "pid", None):
                 free_ip = attempt.pid
+            try:
+                _s1_inst = _ip_vault().snapshot(free_ip) if (_per_ip_identity_enabled() and free_ip) else {}
+            except Exception:
+                _s1_inst = {}
             _current_free_attempt.set(
                 {
                     "ip": free_ip,
                     "identity": _current_free_identity(attempt).get("impersonate") or "",
                     "station": attempt,
+                    "instance": _s1_inst,
                 }
             )
             station = attempt  # cooldown + on_quota_exhausted ciblent CETTE IP
@@ -17760,7 +19723,11 @@ async def _systemone_free_via_pool(endpoint: str, body: dict, headers: dict, for
             f"free {free_model}: pool indisponible (proxy_mode={proxy_mode}) — pas de direct résidentiel",
             status_code=503,
         )
-    wire_headers = _official_free_headers(endpoint or "", _body_conversation_key(body))
+    try:
+        _sys_direct_ip = await _get_cached_public_ip()
+    except Exception:
+        _sys_direct_ip = "direct"
+    wire_headers = _official_free_headers(endpoint or "", _body_conversation_key(body), _sys_direct_ip or None)
     # [Lot 1] SystemOne répond du JSON brut `{model, answers, usage}` (jamais
     # de SSE) : PAS de `_do_free_direct_request` ici — son stream forcé +
     # collecte `_collect_chat_completion` transformerait le JSON en
@@ -18949,7 +20916,7 @@ async def responses(request: Request):
                         except Exception:
                             _r6_mk = 2048
                         try:
-                            _r6_mk = min(max(int(_r6_mk), 1), 4096)
+                            _r6_mk = min(max(int(_r6_mk), 1), 32000)
                         except Exception:
                             _r6_mk = 2048
                         try:
@@ -19738,6 +21705,10 @@ if __name__ == "__main__":
         # dépendait du CWD du lanceur — deux lancements depuis des CWD
         # différents créaient deux locks distincts et deux instances vives.
         os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", f"opencode-{PORT}.lock"),
+        # [V8.6] host/port pour que le message FATAL dise si le détenteur du
+        # verrou sert encore quelque chose, ou n'est qu'un zombie.
+        host=HOST,
+        port=PORT,
         # [Phase 8] DI explicite (ops/lock.py pur).
         log_fn=_log,
         debug_fn=_debug,

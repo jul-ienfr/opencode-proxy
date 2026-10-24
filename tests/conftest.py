@@ -175,3 +175,18 @@ def _reset_web_caches():
     _neuf()
     yield
     _neuf()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_ip_identity_vault(tmp_path, monkeypatch):
+    """Vault d'identites par IP hermetique entre tests.
+
+    Sans ca, les tests qui exercent la jambe free avec de fausses IPs
+    ecriraient dans le vrai `logs/identities/` (etat runtime persistant).
+    """
+    monkeypatch.setenv("OPENCODE_IDENTITIES_DIR", str(tmp_path / "identities"))
+    import free.identities as _fi
+
+    _fi._VAULT = None
+    yield
+    _fi._VAULT = None

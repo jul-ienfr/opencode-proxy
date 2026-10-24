@@ -42,15 +42,41 @@ OUR_PROVIDERS = (PAID_PROVIDER, FREE_PROVIDER)
 INTERNAL_IDS = ("jev-1.13", "jev-1.13-free")
 
 # `npm` → famille d'API. Le `npm` est une clé de **niveau provider** dans le
-# catalogue live (`provider.npm`), et ABSENTE au niveau modèle : aucune entrée
-# de `models:` n'en porte. Elle désigne le package ai-sdk que l'éditeur emploie
-# pour parler au endpoint du provider — d'où la famille d'API qui en découle.
+# catalogue live (`provider.npm`), **surchargeable au niveau modèle** — et il
+# l'est massivement : 66 des 128 modèles de la jambe `opencode` portent leur
+# propre `provider.npm` (32 `@ai-sdk/openai`, 24 `@ai-sdk/anthropic`,
+# 9 `@ai-sdk/google`, 1 `@ai-sdk/mistral`), mesuré le 2026-10-20.
+#
+# [CORRECTION 2026-10-20] Ce commentaire affirmait le contraire (« ABSENTE au
+# niveau modèle : aucune entrée de `models:` n'en porte »). C'était faux, et
+# c'est précisément l'erreur qui empêchait le proxy de router correctement :
+# en croyant le `npm` purement global, la table statique ne pouvait pas
+# déduire qu'un modèle donné parle `/messages` ou un protocole gemini.
+#
 # Règle officielle : packages/core/src/provider/model.ts:141-162.
 NPM_TO_API = {
     "@ai-sdk/anthropic": "messages",
     "@ai-sdk/openai": "responses",
     "@ai-sdk/openai-compatible": "chat",
+    # [AJOUT 2026-10-20] Ces deux familles existent dans le catalogue live et
+    # étaient absentes de la table : 10 modèles (9 free + 1 payant) n'avaient
+    # donc aucune route dérivable, et le `npm` était traité comme « inconnu ».
+    "@ai-sdk/google": "gemini",
+    "@ai-sdk/mistral": "chat",
 }
+
+#: Familles d'API connues. `gemini` n'est pas implémentée par le proxy
+#: aujourd'hui : elle doit produire un refus **explicite** (501), jamais un
+#: repli silencieux vers `/chat/completions`.
+KNOWN_API_FAMILIES = ("chat", "messages", "responses", "gemini")
+
+#: Marqueurs d'URL qui trahissent la famille sans consulter le `npm`. Le
+#: catalogue porte l'URL par modèle, ce qui est plus fiable qu'une table.
+_API_URL_MARKERS = (
+    ("/anthropic/", "messages"),
+    ("/google/", "gemini"),
+    ("/gemini/", "gemini"),
+)
 
 # Un id tiers peut être hébergé par une demi-douzaine de providers (7298 ids du
 # catalogue live sont hors de notre périmètre). Le message de refus n'en nomme
@@ -195,6 +221,117 @@ def api_family_for_npm(npm: str | None) -> str | None:
     que cette matrice existe pour éviter.
     """
     return NPM_TO_API.get(str(npm or "").strip()) if npm else None
+
+
+# ─────────── Résolution PAR MODÈLE (alignement client 1.19.3) ────────────────
+#
+# Le catalogue porte, pour CHAQUE modèle, un bloc ``provider`` :
+#
+#     "qwen3.6-plus-free": {"provider": {"npm": "@ai-sdk/anthropic",
+#                                        "api": "https://opencode.ai/inference/anthropic/v1"}}
+#
+# Mesuré le 2026-10-20 sur les 161 modèles de nos deux jambes : ``api`` est
+# TOUJOURS présent par modèle, ``npm`` ne l'est que 66 fois sur 128 (le reste
+# hérite du provider). C'est la règle officielle de l'éditeur
+# (`packages/core/src/plugin/provider/opencode.ts:124-160`) et c'est plus
+# fiable qu'une table : l'URL de l'amont vient de la donnée, pas d'une
+# supposition sur le protocole.
+
+
+def model_provider_block(catalog: dict, provider: str, model_id: str) -> dict:
+    """Bloc ``provider`` **du modèle** (surcharge), ou ``{}`` s'il n'y en a pas.
+
+    Ne rend jamais autre chose qu'un dict : les appelants comparent des
+    chaînes, et un ``None`` leur ferait écrire des ``if`` défensifs partout.
+    """
+    entry = ((catalog.get(provider) or {}).get("models") or {}).get(model_id)
+    if not isinstance(entry, dict):
+        return {}
+    block = entry.get("provider")
+    return block if isinstance(block, dict) else {}
+
+
+def model_api(catalog: dict, provider: str, model_id: str) -> str | None:
+    """URL d'API effective du modèle : surcharge modèle, sinon provider.
+
+    C'est la **seule** source fiable de l'endpoint amont : elle est servie par
+    l'éditeur et change sans préavis (les bases ``/inference/v1`` et
+    ``/zen/go/v1`` codées en dur par le proxy y ont déjà survécu par chance).
+    """
+    own = model_provider_block(catalog, provider, model_id).get("api")
+    if isinstance(own, str) and own.strip():
+        return own.strip()
+    inherited = (catalog.get(provider) or {}).get("api")
+    return str(inherited).strip() if inherited else None
+
+
+def model_npm(catalog: dict, provider: str, model_id: str) -> str | None:
+    """Package ai-sdk effectif du modèle : surcharge modèle, sinon provider."""
+    own = model_provider_block(catalog, provider, model_id).get("npm")
+    if isinstance(own, str) and own.strip():
+        return own.strip()
+    return provider_npm(catalog, provider)
+
+
+def api_family_for_url(api_url: str | None) -> str | None:
+    """Famille déduite de l'URL amont, sans consulter le ``npm``.
+
+    Plus robuste que la table : si l'éditeur ajoute une famille, l'URL la
+    nomme. ``None`` = aucune signature reconnue (l'appelant doit alors
+    interroger le ``npm``, puis refuser s'il ne sait toujours pas).
+    """
+    if not api_url:
+        return None
+    low = str(api_url).lower()
+    for marker, family in _API_URL_MARKERS:
+        if marker in low:
+            return family
+    return None
+
+
+def api_family_for_model(catalog: dict, provider: str, model_id: str) -> str | None:
+    """Famille d'API d'un modèle : par l'URL d'abord, par le ``npm`` ensuite.
+
+    L'ordre n'est pas arbitraire. L'URL dit où l'on écrit ; le ``npm`` dit avec
+    quel client. Quand les deux se contredisent, c'est l'URL qui gagne, parce
+    que c'est elle qui reçoit la requête. ``None`` = inconnue : refuser en
+    nommant le modèle, ne jamais retomber sur ``/chat/completions``.
+    """
+    by_url = api_family_for_url(model_api(catalog, provider, model_id))
+    if by_url:
+        return by_url
+    return api_family_for_npm(model_npm(catalog, provider, model_id))
+
+
+#: Famille d'API → protocole du proxy. Le protocole décide de la **conversion**
+#: (Anthropic ↔ OpenAI) et de la forme du corps ; la famille décide de l'**URL**.
+#: `gemini` n'a pas de protocole : aucun convertisseur n'existe côté proxy, et
+#: c'est précisément pourquoi elle doit produire un refus explicite.
+FAMILY_TO_PROTOCOL = {
+    "chat": "openai",
+    "responses": "openai",
+    "messages": "anthropic",
+}
+
+
+def route_for_model(catalog: dict, provider: str, model_id: str) -> dict | None:
+    """Route complète d'un modèle d'après le catalogue ; ``None`` si indécidable.
+
+    Rend ``{"family", "protocol", "base_url", "source": "catalog"}``. Le
+    ``protocol`` peut être ``None`` pour une famille connue mais non convertie
+    (``gemini``) : l'appelant doit alors refuser en le nommant, jamais retomber
+    sur un protocole par défaut.
+    """
+    family = api_family_for_model(catalog, provider, model_id)
+    base_url = model_api(catalog, provider, model_id)
+    if not family or not base_url:
+        return None
+    return {
+        "family": family,
+        "protocol": FAMILY_TO_PROTOCOL.get(family),
+        "base_url": base_url,
+        "source": "catalog",
+    }
 
 
 def is_servable(model_id: str, catalog: dict) -> bool:

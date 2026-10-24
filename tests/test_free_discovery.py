@@ -295,7 +295,9 @@ class TestApplyPersist:
             assert "acme-x-free" in st.MODELS
             assert st.FREE_MODEL_MAP.get("acme-x") == "acme-x-free"
             assert added == 1
-            assert st.FREE_MODEL_POOL == ["acme-x-free"]
+            # [CORRECTION 2026-10-20] Le pool inclut l'overlay des modèles
+            # vérifiés (big-pickle) : on vérifie la partie issue de la découverte.
+            assert [m for m in st.FREE_MODEL_POOL if m not in st._EXPOSED_VERIFIED_IDS] == ["acme-x-free"]
         finally:
             _restore_settings(st, old)
 

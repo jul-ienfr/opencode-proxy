@@ -193,6 +193,42 @@ def free_refusal_response(exc: FreeRefusal, protocol: str, *, anthropic_error_fn
 
 # ─────────── [PLAN_AUDIT_CLIENT_OFFICIEL G1] classement des erreurs amont ───────────
 
+# [V5.2] Vocabulaires d'erreurs acceptés pour un relais « tel quel ».
+# Anthropic et OpenAI ne partagent pas leurs noms de type : `server_error` est
+# un type OpenAI, absent du vocabulaire Anthropic (qui dit `api_error` pour un
+# 5xx). Relayer un type étranger au client n'est pas de la fidélité — c'est un
+# nom qu'il ne sait pas interpréter. On filtre donc par vocabulaire du CLIENT.
+_ANTHROPIC_ERROR_TYPES: frozenset = frozenset(
+    {
+        "api_error",
+        "authentication_error",
+        "billing_error",
+        "invalid_request_error",
+        "not_found_error",
+        "overloaded_error",
+        "permission_error",
+        "rate_limit_error",
+        "request_too_large",
+        "timeout_error",
+    }
+)
+_OPENAI_ERROR_TYPES: frozenset = frozenset(
+    {
+        "api_error",
+        "authentication_error",
+        "context_length_exceeded",
+        "insufficient_quota",
+        "invalid_request_error",
+        "not_found_error",
+        "overloaded_error",
+        "permission_error",
+        "rate_limit_error",
+        "rate_limit_exceeded",
+        "server_error",
+        "timeout_error",
+    }
+)
+
 # Le client officiel ne se fie pas au seul statut HTTP : il lit le CORPS de
 # l'erreur amont pour décider du traitement
 # (`packages/opencode/src/provider/error.ts:102-154`, bibliothèque de motifs
@@ -285,17 +321,187 @@ def _match_upstream_motif(body: object):
     message d'exception). Rend ``None`` si aucun motif ne correspond — dans ce
     cas l'appelant garde son comportement par défaut (``api_error``).
     Le label gateway `[code]` est déplié avant match (parité Zen).
+
+    [V0.5] Les motifs de surcharge sont ignorés quand le corps parle de débit
+    (« rate limit », « too many requests ») : le client officiel a exactement
+    cette exclusion (`provider-error.ts:34`) pour l'overflow de contexte, et
+    notre motif « try again » attrapait « rate limit exceeded, try again later »
+    en `overloaded_error`. Un débit n'est pas une surcharge : il se traite en
+    `rate_limit_error`, avec le `retry-after` que le client sait lire.
     """
     if not isinstance(body, str) or not body:
         return None
     try:
         hay = _strip_gateway_label(body)
+        parle_de_debit = bool(re.search(r"rate limit|too many requests|throttl", hay, re.IGNORECASE))
         for rx, etype, retryable, pause in _MOTIF_RES:
             if rx.search(hay):
+                if etype == "overloaded_error" and parle_de_debit:
+                    continue
                 return etype, retryable, pause
     except Exception:
         return None
     return None
+
+
+def extract_upstream_error_type(body: object, vocab: str = "anthropic") -> str | None:
+    """[V5.2] Type d'erreur **explicite** du corps amont, s'il est utilisable tel quel.
+
+    V5.2 demande qu'un `event: error` amont soit transmis « tel quel (type,
+    message) » — pas retraduit. Or ``classify_upstream_error`` ne reconnaît que
+    les motifs de surcharge : un amont qui dit clairement
+    ``{"error":{"type":"rate_limit_error",…}}`` ressortait en ``api_error``,
+    c'est-à-dire une information perdue alors qu'elle était explicite.
+
+    ``vocab`` est le vocabulaire du **client** visé (``"anthropic"`` pour
+    ``/v1/messages``, ``"openai"`` pour ``/v1/chat/completions``). Un type
+    absent de ce vocabulaire n'est pas relayé : le client ne saurait pas
+    l'interpréter, et le proxy perdrait le mapping de parité déjà vérifié
+    (``core/errors.py`` motifs → types Anthropic).
+
+    Pur, jamais de raise. Rend ``None`` quand le corps n'offre rien d'exploitable.
+    """
+    if not isinstance(body, str) or not body.strip():
+        return None
+    try:
+        import json as _json
+
+        data = _json.loads(body)
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    err = data.get("error")
+    if not isinstance(err, dict):
+        err = data
+    etype = err.get("type")
+    if not isinstance(etype, str):
+        return None
+    etype = etype.strip()
+    autorises = _OPENAI_ERROR_TYPES if str(vocab).lower() == "openai" else _ANTHROPIC_ERROR_TYPES
+    return etype if etype in autorises else None
+
+
+# ---------------------------------------------------------------------------
+# [V0.5] Table de classification de RÉFÉRENCE, copiée du client officiel
+# (`packages/llm/src/route/executor.ts:225-275` + `provider-error.ts:4-43`).
+#
+# Pourquoi la recopier plutôt que la résumer : nos motifs (ci-dessous) sont
+# classés par TEXTE, le client officiel est classé par STATUT avec un motif
+# secondaire. Les deux ne se recouvrent pas — un 429 « Too many requests »
+# tombait chez nous en `api_error` alors que le client officiel en fait un
+# rate limit. Cette table rend l'écart VISIBLE et testable.
+# ---------------------------------------------------------------------------
+
+# `provider-error.ts:4-32` — 27 motifs d'overflow de contexte.
+_CONTEXT_OVERFLOW_PATTERNS: tuple = tuple(
+    re.compile(p, re.IGNORECASE)
+    for p in (
+        r"prompt is too long",
+        r"request_too_large",
+        r"input is too long for requested model",
+        r"exceeds the context window",
+        r"exceeds (?:the )?(?:model'?s )?maximum context length(?: of [\d,]+ tokens?|\s*\([\d,]+\))?",
+        r"input token count.*exceeds the maximum",
+        r"tokens in request more than max tokens allowed",
+        r"maximum prompt length is \d+",
+        r"reduce the length of the messages",
+        r"maximum context length is \d+ tokens",
+        r"exceeds (?:the )?maximum allowed input length of [\d,]+ tokens?",
+        r"input \(\d+ tokens\) is longer than the model'?s context length \(\d+ tokens\)",
+        r"exceeds the limit of \d+",
+        r"exceeds the available context size",
+        r"greater than the context length",
+        r"context window exceeds limit",
+        r"exceeded model token limit",
+        r"context[_ ]length[_ ]exceeded",
+        r"request entity too large",
+        r"context length is only \d+ tokens",
+        r"input length.*exceeds.*context length",
+        r"prompt too long; exceeded (?:max )?context length",
+        r"too large for model with \d+ maximum context length",
+        r"prompt has [\d,]+ tokens?, but the configured context size is [\d,]+ tokens?",
+        r"model_context_window_exceeded",
+        r"too many tokens",
+        r"token limit exceeded",
+    )
+)
+# `provider-error.ts:34` — ces textes parlent de débit, pas de taille.
+_CONTEXT_OVERFLOW_EXCLUSIONS: tuple = tuple(
+    re.compile(p, re.IGNORECASE)
+    for p in (r"^(throttling error|service unavailable):", r"rate limit", r"too many requests")
+)
+
+# `executor.ts:91` — statuts que le client officiel rejoue.
+_RETRYABLE_STATUSES: frozenset = frozenset({429, 503, 504, 529})
+
+# Classe officielle → type d'erreur émis sur le fil.
+# 5xx et inconnu restent `api_error` : c'est le type Anthropic pour un échec
+# serveur (`server_error` est un nom OpenAI — cf. extract_upstream_error_type).
+_STATUS_CLASS_TO_TYPE: dict = {
+    "content_policy": "invalid_request_error",
+    "authentication": "authentication_error",
+    "permission": "permission_error",
+    "quota": "permission_error",
+    "rate_limit": "rate_limit_error",
+    "invalid_request": "invalid_request_error",
+    "context_overflow": "invalid_request_error",
+    "provider_internal": "api_error",
+    "unknown": "api_error",
+}
+
+
+def is_context_overflow(message: object) -> bool:
+    """[V0.5] Miroir de `isContextOverflow` (`provider-error.ts:36-38`).
+
+    L'exclusion est aussi importante que les motifs : « throttling error » ou
+    « rate limit » ne disent pas que le prompt est trop long, et les classer en
+    overflow ferait compacter le client pour rien.
+    """
+    if not isinstance(message, str) or not message:
+        return False
+    if any(rx.search(message) for rx in _CONTEXT_OVERFLOW_EXCLUSIONS):
+        return False
+    return any(rx.search(message) for rx in _CONTEXT_OVERFLOW_PATTERNS)
+
+
+def classify_status_class(status: object, body: object = "") -> str:
+    """[V0.5] Classe officielle d'un échec amont — `(statut, corps) → classe`.
+
+    Ordre EXACT de `executor.ts:233-274` : le corps « content policy » gagne sur
+    tout, puis 401, 403, 429 (quota vs rate limit), 400/404/409/413/422, puis
+    ≥500 ou statut rejouable, puis inconnu.
+
+    Rend un nom de classe officiel (`rate_limit`, `invalid_request`, …) —
+    jamais un type de fil : la traduction est le travail de
+    ``_STATUS_CLASS_TO_TYPE``, et la garder séparée permet de comparer les deux
+    vocabulaires sans les confondre.
+    """
+    try:
+        statut = int(status)
+    except (TypeError, ValueError):
+        statut = 502
+    hay = body if isinstance(body, str) else ""
+    if not hay and isinstance(body, (bytes, bytearray)):
+        hay = bytes(body).decode("utf-8", "replace")
+    try:
+        if re.search(r"content[-_\s]?policy|content_filter|safety", hay, re.IGNORECASE):
+            return "content_policy"
+    except Exception:
+        pass
+    if statut == 401:
+        return "authentication"
+    if statut == 403:
+        return "permission"
+    if statut == 429:
+        if re.search(r"insufficient[-_\s]?quota|quota[-_\s]?exceeded", hay, re.IGNORECASE):
+            return "quota"
+        return "rate_limit"
+    if statut in (400, 404, 409, 413, 422):
+        return "context_overflow" if is_context_overflow(hay) else "invalid_request"
+    if statut >= 500 or statut in _RETRYABLE_STATUSES:
+        return "provider_internal"
+    return "unknown"
 
 
 def classify_upstream_error(status: object, body: object) -> tuple:
@@ -317,7 +523,14 @@ def classify_upstream_error(status: object, body: object) -> tuple:
         return status_i, "permission_error"
     _m = _match_upstream_motif(body)
     if _m is None:
-        return status_i, "api_error"
+        # [V0.5] Aucun motif : on retombe sur la table de RÉFÉRENCE du client
+        # officiel, classée par statut. Avant, tout corps sans motif sortait en
+        # `api_error` — y compris un 429 « Too many requests » (le client
+        # officiel en fait un rate limit) et un 401 sans message (le client
+        # officiel en fait une erreur d'authentification). Les motifs gardent la
+        # priorité : ils sont plus spécifiques qu'un statut.
+        _classe = classify_status_class(status_i, body)
+        return status_i, _STATUS_CLASS_TO_TYPE.get(_classe, "api_error")
     return status_i, _m[0]
 
 
@@ -384,6 +597,86 @@ def is_free_quota_failure(status: object, body: object) -> bool:
     return False
 
 
+# Durées humaines dans un corps d'erreur 429 (« retry in 3hr 12min »,
+# « quota resets in 2 days », « 45min ») — repli quand l'en-tête Retry-After
+# est absent (cas réel : 429 trial zen sans header, 17/08). Somme des
+# composantes jour/heure/minute rencontrées ; None si aucune ou hors
+# (0, 86400]. Pur, jamais de raise. Ne pas appeler sur un corps non-quota :
+# une durée y serait décorrelée du quota (l'appelant a déjà classé).
+_BODY_DURATION_RES = (
+    (re.compile(r"(\d+)\s*d(?:ays?)?\b", re.IGNORECASE), 86400),
+    (re.compile(r"(\d+)\s*(?:h(?:ours?)?|hrs?)\b", re.IGNORECASE), 3600),
+    (re.compile(r"(\d+)\s*m(?:in(?:utes?)?)?\b", re.IGNORECASE), 60),
+)
+
+
+def parse_body_retry_seconds(body: object) -> float | None:
+    """Extrait une durée de cooldown d'un corps d'erreur 429 (secondes).
+
+    Exemples reconnus : ``"retry in 3hr 12min"`` → 11520.0,
+    ``"quota resets in 2 days"`` → 172800 → None (plafond dépassé),
+    ``"try again in 45min"`` → 2700.0. ``None`` si aucune durée
+    parseable ou total hors (0, 86400].
+    """
+    try:
+        if not isinstance(body, str) or not body:
+            return None
+        total = 0
+        for _rx, _mult in _BODY_DURATION_RES:
+            for _m in _rx.finditer(body):
+                try:
+                    total += int(_m.group(1)) * _mult
+                except (TypeError, ValueError):
+                    continue
+        if total <= 0 or total > 86400:
+            return None
+        return float(total)
+    except Exception:
+        return None
+
+
+def free_quota_scope(status: object, body: object) -> str:
+    """Scope d'un 429 free : de QUEL quota parle le provider ?
+
+    * ``"trial-exhausted"`` — ``FreeUsageLimitError`` (trial anonyme per-IP
+      épuisé, message « Free usage limit reached... », MESURÉ en prod :
+      aucun reset temporel annoncé, le bucket ne revient pas tout seul) ;
+    * ``"rate-limited"`` — limite de débit explicite ou autre motif quota
+      (fenêtres rolling/weekly : un reset existe, durées applicables) ;
+    * ``"transient"`` — 429 sans motif quota (surcharge amont) ;
+    * ``"unknown"`` — non-429, corps vide ou illisible.
+
+    Pur, jamais de raise. `GoUsageLimitError` (quotas abonnement avec
+    fenêtres) reste ``"rate-limited"`` : lui a un reset, contrairement au
+    trial.
+    """
+    try:
+        s = int(status)
+    except (TypeError, ValueError):
+        return "unknown"
+    if s != 429:
+        return "unknown"
+    if not isinstance(body, str) or not body:
+        return "unknown"
+    try:
+        low = body.lower()
+        nospace = low.replace(" ", "").replace("_", "").replace("-", "")
+        if "freeusagelimiterror" in nospace or "free usage limit" in low:
+            return "trial-exhausted"
+        if (
+            "rate limit" in low
+            or "rate_limit" in low
+            or "too many requests" in low
+            or "ratelimiterror" in nospace
+        ):
+            return "rate-limited"
+        if is_free_quota_failure(status, body):
+            return "rate-limited"
+    except Exception:
+        return "unknown"
+    return "transient"
+
+
 def is_credit_exhaustion(body: object) -> bool:
     """[G1] Vrai si le corps porte un motif de quota/crédit épuisé.
 
@@ -406,7 +699,9 @@ __all__ = [
     "_openai_error",
     "anthropic_error",
     "classify_upstream_error",
+    "extract_upstream_error_type",
     "free_refusal_response",
+    "free_quota_scope",
     "is_credit_exhaustion",
     "is_free_quota_failure",
     "openai_error",

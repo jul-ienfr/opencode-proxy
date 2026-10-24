@@ -30,7 +30,7 @@ intact des 429/401/403 (jamais de 503), log `[compaction] … native=0/1`.
 | Destination | Aller | Retour |
 |---|---|---|
 | Anthropic (`protocol:anthropic`, `go/messages`) | passthrough verbatim + `strip_synthetic_thinking` seul ; forward `context_management`, beta `compact-*`, blocs `compaction` ; `pause_after_compaction` → `stop_reason=compaction` | passthrough ; bloc `compaction` en 1 seul delta ; `usage.iterations=[compaction,message]` relayé |
-| OpenAI Chat (`protocol:openai`, `go/chat` ou `free/chat`) | entrée Anthropic → `anthropic_to_openai` + `sanitize_tool_names` (64) + `_free_wire_body` côté free ; entrée Chat → remap `model` + `ensure_min_tokens` + effort recalculé plafond free ; résumeur : `build_summarizer_body` (`messages`, `stream:false`, cap 4096, sans tools/system/thinking) | client Anthropic → `openai_to_anthropic` + restore noms ; client Chat → `choices` verbatim ; 400 → `is_overflow` |
+| OpenAI Chat (`protocol:openai`, `go/chat` ou `free/chat`) | entrée Anthropic → `anthropic_to_openai` + `sanitize_tool_names` (64) + `_free_wire_body` côté free ; entrée Chat → remap `model` + `ensure_min_tokens` + effort recalculé plafond free ; résumeur : `build_summarizer_body` (`messages`, `stream:false`, cap 32000, sans tools/system/thinking) | client Anthropic → `openai_to_anthropic` + restore noms ; client Chat → `choices` verbatim ; 400 → `is_overflow` |
 | Responses (`api:responses`, `go/responses` ou `free/responses`) | Chat → `_chat_to_responses_request`, Anthropic → `_anthropic_to_responses_request`, natif → `_sanitize_native_responses_request` ; forward `compact_threshold`, `conversation`, `previous_response_id`, `prompt_cache_key` ; résumeur : `build_summarizer_responses_body` (`input`, `store:false`) | `openai_chat_to_responses` / `_responses_to_anthropic_response` / `_responses_to_chat_response` + `name_map` ; item `compaction` opaque relayé tel quel, sortie `/responses/compact` = fenêtre canonique (ne jamais élaguer) |
 
 `jev/systemone` (`{model,state,questions}`) : jamais de corps résumeur chat
@@ -61,7 +61,7 @@ ne contourne pas `strict_free` (correctif Hermes opt-in).
 ```yaml
 server_compaction:
   enabled: false            # condense-and-retry serveur (défaut OFF = passthrough)
-  summary_max_tokens: 2048  # capé à 4096 (cap client officiel)
+  summary_max_tokens: 2048  # capé à 32000 (SUMMARY_OUTPUT_MAX officiel)
   keep_recent_pairs: 4      # paires complètes gardées verbatim (frontières outil)
   summarizer_model_override: null  # souverain quand posé
   timeout_s: 60
@@ -77,7 +77,7 @@ server_compaction:
   summary_lean: true        # jambe free : sorties d'outils tronquées sur trafic
                             # compactage détecté (l'amont digère mal les Mo)
   summary_lean_max_chars: 2000
-  summary_clamp_max_tokens: 4096  # sortie résumés plafonnée (officiel)
+  summary_clamp_max_tokens: 32000  # sortie résumés plafonnée (SUMMARY_OUTPUT_MAX officiel)
   keep_tokens: null         # budget tokens queue (officiel keep.tokens) ; null = paires
   keep_recent_pairs: 4      # ... utilisées quand keep_tokens est null
   huge_warn_tokens: 0       # 0 = off ; warn log au-delà (opt-in)
@@ -86,8 +86,10 @@ server_compaction:
 
 ### Template, allègement et garde (aligné officiel)
 
-- Résumeur : template à rubriques (`## Objective…`), 1 corrective si
-  rubriques absentes puis échec franc, médias strippés en descripteurs,
+- Résumeur : gabarit officiel verbatim (`SUMMARY_TEMPLATE` + `SUMMARY_RULES` :
+  `## Objective/Requirements/Decisions/Work State/Next Move/Relevant Files/
+  Important Context`), validation exacte `filled()`, 1 NUDGE si rubriques
+  absentes puis échec franc, médias strippés en descripteurs,
   sorties d'outils rognées — comme l'officiel, sans jamais bloquer.
 - Queue gardée au budget tokens quand `keep_tokens` est posé (sinon paires).
 - Garde pré-forward opt-in (`huge_*`, 0 = inactive) : warn log / 413

@@ -29,6 +29,10 @@ from test_vpn_freshness import FakeVPNManager, _cfg
 import vpn_manager as vm
 
 
+async def _no_sleep(_seconds):
+    return None
+
+
 class ControlFakeVPNManager(FakeVPNManager):
     """FakeVPNManager whose `_docker_run` records the argv and answers with
     a scripted stdout (keyed by substring of the sh script), so the control
@@ -137,6 +141,10 @@ def _fast_mgr(tmp_path, ip="9.9.9.9", clears_on_pin=1, **over):
         "/v1/vpn/status": '{"status":"running"}',
         "/v1/publicip/ip": f'{{"public_ip":"{ip}"}}',
     }
+    # [V8.4] pas de vraies pauses de polling : les budgets de reprise
+    # (15 s de rattrapage, rungs de restart) rendaient ces tests lents
+    # (90 s, 32 s, 17 s) pour des assertions instantanees.
+    mgr._sleep_fn = _no_sleep
     return mgr
 
 
@@ -1074,6 +1082,7 @@ class TestStackSelector:
         mgr = _stack_mgr(tmp_path, monkeypatch)
         clock = {"t": 1_000_000.0}
         mgr._now_fn = lambda: clock["t"]
+        mgr._sleep_fn = _no_sleep
         mgr._stack_effective = "openvpn"
         mgr._stack_since = clock["t"]
         mgr._auth_failed_window = [clock["t"] - 1000, clock["t"] - 900, clock["t"] - 800]
@@ -1092,6 +1101,7 @@ class TestStackSelector:
         mgr._auto_flip_cooldown_min = 30
         clock = {"t": 1_000_000.0}
         mgr._now_fn = lambda: clock["t"]
+        mgr._sleep_fn = _no_sleep
         mgr._stack_effective = "openvpn"
         mgr._auth_failed_window = [clock["t"] - 1000, clock["t"] - 900, clock["t"] - 800]
         # Flipped 100 s ago: inside the 30-min cooldown → no second flip.
@@ -1107,6 +1117,7 @@ class TestStackSelector:
         mgr = _stack_mgr(tmp_path, monkeypatch)
         clock = {"t": 1_000_000.0}
         mgr._now_fn = lambda: clock["t"]
+        mgr._sleep_fn = _no_sleep
         mgr._stack_effective = "wireguard"
         # 4/5 dead ticks: below the threshold — hold.
         mgr._egress_failures = mgr._auto_wg_egress_ticks - 1
@@ -1123,6 +1134,7 @@ class TestStackSelector:
         mgr = _stack_mgr(tmp_path, monkeypatch)
         clock = {"t": 1_000_000.0}
         mgr._now_fn = lambda: clock["t"]
+        mgr._sleep_fn = _no_sleep
         mgr._stack_effective = "openvpn"
         # Healthy OV for > 60 min, zero failures → back to the preferred WG.
         mgr._stack_since = clock["t"] - 3601

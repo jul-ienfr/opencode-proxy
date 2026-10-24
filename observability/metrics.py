@@ -105,6 +105,92 @@ def observe_latency_ms(
         pass
 
 
+#: Nombre maximal de series de latence par jambe et par modele. Au-dela, les
+#: modeles excedentaires partagent une serie ``other`` : un nom de modele vient
+#: du client, donc l'espace de cles n'est pas borne par construction.
+LEG_LAT_MAX_KEYS = 200
+
+#: Longueur maximale d'un nom de modele retenu dans une cle de metrique.
+LEG_MODEL_MAX_LEN = 64
+
+
+def leg_latency_key(leg: str, model: str, *, max_len: int = LEG_MODEL_MAX_LEN) -> str:
+    """Cle de serie ``leg_ms:<jambe>:<modele>`` (pure, testable)."""
+    leg_part = str(leg or "?").strip().lower() or "?"
+    model_part = str(model or "?").strip()[:max_len] or "?"
+    return f"leg_ms:{leg_part}:{model_part}"
+
+
+#: Dernier statut connu par serie `leg_ms:<jambe>:<modele>`. Sert a distinguer
+#: « observe » de « observe **avec succes** » : un modele qui echoue a chaque
+#: appel est tres observable, et pourtant mort. Sans cette distinction, le
+#: detecteur de derive (V8.1) prenait un modele casse pour un modele servi.
+_LEG_STATUS: dict[str, int] = {}
+
+
+def mark_leg_status(key: str, status) -> None:
+    """Retient le dernier statut d'une serie (borne, fail-soft)."""
+    try:
+        if key not in _LEG_STATUS and len(_LEG_STATUS) >= LEG_LAT_MAX_KEYS:
+            return
+        _LEG_STATUS[str(key)] = int(status)
+    except Exception:
+        pass
+
+
+def leg_ok_models() -> set[str]:
+    """Modeles dont le **dernier** appel a reussi (statut 2xx)."""
+    out: set[str] = set()
+    try:
+        for key, status in list(_LEG_STATUS.items()):
+            if 200 <= int(status) < 300 and str(key).startswith("leg_ms:"):
+                parts = str(key).split(":", 2)
+                if len(parts) == 3 and parts[2]:
+                    out.add(parts[2])
+    except Exception:
+        pass
+    return out
+
+
+def reset_leg_status() -> None:
+    try:
+        _LEG_STATUS.clear()
+    except Exception:
+        pass
+
+
+def observe_leg_call(
+    rings: dict,
+    lock,
+    leg: str,
+    model: str,
+    duration_ms: float,
+    status: int | None = None,
+    *,
+    counters: dict | None = None,
+    max_keys: int = LEG_LAT_MAX_KEYS,
+) -> str | None:
+    """Enregistre la latence d'un appel par jambe et par modele (fail-soft).
+
+    Rend la cle utilisee (utile en test), ou ``None`` si rien n'a ete ecrit.
+
+    La serie est bornee : quand ``max_keys`` est atteint, les nouveaux modeles
+    sont agreges sous ``leg_ms:<jambe>:other``. Sans cette borne, un client
+    pourrait faire croitre la memoire en inventant des noms de modele.
+    """
+    try:
+        key = leg_latency_key(leg, model)
+        with lock:
+            if key not in rings and len(rings) >= int(max_keys):
+                key = leg_latency_key(leg, "other")
+        observe_latency_ms(rings, lock, key, float(duration_ms))
+        if counters is not None and status is not None:
+            bump_misc_counter(counters, lock, f"leg_status:{str(leg).lower()}:{int(status)}")
+        return key
+    except Exception:
+        return None
+
+
 def bump_misc_counter(counters: dict | None, lock, name: str) -> None:
     """Compteur simple (db_queuefull, fetch_quotas_429, …) — fail-soft."""
     if counters is None:

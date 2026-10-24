@@ -280,6 +280,26 @@ class KeyPauser:
             self._save()  # [P1-8] hors lock
             self._debug_fn(f"  [keypauser] cleanup: {len(expired)} expired pauses removed")
 
+    def unpause_all(self) -> int:
+        """[V8.8] Annuler TOUS les pauses et **persister** la suppression.
+
+        L'endpoint `/api/key-pauses/reset` vidait `_paused` et `_reasons` en
+        mémoire sans appeler `_save()` : le fichier de pauses conservait les
+        entrées, et le redémarrage suivant les rechargeait. Constaté en vrai —
+        un pause `reason: "test"` effacé à la main est revenu au boot, ramenant
+        `/health` en `degraded` sans explication. Un « reset » qui ne survit pas
+        au redémarrage n'est pas un reset.
+
+        Returns:
+            Le nombre de pauses effectivement retirés.
+        """
+        with self._lock:
+            count = len(self._paused)
+            self._paused.clear()
+            self._reasons.clear()
+        self._save()  # hors lock, comme cleanup_expired/unpause_if_paused
+        return count
+
     def unpause_if_paused(self, api_key: str) -> bool:
         """Remove a pause for a key if it exists. Returns True if removed."""
         prefix = self._prefix(api_key)

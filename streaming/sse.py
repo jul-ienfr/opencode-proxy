@@ -123,6 +123,12 @@ async def sse_pump(
                 except StopAsyncIteration:
                     return
                 except Exception as exc:
+                    # [V5.1] Une exception qui porte un statut HTTP explicite vient
+                    # du CONSOMMATEUR (elle demande un 5xx honnête), pas d'une
+                    # lecture amont cassée : la transformer en trame d'erreur la
+                    # rendrait invisible derrière un 200. On la laisse remonter.
+                    if getattr(exc, "status_code", None):
+                        raise
                     # [FIX cause n°1] Ne JAMAIS avaler une erreur de lecture amont.
                     _notifier(on_error, exc)
                     if error_event:

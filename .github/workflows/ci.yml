@@ -8,7 +8,11 @@ on:
 jobs:
   lint-test:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # [V8.4] 15 → 25 min : après le correctif DDG (721 s → 0,13 s) la suite
+    # prend ~6 min en local ; un runner partagé est plus lent, et un job qui
+    # expire ne prouve rien (on ne sait pas si le code est cassé ou le budget
+    # trop court).
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -45,8 +49,24 @@ jobs:
       - name: Mypy (progressif, non bloquant)
         run: mypy . --ignore-missing-imports
         continue-on-error: true
+      - name: Contrats d'alignement (BLOQUANT, ~6 s)
+        # [V8.4] Premier pas payé : il échoue en quelques secondes si un
+        # contrat mesuré casse (gate free, parité client, routage, dérive).
+        # Avant, tout passait par un unique `pytest` de 15 min : une régression
+        # de contrat se noyait dans les tests réseau et le job expirait.
+        run: python scripts/ci_contracts.py
+      - name: Config sans clé inerte (BLOQUANT)
+        # [V7.2] Une clé de `config.yaml` que personne ne lit (faute de frappe,
+        # vestige) est un mensonge silencieux : `dashboard_trust.require_token`
+        # existait sans jamais être consulté — un réglage de sécurité inopérant.
+        # `--strict` compare à la référence versionnée et refuse toute clé morte
+        # nouvelle.
+        run: python scripts/config_audit.py --strict
       - name: Tests with coverage
-        run: pytest -q --cov --cov-report=term-missing --cov-fail-under=60
+        # [V8.4] `-m "not docker"` : le seul test Docker-marké (chaos kill -9)
+        # exige un daemon live et n'a rien à faire dans le gate par défaut —
+        # c'est ce qui faisait échouer la CI. Reste exécutable via `-m docker`.
+        run: pytest -q -m "not docker" --cov --cov-report=term-missing --cov-fail-under=60
         # Palier audit 2026-10-04 (mesuré 62%) — synchronisé avec scripts/gate.ps1
       # ── [Phase 5/9 plan boot] Garde-fous de performance du démarrage ──
       # Ces trois pas verrouillent les acquis du chantier boot : sans eux, une

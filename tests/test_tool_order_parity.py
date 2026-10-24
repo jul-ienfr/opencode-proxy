@@ -136,7 +136,8 @@ def test_free_wire_shims_are_sorted_with_the_rest():
         "tools": [_tool("zzz"), _tool("aaa")],
     }
     wire, _forced = oc._free_wire_body(body)
-    assert _names(wire["tools"]) == ["aaa", "bash", "read", "zzz"]
+    # [V6.2.2] `bash` retiré des shims : l'ordre porte sur les outils restants.
+    assert _names(wire["tools"]) == ["aaa", "read", "zzz"]
     # Le corps d'origine n'est jamais muté (idempotence des retries/hedges).
     assert _names(body["tools"]) == ["zzz", "aaa"]
 
@@ -150,7 +151,7 @@ def test_free_wire_is_idempotent_once_sorted():
     }
     first, _ = oc._free_wire_body(body)
     second, _ = oc._free_wire_body(first)
-    assert _names(second["tools"]) == _names(first["tools"]) == ["aaa", "bash", "read", "zzz"]
+    assert _names(second["tools"]) == _names(first["tools"]) == ["aaa", "read", "zzz"]
 
 
 def test_free_wire_responses_leg_is_left_alone():
@@ -162,7 +163,7 @@ def test_free_wire_responses_leg_is_left_alone():
         "tools": [{"type": "function", "name": "zzz"}, {"type": "function", "name": "aaa"}],
     }
     wire, _ = oc._free_wire_body(body)
-    assert [t["name"] for t in wire["tools"]] == ["zzz", "aaa", "bash", "read"]
+    assert [t["name"] for t in wire["tools"]] == ["zzz", "aaa", "read"]
 
 
 def test_end_to_end_chat_request_is_sorted():

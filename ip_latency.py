@@ -72,7 +72,7 @@ class IpLatencyTracker:
         else:
             self._ewma_log = self.alpha * ln + (1 - self.alpha) * self._ewma_log
         if first_on_ip:
-            return  # warm-up exclu du comptage slow
+            return  # warm-up exclu du comptage slow (ring/EWMA conservés — contrat v6/tests)
         self._samples.append((self.request_count, round(self.ewma_ms or 0.0, 1)))
         if slow_threshold_ms > 0 and duration_ms > slow_threshold_ms:
             self.consecutive_slow += 1

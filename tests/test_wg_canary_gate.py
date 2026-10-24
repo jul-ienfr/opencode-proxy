@@ -23,6 +23,10 @@ import pytest
 import vpn_manager as vm
 
 
+async def _no_sleep(_seconds):
+    return None
+
+
 class _CanaryMgr(vm.VPNManager):
     """VPNManager réel + frontières docker/réseau remplacées."""
 
@@ -90,7 +94,12 @@ def _mgr(tmp_path, **over):
         "auto_ov_fail_threshold": 3,
     }
     cfg.update(over)
-    return _CanaryMgr(cfg, tmp_path)
+    _m = _CanaryMgr(cfg, tmp_path)
+    # [V8.4] pas de vraies pauses : sinon chaque test de canary paie le
+    # budget de boot (90 s) en asyncio.sleep alors que l'assertion est
+    # instantanee.
+    _m._sleep_fn = _no_sleep
+    return _m
 
 
 # ── Le verrou d'application ──────────────────────────────────────────
@@ -158,6 +167,7 @@ async def test_canary_verdict_is_ttl_cached(tmp_path):
     m._canary_probe_result = True
     clock = _Clock()
     m._now_fn = clock
+    m._sleep_fn = _no_sleep
 
     assert await m._wg_canary_alive("r1") is True
     first_calls = len(m.compose_calls)
@@ -178,6 +188,7 @@ async def test_canary_failure_throttles_docker_calls(tmp_path):
     clock = _Clock()
     clock.set_step(1.0)  # le poll doit voir le temps passer pour finir
     m._now_fn = clock
+    m._sleep_fn = _no_sleep
     m._canary_probe_result = False
 
     for _ in range(5):
@@ -202,6 +213,7 @@ async def test_auto_decision_return_flip_is_the_one_blocked(tmp_path):
     m = _mgr(tmp_path)
     clock = _Clock()
     m._now_fn = clock
+    m._sleep_fn = _no_sleep
     m._stack_effective = "openvpn"
     m._stack_since = clock["t"] - 61 * 60  # OV sain > auto_ov_return_min
     m._auth_failed_window = []
@@ -272,6 +284,7 @@ def test_churn_loop_triggers_flip_to_openvpn(tmp_path):
     m = _mgr(tmp_path)
     clock = _Clock()
     m._now_fn = clock
+    m._sleep_fn = _no_sleep
     m._stack_effective = "wireguard"
     m._egress_failures = 0  # jamais 3 ticks consécutifs (fenêtres vivantes)
     m._restart_churn = True

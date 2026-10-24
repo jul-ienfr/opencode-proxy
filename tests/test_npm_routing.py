@@ -4,10 +4,12 @@
 dit pourquoi il refuse le reste. Deux règles, toutes deux lues sur le catalogue
 live de l'éditeur :
 
-1. le ``npm`` est une clé de **niveau provider** (`provider.npm`), absente au
-   niveau modèle — la matrice ne peut donc pas se déduire par modèle, elle se lit
-   sur le provider qui sert l'id (`NPM_TO_API`, `provider_npm`,
-   `api_family_for_npm`) ;
+1. le ``npm`` est une clé de **niveau provider** (`provider.npm`), **surchargeable
+   au niveau modèle** — et il l'est massivement : 66 des 128 modèles free portent
+   leur propre `provider.npm` (mesure du 2026-10-20). La résolution effective se
+   fait donc **par modèle** (`model_npm`, `model_api`,
+   `api_family_for_model`) ; `provider_npm` reste l'accesseur bas niveau du
+   provider seul ;
 2. le proxy ne fournit **que** ce que sert un provider opencode, plus l'exception
    interne `jev-1.13*` (`is_servable`, `refusal_reason`).
 
@@ -69,47 +71,73 @@ def _tiers(npm: str | None, *model_ids: str) -> dict:
 
 
 def test_matrice_npm_connue_et_rien_dautre():
-    """Trois valeurs connues, et **rien** d'autre : le tableau est fermé.
+    """Les valeurs connues, et **rien** d'autre : le tableau est fermé.
 
     Un ``npm`` absent de `NPM_TO_API` ne rend pas une famille par défaut — il
     rend ``None``, ce qui force l'appelant à refuser au lieu de deviner.
+
+    [CORRECTION 2026-10-20] Ce test exigeait « trois valeurs, et rien d'autre ».
+    C'était l'expression de la croyance fausse selon laquelle seuls trois
+    packages existaient. Le catalogue live en sert **cinq** : `@ai-sdk/google`
+    (9 modèles free + 1 payant) et `@ai-sdk/mistral` (1) étaient absents de la
+    table, donc traités comme inconnus — d'où 10 modèles sans route dérivable.
     """
     assert mc.NPM_TO_API == {
         "@ai-sdk/anthropic": "messages",
         "@ai-sdk/openai": "responses",
         "@ai-sdk/openai-compatible": "chat",
+        "@ai-sdk/google": "gemini",
+        "@ai-sdk/mistral": "chat",
     }
     for npm, famille in mc.NPM_TO_API.items():
         assert mc.api_family_for_npm(npm) == famille, npm
         assert mc.api_family_for_npm(f"  {npm}  ") == famille, "espaces non ignorés"
+    # Toute famille déclarée doit être connue du routeur.
+    assert set(mc.NPM_TO_API.values()) <= set(mc.KNOWN_API_FAMILIES)
 
 
 def test_npm_hors_table_rend_none_pas_de_deviner():
-    """``@ai-sdk/google`` n'est pas dans la table : on ne sait pas, et on le dit.
+    """Un ``npm`` réellement inconnu rend ``None`` : on ne devine pas.
 
     Inventer ``chat`` ici reproduirait exactement le défaut que la matrice existe
     pour éviter — viser ``/chat/completions`` vers un endpoint inconnu.
+
+    [CORRECTION 2026-10-20] Ce test prenait `@ai-sdk/google` et
+    `@ai-sdk/mistral` pour des inconnus. Ils sont au catalogue live et
+    désormais dans la table ; le témoin d'inconnu doit être un package qui
+    n'existe réellement pas chez l'éditeur.
     """
-    for npm in ("@ai-sdk/google", "@ai-sdk/mistral", "@aihubmix/ai-sdk-provider", ""):
+    for npm in ("@aihubmix/ai-sdk-provider", "@ai-sdk/inconnu", "openai", ""):
         assert mc.api_family_for_npm(npm) is None, npm
     assert mc.api_family_for_npm(None) is None
 
 
-def test_npm_est_lu_au_niveau_provider_jamais_modele():
-    """Un ``npm`` collé sur une entrée de ``models:`` doit être **ignoré**.
+def test_npm_est_lu_au_niveau_provider_puis_surcharge_par_le_modele():
+    """Deux accesseurs, deux niveaux — et c'est voulu.
 
-    Le catalogue live n'en porte aucun au niveau modèle : si cette lecture
-    changeait de niveau, la matrice se mettrait à suivre une clé qui n'existe
-    pas — et à rendre une famille pour un provider qui n'en déclare aucune.
+    `provider_npm` lit le ``npm`` du **provider** et rien d'autre : c'est un
+    accesseur bas niveau, et il doit rester insensible à un leurre posé sur un
+    modèle. La résolution *effective*, elle, passe par `model_npm`, qui applique
+    la règle officielle : surcharge du modèle d'abord, provider ensuite.
+
+    [CORRECTION 2026-10-20] Ce test affirmait que « le catalogue live n'en porte
+    aucun au niveau modèle ». C'est faux : 66 des 128 modèles free portent leur
+    propre `provider.npm`. Le leurre de ce test est donc, dans la réalité, le
+    cas **courant** — et c'est `model_npm` qui doit le respecter.
     """
     catalog = _cat(
         tiers=_tiers("@ai-sdk/anthropic", "m"),
         bruit=_tiers(None, "m2"),
     )
-    catalog["tiers"]["models"]["m"]["npm"] = "@ai-sdk/google"  # leurre
+    catalog["tiers"]["models"]["m"]["npm"] = "@ai-sdk/google"  # leurre plate
+    catalog["tiers"]["models"]["m"]["provider"] = {"npm": "@ai-sdk/google"}  # vrai emplacement
+    # Bas niveau : toujours le provider.
     assert mc.provider_npm(catalog, "tiers") == "@ai-sdk/anthropic"
     assert mc.provider_npm(catalog, "bruit") is None
-    assert mc.api_family_for_npm(mc.provider_npm(catalog, "tiers")) == "messages"
+    # Résolution effective : la surcharge de modèle gagne.
+    assert mc.model_npm(catalog, "tiers", "m") == "@ai-sdk/google"
+    assert mc.model_npm(catalog, "tiers", "absent") == "@ai-sdk/anthropic"
+    assert mc.api_family_for_model(catalog, "tiers", "m") == "gemini"
 
 
 def test_provider_npm_sans_declaration_rend_none():
@@ -189,16 +217,23 @@ def test_parti_servi_ou_refus_jamais_les_deux():
 
 
 def test_refus_nomme_lid_les_hotes_et_le_npm_de_chacun():
-    """Les trois formes du message, en un seul catalogue.
+    """Les formes du message, en un seul catalogue.
 
     Le ``npm`` de chaque hôte est dans le message parce que c'est lui qui aurait
     dû choisir l'endpoint — y compris, et surtout, quand il est hors table.
+
+    [CORRECTION 2026-10-20] Le témoin « hors table » était `@ai-sdk/google`, qui
+    est au catalogue. Remplacé par un package réellement inconnu de la table, et
+    complété par un hôte google, désormais reconnu comme famille ``gemini``.
+
+    Trois hôtes exactement : `MAX_NAMED_HOSTS` borne la liste à trois, et le
+    quatrième serait tronqué — la borne a son propre test.
     """
     catalog = _cat(
         **_LEGS,
         connu=_tiers("@ai-sdk/anthropic", "m-tier"),
-        hors_table=_tiers("@ai-sdk/google", "m-tier"),
-        muet=_tiers(None, "m-tier"),
+        gemini=_tiers("@ai-sdk/google", "m-tier"),
+        hors_table=_tiers("@aihubmix/ai-sdk-provider", "m-tier"),
     )
     reason = mc.refusal_reason("m-tier", catalog)
     assert reason is not None
@@ -207,10 +242,18 @@ def test_refus_nomme_lid_les_hotes_et_le_npm_de_chacun():
         "no opencode provider serves it, it is hosted upstream by "
     )
     assert "connu (npm @ai-sdk/anthropic, api messages)" in reason
+    assert "gemini (npm @ai-sdk/google, api gemini)" in reason
     assert (
-        "hors_table (npm @ai-sdk/google, outside the known table: "
+        "hors_table (npm @aihubmix/ai-sdk-provider, outside the known table: "
         "no endpoint can be derived)"
     ) in reason
+
+
+def test_refus_nomme_un_hote_sans_npm():
+    """Un hôte qui ne déclare aucun ``npm`` le dit, au lieu de rendre une chaîne vide."""
+    catalog = _cat(**_LEGS, muet=_tiers(None, "m-tier"))
+    reason = mc.refusal_reason("m-tier", catalog)
+    assert reason is not None
     assert "muet (no npm declared)" in reason
 
 

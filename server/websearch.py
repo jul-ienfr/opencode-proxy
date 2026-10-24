@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import html as _html
 import ipaddress
 import re
 import socket
@@ -44,6 +45,66 @@ FETCH_LOCKS_MAX = 256
 # fallback tags à chaque fetch sans trafilatura/bs4).
 _WS_RE = re.compile(r"\s+")
 _TAG_RE = re.compile(r"<[^>]+>")
+
+# [fix DDG 403 22/10] L'endpoint HTML historique (`html.duckduckgo.com`)
+# répond 403 depuis cet hôte ; `lite.duckduckgo.com` répond 200 et expose un
+# tableau simple. On l'utilise en priorité, avec repli sur la lib
+# `duckduckgo_search` si le parse échoue.
+_DDG_LINK_RE = re.compile(
+    r"<a\b([^>]*\bclass=['\"]result-link['\"][^>]*)>(.*?)</a>", re.S | re.I
+)
+_DDG_SNIP_RE = re.compile(
+    r"<td[^>]*class=['\"]result-snippet['\"][^>]*>(.*?)</td>", re.S | re.I
+)
+_DDG_HREF_RE = re.compile(r"href=['\"]([^'\"]+)['\"]", re.I)
+_DDG_UDDG_RE = re.compile(r"[?&]uddg=([^&]+)")
+_DDG_LITE_URL = "https://lite.duckduckgo.com/lite/"
+
+
+def _clean_html_text(value: str) -> str:
+    return _html.unescape(_TAG_RE.sub("", value or "")).strip()
+
+
+def parse_ddg_lite(page: str, max_results: int = 5) -> list:
+    """Parse ``lite.duckduckgo.com`` → [{title, href, body}] (forme DDGS)."""
+    anchors = list(_DDG_LINK_RE.finditer(page or ""))
+    out = []
+    for i, m in enumerate(anchors[: max(1, int(max_results or 5))]):
+        attrs, title = m.group(1), m.group(2)
+        nxt = anchors[i + 1].start() if i + 1 < len(anchors) else len(page)
+        sm = _DDG_SNIP_RE.search(page[m.end() : nxt])
+        hm = _DDG_HREF_RE.search(attrs)
+        href = hm.group(1) if hm else ""
+        um = _DDG_UDDG_RE.search(href)
+        if um:
+            href = urllib.parse.unquote(um.group(1))
+        elif href.startswith("//"):
+            href = "https:" + href
+        out.append(
+            {
+                "title": _clean_html_text(title),
+                "href": href,
+                "body": _clean_html_text(sm.group(1)) if sm else "",
+            }
+        )
+    return out
+
+
+def _search_ddg_lite(query: str, max_results: int, timeout: float, proxy=None) -> list:
+    """GET lite.duckduckgo.com via curl_cffi (impersonation navigateur)."""
+    from curl_cffi import requests as _cr
+
+    kwargs = {
+        "params": {"q": query},
+        "timeout": max(2.0, float(timeout)),
+        "impersonate": "chrome131",
+    }
+    if proxy:
+        kwargs["proxy"] = proxy
+    resp = _cr.get(_DDG_LITE_URL, **kwargs)
+    if resp.status_code != 200:
+        raise RuntimeError(f"DDG lite HTTP {resp.status_code}")
+    return parse_ddg_lite(resp.text, max_results)
 
 
 def _noop_log(*args, **kwargs) -> None:
@@ -176,6 +237,17 @@ async def execute_ddg_search(
                 async with sem:
 
                     def _sync_ddg():
+                        # 1) lite.duckduckgo.com (200 depuis cet hôte,
+                        # ~1,3 s) — l'endpoint html de la lib renvoie 403.
+                        try:
+                            _lite = _search_ddg_lite(
+                                qnorm, max_results, timeout, proxy=proxy
+                            )
+                            if _lite:
+                                return _lite
+                        except Exception:
+                            pass
+                        # 2) repli historique (autre réseau / autre pays).
                         try:
                             from duckduckgo_search import DDGS
 

@@ -53,7 +53,11 @@ from core.errors import (
         ("monthly usage limit", "permission_error"),
         ("invalid_prompt", "invalid_request_error"),
         ("server_is_overloaded", "overloaded_error"),
-        ("server_error", "api_error"),
+        # [V0.5] `server_error` n'est pas un motif : il tombe sur la table par
+        # STATUT du client officiel. Un 400 est une requête invalide
+        # (`executor.ts:253-265`), donc `invalid_request_error` — plus jamais le
+        # fourre-tout `api_error` qui laissait le client réessayer en boucle.
+        ("server_error", "invalid_request_error"),
     ],
 )
 def test_chaque_motif_donne_son_type(motif, etype):
@@ -61,6 +65,28 @@ def test_chaque_motif_donne_son_type(motif, etype):
     le statut. Le statut, lui, est conservé tel quel (les règles de fenêtre
     d'auth ne vivent pas ici)."""
     assert classify_upstream_error(400, f'{{"error":{{"message":"{motif}"}}}}') == (400, etype)
+
+
+def test_un_motif_inconnu_suit_la_table_par_statut():
+    """[V0.5] Sans motif reconnu, c'est le STATUT qui décide (table officielle)."""
+    assert classify_upstream_error(401, "") == (401, "authentication_error")
+    assert classify_upstream_error(429, "") == (429, "rate_limit_error")
+    assert classify_upstream_error(422, "") == (422, "invalid_request_error")
+    # Le contrat historique des 5xx tient : un 503 ordinaire reste api_error.
+    assert classify_upstream_error(503, "") == (503, "api_error")
+
+
+def test_un_debit_n_est_pas_une_surcharge():
+    """[V0.5] `try again` attrapait « rate limit … try again later »."""
+    assert classify_upstream_error(400, "rate limit exceeded, try again later") == (
+        400,
+        "invalid_request_error",
+    )
+    assert classify_upstream_error(429, "rate limit exceeded, try again later") == (
+        429,
+        "rate_limit_error",
+    )
+    assert classify_upstream_error(503, "server_is_overloaded") == (503, "overloaded_error")
 
 
 def test_overflow_remonte_en_invalid_request_error():

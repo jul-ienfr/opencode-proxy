@@ -1,14 +1,21 @@
-"""test_upstream_event.py — [phase 1] breaker « 429 corrélés » tous modes.
+"""test_upstream_event.py — breaker « 429 corrélés » tous modes.
 
 Contexte : en strict round-robin, 1 requête peut frapper 5 stations
-(max_free_attempts) en bad-markant chacune + rotation à chaque 429 —
-une vague amont (capacité/policy, pas quota) rase la flotte entière alors
-que les tunnels vont bien. Le breaker G4 n'existait qu'en failover.
+(max_free_attempts) — une vague amont (capacité/policy, pas quota) rase la
+flotte entière alors que les tunnels vont bien. Le breaker G4 n'existait
+qu'en failover.
 
-Règle : 3+ 429 sur des couples (station, IP) DISTINCTS / 60 s = événement
+Règle : 3+ signaux sur des couples (station, IP) DISTINCTS / 60 s = événement
 amont → gel des rotations 429 (180 s), cooldowns conservés (C1), refus
-honnête via le chemin strict_free existant. 429 répétés sur le MÊME
-bucket = quota per-IP réel → rotation normale.
+honnête via le chemin strict_free existant.
+
+[fix quota-vs-breaker] Un VRAI quota per-IP (``quota=True``, ``429
+FreeUsageLimitError``) n'est PAS un signal amont : c'est une limite
+quotidienne propre à l'IP. Il ne doit donc jamais déclarer/geler un
+événement — sinon 3 stations épuisées suffisaient à figer toutes les
+rotations 180 s alors qu'un pool d'IP fraîches restait disponible. Seuls
+les 429 TRANSITOIRES (``quota=False``), les timeouts et les AUTH alimentent
+le log corrélé.
 
 Offline : doubles _Station (même forme que test_pool_station_set),
 _launch_rotation spybée, jamais de docker.
@@ -53,16 +60,47 @@ def _pool3():
 
 
 class TestUpstreamEvent:
-    def test_three_distinct_pairs_declare_event_and_freeze_rotation(self):
+    # ── quota per-IP réel : jamais un signal amont ──────────────────
+
+    def test_three_distinct_quota_429_never_declare_and_keep_rotating(self):
+        """3 vrais quotas 429 sur 3 stations distinctes : AUCUN événement,
+        chaque station tourne (IP fraîche = nouveau quota)."""
         pool, (s1, s2, s3) = _pool3()
         pool.on_quota_exhausted(s1)
-        assert pool._upstream_event_active() is False
-        assert pool.rotated == [s1]  # 429 isolé → rotation normale
         pool.on_quota_exhausted(s2)
+        pool.on_quota_exhausted(s3)
         assert pool._upstream_event_active() is False
-        pool.on_quota_exhausted(s3)  # 3ᵉ couple distinct → événement
+        assert pool.rotated == [s1, s2, s3]
+        assert len(pool._upstream_429_log) == 0, (
+            "un quota per-IP ne doit pas alimenter le log corrélé"
+        )
+        # La 4ᵉ station (autre IP) tourne encore : pas de gel rétroactif.
+        s1.current_ip = "1.1.1.2"
+        pool.on_quota_exhausted(s1)
+        assert pool.rotated == [s1, s2, s3, s1]
+        assert pool._upstream_event_active() is False
+
+    def test_same_bucket_quota_repeats_never_declare(self):
+        """3× 429 sur le même (station, IP) = quota per-IP → rotations."""
+        pool, (s1, _, _) = _pool3()
+        for _ in range(4):
+            pool.on_quota_exhausted(s1)
+        assert pool._upstream_event_active() is False
+        assert pool.rotated == [s1] * 4
+        assert len(pool._upstream_429_log) == 0
+
+    # ── 429 transitoires : le vrai signal amont ─────────────────────
+
+    def test_three_distinct_transient_429_declare_event_and_freeze(self):
+        """3× 429 « Endpoint is unavailable » (quota=False) sur des couples
+        distincts = événement amont → rotations gelées, cooldowns conservés.
+        Un quota réel pendant l'événement ne relance pas la rotation."""
+        pool, (s1, s2, s3) = _pool3()
+        for st in (s1, s2, s3):
+            pool.on_quota_exhausted(st, quota=False)
         assert pool._upstream_event_active() is True
         assert pool._upstream_event_remaining_s() > 0
+        assert pool.rotated == [], "un 429 transitoire ne rotationne pas"
         # Pendant l'événement : cooldown oui, rotation non.
         s1.current_ip = "1.1.1.2"
         n_before = len(pool.rotated)
@@ -72,19 +110,10 @@ class TestUpstreamEvent:
         assert st["upstream_event_active"] is True
         assert st["upstream_event_remaining_s"] > 0
 
-    def test_same_bucket_repeats_never_declare(self):
-        """3× 429 sur le même (station, IP) = quota per-IP → rotations."""
-        pool, (s1, _, _) = _pool3()
-        for _ in range(4):
-            pool.on_quota_exhausted(s1)
-        assert pool._upstream_event_active() is False
-        assert pool.rotated == [s1] * 4
-
-    def test_event_expires_then_rotations_resume(self):
+    def test_event_expires_then_quota_rotations_resume(self):
         pool, (s1, s2, s3) = _pool3()
-        pool.on_quota_exhausted(s1)
-        pool.on_quota_exhausted(s2)
-        pool.on_quota_exhausted(s3)
+        for st in (s1, s2, s3):
+            pool.on_quota_exhausted(st, quota=False)
         assert pool._upstream_event_active() is True
         # Temps écoulé : événement expiré + fenêtre vidée de la rafale.
         pool._upstream_event_until = time.monotonic() - 1.0
@@ -94,15 +123,14 @@ class TestUpstreamEvent:
         assert pool.rotated[-1] is s1  # rotation normale à nouveau
 
     def test_hot_window_redeclares_after_expiry(self):
-        """Fenêtre encore chaude à l'expiration → le 429 suivant redéclare
-        (l'amont rejette toujours : pas de rotation dans le mur)."""
+        """Fenêtre encore chaude à l'expiration → le 429 transitoire suivant
+        redéclare (l'amont rejette toujours : pas de rotation dans le mur)."""
         pool, (s1, s2, s3) = _pool3()
-        pool.on_quota_exhausted(s1)
-        pool.on_quota_exhausted(s2)
-        pool.on_quota_exhausted(s3)
+        for st in (s1, s2, s3):
+            pool.on_quota_exhausted(st, quota=False)
         pool._upstream_event_until = time.monotonic() - 1.0
         n = len(pool.rotated)
-        pool.on_quota_exhausted(s1)
+        pool.on_quota_exhausted(s1, quota=False)
         assert pool._upstream_event_active() is True
         assert len(pool.rotated) == n
 
@@ -110,9 +138,13 @@ class TestUpstreamEvent:
         """Rollback : upstream_event_threshold=999 → jamais d'événement."""
         pool, (s1, s2, s3) = _pool3()
         pool.update_config({"upstream_event_threshold": 999})
-        pool.on_quota_exhausted(s1)
-        pool.on_quota_exhausted(s2)
-        pool.on_quota_exhausted(s3)
+        for st in (s1, s2, s3):
+            pool.on_quota_exhausted(st, quota=False)
+        assert pool._upstream_event_active() is False
+        assert pool.rotated == []
+        # Les vrais quotas, eux, rotationnent toujours.
+        for st in (s1, s2, s3):
+            pool.on_quota_exhausted(st)
         assert pool._upstream_event_active() is False
         assert pool.rotated == [s1, s2, s3]
 
@@ -130,34 +162,34 @@ class TestUpstreamEvent:
         assert pool._upstream_event_threshold == 5  # invalide → inchangé
 
     def test_cooldown_still_applied_during_event(self):
-        """Le gel ne concerne que la rotation : le cooldown C1 reste posé."""
+        """Le gel ne concerne que la rotation : le cooldown C1 reste posé
+        sur un VRAI quota arrivé pendant l'événement."""
         pool, (s1, s2, s3) = _pool3()
-        pool.on_quota_exhausted(s1)
-        pool.on_quota_exhausted(s2)
-        pool.on_quota_exhausted(s3)
+        for st in (s1, s2, s3):
+            pool.on_quota_exhausted(st, quota=False)
         assert pool._upstream_event_active() is True
-        # s1 et s2 bad-markées (une autre restait utilisable à chaque fois).
+        n = len(pool.rotated)
+        # Un quota réel pendant l'événement : cooldown posé, rotation gelée.
+        pool.on_quota_exhausted(s1)
         assert pool._per_station(s1)["bad_until"] is not None
-        assert pool._per_station(s2)["bad_until"] is not None
+        assert len(pool.rotated) == n
 
     def test_last_servable_never_force_rotated_during_event(self):
         """Pendant l'événement, même la dernière-servable ne rotationne pas
-        (elle continue de servir ; un 429 isolé hors événement garde le
+        (elle continue de servir ; un quota isolé hors événement garde le
         comportement historique : rotation en fond)."""
         pool, (s1, s2, s3) = _pool3()
         s2.status = "error"
         s3.status = "error"
         pool.on_quota_exhausted(s1)  # seule servable, pas d'événement
         assert pool.rotated == [s1]  # historique : rotation en fond
-        # Force un événement via 3 couples distincts (s1 change d'IP).
+        # Force un événement via 3 couples distincts (429 transitoires).
         pool._upstream_429_log.clear()
         pool._upstream_event_until = 0.0
-        s1.current_ip = "9.9.9.1"
-        pool.on_quota_exhausted(s2)  # error mais loggé quand même
-        s1.current_ip = "9.9.9.2"
-        pool.on_quota_exhausted(s3)
+        pool.on_quota_exhausted(s2, quota=False)  # (s2, 2.2.2.2)
+        pool.on_quota_exhausted(s3, quota=False)  # (s3, 3.3.3.3)
         s1.current_ip = "9.9.9.3"
-        pool.on_quota_exhausted(s1)
+        pool.on_quota_exhausted(s1, quota=False)  # (s1, 9.9.9.3)
         assert pool._upstream_event_active() is True
         n = len(pool.rotated)
         pool.on_quota_exhausted(s1)  # dernière-servable, en événement
@@ -167,12 +199,12 @@ class TestUpstreamEvent:
     # ── [fiab 09/09 phase 2] multi-causes : timeouts + AUTH ──────────
 
     def test_mixed_429_timeout_auth_declares_event(self):
-        """Une vague MIXTE (429 + timeout + AUTH sur couples distincts)
-        déclare comme une vague homogène — c'est le cas réel d'un throttle
-        amont (storm auto-infligé : les retries timeoutent ET les AUTH
-        suivants sont refusés)."""
+        """Une vague MIXTE (429 transitoire + timeout + AUTH sur couples
+        distincts) déclare comme une vague homogène — c'est le cas réel d'un
+        throttle amont (storm auto-infligé : les retries timeoutent ET les
+        AUTH suivants sont refusés)."""
         pool, (s1, s2, s3) = _pool3()
-        pool._note_upstream_429(s1)
+        pool._note_upstream_429(s1)  # 429 transitoire (quota=False en prod)
         assert pool._upstream_event_active() is False
         pool._note_upstream_timeout(s2)
         assert pool._upstream_event_active() is False
@@ -197,6 +229,32 @@ class TestUpstreamEvent:
         await pool.on_disconnect_retry(s3)
         assert pool._upstream_event_active() is True
         assert len(pool.rotated) == n  # s3 gelée, pas de rotation neuve
+
+    @pytest.mark.asyncio
+    async def test_rate_limited_retry_skips_breaker_but_still_rotates(self):
+        """[fix quota-vs-breaker] Un retry après 429 quota (rate_limited=True)
+        ne compte PAS comme un timeout : 3 stations distinctes n'annoncent
+        aucun événement, chacune est bad-markée « rate_limit » et tourne."""
+        pool, (s1, s2, s3) = _pool3()
+        for st in (s1, s2, s3):
+            await pool.on_disconnect_retry(st, rate_limited=True)
+        assert pool._upstream_event_active() is False
+        assert len(pool._upstream_429_log) == 0
+        assert pool.rotated == [s1, s2, s3]
+        assert pool._per_station(s1)["bad_cause"] == "rate_limit"
+        assert pool._per_station(s2)["bad_cause"] == "rate_limit"
+
+    @pytest.mark.asyncio
+    async def test_rate_limited_retry_does_not_feed_mixed_event(self):
+        """Deux vrais timeouts + N retries quota : le seuil n'est atteint
+        que par les timeouts, jamais par les quotas."""
+        pool, (s1, s2, s3) = _pool3()
+        await pool.on_disconnect_retry(s1)  # timeout #1
+        await pool.on_disconnect_retry(s2)  # timeout #2
+        for _ in range(4):
+            await pool.on_disconnect_retry(s3, rate_limited=True)
+        assert pool._upstream_event_active() is False
+        assert len(pool._upstream_429_log) == 2
 
     def test_notify_genuine_failure_feeds_timeout(self):
         """notify_connection_failure n'alimente que sur bad-mark genuine

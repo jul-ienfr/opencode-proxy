@@ -166,11 +166,29 @@ def _traffic_apply_lazy() -> None:
 # [F-H6] Fail-closed when DASHBOARD_REQUIRE_TOKEN=true and host 0.0.0.0 without token.
 
 _DASHBOARD_TOKEN = os.getenv("DASHBOARD_TOKEN", "").strip()
-_DASHBOARD_REQUIRE_TOKEN = os.getenv("DASHBOARD_REQUIRE_TOKEN", "").strip().lower() in (
-    "1",
-    "true",
-    "yes",
-)
+
+
+def _require_token_from_config() -> bool:
+    """[V7.2] `dashboard_trust.require_token` du YAML — jusqu'ici **ignoré**.
+
+    Le code ne lisait que la variable d'environnement `DASHBOARD_REQUIRE_TOKEN`.
+    Un utilisateur qui écrivait `require_token: true` dans `config.yaml` croyait
+    donc exiger un token sur son dashboard : rien ne se passait. Un réglage de
+    sécurité qui ne s'applique pas en silence est pire qu'un réglage absent.
+
+    Précédence : variable d'environnement d'abord (comportement inchangé pour
+    ceux qui l'utilisent), puis le YAML.
+    """
+    env = os.getenv("DASHBOARD_REQUIRE_TOKEN", "").strip().lower()
+    if env:
+        return env in ("1", "true", "yes")
+    try:
+        return bool(config_settings.yaml_get("dashboard_trust", "require_token", False))
+    except Exception:
+        return False
+
+
+_DASHBOARD_REQUIRE_TOKEN = _require_token_from_config()
 _host_for_warning = "0.0.0.0"
 try:
     _host_for_warning = (os.getenv("OPENCODE_HOST", "") or "").strip()
@@ -1528,6 +1546,11 @@ def register_dashboard(
                     pass
         except Exception:
             local_ips = []
+        _mgr = server_manager_getter() if server_manager_getter else None
+        try:
+            _port = int(getattr(_mgr, "port", PORT)) if _mgr else PORT
+        except (TypeError, ValueError):
+            _port = PORT
         return {
             "proxy": PROXY or "",
             "api_key_set": bool(API_KEY),
@@ -1535,7 +1558,7 @@ def register_dashboard(
             if API_KEY and len(API_KEY) > 8
             else ("****" if API_KEY else ""),
             "host": HOST,
-            "port": PORT,
+            "port": _port,
             "local_ips": local_ips,
             "routes": routes_info,
             "models": models_info,
@@ -2116,9 +2139,16 @@ def register_dashboard(
     @app.get("/api/proxy/status")
     async def proxy_status():
         mgr = server_manager_getter() if server_manager_getter else None
+        # [port CLI] --port 4100 ne modifie que le PORT du module opencode ;
+        # le PORT importé ici reste celui du config.yaml (4000). Le manager
+        # porte le port RÉELLEMENT écouté : le dashboard doit l'afficher.
+        try:
+            effective_port = int(getattr(mgr, "port", PORT)) if mgr else PORT
+        except (TypeError, ValueError):
+            effective_port = PORT
         if mgr:
-            return {"running": mgr.is_running, "port": PORT}
-        return {"running": True, "port": PORT}
+            return {"running": mgr.is_running, "port": effective_port}
+        return {"running": True, "port": effective_port}
 
     @app.post("/api/proxy/start")
     async def proxy_start():

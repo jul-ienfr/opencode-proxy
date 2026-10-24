@@ -97,11 +97,12 @@ def test_override_to_free_model_stays_free():
 
 def test_blank_override_ignored():
     """Override vide/espaces = absent (pas de route parasite)."""
+    oc._free_model_rr.clear()
     m, ep, proto, is_free = oc._compaction_summarizer_plan(
         "mimo-v2.5", "   ", endpoint="https://opencode.ai/zen/go/v1/chat/completions", protocol="openai"
     )[:4]
     assert is_free is True
-    assert m == "mimo-v2.6-flash-free"
+    assert m in ("mimo-v2.6-flash-free", "deepseek-v4.1-flash-free", "glm-5.3-flash-free")
 
 
 def test_plan_is_pure_and_never_raises():
@@ -244,7 +245,8 @@ ORPHAN_FREE_IDS = [
     "nemotron-3-ultra-free",
     "mimo-v2.6-flash-free",
     "deepseek-v4-flash-free",
-    "mimo-v2.5-free",
+    # NOTE : mimo-v2.5-free N'EST PLUS orphelin — 410 ModelDeprecated amont
+    # (remplacement officiel : mimo-v2.6-flash-free, cf. free_model_map).
     "muse-spark-1.3-contributor-free",
 ]
 
@@ -288,7 +290,20 @@ def test_paid_ids_still_resolve_to_none(model_id):
 
 def test_mapped_paid_names_keep_their_destination():
     """Les noms payants mappés gardent leur destination déclarée (non régressé)."""
-    assert oc._resolve_free_model("mimo-v2.5") == "mimo-v2.6-flash-free"
+    oc._free_model_rr.clear()
+    assert oc._resolve_free_model("mimo-v2.5") in (
+        "mimo-v2.6-flash-free",
+        "deepseek-v4.1-flash-free",
+        "glm-5.3-flash-free",
+    )
     # deepseek-v4-flash-free mort côté amont (0 succès) : remappé sain.
-    assert oc._resolve_free_model("glm-5.1") == "mimo-v2.6-flash-free"
-    assert oc._resolve_free_model("deepseek-v4-flash") == "mimo-v2.6-flash-free"
+    assert oc._resolve_free_model("glm-5.1") in (
+        "mimo-v2.6-flash-free",
+        "deepseek-v4.1-flash-free",
+        "glm-5.3-flash-free",
+    )
+    assert oc._resolve_free_model("deepseek-v4-flash") in (
+        "mimo-v2.6-flash-free",
+        "deepseek-v4.1-flash-free",
+        "glm-5.3-flash-free",
+    )

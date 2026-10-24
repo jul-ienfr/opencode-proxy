@@ -72,26 +72,26 @@ import opencode as oc
 MSG_RE = re.compile(r"msg_[0-9a-f]{12}[0-9A-Za-z]{14}")
 SES_RE = re.compile(r"ses_[0-9a-f]{12}[0-9A-Za-z]{14}")
 
-EXPECTED_ORDER = [
+#: [ALIGNEMENT 2026-10-20] Wire OFFICIEL (client 1.19.3, capture locale
+#: `_research/oc-1.19.3/capture.jsonl`) : l'identité de session est portée par
+#: trois noms, avec la MÊME valeur. Ordre mesuré sur le fil.
+OFFICIAL_ORDER = [
     "Authorization",
     "Content-Type",
     "User-Agent",
-    "x-opencode-client",
-    "x-opencode-project",
-    "x-opencode-request",
-    "x-opencode-session",
-    # [wire complet] 4 en-têtes de transport posés EXPLICITEMENT, dans l'ordre
-    # du client natif (mesuré mitmproxy en 1.18.31, 2026-10-15).
-    # Avant, libcurl les plaçait autrement : Host en position 1, Accept
-    # absente, Accept-Encoding sans zstd.
+    "x-opencode-session-id",
+    "x-session-affinity",
+    "x-session-id",
     "Connection",
     "Accept",
     "Host",
     "Accept-Encoding",
 ]
 
-# Ordre EXACT sur le fil chez le client officiel natif (12 en-têtes, 1.18.31).
-CLIENT_WIRE_ORDER = [
+#: Wire LEGACY (client 1.18.31) — conservé pour le mode `legacy`
+#: (rollback à chaud) et pour les tests des IDs `msg_`, qui n'existent que
+#: dans ce wire.
+LEGACY_ORDER = [
     "Authorization",
     "Content-Type",
     "User-Agent",
@@ -103,8 +103,14 @@ CLIENT_WIRE_ORDER = [
     "Accept",
     "Host",
     "Accept-Encoding",
-    "Content-Length",
 ]
+
+#: Ajouté par le transport (libcurl), jamais posé par le proxy.
+TRANSPORT_ONLY = ["Content-Length"]
+
+#: Alias historique : le wire par défaut est désormais l'officiel.
+EXPECTED_ORDER = OFFICIAL_ORDER
+CLIENT_WIRE_ORDER = OFFICIAL_ORDER + TRANSPORT_ONLY
 
 
 @pytest.fixture
@@ -119,18 +125,17 @@ def official_env(monkeypatch, tmp_path):
 
 
 def test_header_set_exact(official_env):
-    """Wire complet : les en-tetes du client, dans l'ordre du client.
+    """Wire complet : les en-tetes du client 1.19.3, dans l'ordre du client.
 
-    [2e passe] Le client officiel envoie 12 en-tetes (mesure 243x) : les 7 de
-    la couche ai-sdk PUIS Connection, Accept, Host, Accept-Encoding,
-    Content-Length. Les 11 premiers sont poses ici ; Content-Length est genere
-    par le transport. AVANT ce correctif, la jambe free n'en envoyait que 10 :
-    Accept et Connection manquaient, Host partait en position 1 et
-    Accept-Encoding valait gzip, deflate, br au lieu de gzip, deflate, br, zstd.
+    [ALIGNEMENT 2026-10-20] Le client officiel n'emet plus le quartet
+    `x-opencode-client/project/request/session` : il porte l'identite de
+    session par `x-opencode-session-id` + `x-session-affinity` +
+    `x-session-id`, avec la MEME valeur (capture locale du binaire 1.19.3).
+    Le mode `legacy` (wire 1.18.x) reste disponible et est verifie plus bas.
     Aucun en-tete navigateur, et jamais x-api-key (invariant A.0).
     """
     h = oc._official_free_headers("https://opencode.ai/inference/v1/chat/completions")
-    assert list(h.keys()) == EXPECTED_ORDER
+    assert list(h.keys()) == OFFICIAL_ORDER
     lower = {k.lower() for k in h}
     for banned in (
         "accept-language",
@@ -143,42 +148,46 @@ def test_header_set_exact(official_env):
         "anthropic-version",
         "x-stainless-arch",
         "x-parent-session-id",
+        # Quartet 1.18.x : plus emis (mesure : non requis par la porte).
+        "x-opencode-client",
+        "x-opencode-project",
+        "x-opencode-request",
     ):
-        assert banned not in lower, f"browser/client header {banned!r} leaked to free"
+        assert banned not in lower, f"en-tete {banned!r} ne doit pas partir sur la jambe free"
+
+
+def test_legacy_style_restores_the_1_18_wire(official_env, monkeypatch):
+    """Rollback : `OPENCODE_FREE_WIRE_STYLE=legacy` restaure le wire 1.18.x."""
+    monkeypatch.setattr(oc, "_FREE_WIRE_STYLE", "legacy")
+    h = oc._official_free_headers("https://opencode.ai/inference/v1/chat/completions")
+    assert list(h.keys()) == LEGACY_ORDER
+    assert h["x-opencode-client"] == oc._OPENCODE_CLIENT_NAME
+    assert MSG_RE.fullmatch(h["x-opencode-request"])
+    assert "x-opencode-session-id" not in h
 
 
 def test_header_values_official(official_env):
-    """Valeurs exactes du client officiel natif (mesuré mitmproxy 1.18.31).
+    """Valeurs exactes du client 1.19.3 (capture locale, chemin ai-sdk).
 
-    Mesuré au mitmproxy sur le natif (`opencode run`, provider `opencode`) :
-      x-opencode-client  = "cli"   (choix proxy assumé : `run` envoie
-                            « desktop » (natif), mais
-                            « cli » obtient des 200 en production)
-      x-opencode-project = ID de projet dérivé (ici le contenu de
-                           .git/opencode), PAS la constante "global"
-      PAS de x-opencode-session-id (le natif ne l'envoie jamais)
-    Hors dépôt git, le client envoie littéralement "global" (vérifié par
-    capture : dossier temp hors repo → x-opencode-project: global).
+    Reference : `_research/oc-1.19.3/capture.jsonl` — UA
+    `opencode/1.19.3 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14`,
+    trois en-tetes de session de meme valeur `ses_<12 hex><14 base62>`.
+    Hors depot git, l'ancien client envoyait `x-opencode-project: global` ;
+    cet en-tete n'existe plus dans le wire officiel.
     """
-    h = oc._official_free_headers()
+    h = oc._official_free_headers("https://opencode.ai/inference/v1/chat/completions")
     assert h["User-Agent"] == oc._OPENCODE_OFFICIAL_UA
-    assert h["User-Agent"] == "opencode/1.18.31 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14"
+    assert h["User-Agent"] == "opencode/1.19.3 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14"
     assert h["Authorization"] == "Bearer public"
-    assert h["x-opencode-client"] == "cli"
-    # PAS de session-id : le natif ne l'envoie jamais (mesuré mitmproxy).
-    assert "x-opencode-session-id" not in h
     assert h["Content-Type"] == "application/json"
-    # project = ID dérivé de git, ou "global" hors dépôt git. Jamais vide.
-    proj = h["x-opencode-project"]
-    assert proj, "x-opencode-project ne doit jamais être vide"
-    assert re.fullmatch(r"(global|[0-9a-f]{40})", proj), proj
-    if oc._OPENCODE_PROJECT == "global":
-        assert proj == "global"
-    else:
-        assert proj == oc._OPENCODE_PROJECT
-    assert "Accept" not in h, "Accept must stay transport-added (10th), never explicit"
-    assert MSG_RE.fullmatch(h["x-opencode-request"]), h["x-opencode-request"]
-    assert SES_RE.fullmatch(h["x-opencode-session"]), h["x-opencode-session"]
+    # Identite de session : trois noms, une seule valeur.
+    sid = h["x-opencode-session-id"]
+    assert SES_RE.fullmatch(sid), sid
+    assert h["x-session-affinity"] == sid
+    assert h["x-session-id"] == sid
+    assert "Accept" in h, "Accept est pose explicitement (ordre du client)"
+    assert "x-opencode-request" not in h
+    assert "x-opencode-project" not in h
 
 
 def test_client_name_enum_matches_binary(official_env):
@@ -222,11 +231,16 @@ def test_ua_per_endpoint(official_env):
     assert resp["User-Agent"] == oc._OPENCODE_OFFICIAL_UA_RESPONSES
     assert "4.0.40" in resp["User-Agent"]
     # Même jeu/ordre par ailleurs
-    assert list(resp) == EXPECTED_ORDER
+    assert list(resp) == OFFICIAL_ORDER
 
 
-def test_msg_stable_same_task_new_after_reset(official_env):
-    """Même tâche → même msg_ (retries/hedges d'un même message)."""
+def test_msg_stable_same_task_new_after_reset(official_env, monkeypatch):
+    """Même tâche → même msg_ (retries/hedges d'un même message).
+
+    Le header `x-opencode-request` n'existe que dans le wire 1.18.x : ce test
+    verrouille donc le mode `legacy`, qui reste le chemin de rollback.
+    """
+    monkeypatch.setattr(oc, "_FREE_WIRE_STYLE", "legacy")
     h1 = oc._official_free_headers()
     h2 = oc._official_free_headers()
     assert h1["x-opencode-request"] == h2["x-opencode-request"]
@@ -237,8 +251,9 @@ def test_msg_stable_same_task_new_after_reset(official_env):
     assert h3["x-opencode-request"] != h1["x-opencode-request"]
 
 
-async def test_msg_distinct_across_tasks(official_env):
+async def test_msg_distinct_across_tasks(official_env, monkeypatch):
     """Deux tâches (= deux messages logiques) → deux msg_ distincts."""
+    monkeypatch.setattr(oc, "_FREE_WIRE_STYLE", "legacy")
 
     async def _send():
         return oc._official_free_headers()["x-opencode-request"]
@@ -267,10 +282,10 @@ def test_hostile_profile_extras_never_reach_free(official_env):
     lower = {k.lower(): v for k, v in h.items()}
     for k in hostile["extra_headers"]:
         assert k.lower() not in lower, f"profile extra {k!r} leaked to free"
-    assert set(h.keys()) == set(EXPECTED_ORDER)
+    assert set(h.keys()) == set(OFFICIAL_ORDER)
     # Le jeu ferme comprend EXACTEMENT les en-tetes du client : hors extras
     # hostiles, il ne doit rien contenir d'autre.
-    assert set(h) == set(CLIENT_WIRE_ORDER) - {"Content-Length"}
+    assert set(h) == set(CLIENT_WIRE_ORDER) - set(TRANSPORT_ONLY)
 
 
 class _FakeCurlResp:
@@ -319,10 +334,11 @@ async def test_bun_replay_non_stream(official_env, monkeypatch):
     seen = {}
     posts = []
 
-    async def _fake_factory(proxy_url, impersonate, fp_override=None):
+    async def _fake_factory(proxy_url, impersonate, fp_override=None, egress_ip=None):
         seen["proxy_url"] = proxy_url
         seen["impersonate"] = impersonate
         seen["fp_override"] = fp_override
+        seen["egress_ip"] = egress_ip
         return _FakePool(), _FakeSlot(posts)
 
     monkeypatch.setattr(oc, "_get_pooled_curl_session", _fake_factory)
@@ -468,11 +484,12 @@ def test_free_wire_body_chat_appends_shim(official_env):
     wire, forced = oc._free_wire_body(body, force_stream=True)
     assert forced is True
     assert wire["stream"] is True
-    assert _chat_names(wire["tools"]) == {"bash", "read"}
+    # [V6.2.2] `bash` mesuré non load-bearing : seul `read` est injecté.
+    assert _chat_names(wire["tools"]) == {"read"}
     assert "tools" not in body and body.get("stream") is not True  # entrée intacte
     wire2, forced2 = oc._free_wire_body(wire, force_stream=True)
     assert forced2 is False  # déjà conforme : inchangé
-    assert _chat_names(wire2["tools"]) == {"bash", "read"}
+    assert _chat_names(wire2["tools"]) == {"read"}
 
 
 def test_free_wire_body_chat_keeps_client_tools(official_env):
@@ -491,9 +508,13 @@ def test_free_wire_body_chat_keeps_client_tools(official_env):
     wire, forced = oc._free_wire_body(body, force_stream=True)
     assert forced is False  # déjà stream:true
     names = _chat_names(wire["tools"])
-    assert {"Bash", "bash", "read"} <= names
-    assert wire["tools"][0] is not mine  # [E3] le shim « bash » passe devant
-    assert [t["function"]["name"] for t in wire["tools"]] == ["bash", "Bash", "read"]
+    assert {"Bash", "read"} <= names
+    # [V6.2.2] `bash` retiré : le client ne fournissant que « Bash », le shim
+    # ajouté est « read ». La collation ICU place la majuscule avant la
+    # minuscule, donc l'outil client passe en tête et le shim suit. L'objet
+    # client doit rester le MÊME (pas de recopie, pas de doublon).
+    assert wire["tools"][0] is mine
+    assert [t["function"]["name"] for t in wire["tools"]] == ["Bash", "read"]
 
 
 def test_free_wire_body_responses_prompt_cache_key(official_env):
@@ -501,7 +522,7 @@ def test_free_wire_body_responses_prompt_cache_key(official_env):
     body = {"model": "m", "input": [{"role": "user", "content": "hi"}]}
     wire, forced = oc._free_wire_body(body, force_stream=True)
     assert forced is True
-    assert _resp_names(wire["tools"]) == {"bash", "read"}
+    assert _resp_names(wire["tools"]) == {"read"}
     assert wire["prompt_cache_key"] == oc._free_session_id()
     assert wire["prompt_cache_key"].startswith("ses_")
 
@@ -629,7 +650,8 @@ async def test_do_free_direct_request_collects(official_env, monkeypatch):
 
     wire = json.loads(sent["content"].decode())
     assert wire["stream"] is True
-    assert _chat_names(wire["tools"]) == {"bash", "read"}
+    # [V6.2.2] `bash` mesuré non load-bearing : seul `read` est injecté.
+    assert _chat_names(wire["tools"]) == {"read"}
     assert "tools" not in body
 
 

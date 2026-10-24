@@ -98,6 +98,41 @@ def compute_retry_delay(
     return wait
 
 
+# ─────────── Statuts rejouables (parité client officiel 1.19.3) ───────────
+#
+# Source : `packages/llm/src/route/executor.ts` (client officiel) —
+# `retryableStatus()` renvoie vrai pour 429, 503, 504, 529 **et tout statut
+# ≥ 500**. Tout le reste (400, 401, 403, 404, 409, 413, 422, 425…) est classé
+# `InvalidRequest` et n'est JAMAIS rejoué : réémettre une requête que l'amont
+# a déclarée invalide ne peut que reproduire l'erreur, en consommant du quota
+# et de la latence.
+#
+# Écarts volontaires par rapport à ce que le proxy faisait avant :
+#   * 409 (Conflict) était rejoué → non rejoué (l'officiel le classe
+#     InvalidRequest) ;
+#   * 408 (Request Timeout), 425 (Too Early) et 499 (client closed) étaient
+#     rejoués → non rejoués ici : ce sont des conditions de *transport*, pas
+#     des surcharges amont, et le proxy a ses propres reprises de transport ;
+#   * 429 était absent de l'ensemble « 5xx » et n'était rejoué que par les
+#     chemins free dédiés → désormais rejouable partout, comme l'officiel ;
+#   * 501/505+ (5xx hors liste historique) étaient ignorés → rejoués, comme
+#     tout 5xx chez l'officiel.
+RETRYABLE_STATUSES: frozenset[int] = frozenset({429, 503, 504, 529} | set(range(500, 600)))
+
+
+def is_retryable_status(status: object) -> bool:
+    """Vrai si le statut justifie une reprise (parité client officiel).
+
+    Pur, sans raise : appelé sur le chemin de la requête. Un statut illisible
+    n'est pas rejouable — mieux vaut rendre l'erreur que boucler dessus.
+    """
+    try:
+        code = int(status)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return False
+    return code in RETRYABLE_STATUSES
+
+
 # ─────────── Budget de reprises (PLAN_ALIGNEMENT_CLIENT_OFFICIEL G2) ───────────
 
 # Plafond du budget. La jambe libre DÉRIVE sa borne de ce budget
@@ -167,4 +202,11 @@ def resolve_max_retries(raw: object, default: int = 2) -> int:
     return value
 
 
-__all__ = ["RETRY_BUDGET_MAX", "compute_retry_delay", "parse_retry_after", "resolve_max_retries"]
+__all__ = [
+    "RETRY_BUDGET_MAX",
+    "RETRYABLE_STATUSES",
+    "compute_retry_delay",
+    "is_retryable_status",
+    "parse_retry_after",
+    "resolve_max_retries",
+]

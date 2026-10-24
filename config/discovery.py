@@ -32,6 +32,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 logger = logging.getLogger("config.settings")
@@ -587,6 +588,244 @@ def persist_free_mappings(
         log.warning("[free-discovery] persist failed: %s", e)
 
 
+# ── [PLAN_STRATEGIE_FREE_MODELS Lot A] Sonde active de servabilité ─────────────
+#
+# Philosophie (plan 2026-10-16 §3) : la cascade de découverte *croit* le listing
+# ``/models`` ; la sonde active le *vérifie* par une requête minimale réelle
+# (cap tokens tiny, face publique) AVANT promotion : 200/429 → promu.
+# Ce module ne porte QUE la mécanique pure (config, shaping, verdict, recheck
+# plan, exécutant borné) — la GATE runtime (face officielle
+# ``_official_free_headers``, egress PROXY, usage DB, état discovery) vit côté
+# hôte (``opencode.py``) et est DI-ifiée via ``settings._FREE_PROBE_GATE``
+# (pattern G4 : poussée par l'hôte, jamais importée par ce module).
+#
+# Verdicts : alive | limited | dead | not_free | unknown | not_probeable
+#   * alive          2xx                                  → promu
+#   * limited        429 (quota, modèle vivant)           → promu (+ marqué)
+#   * dead           dead_status (404/410) OU marqueur body → refusé
+#   * not_free       401/402 (refus Bearer public)        → refusé
+#   * unknown        5xx / transport / 403 (geo-policy, peut dépendre de
+#                    l'IP de sortie) / 400 sans marqueur  → PAS promu ce cycle,
+#                    re-sonde au suivant (probe_recheck_plan)
+#   * not_probeable  jev-* (SystemOne non-chat, v1)       → promu comme avant
+
+_PROBE_DEFAULT_DEAD_MARKERS = (
+    "not found",
+    "unknown model",
+    "invalid model",
+    "no such model",
+    "no longer",
+    "retired",
+    "sunset",
+    "does not exist",
+)
+
+
+def probe_cfg(raw: Any) -> dict:
+    """Parse + clamp d'un bloc ``free_discovery.probe`` (fail-soft).
+
+    ``enabled`` défaut FALSE : la suite tests historique ne connaît pas la
+    clef (les scripts qui n'ont pas de section probe gardent le comportement
+    add-only simple) ; la prod dépend du config.yaml explicite. Valeur
+    invalide → défaut, hors bornes → clamp (jamais d'écrasement silencieux).
+    """
+    raw = raw if isinstance(raw, dict) else {}
+
+    def _num(key: str, default: float, lo: float, hi: float) -> float:
+        try:
+            v = float(raw.get(key, default))
+        except (TypeError, ValueError):
+            return float(default)
+        if v != v:  # NaN
+            return float(default)
+        return max(lo, min(hi, v))
+
+    def _status_set(key: str, default: list) -> set:
+        xs = raw.get(key, default)
+        if not isinstance(xs, (list, tuple, set)):
+            xs = default
+        out: set = set()
+        for x in xs:
+            try:
+                out.add(int(x))
+            except (TypeError, ValueError):
+                pass
+        return out
+
+    markers_raw = raw.get("dead_markers")
+    if isinstance(markers_raw, (list, tuple)) and markers_raw:
+        markers = tuple(
+            str(m).lower() for m in markers_raw if isinstance(m, str) and m.strip()
+        )
+    else:
+        markers = _PROBE_DEFAULT_DEAD_MARKERS
+    return {
+        "enabled": bool(raw.get("enabled", False)),
+        "timeout": _num("timeout", 8.0, 2.0, 60.0),
+        "concurrency": int(_num("concurrency", 3.0, 1.0, 10.0)),
+        "max_ids": int(_num("max_ids", 10.0, 1.0, 50.0)),
+        "dead_ttl_s": _num("dead_ttl_s", 86400.0, 60.0, 604800.0),
+        "recheck_interval_s": _num("recheck_interval_s", 1800.0, 60.0, 86400.0),
+        "skip_recent_ok_s": _num("skip_recent_ok_s", 1800.0, 0.0, 86400.0),
+        "dead_status": _status_set("dead_status", [404, 410]),
+        "not_free_status": _status_set("not_free_status", [401, 402]),
+        "dead_markers": markers,
+    }
+
+
+def free_probe_shaping(mid: str, api_base_free: str) -> tuple:
+    """(endpoint_url, body_minimal) pour UN id — (None, None) = non sondable.
+
+    ``muse-*``/``spark-*`` → /responses (``input``/``max_output_tokens``),
+    sinon /chat/completions (``messages``/``max_tokens``). ``jev-*`` :
+    SystemOne est state+typed-questions (NON chat) — une sonde synthétique
+    serait une fausse 400 permanente → non sondable v1 (promu comme avant).
+    Cap frugal 64 tokens ; un upstream qui exige un min_tokens répond 400
+    sans marqueur → verdict unknown (pas de promotion erronée pour autant).
+    """
+    lid = str(mid).lower()
+    if "jev" in lid:
+        return None, None
+    url = free_endpoint_for(mid, api_base_free)
+    if "/responses" in url:
+        body = {"model": mid, "input": "ping", "max_output_tokens": 64, "stream": False}
+    else:
+        body = {
+            "model": mid,
+            "messages": [{"role": "user", "content": "ping"}],
+            "max_tokens": 64,
+            "stream": False,
+        }
+    return url, body
+
+
+def free_probe_verdict(status: Any, body: str, cfg: dict) -> tuple:
+    """(verdict, raison) — PUR, aucune I/O. Erreur transport → ``unknown``.
+
+    403 n'est JAMAIS mort par défaut : le fléchage 403 amont peut venir de la
+    policy GEO/tenant de l'IP de sortie (les chemins free du proxy retentent
+    déjà les 403-DataPolicy sur station fraîche) — verdict ``unknown`` plutôt
+    qu'un faux ``dead`` irrévocable.
+    """
+    try:
+        s = int(status)
+    except (TypeError, ValueError):
+        return "unknown", "transport/réseau — pas de statut"
+    if 200 <= s < 300:
+        return "alive", "2xx"
+    if s in (cfg.get("dead_status") or ()):
+        return "dead", f"status {s}"
+    if s == 429:
+        return "limited", "429 quota — modèle vivant"
+    if s in (cfg.get("not_free_status") or ()):
+        return "not_free", f"status {s} — refus Bearer public"
+    if 500 <= s < 600:
+        return "unknown", f"status {s} — transitoire upstream"
+    low = (body or "").lower()
+    for marker in cfg.get("dead_markers") or ():
+        if marker in low:
+            return "dead", f"marque corps {marker!r} (status {s})"
+    return "unknown", f"status {s} — sans marque (param shape / incertitude)"
+
+
+def probe_recheck_plan(results: dict, cfg: dict, now: float) -> list:
+    """Ids à RE-sonder : verdict ``unknown`` dont ``checked_epoch`` stagne
+    au-delà de ``recheck_interval_s``. Les ``dead`` suivent le dead_ttl (hors
+    plan), ``alive``/``limited`` sont frais, ``not_probeable`` est final."""
+    out = []
+    for mid, r in (results or {}).items():
+        if not isinstance(r, dict):
+            continue
+        try:
+            ts = float(r.get("checked_epoch") or 0.0)
+        except (TypeError, ValueError):
+            ts = 0.0
+        if r.get("verdict") == "unknown" and (now - ts) >= cfg["recheck_interval_s"]:
+            out.append(mid)
+    return sorted(out)
+
+
+def probe_free_models(
+    ids: list,
+    *,
+    api_base_free: str,
+    headers_fn: Callable | None,
+    dispatch_fn: Callable,
+    cfg: dict,
+    log=logger,
+) -> dict:
+    """Sonde SANS ÉTAT de ``ids`` → {mid: {verdict, status, reason, checked_at,
+    checked_epoch}}. Borné : ``max_ids`` ids max (ordre de l'appelant),
+    ``concurrency`` threads max (ThreadPoolExecutor borné). Une erreur de
+    dispatch est un verdict ``unknown`` — jamais propagée. ``headers_fn`` est
+    DI-hôte (face officielle) ; à défaut, headers publics minimaux."""
+    results: dict = {}
+    if not ids:
+        return results
+    to_probe = list(ids)[: cfg["max_ids"]]
+
+    def _one(mid: str) -> tuple:
+        checked_at = _dt_now_utc_iso()
+        checked_epoch = time.time()
+        url, body = free_probe_shaping(mid, api_base_free)
+        if url is None:
+            return mid, {
+                "verdict": "not_probeable",
+                "status": None,
+                "reason": "jev-* SystemOne (non-chat) — hors sonde v1",
+                "checked_at": checked_at,
+                "checked_epoch": checked_epoch,
+            }
+        try:
+            payload = json.dumps(body).encode("utf-8")
+        except Exception:
+            payload = b"{}"
+        if headers_fn is not None:
+            headers = headers_fn(url)
+        else:
+            headers = {
+                "Authorization": "Bearer public",
+                "Content-Type": "application/json",
+            }
+        try:
+            status, body_text = dispatch_fn(url, headers, payload)
+        except Exception as e:
+            return mid, {
+                "verdict": "unknown",
+                "status": None,
+                "reason": f"transport {type(e).__name__}: {e}",
+                "checked_at": checked_at,
+                "checked_epoch": checked_epoch,
+            }
+        verdict, reason = free_probe_verdict(status, body_text, cfg)
+        return mid, {
+            "verdict": verdict,
+            "status": int(status) if isinstance(status, int) else None,
+            "reason": reason,
+            "checked_at": checked_at,
+            "checked_epoch": checked_epoch,
+        }
+
+    conc = max(1, int(cfg.get("concurrency") or 1))
+    if conc <= 1 or len(to_probe) == 1:
+        for mid in to_probe:
+            m, r = _one(mid)
+            results[m] = r
+    else:
+        with ThreadPoolExecutor(max_workers=min(conc, len(to_probe))) as ex:
+            for m, r in ex.map(_one, to_probe):
+                results[m] = r
+    if log is not None:
+        log.debug("[free-discovery] probe done: %s", results)
+    return results
+
+
+def _dt_now_utc_iso() -> str:
+    from datetime import datetime as _dt, timezone as _tz
+
+    return _dt.now(_tz.utc).isoformat()
+
+
 __all__ = [
     "_CREATE_NO_WINDOW",
     "_detect_free_ids",
@@ -597,8 +836,13 @@ __all__ = [
     "fetch_upstream_models",
     "free_discovery_urls",
     "free_endpoint_for",
+    "free_probe_shaping",
+    "free_probe_verdict",
     "is_free_model",
     "persist_free_mappings",
+    "probe_cfg",
+    "probe_free_models",
+    "probe_recheck_plan",
     "start_background_fetch",
 ]
 

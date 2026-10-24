@@ -158,9 +158,13 @@ def test_official_headers_conversation_key(tmp_path, monkeypatch):
         h2 = oc._official_free_headers("", "conv-A")
         h3 = oc._official_free_headers("", "conv-B")
         h0 = oc._official_free_headers("")
-        assert h1["x-opencode-session"] == h2["x-opencode-session"]
-        assert h3["x-opencode-session"] != h1["x-opencode-session"]
-        assert h0["x-opencode-session"] == oc._free_session_id()
+        # [ALIGNEMENT 2026-10-20] le porteur d'identité est désormais
+        # `x-opencode-session-id` (wire officiel 1.19.3) ; la sémantique
+        # testée est inchangée : stable par conversation, distincte entre elles.
+        _k = "x-opencode-session-id" if "x-opencode-session-id" in h1 else "x-opencode-session"
+        assert h1[_k] == h2[_k]
+        assert h3[_k] != h1[_k]
+        assert h0[_k] == oc._free_session_id()
         assert list(h1.keys()) == list(h0.keys())  # jeu/ordre inchangés
     finally:
         oc._CONVERSATION_SESSIONS.clear()

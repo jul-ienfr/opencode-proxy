@@ -181,6 +181,11 @@ def free_env(monkeypatch, echo_server, tmp_path):
     monkeypatch.setattr(oc, "API_BASE_FREE", echo_server)
     monkeypatch.setattr(oc, "_vpn_manager", None)
     monkeypatch.setattr(oc, "_free_ip_pool", None)
+    # [hermeticite 2026-10-24] config.yaml live porte enforce_vpn_only: true,
+    # qui interdit le repli direct et faisait lever _FreeTunnelFailure a ces
+    # deux tests de repli direct. Le contrat teste est le mode historique :
+    # on le pose explicitement au lieu d'heriter de la machine.
+    monkeypatch.setitem(oc.IP_ROTATION, "enforce_vpn_only", False)
     monkeypatch.setattr(oc, "_get_cached_public_ip", _stub_public_ip)
     monkeypatch.setattr(oc, "_log_free_model_usage", lambda *a, **k: None)
     monkeypatch.setattr(oc, "_debug", lambda *a, **k: None)
@@ -228,19 +233,24 @@ def assert_official_free_identity(label, headers):
     assert headers.get("user-agent") == oc._OPENCODE_OFFICIAL_UA, (
         f"{label}: official UA expected, got {headers.get('user-agent')!r}"
     )
-    assert headers.get("x-opencode-client") == oc._OPENCODE_CLIENT_NAME, (
-        f"{label}: x-opencode-client must be the official client name "
-        f"{oc._OPENCODE_CLIENT_NAME!r}, got {headers.get('x-opencode-client')!r}"
+    # [ALIGNEMENT 2026-10-20] Wire officiel 1.19.3 : l'identité de session est
+    # portée par x-opencode-session-id / x-session-affinity / x-session-id
+    # (même valeur). Le quartet 1.18.x (client/project/request/session) n'est
+    # plus émis : mesuré non requis par la porte (le wire officiel passe, 200).
+    from config import free_gate
+
+    assert free_gate.identity_ok(headers), (
+        f"{label}: aucun en-tête d'identité de session sur l'envoi free "
+        f"(attendu l'un de {free_gate.SESSION_IDENTITY_HEADERS})"
     )
-    assert headers.get("x-opencode-project") == oc._OPENCODE_PROJECT, (
-        f"{label}: x-opencode-project must be the official derived project id "
-        f"{oc._OPENCODE_PROJECT!r}, got {headers.get('x-opencode-project')!r}"
+    _sid = (
+        headers.get("x-opencode-session-id")
+        or headers.get("x-session-affinity")
+        or headers.get("x-session-id")
+        or headers.get("x-opencode-session")
     )
-    assert re.fullmatch(r"msg_[0-9a-f]{12}[0-9A-Za-z]{14}", headers.get("x-opencode-request", "") or ""), (
-        f"{label}: bad x-opencode-request ID: {headers.get('x-opencode-request')!r}"
-    )
-    assert re.fullmatch(r"ses_[0-9a-f]{12}[0-9A-Za-z]{14}", headers.get("x-opencode-session", "") or ""), (
-        f"{label}: bad x-opencode-session ID: {headers.get('x-opencode-session')!r}"
+    assert re.fullmatch(r"ses_[0-9a-f]{12}[0-9A-Za-z]{14}", _sid or ""), (
+        f"{label}: bad free session ID: {_sid!r}"
     )
 
 
@@ -270,12 +280,13 @@ async def test_path_b_direct_httpx_free_attempt(free_env):
     # Model swap reached the wire
     wire = json.loads(cap["body"])
     assert wire["model"] == "free-test-model"
-    # [gate body 2026-09-18] grille tools (bash+read) + stream forcé : le
+    # [gate body 2026-09-18] grille tools (read seul depuis V6.2.2) + stream : le
     # corps non-stream du client part en stream:true avec les shims.
     assert wire.get("stream") is True, "Path B: free wire must force stream:true"
-    assert {"bash", "read"} <= {
+    # [V6.2.2] `bash` retiré : mesuré non load-bearing (read seul -> 200).
+    assert {"read"} <= {
         t.get("function", {}).get("name") for t in wire.get("tools", []) if isinstance(t, dict)
-    }, "Path B: free wire must carry bash+read tools"
+    }, "Path B: free wire must carry the read tool"
     # Le jeu officiel est uniforme : aucun header protocole client
     # (anthropic-version) n'est répercuté
     assert "anthropic-version" not in headers, (

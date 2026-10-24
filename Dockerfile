@@ -2,10 +2,10 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# System deps: ca-certificates + OpenVPN for IP rotation
+# System deps: ca-certificates only. [audit-2026-10-24 Phase4] openvpn supprimé :
+# le tunnel vit dans gluetun, jamais sur l'hôte/proxy — surface et poids inutiles.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
-    openvpn \
     && rm -rf /var/lib/apt/lists/*
 
 # docker CLI + compose v2 plugin ([13]): vpn_manager.py drives gluetun via
@@ -24,6 +24,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl \
     && chmod +x /usr/local/lib/docker/cli-plugins/docker-compose \
     && rm -rf /tmp/docker /tmp/docker.tgz \
     && docker --version && docker compose version
+# [audit-2026-10-24 Phase4 TODO] épingler sha256 des binaires docker/compose
+# (vérifier sur download.docker.com + github releases, ne pas inventer).
 
 # Install Python dependencies from requirements.txt (respects version pins)
 COPY requirements.txt .
@@ -65,6 +67,7 @@ COPY --chown=opencode:opencode upstream/ ./upstream/
 COPY --chown=opencode:opencode vpn/ ./vpn/
 COPY --chown=opencode:opencode scripts/make_credentials_env.py ./scripts/make_credentials_env.py
 COPY --chown=opencode:opencode scripts/precompress.py ./scripts/precompress.py
+COPY --chown=opencode:opencode scripts/vpn_alerts.py ./scripts/vpn_alerts.py
 # [Phase 5 plan boot] Assets pré-compressés AU BUILD (jamais au runtime) : le
 # démarrage ne compresse plus 250 Ko de JS en zlib et le service sert du
 # brotli (−82 % mesuré sur app.js). Non fatal : sans brotli, gzip seul ; sans

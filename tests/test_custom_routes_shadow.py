@@ -1,26 +1,31 @@
-"""Lot Z (plan §19.5, vague V1b) — les routes ``custom_routes`` de muse-spark, verrouillées.
+"""Les routes ``custom_routes`` déployées sont exécutées à la lettre.
 
-Historique : une route custom a un temps réécrit ``muse-spark-1.3-contributor``
-vers ``step-5-preview-free`` (jambe anonyme) AVANT la résolution d'endpoint.
-Ce shadow a été retiré de la config déployée : la route ``musespark13contributor``
-est désormais une IDENTITÉ (match = model = ``muse-spark-1.3-contributor``).
+Historique (Lot Z §19.5, vague V1b) : ce fichier verrouillait l'IDENTITÉ d'un
+shadow anonyme retiré de la config déployée (``muse-spark-1.3-contributor`` →
+``step-5-preview-free``). Depuis le 2026-10-17, le custom mapping est
+SOUVERAIN : chaque redir (payant → free inclus) est une décision de
+l'utilisateur, jamais une dérive à « réparer » — voir
+``docs/custom-mapping-gouvernance.md``.
 
-Comportement vivant actuel, sur la config réelle :
+Le contrat testé ici n'est donc plus le CONTENU du mapping, mais son
+EXÉCUTION :
 
-    muse-spark-1.3-contributor  -->  muse-spark-1.3-contributor  (custom_routes, identité)
-                                -->  jambe free via FREE_MODEL_MAP
-                                     (muse-spark-1.3-contributor-free, api: responses,
-                                      geo meta-muse-spark, endpoint zen/v1/responses anonyme)
-
-L'entrée ``models.muse-spark-1.3-contributor`` (``api: responses``, geo
-``meta-muse-spark``…) EST lue pour cet id. Ce fichier existe pour que toute
-déviation (réintroduction d'un shadow, changement de cible) casse bruyamment
-au lieu de laisser croire que la jambe free est ce qu'elle était.
+1. l'objet ``custom_routes`` chargé au runtime est exactement celui du yaml
+   disque (aucun writer automatique — persist mémoire, discovery, agent — n'a
+   réécrit les déclarations humaines, c'est l'écrasement du 2026-10-17) ;
+2. pour chaque route déclarée : chaque id du ``match`` sort EXACTEMENT sur la
+   ``model`` déclarée, en un unique hop (pas de passage transitif quand la
+   cible est elle-même le ``match`` d'une autre route) ;
+3. tout id couvert par aucune route sort à l'identité ;
+4. la jambe *free-first* reste accessible via ``FREE_MODEL_MAP`` (indépendante
+   des ``custom_routes``).
 
 Contrairement à ``tests/test_e2e_protocol_matrix.py`` — qui neutralise
-``SORTED_CUSTOM_ROUTES`` pour mesurer la seule matrice de protocoles — ce fichier
-lit la config telle qu'elle est déployée.
+``SORTED_CUSTOM_ROUTES`` pour mesurer la seule matrice de protocoles — ce
+fichier lit la config telle qu'elle est déployée.
 """
+
+import yaml
 
 import config.settings as _cfg_settings
 from app.router import route_for
@@ -43,56 +48,100 @@ def _resolve(name):
     return res
 
 
-def test_muse_spark_13_contributor_is_identity_not_shadowed():
-    """Plus de shadow : l'id demandé sort tel quel (route identité)."""
-    assert _resolve("muse-spark-1.3-contributor")["model"] == "muse-spark-1.3-contributor"
-
-
-def test_free_leg_comes_from_free_model_map():
-    """La jambe free passe par FREE_MODEL_MAP, pas par custom_routes."""
-    assert (
-        _cfg_settings.FREE_MODEL_MAP.get("muse-spark-1.3-contributor")
-        == "muse-spark-1.3-contributor-free"
-    )
-    # …et aucune route custom ne réécrit cet id vers autre chose :
+def _match_to_target():
+    """Match → cible de toutes les routes déclarées (pour les contre-épreuves)."""
+    m2t = {}
     for r in _cfg_settings.SORTED_CUSTOM_ROUTES:
-        if "muse-spark-1.3-contributor" in (r.get("match") or []):
-            assert r.get("model") == "muse-spark-1.3-contributor"
+        for _id in r.get("match") or []:
+            m2t[_id] = r.get("model")
+    return m2t
 
 
-def test_free_target_lands_on_the_anonymous_responses_leg():
-    """La cible free est api: responses, geo meta-muse-spark, endpoint anonyme."""
-    cfg = _cfg_settings.get_model_config("muse-spark-1.3-contributor-free")
-    assert cfg["endpoint"] == "https://opencode.ai/inference/v1/responses"
-    assert cfg.get("api") == "responses"
+def test_declared_mapping_is_what_the_runtime_carries():
+    """Aucun writer automatique n'a écrasé les déclarations humaines.
+
+    L'objet ``custom_routes`` du runtime (``CUSTOM_ROUTES`` et sa liste
+    triée) est exactement celui du ``config.yaml`` sur disque.
+    """
+    with open(_cfg_settings.CONFIG_PATH, encoding="utf-8") as f:
+        on_disk = (yaml.safe_load(f) or {}).get("custom_routes") or {}
+    assert _cfg_settings.CUSTOM_ROUTES == on_disk
+    runtime_set = {
+        (tuple(r.get("match") or []), r.get("model"))
+        for r in _cfg_settings.SORTED_CUSTOM_ROUTES
+    }
+    disk_set = {
+        (tuple(r.get("match") or []), r.get("model"))
+        for r in on_disk.values()
+    }
+    assert runtime_set == disk_set
 
 
-def test_paid_entry_of_the_id_is_reached_at_runtime():
-    """L'entrée ``models:`` de l'id demandé dit /responses… et elle est lue."""
-    paid = _cfg_settings.get_model_config("muse-spark-1.3-contributor")
-    assert "responses" in paid["endpoint"]
-    # …et la route réellement prise mène à cet id, pas à un shadow :
-    resolved = _resolve("muse-spark-1.3-contributor")["model"]
-    assert resolved == "muse-spark-1.3-contributor"
+def test_every_declared_route_is_followed_literally():
+    """Chaque id d'un ``match`` sort sur la ``model`` déclarée — sans jugement."""
+    for r in _cfg_settings.SORTED_CUSTOM_ROUTES:
+        target = r.get("model")
+        assert target in _cfg_settings.MODELS, (
+            f"cible {target!r} absente de models: — la route est déclarée mais non servable"
+        )
+        for _id in r.get("match") or []:
+            assert _resolve(_id)["model"] == target, (
+                f"{_id!r} ne suit pas sa route déclarée ({target!r})"
+            )
 
 
-def test_pass_is_not_transitive():
-    """L'id réécrit ne repasse PAS dans custom_routes (sinon boucle / surprise)."""
-    target = _resolve("muse-spark-1.3-contributor")["model"]
-    # muse-spark-1.3-contributor EST le match d'une route custom (identité) :
-    # le passage unique s'arrête dessus sans boucle.
-    assert target in _cfg_settings.MODELS
+def test_custom_redirect_never_transits_a_second_hop():
+    """La cible d'une route qui est aussi le match d'une autre route s'arrête là.
+
+    Cas réel du yaml déployé : la cible d'un alias peut être elle-même matchée
+    par une autre route (ex. un id payant cible d'un alias ET match d'une
+    route propre). Le passage unique s'arrête sur la première cible.
+    """
+    m2t = _match_to_target()
+    for r in _cfg_settings.SORTED_CUSTOM_ROUTES:
+        target = r.get("model")
+        if target not in m2t:
+            continue  # pas de cas de chaîne déclaré pour cette cible
+        for _id in r.get("match") or []:
+            assert _resolve(_id)["model"] == target, (
+                f"{_id!r} a transité un second hop vers {m2t[target]!r} "
+                f"au lieu de s'arrêter sur {target!r}"
+            )
 
 
-def test_gpt56luna_routes_to_muse_spark_identity():
-    """gpt-5.6-luna route vers muse-spark-1.3-contributor (identité ensuite)."""
-    assert _resolve("gpt-5.6-luna")["model"] == "muse-spark-1.3-contributor"
-    # Son intention (/responses) est satisfaite par l'entrée models:.
-    assert "responses" in _cfg_settings.get_model_config("muse-spark-1.3-contributor")["endpoint"]
-    assert "responses" in _cfg_settings.get_model_config("gpt-5.6-luna")["endpoint"]
+#: Ids « plats » historiques (aucune route, aucune réécriture attendue). Garde
+#: explicite : si la config générale un jour les réécrit, le test le criera.
+_PLAIN_IDS = ("grok-4.7", "glm-5")
 
 
-def test_unshadowed_model_resolves_to_itself():
-    """Contre-épreuve : sans route custom qui matche exactement, l'identité tient."""
-    assert _resolve("grok-4.7")["model"] == "grok-4.7"
-    assert _resolve("glm-5")["model"] == "glm-5"
+def test_ids_without_declared_route_resolve_to_identity():
+    """Contre-épreuve : sans route custom qui matche, l'identité tient."""
+    matched = set(_match_to_target())
+    present = [i for i in _PLAIN_IDS if i in _cfg_settings.MODELS and i not in matched]
+    if not present:
+        candidates = [_id for _id in _cfg_settings.MODELS if _id not in matched]
+        present = candidates[:2]
+    for _id in present:
+        assert _resolve(_id)["model"] == _id, _id
+
+
+def test_free_first_leg_still_holds_for_mapped_paid_ids():
+    """La jambe *free-first* passe par ``FREE_MODEL_MAP``, indépendamment.
+
+    Pour un id payant mappé (jambe free-first), la cible ``-free`` déclarée
+    dans la map reste servable (présente dans ``models:``) — même si une
+    ``custom_routes`` réécrit l'id vers autre chose : les deux mécanismes
+    coexistent, le mapping humain ne détruit pas la jambe free de la map.
+    """
+    covered = [
+        (paid, free)
+        for paid, free in _cfg_settings.FREE_MODEL_MAP.items()
+        if paid in _match_to_target() and free in _cfg_settings.MODELS
+    ]
+    assert covered, (
+        "aucun couple map couvert + servable : la map a-t-elle été vidée ?"
+    )
+    for paid, free in covered:
+        assert free in _cfg_settings.MODELS, (paid, free)
+        cfg = _cfg_settings.get_model_config(free)
+        assert cfg.get("endpoint"), (paid, free)

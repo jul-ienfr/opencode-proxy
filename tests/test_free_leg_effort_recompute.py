@@ -27,6 +27,7 @@ import json
 
 import pytest
 
+import config.settings as _cfg_settings
 import opencode as oc
 
 PAID_CHAT = "deepseek-v4-flash"
@@ -134,6 +135,35 @@ class _Seam:
         return self.calls[0]["body"]
 
 
+def _bypass_declared_custom_routes_for_paid(monkeypatch):
+    """Séquestre les custom_routes de la CONFIG déployée pour ``PAID_CHAT``.
+
+    Le custom mapping est souverain (docs/custom-mapping-gouvernance.md) et
+    peut rediriger l'id payant témoin (ex. ``deepseek-v4-flash``) vers une
+    cible libre au goût de l'utilisateur. Le témoin, lui, exerce le couple
+    payant/free posé en mémoire par ce fichier : le mapping déployé ne doit
+    pas le parasiter. Jamais de mutation de la config ni du disque : une
+    COPIE filtrée prend la place des globales runtime (oc + settings), le
+    reload «mtime» est neutralisé (aucune re-lecture de config.yaml à chaud)
+    et le cache de routes est vidé pour que la résolution reprenne à frais.
+    """
+
+    def _keep(route):
+        return PAID_CHAT not in (route.get("match") or [])
+
+    filtered = {name: r for name, r in oc.CUSTOM_ROUTES.items() if _keep(r)}
+    monkeypatch.setattr(oc, "CUSTOM_ROUTES", filtered)
+    monkeypatch.setattr(_cfg_settings, "CUSTOM_ROUTES", filtered)
+    monkeypatch.setattr(
+        _cfg_settings,
+        "SORTED_CUSTOM_ROUTES",
+        [r for r in _cfg_settings.SORTED_CUSTOM_ROUTES if _keep(r)],
+    )
+    monkeypatch.setattr(oc, "maybe_reload_custom_routes", lambda *a, **k: None)
+    monkeypatch.setattr(oc, "_seen_route_version", -1)
+    oc._route_cache.clear()
+
+
 @pytest.fixture
 def free_env(monkeypatch):
     monkeypatch.setattr(oc, "_vpn_manager", _StubVpn())
@@ -172,6 +202,10 @@ def free_env(monkeypatch):
         }
     )
     oc._free_model_cooldowns.clear()
+    # Le mapping déployé ne doit pas parasiter le témoin (couple posé en
+    # mémoire) : custom_routes de la config réelle séquestrées (souveraineté
+    # utilisateur intacte).
+    _bypass_declared_custom_routes_for_paid(monkeypatch)
     # Le -free homonyme est mort côté amont (remappé sain en config) : le
     # témoin force le couple divergent dans la map, le temps des tests.
     _map_had = PAID_CHAT in oc.FREE_MODEL_MAP

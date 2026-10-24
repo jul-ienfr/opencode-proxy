@@ -9,6 +9,10 @@ import vpn_manager as vm
 
 # ── helpers ──────────────────────────────────────────────────────────
 
+async def _no_sleep(_seconds):
+    return None
+
+
 class _Clock:
     def __init__(self, t=0.0):
         self.t = t
@@ -64,6 +68,7 @@ async def test_ttl_asym_fail_retested_before_pass(tmp_path):
     clock = _Clock()
     clock.set_step(1.0)
     m._now_fn = clock
+    m._sleep_fn = _no_sleep
     m._canary_probe_result = False
     # FAIL -> cache 90s
     assert await m._wg_canary_alive("r1") is False
@@ -85,6 +90,7 @@ async def test_ttl_asym_fail_retested_before_pass(tmp_path):
     clock2 = _Clock()
     clock2.set_step(1.0)
     m2._now_fn = clock2
+    m2._sleep_fn = _no_sleep
     m2._canary_probe_result = True
     assert await m2._wg_canary_alive("r1") is True
     ups2 = len([c for c in m2.compose_calls if "up" in c])
@@ -104,6 +110,7 @@ async def test_canary_cache_invalidated_after_ov_to_wg_flip(tmp_path):
     m = _canary_mgr(tmp_path, wg_canary_fail_ttl_s=90, wg_canary_pass_ttl_s=600)
     clock = _Clock()
     m._now_fn = clock
+    m._sleep_fn = _no_sleep
     # need compose file for _apply_stack .env write
     import os
     tmpdir = str(tmp_path)

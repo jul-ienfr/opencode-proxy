@@ -132,12 +132,32 @@ def test_session_id_is_case_insensitive_on_the_incoming_key():
     assert "x-opencode-session-id" not in h
 
 
-def test_free_leg_still_has_no_session_id():
-    """Jambe free : PAS de `x-opencode-session-id` (le natif 1.18.31 ne
-    l'envoie jamais — mesuré mitmproxy 2026-10-15)."""
+def test_free_leg_carries_the_official_session_identity():
+    """[ALIGNEMENT 2026-10-20] Jambe free : le wire est celui du client 1.19.3.
+
+    Inversion assumée du test précédent : le client officiel ÉMET
+    `x-opencode-session-id` (capture `_research/oc-1.19.3/capture.jsonl`), et
+    la passerelle accepte ce jeu sans le quartet 1.18.x (mesuré : 200). Le
+    mode `legacy` reste disponible pour rollback à chaud.
+    """
     h = oc._official_free_headers("")
+    assert h["x-opencode-session-id"].startswith("ses_")
+    assert h["x-session-affinity"] == h["x-opencode-session-id"]
+    assert h["x-session-id"] == h["x-opencode-session-id"]
+    assert "x-opencode-client" not in h
+    assert "x-opencode-project" not in h
+    assert "x-opencode-request" not in h
+
+
+def test_free_leg_legacy_style_keeps_the_quartet(monkeypatch):
+    """Le drapeau `legacy` restaure le wire 1.18.x (rollback sans redéploiement)."""
+    monkeypatch.setattr(oc, "_FREE_WIRE_STYLE", "legacy")
+    h = oc._official_free_headers("")
+    assert h["x-opencode-client"] == oc._OPENCODE_CLIENT_NAME
+    assert h["x-opencode-project"] == oc._OPENCODE_PROJECT
+    assert h["x-opencode-request"].startswith("msg_")
+    assert h["x-opencode-session"].startswith("ses_")
     assert "x-opencode-session-id" not in h
-    assert "x-opencode-session" in h
 
 
 def test_paid_session_stable_within_window():

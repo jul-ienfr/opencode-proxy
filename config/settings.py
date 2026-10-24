@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import pathlib
 import re
 import secrets
 import sys
@@ -92,6 +93,23 @@ def load_yaml_config() -> dict:
         except OSError:
             _config_yaml_mtime = 0.0
         logger.info("[config] loaded config.yaml (%d top-level keys)", len(_yaml_data))
+        # [audit-2026-10-24 Phase1 P0] override secret via env : VPN_CONTROL_API_KEY
+        # (ou CONTROL_API_KEY) prime sur config.yaml — permet de sortir la clé
+        # du YAML versionné vers .env / secret manager sans casser le boot.
+        # Le YAML reste fallback (compat), mais un warning rappelle de migrer.
+        try:
+            _env_ck = (os.getenv("VPN_CONTROL_API_KEY") or os.getenv("CONTROL_API_KEY") or "").strip()
+            if _env_ck and isinstance(_yaml_data.get("ip_rotation"), dict):
+                if str(_yaml_data["ip_rotation"].get("control_api_key") or "") != _env_ck:
+                    _yaml_data["ip_rotation"]["control_api_key"] = _env_ck
+                    logger.info("[config] control_api_key overriden from env (yaml not persisted)")
+            elif isinstance(_yaml_data.get("ip_rotation"), dict) and str(
+                _yaml_data["ip_rotation"].get("control_api_key") or ""
+            ).strip():
+                logger.warning(
+                    "[config] control_api_key en clair dans config.yaml — migrez vers VPN_CONTROL_API_KEY dans .env (chmod 600, gitignoré)")
+        except Exception:
+            pass
         # F-H6: generate control_api_key once if empty (boot single-flight, portalocker if available)
         try:
             _ir = _yaml_data.get("ip_rotation", {})
@@ -455,7 +473,7 @@ _SERVER_COMPACTION_DEFAULTS = {
     "tiny_retry": True,
     "summary_lean": True,
     "summary_lean_max_chars": 2000,
-    "summary_clamp_max_tokens": 4096,
+    "summary_clamp_max_tokens": 32000,  # SUMMARY_OUTPUT_MAX officiel
     "keep_tokens": None,
     "huge_warn_tokens": 0,
     "huge_deny_tokens": 0,
@@ -817,8 +835,184 @@ MODELS = {}
 # Paid: https://opencode.ai/zen/go/v1/responses, Free: https://opencode.ai/inference/v1/responses
 # (2026-10-15 : la jambe free /zen/v1/* répond 403 FreeTierError depuis la
 # migration inference — le natif 1.18.31 appelle inference/v1 directement)
-_RESPONSES_ENDPOINT = "https://opencode.ai/zen/go/v1/responses"
-_RESPONSES_FREE_ENDPOINT = "https://opencode.ai/inference/v1/responses"
+_RESPONSES_ENDPOINT = yaml_get(
+    "upstream", "responses_base", "https://opencode.ai/zen/go/v1/responses"
+)
+_RESPONSES_FREE_ENDPOINT = yaml_get(
+    "upstream", "responses_free_base", "https://opencode.ai/inference/v1/responses"
+)
+
+# ── [ALIGNEMENT 2026-10-20] Routes dérivées du catalogue public ─────────────
+#
+# Le catalogue de l'éditeur porte, pour CHAQUE modèle, sa famille d'API et son
+# URL amont (`config/catalog_routes.json`, généré par
+# `scripts/refresh_catalog_routes.py`). C'est la source de vérité du routage :
+# la table `models:` de `config.yaml` est une saisie humaine, et la mesure du
+# 2026-10-20 y a trouvé 5 protocoles faux et 3 modèles free hébergés en
+# `/anthropic/` routés vers `/chat/completions` (donc 404).
+#
+# **Périmètre volontairement étroit.** Le catalogue n'est appliqué QUE là où il
+# contredit la config sur la FAMILLE (`messages` ↔ `chat`). La base « chat »
+# qui fonctionne aujourd'hui (`/inference/v1/chat/completions`, vérifiée 200 à
+# travers la porte) n'est PAS remplacée par celle du catalogue
+# (`/inference/openai/v1`) : ce serait un changement du chemin chaud, à vérifier
+# en direct avant de l'adopter, et il n'apporte rien tant que l'actuelle passe.
+CATALOG_ROUTES_FILE = pathlib.Path(__file__).with_name("catalog_routes.json")
+
+#: Suffixe d'endpoint par famille d'API. Les bases du catalogue n'incluent pas
+#: le chemin de la méthode ; les `endpoint` de `MODELS` sont des URL complètes.
+_FAMILY_SUFFIX = {
+    "chat": "/chat/completions",
+    "responses": "/responses",
+    "messages": "/messages",
+}
+
+
+def _load_catalog_routes() -> dict:
+    """Charge le cache de routes ; ``{}`` s'il est absent ou illisible.
+
+    Un cache manquant ne doit jamais empêcher le proxy de démarrer : on
+    retombe alors sur la config, comme avant l'alignement.
+    """
+    try:
+        data = json.loads(CATALOG_ROUTES_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return data.get("providers") or {}
+
+
+CATALOG_ROUTES = _load_catalog_routes()
+
+
+def _catalog_unsupported_families() -> dict:
+    """Modèles dont le catalogue nomme une famille sans protocole convertible.
+
+    Aujourd'hui : `gemini` (10 modèles, 9 free + 1 payant). Le catalogue dit où
+    écrire (`base_url`) et avec quel dialecte (`family`), mais le proxy n'a
+    **aucun convertisseur** pour ce dialecte. Sans cette table, un id gemini
+    retombait silencieusement sur l'endpoint chat en protocole `openai` : le
+    client recevait une erreur d'amont incompréhensible, ou pire, un 200 vide.
+
+    Refuser en nommant le modèle est toujours meilleur qu'échouer ailleurs :
+    l'utilisateur sait alors que le proxy ne sait pas faire, et non que le
+    service est cassé.
+    """
+    out: dict = {}
+    try:
+        for rows in (CATALOG_ROUTES or {}).values():
+            for model_id, route in (rows or {}).items():
+                if isinstance(route, dict) and route.get("family") and route.get("protocol") is None:
+                    out.setdefault(str(model_id), str(route.get("family")))
+    except Exception:
+        return {}
+    return out
+
+
+#: ``{model_id: famille}`` — familles connues du catalogue mais non converties.
+CATALOG_UNSUPPORTED = _catalog_unsupported_families()
+
+
+def catalog_route_for(model_id: str, is_free: bool | None = None) -> dict | None:
+    """Route catalogue d'un modèle **sur sa jambe**, ou ``None``.
+
+    ``is_free`` choisit la jambe ; sans lui, le suffixe ``-free`` décide, puis
+    la jambe payante (l'historique route un id ambigu vers le payant).
+
+    **Aucun repli d'une jambe sur l'autre.** Le même id peut exister des deux
+    côtés avec une famille DIFFÉRENTE — mesuré : `minimax-m2.7` est
+    ``messages`` sur ``opencode-go`` et ``chat`` sur ``opencode``. Emprunter la
+    route de l'autre jambe enverrait le trafic payant sur la base *free* (ou
+    l'inverse) : une erreur silencieuse, exactement ce qu'on cherche à
+    supprimer.
+    """
+    if is_free is None:
+        is_free = str(model_id).lower().endswith("-free")
+    leg = CATALOG_ROUTES.get("opencode" if is_free else "opencode-go") or {}
+    route = leg.get(model_id)
+    return route if isinstance(route, dict) else None
+
+
+def _catalog_endpoint(model_id: str, is_free: bool) -> str | None:
+    """Endpoint déduit du catalogue, **seulement** s'il contredit la config.
+
+    Rend ``None`` quand le catalogue est d'accord avec la config (ou muet) :
+    l'appelant garde alors ses heuristiques historiques, inchangées.
+    """
+    route = catalog_route_for(model_id, is_free)
+    if not route:
+        return None
+    family = route.get("family")
+    base = str(route.get("base_url") or "").rstrip("/")
+    suffix = _FAMILY_SUFFIX.get(str(family))
+    if not base or not suffix:
+        # Famille connue mais sans route chez nous (`gemini`) : on ne compose
+        # RIEN. Refuser est la décision de l'appelant, pas un endpoint inventé.
+        return None
+    return base + suffix
+
+
+def _legacy_endpoint(model_id: str, model_data: dict, protocol: str) -> str:
+    """Endpoint historique (avant catalogue) — la référence à ne pas casser.
+
+    Extrait tel quel de l'ancien `_resolve_model_endpoint` : c'est lui qui
+    répond 200 aujourd'hui, y compris à travers la porte free.
+    """
+    is_free = str(model_id).lower().endswith("-free")
+    if get_model_api(model_id, model_data) == "responses":
+        return _RESPONSES_FREE_ENDPOINT if is_free else _RESPONSES_ENDPOINT
+    if is_free:
+        return API_BASE_FREE
+    return API_BASE_OPENAI if protocol == "openai" else API_BASE_ANTHROPIC
+
+
+def _endpoint_family(endpoint: str, protocol: str) -> str:
+    """Famille d'API d'un endpoint, déduite de sa forme."""
+    low = str(endpoint or "").lower()
+    if low.endswith("/responses"):
+        return "responses"
+    if low.endswith("/messages"):
+        return "messages"
+    return "chat"
+
+
+def _catalog_override(model_id: str, model_data: dict, protocol: str) -> dict | None:
+    """Surcharge catalogue : ``{"protocol", "endpoint"}``, ou ``None``.
+
+    Deux corrections distinctes, et c'est volontaire de les séparer :
+
+    * le **protocole** est corrigé dès que le catalogue et la config divergent —
+      c'est le bug le plus grave, une famille `messages` avec un protocole
+      OpenAI envoie un corps au mauvais format ;
+    * l'**endpoint** n'est remplacé que si sa famille est réellement
+      incompatible. Quand l'endpoint actuel parle déjà la bonne famille, on le
+      garde : c'est lui qui fonctionne, et la base du catalogue
+      (`/inference/openai/v1`) n'est pas celle du proxy (`/inference/v1`) —
+      changer d'URL sans nécessité, c'est prendre un risque gratuit.
+    """
+    is_free = str(model_id).lower().endswith("-free")
+    # Un `api:` explicite en config est une décision humaine (mesurée, datée) :
+    # le catalogue ne la renverse pas. Il ne comble que ce que la config ne dit
+    # pas. Sans cette borne, le catalogue écraserait aussi les `endpoint:`
+    # volontaires (ex. un id `-free` sciemment servi par la jambe Go).
+    if isinstance(model_data, dict) and str(model_data.get("api") or "").strip():
+        return None
+    route = catalog_route_for(model_id, is_free)
+    if not route:
+        return None
+    family = str(route.get("family") or "")
+    catalog_protocol = str(route.get("protocol") or "")
+    if not family or not catalog_protocol:
+        return None  # famille non convertible chez nous (gemini) : pas de route
+
+    legacy = _legacy_endpoint(model_id, model_data, protocol)
+    endpoint_family = _endpoint_family(legacy, protocol)
+    if family == endpoint_family and catalog_protocol == protocol:
+        return None  # déjà d'accord : ne rien toucher
+
+    endpoint = None
+    if family != endpoint_family:
+        endpoint = _catalog_endpoint(model_id, is_free)
+    return {"protocol": catalog_protocol, "endpoint": endpoint}
 
 
 def _resolve_model_endpoint(model_id: str, model_data: dict, protocol: str) -> str:
@@ -844,16 +1038,25 @@ def _resolve_model_endpoint(model_id: str, model_data: dict, protocol: str) -> s
         return value
     lid = model_id.lower()
     is_free = lid.endswith("-free")
-    if get_model_api(model_id, model_data) == "responses":
-        return _RESPONSES_FREE_ENDPOINT if is_free else _RESPONSES_ENDPOINT
-    if is_free:
-        return API_BASE_FREE
-    return API_BASE_OPENAI if protocol == "openai" else API_BASE_ANTHROPIC
+    # [ALIGNEMENT 2026-10-20] Le catalogue corrige le protocole, et l'endpoint
+    # seulement si sa famille est incompatible. Cf. `_catalog_override`.
+    override = _catalog_override(model_id, model_data, protocol)
+    if override:
+        if override.get("endpoint"):
+            return override["endpoint"]
+        return _legacy_endpoint(model_id, model_data, protocol)
+    return _legacy_endpoint(model_id, model_data, protocol)
 
 
 for _model_id, _model_data in _models_cfg.items():
     if isinstance(_model_data, dict):
         _proto = _model_data.get("protocol", "openai")
+        # [ALIGNEMENT 2026-10-20] Quand le catalogue contredit la config, le
+        # protocole ET l'endpoint changent ENSEMBLE. Corriger l'un sans l'autre
+        # enverrait un corps OpenAI sur `/messages` — pire que le bug d'origine.
+        _override = _catalog_override(_model_id, _model_data, _proto)
+        if _override:
+            _proto = _override["protocol"]
         _endpoint = _resolve_model_endpoint(_model_id, _model_data, _proto)
         MODELS[_model_id] = {
             "endpoint": _endpoint,
@@ -861,6 +1064,69 @@ for _model_id, _model_data in _models_cfg.items():
             "api": get_model_api(_model_id, _model_data),
             "capabilities": get_model_capabilities(_model_id, _model_data),
         }
+
+# ── [ALIGNEMENT 2026-10-20] Modèles free vérifiés en direct ─────────────────
+#
+# Le catalogue déclare 128 modèles sur la jambe `opencode` ; la config n'en
+# expose que 46. Les 82 autres ne sont PAS offerts pour autant : le catalogue
+# dit ce que l'éditeur propose, pas ce que la porte free accepte. Mesuré le
+# 2026-10-20 sur les 81 ids absents de la config : la majorité répond 400
+# « Model is unavailable » ou 401, y compris sur le chemin Anthropic.
+#
+# Seuls les ids réellement servis anonymement sont exposés, et seulement ceux
+# pour lesquels un appel réel a rendu 200. Le fichier est régénérable par
+# `_research/probe_free_models.py` ; il n'est jamais édité à la main.
+FREE_MODELS_EXPOSED_FILE = pathlib.Path(__file__).with_name("free_models_verified.json")
+
+
+def _load_exposed_free_models() -> dict:
+    """`{model_id: spec}` des modèles free vérifiés ; `{}` si le fichier manque."""
+    try:
+        data = json.loads(FREE_MODELS_EXPOSED_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    models = data.get("models")
+    return models if isinstance(models, dict) else {}
+
+
+#: Ids exposés **parce que vérifiés en direct** (200 mesuré). Ils doivent
+#: rejoindre `FREE_MODELS` plus bas : sans ça, le pipeline ne les reconnaît pas
+#: comme free et les traite en **payant** — mesuré le 2026-10-20, `big-pickle`
+#: partait alors sur la voie à clé et rendait « All API keys exhausted ».
+_EXPOSED_VERIFIED_IDS: set = set()
+
+for _model_id, _spec in _load_exposed_free_models().items():
+    if not isinstance(_spec, dict):
+        continue
+    _existing = MODELS.get(_model_id)
+    if isinstance(_existing, dict) and _existing.get("source"):
+        # La config explicite (et toute entrée déjà qualifiée par une `source`)
+        # reste souveraine.
+        #
+        # [FIX instabilité 2026-10-20] La condition était « l'id existe →
+        # ignorer ». Or la découverte écrit `{"endpoint", "protocol"}` SANS
+        # `source` : un modèle ajouté par elle (c'est le cas mesuré de
+        # `big-pickle`, vu dans le catalogue live) bloquait donc son propre
+        # enregistrement vérifié et gardait l'endpoint de la découverte — qui
+        # peut désigner la mauvaise jambe. Le test d'exposition passait quand le
+        # fichier gagnait la course, échouait quand la découverte arrivait
+        # d'abord. Une entrée sans `source` n'a aucune autorité : elle est
+        # remplacée.
+        continue
+    _family = str(_spec.get("family") or "chat")
+    _proto = str(_spec.get("protocol") or "openai")
+    if _family != "chat" or _proto != "openai":
+        # Seule la famille chat est exposée : pour `messages`, la base et les
+        # en-têtes attendus n'ont pas été validés en direct sur la jambe free.
+        continue
+    MODELS[_model_id] = {
+        "endpoint": API_BASE_FREE,
+        "protocol": "openai",
+        "api": "chat",
+        "capabilities": get_model_capabilities(_model_id, {"protocol": "openai"}),
+        "source": "free_verified",
+    }
+    _EXPOSED_VERIFIED_IDS.add(_model_id)
 
 
 # [Phase 1] Fetch + starter déplacés vers config/discovery.py (DI).
@@ -931,6 +1197,12 @@ if isinstance(_purged_raw, list):
 
 # Seed FREE_MODELS from existing free_model_map values (known frees at boot)
 FREE_MODELS: set = {v for v in FREE_MODEL_MAP.values() if isinstance(v, str) and v}
+# [FIX 2026-10-20] Les modèles exposés parce que **vérifiés en direct** sont
+# free par construction : `_is_free_model_route` ne les reconnaissait pas (ni
+# `-free`, ni dans FREE_MODEL_MAP) et les envoyait sur la voie **payante**.
+# Mesuré : `big-pickle` → « All API keys exhausted » alors que sa base est
+# l'inférence anonyme.
+FREE_MODELS |= _EXPOSED_VERIFIED_IDS
 FREE_MODEL_POOL: list = sorted(FREE_MODELS)
 # Observability state (exposed via GET /api/free-models)
 _FREE_DISCOVERY_STATE: dict[str, Any] = {
@@ -942,6 +1214,16 @@ _FREE_DISCOVERY_STATE: dict[str, Any] = {
     "detected": sorted(FREE_MODELS),
 }
 _FREE_DISCOVERY_URLS_CACHE = None
+
+# ── [PLAN_STRATEGIE_FREE_MODELS Lot A — sonde active de servabilité] ─────────
+# DI G4 (jamais l'inverse : config.settings ne importe PAS opencode) —
+# ``opencode.py`` pousse ICI sa gate runtime (face officielle + egress + DB)
+# à la fin de son import : ``_cfg_settings._FREE_PROBE_GATE = _free_probe_gate``.
+# Signature: gate(announced: set, known: set, api_base_free: str) ->
+#   (accepted: set | None, probe_state: dict | None)
+#   * accepted None / gate absent / gate lève  → comportement historique
+#     (announce-only add) — fail-soft, la sonde n'est jamais bloquante.
+_FREE_PROBE_GATE: Any = None
 
 
 # [Phase 1] URLs déplacées vers config/discovery.py (bases en paramètres).
@@ -1007,6 +1289,18 @@ def _apply_discovered_free_models(free_ids: set, source: str = "none") -> int:
     )
     if _new_pool is not None:
         FREE_MODEL_POOL = _new_pool
+    # [FIX 2026-10-20] La découverte fait `free_models.clear()` puis
+    # `update(free_ids)` : elle REBÂTIT le registre à chaque passe. Les modèles
+    # exposés parce que vérifiés en direct (`big-pickle`) n'y figurent pas — ils
+    # ne finissent pas par `-free` et ne sont pas des cibles découvertes — donc
+    # la passe suivante les effaçait, et le pipeline les renvoyait sur la voie
+    # payante. Mesuré en direct : « All API keys exhausted » sur un modèle dont
+    # la base est l'inférence anonyme. On ré-ajoute les vérifiés APRÈS chaque
+    # passe : leur preuve (un 200 réel) ne périme pas à la découverte suivante.
+    _missing_verified = _EXPOSED_VERIFIED_IDS - FREE_MODELS
+    FREE_MODELS.update(_missing_verified)  # in-place : pas de rebind local
+    if _missing_verified and isinstance(FREE_MODEL_POOL, list):
+        FREE_MODEL_POOL = sorted(FREE_MODELS)
     return added
 
 
@@ -1039,6 +1333,29 @@ def _ensure_free_models_sync() -> int:
             logger.warning("[free-discovery] no free ids detected source=%s", source)
             _FREE_DISCOVERY_STATE["source"] = source
             return 0
+        # [Lot A — sonde active] Si une gate runtime est DI-ifiée par
+        # opencode.py, les ids ANNONCÉS sont filtrés par verdict live avant
+        # l'apply (alive/limited promus, dead/not_free refusés, unknown
+        # reportés au cycle suivant). Absente / levée → comportement
+        # historique announce-only (fail-soft, jamais bloquant).
+        _gate = globals().get("_FREE_PROBE_GATE")
+        if _gate is not None:
+            try:
+                _accepted, _probe_state = _gate(set(free_ids), set(FREE_MODELS), API_BASE_FREE)
+            except Exception as e:
+                logger.warning(
+                    "[free-discovery] probe gate échouée (fallback announce-only): %s", e
+                )
+                _accepted, _probe_state = None, None
+            if isinstance(_probe_state, dict):
+                _FREE_DISCOVERY_STATE["probe"] = _probe_state
+            if isinstance(_accepted, set):
+                free_ids = _accepted
+                if not free_ids:
+                    logger.warning(
+                        "[free-discovery] sonde : 0 id vivant promu cette passe (source=%s)",
+                        source,
+                    )
         added = _apply_discovered_free_models(free_ids, source=source)
         if added or free_ids != set(_yaml_data.get("free_model_map", {}).values()):
             _persist_free_mappings()

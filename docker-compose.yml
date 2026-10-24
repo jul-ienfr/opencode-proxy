@@ -3,6 +3,16 @@
 # share one stanza instead of duplicating it. Stations 1-2 keep their
 # historical literal blocks.
 x-gluetun-multi-base: &gluetun-multi-base
+  # [audit-2026-10-24 Phase0] bornes ressources par gluetun : évite OOM-killer
+  # arbitraire sur hôte 10 stations + proxy. 512m/0.5 suffisant (gluetun ~80-150m).
+  mem_limit: 512m
+  cpus: 0.5
+  pids_limit: 128
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
   # [PC-12 audit 2026-09-08, révisé 2026-09-08] :latest VOULU (pas :latest par
   # négligence) : la dernière release v3.41.3 (30/07) ne contient PAS les
   # hotfixes master postérieurs — firewall netlink (connexions droppées au
@@ -87,6 +97,21 @@ services:
   opencode-proxy:
     build: .
     container_name: opencode-proxy
+    # [audit-2026-10-24 Phase0] bornes proxy + logs bornés + healthcheck compose.
+    mem_limit: 2g
+    cpus: 2.0
+    pids_limit: 256
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:4000/health')\""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
     ports:
       - "4000:4000"
     env_file:
@@ -156,6 +181,14 @@ services:
   vpn-gluetun:
     image: qmcgaw/gluetun:latest
     container_name: opencode-vpn
+    mem_limit: 512m
+    cpus: 0.5
+    pids_limit: 128
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     cap_add:
       - NET_ADMIN
     devices:
@@ -255,6 +288,14 @@ services:
     image: qmcgaw/gluetun:latest
     profiles: ["dual-station", "multi-station"]
     container_name: opencode-vpn-2
+    mem_limit: 512m
+    cpus: 0.5
+    pids_limit: 128
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     cap_add:
       - NET_ADMIN
     devices:
@@ -509,6 +550,14 @@ services:
     image: qmcgaw/gluetun:latest
     profiles: ["wg-test"]
     container_name: opencode-wg-test
+    mem_limit: 512m
+    cpus: 0.5
+    pids_limit: 128
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     cap_add:
       - NET_ADMIN
     devices:
@@ -544,11 +593,13 @@ services:
       - gluetun-wg-test:/gluetun
     restart: unless-stopped
     # [plan] local healthcheck — control server instead of external egress.
+    # [audit-2026-10-24 Phase0] aligné sur stations : egress réelle via tunnel,
+    # pas status local (faux-positif H3). Canari = même verdict que prod.
     healthcheck:
-      test: ["CMD-SHELL", "wget -q -O - -T 5 --header=\"X-API-Key: $$VPN_CONTROL_API_KEY\" http://127.0.0.1:8000/v1/vpn/status"]
+      test: ["CMD-SHELL", "wget -q -O /dev/null -T 12 http://api.ipify.org || exit 1"]
       interval: 30s
-      timeout: 5s
-      retries: 3
+      timeout: 15s
+      retries: 2
       start_period: 60s
 
   # ── [P2-14] socket-proxy opt-in (profil `socket-proxy`, OFF par défaut) ──
@@ -566,6 +617,14 @@ services:
     image: tecnativa/docker-socket-proxy:latest
     profiles: ["socket-proxy"]
     container_name: opencode-docker-proxy
+    mem_limit: 128m
+    cpus: 0.25
+    pids_limit: 64
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     ports:
       - "127.0.0.1:2375:2375"    # loopback only — jamais exposé au LAN
     volumes:
@@ -590,6 +649,32 @@ services:
       - SYSTEM=0
       - TASKS=0
       - VOLUMES=1
+    restart: unless-stopped
+
+  # ── [audit-2026-10-24 Phase5] alertes opt-in (profil `monitoring`) ──
+  # Scrape /metrics + /health?detail=full toutes les 60s, webhook si
+  # usable<floor 2min, slo breached, canary failing. OFF par défaut :
+  # `docker compose --profile monitoring up -d vpn-alerts`.
+  # Env : VPN_ALERT_BASE (défaut http://opencode-proxy:4000), VPN_ALERT_WEBHOOK.
+  vpn-alerts:
+    build: .
+    profiles: ["monitoring"]
+    container_name: opencode-vpn-alerts
+    mem_limit: 128m
+    cpus: 0.25
+    pids_limit: 64
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    command: ["python", "scripts/vpn_alerts.py"]
+    environment:
+      - VPN_ALERT_BASE=http://opencode-proxy:4000
+      - VPN_ALERT_WEBHOOK=${VPN_ALERT_WEBHOOK:-}
+    depends_on:
+      opencode-proxy:
+        condition: service_healthy
     restart: unless-stopped
 
 volumes:

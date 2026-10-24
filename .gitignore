@@ -56,6 +56,7 @@ env_dump.json
 
 # Debug dumps / transient scratch (debugging artifacts, not source)
 logs/_*
+logs/identities/
 logs/panel_dump.json
 logs/commit-*-msg.txt
 logs/env_vpn_type_backup_*
@@ -134,3 +135,16 @@ static/*.br
 .audit-logs-wt/
 # worktrees d'agents d'audit (jetables, mais lintes par ruff s'ils sont visibles)
 .trou*-wt/
+
+# ── Audit alignement 2026-10-20 : artefacts lourds, NE PAS COMMITTER ──────
+# Le binaire officiel OpenCode (180 Mo) + l'archive de release (59 Mo) +
+# l'état XDG du client de mesure sont des outils de reproduction, pas des
+# sources. Les sources officielles texte (_research/official-1.19.3/*.ts)
+# et les mesures JSON restent, elles, versionnables.
+_research/oc-1.19.3/bin/
+_research/oc-1.19.3/*.zip
+_research/oc-1.19.3/xdg/
+_research/oc-1.19.3/work/
+.npm-cache/
+.oc-client/
+

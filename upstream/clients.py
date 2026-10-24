@@ -259,13 +259,13 @@ def swap_pools_for_proxy(
     pool_size: int = DEFAULT_POOL_SIZE,
     debug_fn: Callable[..., None] | None = None,
 ) -> None:
-    """[P2.3 perf] Swap-and-close des pools curl d'un proxy après rotation
-    IP réussie — appelé par free_ip_pool depuis la branche ``alive:`` de
-    _rotate_station (via le wrapper hôte).
+    """[P2.3 perf + audit-2026-10-24] Swap-and-close des pools curl d'un proxy
+    après rotation IP réussie.
 
-    Économise 1 aller-retour échoué (+1-3 s) sur la première requête
-    post-rotation : les sessions de l'ancien tunnel ne sont plus jamais
-    réempruntées. Protocole SANS casser les requêtes en vol :
+    Clés couvertes : ``<proxy>|<preset>`` (geo), ``<proxy>|bun`` (sondes free
+    sans IP) ET ``<proxy>|<ip>|bun`` (face Bun par IP — audit : le préfixe
+    ``<proxy>|`` les couvre toutes, l'ancien wrapper n'était juste jamais
+    appelé). Protocole SANS casser les requêtes en vol :
       - pop de la clé + pool NEUF immédiat dans le dict ;
       - busy_count == 0 → close_all() fire-and-forget (task) ;
       - sinon pool.closing = True : les checkins ferment leurs sessions au
@@ -344,6 +344,7 @@ class RoleClientStore:
         *,
         bound_url: str | None = None,
         grace_s: float = DEFAULT_CLOSE_GRACE_S,
+        limits: httpx.Limits | None = None,
     ) -> httpx.AsyncClient:
         """Client partagé du rôle. ``bound_url`` = proxy attendu (None =
         direct, jamais de proxy). Retourne toujours un client ouvert."""
@@ -353,10 +354,14 @@ class RoleClientStore:
             if entry is not None and entry[1] == want and not entry[0].is_closed:
                 return entry[0]
             old = entry[0] if entry is not None else None
+            # [audit-2026-10-24 Phase0] limits unifiés (était défaut httpx
+            # 100/20, incohérent avec upstream.max_connections=64 /
+            # max_keepalive=32). Injectés par l'hôte, défaut sain sinon.
+            _lim = limits or httpx.Limits(max_connections=64, max_keepalive_connections=32)
             if want:
-                transport = httpx.AsyncHTTPTransport(proxy=want, retries=0)
+                transport = httpx.AsyncHTTPTransport(proxy=want, limits=_lim, retries=0)
             else:
-                transport = httpx.AsyncHTTPTransport(retries=0)
+                transport = httpx.AsyncHTTPTransport(limits=_lim, retries=0)
             client = httpx.AsyncClient(transport=transport, timeout=self._timeout or default_role_timeout())
             self.clients[role] = (client, want)
         if old is not None and not old.is_closed:

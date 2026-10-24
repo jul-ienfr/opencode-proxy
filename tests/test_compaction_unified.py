@@ -156,7 +156,7 @@ def test_summarizer_bodies_match_api():
     assert resp["store"] is False
     anth = build_summarizer_anthropic_body("hello", 2048, "m")
     assert "messages" in anth and "input" not in anth
-    assert build_summarizer_for_api("hello", 99999, "m", "chat")["max_tokens"] == 4096
+    assert build_summarizer_for_api("hello", 99999, "m", "chat")["max_tokens"] == 32000
 
 
 def test_should_use_tunnel_parity():

@@ -1,0 +1,152 @@
+# Table de classification d'erreurs de RÉFÉRENCE — [V0.5]
+#
+# Source unique : le client officiel OpenCode 1.19.3.
+#   * classes et ordre de décision : packages/llm/src/route/executor.ts:225-275
+#   * motifs d'overflow de contexte : packages/llm/src/provider-error.ts:4-38
+#   * statuts rejouables : packages/llm/src/route/executor.ts:91
+#
+# Ce fichier n'est pas une documentation : `tests/test_error_class_table.py` le
+# charge et exige que `core.errors.classify_status_class` ET
+# `core.errors.classify_upstream_error` reproduisent chaque ligne. Une ligne
+# ajoutée ici est un contrat ; une ligne qui casse est une régression.
+#
+# `class` = vocabulaire du client officiel (raison interne).
+# `wire_type` = type réellement émis sur le fil (vocabulaire Anthropic/OpenAI).
+# Les deux diffèrent volontairement : le client officiel distingue « quota » de
+# « rate limit » par le corps, mais émet `permission_error` dans les deux cas
+# côté facturation et `rate_limit_error` côté débit.
+#
+# `motif_priority: true` marque les cas où nos motifs par TEXTE (plus
+# spécifiques qu'un statut) doivent gagner sur la table par statut.
+
+reference:
+  client: official-1.19.3
+  executor: packages/llm/src/route/executor.ts:225-275
+  provider_error: packages/llm/src/provider-error.ts:4-38
+  retryable_statuses: [429, 503, 504, 529]
+
+cases:
+  # --- 401 / 403 : authentification (executor.ts:236-241) -------------------
+  - status: 401
+    body: ""
+    class: authentication
+    wire_type: authentication_error
+  - status: 401
+    body: '{"error":{"message":"Invalid API key provided"}}'
+    class: authentication
+    wire_type: authentication_error
+  - status: 403
+    body: ""
+    class: permission
+    wire_type: permission_error
+
+  # --- 429 : quota explicite OU rate limit (executor.ts:242-252) ------------
+  - status: 429
+    body: ""
+    class: rate_limit
+    wire_type: rate_limit_error
+  - status: 429
+    body: '{"error":{"message":"Too many requests"}}'
+    class: rate_limit
+    wire_type: rate_limit_error
+  - status: 429
+    body: '{"error":{"type":"insufficient_quota"}}'
+    class: quota
+    wire_type: permission_error
+    motif_priority: true
+  - status: 429
+    body: '{"error":{"code":"quota_exceeded"}}'
+    class: quota
+    wire_type: permission_error
+    motif_priority: true
+
+  # --- 400 / 404 / 409 / 413 / 422 : requête invalide (executor.ts:253-265) --
+  - status: 400
+    body: ""
+    class: invalid_request
+    wire_type: invalid_request_error
+  - status: 404
+    body: ""
+    class: invalid_request
+    wire_type: invalid_request_error
+  - status: 409
+    body: ""
+    class: invalid_request
+    wire_type: invalid_request_error
+  - status: 413
+    body: ""
+    class: invalid_request
+    wire_type: invalid_request_error
+  - status: 422
+    body: ""
+    class: invalid_request
+    wire_type: invalid_request_error
+
+  # --- overflow de contexte : sous-classe de invalid_request ----------------
+  - status: 400
+    body: "prompt is too long: 210000 tokens > 200000 maximum"
+    class: context_overflow
+    wire_type: invalid_request_error
+  - status: 400
+    body: "context_length_exceeded"
+    class: context_overflow
+    wire_type: invalid_request_error
+  - status: 413
+    body: "request entity too large"
+    class: context_overflow
+    wire_type: invalid_request_error
+  - status: 400
+    body: "rate limit exceeded, try again later"
+    class: invalid_request
+    wire_type: invalid_request_error
+    note: "exclusion officielle : « rate limit » n'est jamais un overflow"
+
+  # --- content policy : gagne sur TOUT statut (executor.ts:233-235) --------
+  - status: 400
+    body: "blocked by content policy"
+    class: content_policy
+    wire_type: invalid_request_error
+  - status: 500
+    body: "content_filter triggered"
+    class: content_policy
+    wire_type: invalid_request_error
+
+  # --- ≥ 500 ou statut rejouable (executor.ts:266-273, :91) ----------------
+  - status: 500
+    body: ""
+    class: provider_internal
+    wire_type: api_error
+  - status: 503
+    body: ""
+    class: provider_internal
+    wire_type: api_error
+  - status: 504
+    body: ""
+    class: provider_internal
+    wire_type: api_error
+  - status: 529
+    body: ""
+    class: provider_internal
+    wire_type: api_error
+  - status: 503
+    body: '{"error":"server_is_overloaded"}'
+    class: provider_internal
+    wire_type: overloaded_error
+    motif_priority: true
+
+  # --- inconnu (executor.ts:274) -------------------------------------------
+  - status: 418
+    body: ""
+    class: unknown
+    wire_type: api_error
+
+  # --- divergence ASSUMÉE : 402 (facturation) ------------------------------
+  # Le client officiel n'a pas de cas 402 ; nous le classons en quota
+  # (permission_error) depuis la parité v2, parce qu'un 402 est un défaut de
+  # facturation et doit pauser la clé, pas être rejoué.
+  - status: 402
+    body: ""
+    class: unknown
+    wire_type: permission_error
+    divergence: true
+    note: "règle proxy (parité v2) : 402 = facturation → permission_error + pause de clé"

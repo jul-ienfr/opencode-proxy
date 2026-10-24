@@ -94,16 +94,44 @@ def assert_no_paid_artifacts(label, headers, body=""):
     assert "claude-cli" not in ua and "python-httpx" not in ua, (
         f"{label}: client UA leaked to the free endpoint: {ua!r}"
     )
-    assert ua == oc._OPENCODE_OFFICIAL_UA, (
-        f"{label}: official UA expected, got {ua!r}"
+    # [per-IP vault] L'UA est versionnée par IP (pool mesuré 1.18.31/1.19.3,
+    # cf. free.identities) — accepter toute UA officielle du pool, pas le
+    # seul singleton global (les fakes utilisent des IPs/Hash qui tombent
+    # sur l'autre version).
+    try:
+        from free.identities import KNOWN_CLIENT_VERSIONS as _KCV
+        _ok_uas = {
+            f"opencode/{_v} ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14" for _v in _KCV
+        } | {
+            f"opencode/{_v} ai-sdk/provider-utils/4.0.40 runtime/bun/1.3.14" for _v in _KCV
+        }
+    except Exception:
+        _ok_uas = set()
+    _ok_uas.add(oc._OPENCODE_OFFICIAL_UA)
+    try:
+        _ok_uas.add(oc._OPENCODE_OFFICIAL_UA_RESPONSES)
+    except Exception:
+        pass
+    assert ua in _ok_uas, (
+        f"{label}: official per-IP UA expected (one of {sorted(_ok_uas)}), got {ua!r}"
     )
-    assert headers.get("x-opencode-client") == oc._OPENCODE_CLIENT_NAME, f"{label}: bad x-opencode-client"
-    assert headers.get("x-opencode-project") == oc._OPENCODE_PROJECT, f"{label}: bad x-opencode-project"
-    assert re.fullmatch(r"msg_[0-9a-f]{12}[0-9A-Za-z]{14}", headers.get("x-opencode-request", "") or ""), (
-        f"{label}: bad x-opencode-request ID: {headers.get('x-opencode-request')!r}"
+    # [ALIGNEMENT 2026-10-20] Wire officiel 1.19.3 — identité de session portée
+    # par x-opencode-session-id / x-session-affinity / x-session-id, quartet
+    # 1.18.x abandonné (mesuré non requis par la porte).
+    from config import free_gate
+
+    assert free_gate.identity_ok(headers), (
+        f"{label}: aucun en-tête d'identité de session free "
+        f"(attendu l'un de {free_gate.SESSION_IDENTITY_HEADERS})"
     )
-    assert re.fullmatch(r"ses_[0-9a-f]{12}[0-9A-Za-z]{14}", headers.get("x-opencode-session", "") or ""), (
-        f"{label}: bad x-opencode-session ID: {headers.get('x-opencode-session')!r}"
+    _sid = (
+        headers.get("x-opencode-session-id")
+        or headers.get("x-session-affinity")
+        or headers.get("x-session-id")
+        or headers.get("x-opencode-session")
+    )
+    assert re.fullmatch(r"ses_[0-9a-f]{12}[0-9A-Za-z]{14}", _sid or ""), (
+        f"{label}: bad free session ID: {_sid!r}"
     )
     if body:
         assert PAID_KEY_MARKER not in body, f"{label}: paid key leaked in request body"
@@ -240,9 +268,33 @@ def free_vpn_env(monkeypatch, tmp_path):
 
 
 @pytest.fixture
-def free_cfg():
+def free_cfg(monkeypatch):
     """Save/restore the hot-reload keys on the LIVE IP_ROTATION dict
-    (the same dict POST /api/vpn-config mutates in place)."""
+    (the same dict POST /api/vpn-config mutates in place).
+
+    [FIX instabilité 2026-10-20] Ce fixture croyait qu'écrire
+    ``IP_ROTATION["on_429_action"]`` suffisait. Le lecteur réel
+    (``config.settings.get_429_action``) interroge ``yaml_get("ip_rotation", …)``
+    — le YAML **live**. Tant que le dict `IP_ROTATION` et la section YAML ne
+    font qu'un, la mutation passe ; mais dès qu'un rechargement YAML remplace la
+    section (ce qui arrive en suite complète), la mutation est perdue, l'action
+    retombe sur `config.yaml` (`both`) et les deux tests A4 échouent — chacun
+    voyant *aussi* se produire l'action de l'autre mode. D'où l'intermittence :
+    2 échecs sur un run, 0 sur le suivant, mêmes tests.
+
+    On patche donc le LECTEUR pour qu'il lise l'état que le test pilote. La
+    production n'est pas touchée : c'est le contrat du test qui devient explicite
+    au lieu de dépendre d'un aliasing d'objet.
+    """
+    import config.settings as _st
+
+    monkeypatch.setattr(
+        _st,
+        "get_429_action",
+        lambda default="both": _st.normalize_429_action(
+            oc.IP_ROTATION.get("on_429_action") or default, default
+        ),
+    )
     saved = {
         k: oc.IP_ROTATION.get(k)
         for k in (
@@ -677,6 +729,88 @@ async def test_stream_429_cooldown_rotation_refuse(free_vpn_env, free_cfg, monke
     assert refuse is False, "strict_free + stations utilisables → False (retry/fallback)"
 
 
+# ── [fix quota-vs-breaker] 429 quota : retry marqué, refus strict ─────────
+class _FakeStream429Resp:
+    """Minimal response double for _free_429_stream_decision: 429 + body."""
+
+    status_code = 429
+    headers = {"retry-after": "30"}
+
+    async def aread(self):
+        return b'{"error": {"message": "Free usage limit exceeded"}}'
+
+
+@pytest.mark.asyncio
+async def test_stream_429_retry_marks_rate_limited_for_pool(free_vpn_env, free_cfg, monkeypatch):
+    """[fix quota-vs-breaker] Un 429 quota qui repart sur une station fraîche
+    marque la tentative ``rate_limited`` : _open_free_stream transmettra ce
+    drapeau au pool pour ne PAS alimenter le breaker timeout corrélé."""
+    oc.IP_ROTATION["strict_free"] = False
+    oc.IP_ROTATION["auto_max_free_attempts"] = False
+    oc.IP_ROTATION["max_free_attempts"] = 2
+    a = _Station(1, "1.1.1.1", "socks5://127.0.0.1:1080")
+    b = _Station(2, "2.2.2.2", "socks5://127.0.0.1:1081")
+    pool = _PoolStream429([a, b])
+    monkeypatch.setattr(oc, "_free_ip_pool", pool)
+    oc._current_free_attempt.set({"station": a, "proxy_url": a.socks5_url})
+
+    decision, refuse = await oc._free_429_stream_decision(
+        FREE_MODEL, _FakeStream429Resp(), 0, None, PAID_MODEL
+    )
+    assert decision == "retry_free", "budget restant → station fraîche"
+    assert refuse is False
+    attempt = oc._current_free_attempt.get() or {}
+    assert attempt.get("rate_limited") is True, (
+        "le prochain on_disconnect_retry doit savoir que la cause est un quota 429"
+    )
+    assert attempt.get("station") is a, "la station échouée reste exclue du retry"
+
+
+@pytest.mark.asyncio
+async def test_stream_429_budget_exhausted_strict_refuses_not_paid(free_vpn_env, free_cfg, monkeypatch):
+    """[fix strict_free 429] Budget free épuisé en mode tunnel + strict_free :
+    refus, même si une rotation est en vol (l'ancien gate
+    ``_free_stations_exhausted`` renvoyait False et lançait une jambe payante
+    avec une clé expirée)."""
+    oc.IP_ROTATION["strict_free"] = True
+    oc.IP_ROTATION["auto_max_free_attempts"] = False
+    oc.IP_ROTATION["max_free_attempts"] = 2
+    a = _Station(1, "1.1.1.1", "socks5://127.0.0.1:1080")
+    b = _Station(2, "2.2.2.2", "socks5://127.0.0.1:1081")
+    pool = _PoolStream429([a, b])
+    # Simule la rotation en vol : _free_stations_exhausted() → False.
+    pool.any_rotation_in_flight = lambda: True
+    monkeypatch.setattr(oc, "_free_ip_pool", pool)
+    oc._set_free_cooldown(FREE_MODEL, 9999, a)
+    oc._set_free_cooldown(FREE_MODEL, 9999, b)
+    oc._current_free_attempt.set({"station": a, "proxy_url": a.socks5_url})
+
+    decision, refuse = await oc._free_429_stream_decision(
+        FREE_MODEL, _FakeStream429Resp(), 1, None, PAID_MODEL
+    )
+    assert decision == "fallback_paid"
+    assert refuse is True, "strict_free + tunnel → aucune jambe payante"
+
+
+@pytest.mark.asyncio
+async def test_stream_429_budget_exhausted_not_strict_falls_back_paid(free_vpn_env, free_cfg, monkeypatch):
+    """Symétrique : strict_free OFF → comportement historique (paid)."""
+    oc.IP_ROTATION["strict_free"] = False
+    oc.IP_ROTATION["auto_max_free_attempts"] = False
+    oc.IP_ROTATION["max_free_attempts"] = 2
+    a = _Station(1, "1.1.1.1", "socks5://127.0.0.1:1080")
+    b = _Station(2, "2.2.2.2", "socks5://127.0.0.1:1081")
+    pool = _PoolStream429([a, b])
+    monkeypatch.setattr(oc, "_free_ip_pool", pool)
+    oc._current_free_attempt.set({"station": a, "proxy_url": a.socks5_url})
+
+    decision, refuse = await oc._free_429_stream_decision(
+        FREE_MODEL, _FakeStream429Resp(), 1, None, PAID_MODEL
+    )
+    assert decision == "fallback_paid"
+    assert refuse is False
+
+
 # ── [PLAN-corrections-429 §5 Lot A] on_429_action / strict_free / retry_after ──
 @pytest.mark.asyncio
 async def test_free_429_cooldown_only(free_vpn_env, free_cfg, monkeypatch):
@@ -879,6 +1013,7 @@ async def test_stream_direct_mode_legacy_direct_fallback(free_vpn_env, free_cfg,
     direct httpx fallback — NO _FreeTunnelFailure. Invariant A.0 holds on
     the direct request, and the failed station is preserved in the
     ContextVar (a later disconnect retry can still switch away from it)."""
+    monkeypatch.setitem(oc.IP_ROTATION, "enforce_vpn_only", False)
     a = _Station(1, "1.1.1.1", "socks5://127.0.0.1:1080")
     pool = _PoolStream429([a])
     pool.active_station = a

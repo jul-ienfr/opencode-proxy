@@ -48,66 +48,23 @@ _ENV_RW_LOCK = threading.Lock()
 
 # [plan 05/09 §1.1] Throttle AUTH inter-stations — NordVPN rate-limited
 # les rafales (6 AUTH en <2s depuis la même IP résidentielle → AUTH_FAILED
-# en cascade, 476 occurrences). Espace les tentatives de 30 s, limite à
-# 2 connexions simultanées, cooldown global 120 s après 3 AUTH_FAILED
-# consécutifs (le compte est temporairement bloqué côté NordVPN).
-_AUTH_THROTTLE_LOCK = threading.Lock()
-_AUTH_FAIL_TIMES: list[float] = []
-_AUTH_GLOBAL_COOLDOWN_UNTIL = 0.0
-_AUTH_LAST_CONNECT_AT = 0.0
-_AUTH_IN_FLIGHT = 0
-
-
-def _auth_record_failure() -> None:
-    global _AUTH_GLOBAL_COOLDOWN_UNTIL
-    now = time.monotonic()
-    armed = False
-    with _AUTH_THROTTLE_LOCK:
-        _AUTH_FAIL_TIMES.append(now)
-        _AUTH_FAIL_TIMES[:] = [t for t in _AUTH_FAIL_TIMES if now - t <= 300.0]
-        if len(_AUTH_FAIL_TIMES) >= 3:
-            _AUTH_GLOBAL_COOLDOWN_UNTIL = now + 120.0
-            _AUTH_FAIL_TIMES.clear()
-            armed = True
-    if armed:
-        logger.warning("[vpn] AUTH_FAILED x3 — cooldown global 120s (plan 05/09 §1.1)")
-
-
-def _auth_cooldown_remaining() -> float:
-    now = time.monotonic()
-    with _AUTH_THROTTLE_LOCK:
-        return max(0.0, _AUTH_GLOBAL_COOLDOWN_UNTIL - now)
-
-
-def _auth_connect_done() -> None:
-    global _AUTH_IN_FLIGHT
-    with _AUTH_THROTTLE_LOCK:
-        _AUTH_IN_FLIGHT = max(0, _AUTH_IN_FLIGHT - 1)
-
-
-async def _auth_gate() -> None:
-    global _AUTH_LAST_CONNECT_AT, _AUTH_IN_FLIGHT
-    if os.getenv("PYTEST_CURRENT_TEST"):
-        return
-    while True:
-        wait = _auth_cooldown_remaining()
-        if wait > 0:
-            await asyncio.sleep(min(wait, 5.0))
-            continue
-        sleep_for = 0.0
-        with _AUTH_THROTTLE_LOCK:
-            if _AUTH_IN_FLIGHT >= 2:
-                sleep_for = 2.0
-            else:
-                now = time.monotonic()
-                delta = now - _AUTH_LAST_CONNECT_AT
-                if delta < 30.0:
-                    sleep_for = 30.0 - delta
-                else:
-                    _AUTH_LAST_CONNECT_AT = now
-                    _AUTH_IN_FLIGHT += 1
-                    return
-        await asyncio.sleep(sleep_for)
+# en cascade, 476 occurrences). Voir vpn.auth (extraction Phase4) :
+# 2 connexions simultanées, 12s inter-stations / 30s même station,
+# cooldown global 120s après 3 AUTH_FAILED consécutifs.
+# [audit-2026-10-24 Phase4] noms historiques ré-exportés pour compat
+# (tests + appelants patchent vpn.manager._auth_gate).
+from vpn.auth import (
+    _AUTH_FAIL_TIMES,
+    _AUTH_LAST_BY_STATION,
+    _AUTH_THROTTLE_LOCK,
+    _auth_connect_done,
+    _auth_cooldown_remaining,
+    _auth_gate,
+    _auth_record_failure,
+)
+# Scalaires (_AUTH_IN_FLIGHT, _AUTH_LAST_CONNECT_AT, ...) : ne PAS les
+# ré-importer ici (un import figerait une copie — ils sont rebindés via
+# `global` dans vpn.auth). Y accéder via vpn.auth ou les fonctions.
 
 
 # ── Docker Desktop auto-launch (Windows) ───────────────────────────────
@@ -1154,7 +1111,19 @@ class VPNManager:
         if _per:
             _ovr = _per.get(str(station)) or _per.get(station)
         if isinstance(_ovr, dict) and _ovr:
-            cfg = {**cfg, **_ovr}
+            # [audit-2026-10-24 Phase4] merge DEEP (était shallow {**cfg,**_ovr}
+            # qui écrasait les imbriqués free_parallel/latency_rotation).
+            try:
+                import copy as _cpy
+                _merged = _cpy.deepcopy(cfg)
+                for _k, _v in _ovr.items():
+                    if isinstance(_v, dict) and isinstance(_merged.get(_k), dict):
+                        _merged[_k] = {**_merged[_k], **_v}
+                    else:
+                        _merged[_k] = _v
+                cfg = _merged
+            except Exception:
+                cfg = {**cfg, **_ovr}
             logging.getLogger("vpn_manager").info(
                 "[vpn] per_station overrides appliqués st%s: %s", station, sorted(_ovr)
             )
@@ -1215,6 +1184,12 @@ class VPNManager:
             [str(u).strip() for u in _urls if str(u).strip()] if isinstance(_urls, list) else []
         )
         self._ip_check_idx = 0
+        # [multi-source 2026-10-24] rotation de la PRIORITÉ des sources
+        # d'IP (control / socks / http) à chaque appel : une source en
+        # panne ne pénalise qu'un appel sur trois au lieu de bloquer
+        # systématiquement la confirmation d'IP (stations IP-less ->
+        # 503 empty-SSE -> rotations -> storm AUTH NordVPN).
+        self._ip_method_idx = 0
         # gluetun control server (docker exec; the key lives in the CONTAINER
         # env as VPN_CONTROL_API_KEY — never in process args, never logged).
         # Country rotation pins the country via PUT /v1/vpn/settings; both
@@ -1491,6 +1466,11 @@ class VPNManager:
         # time.monotonic globally (process-wide side effect); production uses
         # time.monotonic.
         self._now_fn = time.monotonic
+        # [V8.4] Le SOMMEIL est injectable pour la même raison que l'horloge :
+        # un test qui avance une fausse horloge payait quand même les vraies
+        # pauses (`asyncio.sleep`), d'où 90-96 s par test de canary — 12 min de
+        # suite pour des assertions instantanées. Production : asyncio.sleep.
+        self._sleep_fn = asyncio.sleep
         # [extern-detect — audit 2026-09-08] traçabilité des recreates :
         # StartedAt observé + horodatage de nos propres ops docker mutantes.
         self._last_seen_started_at: str | None = None
@@ -2077,7 +2057,7 @@ class VPNManager:
             # (tunnel pas encore établi derrière le SOCKS5 répondeur) ne doivent
             # pas charger le breaker.
             self._warmup_until = time.monotonic() + self._breaker_warmup_grace_s
-            await _auth_gate()
+            await _auth_gate(self._docker_container)
             try:
                 await self._compose_up()
                 started_at = await self._wait_healthy(timeout=120)
@@ -3207,8 +3187,105 @@ class VPNManager:
             logger.debug("[vpn] probe fail %s via %s: %s", url, self.socks5_url, e)
             return None
 
+    @staticmethod
+    def _valid_ip(text: object) -> str | None:
+        """Garde-fous : un body d'erreur HTML ne doit jamais être commité comme IP."""
+        try:
+            import ipaddress
+
+            t = str(text or "").strip()
+            if not t or len(t) > 64:
+                return None
+            ipaddress.ip_address(t)
+            return t
+        except Exception:
+            return None
+
+    async def _socks_public_ip(self) -> str | None:
+        """Source SOCKS5 : sticky-first + sweep parallèle borné (ex-corps de get_public_ip).
+
+        Sémantique préservée : succès sticky → index inchangé ; succès en
+        sweep → index avancé ; échec complet → index reset à 0. Rend None
+        quand la chaîne SOCKS est inutilisable (l'orchestrateur essaie
+        alors les autres sources).
+        """
+        urls = self._ip_check_urls or [self._ip_check_url]
+        base = self._ip_check_idx % len(urls)
+        # 1) Endpoint sticky seul — le cas nominal (tunnel sain, endpoint up)
+        # coûte exactement UN GET.
+        ip = await self._probe_url(urls[base])
+        if ip:
+            return self._valid_ip(ip)
+        # 2) Fallback : sweep des AUTRES endpoints en parallèle, budget borné.
+        others = [(base + i) % len(urls) for i in range(1, len(urls))]
+        if not others:
+            self._ip_check_idx = 0
+            return None
+        try:
+            results = await asyncio.wait_for(
+                asyncio.gather(*(self._probe_url(urls[j]) for j in others)),
+                max(2.0, self._ip_probe_budget),
+            )
+        except TimeoutError:
+            self._ip_check_idx = 0  # sweep annulé → reset, échec total SOCKS
+            return None
+        for k, j in enumerate(others):
+            if k >= len(results):
+                break  # cancelled sweep → the total-failure tail
+            if results[k]:
+                valid = self._valid_ip(results[k])
+                if valid:
+                    self._ip_check_idx = j
+                    return valid
+        self._ip_check_idx = 0  # full sweep failed — restart at the top next call
+        return None
+
+    async def _http_public_ip(self, budget: float | None = None) -> str | None:
+        """Source HTTP-proxy (:8888) : GET ip_check via le proxy HTTP gluetun.
+
+        Couvre le cas Docker Desktop Windows où le serveur SOCKS5 loopback
+        refuse les connexions alors que le tunnel porte du trafic (le HTTP
+        proxy est la voie d'egress documentée hôte/LAN). Sticky-first puis
+        balayage séquentiel borné ; rend None si le proxy HTTP est absent
+        ou si rien ne répond.
+        """
+        try:
+            proxy = getattr(self, "proxy_url", None)
+        except Exception:
+            proxy = None
+        if not proxy:
+            return None
+        urls = list(self._ip_check_urls or []) or [self._ip_check_url]
+        try:
+            base = int(getattr(self, "_ip_check_idx", 0) or 0) % len(urls)
+        except Exception:
+            base = 0
+        try:
+            budget = max(1.0, min(15.0, float(budget if budget is not None else self._ip_probe_budget)))
+        except Exception:
+            budget = 8.0
+        # import LOCAL (convention : httpx stubé en tests via sys.modules).
+        try:
+            import httpx
+        except Exception:
+            return None
+        ordered = [urls[(base + i) % len(urls)] for i in range(len(urls))]
+        per = max(1.0, budget / max(1, len(ordered)))
+        for url in ordered:
+            try:
+                async with httpx.AsyncClient(timeout=per, proxy=proxy) as client:
+                    r = await client.get(url, follow_redirects=True)
+                if 200 <= r.status_code < 400:
+                    valid = self._valid_ip(r.text)
+                    if valid:
+                        logger.debug("[vpn] probe ok %s via http-proxy", url)
+                        return valid
+            except Exception:
+                continue
+        return None
+
     async def get_public_ip(self) -> str | None:
-        """Query the public IP through the SOCKS5 tunnel (127.0.0.1:1080).
+        """IP publique via 3 sources en rotation (control / SOCKS5 / HTTP-proxy).
 
         Tries the ordered ``ip_check_urls`` chain (``ip_check_url`` stays
         the legacy alias — entry 1 when no chain is configured), every
@@ -3218,47 +3295,62 @@ class VPNManager:
         cas nominal) ; le sweep parallèle borné par ``ip_probe_budget`` ne
         sert qu'en fallback quand l'endpoint sticky échoue. Le sticky index
         reste la source d'ordre ; un échec complet réinitialise l'index.
-        Returns None only when every endpoint failed — never "unknown" as
+        [multi-source 2026-10-24] la PRIORITÉ des sources tourne à chaque
+        appel (``_ip_method_idx``) : control (pas d'egress, ~1 s, couvre le
+        SOCKS loopback KO), SOCKS (preuve d'egress complète), HTTP-proxy
+        (voie documentée Docker Desktop). Une source en panne ne bloque
+        plus systématiquement la confirmation d'IP — une IP invalide
+        (HTML d'erreur) est rejetée par ``_valid_ip`` et ne finit jamais
+        dans ``_current_ip``.
+        Returns None only when every source failed — never "unknown" as
         a success value.
         """
-        urls = self._ip_check_urls or [self._ip_check_url]
-        base = self._ip_check_idx % len(urls)
-        # 1) Endpoint sticky seul — le cas nominal (tunnel sain, endpoint up)
-        # coûte exactement UN GET.
-        ip = await self._probe_url(urls[base])
-        if ip:
-            return ip
-        # 2) Fallback : sweep des AUTRES endpoints en parallèle, budget borné.
-        others = [(base + i) % len(urls) for i in range(1, len(urls))]
-        if not others:
-            self._ip_check_idx = 0
-            logger.error(
-                "[vpn] public IP probe failed on %d endpoint(s) via SOCKS5", len(urls)
-            )
-            return None
         try:
-            results = await asyncio.wait_for(
-                asyncio.gather(*(self._probe_url(urls[j]) for j in others)),
-                max(2.0, self._ip_probe_budget),
-            )
-        except TimeoutError:
-            results = []  # sweep cancelled → total failure
-        for k, j in enumerate(others):
-            if k >= len(results):
-                break  # cancelled sweep → the total-failure tail
-            if results[k]:
-                self._ip_check_idx = j
-                return results[k]
-        self._ip_check_idx = 0  # full sweep failed — restart at the top next call
-        logger.error("[vpn] public IP probe failed on all %d endpoints via SOCKS5", len(urls))
-        # Fallback: gluetun self-reports its public IP via the control server
-        # (plain HTTP, no SOCKS5). The loopback SOCKS5 server can refuse
-        # connections even when the tunnel is healthy — trust gluetun's view
-        # instead of declaring the tunnel dead (false-error → recovery churn).
-        ctrl_ip = await self._control_public_ip()
-        if ctrl_ip:
-            logger.debug("[vpn] public IP from control fallback: %s", ctrl_ip)
-            return ctrl_ip
+            _m = int(getattr(self, "_ip_method_idx", 0) or 0) % 3
+        except Exception:
+            _m = 0
+        try:
+            self._ip_method_idx = (_m + 1) % 3
+        except Exception:
+            pass
+        # Ordres tournants : control d'abord 2 fois sur 3 (rapide, sans
+        # egress — il couvre le cas SOCKS loopback KO), SOCKS d'abord
+        # 1 fois sur 3 (preuve d'egress complète, contrat sticky testé).
+        if _m == 1:
+            order = ("socks", "control", "http")
+        elif _m == 2:
+            order = ("control", "http", "socks")
+        else:
+            order = ("control", "socks", "http")
+        try:
+            deadline = time.monotonic() + max(2.0, float(self._ip_probe_budget or 20.0))
+        except Exception:
+            deadline = time.monotonic() + 20.0
+        for method in order:
+            try:
+                remaining = deadline - time.monotonic()
+            except Exception:
+                remaining = 0.0
+            if remaining <= 0.5:
+                break
+            try:
+                if method == "control":
+                    ctrl_ip = await self._control_public_ip()
+                    valid = self._valid_ip(ctrl_ip) if ctrl_ip else None
+                    if valid:
+                        logger.debug("[vpn] public IP from control (order=%s)", order)
+                        return valid
+                elif method == "socks":
+                    socks_ip = await self._socks_public_ip()
+                    if socks_ip:
+                        return socks_ip
+                else:
+                    http_ip = await self._http_public_ip(budget=remaining)
+                    if http_ip:
+                        return http_ip
+            except Exception:
+                continue
+        logger.error("[vpn] public IP probe failed on all sources (control/socks/http)")
         return None
 
     async def _socks_egress_ok(self) -> bool:
@@ -3836,8 +3928,20 @@ class VPNManager:
         boot) : registre partagé anti-réutilisation + entrée d'historique
         avec l'identité LIVE (sans avance — refresh_status constate le
         tunnel, _commit_ip fait tourner) + persist. Le chrono connecté est
-        piloté par _set_status, jamais touché ici ([stabilité 25/08])."""
+        piloté par _set_status, jamais touché ici ([stabilité 25/08]).
+        [virgin-client 2026-10-24] IP adoptée = client vierge : si un fichier
+        d'identité traîne pour cette IP (bucket peut-être épuisé), on le
+        remplace par une installation neuve — même règle qu'en rotation,
+        best-effort, jamais de raise."""
         self._current_ip = ip
+        try:
+            from free.identities import get_vault as _get_identity_vault
+
+            _vv = _get_identity_vault()
+            if _vv is not None and hasattr(_vv, "rotate_installation"):
+                _vv.rotate_installation(ip)
+        except Exception:
+            pass
         self._record_ip_change(ip)
         self._ip_history.append(
             {
@@ -4444,6 +4548,9 @@ class VPNManager:
                 # [PR2 cascade] Per-server technology cascade state
                 "cascade_enabled": self._cascade_enabled,
                 "cascade_active": self._cascade_is_active(),
+                # [audit-2026-10-24] fenêtres aveugles watchdog (skips sous
+                # rotation/lock) — alerte si croît vite.
+                "skipped_ticks": int(getattr(self, "_watchdog_skipped_ticks", 0) or 0),
                 "cascade_step": self._cascade_step,
                 "cascade_elapsed_s": round(self._cascade_elapsed(), 1),
                 "cascade_remaining_s": round(
@@ -6180,7 +6287,7 @@ class VPNManager:
                 if await self._canary_probe_once():
                     ok = True
                     break
-                await asyncio.sleep(self._WG_CANARY_POLL_INTERVAL_S)
+                await self._sleep_fn(self._WG_CANARY_POLL_INTERVAL_S)
         except Exception as e:
             _bringup_failed = True
             logger.warning("[vpn-canary] bring-up échoué: %s", e)
@@ -6361,12 +6468,20 @@ class VPNManager:
         # call — profiled services run when explicitly targeted (same
         # mechanism a station brings itself up). 300 s: N recreations,
         # one command.
+        # [audit-2026-10-24 Phase1] blast-radius connu : 1 flip global raté =
+        # flotte down. Préférer flips per-station (stations=[...], auto
+        # hétérogène) ; le global manuel reste 1 commande (contrat tests
+        # test_vpn_stack_nstation) avec warning explicite + stagger applicatif
+        # en amont (boot_stagger_s). Voir _apply_stack séquentiel rejeté :
+        # N commandes = N AUTH séquentielles + N fenêtres d'échec partielles.
         # [fiab 09/09] recréation = nouvelle connexion = VRAI AUTH : un
         # seul slot global suffit (compose unique qui refait TOUS les
         # services d'un coup — pas un slot par station). Slot libéré dès
         # le compose lancé (le poll de santé ne fait que lire le statut).
+        if _is_global_flip:
+            logger.warning("[vpn] _apply_stack: flip GLOBAL %s services %s — préférer per-station en auto", mode, services)
         try:
-            await _auth_gate()
+            await _auth_gate(self._docker_container)
             cmd = ["compose", "-f", compose_path, "up", "-d", "--force-recreate"] + sorted(services)
             # Explicit env: the TARGET stack reaches the compose child even
             # when the parent env is stale (19/08 root cause — §2.1).
@@ -7892,13 +8007,23 @@ class VPNManager:
             # Rotation in flight — a restart would race its IP validation
             # (the skip MUST stay). Trace it once per rotation so a lost
             # pool wake (plan guard 2529) is visible in the logs: the
+            # [audit-2026-10-24] compteur skipped exposé en get_status pour
+            # détecter les fenêtres aveugles (6 watchdogs non coordonnés).
             # per-task pointer re-logs for a NEW rotation, and stays quiet
             # while the SAME rotation keeps the tick out.
             if self._skipped_rotation_task is not self._rotation_task:
                 self._skipped_rotation_task = self._rotation_task
                 logger.info("[vpn-watchdog] tick skipped — rotation in flight")
+            try:
+                self._watchdog_skipped_ticks = int(getattr(self, "_watchdog_skipped_ticks", 0)) + 1
+            except Exception:
+                pass
             return
         if self._lock.locked():
+            try:
+                self._watchdog_skipped_ticks = int(getattr(self, "_watchdog_skipped_ticks", 0)) + 1
+            except Exception:
+                pass
             return  # connect/rotate/apply_update in progress — skip this tick
         escalate = False
         async with self._lock:

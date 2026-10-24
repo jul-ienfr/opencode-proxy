@@ -551,7 +551,9 @@ class LatencyRotationEngine:
 
     def __init__(self) -> None:
         self.cfg = EngineConfig()
-        self._trackers: dict[tuple[int, str], IpLatencyTracker] = {}
+        # [audit-2026-10-24] OrderedDict = vraie LRU (move_to_end + popitem).
+        from collections import OrderedDict as _OD
+        self._trackers: dict[tuple[int, str], IpLatencyTracker] = _OD()  # type: ignore[assignment]
         # (sid, ip) -> (kind, until_monotonic)
         self._cooldowns: dict[tuple[int, str], tuple[str, float]] = {}
         # couples ayant DÉJÀ subi un soft — re-slow après expiration = hard
@@ -566,6 +568,15 @@ class LatencyRotationEngine:
         self.total_soft: int = 0
         self.total_hard: int = 0
         self._now: Any = time.monotonic  # point d'injection tests
+        self._last_engine_persist_at: float = 0.0
+        # [audit-2026-10-24] restaure cooldowns/compteurs au boot (évite
+        # burst rotations post-restart). Sauf sous pytest (isolation tests).
+        try:
+            import os as _os
+            if not _os.getenv("PYTEST_CURRENT_TEST"):
+                self._load_engine_state()
+        except Exception:
+            pass
 
     # ── config ────────────────────────────────────────────────────────
 
@@ -606,16 +617,15 @@ class LatencyRotationEngine:
         """Rotation réussie : warm-up v6 — reset consecutive_slow de tous les
         trackers de la station (la nouvelle IP démarre vierge, et les anciennes
         aussi pour éviter un faux signal au retour par fallback LRU).
-        Invalide aussi les entrées _soft_history de la station : sinon une IP
-        revenue après rotation re-slow est re-marquée d'office en hard
-        (escalade soft→hard systématique) et le pool tombe à 1/N routable."""
+        [audit-2026-10-24 Phase2] purge _soft_history restreinte à la
+        nouvelle IP uniquement (avant : tout le sid → une IP historiquement
+        lente revenant par LRU repartait en soft au lieu d'escalader en hard).
+        """
         for (s, _ip), tr in self._trackers.items():
             if s == int(sid):
                 tr.reset_consecutive_slow()
-        # purge anti hard-cascade : on ne peut escalader en hard que sur une
-        # IP observée re-lente APRÈS l'expiration de SON soft, pas sur une IP
-        # repassée par une rotation entre-temps.
-        self._soft_history = {k for k in self._soft_history if int(k[0]) != int(sid)}
+        # Ne purger que la nouvelle IP : historique des autres IPs conservé.
+        self._soft_history.discard((int(sid), str(new_ip)))
         self.tracker_for(int(sid), str(new_ip))
 
     def threshold_for(self, model: str) -> tuple[float, float]:
@@ -636,8 +646,30 @@ class LatencyRotationEngine:
                 consecutive_slow_limit=self.cfg.consecutive_slow,
             )
             self._trackers[key] = tr
+            # [audit-2026-10-24 Phase2] vraie LRU OrderedDict (était
+            # pop(next(iter())) arbitraire). Touche en fin, éviction oldest.
+            try:
+                self._trackers.move_to_end(key)  # type: ignore[attr-defined]
+            except Exception:
+                pass
             while len(self._trackers) > 300:  # borne mémoire globale
-                self._trackers.pop(next(iter(self._trackers)))
+                try:
+                    self._trackers.popitem(last=False)  # type: ignore[attr-defined]
+                except Exception:
+                    try:
+                        self._trackers.pop(next(iter(self._trackers)))
+                    except Exception:
+                        break
+        else:
+            # Touche LRU : remonte en fin (IPs chaudes conservées).
+            try:
+                self._trackers.move_to_end(key)  # type: ignore[attr-defined]
+            except Exception:
+                try:
+                    _tr = self._trackers.pop(key)
+                    self._trackers[key] = _tr
+                except Exception:
+                    pass
         return tr
 
     # ── cooldowns ─────────────────────────────────────────────────────
@@ -651,6 +683,96 @@ class LatencyRotationEngine:
         else:
             self.total_soft += 1
         _lat_logger.info("[latency] %s cooldown st%s ip=%s %.0fs", kind, sid, ip, dur)
+        try:
+            self._maybe_persist_engine_state()
+        except Exception:
+            pass
+
+    def _engine_state_file(self) -> str:
+        try:
+            base = self._cfg_file() if hasattr(self, "_cfg_file") else None
+        except Exception:
+            base = None
+        try:
+            import os as _os
+            return _os.path.join(ROOT, "logs", "latency_engine.json")
+        except Exception:
+            return "logs/latency_engine.json"
+
+    def _maybe_persist_engine_state(self, force: bool = False) -> None:
+        # Persist détaillée : cooldowns avec TTL restant + compteurs +
+        # soft_history. Débouncée 60s (mark = rare, pas hot path requête).
+        # Sauf sous pytest (isolation).
+        try:
+            import os as _os
+            if _os.getenv("PYTEST_CURRENT_TEST"):
+                return
+            now = self._now()
+            if not force and (now - float(getattr(self, "_last_engine_persist_at", 0.0))) < 60.0:
+                return
+            self._last_engine_persist_at = now
+            self._save_engine_state()
+        except Exception:
+            pass
+
+    def _save_engine_state(self) -> None:
+        try:
+            import json as _js
+            import os as _os
+            now = self._now()
+            cds = []
+            for (sid, ip), (kind, until) in list(self._cooldowns.items()):
+                rem = float(until - now)
+                if rem > 0:
+                    cds.append({"sid": int(sid), "ip": str(ip), "kind": str(kind), "remaining": rem})
+            payload = {
+                "cooldowns": cds,
+                "soft_history": [[int(s), str(i)] for (s, i) in list(self._soft_history)],
+                "total_soft": int(self.total_soft),
+                "total_hard": int(self.total_hard),
+                "saved_at": _now_utc(),
+            }
+            fp = self._engine_state_file()
+            _os.makedirs(_os.path.dirname(fp), exist_ok=True)
+            tmp = fp + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                _js.dump(payload, f)
+            _os.replace(tmp, fp)
+        except Exception as e:
+            _lat_logger.debug("[latency] save engine state KO: %s", e)
+
+    def _load_engine_state(self) -> None:
+        try:
+            import json as _js
+            import os as _os
+            fp = self._engine_state_file()
+            if not _os.path.exists(fp):
+                return
+            with open(fp, encoding="utf-8") as f:
+                data = _js.load(f) or {}
+            now = self._now()
+            for e in (data.get("cooldowns") or []):
+                try:
+                    sid = int(e.get("sid"))
+                    ip = str(e.get("ip"))
+                    kind = str(e.get("kind"))
+                    rem = float(e.get("remaining", 0))
+                    if rem > 0 and kind in (COOLDOWN_SOFT, COOLDOWN_HARD):
+                        self._cooldowns[(sid, ip)] = (kind, now + rem)
+                except Exception:
+                    continue
+            try:
+                self._soft_history = {(int(s), str(i)) for s, i in (data.get("soft_history") or [])}
+            except Exception:
+                pass
+            try:
+                self.total_soft = int(data.get("total_soft", 0))
+                self.total_hard = int(data.get("total_hard", 0))
+            except Exception:
+                pass
+            _lat_logger.info("[latency] engine state restauré (%d cooldowns)", len(self._cooldowns))
+        except Exception as e:
+            _lat_logger.debug("[latency] load engine state KO: %s", e)
 
     def cooldown_kind(self, sid: int, ip: str) -> str | None:
         entry = self._cooldowns.get((int(sid), str(ip)))

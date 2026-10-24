@@ -6,7 +6,8 @@ Réplique EXACTE de la requête qu'OpenCode enverrait lui-même pour résumer :
 - PAS de system (clé absente) ;
 - stream:false, même modèle/route que la requête d'origine (sauf override
   explicite) ;
-- max_tokens = min(summary_max_tokens, 4096) — cap client officiel ;
+- max_tokens = min(summary_max_tokens, 32000) — cap client officiel
+  (SUMMARY_OUTPUT_MAX) ;
 - PAS de bloc thinking/effort, PAS de web_search/web_fetch ;
 - timeout dédié, max_attempts:1 (jamais de récursion) ;
 - jamais mis en cache (ni lecture ni écriture).
@@ -20,75 +21,214 @@ from __future__ import annotations
 import asyncio
 import json as _json
 
-_SUMMARY_CAP = 4096  # cap client officiel : min(outputLimit, 4096)
+_SUMMARY_CAP = 32000  # plafond officiel SUMMARY_OUTPUT_MAX (model-request.ts) :
+# un résumé n'a jamais besoin de plus ; une demande au-delà ne peut pas être
+# réduite pour tenir dans une fenêtre que le catalogue surestime.
+_OUTPUT_TOKEN_FALLBACK = 32000  # catalogue sans limite de sortie (officiel)
+_OUTPUT_TOKEN_MAX = 256000  # aucune réponse n'a besoin de plus (officiel)
+_OUTPUT_TOKEN_MIN = 1024  # plancher officiel
 
 
-# Rubriques exigées du résumé (aligné officiel : template structuré imposé,
-# réponse invalide → 1 corrective, cf. has_required_outline/REWRITE_PROMPT).
-_REQUIRED_HEADINGS = (
-    "objective",
-    "decisions",
-    "completed work",
-    "active work",
-    "next steps",
-    "relevant files",
+# Gabarit officiel du résumé (compaction.ts:SUMMARY_TEMPLATE, verbatim) :
+# rubriques exigées, réponse invalide → 1 corrective (NUDGE), cf.
+# has_required_outline (sémantique officielle filled() : ligne exacte).
+_SUMMARY_TEMPLATE = (
+    "You MUST use this format for your response (you may omit sections that aren't "
+    "applicable). Do not include the <template> tags in your response.\n"
+    "<template>\n"
+    "## Objective\n"
+    "- [one or two brief sentences describing what the user is trying to accomplish]\n"
+    "\n"
+    "## Requirements\n"
+    "- [constraints, preferences, requirements, and scope boundaries stated by the user, "
+    'or "(none)"]\n'
+    "\n"
+    "## Decisions\n"
+    "- [decisions already made and why, or \"(none)\"]\n"
+    "\n"
+    "## Work State\n"
+    "Break the objective into smaller goals and report which are completed, which are "
+    "being worked on, and which are blocked.\n"
+    "### Completed\n"
+    "- [goals that have been completed; otherwise \"(none)\"]\n"
+    "\n"
+    "### Active\n"
+    "- [goals currently being worked on; otherwise \"(none)\"]\n"
+    "\n"
+    "### Blocked\n"
+    "- [anything blocking progress, and why; otherwise \"(none)\"]\n"
+    "\n"
+    "## Next Move\n"
+    "- [ordered list of next actions, or \"(none)\"]\n"
+    "\n"
+    "## Relevant Files\n"
+    "List the files and directories, other than the current working directory, that "
+    "another agent would need to open to continue this work. Include at most 15, most "
+    "important first. Do not list every file that was read or changed. Include paths "
+    "outside the current working directory when relevant. If none, write \"(none)\".\n"
+    "- `[file or directory path]`: [brief reason it matters]\n"
+    "\n"
+    "## Important Context\n"
+    "- [facts the next agent cannot continue without and cannot easily find on its own; "
+    'or "(none)"]\n'
+    "</template>"
 )
 
-_STRUCTURE_INSTRUCTIONS = (
-    "Write a structured summary to allow continuing the work in a fresh context "
-    "window where the raw history above will be replaced with this summary. "
-    "Use exactly these sections (omit none, keep each concise):\n"
-    "## Objective\n## Decisions\n## Completed work\n"
-    "## Active work and next steps\n## Relevant files and context"
+_SUMMARY_RULES = (
+    "Rules:\n"
+    "- Keep each section concise. Use terse, single-line bullets, not prose paragraphs "
+    "or nested lists.\n"
+    "- Prefer short references over detailed restatement. It is fine to leave out "
+    "information the next agent can recover from the code or the files listed above.\n"
+    "- Preserve exact file paths, symbols, commands, error strings, URLs, and identifiers.\n"
+    "- Carry forward only user questions or requests that remain unanswered or require "
+    "further action. Do not repeat ones that newer history has answered or resolved. "
+    "Preserve exact wording when carrying one forward.\n"
+    "- Preserve consequential workflow state, including whether changes are uncommitted, "
+    "committed, pushed, under review, or merged.\n"
+    "- Do not mention the summary process or that context was compacted."
 )
+
+# Relance unique officielle quand les rubriques manquent (compaction.ts:NUDGE).
+_NUDGE = (
+    "The previous response did not fill in the required summary template. Do not call "
+    "tools. Return the summary as text using the exact section headings from the template."
+)
+
+# Rubrique des résumés écrits avec l'ancien gabarit (compaction.ts:LEGACY_HEADING) :
+# un checkpoint hérité est réécrit une fois au niveau de détail actuel.
+_LEGACY_HEADING = "## Additional Context"
+
+
+def _template_headings() -> tuple:
+    """Rubriques du gabarit (officiel : toute ligne commençant par ``##``)."""
+    try:
+        return tuple(ln for ln in _SUMMARY_TEMPLATE.splitlines() if ln.startswith("##"))
+    except Exception:
+        return ()
+
+
+def build_prompt(update: bool, legacy: bool = False) -> str:
+    """Prompt résumeur officiel (compaction.ts:buildPrompt, verbatim).
+
+    ``update=False`` : premier résumé ; ``update=True`` : consolidation d'un
+    checkpoint existant (``legacy=True`` : réécriture au niveau actuel).
+    Ne lève jamais.
+    """
+    try:
+        shared = [
+            "Summarize only what the user and the assistant said and did. Leave out "
+            "instructions and setup the assistant was given rather than told by the user: "
+            "repository conventions, instruction files such as AGENTS.md, and environment "
+            "details like the session ID. The next agent receives current versions of all "
+            "of these separately.",
+            _SUMMARY_TEMPLATE,
+            _SUMMARY_RULES,
+            "Do not continue the task or call tools.",
+            "Return only the structured summary in the requested format. Do not include "
+            "a preamble, explanation, or other commentary.",
+        ]
+        if not update:
+            return "\n\n".join(
+                [
+                    "You MUST summarize the conversation above into a structured summary "
+                    "that will be given to another agent to resume the work.",
+                    *shared,
+                ]
+            )
+        parts = [
+            "Update the existing checkpoint in the conversation above into one "
+            "consolidated summary.",
+        ]
+        if legacy:
+            parts.append(
+                "The existing checkpoint was written with an earlier format that recorded "
+                "far more detail than this one asks for. Rewrite it at the level of detail "
+                "described below rather than carrying its detail forward. Keep its "
+                "requirements, decisions, and open questions; they came from earlier "
+                "conversation with the user."
+            )
+        parts.extend(
+            [
+                "Newer history always takes precedence over the existing checkpoint. "
+                "Preserve previous information unless newer history clearly contradicts, "
+                "supersedes, resolves, or makes it stale. If something is no longer relevant "
+                "to continuing the work, you may remove it.",
+                "Incorporate newer requirements, decisions, progress, and context. Reconcile "
+                "Work State and Next Move: move completed work out of Active, remove resolved "
+                "blockers and answered questions, and preserve unresolved or pending work.",
+                "Return only the updated Markdown sections. Do not reproduce the "
+                "`<conversation-checkpoint>`, `<summary>`, or `<recent-context>` wrapper tags "
+                "from the previous checkpoint.",
+                *shared,
+            ]
+        )
+        return "\n\n".join(parts)
+    except Exception:
+        return _NUDGE
 
 
 def has_required_outline(summary_text) -> bool:
-    """True si le résumé contient ≥1 rubrique exigée (`#` optionnel, casse libre).
+    """True si le résumé remplit le gabarit (sémantique officielle filled()).
 
-    Validation réplique officielle : un résumé sans aucune rubrique est
-    rejeté (1 corrective, puis échec franc). Ne lève jamais.
+    Une ligne au moins égale (après strip) à une rubrique du gabarit —
+    comparaison exacte, sensible à la casse, comme l'officiel. Ne lève jamais.
     """
     try:
         if not isinstance(summary_text, str) or not summary_text.strip():
             return False
-        low = summary_text.lower()
-        return any(h in low for h in _REQUIRED_HEADINGS)
+        heads = set(_template_headings())
+        if not heads:
+            return False
+        for ln in summary_text.splitlines():
+            try:
+                if ln.strip() and ln.strip() in heads:
+                    return True
+            except Exception:
+                continue
+        return False
     except Exception:
         return False
 
 
 def build_rewrite_prompt(bad_summary: str) -> str:
-    """Prompt correctif unique quand le résumé ne respecte pas les rubriques."""
+    """Prompt correctif unique (NUDGE officiel + tentative pour contexte).
+
+    Le NUDGE officiel n'embarque pas la tentative (elle est dans l'historique
+    de la requête officielle) ; notre transport mono-message n'a pas
+    d'historique, on la joint donc (tronquée) pour garder la corrective utile.
+    Ne lève jamais.
+    """
     try:
         attempt = bad_summary if isinstance(bad_summary, str) else ""
     except Exception:
         attempt = ""
     return (
-        "The previous response did not use the required sections. Rewrite it "
-        "using exactly these sections (omit none, keep each concise):\n"
-        "## Objective\n## Decisions\n## Completed work\n"
-        "## Active work and next steps\n## Relevant files and context\n\n"
-        "Previous attempt:\n<attempt>\n" + attempt[:8000] + "\n</attempt>"
+        _NUDGE + "\n\nPrevious attempt:\n<attempt>\n" + attempt[:8000] + "\n</attempt>"
     )
 
 
 def build_summary_user_text(history_text: str, previous_summary: str | None = None) -> str:
     """Corps du message user résumeur (template compaction : chaînage previousSummary)."""
-    prev = (previous_summary or "").strip()
-    hist = (history_text or "").strip()
+    prev = (previous_summary or "").strip() if isinstance(previous_summary, str) else ""
+    if not isinstance(history_text, str):
+        try:
+            hist = str(history_text or "")
+        except Exception:
+            hist = ""
+    else:
+        hist = history_text
+    hist = hist.strip()
     if prev:
         return (
-            "Previous summary:\n<previous-summary>\n" + prev + "\n</previous-summary>\n\n"
-            "Conversation to summarize:\n<conversation>\n" + hist + "\n</conversation>\n\n"
-            + _STRUCTURE_INSTRUCTIONS
-            + " Continue from the previous summary: preserve still-true details, "
-              "remove stale ones, merge in the new facts."
+            build_prompt(True, _LEGACY_HEADING in prev)
+            + "\n\nPrevious summary:\n<previous-summary>\n" + prev + "\n</previous-summary>\n\n"
+            "Conversation to summarize:\n<conversation>\n" + hist + "\n</conversation>"
         )
     return (
         "Summarize the following conversation concisely.\n\n"
         "<conversation>\n" + hist + "\n</conversation>\n\n"
-        + _STRUCTURE_INSTRUCTIONS
+        + build_prompt(False)
     )
 
 
@@ -127,7 +267,7 @@ def should_clamp_summary(body, cap=None) -> bool:
 
 
 def cap_summary_max_tokens(body, cap=None) -> tuple:
-    """Plafonne max_tokens/max_output_tokens au cap officiel (4096).
+    """Plafonne max_tokens/max_output_tokens au cap officiel (32000).
 
     Réplique officielle : l'officiel n'envoie jamais plus de
     ``min(outputLimit, 4096)`` pour un résumé — borne les générations
@@ -490,6 +630,7 @@ def _extract_text(data) -> str | None:
 
 
 __all__ = [
+    "build_prompt",
     "build_summary_user_text",
     "build_summarizer_body",
     "build_summarizer_anthropic_body",

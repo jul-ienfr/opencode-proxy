@@ -311,7 +311,61 @@ def test_launch_rotation_ignores_unknown_station():
     assert pool._rotation_queue.empty()
 
 
-# ── 5. _free_stream_refuse_bytes : parité véridique avec le non-stream ──
+# ── 5. _mark_free_stations_429 : quota ≠ signal amont, transitoire = signal ──
+
+
+def test_mark_quota_429_rotates_without_feeding_breaker(monkeypatch):
+    """[fix quota-vs-breaker] Un VRAI quota per-IP (FreeUsageLimitError /
+    rate limit) rotationne chaque station mais n'alimente jamais le log
+    corrélé : 3 stations épuisées ne doivent pas déclarer un événement amont
+    ni geler les rotations suivantes."""
+    import opencode as oc
+
+    pool, stations = _iso_pool(3)
+    launched = []
+    pool._launch_rotation = lambda station, forced_pool=None, **kw: launched.append(station)
+    monkeypatch.setattr(oc, "_free_ip_pool", pool)
+    monkeypatch.setattr(oc, "_record_global_429", lambda: None)
+    monkeypatch.setattr(oc, "_note_free_429", lambda model: None)
+    monkeypatch.setattr(oc, "_set_free_cooldown", lambda *a, **k: None)
+    monkeypatch.setattr(oc._cfg_settings, "get_429_action", lambda: "both")
+
+    for st in stations:
+        oc._mark_free_stations_429("m", "30", stations=[st], body=QUOTA_RATE_LIMIT)
+
+    assert launched == stations, "chaque quota per-IP doit rotationner sa station"
+    assert len(pool._upstream_429_log) == 0, "un quota per-IP n'est pas un signal amont"
+    assert pool._upstream_event_active() is False
+
+
+def test_mark_transient_429_feeds_breaker_without_rotation(monkeypatch):
+    """[fix quota-vs-breaker] Symétrique : un 429 transitoire (Endpoint is
+    unavailable) alimente le log corrélé — 3 couples distincts déclarent
+    l'événement — sans rotation ni bad-mark de station."""
+    import opencode as oc
+
+    pool, stations = _iso_pool(3)
+    pool._upstream_event_threshold = 3
+    launched = []
+    pool._launch_rotation = lambda station, forced_pool=None, **kw: launched.append(station)
+    monkeypatch.setattr(oc, "_free_ip_pool", pool)
+    monkeypatch.setattr(oc, "_record_global_429", lambda: None)
+    monkeypatch.setattr(oc, "_note_free_429", lambda model: None)
+    monkeypatch.setattr(oc, "_set_free_cooldown", lambda *a, **k: None)
+    monkeypatch.setattr(oc._cfg_settings, "get_429_action", lambda: "both")
+
+    for st in stations:
+        oc._mark_free_stations_429("m", "30", stations=[st], body=UNAVAILABLE)
+
+    assert launched == [], "un 429 transitoire ne rotationne pas"
+    assert len(pool._upstream_429_log) == 3
+    assert pool._upstream_event_active() is True
+    assert all(pool._per_station(st).get("bad_until") is None for st in stations), (
+        "une surcharge amont ne doit pas bad-mark les stations"
+    )
+
+
+# ── 6. _free_stream_refuse_bytes : parité véridique avec le non-stream ──
 #
 # Le chemin stream affirmait « Free quota exhausted on all VPN stations. »
 # pour TOUT 429, y compris « Endpoint is unavailable » (surcharge serveur

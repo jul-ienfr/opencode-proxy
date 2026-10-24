@@ -1347,7 +1347,15 @@ class TestWebSearchWebFetch:
 
         m._DDG_CACHE.clear()
         m._DDG_LOCKS.clear()
-        with patch("duckduckgo_search.DDGS", FakeDDGS):
+        # [V8.4] `_sync_ddg` essaie d'abord `_search_ddg_lite` — un VRAI appel
+        # réseau (~1,2 s). Ce test ne patchait que `DDGS`, donc chaque itération
+        # payait le réseau : 600 × 1,2 s = 721 s mesurés, pour vérifier un LRU.
+        # On force le repli mocké : le test redevient instantané et ne dépend
+        # plus de la connectivité.
+        with (
+            patch("server.websearch._search_ddg_lite", lambda *a, **kw: []),
+            patch("duckduckgo_search.DDGS", FakeDDGS),
+        ):
             for i in range(600):
                 await m._execute_ddg_search(f"query {i}", 5, timeout=10)
             assert len(m._DDG_CACHE) == 512

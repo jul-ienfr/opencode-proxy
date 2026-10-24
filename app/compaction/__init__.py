@@ -17,6 +17,7 @@ from app.compaction.streaming import (
     should_buffer_compaction,
 )
 from app.compaction.summarizer import (
+    build_prompt,
     build_rewrite_prompt,
     build_summarizer_anthropic_body,
     build_summarizer_body,
@@ -72,6 +73,7 @@ __all__ = [
     "build_condensed_history",
     "build_checkpoint_input",
     "build_condensed_input",
+    "build_prompt",
     "build_summary_user_text",
     "build_summarizer_body",
     "build_summarizer_anthropic_body",

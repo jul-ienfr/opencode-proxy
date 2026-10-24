@@ -357,8 +357,8 @@ def test_summarizer_body_is_official_replica():
     assert b == {"messages": [{"role": "user", "content": "x" * 10}], "max_tokens": 2048, "stream": False}
 
 
-def test_summarizer_body_caps_at_4096():
-    assert build_summarizer_body("x", 128000)["max_tokens"] == 4096  # cap officiel
+def test_summarizer_body_caps_at_official_max():
+    assert build_summarizer_body("x", 128000)["max_tokens"] == 32000  # SUMMARY_OUTPUT_MAX officiel
     assert build_summarizer_body("x", 512)["max_tokens"] == 512
     assert build_summarizer_body("x", -5)["max_tokens"] == 2048  # repli sûr
 
@@ -663,17 +663,24 @@ def test_lean_never_raises():
 
 
 def test_summary_template_has_required_outline():
-    from app.compaction import build_summary_user_text, has_required_outline
+    from app.compaction import build_prompt, build_summary_user_text, has_required_outline
 
     t = build_summary_user_text("HIST", "ANCIEN")
     assert has_required_outline(t) is True
     assert "## Objective" in t and "<previous-summary>" in t
+    # Branche update officielle : ne pas reproduire les wrappers.
+    assert "Do not reproduce the" in build_prompt(True) and "<summary>" in build_prompt(True)
     t2 = build_summary_user_text("HIST", None)
     assert has_required_outline(t2) is True
+    assert "## Requirements" in t2 and "## Work State" in t2
+    assert "Do not continue the task or call tools." in t2
     assert has_required_outline("bavardage sans structure") is False
     assert has_required_outline("") is False
     assert has_required_outline(None) is False
-    assert has_required_outline("## decisions\nok") is True  # casse indifférente
+    # Sémantique officielle filled() : ligne exacte, sensible à la casse.
+    assert has_required_outline("## decisions\nok") is False
+    assert has_required_outline("## Decisions\nok") is True
+    assert has_required_outline("texte ## Objective dans la phrase") is False
 
 
 def test_serialize_strips_media_to_descriptors():
@@ -759,7 +766,7 @@ def test_huge_context_check_matrix():
     assert huge_context_check(object(), object(), warn_tokens=1, deny_tokens=2) == (None, "")
 
 
-# ── cap officiel 4096 : should_clamp_summary / cap_summary_max_tokens ──
+# ── cap officiel 32000 (SUMMARY_OUTPUT_MAX) : should_clamp / cap ──
 
 
 def test_should_clamp_prefilter():

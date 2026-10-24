@@ -127,8 +127,12 @@ class Socks5Endpoint:
         self.pid = f"{self.host}:{self.port}"
         self._quota_per_ip = 0  # filled by set_socks5_proxies / update_config
         self.status = "connected"
-        self.current_ip = None
-        self.current_server = None
+        # [audit-2026-10-24 Phase3] identité stable PAR PROXY (avant : None →
+        # vault singleton 'direct' partagé entre tous les proxies statiques +
+        # impersonation chrome131 partagée). Le host:port sert d'IP logique.
+        self.current_ip = f"socks5:{self.host}:{self.port}"
+        self.current_server = {"name": f"socks5:{self.host}:{self.port}", "static": True}
+        self.current_identity = {"impersonate": "chrome131", "per_proxy": True}
 
     @property
     def has_password(self) -> bool:
@@ -199,6 +203,10 @@ class FreeIPPool:
         self._total_free_requests = 0
         # Per-station state (request counters, IP stats, 429-bad TTL...)
         self._per: dict[int, dict] = {}
+        # [audit-2026-10-24] persistance quota/ip_stats (évite quota wall
+        # oublié → 429 immédiat post-restart). Chargée par l'hôte après
+        # set_stations, sauvée débouncée sur rotation/bad-mark.
+        self._last_pool_persist_at: float = 0.0
         # Single-flight background rotation PER STATION: concurrent 429s
         # (stream + non-stream, 4 stream handlers) share ONE rotation per
         # station (and ``VPNManager.connect_next`` is itself single-flight
@@ -561,6 +569,10 @@ class FreeIPPool:
             )
         else:
             per["degraded_override"] = False
+        try:
+            self.save_pool_state()
+        except Exception:
+            pass
 
     def _station_usable(
         self,
@@ -1340,16 +1352,25 @@ class FreeIPPool:
             # Track activity for opportune update timing
             station.note_free_request()
             # Track stats for the current station IP
+            # [audit-2026-10-24 Phase2] borne anti-fuite : 200 IPs/station max,
+            # éviction oldest-first (avant : croissance illimitée 24/7).
             ip = station.current_ip or "unknown"
-            if ip not in per["ip_stats"]:
-                per["ip_stats"][ip] = {
+            _ip_stats = per["ip_stats"]
+            if ip not in _ip_stats:
+                if len(_ip_stats) >= 200:
+                    try:
+                        _oldest = next(iter(_ip_stats))
+                        _ip_stats.pop(_oldest, None)
+                    except Exception:
+                        pass
+                _ip_stats[ip] = {
                     "requests": 0,
                     "start": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                     "server": station.current_server.get("name", "?")
                     if station.current_server
                     else "?",
                 }
-            per["ip_stats"][ip]["requests"] += 1
+            _ip_stats[ip]["requests"] += 1
 
             return station.socks5_url, station
 
@@ -1404,18 +1425,69 @@ class FreeIPPool:
         # station.current_ip against this to detect a MANAGER repair (re-pin
         # with no pool rotation involved) and absorb its late-signal tail.
         per["last_confirmed_ip"] = new_ip
+        # [virgin-client 2026-10-24] IP neuve = client vierge : nouvelle
+        # installation (version/UA/ses_/project) SANS toucher au tunnel.
+        # Une IP recyclée qui rechargeait son ancienne identité héritait
+        # d'un bucket peut-être épuisé — désormais chaque IP fraîche part
+        # avec un client neuf (zéro AUTH NordVPN, zéro requête amont).
+        # Best-effort, jamais de raise (la rotation a déjà réussi).
+        try:
+            from free.identities import get_vault as _get_identity_vault
+
+            _vv = _get_identity_vault()
+            if _vv is not None and hasattr(_vv, "rotate_installation"):
+                _new_face = _vv.rotate_installation(new_ip)
+                try:
+                    logger.info(
+                        "[free-ip] station %s virgin client for %s (%s/%s gen %s)",
+                        getattr(station, "_station", "?"),
+                        new_ip,
+                        (_new_face or {}).get("version"),
+                        (_new_face or {}).get("client"),
+                        (_new_face or {}).get("generation"),
+                    )
+                except Exception:
+                    pass
+        except Exception:
+            pass
         # [plan v10 §3.6.5 Lot 3] warm-up post-rotation : reset consecutive_slow
         # du superviseur + note rotation au moteur (anti-flap/global_degraded).
         try:
             eng = getattr(self, "latency_engine", None)
             if eng is not None:
                 eng._note_rotation(int(station._station))
+                try:
+                    eng.on_rotation_done(int(station._station), str(new_ip))
+                except Exception:
+                    pass
             import shared_state as _ss
 
             for sup in getattr(_ss, "station_supervisors", None) or []:
                 if sup.station == station._station:
                     sup.on_ip_finalized(new_ip)
                     break
+        except Exception:
+            pass
+        # [audit-2026-10-24 Phase0] swap-and-close curl pools post-rotation :
+        # l'ancien wrapper opencode._flush_curl_pools_for_proxy n'était jamais
+        # appelé → +1-3s systématique 1er POST post-rotation. Callback injecté
+        # par l'hôte (pas d'import cycle), fail-soft.
+        try:
+            _flush_cb = getattr(self, "_post_rotation_flush_cb", None)
+            if callable(_flush_cb):
+                try:
+                    _proxy_url = getattr(station, "http_proxy_url", None)
+                    if callable(_proxy_url):
+                        _proxy_url = _proxy_url()
+                    elif _proxy_url is None:
+                        _proxy_url = getattr(station, "_proxy_url", None)
+                    _flush_cb(_proxy_url)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            self.save_pool_state(force=True)
         except Exception:
             pass
         return new_ip
@@ -1578,7 +1650,15 @@ class FreeIPPool:
         overloaded_error), pas un quota per-IP. On saute la rotation (et le
         bad-mark) : l'IP neuve serait rejetée pareil, la rotation ne ferait
         que brûler des IP + des handshakes AUTH NordVPN (tempête de rotation).
-        Le compteur corrélé ``_note_upstream_429`` reste alimenté plus haut.
+
+        [fix quota-vs-breaker] Un VRAI quota per-IP (``quota=True``) n'alimente
+        PAS le breaker corrélé : c'est une limite quotidienne propre à l'IP,
+        pas une preuve de panne amont. L'alimenter faisait déclarer un
+        « événement amont » après 3 stations épuisées et gelait TOUTES les
+        rotations 180 s — donc un « quota exceeded » permanent alors que le
+        pool avait des IP fraîches à essayer. Seul un 429 TRANSITOIRE
+        (``quota=False``) alimente ``_note_upstream_429`` : lui seul signale
+        un amont qui rejette indépendamment de l'IP.
 
         No-op when VPN is disabled or in direct mode.
         """
@@ -1608,11 +1688,16 @@ class FreeIPPool:
         # [phase 1] alimente le breaker corrélé (TOUS modes, pas seulement
         # failover) AVANT d'agir — un événement déclaré par CET appel gèle
         # la rotation ci-dessous (l'IP neuve 429erait aussi).
-        try:
-            self._note_upstream_429(station)
-        except Exception:
-            pass
-        if action in ("cooldown", "both"):
+        # [fix quota-vs-breaker] UNIQUEMENT un 429 transitoire : un vrai
+        # quota per-IP est une limite quotidienne de l'IP, pas un signal
+        # d'amont. L'y inclure déclarait un événement après 3 stations
+        # épuisées et gelait toutes les rotations 180 s (quota « permanent »).
+        if not quota:
+            try:
+                self._note_upstream_429(station)
+            except Exception:
+                pass
+        if action in ("cooldown", "both") and quota:
             if self.dual_station:
                 if self._any_other_usable(station):
                     self._apply_bad_mark(station, "rate_limit")
@@ -1687,7 +1772,7 @@ class FreeIPPool:
         self._failover_exhausted_cb = cb if callable(cb) or cb is None else None
 
     async def on_disconnect_retry(
-        self, failed: VPNManager | None = None, forced_pool=None
+        self, failed: VPNManager | None = None, forced_pool=None, rate_limited: bool = False
     ) -> tuple[str | None, VPNManager | Socks5Endpoint | None]:
         """Pick a DIFFERENT station for a retry after an upstream disconnect.
 
@@ -1697,6 +1782,15 @@ class FreeIPPool:
         without sending a response", 17/08 21:44). A retry is NOT a new
         request: no counter advance (the failed attempt already consumed its
         per-IP slot) — this is where it differs from `on_request`.
+
+        ``rate_limited=True`` ([fix quota-vs-breaker]) means the previous
+        free attempt ended in a 429 quota, not a dead tunnel. In that case
+        the failure is NOT fed into the correlated upstream breaker
+        (``_note_upstream_timeout``): a per-IP daily quota says nothing
+        about upstream health, and feeding it made the breaker declare an
+        event and freeze the very rotations this retry needs. The station
+        is still bad-marked (cause ``rate_limit``) and rotated, and the
+        retry still lands on another station.
 
         Mirrors `on_quota_exhausted`:
           * no-op when disabled or not in vpn mode → (None, None)
@@ -1720,7 +1814,7 @@ class FreeIPPool:
             # _launch_rotation, no dual_station check.
             target = failed if isinstance(failed, Socks5Endpoint) else self._socks5_current
             if target is not None and self._socks5_any_other(target):
-                self._apply_bad_mark(target, "timeout")
+                self._apply_bad_mark(target, "rate_limit" if rate_limited else "timeout")
             # `st` couvre les deux modes (endpoint SOCKS5 OU manager VPN).
             st: VPNManager | Socks5Endpoint | None = (
                 self._socks5_best_excluding(target) if target is not None else self._socks5_next()
@@ -1739,16 +1833,20 @@ class FreeIPPool:
         if failed is not None:
             if self.dual_station:
                 if self._any_other_usable(failed):
-                    self._apply_bad_mark(failed, "timeout")
+                    self._apply_bad_mark(failed, "rate_limit" if rate_limited else "timeout")
             # [fiab 09/09 phase 2] alimente le breaker corrélé AVANT d'agir
             # (même règle que on_quota_exhausted : un événement déclaré par
             # CET appel gèle la rotation ci-dessous — l'IP neuve mourrait
             # aussi si la cause est commune). Mode vpn uniquement (la
             # branche socks5 est sortie plus haut).
-            try:
-                self._note_upstream_timeout(failed)
-            except Exception:
-                pass
+            # [fix quota-vs-breaker] SAUF si le retry fait suite à un 429
+            # quota : ce n'est pas un timeout tunnel, et l'alimenter gelait
+            # les rotations nécessaires au renouvellement d'IP.
+            if not rate_limited:
+                try:
+                    self._note_upstream_timeout(failed)
+                except Exception:
+                    pass
             # [plan-perf Lot 2] URGENT (-1) : ce retry sert une requête qui
             # attend déjà (budget rotation_wait_timeout) — il passe devant
             # les rotations de fond 429 en attente (pas de préemption des
@@ -2516,6 +2614,106 @@ class FreeIPPool:
         in the same task's finally)."""
         return any(t is not None and not t.done() for t in self._rotation_tasks.values())
 
+    def _pool_state_file(self) -> str:
+        try:
+            import os as _os
+            root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+            return _os.path.join(root, "logs", "free_pool.json")
+        except Exception:
+            return "logs/free_pool.json"
+
+    def save_pool_state(self, force: bool = False) -> None:
+        """Persiste compteurs quota + ip_stats (débouncée 60s, fail-soft)."""
+        try:
+            import json as _js
+            import os as _os
+            import time as _tm
+            if not force and (_tm.monotonic() - float(getattr(self, "_last_pool_persist_at", 0.0))) < 60.0:
+                return
+            self._last_pool_persist_at = _tm.monotonic()
+            data: dict[str, dict] = {}
+            for sid, per in list(self._per.items()):
+                try:
+                    ip_stats = dict(list((per.get("ip_stats") or {}).items())[-200:])
+                    bu = per.get("bad_until")
+                    rem = float(bu - _tm.monotonic()) if bu else 0.0
+                    data[str(int(sid))] = {
+                        "request_count": int(per.get("request_count", 0) or 0),
+                        "ip_stats": ip_stats,
+                        "last_confirmed_ip": per.get("last_confirmed_ip"),
+                        "bad_remaining": max(0.0, rem),
+                        "bad_cause": per.get("bad_cause"),
+                    }
+                except Exception:
+                    continue
+            fp = self._pool_state_file()
+            _os.makedirs(_os.path.dirname(fp), exist_ok=True)
+            tmp = fp + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                _js.dump({"per": data}, f)
+            _os.replace(tmp, fp)
+        except Exception as e:
+            logger.debug("[free-ip] save pool state KO: %s", e)
+
+    def load_pool_state(self) -> None:
+        """Restaure compteurs au boot (fail-open, borné, jamais de 500)."""
+        try:
+            import json as _js
+            import os as _os
+            import time as _tm
+            if _os.getenv("PYTEST_CURRENT_TEST"):
+                return
+            fp = self._pool_state_file()
+            if not _os.path.exists(fp):
+                return
+            with open(fp, encoding="utf-8") as f:
+                raw = _js.load(f) or {}
+            for sid_s, st in (raw.get("per") or {}).items():
+                try:
+                    sid = int(sid_s)
+                    per = self._per_station_by_sid(sid)
+                    per["request_count"] = max(0, int(st.get("request_count", 0)))
+                    if isinstance(st.get("ip_stats"), dict):
+                        per["ip_stats"] = dict(list(st["ip_stats"].items())[-200:])
+                    if st.get("last_confirmed_ip"):
+                        per["last_confirmed_ip"] = str(st["last_confirmed_ip"])
+                    rem = float(st.get("bad_remaining", 0) or 0)
+                    if rem > 0:
+                        per["bad_until"] = _tm.monotonic() + min(rem, 3600.0)
+                        per["bad_cause"] = st.get("bad_cause")
+                except Exception:
+                    continue
+            logger.info("[free-ip] pool state restauré (%d stations)", len(raw.get("per") or {}))
+        except Exception as e:
+            logger.debug("[free-ip] load pool state KO: %s", e)
+
+    def _per_station_by_sid(self, sid: int) -> dict:
+        for st in self._stations:
+            if int(getattr(st, "_station", -999)) == int(sid):
+                return self._per_station(st)
+        per = self._per.get(int(sid))
+        if per is None:
+            per = self._per[int(sid)] = {
+                "request_count": 0, "session_start": None, "last_confirmed_ip": None,
+                "ip_stats": {}, "last_connect_attempt": None, "last_quota_per_ip": None,
+                "bad_until": None, "bad_cause": None, "degraded_override": False,
+                "rotation_started_at": None, "post_commit_retry_count": 0,
+                "consec_429": 0, "consec_429_ips": [],
+            }
+        return per
+
+    def _wire_snapshot_for(self, station) -> dict:
+        """Snapshot vault Bun pour l'IP courante (fail-soft, jamais de 500)."""
+        try:
+            ip = getattr(station, "current_ip", None) or getattr(station, "pid", None)
+            if not ip:
+                return {}
+            from free.identities import get_vault
+
+            return get_vault().snapshot(str(ip))
+        except Exception:
+            return {}
+
     def get_status(self) -> dict:
         """Return pool status for the dashboard (aggregated over stations).
 
@@ -2559,6 +2757,10 @@ class FreeIPPool:
                     "egress_state": _egr,
                     "last_rotation_error": getattr(st, "_last_rotation_error", None),
                     "vpn": st.get_status(),
+                    # [audit-2026-10-24] wire identity réelle (vault Bun par IP)
+                    # à côté de l'identité navigateur geo (vpn.current_identity).
+                    # Fini l'observabilité mensongère : dashboard lit les deux.
+                    "wire_identity": self._wire_snapshot_for(st),
                 }
             )
         active = self._active_station or self._vpn
@@ -2689,6 +2891,8 @@ class FreeIPPool:
             "ips_used": len({ip for p in self._per.values() for ip in p["ip_stats"]}),
             "ip_stats": {ip: st for p in self._per.values() for ip, st in p["ip_stats"].items()},
             "vpn": self._vpn.get_status(),
+            # [audit-2026-10-24] wire top-level (s1) pour compat dashboard legacy.
+            "wire_identity": (stations[0].get("wire_identity") if stations else {}),
             # [free_parallel] observability
             "free_parallel": {
                 "enabled": self._free_parallel_enabled,
