@@ -1,19 +1,26 @@
 #!/usr/bin/env python3
-"""Capture automatique au reset de quota opencode.
+"""Capture prioritaire du retour de quota opencode.
 
-Objectif : au premier instant ou le provider re-accepte le tier gratuit,
-enregistrer INTEGRALEMENT la requete acceptee (en-tetes dans l'ordre, corps,
-empreinte TLS, identite, IP d'egress) et la reponse, puis mesurer le quota
-observe (combien de 200 avant le premier 429, sur combien d'IPs).
+Objectif : detecter AVANT les autres consommateurs le premier instant ou le
+provider re-accepte, capturer la requete gagnante en integralite, puis
+mesurer le quota accorde (combien de 200 avant le premier 429).
 
 Modes :
-  --until-reset          attend le prochain 00:00 UTC puis capture
-  --now [secondes]       capture tout de suite (validation / diagnostic)
-  --dry-run              n'ecrit pas, affiche seulement
+  --watch [--max-seconds N]   veille continue (recommande), concurrence moderee
+  --until-reset               attend le prochain 00:00 UTC puis veille
+  --now SECONDE              capture limitee dans le temps (validation)
+  --dry-run                   n'ecrit pas sur disque
 
-Sorties (logs/quota_reset_capture/) :
-  evidence.jsonl   une ligne JSON par tentative (requete + reponse completes)
-  rapport.md       synthese lisible : identifiants, quota observe, diff 200/429
+Sorties : logs/quota_reset_capture/
+  accepted/accepted_<ts>.json   la requete gagnante, complete (fsync immediat)
+  attempts.log                  journal compact des refus (bufferise)
+  evidence.jsonl                historique complet (uniquement si --full)
+  rapport.md                    synthese lisible
+  watch.log                     journal des executions planifiees
+
+Budget de sondage : concurrency 3, intervalle adaptatif 0.5-3 s. Assez rapide
+pour gagner la course, assez sobre pour ne pas consommer soi-meme le quota
+qu'on veut mesurer.
 """
 from __future__ import annotations
 
@@ -21,7 +28,6 @@ import argparse
 import asyncio
 import datetime as dt
 import hashlib
-import io
 import json
 import os
 import sys
@@ -31,8 +37,11 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
 OUT_DIR = os.path.join(ROOT, "logs", "quota_reset_capture")
+ACCEPTED_DIR = os.path.join(OUT_DIR, "accepted")
+ATTEMPTS = os.path.join(OUT_DIR, "attempts.log")
 EVIDENCE = os.path.join(OUT_DIR, "evidence.jsonl")
 REPORT = os.path.join(OUT_DIR, "rapport.md")
+LOCK = os.path.join(OUT_DIR, ".watch.lock")
 
 MODELS = [
     "deepseek-v4.1-flash-free",
@@ -41,8 +50,9 @@ MODELS = [
     "big-pickle",
 ]
 
-# stations -> ports SOCKS du pool
 STATION_PORTS = {i: 1080 + (i - 1) for i in range(1, 7)}
+CONCURRENCY = 3
+SEM = asyncio.Semaphore(CONCURRENCY)
 
 
 def log(msg: str) -> None:
@@ -52,157 +62,187 @@ def log(msg: str) -> None:
 
 def next_utc_midnight(now: dt.datetime | None = None) -> dt.datetime:
     now = now or dt.datetime.now(dt.timezone.utc)
-    tomorrow = (now + dt.timedelta(days=1)).date()
-    return dt.datetime(
-        tomorrow.year, tomorrow.month, tomorrow.day, tzinfo=dt.timezone.utc
-    )
+    d = (now + dt.timedelta(days=1)).date()
+    return dt.datetime(d.year, d.month, d.day, tzinfo=dt.timezone.utc)
 
 
-def _write_line(payload: dict) -> None:
-    os.makedirs(OUT_DIR, exist_ok=True)
-    with open(EVIDENCE, "a", encoding="utf-8") as f:
-        f.write(json.dumps(payload, ensure_ascii=False, default=str) + "\n")
+def _ensure_dirs() -> None:
+    os.makedirs(ACCEPTED_DIR, exist_ok=True)
+
+
+def _append_attempt(line: str) -> None:
+    _ensure_dirs()
+    try:
+        with open(ATTEMPTS, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+
+
+def _save_accepted(record: dict) -> str:
+    """Ecrit la requete gagnante en fsync immediat. Rend le chemin."""
+    _ensure_dirs()
+    ts = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    path = os.path.join(ACCEPTED_DIR, f"accepted_{ts}.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(record, f, ensure_ascii=False, indent=2, default=str)
         f.flush()
         os.fsync(f.fileno())
+    return path
+
+
+def _acquire_lock() -> bool:
+    """Empeche deux veilles simultanees (tache planifiee qui se chevauche)."""
+    _ensure_dirs()
+    try:
+        if os.path.exists(LOCK):
+            pid = (open(LOCK, encoding="ascii", errors="replace").read() or "").strip()
+            if pid.isdigit():
+                import subprocess
+
+                r = subprocess.run(
+                    ["tasklist", "/FI", f"PID eq {pid}"], capture_output=True, text=True, timeout=15
+                )
+                if pid in (r.stdout or ""):
+                    log(f"veille deja active (pid {pid}) — sortie")
+                    return False
+        with open(LOCK, "w", encoding="ascii") as f:
+            f.write(str(os.getpid()))
+        return True
+    except Exception:
+        return True
+
+
+def _release_lock() -> None:
+    try:
+        os.remove(LOCK)
+    except Exception:
+        pass
 
 
 async def pick_targets(oc) -> list[tuple[int, str]]:
-    """(station, ip) reellement servables, via l'API du proxy."""
     import urllib.request
 
-    url = "http://127.0.0.1:4000/api/pool-status"
     try:
-        with urllib.request.urlopen(url, timeout=10) as r:
+        with urllib.request.urlopen("http://127.0.0.1:4000/api/pool-status", timeout=8) as r:
             data = json.loads(r.read().decode())
-    except Exception as e:
-        log(f"pool-status indisponible: {e}")
+    except Exception:
         return []
     out = []
     for s in data.get("stations", []):
-        ip = s.get("current_ip")
-        status = s.get("vpn_status")
+        ip, status = s.get("current_ip"), s.get("vpn_status")
         if ip and status in ("connected", "degraded"):
             out.append((int(s.get("station")), str(ip)))
     return out
 
 
-async def identity_for(oc, ip: str, fresh: bool):
-    """Force une installation coherente pour cette IP (option: nouvelle)."""
-    import free.identities as fi
-
+async def identity_for(oc, ip: str):
     vault = oc._ip_vault()
     if vault is None:
         return {}
-    if fresh:
-        vault.rotate_installation(ip)
     ident = vault.get(ip)
     return {
         "version": ident.version,
         "client": ident.client,
         "project": ident.project,
-        "ses": ident.session_for(None),
+        "ses": ident.session_for("capture-conv"),
         "msg": ident.new_msg(),
         "generation": getattr(ident, "generation", 0),
     }
 
 
-async def probe(oc, station: int, ip: str, model: str, fresh: bool, label: str) -> dict:
-    """UNE tentative complete, avec capture integrale."""
-    port = STATION_PORTS.get(station, 1080)
-    endpoint = oc._cfg_settings._free_endpoint_for(model) or oc.API_BASE_FREE
-    ident = await identity_for(oc, ip, fresh)
+async def probe(oc, station: int, ip: str, model: str) -> dict:
+    """Une tentative complete. Retourne le record (toujours, meme en erreur)."""
+    async with SEM:
+        port = STATION_PORTS.get(station, 1080)
+        endpoint = oc._cfg_settings._free_endpoint_for(model) or oc.API_BASE_FREE
+        ident = await identity_for(oc, ip)
+        headers = oc._official_free_headers(endpoint, "capture-conv", ip)
+        imp, fp = oc._get_free_fp_kwargs()
 
-    # identity headers reconstruits par la machinerie du proxy
-    headers = oc._official_free_headers(endpoint, "capture-conv", ip)
-    header_items = list(headers.items())
-    imp, fp = oc._get_free_fp_kwargs()
+        if "/systemone" in endpoint:
+            body = {"model": model, "state": "reply OK", "questions": {"ok": {"type": "score"}}}
+            raw = body
+        else:
+            raw = {
+                "model": model,
+                "messages": [{"role": "user", "content": "Dis OK"}],
+                "max_tokens": 16,
+            }
+            body, _ = oc._free_wire_body(raw, force_stream=True, egress_ip=ip)
 
-    if "/systemone" in endpoint:
-        body = {"model": model, "state": "reply OK", "questions": {"ok": {"type": "score"}}}
-        stream_wire = False
-    else:
-        raw_body = {
+        body_bytes = oc._serialize_json_body(body)
+        rec = {
+            "ts_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "station": station,
+            "egress_ip": ip,
             "model": model,
-            "messages": [{"role": "user", "content": "Dis OK"}],
-            "max_tokens": 16,
+            "endpoint": endpoint,
+            "identity": ident,
+            "request": {
+                "method": "POST",
+                "url": endpoint,
+                "headers_order": list(headers.items()),
+                "body_sha256": hashlib.sha256(body_bytes).hexdigest(),
+                "body_len": len(body_bytes),
+                "body": body_bytes.decode("utf-8", "replace"),
+                "tls": {"impersonate": imp, "fp_keys": sorted((fp or {}).keys())},
+            },
         }
-        body, stream_wire = oc._free_wire_body(raw_body, force_stream=True, egress_ip=ip)
 
-    body_bytes = oc._serialize_json_body(body)
-    record = {
-        "ts_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
-        "label": label,
-        "station": station,
-        "egress_ip": ip,
-        "model": model,
-        "endpoint": endpoint,
-        "identity": ident,
-        "request": {
-            "method": "POST",
-            "url": endpoint,
-            "headers_order": header_items,
-            "body_sha256": hashlib.sha256(body_bytes).hexdigest(),
-            "body_len": len(body_bytes),
-            "body": body_bytes.decode("utf-8", "replace"),
-            "tls": {"impersonate": imp, "fp_keys": sorted((fp or {}).keys())},
-        },
-    }
-
-    pool = slot = None
-    try:
-        pool, slot = await oc._get_pooled_curl_session(
-            f"socks5://127.0.0.1:{port}", imp, fp, egress_ip=ip
-        )
+        pool = slot = None
         t0 = time.monotonic()
-        resp = await slot.sess.post(
-            endpoint, content=body_bytes, headers=headers, timeout=(10, 60), stream=True
-        )
-        elapsed = round((time.monotonic() - t0) * 1000)
-        chunks = []
         try:
-            async for ln in resp.aiter_lines():
-                chunks.append(
-                    ln.decode("utf-8", "replace")
-                    if isinstance(ln, (bytes, bytearray))
-                    else str(ln)
-                )
-                if sum(len(c) for c in chunks) > 4000:
-                    break
+            pool, slot = await oc._get_pooled_curl_session(
+                f"socks5://127.0.0.1:{port}", imp, fp, egress_ip=ip
+            )
+            resp = await slot.sess.post(
+                endpoint, content=body_bytes, headers=headers, timeout=(8, 45), stream=True
+            )
+            elapsed = round((time.monotonic() - t0) * 1000)
+            chunks = []
+            try:
+                async for ln in resp.aiter_lines():
+                    chunks.append(
+                        ln.decode("utf-8", "replace")
+                        if isinstance(ln, (bytes, bytearray))
+                        else str(ln)
+                    )
+                    if sum(len(c) for c in chunks) > 4000:
+                        break
+            finally:
+                try:
+                    await resp.aclose()
+                except Exception:
+                    pass
+            rec["response"] = {
+                "status": resp.status_code,
+                "headers": list(dict(resp.headers).items()),
+                "elapsed_ms": elapsed,
+                "body": "\n".join(chunks)[:4000],
+            }
+        except Exception as e:
+            rec["response"] = {
+                "status": None,
+                "error": f"{type(e).__name__}: {e}",
+                "elapsed_ms": round((time.monotonic() - t0) * 1000),
+            }
         finally:
-            try:
-                await resp.aclose()
-            except Exception:
-                pass
-        record["response"] = {
-            "status": resp.status_code,
-            "headers": list(dict(resp.headers).items()),
-            "elapsed_ms": elapsed,
-            "body": "\n".join(chunks)[:4000],
-        }
-    except Exception as e:
-        record["response"] = {"status": None, "error": f"{type(e).__name__}: {e}"}
-    finally:
-        if pool is not None and slot is not None:
-            try:
-                await pool.checkin(slot)
-            except Exception:
-                pass
-
-    st = (record.get("response") or {}).get("status")
-    ra = None
-    for k, v in (record.get("response") or {}).get("headers") or []:
-        if str(k).lower() == "retry-after":
-            ra = v
-    log(f"{label} st={station} ip={ip} model={model} -> {st} ra={ra}")
-    return record
+            if pool is not None and slot is not None:
+                try:
+                    await pool.checkin(slot)
+                except Exception:
+                    pass
+        return rec
 
 
-async def measure_quota(oc, station: int, ip: str, model: str, max_probes: int = 200) -> dict:
-    """Apres une acceptation : compter les 200 avant le premier 429 sur CETTE IP."""
-    counts = {"200": 0, "429": 0, "other": 0, "first_429_at": None, "statuses": []}
+async def measure_quota(oc, station: int, ip: str, model: str, max_probes: int = 120) -> dict:
+    """Compte les 200 successifs sur CETTE IP avant le premier 429."""
+    counts = {"200": 0, "429": 0, "other": 0, "first_429_at": None, "statuses": [], "retry_after": None}
     for i in range(max_probes):
-        rec = await probe(oc, station, ip, model, fresh=False, label=f"quota-{i + 1}")
-        st = (rec.get("response") or {}).get("status")
+        rec = await probe(oc, station, ip, model)
+        resp = rec.get("response") or {}
+        st = resp.get("status")
         counts["statuses"].append(st)
         if st == 200:
             counts["200"] += 1
@@ -210,6 +250,9 @@ async def measure_quota(oc, station: int, ip: str, model: str, max_probes: int =
             counts["429"] += 1
             if counts["first_429_at"] is None:
                 counts["first_429_at"] = i + 1
+                for k, v in resp.get("headers") or []:
+                    if str(k).lower() == "retry-after":
+                        counts["retry_after"] = v
             break
         else:
             counts["other"] += 1
@@ -218,179 +261,166 @@ async def measure_quota(oc, station: int, ip: str, model: str, max_probes: int =
     return counts
 
 
-def write_report(records: list[dict], measurements: list[dict]) -> None:
-    os.makedirs(OUT_DIR, exist_ok=True)
-    lines = ["# Capture reset de quota — opencode", ""]
-    lines.append(f"Genere le {dt.datetime.now(dt.timezone.utc).isoformat()}")
+def write_report(accepted: list[dict], refusals: int, measurements: list[dict]) -> None:
+    _ensure_dirs()
+    lines = ["# Capture quota opencode", ""]
+    lines.append(f"Mis a jour : {dt.datetime.now(dt.timezone.utc).isoformat()}")
+    lines.append(f"- refus observes (session courante) : {refusals}")
+    lines.append(f"- acceptations capturees : {len(accepted)}")
     lines.append("")
-    accepted = [r for r in records if (r.get("response") or {}).get("status") == 200]
-    refused = [r for r in records if (r.get("response") or {}).get("status") == 429]
-    lines.append(f"- tentatives : {len(records)}")
-    lines.append(f"- acceptees (200) : {len(accepted)}")
-    lines.append(f"- refusees (429) : {len(refused)}")
-    lines.append("")
-
     if accepted:
-        a = accepted[0]
-        lines.append("## Premiere requete ACCEPTEE (reference complete)")
-        lines.append("")
-        lines.append(f"- moment : `{a['ts_utc']}`")
-        lines.append(f"- egress : `{a['egress_ip']}` (station {a['station']})")
-        lines.append(f"- modele : `{a['model']}`")
-        lines.append(f"- endpoint : `{a['endpoint']}`")
-        lines.append(f"- identite : `{json.dumps(a['identity'], ensure_ascii=False)}`")
-        lines.append("")
-        lines.append("### En-tetes envoyes (ordre exact)")
+        a = accepted[-1]
+        lines += [
+            "## Requete ACCEPTEE capturee",
+            "",
+            f"- moment : `{a['ts_utc']}`",
+            f"- egress : `{a['egress_ip']}` (station {a['station']})",
+            f"- modele : `{a['model']}`",
+            f"- endpoint : `{a['endpoint']}`",
+            f"- identite : `{json.dumps(a['identity'], ensure_ascii=False)}`",
+            "",
+            "### En-tetes (ordre exact)",
+        ]
         for k, v in a["request"]["headers_order"]:
-            shown = v if str(k).lower() != "authorization" else "Bearer public"
+            shown = "Bearer public" if str(k).lower() == "authorization" else v
             lines.append(f"1. `{k}: {shown}`")
-        lines.append("")
-        lines.append(f"- corps : {a['request']['body_len']} octets, sha256 `{a['request']['body_sha256']}`")
-        lines.append(f"- TLS : impersonate={a['request']['tls']['impersonate']!r} fp={a['request']['tls']['fp_keys']}")
-        lines.append("")
-        lines.append("### Reponse")
-        lines.append(f"- statut : `{a['response']['status']}` en {a['response']['elapsed_ms']} ms")
+        lines += [
+            "",
+            f"- corps : {a['request']['body_len']} o, sha256 `{a['request']['body_sha256']}`",
+            f"- TLS : impersonate={a['request']['tls']['impersonate']!r} fp={a['request']['tls']['fp_keys']}",
+            "",
+            "### Reponse",
+            f"- statut : `{a['response']['status']}` en {a['response']['elapsed_ms']} ms",
+        ]
         for k, v in a["response"].get("headers") or []:
             lines.append(f"  - `{k}: {v}`")
-        lines.append("```")
-        lines.append((a["response"].get("body") or "")[:1200])
-        lines.append("```")
-        lines.append("")
+        lines += ["```", (a["response"].get("body") or "")[:1500], "```", ""]
     else:
-        # Aucune acceptation : on documente quand meme la requete de reference
-        # et la reponse, pour analyser le refus.
-        r0 = records[0]
-        lines.append("## Aucune acceptation — requete de reference (refusee)")
-        lines.append("")
-        lines.append(f"- moment : `{r0['ts_utc']}`")
-        lines.append(f"- egress : `{r0['egress_ip']}` (station {r0['station']})")
-        lines.append(f"- modele : `{r0['model']}`")
-        lines.append(f"- endpoint : `{r0['endpoint']}`")
-        lines.append(f"- identite : `{json.dumps(r0['identity'], ensure_ascii=False)}`")
-        lines.append("")
-        lines.append("### En-tetes envoyes (ordre exact)")
-        for k, v in r0["request"]["headers_order"]:
-            shown = v if str(k).lower() != "authorization" else "Bearer public"
-            lines.append(f"1. `{k}: {shown}`")
-        lines.append("")
-        lines.append(f"- corps : {r0['request']['body_len']} octets, sha256 `{r0['request']['body_sha256']}`")
-        lines.append(f"- TLS : impersonate={r0['request']['tls']['impersonate']!r} fp={r0['request']['tls']['fp_keys']}")
-        lines.append("")
-        lines.append("### Reponse du provider")
-        lines.append(f"- statut : `{(r0.get('response') or {}).get('status')}`")
-        for k, v in (r0.get("response") or {}).get("headers") or []:
-            lines.append(f"  - `{k}: {v}`")
-        lines.append("```")
-        lines.append(((r0.get("response") or {}).get("body") or "")[:1200])
-        lines.append("```")
-        lines.append("")
-        if len(records) > 1:
-            lines.append("### Variabilite observee sur les tentatives")
-            statuses = {}
-            for rec in records:
-                s = (rec.get("response") or {}).get("status")
-                statuses[s] = statuses.get(s, 0) + 1
-            lines.append(f"- statuts : {statuses}")
-            ips = sorted({rec["egress_ip"] for rec in records})
-            lines.append(f"- IPs d'egress testees : {len(ips)} -> {ips[:8]}")
-            lines.append(
-                f"- corps differents entre tentatives : "
-                f"{'oui' if len({rec['request']['body_sha256'] for rec in records}) > 1 else 'non'}"
-            )
-            lines.append("")
-
-    if accepted and refused:
-        a0, r0 = accepted[0], refused[0]
-        lines.append("## Comparaison ACCEPTEE vs REFUSEE")
-        lines.append(f"- acceptee : `{a0['ts_utc']}` egress `{a0['egress_ip']}` modele `{a0['model']}`")
-        lines.append(f"- refusee  : `{r0['ts_utc']}` egress `{r0['egress_ip']}` modele `{r0['model']}`")
-        lines.append("")
-        acc = dict(a0["request"]["headers_order"])
-        ref = dict(r0["request"]["headers_order"])
-        for k in sorted(set(acc) | set(ref)):
-            if acc.get(k) != ref.get(k):
-                lines.append(f"- `{k}` : accepte=`{str(acc.get(k))[:70]}` refuse=`{str(ref.get(k))[:70]}`")
-        d_acc = a0["request"]["body_sha256"]
-        d_ref = r0["request"]["body_sha256"]
-        lines.append(f"- corps identique : {'oui' if d_acc == d_ref else 'non'}")
-        lines.append("")
+        lines += ["Aucune acceptation pour l'instant — le chat gratuit reste refuse.", ""]
 
     if measurements:
         lines.append("## Quota observe")
         for m in measurements:
+            c = m["counts"]
             lines.append(
-                f"- ip `{m['ip']}` modele `{m['model']}` : "
-                f"{m['counts']['200']} succes avant le premier 429 "
-                f"(position {m['counts']['first_429_at']}), statuts={m['counts']['statuses'][:15]}"
+                f"- ip `{m['ip']}` modele `{m['model']}` : {c['200']} succes avant 429 "
+                f"(position {c['first_429_at']}, retry-after={c['retry_after']})"
             )
         lines.append("")
 
     with open(REPORT, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
-    log(f"rapport ecrit: {REPORT}")
 
 
-async def run_capture(duration_s: float, dry_run: bool, until_reset: bool) -> None:
+async def watch(max_seconds: float, dry_run: bool, full: bool, until_reset: bool) -> None:
     import opencode as oc
 
-    os.makedirs(OUT_DIR, exist_ok=True)
+    _ensure_dirs()
     if until_reset:
         target = next_utc_midnight()
-        wait = (target - dt.datetime.now(dt.timezone.utc)).total_seconds()
-        # demarre 20 s avant le reset pour avoir un refus de reference
-        wait = max(0.0, wait - 20.0)
-        log(f"reset UTC prevu a {target.isoformat()} — attente {wait / 60:.1f} min")
+        wait = max(0.0, (target - dt.datetime.now(dt.timezone.utc)).total_seconds() - 20.0)
+        log(f"reset annonce {target.isoformat()} — attente {wait / 60:.1f} min")
         await asyncio.sleep(wait)
 
-    deadline = time.monotonic() + duration_s
-    records: list[dict] = []
+    deadline = time.monotonic() + max_seconds if max_seconds > 0 else float("inf")
+    accepted: list[dict] = []
     measurements: list[dict] = []
-    winner: tuple[int, str, str] | None = None
+    refusals = 0
+    last_summary = 0.0
+    found_this_pass = False
+    last_no_target_log = 0.0
 
     while time.monotonic() < deadline:
         targets = await pick_targets(oc)
         if not targets:
-            log("aucune station servable — attente 10 s")
-            await asyncio.sleep(10)
+            now_nt = time.monotonic()
+            if now_nt - last_no_target_log >= 60.0:
+                log("aucune station servable (pool en erreur/cooling) — veille passive")
+                last_no_target_log = now_nt
+            await asyncio.sleep(3)
             continue
-        for station, ip in targets:
-            if time.monotonic() >= deadline:
-                break
-            for model in MODELS:
-                if time.monotonic() >= deadline:
-                    break
-                rec = await probe(oc, station, ip, model, fresh=False, label="capture")
-                records.append(rec)
-                if not dry_run:
-                    _write_line(rec)
-                if (rec.get("response") or {}).get("status") == 200 and winner is None:
-                    winner = (station, ip, model)
-                    log(f"ACCEPTATION DETECTEE: station={station} ip={ip} model={model}")
-                    # mesure du quota sur cette IP
-                    counts = await measure_quota(oc, station, ip, model)
-                    measurements.append({"ip": ip, "model": model, "counts": counts})
-                    deadline = min(deadline, time.monotonic() + 30)
-                    break
-            if winner:
-                break
-        if winner:
-            break
-        await asyncio.sleep(2)
 
-    if not dry_run and records:
-        write_report(records, measurements)
-    log(f"fin — {len(records)} tentatives, acceptations={sum(1 for r in records if (r.get('response') or {}).get('status') == 200)}")
+        pairs = [(st, ip, m) for st, ip in targets for m in MODELS]
+        tasks = [asyncio.create_task(probe(oc, st, ip, m)) for st, ip, m in pairs]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        hits = []
+        for rec in results:
+            if not isinstance(rec, dict):
+                continue
+            resp = rec.get("response") or {}
+            st = resp.get("status")
+            if st == 200:
+                hits.append(rec)
+            elif st == 429:
+                refusals += 1
+                if full and not dry_run:
+                    try:
+                        with open(EVIDENCE, "a", encoding="utf-8") as f:
+                            f.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
+                    except Exception:
+                        pass
+                ra = next(
+                    (v for k, v in resp.get("headers") or [] if str(k).lower() == "retry-after"),
+                    None,
+                )
+                _append_attempt(
+                    f"{rec['ts_utc']} {st} {rec['egress_ip']} {rec['model']} ra={ra}"
+                )
+
+        if hits:
+            for rec in hits:
+                path = "(dry-run)"
+                if not dry_run:
+                    path = _save_accepted(rec)
+                log(f"ACCEPTATION CAPTUREE -> {path}")
+                accepted.append(rec)
+                # mesure immediate du quota sur cette IP avant les autres
+                counts = await measure_quota(
+                    oc, rec["station"], rec["egress_ip"], rec["model"]
+                )
+                measurements.append(
+                    {"ip": rec["egress_ip"], "model": rec["model"], "counts": counts}
+                )
+                log(f"quota mesure ip={rec['egress_ip']} : {counts['200']} succes avant 429")
+                found_this_pass = True
+            if not dry_run:
+                write_report(accepted, refusals, measurements)
+            # apres capture, on ralentit pour ne pas gaspiller
+            await asyncio.sleep(5.0)
+        else:
+            now = time.monotonic()
+            if now - last_summary >= 60.0:
+                log(f"veille — {refusals} refus cumules, pas d'acceptation")
+                last_summary = now
+            await asyncio.sleep(0.5 if found_this_pass else 1.0)
+
+    if not dry_run and (accepted or refusals):
+        write_report(accepted, refusals, measurements)
+    log(f"fin veille — refus={refusals} acceptations={len(accepted)}")
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--until-reset", action="store_true", help="attendre le prochain 00:00 UTC")
-    ap.add_argument("--now", type=float, default=0.0, metavar="SECONDES", help="capturer maintenant pendant N secondes")
-    ap.add_argument("--dry-run", action="store_true", help="ne rien ecrire sur disque")
+    ap.add_argument("--watch", action="store_true")
+    ap.add_argument("--until-reset", action="store_true")
+    ap.add_argument("--now", type=float, default=0.0, metavar="SECONDES")
+    ap.add_argument("--max-seconds", type=float, default=0.0)
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--full", action="store_true", help="ecrire aussi evidence.jsonl")
     args = ap.parse_args()
 
-    duration = args.now if args.now > 0 else 900.0
-    asyncio.run(run_capture(duration, args.dry_run, args.until_reset))
+    if not _acquire_lock():
+        return
+    try:
+        if args.now > 0:
+            asyncio.run(watch(args.now, args.dry_run, args.full, False))
+        else:
+            asyncio.run(
+                watch(args.max_seconds, args.dry_run, args.full, args.until_reset)
+            )
+    finally:
+        _release_lock()
 
 
 if __name__ == "__main__":
