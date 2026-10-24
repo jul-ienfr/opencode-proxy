@@ -5845,6 +5845,22 @@ def _official_free_headers(endpoint: str = "", conversation_key: str | None = No
                     "x-session-id": _conv_session,
                 }
             )
+    # [installation 2026-10-24] Le client reel envoie aussi l'ancrage local de
+    # l'installation : `x-opencode-directory` (repertoire du projet courant) et
+    # `x-opencode-workspace`, presents dans les binaires 1.18.31, 1.19.3 et
+    # 2.1.4 (analyse des chaines). Absents de notre wire, ils rendaient toutes
+    # les IPs interchangeables sur cet axe. Derives par IP (chemin plausible
+    # DISTINCT, jamais partage). Ajoutes APRES les identifiants pour ne pas
+    # alterer l'ordre mesure des 7 premiers en-tetes.
+    if _per_ip and egress_ip:
+        try:
+            import hashlib as _hl
+
+            _ih = _hl.sha256(str(egress_ip).encode()).hexdigest()[:10]
+            out["x-opencode-directory"] = f"C:\\Users\\dev\\projects\\{_ih}"
+            out["x-opencode-workspace"] = _ih[:8]
+        except Exception:
+            pass
     if _FREE_WIRE_FULL_HEADERS:
         # Ordre du client 1.18.31 natif : Connection 8e, Accept 9e, Host 10e, AE 11e.
         # (libcurl replacera Connection en dernier — cf. docstring.)

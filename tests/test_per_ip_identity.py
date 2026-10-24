@@ -101,6 +101,30 @@ def test_official_headers_differ_per_ip(monkeypatch, tmp_path):
     assert h18["x-opencode-session"] != h19["x-opencode-session-id"]
 
 
+def test_installation_anchor_is_per_ip(monkeypatch, tmp_path):
+    """Le client reel envoie x-opencode-directory/workspace (chaines des
+    binaires 1.18.31/1.19.3/2.1.4). Chaque IP doit porter SON ancrage local,
+    jamais celui d'une autre machine."""
+    monkeypatch.setenv("PER_IP_IDENTITY", "1")
+    monkeypatch.setenv("OPENCODE_IDENTITIES_DIR", str(tmp_path / "identities"))
+    seen = {"dir": set(), "ws": set()}
+    for ip in ("186.247.163.125", "187.13.8.129", "86.104.21.99"):
+        h = oc._official_free_headers(
+            "https://opencode.ai/inference/v1/chat/completions", None, ip
+        )
+        d = h.get("x-opencode-directory", "")
+        w = h.get("x-opencode-workspace", "")
+        assert d, f"x-opencode-directory absent pour {ip}"
+        assert w, f"x-opencode-workspace absent pour {ip}"
+        assert d not in seen["dir"], f"repertoire partage entre IPs : {d}"
+        assert w not in seen["ws"], f"workspace partage entre IPs : {w}"
+        seen["dir"].add(d)
+        seen["ws"].add(w)
+    # Hors chemin per-IP (sondes/tests) : aucun ancrage invente.
+    h0 = oc._official_free_headers("https://opencode.ai/inference/v1/chat/completions", None)
+    assert "x-opencode-directory" not in h0
+
+
 def test_each_ip_gets_full_distinct_client(monkeypatch, tmp_path):
     """Le provider ne doit pas pouvoir relier deux IPs : chaque client complet
     (version + client + project + request + session) est propre à son IP."""
