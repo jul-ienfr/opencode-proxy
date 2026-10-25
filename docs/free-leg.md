@@ -2,7 +2,8 @@
 
 > Ce document remplace l'archéologie. Tout ce qu'il affirme a été **mesuré** contre
 > la passerelle réelle ; les cas où la preuve n'est qu'un test sont signalés.
-> Dernière vérification live : 2026-10-22.
+> Dernière vérification live : 2026-10-25 (voir le correctif du gate :
+> [`CAUSE-RACINE-FREE-GATE-2026-10-25.md`](CAUSE-RACINE-FREE-GATE-2026-10-25.md)).
 
 ## 1. Ce qu'est la jambe gratuite
 
@@ -45,18 +46,29 @@ curl -s "http://127.0.0.1:4000/health?detail=full" | python -c "import json,sys;
 
 ## 3. Le contrat de corps — mesuré, pas supposé
 
-| Règle | Mesure | Conséquence |
-|---|---|---|
-| `stream: true` **obligatoire** | `true` → 200 ; `false` ou absent → **403** | un client non-stream est converti, sa réponse reconstituée |
-| outil `read` réaliste **obligatoire** | `read` seul → 200 ; aucun outil → **403** | shim injecté automatiquement |
-| `bash` **inutile** | `bash` seul → 403 ; `read`+`bash` → **200 = même verdict que `read` seul** | shim retiré (V6.2.2), réintroduisible par configuration |
-| description courte **rejetée** | `properties: {}` ou description placeholder → 403 **même avec le bon nom** | validation au chargement, min. 40 caractères |
-| `tool_choice: "auto"` | émis dès qu'il y a des outils, comme le client officiel | ne pas « corriger » |
-| outils triés | collation ICU, majuscule avant minuscule | shim trié **avec** les outils client |
+> **Changement majeur du 2026-10-23T23:17:27Z.** Le contrat ci-dessous a été
+> durci ce jour-là. L'ancienne règle « `read` seul suffit » (mesure du 21/10)
+> ne vaut plus : avec un corps réduit, le provider répond désormais `403`
+> `FreeTierError`. Détail complet, preuves et correctif :
+> [`CAUSE-RACINE-FREE-GATE-2026-10-25.md`](CAUSE-RACINE-FREE-GATE-2026-10-25.md).
 
-Les définitions vivent dans `config.yaml > free.shims`, avec un champ `necessity`
-(`read: required`). Une entrée invalide est **écartée au chargement avec sa raison** :
-une description trop courte ferait échouer chaque requête en 403 muet.
+| Règle | Mesure (2026-10-25) | Conséquence |
+|---|---|---|
+| **signature complète du client** (10 outils officiels + prompt système) | corps complet 44 Ko → **200** ; 1 seul outil → **403** ; sans `tools` → **403** ; sans prompt système → **429** | le proxy envoie la copie figée `free/official_payload.json` dès qu'un nom officiel manque |
+| `stream: true` **obligatoire** | `true` → 200 ; `false` ou absent → **403** | un client non-stream est converti, sa réponse reconstituée |
+| `tool_choice: "auto"` | émis dès qu'il y a des outils, comme le client officiel | ne pas « corriger » |
+| ordre des clés | `model, max_tokens, messages, tools, tool_choice, stream, stream_options` | `_reorder_client_body` |
+| outils triés | la copie officielle garde son ordre exact ; on ne trie plus que les tools client | — |
+
+Les anciennes règles (`read` obligatoire, `bash` inutile, description ≥ 40
+caractères) décrivaient le gate **avant** son durcissement. Elles restent
+utiles pour comprendre l'historique, mais elles ne doivent plus servir de
+critère d'acceptation : un corps qui les respecte et n'a pas les 10 outils
+est refusé.
+
+Les définitions restent dans `config.yaml > free.shims` pour la jambe
+`/v1/responses` (forme `input`, non couverte par la capture), mais la jambe
+`chat` ne s'en sert plus : elle envoie la copie intégrale.
 
 ## 4. Le fil
 

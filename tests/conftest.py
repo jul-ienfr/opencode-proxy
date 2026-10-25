@@ -190,3 +190,44 @@ def _isolate_ip_identity_vault(tmp_path, monkeypatch):
     _fi._VAULT = None
     yield
     _fi._VAULT = None
+
+
+@pytest.fixture(autouse=True)
+def _reset_free_model_rr():
+    """[FIX ordre 2026-10-25] Round-robin des modèles free remis à zéro.
+
+    ``_free_model_rr`` est un compteur module-level : sans reset, le modèle
+    choisi par ``_resolve_free_model`` dépend du nombre de tests exécutés
+    avant. Les tests e2e qui assertent « la requête part sur tel modèle free »
+    échouaient donc selon l'ordre des fichiers — constaté en ajoutant
+    ``tests/test_free_official_payload.py`` (même famille de failence que
+    ``_reset_global_429`` ci-dessus).
+    """
+    import opencode as oc
+
+    def _neuf() -> None:
+        try:
+            oc._free_model_rr.clear()
+        except Exception:
+            pass
+
+    # Le spread est un état de config global : en test, il rend le modèle
+    # choisi dépendant du nombre d'appels précédents. On le désactive par
+    # défaut ; les tests qui l'exercent le réactivent explicitement
+    # (test_audit_routabilite_pc le fait via monkeypatch).
+    _avant = oc.IP_ROTATION.get("free_model_spread")
+    try:
+        oc.IP_ROTATION["free_model_spread"] = False
+    except Exception:
+        pass
+
+    _neuf()
+    yield
+    try:
+        if _avant is None:
+            oc.IP_ROTATION.pop("free_model_spread", None)
+        else:
+            oc.IP_ROTATION["free_model_spread"] = _avant
+    except Exception:
+        pass
+    _neuf()
