@@ -14,6 +14,20 @@ __pycache__/
 # Database
 logs/*.db*
 logs/requests.db.bak*
+logs/requests.db.*
+
+# Artefacts d'exécution / recherche locale — jamais versionnés.
+# (Les rares fichiers suivis sous logs/ et _research/ restent suivis :
+#  .gitignore ne s'applique qu'aux fichiers non suivis.)
+logs/quota_reset_capture/
+logs/boot.out
+logs/free_pool.json
+logs/*.lock.pid
+_research/
+config.yaml.*.bak*
+can[0-9]*.json
+ddgtest.py
+wstest.py
 
 # Logs
 *.log
