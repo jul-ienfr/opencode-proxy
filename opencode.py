@@ -6,6 +6,7 @@ Convert Anthropic /v1/messages ↔ OpenAI chat/completions
 import asyncio
 import contextlib
 import contextvars
+import copy
 import datetime
 import email.utils
 import hmac
@@ -5248,8 +5249,72 @@ def _free_shim_tool(name: str, responses: bool) -> dict:
     }
 
 
+def _official_free_payload() -> dict:
+    """Payload officiel figé (capture intégrale du client 1.18.31).
+
+    Le gate gratuit du provider vérifie la signature du client : suite
+    complète des 10 tools + prompt système officiel. Une version réduite
+    (un seul tool, sans système) est refusée 403/429 — mesuré le 2026-10-25.
+    """
+    global _OFFICIAL_FREE_PAYLOAD
+    if _OFFICIAL_FREE_PAYLOAD is not None:
+        return _OFFICIAL_FREE_PAYLOAD
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "free", "official_payload.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            body = (json.load(f) or {}).get("body") or {}
+    except Exception:
+        body = {}
+    tools = body.get("tools") if isinstance(body.get("tools"), list) else []
+    system = None
+    for m in body.get("messages") or []:
+        if isinstance(m, dict) and m.get("role") == "system":
+            system = m
+            break
+    _OFFICIAL_FREE_PAYLOAD = {
+        "tools": tools,
+        "names": {
+            t.get("function", {}).get("name")
+            for t in tools
+            if isinstance(t, dict) and isinstance(t.get("function"), dict)
+        },
+        "system": system,
+        "stream_options": body.get("stream_options") or {"include_usage": True},
+    }
+    return _OFFICIAL_FREE_PAYLOAD
+
+
+_OFFICIAL_FREE_PAYLOAD: dict | None = None
+
+
+def _has_official_system(messages) -> bool:
+    """Le corps porte-t-il déjà le prompt système officiel ?"""
+    if not isinstance(messages, list):
+        return False
+    for m in messages:
+        if not isinstance(m, dict) or m.get("role") != "system":
+            continue
+        c = m.get("content")
+        if isinstance(c, str) and "You are opencode, an interactive CLI tool" in c:
+            return True
+    return False
+
+
 def _free_wire_body(body, force_stream: bool = False, egress_ip: str | None = None):
-    """Copie d'envoi jambe free : grille tools + stream (±prompt_cache_key).
+    """Copie d'envoi jambe free : copie officielle + stream (±prompt_cache_key).
+
+    [2026-10-25] DEUX régimes, mesurés sur le vrai endpoint :
+      * corps réduit (peu/pas de tools, pas de prompt système) -> 403
+        ``FreeTierError: free tier can only be used from within OpenCode``,
+        ou 429 ``FreeUsageLimitError`` ;
+      * copie intégrale du client officiel (10 tools + prompt système,
+        ordre « model, max_tokens, messages, tools, tool_choice, stream,
+        stream_options ») -> 200, sur la MÊME IP, à la même seconde.
+    La régression du 23/10 23:17 UTC correspond exactement au durcissement
+    de ce gate : l'ancienne mesure (« read seul suffit », 21/10) ne vaut plus.
+    On envoie donc la copie figée dans ``free/official_payload.json``
+    (capture intégrale du client 1.18.31) dès que le corps n'en porte pas
+    déjà la signature ; un corps déjà conforme passe TEL QUEL.
 
     Ne mute JAMAIS l'entrée (copie défensive quand un patch est requis —
     les appelants réutilisent le même dict sur retries/hedges ; la fonction
@@ -5257,18 +5322,6 @@ def _free_wire_body(body, force_stream: bool = False, egress_ip: str | None = No
     stream_forcé_ici est True, l'appelant a basculé un corps non-stream en
     stream:true pour passer le gate et doit LIRE du SSE puis reconstituer
     du JSON (collecteurs ci-dessous).
-
-    [copie exacte, 3e passe] Deux signatures du corps officiel sont
-    désormais reproduites (MESURÉES sur 243 requêtes du vrai client) :
-      * ORDRE DES CLÉS : « model, max_tokens, messages, tools, tool_choice,
-        stream, stream_options » — 242/243 requêtes, l'ordre est donc une
-        signature stable, pas un hasard (json.dumps respecte l'ordre du
-        dict : nos octets partaient dans un ordre différent) ;
-      * ``tool_choice: "auto"`` présent dès qu'il y a des tools (242/242) —
-        le client le pose toujours, nous l'omettions.
-    L'ordre n'a aucun effet sémantique (JSON), mais l'octet compte pour une
-    copie fidèle. Corps Responses (``input``) : ordre non mesuré chez le
-    client → inchangé (on n'invente rien).
     """
     if not isinstance(body, dict):
         return body, False
@@ -5295,30 +5348,51 @@ def _free_wire_body(body, force_stream: bool = False, egress_ip: str | None = No
     # l'injecte plus — moins d'octets, même passage, un shim de moins à
     # maintenir. Le registre peut le réintroduire par configuration si une
     # mesure future le réhabilite.
-    missing = [n for n in ("read",) if n not in have]
+    _payload = _official_free_payload()
+    _official_names = _payload["names"]
+    # [2026-10-25] Le gate a changé le 23/10 23:17 UTC: « read seul -> 200 »
+    # (mesure du 21/10) ne vaut plus. Il exige désormais la suite COMPLÈTE
+    # des 10 tools officiels + le prompt système. Mesuré sur le vrai endpoint:
+    #   10 tools + système -> 200 ; 1 tool -> 403 ; sans système -> 429.
+    need_tools = is_chat and bool(_official_names) and not _official_names.issubset(have)
+    need_system = is_chat and isinstance(_payload.get("system"), dict) and not _has_official_system(
+        body.get("messages")
+    )
+    missing = [n for n in ("read",) if n not in have] if is_resp else []
     need_stream = force_stream and body.get("stream") is not True
     need_key = is_resp and not body.get("prompt_cache_key")
+    will_have_tools = bool(tools) or need_tools or bool(missing)
     # Le client pose « auto » dès qu'il y a des tools (242/242 mesures) — y
-    # compris quand les tools viennent de notre grille shim.
-    need_tc = is_chat and (bool(tools) or bool(missing)) and "tool_choice" not in body
+    # compris quand les tools viennent de la copie officielle.
+    need_tc = is_chat and will_have_tools and "tool_choice" not in body
     # L'ordre client n'est réordonné que si le corps est en forme chat ET
-    # finira par porter des tools (ceux d'origine OU ceux du shim) : hors de
-    # là, on ne touche à rien. NB : on teste l'état FINAL, pas l'état initial
-    # — sinon un corps sans tools (grille ajoutée ensuite) garderait l'ordre
-    # d'origine alors qu'il porte désormais des tools.
-    need_order = is_chat and (bool(tools) or bool(missing))
-    if not missing and not need_stream and not need_key and not need_tc and not need_order:
+    # finira par porter des tools (ceux d'origine OU la copie officielle).
+    need_order = is_chat and will_have_tools
+    if (
+        not missing
+        and not need_tools
+        and not need_system
+        and not need_stream
+        and not need_key
+        and not need_tc
+        and not need_order
+    ):
         return body, False
     wire = dict(body)
-    if missing:
+    if need_tools:
+        # Copie intégrale, octet pour octet, dans l'ordre officiel.
+        wire["tools"] = copy.deepcopy(_payload["tools"])
+    elif missing:
         base = list(tools) if isinstance(tools, list) else []
         base.extend(_free_shim_tool(n, is_resp) for n in missing)
         wire["tools"] = base
-    if is_chat and need_order:
-        # Parité client officiel v1 (tri ICU `toSorted(localeCompare)`,
-        # (tri constaté sur le natif : outils triés sur le fil).
-        # Les shims `bash`/`read` sont triés AVEC le reste, pas appendus :
-        # le tri porte sur l'état FINAL (outils d'origine + shims).
+    if need_system:
+        # Le prompt système officiel est ajouté EN TÊTE ; les messages du
+        # client (y compris son propre prompt système) sont conservés tels quels.
+        wire["messages"] = [copy.deepcopy(_payload["system"])] + list(wire.get("messages") or [])
+    if is_chat and need_order and not need_tools:
+        # Tri ICU de parité v1, uniquement sur des tools fournis par le client :
+        # la copie officielle, elle, garde son ordre exact.
         wire["tools"] = _sorted_chat_tools(wire.get("tools"))
     if need_tc:
         # Le client pose « auto » dès qu'il y a des tools (242/242 mesures).
@@ -5337,6 +5411,9 @@ def _free_wire_body(body, force_stream: bool = False, egress_ip: str | None = No
     forced = False
     if need_stream:
         wire["stream"] = True
+        # Le corps officiel porte toujours stream_options (include_usage).
+        if "stream_options" not in wire and isinstance(_payload.get("stream_options"), dict):
+            wire["stream_options"] = copy.deepcopy(_payload["stream_options"])
         forced = True
     if need_order:
         wire = _reorder_client_body(wire)

@@ -189,7 +189,17 @@ class TestWireShapes:
 
 
 class TestInjection:
-    """V6.2.2 — ce qui part réellement sur le fil, mesuré et non supposé."""
+    """2026-10-25 — ce qui part réellement sur le fil, mesuré et non supposé.
+
+    Le gate a été durci le 23/10 à 23:17 UTC : « read seul » (mesure du
+    21/10) ne passe plus. Il exige la suite COMPLÈTE des 10 tools officiels
+    plus le prompt système. Mesuré sur le vrai endpoint, même IP, même
+    seconde : 10 tools + système → 200 ; 1 tool → 403 ; sans système → 429.
+    """
+
+    OFFICIAL = [
+        "bash", "edit", "glob", "grep", "read", "skill", "task", "todowrite", "webfetch", "write",
+    ]
 
     def _wire(self, body):
         import opencode as oc
@@ -197,17 +207,17 @@ class TestInjection:
         wire, _ = oc._free_wire_body(body, "big-pickle")
         return wire
 
-    def test_only_read_is_injected(self):
+    def test_full_official_tool_set_is_injected(self):
         wire = self._wire({"messages": [{"role": "user", "content": "hi"}]})
         names = [t["function"]["name"] for t in wire.get("tools") or []]
-        assert names == ["read"], f"outils injectés : {names}"
+        assert names == self.OFFICIAL, f"outils injectés : {names}"
 
-    def test_bash_is_no_longer_injected(self):
+    def test_bash_is_part_of_the_official_signature(self):
         wire = self._wire({"messages": [{"role": "user", "content": "hi"}]})
         names = [t["function"]["name"] for t in wire.get("tools") or []]
-        assert "bash" not in names
+        assert "bash" in names
 
-    def test_client_tools_are_preserved_and_read_is_added(self):
+    def test_client_tools_are_replaced_by_the_official_copy(self):
         wire = self._wire(
             {
                 "messages": [{"role": "user", "content": "hi"}],
@@ -224,7 +234,7 @@ class TestInjection:
             }
         )
         names = [t["function"]["name"] for t in wire.get("tools") or []]
-        assert "my_tool" in names and "read" in names
+        assert names == self.OFFICIAL
 
     def test_tool_choice_stays_auto(self):
         wire = self._wire({"messages": [{"role": "user", "content": "hi"}]})

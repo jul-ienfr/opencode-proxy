@@ -80,8 +80,10 @@ def test_tool_choice_auto_added_for_shimmed_tools():
         force_stream=True,
     )
     assert wire["tool_choice"] == "auto"
-    # [V6.2.2] mesuré : `bash` n'est pas load-bearing, seul `read` est injecté.
-    assert [t["function"]["name"] for t in wire["tools"]] == ["read"]
+    # [2026-10-25] copie officielle : les 10 tools, dans l'ordre officiel.
+    assert [t["function"]["name"] for t in wire["tools"]] == [
+        "bash", "edit", "glob", "grep", "read", "skill", "task", "todowrite", "webfetch", "write",
+    ]
     assert list(wire) == [k for k in CLIENT_KEY_ORDER if k in wire]
 
 

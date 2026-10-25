@@ -88,6 +88,22 @@ OFFICIAL_ORDER = [
     "Accept-Encoding",
 ]
 
+#: Suite COMPLÈTE des tools du client officiel 1.18.31 (capture intégrale
+#: 2026-10-25, `free/official_payload.json`). Le gate gratuit exige cette
+#: signature exacte : `read` seul -> 403 depuis le durcissement du 23/10.
+OFFICIAL_TOOL_NAMES = {
+    "bash",
+    "edit",
+    "glob",
+    "grep",
+    "read",
+    "skill",
+    "task",
+    "todowrite",
+    "webfetch",
+    "write",
+}
+
 #: Wire LEGACY (client 1.18.31) — conservé pour le mode `legacy`
 #: (rollback à chaud) et pour les tests des IDs `msg_`, qui n'existent que
 #: dans ce wire.
@@ -478,43 +494,40 @@ def _resp_names(tools):
 
 
 def test_free_wire_body_chat_appends_shim(official_env):
-    """Corps chat sans tools → paire shim bash+read, stream forcé, sans
-    muter l'entrée (idempotent au 2ᵉ passage)."""
+    """Corps chat sans tools → copie officielle complète (10 tools + prompt
+    système), stream forcé, sans muter l'entrée (idempotent au 2ᵉ passage)."""
     body = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
     wire, forced = oc._free_wire_body(body, force_stream=True)
     assert forced is True
     assert wire["stream"] is True
-    # [V6.2.2] `bash` mesuré non load-bearing : seul `read` est injecté.
-    assert _chat_names(wire["tools"]) == {"read"}
+    # [2026-10-25] durcissement du gate : la suite COMPLÈTE est requise.
+    assert _chat_names(wire["tools"]) == OFFICIAL_TOOL_NAMES
+    assert wire["messages"][0]["role"] == "system"
+    assert "You are opencode, an interactive CLI tool" in wire["messages"][0]["content"]
+    assert wire["messages"][-1] == {"role": "user", "content": "hi"}
     assert "tools" not in body and body.get("stream") is not True  # entrée intacte
     wire2, forced2 = oc._free_wire_body(wire, force_stream=True)
     assert forced2 is False  # déjà conforme : inchangé
-    assert _chat_names(wire2["tools"]) == {"read"}
+    assert _chat_names(wire2["tools"]) == OFFICIAL_TOOL_NAMES
 
 
 def test_free_wire_body_chat_keeps_client_tools(official_env):
-    """Tools client conservés + shim manquant ajouté (ex. Bash capitalisé
-    côté Claude ne compte PAS : le gate est case-sensitive).
+    """Tools client remplacés par la copie officielle (ex. Bash capitalisé
+    ne compte PAS : le gate est case-sensitive).
 
-    Parité v1 (tri ICU `toSorted(localeCompare)`, binaire 1.18.31) : les
-    shims sont triés AVEC les outils du client. D'où l'ordre attendu ici :
-    « bash » avant « Bash » (primaire égal, le niveau tertiaire de la
-    collation met la minuscule avant la majuscule), puis « Bash » avant
-    « read ».
+    [2026-10-25] Le gate exige la suite complète, pas un sur-ensemble
+    arbitraire : dès qu'un seul nom officiel manque, les 10 tools officiels
+    sont envoyés tels quels (copie intégrale, ordre exact).
     """
     mine = {"type": "function", "function": {"name": "Bash", "description": "x",
             "parameters": {"type": "object", "properties": {}}}}
     body = {"model": "m", "messages": [], "tools": [mine], "stream": True}
     wire, forced = oc._free_wire_body(body, force_stream=True)
     assert forced is False  # déjà stream:true
-    names = _chat_names(wire["tools"])
-    assert {"Bash", "read"} <= names
-    # [V6.2.2] `bash` retiré : le client ne fournissant que « Bash », le shim
-    # ajouté est « read ». La collation ICU place la majuscule avant la
-    # minuscule, donc l'outil client passe en tête et le shim suit. L'objet
-    # client doit rester le MÊME (pas de recopie, pas de doublon).
-    assert wire["tools"][0] is mine
-    assert [t["function"]["name"] for t in wire["tools"]] == ["Bash", "read"]
+    assert _chat_names(wire["tools"]) == OFFICIAL_TOOL_NAMES
+    assert [t["function"]["name"] for t in wire["tools"]] == [
+        "bash", "edit", "glob", "grep", "read", "skill", "task", "todowrite", "webfetch", "write",
+    ]
 
 
 def test_free_wire_body_responses_prompt_cache_key(official_env):
@@ -650,8 +663,8 @@ async def test_do_free_direct_request_collects(official_env, monkeypatch):
 
     wire = json.loads(sent["content"].decode())
     assert wire["stream"] is True
-    # [V6.2.2] `bash` mesuré non load-bearing : seul `read` est injecté.
-    assert _chat_names(wire["tools"]) == {"read"}
+    # [2026-10-25] copie officielle complète : 10 tools.
+    assert _chat_names(wire["tools"]) == OFFICIAL_TOOL_NAMES
     assert "tools" not in body
 
 

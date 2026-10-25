@@ -128,22 +128,24 @@ def test_sanitize_chat_tools_sorts_the_renamed_tools_with_the_rest():
 
 
 def test_free_wire_shims_are_sorted_with_the_rest():
-    """Jambe free : ``bash``/``read`` s'intercalent dans l'ordre trié (mesuré
-    1.19.0), ils ne sont pas simplement ajoutés en fin de liste."""
+    """Jambe free : dès qu'un nom officiel manque, la copie officielle
+    complète remplace les tools du client, dans son ordre exact."""
     body = {
         "model": "m",
         "messages": [{"role": "user", "content": "hi"}],
         "tools": [_tool("zzz"), _tool("aaa")],
     }
     wire, _forced = oc._free_wire_body(body)
-    # [V6.2.2] `bash` retiré des shims : l'ordre porte sur les outils restants.
-    assert _names(wire["tools"]) == ["aaa", "read", "zzz"]
+    # [2026-10-25] le gate exige la suite complète, pas un tri partiel.
+    assert _names(wire["tools"]) == [
+        "bash", "edit", "glob", "grep", "read", "skill", "task", "todowrite", "webfetch", "write",
+    ]
     # Le corps d'origine n'est jamais muté (idempotence des retries/hedges).
     assert _names(body["tools"]) == ["zzz", "aaa"]
 
 
 def test_free_wire_is_idempotent_once_sorted():
-    """Réappliquer le wire ne change plus rien : le tri est un point fixe."""
+    """Réappliquer le wire ne change plus rien : la copie est un point fixe."""
     body = {
         "model": "m",
         "messages": [{"role": "user", "content": "hi"}],
@@ -151,7 +153,10 @@ def test_free_wire_is_idempotent_once_sorted():
     }
     first, _ = oc._free_wire_body(body)
     second, _ = oc._free_wire_body(first)
-    assert _names(second["tools"]) == _names(first["tools"]) == ["aaa", "read", "zzz"]
+    expected = [
+        "bash", "edit", "glob", "grep", "read", "skill", "task", "todowrite", "webfetch", "write",
+    ]
+    assert _names(second["tools"]) == _names(first["tools"]) == expected
 
 
 def test_free_wire_responses_leg_is_left_alone():
