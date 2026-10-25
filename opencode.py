@@ -7947,6 +7947,193 @@ def _free_attempts_active(forced_pool=None) -> bool:
     return effective_free_max_attempts(forced_pool) > 1 or _free_exception_fallback_mode() == "station-first"
 
 
+def _stream_hedge_enabled() -> bool:
+    """Hedge actif pour les flux SSE ? (`free_parallel.mode == "hedge"`)."""
+    try:
+        fp = (IP_ROTATION or {}).get("free_parallel") or {}
+        return bool(fp.get("enabled")) and str(fp.get("mode") or "") == "hedge"
+    except Exception:
+        return False
+
+
+class _ReplayStreamResponse:
+    """Réponse stream dont la première ligne a déjà été lue (course de hedge)."""
+
+    def __init__(self, resp, first_line=None):
+        self._resp = resp
+        self._first = first_line
+
+    @property
+    def status_code(self):
+        return getattr(self._resp, "status_code", 200)
+
+    @property
+    def headers(self):
+        try:
+            return getattr(self._resp, "headers", {})
+        except Exception:
+            return {}
+
+    async def aiter_lines(self):
+        if self._first is not None:
+            first, self._first = self._first, None
+            yield first
+        async for line in self._resp.aiter_lines():
+            yield line
+
+    async def aclose(self):
+        try:
+            await self._resp.aclose()
+        except Exception:
+            pass
+
+
+@asynccontextmanager
+async def _open_free_stream_hedged(
+    endpoint,
+    body,
+    headers,
+    use_free,
+    count_request=True,
+    fresh_station=False,
+    direct_fallback=True,
+    forced_pool=None,
+):
+    """Hedge de FLUX : 2 stations en course, la première qui produit un token.
+
+    [2026-10-25] Le hedge historique était réservé au non-stream (attendre la
+    réponse complète). Ici on course les deux ouvertures de flux et on garde
+    celle qui émet sa première ligne SSE. Le perdant est annulé et fermé, la
+    comptabilité n'est incrémentée que pour le gagnant (`note_hedge_winner`).
+
+    Coût : une requête de plus, uniquement quand la primaire n'a rien produit
+    après `hedge_delay_ms`. Désactivable par `free_parallel.mode != "hedge"`
+    (toggle GUI).
+    """
+    pool = _free_ip_pool
+    try:
+        cands = pool.pick_candidates(forced_pool)[:2] if pool else []
+    except Exception:
+        cands = []
+    if len(cands) < 2:
+        async with _open_free_stream(
+            endpoint, body, headers, use_free, count_request, fresh_station,
+            direct_fallback, forced_pool,
+        ) as resp:
+            yield resp
+        return
+    try:
+        fp = (IP_ROTATION or {}).get("free_parallel") or {}
+        stagger = float(fp.get("hedge_delay_ms", 400) or 0) / 1000.0
+    except Exception:
+        stagger = 0.4
+    stagger = max(0.0, min(5.0, stagger))
+
+    async def _probe(station):
+        ctx = _open_free_stream(
+            endpoint, body, headers, use_free, False, fresh_station,
+            direct_fallback, forced_pool, forced_station=station,
+        )
+        resp = await ctx.__aenter__()
+        try:
+            if getattr(resp, "status_code", 200) != 200:
+                return {"ok": False, "station": station, "ctx": ctx, "resp": resp, "first": None}
+            first = None
+            async for line in resp.aiter_lines():
+                first = line
+                break
+            return {"ok": first is not None, "station": station, "ctx": ctx, "resp": resp, "first": first}
+        except BaseException:
+            try:
+                await ctx.__aexit__(None, None, None)
+            except Exception:
+                pass
+            raise
+
+    winner = None
+    seen: list = []
+    tasks: list = []
+    try:
+        t1 = asyncio.create_task(_probe(cands[0]))
+        tasks.append(t1)
+        await asyncio.wait([t1], timeout=stagger)
+        # La seconde ne part que si la primaire n'a pas DÉJÀ un flux utile :
+        # un 429/erreur rapide ne doit pas annuler la course (sinon aucune
+        # station n'est essayée alors qu'une autre pouvait servir).
+        _t1_ok = False
+        if t1.done():
+            try:
+                _t1_ok = bool(t1.result().get("ok"))
+            except Exception:
+                _t1_ok = False
+        if not _t1_ok:
+            tasks.append(asyncio.create_task(_probe(cands[1])))
+        pending = set(tasks)
+        while pending:
+            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            for t in done:
+                try:
+                    r = t.result()
+                except Exception:
+                    continue
+                seen.append(r)
+                if r["ok"] and winner is None:
+                    winner = r
+            if winner is not None:
+                break
+        for t in pending:
+            t.cancel()
+        for t in pending:
+            try:
+                seen.append(await t)
+            except BaseException:
+                pass
+        for r in seen:
+            if winner is not None and r is winner:
+                continue
+            try:
+                await r["resp"].aclose()
+            except Exception:
+                pass
+            try:
+                await r["ctx"].__aexit__(None, None, None)
+            except Exception:
+                pass
+        if winner is None:
+            raise _FreeTunnelFailure(cands[0], RuntimeError("hedge: aucun flux gagnant"))
+        try:
+            note = getattr(pool, "note_hedge_winner", None)
+            if callable(note):
+                note(winner["station"], cands[0])
+        except Exception:
+            pass
+        try:
+            _current_free_attempt.set(
+                {
+                    "station": winner["station"],
+                    "proxy_url": getattr(winner["station"], "socks5_url", None),
+                    "hedged": True,
+                }
+            )
+        except Exception:
+            pass
+        _debug(
+            f"  [free-stream] hedge gagné par station "
+            f"{getattr(winner['station'], '_station', '?')} (stagger={stagger:.1f}s)"
+        )
+        yield _ReplayStreamResponse(winner["resp"], winner["first"])
+    finally:
+        if winner is not None:
+            try:
+                await winner["resp"].aclose()
+            except Exception:
+                pass
+            try:
+                await winner["ctx"].__aexit__(None, None, None)
+            except Exception:
+                pass
+
+
 @asynccontextmanager
 async def _open_free_stream(
     endpoint,
@@ -7957,6 +8144,7 @@ async def _open_free_stream(
     fresh_station: bool = False,
     direct_fallback: bool = True,
     forced_pool=None,
+    forced_station=None,
 ):
     """Context manager: upstream stream, routed through the VPN when free.
 
@@ -7991,6 +8179,22 @@ async def _open_free_stream(
     """
     if not _direct_fallback_allowed():
         direct_fallback = False
+    # [2026-10-25] Hedge de flux (opt-in, GUI) : course de 2 stations, la
+    # première qui émet un token gagne. Les sondes passent `forced_station`,
+    # donc ce branchement ne se rejoue pas récursivement.
+    if (
+        use_free
+        and forced_station is None
+        and _stream_hedge_enabled()
+        and isinstance(body, dict)
+        and body.get("stream")
+    ):
+        async with _open_free_stream_hedged(
+            endpoint, body, headers, use_free, count_request, fresh_station,
+            direct_fallback, forced_pool,
+        ) as _hedged_resp:
+            yield _hedged_resp
+        return
     # [PLAN_CORRECTION_FAUX_429 Lot B2] delai court plafonne avant re-tentative free (fresh_station)
     if use_free and fresh_station and not count_request:
         try:
@@ -8004,7 +8208,12 @@ async def _open_free_stream(
     )
     if use_free and _free_ip_pool and _free_ip_pool.enabled:
         _debug("  [free-stream] getting proxy from pool...")
-        if count_request:
+        if forced_station is not None:
+            # [2026-10-25] Sonde de hedge : station imposée, aucun compteur
+            # avancé ici (note_hedge_winner s'en charge pour le gagnant).
+            station = forced_station
+            proxy_url = getattr(forced_station, "socks5_url", None)
+        elif count_request:
             try:
                 proxy_url, station = await _free_ip_pool.on_request(forced_pool)
             except TypeError:

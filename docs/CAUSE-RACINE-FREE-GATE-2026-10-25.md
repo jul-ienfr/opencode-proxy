@@ -463,6 +463,23 @@ Le reste de la latence est la génération du modèle : pour aller plus vite il
 faut changer de modèle (`deepseek` ≈ 6,5 s médian, `mimo` ≈ 21 s) ou activer
 le hedging, qui double la consommation de quota.
 
+### Hedging de flux (streaming)
+
+`free_parallel.mode: hedge` course **deux stations** et garde le premier flux
+qui émet un token ; le perdant est annulé et fermé, et la comptabilité n'est
+incrémentée que pour le gagnant (`note_hedge_winner`). La seconde ne part que
+si la primaire n'a rien produit après `hedge_delay_ms` (1 500 ms) — inutile de
+payer une requête quand la première répond vite.
+
+Fonctionne aussi pour le non-stream (mécanisme historique). Coût : une requête
+supplémentaire **par course**, donc le quota fond plus vite ; c'est pourquoi
+le mode est un simple menu dans le GUI (VPN → stations free), avec le toggle
+« Paralléliser les stations free » pour tout couper.
+
+Premières mesures après activation : `{primary: 1, hedge: 3, total: 4}` — trois
+courses sur quatre gagnées par la station secondaire, sans dégrader les flux
+(vérifié : chat/messages/responses en streaming, outils et raisonnement).
+
 ## 10. Vérifier et maintenir
 
 ### Vérification rapide

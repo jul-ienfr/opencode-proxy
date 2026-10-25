@@ -369,8 +369,8 @@ ip_rotation:
   free_parallel:
     enabled: true
     routing: round-robin
-    mode: load-balance
-    hedge_delay_ms: 400
+    mode: hedge
+    hedge_delay_ms: 1500
     hedge_max_attempts: 1
   identity_diversity: true
   identity_max_profiles: 256
