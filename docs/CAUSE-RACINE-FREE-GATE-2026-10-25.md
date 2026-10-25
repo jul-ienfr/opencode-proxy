@@ -275,6 +275,19 @@ détailler son calcul, trois fois de suite.
 - **Client tiers réel à 22 outils** (`browser_exec`, `terminal`, …) : `200`
   (10 officiels + 22 extras = 32 outils). La fusion tient à l'échelle.
 
+### Tenue sur une heure de trafic (2026-10-25, 08:39 → 09:39 UTC)
+
+```
+deepseek-v4.1-flash-free   n=76   ok=75  ( 98,7 %)  avg=6,7 s   max=28,9 s
+mimo-v2.6-flash-free       n=63   ok=63  (100,0 %)  avg=13,8 s  max=61,9 s
+glm-5.3-flash-free         n=57   ok=57  (100,0 %)  avg=8,8 s   max=71,5 s
+échecs : 1 (429)
+jev (systemone)            n=78
+```
+
+Les maxima élevés sont des générations longues (raisonnement + sorties
+verbeuses), pas des reprises : une seule requête a échoué sur 196.
+
 ## 8. Coût et limites
 
 | Point | Valeur | Commentaire |
