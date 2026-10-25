@@ -792,3 +792,7 @@ canary:
   interval_s: 1800
   model: big-pickle
   timeout_s: 90
+observability:
+  slo_targets:
+    p50_ms: 12000
+    p95_ms: 30000

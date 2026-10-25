@@ -46,6 +46,20 @@ class TestVerdicts:
         v = evaluate(series(p50=5000), targets={"p50_ms": 10000, "p95_ms": 99999})
         assert v["status"] == "ok"
 
+    def test_config_targets_are_valid(self):
+        """[2026-10-25] Le health passe les cibles de config à `evaluate`.
+
+        La série mesure la complétion complète (~11k tokens d'entrée sur la
+        jambe free), pas le TTFT : les cibles de config doivent donc être
+        cohérentes entre elles et plus larges que celles du plan.
+        """
+        from config.settings import yaml_get
+
+        t = yaml_get("observability", "slo_targets", None)
+        assert isinstance(t, dict), "observability.slo_targets absent de config.yaml"
+        assert 0 < float(t["p50_ms"]) < float(t["p95_ms"])
+        assert float(t["p50_ms"]) >= DEFAULT_TARGETS["p50_ms"]
+
 
 class TestInsufficientData:
     def test_too_few_samples_is_unknown(self):

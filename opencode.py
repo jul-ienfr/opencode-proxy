@@ -16515,7 +16515,15 @@ async def health(detail: str = "lite"):
                 try:
                     from observability.slo import evaluate as _slo_evaluate
 
-                    payload["slo"] = _slo_evaluate(_leg_series)
+                    # [2026-10-25] Cibles pilotées par la config : la série
+                    # `leg_ms` mesure la COMPLÉTION COMPLÈTE, alors que la cible
+                    # historique (p50 4 s / p95 12 s) visait une première
+                    # réponse sur prompt court. La jambe free porte désormais
+                    # ~11k tokens d'entrée (copie officielle du client), donc
+                    # 4 s est structurellement inatteignable et le SLO restait
+                    # « breached » en permanence sur du trafic sain.
+                    _slo_targets = yaml_get("observability", "slo_targets", None)
+                    payload["slo"] = _slo_evaluate(_leg_series, targets=_slo_targets)
                 except Exception:
                     pass
         except Exception:
