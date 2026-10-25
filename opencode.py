@@ -9137,6 +9137,103 @@ def _free_stations_exhausted(free_model: str) -> bool:
     return True
 
 
+def _free_cooldown_remaining(free_model: str, station=None) -> float:
+    """Secondes restantes du cooldown (0 si inactif). Lecture seule."""
+    key = _free_cooldown_key(free_model, station)
+    with _free_cooldown_lock:
+        expiry = _free_model_cooldowns.get(key, 0.0)
+    try:
+        return max(0.0, float(expiry) - time.monotonic())
+    except Exception:
+        return 0.0
+
+
+def _free_preflight_retry_after(model_id: str, *, min_wait: float = 5.0) -> float | None:
+    """Délai (s) si AUCUNE station chaude ne peut servir AUCUN candidat free.
+
+    [2026-10-25] Sert à refuser AVANT d'ouvrir le flux SSE : les en-têtes SSE
+    étant déjà partis, le refus arrivait en HTTP 200 + ``data: {"error":…}`` et
+    le client affichait du JSON brut. Ici le client reçoit un vrai 429 lisible.
+
+    Ne conclut jamais dans les cas ambigus :
+      * ``strict_free`` désactivé -> None (un repli payant reste possible) ;
+      * pool absent/désactivé -> None ;
+      * aucune station chaude (warmup/erreur) -> None : le chemin normal
+        répond 503 ``vpn_warming``, plus juste qu'un 429 ;
+      * rotation en vol -> None (une IP fraîche peut arriver) ;
+      * un couple (modèle, station) sans cooldown -> None ;
+      * le cooldown le plus court expire dans < ``min_wait`` -> None
+        (laisser le chemin normal tenter, il passera).
+    """
+    try:
+        if not bool((IP_ROTATION or {}).get("strict_free", False)):
+            return None
+    except Exception:
+        return None
+    pool = _free_ip_pool
+    if pool is None or not getattr(pool, "enabled", False):
+        return None
+    try:
+        if getattr(pool, "any_rotation_in_flight", lambda: False)():
+            return None
+    except Exception:
+        return None
+    stations = []
+    for st in getattr(pool, "_stations", None) or []:
+        try:
+            if pool._station_usable(st, exclude_approaching=False):
+                stations.append(st)
+        except Exception:
+            continue
+    if not stations:
+        return None
+    try:
+        base = FREE_MODEL_MAP.get(model_id)
+    except Exception:
+        base = None
+    if not base:
+        if not _is_free_model_route(model_id):
+            return None
+        base = model_id
+    try:
+        chain = _free_candidate_chain(model_id, base) or [base]
+    except Exception:
+        chain = [base]
+    waits: list[float] = []
+    for m in chain:
+        for st in stations:
+            if not _free_cooldown_active(m, st):
+                return None
+            waits.append(_free_cooldown_remaining(m, st))
+    if not waits:
+        return None
+    shortest = min(waits)
+    if shortest < float(min_wait):
+        return None
+    return shortest
+
+
+def _free_preflight_response(wait_s: float, *, anthropic: bool):
+    """429 JSON propre (le seul format qu'un client affiche lisiblement)."""
+    msg = "Free quota exhausted on all VPN stations."
+    try:
+        if wait_s >= 1:
+            msg += f" Retry in {int(wait_s)}s."
+    except Exception:
+        pass
+    resp = (
+        _anthropic_error(429, msg, "rate_limit_error")
+        if anthropic
+        else _openai_error(429, msg, "rate_limit_error")
+    )
+    try:
+        if wait_s >= 1:
+            resp.headers["Retry-After"] = str(int(wait_s))
+    except Exception:
+        pass
+    return resp
+
+
 def _mark_free_stations_429(
     free_model: str,
     retry_after: str = "",
@@ -13098,6 +13195,16 @@ async def messages(request: Request):
     endpoint = cfg["endpoint"]
     protocol = cfg["protocol"]
     _debug(f"[messages] route: {original_model!r} → {model_id} | {protocol} | endpoint={endpoint}")
+
+    # [2026-10-25] Vrai 429 avant ouverture du flux (cf. _free_preflight_retry_after).
+    if bool(body.get("stream")) and not _is_compaction:
+        _pf_wait = _free_preflight_retry_after(model_id)
+        if _pf_wait is not None:
+            _log(
+                f"  [free-preflight] messages 429 : aucune station libre "
+                f"(retry {_pf_wait:.0f}s) model={model_id!r}"
+            )
+            return _free_preflight_response(_pf_wait, anthropic=True)
 
     # [V8.5] Mauvais protocole : `jev-*` et consorts ne sont pas des modèles de
     # chat, ils vivent sur `/inference/v1/systemone` (questions + state). Les
@@ -17065,6 +17172,18 @@ async def chat_completions(request: Request):
     body["model"] = model_id
     is_stream = body.get("stream", False)
 
+    # [2026-10-25] Refus de quota AVANT d'ouvrir le flux : un vrai 429 lisible
+    # au lieu d'un 200 + data:{"error":…}. No-op dès qu'une station peut servir
+    # (voir _free_preflight_retry_after : warmup, rotation, repli payant).
+    if is_stream and not _is_compaction:
+        _pf_wait = _free_preflight_retry_after(model_id)
+        if _pf_wait is not None:
+            _log(
+                f"  [free-preflight] chat 429 : aucune station libre "
+                f"(retry {_pf_wait:.0f}s) model={model_id!r}"
+            )
+            return _free_preflight_response(_pf_wait, anthropic=False)
+
     thinking_raw = body.get("thinking") if isinstance(body.get("thinking"), dict) else {}
     thinking_type = thinking_raw.get("type", "none") if isinstance(thinking_raw, dict) and thinking_raw else "none"
     effort = (
@@ -20514,6 +20633,16 @@ async def responses(request: Request):
     is_stream = body.get("stream", False)
 
     _log(f"→ {original_model!r} → {model_id} | {protocol} | responses | stream={is_stream} | ip={client_ip}")
+
+    # [2026-10-25] Vrai 429 avant ouverture du flux (cf. _free_preflight_retry_after).
+    if is_stream and not _is_compaction:
+        _pf_wait = _free_preflight_retry_after(model_id)
+        if _pf_wait is not None:
+            _log(
+                f"  [free-preflight] responses 429 : aucune station libre "
+                f"(retry {_pf_wait:.0f}s) model={model_id!r}"
+            )
+            return _free_preflight_response(_pf_wait, anthropic=False)
 
     # [Compaction garde opt-in] voir handler messages (warn log / deny 413).
     _huge_level, _huge_msg = _huge_context_verdict(body, body_bytes)

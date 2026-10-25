@@ -387,7 +387,7 @@ verbeuses), pas des reprises : une seule requête a échoué sur 196.
 | SLO health | cibles pilotées par `observability.slo_targets` (12 s / 30 s) + `slo_targets_by_model` | la série `leg_ms` mesure la complétion complète ; `mimo` (raisonnement verbeux) a sa propre cible p95 45 s. Vérifié : `ok` |
 | Comportement | le modèle se comporte en agent de code | conséquence directe du prompt système officiel |
 | Choix d'outil | peut privilégier un outil officiel | observé quand la requête est vide ; avec une entrée valide, l'outil du client est appelé (2/2 mesures) |
-| Erreurs en cours de flux | HTTP 200 déjà engagé | quand toutes les stations sont à quota, le refus part en `data: {"error":…}` (le client affiche le JSON). Un vrai 4xx serait plus lisible mais exigerait un préflight avant ouverture du flux |
+| Erreurs en cours de flux | HTTP 200 déjà engagé | **préflight ajouté le 2026-10-25** : quand aucune station chaude ne peut servir, le client reçoit un vrai `429` + `Retry-After` **avant** l'ouverture du flux. Une erreur qui survient après le début du flux reste en `200 + data:{error}` (inévitable) |
 | Forme `responses` | non couverte par la capture | elle passe aujourd'hui via conversion → chat |
 
 Si un jour un client tiers a besoin de ses propres outils, il faut **mesurer**
