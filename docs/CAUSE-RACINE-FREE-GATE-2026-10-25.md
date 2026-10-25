@@ -314,6 +314,18 @@ pas testé, et ce n'est pas nécessaire au fonctionnement actuel.
 ### Vérification rapide
 
 ```bash
+python scripts/verify_free_leg.py            # 6 contrôles, 3 requêtes
+python scripts/verify_free_leg.py --full     # + outils et raisonnement, 5 requêtes
+```
+
+Le script vérifie le payload officiel, le canary, puis fait de **vrais appels**
+sur les trois protocoles (prompts uniques pour ne pas être servi par le cache).
+Sortie : tableau PASS/FAIL, code de sortie 1 au premier échec — utilisable en
+supervision.
+
+Contrôle manuel équivalent, sur un seul endpoint :
+
+```bash
 curl -s http://127.0.0.1:4000/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{"model":"deepseek-v4.1-flash-free","messages":[{"role":"user","content":"Dis OK"}],"max_tokens":8}'
