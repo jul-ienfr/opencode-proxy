@@ -3376,16 +3376,17 @@ def register_dashboard(
             if "enabled" in _lr and not isinstance(_lr["enabled"], bool):
                 return JSONResponse(status_code=400, content={"error": "latency_rotation.enabled doit être booléen"})
 
-        # [free_parallel] validate nested + flat keys
+        # [free_parallel] type check only — PAS de normalisation ici.
+        # `_normalize_free_parallel` remplit les clés absentes avec leurs
+        # DÉFAUTS ; appliqué à un patch partiel {enabled,routing,mode}, il
+        # fabriquait un hedge_delay_ms=400 qui écrasait ensuite la valeur
+        # existante (1500) lors de la fusion dans `_persist_vpn_config`.
+        # Mesuré le 2026-10-25 : un simple toggle GUI faisait 1500 -> 400.
+        # La normalisation (et donc la validation des valeurs) reste faite
+        # sur le dictionnaire FUSIONNÉ, dans `_persist_vpn_config`.
         if "free_parallel" in body:
             if not isinstance(body["free_parallel"], dict):
                 return {"error": "free_parallel doit être un objet"}
-            try:
-                import config.settings as _st_fp
-
-                body["free_parallel"] = _st_fp._normalize_free_parallel(body["free_parallel"])
-            except Exception as e:
-                return {"error": f"free_parallel invalide : {e}"}
         for _fk in (
             "free_parallel_enabled",
             "free_parallel_routing",
