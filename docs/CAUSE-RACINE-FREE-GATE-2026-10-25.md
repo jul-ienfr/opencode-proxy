@@ -228,6 +228,17 @@ non-stream : tool_calls -> {"name":"get_weather","arguments":"{\"city\": \"Paris
              finish_reason = tool_calls
 ```
 
+### Validation du chemin réel (2026-10-25)
+
+- **Client officiel via le proxy** : `opencode` 1.18.31 configuré sur
+  `baseURL = http://127.0.0.1:4000/v1`, `opencode run` → `OK`. Requête
+  enregistrée `success=1`, `is_stream=1`, `tools` = les 10 officiels : le
+  payload complet traverse le proxy en passthrough.
+- **Façade Anthropic** `/v1/messages` avec un outil client : `200`,
+  `stop_reason="tool_use"`, bloc `tool_use` `{"city":"Paris"}`.
+- **Client tiers réel à 22 outils** (`browser_exec`, `terminal`, …) : `200`
+  (10 officiels + 22 extras = 32 outils). La fusion tient à l'échelle.
+
 ## 8. Coût et limites
 
 | Point | Valeur | Commentaire |
@@ -236,6 +247,7 @@ non-stream : tool_calls -> {"name":"get_weather","arguments":"{\"city\": \"Paris
 | Cache | 11 008 tokens cachés | le prompt est stable → coût réel faible |
 | Outils du client | **fusionnés** après les 10 officiels | le *function calling* tiers est préservé (mesuré : extras acceptés) |
 | `tool_calls` non-stream | recomposés depuis le SSE | bug corrigé le 2026-10-25 : ils étaient jetés, message vide |
+| Latence observée | p50 4,4 s (deepseek), 8,1 s (glm), 11,4 s (mimo) | complétion entière avec ~11k tokens d'entrée ; le SLO `p50 < 4 s` du health vise le TTFT, pas la génération |
 | Comportement | le modèle se comporte en agent de code | conséquence directe du prompt système officiel |
 | Forme `responses` | non couverte par la capture | elle passe aujourd'hui via conversion → chat |
 
