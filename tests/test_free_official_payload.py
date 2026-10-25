@@ -202,6 +202,8 @@ def test_le_collecteur_accepte_le_dialecte_reasoning():
     msg = out["choices"][0]["message"]
     assert msg["reasoning_content"] == "je calcule 17*23"
     assert msg["content"] == "391"
+    # Parité OpenRouter : le détail est restitué aussi en non-stream.
+    assert msg["reasoning_details"] == [{"type": "reasoning.text", "text": "je calcule 17*23"}]
 
 
 def test_le_normaliseur_de_chunk_ajoute_l_alias_sans_ecraser():

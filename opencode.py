@@ -5571,6 +5571,7 @@ def _collect_chat_completion(lines, model) -> dict | None:
     """
     content, finish, usage = [], None, {}
     reasoning: list[str] = []
+    details_seen = False
     tool_calls: dict[int, dict] = {}
     for ev in _iter_sse_data(lines):
         if not isinstance(ev, dict):
@@ -5596,12 +5597,15 @@ def _collect_chat_completion(lines, model) -> dict | None:
                     if not (isinstance(alt, str) and alt):
                         det = d.get("reasoning_details")
                         if isinstance(det, list):
+                            details_seen = True
                             alt = "".join(
                                 p.get("text", "")
                                 for p in det
                                 if isinstance(p, dict) and isinstance(p.get("text"), str)
                             )
                     rc = alt
+                elif isinstance(d.get("reasoning_details"), list):
+                    details_seen = True
                 if isinstance(rc, str) and rc:
                     reasoning.append(rc)
                 for tc in d.get("tool_calls") or []:
@@ -5641,6 +5645,13 @@ def _collect_chat_completion(lines, model) -> dict | None:
     if reasoning:
         # Parité DeepSeek/mimo : le raisonnement est un champ du message.
         message["reasoning_content"] = "".join(reasoning)
+        # [2026-10-25] Dialecte OpenRouter : quand l'amont a émis
+        # `reasoning_details`, on le restitue aussi (forme compacte, un seul
+        # bloc avec le texte complet) — les SDK OpenRouter le lisent.
+        if details_seen:
+            message["reasoning_details"] = [
+                {"type": "reasoning.text", "text": message["reasoning_content"]}
+            ]
     if tool_calls:
         ordered = [tool_calls[i] for i in sorted(tool_calls)]
         for tc in ordered:
