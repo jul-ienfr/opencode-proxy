@@ -247,8 +247,12 @@ reasoning    : "The user asks in French: 'How much is 17*23?' ..."
   `stop_reason="tool_use"`, bloc `tool_use` `{"city":"Paris"}`.
 - **Façade Responses** `/v1/responses` avec un outil client : `200`,
   item `function_call` correctement formé (`call_id`, `name`, `arguments`).
-  À noter : sur ce cas, le modèle a choisi `bash` (outil officiel) plutôt que
-  `get_weather` — le prompt système officiel l'oriente vers l'agent de code.
+  Bug corrigé le 2026-10-25 : les formes courtes `"input": "texte"` et
+  `"content": "texte"` étaient **perdues** (la boucle itérait la chaîne
+  caractère par caractère) — le modèle recevait une requête vide et
+  répondait « Bonjour, comment puis-je vous aider ? ». Après normalisation,
+  les trois formes d'`input` donnent la même réponse et l'outil du client est
+  bien appelé.
 - **Tour d'agent complet via le client officiel** : « combien de `.py` dans le
   dossier ? » → le client appelle `Glob "*.py"` (2 matches), exécute l'outil,
   renvoie le résultat au modèle, réponse finale `2`. La boucle complète
@@ -268,7 +272,7 @@ reasoning    : "The user asks in French: 'How much is 17*23?' ..."
 | Latence observée | p50 4,4 s (deepseek), 8,1 s (glm), 11,4 s (mimo) | complétion entière avec ~11k tokens d'entrée ; le SLO `p50 < 4 s` du health vise le TTFT, pas la génération |
 | SLO health | cibles pilotées par `observability.slo_targets` (12 s / 30 s) | la série `leg_ms` mesure la complétion complète ; vérifié après réglage : `ok`, p50 1,95 s |
 | Comportement | le modèle se comporte en agent de code | conséquence directe du prompt système officiel |
-| Choix d'outil | peut privilégier un outil officiel | mesuré : `bash` choisi au lieu de `get_weather` sur `/v1/responses` ; les outils client restent disponibles |
+| Choix d'outil | peut privilégier un outil officiel | observé quand la requête est vide ; avec une entrée valide, l'outil du client est appelé (2/2 mesures) |
 | Erreurs en cours de flux | HTTP 200 déjà engagé | quand toutes les stations sont à quota, le refus part en `data: {"error":…}` (le client affiche le JSON). Un vrai 4xx serait plus lisible mais exigerait un préflight avant ouverture du flux |
 | Forme `responses` | non couverte par la capture | elle passe aujourd'hui via conversion → chat |
 

@@ -2783,12 +2783,41 @@ def _responses_part_to_anthropic(part: dict) -> dict | None:
 
 
 def openai_responses_to_anthropic(body: dict) -> dict:
-    """Convert OpenAI Responses API request → Anthropic Messages format."""
+    """Convert OpenAI Responses API request → Anthropic Messages format.
+
+    [2026-10-25] Deux formes très répandues étaient silencieusement PERDUES :
+      * ``"input": "texte"`` (raccourci d'une requête utilisateur) — la boucle
+        itérait la chaîne caractère par caractère, chacun écarté par le test
+        ``isinstance(item, dict)``, donc zéro message ;
+      * ``"content": "texte"`` dans un item — même effet.
+    Résultat mesuré : le modèle recevait une requête vide et répondait
+    « Bonjour, comment puis-je vous aider ? ». On normalise les deux formes
+    en amont de la boucle.
+    """
+    _raw_input = body.get("input", [])
+    if isinstance(_raw_input, str):
+        _raw_input = [{"role": "user", "content": _raw_input}] if _raw_input else []
+    elif not isinstance(_raw_input, list):
+        _raw_input = []
+    _norm_input: list = []
+    for _it in _raw_input:
+        if (
+            isinstance(_it, dict)
+            and _it.get("role")
+            and isinstance(_it.get("content"), str)
+        ):
+            _txt = _it["content"]
+            _it = {
+                **_it,
+                "content": [{"type": "input_text", "text": _txt}] if _txt else [],
+            }
+        _norm_input.append(_it)
+
     system_text = ""
     pending_tool_results: list = []
     anthro_messages: list = []
 
-    for item in body.get("input", []):
+    for item in _norm_input:
         if not isinstance(item, dict):
             continue
         role = item.get("role", item.get("type", "user"))
