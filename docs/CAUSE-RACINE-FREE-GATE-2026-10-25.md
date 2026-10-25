@@ -252,6 +252,37 @@ perdaient le raisonnement : le modèle avait répondu sans raisonner sur cet
 appel. La matrice ci-dessus a été refaite avec un prompt qui l'oblige à
 détailler son calcul, trois fois de suite.
 
+### Dialecte du raisonnement, mesuré modèle par modèle (2026-10-25)
+
+Les amonts free n'écrivent pas tous le raisonnement dans le même champ :
+
+| Modèle | Champ émis | `reasoning_options` (models.dev) |
+|---|---|---|
+| `deepseek-v4.1-flash-free` | `reasoning_content` | `toggle` + `effort` (low/high/max) |
+| `glm-5.3-flash-free` | `reasoning_content` | `effort` (low/high/max) |
+| `deepseek-v4-flash-free` | `reasoning_content` | `effort` |
+| `mimo-v2.6-flash-free` | **`reasoning` + `reasoning_details[]`** | *(aucune : toujours actif)* |
+| `nemotron-3.5-lightning-free` | **`reasoning` + `reasoning_details[]`** | *(aucune : toujours actif)* |
+| `big-pickle` | `reasoning_content` | *(aucune)* |
+
+Ce que fait le client officiel 1.18.31 (fonction extraite du binaire, verbatim) :
+
+```
+reasoning_options absent  -> aucun paramètre
+reasoning_options = []    -> aucun paramètre (raisonnement toujours actif)
+effort présent            -> reasoning_effort (low/high/max)
+toggle seul               -> rien pour @ai-sdk/openai-compatible
+```
+
+Et le parseur 1.19.3 ne lit **que** `delta.reasoning_content` : un modèle qui
+répond `reasoning` seul verrait son raisonnement invisible.
+
+Le proxy accepte donc les deux dialectes : `_normalize_chat_reasoning_chunk`
+ajoute `reasoning_content` depuis `reasoning`/`reasoning_details` **sans
+retirer** les champs d'origine (les clients OpenRouter, eux, lisent
+`reasoning`/`reasoning_details`). Le collecteur non-stream applique la même
+règle.
+
 ### Validation du chemin réel (2026-10-25)
 
 - **Client officiel via le proxy** : `opencode` 1.18.31 configuré sur

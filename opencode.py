@@ -5516,6 +5516,48 @@ def _iter_sse_data(lines):
             continue
 
 
+def _normalize_chat_reasoning_chunk(chunk: dict) -> bool:
+    """Ajoute ``delta.reasoning_content`` depuis les autres dialectes.
+
+    Les amonts free ne parlent pas le même dialecte :
+      * deepseek / glm / big-pickle -> ``reasoning_content`` ;
+      * mimo / nemotron             -> ``reasoning`` (+ ``reasoning_details[]``,
+        style OpenRouter).
+
+    Le client officiel 1.19.3 ne lit QUE ``delta.reasoning_content``. On
+    AJOUTE donc l'alias sans retirer les champs d'origine (les clients
+    OpenRouter, eux, lisent ``reasoning``/``reasoning_details``).
+
+    Rend True si un alias a été ajouté. Ne lève jamais.
+    """
+    changed = False
+    try:
+        if not isinstance(chunk, dict):
+            return False
+        for ch in chunk.get("choices") or []:
+            d = ch.get("delta") if isinstance(ch, dict) else None
+            if not isinstance(d, dict):
+                continue
+            cur = d.get("reasoning_content")
+            if isinstance(cur, str) and cur:
+                continue
+            alt = d.get("reasoning")
+            if not (isinstance(alt, str) and alt):
+                det = d.get("reasoning_details")
+                if isinstance(det, list):
+                    alt = "".join(
+                        p.get("text", "")
+                        for p in det
+                        if isinstance(p, dict) and isinstance(p.get("text"), str)
+                    )
+            if isinstance(alt, str) and alt:
+                d["reasoning_content"] = alt
+                changed = True
+    except Exception:
+        return changed
+    return changed
+
+
 def _collect_chat_completion(lines, model) -> dict | None:
     """Reconstitue un chat.completion JSON depuis des chunks SSE OpenAI.
 
@@ -5545,7 +5587,21 @@ def _collect_chat_completion(lines, model) -> dict | None:
                 # voyage dans delta.reasoning_content : il était jeté, donc un
                 # client non-stream ne recevait que la réponse finale. Or
                 # l'amont EXIGE qu'il soit renvoyé au tour suivant.
+                # Tous les amonts ne parlent pas le même dialecte :
+                # deepseek/glm -> reasoning_content ; mimo/nemotron ->
+                # reasoning + reasoning_details[]. On accepte les deux.
                 rc = d.get("reasoning_content")
+                if not (isinstance(rc, str) and rc):
+                    alt = d.get("reasoning")
+                    if not (isinstance(alt, str) and alt):
+                        det = d.get("reasoning_details")
+                        if isinstance(det, list):
+                            alt = "".join(
+                                p.get("text", "")
+                                for p in det
+                                if isinstance(p, dict) and isinstance(p.get("text"), str)
+                            )
+                    rc = alt
                 if isinstance(rc, str) and rc:
                     reasoning.append(rc)
                 for tc in d.get("tool_calls") or []:
@@ -17956,12 +18012,25 @@ async def chat_completions(request: Request):
                         _done_emitted = False
 
                         def _enrich_chunk(_c):
-                            """Ajoute id/object/created/model absents d'un delta."""
+                            """Ajoute id/object/created/model absents d'un delta.
+
+                            [2026-10-25] Normalise AUSSI le raisonnement. Les
+                            amonts free ne parlent pas le même dialecte :
+                              * deepseek / glm / big-pickle -> ``reasoning_content``
+                              * mimo / nemotron             -> ``reasoning``
+                                + ``reasoning_details[]`` (style OpenRouter)
+                            Le client officiel 1.19.3 ne lit QUE
+                            ``delta.reasoning_content`` : sans cet alias, le
+                            raisonnement de mimo/nemotron est invisible. On
+                            AJOUTE l'alias sans retirer les champs d'origine
+                            (les clients OpenRouter les utilisent).
+                            """
                             if isinstance(_c, dict) and _c.get("choices"):
                                 _c.setdefault("id", _out_id_meta)
                                 _c.setdefault("object", "chat.completion.chunk")
                                 _c.setdefault("created", _out_created_meta)
                                 _c.setdefault("model", original_model)
+                                _normalize_chat_reasoning_chunk(_c)
                             return _c
 
                         def _usage_frame() -> bytes:

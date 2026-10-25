@@ -186,3 +186,43 @@ def test_le_collecteur_non_stream_conserve_le_raisonnement():
     msg = out["choices"][0]["message"]
     assert msg["content"] == "391 !"
     assert msg["reasoning_content"] == "17*23 = 391."
+
+
+def test_le_collecteur_accepte_le_dialecte_reasoning():
+    """mimo/nemotron émettent `reasoning` + `reasoning_details`, pas
+    `reasoning_content`. Mesuré en direct sur l'amont le 2026-10-25."""
+    lines = [
+        'data: {"choices":[{"delta":{"reasoning":"je "}}]}',
+        'data: {"choices":[{"delta":{"reasoning":"calcule"}}]}',
+        'data: {"choices":[{"delta":{"reasoning_details":[{"type":"reasoning.text","text":" 17*23"}]}}]}',
+        'data: {"choices":[{"delta":{"content":"391"},"finish_reason":"stop"}]}',
+        "data: [DONE]",
+    ]
+    out = oc._collect_chat_completion(lines, "m")
+    msg = out["choices"][0]["message"]
+    assert msg["reasoning_content"] == "je calcule 17*23"
+    assert msg["content"] == "391"
+
+
+def test_le_normaliseur_de_chunk_ajoute_l_alias_sans_ecraser():
+    chunk = {
+        "choices": [
+            {"delta": {"reasoning": "abc", "reasoning_details": [{"text": "abc"}]}}
+        ]
+    }
+    assert oc._normalize_chat_reasoning_chunk(chunk) is True
+    d = chunk["choices"][0]["delta"]
+    assert d["reasoning_content"] == "abc"
+    # Les champs d'origine restent intacts (clients OpenRouter).
+    assert d["reasoning"] == "abc"
+    assert d["reasoning_details"] == [{"text": "abc"}]
+
+    # Déjà présent : jamais écrasé.
+    chunk2 = {"choices": [{"delta": {"reasoning_content": "officiel", "reasoning": "autre"}}]}
+    assert oc._normalize_chat_reasoning_chunk(chunk2) is False
+    assert chunk2["choices"][0]["delta"]["reasoning_content"] == "officiel"
+
+
+def test_le_normaliseur_ignore_les_chunks_sans_raisonnement():
+    assert oc._normalize_chat_reasoning_chunk({"choices": [{"delta": {"content": "x"}}]}) is False
+    assert oc._normalize_chat_reasoning_chunk({}) is False
