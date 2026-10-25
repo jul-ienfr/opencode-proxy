@@ -232,6 +232,12 @@ models:
     protocol: anthropic
   kimi-k3.1-pro:
     protocol: openai
+  iceman-contributor-free:
+    protocol: openai
+  gemini-4-argon:
+    protocol: openai
+  flint-40b-free:
+    protocol: openai
 free_model_map:
   mimo-v2.5: mimo-v2.6-flash-free
   qwen3.7-max: mimo-v2.6-flash-free

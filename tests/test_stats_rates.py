@@ -115,7 +115,16 @@ class TestPeriodMinutes:
         today = now.astimezone().strftime("%Y-%m-%d")
         minutes = _period_minutes(today, today, now)
         assert minutes is not None
-        elapsed = (now - now.astimezone().replace(hour=0, minute=0, second=0, microsecond=0)).total_seconds() / 60.0
+        # [2026-10-25] Minuit local doit être calculé avec le décalage EN
+        # VIGUEUR À MINUIT, pas celui de maintenant : le 25/10 est le jour du
+        # changement d'heure en Europe (02:00→01:00). `astimezone()` sur un
+        # datetime naïf applique la règle DST correcte ; un `.replace(hour=0)`
+        # sur un datetime déjà aware garderait le décalage courant et
+        # fabriquerait un minuit faux d'une heure.
+        local_midnight = datetime.fromisoformat(
+            now.astimezone().strftime("%Y-%m-%d") + "T00:00:00"
+        ).astimezone(UTC)
+        elapsed = (now - local_midnight).total_seconds() / 60.0
         assert abs(minutes - elapsed) < 1.0
 
     def test_full_past_day_is_1440_minutes(self):

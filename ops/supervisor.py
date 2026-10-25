@@ -86,6 +86,24 @@ class StationSupervisor:
     # default_factory → compat build_supervisors/sync_supervisors inchangée.
     restart_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
+    #: [2026-10-25] Borne mémoire sur la vitrine locale des trackers.
+    #: Chaque IP vue crée une entrée ; sans plafond, un proxy qui tourne des
+    #: jours avec des rotations régulières accumule indéfiniment (constaté :
+    #: 40 IP → 40 entrées, la borne du §4 Lot 1 avait sauté à la refonte
+    #: moteur du 24/10 qui a fait de `ip_latency` une simple vitrine).
+    MAX_IP_TRACKERS: int = 30
+
+    def _remember_tracker(self, ip: str, tr: IpLatencyTracker) -> None:
+        """Mémorise le tracker en gardant les N IP les plus récentes."""
+        self.ip_latency[ip] = tr
+        surplus = len(self.ip_latency) - self.MAX_IP_TRACKERS
+        if surplus > 0:
+            # dict ordonné par insertion : les plus anciennes partent d'abord.
+            for old in list(self.ip_latency.keys())[:surplus]:
+                if old == ip:
+                    continue
+                self.ip_latency.pop(old, None)
+
     # ── cycle de vie (délégation pure) ────────────────────────────────
 
     async def start(self) -> None:
@@ -169,9 +187,9 @@ class StationSupervisor:
         try:
             from latency_rotation import get_engine as _ge
             tr = _ge().tracker_for(self.station, ip)
-            # Réconcilie la vitrine locale sur l'instance moteur.
+            # Réconcilie la vitrine locale sur l'instance moteur (bornée).
             try:
-                self.ip_latency[ip] = tr
+                self._remember_tracker(ip, tr)
             except Exception:
                 pass
             return tr
@@ -181,7 +199,7 @@ class StationSupervisor:
             if cached is not None:
                 return cached
             tr = IpLatencyTracker(station=self.station, ip=ip)
-            self.ip_latency[ip] = tr
+            self._remember_tracker(ip, tr)
             return tr
 
     def on_ip_finalized(self, new_ip: str) -> None:

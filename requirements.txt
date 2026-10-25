@@ -4,6 +4,10 @@
 # or `uv pip compile requirements.in --generate-hashes -o requirements.txt`
 fastapi==0.141.1
 starlette==1.6.0
+# [2026-10-25] requis par POST /api/vpn/upload-config (request.form()).
+# Sans lui, l'upload .ovpn du dashboard lève « python-multipart must be
+# installed » à l'exécution — dépendance transitive de FastAPI non installée.
+python-multipart==0.0.32
 uvicorn[standard]==0.41.0
 httpx[socks,http2]==0.28.1
 rich==14.3.3

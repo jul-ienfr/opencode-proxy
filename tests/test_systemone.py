@@ -51,6 +51,17 @@ class _FakeClient:
 def client(monkeypatch):
     fake = _FakeClient()
     monkeypatch.setattr(oc, "_ensure_http_client", lambda: fake)
+
+    # [2026-10-25] La jambe free SystemOne passe désormais par un tunnel
+    # (enforce_vpn_only) : le process de test n'a pas de station, donc le
+    # chemin direct est refusé 503. On remplace le transport — pas le wire —
+    # pour continuer à vérifier exactement ce qui part sur le fil.
+    async def _free_via_pool(endpoint, body, headers, forced_pool=None, req_id=None):
+        # Délègue au même faux client : les tests qui remplacent `fake.post`
+        # (ex. 402 amont) gardent leur comportement.
+        return await fake.post(endpoint, content=json.dumps(body), headers=headers)
+
+    monkeypatch.setattr(oc, "_systemone_free_via_pool", _free_via_pool)
     # Silence DB + logs (pas de touch requests.db live)
     monkeypatch.setattr(oc, "_save_and_log_request", _noop_save())
     monkeypatch.setattr(oc, "_log_and_save_error", _noop_err())

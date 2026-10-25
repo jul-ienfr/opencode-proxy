@@ -230,9 +230,13 @@ def assert_official_free_identity(label, headers):
     assert headers.get("authorization") == "Bearer public", (
         f"{label}: Authorization must be exactly 'Bearer public', got {headers.get('authorization')!r}"
     )
-    assert headers.get("user-agent") == oc._OPENCODE_OFFICIAL_UA, (
-        f"{label}: official UA expected, got {headers.get('user-agent')!r}"
-    )
+    # [2026-10-25] L'UA dépend de l'identité par IP (vault) : 1.18.31 et 1.19.3
+    # n'ont pas le même suffixe provider-utils/runtime. On vérifie la FORME
+    # officielle, pas une version figée.
+    ua = headers.get("user-agent") or ""
+    assert re.match(
+        r"^opencode/\d+\.\d+\.\d+ ai-sdk/provider-utils/\d+\.\d+\.\d+ runtime/bun/", ua
+    ), f"{label}: official UA expected, got {ua!r}"
     # [ALIGNEMENT 2026-10-20] Wire officiel 1.19.3 : l'identité de session est
     # portée par x-opencode-session-id / x-session-affinity / x-session-id
     # (même valeur). Le quartet 1.18.x (client/project/request/session) n'est
@@ -602,6 +606,12 @@ async def test_open_free_stream_count_false_empty_attempt_direct_fallback(free_e
     fake_client = _FakeHttpxClient()
     monkeypatch.setattr(oc, "_free_ip_pool", _StubPoolNeverCount())
     monkeypatch.setattr(oc, "_client", fake_client)
+    # [2026-10-25] Ce test décrit le repli DIRECT : il doit donc forcer
+    # proxy_mode=direct. Sans cela, il passait seul mais échouait dans la
+    # suite dès qu'un autre test avait initialisé un VPN manager (proxy_mode
+    # vpn → repli direct interdit, 503 honnête). Dépendance d'ordre, pas de
+    # comportement.
+    monkeypatch.setattr(oc, "_free_proxy_mode", lambda: "direct")
 
     oc._current_free_attempt.set({})
     try:
@@ -621,7 +631,14 @@ async def test_open_free_stream_count_false_empty_attempt_direct_fallback(free_e
     assert method == "POST"
     assert url == oc.API_BASE_FREE
     # [gate 2026-09-17] Direct path stamped the official identity (invariant A.0)
-    assert kwargs["headers"].get("User-Agent") == oc._OPENCODE_OFFICIAL_UA
+    # [2026-10-25] L'UA dépend de l'identité par IP (vault) : 1.18.31 et 1.19.3
+    # n'ont pas le même suffixe provider-utils/runtime. On vérifie donc la
+    # FORME officielle, pas une version figée — le test doit rester stable
+    # quand le vault tire l'une ou l'autre.
+    ua = kwargs["headers"].get("User-Agent") or ""
+    assert re.match(
+        r"^opencode/\d+\.\d+\.\d+ ai-sdk/provider-utils/\d+\.\d+\.\d+ runtime/bun/", ua
+    ), ua
     assert kwargs["headers"].get("Authorization") == "Bearer public"
     # Retry state: station None → the next attempt also falls back direct
     assert attempt.get("station") is None

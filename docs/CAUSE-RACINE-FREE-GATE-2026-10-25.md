@@ -236,6 +236,19 @@ curl -s http://127.0.0.1:4000/v1/chat/completions \
 
 Attendu : `200` avec `"content":"OK"`.
 
+### Vérification continue (canary)
+
+Le proxy sonde déjà la jambe free en continu (`_free_canary_loop`) :
+
+```bash
+curl -s "http://127.0.0.1:4000/health?detail=full" | python -c "import json,sys; print(json.load(sys.stdin)['canary']['probes'])"
+# {'free.chat': {'verdict': 'ok', 'ok_rate': 1.0, ...}, 'free.messages': {...}}
+```
+
+Le 2026-10-25 après correctif : `free.chat` **10/10** et `free.messages`
+**10/10**, verdict `ok`. Si le gate change encore, ce canary passera en
+`failing` en quelques cycles — sans attendre qu'un utilisateur se plaigne.
+
 ### Régénérer la capture (si le client officiel évolue)
 
 ```bash
