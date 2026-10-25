@@ -353,10 +353,19 @@ class IpIdentity:
 class IdentityVault:
     """Registre des identités par IP (1 IP = 1 installation)."""
 
+    #: [2026-10-25] Plafond mémoire/disque. Le vault créait une identité (et
+    #: un fichier) par IP vue, à vie : 548 fichiers après quelques jours de
+    #: rotation. `prune()` existait mais n'était appelé nulle part. On borne
+    #: à l'insertion : les plus anciennes sont oubliées (fichier supprimé) ;
+    #: une IP revue plus tard repart sur une identité neuve, ce qui est sans
+    #: effet fonctionnel (le but est la distinction, pas la stabilité).
+    MAX_IDS = 512
+
     def __init__(self, base_project: str = "", forced_client: str = "", forced_version: str = ""):
         self._lock = threading.Lock()
         self._ids: dict[str, IpIdentity] = {}
         self._gen: dict[str, int] = {}
+        self._max_ids = self.MAX_IDS
         self._base_project = base_project or ""
         self._forced_client = forced_client if forced_client in KNOWN_CLIENT_NAMES else ""
         self._forced_version = forced_version if forced_version in KNOWN_CLIENT_VERSIONS else ""
@@ -410,7 +419,42 @@ class IdentityVault:
                     except Exception:
                         pass
                 self._ids[key] = ident
+                self._enforce_cap_locked(keep=key)
             return ident
+
+    def _forget(self, key: str) -> None:
+        """Oublie une IP : entrée mémoire + fichier d'identité (fail-soft)."""
+        ident = self._ids.pop(key, None)
+        self._gen.pop(key, None)
+        path = getattr(ident, "_file", "") if ident is not None else ""
+        if not path:
+            path = os.path.join(_identities_dir(), _safe_filename(key) + ".json")
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        except Exception:
+            pass
+
+    def _enforce_cap_locked(self, keep: str = "") -> None:
+        """Évince les identités les plus anciennes au-delà du plafond.
+
+        Appelé sous `self._lock` (dict ordonné par insertion). `keep` n'est
+        jamais évincé : c'est l'IP de la requête en cours.
+        """
+        try:
+            surplus = len(self._ids) - int(self._max_ids)
+        except Exception:
+            return
+        if surplus <= 0:
+            return
+        for old in list(self._ids.keys()):
+            if surplus <= 0:
+                break
+            if old == keep:
+                continue
+            self._forget(old)
+            surplus -= 1
 
     def rotate_installation(self, ip: str) -> dict:
         """Nouvelle installation sur la MÊME IP, SANS toucher au tunnel.
@@ -461,14 +505,51 @@ class IdentityVault:
         except Exception:
             return {"ip": ip or "direct"}
 
+    def cleanup_stale_files(self, max_age_days: float = 14.0) -> int:
+        """Supprime les fichiers d'identité plus vieux que N jours.
+
+        [2026-10-25] Les fichiers des IP jamais revues ne sont jamais chargés
+        en mémoire, donc `_enforce_cap_locked` ne peut pas les évincer : sans
+        ce balayage, `logs/identities/` grossit indéfiniment (548 fichiers
+        constatés). Une IP revue après le délai repart sur une identité
+        neuve — sans effet fonctionnel.
+        """
+        removed = 0
+        cutoff = time.time() - max(0.0, float(max_age_days)) * 86400.0
+        try:
+            base_dir = _identities_dir()
+            for name in os.listdir(base_dir):
+                if not name.endswith(".json"):
+                    continue
+                path = os.path.join(base_dir, name)
+                try:
+                    if os.path.getmtime(path) >= cutoff:
+                        continue
+                    os.remove(path)
+                    removed += 1
+                except OSError:
+                    continue
+        except Exception:
+            pass
+        return removed
+
     def prune(self, active_ips: set[str], max_ids: int = 512) -> int:
-        """Évince les identités hors fenêtre (IPs plus vues)."""
+        """Évince les identités hors fenêtre (IPs plus vues).
+
+        Supprime aussi le fichier correspondant : sinon le dossier
+        `logs/identities/` grossit indéfiniment (548 fichiers constatés le
+        2026-10-25). Rend le nombre d'entrées oubliées.
+        """
         with self._lock:
             stale = [k for k in self._ids if k not in active_ips]
             for k in stale:
-                self._ids.pop(k, None)
-            while len(self._ids) > max(64, int(max_ids)):
-                self._ids.pop(next(iter(self._ids)))
+                self._forget(k)
+            try:
+                cap = max(64, int(max_ids))
+            except Exception:
+                cap = 512
+            while len(self._ids) > cap:
+                self._forget(next(iter(self._ids)))
             return len(stale)
 
 
@@ -485,6 +566,13 @@ def get_vault(base_project: str = "", forced_client: str = "", forced_version: s
     with _VAULT_LOCK:
         if _VAULT is None:
             _VAULT = IdentityVault(base_project, forced_client, forced_version)
+            # [2026-10-25] Balayage unique au boot : les fichiers des IP
+            # jamais revues ne sont jamais chargés, donc jamais évincés par
+            # le plafond mémoire. Coût : un listdir + stat sur ~550 fichiers.
+            try:
+                _VAULT.cleanup_stale_files()
+            except Exception:
+                pass
         elif base_project or forced_client or forced_version:
             _VAULT.configure(base_project, forced_client, forced_version)
         return _VAULT
