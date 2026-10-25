@@ -283,6 +283,24 @@ retirer** les champs d'origine (les clients OpenRouter, eux, lisent
 `reasoning`/`reasoning_details`). Le collecteur non-stream applique la même
 règle.
 
+### Paramètres d'activation : mesurés, tous tolérés
+
+Envoyés à l'amont sur `deepseek-v4.1`, `glm-5.3` et `mimo-v2.6` : rien,
+`reasoning_effort: "high"`, `thinking: {"type":"enabled"}`,
+`enable_thinking: true`. **200 partout**, raisonnement présent quand le
+prompt l'exige.
+
+Conclusion : aucun paramètre n'est requis ni rejeté ; le raisonnement est
+actif par défaut. Le proxy ne force donc rien et laisse passer ce que le
+client envoie. Le seul point dur reste l'historique : `deepseek` exige
+`reasoning_content` sur chaque message assistant (rempli à `" "` par
+`ensure_deepseek_reasoning`), tandis que `glm` et `mimo` acceptent son
+absence — mesuré sur un tour assistant rejoué, avec et sans le champ.
+
+À noter : `deepseek-v4.1` ne raisonne pas sur une question triviale
+(« 17*23 ») — d'où les faux négatifs des premiers tests. Sur une demande qui
+impose de détailler, il émet bien `reasoning_content`.
+
 ### Validation du chemin réel (2026-10-25)
 
 - **Client officiel via le proxy** : `opencode` 1.18.31 configuré sur
