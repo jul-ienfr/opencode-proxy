@@ -228,6 +228,15 @@ non-stream : tool_calls -> {"name":"get_weather","arguments":"{\"city\": \"Paris
              finish_reason = tool_calls
 ```
 
+Et le raisonnement, qui était également jeté en non-stream (mesuré sur
+`mimo-v2.6-flash-free`, `delta.reasoning_content`) :
+
+```
+clés message : ['role', 'content', 'reasoning_content']
+content      : "391"
+reasoning    : "The user asks in French: 'How much is 17*23?' ..."
+```
+
 ### Validation du chemin réel (2026-10-25)
 
 - **Client officiel via le proxy** : `opencode` 1.18.31 configuré sur
@@ -247,6 +256,7 @@ non-stream : tool_calls -> {"name":"get_weather","arguments":"{\"city\": \"Paris
 | Cache | 11 008 tokens cachés | le prompt est stable → coût réel faible |
 | Outils du client | **fusionnés** après les 10 officiels | le *function calling* tiers est préservé (mesuré : extras acceptés) |
 | `tool_calls` non-stream | recomposés depuis le SSE | bug corrigé le 2026-10-25 : ils étaient jetés, message vide |
+| `reasoning_content` non-stream | recomposé depuis le SSE | bug corrigé le 2026-10-25 : mimo et deepseek l'émettent, il était jeté |
 | Latence observée | p50 4,4 s (deepseek), 8,1 s (glm), 11,4 s (mimo) | complétion entière avec ~11k tokens d'entrée ; le SLO `p50 < 4 s` du health vise le TTFT, pas la génération |
 | Comportement | le modèle se comporte en agent de code | conséquence directe du prompt système officiel |
 | Forme `responses` | non couverte par la capture | elle passe aujourd'hui via conversion → chat |

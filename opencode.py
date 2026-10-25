@@ -5528,6 +5528,7 @@ def _collect_chat_completion(lines, model) -> dict | None:
     `arguments` fragmentés sur les suivants, à concaténer).
     """
     content, finish, usage = [], None, {}
+    reasoning: list[str] = []
     tool_calls: dict[int, dict] = {}
     for ev in _iter_sse_data(lines):
         if not isinstance(ev, dict):
@@ -5540,6 +5541,13 @@ def _collect_chat_completion(lines, model) -> dict | None:
                 t = d.get("content")
                 if isinstance(t, str) and t:
                     content.append(t)
+                # [2026-10-25] Le raisonnement (DeepSeek/mimo « thinking »)
+                # voyage dans delta.reasoning_content : il était jeté, donc un
+                # client non-stream ne recevait que la réponse finale. Or
+                # l'amont EXIGE qu'il soit renvoyé au tour suivant.
+                rc = d.get("reasoning_content")
+                if isinstance(rc, str) and rc:
+                    reasoning.append(rc)
                 for tc in d.get("tool_calls") or []:
                     if not isinstance(tc, dict):
                         continue
@@ -5574,6 +5582,9 @@ def _collect_chat_completion(lines, model) -> dict | None:
     if not content and not finish and not usage and not tool_calls:
         return None
     message: dict = {"role": "assistant", "content": "".join(content)}
+    if reasoning:
+        # Parité DeepSeek/mimo : le raisonnement est un champ du message.
+        message["reasoning_content"] = "".join(reasoning)
     if tool_calls:
         ordered = [tool_calls[i] for i in sorted(tool_calls)]
         for tc in ordered:

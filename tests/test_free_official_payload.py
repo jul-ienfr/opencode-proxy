@@ -168,3 +168,21 @@ def test_le_collecteur_non_stream_ne_casse_pas_une_reponse_texte():
     assert msg["content"] == "Bonjour"
     assert "tool_calls" not in msg
     assert out["choices"][0]["finish_reason"] == "stop"
+
+
+def test_le_collecteur_non_stream_conserve_le_raisonnement():
+    """Mesuré : mimo et deepseek envoient delta.reasoning_content.
+
+    Sans ce champ, un client non-stream ne reçoit que la réponse finale — et
+    l'amont exige que le raisonnement lui soit renvoyé au tour suivant.
+    """
+    lines = [
+        'data: {"choices":[{"delta":{"role":"assistant","reasoning_content":"17*23 = "}}]}',
+        'data: {"choices":[{"delta":{"reasoning_content":"391.","content":"391"}}]}',
+        'data: {"choices":[{"delta":{"content":" !"},"finish_reason":"stop"}]}',
+        "data: [DONE]",
+    ]
+    out = oc._collect_chat_completion(lines, "m")
+    msg = out["choices"][0]["message"]
+    assert msg["content"] == "391 !"
+    assert msg["reasoning_content"] == "17*23 = 391."
