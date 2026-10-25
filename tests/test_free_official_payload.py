@@ -46,8 +46,10 @@ def test_un_corps_minimal_recoit_la_copie_integrale():
 
     assert forced is True
     assert wire["stream"] is True
-    assert wire["tool_choice"] == "auto"
-    assert [t["function"]["name"] for t in wire["tools"]] == OFFICIAL_TOOL_NAMES
+    # Client sans AUCUN outil : `read` technique pour le gate, et tool_choice
+    # "none" pour que le modèle ne l'appelle jamais (le client ne l'a pas).
+    assert wire["tool_choice"] == "none"
+    assert [t["function"]["name"] for t in wire["tools"]] == ["read"]
     assert wire["messages"][0]["role"] == "system"
     assert SYSTEM_MARKER in wire["messages"][0]["content"]
     # Les messages du client sont conservés après le prompt officiel.
@@ -75,12 +77,9 @@ def test_un_corps_deja_conforme_traverse_sans_etre_modifie():
     assert oc._serialize_json_body(wire) == oc._serialize_json_body(body)
 
 
-def test_les_outils_du_client_sont_conserves_apres_les_officiels():
-    """Mesuré : 10 officiels + extras -> 200 ; un nom officiel renommé -> refus.
-
-    Donc on fusionne (officiels d'abord, extras ensuite) au lieu d'écraser :
-    un client tiers garde son function calling.
-    """
+def test_les_outils_du_client_sont_conserves_apres_le_read_officiel():
+    """Le gate ne demande que `read` : on ajoute le read officiel et on garde
+    les outils du client, au lieu d'imposer les 10 outils v1."""
     mine = {
         "type": "function",
         "function": {
@@ -96,10 +95,10 @@ def test_les_outils_du_client_sont_conserves_apres_les_officiels():
     }
     wire, _ = oc._free_wire_body(body, force_stream=True)
     names = [t["function"]["name"] for t in wire["tools"]]
-    assert names[:10] == OFFICIAL_TOOL_NAMES
-    assert names[10:] == ["get_weather"]
+    assert names == ["read", "get_weather"]
     # L'outil du client n'est pas copié : c'est le même objet.
-    assert wire["tools"][10] is mine
+    assert wire["tools"][1] is mine
+    assert wire["tool_choice"] == "auto"
 
 
 def test_un_outil_client_qui_shadowe_un_nom_officiel_est_ignore():
@@ -111,8 +110,8 @@ def test_un_outil_client_qui_shadowe_un_nom_officiel_est_ignore():
     body = {"model": "m", "messages": [], "tools": [shadow]}
     wire, _ = oc._free_wire_body(body, force_stream=True)
     names = [t["function"]["name"] for t in wire["tools"]]
-    assert names == OFFICIAL_TOOL_NAMES
-    assert wire["tools"][4] is not shadow
+    assert names == ["read"]
+    assert wire["tools"][0] is not shadow
 
 
 V2_SYSTEM = "You are an AI agent running in OpenCode, a coding agent harness. Help the user."
@@ -163,7 +162,8 @@ def test_systeme_v2_sans_read_recoit_les_outils_officiels():
     }
     wire, _ = oc._free_wire_body(body, force_stream=True)
     names = [t["function"]["name"] for t in wire["tools"]]
-    assert names == OFFICIAL_TOOL_NAMES
+    # Le `read` officiel est ajouté ; l'outil du client est conservé.
+    assert names == ["read", "edit"]
     # Le prompt v2 est conservé : pas de prompt v1 ajouté par-dessus.
     assert wire["messages"][0]["content"] == V2_SYSTEM
 

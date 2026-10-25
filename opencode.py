@@ -5390,7 +5390,6 @@ def _free_wire_body(body, force_stream: bool = False, egress_ip: str | None = No
     # maintenir. Le registre peut le réintroduire par configuration si une
     # mesure future le réhabilite.
     _payload = _official_free_payload()
-    _official_names = _payload["names"]
     # [2026-10-25] Règle MESURÉE avec témoins intercalés :
     #   * un prompt système OFFICIEL (1.18.31 ou 2.1.4) + l'outil `read`
     #     -> 200, quels que soient les autres outils ;
@@ -5404,15 +5403,6 @@ def _free_wire_body(body, force_stream: bool = False, egress_ip: str | None = No
     _has_official_sys = _has_official_system(body.get("messages"))
     _signature_ok = bool(_has_official_sys and "read" in have)
     _client_tools = tools if isinstance(tools, list) else []
-    _extras: list = []
-    _seen: set = set()
-    if is_chat:
-        for _t in _client_tools:
-            _n = _t.get("function", {}).get("name") if isinstance(_t, dict) else None
-            if not isinstance(_n, str) or _n in _official_names or _n in _seen:
-                continue
-            _seen.add(_n)
-            _extras.append(_t)
     need_tools = is_chat and bool(_payload["tools"]) and not _signature_ok
     need_system = is_chat and isinstance(_payload.get("system"), dict) and not _has_official_sys
     missing = [n for n in ("read",) if n not in have] if is_resp else []
@@ -5420,8 +5410,10 @@ def _free_wire_body(body, force_stream: bool = False, egress_ip: str | None = No
     need_key = is_resp and not body.get("prompt_cache_key")
     will_have_tools = bool(tools) or need_tools or bool(missing)
     # Le client v1 pose « auto » dès qu'il a des tools ; le v2 ne le pose pas.
-    # On n'ajoute donc `tool_choice` que quand NOUS injectons la grille, pour
-    # ne pas déformer un corps officiel déjà valide (v1 ou v2).
+    # On n'ajoute `tool_choice` que quand NOUS injectons la grille, pour ne pas
+    # déformer un corps officiel déjà valide. Client sans AUCUN outil : "none",
+    # pour que le modèle n'appelle pas le `read` technique qu'on ajoute pour
+    # le gate (il ne pourrait pas l'exécuter).
     need_tc = is_chat and need_tools and "tool_choice" not in body
     # Idem pour l'ordre des clés : un corps officiel (signature ok) traverse
     # tel quel, quel que soit son ordre (v2 utilise max_completion_tokens).
@@ -5438,8 +5430,23 @@ def _free_wire_body(body, force_stream: bool = False, egress_ip: str | None = No
         return body, False
     wire = dict(body)
     if need_tools:
-        # Signature officielle exacte d'abord (copie), puis les extras client.
-        wire["tools"] = [copy.deepcopy(t) for t in _payload["tools"]] + _extras
+        # [2026-10-25] Le gate ne demande QUE `read` + prompt officiel (mesuré).
+        # On n'injecte donc plus les 10 outils v1 : on ajoute le `read`
+        # officiel et on CONSERVE les outils du client. Un client tiers garde
+        # son function calling, et le modèle ne se voit pas offrir `bash` /
+        # `task` / `todowrite` qu'il ne saurait pas exécuter côté client.
+        _read_def = None
+        for _t in _payload["tools"]:
+            if isinstance(_t, dict) and _t.get("function", {}).get("name") == "read":
+                _read_def = _t
+                break
+        _kept = [
+            _t
+            for _t in _client_tools
+            if isinstance(_t, dict)
+            and _t.get("function", {}).get("name") != "read"
+        ]
+        wire["tools"] = ([copy.deepcopy(_read_def)] if _read_def else []) + _kept
     elif missing:
         base = list(tools) if isinstance(tools, list) else []
         base.extend(_free_shim_tool(n, is_resp) for n in missing)
@@ -5453,8 +5460,9 @@ def _free_wire_body(body, force_stream: bool = False, egress_ip: str | None = No
         # la copie officielle, elle, garde son ordre exact.
         wire["tools"] = _sorted_chat_tools(wire.get("tools"))
     if need_tc:
-        # Le client pose « auto » dès qu'il y a des tools (242/242 mesures).
-        wire["tool_choice"] = "auto"
+        # Client sans aucun outil : le `read` technique ajouté pour le gate ne
+        # doit jamais être appelé (le client ne saurait pas l'exécuter).
+        wire["tool_choice"] = "none" if not _client_tools else "auto"
     if need_key:
         try:
             # Parité options() : promptCacheKey = sessionID de la conversation

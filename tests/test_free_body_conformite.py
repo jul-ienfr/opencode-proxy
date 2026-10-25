@@ -73,17 +73,14 @@ def test_tool_choice_auto_added_when_tools_present():
     assert wire["tool_choice"] == "auto"
 
 
-def test_tool_choice_auto_added_for_shimmed_tools():
-    """Meme quand les tools viennent de notre grille shim (corps nu)."""
+def test_tool_choice_none_quand_le_client_n_a_aucun_outil():
+    """Corps nu : `read` technique pour le gate, mais aucun appel autorisé."""
     wire, _ = oc._free_wire_body(
         {"model": "m", "messages": [{"role": "user", "content": "x"}], "stream": True},
         force_stream=True,
     )
-    assert wire["tool_choice"] == "auto"
-    # [2026-10-25] copie officielle : les 10 tools, dans l'ordre officiel.
-    assert [t["function"]["name"] for t in wire["tools"]] == [
-        "bash", "edit", "glob", "grep", "read", "skill", "task", "todowrite", "webfetch", "write",
-    ]
+    assert wire["tool_choice"] == "none"
+    assert [t["function"]["name"] for t in wire["tools"]] == ["read"]
     assert list(wire) == [k for k in CLIENT_KEY_ORDER if k in wire]
 
 

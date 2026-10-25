@@ -205,27 +205,33 @@ reste pour les clients génériques, qui n'ont ni prompt officiel ni `read`.
 | Fichier | Rôle |
 |---|---|
 | `free/official_payload.json` | capture intégrale du client 1.18.31 : corps complet + en-têtes d'origine + provenance |
-| `opencode.py` (`_official_free_payload`, `_has_official_system`, `_free_wire_body`) | envoie la copie dès qu'un nom officiel manque |
-| `scripts/capture_official_payload.py` | régénère la capture (maintenance) |
+| `opencode.py` (`_official_free_payload`, `_has_official_system`, `_free_wire_body`) | laisse passer un client officiel, complète un client générique |
+| `scripts/capture_official_payload.py` | régénère la capture (maintenance), y compris pour le client v2 (`--binary … --standalone`) |
 | `tests/test_free_official_payload.py` | verrouille le contrat |
 
 ### Comportement
 
-- **corps client incomplet** → les 10 outils officiels et le prompt système sont
-  injectés, les messages du client sont conservés à la suite ;
-- **corps déjà conforme** (vrai client OpenCode) → il passe **tel quel**, octet
-  pour octet ;
-- `tool_choice:"auto"` ajouté s'il manque ; `stream_options` ajouté quand le
-  stream est forcé ;
-- l'ordre des clés reste `model, max_tokens, messages, tools, tool_choice,
-  stream, stream_options` ;
+- **client officiel reconnu** (1.18.31 ou 2.1.4 : prompt officiel + `read`)
+  → traverse **tel quel**, octet pour octet. C'est ce qui préserve les 12
+  outils du client v2 (`shell`, `execute`, `subagent`…) au lieu de lui
+  imposer ceux de 1.18.31 ;
+- **client générique** (pas de prompt officiel) → le prompt officiel est
+  ajouté, et **seul l'outil `read` officiel** est injecté. Les outils du
+  client sont conservés tels quels : le modèle ne se voit plus offrir
+  `bash`/`task`/`todowrite` qu'un client tiers ne saurait pas exécuter ;
+- **client sans aucun outil** → `read` est ajouté pour le gate mais
+  `tool_choice: "none"` interdit de l'appeler (un client de chat ne recevra
+  jamais un appel d'outil qu'il ne connaît pas) ;
+- `stream_options` ajouté quand le stream est forcé ;
+- l'ordre des clés n'est réordonné que si l'on a modifié le corps ; un corps
+  officiel garde son ordre (v2 utilise `max_completion_tokens`) ;
 - l'entrée n'est **jamais** mutée (les retries/hedges réutilisent le même dict).
 
 ### Ce qui a été retiré
 
-Le shim `read` seul n'est plus utilisé pour la forme `chat` : il ne passait plus
-le gate. Il reste en place pour la forme `responses` (`input`), qui n'est pas
-couverte par la capture.
+L'injection des **10 outils v1** est supprimée : elle datait de la mesure
+« suite complète exigée », invalidée par la re-mesure du 15 h. Le shim `read`
+suffit, et il reste aussi utilisé pour la forme `responses` (`input`).
 
 ## 7. Preuve bout-en-bout (2026-10-25)
 
@@ -414,8 +420,8 @@ verbeuses), pas des reprises : une seule requête a échoué sur 196.
 
 | Point | Valeur | Commentaire |
 |---|---|---|
-| Tokens d'entrée | ~11 000 / requête | prompt système + 10 tools |
-| Cache | 11 008 tokens cachés | le prompt est stable → coût réel faible |
+| Tokens d'entrée | ~5–7 k selon le client | prompt système officiel (client v2 : 9,7 k car. + 12 outils ; générique : 21,6 k car. + `read` + ses outils) |
+| Cache | 11 008 tokens cachés (v1) | le prompt est stable → coût réel faible |
 | Outils du client | **fusionnés** après les 10 officiels | le *function calling* tiers est préservé (mesuré : extras acceptés) |
 | `tool_calls` non-stream | recomposés depuis le SSE | bug corrigé le 2026-10-25 : ils étaient jetés, message vide |
 | `reasoning_content` non-stream | recomposé depuis le SSE | bug corrigé le 2026-10-25 : mimo et deepseek l'émettent, il était jeté |

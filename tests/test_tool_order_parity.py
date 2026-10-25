@@ -128,24 +128,21 @@ def test_sanitize_chat_tools_sorts_the_renamed_tools_with_the_rest():
 
 
 def test_free_wire_shims_are_sorted_with_the_rest():
-    """Jambe free : la copie officielle ouvre la liste, puis les extras du
-    client (mesuré 2026-10-25 : les extras passent le gate)."""
+    """Jambe free : le `read` officiel ouvre la liste, puis les outils du
+    client dans leur ordre d'origine (mesuré : read + outil client -> 200)."""
     body = {
         "model": "m",
         "messages": [{"role": "user", "content": "hi"}],
         "tools": [_tool("zzz"), _tool("aaa")],
     }
     wire, _forced = oc._free_wire_body(body)
-    assert _names(wire["tools"]) == [
-        "bash", "edit", "glob", "grep", "read", "skill", "task", "todowrite", "webfetch", "write",
-        "zzz", "aaa",
-    ]
+    assert _names(wire["tools"]) == ["read", "zzz", "aaa"]
     # Le corps d'origine n'est jamais muté (idempotence des retries/hedges).
     assert _names(body["tools"]) == ["zzz", "aaa"]
 
 
 def test_free_wire_is_idempotent_once_sorted():
-    """Réappliquer le wire ne change plus rien : la fusion est un point fixe."""
+    """Réappliquer le wire ne change plus rien : la signature est un point fixe."""
     body = {
         "model": "m",
         "messages": [{"role": "user", "content": "hi"}],
@@ -153,11 +150,7 @@ def test_free_wire_is_idempotent_once_sorted():
     }
     first, _ = oc._free_wire_body(body)
     second, _ = oc._free_wire_body(first)
-    expected = [
-        "bash", "edit", "glob", "grep", "read", "skill", "task", "todowrite", "webfetch", "write",
-        "zzz", "aaa",
-    ]
-    assert _names(second["tools"]) == _names(first["tools"]) == expected
+    assert _names(second["tools"]) == _names(first["tools"]) == ["read", "zzz", "aaa"]
 
 
 def test_free_wire_responses_leg_is_left_alone():

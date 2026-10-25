@@ -189,17 +189,15 @@ class TestWireShapes:
 
 
 class TestInjection:
-    """2026-10-25 — ce qui part réellement sur le fil, mesuré et non supposé.
+    """2026-10-25 (re-mesuré) — ce qui part réellement sur le fil.
 
-    Le gate a été durci le 23/10 à 23:17 UTC : « read seul » (mesure du
-    21/10) ne passe plus. Il exige la suite COMPLÈTE des 10 tools officiels
-    plus le prompt système. Mesuré sur le vrai endpoint, même IP, même
-    seconde : 10 tools + système → 200 ; 1 tool → 403 ; sans système → 429.
+    La règle du gate, mesurée avec témoins intercalés : un prompt système
+    OFFICIEL reconnu (1.18.31 ou 2.1.4) + l'outil ``read`` -> 200, quels que
+    soient les autres outils. Système court -> 429 ; sans ``read`` -> 429.
+
+    On n'injecte donc plus les 10 outils v1 : seulement le ``read`` officiel,
+    en conservant les outils du client.
     """
-
-    OFFICIAL = [
-        "bash", "edit", "glob", "grep", "read", "skill", "task", "todowrite", "webfetch", "write",
-    ]
 
     def _wire(self, body):
         import opencode as oc
@@ -207,22 +205,19 @@ class TestInjection:
         wire, _ = oc._free_wire_body(body, "big-pickle")
         return wire
 
-    def test_full_official_tool_set_is_injected(self):
+    def test_read_seul_est_injecte(self):
         wire = self._wire({"messages": [{"role": "user", "content": "hi"}]})
         names = [t["function"]["name"] for t in wire.get("tools") or []]
-        assert names == self.OFFICIAL, f"outils injectés : {names}"
+        assert names == ["read"], f"outils injectés : {names}"
 
-    def test_bash_is_part_of_the_official_signature(self):
+    def test_les_outils_v1_ne_sont_plus_imposes(self):
+        """Un client générique ne doit pas se voir offrir bash/task/todowrite."""
         wire = self._wire({"messages": [{"role": "user", "content": "hi"}]})
         names = [t["function"]["name"] for t in wire.get("tools") or []]
-        assert "bash" in names
+        assert "bash" not in names and "task" not in names and "todowrite" not in names
 
     def test_client_tools_are_preserved_after_the_official_set(self):
-        """Mesuré 2026-10-25 : 10 officiels + extras -> 200, un nom renommé -> refus.
-
-        On fusionne donc : signature officielle exacte d'abord, outils client
-        ensuite. Le function calling du client n'est plus perdu.
-        """
+        """Le `read` officiel d'abord, puis les outils du client tels quels."""
         wire = self._wire(
             {
                 "messages": [{"role": "user", "content": "hi"}],
@@ -239,8 +234,24 @@ class TestInjection:
             }
         )
         names = [t["function"]["name"] for t in wire.get("tools") or []]
-        assert names == self.OFFICIAL + ["my_tool"]
+        assert names == ["read", "my_tool"]
 
-    def test_tool_choice_stays_auto(self):
+    def test_tool_choice_none_quand_le_client_n_a_aucun_outil(self):
+        """Le `read` technique ne doit jamais être appelé par un client de chat."""
         wire = self._wire({"messages": [{"role": "user", "content": "hi"}]})
+        assert wire.get("tool_choice") == "none"
+
+    def test_tool_choice_auto_quand_le_client_a_des_outils(self):
+        wire = self._wire(
+            {
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {"name": "my_tool", "description": "x",
+                                     "parameters": {"type": "object", "properties": {}}},
+                    }
+                ],
+            }
+        )
         assert wire.get("tool_choice") == "auto"

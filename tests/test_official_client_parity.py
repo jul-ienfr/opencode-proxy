@@ -494,41 +494,37 @@ def _resp_names(tools):
 
 
 def test_free_wire_body_chat_appends_shim(official_env):
-    """Corps chat sans tools → copie officielle complète (10 tools + prompt
-    système), stream forcé, sans muter l'entrée (idempotent au 2ᵉ passage)."""
+    """Corps chat sans tools → `read` officiel + prompt système, stream forcé,
+    sans muter l'entrée (idempotent au 2ᵉ passage)."""
     body = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
     wire, forced = oc._free_wire_body(body, force_stream=True)
     assert forced is True
     assert wire["stream"] is True
-    # [2026-10-25] durcissement du gate : la suite COMPLÈTE est requise.
-    assert _chat_names(wire["tools"]) == OFFICIAL_TOOL_NAMES
+    # [2026-10-25] gate re-mesuré : `read` + prompt officiel suffisent.
+    assert _chat_names(wire["tools"]) == {"read"}
+    # Client sans outils : le read technique ne doit pas être appelé.
+    assert wire["tool_choice"] == "none"
     assert wire["messages"][0]["role"] == "system"
     assert "You are opencode, an interactive CLI tool" in wire["messages"][0]["content"]
     assert wire["messages"][-1] == {"role": "user", "content": "hi"}
     assert "tools" not in body and body.get("stream") is not True  # entrée intacte
     wire2, forced2 = oc._free_wire_body(wire, force_stream=True)
     assert forced2 is False  # déjà conforme : inchangé
-    assert _chat_names(wire2["tools"]) == OFFICIAL_TOOL_NAMES
+    assert _chat_names(wire2["tools"]) == {"read"}
 
 
 def test_free_wire_body_chat_keeps_client_tools(official_env):
-    """Tools client conservés APRÈS la copie officielle (mesuré 2026-10-25 :
-    10 officiels + extras -> 200 ; un nom officiel renommé -> refus).
-
-    « Bash » capitalisé n'est pas officiel : il est donc conservé en extra,
-    derrière les 10 outils officiels.
-    """
+    """Le `read` officiel est ajouté DEVANT les outils du client, qui sont
+    conservés tels quels (mesuré : read + outil client -> 200)."""
     mine = {"type": "function", "function": {"name": "Bash", "description": "x",
             "parameters": {"type": "object", "properties": {}}}}
     body = {"model": "m", "messages": [], "tools": [mine], "stream": True}
     wire, forced = oc._free_wire_body(body, force_stream=True)
     assert forced is False  # déjà stream:true
     names = [t["function"]["name"] for t in wire["tools"]]
-    assert names[:10] == [
-        "bash", "edit", "glob", "grep", "read", "skill", "task", "todowrite", "webfetch", "write",
-    ]
-    assert names[10:] == ["Bash"]
-    assert wire["tools"][10] is mine
+    assert names == ["read", "Bash"]
+    assert wire["tools"][1] is mine
+    assert wire["tool_choice"] == "auto"
 
 
 def test_free_wire_body_responses_prompt_cache_key(official_env):
@@ -664,8 +660,8 @@ async def test_do_free_direct_request_collects(official_env, monkeypatch):
 
     wire = json.loads(sent["content"].decode())
     assert wire["stream"] is True
-    # [2026-10-25] copie officielle complète : 10 tools.
-    assert _chat_names(wire["tools"]) == OFFICIAL_TOOL_NAMES
+    # [2026-10-25] gate re-mesuré : `read` + prompt officiel suffisent.
+    assert _chat_names(wire["tools"]) == {"read"}
     assert "tools" not in body
 
 
