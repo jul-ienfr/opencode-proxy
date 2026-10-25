@@ -53,6 +53,9 @@ MODELS = [
 STATION_PORTS = {i: 1080 + (i - 1) for i in range(1, 7)}
 CONCURRENCY = 3
 SEM = asyncio.Semaphore(CONCURRENCY)
+# Paliers de ralentissement quand le refus persiste : 2 s -> 30 s.
+# 2 s = detection quasi immediate ; 30 s = veille de fond sobre.
+_BACKOFF = (2.0, 3.0, 5.0, 8.0, 12.0, 18.0, 25.0, 30.0)
 
 
 def log(msg: str) -> None:
@@ -75,6 +78,19 @@ def _append_attempt(line: str) -> None:
     try:
         with open(ATTEMPTS, "a", encoding="utf-8") as f:
             f.write(line + "\n")
+    except Exception:
+        pass
+
+
+def _rotate_attempts(max_bytes: int = 2_000_000) -> None:
+    """Borne le journal de refus : 160k lignes/jour sinon."""
+    try:
+        if os.path.getsize(ATTEMPTS) <= max_bytes:
+            return
+    except Exception:
+        return
+    try:
+        os.replace(ATTEMPTS, ATTEMPTS + ".1")
     except Exception:
         pass
 
@@ -393,7 +409,17 @@ async def watch(max_seconds: float, dry_run: bool, full: bool, until_reset: bool
             if now - last_summary >= 60.0:
                 log(f"veille — {refusals} refus cumules, pas d'acceptation")
                 last_summary = now
-            await asyncio.sleep(0.5 if found_this_pass else 1.0)
+                _rotate_attempts()
+            # [sobriete 2026-10-25] 160k refus en 17 h = martelage inutile qui
+            # peut aggraver le blocage cote fournisseur. On ralentit par palier
+            # tant que rien ne change, et on repart vite des qu'une acceptation
+            # apparait.
+            if found_this_pass:
+                delay = 0.5
+            else:
+                idx = min(len(_BACKOFF), refusals // 60)
+                delay = _BACKOFF[idx]
+            await asyncio.sleep(delay)
 
     if not dry_run and (accepted or refusals):
         write_report(accepted, refusals, measurements)
