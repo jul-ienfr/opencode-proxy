@@ -38,6 +38,11 @@ sys.path.insert(0, ROOT)
 
 OUT_DIR = os.path.join(ROOT, "logs", "quota_reset_capture")
 ACCEPTED_DIR = os.path.join(OUT_DIR, "accepted")
+# [2026-10-25] Les refus doivent aussi etre rejouables octet pour octet.
+# On garde donc une reference complete (en-tetes ordonnes + corps + TLS +
+# identite) meme quand rien n'est accepte : sans elle, aucune capture n'est
+# rejouable, et une capture non rejouable ne vaut rien.
+REFERENCE_DIR = os.path.join(OUT_DIR, "reference")
 ATTEMPTS = os.path.join(OUT_DIR, "attempts.log")
 EVIDENCE = os.path.join(OUT_DIR, "evidence.jsonl")
 REPORT = os.path.join(OUT_DIR, "rapport.md")
@@ -82,29 +87,56 @@ def _append_attempt(line: str) -> None:
         pass
 
 
-def _rotate_attempts(max_bytes: int = 2_000_000) -> None:
-    """Borne le journal de refus : 160k lignes/jour sinon."""
+def _rotate_attempts(max_bytes: int = 2_000_000, keep: int = 10) -> None:
+    """Borne le journal de refus : 160k lignes/jour sinon.
+
+    Archive horodatee (et non un simple .1 ecrase) : le journal de la nuit
+    reste consultable et on ne perd pas l'historique a chaque rotation.
+    """
     try:
         if os.path.getsize(ATTEMPTS) <= max_bytes:
             return
     except Exception:
         return
+    ts = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     try:
-        os.replace(ATTEMPTS, ATTEMPTS + ".1")
+        os.replace(ATTEMPTS, f"{ATTEMPTS}.{ts}")
+    except Exception:
+        return
+    # ne garde que les N archives les plus recentes
+    try:
+        archives = sorted(
+            (n for n in os.listdir(OUT_DIR) if n.startswith(os.path.basename(ATTEMPTS) + ".")),
+            reverse=True,
+        )
+        for old in archives[keep:]:
+            try:
+                os.remove(os.path.join(OUT_DIR, old))
+            except Exception:
+                pass
     except Exception:
         pass
 
 
-def _save_accepted(record: dict) -> str:
-    """Ecrit la requete gagnante en fsync immediat. Rend le chemin."""
-    _ensure_dirs()
-    ts = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    path = os.path.join(ACCEPTED_DIR, f"accepted_{ts}.json")
+def _save_full(record: dict, kind: str, directory: str | None = None) -> str:
+    """Ecrit un enregistrement COMPLET (rejouable) en fsync immediat.
+
+    kind: 'accepted' (200), 'refus' (429), 'anomalie' (403/5xx/erreur).
+    """
+    directory = directory or REFERENCE_DIR
+    os.makedirs(directory, exist_ok=True)
+    ts = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    path = os.path.join(directory, f"{kind}_{ts}.json")
     with open(path, "w", encoding="utf-8") as f:
         json.dump(record, f, ensure_ascii=False, indent=2, default=str)
         f.flush()
         os.fsync(f.fileno())
     return path
+
+
+def _save_accepted(record: dict) -> str:
+    """Ecrit la requete gagnante en fsync immediat. Rend le chemin."""
+    return _save_full(record, "accepted", ACCEPTED_DIR)
 
 
 def _acquire_lock() -> bool:
@@ -202,7 +234,14 @@ async def probe(oc, station: int, ip: str, model: str) -> dict:
                 "body_sha256": hashlib.sha256(body_bytes).hexdigest(),
                 "body_len": len(body_bytes),
                 "body": body_bytes.decode("utf-8", "replace"),
-                "tls": {"impersonate": imp, "fp_keys": sorted((fp or {}).keys())},
+                "tls": {
+                    "impersonate": imp,
+                    # on stocke les VALEURS du fingerprint, pas seulement les
+                    # noms de cles : sinon la capture n'est pas rejouable a
+                    # l'identique (JA3/ALPN/http_version).
+                    "fp": fp,
+                    "fp_keys": sorted((fp or {}).keys()),
+                },
             },
         }
 
@@ -313,6 +352,52 @@ def write_report(accepted: list[dict], refusals: int, measurements: list[dict]) 
         lines += ["```", (a["response"].get("body") or "")[:1500], "```", ""]
     else:
         lines += ["Aucune acceptation pour l'instant — le chat gratuit reste refuse.", ""]
+        # Meme en refus, on documente et on rend rejouable la derniere reference.
+        try:
+            refs = sorted(
+                n for n in os.listdir(REFERENCE_DIR) if n.endswith(".json")
+            ) if os.path.isdir(REFERENCE_DIR) else []
+        except Exception:
+            refs = []
+        if refs:
+            lines.append(f"## Reference rejouable la plus recente ({len(refs)} en tout)")
+            lines.append("")
+            try:
+                with open(os.path.join(REFERENCE_DIR, refs[-1]), encoding="utf-8") as f:
+                    r = json.load(f)
+            except Exception:
+                r = {}
+            if r:
+                req = r.get("request") or {}
+                resp = r.get("response") or {}
+                lines += [
+                    f"- fichier : `logs/quota_reset_capture/reference/{refs[-1]}`",
+                    f"- moment : `{r.get('ts_utc')}`",
+                    f"- egress : `{r.get('egress_ip')}` (station {r.get('station')})",
+                    f"- modele : `{r.get('model')}`",
+                    f"- identite : `{json.dumps(r.get('identity'), ensure_ascii=False)}`",
+                    f"- corps : {req.get('body_len')} o, sha256 `{req.get('body_sha256')}`",
+                    "",
+                    "### En-tetes (ordre exact)",
+                ]
+                for k, v in req.get("headers_order") or []:
+                    shown = "Bearer public" if str(k).lower() == "authorization" else v
+                    lines.append(f"1. `{k}: {shown}`")
+                lines += [
+                    "",
+                    "### Reponse",
+                    f"- statut : `{resp.get('status')}` en {resp.get('elapsed_ms')} ms",
+                ]
+                for k, v in resp.get("headers") or []:
+                    lines.append(f"  - `{k}: {v}`")
+                lines += [
+                    "",
+                    "Rejouer : `python scripts/quota_replay.py --record reference/"
+                    f"{refs[-1]}`",
+                    "",
+                ]
+        else:
+            lines += ["Aucune reference complete enregistree pour l'instant.", ""]
 
     if measurements:
         lines.append("## Quota observe")
@@ -345,6 +430,7 @@ async def watch(max_seconds: float, dry_run: bool, full: bool, until_reset: bool
     last_summary = 0.0
     found_this_pass = False
     last_no_target_log = 0.0
+    last_reference = 0.0
 
     while time.monotonic() < deadline:
         targets = await pick_targets(oc)
@@ -361,6 +447,7 @@ async def watch(max_seconds: float, dry_run: bool, full: bool, until_reset: bool
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         hits = []
+        anomalies = []
         for rec in results:
             if not isinstance(rec, dict):
                 continue
@@ -383,6 +470,36 @@ async def watch(max_seconds: float, dry_run: bool, full: bool, until_reset: bool
                 _append_attempt(
                     f"{rec['ts_utc']} {st} {rec['egress_ip']} {rec['model']} ra={ra}"
                 )
+            else:
+                # 403/5xx/timeout : signal fort, on le garde en entier.
+                anomalies.append(rec)
+                _append_attempt(f"{rec['ts_utc']} {st} {rec['egress_ip']} {rec['model']} ra=None")
+
+        # [2026-10-25] Une capture non rejouable ne vaut rien : on persiste une
+        # reference COMPLETE (en-tetes ordonnes, corps, TLS, identite, egress)
+        # des le premier tour de chaque session, puis toutes les 5 min, meme si
+        # la reponse est un refus.
+        now_loop = time.monotonic()
+        if not dry_run and results and now_loop - last_reference >= 300.0:
+            first = next((r for r in results if isinstance(r, dict)), None)
+            if first is not None:
+                kind = "refus" if (first.get("response") or {}).get("status") == 429 else "anomalie"
+                try:
+                    p = _save_full(first, kind)
+                    log(f"reference rejouable ({kind}) -> {os.path.relpath(p, ROOT)}")
+                    last_reference = now_loop
+                except Exception as e:
+                    log(f"echec sauvegarde reference : {e}")
+        for rec in anomalies:
+            if not dry_run:
+                try:
+                    p = _save_full(rec, "anomalie")
+                    log(
+                        f"ANOMALIE {(rec.get('response') or {}).get('status')} "
+                        f"-> {os.path.relpath(p, ROOT)}"
+                    )
+                except Exception as e:
+                    log(f"echec sauvegarde anomalie : {e}")
 
         if hits:
             for rec in hits:
