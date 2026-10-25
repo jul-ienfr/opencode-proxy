@@ -196,6 +196,20 @@ stream    : 200, chunks reçus
 /v1/responses : 200 (input_tokens 11 045)
 ```
 
+Vérification finale dans `logs/requests.db` — 8 succès consécutifs, 3 modèles,
+4 IP de sortie différentes :
+
+```
+2026-10-25T03:32:45Z  glm-5.3-flash-free       success=1  ip=187.13.240.147
+2026-10-25T03:33:14Z  glm-5.3-flash-free       success=1  ip=84.233.199.109
+2026-10-25T03:33:45Z  mimo-v2.6-flash-free     success=1  ip=187.15.103.33
+2026-10-25T03:34:00Z  mimo-v2.6-flash-free     success=1  ip=186.247.41.77
+2026-10-25T03:34:22Z  glm-5.3-flash-free       success=1  ip=187.13.240.147
+2026-10-25T03:35:44Z  deepseek-v4.1-flash-free success=1  ip=84.233.199.109
+2026-10-25T03:35:54Z  mimo-v2.6-flash-free     success=1  ip=187.15.103.33
+2026-10-25T03:36:00Z  glm-5.3-flash-free       success=1  ip=186.247.41.77
+```
+
 ## 8. Coût et limites
 
 | Point | Valeur | Commentaire |
@@ -257,7 +271,10 @@ complète (le client émet aussi des POST de titre/compaction) et réécrit
 6. **25/10** — interception locale → payload réel.
 7. **25/10** — bisection A/B/C/D puis variantes de corps → la signature complète
    est la condition.
-8. **25/10** — correctif, tests, preuve bout-en-bout.
+8. **25/10** — correctif, tests, preuve bout-en-bout, documentation.
+9. **25/10** — tâches planifiées de capture (`OpenCodeQuotaWatch`,
+   `OpenCodeQuotaResetCapture`) supprimées : elles n'avaient plus d'objet et
+   auraient consommé du quota free pour rien.
 
 ## 11. Ce que ce document remplace
 
