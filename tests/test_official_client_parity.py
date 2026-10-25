@@ -512,22 +512,23 @@ def test_free_wire_body_chat_appends_shim(official_env):
 
 
 def test_free_wire_body_chat_keeps_client_tools(official_env):
-    """Tools client remplacés par la copie officielle (ex. Bash capitalisé
-    ne compte PAS : le gate est case-sensitive).
+    """Tools client conservés APRÈS la copie officielle (mesuré 2026-10-25 :
+    10 officiels + extras -> 200 ; un nom officiel renommé -> refus).
 
-    [2026-10-25] Le gate exige la suite complète, pas un sur-ensemble
-    arbitraire : dès qu'un seul nom officiel manque, les 10 tools officiels
-    sont envoyés tels quels (copie intégrale, ordre exact).
+    « Bash » capitalisé n'est pas officiel : il est donc conservé en extra,
+    derrière les 10 outils officiels.
     """
     mine = {"type": "function", "function": {"name": "Bash", "description": "x",
             "parameters": {"type": "object", "properties": {}}}}
     body = {"model": "m", "messages": [], "tools": [mine], "stream": True}
     wire, forced = oc._free_wire_body(body, force_stream=True)
     assert forced is False  # déjà stream:true
-    assert _chat_names(wire["tools"]) == OFFICIAL_TOOL_NAMES
-    assert [t["function"]["name"] for t in wire["tools"]] == [
+    names = [t["function"]["name"] for t in wire["tools"]]
+    assert names[:10] == [
         "bash", "edit", "glob", "grep", "read", "skill", "task", "todowrite", "webfetch", "write",
     ]
+    assert names[10:] == ["Bash"]
+    assert wire["tools"][10] is mine
 
 
 def test_free_wire_body_responses_prompt_cache_key(official_env):

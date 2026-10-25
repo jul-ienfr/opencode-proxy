@@ -54,7 +54,7 @@ curl -s "http://127.0.0.1:4000/health?detail=full" | python -c "import json,sys;
 
 | Règle | Mesure (2026-10-25) | Conséquence |
 |---|---|---|
-| **signature complète du client** (10 outils officiels + prompt système) | corps complet 44 Ko → **200** ; 1 seul outil → **403** ; sans `tools` → **403** ; sans prompt système → **429** | le proxy envoie la copie figée `free/official_payload.json` dès qu'un nom officiel manque |
+| **signature complète du client** (10 outils officiels + prompt système) | corps complet 44 Ko → **200** ; 1 seul outil → **403** ; sans `tools` → **403** ; sans prompt système → **429** ; nom officiel renommé → refus ; outils en plus → **200** | le proxy envoie la copie figée `free/official_payload.json` puis **fusionne** les outils du client derrière les 10 officiels |
 | `stream: true` **obligatoire** | `true` → 200 ; `false` ou absent → **403** | un client non-stream est converti, sa réponse reconstituée |
 | `tool_choice: "auto"` | émis dès qu'il y a des outils, comme le client officiel | ne pas « corriger » |
 | ordre des clés | `model, max_tokens, messages, tools, tool_choice, stream, stream_options` | `_reorder_client_body` |

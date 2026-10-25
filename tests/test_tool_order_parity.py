@@ -128,24 +128,24 @@ def test_sanitize_chat_tools_sorts_the_renamed_tools_with_the_rest():
 
 
 def test_free_wire_shims_are_sorted_with_the_rest():
-    """Jambe free : dès qu'un nom officiel manque, la copie officielle
-    complète remplace les tools du client, dans son ordre exact."""
+    """Jambe free : la copie officielle ouvre la liste, puis les extras du
+    client (mesuré 2026-10-25 : les extras passent le gate)."""
     body = {
         "model": "m",
         "messages": [{"role": "user", "content": "hi"}],
         "tools": [_tool("zzz"), _tool("aaa")],
     }
     wire, _forced = oc._free_wire_body(body)
-    # [2026-10-25] le gate exige la suite complète, pas un tri partiel.
     assert _names(wire["tools"]) == [
         "bash", "edit", "glob", "grep", "read", "skill", "task", "todowrite", "webfetch", "write",
+        "zzz", "aaa",
     ]
     # Le corps d'origine n'est jamais muté (idempotence des retries/hedges).
     assert _names(body["tools"]) == ["zzz", "aaa"]
 
 
 def test_free_wire_is_idempotent_once_sorted():
-    """Réappliquer le wire ne change plus rien : la copie est un point fixe."""
+    """Réappliquer le wire ne change plus rien : la fusion est un point fixe."""
     body = {
         "model": "m",
         "messages": [{"role": "user", "content": "hi"}],
@@ -155,6 +155,7 @@ def test_free_wire_is_idempotent_once_sorted():
     second, _ = oc._free_wire_body(first)
     expected = [
         "bash", "edit", "glob", "grep", "read", "skill", "task", "todowrite", "webfetch", "write",
+        "zzz", "aaa",
     ]
     assert _names(second["tools"]) == _names(first["tools"]) == expected
 

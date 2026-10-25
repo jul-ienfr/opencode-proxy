@@ -5316,6 +5316,12 @@ def _free_wire_body(body, force_stream: bool = False, egress_ip: str | None = No
     (capture intégrale du client 1.18.31) dès que le corps n'en porte pas
     déjà la signature ; un corps déjà conforme passe TEL QUEL.
 
+    [2026-10-25 bis] Le gate exige les 10 noms officiels EXACTEMENT (renommer
+    ``read`` en ``read_file`` -> refus) mais ACCEPTE des outils en plus
+    (10+1 et 10+3 mesurés -> 200). On fusionne donc au lieu de remplacer :
+    10 officiels (copie, ordre exact) puis les outils du client dont le nom
+    n'est pas officiel. Le function calling des clients tiers survit.
+
     Ne mute JAMAIS l'entrée (copie défensive quand un patch est requis —
     les appelants réutilisent le même dict sur retries/hedges ; la fonction
     est idempotente). Retourne (wire, stream_forcé_ici) : quand
@@ -5351,10 +5357,28 @@ def _free_wire_body(body, force_stream: bool = False, egress_ip: str | None = No
     _payload = _official_free_payload()
     _official_names = _payload["names"]
     # [2026-10-25] Le gate a changé le 23/10 23:17 UTC: « read seul -> 200 »
-    # (mesure du 21/10) ne vaut plus. Il exige désormais la suite COMPLÈTE
-    # des 10 tools officiels + le prompt système. Mesuré sur le vrai endpoint:
+    # (mesure du 21/10) ne vaut plus. Il exige la suite COMPLÈTE des 10 tools
+    # officiels + le prompt système. Mesuré sur le vrai endpoint:
     #   10 tools + système -> 200 ; 1 tool -> 403 ; sans système -> 429.
-    need_tools = is_chat and bool(_official_names) and not _official_names.issubset(have)
+    # [2026-10-25 bis] Il accepte des tools EN PLUS mais refuse un nom
+    # officiel RENOMMÉ : 10+1 et 10+3 -> 200 ; `read` -> `read_file` -> 429
+    # (même IP, contrôle officiel -> 200 juste après). On FUSIONNE donc :
+    # les 10 officiels d'abord (signature exacte), puis les outils du client
+    # qui ne portent pas un nom officiel. Le function calling des clients
+    # tiers est préservé au lieu d'être écrasé.
+    _client_tools = tools if isinstance(tools, list) else []
+    _extras: list = []
+    _seen: set = set()
+    if is_chat:
+        for _t in _client_tools:
+            _n = _t.get("function", {}).get("name") if isinstance(_t, dict) else None
+            if not isinstance(_n, str) or _n in _official_names or _n in _seen:
+                continue
+            _seen.add(_n)
+            _extras.append(_t)
+    need_tools = is_chat and bool(_payload["tools"]) and (
+        not _official_names.issubset(have) or bool(_extras)
+    )
     need_system = is_chat and isinstance(_payload.get("system"), dict) and not _has_official_system(
         body.get("messages")
     )
@@ -5380,8 +5404,8 @@ def _free_wire_body(body, force_stream: bool = False, egress_ip: str | None = No
         return body, False
     wire = dict(body)
     if need_tools:
-        # Copie intégrale, octet pour octet, dans l'ordre officiel.
-        wire["tools"] = copy.deepcopy(_payload["tools"])
+        # Signature officielle exacte d'abord (copie), puis les extras client.
+        wire["tools"] = [copy.deepcopy(t) for t in _payload["tools"]] + _extras
     elif missing:
         base = list(tools) if isinstance(tools, list) else []
         base.extend(_free_shim_tool(n, is_resp) for n in missing)
@@ -5481,8 +5505,18 @@ def _iter_sse_data(lines):
 
 
 def _collect_chat_completion(lines, model) -> dict | None:
-    """Reconstitue un chat.completion JSON depuis des chunks SSE OpenAI."""
+    """Reconstitue un chat.completion JSON depuis des chunks SSE OpenAI.
+
+    [2026-10-25] Les `tool_calls` étaient JETÉS : on ne collectait que
+    `delta.content`. Un client non-stream recevait donc
+    ``finish_reason="tool_calls"`` avec un message vide et aucun appel d'outil
+    — le function calling ne fonctionnait qu'en stream. Constaté en live sur
+    la jambe free (corps de 44 Ko, outil `get_weather`). On recompose
+    maintenant les appels par `index` (id/nom dans le premier chunk,
+    `arguments` fragmentés sur les suivants, à concaténer).
+    """
     content, finish, usage = [], None, {}
+    tool_calls: dict[int, dict] = {}
     for ev in _iter_sse_data(lines):
         if not isinstance(ev, dict):
             continue
@@ -5490,15 +5524,56 @@ def _collect_chat_completion(lines, model) -> dict | None:
             if not isinstance(ch, dict):
                 continue
             d = ch.get("delta") or {}
-            t = d.get("content") if isinstance(d, dict) else None
-            if isinstance(t, str) and t:
-                content.append(t)
+            if isinstance(d, dict):
+                t = d.get("content")
+                if isinstance(t, str) and t:
+                    content.append(t)
+                for tc in d.get("tool_calls") or []:
+                    if not isinstance(tc, dict):
+                        continue
+                    try:
+                        idx = int(tc.get("index", 0))
+                    except (TypeError, ValueError):
+                        idx = 0
+                    slot = tool_calls.setdefault(
+                        idx,
+                        {
+                            "index": idx,
+                            "id": "",
+                            "type": "function",
+                            "function": {"name": "", "arguments": ""},
+                        },
+                    )
+                    if tc.get("id"):
+                        slot["id"] = tc["id"]
+                    if tc.get("type"):
+                        slot["type"] = tc["type"]
+                    fn = tc.get("function") or {}
+                    if isinstance(fn, dict):
+                        if fn.get("name"):
+                            slot["function"]["name"] = fn["name"]
+                        args = fn.get("arguments")
+                        if isinstance(args, str):
+                            slot["function"]["arguments"] += args
             if ch.get("finish_reason"):
                 finish = ch["finish_reason"]
         if isinstance(ev.get("usage"), dict):
             usage = ev["usage"]
-    if not content and not finish and not usage:
+    if not content and not finish and not usage and not tool_calls:
         return None
+    message: dict = {"role": "assistant", "content": "".join(content)}
+    if tool_calls:
+        ordered = [tool_calls[i] for i in sorted(tool_calls)]
+        for tc in ordered:
+            tc.pop("index", None)
+            if not tc.get("id"):
+                tc["id"] = f"call_free_{int(time.time() * 1000):x}{tc['function']['name'][:6]}"
+        message["tool_calls"] = ordered
+        # Parité OpenAI : un message d'appel d'outil porte content=null.
+        if not message["content"]:
+            message["content"] = None
+        if not finish:
+            finish = "tool_calls"
     return {
         "id": f"chatcmpl-free-{int(time.time() * 1000):x}",
         "object": "chat.completion",
@@ -5507,7 +5582,7 @@ def _collect_chat_completion(lines, model) -> dict | None:
         "choices": [
             {
                 "index": 0,
-                "message": {"role": "assistant", "content": "".join(content)},
+                "message": message,
                 "finish_reason": finish or "stop",
             }
         ],

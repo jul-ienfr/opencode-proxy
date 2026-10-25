@@ -143,6 +143,9 @@ passage = signature_complète(tools) ∧ prompt_système_présent
 ```
 
 - les **10** outils officiels sont nécessaires (un seul → 403) ;
+- les noms doivent être **exacts** : renommer `read` en `read_file` → refus
+  (mesuré : `429`, puis `200` avec le corps officiel juste après, même IP) ;
+- **des outils en plus sont acceptés** : 11 et 13 outils → `200` ;
 - le prompt système est nécessaire (absent → 429) ;
 - l'ordre des clés et `tool_choice:"auto"` sont la forme du client, pas des
   critères observables séparément.
@@ -151,6 +154,12 @@ C'est exactement la régression du 23/10 : l'ancienne mesure du 21/10 disait
 « `read` seul → 200 ». Le proxy n'injectait donc que `read`. Le jour où le gate a
 exigé la suite complète, chaque requête est devenue un 403/429 — sans qu'aucune
 IP, aucun modèle ni aucun quota ne soit en cause.
+
+Conséquence pratique des deux dernières règles : on **fusionne** au lieu de
+remplacer. Les 10 officiels partent en tête (signature exacte), puis les outils
+du client dont le nom n'est pas officiel. Le *function calling* d'un client
+tiers survit, et un outil client qui porterait un nom officiel est ignoré au
+profit de la définition officielle.
 
 ## 6. Correctif
 
@@ -210,17 +219,27 @@ Vérification finale dans `logs/requests.db` — 8 succès consécutifs, 3 modè
 2026-10-25T03:36:00Z  glm-5.3-flash-free       success=1  ip=186.247.41.77
 ```
 
+Et le *function calling* d'un client tiers, de bout en bout avec l'outil
+`get_weather` fourni par le client :
+
+```
+stream     : tool_calls -> {"city": "Paris"} (fragments SSE)
+non-stream : tool_calls -> {"name":"get_weather","arguments":"{\"city\": \"Paris\"}"}
+             finish_reason = tool_calls
+```
+
 ## 8. Coût et limites
 
 | Point | Valeur | Commentaire |
 |---|---|---|
 | Tokens d'entrée | ~11 000 / requête | prompt système + 10 tools |
 | Cache | 11 008 tokens cachés | le prompt est stable → coût réel faible |
-| Outils du client | remplacés par les 10 officiels | un client tiers perd son *function calling* propre ; c'était déjà le cas avec le shim `read` |
+| Outils du client | **fusionnés** après les 10 officiels | le *function calling* tiers est préservé (mesuré : extras acceptés) |
+| `tool_calls` non-stream | recomposés depuis le SSE | bug corrigé le 2026-10-25 : ils étaient jetés, message vide |
 | Comportement | le modèle se comporte en agent de code | conséquence directe du prompt système officiel |
 | Forme `responses` | non couverte par la capture | elle passe aujourd'hui via conversion → chat |
 
-Si un jour un client tiers a besoin de ses propres outils, il faudra **mesurer**
+Si un jour un client tiers a besoin de ses propres outils, il faut **mesurer**
 si le gate accepte les 10 officiels **plus** des outils supplémentaires. Ce n'est
 pas testé, et ce n'est pas nécessaire au fonctionnement actuel.
 

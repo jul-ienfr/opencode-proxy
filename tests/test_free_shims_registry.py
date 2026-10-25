@@ -217,7 +217,12 @@ class TestInjection:
         names = [t["function"]["name"] for t in wire.get("tools") or []]
         assert "bash" in names
 
-    def test_client_tools_are_replaced_by_the_official_copy(self):
+    def test_client_tools_are_preserved_after_the_official_set(self):
+        """Mesuré 2026-10-25 : 10 officiels + extras -> 200, un nom renommé -> refus.
+
+        On fusionne donc : signature officielle exacte d'abord, outils client
+        ensuite. Le function calling du client n'est plus perdu.
+        """
         wire = self._wire(
             {
                 "messages": [{"role": "user", "content": "hi"}],
@@ -234,7 +239,7 @@ class TestInjection:
             }
         )
         names = [t["function"]["name"] for t in wire.get("tools") or []]
-        assert names == self.OFFICIAL
+        assert names == self.OFFICIAL + ["my_tool"]
 
     def test_tool_choice_stays_auto(self):
         wire = self._wire({"messages": [{"role": "user", "content": "hi"}]})
