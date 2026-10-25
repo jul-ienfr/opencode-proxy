@@ -5281,6 +5281,18 @@ def _official_free_payload() -> dict:
         "system": system,
         "stream_options": body.get("stream_options") or {"include_usage": True},
     }
+    # [2026-10-25] Échec bruyant : une copie absente/corrompue ferait envoyer
+    # un corps réduit, donc un 403 sur TOUTE la jambe free. On le dit une fois
+    # (le champ /health?detail=full>free_payload>ok le montre aussi).
+    if len(tools) < 10 or not isinstance(system, dict):
+        logging.getLogger(__name__).warning(
+            "[free] copie officielle INCOMPLETE (%s) : tools=%d, system=%s — "
+            "la jambe free va être refusée en 403. Régénérer avec "
+            "scripts/capture_official_payload.py",
+            path,
+            len(tools),
+            bool(system),
+        )
     return _OFFICIAL_FREE_PAYLOAD
 
 
@@ -16451,6 +16463,18 @@ async def health(detail: str = "lite"):
     # payload léger est appelé toutes les 30 s par la supervision et ne doit
     # pas grossir (cf. note ci-dessus sur le coût de sérialisation).
     if _detail_full:
+        # [2026-10-25] Santé de la copie officielle : sans elle, TOUTE la jambe
+        # free repasse en 403. Le champ rend l'état visible sans lire les logs.
+        try:
+            _fp = _official_free_payload()
+            payload["free_payload"] = {
+                "tools": len(_fp.get("tools") or []),
+                "system_chars": len(((_fp.get("system") or {}).get("content")) or ""),
+                "ok": len(_fp.get("tools") or []) >= 10
+                and bool((_fp.get("system") or {}).get("content")),
+            }
+        except Exception as _e:
+            payload["free_payload"] = {"ok": False, "error": str(_e)[:200]}
         payload["empty_stream_incidents"] = empty_stream_stats()
         # [V6.3.1] Répartition des échecs free par cause : c'est la mesure qui
         # dira si la politique de reprise dépense ses rotations sur des refus

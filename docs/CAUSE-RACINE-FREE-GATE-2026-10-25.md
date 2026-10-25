@@ -280,6 +280,18 @@ Le 2026-10-25 après correctif : `free.chat` **10/10** et `free.messages`
 **10/10**, verdict `ok`. Si le gate change encore, ce canary passera en
 `failing` en quelques cycles — sans attendre qu'un utilisateur se plaigne.
 
+### Santé de la copie officielle
+
+```bash
+curl -s "http://127.0.0.1:4000/health?detail=full" | python -c "import json,sys; print(json.load(sys.stdin)['free_payload'])"
+# {'tools': 10, 'system_chars': 21603, 'ok': True}
+```
+
+`ok: false` (fichier absent, tronqué, tools manquants) signifie que toute la
+jambe free va répondre 403 : régénérer avec
+`scripts/capture_official_payload.py`. Un warning est aussi émis dans les logs
+au premier chargement invalide.
+
 ### Régénérer la capture (si le client officiel évolue)
 
 ```bash
