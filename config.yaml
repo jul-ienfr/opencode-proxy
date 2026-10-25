@@ -796,3 +796,10 @@ observability:
   slo_targets:
     p50_ms: 12000
     p95_ms: 30000
+  slo_targets_by_model:
+    mimo-v2.6-flash-free:
+      p50_ms: 20000
+      p95_ms: 45000
+    glm-5.3-flash-free:
+      p50_ms: 12000
+      p95_ms: 30000

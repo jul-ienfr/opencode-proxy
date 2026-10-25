@@ -53,11 +53,17 @@ def _as_series(entries) -> list[dict]:
     return rows
 
 
-def evaluate(entries, targets: dict | None = None) -> dict:
+def evaluate(entries, targets: dict | None = None, targets_by_model: dict | None = None) -> dict:
     """Verdict SLO sur des series mesurees. Pur, ne leve jamais.
 
     ``entries`` : ``{"leg_ms:free:modele": {"n", "p50_ms", "p95_ms"}}`` (la forme
     exposée par ``/health``) ou des tuples ``(n, p50, p95, p99)``.
+
+    [2026-10-25] ``targets_by_model`` : cibles par modèle (clé = nom de modèle
+    tel qu'il apparaît dans la série ``leg_ms:<jambe>:<modèle>``). Utile quand
+    les modèles n'ont pas le même profil : un modèle de raisonnement verbeux
+    produit des complétions structurellement plus longues qu'un modèle court.
+    Un modèle absent de la table retombe sur ``targets``.
     """
     tgt = dict(DEFAULT_TARGETS)
     try:
@@ -68,6 +74,20 @@ def evaluate(entries, targets: dict | None = None) -> dict:
     except Exception:
         pass
 
+    per_model: dict[str, dict] = {}
+    try:
+        if isinstance(targets_by_model, dict):
+            for model, override in targets_by_model.items():
+                if not isinstance(override, dict):
+                    continue
+                merged = dict(tgt)
+                for name in ("p50_ms", "p95_ms"):
+                    if name in override:
+                        merged[name] = float(override[name])
+                per_model[str(model)] = merged
+    except Exception:
+        per_model = {}
+
     series = []
     # None = aucun verdict exploitable pour l'instant. Sans ce `None`, un
     # payload entièrement « unknown » (que des séries jeunes) sortirait `ok` —
@@ -76,17 +96,21 @@ def evaluate(entries, targets: dict | None = None) -> dict:
     order = {"unknown": 0, "ok": 1, "degraded": 2, "breached": 3}
 
     for row in _as_series(entries):
+        # Clé « leg_ms:<jambe>:<modèle> » -> modèle.
+        parts = str(row["key"]).split(":", 2)
+        model = parts[2] if len(parts) == 3 else ""
+        row_tgt = per_model.get(model, tgt)
         if row["n"] < MIN_SAMPLES:
             verdict = "unknown"
-        elif row["p50_ms"] > tgt["p50_ms"]:
+        elif row["p50_ms"] > row_tgt["p50_ms"]:
             verdict = "breached"
-        elif row["p95_ms"] > tgt["p95_ms"]:
+        elif row["p95_ms"] > row_tgt["p95_ms"]:
             verdict = "degraded"
         else:
             verdict = "ok"
         row["verdict"] = verdict
-        row["p50_target_ms"] = tgt["p50_ms"]
-        row["p95_target_ms"] = tgt["p95_ms"]
+        row["p50_target_ms"] = row_tgt["p50_ms"]
+        row["p95_target_ms"] = row_tgt["p95_ms"]
         series.append(row)
         # `unknown` n'écrase jamais un vrai verdict : une série jeune ne doit pas
         # masquer une série cassée. Mais s'il n'y a QUE des séries jeunes, le

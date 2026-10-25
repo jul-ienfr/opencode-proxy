@@ -16590,7 +16590,10 @@ async def health(detail: str = "lite"):
                     # 4 s est structurellement inatteignable et le SLO restait
                     # « breached » en permanence sur du trafic sain.
                     _slo_targets = yaml_get("observability", "slo_targets", None)
-                    payload["slo"] = _slo_evaluate(_leg_series, targets=_slo_targets)
+                    _slo_by_model = yaml_get("observability", "slo_targets_by_model", None)
+                    payload["slo"] = _slo_evaluate(
+                        _leg_series, targets=_slo_targets, targets_by_model=_slo_by_model
+                    )
                 except Exception:
                     pass
         except Exception:

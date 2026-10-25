@@ -384,7 +384,7 @@ verbeuses), pas des reprises : une seule requête a échoué sur 196.
 | `reasoning_content` non-stream | recomposé depuis le SSE | bug corrigé le 2026-10-25 : mimo et deepseek l'émettent, il était jeté |
 | Raisonnement (3 protocoles) | **porté partout** | mesuré 2026-10-25 : chat `reasoning_content`, Anthropic bloc `thinking` + `thinking_delta`, Responses item `reasoning` + événements |
 | Latence observée | p50 4,4 s (deepseek), 8,1 s (glm), 11,4 s (mimo) | complétion entière avec ~11k tokens d'entrée ; le SLO `p50 < 4 s` du health vise le TTFT, pas la génération |
-| SLO health | cibles pilotées par `observability.slo_targets` (12 s / 30 s) | la série `leg_ms` mesure la complétion complète ; vérifié après réglage : `ok`, p50 1,95 s |
+| SLO health | cibles pilotées par `observability.slo_targets` (12 s / 30 s) + `slo_targets_by_model` | la série `leg_ms` mesure la complétion complète ; `mimo` (raisonnement verbeux) a sa propre cible p95 45 s. Vérifié : `ok` |
 | Comportement | le modèle se comporte en agent de code | conséquence directe du prompt système officiel |
 | Choix d'outil | peut privilégier un outil officiel | observé quand la requête est vide ; avec une entrée valide, l'outil du client est appelé (2/2 mesures) |
 | Erreurs en cours de flux | HTTP 200 déjà engagé | quand toutes les stations sont à quota, le refus part en `data: {"error":…}` (le client affiche le JSON). Un vrai 4xx serait plus lisible mais exigerait un préflight avant ouverture du flux |

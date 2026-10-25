@@ -60,6 +60,31 @@ class TestVerdicts:
         assert 0 < float(t["p50_ms"]) < float(t["p95_ms"])
         assert float(t["p50_ms"]) >= DEFAULT_TARGETS["p50_ms"]
 
+    def test_cibles_par_modele(self):
+        """Un modèle verbeux a sa propre cible ; les autres gardent la globale."""
+        series = {
+            "leg_ms:free:mimo-v2.6-flash-free": {"n": 10, "p50_ms": 13000, "p95_ms": 33000},
+            "leg_ms:free:deepseek-v4.1-flash-free": {"n": 10, "p50_ms": 7000, "p95_ms": 10000},
+        }
+        v = evaluate(
+            series,
+            targets={"p50_ms": 12000, "p95_ms": 30000},
+            targets_by_model={"mimo-v2.6-flash-free": {"p50_ms": 20000, "p95_ms": 45000}},
+        )
+        by_key = {r["key"].split(":", 2)[2]: r for r in v["series"]}
+        assert by_key["mimo-v2.6-flash-free"]["verdict"] == "ok"
+        assert by_key["mimo-v2.6-flash-free"]["p95_target_ms"] == 45000.0
+        assert by_key["deepseek-v4.1-flash-free"]["p95_target_ms"] == 30000.0
+        assert v["status"] == "ok"
+
+    def test_modele_sans_cible_specifique_retombe_sur_la_globale(self):
+        v = evaluate(
+            {"leg_ms:free:inconnu": {"n": 10, "p50_ms": 40000, "p95_ms": 50000}},
+            targets={"p50_ms": 12000, "p95_ms": 30000},
+            targets_by_model={"autre": {"p50_ms": 99000, "p95_ms": 99000}},
+        )
+        assert v["status"] == "breached"
+
 
 class TestInsufficientData:
     def test_too_few_samples_is_unknown(self):
