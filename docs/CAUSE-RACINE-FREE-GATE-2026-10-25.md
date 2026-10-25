@@ -394,7 +394,33 @@ Si un jour un client tiers a besoin de ses propres outils, il faut **mesurer**
 si le gate accepte les 10 officiels **plus** des outils supplémentaires. Ce n'est
 pas testé, et ce n'est pas nécessaire au fonctionnement actuel.
 
-## 9. Vérifier et maintenir
+## 9. Latence : où part le temps (mesuré 2026-10-25)
+
+| Poste | Coût mesuré | Commentaire |
+|---|---|---|
+| Traitement proxy (injection 44 Ko, sérialisation) | **0,02–0,07 ms** | négligeable |
+| Estimation de tokens (tiktoken, 11k) | 1,6 ms médian | premier appel 110 ms (chargement) |
+| Identité par IP, empreinte TLS | ~0 ms | cache mémoire |
+| Aller-retour réseau via le tunnel | **~160 ms** (session chaude) | ~600 ms si handshake TCP+TLS |
+| Génération du modèle | **1,4–2,3 s** pour 8 tokens ; 6,5 s médian sur réponses réelles | hors de portée du proxy |
+
+Conclusion : le proxy représente **2 à 3 %** du temps total. Le seul gain
+réel côté proxy était le handshake à froid.
+
+### Préchauffage TLS
+
+Le pool curl évince une session après **10 min d'inactivité**. La requête
+suivante repayait alors ~600 ms de handshake. Un GET minuscule sur
+`https://opencode.ai/robots.txt` toutes les **5 min** garde la connexion
+chaude — aucune requête d'inférence, donc **aucun quota consommé**
+(`free_prewarm` dans `config.yaml`).
+
+Gain : ~440 ms sur la première requête après une période d'inactivité.
+Le reste de la latence est la génération du modèle : pour aller plus vite il
+faut changer de modèle (`deepseek` ≈ 6,5 s médian, `mimo` ≈ 21 s) ou activer
+le hedging, qui double la consommation de quota.
+
+## 10. Vérifier et maintenir
 
 ### Vérification rapide
 
@@ -466,7 +492,7 @@ complète (le client émet aussi des POST de titre/compaction) et réécrit
 | `410 ModelDeprecated` | modèle retiré | mettre à jour `free_model_candidates` |
 | `200` mais réponse vide/excentrée | prompt système injecté | vérifier que les messages client suivent bien le prompt |
 
-## 10. Chronologie de la recherche (pour mémoire)
+## 11. Chronologie de la recherche (pour mémoire)
 
 1. **24/10** — capture automatique au reset : 43 tentatives, 0 succès.
 2. **24/10** — vérification que `retry-after` = secondes jusqu'à minuit
@@ -483,7 +509,7 @@ complète (le client émet aussi des POST de titre/compaction) et réécrit
    `OpenCodeQuotaResetCapture`) supprimées : elles n'avaient plus d'objet et
    auraient consommé du quota free pour rien.
 
-## 11. Ce que ce document remplace
+## 12. Ce que ce document remplace
 
 Les plans antérieurs (`PLAN-corrections-429.md`, `PLAN_CORRECTION_FAUX_429.md`,
 `PLAN_ALIGNEMENT_CLIENT_OFFICIEL_2026-10-09.md`) décrivaient le gate d'avant le

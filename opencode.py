@@ -2934,6 +2934,14 @@ async def lifespan(app):
         app.state._canary_loop_task = asyncio.create_task(_free_canary_loop())
         _debug("  [lifespan] canary loop started")
 
+    # [2026-10-25] Préchauffage TLS : le pool évince une session après 10 min
+    # d'inactivité (TTL 600 s) ; la requête suivante repayait ~600 ms de
+    # handshake TCP+TLS à travers le tunnel. Un GET minuscule (robots.txt,
+    # AUCUN quota d'inférence) garde la connexion chaude.
+    if yaml_get("free_prewarm", "enabled", True):
+        app.state._free_prewarm_task = asyncio.create_task(_free_prewarm_loop())
+        _debug("  [lifespan] free prewarm loop started")
+
     # Ultra-fast DB writer (single writer, batch 32)
     # [fix hot-restart] ``asyncio.Queue`` se lie à la boucle courante au
     # premier get/put. Un hot-restart (ServerManager.restart) réutilise les
@@ -16496,6 +16504,101 @@ async def _canary_cycle(model_override: str = "") -> dict:
         out[probe] = await _canary_probe_once(probe, path, model, timeout_s)
     _debug(f"  [canary] cycle {out}")
     return {"model": model, "probes": out}
+
+
+async def _free_prewarm_once() -> bool:
+    """Établit TCP+TLS vers la station courante, sans consommer de quota.
+
+    Le pool curl évince une session après ``_CURL_POOL_IDLE_TTL`` (600 s) ;
+    la requête suivante repayait alors ~600 ms de handshake à travers le
+    tunnel (mesuré). On garde la connexion chaude avec un GET minuscule sur
+    une ressource statique — jamais l'endpoint d'inférence.
+
+    L'URL est dérivée de ``API_BASE_FREE`` (résolveur de config) ou de
+    ``free_prewarm.url`` : aucun littéral d'amont en dur ici.
+
+    Fail-soft : n'importe quelle erreur -> False, jamais d'exception.
+    """
+    pool = _free_ip_pool
+    if pool is None or not getattr(pool, "enabled", False):
+        return False
+    try:
+        proxy = pool.proxy_url
+    except Exception:
+        proxy = None
+    if not proxy:
+        return False
+    try:
+        url = str(yaml_get("free_prewarm", "url", "") or "").strip()
+    except Exception:
+        url = ""
+    if not url:
+        try:
+            from urllib.parse import urlsplit
+
+            base = str(getattr(_cfg_settings, "API_BASE_FREE", "") or "")
+            parts = urlsplit(base)
+            if parts.scheme and parts.netloc:
+                url = f"{parts.scheme}://{parts.netloc}/robots.txt"
+        except Exception:
+            url = ""
+    if not url:
+        return False
+    try:
+        st = getattr(pool, "active_station", None)
+        ip = str(getattr(st, "current_ip", "") or "")
+    except Exception:
+        ip = ""
+    try:
+        imp, fp = _get_free_fp_kwargs()
+        p, slot = await _get_pooled_curl_session(proxy, imp, fp, egress_ip=ip or None)
+    except Exception:
+        return False
+    try:
+        r = await slot.sess.get(url, timeout=(5, 15))
+        close = getattr(r, "aclose", None)
+        if close is not None:
+            try:
+                await close()
+            except Exception:
+                pass
+        return True
+    except Exception:
+        return False
+    finally:
+        try:
+            await p.checkin(slot)
+        except Exception:
+            pass
+
+
+async def _free_prewarm_loop() -> None:
+    """Préchauffage périodique (par défaut toutes les 5 min)."""
+    try:
+        interval = float(yaml_get("free_prewarm", "interval_s", 300) or 300)
+    except Exception:
+        interval = 300.0
+    interval = max(30.0, interval)
+    # Premier passage dès que la flotte est up (laisse les tunnels se monter).
+    await asyncio.sleep(min(15.0, interval))
+    failures = 0
+    while True:
+        try:
+            ok = await _free_prewarm_once()
+            _debug(f"  [free-prewarm] connexion {'chaude' if ok else 'non établie'}")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            ok = False
+            _debug(f"  [free-prewarm] erreur {type(exc).__name__}: {exc}")
+        if ok:
+            failures = 0
+            await asyncio.sleep(interval)
+        else:
+            # Au démarrage, les tunnels peuvent ne pas être prêts : on réessaie
+            # toutes les 20 s pendant ~2 min, puis on retombe sur l'intervalle.
+            failures += 1
+            await asyncio.sleep(20.0 if failures < 6 else interval)
 
 
 async def _free_canary_loop() -> None:
