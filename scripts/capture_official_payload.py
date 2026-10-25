@@ -123,6 +123,16 @@ def main() -> None:
     ap.add_argument("--model", default="deepseek-v4.1-flash-free")
     ap.add_argument("--port", type=int, default=4599)
     ap.add_argument("--timeout", type=float, default=180.0)
+    ap.add_argument(
+        "--binary",
+        default="opencode",
+        help="binaire client à intercepter (ex. opencode-cli.exe v2.1.4)",
+    )
+    ap.add_argument(
+        "--standalone",
+        action="store_true",
+        help="passe --standalone au client (v2 : sinon il utilise le service en arrière-plan et ignore OPENCODE_CONFIG)",
+    )
     args = ap.parse_args()
 
     server = ThreadingHTTPServer(("127.0.0.1", args.port), _Capture)
@@ -134,7 +144,10 @@ def main() -> None:
     env["OPENCODE_CONFIG"] = config_path
     env["OPENCODE_DISABLE_AUTOUPDATE"] = "1"
 
-    cmd = ["opencode", "run", "--model", f"opencode-local/{args.model}", "Réponds exactement: OK"]
+    cmd = [args.binary, "run"]
+    if args.standalone:
+        cmd.append("--standalone")
+    cmd += ["--model", f"opencode-local/{args.model}", "Réponds exactement: OK"]
     print(f"[capture] lancement : {' '.join(cmd)}")
     try:
         proc = subprocess.run(

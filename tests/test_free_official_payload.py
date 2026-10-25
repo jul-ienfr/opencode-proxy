@@ -115,6 +115,73 @@ def test_un_outil_client_qui_shadowe_un_nom_officiel_est_ignore():
     assert wire["tools"][4] is not shadow
 
 
+V2_SYSTEM = "You are an AI agent running in OpenCode, a coding agent harness. Help the user."
+V2_TOOLS = [
+    "edit", "glob", "grep", "question", "read", "shell",
+    "skill", "subagent", "webfetch", "websearch", "write", "execute",
+]
+
+
+def _tool(name):
+    return {
+        "type": "function",
+        "function": {"name": name, "description": "d", "parameters": {"type": "object"}},
+    }
+
+
+def test_corps_officiel_v2_traverse_tel_quel():
+    """Client 2.1.4 : prompt v2 + 12 outils, dont `read`.
+
+    Mesuré : système v2 + read -> 200. On ne doit PAS injecter le jeu v1,
+    sinon le modèle appelle `bash`/`task`/`todowrite`, que le client v2 ne
+    sait pas exécuter.
+    """
+    body = {
+        "model": "m",
+        "messages": [
+            {"role": "system", "content": V2_SYSTEM},
+            {"role": "user", "content": "salut"},
+        ],
+        "tools": [_tool(n) for n in V2_TOOLS],
+        "stream": True,
+        "stream_options": {"include_usage": True},
+        "max_completion_tokens": 32,
+    }
+    wire, forced = oc._free_wire_body(body, force_stream=True)
+    assert forced is False
+    assert wire == body
+    assert [t["function"]["name"] for t in wire["tools"]] == V2_TOOLS
+
+
+def test_systeme_v2_sans_read_recoit_les_outils_officiels():
+    body = {
+        "model": "m",
+        "messages": [{"role": "system", "content": V2_SYSTEM},
+                     {"role": "user", "content": "salut"}],
+        "tools": [_tool("edit")],
+        "stream": True,
+    }
+    wire, _ = oc._free_wire_body(body, force_stream=True)
+    names = [t["function"]["name"] for t in wire["tools"]]
+    assert names == OFFICIAL_TOOL_NAMES
+    # Le prompt v2 est conservé : pas de prompt v1 ajouté par-dessus.
+    assert wire["messages"][0]["content"] == V2_SYSTEM
+
+
+def test_systeme_custom_avec_read_recoit_le_prompt_officiel():
+    """Mesuré : système court + read -> 429. Il faut donc le prompt officiel."""
+    body = {
+        "model": "m",
+        "messages": [{"role": "system", "content": "Tu es bref."},
+                     {"role": "user", "content": "salut"}],
+        "tools": [_tool("read")],
+        "stream": True,
+    }
+    wire, _ = oc._free_wire_body(body, force_stream=True)
+    assert "You are opencode, an interactive CLI tool" in wire["messages"][0]["content"]
+    assert wire["messages"][1]["content"] == "Tu es bref."
+
+
 def test_l_ordre_des_cles_reste_celui_du_client():
     """Ordre officiel : model, max_tokens, messages, tools, tool_choice, stream."""
     body = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}

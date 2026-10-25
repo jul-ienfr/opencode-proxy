@@ -5308,14 +5308,29 @@ _OFFICIAL_FREE_PAYLOAD: dict | None = None
 
 
 def _has_official_system(messages) -> bool:
-    """Le corps porte-t-il déjà le prompt système officiel ?"""
+    """Le corps porte-t-il un prompt système officiel reconnu ?
+
+    [2026-10-25] Deux clients officiels coexistent et n'ont PAS le même
+    prompt :
+      * 1.18.31 -> « You are opencode, an interactive CLI tool ... »
+      * 2.1.4   -> « You are an AI agent running in OpenCode, a coding agent
+                   harness ... »
+    Le gate vérifie la présence d'un prompt officiel + l'outil ``read``
+    (mesuré : système court + read -> 429 ; système v2 + read -> 200). Ne
+    reconnaître que le marqueur v1 faisait injecter inutilement le jeu v1 à
+    un client v2 — donc des outils que le client ne sait pas exécuter.
+    """
     if not isinstance(messages, list):
         return False
+    markers = (
+        "You are opencode, an interactive CLI tool",
+        "You are an AI agent running in OpenCode",
+    )
     for m in messages:
         if not isinstance(m, dict) or m.get("role") != "system":
             continue
         c = m.get("content")
-        if isinstance(c, str) and "You are opencode, an interactive CLI tool" in c:
+        if isinstance(c, str) and any(mk in c for mk in markers):
             return True
     return False
 
@@ -5376,16 +5391,18 @@ def _free_wire_body(body, force_stream: bool = False, egress_ip: str | None = No
     # mesure future le réhabilite.
     _payload = _official_free_payload()
     _official_names = _payload["names"]
-    # [2026-10-25] Le gate a changé le 23/10 23:17 UTC: « read seul -> 200 »
-    # (mesure du 21/10) ne vaut plus. Il exige la suite COMPLÈTE des 10 tools
-    # officiels + le prompt système. Mesuré sur le vrai endpoint:
-    #   10 tools + système -> 200 ; 1 tool -> 403 ; sans système -> 429.
-    # [2026-10-25 bis] Il accepte des tools EN PLUS mais refuse un nom
-    # officiel RENOMMÉ : 10+1 et 10+3 -> 200 ; `read` -> `read_file` -> 429
-    # (même IP, contrôle officiel -> 200 juste après). On FUSIONNE donc :
-    # les 10 officiels d'abord (signature exacte), puis les outils du client
-    # qui ne portent pas un nom officiel. Le function calling des clients
-    # tiers est préservé au lieu d'être écrasé.
+    # [2026-10-25] Règle MESURÉE avec témoins intercalés :
+    #   * un prompt système OFFICIEL (1.18.31 ou 2.1.4) + l'outil `read`
+    #     -> 200, quels que soient les autres outils ;
+    #   * système court/custom + `read`             -> 429 ;
+    #   * système officiel SANS `read`              -> 429 ;
+    #   * sans système + 10 outils                  -> 429.
+    # Donc : prompt officiel reconnu + `read` = signature suffisante. On ne
+    # réinjecte PAS la copie v1 quand le client est déjà un client officiel
+    # (v1 ou v2) : cela écrasait les outils v2 (shell/execute/subagent…) par
+    # des outils que le client ne sait pas exécuter.
+    _has_official_sys = _has_official_system(body.get("messages"))
+    _signature_ok = bool(_has_official_sys and "read" in have)
     _client_tools = tools if isinstance(tools, list) else []
     _extras: list = []
     _seen: set = set()
@@ -5396,22 +5413,19 @@ def _free_wire_body(body, force_stream: bool = False, egress_ip: str | None = No
                 continue
             _seen.add(_n)
             _extras.append(_t)
-    need_tools = is_chat and bool(_payload["tools"]) and (
-        not _official_names.issubset(have) or bool(_extras)
-    )
-    need_system = is_chat and isinstance(_payload.get("system"), dict) and not _has_official_system(
-        body.get("messages")
-    )
+    need_tools = is_chat and bool(_payload["tools"]) and not _signature_ok
+    need_system = is_chat and isinstance(_payload.get("system"), dict) and not _has_official_sys
     missing = [n for n in ("read",) if n not in have] if is_resp else []
     need_stream = force_stream and body.get("stream") is not True
     need_key = is_resp and not body.get("prompt_cache_key")
     will_have_tools = bool(tools) or need_tools or bool(missing)
-    # Le client pose « auto » dès qu'il y a des tools (242/242 mesures) — y
-    # compris quand les tools viennent de la copie officielle.
-    need_tc = is_chat and will_have_tools and "tool_choice" not in body
-    # L'ordre client n'est réordonné que si le corps est en forme chat ET
-    # finira par porter des tools (ceux d'origine OU la copie officielle).
-    need_order = is_chat and will_have_tools
+    # Le client v1 pose « auto » dès qu'il a des tools ; le v2 ne le pose pas.
+    # On n'ajoute donc `tool_choice` que quand NOUS injectons la grille, pour
+    # ne pas déformer un corps officiel déjà valide (v1 ou v2).
+    need_tc = is_chat and need_tools and "tool_choice" not in body
+    # Idem pour l'ordre des clés : un corps officiel (signature ok) traverse
+    # tel quel, quel que soit son ordre (v2 utilise max_completion_tokens).
+    need_order = is_chat and will_have_tools and not _signature_ok
     if (
         not missing
         and not need_tools

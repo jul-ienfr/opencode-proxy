@@ -106,6 +106,26 @@ Deux constats immédiats :
 Ces écarts ne sont pas la cause (voir bisection C), mais ils sont désormais
 documentés.
 
+### Le client 2.1.4 (desktop) diffère complètement de 1.18.31
+
+Capture du `opencode-cli.exe` v2.1.4 (même méthode d'interception) :
+
+| | 1.18.31 | 2.1.4 |
+|---|---|---|
+| Outils | **10** : `bash, edit, glob, grep, read, skill, task, todowrite, webfetch, write` | **12** : `edit, glob, grep, question, read, shell, skill, subagent, webfetch, websearch, write, execute` |
+| Prompt système | 21 603 car., « You are opencode, an interactive CLI tool… » | **9 691 car., « You are an AI agent running in OpenCode, a coding agent harness… »** |
+| Corps | `max_tokens`, `tool_choice` | **`max_completion_tokens`**, pas de `tool_choice` |
+| En-têtes | quartet `x-opencode-request/session/…` | `x-opencode-session-id` + `x-session-affinity` + `X-Session-Id` + `x-opencode-project` + `x-opencode-client`, **sans `x-opencode-request`** |
+
+Conséquence : injecter le jeu v1 à un client v2 lui donnait des outils
+(`bash`, `task`, `todowrite`) qu'il **ne sait pas exécuter**. Depuis le
+correctif, un client officiel reconnu (v1 **ou** v2) traverse tel quel.
+
+Le CLI v2 ne lit `OPENCODE_CONFIG` que lancé avec **`--standalone`** : sans ce
+flag il se connecte au service en arrière-plan, qui a sa propre configuration
+et ignore le fichier. C'est ce qui faisait échouer le premier test
+(`Model unavailable`).
+
 ## 5. Bisection : ce qui décide
 
 Même station, même IP, même seconde, même TLS. Seuls le corps et les en-têtes
@@ -138,28 +158,45 @@ Message du 403 :
 
 ### La règle exacte
 
+> **Révision du 2026-10-25 (15 h).** La règle mesurée le matin (« les 10 outils
+> exacts sont nécessaires ») **ne tient plus** : re-mesurée avec des témoins
+> intercalés sur une station fraîche, elle est plus simple. Les deux mesures
+> sont consignées ici, la plus récente faisant foi.
+
 ```
-passage = signature_complète(tools) ∧ prompt_système_présent
+passage = prompt_système_officiel_reconnu ∧ outil `read` présent
 ```
 
-- les **10** outils officiels sont nécessaires (un seul → 403) ;
-- les noms doivent être **exacts** : renommer `read` en `read_file` → refus
-  (mesuré : `429`, puis `200` avec le corps officiel juste après, même IP) ;
-- **des outils en plus sont acceptés** : 11 et 13 outils → `200` ;
-- le prompt système est nécessaire (absent → 429) ;
-- l'ordre des clés et `tool_choice:"auto"` sont la forme du client, pas des
-  critères observables séparément.
+Mesures du 15 h (chaque cas encadré par un témoin qui repasse en 200, donc
+pas de confusion avec le quota) :
 
-C'est exactement la régression du 23/10 : l'ancienne mesure du 21/10 disait
-« `read` seul → 200 ». Le proxy n'injectait donc que `read`. Le jour où le gate a
-exigé la suite complète, chaque requête est devenue un 403/429 — sans qu'aucune
-IP, aucun modèle ni aucun quota ne soit en cause.
+| Corps | Résultat |
+|---|---|
+| 12 outils v2 + prompt v2 | **200** |
+| `read` seul + prompt v1 | **200** |
+| `read` seul + prompt v2 | **200** |
+| `read` + `edit` + prompt v2 | **200** |
+| 6 outils **sans** `read` + prompt v2 | **429** |
+| aucun outil + prompt v2 | **429** |
+| `read` seul + prompt système **court** (« Tu es un assistant concis. ») | **429** |
+| `read` seul, **sans** système | **429** |
 
-Conséquence pratique des deux dernières règles : on **fusionne** au lieu de
-remplacer. Les 10 officiels partent en tête (signature exacte), puis les outils
-du client dont le nom n'est pas officiel. Le *function calling* d'un client
-tiers survit, et un outil client qui porterait un nom officiel est ignoré au
-profit de la définition officielle.
+Deux conséquences :
+
+1. **Le contenu du prompt système compte** : un prompt court ou absent est
+   refusé même avec `read`. Il faut un prompt officiel reconnu.
+2. **Les autres outils sont libres** : seul `read` est nécessaire. Le jeu v2
+   (12 outils) passe tel quel.
+
+Conséquence pour le proxy : on **n'injecte plus la copie v1** quand le client
+est déjà un client officiel (v1 ou v2) — il traverse tel quel. L'injection
+reste pour les clients génériques, qui n'ont ni prompt officiel ni `read`.
+
+> **Pourquoi le changement.** Le matin, un corps v1 avec `read` seul
+> répondait 403 ; l'après-midi, le même corps répond 200. Le provider ajuste
+> son gate en continu : c'est précisément pour cela que le proxy vérifie une
+> **signature minimale** et laisse passer les clients officiels, au lieu de
+> figer un jeu d'outils qui peut changer sous nos pieds.
 
 ## 6. Correctif
 
