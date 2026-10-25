@@ -290,12 +290,48 @@ Envoyés à l'amont sur `deepseek-v4.1`, `glm-5.3` et `mimo-v2.6` : rien,
 `enable_thinking: true`. **200 partout**, raisonnement présent quand le
 prompt l'exige.
 
+Idem pour des valeurs **non déclarées** par le modèle : `glm` accepte
+`medium` et `xhigh` (il ne déclare que low/high/max), `deepseek` accepte
+`medium`, `mimo` accepte `high` et `minimal` (il ne déclare rien), `beam`
+accepte `max`. **200 partout** : l'amont est permissif.
+
 Conclusion : aucun paramètre n'est requis ni rejeté ; le raisonnement est
 actif par défaut. Le proxy ne force donc rien et laisse passer ce que le
 client envoie. Le seul point dur reste l'historique : `deepseek` exige
 `reasoning_content` sur chaque message assistant (rempli à `" "` par
 `ensure_deepseek_reasoning`), tandis que `glm` et `mimo` acceptent son
 absence — mesuré sur un tour assistant rejoué, avec et sans le champ.
+
+### Tous les modèles free non dépréciés (models.dev, 2026-10-25)
+
+| Modèle | `reasoning_options` |
+|---|---|
+| `deepseek-v4.1-flash-free` | `toggle` + `effort` low/high/max |
+| `glm-5.3-flash-free` | `effort` low/high/max |
+| `beam-free` | `effort` low/medium/high/xhigh… |
+| `flint-40b-free` | `effort` low/medium/high/xhigh… |
+| `nemotron-3.5-super-vl-free` | `effort` none/minimal/low/medium/high… |
+| `mimo-v2.6-flash-free` | *(aucune : toujours actif)* |
+| `nemotron-3.5-lightning-free` | *(aucune)* |
+| `nemotron-3-ultra-free` | *(aucune)* |
+| `big-pickle` | *(aucune)* |
+
+Le champ de sortie reste `reasoning_content` pour tous (sauf le dialecte
+`reasoning`/`reasoning_details` constaté sur mimo et nemotron), d'où la
+normalisation décrite plus haut.
+
+### Différence entre le client installé (1.18.31) et 1.19.3
+
+- **1.18.31** : le binaire contient la fonction qui traduit
+  `reasoning_options` en options provider (extraite verbatim ci-dessus) ;
+  `@ai-sdk/openai-compatible` envoie `reasoning_effort` quand le modèle
+  déclare une option `effort`, et rien du tout sinon.
+- **1.19.3** : réécriture avec ses propres protocoles ; le parseur
+  `openai-chat.ts` ne lit **que** `delta.reasoning_content`.
+
+D'où la règle du proxy : **émettre `reasoning_content` dans tous les cas**,
+tout en conservant `reasoning`/`reasoning_details` pour les clients qui
+lisent le dialecte OpenRouter.
 
 À noter : `deepseek-v4.1` ne raisonne pas sur une question triviale
 (« 17*23 ») — d'où les faux négatifs des premiers tests. Sur une demande qui
