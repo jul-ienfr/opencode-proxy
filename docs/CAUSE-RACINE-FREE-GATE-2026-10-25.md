@@ -269,6 +269,7 @@ reasoning    : "The user asks in French: 'How much is 17*23?' ..."
 | Outils du client | **fusionnés** après les 10 officiels | le *function calling* tiers est préservé (mesuré : extras acceptés) |
 | `tool_calls` non-stream | recomposés depuis le SSE | bug corrigé le 2026-10-25 : ils étaient jetés, message vide |
 | `reasoning_content` non-stream | recomposé depuis le SSE | bug corrigé le 2026-10-25 : mimo et deepseek l'émettent, il était jeté |
+| Raisonnement en Anthropic/Responses | non converti | le chat porte `reasoning_content` ; `/v1/messages` et `/v1/responses` ne l'exposent pas encore (pas de bloc `thinking` / item `reasoning`) |
 | Latence observée | p50 4,4 s (deepseek), 8,1 s (glm), 11,4 s (mimo) | complétion entière avec ~11k tokens d'entrée ; le SLO `p50 < 4 s` du health vise le TTFT, pas la génération |
 | SLO health | cibles pilotées par `observability.slo_targets` (12 s / 30 s) | la série `leg_ms` mesure la complétion complète ; vérifié après réglage : `ok`, p50 1,95 s |
 | Comportement | le modèle se comporte en agent de code | conséquence directe du prompt système officiel |
