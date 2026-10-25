@@ -237,6 +237,21 @@ content      : "391"
 reasoning    : "The user asks in French: 'How much is 17*23?' ..."
 ```
 
+### Matrice du raisonnement (2026-10-25)
+
+Vérifiée sur `mimo-v2.6-flash-free`, un modèle qui raisonne réellement :
+
+| Protocole | Non-stream | Stream |
+|---|---|---|
+| `/v1/chat/completions` | `message.reasoning_content` | `delta.reasoning_content` |
+| `/v1/messages` | bloc `thinking` (signature locale) | `thinking_delta` |
+| `/v1/responses` | item `reasoning` | événements `reasoning` |
+
+Un premier test avait conclu à tort que les façades Anthropic/Responses
+perdaient le raisonnement : le modèle avait répondu sans raisonner sur cet
+appel. La matrice ci-dessus a été refaite avec un prompt qui l'oblige à
+détailler son calcul, trois fois de suite.
+
 ### Validation du chemin réel (2026-10-25)
 
 - **Client officiel via le proxy** : `opencode` 1.18.31 configuré sur
@@ -269,7 +284,7 @@ reasoning    : "The user asks in French: 'How much is 17*23?' ..."
 | Outils du client | **fusionnés** après les 10 officiels | le *function calling* tiers est préservé (mesuré : extras acceptés) |
 | `tool_calls` non-stream | recomposés depuis le SSE | bug corrigé le 2026-10-25 : ils étaient jetés, message vide |
 | `reasoning_content` non-stream | recomposé depuis le SSE | bug corrigé le 2026-10-25 : mimo et deepseek l'émettent, il était jeté |
-| Raisonnement en Anthropic/Responses | non converti | le chat porte `reasoning_content` ; `/v1/messages` et `/v1/responses` ne l'exposent pas encore (pas de bloc `thinking` / item `reasoning`) |
+| Raisonnement (3 protocoles) | **porté partout** | mesuré 2026-10-25 : chat `reasoning_content`, Anthropic bloc `thinking` + `thinking_delta`, Responses item `reasoning` + événements |
 | Latence observée | p50 4,4 s (deepseek), 8,1 s (glm), 11,4 s (mimo) | complétion entière avec ~11k tokens d'entrée ; le SLO `p50 < 4 s` du health vise le TTFT, pas la génération |
 | SLO health | cibles pilotées par `observability.slo_targets` (12 s / 30 s) | la série `leg_ms` mesure la complétion complète ; vérifié après réglage : `ok`, p50 1,95 s |
 | Comportement | le modèle se comporte en agent de code | conséquence directe du prompt système officiel |
