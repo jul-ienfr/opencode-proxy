@@ -326,6 +326,46 @@ retirer** les champs d'origine (les clients OpenRouter, eux, lisent
 `reasoning`/`reasoning_details`). Le collecteur non-stream applique la même
 règle.
 
+### Appels d'outils au nom vide (deepseek-harness, 2026-10-25)
+
+Symptôme côté client : `This turn failed format v4 tool/result at seq N
+requires toolCallId matching its tool source`, puis session impossible à
+reprendre.
+
+Cause mesurée dans le journal de session du harness (`session.v4.jsonl.zstd`) :
+
+```json
+{"type":"tool/call","callId":"","name":"","arguments":"\"npm run db:migrate…\""}
+```
+
+Le modèle avait appelé un outil **inexistant**. Pourquoi : le prompt du
+harness (`You are an AI agent powered by DeepSeek Harness…`) n'est pas un
+prompt officiel, donc le proxy injectait celui d'OpenCode — qui décrit
+`bash`, `task`, `todowrite`. Or le harness fournit `pwsh`, `read`, `edit`…
+Le modèle a suivi le prompt injecté, appelé `bash` (absent de `tools`), et la
+passerelle a rendu un `tool_call` **sans nom ni id**. Le harness ne peut alors
+apparier aucun résultat, et refuse de rejouer le tour.
+
+Correctif en deux points :
+
+1. **garder le `read` du client** quand il en fournit un (le gate ne vérifie
+   que le nom ; remplacer son schéma `file_path` par `filePath` casserait son
+   exécuteur) ;
+2. **consigne ajoutée à la fin du dernier message système du client** :
+   *« Only the tools declared in this request's `tools` array are available.
+   Ignore any tool name mentioned above that is not in that array, and never
+   invent a tool name. »*
+
+Vérifié : le gate accepte le prompt officiel + cette consigne (200), et le
+même tour harness produit désormais
+`id='call_00_e4fh…' name='pwsh' args='{"command": "npm run db:migrate"}'`.
+
+> **Reprise d'une session déjà cassée** : le journal se termine par un
+> `tool/call` vide sans résultat. Le plus sûr est de démarrer une nouvelle
+> session ; sinon il faut supprimer les deux derniers événements
+> (`assistant/message` + `tool/call`) du `session.v4.jsonl.zstd` avant de
+> reprendre.
+
 ### Paramètres d'activation : mesurés, tous tolérés
 
 Envoyés à l'amont sur `deepseek-v4.1`, `glm-5.3` et `mimo-v2.6` : rien,

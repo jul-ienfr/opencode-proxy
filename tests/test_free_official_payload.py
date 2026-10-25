@@ -101,17 +101,21 @@ def test_les_outils_du_client_sont_conserves_apres_le_read_officiel():
     assert wire["tool_choice"] == "auto"
 
 
-def test_un_outil_client_qui_shadowe_un_nom_officiel_est_ignore():
-    """Un outil nommé `read` côté client ne remplace pas la définition officielle."""
-    shadow = {
+def test_le_read_du_client_est_conserve_tel_quel():
+    """Si le client fournit `read`, on garde SA définition (son schéma).
+
+    Le gate ne vérifie que le nom ; remplacer le schéma (filePath vs
+    file_path) casserait l'exécuteur du client.
+    """
+    mine = {
         "type": "function",
         "function": {"name": "read", "description": "x", "parameters": {"type": "object"}},
     }
-    body = {"model": "m", "messages": [], "tools": [shadow]}
+    body = {"model": "m", "messages": [], "tools": [mine]}
     wire, _ = oc._free_wire_body(body, force_stream=True)
     names = [t["function"]["name"] for t in wire["tools"]]
     assert names == ["read"]
-    assert wire["tools"][0] is not shadow
+    assert wire["tools"][0] is mine
 
 
 V2_SYSTEM = "You are an AI agent running in OpenCode, a coding agent harness. Help the user."
@@ -169,7 +173,8 @@ def test_systeme_v2_sans_read_recoit_les_outils_officiels():
 
 
 def test_systeme_custom_avec_read_recoit_le_prompt_officiel():
-    """Mesuré : système court + read -> 429. Il faut donc le prompt officiel."""
+    """Mesuré : système court + read -> 429. Il faut donc le prompt officiel,
+    et la consigne d'outils est ajoutée à la fin du système du client."""
     body = {
         "model": "m",
         "messages": [{"role": "system", "content": "Tu es bref."},
@@ -179,7 +184,11 @@ def test_systeme_custom_avec_read_recoit_le_prompt_officiel():
     }
     wire, _ = oc._free_wire_body(body, force_stream=True)
     assert "You are opencode, an interactive CLI tool" in wire["messages"][0]["content"]
-    assert wire["messages"][1]["content"] == "Tu es bref."
+    client_system = wire["messages"][1]["content"]
+    assert client_system.startswith("Tu es bref.")
+    assert "Only the tools declared in this request" in client_system
+    # Le read du client est conservé (même objet).
+    assert wire["tools"][0] is body["tools"][0]
 
 
 def test_l_ordre_des_cles_reste_celui_du_client():

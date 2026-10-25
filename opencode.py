@@ -5307,6 +5307,38 @@ def _official_free_payload() -> dict:
 _OFFICIAL_FREE_PAYLOAD: dict | None = None
 
 
+#: [2026-10-25] Consigne ajoutée aux clients dont le prompt n'est PAS
+#: officiel. Le prompt OpenCode (obligatoire pour le gate) décrit `bash`,
+#: `todowrite`, `task`… que ces clients n'ont pas forcément : un modèle qui
+#: appelle un outil absent produit un `tool_call` au nom vide (mesuré avec
+#: deepseek-harness : `{"id":"","name":""}`), impossible à apparier ensuite.
+_AVAILABLE_TOOLS_NOTE = (
+    "\n\n# Available tools\n"
+    "Only the tools declared in this request's `tools` array are available. "
+    "Ignore any tool name mentioned above that is not in that array, and never "
+    "invent a tool name."
+)
+
+
+def _inject_official_system(messages, system: dict, note: str = _AVAILABLE_TOOLS_NOTE):
+    """Prompt officiel en tête + consigne d'outils en DERNIER message système.
+
+    La consigne est ajoutée à la fin du dernier message système du client
+    (copie, jamais de mutation) pour être la dernière instruction lue ; à
+    défaut, elle termine le prompt officiel.
+    """
+    out = [copy.deepcopy(system)] + list(messages or [])
+    for i in range(len(out) - 1, 0, -1):
+        m = out[i]
+        if isinstance(m, dict) and m.get("role") == "system" and isinstance(m.get("content"), str):
+            nm = dict(m)
+            nm["content"] = m["content"] + note
+            out[i] = nm
+            return out
+    out[0]["content"] = str(out[0].get("content") or "") + note
+    return out
+
+
 def _has_official_system(messages) -> bool:
     """Le corps porte-t-il un prompt système officiel reconnu ?
 
@@ -5431,30 +5463,27 @@ def _free_wire_body(body, force_stream: bool = False, egress_ip: str | None = No
     wire = dict(body)
     if need_tools:
         # [2026-10-25] Le gate ne demande QUE `read` + prompt officiel (mesuré).
-        # On n'injecte donc plus les 10 outils v1 : on ajoute le `read`
-        # officiel et on CONSERVE les outils du client. Un client tiers garde
-        # son function calling, et le modèle ne se voit pas offrir `bash` /
-        # `task` / `todowrite` qu'il ne saurait pas exécuter côté client.
-        _read_def = None
-        for _t in _payload["tools"]:
-            if isinstance(_t, dict) and _t.get("function", {}).get("name") == "read":
-                _read_def = _t
-                break
-        _kept = [
-            _t
-            for _t in _client_tools
-            if isinstance(_t, dict)
-            and _t.get("function", {}).get("name") != "read"
-        ]
-        wire["tools"] = ([copy.deepcopy(_read_def)] if _read_def else []) + _kept
+        # On n'injecte plus les 10 outils v1 : on garantit la présence de
+        # `read` et on CONSERVE les outils du client (son function calling).
+        # Si le client fournit déjà `read`, on garde SA définition : son schéma
+        # (ex. file_path vs filePath) est celui que son exécuteur comprend.
+        if "read" in have:
+            wire["tools"] = list(_client_tools)
+        else:
+            _read_def = None
+            for _t in _payload["tools"]:
+                if isinstance(_t, dict) and _t.get("function", {}).get("name") == "read":
+                    _read_def = _t
+                    break
+            wire["tools"] = ([copy.deepcopy(_read_def)] if _read_def else []) + list(_client_tools)
     elif missing:
         base = list(tools) if isinstance(tools, list) else []
         base.extend(_free_shim_tool(n, is_resp) for n in missing)
         wire["tools"] = base
     if need_system:
-        # Le prompt système officiel est ajouté EN TÊTE ; les messages du
-        # client (y compris son propre prompt système) sont conservés tels quels.
-        wire["messages"] = [copy.deepcopy(_payload["system"])] + list(wire.get("messages") or [])
+        # Prompt officiel en tête (obligatoire pour le gate) + consigne qui
+        # limite le modèle aux outils réellement déclarés.
+        wire["messages"] = _inject_official_system(wire.get("messages"), _payload["system"])
     if is_chat and need_order and not need_tools:
         # Tri ICU de parité v1, uniquement sur des tools fournis par le client :
         # la copie officielle, elle, garde son ordre exact.
