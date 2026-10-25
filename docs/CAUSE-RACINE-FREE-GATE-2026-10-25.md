@@ -245,6 +245,10 @@ reasoning    : "The user asks in French: 'How much is 17*23?' ..."
   payload complet traverse le proxy en passthrough.
 - **Façade Anthropic** `/v1/messages` avec un outil client : `200`,
   `stop_reason="tool_use"`, bloc `tool_use` `{"city":"Paris"}`.
+- **Façade Responses** `/v1/responses` avec un outil client : `200`,
+  item `function_call` correctement formé (`call_id`, `name`, `arguments`).
+  À noter : sur ce cas, le modèle a choisi `bash` (outil officiel) plutôt que
+  `get_weather` — le prompt système officiel l'oriente vers l'agent de code.
 - **Client tiers réel à 22 outils** (`browser_exec`, `terminal`, …) : `200`
   (10 officiels + 22 extras = 32 outils). La fusion tient à l'échelle.
 
@@ -259,6 +263,7 @@ reasoning    : "The user asks in French: 'How much is 17*23?' ..."
 | `reasoning_content` non-stream | recomposé depuis le SSE | bug corrigé le 2026-10-25 : mimo et deepseek l'émettent, il était jeté |
 | Latence observée | p50 4,4 s (deepseek), 8,1 s (glm), 11,4 s (mimo) | complétion entière avec ~11k tokens d'entrée ; le SLO `p50 < 4 s` du health vise le TTFT, pas la génération |
 | Comportement | le modèle se comporte en agent de code | conséquence directe du prompt système officiel |
+| Choix d'outil | peut privilégier un outil officiel | mesuré : `bash` choisi au lieu de `get_weather` sur `/v1/responses` ; les outils client restent disponibles |
 | Forme `responses` | non couverte par la capture | elle passe aujourd'hui via conversion → chat |
 
 Si un jour un client tiers a besoin de ses propres outils, il faut **mesurer**
