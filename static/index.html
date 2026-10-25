@@ -497,6 +497,8 @@
                                         <option value="strict">Compteur strict (1,2,3…)</option>
                                         <option value="hedge">Hedge (course)</option>
                                     </select>
+                                    <span class="label" style="font-size:12px;margin-left:6px" data-i18n="config.free_hedge_delay">Délai avant course (ms)</span>
+                                    <input type="number" id="cfg-free-parallel-delay" class="config-input" style="width:90px;font-size:12px" min="0" max="2000" step="100" onchange="saveFreeParallelDelay()">
                                 </div>
                                 <div style="font-size:11px;color:var(--text-muted);margin-top:4px" data-i18n="config.free_parallel_hint">Round-Robin = least-loaded (répartit sur N), Failover = sticky 1 puis bascule sur panne/quota. Hedge = course de 2 stations, la première qui répond gagne (streaming inclus) ; coûte une requête de plus par course. Désactivable via l'interrupteur ci-dessus.</div>
                             </div>

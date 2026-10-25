@@ -189,6 +189,7 @@ const LOCALE = {
         'config.routing_failover': 'Failover',
         'config.free_parallel': 'Parallelize free stations',
         'config.free_parallel_hint': 'Round-Robin = least-loaded (spread on N), Failover = sticky 1 then switch on failure/quota. Hedge = 2-station race, first useful response wins (streaming included); costs one extra request per race. Turn the switch off to disable.',
+        'config.free_hedge_delay': 'Hedge delay (ms)',
         'config.free_routing': 'Free stations routing',
         'config.free_routing_rr': 'Round-Robin (spread)',
         'config.free_routing_failover': 'Failover (switch)',
@@ -512,6 +513,7 @@ const LOCALE = {
         'config.routing_failover': 'Failover',
         'config.free_parallel': 'Paralléliser les stations free',
         'config.free_parallel_hint': 'Round-Robin = least-loaded (répartit sur N), Failover = sticky 1 puis bascule sur panne/quota. Hedge = course de 2 stations, la première qui répond gagne (streaming inclus) ; coûte une requête de plus par course. Désactivable via l\'interrupteur ci-dessus.',
+        'config.free_hedge_delay': 'Délai avant course (ms)',
         'config.free_routing': 'Routage stations free',
         'config.free_routing_rr': 'Round-Robin (répartir)',
         'config.free_routing_failover': 'Failover (bascule)',
@@ -3644,6 +3646,10 @@ document.addEventListener('DOMContentLoaded', () => {
             }
             if (fpRoutingEl && document.activeElement !== fpRoutingEl) fpRoutingEl.value = fp.routing || 'round-robin';
             if (fpModeEl && document.activeElement !== fpModeEl) fpModeEl.value = fp.mode || 'load-balance';
+            const fpDelayEl = document.getElementById('cfg-free-parallel-delay');
+            if (fpDelayEl && document.activeElement !== fpDelayEl) {
+                fpDelayEl.value = (fp.hedge_delay_ms !== undefined ? fp.hedge_delay_ms : 1500);
+            }
             if (fpRow) fpRow.style.display = (fp.enabled ? 'flex' : 'none');
             if (fpStatus) fpStatus.textContent = fp.enabled ? `ON · ${fp.routing || 'round-robin'} · ${fp.mode || 'load-balance'}` : 'OFF';
             // also update hedge observability if present
@@ -4141,6 +4147,24 @@ document.addEventListener('DOMContentLoaded', () => {
         await fetchWithToken('/api/vpn-config', {
             method: 'POST', headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({free_parallel: {enabled: !!enabled, routing, mode}})
+        });
+        refreshVPNStatus();
+    };
+    // [2026-10-25] Délai avant de lancer la course de hedge (ms). 0 = course
+    // immédiate (coûte une requête de plus à chaque appel) ; 1500 = la seconde
+    // station ne part que si la première n'a rien produit après 1,5 s.
+    window.saveFreeParallelDelay = async function() {
+        const enabled = document.getElementById('cfg-free-parallel-enabled')?.checked || false;
+        const routing = document.getElementById('cfg-free-parallel-routing')?.value || 'round-robin';
+        const mode = document.getElementById('cfg-free-parallel-mode')?.value || 'load-balance';
+        const el = document.getElementById('cfg-free-parallel-delay');
+        let delay = parseInt(el?.value, 10);
+        if (!Number.isFinite(delay)) delay = 1500;
+        delay = Math.max(0, Math.min(2000, delay));
+        if (el) el.value = delay;
+        await fetchWithToken('/api/vpn-config', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({free_parallel: {enabled: !!enabled, routing, mode, hedge_delay_ms: delay}})
         });
         refreshVPNStatus();
     };
