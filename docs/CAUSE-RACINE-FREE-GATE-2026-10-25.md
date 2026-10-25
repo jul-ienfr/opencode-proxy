@@ -249,6 +249,10 @@ reasoning    : "The user asks in French: 'How much is 17*23?' ..."
   item `function_call` correctement formé (`call_id`, `name`, `arguments`).
   À noter : sur ce cas, le modèle a choisi `bash` (outil officiel) plutôt que
   `get_weather` — le prompt système officiel l'oriente vers l'agent de code.
+- **Tour d'agent complet via le client officiel** : « combien de `.py` dans le
+  dossier ? » → le client appelle `Glob "*.py"` (2 matches), exécute l'outil,
+  renvoie le résultat au modèle, réponse finale `2`. La boucle complète
+  (outil → exécution → second tour) fonctionne en gratuit.
 - **Client tiers réel à 22 outils** (`browser_exec`, `terminal`, …) : `200`
   (10 officiels + 22 extras = 32 outils). La fusion tient à l'échelle.
 
@@ -264,6 +268,7 @@ reasoning    : "The user asks in French: 'How much is 17*23?' ..."
 | Latence observée | p50 4,4 s (deepseek), 8,1 s (glm), 11,4 s (mimo) | complétion entière avec ~11k tokens d'entrée ; le SLO `p50 < 4 s` du health vise le TTFT, pas la génération |
 | Comportement | le modèle se comporte en agent de code | conséquence directe du prompt système officiel |
 | Choix d'outil | peut privilégier un outil officiel | mesuré : `bash` choisi au lieu de `get_weather` sur `/v1/responses` ; les outils client restent disponibles |
+| Erreurs en cours de flux | HTTP 200 déjà engagé | quand toutes les stations sont à quota, le refus part en `data: {"error":…}` (le client affiche le JSON). Un vrai 4xx serait plus lisible mais exigerait un préflight avant ouverture du flux |
 | Forme `responses` | non couverte par la capture | elle passe aujourd'hui via conversion → chat |
 
 Si un jour un client tiers a besoin de ses propres outils, il faut **mesurer**
