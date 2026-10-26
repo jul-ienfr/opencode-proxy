@@ -30,7 +30,12 @@ import uuid
 from collections.abc import Mapping
 from types import MappingProxyType
 
-from app.protocol.mapping import _json_dumps_str, _local_signature, restore_tool_name
+from app.protocol.mapping import (
+    _json_dumps_str,
+    _local_signature,
+    anthropic_usage_from_openai,
+    restore_tool_name,
+)
 
 __all__ = [
     "ChatSseToAnthropicState",
@@ -328,7 +333,9 @@ class ChatSseToAnthropicState:
         "open_blocks",
         "input_tokens",
         "input_tokens_estimate",
+        "usage_seen",
         "cache_read_input_tokens",
+        "cache_creation_input_tokens",
         "output_tokens",
         "finish_reason",
     )
@@ -364,7 +371,11 @@ class ChatSseToAnthropicState:
         self.pending_tool_ids: dict[int, str] = {}
         # Blocs ouverts, dans l'ordre d'ouverture (ordre de clôture).
         self.open_blocks: list[int] = []
+        # Input NON caché (sémantique Anthropic). Le total OpenAI arrive avec
+        # le cache inclus : la conversion soustrait le cache pour que le client
+        # n'additionne pas deux fois le même contexte (autocompact prématuré).
         self.input_tokens: int = 0
+        self.usage_seen: bool = False
         # [réf. opencode.py:10584] ``message_start`` doit annoncer un
         # ``input_tokens`` : l'usage amont n'arrive qu'en fin de flux (voire
         # jamais sans ``stream_options.include_usage``), donc trop tard pour un
@@ -374,6 +385,7 @@ class ChatSseToAnthropicState:
         # arrivé dans le même chunk que le premier delta reste prioritaire.
         self.input_tokens_estimate: int = max(0, int(input_tokens_estimate or 0))
         self.cache_read_input_tokens: int = 0
+        self.cache_creation_input_tokens: int = 0
         self.output_tokens: int = 0
         self.finish_reason: str | None = None
 
@@ -390,7 +402,9 @@ class ChatSseToAnthropicState:
         self.pending_tool_ids.clear()
         self.open_blocks.clear()
         self.input_tokens = 0
+        self.usage_seen = False
         self.cache_read_input_tokens = 0
+        self.cache_creation_input_tokens = 0
         self.output_tokens = 0
         self.finish_reason = None
 
@@ -409,6 +423,18 @@ class ChatSseToAnthropicState:
                 },
             )
         ]
+
+    def client_input_tokens(self) -> int:
+        """Input Anthropic à annoncer : réel non caché, sinon estimation totale.
+
+        L'usage OpenAI contient le cache *dans* le total ; une fois l'usage vu,
+        ``input_tokens`` a déjà été normalisé (cache soustrait) par
+        ``feed_chunk``. Avant l'usage, on annonce l'estimation totale avec
+        ``cache_read_input_tokens: 0`` — le ``message_delta`` final corrige.
+        """
+        if self.usage_seen:
+            return max(0, self.input_tokens)
+        return max(0, self.input_tokens or self.input_tokens_estimate)
 
     def message_start_events(self) -> list[str]:
         """``message_start`` — payload identique à ``opencode.py:8556-8609``.
@@ -433,10 +459,10 @@ class ChatSseToAnthropicState:
                         "stop_reason": None,
                         "stop_sequence": None,
                         "usage": {
-                            "input_tokens": self.input_tokens or self.input_tokens_estimate,
+                            "input_tokens": self.client_input_tokens(),
                             "output_tokens": 0,
                             "cache_read_input_tokens": self.cache_read_input_tokens,
-                            "cache_creation_input_tokens": 0,
+                            "cache_creation_input_tokens": self.cache_creation_input_tokens,
                         },
                     },
                 },
@@ -500,8 +526,13 @@ class ChatSseToAnthropicState:
                     "type": "message_delta",
                     "delta": {"stop_reason": stop_reason, "stop_sequence": None},
                     "usage": {
+                        # Valeur finale non cachée : le client remplace
+                        # l'estimation du start et additionne input + cache,
+                        # soit exactement le total OpenAI d'origine.
+                        "input_tokens": self.client_input_tokens(),
                         "output_tokens": self.output_tokens,
                         "cache_read_input_tokens": self.cache_read_input_tokens,
+                        "cache_creation_input_tokens": self.cache_creation_input_tokens,
                     },
                 },
             )
@@ -556,14 +587,33 @@ class ChatSseToAnthropicState:
             return []
         events: list[str] = []
 
-        usage_in, usage_out = _usage_tokens(chunk)
-        if usage_in is not None:
-            self.input_tokens = usage_in
-        if usage_out is not None:
-            self.output_tokens = usage_out
-        _cached = _usage_cache_read(chunk)
-        if _cached is not None:
-            self.cache_read_input_tokens = _cached
+        # OpenAI inclut le cache dans `prompt_tokens` / `input_tokens`.
+        # Anthropic l'expose à part : on normalise ici pour que le client
+        # (Claude Code) n'additionne pas deux fois le même contexte.
+        _usage = chunk.get("usage")
+        if isinstance(_usage, dict):
+            _has_input = "prompt_tokens" in _usage or "input_tokens" in _usage
+            _has_output = "completion_tokens" in _usage or "output_tokens" in _usage
+            if _has_input or _has_output:
+                _conv = anthropic_usage_from_openai(_usage)
+                if _has_input:
+                    self.input_tokens = _conv["input_tokens"]
+                    self.usage_seen = True
+                elif _conv["cache_read_input_tokens"] or _conv["cache_creation_input_tokens"]:
+                    # Pas de total dans ce chunk, mais le cache est connu :
+                    # l'estimation locale inclut déjà le cache, on le retire
+                    # pour conserver la sémantique Anthropic.
+                    self.input_tokens = max(
+                        0,
+                        self.input_tokens_estimate
+                        - _conv["cache_read_input_tokens"]
+                        - _conv["cache_creation_input_tokens"],
+                    )
+                    self.usage_seen = True
+                self.cache_read_input_tokens = _conv["cache_read_input_tokens"]
+                self.cache_creation_input_tokens = _conv["cache_creation_input_tokens"]
+                if _has_output:
+                    self.output_tokens = _conv["output_tokens"]
 
         # ── F1 : la panne amont passe AVANT tout le reste ──────────────
         # Une passerelle Chat signale un échec milieu de flux par une clé
@@ -587,7 +637,8 @@ class ChatSseToAnthropicState:
             delta = {}
 
         # opencode.py:10561-10590 — ``message_start`` au premier chunk exploitable.
-        if not self.started and (delta or usage_in is not None or usage_out is not None):
+        _usage_here = isinstance(chunk.get("usage"), dict)
+        if not self.started and (delta or _usage_here):
             events.extend(self.message_start_events())
 
         # opencode.py:10592-10623 — bloc texte, ouvert paresseusement.

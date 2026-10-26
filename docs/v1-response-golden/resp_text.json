@@ -35,12 +35,12 @@
     "stop_reason": "end_turn",
     "stop_sequence": null,
     "usage": {
-      "input_tokens": 12,
+      "input_tokens": 8,
       "output_tokens": 9,
       "cache_creation_input_tokens": 0,
       "cache_read_input_tokens": 4
     }
   },
-  "_note": "usage prompt/completion -> input/output tokens ; cached_tokens -> cache_read",
+  "_note": "usage prompt/completion -> input/output tokens ; cached_tokens -> cache_read ; input Anthropic = 12 − 4 = 8",
   "_generated_by": "scripts/gen_golden_fixtures.py (plan v10 §11.5)"
 }

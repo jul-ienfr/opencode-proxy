@@ -39,12 +39,12 @@
     "stop_reason": "end_turn",
     "stop_sequence": null,
     "usage": {
-      "input_tokens": 100,
+      "input_tokens": 0,
       "output_tokens": 10,
       "cache_creation_input_tokens": 60,
       "cache_read_input_tokens": 40
     }
   },
-  "_note": "axe usage cache creation (A6) : prompt_tokens_details → cache_read 40 / cache_creation 60",
+  "_note": "axe usage cache creation (A6) : prompt_tokens_details → cache_read 40 / cache_creation 60 ; input Anthropic = 100 − 40 − 60 = 0 (le client additionne les trois)",
   "_generated_by": "scripts/gen_golden_fixtures.py (plan v10 §11.5)"
 }

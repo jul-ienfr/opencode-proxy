@@ -57,7 +57,10 @@ def test_cache_read_tokens_priority_is_stable():
     [
         ({"prompt_tokens_details": {"cache_creation_tokens": 42}}, 42),
         ({"cache_creation_input_tokens": 42}, 42),
-        ({"prompt_cache_miss_tokens": 42}, 42),
+        # DeepSeek : `prompt_cache_miss_tokens` est l'input NON caché, pas une
+        # écriture de cache. L'exposer comme cache_creation doublait le contexte
+        # vu par les clients Anthropic (autocompact prématuré).
+        ({"prompt_cache_miss_tokens": 42}, 0),
         ({}, 0),
     ],
 )

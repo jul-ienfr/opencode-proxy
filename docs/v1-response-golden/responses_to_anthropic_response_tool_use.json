@@ -72,12 +72,12 @@
     "stop_reason": "tool_use",
     "stop_sequence": null,
     "usage": {
-      "input_tokens": 20,
+      "input_tokens": 15,
       "output_tokens": 9,
       "cache_creation_input_tokens": 0,
       "cache_read_input_tokens": 5
     }
   },
-  "_note": "axe usage cache read + noms d'outils : cached_tokens → cache_read_input_tokens, nom restauré",
+  "_note": "axe usage cache read + noms d'outils : cached_tokens → cache_read_input_tokens (input Anthropic = 20 − 5 = 15), nom restauré",
   "_generated_by": "scripts/gen_golden_fixtures.py (plan v10 §11.5)"
 }

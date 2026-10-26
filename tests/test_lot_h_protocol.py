@@ -31,17 +31,26 @@ class TestH1CacheCreationTokens:
         out = pm.openai_to_anthropic(resp, "test-model")
         assert out["usage"]["cache_creation_input_tokens"] == 77
 
-    def test_from_prompt_cache_miss_tokens(self):
+    def test_prompt_cache_miss_tokens_is_not_cache_creation(self):
+        """DeepSeek : ``prompt_cache_miss_tokens`` = input non caché, pas une
+        écriture de cache. Le compter comme cache_creation faisait voir ~2× le
+        contexte au client Anthropic (autocompact prématuré)."""
         resp = {
             "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
             "usage": {
                 "prompt_tokens": 100,
                 "completion_tokens": 50,
-                "prompt_cache_miss_tokens": 33,
+                "prompt_cache_hit_tokens": 60,
+                "prompt_cache_miss_tokens": 40,
+                "prompt_tokens_details": {"cached_tokens": 60},
             },
         }
         out = pm.openai_to_anthropic(resp, "test-model")
-        assert out["usage"]["cache_creation_input_tokens"] == 33
+        assert out["usage"]["cache_creation_input_tokens"] == 0
+        assert out["usage"]["cache_read_input_tokens"] == 60
+        assert out["usage"]["input_tokens"] == 40
+        # Total Anthropic = input + cache = 100, exactement prompt_tokens.
+        assert out["usage"]["input_tokens"] + out["usage"]["cache_read_input_tokens"] == 100
 
     def test_fallback_zero(self):
         resp = {

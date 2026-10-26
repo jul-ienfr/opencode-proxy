@@ -20,6 +20,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - pyproject.toml (ruff/mypy/pytest), SERVER_COUNTRIES source unique, deps pinnées
 
 ### Fixed
+- [2026-10-26] Usage Anthropic : `input_tokens` exclut désormais cache read/write (OpenAI les inclut dans `prompt_tokens`) ; `prompt_cache_miss_tokens` n'est plus compté comme cache_creation → contexte ~2× surestimé par Claude Code, autocompact prématuré / thrashing
+- [2026-10-26] `tool_calls` amont sans nom/id (dsh `requires toolCallId matching its tool source`) : nom inféré des arguments, id synthétisé, appel invalide écarté ou flux rejoué
 - [2026-10-26] Flapping station : resets voie secondaire ignorés côté statut, churn borné, anti-flap, frontière de guérison
 - [2026-10-26] `boot_error` stale recalculé ; `disconnect` persistant ; `toggle/connect/heal` fleet-wide
 - [2026-10-26] Mise à jour d'image coordonnée flotte ; `control_api_key` migré hors de `config.yaml`

@@ -830,6 +830,118 @@ def test_p3_chat_passthrough_stream(client, recorder):
     assert "hello" in text
 
 
+def test_p3_stream_repare_un_tool_call_amont_sans_nom_ni_id(client, recorder):
+    """P3 stream : l'amont emet ``id=""`` / ``name=""`` (mesure dsh).
+
+    Le client doit recevoir un appel complet (id + nom ``pwsh`` infere des
+    arguments) : sinon il cree un ``tool/call`` vide et refuse de rejouer la
+    session (« requires toolCallId matching its tool source »).
+    """
+    base = {
+        "id": "chatcmpl_tc_empty",
+        "object": "chat.completion.chunk",
+        "created": 1700000000,
+        "model": "upstream",
+    }
+    malformed = [
+        {
+            **base,
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "",
+                                "type": "function",
+                                "function": {"name": "", "arguments": "command"},
+                            }
+                        ],
+                    },
+                    "finish_reason": None,
+                }
+            ],
+        },
+        {
+            **base,
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "function": {
+                                    "arguments": '": "npm test","description":"test"}'
+                                },
+                            }
+                        ]
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ],
+            "usage": {"prompt_tokens": 11, "completion_tokens": 22, "total_tokens": 33},
+        },
+    ]
+    recorder.set_upstream(
+        lambda e, b, p: FakeResponse(lines=[f"data: {json.dumps(c)}" for c in malformed] + ["data: [DONE]"])
+    )
+    body = {
+        "model": PAID_CHAT,
+        "max_tokens": 256,
+        "stream": True,
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "pwsh",
+                    "description": "PowerShell",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "command": {"type": "string"},
+                            "description": {"type": "string"},
+                        },
+                        "required": ["command", "description"],
+                    },
+                },
+            }
+        ],
+    }
+
+    status, ctype, text = _post(client, "/v1/chat/completions", body, stream=True)
+
+    assert status == 200
+    assert ctype.startswith("text/event-stream")
+    acc: dict[int, dict] = {}
+    finish = None
+    for _name, payload in _sse_events(text):
+        for ch in payload.get("choices") or []:
+            if ch.get("finish_reason"):
+                finish = ch["finish_reason"]
+            for tc in (ch.get("delta") or {}).get("tool_calls") or []:
+                st = acc.setdefault(
+                    tc.get("index", 0),
+                    {"id": "", "name": "", "arguments": ""},
+                )
+                if tc.get("id"):
+                    st["id"] = tc["id"]
+                fn = tc.get("function") or {}
+                if fn.get("name"):
+                    st["name"] = fn["name"]
+                st["arguments"] += fn.get("arguments") or ""
+    assert finish == "tool_calls"
+    assert list(acc) == [0]
+    call = acc[0]
+    assert call["id"], "un tool_call avec id vide casse la session du harness"
+    assert call["name"] == "pwsh"
+    assert json.loads(call["arguments"]) == {"command": "npm test", "description": "test"}
+    assert "data: [DONE]" in text
+
+
 def test_p4_chat_to_anthropic_stream(client, recorder):
     """P4 stream â€” amont Anthropic converti en chunks Chat + ``[DONE]``.
 

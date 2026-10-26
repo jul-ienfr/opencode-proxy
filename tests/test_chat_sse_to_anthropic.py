@@ -117,7 +117,13 @@ def test_texte_multi_chunks_un_seul_bloc():
 
     md = _data(events, "message_delta")[0]
     assert md["delta"] == {"stop_reason": "end_turn", "stop_sequence": None}
-    assert md["usage"] == {"output_tokens": 3, "cache_read_input_tokens": 0}
+    # input_tokens 12 = total estimé (aucun usage amont) ; cache à 0.
+    assert md["usage"] == {
+        "input_tokens": 12,
+        "output_tokens": 3,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+    }
 
 
 def test_message_delta_reports_cache_read():
@@ -140,7 +146,14 @@ def test_message_delta_reports_cache_read():
         st,
     )
     md = _data(events, "message_delta")[0]
-    assert md["usage"] == {"output_tokens": 5, "cache_read_input_tokens": 60}
+    # Anthropic : 100 total − 60 cachés = 40 d'input non caché.
+    # Le client additionne 40 + 60 = 100, jamais 160.
+    assert md["usage"] == {
+        "input_tokens": 40,
+        "output_tokens": 5,
+        "cache_read_input_tokens": 60,
+        "cache_creation_input_tokens": 0,
+    }
 
     # Le format des chaînes est exactement celui de _sse (opencode.py:7945-7946).
     assert events[0].startswith("event: message_start\ndata: {")

@@ -119,6 +119,13 @@ docker run -d \
 
 ## Claude Code — Hygiène contexte (anti-thrashing Autocompact)
 
+> **Cause racine corrigée le 2026-10-26.** L'usage OpenAI (`prompt_tokens`, cache
+> inclus) était relayé tel quel en `input_tokens` **et** en
+> `cache_read_input_tokens` : Claude Code additionne les deux et voyait ~2× le
+> contexte réel, d'où un autocompact tous les 2-3 tours. Voir
+> `app/protocol/mapping.py::anthropic_usage_from_openai`. Les règles ci-dessous
+> restent utiles pour les gros fichiers, mais ne sont plus le correctif principal.
+
 Pour éviter `Autocompact thrashing` (contexte qui se remplit en 2-3 tours) :
 - `Read` toujours avec `limit` (ex: `Read opencode.py limit 100 offset 1200`) sur les gros fichiers.
 - `Grep` toujours avec `glob`/`path` ciblé (`glob: "*.py"` ou `path: "app/"`) + `output_mode: "files_with_matches"` + `head_limit: 30` d'abord.

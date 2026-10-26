@@ -163,12 +163,13 @@ async def test_message_delta_carries_the_real_output_and_cache(upstream):
 
 
 @pytest.mark.asyncio
-async def test_start_and_delta_are_not_contradictory(upstream):
-    """Le debut annonce une estimation, la fin la verite : jamais l'inverse.
+async def test_start_and_delta_totals_are_consistent(upstream):
+    """Le debut annonce le total estimé ; la fin le total réel, cache compris.
 
-    Un `input_tokens` final inferieur a celui annonce au depart serait une
-    regression deja vue ailleurs : le client afficherait une consommation qui
-    diminue en cours de reponse.
+    Anthropic définit `input_tokens` HORS cache : comparer les seuls
+    `input_tokens` start/delta n'a pas de sens. Le client additionne
+    input + cache_read + cache_creation ; c'est ce total qui doit rester
+    cohérent et ne jamais compter le cache deux fois.
     """
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=oc.app), base_url="http://proxy.test", timeout=30.0
@@ -185,8 +186,35 @@ async def test_start_and_delta_are_not_contradictory(upstream):
 
     start_usage = _payloads(response.text, "message_start")[0]["message"]["usage"]
     delta_usage = _payloads(response.text, "message_delta")[0].get("usage") or {}
-    assert start_usage.get("input_tokens", 0) >= 0
-    # `message_delta` ne renvoie pas input_tokens (conforme au protocole) : on
-    # verifie seulement qu'il n'en invente pas un plus petit.
-    if "input_tokens" in delta_usage:
-        assert delta_usage["input_tokens"] >= start_usage.get("input_tokens", 0)
+
+    def _total(usage):
+        return (
+            (usage.get("input_tokens") or 0)
+            + (usage.get("cache_read_input_tokens") or 0)
+            + (usage.get("cache_creation_input_tokens") or 0)
+        )
+
+    assert _total(start_usage) > 0
+    assert _total(delta_usage) == 100, delta_usage
+    assert delta_usage.get("input_tokens") == 60, delta_usage
+    assert delta_usage.get("cache_read_input_tokens") == 40, delta_usage
+
+
+def test_non_stream_usage_also_excludes_cache():
+    """Le chemin non-stream applique la même règle (sinon l'autocompact saute
+    au tour suivant, avant même le prochain stream)."""
+    out = oc.openai_to_anthropic(
+        {
+            "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+            "usage": {
+                "prompt_tokens": 87649,
+                "completion_tokens": 12,
+                "prompt_tokens_details": {"cached_tokens": 87552},
+            },
+        },
+        "muse-spark-1.3-contributor",
+    )
+    usage = out["usage"]
+    assert usage["input_tokens"] == 97, usage
+    assert usage["cache_read_input_tokens"] == 87552, usage
+    assert usage["input_tokens"] + usage["cache_read_input_tokens"] == 87649

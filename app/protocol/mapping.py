@@ -220,6 +220,88 @@ def _extract_cache_tokens(usage: dict) -> int:
     return 0
 
 
+def _usage_int(value) -> int:
+    """Entier positif d'un champ `usage` — 0 pour tout le reste (bool inclus)."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return 0
+    return max(0, value)
+
+
+def anthropic_input_tokens(total_input, cache_read=0, cache_creation=0) -> int:
+    """`input_tokens` Anthropic = input total OpenAI − parts servies par le cache.
+
+    OpenAI compte **tout** l'input dans `prompt_tokens` / `input_tokens`, cache
+    inclus ; Anthropic expose l'input non caché dans `input_tokens` et le cache
+    dans `cache_read_input_tokens` / `cache_creation_input_tokens`. Les clients
+    Anthropic additionnent les trois : sans cette soustraction, ils voient
+    ~2× le contexte réel et auto-compactent bien trop tôt (thrashing).
+    """
+    return max(
+        0,
+        _usage_int(total_input) - _usage_int(cache_read) - _usage_int(cache_creation),
+    )
+
+
+def anthropic_usage_from_openai(usage: dict) -> dict:
+    """Convertit un `usage` OpenAI (Chat ou Responses) en `usage` Anthropic.
+
+    Formes acceptées :
+    - Chat : `prompt_tokens` + `completion_tokens` + `prompt_tokens_details` ;
+    - Responses : `input_tokens` + `output_tokens` + `input_tokens_details`.
+
+    Les détails de cache sont lus dans les deux conteneurs. Les champs
+    `cache_creation_*` ne sont soustraits que lorsqu'ils sont imbriqués dans les
+    détails du prompt (donc inclus dans le total) : un `cache_creation` top-level
+    peut venir d'un upstream Anthropic-compatible où il est déjà hors total.
+    """
+    if not isinstance(usage, dict):
+        return {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+        }
+
+    total_raw = usage.get("prompt_tokens")
+    if total_raw is None:
+        total_raw = usage.get("input_tokens")
+    out_raw = usage.get("completion_tokens")
+    if out_raw is None:
+        out_raw = usage.get("output_tokens")
+    total_in = _usage_int(total_raw)
+    out = _usage_int(out_raw)
+
+    details = usage.get("prompt_tokens_details")
+    if not isinstance(details, dict):
+        details = usage.get("input_tokens_details")
+    details = details if isinstance(details, dict) else {}
+
+    cache_read = _usage_int(details.get("cached_tokens"))
+    if not cache_read:
+        cache_read = _usage_int(usage.get("cached_tokens"))
+    if not cache_read:
+        cache_read = _usage_int(usage.get("cache_read_input_tokens"))
+
+    # Création de cache *imbriquée* dans les détails du prompt : elle fait
+    # partie de `prompt_tokens`, donc on la soustrait de l'input Anthropic.
+    nested_creation = _usage_int(details.get("cache_creation_tokens"))
+    if not nested_creation:
+        nested_creation = _usage_int(details.get("cache_creation_input_tokens"))
+    if not nested_creation:
+        nested_creation = _usage_int(details.get("cache_write_tokens"))
+    # Champ déclaré au client : conserve la lecture top-level Anthropic-compat
+    # (`cache_creation_input_tokens`) pour ne pas casser les upstreams qui
+    # l'exposent, même si ce n'est pas toujours un sous-ensemble du prompt.
+    reported_creation = _extract_cache_creation_tokens(usage)
+
+    return {
+        "input_tokens": anthropic_input_tokens(total_in, cache_read, nested_creation),
+        "output_tokens": out,
+        "cache_creation_input_tokens": reported_creation,
+        "cache_read_input_tokens": cache_read,
+    }
+
+
 def _extract_reasoning_tokens(usage: dict, output_tokens: int | None = None) -> int:
     """[Lot L12 — A18] Tokens de raisonnement d'un `usage` amont, toutes formes.
 
@@ -412,16 +494,24 @@ def _extract_cache_creation_tokens(usage: dict) -> int:
 
     OpenAI n'expose pas de champ standard unique : certains upstreams renvoient
     `prompt_tokens_details.cache_creation_tokens`, d'autres un top-level
-    `cache_creation_input_tokens` (passthrough Anthropic-compat) ou
-    `prompt_cache_miss_tokens`. Fallback 0 quand absent.
+    `cache_creation_input_tokens` (passthrough Anthropic-compat). Fallback 0
+    quand absent.
+
+    ``prompt_cache_miss_tokens`` (DeepSeek & compatibles) n'est **pas** de la
+    création de cache : c'est l'input non caché, déjà compté dans
+    ``prompt_tokens - cached_tokens``. Le compter ici le faisait additionner
+    une seconde fois par les clients Anthropic (contexte ~2× → autocompact
+    prématuré).
     """
     details = usage.get("prompt_tokens_details") or {}
     if "cache_creation_tokens" in details:
         return details["cache_creation_tokens"]
+    if "cache_creation_input_tokens" in details:
+        return details["cache_creation_input_tokens"]
+    if "cache_write_tokens" in details:
+        return details["cache_write_tokens"]
     if "cache_creation_input_tokens" in usage:
         return usage["cache_creation_input_tokens"]
-    if "prompt_cache_miss_tokens" in usage:
-        return usage["prompt_cache_miss_tokens"]
     return 0
 
 
@@ -2182,12 +2272,7 @@ def openai_to_anthropic(resp: dict, model: str, name_map: dict | None = None) ->
         "model": model,
         "stop_reason": stop,
         "stop_sequence": None,
-        "usage": {
-            "input_tokens": usage.get("prompt_tokens", 0),
-            "output_tokens": usage.get("completion_tokens", 0),
-            "cache_creation_input_tokens": _extract_cache_creation_tokens(usage),
-            "cache_read_input_tokens": usage.get("prompt_tokens_details", {}).get("cached_tokens", 0),
-        },
+        "usage": anthropic_usage_from_openai(usage),
     }
 
 
@@ -5020,9 +5105,6 @@ def _responses_to_anthropic_response(resp: dict, model: str, name_map: dict | No
     has_tools = any(b.get("type") == "tool_use" for b in blocks)
     if has_tools:
         stop = "tool_use"
-    # Cache tokens come from input_tokens_details, NOT output_tokens_details
-    _inp_details = usage.get("input_tokens_details") if isinstance(usage.get("input_tokens_details"), dict) else {}
-    _cache_read = _inp_details.get("cached_tokens", 0) if isinstance(_inp_details, dict) else 0
     return {
         "id": f"msg_{uuid.uuid4().hex[:24]}",
         "type": "message",
@@ -5031,14 +5113,9 @@ def _responses_to_anthropic_response(resp: dict, model: str, name_map: dict | No
         "model": model,
         "stop_reason": stop,
         "stop_sequence": None,
-        "usage": {
-            "input_tokens": usage.get("input_tokens", 0),
-            "output_tokens": usage.get("output_tokens", 0),
-            # F3 : la création cache (part la plus chère) était extraite mais
-            # jamais propagée — parité openai_to_anthropic (champ standard).
-            "cache_creation_input_tokens": _extract_cache_creation_tokens(usage),
-            "cache_read_input_tokens": _cache_read,
-        },
+        # input_tokens doit être l'input NON caché : les clients Anthropic
+        # additionnent input + cache_read + cache_creation pour le contexte.
+        "usage": anthropic_usage_from_openai(usage),
     }
 
 

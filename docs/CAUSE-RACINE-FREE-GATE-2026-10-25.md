@@ -366,6 +366,44 @@ même tour harness produit désormais
 > (`assistant/message` + `tool/call`) du `session.v4.jsonl.zstd` avant de
 > reprendre.
 
+### Récidive : arguments valides, nom/id vides (dsh, 2026-10-26)
+
+Même symptôme (`format v4 tool/result at seq 9473 requires toolCallId
+matching its tool source`), mais **cause différente** : le modèle n'a pas
+appelé un outil inexistant. L'amont free a émis un `tool_call` avec
+`id=""` et `name=""` **alors que les arguments étaient ceux de `pwsh`** :
+
+```json
+{"type":"tool-call","id":"","name":"","arguments":"{}"}
+```
+
+Le flux journalisé montre pourtant `"command": "for ($i=0; … Invoke-WebRequest
+…"`. Le harness reçoit donc un `tool/call` vide et ne peut apparier le
+`tool/result` (qui n'a pas le même `callId`) ; la session est refusée au
+rechargement.
+
+La consigne « n'invente pas de nom d'outil » ne protège pas de ce cas : le
+nom n'a jamais été émis par l'amont. Correctif côté proxy, avant tout yield :
+
+- `_ChatToolCallHealer` retient les deltas d'un `tool_call` sans nom, puis
+  infère le nom **d'après les clés de ses arguments** et les outils réellement
+  déclarés par le client (`command` → `pwsh`, `file_path`+`content` → `write`,
+  etc.) ;
+- le flux dsh mesuré avait aussi perdu l'ouverture `{"` (`command": "for …`) :
+  le proxy la restaure avant d'émettre l'appel, sinon le JSON resterait
+  invalide même avec le bon nom ;
+- tout `id` vide est synthétisé ; jamais `id=""` côté client ;
+- si plusieurs schémas restent compatibles, aucun choix n'est deviné : l'appel
+  est écarté et `finish_reason` devient `stop` (pas `tool_calls`) ;
+- si rien d'exploitable n'a été émis, le flux est rejoué sur une station
+  fraîche via la reprise « stream vide » existante ; le client ne voit jamais
+  l'appel invalide ;
+- le collecteur non-stream applique la même inférence/écart, et le chemin
+  Anthropic écarte un `tool_use` sans nom au lieu d'émettre un bloc invalide.
+
+Couvert par `tests/test_tool_call_identity_healing.py` et le test E2E
+`test_p3_stream_repare_un_tool_call_amont_sans_nom_ni_id`.
+
 ### « the turn stopped while a tool result was still pending » (dsh, 2026-10-26)
 
 Symptôme : le harness affiche `⚠️ No reply: the turn stopped while a tool

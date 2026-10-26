@@ -5724,7 +5724,448 @@ def _normalize_chat_reasoning_chunk(chunk: dict) -> bool:
     return changed
 
 
-def _collect_chat_completion(lines, model) -> dict | None:
+def _tool_schema_index(tools) -> list[dict]:
+    """Index minimal des outils client pour inférer un nom manquant.
+
+    Accepte les trois formes rencontrées : OpenAI chat
+    (``function.name`` / ``function.parameters``), Anthropic
+    (``name`` / ``input_schema``) et Responses (``name`` / ``parameters``).
+    On ne garde que ce qui sert à l'inférence : propriétés et requis.
+    """
+    out: list[dict] = []
+    for _t in tools or []:
+        if not isinstance(_t, dict):
+            continue
+        _fn = _t.get("function") if isinstance(_t.get("function"), dict) else _t
+        _name = _fn.get("name")
+        if not isinstance(_name, str) or not _name.strip():
+            continue
+        _params = _fn.get("parameters")
+        if not isinstance(_params, dict):
+            _params = _fn.get("input_schema") if isinstance(_fn.get("input_schema"), dict) else {}
+        _props = _params.get("properties") if isinstance(_params.get("properties"), dict) else {}
+        _req = _params.get("required") if isinstance(_params.get("required"), list) else []
+        out.append(
+            {
+                "name": _name.strip(),
+                "props": set(_props),
+                "required": {_r for _r in _req if isinstance(_r, str)},
+            }
+        )
+    return out
+
+
+def _json_object_top_keys(text: str) -> set[str]:
+    """Clés de PREMIER niveau d'un objet JSON, même partiel.
+
+    Un flux d'arguments d'outil peut être coupé au milieu d'une valeur : le
+    parseur JSON le rejette, mais les clés déjà complètes (``"command":``)
+    suffisent à reconnaître l'outil. On ignore tout ce qui est imbriqué
+    (profondeur > 1) et les chaînes inachevées.
+    """
+    keys: set[str] = set()
+    if not isinstance(text, str) or not text.strip():
+        return keys
+    depth = 0
+    in_str = False
+    escaped = False
+    start = -1
+    for i, ch in enumerate(text):
+        if in_str:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_str = False
+                if depth == 1:
+                    j = i + 1
+                    while j < len(text) and text[j] in " \t\r\n":
+                        j += 1
+                    if j < len(text) and text[j] == ":":
+                        raw = text[start:i]
+                        try:
+                            keys.add(_json_loads(f'"{raw}"'))
+                        except Exception:
+                            keys.add(raw)
+        elif ch == '"':
+            in_str = True
+            start = i + 1
+        elif ch in "[{":
+            depth += 1
+        elif ch in "]}":
+            depth = max(0, depth - 1)
+    return keys
+
+
+def _tool_arguments_prefix_candidates(arguments: str) -> list[str]:
+    """Variantes d'arguments quand l'amont a omis le préfixe ``{"``.
+
+    Mesuré (dsh, 2026-10-26) : le flux d'arguments reçu commence par
+    ``command": "for (...)`` — l'ouverture ``{"`` manque. On ne l'ajoute
+    qu'aux fins d'inférence ; la réparation effective est faite au flush.
+    """
+    if not isinstance(arguments, str) or not arguments:
+        return [arguments] if isinstance(arguments, str) else []
+    s = arguments.lstrip()
+    if not s or s.startswith(("{", "[")):
+        return [arguments]
+    if s.startswith('"'):
+        return [arguments, "{" + s]
+    return [arguments, '{"' + s]
+
+
+def _repair_tool_arguments_prefix(arguments: str) -> str:
+    """Rend ``{"command": …`` à partir de ``command": …`` (ou ``"command": …``)."""
+    if not isinstance(arguments, str):
+        return ""
+    s = arguments.lstrip()
+    if not s or s.startswith(("{", "[")):
+        return arguments
+    if s.startswith('"'):
+        return "{" + s
+    return '{"' + s
+
+
+def _repaired_tool_arguments(arguments: str) -> str:
+    """Version préfixée SEULEMENT si elle redevient un objet JSON complet."""
+    for cand in _tool_arguments_prefix_candidates(arguments):
+        if cand == arguments:
+            continue
+        try:
+            if isinstance(_json_loads(cand), dict):
+                return cand
+        except Exception:
+            continue
+    return ""
+
+
+def _infer_tool_name_from_arguments(arguments, tools) -> str:
+    """Retrouve l'outil visé par des arguments JSON (même partiels).
+
+    Mesure 2026-10-26 : l'amont a émis ``tool_calls[0].function.name=""``
+    avec les arguments de ``pwsh``. Le client a reçu un appel sans nom, puis
+    n'a plus pu apparier son résultat. On reconnaît l'outil par les clés de
+    ses arguments, sans jamais deviner si plusieurs schémas restent
+    compatibles : dans ce cas le caller écarte l'appel (ou rejoue le flux).
+    """
+    entries = _tool_schema_index(tools)
+    if not entries:
+        return ""
+    args = arguments if isinstance(arguments, str) else ""
+    variants = _tool_arguments_prefix_candidates(args)
+    keys: set[str] = set()
+    for _variant in variants:
+        keys.update(_json_object_top_keys(_variant))
+    complete = None
+    for _variant in variants:
+        if not _variant.strip():
+            continue
+        try:
+            _parsed = _json_loads(_variant)
+            if isinstance(_parsed, dict):
+                complete = _parsed
+                keys = set(_parsed)
+                break
+        except Exception:
+            continue
+
+    candidates: list[dict] = []
+    for entry in entries:
+        _props = entry["props"]
+        if _props:
+            if not keys.issubset(_props):
+                continue
+        elif keys:
+            continue
+        candidates.append(entry)
+
+    if not candidates:
+        return ""
+    # Un seul schéma accepte ces clés : c'est lui, même si un champ requis
+    # manque encore dans un JSON partiel (ou a été omis par le modèle).
+    if len(candidates) == 1:
+        return candidates[0]["name"]
+    if complete is not None:
+        satisfied = [e for e in candidates if e["required"].issubset(keys)]
+        if len(satisfied) == 1:
+            return satisfied[0]["name"]
+        exact = [e for e in satisfied or candidates if e["required"] == keys]
+        if len(exact) == 1:
+            return exact[0]["name"]
+    if not keys:
+        # N'inférer un outil sans argument que sur un flux vide ou un ``{}``
+        # complet : un fragment encore incomplet ne prouve rien.
+        if not args.strip() or isinstance(complete, dict):
+            noargs = [e for e in candidates if not e["required"]]
+            if len(noargs) == 1:
+                return noargs[0]["name"]
+    return ""
+
+
+def _delta_has_visible_content(delta) -> bool:
+    """Vrai si le delta porte du texte/raisonnement exploitable."""
+    if not isinstance(delta, dict):
+        return False
+    for _k in ("content", "reasoning_content", "reasoning"):
+        _v = delta.get(_k)
+        if isinstance(_v, str) and _v:
+            return True
+    return False
+
+
+def _chat_chunk_has_payload(chunk) -> bool:
+    """Le chunk mérite-t-il encore d'être envoyé après retrait des appels ?"""
+    if not isinstance(chunk, dict):
+        return False
+    choices = chunk.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return True
+    for ch in choices:
+        if not isinstance(ch, dict):
+            return True
+        if ch.get("finish_reason") is not None:
+            return True
+        delta = ch.get("delta")
+        if not isinstance(delta, dict):
+            return True
+        if _delta_has_visible_content(delta) or delta.get("tool_calls") or delta.get("role"):
+            return True
+    return False
+
+
+class _ChatToolCallHealer:
+    """Répare les ``tool_calls`` OpenAI sans nom/id avant le client.
+
+    [2026-10-26] Mesure deepseek-harness : l'amont free émet parfois un
+    tool_call ``id=""`` / ``name=""`` alors que les arguments sont ceux d'un
+    outil bien réel (``pwsh``). Le client crée alors un ``tool/call`` vide,
+    ne peut apparier aucun ``tool/result`` et refuse de rejouer le tour
+    (``requires toolCallId matching its tool source``). Le journal de session
+    devient impossible à reprendre.
+
+    Règles :
+      * un nom présent est conservé ;
+      * un nom absent est inféré des clés d'arguments contre les outils
+        réellement déclarés par le client ;
+      * un id absent est synthétisé (jamais ``""``) ;
+      * tant que le nom n'est pas connu, les deltas sont retenus (on ne
+        relaie jamais un appel incomplet) ;
+      * à la fin, un appel non identifiable est écarté et ne produit pas de
+        ``finish_reason: "tool_calls"``. Si rien d'exploitable n'est parti,
+        le flux vide déclenche le retry existant sur une station fraîche.
+    """
+
+    def __init__(self, tools):
+        self._tools = tools if isinstance(tools, list) else []
+        self._states: dict[int, dict] = {}
+        self._template = None
+        self.used_names: list[str] = []
+        self.emitted_indices: set[int] = set()
+        self.dropped_calls = 0
+        self.saw_content = False
+
+    @staticmethod
+    def _call_index(tc, fallback: int) -> int:
+        idx = tc.get("index")
+        if isinstance(idx, bool) or not isinstance(idx, int):
+            return fallback
+        return idx
+
+    def _state(self, tc) -> dict:
+        idx = self._call_index(tc, len(self._states))
+        st = self._states.get(idx)
+        if st is None:
+            st = {
+                "index": idx,
+                "id": "",
+                "name": "",
+                "args": "",
+                "pending": False,
+                "emitted": False,
+            }
+            self._states[idx] = st
+        return st
+
+    def _mark_emitted(self, st) -> None:
+        if st["emitted"]:
+            return
+        st["emitted"] = True
+        self.emitted_indices.add(st["index"])
+        if st["name"] and st["name"] not in self.used_names:
+            self.used_names.append(st["name"])
+
+    def _call_chunk(self, template, st) -> dict:
+        if not st["id"]:
+            st["id"] = _fast_id("call")
+        base = {
+            k: v
+            for k, v in (template or {}).items()
+            if k not in ("choices", "usage") and not str(k).startswith("_")
+        }
+        base["choices"] = [
+            {
+                "index": 0,
+                "delta": {
+                    "tool_calls": [
+                        {
+                            "index": st["index"],
+                            "id": st["id"],
+                            "type": "function",
+                            "function": {"name": st["name"], "arguments": st["args"]},
+                        }
+                    ]
+                },
+                "finish_reason": None,
+            }
+        ]
+        return base
+
+    def _flush_pending(self, template, final: bool = False) -> list[dict]:
+        out: list[dict] = []
+        for st in self._states.values():
+            if not st["pending"]:
+                continue
+            if not st["name"]:
+                if final:
+                    # Fin de flux : ne pas fabriquer un appel aux arguments
+                    # incomplets (JSON tronqué) — le client le rejetterait.
+                    _repaired = _repaired_tool_arguments(st["args"])
+                    if _repaired:
+                        st["args"] = _repaired
+                    try:
+                        _args_obj = _json_loads(st["args"])
+                    except Exception:
+                        _args_obj = None
+                    if isinstance(_args_obj, dict):
+                        st["name"] = _infer_tool_name_from_arguments(st["args"], self._tools)
+                else:
+                    st["name"] = _infer_tool_name_from_arguments(st["args"], self._tools)
+            if not st["name"]:
+                st["pending"] = False
+                self.dropped_calls += 1
+                continue
+            out.append(self._call_chunk(template, st))
+            st["pending"] = False
+            self._mark_emitted(st)
+        return out
+
+    def feed(self, chunk):
+        """Retourne les chunks à émettre pour ce chunk amont (0..n)."""
+        if not isinstance(chunk, dict):
+            return [chunk]
+        self._template = chunk
+        choices = chunk.get("choices")
+        if not isinstance(choices, list) or not choices:
+            return [chunk]
+
+        out: list[dict] = []
+        finish_present = False
+        for ch in choices:
+            if not isinstance(ch, dict):
+                continue
+            delta = ch.get("delta")
+            if not isinstance(delta, dict):
+                continue
+            if _delta_has_visible_content(delta):
+                self.saw_content = True
+            if ch.get("finish_reason") is not None:
+                finish_present = True
+            tcs = delta.get("tool_calls")
+            if not isinstance(tcs, list) or not tcs:
+                continue
+
+            keep: list[dict] = []
+            for tc in tcs:
+                if not isinstance(tc, dict):
+                    continue
+                st = self._state(tc)
+                fn = tc.get("function")
+                if not isinstance(fn, dict):
+                    fn = tc if (tc.get("name") or tc.get("arguments")) else {}
+                if tc.get("id") and not st["id"]:
+                    st["id"] = str(tc["id"])
+                args = fn.get("arguments")
+                if isinstance(args, str):
+                    st["args"] += args
+                elif isinstance(args, dict):
+                    st["args"] += _json_dumps_str(args)
+                # [2026-10-26] Flux dsh : l'ouverture ``{"`` manque. On la
+                # restaure AVANT l'inférence, sinon le premier fragment part
+                # tel quel et le reste du flux produit un JSON invalide.
+                if st["args"] and not st["args"].lstrip().startswith(("{", "[")):
+                    st["args"] = _repair_tool_arguments_prefix(st["args"])
+                name = fn.get("name")
+                if isinstance(name, str) and name.strip() and not st["name"]:
+                    st["name"] = name.strip()
+                if not st["name"]:
+                    st["name"] = _infer_tool_name_from_arguments(st["args"], self._tools)
+                if not st["name"]:
+                    # Nom inconnu : on retient le delta, jamais de tool_call vide.
+                    st["pending"] = True
+                    continue
+                if st["pending"]:
+                    # Nom trouvé après coup : on rejoue les arguments accumulés
+                    # en un premier delta valide, puis on reprend le flux.
+                    # [2026-10-26] L'amont peut avoir omis l'ouverture ``{"``
+                    # (mesure dsh) : on la restaure avant de rendre l'appel.
+                    if not st["args"].lstrip().startswith(("{", "[")):
+                        st["args"] = _repair_tool_arguments_prefix(st["args"])
+                    out.append(self._call_chunk(chunk, st))
+                    st["pending"] = False
+                    self._mark_emitted(st)
+                    continue
+
+                if not st["id"]:
+                    st["id"] = _fast_id("call")
+                tc_out = dict(tc)
+                fn_out = dict(fn)
+                fn_out["name"] = st["name"]
+                if not st["emitted"]:
+                    # Premier delta émis : il porte TOUT l'argument accumulé
+                    # (et le préfixe réparé), pas seulement le fragment courant.
+                    fn_out["arguments"] = st["args"]
+                tc_out["function"] = fn_out
+                tc_out["id"] = st["id"]
+                tc_out.setdefault("type", "function")
+                keep.append(tc_out)
+                self._mark_emitted(st)
+
+            if keep:
+                delta["tool_calls"] = keep
+            else:
+                delta.pop("tool_calls", None)
+
+        if finish_present:
+            out.extend(self._flush_pending(chunk, final=True))
+            for ch in choices:
+                if not isinstance(ch, dict):
+                    continue
+                fr = ch.get("finish_reason")
+                if fr == "tool_calls" and not self.emitted_indices:
+                    # Aucun appel valide : ne pas annoncer un tour d'outil.
+                    ch["finish_reason"] = "stop"
+                elif fr in (None, "", "stop") and self.emitted_indices:
+                    ch["finish_reason"] = "tool_calls"
+            # Rien de visible + appels tous invalides : ne pas clore le flux,
+            # laisser la reprise « stream vide » rejouer sur une station fraîche.
+            if not self.saw_content and not self.emitted_indices and self.dropped_calls:
+                return out
+
+        if _chat_chunk_has_payload(chunk):
+            out.append(chunk)
+        return out
+
+    def finish(self, template=None) -> list[dict]:
+        """Flush de fin de flux (EOF/[DONE]) : infère ou écarte les retenus."""
+        if isinstance(template, dict):
+            self._template = template
+        if not self._states:
+            return []
+        return self._flush_pending(self._template or {}, final=True)
+
+
+def _collect_chat_completion(lines, model, tools=None) -> dict | None:
     """Reconstitue un chat.completion JSON depuis des chunks SSE OpenAI.
 
     [2026-10-25] Les `tool_calls` étaient JETÉS : on ne collectait que
@@ -5819,17 +6260,43 @@ def _collect_chat_completion(lines, model) -> dict | None:
                 {"type": "reasoning.text", "text": message["reasoning_content"]}
             ]
     if tool_calls:
-        ordered = [tool_calls[i] for i in sorted(tool_calls)]
-        for tc in ordered:
+        ordered = []
+        for tc in (tool_calls[i] for i in sorted(tool_calls)):
             tc.pop("index", None)
+            fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+            if not isinstance(fn.get("arguments"), str):
+                fn["arguments"] = _json_dumps_str(fn["arguments"]) if isinstance(fn.get("arguments"), dict) else "{}"
+            if not fn["arguments"].lstrip().startswith(("{", "[")):
+                _repaired_args = _repaired_tool_arguments(fn["arguments"])
+                if _repaired_args:
+                    fn["arguments"] = _repaired_args
+            if not isinstance(fn.get("name"), str) or not fn["name"].strip():
+                # [2026-10-26] Nom vide mesuré (dsh) : on le retrouve par les
+                # arguments, sinon on écarte l'appel — un tool_call sans nom
+                # casse la session côté client (résultat non appariable).
+                fn["name"] = _infer_tool_name_from_arguments(fn.get("arguments", ""), tools)
+            if not isinstance(fn.get("name"), str) or not fn["name"].strip():
+                _debug(
+                    "  [collect] SKIP tool_call sans nom "
+                    f"id={tc.get('id')!r} args={(fn.get('arguments') or '')[:120]!r}"
+                )
+                continue
+            fn["name"] = fn["name"].strip()
+            tc["function"] = fn
             if not tc.get("id"):
-                tc["id"] = f"call_free_{int(time.time() * 1000):x}{tc['function']['name'][:6]}"
-        message["tool_calls"] = ordered
-        # Parité OpenAI : un message d'appel d'outil porte content=null.
-        if not message["content"]:
-            message["content"] = None
-        if not finish:
-            finish = "tool_calls"
+                tc["id"] = f"call_free_{int(time.time() * 1000):x}{fn['name'][:6]}"
+            ordered.append(tc)
+        if ordered:
+            message["tool_calls"] = ordered
+            # Parité OpenAI : un message d'appel d'outil porte content=null.
+            if not message["content"]:
+                message["content"] = None
+            if not finish:
+                finish = "tool_calls"
+        elif finish == "tool_calls":
+            # Tous les appels ont été écartés : un « tool_calls » sans appel
+            # laisserait le client attendre un résultat qui n'arrivera jamais.
+            finish = "stop"
     return {
         "id": f"chatcmpl-free-{int(time.time() * 1000):x}",
         "object": "chat.completion",
@@ -6856,7 +7323,7 @@ async def _do_free_request_curl_cffi(
             if "/responses" in _ep:
                 _forced_data = _collect_responses_object(_forced_lines, wire_body.get("model", ""))
             else:
-                _forced_data = _collect_chat_completion(_forced_lines, wire_body.get("model", ""))
+                _forced_data = _collect_chat_completion(_forced_lines, wire_body.get("model", ""), tools=body.get("tools"))
             if not _forced_data:
                 # SSE vide (tunnel tronqué ?) → proxy suivant, comme une
                 # erreur transport (pas de bad-mark : pas un connect-error).
@@ -6904,7 +7371,7 @@ async def _do_free_direct_request(endpoint, body: dict, headers: dict):
     if "/responses" in (endpoint or ""):
         data = _collect_responses_object(lines, wire_body.get("model", ""))
     else:
-        data = _collect_chat_completion(lines, wire_body.get("model", ""))
+        data = _collect_chat_completion(lines, wire_body.get("model", ""), tools=body.get("tools"))
     if not data:
         raise UpstreamError("free direct: empty SSE collection", status_code=502)
     out = httpx.Response(
@@ -13187,6 +13654,7 @@ from app.protocol.mapping import (  # noqa: E402,I001  # re-export after functio
     responses_stream_sse,
     restore_chat_response_tool_names,
     sanitize_chat_tool_names,
+    anthropic_input_tokens,
     anthropic_to_openai,
     anthropic_to_openai_response,
     anthropic_to_openai_responses,
@@ -13392,6 +13860,10 @@ async def _finalize_and_close_stream(
     final_in, final_out, final_cache, log_tag = _finalize_stream_tokens(
         model_id, stream_in_est, None, stream_out_tokens, 0, actual_usage, _token_usage, _token_lock
     )
+    # Usage CLIENT Anthropic : `input_tokens` exclut le cache, que le client
+    # additionne séparément. `final_in` reste le total OpenAI pour la DB.
+    final_cache_write = _extract_cache_creation_tokens(actual_usage) if actual_usage else 0
+    client_in = anthropic_input_tokens(final_in, final_cache, final_cache_write)
     if not started:
         started = True
         yield _sse(
@@ -13407,9 +13879,10 @@ async def _finalize_and_close_stream(
                     "stop_reason": None,
                     "stop_sequence": None,
                     "usage": {
-                        "input_tokens": final_in,
+                        "input_tokens": client_in,
                         "output_tokens": 0,
                         "cache_read_input_tokens": final_cache,
+                        "cache_creation_input_tokens": final_cache_write,
                     },
                 },
             },
@@ -13442,7 +13915,14 @@ async def _finalize_and_close_stream(
         {
             "type": "message_delta",
             "delta": {"stop_reason": "tool_use" if has_tools else "end_turn"},
-            "usage": {"output_tokens": final_out, "cache_read_input_tokens": final_cache},
+            "usage": {
+                # Le client remplace l'estimation du start par ce total réel
+                # non caché (input + cache = prompt total OpenAI).
+                "input_tokens": client_in,
+                "output_tokens": final_out,
+                "cache_read_input_tokens": final_cache,
+                "cache_creation_input_tokens": final_cache_write,
+            },
         },
     )
     yield _sse("message_stop", {"type": "message_stop"})
@@ -15849,6 +16329,8 @@ async def messages(request: Request):
         for _attempt in range(_free_bound):
             used_tools = []  # Reset on each retry attempt
             tool_block_idx = {}  # Reset tracking dict on each retry
+            skipped_tool_idx = set()  # [2026-10-26] tool_calls amont sans nom
+            args_started = set()  # [2026-10-26] premier fragment d'arguments
             got_response_completed = False  # Responses API: set on response.completed
             _responses_stream_done = False  # True after response.completed/incomplete → break inner loop
             try:
@@ -16324,6 +16806,10 @@ async def messages(request: Request):
                         # Tool calls
                         for tc in delta.get("tool_calls") or []:
                             api_idx = tc.get("index", 0)
+                            # [2026-10-26] Appel déjà écarté (nom vide au
+                            # premier delta) : ignorer aussi ses arguments.
+                            if api_idx in skipped_tool_idx:
+                                continue
                             if api_idx not in tool_block_idx:
                                 block_idx = next_block_idx
                                 next_block_idx += 1
@@ -16345,8 +16831,19 @@ async def messages(request: Request):
                                 # a envoyé. ``used_tools`` enregistre donc le nom
                                 # d'origine, comme en non-stream.
                                 tc_name = restore_tool_name(tc.get("function", {}).get("name", ""), _out_tool_map)
-                                if tc_name:
-                                    used_tools.append(tc_name)
+                                if not tc_name:
+                                    # [2026-10-26] Un tool_use au nom vide casse
+                                    # l'appariement du tool_result côté client
+                                    # (mesure dsh : « requires toolCallId matching
+                                    # its tool source »). On écarte l'appel plutôt
+                                    # que d'émettre un bloc invalide.
+                                    skipped_tool_idx.add(api_idx)
+                                    _debug(
+                                        f"  [stream-oai] SKIP tool_call sans nom idx={api_idx} "
+                                        f"id={tc_id!r} args={str(tc.get('function', {}).get('arguments', ''))[:120]!r}"
+                                    )
+                                    continue
+                                used_tools.append(tc_name)
                                 _debug(
                                     f"  [stream-oai] tool_call block_start idx={block_idx} name={tc_name!r} id={tc_id}"
                                 )
@@ -16365,6 +16862,12 @@ async def messages(request: Request):
                                 )
                                 open_blocks.append(block_idx)
                             if args := tc.get("function", {}).get("arguments", ""):
+                                if api_idx not in args_started:
+                                    args_started.add(api_idx)
+                                    # [2026-10-26] Même réparation que côté Chat :
+                                    # l'amont peut omettre l'ouverture ``{"``.
+                                    if not args.lstrip().startswith(("{", "[")):
+                                        args = _repair_tool_arguments_prefix(args)
                                 stream_out_tokens += _estimate_tokens(args)
                                 yield _sse(
                                     "content_block_delta",
@@ -18700,6 +19203,20 @@ async def chat_completions(request: Request):
                         # ``T.trim()==="[DONE]"``). Sans lui, la boucle de
                         # consommation reste en attente jusqu'au timeout.
                         _done_emitted = False
+                        # [2026-10-26] Répare les tool_calls amont sans nom/id
+                        # AVANT tout yield (cf. _ChatToolCallHealer). Le client
+                        # harness refuse ensuite de rejouer le tour.
+                        _tool_healer = _ChatToolCallHealer(body.get("tools"))
+
+                        def _sync_healer() -> None:
+                            """Reporte les appels réellement émis dans le tracking."""
+                            nonlocal _synth_finish
+                            for _name in _tool_healer.used_names:
+                                if _name not in used_tools:
+                                    used_tools.append(_name)
+                            seen_tool_indices.update(_tool_healer.emitted_indices)
+                            if _tool_healer.emitted_indices and _synth_finish in (None, "", "stop"):
+                                _synth_finish = "tool_calls"
 
                         def _enrich_chunk(_c):
                             """Ajoute id/object/created/model absents d'un delta.
@@ -18751,6 +19268,31 @@ async def chat_completions(request: Request):
                                 continue
                             data_str = line[5:].strip()
                             if data_str == "[DONE]":
+                                _flushed = _tool_healer.finish()
+                                for _c in _flushed:
+                                    _oai_has_yielded = True
+                                    yield f"data: {_json_dumps_str(_enrich_chunk(_c), ensure_ascii=False)}\n\n".encode()
+                                _sync_healer()
+                                if _flushed and not emitted_finish:
+                                    _synth = {
+                                        "id": _fast_id("chatcmpl"),
+                                        "object": "chat.completion.chunk",
+                                        "created": int(time.time()),
+                                        "model": original_model,
+                                        "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+                                    }
+                                    yield f"data: {_json_dumps_str(_synth, ensure_ascii=False)}\n\n".encode()
+                                    emitted_finish = True
+                                if (
+                                    not _flushed
+                                    and _tool_healer.dropped_calls
+                                    and not _tool_healer.saw_content
+                                    and not _tool_healer.emitted_indices
+                                ):
+                                    # Rien d'exploitable n'est parti : laisser la
+                                    # reprise « stream vide » rejouer le tour au lieu
+                                    # de clore sur un [DONE] vide.
+                                    break
                                 yield _usage_frame()
                                 yield line.encode() + b"\n\n"
                                 _done_emitted = True
@@ -18786,9 +19328,11 @@ async def chat_completions(request: Request):
                                 # le parseur officiel émet ses ``response-metadata``
                                 # depuis le PREMIER chunk reçu.
                                 chunk = _enrich_chunk(restore_chat_response_tool_names(chunk, _out_tool_map))
-                                _oai_has_yielded = True
+                                for _c in _tool_healer.feed(chunk):
+                                    _oai_has_yielded = True
+                                    yield f"data: {_json_dumps_str(_c, ensure_ascii=False)}\n\n".encode()
+                                _sync_healer()
                                 _chunk_already_yielded = True
-                                yield f"data: {_json_dumps_str(chunk, ensure_ascii=False)}\n\n".encode()
                                 # reasoning_content / content compté plus bas via choices
                                 choices = chunk.get("choices", [])
                                 # ne pas re-tomber dans le test choices vide ci-dessous
@@ -18815,8 +19359,10 @@ async def chat_completions(request: Request):
                                     # [TROU 2 — A8] nom d'outil restauré avant yield.
                                     # [PARITE] + métadonnées id/object/created/model.
                                     chunk = _enrich_chunk(restore_chat_response_tool_names(chunk, _out_tool_map))
-                                    _oai_has_yielded = True
-                                    yield f"data: {_json_dumps_str(chunk, ensure_ascii=False)}\n\n".encode()
+                                    for _c in _tool_healer.feed(chunk):
+                                        _oai_has_yielded = True
+                                        yield f"data: {_json_dumps_str(_c, ensure_ascii=False)}\n\n".encode()
+                                    _sync_healer()
                                     continue
                             if choices and isinstance(choices, list) and len(choices) > 0:
                                 delta = choices[0].get("delta", {}) if isinstance(choices[0], dict) else {}
@@ -18839,39 +19385,36 @@ async def chat_completions(request: Request):
                                     # flux SSE (mutation in-place sur `chunk`, dont
                                     # le yield ré-émet la version restaurée).
                                     chunk = restore_chat_response_tool_names(chunk, _out_tool_map)
-                                    for tc in delta.get("tool_calls") or []:
-                                        if isinstance(tc, dict) and "name" in tc.get("function", {}):
-                                            tc_idx = tc.get("index", len(seen_tool_indices))
-                                            if tc_idx not in seen_tool_indices:
-                                                seen_tool_indices.add(tc_idx)
-                                                used_tools.append(tc["function"]["name"])
-                                    # [PARITE client officiel] L'amont free peut
-                                    # emettre des tool_calls SANS finish_reason
-                                    # terminal (mesure : 3 frames de delta puis
-                                    # EOF). Le proxy synthetisait alors « stop »,
-                                    # soit un tour d'outil annonce comme termine.
-                                    # Le parseur officiel mappe tool_calls ->
-                                    # "tool-calls" et stop -> "stop" : un « stop »
-                                    # avec outil fait croire au client que le tour
-                                    # est fini et l'outil n'est jamais execute.
-                                    if seen_tool_indices and _synth_finish in (None, "", "stop"):
-                                        _synth_finish = "tool_calls"
+                                    # [2026-10-26] Le suivi des tool_calls (id/nom
+                                    # valides, synthèse finish) est fait par
+                                    # _tool_healer.feed() ci-dessous : ne plus
+                                    # compter un `"name": ""` comme un appel.
                                 # Track finish_reason for truncated-stream detection
                                 _fr = choices[0].get("finish_reason") if isinstance(choices[0], dict) else None
                                 if _fr is not None:
                                     emitted_finish = True
                             if not _chunk_already_yielded:
-                                _oai_has_yielded = True
-                                # [TROU 2 — A8] On ré-émet le chunk PARSÉ (et non la
-                                # ligne amont brute) : le restore-retour a réécrit
-                                # le nom d'outil dans `chunk`, et relâcher la ligne
-                                # d'origine renvoyait au client le nom raccourci.
-                                # Sérialisation identique aux autres yields (orjson,
-                                # même `ensure_ascii=False`) ; `data_str` == le JSON
-                                # du chunk, donc aucune perte de champ.
-                                # [PARITE] + métadonnées id/object/created/model.
-                                yield f"data: {_json_dumps_str(_enrich_chunk(chunk), ensure_ascii=False)}\n\n".encode()
+                                for _c in _tool_healer.feed(chunk):
+                                    _oai_has_yielded = True
+                                    # [TROU 2 — A8] On ré-émet le chunk PARSÉ (et non la
+                                    # ligne amont brute) : le restore-retour a réécrit
+                                    # le nom d'outil dans `chunk`, et relâcher la ligne
+                                    # d'origine renvoyait au client le nom raccourci.
+                                    # Sérialisation identique aux autres yields (orjson,
+                                    # même `ensure_ascii=False`) ; `data_str` == le JSON
+                                    # du chunk, donc aucune perte de champ.
+                                    # [PARITE] + métadonnées id/object/created/model.
+                                    yield f"data: {_json_dumps_str(_enrich_chunk(_c), ensure_ascii=False)}\n\n".encode()
+                                _sync_healer()
                             _chunk_already_yielded = False
+
+                        # [2026-10-26] EOF sans chunk `finish` : les tool_calls
+                        # retenus (nom inféré des arguments) doivent partir AVANT
+                        # la synthèse terminale, sinon ils seraient perdus.
+                        for _c in _tool_healer.finish():
+                            _oai_has_yielded = True
+                            yield f"data: {_json_dumps_str(_enrich_chunk(_c), ensure_ascii=False)}\n\n".encode()
+                        _sync_healer()
 
                         # [FIX EOF nu] Fin de flux amont sans AUCUN contenu, sans usage et
                         # sans finish_reason : l'amont a fermé après ses seuls événements

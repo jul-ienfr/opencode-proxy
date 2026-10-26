@@ -253,6 +253,10 @@ def anthropic_sse_from_completion(
     try:
         text = text if isinstance(text, str) else ""
         mid = msg_id or "msg_compact"
+        # Sémantique Anthropic : input_tokens exclut le cache, que le client
+        # additionne à part. `input_tokens` reçu ici est le total OpenAI.
+        cache_read = max(0, int(cache_read or 0))
+        client_in = max(0, int(input_tokens or 0) - cache_read)
         return [
             b"event: message_start\ndata: "
             + _dump(
@@ -267,9 +271,9 @@ def anthropic_sse_from_completion(
                         "stop_reason": None,
                         "stop_sequence": None,
                         "usage": {
-                            "input_tokens": input_tokens or 0,
+                            "input_tokens": client_in,
                             "output_tokens": 0,
-                            "cache_read_input_tokens": cache_read or 0,
+                            "cache_read_input_tokens": cache_read,
                         },
                     },
                 }
@@ -289,7 +293,11 @@ def anthropic_sse_from_completion(
                 {
                     "type": "message_delta",
                     "delta": {"stop_reason": stop_reason or "end_turn"},
-                    "usage": {"output_tokens": output_tokens or 0},
+                    "usage": {
+                        "input_tokens": client_in,
+                        "output_tokens": output_tokens or 0,
+                        "cache_read_input_tokens": cache_read,
+                    },
                 }
             )
             + b"\n\n",
