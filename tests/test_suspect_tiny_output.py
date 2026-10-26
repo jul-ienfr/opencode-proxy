@@ -216,3 +216,19 @@ def test_should_retry_empty_stream(yielded, out, expected):
 
 def test_should_retry_empty_stream_never_raises():
     assert oc._should_retry_empty_stream(object(), object()) is False
+
+
+def test_should_retry_empty_stream_ignore_une_simple_enveloppe():
+    """[2026-10-26] Un chunk `role` seul n'est pas du contenu : le retry reste sûr.
+
+    Mesuré avec dsh : EOF après le seul `role` -> l'ancienne condition
+    (`not has_yielded`) refusait le retry et émettait « upstream stream
+    truncated without terminal », d'où le warning « turn stopped while a tool
+    result was still pending ».
+    """
+    # enveloppe seule (has_yielded=True, rien d'exploitable)
+    assert oc._should_retry_empty_stream(True, 0, content_yielded=False) is True
+    # vrai contenu : jamais de retry (concaténation interdite)
+    assert oc._should_retry_empty_stream(True, 12, content_yielded=True) is False
+    # tool call complet : contenu exploitable
+    assert oc._should_retry_empty_stream(True, 0, content_yielded=True) is False

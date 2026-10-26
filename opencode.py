@@ -12284,18 +12284,24 @@ def _is_suspect_tiny_output(inp, out, tools_used) -> bool:
         return False
 
 
-def _should_retry_empty_stream(has_yielded: bool, stream_out) -> bool:
-    """True si RIEN n'est parti au client : un retry est sûr (pas de concat).
+def _should_retry_empty_stream(has_yielded: bool, stream_out, *, content_yielded=None) -> bool:
+    """True si RIEN d'exploitable n'est parti au client : un retry est sûr.
 
     Pur, jamais de raise. Couvre deux cas amont :
     - EOF sans terminal ni usage (flux nu) ;
     - complétion NOMINALE (usage présent) mais zéro delta visible — ex. tour
       reasoning-only chiffré/skippé : le client n'a reçu que du vide.
-    Dans les deux cas le client n'a rien d'exploitable ; la maquinaria
-    `_incomplete_empty` existante rejoue sur station fraîche (puis failover
-    payant, puis erreur typée — jamais de faux `stop`).
+
+    [2026-10-26] ``content_yielded`` : quand l'appelant sait distinguer un
+    vrai contenu (texte, raisonnement, tool call) d'une simple enveloppe,
+    il le passe. Un chunk `role` seul ne rend pas le flux exploitable : sans
+    cette distinction, un EOF après le seul `role` partait en erreur
+    « truncated without terminal » au lieu d'un retry (mesuré : dsh affichait
+    « the turn stopped while a tool result was still pending »).
     """
     try:
+        if content_yielded is not None:
+            return not content_yielded and (stream_out or 0) == 0
         return not has_yielded and (stream_out or 0) == 0
     except Exception:
         return False
@@ -18698,7 +18704,11 @@ async def chat_completions(request: Request):
                         # `_should_retry_empty_stream` couvre les deux cas ; la
                         # maquinaria `_incomplete_empty` derrière est inchangée
                         # (retry borné → erreur typée, jamais de faux `stop`).
-                        if _should_retry_empty_stream(_oai_has_yielded, stream_out):
+                        if _should_retry_empty_stream(
+                            _oai_has_yielded,
+                            stream_out,
+                            content_yielded=bool(stream_out > 0 or seen_tool_indices),
+                        ):
                             if actual_usage is None:
                                 _debug(
                                     "  [oai-stream] upstream EOF without terminal event "
@@ -18854,6 +18864,32 @@ async def chat_completions(request: Request):
                                         f"synthèse {_synth_finish!r} (flux complet, pas une troncature)"
                                     )
                                 else:
+                                    if seen_tool_indices:
+                                        # [2026-10-26] Outil(s) complet(s) reçus mais
+                                        # l'amont a omis le terminal : le tour d'outil
+                                        # est VALIDE (nom, id, arguments complets).
+                                        # Synthétiser `tool_calls` évite de transformer
+                                        # un tour exploitable en erreur « truncated »
+                                        # (le client laissait alors un résultat pendant).
+                                        _debug(
+                                            "  [oai-stream] tool_calls complets sans finish/usage "
+                                            "→ synthèse tool_calls (pas une troncature)"
+                                        )
+                                        _synth = {
+                                            "id": _fast_id("chatcmpl"),
+                                            "object": "chat.completion.chunk",
+                                            "created": int(time.time()),
+                                            "model": original_model,
+                                            "choices": [
+                                                {"index": 0, "delta": {}, "finish_reason": "tool_calls"}
+                                            ],
+                                        }
+                                        yield f"data: {_json_dumps_str(_synth, ensure_ascii=False)}\n\n".encode()
+                                        yield _usage_frame()
+                                        yield b"data: [DONE]\n\n"
+                                        emitted_finish = True
+                                        _done_emitted = True
+                                        continue
                                     # Parité Anthropic : contenu sans terminal ni usage =
                                     # troncature réelle, pas un succès. On émet une erreur
                                     # explicite au lieu d'un faux `stop` + [DONE].

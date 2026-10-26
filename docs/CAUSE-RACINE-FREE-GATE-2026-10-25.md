@@ -366,6 +366,29 @@ même tour harness produit désormais
 > (`assistant/message` + `tool/call`) du `session.v4.jsonl.zstd` avant de
 > reprendre.
 
+### « the turn stopped while a tool result was still pending » (dsh, 2026-10-26)
+
+Symptôme : le harness affiche `⚠️ No reply: the turn stopped while a tool
+result was still pending…`. Deux tours avaient terminé avec
+`{"kind":"error","message":"upstream stream truncated without terminal"}`.
+
+Cause : l'amont ferme parfois le flux après un **simple chunk `role`**, sans
+contenu ni `finish_reason`. Le retry de flux vide exigeait `not has_yielded` :
+ce chunk d'enveloppe annulait donc le retry, et le proxy émettait sa propre
+erreur `upstream stream truncated without terminal` — que le harness remontait
+comme un tour échoué.
+
+Correctifs :
+
+- `_should_retry_empty_stream(..., content_yielded=...)` : une enveloppe seule
+  n'est pas du contenu exploitable, le retry sur station fraîche reste sûr ;
+- si des `tool_calls` **complets** ont été reçus mais que le terminal manque,
+  le proxy synthétise `finish_reason: "tool_calls"` au lieu d'une erreur — le
+  tour d'outil est valide et le client peut exécuter l'outil.
+
+Les vraies troncatures de texte (contenu partiel, pas de terminal) restent des
+erreurs : on ne fabrique pas de faux `stop`.
+
 ### Paramètres d'activation : mesurés, tous tolérés
 
 Envoyés à l'amont sur `deepseek-v4.1`, `glm-5.3` et `mimo-v2.6` : rien,
