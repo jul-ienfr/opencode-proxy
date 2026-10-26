@@ -545,14 +545,30 @@ class TestPinLoopEgressOk:
         VPNManager._pin_widen_in_flight = {}
         return mgr
 
-    async def test_pin_loop_egress_ok_is_degraded_not_error(self, tmp_path):
-        """P0-1 : resets vieux (> grace) + egress OK → degraded pin-loop."""
+    async def test_old_reset_egress_ok_is_healed_not_error(self, tmp_path):
+        """Reset ancien (> grace), sans boucle de resets + egress OK → guéri.
+
+        Non-régression s6 : le même log ne doit pas ré-armer le marqueur
+        secondaire à chaque refresh et condamner la station à un degraded
+        perpétuel. Avec des compteurs de boucle, le comportement degraded +
+        widen reste couvert par test_pin_loop_triggers_widen.
+        """
         mgr = self._pin_loop_mgr(tmp_path)
         st = await mgr.refresh_status(force=True)
-        assert st["status"] == VPNState.DEGRADED
-        assert st["degraded_reason"] == "pin-loop"
+        assert st["status"] == VPNState.CONNECTED
         assert st["egress_state"] == "tunnel_up_full"
-        assert st["ip"] == "9.9.9.9"  # jamais purgée sur la voie degraded
+        assert st["ip"] == "9.9.9.9"  # IP conservée
+        assert st["secondary_path_issue"] is False
+        _cancel(mgr._server_issue_recheck_task)
+
+    async def test_same_old_reset_counted_once_across_refreshes(self, tmp_path):
+        """Non-régression : le même reset relu à chaque refresh ne doit pas
+        gonfler `_pin_resets_1h` (sinon widen + degraded perpétuel)."""
+        mgr = self._pin_loop_mgr(tmp_path)
+        await mgr.refresh_status(force=True)
+        await mgr.refresh_status(force=True)
+        await mgr.refresh_status(force=True)
+        assert len(mgr._pin_resets_1h) == 1
         _cancel(mgr._server_issue_recheck_task)
 
     async def test_pin_loop_triggers_widen(self, tmp_path):
@@ -997,13 +1013,17 @@ class TestServerRefusedAutoRecovery:
         assert st["ip"] == "9.9.9.9"  # jamais purgée sur la voie degraded
         _cancel(mgr._server_issue_recheck_task)
 
-    async def test_old_refused_chunk_is_pin_loop_degraded(self, tmp_path):
-        """Chunk st1 réel horodaté (vieux de > grace) + egress OK → degraded
-        voie pin-loop (pas de pending, pas de recheck) : la station reste
-        routable au lieu de coller en error."""
+    async def test_old_refused_chunk_egress_ok_is_healed(self, tmp_path):
+        """Chunk st1 réel horodaté (vieux de > grace) + egress OK → guéri.
+
+        La station reste routable (CONNECTED) au lieu de coller en error ou
+        en degraded perpétuel : plus de ré-armement du marqueur secondaire
+        sur une ligne de log ancienne.
+        """
         mgr = GraceFake(_gcfg(tmp_path), tmp_path)
         mgr._current_ip = "9.9.9.9"
         mgr.log_text = _ST1_REFUSED_CHUNK
         st = await mgr.refresh_status(force=True)
-        assert st["status"] == VPNState.DEGRADED
-        assert st["ip"] == "9.9.9.9"  # jamais purgée sur la voie degraded
+        assert st["status"] == VPNState.CONNECTED
+        assert st["ip"] == "9.9.9.9"  # IP conservée
+        assert st["secondary_path_issue"] is False

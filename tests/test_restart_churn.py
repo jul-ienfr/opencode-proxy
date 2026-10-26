@@ -70,6 +70,8 @@ async def test_scan_counts_markers_against_threshold(tmp_path):
         "logs",
         "--since",
         f"{mgr._restart_churn_window_min}m",
+        "--tail",
+        "2000",
         mgr._docker_container,
     ]
 
@@ -102,7 +104,14 @@ async def test_scan_snaps_to_recovery_boundary(tmp_path):
     mgr._restart_churn_recovered_at = time.time()  # recovered just now
     mgr.log_stdout = ""  # post-boundary window: nothing fresh
     assert await mgr._check_restart_churn(10) is False
-    assert mgr.docker_log_args[-1] == ["logs", "--since", "1s", mgr._docker_container]
+    assert mgr.docker_log_args[-1] == [
+        "logs",
+        "--since",
+        "1s",
+        "--tail",
+        "2000",
+        mgr._docker_container,
+    ]
 
 
 @pytest.mark.asyncio

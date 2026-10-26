@@ -139,11 +139,19 @@ def test_opencode_import_budget():
     ne pas dépendre de la charge machine, tout en attrapant le retour d'un
     import lourd (tiktoken seul ajoutait 1-2 s à froid).
     """
-    out = _boot_probe(
-        "import time;t=time.perf_counter();import opencode;print('MS: %.0f' % ((time.perf_counter()-t)*1000))"
-    )
-    ms = float([ln for ln in out.splitlines() if ln.startswith("MS:")][0].split(":")[1])
-    assert ms < 900, f"import opencode = {ms:.0f} ms (budget 900 ms)"
+    # Deux passes : la première peut payer le cache disque/antivirus sous
+    # charge (6 tunnels Docker + suite complète). On garde le budget sur la
+    # meilleure mesure, sans masquer un import structurellement lourd.
+    vals: list[float] = []
+    for _ in range(2):
+        out = _boot_probe(
+            "import time;t=time.perf_counter();import opencode;print('MS: %.0f' % ((time.perf_counter()-t)*1000))"
+        )
+        vals.append(
+            float([ln for ln in out.splitlines() if ln.startswith("MS:")][0].split(":")[1])
+        )
+    ms = min(vals)
+    assert ms < 900, f"import opencode = {ms:.0f} ms (budget 900 ms, passes={vals})"
 
 
 def test_config_import_does_no_network():

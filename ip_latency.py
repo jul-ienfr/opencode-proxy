@@ -45,6 +45,7 @@ class IpLatencyTracker:
     alpha: float = 0.3
     min_requests_before_eval: int = 5
     consecutive_slow_limit: int = 3
+    warmup_requests: int = 1
     _ring: deque[float] = field(default_factory=lambda: deque(maxlen=20))
     _ewma_log: float | None = None
     consecutive_slow: int = 0
@@ -62,7 +63,7 @@ class IpLatencyTracker:
         Warm-up v6 §3.6.5 : la 1ʳᵉ requête sur une IP neuve (count==0 avant
         enregistrement) paie le handshake TLS/SOCKS — elle alimente ring et
         EWMA mais ne compte JAMAIS comme slow."""
-        first_on_ip = self.request_count == 0
+        first_on_ip = self.request_count < max(0, int(self.warmup_requests or 1))
         duration_ms = max(0.0, float(duration_ms))
         self._ring.append(duration_ms)
         self.request_count += 1

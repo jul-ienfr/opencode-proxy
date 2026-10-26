@@ -231,3 +231,21 @@ def _reset_free_model_rr():
     except Exception:
         pass
     _neuf()
+
+
+@pytest.fixture(autouse=True)
+def _reset_station_quality_registry():
+    """[roadmap] Registre qualité = singleton : isolation entre tests."""
+    try:
+        from free.quality import reset_quality_registry
+
+        reset_quality_registry()
+    except Exception:
+        pass
+    yield
+    try:
+        from free.quality import reset_quality_registry
+
+        reset_quality_registry()
+    except Exception:
+        pass

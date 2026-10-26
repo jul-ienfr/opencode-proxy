@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 ### Added
+- [2026-10-26] Roadmap stations/IP : `ops/health.py`, `ops/fleet.py`, `ops/jobs.py`, `ops/updater.py`, `free/quality.py`, `free/probe.py`, `free/selector.py`
+- [2026-10-26] Sélection par score mesuré (latence/succès/quota/charge/stabilité) + sonde active sans quota
+- [2026-10-26] API flotte : start/stop/restart/connect/disconnect par station, jobs 202, snapshot read-only
+- [2026-10-26] Persistance quota périodique + flush shutdown ; anti-flap ; stack `.env` par station
 - Audit routabilité `docs/audit-routabilite-stations-2026-09-08.md` + ADR-007 (PC-1→PC-16 implémentés)
 - `scripts/config_coverage.py` + gate `--baseline` (O1 : zéro clé morte)
 - Métriques `/metrics` : `pool_station_usable`, `pool_usable_stations`, `pool_usable_floor`, `free_429_by_model`
@@ -16,6 +20,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - pyproject.toml (ruff/mypy/pytest), SERVER_COUNTRIES source unique, deps pinnées
 
 ### Fixed
+- [2026-10-26] Flapping station : resets voie secondaire ignorés côté statut, churn borné, anti-flap, frontière de guérison
+- [2026-10-26] `boot_error` stale recalculé ; `disconnect` persistant ; `toggle/connect/heal` fleet-wide
+- [2026-10-26] Mise à jour d'image coordonnée flotte ; `control_api_key` migré hors de `config.yaml`
 - Watchdog : budget `max_restarts_per_hour` appliqué toutes voies + décision unique par tick (F1/F2)
 - Pool free : bad-mark par cause + garde N-2 (jamais 1/6), rotation sans coupure (H5/H6)
 - Canary WG : bring-up échoué = indéterminé, plus de freeze 10 min (F3/H7)

@@ -14,7 +14,7 @@ import pytest
 from test_vpn_freshness import FakeVPNManager, _cfg
 
 import vpn_manager as vm
-from tests.test_ip_probe import _FakeClient, _FakeHttpx
+from test_ip_probe import _FakeClient, _FakeHttpx
 
 
 def _mgr(tmp_path, **over):

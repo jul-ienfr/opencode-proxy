@@ -2875,6 +2875,15 @@ def register_dashboard(
         _stats_cache.set("ip_stats", stats, ttl=10)
         return stats
 
+    def _fleet_controller():
+        import shared_state
+        from ops.fleet import FleetController
+
+        return FleetController(
+            list(getattr(shared_state, "vpn_managers", None) or []),
+            getattr(shared_state, "free_ip_pool", None),
+        )
+
     @app.get("/api/vpn/station/{station_id}/logs")
     async def get_station_logs(station_id: int, lines: int = 50):
         """[plan v10 §4 Lot 4] derniers logs docker de la station N — MTTR
@@ -2916,36 +2925,54 @@ def register_dashboard(
         refreshed_at = datetime.now(UTC).isoformat()
         refresh_error = None
         stale = False
+        status_age_s = None
         if managers:
+            # [roadmap] Stale-while-revalidate : le dashboard ne doit JAMAIS
+            # attendre 6 scans Docker (inspect+logs+control) sur son thread.
+            # On sert l'état en mémoire immédiatement et on rafraîchit en fond
+            # (single-flight). Le watchdog garde la fraîcheur côté station.
             try:
-                # [v6 P1-1] asyncio.timeout (Python 3.11+) + return_exceptions + cancel propre
-                async with asyncio.timeout(2.0):
-                    _results = await asyncio.gather(
-                        *(mgr.refresh_status(force=False) for mgr in managers), return_exceptions=True
-                    )
-                for _r in _results:
-                    if isinstance(_r, Exception):
-                        refresh_error = f"{type(_r).__name__}: {_r}"
-                        break
-                refreshed_at = datetime.now(UTC).isoformat()
-            except TimeoutError:
-                stale = True
-                refresh_error = "refresh timeout after 2.0s"
-                refreshed_at = datetime.now(UTC).isoformat()
-                try:
-                    # [v6 P1-1] background force=True single-flight (évite stale 10s + herd 40 spawns)
+                _now = time.monotonic()
+                _ages = [
+                    None
+                    if getattr(m, "_last_status_refresh_at", None) is None
+                    else _now - float(getattr(m, "_last_status_refresh_at", 0.0))
+                    for m in managers
+                ]
+                _cache_s = max(
+                    0.5,
+                    min(
+                        float(getattr(m, "_STATUS_CACHE_SECONDS", 5.0))
+                        for m in managers
+                    ),
+                )
+                _known_ages = [a for a in _ages if a is not None]
+                status_age_s = max(_known_ages) if _known_ages else None
+                # « stale » = donnée vraiment périmée (badge UI / alerte) ;
+                # la revalidation, elle, part dès que le cache station expire.
+                # 120 s : un poll externe à 60 s ne doit pas être marqué
+                # périmé alors que le refresh de fond réussit.
+                _fresh_bound = max(120.0, _cache_s * 6.0)
+                stale = any(a is None or a >= _fresh_bound for a in _ages)
+                _needs_refresh = any(a is None or a >= _cache_s for a in _ages)
+                if _needs_refresh:
                     _inflight = getattr(shared_state, "_refresh_inflight", None)
                     if not _inflight or getattr(_inflight, "done", lambda: True)():
-                        shared_state._refresh_inflight = asyncio.create_task(
-                            asyncio.gather(*(m.refresh_status(force=True) for m in managers), return_exceptions=True)
+                        # gather() renvoie un Future, pas une coroutine :
+                        # create_task() lève TypeError. ensure_future() accepte
+                        # les deux et garde le single-flight.
+                        shared_state._refresh_inflight = asyncio.ensure_future(
+                            asyncio.gather(
+                                *(m.refresh_status(force=False) for m in managers),
+                                return_exceptions=True,
+                            )
                         )
                         shared_state._refresh_inflight.add_done_callback(
                             lambda t: setattr(shared_state, "_refresh_inflight", None)
                         )
-                except Exception:
-                    pass
             except Exception as _e:
                 refresh_error = f"{type(_e).__name__}: {_e}"
+            refreshed_at = datetime.now(UTC).isoformat()
             if shared_state.free_ip_pool:
                 data = shared_state.free_ip_pool.get_status()
             else:
@@ -3023,9 +3050,32 @@ def register_dashboard(
             # dashboard s'affiche quand ce champ est présent.
             if config_settings.ENV_DIVERGENCE:
                 data["env_divergence"] = [{"key": k, "file": f, "env": e} for k, f, e in config_settings.ENV_DIVERGENCE]
-            # [v6 P0-2] boot_error — 1/4 vs 4/4 visible (fail-open, pas raise)
-            if getattr(shared_state, "boot_error", None):
-                data["boot_error"] = shared_state.boot_error
+            # [roadmap] boot_error dynamique : l'ancien champ restait collé à
+            # « boot 5/6 » après guérison. On recalcule à chaque lecture.
+            try:
+                _expected_n = config_settings.resolved_station_count(
+                    getattr(config_settings, "IP_ROTATION", {}) or {}
+                )
+                _up_n = sum(
+                    1
+                    for _m in managers
+                    if str(getattr(_m, "status", "disconnected") or "disconnected")
+                    in ("connected", "degraded")
+                )
+                _enabled = bool(
+                    (getattr(config_settings, "IP_ROTATION", {}) or {}).get("enabled", False)
+                )
+                if _enabled and _up_n < _expected_n:
+                    shared_state.boot_error = (
+                        f"boot {_up_n}/{_expected_n}: connected {_up_n} — reconcile/pool"
+                    )
+                    data["boot_error"] = shared_state.boot_error
+                else:
+                    shared_state.boot_error = None
+                    data["boot_error"] = None
+            except Exception:
+                if getattr(shared_state, "boot_error", None):
+                    data["boot_error"] = shared_state.boot_error
             # [docker-autostart 2026-10-07] état daemon pour le badge
             # dashboard (lecture seule, jamais bloquant).
             try:
@@ -3055,6 +3105,12 @@ def register_dashboard(
                 # (config.yaml latency_rotation.enabled) pour le toggle.
                 data["latency_enabled"] = bool(getattr(_leng.cfg, "enabled", True))
                 data["global_degraded_remaining"] = round(max(0.0, float(_leng._global_paused_until) - _leng._now()), 1)
+            except Exception:
+                pass
+            try:
+                from free.quality import get_quality_registry
+
+                data["quality"] = get_quality_registry().status()
             except Exception:
                 pass
             data["socks5"] = {
@@ -3153,6 +3209,7 @@ def register_dashboard(
             data["stale"] = stale
             data["refreshed_at"] = refreshed_at
             data["refresh_error"] = refresh_error
+            data["status_age_s"] = status_age_s
             # [prancy-unicorn Phase1 Q5] garde-fou clone frais : warning si N>=2 && !free_parallel
             try:
                 _fp_cfg = config_settings.FREE_PARALLEL if hasattr(config_settings, "FREE_PARALLEL") else {}
@@ -3540,11 +3597,12 @@ def register_dashboard(
 
         body = await request.json()
         enabled = body.get("enabled", True)
-        if shared_state.vpn_manager:
-            shared_state.vpn_manager.enabled = enabled
-            if shared_state.free_ip_pool:
-                shared_state.free_ip_pool._vpn = shared_state.vpn_manager
-            return {"ok": True, "enabled": enabled}
+        managers = list(getattr(shared_state, "vpn_managers", None) or [])
+        if not managers and shared_state.vpn_manager:
+            managers = [shared_state.vpn_manager]
+        if managers:
+            res = await _fleet_controller().set_enabled_all(enabled)
+            return res
         return {"error": "gestionnaire VPN non initialisé"}
 
     @app.post("/api/vpn/connect")
@@ -3558,20 +3616,21 @@ def register_dashboard(
         if not shared_state.vpn_manager:
             return {"error": "gestionnaire VPN non initialisé"}
 
-        await shared_state.vpn_manager.refresh_status()
-        if shared_state.vpn_manager.status in ("connected", "degraded"):
-            return {
-                "ok": True,
-                "ip": shared_state.vpn_manager.current_ip,
-                "server": shared_state.vpn_manager.current_server,
-            }
-
+        managers = list(getattr(shared_state, "vpn_managers", None) or [])
+        if not managers:
+            managers = [shared_state.vpn_manager]
         try:
-            await shared_state.vpn_manager.connect()
+            # [roadmap] Connecter TOUTE la flotte, pas seulement la station 1.
+            res = await _fleet_controller().connect_all()
+            first = managers[0]
+            try:
+                await first.refresh_status()
+            except Exception:
+                pass
             return {
-                "ok": True,
-                "ip": shared_state.vpn_manager.current_ip,
-                "server": shared_state.vpn_manager.current_server,
+                **res,
+                "ip": getattr(first, "current_ip", None),
+                "server": getattr(first, "current_server", None),
             }
         except Exception as e:
             return {"error": str(e)}
@@ -3584,10 +3643,10 @@ def register_dashboard(
             return err
         import shared_state
 
-        if not shared_state.vpn_manager:
+        managers = list(getattr(shared_state, "vpn_managers", None) or [])
+        if not managers and not shared_state.vpn_manager:
             return {"error": "gestionnaire VPN non initialisé"}
-        await shared_state.vpn_manager.disconnect()
-        return {"ok": True}
+        return await _fleet_controller().disconnect_all(stop_containers=False)
 
     @app.post("/api/vpn/health-check")
     async def vpn_health_check(request: Request):
@@ -3614,14 +3673,15 @@ def register_dashboard(
             from config.settings import IP_ROTATION, resolved_station_count
 
             n = resolved_station_count(IP_ROTATION)
-            managers = getattr(shared_state, "vpn_managers", None) or []
+            managers = list(getattr(shared_state, "vpn_managers", None) or [])
             if len(managers) < n:
                 # import at runtime to avoid circular import (opencode imports dashboard)
                 from opencode import _apply_station_count
 
                 await _apply_station_count(n)
-                return {"healed": True, "n": n, "managers": len(getattr(shared_state, "vpn_managers", []) or [])}
-            return {"healed": False, "n": n, "managers": len(managers)}
+                managers = list(getattr(shared_state, "vpn_managers", None) or [])
+            res = await _fleet_controller().heal()
+            return {"healed": bool(res.get("healed")), "n": n, "managers": len(managers), **res}
         except Exception as e:
             return {"error": str(e), "healed": False}
 
@@ -3705,9 +3765,16 @@ def register_dashboard(
                     "error": "aucune mise à jour disponible",
                     "update": shared_state.vpn_manager.get_status()["update"],
                 }
-            # check_opportune=True ([21]): the manual endpoint must not cut
-            # live free streams either — the check runs inside the lock.
-            result = await shared_state.vpn_manager.apply_update(check_opportune=True)
+            # [roadmap] mise à jour coordonnée de toute la flotte, pas de la
+            # seule station 1. On conserve le garde-fou « trafic actif ».
+            if not shared_state.vpn_manager._update_opportune():
+                return {"ok": False, "error": "pas opportun (trafic actif)"}
+            from ops.updater import apply_fleet_update
+
+            result = await apply_fleet_update(
+                list(getattr(shared_state, "vpn_managers", None) or []),
+                shared_state.vpn_manager,
+            )
             result["update"] = shared_state.vpn_manager.get_status()["update"]
             return result
         except Exception as e:
@@ -3897,6 +3964,135 @@ def register_dashboard(
         except Exception as e:
             return JSONResponse(status_code=502, content={"error": str(e)[:200]})
         return {"ok": True, "station": sid, "queued": True}
+
+    @app.post("/api/vpn/station/{sid}/stack")
+    async def set_station_stack(sid: int, request: Request):
+        """Change la stack d'UNE station (WG/OV) sans flip global."""
+        err = _check_dashboard_token(request)
+        if err:
+            return err
+        import shared_state
+
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        stack = str((body or {}).get("stack") or "").strip().lower()
+        if stack not in ("wireguard", "openvpn"):
+            return JSONResponse(status_code=400, content={"error": "stack doit être wireguard|openvpn"})
+        mgr = next(
+            (
+                m
+                for m in (getattr(shared_state, "vpn_managers", None) or [])
+                if getattr(m, "_station", None) == sid
+            ),
+            None,
+        )
+        if mgr is None:
+            return JSONResponse(status_code=404, content={"error": f"station {sid} introuvable"})
+        try:
+            # Flip PER-STATION : stations=[sid] borne le blast-radius.
+            # force=True répare une éventuelle divergence état/conteneur.
+            res = await mgr.set_stack(
+                stack, propagate=True, stations=[sid], force=True
+            )
+            if not res.get("ok"):
+                return JSONResponse(
+                    status_code=502,
+                    content={"error": res.get("error") or "échec application stack"},
+                )
+            return {
+                "ok": True,
+                "station": sid,
+                "stack": stack,
+                "effective": mgr._stack_effective,
+            }
+        except Exception as e:
+            return JSONResponse(status_code=502, content={"error": str(e)[:200]})
+
+    @app.post("/api/vpn/station/{sid}/start")
+    async def start_station(sid: int, request: Request):
+        err = _check_dashboard_token(request)
+        if err:
+            return err
+        return await _fleet_controller().start_station(sid)
+
+    @app.post("/api/vpn/station/{sid}/stop")
+    async def stop_station(sid: int, request: Request):
+        err = _check_dashboard_token(request)
+        if err:
+            return err
+        return await _fleet_controller().stop_station(sid)
+
+    @app.post("/api/vpn/station/{sid}/connect")
+    async def connect_station(sid: int, request: Request):
+        err = _check_dashboard_token(request)
+        if err:
+            return err
+        return await _fleet_controller().connect_station(sid)
+
+    @app.post("/api/vpn/station/{sid}/disconnect")
+    async def disconnect_station(sid: int, request: Request):
+        err = _check_dashboard_token(request)
+        if err:
+            return err
+        return await _fleet_controller().disconnect_station(sid)
+
+    @app.post("/api/vpn/fleet/connect")
+    async def fleet_connect(request: Request):
+        err = _check_dashboard_token(request)
+        if err:
+            return err
+        return await _fleet_controller().connect_all()
+
+    @app.post("/api/vpn/fleet/disconnect")
+    async def fleet_disconnect(request: Request):
+        err = _check_dashboard_token(request)
+        if err:
+            return err
+        return await _fleet_controller().disconnect_all(stop_containers=False)
+
+    @app.get("/api/vpn/fleet")
+    async def fleet_status(request: Request):
+        err = _check_dashboard_token(request)
+        if err:
+            return err
+        return _fleet_controller().status()
+
+    @app.post("/api/vpn/jobs/fleet/{action}")
+    async def fleet_job(action: str, request: Request):
+        """Lance une opération de flotte en tâche de fond (202 + job_id)."""
+        err = _check_dashboard_token(request)
+        if err:
+            return err
+        from ops.jobs import get_jobs
+
+        fleet = _fleet_controller()
+        actions = {
+            "connect": fleet.connect_all,
+            "disconnect": lambda: fleet.disconnect_all(stop_containers=False),
+            "heal": fleet.heal,
+        }
+        fn = actions.get(str(action))
+        if fn is None:
+            return JSONResponse(status_code=400, content={"error": f"action inconnue: {action}"})
+        job = get_jobs().create(f"fleet:{action}", fn())
+        return JSONResponse(status_code=202, content=job.snapshot())
+
+    @app.get("/api/vpn/jobs/{job_id}")
+    async def get_job(job_id: str):
+        from ops.jobs import get_jobs
+
+        job = get_jobs().get(job_id)
+        if job is None:
+            return JSONResponse(status_code=404, content={"error": "job introuvable"})
+        return job.snapshot()
+
+    @app.get("/api/vpn/jobs")
+    async def list_jobs():
+        from ops.jobs import get_jobs
+
+        return get_jobs().status()
 
     @app.get("/api/costs")
     async def get_costs(from_date: str = None, to_date: str = None, station: int = None):

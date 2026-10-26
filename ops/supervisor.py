@@ -318,19 +318,21 @@ class StationSupervisor:
         return self.tracker_for(ip).snapshot()
 
 
-def build_supervisors(managers: list[Any]) -> list[StationSupervisor]:
-    """Construit les superviseurs alignés 1:1 avec la registry de managers."""
-    # [audit-2026-10-24] seuils unifiés : lit circuit_breaker_threshold (défaut 3)
-    # + recovery (défaut 300→cooldown 60s historique conservé si absent) depuis
-    # ip_rotation — fini les 3 breakers aux seuils divergents non documentés.
-    # Priorité : Engine latence > pool bad_ttl > manager breaker > superviseur local.
+def _supervisor_thresholds() -> tuple[int, float]:
     _thr, _cool = 3, 60.0
     try:
         from config.settings import IP_ROTATION as _IR
+
         _thr = max(1, int((_IR or {}).get("circuit_breaker_threshold", 3)))
         _cool = float((_IR or {}).get("station_bad_ttl_s", 60.0))
     except Exception:
         pass
+    return _thr, _cool
+
+
+def build_supervisors(managers: list[Any]) -> list[StationSupervisor]:
+    """Construit les superviseurs alignés 1:1 avec la registry de managers."""
+    _thr, _cool = _supervisor_thresholds()
     supervisors = [
         StationSupervisor(station=m._station, manager=m, breaker_threshold=_thr, breaker_cooldown_sec=_cool)
         for m in sorted(managers, key=lambda m: m._station)
@@ -345,11 +347,17 @@ def sync_supervisors(current: list[StationSupervisor], managers: list[Any]) -> l
     station et son volume persistent), pas à l'identité d'objet du manager
     (reconstruit possible au boot-reconcile) — re-liaison systématique."""
     by_sid = {s.station: s for s in current}
+    _thr, _cool = _supervisor_thresholds()
     out: list[StationSupervisor] = []
     for m in sorted(managers, key=lambda m: m._station):
         sup = by_sid.get(m._station)
         if sup is None:
-            sup = StationSupervisor(station=m._station, manager=m)
+            sup = StationSupervisor(
+                station=m._station,
+                manager=m,
+                breaker_threshold=_thr,
+                breaker_cooldown_sec=_cool,
+            )
         else:
             sup.manager = m
         out.append(sup)

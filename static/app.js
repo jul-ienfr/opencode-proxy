@@ -3614,7 +3614,11 @@ document.addEventListener('DOMContentLoaded', () => {
                     '<strong style="font-size:12px">' + (t('vpn.stack.station') || 'Station') + ' ' + s.station + '</strong>' +
                     '<span style="font-size:12px">' + statusText + '</span>' +
                     '<button class="btn" onclick="vpnNext(' + s.station + ')" style="font-size:11px;padding:2px 8px">' +
-                    t('vpn.switch_ip') + '</button></div>' +
+                    t('vpn.switch_ip') + '</button>' +
+                    '<button class="btn" onclick="vpnStationAction(' + s.station + ',\'restart\')" style="font-size:11px;padding:2px 8px" title="Restart">↻</button>' +
+                    '<button class="btn" onclick="vpnStationAction(' + s.station + ',\'start\')" style="font-size:11px;padding:2px 8px" title="Start">▶</button>' +
+                    '<button class="btn" onclick="vpnStationAction(' + s.station + ',\'stop\')" style="font-size:11px;padding:2px 8px" title="Stop">■</button>' +
+                    '</div>' +
                     '<div class="config-grid">' +
                     '<div class="config-row"><span class="label">' + t('vpn.current_ip') + '</span>' +
                     '<span class="value" style="font-family:monospace;font-weight:bold">' + escHtml(s.current_ip || '—') + '</span></div>' +
@@ -3977,6 +3981,16 @@ document.addEventListener('DOMContentLoaded', () => {
 
     window.vpnDisconnect = async function() {
         await fetchWithToken('/api/vpn/disconnect', { method: 'POST' });
+        refreshVPNStatus();
+    };
+
+    window.vpnStationAction = async function(station, action) {
+        if (action === 'stop' && !confirm('Arrêter et supprimer la station ' + station + ' ?')) return;
+        try {
+            const resp = await fetchWithToken('/api/vpn/station/' + station + '/' + action, { method: 'POST' });
+            const data = await resp.json();
+            if (data.error) alert('Erreur: ' + data.error);
+        } catch (e) { alert('Erreur: ' + e); }
         refreshVPNStatus();
     };
 

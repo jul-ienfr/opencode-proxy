@@ -26,6 +26,7 @@ system):
     calls docker.
 """
 
+import json
 import os
 import subprocess
 
@@ -298,3 +299,105 @@ async def test_stop_never_calls_docker(tmp_path, monkeypatch):
     await m.stop()
     assert m.cmds == [], "stop() must never touch docker"
     assert m._state_file and os.path.exists(m._state_file), "stop() persists the vpn state"
+
+
+# ── Per-station flip (roadmap R1.5/R2.2) ─────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_apply_stack_per_station_bounds_blast_radius(tmp_path, monkeypatch):
+    """stations=[2] ne recrée QUE s2 et ne touche pas les autres clés .env."""
+    managers = _managers(tmp_path, 4)
+    monkeypatch.setattr(shared_state, "vpn_managers", managers, raising=False)
+    (tmp_path / "wireguard.env").write_text("PRIVATE_KEY=x\n", encoding="utf-8")
+    for m in managers:
+        m._stack_effective = "openvpn"
+    compose = tmp_path / "docker-compose.yml"
+    _seed_env(
+        tmp_path,
+        VPN_TYPE="openvpn",
+        VPN_TYPE_STATION1="openvpn",
+        VPN_TYPE_STATION2="openvpn",
+        VPN_TYPE_STATION3="openvpn",
+        VPN_TYPE_STATION4="openvpn",
+    )
+    monkeypatch.setenv("VPN_DOCKER_COMPOSE_FILE", str(compose))
+
+    assert await managers[1]._apply_stack("wireguard", stations=[2]) is True
+
+    env = _env_map(tmp_path / ".env")
+    assert env["VPN_TYPE_STATION2"] == "wireguard"
+    for s in (1, 3, 4):
+        assert env[f"VPN_TYPE_STATION{s}"] == "openvpn", "s2 flip must not touch s%d" % s
+    args, _timeout, _env = managers[1].cmds[-1]
+    services = [a for a in args if a.startswith("vpn-gluetun")]
+    assert services == ["vpn-gluetun-2"], "one compose service only"
+    assert managers[1]._stack_effective == "wireguard"
+    for idx in (0, 2, 3):
+        assert managers[idx]._stack_effective == "openvpn", "siblings untouched"
+
+
+def test_manual_per_station_stack_persists(tmp_path, monkeypatch):
+    """Un choix manuel (stack_manual) survit au reload même sous config auto."""
+    (tmp_path / "wireguard.env").write_text("PRIVATE_KEY=x\n", encoding="utf-8")
+    monkeypatch.setattr(FakeVPNManager, "_wg_key_present", lambda self: True)
+    m = FakeVPNManager(_cfg(tmp_path), station=1, tmp_path=tmp_path)
+    m._stack = "wireguard"
+    m._stack_manual = True
+    m._stack_effective = "wireguard"
+    m.save_state()
+
+    m2 = FakeVPNManager(_cfg(tmp_path), station=1, tmp_path=tmp_path)
+    assert m2._stack == "wireguard"
+    assert m2._stack_manual is True
+    assert m2._stack_effective == "wireguard"
+
+
+def test_legacy_state_without_stack_manual_is_ignored(tmp_path, monkeypatch):
+    """Un ancien état sans drapeau ne doit pas verrouiller la station."""
+    (tmp_path / "wireguard.env").write_text("PRIVATE_KEY=x\n", encoding="utf-8")
+    monkeypatch.setattr(FakeVPNManager, "_wg_key_present", lambda self: True)
+    m = FakeVPNManager(_cfg(tmp_path), station=1, tmp_path=tmp_path)
+    m._stack = "wireguard"
+    m._stack_manual = True
+    m.save_state()
+    state_path = m._get_state_path()
+    data = json.loads(open(state_path, encoding="utf-8").read())
+    data.pop("stack_manual", None)
+    with open(state_path, "w", encoding="utf-8") as f:
+        json.dump(data, f)
+
+    m2 = FakeVPNManager(_cfg(tmp_path), station=1, tmp_path=tmp_path)
+    assert m2._stack == "auto"
+    assert m2._stack_manual is False
+
+
+@pytest.mark.asyncio
+async def test_set_stack_per_station_force_bypasses_noop(tmp_path, monkeypatch):
+    """force=True répare une divergence état/conteneur même si la cible
+    semble déjà effective ; sans force, le no-op ne recrée rien."""
+    managers = _managers(tmp_path, 3)
+    monkeypatch.setattr(shared_state, "vpn_managers", managers, raising=False)
+    (tmp_path / "wireguard.env").write_text("PRIVATE_KEY=x\n", encoding="utf-8")
+    for m in managers:
+        m._stack_effective = "wireguard"
+        m._stack = "auto"
+    compose = tmp_path / "docker-compose.yml"
+    _seed_env(
+        tmp_path,
+        VPN_TYPE_STATION1="wireguard",
+        VPN_TYPE_STATION2="wireguard",
+        VPN_TYPE_STATION3="wireguard",
+    )
+    monkeypatch.setenv("VPN_DOCKER_COMPOSE_FILE", str(compose))
+
+    res = await managers[2].set_stack("wireguard", stations=[3])
+    assert res["ok"] is True
+    assert managers[2].cmds == [], "no-op: no compose recreate"
+
+    res = await managers[2].set_stack("wireguard", stations=[3], force=True)
+    assert res["ok"] is True
+    assert managers[2]._stack == "wireguard"
+    args, _timeout, _env = managers[2].cmds[-1]
+    services = [a for a in args if a.startswith("vpn-gluetun")]
+    assert services == ["vpn-gluetun-3"], "force recreates the target station only"

@@ -882,6 +882,10 @@ def _pc_pool(*stations):
     pool = FreeIPPool(stations[0], stations[1] if len(stations) > 1 else None)
     if len(stations) > 2:
         pool.set_stations(list(stations))
+    # Ces tests couvrent PC-10 (bad-mark, garde N-2), pas la sélection
+    # qualité : neutraliser le sélecteur évite toute pollution du registre
+    # global / exploration aléatoire entre tests.
+    pool.selector = None
     pool._bad_ttl = 60.0
     pool._rotation_wait_timeout = 5.0
     return pool

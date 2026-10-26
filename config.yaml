@@ -1,4 +1,4 @@
-server:
+﻿server:
   host: 0.0.0.0
   port: 4000
   debug: false
@@ -268,11 +268,37 @@ client_auth:
 supervisor:
   enabled: true
   warmup_excluded_requests: 1
+stations:
+  health:
+    effective_stack_filter: true
+    flap_hysteresis_s: 45
+    flap_min_observations: 2
+    churn_scan_max_min: 10
+    log_scan_tail: 2000
+    secondary_path_hold_s: 60
+    degraded_hold_s: 30
+  reconciler:
+    enabled: true
+  quality:
+    enabled: true
+    probe_interval_s: 30
+    probe_timeout_s: 5
+    min_samples: 5
+    exploration_pct: 5
+    latency_weight: 0.4
+    success_weight: 0.2
+    quota_weight: 0.15
+    server_weight: 0.15
+    stability_weight: 0.1
+    latency_floor_ms: 1000
+    latency_ceiling_ms: 20000
+    rotate_floor: 0.35
+    consecutive_low: 3
 ip_rotation:
   auto_flip_cooldown_min: 15
   auto_hetero_boot: false
   auto_max_free_attempts: true
-  auto_mixed_stacks: true
+  auto_mixed_stacks: false
   auto_ov_fail_threshold: 3
   auto_ov_return_min: 60
   auto_wg_egress_ticks: 20
@@ -293,7 +319,6 @@ ip_rotation:
   circuit_breaker_threshold: 3
   compose_service_2: vpn-gluetun-2
   connect_retry_interval: 20
-  control_api_key: vg3q59eBCjG9hWVXm2Wpc8n9smumwhtugihf7oDafv0
   control_enabled: true
   control_pin_catchup: 25
   control_pin_timeout: 20
@@ -313,7 +338,6 @@ ip_rotation:
   egress_failure_tick_interval: 15.0
   enabled: true
   enforce_vpn_only: true
-  free_exception_fallback: station-first
   free_model_candidates:
     deepseek-v4.1-flash:
     - deepseek-v4.1-flash-free
@@ -365,7 +389,7 @@ ip_rotation:
     - mimo-v2.6-flash-free
     - deepseek-v4.1-flash-free
     - glm-5.3-flash-free
-  free_model_spread: true
+  free_model_spread: false
   free_parallel:
     enabled: true
     routing: round-robin
@@ -407,7 +431,6 @@ ip_rotation:
     soft_cooldown_sec: 600
     stream_metric: ttfb
     window: 20
-  max_free_attempts: 6
   on_429_action: both
   ov_auth_backoff_max_s: 600
   ov_auth_backoff_s: 90
@@ -453,7 +476,7 @@ ip_rotation:
   station_connect_retry_interval_s: 300
   station_count: 6
   station_max_rotations_per_hour: 10
-  status_cache_seconds: 2.0
+  status_cache_seconds: 5.0
   strict_free: true
   switch_delay: 1
   trial_dead_cooldown_s: 21600
@@ -485,6 +508,8 @@ ip_rotation:
   wg_canary_poll_interval_s: 4
   wg_churn_fallback: true
   wg_return_enabled: true
+  max_free_attempts: 6
+  free_exception_fallback: station-first
 geo:
   enabled: true
   version: 1

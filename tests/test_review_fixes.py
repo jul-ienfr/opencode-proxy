@@ -115,6 +115,7 @@ async def test_on_request_degenerate_threshold_uses_throttled_kick(tmp_path, mon
     pas de _launch_rotation non throttlé par requête (churn, hot-loop
     docker). La requête passe quand même à l'autre station, zéro attente."""
     pool, ms = _pool(tmp_path, 2)
+    pool.selector = None  # test du chemin legacy (le score a ses propres tests)
     for m in ms:
         m._status = vm.VPNState.CONNECTED
     ms[0]._quota_per_ip = 11  # seuil station 1 = max(1, 1)
@@ -136,6 +137,7 @@ async def test_on_request_healthy_threshold_uses_launch(tmp_path, monkeypatch):
     """Seuil sain (> 1) : l'embrayage dual-clutch classique — launch de la
     rotation du départ et service immédiat de l'autre station."""
     pool, ms = _pool(tmp_path, 2)
+    pool.selector = None  # test du chemin legacy (le score a ses propres tests)
     for m in ms:
         m._status = vm.VPNState.CONNECTED
     ms[0]._quota_per_ip = 15  # seuil station 1 = 5

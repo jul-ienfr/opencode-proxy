@@ -288,6 +288,18 @@ def render_vpn_section(vpn: dict | None) -> list[str]:
     )
     _gauge(
         lines,
+        "vpn_station_flap_1h",
+        "transitions de statut stables sur 1 h par station",
+        vpn.get("flaps", []),
+    )
+    _gauge(
+        lines,
+        "vpn_station_secondary_path_issue",
+        "1 si des marqueurs de voie secondaire sont vus sans condamner le tunnel",
+        vpn.get("secondary", []),
+    )
+    _gauge(
+        lines,
         "watchdog_restart_total",
         "restarts watchdog par station (fenêtre 1 h)",
         [(lbl, val) for lbl, val in vpn.get("restarts", []) if val],

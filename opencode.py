@@ -2044,13 +2044,42 @@ async def _apply_station_count(new_n: int) -> None:
                 pool = getattr(shared_state, "free_ip_pool", None)
                 if pool is not None:
                     pool.set_stations(managers)
-                # [fix 19/08] Sync the .env substitution keys FIRST: without
-                # VPN_TYPE_STATION{1..N}, a new station boots on the compose
-                # default ${VPN_TYPE_STATIONn:-openvpn} — OpenVPN under a
-                # running WireGuard fleet (the 2-new-stations-on-openvpn bug).
-                # No-op path writes the env, docker stays untouched.
+                # [roadmap] Flotte hétérogène : chaque nouvelle station reçoit
+                # SON slot (WG/OV-TCP/OV-UDP), puis le .env est synchronisé
+                # par station. L'ancien _apply_stack(stations=None) réécrivait
+                # toutes les clés avec la stack de la station 1.
+                _mixed_up = (
+                    str(IP_ROTATION.get("vpn_stack", "auto") or "auto").lower() == "auto"
+                    and bool(IP_ROTATION.get("auto_mixed_stacks", True))
+                )
+                # Ne pas convertir une flotte homogène en flotte mixte lors
+                # d'un simple upscale. Le mode mixte s'applique si la flotte
+                # existante est DÉJÀ hétérogène (boot mixed) ; sinon la
+                # nouvelle station rejoint la stack commune.
+                _existing_stacks = {
+                    str(getattr(_m, "_stack_effective", "") or "")
+                    for _m in managers[:old_n]
+                    if getattr(_m, "_stack_effective", None)
+                }
+                _mixed_existing = len(_existing_stacks) > 1
+                if _mixed_up and _mixed_existing:
+                    for _m in managers[old_n:]:
+                        try:
+                            _m.apply_mixed_slot()
+                        except Exception:
+                            pass
+                elif _existing_stacks:
+                    _common_stack = next(iter(_existing_stacks))
+                    for _m in managers[old_n:]:
+                        try:
+                            _m._stack = _common_stack
+                            _m._stack_effective = _common_stack
+                        except Exception:
+                            pass
                 if managers:
-                    await managers[0]._apply_stack(managers[0]._stack_effective)
+                    managers[0]._sync_stack_env(
+                        {m._station: m._stack_effective for m in managers}
+                    )
                 # [fix] Parallélise les compose up — 1→10 en // (gain 5-40s, 1 clic suffit)
                 # Use connect() for new stations so the container is actually up (start() only schedules background task)
                 if managers[old_n:]:
@@ -2126,9 +2155,21 @@ async def _apply_station_count(new_n: int) -> None:
                     return_exceptions=True,
                 )
                 await asyncio.gather(*(m.stop() for m in _retired))
-                await asyncio.gather(*(m.stop_container() for m in reversed(_retired)))
-            # P2 garde-fou: orphan rm -f fallback (compose stop peut laisser Exited)
-            for m in _retired:
+                _stop_order = list(reversed(_retired))
+                _stop_results = await asyncio.gather(
+                    *(m.stop_container() for m in _stop_order), return_exceptions=True
+                )
+                # [roadmap] Le rm -f de secours ne s'exécute QUE si
+                # stop_container a échoué : il était auparavant relancé pour
+                # chaque station saine (2 rm -f + faux log « orphan »).
+                _orphans = [
+                    m
+                    for m, _res in zip(_stop_order, _stop_results)
+                    if isinstance(_res, Exception)
+                ]
+            else:
+                _orphans = []
+            for m in _orphans:
                 try:
                     import subprocess as _sp
 
@@ -2148,6 +2189,13 @@ async def _apply_station_count(new_n: int) -> None:
             managers = managers[:new_n]
             shared_state.vpn_managers = managers
             _sync_station_supervisors(shared_state)
+            try:
+                if managers:
+                    managers[0]._sync_stack_env(
+                        {m._station: m._stack_effective for m in managers}
+                    )
+            except Exception:
+                pass
             pool = getattr(shared_state, "free_ip_pool", None)
             if pool is not None:
                 pool.set_stations(managers)
@@ -2156,7 +2204,7 @@ async def _apply_station_count(new_n: int) -> None:
             watcher.set_managers({m._docker_container: m for m in managers})
         # Retro-compat aliases converge too
         shared_state.vpn_manager = managers[0]
-        shared_state.vpn_manager_2 = managers[1] if new_n >= 2 else None
+        shared_state.vpn_manager_2 = managers[1] if len(managers) >= 2 else None
         # [plan v2 auto-sync] derive AFTER set_stations+watcher, persist LAST
         # Strict: shared_state → pool.set_stations → watcher → derive → persist
         try:
@@ -2455,6 +2503,15 @@ async def lifespan(app):
     # vpn_manager / vpn_manager_2 stay retro-compat aliases for the legacy
     # single/dual reads; all runtime readers use shared_state.vpn_managers.
     shared_state.vpn_managers = _managers
+    # [roadmap] Une seule source pour .env : chaque station reçoit sa stack
+    # effective, jamais la stack globale de la station 1.
+    try:
+        if _managers:
+            _managers[0]._sync_stack_env(
+                {m._station: m._stack_effective for m in _managers}
+            )
+    except Exception as _e_env_sync:
+        _debug(f"  [lifespan] stack env sync failed (fail-soft): {_e_env_sync}")
     _sync_station_supervisors(shared_state)
     # [plan v10 §3.6 Lot 3] moteur latence-adaptive : singleton partagé,
     # config canonique `ip_rotation.latency_rotation` (hot-reload via pool).
@@ -2473,6 +2530,11 @@ async def lifespan(app):
     # (FreeIPPool._post_rotation_flush_cb, fail-soft — sans import cycle).
     try:
         shared_state.free_ip_pool._post_rotation_flush_cb = _flush_curl_pools_for_proxy  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    try:
+        if bool(yaml_get("latency_rotation", "prewarm_after_rotate", True)):
+            shared_state.free_ip_pool._post_rotation_prewarm_cb = _free_prewarm_once  # type: ignore[attr-defined]
     except Exception:
         pass
     # [plan] E: boot-time fan-out of the ip_rotation timings (connect retry,
@@ -2942,6 +3004,29 @@ async def lifespan(app):
         app.state._free_prewarm_task = asyncio.create_task(_free_prewarm_loop())
         _debug("  [lifespan] free prewarm loop started")
 
+    # [roadmap] Persistance périodique des compteurs quota : sans ce flush,
+    # un crash entre deux rotations perdait jusqu'à des dizaines de requêtes
+    # (constaté : fichier 1–3 vs live 47–49).
+    async def _pool_persist_loop() -> None:
+        while True:
+            try:
+                await asyncio.sleep(30.0)
+                _p = getattr(shared_state, "free_ip_pool", None)
+                if _p is not None:
+                    await asyncio.to_thread(_p.save_pool_state, False)
+            except asyncio.CancelledError:
+                raise
+            except Exception as _e:
+                _debug(f"  [free-ip] pool persist loop error: {_e}")
+                await asyncio.sleep(10.0)
+
+    app.state._pool_persist_task = asyncio.create_task(_pool_persist_loop())
+    try:
+        app.state._station_probe_task = asyncio.create_task(_station_quality_probe_loop())
+        _debug("  [lifespan] station quality probe loop started (hot-toggle)")
+    except Exception:
+        pass
+
     # Ultra-fast DB writer (single writer, batch 32)
     # [fix hot-restart] ``asyncio.Queue`` se lie à la boucle courante au
     # premier get/put. Un hot-restart (ServerManager.restart) réutilise les
@@ -2972,6 +3057,13 @@ async def lifespan(app):
     app.state._boot_ready = False
 
     _debug("  [lifespan] app shutting down")
+    # [roadmap] flush final du quota avant de tuer les tâches.
+    try:
+        _p_shutdown = getattr(shared_state, "free_ip_pool", None)
+        if _p_shutdown is not None:
+            await asyncio.to_thread(_p_shutdown.save_pool_state, True)
+    except Exception:
+        pass
     # Drain DB queue via writer before flush
     if _db_writer_task:
         _db_writer_task.cancel()
@@ -2986,7 +3078,7 @@ async def lifespan(app):
 
     # Cancel background tasks (Phase 1 : warmup + loops — borné, pas de
     # "task destroyed pending").
-    for _bg_attr in ("_balance_task", "_docker_task", "_watcher_task", "_db_migrate_task"):
+    for _bg_attr in ("_balance_task", "_docker_task", "_watcher_task", "_db_migrate_task", "_pool_persist_task", "_station_probe_task"):
         _bg = getattr(app.state, _bg_attr, None)
         if _bg is not None:
             _bg.cancel()
@@ -3485,6 +3577,8 @@ def _build_metrics_text() -> str:
         degraded_rows = []
         cooldown_rows = []
         restart_rows = []
+        flap_rows = []
+        secondary_rows = []
         for m in mgrs:
             status = str(getattr(m, "status", "") or "")
             st_rows.append((f'station="{m._station}"', 1 if status == "connected" else 0))
@@ -3509,6 +3603,15 @@ def _build_metrics_text() -> str:
             except Exception:
                 _n = 0
             restart_rows.append((f'station="{m._station}"', _n))
+            try:
+                _db = getattr(m, "_status_debouncer", None)
+                _flaps = _db.flap_count(time.monotonic()) if _db is not None else 0
+            except Exception:
+                _flaps = 0
+            flap_rows.append((f'station="{m._station}"', _flaps))
+            secondary_rows.append(
+                (f'station="{m._station}"', 1 if bool(getattr(m, "_secondary_path_issue", False)) else 0)
+            )
 
         ewma_rows, p95_rows, slow_rows = [], [], []
         if eng is not None:
@@ -3531,6 +3634,8 @@ def _build_metrics_text() -> str:
                 "degraded": degraded_rows,
                 "cooldowns": cooldown_rows,
                 "restarts": restart_rows,
+                "flaps": flap_rows,
+                "secondary": secondary_rows,
                 "ewma": ewma_rows,
                 "p95": p95_rows,
                 "slow": slow_rows,
@@ -3547,6 +3652,8 @@ def _build_metrics_text() -> str:
                 "degraded": degraded_rows,
                 "cooldowns": cooldown_rows,
                 "restarts": restart_rows,
+                "flaps": flap_rows,
+                "secondary": secondary_rows,
                 "has_engine": False,
             }
     except Exception as e:
@@ -7786,6 +7893,7 @@ class _CurlCffiStreamResponse:
             sid = int(getattr(station, "_station", 0) or 0)
             ip = str((_current_free_attempt.get() or {}).get("ip") or "")
             eng.record_request(sid, ip, ttfb_ms, model, self.status_code)
+            _record_station_quality(station, ip, ttfb_ms, self.status_code)
         except Exception:
             pass
 
@@ -9367,6 +9475,53 @@ def _is_watchdog_cancelled(station) -> bool:
     return getattr(pool, "is_watchdog_cancelled", lambda *a, **k: False)(station, asyncio.current_task())
 
 
+def _record_station_quality(
+    station,
+    ip: str,
+    duration_ms: float,
+    status: int | None,
+    *,
+    latency: bool = True,
+) -> None:
+    """Alimente le score qualité + le breaker superviseur (fail-soft total).
+
+    ``latency=False`` pour un non-streaming : ``duration_ms`` est la durée
+    totale du completion, pas un TTFB. Elle doit compter pour le succès/429
+    mais pas pour la latence de la station (sinon une réponse longue passe
+    pour un tunnel lent)."""
+    try:
+        sid = int(getattr(station, "_station", -1))
+    except Exception:
+        return
+    if sid < 1:
+        return
+    try:
+        from free.quality import get_quality_registry
+
+        get_quality_registry().observe(
+            sid, str(ip or "unknown"), float(duration_ms), status, latency=latency
+        )
+    except Exception:
+        pass
+    try:
+        import shared_state as _ss_q
+
+        for sup in getattr(_ss_q, "station_supervisors", None) or []:
+            if int(getattr(sup, "station", -1)) != sid:
+                continue
+            try:
+                code = int(status) if status is not None else 0
+                if 200 <= code < 500:
+                    sup.record_success()
+                elif code >= 500:
+                    sup.record_failure()
+            except Exception:
+                pass
+            break
+    except Exception:
+        pass
+
+
 def _free_stations_exhausted(free_model: str) -> bool:
     """True when NO station can serve a fresh free attempt for this model.
 
@@ -10728,6 +10883,13 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
         if isinstance(station, object) and getattr(station, "_station", None) is not None:
             _sid = int(station._station)
             _dec = _eng.record_request(_sid, str(free_ip or "direct"), float(elapsed_ms), free_model, resp.status_code)
+            _record_station_quality(
+                station,
+                str(free_ip or "direct"),
+                float(elapsed_ms),
+                resp.status_code,
+                latency=False,
+            )
             # [v10 §12.1.3] alerte proactive SSE : une lente avant le seuil
             if _dec.get("action") == "warn":
                 try:
@@ -16838,6 +17000,32 @@ async def _free_prewarm_once() -> bool:
             pass
 
 
+async def _station_quality_probe_loop() -> None:
+    """Sonde active légère (score qualité), désactivée par défaut."""
+    if __import__("os").getenv("PYTEST_CURRENT_TEST"):
+        return
+    try:
+        from free.quality import QualityConfig
+        from free.probe import probe_once
+
+        while True:
+            cfg = QualityConfig.from_yaml()
+            if not cfg.enabled:
+                await asyncio.sleep(30.0)
+                continue
+            managers = list(getattr(__import__("shared_state"), "vpn_managers", None) or [])
+            if managers:
+                try:
+                    await probe_once(managers, cfg=cfg, concurrency=2)
+                except Exception as exc:
+                    _debug(f"  [free-quality] probe error {type(exc).__name__}: {exc}")
+            await asyncio.sleep(max(5.0, float(cfg.probe_interval_s)))
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        _debug(f"  [free-quality] probe loop disabled: {exc}")
+
+
 async def _free_prewarm_loop() -> None:
     """Préchauffage périodique (par défaut toutes les 5 min)."""
     try:
@@ -20522,6 +20710,7 @@ async def _systemone_free_via_pool(endpoint: str, body: dict, headers: dict, for
                 setattr(_ss_lat_dead, "latency_engine", _eng)  # noqa: B010 — attribut dynamique, mypy l'interdit en accès direct
             if isinstance(station, object) and getattr(station, "_station", None) is not None:
                 _eng.record_request(int(getattr(station, "_station")), str(free_ip or "direct"), float(_dead_ms), free_model, 502)  # noqa: B009
+                _record_station_quality(station, str(free_ip or "direct"), float(_dead_ms), 502)
         except Exception as _e_lat:
             _debug(f"  [systemone-free] latency engine skip: {_e_lat}")
         raise UpstreamError(

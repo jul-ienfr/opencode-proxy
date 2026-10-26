@@ -1244,6 +1244,11 @@ class VPNManager:
         self._stack = str(cfg.get("vpn_stack", "auto")).strip().lower()
         if self._stack not in ("auto", "wireguard", "openvpn"):
             self._stack = "auto"
+        # Choix manuel PAR STATION (endpoint /api/vpn/station/{sid}/stack) :
+        # persisté et restauré même quand config.yaml dit auto. Distinct des
+        # anciens états sans drapeau (ignorés pour ne pas ressusciter un
+        # réglage obsolète).
+        self._stack_manual = False
         # Key file lives NEXT TO the compose file (vpn_configs/ is gitignored
         # as a whole; the key never enters config.yaml, .env or state).
         self._wg_key_file = os.path.join(
@@ -1531,6 +1536,9 @@ class VPNManager:
         # Poll cadence for _wait_healthy / control-server "running" wait
         # (config ships 0.5 s — the legacy hard-coded sleep(2) is gone).
         self._wait_healthy_poll = max(0.1, float(cfg.get("wait_healthy_poll", 2.0)))
+        # [roadmap] Le scan auth/TLS par pin était fait toutes les 0,5 s
+        # (~90 docker exec par rotation). 2 s suffit pour détecter un rejet.
+        self._pin_scan_interval = max(1.0, float(cfg.get("pin_scan_interval_s", 2.0)))
         self._update_apply_window = cfg.get("update_apply_window", "03:00-05:00")
         self._update_idle_minutes = cfg.get("update_apply_idle_minutes", 15)
         self._update_max_defer_hours = cfg.get("update_apply_max_defer_hours", 24)
@@ -1553,9 +1561,35 @@ class VPNManager:
 
         # Runtime state
         self._status = VPNState.DISCONNECTED
+        self._health_policy: Any = None
+        self._status_debouncer: Any = None
+        try:
+            from ops.health import HealthPolicy, StatusDebouncer
+
+            self._health_policy = HealthPolicy.from_yaml()
+            self._status_debouncer = StatusDebouncer(
+                policy=self._health_policy, stable=str(self._status)
+            )
+        except Exception:
+            self._health_policy = None
+            self._status_debouncer = None
+        # [roadmap] dernier egress réellement OK : frontière de guérison pour
+        # ne pas réinterpréter indéfiniment de vieux marqueurs de logs.
+        self._last_effective_ok_at: float = 0.0
+        # [roadmap] problème vu sur une voie NON effective (ex. resets OV sur
+        # une station WireGuard) : informatif, ne doit pas changer le statut.
+        self._secondary_path_issue = False
+        self._secondary_path_issue_until: float = 0.0
+        self._degraded_hold_until: float = 0.0
+        # [roadmap] état désiré explicite : disconnect ne doit pas être annulé
+        # par le prochain refresh/watchdog.
+        self._desired_connected = True
         self._error: str | None = None
         self._current_ip: str | None = None
         self._current_server: dict | None = None
+        # [roadmap] dernière charge connue du serveur choisi (pour le score).
+        self._server_load: float | None = None
+        self._quality_low_count: int = 0
         self._connected_at: float | None = None
         self._auth_failed = False
         self._server_issue = False  # TLS negotiation failure (stale/crashed server)
@@ -1570,10 +1604,14 @@ class VPNManager:
         self._restart_churn_recovered_at: float | None = None
         # [v10 §14.1.10] cadence du scan churn (recovery → re-scan immédiat)
         self._churn_next_due = 0.0
+        self._last_churn_log_at: float = 0.0
         self._total_switches = 0
         self._ip_history: list[dict] = []
         self._lock = asyncio.Lock()
         self._ops_lock = asyncio.Lock()
+        # [roadmap] Un seul refresh docker par station à la fois : dashboard et
+        # watchdog pouvaient lancer deux scans complets en parallèle.
+        self._refresh_lock = asyncio.Lock()
         self._docker_ops_in_flight = 0
         self._last_egress_probe_at: float | None = None
         self._event_wake = False
@@ -1784,6 +1822,9 @@ class VPNManager:
         )
         self._pin_resets_1h: list[float] = []
         self._pin_auths_1h: list[float] = []
+        # Timestamp du dernier reset distinct compté (dédup des relectures
+        # du même log à chaque refresh — sinon le compteur 1 h gonfle).
+        self._last_pin_reset_event_at: float | None = None
         self._pin_widened_until = 0.0
         self._pin_widen_original: str | None = None
         self._pin_widen_extended = False
@@ -1946,6 +1987,8 @@ class VPNManager:
         ``connect_next``), so a later retry is not gated.
         """
         self.load_state()
+        if self._enabled:
+            self._desired_connected = True
         if self._watchdog_event is None:
             self._watchdog_event = asyncio.Event()
         await self.refresh_status()
@@ -1969,7 +2012,9 @@ class VPNManager:
             self._startup_connect_task = asyncio.create_task(self._startup_connect())
         if not self._watchdog_task or self._watchdog_task.done():
             self._watchdog_task = asyncio.create_task(self._watchdog_loop())
-        if self._update_enabled and not self._update_task:
+        # [roadmap] Un seul updater de flotte (station 1). Les autres managers
+        # ne doivent plus pull/compare le même tag partagé en parallèle.
+        if self._update_enabled and not self._update_task and int(getattr(self, "_station", 1)) == 1:
             self._update_task = asyncio.create_task(self._updater_loop())
 
     async def _startup_connect(self) -> None:
@@ -2007,6 +2052,7 @@ class VPNManager:
         if self._update_task:
             self._update_task.cancel()
             self._update_task = None
+        self._desired_connected = False
         self._enabled = False
         self.save_state()
 
@@ -2043,6 +2089,7 @@ class VPNManager:
 
     async def connect(self) -> None:
         """Bring the tunnel up: compose up + wait healthy + record IP."""
+        self._desired_connected = True
         async with self._lock:
             # [graceful-aurora LOT C] auth_cooling : le pilotage se tait
             # (la renégo spontanée suit son cours en tâche de fond).
@@ -2478,25 +2525,73 @@ class VPNManager:
 
     async def disconnect(self) -> None:
         """Disconnect: update state + persist. Never stops the container —
-        the tunnel is owned by docker-compose and stays up."""
+        the tunnel is owned by docker-compose and stays up.
+
+        [roadmap] ``_desired_connected=False`` empêche le watchdog/refresh de
+        repasser immédiatement en CONNECTED : un disconnect explicite est un
+        état voulu, pas une simple photo mémoire.
+        """
+        self._desired_connected = False
         async with self._lock:
             if self._status == VPNState.DISCONNECTED:
+                self.save_state()
                 return
-            self._set_status(VPNState.DISCONNECTING)
+            self._set_status(VPNState.DISCONNECTING, force=True)
             self._current_ip = None
             self._connected_at = None
-            self._set_status(VPNState.DISCONNECTED)
+            self._set_status(VPNState.DISCONNECTED, force=True)
             self.save_state()
             logger.info("[vpn] disconnected (tunnel left running, compose-managed)")
 
     # ── State transitions + events ─────────────────────────────
 
-    def _set_status(self, status) -> None:
+    def _set_status(self, status, *, force: bool = False) -> None:
         """Transition to ``status``, publishing a vpn_event on change
         (dashboard SSE). No-op when the status is unchanged — only REAL
-        transitions surface, so kill/restart bursts coalesce naturally."""
+        transitions surface, so kill/restart bursts coalesce naturally.
+
+        [roadmap] Anti-flap : ``StatusDebouncer`` retarde les transitions
+        error/degraded quand le tunnel est déjà routable. ``force=True`` est
+        réservé aux opérations explicites (stop/disconnect) et aux tests qui
+        veulent l'état immédiat.
+        """
+        raw = str(status)
+        debouncer = getattr(self, "_status_debouncer", None)
+        if debouncer is not None:
+            # Les tests/anciens appelants peuvent avoir écrit _status
+            # directement : resynchronise la base du debouncer.
+            if debouncer.stable != str(self._status):
+                debouncer.stable = str(self._status)
+            if force:
+                debouncer.force(raw, time.monotonic())
+                status = raw
+            else:
+                target = debouncer.observe(raw, time.monotonic())
+                if target == str(self._status):
+                    return
+                status = target
+        if (
+            not force
+            and str(status) == VPNState.CONNECTED
+            and str(self._status) == VPNState.DEGRADED
+            and time.monotonic() < float(getattr(self, "_degraded_hold_until", 0.0))
+        ):
+            # [roadmap] Hold-down anti-flap : un degraded récent ne doit pas
+            # repasser connected sur un simple clear de stale error.
+            return
         if status == self._status:
             return
+        if str(status) == VPNState.DEGRADED:
+            try:
+                _hold = float(
+                    getattr(
+                        getattr(self, "_health_policy", None), "degraded_hold_s", 0.0
+                    )
+                    or 0.0
+                )
+            except Exception:
+                _hold = 0.0
+            self._degraded_hold_until = time.monotonic() + _hold if _hold > 0 else 0.0
         self._status = status
         # [stabilité 25/08] chrono de connexion : démarre à la PREMIÈRE
         # transition vers connected après une déconnexion (monotone — pas de
@@ -2590,6 +2685,8 @@ class VPNManager:
         Pass force=True from paths that must see reality immediately
         (startup reconcile, image update apply/rollback).
         """
+        if not getattr(self, "_desired_connected", True):
+            return self.get_status()
         if (
             not force
             and self._last_status_refresh_at is not None
@@ -2650,7 +2747,17 @@ class VPNManager:
         # ``text`` retombent sur les appels séparés historiques.
         _started_at = info.get("started_at", "")
         if _started_at and self._auth_check_supports_text():
-            _res = await asyncio.to_thread(self._docker_run, ["logs", "--since", _started_at, self._docker_container], 30
+            _res = await asyncio.to_thread(
+                self._docker_run,
+                [
+                    "logs",
+                    "--since",
+                    _started_at,
+                    "--tail",
+                    str(max(100, int(getattr(self._health_policy, "log_scan_tail", 2000)))),
+                    self._docker_container,
+                ],
+                30,
             )
             _shared_log = _res.stdout if _res.returncode == 0 else None
             auth_failed = await self._check_auth_failed(_started_at, text=_shared_log)
@@ -2665,14 +2772,20 @@ class VPNManager:
                 await self._check_server_issue(_started_at) if not auth_failed else False
             )
         if auth_failed or server_issue:
-            # [graceful-aurora LOT E] compteurs pin (1/refresh, anti-triple).
-            try:
-                self._feed_pin_windows(bool(auth_failed), bool(server_issue))
-            except Exception:
-                pass
+            # [graceful-aurora LOT E] compteurs pin. Les AUTH restent
+            # comptées par refresh ; les RESETS sont dédupliqués par
+            # timestamp d'événement plus bas — sinon le même log ancien,
+            # relu à chaque refresh, gonflait `_pin_resets_1h` (6-7/h
+            # artificiels) et déclenchait un widen + degraded perpétuel.
+            if auth_failed:
+                try:
+                    self._feed_pin_windows(True, False)
+                except Exception:
+                    pass
             # [graceful-aurora LOT A] reset récent (≤ grace) + pas de AUTH :
             # micro-coupure ~10 s → degraded routable + recheck différé,
             # jamais error collé. Rollback : server_issue_recheck=false.
+            _stale_issue = False
             if server_issue and not auth_failed:
                 try:
                     _grace = float(getattr(self, "_server_issue_grace_s", 25.0))
@@ -2684,6 +2797,30 @@ class VPNManager:
                 except Exception:
                     _shared_txt = None
                 _age, _healed = self._server_issue_grace_info(_shared_txt)
+                # Dédup : un reset n'est compté qu'une fois, quand son
+                # timestamp d'événement avance réellement.
+                _event_at = None
+                try:
+                    _event_at = self._now_fn() - float(_age)
+                    _last_event = getattr(self, "_last_pin_reset_event_at", None)
+                    _new_reset = (
+                        _last_event is None
+                        or _event_at > float(_last_event) + 2.0
+                    )
+                except Exception:
+                    _new_reset = True
+                if _new_reset and not _healed:
+                    if _event_at is not None:
+                        self._last_pin_reset_event_at = _event_at
+                    try:
+                        self._feed_pin_windows(False, True)
+                    except Exception:
+                        pass
+                # Un reset VIEUX de plus que la grâce et jamais ré-émis ne
+                # doit pas condamner la station à un degraded perpétuel :
+                # il sera arbitré par l'egress réel plus bas (OK → guéri,
+                # KO → error inchangé).
+                _stale_issue = bool(_age is not None and _age > _grace)
                 try:
                     self._last_reset_age_s = _age
                 except Exception:
@@ -2712,9 +2849,9 @@ class VPNManager:
                         if VPNState.can_transition(self._status, VPNState.DEGRADED):
                             self._set_status(VPNState.DEGRADED)
                         else:
-                            self._status = VPNState.DEGRADED
+                            self._set_status(VPNState.DEGRADED)
                     except Exception:
-                        self._status = VPNState.DEGRADED
+                        self._set_status(VPNState.DEGRADED)
                     logger.warning(
                         "[vpn] server_issue récent (âge %.0fs ≤ %.0fs) — degraded, recheck programmé",
                         _age,
@@ -2744,8 +2881,58 @@ class VPNManager:
                         _egress_ok = await self._socks_egress_ok()
                     except Exception:
                         _egress_ok = False
-                    if _egress_ok:
+                    try:
+                        _n_recent_resets = sum(
+                            1
+                            for _t in (getattr(self, "_pin_resets_1h", None) or [])
+                            if self._now_fn() - _t < 3600.0
+                        )
+                    except Exception:
+                        _n_recent_resets = 0
+                    _pin_loop_active = _n_recent_resets >= int(
+                        getattr(self, "_pin_widen_resets", 6)
+                    )
+                    if _egress_ok and _stale_issue and not _pin_loop_active:
+                        # Reset ancien (> grâce), jamais ré-émis, egress réel
+                        # OK et aucun compteur de boucle : la station est
+                        # guérie. Sans cette branche, le même log restait
+                        # dans la fenêtre et ré-armait le marqueur secondaire
+                        # à chaque refresh → degraded perpétuel (s6, 31 min
+                        # observées).
                         self._egress_state = "tunnel_up_full"
+                        self._last_effective_ok_at = time.monotonic()
+                        self._server_issue = False
+                        self._server_issue_pending = False
+                        self._secondary_path_issue = False
+                        # On conserve `_secondary_path_issue_until` : le hold
+                        # anti-flap restant doit expirer avant le retour à
+                        # CONNECTED (fait par le watchdog au tick suivant).
+                        self._error = None
+                        self._degraded_reason = None
+                        try:
+                            self._egress_socks_pending = False
+                        except Exception:
+                            pass
+                        # Le même log ancien est relu à chaque refresh : INFO
+                        # seulement au premier événement, debug ensuite (sinon
+                        # ~12 lignes/min par station guérie).
+                        _heal_log = logger.info if _new_reset else logger.debug
+                        _heal_log(
+                            "[vpn] s%s reset ancien (>%.0fs) + egress OK — guéri",
+                            getattr(self, "_station", "?"),
+                            _grace,
+                        )
+                        # Si le hold anti-flap est encore actif, on laisse le
+                        # watchdog repasser CONNECTED à son expiration. Sinon
+                        # on rétablit immédiatement (preuve egress réelle).
+                        if not self._secondary_path_active():
+                            self._set_status(VPNState.CONNECTED, force=True)
+                        # Return obligatoire : le code egress-KO ci-dessous
+                        # collerait sinon ERROR sur un tunnel qui sert.
+                        return self.get_status()
+                    elif _egress_ok:
+                        self._egress_state = "tunnel_up_full"
+                        self._last_effective_ok_at = time.monotonic()
                         try:
                             self._degraded_reason = "pin-loop"
                             self._egress_socks_pending = False
@@ -2759,14 +2946,36 @@ class VPNManager:
                             if VPNState.can_transition(self._status, VPNState.DEGRADED):
                                 self._set_status(VPNState.DEGRADED)
                             else:
-                                self._status = VPNState.DEGRADED
+                                self._set_status(VPNState.DEGRADED)
                         except Exception:
-                            self._status = VPNState.DEGRADED
+                            self._set_status(VPNState.DEGRADED)
+                        # [roadmap] Marqueur explicite : tant que la voie
+                        # secondaire produit des resets, le watchdog ne doit
+                        # pas effacer l'état degraded à chaque tick.
+                        self._secondary_path_issue = bool(
+                            str(getattr(self, "_stack_effective", "") or "") != "openvpn"
+                        )
+                        try:
+                            _hold = float(
+                                getattr(
+                                    getattr(self, "_health_policy", None),
+                                    "secondary_path_hold_s",
+                                    0.0,
+                                )
+                                or 0.0
+                            )
+                        except Exception:
+                            _hold = 0.0
+                        self._secondary_path_issue_until = (
+                            time.monotonic() + _hold if _hold > 0 else 0.0
+                        )
                         self._current_server = {
                             "name": self._docker_container,
                             "country": self._current_country or self._server_countries,
                         }
-                        logger.warning(
+                        # [roadmap] bruit : ces resets sont une information de
+                        # voie secondaire, pas une erreur du tunnel effectif.
+                        logger.debug(
                             "[vpn] s%s resets voie secondaire mais egress OK "
                             "(stack %s) — degraded pin-loop, IP gardée",
                             getattr(self, "_station", "?"),
@@ -2785,6 +2994,8 @@ class VPNManager:
                     # [P0-3] egress KO : qualifier le message selon le stack
                     # effectif — un reset OV sur une station WG n'est pas un
                     # "serveur injoignable" du tunnel effectif.
+                    self._secondary_path_issue = False
+                    self._secondary_path_issue_until = 0.0
                     try:
                         _stack_eff = str(getattr(self, "_stack_effective", "") or "")
                     except Exception:
@@ -2810,6 +3021,8 @@ class VPNManager:
                 return self.get_status()
         self._auth_failed = False
         self._server_issue = False
+        if not self._secondary_path_active():
+            self._secondary_path_issue = False
         try:
             # Guérison : un refresh réussi efface le pending (le statut
             # error historique restait collé ; ici on ne touche PAS à
@@ -2949,9 +3162,9 @@ class VPNManager:
                                     if VPNState.can_transition(self._status, VPNState.DEGRADED):
                                         self._set_status(VPNState.DEGRADED)
                                     else:
-                                        self._status = VPNState.DEGRADED
+                                        self._set_status(VPNState.DEGRADED)
                                 except Exception:
-                                    self._status = VPNState.DEGRADED
+                                    self._set_status(VPNState.DEGRADED)
                                 self._current_server = {
                                     "name": self._docker_container,
                                     "country": self._current_country or self._server_countries,
@@ -2972,9 +3185,9 @@ class VPNManager:
                             if VPNState.can_transition(self._status, VPNState.DEGRADED):
                                 self._set_status(VPNState.DEGRADED)
                             else:
-                                self._status = VPNState.DEGRADED
+                                self._set_status(VPNState.DEGRADED)
                         except Exception:
-                            self._status = VPNState.DEGRADED
+                            self._set_status(VPNState.DEGRADED)
                         self._current_server = {
                             "name": self._docker_container,
                             "country": self._current_country or self._server_countries,
@@ -3034,9 +3247,9 @@ class VPNManager:
                     if VPNState.can_transition(self._status, VPNState.DEGRADED):
                         self._set_status(VPNState.DEGRADED)
                     else:
-                        self._status = VPNState.DEGRADED
+                        self._set_status(VPNState.DEGRADED)
                 except Exception:
-                    self._status = VPNState.DEGRADED
+                    self._set_status(VPNState.DEGRADED)
                 self._current_server = {
                     "name": self._docker_container,
                     "country": self._current_country or self._server_countries,
@@ -3616,6 +3829,17 @@ class VPNManager:
             except Exception as e:
                 logger.debug("[vpn] pin restore failed: %s", e)
 
+    def _note_effective_ok(self) -> None:
+        """Horodate une preuve d'egress réelle (frontière de guérison)."""
+        self._last_effective_ok_at = time.monotonic()
+
+    def _secondary_path_active(self) -> bool:
+        """Marqueur voie secondaire encore dans sa fenêtre de maintien."""
+        try:
+            return time.monotonic() < float(self._secondary_path_issue_until)
+        except Exception:
+            return False
+
     async def _probe_tunnel_light(self) -> bool:
         """[plan 18/08 §E1/am.10 / Axe 1.3] Light egress probe — SOCKS5
         handshake + CONNECT to the ip_check endpoint (same chain as
@@ -3651,6 +3875,7 @@ class VPNManager:
                 if verdict == "ok":
                     if i > 0:
                         self._ip_check_idx = (base + i) % len(urls)
+                    VPNManager._note_effective_ok(self)
                     return True
                 if verdict == "timeout":
                     timeout_seen = True
@@ -3667,6 +3892,7 @@ class VPNManager:
                         urls[(base + 0) % len(urls)], per_attempt=remaining
                     )
                     if verdict == "ok":
+                        VPNManager._note_effective_ok(self)
                         return True
             # SOCKS5 probe failed but gluetun may still be healthy — the
             # loopback SOCKS5 server can refuse connections while the tunnel
@@ -3674,8 +3900,10 @@ class VPNManager:
             # HTTP proxy (works on Docker Desktop Windows where SOCKS5 loopback
             # is refused) as a last egress liveness signal.
             if await self._control_status() and await self._control_public_ip():
+                VPNManager._note_effective_ok(self)
                 return True
             if await self._http_proxy_egress_ok():
+                VPNManager._note_effective_ok(self)
                 return True
             return False
         except Exception:
@@ -4393,6 +4621,19 @@ class VPNManager:
             "proxy_mode": self._proxy_mode,
             "mode": self._mode,
             "status": self._status,
+            "desired_connected": bool(getattr(self, "_desired_connected", True)),
+            "secondary_path_issue": bool(getattr(self, "_secondary_path_issue", False)),
+            "server_load": getattr(self, "_server_load", None),
+            "flap_count_1h": (
+                self._status_debouncer.flap_count(time.monotonic())
+                if getattr(self, "_status_debouncer", None) is not None
+                else 0
+            ),
+            "last_effective_ok_age_s": (
+                round(max(0.0, time.monotonic() - self._last_effective_ok_at), 1)
+                if getattr(self, "_last_effective_ok_at", 0.0)
+                else None
+            ),
             "ip": self._current_ip,
             "server": self._current_server.get("name") if self._current_server else None,
             "country": self._current_server.get("country") if self._current_server else None,
@@ -5126,7 +5367,7 @@ class VPNManager:
                     return True
                 return await self._check_server_issue(since_pin)
             result = await asyncio.to_thread(self._docker_run,
-                ["logs", "--since", since_pin, self._docker_container],
+                ["logs", "--since", since_pin, "--tail", "1000", self._docker_container],
                 30,
             )
             if result.returncode != 0:
@@ -5136,13 +5377,29 @@ class VPNManager:
                 return True
             return await self._check_server_issue(since_pin, text=text)
 
-        # Record hostnames only after confirmed success (plan v5 b)
+        # [roadmap] Ne PAS marquer toute la short-list top-5 comme « récente » :
+        # c'était le bug qui faisait descendre le pinner dans la liste de
+        # charge à chaque rotation. On retient le premier choix (le moins
+        # chargé) ; le hostname réel reste visible via _current_hostname dans
+        # les chemins de recovery, sans payer un docker logs supplémentaire à
+        # chaque pin réussi.
         async def _on_success():
-            for h in hostnames:
-                try:
-                    self._record_used_server(h)
-                except Exception:
-                    pass
+            if not hostnames:
+                return
+            chosen = hostnames[0]
+            try:
+                self._record_used_server(chosen)
+            except Exception:
+                pass
+            try:
+                _cache = getattr(self, "_nord_loads_cache", None)
+                _entries = (_cache[1].get(country) if _cache else None) or []
+                for _h, _load in _entries:
+                    if _h == chosen:
+                        self._server_load = float(_load)
+                        break
+            except Exception:
+                pass
 
         while time.monotonic() < deadline:
             # Scan BEFORE leaning on the status reply: gluetun can report
@@ -5184,14 +5441,14 @@ class VPNManager:
                                 return True  # a real IP through the tunnel
                         except Exception:
                             pass  # probe slipped — keep waiting
-                        await asyncio.sleep(self._wait_healthy_poll)
+                        await asyncio.sleep(self._pin_scan_interval)
                 await _on_success()
                 return True
             if status is False:
                 if not stopped_warned:
                     logger.warning("[vpn] control pin %s: VPN reports stopped", country)
                     stopped_warned = True
-            await asyncio.sleep(self._wait_healthy_poll)
+            await asyncio.sleep(self._pin_scan_interval)
         logger.warning("[vpn] control pin %s: not running after %.0fs", country, timeout)
         return False
 
@@ -5485,7 +5742,7 @@ class VPNManager:
         "Connecting to [...]". The SIGUSR1 retry loop re-logs the same
         remote every ~11 s, so the last occurrence is the host in play.
         None when the container is absent or no hostname is logged."""
-        result = await asyncio.to_thread(self._docker_run, ["logs", "--since", since, self._docker_container], 30
+        result = await asyncio.to_thread(self._docker_run, ["logs", "--since", since, "--tail", "2000", self._docker_container], 30
         )
         if result.returncode != 0:
             return None
@@ -5498,7 +5755,7 @@ class VPNManager:
         [incident st1 12/10] quand le chunk ne contient aucun hostname
         (boucle SIGUSR1 précoce sur un serveur qui refuse), l'IP reste
         lisible et permet au fast-pin de sauter un serveur blacklisté."""
-        result = await asyncio.to_thread(self._docker_run, ["logs", "--since", since, self._docker_container], 30
+        result = await asyncio.to_thread(self._docker_run, ["logs", "--since", since, "--tail", "2000", self._docker_container], 30
         )
         if result.returncode != 0:
             return None
@@ -6363,7 +6620,14 @@ class VPNManager:
         )
         return True
 
-    async def _apply_stack(self, mode: str, reason: str = "manual", auto: bool = False, stations: list | None = None) -> bool:
+    async def _apply_stack(
+        self,
+        mode: str,
+        reason: str = "manual",
+        auto: bool = False,
+        stations: list | None = None,
+        force: bool = False,
+    ) -> bool:
         """Switch the effective stack (compose substitution) and record the flip.
         mode ∈ {"wireguard", "openvpn"} (auto is resolved by the caller).
         Refuses wireguard when vpn_configs/wireguard.env is missing.
@@ -6461,7 +6725,7 @@ class VPNManager:
         # re-synced even when the stack is already effective — the compose
         # default ${VPN_TYPE_STATIONn:-openvpn} would otherwise boot a newly
         # upscaled station on OpenVPN under a running WireGuard fleet.
-        if mode == self._stack_effective:
+        if mode == self._stack_effective and not force:
             logger.info("[vpn] stack already %s — no-op (env synced)", mode)
             return True
         # Recreate ALL active stations in the target stack in one compose
@@ -6533,6 +6797,68 @@ class VPNManager:
         if mode == "openvpn" and not hasattr(self, "_ovpn_protocol_effective"):
             self._ovpn_protocol_effective = getattr(self, "_ovpn_protocol", "udp")
         return True
+
+    def _sync_stack_env(self, station_stacks: dict[int, str]) -> bool:
+        """[roadmap] Écrit ``VPN_TYPE_STATIONn`` par station (delta only).
+
+        L'ancien ``_apply_stack(stations=None)`` réécrivait TOUTES les clés
+        avec une seule stack. En flotte hétérogène, un upscale pouvait donc
+        convertir silencieusement les stations OV en WG. Cette méthode est
+        l'unique primitive de synchronisation du .env pour une flotte mixte.
+        """
+        wanted: dict[str, str] = {}
+        for sid, stack in (station_stacks or {}).items():
+            try:
+                sid_i = int(sid)
+            except (TypeError, ValueError):
+                continue
+            mode = str(stack or "").strip().lower()
+            if sid_i >= 1 and mode in ("wireguard", "openvpn"):
+                wanted[f"VPN_TYPE_STATION{sid_i}"] = mode
+        if not wanted:
+            return True
+        compose_path = self._compose_file_path()
+        env_path = os.path.join(os.path.dirname(compose_path), ".env")
+        _ENV_RW_LOCK.acquire()
+        try:
+            try:
+                with open(env_path, encoding="utf-8") as f:
+                    lines = f.read().splitlines()
+            except FileNotFoundError:
+                lines = []
+            out: list[str] = []
+            seen: set[str] = set()
+            for ln in lines:
+                stripped = ln.strip()
+                if not stripped or stripped.startswith("#") or "=" not in stripped:
+                    out.append(ln)
+                    continue
+                key = stripped.split("=", 1)[0].strip()
+                if key in wanted:
+                    seen.add(key)
+                    wanted_val = wanted[key]
+                    if stripped != f"{key}={wanted_val}":
+                        out.append(f"{key}={wanted_val}")
+                    else:
+                        out.append(ln)
+                elif key.startswith("VPN_TYPE_STATION"):
+                    # [roadmap] prune les clés des stations retirées : un
+                    # downscale ne doit pas laisser une stack fantôme.
+                    continue
+                else:
+                    out.append(ln)
+            for key in sorted(wanted.keys() - seen):
+                out.append(f"{key}={wanted[key]}")
+            tmp = env_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write("\n".join(out) + "\n")
+            os.replace(tmp, env_path)
+            return True
+        except OSError as e:
+            logger.error("[vpn] _sync_stack_env: cannot write %s: %s", env_path, e)
+            return False
+        finally:
+            _ENV_RW_LOCK.release()
 
     async def _apply_ovpn_protocol(self, protocol: str, reason: str = "protocol fallback") -> bool:
         """Flip OpenVPN protocol/port without changing VPN_TYPE.
@@ -6781,12 +7107,21 @@ class VPNManager:
         self._cascade_started_at = None
         self._cascade_pending_proto = None
 
-    async def set_stack(self, mode: str, propagate: bool = True) -> dict:
+    async def set_stack(
+        self,
+        mode: str,
+        propagate: bool = True,
+        stations: list[int] | None = None,
+        force: bool = False,
+    ) -> dict:
         """API entry point (dashboard). mode ∈ {"auto", "wireguard", "openvpn"}.
         For a manual selection: apply it immediately (reason="manual").
         propagate=False → state-only sync (used for the other managers:
         _apply_stack already recreated ALL active containers — a second
         compose call would be a duplicate).
+        ``stations`` restreint le flip à ces stations (pas de flip global).
+        ``force`` recrée même si l'état mémoire prétend déjà la cible
+        (réparation d'une divergence état/conteneur).
         Returns a result dict for the dashboard."""
         if mode not in ("auto", "wireguard", "openvpn"):
             return {"ok": False, "error": f"unknown stack {mode!r}"}
@@ -6794,22 +7129,30 @@ class VPNManager:
             # Back to auto: no forced flip — the watchdog policy resumes at
             # the next tick from the current effective stack (WG stays WG).
             self._stack = "auto"
+            self._stack_manual = False
             self._auth_failed_window = []
             self._last_auto_flip_at = None
+            self.save_state()
             logger.info("[vpn] stack: auto (effective %s, watchdog resumes)", self._stack_effective)
             return {"ok": True, "effective": self._stack_effective}
         if propagate:
-            ok = await self._apply_stack(mode, reason="manual")
+            ok = await self._apply_stack(
+                mode, reason="manual", stations=stations, force=force
+            )
             if ok:
                 self._stack = mode  # manual selection wins over auto policy
+                self._stack_manual = True
+                self.save_state()
         else:
             # State-only: station-2 manager mirrors the flip already applied
             # by station 1's _apply_stack (both containers were recreated).
             self._stack = mode
             self._stack_effective = mode
             self._stack_since = self._now_fn()
+            self._stack_manual = True
             self._auth_failed_window = []
             self._last_auto_flip_at = None
+            self.save_state()
             ok = True
         return {"ok": ok, "effective": self._stack_effective}
 
@@ -6900,7 +7243,7 @@ class VPNManager:
         """
         if text is None:
             since = started_at if started_at else "10m"
-            result = await asyncio.to_thread(self._docker_run, ["logs", "--since", since, self._docker_container], 30
+            result = await asyncio.to_thread(self._docker_run, ["logs", "--since", since, "--tail", "2000", self._docker_container], 30
             )
             if result.returncode != 0:
                 return False
@@ -7266,7 +7609,7 @@ class VPNManager:
         ``_last_reset_age_s`` / ``_last_init_ok_at``."""
         if text is None:
             since = started_at if started_at else "10m"
-            result = await asyncio.to_thread(self._docker_run, ["logs", "--since", since, self._docker_container], 30
+            result = await asyncio.to_thread(self._docker_run, ["logs", "--since", since, "--tail", "2000", self._docker_container], 30
             )
             if result.returncode != 0:
                 return False
@@ -7363,26 +7706,34 @@ class VPNManager:
         Self-resolving: when the restarts stop, a scan sees no fresh markers
         and the flag clears — no separate 'resolved' event needed.
         """
+        # [roadmap] Fenêtre bornée. L'ancienne version utilisait tout le temps
+        # écoulé depuis la dernière recovery : 4 restarts sur 14 h étaient
+        # comptés comme un churn toutes les 60 s. On garde le bénéfice de la
+        # frontière de recovery, mais jamais au-delà de churn_scan_max_min.
+        _hp = getattr(self, "_health_policy", None)
+        _max_min = max(2, int(getattr(_hp, "churn_scan_max_min", 10)))
         if self._restart_churn_recovered_at is not None:
-            # Recovery boundary: only markers written after the last
-            # successful recovery count (docker logs span recoveries).
             elapsed = max(1.0, time.time() - self._restart_churn_recovered_at)
-            since = f"{int(elapsed)}s"
+            window_s = min(float(window_min * 60), float(_max_min * 60), elapsed)
+            since = f"{max(1, int(window_s))}s"
         else:
             since = f"{max(2, int(window_min))}m"
-        result = await asyncio.to_thread(self._docker_run, ["logs", "--since", since, self._docker_container], 30
+        result = await asyncio.to_thread(self._docker_run, ["logs", "--since", since, "--tail", str(max(100, int(getattr(self._health_policy, "log_scan_tail", 2000)))), self._docker_container], 30
         )
         if result.returncode != 0:
             return False
         count = result.stdout.count("restarting VPN because it failed to pass the healthcheck")
         if count >= self._restart_churn_threshold:
-            logger.warning(
-                "[vpn] healthcheck-restart churn: %d restarts in the last "
-                "%s (threshold %d) — arming egress watchdog",
-                count,
-                since,
-                self._restart_churn_threshold,
-            )
+            _now = time.monotonic()
+            if _now - float(getattr(self, "_last_churn_log_at", 0.0)) >= 300.0:
+                self._last_churn_log_at = _now
+                logger.warning(
+                    "[vpn] healthcheck-restart churn: %d restarts in the last "
+                    "%s (threshold %d) — arming egress watchdog",
+                    count,
+                    since,
+                    self._restart_churn_threshold,
+                )
             return True
         return False
 
@@ -7831,12 +8182,15 @@ class VPNManager:
 
     async def _updater_loop(self) -> None:
         """Background loop: detect available updates and apply them at the
-        most opportune moment. First iteration runs immediately, then every
-        update_check_interval seconds.
-        [P3 perf] stagger par index de station : les N managers ne tirent
-        plus ``docker compose pull`` quasi simultanément toutes les 6 h
-        (N× bande passante + N× charge docker daemon pour LA MÊME image) —
-        le premier check est décalé de ``_station × 90 s``."""
+        most opportune moment, pour TOUTE la flotte depuis la station 1.
+
+        [roadmap] L'ancien loop par manager comparait le digest du tag partagé
+        avant/après son propre pull : après la première station, les autres ne
+        voyaient plus de delta et restaient sur l'ancienne image. Un seul
+        updater coordonné élimine cette course.
+        """
+        if int(getattr(self, "_station", 1)) != 1:
+            return
         try:
             _idx = max(0, int(getattr(self, "_station", 1)) - 1)
             await asyncio.sleep(_idx * 90)
@@ -7845,9 +8199,12 @@ class VPNManager:
         while True:
             try:
                 if await self.check_update() and self._update_opportune():
-                    # Re-check opportune-ness inside the lock ([21]): traffic
-                    # may have started between the outer check and the apply.
-                    await self.apply_update(check_opportune=True)
+                    managers = list(getattr(shared_state, "vpn_managers", None) or [])
+                    from ops.updater import apply_fleet_update
+
+                    res = await apply_fleet_update(managers, self)
+                    if not res.get("ok"):
+                        logger.warning("[vpn-update] fleet update failed: %s", res.get("errors"))
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -7984,6 +8341,8 @@ class VPNManager:
         """One watchdog pass: scan for AUTH_FAILED/TLS failure; restart when found."""
         if not self._enabled or self._proxy_mode != "vpn":
             return  # VPN feature off or tunnel bypassed — nothing to watch
+        if not getattr(self, "_desired_connected", True):
+            return  # disconnect explicite : le watchdog ne doit pas reconnecter
         # [PC-15 — audit routabilité] heartbeat toutes les 5 min même sans
         # événement (F10) : la supervision externe lit la présence des lignes.
         try:
@@ -8102,6 +8461,7 @@ class VPNManager:
                 if self._egress_failures:
                     logger.info("[vpn-watchdog] egress OK — counter reset")
                 self._egress_failures = 0
+                VPNManager._note_effective_ok(self)
             # [plan 18/08 §3c] auto-mode policy — decided inside the lock on
             # fresh counters, applied AFTER it (_apply_stack takes the lock;
             # asyncio.Lock is not reentrant, calling it here would deadlock).
@@ -8207,15 +8567,38 @@ class VPNManager:
                 except Exception:
                     _up_ctrl = None
                 _transient = self._egress_failures < (self._auto_wg_egress_ticks * 2)
+                if _up_egress and (
+                    getattr(self, "_secondary_path_issue", False)
+                    or VPNManager._secondary_path_active(self)
+                ):
+                    # Marqueur voie secondaire encore présent : on reste
+                    # degraded, on ne flappe pas vers connected et on ne
+                    # déclenche pas de recovery sur un tunnel qui sert.
+                    logger.debug(
+                        "[vpn-watchdog] s%s secondary path issue — keeping degraded",
+                        self._station,
+                    )
+                    return
                 if _up_egress and not churn_driven:
-                    logger.warning(
+                    _clear_log = (
+                        logger.warning
+                        if (self._auth_failed or self._egress_failures > 0)
+                        else logger.debug
+                    )
+                    _clear_log(
                         "[vpn-watchdog] s%s egress OK — clearing stale error (auth_failed=%s), set CONNECTED",
                         self._station, self._auth_failed,
                     )
                     self._auth_failed = False
                     self._server_issue = False
                     self._restart_churn = False
+                    # [roadmap] Le clear doit aussi avancer la frontière du
+                    # scan churn : sinon les mêmes marqueurs anciens sont
+                    # redétectés au prochain refresh.
+                    self._restart_churn_recovered_at = time.time()
+                    self._churn_next_due = 0.0
                     self._egress_failures = 0
+                    VPNManager._note_effective_ok(self)
                     try:
                         self._auth_grace_until = 0.0
                     except Exception:
@@ -8732,6 +9115,7 @@ class VPNManager:
                 "failed_hosts": self._failed_hosts,
                 # [plan 18/08 §3b] stack selection + flip journal (cap 20)
                 "stack": self._stack,
+                "stack_manual": bool(getattr(self, "_stack_manual", False)),
                 # [audit 2026-09-09] stack_effective persistée : au boot, la
                 # mémoire (vpn_state{n}.json) doit primer sur le .env quand le
                 # conteneur RÉEL la confirme. Le .env est un cache d'intention
@@ -8873,14 +9257,36 @@ class VPNManager:
             # effective stays as computed at init (WG if keys present else
             # OV) — the watchdog reconciles auto at the next tick.
             restored_stack = state.get("stack")
+            _restored_manual = bool(state.get("stack_manual", False))
             if restored_stack in ("auto", "wireguard", "openvpn"):
-                # FIX auto always functional: stale manual (wireguard/openvpn) in state must not
-                # override config's auto — otherwise a one-off manual flip locks the station forever
-                # and _auto_flip_decision (guard `if _stack != auto: return None`) never runs.
+                # Choix manuel per-station explicite (stack_manual=True) :
+                # on le restaure même sous config auto. Les anciens états
+                # sans drapeau restent ignorés (un flip one-off ne doit pas
+                # verrouiller la station pour toujours).
                 if self._stack == "auto" and restored_stack != "auto":
-                    logger.info("[vpn] state stack %s ignored — config is auto (effective %s)", restored_stack, self._stack_effective)
+                    if _restored_manual and (
+                        restored_stack != "wireguard" or self._wg_key_present()
+                    ):
+                        self._stack = restored_stack
+                        self._stack_manual = True
+                        self._stack_effective = restored_stack
+                        logger.info(
+                            "[vpn] state stack %s restored (manual, effective %s)",
+                            restored_stack,
+                            self._stack_effective,
+                        )
+                    else:
+                        logger.info(
+                            "[vpn] state stack %s ignored — config is auto "
+                            "(legacy or key missing, effective %s)",
+                            restored_stack,
+                            self._stack_effective,
+                        )
                 else:
                     self._stack = restored_stack
+                    self._stack_manual = (
+                        _restored_manual if restored_stack != "auto" else False
+                    )
             # [audit 2026-09-09] stack_effective restaurée (flotte mixte auto) :
             # _stack reste "auto" (le mode choisi) mais l'EFFECTIVE — posée par
             # apply_mixed_slot() au boot précédent ou par un flip auto — est
@@ -9170,3 +9576,23 @@ async def reconcile_orphan_containers(managers: list, runner=None) -> list[str]:
             "[vpn] boot reconcile removed %d container(s): %s", len(removed), ", ".join(removed)
         )
     return removed
+
+
+# [roadmap] Sérialisation non bloquante du refresh de statut. Un appelant qui
+# trouve le verrou occupé reçoit l'état courant au lieu d'empiler un second scan
+# Docker complet (dashboard + watchdog + SSE).
+def _serialized_refresh(fn):
+    async def _wrapper(self, *args, **kwargs):
+        lock = getattr(self, "_refresh_lock", None)
+        if lock is None:
+            return await fn(self, *args, **kwargs)
+        if lock.locked():
+            return self.get_status()
+        async with lock:
+            return await fn(self, *args, **kwargs)
+
+    _wrapper.__name__ = getattr(fn, "__name__", "refresh_status")
+    return _wrapper
+
+
+VPNManager.refresh_status = _serialized_refresh(VPNManager.refresh_status)  # type: ignore[method-assign]

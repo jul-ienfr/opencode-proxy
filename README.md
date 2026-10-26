@@ -138,6 +138,26 @@ The compose service runs with `FIREWALL=on`: the container only talks through th
 - VPN down → free requests fail over to a direct connection (fail-open, by design) until the tunnel recovers
 - gluetun image updates are checked periodically and applied automatically during the configured idle window
 
+### Station quality & fleet operations (2026-10-26)
+
+- **Quality selector** (`stations.quality.enabled`): each eligible station gets
+  a measured score (latency, success rate, quota headroom, server load,
+  stability). A light active probe (static GET via SOCKS5, no inference/quota)
+  feeds cold-start scores; the pool's legacy round-robin remains the rollback.
+- **Health guard**: secondary-path OpenVPN resets on a WireGuard station no
+  longer flap the status; a flap hysteresis and a bounded churn window are
+  configurable under `stations.health`.
+- **Fleet API**: `GET /api/vpn/fleet`, `POST /api/vpn/fleet/{connect,disconnect}`,
+  `POST /api/vpn/station/{sid}/{start,stop,restart,connect,disconnect}`,
+  `POST /api/vpn/jobs/fleet/{connect,disconnect,heal}` (202 + job id).
+- **Per-station action buttons** are exposed in the VPN tab.
+- **Secret migration**: `scripts/migrate_control_key.py` moves
+  `control_api_key` from `config.yaml` to `.env`; restart the proxy after it.
+- **Persistence**: quota counters are flushed every 30 s and on shutdown, not
+  only on rotations.
+- Detailed audit/roadmap: `docs/AUDIT_STATIONS_IP_2026-10-26.md`,
+  `docs/ROADMAP_STATIONS_IP_2026-10-26.md`, `docs/SUIVI_ROADMAP_STATIONS_2026-10-26.md`.
+
 ## Web Dashboard
 
 The dashboard features 4 tabs with real-time updates via SSE (Server-Sent Events).

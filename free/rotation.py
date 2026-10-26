@@ -637,6 +637,12 @@ class LatencyRotationEngine:
         key = (int(sid), str(ip))
         tr = self._trackers.get(key)
         if tr is None:
+            try:
+                from ops.supervisor import warmup_excluded_requests
+
+                _warm = warmup_excluded_requests()
+            except Exception:
+                _warm = 1
             tr = IpLatencyTracker(
                 station=int(sid),
                 ip=str(ip),
@@ -644,6 +650,7 @@ class LatencyRotationEngine:
                 alpha=self.cfg.ewma_alpha,
                 min_requests_before_eval=self.cfg.min_requests_before_eval,
                 consecutive_slow_limit=self.cfg.consecutive_slow,
+                warmup_requests=_warm,
             )
             self._trackers[key] = tr
             # [audit-2026-10-24 Phase2] vraie LRU OrderedDict (était
@@ -654,7 +661,7 @@ class LatencyRotationEngine:
                 pass
             while len(self._trackers) > 300:  # borne mémoire globale
                 try:
-                    self._trackers.popitem(last=False)  # type: ignore[attr-defined]
+                    self._trackers.popitem(last=False)  # type: ignore[attr-defined, call-arg]
                 except Exception:
                     try:
                         self._trackers.pop(next(iter(self._trackers)))
@@ -689,10 +696,6 @@ class LatencyRotationEngine:
             pass
 
     def _engine_state_file(self) -> str:
-        try:
-            base = self._cfg_file() if hasattr(self, "_cfg_file") else None
-        except Exception:
-            base = None
         try:
             import os as _os
             return _os.path.join(ROOT, "logs", "latency_engine.json")
@@ -773,6 +776,31 @@ class LatencyRotationEngine:
             _lat_logger.info("[latency] engine state restauré (%d cooldowns)", len(self._cooldowns))
         except Exception as e:
             _lat_logger.debug("[latency] load engine state KO: %s", e)
+
+    def prune_stations(self, max_sid: int) -> int:
+        """[roadmap] Purge l'état des stations retirées (downscale).
+
+        Sans cette purge, un sid réutilisé plus tard héritait de trackers et
+        cooldowns d'une ancienne topologie.
+        """
+        try:
+            max_sid = int(max_sid)
+        except (TypeError, ValueError):
+            return 0
+        removed = 0
+        for key in [k for k in self._trackers if int(k[0]) > max_sid]:
+            self._trackers.pop(key, None)
+            removed += 1
+        for key in [k for k in self._cooldowns if int(k[0]) > max_sid]:
+            self._cooldowns.pop(key, None)
+        self._soft_history = {k for k in self._soft_history if int(k[0]) <= max_sid}
+        for sid in [s for s in self._soft_log if int(s) > max_sid]:
+            self._soft_log.pop(sid, None)
+        self._global_log = deque(
+            (e for e in self._global_log if int(e[1]) <= max_sid),
+            maxlen=self._global_log.maxlen,
+        )
+        return removed
 
     def cooldown_kind(self, sid: int, ip: str) -> str | None:
         entry = self._cooldowns.get((int(sid), str(ip)))
