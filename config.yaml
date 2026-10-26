@@ -1,4 +1,4 @@
-﻿server:
+server:
   host: 0.0.0.0
   port: 4000
   debug: false
@@ -441,7 +441,7 @@ ip_rotation:
   ov_auth_station_threshold: 5
   ov_auth_window_s: 1800
   ovpn_endpoint_port: ''
-  ovpn_protocol: tcp
+  ovpn_protocol: udp
   paid_hedge_after_ms: 0
   per_ip_identity: true
   pin_widen_auths: 8
