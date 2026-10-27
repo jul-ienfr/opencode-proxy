@@ -139,6 +139,15 @@ async def fetch_available_models() -> list[str]:
     try:
         import config.settings as _cs
 
+        try:
+            from config import live_models as _lm
+
+            if _lm.is_ready():
+                # Le relevé vivant est la source de vérité : ne pas réinjecter
+                # un id retiré via le cache upstream.
+                return sorted(_cs.MODELS)
+        except Exception:
+            pass
         lr = _cs._FREE_DISCOVERY_STATE.get("last_refresh") if hasattr(_cs, "_FREE_DISCOVERY_STATE") else None
         if lr and getattr(_cs, "FREE_MODELS", None):
             try:
@@ -180,8 +189,15 @@ def get_available_models() -> dict:
     """Return merged model info: local config + auto-discovered upstream."""
     from config.settings import MODELS
 
+    try:
+        from config import live_models as _lm
+    except Exception:
+        _lm = None
+
     result = {}
-    for mid, cfg in MODELS.items():
+    for mid, cfg in list(MODELS.items()):
+        if _lm is not None and _lm.is_removed(mid):
+            continue
         result[mid] = {
             "protocol": cfg["protocol"],
             "endpoint": cfg["endpoint"].rsplit("/", 1)[-1],
@@ -189,6 +205,12 @@ def get_available_models() -> dict:
         }
     if _models_cache:
         for mid in _models_cache:
+            if _lm is not None and _lm.is_removed(mid):
+                continue
+            if _lm is not None and _lm.is_ready() and mid not in MODELS:
+                # Le relevé vivant est prêt : ne pas afficher un id que le
+                # proxy ne sert pas (familles non converties, gemini…).
+                continue
             if mid not in result:
                 if mid.startswith("minimax-m"):
                     ep = API_BASE_ANTHROPIC

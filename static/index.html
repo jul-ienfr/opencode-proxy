@@ -443,8 +443,8 @@
                             <div style="display:flex;align-items:center;gap:8px;margin-top:10px">
                                 <span class="label" style="font-size:12px">Mode épuisement</span>
                                 <select id="vpn-exhaust-mode" class="config-input" style="width:200px;font-size:12px" onchange="vpnSaveExhaustMode()">
-                                    <option value="fallback">Fallback payant (défaut)</option>
-                                    <option value="strict">Strict free — refuser 429/503</option>
+                                    <option value="fallback">Fallback payant — free puis payant</option>
+                                    <option value="strict">Strict free — jamais de payant</option>
                                 </select>
                             </div>
                             <div style="display:flex;align-items:center;gap:8px;margin-top:10px">
@@ -463,10 +463,11 @@
                             </div>
                             <div style="display:flex;align-items:center;gap:8px;margin-top:10px">
                                 <span class="label" style="font-size:12px">Essais gratuits / requête</span>
-                                <select id="vpn-free-attempts" class="config-input" style="width:70px;font-size:12px" onchange="vpnSaveMaxFreeAttempts()">
-                                    <option value="1">1</option>
-                                    <option value="2">2</option>
-                                    <option value="3">3</option>
+                                <select id="vpn-free-attempts" class="config-input" style="width:150px;font-size:12px" onchange="vpnSaveMaxFreeAttempts()">
+                                    <option value="auto">Auto (selon stations)</option>
+                                    <option value="1">1 essai</option>
+                                    <option value="2">2 essais</option>
+                                    <option value="3">3 essais</option>
                                 </select>
                             </div>
                             <div style="display:flex;align-items:center;gap:8px;margin-top:10px">
@@ -501,6 +502,23 @@
                                     <input type="number" id="cfg-free-parallel-delay" class="config-input" style="width:90px;font-size:12px" min="0" max="2000" step="100" onchange="saveFreeParallelDelay()">
                                 </div>
                                 <div style="font-size:11px;color:var(--text-muted);margin-top:4px" data-i18n="config.free_parallel_hint">Round-Robin = least-loaded (répartit sur N), Failover = sticky 1 puis bascule sur panne/quota. Hedge = course de 2 stations, la première qui répond gagne (streaming inclus) ; coûte une requête de plus par course. Désactivable via l'interrupteur ci-dessus.</div>
+                            </div>
+                            <!-- [retry] Retry transparent côté proxy : le client ne voit pas les 429/502 récupérables -->
+                            <div id="retry-until-success-section" style="margin-top:14px;padding:10px;background:var(--bg);border-radius:6px;border:1px solid var(--border)">
+                                <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+                                    <label class="toggle-switch" style="margin:0">
+                                        <input type="checkbox" id="cfg-retry-until-success" onchange="toggleRetryUntilSuccess(this.checked)">
+                                        <span class="toggle-slider"></span>
+                                    </label>
+                                    <span style="font-size:13px;font-weight:500" data-i18n="config.retry_until_success">Retry jusqu'au succès</span>
+                                    <span id="retry-until-success-status" style="font-size:11px;color:var(--text-muted)"></span>
+                                </div>
+                                <div id="retry-until-success-row" style="display:none;align-items:center;gap:8px;margin-top:10px;flex-wrap:wrap">
+                                    <span class="label" style="font-size:12px" data-i18n="config.retry_max_wait">Attente max (s)</span>
+                                    <input type="number" id="cfg-retry-max-wait" class="config-input" style="width:90px;font-size:12px" min="0" max="86400" step="30" onchange="saveRetryMaxWait()">
+                                    <span style="font-size:11px;color:var(--text-muted)" data-i18n="config.retry_max_wait_hint">0 = infini. Le client reçoit des keepalives SSE pendant l'attente.</span>
+                                </div>
+                                <div style="font-size:11px;color:var(--text-muted);margin-top:6px" data-i18n="config.retry_hint">Le proxy garde la requête ouverte et rejoue les erreurs récupérables (429, 5xx, flux vide) au lieu de les renvoyer au client. Combiné à « Mode épuisement » : Strict free = free-only jusqu'au succès ; Fallback payant = free puis payant. Un échec après le premier token ne peut pas être rejoué.</div>
                             </div>
                             <!-- Station rows — rendered by JS (one per active station) -->
                             <div id="vpn-station-rows" style="margin-top:10px"></div>

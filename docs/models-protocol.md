@@ -40,8 +40,33 @@ Modèles free directs : `nemotron-3-ultra-free`,
 
 > Note : les ids morts (`kimi-k2.7`, `hy3-free`, `laguna-s-2.1-free`,
 > `x-preview-f-free`, `ox-alpha-free`) ont été retirés du seed `config.yaml`
-> (2026-09-09 — pings live 503 upstream) ; si la découverte auto les
-> ré-annonce, elle les ré-ajoute (add-only) sans édition manuelle.
+> (2026-09-09 — pings live 503 upstream). La découverte auto est add-only,
+> mais `live_models` les retire du routage au relevé suivant s'ils ne sont
+> plus annoncés.
+
+## Catalogue vivant (`live_models`)
+
+Depuis le 2026-10-27, `MODELS` n'est plus figé au démarrage :
+
+- `GET /models` des deux jambes (`opencode-go`, `opencode`) est relevé toutes
+  les `live_models.interval` s ; les nouveaux ids entrent, les ids disparus
+  ou `deprecated` sur leur jambe routée sortent. Un id déprécié sur une jambe
+  mais actif sur l'autre migre vers la jambe active.
+- Le catalogue `https://models.opencode.ai/api.json` fournit les
+  `reasoning_options`. `capabilities.effort.max.supported` de `GET /v1/models`
+  n'est vrai que si le modèle liste réellement `max` ; un modèle limité à
+  `high` expose `max: {supported: false}`.
+- Le même catalogue alimente `config/effort_caps.py` et
+  `config/reasoning_options.py` : le niveau annoncé au client et le niveau
+  réellement envoyé à l'amont ne peuvent plus diverger.
+- Un client qui a utilisé un modèle retiré reçoit un `410` explicite au
+  prochain appel de ce modèle, plus un en-tête `X-OpenCode-Notice` sur ses
+  requêtes suivantes. Le dashboard reçoit `models_updated` et affiche un
+  pop-up (les événements sont conservés par `revision`).
+
+Un relevé partiel (une jambe indisponible) ne supprime jamais aucun modèle.
+`live_models.remove_deprecated: false` est le rollback : les modèles restent
+routables mais sont marqués `deprecated`.
 
 ## Inventaire contre le catalogue live (alignement client officiel H1)
 
@@ -69,9 +94,14 @@ jambe payée finissent pourtant par `-free` (`longcat-2.5-preview-free`,
 |---|---|---|
 | `mort` | absent des **deux** jambes, sans endpoint interne | purge |
 | `hors-jambe` | routé d'un côté, hébergé de l'autre | lot B1 (migration de route), pas une suppression |
-| `deprecated` | fin de vie **sur la jambe routée** | conservé : toujours servi |
+| `deprecated` | fin de vie **sur la jambe routée** | retiré du routage et de `/v1/models` (migration si l'autre jambe est active) |
 | `non-catalogue-interne` | endpoint interne hors catalogue | **conservé** — ne jamais retirer |
 | `ok` | conforme | — |
+
+> Depuis le 2026-10-27, `live_models` applique ces verdicts **au runtime** :
+> les entrées `deprecated` et `mort` sont retirées automatiquement de `MODELS`
+> (un id déprécié sur une jambe mais actif sur l'autre migre). L'inventaire
+> ci-dessous reste l'état de référence de la purge manuelle H1.
 
 État après inventaire (54 entrées) :
 

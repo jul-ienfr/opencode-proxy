@@ -203,6 +203,44 @@ upstream:
   free_models_url: ''   # override GET /models URL; empty = auto (free_base + openai_base)
 ```
 
+### Live model catalog (availability + effort)
+
+`live_models` keeps the client-facing catalog aligned with what the two
+opencode legs actually serve, without editing `config.yaml`:
+
+- **Every `live_models.interval` s** (default 300), the proxy fetches both
+  `GET /models` endpoints. New ids are added to `MODELS`; ids that disappeared
+  or are `deprecated` on their routed leg are removed. A model that is
+  `deprecated` on one leg but active on the other is migrated, not dropped.
+  A partial fetch (one leg down) never deletes anything.
+- **Effort capabilities are derived from `reasoning_options`** in
+  `models.opencode.ai/api.json` (refreshed every `catalog_interval` s, default
+  1800). `GET /v1/models` exposes the Anthropic Models API `capabilities`
+  object: `effort.max.supported` is `true` only when the model really lists
+  `max`; a model capped at `high` reports `max: {supported: false}`. The same
+  catalog data drives request clamping (`config/effort_caps.py` and
+  `config/reasoning_options.py`), so the announced and enforced levels match.
+- **Clients that used a removed model** receive an explicit `410` when they
+  retry it, and a `X-OpenCode-Model-Deprecated` / `X-OpenCode-Notice` header
+  on their next API request. Notices are stored in memory for 7 days.
+- **Dashboard pop-up**: the `models_updated` SSE event (and the `revision`
+  returned by `GET /api/live-models`) triggers a toast when models are added,
+  removed or deprecated — including changes that happened while the dashboard
+  was closed.
+
+```yaml
+live_models:
+  enabled: true
+  interval: 300          # /models polling
+  catalog_interval: 1800 # models.opencode.ai/api.json polling
+  remove_deprecated: true
+  notify_clients: true
+  ignore_ids: [test]
+```
+
+`POST /api/live-models/refresh` forces an immediate full refresh (dashboard
+token protected like the other mutation endpoints).
+
 ### Configuration
 - **Proxy Status**: Running/stopped indicator, start/stop buttons, click-to-copy localhost and LAN addresses
 - **Model Mapping**: Map opus/sonnet/haiku to any available backend model, with pass-through toggle
@@ -239,6 +277,8 @@ upstream:
 | GET | `/api/quotas` | OpenCode Go quota usage |
 | GET | `/api/free-models` | Free-model discovery snapshot `{detected,mapped,pool,removed,last_refresh,next_refresh,source,consecutive_failures}` |
 | POST | `/api/free-discovery/refresh` | Force a discovery refresh (singleflight, rate-limited) |
+| GET | `/api/live-models` | Live catalog snapshot `{revision,available,deprecated,added,removed,effort,events,notices}` |
+| POST | `/api/live-models/refresh` | Force a full live-catalog refresh (singleflight) |
 | GET | `/api/free-model-usage` | Free model request counters |
 | GET | `/api/config` | Full proxy configuration |
 | POST | `/api/config` | Update configuration at runtime |
@@ -308,6 +348,7 @@ trust.py                 # Client auth + dashboard trust middlewares
 config/
   __init__.py            # Package exports
   settings.py            # Configuration, .env management, routes, geo
+  live_models.py         # Live catalog: additions, retirements, effort caps
 dashboard/
   __init__.py            # Package exports
   api.py                 # Dashboard API endpoints

@@ -226,6 +226,11 @@ const LOCALE = {
         'config.cr_effort_low': 'Low',
         'config.cr_effort_medium': 'Medium',
         'config.cr_effort_high': 'High',
+        'models.toast_title': 'Model catalog',
+        'models.toast_added': 'New model(s): {models}',
+        'models.toast_removed': 'Removed model(s): {models}',
+        'models.toast_deprecated': 'Deprecated model(s): {models}',
+        'models.toast_notified': 'Clients using them were notified.',
         'config.cr_add_btn': 'Add',
         'config.cr_save': 'Save Custom Routes',
         'config.cr_saved': 'Saved!',
@@ -251,6 +256,10 @@ const LOCALE = {
         'config.debug_enabled': 'Debug logging active',
         'config.debug_off': 'Debug logging off',
         'config.debug_save': 'Toggle',
+        'config.retry_until_success': 'Retry until success',
+        'config.retry_max_wait': 'Max wait (s)',
+        'config.retry_max_wait_hint': '0 = infinite. The client receives SSE keepalives while waiting.',
+        'config.retry_hint': 'The proxy keeps the request open and replays recoverable errors (429, 5xx, empty stream) instead of returning them to the client. With Exhaustion mode: Strict free = free-only until success; Paid fallback = free then paid. A failure after the first token cannot be replayed.',
         'nav.debug_logs': 'Debug Logs',
         'nav.traffic': 'Traffic',
         'traffic.title': 'Traffic (Wireshark)',
@@ -550,6 +559,11 @@ const LOCALE = {
         'config.cr_effort_low': 'Faible',
         'config.cr_effort_medium': 'Moyen',
         'config.cr_effort_high': 'Élevé',
+        'models.toast_title': 'Catalogue modèles',
+        'models.toast_added': 'Nouveau(x) modèle(s) : {models}',
+        'models.toast_removed': 'Modèle(s) retiré(s) : {models}',
+        'models.toast_deprecated': 'Modèle(s) déprécié(s) : {models}',
+        'models.toast_notified': 'Les clients qui les utilisaient ont été notifiés.',
         'config.cr_add_btn': 'Ajouter',
         'config.cr_save': 'Sauvegarder',
         'config.cr_saved': 'Sauvegardé !',
@@ -575,6 +589,10 @@ const LOCALE = {
         'config.debug_enabled': 'Debug actif',
         'config.debug_off': 'Debug désactivé',
         'config.debug_save': 'Basculer',
+        'config.retry_until_success': 'Retry jusqu\'au succès',
+        'config.retry_max_wait': 'Attente max (s)',
+        'config.retry_max_wait_hint': '0 = infini. Le client reçoit des keepalives SSE pendant l\'attente.',
+        'config.retry_hint': 'Le proxy garde la requête ouverte et rejoue les erreurs récupérables (429, 5xx, flux vide) au lieu de les renvoyer au client. Combiné à « Mode épuisement » : Strict free = free-only jusqu\'au succès ; Fallback payant = free puis payant. Un échec après le premier token ne peut pas être rejoué.',
         'nav.debug_logs': 'Logs Debug',
         'nav.traffic': 'Trafic',
         'traffic.title': 'Trafic (Wireshark)',
@@ -2716,11 +2734,27 @@ document.addEventListener('DOMContentLoaded', () => {
             lastEventTs = Date.now();
             fetchQuotas().then(renderQuotas);
         });
-        es.addEventListener('models_updated', () => {
+        es.addEventListener('models_updated', (ev) => {
             lastEventTs = Date.now();
+            try {
+                const data = ev && ev.data ? JSON.parse(ev.data) : null;
+                // Les polls quota publient `{count}` : pas de pop-up pour ça.
+                if (data && (data.revision || data.added || data.removed || data.deprecated)) {
+                    showModelCatalogToast(data);
+                    if (data.revision) {
+                        _lastModelRevision = Number(data.revision);
+                        localStorage.setItem(MODEL_REV_KEY, String(_lastModelRevision));
+                    }
+                }
+            } catch (e) {}
             fetchConfig().then(data => {
                 if (data) { configData = data; renderConfig(data); }
             });
+            if (window._sseRefresh) clearTimeout(window._sseRefresh);
+            window._sseRefresh = setTimeout(() => {
+                window._sseRefresh = null;
+                refreshAll();
+            }, 300);
         });
         // [plan] C: real-time vpn container events (die/start/restart/health)
         // Instantané : chaque station pousse son vpn_event dès _set_status
@@ -3267,11 +3301,12 @@ document.addEventListener('DOMContentLoaded', () => {
                 const cooldownRow = document.getElementById('vpn-cooldown-row');
                 if (cooldownRow && !isFocused429) cooldownRow.style.display = (on429Action.value === 'both' ? 'flex' : 'none');
                 const cooldownInput = document.getElementById('vpn-cooldown-sec');
-                if (cooldownInput && cfgData.bad_ttl !== undefined && cfgData.bad_ttl !== null) {
+                const _cooldownPersisted = cfgData.station_bad_ttl_s ?? cfgData.bad_ttl;
+                if (cooldownInput && _cooldownPersisted !== undefined && _cooldownPersisted !== null) {
                     const isFocusedCd = document.activeElement === cooldownInput;
                     const isSavingCd = typeof _vpnCooldownSaving !== 'undefined' && _vpnCooldownSaving;
                     const hasPendingCd = typeof _vpnCooldownPending !== 'undefined' && _vpnCooldownPending !== null;
-                    const persistedCd = String(cfgData.bad_ttl);
+                    const persistedCd = String(_cooldownPersisted);
                     if (isFocusedCd || isSavingCd) {
                     } else if (hasPendingCd && String(_vpnCooldownPending) !== persistedCd) {
                         cooldownInput.value = String(_vpnCooldownPending);
@@ -3285,7 +3320,11 @@ document.addEventListener('DOMContentLoaded', () => {
             // [plan 19/08 §1/§2] free multi-attempt cap (1-3) + exception
             // ordering (station-first / direct) — read from config.
             const freeAttempts = document.getElementById('vpn-free-attempts');
-            if (freeAttempts) freeAttempts.value = String(cfgData.max_free_attempts || 2);
+            if (freeAttempts) {
+                freeAttempts.value = cfgData.auto_max_free_attempts === false
+                    ? String(cfgData.max_free_attempts || 2)
+                    : 'auto';
+            }
             const exceptionMode = document.getElementById('vpn-exception-mode');
             if (exceptionMode) exceptionMode.value = cfgData.free_exception_fallback || 'station-first';
 
@@ -3319,7 +3358,50 @@ document.addEventListener('DOMContentLoaded', () => {
 
         // [plan 18/08 §3d] VPN technology selector state
         refreshStackInfo();
+        // [retry] état du retry transparent (léger, idempotent)
+        refreshRetryConfig().catch(()=>{});
     }
+
+    // [retry] Retry transparent : le client ne voit pas les 429/502 récupérables.
+    async function refreshRetryConfig() {
+        const resp = await fetchWithToken('/api/retry-config');
+        const cfg = await resp.json();
+        const toggle = document.getElementById('cfg-retry-until-success');
+        const row = document.getElementById('retry-until-success-row');
+        const maxWait = document.getElementById('cfg-retry-max-wait');
+        const status = document.getElementById('retry-until-success-status');
+        const enabled = !!cfg.enabled;
+        if (toggle && document.activeElement !== toggle) toggle.checked = enabled;
+        if (row) row.style.display = enabled ? 'flex' : 'none';
+        if (maxWait && document.activeElement !== maxWait) {
+            maxWait.value = String(cfg.max_wait_s ?? 900);
+        }
+        if (status) {
+            status.textContent = enabled
+                ? (Number(cfg.max_wait_s) > 0 ? `ON — max ${cfg.max_wait_s}s` : 'ON — infini')
+                : 'OFF';
+        }
+        return cfg;
+    }
+
+    window.toggleRetryUntilSuccess = async function(enabled) {
+        await fetchWithToken('/api/retry-config', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({enabled: !!enabled})
+        });
+        await refreshRetryConfig().catch(()=>{});
+        refreshVPNStatus();
+    };
+
+    window.saveRetryMaxWait = async function() {
+        const raw = document.getElementById('cfg-retry-max-wait')?.value;
+        const n = Math.max(0, Math.min(86400, parseInt(raw, 10) || 0));
+        await fetchWithToken('/api/retry-config', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({max_wait_s: n})
+        });
+        await refreshRetryConfig().catch(()=>{});
+    };
 
     // [plan 18/08 §3d] Render per-station stack info from GET /api/vpn-stack-info
     async function refreshStackInfo() {
@@ -4092,11 +4174,13 @@ document.addEventListener('DOMContentLoaded', () => {
         try {
             const resp = await fetchWithToken('/api/vpn-config', {
                 method: 'POST', headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({bad_ttl: n})
+                body: JSON.stringify({station_bad_ttl_s: n})
             });
             const data = await resp.json().catch(()=>({}));
             if (!resp.ok || data.error) throw new Error(data.error || `HTTP ${resp.status}`);
-            const persisted = data.config ? String(data.config.bad_ttl || n) : String(n);
+            const persisted = data.config
+                ? String(data.config.station_bad_ttl_s ?? data.config.bad_ttl ?? n)
+                : String(n);
             if (input) input.value = persisted;
             if (persisted === String(n)) _vpnCooldownPending = null;
         } catch (e) {
@@ -4111,10 +4195,13 @@ document.addEventListener('DOMContentLoaded', () => {
     // [plan 19/08 §1] free multi-attempt cap (1-3) — persisted + hot-reload
     // (read per-request via IP_ROTATION.get, no restart).
     window.vpnSaveMaxFreeAttempts = async function() {
-        const n = parseInt(document.getElementById('vpn-free-attempts').value, 10) || 2;
+        const raw = document.getElementById('vpn-free-attempts').value;
+        const payload = raw === 'auto'
+            ? {auto_max_free_attempts: true}
+            : {auto_max_free_attempts: false, max_free_attempts: parseInt(raw, 10) || 2};
         await fetchWithToken('/api/vpn-config', {
             method: 'POST', headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({max_free_attempts: n})
+            body: JSON.stringify(payload)
         });
         refreshVPNStatus();
     };
@@ -4475,18 +4562,101 @@ document.addEventListener('DOMContentLoaded', () => {
             }
         } catch (e) {}
     }
-    function showGeoToast(msg) {
-        let toast = document.getElementById('geo-toast');
+    function showToast(msg, kind) {
+        let toast = document.getElementById('app-toast');
         if (!toast) {
             toast = document.createElement('div');
-            toast.id = 'geo-toast';
-            toast.style.cssText = 'position:fixed;bottom:16px;right:16px;max-width:420px;padding:12px 16px;background:var(--bg-card,#222);border:1px solid var(--warning,#e6a000);border-radius:8px;box-shadow:0 8px 24px rgba(0,0,0,.4);font-size:12px;z-index:9999;display:none';
+            toast.id = 'app-toast';
+            toast.style.cssText = 'position:fixed;bottom:16px;right:16px;max-width:520px;padding:12px 16px;background:var(--bg-card,#222);border:1px solid var(--warning,#e6a000);border-radius:8px;box-shadow:0 8px 24px rgba(0,0,0,.4);font-size:12px;z-index:9999;display:none';
             document.body.appendChild(toast);
         }
+        if (kind === 'success') toast.style.borderColor = 'var(--success,#2e9e5b)';
+        else if (kind === 'warning') toast.style.borderColor = 'var(--warning,#e6a000)';
+        else toast.style.borderColor = 'var(--border,#444)';
         toast.textContent = msg;
         toast.style.display = 'block';
-        setTimeout(()=>{ toast.style.display='none'; }, 6000);
+        clearTimeout(toast._hideTimer);
+        toast._hideTimer = setTimeout(() => { toast.style.display = 'none'; }, 8000);
     }
+
+    function showGeoToast(msg) {
+        showToast(msg, 'warning');
+    }
+
+    // ── [live-models] Pop-up ajout/dépréciation ----------------------------
+    // Le SSE `models_updated` pousse l'événement en direct ; au chargement on
+    // compare `revision` à celle mémorisée pour ne pas rater un changement
+    // survenu dashboard fermé.
+    let _lastModelRevision = null;
+    const MODEL_REV_KEY = 'opencode_models_revision';
+
+    function _fmtModelList(list) {
+        const items = (list || []).map(String);
+        if (!items.length) return '';
+        const shown = items.slice(0, 6).join(', ');
+        return items.length > 6 ? shown + '…' : shown;
+    }
+
+    function showModelCatalogToast(evt) {
+        if (!evt || typeof evt !== 'object') return;
+        const parts = [];
+        if ((evt.added || []).length) {
+            parts.push(t('models.toast_added').replace('{models}', _fmtModelList(evt.added)));
+        }
+        if ((evt.deprecated || []).length) {
+            parts.push(t('models.toast_deprecated').replace('{models}', _fmtModelList(evt.deprecated)));
+        }
+        const _deprecatedSet = new Set((evt.deprecated || []).map(String));
+        const _removedOthers = (evt.removed || []).filter(m => !_deprecatedSet.has(String(m)));
+        if (_removedOthers.length) {
+            parts.push(t('models.toast_removed').replace('{models}', _fmtModelList(_removedOthers)));
+        }
+        if (evt.notified_clients) {
+            parts.push(t('models.toast_notified'));
+        }
+        if (!parts.length) return;
+        const warn = (evt.deprecated || []).length || (evt.removed || []).length;
+        showToast(t('models.toast_title') + ' — ' + parts.join(' · '), warn ? 'warning' : 'success');
+    }
+
+    async function pollModelCatalog() {
+        try {
+            const data = await apiFetch('/api/live-models');
+            if (!data || !data.ready) return;
+            const rev = Number(data.revision || 0);
+            const stored = Number(localStorage.getItem(MODEL_REV_KEY) || 0);
+            if (_lastModelRevision === null) {
+                _lastModelRevision = rev;
+                if (rev > stored) {
+                    const missed = (data.events || [])
+                        .slice()
+                        .reverse()
+                        .find(e => Number(e.revision || 0) > stored);
+                    let recent = true;
+                    if (missed && missed.at) {
+                        try {
+                            recent = (Date.now() - new Date(missed.at).getTime()) < 86400000;
+                        } catch (e) { recent = true; }
+                    }
+                    if (missed && recent) showModelCatalogToast(missed);
+                }
+                localStorage.setItem(MODEL_REV_KEY, String(rev));
+                return;
+            }
+            if (rev > _lastModelRevision) {
+                const evt = (data.events || []).find(e => Number(e.revision || 0) === rev)
+                    || (data.events || [])[(data.events || []).length - 1];
+                if (evt) showModelCatalogToast(evt);
+                _lastModelRevision = rev;
+                localStorage.setItem(MODEL_REV_KEY, String(rev));
+            }
+        } catch (e) {}
+    }
+
+    // Appelé APRÈS l'initialisation des constantes ci-dessus (le premier
+    // appel immédiat ne doit pas tomber dans la TDZ de `MODEL_REV_KEY`).
+    pollModelCatalog();
+    setInterval(pollModelCatalog, 60000);
 
     function setProxyModeUI(mode) {
         document.querySelectorAll('.proxy-mode-btn').forEach(btn => btn.classList.remove('active'));
@@ -4650,6 +4820,9 @@ document.addEventListener('DOMContentLoaded', () => {
         await fetchWithToken('/api/geo-policies/rollback', { method: 'POST' });
         refreshVPNStatus();
     };
+
+    // [retry] charge l'état initial même si l'onglet VPN n'est pas encore actif
+    refreshRetryConfig().catch(()=>{});
 
     // Refresh VPN status every 10 seconds when VPN tab is active
     setInterval(() => {

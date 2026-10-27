@@ -162,6 +162,62 @@ def test_post_station_count_out_of_range_is_400(ctx):
     assert resp0.status_code == 400
 
 
+# ── [GUI] Essais gratuits : auto=false active réellement la valeur ──
+
+
+def test_post_auto_max_free_attempts_is_persisted(ctx):
+    """Le sélecteur « Essais gratuits » doit être effectif : auto=false est
+    un vrai flag de config, pas un affichage mort."""
+    fast, s1, s2, pool, applied, persisted = ctx
+
+    resp = _post(fast, {"auto_max_free_attempts": False, "max_free_attempts": 2})
+
+    assert resp["ok"] is True
+    assert persisted == [{"auto_max_free_attempts": False, "max_free_attempts": 2}]
+    assert applied == []
+
+
+def test_post_auto_max_free_attempts_string_false(ctx):
+    fast, s1, s2, pool, applied, persisted = ctx
+
+    resp = _post(fast, {"auto_max_free_attempts": "false"})
+
+    assert resp["ok"] is True
+    assert persisted == [{"auto_max_free_attempts": False}]
+
+
+def test_post_station_bad_ttl_seconds_is_the_dedicated_key(ctx):
+    """GUI « Cooldown (s) » : la clé dédiée station est en secondes, distincte
+    de bad_ttl (minutes du fast-pin)."""
+    fast, s1, s2, pool, applied, persisted = ctx
+
+    resp = _post(fast, {"station_bad_ttl_s": 120})
+
+    assert resp["ok"] is True
+    assert persisted == [{"station_bad_ttl_s": 120}]
+
+
+# ── [retry] /api/retry-config : validation + persistance ──────────
+
+
+def test_post_retry_config_validates_and_persists(ctx, monkeypatch):
+    fast, s1, s2, pool, applied, persisted = ctx
+    calls = []
+    monkeypatch.setattr(api, "_persist_retry_until_success", lambda u: calls.append(dict(u)))
+    monkeypatch.setattr(
+        api,
+        "_retry_until_success_config",
+        lambda: {"enabled": True, "max_wait_s": 120, "base_delay_s": 1.0},
+    )
+
+    with TestClient(fast) as client:
+        resp = client.post("/api/retry-config", json={"enabled": "true", "max_wait_s": 120})
+
+    assert resp.status_code == 200
+    assert resp.json()["enabled"] is True
+    assert calls == [{"enabled": True, "max_wait_s": 120}]
+
+
 # ── regression: legacy dual_station toggle ───────────────────────
 
 

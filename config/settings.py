@@ -17,6 +17,8 @@ from typing import Any
 # migre, l'état est injecté aux wrappers À L'APPEL.
 from config import discovery as _discovery_mod  # noqa: E402
 from config import geo as _geo_mod  # noqa: E402
+from config import live_models as _live_models  # noqa: E402
+from config import models_catalog as _models_catalog  # noqa: E402
 
 # Windows: masquer la fenêtre console des subprocess (évite le flash noir 1s)
 _CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
@@ -1146,7 +1148,7 @@ _discovery_mod.start_background_fetch(
     # Idem pour PURGED_IDS (défini plus bas, :919) : sans ce filtre la 3e voie
     # d'ajout — le fetch du catalogue upstream — ré-annonce les ids morts 0,5 s
     # après l'import et annule la purge manuelle de `models:` à chaque démarrage.
-    purged_ids_fn=lambda: PURGED_IDS,  # type: ignore[has-type]
+    purged_ids_fn=lambda: PURGED_IDS | _live_models.blocked_ids(),  # type: ignore[has-type]
 )
 
 # ── Web search native allowlist (v3.3) ─────────────────────────
@@ -1175,6 +1177,45 @@ FREE_DISCOVERY_INTERVAL = int(
 FREE_DISCOVERY_ENABLED = bool(FREE_DISCOVERY.get("enabled", True))
 FREE_DISCOVERY_AUTO_PERSIST = bool(FREE_DISCOVERY.get("auto_persist", True))
 FREE_DISCOVERY_DEFAULT_TARGET = FREE_DISCOVERY.get("default_target", "mimo-v2.5-free")
+
+# ── [live-models] Reflet automatique du catalogue réel ─────────────────────
+# La liste des modèles servis n'est plus une table statique complétée à la
+# main : un relevé périodique des deux jambes (`/models`) et du catalogue
+# officiel (`models.opencode.ai/api.json`) ajoute les nouveaux ids, migre un
+# id déprécié d'une jambe vers l'autre quand celle-ci est active, et retire
+# les ids qui ne sont plus annoncés/dépréciés. Les niveaux d'effort sont lus
+# dans `reasoning_options` du catalogue, pas déclarés à la main.
+_raw_live_cfg = yaml_get("live_models", default={})
+LIVE_MODELS_CFG = _raw_live_cfg if isinstance(_raw_live_cfg, dict) else {}
+LIVE_MODELS_ENABLED = bool(LIVE_MODELS_CFG.get("enabled", True))
+try:
+    LIVE_MODELS_INTERVAL = max(60, int(LIVE_MODELS_CFG.get("interval", 300) or 300))
+except (TypeError, ValueError):
+    LIVE_MODELS_INTERVAL = 300
+try:
+    LIVE_MODELS_CATALOG_INTERVAL = max(
+        300, int(LIVE_MODELS_CFG.get("catalog_interval", 1800) or 1800)
+    )
+except (TypeError, ValueError):
+    LIVE_MODELS_CATALOG_INTERVAL = 1800
+LIVE_MODELS_REMOVE_DEPRECATED = bool(LIVE_MODELS_CFG.get("remove_deprecated", True))
+LIVE_MODELS_NOTIFY_CLIENTS = bool(LIVE_MODELS_CFG.get("notify_clients", True))
+_live_ignore_raw = LIVE_MODELS_CFG.get("ignore_ids", ["test"])
+if not isinstance(_live_ignore_raw, (list, tuple, set)):
+    _live_ignore_raw = ["test"]
+_LIVE_MODELS_IGNORED = {
+    str(x).strip().lower()
+    for x in _live_ignore_raw
+    if isinstance(x, str) and str(x).strip()
+}
+_LIVE_MODELS_LOCK = threading.Lock()
+_LIVE_MODELS_STATE_PATH = os.path.join(ROOT, "logs", "live_models.json")
+_LIVE_MODELS_CATALOG: dict[str, Any] = {"data": {}, "fetched_at": 0.0, "last_attempt": 0.0}
+
+#: Bases connues : sert à décider si un endpoint est interne (jamais retiré).
+_LIVE_FREE_BASES = {API_BASE_FREE, _RESPONSES_FREE_ENDPOINT}
+_LIVE_PAID_BASES = {API_BASE_OPENAI, API_BASE_ANTHROPIC, _RESPONSES_ENDPOINT} - _LIVE_FREE_BASES
+
 # -free ids served only via the authenticated Go endpoint (explicit
 # `endpoint: go` in config): never added to the anonymous free pool /
 # FREE_MODELS by auto-discovery.
@@ -1286,6 +1327,7 @@ def _apply_discovered_free_models(free_ids: set, source: str = "none") -> int:
         lock=_reload_lock,
         log=logger,
         purged_ids=PURGED_IDS,
+        blocked_ids=_live_models.blocked_ids(),
     )
     if _new_pool is not None:
         FREE_MODEL_POOL = _new_pool
@@ -1299,7 +1341,24 @@ def _apply_discovered_free_models(free_ids: set, source: str = "none") -> int:
     # passe : leur preuve (un 200 réel) ne périme pas à la découverte suivante.
     _missing_verified = _EXPOSED_VERIFIED_IDS - FREE_MODELS
     FREE_MODELS.update(_missing_verified)  # in-place : pas de rebind local
-    if _missing_verified and isinstance(FREE_MODEL_POOL, list):
+    # [live-models] Le relevé vivant peut avoir ajouté des modèles de la jambe
+    # anonyme qui ne finissent pas par `-free` (claude-*, gpt-*, big-pickle).
+    # La découverte free, elle, rebâtit FREE_MODELS depuis son propre set :
+    # sans cette ré-injection, elle les effacerait à chaque cycle.
+    _live_free_added = False
+    try:
+        for _mid, _entry in (_live_models.get_state().get("available") or {}).items():
+            if (
+                isinstance(_entry, dict)
+                and _entry.get("leg") == _live_models.FREE_LEG
+                and _mid in MODELS
+                and _mid not in FREE_MODELS
+            ):
+                FREE_MODELS.add(_mid)
+                _live_free_added = True
+    except Exception:
+        pass
+    if (_missing_verified or _live_free_added) and isinstance(FREE_MODEL_POOL, list):
         FREE_MODEL_POOL = sorted(FREE_MODELS)
     return added
 
@@ -1314,6 +1373,7 @@ def _persist_free_mappings():
         save_yaml_fn=save_yaml_config,
         log=logger,
         purged_ids=PURGED_IDS,
+        blocked_ids=_live_models.blocked_ids(),
     )
 
 
@@ -1392,6 +1452,327 @@ def _ensure_free_models_async():
 # avec globals().get("_reload_lock") = None → écritures hors verrou en
 # course avec le reload principal.
 _reload_lock = threading.Lock()
+
+# ── [live-models] Relevé + application du catalogue vivant ─────────────────
+# L'état est porté par `config.live_models` (pur) ; l'hôte fournit les bases,
+# les dictionnaires à muter et la reconstruction des routes. Aucune I/O au
+# chargement : le premier relevé part du lifespan (tâche de fond).
+
+
+def _live_models_index_urls() -> dict[str, str]:
+    """URLs ``/models`` par jambe, dérivées des bases configurées."""
+    def _models_url(base: str) -> str:
+        text = str(base or "").strip()
+        if not text:
+            return ""
+        if "/chat/completions" in text:
+            text = text.rsplit("/chat/completions", 1)[0]
+        text = text.rstrip("/")
+        return text + "/models" if text else ""
+
+    return {
+        _live_models.PAID_LEG: _models_url(API_BASE_OPENAI),
+        _live_models.FREE_LEG: _models_url(API_BASE_FREE),
+    }
+
+
+def _live_model_leg(model_id: str, cfg: dict | None) -> str | None:
+    """Jambe réellement visée par un modèle configuré."""
+    data = cfg if isinstance(cfg, dict) else {}
+    endpoint: str | None = None
+    try:
+        endpoint = _resolve_model_endpoint(
+            model_id, data, data.get("protocol") or "openai"
+        )
+    except Exception:
+        endpoint = data.get("endpoint")
+    if endpoint in _LIVE_FREE_BASES:
+        return _live_models.FREE_LEG
+    if endpoint in _LIVE_PAID_BASES:
+        return _live_models.PAID_LEG
+    low = str(endpoint or "").lower()
+    # Les bases du catalogue (`/inference/go/openai/v1`, `/inference/anthropic/v1`)
+    # ne sont pas forcément celles du proxy : la forme de l'URL suffit à
+    # retrouver la jambe.
+    if "/zen/" in low or "/inference/go/" in low:
+        return _live_models.PAID_LEG
+    if "opencode.ai/inference/" in low:
+        return _live_models.FREE_LEG
+    return None
+
+
+def _live_is_internal(model_id: str, cfg: dict | None) -> bool:
+    """Un endpoint explicite hors jambes opencode n'est jamais retiré."""
+    data = cfg if isinstance(cfg, dict) else {}
+    if model_id in ("jev-1.13", "jev-1.13-free"):
+        return True
+    if str(data.get("endpoint") or "").strip() == "":
+        return False
+    return _live_model_leg(model_id, data) is None
+
+
+def _live_route_for(model_id: str, entry: dict) -> dict | None:
+    """Construit la route d'un modèle découvert dans le relevé vivant."""
+    return _live_models.build_route(
+        model_id,
+        entry,
+        api_base_free=API_BASE_FREE,
+        api_base_openai=API_BASE_OPENAI,
+        api_base_anthropic=API_BASE_ANTHROPIC,
+        responses_free=_RESPONSES_FREE_ENDPOINT,
+        responses_paid=_RESPONSES_ENDPOINT,
+        resolve_protocol_fn=_resolve_protocol,
+    )
+
+
+def _live_rebuild_routes_locked() -> None:
+    """Reconstruit ROUTES/SORTED_ROUTES après ajout/retrait (verrou tenu)."""
+    global SORTED_ROUTES
+    try:
+        new_routes = load_routes()
+        ROUTES.clear()
+        ROUTES.update(new_routes)
+        SORTED_ROUTES = _sort_routes_by_match(ROUTES)
+        _bump_route_version_unlocked()
+    except Exception as exc:  # pragma: no cover — jamais casser le trafic
+        logger.warning("[live-models] rebuild routes failed: %s", exc)
+
+
+def _load_live_models_persisted() -> None:
+    """Recharge les événements et l'inventaire persistés (pas les notices)."""
+    try:
+        with open(_LIVE_MODELS_STATE_PATH, encoding="utf-8") as fh:
+            data = json.load(fh) or {}
+    except Exception:
+        return
+    if not isinstance(data, dict):
+        return
+    try:
+        _live_models.load_persisted(
+            # Les notices sont volontairement reconstruites au démarrage :
+            # un client qui a utilisé un modèle déprécié doit être prévenu
+            # même si le proxy a redémarré entre-temps. Le pop-up dashboard,
+            # lui, est dédupliqué par `available_ids`.
+            announced=None,
+            events=data.get("events") or [],
+            revision=int(data.get("revision") or 0),
+            available_ids=(
+                data.get("available_ids") if "available_ids" in data else None
+            ),
+        )
+    except Exception:
+        pass
+
+
+def _save_live_models_persisted() -> None:
+    """Écrit l'état durable (best-effort, atomique)."""
+    try:
+        data = _live_models.persisted()
+        directory = os.path.dirname(_LIVE_MODELS_STATE_PATH)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        tmp = _LIVE_MODELS_STATE_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False, indent=1)
+            fh.flush()
+            try:
+                os.fsync(fh.fileno())
+            except Exception:
+                pass
+        os.replace(tmp, _LIVE_MODELS_STATE_PATH)
+    except Exception as exc:
+        logger.debug("[live-models] persist state failed: %s", exc)
+
+
+def _live_catalog_snapshot(force: bool = False) -> dict:
+    """Catalogue officiel, rafraîchi au plus toutes les N secondes."""
+    now = time.monotonic()
+    try:
+        catalog_interval = max(
+            300,
+            int(
+                yaml_get(
+                    "live_models", "catalog_interval", LIVE_MODELS_CATALOG_INTERVAL
+                )
+                or LIVE_MODELS_CATALOG_INTERVAL
+            ),
+        )
+    except (TypeError, ValueError):
+        catalog_interval = LIVE_MODELS_CATALOG_INTERVAL
+    age = now - float(_LIVE_MODELS_CATALOG.get("fetched_at") or 0.0)
+    if not force and _LIVE_MODELS_CATALOG.get("data") and age < catalog_interval:
+        return dict(_LIVE_MODELS_CATALOG.get("data") or {})
+    _LIVE_MODELS_CATALOG["last_attempt"] = now
+    try:
+        data = _models_catalog.fetch_catalog(timeout=20.0)
+        if isinstance(data, dict) and data:
+            _LIVE_MODELS_CATALOG["data"] = data
+            _LIVE_MODELS_CATALOG["fetched_at"] = now
+            import datetime as _dt_live
+
+            _live_models.get_state()["last_catalog_refresh"] = (
+                _dt_live.datetime.now(_dt_live.UTC).isoformat()
+            )
+            return data
+    except Exception as exc:
+        logger.debug("[live-models] catalog fetch failed (cache conservé): %s", exc)
+    return dict(_LIVE_MODELS_CATALOG.get("data") or {})
+
+
+def _catalog_missing_live_ids(
+    live_by_leg: dict[str, set], catalog: dict | None
+) -> bool:
+    """Vrai si un id annoncé par une jambe n'est pas encore dans le catalogue."""
+    if not isinstance(catalog, dict) or not catalog:
+        return False
+    for leg, ids in (live_by_leg or {}).items():
+        models = ((catalog.get(leg) or {}).get("models") or {})
+        if any(str(mid) not in models for mid in ids):
+            return True
+    return False
+
+
+def refresh_live_models_sync(force_catalog: bool = False) -> dict[str, Any]:
+    """Un cycle complet : relevé des jambes + catalogue → MODELS.
+
+    Fail-soft : une jambe indisponible produit un relevé *partiel* qui ne
+    supprime rien ; un catalogue indisponible conserve le précédent. Aucun
+    appel réseau n'est fait si ``live_models.enabled`` est faux.
+    """
+    if not LIVE_MODELS_ENABLED:
+        return {"skipped": True, "reason": "disabled"}
+    with _LIVE_MODELS_LOCK:
+        urls = _live_models_index_urls()
+        try:
+            live_by_leg, source, errors = _discovery_mod.fetch_models_index_sync(
+                urls, timeout=12.0, proxy=PROXY, log=logger
+            )
+        except Exception as exc:
+            _live_models.set_error(f"{type(exc).__name__}: {exc}")
+            return {"ok": False, "error": str(exc), "errors": {}}
+        if not live_by_leg:
+            _live_models.set_error("aucune jambe n'a répondu")
+            return {"ok": False, "error": "aucune jambe n'a répondu", "errors": errors}
+
+        _force_catalog = bool(force_catalog)
+        if not _force_catalog and _LIVE_MODELS_CATALOG.get("data"):
+            try:
+                _age_attempt = time.monotonic() - float(
+                    _LIVE_MODELS_CATALOG.get("last_attempt") or 0.0
+                )
+            except (TypeError, ValueError):
+                _age_attempt = 0.0
+            if _age_attempt > 300 and _catalog_missing_live_ids(
+                live_by_leg, _LIVE_MODELS_CATALOG.get("data")
+            ):
+                # Un id vient d'apparaître côté /models mais pas encore dans
+                # le catalogue : on force un relevé (au plus 1/5 min) pour
+                # obtenir ses niveaux d'effort sans attendre 30 min.
+                _force_catalog = True
+        catalog = _live_catalog_snapshot(force=_force_catalog)
+        fetched_legs = set(live_by_leg)
+        previous = _live_models.by_leg()
+        current_legs = {
+            mid: _live_model_leg(mid, cfg)
+            for mid, cfg in list(MODELS.items())
+            if isinstance(cfg, dict)
+        }
+        snapshot = _live_models.build_snapshot(
+            live_by_leg=live_by_leg,
+            current_models=dict(MODELS),
+            current_legs=current_legs,
+            catalog=catalog,
+            fetched_legs=fetched_legs,
+            previous_by_leg=previous,
+            purged_ids=PURGED_IDS,
+            ignored_ids=_LIVE_MODELS_IGNORED,
+            is_internal_fn=_live_is_internal,
+            source=source,
+        )
+        # Rollback documenté : `live_models.remove_deprecated: false` conserve
+        # les modèles dépréciés (ils restent routables) tout en les marquant
+        # `deprecated` dans /v1/models. Le défaut reste le retrait.
+        if not LIVE_MODELS_REMOVE_DEPRECATED:
+            for _mid, _row in list((snapshot.get("deprecated") or {}).items()):
+                if _mid in MODELS:
+                    _kept = dict(_row)
+                    _kept["status"] = "deprecated"
+                    _kept["deprecated"] = True
+                    snapshot.setdefault("available", {})[_mid] = _kept
+            _dep = set(snapshot.get("deprecated") or ())
+            snapshot["removed_ids"] = [
+                m for m in (snapshot.get("removed_ids") or ()) if m not in _dep
+            ]
+            snapshot["removed_deprecated"] = []
+        if snapshot.get("guarded"):
+            logger.warning(
+                "[live-models] relevé tronqué (>50% des modèles auraient disparu) "
+                "— aucune suppression ce cycle"
+            )
+            # Conserver l'inventaire précédent : sinon /v1/models masquerait
+            # les modèles absents du relevé tronqué, sans les retirer.
+            try:
+                _prev_available = _live_models.get_state().get("available") or {}
+                for _mid, _row in _prev_available.items():
+                    if _mid in MODELS and _mid not in snapshot["available"]:
+                        snapshot["available"][_mid] = _row
+            except Exception:
+                pass
+
+        with _reload_lock:
+            apply_result = _live_models.apply_snapshot(
+                snapshot,
+                models=MODELS,
+                free_models=FREE_MODELS,
+                free_model_map=FREE_MODEL_MAP,
+                free_model_pool=FREE_MODEL_POOL,
+                route_fn=_live_route_for,
+                is_internal_fn=_live_is_internal,
+                cache_clear_fn=lambda: get_model_config.cache_clear(),
+                log=logger,
+            )
+            if apply_result.get("added") or apply_result.get("removed") or apply_result.get("migrated"):
+                _live_rebuild_routes_locked()
+            # Les capabilities (web-search, etc.) ne sont pas dans le relevé :
+            # on les fusionne avec la même source que les entrées config.
+            for mid in list(apply_result.get("added") or ()) + list(
+                apply_result.get("migrated") or ()
+            ):
+                try:
+                    MODELS[mid]["capabilities"] = get_model_capabilities(mid, MODELS[mid])
+                except Exception:
+                    pass
+        commit = _live_models.commit_snapshot(
+            snapshot, apply_result, source=source, model_ids=set(MODELS)
+        )
+        # Persisté même sans pop-up : `available_ids` est la référence du
+        # prochain démarrage pour ne pas rejouer un événement identique.
+        _save_live_models_persisted()
+        if errors:
+            _live_models.set_error("; ".join(f"{k}: {v}" for k, v in sorted(errors.items())))
+        else:
+            _live_models.set_error(None)
+        return {
+            "ok": True,
+            "revision": commit.get("revision"),
+            "changed": bool(commit.get("changed")),
+            "event": commit.get("event"),
+            "notified": list(commit.get("notified_ids") or ()),
+            "added": list(apply_result.get("added") or ()),
+            "removed": list(apply_result.get("removed") or ()),
+            "migrated": list(apply_result.get("migrated") or ()),
+            "deprecated": list(snapshot.get("removed_deprecated") or ()),
+            "unavailable": list(snapshot.get("removed_unavailable") or ()),
+            "partial": bool(snapshot.get("partial")),
+            "guarded": bool(snapshot.get("guarded")),
+            "source": source,
+            "catalog": bool(catalog),
+            "errors": errors,
+        }
+
+
+_load_live_models_persisted()
+
 
 # [Phase 3b-1 boot] Le spawn du thread free-discovery au niveau module est
 # SUPPRIMÉ. Il lançait, PENDANT la fenêtre import → listen :
@@ -1713,6 +2094,22 @@ def maybe_reload_custom_routes():
                     # lit/écrit new_yaml déjà chargé — aucune relecture.
                     _yaml_data = new_yaml
                     _config_yaml_mtime = cfg_mtime
+                    # [secret] L'override env doit aussi s'appliquer au
+                    # hot-reload : sinon retirer `control_api_key` du YAML
+                    # (migration vers .env) le faisait disparaître du miroir
+                    # IP_ROTATION au premier reload, sans redémarrage.
+                    try:
+                        _env_ck_reload = (
+                            os.getenv("VPN_CONTROL_API_KEY")
+                            or os.getenv("CONTROL_API_KEY")
+                            or ""
+                        ).strip()
+                        if _env_ck_reload and isinstance(
+                            new_yaml.get("ip_rotation"), dict
+                        ):
+                            new_yaml["ip_rotation"]["control_api_key"] = _env_ck_reload
+                    except Exception:
+                        pass
                     # IP_ROTATION in-place (keep object identity)
                     new_ip = new_yaml.get("ip_rotation", {}) if isinstance(new_yaml.get("ip_rotation"), dict) else {}
                     # Fix P2: snapshot old server_countries AVANT clear/update

@@ -225,6 +225,16 @@ def extract_requested_level(fields: dict) -> tuple[str | None, str, bool]:
     return None, "absent", False
 
 
+def _live_effort_supported(model: str) -> bool | None:
+    """``True``/``False`` si le catalogue vivant connaît le modèle, sinon ``None``."""
+    try:
+        from config import live_models
+
+        return live_models.effort_supported(model)
+    except Exception:  # pragma: no cover — config absente (tests isolés)
+        return None
+
+
 def max_level_for_model(model: str) -> str | None:
     """Plafond d'effort du modèle — le maximum qu'il sait faire.
 
@@ -302,6 +312,15 @@ def resolve_effort(
         ``EffortDecision`` — identique pour les 6 chemins à entrée égale.
     """
     level, source, explicit = extract_requested_level(fields or {})
+
+    # [LIVE-EFFORT] Le catalogue peut déclarer qu'un modèle n'expose aucun
+    # paramètre d'effort (reasoning_options sans entrée `effort`). Dans ce cas,
+    # envoyer `reasoning_effort` est au mieux inutile, au pire un 400. On
+    # n'émet rien — le raisonnement reste piloté par le modèle.
+    if _live_effort_supported(model) is False:
+        return EffortDecision(
+            wants=False, level=None, source=source or "unsupported", explicit=explicit
+        )
 
     if level == MODEL_MAX:
         # « Le maximum du modèle » : décision différée au modèle cible. Le

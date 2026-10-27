@@ -4205,6 +4205,7 @@ class VPNManager:
             # [plan 19/08 §1/§2] free multi-attempt cap + exception ordering —
             # read from the config mirror (persisted selection, hot-reload).
             _free_attempts = _cfg_data.get("ip_rotation", {}).get("max_free_attempts", 2)
+            _auto_free_attempts = _cfg_data.get("ip_rotation", {}).get("auto_max_free_attempts", True)
             _exc_fallback = _cfg_data.get("ip_rotation", {}).get(
                 "free_exception_fallback", "station-first"
             )
@@ -4221,16 +4222,27 @@ class VPNManager:
             except Exception:
                 _bad_ttl = 1440
             _bad_ttl = max(1, min(4320, _bad_ttl))
+            try:
+                # Cooldown station en SECONDES (GUI « Cooldown (s) »), distinct
+                # du bad_ttl fast-pin en MINUTES.
+                _station_bad_ttl_s = int(
+                    _cfg_data.get("ip_rotation", {}).get("station_bad_ttl_s", 60)
+                )
+            except Exception:
+                _station_bad_ttl_s = 60
+            _station_bad_ttl_s = max(1, min(3600, _station_bad_ttl_s))
         except Exception:
             _dual = _strict = False
             _vpn_stack = "auto"
             _spm_cfg = "proxy"
             _station_count = 2 if _dual else 1
             _free_attempts = 2
+            _auto_free_attempts = True
             _exc_fallback = "station-first"
             _free_parallel = {}
             _on_429_action = "both"
             _bad_ttl = 60
+            _station_bad_ttl_s = 60
         return {
             "enabled": self._enabled,
             "proxy_mode": self._proxy_mode,
@@ -4311,11 +4323,13 @@ class VPNManager:
             # [plan 19/08 §1/§2] free multi-attempt cap (1-3) + exception
             # ordering (station-first / direct) — same mirror pattern.
             "max_free_attempts": _free_attempts,
+            "auto_max_free_attempts": _auto_free_attempts,
             "free_exception_fallback": _exc_fallback,
             # [free_parallel] Stations free parallel routing (persisted)
             "free_parallel": _free_parallel,
             "on_429_action": _on_429_action,
             "bad_ttl": _bad_ttl,
+            "station_bad_ttl_s": _station_bad_ttl_s,
         }
 
     async def update_config(self, updates: dict) -> dict:

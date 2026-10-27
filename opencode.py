@@ -25,7 +25,7 @@ import traceback
 import urllib.parse
 from collections import OrderedDict, deque
 from contextlib import asynccontextmanager
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Annotated, Any
 
 # [Phase 3b-1 boot] httpx DIFFÉRÉ (~81 ms mesurés sur import → listen, dont
 # ~63 ms dans httpx/__init__.py:15 qui importe `._main` → rich + click +
@@ -45,9 +45,10 @@ else:
 # net au boot si absent. Un fallback silencieux sur stdlib json rendrait le
 # proxy 5-10x plus lent sans aucun signal.
 import orjson as _orjson  # type: ignore
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI, Query, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
+import config.live_models as _cfg_live
 import config.settings as _cfg_settings
 from config import (
     API_BASE_FREE,
@@ -2298,6 +2299,172 @@ from server.cache import ResponseCache as _ResponseCache  # noqa: E402
 _response_cache = _ResponseCache(debug_fn=_debug, dumps_str_fn=_json_dumps_str)
 
 
+# ── [live-models] Notices clients + boucle de rafraîchissement ──────────────
+
+def _live_clients_for_model_sync(model_id: str, days: int = 30, limit: int = 500) -> list[dict]:
+    """Clients (IP/alias) qui ont réellement utilisé ``model_id`` récemment.
+
+    Lecture bornée et indexée par ``model``/``original_model``. Fail-soft :
+    une base indisponible rend une liste vide (aucune notice inventée).
+    """
+    try:
+        cutoff = (
+            datetime.datetime.now(datetime.UTC) - datetime.timedelta(days=max(1, int(days)))
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        conn = globals().get("_conn")
+        lock = globals().get("_db_commit_lock")
+        if conn is None or lock is None:
+            return []
+        with lock:
+            rows = conn.execute(
+                "SELECT DISTINCT client_ip, account_alias FROM requests "
+                "WHERE (model = ? OR original_model = ?) AND timestamp >= ? "
+                "LIMIT ?",
+                (model_id, model_id, cutoff, max(1, int(limit))),
+            ).fetchall()
+        out: list[dict] = []
+        for row in rows:
+            try:
+                ip = row["client_ip"] or ""
+                alias = row["account_alias"] or ""
+            except Exception:
+                ip = row[0] if len(row) > 0 else ""
+                alias = row[1] if len(row) > 1 else ""
+            if ip or alias:
+                out.append({"client_ip": ip, "account_alias": alias})
+        return out
+    except Exception as exc:
+        _debug(f"  [live-models] clients lookup failed for {model_id!r}: {exc}")
+        return []
+
+
+def _record_live_deprecation_notices_sync(notified: list[str]) -> int:
+    """Enregistre les notices des clients touchés par un retrait."""
+    clients_by_model: dict[str, list[dict]] = {}
+    for model_id in notified or ():
+        clients = _live_clients_for_model_sync(model_id)
+        if clients:
+            clients_by_model[model_id] = clients
+    if not clients_by_model:
+        return 0
+    created = _cfg_live.record_deprecation_notices(clients_by_model)
+    return len(created)
+
+
+def _publish_live_models_event(result: dict) -> None:
+    """Pousse l'événement SSE consommé par le pop-up du dashboard."""
+    event = result.get("event") if isinstance(result.get("event"), dict) else None
+    if not event:
+        return
+    try:
+        from dashboard.events import get_event_manager
+
+        get_event_manager().publish(
+            "models_updated",
+            {
+                "count": len(MODELS),
+                "revision": result.get("revision"),
+                "added": list(event.get("added") or ()),
+                "removed": list(event.get("removed") or ()),
+                "deprecated": list(event.get("deprecated") or ()),
+                "unavailable": list(event.get("unavailable") or ()),
+                "migrated": list(event.get("migrated") or ()),
+                "notified": list(event.get("notified") or ()),
+                "notified_clients": int(event.get("notified_clients") or 0),
+                "partial": bool(event.get("partial")),
+                "at": event.get("at"),
+            },
+        )
+    except Exception:
+        pass
+
+
+async def _process_live_models_result(result: dict) -> int:
+    """Notifie les clients concernés puis publie l'événement dashboard."""
+    if not isinstance(result, dict) or not result.get("ok"):
+        return 0
+    notified = list(result.get("notified") or ())
+    created = 0
+    if notified and _cfg_settings.LIVE_MODELS_NOTIFY_CLIENTS:
+        created = await asyncio.to_thread(_record_live_deprecation_notices_sync, notified)
+    if result.get("changed"):
+        try:
+            _event = result.get("event")
+            if isinstance(_event, dict):
+                _event["notified_clients"] = int(created or 0)
+        except Exception:
+            pass
+        _publish_live_models_event(result)
+        try:
+            _log(
+                f"  [live-models] ajout={len(result.get('added') or ())} "
+                f"retrait={len(result.get('removed') or ())} "
+                f"migration={len(result.get('migrated') or ())} "
+                f"notices={created} revision={result.get('revision')}"
+            )
+        except Exception:
+            pass
+    return created
+
+
+async def _live_models_refresh_once(force_catalog: bool = False) -> dict:
+    """Singleflight : un seul relevé à la fois."""
+    lock = getattr(app.state, "_live_models_lock", None)
+    if lock is None:
+        app.state._live_models_lock = asyncio.Lock()
+        lock = app.state._live_models_lock
+    async with lock:
+        result = await asyncio.to_thread(
+            _cfg_settings.refresh_live_models_sync, bool(force_catalog)
+        )
+        await _process_live_models_result(result)
+        if result.get("changed"):
+            # Le compteur de clients notifiés est ajouté par _process ; on
+            # réécrit l'état pour que le dashboard puisse l'afficher après
+            # un redémarrage (rattrapage par `revision`).
+            try:
+                _cfg_settings._save_live_models_persisted()
+            except Exception:
+                pass
+        return result
+
+
+async def _live_models_loop():
+    """Rafraîchit le catalogue vivant à intervalle court (défaut 300 s)."""
+    while True:
+        try:
+            interval = int(
+                yaml_get(
+                    "live_models",
+                    "interval",
+                    _cfg_settings.LIVE_MODELS_INTERVAL,
+                )
+                or _cfg_settings.LIVE_MODELS_INTERVAL
+            )
+            if interval < 60:
+                interval = 60
+            jitter = 0.9 + random.random() * 0.2
+            sleep_s = interval * jitter
+            try:
+                _cfg_live.set_next_refresh(
+                    (
+                        datetime.datetime.now(datetime.UTC)
+                        + datetime.timedelta(seconds=sleep_s)
+                    ).isoformat()
+                )
+            except Exception:
+                pass
+            await asyncio.sleep(sleep_s)
+            if not _cfg_settings.LIVE_MODELS_ENABLED:
+                continue
+            await _live_models_refresh_once()
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            _debug(f"  [live-models] loop error: {type(exc).__name__}: {exc}")
+            await asyncio.sleep(60)
+
+
 @asynccontextmanager
 async def lifespan(app):
     _debug("  [lifespan] app starting")
@@ -2990,6 +3157,17 @@ async def lifespan(app):
         app.state._free_discovery_task = asyncio.create_task(_free_discovery_loop())
         _debug("  [lifespan] free-discovery loop started")
 
+    # [live-models] Relevé du catalogue réel : ajoute les nouveaux modèles,
+    # retire les dépréciés/absents et met à jour les niveaux d'effort. Le boot
+    # est fire-and-forget ; la boucle ne planifie que les cycles suivants.
+    if _cfg_settings.LIVE_MODELS_ENABLED:
+        app.state._live_models_lock = asyncio.Lock()
+        app.state._live_models_boot_task = asyncio.create_task(
+            _live_models_refresh_once()
+        )
+        app.state._live_models_task = asyncio.create_task(_live_models_loop())
+        _debug("  [lifespan] live-models loop started")
+
     # [V8.2] Canary : vérifie périodiquement que la jambe répond vraiment.
     # Désactivable par `canary.enabled: false` (aucune sonde, aucun quota).
     if yaml_get("canary", "enabled", True):
@@ -3150,6 +3328,23 @@ async def lifespan(app):
         except asyncio.CancelledError:
             pass
         _debug("  [lifespan] quota fetcher task cancelled")
+    lm_task = getattr(app.state, "_live_models_task", None)
+    if lm_task:
+        lm_task.cancel()
+        try:
+            await lm_task
+        except asyncio.CancelledError:
+            pass
+        _debug("  [lifespan] live-models task cancelled")
+    lm_boot = getattr(app.state, "_live_models_boot_task", None)
+    if lm_boot:
+        lm_boot.cancel()
+        try:
+            await lm_boot
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
     fd_task = getattr(app.state, "_free_discovery_task", None)
     if fd_task:
         fd_task.cancel()
@@ -3842,6 +4037,61 @@ class GeoWarningMiddleware:
 app.add_middleware(GeoWarningMiddleware)
 
 
+class ModelDeprecationNoticeMiddleware:
+    """Ajoute un en-tête de notice aux clients qui ont utilisé un modèle retiré.
+
+    ASGI pur (comme GeoWarningMiddleware) : les en-têtes sont ajoutés à
+    ``http.response.start``, y compris pour les réponses streamées, sans
+    bufferiser le corps. Le client voit la notice sur sa prochaine requête,
+    même s'il a changé de modèle entre-temps.
+    """
+
+    PREFIXES = ("/v1/", "/anthropic/")
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http" or not _cfg_settings.LIVE_MODELS_NOTIFY_CLIENTS:
+            await self.app(scope, receive, send)
+            return
+        path = str(scope.get("path") or "")
+        if not path.startswith(self.PREFIXES):
+            await self.app(scope, receive, send)
+            return
+        try:
+            client = scope.get("client")
+            ip = str(client[0] or "") if isinstance(client, (tuple, list)) and client else ""
+            notice = _cfg_live.notice_for(ip, "") if ip else None
+        except Exception:
+            notice = None
+        if not notice:
+            await self.app(scope, receive, send)
+            return
+
+        model = str(notice.get("model") or "")
+        message = str(notice.get("message") or _cfg_live.notice_message(model))
+
+        async def send_wrapper(message_obj):
+            if message_obj.get("type") == "http.response.start":
+                try:
+                    headers = list(message_obj.get("headers") or [])
+                    headers.append((b"x-opencode-model-deprecated", model.encode("latin-1", "replace")))
+                    headers.append((b"x-opencode-notice", message.encode("latin-1", "replace")))
+                    headers.append(
+                        (b"warning", ('299 - "' + message.replace('"', "'") + '"').encode("latin-1", "replace"))
+                    )
+                    message_obj["headers"] = headers
+                except Exception:
+                    pass
+            await send(message_obj)
+
+        await self.app(scope, receive, send_wrapper)
+
+
+app.add_middleware(ModelDeprecationNoticeMiddleware)
+
+
 # ── Circuit Breaker (per-endpoint) ──────────────────────────────
 
 _CB_FAILURE_THRESHOLD = yaml_get("circuit_breaker", "failure_threshold", 5)  # trips open after N consecutive failures
@@ -3986,6 +4236,29 @@ app.add_middleware(
     on_empty=lambda reason: _note_empty_stream("?", f"choke:{reason}"),
 )
 
+# [RetryUntilSuccess] Retry transparent côté proxy : le client ne voit ni 429
+# ni 502 pour une erreur récupérable. Placé APRÈS EmptyGuard (donc à
+# l'extérieur) pour pouvoir rejouer le 502 qu'il produit, et AVANT
+# RequestDeadline (qui reste le plus externe) pour que le budget total borne
+# la boucle de retry. Désactivé par défaut (`retry_until_success.enabled`).
+from streaming.retry_until_success import RetryUntilSuccessMiddleware  # noqa: E402
+
+
+def _note_retry_event(kind, attempt, status, size):
+    """Compteur `/metrics` fail-soft : retry/success/exhausted."""
+    try:
+        _bump_misc_counter(f"retry_until_success:{kind}")
+    except Exception:
+        pass
+
+
+app.add_middleware(
+    RetryUntilSuccessMiddleware,
+    config_getter=lambda: yaml_get("retry_until_success", None, {}) or {},
+    debug_fn=_debug,
+    on_event=_note_retry_event,
+)
+
 # [V6.5.3] Plafond de durée TOTALE d'une requête — enregistré en dernier, donc
 # le plus externe : il borne tout ce qui précède, y compris le garde de flux.
 # `request_budget_s: 0` désactive explicitement ; 900 s ne coupe jamais du trafic
@@ -3993,9 +4266,34 @@ app.add_middleware(
 # amont accepte la connexion puis se tait indéfiniment.
 from streaming.deadline import RequestDeadlineMiddleware  # noqa: E402
 
+
+def _request_budget_s() -> float:
+    """Budget total ; élargi à la fenêtre de retry quand elle est active.
+
+    Sans cet élargissement, `timeouts.request_budget_s: 240` couperait une
+    boucle `retry_until_success.enabled: true` configurée à 900 s avant même
+    la première tentative tardive. ``max_wait_s: 0`` (infini) désactive le
+    plafond : le middleware de retry s'arrête sur déconnexion client.
+    """
+    try:
+        base = float(yaml_get("timeouts", "request_budget_s", 900) or 0)
+    except (TypeError, ValueError):
+        base = 900.0
+    try:
+        cfg = yaml_get("retry_until_success", None, {}) or {}
+        if isinstance(cfg, dict) and bool(cfg.get("enabled", False)):
+            wait = float(cfg.get("max_wait_s", 900) or 0)
+            if wait <= 0:
+                return 0.0
+            return max(base, wait + 60.0)
+    except Exception:
+        pass
+    return base
+
+
 app.add_middleware(
     RequestDeadlineMiddleware,
-    budget_getter=lambda: yaml_get("timeouts", "request_budget_s", 900),
+    budget_getter=_request_budget_s,
 )
 
 
@@ -4009,6 +4307,7 @@ from core.errors import classify_upstream_error as _classify_upstream_error  # n
 from core.errors import extract_upstream_error_type as _extract_upstream_error_type  # noqa: E402
 from core.errors import is_credit_exhaustion as _is_credit_exhaustion  # noqa: E402
 from core.errors import is_free_quota_failure as _is_free_quota_failure  # noqa: E402
+from core.errors import model_deprecated_error as _model_deprecated_error  # noqa: E402
 from core.errors import openai_error as _openai_error  # noqa: E402
 from core.errors import upstream_retry_signal as _upstream_retry_signal  # noqa: E402
 from upstream.breaker import CircuitOpenError  # noqa: E402
@@ -13159,7 +13458,54 @@ def _route_for(model_name: str) -> dict | None:
         ),
         debug_fn=_debug,
     )
+    # [LIVE-MODELS] Un alias/custom route peut encore viser un id que le
+    # relevé vivant vient de retirer. On refuse ici plutôt que d'envoyer une
+    # requête à un modèle qui n'existe plus en amont : le handler produira un
+    # 404/410 explicite (et le middleware de notice prévient le client).
+    if isinstance(res, dict):
+        target = str(res.get("model") or "").strip()
+        if target and _cfg_live.is_removed(target):
+            _debug(f"  [route] removed model target: {target!r}")
+            return None
     return res
+
+
+def _deprecated_model_response(model_name: str, protocol: str):
+    """410 explicite si ``model_name`` (ou sa cible) a été retiré.
+
+    Retourne ``None`` quand le modèle n'est pas connu comme retiré : le
+    handler garde alors son 404 historique.
+    """
+    target = model_name if _cfg_live.is_removed(model_name) else None
+    if target is None:
+        # Un alias (`sonnet`, route custom) peut viser un id retiré : le
+        # refus doit nommer la cible réelle, pas seulement l'alias.
+        try:
+            name = str(model_name or "").lower().strip()
+            for route in list(_cfg_settings.SORTED_ROUTES) + list(
+                _cfg_settings.SORTED_CUSTOM_ROUTES
+            ):
+                if not isinstance(route, dict) or route.get("enabled") is False:
+                    continue
+                if not any(str(m).lower() in name for m in route.get("match", [])):
+                    continue
+                candidate = str(route.get("model") or "")
+                if candidate and _cfg_live.is_removed(candidate):
+                    target = candidate
+                    break
+        except Exception:
+            target = None
+    if target is None:
+        return None
+    try:
+        active = [
+            mid
+            for mid in sorted(list(MODELS))
+            if not _cfg_live.is_removed(mid)
+        ][:8]
+    except Exception:
+        active = []
+    return _model_deprecated_error(target, protocol, available=active)
 
 
 def _extract_tool_names(body: dict) -> list:
@@ -14103,6 +14449,9 @@ async def messages(request: Request):
     route = _route_for(original_model)
     if route is None:
         _debug(f"[messages] ✗ no route found for {original_model!r}")
+        _dep = _deprecated_model_response(original_model, "anthropic")
+        if _dep is not None:
+            return _dep
         # Parité officielle : enveloppe Anthropic sur route Anthropic
         # (le SDK lève NotFoundError typée au lieu d'un 404 brut).
         return _anthropic_error(404, f"Model not found: {original_model!r}", error_type="not_found_error")
@@ -17999,6 +18348,47 @@ def _free_quota_states(limit: int = 200) -> list:
         return []
 
 
+@app.get("/api/live-models")
+async def live_models_api():
+    """État du catalogue vivant (modèles réellement disponibles + efforts).
+
+    Expose aussi les événements récents et les notices agrégées : le dashboard
+    s'en sert pour afficher le pop-up même s'il n'était pas connecté au moment
+    exact du changement.
+    """
+    payload = _cfg_live.snapshot_for_api()
+    payload.update(
+        {
+            "enabled": bool(_cfg_settings.LIVE_MODELS_ENABLED),
+            "interval": int(_cfg_settings.LIVE_MODELS_INTERVAL),
+            "catalog_interval": int(_cfg_settings.LIVE_MODELS_CATALOG_INTERVAL),
+            "remove_deprecated": bool(_cfg_settings.LIVE_MODELS_REMOVE_DEPRECATED),
+            "notify_clients": bool(_cfg_settings.LIVE_MODELS_NOTIFY_CLIENTS),
+        }
+    )
+    return payload
+
+
+@app.post("/api/live-models/refresh")
+async def live_models_refresh(request: Request):
+    """Force un relevé immédiat du catalogue vivant."""
+    _dash = os.getenv("DASHBOARD_TOKEN", "").strip()
+    if _dash:
+        provided = request.headers.get("X-Dashboard-Token", "")
+        if not provided or not hmac.compare_digest(provided, _dash):
+            return JSONResponse(
+                status_code=401,
+                content={
+                    "error": "unauthorized",
+                    "message": "Valid X-Dashboard-Token header required (DASHBOARD_TOKEN env).",
+                },
+            )
+    result = await _live_models_refresh_once(force_catalog=True)
+    if not result.get("ok"):
+        return JSONResponse(status_code=502, content=result)
+    return result
+
+
 @app.get("/api/free-models")
 async def free_models():
     """Observability for auto free discovery (GET /api/free-models)."""
@@ -18103,37 +18493,300 @@ async def free_discovery_refresh(request: Request):
     }
 
 
+def _live_model_entry(model_id: str) -> dict | None:
+    try:
+        return _cfg_live.get_model_entry(model_id)
+    except Exception:
+        return None
+
+
+def _model_effort_levels(model_id: str) -> list | None:
+    """Niveaux d'effort réels : catalogue vivant, sinon table de config."""
+    try:
+        levels = _cfg_live.effort_levels(model_id)
+    except Exception:
+        levels = None
+    if levels is not None:
+        try:
+            from config.effort_caps import get_effort_order
+
+            order = get_effort_order()
+            levels = [str(x).strip().lower() for x in levels if str(x).strip().lower() in order]
+        except Exception:
+            levels = [str(x).strip().lower() for x in levels]
+        return list(levels)
+    try:
+        from config.reasoning_options import get_allowed_variants
+
+        variants = get_allowed_variants(model_id)
+        return list(variants) if variants else None
+    except Exception:
+        return None
+
+
+def _effort_capability(model_id: str) -> dict:
+    """Objet ``capabilities.effort`` au format Anthropic Models API.
+
+    ``max.supported`` est vrai **seulement** si le catalogue vivant (ou la
+    table de repli) liste réellement ``max``. Un modèle plafonné à ``high``
+    expose donc ``max: {supported: false}`` — le client sait qu'il ne doit pas
+    proposer le cran maximal.
+    """
+    levels = _model_effort_levels(model_id) or []
+    normalized = {"low" if str(x).strip().lower() == "minimal" else str(x).strip().lower()
+                  for x in levels}
+    out: dict[str, Any] = {"supported": bool(normalized)}
+    for level in ("low", "medium", "high", "xhigh", "max"):
+        out[level] = {"supported": level in normalized}
+    if "minimal" in normalized:
+        out["minimal"] = {"supported": True}
+    return out
+
+
+def _thinking_capability(model_id: str, cfg: dict) -> dict:
+    live = None
+    try:
+        live = _cfg_live.thinking_capability(model_id)
+    except Exception:
+        live = None
+    if isinstance(live, dict):
+        types = live.get("types") if isinstance(live.get("types"), dict) else {}
+        return {
+            "supported": bool(live.get("supported")),
+            "types": {
+                name: {"supported": bool(types.get(name))}
+                for name in ("adaptive", "enabled", "disabled", "between_tools")
+            },
+        }
+    caps = cfg.get("capabilities", {}) if isinstance(cfg, dict) else {}
+    if not isinstance(caps, dict):
+        caps = {}
+    reasoning = bool(caps.get("reasoning")) or bool(_model_effort_levels(model_id))
+    return {
+        "supported": reasoning,
+        "types": {
+            "adaptive": {"supported": reasoning},
+            "enabled": {"supported": reasoning},
+            "disabled": {"supported": False},
+            "between_tools": {"supported": reasoning},
+        },
+    }
+
+
+def _model_capabilities(model_id: str, cfg: dict, entry: dict | None) -> dict:
+    meta = (entry or {}).get("metadata") if isinstance((entry or {}).get("metadata"), dict) else {}
+    modalities = meta.get("modalities") if isinstance(meta.get("modalities"), dict) else {}
+    inputs = [str(x).strip().lower() for x in (modalities.get("input") or [])]
+    cap = {
+        "batch": {"supported": False},
+        "citations": {"supported": False},
+        "code_execution": {"supported": False},
+        "context_management": {"supported": False},
+        "effort": _effort_capability(model_id),
+        "image_input": {"supported": "image" in inputs},
+        "pdf_input": {"supported": "pdf" in inputs},
+        "server_tools": {
+            "supported": False,
+            "web_search": {"supported": False},
+            "code_execution": {"supported": False},
+        },
+        "structured_outputs": {"supported": bool(meta.get("structured_output"))},
+        "thinking": _thinking_capability(model_id, cfg),
+    }
+    return cap
+
+
+def _release_epoch(meta: dict, fallback: int) -> int:
+    raw = meta.get("release_date") if isinstance(meta, dict) else None
+    if isinstance(raw, str) and raw.strip():
+        try:
+            dt = datetime.datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=datetime.UTC)
+            return int(dt.timestamp())
+        except Exception:
+            pass
+    return fallback
+
+
+def _model_api_item(model_id: str, lifecycle: str, now: int) -> dict:
+    cfg = get_model_config(model_id)
+    entry = _live_model_entry(model_id)
+    meta = entry.get("metadata") if isinstance((entry or {}).get("metadata"), dict) else {}
+    endpoint = cfg.get("endpoint", "")
+    cb = _circuit_breakers.get(endpoint)
+    cb_state = cb.state if cb else "unknown"
+    usage = _token_usage.get(model_id, {})
+    created = _release_epoch(meta, now)
+    release = meta.get("release_date")
+    created_at = (
+        f"{str(release).strip()}T00:00:00Z"
+        if isinstance(release, str) and str(release).strip()
+        else datetime.datetime.fromtimestamp(created, datetime.UTC).isoformat()
+    )
+    limit = meta.get("limit") if isinstance(meta.get("limit"), dict) else {}
+    max_input = limit.get("context") or limit.get("input")
+    max_tokens = limit.get("output")
+    return {
+        "id": model_id,
+        "object": "model",
+        "type": "model",
+        "created": created,
+        "created_at": created_at,
+        "display_name": meta.get("name") or model_id,
+        "owned_by": "opencode",
+        "status": cb_state,
+        "lifecycle": lifecycle,
+        "deprecated_at": None,
+        "retires_at": None,
+        "line": None,
+        "max_input_tokens": max_input,
+        "max_tokens": max_tokens,
+        "capabilities": _model_capabilities(model_id, cfg, entry),
+        "reasoning_options": (entry or {}).get("reasoning_options"),
+        "proxy": {
+            "leg": (entry or {}).get("leg"),
+            "protocol": cfg.get("protocol"),
+            "source": (entry or {}).get("status") or "config",
+        },
+        "requests": {
+            "input": usage.get("input", 0),
+            "output": usage.get("output", 0),
+            "cache": usage.get("cache", 0),
+            # Phase 2 chantier boot : compteurs à 0 le temps du
+            # rattrapage GROUP BY en fond sur grosse DB.
+            "stale": bool(_token_counters_stale),
+        },
+    }
+
+
 @app.get("/v1/models")
-async def list_models():
+async def list_models(
+    request: Request = None,
+    limit: int | None = None,
+    after_id: str | None = None,
+    before_id: str | None = None,
+    lifecycle: Annotated[list[str] | None, Query()] = None,
+):
+    """Liste les modèles **réellement servis**, avec capacités d'effort.
+
+    Compatible OpenAI (``object: list`` / ``data[].object: model``) et
+    Anthropic Models API (``type``, ``display_name``, ``capabilities``,
+    pagination ``after_id``/``before_id``, filtre ``lifecycle``).
+
+    Le catalogue vivant fait foi : un id retiré n'apparaît plus par défaut.
+    ``?lifecycle=deprecated`` permet de le consulter explicitement (le client
+    qui l'utilisait reçoit par ailleurs une notice/410 explicite).
+
+    Le drapeau ``requests.stale`` de chaque entrée est construit à partir de
+    ``_token_counters_stale`` (voir ``_model_api_item``) et émis sous la forme
+    "stale": bool(_token_counters_stale).
+    """
     now = int(time.time())
-    seen = set()
-    data = []
-    for model_id in MODELS:
-        if model_id not in seen:
-            cfg = get_model_config(model_id)
-            endpoint = cfg.get("endpoint", "")
-            cb = _circuit_breakers.get(endpoint)
-            cb_state = cb.state if cb else "unknown"
-            usage = _token_usage.get(model_id, {})
-            data.append(
-                {
-                    "id": model_id,
-                    "object": "model",
-                    "created": now,
-                    "owned_by": "opencode",
-                    "status": cb_state,
-                    "requests": {
-                        "input": usage.get("input", 0),
-                        "output": usage.get("output", 0),
-                        "cache": usage.get("cache", 0),
-                        # Phase 2 chantier boot : compteurs à 0 le temps du
-                        # rattrapage GROUP BY en fond sur grosse DB.
-                        "stale": bool(_token_counters_stale),
-                    },
-                }
+    ready = False
+    try:
+        ready = _cfg_live.is_ready()
+    except Exception:
+        ready = False
+
+    requested = {str(x).strip().lower() for x in (lifecycle or ()) if str(x).strip()}
+    include_active = not requested or "active" in requested
+    include_deprecated = "deprecated" in requested
+    include_retired = "retired" in requested
+
+    active_ids: list[str] = []
+    deprecated_ids: list[str] = []
+    retired_ids: list[str] = []
+    if ready:
+        try:
+            state = _cfg_live.get_state()
+            available_map = state.get("available") or {}
+            available = set(available_map)
+            deprecated = set(state.get("deprecated") or ())
+            deprecated.update(
+                mid
+                for mid, row in available_map.items()
+                if isinstance(row, dict) and row.get("status") == "deprecated"
             )
-            seen.add(model_id)
-    return {"object": "list", "data": data, "cache": _response_cache.stats()}
+            retired = set(state.get("retired") or ())
+        except Exception:
+            available_map, available, deprecated, retired = {}, set(MODELS), set(), set()
+        active_ids = [
+            mid
+            for mid in list(MODELS)
+            if mid in available
+            and not _cfg_live.is_removed(mid)
+            and str((available_map.get(mid) or {}).get("status") or "active") != "deprecated"
+        ]
+        deprecated_ids = [
+            mid for mid in sorted(set(MODELS) | deprecated) if mid in deprecated
+        ]
+        retired_ids = [
+            mid for mid in sorted(set(MODELS) | retired) if mid in retired and mid not in deprecated
+        ]
+    else:
+        active_ids = list(MODELS)
+
+    ids: list[str] = []
+    if include_active:
+        ids.extend(active_ids)
+    if include_deprecated:
+        ids.extend(deprecated_ids)
+    if include_retired:
+        ids.extend(retired_ids)
+    # Déduplication + ordre stable, du plus récent au plus ancien (par date de
+    # sortie quand le catalogue la connaît).
+    seen: set[str] = set()
+    unique: list[str] = []
+    for mid in ids:
+        if mid not in seen:
+            seen.add(mid)
+            unique.append(mid)
+    items = {mid: _model_api_item(mid, "deprecated" if mid in deprecated_ids else "retired" if mid in retired_ids else "active", now) for mid in unique}
+    unique.sort(key=lambda mid: (items[mid].get("created") or 0, mid), reverse=True)
+
+    total = len(unique)
+    start = 0
+    end = total
+    if after_id:
+        for idx, mid in enumerate(unique):
+            if mid == str(after_id):
+                start = idx + 1
+                break
+    if before_id:
+        for idx, mid in enumerate(unique):
+            if mid == str(before_id):
+                end = idx
+                break
+    page = unique[start:end]
+    if limit is not None:
+        try:
+            lim = max(1, min(1000, int(limit)))
+        except (TypeError, ValueError):
+            lim = total
+        # `before_id` pagine vers l'arrière : on garde la fin de la fenêtre.
+        if before_id:
+            start = max(start, end - lim)
+        else:
+            end = min(end, start + lim)
+        page = unique[start:end]
+    data = [items[mid] for mid in page]
+    payload = {
+        "object": "list",
+        "data": data,
+        "first_id": data[0]["id"] if data else None,
+        "last_id": data[-1]["id"] if data else None,
+        "has_more": bool(start > 0 if before_id else end < total),
+        "cache": _response_cache.stats(),
+    }
+    try:
+        client_ip = _get_client_ip(request) if request is not None else ""
+        notice = _cfg_live.notice_for(client_ip, "") if client_ip else None
+        if notice:
+            payload["notice"] = notice
+    except Exception:
+        pass
+    return payload
 
 
 @app.post("/v1/messages/count_tokens")
@@ -18196,7 +18849,10 @@ async def chat_completions(request: Request):
     route = _route_for(original_model)
     if route is None:
         _debug(f"[chat] ✗ no route found for {original_model!r}")
-        available = sorted(MODELS.keys())
+        _dep = _deprecated_model_response(original_model, "openai")
+        if _dep is not None:
+            return _dep
+        available = sorted(list(MODELS.keys()))
         return JSONResponse(
             status_code=404,
             content={
@@ -21417,7 +22073,7 @@ async def systemone(request: Request):
     route = _route_for(original_model)
     if route is None:
         _debug(f"[systemone] ✗ no route found for {original_model!r}")
-        available = sorted(m for m in MODELS if "jev" in m.lower())
+        available = sorted(m for m in list(MODELS) if "jev" in m.lower())
         return JSONResponse(
             status_code=404,
             content={
@@ -21749,7 +22405,10 @@ async def responses(request: Request):
         _log(f"  [compaction] req_id={req_id} model={original_model!r} body={len(body_bytes)}B (responses) native={int(_native)}")
     route = _route_for(original_model)
     if route is None:
-        available = sorted(MODELS.keys())
+        _dep = _deprecated_model_response(original_model, "openai")
+        if _dep is not None:
+            return _dep
+        available = sorted(list(MODELS.keys()))
         return JSONResponse(
             status_code=404,
             content={

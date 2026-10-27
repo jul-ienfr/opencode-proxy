@@ -127,6 +127,33 @@ def openai_error(
 _openai_error = openai_error
 
 
+def model_deprecated_error(
+    model_id: str,
+    protocol: str = "anthropic",
+    *,
+    available: list[str] | None = None,
+    status_code: int = 410,
+) -> JSONResponse:
+    """[LIVE-MODELS] Refus explicite d'un modèle retiré du catalogue vivant.
+
+    Le client qui utilisait ce modèle doit apprendre *pourquoi* il disparaît,
+    pas recevoir un 404 nu. On garde le format de son protocole (Anthropic ou
+    OpenAI) et on nomme les modèles encore actifs quand ils sont connus.
+    """
+    model = str(model_id or "")
+    message = (
+        f'Model "{model}" is deprecated or no longer served by OpenCodeProxy. '
+        "Use GET /v1/models to choose an active model."
+    )
+    if available:
+        sample = ", ".join(str(x) for x in available[:8])
+        if sample:
+            message += f" Active models include: {sample}."
+    if str(protocol).lower() == "openai":
+        return openai_error(status_code, message, error_type="model_deprecated")
+    return anthropic_error(status_code, message, error_type="not_found_error")
+
+
 def free_refusal_response(exc: FreeRefusal, protocol: str, *, anthropic_error_fn=anthropic_error, openai_error_fn=openai_error, redact_fn) -> JSONResponse:
     """[PLAN_CORRECTION_FAUX_429 Lot A1] Réponse HTTP véridique (non-stream).
 
@@ -704,6 +731,7 @@ __all__ = [
     "free_quota_scope",
     "is_credit_exhaustion",
     "is_free_quota_failure",
+    "model_deprecated_error",
     "openai_error",
     "upstream_retry_signal",
 ]

@@ -142,12 +142,22 @@ def allow_list_enabled() -> bool:
     return bool(_yaml_get("thinking", FLAG_KEY, default=False))
 
 
-def get_allowed_variants(model):
-    """Variantes autorisées pour ``model`` (longest-prefix), ou ``None``.
+def _live_variants(model):
+    """Variantes déclarées par le catalogue vivant, ou ``None`` si muet.
 
-    ``None`` n'est **pas** un défaut : il dit « la table ne donne rien pour ce
-    modèle », donc pas de clamp — le plafond local reste seul juge.
+    ``[]`` est une information explicite (« aucun effort »), distincte de
+    ``None`` (« je ne sais pas »).
     """
+    try:
+        from config import live_models
+
+        return live_models.effort_levels(model)
+    except Exception:  # pragma: no cover — config absente (tests isolés)
+        return None
+
+
+def _config_allowed_variants(model):
+    """Ancienne source : table ``thinking.reasoning_options`` (config.yaml)."""
     table = _yaml_get("thinking", OPTIONS_KEY, default=None)
     if not isinstance(table, dict) or not table:
         return None
@@ -172,22 +182,44 @@ def get_allowed_variants(model):
     return _normalize_variants(table.get("default"))
 
 
-def clamp_effort_to_allow_list(level, model):
-    """Ramène ``level`` dans l'allow-list de ``model`` — si le flag est armé.
+def get_allowed_variants(model):
+    """Variantes autorisées pour ``model`` (catalogue vivant, sinon config).
 
-    - Flag à ``false`` ⇒ ``level`` rendu **inchangé** (comportement d'origine).
-    - Aucune entrée pour ce modèle ⇒ inchangé (le plafond local suffit).
-    - ``None``, ``none``/``off``, niveau hors ``effort_order`` ⇒ inchangé
-      (ce n'est pas à cette couche de valider la demande du client).
-    - Sinon : plus grande autorisée ≤ demandée ; à défaut, la plus petite
+    Le catalogue officiel gagne dès qu'il déclare des niveaux ``effort`` : la
+    table locale devient un filet pour les ids qu'il ne connaît pas encore.
+    ``None`` n'est **pas** un défaut : il dit « aucune information ».
+    """
+    live = _live_variants(model)
+    if live is not None:
+        return live or None
+    return _config_allowed_variants(model)
+
+
+def clamp_effort_to_allow_list(level, model):
+    """Ramène ``level`` dans l'allow-list de ``model``.
+
+    [LIVE-EFFORT] Le catalogue vivant est appliqué **sans flag** : il décrit
+    ce que l'amont accepte réellement, pas une préférence locale. La table
+    ``thinking.reasoning_options`` et son flag historique ne servent plus que
+    de repli quand le catalogue ne connaît pas le modèle.
+
+    - Catalogue muet + flag à ``false`` ⇒ ``level`` inchangé (comportement
+      d'origine, bit pour bit) ;
+    - catalogue explicite ``[]`` ⇒ aucun clamp (raisonnement toujours actif) ;
+    - ``None``, ``none``/``off``, niveau hors ``effort_order`` ⇒ inchangé ;
+    - sinon : plus grande autorisée ≤ demandée ; à défaut, la plus petite
       autorisée connue de l'ordre total.
     """
-    if not allow_list_enabled():
-        return level
     if level is None:
         return level
 
-    allowed = get_allowed_variants(model)
+    live = _live_variants(model)
+    if live is None:
+        if not allow_list_enabled():
+            return level
+        allowed = _config_allowed_variants(model)
+    else:
+        allowed = live
     if not allowed:
         return level
 

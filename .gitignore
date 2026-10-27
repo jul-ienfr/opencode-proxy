@@ -22,6 +22,8 @@ logs/requests.db.*
 logs/quota_reset_capture/
 logs/boot.out
 logs/free_pool.json
+logs/live_models.json
+logs/live_models.json.tmp
 logs/*.lock.pid
 _research/
 config.yaml.*.bak*

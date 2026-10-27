@@ -255,6 +255,83 @@ def detect_free_ids(payloads: list) -> set:
 _detect_free_ids = detect_free_ids
 
 
+def model_ids_from_payload(payload: Any) -> set[str]:
+    """Ids d'un payload ``GET /models`` (OpenAI : ``{"data": [{"id": ...}]}``)."""
+    ids: set[str] = set()
+    if not isinstance(payload, dict):
+        return ids
+    data = payload.get("data")
+    if not isinstance(data, list):
+        return ids
+    for row in data:
+        if not isinstance(row, dict):
+            continue
+        mid = row.get("id")
+        if isinstance(mid, str) and mid.strip():
+            ids.add(mid.strip())
+    return ids
+
+
+def fetch_models_index_sync(
+    urls_by_leg: dict[str, str],
+    *,
+    timeout: float = 12.0,
+    proxy: str = "",
+    log=logger,
+) -> tuple[dict[str, set], str, dict[str, str]]:
+    """Relève les ids *réellement annoncés* par chaque jambe opencode.
+
+    Retourne ``(ids_par_jambe, source, erreurs_par_jambe)``. Une jambe en
+    échec est absente du premier dict : l'appelant la conserve depuis son
+    dernier relevé et marque l'instantané comme partiel (jamais de suppression
+    sur un relevé incomplet).
+
+    Pas de retry ici : la boucle live repasse à intervalle court. Le but est
+    de refléter vite l'amont, pas de bloquer un cycle sur un 5xx transitoire.
+    """
+    out: dict[str, set] = {}
+    errors: dict[str, str] = {}
+    sources: list[str] = []
+    if not urls_by_leg:
+        return out, "none", errors
+    for leg, url in urls_by_leg.items():
+        if not isinstance(url, str) or not url.strip():
+            errors[str(leg)] = "url absente"
+            continue
+        try:
+            data = None
+            try:
+                import httpx as _httpx
+
+                kwargs: dict[str, Any] = {"timeout": timeout}
+                if proxy:
+                    kwargs["proxy"] = proxy
+                with _httpx.Client(**kwargs) as client:
+                    resp = client.get(
+                        url, headers={"User-Agent": "opencode-proxy/live-models"}
+                    )
+                if resp.status_code != 200:
+                    raise RuntimeError(f"HTTP {resp.status_code}")
+                data = resp.json()
+            except ImportError:
+                import urllib.request as _urlreq
+
+                req = _urlreq.Request(
+                    url, headers={"User-Agent": "opencode-proxy/live-models"}
+                )
+                with _urlreq.urlopen(req, timeout=timeout) as resp:  # noqa: S310
+                    data = json.loads(resp.read().decode("utf-8"))
+            ids = model_ids_from_payload(data)
+            if not ids:
+                raise RuntimeError("aucun id dans la réponse")
+            out[str(leg)] = ids
+            sources.append(url)
+        except Exception as exc:
+            errors[str(leg)] = f"{type(exc).__name__}: {exc}"
+            log.debug("[live-models] fetch %s failed: %s", leg, exc)
+    return out, "|".join(sources) if sources else "none", errors
+
+
 def fetch_free_models_sync(
     timeout: float = 10,
     *,
@@ -410,6 +487,7 @@ def apply_discovered_free_models(
     lock=None,
     log=logger,
     purged_ids: set | frozenset = frozenset(),
+    blocked_ids: set | frozenset = frozenset(),
 ) -> tuple[int, list | None]:
     """Apply discovered free_ids to MODELS/FREE_MODEL_MAP/FREE_MODEL_POOL.
 
@@ -417,6 +495,9 @@ def apply_discovered_free_models(
     Otherwise mutates models (add missing free_ids with endpoint/protocol),
     free_models in-place, and free_model_map add-only
     (paid → paid-free homonyme). Thread-safe via lock if available.
+
+    ``blocked_ids`` : ids retirés par le relevé vivant (dépréciés/absents).
+    La découverte free est add-only et ne doit pas les ressusciter.
 
     Retourne (added, sorted_pool) — l'hôte réassigne son global
     FREE_MODEL_POOL (rebind historique préservé) ; sorted_pool est None
@@ -426,6 +507,7 @@ def apply_discovered_free_models(
     if not isinstance(free_ids, set):
         free_ids = set(free_ids)
     purged = _normalize_ids(purged_ids)
+    blocked = _normalize_ids(blocked_ids)
     if purged:
         _purged_hits = free_ids & purged
         if _purged_hits:
@@ -434,6 +516,14 @@ def apply_discovered_free_models(
                 ", ".join(sorted(_purged_hits)),
             )
         free_ids -= purged
+    if blocked:
+        _blocked_hits = free_ids & blocked
+        if _blocked_hits:
+            log.info(
+                "[free-discovery] live-retired ids kept out of the anonymous pool: %s",
+                ", ".join(sorted(_blocked_hits)),
+            )
+        free_ids -= blocked
     if go_only_ids:
         _go_only_hits = {f for f in free_ids if str(f).lower() in go_only_ids}
         if _go_only_hits:
@@ -453,6 +543,15 @@ def apply_discovered_free_models(
                 _mid,
             )
         free_models -= purged
+    if blocked:
+        for _mid in sorted(blocked & set(models)):
+            models.pop(_mid, None)
+            log.info(
+                "[free-discovery] live-retired id %s dropped from models "
+                "(déprécié/absent du relevé vivant)",
+                _mid,
+            )
+        free_models -= blocked
     if free_ids == free_models:
         for _fid in sorted(free_ids):
             if "muse" in _fid.lower() or "spark" in _fid.lower():
@@ -548,11 +647,13 @@ def persist_free_mappings(
     save_yaml_fn: Callable[[], None],
     log=logger,
     purged_ids: set | frozenset = frozenset(),
+    blocked_ids: set | frozenset = frozenset(),
 ) -> None:
     """Merge add-only free mappings into config.yaml (atomic tmp+fsync+replace under lock)."""
     if not auto_persist:
         return
     purged = _normalize_ids(purged_ids)
+    blocked = _normalize_ids(blocked_ids)
     try:
         # Ensure sections exist
         if "free_model_map" not in yaml_data or not isinstance(
@@ -563,6 +664,8 @@ def persist_free_mappings(
             yaml_data["models"] = {}
         # Merge FREE_MODEL_MAP add-only
         for k, v in free_model_map.items():
+            if k in blocked or v in blocked:
+                continue
             if k not in yaml_data["free_model_map"]:
                 yaml_data["free_model_map"][k] = v
         # Purge tombstonée : un id retiré à la main de `models:` ne doit jamais
@@ -574,9 +677,15 @@ def persist_free_mappings(
                 "[free-discovery] purged id %s dropped from config models: (retiré à la main)",
                 _mid,
             )
+        for _mid in sorted(blocked & set(yaml_data["models"])):
+            yaml_data["models"].pop(_mid, None)
+            log.info(
+                "[free-discovery] live-retired id %s dropped from config models",
+                _mid,
+            )
         # Merge MODELS add-only (only free ids or newly discovered)
         for mid, cfg in models.items():
-            if mid in purged:
+            if mid in purged or mid in blocked:
                 continue
             if mid not in yaml_data["models"]:
                 # Persist minimal protocol hint

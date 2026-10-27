@@ -72,9 +72,39 @@ def get_effort_caps() -> dict:
     return dict(raw) if isinstance(raw, dict) else {}
 
 
+def _live_effort_levels(model) -> list | None:
+    """Niveaux d'effort déclarés par le catalogue vivant, ou ``None``.
+
+    ``None`` = aucune information (catalogue vide/inaccessible ou modèle
+    inconnu) → la config historique reste juge. ``[]`` = le catalogue dit
+    explicitement qu'il n'y a pas d'effort : on ne fabrique pas de plafond.
+    """
+    try:
+        from config import live_models as _live
+
+        return _live.effort_levels(model)
+    except Exception:  # pragma: no cover — config absente (tests isolés)
+        return None
+
+
 def get_max_effort_for_model(model) -> str:
-    """Plafond d'effort pour un modèle (matching longest-prefix, insensible casse)."""
+    """Plafond d'effort pour un modèle (catalogue vivant, puis config).
+
+    [LIVE-EFFORT] Le catalogue officiel est la source de vérité dès qu'il
+    déclare des niveaux ``effort`` pour le modèle : un modèle qui n'expose que
+    ``high`` ne doit jamais être annoncé avec ``max``, et un modèle qui expose
+    ``max`` ne doit pas rester plafonné à ``high`` par une table manuelle
+    devenue stale. La table ``thinking.effort_caps`` reste le filet pour les
+    modèles absents du catalogue (internes, ids tout juste sortis).
+    """
     order = get_effort_order()
+    levels = _live_effort_levels(model)
+    if levels:
+        known = [str(level).strip().lower() for level in levels]
+        known = [level for level in known if level in order]
+        if known:
+            return max(known, key=order.index)
+
     caps = get_effort_caps()
 
     def _valid_cap(value) -> str | None:
@@ -112,6 +142,8 @@ def clamp_effort(effort, model):
     """Relegue l'effort demandé au plafond du modèle. Retourne None si désactivé.
 
     - ``None``/``""``/``"none"`` (insensible casse) → ``None`` (raisonnement désactivé).
+    - Catalogue vivant sans option ``effort`` → ``None`` (ne pas envoyer un
+      champ que l'amont n'expose pas).
     - Niveau inconnu (hors ``effort_order``) → inchangé (robustesse forward).
     - Sinon ``min(demandé, cap(modèle))`` sur l'ordre ; en-dessous du cap → inchangé.
     """
@@ -120,6 +152,13 @@ def clamp_effort(effort, model):
     level = str(effort).strip().lower()
     if level in _DISABLED:
         return None
+    try:
+        from config import live_models as _live
+
+        if _live.effort_supported(model) is False:
+            return None
+    except Exception:  # pragma: no cover — config absente (tests isolés)
+        pass
     order = get_effort_order()
     if level not in order:
         return effort

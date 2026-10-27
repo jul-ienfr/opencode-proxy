@@ -819,6 +819,10 @@ def _persist_vpn_config(updates: dict):
                 # no container effect (read per-request via IP_ROTATION.get),
                 # persisted so the GUI selection survives a restart.
                 "max_free_attempts": "max_free_attempts",
+                # [GUI « Essais gratuits / requête »] Auto = budget dérivé du
+                # nombre de stations (comportement historique) ; false = la
+                # valeur 1-3 du sélecteur est réellement appliquée.
+                "auto_max_free_attempts": "auto_max_free_attempts",
                 "free_exception_fallback": "free_exception_fallback",
                 # [Axe 3.1] socks5 backend (static proxy list, auto-rotate toggle,
                 # NordVPN country API, custom .ovpn file) — all persisted config.
@@ -831,6 +835,10 @@ def _persist_vpn_config(updates: dict):
                 "ovpn_endpoint_port": "ovpn_endpoint_port",
                 "auto_hetero_boot": "auto_hetero_boot",
                 "on_429_action": "on_429_action",
+                # `station_bad_ttl_s` = cooldown station en SECONDES (GUI
+                # « Cooldown (s) »). `bad_ttl` reste le TTL fast-pin en
+                # MINUTES : les deux unités ne doivent plus être confondues.
+                "station_bad_ttl_s": "station_bad_ttl_s",
                 "bad_ttl": "bad_ttl",
                 # [phase 1] qui choisit les serveurs VPN : proxy | gluetun.
                 "server_pick_mode": "server_pick_mode",
@@ -1009,6 +1017,132 @@ def _persist_vpn_config(updates: dict):
     except Exception as e:
         _debug(f"  [vpn] failed to persist config: {e}")
         return f"persist config.yaml échoué: {type(e).__name__}: {e}"
+    return None
+
+
+_RETRY_UNTIL_SUCCESS_DEFAULTS = {
+    "enabled": False,
+    "max_wait_s": 900,
+    "base_delay_s": 1.0,
+    "max_delay_s": 60.0,
+    "keepalive_interval_s": 10,
+    "buffer_max_bytes": 10485760,
+}
+
+
+def _retry_until_success_config() -> dict:
+    """Vue effective de `retry_until_success` (défauts inclus)."""
+    try:
+        from config import settings as _st
+
+        raw = _st._yaml_data.get("retry_until_success")
+    except Exception:
+        raw = None
+    cfg = dict(_RETRY_UNTIL_SUCCESS_DEFAULTS)
+    if isinstance(raw, dict):
+        cfg.update(raw)
+    return cfg
+
+
+def _write_config_yaml_atomic(config: dict, config_path: str) -> None:
+    """Écriture atomique config.yaml (tempfile + fsync + replace)."""
+    import tempfile
+
+    import yaml
+
+    dir_name = os.path.dirname(config_path) or "."
+    fd, tmp_path = tempfile.mkstemp(dir=dir_name, prefix=".config.yaml.tmp.")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            yaml.dump(config, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                pass
+        os.replace(tmp_path, config_path)
+    finally:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+
+
+def _persist_retry_until_success(updates: dict) -> str | None:
+    """Persiste `retry_until_success` (top-level) + met à jour le miroir.
+
+    Le middleware lit `config.settings._yaml_data` à chaque requête : la
+    mutation en place suffit pour un hot-reload sans redémarrage.
+    """
+    if not isinstance(updates, dict):
+        return "retry_until_success doit être un objet"
+    import yaml
+
+    config_path = __CONFIG_YAML_PATH
+    if not os.path.exists(config_path):
+        return f"config.yaml introuvable: {config_path}"
+    with _persist_lock:
+        try:
+            with open(config_path, encoding="utf-8") as f:
+                config = yaml.safe_load(f) or {}
+        except Exception as e:
+            return f"lecture config.yaml échouée: {type(e).__name__}: {e}"
+        current = config.get("retry_until_success")
+        current = dict(current) if isinstance(current, dict) else {}
+        merged = {**_RETRY_UNTIL_SUCCESS_DEFAULTS, **current, **updates}
+        # Bornes de sécurité — mêmes valeurs que RetryPolicy.
+        try:
+            merged["enabled"] = bool(merged.get("enabled", False))
+        except Exception:
+            merged["enabled"] = False
+        try:
+            merged["max_wait_s"] = max(0.0, min(86400.0, float(merged.get("max_wait_s", 900))))
+        except (TypeError, ValueError):
+            merged["max_wait_s"] = 900.0
+        try:
+            merged["base_delay_s"] = max(0.05, min(300.0, float(merged.get("base_delay_s", 1.0))))
+        except (TypeError, ValueError):
+            merged["base_delay_s"] = 1.0
+        try:
+            merged["max_delay_s"] = max(
+                float(merged["base_delay_s"]),
+                min(3600.0, float(merged.get("max_delay_s", 60.0))),
+            )
+        except (TypeError, ValueError):
+            merged["max_delay_s"] = max(float(merged["base_delay_s"]), 60.0)
+        try:
+            merged["keepalive_interval_s"] = max(
+                1.0, min(120.0, float(merged.get("keepalive_interval_s", 10)))
+            )
+        except (TypeError, ValueError):
+            merged["keepalive_interval_s"] = 10.0
+        try:
+            merged["buffer_max_bytes"] = max(
+                1024, min(64 * 1024 * 1024, int(merged.get("buffer_max_bytes", 10485760)))
+            )
+        except (TypeError, ValueError):
+            merged["buffer_max_bytes"] = 10485760
+        if merged == current:
+            return None
+        config["retry_until_success"] = merged
+        try:
+            _write_config_yaml_atomic(config, config_path)
+        except Exception as e:
+            return f"écriture config.yaml échouée: {type(e).__name__}: {e}"
+        try:
+            from config import settings as _st
+
+            _st._yaml_data["retry_until_success"] = dict(merged)
+            _st._config_yaml_mtime = _config_yaml_mtime()
+        except Exception:
+            pass
+        try:
+            global _config_yaml_known_mtime
+            _config_yaml_known_mtime = _config_yaml_mtime()
+        except Exception:
+            pass
+        _debug(f"  [retry] config persisted: {merged}")
     return None
 
 
@@ -1829,7 +1963,7 @@ def register_dashboard(
                 "via_vpn": bool(wf_via),
                 "on_error": wf_onerr,
             },
-            "available_models": sorted(MODELS.keys()),
+            "available_models": sorted(list(MODELS.keys())),
             "modes": ["duckduckgo", "model", "ddg_then_model", "model_then_ddg"],
             "web_fetch_modes": ["direct", "model", "direct_then_model"],
             "native_models": WEB_SEARCH_NATIVE_MODELS,
@@ -1954,7 +2088,7 @@ def register_dashboard(
             "enabled": bool(yaml_get("web_fetch", "enabled", True)),
             "via_vpn": bool(yaml_get("web_fetch", "via_vpn", False)),
             "on_error": yaml_get("web_fetch", "on_error", "strip"),
-            "available_models": sorted(MODELS.keys()),
+            "available_models": sorted(list(MODELS.keys())),
             "modes": ["direct", "model", "direct_then_model"],
             "native_models": WEB_SEARCH_NATIVE_MODELS,
         }
@@ -3319,6 +3453,47 @@ def register_dashboard(
             "trackers": trackers,
         }
 
+    @app.get("/api/retry-config")
+    async def get_retry_config():
+        """Retry transparent : configuration effective (défauts inclus)."""
+        return _retry_until_success_config()
+
+    @app.post("/api/retry-config")
+    async def update_retry_config(request: Request):
+        """Active/désactive le retry transparent et règle sa fenêtre."""
+        err = _check_dashboard_token(request)
+        if err:
+            return err
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse(status_code=400, content={"error": "JSON invalide"})
+        if not isinstance(body, dict):
+            return JSONResponse(status_code=400, content={"error": "objet JSON attendu"})
+        updates: dict = {}
+        for key in (
+            "enabled",
+            "max_wait_s",
+            "base_delay_s",
+            "max_delay_s",
+            "keepalive_interval_s",
+            "buffer_max_bytes",
+        ):
+            if key in body:
+                updates[key] = body[key]
+        if "enabled" in updates:
+            raw = updates["enabled"]
+            if isinstance(raw, str):
+                updates["enabled"] = raw.strip().lower() in ("1", "true", "yes", "on")
+            else:
+                updates["enabled"] = bool(raw)
+        if not updates:
+            return _retry_until_success_config()
+        persist_err = _persist_retry_until_success(updates)
+        if persist_err:
+            return JSONResponse(status_code=400, content={"error": persist_err})
+        return _retry_until_success_config()
+
     @app.get("/api/vpn-config")
     async def get_vpn_config():
         """Get current VPN configuration."""
@@ -3390,6 +3565,21 @@ def register_dashboard(
                 body["max_free_attempts"] = max(1, min(3, int(body["max_free_attempts"])))
             except (TypeError, ValueError):
                 return {"error": "max_free_attempts doit être un entier entre 1 et 3"}
+        # [GUI « Essais gratuits / requête »] Le sélecteur doit être effectif :
+        # auto=false active réellement max_free_attempts (1-3). Sans ce flag,
+        # effective_free_max_attempts() dérive du nombre de stations et ignore
+        # silencieusement le choix de l'opérateur.
+        if "auto_max_free_attempts" in body:
+            _raw_auto = body["auto_max_free_attempts"]
+            if isinstance(_raw_auto, str):
+                body["auto_max_free_attempts"] = _raw_auto.strip().lower() in (
+                    "1",
+                    "true",
+                    "yes",
+                    "on",
+                )
+            else:
+                body["auto_max_free_attempts"] = bool(_raw_auto)
         if "free_exception_fallback" in body:
             if str(body["free_exception_fallback"]) not in ("station-first", "direct"):
                 return {"error": "free_exception_fallback doit être 'station-first' ou 'direct'"}
@@ -3412,7 +3602,7 @@ def register_dashboard(
                     content={"error": "server_pick_mode doit être 'proxy' ou 'gluetun'"},
                 )
             body["server_pick_mode"] = _v
-        # bad_ttl — conditional cooldown duration for both/cooldown, 1..3600s
+        # bad_ttl — legacy host fast-pin TTL (minutes) ; conservé pour compat.
         if "bad_ttl" in body or "cooldown_sec" in body or "badTtl" in body:
             _raw_bt = body.pop("bad_ttl", body.pop("cooldown_sec", body.pop("badTtl", None)))
             try:
@@ -3422,6 +3612,24 @@ def register_dashboard(
             if not (1 <= _bt <= 3600):
                 return JSONResponse(status_code=400, content={"error": "bad_ttl doit être un entier entre 1 et 3600"})
             body["bad_ttl"] = _bt
+        # [GUI « Cooldown (s) »] Clé dédiée au bad-mark station, en SECONDES.
+        # L'ancien GUI écrivait bad_ttl (minutes côté fast-pin) : dès que
+        # station_bad_ttl_s existait dans config.yaml, le réglage n'avait plus
+        # aucun effet sur le cooldown station.
+        if "station_bad_ttl_s" in body:
+            try:
+                _sbt = int(float(body["station_bad_ttl_s"]))
+            except (TypeError, ValueError):
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": "station_bad_ttl_s doit être un entier entre 1 et 3600"},
+                )
+            if not (1 <= _sbt <= 3600):
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": "station_bad_ttl_s doit être un entier entre 1 et 3600"},
+                )
+            body["station_bad_ttl_s"] = _sbt
 
         # [GUI toggle « Cooldown latence »] validation minimale du bloc imbriqué
         # latency_rotation (scope: le booléen enabled — les autres clés restent

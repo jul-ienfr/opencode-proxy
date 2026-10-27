@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 ### Added
+- [2026-10-27] Catalogue vivant `live_models` : ajout automatique des modèles annoncés par `/models` (deux jambes), retrait des modèles dépréciés/absents, migration vers la jambe active
+- [2026-10-27] `GET /v1/models` compatible Anthropic Models API (`capabilities.effort`, `thinking`, limites) ; `max.supported` reflète réellement le catalogue
+- [2026-10-27] Notices clients pour les modèles retirés : `410` explicite, en-têtes `X-OpenCode-Model-Deprecated` / `X-OpenCode-Notice`, mémorisées 7 jours
+- [2026-10-27] Pop-up dashboard + événement SSE `models_updated` lors d'un ajout/retrait/dépréciation, avec rattrapage par `revision`
 - [2026-10-26] Roadmap stations/IP : `ops/health.py`, `ops/fleet.py`, `ops/jobs.py`, `ops/updater.py`, `free/quality.py`, `free/probe.py`, `free/selector.py`
 - [2026-10-26] Sélection par score mesuré (latence/succès/quota/charge/stabilité) + sonde active sans quota
 - [2026-10-26] API flotte : start/stop/restart/connect/disconnect par station, jobs 202, snapshot read-only
