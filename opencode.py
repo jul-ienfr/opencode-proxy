@@ -10666,7 +10666,10 @@ async def _hedged_fetch(cands, body: dict, headers: dict, endpoint: str, forced_
 
     # helper to fetch one candidate
     async def _one(station):
-        return await _do_free_request_curl_cffi(body, headers, station.socks5_url, station=station, endpoint=endpoint)
+        async with _free_model_slot(str(body.get("model") or ""), station):
+            return await _do_free_request_curl_cffi(
+                body, headers, station.socks5_url, station=station, endpoint=endpoint
+            )
 
     tasks = {}
     # launch primary immediately
@@ -11000,6 +11003,10 @@ class _CurlCffiStreamResponse:
         self._ttfb_ms: int | None = None
         self._first_chunk_seen = False
         self._free_ip = ""
+        # [reliability P0] Jeton de concurrence (modèle, station/IP) rendu
+        # à la fermeture du flux — jamais avant, sinon la rafale revient.
+        self._slot_token = None
+        self._slot_pool = None
         # [P0.2] Watchdog premier octet : un flux free qui n'a rien produit
         # après N secondes est annulé AVANT le premier octet (retry sûr).
         try:
@@ -11033,7 +11040,7 @@ class _CurlCffiStreamResponse:
             sid = int(getattr(station, "_station", 0) or 0)
             ip = self._free_ip or str((_current_free_attempt.get() or {}).get("ip") or "")
             eng.record_request(sid, ip, ttfb_ms, model, self.status_code)
-            _record_station_quality(station, ip, ttfb_ms, self.status_code)
+            _record_station_quality(station, ip, ttfb_ms, self.status_code, model=model)
         except Exception:
             pass
 
@@ -11053,6 +11060,7 @@ class _CurlCffiStreamResponse:
                 self._first_byte_timeout_s * 1000.0,
                 504,
                 latency=False,
+                model=str(self._ttfb_ctx[2] or ""),
             )
         except Exception:
             pass
@@ -11122,7 +11130,17 @@ class _CurlCffiStreamResponse:
         return await self._resp.acontent()
 
     async def aclose(self):
-        await self._resp.aclose()
+        try:
+            await self._resp.aclose()
+        finally:
+            token = self._slot_token
+            self._slot_token = None
+            pool = self._slot_pool
+            if token is not None and pool is not None and hasattr(pool, "release_model_slot"):
+                try:
+                    pool.release_model_slot(token)
+                except Exception:
+                    pass
 
 
 class _FreeTunnelFailure(Exception):
@@ -11298,6 +11316,42 @@ def _free_proxy_mode() -> str:
 def _free_attempts_active(forced_pool=None) -> bool:
     """Free re-strike budget is active (>1 attempt or station-first)."""
     return effective_free_max_attempts(forced_pool) > 1 or _free_exception_fallback_mode() == "station-first"
+
+
+@asynccontextmanager
+async def _free_model_slot(model: str, station):
+    """[reliability P0] Porte de concurrence par (modèle, station/IP).
+
+    Fail-open si le pool ne l'implémente pas (doubles de test, boot) : la
+    disponibilité ne dépend jamais de cette optimisation.
+    """
+    pool = _free_ip_pool
+    if pool is not None and hasattr(pool, "model_slot"):
+        async with pool.model_slot(model, station):
+            yield
+    else:
+        yield
+
+
+async def _acquire_free_model_slot(model: str, station):
+    pool = _free_ip_pool
+    if pool is not None and hasattr(pool, "acquire_model_slot"):
+        try:
+            return await pool.acquire_model_slot(model, station)
+        except Exception:
+            return None
+    return None
+
+
+def _release_free_model_slot(token) -> None:
+    if token is None:
+        return
+    pool = _free_ip_pool
+    if pool is not None and hasattr(pool, "release_model_slot"):
+        try:
+            pool.release_model_slot(token)
+        except Exception:
+            pass
 
 
 def _stream_hedge_enabled() -> bool:
@@ -11608,7 +11662,7 @@ async def _open_free_stream(
         elif count_request:
             try:
                 proxy_url, station = await _free_ip_pool.on_request(
-                    forced_pool, excluded=_dead_stations
+                    forced_pool, excluded=_dead_stations, model=_free_model_name
                 )
             except TypeError:
                 try:
@@ -11670,6 +11724,8 @@ async def _open_free_stream(
                     f"(proxy_mode={_free_proxy_mode()}) → no direct stream, caller retries/paid"
                 )
                 raise _FreeTunnelFailure(station, RuntimeError("no usable VPN station"))
+        _slot_token = None
+        _wrapped_stream = None
         if proxy_url:
             try:
                 station = station or (_free_ip_pool.active_station if proxy_url else None)
@@ -11722,6 +11778,9 @@ async def _open_free_stream(
                 # après restitution — sémantique inchangée, parallélisme OK.
                 try:
                     _debug(f"  [free-stream] posting to {endpoint} (pooled)")
+                    _slot_token = await _acquire_free_model_slot(
+                        _free_model_name or str(body.get("model") or ""), station
+                    )
                     _t0_ttfb = time.monotonic()
                     resp = await slot2.sess.post(
                         endpoint,
@@ -11733,13 +11792,23 @@ async def _open_free_stream(
                     # [P2.1] éviction différée : close réel au lieu du
                     # discard (socket qui fuyait à chaque stop client en stream).
                     _evict_later(pool2, slot2)
+                    _release_free_model_slot(_slot_token)
+                    _slot_token = None
                     raise
                 except BaseException:
                     _evict_later(pool2, slot2)
+                    _release_free_model_slot(_slot_token)
+                    _slot_token = None
                     raise
                 await pool2.checkin(slot2)
                 _debug(f"  [free-stream] response status={resp.status_code}")
                 wrapped = _CurlCffiStreamResponse(resp)
+                _wrapped_stream = wrapped
+                # Le jeton est rendu par aclose() : le flux garde sa place
+                # (modèle, station/IP) tant qu'il est vivant.
+                wrapped._slot_token = _slot_token
+                wrapped._slot_pool = _free_ip_pool
+                _slot_token = None
                 # [v10 §3.6.1 Lot 5] TTFB streaming : la 1ʳᵉ lecture du
                 # consommateur recordera la mesure au moteur.
                 wrapped._ttfb_ctx = (
@@ -11790,6 +11859,15 @@ async def _open_free_stream(
                     # pooled session stays open (don't close)
                 return
             except Exception as e:
+                # [reliability P0] Ne jamais laisser un jeton de concurrence
+                # orphelin si l'ouverture échoue avant le yield.
+                try:
+                    if _wrapped_stream is not None:
+                        await _wrapped_stream.aclose()
+                except Exception:
+                    pass
+                _release_free_model_slot(_slot_token)
+                _slot_token = None
                 # [plan 18/08 §1a] a REAL connection failure (dead SOCKS5
                 # tunnel) is invisible to the pool — the station stays
                 # "connected" and every request re-strikes it. Signal
@@ -12426,6 +12504,17 @@ def _free_min_retry_after(models) -> str:
                         rem = exp - now
                         if best is None or rem < best:
                             best = rem
+        # [reliability P0] Un backoff modèle global est un vrai délai de
+        # reprise : le Retry-After doit le refléter, pas rester vide.
+        try:
+            _pool = _free_ip_pool
+            if _pool is not None and hasattr(_pool, "model_global_remaining"):
+                for m in models or []:
+                    _rem = float(_pool.model_global_remaining(m) or 0.0)
+                    if _rem > 0 and (best is None or _rem < best):
+                        best = _rem
+        except Exception:
+            pass
         if best is None:
             return ""
         try:
@@ -12456,13 +12545,24 @@ async def _wait_for_fresh_free(models, timeout_s: float = 45.0, poll_s: float = 
     # Nudge ciblé : seules les stations mortes pour cette chaîne (les
     # saines gardent leur bonne IP — une rotation leur ferait perdre un
     # bucket vivant + coûterait un AUTH NordVPN pour rien).
-    if pool is not None and stations:
+    # [reliability P0] Une limite modèle globale (429 sur plusieurs IP) ne
+    # se répare pas en tournant : on attend sans brûler d'IP.
+    _global_wait = 0.0
+    try:
+        if pool is not None:
+            _global_wait = max((pool.model_global_remaining(m) for m in (models or [])), default=0.0)
+    except Exception:
+        _global_wait = 0.0
+    if pool is not None and stations and _global_wait <= 0:
         for st in stations:
             _dead_here = False
             try:
                 for m in models or []:
                     try:
                         if _free_trial_dead_active(m, st):
+                            _dead_here = True
+                            break
+                        if hasattr(pool, "model_ip_bad") and pool.model_ip_bad(m, st):
                             _dead_here = True
                             break
                     except Exception:
@@ -12777,6 +12877,11 @@ def _trial_dead_stations(free_model: str) -> set:
             if st is not None and (
                 _free_trial_dead_active(free_model, st)
                 or _free_cooldown_active(free_model, st)
+                or (
+                    pool is not None
+                    and hasattr(pool, "model_ip_bad")
+                    and pool.model_ip_bad(free_model, st)
+                )
             ):
                 dead.add(st)
         except Exception:
@@ -12815,13 +12920,18 @@ def _record_station_quality(
     status: int | None,
     *,
     latency: bool = True,
+    model: str = "",
 ) -> None:
     """Alimente le score qualité + le breaker superviseur (fail-soft total).
 
     ``latency=False`` pour un non-streaming : ``duration_ms`` est la durée
     totale du completion, pas un TTFB. Elle doit compter pour le succès/429
     mais pas pour la latence de la station (sinon une réponse longue passe
-    pour un tunnel lent)."""
+    pour un tunnel lent).
+
+    [reliability P0] ``model`` alimente la santé (modèle, IP) utilisée pour
+    distinguer une mauvaise IP d'un quota réellement consommé.
+    """
     try:
         sid = int(getattr(station, "_station", -1))
     except Exception:
@@ -12834,6 +12944,17 @@ def _record_station_quality(
         get_quality_registry().observe(sid, str(ip or "unknown"), float(duration_ms), status, latency=latency)
     except Exception:
         pass
+    try:
+        code = int(status or 0)
+    except (TypeError, ValueError):
+        code = 0
+    if model and 200 <= code < 300:
+        try:
+            pool = _free_ip_pool
+            if pool is not None and hasattr(pool, "note_model_ip"):
+                pool.note_model_ip(model, station, code, ip=str(ip or "unknown"))
+        except Exception:
+            pass
     try:
         import shared_state as _ss_q
 
@@ -12915,6 +13036,8 @@ def _free_stations_exhausted(free_model: str) -> bool:
     """
     if not _free_ip_pool:
         return True
+    if hasattr(_free_ip_pool, "model_global_remaining") and _free_ip_pool.model_global_remaining(free_model) > 0:
+        return True
     if getattr(_free_ip_pool, "socks5_mode", False):
         # [Axe 3.1] socks5 mode: the docker stations are inert — the usable
         # set is the enabled static proxies. No rotation can land a fresh
@@ -12922,7 +13045,9 @@ def _free_stations_exhausted(free_model: str) -> bool:
         # exemption below does not apply.
         for ep in _free_ip_pool._socks5_enabled_eps():
             if _free_ip_pool._socks5_usable(ep, exclude_approaching=False):
-                if not _free_cooldown_active(free_model, ep):
+                if not _free_cooldown_active(free_model, ep) and not (
+                    hasattr(_free_ip_pool, "model_ip_bad") and _free_ip_pool.model_ip_bad(free_model, ep)
+                ):
                     return False
         return True
     if not _free_ip_pool._stations:
@@ -12931,7 +13056,9 @@ def _free_stations_exhausted(free_model: str) -> bool:
         return False
     for st in _free_ip_pool._stations:
         if _free_ip_pool._station_usable(st, exclude_approaching=False):
-            if not _free_cooldown_active(free_model, st):
+            if not _free_cooldown_active(free_model, st) and not (
+                hasattr(_free_ip_pool, "model_ip_bad") and _free_ip_pool.model_ip_bad(free_model, st)
+            ):
                 return False
     return True
 
@@ -12992,6 +13119,14 @@ def _free_preflight_retry_after(model_id: str, *, min_wait: float = 5.0) -> floa
         base = None
     if not base:
         return None
+    # [reliability P0] Limite modèle globale : inutile d'ouvrir un flux pour
+    # rejouer les mêmes 429 ; le client reçoit un Retry-After honnête.
+    try:
+        _mg = pool.model_global_remaining(base) if hasattr(pool, "model_global_remaining") else 0.0
+        if _mg > 0:
+            return max(float(min_wait), _mg)
+    except Exception:
+        pass
     try:
         chain = _free_candidate_chain(model_id, base)
     except Exception:
@@ -12999,7 +13134,13 @@ def _free_preflight_retry_after(model_id: str, *, min_wait: float = 5.0) -> floa
     waits: list[float] = []
     for m in chain:
         for st in stations:
-            if not _free_cooldown_active(m, st):
+            _ip_block = 0.0
+            try:
+                if hasattr(pool, "model_ip_block_remaining"):
+                    _ip_block = pool.model_ip_block_remaining(m, st)
+            except Exception:
+                _ip_block = 0.0
+            if not _free_cooldown_active(m, st) and _ip_block <= 0:
                 return None
             # [audit 2026-10-30] A transient cooldown (5xx / "Endpoint is
             # unavailable") is not a quota exhaustion. The old preflight
@@ -13012,7 +13153,7 @@ def _free_preflight_retry_after(model_id: str, *, min_wait: float = 5.0) -> floa
                     return None
             except Exception:
                 pass
-            waits.append(_free_cooldown_remaining(m, st))
+            waits.append(max(_free_cooldown_remaining(m, st), _ip_block))
     if not waits:
         return None
     shortest = min(waits)
@@ -13104,6 +13245,34 @@ def _mark_free_stations_429(
         _scope = ""
     if stations is None:
         stations = [_free_attempt_station()]
+    pool = _free_ip_pool
+    # [reliability P0] Enregistre le 429 par (modèle, station, IP) AVANT
+    # toute décision : c'est ce qui distingue une IP mauvaise d'un quota.
+    if pool is not None and hasattr(pool, "note_model_ip"):
+        for station in stations:
+            if station is None:
+                continue
+            try:
+                pool.note_model_ip(free_model, station, 429)
+            except Exception:
+                pass
+        try:
+            _mg = pool.model_global_remaining(free_model)
+        except Exception:
+            _mg = 0.0
+        if _mg > 0:
+            _log(
+                f"  FREE {free_model!r} 429 sur plusieurs IP — limite modèle globale "
+                f"({_mg:.0f}s), rotations suspendues"
+            )
+            for station in stations:
+                if station is None:
+                    continue
+                try:
+                    _set_free_cooldown(free_model, min(max(1.0, _mg), 30.0), station, scope="transient")
+                except Exception:
+                    pass
+            return
     seen = set()
     for station in stations:
         if station is None or id(station) in seen:
@@ -13118,6 +13287,13 @@ def _mark_free_stations_429(
                 _td = _trial_dead_cooldown_seconds()
                 if _td > 0:
                     _cd_secs = max(_cd_secs, _td)
+            # Une IP à 0 succès est mauvaise, pas "quota consommé" : on ne
+            # l'écarte pas 13 h, on la remplace et on la reteste après TTL.
+            try:
+                if pool is not None and hasattr(pool, "model_ip_bad") and pool.model_ip_bad(free_model, station):
+                    _cd_secs = min(_cd_secs, 120.0)
+            except Exception:
+                pass
         else:
             _cd_secs = min(_free_429_cooldown_seconds(retry_after), 30.0)
         if _action_429 != "rotate":
@@ -13692,7 +13868,7 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
         _hedge_pre = False
     if _free_ip_pool and _free_ip_pool.enabled and not _hedge_pre:
         try:
-            _, station = await _free_ip_pool.on_request(forced_pool)
+            _, station = await _free_ip_pool.on_request(forced_pool, model=free_model)
         except TypeError:
             _, station = await _free_ip_pool.on_request()
         vpn = station or _vpn_manager
@@ -13961,13 +14137,14 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
             _free_used += 1
             _free_elapsed = int((time.monotonic() - t0) * 1000)
             try:
-                resp = await _do_free_request_curl_cffi(
-                    free_body,
-                    free_headers,
-                    attempt.socks5_url,
-                    station=attempt,
-                    endpoint=free_endpoint,
-                )
+                async with _free_model_slot(free_model, attempt):
+                    resp = await _do_free_request_curl_cffi(
+                        free_body,
+                        free_headers,
+                        attempt.socks5_url,
+                        station=attempt,
+                        endpoint=free_endpoint,
+                    )
                 if attempt.current_ip:
                     free_ip = attempt.current_ip
                 elif getattr(attempt, "pid", None):
@@ -14029,6 +14206,17 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
                         _last_body = ""
                     _last_tunnel_exc = None
                     resp = None
+                    # [reliability P0] 429 sur plusieurs IP = limite modèle
+                    # globale : arrêter d'essayer les stations restantes.
+                    try:
+                        if (
+                            _free_ip_pool is not None
+                            and hasattr(_free_ip_pool, "model_global_remaining")
+                            and _free_ip_pool.model_global_remaining(free_model) > 0
+                        ):
+                            break
+                    except Exception:
+                        pass
                     try:
                         _dly = _free_retry_delay_seconds(_free_used)
                         if _dly > 0:
@@ -14383,6 +14571,7 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
                 float(elapsed_ms),
                 resp.status_code,
                 latency=False,
+                model=free_model,
             )
             # [v10 §12.1.3] alerte proactive SSE : une lente avant le seuil
             if _dec.get("action") == "warn":
@@ -21476,12 +21665,23 @@ async def api_free_health():
     systemone = [name for name in free_routed if _is_systemone(name)]
     served = sorted(name for name in chat_routed if name in ok)
     unproven = sorted(name for name in chat_routed if name not in ok)
+    model_ip_health = []
+    model_global_backoff = []
+    try:
+        if _free_ip_pool is not None and hasattr(_free_ip_pool, "model_ip_status"):
+            model_ip_health = _free_ip_pool.model_ip_status(40)
+        if _free_ip_pool is not None and hasattr(_free_ip_pool, "model_global_status"):
+            model_global_backoff = _free_ip_pool.model_global_status()
+    except Exception:
+        model_ip_health, model_global_backoff = [], []
     return {
         "routed": len(free_routed),
         "served": served,
         "unproven": unproven,
         "systemone": systemone,
         "quotas": _free_quota_states(),
+        "model_ip_health": model_ip_health,
+        "model_global_backoff": model_global_backoff,
         "note": (
             "`unproven` = aucun succès observé depuis le démarrage : soit le "
             "modèle n'a pas été appelé, soit il est refusé en amont. Un 200 du "
@@ -25187,7 +25387,10 @@ async def _systemone_free_via_pool(endpoint: str, body: dict, headers: dict, for
             # un vieux double sans le paramètre lève TypeError → couvert par le except
             # ci-dessous (repli direct/fail-closed, jamais de crash).
             assert pool is not None
-            _, station = await pool.on_request(forced_pool)
+            try:
+                _, station = await pool.on_request(forced_pool, model=free_model)
+            except TypeError:
+                _, station = await pool.on_request(forced_pool)
         except Exception as e:
             _debug(f"  [systemone-free] on_request failed ({e}) → repli direct/fail-closed")
             station = None
@@ -25322,13 +25525,14 @@ async def _systemone_free_via_pool(endpoint: str, body: dict, headers: dict, for
             _free_used += 1
             _free_elapsed = int((time.monotonic() - t0) * 1000)
             try:
-                resp = await _do_free_request_curl_cffi(
-                    body,
-                    headers,
-                    attempt.socks5_url,
-                    station=attempt,
-                    endpoint=endpoint,
-                )
+                async with _free_model_slot(free_model, attempt):
+                    resp = await _do_free_request_curl_cffi(
+                        body,
+                        headers,
+                        attempt.socks5_url,
+                        station=attempt,
+                        endpoint=endpoint,
+                    )
             except Exception as e:
                 _debug(f"  [systemone-free] tunnel error (station {getattr(attempt, '_station', '?')}): {e}")
                 _last_tunnel_exc = e
@@ -25525,7 +25729,7 @@ async def _systemone_free_via_pool(endpoint: str, body: dict, headers: dict, for
             _st_lat = getattr(station, "_station", None) if isinstance(station, object) else None
             if _st_lat is not None:
                 _eng.record_request(int(_st_lat), str(free_ip or "direct"), float(_dead_ms), free_model, 502)
-                _record_station_quality(station, str(free_ip or "direct"), float(_dead_ms), 502)
+                _record_station_quality(station, str(free_ip or "direct"), float(_dead_ms), 502, model=free_model)
         except Exception as _e_lat:
             _debug(f"  [systemone-free] latency engine skip: {_e_lat}")
         raise UpstreamError(

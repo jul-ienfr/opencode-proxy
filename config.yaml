@@ -30,7 +30,7 @@ routing:
   aliases:
     nimo: mimo
 free_model_map:
-  mimo-v2.5: mimo-v2.6-flash-free
+  mimo-v2.5: deepseek-v4-flash-free
   qwen3.7-max: mimo-v2.6-flash-free
   glm-5.1: mimo-v2.6-flash-free
   kimi-k2.6: mimo-v2.6-flash-free
@@ -98,6 +98,7 @@ ip_rotation:
   auto_ov_return_min: 60
   auto_wg_egress_ticks: 20
   backoff_max_delay: 60
+  bad_ip_ttl_s: 1800
   bad_ttl: 10
   bad_ttl_by_cause:
     auth: 0
@@ -178,6 +179,11 @@ ip_rotation:
     stream_metric: ttfb
     window: 20
   max_free_attempts: 6
+  max_inflight_per_model_ip: 2
+  model_global_429_min_ips: 3
+  model_global_429_window_s: 60
+  model_global_cooldown_s: 60
+  model_slot_wait_s: 20
   on_429_action: both
   ov_auth_backoff_max_s: 600
   ov_auth_backoff_s: 90
@@ -188,7 +194,7 @@ ip_rotation:
   ov_auth_station_threshold: 5
   ov_auth_window_s: 1800
   ovpn_endpoint_port: ''
-  ovpn_protocol: tcp
+  ovpn_protocol: udp
   paid_hedge_after_ms: 0
   per_ip_identity: true
   pin_widen_auths: 8
@@ -215,7 +221,19 @@ ip_rotation:
     min_samples: 3
     trend_pct: 25.0
     ttfb_ceiling_ms: 8000
+  quota_ip_block_s: 120
   quota_per_ip: 500
+  quota_per_ip_by_model:
+    deepseek-v4-flash: 150
+    deepseek-v4-flash-free: 150
+    deepseek-v4.1-flash: 150
+    deepseek-v4.1-flash-free: 150
+    glm-5.3-flash-free: 8
+    jev-1.13-free: 150
+    mimo-v2.6-flash-free: 20
+    muse-spark-1.3-contributor-free: 150
+    nemotron-3.5-lightning-free: 40
+    nemotron-3.5-super-vl-free: 40
   recent_ip_max_age: 1800
   recent_ip_window: 20
   rotation_fail_cooldown: 60

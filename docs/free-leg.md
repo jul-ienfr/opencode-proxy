@@ -298,3 +298,25 @@ Le dashboard suit la même source : Configuration groupe Gratuit/Payant avec
 filtres et badges ; Modèles Gratuits affiche `detected` (découvert), `routed`
 (présent dans `MODELS`) et `served` (succès observé). « Détecté » n'implique ni
 « routé » ni « prouvé ».
+
+## 12. Santé par `(modèle, IP)` — même modèle, egress seulement
+
+La jambe free ne change **jamais** de modèle pour éviter un 429 : elle change
+d'IP. Le pool distingue désormais :
+
+* **IP mauvaise** : 429 avec 0 succès sur cette IP → quarantaine
+  (`ip_rotation.bad_ip_ttl_s`, 30 min par défaut), remplacement immédiat ;
+* **quota IP** : 429 après des succès → blocage court
+  (`quota_ip_block_s`), rotation de la station ;
+* **limite modèle globale** : 429 sur 3 IP distinctes en 60 s → arrêt des
+  rotations et backoff (`model_global_cooldown_s`) ; une IP neuve ne réglerait
+  rien ;
+* **seuil par modèle** : `ip_rotation.quota_per_ip_by_model` coupe avant le mur
+  réel (DeepSeek 150, au lieu du plafond global 500) ;
+* **concurrence** : au plus `max_inflight_per_model_ip` requêtes en vol par
+  couple `(modèle, station)` ; les autres attendent brièvement au lieu de
+  partir en rafale sur la même IP.
+
+La santé est visible dans `GET /api/free-health` (`model_ip_health`,
+`model_global_backoff`). Aucun test ne substitue un modèle : les contrats
+`tests/test_free_ip_reliability.py` vérifient uniquement l'egress.

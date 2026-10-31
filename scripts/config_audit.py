@@ -49,6 +49,7 @@ SECTIONS_DYNAMIQUES = {"models", "custom_routes", "free_model_map", "pricing"}
 # On ne les audite pas — sinon chaque nouveau modèle apparaît comme « clé morte ».
 CARTES_PAR_IDENTIFIANT = {
     "effort_caps",
+    "quota_per_ip_by_model",
     "min_tokens",
     "free_model_candidates",
     "policies",

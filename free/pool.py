@@ -33,9 +33,12 @@ import itertools
 import logging
 import math
 import random
+import threading
 import time
 import urllib.parse
 import weakref
+from collections import deque
+from contextlib import asynccontextmanager
 from typing import Any, cast
 
 from vpn.manager import RotationFailed, VPNManager, VPNState
@@ -443,6 +446,16 @@ class FreeIPPool:
         # `quality_rotation.max_per_hour`, en plus de l'anti-flap du moteur).
         self._quality_rotations: list[float] = []
         self._quality_rot_last_sid: dict[int, float] = {}
+        # [reliability P0] Santé par (modèle, station, IP) : distinguer une
+        # mauvaise IP (0 succès) d'un quota réellement consommé. Le pool ne
+        # change jamais de modèle ; il ne fait que choisir/protéger l'egress.
+        self._model_ip_health: dict[tuple[str, int, str], dict[str, Any]] = {}
+        self._model_429_events: dict[str, deque] = {}
+        self._model_global_until: dict[str, float] = {}
+        self._model_ip_lock = threading.Lock()
+        # [reliability P0] Porte de concurrence par (modèle, station/IP) :
+        # évite les rafales de 40 requêtes sur une IP déjà au mur.
+        self._model_slots: dict[tuple[str, int, int], asyncio.Semaphore] = {}
         # [review 18/08 F1a] Late-signal absorption window — SHORT on
         # purpose (20 s, NOT bad_ttl): long enough for the dial queue of a
         # request launched before a rotation (connect timeout 10 s +
@@ -663,7 +676,7 @@ class FreeIPPool:
             load = None
         return used, limit, load, inflight
 
-    def _rotation_threshold(self, station: VPNManager) -> int:
+    def _rotation_threshold(self, station: VPNManager, model: str | None = None) -> int:
         """Quota-per-IP at which a station should rotate (C3).
 
         Station N rotates ``rotation_stagger * (N - 1)`` requests earlier
@@ -678,8 +691,25 @@ class FreeIPPool:
         quota wall at a sane distance; the caller (``on_request``) routes a
         degenerate threshold (== 1) through the THROTTLED kick instead of
         the unthrottled dual-clutch launch — pacing rotations instead of
-        hot-looping them."""
+        hot-looping them.
+
+        [reliability P0] ``quota_per_ip`` is a global fallback. When the
+        caller knows the free model, use its measured profile
+        (``ip_rotation.quota_per_ip_by_model``) so DeepSeek rotates near its
+        real per-IP wall instead of the historical 500 guess.
+        """
         base = station._quota_per_ip
+        try:
+            _mid = str(model or "").strip().lower()
+            _profile = _yaml_get("ip_rotation", "quota_per_ip_by_model", {}) or {}
+            if _mid and isinstance(_profile, dict):
+                _raw = _profile.get(_mid)
+                if _raw is not None:
+                    _cap = int(_raw)
+                    if _cap > 0:
+                        base = min(base, _cap)
+        except Exception:
+            pass
         _qp = getattr(self, "_quality_preselection", None) or {}
         try:
             if _qp.get("enabled") and getattr(self, "quality", None) is not None:
@@ -711,6 +741,250 @@ class FreeIPPool:
         except Exception:
             pass
         return max(1, base - 10 - self._rotation_stagger * max(0, station._station - 1))
+
+    # ── [reliability P0] santé IP par modèle ─────────────────────────────
+    def _model_ip_state(
+        self, model: str, station, ip: str | None = None, *, now: float | None = None, create: bool = True
+    ) -> dict:
+        """État borné par (modèle, station, IP). Fail-soft, jamais bloquant."""
+        mid = str(model or "").strip().lower()
+        try:
+            sid = int(getattr(station, "_station", 0) or 0)
+        except (TypeError, ValueError):
+            sid = 0
+        if ip is None:
+            try:
+                ip = getattr(station, "current_ip", "") or getattr(station, "pid", "") or "unknown"
+            except Exception:
+                ip = "unknown"
+        key = (mid, sid, str(ip or "unknown"))
+        lock = getattr(self, "_model_ip_lock", None)
+        health = getattr(self, "_model_ip_health", None)
+        if not isinstance(health, dict):
+            health = {}
+            self._model_ip_health = health
+        if lock is None:
+            lock = threading.Lock()
+            self._model_ip_lock = lock
+        with lock:
+            st = health.get(key)
+            if not isinstance(st, dict):
+                if not create:
+                    return {}
+                st = {
+                    "ok": 0,
+                    "n429": 0,
+                    "consecutive_429": 0,
+                    "last_ok_at": 0.0,
+                    "last_429_at": 0.0,
+                    "blocked_until": 0.0,
+                    "last_status": None,
+                }
+                health[key] = st
+                while len(health) > 4096:
+                    health.pop(next(iter(health)))
+            if now is not None:
+                st["_test_now"] = float(now)
+            return st
+
+    def note_model_ip(self, model: str, station, status: int | None, *, ip: str | None = None) -> None:
+        """Enregistre un résultat réel pour un couple (modèle, IP).
+
+        Règles P0 :
+        * 200 : l'IP redevient saine, le compteur de 429 consécutifs repart à 0.
+        * 429 avec 0 succès : mauvaise IP → quarantaine longue (``bad_ip_ttl_s``).
+        * 429 après des succès : quota IP → blocage court, la station doit
+          tourner ; l'IP ne sera pas rejouée avant ``quota_ip_block_s``.
+        """
+        mid = str(model or "").strip().lower()
+        if not mid or station is None:
+            return
+        try:
+            now = time.monotonic()
+            st = self._model_ip_state(mid, station, ip, now=now)
+            code = int(status or 0)
+            with (getattr(self, "_model_ip_lock", None) or threading.Lock()):
+                st["last_status"] = code
+                if 200 <= code < 300:
+                    st["ok"] = int(st.get("ok") or 0) + 1
+                    st["consecutive_429"] = 0
+                    st["last_ok_at"] = now
+                    st["blocked_until"] = 0.0
+                    # Une réussite prouve que le modèle répond : on lève le
+                    # backoff global et on purge les vieux 429 du modèle.
+                    try:
+                        self._model_global_until.pop(mid, None)
+                        self._model_429_events.pop(mid, None)
+                    except Exception:
+                        pass
+                    return
+                if code != 429:
+                    return
+                st["n429"] = int(st.get("n429") or 0) + 1
+                st["consecutive_429"] = int(st.get("consecutive_429") or 0) + 1
+                st["last_429_at"] = now
+                ok = int(st.get("ok") or 0)
+                try:
+                    bad_ttl = float(_yaml_get("ip_rotation", "bad_ip_ttl_s", 1800) or 1800)
+                except (TypeError, ValueError):
+                    bad_ttl = 1800.0
+                try:
+                    quota_block = float(_yaml_get("ip_rotation", "quota_ip_block_s", 120) or 120)
+                except (TypeError, ValueError):
+                    quota_block = 120.0
+                # 0 succès = IP mauvaise/blacklistée. Après un historique
+                # positif, un 429 est un quota : blocage court.
+                block = bad_ttl if ok == 0 else quota_block
+                if ok > 0 and int(st.get("consecutive_429") or 0) >= 3:
+                    block = max(block, bad_ttl)
+                st["blocked_until"] = max(float(st.get("blocked_until") or 0.0), now + max(1.0, block))
+                # Détection modèle global : 429 sur plusieurs IP distinctes
+                # dans une fenêtre courte. Une IP neuve ne réglera rien.
+                try:
+                    window = float(_yaml_get("ip_rotation", "model_global_429_window_s", 60) or 60)
+                except (TypeError, ValueError):
+                    window = 60.0
+                try:
+                    min_ips = int(_yaml_get("ip_rotation", "model_global_429_min_ips", 3) or 3)
+                except (TypeError, ValueError):
+                    min_ips = 3
+                try:
+                    cooldown = float(_yaml_get("ip_rotation", "model_global_cooldown_s", 60) or 60)
+                except (TypeError, ValueError):
+                    cooldown = 60.0
+                events = self._model_429_events.get(mid)
+                if not isinstance(events, deque):
+                    events = deque(maxlen=128)
+                    self._model_429_events[mid] = events
+                _ip = str(ip or getattr(station, "current_ip", "") or "unknown")
+                events.append((now, _ip))
+                while events and now - float(events[0][0]) > max(1.0, window):
+                    events.popleft()
+                distinct = {str(e[1]) for e in events if now - float(e[0]) <= max(1.0, window)}
+                if len(distinct) >= max(2, min_ips):
+                    self._model_global_until[mid] = now + max(1.0, cooldown)
+        except Exception:
+            return
+
+    def model_ip_block_remaining(self, model: str, station, *, ip: str | None = None) -> float:
+        """Secondes de quarantaine restantes pour (modèle, station/IP)."""
+        try:
+            st = self._model_ip_state(model, station, ip, create=False)
+            return max(0.0, float(st.get("blocked_until") or 0.0) - time.monotonic())
+        except Exception:
+            return 0.0
+
+    def model_ip_bad(self, model: str, station, *, ip: str | None = None) -> bool:
+        return self.model_ip_block_remaining(model, station, ip=ip) > 0.0
+
+    def model_global_remaining(self, model: str) -> float:
+        """Secondes de backoff modèle global restantes (0 si aucun)."""
+        mid = str(model or "").strip().lower()
+        try:
+            until = float((getattr(self, "_model_global_until", {}) or {}).get(mid, 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+        now = time.monotonic()
+        if until <= now:
+            try:
+                (getattr(self, "_model_global_until", {}) or {}).pop(mid, None)
+            except Exception:
+                pass
+            return 0.0
+        return max(0.0, until - now)
+
+    def model_global_status(self) -> list[dict]:
+        """Backoffs modèle globaux actifs (429 sur plusieurs IP)."""
+        out: list[dict] = []
+        try:
+            now = time.monotonic()
+            for mid, until in list((getattr(self, "_model_global_until", {}) or {}).items()):
+                rem = max(0.0, float(until or 0.0) - now)
+                if rem > 0:
+                    out.append({"model": mid, "remaining_s": round(rem, 1)})
+        except Exception:
+            return []
+        return out
+
+    def model_ip_status(self, limit: int = 40) -> list[dict]:
+        """Vue bornée pour l'observabilité (modèle, station, IP, état)."""
+        out: list[dict] = []
+        try:
+            now = time.monotonic()
+            items = list((getattr(self, "_model_ip_health", {}) or {}).items())[-max(1, int(limit)) :]
+            for (mid, sid, ip), st in items:
+                out.append(
+                    {
+                        "model": mid,
+                        "station": sid,
+                        "ip": ip,
+                        "ok": int(st.get("ok") or 0),
+                        "n429": int(st.get("n429") or 0),
+                        "consecutive_429": int(st.get("consecutive_429") or 0),
+                        "blocked_s": max(0.0, float(st.get("blocked_until") or 0.0) - now),
+                        "last_status": st.get("last_status"),
+                    }
+                )
+        except Exception:
+            return []
+        return out
+
+    # ── [reliability P0] concurrence par (modèle, station) ───────────────
+    def _model_slot_limit(self) -> int:
+        try:
+            return max(1, min(int(_yaml_get("ip_rotation", "max_inflight_per_model_ip", 2) or 2), 8))
+        except (TypeError, ValueError):
+            return 2
+
+    def _model_slot(self, model: str, station) -> asyncio.Semaphore:
+        mid = str(model or "").strip().lower()
+        try:
+            sid = int(getattr(station, "_station", 0) or 0)
+        except (TypeError, ValueError):
+            sid = 0
+        limit = self._model_slot_limit()
+        key = (mid, sid, limit)
+        slots = getattr(self, "_model_slots", None)
+        if not isinstance(slots, dict):
+            slots = {}
+            self._model_slots = slots
+        sem = slots.get(key)
+        if sem is None:
+            sem = asyncio.Semaphore(limit)
+            slots[key] = sem
+        return sem
+
+    async def acquire_model_slot(self, model: str, station):
+        """Acquiert une place de concurrence ; None si timeout (fail-open)."""
+        try:
+            sem = self._model_slot(model, station)
+            try:
+                timeout = float(_yaml_get("ip_rotation", "model_slot_wait_s", 20) or 20)
+            except (TypeError, ValueError):
+                timeout = 20.0
+            await asyncio.wait_for(sem.acquire(), timeout=max(0.1, timeout))
+            return sem
+        except TimeoutError:
+            return None
+        except Exception:
+            return None
+
+    def release_model_slot(self, token) -> None:
+        if token is None:
+            return
+        try:
+            token.release()
+        except Exception:
+            pass
+
+    @asynccontextmanager
+    async def model_slot(self, model: str, station):
+        """Contexte de concurrence par (modèle, station) ; fail-open au timeout."""
+        token = await self.acquire_model_slot(model, station)
+        try:
+            yield token
+        finally:
+            self.release_model_slot(token)
 
     def on_quality_completion(self, station: VPNManager, ip: str, *, success: bool = True) -> None:
         """Rotation anticipée sur perte de débit (GUI `quality_rotation`).
@@ -1574,7 +1848,7 @@ class FreeIPPool:
         self._launch_rotation(station, forced_pool=forced_pool)
 
     async def on_request(
-        self, forced_pool=None, excluded=None
+        self, forced_pool=None, excluded=None, model: str | None = None
     ) -> tuple[str | None, VPNManager | Socks5Endpoint | None]:
         """Called before each free model request.
 
@@ -1709,14 +1983,14 @@ class FreeIPPool:
                                 # geo-pool. Même logique que le chemin normal.
                                 per["request_count"] += 1
                                 self._dirty_state = True
-                                if per["request_count"] >= self._rotation_threshold(station):
+                                if per["request_count"] >= self._rotation_threshold(station, model):
                                     logger.info(
                                         "[free-ip] st%d geo-branch over quota threshold (%d/%d) — rotation kick",
                                         station._station,
                                         per["request_count"],
                                         station._quota_per_ip,
                                     )
-                                    if self._rotation_threshold(station) <= 1:
+                                    if self._rotation_threshold(station, model) <= 1:
                                         _kick(station)
                                     else:
                                         _rot(station)
@@ -1772,7 +2046,7 @@ class FreeIPPool:
             # no other station is usable, keep serving on this one and
             # rotate it in the background — the request path never blocks
             # on a docker rotation (C6).
-            if per["request_count"] >= self._rotation_threshold(station):
+            if per["request_count"] >= self._rotation_threshold(station, model):
                 _dual_excl = set(excluded or ()) | {station}
                 other = self._best_station_excluding_many(_dual_excl, forced_pool)
                 if other is None:
@@ -1793,7 +2067,7 @@ class FreeIPPool:
                     # hot-loop). The throttled kick (last_connect_attempt /
                     # _connect_retry_interval) paces rotation attempts; the
                     # request still passes to `other` with zero wait.
-                    if self._rotation_threshold(station) <= 1:
+                    if self._rotation_threshold(station, model) <= 1:
                         _kick(station)
                     else:
                         _rot(station)
