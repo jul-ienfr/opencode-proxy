@@ -21336,6 +21336,17 @@ async def health(detail: str = "lite"):
     if not db_ok:
         status = "degraded"
         status_reasons.append("db: probe busy")
+    # [P1] Capacité free honnête : une station connectée sans quota n'est pas
+    # disponible. On dégrade /health quand la capacité effective baisse.
+    _free_capacity: dict = {}
+    try:
+        if _free_ip_pool is not None and hasattr(_free_ip_pool, "capacity_snapshot"):
+            _free_capacity = _free_ip_pool.capacity_snapshot()
+            if _free_capacity.get("capacity_degraded"):
+                status = "degraded"
+                status_reasons.append(f"free: {_free_capacity.get('capacity_reason') or 'capacity degraded'}")
+    except Exception:
+        _free_capacity = {}
     _debug(f"  [health] key pauses: {len(key_pause_status)} active, status={status}")
 
     _debug(f"  [health] overall status={status}")
@@ -21347,6 +21358,7 @@ async def health(detail: str = "lite"):
         "upstream": "ok" if upstream_ok else "unreachable",
         "circuit_breakers": cb_status,
         "key_pauses": key_pause_status,
+        "free_capacity": _free_capacity,
     }
     # [V5.1] Incidents « flux amont vide » — seulement en vue complète : le
     # payload léger est appelé toutes les 30 s par la supervision et ne doit
@@ -21667,11 +21679,27 @@ async def api_free_health():
     unproven = sorted(name for name in chat_routed if name not in ok)
     model_ip_health = []
     model_global_backoff = []
+    capacity: dict = {}
+    station_health: dict = {}
+    quota_leases: list = []
+    rotation_planner: dict = {}
+    last_selection: dict = {}
     try:
         if _free_ip_pool is not None and hasattr(_free_ip_pool, "model_ip_status"):
             model_ip_health = _free_ip_pool.model_ip_status(40)
         if _free_ip_pool is not None and hasattr(_free_ip_pool, "model_global_status"):
             model_global_backoff = _free_ip_pool.model_global_status()
+        if _free_ip_pool is not None:
+            if hasattr(_free_ip_pool, "capacity_snapshot"):
+                capacity = _free_ip_pool.capacity_snapshot()
+            if hasattr(_free_ip_pool, "_station_health"):
+                station_health = _free_ip_pool._station_health.snapshot()
+            if hasattr(_free_ip_pool, "_quota"):
+                quota_leases = _free_ip_pool._quota.snapshot(80)
+            if hasattr(_free_ip_pool, "_rotation_planner"):
+                rotation_planner = _free_ip_pool._rotation_planner.snapshot()
+            if hasattr(_free_ip_pool, "_best_ip"):
+                last_selection = _free_ip_pool._best_ip.snapshot()
     except Exception:
         model_ip_health, model_global_backoff = [], []
     return {
@@ -21682,12 +21710,18 @@ async def api_free_health():
         "quotas": _free_quota_states(),
         "model_ip_health": model_ip_health,
         "model_global_backoff": model_global_backoff,
+        "capacity": capacity,
+        "station_health": station_health,
+        "quota_leases": quota_leases,
+        "rotation_planner": rotation_planner,
+        "last_selection": last_selection,
         "note": (
             "`unproven` = aucun succès observé depuis le démarrage : soit le "
             "modèle n'a pas été appelé, soit il est refusé en amont. Un 200 du "
             "proxy ne suffit pas à conclure. `systemone` = autre protocole "
             "(/v1/systemone), jamais jugé sur le chat. `quotas` = clés "
-            "(modèle, IP) en cooldown avec scope et retour estimé."
+            "(modèle, IP) en cooldown avec scope et retour estimé. "
+            "`capacity` = stations réellement usable + quota, pas un faux 6/6."
         ),
     }
 

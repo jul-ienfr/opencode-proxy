@@ -157,6 +157,11 @@ ip_rotation:
   - https://ifconfig.me/ip
   - https://checkip.amazonaws.com
   ip_probe_budget: 20.0
+  ip_quota:
+    enabled: true
+    quota_reserve_pct: 10
+    rotation_threshold_pct: 20
+    selection_demand: 10
   latency_rotation:
     consecutive_slow: 5
     enabled: false
@@ -178,7 +183,7 @@ ip_rotation:
     soft_cooldown_sec: 600
     stream_metric: ttfb
     window: 20
-  max_free_attempts: 6
+  max_free_attempts: 7
   max_inflight_per_model_ip: 2
   model_global_429_min_ips: 3
   model_global_429_window_s: 60
@@ -194,7 +199,7 @@ ip_rotation:
   ov_auth_station_threshold: 5
   ov_auth_window_s: 1800
   ovpn_endpoint_port: ''
-  ovpn_protocol: udp
+  ovpn_protocol: tcp
   paid_hedge_after_ms: 0
   per_ip_identity: true
   pin_widen_auths: 8
@@ -236,8 +241,12 @@ ip_rotation:
     nemotron-3.5-super-vl-free: 40
   recent_ip_max_age: 1800
   recent_ip_window: 20
+  rotation_concurrency: 1
   rotation_fail_cooldown: 60
   rotation_max_duration: 240
+  rotation_planner:
+    enabled: true
+    spare_station: 7
   rotation_stagger: 10
   rotation_storm_cooldown_s: 600
   rotation_wait_timeout: 5
@@ -258,8 +267,30 @@ ip_rotation:
   state_file_2: logs/vpn_state2.json
   station_bad_ttl_s: 60
   station_connect_retry_interval_s: 300
-  station_count: 6
+  station_count: 7
+  station_health:
+    max_effective_age_s: 60
+    shadow: false
+    strict: true
   station_max_rotations_per_hour: 10
+  station_repair:
+    auth_backoff_s:
+    - 300
+    - 900
+    - 1800
+    auth_global_min_stations: 2
+    auth_global_pause_s: 300
+    auth_global_window_s: 60
+    bad_probes: 2
+    detect_after_s: 20
+    enabled: true
+    good_probes: 2
+    last_good_first: true
+    max_recreates_per_hour: 1
+    max_restarts_per_hour: 3
+    park_after_failures: 3
+    park_s: 1800
+    verify_egress_before_usable: true
   status_cache_seconds: 5.0
   strict_free: true
   switch_delay: 1

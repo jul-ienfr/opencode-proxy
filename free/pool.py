@@ -41,6 +41,11 @@ from collections import deque
 from contextlib import asynccontextmanager
 from typing import Any, cast
 
+from free.best_ip import BestIpSelector
+from free.ip_quota import IpQuotaRegistry, QuotaProfile
+from free.rotation_planner import RotationPlanner
+from free.station_health import StationHealthRegistry, station_contract
+from station_repair import RepairPolicy
 from vpn.manager import RotationFailed, VPNManager, VPNState
 
 
@@ -65,7 +70,7 @@ def _egress_rank(station) -> int:
     return 0
 
 
-def _best_station_excluding_impl(pool, station, forced_pool, selector=None):
+def _best_station_excluding_impl(pool, station, forced_pool, selector=None, model=None):
     """Sélection « autre station » : score si activé, sinon ordre legacy."""
     _ordered = sorted(
         (st for st in pool._stations if st is not station),
@@ -75,7 +80,9 @@ def _best_station_excluding_impl(pool, station, forced_pool, selector=None):
         usable = [
             st
             for st in _ordered
-            if pool._station_usable(st, exclude_approaching=exclude_approaching, forced_pool=forced_pool)
+            if pool._station_usable(
+                st, exclude_approaching=exclude_approaching, forced_pool=forced_pool, model=model
+            )
         ]
         if usable:
             if selector is not None and selector.enabled:
@@ -94,6 +101,7 @@ def _best_station_excluding_impl(pool, station, forced_pool, selector=None):
             forced_pool=forced_pool,
             ignore_latency_cool=True,
             ignore_supervisor_breaker=True,
+            model=model,
         )
     ]
     if usable:
@@ -105,7 +113,7 @@ def _best_station_excluding_impl(pool, station, forced_pool, selector=None):
     return None
 
 
-def _best_station_excluding_many_impl(pool, excluded, forced_pool, selector=None):
+def _best_station_excluding_many_impl(pool, excluded, forced_pool, selector=None, model=None):
     """Sélection « pas dans excluded » : score si activé, sinon legacy."""
     _ordered = sorted(
         (st for st in pool._stations if st not in excluded),
@@ -115,7 +123,9 @@ def _best_station_excluding_many_impl(pool, excluded, forced_pool, selector=None
         usable = [
             st
             for st in _ordered
-            if pool._station_usable(st, exclude_approaching=exclude_approaching, forced_pool=forced_pool)
+            if pool._station_usable(
+                st, exclude_approaching=exclude_approaching, forced_pool=forced_pool, model=model
+            )
         ]
         if usable:
             if selector is not None and selector.enabled:
@@ -134,6 +144,7 @@ def _best_station_excluding_many_impl(pool, excluded, forced_pool, selector=None
             forced_pool=forced_pool,
             ignore_latency_cool=True,
             ignore_supervisor_breaker=True,
+            model=model,
         )
     ]
     if usable:
@@ -456,6 +467,43 @@ class FreeIPPool:
         # [reliability P0] Porte de concurrence par (modèle, station/IP) :
         # évite les rafales de 40 requêtes sur une IP déjà au mur.
         self._model_slots: dict[tuple[str, int, int], asyncio.Semaphore] = {}
+        # [P1/P3] Couche fiabilité : santé station, lease IP/quota, sélection
+        # lexicographique et planification de rotation. Toutes les briques sont
+        # instanciées, mais les flags décident de leur application (rollback).
+        _rel_cfg = getattr(vpn_manager, "_config", None) or {}
+        _health_cfg = _rel_cfg.get("station_health") if isinstance(_rel_cfg.get("station_health"), dict) else {}
+        _quota_cfg = _rel_cfg.get("ip_quota") if isinstance(_rel_cfg.get("ip_quota"), dict) else {}
+        _rotation_cfg = (
+            _rel_cfg.get("rotation_planner") if isinstance(_rel_cfg.get("rotation_planner"), dict) else {}
+        )
+        self._strict_health = bool(_health_cfg.get("strict", False))
+        self._shadow_selector = bool(_health_cfg.get("shadow", False))
+        self._max_effective_age_s = max(1.0, float(_health_cfg.get("max_effective_age_s", 60) or 60))
+        self._quota_enabled = bool(_quota_cfg.get("enabled", False))
+        self._rotation_planner_enabled = bool(_rotation_cfg.get("enabled", False))
+        self._spare_station = int(_rotation_cfg.get("spare_station", 0) or 0)
+        self._spare_promoted = False
+        self._draining_stations: set[int] = set()
+        self._spare_ready = bool(self._spare_station)
+        self._station_health = StationHealthRegistry()
+        self._quota_profile = QuotaProfile.from_config(_rel_cfg)
+        self._quota = IpQuotaRegistry(self._quota_profile)
+        self._best_ip = BestIpSelector(
+            self._quota,
+            self._station_health,
+            inflight_provider=lambda st: len(self._per_station(st).get("stream_tasks") or ()),
+            latency_provider=self._selection_latency,
+            max_effective_age_s=self._max_effective_age_s,
+        )
+        self._rotation_planner = RotationPlanner(
+            enabled=self._rotation_planner_enabled,
+            profile=self._quota_profile,
+            min_active=1,
+        )
+        self._repair_policy = RepairPolicy.from_config(_rel_cfg)
+        self._last_selection: Any = None
+        self._last_model: str | None = None
+        self._last_repair: dict[str, Any] = {}
         # [review 18/08 F1a] Late-signal absorption window — SHORT on
         # purpose (20 s, NOT bad_ttl): long enough for the dial queue of a
         # request launched before a rotation (connect timeout 10 s +
@@ -676,6 +724,174 @@ class FreeIPPool:
             load = None
         return used, limit, load, inflight
 
+    def _selection_latency(self, station) -> float | None:
+        """Latence observée pour la sélection (qualité si disponible)."""
+        try:
+            sid = int(getattr(station, "_station", -1))
+            ip = str(getattr(station, "current_ip", "") or "unknown")
+            if getattr(self, "quality", None) is not None:
+                item = self.quality.get(sid, ip)
+                value = item.latency_ms()
+                if value:
+                    return float(value)
+        except Exception:
+            pass
+        try:
+            value = getattr(station, "_server_load", None)
+            return float(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    def _station_id(self, station) -> int:
+        try:
+            return int(getattr(station, "_station", 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _station_health_snapshot(self, station) -> dict:
+        try:
+            item = self._station_health.get(self._station_id(station))
+            return item.snapshot() if item is not None else {}
+        except Exception:
+            return {}
+
+    def station_usable(self, station, *, model: str | None = None, now: float | None = None) -> bool:
+        """Contrat public ``station_usable`` (avec quota si ``model`` fourni)."""
+        return self._station_usable(
+            station,
+            exclude_approaching=False,
+            model=model,
+            now=now,
+        )
+
+    def model_usable(
+        self,
+        model: str,
+        station,
+        *,
+        now: float | None = None,
+        allow_draining: bool = False,
+    ) -> tuple[bool, str | None]:
+        """Contrat public ``model_usable(model, station)``."""
+        if not self.station_usable(station, model=None, now=now):
+            return False, "station-unusable"
+        if not getattr(self, "_quota_enabled", False):
+            return True, None
+        return self._quota.model_usable(
+            model,
+            station,
+            now=now,
+            allow_draining=allow_draining,
+        )
+
+    def capacity_snapshot(self) -> dict:
+        """Vue capacité légère pour ``/health`` (sans get_status lourd)."""
+        all_stations = list(getattr(self, "_stations", None) or [])
+        spare_id = int(getattr(self, "_spare_station", 0) or 0)
+        promoted = bool(getattr(self, "_spare_promoted", False))
+        active = [
+            st for st in all_stations if not (spare_id and self._station_id(st) == spare_id)
+        ]
+        configured = len(active)
+        usable = 0
+        with_quota = 0
+        repairing = 0
+        parked = 0
+        model = getattr(self, "_last_model", None) or ""
+        for st in active:
+            try:
+                if self.station_usable(st):
+                    usable += 1
+                if model:
+                    ok, _ = self.model_usable(model, st)
+                    if ok:
+                        with_quota += 1
+                elif self.station_usable(st):
+                    with_quota += 1
+                h = self._station_health.get(self._station_id(st)) if hasattr(self, "_station_health") else None
+                if h is not None and h.state in ("repairing", "probing"):
+                    repairing += 1
+                elif h is not None and h.state == "parked":
+                    parked += 1
+            except Exception:
+                continue
+        degraded = usable < configured
+        reason = None
+        if degraded:
+            reason = f"{usable}/{configured} stations usable"
+        elif model and with_quota < configured:
+            reason = f"{with_quota}/{configured} stations avec quota"
+        return {
+            "configured_stations": configured,
+            "stations_total": len(all_stations),
+            "usable_stations": usable,
+            "active_stations_with_quota": with_quota,
+            "warm_spare_ready": self._spare_qualified(model or None),
+            "spare_station": spare_id or None,
+            "spare_promoted": promoted,
+            "repairing_stations": repairing,
+            "parked_stations": parked,
+            "capacity_degraded": bool(degraded or (model and with_quota < configured)),
+            "capacity_reason": reason,
+        }
+
+    def quota_lease(self, model: str, station, *, ip: str | None = None):
+        try:
+            return self._quota.lease_for(model, station, ip=ip)
+        except Exception:
+            return None
+
+    def _note_health_probe(self, station, ok: bool, *, cause: str | None = None) -> None:
+        try:
+            self._station_health.observe(
+                self._station_id(station),
+                bool(ok),
+                good_needed=int(getattr(self._repair_policy, "good_probes", 2) or 2),
+                bad_needed=int(getattr(self._repair_policy, "bad_probes", 2) or 2),
+            )
+            if not ok and cause:
+                item = self._station_health.get(self._station_id(station))
+                if item is not None:
+                    item.last_error = cause
+        except Exception:
+            pass
+
+    def note_station_probe(self, station, ok: bool, *, cause: str | None = None) -> None:
+        """Point d'entrée watchdog : alimente la machine à états santé."""
+        self._note_health_probe(station, ok, cause=cause)
+
+    def mark_station_repairing(self, station, *, cause: str | None = None) -> None:
+        try:
+            item = self._station_health.get(self._station_id(station))
+            if item is not None:
+                item.begin_repair(cause=cause)
+        except Exception:
+            pass
+
+    def mark_station_repaired(self, station) -> None:
+        try:
+            item = self._station_health.get(self._station_id(station))
+            if item is not None:
+                item.repair_succeeded()
+        except Exception:
+            pass
+
+    def mark_station_parked(self, station, *, cause: str | None = None, seconds: float = 1800.0) -> None:
+        try:
+            item = self._station_health.get(self._station_id(station))
+            if item is not None:
+                item.park(seconds=seconds, cause=cause)
+        except Exception:
+            pass
+
+    def _note_model_request(self, model: str | None, station) -> None:
+        if not model or station is None:
+            return
+        try:
+            self._quota.note_request(model, station)
+        except Exception:
+            pass
+
     def _rotation_threshold(self, station: VPNManager, model: str | None = None) -> int:
         """Quota-per-IP at which a station should rotate (C3).
 
@@ -697,7 +913,16 @@ class FreeIPPool:
         caller knows the free model, use its measured profile
         (``ip_rotation.quota_per_ip_by_model``) so DeepSeek rotates near its
         real per-IP wall instead of the historical 500 guess.
+
+        [P3] Quand ``ip_quota.enabled`` est actif, le seuil est dynamique :
+        ``profil - 20 %`` (le point où le headroom atteint la réserve de
+        rotation). Le seuil fixe 150 n'est plus jamais utilisé.
         """
+        if getattr(self, "_quota_enabled", False):
+            try:
+                return max(1, int(self._quota.profile.rotation_at_used(model)))
+            except Exception:
+                pass
         base = station._quota_per_ip
         try:
             _mid = str(model or "").strip().lower()
@@ -741,6 +966,108 @@ class FreeIPPool:
         except Exception:
             pass
         return max(1, base - 10 - self._rotation_stagger * max(0, station._station - 1))
+
+    def _plan_proactive_rotation(self, model: str | None, station=None) -> None:
+        """Applique le RotationPlanner (P4) après une requête servie.
+
+        Le planner ne choisit que des IP ``draining``/au seuil. Sans spare, il
+        impose une rotation à la fois ; avec spare, il demande une promotion
+        (le pool reste honnête : pas de 7e egress configuré = pas de spare).
+        """
+        if not getattr(self, "_rotation_planner_enabled", False) or not model:
+            return
+        try:
+            leases = self._quota.leases_for_model(model)
+            if not leases:
+                return
+            active_count = 0
+            for lease in leases:
+                lease.refresh(self._quota_profile)
+                if lease.selectable and lease.headroom > self._quota_profile.reserve_for(model):
+                    active_count += 1
+            decision = self._rotation_planner.plan(
+                leases,
+                active_count=max(1, active_count),
+                qualified_spares=1 if self._spare_qualified(model) else 0,
+                rotation_in_flight=self.any_rotation_in_flight(),
+            )
+            if decision is None:
+                return
+            target = self._station_by_id(decision.station)
+            if target is None:
+                return
+            if decision.spare_used:
+                self._spare_promoted = True
+            self._draining_stations.add(int(decision.station))
+            logger.info(
+                "[free-ip] rotation planifiée s%s action=%s model=%s headroom=%d spare=%s",
+                decision.station,
+                decision.action,
+                decision.model,
+                decision.headroom,
+                decision.spare_used,
+            )
+            self._last_repair = decision.snapshot()
+            self._launch_rotation(target)
+        except Exception:
+            return
+
+    def _station_by_id(self, sid: int):
+        for st in self._stations:
+            if self._station_id(st) == int(sid):
+                return st
+        return None
+
+    def _is_spare(self, station) -> bool:
+        try:
+            return bool(getattr(self, "_spare_station", 0)) and self._station_id(station) == int(
+                self._spare_station
+            )
+        except Exception:
+            return False
+
+    def _selection_stations(self) -> list:
+        """Stations routables : spare exclu tant qu'il n'est pas promu."""
+        out = []
+        for st in self._stations:
+            sid = self._station_id(st)
+            if sid in getattr(self, "_draining_stations", set()):
+                continue
+            if self._is_spare(st) and not getattr(self, "_spare_promoted", False):
+                continue
+            out.append(st)
+        return out
+
+    def _spare_qualified(self, model: str | None = None) -> bool:
+        if not getattr(self, "_spare_station", 0):
+            return False
+        st = self._station_by_id(self._spare_station)
+        if st is None:
+            return False
+        if not self.station_usable(st, model=None):
+            return False
+        if model:
+            ok, _ = self.model_usable(model, st)
+            return ok
+        return True
+
+    def _maybe_demote_spare(self, forced_pool=None, model: str | None = None) -> None:
+        """Le spare n'est promu que tant qu'aucune station active ne peut servir."""
+        if not getattr(self, "_spare_promoted", False):
+            return
+        if getattr(self, "_draining_stations", None):
+            return
+        try:
+            for st in self._stations:
+                if self._is_spare(st):
+                    continue
+                if self._station_usable(
+                    st, exclude_approaching=False, forced_pool=forced_pool, model=model
+                ):
+                    self._spare_promoted = False
+                    return
+        except Exception:
+            pass
 
     # ── [reliability P0] santé IP par modèle ─────────────────────────────
     def _model_ip_state(
@@ -810,6 +1137,11 @@ class FreeIPPool:
                     st["consecutive_429"] = 0
                     st["last_ok_at"] = now
                     st["blocked_until"] = 0.0
+                    self._note_health_probe(station, True)
+                    try:
+                        self._quota.note_success(mid, station, ip=str(ip or ""), now=now)
+                    except Exception:
+                        pass
                     # Une réussite prouve que le modèle répond : on lève le
                     # backoff global et on purge les vieux 429 du modèle.
                     try:
@@ -838,6 +1170,11 @@ class FreeIPPool:
                 if ok > 0 and int(st.get("consecutive_429") or 0) >= 3:
                     block = max(block, bad_ttl)
                 st["blocked_until"] = max(float(st.get("blocked_until") or 0.0), now + max(1.0, block))
+                self._note_health_probe(station, False, cause="429")
+                try:
+                    self._quota.note_429(mid, station, ip=str(ip or ""), now=now)
+                except Exception:
+                    pass
                 # Détection modèle global : 429 sur plusieurs IP distinctes
                 # dans une fenêtre courte. Une IP neuve ne réglera rien.
                 try:
@@ -1263,6 +1600,8 @@ class FreeIPPool:
         forced_pool=None,
         ignore_latency_cool: bool = False,
         ignore_supervisor_breaker: bool = False,
+        model: str | None = None,
+        now: float | None = None,
     ) -> bool:
         """A station is usable when its tunnel is up and it is not marked
         bad by a recent 429. ``exclude_approaching`` also rules out stations
@@ -1329,6 +1668,25 @@ class FreeIPPool:
                 _rot_at, _last_good, _grace = None, None, 5.0
             if _rot_at is not None and _last_good and (time.monotonic() - _rot_at) < _grace:
                 return True
+        # [P1] Contrat strict : auth OK, egress vérifié, pas de réparation/park,
+        # dernier egress pas trop vieux. Flag OFF = comportement historique.
+        _ts = float(now if now is not None else time.monotonic())
+        if getattr(self, "_strict_health", False):
+            _h = None
+            try:
+                _h = self._station_health.get(int(getattr(station, "_station", -1)))
+                if _h is not None:
+                    _h.resume_if_due(_ts)
+            except Exception:
+                _h = None
+            _ok, _why = station_contract(
+                station,
+                health=_h,
+                now=_ts,
+                max_effective_age_s=float(getattr(self, "_max_effective_age_s", 60.0) or 60.0),
+            )
+            if not _ok:
+                return False
         # [graceful-aurora] degraded routable (LOT A/C/F) : up = connected +
         # degraded. Le second-pass LRU reste inchangé (ignore_latency_cool).
         if not _station_is_up(station):
@@ -1354,11 +1712,18 @@ class FreeIPPool:
                     return False
             except Exception:
                 pass
-        if exclude_approaching and per["request_count"] >= self._rotation_threshold(station):
+        if exclude_approaching and per["request_count"] >= self._rotation_threshold(station, model):
             return False
+        # [P3] Une IP sans quota (ou en quarantaine) n'est jamais sélectionnable
+        # pour ce modèle, même en second passage. Le fallback paid/strict gère
+        # l'absence de candidat.
+        if model is not None and getattr(self, "_quota_enabled", False):
+            _qok, _qwhy = self._quota.model_usable(model, station, now=_ts)
+            if not _qok:
+                return False
         return True
 
-    def _non_routable_reason(self, station) -> str | None:
+    def _non_routable_reason(self, station, model: str | None = None) -> str | None:
         """[fiabilisation 05/09 Lot 0] Pourquoi ``station`` n'est pas routable
         (base : mêmes branches et même ordre que ``_station_usable`` avec
         ``exclude_approaching=False``, sans ``forced_pool``). ``None`` =
@@ -1425,9 +1790,25 @@ class FreeIPPool:
                 return "latency-hard-cool"
         except Exception:
             pass
+        if getattr(self, "_strict_health", False):
+            try:
+                _h = self._station_health.get(int(getattr(station, "_station", -1)))
+            except Exception:
+                _h = None
+            _ok, _why = station_contract(
+                station,
+                health=_h,
+                max_effective_age_s=float(getattr(self, "_max_effective_age_s", 60.0) or 60.0),
+            )
+            if not _ok:
+                return _why
+        if model and getattr(self, "_quota_enabled", False):
+            _qok, _qwhy = self._quota.model_usable(model, station)
+            if not _qok:
+                return f"quota={_qwhy}"
         return None
 
-    def usability_report(self) -> dict:
+    def usability_report(self, model: str | None = None) -> dict:
         """[fiabilisation 05/09 Lot 0] N/M routable + raison par station,
         pour le dashboard et le diagnostic « 1 seule station routable ».
         [graceful-aurora LOT F/J] + ``egress_state`` par station."""
@@ -1442,7 +1823,7 @@ class FreeIPPool:
             except Exception:
                 _egr = "unknown"
             report[sid] = {
-                "reason": self._non_routable_reason(st) or "routable",
+                "reason": self._non_routable_reason(st, model) or "routable",
                 "egress_state": _egr,
             }
         return report
@@ -1451,7 +1832,7 @@ class FreeIPPool:
         """True when free_parallel enabled + routing round-robin (tout mode sauf failover)."""
         return bool(self._free_parallel_enabled) and self._free_parallel_routing == "round-robin"
 
-    def _best_station(self, forced_pool=None) -> VPNManager | None:
+    def _best_station(self, forced_pool=None, model: str | None = None) -> VPNManager | None:
         """Best station for the next request.
 
         - enabled==false  → sticky station 1
@@ -1460,11 +1841,38 @@ class FreeIPPool:
         - enabled==true + round-robin + strict → compteur strict 1,2,3… change à chaque requête
         - enabled==true + round-robin + hedge → primaire strict (hedge en course)
         Approaching quota NOT excluded here (dual-clutch géré dans on_request).
+
+        [P3] Avec ``ip_quota.enabled`` + un modèle, la sélection passe par
+        ``BestIpSelector`` (quota restant > latence). Sans modèle, le chemin
+        historique reste intact (compat tests/dashboard).
         """
+        self._maybe_demote_spare(forced_pool, model)
+        _stations_for_pick = self._selection_stations()
         usable = [
-            st for st in self._stations if self._station_usable(st, exclude_approaching=False, forced_pool=forced_pool)
+            st
+            for st in _stations_for_pick
+            if self._station_usable(
+                st, exclude_approaching=False, forced_pool=forced_pool, model=model
+            )
         ]
+        if not usable and getattr(self, "_spare_station", 0) and not getattr(self, "_spare_promoted", False):
+            # Toutes les stations actives sont indisponibles : le spare chaud
+            # devient la dernière capacité utilisable.
+            self._spare_promoted = True
+            _stations_for_pick = self._selection_stations()
+            usable = [
+                st
+                for st in _stations_for_pick
+                if self._station_usable(
+                    st, exclude_approaching=False, forced_pool=forced_pool, model=model
+                )
+            ]
         if not usable:
+            # [P3] Ne jamais ré-admettre une station sans quota via les passes
+            # de secours : elles existent pour le breaker/latence, pas pour
+            # servir une IP épuisée.
+            if model is not None and getattr(self, "_quota_enabled", False):
+                return None
             # [fiabilisation 05/09] second pass ignorant le hard-cool latence
             # (miroir de pick_candidates §3.6.5) : sans ça, le chemin
             # on_request (qui passe par _best_station, pas pick_candidates)
@@ -1472,12 +1880,13 @@ class FreeIPPool:
             # effondrement artificiel N→0/1 sur refroidissement seul.
             usable = [
                 st
-                for st in self._stations
+                for st in _stations_for_pick
                 if self._station_usable(
                     st,
                     exclude_approaching=False,
                     forced_pool=forced_pool,
                     ignore_latency_cool=True,
+                    model=model,
                 )
             ]
         if not usable:
@@ -1488,17 +1897,34 @@ class FreeIPPool:
             # breaker, mais le client obtient une vraie réponse/429.
             usable = [
                 st
-                for st in self._stations
+                for st in _stations_for_pick
                 if self._station_usable(
                     st,
                     exclude_approaching=False,
                     forced_pool=forced_pool,
                     ignore_latency_cool=True,
                     ignore_supervisor_breaker=True,
+                    model=model,
                 )
             ]
         if not usable:
             return None
+        # [P3] Sélection lexicographique par quota restant. En shadow, le
+        # calcul est exposé sans changer le routage (P0).
+        _best_ip = getattr(self, "_best_ip", None)
+        if _best_ip is not None and model is not None and (
+            getattr(self, "_quota_enabled", False) or getattr(self, "_shadow_selector", False)
+        ):
+            try:
+                ranked = _best_ip.rank(self._prefer_healthy(usable), model)
+            except Exception:
+                ranked = []
+            if ranked:
+                self._last_selection = ranked[0]
+                if not getattr(self, "_shadow_selector", False):
+                    return ranked[0].station
+            elif getattr(self, "_quota_enabled", False):
+                return None
         # [roadmap] Sélection par score mesuré quand activée. Le legacy reste
         # le fallback exact (flag OFF, tests, rollback).
         _selector = getattr(self, "selector", None)
@@ -1550,28 +1976,41 @@ class FreeIPPool:
         except Exception:
             return usable[0]
 
-    def _best_station_excluding(self, station: VPNManager, forced_pool=None) -> VPNManager | None:
+    def _best_station_excluding(
+        self, station: VPNManager, forced_pool=None, model: str | None = None
+    ) -> VPNManager | None:
         """Best station other than ``station`` (for an immediate dual-clutch
         switch when the current one approaches quota)."""
-        _ordered = _best_station_excluding_impl(self, station, forced_pool, selector=getattr(self, "selector", None))
+        _ordered = _best_station_excluding_impl(
+            self, station, forced_pool, selector=getattr(self, "selector", None), model=model
+        )
+        if _ordered is not None and self._is_spare(_ordered):
+            self._spare_promoted = True
         return _ordered
 
-    def _best_station_excluding_many(self, excluded: set, forced_pool=None) -> VPNManager | None:
+    def _best_station_excluding_many(
+        self, excluded: set, forced_pool=None, model: str | None = None
+    ) -> VPNManager | None:
         """Best station NOT in ``excluded`` (cumulative retries: never
         re-strike an IP/bucket already used in this request's free attempts)."""
-        return _best_station_excluding_many_impl(self, excluded, forced_pool, selector=getattr(self, "selector", None))
+        result = _best_station_excluding_many_impl(
+            self, excluded, forced_pool, selector=getattr(self, "selector", None), model=model
+        )
+        if result is not None and self._is_spare(result):
+            self._spare_promoted = True
+        return result
 
-    def _any_other_usable(self, station: VPNManager, forced_pool=None) -> bool:
+    def _any_other_usable(self, station: VPNManager, forced_pool=None, model: str | None = None) -> bool:
         """True when at least one OTHER station is usable right now (C1 —
         the "never bad-mark the last standing station" guard)."""
         for st in self._stations:
             if st is station:
                 continue
-            if self._station_usable(st, exclude_approaching=False, forced_pool=forced_pool):
+            if self._station_usable(st, exclude_approaching=False, forced_pool=forced_pool, model=model):
                 return True
         return False
 
-    def pick_candidates(self, forced_pool=None) -> list:
+    def pick_candidates(self, forced_pool=None, model: str | None = None) -> list:
         """[free_parallel] Return up to N usable stations sorted by routing.
 
         - enabled==false or N==1 → 1 seule (pas de hedge)
@@ -1586,21 +2025,41 @@ class FreeIPPool:
             return []
         # if disabled and single station, still return 1 usable (fallback seq)
         # collect usable with exclude_approaching=False (hedge veut même au seuil)
+        self._maybe_demote_spare(forced_pool, model)
+        _stations_for_pick = self._selection_stations()
         usable = [
-            st for st in self._stations if self._station_usable(st, exclude_approaching=False, forced_pool=forced_pool)
+            st
+            for st in _stations_for_pick
+            if self._station_usable(
+                st, exclude_approaching=False, forced_pool=forced_pool, model=model
+            )
         ]
+        if not usable and getattr(self, "_spare_station", 0) and not getattr(self, "_spare_promoted", False):
+            self._spare_promoted = True
+            _stations_for_pick = self._selection_stations()
+            usable = [
+                st
+                for st in _stations_for_pick
+                if self._station_usable(
+                    st, exclude_approaching=False, forced_pool=forced_pool, model=model
+                )
+            ]
         if not usable:
             # [plan v10 §3.6.5 GARANTIE LRU] toutes hard-cooled/indisponibles →
             # second pass ignorant le cooldown latence : on sert quand même la
             # moins mauvaise (jamais de fallback paid par refroidissement seul).
+            # [P3] Mais jamais une IP sans quota.
+            if model is not None and getattr(self, "_quota_enabled", False):
+                return []
             usable = [
                 st
-                for st in self._stations
+                for st in _stations_for_pick
                 if self._station_usable(
                     st,
                     exclude_approaching=False,
                     forced_pool=forced_pool,
                     ignore_latency_cool=True,
+                    model=model,
                 )
             ]
             if not usable:
@@ -1619,6 +2078,24 @@ class FreeIPPool:
             except Exception:
                 pass
             return [usable[0]]
+        # [P3] Sélection lexicographique quota si activée.
+        _best_ip = getattr(self, "_best_ip", None)
+        if _best_ip is not None and model is not None and (
+            getattr(self, "_quota_enabled", False) or getattr(self, "_shadow_selector", False)
+        ):
+            try:
+                ranked = _best_ip.rank(self._prefer_healthy(usable), model)
+            except Exception:
+                ranked = []
+            if ranked:
+                self._last_selection = ranked[0]
+                if not getattr(self, "_shadow_selector", False):
+                    stations_ranked = [row.station for row in ranked]
+                    if not self._free_parallel_enabled:
+                        return stations_ranked[:1]
+                    return stations_ranked
+            elif getattr(self, "_quota_enabled", False):
+                return []
         _selector = getattr(self, "selector", None)
         if _selector is not None and _selector.enabled:
             ranked = _selector.rank(self._prefer_healthy(usable))
@@ -1652,8 +2129,8 @@ class FreeIPPool:
         return usable
 
     # Back-compat alias for plan's pick_two (2 stations max)
-    def pick_two(self, forced_pool=None) -> list:
-        cands = self.pick_candidates(forced_pool)
+    def pick_two(self, forced_pool=None, model: str | None = None) -> list:
+        cands = self.pick_candidates(forced_pool, model=model)
         return cands[:2]
 
     # [Axe 3.1] Static SOCKS5 proxies (socks5 mode — NO docker is ever
@@ -1886,6 +2363,8 @@ class FreeIPPool:
             return self._kick_connect(_st, forced_pool=forced_pool)
 
         self._total_free_requests += 1
+        if model:
+            self._last_model = str(model)
 
         mode = self._vpn.proxy_mode
         if mode == "direct":
@@ -1931,6 +2410,7 @@ class FreeIPPool:
             per["last_quota_per_ip"] = ep._quota_per_ip
             async with self._pool_pick_lock:
                 per["request_count"] += 1
+            self._note_model_request(model, ep)
             self._dirty_state = True
             ep.note_free_request()
             ip = ep.current_ip or ep.pid
@@ -1948,15 +2428,15 @@ class FreeIPPool:
             # [v6 P1-4] pick+increment race — lock <50µs, pas sur ensure_connected
             async with self._pool_pick_lock:
                 if excluded:
-                    station = self._best_station_excluding_many(excluded, forced_pool)
+                    station = self._best_station_excluding_many(excluded, forced_pool, model=model)
                     if station is None:
                         # [2026-10-29] Toutes les stations sont trial-dead :
                         # on retente l'une d'elles plutôt que de rendre None.
                         # Un 429 amont réel déclenche la rotation de cette
                         # station ; None produisait un 502 vide sans rotation.
-                        station = self._best_station(forced_pool)
+                        station = self._best_station(forced_pool, model=model)
                 else:
-                    station = self._best_station(forced_pool)
+                    station = self._best_station(forced_pool, model=model)
             if station is None and forced_pool is not None:
                 for st in self._stations:
                     if not _station_is_up(st):
@@ -1967,12 +2447,12 @@ class FreeIPPool:
                         ok = await st.ensure_geo_egress(forced_pool, timeout=_geo_timeout)
                         if ok:
                             station = (
-                                self._best_station_excluding_many(excluded, forced_pool)
+                                self._best_station_excluding_many(excluded, forced_pool, model=model)
                                 if excluded
-                                else self._best_station(forced_pool)
+                                else self._best_station(forced_pool, model=model)
                             )
                             if station is None and excluded:
-                                station = self._best_station(forced_pool)
+                                station = self._best_station(forced_pool, model=model)
                             if station is not None:
                                 self._active_station = station
                                 per = self._per_station(station)
@@ -1982,7 +2462,9 @@ class FreeIPPool:
                                 # une station au seuil servait indéfiniment sous
                                 # geo-pool. Même logique que le chemin normal.
                                 per["request_count"] += 1
+                                self._note_model_request(model, station)
                                 self._dirty_state = True
+                                self._plan_proactive_rotation(model, station)
                                 if per["request_count"] >= self._rotation_threshold(station, model):
                                     logger.info(
                                         "[free-ip] st%d geo-branch over quota threshold (%d/%d) — rotation kick",
@@ -2048,9 +2530,9 @@ class FreeIPPool:
             # on a docker rotation (C6).
             if per["request_count"] >= self._rotation_threshold(station, model):
                 _dual_excl = set(excluded or ()) | {station}
-                other = self._best_station_excluding_many(_dual_excl, forced_pool)
+                other = self._best_station_excluding_many(_dual_excl, forced_pool, model=model)
                 if other is None:
-                    other = self._best_station_excluding(station, forced_pool)
+                    other = self._best_station_excluding(station, forced_pool, model=model)
                 if other is not None:
                     logger.info(
                         "[free-ip] station %d approaching quota (%d/%d) — "
@@ -2071,6 +2553,9 @@ class FreeIPPool:
                         _kick(station)
                     else:
                         _rot(station)
+                    if self._is_spare(other):
+                        self._spare_promoted = True
+                    self._draining_stations.add(int(station._station))
                     station = other
                     self._active_station = station
                     per = self._per_station(station)
@@ -2123,7 +2608,9 @@ class FreeIPPool:
             # [v6 P1-4] increment sous lock (évite sur-quota 429)
             async with self._pool_pick_lock:
                 per["request_count"] += 1
+            self._note_model_request(model, station)
             self._dirty_state = True
+            self._plan_proactive_rotation(model, station)
             # [roadmap] Rotation proactive pilotée par le score mesuré :
             # seulement après N scores bas consécutifs, et en arrière-plan.
             try:
@@ -2522,7 +3009,7 @@ class FreeIPPool:
                 pass
         if action in ("cooldown", "both") and quota:
             if self.dual_station:
-                if self._any_other_usable(station):
+                if self._any_other_usable(station, model=getattr(self, "_last_model", None)):
                     self._apply_bad_mark(station, "rate_limit")
         if action in ("rotate", "both") and quota:
             if self._upstream_event_active():
@@ -2599,7 +3086,12 @@ class FreeIPPool:
         self._failover_exhausted_cb = cb if callable(cb) or cb is None else None
 
     async def on_disconnect_retry(
-        self, failed: VPNManager | None = None, forced_pool=None, rate_limited: bool = False, excluded=None
+        self,
+        failed: VPNManager | None = None,
+        forced_pool=None,
+        rate_limited: bool = False,
+        excluded=None,
+        model: str | None = None,
     ) -> tuple[str | None, VPNManager | Socks5Endpoint | None]:
         """Pick a DIFFERENT station for a retry after an upstream disconnect.
 
@@ -2639,6 +3131,7 @@ class FreeIPPool:
         """
         if not self._vpn.enabled:
             return None, None
+        model = model or getattr(self, "_last_model", None)
         if self._vpn.proxy_mode == "socks5":
             # [Axe 3.1] Static list, NO docker: bad-mark the failed proxy
             # (C1-guarded by _socks5_any_other) and pick the next one. No
@@ -2668,7 +3161,7 @@ class FreeIPPool:
         await self.ensure_connected()
         if failed is not None:
             if self.dual_station:
-                if self._any_other_usable(failed):
+                if self._any_other_usable(failed, model=getattr(self, "_last_model", None)):
                     self._apply_bad_mark(failed, "rate_limit" if rate_limited else "timeout")
             # [fiab 09/09 phase 2] alimente le breaker corrélé AVANT d'agir
             # (même règle que on_quota_exhausted : un événement déclaré par
@@ -2703,15 +3196,15 @@ class FreeIPPool:
         if failed is not None:
             _vpn_excl.add(failed)
         st = (
-            self._best_station_excluding_many(_vpn_excl, forced_pool)
+            self._best_station_excluding_many(_vpn_excl, forced_pool, model=model)
             if _vpn_excl
-            else self._best_station(forced_pool)
+            else self._best_station(forced_pool, model=model)
         )
         if st is None and failed is not None and excluded:
             # [2026-10-29] Toutes les autres stations sont trial-dead :
             # retenter l'une d'elles (pas la station qui vient d'échouer)
             # plutôt que rendre None — le 429 amont la fera tourner.
-            st = self._best_station_excluding(failed, forced_pool)
+            st = self._best_station_excluding(failed, forced_pool, model=model)
         if st is None:
             return None, None
         self._active_station = st
@@ -2791,7 +3284,7 @@ class FreeIPPool:
         # handshake) + teardown recv is genuine — the dead freshly-rotated
         # tunnel is bad-marked NOW (étage 0) instead of being re-struck for a
         # full bad_ttl.
-        if self._any_other_usable(station) and (
+        if self._any_other_usable(station, model=getattr(self, "_last_model", None)) and (
             per["session_start"] is None or time.monotonic() - per["session_start"] >= self._late_signal_grace
         ):
             self._apply_bad_mark(station, "timeout")
@@ -3055,6 +3548,12 @@ class FreeIPPool:
 
     async def _rotate_station(self, station: VPNManager):
         sid = station._station
+        _planner = getattr(self, "_rotation_planner", None)
+        if _planner is not None:
+            try:
+                _planner.note_started()
+            except Exception:
+                _planner = None
         # Register in-flight BEFORE the first await: the worker is the only
         # task that ever rotates, so ``current_task()`` is exactly the
         # "rotation running" marker `_launch_rotation` checks — a re-launch
@@ -3099,8 +3598,14 @@ class FreeIPPool:
                     alive = False
                 if alive:
                     per["post_commit_retry_count"] = 0
+                    self._note_health_probe(station, True)
+                    try:
+                        station._note_effective_ok()
+                    except Exception:
+                        pass
                 else:
                     per["post_commit_retry_count"] += 1
+                    self._note_health_probe(station, False, cause="post-commit-egress")
                     logger.warning(
                         "[free-ip] station %d fresh IP not egressing "
                         "(post-commit probe dead, attempt %d/%d) — "
@@ -3115,7 +3620,7 @@ class FreeIPPool:
                     station.arm_egress_watchdog()
                     if per["post_commit_retry_count"] < self._POST_COMMIT_RETRY_MAX:
                         # C1: never bad-mark the ONLY usable station.
-                        if self._any_other_usable(station):
+                        if self._any_other_usable(station, model=getattr(self, "_last_model", None)):
                             self._apply_bad_mark(station, "timeout")
                         needs_retry = True
                     # At the cap: give up on immediate re-rotation — the
@@ -3159,6 +3664,16 @@ class FreeIPPool:
                 pass
         finally:
             self._rotation_tasks.pop(sid, None)
+            try:
+                self._draining_stations.discard(int(sid))
+                self._spare_promoted = False
+            except Exception:
+                pass
+            if _planner is not None:
+                try:
+                    _planner.note_finished()
+                except Exception:
+                    pass
             # [plan v10 §14.1.8] le tag géo était posé par _launch_rotation et
             # JAMAIS nettoyé : après UN 429 géo, toutes les rotations futures
             # de la station restaient verrouillées sur ces pays jusqu'au
@@ -3222,6 +3737,15 @@ class FreeIPPool:
             self._per.pop(sid, None)
             self._pending.discard(sid)
             self._rotation_tasks.pop(sid, None)
+            try:
+                self._station_health.remove(sid)
+                self._quota.prune_station(sid)
+                self._draining_stations.discard(int(sid))
+                if int(sid) == int(getattr(self, "_spare_station", 0) or 0):
+                    self._spare_station = 0
+                    self._spare_promoted = False
+            except Exception:
+                pass
         # [prancy-unicorn Phase1 P1] prune ghost sids >N in shared_rotation
         try:
             import shared_state as _ss_prune
@@ -3309,6 +3833,15 @@ class FreeIPPool:
             self._pending.discard(sid)
             self._rotation_tasks.pop(sid, None)
             self._per.pop(sid, None)
+            try:
+                self._station_health.remove(sid)
+                self._quota.prune_station(sid)
+                self._draining_stations.discard(int(sid))
+                if int(sid) == int(getattr(self, "_spare_station", 0) or 0):
+                    self._spare_station = 0
+                    self._spare_promoted = False
+            except Exception:
+                pass
             try:
                 _eng = getattr(self, "latency_engine", None)
                 if _eng is not None and hasattr(_eng, "prune_stations"):
@@ -3552,6 +4085,41 @@ class FreeIPPool:
                 self._free_parallel_hedge_delay_ms = max(0, min(2000, int(cfg["free_parallel_hedge_delay_ms"])))
             except Exception:
                 pass
+        # [P1/P3/P4] Hot-reload des blocs de fiabilité. Le body du dashboard
+        # peut être partiel : on le fusionne sur la config connue du manager.
+        if any(k in cfg for k in ("station_health", "ip_quota", "rotation_planner", "station_repair")):
+            try:
+                _rel_cfg = dict(getattr(self._vpn, "_config", {}) or {})
+                _rel_cfg.update(cfg)
+                _health_cfg = (
+                    _rel_cfg.get("station_health") if isinstance(_rel_cfg.get("station_health"), dict) else {}
+                )
+                _quota_cfg = _rel_cfg.get("ip_quota") if isinstance(_rel_cfg.get("ip_quota"), dict) else {}
+                _rotation_cfg = (
+                    _rel_cfg.get("rotation_planner")
+                    if isinstance(_rel_cfg.get("rotation_planner"), dict)
+                    else {}
+                )
+                self._strict_health = bool(_health_cfg.get("strict", False))
+                self._shadow_selector = bool(_health_cfg.get("shadow", False))
+                self._max_effective_age_s = max(
+                    1.0, float(_health_cfg.get("max_effective_age_s", 60) or 60)
+                )
+                self._quota_enabled = bool(_quota_cfg.get("enabled", False))
+                self._rotation_planner_enabled = bool(_rotation_cfg.get("enabled", False))
+                self._spare_station = int(_rotation_cfg.get("spare_station", 0) or 0)
+                self._spare_promoted = False
+                self._draining_stations.clear()
+                self._spare_ready = bool(self._spare_station)
+                self._quota_profile = QuotaProfile.from_config(_rel_cfg)
+                self._quota.profile = self._quota_profile
+                self._best_ip.quota = self._quota
+                self._best_ip.max_effective_age_s = self._max_effective_age_s
+                self._rotation_planner.profile = self._quota_profile
+                self._rotation_planner.enabled = self._rotation_planner_enabled
+                self._repair_policy = RepairPolicy.from_config(_rel_cfg)
+            except Exception:
+                pass
         # [roadmap] Recharge le flag qualité (canary / rollback à chaud).
         try:
             from free.quality import QualityConfig, get_quality_registry
@@ -3586,6 +4154,8 @@ class FreeIPPool:
                 per["request_count"] = 0
             per["last_quota_per_ip"] = getattr(winner, "_quota_per_ip", 0)
             per["request_count"] += 1
+            self._note_model_request(getattr(self, "_last_model", None), winner)
+            self._note_health_probe(winner, True)
             self._dirty_state = True
             try:
                 winner.note_free_request()
@@ -3632,6 +4202,7 @@ class FreeIPPool:
                 per["request_count"] = 0
             per["last_quota_per_ip"] = getattr(loser, "_quota_per_ip", 0)
             per["request_count"] += 1
+            self._note_model_request(getattr(self, "_last_model", None), loser)
             self._dirty_state = True
             try:
                 loser.note_free_request()
@@ -3706,8 +4277,13 @@ class FreeIPPool:
             fp = self._pool_state_file()
             _os.makedirs(_os.path.dirname(fp), exist_ok=True)
             tmp = fp + ".tmp"
+            payload = {
+                "per": data,
+                "health": self._station_health.export_state() if hasattr(self, "_station_health") else {},
+                "quota": self._quota.export_state() if hasattr(self, "_quota") else [],
+            }
             with open(tmp, "w", encoding="utf-8") as f:
-                _js.dump({"per": data}, f)
+                _js.dump(payload, f)
             _os.replace(tmp, fp)
             self._dirty_state = False
         except Exception as e:
@@ -3742,6 +4318,10 @@ class FreeIPPool:
                         per["bad_cause"] = st.get("bad_cause")
                 except Exception:
                     continue
+            if hasattr(self, "_station_health"):
+                self._station_health.restore_state(raw.get("health"))
+            if hasattr(self, "_quota"):
+                self._quota.restore_state(raw.get("quota"))
             self._dirty_state = False
             logger.info("[free-ip] pool state restauré (%d stations)", len(raw.get("per") or {}))
         except Exception as e:
@@ -3792,6 +4372,17 @@ class FreeIPPool:
         stations = []
         for st in self._stations:
             per = self._per_station(st)
+            sid = self._station_id(st)
+            _health = self._station_health.get(sid)
+            _health_snap = _health.snapshot() if _health is not None else {}
+            _model = getattr(self, "_last_model", None) or ""
+            try:
+                _lease = self._quota.lease_for(_model, st) if _model else None
+            except Exception:
+                _lease = None
+            _lease_snap = _lease.snapshot() if _lease is not None else {}
+            _station_ok = self.station_usable(st)
+            _model_ok, _model_why = self.model_usable(_model, st) if _model else (_station_ok, None)
             try:
                 _egr = str(getattr(st, "_egress_state", "unknown") or "unknown")
             except Exception:
@@ -3818,10 +4409,22 @@ class FreeIPPool:
                     "last_good_ip": per.get("last_confirmed_ip"),
                     # [fiabilisation 05/09 Lot 0] raison lisible quand la
                     # station n'est pas servable (None = routable).
-                    "non_routable_reason": self._non_routable_reason(st),
+                    "non_routable_reason": self._non_routable_reason(st, _model or None),
                     # [graceful-aurora LOT F/J] état egress distingué.
                     "egress_state": _egr,
                     "last_rotation_error": getattr(st, "_last_rotation_error", None),
+                    # [P0/P1/P3] instrumentation station/IP/quota.
+                    "station_usable": bool(_station_ok),
+                    "model_usable": bool(_model_ok),
+                    "model_usable_reason": _model_why,
+                    "model": _model or None,
+                    "health": _health_snap,
+                    "ip_state": _lease_snap.get("state"),
+                    "quota_headroom": _lease_snap.get("headroom"),
+                    "quota_estimate": _lease_snap.get("quota_estimate", st._quota_per_ip),
+                    "quota_used": _lease_snap.get("used"),
+                    "quality_score": _lease_snap.get("success_rate"),
+                    "quota_lease": _lease_snap,
                     "vpn": st.get_status(),
                     # [audit-2026-10-24] wire identity réelle (vault Bun par IP)
                     # à côté du profil d'identité (porteur TLS + UA officiel).
@@ -3920,6 +4523,51 @@ class FreeIPPool:
             _dual_cfg = bool((getattr(self._vpn, "_config", {}) or {}).get("dual_station", False))
         except Exception:
             _dual_cfg = False
+        # [P0] Agrégats capacité / quota / réparation. Le spare chaud n'est
+        # pas compté dans la capacité active tant qu'il n'est pas promu.
+        _spare_id = int(getattr(self, "_spare_station", 0) or 0)
+        _promoted = bool(getattr(self, "_spare_promoted", False))
+        _active_rows = [
+            _s for _s in stations if not (_spare_id and _s.get("station") == _spare_id)
+        ]
+        _configured = len(_active_rows)
+        _usable_n = sum(1 for _s in _active_rows if _s.get("station_usable"))
+        _with_quota_n = sum(1 for _s in _active_rows if _s.get("model_usable"))
+        _repairing_n = sum(
+            1 for _s in _active_rows if (_s.get("health") or {}).get("state") in ("repairing", "probing")
+        )
+        _parked_n = sum(1 for _s in _active_rows if (_s.get("health") or {}).get("state") == "parked")
+        _auth_failures_30m = 0
+        _repair_attempts_n = 0
+        _repair_success_n = 0
+        _repair_parked_n = 0
+        _last_errors: list[str] = []
+        _causes: list[str] = []
+        _retry_in = 0.0
+        _action_required = False
+        for _s in stations:
+            _vpn_s = _s.get("vpn") or {}
+            _h = _s.get("health") or {}
+            try:
+                _auth_failures_30m += int(_vpn_s.get("auth_fail_30min", 0) or 0)
+            except Exception:
+                pass
+            _repair_attempts_n += int(_h.get("repair_attempts", 0) or 0)
+            _repair_success_n += int(_h.get("repair_successes", 0) or 0)
+            if _h.get("state") == "parked":
+                _repair_parked_n += 1
+            if _h.get("last_error"):
+                _last_errors.append(str(_h["last_error"]))
+            if _h.get("cause"):
+                _causes.append(str(_h["cause"]))
+            _retry_in = max(_retry_in, float(_h.get("next_retry_in_s", 0) or 0))
+            _action_required = _action_required or bool(_h.get("action_required", False))
+        _capacity_reason = None
+        if _configured and _usable_n < _configured:
+            _capacity_reason = f"{_usable_n}/{_configured} stations usable"
+        elif _configured and _with_quota_n < _configured:
+            _capacity_reason = f"{_with_quota_n}/{_configured} stations avec quota"
+        _planner_snap = self._rotation_planner.snapshot() if hasattr(self, "_rotation_planner") else {}
         return {
             "enabled": self._vpn.enabled,
             "proxy_mode": self._vpn.proxy_mode,
@@ -3929,6 +4577,45 @@ class FreeIPPool:
             "stations": stations,
             "healthy": _healthy,
             "healthy_routable": _healthy_routable,
+            # [P0] capacité honnête : une station connectée sans quota n'est
+            # pas comptée comme disponible.
+            "configured_stations": _configured,
+            "stations_total": len(stations),
+            "usable_stations": _usable_n,
+            "active_stations_with_quota": _with_quota_n,
+            "warm_spare_ready": self._spare_qualified(getattr(self, "_last_model", None)),
+            "spare_station": _spare_id or None,
+            "spare_promoted": _promoted,
+            "repairing_stations": _repairing_n,
+            "parked_stations": _parked_n,
+            "auth_failures_30m": _auth_failures_30m,
+            "repair_attempts": _repair_attempts_n,
+            "repair_success": _repair_success_n,
+            "repair_parked": _repair_parked_n,
+            "last_repair_attempt": (self._last_repair or {}).get("last_action"),
+            "next_retry_in_s": _retry_in,
+            "last_error": (_last_errors[-1] if _last_errors else None),
+            "cause": (_causes[-1] if _causes else None),
+            "action_required": _action_required,
+            "capacity_degraded": bool(_capacity_reason),
+            "capacity_reason": _capacity_reason,
+            "rotation_planner": _planner_snap,
+            "rotation_planner_enabled": bool(getattr(self, "_rotation_planner_enabled", False)),
+            "shadow_selector": bool(getattr(self, "_shadow_selector", False)),
+            "last_selection": self._best_ip.snapshot()
+            if hasattr(self, "_best_ip")
+            else {},
+            "quota_leases": self._quota.snapshot(40) if hasattr(self, "_quota") else [],
+            "quota_profile": {
+                "reserve_pct": round(float(getattr(self._quota_profile, "reserve_pct", 0.0)) * 100.0, 1),
+                "rotation_pct": round(float(getattr(self._quota_profile, "rotation_pct", 0.0)) * 100.0, 1),
+            },
+            "station_health": self._station_health.snapshot() if hasattr(self, "_station_health") else {},
+            "repair_policy": {
+                "enabled": bool(getattr(self._repair_policy, "enabled", False)),
+                "park_after_failures": int(getattr(self._repair_policy, "park_after_failures", 3)),
+                "park_s": float(getattr(self._repair_policy, "park_s", 1800.0)),
+            },
             # [graceful-aurora LOT J] dégradées mais routables (ambre).
             "degraded_routable": _degraded_routable,
             # [phase 1] événement amont 429 corrélés (gel rotations).

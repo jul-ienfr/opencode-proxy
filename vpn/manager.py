@@ -51,6 +51,17 @@ if TYPE_CHECKING:  # annotation seule — pas d'import runtime (déjà injecté 
 # cooldown global 120s après 3 AUTH_FAILED consécutifs.
 # [audit-2026-10-24 Phase4] noms historiques ré-exportés pour compat
 # (tests + appelants patchent vpn.manager._auth_gate).
+from station_repair import (
+    PARK,
+    PIN_LAST_GOOD,
+    RECREATE,
+    RESTART,
+    STACK,
+    STOP,
+    GlobalAuthGuard,
+    RepairPolicy,
+    RepairState,
+)
 from vpn.auth import (
     _AUTH_FAIL_TIMES,  # noqa: F401 — réexporté (consommé par vpn_manager.__all__)
     _AUTH_LAST_BY_STATION,  # noqa: F401 — réexporté (compat tests)
@@ -77,6 +88,13 @@ _ENV_RW_LOCK = threading.Lock()
 # its own compose recreate). Keyed by running loop so pytest's multiple
 # asyncio.run() loops never share a bound lock.
 _STACK_FLIP_LOCKS: dict[int, asyncio.Lock] = {}
+
+
+# [P2] Garde auth globale au PROCESS : deux stations qui échouent dans la
+# même fenêtre ne doivent pas lancer deux probes AUTH. Les managers sont
+# recréés (rotation/downscale) mais la garde survit — c'est le compte
+# NordVPN qui est partagé, pas l'instance.
+_STATION_AUTH_GUARD = GlobalAuthGuard()
 
 
 def _stack_flip_lock() -> asyncio.Lock:
@@ -1737,6 +1755,24 @@ class VPNManager:
         self._watchdog_max_restarts_per_hour = int(_mx_rst)
         self._auth_grace_until = 0.0
         self._watchdog_last_action: str | None = None
+        # [P2] Réparation auth bornée : restart immédiat -> stop 5/15 min ->
+        # pin dernier bon serveur -> recreate -> stack -> park 30 min.
+        self._repair_policy: RepairPolicy = RepairPolicy.from_config(cfg)
+        self._station_repair_enabled: bool = bool(self._repair_policy.enabled)
+        self._repair_state: RepairState = RepairState()
+        self._auth_repair_task: asyncio.Task | None = None
+        self._auth_park_until: float = 0.0
+        self._auth_next_retry_at: float = 0.0
+        self._auth_global_pause_until: float = 0.0
+        self._credentials_suspect: bool = False
+        self._auth_probe_in_progress: bool = False
+        self._repairing: bool = False
+        self._parked_until: float = 0.0
+        self._repair_sleep = asyncio.sleep
+        self._last_good_country: str | None = None
+        self._last_good_host: str | None = None
+        self._last_good_ip: str | None = None
+        self._last_good_at: float = 0.0
         self._watchdog_restarts_1h: list[float] = []
         # [PC-15 — audit routabilité 2026-09-08] heartbeat watchdog (F10) :
         # une ligne toutes les 5 min même sans événement — la supervision
@@ -2140,6 +2176,8 @@ class VPNManager:
                 self._backoff.record_success()
                 self._last_rotation_failed_at = None  # tunnel is up: clear cooldown
                 self._last_rotation_error = None
+                self._record_last_good()
+                self._note_pool_health(True, cause="connected")
                 self.save_state()
                 logger.info("[vpn] connected — IP %s", self._current_ip)
             except asyncio.CancelledError:
@@ -3795,8 +3833,26 @@ class VPNManager:
                 logger.debug("[vpn] pin restore failed: %s", e)
 
     def _note_effective_ok(self) -> None:
-        """Horodate une preuve d'egress réelle (frontière de guérison)."""
-        self._last_effective_ok_at = time.monotonic()
+        """Horodate une preuve d'egress réelle (frontière de guérison).
+
+        [P2] C'est aussi la seule preuve qui met à jour le dernier bon
+        serveur/pays/IP : un tunnel qui répond vraiment, pas un statut
+        auto-déclaré.
+        """
+        ts = time.monotonic()
+        self._last_effective_ok_at = ts
+        try:
+            country = getattr(self, "_current_country", None)
+            host = getattr(self, "_current_host", None)
+            ip = getattr(self, "_current_ip", None)
+            if country or host or ip:
+                self._last_good_country = str(country) if country else self._last_good_country
+                self._last_good_host = str(host) if host else self._last_good_host
+                self._last_good_ip = str(ip) if ip else self._last_good_ip
+                self._last_good_at = ts
+                self._repair_state.mark_last_good(country=country, host=host, ip=ip, now=ts)
+        except Exception:
+            pass
 
     def _secondary_path_active(self) -> bool:
         """Marqueur voie secondaire encore dans sa fenêtre de maintien."""
@@ -4306,6 +4362,8 @@ class VPNManager:
             "on_429_action": _on_429_action,
             "bad_ttl": _bad_ttl,
             "station_bad_ttl_s": _station_bad_ttl_s,
+            # [P2] politique de réparation auth (lecture dashboard).
+            "station_repair": self._config.get("station_repair", {}),
         }
 
     async def update_config(self, updates: dict) -> dict:
@@ -4467,6 +4525,17 @@ class VPNManager:
             )
         if "ov_auth_cascade_enabled" in updates:
             self._ov_auth_cascade_enabled = bool(updates["ov_auth_cascade_enabled"])
+        # [P2] hot-reload de la politique de réparation auth.
+        if "station_repair" in updates or "station_repair_enabled" in updates:
+            try:
+                self._repair_policy = RepairPolicy.from_config(self._config)
+                self._station_repair_enabled = bool(self._repair_policy.enabled)
+                if not self._station_repair_enabled:
+                    _task = getattr(self, "_auth_repair_task", None)
+                    if _task is not None and not _task.done():
+                        _task.cancel()
+            except Exception:
+                pass
         if "stack_age_guard_s" in updates:
             self._stack_age_guard_s = _clamp_cfg_number(updates, "stack_age_guard_s", 600.0, 60.0, 3600.0)
         if "wg_canary_poll_interval_s" in updates:
@@ -4721,6 +4790,18 @@ class VPNManager:
             )
             if getattr(self, "_auth_cool_until", 0.0) > self._now_fn()
             else 0,
+            # [P2] réparation auth : pause globale, park, dernier bon serveur.
+            "auth_global_pause_remaining_s": round(self._auth_global_pause_remaining(), 1),
+            "auth_park_remaining_s": max(
+                0.0, float(getattr(self, "_auth_park_until", 0.0) or 0.0) - self._now_fn()
+            ),
+            "credentials_suspect": bool(getattr(self, "_credentials_suspect", False)),
+            "repair": (
+                self._repair_state.snapshot(self._now_fn())
+                if hasattr(self, "_repair_state")
+                else {}
+            ),
+            "repair_enabled": bool(getattr(self, "_station_repair_enabled", False)),
             # [graceful-aurora LOT E/J] pin réversible.
             "pinned_country": getattr(self, "_current_country", None),
             # [PC-11] pays d'attache déterministe (partage explicite si N > pays).
@@ -7468,6 +7549,306 @@ class VPNManager:
             "ov_auth_cascade_cooldown_s": float(getattr(self, "_ov_auth_cascade_cooldown_s", 1800.0)),
         }
 
+    # ── [P2] Réparation auth bornée ─────────────────────────────────
+    def _note_pool_health(self, ok: bool, cause: str | None = None) -> None:
+        try:
+            _pool = getattr(shared_state, "free_ip_pool", None)
+            if _pool is not None and hasattr(_pool, "note_station_probe"):
+                _pool.note_station_probe(self, bool(ok), cause=cause)
+        except Exception:
+            pass
+
+    def _mark_pool_repairing(self, cause: str) -> None:
+        try:
+            _pool = getattr(shared_state, "free_ip_pool", None)
+            if _pool is not None and hasattr(_pool, "mark_station_repairing"):
+                _pool.mark_station_repairing(self, cause=cause)
+        except Exception:
+            pass
+
+    def _mark_pool_parked(self, cause: str, seconds: float) -> None:
+        try:
+            _pool = getattr(shared_state, "free_ip_pool", None)
+            if _pool is not None and hasattr(_pool, "mark_station_parked"):
+                _pool.mark_station_parked(self, cause=cause, seconds=seconds)
+        except Exception:
+            pass
+
+    def _mark_pool_repaired(self) -> None:
+        try:
+            _pool = getattr(shared_state, "free_ip_pool", None)
+            if _pool is not None and hasattr(_pool, "mark_station_repaired"):
+                _pool.mark_station_repaired(self)
+        except Exception:
+            pass
+
+    def _record_last_good(self, now: float | None = None) -> None:
+        """Mémorise le dernier egress réellement sain (pays/host/IP)."""
+        ts = self._now_fn() if now is None else float(now)
+        country = getattr(self, "_current_country", None)
+        host = getattr(self, "_current_host", None)
+        ip = getattr(self, "_current_ip", None)
+        if country or host or ip:
+            self._last_good_country = str(country) if country else self._last_good_country
+            self._last_good_host = str(host) if host else self._last_good_host
+            self._last_good_ip = str(ip) if ip else self._last_good_ip
+            self._last_good_at = ts
+        try:
+            self._repair_state.mark_last_good(country=country, host=host, ip=ip, now=ts)
+        except Exception:
+            pass
+        try:
+            self.save_state()
+        except Exception:
+            pass
+
+    def _auth_global_pause_remaining(self) -> float:
+        try:
+            return float(_STATION_AUTH_GUARD.remaining(self._now_fn()))
+        except Exception:
+            return 0.0
+
+    def _all_peers_auth_failed(self) -> bool:
+        """True si toutes les stations actives sont en AUTH_FAILED (credentials)."""
+        try:
+            import shared_state as _ss
+
+            peers = [
+                m
+                for m in (getattr(_ss, "vpn_managers", None) or [])
+                if m is not None and not getattr(m, "_disabled", False)
+            ]
+            if len(peers) < 2:
+                return False
+            active = [m for m in peers if getattr(m, "_enabled", True)]
+            if len(active) < 2:
+                return False
+            return all(bool(getattr(m, "_auth_failed", False)) for m in active)
+        except Exception:
+            return False
+
+    def _park_auth(self, cause: str, now: float | None = None) -> None:
+        ts = self._now_fn() if now is None else float(now)
+        self._repair_state.park(self._repair_policy, ts, cause=cause)
+        self._auth_park_until = ts + max(30.0, float(self._repair_policy.park_s))
+        self._parked_until = self._auth_park_until
+        self._auth_next_retry_at = self._auth_park_until
+        self._auth_failed = True
+        self._repairing = False
+        self._watchdog_last_action = f"parked:{cause}"
+        self._error = f"station parked: {cause}"
+        self._mark_pool_parked(cause, float(self._repair_policy.park_s))
+        try:
+            self._set_status(VPNState.ERROR)
+        except Exception:
+            pass
+        logger.error(
+            "[vpn] s%s PARKED %.0fs — cause=%s (action requise)",
+            self._station,
+            self._repair_policy.park_s,
+            cause,
+        )
+
+    async def _stop_service(self) -> None:
+        """Arrêt RÉEL du service (pas un sleep proxy) — le conteneur ne doit
+        plus renvoyer d'AUTH pendant la fenêtre de silence."""
+        self._docker_op_begin()
+        try:
+            compose_file = self._compose_file_path()
+            result = await asyncio.to_thread(
+                self._docker_run,
+                ["compose", "-f", compose_file, "stop", self._compose_service],
+                120,
+                env=self._compose_env(),
+            )
+            if result.returncode != 0:
+                raise RuntimeError(
+                    f"compose stop failed: {result.stderr.strip() or result.stdout.strip()}"
+                )
+            try:
+                self._set_status(VPNState.DISCONNECTED)
+            except Exception:
+                pass
+        finally:
+            self._docker_op_end()
+
+    async def _pin_last_good(self) -> bool:
+        """Re-pin le dernier pays sain si disponible."""
+        country = self._last_good_country or getattr(self, "_current_country", None)
+        if not country:
+            return False
+        try:
+            ok = await self._control_pin_country(str(country), timeout=30.0, catchup=5.0)
+        except Exception:
+            ok = False
+        if ok:
+            logger.info("[vpn] s%s auth repair: re-pin last good country=%s", self._station, country)
+        return bool(ok)
+
+    def _launch_auth_repair(self, cause: str = "auth_throttle") -> None:
+        """Démarre le worker de réparation auth (single-flight)."""
+        if not self._station_repair_enabled:
+            return
+        task = self._auth_repair_task
+        if task is not None and not task.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._credentials_suspect = cause == "credentials"
+        self._mark_pool_repairing(cause)
+        self._auth_repair_task = loop.create_task(self._auth_repair_loop(cause))
+
+    async def _auth_repair_loop(self, cause: str) -> None:
+        """Applique la séquence auth du plan, sans dépasser les budgets."""
+        try:
+            while not getattr(self, "_closing", False):
+                now = self._now_fn()
+                if self._credentials_suspect:
+                    self._park_auth("credentials", now)
+                    return
+                if self._all_peers_auth_failed():
+                    self._credentials_suspect = True
+                    self._park_auth("credentials", now)
+                    return
+                if self._auth_park_until > now:
+                    await self._repair_sleep(min(30.0, self._auth_park_until - now))
+                    continue
+                if not self._auth_failed:
+                    # Le tunnel a guéri pendant l'attente.
+                    self._repair_state.note_success(now)
+                    return
+                if not self._repair_state.due(now):
+                    wait = min(30.0, max(0.1, self._repair_state.next_retry_at - now))
+                    await self._repair_sleep(wait)
+                    continue
+                if not _STATION_AUTH_GUARD.allow_probe(self._station, now):
+                    wait = min(30.0, max(0.1, _STATION_AUTH_GUARD.remaining(now)))
+                    await self._repair_sleep(wait)
+                    continue
+                action = self._repair_state.plan(self._repair_policy, now)
+                if action.action == PARK:
+                    self._park_auth(cause or "auth_throttle", now)
+                    return
+                logger.info(
+                    "[vpn] s%s auth repair attempt=%d action=%s delay=%.0fs cause=%s",
+                    self._station,
+                    action.attempt,
+                    action.action,
+                    action.delay_s,
+                    cause,
+                )
+                healed = False
+                self._repairing = True
+                try:
+                    async with self._lock:
+                        if action.action == RESTART:
+                            await _auth_gate(self._docker_container)
+                            try:
+                                await self._docker_restart()
+                            finally:
+                                _auth_connect_done()
+                            await self._wait_healthy(timeout=60)
+                        elif action.action == STOP:
+                            await self._stop_service()
+                            await self._repair_sleep(max(0.0, action.delay_s))
+                            await _auth_gate(self._docker_container)
+                            try:
+                                await self._ensure_container()
+                            finally:
+                                _auth_connect_done()
+                            await self._wait_healthy(timeout=120)
+                        elif action.action == PIN_LAST_GOOD:
+                            await self._pin_last_good()
+                            await _auth_gate(self._docker_container)
+                            try:
+                                await self._ensure_container()
+                            finally:
+                                _auth_connect_done()
+                            await self._wait_healthy(timeout=120)
+                        elif action.action == RECREATE:
+                            await _auth_gate(self._docker_container)
+                            try:
+                                await self._ensure_container(force_recreate=True)
+                            finally:
+                                _auth_connect_done()
+                            await self._wait_healthy(timeout=120)
+                        elif action.action == STACK:
+                            target = "openvpn" if getattr(self, "_stack_effective", None) == "wireguard" else "wireguard"
+                            await self._apply_stack(target, reason="auth repair", auto=True, stations=[self._station])
+                        healed = await self._auth_probe_after_repair()
+                except Exception as exc:
+                    self._repair_state.note_failure(f"{type(exc).__name__}: {exc}", self._now_fn())
+                finally:
+                    self._repairing = False
+                    self._repair_state.note_attempt(action, self._now_fn())
+                if healed:
+                    self._auth_repair_succeeded()
+                    return
+                self._repair_state.note_failure(
+                    self._repair_state.last_error or "auth-still-failing",
+                    self._now_fn(),
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("[vpn] s%s auth repair crashed: %s", self._station, exc)
+        finally:
+            self._auth_repair_task = None
+
+    async def _auth_probe_after_repair(self) -> bool:
+        """Vérifie auth + egress réel avant de considérer la station réparée."""
+        try:
+            started_at = await self._wait_healthy(timeout=60)
+        except Exception:
+            return False
+        if not started_at:
+            return False
+        try:
+            if await self._check_auth_failed(started_at):
+                return False
+            if not await self._probe_tunnel_light():
+                return False
+        except Exception:
+            return False
+        return True
+
+    def _auth_repair_succeeded(self) -> None:
+        now = self._now_fn()
+        self._auth_failed = False
+        self._server_issue = False
+        self._credentials_suspect = False
+        self._auth_park_until = 0.0
+        self._parked_until = 0.0
+        self._auth_next_retry_at = 0.0
+        self._auth_cool_until = 0.0
+        self._auth_grace_until = 0.0
+        self._repair_state.note_success(now)
+        self._record_last_good(now)
+        try:
+            self._auth_fail_times.clear()
+            self._auth_failed_window.clear()
+        except Exception:
+            pass
+        try:
+            _STATION_AUTH_GUARD.clear()
+        except Exception:
+            pass
+        try:
+            self._note_effective_ok()
+            self._set_status(VPNState.CONNECTED)
+        except Exception:
+            pass
+        self._mark_pool_repaired()
+        self._note_pool_health(True, cause="auth-repaired")
+        self._watchdog_last_action = "auth-repaired"
+        logger.warning("[vpn] s%s auth repair SUCCESS — restored", self._station)
+        try:
+            self.save_state()
+        except Exception:
+            pass
+
     async def _check_auth_failed(self, started_at: str = "", text: str | None = None) -> bool:
         """Scan container logs for AUTH_FAILED (OpenVPN auth rejection).
 
@@ -7532,6 +7913,20 @@ class VPNManager:
             # here, where live-ness is already established: an AUTH_FAILED
             # superseded by a success must never poison the blacklist.
             self._record_auth_failure(text)
+            self._note_pool_health(False, cause="auth")
+            # [P2] Garde auth globale : 2+ stations dans la fenêtre → une
+            # seule probe autorisée, pause 5 min puis 15 min.
+            try:
+                if _STATION_AUTH_GUARD.note_failure(self._station, self._now_fn()):
+                    _pause = _STATION_AUTH_GUARD.remaining(self._now_fn())
+                    self._auth_global_pause_until = self._now_fn() + _pause
+                    logger.warning(
+                        "[vpn] auth storm détectée — pause globale %.0fs, une seule probe autorisée (s%s)",
+                        _pause,
+                        self._station,
+                    )
+            except Exception:
+                pass
             # [plan 18/08 §3c] auto-mode counter: sliding 30-min window of
             # LIVE rejections (threshold in config: auto_ov_fail_threshold).
             # Monotonic timestamps; pruned lazily by _auto_flip_decision.
@@ -7758,6 +8153,27 @@ class VPNManager:
             pass
         auth_path = (kind == "AUTH_FAILED") or bool(getattr(self, "_auth_failed", False))
         if auth_path:
+            # [P2] Nouvelle politique : restart immédiat, puis arrêts réels
+            # 5/15 min, pin, recreate, stack, park. Le flag OFF conserve
+            # exactement l'ancienne grâce/cooldown (rollback).
+            if getattr(self, "_station_repair_enabled", False):
+                now = self._now_fn()
+                if getattr(self, "_credentials_suspect", False) or self._all_peers_auth_failed():
+                    self._credentials_suspect = True
+                    return ("credentials-parked", "all-stations-auth-failed")
+                if float(getattr(self, "_auth_park_until", 0.0) or 0.0) > now:
+                    return ("auth-parked", f"{int(self._auth_park_until - now)}s")
+                task = getattr(self, "_auth_repair_task", None)
+                if task is not None and not task.done():
+                    return ("repairing", "auth-repair-in-flight")
+                try:
+                    if _STATION_AUTH_GUARD.remaining(now) > 0 and not _STATION_AUTH_GUARD.allow_probe(
+                        self._station, now
+                    ):
+                        return ("global-pause", f"{int(_STATION_AUTH_GUARD.remaining(now))}s")
+                except Exception:
+                    pass
+                return ("auth-repair", "auth-throttle")
             try:
                 _cooling = self._auth_cooling()
             except Exception:
@@ -8775,6 +9191,15 @@ class VPNManager:
             except Exception:
                 pass
             return
+        # [P2] Une réparation auth en vol possède la station : le watchdog ne
+        # doit pas lancer un second restart/stop concurrent.
+        _auth_task = getattr(self, "_auth_repair_task", None)
+        if _auth_task is not None and not _auth_task.done():
+            self._watchdog_last_action = "auth-repair-in-flight"
+            return
+        if float(getattr(self, "_auth_park_until", 0.0) or 0.0) > self._now_fn():
+            self._watchdog_last_action = "auth-parked"
+            return
         if self._lock.locked():
             try:
                 self._watchdog_skipped_ticks = int(getattr(self, "_watchdog_skipped_ticks", 0)) + 1
@@ -8830,6 +9255,14 @@ class VPNManager:
                 tunnel_alive = await asyncio.wait_for(self._probe_tunnel_light(), self._ip_probe_budget)
             except TimeoutError:
                 tunnel_alive = False
+            # [P1] Alimente la machine à états santé du pool : 2 probes réels
+            # avant de réadmettre, 2 échecs avant réparation.
+            try:
+                _pool = getattr(shared_state, "free_ip_pool", None)
+                if _pool is not None and hasattr(_pool, "note_station_probe"):
+                    _pool.note_station_probe(self, bool(tunnel_alive), cause="egress")
+            except Exception:
+                pass
             if not tunnel_alive:
                 self._egress_failures += 1
                 # [audit 2026-10-30] Dès le premier échec, la station n'est
@@ -9055,6 +9488,41 @@ class VPNManager:
                 # rapide qui nourrit le rejet serveur — cas S4). Rollback :
                 # ``watchdog_auth_grace_s: 0`` = restart immédiat historique.
                 _action, _reason = self._decide_watchdog_action(kind)
+                # [P2] Actions de la politique de réparation auth. Elles
+                # sortent AVANT la grâce/cooldown historiques : le restart est
+                # immédiat, les silences sont des arrêts réels de conteneur.
+                if _action == "auth-repair":
+                    self._watchdog_last_action = "auth-repair"
+                    logger.warning(
+                        "[vpn-watchdog] s%s action=auth-repair — séquence restart/stop/pin bornée",
+                        self._station,
+                    )
+                    self._launch_auth_repair("auth_throttle")
+                    return
+                if _action == "credentials-parked":
+                    self._watchdog_last_action = "credentials-parked"
+                    self._credentials_suspect = True
+                    self._park_auth("credentials")
+                    return
+                if _action == "auth-parked":
+                    self._watchdog_last_action = "auth-parked"
+                    logger.warning(
+                        "[vpn-watchdog] s%s déjà parkée (%s) — aucune nouvelle auth",
+                        self._station,
+                        _reason,
+                    )
+                    return
+                if _action == "global-pause":
+                    self._watchdog_last_action = "global-pause"
+                    logger.warning(
+                        "[vpn-watchdog] s%s auth globale en pause (%s) — une seule probe autorisée",
+                        self._station,
+                        _reason,
+                    )
+                    return
+                if _action == "repairing":
+                    self._watchdog_last_action = "repairing"
+                    return
                 if _action == "auth-cooling":
                     self._watchdog_last_action = "auth-cooling"
                     logger.warning(
@@ -9571,6 +10039,30 @@ class VPNManager:
                 "ovpn_endpoint_port_effective": getattr(self, "_ovpn_endpoint_port_effective", "1194"),
                 "auto_hetero_boot": getattr(self, "_auto_hetero_boot", False),
                 "flips": self._flips,
+                # [P2] dernier bon serveur + état de réparation (park/retry).
+                "last_good": {
+                    "country": getattr(self, "_last_good_country", None),
+                    "host": getattr(self, "_last_good_host", None),
+                    "ip": getattr(self, "_last_good_ip", None),
+                    "at": getattr(self, "_last_good_at", 0.0),
+                },
+                "repair_state": {
+                    "attempt": int(getattr(self._repair_state, "attempt", 0)),
+                    "parked_remaining_s": max(
+                        0.0,
+                        float(getattr(self._repair_state, "parked_until", 0.0))
+                        - self._now_fn(),
+                    ),
+                    "next_retry_in_s": max(
+                        0.0,
+                        float(getattr(self._repair_state, "next_retry_at", 0.0))
+                        - self._now_fn(),
+                    ),
+                    "last_error": getattr(self._repair_state, "last_error", None),
+                    "repair_successes": int(getattr(self._repair_state, "repair_successes", 0)),
+                    "repair_failures": int(getattr(self._repair_state, "repair_failures", 0)),
+                    "action_required": bool(getattr(self._repair_state, "action_required", False)),
+                },
                 "saved_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             }
             state_path = self._get_state_path()
@@ -9760,6 +10252,46 @@ class VPNManager:
             restored_flips = state.get("flips")
             if isinstance(restored_flips, list):
                 self._flips = [f for f in restored_flips if isinstance(f, dict)][-20:]
+            # [P2] dernier bon serveur + reprise du park/retry (durées
+            # relatives : les timestamps monotonic ne survivent pas au boot).
+            _lg = state.get("last_good")
+            if isinstance(_lg, dict):
+                self._last_good_country = _lg.get("country") or self._last_good_country
+                self._last_good_host = _lg.get("host") or self._last_good_host
+                self._last_good_ip = _lg.get("ip") or self._last_good_ip
+                try:
+                    self._last_good_at = float(_lg.get("at", 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    self._last_good_at = 0.0
+                self._repair_state.mark_last_good(
+                    country=self._last_good_country,
+                    host=self._last_good_host,
+                    ip=self._last_good_ip,
+                    now=self._now_fn(),
+                )
+            _rs = state.get("repair_state")
+            if isinstance(_rs, dict):
+                try:
+                    self._repair_state.attempt = max(0, int(_rs.get("attempt", 0) or 0))
+                    _park_rem = max(0.0, float(_rs.get("parked_remaining_s", 0.0) or 0.0))
+                    _retry_rem = max(0.0, float(_rs.get("next_retry_in_s", 0.0) or 0.0))
+                    if _park_rem > 0:
+                        self._repair_state.parked_until = self._now_fn() + min(
+                            _park_rem, float(self._repair_policy.park_s)
+                        )
+                        self._auth_park_until = self._repair_state.parked_until
+                    if _retry_rem > 0:
+                        self._repair_state.next_retry_at = self._now_fn() + min(_retry_rem, 3600.0)
+                    self._repair_state.last_error = _rs.get("last_error")
+                    self._repair_state.repair_successes = max(
+                        0, int(_rs.get("repair_successes", 0) or 0)
+                    )
+                    self._repair_state.repair_failures = max(
+                        0, int(_rs.get("repair_failures", 0) or 0)
+                    )
+                    self._repair_state.action_required = bool(_rs.get("action_required", False))
+                except (TypeError, ValueError):
+                    pass
             logger.info(
                 "[vpn] state loaded: %d IPs in history, %d total switches",
                 len(self._ip_history),
